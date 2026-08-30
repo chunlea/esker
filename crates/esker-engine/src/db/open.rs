@@ -18,7 +18,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use crate::batch::WriteBatch;
@@ -30,7 +30,12 @@ use crate::options::Options;
 use crate::version::{VersionEdit, VersionSet};
 use crate::wal::{LogReader, LogWriter, ReadOutcome};
 
-use super::{ColumnFamily, Db, DbInner, SnapshotList, Wal, WriteQueue};
+use super::table_cache::TableCache;
+use super::{ColumnFamily, Db, DbInner, FlushState, SnapshotList, Wal, WriteQueue};
+
+/// How many SSTs are kept open at once. Small enough to bound file descriptors, large enough
+/// that a hot working set is not reopened on every lookup.
+const MAX_OPEN_TABLES: usize = 256;
 
 /// Column families a new database is created with, unless the caller names others.
 pub const DEFAULT_COLUMN_FAMILIES: &[&str] = &[crate::cf::DEFAULT];
@@ -59,47 +64,13 @@ impl Db {
         cfs: &[&str],
     ) -> Result<Self> {
         let dir = path.as_ref().to_path_buf();
+        let dir_for_error = dir.clone();
         let comparator = Arc::new(InternalKeyComparator::new(Arc::clone(&options.comparator)));
-        let current = filename::current(&dir);
-        let exists = fs.exists(&current).at(&current)?;
-
-        if exists && options.error_if_exists {
-            return Err(Error::InvalidArgument(format!(
-                "{} already contains a database",
-                dir.display()
-            )));
-        }
-
-        let mut versions = if exists {
-            VersionSet::recover(
-                Arc::clone(&fs),
-                &dir,
-                Arc::clone(&comparator),
-                options.num_levels,
-            )?
-        } else if options.create_if_missing {
-            VersionSet::create(
-                Arc::clone(&fs),
-                &dir,
-                Arc::clone(&comparator),
-                options.num_levels,
-                cfs,
-            )?
-        } else {
-            return Err(Error::NotFound(format!(
-                "{} does not contain a database and create_if_missing is off",
-                dir.display()
-            )));
-        };
-
-        for name in cfs {
-            if versions.cf_id(name).is_none() {
-                versions.create_cf(name)?;
-            }
-        }
+        let mut versions = open_versions(&fs, &dir, &comparator, &options, cfs)?;
 
         // Build a column family for every family the manifest knows about, not only the ones
-        // the caller named.
+        // the caller named. The log number is filled in below, once replay has said which
+        // segment the recovered data came from.
         let mut families: BTreeMap<u32, Arc<ColumnFamily>> = BTreeMap::new();
         for (id, name) in versions.column_families().clone() {
             families.insert(
@@ -109,6 +80,7 @@ impl Db {
                     name,
                     options.cf_options.clone(),
                     &comparator,
+                    versions.log_number(),
                 )),
             );
         }
@@ -117,12 +89,16 @@ impl Db {
         let last_seqno = versions.last_seqno().max(replayed.max_seqno);
 
         // Writes go to a fresh segment. The log number stays at the oldest segment whose
-        // contents are still only in memory, so a crash before the next flush replays them
-        // again.
-        // TODO(step-6b): flush the recovered memtables here, as LevelDB does, and advance the
-        // log number past them; until then segments accumulate across reopens.
+        // contents are still only in memory, so a crash before the first flush replays them
+        // again; the flush that follows moves it forward.
         let wal_number = versions.new_file_number();
         let log_number = replayed.oldest_segment.unwrap_or(wal_number);
+        for cf in families.values() {
+            let mut mem = cf.mem.write().map_err(|_| {
+                Error::Poisoned("a thread panicked while holding a memtable lock".to_string())
+            })?;
+            mem.active_log = log_number;
+        }
         let wal_path = filename::wal(&dir, wal_number);
         let writer = LogWriter::new(
             fs.create(&wal_path).at(&wal_path)?,
@@ -135,6 +111,12 @@ impl Db {
         edit.log_number = Some(log_number);
         versions.log_and_apply(&mut edit)?;
 
+        let table_cache = TableCache::new(
+            Arc::clone(&fs),
+            dir.clone(),
+            MAX_OPEN_TABLES,
+            options.block_cache.clone(),
+        );
         let inner = Arc::new(DbInner {
             fs,
             dir,
@@ -148,12 +130,34 @@ impl Db {
             }),
             writers: Mutex::new(WriteQueue::default()),
             write_ready: Condvar::new(),
+            table_cache,
+            flush: Mutex::new(FlushState::default()),
+            flush_wanted: Condvar::new(),
+            flush_done: Condvar::new(),
+            shutdown: AtomicBool::new(false),
+            stalls: AtomicU64::new(0),
+            slowdowns: AtomicU64::new(0),
             next_seqno: AtomicU64::new(last_seqno + 1),
             visible_seqno: AtomicU64::new(last_seqno),
             snapshots: SnapshotList::new(),
         });
 
-        let db = Self { inner };
+        // One background thread per database, holding a `Weak` so that dropping the last
+        // handle lets the state go even if the thread is mid-wait.
+        let weak = Arc::downgrade(&inner);
+        let flusher = std::thread::Builder::new()
+            .name("esker-flush".to_string())
+            .spawn(move || {
+                if let Some(inner) = weak.upgrade() {
+                    inner.flush_loop();
+                }
+            })
+            .map_err(|err| Error::io(&dir_for_error, err))?;
+
+        let db = Self {
+            inner,
+            flusher: Some(flusher),
+        };
         db.purge_obsolete_files()?;
         Ok(db)
     }
@@ -164,6 +168,54 @@ impl Db {
         let mut versions = super::lock(&self.inner.versions)?;
         versions.purge_obsolete_files()
     }
+}
+
+/// Creates or recovers the version set, and makes sure every column family the caller named
+/// exists.
+fn open_versions(
+    fs: &Arc<dyn FileSystem>,
+    dir: &Path,
+    comparator: &Arc<InternalKeyComparator>,
+    options: &Options,
+    cfs: &[&str],
+) -> Result<VersionSet> {
+    let current = filename::current(dir);
+    let exists = fs.exists(&current).at(&current)?;
+    if exists && options.error_if_exists {
+        return Err(Error::InvalidArgument(format!(
+            "{} already contains a database",
+            dir.display()
+        )));
+    }
+
+    let mut versions = if exists {
+        VersionSet::recover(
+            Arc::clone(fs),
+            dir,
+            Arc::clone(comparator),
+            options.num_levels,
+        )?
+    } else if options.create_if_missing {
+        VersionSet::create(
+            Arc::clone(fs),
+            dir,
+            Arc::clone(comparator),
+            options.num_levels,
+            cfs,
+        )?
+    } else {
+        return Err(Error::NotFound(format!(
+            "{} does not contain a database and create_if_missing is off",
+            dir.display()
+        )));
+    };
+
+    for name in cfs {
+        if versions.cf_id(name).is_none() {
+            versions.create_cf(name)?;
+        }
+    }
+    Ok(versions)
 }
 
 /// What replaying the log found.

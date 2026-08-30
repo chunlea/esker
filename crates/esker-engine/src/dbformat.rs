@@ -26,6 +26,8 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::sync::Arc;
 
+use crate::options::PrefixExtractor;
+
 /// The engine's sequence number: one per write batch, ordering everything.
 pub type SeqNo = u64;
 
@@ -289,12 +291,64 @@ impl Comparator for InternalKeyComparator {
     }
 }
 
+/// Applies a user-level prefix extractor to the user key inside an internal key.
+///
+/// SSTs store internal keys, so a bloom filter built over them straight would be built over
+/// `user_key ++ tag` — and every version of a key has a different tag, so a point read could
+/// never probe it. `LevelDB` solves this with an `InternalFilterPolicy` that strips the tag
+/// first; this is the same idea, expressed as a prefix extractor so that a column family's own
+/// extractor composes with it.
+///
+/// With no user extractor the filter is over whole user keys. With one — "strip the 8-byte
+/// MVCC timestamp", for the versioned column families of `docs/DESIGN.md` §3 — the filter
+/// answers "does this user key exist at any version", which is the question a seek asks.
+#[derive(Debug, Clone)]
+pub struct InternalPrefixExtractor {
+    user: Option<Arc<dyn PrefixExtractor>>,
+    name: String,
+}
+
+impl InternalPrefixExtractor {
+    /// Wraps `user`, or extracts the whole user key when there is none.
+    pub fn new(user: Option<Arc<dyn PrefixExtractor>>) -> Self {
+        let name = match &user {
+            Some(user) => format!("esker.Internal({})", user.name()),
+            None => "esker.Internal".to_string(),
+        };
+        Self { user, name }
+    }
+}
+
+impl PrefixExtractor for InternalPrefixExtractor {
+    fn prefix<'a>(&self, key: &'a [u8]) -> &'a [u8] {
+        let user_key = extract_user_key(key);
+        match &self.user {
+            Some(user) => user.prefix(user_key),
+            None => user_key,
+        }
+    }
+
+    fn in_domain(&self, key: &[u8]) -> bool {
+        if key.len() < TAG_LEN {
+            return false;
+        }
+        let user_key = extract_user_key(key);
+        self.user
+            .as_ref()
+            .is_none_or(|user| user.in_domain(user_key))
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        BytewiseComparator, Comparator, EntryKind, InternalKeyComparator, KIND_FOR_SEEK, MAX_SEQNO,
-        TAG_LEN, extract_tag, extract_user_key, internal_key, lookup_key, pack_tag,
-        split_internal_key, tag_kind, tag_seqno,
+        BytewiseComparator, Comparator, EntryKind, InternalKeyComparator, InternalPrefixExtractor,
+        KIND_FOR_SEEK, MAX_SEQNO, PrefixExtractor, TAG_LEN, extract_tag, extract_user_key,
+        internal_key, lookup_key, pack_tag, split_internal_key, tag_kind, tag_seqno,
     };
     use std::cmp::Ordering;
     use std::sync::Arc;
@@ -458,6 +512,38 @@ mod tests {
         c.find_short_successor(&mut succ);
         assert_eq!(c.cmp(&key, &succ), Ordering::Less);
         assert_eq!(extract_user_key(&succ), b"b");
+    }
+
+    /// A filter over internal keys would be a filter over `user_key ++ tag`, which a point
+    /// read could never probe: every version has a different tag.
+    #[test]
+    fn the_internal_extractor_strips_the_tag() {
+        let extractor = InternalPrefixExtractor::new(None);
+        let key = internal_key(b"user", 42, EntryKind::Put);
+        assert!(extractor.in_domain(&key));
+        assert_eq!(extractor.prefix(&key), b"user");
+        assert_eq!(
+            extractor.prefix(&internal_key(b"user", 7, EntryKind::Delete)),
+            extractor.prefix(&key),
+            "every version of a key must probe the same filter entry"
+        );
+        assert!(!extractor.in_domain(b"short"), "not an internal key");
+    }
+
+    /// A column family's own extractor composes: the tag comes off, then its suffix.
+    #[test]
+    fn the_internal_extractor_composes_with_a_user_one() {
+        let user = Arc::new(crate::options::StripSuffix::new(8));
+        let extractor = InternalPrefixExtractor::new(Some(user));
+        let versioned = [b"user".as_slice(), &[0u8; 8]].concat();
+        let key = internal_key(&versioned, 42, EntryKind::Put);
+        assert!(extractor.in_domain(&key));
+        assert_eq!(extractor.prefix(&key), b"user");
+        assert!(
+            extractor.name().contains("StripSuffix.8"),
+            "{}",
+            extractor.name()
+        );
     }
 
     #[test]

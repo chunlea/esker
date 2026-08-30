@@ -77,6 +77,10 @@ impl DbInner {
         self.check_column_families(&batch)?;
         let sync = options.sync || self.options.wal_sync_mode == WalSyncMode::PerWrite;
 
+        // Before anything is logged: make room, which may switch a memtable, roll the log
+        // and stall this writer.
+        self.make_room_for_write()?;
+
         let ticket = {
             let mut queue = lock(&self.writers)?;
             let ticket = queue.next_ticket;

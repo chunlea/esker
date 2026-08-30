@@ -416,3 +416,277 @@ fn existing_column_families_are_opened_even_when_unnamed() {
         Some(&b"v"[..])
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// Flush: memtables becoming L0 files, and reads that have to go and find them.
+// ---------------------------------------------------------------------------------------
+
+use esker_engine::options::CfOptions;
+
+/// Options with a memtable small enough that a handful of writes fills it.
+fn small_buffer(bytes: usize) -> Options {
+    Options {
+        create_if_missing: true,
+        cf_options: CfOptions {
+            write_buffer_size: bytes,
+            ..CfOptions::default()
+        },
+        ..Options::default()
+    }
+}
+
+#[test]
+fn a_flush_moves_data_to_l0_and_reads_still_find_it() {
+    let (_, fs) = memfs();
+    let db = open(&fs, options(), &[cf::DEFAULT]).unwrap();
+    for i in 0..200u32 {
+        db.put(cf::DEFAULT, format!("key-{i:04}").as_bytes(), b"value")
+            .unwrap();
+    }
+    db.delete(cf::DEFAULT, b"key-0007").unwrap();
+    assert_eq!(
+        db.property("esker.num-files-at-level0.default").unwrap(),
+        "0"
+    );
+
+    db.flush(cf::DEFAULT).unwrap();
+    assert_eq!(
+        db.property("esker.num-files-at-level0.default").unwrap(),
+        "1"
+    );
+    assert_eq!(
+        db.property("esker.num-immutable-mem-table.default")
+            .unwrap(),
+        "0"
+    );
+    assert_eq!(
+        db.property("esker.mem-table-size.default").unwrap(),
+        "0",
+        "the flushed table is gone from memory"
+    );
+
+    for i in 0..200u32 {
+        let key = format!("key-{i:04}");
+        let expected = if i == 7 { None } else { Some(&b"value"[..]) };
+        assert_eq!(get(&db, key.as_bytes()).as_deref(), expected, "{key}");
+    }
+    assert!(
+        db.property("esker.open-tables")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap()
+            >= 1
+    );
+}
+
+#[test]
+fn flushed_data_survives_a_reopen_and_the_old_log_is_reclaimed() {
+    let (memfs, fs) = memfs();
+    let old_log;
+    {
+        let db = open(&fs, options(), &[cf::DEFAULT]).unwrap();
+        old_log = db.wal_number().unwrap();
+        for i in 0..50u32 {
+            db.put(cf::DEFAULT, format!("k{i:03}").as_bytes(), b"v")
+                .unwrap();
+        }
+        db.flush(cf::DEFAULT).unwrap();
+        assert!(
+            !memfs
+                .exists(&filename::wal(std::path::Path::new(DIR), old_log))
+                .unwrap(),
+            "the flushed segment should have been reclaimed"
+        );
+    }
+
+    let db = open(&fs, Options::default(), &[cf::DEFAULT]).unwrap();
+    assert_eq!(
+        db.property("esker.num-files-at-level0.default").unwrap(),
+        "1"
+    );
+    // Once the segments are gone the manifest is the only record of how far the sequence
+    // numbers got. If an edit forgot to stamp it, recovery restarts numbering from an older
+    // point and every flushed write becomes invisible — which is exactly what happened the
+    // first time this test was written.
+    assert!(
+        db.last_seqno() >= 50,
+        "the sequence number did not survive the flush: {}",
+        db.last_seqno()
+    );
+    for i in 0..50u32 {
+        assert_eq!(
+            get(&db, format!("k{i:03}").as_bytes()).as_deref(),
+            Some(&b"v"[..])
+        );
+    }
+}
+
+/// The engine flushes on its own once a memtable fills, without anyone asking.
+#[test]
+fn a_full_memtable_flushes_by_itself() {
+    let (_, fs) = memfs();
+    let db = open(&fs, small_buffer(4 * 1024), &[cf::DEFAULT]).unwrap();
+    for i in 0..400u32 {
+        db.put(cf::DEFAULT, format!("key-{i:05}").as_bytes(), &[b'v'; 64])
+            .unwrap();
+    }
+    // Wait for the background thread to catch up; the last table may still be in memory.
+    db.flush(cf::DEFAULT).unwrap();
+
+    let files: usize = db
+        .property("esker.num-files-at-level0.default")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        files > 1,
+        "several memtables should have filled and flushed, saw {files}"
+    );
+    for i in 0..400u32 {
+        let key = format!("key-{i:05}");
+        assert_eq!(
+            get(&db, key.as_bytes()).as_deref(),
+            Some(&[b'v'; 64][..]),
+            "{key}"
+        );
+    }
+}
+
+/// A tombstone has to reach L0 as an entry, or the value underneath it comes back.
+#[test]
+fn a_tombstone_survives_a_flush_that_leaves_the_value_behind() {
+    let (_, fs) = memfs();
+    let db = open(&fs, options(), &[cf::DEFAULT]).unwrap();
+    db.put(cf::DEFAULT, b"k", b"v").unwrap();
+    db.flush(cf::DEFAULT).unwrap();
+    db.delete(cf::DEFAULT, b"k").unwrap();
+    db.flush(cf::DEFAULT).unwrap();
+
+    assert_eq!(
+        db.property("esker.num-files-at-level0.default").unwrap(),
+        "2"
+    );
+    assert_eq!(get(&db, b"k"), None, "the newer L0 file must win");
+    drop(db);
+
+    let db = open(&fs, Options::default(), &[cf::DEFAULT]).unwrap();
+    assert_eq!(get(&db, b"k"), None, "and still after a reopen");
+}
+
+/// L0 files overlap, so a read has to consult them newest first.
+#[test]
+fn overlapping_l0_files_are_read_newest_first() {
+    let (_, fs) = memfs();
+    let db = open(&fs, options(), &[cf::DEFAULT]).unwrap();
+    for generation in 0..4u32 {
+        for i in 0..10u32 {
+            db.put(
+                cf::DEFAULT,
+                format!("k{i}").as_bytes(),
+                format!("gen{generation}").as_bytes(),
+            )
+            .unwrap();
+        }
+        db.flush(cf::DEFAULT).unwrap();
+    }
+    assert_eq!(
+        db.property("esker.num-files-at-level0.default").unwrap(),
+        "4"
+    );
+    for i in 0..10u32 {
+        assert_eq!(
+            get(&db, format!("k{i}").as_bytes()).as_deref(),
+            Some(&b"gen3"[..]),
+            "k{i} should read the newest generation"
+        );
+    }
+}
+
+/// A snapshot taken before a flush still sees what it saw, even though the data has moved
+/// from memory to disk underneath it.
+#[test]
+fn a_snapshot_reads_the_same_values_across_a_flush() {
+    let (_, fs) = memfs();
+    let db = open(&fs, options(), &[cf::DEFAULT]).unwrap();
+    db.put(cf::DEFAULT, b"k", b"first").unwrap();
+    let snapshot = db.snapshot();
+    db.put(cf::DEFAULT, b"k", b"second").unwrap();
+    db.flush(cf::DEFAULT).unwrap();
+
+    let at_snapshot = ReadOptions {
+        snapshot: Some(snapshot),
+        ..ReadOptions::default()
+    };
+    assert_eq!(
+        db.get(cf::DEFAULT, b"k", &at_snapshot).unwrap().as_deref(),
+        Some(&b"first"[..])
+    );
+    assert_eq!(get(&db, b"k").as_deref(), Some(&b"second"[..]));
+}
+
+/// Writers must be pushed back when they outrun the flush thread, and the push-back has to be
+/// visible rather than mysterious (`docs/DESIGN.md` §4.4).
+#[test]
+fn write_stalls_are_counted() {
+    let (_, fs) = memfs();
+    let db = open(&fs, small_buffer(1024), &[cf::DEFAULT]).unwrap();
+    for i in 0..2_000u32 {
+        db.put(cf::DEFAULT, format!("key-{i:06}").as_bytes(), &[b'x'; 128])
+            .unwrap();
+    }
+    db.flush(cf::DEFAULT).unwrap();
+    let stalls: u64 = db.property("esker.write-stalls").unwrap().parse().unwrap();
+    let slowdowns: u64 = db
+        .property("esker.write-slowdowns")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        stalls + slowdowns > 0,
+        "writing 2000 records into a 1 KiB buffer should have pushed back at least once"
+    );
+    for i in 0..2_000u32 {
+        assert_eq!(
+            get(&db, format!("key-{i:06}").as_bytes()).as_deref(),
+            Some(&[b'x'; 128][..]),
+            "key-{i:06}"
+        );
+    }
+}
+
+/// Everything at once, against a model: random puts and deletes across flushes, read back at
+/// every snapshot that was taken along the way.
+#[test]
+fn reads_match_a_model_across_flushes() {
+    use std::collections::BTreeMap;
+
+    let (_, fs) = memfs();
+    let db = open(&fs, small_buffer(8 * 1024), &[cf::DEFAULT]).unwrap();
+    let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut rng = esker_base::rng::Pcg32::from_seed(0xE5E5);
+
+    for round in 0..1_500u32 {
+        let key = format!("key-{:04}", rng.below(400)).into_bytes();
+        if rng.chance(0.25) {
+            db.delete(cf::DEFAULT, &key).unwrap();
+            model.remove(&key);
+        } else {
+            let value = format!("v{round}").into_bytes();
+            db.put(cf::DEFAULT, &key, &value).unwrap();
+            model.insert(key, value);
+        }
+        if round % 400 == 399 {
+            db.flush(cf::DEFAULT).unwrap();
+        }
+    }
+    db.flush(cf::DEFAULT).unwrap();
+
+    for i in 0..400u32 {
+        let key = format!("key-{i:04}").into_bytes();
+        assert_eq!(
+            get(&db, &key).as_deref(),
+            model.get(&key).map(Vec::as_slice),
+            "key-{i:04}"
+        );
+    }
+}

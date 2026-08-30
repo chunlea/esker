@@ -2,7 +2,9 @@
 //!
 //! * [`open`] — creating and recovering, including replaying the log
 //! * [`write`] — group commit, and where invariant 1 is enforced
-//! * [`read`] — point lookups through memtables and, from step 6b, the levels
+//! * [`flush`] — switching memtables, and turning the full ones into L0 files
+//! * [`read`] — point lookups, through memtables and then down the levels
+//! * [`table_cache`] — open SSTs, kept open
 //! * [`snapshot`] — read positions, and the floor compaction may not collect below
 //!
 //! # What is shared and what is not
@@ -20,16 +22,19 @@
 //! publishes the second. Until it does, the writes are durable but invisible, which is exactly
 //! the window in which a half-applied batch would otherwise be readable.
 
+pub mod flush;
 pub mod open;
 pub mod read;
 pub mod snapshot;
+pub mod table_cache;
 pub mod write;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::thread::JoinHandle;
 
 pub use snapshot::{Snapshot, SnapshotList};
 
@@ -42,13 +47,38 @@ use crate::options::{CfOptions, Options};
 use crate::version::VersionSet;
 use crate::wal::LogWriter;
 
+use table_cache::TableCache;
+
 /// A log-structured key-value store in one directory.
 ///
-/// Cloneable and shared: every method takes `&self`, and concurrent readers and writers are
-/// the normal case rather than something to arrange around.
-#[derive(Debug, Clone)]
+/// Every method takes `&self` and concurrent readers and writers are the normal case, but the
+/// handle itself is not `Clone`: it owns the background flush thread and stops it on drop.
+/// Share it with an `Arc`, the way `LevelDB` and `RocksDB` are shared.
+#[derive(Debug)]
 pub struct Db {
     pub(crate) inner: Arc<DbInner>,
+    /// `None` only after `Drop` has taken it to join.
+    flusher: Option<JoinHandle<()>>,
+}
+
+impl Drop for Db {
+    fn drop(&mut self) {
+        // The flag is set while holding the lock the background thread waits on, so it either
+        // has not taken the lock yet — and will see the flag — or is already waiting and gets
+        // the notification. Setting it outside the lock loses the wake-up in between.
+        if let Ok(_state) = self.inner.flush.lock() {
+            self.inner.shutdown.store(true, Ordering::Release);
+        } else {
+            self.inner.shutdown.store(true, Ordering::Release);
+        }
+        self.inner.flush_wanted.notify_all();
+        self.inner.flush_done.notify_all();
+        if let Some(handle) = self.flusher.take() {
+            // A background thread that panicked has already reported through `flush.error`;
+            // there is nothing useful to do with the join result here.
+            let _unused = handle.join();
+        }
+    }
 }
 
 /// The state behind a [`Db`]. Separate so that background work can hold a `Weak` to it and
@@ -64,11 +94,33 @@ pub(crate) struct DbInner {
     pub(crate) wal: Mutex<Wal>,
     pub(crate) writers: Mutex<WriteQueue>,
     pub(crate) write_ready: Condvar,
+    pub(crate) table_cache: TableCache,
+    /// Guards the background thread's wake-up flag and its last error.
+    pub(crate) flush: Mutex<FlushState>,
+    /// Signalled to wake the background thread.
+    pub(crate) flush_wanted: Condvar,
+    /// Signalled when it has finished a table, to release stalled writers.
+    pub(crate) flush_done: Condvar,
+    pub(crate) shutdown: AtomicBool,
+    /// Times a writer was stopped outright, and times it was merely slowed. Both are
+    /// properties, because a database that mysteriously goes slow is one nobody can operate.
+    pub(crate) stalls: AtomicU64,
+    pub(crate) slowdowns: AtomicU64,
     /// The next sequence number to hand out.
     pub(crate) next_seqno: AtomicU64,
     /// The highest sequence number a reader may see.
     pub(crate) visible_seqno: AtomicU64,
     pub(crate) snapshots: Arc<SnapshotList>,
+}
+
+/// What the background flush thread is doing, and what went wrong if anything did.
+#[derive(Debug, Default)]
+pub(crate) struct FlushState {
+    /// Set by a writer that has made a memtable immutable.
+    pub(crate) wanted: bool,
+    /// The first background failure. Reported to foreground callers rather than kept quiet
+    /// while writes pile up behind it.
+    pub(crate) error: Option<String>,
 }
 
 /// The log segment writes currently go to.
@@ -91,8 +143,13 @@ pub struct ColumnFamily {
 #[derive(Debug)]
 pub(crate) struct MemState {
     pub(crate) active: Arc<MemTable>,
-    /// Oldest first, so the newest is at the back and a read walks it backwards.
-    pub(crate) immutable: Vec<Arc<MemTable>>,
+    /// The log segment the active table's writes are going to. A memtable and the segment it
+    /// was filled from live and die together: the segment may be deleted only once the table
+    /// is on disk.
+    pub(crate) active_log: u64,
+    /// Oldest first, each with the log segment it was filled from. The newest is at the back,
+    /// so a read walks it backwards.
+    pub(crate) immutable: Vec<(Arc<MemTable>, u64)>,
 }
 
 impl ColumnFamily {
@@ -101,6 +158,7 @@ impl ColumnFamily {
         name: String,
         options: CfOptions,
         comparator: &Arc<InternalKeyComparator>,
+        log_number: u64,
     ) -> Self {
         Self {
             id,
@@ -108,6 +166,7 @@ impl ColumnFamily {
             options,
             mem: RwLock::new(MemState {
                 active: Arc::new(MemTable::new(Arc::clone(comparator))),
+                active_log: log_number,
                 immutable: Vec::new(),
             }),
         }
@@ -204,28 +263,43 @@ impl Db {
     /// infer one (`docs/DESIGN.md` §4.4, §12).
     ///
     /// Recognised names: `esker.num-column-families`, `esker.snapshots`,
-    /// `esker.last-sequence`, `esker.mem-table-size.<cf>`, `esker.num-immutable-mem-table.<cf>`,
-    /// `esker.num-files-at-level<n>.<cf>`.
+    /// `esker.last-sequence`, `esker.write-stalls`, `esker.write-slowdowns`,
+    /// `esker.open-tables`, `esker.mem-table-size.<cf>`, `esker.num-immutable-mem-table.<cf>`,
+    /// `esker.oldest-log.<cf>`, `esker.num-files-at-level<n>.<cf>`.
     pub fn property(&self, name: &str) -> Option<String> {
         let inner = &self.inner;
         match name {
             "esker.num-column-families" => Some(inner.cfs.read().ok()?.len().to_string()),
             "esker.snapshots" => Some(inner.snapshots.len().to_string()),
             "esker.last-sequence" => Some(self.last_seqno().to_string()),
+            "esker.write-stalls" => Some(inner.stalls.load(Ordering::Relaxed).to_string()),
+            "esker.write-slowdowns" => Some(inner.slowdowns.load(Ordering::Relaxed).to_string()),
+            "esker.open-tables" => Some(inner.table_cache.len().to_string()),
             _ => {
                 let (prefix, cf_name) = name.rsplit_once('.')?;
                 let cf = inner.cf_by_name(cf_name).ok()?;
                 match prefix {
                     "esker.mem-table-size" => {
                         let mem = cf.mem.read().ok()?;
-                        let total: usize = std::iter::once(&mem.active)
-                            .chain(mem.immutable.iter())
-                            .map(|table| table.approximate_size())
-                            .sum();
+                        let total: usize = mem.active.approximate_size()
+                            + mem
+                                .immutable
+                                .iter()
+                                .map(|(table, _)| table.approximate_size())
+                                .sum::<usize>();
                         Some(total.to_string())
                     }
                     "esker.num-immutable-mem-table" => {
                         Some(cf.mem.read().ok()?.immutable.len().to_string())
+                    }
+                    "esker.oldest-log" => {
+                        let mem = cf.mem.read().ok()?;
+                        Some(
+                            mem.immutable
+                                .first()
+                                .map_or(mem.active_log, |(_, log)| *log)
+                                .to_string(),
+                        )
                     }
                     other => {
                         let level: usize = other
@@ -242,6 +316,23 @@ impl Db {
 }
 
 impl DbInner {
+    /// Logs a manifest edit, stamping it with the sequence number reached so far.
+    ///
+    /// Every edit carries it, and it must: once a flush lets the log segments behind it be
+    /// deleted, the manifest is the **only** remaining record of how far the sequence numbers
+    /// got. Recovery takes the higher of the manifest's number and the replayed log's, so an
+    /// edit that forgot to stamp it would silently restart numbering from an older point and
+    /// hide every write that had been flushed.
+    ///
+    /// Stamping the *visible* number can overshoot when an unsynced write is lost in a power
+    /// cut. Overshooting is harmless — a sequence number is never reused — while
+    /// undershooting hands out one that is already in use.
+    pub(crate) fn log_and_apply(&self, edit: &mut crate::version::VersionEdit) -> Result<()> {
+        let mut versions = lock(&self.versions)?;
+        versions.set_last_seqno(self.visible_seqno.load(Ordering::Acquire));
+        versions.log_and_apply(edit)
+    }
+
     /// The column family called `name`.
     pub(crate) fn cf_by_name(&self, name: &str) -> Result<Arc<ColumnFamily>> {
         let cfs = read_lock(&self.cfs)?;
@@ -263,6 +354,10 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>> {
 
 pub(crate) fn read_lock<T>(lock: &RwLock<T>) -> Result<RwLockReadGuard<'_, T>> {
     lock.read().map_err(|_| poisoned())
+}
+
+pub(crate) fn write_lock<T>(lock: &RwLock<T>) -> Result<RwLockWriteGuard<'_, T>> {
+    lock.write().map_err(|_| poisoned())
 }
 
 fn poisoned() -> Error {
