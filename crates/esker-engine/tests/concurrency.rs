@@ -69,9 +69,10 @@ const SECONDS_LONG: u64 = 30;
 /// would. When step 7's compaction is wired in here this can go back to a rate.
 const TARGET_FLUSHES: u32 = 32;
 
-// TODO(spine step 7): mix `compact` in beside the flushes once `Db` has a compaction API —
-// same shape as here, and the same final comparison. `compaction_still_has_no_public_api` in
-// tests/model.rs is the canary that fails when the API appears.
+// TODO(spine step 7): mix `compact_range` in beside the flushes once compaction has landed —
+// same shape as here, and the same final comparison. The model test covers compaction
+// operation by operation; what this file would add is compaction running *while* sixteen
+// threads read and write, which is the case a single-threaded model cannot reach.
 
 fn key_of(stripe: usize, slot: u32) -> Vec<u8> {
     format!("s{stripe:02}-k{slot:04}").into_bytes()
