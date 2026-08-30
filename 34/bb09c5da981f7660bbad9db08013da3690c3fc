@@ -1,0 +1,29 @@
+crates/esker-pd/tests/balance.rs
+  s_04c6c85b29b28a::t_f47fe4fe7275a7 38-42,94-97,279-281,290-298,300-306,310,315-320,350,353-357,395,420-491
+docs/DESIGN.md
+  s_04c6c85b29b28a::t_d4570616496cbf 454-460,666
+crates/esker-pd/src/balance.rs
+  s_04c6c85b29b28a::t_738dc147b1019b 61-67,101-108,146-180,191-196,273,344,478-484,486-487,493-537
+docs/adr/0018-balance-moves-the-spread-by-two.md
+  s_04c6c85b29b28a::t_e68fe7990db788 38-44,69-73,83-91,95-116,119-121
+crates/esker-pd/src/pd/repair.rs
+  s_04c6c85b29b28a::t_d0d2158de95aa1 185-195,217
+crates/esker-pd/src/pd/mod.rs
+  s_04c6c85b29b28a::t_f35ba51640dc9a 70-83,112-113,147,223,297
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "34bb09c5da981f7660bbad9db08013da3690c3fc",
+  "prompts": {},
+  "sessions": {
+    "s_04c6c85b29b28a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0e874339-89db-44c7-acd5-0deac94983ec",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
