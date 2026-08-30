@@ -8,6 +8,7 @@
 
 mod args;
 mod bench;
+mod bench_remote;
 mod bytes;
 mod manifest_dump;
 mod raw;

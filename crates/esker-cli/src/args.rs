@@ -10,7 +10,7 @@
 //! ```text
 //! esker [--version | -V] [--help | -h]
 //! esker bench [<workload>] [--num N] [--value-size N] [--batch-size N] [--threads N]
-//!             [--sync] [--dir PATH] [--duration-secs N] [--help]
+//!             [--sync] [--dir PATH] [--duration-secs N] [--remote HOST:PORT] [--help]
 //! esker sst-dump <path> [--verbose | -v] [--prefix-len N] [--help]
 //! esker wal-dump <path> [--verbose | -v] [--help]
 //! esker manifest-dump <dir> [--help]
@@ -147,6 +147,9 @@ Bench options:
       --dir PATH        Where to put the database (default a temporary directory)
       --duration-secs N Stop the measured phase early after this long (default 0, no limit)
       --bloom-bits N    Bloom filter bits per key; 0 builds none (default 10)
+      --remote HOST:PORT  Drive the workload over the network against a running
+                        server instead of an in-process database. The engine
+                        options above belong to that server and are ignored.
 
 Sst-dump options:
   -v, --verbose         Print every key and value, not just the summary
@@ -245,6 +248,10 @@ fn parse_bench(arguments: &[String]) -> Result<Command, ParseError> {
         if flag == "--dir" {
             let raw = take_value(arguments, &mut index, inline, "--dir")?;
             options.dir = Some(PathBuf::from(raw));
+            continue;
+        }
+        if flag == "--remote" {
+            options.remote = Some(take_value(arguments, &mut index, inline, "--remote")?);
             continue;
         }
 

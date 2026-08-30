@@ -37,11 +37,11 @@ use crate::bytes::escape_capped;
 pub(crate) const DEFAULT_ADDR: &str = "127.0.0.1:20160";
 
 /// The first region of a cluster covers everything and is region 1 (`docs/DESIGN.md` §7).
-const BOOTSTRAP_REGION: u64 = 1;
+pub(crate) const BOOTSTRAP_REGION: u64 = 1;
 
 /// `RequestHeader::peer` of zero means "no opinion about the leader", which is the truth for
 /// a client that has just connected and been told nothing.
-const NO_LEADER_OPINION: u64 = 0;
+pub(crate) const NO_LEADER_OPINION: u64 = 0;
 
 /// What `esker raw` was asked to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,7 +173,7 @@ pub(crate) fn run(options: &RawOptions, out: &mut impl Write) -> Result<Outcome,
 }
 
 /// Turns `host:port` into an address, preferring IPv4 when a name resolves to both.
-fn resolve(addr: &str) -> Result<SocketAddr, String> {
+pub(crate) fn resolve(addr: &str) -> Result<SocketAddr, String> {
     let mut resolved = addr
         .to_socket_addrs()
         .map_err(|err| format!("{addr}: {err}"))?

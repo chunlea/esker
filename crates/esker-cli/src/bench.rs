@@ -75,7 +75,7 @@ impl Workload {
     }
 
     /// Whether the database has to be populated before the measured phase.
-    fn needs_a_populated_database(self) -> bool {
+    pub(crate) fn needs_a_populated_database(self) -> bool {
         matches!(
             self,
             Self::Overwrite | Self::ReadRandom | Self::ReadMissing | Self::ReadSeq
@@ -154,6 +154,10 @@ pub(crate) struct Run {
     /// Bloom filter bits per key. Zero builds no filter, which is how the filter's own cost
     /// and benefit are measured rather than argued about.
     pub(crate) bloom_bits: u32,
+    /// Drive the workload over the network against this `host:port` instead of opening a
+    /// database in this process. The engine options above are the server's business then, not
+    /// this driver's, and are ignored.
+    pub(crate) remote: Option<String>,
 }
 
 impl Default for Run {
@@ -171,16 +175,17 @@ impl Default for Run {
             dir: None,
             duration_secs: 0,
             bloom_bits: 10,
+            remote: None,
         }
     }
 }
 
 /// A key, formatted the way `db_bench` formats one so the numbers are comparable.
-fn key_for(index: u64) -> Vec<u8> {
+pub(crate) fn key_for(index: u64) -> Vec<u8> {
     format!("key{index:016}").into_bytes()
 }
 
-fn value_of(size: u32, seed: u64) -> Vec<u8> {
+pub(crate) fn value_of(size: u32, seed: u64) -> Vec<u8> {
     let mut value = vec![0u8; usize::try_from(size).unwrap_or(0)];
     let mut rng = Pcg32::from_seed(seed);
     rng.fill_bytes(&mut value);
@@ -188,7 +193,13 @@ fn value_of(size: u32, seed: u64) -> Vec<u8> {
 }
 
 /// Runs one workload and returns what it measured.
+///
+/// `--remote` drives the same workload over the network instead, against a server that owns
+/// its own database; the engine options here are that server's business and are ignored.
 pub(crate) fn run(options: &Run) -> Result<Report, String> {
+    if let Some(addr) = &options.remote {
+        return crate::bench_remote::run(options, addr);
+    }
     let (dir, temporary) = match &options.dir {
         Some(dir) => (dir.clone(), false),
         None => (temp_dir(), true),
@@ -254,7 +265,7 @@ fn run_in(options: &Run, dir: &Path) -> Result<Report, String> {
     })
 }
 
-fn percentile(sorted: &[Duration], fraction: f64) -> Duration {
+pub(crate) fn percentile(sorted: &[Duration], fraction: f64) -> Duration {
     if sorted.is_empty() {
         return Duration::ZERO;
     }
@@ -508,6 +519,7 @@ mod tests {
             dir: None,
             duration_secs: 0,
             bloom_bits: 10,
+            remote: None,
         }
     }
 
