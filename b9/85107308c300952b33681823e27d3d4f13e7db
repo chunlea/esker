@@ -1,0 +1,16 @@
+docs/adr/0017-range-tombstones.md
+  h_44076b318daf9c 108-148,158-160
+docs/plans/phase-5.md
+  h_44076b318daf9c 191-193,228-242
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "b985107308c300952b33681823e27d3d4f13e7db",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
