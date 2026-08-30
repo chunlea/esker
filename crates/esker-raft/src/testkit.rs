@@ -17,7 +17,7 @@ use crate::config::Config;
 use crate::message::Message;
 use crate::raw_node::RawNode;
 use crate::storage::{LogStorage, MemStorage};
-use crate::types::{ConfState, Entry, Index, NodeId};
+use crate::types::{ConfState, Entry, Index, NodeId, offset};
 
 /// A group of nodes, a message queue, and a set of severed links.
 pub(crate) struct Harness {
@@ -25,6 +25,11 @@ pub(crate) struct Harness {
     queue: Vec<Message>,
     /// Directed links that drop everything, as `(from, to)`.
     severed: Vec<(NodeId, NodeId)>,
+    /// Every `(term, leader)` this group has ever produced, sorted by term. Election Safety is
+    /// a claim about history, not about the current instant: a node can take office in a term,
+    /// step down, and be followed by a different node in the *same* term, which no snapshot of
+    /// the present would catch.
+    elected: Vec<(crate::types::Term, NodeId)>,
 }
 
 impl Harness {
@@ -52,6 +57,7 @@ impl Harness {
             nodes,
             queue: Vec::new(),
             severed: Vec::new(),
+            elected: Vec::new(),
         }
     }
 
@@ -113,7 +119,7 @@ impl Harness {
 
     /// Drains every node's `Ready` — persisting exactly as the contract requires — and queues the
     /// messages. Returns how many were queued.
-    fn drain_ready(&mut self) -> usize {
+    pub(crate) fn drain_ready(&mut self) -> usize {
         let mut outgoing = Vec::new();
         for (_, node) in &mut self.nodes {
             if !node.has_ready() {
@@ -139,6 +145,48 @@ impl Harness {
         let queued = outgoing.len();
         self.queue.extend(outgoing);
         queued
+    }
+
+    /// How many messages are in flight.
+    pub(crate) fn pending(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Delivers the message at `at`, removing it from the queue. Out-of-order delivery is the
+    /// point: this is what lets a property test shuffle a network without owning one.
+    pub(crate) fn deliver_one(&mut self, at: usize) {
+        if at >= self.queue.len() {
+            return;
+        }
+        let message = self.queue.remove(at);
+        self.deliver_message(message);
+    }
+
+    /// Loses the message at `at`.
+    pub(crate) fn drop_one(&mut self, at: usize) {
+        if at < self.queue.len() {
+            self.queue.remove(at);
+        }
+    }
+
+    /// Delivers the message at `at` and leaves a copy queued, so it arrives twice.
+    pub(crate) fn duplicate_one(&mut self, at: usize) {
+        if at >= self.queue.len() {
+            return;
+        }
+        let message = self.queue[at].clone();
+        self.deliver_message(message);
+    }
+
+    fn deliver_message(&mut self, message: Message) {
+        let link = (message.sender(), message.recipient());
+        if self.severed.contains(&link) {
+            return;
+        }
+        if let Some((_, node)) = self.nodes.iter_mut().find(|(id, _)| *id == link.1) {
+            node.step(message)
+                .expect("step must not fail on a well-formed message");
+        }
     }
 
     /// Delivers everything queued, dropping what crosses a severed link.
@@ -213,6 +261,74 @@ impl Harness {
             [(id, _)] => *id,
             other => panic!("expected exactly one leader, found {other:?}"),
         }
+    }
+
+    /// Election Safety (Figure 3.2, P1): at most one leader per term, over the whole run.
+    ///
+    /// Returns the violation as text rather than panicking, so a property test can shrink toward
+    /// the smallest schedule that produces it.
+    pub(crate) fn check_election_safety(&mut self) -> Result<(), String> {
+        let leaders: Vec<(crate::types::Term, NodeId)> = self
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.role() == crate::core::Role::Leader)
+            .map(|(id, node)| (node.term(), *id))
+            .collect();
+        for (term, id) in leaders {
+            match self
+                .elected
+                .binary_search_by_key(&term, |(recorded, _)| *recorded)
+            {
+                Ok(at) if self.elected[at].1 != id => {
+                    return Err(format!(
+                        "two leaders in term {term}: node {} and node {id}",
+                        self.elected[at].1
+                    ));
+                }
+                Ok(_) => {}
+                Err(at) => self.elected.insert(at, (term, id)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Log Matching (P3) and State Machine Safety (P5), checked as one sweep.
+    ///
+    /// Log Matching: if two logs hold an entry with the same index and term, they are identical up
+    /// to that index. State Machine Safety follows from it here: everything below both nodes'
+    /// commit indices must be byte-identical, because those entries have been handed to a state
+    /// machine and cannot be taken back.
+    pub(crate) fn check_log_matching(&self) -> Result<(), String> {
+        for (left_id, _) in &self.nodes {
+            for (right_id, _) in &self.nodes {
+                if left_id >= right_id {
+                    continue;
+                }
+                let left = self.log_of(*left_id);
+                let right = self.log_of(*right_id);
+                let common = left.len().min(right.len());
+                for at in (0..common).rev() {
+                    if left[at].term != right[at].term || left[at].index != right[at].index {
+                        continue;
+                    }
+                    if left[..=at] != right[..=at] {
+                        return Err(format!(
+                            "log matching violated between {left_id} and {right_id} at index {}",
+                            left[at].index
+                        ));
+                    }
+                    break;
+                }
+                let committed = self.commit_of(*left_id).min(self.commit_of(*right_id));
+                let prefix = offset(committed).min(common);
+                if left[..prefix] != right[..prefix] {
+                    return Err(format!(
+                        "committed prefixes differ between {left_id} and {right_id} below {committed}"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Every entry in a node's log, durable or not.

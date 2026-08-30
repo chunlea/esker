@@ -30,6 +30,8 @@ mod error;
 mod log;
 mod message;
 mod progress;
+#[cfg(test)]
+mod proptests;
 mod raw_node;
 mod readonly;
 mod replication;

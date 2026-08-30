@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 902e22fd014a046c03dc0721940224d12d8ed375bef28dd0dbc2d60852c38138 # shrinks to seed = 0, actions = [Campaign(29), Deliver(0), Deliver(0), Deliver(0), Deliver(9), Deliver(0), Deliver(181), Campaign(203)]
+cc 2c79f9d0e267b548f714a90ba3bf03e7e8d42922e9cce4392a9ced8f9859b3bb # shrinks to seed = 782759198027677618, actions = [Campaign(212), Duplicate(110), Deliver(12), Deliver(0), Deliver(125), Deliver(1), Deliver(1), Deliver(101), Propose(0), Deliver(0), Deliver(0), Deliver(48), Deliver(128), Deliver(16), Campaign(116)]
+cc 8b73d3252649b5ac80d24ea33365270d372cde1bdea5327208c988fde5ccfe27 # shrinks to seed = 89567143330761436, actions = [Campaign(113), Deliver(0), Deliver(0), Drop(48), Deliver(0), Deliver(0), Deliver(0), Deliver(0), Deliver(0), Deliver(0), Deliver(0), Deliver(0), Deliver(0), Deliver(0), Campaign(158)]

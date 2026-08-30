@@ -35,6 +35,12 @@ use crate::types::{
 ///    `HardState` recording it; the core never emits the response in an earlier `Ready` than the
 ///    vote.
 ///
+///    Rule 1 is also what makes the leader's own bookkeeping safe. A leader counts *itself* as
+///    holding an entry the moment it appends one — before any fsync. That is only sound because no
+///    follower can acknowledge the entry until the leader has sent it, and the leader may not send
+///    until it has persisted. Persist-before-send is therefore not a nicety about message
+///    ordering: it is the reason a quorum of acknowledgements means a quorum of durable copies.
+///
 /// 2. **Apply [`snapshot`](Ready::snapshot) before `entries`** when both are present. The snapshot
 ///    replaces the log prefix that the entries continue; the other order leaves a hole.
 ///
@@ -266,7 +272,9 @@ mod tests {
     use crate::config::Config;
     use crate::core::Role;
     use crate::message::Message;
+    use crate::storage::LogStorage;
     use crate::storage::MemStorage;
+    use crate::testkit::Harness;
     use crate::types::{ConfState, Entry, HardState, Snapshot, SnapshotMeta};
 
     fn node(id: u64) -> RawNode<MemStorage> {
@@ -510,6 +518,126 @@ mod tests {
 
         node.advance(&second);
         assert!(node.ready().hard_state.is_none(), "advance settles it");
+    }
+
+    /// Rule 5, the other half: what a `Ready` returned is never returned again.
+    #[test]
+    fn nothing_is_offered_twice_after_advance() {
+        let mut group = Harness::new(&[1, 2, 3], 91);
+        group.campaign(1);
+        group.settle();
+        group.propose(1, b"once");
+
+        // `settle` has already discharged and advanced everything.
+        for id in [1, 2, 3] {
+            assert!(
+                !group.node(id).has_ready(),
+                "node {id} still has work after advance"
+            );
+        }
+    }
+
+    /// Rule 1 is testable from the core's side as one claim: the entries a message depends on are
+    /// in the *same* `Ready` as the message, so a driver that persists first is never forced to
+    /// send something it has not written.
+    #[test]
+    fn a_message_never_precedes_the_entries_it_depends_on() {
+        let mut leader = RawNode::new(
+            Config {
+                pre_vote: false,
+                ..Config::new(1, vec![1, 2, 3], 12)
+            },
+            MemStorage::with_conf_state(ConfState::from_voters(vec![1, 2, 3])),
+        )
+        .unwrap();
+        leader.campaign().unwrap();
+        for voter in [2, 3] {
+            leader
+                .step(Message::RequestVoteResponse {
+                    from: voter,
+                    to: 1,
+                    term: 1,
+                    granted: true,
+                    pre_vote: false,
+                })
+                .unwrap();
+        }
+        let ready = leader.ready();
+        leader.storage_mut().append(&ready.entries).unwrap();
+        leader.advance(&ready);
+
+        leader
+            .propose(bytes::Bytes::from_static(b"payload"))
+            .unwrap();
+        let ready = leader.ready();
+        let carried: Vec<u64> = ready.entries.iter().map(|entry| entry.index).collect();
+        let durable = leader.storage().last_index().unwrap();
+        for message in &ready.messages {
+            if let Message::AppendEntries { entries, .. } = message {
+                for entry in entries {
+                    assert!(
+                        entry.index <= durable || carried.contains(&entry.index),
+                        "an entry at {} was sent without being offered for persistence first",
+                        entry.index
+                    );
+                }
+            }
+        }
+        assert!(
+            !ready.entries.is_empty(),
+            "the proposal must be offered for persistence"
+        );
+    }
+
+    /// Rule 3: committed entries are either already durable or are in the same `Ready`'s entries,
+    /// which the driver has just written. A committed entry that appears in neither could be
+    /// applied and then lost.
+    #[test]
+    fn committed_entries_are_durable_or_carried_alongside() {
+        let mut group = Harness::new(&[1, 2, 3], 92);
+        group.campaign(1);
+        group.settle();
+
+        // Drive by hand so the Ready can be inspected before it is discharged.
+        group
+            .node_mut(1)
+            .propose(bytes::Bytes::from_static(b"x"))
+            .unwrap();
+        let node = group.node_mut(1);
+        let durable = node.storage().last_index().unwrap();
+        let ready = node.ready();
+        let carried: Vec<u64> = ready.entries.iter().map(|entry| entry.index).collect();
+        for entry in &ready.committed_entries {
+            assert!(
+                entry.index <= durable || carried.contains(&entry.index),
+                "committed entry {} is neither durable nor being persisted now",
+                entry.index
+            );
+        }
+    }
+
+    /// L1's timing: heartbeats go out on the heartbeat tick, not on the election tick.
+    #[test]
+    fn a_leader_sends_heartbeats_on_the_heartbeat_tick() {
+        let mut group = Harness::new(&[1, 2, 3], 93);
+        group.campaign(1);
+        group.settle();
+
+        let heartbeat_tick = 2;
+        for tick in 1..=heartbeat_tick {
+            group.node_mut(1).tick();
+            let ready = group.node_mut(1).ready();
+            let appends = ready
+                .messages
+                .iter()
+                .filter(|message| matches!(message, Message::AppendEntries { .. }))
+                .count();
+            if tick < heartbeat_tick {
+                assert_eq!(appends, 0, "a heartbeat went out early, on tick {tick}");
+            } else {
+                assert_eq!(appends, 2, "no heartbeat on the heartbeat tick");
+            }
+        }
     }
 
     #[test]

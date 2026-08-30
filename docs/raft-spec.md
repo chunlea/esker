@@ -54,7 +54,7 @@ Arguments: `term`, `candidateId`, `lastLogIndex`, `lastLogTerm`. Results: `term`
 
 | # | Rule | Implemented by | Tested by |
 |---|---|---|---|
-| R1 | If `commitIndex > lastApplied`, apply `log[++lastApplied]` to the state machine | `log::RaftLog::next_committed`, `raw_node::RawNode::{ready, advance}` | `committed_entries_are_handed_out_once_and_in_order` |
+| R1 | If `commitIndex > lastApplied`, apply `log[++lastApplied]` to the state machine | `log::RaftLog::next_committed`, `raw_node::RawNode::{ready, advance}` | `committed_entries_are_handed_out_once_and_in_order`, `nothing_is_offered_twice_after_advance`, `committed_entries_are_durable_or_carried_alongside` |
 | R2 | If a request or response carries `term > currentTerm`, set `currentTerm = term` and become a follower | `core::Raft::step_higher_term` | `an_append_from_an_older_term_is_answered_so_its_sender_learns`, `a_pre_vote_from_a_higher_term_does_not_move_this_node_s_term` (the §9.6 exception) |
 
 ### Followers
@@ -94,11 +94,11 @@ system, not of one function, so their "implemented by" is the argument, not a li
 
 | # | Property | Argued by | Checked by |
 |---|---|---|---|
-| P1 | **Election Safety** — at most one leader per term | V2 (a server votes once per term) plus quorum intersection | TBD (step 3 proptest, `esker-sim`) |
+| P1 | **Election Safety** — at most one leader per term | V2 (a server votes once per term) plus quorum intersection | `proptests::{three,five}_nodes_never_have_two_leaders_in_one_term`, `an_even_group_never_breaks_a_tie_by_electing_twice`; `esker-sim` |
 | P2 | **Leader Append-Only** — a leader never overwrites or deletes entries in its own log | leaders only append; truncation is a follower path (A3) | TBD (`esker-sim`) |
-| P3 | **Log Matching** — two logs agreeing at an index and term are identical up to it | A2's induction | TBD (`esker-sim`) |
+| P3 | **Log Matching** — two logs agreeing at an index and term are identical up to it | A2's induction | `testkit::Harness::check_log_matching`, run after every action of the proptests; `esker-sim` |
 | P4 | **Leader Completeness** — a committed entry is present in every future leader's log | V2's up-to-date check plus L4's term condition | TBD (`esker-sim`) |
-| P5 | **State Machine Safety** — no two servers apply different commands at the same index | P4 plus R1 | TBD (`esker-sim`) |
+| P5 | **State Machine Safety** — no two servers apply different commands at the same index | P4 plus R1 | `testkit::Harness::check_log_matching`'s committed-prefix half, run after every action of the proptests; `esker-sim` |
 
 ## 5. Log compaction and snapshots (dissertation §5)
 
@@ -126,6 +126,24 @@ Features from later chapters, each of which this crate implements.
 | X7b | Check-quorum, leader half: a leader without quorum contact steps down | §6.2 | TBD (step 6) | TBD (step 6) |
 | X8 | Pre-vote: a returning node does not bump the term to lose an election | §9.6 | `core::Raft::step_higher_term` (the exemption), `election::Raft::{campaign, become_pre_candidate}` | `a_pre_vote_from_a_higher_term_does_not_move_this_node_s_term`, `a_granted_pre_vote_records_no_vote`, `a_partitioned_node_running_pre_votes_never_raises_its_term`, `without_pre_vote_a_returning_node_deposes_the_leader`, `a_late_pre_vote_grant_does_not_count_toward_a_real_election` |
 | X9 | `ReadIndex`: linearizable reads without a log write | §6.4 | `readonly::ReadOnly` | TBD (step 4) |
+
+### The driver contract
+
+Not in Figure 3.1 at all, because the paper assumes a server that persists its own state. Splitting
+the decision from the I/O is what makes this crate simulatable, and it moves five rules out of the
+algorithm and into `Ready`'s documentation.
+
+| # | Rule | Implemented by | Tested by |
+|---|---|---|---|
+| D1 | Persist `hard_state` and `entries` before sending `messages` from the same `Ready` | `raw_node::Ready` (documentation), `testkit::Harness::drain_ready` (a driver that obeys it) | `the_ready_that_grants_a_vote_carries_the_vote_it_recorded`, `a_message_never_precedes_the_entries_it_depends_on`; violations are `esker-sim`'s to inject |
+| D2 | Apply `snapshot` before `entries` | `raw_node::RawNode::advance` | TBD (step 5) |
+| D3 | Apply `committed_entries` in order, exactly once | `raw_node::RawNode::{ready, advance}` | `committed_entries_are_durable_or_carried_alongside`, `nothing_is_offered_twice_after_advance` |
+| D4 | Answer a read only past its index | `readonly` | TBD (step 4) |
+| D5 | A `Ready` not advanced is re-offered unchanged | `raw_node::RawNode::ready` | `a_ready_that_is_not_advanced_is_offered_again` |
+
+D1 is also what makes the leader's own bookkeeping sound: a leader counts itself as holding an entry
+the moment it appends one, before any fsync, and that is safe only because no follower can
+acknowledge the entry until the leader has sent it, and it may not send until it has persisted.
 
 ## 7. What the dissertation leaves to the implementation
 

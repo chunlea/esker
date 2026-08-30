@@ -62,6 +62,13 @@ impl<S: LogStorage> Raft<S> {
     /// the outgoing leader has already established that the cluster is healthy and that this node
     /// should have it.
     pub(crate) fn campaign(&mut self, kind: CampaignKind) -> Result<()> {
+        // A leader campaigning against itself would depose itself for nothing. `campaign` is
+        // public, so this is a caller's mistake to absorb rather than a panic to inflict
+        // (`CLAUDE.md` invariant 9).
+        if self.role == Role::Leader {
+            tracing::debug!(id = self.id, "declined to campaign: already the leader");
+            return Ok(());
+        }
         // A learner, or a node a configuration change removed, has no business campaigning: it
         // cannot win, and the attempt would disturb a cluster that is fine without it.
         if !self.is_voter(self.id) {
