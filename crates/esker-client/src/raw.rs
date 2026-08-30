@@ -332,6 +332,10 @@ impl RawClient {
         };
 
         let mut attempts: u32 = 0;
+        // The region the last attempt was addressed to, so a refusal repairs the entry that
+        // produced it. Zero until one is routed: a resolver that failed named no region, and
+        // there is nothing cached to invalidate.
+        let mut region_id: u64 = 0;
         loop {
             if self.clock.now() >= deadline {
                 return Err(Error::DeadlineExceeded {
@@ -340,29 +344,38 @@ impl RawClient {
                 });
             }
 
-            let route = self.route(routing_key(request))?;
-            let target = route.target().ok_or_else(|| Error::NoRegion {
-                key: Bytes::copy_from_slice(routing_key(request)),
-            })?;
-            let wire = Request::raw_kv(
-                RequestHeader::new(route.region.id, route.region.epoch, target.peer_id),
-                request.clone(),
-            );
-
             attempts += 1;
-            let error = match self.transport.call(target.store_id, &wire, deadline) {
-                Ok(response) if response.method() == method => return Ok(response),
-                Ok(response) => return Err(unexpected(method, &response)),
+            // A resolver failure is not a routing answer: the placement driver could not say,
+            // which is usually momentary. It goes through the same classifier as a store's
+            // refusal so that "retryable" is decided in one place, by the protocol crate.
+            let error = match self.route(routing_key(request)) {
                 Err(error) => error,
+                Ok(route) => {
+                    let target = route.target().ok_or_else(|| Error::NoRegion {
+                        key: Bytes::copy_from_slice(routing_key(request)),
+                    })?;
+                    let wire = Request::raw_kv(
+                        RequestHeader::new(route.region.id, route.region.epoch, target.peer_id),
+                        request.clone(),
+                    );
+                    match self.transport.call(target.store_id, &wire, deadline) {
+                        Ok(response) if response.method() == method => return Ok(response),
+                        Ok(response) => return Err(unexpected(method, &response)),
+                        Err(error) => {
+                            region_id = route.region.id;
+                            error
+                        }
+                    }
+                }
             };
 
             match classify(&error) {
                 Verdict::Surface => {
-                    self.on_terminal(&error, route.region.id, routing_key(request));
+                    self.on_terminal(&error, region_id, routing_key(request));
                     return Err(terminal(error, method));
                 }
                 Verdict::Retry(redirect) => {
-                    self.repair(&redirect, route.region.id);
+                    self.repair(&redirect, region_id);
                     if attempts > self.options.retry.max_retries {
                         return Err(Error::RetriesExhausted {
                             attempts,
@@ -385,14 +398,24 @@ impl RawClient {
     }
 
     /// The cached route for `key`, or a fresh one from the resolver.
-    fn route(&self, key: &[u8]) -> Result<Route> {
+    ///
+    /// The three outcomes are three different things, and flattening any pair of them would cost
+    /// the caller something: a hit, a `GetRegion` that says no region covers the key — terminal,
+    /// because waiting does not create one — and a `GetRegion` that could not be answered, which
+    /// is the caller's to classify and usually to retry.
+    fn route(&self, key: &[u8]) -> std::result::Result<Route, ProtoError> {
         if let Some(route) = self.cache.lookup(key) {
             return Ok(route);
         }
-        // TODO(phase-4): this is `GetRegion(key)` over the wire to the placement driver; today
-        // it answers from a constant. Nothing above it changes when that lands.
-        let route = self.resolver.locate(key).ok_or_else(|| Error::NoRegion {
-            key: Bytes::copy_from_slice(key),
+        let route = self.resolver.locate(key)?.ok_or_else(|| {
+            // Not retryable, and the classifier agrees: `KeyNotInRegion` says this key belongs
+            // to no region the cluster admits to, which is what "no region covers it" is.
+            ProtoError::KeyNotInRegion {
+                key: Bytes::copy_from_slice(key),
+                region_id: 0,
+                start_key: Bytes::new(),
+                end_key: Bytes::new(),
+            }
         })?;
         self.cache.insert(route.clone());
         Ok(route)
@@ -424,9 +447,14 @@ impl RawClient {
     /// `KeyNotInRegion` is not retryable — waiting cannot fix a routing mistake — but it does
     /// prove the cached region is a lie, and leaving it in place would make the caller's next
     /// call fail the same way.
+    ///
+    /// `region_id == 0` is the resolver's own refusal: nothing was cached, so there is nothing
+    /// to drop, and only the key is swept.
     fn on_terminal(&self, error: &ProtoError, region_id: u64, key: &[u8]) {
         if matches!(error, ProtoError::KeyNotInRegion { .. }) {
-            self.cache.invalidate(region_id);
+            if region_id != 0 {
+                self.cache.invalidate(region_id);
+            }
             self.cache.invalidate_key(key);
         }
     }

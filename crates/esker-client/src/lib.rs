@@ -40,7 +40,7 @@ pub mod wire;
 
 pub use error::{Error, Result};
 pub use raw::{ClientOptions, RawClient};
-pub use region_cache::{RegionCache, RegionResolver, Route, StaticRegion};
+pub use region_cache::{RegionCache, RegionResolver, RegionTable, Route, StaticRegion};
 pub use retry::{BACKOFF_BASE_MS, BACKOFF_MAX_MS, MAX_RETRIES, RetryPolicy, backoff_ms};
 pub use tcp::TcpStores;
 pub use transport::StoreTransport;

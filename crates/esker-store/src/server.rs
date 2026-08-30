@@ -794,6 +794,16 @@ impl Service for StoreService {
                         "Hello is handled by the connection, not by the store",
                     ));
                 }
+                // A store is not a placement driver. Answering anything but a refusal — even a
+                // helpful-looking one — would let a misconfigured client believe it had reached
+                // PD and route the whole cluster from a store's opinion.
+                Request::Pd { request, .. } => {
+                    return Err(ProtoError::invalid(format!(
+                        "{} is a placement-driver method; this is store {}",
+                        request.method().name(),
+                        store.store_id()
+                    )));
+                }
             };
 
             store

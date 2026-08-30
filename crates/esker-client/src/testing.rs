@@ -43,7 +43,9 @@ fn raw_body(request: &Request) -> Option<&RawKvReq> {
         Request::RawKv { request, .. } => Some(request),
         // A client never sends `Hello` through a rule — the transport handles it — and never
         // sends Raft traffic at all: that is store-to-store, on connections a client has none of.
-        Request::Hello(_) | Request::Raft(_) => None,
+        // A `Pd` request has no `RawKv` body and is not addressed to a region, so no rule
+        // written in terms of keys or regions can match one.
+        Request::Hello(_) | Request::Raft(_) | Request::Pd { .. } => None,
     }
 }
 

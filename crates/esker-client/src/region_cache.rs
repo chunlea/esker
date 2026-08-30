@@ -5,21 +5,26 @@
 //! therefore costs a redirect and never a wrong answer. That is what lets the cache be
 //! optimistic — it is repaired by the errors it causes.
 //!
-//! # One entry today, the real structure anyway
+//! # Keyed by `start_key`, walked backwards
 //!
-//! Phase 2 has one region, `["", "")`. Storing that in a `BTreeMap` keyed by `start_key`
-//! rather than in an `Option` is not ceremony: it is the only way the *lookup* is the real
-//! one, and the lookup is where the interesting mistake lives. An empty `end_key` means
-//! unbounded, so `b""` as an upper bound sorts before every key rather than after it — a map
-//! keyed by `end_key`, which is the obvious choice, gets the last region wrong forever. This
-//! one is keyed by `start_key` and walks backwards, which has no such case.
+//! An empty `end_key` means unbounded, so `b""` as an upper bound sorts *before* every key
+//! rather than after it — a map keyed by `end_key`, which is the obvious choice and the one
+//! `TiKV` uses with a sentinel maximum it does not have here, gets the last region of the cluster wrong
+//! for ever. This one is keyed by `start_key` and walks back to the last region starting at or
+//! before the key, then checks that the region actually reaches it. Same lookup, same cost, no
+//! such case (`docs/plans/phase-4.md` §10).
 //!
 //! # The refresh hook
 //!
 //! A miss asks a [`RegionResolver`], which is `GetRegion(key) → Region + leader hint` from
-//! `docs/DESIGN.md` §7 with the network taken out. Phase 2 answers from
-//! [`StaticRegion`]; phase 4 replaces it with a call to the placement driver and nothing
-//! above it changes.
+//! `docs/DESIGN.md` §7 with the network taken out. [`StaticRegion`] answers for one region and
+//! [`RegionTable`] for a routing table; the placement driver's client answers for a cluster, and
+//! nothing above the trait changes when it does.
+//!
+//! **`Ok(None)` and `Err` are different answers and the difference matters.** `Ok(None)` is *no
+//! region covers this key* — a routing failure the caller reports and does not retry. `Err` is
+//! *the placement driver could not say*, which is retryable, and collapsing it into `Ok(None)`
+//! would turn a momentary PD outage into a terminal error on every call in the process.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -27,7 +32,7 @@ use std::sync::RwLock;
 
 use bytes::Bytes;
 
-use crate::wire::{Epoch, Peer, Region};
+use crate::wire::{Epoch, Peer, ProtoError, Region};
 
 /// A region and the peer the client currently believes leads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,9 +65,16 @@ impl Route {
 pub trait RegionResolver: fmt::Debug + Send + Sync {
     /// Finds the region owning `key`, and the leader hint that came with it.
     ///
-    /// Returning `None` means no region covers the key, which the caller turns into
-    /// [`crate::Error::NoRegion`]. It is a routing failure, not a missing key.
-    fn locate(&self, key: &[u8]) -> Option<Route>;
+    /// `Ok(None)` means no region covers the key, which the caller turns into
+    /// [`crate::Error::NoRegion`]. It is a routing failure, not a missing key, and not something
+    /// waiting fixes.
+    ///
+    /// `Err` means the placement driver could not answer — it is unreachable, or busy, or this
+    /// process is not bootstrapped yet. That is a different thing, it is often retryable, and the
+    /// caller decides which by asking [`ProtoError::is_retryable`]. An implementation that
+    /// reported it as `Ok(None)` would make every call in the process fail terminally for as long
+    /// as PD was away.
+    fn locate(&self, key: &[u8]) -> Result<Option<Route>, ProtoError>;
 }
 
 /// The whole key space, one region, one peer — phase 2's answer to every lookup.
@@ -121,10 +133,65 @@ impl StaticRegion {
 }
 
 impl RegionResolver for StaticRegion {
-    fn locate(&self, key: &[u8]) -> Option<Route> {
-        // TODO(phase-4): ask the placement driver instead of answering from a constant. The
-        // shape of the answer does not change, which is the point of this trait.
-        self.route.region.contains(key).then(|| self.route.clone())
+    fn locate(&self, key: &[u8]) -> Result<Option<Route>, ProtoError> {
+        Ok(self.route.region.contains(key).then(|| self.route.clone()))
+    }
+}
+
+/// A routing table: many regions, answered by range — the shape a placement driver replies in.
+///
+/// A client given a static topology uses it directly; a test uses it to drive the cache's
+/// multi-region paths without a placement driver. It is the same lookup [`RegionCache`] performs,
+/// deliberately: a resolver that answered by a different rule than the cache it fills would make
+/// the cache's correctness depend on which of the two was asked.
+#[derive(Debug, Default)]
+pub struct RegionTable {
+    by_start: BTreeMap<Bytes, Route>,
+}
+
+impl RegionTable {
+    /// A table covering nothing.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A table over `routes`, whatever order they arrive in.
+    #[must_use]
+    pub fn from_routes<I: IntoIterator<Item = Route>>(routes: I) -> Self {
+        let mut table = Self::new();
+        for route in routes {
+            table.insert(route);
+        }
+        table
+    }
+
+    /// Adds or replaces the region beginning where `route` begins.
+    pub fn insert(&mut self, route: Route) {
+        self.by_start.insert(route.region.start_key.clone(), route);
+    }
+
+    /// How many regions it covers.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.by_start.len()
+    }
+
+    /// Whether it covers none.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_start.is_empty()
+    }
+}
+
+impl RegionResolver for RegionTable {
+    fn locate(&self, key: &[u8]) -> Result<Option<Route>, ProtoError> {
+        Ok(self
+            .by_start
+            .range(..=Bytes::copy_from_slice(key))
+            .next_back()
+            .filter(|(_, route)| route.region.contains(key))
+            .map(|(_, route)| route.clone()))
     }
 }
 
@@ -261,8 +328,8 @@ fn overlaps(left: &Region, right: &Region) -> bool {
 mod tests {
     use bytes::Bytes;
 
-    use super::{RegionCache, RegionResolver, Route, StaticRegion};
-    use crate::wire::{Epoch, Peer, Region};
+    use super::{RegionCache, RegionResolver, RegionTable, Route, StaticRegion};
+    use crate::wire::{Epoch, Peer, ProtoError, Region};
 
     fn route(id: u64, start: &[u8], end: &[u8], stores: &[u64]) -> Route {
         let peers: Vec<Peer> = stores
@@ -393,10 +460,13 @@ mod tests {
     #[test]
     fn the_static_resolver_answers_for_the_whole_key_space() {
         let resolver = StaticRegion::whole_key_space(1, 7, 70);
-        let route = resolver.locate(b"anything").expect("everything is covered");
+        let route = resolver
+            .locate(b"anything")
+            .unwrap()
+            .expect("everything is covered");
         assert_eq!(route.region.id, 1);
         assert_eq!(route.target().map(|p| p.store_id), Some(7));
-        assert!(resolver.locate(b"").is_some());
+        assert!(resolver.locate(b"").unwrap().is_some());
 
         // A resolver whose region does not cover the key says so rather than guessing.
         let narrow = StaticRegion::new(Route {
@@ -409,7 +479,71 @@ mod tests {
             },
             leader: None,
         });
-        assert!(narrow.locate(b"m").is_some());
-        assert!(narrow.locate(b"z").is_none());
+        assert!(narrow.locate(b"m").unwrap().is_some());
+        assert!(narrow.locate(b"z").unwrap().is_none());
+    }
+
+    /// A routing table answers by the same rule the cache looks up by, including the case the
+    /// whole structure exists for: the last region's end key is empty, and a key above every
+    /// region's start belongs to it.
+    #[test]
+    fn a_routing_table_answers_across_a_split_key_space() {
+        let table = RegionTable::from_routes([
+            route(1, b"", b"g", &[1]),
+            route(2, b"g", b"q", &[2]),
+            route(3, b"q", b"", &[3]),
+        ]);
+        assert_eq!(table.len(), 3);
+        assert!(!table.is_empty());
+
+        for (key, expected) in [
+            (&b""[..], 1),
+            (b"f\xff", 1),
+            (b"g", 2),
+            (b"q", 3),
+            (b"\xff\xff\xff", 3),
+        ] {
+            assert_eq!(
+                table.locate(key).unwrap().map(|r| r.region.id),
+                Some(expected),
+                "key {key:?}"
+            );
+        }
+    }
+
+    /// A gap is not a region. A table that answered with the region below the key would send a
+    /// request to a store that would refuse it with `KeyNotInRegion` — one round trip to learn
+    /// what the table already knew.
+    #[test]
+    fn a_routing_table_says_no_rather_than_guessing() {
+        let table =
+            RegionTable::from_routes([route(1, b"", b"g", &[1]), route(3, b"q", b"", &[3])]);
+        assert!(table.locate(b"j").unwrap().is_none());
+        assert!(table.locate(b"g").unwrap().is_none());
+        assert!(RegionTable::new().locate(b"anything").unwrap().is_none());
+    }
+
+    /// `Ok(None)` and `Err` are different answers. A resolver that reported an unreachable
+    /// placement driver as "no region covers this key" would turn a momentary outage into a
+    /// terminal error on every call in the process, because the first is retryable and the
+    /// second is not.
+    #[test]
+    fn an_unanswerable_lookup_is_not_the_same_as_an_uncovered_key() {
+        #[derive(Debug)]
+        struct Unreachable;
+        impl RegionResolver for Unreachable {
+            fn locate(&self, _: &[u8]) -> Result<Option<Route>, ProtoError> {
+                Err(ProtoError::ServerIsBusy {
+                    reason: "the placement driver is not answering".to_owned(),
+                })
+            }
+        }
+
+        let error = Unreachable.locate(b"k").unwrap_err();
+        assert!(error.is_retryable(), "an outage is worth waiting out");
+        assert!(
+            RegionTable::new().locate(b"k").unwrap().is_none(),
+            "an uncovered key is an answer, not a failure"
+        );
     }
 }
