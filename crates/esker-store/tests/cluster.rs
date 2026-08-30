@@ -111,14 +111,18 @@ async fn settled_leader(nodes: &[Node]) -> usize {
         }
         if let Some(Some(leader)) = beliefs.first().copied() {
             let unanimous = beliefs.iter().all(|belief| *belief == Some(leader));
-            let Ok(at) = usize::try_from(leader - 1) else {
-                continue;
-            };
-            if unanimous
-                && at < nodes.len()
-                && nodes[at].store.peer().unwrap().status().await.unwrap().role == Role::Leader
-            {
-                return at;
+            // Found by peer id rather than by arithmetic on the index: a test that has removed a
+            // node no longer has `index == id - 1`, and assuming it does is how this helper
+            // spins for ever looking at the wrong node.
+            let at = nodes
+                .iter()
+                .position(|node| node.store.peer().unwrap().peer_id() == leader);
+            if let Some(at) = at {
+                if unanimous
+                    && nodes[at].store.peer().unwrap().status().await.unwrap().role == Role::Leader
+                {
+                    return at;
+                }
             }
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -383,6 +387,135 @@ async fn a_compare_and_swap_over_the_wire_is_ordered_by_raft() {
         assert_eq!(stored.as_deref(), Some(&b"first"[..]));
     }
     shutdown(nodes).await;
+}
+
+/// **Killing the leader loses nothing.** Writes are acknowledged, the leader is stopped, the
+/// remaining two elect a new one — and every write that was acknowledged is still there.
+///
+/// This is `CLAUDE.md` invariant 1 at the consensus layer. An acknowledgement means the command
+/// applied on this peer, which means it committed, which means a quorum had it durably — so the
+/// two survivors are a quorum and at least one of them must hold every acknowledged write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_acknowledged_write_is_lost_when_the_leader_is_killed() {
+    let mut nodes = start_cluster(3).await;
+    let leader = settled_leader(&nodes).await;
+
+    // Acknowledged writes: each `propose` returns only once the command has applied.
+    let mut acknowledged = Vec::new();
+    for index in 0..12_u32 {
+        let key = format!("acked-{index:02}");
+        nodes[leader]
+            .store
+            .peer()
+            .unwrap()
+            .propose(&Command::Put {
+                key: Bytes::from(key.clone().into_bytes()),
+                value: Bytes::from(index.to_be_bytes().to_vec()),
+            })
+            .await
+            .unwrap();
+        acknowledged.push((key, index));
+    }
+
+    // Stop the leader: its driver thread, its ticker and its connections all go away, which is
+    // what a store dying looks like to the other two.
+    nodes[leader].store.stop();
+    let dead = nodes.remove(leader);
+    // The directory has to outlive the assertions below — the survivors do not need it, but
+    // dropping it here would delete a database a still-running peer might touch.
+    let Node { handle, dir, .. } = dead;
+    let _ = handle.shutdown().await;
+
+    // Two of three is still a quorum, so the survivors elect one of themselves.
+    let new_leader = settled_leader(&nodes).await;
+    assert_eq!(nodes.len(), 2);
+
+    // Every acknowledged write is on both survivors.
+    for node in &nodes {
+        for (key, value) in &acknowledged {
+            let stored = esker_store::rawkv::get(node.store.db(), key.as_bytes()).unwrap();
+            assert_eq!(
+                stored.as_deref(),
+                Some(&value.to_be_bytes()[..]),
+                "store {} lost the acknowledged write {key}",
+                node.store.store_id()
+            );
+        }
+    }
+
+    // And the cluster still takes writes.
+    nodes[new_leader]
+        .store
+        .peer()
+        .unwrap()
+        .propose(&Command::Put {
+            key: Bytes::from_static(b"after"),
+            value: Bytes::from_static(b"the-kill"),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        esker_store::rawkv::get(nodes[new_leader].store.db(), b"after")
+            .unwrap()
+            .as_deref(),
+        Some(&b"the-kill"[..])
+    );
+
+    drop(dir);
+    shutdown(nodes).await;
+}
+
+/// A minority cannot elect a leader or accept a write. Two of three stops is one survivor, which
+/// is not a quorum — and a store that kept serving on its own would be the split brain every
+/// other rule here exists to prevent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lone_survivor_cannot_serve() {
+    let mut nodes = start_cluster(3).await;
+    let leader = settled_leader(&nodes).await;
+    nodes[leader]
+        .store
+        .peer()
+        .unwrap()
+        .propose(&Command::Put {
+            key: Bytes::from_static(b"before"),
+            value: Bytes::from_static(b"the-kill"),
+        })
+        .await
+        .unwrap();
+
+    // Stop two, keeping whichever was not the leader last.
+    let survivor_at = (leader + 2) % 3;
+    let mut survivor = None;
+    for (at, node) in nodes.drain(..).enumerate() {
+        if at == survivor_at {
+            survivor = Some(node);
+        } else {
+            node.store.stop();
+            let _ = node.handle.shutdown().await;
+        }
+    }
+    let survivor = survivor.unwrap();
+
+    // It campaigns and never wins: one of three is not a majority.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let status = survivor.store.peer().unwrap().status().await.unwrap();
+    assert_ne!(status.role, Role::Leader, "one of three elected itself");
+
+    // And it refuses a write rather than accepting one it could never commit.
+    let error = survivor
+        .store
+        .peer()
+        .unwrap()
+        .propose(&Command::Put {
+            key: Bytes::from_static(b"lonely"),
+            value: Bytes::from_static(b"v"),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(error, esker_proto::ProtoError::NotLeader { .. }));
+
+    survivor.store.stop();
+    let _ = survivor.handle.shutdown().await;
 }
 
 /// A linearizable read on the leader comes back at an index the state machine has *already*

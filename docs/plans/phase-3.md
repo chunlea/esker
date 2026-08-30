@@ -355,15 +355,16 @@ to serve it.
 | 1 | `RaftLogStorage` over the engine's `raft` CF | `esker-store/src/raft_log.rs` | **done** |
 | 2 | The driver: `RawNode` + the `Ready` loop, on its own thread | `esker-store/src/peer.rs` | **done** |
 | 3 | The apply loop: committed entries → data CFs + `apply_index`, one batch | `esker-store/src/apply.rs` | **done** |
-| 4 | Transport: `RaftTransport::Batch` over `esker-proto` | `esker-proto/src/raft.rs`, `esker-store/src/transport.rs` | to do |
-| 5 | Leader-only serving, `NotLeader` redirects, `ReadIndex` reads; the client learns leaders | `esker-store/src/server.rs`, `esker-client/src/**` | to do |
-| 6 | `esker-cli cluster start --nodes 3` / `cluster stop` | `esker-cli/src/cluster.rs` | to do |
-| 7 | The store-level test spine | `esker-store/tests/**` | to do |
+| 4 | Transport: `RaftTransport::Batch` over `esker-proto` | `esker-proto/src/raft.rs`, `esker-store/src/transport.rs` | **done** |
+| 5 | Leader-only serving, `NotLeader` redirects, `ReadIndex` reads; the client learns leaders | `esker-store/src/server.rs`, `esker-client/src/**` | **done** |
+| 6 | `esker-cli cluster start --nodes 3` / `cluster stop` | `esker-cli/src/cluster.rs` | **done** |
+| 7 | The store-level test spine | `esker-store/tests/**` | **done** |
 
-Units 1–3 are the spine: a peer can now be started over a real database, elect itself, replicate,
-apply commands to the data column families and answer a linearizable read — everything except
-reaching another process. What remains is the network (unit 4), the request path in front of it
-(unit 5), the way to start three of them (unit 6), and the cross-process tests (unit 7).
+All seven landed. Three stores hold one region over real TCP: they elect a leader with no help,
+a write proposed on the leader reaches every peer's data column family, a follower redirects with
+the hint a client acts on, a `ReadIndex` read is answered past its apply, and killing the leader
+loses no acknowledged write. `esker cluster start --nodes 3` starts it as three processes and the
+phase-2 `raw` commands work against it from any entry point.
 
 ### 11.2 The five decisions worth writing down before the code
 
@@ -430,7 +431,31 @@ the read's own position in the order. The driver holds the read until `applied_i
    entries are written in one batch, so they agree — but a torn tail could still leave the record
    describing entries that are not there, and seeking to the end costs one iterator.
 
-### 11.5 Non-goals for 3e
+### 11.5 What units 4–7 changed against the plan
+
+6. **`esker-proto` depends on `esker-raft`** and the wire carries the real `Message`
+   ([ADR 0009](../adr/0009-the-wire-carries-the-raft-message.md)). §11.1 left the type open; a
+   mirrored enum would be a second place to keep thirty-odd fields in step, and the drift would be
+   silent. Adding the variant produced five non-exhaustive-match errors, which is the property the
+   ADR argues for.
+
+7. **A replicated region lists every peer, and the client connects to every store.** The plan
+   assumed unit 5 was server-side only, because phase 2 had already built the region cache to learn
+   leaders from `NotLeader` hints. It had — and the hint names a *peer*, so a one-peer region and a
+   one-entry address book meant the client learned which peer led and had no way to reach it.
+   Found by running `esker cluster start` and watching `raw` give up after nine attempts.
+
+8. **`RaftPeer::propose` takes a `Command`; `esker raw --addr` is repeatable.** Both are the same
+   shape of fix — making the type or the interface carry what correctness needs, rather than
+   documenting it.
+
+9. **Test timing is not free.** Seven three-node clusters in one process with a 5 ms tick is enough
+   contention to delay a tick past an election timeout, and leadership churns; 25 ms leaves
+   headroom. The leader helper waits for the cluster to *agree* rather than for one node to claim
+   office, and finds that node by peer id — assuming `index == id - 1` breaks the moment a test
+   removes a node, which is exactly what the leader-kill test does.
+
+### 11.6 Non-goals for 3e
 
 - **Snapshot bytes.** The core's `InstallSnapshot` metadata path is done; streaming the region's
   SSTs is phase 4, and a single region that never compacts its raft log never needs one. The send
