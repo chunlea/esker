@@ -577,7 +577,13 @@ fn a_tombstone_survives_a_flush_that_leaves_the_value_behind() {
 #[test]
 fn overlapping_l0_files_are_read_newest_first() {
     let (_, fs) = memfs();
-    let db = open(&fs, options(), &[cf::DEFAULT]).unwrap();
+    // Four L0 files is exactly the default compaction trigger, so the background pool is
+    // entitled to merge them away before the count below is read — and on a loaded machine it
+    // does. What this test is about is the order a read consults overlapping L0 files in, not
+    // when compaction fires, so the trigger goes out of reach and the files stay put.
+    let mut options = options();
+    options.cf_options.level0_file_num_compaction_trigger = 100;
+    let db = open(&fs, options, &[cf::DEFAULT]).unwrap();
     for generation in 0..4u32 {
         for i in 0..10u32 {
             db.put(
