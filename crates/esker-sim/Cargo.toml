@@ -20,6 +20,9 @@ thiserror.workspace = true
 # DESIGN.md §11 requires the linearizability checker to be proven both ways: a generated
 # legal history must pass and a generated illegal one must fail. That is a property test.
 proptest.workspace = true
+# `tests/stateright_raft.rs`: sub-phase 3c, an exhaustive model of a 3-node cluster. Dev-only,
+# so it is outside the runtime dependency budget (`deny.toml` sets `exclude-dev`).
+stateright.workspace = true
 
 [lints]
 workspace = true
