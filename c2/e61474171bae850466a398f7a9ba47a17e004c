@@ -1,0 +1,42 @@
+crates/esker-client/tests/txn.rs
+  h_44076b318daf9c 1-810
+crates/esker-client/src/tcp.rs
+  h_44076b318daf9c 113
+crates/esker-proto/tests/messages.rs
+  h_44076b318daf9c 13,423-470
+crates/esker-proto/src/txn.rs
+  h_44076b318daf9c 108-189,524-538,566-568,585-589,609-617,666,818-859,877-885
+crates/esker-client/src/txn.rs
+  h_44076b318daf9c 1-681
+crates/esker-client/src/error.rs
+  h_44076b318daf9c 85-117,141-152
+crates/esker-proto/src/lib.rs
+  h_44076b318daf9c 63
+crates/esker-client/src/lib.rs
+  h_44076b318daf9c 35,40,47,50
+crates/esker-proto/tests/golden/messages.hex
+  h_44076b318daf9c 86-89,104-110
+crates/esker-client/src/raw.rs
+  h_44076b318daf9c 3-4,16,18-19,21,23,28,46,54,61,67-73,225,228-229,235-240
+crates/esker-client/src/wire.rs
+  h_44076b318daf9c 27,31-128
+docs/plans/phase-5.md
+  h_44076b318daf9c 186-190,195-230
+crates/esker-client/src/router.rs
+  h_44076b318daf9c 1-385
+docs/adr/0016-txnkv-on-the-wire.md
+  h_44076b318daf9c 35-57
+crates/esker-client/src/testing.rs
+  h_44076b318daf9c 36-37,40-62,71-73,109,124,126-127,135-142,145-146,210-215,222,225,397-399,433,459,461-462,530
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "c2e61474171bae850466a398f7a9ba47a17e004c",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
