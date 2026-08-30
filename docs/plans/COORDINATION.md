@@ -100,6 +100,12 @@ One coordinator (Fable, herdr pane `COORD`) directing coding lanes. Phases are g
 
 ## Incidents
 
+- 2026-08-30 ~06:40 **ENGINE FINDING (phase-2 lane)**: DESIGN §4.7 claimed v1 rejects
+  multi-SST DeleteRange; the engine actually accepted every range and silently treated
+  it as a point delete at `begin`. Store works around it (ADR 0006: bounded scan +
+  point deletes, atomic). Ruling: engine now REFUSES DeleteRange in v1 with a typed
+  error until phase-5 range tombstones; fix + regression assigned to `wy-p2-proto`
+  under a one-time engine-write grant.
 - 2026-08-30 ~04:50: watcher blind spot — a lane whose turn ended at 4:23 with a leftover
   shell kept reporting `working`, so the coordinator missed ~25 idle minutes. Watcher now
   also detects the "· done H:MM" footer. Lesson: agent_status alone does not mean the
