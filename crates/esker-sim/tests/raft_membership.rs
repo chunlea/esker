@@ -120,8 +120,26 @@ fn membership_changes_under_faults_hold_every_property() {
 /// ```text
 /// cargo test -p esker-sim --release --test raft_membership -- --ignored --nocapture
 /// ```
+///
+/// # This run is currently RED, and deliberately so
+///
+/// `ESKER_SIM_SEED=41213` reaches a state where two nodes hold the *same log* — five entries,
+/// the conf-change that adds server 5 at index 5, nothing compacted, neither truncated — and
+/// their cores disagree about the membership: node 2's has the change, node 1's does not. The
+/// driver's derivation matches node 2's core exactly, so this is not the harness losing a
+/// change; it is one core losing a change that is still in its own log.
+///
+/// The shape that produces it is visible in node 1's log: index 2 and index 5 hold the *same*
+/// conf change, so it was appended, taken away by a truncation, and re-appended. `ConfTracker`
+/// pops appended changes at or above a truncation point and re-records them from the entries an
+/// append carries; a re-append that does not carry the conf-change entry again — because the
+/// prefix already matched — would pop the change and never put it back. That is a reading, not
+/// a diagnosis: it is the core lane's to adjudicate, and this test is the reproduction.
+///
+/// The default sweep above does not reach it and stays green, so this is a finding on the
+/// acceptance gate rather than a broken build.
 #[test]
-#[ignore = "the thousands-of-seeds membership run"]
+#[ignore = "the thousands-of-seeds membership run; currently RED on seed 41213, see above"]
 fn thousands_of_membership_seeds() {
     let mut changes = 0;
     let mut joins = 0;
