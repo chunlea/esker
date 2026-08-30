@@ -190,7 +190,7 @@ impl<S: LogStorage> Raft<S> {
     /// Rebuilds the progress map from the current configuration, keeping what is still known about
     /// peers that survived the change.
     pub(crate) fn rebuild_progress(&mut self) -> Result<()> {
-        let next = self.log.last_index()? + 1;
+        let next = self.log.last_index()?.saturating_add(1);
         let conf = self.conf.current().clone();
         for id in conf.members() {
             let is_learner = conf.is_learner(id);
@@ -283,9 +283,19 @@ impl<S: LogStorage> Raft<S> {
                 tracing::warn!(id = self.id, %error, "could not send heartbeats");
             }
         }
-        if self.check_quorum && self.election_elapsed >= self.randomized_election_timeout {
+        if self.election_elapsed >= self.randomized_election_timeout {
             self.election_elapsed = 0;
-            // TODO(step-6): check quorum, step down without one.
+            // A transfer gets one election timeout. Giving up on it matters as much as starting
+            // it: the leader refuses proposals while one is in flight.
+            self.abort_transfer();
+            if self.check_quorum && !self.check_quorum_active() {
+                tracing::info!(
+                    id = self.id,
+                    term = self.term,
+                    "stepping down: no quorum contact within an election timeout"
+                );
+                self.become_follower(self.term, None);
+            }
         }
     }
 
@@ -482,17 +492,7 @@ impl<S: LogStorage> Raft<S> {
                 }
                 self.handle_install_snapshot(from, snapshot)
             }
-            other @ Message::TimeoutNow { .. } => {
-                // TODO(step-6): leadership transfer.
-                tracing::trace!(
-                    id = self.id,
-                    term = self.term,
-                    message = other.kind_name(),
-                    from = other.sender(),
-                    "message accepted; handler not implemented yet"
-                );
-                Ok(())
-            }
+            Message::TimeoutNow { from, .. } => self.handle_timeout_now(from),
         }
     }
 }

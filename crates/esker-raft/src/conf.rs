@@ -12,9 +12,6 @@
 //! pushes, truncating pops, and committing folds the settled prefix into the base
 //! (`docs/plans/phase-3.md` §6 race 3).
 
-// TODO(step-6): step-6 (membership) is the first caller of the mutators here.
-#![allow(dead_code)]
-
 use crate::types::{ConfChange, ConfState, Index};
 
 /// The configuration, plus enough history to undo the part that is not committed yet.
@@ -92,5 +89,326 @@ impl ConfTracker {
         self.base = conf;
         self.base_index = index;
         self.appended.clear();
+    }
+}
+
+use crate::core::{Raft, Role};
+use crate::error::{RaftError, Result as RaftResult};
+use crate::storage::LogStorage;
+use crate::types::{Entry, EntryKind};
+
+impl<S: LogStorage> Raft<S> {
+    /// Proposes a single-server membership change, applying it to this node the moment the entry
+    /// is appended.
+    pub(crate) fn propose_conf_change(&mut self, change: &ConfChange) -> RaftResult<Index> {
+        if self.role != Role::Leader {
+            return Err(RaftError::NotLeader);
+        }
+        if let Some(at) = self.conf.pending() {
+            return Err(RaftError::ConfChangePending(at));
+        }
+        if let Some(target) = self.lead_transferee {
+            return Err(RaftError::LeadershipTransferInProgress(target));
+        }
+        // Removing the last voter would leave a group nothing could ever commit in.
+        let mut after = self.conf.current().clone();
+        change.apply_to(&mut after);
+        if after.voters.is_empty() {
+            return Err(RaftError::InvalidConfig(
+                "a configuration change may not remove the last voter".into(),
+            ));
+        }
+        self.propose_entry(EntryKind::ConfChange, change.encode())
+    }
+
+    /// Applies the configuration carried by any `ConfChange` entries in `entries`.
+    ///
+    /// Called from both append paths — the leader's and the follower's — because §4.1's rule is
+    /// about *appending*, and both of them append.
+    pub(crate) fn record_conf_changes(&mut self, entries: &[Entry]) -> RaftResult<()> {
+        let mut moved = false;
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::ConfChange)
+        {
+            // The bytes came off a log that may have lied; a corrupt payload is an error value,
+            // never a panic (`CLAUDE.md` invariant 9).
+            let change = ConfChange::decode(&entry.data)?;
+            let before = self.conf.current().clone();
+            self.conf.append(entry.index, &change);
+            moved |= *self.conf.current() != before;
+            tracing::debug!(
+                id = self.id,
+                index = entry.index,
+                node = change.node,
+                kind = ?change.kind,
+                "applied a configuration change at append time"
+            );
+        }
+        if moved {
+            self.rebuild_progress()?;
+        }
+        Ok(())
+    }
+
+    /// Reverts every configuration change appended at or above `index` — the truncation path.
+    pub(crate) fn revert_conf_to(&mut self, index: Index) -> RaftResult<()> {
+        if self.conf.truncate_from(index) {
+            tracing::debug!(
+                id = self.id,
+                index,
+                "reverted a configuration that was truncated away"
+            );
+            self.rebuild_progress()?;
+        }
+        Ok(())
+    }
+
+    /// Folds every configuration change at or below the commit index into the base, so it can no
+    /// longer be undone.
+    pub(crate) fn advance_conf_commit(&mut self) {
+        self.conf.commit_to(self.log.committed);
+    }
+
+    /// A leader that a committed configuration change has removed steps down (§4.2.2).
+    ///
+    /// It cannot be a *correct* leader any more: the quorum it would count is a quorum of a group
+    /// it is no longer in. Staying would let it serve reads from a cluster that has moved on.
+    pub(crate) fn step_down_if_removed(&mut self) {
+        if self.role == Role::Leader && !self.is_voter(self.id) {
+            tracing::info!(
+                id = self.id,
+                term = self.term,
+                "stepping down: a committed configuration change removed this node"
+            );
+            self.become_follower(self.term, None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use crate::config::Config;
+    use crate::core::Role;
+    use crate::error::RaftError;
+    use crate::message::Message;
+    use crate::raw_node::RawNode;
+    use crate::storage::MemStorage;
+    use crate::testkit::Harness;
+    use crate::types::{ConfChange, ConfChangeKind, ConfState, Entry, EntryKind, HardState};
+
+    fn add_voter(node: u64) -> ConfChange {
+        ConfChange::new(ConfChangeKind::AddVoter, node)
+    }
+
+    /// **§4.1, the rule that makes single-server changes safe.** The configuration takes effect
+    /// when the entry is *appended*, not when it commits — so the change is visible on the leader
+    /// before any follower has acknowledged it.
+    #[test]
+    fn a_configuration_applies_when_its_entry_is_appended() {
+        let mut group = Harness::with_config(&[1, 2, 3], 301, |config| config.check_quorum = false);
+        group.campaign(1);
+        group.settle();
+        assert_eq!(group.node(1).status().conf.voters, vec![1, 2, 3]);
+
+        // Propose without settling: nothing has acknowledged the entry, so it is not committed.
+        group.node_mut(1).propose_conf_change(add_voter(4)).unwrap();
+        assert_eq!(
+            group.node(1).status().conf.voters,
+            vec![1, 2, 3, 4],
+            "the configuration must be in force before the entry commits"
+        );
+        assert!(group.node(1).commit_index() < group.node(1).status().last_index);
+    }
+
+    /// **Race 3.** The other side of the same rule: an uncommitted change that gets truncated has
+    /// to take its configuration with it, or the node counts a quorum over members that were never
+    /// added.
+    #[test]
+    fn a_truncated_configuration_change_reverts() {
+        let mut follower = RawNode::new(
+            Config::new(2, vec![1, 2, 3], 302),
+            MemStorage::with_conf_state(ConfState::from_voters(vec![1, 2, 3])),
+        )
+        .unwrap();
+
+        // A leader in term 1 appends "add voter 4"; this follower takes it, and the configuration
+        // changes on the spot.
+        follower
+            .step(Message::AppendEntries {
+                from: 1,
+                to: 2,
+                term: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![Entry::empty(1, 1), Entry::conf_change(1, 2, &add_voter(4))],
+                leader_commit: 1,
+                context: Bytes::new(),
+            })
+            .unwrap();
+        assert_eq!(follower.status().conf.voters, vec![1, 2, 3, 4]);
+        let ready = follower.ready();
+        follower.storage_mut().append(&ready.entries).unwrap();
+        follower.advance(&ready);
+
+        // That leader loses office. The new one's log has something else at index 2.
+        follower
+            .step(Message::AppendEntries {
+                from: 3,
+                to: 2,
+                term: 2,
+                prev_log_index: 1,
+                prev_log_term: 1,
+                entries: vec![Entry::empty(2, 2)],
+                leader_commit: 1,
+                context: Bytes::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            follower.status().conf.voters,
+            vec![1, 2, 3],
+            "a truncated configuration change must revert"
+        );
+    }
+
+    /// A committed change is settled: nothing can truncate it any more, so it stops being
+    /// revertible and a second change becomes proposable.
+    #[test]
+    fn a_committed_change_settles_and_lets_the_next_one_through() {
+        let mut group = Harness::with_config(&[1, 2, 3], 303, |config| config.check_quorum = false);
+        group.campaign(1);
+        group.settle();
+
+        group.node_mut(1).propose_conf_change(add_voter(4)).unwrap();
+        assert!(
+            matches!(
+                group.node_mut(1).propose_conf_change(add_voter(5)),
+                Err(RaftError::ConfChangePending(_))
+            ),
+            "overlapping single-server changes can produce two disjoint majorities"
+        );
+
+        group.settle();
+        // 4 does not exist in this harness, so the quorum is now 3 of 4: nodes 1, 2 and 3.
+        assert_eq!(group.commit_of(1), group.node(1).status().last_index);
+        assert!(group.node_mut(1).propose_conf_change(add_voter(5)).is_ok());
+    }
+
+    /// A learner replicates without voting, so adding one does not make elections harder while it
+    /// catches up (§4.2.1).
+    #[test]
+    fn a_learner_receives_the_log_without_joining_the_quorum() {
+        let mut group = Harness::with_config(&[1, 2, 3], 304, |config| config.check_quorum = false);
+        group.campaign(1);
+        group.settle();
+        group
+            .node_mut(1)
+            .propose_conf_change(ConfChange::new(ConfChangeKind::AddLearner, 4))
+            .unwrap();
+        group.settle();
+
+        let status = group.node(1).status();
+        assert_eq!(status.conf.voters, vec![1, 2, 3]);
+        assert_eq!(status.conf.learners, vec![4]);
+        assert_eq!(
+            status.conf.quorum(),
+            2,
+            "a learner does not raise the bar for a majority"
+        );
+    }
+
+    /// §4.2.2. A leader a committed change removed cannot be a correct leader: the quorum it would
+    /// count belongs to a group it is not in.
+    #[test]
+    fn a_leader_removed_by_a_committed_change_steps_down() {
+        let mut group = Harness::with_config(&[1, 2, 3], 305, |config| config.check_quorum = false);
+        group.campaign(1);
+        group.settle();
+
+        group
+            .node_mut(1)
+            .propose_conf_change(ConfChange::new(ConfChangeKind::Remove, 1))
+            .unwrap();
+        assert_eq!(
+            group.node(1).status().conf.voters,
+            vec![2, 3],
+            "applied at append"
+        );
+        group.settle();
+        assert_ne!(
+            group.node(1).role(),
+            Role::Leader,
+            "a removed leader must step down"
+        );
+    }
+
+    /// A change that would leave nothing able to commit is refused rather than accepted and
+    /// mourned.
+    #[test]
+    fn removing_the_last_voter_is_refused() {
+        let mut group = Harness::new(&[1], 306);
+        group.campaign(1);
+        group.settle();
+        assert!(matches!(
+            group
+                .node_mut(1)
+                .propose_conf_change(ConfChange::new(ConfChangeKind::Remove, 1)),
+            Err(RaftError::InvalidConfig(_))
+        ));
+    }
+
+    /// A restarting node takes its membership from its log — including an uncommitted change,
+    /// because §4.1 says the latest configuration in the log is the one in force.
+    #[test]
+    fn a_restart_recovers_the_configuration_from_storage() {
+        let mut storage = MemStorage::with_conf_state(ConfState::from_voters(vec![1, 2, 3]));
+        storage.append(&[Entry::empty(1, 1)]).unwrap();
+        storage.set_hard_state(HardState {
+            term: 1,
+            voted_for: None,
+            commit: 1,
+        });
+        storage.set_conf_state(ConfState {
+            voters: vec![1, 2, 3, 4],
+            learners: vec![5],
+        });
+
+        let node = RawNode::new(Config::new(1, vec![9, 9, 9], 307), storage).unwrap();
+        assert_eq!(node.status().conf.voters, vec![1, 2, 3, 4]);
+        assert_eq!(node.status().conf.learners, vec![5]);
+    }
+
+    /// Invariant 9: a corrupt `ConfChange` payload in the log is an error, not a panic.
+    #[test]
+    fn a_corrupt_configuration_entry_is_an_error() {
+        let mut follower = RawNode::new(
+            Config::new(2, vec![1, 2, 3], 308),
+            MemStorage::with_conf_state(ConfState::from_voters(vec![1, 2, 3])),
+        )
+        .unwrap();
+        let corrupt = Entry {
+            term: 1,
+            index: 1,
+            kind: EntryKind::ConfChange,
+            data: Bytes::from_static(b"\xff\x00"),
+        };
+        let outcome = follower.step(Message::AppendEntries {
+            from: 1,
+            to: 2,
+            term: 1,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![corrupt],
+            leader_commit: 0,
+            context: Bytes::new(),
+        });
+        assert!(matches!(outcome, Err(RaftError::CorruptConfChange(_))));
+        assert_eq!(
+            follower.status().conf.voters,
+            vec![1, 2, 3],
+            "and the configuration is intact"
+        );
     }
 }

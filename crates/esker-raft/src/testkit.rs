@@ -160,6 +160,11 @@ impl Harness {
         self.queue.len()
     }
 
+    /// The messages in flight, for a test that wants to see what a node sent without taking it.
+    pub(crate) fn pending_messages(&self) -> &[Message] {
+        &self.queue
+    }
+
     /// Delivers the message at `at`, removing it from the queue. Out-of-order delivery is the
     /// point: this is what lets a property test shuffle a network without owning one.
     pub(crate) fn deliver_one(&mut self, at: usize) {

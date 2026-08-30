@@ -81,7 +81,10 @@ impl<S: LogStorage> Raft<S> {
 
         let pre_vote = kind == CampaignKind::PreElection;
         // A pre-vote asks about the *next* term without adopting it; a real campaign adopts it.
-        let vote_term = self.term + 1;
+        // Saturating because a message off the network can carry any term at all, including the
+        // last one: a node that has been pushed to `Term::MAX` can never win another election, but
+        // it must not panic trying (`CLAUDE.md` invariant 9).
+        let vote_term = self.term.saturating_add(1);
         if pre_vote {
             self.become_pre_candidate();
         } else {
@@ -134,7 +137,7 @@ impl<S: LogStorage> Raft<S> {
     /// Adopts the next term and votes for itself (Figure 3.1, C1).
     pub(crate) fn become_candidate(&mut self) {
         debug_assert_ne!(self.role, Role::Leader, "a leader does not campaign");
-        let next = self.term + 1;
+        let next = self.term.saturating_add(1);
         self.reset(next);
         self.vote = Some(self.id);
         self.role = Role::Candidate;
@@ -167,7 +170,7 @@ impl<S: LogStorage> Raft<S> {
             );
         }
 
-        let index = last + 1;
+        let index = last.saturating_add(1);
         self.log.append(vec![Entry::empty(self.term, index)])?;
         if let Some(own) = self.progress.get_mut(self.id) {
             own.matched = index;

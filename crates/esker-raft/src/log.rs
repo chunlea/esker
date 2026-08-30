@@ -22,6 +22,19 @@ use crate::error::{RaftError, Result};
 use crate::storage::LogStorage;
 use crate::types::{Entry, Index, Snapshot, Term, offset};
 
+/// What a follower's append did to the log.
+///
+/// `truncated_from` is the part the caller above cannot work out for itself, and it matters: a
+/// configuration change takes effect when its entry is appended, so an entry that gets truncated
+/// has to take its configuration with it (dissertation §4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AppendOutcome {
+    /// The last index the log now holds from this batch.
+    pub(crate) last: Index,
+    /// The index truncation started at, if the batch replaced anything.
+    pub(crate) truncated_from: Option<Index>,
+}
+
 /// The Raft log: a durable prefix plus an unstable tail.
 #[derive(Debug)]
 pub(crate) struct RaftLog<S: LogStorage> {
@@ -186,7 +199,7 @@ impl<S: LogStorage> RaftLog<S> {
         prev_term: Term,
         committed: Index,
         entries: Vec<Entry>,
-    ) -> Result<Option<Index>> {
+    ) -> Result<Option<AppendOutcome>> {
         if !self.matches(prev_index, prev_term) {
             return Ok(None);
         }
@@ -194,6 +207,7 @@ impl<S: LogStorage> RaftLog<S> {
             .first()
             .map_or(prev_index.saturating_add(1), |entry| entry.index);
         let last_new = entries.last().map_or(prev_index, |entry| entry.index);
+        let mut truncated_from = None;
         if let Some(conflict) = self.find_conflict(&entries)? {
             if conflict <= self.committed {
                 // Rewriting a committed entry would break State Machine Safety. The only way to
@@ -204,11 +218,17 @@ impl<S: LogStorage> RaftLog<S> {
                 )));
             }
             let already_held = offset(conflict - first_new);
+            if conflict <= self.last_index()? {
+                truncated_from = Some(conflict);
+            }
             self.truncate_and_append(entries.into_iter().skip(already_held).collect());
         }
         // §5.3: a follower's commit index is the leader's, but never past what it actually holds.
         self.commit_to(committed.min(last_new))?;
-        Ok(Some(last_new))
+        Ok(Some(AppendOutcome {
+            last: last_new,
+            truncated_from,
+        }))
     }
 
     /// The first index in `entries` that disagrees with this log, or `None` if all of them either
@@ -423,7 +443,9 @@ mod tests {
     fn truncating_into_the_durable_prefix_shortens_the_log() {
         let mut log = log_with(&[(1, 1), (1, 2), (1, 3)]);
         assert_eq!(
-            log.maybe_append(1, 1, 0, entries(&[(2, 2)])).unwrap(),
+            log.maybe_append(1, 1, 0, entries(&[(2, 2)]))
+                .unwrap()
+                .map(|done| done.last),
             Some(2)
         );
         assert_eq!(log.last_index().unwrap(), 2);
@@ -458,7 +480,8 @@ mod tests {
         let mut log = log_with(&[(1, 1), (1, 2), (1, 3)]);
         assert_eq!(
             log.maybe_append(1, 1, 0, entries(&[(1, 2), (3, 3), (3, 4)]))
-                .unwrap(),
+                .unwrap()
+                .map(|done| done.last),
             Some(4)
         );
         assert_eq!(log.term(2).unwrap(), 1);
@@ -473,11 +496,14 @@ mod tests {
         let mut log = log_with(&[(1, 1)]);
         assert_eq!(
             log.maybe_append(1, 1, 0, entries(&[(1, 2), (1, 3)]))
-                .unwrap(),
+                .unwrap()
+                .map(|done| done.last),
             Some(3)
         );
         assert_eq!(
-            log.maybe_append(1, 1, 0, entries(&[(1, 2)])).unwrap(),
+            log.maybe_append(1, 1, 0, entries(&[(1, 2)]))
+                .unwrap()
+                .map(|done| done.last),
             Some(2)
         );
         assert_eq!(log.last_index().unwrap(), 3);

@@ -53,9 +53,14 @@ use crate::types::{
 ///    through its index.** The index is the point the read linearizes at; answering earlier
 ///    returns a state older than the read's own position in the order.
 ///
-/// 5. **Then call [`RawNode::advance`].** Nothing already returned is returned again. A `Ready`
-///    that is dropped without being advanced is re-offered unchanged, so a driver that crashes
-///    mid-discharge resumes rather than skips.
+/// 5. **Then call [`RawNode::advance`].** Nothing already returned is returned again.
+///
+///    A `Ready` that is dropped without being advanced re-offers its *state* — `hard_state`,
+///    `entries`, `snapshot`, `committed_entries` — so a driver that fails mid-discharge resumes
+///    rather than skips. Its `messages` are **taken**, and a dropped `Ready` loses them. That is
+///    deliberate and safe: the network may lose any message anyway, so Raft already retries
+///    everything it sends. It is only worth knowing because inspecting a `Ready` and discarding it
+///    is not free — the messages go with it.
 ///
 /// Sending before persisting is not a small violation with a small consequence. It is the
 /// difference between a cluster that survives a power cut and one that silently forgets.
@@ -142,12 +147,7 @@ impl<S: LogStorage> RawNode<S> {
         if self.raft.role != Role::Leader {
             return Err(RaftError::NotLeader);
         }
-        if let Some(at) = self.raft.conf.pending() {
-            return Err(RaftError::ConfChangePending(at));
-        }
-        let _ = change;
-        // TODO(step-6): encode, append, and apply the configuration at append time.
-        Ok(())
+        self.raft.propose_conf_change(&change).map(|_| ())
     }
 
     /// Requests a linearizable read.
@@ -180,9 +180,14 @@ impl<S: LogStorage> RawNode<S> {
     }
 
     /// Asks the leader to hand leadership to `target` (§3.10).
+    ///
+    /// A no-op anywhere but the leader, and on a leader asked to transfer to itself or to a node
+    /// that cannot vote. While a transfer is in flight the leader refuses proposals, and it
+    /// abandons the attempt after one election timeout.
     pub fn transfer_leader(&mut self, target: NodeId) {
-        let _ = target;
-        // TODO(step-6): leadership transfer.
+        if let Err(error) = self.raft.transfer_leader(target) {
+            tracing::warn!(%error, target, "could not begin a leadership transfer");
+        }
     }
 
     /// Whether there is anything for the driver to do.
@@ -524,6 +529,10 @@ mod tests {
         );
         let second = node.ready();
         assert_eq!(first.hard_state, second.hard_state);
+        assert!(
+            !first.messages.is_empty() && second.messages.is_empty(),
+            "state is re-offered; messages are taken once, which the contract says explicitly"
+        );
 
         node.advance(&second);
         assert!(node.ready().hard_state.is_none(), "advance settles it");

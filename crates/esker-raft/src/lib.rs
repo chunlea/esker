@@ -39,6 +39,7 @@ mod snapshot;
 mod storage;
 #[cfg(test)]
 mod testkit;
+mod transfer;
 mod types;
 
 pub use crate::config::{Config, MAX_SIZE_PER_MSG};

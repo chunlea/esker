@@ -119,13 +119,14 @@ Features from later chapters, each of which this crate implements.
 | # | Feature | Chapter | Implemented by | Tested by |
 |---|---|---|---|---|
 | X1 | Randomised election timeouts, redrawn per election | §3.4, §9.5 | `core::Raft::reset_election_timeout`, called from `reset` and `become_pre_candidate` | `nodes_sharing_a_seed_still_draw_different_election_timeouts`, `a_group_sharing_one_seed_still_elects_someone` |
-| X2 | **Membership change applied when the entry is appended, not committed** | §4.1 | `conf::ConfTracker::append` | TBD (step 6) |
-| X3 | An uncommitted membership change that is truncated reverts the configuration | §4.1 | `conf::ConfTracker::truncate_from` | TBD (step 6) |
-| X4 | One membership change at a time | §4.1 | `raw_node::RawNode::propose_conf_change` | TBD (step 6) |
-| X5 | Learners: replicate without voting or counting toward quorum | §4.2.1 | `types::ConfState::quorum` | `learners_do_not_count_toward_a_quorum` |
-| X6 | Leadership transfer via `TimeoutNow` | §3.10 | TBD (step 6) | TBD (step 6) |
+| X2 | **Membership change applied when the entry is appended, not committed** | §4.1 | `conf::Raft::record_conf_changes`, `conf::ConfTracker::append`, called from both append paths | **`a_configuration_applies_when_its_entry_is_appended`** |
+| X3 | An uncommitted membership change that is truncated reverts the configuration | §4.1 | `conf::Raft::revert_conf_to`, `log::AppendOutcome::truncated_from` | **`a_truncated_configuration_change_reverts`** |
+| X4 | One membership change at a time | §4.1 | `conf::Raft::propose_conf_change`, `conf::ConfTracker::pending` | `a_committed_change_settles_and_lets_the_next_one_through`, `removing_the_last_voter_is_refused` |
+| X4b | A leader a committed change removed steps down | §4.2.2 | `conf::Raft::step_down_if_removed` | `a_leader_removed_by_a_committed_change_steps_down` |
+| X5 | Learners: replicate without voting or counting toward quorum | §4.2.1 | `types::ConfState::quorum`, `election::Raft::{campaign, poll}`, `transfer::Raft::check_quorum_active` | `learners_do_not_count_toward_a_quorum`, `a_learner_receives_the_log_without_joining_the_quorum`, `a_learner_does_not_campaign`, `learners_do_not_count_toward_quorum_contact` |
+| X6 | Leadership transfer via `TimeoutNow` | §3.10 | `transfer::Raft::{transfer_leader, nudge_transferee, maybe_finish_transfer, abort_transfer, handle_timeout_now}` | `a_transfer_hands_office_to_a_current_follower`, `a_transferring_leader_refuses_proposals`, `a_lagging_target_is_caught_up_before_it_is_told_to_campaign`, `a_transfer_that_times_out_is_abandoned`, `timeout_now_campaigns_immediately_and_forces_past_the_lease` |
 | X7 | Check-quorum, voter half: a follower with a healthy leader refuses votes | §6.2 | `core::Raft::vetoed_by_leader_lease` | `check_quorum_makes_a_follower_refuse_a_vote_while_its_leader_is_healthy`, `a_forced_vote_request_is_not_vetoed_by_the_lease` |
-| X7b | Check-quorum, leader half: a leader without quorum contact steps down | §6.2 | TBD (step 6) | TBD (step 6) |
+| X7b | Check-quorum, leader half: a leader without quorum contact steps down | §6.2 | `transfer::Raft::check_quorum_active`, `core::Raft::tick_heartbeat` | `a_leader_without_quorum_contact_steps_down`, `a_leader_in_contact_with_a_majority_keeps_office`, `learners_do_not_count_toward_quorum_contact` |
 | X8 | Pre-vote: a returning node does not bump the term to lose an election | §9.6 | `core::Raft::step_higher_term` (the exemption), `election::Raft::{campaign, become_pre_candidate}` | `a_pre_vote_from_a_higher_term_does_not_move_this_node_s_term`, `a_granted_pre_vote_records_no_vote`, `a_partitioned_node_running_pre_votes_never_raises_its_term`, `without_pre_vote_a_returning_node_deposes_the_leader`, `a_late_pre_vote_grant_does_not_count_toward_a_real_election` |
 | X9 | `ReadIndex`: linearizable reads without a log write | §6.4 | `readonly::Raft::{read_index, record_read_ack, answer_read}` | `a_read_is_answered_at_the_commit_index_after_a_heartbeat_quorum`, `a_leader_without_a_quorum_answers_no_read`, `a_read_does_not_survive_a_change_of_leadership`, `an_earlier_round_completes_with_a_later_one` |
 | X9b | A leader postpones reads until an entry of **its own term** has committed — until then its commit index is inherited and unproven | §6.4 | `readonly::Raft::{has_committed_in_current_term, flush_postponed_reads}` | `a_read_waits_until_the_leader_has_committed_in_its_own_term` |
@@ -143,7 +144,7 @@ algorithm and into `Ready`'s documentation.
 | D2 | Apply `snapshot` before `entries` | `raw_node::RawNode::advance`, `testkit::Harness::drain_ready` | `a_snapshot_discards_an_unpersisted_tail`, `a_compacted_leader_sends_a_snapshot_and_waits_for_it` |
 | D3 | Apply `committed_entries` in order, exactly once | `raw_node::RawNode::{ready, advance}` | `committed_entries_are_durable_or_carried_alongside`, `nothing_is_offered_twice_after_advance` |
 | D4 | Answer a read only past its index | `readonly`, `raw_node::Ready::read_states` | the rule is the driver's; `testkit::Harness::drain_ready` records read states as a driver would, and `esker-sim` injects violations |
-| D5 | A `Ready` not advanced is re-offered unchanged | `raw_node::RawNode::ready` | `a_ready_that_is_not_advanced_is_offered_again` |
+| D5 | A `Ready` not advanced re-offers its state; its messages are taken once (losing a message is always safe — the network may lose one anyway) | `raw_node::RawNode::ready` | `a_ready_that_is_not_advanced_is_offered_again` |
 
 D1 is also what makes the leader's own bookkeeping sound: a leader counts itself as holding an entry
 the moment it appends one, before any fsync, and that is safe only because no follower can

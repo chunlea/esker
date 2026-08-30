@@ -33,13 +33,16 @@ impl<S: LogStorage> Raft<S> {
     /// Appends `data` as an entry of the current term and starts replicating it.
     pub(crate) fn propose_entry(&mut self, kind: EntryKind, data: Bytes) -> Result<Index> {
         debug_assert_eq!(self.role, Role::Leader, "only a leader appends");
-        let index = self.log.last_index()? + 1;
-        self.log.append(vec![Entry {
+        let index = self.log.last_index()?.saturating_add(1);
+        let entry = Entry {
             term: self.term,
             index,
             kind,
             data,
-        }])?;
+        };
+        self.log.append(vec![entry.clone()])?;
+        // §4.1: a configuration takes effect here, at the append, not when the entry commits.
+        self.record_conf_changes(&[entry])?;
         if let Some(own) = self.progress.get_mut(self.id) {
             own.maybe_update(index);
         }
@@ -173,17 +176,31 @@ impl<S: LogStorage> Raft<S> {
         self.leader = Some(from);
         self.election_elapsed = 0;
 
+        // Kept before the entries are consumed: §4.1 says a configuration takes effect when its
+        // entry is *appended*, so these have to be applied the moment the append succeeds.
+        let conf_changes: Vec<Entry> = entries
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::ConfChange)
+            .cloned()
+            .collect();
         let appended = self
             .log
             .maybe_append(prev_log_index, prev_log_term, leader_commit, entries);
         match appended {
-            Ok(Some(last)) => {
+            Ok(Some(outcome)) => {
+                // A truncated entry takes its configuration with it, or this node would count a
+                // quorum over members that were never added.
+                if let Some(from_index) = outcome.truncated_from {
+                    self.revert_conf_to(from_index)?;
+                }
+                self.record_conf_changes(&conf_changes)?;
+                self.advance_conf_commit();
                 self.send(Message::AppendEntriesResponse {
                     from: self.id,
                     to: from,
                     term: self.term,
                     reject: false,
-                    index: last,
+                    index: outcome.last,
                     hint_term: 0,
                     context,
                 });
@@ -324,6 +341,10 @@ impl<S: LogStorage> Raft<S> {
             }
         }
 
+        // A transfer target that has just caught up gets its `TimeoutNow` now rather than at the
+        // next tick.
+        self.maybe_finish_transfer(from)?;
+
         let last = self.log.last_index()?;
         if advanced && self.maybe_commit()? {
             // Every follower learns the new commit index from the next message either way; sending
@@ -385,6 +406,10 @@ impl<S: LogStorage> Raft<S> {
         }
 
         self.log.commit_to(candidate)?;
+        // A committed configuration change can no longer be truncated away, so it stops being
+        // revertible — and if it removed this node, this node stops leading (§4.2.2).
+        self.advance_conf_commit();
+        self.step_down_if_removed();
         // The first entry of this leader's term has just committed, which is what a postponed
         // read was waiting for.
         self.flush_postponed_reads()?;
