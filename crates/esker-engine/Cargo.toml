@@ -19,6 +19,12 @@ lz4_flex.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+[features]
+# Exposes `esker_engine::testing`, the fault-injecting FileSystem the crash tests of
+# DESIGN.md §11 need. Off by default: a normal build must not carry code whose job is to
+# break things. Enable it from a dev-dependency, never from a runtime one.
+testing = []
+
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true

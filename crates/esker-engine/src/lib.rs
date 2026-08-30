@@ -58,6 +58,8 @@ pub mod memfs;
 pub mod memtable;
 pub mod options;
 pub mod sst;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 pub mod version;
 pub mod wal;
 
