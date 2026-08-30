@@ -309,3 +309,38 @@ with no new dependency.
    balance operators are the first thing that needs one. `approximate_size` is 4b's, from SST
    properties plus the memtable. Each is documented as a placeholder at its field rather than left
    to look like a measurement.
+
+## 11. Outstanding after 4a
+
+Two items this lane could not close on its own. Both are recorded here rather than left as silence.
+
+### 11.1 `docs/DESIGN.md` §6 has two lines that no longer match the code
+
+The constitution says code and DESIGN must not drift within a change, and these two do. The edit is
+written below rather than made, because the placement-driver lane is rewriting §7 of the same file
+in its worktree right now and staging `DESIGN.md` would sweep that in. It lands the moment that
+lane commits.
+
+1. **"Apply loop: one worker per store (sharded by region id later)."** What 4a ships is **one
+   driver thread per region** — phase 3e's `raft-{region_id}` thread, one per entry in the region
+   map. The invariant the brief names is intact: `apply_index` is per region, one `WriteBatch` per
+   entry batch per region, and entries of one region cannot interleave. What is not intact is the
+   *thread count*: fifty regions on a store is fifty OS threads, and five simulated stores in one
+   process is two hundred and fifty.
+
+   The consolidation is not obviously the right fix either, and this is the part worth deciding
+   rather than assuming. One worker per store makes region A's `fsync` block region B's consensus
+   entirely, which is worse for tail latency than the threads are for memory — which is why TiKV
+   has a *pool* sized independently of the region count rather than either extreme. **This is a
+   coordinator decision for 4d** ("sharded later" is already where §6 puts it), and until it is
+   taken §6 should describe what exists.
+
+2. **"Heartbeats *(phase 4 — `esker-pd` is a stub until then)*."** Built: `heartbeat.rs` counts
+   ticks, a store beats every 10 s and a region's leader every 60 s *or on a change*, where a
+   change is an epoch bump or a leader change. The parenthetical goes and the "or on change" gets
+   its definition.
+
+### 11.2 The `--pd` flag's parsing
+
+Written, tested, and held out of a commit for the same shared-file reason (§9). `esker server`
+already builds a `RemotePd` when `ServerOptions::pd` is set; nothing else is missing.
