@@ -69,6 +69,7 @@ pub mod wal;
 
 pub use batch::WriteBatch;
 pub use cache_api::{BlockCache, CacheKey};
+pub use db::iter::DbIterator;
 pub use db::{ColumnFamily, Db, Snapshot};
 pub use dbformat::{
     BytewiseComparator, Comparator, EntryKind, InternalKeyComparator, MAX_SEQNO, SeqNo,

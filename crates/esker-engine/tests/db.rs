@@ -690,3 +690,290 @@ fn reads_match_a_model_across_flushes() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// Iteration: many versions in, one entry per user key out.
+// ---------------------------------------------------------------------------------------
+
+use esker_engine::options::StripSuffix;
+
+/// Every key and value the iterator yields, walking forward from the start.
+fn scan(db: &Db) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut iter = db.iter(cf::DEFAULT, &ReadOptions::default()).unwrap();
+    let mut out = Vec::new();
+    iter.seek_to_first();
+    while iter.valid() {
+        out.push((iter.key().to_vec(), iter.value().to_vec()));
+        iter.next();
+    }
+    iter.status().unwrap();
+    out
+}
+
+/// The same, walking backward from the end.
+fn scan_back(db: &Db) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut iter = db.iter(cf::DEFAULT, &ReadOptions::default()).unwrap();
+    let mut out = Vec::new();
+    iter.seek_to_last();
+    while iter.valid() {
+        out.push((iter.key().to_vec(), iter.value().to_vec()));
+        iter.prev();
+    }
+    iter.status().unwrap();
+    out
+}
+
+fn pairs(entries: &[(&str, &str)]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    entries
+        .iter()
+        .map(|(key, value)| (key.as_bytes().to_vec(), value.as_bytes().to_vec()))
+        .collect()
+}
+
+#[test]
+fn iteration_yields_one_entry_per_key_newest_first() {
+    let (_, fs) = memfs();
+    let db = open(&fs, options(), &[cf::DEFAULT]).unwrap();
+    db.put(cf::DEFAULT, b"b", b"old").unwrap();
+    db.put(cf::DEFAULT, b"a", b"a1").unwrap();
+    db.put(cf::DEFAULT, b"b", b"new").unwrap();
+    db.put(cf::DEFAULT, b"c", b"c1").unwrap();
+    db.delete(cf::DEFAULT, b"c").unwrap();
+
+    assert_eq!(scan(&db), pairs(&[("a", "a1"), ("b", "new")]));
+    assert_eq!(scan_back(&db), pairs(&[("b", "new"), ("a", "a1")]));
+}
+
+/// The same, with the data spread across memtables and L0 files so the merge cursor is
+/// actually merging.
+#[test]
+fn iteration_merges_memtables_and_l0_files() {
+    let (_, fs) = memfs();
+    let db = open(&fs, options(), &[cf::DEFAULT]).unwrap();
+    db.put(cf::DEFAULT, b"a", b"gen0").unwrap();
+    db.put(cf::DEFAULT, b"c", b"gen0").unwrap();
+    db.flush(cf::DEFAULT).unwrap();
+    db.put(cf::DEFAULT, b"b", b"gen1").unwrap();
+    db.put(cf::DEFAULT, b"c", b"gen1").unwrap();
+    db.flush(cf::DEFAULT).unwrap();
+    db.put(cf::DEFAULT, b"d", b"memtable").unwrap();
+    db.delete(cf::DEFAULT, b"a").unwrap();
+
+    assert_eq!(
+        db.property("esker.num-files-at-level0.default").unwrap(),
+        "2"
+    );
+    assert_eq!(
+        scan(&db),
+        pairs(&[("b", "gen1"), ("c", "gen1"), ("d", "memtable")]),
+        "the newer file wins, and the tombstone hides the older value"
+    );
+    assert_eq!(
+        scan_back(&db),
+        pairs(&[("d", "memtable"), ("c", "gen1"), ("b", "gen1")])
+    );
+}
+
+#[test]
+fn seeking_lands_on_the_right_key_in_both_directions() {
+    let (_, fs) = memfs();
+    let db = open(&fs, options(), &[cf::DEFAULT]).unwrap();
+    for key in ["a", "c", "e"] {
+        db.put(cf::DEFAULT, key.as_bytes(), key.as_bytes()).unwrap();
+    }
+    db.flush(cf::DEFAULT).unwrap();
+    let mut iter = db.iter(cf::DEFAULT, &ReadOptions::default()).unwrap();
+
+    iter.seek(b"b");
+    assert_eq!(iter.key(), b"c", "seek goes forward");
+    iter.seek(b"c");
+    assert_eq!(iter.key(), b"c", "an exact hit stays put");
+    iter.seek(b"z");
+    assert!(!iter.valid());
+
+    iter.seek_for_prev(b"d");
+    assert_eq!(iter.key(), b"c", "seek_for_prev goes backward");
+    iter.seek_for_prev(b"c");
+    assert_eq!(iter.key(), b"c");
+    iter.seek_for_prev(b"");
+    assert!(!iter.valid());
+    iter.status().unwrap();
+}
+
+/// Turning around mid-scan must land on the neighbour, not repeat the current key or skip
+/// one. This is the case the merge cursor's direction handling exists for.
+#[test]
+fn changing_direction_mid_scan_lands_on_the_neighbour() {
+    let (_, fs) = memfs();
+    let db = open(&fs, options(), &[cf::DEFAULT]).unwrap();
+    for round in 0..3 {
+        for key in ["a", "b", "c", "d"] {
+            db.put(cf::DEFAULT, key.as_bytes(), format!("v{round}").as_bytes())
+                .unwrap();
+        }
+        if round == 1 {
+            db.flush(cf::DEFAULT).unwrap();
+        }
+    }
+
+    let mut iter = db.iter(cf::DEFAULT, &ReadOptions::default()).unwrap();
+    iter.seek_to_first();
+    assert_eq!(iter.key(), b"a");
+    iter.next();
+    iter.next();
+    assert_eq!(iter.key(), b"c");
+    iter.prev();
+    assert_eq!(iter.key(), b"b", "one step back");
+    iter.prev();
+    assert_eq!(iter.key(), b"a");
+    iter.next();
+    assert_eq!(iter.key(), b"b", "and forward again");
+    iter.next();
+    assert_eq!(iter.key(), b"c");
+    assert_eq!(iter.value(), b"v2", "still the newest version");
+    iter.prev();
+    iter.prev();
+    assert_eq!(iter.key(), b"a");
+    iter.prev();
+    assert!(!iter.valid(), "off the front");
+}
+
+#[test]
+fn an_iterator_reads_at_its_snapshot() {
+    let (_, fs) = memfs();
+    let db = open(&fs, options(), &[cf::DEFAULT]).unwrap();
+    db.put(cf::DEFAULT, b"a", b"first").unwrap();
+    db.put(cf::DEFAULT, b"b", b"first").unwrap();
+    let snapshot = db.snapshot();
+
+    db.put(cf::DEFAULT, b"a", b"second").unwrap();
+    db.delete(cf::DEFAULT, b"b").unwrap();
+    db.put(cf::DEFAULT, b"c", b"new").unwrap();
+    db.flush(cf::DEFAULT).unwrap();
+
+    let mut iter = db
+        .iter(
+            cf::DEFAULT,
+            &ReadOptions {
+                snapshot: Some(snapshot),
+                ..ReadOptions::default()
+            },
+        )
+        .unwrap();
+    let mut out = Vec::new();
+    iter.seek_to_first();
+    while iter.valid() {
+        out.push((iter.key().to_vec(), iter.value().to_vec()));
+        iter.next();
+    }
+    assert_eq!(out, pairs(&[("a", "first"), ("b", "first")]));
+    assert_eq!(scan(&db), pairs(&[("a", "second"), ("c", "new")]));
+}
+
+/// `prefix_same_as_start` stops the scan when the prefix changes rather than running to the
+/// end of the key space (`docs/DESIGN.md` §4.9).
+#[test]
+fn prefix_same_as_start_stops_at_the_prefix_boundary() {
+    let (_, fs) = memfs();
+    let db = open(
+        &fs,
+        Options {
+            create_if_missing: true,
+            cf_options: CfOptions {
+                // The MVCC shape of DESIGN §3: a user key with a fixed-length version suffix.
+                prefix_extractor: Some(Arc::new(StripSuffix::new(4))),
+                ..CfOptions::default()
+            },
+            ..Options::default()
+        },
+        &[cf::DEFAULT],
+    )
+    .unwrap();
+
+    for user in ["aaaa", "bbbb", "cccc"] {
+        for version in 0..3u32 {
+            let mut key = user.as_bytes().to_vec();
+            key.extend_from_slice(&version.to_be_bytes());
+            db.put(cf::DEFAULT, &key, user.as_bytes()).unwrap();
+        }
+    }
+    db.flush(cf::DEFAULT).unwrap();
+
+    let mut iter = db
+        .iter(
+            cf::DEFAULT,
+            &ReadOptions {
+                prefix_same_as_start: true,
+                ..ReadOptions::default()
+            },
+        )
+        .unwrap();
+    let mut start = b"bbbb".to_vec();
+    start.extend_from_slice(&0u32.to_be_bytes());
+    iter.seek(&start);
+
+    let mut seen = 0;
+    while iter.valid() {
+        assert_eq!(&iter.key()[..4], b"bbbb", "the scan left its prefix");
+        seen += 1;
+        iter.next();
+    }
+    assert_eq!(seen, 3, "all three versions of bbbb and nothing else");
+    iter.status().unwrap();
+
+    // Without the option the same seek runs on into cccc.
+    let mut iter = db.iter(cf::DEFAULT, &ReadOptions::default()).unwrap();
+    iter.seek(&start);
+    let mut seen = 0;
+    while iter.valid() {
+        seen += 1;
+        iter.next();
+    }
+    assert_eq!(seen, 6, "bbbb and cccc");
+}
+
+#[test]
+fn an_empty_database_iterates_to_nothing() {
+    let (_, fs) = memfs();
+    let db = open(&fs, options(), &[cf::DEFAULT]).unwrap();
+    assert!(scan(&db).is_empty());
+    assert!(scan_back(&db).is_empty());
+    let mut iter = db.iter(cf::DEFAULT, &ReadOptions::default()).unwrap();
+    iter.next();
+    assert!(!iter.valid(), "next on an invalid cursor is a no-op");
+    iter.prev();
+    assert!(!iter.valid());
+}
+
+/// Random writes across flushes, then the whole key space walked both ways and compared with a
+/// `BTreeMap`.
+#[test]
+fn iteration_matches_a_model() {
+    use std::collections::BTreeMap;
+
+    let (_, fs) = memfs();
+    let db = open(&fs, small_buffer(8 * 1024), &[cf::DEFAULT]).unwrap();
+    let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut rng = esker_base::rng::Pcg32::from_seed(0x17E5);
+
+    for round in 0..1_200u32 {
+        let key = format!("key-{:03}", rng.below(200)).into_bytes();
+        if rng.chance(0.3) {
+            db.delete(cf::DEFAULT, &key).unwrap();
+            model.remove(&key);
+        } else {
+            let value = format!("v{round}").into_bytes();
+            db.put(cf::DEFAULT, &key, &value).unwrap();
+            model.insert(key, value);
+        }
+        if round % 300 == 299 {
+            db.flush(cf::DEFAULT).unwrap();
+        }
+    }
+
+    let expected: Vec<(Vec<u8>, Vec<u8>)> = model.into_iter().collect();
+    assert_eq!(scan(&db), expected);
+    let mut backwards = expected.clone();
+    backwards.reverse();
+    assert_eq!(scan_back(&db), backwards);
+}

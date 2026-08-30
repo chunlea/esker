@@ -3,6 +3,7 @@
 //! * [`open`] — creating and recovering, including replaying the log
 //! * [`write`] — group commit, and where invariant 1 is enforced
 //! * [`flush`] — switching memtables, and turning the full ones into L0 files
+//! * [`iter`] — many versions in, one entry per user key out
 //! * [`merge`] — several sorted cursors walked as one
 //! * [`read`] — point lookups, through memtables and then down the levels
 //! * [`table_cache`] — open SSTs, kept open
@@ -24,6 +25,7 @@
 //! the window in which a half-applied batch would otherwise be readable.
 
 pub mod flush;
+pub mod iter;
 pub mod merge;
 pub mod open;
 pub mod read;
