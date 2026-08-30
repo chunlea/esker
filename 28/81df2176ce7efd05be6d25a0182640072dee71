@@ -1,0 +1,25 @@
+crates/esker-engine/src/compaction/picker.rs
+  s_720b990b4c85a3::t_7c245c9c3e2708 26,185-186,200-205,249-278,425-457
+crates/esker-engine/tests/db.rs
+  s_720b990b4c85a3::t_9505f8d6d011dd 1199-1266
+crates/esker-engine/tests/model.rs
+  s_720b990b4c85a3::t_8c4e0c235190ee 58,87-92
+crates/esker-engine/tests/proptest-regressions/model.txt
+  s_720b990b4c85a3::t_000298a4f407c5 1-7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2881df2176ce7efd05be6d25a0182640072dee71",
+  "prompts": {},
+  "sessions": {
+    "s_720b990b4c85a3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "227f5c5f-560a-4117-b024-963f1ffc76a1",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
