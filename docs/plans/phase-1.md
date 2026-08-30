@@ -289,3 +289,37 @@ test lane — and the DESIGN.md review.
 20. **`bench --threads` defaults to 1 and `--duration-secs` to 0 (no limit).** A benchmark
     whose defaults are ambitious measures the settings; one that stops after ten seconds
     cannot produce the acceptance number.
+
+21. **Four compaction bugs found after the phase closed, by the model proptest and by running
+    the suite under parallel load.** Each was silent, and two of them lost or hid data.
+    *An L0 compaction takes the overlap to a fixed point* — the input set was swept once, so a
+    file reachable only through another stayed at L0 holding an older version of a key whose
+    newer version had just moved to L1. A point read consults all of L0 before L1, so the older
+    value won: an acknowledged write, lost. `DESIGN.md` §4.7 already said "L0→L1 merges all
+    overlapping L0 files"; the code had drifted from it. The existing L0 tests missed it because
+    their overlap chains are all reachable from the seed's own range in one sweep.
+    *The obsolete-file sweep samples the directory listing and the register of files being
+    written as one instant* — read one after the other they describe two moments, and a flush
+    that installed its edit in between was in no version when the directory was read and no
+    longer pending when the register was. Its live SST was deleted and the next read of it
+    failed. §4.6 already required the opposite.
+    *The register releases a compaction's outputs, not its inputs* — the inputs were named by a
+    version from the start and were never registered, so the release removed nothing and every
+    output stayed held for the life of the process, and the sweep skips everything held.
+    *A compaction plan whose inputs are gone is dropped rather than applied* — a plan is picked
+    against a pinned version and applied against `current`, and the reservation is taken after
+    the pick, so a compaction that committed and released in between left the plan naming files
+    `current` no longer had. The manifest builder refused the edit as corruption, reporting a
+    lost race as damage. It errors rather than corrupts: the edit never reaches the manifest.
+
+    Two of these needed machinery that did not exist. The sweep race is an ordering bug between
+    two threads, not a failing operation, so `testing::FaultFileSystem` cannot reach it —
+    `testing::pause` was added for it, and its module docs carry the one rule that matters:
+    these points sit inside locks, so a hook that waits at one for a thread needing the same
+    lock deadlocks exactly when the engine is right.
+
+    **Still open.** One failure of `a_compacted_database_reopens_unchanged` — 1 in 60 sweeps of
+    the fixed tree, 0 in 54 of the tree before it — was never reproduced and its error text was
+    lost. It failed at the `.unwrap()` on `compact_range`, which is the shape the stale-plan bug
+    above produces; that is suggestive and is not proof, and the evidence to settle it no longer
+    exists. Recorded so the next person who sees it starts here rather than from nothing.
