@@ -172,14 +172,28 @@ needed; the kill -9 loop still runs for real durability.
 8. **`unsafe`.** Warn-level in this crate, but every site still needs `// SAFETY:` and a test.
    We expect to need none in the spine.
 
-## 8. Non-goals for this phase
+## 8. Non-goals for this phase — final accounting
 
-- No range-tombstone machinery (`DeleteRange` keeps the v1 limitation of DESIGN §4.7).
-- No compression codec other than `lz4_flex`; no dictionary compression.
-- No in-house skiplist (`crossbeam-skiplist` stays until it is measured to matter).
-- No S3 `FileSystem`, no TLS, no tiering (phase 6b).
-- No performance tuning before the correctness tests are green; benchmarks are recorded, not chased.
-- No `esker-store`/Raft integration (phase 2+); the engine stays byte-opaque.
+Every non-goal below held. They are recorded with what a later phase inherits, because the
+useful half of a non-goal is knowing when it stops being one.
+
+| Not done | Still not done because | Whose problem next |
+|---|---|---|
+| Range tombstones | `DeleteRange` is a stored entry kind with the v1 limitation of DESIGN §4.7: the memtable answers for the key at `begin` and no other. The format is frozen, so making it real is not a format change. | phase 5, with `esker-txn` |
+| A compression codec other than `lz4_flex` | Nothing else is pure Rust (ADR 0003). No dictionary compression either. | — |
+| An in-house arena skiplist | `crossbeam-skiplist` has not been measured to matter. It costs one `Arc` clone per insert and an `O(log n)` cursor step, both of which the replacement removes. | post-v1, after a profile |
+| An S3 `FileSystem`, TLS, tiering | Every file touch already goes through the `FileSystem` trait, so this is an implementation and not a redesign. | phase 6b |
+| Performance tuning | Correctness first. Numbers are recorded in `docs/bench/phase-1.md` and one of them — eight threads slower than one — is written down *as* a known cost rather than chased. | phase 2, once there is a caller with a real concurrency profile |
+| `esker-store` / Raft integration | The engine stayed byte-opaque throughout; nothing here depends on `esker-keys`. | phase 2 |
+| Overlapping `ingest` | A file built elsewhere carries another database's sequence numbers, so an overlap has no defensible answer to "which version is newer". Refused rather than merged. | v2, if a caller ever needs it |
+| A two-level iterator per level | `Db::iter` opens one cursor per file, so a scan opens every file in every level. Correct, and wasteful once the deeper levels fill. | post-v1 |
+| Grandparent overlap limiting in the picker | A compaction may produce an output that overlaps a great deal of L+2, making the *next* compaction expensive. A heuristic, not a correctness rule. | post-v1 |
+| An LRU table cache | Open readers are evicted by lowest file number, not by use. A wrong choice costs four small reads. | post-v1 |
+
+One thing that *was* on this list is not any more: the point-read path bypassing the bloom
+filter. The gate asked for it and it is done (`TableReader::may_contain`, run 2 in
+`docs/bench/phase-1.md`), so the only remaining filter work is the `readmissing` win that
+already exists rather than one still owed.
 
 ## 9. Progress
 
