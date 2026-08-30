@@ -121,25 +121,45 @@ fn membership_changes_under_faults_hold_every_property() {
 /// cargo test -p esker-sim --release --test raft_membership -- --ignored --nocapture
 /// ```
 ///
-/// # This run is currently RED, and deliberately so
+/// # Seed 41213 is fixed; this run is still RED, for other reasons
 ///
-/// `ESKER_SIM_SEED=41213` reaches a state where two nodes hold the *same log* — five entries,
-/// the conf-change that adds server 5 at index 5, nothing compacted, neither truncated — and
-/// their cores disagree about the membership: node 2's has the change, node 1's does not. The
-/// driver's derivation matches node 2's core exactly, so this is not the harness losing a
-/// change; it is one core losing a change that is still in its own log.
+/// The membership finding this note was opened for — `ESKER_SIM_SEED=41213`, where node 1's core
+/// had lost a conf change that was still in its own log — is fixed in `esker-raft` by 987d472,
+/// and the reading recorded here was wrong in an instructive way. Index 2 and index 5 held the
+/// same conf change not because one was truncated and re-appended, but because they were two
+/// proposals with a `remove` between them; nothing on node 1 was ever truncated. What broke was
+/// §4.1 applied to an entry that had not been appended: a *duplicate* `AppendEntries` whose
+/// entries the log already held wrote nothing, but its conf entry was re-recorded anyway, which
+/// `ConfTracker` reads as "the entry at that index was replaced" and which dropped the later
+/// change off the stack.
 ///
-/// The shape that produces it is visible in node 1's log: index 2 and index 5 hold the *same*
-/// conf change, so it was appended, taken away by a truncation, and re-appended. `ConfTracker`
-/// pops appended changes at or above a truncation point and re-records them from the entries an
-/// append carries; a re-append that does not carry the conf-change entry again — because the
-/// prefix already matched — would pop the change and never put it back. That is a reading, not
-/// a diagnosis: it is the core lane's to adjudicate, and this test is the reproduction.
+/// # What is left
 ///
-/// The default sweep above does not reach it and stays green, so this is a finding on the
-/// acceptance gate rather than a broken build.
+/// The whole class went with it. Over seeds 41000..44000, 27 seeds failed before that fix and 14
+/// after; thirteen of the twenty-seven were `membership: node N derived X from its log but its
+/// core believes Y`, and not one of those is left. Twelve of the fourteen survivors fail before
+/// the fix too, with the same violation text and — for eleven of them; 43063 moves by one — at
+/// the very same event number. The other two are seeds that failed before under a different
+/// number: a seed is a schedule, and a core that decides differently walks a different one, so
+/// the census below is by class rather than by seed. What it is a census *of* is what the
+/// abort-at-first-failure sweep was hiding behind 41213:
+///
+/// * **committed twice** (41226, 41293, 41496, 42411, 42725, 43063, 43540). Every one of them has
+///   an `InstallSnapshot` restored immediately before it, and the index the checker objects to is
+///   *below* that snapshot's index. `esker-raft`'s `RaftLog::restore` moves the commit index to
+///   the snapshot's index at once and answers `first_index` from the pending snapshot, while
+///   `NodeSlot::refresh` reads the log out of storage, which the driver has not overwritten yet.
+///   So the pair the checker compares — an in-memory commit index against a durable log — spans a
+///   window in which they are not describing the same log. Whether that is a core bug or an
+///   observation window in the harness is this crate's to adjudicate.
+/// * **leader completeness** (42256, 42467, 43634), **snapshot metadata** (42397), **election
+///   safety** (42650), and **two nodes deriving different configurations from logs that agree**
+///   (42242, 43909) — between one and three seeds each, and each its own question.
+///
+/// The default sweep above does not reach any of them and stays green, so this remains a finding
+/// on the acceptance gate rather than a broken build.
 #[test]
-#[ignore = "the thousands-of-seeds membership run; currently RED on seed 41213, see above"]
+#[ignore = "the thousands-of-seeds membership run; still RED on 14 of the first 3000 seeds, see above"]
 fn thousands_of_membership_seeds() {
     let mut changes = 0;
     let mut joins = 0;
