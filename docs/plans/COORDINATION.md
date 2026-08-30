@@ -29,8 +29,12 @@ One coordinator (Fable, herdr pane `COORD`) directing coding lanes. Phases are g
     probe path (shared `filter_key` for build+probe; extractor mismatch drops the filter).
     Contract notes relayed to the spine lane (seqno_range before finish, finish syncs,
     LevelDB cursor semantics, per-CF TableOptions parity, ADR numbering).
-  - [ ] `cl-p1-sst` round 2: ADR 0005 (format bounds), fault-injecting FileSystem
-    (`src/testing/`), `esker-cli sst-dump`.
+  - [x] `cl-p1-sst` round 2 — **accepted ~03:10**: ADR 0005, FaultFs (per-op RNG
+    derivation; rename applied by fsync_dir), sst-dump. Out-of-lane edits all minimal
+    and self-reported.
+  - [ ] `cl-p1-sst` round 3: crash loop (in-process FaultFs sweep + subprocess SIGKILL
+    200×; 1,000 behind --ignored). Bugs in spine files = repro test + report, never a
+    cross-lane fix.
   - [ ] spine: WAL ✅ batch/internal-key ✅ memtable ✅(assumed, verify at gate)
     manifest/Version in progress → Db → compaction → checkpoint → cli/bench.
 - [ ] Phase 2 — single-node server
@@ -76,6 +80,9 @@ One coordinator (Fable, herdr pane `COORD`) directing coding lanes. Phases are g
 
 ## Incidents
 
+- 2026-08-30 ~03:08: `cl-p1-sst` ran `cargo fmt --all`, reformatting the spine's
+  in-flight files (whitespace only, self-reported). Standing rule added to all future
+  briefs: **`cargo fmt -p <crate>` only** in a shared tree.
 - 2026-08-30 ~01:50: found unsent text "开始 phase 1" typed into lane `wy-p0`'s input
   box (origin unknown, likely the user pre-sleep). Not submitted; phase gating held.
   Cleared/retired with the pane after acceptance. Rule reaffirmed: phases open only
