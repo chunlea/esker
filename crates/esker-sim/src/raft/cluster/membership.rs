@@ -16,28 +16,36 @@ impl Cluster {
     /// Starts any node a live configuration now names and that has never run.
     ///
     /// A server being added does not exist until something says it does; this is the moment it
-    /// starts. It comes up with an empty log and the configuration that added it, and catches
-    /// up from the leader like any other follower that is behind.
+    /// starts. It comes up with an empty log and catches up from the leader like any other
+    /// follower that is behind.
+    ///
+    /// What it comes up *with* is the configuration at log index 0 — the cluster's original — and
+    /// not the one that happens to name it now, even though that is the one that brought it into
+    /// existence. Its log starts empty, so index 0 is where its own derivation starts, and it
+    /// learns everything after that the way any follower does: from the entries, or from a
+    /// snapshot, which carries a configuration and the index it holds at. Seeding it with the
+    /// naming configuration instead puts itself in the membership as of index 0, which its own
+    /// log does not say — and then two nodes holding the very same conf-change entry disagree
+    /// about what that entry established, because one of them started counting from somewhere
+    /// else. That is `ESKER_SIM_SEED=41872`.
     pub(super) fn start_named_spares(&mut self) -> Result<(), Failure> {
         let named: Vec<(RaftId, esker_raft::ConfState)> = self
             .nodes
             .values()
             .filter(|slot| !slot.started() && !slot.online())
-            .filter_map(|slot| {
-                let config = self
-                    .nodes
+            .filter(|slot| {
+                self.nodes
                     .values()
                     .filter(|other| other.online())
                     .map(NodeSlot::config_of)
-                    .find(|config| config.contains(slot.id))?;
-                Some((slot.id, config))
+                    .any(|config| config.contains(slot.id))
             })
+            .map(|slot| (slot.id, slot.bootstrap.clone()))
             .collect();
 
-        for (id, config) in named {
-            let node = self.build_node(id, None, 0, &config)?;
+        for (id, bootstrap) in named {
+            let node = self.build_node(id, None, 0, &bootstrap)?;
             if let Some(slot) = self.nodes.get_mut(&id) {
-                slot.bootstrap = config;
                 slot.revive(node);
             }
             self.stats.joins += 1;
