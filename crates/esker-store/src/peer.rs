@@ -352,6 +352,14 @@ impl PeerCore {
         // Only now, with both records durable, does the split become visible to anything else.
         if let Some((parent, child)) = split_halves {
             self.region = parent.clone();
+            // The parent has given away roughly half its keys, so it is holding roughly half the
+            // bytes. Without this the hint would stay over the threshold for ever and the parent
+            // would try to split on every tick until it ran out of boundaries — the counter counts
+            // what was *applied*, and a split applies nothing it can subtract exactly.
+            let _ =
+                self.published
+                    .size
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |size| Some(size / 2));
             self.host.split_applied(&parent, &child)?;
             tracing::info!(
                 region_id = parent.id,

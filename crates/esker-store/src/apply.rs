@@ -312,8 +312,20 @@ pub const MAX_DELETE_RANGE_KEYS: u64 = 64 * 1024;
 /// This is what stops a write proposed before a split from landing in the wrong half. A `Put`
 /// ordered after the `Split` entry that narrowed its region is applied against the narrowed range,
 /// finds its key outside, and is refused — on every peer, identically, because every peer's range
-/// at that entry is the product of the same log prefix. The proposer learns it as
-/// [`ProtoError::EpochNotMatch`], refreshes, and its retry lands on the half that owns the key.
+/// at that entry is the product of the same log prefix.
+///
+/// The refusal is [`ProtoError::EpochNotMatch`], **not** `KeyNotInRegion`, and the difference is
+/// the whole point. The proposer did not route wrongly: it routed correctly and the region moved
+/// underneath it, which is retryable and repairable. `KeyNotInRegion` is terminal — it says *no
+/// region here owns this key and waiting will not change that* — and answering a lost race with it
+/// would fail a write that a refresh and one retry would have completed. The request path still
+/// answers `KeyNotInRegion`, because there the epoch matched and the range is what the epoch says
+/// it is, so a key outside it is genuinely the caller's mistake.
+///
+/// The hint carries only *this* region, because the driver knows only its own. That costs the
+/// client one `GetRegion` for the half it does not yet know about — the narrowed parent evicts the
+/// stale entry, the key then misses, and the resolver answers. One extra round trip, on a race
+/// that happens once per split rather than once per request.
 ///
 /// A **whole-command check, before anything is staged.** A batch is one atomic write and there is
 /// no half of it to keep, so finding the bad key part way through would mean either a partial
@@ -322,11 +334,8 @@ pub const MAX_DELETE_RANGE_KEYS: u64 = 64 * 1024;
 /// [`Command::Split`] touches no key and is checked by the caller against a different question:
 /// whether its boundary is still inside the region ([`crate::split::is_legal_boundary`]).
 pub fn check_scope(command: &Command, region: &Region) -> Result<(), ProtoError> {
-    let refuse = |key: &[u8]| ProtoError::KeyNotInRegion {
-        key: Bytes::copy_from_slice(key),
-        region_id: region.id,
-        start_key: region.start_key.clone(),
-        end_key: region.end_key.clone(),
+    let refuse = |_key: &[u8]| ProtoError::EpochNotMatch {
+        current_regions: vec![region.clone()],
     };
     let one = |key: &Bytes| {
         if region.contains(key) {
@@ -926,17 +935,19 @@ mod tests {
             &narrowed,
         )
         .unwrap_err();
-        match error {
-            ProtoError::KeyNotInRegion { key, end_key, .. } => {
-                assert_eq!(key, outside);
-                assert_eq!(
-                    end_key,
-                    Bytes::from_static(b"m"),
-                    "the range that refused it"
-                );
+        // `EpochNotMatch`, not `KeyNotInRegion`: the proposer routed correctly and the region moved
+        // under it. Answering a lost race with the terminal error would fail a write that a refresh
+        // and one retry would have completed.
+        match &error {
+            ProtoError::EpochNotMatch { current_regions } => {
+                assert_eq!(current_regions, &vec![narrowed.clone()]);
             }
             other => panic!("{other:?}"),
         }
+        assert!(
+            error.is_retryable(),
+            "a proposal the split overtook must be worth sending again"
+        );
 
         // A batch is refused whole, however late the bad key comes.
         assert!(
