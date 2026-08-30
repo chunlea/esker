@@ -1,0 +1,29 @@
+Cargo.lock
+  s_84bf31abd6a949::t_b915cd96911e5c 107,109-111,113
+crates/esker-cli/src/bench_remote.rs
+  s_84bf31abd6a949::t_aa48ee5718becd 321-412
+crates/esker-cli/src/raw.rs
+  s_84bf31abd6a949::t_0022b903bfe137 248-423
+crates/esker-cli/src/testserver.rs
+  s_84bf31abd6a949::t_c8f7bde0b3713a 1-62
+crates/esker-client/Cargo.toml
+  s_84bf31abd6a949::t_b00adf3b6f77cd 34-36,38-39
+crates/esker-client/tests/store_model.rs
+  s_84bf31abd6a949::t_340b75009aa9b9 32,34-38,45-46,88-93,127-131,232-237,312-320,401,403-410,412-447,451-453,456-485,489,493-495,498-501,503,505,509-510,512-515,519
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "fd8fb95784105e2c3c9e559b9ac0802814adf5c0",
+  "prompts": {},
+  "sessions": {
+    "s_84bf31abd6a949": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "efbdd5ba-687c-4b5c-b773-9bc846ae2e20",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
