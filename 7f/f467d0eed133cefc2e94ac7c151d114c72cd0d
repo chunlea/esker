@@ -1,0 +1,21 @@
+docs/DESIGN.md
+  s_84bf31abd6a949::t_45cc650b593432 209-212,313-317,321-327,330-340,350-355
+docs/plans/phase-2.md
+  s_84bf31abd6a949::t_decdc00cce0db3 338-353,357-395
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "7ff467d0eed133cefc2e94ac7c151d114c72cd0d",
+  "prompts": {},
+  "sessions": {
+    "s_84bf31abd6a949": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "efbdd5ba-687c-4b5c-b773-9bc846ae2e20",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
