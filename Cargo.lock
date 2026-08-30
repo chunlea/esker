@@ -191,6 +191,7 @@ dependencies = [
  "bytes",
  "esker-base",
  "esker-engine",
+ "esker-pd",
  "esker-proto",
  "tempfile",
  "thiserror",

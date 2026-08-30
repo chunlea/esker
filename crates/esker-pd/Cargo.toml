@@ -30,6 +30,10 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["rt", "sync"] }
 
 [dev-dependencies]
+# The crate's own test clock, enabled for its tests only. An integration test links the
+# library as an ordinary dependency, so `#[cfg(test)]` does not reach it and the feature is
+# the only way in — the same shape `esker-engine` uses for its fault-injecting filesystem.
+esker-pd = { path = ".", features = ["testing"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["net", "time", "rt-multi-thread", "macros"] }
 
