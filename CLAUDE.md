@@ -35,6 +35,7 @@ they must never drift.
 | Keys | `esker-keys` | memcomparable codec, reserved key-space layout | TiDB codec |
 | Sim/test | `esker-sim` | deterministic simulator, fault injection, checkers | madsim/Jepsen-lite |
 | Tools | `esker-cli` | bootstrap, inspect, sst-dump, wal-dump, bench | ldb / db_bench |
+| Primitives | `esker-base` | crc32c, varints, hash64, seeded PCG32 — no key semantics (ADR 0004) | util/ |
 
 ## Non-negotiable invariants
 

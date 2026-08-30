@@ -18,8 +18,11 @@ One coordinator (Fable, herdr pane `COORD`) directing coding lanes. Phases are g
 
 ## Task list
 
-- [ ] Phase 0 — scaffold (lane: `wy-p0`, claude-wy/opus)
-- [ ] Phase 1 — engine
+- [x] Phase 0 — scaffold (lane `wy-p0`, claude-wy/opus) — **accepted 2026-08-30 ~02:00**:
+  8 commits, 115 tests, `just check` green (verified independently by coordinator),
+  7/40 runtime crates; coordinator reviewed `codec.rs`, `crc32c.rs`, `deny.toml`,
+  workspace manifest in full.
+- [ ] Phase 1 — engine (lanes `wy-p1-spine` + `cl-p1-sst`, test lane later)
 - [ ] Phase 2 — single-node server
 - [ ] Phase 3 — raft
 - [ ] Phase 4 — multi-raft + PD
@@ -50,6 +53,20 @@ One coordinator (Fable, herdr pane `COORD`) directing coding lanes. Phases are g
 - 2026-08-30: coordinator quota note — `claude` pool Fable week at 69% at start; Fable is
   reserved for review/adjudication, volume goes to Opus/Sonnet lanes.
 
+- 2026-08-30 (phase-0 gate): lane judgment calls **approved** — `clippy::unwrap_used`/
+  `expect_used` as workspace lints (invariant 9 mechanized); `RUSTDOCFLAGS=-D warnings`
+  in `just doc`; `esker-base` as 11th crate (ADR 0004; CLAUDE.md table row added);
+  CI third-party actions (taiki-e/install-action, Swatinem/rust-cache) accepted as
+  CI-only supply chain, not in the artifact dependency graph — revisit if CI hardening
+  ever matters.
+- 2026-08-30: phase-1 parallelization — SST/cache are leaf modules with no dependency
+  on WAL/memtable, so prompt-01's "steps in order" is honored *within the spine lane*;
+  the SST lane builds pure byte-level modules against contracts pinned in both briefs.
+  Contract owner (fs/dbformat/lib.rs): spine lane.
+
 ## Incidents
 
-(none yet)
+- 2026-08-30 ~01:50: found unsent text "开始 phase 1" typed into lane `wy-p0`'s input
+  box (origin unknown, likely the user pre-sleep). Not submitted; phase gating held.
+  Cleared/retired with the pane after acceptance. Rule reaffirmed: phases open only
+  through the coordinator's gate.
