@@ -13,5 +13,10 @@ bytes.workspace = true
 esker-base.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+# DESIGN.md §11 requires the linearizability checker to be proven both ways: a generated
+# legal history must pass and a generated illegal one must fail. That is a property test.
+proptest.workspace = true
+
 [lints]
 workspace = true

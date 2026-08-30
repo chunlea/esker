@@ -1,8 +1,8 @@
 //! The deterministic simulator: a logical clock, an injected seeded random number generator,
-//! and a `Network` the rest of the system talks to — implemented once in memory with fault
-//! injection and once, later, by the real TCP transport. Every run is a function of its seed,
-//! so every failure is reproducible from the one number the test prints
-//! (`docs/DESIGN.md` §11).
+//! a `Network` the rest of the system talks to — implemented once in memory with fault
+//! injection and once, later, by the real TCP transport — and the history checkers that decide
+//! whether what came out of a run was allowed to. Every run is a function of its seed, so
+//! every failure is reproducible from the one number the test prints (`docs/DESIGN.md` §11).
 //!
 //! # Invariants
 //!
@@ -18,10 +18,12 @@
 
 pub mod clock;
 pub mod fault;
+pub mod lin;
 pub mod net;
 
 pub use clock::{Clock, Millis};
 pub use fault::FaultPlan;
+pub use lin::{CheckOutcome, Checker, History, Register, RegisterInput, RegisterOutput};
 pub use net::{
     Envelope, Network, NetworkError, NodeId, NodeView, SimNetwork, TraceEvent, scenario_rng,
 };
