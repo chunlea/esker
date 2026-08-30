@@ -1,0 +1,23 @@
+docs/DESIGN.md
+  s_8dc89cd8f6be19::t_0939d32444b5d5 379-404,593-594
+docs/adr/0013-repair-operators-are-requests-not-commands.md
+  s_8dc89cd8f6be19::t_9bb54e025c0d4d 1-103
+docs/plans/phase-4-pd.md
+  s_8dc89cd8f6be19::t_2ad034afb80020 3,288-343
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "46e10cccfc1b499c28803edcd50004bc78c86319",
+  "prompts": {},
+  "sessions": {
+    "s_8dc89cd8f6be19": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "20caabd3-7fb9-42f6-a519-04be2a284eef",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
