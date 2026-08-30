@@ -26,6 +26,10 @@ tracing.workspace = true
 testing = []
 
 [dev-dependencies]
+# The crate's own test harness, enabled for its tests only. An integration test links the
+# library as an ordinary dependency, so `#[cfg(test)]` does not reach it and the feature is
+# the only way in (see src/testing/mod.rs).
+esker-engine = { path = ".", features = ["testing"] }
 proptest.workspace = true
 tempfile.workspace = true
 

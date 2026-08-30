@@ -102,6 +102,7 @@ dependencies = [
  "bytes",
  "crossbeam-skiplist",
  "esker-base",
+ "esker-engine",
  "lz4_flex",
  "proptest",
  "tempfile",
