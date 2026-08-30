@@ -31,6 +31,8 @@
 //! | [`cache_api`] | the block cache shape the read path is written against |
 //! | [`options`] | knobs, prefix extraction, compression, and the §14 defaults |
 //! | [`mod@format`] | byte sizes that are frozen |
+//! | [`memfs`] | an in-memory filesystem, so damage can be injected without a disk |
+//! | [`wal`] | the write-ahead log: durability, and torn tails told from corruption |
 //! | [`sst`], [`cache`] | the table format and the sharded LRU behind it |
 
 #![warn(unsafe_code)]
@@ -41,8 +43,10 @@ pub mod cache_api;
 pub mod dbformat;
 pub mod error;
 pub mod fs;
+pub mod memfs;
 pub mod options;
 pub mod sst;
+pub mod wal;
 
 pub use cache_api::{BlockCache, CacheKey};
 pub use dbformat::{
@@ -51,6 +55,7 @@ pub use dbformat::{
 pub use error::{Error, Result};
 pub use fs::{FileSystem, LocalFileSystem, RandomAccessFile, WritableFile};
 pub use options::{Compression, PrefixExtractor, WalSyncMode, WriteOptions};
+pub use wal::{LogReader, LogWriter, ReadOutcome};
 
 /// The checksum every engine format uses, re-exported so callers can write
 /// `esker_engine::crc32c::checksum(..)` as `docs/DESIGN.md` §4.5 describes. The

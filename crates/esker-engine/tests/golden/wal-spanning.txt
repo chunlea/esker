@@ -1,0 +1,8 @@
+# One 70000-byte record, payload byte i = (i * 31 + 7) & 0xff.
+# Too large to check in as hex, so it is pinned by its shape and its checksum.
+# Fields: name = value
+file_len = 70021
+file_crc32c = 0x57bc62a1
+fragments = FIRST,MIDDLE,LAST
+fragment_lens = 32761,32761,4478
+padding_bytes = 0
