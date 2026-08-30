@@ -300,16 +300,53 @@ Regions cover the whole key space contiguously; the first region is `["", "")`.
 
 ## 7. Placement driver (`esker-pd`)
 
-Single binary, state kept in its own `esker-engine` instance; made highly available by running three PDs
-replicated with `esker-raft` (sub-phase 4c — until then, one PD with durable state is acceptable).
+Single binary, state kept in its own `esker-engine` instance (default column family only); made highly
+available by running three PDs replicated with `esker-raft` (*sub-phase 4e — until then, one PD with
+durable state is what 4a ships, and it is a single point of failure by design rather than by oversight*).
 
-- **Bootstrap:** first store to register receives region 1 covering everything.
-- **Routing:** `GetRegion(key) → Region + leader hint`; clients cache and invalidate on epoch errors.
-- **TSO:** `ts = physical_ms << 18 | logical`; PD persists a high-water mark 3 s ahead so restarts never
-  hand out a smaller ts; allocated in batches to callers.
-- **Scheduling (phase 4b):** replica repair (down store → add peer elsewhere), leader balance, region-count
-  balance. Every operator is a small state machine with a timeout; PD never sends a second operator for a
-  region while one is in flight.
+- **State (*fixed*, version 1).** PD's own key space, under the `'m'` metadata prefix of §3, with ids
+  big-endian so a scan runs in id order:
+
+  ```text
+  'm' 'c'                        cluster record: the cluster id, the first region, the created ms
+  'm' 'a'                        allocator record: the end of the reserved id batch
+  'm' 'k' ++ tag:u8 ++ end_key   range index: which region ends here (tag 1 bounded, 2 = +∞)
+  'm' 'r' ++ region_id:u64 BE    region record: the Region, the leader hint, the last heartbeat
+  'm' 's' ++ store_id:u64 BE     store record: address, stats, the last heartbeat
+  'm' 't'                        the oracle's high-water mark, in physical milliseconds
+  ```
+
+  Every value is `version:u8 ++ fields`, decoded strictly and golden-tested; the engine's own checksums
+  cover the bytes, so records carry no second CRC. The **range index** is what makes `GetRegion` one
+  seek: it is keyed by *end* key, tagged so that the region running to +∞ sorts last (`b""` alone sorts
+  first), and a lookup seeks to `key ++ 0x00` because an end key is exclusive. Both keys of a region are
+  written in one `WriteBatch`, so the index can never name a region that is not there.
+- **Bootstrap:** the first store to register receives region 1 covering everything, with one voting peer
+  on itself, and PD mints the **cluster id** that every later request is checked against. `Bootstrap` is
+  idempotent and is also registration — a store calls it on every start, and only the first call in the
+  life of a cluster comes back with a region to create; every other one answers `region: None` and the
+  store reads the regions it hosts off its own disk (§6).
+- **Routing:** `GetRegion(key) → Region + leader hint + the addresses of its peers' stores`; clients cache
+  and invalidate on epoch errors. Before anything has bootstrapped it is a typed `NotBootstrapped`, never
+  an empty answer. Region records are upserted by heartbeat under an **epoch guard**: a beat behind in
+  either counter of `(conf_ver, version)` is dropped, and within one epoch the higher Raft term wins,
+  because a leader election bumps the term and not the epoch. Heartbeats cross on the network whenever a
+  leader changes, so the order PD accepts them in is the order they happened, not the order they arrived.
+- **Ids:** `AllocId(count)` hands out consecutive cluster-unique ids from a reserved batch (1,000 by
+  *default*). The end of a batch is persisted, `sync = true`, **before any id in it is handed out**, so a
+  crash skips ids and can never repeat one.
+- **TSO:** `ts = physical_ms << 18 | logical`, allocated in batches. PD persists a high-water mark 3 s
+  *ahead*, fsynced before any timestamp at or above the old mark leaves, so **every timestamp handed out
+  has `physical < mark`**; a restart resumes at `max(clock, mark)` and therefore cannot repeat one even
+  when the wall clock jumps backwards. This is the only place in Esker that reads a wall clock, and it
+  reads it through an injected `Clock` so that a test can make it misbehave.
+- **Liveness:** a store is down when its last heartbeat is older than `max_store_down_time`. Recorded and
+  reported in 4a; *acted on in 4c*, where replica repair lives.
+- **Scheduling (phase 4b–4d):** replica repair (down store → add peer elsewhere), leader balance,
+  region-count balance. Every operator is a small state machine with a timeout; PD never sends a second
+  operator for a region while one is in flight.
+- **Tools:** `esker pd serve --data-dir --listen` runs it; `esker pd inspect --data-dir` prints the whole
+  state above, including the range index beside the records it points at.
 
 ## 8. Transactions (`esker-txn`)
 
@@ -387,12 +424,16 @@ Methods: `RawKv { Get, BatchGet, Put, BatchPut, Delete, DeleteRange, Scan, Compa
 (namespace `'x'`), `Pd { Bootstrap, StoreHeartbeat, RegionHeartbeat, GetRegion, AllocId, Tso }`,
 `RaftTransport { Batch }`. Every KV request carries `{ region_id, epoch, peer }` and every error is a
 typed enum with redirect hints (`NotLeader{leader_hint}`, `EpochNotMatch{current_regions}`,
-`KeyNotInRegion`, `ServerIsBusy`, `Locked{lock_info}`). Unknown methods and fields are errors, not
+`KeyNotInRegion`, `ServerIsBusy`, `Locked{lock_info}`). A `Pd` request carries the **cluster id** in
+place of the region header, since PD's answers are about the routing table rather than about a region,
+and `Bootstrap` may send zero because asking is how a caller learns it; PD's own two refusals are
+`NotBootstrapped` and `ClusterMismatch{expected, actual}`, and neither is retryable. Unknown methods and fields are errors, not
 ignored — forward compatibility is handled by `WIRE_VERSION` negotiation on connect.
 
 Method numbers are `service:method`, so a service's numbers stay contiguous and one can be reserved
 before it is written: `0x00` system (`0x0001` Hello), `0x01` RawKv (`0x0101`–`0x0108`, in the order
-listed above), with `0x02` TxnKv, `0x03` Pd and `0x04` RaftTransport reserved. `Hello`'s layout is
+listed above), `0x03` Pd (`0x0301`–`0x0306`, in the order listed above) and `0x04` RaftTransport
+(`0x0401`), with `0x02` TxnKv reserved. `Hello`'s layout is
 frozen for ever — a fixed four-byte version and nothing else — because reading it is how a peer at
 another version turns a mismatch into `WireVersion` rather than a hang.
 
@@ -484,6 +525,9 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
 | raft tick / election / heartbeat | 100 ms / 10–20 ticks / 2 ticks |
 | max inflight raft msgs | 256 |
 | store / region heartbeat | 10 s / 60 s |
+| PD id allocation batch | 1,000 ids per persist |
+| PD TSO save interval | 3 s ahead of what is handed out |
+| `max_store_down_time` | 30 s |
 | txn lock TTL | 3 s (heartbeat-extended) |
 | transport (`TransportConfig`) | §9 has the table — seven knobs, listed there because each one only means something next to the rule it bounds |
 | store WAL sync mode | `Never` — the engine adds no `fsync` of its own, so each request's `sync` flag decides (§4.2, and `CLAUDE.md` invariant 1's opt-out) |
