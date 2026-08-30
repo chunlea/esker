@@ -59,6 +59,16 @@ const SLOTS: u32 = 48;
 const SECONDS: u64 = 3;
 const SECONDS_LONG: u64 = 30;
 
+/// Flushes to aim for, whatever the run's length.
+///
+/// A *rate* rather than a count was the first thing tried, and it was wrong: a flush every
+/// 40 ms gives 35 L0 files in three seconds and 329 in thirty, and with no compaction yet to
+/// merge them, every point lookup in the final comparison has to consult all of them. That
+/// turned a thirty-second run into a four-minute one — correct, but for no extra coverage,
+/// since crossing three dozen L0 files already exercises everything crossing three hundred
+/// would. When step 7's compaction is wired in here this can go back to a rate.
+const TARGET_FLUSHES: u32 = 32;
+
 // TODO(spine step 7): mix `compact` in beside the flushes once `Db` has a compaction API —
 // same shape as here, and the same final comparison. `compaction_still_has_no_public_api` in
 // tests/model.rs is the canary that fails when the API appears.
@@ -316,9 +326,9 @@ fn scan_with(
 
 /// Flushes the column family every so often, so the read path is crossing memtables and L0
 /// files rather than only memtables.
-fn flusher(shared: &Shared, deadline: Instant) -> Result<(), String> {
+fn flusher(shared: &Shared, deadline: Instant, interval: Duration) -> Result<(), String> {
     while Instant::now() < deadline && !shared.stop.load(Ordering::Relaxed) {
-        std::thread::sleep(Duration::from_millis(40));
+        std::thread::sleep(interval);
         shared
             .db
             .flush(cf::DEFAULT)
@@ -375,7 +385,8 @@ fn run(seconds: u64) {
     }
     let flush_thread = {
         let shared = Arc::clone(&shared);
-        std::thread::spawn(move || flusher(&shared, deadline))
+        let interval = Duration::from_secs(seconds) / TARGET_FLUSHES;
+        std::thread::spawn(move || flusher(&shared, deadline, interval))
     };
     barrier.wait();
 
