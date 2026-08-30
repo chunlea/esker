@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use esker_engine::{
     Db, LocalFileSystem, Options, ReadOptions, WalSyncMode, WriteBatch, WriteOptions, cf,
 };
-use esker_proto::Region;
+use esker_proto::{Region, StoreInfo};
 
 use crate::alloc::{ALLOC_BATCH, Allocator};
 use crate::clock::{Clock, SystemClock};
@@ -118,13 +118,13 @@ pub struct RegionRoute {
     pub region: Region,
     /// The peer PD last heard was leading it, if any.
     pub leader_peer_id: Option<u64>,
-    /// The addresses of the stores hosting the region's peers, in peer order.
+    /// The stores hosting the region's peers, in peer order.
     ///
     /// A client addresses a store by id and "resolving one to a socket is PD's job"
     /// (`docs/DESIGN.md` §10); sending them with the region saves the round trip that asking
     /// separately would cost. A peer whose store PD has never heard of is absent from this
     /// list rather than present with an empty address.
-    pub stores: Vec<(u64, String)>,
+    pub stores: Vec<StoreInfo>,
 }
 
 /// The placement driver.
@@ -348,7 +348,7 @@ impl Pd {
         let mut stores = Vec::with_capacity(record.region.peers.len());
         for peer in &record.region.peers {
             if let Some(store) = routing::read_store(&self.db, peer.store_id)? {
-                stores.push((store.store_id, store.address));
+                stores.push(StoreInfo::new(store.store_id, store.address));
             }
         }
         Ok(Some(RegionRoute {
@@ -517,7 +517,7 @@ mod tests {
     use crate::Clock as _;
     use crate::clock::TestClock;
     use crate::error::PdError;
-    use esker_proto::{Epoch, Peer, Region};
+    use esker_proto::{Epoch, Peer, Region, StoreInfo};
     use std::sync::Arc;
 
     fn open() -> (tempfile::TempDir, Arc<TestClock>, Arc<Pd>) {
@@ -569,7 +569,7 @@ mod tests {
                 .unwrap()
                 .expect("a region covers {key:?}");
             assert_eq!(route.region.id, region.id);
-            assert_eq!(route.stores, vec![(1, "127.0.0.1:20160".to_owned())]);
+            assert_eq!(route.stores, vec![StoreInfo::new(1, "127.0.0.1:20160")]);
             assert_eq!(route.leader_peer_id, None, "no heartbeat has arrived yet");
         }
     }
@@ -601,7 +601,7 @@ mod tests {
         pd.bootstrap(1, "127.0.0.1:20160").unwrap();
         pd.bootstrap(1, "127.0.0.1:29999").unwrap();
         let route = pd.get_region(b"k").unwrap().unwrap();
-        assert_eq!(route.stores, vec![(1, "127.0.0.1:29999".to_owned())]);
+        assert_eq!(route.stores, vec![StoreInfo::new(1, "127.0.0.1:29999")]);
     }
 
     #[test]

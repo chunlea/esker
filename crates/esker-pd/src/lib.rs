@@ -41,6 +41,7 @@ pub mod keys;
 pub mod pd;
 pub mod record;
 pub mod routing;
+pub mod service;
 pub mod tso;
 
 pub use clock::{Clock, SystemClock};
@@ -48,6 +49,7 @@ pub use error::{PdError, Result};
 pub use pd::{Bootstrapped, Pd, PdOptions, RegionRoute};
 pub use record::{ClusterRecord, RegionRecord, StoreRecord, StoreStats};
 pub use routing::{RegionBeat, StoreBeat, Upsert};
+pub use service::PdService;
 
 /// Bits of the logical counter in a timestamp: `ts = physical_ms << 18 | logical`
 /// (`docs/DESIGN.md` §7). Part of the wire format — every timestamp on disk uses it.
