@@ -58,6 +58,13 @@ pub enum Balance {
         from_store: u64,
         /// The store gaining one.
         to_store: u64,
+        /// Whether this transfer is a step of a replica move already under way, rather than
+        /// leader balance in its own right.
+        ///
+        /// It matters because a move must run to completion: while it is half done the region
+        /// sits on **two** stores and is counted on both, so a move left hanging inflates the
+        /// numbers every other decision is taken from. See [`Balance::finishes_a_move`].
+        finishing: bool,
     },
     /// Put a new replica of `region_id` on a quieter store — the first half of a move.
     AddPeer {
@@ -91,7 +98,14 @@ impl Balance {
     /// space and traffic for no gain.
     #[must_use]
     pub fn finishes_a_move(&self) -> bool {
-        matches!(self, Self::RemovePeer { .. })
+        matches!(
+            self,
+            Self::RemovePeer { .. }
+                | Self::TransferLeader {
+                    finishing: true,
+                    ..
+                }
+        )
     }
 
     /// The region this move is about.
@@ -129,22 +143,41 @@ pub fn region_balance(region: &RegionRecord, cluster: &Cluster<'_>) -> Option<Ba
     // needs finishing. Doing this before considering a new move is what stops PD starting a
     // second move while the first is half done.
     if region.region.peers.len() > cluster.target_replicas {
-        let heaviest = region
-            .region
-            .peers
-            .iter()
-            // Never drop the leader to finish a move: transferring first would cost an election
-            // that the next round would have to pay for anyway. A region whose only spare
-            // replica is its leader waits for leader balance to move the office.
-            .filter(|peer| peer.peer_id != region.leader_peer_id)
-            .max_by_key(|peer| {
-                (
-                    cluster.effective_regions(peer.store_id),
-                    // Highest count wins; the *lowest* store id breaks the tie, so `max_by_key`
-                    // is given the negated id.
-                    -i64::try_from(peer.store_id).unwrap_or(i64::MAX),
-                )
-            })?;
+        // The replica that goes is the one on the busiest store — that is the whole point of
+        // the move, so nothing may override it. Picking any other replica would undo the move
+        // that was just made, and the two halves would chase each other for ever.
+        let heaviest = region.region.peers.iter().max_by_key(|peer| {
+            (
+                cluster.effective_regions(peer.store_id),
+                // Highest count wins; the *lowest* store id breaks the tie, so `max_by_key`
+                // is given the negated id.
+                -i64::try_from(peer.store_id).unwrap_or(i64::MAX),
+            )
+        })?;
+
+        if heaviest.peer_id == region.leader_peer_id {
+            // The replica that has to go is the leader's, so the office moves first
+            // (`prompts/04-multiraft-pd.md` 4d: "move a follower replica, then transfer
+            // leadership only if needed"). Removing a leader outright costs an election that
+            // the cluster takes at PD's convenience rather than its own.
+            let successor = region
+                .region
+                .peers
+                .iter()
+                .filter(|peer| peer.peer_id != heaviest.peer_id)
+                .filter(|peer| peer.role == PeerRole::Voter)
+                .filter(|peer| !cluster.is_store_down(peer.store_id))
+                .min_by_key(|peer| (cluster.effective_leaders(peer.store_id), peer.store_id))?;
+            return Some(Balance::TransferLeader {
+                region_id,
+                epoch,
+                to_peer_id: successor.peer_id,
+                from_store: heaviest.store_id,
+                to_store: successor.store_id,
+                finishing: true,
+            });
+        }
+
         return Some(Balance::RemovePeer {
             region_id,
             epoch,
@@ -155,14 +188,16 @@ pub fn region_balance(region: &RegionRecord, cluster: &Cluster<'_>) -> Option<Ba
 
     // The first half: is one of this region's stores meaningfully busier than somewhere this
     // region could go?
+    //
+    // Every peer counts here, the leader's included. Adding a replica elsewhere does not move
+    // the office — only the `RemovePeer` above can do that, and it handles the case. Excluding
+    // the leader here instead would mean a region with a *single* replica could never move at
+    // all, because that replica is always the leader: a cluster of one store would never spread
+    // onto a store that joined it.
     let busiest = region
         .region
         .peers
         .iter()
-        // Moving the leader's replica means moving the office too; leader balance is the
-        // cheaper tool for that, so a follower is preferred and a region whose only busy peer
-        // is its leader is left to it.
-        .filter(|peer| peer.peer_id != region.leader_peer_id)
         .filter(|peer| !cluster.is_store_down(peer.store_id))
         .max_by_key(|peer| {
             (
@@ -235,6 +270,7 @@ pub fn leader_balance(region: &RegionRecord, cluster: &Cluster<'_>) -> Option<Ba
         to_peer_id: candidate.peer_id,
         from_store: leader.store_id,
         to_store: candidate.store_id,
+        finishing: false,
     })
 }
 
@@ -305,6 +341,7 @@ mod tests {
                 to_peer_id: 30,
                 from_store: 1,
                 to_store: 3,
+                finishing: false,
             })
         );
     }
@@ -438,17 +475,66 @@ mod tests {
         );
     }
 
-    /// Moving a leader's replica costs an election as well as a transfer, so a follower is
-    /// preferred and a region whose only busy peer leads is left to leader balance.
+    /// A region whose only replica is its leader must still be able to move, or a cluster of
+    /// one store never spreads onto a store that joins it — every region there is led by its
+    /// only peer. Adding a replica elsewhere does not move the office, so nothing about the
+    /// leader stands in the way of the *first* half of a move.
+    ///
+    /// This is the case the store lane's integration test found: with the leader excluded here,
+    /// it timed out waiting for regions to reach a second store.
     #[test]
-    fn the_leaders_replica_is_not_the_one_that_moves() {
-        let stores = [store(1, 40, 0), store(2, 5, 0)];
+    fn a_region_whose_only_replica_leads_still_moves() {
+        let stores = [store(1, 40, 40), store(2, 0, 0)];
         let region = region(&[(1, 10)], 10);
         let cluster = Cluster {
             target_replicas: 1,
             ..cluster(&stores)
         };
-        assert_eq!(region_balance(&region, &cluster), None);
+        assert_eq!(
+            region_balance(&region, &cluster),
+            Some(Balance::AddPeer {
+                region_id: 7,
+                epoch: Epoch::new(1, 1),
+                store_id: 2,
+            })
+        );
+    }
+
+    /// And the second half, when the replica that has to go is the leader's: the office moves
+    /// first. Removing a leader outright costs an election at PD's convenience rather than the
+    /// cluster's, and picking a *different* replica to drop would undo the move just made.
+    #[test]
+    fn a_move_whose_replica_is_the_leaders_transfers_the_office_first() {
+        let stores = [store(1, 40, 40), store(2, 1, 1)];
+        // The move has landed: the region is on both stores and over its target of one.
+        let landed = region(&[(1, 10), (2, 20)], 10);
+        let cluster = Cluster {
+            target_replicas: 1,
+            ..cluster(&stores)
+        };
+        assert_eq!(
+            region_balance(&landed, &cluster),
+            Some(Balance::TransferLeader {
+                region_id: 7,
+                epoch: Epoch::new(1, 1),
+                to_peer_id: 20,
+                from_store: 1,
+                to_store: 2,
+                finishing: true,
+            })
+        );
+
+        // Once the office has moved, the replica on the busy store goes.
+        let moved = region(&[(1, 10), (2, 20)], 20);
+        assert_eq!(
+            region_balance(&moved, &cluster),
+            Some(Balance::RemovePeer {
+                region_id: 7,
+                epoch: Epoch::new(1, 1),
+                peer_id: 10,
+                from_store: 1,
+            })
+        );
     }
 
     /// A balanced cluster asks for nothing — the property that makes "converge and stop" true.

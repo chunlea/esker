@@ -451,10 +451,13 @@ durable state is what 4a ships, and it is a single point of failure by design ra
   ([ADR 0018](adr/0018-balance-moves-the-spread-by-two.md)). Counts are **effective** counts: an
   operator's effect is applied when it is issued and withdrawn when it retires, so a round of decisions
   is a sequence rather than a hundred independent readings of the same stale numbers. Region count is
-  decided before leader count, because moving a replica takes any leadership of that region with it; a
-  replica move is add-then-remove, and the leader's own replica is not the one that moves. A per-region
-  `balance_cooldown` is a second guard against a store whose reports lag; repair ignores it, and so does
-  the second half of a move already begun. Balance can be switched off with repair left on.
+  decided before leader count, because moving a replica takes any leadership of that region with it. A
+  replica move is add-then-remove; the replica that goes is the one on the busiest store, and when that
+  is the leader's the office is transferred first. **A move already begun always finishes**: while it is
+  half done the region sits on two stores and is counted on both, so a stranded move corrupts the numbers
+  every later decision uses — which is why at most `max_balance_operators` moves are *started* at once,
+  and why neither that cap nor the per-region `balance_cooldown` may pause a move in progress. Repair is
+  subject to neither. Balance can be switched off with repair left on.
 - **Operator history.** The last 64 operator events — issued, done, cancelled, timed out — are kept in
   one bounded record on disk, so `esker pd inspect` can say what PD asked a cluster to do after the
   process is gone. A debugging record only: no decision reads it, and losing it costs an explanation
@@ -660,6 +663,7 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
 | `operator_timeout` | 300 s, measured from the last observed progress |
 | `target_replicas` | 3 |
 | `balance_cooldown` | 300 s per region, after an operator retires |
+| `max_balance_operators` | 4 moves started at once (finishing a move is never capped) |
 | leader / region spread threshold | 2 (a constant, not a knob — see ADR 0018) |
 | PD operator history | 64 events |
 | txn lock TTL | 3 s (heartbeat-extended) |

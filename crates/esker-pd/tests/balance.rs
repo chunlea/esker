@@ -35,6 +35,11 @@
 /// Rounds of quiet a test insists on after the cluster settles.
 const QUIET_ROUNDS: usize = 100;
 
+/// Consecutive quiet rounds that count as settled. Longer than the balance cooldown in rounds
+/// (300 s at one region-heartbeat interval each), so a cluster waiting out a cooldown is not
+/// mistaken for a finished one.
+const QUIET_RUN: usize = 10;
+
 /// What `--ignored` runs instead: the thousand rounds `prompts/04-multiraft-pd.md` 4d asks for.
 const SOAK_ROUNDS: usize = 1_000;
 
@@ -86,7 +91,10 @@ impl Model {
                     Shard {
                         // Peer ids well clear of the ones PD's allocator will mint.
                         peers: vec![Peer::voter(store_id, next * 100 + store_id)],
-                        leader_peer_id: 0,
+                        // A region's only replica leads it — which is what a real cluster looks
+                        // like, and the case that caught the rule refusing to move a leader's
+                        // replica at all.
+                        leader_peer_id: next * 100 + store_id,
                         epoch: Epoch::INITIAL,
                     },
                 );
@@ -268,6 +276,9 @@ impl Harness {
                 })
                 .unwrap();
             if let Some(operator) = beat.operator {
+                if std::env::var("ESKER_TRACE_BALANCE").is_ok() {
+                    println!("  {operator:?}");
+                }
                 self.model.apply(&operator);
                 issued += 1;
                 self.operators += 1;
@@ -276,19 +287,36 @@ impl Harness {
         issued
     }
 
-    /// Rounds until `spread` is at most one, or `limit` rounds, whichever comes first.
-    fn settle(&mut self, limit: usize, spread: fn(&Model) -> u64) -> usize {
+    /// Rounds until PD has asked for nothing for [`QUIET_RUN`] rounds running.
+    ///
+    /// "Settled" has to mean *PD has nothing left to ask*, not "the counts look even". A move
+    /// is two or three operators, and while one is half done the region sits on both stores —
+    /// so a snapshot of the counts can look balanced with dozens of moves outstanding. The
+    /// quiet run has to be longer than the balance cooldown, or a cluster merely waiting out
+    /// its cooldown would be mistaken for a finished one.
+    fn settle(&mut self, limit: usize) -> usize {
+        let mut quiet = 0;
         for round in 1..=limit {
-            self.round();
-            if spread(&self.model) <= 1 {
-                return round;
+            if self.round() == 0 {
+                quiet += 1;
+                if quiet >= QUIET_RUN {
+                    return round;
+                }
+            } else {
+                quiet = 0;
             }
         }
         panic!(
-            "not balanced after {limit} rounds: regions {:?}, leaders {:?}",
+            "not settled after {limit} rounds: regions {:?}, leaders {:?}",
             self.model.region_counts(),
             self.model.leader_counts()
         );
+    }
+
+    /// Replicas across the cluster, which must equal the number of regions once every move has
+    /// finished. A half-done move shows up here and nowhere else.
+    fn replicas(&self) -> u64 {
+        self.model.region_counts().iter().sum()
     }
 }
 
@@ -319,10 +347,14 @@ fn regions_spread_and_stop(quiet: usize) {
     let mut harness = Harness::start(Model::single_replica(&[60, 30, 10]), 1);
     assert_eq!(harness.model.region_counts(), vec![60, 30, 10]);
 
-    let rounds = harness.settle(200, region_spread);
+    let rounds = harness.settle(200);
     let counts = harness.model.region_counts();
     assert!(region_spread(&harness.model) <= 1, "settled at {counts:?}");
-    assert_eq!(counts.iter().sum::<u64>(), 100, "a region was lost");
+    assert_eq!(
+        harness.replicas(),
+        100,
+        "settled with moves half done: {counts:?}"
+    );
     println!(
         "regions balanced to {counts:?} in {rounds} rounds, {} operators",
         harness.operators
@@ -360,7 +392,7 @@ fn leaders_spread_and_stop(quiet: usize) {
     let mut harness = Harness::start(Model::three_replicas(&[60, 30, 10]), 3);
     assert_eq!(harness.model.leader_counts(), vec![60, 30, 10]);
 
-    let rounds = harness.settle(200, leader_spread);
+    let rounds = harness.settle(200);
     let counts = harness.model.leader_counts();
     assert!(leader_spread(&harness.model) <= 1, "settled at {counts:?}");
     assert_eq!(counts.iter().sum::<u64>(), 100, "a leader was lost");
@@ -383,6 +415,78 @@ fn leaders_spread_and_stop(quiet: usize) {
         );
     }
     assert_eq!(harness.model.leader_counts(), counts);
+}
+
+/// The in-flight cap bounds how many moves are started at once — and a move already begun is
+/// never blocked by it, because a region stranded on two stores is exactly what the cap exists
+/// to avoid.
+#[test]
+fn no_more_moves_are_started_than_the_cap_allows() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::new(1_700_000_000_000));
+    let cap = 2;
+    let pd = Pd::open(
+        dir.path(),
+        PdOptions {
+            target_replicas: 1,
+            max_balance_operators: cap,
+            filesystem: Some(Arc::new(MemFileSystem::new())),
+            ..PdOptions::with_clock(Arc::clone(&clock) as Arc<dyn Clock>)
+        },
+    )
+    .unwrap();
+    let model = Model::single_replica(&[60, 30, 10]);
+    for store_id in &model.stores {
+        pd.bootstrap(*store_id, &format!("127.0.0.1:{store_id}"))
+            .unwrap();
+    }
+    let mut harness = Harness {
+        _dir: dir,
+        clock,
+        pd,
+        model,
+        operators: 0,
+    };
+
+    // One round of heartbeats with nothing applied: every region asks, and only the cap's
+    // worth of moves may start.
+    harness.clock.advance(60_000);
+    for store_id in &harness.model.stores {
+        harness
+            .pd
+            .store_heartbeat(&StoreBeat {
+                store_id: *store_id,
+                stats: StoreStats {
+                    region_count: harness.model.regions_on(*store_id),
+                    leader_count: harness.model.leaders_on(*store_id),
+                    ..StoreStats::default()
+                },
+            })
+            .unwrap();
+    }
+    let mut started = 0;
+    for id in harness.model.shards.keys().copied().collect::<Vec<_>>() {
+        let shard = harness.model.shards[&id].clone();
+        let beat = harness
+            .pd
+            .region_heartbeat(&RegionBeat {
+                region: shard.region(id),
+                leader_peer_id: shard.leader_peer_id,
+                term: 4,
+                approximate_size: 0,
+                applied_index: 0,
+            })
+            .unwrap();
+        if beat.operator.is_some() {
+            started += 1;
+        }
+    }
+    assert_eq!(started, cap, "the cap did not bound the moves started");
+
+    // And it still converges, just more slowly — the cap delays moves, it does not forbid them.
+    harness.settle(400);
+    assert!(region_spread(&harness.model) <= 1);
+    assert_eq!(harness.replicas(), 100);
 }
 
 /// A cluster that is already balanced is not touched at all — the property every "and then

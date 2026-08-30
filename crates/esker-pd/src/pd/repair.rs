@@ -182,10 +182,17 @@ impl Pd {
             return None;
         }
         let move_ = balance::balance_for(record, cluster)?;
-        // A cooling region may still *finish* the move it started. The cooldown is there to
-        // stop a region being picked up again, not to strand it over-replicated for five
-        // minutes with the second half of its own move outstanding.
-        if state.cooling.contains_key(&record.region.id) && !move_.finishes_a_move() {
+        if move_.finishes_a_move() {
+            // A move already begun always proceeds: neither the cooldown nor the in-flight cap
+            // may strand a region on two stores. Both exist to stop moves being *started*.
+            return Some(Plan::Balance(move_));
+        }
+        // A cooling region is not picked up again, and neither is any region while enough
+        // moves are already under way — see `MAX_BALANCE_OPERATORS` for why the cap is about
+        // arithmetic rather than throughput.
+        if state.cooling.contains_key(&record.region.id)
+            || state.in_flight.len() >= self.max_balance_operators
+        {
             return None;
         }
         Some(Plan::Balance(move_))
@@ -207,6 +214,7 @@ impl Pd {
                 to_peer_id,
                 from_store,
                 to_store,
+                ..
             }) => (
                 Operator::TransferLeader {
                     region_id,

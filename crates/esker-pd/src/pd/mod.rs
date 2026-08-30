@@ -67,6 +67,20 @@ pub const MAX_STORE_DOWN_TIME_MS: u64 = 30_000;
 /// for. Repair ignores it: a region a failure away from losing quorum does not wait.
 pub const BALANCE_COOLDOWN_MS: u64 = 300_000;
 
+/// Balance moves PD will start while others are still in flight.
+///
+/// `prompts/04-multiraft-pd.md` 4d asks for balance to have "in-flight limits", and the reason
+/// is sharper than throttling I/O. A region **mid-move sits on two stores and is counted on
+/// both**, so every move in flight inflates the very numbers the next decision is taken from.
+/// Effective counts ([`crate::schedule::LoadDelta`]) correct for the operator itself; they
+/// cannot correct for a replica that genuinely exists in two places until the move finishes.
+/// Bounding the moves in flight bounds that inflation, and with it the number of moves made
+/// against a picture that is slightly wrong.
+///
+/// Repair is never capped, and neither is *finishing* a move already begun — a cap that could
+/// strand a half-done move would be worse than no cap at all.
+pub const MAX_BALANCE_OPERATORS: usize = 4;
+
 /// How long an operator may make no observable progress before PD gives up on it.
 ///
 /// Generous on purpose. The slow part of an `AddPeer` is catching the new replica up from a
@@ -95,6 +109,8 @@ pub struct PdOptions {
     pub target_replicas: usize,
     /// How long after an operator retires before that region may be balanced again.
     pub balance_cooldown_ms: u64,
+    /// Balance moves that may be *started* while others are in flight.
+    pub max_balance_operators: usize,
     /// Whether the balance rules run at all. On by default; a test or an operator wanting a
     /// cluster left exactly as it is turns them off, and repair still runs.
     pub balance: bool,
@@ -128,6 +144,7 @@ impl PdOptions {
             operator_timeout_ms: OPERATOR_TIMEOUT_MS,
             target_replicas: schedule::TARGET_REPLICAS,
             balance_cooldown_ms: BALANCE_COOLDOWN_MS,
+            max_balance_operators: MAX_BALANCE_OPERATORS,
             balance: true,
             filesystem: None,
         }
@@ -203,6 +220,7 @@ pub struct Pd {
     operator_timeout_ms: u64,
     target_replicas: usize,
     balance_cooldown_ms: u64,
+    max_balance_operators: usize,
     balance: bool,
     state: Mutex<State>,
 }
@@ -276,6 +294,7 @@ impl Pd {
             operator_timeout_ms: options.operator_timeout_ms,
             target_replicas: options.target_replicas,
             balance_cooldown_ms: options.balance_cooldown_ms,
+            max_balance_operators: options.max_balance_operators,
             balance: options.balance,
             state: Mutex::new(State {
                 cluster,

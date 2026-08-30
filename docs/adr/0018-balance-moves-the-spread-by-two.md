@@ -35,10 +35,13 @@ pub const REGION_SPREAD_THRESHOLD: i64 = 2;
 - A move is proposed only when `effective(busiest) - effective(quietest) >= 2`.
 - `effective` is the reported count **plus every in-flight operator's `LoadDelta`**, applied when
   the operator is issued and withdrawn when it retires.
-- Region count is considered before leader count; a replica move is add-then-remove; the leader's
-  own replica is not the one that moves.
-- A per-region cooldown (`balance_cooldown`, 300 s) is a second guard; repair ignores it, and so
-  does the second half of a move already begun.
+- Region count is considered before leader count; a replica move is add-then-remove; the replica
+  that goes is the one on the busiest store, and if that is the leader's the office is
+  transferred first.
+- At most `max_balance_operators` moves are *started* at once.
+- A per-region cooldown (`balance_cooldown`, 300 s) is a second guard.
+- **Neither the cap nor the cooldown may block a move already begun.** Repair is subject to
+  neither.
 
 ## Rationale
 
@@ -63,10 +66,11 @@ Deciding the leader first would propose a transfer that the replica move then un
 looks like progress and is not.
 
 **Per-region and greedy, accepting the cost.** A global optimiser would move fewer replicas: the
-fairness test converges 60/30/10 to 33/34/33 in 120 operators where the minimum is about 54,
-because a region on the middle store may move to the empty store early and a region from the full
-store then takes its place. Every individual decision was right when it was made; only the whole
-sequence is more than the minimum.
+fairness test converges 60/30/10 to [33, 34, 33] in 85 operators where about 81 is the floor —
+27 moves of three steps each, since a move whose replica is the leader's must transfer the office
+before it can remove the replica. A region on the middle store may still move to the empty store
+early and a region from the full store then take its place. Every individual decision was right
+when it was made; only the whole sequence is more than the minimum.
 
 That is the price of the heartbeat-driven design, and it buys three things worth more than the
 extra moves: PD needs no scheduler loop and no timer thread; a restart re-derives everything from
@@ -76,14 +80,45 @@ hand. A global optimiser would be a second scheduler with its own state, its own
 own restart story, to save moves in a cluster that is being rebalanced — which is by definition
 not the steady state.
 
+**A move in flight must always be allowed to finish**, and this is the rule the other two kept
+breaking. A region mid-move sits on **two stores and is counted on both**, so a half-done move
+inflates the very numbers every other decision is taken from. Effective counts correct for the
+operator itself; they cannot correct for a replica that genuinely exists twice. Every mechanism
+that pauses a move therefore has to exempt the steps that complete one — which is also why the
+in-flight cap exists at all: bounding the moves under way bounds the inflation, and with it the
+number of moves made against a picture that is slightly wrong. With the cap at four, converging
+60/30/10 costs 85 operators against a floor of 81; without it, 417.
+
 **Balance can be switched off**, and repair still runs. An operator who wants a cluster left
 exactly where it is should not have to give up replica repair to get it.
 
+## What this got wrong first
+
+Three bugs, each found by a test that the previous version of the code would have passed.
+
+1. **A region whose only replica was its leader could never move.** "The leader's replica is not
+   the one that moves" was applied to the *first* half of a move, where it is meaningless —
+   adding a replica elsewhere does not move the office. In a one-store cluster every region is
+   led by its only peer, so no region could ever spread onto a store that joined: the store
+   lane's integration test timed out waiting, which is how it was found. My own unit test had
+   asserted the broken behaviour as if it were intended.
+2. **Finishing a move could pick the wrong replica.** With the leader filter on the second half
+   too, the replica dropped could be the *newly added* one — undoing the move just made. The
+   replica that goes must be the one on the busiest store, full stop; if that is the leader's,
+   the office moves first.
+3. **A transfer that was finishing a move was treated as a new one**, so the cooldown stranded
+   the region on two stores for five rounds. That inflation is what made the balancer chase its
+   own tail: 158 replicas for 100 regions, and a "converged" cluster with 58 moves outstanding.
+
+All three were invisible to a convergence test that asked whether *the counts looked even*. They
+appeared the moment the test asked whether **PD had stopped asking for anything** and whether the
+replica count still equalled the region count. That is the criterion this file's tests use now.
+
 ## Consequences
 
-- **Convergence is bounded and testable.** 100 regions at 60/30/10 settle in two rounds, leaders
-  in one, and a thousand further rounds produce no operator at all — the assertion that a
-  balancer has actually stopped, which a snapshot of the counts cannot make.
+- **Convergence is bounded and testable.** 100 regions at 60/30/10 settle to [33, 34, 33] and
+  leaders to [34, 33, 33], and a thousand further rounds produce no operator at all — the
+  assertion that a balancer has actually stopped, which a snapshot of the counts cannot make.
 - **A cluster with fewer stores than replicas never balances regions**, because every store
   already holds every region and there is nowhere to move one. Leader balance still works. This
   is not a special case in the code; it falls out of "a store already hosting a peer of this
