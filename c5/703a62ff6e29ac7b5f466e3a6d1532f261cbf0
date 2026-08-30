@@ -1,0 +1,19 @@
+crates/esker-engine/tests/crash_kill.rs
+  s_dc640bf0df4adb::t_e664358056ff23 122-129,175-208,223-226,256-265,268,484-493,499,517,530-535,543-544,557-566
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "c5703a62ff6e29ac7b5f466e3a6d1532f261cbf0",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
