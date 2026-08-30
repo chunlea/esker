@@ -31,6 +31,7 @@
 //! | [`raft_log`] | the Raft log and the peer's persistent state, on the `raft` column family |
 //! | [`rawkv`] | the eight `RawKv` methods, over the engine, synchronously |
 //! | [`server`] | opening the database and its column families, and the wire service |
+//! | [`split`] | when a region is split, and where |
 //! | [`transport`] | one connection per store pair, carrying every region's messages per tick |
 //!
 //! Phase 2 builds the single-region store (`prompts/02-single-node-server.md`); the apply
@@ -50,6 +51,7 @@ pub mod rawkv;
 pub mod region;
 pub mod regions;
 pub mod server;
+pub mod split;
 pub mod transport;
 
 pub use apply::Command;
@@ -63,6 +65,7 @@ pub use rawkv::Limits;
 pub use region::{RegionMeta, request_range};
 pub use regions::{RegionMap, RegionState};
 pub use server::{Store, StoreOptions, StoreService};
+pub use split::{SplitOptions, choose_split_key};
 pub use transport::{PeerAddress, RegionTransport, StoreAddress, StoreTransport};
 
 /// Key prefixes inside the `raft` column family (`docs/DESIGN.md` §6).
