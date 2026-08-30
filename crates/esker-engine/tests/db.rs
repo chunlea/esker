@@ -1196,6 +1196,74 @@ fn compaction_moves_data_down_and_keeps_every_key() {
     );
 }
 
+/// **Regression.** A newer version of a key must never end up *below* an older one.
+///
+/// L0 files overlap, so an L0 compaction has to take every L0 file that overlaps its inputs —
+/// and that set has to be closed under the overlap, not swept once. Three files, flushed
+/// oldest first:
+///
+/// ```text
+///   A = [k15, k15]   the older k15                     (oldest)
+///   B = [k09, k20]   the newer k15
+///   S = [k05, k09]   the seed                          (newest)
+/// ```
+///
+/// `S` pulls in `B`, which widens the range from `[k05, k09]` to `[k05, k20]` — and only then
+/// does `A` overlap. Sweep once and `A` is left at L0 holding k15's older value while the newer
+/// one moves to L1; a point read consults every L0 file before it reaches L1, so the older
+/// value wins and an acknowledged write is lost.
+///
+/// The range is bounded at `[k05, k05]` so the compaction is seeded by `S` alone, and the
+/// trigger is set out of reach so the only compaction that runs is the one asked for here: the
+/// bug is in which files are picked, not in when, and a test of it should not turn on the
+/// background pool's timing.
+#[test]
+fn an_l0_compaction_never_leaves_an_older_version_above_a_newer_one() {
+    let (_, fs) = memfs();
+    let mut options = options();
+    options.cf_options.level0_file_num_compaction_trigger = 100;
+    let db = open(&fs, options, &[cf::DEFAULT]).unwrap();
+
+    db.put(cf::DEFAULT, b"k15", b"old").unwrap();
+    db.flush(cf::DEFAULT).unwrap();
+
+    db.put(cf::DEFAULT, b"k09", b"v0").unwrap();
+    db.put(cf::DEFAULT, b"k15", b"new").unwrap();
+    db.put(cf::DEFAULT, b"k20", b"v0").unwrap();
+    db.flush(cf::DEFAULT).unwrap();
+
+    db.put(cf::DEFAULT, b"k05", b"v0").unwrap();
+    db.put(cf::DEFAULT, b"k09", b"v1").unwrap();
+    db.flush(cf::DEFAULT).unwrap();
+
+    assert_eq!(
+        db.property("esker.num-files-at-level0.default").unwrap(),
+        "3",
+        "three L0 files, none of them compacted yet"
+    );
+
+    db.compact_range(cf::DEFAULT, Some(b"k05"), Some(b"k05"))
+        .unwrap();
+
+    assert_eq!(
+        get(&db, b"k15").as_deref(),
+        Some(&b"new"[..]),
+        "the newer version of k15 was left below the older one"
+    );
+    for (key, value) in [
+        (&b"k05"[..], &b"v0"[..]),
+        (&b"k09"[..], &b"v1"[..]),
+        (&b"k20"[..], &b"v0"[..]),
+    ] {
+        assert_eq!(
+            get(&db, key).as_deref(),
+            Some(value),
+            "{}",
+            String::from_utf8_lossy(key)
+        );
+    }
+}
+
 /// A compaction may not collect what a snapshot can still read. This is the property the
 /// floor exists for, checked end to end rather than in the picker's unit tests.
 #[test]

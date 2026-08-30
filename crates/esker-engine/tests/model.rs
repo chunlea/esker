@@ -55,6 +55,7 @@ use esker_engine::memfs::MemFileSystem;
 use esker_engine::options::{Options, ReadOptions, WriteOptions};
 use esker_engine::{Db, Snapshot, cf};
 use proptest::prelude::*;
+use proptest::test_runner::FileFailurePersistence;
 
 const DIR: &str = "/db";
 
@@ -83,6 +84,12 @@ type Entries = Vec<(Vec<u8>, Vec<u8>)>;
 fn config(cases: u32) -> ProptestConfig {
     ProptestConfig {
         cases,
+        // An integration test has no `lib.rs` or `main.rs` beside it, so proptest's default
+        // `SourceParallel` cannot find a source root and silently persists nothing — which
+        // means a checked-in failing seed would never be replayed. Name the file outright.
+        failure_persistence: Some(Box::new(FileFailurePersistence::Direct(
+            "tests/proptest-regressions/model.txt",
+        ))),
         ..ProptestConfig::default()
     }
 }

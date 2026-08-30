@@ -23,7 +23,7 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use crate::dbformat::{InternalKeyComparator, extract_user_key};
+use crate::dbformat::{Comparator, InternalKeyComparator, extract_user_key};
 use crate::options::CfOptions;
 use crate::version::{CfVersion, FileMeta};
 
@@ -182,10 +182,8 @@ impl Picker {
         // L0 files overlap each other, so a compaction of one is a compaction of everything
         // that shares its range — otherwise the output would sit below entries that are newer
         // than it.
-        if level == 0
-            && let Some((low, high)) = CfVersion::range_of(&inputs, user)
-        {
-            inputs = version.overlapping(0, Some(&low), Some(&high), user);
+        if level == 0 {
+            inputs = l0_closure(version, inputs, user);
         }
 
         let mut overlapped = match CfVersion::range_of(&inputs, user) {
@@ -199,7 +197,12 @@ impl Picker {
         if !overlapped.is_empty()
             && let Some((low, high)) = CfVersion::range_of(&overlapped, user)
         {
-            let expanded = version.overlapping(level, Some(&low), Some(&high), user);
+            let mut expanded = version.overlapping(level, Some(&low), Some(&high), user);
+            if level == 0 {
+                // Same rule as above: a set of L0 inputs that is not closed under overlap
+                // inverts the pair it splits.
+                expanded = l0_closure(version, expanded, user);
+            }
             if expanded.len() > inputs.len()
                 && let Some((low, high)) = CfVersion::range_of(&expanded, user)
             {
@@ -240,6 +243,36 @@ impl Picker {
             }
         }
         true
+    }
+}
+
+/// Grows `files` until it holds every L0 file that overlaps its own key range.
+///
+/// One pass is not enough, and that is the whole point of this function. Each file pulled in
+/// can widen the range, and a file that overlaps only the *widened* range has to come too:
+/// leave it behind and it stays at L0 still holding an older version of a key whose newer
+/// version has just moved to L1 — and the read path consults all of L0 before L1, so the older
+/// version wins and an acknowledged write is lost. `LevelDB` says this by restarting its scan
+/// whenever an added file widens the range; a fixed point is the same rule without the index
+/// arithmetic.
+///
+/// Terminates because every round is a superset of the last and L0 holds finitely many files.
+fn l0_closure(
+    version: &CfVersion,
+    mut files: Vec<Arc<FileMeta>>,
+    user: &dyn Comparator,
+) -> Vec<Arc<FileMeta>> {
+    loop {
+        let Some((low, high)) = CfVersion::range_of(&files, user) else {
+            return files;
+        };
+        let grown = version.overlapping(0, Some(&low), Some(&high), user);
+        // Every file of `files` lies inside `[low, high]`, so `grown` contains all of them and
+        // equal lengths mean the set has stopped growing.
+        if grown.len() == files.len() {
+            return grown;
+        }
+        files = grown;
     }
 }
 
@@ -386,6 +419,39 @@ mod tests {
             picked,
             vec![2, 3, 4],
             "the chain of overlapping files, not the disjoint one"
+        );
+    }
+
+    /// **Regression.** The overlap has to be taken to a fixed point, not swept once.
+    ///
+    /// The seed `[k09, k09]` pulls in `[k08, k19]`, and *that* widens the range onto
+    /// `[k08, k08]`, which overlaps nothing the seed touched. One sweep leaves it at L0 while
+    /// the newer version of `k08` moves to L1 — and a point read consults every L0 file before
+    /// it reaches L1, so the older value wins and an acknowledged write is lost. The model
+    /// test found this shape; [`an_l0_compaction_takes_every_overlapping_l0_file`] and
+    /// [`overlapping_l0_files_are_compacted_together`] both miss it because their chains are
+    /// reachable in a single sweep.
+    #[test]
+    fn an_l0_file_reached_only_through_another_is_still_taken() {
+        let version = version(&[
+            (0, 10, "k09", "k09", 1),
+            (0, 8, "k08", "k19", 1),
+            (0, 6, "k08", "k08", 1),
+            (0, 4, "k00", "k00", 1),
+        ]);
+        let compaction = picker()
+            .pick(0, cf(&version), &[])
+            .expect("four files trigger L0");
+        let mut picked = numbers(&compaction.inputs);
+        picked.sort_unstable();
+        assert_eq!(
+            picked,
+            vec![6, 8, 10],
+            "file 6 overlaps only the range file 8 widened the seed to"
+        );
+        assert!(
+            !picked.contains(&4),
+            "the closure stops at files that really do not overlap"
         );
     }
 
