@@ -19,10 +19,10 @@
 //!
 //! # Where the scheduling lives
 //!
-//! Replica repair — observing an operator, retiring it, issuing the next one — is
-//! [`repair`], a child module. It is a child rather than a sibling because it reaches into
-//! this one's private state on every heartbeat, and because the two halves are one lock's
-//! worth of work: the file is split for reading, not for isolation.
+//! Replica repair — observing an operator, retiring it, issuing the next one — is the private
+//! `repair` child module. It is a child rather than a sibling because it reaches into this
+//! one's private state on every heartbeat, and because the two halves are one lock's worth of
+//! work: the file is split for reading, not for isolation.
 //!
 //! # One lock
 //!
