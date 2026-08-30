@@ -24,26 +24,35 @@
 //! the engine, which is concurrent, and a lookup racing an upsert is exactly the staleness the
 //! design already tolerates (`docs/DESIGN.md` §7).
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use esker_engine::{
     Db, LocalFileSystem, Options, ReadOptions, WalSyncMode, WriteBatch, WriteOptions, cf,
 };
-use esker_proto::{Region, StoreInfo};
+use esker_proto::{Operator, Region, StoreInfo};
 
 use crate::alloc::{ALLOC_BATCH, Allocator};
 use crate::clock::{Clock, SystemClock};
 use crate::error::{PdError, Result};
 use crate::keys;
+use crate::operator::{InFlight, Observed};
 use crate::record::{AllocRecord, ClusterRecord, RegionRecord, StoreRecord, TsoRecord};
 use crate::routing::{self, RegionBeat, StoreBeat, Upsert};
+use crate::schedule::{self, Cluster, Repair};
 use crate::tso::Oracle;
 
 /// How long a store may be silent before it is considered down (`docs/DESIGN.md` §7).
-///
-/// Recorded and exposed in 4a; acted on in 4c, which is where replica repair lives.
 pub const MAX_STORE_DOWN_TIME_MS: u64 = 30_000;
+
+/// How long an operator may make no observable progress before PD gives up on it.
+///
+/// Generous on purpose. The slow part of an `AddPeer` is catching the new replica up from a
+/// snapshot, and cancelling a transfer that is working throws the work away and starts again
+/// with a fresh peer id. The clock runs from the last observed progress rather than from the
+/// issue ([`crate::operator`]), so this bounds *being stuck*, not taking long.
+pub const OPERATOR_TIMEOUT_MS: u64 = 300_000;
 
 /// How PD is opened.
 #[derive(Debug, Clone)]
@@ -57,8 +66,12 @@ pub struct PdOptions {
     pub alloc_batch: u64,
     /// How far ahead of the clock the oracle's mark is persisted.
     pub tso_save_interval_ms: u64,
-    /// How long a store may be silent before [`Pd::down_stores`] reports it.
+    /// How long a store may be silent before it is down, and its regions are repaired.
     pub max_store_down_time_ms: u64,
+    /// How long an operator may make no observable progress before it is abandoned.
+    pub operator_timeout_ms: u64,
+    /// Replicas a region should have. Repair restores this; it does not grow past it.
+    pub target_replicas: usize,
 }
 
 impl PdOptions {
@@ -77,6 +90,8 @@ impl PdOptions {
             alloc_batch: ALLOC_BATCH,
             tso_save_interval_ms: crate::TSO_SAVE_INTERVAL_MS,
             max_store_down_time_ms: MAX_STORE_DOWN_TIME_MS,
+            operator_timeout_ms: OPERATOR_TIMEOUT_MS,
+            target_replicas: schedule::TARGET_REPLICAS,
         }
     }
 
@@ -127,6 +142,19 @@ pub struct RegionRoute {
     pub stores: Vec<StoreInfo>,
 }
 
+/// What one region heartbeat did, and what PD wants back from that region.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Beat {
+    /// Whether the heartbeat updated the routing table or was dropped as stale.
+    pub upsert: Upsert,
+    /// The membership change PD wants this region's leader to propose, if any.
+    ///
+    /// At most one per region, ever, and the *same* one comes back on every heartbeat until a
+    /// heartbeat shows it happened or it is abandoned (`docs/DESIGN.md` §7). A leader that
+    /// ignores it loses nothing but time.
+    pub operator: Option<Operator>,
+}
+
 /// The placement driver.
 #[derive(Debug)]
 pub struct Pd {
@@ -134,6 +162,8 @@ pub struct Pd {
     cf: u32,
     clock: Arc<dyn Clock>,
     max_store_down_time_ms: u64,
+    operator_timeout_ms: u64,
+    target_replicas: usize,
     state: Mutex<State>,
 }
 
@@ -143,6 +173,15 @@ pub(crate) struct State {
     pub(crate) cluster: Option<ClusterRecord>,
     pub(crate) alloc: Allocator,
     pub(crate) oracle: Oracle,
+    /// The operator in flight for each region, keyed by region id — which is what makes
+    /// "never two operators for one region" (`docs/DESIGN.md` §7) a property of the type
+    /// rather than a rule someone has to remember.
+    ///
+    /// **Not persisted.** A restart forgets every operator and re-derives what is needed from
+    /// the next round of heartbeats ([`crate::schedule`]); persisting them would mean
+    /// reconciling a remembered plan with a cluster that moved on while PD was down, which is
+    /// strictly harder than recomputing.
+    pub(crate) in_flight: BTreeMap<u64, InFlight>,
 }
 
 impl Pd {
@@ -180,10 +219,13 @@ impl Pd {
             cf,
             clock: options.clock,
             max_store_down_time_ms: options.max_store_down_time_ms,
+            operator_timeout_ms: options.operator_timeout_ms,
+            target_replicas: options.target_replicas,
             state: Mutex::new(State {
                 cluster,
                 alloc: Allocator::load(alloc, options.alloc_batch),
                 oracle,
+                in_flight: BTreeMap::new(),
             }),
         }))
     }
@@ -389,7 +431,7 @@ impl Pd {
     /// The guard is [`routing::accepts`]; a dropped heartbeat is [`Upsert::Stale`] rather than
     /// an error, because an out-of-order beat is a normal consequence of a leader change and
     /// not something the sender did wrong.
-    pub fn region_heartbeat(&self, beat: &RegionBeat) -> Result<Upsert> {
+    pub fn region_heartbeat(&self, beat: &RegionBeat) -> Result<Beat> {
         if beat.region.id == 0 {
             return Err(PdError::invalid("region id zero is not a region"));
         }
@@ -400,31 +442,150 @@ impl Pd {
             )));
         }
         let now_ms = self.clock.now_ms();
-        let _state = self.lock()?;
+        let mut state = self.lock()?;
 
         let previous = routing::read_region(&self.db, beat.region.id)?;
-        if let Some(previous) = &previous
-            && !routing::accepts(previous, beat.region.epoch, beat.term)
-        {
+        let outdated = previous
+            .as_ref()
+            .is_some_and(|held| !routing::accepts(held, beat.region.epoch, beat.term));
+
+        // The record PD holds after this beat: the new one, or the one it kept.
+        let record = if outdated {
             tracing::debug!(
                 region_id = beat.region.id,
                 "dropping a heartbeat older than the record it would replace"
             );
-            return Ok(Upsert::Stale);
+            previous.clone().unwrap_or_else(|| unreachable_stale(beat))
+        } else {
+            let record = RegionRecord {
+                region: beat.region.clone(),
+                leader_peer_id: beat.leader_peer_id,
+                term: beat.term,
+                approximate_size: beat.approximate_size,
+                applied_index: beat.applied_index,
+                last_heartbeat_ms: now_ms,
+            };
+            let mut batch = WriteBatch::new();
+            routing::stage_region(&mut batch, self.cf, &record, previous.as_ref());
+            self.write(batch)?;
+            record
+        };
+
+        // Scheduling happens here, on the heartbeat, and nowhere else. A store going down is
+        // noticed by *absence*, so the trigger has to be somebody else's beat: repair latency
+        // is therefore bounded by `max_store_down_time` plus one region-heartbeat interval,
+        // and PD needs no timer thread to have it (`docs/DESIGN.md` §7, §14).
+        let operator = self.schedule(&mut state, &record, now_ms)?;
+        Ok(Beat {
+            upsert: if outdated {
+                Upsert::Stale
+            } else {
+                Upsert::Applied
+            },
+            operator,
+        })
+    }
+
+    /// Observes the operator in flight for `record`'s region, and issues one if none is.
+    ///
+    /// Called with the state lock held, because the in-flight set, the allocator and the
+    /// decision all have to move together: two heartbeats for one region arriving at once must
+    /// not each mint a peer id and each believe they are the only operator.
+    fn schedule(
+        &self,
+        state: &mut State,
+        record: &RegionRecord,
+        now_ms: u64,
+    ) -> Result<Option<Operator>> {
+        let region_id = record.region.id;
+
+        if let Some(flight) = state.in_flight.get_mut(&region_id) {
+            match flight.observe(record, now_ms, self.operator_timeout_ms) {
+                Observed::Pending(progress) => {
+                    // `advance` answers `None` for an operator the store has demonstrably
+                    // started: it has the work, and asking again would only earn a refusal.
+                    return Ok(flight.advance(progress, now_ms).cloned());
+                }
+                Observed::Done => {
+                    tracing::info!(
+                        region_id,
+                        operator = flight.operator.name(),
+                        "operator done"
+                    );
+                }
+                Observed::Cancelled(why) => {
+                    tracing::info!(
+                        region_id,
+                        operator = flight.operator.name(),
+                        why = why.name(),
+                        "operator cancelled"
+                    );
+                }
+                Observed::TimedOut => {
+                    tracing::warn!(
+                        region_id,
+                        operator = flight.operator.name(),
+                        sends = flight.sends,
+                        "operator timed out with nothing observed; it will be re-derived"
+                    );
+                }
+            }
+            // Every outcome but `Pending` finishes the operator. Dropping it here is what lets
+            // the rule below issue a replacement on this same heartbeat rather than the next.
+            state.in_flight.remove(&region_id);
         }
 
-        let record = RegionRecord {
-            region: beat.region.clone(),
-            leader_peer_id: beat.leader_peer_id,
-            term: beat.term,
-            approximate_size: beat.approximate_size,
-            applied_index: beat.applied_index,
-            last_heartbeat_ms: now_ms,
+        let stores = routing::stores(&self.db)?;
+        let cluster = Cluster {
+            stores: &stores,
+            now_ms,
+            max_store_down_time_ms: self.max_store_down_time_ms,
+            target_replicas: self.target_replicas,
         };
-        let mut batch = WriteBatch::new();
-        routing::stage_region(&mut batch, self.cf, &record, previous.as_ref());
-        self.write(batch)?;
-        Ok(Upsert::Applied)
+        let Some(repair) = schedule::repair_for(record, &cluster) else {
+            return Ok(None);
+        };
+
+        let operator = match repair {
+            Repair::AddPeer {
+                region_id,
+                epoch,
+                store_id,
+            } => {
+                // A fresh peer id, from the persisted allocator, every time an `AddPeer` is
+                // issued — including after a restart that re-derived the same repair. Reusing
+                // the id of an operator PD has forgotten would risk two peers with one id;
+                // burning one is free (`docs/adr/0010-pd-durable-state.md`).
+                let db = Arc::clone(&self.db);
+                let cf = self.cf;
+                let peer_id = state.alloc.allocate(1, |end| persist_alloc(&db, cf, end))?;
+                Operator::AddPeer {
+                    region_id,
+                    epoch,
+                    store_id,
+                    peer_id,
+                }
+            }
+            Repair::RemovePeer {
+                region_id,
+                epoch,
+                peer_id,
+            } => Operator::RemovePeer {
+                region_id,
+                epoch,
+                peer_id,
+            },
+        };
+        tracing::info!(region_id, operator = operator.name(), "operator issued");
+        state
+            .in_flight
+            .insert(region_id, InFlight::new(operator.clone(), now_ms));
+        Ok(Some(operator))
+    }
+
+    /// The operators PD is waiting on, by region. For the inspector and the tests.
+    pub fn in_flight(&self) -> Result<BTreeMap<u64, InFlight>> {
+        Ok(self.lock()?.in_flight.clone())
     }
 
     /// Every region PD knows about, in id order.
@@ -474,6 +635,13 @@ impl Pd {
     }
 }
 
+/// A heartbeat can only be stale against a record that exists, so this is unreachable — and it
+/// builds a record from the beat rather than panicking if the impossible happens
+/// (`CLAUDE.md` invariant 9).
+fn unreachable_stale(beat: &RegionBeat) -> RegionRecord {
+    RegionRecord::new(beat.region.clone(), 0)
+}
+
 fn read(db: &Db, key: &[u8]) -> Result<Option<bytes::Bytes>> {
     Ok(db.get(cf::DEFAULT, key, &ReadOptions::default())?)
 }
@@ -517,7 +685,7 @@ mod tests {
     use crate::Clock as _;
     use crate::clock::TestClock;
     use crate::error::PdError;
-    use esker_proto::{Epoch, Peer, Region, StoreInfo};
+    use esker_proto::{Epoch, Operator, Peer, Region, StoreInfo};
     use std::sync::Arc;
 
     fn open() -> (tempfile::TempDir, Arc<TestClock>, Arc<Pd>) {
@@ -763,8 +931,8 @@ mod tests {
                 (beat(old, 10, 4), beat(new, 20, 5))
             };
 
-            assert_eq!(pd.region_heartbeat(&first).unwrap(), Upsert::Applied);
-            let outcome = pd.region_heartbeat(&second).unwrap();
+            assert_eq!(pd.region_heartbeat(&first).unwrap().upsert, Upsert::Applied);
+            let outcome = pd.region_heartbeat(&second).unwrap().upsert;
             assert_eq!(
                 outcome,
                 if reversed {
@@ -795,7 +963,8 @@ mod tests {
         for stale in [(2, 3), (3, 2), (2, 4)] {
             assert_eq!(
                 pd.region_heartbeat(&beat(ranged(1, b"", b"", stale), 99, 9))
-                    .unwrap(),
+                    .unwrap()
+                    .upsert,
                 Upsert::Stale,
                 "epoch {stale:?} was accepted over (3, 3)"
             );
@@ -813,7 +982,7 @@ mod tests {
 
         pd.region_heartbeat(&beat(region(), 10, 7)).unwrap();
         assert_eq!(
-            pd.region_heartbeat(&beat(region(), 20, 6)).unwrap(),
+            pd.region_heartbeat(&beat(region(), 20, 6)).unwrap().upsert,
             Upsert::Stale,
             "a beat from a leader that has already lost office"
         );
@@ -821,7 +990,7 @@ mod tests {
 
         // The same leader reporting again, at the same term, is fresher stats.
         assert_eq!(
-            pd.region_heartbeat(&beat(region(), 30, 7)).unwrap(),
+            pd.region_heartbeat(&beat(region(), 30, 7)).unwrap().upsert,
             Upsert::Applied
         );
         assert_eq!(pd.regions().unwrap()[0].leader_peer_id, 30);
@@ -938,6 +1107,323 @@ mod tests {
         let route = pd.get_region(b"zz").unwrap().unwrap();
         assert_eq!(route.region.id, 2);
         assert_eq!(route.leader_peer_id, Some(20));
+    }
+
+    // ------------------------------------------------------------------------------------
+    // 4c: replica repair
+    // ------------------------------------------------------------------------------------
+
+    /// Registers `store_id` and beats for it, which is what a live store does.
+    fn alive(pd: &Pd, store_id: u64, region_count: u64) {
+        pd.store_heartbeat(&StoreBeat {
+            store_id,
+            stats: crate::StoreStats {
+                region_count,
+                ..crate::StoreStats::default()
+            },
+        })
+        .unwrap();
+    }
+
+    fn whole_space(peers: Vec<Peer>, epoch: Epoch) -> Region {
+        Region {
+            id: 1,
+            start_key: bytes::Bytes::new(),
+            end_key: bytes::Bytes::new(),
+            peers,
+            epoch,
+        }
+    }
+
+    fn three_replicas() -> Region {
+        whole_space(
+            vec![Peer::voter(1, 10), Peer::voter(2, 20), Peer::voter(3, 30)],
+            Epoch::new(1, 1),
+        )
+    }
+
+    /// Four stores registered, three replicas, and store 3 about to go quiet.
+    fn cluster_of_four(pd: &Pd) {
+        for store_id in 1..=4 {
+            pd.bootstrap(store_id, &format!("127.0.0.1:{store_id}"))
+                .unwrap();
+        }
+    }
+
+    /// Three stores, three replicas, one store dies: the surviving leader's next heartbeat
+    /// comes back with an `AddPeer`, and PD keeps asking until a heartbeat shows it happened.
+    #[test]
+    fn a_dead_store_earns_an_add_peer_on_the_next_heartbeat() {
+        let (_dir, clock, pd) = open();
+        cluster_of_four(&pd);
+        for store_id in 1..=4 {
+            alive(&pd, store_id, u64::from(store_id == 4));
+        }
+        assert_eq!(
+            pd.region_heartbeat(&beat(three_replicas(), 10, 4))
+                .unwrap()
+                .operator,
+            None,
+            "a healthy region is left alone"
+        );
+
+        // Store 3 goes quiet. The others keep beating, so they stay live.
+        clock.advance(super::MAX_STORE_DOWN_TIME_MS + 1);
+        for store_id in [1, 2, 4] {
+            alive(&pd, store_id, u64::from(store_id == 4));
+        }
+
+        let operator = pd
+            .region_heartbeat(&beat(three_replicas(), 10, 4))
+            .unwrap()
+            .operator
+            .expect("a repair");
+        let (store_id, peer_id) = match operator {
+            Operator::AddPeer {
+                region_id,
+                epoch,
+                store_id,
+                peer_id,
+            } => {
+                assert_eq!(region_id, 1);
+                assert_eq!(epoch, Epoch::new(1, 1), "addressed to the epoch PD holds");
+                (store_id, peer_id)
+            }
+            other => panic!("expected an AddPeer, got {other:?}"),
+        };
+        assert_eq!(store_id, 4, "the only live store without a peer");
+        assert!(peer_id > 0);
+
+        // Asked again, and again, until something changes: the *same* operator, not a second.
+        for _ in 0..3 {
+            let again = pd
+                .region_heartbeat(&beat(three_replicas(), 10, 4))
+                .unwrap()
+                .operator
+                .expect("still asking");
+            assert_eq!(again, operator, "PD invented a second operator");
+        }
+        assert_eq!(pd.in_flight().unwrap().len(), 1);
+        assert_eq!(pd.in_flight().unwrap()[&1].sends, 4);
+    }
+
+    /// The other half of the repair: once the new replica is a voter, PD stops asking for it
+    /// and asks for the dead one to go — add first, remove second.
+    #[test]
+    fn the_dead_peer_is_removed_only_after_the_new_one_is_a_voter() {
+        let (_dir, clock, pd) = open();
+        cluster_of_four(&pd);
+        pd.region_heartbeat(&beat(three_replicas(), 10, 4)).unwrap();
+
+        clock.advance(super::MAX_STORE_DOWN_TIME_MS + 1);
+        for store_id in [1, 2, 4] {
+            alive(&pd, store_id, 0);
+        }
+        let Some(Operator::AddPeer { peer_id, .. }) = pd
+            .region_heartbeat(&beat(three_replicas(), 10, 4))
+            .unwrap()
+            .operator
+        else {
+            panic!("expected an AddPeer");
+        };
+
+        // The store adds it as a learner first: PD sees progress and stops asking.
+        let catching_up = whole_space(
+            vec![
+                Peer::voter(1, 10),
+                Peer::voter(2, 20),
+                Peer::voter(3, 30),
+                Peer {
+                    store_id: 4,
+                    peer_id,
+                    role: esker_proto::PeerRole::Learner,
+                },
+            ],
+            Epoch::new(2, 1),
+        );
+        assert_eq!(
+            pd.region_heartbeat(&beat(catching_up, 10, 4))
+                .unwrap()
+                .operator,
+            None,
+            "the store has the work; asking again would only earn a refusal"
+        );
+
+        // Promoted. Now there are three live replicas, so the dead peer may go.
+        let promoted = whole_space(
+            vec![
+                Peer::voter(1, 10),
+                Peer::voter(2, 20),
+                Peer::voter(3, 30),
+                Peer::voter(4, peer_id),
+            ],
+            Epoch::new(3, 1),
+        );
+        assert_eq!(
+            pd.region_heartbeat(&beat(promoted, 10, 4))
+                .unwrap()
+                .operator,
+            Some(Operator::RemovePeer {
+                region_id: 1,
+                epoch: Epoch::new(3, 1),
+                peer_id: 30,
+            })
+        );
+
+        // And once it is gone, nothing more.
+        let repaired = whole_space(
+            vec![
+                Peer::voter(1, 10),
+                Peer::voter(2, 20),
+                Peer::voter(4, peer_id),
+            ],
+            Epoch::new(4, 1),
+        );
+        assert_eq!(
+            pd.region_heartbeat(&beat(repaired, 10, 4))
+                .unwrap()
+                .operator,
+            None
+        );
+        assert!(pd.in_flight().unwrap().is_empty(), "nothing left in flight");
+    }
+
+    /// An operator nothing acts on must not hold its region for ever: one in flight means no
+    /// second one, so a stuck operator would block every later repair of that region.
+    #[test]
+    fn a_timed_out_operator_is_replaced_rather_than_left_in_the_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(TestClock::new(1_700_000_000_000));
+        let pd = Pd::open(
+            dir.path(),
+            PdOptions {
+                operator_timeout_ms: 1_000,
+                ..PdOptions::with_clock(Arc::clone(&clock) as Arc<dyn crate::Clock>)
+            },
+        )
+        .unwrap();
+        cluster_of_four(&pd);
+
+        clock.advance(super::MAX_STORE_DOWN_TIME_MS + 1);
+        for store_id in [1, 2, 4] {
+            alive(&pd, store_id, 0);
+        }
+        let first = pd
+            .region_heartbeat(&beat(three_replicas(), 10, 4))
+            .unwrap()
+            .operator
+            .expect("a repair");
+
+        // Nothing happens for longer than the operator's patience.
+        clock.advance(2_000);
+        for store_id in [1, 2, 4] {
+            alive(&pd, store_id, 0);
+        }
+        let second = pd
+            .region_heartbeat(&beat(three_replicas(), 10, 4))
+            .unwrap()
+            .operator
+            .expect("a fresh repair");
+
+        assert_ne!(first, second, "the abandoned operator was re-sent verbatim");
+        match (first, second) {
+            (Operator::AddPeer { peer_id: old, .. }, Operator::AddPeer { peer_id: new, .. }) => {
+                assert!(new > old, "a re-issue mints a fresh peer id");
+            }
+            other => panic!("expected two AddPeers, got {other:?}"),
+        }
+        assert_eq!(pd.in_flight().unwrap().len(), 1, "still only one at a time");
+    }
+
+    /// The prompt's explicit test: PD is killed between issuing an operator and its
+    /// completion. In-flight operators are not persisted, so the restarted PD must re-derive
+    /// the need from heartbeats — and must not reuse the peer id it has forgotten, because the
+    /// old one may be halfway through being added.
+    #[test]
+    fn a_pd_restarted_mid_operator_re_derives_and_never_reuses_a_peer_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(TestClock::new(1_700_000_000_000));
+        let options = || PdOptions::with_clock(Arc::clone(&clock) as Arc<dyn crate::Clock>);
+
+        let issued = {
+            let pd = Pd::open(dir.path(), options()).unwrap();
+            cluster_of_four(&pd);
+            clock.advance(super::MAX_STORE_DOWN_TIME_MS + 1);
+            for store_id in [1, 2, 4] {
+                alive(&pd, store_id, 0);
+            }
+            pd.region_heartbeat(&beat(three_replicas(), 10, 4))
+                .unwrap()
+                .operator
+                .expect("a repair")
+        };
+
+        // PD dies here, with the operator in flight and nothing applied.
+        let pd = Pd::open(dir.path(), options()).unwrap();
+        assert!(
+            pd.in_flight().unwrap().is_empty(),
+            "in-flight operators are memory, not state"
+        );
+
+        // The stores re-register and beat, as they do on any PD they find.
+        for store_id in [1, 2, 4] {
+            pd.bootstrap(store_id, &format!("127.0.0.1:{store_id}"))
+                .unwrap();
+        }
+        clock.advance(super::MAX_STORE_DOWN_TIME_MS + 1);
+        for store_id in [1, 2, 4] {
+            alive(&pd, store_id, 0);
+        }
+
+        let after = pd
+            .region_heartbeat(&beat(three_replicas(), 10, 4))
+            .unwrap()
+            .operator
+            .expect("the need is re-derived from the heartbeats");
+
+        match (issued, after) {
+            (
+                Operator::AddPeer {
+                    store_id: before_store,
+                    peer_id: before_peer,
+                    ..
+                },
+                Operator::AddPeer {
+                    store_id: after_store,
+                    peer_id: after_peer,
+                    ..
+                },
+            ) => {
+                assert_eq!(
+                    before_store, after_store,
+                    "the same data re-derives the same placement"
+                );
+                assert!(
+                    after_peer > before_peer,
+                    "peer id {after_peer} was reused after the restart"
+                );
+            }
+            other => panic!("expected two AddPeers, got {other:?}"),
+        }
+    }
+
+    /// 4d's operator is on the wire and nothing in 4c issues one. If this ever fails, leader
+    /// balance arrived early.
+    #[test]
+    fn nothing_in_this_phase_issues_a_transfer_leader() {
+        let (_dir, clock, pd) = open();
+        cluster_of_four(&pd);
+        clock.advance(super::MAX_STORE_DOWN_TIME_MS + 1);
+        for store_id in [1, 2, 4] {
+            alive(&pd, store_id, 0);
+        }
+        for _ in 0..4 {
+            let beat = pd.region_heartbeat(&beat(three_replicas(), 10, 4)).unwrap();
+            assert!(
+                !matches!(beat.operator, Some(Operator::TransferLeader { .. })),
+                "leader balance is 4d"
+            );
+        }
     }
 
     #[test]

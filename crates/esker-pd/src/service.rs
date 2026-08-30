@@ -124,16 +124,21 @@ fn serve(pd: &Pd, cluster_id: u64, request: &PdReq) -> Result<PdResp, ProtoError
             approximate_size,
             applied_index,
         } => {
-            // A stale beat is dropped rather than refused, and the answer is the same either
-            // way: the sender has nothing to do differently, and the next beat supersedes it.
-            pd.region_heartbeat(&RegionBeat {
+            // A stale beat is dropped rather than refused, and the answer does not say which:
+            // the sender has nothing to do differently, and the next beat supersedes it. What
+            // the answer carries is the operator PD wants this region's leader to propose,
+            // which a stale beat can earn just as well as a fresh one — PD schedules against
+            // the record it holds, not against the beat it was sent.
+            let beat = pd.region_heartbeat(&RegionBeat {
                 region: region.clone(),
                 leader_peer_id: *leader_peer_id,
                 term: *term,
                 approximate_size: *approximate_size,
                 applied_index: *applied_index,
             })?;
-            PdResp::RegionHeartbeat { operator: None }
+            PdResp::RegionHeartbeat {
+                operator: beat.operator,
+            }
         }
         PdReq::GetRegion { key } => match pd.get_region(key)? {
             Some(route) => PdResp::GetRegion {
