@@ -410,6 +410,28 @@ and `tokio-macros`, which ADR 0003 anticipated); 3 golden files
 11. **The engine refuses `DeleteRange`** (`Db::write` → `Error::Unsupported`), on a one-time grant
     to touch phase-1 code. See §9.2.
 
+### 9.3 Open, and whose it is: the client does not adopt the server's frame limit
+
+`HelloAck` carries the server's `max_frame_size` precisely so a client can refuse an oversized
+request locally instead of spending a round trip discovering it. Nothing adopts it.
+`Transport::max_frame_size` — `crates/esker-proto/src/transport/client.rs`, `TcpTransport`'s impl —
+returns `self.shared.sink.max_frame_size()`, which is the client's *own* configured limit, and
+`esker-client` checks request sizes against that. A client configured more generously than its
+server therefore passes its own check, sends the frame, and gets a framing refusal that closes the
+connection.
+
+It is a wasted round trip, never a wrong answer, and it only arises when the two ends are
+configured differently — which no default configuration does. Documented in `docs/DESIGN.md` §9
+rather than fixed, because this wrap-up unit is documentation only.
+
+**The fix is one line and it is in this lane's file, not the client's** (the assignment note had it
+the other way round): `TcpTransport::max_frame_size` should return
+`self.shared.sink.max_frame_size().min(self.shared.ack.max_frame_size as usize)`. `esker-client`'s
+existing check then becomes correct with no change on its side, and
+`an_oversized_frame_is_refused_and_the_server_survives` in `crates/esker-store/tests/server.rs`
+would need its generous client to bypass the check to keep testing the server's refusal. Left for
+whoever the coordinator assigns it to.
+
 ### 9.1 Frame kinds stay 1-based, against the brief's 0-based numbering
 
 The lane brief pins `Request=0 … Pong=6`. Phase 0 had already committed
@@ -418,9 +440,22 @@ zero byte must not be a valid kind, so that a run of zeros is not a readable fra
 rule `docs/DESIGN.md` §4.3 states for the WAL record header, where "`0` is reserved and never
 valid, so an all-zero header is not an empty record".
 
-`docs/DESIGN.md` §9 lists the kinds but fixes no numbers, so nothing above this plan is
-contradicted, and the client lane consumes `FrameKind`, never the byte. Kept 1-based, reported to
-the coordinator. Reversing it is a one-line change plus one golden file.
+When this section was written `docs/DESIGN.md` §9 listed the kinds without numbering them, so
+nothing above this plan was contradicted and the choice was the lane's to make. **That is no longer
+the state of the document**: §9 now pins `Request 1 | Response 2 | Stream 3 | StreamEnd 4 |
+Error 5 | Ping 6 | Pong 7` and says why zero is reserved, put there by this lane in the same phase.
+The numbering is now part of the specification rather than an unstated property of the code, which
+is where a wire format's numbers belong.
+
+The estimate of what reversing it would cost was also wrong, and understated. It is not "one line
+and one golden file": it is the `FrameKind` discriminants and `from_u8`, the two tests that assert
+zero is not a kind (`frame_kinds_are_distinct_and_nonzero` in `frame.rs` and
+`a_run_of_zeros_is_not_a_frame` in `tests/frame.rs`), the `frames.hex` golden and every checksum in
+it, and now `docs/DESIGN.md` §9 as well. Still an afternoon rather than a redesign, but it is a
+format change and should be counted as one.
+
+What has not changed is that the client lane consumes `FrameKind` and never the byte, so the
+decision stayed invisible to it — which is why it was safe to make unilaterally and report.
 
 `WIRE_VERSION` did move to `u32` as the brief pins, from phase 0's `u16`.
 

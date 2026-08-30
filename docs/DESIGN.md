@@ -329,12 +329,31 @@ request or a response and the error code in an `Error` frame; `Ping`, `Pong`, `S
 `StreamEnd` carry no tag, and a stream chunk's body *is* the chunk.
 
 The runtime side is `tokio` TCP with a per-connection writer task and a demultiplexer keyed by
-`request_id`; `max_frame_size` 16 MiB (*default*); streams (snapshot transfer) are chunked frames.
-`request_id` is **client-assigned and unique while in flight**: a duplicate is a typed error, never
-a silently replaced waiter. Nothing on a connection is unbounded — the writer queue, the in-flight
-table and the stream buffers all have limits, and a peer at one answers `ServerIsBusy` rather than
-queueing until it dies. A connection silent for `keepalive_interval` (10 s *default*) is pinged and
-one silent for `idle_timeout` (30 s *default*) is dropped with every waiter failed.
+`request_id`; streams (snapshot transfer) are chunked frames. `request_id` is **client-assigned and
+unique while in flight**: a duplicate is a typed error, never a silently replaced waiter. Nothing on
+a connection is unbounded — the writer queue, the in-flight table and the stream buffers all have
+limits, and a peer at one answers `ServerIsBusy` rather than queueing until it dies. A connection
+that goes silent is pinged, and one that stays silent is dropped with every waiter failed.
+
+`TransportConfig` holds the knobs, and both ends of a connection carry their own:
+
+| Knob | Default | What it bounds |
+|---|---|---|
+| `max_frame_size` | 16 MiB | Largest frame read or written, `len` field included. Enforced on both sides — a peer never sends what it would refuse to receive. |
+| `max_in_flight` | 4096 | Requests outstanding on one connection. Past it a caller gets `ServerIsBusy` and a server sheds rather than queues. |
+| `write_queue` | 256 frames | Encoded frames held for the writer task. This is the backpressure that stops a slow socket becoming an unbounded queue. |
+| `keepalive_interval` | 10 s | Silence before a `Ping` goes out. |
+| `idle_timeout` | 30 s | Silence before the peer is presumed gone and every waiter is failed. |
+| `request_timeout` | 30 s | How long a call waits for its answer before `Timeout`. |
+| `shutdown_grace` | 10 s | How long a graceful shutdown waits for in-flight requests before closing anyway. Graceful cannot mean "for ever": a handler wedged on a stuck disk must not hold the process open. |
+
+`HelloAck` reports the server's `max_frame_size` so a client can refuse an oversized request without
+spending a round trip on it. **A client is not obliged to adopt it**, and `esker-client` does not:
+`Transport::max_frame_size` returns the client's own limit, so a client configured more generously
+than its server sends a frame the server refuses and learns about it from the framing error rather
+than from a local check. That is a wasted round trip and a closed connection, never a wrong answer,
+and it only arises when the two are configured differently — but the value is on the wire so that a
+client that wants the cheaper failure can have it.
 
 Every failure also says **whether the request may have taken effect**, because a retry is only free
 when the first attempt provably did nothing: `NotSent` means the bytes never left and the request is
@@ -445,6 +464,8 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
 | max inflight raft msgs | 256 |
 | store / region heartbeat | 10 s / 60 s |
 | txn lock TTL | 3 s (heartbeat-extended) |
+| transport (`TransportConfig`) | §9 has the table — seven knobs, listed there because each one only means something next to the rule it bounds |
+| store WAL sync mode | `Never` — the engine adds no `fsync` of its own, so each request's `sync` flag decides (§4.2, and `CLAUDE.md` invariant 1's opt-out) |
 
 ## 15. Open questions (turn into ADRs as they are decided)
 
