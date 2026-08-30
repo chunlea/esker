@@ -175,9 +175,10 @@ impl Target {
 
 /// What the session reports in `ReadyForQuery`, which is how a client knows whether it is inside a
 /// transaction and whether that transaction is still usable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TransactionStatus {
-    /// Not in a transaction block — `I`.
+    /// Not in a transaction block — `I`. A session starts here.
+    #[default]
     Idle,
     /// In a transaction block — `T`.
     InTransaction,

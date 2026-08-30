@@ -409,9 +409,10 @@ its own gap register, and it would be longer.
 - [x] 1b — the syntax corpus: 353 statements, oracle-verified, 70 gaps registered in §9
 - [x] 1c — the feature recognizer: all 353 answered by a parse or an honest `0A000`, none a syntax
   error; `TABLE`/`ABORT` rewritten as the documented synonyms they are
-- [~] 2 — pgwire: **2a landed** (framing, message codec, startup + `NegotiateProtocolVersion`,
-  `ErrorResponse` fields, goldens, decoder fuzz). 2b is the session state machine and the simple
-  query protocol; 2c the extended protocol; 2d the `tokio` listener and a real `psql` smoke test
+- [~] 2 — pgwire: **2a and 2b landed** — framing, message codec, startup +
+  `NegotiateProtocolVersion`, `ErrorResponse` fields, goldens, decoder fuzz (2a); the session state
+  machine and the simple query protocol (2b). 2c is the extended protocol; 2d the `tokio` listener
+  and a real `psql` smoke test
 - [ ] 3 — row and tuple encodings
 - [ ] 4 — catalog
 - [ ] 5 — backend trait and fake
@@ -450,6 +451,30 @@ test:
 The encoder matched all 14 captured backend messages byte for byte on the first run, which is
 evidence for the goldens being right rather than for the encoder being clever: the same reading of
 the specification produced both, and the capture is the only independent party.
+
+**Unit 2b.** Six more rules read off captures rather than out of the specification, each now a
+test: `ReadyForQuery` is once per *message* and not once per statement; an error abandons the rest
+of the query string; an error **outside** a block leaves the status `I` rather than `E`; a second
+`BEGIN` is a *warning* that still completes with the tag `BEGIN`, and so is `COMMIT` or `ROLLBACK`
+outside a block; committing a failed transaction reports the tag `ROLLBACK`; an empty string gets
+`EmptyQueryResponse` and no `CommandComplete`.
+
+The fourth of those found a real bug the moment it ran. A warning was being returned as an error,
+so the session sent the notice and then *no* `CommandComplete` — a client would have been told
+something was odd and never told the command had finished. Warnings and failures are different
+control flow, not different severities on one path, and the capture is what made that obvious.
+
+`Execute` is the seam the executor will implement in unit 6, and transaction control is separate
+from `execute` on it: the session has to know about `BEGIN`/`COMMIT`/`ROLLBACK` because they move
+the status a client sees, while a real implementation still needs to run them and to be able to
+*fail* while doing so. A commit that fails is a Percolator conflict, and the session ends the
+transaction regardless — leaving it in `T` would have the client waiting for a block that is gone.
+
+Containment (ADR 0014) needed a small piece of design here. The session holds parsed statements and
+hands them to the executor, and holding `sqlparser::ast::Statement` to do that would already have
+broken the promise that replacing the dependency is a one-file job. So `parse::Parsed` wraps the AST
+and exposes only its class and its rendering; the lowering to our own plan types lands with the
+planner.
 
 **Unit 1b.** The corpus was going to be written from the PostgreSQL documentation. It is instead
 written against a **running PostgreSQL 19beta1**, because a container of the target release turned

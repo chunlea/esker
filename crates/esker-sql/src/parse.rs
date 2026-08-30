@@ -130,6 +130,47 @@ impl StatementClass {
     }
 }
 
+/// One parsed statement, with its class, and no `sqlparser` type visible from outside.
+///
+/// This is what keeps ADR 0014's containment rule true in practice. The rest of the crate needs to
+/// *hold* parsed statements — the session passes them to the executor — and if it held
+/// `sqlparser::ast::Statement` to do it, the promise that replacing the dependency means rewriting
+/// one file would already be false. So the AST stays inside and everything outside works with the
+/// class, the rendering, and (from unit 6) the lowered plan.
+#[derive(Debug, Clone)]
+pub struct Parsed {
+    statement: Statement,
+    class: StatementClass,
+}
+
+impl Parsed {
+    /// What kind of statement this is.
+    #[must_use]
+    pub fn class(&self) -> &StatementClass {
+        &self.class
+    }
+
+    /// The statement rendered back to SQL, for `EXPLAIN` output and diagnostics.
+    #[must_use]
+    pub fn rendered(&self) -> String {
+        self.statement.to_string()
+    }
+}
+
+/// Parses a query string into statements, each classified.
+///
+/// A simple-query message may carry several statements in one string, which is why this returns a
+/// list and why the session runs them in order and stops at the first failure.
+pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
+    Ok(parse(sql)?
+        .into_iter()
+        .map(|statement| {
+            let class = classify(&statement);
+            Parsed { statement, class }
+        })
+        .collect())
+}
+
 /// Parses one statement string into statements, guarding the stack first.
 ///
 /// Contract C1 (`docs/plans/phase-6a.md` §1): a [`SqlError::Syntax`] from here for a statement

@@ -119,6 +119,11 @@ pub enum SqlError {
     #[error("current transaction is aborted, commands ignored until end of transaction block")]
     InFailedTransaction,
 
+    /// `BEGIN` inside a transaction block. PostgreSQL sends a warning and stays in the
+    /// transaction rather than failing, which a captured session confirms.
+    #[error("there is already a transaction in progress")]
+    ActiveTransaction,
+
     /// `COMMIT` or `ROLLBACK` outside a transaction block. PostgreSQL sends this as a warning and
     /// carries on, which is what the session layer does with it.
     #[error("there is no transaction in progress")]
@@ -162,6 +167,7 @@ impl SqlError {
             SqlError::InvalidTextRepresentation { .. } => sqlstate::INVALID_TEXT_REPRESENTATION,
             SqlError::DatatypeMismatch(_) => sqlstate::DATATYPE_MISMATCH,
             SqlError::InFailedTransaction => sqlstate::IN_FAILED_SQL_TRANSACTION,
+            SqlError::ActiveTransaction => sqlstate::ACTIVE_SQL_TRANSACTION,
             SqlError::NoActiveTransaction => sqlstate::NO_ACTIVE_SQL_TRANSACTION,
             SqlError::ConfigurationLimitExceeded(_) => sqlstate::CONFIGURATION_LIMIT_EXCEEDED,
             SqlError::ProtocolViolation(_) => sqlstate::PROTOCOL_VIOLATION,
@@ -179,7 +185,7 @@ impl SqlError {
     #[must_use]
     pub fn severity(&self) -> Severity {
         match self {
-            SqlError::NoActiveTransaction => Severity::Warning,
+            SqlError::ActiveTransaction | SqlError::NoActiveTransaction => Severity::Warning,
             SqlError::ProtocolViolation(_) => Severity::Fatal,
             _ => Severity::Error,
         }
