@@ -254,7 +254,7 @@ mod tests {
     }
 
     impl Fixed {
-        fn new(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Box<dyn Cursor + Send> {
+        fn boxed(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Box<dyn Cursor + Send> {
             Box::new(Self {
                 entries,
                 position: None,
@@ -330,9 +330,9 @@ mod tests {
     fn merged() -> MergeCursor {
         MergeCursor::new(
             vec![
-                Fixed::new(vec![entry("a", 3, "a3"), entry("c", 3, "c3")]),
-                Fixed::new(vec![entry("a", 2, "a2"), entry("b", 2, "b2")]),
-                Fixed::new(vec![entry("b", 1, "b1"), entry("d", 1, "d1")]),
+                Fixed::boxed(vec![entry("a", 3, "a3"), entry("c", 3, "c3")]),
+                Fixed::boxed(vec![entry("a", 2, "a2"), entry("b", 2, "b2")]),
+                Fixed::boxed(vec![entry("b", 1, "b1"), entry("d", 1, "d1")]),
             ],
             comparator(),
         )
@@ -423,7 +423,7 @@ mod tests {
     #[test]
     fn a_broken_child_is_reported_rather_than_read_as_the_end() {
         let mut cursor = MergeCursor::new(
-            vec![Fixed::new(vec![entry("a", 1, "a1")]), Fixed::broken()],
+            vec![Fixed::boxed(vec![entry("a", 1, "a1")]), Fixed::broken()],
             comparator(),
         );
         assert_eq!(walk_forward(&mut cursor), ["a1"]);
