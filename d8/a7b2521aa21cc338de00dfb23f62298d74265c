@@ -1,0 +1,19 @@
+crates/esker-client/tests/crash_through_the_client.rs
+  s_4b642fc65050df::t_32934976f45316 63-68,152-188,190-194,197-201
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "d8a7b2521aa21cc338de00dfb23f62298d74265c",
+  "prompts": {},
+  "sessions": {
+    "s_4b642fc65050df": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5213f73d-feb9-40c2-99a7-08164cb70247",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
