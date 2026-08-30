@@ -43,6 +43,14 @@ impl ConfTracker {
     }
 
     /// Applies `change` as of the entry at `index`, returning the new configuration.
+    ///
+    /// **Only for an entry the log has just written.** The stack mirrors the conf-change entries
+    /// the log holds above `base_index`, and it can only stay a mirror if it is moved by the same
+    /// events the log is: a change that is merely *carried again* by a message the log ignored —
+    /// a duplicate, a retransmission whose entries already matched — has not been appended, and
+    /// recording it here reads as "the entry at `index` was replaced" and drops every change above
+    /// it while those entries stay in the log. That is the shape the simulator found on seed
+    /// 41213; see [`crate::log::AppendOutcome`], which is what the callers filter on.
     pub(crate) fn append(&mut self, index: Index, change: &ConfChange) -> &ConfState {
         let mut next = self.current().clone();
         change.apply_to(&mut next);
@@ -124,7 +132,8 @@ impl<S: LogStorage> Raft<S> {
     /// Applies the configuration carried by any `ConfChange` entries in `entries`.
     ///
     /// Called from both append paths — the leader's and the follower's — because §4.1's rule is
-    /// about *appending*, and both of them append.
+    /// about *appending*, and both of them append. `entries` must be entries the log has just
+    /// written, and only those: see [`ConfTracker::append`] for what happens otherwise.
     pub(crate) fn record_conf_changes(&mut self, entries: &[Entry]) -> RaftResult<()> {
         let mut moved = false;
         for entry in entries
@@ -378,6 +387,93 @@ mod tests {
         let node = RawNode::new(Config::new(1, vec![9, 9, 9], 307), storage).unwrap();
         assert_eq!(node.status().conf.voters, vec![1, 2, 3, 4]);
         assert_eq!(node.status().conf.learners, vec![5]);
+    }
+
+    /// Regression, from the simulator's membership sweep (`ESKER_SIM_SEED=41213`).
+    ///
+    /// §4.1 says a configuration takes effect when its entry is *appended*. The other half of that
+    /// sentence is the one this test is about: an `AppendEntries` that appends nothing changes no
+    /// configuration. The message replayed at the end carries a change the log already holds, so
+    /// the log ignores it — but re-applying it to the tracker would read as "the entry at index 3
+    /// was replaced" and take the change at index 5 off the stack, leaving the node counting
+    /// quorums over a configuration its own log contradicts.
+    #[test]
+    fn a_duplicate_append_does_not_take_a_later_configuration_away() {
+        // A correct driver: persist what the `Ready` carries, then advance.
+        fn persist(node: &mut RawNode<MemStorage>) {
+            let ready = node.ready();
+            if let Some(hard_state) = ready.hard_state {
+                node.storage_mut().set_hard_state(hard_state);
+            }
+            node.storage_mut().append(&ready.entries).unwrap();
+            node.advance(&ready);
+        }
+
+        let mut follower = RawNode::new(
+            Config::new(2, vec![1, 2, 3], 309),
+            MemStorage::with_conf_state(ConfState::from_voters(vec![1, 2, 3])),
+        )
+        .unwrap();
+        let append =
+            |prev_log_index, prev_log_term, leader_commit, entries| Message::AppendEntries {
+                from: 1,
+                to: 2,
+                term: 1,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+                context: Bytes::new(),
+            };
+
+        // Add voter 4 at index 2, remove it again at index 3, add it back at index 5 — three
+        // proposals, each committed before the next arrives, so each folds into the base in turn.
+        follower
+            .step(append(
+                0,
+                0,
+                0,
+                vec![Entry::empty(1, 1), Entry::conf_change(1, 2, &add_voter(4))],
+            ))
+            .unwrap();
+        persist(&mut follower);
+        let remove_four = append(
+            2,
+            1,
+            2,
+            vec![Entry::conf_change(
+                1,
+                3,
+                &ConfChange::new(ConfChangeKind::Remove, 4),
+            )],
+        );
+        follower.step(remove_four.clone()).unwrap();
+        persist(&mut follower);
+        assert_eq!(follower.status().conf.voters, vec![1, 2, 3]);
+        follower
+            .step(append(
+                3,
+                1,
+                3,
+                vec![Entry::empty(1, 4), Entry::conf_change(1, 5, &add_voter(4))],
+            ))
+            .unwrap();
+        persist(&mut follower);
+        assert_eq!(follower.status().conf.voters, vec![1, 2, 3, 4]);
+
+        // The network held on to the second message and delivers it again. Every entry it carries
+        // is already in the log, byte for byte, so the log does not move.
+        follower.step(remove_four).unwrap();
+        assert_eq!(
+            follower.status().last_index,
+            5,
+            "a duplicate must not shorten the log"
+        );
+        assert_eq!(
+            follower.status().conf.voters,
+            vec![1, 2, 3, 4],
+            "index 5 still adds voter 4, so voter 4 is still in the configuration"
+        );
     }
 
     /// Invariant 9: a corrupt `ConfChange` payload in the log is an error, not a panic.

@@ -177,8 +177,9 @@ impl<S: LogStorage> Raft<S> {
         self.election_elapsed = 0;
 
         // Kept before the entries are consumed: §4.1 says a configuration takes effect when its
-        // entry is *appended*, so these have to be applied the moment the append succeeds.
-        let conf_changes: Vec<Entry> = entries
+        // entry is *appended*, so these have to be applied the moment the append succeeds. Which
+        // of them count is a question only the append can answer, so the filtering waits for it.
+        let mut conf_changes: Vec<Entry> = entries
             .iter()
             .filter(|entry| entry.kind == EntryKind::ConfChange)
             .cloned()
@@ -188,12 +189,20 @@ impl<S: LogStorage> Raft<S> {
             .maybe_append(prev_log_index, prev_log_term, leader_commit, entries);
         match appended {
             Ok(Some(outcome)) => {
-                // A truncated entry takes its configuration with it, or this node would count a
-                // quorum over members that were never added.
-                if let Some(from_index) = outcome.truncated_from {
-                    self.revert_conf_to(from_index)?;
+                // The configuration follows what the *log* did, not what the message carried.
+                // A message that wrote nothing — a duplicate, a retransmission the log already
+                // agrees with — moves no configuration: re-applying a change the log already held
+                // reads as "the entry at that index was replaced", and would take every change
+                // above it away with it while the entries themselves stay in the log.
+                if let Some(from_index) = outcome.spliced_from {
+                    // A truncated entry takes its configuration with it, or this node would count
+                    // a quorum over members that were never added.
+                    if outcome.truncated {
+                        self.revert_conf_to(from_index)?;
+                    }
+                    conf_changes.retain(|entry| entry.index >= from_index);
+                    self.record_conf_changes(&conf_changes)?;
                 }
-                self.record_conf_changes(&conf_changes)?;
                 self.advance_conf_commit();
                 self.send(Message::AppendEntriesResponse {
                     from: self.id,

@@ -21,15 +21,22 @@ use crate::types::{Entry, Index, Snapshot, Term, offset};
 
 /// What a follower's append did to the log.
 ///
-/// `truncated_from` is the part the caller above cannot work out for itself, and it matters: a
-/// configuration change takes effect when its entry is appended, so an entry that gets truncated
-/// has to take its configuration with it (dissertation §4.1).
+/// Both fields describe the *log*, not the message, and that distinction is the point: a
+/// configuration change takes effect when its entry is appended (dissertation §4.1), so the layer
+/// above has to know which entries this append actually wrote and which of them it took away.
+/// A message can carry entries the log already holds — a duplicate, a retransmission after a lost
+/// response — and those are not appends: nothing moved, so no configuration moves either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AppendOutcome {
     /// The last index the log now holds from this batch.
     pub(crate) last: Index,
-    /// The index truncation started at, if the batch replaced anything.
-    pub(crate) truncated_from: Option<Index>,
+    /// The first index this append wrote, or `None` if it wrote nothing because the log already
+    /// agreed with every entry the message carried. At and above it the log now holds exactly what
+    /// the batch carried; below it, what it already had.
+    pub(crate) spliced_from: Option<Index>,
+    /// Whether that splice *replaced* entries this log already held, rather than extending it.
+    /// A replacement is a truncation, and a truncated entry takes its configuration with it.
+    pub(crate) truncated: bool,
 }
 
 /// The Raft log: a durable prefix plus an unstable tail.
@@ -200,12 +207,10 @@ impl<S: LogStorage> RaftLog<S> {
         if !self.matches(prev_index, prev_term) {
             return Ok(None);
         }
-        let first_new = entries
-            .first()
-            .map_or(prev_index.saturating_add(1), |entry| entry.index);
         let last_new = entries.last().map_or(prev_index, |entry| entry.index);
-        let mut truncated_from = None;
-        if let Some(conflict) = self.find_conflict(&entries)? {
+        let mut spliced_from = None;
+        let mut truncated = false;
+        if let Some((at, conflict)) = self.find_conflict(&entries)? {
             if conflict <= self.committed {
                 // Rewriting a committed entry would break State Machine Safety. The only way to
                 // get here is a bug or a forged message; refuse rather than corrupt.
@@ -214,34 +219,38 @@ impl<S: LogStorage> RaftLog<S> {
                     self.committed
                 )));
             }
-            let already_held = offset(conflict - first_new);
-            if conflict <= self.last_index()? {
-                truncated_from = Some(conflict);
-            }
-            self.truncate_and_append(entries.into_iter().skip(already_held).collect());
+            spliced_from = Some(conflict);
+            truncated = conflict <= self.last_index()?;
+            self.truncate_and_append(entries.into_iter().skip(at).collect());
         }
         // §5.3: a follower's commit index is the leader's, but never past what it actually holds.
         self.commit_to(committed.min(last_new))?;
         Ok(Some(AppendOutcome {
             last: last_new,
-            truncated_from,
+            spliced_from,
+            truncated,
         }))
     }
 
-    /// The first index in `entries` that disagrees with this log, or `None` if all of them either
-    /// match or extend it.
-    fn find_conflict(&self, entries: &[Entry]) -> Result<Option<Index>> {
+    /// The first entry in `entries` that disagrees with this log, as `(position, index)`, or
+    /// `None` if all of them either match or extend it.
+    ///
+    /// Both halves come from the same entry on purpose. The position is where the splice starts
+    /// and the index is what the caller is told; deriving one from the other by subtraction
+    /// assumes the batch is contiguous, and a batch arrives off a network this crate does not
+    /// trust.
+    fn find_conflict(&self, entries: &[Entry]) -> Result<Option<(usize, Index)>> {
         let last = self.last_index()?;
-        for entry in entries {
+        for (at, entry) in entries.iter().enumerate() {
             if entry.index > last {
-                return Ok(Some(entry.index));
+                return Ok(Some((at, entry.index)));
             }
             match self.term(entry.index) {
                 Ok(term) if term == entry.term => {}
                 // A compacted index cannot conflict: it is committed, and committed entries are
                 // identical everywhere.
                 Err(error) if error.is_compacted() => {}
-                _ => return Ok(Some(entry.index)),
+                _ => return Ok(Some((at, entry.index))),
             }
         }
         Ok(None)
