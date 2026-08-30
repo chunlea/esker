@@ -63,6 +63,7 @@ pub mod iterator;
 pub mod memfs;
 pub mod memtable;
 pub mod options;
+pub mod range_del;
 pub mod sst;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

@@ -51,6 +51,9 @@ mod name {
     pub(super) const KEY_LARGEST: &[u8] = b"esker.key.largest";
     pub(super) const KEY_SMALLEST: &[u8] = b"esker.key.smallest";
     pub(super) const PREFIX_EXTRACTOR: &[u8] = b"esker.prefix_extractor";
+    pub(super) const RANGE_DEL_COUNT: &[u8] = b"esker.range_del.count";
+    pub(super) const RANGE_DEL_OFFSET: &[u8] = b"esker.range_del.offset";
+    pub(super) const RANGE_DEL_SIZE: &[u8] = b"esker.range_del.size";
     pub(super) const RAW_KEY_BYTES: &[u8] = b"esker.raw_key_bytes";
     pub(super) const RAW_VALUE_BYTES: &[u8] = b"esker.raw_value_bytes";
     pub(super) const SEQNO_LARGEST: &[u8] = b"esker.seqno.largest";
@@ -59,7 +62,7 @@ mod name {
     /// Every name, in the order they must be written. Only the test that pins that
     /// order reads it; the encoder spells the order out in code.
     #[cfg(test)]
-    pub(super) const ALL: [&[u8]; 16] = [
+    pub(super) const ALL: [&[u8]; 19] = [
         BLOOM_BITS_PER_KEY,
         COMPARATOR,
         COMPRESSION,
@@ -72,6 +75,9 @@ mod name {
         KEY_LARGEST,
         KEY_SMALLEST,
         PREFIX_EXTRACTOR,
+        RANGE_DEL_COUNT,
+        RANGE_DEL_OFFSET,
+        RANGE_DEL_SIZE,
         RAW_KEY_BYTES,
         RAW_VALUE_BYTES,
         SEQNO_LARGEST,
@@ -133,6 +139,18 @@ pub struct TableProperties {
     pub prefix_extractor_name: Option<String>,
     /// Bits per key the filter was built at; 0 when there is no filter.
     pub bloom_bits_per_key: u64,
+    /// Where the range-deletion block lives, and how many tombstones it holds; all zero when
+    /// the table has none, which is nearly all of them.
+    ///
+    /// The handle is here rather than in the footer because the footer is 48 bytes forever and
+    /// a fourth handle does not fit ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)).
+    /// An older table simply has no such property and keeps the zero default, which is what
+    /// makes this an extension rather than a format change.
+    pub range_del_offset: u64,
+    /// Stored payload size of the range-deletion block, trailer excluded.
+    pub range_del_size: u64,
+    /// Tombstones in that block. Zero means there is no block at all.
+    pub range_del_count: u64,
     /// Codec the builder was configured with. Individual blocks may still be stored
     /// uncompressed when compression did not pay — each block's trailer is authoritative.
     pub compression: Compression,
@@ -182,6 +200,15 @@ impl TableProperties {
                 .unwrap_or("")
                 .as_bytes(),
         )?;
+        // Written only when the table has range tombstones. A table with none is byte-identical
+        // to one written before [ADR 0017](../../../docs/adr/0017-range-tombstones.md) existed,
+        // which is exactly what "a missing name keeps its default" is for — and it is what keeps
+        // this an extension rather than a format change to every table ever written.
+        if self.range_del_count > 0 {
+            put_u64(&mut builder, name::RANGE_DEL_COUNT, self.range_del_count)?;
+            put_u64(&mut builder, name::RANGE_DEL_OFFSET, self.range_del_offset)?;
+            put_u64(&mut builder, name::RANGE_DEL_SIZE, self.range_del_size)?;
+        }
         put_u64(&mut builder, name::RAW_KEY_BYTES, self.raw_key_bytes)?;
         put_u64(&mut builder, name::RAW_VALUE_BYTES, self.raw_value_bytes)?;
         put_u64(&mut builder, name::SEQNO_LARGEST, self.largest_seqno)?;
@@ -235,6 +262,9 @@ impl TableProperties {
                     let named = read_string(value, &key)?;
                     props.prefix_extractor_name = (!named.is_empty()).then_some(named);
                 }
+                name::RANGE_DEL_COUNT => props.range_del_count = read_u64(value, &key)?,
+                name::RANGE_DEL_OFFSET => props.range_del_offset = read_u64(value, &key)?,
+                name::RANGE_DEL_SIZE => props.range_del_size = read_u64(value, &key)?,
                 name::RAW_KEY_BYTES => props.raw_key_bytes = read_u64(value, &key)?,
                 name::RAW_VALUE_BYTES => props.raw_value_bytes = read_u64(value, &key)?,
                 name::SEQNO_LARGEST => props.largest_seqno = read_u64(value, &key)?,
@@ -291,6 +321,9 @@ mod tests {
             comparator_name: "esker.BytewiseComparator".to_string(),
             prefix_extractor_name: Some("esker.StripSuffix.8".to_string()),
             bloom_bits_per_key: 10,
+            range_del_offset: 20_480,
+            range_del_size: 64,
+            range_del_count: 3,
             compression: Compression::Lz4,
             file_size: 0,
         }

@@ -23,6 +23,7 @@ use esker_base::rng::Pcg32;
 use esker_engine::fs::FileSystem;
 use esker_engine::memfs::MemFileSystem;
 use esker_engine::options::{Compression, StripSuffix};
+use esker_engine::range_del::{RangeTombstone, RangeTombstones};
 use esker_engine::sst::{TableBuilder, TableOptions, TableReader};
 
 /// Seed of the generator behind every golden file. Changing it invalidates them.
@@ -81,10 +82,14 @@ fn entries() -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 /// The two shapes worth freezing: the defaults, and the other side of every knob.
-fn cases() -> Vec<(&'static str, TableOptions)> {
+fn cases() -> Vec<(&'static str, TableOptions, RangeTombstones)> {
     vec![
         // `docs/DESIGN.md` §14 defaults: 4 KiB blocks, restart every 16, lz4, bloom 10.
-        ("default.sst", TableOptions::default()),
+        (
+            "default.sst",
+            TableOptions::default(),
+            RangeTombstones::new(),
+        ),
         // Uncompressed, small blocks, restart every entry, and a prefix-extracted filter —
         // so the golden files between them cover both codecs and both filter shapes.
         (
@@ -96,15 +101,46 @@ fn cases() -> Vec<(&'static str, TableOptions)> {
                 prefix_extractor: Some(Arc::new(StripSuffix::new(8))),
                 ..TableOptions::default()
             },
+            RangeTombstones::new(),
         ),
+        // The same entries with range tombstones attached: the block
+        // [ADR 0017](../../docs/adr/0017-range-tombstones.md) adds, and the widened key
+        // bounds that make it findable. A separate file rather than a field on the two above,
+        // because those two are frozen and adding a block to them would be a format change to
+        // bytes that have not changed.
+        ("range-del.sst", TableOptions::default(), tombstones()),
     ]
 }
 
+/// The tombstones the third golden table carries.
+///
+/// Deliberately awkward: one starting at the empty key, two sharing a `begin` at different
+/// sequence numbers (which is what makes the block's sort order load-bearing), and one whose
+/// `end` reaches *above* every key in the table — the case that forces the bounds to widen.
+fn tombstones() -> RangeTombstones {
+    let comparator = esker_engine::dbformat::BytewiseComparator;
+    let mut set = RangeTombstones::new();
+    for (begin, end, seqno) in [
+        (&b""[..], &b"a"[..], 100u64),
+        (&b"key/0000"[..], &b"key/0100"[..], 200),
+        (&b"key/0000"[..], &b"key/0100"[..], 300),
+        (&b"z"[..], &[0xffu8; 16][..], 400),
+    ] {
+        set.push(RangeTombstone::new(begin, end, seqno), &comparator);
+    }
+    set
+}
+
 /// Builds one table and returns its bytes.
-fn build(options: TableOptions, entries: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+fn build(
+    options: TableOptions,
+    entries: &[(Vec<u8>, Vec<u8>)],
+    tombstones: RangeTombstones,
+) -> Vec<u8> {
     let fs = MemFileSystem::new();
     let mut builder = TableBuilder::new(options, fs.create(Path::new("/t.sst")).unwrap());
     builder.set_seqno_range(1, 4096);
+    builder.set_range_tombstones(tombstones);
     for (key, value) in entries {
         builder.add(key, value).unwrap();
     }
@@ -128,8 +164,8 @@ fn golden_bytes_are_frozen() {
         std::fs::create_dir_all(golden_dir()).unwrap();
     }
 
-    for (name, options) in cases() {
-        let built = build(options, &entries);
+    for (name, options, tombstones) in cases() {
+        let built = build(options, &entries, tombstones);
         let path = golden_dir().join(name);
         if bless {
             std::fs::write(&path, &built).unwrap();
@@ -165,14 +201,25 @@ fn golden_bytes_are_frozen() {
 #[test]
 fn golden_files_read_back() {
     let entries = entries();
-    for (name, options) in cases() {
+    for (name, options, tombstones) in cases() {
         let bytes = std::fs::read(golden_dir().join(name)).unwrap();
         let table = open(bytes, options.clone()).unwrap_or_else(|e| panic!("{name}: {e}"));
 
         let props = table.properties();
         assert_eq!(props.entry_count, entries.len() as u64, "{name}");
         assert_eq!(props.smallest_key, entries[0].0, "{name}");
-        assert_eq!(props.largest_key, entries[entries.len() - 1].0, "{name}");
+        assert_eq!(props.range_del_count, tombstones.len() as u64, "{name}");
+        assert_eq!(table.range_tombstones(), &tombstones, "{name}");
+        if tombstones.is_empty() {
+            assert_eq!(props.largest_key, entries[entries.len() - 1].0, "{name}");
+        } else {
+            // A tombstone reaching above every key widens the table's bounds, or a read for a
+            // key inside the deleted range would never open the file that says so.
+            assert!(
+                props.largest_key.as_slice() > entries[entries.len() - 1].0.as_slice(),
+                "{name}: the bounds were not widened to span the tombstones"
+            );
+        }
         assert_eq!(props.smallest_seqno, 1, "{name}");
         assert_eq!(props.largest_seqno, 4096, "{name}");
         assert_eq!(props.compression, options.compression, "{name}");
@@ -226,7 +273,7 @@ fn golden_files_read_back() {
 #[test]
 fn flipping_any_byte_is_detected_or_harmless() {
     let entries = entries();
-    for (name, options) in cases() {
+    for (name, options, _) in cases() {
         let original = std::fs::read(golden_dir().join(name)).unwrap();
         let mut detected = 0usize;
         let mut harmless = Vec::new();
@@ -319,7 +366,7 @@ fn flipping_any_byte_is_detected_or_harmless() {
 #[test]
 fn truncating_at_any_offset_is_detected_or_complete() {
     let entries = entries();
-    for (name, options) in cases() {
+    for (name, options, _) in cases() {
         let original = std::fs::read(golden_dir().join(name)).unwrap();
         for cut in 0..original.len() {
             let Ok(table) = open(original[..cut].to_vec(), options.clone()) else {

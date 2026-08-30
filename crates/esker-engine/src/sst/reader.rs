@@ -36,6 +36,7 @@ use crate::dbformat::Comparator;
 use crate::error::{Error, Result};
 use crate::format::SST_FOOTER_SIZE;
 use crate::fs::{RandomAccessFile, read_exact_at};
+use crate::range_del::RangeTombstones;
 
 use super::block::{Block, BlockIter};
 use super::builder::TableOptions;
@@ -57,6 +58,8 @@ struct TableInner {
     /// `None` when the table has no filter, or when its filter was built over different bytes
     /// than this reader would probe with.
     filter: Option<BloomFilter>,
+    /// The ranges this table declares deleted; empty for nearly every table.
+    range_tombstones: RangeTombstones,
     props: TableProperties,
 }
 
@@ -246,6 +249,30 @@ impl TableReader {
 
         let index = source.read_parsed(footer.index, false)?;
 
+        // The range-deletion block, when there is one. Its handle is in the properties rather
+        // than the footer, which has no room for a fourth
+        // ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)). Read at open and held for
+        // the life of the reader, like the index and the filter: every read of this table has
+        // to consult it, and nearly every table has none at all.
+        let range_tombstones = if props.range_del_count == 0 {
+            RangeTombstones::new()
+        } else {
+            let handle = BlockHandle::new(props.range_del_offset, props.range_del_size);
+            let payload = source.read(handle, false)?;
+            let tombstones = RangeTombstones::decode(&payload, options.comparator.as_ref())?;
+            if tombstones.len() as u64 != props.range_del_count {
+                return Err(Error::corruption(
+                    &context,
+                    format!(
+                        "the properties claim {} range tombstones and the block holds {}",
+                        props.range_del_count,
+                        tombstones.len()
+                    ),
+                ));
+            }
+            tombstones
+        };
+
         Ok(Self {
             inner: Arc::new(TableInner {
                 file,
@@ -256,6 +283,7 @@ impl TableReader {
                 cache,
                 index,
                 filter,
+                range_tombstones,
                 props: TableProperties { file_size, ..props },
             }),
         })
@@ -265,6 +293,17 @@ impl TableReader {
     #[must_use]
     pub fn properties(&self) -> &TableProperties {
         &self.inner.props
+    }
+
+    /// The range tombstones this table carries; empty for nearly every table
+    /// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)).
+    ///
+    /// A read that finds an entry in this table — or in any *lower* one — has to ask these
+    /// whether it is covered, which is the second question a range delete forces on every read
+    /// path.
+    #[must_use]
+    pub fn range_tombstones(&self) -> &RangeTombstones {
+        &self.inner.range_tombstones
     }
 
     /// Whether a usable bloom filter was found. False either because the table has none or

@@ -51,6 +51,7 @@ use crate::error::{Error, Result};
 use crate::format::SST_FORMAT_VERSION;
 use crate::fs::WritableFile;
 use crate::options::{Compression, PrefixExtractor, defaults};
+use crate::range_del::RangeTombstones;
 
 use super::block::BlockBuilder;
 use super::filter::{BloomBuilder, filter_key};
@@ -137,6 +138,7 @@ pub struct TableBuilder {
     last_key: Vec<u8>,
     separator: Vec<u8>,
     handle_bytes: Vec<u8>,
+    range_tombstones: RangeTombstones,
 }
 
 impl fmt::Debug for TableBuilder {
@@ -180,6 +182,7 @@ impl TableBuilder {
             last_key: Vec::new(),
             separator: Vec::new(),
             handle_bytes: Vec::new(),
+            range_tombstones: RangeTombstones::new(),
         }
     }
 
@@ -188,6 +191,17 @@ impl TableBuilder {
     pub fn set_seqno_range(&mut self, smallest: u64, largest: u64) {
         self.props.smallest_seqno = smallest;
         self.props.largest_seqno = largest;
+    }
+
+    /// Attaches the range tombstones this table carries.
+    ///
+    /// They are written as a block of their own, and the table's key bounds are widened to
+    /// span them: a read for a key inside a deleted range has to open the file that says so,
+    /// and files are picked by their bounds
+    /// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)). Call before
+    /// [`TableBuilder::finish`]; calling twice replaces the set.
+    pub fn set_range_tombstones(&mut self, tombstones: RangeTombstones) {
+        self.range_tombstones = tombstones;
     }
 
     /// Bytes written so far. The flush job uses this to decide when to start a new file.
@@ -280,6 +294,23 @@ impl TableBuilder {
         self.flush_data_block()?;
         self.props.largest_key = std::mem::take(&mut self.last_key);
 
+        // The range-deletion block, uncompressed and before the filter. Its handle goes in the
+        // properties rather than the footer, which is 48 bytes forever and has no room for a
+        // fourth ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)).
+        if !self.range_tombstones.is_empty() {
+            self.widen_bounds_for_tombstones();
+            let payload = self.range_tombstones.encode();
+            let handle = write_block(
+                self.file.as_mut(),
+                &mut self.offset,
+                &payload,
+                Compression::None,
+            )?;
+            self.props.range_del_offset = handle.offset;
+            self.props.range_del_size = handle.size;
+            self.props.range_del_count = self.range_tombstones.len() as u64;
+        }
+
         // The filter, uncompressed. An empty table gets none: its handle would sit at offset
         // 0 with size 0, which is exactly how the footer spells "absent".
         let filter_handle = match self.filter.take() {
@@ -324,6 +355,35 @@ impl TableBuilder {
 
         self.props.file_size = self.offset;
         Ok(self.props)
+    }
+
+    /// Grows the table's key bounds to span its tombstones.
+    ///
+    /// `Version::overlapping` picks files by `smallest_key`/`largest_key`, so a tombstone
+    /// reaching outside them would be invisible to exactly the reads that need it — and the
+    /// failure would be silent: the read returns the value from a lower level with nothing
+    /// reporting an error.
+    ///
+    /// The bounds are *user* keys here, and a tombstone's `end` is exclusive; recording it as
+    /// the largest key overstates the table's reach by one key, which costs an extra file
+    /// opened and never a wrong answer. An empty table takes the tombstones' bounds outright.
+    fn widen_bounds_for_tombstones(&mut self) {
+        let comparator = self.options.comparator.as_ref();
+        let Some((low, high)) = self.range_tombstones.key_bounds(comparator) else {
+            return;
+        };
+        let (low, high) = (low.to_vec(), high.to_vec());
+        if self.props.entry_count == 0 {
+            self.props.smallest_key = low;
+            self.props.largest_key = high;
+            return;
+        }
+        if comparator.cmp(&low, &self.props.smallest_key) == Ordering::Less {
+            self.props.smallest_key = low;
+        }
+        if comparator.cmp(&high, &self.props.largest_key) == Ordering::Greater {
+            self.props.largest_key = high;
+        }
     }
 }
 
