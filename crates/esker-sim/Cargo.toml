@@ -11,6 +11,9 @@ publish.workspace = true
 [dependencies]
 bytes.workspace = true
 esker-base.workspace = true
+# The simulator drives real `RawNode`s: 3b is a discrete-event simulation of the actual core,
+# not a model of it (`prompts/03-raft.md`).
+esker-raft.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

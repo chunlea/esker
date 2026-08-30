@@ -20,6 +20,7 @@ pub mod clock;
 pub mod fault;
 pub mod lin;
 pub mod net;
+pub mod raft;
 
 pub use clock::{Clock, Millis};
 pub use fault::FaultPlan;
