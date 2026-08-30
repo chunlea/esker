@@ -1,0 +1,25 @@
+# Golden frames (docs/DESIGN.md 9), produced by an independent encoder.
+# frame = len:u32 LE ++ crc32c:u32 LE ++ kind:u8 ++ request_id:u64 LE ++ body
+# len   = the bytes after the len field itself: 13 + len(body)
+# crc   = crc32c(kind ++ request_id LE ++ body) -- NOT the body alone, and never the len
+# kind  = Request 1, Response 2, Stream 3, StreamEnd 4, Error 5, Ping 6, Pong 7;
+#         0 is reserved and never valid, so a run of zeros is not a frame.
+#
+# Each case is `frame <name> <hex>`; `stream` is every frame above, back to back, which
+# is what a reader fed by TCP actually sees.
+
+# Ping, id 0, empty body: the smallest legal frame, 17 bytes
+frame ping-empty 0d000000f170bb88060000000000000000
+# Request, id 1, body = method 0x0101 (RawKv Get) with no fields yet
+frame request-get 0f000000e8213f170101000000000000000101
+# Response, id u64::MAX: the id is little-endian and the checksum covers it
+frame response-max-id 15000000513a300a02ffffffffffffffff0001020304050607
+# Stream, id 42, a 16-byte chunk
+frame stream-chunk 1d0000008b9e37e5032a00000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+# StreamEnd, id 42, empty body closes the stream
+frame stream-end 0d0000009d3169b8042a00000000000000
+# Error, id 7, code 4 (ServerIsBusy) and a length-prefixed reason
+frame error-busy 1b0000006d3b368805070000000000000004000b7772697465207374616c6c
+
+# The six frames above concatenated, in order.
+stream 0d000000f170bb880600000000000000000f000000e8213f17010100000000000000010115000000513a300a02ffffffffffffffff00010203040506071d0000008b9e37e5032a00000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0d0000009d3169b8042a000000000000001b0000006d3b368805070000000000000004000b7772697465207374616c6c

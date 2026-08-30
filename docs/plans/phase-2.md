@@ -128,7 +128,7 @@ after a message decodes: a body that is longer than its fields is a different me
 ```rust
 pub enum ProtoError {
     NotLeader { region_id: u64, leader_hint: Option<u64> },     // 1
-    EpochNotMatch { current_regions: Vec<RegionMeta> },         // 2
+    EpochNotMatch { current_regions: Vec<Region> },             // 2
     KeyNotInRegion { key: Bytes, region_id: u64,
                      start_key: Bytes, end_key: Bytes },        // 3
     ServerIsBusy { reason: String },                            // 4
@@ -139,18 +139,29 @@ pub enum ProtoError {
     Unsupported { detail: String },                             // 9
     Corrupt { context: String, detail: String },                // 10
     Io { detail: String },                                      // 11
-    Closed { detail: String },                                  // 12
+    Closed { detail: String },                                  // 12  sent, no answer
     DuplicateRequestId { request_id: u64 },                     // 13
     Internal { detail: String },                                // 14
+    NotSent { detail: String },                                 // 15  provably never sent
 }
 ```
 
 Every variant encodes and decodes, including the ones a server never sends (`Corrupt`, `Io`,
-`Closed` are usually raised locally), because a round trip that is only exercised for some variants
-is a golden test with holes in it.
+`Closed`, `NotSent` are usually raised locally), because a round trip that is only exercised for
+some variants is a golden test with holes in it.
 
-`ProtoError::is_retryable()` is on this type rather than in the client, so that server and client
-cannot disagree about it: true for `NotLeader`, `EpochNotMatch`, `ServerIsBusy`, `RegionNotFound`.
+Two predicates live on the error rather than in the client, so that the two sides cannot come to
+disagree about them:
+
+* **`is_retryable()`** — the server said "try again, or try elsewhere": `NotLeader`,
+  `EpochNotMatch`, `ServerIsBusy`, `RegionNotFound`.
+* **`outcome() -> RequestOutcome::{NotApplied, Unknown}`** — whether the request may have taken
+  effect, which is what decides whether a *write* may be sent again. Every error the peer sent is
+  `NotApplied`, because sending it is how the peer says it did not serve the request; so is
+  `NotSent`, which means the request provably never reached the wire. `Unknown` is exactly
+  `Closed`, `Io`, `Corrupt` and `Internal` — the failures that happened *around* the answer rather
+  than in it. A transport that cannot tell must say `Unknown`: that costs a failed call, where the
+  other direction costs a silently duplicated write.
 
 ### 3.4 Rust surface
 
@@ -222,6 +233,36 @@ impl TcpTransport {
   sides. Bounded channels everywhere; no queue in this crate is unbounded.
 * A connection that goes quiet for `keepalive_interval` is pinged, and one silent for
   `idle_timeout` is dropped with every waiter failed as `Closed`. Nothing hangs for ever.
+
+### 3.6 Answers to the client lane's contract note
+
+The client lane raised five points against the shapes above before either crate landed. What was
+adopted, and what was not:
+
+1. **"Provably never sent" vs "sent, no answer" — adopted, and it is now part of `ProtoError`.**
+   `NotSent` (code 15) and `Closed` (code 12) are the pair, and `outcome()` is the predicate; see
+   §3.3. This was the right thing to ask for: without it a client cannot tell a write it may
+   safely repeat from one it may not, and `esker-txn` will need the same distinction for
+   `Prewrite` in phase 5.
+2. **A synchronous `call` — provided as a wrapper, not as the trait.** The async `Transport` of
+   §3.4 stays, because it is what the store's connection tasks and phase 4's Raft transport are
+   written against. Alongside it, `BlockingTransport` wraps one and exposes
+   `fn call(&self, request: Request, deadline: Instant) -> Result<Response, ProtoError>`, which is
+   what a CLI thread and `bench --remote` want. A per-call **deadline** is adopted on both.
+   **Addressing stays an address, not a `store_id`.** One `TcpTransport` is one connection to one
+   peer, which is what `docs/DESIGN.md` §6 describes and what phase 4 needs per (store, store)
+   pair. Mapping `store_id → address` is routing, which `docs/DESIGN.md` §10 puts in the client
+   and §7 puts in PD; a table inside `esker-proto` would put routing below the wire.
+3. **Names follow the brief, not the transcription.** `Epoch` (not `RegionEpoch`),
+   `RequestHeader` (not `RequestContext`), `RawKvReq`/`RawKvResp` (not `RawRequest`/`RawResponse`),
+   `Method` covering every service (not `RawMethod`), and **one** `ProtoError` rather than a
+   `ServerError`/`CallError` split — `outcome()` is what the split was for. `Peer`, `PeerRole` and
+   `Region` are as transcribed. The empty-`end_key`-is-unbounded rule is implemented in
+   `Region::contains` and `Region::contains_range` with a test that pins it.
+4. **`Scan::keys_only` — dropped.** Nothing in this phase calls it, and a wire field with no caller
+   is a field with no test. It is a `WIRE_VERSION` bump away if phase 6's index scans want it.
+5. **Confirmed: the client sends raw user bytes.** The `'r'` namespace is the store's job on every
+   path — point reads, scan bounds, `DeleteRange` bounds and `CompareAndSwap` alike.
 
 ## 4. The store
 

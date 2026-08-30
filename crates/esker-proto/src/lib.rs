@@ -7,66 +7,51 @@
 //! # Invariants
 //!
 //! * **Every frame is checksummed** with CRC32C, like every byte on disk
-//!   (`CLAUDE.md` invariant 2).
+//!   (`CLAUDE.md` invariant 2). The checksum covers the kind and the request id as well as the
+//!   body, because a flipped request id would otherwise deliver a response to the wrong
+//!   caller with everything else intact.
 //! * **Unknown methods and unknown fields are errors, never ignored.** Compatibility is
 //!   negotiated once, through [`WIRE_VERSION`] on connect, rather than guessed per message.
+//!   Trailing bytes after a message decodes are an error for the same reason.
 //! * **Every key-value request carries `{ region_id, epoch, peer }`** so the server can reject
 //!   a stale epoch with a redirect hint (invariant 5).
 //! * **Byte-opaque.** Keys and values cross the wire as byte strings; this crate never
-//!   interprets them (invariant 7).
+//!   interprets them, and the `'r'` namespace of `docs/DESIGN.md` §3 is added by the store,
+//!   never by a client (invariant 7).
+//! * **Nothing here is unbounded.** Frames have a maximum size, requests in flight have a
+//!   limit, and every channel is a bounded one. A server at its limit answers
+//!   [`ProtoError::ServerIsBusy`]; it does not queue until it dies.
 //!
-//! Phase 0 contains only the frame constants; the protocol is phase 2
-//! (`prompts/02-single-node-server.md`).
+//! # Module map
+//!
+//! | Module | What it decides |
+//! |---|---|
+//! | [`error`] | the typed error, its wire codes, and whether a failed request may have applied |
+//! | [`codec`] | how a field becomes bytes: varints, length prefixes, and canonical encodings |
+//! | [`frame`] | the envelope: length, checksum, kind, request id |
+//! | [`region`] | regions, epochs and peers — what a request is addressed to |
+//! | [`messages`] | one `encode`/`decode` pair per message, and the method numbers |
+//! | [`transport`] | tokio TCP: the writer task, the demultiplexer, keepalive and streams |
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod codec;
+pub mod error;
+pub mod frame;
+pub mod region;
+
+pub use codec::{DecodeError, Decoder, Encoder};
+pub use error::{ProtoError, RequestOutcome};
+pub use frame::{FRAME_HEADER_SIZE, Frame, FrameDecoder, FrameKind, MAX_BODY_SIZE, MAX_FRAME_SIZE};
+pub use region::{Epoch, Peer, PeerRole, Region};
+
 /// Version of the framing and of every message encoding. Negotiated when a connection opens;
-/// a mismatch is a hard error, not a downgrade.
-pub const WIRE_VERSION: u16 = 1;
-
-/// `len:u32 ++ crc32c:u32 ++ kind:u8 ++ request_id:u64` (`docs/DESIGN.md` §9).
-pub const FRAME_HEADER_SIZE: usize = 4 + 4 + 1 + 8;
-
-/// Largest frame that will be read or written. A larger declared length is rejected before
-/// anything is allocated, so a corrupt or hostile length cannot exhaust memory.
-pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
-
-/// Frame kinds (`docs/DESIGN.md` §9). One byte on the wire, so these values are format.
-pub mod frame_kind {
-    /// A request; the body starts with a `method:u16`.
-    pub const REQUEST: u8 = 1;
-    /// A response to the request with the same id.
-    pub const RESPONSE: u8 = 2;
-    /// One chunk of a stream, such as a snapshot transfer.
-    pub const STREAM: u8 = 3;
-    /// The final frame of a stream.
-    pub const STREAM_END: u8 = 4;
-    /// A typed error carrying redirect hints.
-    pub const ERROR: u8 = 5;
-    /// Liveness probe.
-    pub const PING: u8 = 6;
-    /// Reply to a [`PING`].
-    pub const PONG: u8 = 7;
-
-    /// Every kind this version defines.
-    pub const ALL: [u8; 7] = [REQUEST, RESPONSE, STREAM, STREAM_END, ERROR, PING, PONG];
-}
+/// a mismatch is a hard error, not a downgrade (`docs/DESIGN.md` §9).
+pub const WIRE_VERSION: u32 = 1;
 
 #[cfg(test)]
 mod tests {
-    use super::{FRAME_HEADER_SIZE, MAX_FRAME_SIZE, WIRE_VERSION, frame_kind};
-
-    /// One byte on the wire per kind, and a zero would be indistinguishable from padding.
-    #[test]
-    fn frame_kinds_are_distinct_and_nonzero() {
-        let unique: std::collections::BTreeSet<u8> = frame_kind::ALL.into_iter().collect();
-        assert_eq!(
-            unique.len(),
-            frame_kind::ALL.len(),
-            "two frame kinds share a tag"
-        );
-        assert!(!unique.contains(&0));
-    }
+    use super::{FRAME_HEADER_SIZE, MAX_FRAME_SIZE, WIRE_VERSION};
 
     /// The header layout is fixed; if this drifts, every peer on the old version is unable to
     /// find the body.

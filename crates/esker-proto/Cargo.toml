@@ -8,5 +8,32 @@ license.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+[dependencies]
+# The checksum on every frame, and the varints every body is built from. Sharing them with
+# the engine is why they live in `esker-base` (ADR 0004).
+esker-base.workspace = true
+# `Bytes` at API boundaries: a frame body is split from the read buffer without a copy.
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# The network edge, and the only place in the project where async appears (CLAUDE.md,
+# "Toolchain and conventions"). Features are listed one by one: `net` and `io-util` for the
+# sockets, `rt`/`rt-multi-thread` for the tasks a connection owns, `sync` for the bounded
+# channels that are this crate's backpressure, `time` for the keepalive, `macros` for
+# `#[tokio::test]` and `#[tokio::main]`. No `fs`, no `process`, no `signal` — the CLI adds
+# `signal` for ctrl-c, which is the only place that needs it.
+tokio = { workspace = true, features = [
+    "net",
+    "io-util",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "macros",
+] }
+
+[dev-dependencies]
+proptest.workspace = true
+
 [lints]
 workspace = true
