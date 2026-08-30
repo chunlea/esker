@@ -23,6 +23,16 @@ One coordinator (Fable, herdr pane `COORD`) directing coding lanes. Phases are g
   7/40 runtime crates; coordinator reviewed `codec.rs`, `crc32c.rs`, `deny.toml`,
   workspace manifest in full.
 - [ ] Phase 1 — engine (lanes `wy-p1-spine` + `cl-p1-sst`, test lane later)
+  - [x] step 4 SST layer (`cl-p1-sst`) — **accepted 2026-08-30 ~03:00**: builder/reader/
+    bloom/block/framing + 84 tests; corrupt-any-byte proves the only unchecked bytes are
+    the footer's zero padding; coordinator reviewed `footer.rs` in full and the bloom
+    probe path (shared `filter_key` for build+probe; extractor mismatch drops the filter).
+    Contract notes relayed to the spine lane (seqno_range before finish, finish syncs,
+    LevelDB cursor semantics, per-CF TableOptions parity, ADR numbering).
+  - [ ] `cl-p1-sst` round 2: ADR 0005 (format bounds), fault-injecting FileSystem
+    (`src/testing/`), `esker-cli sst-dump`.
+  - [ ] spine: WAL ✅ batch/internal-key ✅ memtable ✅(assumed, verify at gate)
+    manifest/Version in progress → Db → compaction → checkpoint → cli/bench.
 - [ ] Phase 2 — single-node server
 - [ ] Phase 3 — raft
 - [ ] Phase 4 — multi-raft + PD
