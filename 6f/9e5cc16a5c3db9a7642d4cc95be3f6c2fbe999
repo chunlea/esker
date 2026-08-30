@@ -1,0 +1,19 @@
+docs/adr/0005-sst-format-bounds.md
+  s_583ba4eb96ad8a::t_44a55a00283d01 1-92
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "6f9e5cc16a5c3db9a7642d4cc95be3f6c2fbe999",
+  "prompts": {},
+  "sessions": {
+    "s_583ba4eb96ad8a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2ac73fb2-9428-4877-ae7d-195e5b69e526",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
