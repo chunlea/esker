@@ -192,8 +192,10 @@ needed; the kill -9 loop still runs for real durability.
 - [x] step 4 — SST + block cache *(SST lane, accepted at the coordinator's gate)*
 - [x] step 5 — manifest / `VersionSet` (`filename.rs`, `version/{edit,builder,set}.rs`,
       the full `CURRENT`-swap crash matrix)
-- [ ] step 6 — `Db` *(in progress)*
-- [ ] step 7 — compaction
+- [x] step 6 — `Db` — open/recovery/group commit/snapshots (6a), memtable switch, background
+      flush to L0 and level reads (6b), the merge cursor and `DbIterator` (6c), runtime
+      `create_cf`/`drop_cf` (6d)
+- [ ] step 7 — compaction *(next)*
 - [ ] step 8 — checkpoint + ingest
 - [ ] step 9 — `esker-cli` tools + bench numbers
 
@@ -221,3 +223,26 @@ needed; the kill -9 loop still runs for real durability.
 8. **`memfs.rs` is a normal module, not test-only.** The simulator will want an in-memory
    filesystem in a normal build; only deliberate misbehaviour belongs behind a feature, which
    is where the SST lane put its `testing::FaultFileSystem`.
+9. **The `Cursor` trait lives in `src/iterator.rs`**, not in `dbformat.rs`: it is a shape, not
+   a format. `MemTableIter` implements it; `sst::TableIter` is adapted by a wrapper in
+   `db/iter.rs` until the SST lane implements it directly.
+10. **The memtable cursor owns its table** and navigates by key rather than holding a
+    `crossbeam-skiplist` entry, which borrows the map. The alternative was a self-referential
+    struct — a lifetime threaded through every caller, an `unsafe` lifetime extension, or a
+    banned crate. It costs `O(log n)` per step and a copy of the entry; `CLAUDE.md` says to
+    prefer safe code and optimise after a profile, and the in-house skiplist removes the cost.
+11. **`Db` is not `Clone`.** It owns the background flush thread and stops it on drop; share it
+    with an `Arc`, as `LevelDB` and `RocksDB` are shared.
+12. **Three bugs the tests found, recorded because each was silent.**
+    *A failed WAL append now ends the segment* — writing after a partial write laid the next
+    group over a half-written record, turning a torn tail into mid-log corruption and losing
+    every acknowledged write past it (found by the crash lane's injector).
+    *Every manifest edit stamps the sequence number* — once a flush deletes the segments behind
+    it, the manifest is the only record of how far numbering got, and an edit that forgot it
+    restarted numbering and made flushed writes invisible.
+    *Shutdown sets its flag under the lock the background thread waits on* — outside it, the
+    wake-up is lost in the window between the thread's check and its wait, and the join in
+    `Drop` hangs.
+13. **`Error` gained `GroupCommit` and `Poisoned`.** A failed group commit belongs to every
+    writer in it; a failed manifest write means memory and disk may disagree, and the honest
+    answer is to stop rather than guess.
