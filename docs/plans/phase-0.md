@@ -1,6 +1,6 @@
 # Phase 0 plan — scaffold the workspace
 
-Status: **in progress** (written before implementation; "Changes vs plan" filled in at the end).
+Status: **complete** (written before implementation; §8 records what changed).
 Spec: `prompts/00-scaffold.md`. Constitution: `CLAUDE.md`. Design: `docs/DESIGN.md`.
 
 ## 1. Scope
@@ -137,4 +137,73 @@ pub enum TraceEvent { Sent, Dropped, Duplicated, Delivered }
 
 ## 8. Changes vs plan
 
-Filled in at the end of the phase.
+The plan held. Seven things came out differently, all of them discovered by building it.
+
+1. **`unsafe_code = "warn"` in `esker-engine` could not be done in the manifest.** Cargo
+   rejects a `[lints]` table that both inherits the workspace and overrides it
+   ("cannot override `workspace.lints` in `lints`"). Since `lints.workspace = true` has to be
+   in *every* manifest — without it a crate is silently unlinted — the relaxation is a
+   crate-root `#![warn(unsafe_code)]` in `esker-engine`, which takes precedence over the
+   workspace `deny`. Verified both directions: the same `unsafe` block warns in the engine and
+   fails the build in `esker-keys`. Note that under `just check` (`-D warnings`) a warning is
+   still an error, so an engine `unsafe` site needs a targeted `#[allow]` plus a `// SAFETY:`
+   comment either way — which is what invariant 8 requires.
+
+2. **`clippy::assertions_on_constants` had to be allowed.** Several skeleton tests deliberately
+   pin relationships between compile-time constants ("the election timeout must dominate the
+   heartbeat interval", "the inline-value cutoff must fit in one length byte"). Those are
+   assertions on constants on purpose. Allowed at the workspace level with that reason written
+   next to it, alongside `module_name_repetitions`, `missing_errors_doc` and
+   `must_use_candidate`.
+
+3. **`clippy::unwrap_used` and `expect_used` were added**, which the plan did not mention.
+   `CLAUDE.md` invariant 9 is a rule about panicking on user input and on-disk data; making it
+   a lint means each exception needs a comment rather than a habit. Test code opts out at the
+   file or crate level.
+
+4. **The dependency budget test needed a JSON parser.** `cargo metadata` emits JSON and `serde`
+   is banned, so `crates/esker-cli/tests/dep_budget.rs` contains a small test-only reader.
+   Two refinements the plan had not anticipated: the graph is filtered to the host triple
+   (otherwise the Windows tree is counted, a dozen crates for a target nothing builds), and
+   build edges are checked for banned *names* but do not count against the budget — a build
+   script is how a C compiler gets into a "pure Rust" graph.
+
+5. **`cargo-deny` cannot express glob patterns**, so `*-sys` and `openssl*` live only in the
+   budget test, and `deny.toml` lists the concrete crates. The two mechanisms are complementary
+   rather than redundant, and ADR 0003 says so.
+
+6. **A fourth ADR** — `0004-esker-base.md` — records why there is an eleventh crate, since a
+   future reader would otherwise reasonably try to fold it into `esker-keys` and break
+   invariant 7 doing it.
+
+7. **`cargo doc` needed `RUSTDOCFLAGS="-D warnings"`** to be worth running. Four intra-doc
+   links were broken on the first full gate — links into a crate that is not a dependency, and
+   one to a `#[cfg(test)]` module. A broken link to an invariant is a broken reference to the
+   rule it states, so the `doc` recipe denies warnings.
+
+8. **Two real bugs were caught by tests written from this plan**, both in code that looked
+   obviously correct: `Pcg32::range_inclusive(0, u64::MAX)` overflowed computing `span + 1`,
+   and `esker_client::backoff_ms` used `checked_shl`, which guards the shift width but not the
+   value, so a large attempt count shifted every bit out and returned a *zero* delay instead of
+   the ceiling. Both are now regression tests.
+
+### Numbers at the end of the phase
+
+| | |
+|---|---|
+| Crates | 11 |
+| Tests | 115, all passing (`esker-keys` 32, `esker-base` 28, `esker-sim` 16, `esker-cli` 16, seven skeletons 3–4 each) |
+| Property test cases | 1,000 per property, 15 properties, count checked by a test rather than asserted |
+| Runtime transitive crates | 7 of a 40 budget |
+| Rust source | 4,563 lines including tests |
+| ADRs | 4 |
+
+### For the coordinator
+
+* `docs/DESIGN.md` §4.5 names the checksum `esker-engine::crc32c`. It lives in `esker-base`
+  (ADR 0004) and `esker-engine` re-exports it, so the path in the design document resolves and
+  a test asserts it. **No DESIGN.md edit is needed**, but if the layering table in `CLAUDE.md`
+  is ever regenerated it should gain an `esker-base` row.
+* `deny.toml` carries the dependency budget in a marked comment (`# esker-dep-budget = 40`)
+  because cargo-deny rejects unknown configuration keys. Both the config and the test read that
+  one line.

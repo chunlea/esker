@@ -10,7 +10,7 @@
 //!   simulatable and model-checkable, and it is not traded away for convenience
 //!   (`CLAUDE.md` invariant 4).
 //! * **Every decision is a function of `(state, message | tick)`.** No wall clock, no ambient
-//!   randomness: the election timeout is drawn from an injected [`esker_base::rng::Pcg32`].
+//!   randomness: the election timeout is drawn from an injected `esker_base::rng::Pcg32`.
 //! * **The driver contract is part of correctness.** The caller persists `hard_state` and
 //!   entries — with fsync — *before* sending any message from the same `Ready`. Violating the
 //!   order breaks Raft's safety guarantee, so the simulator tests it explicitly.

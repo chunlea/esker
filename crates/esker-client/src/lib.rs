@@ -29,7 +29,7 @@ pub const BACKOFF_MAX_MS: u64 = 2_000;
 /// Delay before retry number `attempt`, counting from zero.
 ///
 /// Exponential with a hard ceiling. The caller adds jitter from its own
-/// [`esker_base::rng::Pcg32`] so that a herd of clients does not retry in lockstep; that draw
+/// `esker_base::rng::Pcg32` so that a herd of clients does not retry in lockstep; that draw
 /// is not made here, because this function must stay deterministic and testable.
 #[must_use]
 pub fn backoff_ms(attempt: u32) -> u64 {

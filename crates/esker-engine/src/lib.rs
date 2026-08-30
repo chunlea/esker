@@ -1,6 +1,6 @@
 //! The log-structured storage engine: a write-ahead log, memtables, sorted string tables, a
 //! manifest and compaction, all over byte-opaque keys ordered by a pluggable comparator.
-//! One directory is one [`Db`] with many column families sharing a single WAL and one
+//! One directory is one `Db` with many column families sharing a single WAL and one
 //! sequence-number space (`docs/DESIGN.md` §4).
 //!
 //! # Invariants

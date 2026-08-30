@@ -11,8 +11,8 @@
 //!   `cfg(target_feature)` — never by runtime detection, so that a build is reproducible and
 //!   the fast path is not a hidden branch.
 //!
-//! The two agree byte for byte; [`tests`] checks that on random inputs whenever the hardware
-//! path is compiled in.
+//! The two agree byte for byte, and a test checks that on random inputs at every length
+//! class whenever the hardware path is compiled in.
 
 /// The reflected Castagnoli polynomial. Part of the on-disk format: changing it invalidates
 /// every checksum ever written.
