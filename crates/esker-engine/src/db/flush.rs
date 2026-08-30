@@ -370,7 +370,7 @@ impl DbInner {
     }
 
     /// Deletes what no version needs, forgetting any table reader for a file that goes.
-    fn purge_and_evict(&self) -> Result<()> {
+    pub(crate) fn purge_and_evict(&self) -> Result<()> {
         let deleted = lock(&self.versions)?.purge_obsolete_files()?;
         for path in &deleted {
             if let Some(FileKind::Sst(number)) = filename::classify_path(path) {

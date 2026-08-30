@@ -977,3 +977,95 @@ fn iteration_matches_a_model() {
     backwards.reverse();
     assert_eq!(scan_back(&db), backwards);
 }
+
+// ---------------------------------------------------------------------------------------
+// Column families created and dropped while the database is open.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn a_column_family_created_at_runtime_survives_a_reopen() {
+    let (_, fs) = memfs();
+    {
+        let db = open(&fs, options(), &[cf::DEFAULT]).unwrap();
+        let id = db.create_cf("metrics", CfOptions::default()).unwrap();
+        assert_eq!(db.cf_id("metrics"), Some(id));
+        db.put("metrics", b"k", b"v").unwrap();
+        db.put(cf::DEFAULT, b"k", b"default").unwrap();
+        db.flush("metrics").unwrap();
+    }
+
+    let db = open(&fs, Options::default(), &[cf::DEFAULT]).unwrap();
+    assert!(db.cf_names().contains(&"metrics".to_string()));
+    assert_eq!(
+        db.get("metrics", b"k", &ReadOptions::default())
+            .unwrap()
+            .as_deref(),
+        Some(&b"v"[..])
+    );
+    assert_eq!(get(&db, b"k").as_deref(), Some(&b"default"[..]));
+}
+
+#[test]
+fn dropping_a_column_family_takes_its_data_with_it() {
+    let (memfs, fs) = memfs();
+    let db = open(&fs, options(), &[cf::DEFAULT, cf::LOCK]).unwrap();
+    db.put(cf::LOCK, b"k", b"v").unwrap();
+    db.put(cf::DEFAULT, b"keep", b"me").unwrap();
+    db.flush(cf::LOCK).unwrap();
+
+    let before = memfs.list(std::path::Path::new(DIR)).unwrap().len();
+    db.drop_cf(cf::LOCK).unwrap();
+    assert_eq!(db.cf_id(cf::LOCK), None);
+    assert!(db.get(cf::LOCK, b"k", &ReadOptions::default()).is_err());
+    assert!(
+        memfs.list(std::path::Path::new(DIR)).unwrap().len() < before,
+        "the dropped family's files should have been reclaimed"
+    );
+    assert_eq!(get(&db, b"keep").as_deref(), Some(&b"me"[..]));
+    drop(db);
+
+    let db = open(&fs, Options::default(), &[cf::DEFAULT]).unwrap();
+    assert!(
+        !db.cf_names().contains(&cf::LOCK.to_string()),
+        "a dropped family stays dropped"
+    );
+    assert_eq!(get(&db, b"keep").as_deref(), Some(&b"me"[..]));
+}
+
+#[test]
+fn creating_a_column_family_twice_is_refused() {
+    let (_, fs) = memfs();
+    let db = open(&fs, options(), &[cf::DEFAULT]).unwrap();
+    db.create_cf("twice", CfOptions::default()).unwrap();
+    let err = db.create_cf("twice", CfOptions::default()).unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+    assert!(db.drop_cf("nothing-here").is_err());
+}
+
+/// The sequence number must survive an edit that rolls the manifest, whichever edit it is.
+#[test]
+fn a_column_family_edit_carries_the_sequence_number() {
+    let (_, fs) = memfs();
+    let seqno;
+    {
+        let db = open(&fs, options(), &[cf::DEFAULT]).unwrap();
+        for i in 0..20u32 {
+            db.put(cf::DEFAULT, format!("k{i}").as_bytes(), b"v")
+                .unwrap();
+        }
+        db.flush(cf::DEFAULT).unwrap();
+        seqno = db.last_seqno();
+        db.create_cf("later", CfOptions::default()).unwrap();
+    }
+    let db = open(&fs, Options::default(), &[cf::DEFAULT]).unwrap();
+    assert!(
+        db.last_seqno() >= seqno,
+        "the sequence number went backwards across a column-family edit"
+    );
+    for i in 0..20u32 {
+        assert_eq!(
+            get(&db, format!("k{i}").as_bytes()).as_deref(),
+            Some(&b"v"[..])
+        );
+    }
+}

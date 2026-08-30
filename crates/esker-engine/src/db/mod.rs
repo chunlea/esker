@@ -246,6 +246,47 @@ impl Db {
         )
     }
 
+    /// Creates a column family and returns its id.
+    ///
+    /// The manifest edit is logged and made durable before the family exists in memory: a
+    /// family that took writes and then vanished on reopen would lose them, while one the
+    /// manifest knows about and this process does not is fixed by opening the database again.
+    pub fn create_cf(&self, name: &str, options: CfOptions) -> Result<u32> {
+        let id = {
+            let mut versions = lock(&self.inner.versions)?;
+            // The manifest may roll on this edit, and a rolled manifest is the only remaining
+            // record of the sequence number. Stamp it first; see `DbInner::log_and_apply`.
+            versions.set_last_seqno(self.inner.visible_seqno.load(Ordering::Acquire));
+            versions.create_cf(name)?
+        };
+        let log_number = lock(&self.inner.wal)?.number;
+        let cf = Arc::new(ColumnFamily::new(
+            id,
+            name.to_string(),
+            options,
+            &self.inner.comparator,
+            log_number,
+        ));
+        write_lock(&self.inner.cfs)?.insert(id, cf);
+        Ok(id)
+    }
+
+    /// Drops a column family. Its files and memtables go with it.
+    ///
+    /// Writes already queued for it are logged and then skipped, exactly as replay skips log
+    /// records for a family that no longer exists.
+    pub fn drop_cf(&self, name: &str) -> Result<()> {
+        let id = self.inner.cf_by_name(name)?.id();
+        {
+            let mut versions = lock(&self.inner.versions)?;
+            versions.set_last_seqno(self.inner.visible_seqno.load(Ordering::Acquire));
+            versions.drop_cf(name)?;
+        }
+        write_lock(&self.inner.cfs)?.remove(&id);
+        self.inner.purge_and_evict()?;
+        Ok(())
+    }
+
     /// A read position: everything written so far is visible through it, nothing later is.
     pub fn snapshot(&self) -> Snapshot {
         self.inner
