@@ -1,0 +1,23 @@
+crates/esker-pd/src/operator.rs
+  s_04c6c85b29b28a::t_b85293308a456a 38,103-109,113,115,122,224,261,309,327,342,364,379,399,427
+crates/esker-pd/src/pd/repair.rs
+  s_04c6c85b29b28a::t_134d4806bc8199 22,75-77,80,89,102-110,116-132,137
+crates/esker-pd/src/schedule.rs
+  s_04c6c85b29b28a::t_382d9374c644e1 81-147,152-153,182-231,339,384,391-436
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "63f3c21c1e5e8914233145b94cb2c22929b3ab6d",
+  "prompts": {},
+  "sessions": {
+    "s_04c6c85b29b28a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0e874339-89db-44c7-acd5-0deac94983ec",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
