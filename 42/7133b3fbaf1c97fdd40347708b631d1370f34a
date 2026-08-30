@@ -1,0 +1,21 @@
+crates/esker-sim/src/lin.rs
+  s_34d3e1d2eec97a::t_96ac1c0fcce5ae 19-23,151-153,163-174,177-178
+crates/esker-sim/tests/lin_register.rs
+  s_34d3e1d2eec97a::t_c0b5f059d633e3 228-267
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "427133b3fbaf1c97fdd40347708b631d1370f34a",
+  "prompts": {},
+  "sessions": {
+    "s_34d3e1d2eec97a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9489838b-5536-4d39-8dbe-930a5f0cac17",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
