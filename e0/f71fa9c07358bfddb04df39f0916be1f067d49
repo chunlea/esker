@@ -1,0 +1,33 @@
+crates/esker-cli/Cargo.toml
+  s_04c6c85b29b28a::t_a41e87ba3e619c 33-35
+crates/esker-cli/src/pd.rs
+  s_04c6c85b29b28a::t_6a915d05d1d100 138-162,252-253,330,334-411
+crates/esker-pd/src/keys.rs
+  s_04c6c85b29b28a::t_814b02b803d475 12,49-50,82-87,182-183,190
+crates/esker-pd/src/pd/mod.rs
+  s_04c6c85b29b28a::t_ab01974390343b 49-51,225-229,264-267,286,547-566
+crates/esker-pd/src/pd/repair.rs
+  s_04c6c85b29b28a::t_4d15ebe501d05a 21,25-45,82,109-114,117,120,122,130,139,148,150-151,160-161,281
+crates/esker-pd/src/record.rs
+  s_04c6c85b29b28a::t_e863ee62c0cf5a 311-502,715-764
+crates/esker-pd/tests/golden/records.hex
+  s_04c6c85b29b28a::t_46b7f9bcb4fcda 16
+crates/esker-pd/tests/records.rs
+  s_04c6c85b29b28a::t_773a1b4b062da0 16-17,83-131,163,201
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "e0f71fa9c07358bfddb04df39f0916be1f067d49",
+  "prompts": {},
+  "sessions": {
+    "s_04c6c85b29b28a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0e874339-89db-44c7-acd5-0deac94983ec",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
