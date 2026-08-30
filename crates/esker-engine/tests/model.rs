@@ -23,9 +23,9 @@
 //!
 //! # Snapshots do not survive a reopen
 //!
-//! That is this file's definition, and the model drops its clones at every `Reopen`. The
-//! engine does not currently enforce it — see
-//! [`a_snapshot_taken_before_a_reopen_is_not_rejected`], which pins what it does instead.
+//! That is this file's definition, the model drops its clones at every `Reopen`, and the
+//! engine now enforces it: a handle from a closed database is refused rather than accepted as
+//! a bare number — see [`a_snapshot_taken_before_a_reopen_is_refused`].
 //!
 //! # `flush` and `compact` must be invisible
 //!
@@ -541,25 +541,20 @@ fn a_database_is_a_btreemap_acceptance_run() {
 // Two semantics this file depends on, pinned
 // ---------------------------------------------------------------------------------------
 
-/// **Snapshots do not survive a reopen — but the engine does not say so.**
+/// **A snapshot from a closed database is refused, not silently believed.**
 ///
-/// A [`Snapshot`] is a sequence number plus a handle on the issuing database's snapshot list.
-/// Nothing stops one being handed to a *different* `Db`, and nothing checks that it came from
-/// this one: the read path takes `Snapshot::seqno` and uses it as a bare number. Because
-/// recovery preserves sequence numbers, a stale snapshot currently reads as though it were
-/// still live, which is the most misleading of the possible behaviours.
+/// A [`Snapshot`] is a sequence number plus a handle on the issuing database's snapshot list,
+/// and sequence numbers survive a reopen — so a stale handle names a number that still means
+/// something in the reopened database. Believing it is the most misleading of the available
+/// behaviours: the reopened list has never heard of that handle, so the floor it hands
+/// compaction can sit above the number the handle claims, and the versions it pinned are
+/// collected while it still holds them.
 ///
-/// It is latent rather than harmful today only because nothing collects old versions yet. Once
-/// compaction lands (step 7) the reopened database's snapshot list will not know about the
-/// stale handle, so the floor it computes may be above the seqno that handle still reads at,
-/// and a read through it would see whatever survived rather than what it pinned.
-///
-/// This test pins the present behaviour so that a future change — refusing a foreign snapshot,
-/// or making one impossible to construct across databases — arrives as a deliberate edit here
-/// rather than as a silent difference. The model takes the safe reading regardless: it drops
-/// its clones at every reopen.
+/// The engine therefore stamps every list with an instance id, every snapshot remembers its
+/// own, and the read paths compare them. A snapshot's whole promise is that what it saw stays
+/// readable, and only the database that issued it can keep that promise.
 #[test]
-fn a_snapshot_taken_before_a_reopen_is_not_rejected() {
+fn a_snapshot_taken_before_a_reopen_is_refused() {
     let fs: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
     let options = || Options {
         create_if_missing: true,
@@ -575,19 +570,37 @@ fn a_snapshot_taken_before_a_reopen_is_not_rejected() {
     };
 
     let db = Db::open_with(DIR, Options::default(), Arc::clone(&fs), &CFS).unwrap();
-    let options = ReadOptions {
+    let read_options = ReadOptions {
         snapshot: Some(stale.clone()),
         ..ReadOptions::default()
     };
 
-    // Not an error, and not empty: the sequence number is simply used.
-    let found = db
-        .get(cf::DEFAULT, b"k", &options)
-        .expect("a stale snapshot is accepted rather than refused");
+    let error = db
+        .get(cf::DEFAULT, b"k", &read_options)
+        .expect_err("a stale snapshot must be refused, not used as a bare sequence number");
+    let message = error.to_string();
+    assert!(message.contains("database instance"), "{message}");
+    assert!(message.contains("do not survive a reopen"), "{message}");
+
+    assert!(
+        db.iter(cf::DEFAULT, &read_options).is_err(),
+        "an iterator must refuse it too, or a scan becomes the way around the check"
+    );
+
+    // A snapshot from *this* database still works, and the database itself is unaffected.
+    let live = db.snapshot();
     assert_eq!(
-        found.as_deref(),
-        Some(&b"first"[..]),
-        "a stale snapshot read something other than the value at its sequence number"
+        db.get(
+            cf::DEFAULT,
+            b"k",
+            &ReadOptions {
+                snapshot: Some(live),
+                ..ReadOptions::default()
+            }
+        )
+        .unwrap()
+        .as_deref(),
+        Some(&b"second"[..])
     );
     assert_eq!(
         db.get(cf::DEFAULT, b"k", &ReadOptions::default())
@@ -597,14 +610,13 @@ fn a_snapshot_taken_before_a_reopen_is_not_rejected() {
         "the reopened database lost the newer write"
     );
 
-    let mut iter = db.iter(cf::DEFAULT, &options).unwrap();
-    iter.seek_to_first();
-    assert!(
-        iter.valid(),
-        "an iterator at a stale snapshot found nothing"
+    // The stale handle still holds a sequence number in *its* list, which is now nobody's:
+    // dropping it is all that is left to do with it.
+    assert_eq!(stale.seqno(), 1);
+    assert_ne!(
+        stale.instance(),
+        db.property("esker.instance").unwrap().parse().unwrap()
     );
-    assert_eq!(iter.value(), b"first");
-    iter.status().unwrap();
 }
 
 /// The tripwire for the one operation `prompts/01-engine.md` lists that is not modelled.

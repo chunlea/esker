@@ -1069,3 +1069,79 @@ fn a_column_family_edit_carries_the_sequence_number() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// The line compaction will not be allowed to collect below.
+// ---------------------------------------------------------------------------------------
+
+/// With no snapshots outstanding the floor is the newest visible sequence number: every
+/// version a reader could still ask for is one a fresh read would see. A live snapshot pulls
+/// it back to itself and holds it there.
+#[test]
+fn the_compaction_floor_follows_the_oldest_live_snapshot() {
+    let (_, fs) = memfs();
+    let db = open(&fs, options(), &[cf::DEFAULT]).unwrap();
+    let floor = || -> u64 {
+        db.property("esker.compaction-floor")
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+
+    db.put(cf::DEFAULT, b"k", b"1").unwrap();
+    assert_eq!(
+        floor(),
+        db.last_seqno(),
+        "no snapshots: the floor is the present"
+    );
+
+    let old = db.snapshot();
+    let pinned = old.seqno();
+    db.put(cf::DEFAULT, b"k", b"2").unwrap();
+    db.put(cf::DEFAULT, b"k", b"3").unwrap();
+    assert_eq!(floor(), pinned, "a live snapshot holds the floor at itself");
+
+    // A newer snapshot never moves the floor forward past an older one.
+    let newer = db.snapshot();
+    assert!(newer.seqno() > pinned);
+    assert_eq!(floor(), pinned);
+
+    drop(old);
+    assert_eq!(
+        floor(),
+        newer.seqno(),
+        "the floor rises as handles are released"
+    );
+    drop(newer);
+    assert_eq!(floor(), db.last_seqno());
+}
+
+/// The other half of the same rule: a snapshot from a database that has been closed pins
+/// nothing here, so it is refused rather than allowed to read below a floor it cannot move.
+#[test]
+fn a_snapshot_from_another_database_is_refused() {
+    let (_, fs) = memfs();
+    let foreign = {
+        let other: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
+        let db = open(&other, options(), &[cf::DEFAULT]).unwrap();
+        db.put(cf::DEFAULT, b"k", b"elsewhere").unwrap();
+        db.snapshot()
+    };
+
+    let db = open(&fs, options(), &[cf::DEFAULT]).unwrap();
+    db.put(cf::DEFAULT, b"k", b"here").unwrap();
+    let read_options = ReadOptions {
+        snapshot: Some(foreign.clone()),
+        ..ReadOptions::default()
+    };
+    assert!(matches!(
+        db.get(cf::DEFAULT, b"k", &read_options),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(db.iter(cf::DEFAULT, &read_options).is_err());
+    // And it does not move this database's floor, because it holds nothing in it.
+    assert_eq!(
+        db.property("esker.compaction-floor").unwrap(),
+        db.last_seqno().to_string()
+    );
+}

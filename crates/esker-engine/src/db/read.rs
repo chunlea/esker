@@ -30,27 +30,78 @@ use crate::memtable::Lookup;
 use crate::options::ReadOptions;
 use crate::version::{CfVersion, FileMeta, Version};
 
-use super::{ColumnFamily, Db, DbInner, Snapshot, lock, read_lock};
+use super::{ColumnFamily, Db, DbInner, lock, read_lock};
 
 impl Db {
     /// Reads one key, or `None` if it is not there at this snapshot.
+    ///
+    /// A snapshot from a different open database is refused: it pins nothing here, so
+    /// nothing keeps the versions it names readable.
     pub fn get(&self, cf: &str, key: &[u8], options: &ReadOptions) -> Result<Option<Bytes>> {
         let cf = self.inner.cf_by_name(cf)?;
-        let snapshot = options.snapshot.as_ref().map_or_else(
-            || self.inner.visible_seqno.load(AtomicOrdering::Acquire),
-            Snapshot::seqno,
-        );
+        let snapshot = self.inner.read_seqno(options)?;
         Ok(self.inner.lookup(&cf, key, snapshot)?.and_then(value_of))
     }
 
-    /// Reads at an explicit sequence number, a shorthand for filling in [`ReadOptions`].
-    pub fn get_at(&self, cf: &str, key: &[u8], snapshot: SeqNo) -> Result<Option<Bytes>> {
+    /// Reads at an explicit sequence number.
+    ///
+    /// Unlike a [`crate::Snapshot`], a bare number pins nothing: it is a request to read history that
+    /// may already have been compacted away, and there is no error for that — the read simply
+    /// sees whatever survived. Take a snapshot *before* the writes you want to be able to read
+    /// back; this is for the engine's own machinery and for tests, which know when nothing has
+    /// been collected yet.
+    pub fn get_at(&self, cf: &str, key: &[u8], seqno: SeqNo) -> Result<Option<Bytes>> {
         let cf = self.inner.cf_by_name(cf)?;
-        Ok(self.inner.lookup(&cf, key, snapshot)?.and_then(value_of))
+        // Held for the call so a compaction running alongside it cannot collect mid-read.
+        let pinned = self.inner.snapshots.acquire(seqno);
+        let found = self.inner.lookup(&cf, key, pinned.seqno());
+        drop(pinned);
+        Ok(found?.and_then(value_of))
     }
 }
 
 impl DbInner {
+    /// The sequence number a read should use, refusing a snapshot from another database.
+    ///
+    /// Sequence numbers survive a reopen, so a handle taken before one is still a plausible
+    /// number afterwards and would read as though it were live. It is not: this database's
+    /// snapshot list has never heard of it, so the floor it hands compaction can sit above
+    /// the number the handle claims, and the versions it pinned can be collected while it
+    /// still holds them. A snapshot's whole promise is that what it saw stays readable, and
+    /// that is a promise only the database that issued it can keep.
+    pub(crate) fn read_seqno(&self, options: &ReadOptions) -> Result<SeqNo> {
+        let Some(snapshot) = &options.snapshot else {
+            return Ok(self.visible_seqno.load(AtomicOrdering::Acquire));
+        };
+        if snapshot.instance() != self.snapshots.instance() {
+            return Err(Error::InvalidArgument(format!(
+                "a snapshot at sequence number {} belongs to database instance {}, not {}; \
+                 snapshots do not survive a reopen",
+                snapshot.seqno(),
+                snapshot.instance(),
+                self.snapshots.instance()
+            )));
+        }
+        Ok(snapshot.seqno())
+    }
+
+    /// The sequence number below which a shadowed version may be dropped.
+    ///
+    /// The oldest live snapshot, or the newest visible sequence number when there are none.
+    /// Compaction may drop a version only when a newer one for the same key exists at or
+    /// below this line, because then every reader that can still ask sees the newer one.
+    ///
+    /// A snapshot taken *after* this is read is safe without any locking: it can only be at
+    /// the sequence number current when it was taken, which is at or above the floor, so the
+    /// version that shadowed the dropped one is visible to it. That is the whole argument,
+    /// and it holds only because a handle from another database is refused — one of those
+    /// could name a number below the floor and this reasoning would not cover it.
+    pub(crate) fn compaction_floor(&self) -> SeqNo {
+        self.snapshots
+            .oldest()
+            .unwrap_or_else(|| self.visible_seqno.load(AtomicOrdering::Acquire))
+    }
+
     /// The newest entry for `key` at or below `snapshot`, wherever it lives.
     pub(crate) fn lookup(
         &self,

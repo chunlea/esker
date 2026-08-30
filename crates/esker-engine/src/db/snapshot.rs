@@ -9,23 +9,51 @@
 //! numbers, and [`SnapshotList::oldest`] is the line compaction is not allowed to collect
 //! below. A snapshot releases itself on drop, so forgetting one costs space until the handle
 //! goes away rather than forever.
+//!
+//! # A snapshot belongs to one open database
+//!
+//! Sequence numbers survive a reopen, so a handle taken before one is still a plausible
+//! number afterwards — and reading through it would quietly work. It must not. The reopened
+//! database's list has never heard of that handle, so the floor it gives compaction can sit
+//! above the sequence number the handle still claims to read at, and the versions it pinned
+//! would be collected out from under it.
+//!
+//! Every list therefore carries an instance id, every snapshot remembers its list's, and the
+//! read paths refuse a handle from anywhere else. Refusing is the only honest option: the
+//! guarantee a snapshot makes is that what it saw stays readable, and a reopened database
+//! cannot make that promise about a number it was handed.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::dbformat::SeqNo;
 
+/// Hands each open database a distinct identity. Never repeats within a process, and a
+/// snapshot cannot leave one.
+static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
 /// The sequence numbers readers are currently holding.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SnapshotList {
+    /// Which open database this list belongs to.
+    instance: u64,
     /// Sequence number to how many live snapshots name it.
     counts: Mutex<BTreeMap<SeqNo, usize>>,
 }
 
 impl SnapshotList {
-    /// An empty list.
+    /// An empty list, with a fresh instance id.
     pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        Arc::new(Self {
+            instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
+            counts: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    /// The open database this list belongs to.
+    pub fn instance(&self) -> u64 {
+        self.instance
     }
 
     /// Takes a snapshot at `seqno`.
@@ -89,6 +117,15 @@ impl Snapshot {
     pub fn seqno(&self) -> SeqNo {
         self.seqno
     }
+
+    /// The open database that issued it.
+    ///
+    /// Reads compare this with their own: a snapshot from a database that has since been
+    /// closed and reopened pins nothing in the new one, so using it would be a promise
+    /// nobody is keeping.
+    pub fn instance(&self) -> u64 {
+        self.list.instance()
+    }
 }
 
 impl Clone for Snapshot {
@@ -144,6 +181,19 @@ mod tests {
         assert_eq!(list.oldest(), Some(7));
         drop(second);
         assert_eq!(list.oldest(), None);
+    }
+
+    /// Every open database gets its own identity, so a handle from one can be told from a
+    /// handle from another — which is what makes a stale snapshot refusable rather than
+    /// silently plausible.
+    #[test]
+    fn snapshots_carry_the_instance_that_issued_them() {
+        let first = SnapshotList::new();
+        let second = SnapshotList::new();
+        assert_ne!(first.instance(), second.instance());
+        assert_eq!(first.acquire(1).instance(), first.instance());
+        assert_eq!(first.acquire(9).clone().instance(), first.instance());
+        assert_ne!(first.acquire(1).instance(), second.acquire(1).instance());
     }
 
     /// Cloning has to count too, or a compaction could collect what a clone can still read.

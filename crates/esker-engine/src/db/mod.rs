@@ -308,6 +308,7 @@ impl Db {
     /// infer one (`docs/DESIGN.md` §4.4, §12).
     ///
     /// Recognised names: `esker.num-column-families`, `esker.snapshots`,
+    /// `esker.compaction-floor`, `esker.instance`,
     /// `esker.last-sequence`, `esker.write-stalls`, `esker.write-slowdowns`,
     /// `esker.open-tables`, `esker.mem-table-size.<cf>`, `esker.num-immutable-mem-table.<cf>`,
     /// `esker.oldest-log.<cf>`, `esker.num-files-at-level<n>.<cf>`.
@@ -316,6 +317,8 @@ impl Db {
         match name {
             "esker.num-column-families" => Some(inner.cfs.read().ok()?.len().to_string()),
             "esker.snapshots" => Some(inner.snapshots.len().to_string()),
+            "esker.compaction-floor" => Some(inner.compaction_floor().to_string()),
+            "esker.instance" => Some(inner.snapshots.instance().to_string()),
             "esker.last-sequence" => Some(self.last_seqno().to_string()),
             "esker.write-stalls" => Some(inner.stalls.load(Ordering::Relaxed).to_string()),
             "esker.write-slowdowns" => Some(inner.slowdowns.load(Ordering::Relaxed).to_string()),

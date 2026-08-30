@@ -21,7 +21,6 @@
 
 use std::cmp::Ordering;
 use std::sync::Arc;
-use std::sync::atomic::Ordering as AtomicOrdering;
 
 use crate::dbformat::{
     EntryKind, InternalKeyComparator, MAX_SEQNO, SeqNo, extract_user_key, internal_key, lookup_key,
@@ -350,10 +349,7 @@ impl Db {
     /// long time therefore holds disk space; that is the trade a consistent scan costs.
     pub fn iter(&self, cf: &str, options: &ReadOptions) -> Result<DbIterator> {
         let cf = self.inner.cf_by_name(cf)?;
-        let snapshot = options.snapshot.as_ref().map_or_else(
-            || self.inner.visible_seqno.load(AtomicOrdering::Acquire),
-            Snapshot::seqno,
-        );
+        let snapshot = self.inner.read_seqno(options)?;
 
         let mut children: Vec<Box<dyn Cursor + Send>> = Vec::new();
         {
