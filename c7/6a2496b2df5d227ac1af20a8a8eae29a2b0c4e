@@ -1,0 +1,29 @@
+crates/esker-cli/src/args.rs
+  s_583ba4eb96ad8a::t_e6871ef7aefd69 14-15,23,25,38-41,122-123,139-144,165-166,277-322
+crates/esker-cli/src/bytes.rs
+  s_583ba4eb96ad8a::t_5d67c815537314 1-76
+crates/esker-cli/src/main.rs
+  s_583ba4eb96ad8a::t_04c9716ef287e7 3-5,10-11,13,54-73
+crates/esker-cli/src/manifest_dump.rs
+  s_583ba4eb96ad8a::t_62acadea569374 1-531
+crates/esker-cli/src/sst_dump.rs
+  s_583ba4eb96ad8a::t_7835f96799fb05 35,465
+crates/esker-cli/src/wal_dump.rs
+  s_583ba4eb96ad8a::t_b108434c2293e5 1-537
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "c76a2496b2df5d227ac1af20a8a8eae29a2b0c4e",
+  "prompts": {},
+  "sessions": {
+    "s_583ba4eb96ad8a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2ac73fb2-9428-4877-ae7d-195e5b69e526",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
