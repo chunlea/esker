@@ -36,8 +36,9 @@ use crate::alloc::{ALLOC_BATCH, Allocator};
 use crate::clock::{Clock, SystemClock};
 use crate::error::{PdError, Result};
 use crate::keys;
-use crate::record::{AllocRecord, ClusterRecord, RegionRecord, StoreRecord};
+use crate::record::{AllocRecord, ClusterRecord, RegionRecord, StoreRecord, TsoRecord};
 use crate::routing;
+use crate::tso::Oracle;
 
 /// How long a store may be silent before it is considered down (`docs/DESIGN.md` §7).
 ///
@@ -141,6 +142,7 @@ pub struct Pd {
 pub(crate) struct State {
     pub(crate) cluster: Option<ClusterRecord>,
     pub(crate) alloc: Allocator,
+    pub(crate) oracle: Oracle,
 }
 
 impl Pd {
@@ -167,6 +169,11 @@ impl Pd {
         let alloc = read(&db, &keys::alloc_key())?
             .map(|bytes| AllocRecord::decode(&bytes))
             .transpose()?;
+        let mark = read(&db, &keys::tso_key())?
+            .map(|bytes| TsoRecord::decode(&bytes))
+            .transpose()?;
+        // `max(clock, mark)`, the restart rule, is inside `Oracle::load`.
+        let oracle = Oracle::load(mark, options.clock.now_ms(), options.tso_save_interval_ms);
 
         Ok(Arc::new(Self {
             db,
@@ -176,6 +183,7 @@ impl Pd {
             state: Mutex::new(State {
                 cluster,
                 alloc: Allocator::load(alloc, options.alloc_batch),
+                oracle,
             }),
         }))
     }
@@ -304,6 +312,26 @@ impl Pd {
             .allocate(count, |end| persist_alloc(&db, cf, end))
     }
 
+    /// A run of `count` consecutive timestamps, starting at the returned one.
+    ///
+    /// The high-water mark covering them is durable before any of them leaves this call
+    /// ([`crate::tso`]). This is the one place in Esker that reads a wall clock, and the one
+    /// whose ordering every layer above depends on (`CLAUDE.md` invariant 6).
+    pub fn tso(&self, count: u32) -> Result<u64> {
+        let now_ms = self.clock.now_ms();
+        let mut state = self.lock()?;
+        let db = Arc::clone(&self.db);
+        let cf = self.cf;
+        state
+            .oracle
+            .allocate(count, now_ms, |mark| persist_tso(&db, cf, mark))
+    }
+
+    /// The oracle's high-water mark, for the inspector and the tests.
+    pub fn tso_high_water_ms(&self) -> Result<u64> {
+        Ok(self.lock()?.oracle.high_water_ms())
+    }
+
     /// The region covering `key`, with the leader PD last heard about and the addresses of the
     /// stores its peers are on.
     ///
@@ -379,6 +407,14 @@ impl Pd {
 
 fn read(db: &Db, key: &[u8]) -> Result<Option<bytes::Bytes>> {
     Ok(db.get(cf::DEFAULT, key, &ReadOptions::default())?)
+}
+
+/// Makes the oracle's mark durable. Called *before* a timestamp at or above it is handed out.
+fn persist_tso(db: &Db, cf: u32, high_water_ms: u64) -> Result<()> {
+    let mut batch = WriteBatch::new();
+    batch.put(cf, &keys::tso_key(), &TsoRecord { high_water_ms }.encode());
+    db.write(batch, &WriteOptions::synced())?;
+    Ok(())
 }
 
 /// Makes an id reservation durable. Called by the allocator *before* it hands out an id.
@@ -555,6 +591,69 @@ mod tests {
         assert_eq!(pd.cluster_id().unwrap(), minted);
         assert_eq!(pd.bootstrap(1, "a").unwrap().cluster_id, minted);
         assert_eq!(pd.regions().unwrap().len(), 1);
+    }
+
+    /// The oracle's rule, end to end over a real database and a clock that goes backwards
+    /// across the reopen: nothing repeats, and nothing goes down.
+    #[test]
+    fn timestamps_never_repeat_across_a_reopen_with_a_backwards_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(TestClock::new(1_700_000_000_000));
+        let options = || PdOptions::with_clock(Arc::clone(&clock) as Arc<dyn crate::Clock>);
+
+        let mut seen = Vec::new();
+        {
+            let pd = Pd::open(dir.path(), options()).unwrap();
+            pd.bootstrap(1, "a").unwrap();
+            for _ in 0..4 {
+                seen.push(pd.tso(16).unwrap());
+                clock.advance(1);
+            }
+        }
+
+        // A day backwards, which is what an NTP correction on a badly-set machine looks like.
+        clock.set(1_700_000_000_000 - 86_400_000);
+        let pd = Pd::open(dir.path(), options()).unwrap();
+        let after = pd.tso(1).unwrap();
+
+        let highest = seen.iter().copied().max().unwrap();
+        assert!(
+            after > highest,
+            "after the restart {after} is not above {highest} from before it"
+        );
+        let unique: std::collections::BTreeSet<u64> = seen.iter().copied().collect();
+        assert_eq!(unique.len(), seen.len());
+    }
+
+    /// Every timestamp handed out is strictly below the mark on disk. This is the property the
+    /// restart rule leans on; if it ever fails, a restart can repeat a timestamp.
+    #[test]
+    fn every_timestamp_is_below_the_persisted_mark() {
+        let (_dir, clock, pd) = open();
+        pd.bootstrap(1, "a").unwrap();
+        for step in 0..8 {
+            let ts = pd.tso(4).unwrap();
+            let (physical, _) = crate::decompose_ts(ts);
+            let mark = pd.tso_high_water_ms().unwrap();
+            assert!(
+                physical < mark,
+                "step {step}: {physical} is not below {mark}"
+            );
+            clock.advance(500);
+        }
+        // And the mark on disk is the one in memory, not one still in a buffer somewhere.
+        let stored = crate::record::TsoRecord::decode(
+            &pd.db()
+                .get(
+                    esker_engine::cf::DEFAULT,
+                    &crate::keys::tso_key(),
+                    &esker_engine::ReadOptions::default(),
+                )
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored.high_water_ms, pd.tso_high_water_ms().unwrap());
     }
 
     #[test]

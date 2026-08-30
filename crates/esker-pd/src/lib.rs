@@ -41,6 +41,7 @@ pub mod keys;
 pub mod pd;
 pub mod record;
 pub mod routing;
+pub mod tso;
 
 pub use clock::{Clock, SystemClock};
 pub use error::{PdError, Result};
