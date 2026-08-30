@@ -371,13 +371,16 @@ impl<S: LogStorage> Raft<S> {
         }
 
         self.log.commit_to(candidate)?;
+        // The first entry of this leader's term has just committed, which is what a postponed
+        // read was waiting for.
+        self.flush_postponed_reads()?;
         Ok(true)
     }
 }
 
-// The two seams replication leans on that belong to later steps. Both are reachable only through
-// features those steps introduce — a snapshot needs a compaction, a read acknowledgement needs a
-// `ReadIndex` round — so until then they are quiet by construction, not by accident.
+// The seam replication leans on that belongs to a later step. It is reachable only through a
+// feature that step introduces — a snapshot needs a compaction — so until then it is quiet by
+// construction rather than by accident.
 impl<S: LogStorage> Raft<S> {
     /// TODO(step-5): send an `InstallSnapshot` to a follower whose entries have been compacted.
     #[allow(clippy::unnecessary_wraps)]
@@ -389,10 +392,6 @@ impl<S: LogStorage> Raft<S> {
         );
         Ok(())
     }
-
-    /// TODO(step-4): count this response toward an outstanding `ReadIndex` round.
-    #[allow(clippy::unused_self)]
-    fn record_read_ack(&mut self, _from: NodeId, _context: &Bytes) {}
 }
 
 #[cfg(test)]

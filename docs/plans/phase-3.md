@@ -274,11 +274,11 @@ The orderings that break Raft implementations. Each is a named test in this lane
 ## 9. Progress
 
 - [x] step 0 — this plan
-- [ ] step 0 — the public types compiling; `docs/raft-spec.md` skeleton
-- [ ] step 1 — election
-- [ ] step 2 — replication
-- [ ] step 3 — Ready/advance, the election-safety proptest
-- [ ] step 4 — ReadIndex
+- [x] step 0 — the public types compiling; `docs/raft-spec.md` skeleton
+- [x] step 1 — election
+- [x] step 2 — replication
+- [x] step 3 — Ready/advance, the election-safety proptest
+- [x] step 4 — ReadIndex
 - [ ] step 5 — compaction and InstallSnapshot
 - [ ] step 6 — membership, learners, transfer, pre-vote, check-quorum
 - [ ] step 7 — `docs/raft-spec.md` closed

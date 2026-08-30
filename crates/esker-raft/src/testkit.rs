@@ -25,6 +25,8 @@ pub(crate) struct Harness {
     queue: Vec<Message>,
     /// Directed links that drop everything, as `(from, to)`.
     severed: Vec<(NodeId, NodeId)>,
+    /// Read states each node has produced, in order, as a driver would record them.
+    reads: Vec<(NodeId, crate::types::ReadState)>,
     /// Every `(term, leader)` this group has ever produced, sorted by term. Election Safety is
     /// a claim about history, not about the current instant: a node can take office in a term,
     /// step down, and be followed by a different node in the *same* term, which no snapshot of
@@ -57,6 +59,7 @@ impl Harness {
             nodes,
             queue: Vec::new(),
             severed: Vec::new(),
+            reads: Vec::new(),
             elected: Vec::new(),
         }
     }
@@ -121,7 +124,8 @@ impl Harness {
     /// messages. Returns how many were queued.
     pub(crate) fn drain_ready(&mut self) -> usize {
         let mut outgoing = Vec::new();
-        for (_, node) in &mut self.nodes {
+        let mut answered = Vec::new();
+        for (id, node) in &mut self.nodes {
             if !node.has_ready() {
                 continue;
             }
@@ -140,10 +144,14 @@ impl Harness {
                 .expect("test appends are contiguous");
 
             outgoing.extend(ready.messages.iter().cloned());
+            // Rule 4: a driver answers a read once it has applied through the read's index. This
+            // one records them instead, so a test can assert on what was answered and when.
+            answered.extend(ready.read_states.iter().map(|state| (*id, state.clone())));
             node.advance(&ready);
         }
         let queued = outgoing.len();
         self.queue.extend(outgoing);
+        self.reads.extend(answered);
         queued
     }
 
@@ -244,6 +252,21 @@ impl Harness {
                 }
             }
         }
+    }
+
+    /// Takes the read states a node has produced so far.
+    pub(crate) fn take_read_states(&mut self, id: NodeId) -> Vec<crate::types::ReadState> {
+        self.drain_ready();
+        let mut taken = Vec::new();
+        self.reads.retain(|(node, state)| {
+            if *node == id {
+                taken.push(state.clone());
+                false
+            } else {
+                true
+            }
+        });
+        taken
     }
 
     /// Every node that currently believes it is the leader, with its term.

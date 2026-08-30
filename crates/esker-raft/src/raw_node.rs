@@ -150,11 +150,20 @@ impl<S: LogStorage> RawNode<S> {
         Ok(())
     }
 
-    /// Requests a linearizable read. The index arrives later, in a [`Ready::read_states`].
-    #[allow(clippy::needless_pass_by_value)] // TODO(step-4): the context tags the round.
+    /// Requests a linearizable read.
+    ///
+    /// The answer arrives later, as a [`ReadState`] in [`Ready::read_states`], carrying `ctx` back
+    /// so the caller can match it. The driver must apply through that index before answering the
+    /// read — [`Ready`]'s contract, rule 4.
+    ///
+    /// On a follower this forwards to the leader; if this node does not know a leader, the request
+    /// is dropped and the caller retries, which is what it would have to do anyway.
     pub fn read_index(&mut self, ctx: Bytes) {
-        let _ = ctx;
-        // TODO(step-4): start a ReadIndex round.
+        if let Err(error) = self.raft.read_index(ctx, None) {
+            // Establishing a read index reads the log. A failure means this node cannot answer,
+            // not that the read is unanswerable: the caller's retry may reach a node that can.
+            tracing::warn!(%error, "could not start a read");
+        }
     }
 
     /// Starts an election immediately, skipping the timeout.

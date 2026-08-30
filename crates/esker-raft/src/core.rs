@@ -464,8 +464,13 @@ impl<S: LogStorage> Raft<S> {
                 context,
                 ..
             } => self.handle_append_response(from, reject, index, hint_term, &context),
+            Message::ReadIndex { from, ctx, .. } => self.read_index(ctx, Some(from)),
+            Message::ReadIndexResponse { index, ctx, .. } => {
+                self.handle_read_index_response(index, ctx);
+                Ok(())
+            }
             other => {
-                // TODO(step-2..6): replication responses, snapshots, transfer and reads.
+                // TODO(step-5..6): snapshots and leadership transfer.
                 tracing::trace!(
                     id = self.id,
                     term = self.term,

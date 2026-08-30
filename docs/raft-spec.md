@@ -125,7 +125,9 @@ Features from later chapters, each of which this crate implements.
 | X7 | Check-quorum, voter half: a follower with a healthy leader refuses votes | §6.2 | `core::Raft::vetoed_by_leader_lease` | `check_quorum_makes_a_follower_refuse_a_vote_while_its_leader_is_healthy`, `a_forced_vote_request_is_not_vetoed_by_the_lease` |
 | X7b | Check-quorum, leader half: a leader without quorum contact steps down | §6.2 | TBD (step 6) | TBD (step 6) |
 | X8 | Pre-vote: a returning node does not bump the term to lose an election | §9.6 | `core::Raft::step_higher_term` (the exemption), `election::Raft::{campaign, become_pre_candidate}` | `a_pre_vote_from_a_higher_term_does_not_move_this_node_s_term`, `a_granted_pre_vote_records_no_vote`, `a_partitioned_node_running_pre_votes_never_raises_its_term`, `without_pre_vote_a_returning_node_deposes_the_leader`, `a_late_pre_vote_grant_does_not_count_toward_a_real_election` |
-| X9 | `ReadIndex`: linearizable reads without a log write | §6.4 | `readonly::ReadOnly` | TBD (step 4) |
+| X9 | `ReadIndex`: linearizable reads without a log write | §6.4 | `readonly::Raft::{read_index, record_read_ack, answer_read}` | `a_read_is_answered_at_the_commit_index_after_a_heartbeat_quorum`, `a_leader_without_a_quorum_answers_no_read`, `a_read_does_not_survive_a_change_of_leadership`, `an_earlier_round_completes_with_a_later_one` |
+| X9b | A leader postpones reads until an entry of **its own term** has committed — until then its commit index is inherited and unproven | §6.4 | `readonly::Raft::{has_committed_in_current_term, flush_postponed_reads}` | `a_read_waits_until_the_leader_has_committed_in_its_own_term` |
+| X9c | A follower forwards a read to the leader and reports the answer | §6.4 | `readonly::Raft::{read_index, handle_read_index_response}` | `a_follower_forwards_a_read_and_reports_the_answer`, `a_read_on_a_node_that_knows_no_leader_is_dropped` |
 
 ### The driver contract
 
@@ -138,7 +140,7 @@ algorithm and into `Ready`'s documentation.
 | D1 | Persist `hard_state` and `entries` before sending `messages` from the same `Ready` | `raw_node::Ready` (documentation), `testkit::Harness::drain_ready` (a driver that obeys it) | `the_ready_that_grants_a_vote_carries_the_vote_it_recorded`, `a_message_never_precedes_the_entries_it_depends_on`; violations are `esker-sim`'s to inject |
 | D2 | Apply `snapshot` before `entries` | `raw_node::RawNode::advance` | TBD (step 5) |
 | D3 | Apply `committed_entries` in order, exactly once | `raw_node::RawNode::{ready, advance}` | `committed_entries_are_durable_or_carried_alongside`, `nothing_is_offered_twice_after_advance` |
-| D4 | Answer a read only past its index | `readonly` | TBD (step 4) |
+| D4 | Answer a read only past its index | `readonly`, `raw_node::Ready::read_states` | the rule is the driver's; `testkit::Harness::drain_ready` records read states as a driver would, and `esker-sim` injects violations |
 | D5 | A `Ready` not advanced is re-offered unchanged | `raw_node::RawNode::ready` | `a_ready_that_is_not_advanced_is_offered_again` |
 
 D1 is also what makes the leader's own bookkeeping sound: a leader counts itself as holding an entry
