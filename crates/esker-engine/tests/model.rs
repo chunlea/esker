@@ -31,7 +31,8 @@
 //!
 //! Moving data from a memtable to an L0 file changes where it lives, never what it is, and
 //! compacting merges versions and drops what nothing can see — also invisible from outside. So
-//! both are checked as no-ops *for the model*: the whole database and every live snapshot are
+//! both are checked as no-ops *for the model*, over the whole key space and over a bounded
+//! slice of it, because the two take different paths through the picker: the whole database and every live snapshot are
 //! re-verified across each one. A snapshot's history is precisely what a compaction is
 //! entitled to collect and must not, which is why the snapshot clones are re-checked and not
 //! only the current state.
@@ -133,8 +134,15 @@ enum Op {
     },
     SnapshotDrop(u8),
     Flush(u8),
-    /// Compacts one column family end to end. Like `Flush`, a no-op for the model.
-    Compact(u8),
+    /// Compacts one column family, over the whole key space or a bounded slice of it. Like
+    /// `Flush`, a no-op for the model either way — and the bounded form takes a different path
+    /// through the picker, so both are worth generating.
+    Compact {
+        cf: u8,
+        lo: u8,
+        hi: u8,
+        bounded: bool,
+    },
     Reopen,
 }
 
@@ -161,7 +169,8 @@ fn op() -> impl Strategy<Value = Op> {
         2 => (any::<u8>(), any::<u8>()).prop_map(|(slot, cf)| Op::SnapshotScan { slot, cf }),
         1 => any::<u8>().prop_map(Op::SnapshotDrop),
         2 => any::<u8>().prop_map(Op::Flush),
-        1 => any::<u8>().prop_map(Op::Compact),
+        1 => (any::<u8>(), any::<u8>(), any::<u8>(), any::<bool>())
+            .prop_map(|(cf, lo, hi, bounded)| Op::Compact { cf, lo, hi, bounded }),
         1 => Just(Op::Reopen),
     ]
 }
@@ -294,7 +303,12 @@ impl World {
                 Ok(())
             }
             Op::Flush(cf) => self.flush(*cf),
-            Op::Compact(cf) => self.compact(*cf),
+            Op::Compact {
+                cf,
+                lo,
+                hi,
+                bounded,
+            } => self.compact(*cf, *lo, *hi, *bounded),
             Op::Reopen => self.reopen(),
         }
     }
@@ -444,10 +458,23 @@ impl World {
     /// that is visible from outside, so it is checked as a no-op for the model — through every
     /// live snapshot as well, because a snapshot's history is exactly what a compaction is
     /// entitled to collect and must not.
-    fn compact(&self, cf: u8) -> Result<(), TestCaseError> {
+    fn compact(&self, cf: u8, lo: u8, hi: u8, bounded: bool) -> Result<(), TestCaseError> {
         let cf = cf_index(cf);
+        // The bounds are ordered rather than passed through: `compact_range` refuses an
+        // inverted range, and generating that here would test the argument check instead of
+        // the picker.
+        let (begin, end) = if bounded {
+            let (lo, hi) = (key_of(lo), key_of(hi));
+            if lo <= hi {
+                (Some(lo), Some(hi))
+            } else {
+                (Some(hi), Some(lo))
+            }
+        } else {
+            (None, None)
+        };
         self.db()
-            .compact_range(CFS[cf], None, None)
+            .compact_range(CFS[cf], begin.as_deref(), end.as_deref())
             .map_err(|error| fail("compact", &error))?;
         self.verify()
     }

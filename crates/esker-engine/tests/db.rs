@@ -1368,3 +1368,50 @@ fn a_compaction_filter_drops_what_it_refuses() {
             .all(|key| key.ends_with(['0', '2', '4', '6', '8']))
     );
 }
+
+/// Compacting a slice of the key space leaves the rest where it was, and an inverted range is
+/// a caller's mistake rather than a silent no-op over whatever spans the gap.
+#[test]
+fn a_bounded_compaction_touches_only_its_range() {
+    let (_, fs) = memfs();
+    let db = open(&fs, options(), &[cf::DEFAULT]).unwrap();
+    // Three L0 files with disjoint ranges, so a bounded compaction can pick exactly one.
+    for (low, high) in [(0u32, 9u32), (10, 19), (20, 29)] {
+        for i in low..=high {
+            db.put(cf::DEFAULT, format!("k{i:02}").as_bytes(), b"v")
+                .unwrap();
+        }
+        db.flush(cf::DEFAULT).unwrap();
+    }
+    assert_eq!(
+        db.property("esker.num-files-at-level0.default").unwrap(),
+        "3"
+    );
+
+    db.compact_range(cf::DEFAULT, Some(b"k10"), Some(b"k19"))
+        .unwrap();
+    assert_eq!(
+        db.property("esker.num-files-at-level0.default").unwrap(),
+        "2",
+        "only the file covering the range should have moved"
+    );
+
+    for i in 0..30u32 {
+        assert_eq!(
+            get(&db, format!("k{i:02}").as_bytes()).as_deref(),
+            Some(&b"v"[..]),
+            "k{i:02}"
+        );
+    }
+
+    let err = db
+        .compact_range(cf::DEFAULT, Some(b"k20"), Some(b"k10"))
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+
+    // A range nothing overlaps is not an error; there is simply nothing to do.
+    let before = db.compactions_run();
+    db.compact_range(cf::DEFAULT, Some(b"zzz"), Some(b"zzzz"))
+        .unwrap();
+    assert_eq!(db.compactions_run(), before);
+}

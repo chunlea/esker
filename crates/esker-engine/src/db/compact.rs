@@ -38,13 +38,24 @@ use super::{ColumnFamily, Db, DbInner, lock, read_lock};
 impl Db {
     /// Compacts everything in `[begin, end]` down through the levels.
     ///
-    /// `None` for either bound means unbounded on that side. Flushes the column family first,
-    /// so that "compact this range" means all of it and not just the part already on disk.
+    /// `None` for either bound means unbounded on that side; a range that ends before it
+    /// begins is refused. Flushes the column family first, so that "compact this range" means
+    /// all of it and not just the part already on disk.
     ///
     /// Synchronous: it returns when the range has been compacted, which is what makes it
     /// usable from a test and from `esker-cli`.
     pub fn compact_range(&self, cf: &str, begin: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
         let handle = self.inner.cf_by_name(cf)?;
+        // An inverted range is a caller's mistake, and silently compacting the files that
+        // happen to span the gap would hide it.
+        if let (Some(begin), Some(end)) = (begin, end)
+            && self.inner.comparator.user_comparator().cmp(begin, end)
+                == std::cmp::Ordering::Greater
+        {
+            return Err(Error::InvalidArgument(
+                "compact_range was given a range that ends before it begins".to_string(),
+            ));
+        }
         self.flush(cf)?;
         let picker = self.inner.picker(&handle);
 
