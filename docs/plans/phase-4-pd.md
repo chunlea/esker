@@ -1,6 +1,6 @@
 # Phase 4a — the placement driver, lane `cl-p4-pd`
 
-Status: **in progress**. The lane plan for `crates/esker-pd/**`, the `Pd` service section of
+Status: **4a landed** (§10). The lane plan for `crates/esker-pd/**`, the `Pd` service section of
 `crates/esker-proto/**`, and the `esker pd` subcommand. It hangs under `docs/plans/phase-4.md`,
 which the store lane owns and which pins the cross-lane contract in its §3; nothing here may
 contradict that file. Spec: `prompts/04-multiraft-pd.md` (4a), `docs/DESIGN.md` §7 and §9,
@@ -223,8 +223,65 @@ that is where the policy belongs.
 
 ## 10. Progress
 
-- Unit 0 — this plan.
+4a is **landed**. One commit per unit, in this order:
+
+| # | Unit | Commit |
+|---|---|---|
+| 0 | This plan | `docs(plan): the placement driver's 4a lane, in writing` |
+| 1 | Key space, records, errors, the clock seam, goldens | `feat(pd): the key space and the record encodings…` |
+| 2 | Bootstrap, the allocator, the record I/O underneath | `feat(pd): bootstrap mints the cluster…` |
+| 3 | The oracle and its mark | `feat(pd): the oracle, and the mark that is fsynced ahead of it` |
+| 4 | The routing table: epoch-guarded upsert, lookup, liveness | `feat(pd): the routing table, upserted by heartbeat…` |
+| 5 | Service `0x03` on the wire, with twelve goldens | `feat(proto): service 0x03, the placement driver on the wire` |
+| 6 | `PdService` behind a socket | `feat(pd): the placement driver behind a socket` |
+| 8 | Loopback over real TCP | `test(pd): bootstrap, heartbeats and a lookup over a real socket` |
+| 9 | `kill -9` loops | `test(pd): kill -9 around the allocator and around the oracle's mark` |
+| 7 | `esker pd serve` / `esker pd inspect` | `feat(cli): esker pd serve, and esker pd inspect` |
+| 10 | DESIGN §7/§9/§14, ADRs 0010 and 0011 | `docs(design): what the placement driver actually stores…` |
+
+Units 8 and 9 landed before 7 because the CLI's file is shared with the store lane and was in
+flux; the order inside the lane is otherwise the one above.
 
 ## 11. Changes vs plan
 
-_(nothing yet)_
+1. **The record I/O landed in unit 2, not unit 4.** Bootstrap has to write a store record and a
+   region record with its index entry, atomically, so `routing.rs` could not wait for the
+   heartbeat unit. Unit 4 added the epoch guard and the beats on top of it.
+
+2. **`RegionRoute.stores` is `Vec<StoreInfo>`, not `Vec<(u64, String)>`.** `esker-proto` already
+   has the type the wire uses, and one vocabulary beats a conversion at the edge.
+
+3. **The test clock needed a `testing` feature and a self-dev-dependency.** An integration test
+   links the library as an ordinary dependency, so `#[cfg(test)]` does not reach it. This is the
+   shape `esker-engine` already uses for its fault-injecting filesystem, copied deliberately.
+
+4. **A `SIGKILL` cannot prove the fsync.** It kills the process, not the machine: bytes already in
+   the kernel are still written back. The kill loop therefore proves the *ordering* and the restart
+   rule and cannot tell `sync = true` from `sync = false`; both were mutation-checked in the forms
+   it *can* see (resume at the clock, drop the reservation's write), and the limit is written down
+   beside the test. The engine's own invariant-1 tests have the same edge, so this is a property of
+   the project's test strategy rather than of this lane.
+
+5. **Two `ProtoError` variants and two `Request`/`Response` variants.** Every exhaustive match over
+   those enums needed an arm; `esker-store`'s service had already grown one by the time the wire
+   landed, so no file outside this lane was edited. The `Method::ALL` sweep, the service-byte test
+   and the golden-coverage test in `esker-proto` all went red until the six methods had goldens —
+   which is the mechanism working exactly as intended.
+
+6. **`esker pd inspect` prints the range index beside the records.** Not in the plan. A
+   disagreement between the two is the failure that makes routing wrong while every other line of
+   the report still looks right, so it is printed and counted, with a `WARNING` when they differ.
+
+7. **A store heartbeat from an unregistered store is refused.** Auto-registering one would put a
+   store record with no address into the table, and a client cannot be routed to that. Escalated to
+   the coordinator: it means a store must call `Bootstrap` — which is registration — before it
+   starts beating, on every start.
+
+8. **PD's `Region` encoder is its own.** `Region::encode` in `esker-proto` is `pub(crate)`, and this
+   lane may not edit `region.rs`; writing PD's own encoder is also the better answer, because an
+   on-disk format and a wire format that merely agree today should not share a definition. ADR 0010
+   records it, and the goldens cover both.
+
+9. **No benchmark.** `esker-cli bench`'s workloads are the store lane's file, and PD has no workload
+   in 4a. A TSO/`AllocId` throughput number is worth having before phase 5 puts the oracle on every
+   transaction's critical path; offered to the coordinator rather than taken.
