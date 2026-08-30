@@ -19,9 +19,20 @@ esker-base.workspace = true
 esker-client.workspace = true
 # `bench --remote` hands key-value pairs to the client, whose API takes `Bytes`.
 bytes.workspace = true
+# `server` opens a store and puts the wire in front of it.
+esker-store.workspace = true
+esker-proto.workspace = true
+# The runtime `server` runs on, and the ctrl-c it stops on. This is the only command that
+# builds one: `raw` and `bench --remote` go through the client's blocking transport.
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+# `raw` and `bench --remote` are tested against a real server on a real socket, because a mock
+# would leave out exactly the layers those two commands exist to exercise. Dev-only.
+esker-proto.workspace = true
+esker-store.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "time"] }
 
 [lints]
 workspace = true

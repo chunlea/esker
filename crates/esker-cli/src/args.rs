@@ -29,6 +29,7 @@ use std::path::PathBuf;
 use crate::bench::{Run as BenchOptions, Workload};
 use crate::manifest_dump::DumpOptions as ManifestDumpOptions;
 use crate::raw::{RawCommand, RawOptions, from_hex};
+use crate::server::ServerOptions;
 use crate::sst_dump::DumpOptions;
 use crate::wal_dump::DumpOptions as WalDumpOptions;
 
@@ -49,6 +50,8 @@ pub(crate) enum Command {
     ManifestDump(ManifestDumpOptions),
     /// Read or write keys over the network.
     Raw(RawOptions),
+    /// Open a store and serve it.
+    Server(ServerOptions),
 }
 
 /// Why the arguments could not be understood.
@@ -131,6 +134,7 @@ Commands:
   wal-dump <path>       Print the fragments and records of a log segment
   manifest-dump <dir>   Print a database's manifest and reconstructed version
   raw <verb> ...        Read or write keys over the network
+  server                Open a store and serve the RawKV API
 
 Options:
   -V, --version         Print the version
@@ -155,6 +159,15 @@ Sst-dump options:
   -v, --verbose         Print every key and value, not just the summary
       --prefix-len N    Rebuild a StripSuffix prefix extractor of this length, so
                         that a prefix-built bloom filter can be used
+
+Server options:
+      --data-dir PATH   Where the database lives; created if absent
+                        (default ./esker-data)
+      --listen HOST:PORT  Address to serve on (default 127.0.0.1:20160)
+      --store-id N      This store's id, reported in the handshake (default 1)
+
+Ctrl-C stops the listener, lets in-flight requests finish and closes the
+database. A second one does not wait.
 
 Raw options:
   raw get <key>             Print the value, or exit 1 if the key is absent
@@ -203,6 +216,7 @@ where
         "wal-dump" => parse_wal_dump(&arguments[1..]),
         "manifest-dump" => parse_manifest_dump(&arguments[1..]),
         "raw" => parse_raw(&arguments[1..]),
+        "server" => parse_server(&arguments[1..]),
         other if other.starts_with('-') => Err(ParseError::UnknownFlag(other.to_owned())),
         other => Err(ParseError::UnknownCommand(other.to_owned())),
     }
@@ -445,6 +459,51 @@ fn parse_manifest_dump(arguments: &[String]) -> Result<Command, ParseError> {
 ///
 /// The verb decides how many bare words are expected, so a missing value is named rather than
 /// silently defaulted — the same rule the rest of this parser follows.
+fn parse_server(arguments: &[String]) -> Result<Command, ParseError> {
+    let mut options = ServerOptions::default();
+    let mut index = 0;
+
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        index += 1;
+
+        if argument == "--help" || argument == "-h" {
+            return Ok(Command::Help);
+        }
+        let (flag, inline) = match argument.split_once('=') {
+            Some((flag, value)) => (flag, Some(value.to_owned())),
+            None => (argument.as_str(), None),
+        };
+
+        match flag {
+            "--data-dir" => {
+                options.data_dir =
+                    PathBuf::from(take_value(arguments, &mut index, inline, "--data-dir")?);
+            }
+            "--listen" => {
+                options.listen = take_value(arguments, &mut index, inline, "--listen")?;
+            }
+            "--store-id" => {
+                let raw = take_value(arguments, &mut index, inline, "--store-id")?;
+                options.store_id =
+                    raw.parse()
+                        .ok()
+                        .filter(|id| *id > 0)
+                        .ok_or(ParseError::InvalidValue {
+                            flag: "--store-id",
+                            value: raw.clone(),
+                        })?;
+            }
+            other if other.starts_with('-') => {
+                return Err(ParseError::UnknownFlag(other.to_owned()));
+            }
+            other => return Err(ParseError::UnexpectedArgument(other.to_owned())),
+        }
+    }
+
+    Ok(Command::Server(options))
+}
+
 fn parse_raw(arguments: &[String]) -> Result<Command, ParseError> {
     let Some(verb) = arguments.first() else {
         return Err(ParseError::MissingArgument("<verb>"));

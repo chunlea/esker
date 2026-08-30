@@ -1,8 +1,8 @@
 //! `esker` — command line tools for the Esker key-value store.
 //!
-//! `sst-dump`, `wal-dump` and `manifest-dump` inspect the three on-disk formats, `bench`
-//! drives a workload against a real database, and `region` arrives with the layer it inspects
-//! (`docs/DESIGN.md` §12).
+//! `server` runs a store; `raw` talks to one. `sst-dump`, `wal-dump` and `manifest-dump`
+//! inspect the three on-disk formats, `bench` drives a workload against a real database, and
+//! `region` arrives with the layer it inspects (`docs/DESIGN.md` §12).
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -12,7 +12,10 @@ mod bench_remote;
 mod bytes;
 mod manifest_dump;
 mod raw;
+mod server;
 mod sst_dump;
+#[cfg(test)]
+mod testserver;
 mod wal_dump;
 
 use std::process::ExitCode;
@@ -40,6 +43,13 @@ fn main() -> ExitCode {
             print!("{USAGE}");
             ExitCode::SUCCESS
         }
+        Ok(Command::Server(options)) => match server::run(&options) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(reason) => {
+                eprintln!("esker server: {reason}");
+                ExitCode::from(EXIT_FAILURE)
+            }
+        },
         Ok(Command::Bench(options)) => match bench::run(&options) {
             Ok(report) => {
                 report.print();
