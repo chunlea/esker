@@ -1,0 +1,24 @@
+# Golden VersionEdit (docs/DESIGN.md 4.6), produced by an independent encoder.
+# edit = field*, field = tag:varint ++ payload; every field optional, repeats allowed.
+# Tags: 1 comparator, 2 log_number, 3 next_file_number, 4 last_seqno,
+#       5 cf_add, 6 cf_drop, 7 delete_file, 8 add_file.
+# Lengths are LEB128 varints; byte strings are varint-length-prefixed.
+# One `field` line per field, in the order encode() writes them.
+# comparator = esker.BytewiseComparator
+field 011865736b65722e4279746577697365436f6d70617261746f72
+# log_number = 11
+field 020b
+# next_file_number = 12
+field 030c
+# last_seqno = 72057594037927935 (the 56-bit maximum)
+field 04ffffffffffffff7f
+# cf_add 0 "default"
+field 05000764656661756c74
+# cf_add 7 "write"
+field 0507057772697465
+# cf_drop 3
+field 0603
+# delete_file cf=0 level=1 number=5
+field 07000105
+# add_file cf=0 level=0 number=8 size=32768 smallest=apple@10:Put largest=pear@20:Put seqnos=10..20
+field 080000088080020d6170706c65010a0000000000000c7065617201140000000000000a14

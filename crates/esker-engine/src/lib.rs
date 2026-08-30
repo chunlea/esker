@@ -34,7 +34,9 @@
 //! | [`mod@format`] | byte sizes that are frozen |
 //! | [`memfs`] | an in-memory filesystem, so damage can be injected without a disk |
 //! | [`memtable`] | the sorted in-memory table every write lands in |
+//! | [`filename`] | every file name, derived from a number that is never reused |
 //! | [`wal`] | the write-ahead log: durability, and torn tails told from corruption |
+//! | [`version`] | which files make up the database, and the manifest that records it |
 //! | [`sst`], [`cache`] | the table format and the sharded LRU behind it |
 
 #![warn(unsafe_code)]
@@ -50,11 +52,13 @@ pub mod cache;
 pub mod cache_api;
 pub mod dbformat;
 pub mod error;
+pub mod filename;
 pub mod fs;
 pub mod memfs;
 pub mod memtable;
 pub mod options;
 pub mod sst;
+pub mod version;
 pub mod wal;
 
 pub use batch::WriteBatch;
@@ -66,6 +70,7 @@ pub use error::{Error, Result};
 pub use fs::{FileSystem, LocalFileSystem, RandomAccessFile, WritableFile};
 pub use memtable::MemTable;
 pub use options::{Compression, PrefixExtractor, WalSyncMode, WriteOptions};
+pub use version::{FileMeta, VersionEdit};
 pub use wal::{LogReader, LogWriter, ReadOutcome};
 
 /// The checksum every engine format uses, re-exported so callers can write
