@@ -419,6 +419,36 @@ its own gap register, and it would be longer.
 - [ ] 6 — planner and executor
 - [ ] 7 — `.slt` harness
 
+## 10a. Handoff — where the next session picks up
+
+Everything below is committed, green under `just check`'s per-crate equivalents, and needs no
+context that is not in this file.
+
+**Next, in order:**
+
+1. **2c — the extended query protocol.** `Parse`/`Bind`/`Describe`/`Execute`/`Sync` decode already
+   and are golden-tested against real `psql` bytes; what is missing is the *lifecycle* on top of
+   [`Session`]: named and unnamed prepared statements and portals, and the rule that after an error
+   everything is refused **until `Sync`** — distinct from the simple protocol's "until the block
+   ends", and the trap the brief calls out. `Sync` is what sends `ReadyForQuery` in this protocol,
+   not the end of a message. Capture first: `psql` with `\bind` through the recording proxy (§9 has
+   the container recipe), including a deliberate error before `Sync`, then assert the sequence.
+2. **2d — the `tokio` listener.** One socket to one session; the length-prefixed reader is the only
+   new logic and `MAX_MESSAGE_LEN` is already the cap it should enforce. Then a real `psql` smoke
+   test, which is the first moment this crate is exercised end to end.
+3. **Units 3–7** as originally planned, unchanged.
+
+**Two things to know before touching this code:**
+
+- The `Execute` trait in `pgwire::session` is the executor's seam and is deliberately narrow. Unit 5
+  must reconcile it with what `esker-client`'s `TxnClient` actually exposes; that lane has landed
+  its encodings and its `TxnClient` work, so read those commits rather than guessing (the brief says
+  to report a mismatch, not to invent one).
+- The method that has worked all phase is *capture first, implement second*. Four defects were found
+  that way and none by reading the specification: the parser's recursion limit of 50, the
+  `ROLLBACK` command tag on a failed commit, protocol 3.2's 32-byte cancel key, and a warning that
+  sent no `CommandComplete`. The PostgreSQL 19 container in §9 is how that continues.
+
 ## 11. What changed, and why
 
 **Unit 1.** Three things came out differently from the sketch above.
