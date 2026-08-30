@@ -1,0 +1,35 @@
+crates/esker-raft/src/election.rs
+  s_720b990b4c85a3::t_a8a35e0184d5da 302
+crates/esker-raft/src/election/tests.rs
+  s_720b990b4c85a3::t_25b6a07b3bed31 1-542
+crates/esker-raft/src/replication.rs
+  s_720b990b4c85a3::t_fb57024ca4a78d 421
+crates/esker-raft/src/replication/tests.rs
+  s_720b990b4c85a3::t_dc43d091e4a20f 1-547
+docs/DESIGN.md
+  s_720b990b4c85a3::t_7ca9f38ff65eb6 231-232,234,238-239,241-245,248,251-264,270-271,273-276
+docs/adr/0007-raft-message-set.md
+  s_720b990b4c85a3::t_574517ad082b50 1-96
+docs/adr/0008-raft-determinism-and-the-driver-contract.md
+  s_720b990b4c85a3::t_0494f6ee4e3902 1-96
+docs/plans/phase-3.md
+  s_720b990b4c85a3::t_3b56f2816471ba 284,288-335
+docs/raft-spec.md
+  s_720b990b4c85a3::t_6b0f2be0e8aa81 6-9,101,103,163-169,172-173
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a7635c0851f68738d42e66bc345681048a1dace3",
+  "prompts": {},
+  "sessions": {
+    "s_720b990b4c85a3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "227f5c5f-560a-4117-b024-963f1ffc76a1",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
