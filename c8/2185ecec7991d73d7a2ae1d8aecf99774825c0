@@ -1,0 +1,23 @@
+docs/DESIGN.md
+  s_04c6c85b29b28a::t_0761b863a80509 303-349,427-430,435-436,528-530
+docs/adr/0010-pd-durable-state.md
+  s_04c6c85b29b28a::t_13f0beafabad00 1-112
+docs/adr/0011-pd-service-and-the-cluster-id.md
+  s_04c6c85b29b28a::t_ddefa85cd37f36 1-92
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "c82185ecec7991d73d7a2ae1d8aecf99774825c0",
+  "prompts": {},
+  "sessions": {
+    "s_04c6c85b29b28a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0e874339-89db-44c7-acd5-0deac94983ec",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
