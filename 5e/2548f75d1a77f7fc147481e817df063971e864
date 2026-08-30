@@ -1,0 +1,28 @@
+Cargo.lock
+  h_44076b318daf9c 5-37,63-67,93-128,138-154,164-224,253,256-261,267-301
+crates/esker-keys/Cargo.toml
+  h_44076b318daf9c 11-17
+crates/esker-keys/src/codec.rs
+  h_44076b318daf9c 1-465
+crates/esker-keys/src/lib.rs
+  h_44076b318daf9c 21-27
+crates/esker-keys/src/prefix.rs
+  h_44076b318daf9c 1-188
+crates/esker-keys/tests/golden.rs
+  h_44076b318daf9c 1-211
+crates/esker-keys/tests/golden/keys.txt
+  h_44076b318daf9c 1-46
+crates/esker-keys/tests/proptest_codec.rs
+  h_44076b318daf9c 1-255
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "5e2548f75d1a77f7fc147481e817df063971e864",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
