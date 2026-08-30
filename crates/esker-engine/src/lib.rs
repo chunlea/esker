@@ -19,11 +19,38 @@
 //!   allocator and intrinsics we expect to need. Each site still needs a `// SAFETY:` comment
 //!   and a test (invariant 8).
 //!
-//! Phase 0 contains only the fixed format constants and the checksum re-export; the engine
-//! itself is phase 1 (`prompts/01-engine.md`).
+//! # Module map
+//!
+//! The seams come first, because everything else is written against them.
+//!
+//! | Module | What it decides |
+//! |---|---|
+//! | [`error`] | the one error type; corruption is a value, never a panic |
+//! | [`fs`] | every file touch, so the engine can be faulted, simulated and later tiered |
+//! | [`dbformat`] | internal keys, entry kinds, and the comparator seam |
+//! | [`cache_api`] | the block cache shape the read path is written against |
+//! | [`options`] | knobs, prefix extraction, compression, and the §14 defaults |
+//! | [`mod@format`] | byte sizes that are frozen |
+//! | [`sst`], [`cache`] | the table format and the sharded LRU behind it |
 
 #![warn(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+pub mod cache;
+pub mod cache_api;
+pub mod dbformat;
+pub mod error;
+pub mod fs;
+pub mod options;
+pub mod sst;
+
+pub use cache_api::{BlockCache, CacheKey};
+pub use dbformat::{
+    BytewiseComparator, Comparator, EntryKind, InternalKeyComparator, MAX_SEQNO, SeqNo,
+};
+pub use error::{Error, Result};
+pub use fs::{FileSystem, LocalFileSystem, RandomAccessFile, WritableFile};
+pub use options::{Compression, PrefixExtractor, WalSyncMode, WriteOptions};
 
 /// The checksum every engine format uses, re-exported so callers can write
 /// `esker_engine::crc32c::checksum(..)` as `docs/DESIGN.md` §4.5 describes. The
