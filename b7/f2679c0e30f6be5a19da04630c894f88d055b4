@@ -1,0 +1,21 @@
+crates/esker-engine/src/compaction/job.rs
+  s_583ba4eb96ad8a::t_30ad4c750a61d8 1-599
+crates/esker-engine/src/compaction/mod.rs
+  s_583ba4eb96ad8a::t_a41361a8c541e3 6,8,11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "b7f2679c0e30f6be5a19da04630c894f88d055b4",
+  "prompts": {},
+  "sessions": {
+    "s_583ba4eb96ad8a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2ac73fb2-9428-4877-ae7d-195e5b69e526",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
