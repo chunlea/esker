@@ -15,11 +15,36 @@ use std::sync::Arc;
 use esker_proto::Operator;
 
 use super::{Pd, State, persist_alloc};
+use crate::balance::{self, Balance};
 use crate::error::Result;
 use crate::operator::{InFlight, Observed};
 use crate::record::RegionRecord;
 use crate::routing;
 use crate::schedule::{self, Cluster, LoadDelta, Repair};
+
+/// What the operator already in flight for a region means for this heartbeat.
+#[derive(Debug)]
+enum Step {
+    /// The operator lives on. Answer with this and decide nothing new.
+    Waiting(Option<Operator>),
+    /// The region has no operator; the rules may choose one.
+    Free,
+}
+
+use Step::{Free, Waiting};
+
+/// What one rule decided, before it becomes an operator.
+///
+/// The two rules answer different questions and are asked in order — repair is urgent, balance
+/// is an optimisation — so the result is one type with two shapes rather than two calls whose
+/// precedence a reader has to infer.
+#[derive(Debug, Clone, Copy)]
+enum Plan {
+    /// Something is broken.
+    Repair(Repair),
+    /// Nothing is broken and something is uneven.
+    Balance(Balance),
+}
 
 impl Pd {
     /// Observes the operator in flight for `record`'s region, and issues one if none is.
@@ -33,42 +58,8 @@ impl Pd {
         record: &RegionRecord,
         now_ms: u64,
     ) -> Result<Option<Operator>> {
-        let region_id = record.region.id;
-
-        if let Some(flight) = state.in_flight.get_mut(&region_id) {
-            match flight.observe(record, now_ms, self.operator_timeout_ms) {
-                Observed::Pending(progress) => {
-                    // `advance` answers `None` for an operator the store has demonstrably
-                    // started: it has the work, and asking again would only earn a refusal.
-                    return Ok(flight.advance(progress, now_ms).cloned());
-                }
-                Observed::Done => {
-                    tracing::info!(
-                        region_id,
-                        operator = flight.operator.name(),
-                        "operator done"
-                    );
-                }
-                Observed::Cancelled(why) => {
-                    tracing::info!(
-                        region_id,
-                        operator = flight.operator.name(),
-                        why = why.name(),
-                        "operator cancelled"
-                    );
-                }
-                Observed::TimedOut => {
-                    tracing::warn!(
-                        region_id,
-                        operator = flight.operator.name(),
-                        sends = flight.sends,
-                        "operator timed out with nothing observed; it will be re-derived"
-                    );
-                }
-            }
-            // Every outcome but `Pending` finishes the operator. Dropping it here is what lets
-            // the rule below issue a replacement on this same heartbeat rather than the next.
-            state.in_flight.remove(&region_id);
+        if let Waiting(answer) = self.observe_in_flight(state, record, now_ms) {
+            return Ok(answer);
         }
 
         let stores = routing::stores(&self.db)?;
@@ -82,23 +73,125 @@ impl Pd {
             max_store_down_time_ms: self.max_store_down_time_ms,
             target_replicas: self.target_replicas,
         };
-        let Some(repair) = schedule::repair_for(record, &cluster) else {
+
+        let Some(plan) = self.plan(state, record, &cluster) else {
             return Ok(None);
         };
+        self.issue(state, record, plan, now_ms).map(Some)
+    }
 
-        let (operator, load) = match repair {
-            Repair::AddPeer {
+    /// Reads the heartbeat against the operator already in flight for this region.
+    ///
+    /// [`Waiting`] means the operator lives on and carries what to send — which is `None` when
+    /// the store has demonstrably started, because it has the work and asking again would only
+    /// earn a refusal. [`Free`] means the region has no operator and may be decided afresh.
+    fn observe_in_flight(&self, state: &mut State, record: &RegionRecord, now_ms: u64) -> Step {
+        let region_id = record.region.id;
+        let Some(flight) = state.in_flight.get_mut(&region_id) else {
+            return Free;
+        };
+
+        match flight.observe(record, now_ms, self.operator_timeout_ms) {
+            Observed::Pending(progress) => {
+                return Waiting(flight.advance(progress, now_ms).cloned());
+            }
+            Observed::Done => {
+                tracing::info!(
+                    region_id,
+                    operator = flight.operator.name(),
+                    "operator done"
+                );
+            }
+            Observed::Cancelled(why) => {
+                tracing::info!(
+                    region_id,
+                    operator = flight.operator.name(),
+                    why = why.name(),
+                    "operator cancelled"
+                );
+            }
+            Observed::TimedOut => {
+                tracing::warn!(
+                    region_id,
+                    operator = flight.operator.name(),
+                    sends = flight.sends,
+                    "operator timed out with nothing observed; it will be re-derived"
+                );
+            }
+        }
+        // Every outcome but `Pending` finishes the operator. Dropping it here is what lets the
+        // rules issue a replacement on this same heartbeat rather than the next.
+        state.in_flight.remove(&region_id);
+        // A region that has just been moved is not moved again for balance until it has
+        // settled. Repair is not subject to this — see `BALANCE_COOLDOWN_MS`.
+        state
+            .cooling
+            .insert(region_id, now_ms.saturating_add(self.balance_cooldown_ms));
+        Free
+    }
+
+    /// What this region needs, if anything.
+    ///
+    /// Repair first, always: a region a failure away from losing quorum is not a region to
+    /// optimise the placement of. Balance is asked only when nothing is broken, the region is
+    /// not cooling from its last move, and balancing is switched on at all.
+    fn plan(
+        &self,
+        state: &mut State,
+        record: &RegionRecord,
+        cluster: &Cluster<'_>,
+    ) -> Option<Plan> {
+        // Prune as we pass: `cooling` holds only regions still cooling.
+        state.cooling.retain(|_, until| *until > cluster.now_ms);
+
+        if let Some(repair) = schedule::repair_for(record, cluster) {
+            return Some(Plan::Repair(repair));
+        }
+        if !self.balance || state.cooling.contains_key(&record.region.id) {
+            return None;
+        }
+        balance::balance_for(record, cluster).map(Plan::Balance)
+    }
+
+    /// Turns a plan into an operator, minting a peer id if it needs one, and records it as in
+    /// flight together with the load it commits to moving.
+    fn issue(
+        &self,
+        state: &mut State,
+        record: &RegionRecord,
+        plan: Plan,
+        now_ms: u64,
+    ) -> Result<Operator> {
+        let (operator, load) = match plan {
+            Plan::Balance(Balance::TransferLeader {
+                region_id,
+                epoch,
+                to_peer_id,
+                from_store,
+                to_store,
+            }) => (
+                Operator::TransferLeader {
+                    region_id,
+                    epoch,
+                    to_peer_id,
+                },
+                LoadDelta::transfer_leader(from_store, to_store),
+            ),
+            Plan::Balance(Balance::AddPeer {
                 region_id,
                 epoch,
                 store_id,
-            } => {
+            })
+            | Plan::Repair(Repair::AddPeer {
+                region_id,
+                epoch,
+                store_id,
+            }) => {
                 // A fresh peer id, from the persisted allocator, every time an `AddPeer` is
-                // issued — including after a restart that re-derived the same repair. Reusing
+                // issued — including after a restart that re-derived the same plan. Reusing
                 // the id of an operator PD has forgotten would risk two peers with one id;
                 // burning one is free (`docs/adr/0010-pd-durable-state.md`).
-                let db = Arc::clone(&self.db);
-                let cf = self.cf;
-                let peer_id = state.alloc.allocate(1, |end| persist_alloc(&db, cf, end))?;
+                let peer_id = self.next_peer_id(state)?;
                 (
                     Operator::AddPeer {
                         region_id,
@@ -109,12 +202,25 @@ impl Pd {
                     LoadDelta::add_peer(store_id),
                 )
             }
-            Repair::RemovePeer {
+            Plan::Balance(Balance::RemovePeer {
                 region_id,
                 epoch,
                 peer_id,
-            } => {
-                // The store the replica is leaving, resolved here while the record is in hand.
+                from_store,
+            }) => (
+                Operator::RemovePeer {
+                    region_id,
+                    epoch,
+                    peer_id,
+                },
+                LoadDelta::remove_peer(from_store),
+            ),
+            Plan::Repair(Repair::RemovePeer {
+                region_id,
+                epoch,
+                peer_id,
+            }) => {
+                // The store the replica leaves, resolved while the record is in hand.
                 let from = record
                     .region
                     .peers
@@ -131,11 +237,20 @@ impl Pd {
                 )
             }
         };
+
+        let region_id = record.region.id;
         tracing::info!(region_id, operator = operator.name(), "operator issued");
         state
             .in_flight
             .insert(region_id, InFlight::new(operator.clone(), now_ms, load));
-        Ok(Some(operator))
+        Ok(operator)
+    }
+
+    /// One cluster-unique peer id, persisted before it is handed out ([`crate::alloc`]).
+    fn next_peer_id(&self, state: &mut State) -> Result<u64> {
+        let db = Arc::clone(&self.db);
+        let cf = self.cf;
+        state.alloc.allocate(1, |end| persist_alloc(&db, cf, end))
     }
 
     /// The operators PD is waiting on, by region. For the inspector and the tests.

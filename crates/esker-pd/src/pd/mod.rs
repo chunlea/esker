@@ -55,6 +55,15 @@ mod repair;
 /// How long a store may be silent before it is considered down (`docs/DESIGN.md` §7).
 pub const MAX_STORE_DOWN_TIME_MS: u64 = 30_000;
 
+/// How long after an operator retires before that region may be moved for **balance** again.
+///
+/// Balance is an optimisation, and a region that has just been moved has nothing to gain from
+/// being moved again immediately. The rule's own threshold ([`crate::balance`]) is what stops
+/// it oscillating; this is the weaker second guard, for the case the arithmetic cannot see — a
+/// store whose reported counts are lagging several heartbeats behind what PD has already asked
+/// for. Repair ignores it: a region a failure away from losing quorum does not wait.
+pub const BALANCE_COOLDOWN_MS: u64 = 300_000;
+
 /// How long an operator may make no observable progress before PD gives up on it.
 ///
 /// Generous on purpose. The slow part of an `AddPeer` is catching the new replica up from a
@@ -81,6 +90,11 @@ pub struct PdOptions {
     pub operator_timeout_ms: u64,
     /// Replicas a region should have. Repair restores this; it does not grow past it.
     pub target_replicas: usize,
+    /// How long after an operator retires before that region may be balanced again.
+    pub balance_cooldown_ms: u64,
+    /// Whether the balance rules run at all. On by default; a test or an operator wanting a
+    /// cluster left exactly as it is turns them off, and repair still runs.
+    pub balance: bool,
 }
 
 impl PdOptions {
@@ -101,6 +115,8 @@ impl PdOptions {
             max_store_down_time_ms: MAX_STORE_DOWN_TIME_MS,
             operator_timeout_ms: OPERATOR_TIMEOUT_MS,
             target_replicas: schedule::TARGET_REPLICAS,
+            balance_cooldown_ms: BALANCE_COOLDOWN_MS,
+            balance: true,
         }
     }
 
@@ -173,6 +189,8 @@ pub struct Pd {
     max_store_down_time_ms: u64,
     operator_timeout_ms: u64,
     target_replicas: usize,
+    balance_cooldown_ms: u64,
+    balance: bool,
     state: Mutex<State>,
 }
 
@@ -191,6 +209,12 @@ pub(crate) struct State {
     /// reconciling a remembered plan with a cluster that moved on while PD was down, which is
     /// strictly harder than recomputing.
     pub(crate) in_flight: BTreeMap<u64, InFlight>,
+    /// When each region becomes eligible for a *balance* move again, by region id.
+    ///
+    /// Memory, like the in-flight set: a restart forgets it, and the worst that costs is one
+    /// move that would otherwise have waited. Entries older than now are pruned as they are
+    /// passed, so this does not grow with the number of regions ever balanced.
+    pub(crate) cooling: BTreeMap<u64, u64>,
 }
 
 impl Pd {
@@ -230,11 +254,14 @@ impl Pd {
             max_store_down_time_ms: options.max_store_down_time_ms,
             operator_timeout_ms: options.operator_timeout_ms,
             target_replicas: options.target_replicas,
+            balance_cooldown_ms: options.balance_cooldown_ms,
+            balance: options.balance,
             state: Mutex::new(State {
                 cluster,
                 alloc: Allocator::load(alloc, options.alloc_batch),
                 oracle,
                 in_flight: BTreeMap::new(),
+                cooling: BTreeMap::new(),
             }),
         }))
     }
