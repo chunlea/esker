@@ -99,9 +99,8 @@ Three bugs, each found by a test that the previous version of the code would hav
 1. **A region whose only replica was its leader could never move.** "The leader's replica is not
    the one that moves" was applied to the *first* half of a move, where it is meaningless —
    adding a replica elsewhere does not move the office. In a one-store cluster every region is
-   led by its only peer, so no region could ever spread onto a store that joined: the store
-   lane's integration test timed out waiting, which is how it was found. My own unit test had
-   asserted the broken behaviour as if it were intended.
+   led by its only peer, so no region could ever spread onto a store that joined. The unit test
+   covering it had asserted the broken behaviour as if it were intended.
 2. **Finishing a move could pick the wrong replica.** With the leader filter on the second half
    too, the replica dropped could be the *newly added* one — undoing the move just made. The
    replica that goes must be the one on the busiest store, full stop; if that is the leader's,
@@ -110,9 +109,12 @@ Three bugs, each found by a test that the previous version of the code would hav
    the region on two stores for five rounds. That inflation is what made the balancer chase its
    own tail: 158 replicas for 100 regions, and a "converged" cluster with 58 moves outstanding.
 
-All three were invisible to a convergence test that asked whether *the counts looked even*. They
-appeared the moment the test asked whether **PD had stopped asking for anything** and whether the
-replica count still equalled the region count. That is the criterion this file's tests use now.
+All three were invisible while the fairness model gave its regions no leader and the convergence
+test asked only whether *the counts looked even*. They appeared the moment the model gave every
+region a real leader — which a real cluster always has — and the test asked instead whether **PD
+had stopped asking for anything** and whether the replica count still equalled the region count.
+Those are the criteria it uses now, and the lesson is the ordinary one: a model that is easier
+than reality tests something easier than reality.
 
 ## Consequences
 
