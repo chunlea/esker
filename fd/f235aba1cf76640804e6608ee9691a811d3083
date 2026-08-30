@@ -1,0 +1,62 @@
+Cargo.lock
+  h_44076b318daf9c 1-47
+Cargo.toml
+  h_44076b318daf9c 1-69
+crates/esker-base/Cargo.toml
+  h_44076b318daf9c 1-12
+crates/esker-base/src/lib.rs
+  h_44076b318daf9c 1-25
+crates/esker-cli/Cargo.toml
+  h_44076b318daf9c 1-12
+crates/esker-cli/src/main.rs
+  h_44076b318daf9c 1-4
+crates/esker-client/Cargo.toml
+  h_44076b318daf9c 1-12
+crates/esker-client/src/lib.rs
+  h_44076b318daf9c 1-81
+crates/esker-engine/Cargo.toml
+  h_44076b318daf9c 1-12
+crates/esker-engine/src/lib.rs
+  h_44076b318daf9c 1-95
+crates/esker-keys/Cargo.toml
+  h_44076b318daf9c 1-12
+crates/esker-keys/src/lib.rs
+  h_44076b318daf9c 1-21
+crates/esker-pd/Cargo.toml
+  h_44076b318daf9c 1-12
+crates/esker-pd/src/lib.rs
+  h_44076b318daf9c 1-96
+crates/esker-proto/Cargo.toml
+  h_44076b318daf9c 1-12
+crates/esker-proto/src/lib.rs
+  h_44076b318daf9c 1-91
+crates/esker-raft/Cargo.toml
+  h_44076b318daf9c 1-12
+crates/esker-raft/src/lib.rs
+  h_44076b318daf9c 1-74
+crates/esker-sim/Cargo.toml
+  h_44076b318daf9c 1-12
+crates/esker-sim/src/lib.rs
+  h_44076b318daf9c 1-19
+crates/esker-store/Cargo.toml
+  h_44076b318daf9c 1-12
+crates/esker-store/src/lib.rs
+  h_44076b318daf9c 1-81
+crates/esker-txn/Cargo.toml
+  h_44076b318daf9c 1-12
+crates/esker-txn/src/lib.rs
+  h_44076b318daf9c 1-80
+rust-toolchain.toml
+  h_44076b318daf9c 1-7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "fdf235aba1cf76640804e6608ee9691a811d3083",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
