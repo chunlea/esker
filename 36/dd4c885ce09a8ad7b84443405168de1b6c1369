@@ -1,0 +1,19 @@
+crates/esker-engine/tests/db.rs
+  s_34d3e1d2eec97a::t_4f6a30d82643d8 580-586
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "36dd4c885ce09a8ad7b84443405168de1b6c1369",
+  "prompts": {},
+  "sessions": {
+    "s_34d3e1d2eec97a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9489838b-5536-4d39-8dbe-930a5f0cac17",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
