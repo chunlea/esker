@@ -16,10 +16,34 @@
 //!   order breaks Raft's safety guarantee, so the simulator tests it explicitly.
 //! * **Byte-opaque.** Proposals are opaque payloads; nothing here interprets a key.
 //!
-//! Phase 0 contains only the timing constants; the state machine is phase 3
-//! (`prompts/03-raft.md`).
+//! The plan for what is built here, in what order, and what each lane owns, is
+//! `docs/plans/phase-3.md`; `docs/raft-spec.md` maps every rule of the dissertation's Figure 3.1
+//! to the function that implements it.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+mod conf;
+mod config;
+mod core;
+mod error;
+mod log;
+mod message;
+mod progress;
+mod raw_node;
+mod readonly;
+mod storage;
+mod types;
+
+pub use crate::config::{Config, MAX_SIZE_PER_MSG};
+pub use crate::core::{Role, Status};
+pub use crate::error::{RaftError, Result};
+pub use crate::message::Message;
+pub use crate::raw_node::{RawNode, Ready};
+pub use crate::storage::{InitialState, LogStorage, MemStorage};
+pub use crate::types::{
+    ConfChange, ConfChangeKind, ConfState, Entry, EntryKind, HardState, Index, NodeId, ReadState,
+    Snapshot, SnapshotMeta, Term,
+};
 
 /// Wall-clock duration a caller should map onto one `tick()`, in milliseconds. The core
 /// counts ticks and never reads a clock itself (`docs/DESIGN.md` §14).

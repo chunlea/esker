@@ -156,6 +156,13 @@ dependencies = [
 [[package]]
 name = "esker-raft"
 version = "0.1.0"
+dependencies = [
+ "bytes",
+ "esker-base",
+ "proptest",
+ "thiserror",
+ "tracing",
+]
 
 [[package]]
 name = "esker-sim"
@@ -163,6 +170,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "esker-base",
+ "esker-raft",
  "proptest",
  "thiserror",
 ]

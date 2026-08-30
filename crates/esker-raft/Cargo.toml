@@ -8,5 +8,18 @@ license.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+# Deliberately short. A pure state machine needs bytes to carry payloads, an error
+# type, a way to say what it just decided, and the project's seeded RNG. Anything
+# that could hand it a clock or ambient entropy would undo the whole point of the
+# crate (`CLAUDE.md` invariant 4, `docs/plans/phase-3.md` §7 risk 1).
+[dependencies]
+bytes = { workspace = true }
+esker-base = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
 [lints]
 workspace = true
