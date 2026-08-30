@@ -1,0 +1,31 @@
+crates/esker-cli/src/args.rs
+  s_dc640bf0df4adb::t_969ed98d35fdda 87,115-116,124,172,213,244-245,247
+crates/esker-cli/src/bench.rs
+  s_dc640bf0df4adb::t_fcd3d9e3de27fe 29,43-47,60,72,79-82,154-156,173,213-216,234,433-465,510,556
+crates/esker-engine/src/db/mod.rs
+  s_dc640bf0df4adb::t_5ac4508b98b153 139-142,358,373-374
+crates/esker-engine/src/db/open.rs
+  s_dc640bf0df4adb::t_febf1723a00743 145-146
+crates/esker-engine/src/db/read.rs
+  s_dc640bf0df4adb::t_43abf28dc9ec34 192-202
+crates/esker-engine/src/sst/reader.rs
+  s_dc640bf0df4adb::t_37b18e246fd55d 277-299,306-307
+crates/esker-engine/tests/db.rs
+  s_dc640bf0df4adb::t_b027df50455711 1418-1514
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "df2a31b2ce741ca0909eccc6d4c639d636f56110",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
