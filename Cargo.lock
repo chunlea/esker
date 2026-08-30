@@ -86,6 +86,10 @@ dependencies = [
 [[package]]
 name = "esker-cli"
 version = "0.1.0"
+dependencies = [
+ "esker-engine",
+ "tempfile",
+]
 
 [[package]]
 name = "esker-client"
