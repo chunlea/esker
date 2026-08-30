@@ -25,6 +25,11 @@
 #![warn(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+/// The checksum every engine format uses, re-exported so callers can write
+/// `esker_engine::crc32c::checksum(..)` as `docs/DESIGN.md` §4.5 describes. The
+/// implementation lives in `esker-base` because `esker-proto` needs it too.
+pub use esker_base::crc32c;
+
 /// Names of the column families every store creates at bootstrap (`docs/DESIGN.md` §4.8).
 pub mod cf {
     /// User data, and the long values of transactions (`docs/DESIGN.md` §8).
@@ -91,5 +96,12 @@ mod tests {
     fn wal_block_can_hold_records() {
         assert!(format::WAL_BLOCK_SIZE > format::WAL_HEADER_SIZE * 16);
         assert_eq!(format::WAL_BLOCK_SIZE % 1024, 0);
+    }
+
+    /// The re-export is what keeps `docs/DESIGN.md` §4.5 true; if it disappears the design
+    /// document and the code have drifted.
+    #[test]
+    fn crc32c_is_reachable_through_the_engine() {
+        assert_eq!(crate::crc32c::checksum(b"123456789"), 0xE306_9283);
     }
 }

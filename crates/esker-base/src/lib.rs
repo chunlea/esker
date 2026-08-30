@@ -22,4 +22,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-// TODO(phase-0): the primitives themselves land in the next commit.
+pub mod crc32c;
+pub mod hash;
+pub mod rng;
+pub mod varint;
