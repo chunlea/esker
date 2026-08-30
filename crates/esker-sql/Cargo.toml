@@ -16,7 +16,11 @@ esker-keys.workspace = true
 # anywhere else in this crate is a review failure.
 sqlparser.workspace = true
 thiserror.workspace = true
+# The socket edge only. The engine, the parser, the session state machine and every encoding in
+# this crate are synchronous and `std`-only; `tokio` appears in `pgwire::server` and nowhere else.
+tokio = { workspace = true, features = ["net", "io-util", "rt", "rt-multi-thread", "macros"] }
 tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

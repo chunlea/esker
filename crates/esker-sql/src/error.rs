@@ -151,6 +151,11 @@ pub enum SqlError {
     #[error("portal \"{0}\" does not exist")]
     InvalidCursorName(String),
 
+    /// Authentication failed. Fatal: the connection ends, and PostgreSQL says so with this exact
+    /// message so a client can tell a wrong password from a missing role.
+    #[error("password authentication failed for user \"{0}\"")]
+    InvalidPassword(String),
+
     /// A bug here, not a mistake there. Nothing driven by user input may produce this.
     #[error("internal error: {0}")]
     Internal(String),
@@ -180,6 +185,7 @@ impl SqlError {
             SqlError::ProtocolViolation(_) => sqlstate::PROTOCOL_VIOLATION,
             SqlError::InvalidSqlStatementName(_) => sqlstate::INVALID_SQL_STATEMENT_NAME,
             SqlError::InvalidCursorName(_) => sqlstate::INVALID_CURSOR_NAME,
+            SqlError::InvalidPassword(_) => sqlstate::INVALID_PASSWORD,
             SqlError::Internal(_) => sqlstate::INTERNAL_ERROR,
         }
     }
@@ -193,7 +199,7 @@ impl SqlError {
     pub fn severity(&self) -> Severity {
         match self {
             SqlError::ActiveTransaction | SqlError::NoActiveTransaction => Severity::Warning,
-            SqlError::ProtocolViolation(_) => Severity::Fatal,
+            SqlError::ProtocolViolation(_) | SqlError::InvalidPassword(_) => Severity::Fatal,
             _ => Severity::Error,
         }
     }

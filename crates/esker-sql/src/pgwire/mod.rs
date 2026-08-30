@@ -21,6 +21,7 @@
 //! does not know; PostgreSQL 19 lists them by name, and so does [`negotiation`].
 
 pub mod message;
+pub mod server;
 pub mod session;
 
 use crate::error::{Severity, SqlError};
