@@ -149,8 +149,9 @@ pub enum Completion<O> {
     /// ambiguous error. It may or may not have taken effect, and the checker must consider
     /// both.
     ///
-    /// `at` is kept for the report and is deliberately *not* used to bound the operation:
-    /// see [`Completion::response_time`].
+    /// `at` is kept for the report and is deliberately *not* used to bound the operation: an
+    /// outcome nobody learned is not a claim about when it happened, so the checker may place
+    /// it anywhere after its invocation.
     Unknown {
         /// When the client gave up.
         at: u64,
