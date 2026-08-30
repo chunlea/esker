@@ -34,6 +34,12 @@ esker-engine.workspace = true
 # `tests/store_model.rs` spawns a real server in-process and drives the same proptest through
 # it, so the network is in the loop rather than assumed away. Dev-only.
 esker-store.workspace = true
+# `tests/chaos_linearizability.rs` checks the histories a real three-node cluster produces
+# against the register model. DESIGN.md §11 puts that checker in `esker-sim` precisely so that
+# phase 3e and phase 5 can both use it. Dev-only.
+esker-sim.workspace = true
+# `Role`, to ask a store whether it is the one leading right now. Dev-only.
+esker-raft.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "time"] }
