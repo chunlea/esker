@@ -32,15 +32,19 @@ pub mod gate;
 pub mod raw;
 pub mod region_cache;
 pub mod retry;
+pub mod router;
 pub mod tcp;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod transport;
+pub mod txn;
 pub mod wire;
 
 pub use error::{Error, Result};
 pub use raw::{ClientOptions, RawClient};
 pub use region_cache::{RegionCache, RegionResolver, RegionTable, Route, StaticRegion};
 pub use retry::{BACKOFF_BASE_MS, BACKOFF_MAX_MS, MAX_RETRIES, RetryPolicy, backoff_ms};
+pub use router::Router;
 pub use tcp::TcpStores;
 pub use transport::StoreTransport;
+pub use txn::{CountingOracle, TimestampOracle, Transaction, TxnClient};

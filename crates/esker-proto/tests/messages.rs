@@ -10,7 +10,7 @@
 use bytes::Bytes;
 use esker_proto::messages::{DEFAULT_SCAN_LIMIT, Hello, HelloAck, RawKvReq, RawKvResp};
 use esker_proto::pd::{Operator, PdReq, PdResp, StoreInfo};
-use esker_proto::txn::{LockInfo, TxnKvReq, TxnKvResp, TxnMutation};
+use esker_proto::txn::{LockInfo, TxnKvReq, TxnKvResp, TxnMutation, TxnStatus};
 use esker_proto::{
     Epoch, MAX_FRAME_SIZE, Method, Peer, PeerRole, ProtoError, RaftBatch, RaftMessage, Region,
     Request, RequestHeader, Response, WIRE_VERSION,
@@ -420,9 +420,54 @@ fn golden_txn_responses() -> Vec<(&'static str, Response)> {
                 pairs: vec![(Bytes::from_static(b"a"), Bytes::from_static(b"1"))],
             }),
         ),
-        ("txn-prewrite", Response::TxnKv(TxnKvResp::Prewrite)),
-        ("txn-commit", Response::TxnKv(TxnKvResp::Commit)),
-        ("txn-rollback", Response::TxnKv(TxnKvResp::Rollback)),
+        // Every status has a golden. Four of the five are terminal for a transaction, and a
+        // sentinel with a golden for only its happy case is a sentinel nobody has tested.
+        (
+            "txn-prewrite",
+            Response::TxnKv(TxnKvResp::Prewrite {
+                status: TxnStatus::Ok,
+            }),
+        ),
+        (
+            "txn-prewrite-conflict",
+            Response::TxnKv(TxnKvResp::Prewrite {
+                status: TxnStatus::Conflict {
+                    commit_ts: TXN_COMMIT_TS,
+                },
+            }),
+        ),
+        (
+            "txn-prewrite-rolledback",
+            Response::TxnKv(TxnKvResp::Prewrite {
+                status: TxnStatus::RolledBack,
+            }),
+        ),
+        (
+            "txn-commit",
+            Response::TxnKv(TxnKvResp::Commit {
+                status: TxnStatus::Ok,
+            }),
+        ),
+        (
+            "txn-commit-lock-lost",
+            Response::TxnKv(TxnKvResp::Commit {
+                status: TxnStatus::LockNotFound,
+            }),
+        ),
+        (
+            "txn-rollback",
+            Response::TxnKv(TxnKvResp::Rollback {
+                status: TxnStatus::Ok,
+            }),
+        ),
+        (
+            "txn-rollback-committed",
+            Response::TxnKv(TxnKvResp::Rollback {
+                status: TxnStatus::Committed {
+                    commit_ts: TXN_COMMIT_TS,
+                },
+            }),
+        ),
         (
             "txn-resolve-lock",
             Response::TxnKv(TxnKvResp::ResolveLock { resolved: 3 }),

@@ -1,32 +1,7 @@
 //! `RawClient`: the `RawKv` API application code calls (`docs/DESIGN.md` §10).
 //!
-//! Everything the client does around a call is here, and all of it is ordinary synchronous
-//! code — no sockets, no wall clock, no threads of its own. Bytes leave through
-//! [`StoreTransport`], time enters through [`Clock`], and both are injected, which is why every
-//! rule below is tested against a script rather than a cluster.
-//!
-//! # What one call does
-//!
-//! 1. Refuse it if it could not fit in a frame — better a typed error here than a connection
-//!    torn down at the far end.
-//! 2. Take a permit, so the number of calls in flight is bounded.
-//! 3. Route: ask the region cache, and on a miss the [`RegionResolver`].
-//! 4. Send, with the region's epoch and the believed leader in the header.
-//! 5. On a redirectable refusal, repair the cache, back off with jitter, and go to 3 —
-//!    bounded by both a retry budget and a deadline, whichever ends first.
-//!
-//! # The rule that protects writes
-//!
-//! Only errors `esker-proto` marks retryable are retried, and every one of them is a
-//! *refusal*: [`ProtoError::outcome`] answers `NotApplied`, so the store provably did not
-//! change anything and re-sending is safe for a write as well as a read.
-//!
-//! The dangerous case is the one that is not in that set. When a request goes out and no
-//! usable answer comes back, the write may be in the log and nobody can tell. This client
-//! does **not** re-send it: a mutation whose outcome is `Unknown` becomes
-//! [`Error::AmbiguousResult`], and the caller decides whether to read the key back or to
-//! fail. A read in the same situation is simply returned — re-reading is always safe, so
-//! there is nothing ambiguous to report.
+//! One method per `RawKv` verb over a [`Router`], which is where routing, retries, backoff and
+//! the rule that protects writes live — shared with [`crate::txn`] rather than written twice.
 //!
 //! # Keys are never namespaced here
 //!
@@ -35,69 +10,22 @@
 //! would not show up until a scan came back full of keys nobody wrote.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
 
-use crate::clock::{Clock, SystemClock};
+use crate::clock::Clock;
 use crate::error::{Error, Result};
-use crate::gate::Gate;
-use crate::region_cache::{RegionCache, RegionResolver, Route};
-use crate::retry::{CALL_TIMEOUT_MS, Jitter, Redirect, RetryPolicy, Verdict, classify};
+use crate::region_cache::{RegionCache, RegionResolver};
+use crate::router::Router;
 use crate::transport::StoreTransport;
-use crate::wire::{
-    DEFAULT_SCAN_LIMIT, Method, ProtoError, RawKvReq, RawKvResp, Request, RequestHeader,
-    RequestOutcome, payload_size, routing_key,
-};
+use crate::wire::{Body, DEFAULT_SCAN_LIMIT, Method, RawKvReq, RawKvResp};
 
-/// Most calls in flight at once, per client.
-pub const MAX_IN_FLIGHT: usize = 256;
-
-/// Most entries one scan may ask for, whatever the caller passed.
-///
-/// The server caps a scan too, but a client that asks for `u32::MAX` and is answered honestly
-/// gets a response no frame can hold. Capping here turns that into a smaller answer rather
-/// than a failed call.
-pub const MAX_SCAN_LIMIT: u32 = 16_384;
-
-/// How a [`RawClient`] behaves, all in one place.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClientOptions {
-    /// Retries and their backoff schedule.
-    pub retry: RetryPolicy,
-    /// How long one call may take in total, retries and backoff included.
-    pub call_timeout: Duration,
-    /// Most calls in flight at once.
-    pub max_in_flight: usize,
-    /// Ceiling on a scan's `limit`.
-    pub max_scan_limit: u32,
-    /// Seed for the backoff jitter. `None` draws one per client, which is what production
-    /// wants; a test sets it so the delays are reproducible.
-    pub jitter_seed: Option<u64>,
-}
-
-impl Default for ClientOptions {
-    fn default() -> Self {
-        Self {
-            retry: RetryPolicy::default(),
-            call_timeout: Duration::from_millis(CALL_TIMEOUT_MS),
-            max_in_flight: MAX_IN_FLIGHT,
-            max_scan_limit: MAX_SCAN_LIMIT,
-            jitter_seed: None,
-        }
-    }
-}
+pub use crate::router::{ClientOptions, MAX_IN_FLIGHT, MAX_SCAN_LIMIT};
 
 /// The `RawKv` client: a region cache, bounded retries, and one method per `RawKv` verb.
 #[derive(Debug)]
 pub struct RawClient {
-    transport: Arc<dyn StoreTransport>,
-    resolver: Arc<dyn RegionResolver>,
-    clock: Arc<dyn Clock>,
-    cache: RegionCache,
-    jitter: Jitter,
-    gate: Gate,
-    options: ClientOptions,
+    router: Router,
 }
 
 impl RawClient {
@@ -114,18 +42,8 @@ impl RawClient {
         resolver: Arc<dyn RegionResolver>,
         options: ClientOptions,
     ) -> Self {
-        let jitter = match options.jitter_seed {
-            Some(seed) => Jitter::seeded(seed),
-            None => Jitter::from_entropy(),
-        };
         Self {
-            transport,
-            resolver,
-            clock: Arc::new(SystemClock),
-            cache: RegionCache::new(),
-            jitter,
-            gate: Gate::new(options.max_in_flight),
-            options,
+            router: Router::with_options(transport, resolver, options),
         }
     }
 
@@ -133,20 +51,26 @@ impl RawClient {
     /// runs in microseconds and the backoff sequence can be asserted exactly.
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
-        self.clock = clock;
+        self.router = self.router.with_clock(clock);
         self
     }
 
     /// The region cache, for inspection.
     #[must_use]
     pub fn cache(&self) -> &RegionCache {
-        &self.cache
+        self.router.cache()
     }
 
     /// The options this client was built with.
     #[must_use]
     pub fn options(&self) -> &ClientOptions {
-        &self.options
+        self.router.options()
+    }
+
+    /// The routing and retry machinery underneath.
+    #[must_use]
+    pub fn router(&self) -> &Router {
+        &self.router
     }
 
     // -- the RawKv surface ---------------------------------------------------------------
@@ -298,182 +222,24 @@ impl RawClient {
 
     /// A scan limit the transport can actually answer.
     fn bounded_limit(&self, limit: u32) -> u32 {
-        let limit = if limit == 0 {
-            DEFAULT_SCAN_LIMIT
-        } else {
-            limit
-        };
-        limit.min(self.options.max_scan_limit.max(1))
+        self.router.bounded_limit(limit, DEFAULT_SCAN_LIMIT)
     }
 
-    // -- the call loop -------------------------------------------------------------------
-
-    /// Sends one request, retrying redirectable refusals until the budget or the deadline
-    /// runs out.
+    /// Sends one request, retrying redirectable refusals until the budget or the deadline runs
+    /// out ([`Router::call`]).
     ///
     /// Takes the request by reference because a retry re-sends it: the loop clones it per
     /// attempt rather than consuming it, so the caller's copy is still there to log.
     pub fn call(&self, request: &RawKvReq) -> Result<RawKvResp> {
         let method = request.method();
-        let started = self.clock.now();
-        let deadline = started + self.options.call_timeout;
-
-        let limit = self.transport.max_frame_size();
-        let size = payload_size(request);
-        if size >= limit {
-            return Err(Error::RequestTooLarge { bytes: size, limit });
-        }
-
-        let Some(_permit) = self.gate.acquire(self.options.call_timeout) else {
-            return Err(Error::DeadlineExceeded {
-                attempts: 0,
-                source: None,
-            });
-        };
-
-        let mut attempts: u32 = 0;
-        // The region the last attempt was addressed to, so a refusal repairs the entry that
-        // produced it. Zero until one is routed: a resolver that failed named no region, and
-        // there is nothing cached to invalidate.
-        let mut region_id: u64 = 0;
-        loop {
-            if self.clock.now() >= deadline {
-                return Err(Error::DeadlineExceeded {
-                    attempts,
-                    source: None,
-                });
-            }
-
-            attempts += 1;
-            // A resolver failure is not a routing answer: the placement driver could not say,
-            // which is usually momentary. It goes through the same classifier as a store's
-            // refusal so that "retryable" is decided in one place, by the protocol crate.
-            let error = match self.route(routing_key(request)) {
-                Err(error) => error,
-                Ok(route) => {
-                    let target = route.target().ok_or_else(|| Error::NoRegion {
-                        key: Bytes::copy_from_slice(routing_key(request)),
-                    })?;
-                    let wire = Request::raw_kv(
-                        RequestHeader::new(route.region.id, route.region.epoch, target.peer_id),
-                        request.clone(),
-                    );
-                    match self.transport.call(target.store_id, &wire, deadline) {
-                        Ok(response) if response.method() == method => return Ok(response),
-                        Ok(response) => return Err(unexpected(method, &response)),
-                        Err(error) => {
-                            region_id = route.region.id;
-                            error
-                        }
-                    }
-                }
-            };
-
-            match classify(&error) {
-                Verdict::Surface => {
-                    self.on_terminal(&error, region_id, routing_key(request));
-                    return Err(terminal(error, method));
-                }
-                Verdict::Retry(redirect) => {
-                    self.repair(&redirect, region_id);
-                    if attempts > self.options.retry.max_retries {
-                        return Err(Error::RetriesExhausted {
-                            attempts,
-                            source: Box::new(error),
-                        });
-                    }
-                    let delay = self.jitter.apply(self.options.retry.backoff(attempts - 1));
-                    // Sleeping past the deadline only delays the same answer, so stop now and
-                    // say which failure the caller was waiting on.
-                    if self.clock.now() + delay >= deadline {
-                        return Err(Error::DeadlineExceeded {
-                            attempts,
-                            source: Some(Box::new(error)),
-                        });
-                    }
-                    self.clock.sleep(delay);
-                }
-            }
+        match self.router.call(&Body::Raw(request.clone()))? {
+            crate::wire::Response::RawKv(response) => Ok(response),
+            other => Err(Error::UnexpectedResponse {
+                expected: method,
+                actual: other.method(),
+            }),
         }
     }
-
-    /// The cached route for `key`, or a fresh one from the resolver.
-    ///
-    /// The three outcomes are three different things, and flattening any pair of them would cost
-    /// the caller something: a hit, a `GetRegion` that says no region covers the key — terminal,
-    /// because waiting does not create one — and a `GetRegion` that could not be answered, which
-    /// is the caller's to classify and usually to retry.
-    fn route(&self, key: &[u8]) -> std::result::Result<Route, ProtoError> {
-        if let Some(route) = self.cache.lookup(key) {
-            return Ok(route);
-        }
-        let route = self.resolver.locate(key)?.ok_or_else(|| {
-            // Not retryable, and the classifier agrees: `KeyNotInRegion` says this key belongs
-            // to no region the cluster admits to, which is what "no region covers it" is.
-            ProtoError::KeyNotInRegion {
-                key: Bytes::copy_from_slice(key),
-                region_id: 0,
-                start_key: Bytes::new(),
-                end_key: Bytes::new(),
-            }
-        })?;
-        self.cache.insert(route.clone());
-        Ok(route)
-    }
-
-    /// Applies what a redirectable refusal said to fix.
-    fn repair(&self, redirect: &Redirect, region_id: u64) {
-        match redirect {
-            Redirect::Leader { hint } => self.cache.set_leader(region_id, *hint),
-            Redirect::Epoch { replacements } if replacements.is_empty() => {
-                // No replacements offered, so there is nothing to learn from the error: drop
-                // the entry and let the resolver answer again.
-                self.cache.invalidate(region_id);
-            }
-            Redirect::Epoch { replacements } => {
-                self.cache
-                    .insert_all(replacements.iter().cloned().map(|region| Route {
-                        region,
-                        leader: None,
-                    }));
-            }
-            Redirect::Refresh => self.cache.invalidate(region_id),
-            Redirect::Busy => {}
-        }
-    }
-
-    /// Drops a cache entry that a terminal error proved wrong.
-    ///
-    /// `KeyNotInRegion` is not retryable — waiting cannot fix a routing mistake — but it does
-    /// prove the cached region is a lie, and leaving it in place would make the caller's next
-    /// call fail the same way.
-    ///
-    /// `region_id == 0` is the resolver's own refusal: nothing was cached, so there is nothing
-    /// to drop, and only the key is swept.
-    fn on_terminal(&self, error: &ProtoError, region_id: u64, key: &[u8]) {
-        if matches!(error, ProtoError::KeyNotInRegion { .. }) {
-            if region_id != 0 {
-                self.cache.invalidate(region_id);
-            }
-            self.cache.invalidate_key(key);
-        }
-    }
-}
-
-/// Turns a terminal protocol error into a client error, naming the ambiguous case.
-///
-/// A mutation whose outcome is `Unknown` is the case the whole retry story is built around:
-/// it went out, no usable answer came back, and it may or may not be in the log. A read in
-/// the same position is not ambiguous — nothing changed either way — so it is returned plainly
-/// and the caller may simply ask again.
-fn terminal(error: ProtoError, method: Method) -> Error {
-    if method.is_mutation() && error.outcome() == RequestOutcome::Unknown {
-        return Error::AmbiguousResult {
-            method,
-            source: Box::new(error),
-        };
-    }
-    Error::Store(error)
 }
 
 fn unexpected(expected: Method, response: &RawKvResp) -> Error {

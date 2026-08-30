@@ -33,8 +33,32 @@ use bytes::Bytes;
 
 use crate::transport::StoreTransport;
 use crate::wire::{
-    CallResult, Method, ProtoError, RawKvReq, RawKvResp, Request, RequestHeader, routing_key,
+    CallResult, LockInfo, Method, ProtoError, RawKvReq, RawKvResp, Request, RequestHeader,
+    Response, TxnKvReq, TxnKvResp, routing_key,
 };
+
+/// The `TxnKv` body of a request, when it has one.
+#[must_use]
+fn txn_body(request: &Request) -> Option<&TxnKvReq> {
+    match request {
+        Request::TxnKv { request, .. } => Some(request),
+        Request::Hello(_)
+        | Request::Raft(_)
+        | Request::Snapshot(_)
+        | Request::Pd { .. }
+        | Request::RawKv { .. } => None,
+    }
+}
+
+/// The key a request routes by, whichever service it belongs to.
+#[must_use]
+fn routed_key(request: &Request) -> Option<&[u8]> {
+    match request {
+        Request::RawKv { request, .. } => Some(routing_key(request)),
+        Request::TxnKv { request, .. } => Some(request.routing_key()),
+        Request::Hello(_) | Request::Raft(_) | Request::Snapshot(_) | Request::Pd { .. } => None,
+    }
+}
 
 /// The `RawKv` body of a request, when it has one.
 #[must_use]
@@ -44,12 +68,9 @@ fn raw_body(request: &Request) -> Option<&RawKvReq> {
         // A client never sends `Hello` through a rule — the transport handles it — and never
         // sends Raft traffic at all: that is store-to-store, on connections a client has none of.
         // A `Pd` request has no `RawKv` body and is not addressed to a region, so no rule
-        // written in terms of keys or regions can match one; a snapshot request is a
-        // follower asking a leader, which is store-to-store as well.
-        //
-        // TODO(phase-5): a `TxnKv` request *is* addressed to a region and has keys, so it has
-        // a body a rule should be able to match on. It has none here because this accessor
-        // answers a `RawKvReq`; `txn_body` beside it is the shape that fits.
+        // written in terms of keys or regions can match one; a snapshot request is a follower
+        // asking a leader, which is store-to-store as well. A `TxnKv` request has a body, but
+        // not this one — `txn_body` above is its shape, and `routed_key` covers both.
         Request::Hello(_)
         | Request::Raft(_)
         | Request::Snapshot(_)
@@ -85,7 +106,7 @@ impl Matcher {
             Self::Any => true,
             Self::Method(method) => request.method() == *method,
             Self::Store(id) => store_id == *id,
-            Self::Key(key) => raw_body(request).is_some_and(|body| routing_key(body) == &key[..]),
+            Self::Key(key) => routed_key(request).is_some_and(|routed| routed == &key[..]),
             Self::Region(id) => request
                 .header()
                 .is_some_and(|header| header.region_id == *id),
@@ -100,8 +121,10 @@ impl Matcher {
 /// What a matched rule does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// Answer with this body.
+    /// Answer with this `RawKv` body.
     Reply(RawKvResp),
+    /// Answer with this `TxnKv` body (`docs/DESIGN.md` §8).
+    TxnReply(TxnKvResp),
     /// Fail with this error — a refusal from the store, or a socket that gave up. One enum
     /// covers both because `esker-proto` does: what separates them is
     /// [`ProtoError::outcome`], not which layer raised it.
@@ -109,9 +132,18 @@ pub enum Outcome {
 }
 
 impl Outcome {
+    /// Answer a locked key the way a store does: an `Error` frame carrying the lock, so the
+    /// client's resolution path is driven through the same channel a real store uses
+    /// ([ADR 0016](../../docs/adr/0016-txnkv-on-the-wire.md)).
+    #[must_use]
+    pub fn locked(lock: &LockInfo) -> Self {
+        Self::Fail(lock.into_error())
+    }
+
     fn into_result(self) -> CallResult {
         match self {
-            Self::Reply(response) => Ok(response),
+            Self::Reply(response) => Ok(Response::RawKv(response)),
+            Self::TxnReply(response) => Ok(Response::TxnKv(response)),
             Self::Fail(error) => Err(error),
         }
     }
@@ -175,16 +207,22 @@ impl Call {
         raw_body(&self.request)
     }
 
+    /// The `TxnKv` body, when this was a transactional call.
+    #[must_use]
+    pub fn txn_body(&self) -> Option<&TxnKvReq> {
+        txn_body(&self.request)
+    }
+
     /// The routing header, when this was a key-value call.
     #[must_use]
     pub fn header(&self) -> Option<RequestHeader> {
         self.request.header()
     }
 
-    /// The key the client routed by.
+    /// The key the client routed by, whichever service this was.
     #[must_use]
     pub fn key(&self) -> Option<&[u8]> {
-        self.body().map(routing_key)
+        routed_key(&self.request)
     }
 }
 
@@ -356,7 +394,9 @@ mod tests {
 
     use super::{Bytes, FakeTransport, Matcher, Outcome, Rule};
     use crate::transport::StoreTransport;
-    use crate::wire::{Epoch, Method, ProtoError, RawKvReq, RawKvResp, Request, RequestHeader};
+    use crate::wire::{
+        Epoch, Method, ProtoError, RawKvReq, RawKvResp, Request, RequestHeader, Response,
+    };
 
     fn request(body: RawKvReq) -> Request {
         Request::raw_kv(RequestHeader::new(1, Epoch::INITIAL, 1), body)
@@ -390,7 +430,7 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(
                 transport.call(1, &get(b"k"), deadline()),
-                Ok(RawKvResp::Get { value: None })
+                Ok(Response::RawKv(RawKvResp::Get { value: None }))
             );
         }
         assert_eq!(transport.call_count(), 4);
@@ -416,10 +456,10 @@ mod tests {
             )
             .unmatched(Outcome::Reply(RawKvResp::Get { value: None }));
 
-        let hit = RawKvResp::Get {
+        let hit = Response::RawKv(RawKvResp::Get {
             value: Some(Bytes::from_static(b"v")),
-        };
-        let miss = RawKvResp::Get { value: None };
+        });
+        let miss = Response::RawKv(RawKvResp::Get { value: None });
         assert_eq!(transport.call(2, &get(b"wanted"), deadline()), Ok(hit));
         // Right key, wrong store.
         assert_eq!(
@@ -487,7 +527,7 @@ mod tests {
         }
         assert_eq!(
             transport.call(1, &get(b"k"), deadline()),
-            Ok(RawKvResp::Get { value: None })
+            Ok(Response::RawKv(RawKvResp::Get { value: None }))
         );
     }
 

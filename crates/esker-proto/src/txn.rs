@@ -105,6 +105,88 @@ impl LockInfo {
     }
 }
 
+/// What a transactional write decided, when the decision is about the **transaction** rather
+/// than about serving the request.
+///
+/// The line between this and an `Error` frame is which layer acts on the answer. A
+/// `NotLeader`, an `EpochNotMatch`, a `ServerIsBusy` or a [`ProtoError::Locked`] is a refusal
+/// to *serve*: the client's routing and retry machinery handles it, uniformly, without the
+/// caller ever seeing it (`docs/DESIGN.md` §10). Everything here is a *determination about
+/// this transaction* — it lost a race, or someone else settled it — which no retry can change
+/// and which the caller has to act on. Putting these in the error channel would mean a client
+/// retrying, backing off and exhausting a budget against an answer that will never differ.
+///
+/// The tag is one byte on the wire and zero is not a tag, as everywhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxnStatus {
+    /// It happened.
+    Ok,
+    /// A commit landed after this transaction's snapshot. First-committer-wins and this one is
+    /// not it: it must abort, and only a fresh `start_ts` can help.
+    Conflict {
+        /// The winner's commit timestamp.
+        commit_ts: u64,
+    },
+    /// This transaction was already rolled back — its lock expired and someone resolved it.
+    /// Every other key of it will answer the same way.
+    RolledBack,
+    /// This transaction already committed. Answering a `Rollback`, it means the abort came too
+    /// late; answering a `Commit`, it means a second commit timestamp was asked for, which is
+    /// a contradiction rather than a duplicate.
+    Committed {
+        /// When it committed.
+        commit_ts: u64,
+    },
+    /// The lock is gone and no record says what happened to it.
+    LockNotFound,
+}
+
+impl TxnStatus {
+    /// Whether the transaction may carry on.
+    #[must_use]
+    pub fn is_ok(self) -> bool {
+        matches!(self, Self::Ok)
+    }
+
+    fn tag(self) -> u8 {
+        match self {
+            Self::Ok => 1,
+            Self::Conflict { .. } => 2,
+            Self::RolledBack => 3,
+            Self::Committed { .. } => 4,
+            Self::LockNotFound => 5,
+        }
+    }
+
+    fn encode(self, out: &mut Encoder) {
+        out.put_u8(self.tag());
+        match self {
+            Self::Conflict { commit_ts } | Self::Committed { commit_ts } => {
+                out.put_varint(commit_ts);
+            }
+            Self::Ok | Self::RolledBack | Self::LockNotFound => {}
+        }
+    }
+
+    fn decode(input: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        match input.get_u8("status.tag")? {
+            1 => Ok(Self::Ok),
+            2 => Ok(Self::Conflict {
+                commit_ts: input.get_varint("status.commit_ts")?,
+            }),
+            3 => Ok(Self::RolledBack),
+            4 => Ok(Self::Committed {
+                commit_ts: input.get_varint("status.commit_ts")?,
+            }),
+            5 => Ok(Self::LockNotFound),
+            tag => Err(DecodeError::invalid(
+                "status.tag",
+                format!("{tag} is not a transaction status"),
+            )),
+        }
+    }
+}
+
 /// One key's worth of a [`TxnKvReq::Prewrite`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxnMutation {
@@ -439,12 +521,21 @@ pub enum TxnKvResp {
         /// Key and value.
         pairs: Vec<(Bytes, Bytes)>,
     },
-    /// Every key in the batch is now locked by this transaction.
-    Prewrite,
-    /// The commit records are written and the locks are gone.
-    Commit,
-    /// The rollback markers are written.
-    Rollback,
+    /// Every key in the batch is now locked by this transaction — or why not.
+    Prewrite {
+        /// [`TxnStatus::Ok`] means every key is locked.
+        status: TxnStatus,
+    },
+    /// The commit records are written and the locks are gone — or why not.
+    Commit {
+        /// [`TxnStatus::Ok`] means the keys are committed.
+        status: TxnStatus,
+    },
+    /// The rollback markers are written — or why not.
+    Rollback {
+        /// [`TxnStatus::Ok`] means the keys are rolled back.
+        status: TxnStatus,
+    },
     /// The stuck transaction's keys are finished.
     ResolveLock {
         /// How many keys were finished. A reader that asked for "every key of that
@@ -472,9 +563,9 @@ impl TxnKvResp {
         match self {
             Self::Get { .. } => Method::TxnGet,
             Self::Scan { .. } => Method::TxnScan,
-            Self::Prewrite => Method::TxnPrewrite,
-            Self::Commit => Method::TxnCommit,
-            Self::Rollback => Method::TxnRollback,
+            Self::Prewrite { .. } => Method::TxnPrewrite,
+            Self::Commit { .. } => Method::TxnCommit,
+            Self::Rollback { .. } => Method::TxnRollback,
             Self::ResolveLock { .. } => Method::TxnResolveLock,
             Self::Heartbeat { .. } => Method::TxnHeartbeat,
             Self::GcSafepoint { .. } => Method::TxnGcSafepoint,
@@ -491,9 +582,11 @@ impl TxnKvResp {
                     out.put_bytes(value);
                 }
             }
-            // These three carry nothing: the store either did it or answered with an error
-            // frame, and there is no third outcome to report.
-            Self::Prewrite | Self::Commit | Self::Rollback => {}
+            // A refusal to *serve* went out as an error frame; what is left is the
+            // transaction's own fate, which no retry changes and the caller must act on.
+            Self::Prewrite { status } | Self::Commit { status } | Self::Rollback { status } => {
+                status.encode(out);
+            }
             Self::ResolveLock { resolved } => out.put_varint(*resolved),
             Self::Heartbeat { ttl_ms } => out.put_varint(*ttl_ms),
             Self::GcSafepoint { safepoint } => out.put_varint(*safepoint),
@@ -513,9 +606,15 @@ impl TxnKvResp {
                 }
                 Self::Scan { pairs }
             }
-            Method::TxnPrewrite => Self::Prewrite,
-            Method::TxnCommit => Self::Commit,
-            Method::TxnRollback => Self::Rollback,
+            Method::TxnPrewrite => Self::Prewrite {
+                status: TxnStatus::decode(input)?,
+            },
+            Method::TxnCommit => Self::Commit {
+                status: TxnStatus::decode(input)?,
+            },
+            Method::TxnRollback => Self::Rollback {
+                status: TxnStatus::decode(input)?,
+            },
             Method::TxnResolveLock => Self::ResolveLock {
                 resolved: input.get_varint("resolved")?,
             },
@@ -564,7 +663,7 @@ fn take_opt(input: &mut Decoder<'_>, field: &'static str) -> Result<Option<Bytes
 mod tests {
     use bytes::Bytes;
 
-    use super::{LockInfo, TxnKvReq, TxnKvResp, TxnMutation};
+    use super::{LockInfo, TxnKvReq, TxnKvResp, TxnMutation, TxnStatus};
     use crate::error::ProtoError;
     use crate::messages::{Method, SERVICE_TXN_KV};
 
@@ -716,6 +815,48 @@ mod tests {
         );
     }
 
+    /// Only `Ok` lets a transaction carry on; the other four are terminal for it, which is
+    /// why they are answers rather than errors.
+    #[test]
+    fn only_ok_lets_a_transaction_carry_on() {
+        assert!(TxnStatus::Ok.is_ok());
+        for status in [
+            TxnStatus::Conflict { commit_ts: 9 },
+            TxnStatus::RolledBack,
+            TxnStatus::Committed { commit_ts: 9 },
+            TxnStatus::LockNotFound,
+        ] {
+            assert!(!status.is_ok(), "{status:?}");
+        }
+    }
+
+    /// Every status round-trips, its tags are distinct, and zero is not one.
+    #[test]
+    fn statuses_round_trip_with_distinct_nonzero_tags() {
+        use crate::codec::{Decoder, Encoder};
+        let all = [
+            TxnStatus::Ok,
+            TxnStatus::Conflict { commit_ts: 1 << 41 },
+            TxnStatus::RolledBack,
+            TxnStatus::Committed { commit_ts: 7 },
+            TxnStatus::LockNotFound,
+        ];
+        let tags: std::collections::BTreeSet<u8> = all.iter().map(|s| s.tag()).collect();
+        assert_eq!(tags.len(), all.len(), "two statuses share a tag");
+        assert!(!tags.contains(&0), "zero is not a tag");
+
+        for status in all {
+            let mut out = Encoder::new();
+            status.encode(&mut out);
+            let bytes = out.finish();
+            let mut input = Decoder::new(&bytes);
+            assert_eq!(TxnStatus::decode(&mut input).unwrap(), status);
+            input.finish().unwrap();
+        }
+        assert!(TxnStatus::decode(&mut Decoder::new(&[0])).is_err());
+        assert!(TxnStatus::decode(&mut Decoder::new(&[6])).is_err());
+    }
+
     /// A mutation tag this version does not define is an error, never a skipped entry.
     #[test]
     fn an_unknown_mutation_tag_is_an_error() {
@@ -733,9 +874,15 @@ mod tests {
         for response in [
             TxnKvResp::Get { value: None },
             TxnKvResp::Scan { pairs: vec![] },
-            TxnKvResp::Prewrite,
-            TxnKvResp::Commit,
-            TxnKvResp::Rollback,
+            TxnKvResp::Prewrite {
+                status: TxnStatus::Ok,
+            },
+            TxnKvResp::Commit {
+                status: TxnStatus::Committed { commit_ts: 2 },
+            },
+            TxnKvResp::Rollback {
+                status: TxnStatus::RolledBack,
+            },
             TxnKvResp::ResolveLock { resolved: 0 },
             TxnKvResp::Heartbeat { ttl_ms: 1 },
             TxnKvResp::GcSafepoint { safepoint: 1 },

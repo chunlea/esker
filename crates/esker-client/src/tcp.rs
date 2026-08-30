@@ -110,9 +110,7 @@ impl StoreTransport for TcpStores {
                 "no address is known for store {store_id}"
             )));
         };
-        connection
-            .call(request.clone(), deadline)
-            .and_then(esker_proto::messages::Response::into_raw_kv)
+        connection.call(request.clone(), deadline)
     }
 
     fn max_frame_size(&self) -> usize {

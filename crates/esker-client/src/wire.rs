@@ -24,10 +24,108 @@ use bytes::Bytes;
 pub use esker_proto::messages::{
     DEFAULT_SCAN_LIMIT, Method, RawKvReq, RawKvResp, Request, RequestHeader, Response,
 };
+pub use esker_proto::txn::{LockInfo, TxnKvReq, TxnKvResp, TxnMutation, TxnStatus};
 pub use esker_proto::{Epoch, MAX_FRAME_SIZE, Peer, PeerRole, ProtoError, Region, RequestOutcome};
 
 /// What a call to a store returns: an answer, or a typed refusal.
-pub type CallResult = Result<RawKvResp, ProtoError>;
+///
+/// The whole [`Response`] rather than a `RawKvResp`, because two services now go through the
+/// same routing and retry loop and unwrapping one of them at the transport would mean a
+/// second loop for the other.
+pub type CallResult = Result<Response, ProtoError>;
+
+/// A request before it has been addressed to a region.
+///
+/// The router routes, retries and backs off identically for both services, so the loop takes
+/// one of these rather than being written twice ([`crate::router`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Body {
+    /// A `RawKv` request (namespace `'r'`).
+    Raw(RawKvReq),
+    /// A `TxnKv` request (namespace `'x'`, `docs/DESIGN.md` §8).
+    Txn(TxnKvReq),
+}
+
+impl Body {
+    /// The method this will be sent as.
+    #[must_use]
+    pub fn method(&self) -> Method {
+        match self {
+            Self::Raw(request) => request.method(),
+            Self::Txn(request) => request.method(),
+        }
+    }
+
+    /// The key the region cache is consulted with.
+    #[must_use]
+    pub fn routing_key(&self) -> &[u8] {
+        match self {
+            Self::Raw(request) => routing_key(request),
+            Self::Txn(request) => request.routing_key(),
+        }
+    }
+
+    /// A lower bound on what this encodes to, in bytes.
+    #[must_use]
+    pub fn payload_size(&self) -> usize {
+        match self {
+            Self::Raw(request) => payload_size(request),
+            Self::Txn(request) => txn_payload_size(request),
+        }
+    }
+
+    /// The wire request, addressed to a region.
+    #[must_use]
+    pub fn into_request(self, header: RequestHeader) -> Request {
+        match self {
+            Self::Raw(request) => Request::raw_kv(header, request),
+            Self::Txn(request) => Request::txn_kv(header, request),
+        }
+    }
+}
+
+impl From<RawKvReq> for Body {
+    fn from(request: RawKvReq) -> Self {
+        Self::Raw(request)
+    }
+}
+
+impl From<TxnKvReq> for Body {
+    fn from(request: TxnKvReq) -> Self {
+        Self::Txn(request)
+    }
+}
+
+/// A lower bound on what a `TxnKv` request encodes to, in bytes. See [`payload_size`].
+#[must_use]
+pub fn txn_payload_size(request: &TxnKvReq) -> usize {
+    /// Varint length prefix plus a little slack, per field.
+    const PER_FIELD: usize = 6;
+    let keys =
+        |keys: &[Bytes]| keys.iter().map(|key| key.len() + PER_FIELD).sum::<usize>() + PER_FIELD;
+    match request {
+        TxnKvReq::Get { key, .. } => key.len() + 2 * PER_FIELD,
+        TxnKvReq::Scan { start, end, .. } => start.len() + end.len() + 5 * PER_FIELD,
+        TxnKvReq::Prewrite {
+            primary, mutations, ..
+        } => {
+            primary.len()
+                + mutations
+                    .iter()
+                    .map(|mutation| match mutation {
+                        TxnMutation::Put { key, value } => key.len() + value.len() + 2 * PER_FIELD,
+                        TxnMutation::Delete { key } => key.len() + PER_FIELD,
+                    })
+                    .sum::<usize>()
+                + 4 * PER_FIELD
+        }
+        TxnKvReq::Commit { keys: k, .. }
+        | TxnKvReq::Rollback { keys: k, .. }
+        | TxnKvReq::ResolveLock { keys: k, .. } => keys(k) + 2 * PER_FIELD,
+        TxnKvReq::Heartbeat { primary, .. } => primary.len() + 3 * PER_FIELD,
+        TxnKvReq::GcSafepoint { .. } => PER_FIELD,
+    }
+}
 
 /// The key a request routes by: the one the region cache is consulted with.
 ///

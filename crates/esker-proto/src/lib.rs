@@ -60,7 +60,7 @@ pub use transport::{
     BlockingTransport, BoxFuture, ChunkSender, ChunkStream, Reply, Server, ServerHandle, Service,
     StreamResponse, TcpTransport, Transport, TransportConfig,
 };
-pub use txn::{LockInfo, TxnKvReq, TxnKvResp, TxnMutation};
+pub use txn::{LockInfo, TxnKvReq, TxnKvResp, TxnMutation, TxnStatus};
 
 /// Version of the framing and of every message encoding. Negotiated when a connection opens;
 /// a mismatch is a hard error, not a downgrade (`docs/DESIGN.md` §9).

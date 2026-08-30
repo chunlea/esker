@@ -82,6 +82,39 @@ pub enum Error {
         /// What came back.
         actual: Method,
     },
+
+    /// A transaction lost a write-write race: something committed after its snapshot
+    /// (`docs/txn-spec.md` §5.2). Nothing of it was written. First-committer-wins, and only a
+    /// **new transaction** at a fresh `start_ts` can succeed — retrying this one cannot.
+    #[error("transaction at {start_ts} conflicts with a commit at {commit_ts}")]
+    TxnConflict {
+        /// The losing transaction's snapshot.
+        start_ts: u64,
+        /// The winner's commit timestamp.
+        commit_ts: u64,
+    },
+
+    /// A transaction was settled by someone else — rolled back because its lock expired, or
+    /// found already committed. Its own client is now the one holding a stale belief.
+    #[error("transaction at {start_ts} was already settled: {detail}")]
+    TxnSettled {
+        /// The transaction's snapshot.
+        start_ts: u64,
+        /// Which way, and by what evidence.
+        detail: String,
+    },
+
+    /// A lock stood in the way for the whole of a call's budget: its owner kept heartbeating,
+    /// or the resolution kept losing a race. Nothing was written.
+    #[error("a lock held by the transaction at {start_ts} did not clear in time")]
+    LockNotCleared {
+        /// The transaction holding it.
+        start_ts: u64,
+    },
+
+    /// A bug in this crate rather than a failure of the cluster.
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
 impl Error {
@@ -105,9 +138,18 @@ impl Error {
             Self::DeadlineExceeded { source, .. } => source
                 .as_deref()
                 .is_none_or(|error| error.outcome() == RequestOutcome::NotApplied),
-            Self::NoRegion { .. } | Self::RequestTooLarge { .. } => true,
-            // An answer came back, so the store acted; what it did is anybody's guess.
-            Self::UnexpectedResponse { .. } => false,
+            // A request that was never routed or never built changed nothing. So did a
+            // transaction that lost a write-write race and one whose lock never cleared: both
+            // are the store *saying* it refused, which means its answer arrived.
+            Self::NoRegion { .. }
+            | Self::RequestTooLarge { .. }
+            | Self::TxnConflict { .. }
+            | Self::LockNotCleared { .. } => true,
+            // An answer came back, so the store acted; what it did is anybody's guess. A
+            // transaction settled by someone else is the sharpest case of that — something
+            // *was* written, by them — and an internal bug here proves nothing about the
+            // cluster, so the safe reading is the pessimistic one.
+            Self::UnexpectedResponse { .. } | Self::TxnSettled { .. } | Self::Internal(_) => false,
         }
     }
 }

@@ -32,6 +32,29 @@ a retry after resolution is free, and because contention on many keys of one bat
 where backing off is wanted anyway. Batching them later means adding a response variant, not
 changing this one — the format allows it without a version bump.
 
+### The other half of the line: what *is* a response
+
+A lock is a refusal to **serve**. So are `NotLeader`, `EpochNotMatch` and `ServerIsBusy`: the
+client's routing and retry machinery handles all four, uniformly, and the caller never sees them.
+
+The rest of what a `Prewrite`, `Commit` or `Rollback` can say is not that. "A commit landed after
+your snapshot", "you were rolled back", "you already committed", "your lock is gone" are
+*determinations about this transaction*, which no retry changes and which the caller must act on.
+They travel in the response, as a `TxnStatus` byte:
+
+```
+Ok 1 | Conflict 2 ++ commit_ts | RolledBack 3 | Committed 4 ++ commit_ts | LockNotFound 5
+```
+
+Putting them in the error channel would mean a client retrying, backing off and exhausting a budget
+against an answer that will never differ — its classifier has no way to tell that a `Locked` is
+worth another go and a conflict is not, because both would be `ProtoError`s. Putting a lock in the
+response instead would mean the one refusal that bypasses the retry machinery. The line is *which
+layer acts on the answer*, and it puts each of them where its reader is.
+
+The five map one-to-one onto `esker_txn::TxnError`'s protocol variants, so the store handler this
+lane defers is a `match` and not a translation with judgement in it.
+
 ## Decision 2: `LockInfo` lives in `esker-proto`, and is not `esker_txn::LockRecord`
 
 `esker-proto/src/error.rs` carries a `TODO(phase-5)` proposing that `ProtoError::Locked`'s opaque

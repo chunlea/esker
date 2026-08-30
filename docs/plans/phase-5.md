@@ -183,13 +183,48 @@ short. `docs/DESIGN.md` §15 lists "range tombstones design" as an open question
 
 ## 8. Progress
 
-- [ ] unit 1 — plan and `docs/txn-spec.md`
-- [ ] unit 2 — record and key encodings, goldens, proptests
-- [ ] unit 3 — the Percolator decision library and its matrix
-- [ ] unit 4 — `TxnKv` on the wire
-- [ ] unit 5 — `TxnClient`
+- [x] unit 1 — plan and `docs/txn-spec.md`
+- [x] unit 2 — record and key encodings, goldens, proptests (77 tests, ADR 0015)
+- [x] unit 3 — the Percolator decision library and its matrix (39 protocol cases)
+- [x] unit 4 — `TxnKv` on the wire (ADR 0016, 141 tests in `esker-proto`)
+- [x] unit 5 — `TxnClient` (23 cases, and the `Router` both clients now share)
 - [ ] unit 6 — engine range tombstones
 
 ## 9. What changed, and why
 
-*(Filled in as units land.)*
+**The key layout is not §3's.** Appending a fixed version suffix to a raw user key only keeps one
+key's versions contiguous when keys are prefix-free, and `TxnKV` keys are not: raw, `"a"@0` sorts
+after `"ab"@MAX`, so a seek for `a`'s newest version lands inside `ab`'s — and the prefix check that
+should catch it passes, because `"a"` *is* a prefix of `"ab"`. `esker-keys`' own property test
+excludes the case with a `prop_assume!`. `esker-txn::key` group-encodes first; `docs/txn-spec.md` §2
+and ADR 0015 work the bytes through, and `docs/DESIGN.md` §3 and §8 were corrected in the same
+commit.
+
+**The commit point is a type, not a comment.** `commit_secondary` demands a `PrimaryCommitted`
+token, and the only source of one is `PrimaryCommit::applied()`, which consumes the plan the caller
+has just made durable. §5's risk 3 asked for "type-state or runtime assert"; this is the former, and
+it costs nothing.
+
+**`TxnKv` answers with a status, not only with errors.** ADR 0016 records the line: a lock, a
+`NotLeader` or a `ServerIsBusy` is a refusal to *serve* and belongs in the error channel, where the
+client's retry machinery already handles it; "you conflicted", "you were rolled back", "you already
+committed", "your lock is gone" are determinations about the transaction, which no retry changes.
+The second group travels in the response as a `TxnStatus`. Writing the client is what found it —
+unit 4 shipped `Prewrite` with an empty body, and there was nowhere to put a conflict.
+
+**`RawClient`'s call loop became `Router`.** Both clients want the same five steps, and a second
+copy would be a second place for `docs/DESIGN.md` §10 to drift. `StoreTransport::call` now answers a
+whole `Response` rather than a `RawKvResp`, because unwrapping one service at the transport would
+have meant a second loop for the other. Nothing above the trait changed shape.
+
+**Two things the goldens found.** `esker-proto`'s `damaged_bodies_never_panic` was fuzzing
+`which in 0usize..12` against a list that had grown to 31, so nineteen messages — every `Pd` one
+included — had never been damaged; it indexes against the list's real length now. And the coverage
+sweep that demands a golden request *and* response per method is what made the eight `TxnKv` pairs
+mandatory rather than a judgement call.
+
+**One edit outside the lane.** Adding `Request::TxnKv` made `esker-store`'s dispatch `match`
+non-exhaustive and the workspace stopped compiling. The arm added there is six lines answering
+`Unsupported` with the method's name — the store half of phase 5 is deferred (§1), and a client that
+reaches for it should meet a refusal that says so rather than a default or silence. It was swept
+into the store lane's commit `33e95e9` before this lane could stage it on its own.

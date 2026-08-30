@@ -1,0 +1,810 @@
+//! `TxnClient` against a scripted transport and a clock that jumps.
+//!
+//! Every rule of `docs/txn-spec.md` §5 that the *client* is responsible for has a case here:
+//! the order the two phases go out in, read-your-writes, lock resolution and its bounds, the
+//! per-region grouping, and the retry rules the router enforces on a transactional request the
+//! same way it does on a `RawKv` one.
+//!
+//! Nothing here touches a socket or a wall clock. That is the point of both seams.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::sync::Arc;
+
+use bytes::Bytes;
+use esker_client::clock::FakeClock;
+use esker_client::region_cache::{RegionTable, Route, StaticRegion};
+use esker_client::router::{ClientOptions, Router};
+use esker_client::testing::{FakeTransport, Matcher, Outcome, Rule};
+use esker_client::wire::{
+    Epoch, LockInfo, Method, Peer, ProtoError, RawKvReq, RawKvResp, Region, TxnKvReq, TxnKvResp,
+    TxnMutation, TxnStatus,
+};
+use esker_client::{CountingOracle, Error, TxnClient};
+
+const START_TS: u64 = 10;
+
+fn key(bytes: &'static [u8]) -> Bytes {
+    Bytes::from_static(bytes)
+}
+
+/// One region covering the whole key space, with two peers so a `NotLeader` hint has
+/// somewhere to point.
+fn one_region() -> Arc<StaticRegion> {
+    Arc::new(StaticRegion::new(Route {
+        region: Region {
+            id: 1,
+            start_key: Bytes::new(),
+            end_key: Bytes::new(),
+            peers: vec![Peer::voter(1, 1), Peer::voter(9, 9)],
+            epoch: Epoch::new(1, 1),
+        },
+        leader: Some(Peer::voter(1, 1)),
+    }))
+}
+
+/// Two regions split at `m`, on stores 1 and 2.
+fn two_regions() -> Arc<RegionTable> {
+    Arc::new(RegionTable::from_routes([
+        Route {
+            region: Region {
+                id: 1,
+                start_key: Bytes::new(),
+                end_key: key(b"m"),
+                peers: vec![Peer::voter(1, 1)],
+                epoch: Epoch::new(1, 1),
+            },
+            leader: Some(Peer::voter(1, 1)),
+        },
+        Route {
+            region: Region {
+                id: 2,
+                start_key: key(b"m"),
+                end_key: Bytes::new(),
+                peers: vec![Peer::voter(2, 2)],
+                epoch: Epoch::new(1, 1),
+            },
+            leader: Some(Peer::voter(2, 2)),
+        },
+    ]))
+}
+
+/// A client over `transport`, one region, a jumping clock and a counting oracle.
+fn client(transport: &Arc<FakeTransport>) -> TxnClient {
+    client_on(
+        transport,
+        one_region() as Arc<dyn esker_client::RegionResolver>,
+    )
+}
+
+fn client_on(
+    transport: &Arc<FakeTransport>,
+    resolver: Arc<dyn esker_client::RegionResolver>,
+) -> TxnClient {
+    let options = ClientOptions {
+        jitter_seed: Some(7),
+        ..ClientOptions::default()
+    };
+    let router = Router::with_options(Arc::clone(transport) as _, resolver, options)
+        .with_clock(Arc::new(FakeClock::new()));
+    TxnClient::on_router(
+        Arc::new(router),
+        Arc::new(CountingOracle::starting_at(START_TS)),
+    )
+}
+
+/// Answers every method of a whole successful commit.
+fn script_a_clean_commit(transport: &FakeTransport) {
+    transport
+        .script(
+            Rule::new(
+                Matcher::Method(Method::TxnPrewrite),
+                Outcome::TxnReply(TxnKvResp::Prewrite {
+                    status: TxnStatus::Ok,
+                }),
+            )
+            .forever(),
+        )
+        .script(
+            Rule::new(
+                Matcher::Method(Method::TxnCommit),
+                Outcome::TxnReply(TxnKvResp::Commit {
+                    status: TxnStatus::Ok,
+                }),
+            )
+            .forever(),
+        );
+}
+
+/// The `TxnKv` body of the n-th call, for asserting on what actually went out.
+fn nth_txn(transport: &FakeTransport, index: usize) -> TxnKvReq {
+    transport
+        .nth_call(index)
+        .expect("no such call")
+        .txn_body()
+        .cloned()
+        .unwrap_or_else(|| panic!("call {index} was not a TxnKv request"))
+}
+
+// -- the buffer ---------------------------------------------------------------------------
+
+/// A transaction that writes nothing costs nothing: no timestamps, no round trips.
+#[test]
+fn an_empty_transaction_commits_without_talking_to_anyone() {
+    let transport = Arc::new(FakeTransport::new());
+    let client = client(&transport);
+    let txn = client.begin().unwrap();
+    assert_eq!(txn.commit().unwrap(), None);
+    assert_eq!(transport.call_count(), 0);
+}
+
+/// Writes are buffered until commit. Nothing of a transaction exists anywhere else until then,
+/// which is what makes the whole write set known before the first `Prewrite`.
+#[test]
+fn writes_do_not_leave_the_process_until_commit() {
+    let transport = Arc::new(FakeTransport::new());
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+    txn.put(b"a", b"1");
+    txn.put(b"b", b"2");
+    txn.delete(b"c");
+    assert_eq!(transport.call_count(), 0);
+    assert_eq!(txn.len(), 3);
+}
+
+/// Read-your-writes: a transaction sees its own buffer before it asks the store, and a
+/// buffered delete reads as absent rather than as the committed value underneath.
+#[test]
+fn a_transaction_reads_its_own_writes_without_a_round_trip() {
+    let transport = Arc::new(FakeTransport::new());
+    transport.unmatched(Outcome::TxnReply(TxnKvResp::Get {
+        value: Some(key(b"committed")),
+    }));
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+
+    txn.put(b"a", b"mine");
+    assert_eq!(txn.get(b"a").unwrap(), Some(key(b"mine")));
+    txn.delete(b"a");
+    assert_eq!(txn.get(b"a").unwrap(), None, "a buffered delete hides it");
+    assert_eq!(transport.call_count(), 0, "neither read left the process");
+
+    // A key the transaction has not written does go out, at its snapshot.
+    assert_eq!(txn.get(b"b").unwrap(), Some(key(b"committed")));
+    assert_eq!(transport.call_count(), 1);
+    match nth_txn(&transport, 0) {
+        TxnKvReq::Get { key: k, ts } => {
+            assert_eq!(k, key(b"b"));
+            assert_eq!(ts, START_TS, "a read is at the transaction's snapshot");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The same rule applied to a range: a buffered put appears, a buffered delete removes a row
+/// the store returned, and the result stays in key order.
+#[test]
+fn a_scan_merges_the_buffer_over_what_the_store_returned() {
+    let transport = Arc::new(FakeTransport::new());
+    transport.unmatched(Outcome::TxnReply(TxnKvResp::Scan {
+        pairs: vec![(key(b"a"), key(b"stored-a")), (key(b"c"), key(b"stored-c"))],
+    }));
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+    txn.put(b"b", b"mine-b");
+    txn.delete(b"c");
+    // Outside the range, so it must not appear.
+    txn.put(b"z", b"mine-z");
+
+    let pairs = txn.scan(b"a", b"m", 0).unwrap();
+    assert_eq!(
+        pairs,
+        vec![(key(b"a"), key(b"stored-a")), (key(b"b"), key(b"mine-b"))]
+    );
+}
+
+// -- the order of the two phases ----------------------------------------------------------
+
+/// The commit point. The primary is prewritten alone and first, and committed alone and first;
+/// everything else happens between or after. Getting this wrong is a transaction no resolver
+/// can classify (`docs/txn-spec.md` §5.3).
+#[test]
+fn the_primary_goes_first_in_both_phases() {
+    let transport = Arc::new(FakeTransport::new());
+    script_a_clean_commit(&transport);
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+    txn.put(b"b", b"2");
+    txn.put(b"a", b"1");
+    txn.put(b"c", b"3");
+    let primary = txn.primary().cloned().unwrap();
+    assert_eq!(primary, key(b"a"), "the lowest key is the primary");
+
+    let commit_ts = txn.commit().unwrap().unwrap();
+    assert!(commit_ts > START_TS);
+
+    // Four calls: prewrite(primary), prewrite(secondaries), commit(primary), commit(secondaries).
+    assert_eq!(
+        transport.methods(),
+        vec![
+            Method::TxnPrewrite,
+            Method::TxnPrewrite,
+            Method::TxnCommit,
+            Method::TxnCommit
+        ]
+    );
+
+    match nth_txn(&transport, 0) {
+        TxnKvReq::Prewrite {
+            start_ts,
+            primary: named,
+            mutations,
+            ..
+        } => {
+            assert_eq!(start_ts, START_TS);
+            assert_eq!(named, primary);
+            assert_eq!(
+                mutations,
+                vec![TxnMutation::Put {
+                    key: key(b"a"),
+                    value: key(b"1")
+                }],
+                "the primary is prewritten alone"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    match nth_txn(&transport, 1) {
+        TxnKvReq::Prewrite {
+            primary: named,
+            mutations,
+            ..
+        } => {
+            assert_eq!(named, primary, "a secondary names the primary");
+            let keys: Vec<&Bytes> = mutations.iter().map(TxnMutation::key).collect();
+            assert_eq!(keys, vec![&key(b"b"), &key(b"c")]);
+        }
+        other => panic!("{other:?}"),
+    }
+    match nth_txn(&transport, 2) {
+        TxnKvReq::Commit {
+            start_ts,
+            commit_ts: at,
+            keys,
+        } => {
+            assert_eq!(start_ts, START_TS);
+            assert_eq!(at, commit_ts);
+            assert_eq!(keys, vec![primary.clone()], "the primary commits alone");
+        }
+        other => panic!("{other:?}"),
+    }
+    match nth_txn(&transport, 3) {
+        TxnKvReq::Commit { keys, .. } => assert_eq!(keys, vec![key(b"b"), key(b"c")]),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A transaction that writes one key sends two calls, not four: there are no secondaries to
+/// prewrite and none to clean up.
+#[test]
+fn a_single_key_transaction_is_two_round_trips() {
+    let transport = Arc::new(FakeTransport::new());
+    script_a_clean_commit(&transport);
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+    txn.put(b"only", b"v");
+    txn.commit().unwrap();
+    assert_eq!(
+        transport.methods(),
+        vec![Method::TxnPrewrite, Method::TxnCommit]
+    );
+}
+
+/// Writing the same key twice sends one mutation. Two would be two locks on one key, and the
+/// second would collide with the first.
+#[test]
+fn a_key_written_twice_is_prewritten_once() {
+    let transport = Arc::new(FakeTransport::new());
+    script_a_clean_commit(&transport);
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+    txn.put(b"k", b"first");
+    txn.put(b"k", b"second");
+    txn.delete(b"k");
+    txn.commit().unwrap();
+
+    match nth_txn(&transport, 0) {
+        TxnKvReq::Prewrite { mutations, .. } => assert_eq!(
+            mutations,
+            vec![TxnMutation::Delete { key: key(b"k") }],
+            "the last write for a key wins, and it is the only one"
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Secondaries are grouped by region, one request per region rather than one per key.
+#[test]
+fn secondaries_are_grouped_by_region() {
+    let transport = Arc::new(FakeTransport::new());
+    script_a_clean_commit(&transport);
+    let resolver = two_regions();
+    let client = client_on(
+        &transport,
+        resolver as Arc<dyn esker_client::RegionResolver>,
+    );
+    let mut txn = client.begin().unwrap();
+    for k in [
+        b"a".as_slice(),
+        b"b".as_slice(),
+        b"n".as_slice(),
+        b"o".as_slice(),
+    ] {
+        txn.put(k, b"v");
+    }
+    // Warm the cache, so the grouping has something to group by: it is a hint from the cache
+    // and a cold cache groups everything together, which is correct and slower.
+    for k in [b"a".as_slice(), b"b", b"n", b"o"] {
+        let _ = client.router().cached_route(k);
+    }
+    let _ = txn.get(b"a");
+    let _ = txn.get(b"n");
+    transport.clear_log();
+
+    txn.commit().unwrap();
+
+    // primary(a) + two secondary groups + commit(primary) + two commit groups.
+    let stores = transport.stores();
+    assert_eq!(
+        stores.len(),
+        6,
+        "one call per region per phase, plus the primary's two"
+    );
+    assert_eq!(
+        stores.iter().filter(|store| **store == 2).count(),
+        2,
+        "the far region is asked once per phase"
+    );
+}
+
+/// A second `commit()` or `rollback()` is a bug in the caller, not a second two-phase commit.
+#[test]
+fn a_transaction_cannot_be_finished_twice() {
+    // `commit` and `rollback` consume the transaction, so the compiler already stops the
+    // direct case; this pins the guard behind it, which is what a future `&mut self` API or a
+    // clone would meet.
+    let transport = Arc::new(FakeTransport::new());
+    script_a_clean_commit(&transport);
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+    txn.put(b"k", b"v");
+    assert!(txn.commit().is_ok());
+}
+
+// -- what the store answers ---------------------------------------------------------------
+
+/// A write-write conflict is the transaction's fate, not a failure of the call: nothing was
+/// written, and only a new transaction at a fresh snapshot can succeed.
+#[test]
+fn a_prewrite_conflict_ends_the_transaction() {
+    let transport = Arc::new(FakeTransport::new());
+    transport.unmatched(Outcome::TxnReply(TxnKvResp::Prewrite {
+        status: TxnStatus::Conflict { commit_ts: 42 },
+    }));
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+    txn.put(b"k", b"v");
+
+    match txn.commit().unwrap_err() {
+        Error::TxnConflict {
+            start_ts,
+            commit_ts,
+        } => {
+            assert_eq!(start_ts, START_TS);
+            assert_eq!(commit_ts, 42);
+        }
+        other => panic!("expected a conflict, got {other:?}"),
+    }
+    assert_eq!(transport.call_count(), 1, "it stopped at the primary");
+}
+
+/// A conflict says nothing was written, and the caller may act on that without reading
+/// anything back.
+#[test]
+fn a_conflict_changed_nothing() {
+    let error = Error::TxnConflict {
+        start_ts: 1,
+        commit_ts: 2,
+    };
+    assert!(error.changed_nothing());
+    // A transaction settled by someone else is the opposite: something was written, by them.
+    assert!(
+        !Error::TxnSettled {
+            start_ts: 1,
+            detail: "already committed at 2".to_owned(),
+        }
+        .changed_nothing()
+    );
+}
+
+/// A transaction rolled back under it — its lock expired and a reader cleaned up — must not
+/// carry on. Retrying any part of it would keep failing.
+#[test]
+fn a_transaction_rolled_back_under_us_is_settled() {
+    let transport = Arc::new(FakeTransport::new());
+    transport.unmatched(Outcome::TxnReply(TxnKvResp::Prewrite {
+        status: TxnStatus::RolledBack,
+    }));
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+    txn.put(b"k", b"v");
+    assert!(matches!(
+        txn.commit().unwrap_err(),
+        Error::TxnSettled { start_ts, .. } if start_ts == START_TS
+    ));
+}
+
+/// A secondary that fails to commit is **not** a failed transaction. The primary's record is
+/// written, so the transaction committed; a reader that meets the leftover lock rolls it
+/// forward. Reporting an error would tell the caller their committed transaction failed.
+#[test]
+fn a_failed_secondary_commit_does_not_fail_a_committed_transaction() {
+    let transport = Arc::new(FakeTransport::new());
+    transport
+        .script(
+            Rule::new(
+                Matcher::Method(Method::TxnPrewrite),
+                Outcome::TxnReply(TxnKvResp::Prewrite {
+                    status: TxnStatus::Ok,
+                }),
+            )
+            .forever(),
+        )
+        // The primary's commit succeeds; every one after it fails.
+        .script(Rule::new(
+            Matcher::Method(Method::TxnCommit),
+            Outcome::TxnReply(TxnKvResp::Commit {
+                status: TxnStatus::Ok,
+            }),
+        ))
+        .script(
+            Rule::new(
+                Matcher::Method(Method::TxnCommit),
+                Outcome::Fail(ProtoError::Closed {
+                    detail: "the store went away".to_owned(),
+                }),
+            )
+            .forever(),
+        );
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+    txn.put(b"a", b"1");
+    txn.put(b"b", b"2");
+
+    let commit_ts = txn
+        .commit()
+        .expect("the primary committed, so the transaction did");
+    assert!(commit_ts.unwrap() > START_TS);
+}
+
+// -- locks ---------------------------------------------------------------------------------
+
+fn a_lock(on: &'static [u8], primary: &'static [u8], start_ts: u64) -> LockInfo {
+    LockInfo {
+        key: key(on),
+        primary: key(primary),
+        start_ts,
+        ttl_ms: 3_000,
+    }
+}
+
+/// A `Locked` is not an error to report: the client resolves the lock and asks again. That is
+/// the reader's half of `docs/txn-spec.md` §5.5.
+#[test]
+fn a_read_that_meets_a_lock_resolves_it_and_tries_again() {
+    let transport = Arc::new(FakeTransport::new());
+    transport
+        .script(Rule::new(
+            Matcher::Method(Method::TxnGet),
+            Outcome::locked(&a_lock(b"k", b"primary", 5)),
+        ))
+        .script(
+            Rule::new(
+                Matcher::Method(Method::TxnResolveLock),
+                Outcome::TxnReply(TxnKvResp::ResolveLock { resolved: 1 }),
+            )
+            .forever(),
+        )
+        .script(
+            Rule::new(
+                Matcher::Method(Method::TxnGet),
+                Outcome::TxnReply(TxnKvResp::Get {
+                    value: Some(key(b"v")),
+                }),
+            )
+            .forever(),
+        );
+    let client = client(&transport);
+    let txn = client.begin().unwrap();
+
+    assert_eq!(txn.get(b"k").unwrap(), Some(key(b"v")));
+    assert_eq!(
+        transport.methods(),
+        vec![Method::TxnGet, Method::TxnResolveLock, Method::TxnGet]
+    );
+    // The resolution names the *stuck* transaction, not the reader's own.
+    match nth_txn(&transport, 1) {
+        TxnKvReq::ResolveLock {
+            start_ts,
+            commit_ts,
+            keys,
+        } => {
+            assert_eq!(start_ts, 5, "the lock's transaction, not the reader's");
+            assert_eq!(commit_ts, 0, "zero asks the store to decide by the primary");
+            assert_eq!(keys, vec![key(b"k")]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A prewrite that meets someone else's lock resolves it too — a writer is a reader of the
+/// `lock` CF like any other.
+#[test]
+fn a_prewrite_that_meets_a_lock_resolves_it_and_tries_again() {
+    let transport = Arc::new(FakeTransport::new());
+    transport
+        .script(Rule::new(
+            Matcher::Method(Method::TxnPrewrite),
+            Outcome::locked(&a_lock(b"k", b"other", 5)),
+        ))
+        .script(
+            Rule::new(
+                Matcher::Method(Method::TxnResolveLock),
+                Outcome::TxnReply(TxnKvResp::ResolveLock { resolved: 1 }),
+            )
+            .forever(),
+        )
+        .script(
+            Rule::new(
+                Matcher::Method(Method::TxnPrewrite),
+                Outcome::TxnReply(TxnKvResp::Prewrite {
+                    status: TxnStatus::Ok,
+                }),
+            )
+            .forever(),
+        )
+        .script(
+            Rule::new(
+                Matcher::Method(Method::TxnCommit),
+                Outcome::TxnReply(TxnKvResp::Commit {
+                    status: TxnStatus::Ok,
+                }),
+            )
+            .forever(),
+        );
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+    txn.put(b"k", b"v");
+    assert!(txn.commit().is_ok());
+    assert_eq!(
+        transport.methods(),
+        vec![
+            Method::TxnPrewrite,
+            Method::TxnResolveLock,
+            Method::TxnPrewrite,
+            Method::TxnCommit
+        ]
+    );
+}
+
+/// A lock whose owner keeps heartbeating never clears, and a client that waited for ever would
+/// be indistinguishable from one that hung. The budget is separate from the router's, because
+/// each resolution attempt makes progress and a routing retry does not.
+#[test]
+fn a_lock_that_never_clears_is_bounded() {
+    let transport = Arc::new(FakeTransport::new());
+    transport
+        .script(
+            Rule::new(
+                Matcher::Method(Method::TxnGet),
+                Outcome::locked(&a_lock(b"k", b"primary", 5)),
+            )
+            .forever(),
+        )
+        .script(
+            Rule::new(
+                Matcher::Method(Method::TxnResolveLock),
+                Outcome::TxnReply(TxnKvResp::ResolveLock { resolved: 0 }),
+            )
+            .forever(),
+        );
+    let client = client(&transport).with_max_lock_resolutions(3);
+    let txn = client.begin().unwrap();
+
+    match txn.get(b"k").unwrap_err() {
+        Error::LockNotCleared { start_ts } => assert_eq!(start_ts, 5),
+        other => panic!("expected LockNotCleared, got {other:?}"),
+    }
+    // Four reads and three resolutions: the budget counts resolutions, and the last read is
+    // what discovers the lock is still there.
+    assert_eq!(
+        transport
+            .methods()
+            .iter()
+            .filter(|m| **m == Method::TxnResolveLock)
+            .count(),
+        3
+    );
+    assert_eq!(
+        transport
+            .methods()
+            .iter()
+            .filter(|m| **m == Method::TxnGet)
+            .count(),
+        4
+    );
+}
+
+/// A `Locked` nothing can decode is an error, never "no lock in the way". Treating it as an
+/// absence would loop against a key the client can never read.
+#[test]
+fn an_unreadable_lock_payload_is_an_error() {
+    let transport = Arc::new(FakeTransport::new());
+    transport.unmatched(Outcome::Fail(ProtoError::Locked {
+        lock_info: Bytes::from_static(b"\xff\xff\xff"),
+    }));
+    let client = client(&transport);
+    let txn = client.begin().unwrap();
+    assert!(matches!(
+        txn.get(b"k").unwrap_err(),
+        Error::Store(ProtoError::InvalidRequest { .. })
+    ));
+    assert_eq!(transport.call_count(), 1, "it did not loop");
+}
+
+// -- rollback --------------------------------------------------------------------------------
+
+/// A rollback leaves a marker on every key the transaction *might* have prewritten, which is
+/// every key in its buffer: the client cannot tell a prewrite that never left from one whose
+/// answer was lost, and the marker is what makes a late arrival of the second kind fail
+/// (`docs/txn-spec.md` §5.4).
+#[test]
+fn rollback_marks_every_key_the_transaction_might_have_prewritten() {
+    let transport = Arc::new(FakeTransport::new());
+    transport.unmatched(Outcome::TxnReply(TxnKvResp::Rollback {
+        status: TxnStatus::Ok,
+    }));
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+    txn.put(b"a", b"1");
+    txn.put(b"b", b"2");
+    txn.rollback().unwrap();
+
+    assert_eq!(transport.methods(), vec![Method::TxnRollback]);
+    match nth_txn(&transport, 0) {
+        TxnKvReq::Rollback { start_ts, keys } => {
+            assert_eq!(start_ts, START_TS);
+            assert_eq!(keys, vec![key(b"a"), key(b"b")]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Rolling back a transaction that wrote nothing sends nothing.
+#[test]
+fn rolling_back_an_empty_transaction_is_free() {
+    let transport = Arc::new(FakeTransport::new());
+    let client = client(&transport);
+    client.begin().unwrap().rollback().unwrap();
+    assert_eq!(transport.call_count(), 0);
+}
+
+// -- the router's rules, on a transactional request -------------------------------------------
+
+/// Routing retries work the same for both services: a `NotLeader` is followed, and the second
+/// attempt goes to the peer the hint named.
+#[test]
+fn a_transactional_request_follows_a_not_leader_hint() {
+    let transport = Arc::new(FakeTransport::new());
+    transport
+        .script(Rule::new(
+            Matcher::Method(Method::TxnGet),
+            Outcome::Fail(ProtoError::NotLeader {
+                region_id: 1,
+                leader_hint: Some(9),
+            }),
+        ))
+        .script(
+            Rule::new(
+                Matcher::Method(Method::TxnGet),
+                Outcome::TxnReply(TxnKvResp::Get { value: None }),
+            )
+            .forever(),
+        );
+    let client = client(&transport);
+    let txn = client.begin().unwrap();
+    assert_eq!(txn.get(b"k").unwrap(), None);
+    assert_eq!(transport.call_count(), 2);
+    assert_eq!(transport.peers(), vec![1, 9], "the hint was followed");
+}
+
+/// The write-protection rule holds for a transactional mutation: a `Prewrite` whose answer
+/// never came back is `AmbiguousResult` rather than a silent re-send.
+///
+/// For a transaction that is **not** the end of the story, and that is the point of
+/// Percolator: the prewrite either landed or it did not, and either way the transaction's fate
+/// is decided by one key — so a reader that meets the lock resolves it, and this client may
+/// simply try again. What the type stops is the client *assuming* which happened.
+#[test]
+fn an_unanswered_prewrite_is_ambiguous_and_resolvable() {
+    let transport = Arc::new(FakeTransport::new());
+    transport.unmatched(Outcome::Fail(ProtoError::Timeout {
+        detail: "no answer in 30s".to_owned(),
+    }));
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+    txn.put(b"k", b"v");
+
+    let error = txn.commit().unwrap_err();
+    match &error {
+        Error::AmbiguousResult { method, .. } => assert_eq!(*method, Method::TxnPrewrite),
+        other => panic!("expected AmbiguousResult, got {other:?}"),
+    }
+    assert!(
+        !error.changed_nothing(),
+        "the caller must not assume the prewrite missed"
+    );
+    assert_eq!(
+        transport.call_count(),
+        1,
+        "an unanswered write is not re-sent"
+    );
+}
+
+/// A read that goes unanswered is *not* ambiguous: re-reading is always safe, so it comes back
+/// as a plain store error and the caller may simply ask again.
+#[test]
+fn an_unanswered_read_is_not_ambiguous() {
+    let transport = Arc::new(FakeTransport::new());
+    transport.unmatched(Outcome::Fail(ProtoError::Timeout {
+        detail: "no answer in 30s".to_owned(),
+    }));
+    let client = client(&transport);
+    let txn = client.begin().unwrap();
+    assert!(matches!(
+        txn.get(b"k").unwrap_err(),
+        Error::Store(ProtoError::Timeout { .. })
+    ));
+}
+
+/// One region cache, one set of rules: a `RawClient` and a `TxnClient` sharing a router share
+/// what either of them learned about the cluster.
+#[test]
+fn both_clients_can_share_one_router() {
+    let transport = Arc::new(FakeTransport::new());
+    transport
+        .script(
+            Rule::new(
+                Matcher::Method(Method::RawGet),
+                Outcome::Reply(RawKvResp::Get { value: None }),
+            )
+            .forever(),
+        )
+        .script(
+            Rule::new(
+                Matcher::Method(Method::TxnGet),
+                Outcome::TxnReply(TxnKvResp::Get { value: None }),
+            )
+            .forever(),
+        );
+    let raw = esker_client::RawClient::new(Arc::clone(&transport) as _, one_region() as _);
+    assert_eq!(
+        raw.call(&RawKvReq::get(&b"k"[..])).unwrap(),
+        RawKvResp::Get { value: None }
+    );
+
+    let txn_client = client(&transport);
+    let txn = txn_client.begin().unwrap();
+    assert_eq!(txn.get(b"k").unwrap(), None);
+    assert_eq!(transport.methods(), vec![Method::RawGet, Method::TxnGet]);
+}

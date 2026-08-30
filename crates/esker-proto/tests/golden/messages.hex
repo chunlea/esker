@@ -83,6 +83,10 @@ error cluster-mismatch 1200effdb6f50d01
 # Rollback 0x0205, ResolveLock 0x0206, Heartbeat 0x0207, GcSafepoint 0x0208. Every one
 # carries the same region header as a RawKv request. A ResolveLock commit_ts of zero
 # means roll back: no transaction commits at timestamp zero, so the slot is free.
+#
+# Prewrite, Commit and Rollback answer with a status byte and, for the two that name a
+# timestamp, a varint: Ok 1, Conflict 2 ++ commit_ts, RolledBack 3, Committed 4 ++ commit_ts,
+# LockNotFound 5. A lock in the way is not one of these — it is an Error frame.
 request txn-get 010201020304036b65792a
 request txn-scan 0202010203040161017a642a00
 request txn-scan-reverse 0202010203040161017a642a01
@@ -97,9 +101,13 @@ request txn-gc-safepoint 080201020304808080808040
 response txn-get 0102010176
 response txn-get-absent 010200
 response txn-scan 02020101610131
-response txn-prewrite 0302
-response txn-commit 0402
-response txn-rollback 0502
+response txn-prewrite 030201
+response txn-prewrite-conflict 03020232
+response txn-prewrite-rolledback 030203
+response txn-commit 040201
+response txn-commit-lock-lost 040205
+response txn-rollback 050201
+response txn-rollback-committed 05020432
 response txn-resolve-lock 060203
 response txn-heartbeat 0702b817
 response txn-gc-safepoint 0802808080808040
