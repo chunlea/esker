@@ -50,7 +50,7 @@ pub use codec::{DecodeError, Decoder, Encoder};
 pub use error::{ProtoError, RequestOutcome};
 pub use frame::{FRAME_HEADER_SIZE, Frame, FrameDecoder, FrameKind, MAX_BODY_SIZE, MAX_FRAME_SIZE};
 pub use messages::{
-    Hello, HelloAck, Method, RawKvReq, RawKvResp, Request, RequestHeader, Response,
+    Hello, HelloAck, Method, RawKvReq, RawKvResp, Request, RequestHeader, Response, SnapshotRequest,
 };
 pub use pd::{Operator, PdChannel, PdReq, PdResp, StoreInfo};
 pub use raft::{RaftBatch, RaftMessage};

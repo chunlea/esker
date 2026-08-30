@@ -33,6 +33,7 @@ request pd-region-heartbeat 0303cdd70207016100020302010a01020b010a048080404d
 request pd-get-region 0403cdd702036b6579
 request pd-alloc-id 0503cdd70202
 request pd-tso 0603cdd70210
+request raft-snapshot 0204032a07
 response hello 0100010000000780808008
 response get 0101010176
 response get-absent 010100

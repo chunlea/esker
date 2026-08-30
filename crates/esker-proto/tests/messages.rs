@@ -132,6 +132,7 @@ fn golden_pd_requests() -> Vec<(&'static str, Request)> {
     ]
 }
 
+#[allow(clippy::too_many_lines)]
 fn golden_requests() -> Vec<(&'static str, Request)> {
     let h = header();
     let mut requests = vec![
@@ -149,6 +150,14 @@ fn golden_requests() -> Vec<(&'static str, Request)> {
         (
             "put",
             Request::raw_kv(h, RawKvReq::put(&b"k"[..], &b"v"[..])),
+        ),
+        (
+            "raft-snapshot",
+            Request::Snapshot(esker_proto::SnapshotRequest {
+                region_id: 3,
+                index: 42,
+                peer_id: 7,
+            }),
         ),
         (
             "raft-timeout-now",
@@ -579,7 +588,20 @@ fn the_goldens_cover_every_method_and_every_error_code() {
         .collect();
     let all: std::collections::BTreeSet<Method> = Method::ALL.into_iter().collect();
     assert_eq!(pinned_requests, all, "a method has no golden request");
-    assert_eq!(pinned_responses, all, "a method has no golden response");
+
+    // A streamed method has no `Response` frame to pin: its answer is a run of `Stream` frames,
+    // whose chunk format is `esker-store`'s and is golden-tested there. The exclusion is taken
+    // from the method itself rather than a list here, so a second streamed method cannot be added
+    // without this test noticing.
+    let unary: std::collections::BTreeSet<Method> = Method::ALL
+        .into_iter()
+        .filter(|method| !method.is_streamed())
+        .collect();
+    assert_eq!(pinned_responses, unary, "a method has no golden response");
+    assert!(
+        pinned_responses.iter().all(|method| !method.is_streamed()),
+        "a streamed method has a golden response, which it cannot have"
+    );
 
     let pinned_codes: std::collections::BTreeSet<u16> = golden_errors()
         .iter()

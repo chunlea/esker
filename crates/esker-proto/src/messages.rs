@@ -76,6 +76,13 @@ pub enum Method {
     /// `RaftTransport::Batch` — a tick's worth of Raft messages between two stores
     /// (`docs/DESIGN.md` §6, [ADR 0009](../../docs/adr/0009-the-wire-carries-the-raft-message.md)).
     RaftBatch = 0x0401,
+    /// `RaftTransport::Snapshot` — a follower asking a leader for a region's contents.
+    ///
+    /// The only **streamed** method: its answer is a run of `Stream` frames rather than one
+    /// `Response`. The receiver asks; the leader does not push. `esker-proto`'s streaming is a
+    /// reply shape, and a pulling receiver controls its own retries
+    /// (`docs/plans/phase-4.md` §13.4).
+    RaftSnapshot = 0x0402,
     // TODO(phase-5): service 0x02, TxnKv::{Get, Scan, Prewrite, Commit, Rollback,
     //                ResolveLock, Heartbeat, GcSafepoint}.
 }
@@ -93,7 +100,7 @@ pub const SERVICE_RAFT: u8 = 0x04;
 
 impl Method {
     /// Every method this version defines.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::Hello,
         Self::RawGet,
         Self::RawBatchGet,
@@ -110,6 +117,7 @@ impl Method {
         Self::PdAllocId,
         Self::PdTso,
         Self::RaftBatch,
+        Self::RaftSnapshot,
     ];
 
     /// The wire tag.
@@ -138,8 +146,19 @@ impl Method {
             0x0305 => Some(Self::PdAllocId),
             0x0306 => Some(Self::PdTso),
             0x0401 => Some(Self::RaftBatch),
+            0x0402 => Some(Self::RaftSnapshot),
             _ => None,
         }
+    }
+
+    /// Whether this method's answer is a run of `Stream` frames rather than one `Response`.
+    ///
+    /// Exactly one method is, and the distinction is on the type rather than in a caller's head:
+    /// a caller that used [`crate::Transport::call`] on a streamed method would wait for a
+    /// `Response` frame that is never sent.
+    #[must_use]
+    pub fn is_streamed(self) -> bool {
+        matches!(self, Self::RaftSnapshot)
     }
 
     /// Which service this method belongs to.
@@ -168,6 +187,7 @@ impl Method {
             Self::PdAllocId => "Pd::AllocId",
             Self::PdTso => "Pd::Tso",
             Self::RaftBatch => "RaftTransport::Batch",
+            Self::RaftSnapshot => "RaftTransport::Snapshot",
         }
     }
 
@@ -726,6 +746,26 @@ pub enum Request {
     /// Raft traffic between two stores. It carries no [`RequestHeader`], because one batch may
     /// hold messages for many regions and each carries its own (`docs/DESIGN.md` §6).
     Raft(RaftBatch),
+    /// A follower asking for a region's contents, having been told by an `InstallSnapshot`
+    /// message that its log no longer reaches back far enough.
+    ///
+    /// The answer is a **stream**, not a response frame: a region is megabytes and a Raft
+    /// message is not where megabytes go.
+    Snapshot(SnapshotRequest),
+}
+
+/// A follower's request for a region's contents (`docs/DESIGN.md` §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotRequest {
+    /// The region wanted.
+    pub region_id: u64,
+    /// The snapshot index the asking peer was told about. The sender refuses if it cannot
+    /// produce one at least this recent — a snapshot older than the announcement would leave
+    /// the follower's log with a hole between the two.
+    pub index: u64,
+    /// Which peer is asking, so a store that is not a member of the region is refused rather
+    /// than served a copy of data it has no claim to.
+    pub peer_id: u64,
 }
 
 impl Request {
@@ -743,6 +783,7 @@ impl Request {
             Self::RawKv { request, .. } => request.method(),
             Self::Pd { request, .. } => request.method(),
             Self::Raft(_) => Method::RaftBatch,
+            Self::Snapshot(_) => Method::RaftSnapshot,
         }
     }
 
@@ -750,7 +791,7 @@ impl Request {
     #[must_use]
     pub fn header(&self) -> Option<RequestHeader> {
         match self {
-            Self::Hello(_) | Self::Raft(_) | Self::Pd { .. } => None,
+            Self::Hello(_) | Self::Raft(_) | Self::Snapshot(_) | Self::Pd { .. } => None,
             Self::RawKv { header, .. } => Some(*header),
         }
     }
@@ -774,6 +815,11 @@ impl Request {
                 request.encode(&mut out);
             }
             Self::Raft(batch) => batch.encode(&mut out),
+            Self::Snapshot(request) => {
+                out.put_varint(request.region_id);
+                out.put_varint(request.index);
+                out.put_varint(request.peer_id);
+            }
         }
         out.finish()
     }
@@ -787,6 +833,11 @@ impl Request {
                 version: input.get_u32("hello.version")?,
             }),
             Method::RaftBatch => Self::Raft(RaftBatch::decode(&mut input)?),
+            Method::RaftSnapshot => Self::Snapshot(SnapshotRequest {
+                region_id: input.get_varint("snapshot.region_id")?,
+                index: input.get_varint("snapshot.index")?,
+                peer_id: input.get_varint("snapshot.peer_id")?,
+            }),
             other if other.is_pd() => Self::Pd {
                 cluster_id: input.get_varint("pd.cluster_id")?,
                 request: crate::pd::PdReq::decode(other, &mut input)?,
@@ -1047,7 +1098,7 @@ mod tests {
             assert_eq!(Method::from_u16(method.as_u16()), Some(method));
             let service = match method {
                 Method::Hello => SERVICE_SYSTEM,
-                Method::RaftBatch => crate::messages::SERVICE_RAFT,
+                Method::RaftBatch | Method::RaftSnapshot => crate::messages::SERVICE_RAFT,
                 Method::PdBootstrap
                 | Method::PdStoreHeartbeat
                 | Method::PdRegionHeartbeat

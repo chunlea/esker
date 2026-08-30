@@ -40,7 +40,7 @@ use esker_proto::{Decoder, Encoder, Epoch, Peer, PeerRole, Region};
 
 use crate::error::{Result, StoreError};
 use crate::raft_cf;
-use crate::raft_log::{REGION_KEY_LEN, metadata_key};
+use crate::raft_log::{REGION_KEY_LEN, metadata_key, pending_snapshot_key};
 
 /// Version byte on a region metadata record. A change to any field's meaning bumps it.
 const METADATA_FORMAT_VERSION: u8 = 1;
@@ -50,6 +50,16 @@ const METADATA_FORMAT_VERSION: u8 = 1;
 pub fn encode_region(region: &Region) -> Vec<u8> {
     let mut out = Encoder::with_capacity(32 + region.start_key.len() + region.end_key.len());
     out.put_u8(METADATA_FORMAT_VERSION);
+    encode_region_into(&mut out, region);
+    out.finish()
+}
+
+/// A region's fields, without the record's version byte.
+///
+/// Shared with the snapshot stream's header ([`crate::snapshot`]), which describes a region for a
+/// different reason and versions itself separately. The *fields* are the same question — what a
+/// region is — and writing them twice is how the two answers drift.
+pub fn encode_region_into(out: &mut Encoder, region: &Region) {
     out.put_varint(region.id);
     out.put_bytes(&region.start_key);
     out.put_bytes(&region.end_key);
@@ -61,7 +71,6 @@ pub fn encode_region(region: &Region) -> Vec<u8> {
         out.put_varint(peer.peer_id);
         out.put_u8(peer.role.as_u8());
     }
-    out.finish()
 }
 
 /// Reads a record written by [`encode_region`].
@@ -80,6 +89,17 @@ pub fn decode_region(bytes: &[u8]) -> Result<Region> {
             "region metadata record has format version {version}, expected {METADATA_FORMAT_VERSION}"
         )));
     }
+    decode_region_from(&mut input).and_then(|region| {
+        input.finish().map_err(|error| corrupt(&error))?;
+        Ok(region)
+    })
+}
+
+/// A region's fields, without the record's version byte and without consuming the input's end.
+///
+/// The counterpart of [`encode_region_into`], and the place every "is this region possible"
+/// check lives: bytes off a disk or a socket are never trusted (`CLAUDE.md` invariant 2).
+pub fn decode_region_from(input: &mut Decoder<'_>) -> Result<Region> {
     let id = input.get_varint("region.id").map_err(|e| corrupt(&e))?;
     let start_key = Bytes::copy_from_slice(
         input
@@ -113,7 +133,6 @@ pub fn decode_region(bytes: &[u8]) -> Result<Region> {
             role,
         });
     }
-    input.finish().map_err(|error| corrupt(&error))?;
 
     if peers.is_empty() {
         return Err(StoreError::Bootstrap(format!(
@@ -143,6 +162,79 @@ pub fn decode_region(bytes: &[u8]) -> Result<Region> {
 /// atomic on a peer rather than a sequence a crash can land inside.
 pub fn stage_region(batch: &mut WriteBatch, cf: u32, region: &Region) {
     batch.put(cf, &metadata_key(region.id), &encode_region(region));
+}
+
+/// Announces that a snapshot is being applied to a region, at `index`.
+///
+/// Written **before** anything else the receive touches, and removed only once the region is
+/// complete. Between the two, a restart finds the record and knows not to start the region: its
+/// data may be part of a snapshot and part of nothing, which is the one state that must never be
+/// served (`docs/plans/phase-4.md` §13.1).
+///
+/// It carries the whole region rather than just its id, and that is what makes the recovery
+/// possible: the keys a partial receive left behind are in the region's **range**, and a restart
+/// that knew only an id could not find them — nor could the retry, which would then refuse to
+/// start because the range it was given is not empty.
+pub fn stage_pending_snapshot(batch: &mut WriteBatch, cf: u32, region: &Region, index: u64) {
+    let mut out = Encoder::new();
+    out.put_u8(METADATA_FORMAT_VERSION);
+    out.put_varint(index);
+    encode_region_into(&mut out, region);
+    batch.put(cf, &pending_snapshot_key(region.id), &out.finish());
+}
+
+/// Removes the announcement, which is what makes the region complete.
+pub fn stage_snapshot_done(batch: &mut WriteBatch, cf: u32, region_id: u64) {
+    batch.delete(cf, &pending_snapshot_key(region_id));
+}
+
+/// Every region a snapshot was part-way into when this store last stopped, with the index each
+/// was being brought to.
+pub fn load_pending_snapshots(db: &Db) -> Result<Vec<(Region, u64)>> {
+    let mut iter = db.iter(cf::RAFT, &ReadOptions::default())?;
+    let mut pending = Vec::new();
+    iter.seek(&[raft_cf::PENDING_SNAPSHOT]);
+    while iter.valid() {
+        let key = iter.key();
+        if key.first() != Some(&raft_cf::PENDING_SNAPSHOT) {
+            break;
+        }
+        if key.len() != REGION_KEY_LEN {
+            return Err(StoreError::Bootstrap(format!(
+                "a pending-snapshot key is {} bytes, expected {REGION_KEY_LEN}",
+                key.len()
+            )));
+        }
+        let mut id = [0_u8; 8];
+        id.copy_from_slice(&key[1..]);
+        let region_id = u64::from_be_bytes(id);
+
+        let mut input = Decoder::new(iter.value());
+        let version = input
+            .get_u8("pending.version")
+            .map_err(|error| corrupt(&error))?;
+        if version != METADATA_FORMAT_VERSION {
+            return Err(StoreError::Bootstrap(format!(
+                "a pending-snapshot record has format version {version}, expected \
+                 {METADATA_FORMAT_VERSION}"
+            )));
+        }
+        let index = input
+            .get_varint("pending.index")
+            .map_err(|error| corrupt(&error))?;
+        let region = decode_region_from(&mut input)?;
+        input.finish().map_err(|error| corrupt(&error))?;
+        if region.id != region_id {
+            return Err(StoreError::Bootstrap(format!(
+                "the pending-snapshot record under key {region_id} says it is region {}",
+                region.id
+            )));
+        }
+        pending.push((region, index));
+        iter.next();
+    }
+    iter.status()?;
+    Ok(pending)
 }
 
 /// Adds the removal of a region's record to `batch`.

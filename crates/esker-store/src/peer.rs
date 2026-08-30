@@ -140,8 +140,28 @@ pub enum PeerMsg {
     },
     /// A snapshot of what this peer believes, for the request path and for tests.
     Status(oneshot::Sender<Status>),
+    /// What a follower needs to be sent: the metadata, and a pinned read of the data it names.
+    SnapshotSource(oneshot::Sender<std::result::Result<SnapshotSource, ProtoError>>),
     /// Stop the thread, failing everything outstanding.
     Stop,
+}
+
+/// Everything a leader needs to ship a region: the metadata, and a read pinned at the instant
+/// that metadata describes.
+///
+/// The two are taken **together, on the driver thread**, which is the whole reason this is a
+/// message rather than two accessors. The driver is the only thing that applies entries for this
+/// region, so between reading `applied_index` and pinning the engine snapshot nothing can move —
+/// and metadata that named an index the data did not include would let a follower skip entries it
+/// never received (`docs/plans/phase-4.md` §13.4).
+#[derive(Debug)]
+pub struct SnapshotSource {
+    /// Where the snapshot sits in the log, and the membership as of that index.
+    pub meta: esker_raft::SnapshotMeta,
+    /// The region as the sender holds it.
+    pub region: Region,
+    /// A pinned read of the data `meta.index` describes.
+    pub read: esker_engine::Snapshot,
 }
 
 /// A proposal waiting for its entry to apply.
@@ -551,6 +571,39 @@ impl PeerCore {
         self.reads = still_waiting;
     }
 
+    /// The metadata and the pinned read that go together, taken here because here is the only
+    /// place nothing can apply between the two.
+    fn snapshot_source(&self) -> std::result::Result<SnapshotSource, ProtoError> {
+        if self.applied_index == 0 {
+            return Err(ProtoError::Unsupported {
+                detail: format!(
+                    "region {} has applied nothing and has no snapshot to send",
+                    self.region_id
+                ),
+            });
+        }
+        let term = esker_raft::LogStorage::term(self.node.storage(), self.applied_index).map_err(
+            |error| {
+                ProtoError::internal(format!(
+                    "region {}: no term for its own apply index: {error}",
+                    self.region_id
+                ))
+            },
+        )?;
+        Ok(SnapshotSource {
+            meta: esker_raft::SnapshotMeta {
+                index: self.applied_index,
+                term,
+                // The membership **as of** the apply index, which is what a snapshot names and
+                // what its receiver adopts wholesale. The same value a compaction records, and
+                // for the same reason.
+                conf: self.applied_conf.clone(),
+            },
+            region: self.region.clone(),
+            read: self.node.storage().db().snapshot(),
+        })
+    }
+
     fn publish_leader(&self) {
         let leader = self.node.leader().unwrap_or(0);
         self.leader.store(leader, Ordering::Release);
@@ -592,6 +645,9 @@ impl PeerCore {
             PeerMsg::ReadIndex { notify } => self.read_index(notify),
             PeerMsg::Status(notify) => {
                 let _ = notify.send(self.node.status());
+            }
+            PeerMsg::SnapshotSource(notify) => {
+                let _ = notify.send(self.snapshot_source());
             }
             PeerMsg::Stop => return false,
         }
@@ -806,6 +862,15 @@ impl RaftPeer {
     /// Feeds one Raft message in.
     pub async fn step(&self, message: Message) -> std::result::Result<(), ProtoError> {
         self.send(PeerMsg::Raft(message)).await
+    }
+
+    /// What a follower needs to be sent, taken as one consistent pair on the driver thread.
+    pub async fn snapshot_source(&self) -> std::result::Result<SnapshotSource, ProtoError> {
+        let (notify, answer) = oneshot::channel();
+        self.send(PeerMsg::SnapshotSource(notify)).await?;
+        answer
+            .await
+            .map_err(|_| ProtoError::internal("the Raft peer stopped"))?
     }
 
     /// One logical tick.

@@ -22,12 +22,14 @@
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
+use bytes::Bytes;
 use esker_engine::{Db, LocalFileSystem, Options, WalSyncMode, WriteBatch, WriteOptions, cf};
 use esker_proto::{
     BoxFuture, Peer, PeerRole, ProtoError, RaftBatch, RawKvReq, RawKvResp, Region, Reply, Request,
-    RequestHeader, Response, Service, TransportConfig,
+    RequestHeader, Response, Service, SnapshotRequest, TransportConfig,
 };
 
+use crate::SNAPSHOT_STREAM_DEPTH;
 use crate::apply::Command;
 use crate::error::{Result, StoreError};
 use crate::heartbeat::{Heartbeats, RegionReport, StoreReport};
@@ -38,6 +40,7 @@ use crate::raft_log::RaftLogStorage;
 use crate::rawkv::{self, Limits};
 use crate::region::RegionMeta;
 use crate::regions::{RegionMap, RegionState};
+use crate::snapshot;
 use crate::split::{self, SplitOptions};
 use crate::transport::{PeerAddress, StoreAddress, StoreTransport};
 
@@ -195,6 +198,9 @@ pub struct Store {
     /// The store-wide tasks: the heartbeat schedule and the split checker, when there is a
     /// placement driver for either to talk to.
     background: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Regions a snapshot is being fetched for. A leader re-announces every heartbeat, and each
+    /// announcement would otherwise start another transfer of the same megabytes.
+    receiving: std::sync::Mutex<std::collections::BTreeSet<u64>>,
 }
 
 impl Store {
@@ -241,6 +247,26 @@ impl Store {
         // What this store hosts is what its own `'m'` records say — never what its configuration
         // says on a later open, and never what the placement driver currently believes. A
         // database with none is a fresh one, and only then is `options` a bootstrap.
+        // A snapshot that was part-way in when this store stopped left keys no region covers.
+        // They are cleared before anything else looks at the key space, so the retry finds the
+        // range it was promised and `may_receive` does not refuse it
+        // (`docs/plans/phase-4.md` §13.1).
+        for (region, index) in meta::load_pending_snapshots(&db)? {
+            let removed = snapshot::discard_range(&db, &region)?;
+            let mut batch = WriteBatch::new();
+            let cf_id = db.cf_id(cf::RAFT).ok_or_else(|| {
+                StoreError::Bootstrap("the `raft` column family is missing".into())
+            })?;
+            meta::stage_snapshot_done(&mut batch, cf_id, region.id);
+            db.write(batch, &WriteOptions { sync: true })?;
+            tracing::warn!(
+                region_id = region.id,
+                index,
+                removed,
+                "a snapshot was interrupted; its partial data was discarded"
+            );
+        }
+
         let mut hosted = meta::load_regions(&db)?;
         if hosted.is_empty() {
             hosted.extend(bootstrap(
@@ -287,6 +313,7 @@ impl Store {
             runtime: tokio::runtime::Handle::try_current().ok(),
             tickers: std::sync::Mutex::new(Vec::new()),
             background: std::sync::Mutex::new(Vec::new()),
+            receiving: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         });
 
         // The peers are started only now, because each of them needs a handle back to the store:
@@ -544,6 +571,102 @@ impl Store {
         Ok(true)
     }
 
+    /// Answers a follower's request for a region's contents with a stream of its pairs.
+    ///
+    /// Refused rather than served when the asking peer is not a member of the region: a store
+    /// that is not replicating a range has no claim to a copy of it, and a snapshot is the one
+    /// request that hands over a region wholesale.
+    ///
+    /// Refused, too, when this store cannot produce a snapshot at least as recent as the index the
+    /// follower was told about. A snapshot older than the announcement would leave a hole between
+    /// where the follower's log resumes and where the data actually reaches — the one shape a
+    /// follower cannot detect for itself.
+    ///
+    /// The reading runs on a **blocking thread** and pushes into the stream's bounded channel, so
+    /// a snapshot never buffers a region in memory and a slow reader slows the walk rather than
+    /// growing a queue.
+    async fn send_snapshot(
+        self: &Arc<Self>,
+        ask: SnapshotRequest,
+    ) -> std::result::Result<Reply, ProtoError> {
+        let state = self
+            .regions
+            .get(ask.region_id)
+            .ok_or(ProtoError::RegionNotFound {
+                region_id: ask.region_id,
+            })?;
+        if !state
+            .region()
+            .peers
+            .iter()
+            .any(|peer| peer.peer_id == ask.peer_id)
+        {
+            return Err(ProtoError::invalid(format!(
+                "peer {} is not a member of region {} and may not have a copy of it",
+                ask.peer_id, ask.region_id
+            )));
+        }
+        let peer = state.peer().map(Arc::clone).ok_or_else(|| {
+            ProtoError::invalid(format!(
+                "region {} is not replicated on this store",
+                ask.region_id
+            ))
+        })?;
+
+        let source = peer.snapshot_source().await?;
+        if source.meta.index < ask.index {
+            return Err(ProtoError::Unsupported {
+                detail: format!(
+                    "region {} can offer a snapshot at index {} but {} was asked for",
+                    ask.region_id, source.meta.index, ask.index
+                ),
+            });
+        }
+
+        let (sender, stream) = esker_proto::ChunkStream::channel(SNAPSHOT_STREAM_DEPTH);
+        let db = Arc::clone(&self.db);
+        let header = snapshot::SnapshotHeader {
+            region: source.region.clone(),
+            meta: source.meta.clone(),
+        };
+        tokio::spawn(async move {
+            if sender.send(header.encode()).await.is_err() {
+                return;
+            }
+            // The walk is synchronous engine work and the sending is not, so the two are joined
+            // by a channel rather than by one of them pretending to be the other.
+            let (chunks, mut chunk_rx) = tokio::sync::mpsc::channel::<Bytes>(1);
+            let region = header.region.clone();
+            let read = source.read;
+            let walk = tokio::task::spawn_blocking(move || {
+                snapshot::read_pairs(&db, &region, read, snapshot::CHUNK_TARGET_BYTES, |pairs| {
+                    chunks
+                        .blocking_send(snapshot::encode_pairs(&pairs))
+                        .map_err(|_| ProtoError::Closed {
+                            detail: "the snapshot's reader has gone".to_owned(),
+                        })
+                })
+            });
+            while let Some(chunk) = chunk_rx.recv().await {
+                if sender.send(chunk).await.is_err() {
+                    return;
+                }
+            }
+            match walk.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => sender.fail(error).await,
+                Err(error) => {
+                    sender
+                        .fail(ProtoError::internal(format!(
+                            "the snapshot walk failed: {error}"
+                        )))
+                        .await;
+                }
+            }
+        });
+        Ok(Reply::Stream(stream))
+    }
+
     /// Every region this store **leads**, with what the engine says it holds.
     ///
     /// Synchronous and not cheap — the engine walks each region's files and memtables — so it runs
@@ -648,7 +771,10 @@ impl Store {
     /// A batch for a region this store does not serve is dropped rather than refused: the sender
     /// cannot act on the answer — Raft has no "you sent that to the wrong place" — and answering
     /// would only teach it to retry something that will never work.
-    pub async fn receive_raft(&self, batch: RaftBatch) -> std::result::Result<(), ProtoError> {
+    pub async fn receive_raft(
+        self: &Arc<Self>,
+        batch: RaftBatch,
+    ) -> std::result::Result<(), ProtoError> {
         if self.transport.is_none() {
             return Err(ProtoError::invalid(
                 "this store does not replicate; it has no Raft peer to receive a batch",
@@ -656,6 +782,12 @@ impl Store {
         }
         for message in batch.messages {
             let Some(state) = self.regions.get(message.region_id) else {
+                if let Some((from, index)) = Self::snapshot_announcement(&message.message) {
+                    // A region this store does not host yet, and a leader offering to fill it.
+                    // This is how a peer added by `AddPeer` gets its data.
+                    self.start_snapshot(message.region_id, from, index);
+                    continue;
+                }
                 tracing::debug!(
                     region_id = message.region_id,
                     "dropped a Raft message for a region this store does not host"
@@ -682,6 +814,225 @@ impl Store {
             peer.step(message.message).await?;
         }
         Ok(())
+    }
+
+    /// Starts fetching a region from the peer that offered it, unless one is already in flight.
+    ///
+    /// Spawned rather than awaited: `receive_raft` answers a `RaftBatch` frame, and holding that
+    /// answer open for the length of a snapshot would stall every other region's Raft traffic on
+    /// the same connection. The leader keeps announcing until it sees the follower catch up, so
+    /// nothing is lost by returning immediately.
+    ///
+    /// **One at a time per region.** A leader re-announces every heartbeat, and each announcement
+    /// would otherwise start another transfer of the same megabytes.
+    fn start_snapshot(self: &Arc<Self>, region_id: u64, from_peer: u64, index: u64) {
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        {
+            let Ok(mut receiving) = self.receiving.lock() else {
+                return;
+            };
+            if !receiving.insert(region_id) {
+                return;
+            }
+        }
+        let store = Arc::clone(self);
+        runtime.spawn(async move {
+            match store.fetch_snapshot(region_id, from_peer, index).await {
+                Ok(()) => tracing::info!(region_id, index, "a region arrived by snapshot"),
+                Err(error) => tracing::warn!(
+                    region_id,
+                    index,
+                    %error,
+                    "a snapshot did not arrive; the leader will offer it again"
+                ),
+            }
+            if let Ok(mut receiving) = store.receiving.lock() {
+                receiving.remove(&region_id);
+            }
+        });
+    }
+
+    /// Pulls a region's contents from `from_peer` and adopts it, in the four durable steps of
+    /// `docs/plans/phase-4.md` §13.1.
+    ///
+    /// Nothing serves the region until the last of them, so a crash anywhere before it leaves a
+    /// store that does not host the region at all — and the announcement record it left behind is
+    /// what lets the next open clear the keys and the retry start from a clean range.
+    async fn fetch_snapshot(
+        self: &Arc<Self>,
+        region_id: u64,
+        from_peer: u64,
+        index: u64,
+    ) -> std::result::Result<(), ProtoError> {
+        let mut stream = self
+            .open_snapshot_stream(region_id, from_peer, index)
+            .await?;
+
+        // 1. The header says which region this is and which index it is as of.
+        let first = stream
+            .next_chunk()
+            .await
+            .ok_or_else(|| ProtoError::Closed {
+                detail: "the snapshot stream ended before its header".to_owned(),
+            })??;
+        let header = snapshot::SnapshotHeader::decode(&first)?;
+        if header.region.id != region_id {
+            return Err(ProtoError::invalid(format!(
+                "asked for region {region_id} and was sent {}",
+                header.region.id
+            )));
+        }
+        if self.regions.get(region_id).is_some() {
+            return Err(ProtoError::Unsupported {
+                detail: format!(
+                    "region {region_id} is already on this store; catching an existing peer up by \
+                     snapshot is not supported in this version (docs/plans/phase-4.md §13.2)"
+                ),
+            });
+        }
+
+        // 2. Announce, before a single key is written.
+        self.announce_snapshot(&header).await?;
+
+        // 3. The pairs, chunk by chunk. Each is checked before it is believed.
+        while let Some(chunk) = stream.next_chunk().await {
+            let chunk = chunk?;
+            let db = Arc::clone(&self.db);
+            blocking(move || {
+                let pairs = snapshot::decode_pairs(&chunk)?;
+                snapshot::stage_pairs(&db, &pairs)
+            })
+            .await?;
+        }
+
+        // 4. Adopt, in one batch, so the region becomes complete or stays absent.
+        self.adopt_snapshot(&header).await?;
+        self.host_region(header.region)?;
+        Ok(())
+    }
+
+    /// Connects to the peer that offered the snapshot and asks for it.
+    async fn open_snapshot_stream(
+        &self,
+        region_id: u64,
+        from_peer: u64,
+        index: u64,
+    ) -> std::result::Result<esker_proto::StreamResponse, ProtoError> {
+        let raft = self
+            .raft
+            .as_ref()
+            .ok_or_else(|| ProtoError::invalid("this store has no peer configuration"))?;
+        let address = raft
+            .peers
+            .iter()
+            .find(|peer| peer.peer_id == from_peer)
+            .map(|peer| peer.addr)
+            .ok_or_else(|| {
+                ProtoError::invalid(format!(
+                    "no address for peer {from_peer}, which offered a snapshot"
+                ))
+            })?;
+        // Which peer *this* store is in the region being fetched. The sender checks it against
+        // the region's membership, so a store with no claim to the range is refused a copy.
+        let peer_id = raft
+            .peers
+            .iter()
+            .find(|peer| peer.store_id == self.store_id)
+            .map_or(self.store_id, |peer| peer.peer_id);
+
+        // A connection of its own: a snapshot is megabytes and would sit in front of every Raft
+        // batch queued behind it on the shared store-pair connection.
+        let connection = esker_proto::TcpTransport::connect_with(address, raft.transport).await?;
+        connection
+            .call_stream(Request::Snapshot(SnapshotRequest {
+                region_id,
+                index,
+                peer_id,
+            }))
+            .await
+    }
+
+    /// Step 2: the announcement record, written before any key is.
+    async fn announce_snapshot(
+        &self,
+        header: &snapshot::SnapshotHeader,
+    ) -> std::result::Result<(), ProtoError> {
+        let cf_id = self.raft_cf()?;
+        let db = Arc::clone(&self.db);
+        let region = header.region.clone();
+        let index = header.meta.index;
+        blocking(move || {
+            snapshot::may_receive(&db, &region)?;
+            let mut batch = WriteBatch::new();
+            meta::stage_pending_snapshot(&mut batch, cf_id, &region, index);
+            db.write(batch, &WriteOptions { sync: true })
+                .map(|_| ())
+                .map_err(|error| crate::error::engine_to_proto(&error))
+        })
+        .await
+    }
+
+    /// Step 4: the region's record, the peer's raft state, and the announcement gone — one batch.
+    ///
+    /// Its log begins after the snapshot's index, and the membership it replays conf changes onto
+    /// is the one the snapshot names: the anchor rule of `91de89a`, applied to a peer with no
+    /// history at all.
+    async fn adopt_snapshot(
+        &self,
+        header: &snapshot::SnapshotHeader,
+    ) -> std::result::Result<(), ProtoError> {
+        let cf_id = self.raft_cf()?;
+        let db = Arc::clone(&self.db);
+        let region = header.region.clone();
+        let meta = header.meta.clone();
+        blocking(move || {
+            let mut batch = WriteBatch::new();
+            meta::stage_region(&mut batch, cf_id, &region);
+            let state = crate::raft_log::PersistedState {
+                hard_state: esker_raft::HardState {
+                    term: meta.term,
+                    voted_for: None,
+                    commit: meta.index,
+                },
+                conf_state: meta.conf.clone(),
+                applied_index: meta.index,
+                truncated_index: meta.index,
+                truncated_term: meta.term,
+            };
+            batch.put(
+                cf_id,
+                &crate::raft_log::state_key(region.id),
+                &state.encode(),
+            );
+            meta::stage_snapshot_done(&mut batch, cf_id, region.id);
+            db.write(batch, &WriteOptions { sync: true })
+                .map(|_| ())
+                .map_err(|error| crate::error::engine_to_proto(&error))
+        })
+        .await
+    }
+
+    /// The `raft` column family's id, or the failure that says the store was opened wrong.
+    fn raft_cf(&self) -> std::result::Result<u32, ProtoError> {
+        self.db.cf_id(cf::RAFT).ok_or_else(|| {
+            ProtoError::internal("the store opened without its `raft` column family")
+        })
+    }
+
+    /// Whether a Raft message is a leader saying "your log does not reach back far enough".
+    ///
+    /// Such a message is an **announcement**, not something to step: the core would restore a
+    /// snapshot whose data had not arrived, and the peer would claim an index it did not hold. The
+    /// data is fetched first ([`Store::fetch_snapshot`]) and the region is built from it.
+    fn snapshot_announcement(message: &esker_raft::Message) -> Option<(u64, u64)> {
+        match message {
+            esker_raft::Message::InstallSnapshot { from, snapshot, .. } => {
+                Some((*from, snapshot.meta.index))
+            }
+            _ => None,
+        }
     }
 
     /// Stops replication: the heartbeats, every ticker, every peer's thread, and every store
@@ -926,8 +1277,8 @@ fn whole_key_space(options: &BootstrapOptions<'_>) -> Region {
         None => Region::bootstrap(options.region_id, options.store_id, options.peer_id),
         Some(raft) => Region {
             id: options.region_id,
-            start_key: bytes::Bytes::new(),
-            end_key: bytes::Bytes::new(),
+            start_key: Bytes::new(),
+            end_key: Bytes::new(),
             peers: raft
                 .peers
                 .iter()
@@ -1061,6 +1412,11 @@ impl Service for StoreService {
                     return Err(ProtoError::invalid(
                         "Hello is handled by the connection, not by the store",
                     ));
+                }
+                // A follower asking for a region's contents. The answer is a stream, so it
+                // returns from here rather than falling through to the `RawKv` path below.
+                Request::Snapshot(ask) => {
+                    return store.send_snapshot(ask).await;
                 }
                 // A store is not a placement driver. Answering anything but a refusal — even a
                 // helpful-looking one — would let a misconfigured client believe it had reached

@@ -31,6 +31,7 @@
 //! | [`raft_log`] | the Raft log and the peer's persistent state, on the `raft` column family |
 //! | [`rawkv`] | the eight `RawKv` methods, over the engine, synchronously |
 //! | [`server`] | opening the database and its column families, and the wire service |
+//! | [`snapshot`] | shipping a region to a peer the log cannot catch up |
 //! | [`split`] | when a region is split, and where |
 //! | [`transport`] | one connection per store pair, carrying every region's messages per tick |
 //!
@@ -51,6 +52,7 @@ pub mod rawkv;
 pub mod region;
 pub mod regions;
 pub mod server;
+pub mod snapshot;
 pub mod split;
 pub mod transport;
 
@@ -82,9 +84,17 @@ pub mod raft_cf {
     pub const STATE: u8 = b's';
     /// `'m' ++ region_id:u64` → region metadata.
     pub const METADATA: u8 = b'm';
+    /// `'p' ++ region_id:u64` → a snapshot is part-way into this region.
+    ///
+    /// Written before a receive touches anything and removed when the region is adopted, so a
+    /// restart can tell a region that is complete from one that is half-built and must not be
+    /// served (`docs/plans/phase-4.md` §13.1). A **separate prefix** rather than a field on the
+    /// `'m'` record: that format has a golden test, and an addition beside it costs nothing while
+    /// a change to it would need an ADR and a version bump.
+    pub const PENDING_SNAPSHOT: u8 = b'p';
 
     /// Every prefix this column family uses.
-    pub const ALL: [u8; 3] = [LOG_ENTRY, STATE, METADATA];
+    pub const ALL: [u8; 4] = [LOG_ENTRY, STATE, METADATA, PENDING_SNAPSHOT];
 }
 
 /// A region is split once it grows past this many bytes (`docs/DESIGN.md` §14).
@@ -98,6 +108,12 @@ pub const REGION_HEARTBEAT_MS: u64 = 60_000;
 
 /// Size of one chunk of a streamed Raft snapshot, in bytes.
 pub const SNAPSHOT_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// How many snapshot chunks may be queued for the network before the walk waits.
+///
+/// Small on purpose: a snapshot is megabytes and the point of streaming it is that neither end
+/// holds a region in memory. Four chunks is enough to keep the socket busy while the next is read.
+pub const SNAPSHOT_STREAM_DEPTH: usize = 4;
 
 /// How far the log may run past its truncation point before it is compacted.
 ///

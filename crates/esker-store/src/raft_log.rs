@@ -84,6 +84,15 @@ pub fn metadata_key(region_id: u64) -> [u8; REGION_KEY_LEN] {
     key
 }
 
+/// `'p' ++ region_id`.
+#[must_use]
+pub fn pending_snapshot_key(region_id: u64) -> [u8; REGION_KEY_LEN] {
+    let mut key = [0_u8; REGION_KEY_LEN];
+    key[0] = raft_cf::PENDING_SNAPSHOT;
+    key[1..].copy_from_slice(&region_id.to_be_bytes());
+    key
+}
+
 /// Encodes one log entry's value: `version ++ term ++ index ++ kind ++ data`.
 ///
 /// The index is stored even though the key already carries it. It costs a varint and buys a
