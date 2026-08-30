@@ -1,0 +1,32 @@
+README.md
+  h_44076b318daf9c 1-73
+crates/esker-base/src/crc32c.rs
+  h_44076b318daf9c 14-15
+crates/esker-client/src/lib.rs
+  h_44076b318daf9c 32
+crates/esker-engine/src/lib.rs
+  h_44076b318daf9c 3
+crates/esker-raft/src/lib.rs
+  h_44076b318daf9c 13
+docs/adr/0001-architecture.md
+  h_44076b318daf9c 1-102
+docs/adr/0002-formats-are-hand-rolled.md
+  h_44076b318daf9c 1-68
+docs/adr/0003-dependencies.md
+  h_44076b318daf9c 1-94
+docs/adr/0004-esker-base.md
+  h_44076b318daf9c 1-51
+docs/plans/phase-0.md
+  h_44076b318daf9c 3,140-209
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "605407b7fc5982ee7b520df3ffd58d65fdca9018",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
