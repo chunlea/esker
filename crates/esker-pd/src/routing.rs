@@ -236,13 +236,13 @@ fn scan(db: &Db, kind: u8, mut visit: impl FnMut(&[u8]) -> Result<()>) -> Result
 
 /// The stores that have not been heard from for longer than `max_down_ms`.
 ///
-/// Recorded and exposed in 4a; **nothing acts on it**. Replica repair — adding a peer
-/// elsewhere when a store stays down — is 4c, and building the operator that does it before
-/// the sub-phase that owns it is exactly what `CLAUDE.md` says not to do.
+/// The verdict itself is [`crate::schedule::is_down`], so that the repair rule and this
+/// reporting view cannot come to disagree about what "down" means — the same reason
+/// `ProtoError::is_retryable` lives with the error rather than in the client.
 pub fn down_stores(stores: &[StoreRecord], now_ms: u64, max_down_ms: u64) -> Vec<u64> {
     stores
         .iter()
-        .filter(|store| now_ms.saturating_sub(store.last_heartbeat_ms) > max_down_ms)
+        .filter(|store| crate::schedule::is_down(store, now_ms, max_down_ms))
         .map(|store| store.store_id)
         .collect()
 }

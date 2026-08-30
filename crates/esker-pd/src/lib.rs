@@ -42,6 +42,7 @@ pub mod operator;
 pub mod pd;
 pub mod record;
 pub mod routing;
+pub mod schedule;
 pub mod service;
 pub mod tso;
 
@@ -51,6 +52,7 @@ pub use operator::{Cancelled, InFlight, Observed, Progress};
 pub use pd::{Bootstrapped, Pd, PdOptions, RegionRoute};
 pub use record::{ClusterRecord, RegionRecord, StoreRecord, StoreStats};
 pub use routing::{RegionBeat, StoreBeat, Upsert};
+pub use schedule::{Cluster, Repair};
 pub use service::PdService;
 
 /// Bits of the logical counter in a timestamp: `ts = physical_ms << 18 | logical`
