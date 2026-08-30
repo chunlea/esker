@@ -197,8 +197,13 @@ needed; the kill -9 loop still runs for real durability.
       `create_cf`/`drop_cf` (6d)
 - [x] step 7 — compaction: the picker (7a), `CompactionJob` and `CompactionFilter` (7b), the
       bounded pool, `compact_range` and the file-level wiring (7c)
-- [ ] step 8 — checkpoint + ingest *(next)*
-- [ ] step 9 — `esker-cli` tools + bench numbers
+- [x] step 8 — checkpoint + ingest (`db/{checkpoint,ingest}.rs`)
+- [x] step 9 — `esker-cli`: `sst-dump`/`wal-dump`/`manifest-dump` on the SST lane, `bench` and
+      the numbers in `docs/bench/phase-1.md` here
+
+Every step of `prompts/01-engine.md` is now implemented. What remains before the phase gate is
+the acceptance checklist itself — the 1,000-iteration crash loop and the coverage sweep on the
+test lane — and the DESIGN.md review.
 
 ## 10. Changes vs plan
 
@@ -260,3 +265,13 @@ needed; the kill -9 loop still runs for real durability.
     delete its inputs and write nothing.
 17. **A trivial move is skipped when a compaction filter is configured.** The move is only
     trivial while the output would be byte-identical, and a filter may change it.
+18. **Ingest refuses an overlapping range** rather than merging it. A file built elsewhere
+    carries another database's sequence numbers, so an overlap has no answer to "which version
+    is newer" that is not a guess. `RocksDB` rewrites them on the way in; that is v2. Both v1
+    callers — a region being moved, a table being created — hand over a range nothing holds.
+19. **A checkpoint flushes first and writes its manifest rather than copying one.** A memtable
+    cannot be hard-linked, and the source's manifest is a history referring to files the
+    checkpoint does not contain.
+20. **`bench --threads` defaults to 1 and `--duration-secs` to 0 (no limit).** A benchmark
+    whose defaults are ambitious measures the settings; one that stops after ten seconds
+    cannot produce the acceptance number.
