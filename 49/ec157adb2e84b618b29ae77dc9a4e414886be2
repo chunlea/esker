@@ -1,0 +1,35 @@
+crates/esker-sim/src/fault.rs
+  s_720b990b4c85a3::t_d8168c4b962b5c 52-58,79,142-152
+crates/esker-sim/src/raft/checkers.rs
+  s_720b990b4c85a3::t_8849f42c04f5bc 84-88,224-257,354,553-571,585-589
+crates/esker-sim/src/raft/cluster.rs
+  s_720b990b4c85a3::t_0df747b35b8d93 28,38,74-76,78-85,107,109-111,128-137,240-253,402-416,461-467,519-522,594-608,686-688,693-698,727-737,746-755,760-772,775-797,826,829,841,843-846,850-865,870-872,893-897,910-941,944-945,953-954,956,974,1057-1076
+crates/esker-sim/src/raft/driver.rs
+  s_720b990b4c85a3::t_a06cd4dab55772 34,81-98,181-182,198,283-291,319,325-328
+crates/esker-sim/src/raft/report.rs
+  s_720b990b4c85a3::t_005a24d9d2484a 82-112,184-204,299-318
+crates/esker-sim/tests/raft_checkers.rs
+  s_720b990b4c85a3::t_43f8a64e2dba50 29,289,301
+crates/esker-sim/tests/raft_persist_order.rs
+  s_720b990b4c85a3::t_2d85b36fb2c6ae 70-143
+crates/esker-sim/tests/raft_snapshot.rs
+  s_720b990b4c85a3::t_1b507ad376bca0 1-113
+crates/esker-sim/tests/raft_sweep.rs
+  s_720b990b4c85a3::t_82a0563305e1c4 24-28,203,208-209,217,235-236
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "49ec157adb2e84b618b29ae77dc9a4e414886be2",
+  "prompts": {},
+  "sessions": {
+    "s_720b990b4c85a3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "227f5c5f-560a-4117-b024-963f1ffc76a1",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
