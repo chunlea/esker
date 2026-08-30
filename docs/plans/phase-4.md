@@ -1,6 +1,6 @@
 # Phase 4 plan — many regions, and the driver that places them
 
-Status: **in progress** — 4a accepted, 4b done, 4c–4e gated. Written before implementation; §9 records progress
+Status: **in progress** — 4a and 4b accepted, 4c open, 4d–4e gated. Written before implementation; §9 records progress
 and §10 what changed. Spec: `prompts/04-multiraft-pd.md`. Constitution: `CLAUDE.md` (invariant 5 is
 this phase's whole subject). Design: `docs/DESIGN.md` §2, §6, §7, §9, §14.
 
@@ -45,7 +45,7 @@ wire. So:
 |---|---|---|
 | 4a | Regions and routing: many `RawNode`s per store, ownership checks, PD v1, the client's cache | **accepted** |
 | 4b | Split: size check, split key, the `Split` admin entry through Raft, epoch bumps | **done** (§12) |
-| 4c | Snapshot transfer and peer movement: `checkpoint(range)` streamed, `AddPeer`/`RemovePeer`, replica repair | after 4b |
+| 4c | Snapshot transfer and peer movement: `checkpoint(range)` streamed, `AddPeer`/`RemovePeer`, replica repair | now (§13) |
 | 4d | Balance: leader and region-count operators, `esker-cli region ls/split/transfer-leader` | after 4c |
 | 4e | PD high availability: three PDs replicated with `esker-raft`, TSO high-water mark through Raft | after 4d |
 
@@ -500,3 +500,135 @@ Two smaller things worth recording:
   exercises the log, the apply and the batching but not the network. `tests/cluster.rs` covers the
   network for phase-3's single region; the multi-store split belongs to the phase-4 simulator's
   battery, which is the acceptance lane's.
+
+## 13. Sub-phase 4c — snapshot transfer and peer movement
+
+Spec: `prompts/04-multiraft-pd.md` 4c, `docs/DESIGN.md` §6's Snapshots bullet — whose phase-4
+qualifier comes off in the commit that implements it. The races it targets are §6's rows 2 and 3:
+split vs. snapshot, and remove-peer vs. crash.
+
+4b divided a region. 4c **moves** one: a peer that has fallen too far behind, or one that has just
+been created on a store with none of the data, is caught up by shipping the region's files rather
+than its log. That is the first time bytes cross the wire other than as a Raft entry, and the first
+time a region exists on a store that never had it.
+
+### 13.1 The thing that has to be true, and the shape it forces
+
+**A snapshot is never half-visible.** A region whose data is partly the snapshot's and partly its
+own is a stale-read machine: it answers from a state no peer ever had. Every design decision below
+is downstream of that one sentence.
+
+The receive is therefore staged so that a crash lands in one of three places, each of which a
+restart can name:
+
+| Step | Durable after it | A crash here leaves |
+|---|---|---|
+| 1. Announce | `'p' ++ region_id`: *a snapshot for index N is being applied* | a marked region that is not started and not served |
+| 2. Stage | the files, in a temp directory under the store's | the same, plus files nothing references |
+| 3. Ingest | one manifest edit — atomic, all files or none | the same, plus data in the range |
+| 4. Adopt | `'m'` record + the peer's raft state, and the `'p'` record gone | the region, complete |
+
+On open, a region with a `'p'` record is **not started**. Whether its ingest landed is one seek: the
+range was empty when the snapshot was announced (step 1 refuses otherwise), so *any* key in it means
+step 3 completed and step 4 is all that is left. Both branches resume without ever serving a
+half-state.
+
+`'p'` is a **new prefix**, not a field added to the `'m'` record. The `'m'` format has a golden test
+one sub-phase old, and an addition beside it costs nothing while a change to it would need an ADR
+and a version bump — the same reasoning as `Command`'s tag 6 in 4b.
+
+### 13.2 The two engine and core gaps this ran into
+
+Reported rather than worked around, per this lane's standing instruction.
+
+**`Db::ingest` refuses any overlap, tombstones included** (`crates/esker-engine/src/db/ingest.rs`,
+and it says so: sequence-number rewriting is a v2 feature). A receiver that already held keys in
+the range cannot clear them and then ingest — the deletes leave tombstones, which are keys in the
+range, which ingest refuses. **So 4c only applies a snapshot into a range this store holds nothing
+in**, which is exactly the case 4c creates: a peer added to a store that never had the region. A
+peer that does hold data is refused with a typed error and stays behind; PD sees it in the
+heartbeats. `TODO(post-v1)`: the engine's own v2 sequence-number rewriting removes the restriction.
+
+**`esker-raft` exposes no per-peer `Progress`.** `RawNode::status()` gives the leader its own
+commit, applied and last index, and `ConfState`; there is no `match_index` per follower. The
+learner-promotion criterion `prompts/04` asks for — "promote to voter when caught up" — is a
+statement about a follower's match index, and the store cannot see one. 13.4 says what is used
+instead and why it is sound; the accessor is requested for 4d, where the balance operators want the
+same number to decide whether a transfer is safe.
+
+### 13.3 Units (one commit each)
+
+| # | Unit | Files |
+|---|---|---|
+| 0 | This section | `docs/plans/phase-4.md` |
+| 1 | `Db::approximate_size`, and 4b's byte counter replaced by it | `esker-engine/src/db/**` (granted), `esker-store/src/split.rs`, `server.rs` |
+| 2 | Raft log compaction: `'s'`'s truncation fields written, a real `LogStorage::snapshot` | `esker-store/src/raft_log.rs`, `peer.rs` |
+| 3 | Send: `checkpoint(range)` → `Stream` frames, chunked and checksummed | `esker-store/src/snapshot.rs` (NEW), `esker-proto/src/messages.rs` |
+| 4 | Receive: the four steps of §13.1, and the restart that resumes them | `esker-store/src/snapshot.rs`, `meta.rs`, `server.rs` |
+| 5 | `AddPeer`/`RemovePeer`: conf-change entries, learner first | `esker-store/src/apply.rs`, `peer.rs`, `regions.rs` |
+| 6 | Operators from heartbeat responses: propose, dedupe, drop the stale | `esker-store/src/heartbeat.rs`, `pd.rs` |
+| 7 | The test battery | `esker-store/tests/snapshot.rs` (NEW), `tests/cluster.rs` |
+| 8 | DESIGN §6's Snapshots bullet, and this section closed | `docs/DESIGN.md`, this plan |
+
+### 13.4 Decisions worth writing down before the code
+
+**The Raft message carries the metadata; the files travel beside it.** `InstallSnapshot` goes out
+with `Snapshot::data` **empty** and its `meta` real. `esker-raft` reads only the meta — that is why
+it can handle snapshots in a crate that does no I/O (`types.rs`) — so nothing is lost, and a 96 MiB
+Raft message is not something the frame limit or the message queue should ever see. The receiver
+does not `step` the message until the files are in: the core restoring first would leave a peer
+claiming an index whose data had not arrived.
+
+**A chunk that fails restarts the whole snapshot.** No resume, no per-chunk retransmit. A snapshot
+is idempotent and cheap to redo relative to the bookkeeping that resuming needs, and a partial
+transfer is already discarded by §13.1's staging. Stated here because it is a deliberate v1
+simplification rather than an oversight.
+
+**The checkpoint pins one apply index.** `Db::checkpoint` flushes and then pins a version, so the
+files describe the state at some sequence number. The snapshot's `meta.index` must be an apply
+index that state actually includes — so the driver reads its own `applied_index` **before** the
+checkpoint runs and the checkpoint is taken on the driver's thread, where nothing else can apply in
+between. A meta ahead of the data would let a follower skip entries it never received.
+
+**Learner first, and the promotion criterion the store can actually evaluate.** `AddPeer` adds a
+**learner**: it receives the log and the snapshot without voting, so adding one never makes a
+quorum harder to reach while it catches up — which is the whole reason for the two-step. Promotion
+to voter needs "caught up", and §13.2 says the match index is not visible. What *is* visible, and
+is a sound sufficient condition, is: **the snapshot transfer to that learner completed, and the
+leader has since committed an entry at a term it still leads in.** The first says the learner holds
+everything through `meta.index`; the second says the leader is still the leader and the log has
+moved on with the learner in it. It is more conservative than a match index — a learner that is
+catching up by log replay alone is promoted later than it needs to be — and being late costs a
+delay, while being early costs a quorum that cannot be reached.
+
+**`RemovePeer` tears down the raft state, not the data.** The region's `'l'` entries, `'s'` state
+and `'m'` record go; the keys in `default` stay. Deleting them would mean point deletes over the
+whole range (the engine has no range tombstones in v1, ADR 0006), leaving tombstones that block a
+later `ingest` into the same range — the very thing §13.2 describes. So the data is left, is served
+by nothing, and is reclaimed when the store is next asked to hold a region overlapping it, which is
+when it becomes a problem worth solving. Documented, not silent.
+
+**The anchor rule, for a peer built from a snapshot.** Its `conf_state` comes from the snapshot's
+`meta.conf` — the membership as of `meta.index`, which is the index its log now begins after. Same
+rule as `91de89a`, same reason, third place it applies.
+
+### 13.5 Test list
+
+| Area | Tests |
+|---|---|
+| compaction | the log truncates behind the apply index; `first_index` moves; `term` still answers at the boundary; the configuration written with the truncation is the one as of it |
+| snapshot meta | a compacted log offers a snapshot whose `index`/`term`/`conf` match the truncation record; an uncompacted one still offers nothing |
+| send | the chunk stream is the checkpoint's files, in order, each checksummed; a region's range and nothing else |
+| receive | the four steps land in order; a chunk with a bad checksum aborts without touching the database |
+| the crash matrix | killed after each of §13.1's steps: the restart shows the peer pre-snapshot or fully post-snapshot, and a resumed receive reaches the same state as an uninterrupted one |
+| conf change | `AddPeer` adds a learner; a learner's acknowledgement never counts toward a quorum; promotion happens only under 13.4's criterion; `RemovePeer` leaves no raft state and no route |
+| operators | a heartbeat response's operator is proposed once; the same operator seen twice is proposed once; one against a stale epoch is dropped with a trace |
+| cluster | three stores, a fourth added: learner → snapshot → voter → an old peer removed, with data verified at every step |
+
+### 13.6 Non-goals for 4c
+
+- **Replica repair driven by PD** — the scheduler that notices a store is down and issues the
+  operators. That is the placement-driver lane's; this lane consumes the operators it sends.
+- **`TransferLeader`.** The operator variant is reserved in the contract and ignored here. 4d.
+- **Merge, balance, `esker-cli region`.** Post-v1 and 4d.
+- **Resuming a partial snapshot.** See 13.4.
