@@ -388,7 +388,9 @@ its own gap register, and it would be longer.
 - [x] 1b — the syntax corpus: 353 statements, oracle-verified, 70 gaps registered in §9
 - [x] 1c — the feature recognizer: all 353 answered by a parse or an honest `0A000`, none a syntax
   error; `TABLE`/`ABORT` rewritten as the documented synonyms they are
-- [ ] 2 — pgwire
+- [~] 2 — pgwire: **2a landed** (framing, message codec, startup + `NegotiateProtocolVersion`,
+  `ErrorResponse` fields, goldens, decoder fuzz). 2b is the session state machine and the simple
+  query protocol; 2c the extended protocol; 2d the `tokio` listener and a real `psql` smoke test
 - [ ] 3 — row and tuple encodings
 - [ ] 4 — catalog
 - [ ] 5 — backend trait and fake
@@ -408,6 +410,25 @@ its own gap register, and it would be longer.
 - *A second risk appeared and was closed the same day* (§8.1b): the dependency's own recursion
   limit is 50, which rejects SQL that PostgreSQL accepts. It was found by measuring, not by
   reading, which is the argument for building the corpus next rather than last.
+
+**Unit 2a.** The goldens are recorded, not written. A proxy between `psql` 18.6 and the
+PostgreSQL 19beta1 container logged both directions of five real sessions, and
+`tests/golden/pgwire.hex` is 26 byte strings taken straight out of that log. Three details came
+back different from what the specification alone would have suggested, and each is now pinned by a
+test:
+
+- **`NegotiateProtocolVersion` is followed by the ordinary startup sequence**, not sent instead of
+  it. Asking PostgreSQL 19 for minor version 9 produced a real one to check against, and asking with
+  an unknown `_pq_.` parameter produced the variant that lists options by name.
+- **Committing an already-failed transaction reports the command tag `ROLLBACK`**, not `COMMIT`.
+  Nothing would have caught that but a capture.
+- **In protocol 3.2 the cancel key is 32 bytes, not 4** — visible as a 40-byte `BackendKeyData` in
+  the 3.2 capture against 12 bytes in the 3.0 one. Since we negotiate down to 3.0 we send the short
+  form, but it confirms that answering 3.2 as though it were 3.0 would corrupt the stream.
+
+The encoder matched all 14 captured backend messages byte for byte on the first run, which is
+evidence for the goldens being right rather than for the encoder being clever: the same reading of
+the specification produced both, and the capture is the only independent party.
 
 **Unit 1b.** The corpus was going to be written from the PostgreSQL documentation. It is instead
 written against a **running PostgreSQL 19beta1**, because a container of the target release turned

@@ -44,6 +44,7 @@
 
 pub mod error;
 pub mod parse;
+pub mod pgwire;
 pub mod sqlstate;
 
 pub use error::{Result, Severity, SqlError};
