@@ -1,0 +1,56 @@
+# Golden message bodies (docs/DESIGN.md 9), produced by an independent encoder.
+# body = tag:u16 LE ++ fields. The tag is the method in a request or a response and the
+# error code in an Error frame. Integers are LEB128 varints unless marked fixed; byte
+# strings are varint-length-prefixed; an optional is a present flag then the value, so an
+# empty value and an absent one are different bytes.
+#
+# Every RawKv request carries the header { region_id, epoch{conf_ver, version}, peer }
+# right after its method tag; here that is { 1, {2, 3}, 4 }.
+#
+# Methods: Hello 0x0001; RawKv Get 0x0101, BatchGet 0x0102, Put 0x0103, BatchPut 0x0104,
+# Delete 0x0105, DeleteRange 0x0106, Scan 0x0107, CompareAndSwap 0x0108.
+# Hello's version is a FIXED four-byte little-endian integer: it is the one message every
+# version must be able to read, so its layout can never change.
+
+request hello 010001000000
+request get 010101020304036b6579
+request batch-get 0201010203040201610162
+request put 030101020304016b017601
+request put-unsynced 030101020304016b017600
+request batch-put 04010102030402016101310162013201
+request delete 050101020304016b01
+request delete-range 0601010203040161016d01
+request scan 0701010203040161017a6400
+request scan-reverse 070101020304017a000001
+request cas 080101020304016b01036f6c6401036e657701
+request cas-absent 080101020304016b000001
+
+response hello 0100010000000780808008
+response get 0101010176
+response get-absent 010100
+response get-empty 01010100
+response batch-get 02010201016100
+response put 0301
+response batch-put 0401
+response delete 0501
+response delete-range 060111
+response scan 0701020161013101620132
+response cas-failed 080100010661637475616c
+response cas-swapped 08010100
+
+error not-leader 0100010107
+error not-leader-blind 01000100
+error epoch-not-match 0200020100016d01020101020102016d00010201010302
+error key-not-in-region 0300017a030161016d
+error server-is-busy 04000b7772697465207374616c6c
+error locked 050003010203
+error region-not-found 060009
+error wire-version 07000102
+error invalid-request 080015756e6b6e6f776e206d6574686f6420307830393939
+error unsupported 09001b44656c65746552616e6765206f766572203130303030206b657973
+error corrupt 0a00056672616d6511636865636b73756d206d69736d61746368
+error io 0b000b62726f6b656e2070697065
+error closed 0c000e706565722077656e742061776179
+error duplicate-id 0d002a
+error internal 0e000d706f69736f6e6564206c6f636b
+error not-sent 0f0012636f6e6e656374696f6e2072656675736564

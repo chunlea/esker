@@ -38,11 +38,15 @@
 pub mod codec;
 pub mod error;
 pub mod frame;
+pub mod messages;
 pub mod region;
 
 pub use codec::{DecodeError, Decoder, Encoder};
 pub use error::{ProtoError, RequestOutcome};
 pub use frame::{FRAME_HEADER_SIZE, Frame, FrameDecoder, FrameKind, MAX_BODY_SIZE, MAX_FRAME_SIZE};
+pub use messages::{
+    Hello, HelloAck, Method, RawKvReq, RawKvResp, Request, RequestHeader, Response,
+};
 pub use region::{Epoch, Peer, PeerRole, Region};
 
 /// Version of the framing and of every message encoding. Negotiated when a connection opens;
