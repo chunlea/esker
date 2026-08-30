@@ -1,0 +1,19 @@
+crates/esker-pd/src/routing.rs
+  s_8dc89cd8f6be19::t_d7a5f450adf5e1 14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "b6bac86944fcf604fdfbcbfdf1f9109e960e8b1d",
+  "prompts": {},
+  "sessions": {
+    "s_8dc89cd8f6be19": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "20caabd3-7fb9-42f6-a519-04be2a284eef",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
