@@ -135,6 +135,7 @@ dependencies = [
  "esker-base",
  "esker-client",
  "esker-engine",
+ "esker-pd",
  "esker-proto",
  "esker-sim",
  "esker-store",

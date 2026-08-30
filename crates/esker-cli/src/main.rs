@@ -12,6 +12,7 @@ mod bench_remote;
 mod bytes;
 mod cluster;
 mod manifest_dump;
+mod pd;
 mod raw;
 mod server;
 mod sst_dump;
@@ -106,6 +107,13 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(reason) => {
                 eprintln!("esker cluster: {reason}");
+                ExitCode::from(EXIT_FAILURE)
+            }
+        },
+        Ok(Command::Pd(command)) => match pd::run(&command) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(reason) => {
+                eprintln!("esker pd: {reason}");
                 ExitCode::from(EXIT_FAILURE)
             }
         },

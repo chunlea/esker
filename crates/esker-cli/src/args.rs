@@ -29,6 +29,7 @@ use std::path::PathBuf;
 use crate::bench::{Run as BenchOptions, Workload};
 use crate::cluster::ClusterOptions;
 use crate::manifest_dump::DumpOptions as ManifestDumpOptions;
+use crate::pd::{InspectOptions, PdCommand, ServeOptions};
 use crate::raw::{RawCommand, RawOptions, from_hex};
 use crate::server::ServerOptions;
 use crate::sst_dump::DumpOptions;
@@ -55,6 +56,8 @@ pub(crate) enum Command {
     Server(ServerOptions),
     /// Start or stop a local cluster of stores replicating one region.
     Cluster(ClusterOptions),
+    /// Run the placement driver, or print what it has stored.
+    Pd(PdCommand),
 }
 
 /// Why the arguments could not be understood.
@@ -81,6 +84,8 @@ pub(crate) enum ParseError {
     MissingArgument(&'static str),
     /// A `raw` verb this build does not know.
     UnknownRawCommand(String),
+    /// A `pd` verb this build does not know.
+    UnknownPdCommand(String),
     /// `--hex` was given and an argument is not hex.
     InvalidHex(String),
 }
@@ -108,6 +113,10 @@ impl fmt::Display for ParseError {
             ParseError::UnknownRawCommand(verb) => write!(
                 formatter,
                 "unknown raw command `{verb}`; expected get, put, delete or scan"
+            ),
+            ParseError::UnknownPdCommand(verb) => write!(
+                formatter,
+                "unknown pd command `{verb}`; expected serve or inspect"
             ),
             ParseError::InvalidHex(value) => write!(
                 formatter,
@@ -139,6 +148,7 @@ Commands:
   raw <verb> ...        Read or write keys over the network
   server                Open a store and serve the RawKV API
   cluster start|stop    Start or stop a local cluster replicating one region
+  pd serve|inspect      Run the placement driver, or print what it has stored
 
 Options:
   -V, --version         Print the version
@@ -224,6 +234,7 @@ where
         "raw" => parse_raw(&arguments[1..]),
         "server" => parse_server(&arguments[1..]),
         "cluster" => parse_cluster(&arguments[1..]),
+        "pd" => parse_pd(&arguments[1..]),
         other if other.starts_with('-') => Err(ParseError::UnknownFlag(other.to_owned())),
         other => Err(ParseError::UnknownCommand(other.to_owned())),
     }
@@ -466,6 +477,53 @@ fn parse_manifest_dump(arguments: &[String]) -> Result<Command, ParseError> {
 ///
 /// The verb decides how many bare words are expected, so a missing value is named rather than
 /// silently defaulted — the same rule the rest of this parser follows.
+/// `esker pd serve|inspect [--data-dir PATH] [--listen HOST:PORT]`.
+fn parse_pd(arguments: &[String]) -> Result<Command, ParseError> {
+    let Some(verb) = arguments.first() else {
+        return Err(ParseError::MissingArgument("a pd command"));
+    };
+    if verb == "--help" || verb == "-h" || verb == "help" {
+        return Ok(Command::Help);
+    }
+
+    let mut serve = ServeOptions::default();
+    let mut inspect = InspectOptions::default();
+    let mut index = 1;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        index += 1;
+
+        if argument == "--help" || argument == "-h" {
+            return Ok(Command::Help);
+        }
+        let (flag, inline) = match argument.split_once('=') {
+            Some((flag, value)) => (flag, Some(value.to_owned())),
+            None => (argument.as_str(), None),
+        };
+
+        match flag {
+            "--data-dir" => {
+                let path = PathBuf::from(take_value(arguments, &mut index, inline, "--data-dir")?);
+                serve.data_dir.clone_from(&path);
+                inspect.data_dir = path;
+            }
+            "--listen" => {
+                serve.listen = take_value(arguments, &mut index, inline, "--listen")?;
+            }
+            other if other.starts_with('-') => {
+                return Err(ParseError::UnknownFlag(other.to_owned()));
+            }
+            other => return Err(ParseError::UnexpectedArgument(other.to_owned())),
+        }
+    }
+
+    match verb.as_str() {
+        "serve" => Ok(Command::Pd(PdCommand::Serve(serve))),
+        "inspect" => Ok(Command::Pd(PdCommand::Inspect(inspect))),
+        other => Err(ParseError::UnknownPdCommand(other.to_owned())),
+    }
+}
+
 fn parse_server(arguments: &[String]) -> Result<Command, ParseError> {
     let mut options = ServerOptions::default();
     let mut index = 0;
