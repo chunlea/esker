@@ -1,6 +1,6 @@
 # Phase 4a — the placement driver, lane `cl-p4-pd`
 
-Status: **4a and 4c landed** (§10, §12). The lane plan for `crates/esker-pd/**`, the `Pd` service section of
+Status: **4a, 4c and 4d landed** (§10, §12, §13). The lane plan for `crates/esker-pd/**`, the `Pd` service section of
 `crates/esker-proto/**`, and the `esker pd` subcommand. It hangs under `docs/plans/phase-4.md`,
 which the store lane owns and which pins the cross-lane contract in its §3; nothing here may
 contradict that file. Spec: `prompts/04-multiraft-pd.md` (4a), `docs/DESIGN.md` §7 and §9,
@@ -340,4 +340,60 @@ and applied index an operator's progress is read from.
 - **In-flight operators are invisible to `esker pd inspect`**, which opens a stopped PD's
   database. Live operators need a status endpoint on a running PD — an observability item for
   4d, not a gap in the durable state.
+
+---
+
+## 13. 4d — balance (PD side)
+
+| # | Unit | Commit |
+|---|---|---|
+| 1 | `TransferLeader` on the wire with goldens | **landed in 4c** — encoded and reserved then, precisely so 4d would not change the format |
+| — | Effective counts: the load an operator has already committed to moving | `feat(pd): a scheduler that counts the moves it has already asked for` |
+| 2, 3 | Leader balance and region balance, with the cooldown | `feat(pd): leader balance and region balance, and the gap that is not one` |
+| 4 | The fairness simulation | `test(pd): a hundred regions split 60/30/10, converging and then stopping` |
+| 5 | The persisted operator history, and `pd inspect` | `feat(pd): the ring that says what PD asked the cluster to do` |
+| 6 | DESIGN §7 and §14, ADR 0018 | `docs(design): balance, and the arithmetic that makes it stop` |
+
+### 13.1 The numbers
+
+100 regions at 60/30/10 across three stores settle to **[33, 34, 33] in two rounds**; leadership
+at 60/30/10 settles to **[34, 33, 33] in one**. A thousand further rounds produce **no operator at
+all** — which is the assertion that matters, because a balancer that converges and then churns
+looks identical to a settled one in a snapshot of the counts.
+
+The region convergence costs 120 operators against a theoretical minimum near 54. A region on the
+middle store moves to the empty store early and a region from the full store then takes its
+place: every decision was right when it was made, and only the whole sequence is more than the
+minimum. That is the price of deciding one region at a time on its own heartbeat, and ADR 0018
+argues it is worth paying.
+
+### 13.2 Changes vs the brief
+
+1. **Unit 1 was already done.** `TransferLeader` went on the wire in 4c with its golden, reserved
+   for exactly this. Nothing in `esker-proto` changed for 4d — which also kept this lane clear of
+   a `messages.rs` that three other lanes were editing.
+2. **The history is persisted, not a memory ring.** The brief asks for it in `pd inspect`, and
+   `pd inspect` opens a *stopped* PD's database — an in-memory ring would always print empty
+   there. One bounded record on disk makes the unit's stated purpose true, and it survives the
+   restart that loses the in-flight set.
+3. **`PdOptions` takes a filesystem.** The fairness tests drive 100,000 heartbeats and every one
+   is a durable write; on a real disk that is eight minutes of `fsync` for a property with
+   nothing to do with durability. They run on `esker_engine::memfs`. Nothing about invariant 1 is
+   relaxed — the crash tests keep a real disk.
+4. **The 1,000-round soak is `--ignored`; 100 rounds run inline.** A hundred rounds is twenty
+   cooldown periods, so anything that oscillates does it many times over before the inline run is
+   done; the full thousand is one `--ignored` command away.
+5. **A cooling region may still finish its own move.** The cooldown stops a region being picked up
+   again; stranding it over-replicated for five minutes with the second half of its own move
+   outstanding is not what it is for.
+
+### 13.3 Not built, deliberately
+
+- **No global optimiser.** ADR 0018 records why the greedy per-region rule is the right trade
+  under a heartbeat-driven scheduler, and what it costs.
+- **No store-level operator limit.** Effective counts make one unnecessary for convergence; if a
+  future workload wants to cap concurrent movement for I/O reasons rather than for correctness,
+  that is a knob and not a redesign.
+- **No `esker-cli region` subcommands.** `region ls / split / transfer-leader` are the store
+  lane's unit 3.
 

@@ -443,8 +443,22 @@ durable state is what 4a ships, and it is a single point of failure by design ra
   store liveness, in-flight set). A re-derived `AddPeer` mints a *fresh* peer id from the persisted
   allocator: reusing one PD has forgotten could put two peers under one id while the first is still
   being added.
-- **Scheduling still to come (4d):** leader balance and region-count balance. `TransferLeader` is on the
-  wire and reserved; nothing issues one yet.
+- **Balance (4d):** leader count and region count are spread across live stores, one region decided on
+  its own heartbeat like everything else. A move is proposed only when the gap between the busiest and
+  quietest store is **at least two**, because a move takes one from the busy store and gives one to the
+  quiet one — so acting on a gap of one would turn 5 vs 4 into 4 vs 5 for ever, while acting at two makes
+  every move strictly reduce the spread and the cluster settle at a gap of at most one and stop
+  ([ADR 0018](adr/0018-balance-moves-the-spread-by-two.md)). Counts are **effective** counts: an
+  operator's effect is applied when it is issued and withdrawn when it retires, so a round of decisions
+  is a sequence rather than a hundred independent readings of the same stale numbers. Region count is
+  decided before leader count, because moving a replica takes any leadership of that region with it; a
+  replica move is add-then-remove, and the leader's own replica is not the one that moves. A per-region
+  `balance_cooldown` is a second guard against a store whose reports lag; repair ignores it, and so does
+  the second half of a move already begun. Balance can be switched off with repair left on.
+- **Operator history.** The last 64 operator events — issued, done, cancelled, timed out — are kept in
+  one bounded record on disk, so `esker pd inspect` can say what PD asked a cluster to do after the
+  process is gone. A debugging record only: no decision reads it, and losing it costs an explanation
+  rather than a repair.
 - **Tools:** `esker pd serve --data-dir --listen` runs it; `esker pd inspect --data-dir` prints the whole
   state above, including the range index beside the records it points at.
 
@@ -645,6 +659,9 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
 | `max_store_down_time` | 30 s |
 | `operator_timeout` | 300 s, measured from the last observed progress |
 | `target_replicas` | 3 |
+| `balance_cooldown` | 300 s per region, after an operator retires |
+| leader / region spread threshold | 2 (a constant, not a knob — see ADR 0018) |
+| PD operator history | 64 events |
 | txn lock TTL | 3 s (heartbeat-extended) |
 | transport (`TransportConfig`) | §9 has the table — seven knobs, listed there because each one only means something next to the rule it bounds |
 | store WAL sync mode | `Never` — the engine adds no `fsync` of its own, so each request's `sync` flag decides (§4.2, and `CLAUDE.md` invariant 1's opt-out) |
