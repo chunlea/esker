@@ -1,0 +1,140 @@
+# Phase 0 plan — scaffold the workspace
+
+Status: **in progress** (written before implementation; "Changes vs plan" filled in at the end).
+Spec: `prompts/00-scaffold.md`. Constitution: `CLAUDE.md`. Design: `docs/DESIGN.md`.
+
+## 1. Scope
+
+Produce the skeleton every later phase builds on: a Cargo workspace, the lint/dependency guard
+rails, the in-house primitives that are forbidden to come from crates.io, the memcomparable key
+codec, a deterministic simulator skeleton, and a CLI shell. No storage, consensus or network
+logic beyond those skeletons.
+
+## 2. Crate layout
+
+Eleven crates. Ten come from the prompt; `esker-base` is the "tiny crate if cleaner" the prompt
+explicitly allows, and it is cleaner here for one reason: `crc32c`, varints, `hash64` and the
+seeded RNG are needed by `esker-engine`, `esker-proto` and `esker-sim` alike. Putting them in
+`esker-keys` would force `esker-engine` to depend on `esker-keys`, and invariant 7 says the
+engine must not depend on key semantics. `esker-base` carries no key semantics, so the layering
+stays honest.
+
+| Crate | Phase 0 content |
+|---|---|
+| `esker-base` | `crc32c`, `varint`, `hash64`, `Pcg32` — the in-house primitives |
+| `esker-keys` | memcomparable codec, reserved prefixes, `enc_ts`/`dec_ts` |
+| `esker-engine` | doc comment + invariants + `crc32c` re-export (keeps DESIGN.md §4.5 true) |
+| `esker-raft` | doc comment + invariants (pure state machine, no I/O) |
+| `esker-store` | doc comment + invariants |
+| `esker-pd` | doc comment + invariants |
+| `esker-txn` | doc comment + invariants |
+| `esker-proto` | doc comment + invariants + `WIRE_VERSION` |
+| `esker-client` | doc comment + invariants |
+| `esker-sim` | `Clock`, injected `Pcg32`, `Network` trait, `SimNetwork`, `FaultPlan` |
+| `esker-cli` | hand-written arg parsing, `bench` stub, `tests/dep_budget.rs` |
+
+Skeleton crates are not empty: each states its responsibility and the invariants from `CLAUDE.md`
+that bind it, and each has at least one real test so `cargo test` is meaningful from day one.
+
+## 3. File list
+
+```
+rust-toolchain.toml            channel = "stable" (this machine defaults to nightly)
+Cargo.toml                     workspace.package / .dependencies / .lints
+deny.toml                      bans + the dependency budget marker
+justfile                       check / test / bench / sim / fmt / clippy / deny / doc
+.github/workflows/ci.yml       just check on ubuntu + macos
+README.md                      short overview, pointers to CLAUDE.md and DESIGN.md
+docs/adr/0001-architecture.md
+docs/adr/0002-formats-are-hand-rolled.md
+docs/adr/0003-dependencies.md
+docs/adr/0004-esker-base.md    why an eleventh crate exists
+docs/bench/README.md           how benchmark numbers get recorded
+docs/plans/phase-0.md          this file
+crates/esker-base/src/{lib,crc32c,varint,hash,rng}.rs
+crates/esker-keys/src/{lib,codec,prefix}.rs
+crates/esker-keys/tests/{golden.rs,proptest_codec.rs}
+crates/esker-keys/tests/golden/keys.txt
+crates/esker-sim/src/{lib,clock,net,fault}.rs
+crates/esker-sim/tests/determinism.rs
+crates/esker-cli/src/{main,args}.rs
+crates/esker-cli/tests/dep_budget.rs
+crates/esker-{engine,raft,store,pd,txn,proto,client}/src/lib.rs
+```
+
+## 4. Public API sketch
+
+```rust
+// esker-base
+mod crc32c { pub fn checksum(&[u8]) -> u32; pub fn update(u32, &[u8]) -> u32; }
+mod varint { pub fn put_u64(u64, &mut Vec<u8>); pub fn get_u64(&[u8]) -> Result<(u64, usize)>;
+             pub fn zigzag_encode(i64) -> u64; pub fn zigzag_decode(u64) -> i64;
+             pub fn encoded_len_u64(u64) -> usize; /* u32 variants */ }
+mod hash   { pub fn fnv1a64(&[u8]) -> u64; pub fn hash64(&[u8]) -> u64;
+             pub fn hash64_with_seed(u64, &[u8]) -> u64; }
+mod rng    { pub struct Pcg32; new(seed, seq) / from_seed(seed) / next_u32 / next_u64 /
+             below(u32) / range(u64, u64) / chance(f64) / fill_bytes / shuffle }
+
+// esker-keys
+pub fn encode_u64(u64, &mut Vec<u8>);  pub fn decode_u64(&[u8]) -> Result<(u64, &[u8])>;
+pub fn encode_i64(i64, &mut Vec<u8>);  pub fn decode_i64(&[u8]) -> Result<(i64, &[u8])>;
+pub fn encode_bytes(&[u8], &mut Vec<u8>); pub fn decode_bytes(&[u8]) -> Result<(Vec<u8>, &[u8])>;
+pub enum Value { U64, I64, Bytes }  pub enum ValueKind { .. }
+pub fn encode_tuple(&[Value], &mut Vec<u8>);
+pub fn decode_tuple(&[ValueKind], &[u8]) -> Result<(Vec<Value>, &[u8])>;
+pub fn enc_ts(u64) -> [u8; 8];  pub fn dec_ts(&[u8]) -> Result<u64>;
+pub mod prefix { RAW, TXN, SQL, META, SQL_ROW, SQL_INDEX + small key builders }
+
+// esker-sim
+pub struct Millis(u64);  pub struct Clock;      // logical time, monotonic
+pub trait Network { fn send(&mut self, NodeId, Bytes) -> Result<()>; fn try_recv(&mut self) -> Option<Envelope>; }
+pub struct FaultPlan { drop, duplicate, reorder, min_latency_ms, max_latency_ms, reorder_extra_ms }
+pub struct SimNetwork { new(seed, plan) / node(id) / send / step / run_until / trace }
+pub enum TraceEvent { Sent, Dropped, Duplicated, Delivered }
+```
+
+## 5. Test list
+
+| Area | Tests |
+|---|---|
+| `crc32c` | golden `crc32c("123456789") == 0xE306_9283` + 5 more published vectors; hardware path equals software path on random input; `update` chaining equals one-shot; proptest |
+| `varint` | golden byte vectors; round-trip proptest; boundary lengths (1/2/…/10 bytes); truncated and overlong input return errors, never panic; zigzag round-trip |
+| `hash64` | published FNV-1a vectors; determinism; avalanche smoke test |
+| `Pcg32` | the reference PCG stream for `(seed 42, seq 54)`; `below()` never returns `>= bound`; same seed ⇒ same stream |
+| `esker-keys` | golden file `tests/golden/keys.txt`; proptest round-trip (≥1000 cases); proptest **order preservation** per type; explicit `len % 8 == 0` prefix-free cases; explicit `enc_ts` direction test (`a < b ⇒ enc_ts(a) > enc_ts(b)`); malformed input returns errors |
+| `esker-sim` | same seed ⇒ identical trace twice; different seed ⇒ different trace (guards against a vacuous test); each fault kind is observable in a trace |
+| `esker-cli` | arg-parser unit tests; `dep_budget` (runtime crate count ≤ budget in `deny.toml`, and no crate matches a ban pattern) |
+| every other crate | one real test (invariant constants / doc-level assertions) so `cargo test` covers the whole workspace |
+
+## 6. Risks and how they are handled
+
+1. **Nightly default toolchain.** Handled first: `rust-toolchain.toml` pins stable, verified with
+   `rustup show active-toolchain` inside the repo.
+2. **Workspace lints that do not apply.** `lints.workspace = true` must be in *every* crate;
+   otherwise clippy passes while the constitution is violated. Checked by grepping all manifests.
+3. **Memcomparable prefix-freeness.** An input of length `k*8` still gets a trailing padded group.
+   Property tests must include `len % 8 == 0` inputs explicitly, not just random ones.
+4. **`enc_ts` direction.** Round-trip tests pass with the order inverted, so there is a separate
+   explicit ordering test.
+5. **Self-consistent crypto/PRNG.** `crc32c` and `Pcg32` are checked against *published* vectors;
+   proptests alone would happily bless a wrong algorithm.
+6. **Simulator nondeterminism.** No `HashMap` in the event loop, no `Instant`, no OS entropy; the
+   queue is a `BTreeMap` keyed by `(deliver_at, seq)` so ties have a total order.
+7. **A vacuous `cargo deny`.** Verified once by temporarily adding a banned crate and confirming
+   `cargo deny check` fails, then reverting.
+8. **Dependency counting across platforms.** `cargo metadata` without `--filter-platform` counts the
+   Windows dependency tree too; the budget test filters to the host triple, and `deny.toml` lists
+   the two targets we actually build.
+
+## 7. Non-goals for this phase
+
+- No WAL, memtable, SST, manifest or compaction code (phase 1).
+- No Raft state machine, no RPC framing, no server (phases 2–3).
+- No linearizability/bank checker in `esker-sim` (phase 3+), no link partitions yet.
+- No benchmarks with real numbers; `esker-cli bench` prints "not implemented".
+- No `sqlparser`, no S3/TLS decisions (phase 6).
+- No performance tuning of any kind; correctness and guard rails only.
+
+## 8. Changes vs plan
+
+Filled in at the end of the phase.
