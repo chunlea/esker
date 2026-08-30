@@ -153,8 +153,23 @@ pub struct PeerCore {
     reads: Vec<PendingRead>,
     /// Published for the request path, which must not wait on the driver just to learn who leads.
     leader: Arc<AtomicU64>,
+    /// Published beside it, for the same reason and one more: a region heartbeat carries the
+    /// leader's term and apply index, and a heartbeat round that asked the driver for them would
+    /// queue behind whatever `fsync` it is in the middle of.
+    published: Arc<Published>,
     /// How far the state machine has been driven. Reads wait for this, not for the commit index.
     applied_index: Index,
+}
+
+/// What the driver publishes for readers that must not wait on it.
+///
+/// Three independent atomics rather than one lock: nothing reads two of them and needs them to
+/// agree. A heartbeat that reports last tick's term beside this tick's apply index reports a
+/// state the peer really passed through, and the next heartbeat corrects it either way.
+#[derive(Debug, Default)]
+pub struct Published {
+    term: AtomicU64,
+    applied: AtomicU64,
 }
 
 impl PeerCore {
@@ -317,6 +332,12 @@ impl PeerCore {
     fn publish_leader(&self) {
         let leader = self.node.leader().unwrap_or(0);
         self.leader.store(leader, Ordering::Release);
+        self.published
+            .term
+            .store(self.node.status().term, Ordering::Release);
+        self.published
+            .applied
+            .store(self.applied_index, Ordering::Release);
     }
 
     fn not_leader(&self) -> ProtoError {
@@ -445,6 +466,7 @@ pub struct RaftPeer {
     region_id: u64,
     peer_id: NodeId,
     leader: Arc<AtomicU64>,
+    published: Arc<Published>,
     thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -464,6 +486,8 @@ impl RaftPeer {
         })?;
 
         let leader = Arc::new(AtomicU64::new(0));
+        let published = Arc::new(Published::default());
+        published.applied.store(applied_index, Ordering::Release);
         let core = PeerCore {
             node,
             transport,
@@ -472,6 +496,7 @@ impl RaftPeer {
             pending: Vec::new(),
             reads: Vec::new(),
             leader: Arc::clone(&leader),
+            published: Arc::clone(&published),
             applied_index,
         };
 
@@ -489,6 +514,7 @@ impl RaftPeer {
             region_id: options.region_id,
             peer_id: options.peer_id,
             leader,
+            published,
             thread: std::sync::Mutex::new(Some(thread)),
         }))
     }
@@ -520,6 +546,24 @@ impl RaftPeer {
     #[must_use]
     pub fn is_leader(&self) -> bool {
         self.leader() == Some(self.peer_id)
+    }
+
+    /// The term this peer was last in, without asking the driver thread.
+    ///
+    /// A heartbeat's worth of freshness, not a decision's: it is what the driver published at the
+    /// end of its last round, so a peer that changed term microseconds ago still reports the old
+    /// one. Nothing decides anything on it — the region heartbeat carries it, and the next one
+    /// corrects it.
+    #[must_use]
+    pub fn term(&self) -> Term {
+        self.published.term.load(Ordering::Acquire)
+    }
+
+    /// How far the state machine has applied, without asking the driver thread. Same freshness
+    /// rule as [`RaftPeer::term`].
+    #[must_use]
+    pub fn applied_index(&self) -> Index {
+        self.published.applied.load(Ordering::Acquire)
     }
 
     /// The error a non-leader answers with.

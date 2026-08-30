@@ -26,7 +26,20 @@ tracing.workspace = true
 # synchronous engine off the reactor, and nothing else here is async.
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros"] }
 
+[features]
+# Exposes `esker_store::pd::FakePd`, the in-memory placement driver the bootstrap and heartbeat
+# tests drive. Off by default, on the same reasoning as `esker-client`'s: a normal build carries
+# no machinery whose only caller is a test.
+testing = []
+
 [dev-dependencies]
+# The crate's own test harness, for integration tests that link the library as an ordinary
+# dependency and so cannot reach `#[cfg(test)]` code.
+esker-store = { path = ".", features = ["testing"] }
+# `tests/multi_region.rs` hand-builds the region records a split would leave behind, which means
+# writing into the `raft` column family directly. Already a runtime dependency; listed again so
+# the integration tests can name it.
+esker-engine.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["net", "time"] }
 

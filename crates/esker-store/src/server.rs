@@ -30,7 +30,9 @@ use esker_proto::{
 
 use crate::apply::Command;
 use crate::error::{Result, StoreError};
+use crate::heartbeat::{Heartbeats, RegionReport, StoreReport};
 use crate::meta;
+use crate::pd::{PdClient, StoreInfo};
 use crate::peer::{PeerOptions, RaftPeer};
 use crate::raft_log::RaftLogStorage;
 use crate::rawkv::{self, Limits};
@@ -59,6 +61,21 @@ pub struct StoreOptions {
     /// straight to the engine — which is what phase 2 built and what the CLI's `server` command
     /// still starts.
     pub raft: Option<RaftOptions>,
+    /// The placement driver, when there is one. Setting it means [`Store::open`] must be called
+    /// from inside a `tokio` runtime, because the heartbeat schedule is a task.
+    ///
+    /// `None` is a store that bootstraps its own region from [`StoreOptions::region_id`] and
+    /// sends no heartbeats — phase 2's single node and phase 3e's static cluster, both of which
+    /// the CLI still starts. With one, the bootstrap question is PD's to answer and this store
+    /// reports to it on the schedule of `docs/DESIGN.md` §14.
+    pub pd: Option<Arc<dyn PdClient>>,
+    /// Where other stores and clients reach this one, as PD should record it. Only read when
+    /// [`StoreOptions::pd`] is set.
+    pub address: String,
+    /// What one heartbeat tick is worth. The intervals of `docs/DESIGN.md` §14 are counted in
+    /// these ([`crate::heartbeat::Heartbeats`]), so this is the resolution of the schedule and
+    /// not its period.
+    pub heartbeat_tick: std::time::Duration,
 }
 
 /// How this store's region is replicated.
@@ -112,6 +129,9 @@ impl StoreOptions {
             region_id: 1,
             limits: Limits::new(),
             raft: None,
+            pd: None,
+            address: String::new(),
+            heartbeat_tick: std::time::Duration::from_millis(esker_raft::TICK_MS),
             engine: Options {
                 create_if_missing: true,
                 wal_sync_mode: WalSyncMode::Never,
@@ -152,6 +172,8 @@ pub struct Store {
     /// fifty timers where one wheel would do, which is the same sharding decision as the apply
     /// worker's and belongs with it.
     tickers: Vec<tokio::task::JoinHandle<()>>,
+    /// The task that reports to the placement driver, when there is one.
+    heartbeats: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Store {
@@ -162,6 +184,14 @@ impl Store {
     /// engine imposes no column family and the store creates the set — so creating three of
     /// them later, when `esker-txn` and `esker-raft` arrive, would mean a format change to
     /// every database made before then.
+    ///
+    /// Which regions the store hosts comes from its own `'m'` records ([`crate::meta`]). Only a
+    /// database with none is a bootstrap, and only then do [`StoreOptions::region_id`] and
+    /// [`StoreOptions::peer_id`] — or the placement driver — decide anything.
+    ///
+    /// **Must be called from inside a `tokio` runtime when [`StoreOptions::raft`] or
+    /// [`StoreOptions::pd`] is set**: the peer connections and the heartbeat schedule are tasks.
+    /// A store with neither is exactly phase 2's and needs no runtime at all.
     pub fn open(path: impl AsRef<Path>, options: StoreOptions) -> Result<Arc<Self>> {
         let StoreOptions {
             store_id,
@@ -170,6 +200,9 @@ impl Store {
             limits,
             engine,
             raft,
+            pd,
+            address,
+            heartbeat_tick,
         } = options;
         let db = Db::open_with(path, engine, Arc::new(LocalFileSystem::new()), &cf::BUILTIN)?;
 
@@ -188,14 +221,16 @@ impl Store {
         // database with none is a fresh one, and only then is `options` a bootstrap.
         let mut hosted = meta::load_regions(&db)?;
         if hosted.is_empty() {
-            // TODO(phase-4a unit 5): ask the placement driver whether to bootstrap and for the
-            // ids to bootstrap with, rather than taking them from the options.
-            hosted.push(bootstrap_region(
+            hosted.extend(bootstrap(
                 &db,
-                region_id,
-                store_id,
-                peer_id,
-                raft.as_ref(),
+                &BootstrapOptions {
+                    region_id,
+                    store_id,
+                    peer_id,
+                    address: &address,
+                    raft: raft.as_ref(),
+                    pd: pd.as_ref(),
+                },
             )?);
         }
 
@@ -243,7 +278,7 @@ impl Store {
             "store opened"
         );
 
-        Ok(Arc::new(Self {
+        let store = Arc::new(Self {
             db,
             regions,
             store_id,
@@ -251,7 +286,92 @@ impl Store {
             write_gate: RwLock::new(()),
             transport,
             tickers,
-        }))
+            heartbeats: std::sync::Mutex::new(None),
+        });
+        if let Some(pd) = pd {
+            store.spawn_heartbeats(pd, heartbeat_tick);
+        }
+        Ok(store)
+    }
+
+    /// Starts the task that reports to the placement driver.
+    ///
+    /// The schedule itself counts ticks and reads no clock ([`crate::heartbeat`]); this is the
+    /// edge that turns a `tokio` interval into those ticks — the same shape as a peer's ticker,
+    /// and for the same reason. A tick that is late because the process was busy is skipped
+    /// rather than replayed: `MissedTickBehavior::Delay` would make a stalled store send a burst
+    /// of identical heartbeats the moment it recovered.
+    fn spawn_heartbeats(self: &Arc<Self>, pd: Arc<dyn PdClient>, tick: std::time::Duration) {
+        let store = Arc::downgrade(self);
+        let store_id = self.store_id;
+        let task = tokio::spawn(async move {
+            let mut beats = Heartbeats::new(pd, store_id, tick);
+            let mut interval = tokio::time::interval(tick);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let Some(store) = store.upgrade() else {
+                    return;
+                };
+                let report = store.report();
+                drop(store);
+                beats.tick(&report);
+            }
+        });
+        if let Ok(mut slot) = self.heartbeats.lock() {
+            *slot = Some(task);
+        }
+    }
+
+    /// What this store looks like right now, for one heartbeat round.
+    ///
+    /// Every number is read without waiting on a driver thread: the regions come from the map and
+    /// the Raft numbers from what each driver publishes. A round that asked each peer in turn
+    /// would queue behind whatever `fsync` each was in the middle of, and a store with fifty
+    /// regions would report a state fifty `fsync`s old.
+    #[must_use]
+    pub fn report(&self) -> StoreReport {
+        let regions = self
+            .regions
+            .states()
+            .into_iter()
+            .map(|state| {
+                let region = state.region().clone();
+                match state.peer() {
+                    Some(peer) => RegionReport {
+                        leader_peer_id: peer.leader().unwrap_or(0),
+                        is_leader: peer.is_leader(),
+                        term: peer.term(),
+                        applied_index: peer.applied_index(),
+                        approximate_size: 0,
+                        region,
+                    },
+                    // An unreplicated region has no consensus to lead, and this store is the only
+                    // one that can serve it — which is what a leader is for PD's purposes.
+                    None => RegionReport {
+                        leader_peer_id: region
+                            .peers
+                            .iter()
+                            .find(|peer| peer.store_id == self.store_id)
+                            .map_or(0, |peer| peer.peer_id),
+                        is_leader: true,
+                        term: 0,
+                        applied_index: 0,
+                        approximate_size: 0,
+                        region,
+                    },
+                }
+            })
+            .collect();
+        // TODO(phase-4b): `approximate_size` per region from SST properties plus the memtable,
+        // and `applied_bytes` from the same measurement. 4b's split trigger is the first thing
+        // that needs a number here rather than a zero.
+        StoreReport {
+            capacity: 0,
+            available: 0,
+            applied_bytes: 0,
+            regions,
+        }
     }
 
     /// Every region this store hosts, indexed by id and by range.
@@ -323,8 +443,14 @@ impl Store {
         Ok(())
     }
 
-    /// Stops replication: every ticker, every peer's thread, and every store connection.
+    /// Stops replication: the heartbeats, every ticker, every peer's thread, and every store
+    /// connection.
     pub fn stop(&self) {
+        if let Ok(mut task) = self.heartbeats.lock()
+            && let Some(task) = task.take()
+        {
+            task.abort();
+        }
         for ticker in &self.tickers {
             ticker.abort();
         }
@@ -477,28 +603,86 @@ impl Store {
     }
 }
 
-/// Creates the region a fresh store starts with: id 1, covering `["", "")`
-/// (`docs/DESIGN.md` §7, "the first store to register receives region 1").
+/// What a bootstrap needs to know, so the function that does it takes one argument rather than
+/// six positional ones.
+struct BootstrapOptions<'a> {
+    region_id: u64,
+    store_id: u64,
+    peer_id: u64,
+    address: &'a str,
+    raft: Option<&'a RaftOptions>,
+    pd: Option<&'a Arc<dyn PdClient>>,
+}
+
+/// Decides what a store with no region records of its own should host, and writes the records.
 ///
-/// Its `'m'` record is written **fsynced, before the store serves anything**, because it is what
-/// every later open reads to learn what this store hosts. A bootstrap that served a request before
-/// the record was durable could acknowledge a write into a region that, after a crash, this store
-/// no longer believes it has.
+/// Two shapes, and the difference between them is who answers the question.
+///
+/// * **With a placement driver**, the answer is PD's: it registers this store and says whether
+///   this call is the one that bootstrapped the cluster. Exactly one store in the life of a
+///   cluster is told to create region 1 (`docs/DESIGN.md` §7); every other store gets `None` and
+///   hosts **nothing** until PD places a region on it — which is 4c's work, and until then a
+///   perfectly honest empty store rather than a second claim to the whole key space.
+/// * **Without one**, the answer is the options': region 1 covering everything, which is what
+///   phase 2's single node and phase 3e's static cluster are and what the CLI still starts.
+///
+/// A PD that cannot be reached is a hard failure rather than a fallback to the second shape. A
+/// store that bootstrapped its own region 1 because PD was down would be a second claim to every
+/// key in the cluster, and the two would not find out until a client asked one of them.
+///
+/// The records are written **fsynced, before the store serves anything**, because they are what
+/// every later open reads. A bootstrap that served a request before the record was durable could
+/// acknowledge a write into a region that, after a crash, this store no longer believes it has.
+fn bootstrap(db: &Arc<Db>, options: &BootstrapOptions<'_>) -> Result<Option<Region>> {
+    let region = match options.pd {
+        Some(pd) => {
+            let answer = pd.bootstrap(&StoreInfo {
+                store_id: options.store_id,
+                address: options.address.to_owned(),
+            })?;
+            tracing::info!(
+                store_id = options.store_id,
+                cluster_id = answer.cluster_id,
+                bootstrapping = answer.region.is_some(),
+                "registered with the placement driver"
+            );
+            let Some(region) = answer.region else {
+                tracing::info!(
+                    store_id = options.store_id,
+                    "the cluster already exists; this store hosts nothing until a region is placed on it"
+                );
+                return Ok(None);
+            };
+            region
+        }
+        None => whole_key_space(options),
+    };
+
+    let cf_id = db
+        .cf_id(cf::RAFT)
+        .ok_or_else(|| StoreError::Bootstrap("the `raft` column family is missing".into()))?;
+    let mut batch = WriteBatch::new();
+    meta::stage_region(&mut batch, cf_id, &region);
+    db.write(batch, &WriteOptions { sync: true })?;
+    tracing::info!(
+        store_id = options.store_id,
+        region_id = region.id,
+        peers = region.peers.len(),
+        "bootstrapped a region covering the whole key space"
+    );
+    Ok(Some(region))
+}
+
+/// Region 1 as a store with no placement driver makes it: `["", "")`, at the initial epoch.
 ///
 /// A replicated region lists every peer in [`RaftOptions::peers`], not just this store's: a
 /// `NotLeader` hint names a *peer*, and only the list turns that into the store a client should
 /// send to instead (`docs/DESIGN.md` §10).
-fn bootstrap_region(
-    db: &Arc<Db>,
-    region_id: u64,
-    store_id: u64,
-    peer_id: u64,
-    raft: Option<&RaftOptions>,
-) -> Result<Region> {
-    let region = match raft {
-        None => Region::bootstrap(region_id, store_id, peer_id),
+fn whole_key_space(options: &BootstrapOptions<'_>) -> Region {
+    match options.raft {
+        None => Region::bootstrap(options.region_id, options.store_id, options.peer_id),
         Some(raft) => Region {
-            id: region_id,
+            id: options.region_id,
             start_key: bytes::Bytes::new(),
             end_key: bytes::Bytes::new(),
             peers: raft
@@ -508,20 +692,7 @@ fn bootstrap_region(
                 .collect(),
             epoch: esker_proto::Epoch::INITIAL,
         },
-    };
-    let cf_id = db
-        .cf_id(cf::RAFT)
-        .ok_or_else(|| StoreError::Bootstrap("the `raft` column family is missing".into()))?;
-    let mut batch = WriteBatch::new();
-    meta::stage_region(&mut batch, cf_id, &region);
-    db.write(batch, &WriteOptions { sync: true })?;
-    tracing::info!(
-        store_id,
-        region_id = region.id,
-        peers = region.peers.len(),
-        "bootstrapped a region covering the whole key space"
-    );
-    Ok(region)
+    }
 }
 
 /// Starts one region's Raft peer: its log storage, and its view of the store-pair transport.

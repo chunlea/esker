@@ -23,7 +23,9 @@
 //! | [`region`] | the epoch and key-range checks every request runs |
 //! | [`regions`] | every region this store hosts, indexed by id and by range |
 //! | [`apply`] | what a Raft entry carries, and what applying one does to the data |
+//! | [`heartbeat`] | when a store talks to the placement driver, counted in ticks |
 //! | [`meta`] | the `'m' ++ region_id` record: which regions this store hosts, on disk |
+//! | [`pd`] | the placement driver's five store-facing methods, behind a trait |
 //! | [`peer`] | one region's `RawNode`, its driver thread, and the `Ready` loop |
 //! | [`raft_log`] | the Raft log and the peer's persistent state, on the `raft` column family |
 //! | [`rawkv`] | the eight `RawKv` methods, over the engine, synchronously |
@@ -37,7 +39,9 @@
 
 pub mod apply;
 pub mod error;
+pub mod heartbeat;
 pub mod meta;
+pub mod pd;
 pub mod peer;
 pub mod raft_log;
 pub mod rawkv;
@@ -48,6 +52,8 @@ pub mod transport;
 
 pub use apply::Command;
 pub use error::{Result, StoreError, engine_to_proto};
+pub use heartbeat::{Heartbeats, RegionReport, StoreReport};
+pub use pd::{Bootstrapped, PdClient, RegionHeartbeat, RegionRoute, StoreHeartbeat, StoreInfo};
 pub use peer::{Applied, DiscardTransport, PeerOptions, RaftPeer, RaftTransport};
 pub use raft_log::{PersistedState, RaftLogStorage};
 pub use rawkv::Limits;
