@@ -1,0 +1,19 @@
+docs/plans/phase-4.md
+  s_8dc89cd8f6be19::t_34667e6899541f 130-138,219-246,265-311
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "66b1b7553f80f10f8c9418c225a32aa1c46c3204",
+  "prompts": {},
+  "sessions": {
+    "s_8dc89cd8f6be19": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "20caabd3-7fb9-42f6-a519-04be2a284eef",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
