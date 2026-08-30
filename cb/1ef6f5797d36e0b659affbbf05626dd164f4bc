@@ -1,0 +1,23 @@
+Cargo.lock
+  s_04c6c85b29b28a::t_61423ffc9c769e 194
+crates/esker-pd/Cargo.toml
+  s_04c6c85b29b28a::t_5eef0235dedadb 33-36
+crates/esker-pd/tests/loopback.rs
+  s_04c6c85b29b28a::t_490276567403d9 1-256
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "cb1ef6f5797d36e0b659affbbf05626dd164f4bc",
+  "prompts": {},
+  "sessions": {
+    "s_04c6c85b29b28a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0e874339-89db-44c7-acd5-0deac94983ec",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
