@@ -7,6 +7,7 @@ use bytes::Bytes;
 
 use crate::config::Config;
 use crate::core::{Raft, Role, Status};
+use crate::election::CampaignKind;
 use crate::error::{RaftError, Result};
 use crate::message::Message;
 use crate::storage::LogStorage;
@@ -155,10 +156,13 @@ impl<S: LogStorage> RawNode<S> {
     ///
     /// Exists so a test or the simulator can drive an election deterministically instead of
     /// ticking until one happens by itself.
-    #[allow(clippy::unnecessary_wraps)] // TODO(step-1): campaigning reads the log, which can fail.
     pub fn campaign(&mut self) -> Result<()> {
-        // TODO(step-1): campaign.
-        Ok(())
+        let kind = if self.raft.pre_vote {
+            CampaignKind::PreElection
+        } else {
+            CampaignKind::Election
+        };
+        self.raft.campaign(kind)
     }
 
     /// Asks the leader to hand leadership to `target` (§3.10).
@@ -211,6 +215,13 @@ impl<S: LogStorage> RawNode<S> {
             self.raft.log.applied_to(last.index);
             self.raft.conf.commit_to(last.index);
         }
+    }
+
+    /// The state machine underneath, for the crate's own tests: they exercise paths — a transfer
+    /// campaign, a forced conf change — that no public method reaches on its own yet.
+    #[cfg(test)]
+    pub(crate) fn raft_mut(&mut self) -> &mut Raft<S> {
+        &mut self.raft
     }
 
     /// What this node currently believes.

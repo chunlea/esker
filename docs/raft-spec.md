@@ -16,7 +16,7 @@ Paths are relative to `crates/esker-raft/src/`. Test names are the `#[test]` fun
 | # | Rule | Implemented by | Tested by |
 |---|---|---|---|
 | S1 | `currentTerm`: latest term seen, initialised to 0, **persistent** | `types::HardState::term`, `core::Raft::term` | `a_fresh_node_is_a_follower_of_nobody` |
-| S2 | `votedFor`: candidate voted for in `currentTerm`, or none, **persistent** | `types::HardState::voted_for`, `core::Raft::vote` | TBD (step 1) |
+| S2 | `votedFor`: candidate voted for in `currentTerm`, or none, **persistent** | `types::HardState::voted_for`, `election::Raft::handle_vote_request` | `the_ready_that_grants_a_vote_carries_the_vote_it_recorded`, `a_recorded_vote_survives_a_restart_and_is_not_cast_twice` |
 | S3 | `log[]`: entries with a command and the term when received, **persistent**, first index 1 | `types::Entry`, `storage::LogStorage`, `log::RaftLog` | `appended_entries_come_back_by_index_and_term` |
 | S4 | `commitIndex`, `lastApplied`: volatile, initialised to 0 | `log::RaftLog::committed`, `log::RaftLog::applied` | `committed_entries_are_handed_out_once_and_in_order` |
 | S5 | `nextIndex[]`, `matchIndex[]`: volatile on leaders, reinitialised after election | `progress::Progress::{next, matched}`, `core::Raft::rebuild_progress` | TBD (step 2) |
@@ -44,8 +44,8 @@ Arguments: `term`, `candidateId`, `lastLogIndex`, `lastLogTerm`. Results: `term`
 
 | # | Rule | Implemented by | Tested by |
 |---|---|---|---|
-| V1 | Reply false if `term < currentTerm` | `core::Raft::step_lower_term` | TBD (step 1) |
-| V2 | If `votedFor` is null or `candidateId`, **and** the candidate's log is at least as up to date as this one, grant the vote (§5.2, §5.4.1) | `log::RaftLog::is_up_to_date`, TBD (step 1) | `the_up_to_date_check_compares_term_before_length` |
+| V1 | Reply false if `term < currentTerm` | `core::Raft::step_lower_term` | `a_vote_request_from_an_older_term_is_ignored` (see §7: we ignore rather than reply, except for pre-votes) |
+| V2 | If `votedFor` is null or `candidateId`, **and** the candidate's log is at least as up to date as this one, grant the vote (§5.2, §5.4.1) | `election::Raft::handle_vote_request`, `log::RaftLog::is_up_to_date` | `only_one_vote_is_granted_per_term`, `a_repeated_request_from_the_same_candidate_is_granted_again`, `a_vote_is_refused_to_a_candidate_whose_log_is_behind`, `the_up_to_date_check_compares_term_before_length` |
 
 ## 3. Rules for servers (Figure 3.1, "Rules for Servers")
 
@@ -61,22 +61,23 @@ Arguments: `term`, `candidateId`, `lastLogIndex`, `lastLogTerm`. Results: `term`
 | # | Rule | Implemented by | Tested by |
 |---|---|---|---|
 | F1 | Respond to RPCs from candidates and leaders | `core::Raft::step` | `stepping_any_message_at_any_term_never_panics` |
-| F2 | If no `AppendEntries` from the current leader and no vote granted within the election timeout, become a candidate | `core::Raft::tick_election` | TBD (step 1) |
+| F2 | If no `AppendEntries` from the current leader and no vote granted within the election timeout, become a candidate | `core::Raft::tick_election` | `a_group_sharing_one_seed_still_elects_someone` |
 
 ### Candidates
 
 | # | Rule | Implemented by | Tested by |
 |---|---|---|---|
-| C1 | On conversion: increment `currentTerm`, vote for self, reset the election timer, send `RequestVote` to all other servers | TBD (step 1) | TBD (step 1) |
-| C2 | On votes from a majority, become leader | TBD (step 1) | TBD (step 1) |
-| C3 | On `AppendEntries` from a new leader, become a follower | TBD (step 1) | TBD (step 1) |
-| C4 | If the election times out, start a new one | `core::Raft::tick_election` | TBD (step 1) |
+| C1 | On conversion: increment `currentTerm`, vote for self, reset the election timer, send `RequestVote` to all other servers | `election::Raft::{campaign, become_candidate}` | `a_candidate_with_a_majority_becomes_leader`, `a_learner_does_not_campaign` |
+| C2 | On votes from a majority, become leader | `election::Raft::{poll, handle_vote_response, become_leader}` | `a_candidate_with_a_majority_becomes_leader`, `a_lone_voter_elects_itself`, `votes_from_nodes_outside_the_configuration_do_not_count`, `a_candidate_refused_by_a_majority_reverts_to_follower` |
+| C3 | On `AppendEntries` from a new leader, become a follower | `core::Raft::step_current_term` | `a_candidate_concedes_to_a_leader_of_its_own_term` |
+| C4 | If the election times out, start a new one | `core::Raft::tick_election` | `a_partitioned_node_running_pre_votes_never_raises_its_term` |
 
 ### Leaders
 
 | # | Rule | Implemented by | Tested by |
 |---|---|---|---|
 | L1 | On election, and then periodically, send empty `AppendEntries` to every server so it does not time out | `core::Raft::tick_heartbeat`, TBD (step 2) | TBD (step 2) |
+| L0 | On election, append an empty entry of the new term, so §5.4.2 lets the backlog commit | `election::Raft::become_leader` | `a_new_leader_appends_an_empty_entry_of_its_own_term` |
 | L2 | On a client command, append the entry, then apply it once committed | TBD (step 2) | TBD (step 2) |
 | L3 | If `lastLogIndex >= nextIndex[f]`, send `AppendEntries` from `nextIndex[f]`; on success update `nextIndex[f]` and `matchIndex[f]`, on failure decrement `nextIndex[f]` and retry | TBD (step 2) | TBD (step 2) |
 | L4 | If a majority has `matchIndex >= N` for some `N > commitIndex` **and `log[N].term == currentTerm`**, set `commitIndex = N` (§5.4.2) | TBD (step 2) | TBD (step 2) |
@@ -113,14 +114,15 @@ Features from later chapters, each of which this crate implements.
 
 | # | Feature | Chapter | Implemented by | Tested by |
 |---|---|---|---|---|
-| X1 | Randomised election timeouts, redrawn per election | §3.4, §9.5 | `core::Raft::reset_election_timeout` | `nodes_sharing_a_seed_still_draw_different_election_timeouts` |
+| X1 | Randomised election timeouts, redrawn per election | §3.4, §9.5 | `core::Raft::reset_election_timeout`, called from `reset` and `become_pre_candidate` | `nodes_sharing_a_seed_still_draw_different_election_timeouts`, `a_group_sharing_one_seed_still_elects_someone` |
 | X2 | **Membership change applied when the entry is appended, not committed** | §4.1 | `conf::ConfTracker::append` | TBD (step 6) |
 | X3 | An uncommitted membership change that is truncated reverts the configuration | §4.1 | `conf::ConfTracker::truncate_from` | TBD (step 6) |
 | X4 | One membership change at a time | §4.1 | `raw_node::RawNode::propose_conf_change` | TBD (step 6) |
 | X5 | Learners: replicate without voting or counting toward quorum | §4.2.1 | `types::ConfState::quorum` | `learners_do_not_count_toward_a_quorum` |
 | X6 | Leadership transfer via `TimeoutNow` | §3.10 | TBD (step 6) | TBD (step 6) |
-| X7 | Check-quorum: a leader without quorum contact steps down | §6.2 | TBD (step 6) | TBD (step 6) |
-| X8 | Pre-vote: a returning node does not bump the term to lose an election | §9.6 | `core::Raft::step_higher_term` (the exemption) | `a_pre_vote_from_a_higher_term_does_not_move_this_node_s_term` |
+| X7 | Check-quorum, voter half: a follower with a healthy leader refuses votes | §6.2 | `core::Raft::vetoed_by_leader_lease` | `check_quorum_makes_a_follower_refuse_a_vote_while_its_leader_is_healthy`, `a_forced_vote_request_is_not_vetoed_by_the_lease` |
+| X7b | Check-quorum, leader half: a leader without quorum contact steps down | §6.2 | TBD (step 6) | TBD (step 6) |
+| X8 | Pre-vote: a returning node does not bump the term to lose an election | §9.6 | `core::Raft::step_higher_term` (the exemption), `election::Raft::{campaign, become_pre_candidate}` | `a_pre_vote_from_a_higher_term_does_not_move_this_node_s_term`, `a_granted_pre_vote_records_no_vote`, `a_partitioned_node_running_pre_votes_never_raises_its_term`, `without_pre_vote_a_returning_node_deposes_the_leader`, `a_late_pre_vote_grant_does_not_count_toward_a_real_election` |
 | X9 | `ReadIndex`: linearizable reads without a log write | §6.4 | `readonly::ReadOnly` | TBD (step 4) |
 
 ## 7. What the dissertation leaves to the implementation
@@ -131,6 +133,8 @@ is not yet an ADR becomes one before the phase closes (`prompts/03-raft.md`, "Ac
 | Decision | Where | Status |
 |---|---|---|
 | Heartbeats are `AppendEntries` with no entries, not their own message | `message.rs` | `docs/plans/phase-3.md` §3; ADR TBD |
+| A `RequestVote` from an older term is **ignored**, not refused — Figure 3.1 says reply false. A stale candidate cannot win whatever we say, and staying quiet keeps a looping node from being answered forever. A stale *pre-vote* is refused, because that reply is how a node behind the cluster learns its term | `core.rs` | ADR TBD |
+| A pre-vote round redraws the election timeout even though it does not reset the term, so two nodes that pre-campaigned together do not do so again | `election.rs` | ADR TBD |
 | A snapshot is acknowledged with `AppendEntriesResponse`, not its own response | `message.rs` | `docs/plans/phase-3.md` §3; ADR TBD |
 | The rejection hint carries a term as well as an index, so a leader skips a term per round trip rather than an index | `message.rs`, `progress.rs` | ADR TBD (step 2) |
 | Persistence is the driver's, and the ordering is a documented contract rather than an enforced one | `raw_node.rs` | `docs/plans/phase-3.md` §4; ADR TBD |

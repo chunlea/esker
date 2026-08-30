@@ -25,6 +25,7 @@
 mod conf;
 mod config;
 mod core;
+mod election;
 mod error;
 mod log;
 mod message;
@@ -32,6 +33,8 @@ mod progress;
 mod raw_node;
 mod readonly;
 mod storage;
+#[cfg(test)]
+mod testkit;
 mod types;
 
 pub use crate::config::{Config, MAX_SIZE_PER_MSG};

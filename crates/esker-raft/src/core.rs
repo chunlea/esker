@@ -19,6 +19,7 @@ use esker_base::rng::Pcg32;
 
 use crate::conf::ConfTracker;
 use crate::config::Config;
+use crate::election::CampaignKind;
 use crate::error::Result;
 use crate::log::RaftLog;
 use crate::message::Message;
@@ -97,7 +98,6 @@ pub(crate) struct Raft<S: LogStorage> {
     pub(crate) heartbeat_tick: u64,
     pub(crate) max_inflight_msgs: usize,
     pub(crate) max_size_per_msg: u64,
-    #[allow(dead_code)] // TODO(step-1): read when deciding whether to campaign or pre-campaign.
     pub(crate) pre_vote: bool,
     pub(crate) check_quorum: bool,
     pub(crate) rng: Pcg32,
@@ -211,7 +211,6 @@ impl<S: LogStorage> Raft<S> {
     }
 
     /// Whether `id` counts toward a quorum in the configuration in force.
-    #[allow(dead_code)] // TODO(step-1): the vote count is the first caller.
     pub(crate) fn is_voter(&self, id: NodeId) -> bool {
         self.conf.current().is_voter(id)
     }
@@ -260,7 +259,17 @@ impl<S: LogStorage> Raft<S> {
         self.election_elapsed += 1;
         if self.election_elapsed >= self.randomized_election_timeout {
             self.election_elapsed = 0;
-            // TODO(step-1): campaign.
+            let kind = if self.pre_vote {
+                CampaignKind::PreElection
+            } else {
+                CampaignKind::Election
+            };
+            if let Err(error) = self.campaign(kind) {
+                // Campaigning reads the log; a storage failure here means this node cannot stand
+                // for election, which is survivable — another node will. It is not a reason to
+                // stop ticking.
+                tracing::warn!(id = self.id, %error, "could not campaign");
+            }
         }
     }
 
@@ -286,11 +295,39 @@ impl<S: LogStorage> Raft<S> {
     pub(crate) fn step(&mut self, message: Message) -> Result<()> {
         let term = message.term();
         if term > self.term {
+            if self.vetoed_by_leader_lease(&message) {
+                tracing::debug!(
+                    id = self.id,
+                    from = message.sender(),
+                    "refused a vote request: the current leader's lease has not expired"
+                );
+                return Ok(());
+            }
             self.step_higher_term(&message);
         } else if term < self.term {
             return self.step_lower_term(&message);
         }
         self.step_current_term(message)
+    }
+
+    /// §6.2: a node that has heard from a healthy leader within the election timeout ignores a
+    /// vote request from a higher term entirely — no reply, and no term adopted.
+    ///
+    /// Without this, one disconnected node whose term has run ahead deposes a working leader
+    /// simply by reappearing. With it, that node's request is dropped and it learns the truth from
+    /// the next heartbeat instead.
+    ///
+    /// The exception is a request carrying `force`, which the leader itself ordered for a
+    /// leadership transfer: vetoing that would make transfer fail exactly when the cluster is
+    /// healthy, which is the only time it is ever used.
+    fn vetoed_by_leader_lease(&self, message: &Message) -> bool {
+        let Message::RequestVote { force, .. } = message else {
+            return false;
+        };
+        !force
+            && self.check_quorum
+            && self.leader.is_some()
+            && self.election_elapsed < self.randomized_election_timeout
     }
 
     /// A message from the future: adopt the term, unless it is a pre-vote.
@@ -366,20 +403,55 @@ impl<S: LogStorage> Raft<S> {
     }
 
     /// A message in this node's own term.
-    // The handlers that land in the next steps consume the message and can fail; the signature is
-    // the one they need, so it does not churn under the sibling lane.
-    #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)] // TODO(step-1..6)
+    ///
+    /// A pre-vote request is the one message that can reach here with a term *above* this node's,
+    /// because §9.6 forbids adopting it.
+    // The handlers that land in the remaining steps consume the message; the signature is the one
+    // they need, so it does not churn under the sibling lane.
+    #[allow(clippy::needless_pass_by_value)] // TODO(step-2..6)
     fn step_current_term(&mut self, message: Message) -> Result<()> {
-        // TODO(step-1..6): election, replication, snapshot, membership and read handling. Until
-        // those land, an in-term message is accounted for and dropped — never a panic, which is
-        // the property the sibling lane's fuzzing checks from day one.
-        tracing::trace!(
-            id = self.id,
-            term = self.term,
-            message = message.kind_name(),
-            from = message.sender(),
-            "message accepted; handler not implemented yet"
-        );
-        Ok(())
+        match message {
+            Message::RequestVote {
+                from,
+                term,
+                last_log_index,
+                last_log_term,
+                pre_vote,
+                ..
+            } => {
+                self.handle_vote_request(from, term, last_log_index, last_log_term, pre_vote);
+                Ok(())
+            }
+            Message::RequestVoteResponse {
+                from,
+                granted,
+                pre_vote,
+                ..
+            } => self.handle_vote_response(from, granted, pre_vote),
+            Message::AppendEntries { from, term, .. } => {
+                // Figure 3.1, C3: a candidate that hears from a leader of its own term concedes.
+                // The leader is real — it could only have been elected by a majority — so
+                // continuing to campaign would just cost the cluster another term.
+                if matches!(self.role, Role::Candidate | Role::PreCandidate) {
+                    self.become_follower(term, Some(from));
+                } else if self.role == Role::Follower {
+                    self.leader = Some(from);
+                    self.election_elapsed = 0;
+                }
+                // TODO(step-2): the consistency check, the splice and the response.
+                Ok(())
+            }
+            other => {
+                // TODO(step-2..6): replication responses, snapshots, transfer and reads.
+                tracing::trace!(
+                    id = self.id,
+                    term = self.term,
+                    message = other.kind_name(),
+                    from = other.sender(),
+                    "message accepted; handler not implemented yet"
+                );
+                Ok(())
+            }
+        }
     }
 }
