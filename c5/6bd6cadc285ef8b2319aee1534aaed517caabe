@@ -1,0 +1,25 @@
+crates/esker-engine/src/db/write.rs
+  s_dc640bf0df4adb::t_be06b532b6d66f 29,77,224-239,249-259
+crates/esker-engine/tests/db.rs
+  s_dc640bf0df4adb::t_c50d4abc287269 1519-1580
+docs/DESIGN.md
+  s_dc640bf0df4adb::t_c6b8ec0f9981c1 186-199
+docs/adr/0006-rawkv-delete-range.md
+  s_dc640bf0df4adb::t_9f9abc23fbc311 40-41,73-79
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "c56bd6cadc285ef8b2319aee1534aaed517caabe",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
