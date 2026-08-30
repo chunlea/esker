@@ -1,0 +1,24 @@
+crates/esker-sql/src/lib.rs
+  h_44076b318daf9c 47
+crates/esker-sql/src/pgwire/message.rs
+  h_44076b318daf9c 1-634
+crates/esker-sql/src/pgwire/mod.rs
+  h_44076b318daf9c 1-232
+crates/esker-sql/tests/golden/pgwire.hex
+  h_44076b318daf9c 1-46
+crates/esker-sql/tests/pgwire_golden.rs
+  h_44076b318daf9c 1-442
+docs/plans/phase-6a.md
+  h_44076b318daf9c 391-393,414-432
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "b19a518da5d4fd40039ad977a84e1230245fa54d",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
