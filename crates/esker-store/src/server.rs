@@ -34,7 +34,7 @@ use crate::peer::{PeerOptions, RaftPeer};
 use crate::raft_log::RaftLogStorage;
 use crate::rawkv::{self, Limits};
 use crate::region::RegionMeta;
-use crate::transport::{PeerAddress, StoreTransport};
+use crate::transport::{PeerAddress, StoreAddress, StoreTransport};
 
 /// How a store is opened.
 #[derive(Debug, Clone)]
@@ -201,10 +201,8 @@ impl Store {
                     esker_raft::ConfState::from_voters(voters.clone()),
                 )?;
                 let transport = StoreTransport::spawn(
-                    options.region_id,
-                    region.epoch(),
-                    options.peer_id,
-                    &raft.peers,
+                    options.store_id,
+                    &StoreAddress::from_peers(&raft.peers),
                     raft.transport,
                 );
                 let peer = RaftPeer::start(
@@ -215,7 +213,8 @@ impl Store {
                         seed: raft.seed,
                     },
                     storage,
-                    Arc::clone(&transport) as Arc<dyn crate::peer::RaftTransport>,
+                    transport.for_region(options.region_id, region.epoch(), &raft.peers)
+                        as Arc<dyn crate::peer::RaftTransport>,
                 )?;
                 let ticker = peer.spawn_ticker(raft.tick);
                 (Some(peer), Some(transport), Some(ticker))

@@ -1,4 +1,5 @@
-//! The Raft transport: one connection per store pair, a batch per tick.
+//! The Raft transport: one connection per **store pair**, carrying every region's messages,
+//! a batch per tick.
 //!
 //! [`RaftTransport`] is fire-and-forget and infallible, and this is
 //! where that shape earns itself. Raft already retries everything it sends — a lost message is
@@ -7,17 +8,29 @@
 //! therefore a dropped message and a log line, never an error the consensus layer has to reason
 //! about.
 //!
+//! # Why the connection belongs to the store pair and not to the region
+//!
+//! `docs/DESIGN.md` §6: *one TCP connection per (store, store) pair carrying `RaftTransport::Batch`
+//! frames with `RaftMessage`s for all regions, batched per tick.* Phase 3e had one region and could
+//! not tell the difference. With fifty regions on five stores it is the difference between four
+//! connections per store and two hundred — and between one batched frame per tick and fifty.
+//!
+//! So [`StoreTransport`] is keyed by store id and knows nothing about regions, and
+//! [`RegionTransport`] is the per-region view handed to one peer's driver: it stamps the region id
+//! and epoch onto each message and resolves the peer id Raft names into the store that hosts it.
+//! Every region's view shares the one queue per destination store, which is what makes the batch a
+//! batch.
+//!
 //! # What that buys, and what it costs
 //!
-//! The driver thread never blocks on a socket: [`StoreTransport::send`] hands each message to a
+//! The driver thread never blocks on a socket: [`RegionTransport::send`] hands each message to a
 //! **bounded** queue and returns. A queue that is full drops, which is exactly what a congested
 //! network does, and is why the bound is safe to have — an unbounded one in front of a slow peer
 //! is a memory leak that ends the process instead of the connection
-//! (`docs/DESIGN.md` §9, "nothing is unbounded").
-//!
-//! One task per peer owns that peer's connection, batches whatever has queued since it last woke,
-//! and sends it as a single [`RaftBatch`] frame. Batching is not an optimisation here: without it
-//! a cluster spends a frame per heartbeat per region per tick (`docs/DESIGN.md` §6).
+//! (`docs/DESIGN.md` §9, "nothing is unbounded"). The queue is shared by every region bound for
+//! that store, which is the point and also the cost: a region that floods it drops another
+//! region's heartbeat. Raft retransmits either way, and a per-region queue would trade that for
+//! per-region memory that nothing bounds in aggregate.
 //!
 //! A connection that fails is dropped and rebuilt on the next batch. There is no reconnect
 //! backoff loop, because the tick is already one — a peer that is down costs one failed connect
@@ -34,13 +47,18 @@ use tokio::sync::mpsc;
 
 use crate::peer::RaftTransport;
 
-/// How many messages may queue for one peer before the transport starts dropping.
+/// How many messages may queue for one **store** before the transport starts dropping.
 ///
 /// Generous enough that a brief stall does not lose traffic, small enough that a peer which is
 /// simply gone cannot cost unbounded memory. Dropping is safe: Raft retransmits.
 pub const PEER_SEND_QUEUE: usize = 1024;
 
 /// Where another store's peer can be reached.
+///
+/// Still peer-shaped rather than store-shaped because that is what a caller knows: a region's
+/// membership is a list of peers, and the address book is built from it. [`StoreTransport`]
+/// collapses it to one entry per store; [`StoreTransport::for_region`] keeps the peer half as the
+/// routing table one region needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerAddress {
     /// The Raft peer id, which is what a `Message` names.
@@ -63,84 +81,146 @@ impl PeerAddress {
     }
 }
 
-/// Sends one region's Raft messages to the peers that are not this store.
+/// Where another store can be reached: the unit a connection is actually per.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreAddress {
+    /// The store's id.
+    pub store_id: u64,
+    /// Its address.
+    pub addr: SocketAddr,
+}
+
+impl StoreAddress {
+    /// A store at an address.
+    #[must_use]
+    pub fn new(store_id: u64, addr: SocketAddr) -> Self {
+        Self { store_id, addr }
+    }
+
+    /// The distinct stores named by a peer list, in store-id order.
+    ///
+    /// Two peers of two different regions on one store are one connection, which is the whole
+    /// point of keying by store. A store that appears twice with two different addresses is a
+    /// configuration mistake; the first address wins and the second is logged, because refusing
+    /// to start over it would take the cluster down for a typo that costs one region.
+    #[must_use]
+    pub fn from_peers(peers: &[PeerAddress]) -> Vec<Self> {
+        let mut stores: Vec<Self> = Vec::new();
+        for peer in peers {
+            match stores.binary_search_by_key(&peer.store_id, |store| store.store_id) {
+                Ok(at) => {
+                    if stores[at].addr != peer.addr {
+                        tracing::warn!(
+                            store_id = peer.store_id,
+                            known = %stores[at].addr,
+                            ignored = %peer.addr,
+                            "a store was given two addresses; the first one is used"
+                        );
+                    }
+                }
+                Err(at) => stores.insert(at, Self::new(peer.store_id, peer.addr)),
+            }
+        }
+        stores
+    }
+}
+
+/// One connection per store pair, shared by every region this store hosts.
 #[derive(Debug)]
 pub struct StoreTransport {
-    region_id: u64,
-    epoch: Epoch,
-    /// One queue per peer, sorted by peer id — a `Vec` rather than a map for the same reason the
-    /// core uses one: this is on a decision path and its iteration order should be defined.
-    peers: Vec<(NodeId, mpsc::Sender<RaftMessage>)>,
+    store_id: u64,
+    /// One queue per destination store, sorted by store id — a `Vec` rather than a map for the
+    /// same reason the Raft core uses one: this is on a decision path and its iteration order
+    /// should be defined.
+    stores: Vec<(u64, mpsc::Sender<RaftMessage>)>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl StoreTransport {
-    /// Connects to every peer but this one, spawning a task each.
+    /// Connects to every store but this one, spawning a task each.
     ///
     /// Must be called from inside a `tokio` runtime: the tasks are where the async lives, and the
-    /// driver thread that feeds them is deliberately not async at all.
+    /// driver threads that feed them are deliberately not async at all.
     #[must_use]
-    pub fn spawn(
-        region_id: u64,
-        epoch: Epoch,
-        self_peer: NodeId,
-        peers: &[PeerAddress],
-        config: TransportConfig,
-    ) -> Arc<Self> {
+    pub fn spawn(store_id: u64, stores: &[StoreAddress], config: TransportConfig) -> Arc<Self> {
         let mut queues = Vec::new();
         let mut tasks = Vec::new();
-        for peer in peers.iter().filter(|peer| peer.peer_id != self_peer) {
+        for store in stores.iter().filter(|store| store.store_id != store_id) {
             let (sender, receiver) = mpsc::channel(PEER_SEND_QUEUE);
-            queues.push((peer.peer_id, sender));
-            tasks.push(tokio::spawn(deliver_to(
-                peer.clone(),
-                region_id,
-                receiver,
-                config,
-            )));
+            queues.push((store.store_id, sender));
+            tasks.push(tokio::spawn(deliver_to(store.clone(), receiver, config)));
         }
         queues.sort_by_key(|(id, _)| *id);
         Arc::new(Self {
-            region_id,
-            epoch,
-            peers: queues,
+            store_id,
+            stores: queues,
             tasks,
         })
     }
 
-    /// Stops every peer task. Anything still queued is dropped, which is what a peer going away
+    /// This store's id.
+    #[must_use]
+    pub fn store_id(&self) -> u64 {
+        self.store_id
+    }
+
+    /// The view one region's driver holds: this transport, plus the region's identity and the
+    /// map from its peer ids to the stores hosting them.
+    ///
+    /// `peers` is the region's whole membership, this store's own peer included; the entry for
+    /// this store is kept in the table and never dispatched, because a message addressed to it
+    /// would be Raft talking to itself.
+    #[must_use]
+    pub fn for_region(
+        self: &Arc<Self>,
+        region_id: u64,
+        epoch: Epoch,
+        peers: &[PeerAddress],
+    ) -> Arc<RegionTransport> {
+        let mut routes: Vec<(NodeId, u64)> = peers
+            .iter()
+            .map(|peer| (peer.peer_id, peer.store_id))
+            .collect();
+        routes.sort_unstable_by_key(|(peer_id, _)| *peer_id);
+        routes.dedup_by_key(|(peer_id, _)| *peer_id);
+        Arc::new(RegionTransport {
+            transport: Arc::clone(self),
+            region_id,
+            epoch,
+            routes,
+        })
+    }
+
+    /// Stops every store task. Anything still queued is dropped, which is what a peer going away
     /// looks like from the other end anyway.
     pub fn shutdown(&self) {
         for task in &self.tasks {
             task.abort();
         }
     }
-}
 
-impl RaftTransport for StoreTransport {
-    fn send(&self, messages: Vec<Message>) {
-        for message in messages {
-            let to = message.recipient();
-            let Ok(at) = self.peers.binary_search_by_key(&to, |(id, _)| *id) else {
-                // A message for a peer this store has no address for. In 3e the membership is
-                // static, so this is a configuration mistake rather than a race — worth saying.
-                tracing::warn!(
-                    region_id = self.region_id,
-                    peer = to,
-                    "no address for a peer; the message was dropped"
-                );
-                continue;
-            };
-            let wrapped = RaftMessage::new(self.region_id, self.epoch, message);
-            if self.peers[at].1.try_send(wrapped).is_err() {
-                // Full or closed. Dropping is the honest outcome and Raft will resend; blocking
-                // the driver thread on a slow socket would stall consensus for every region.
-                tracing::debug!(
-                    region_id = self.region_id,
-                    peer = to,
-                    "the send queue is full or closed; the message was dropped"
-                );
-            }
+    /// Queues one already-stamped message for the store hosting its recipient.
+    fn dispatch(&self, to_store: u64, message: RaftMessage) {
+        let region_id = message.region_id;
+        let Ok(at) = self.stores.binary_search_by_key(&to_store, |(id, _)| *id) else {
+            // No address for that store. With a static address book this is a configuration
+            // mistake rather than a race, and it stays worth saying out loud once PD can move a
+            // peer to a store this one has never been told about.
+            tracing::warn!(
+                region_id,
+                store = to_store,
+                "no address for a store; the message was dropped"
+            );
+            return;
+        };
+        if self.stores[at].1.try_send(message).is_err() {
+            // Full or closed. Dropping is the honest outcome and Raft will resend; blocking the
+            // driver thread on a slow socket would stall consensus for every region at once.
+            tracing::debug!(
+                region_id,
+                store = to_store,
+                "the send queue is full or closed; the message was dropped"
+            );
         }
     }
 }
@@ -151,17 +231,87 @@ impl Drop for StoreTransport {
     }
 }
 
-/// One peer's connection: batch what has queued, send it, keep the socket if it worked.
-async fn deliver_to(
-    peer: PeerAddress,
+/// One region's view of the store-pair transport.
+///
+/// This is what a peer's driver holds as its [`RaftTransport`]. It knows the two things the
+/// shared transport must not: which region these messages belong to, and which store each of the
+/// region's peers is on.
+#[derive(Debug)]
+pub struct RegionTransport {
+    transport: Arc<StoreTransport>,
     region_id: u64,
+    /// Stamped onto every message so the far end can drop one from an epoch it has moved past.
+    ///
+    /// Fixed for the life of this view. The epoch only moves on a split or a membership change,
+    /// and both rebuild the region's peer — so a stale stamp cannot outlive the driver that sends
+    /// it. `TODO(phase-4b)`: assert that in the split path, where it stops being free.
+    epoch: Epoch,
+    /// `peer_id → store_id`, sorted by peer id.
+    routes: Vec<(NodeId, u64)>,
+}
+
+impl RegionTransport {
+    /// The region these messages belong to.
+    #[must_use]
+    pub fn region_id(&self) -> u64 {
+        self.region_id
+    }
+
+    /// The epoch stamped onto every message it sends.
+    #[must_use]
+    pub fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+
+    /// The store hosting `peer`, if this region knows of it.
+    #[must_use]
+    pub fn store_of(&self, peer: NodeId) -> Option<u64> {
+        self.routes
+            .binary_search_by_key(&peer, |(peer_id, _)| *peer_id)
+            .ok()
+            .map(|at| self.routes[at].1)
+    }
+}
+
+impl RaftTransport for RegionTransport {
+    fn send(&self, messages: Vec<Message>) {
+        for message in messages {
+            let to = message.recipient();
+            let Some(store) = self.store_of(to) else {
+                tracing::warn!(
+                    region_id = self.region_id,
+                    peer = to,
+                    "no store known for a peer of this region; the message was dropped"
+                );
+                continue;
+            };
+            if store == self.transport.store_id() {
+                // Raft never addresses itself, so this is a membership table that disagrees with
+                // reality rather than a message to deliver locally.
+                tracing::warn!(
+                    region_id = self.region_id,
+                    peer = to,
+                    "a message was addressed to a peer on this store; it was dropped"
+                );
+                continue;
+            }
+            self.transport
+                .dispatch(store, RaftMessage::new(self.region_id, self.epoch, message));
+        }
+    }
+}
+
+/// One store's connection: batch what has queued, send it, keep the socket if it worked.
+async fn deliver_to(
+    store: StoreAddress,
     mut queue: mpsc::Receiver<RaftMessage>,
     config: TransportConfig,
 ) {
     let mut connection: Option<TcpTransport> = None;
     while let Some(first) = queue.recv().await {
-        // Everything queued since the last wake-up travels together. This is the per-tick
-        // batching `docs/DESIGN.md` §6 asks for: without it a heartbeat is a frame.
+        // Everything queued since the last wake-up travels together, whichever regions it came
+        // from. This is the per-tick batching `docs/DESIGN.md` §6 asks for: without it a cluster
+        // spends a frame per heartbeat per region per tick.
         let mut batch = vec![first];
         while let Ok(next) = queue.try_recv() {
             batch.push(next);
@@ -171,15 +321,13 @@ async fn deliver_to(
             connection = None;
         }
         if connection.is_none() {
-            match TcpTransport::connect_with(peer.addr, config).await {
+            match TcpTransport::connect_with(store.addr, config).await {
                 Ok(transport) => connection = Some(transport),
                 Err(error) => {
                     tracing::debug!(
-                        region_id,
-                        peer = peer.peer_id,
-                        store = peer.store_id,
+                        store = store.store_id,
                         %error,
-                        "could not reach a peer; its messages were dropped"
+                        "could not reach a store; its messages were dropped"
                     );
                     continue;
                 }
@@ -192,14 +340,126 @@ async fn deliver_to(
         let count = batch.len();
         if let Err(error) = transport.call(Request::Raft(RaftBatch::new(batch))).await {
             tracing::debug!(
-                region_id,
-                peer = peer.peer_id,
+                store = store.store_id,
                 count,
                 %error,
-                "a Raft batch did not reach its peer"
+                "a Raft batch did not reach its store"
             );
             // The connection is suspect; the next batch builds a new one.
             connection = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PeerAddress, StoreAddress, StoreTransport};
+    use crate::peer::RaftTransport;
+    use esker_proto::{Epoch, TransportConfig};
+    use esker_raft::Message;
+    use std::net::SocketAddr;
+
+    fn addr(port: u16) -> SocketAddr {
+        format!("127.0.0.1:{port}").parse().unwrap()
+    }
+
+    /// Two regions with peers on the same three stores must collapse to three addresses, not
+    /// six. This is the whole reason the connection is keyed by store.
+    #[test]
+    fn peers_on_the_same_store_are_one_address() {
+        let peers = vec![
+            PeerAddress::new(1, 1, addr(7001)),
+            PeerAddress::new(2, 2, addr(7002)),
+            PeerAddress::new(3, 3, addr(7003)),
+            // The second region's peers, on the same three stores.
+            PeerAddress::new(11, 1, addr(7001)),
+            PeerAddress::new(12, 2, addr(7002)),
+            PeerAddress::new(13, 3, addr(7003)),
+        ];
+        let stores = StoreAddress::from_peers(&peers);
+        assert_eq!(
+            stores,
+            vec![
+                StoreAddress::new(1, addr(7001)),
+                StoreAddress::new(2, addr(7002)),
+                StoreAddress::new(3, addr(7003)),
+            ]
+        );
+    }
+
+    /// A store named twice with two addresses is a typo in a config file. Taking the cluster
+    /// down over it would cost every region; one warning and the first address costs one.
+    #[test]
+    fn a_store_with_two_addresses_keeps_the_first() {
+        let stores = StoreAddress::from_peers(&[
+            PeerAddress::new(1, 1, addr(7001)),
+            PeerAddress::new(2, 1, addr(7999)),
+        ]);
+        assert_eq!(stores, vec![StoreAddress::new(1, addr(7001))]);
+    }
+
+    #[tokio::test]
+    async fn a_regions_view_resolves_peers_to_stores_and_never_to_itself() {
+        let peers = vec![
+            PeerAddress::new(1, 1, addr(7101)),
+            PeerAddress::new(2, 2, addr(7102)),
+            PeerAddress::new(3, 3, addr(7103)),
+        ];
+        let transport =
+            StoreTransport::spawn(1, &StoreAddress::from_peers(&peers), TransportConfig::new());
+        // Two other stores; never a queue back to this one.
+        assert_eq!(transport.stores.len(), 2);
+
+        let region = transport.for_region(7, Epoch::INITIAL, &peers);
+        assert_eq!(region.region_id(), 7);
+        assert_eq!(region.store_of(2), Some(2));
+        assert_eq!(region.store_of(3), Some(3));
+        assert_eq!(
+            region.store_of(1),
+            Some(1),
+            "this store's own peer stays in the table; it is dropped at send time"
+        );
+        assert_eq!(region.store_of(99), None);
+
+        // Neither of the two messages a region must not dispatch panics or reaches a queue: one
+        // names a peer nobody knows, one names this store's own.
+        region.send(vec![
+            Message::TimeoutNow {
+                from: 1,
+                to: 99,
+                term: 1,
+            },
+            Message::TimeoutNow {
+                from: 2,
+                to: 1,
+                term: 1,
+            },
+        ]);
+    }
+
+    /// The point of the per-store queue: two regions bound for the same store share it, so one
+    /// tick is one batch rather than one batch per region.
+    #[tokio::test]
+    async fn every_region_bound_for_one_store_shares_its_queue() {
+        let peers = vec![
+            PeerAddress::new(1, 1, addr(7201)),
+            PeerAddress::new(2, 2, addr(7202)),
+        ];
+        let transport =
+            StoreTransport::spawn(1, &StoreAddress::from_peers(&peers), TransportConfig::new());
+        let first = transport.for_region(1, Epoch::INITIAL, &peers);
+        let second = transport.for_region(2, Epoch::INITIAL, &peers);
+
+        for region in [&first, &second] {
+            region.send(vec![Message::TimeoutNow {
+                from: 1,
+                to: 2,
+                term: 1,
+            }]);
+        }
+
+        // One queue, both regions' messages in it. The task at the other end is trying to
+        // connect to a port nothing is listening on, so nothing has drained.
+        assert_eq!(transport.stores.len(), 1);
     }
 }

@@ -26,7 +26,7 @@
 //! | [`raft_log`] | the Raft log and the peer's persistent state, on the `raft` column family |
 //! | [`rawkv`] | the eight `RawKv` methods, over the engine, synchronously |
 //! | [`server`] | opening the database and its column families, and the wire service |
-//! | [`transport`] | one connection per store pair, carrying a batch of Raft messages per tick |
+//! | [`transport`] | one connection per store pair, carrying every region's messages per tick |
 //!
 //! Phase 2 builds the single-region store (`prompts/02-single-node-server.md`); the apply
 //! loop, splits and snapshots are phase 4 (`prompts/04-multiraft-pd.md`).
@@ -49,7 +49,7 @@ pub use raft_log::{PersistedState, RaftLogStorage};
 pub use rawkv::Limits;
 pub use region::RegionMeta;
 pub use server::{Store, StoreOptions, StoreService};
-pub use transport::{PeerAddress, StoreTransport};
+pub use transport::{PeerAddress, RegionTransport, StoreAddress, StoreTransport};
 
 /// Key prefixes inside the `raft` column family (`docs/DESIGN.md` §6).
 ///
