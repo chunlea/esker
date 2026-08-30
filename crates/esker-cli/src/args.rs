@@ -84,7 +84,7 @@ impl fmt::Display for ParseError {
             ParseError::UnknownWorkload(workload) => write!(
                 formatter,
                 "unknown workload `{workload}`; expected fillseq, fillrandom, overwrite, \
-                 readrandom or readseq"
+                 readrandom, readmissing or readseq"
             ),
             ParseError::MissingArgument(name) => write!(formatter, "missing {name}"),
         }
@@ -112,8 +112,8 @@ Options:
   -h, --help            Print this message
 
 Bench options:
-  <workload>            fillseq | fillrandom | overwrite | readrandom | readseq
-                        (default fillrandom)
+  <workload>            fillseq | fillrandom | overwrite | readrandom | readmissing
+                        | readseq (default fillrandom)
       --num N           Keys in the database, and operations measured (default 100000)
       --value-size N    Value size in bytes (default 100)
       --batch-size N    Entries per write batch (default 1)
@@ -121,6 +121,7 @@ Bench options:
       --sync            Wait for each write to be durable (default off)
       --dir PATH        Where to put the database (default a temporary directory)
       --duration-secs N Stop the measured phase early after this long (default 0, no limit)
+      --bloom-bits N    Bloom filter bits per key; 0 builds none (default 10)
 
 Sst-dump options:
   -v, --verbose         Print every key and value, not just the summary
@@ -168,6 +169,7 @@ enum Target {
     BatchSize,
     Threads,
     DurationSecs,
+    BloomBits,
 }
 
 fn parse_bench(arguments: &[String]) -> Result<Command, ParseError> {
@@ -208,6 +210,7 @@ fn parse_bench(arguments: &[String]) -> Result<Command, ParseError> {
             "--batch-size" => (Target::BatchSize, "--batch-size"),
             "--threads" => (Target::Threads, "--threads"),
             "--duration-secs" => (Target::DurationSecs, "--duration-secs"),
+            "--bloom-bits" => (Target::BloomBits, "--bloom-bits"),
             other if other.starts_with('-') => {
                 return Err(ParseError::UnknownFlag(other.to_owned()));
             }
@@ -238,8 +241,10 @@ fn parse_bench(arguments: &[String]) -> Result<Command, ParseError> {
             Target::ValueSize => options.value_size = positive(name, &raw)?,
             Target::BatchSize => options.batch_size = positive(name, &raw)?,
             Target::Threads => options.threads = positive(name, &raw)?,
-            // Zero is the only sensible "no limit", so it is allowed here and nowhere else.
+            // Zero is meaningful for both of these — no time limit, and no filter — so they
+            // take `number` rather than `positive`.
             Target::DurationSecs => options.duration_secs = number(name, &raw)?,
+            Target::BloomBits => options.bloom_bits = number(name, &raw)?,
         }
     }
 

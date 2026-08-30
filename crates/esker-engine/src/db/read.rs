@@ -189,13 +189,17 @@ impl DbInner {
     ) -> Result<Option<Lookup>> {
         let reader = self.table_cache.get(file.number, &self.table_options(cf))?;
 
-        // TODO(post-v1): this bypasses the bloom filter. `TableReader::get` applies it, but
-        // only for an exact internal-key match, and an MVCC lookup is a seek — the key being
-        // looked for is `(user_key, snapshot)`, which is almost never stored verbatim. A
-        // filter-aware "seek to this internal key" on the reader would restore it; the filter
-        // is already built over user keys (see `InternalPrefixExtractor`), so nothing else
-        // here has to change. Until then every level lookup pays a block read the filter
-        // would have avoided.
+        // Bloom before disk (`docs/DESIGN.md` §4.9). The filter is built over the user key
+        // inside the internal key, so probing it with the seek target asks exactly the right
+        // question — "does this table hold this user key at any version" — and a miss saves
+        // an index lookup and a block read. A filter can only rule a key *out*, so a `true`
+        // here means nothing has been decided and the seek proceeds.
+        if !reader.may_contain(target) {
+            self.bloom_skips.fetch_add(1, AtomicOrdering::Relaxed);
+            return Ok(None);
+        }
+        self.bloom_probes.fetch_add(1, AtomicOrdering::Relaxed);
+
         let mut iter = reader.iter();
         iter.seek(target);
         // A block that could not be read ends iteration exactly like reaching the end, so the

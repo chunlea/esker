@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use esker_base::rng::Pcg32;
 use esker_engine::batch::WriteBatch;
-use esker_engine::options::{Options, ReadOptions, WalSyncMode, WriteOptions};
+use esker_engine::options::{CfOptions, Options, ReadOptions, WalSyncMode, WriteOptions};
 use esker_engine::{Db, cf};
 
 /// One of the five workloads.
@@ -40,6 +40,11 @@ pub(crate) enum Workload {
     Overwrite,
     /// Read random keys.
     ReadRandom,
+    /// Read random keys that are not there, but sort inside the range of the keys that are.
+    ///
+    /// The workload the bloom filter exists for: the range check cannot rule these out, so
+    /// without a filter every one of them costs an index lookup and a block read.
+    ReadMissing,
     /// Iterate the whole database.
     ReadSeq,
 }
@@ -52,6 +57,7 @@ impl Workload {
             "fillrandom" => Some(Self::FillRandom),
             "overwrite" => Some(Self::Overwrite),
             "readrandom" => Some(Self::ReadRandom),
+            "readmissing" => Some(Self::ReadMissing),
             "readseq" => Some(Self::ReadSeq),
             _ => None,
         }
@@ -63,13 +69,17 @@ impl Workload {
             Self::FillRandom => "fillrandom",
             Self::Overwrite => "overwrite",
             Self::ReadRandom => "readrandom",
+            Self::ReadMissing => "readmissing",
             Self::ReadSeq => "readseq",
         }
     }
 
     /// Whether the database has to be populated before the measured phase.
     fn needs_a_populated_database(self) -> bool {
-        matches!(self, Self::Overwrite | Self::ReadRandom | Self::ReadSeq)
+        matches!(
+            self,
+            Self::Overwrite | Self::ReadRandom | Self::ReadMissing | Self::ReadSeq
+        )
     }
 }
 
@@ -141,6 +151,9 @@ pub(crate) struct Run {
     pub(crate) dir: Option<PathBuf>,
     /// Stop the measured phase early after this long. Zero runs the whole workload.
     pub(crate) duration_secs: u32,
+    /// Bloom filter bits per key. Zero builds no filter, which is how the filter's own cost
+    /// and benefit are measured rather than argued about.
+    pub(crate) bloom_bits: u32,
 }
 
 impl Default for Run {
@@ -157,6 +170,7 @@ impl Default for Run {
             sync: false,
             dir: None,
             duration_secs: 0,
+            bloom_bits: 10,
         }
     }
 }
@@ -196,6 +210,10 @@ fn run_in(options: &Run, dir: &Path) -> Result<Report, String> {
             error_if_exists: false,
             // The workload's own `--sync` decides; the engine adds nothing of its own.
             wal_sync_mode: WalSyncMode::Never,
+            cf_options: CfOptions {
+                bloom_bits_per_key: usize::try_from(options.bloom_bits).unwrap_or(0),
+                ..CfOptions::default()
+            },
             ..Options::default()
         },
     )
@@ -213,6 +231,7 @@ fn run_in(options: &Run, dir: &Path) -> Result<Report, String> {
     let latencies = match options.workload {
         Workload::ReadSeq => measure_scan(&db, options)?,
         Workload::ReadRandom => measure_parallel(&db, options, read_random)?,
+        Workload::ReadMissing => measure_parallel(&db, options, read_missing)?,
         Workload::FillSeq => measure_parallel(&db, options, write_sequential)?,
         Workload::FillRandom | Workload::Overwrite => measure_parallel(&db, options, write_random)?,
     };
@@ -411,6 +430,39 @@ fn read_random(
     Ok(latencies)
 }
 
+/// Reads keys that are absent but sort between two that are present, so the file's key range
+/// cannot rule them out and only the bloom filter can. `db_bench` does the same by appending a
+/// character to a key that exists.
+fn read_missing(
+    db: &Db,
+    options: &Run,
+    worker: u32,
+    _start: u64,
+    count: u64,
+) -> Result<Vec<Duration>, String> {
+    let mut rng = Pcg32::new(0x_4155_0000 + u64::from(worker), u64::from(worker));
+    let read = ReadOptions::default();
+    let deadline = deadline_of(options);
+    let mut latencies = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+
+    for _ in 0..count {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break;
+        }
+        let mut key = key_for(rng.range_inclusive(0, options.num.saturating_sub(1)));
+        key.push(b'.');
+        let started = Instant::now();
+        let found = db
+            .get(cf::DEFAULT, &key, &read)
+            .map_err(|err| err.to_string())?;
+        latencies.push(started.elapsed());
+        if found.is_some() {
+            return Err("readmissing found a key that should not exist".to_string());
+        }
+    }
+    Ok(latencies)
+}
+
 /// A scan is one cursor, so it runs on one thread whatever `--threads` says.
 fn measure_scan(db: &Arc<Db>, options: &Run) -> Result<Vec<Duration>, String> {
     let deadline = deadline_of(options);
@@ -455,6 +507,7 @@ mod tests {
             sync: false,
             dir: None,
             duration_secs: 0,
+            bloom_bits: 10,
         }
     }
 
@@ -500,6 +553,7 @@ mod tests {
             Workload::FillRandom,
             Workload::Overwrite,
             Workload::ReadRandom,
+            Workload::ReadMissing,
             Workload::ReadSeq,
         ] {
             let report = run(&small(workload)).unwrap_or_else(|err| panic!("{workload:?}: {err}"));

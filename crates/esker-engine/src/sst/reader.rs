@@ -274,19 +274,37 @@ impl TableReader {
         self.inner.filter.is_some()
     }
 
+    /// Whether this table could hold `key`, according to its bloom filter.
+    ///
+    /// A filter can only ever rule a key *out*, so this answers `true` whenever it cannot
+    /// help: no filter, one built over different bytes, or a key outside the extractor's
+    /// domain — such a key was never added, so its absence from the filter means nothing.
+    ///
+    /// Exposed separately from [`get`](TableReader::get) because the engine's point-read path
+    /// is a *seek*, not an exact match: it looks for `(user_key, snapshot)`, which is almost
+    /// never stored verbatim, so it drives [`iter`](TableReader::iter) and needs to consult
+    /// the filter itself before opening a cursor and reading a block.
+    #[must_use]
+    pub fn may_contain(&self, key: &[u8]) -> bool {
+        let inner = &self.inner;
+        let Some(filter) = inner.filter.as_ref() else {
+            return true;
+        };
+        // The probe key goes through the same `filter_key` the builder used.
+        match filter_key(inner.options.prefix_extractor.as_deref(), key) {
+            Some(bytes) => filter.may_contain(bytes),
+            None => true,
+        }
+    }
+
     /// Looks one key up.
     ///
     /// Bloom, then index, then one data block. `Ok(None)` means the key is not in this table;
     /// an `Err` means the table could not be read and the caller must not treat it as absence.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let inner = &self.inner;
-        if let Some(filter) = inner.filter.as_ref() {
-            // The probe key goes through the same `filter_key` the builder used. A key outside
-            // the extractor's domain was never added, so it cannot be filtered out.
-            match filter_key(inner.options.prefix_extractor.as_deref(), key) {
-                Some(bytes) if !filter.may_contain(bytes) => return Ok(None),
-                _ => {}
-            }
+        if !self.may_contain(key) {
+            return Ok(None);
         }
 
         let mut index_iter = inner.index.iter(inner.comparator());

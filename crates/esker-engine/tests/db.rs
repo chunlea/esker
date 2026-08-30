@@ -1415,3 +1415,100 @@ fn a_bounded_compaction_touches_only_its_range() {
         .unwrap();
     assert_eq!(db.compactions_run(), before);
 }
+
+/// Bloom before disk (`docs/DESIGN.md` §4.9).
+///
+/// The absent keys here sit *inside* the key range of every file, so the range check cannot
+/// rule them out and the filter is the only thing that can. Without it each of these reads
+/// would open a table, walk its index and read a data block to learn nothing.
+#[test]
+fn a_point_read_consults_the_bloom_filter_before_opening_a_table() {
+    let (_, fs) = memfs();
+    let db = open(&fs, options(), &[cf::DEFAULT]).unwrap();
+    // Even keys only, so the odd ones are absent but bracketed by the file's range.
+    for i in (0..2_000u32).step_by(2) {
+        db.put(cf::DEFAULT, format!("key-{i:05}").as_bytes(), b"v")
+            .unwrap();
+    }
+    db.flush(cf::DEFAULT).unwrap();
+    db.compact_range(cf::DEFAULT, None, None).unwrap();
+
+    let skips_before: u64 = db.property("esker.bloom-skips").unwrap().parse().unwrap();
+    let probes_before: u64 = db.property("esker.bloom-probes").unwrap().parse().unwrap();
+
+    for i in (1..2_000u32).step_by(2) {
+        assert_eq!(
+            get(&db, format!("key-{i:05}").as_bytes()),
+            None,
+            "key-{i:05}"
+        );
+    }
+    let skips: u64 = db
+        .property("esker.bloom-skips")
+        .unwrap()
+        .parse::<u64>()
+        .unwrap()
+        - skips_before;
+    let probes: u64 = db
+        .property("esker.bloom-probes")
+        .unwrap()
+        .parse::<u64>()
+        .unwrap()
+        - probes_before;
+
+    // 999, not 1000: `key-01999` is past the largest key stored, so the file's range rules it
+    // out before the filter is ever needed. The cheap check runs first, which is the point.
+    assert_eq!(skips + probes, 999, "one table consulted per absent key inside the range");
+    // 10 bits/key is a ~1% false-positive rate, so almost every one of these should be a skip.
+    assert!(
+        skips >= 950,
+        "the filter skipped only {skips} of 999 tables; it is not being consulted"
+    );
+
+    // And it never rules out a key that is there: a filter may only say "no".
+    for i in (0..2_000u32).step_by(2) {
+        assert_eq!(
+            get(&db, format!("key-{i:05}").as_bytes()).as_deref(),
+            Some(&b"v"[..]),
+            "key-{i:05}"
+        );
+    }
+}
+
+/// A column family with the filter turned off still reads correctly — the filter is an
+/// optimisation, and the read path must not depend on one being there.
+#[test]
+fn reads_are_correct_without_a_bloom_filter() {
+    let (_, fs) = memfs();
+    let db = open(
+        &fs,
+        Options {
+            create_if_missing: true,
+            cf_options: CfOptions {
+                bloom_bits_per_key: 0,
+                ..CfOptions::default()
+            },
+            ..Options::default()
+        },
+        &[cf::DEFAULT],
+    )
+    .unwrap();
+    for i in (0..200u32).step_by(2) {
+        db.put(cf::DEFAULT, format!("key-{i:04}").as_bytes(), b"v")
+            .unwrap();
+    }
+    db.flush(cf::DEFAULT).unwrap();
+
+    assert_eq!(
+        db.property("esker.bloom-skips").unwrap(),
+        "0",
+        "nothing to skip with"
+    );
+    for i in 0..200u32 {
+        let expected = if i % 2 == 0 { Some(&b"v"[..]) } else { None };
+        assert_eq!(
+            get(&db, format!("key-{i:04}").as_bytes()).as_deref(),
+            expected
+        );
+    }
+}

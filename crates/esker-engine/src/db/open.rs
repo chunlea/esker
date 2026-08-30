@@ -142,6 +142,8 @@ impl Db {
             pending_outputs: Mutex::new(BTreeSet::new()),
             compact_pointers: Mutex::new(BTreeMap::new()),
             compactions: AtomicU64::new(0),
+            bloom_skips: AtomicU64::new(0),
+            bloom_probes: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             stalls: AtomicU64::new(0),
             slowdowns: AtomicU64::new(0),

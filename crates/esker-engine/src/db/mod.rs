@@ -136,6 +136,10 @@ pub(crate) struct DbInner {
     /// In memory only: losing it costs the spreading and nothing else.
     pub(crate) compact_pointers: Mutex<BTreeMap<(u32, usize), Vec<u8>>>,
     pub(crate) compactions: AtomicU64,
+    /// Tables a point read did not open because their bloom filter ruled the key out, and
+    /// tables it did open. Together they say whether the filter is earning its bits.
+    pub(crate) bloom_skips: AtomicU64,
+    pub(crate) bloom_probes: AtomicU64,
     pub(crate) shutdown: AtomicBool,
     /// Times a writer was stopped outright, and times it was merely slowed. Both are
     /// properties, because a database that mysteriously goes slow is one nobody can operate.
@@ -351,6 +355,7 @@ impl Db {
     /// `esker.compaction-floor`, `esker.instance`,
     /// `esker.last-sequence`, `esker.write-stalls`, `esker.write-slowdowns`,
     /// `esker.open-tables`, `esker.compactions`, `esker.compactions-running`,
+    /// `esker.bloom-skips`, `esker.bloom-probes`,
     /// `esker.mem-table-size.<cf>`, `esker.num-immutable-mem-table.<cf>`,
     /// `esker.oldest-log.<cf>`, `esker.num-files-at-level<n>.<cf>`.
     pub fn property(&self, name: &str) -> Option<String> {
@@ -365,6 +370,8 @@ impl Db {
             "esker.write-slowdowns" => Some(inner.slowdowns.load(Ordering::Relaxed).to_string()),
             "esker.open-tables" => Some(inner.table_cache.len().to_string()),
             "esker.compactions" => Some(inner.compactions.load(Ordering::Relaxed).to_string()),
+            "esker.bloom-skips" => Some(inner.bloom_skips.load(Ordering::Relaxed).to_string()),
+            "esker.bloom-probes" => Some(inner.bloom_probes.load(Ordering::Relaxed).to_string()),
             "esker.compactions-running" => Some(
                 inner
                     .compacting
