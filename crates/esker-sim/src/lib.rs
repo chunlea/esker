@@ -16,4 +16,12 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-// TODO(phase-0): clock, fault plan and in-memory network land in the next commits.
+pub mod clock;
+pub mod fault;
+pub mod net;
+
+pub use clock::{Clock, Millis};
+pub use fault::FaultPlan;
+pub use net::{
+    Envelope, Network, NetworkError, NodeId, NodeView, SimNetwork, TraceEvent, scenario_rng,
+};
