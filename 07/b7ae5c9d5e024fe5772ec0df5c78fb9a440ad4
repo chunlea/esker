@@ -1,0 +1,23 @@
+Cargo.lock
+  s_b52c2c840eeae6::t_f7f526943c2e0a 105
+crates/esker-engine/Cargo.toml
+  s_b52c2c840eeae6::t_fb07d096213279 29-32
+crates/esker-engine/tests/crash_faultfs.rs
+  s_b52c2c840eeae6::t_45c57dae1076e7 1-481
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "07b7ae5c9d5e024fe5772ec0df5c78fb9a440ad4",
+  "prompts": {},
+  "sessions": {
+    "s_b52c2c840eeae6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe005f8d-b378-44b1-824d-4541e546f193",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
