@@ -317,8 +317,30 @@ ignored — forward compatibility is handled by `WIRE_VERSION` negotiation on co
 
 ## 10. Client (`esker-client`)
 
-Region cache keyed by key range; `GetRegion` on miss; automatic retry with backoff on redirectable
-errors (bounded); `RawClient` and `TxnClient` (begin / get / scan / put / delete / commit / rollback).
+`RawClient` now, `TxnClient` in phase 5 (begin / get / scan / put / delete / commit / rollback). The
+core is synchronous and has no I/O of its own: bytes leave through a `StoreTransport` (addressed by
+**store id**, not by address — resolving one to a socket is PD's job) and time enters through a
+`Clock`. Both are injected, so every rule below is tested against a scripted transport and a clock
+that jumps rather than waits.
+
+- **Region cache** keyed by range, `GetRegion` on miss (`RegionResolver`; one static region until
+  phase 4). It is a *hint, never an authority*: every request carries the epoch the cache believes
+  and the store checks it, so a stale entry costs a redirect and never a wrong answer.
+- **Retries** are bounded by both a budget (8 retries *default*) and a per-call deadline (10 s
+  *default*), whichever ends first. Which errors are retryable is `ProtoError::is_retryable()` —
+  asked, not duplicated, so the client and the store cannot drift: `NotLeader` (follow the peer-id
+  hint), `EpochNotMatch` (take the replacement regions), `RegionNotFound` (drop the entry, ask the
+  resolver), `ServerIsBusy` (wait). Backoff is exponential to a 2 s ceiling with **equal jitter**
+  from a per-client seeded PCG32, so a leader election does not reconverge every client in lockstep.
+- **A write is re-sent only when the previous attempt provably did not commit.** Every retried error
+  is a refusal, so `outcome() == NotApplied`. A request that went out and got no usable answer is
+  never retried: a *mutation* in that position becomes `Error::AmbiguousResult` and the caller
+  decides; a *read* is returned plainly, because re-reading is always safe. `esker-txn` depends on
+  this distinction (§8), which is why it is a type and not a log line.
+- **Bounded everything:** retries, calls in flight (256 *default*), and scan limits, capped so a
+  response fits `max_frame_size`; an oversized request is refused before it is sent.
+- **The client never namespaces a key.** The `'r'` prefix of §3 is applied by the store on every
+  path, scan bounds and `DeleteRange` included.
 
 ## 11. Testing strategy (required per component)
 
