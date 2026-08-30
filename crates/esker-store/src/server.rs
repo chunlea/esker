@@ -29,7 +29,6 @@ use esker_proto::{
     RequestHeader, Response, Service, SnapshotRequest, TransportConfig,
 };
 
-use crate::SNAPSHOT_STREAM_DEPTH;
 use crate::apply::Command;
 use crate::error::{Result, StoreError};
 use crate::heartbeat::{Heartbeats, RegionReport, StoreReport};
@@ -43,6 +42,7 @@ use crate::regions::{RegionMap, RegionState};
 use crate::snapshot;
 use crate::split::{self, SplitOptions};
 use crate::transport::{PeerAddress, StoreAddress, StoreTransport};
+use crate::{OPERATOR_TIMEOUT, SNAPSHOT_STREAM_DEPTH};
 
 /// How a store is opened.
 #[derive(Debug, Clone)]
@@ -76,10 +76,19 @@ pub struct StoreOptions {
     /// Where other stores and clients reach this one, as PD should record it. Only read when
     /// [`StoreOptions::pd`] is set.
     pub address: String,
-    /// What one heartbeat tick is worth. The intervals of `docs/DESIGN.md` §14 are counted in
-    /// these ([`crate::heartbeat::Heartbeats`]), so this is the resolution of the schedule and
-    /// not its period.
+    /// What one heartbeat tick is worth. The intervals below are counted in these
+    /// ([`crate::heartbeat::Heartbeats`]), so this is the resolution of the schedule and not its
+    /// period.
     pub heartbeat_tick: std::time::Duration,
+    /// How often this store reports itself (`docs/DESIGN.md` §14: 10 s).
+    pub store_heartbeat: std::time::Duration,
+    /// How often each region's leader reports it, absent a change (§14: 60 s).
+    ///
+    /// It is also the **latency of an operator**: the placement driver answers a region heartbeat
+    /// and has no other way to reach a store, so a repair waits at most this long — less whenever
+    /// the region has changed, since a change beats immediately. Configurable because a test that
+    /// waited sixty seconds for a membership change would not be run.
+    pub region_heartbeat: std::time::Duration,
     /// When a region is split, and how finely the boundary is chosen.
     ///
     /// Splitting needs cluster-unique ids, so it needs a placement driver: a store with
@@ -90,9 +99,22 @@ pub struct StoreOptions {
 /// How this store's region is replicated.
 #[derive(Debug, Clone)]
 pub struct RaftOptions {
-    /// Every peer of the region, this store's included. The peer with `peer_id ==
-    /// `[`StoreOptions::peer_id`] is this one and is never connected to.
+    /// The **address book**: every peer this store may have to reach, on every region it hosts,
+    /// with the store each is on. The entry for this store is never connected to.
+    ///
+    /// Not the same thing as a region's membership, and 4c is where the difference started to
+    /// matter. A region's peers come from its own `'m'` record and move when a conf change
+    /// applies; this list only says where a peer id can be found, and a store must know how to
+    /// reach a peer it is *about* to be told it has.
     pub peers: Vec<PeerAddress>,
+    /// The voters of the region this store bootstraps, or `None` for "every peer in the address
+    /// book".
+    ///
+    /// A cluster whose stores all start together bootstraps one region across all of them and
+    /// leaves this `None`. A store that is the first of a cluster others will *join* sets it to
+    /// its own peer, so that its region can commit before the others exist — and they arrive
+    /// later as learners, which is what `AddPeer` is for.
+    pub bootstrap_voters: Option<Vec<u64>>,
     /// Seed for the election-timeout RNG. A whole cluster may share one: the peer id selects the
     /// stream (`docs/adr/0008-raft-determinism-and-the-driver-contract.md`).
     pub seed: u64,
@@ -111,6 +133,7 @@ impl RaftOptions {
     pub fn new(peers: Vec<PeerAddress>, seed: u64) -> Self {
         Self {
             peers,
+            bootstrap_voters: None,
             seed,
             tick: std::time::Duration::from_millis(esker_raft::TICK_MS),
             transport: TransportConfig::new(),
@@ -144,6 +167,8 @@ impl StoreOptions {
             pd: None,
             address: String::new(),
             heartbeat_tick: std::time::Duration::from_millis(esker_raft::TICK_MS),
+            store_heartbeat: std::time::Duration::from_millis(crate::STORE_HEARTBEAT_MS),
+            region_heartbeat: std::time::Duration::from_millis(crate::REGION_HEARTBEAT_MS),
             split: SplitOptions::new(),
             engine: Options {
                 create_if_missing: true,
@@ -230,6 +255,8 @@ impl Store {
             pd,
             address,
             heartbeat_tick,
+            store_heartbeat,
+            region_heartbeat,
             split,
         } = options;
         let db = Db::open_with(path, engine, Arc::new(LocalFileSystem::new()), &cf::BUILTIN)?;
@@ -324,7 +351,12 @@ impl Store {
         }
 
         if let Some(pd) = pd {
-            store.spawn_heartbeats(Arc::clone(&pd), heartbeat_tick);
+            store.spawn_heartbeats(
+                Arc::clone(&pd),
+                heartbeat_tick,
+                store_heartbeat,
+                region_heartbeat,
+            );
             store.spawn_split_checker(pd, heartbeat_tick);
         }
         Ok(store)
@@ -422,22 +454,36 @@ impl Store {
         }
 
         let (kind, node, store_id) = match operator {
-            // **Learner first.** A learner receives the log and the snapshot without voting, so
-            // adding one never makes a quorum harder to reach while it catches up. The promotion
-            // is a second operator, which PD issues once it sees the learner in a heartbeat.
+            // **Learner first, and PD decides when the second step happens.** An `AddPeer` for a
+            // peer this region has never heard of adds a *learner*: it receives the log and the
+            // snapshot without voting, so it never makes a quorum harder to reach while it is
+            // catching up. The same operator for a peer that is *already a learner* is the
+            // promotion.
+            //
+            // Splitting it that way is not a shortcut around the contract, it is where the
+            // information is. "Has this learner caught up" is a statement about its match index,
+            // which `esker-raft` does not expose (`docs/plans/phase-4.md` §13.2) — but PD sees
+            // every store's region heartbeats, including the learner's own `applied_index`, so PD
+            // can compare them and this store cannot. A leader that promoted on a guess would put
+            // a peer that is not caught up into the quorum, and the group would stop committing
+            // until it was.
             Operator::AddPeer {
                 store_id, peer_id, ..
-            } => {
-                if state
-                    .region()
-                    .peers
-                    .iter()
-                    .any(|peer| peer.peer_id == *peer_id)
-                {
-                    return;
-                }
-                (esker_raft::ConfChangeKind::AddLearner, *peer_id, *store_id)
-            }
+            } => match state
+                .region()
+                .peers
+                .iter()
+                .find(|peer| peer.peer_id == *peer_id)
+            {
+                None => (esker_raft::ConfChangeKind::AddLearner, *peer_id, *store_id),
+                Some(peer) if peer.role == PeerRole::Learner => (
+                    esker_raft::ConfChangeKind::AddVoter,
+                    *peer_id,
+                    peer.store_id,
+                ),
+                // Already a voter: nothing to do.
+                Some(_) => return,
+            },
             Operator::RemovePeer { peer_id, .. } => {
                 let Some(existing) = state
                     .region()
@@ -464,71 +510,25 @@ impl Store {
             }
         };
 
-        match peer.propose_conf_change(kind, node, store_id).await {
-            Ok(_) => tracing::info!(region_id, node, ?kind, "an operator applied"),
-            Err(error) => tracing::debug!(
+        // Bounded, because a proposal is answered when it *applies* and a membership change that
+        // cannot reach a quorum never does. Without this the heartbeat round that carried the
+        // operator would stop, and with it the only channel the placement driver has to correct
+        // its own mistake.
+        let proposal = peer.propose_conf_change(kind, node, store_id);
+        match tokio::time::timeout(OPERATOR_TIMEOUT, proposal).await {
+            Ok(Ok(_)) => tracing::info!(region_id, node, ?kind, "an operator applied"),
+            Ok(Err(error)) => tracing::debug!(
                 region_id,
                 node,
                 %error,
                 "an operator did not apply; the placement driver will issue it again"
             ),
-        }
-    }
-
-    /// Promotes a learner that has caught up, which is the second half of learner-first.
-    ///
-    /// The criterion is the one the store can **actually evaluate**: `esker-raft` exposes no
-    /// per-peer `Progress`, so "the learner's match index is near the leader's last index" is not
-    /// a question this layer can ask (`docs/plans/phase-4.md` §13.2). What it can see is that the
-    /// learner is in the region's membership and that this leader has since committed an entry in
-    /// a term it still holds — the first says the learner is receiving the log, the second that
-    /// the log has moved on with it in place.
-    ///
-    /// More conservative than a match index, deliberately: promoting late costs a delay, and
-    /// promoting early costs a quorum that cannot be reached.
-    pub async fn promote_caught_up_learners(self: &Arc<Self>) {
-        for state in self.regions.states() {
-            let Some(peer) = state.peer().map(Arc::clone) else {
-                continue;
-            };
-            if !peer.is_leader() {
-                continue;
-            }
-            let learners: Vec<Peer> = state
-                .region()
-                .peers
-                .iter()
-                .filter(|peer| peer.role == PeerRole::Learner)
-                .copied()
-                .collect();
-            if learners.is_empty() {
-                continue;
-            }
-            let Ok(status) = peer.status().await else {
-                continue;
-            };
-            // The leader has committed something of its own in this term, so the group — the
-            // learner included — has been following it rather than merely tolerating it.
-            if status.applied < status.commit || status.commit == 0 {
-                continue;
-            }
-            for learner in learners {
-                if let Err(error) = peer
-                    .propose_conf_change(
-                        esker_raft::ConfChangeKind::AddVoter,
-                        learner.peer_id,
-                        learner.store_id,
-                    )
-                    .await
-                {
-                    tracing::debug!(
-                        region_id = state.id(),
-                        peer_id = learner.peer_id,
-                        %error,
-                        "a learner was not promoted; it will be tried again"
-                    );
-                }
-            }
+            Err(_) => tracing::warn!(
+                region_id,
+                node,
+                ?kind,
+                "an operator did not commit within its timeout; it may still apply later"
+            ),
         }
     }
 
@@ -611,14 +611,25 @@ impl Store {
     /// placement driver that had gone away would hold it for the whole timeout, every ten
     /// seconds, on every store. The schedule travels into the closure and back out, because it
     /// is the state that must survive the round.
-    fn spawn_heartbeats(self: &Arc<Self>, pd: Arc<dyn PdClient>, tick: std::time::Duration) {
+    fn spawn_heartbeats(
+        self: &Arc<Self>,
+        pd: Arc<dyn PdClient>,
+        tick: std::time::Duration,
+        store_every: std::time::Duration,
+        region_every: std::time::Duration,
+    ) {
         let Some(runtime) = self.runtime.clone() else {
             return;
         };
         let weak = Arc::downgrade(self);
         let store_id = self.store_id;
         let task = runtime.spawn(async move {
-            let mut beats = Heartbeats::new(pd, store_id, tick);
+            let mut beats = Heartbeats::with_intervals(
+                pd,
+                store_id,
+                Heartbeats::interval_ticks(store_every, tick),
+                Heartbeats::interval_ticks(region_every, tick),
+            );
             let mut interval = tokio::time::interval(tick);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -646,10 +657,6 @@ impl Store {
                 for operator in operators {
                     store.run_operator(&operator).await;
                 }
-                // A learner that has caught up is promoted here rather than by an operator: PD
-                // asks for the *replica*, and whether it is ready to vote is a fact only its
-                // leader has.
-                store.promote_caught_up_learners().await;
                 drop(store);
             }
         });
@@ -990,16 +997,21 @@ impl Store {
         }
         for message in batch.messages {
             let Some(state) = self.regions.get(message.region_id) else {
-                if let Some((from, index)) = Self::snapshot_announcement(&message.message) {
-                    // A region this store does not host yet, and a leader offering to fill it.
-                    // This is how a peer added by `AddPeer` gets its data.
-                    self.start_snapshot(message.region_id, from, index);
-                    continue;
-                }
-                tracing::debug!(
-                    region_id = message.region_id,
-                    "dropped a Raft message for a region this store does not host"
-                );
+                // Raft traffic for a region this store does not host, which is how a peer added
+                // by `AddPeer` first hears of itself. **It asks the sender for the region.**
+                //
+                // The obvious alternative is to build an empty peer and let Raft discover the gap
+                // — the follower rejects, the leader backs off past its own log start and offers
+                // a snapshot. It cannot work here: a store with no region has no peer to reject
+                // *with*, so it drops the message, the leader sees no rejection, backs off to
+                // nothing, and offers nothing. The traffic itself is the signal, so the traffic
+                // is what this acts on.
+                //
+                // A store that has been *removed* from a region and receives a stray message asks
+                // too, and is refused: the sender checks the asking peer against the region's
+                // membership, which is the right place for that check to live.
+                let index = Self::snapshot_announcement(&message.message).unwrap_or(0);
+                self.start_snapshot(message.region_id, message.message.sender(), index);
                 continue;
             };
             // Invariant 5, applied to Raft traffic. A batch carries messages for many regions
@@ -1229,16 +1241,17 @@ impl Store {
         })
     }
 
-    /// Whether a Raft message is a leader saying "your log does not reach back far enough".
+    /// The index a leader's `InstallSnapshot` names, if this message is one.
     ///
     /// Such a message is an **announcement**, not something to step: the core would restore a
     /// snapshot whose data had not arrived, and the peer would claim an index it did not hold. The
     /// data is fetched first ([`Store::fetch_snapshot`]) and the region is built from it.
-    fn snapshot_announcement(message: &esker_raft::Message) -> Option<(u64, u64)> {
+    ///
+    /// Any other message asks for index zero — "whatever you have" — because a store with no
+    /// region has no idea how far behind it is and the sender's own state is the answer.
+    fn snapshot_announcement(message: &esker_raft::Message) -> Option<u64> {
         match message {
-            esker_raft::Message::InstallSnapshot { from, snapshot, .. } => {
-                Some((*from, snapshot.meta.index))
-            }
+            esker_raft::Message::InstallSnapshot { snapshot, .. } => Some(snapshot.meta.index),
             _ => None,
         }
     }
@@ -1487,9 +1500,17 @@ fn whole_key_space(options: &BootstrapOptions<'_>) -> Region {
             id: options.region_id,
             start_key: Bytes::new(),
             end_key: Bytes::new(),
+            // The address book unless the caller named the voters: a store that others will join
+            // bootstraps a region of one and grows it, rather than a region that cannot commit
+            // until every listed peer exists.
             peers: raft
                 .peers
                 .iter()
+                .filter(|peer| {
+                    raft.bootstrap_voters
+                        .as_ref()
+                        .is_none_or(|voters| voters.contains(&peer.peer_id))
+                })
                 .map(|peer| Peer::voter(peer.store_id, peer.peer_id))
                 .collect(),
             epoch: esker_proto::Epoch::INITIAL,
@@ -1647,6 +1668,19 @@ impl Service for StoreService {
                         request.method().name(),
                         store.store_id()
                     )));
+                }
+                // TODO(phase-5): the `TxnKv` handlers. The wire codecs and the decision
+                // library exist (`esker_proto::txn`, `esker-txn`); what is missing is this
+                // store's side, which is deliberately not built while phase 4 is open
+                // (`docs/plans/phase-5.md` §1). A refusal that names the method is what a
+                // client should meet until then — not a default, and not silence.
+                Request::TxnKv { request, .. } => {
+                    return Err(ProtoError::Unsupported {
+                        detail: format!(
+                            "{} is not served yet: the store half of phase 5",
+                            request.method().name()
+                        ),
+                    });
                 }
             };
 

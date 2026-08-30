@@ -109,6 +109,13 @@ pub const REGION_HEARTBEAT_MS: u64 = 60_000;
 /// Size of one chunk of a streamed Raft snapshot, in bytes.
 pub const SNAPSHOT_CHUNK_SIZE: usize = 1024 * 1024;
 
+/// How long a store waits for one of the placement driver's operators to commit.
+///
+/// A proposal is answered when it *applies*, and a membership change that cannot reach a quorum
+/// never does. The wait is bounded so that the heartbeat round carrying the operator cannot stop —
+/// which would close the only channel PD has to correct whatever it got wrong.
+pub const OPERATOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// How many snapshot chunks may be queued for the network before the walk waits.
 ///
 /// Small on purpose: a snapshot is megabytes and the point of streaming it is that neither end

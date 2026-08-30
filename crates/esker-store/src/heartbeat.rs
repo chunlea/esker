@@ -91,8 +91,8 @@ impl Heartbeats {
         Self::with_intervals(
             pd,
             store_id,
-            Self::interval_ticks(STORE_HEARTBEAT_MS, tick),
-            Self::interval_ticks(REGION_HEARTBEAT_MS, tick),
+            Self::interval_ticks(Duration::from_millis(STORE_HEARTBEAT_MS), tick),
+            Self::interval_ticks(Duration::from_millis(REGION_HEARTBEAT_MS), tick),
         )
     }
 
@@ -115,14 +115,15 @@ impl Heartbeats {
         }
     }
 
-    /// How many ticks of `tick` an interval of `millis` is, rounded up and never zero.
+    /// How many ticks of `tick` an `interval` is, rounded up and never zero.
     ///
     /// Rounded **up** because beating early is the cheap mistake: a store heartbeat at 9.5 s
     /// costs PD one extra message, while one at 10.5 s eats into the 30 s `max_store_down_time`
     /// that decides whether this store is alive.
     #[must_use]
-    pub fn interval_ticks(millis: u64, tick: Duration) -> u64 {
+    pub fn interval_ticks(interval: Duration, tick: Duration) -> u64 {
         let tick_ms = u64::try_from(tick.as_millis()).unwrap_or(u64::MAX).max(1);
+        let millis = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX);
         millis.div_ceil(tick_ms).max(1)
     }
 
@@ -277,21 +278,22 @@ mod tests {
     #[test]
     fn the_documented_intervals_come_out_in_ticks() {
         let tick = Duration::from_millis(esker_raft::TICK_MS);
+        let ms = Duration::from_millis;
         assert_eq!(
-            Heartbeats::interval_ticks(crate::STORE_HEARTBEAT_MS, tick),
+            Heartbeats::interval_ticks(ms(crate::STORE_HEARTBEAT_MS), tick),
             100
         );
         assert_eq!(
-            Heartbeats::interval_ticks(crate::REGION_HEARTBEAT_MS, tick),
+            Heartbeats::interval_ticks(ms(crate::REGION_HEARTBEAT_MS), tick),
             600
         );
         // Rounded up: beating early costs PD a message, beating late eats the down-time budget.
+        assert_eq!(Heartbeats::interval_ticks(ms(101), ms(100)), 2);
         assert_eq!(
-            Heartbeats::interval_ticks(101, Duration::from_millis(100)),
-            2
+            Heartbeats::interval_ticks(ms(1), Duration::from_secs(10)),
+            1
         );
-        assert_eq!(Heartbeats::interval_ticks(1, Duration::from_secs(10)), 1);
-        assert_eq!(Heartbeats::interval_ticks(0, Duration::from_millis(100)), 1);
+        assert_eq!(Heartbeats::interval_ticks(ms(0), ms(100)), 1);
     }
 
     /// The first round reports, and then only every tenth. A store that reported on every tick
