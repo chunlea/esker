@@ -1,0 +1,37 @@
+crates/esker-engine/src/compaction/job.rs
+  s_b52c2c840eeae6::t_a231fce44d9812 68-71,74-78,187,206-209,217-219,321,330-331,333-339,545-598,624-627
+crates/esker-engine/src/compaction/picker.rs
+  s_b52c2c840eeae6::t_f72bf131856d98 346-347
+crates/esker-engine/src/db/compact.rs
+  s_b52c2c840eeae6::t_be1412d22c43ce 1-467
+crates/esker-engine/src/db/flush.rs
+  s_b52c2c840eeae6::t_e06ab95ccaa578 32,272,274-275,288-290,320
+crates/esker-engine/src/db/iter.rs
+  s_b52c2c840eeae6::t_31a60dbd0f8717 53-57,379
+crates/esker-engine/src/db/mod.rs
+  s_b52c2c840eeae6::t_3805c07d0794ed 6,28,38,68-69,77-78,81-82,85,88-92,121-134,147-155,349-350,363-370
+crates/esker-engine/src/db/open.rs
+  s_b52c2c840eeae6::t_a4c3eba784e829 19,23,35,138-144,153,158,172-208
+crates/esker-engine/src/options.rs
+  s_b52c2c840eeae6::t_7f0c20ec6881a5 18,243-245,265
+crates/esker-engine/tests/db.rs
+  s_b52c2c840eeae6::t_6616bb4c2fdc61 1148-1370
+crates/esker-engine/tests/model.rs
+  s_b52c2c840eeae6::t_5d9cf8fcb1f745 32-37,136-137,164,297,443-454
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "e33b44c1f403779b2927e233524ec1cb857ad180",
+  "prompts": {},
+  "sessions": {
+    "s_b52c2c840eeae6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe005f8d-b378-44b1-824d-4541e546f193",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
