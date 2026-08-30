@@ -9,7 +9,7 @@
 
 use bytes::Bytes;
 use esker_proto::messages::{DEFAULT_SCAN_LIMIT, Hello, HelloAck, RawKvReq, RawKvResp};
-use esker_proto::pd::{PdReq, PdResp, StoreInfo};
+use esker_proto::pd::{Operator, PdReq, PdResp, StoreInfo};
 use esker_proto::{
     Epoch, MAX_FRAME_SIZE, Method, Peer, PeerRole, ProtoError, RaftBatch, RaftMessage, Region,
     Request, RequestHeader, Response, WIRE_VERSION,
@@ -253,7 +253,43 @@ fn golden_pd_responses() -> Vec<(&'static str, Response)> {
             }),
         ),
         ("pd-store-heartbeat", Response::Pd(PdResp::StoreHeartbeat)),
-        ("pd-region-heartbeat", Response::Pd(PdResp::RegionHeartbeat)),
+        (
+            "pd-region-heartbeat",
+            Response::Pd(PdResp::RegionHeartbeat { operator: None }),
+        ),
+        (
+            "pd-region-heartbeat-add-peer",
+            Response::Pd(PdResp::RegionHeartbeat {
+                operator: Some(Operator::AddPeer {
+                    region_id: 7,
+                    epoch: Epoch::new(2, 3),
+                    store_id: 4,
+                    peer_id: 41,
+                }),
+            }),
+        ),
+        (
+            "pd-region-heartbeat-remove-peer",
+            Response::Pd(PdResp::RegionHeartbeat {
+                operator: Some(Operator::RemovePeer {
+                    region_id: 7,
+                    epoch: Epoch::new(2, 3),
+                    peer_id: 11,
+                }),
+            }),
+        ),
+        (
+            // Reserved for 4d and pinned now, so that leader balance does not change the
+            // operator encoding when it arrives.
+            "pd-region-heartbeat-transfer-leader",
+            Response::Pd(PdResp::RegionHeartbeat {
+                operator: Some(Operator::TransferLeader {
+                    region_id: 7,
+                    epoch: Epoch::new(2, 3),
+                    to_peer_id: 10,
+                }),
+            }),
+        ),
         (
             "pd-get-region",
             Response::Pd(PdResp::GetRegion {

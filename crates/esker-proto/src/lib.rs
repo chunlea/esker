@@ -52,7 +52,7 @@ pub use frame::{FRAME_HEADER_SIZE, Frame, FrameDecoder, FrameKind, MAX_BODY_SIZE
 pub use messages::{
     Hello, HelloAck, Method, RawKvReq, RawKvResp, Request, RequestHeader, Response,
 };
-pub use pd::{PdChannel, PdReq, PdResp, StoreInfo};
+pub use pd::{Operator, PdChannel, PdReq, PdResp, StoreInfo};
 pub use raft::{RaftBatch, RaftMessage};
 pub use region::{Epoch, Peer, PeerRole, Region};
 pub use transport::{

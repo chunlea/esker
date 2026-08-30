@@ -133,7 +133,7 @@ fn serve(pd: &Pd, cluster_id: u64, request: &PdReq) -> Result<PdResp, ProtoError
                 approximate_size: *approximate_size,
                 applied_index: *applied_index,
             })?;
-            PdResp::RegionHeartbeat
+            PdResp::RegionHeartbeat { operator: None }
         }
         PdReq::GetRegion { key } => match pd.get_region(key)? {
             Some(route) => PdResp::GetRegion {

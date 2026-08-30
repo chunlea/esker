@@ -50,7 +50,10 @@ response raft-ack 0104
 response pd-bootstrap 0103cdd7020107016100020302010a01020b01
 response pd-bootstrap-registered 0103cdd70200
 response pd-store-heartbeat 0203
-response pd-region-heartbeat 0303
+response pd-region-heartbeat 030300
+response pd-region-heartbeat-add-peer 030301010702030429
+response pd-region-heartbeat-remove-peer 030301020702030b
+response pd-region-heartbeat-transfer-leader 030301030702030a
 response pd-get-region 04030107016100020302010a01020b010a01010f3132372e302e302e313a3230313630
 response pd-get-region-none 0403000000
 response pd-alloc-id 0503e80702

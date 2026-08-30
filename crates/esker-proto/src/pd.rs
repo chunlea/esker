@@ -4,7 +4,7 @@
 //! ```text
 //! 0x0301 Bootstrap        register a store; create the cluster if this is the first
 //! 0x0302 StoreHeartbeat   capacity and load, every 10 s
-//! 0x0303 RegionHeartbeat  one region's leader reporting, every 60 s or on a change
+//! 0x0303 RegionHeartbeat  one region's leader reporting; the answer may carry an Operator
 //! 0x0304 GetRegion        where a key lives, who leads it, and how to reach its stores
 //! 0x0305 AllocId          a block of cluster-unique ids
 //! 0x0306 Tso              a batch of timestamps
@@ -33,7 +33,7 @@ use bytes::Bytes;
 
 use crate::codec::{DecodeError, Decoder, Encoder};
 use crate::messages::Method;
-use crate::region::Region;
+use crate::region::{Epoch, Region};
 use crate::{ProtoError, Request, Response, Transport};
 
 /// A store, and where to reach it.
@@ -68,6 +68,169 @@ impl StoreInfo {
         Ok(Self {
             store_id: input.get_varint("store.id")?,
             address: input.get_str("store.address")?.to_owned(),
+        })
+    }
+}
+
+/// One membership change PD wants a region's leader to propose (`docs/DESIGN.md` §7).
+///
+/// An operator is a **request, not a command**. It rides on the answer to that region's
+/// heartbeat, and PD re-sends it on every later heartbeat until a heartbeat shows it happened
+/// or it times out — so a lost response costs a heartbeat interval and never a stuck region.
+/// The receiving store checks the epoch and its own state before proposing anything, which is
+/// what makes re-sending safe: a duplicate is refused rather than applied twice.
+///
+/// The **epoch is part of the operator** for that reason. A store that has split or changed
+/// membership since PD last heard from it will refuse an operator addressed to the old shape
+/// (`CLAUDE.md` invariant 5), and PD will re-derive from the next heartbeat rather than insist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Operator {
+    /// Add a replica of `region_id` on `store_id`, numbered `peer_id`.
+    ///
+    /// The peer id comes from PD's allocator, so it is cluster-unique and is *not* reused when
+    /// an operator is re-issued after a PD restart — the store's own epoch check absorbs the
+    /// stale one.
+    AddPeer {
+        /// The region to grow.
+        region_id: u64,
+        /// The epoch PD believes it is at.
+        epoch: Epoch,
+        /// Where the new replica goes.
+        store_id: u64,
+        /// What to number it.
+        peer_id: u64,
+    },
+
+    /// Remove the replica `peer_id` from `region_id`.
+    ///
+    /// Only ever issued once the region already has enough live replicas without it: removing
+    /// first and adding second is how a repair takes a region below quorum
+    /// (`docs/DESIGN.md` §7).
+    RemovePeer {
+        /// The region to shrink.
+        region_id: u64,
+        /// The epoch PD believes it is at.
+        epoch: Epoch,
+        /// Which replica to drop.
+        peer_id: u64,
+    },
+
+    /// Move leadership of `region_id` to `to_peer_id`.
+    ///
+    /// **Reserved for 4d.** It is on the wire now so that the operator encoding does not change
+    /// when leader balance arrives; nothing in 4c issues one, and a test pins that.
+    TransferLeader {
+        /// The region whose leadership moves.
+        region_id: u64,
+        /// The epoch PD believes it is at.
+        epoch: Epoch,
+        /// The peer that should take office.
+        to_peer_id: u64,
+    },
+}
+
+/// Wire tag for an operator's kind (*fixed*). Zero is reserved, as everywhere in this format.
+mod operator_kind {
+    pub(super) const ADD_PEER: u8 = 1;
+    pub(super) const REMOVE_PEER: u8 = 2;
+    pub(super) const TRANSFER_LEADER: u8 = 3;
+}
+
+impl Operator {
+    /// The region this operator is about.
+    #[must_use]
+    pub fn region_id(&self) -> u64 {
+        match self {
+            Self::AddPeer { region_id, .. }
+            | Self::RemovePeer { region_id, .. }
+            | Self::TransferLeader { region_id, .. } => *region_id,
+        }
+    }
+
+    /// The epoch PD believed the region was at when it issued this.
+    #[must_use]
+    pub fn epoch(&self) -> Epoch {
+        match self {
+            Self::AddPeer { epoch, .. }
+            | Self::RemovePeer { epoch, .. }
+            | Self::TransferLeader { epoch, .. } => *epoch,
+        }
+    }
+
+    /// The name a log line or an error message uses.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::AddPeer { .. } => "AddPeer",
+            Self::RemovePeer { .. } => "RemovePeer",
+            Self::TransferLeader { .. } => "TransferLeader",
+        }
+    }
+
+    fn encode(&self, out: &mut Encoder) {
+        match self {
+            Self::AddPeer {
+                region_id,
+                epoch,
+                store_id,
+                peer_id,
+            } => {
+                out.put_u8(operator_kind::ADD_PEER);
+                out.put_varint(*region_id);
+                epoch.encode(out);
+                out.put_varint(*store_id);
+                out.put_varint(*peer_id);
+            }
+            Self::RemovePeer {
+                region_id,
+                epoch,
+                peer_id,
+            } => {
+                out.put_u8(operator_kind::REMOVE_PEER);
+                out.put_varint(*region_id);
+                epoch.encode(out);
+                out.put_varint(*peer_id);
+            }
+            Self::TransferLeader {
+                region_id,
+                epoch,
+                to_peer_id,
+            } => {
+                out.put_u8(operator_kind::TRANSFER_LEADER);
+                out.put_varint(*region_id);
+                epoch.encode(out);
+                out.put_varint(*to_peer_id);
+            }
+        }
+    }
+
+    fn decode(input: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let kind = input.get_u8("operator.kind")?;
+        let region_id = input.get_varint("operator.region_id")?;
+        let epoch = Epoch::decode(input)?;
+        Ok(match kind {
+            operator_kind::ADD_PEER => Self::AddPeer {
+                region_id,
+                epoch,
+                store_id: input.get_varint("operator.store_id")?,
+                peer_id: input.get_varint("operator.peer_id")?,
+            },
+            operator_kind::REMOVE_PEER => Self::RemovePeer {
+                region_id,
+                epoch,
+                peer_id: input.get_varint("operator.peer_id")?,
+            },
+            operator_kind::TRANSFER_LEADER => Self::TransferLeader {
+                region_id,
+                epoch,
+                to_peer_id: input.get_varint("operator.to_peer_id")?,
+            },
+            other => {
+                return Err(DecodeError::UnknownTag {
+                    what: "operator kind",
+                    tag: u64::from(other),
+                });
+            }
         })
     }
 }
@@ -240,8 +403,16 @@ pub enum PdResp {
     StoreHeartbeat,
 
     /// Recorded, or dropped as stale — which is not something the sender acts on, so the
-    /// answer carries nothing. PD logs the drop; the next beat supersedes it either way.
-    RegionHeartbeat,
+    /// answer does not say which. PD logs the drop; the next beat supersedes it either way.
+    ///
+    /// What the answer *does* carry is at most one [`Operator`] for this region: the membership
+    /// change PD wants its leader to propose. **At most one, ever** — PD never has two in
+    /// flight for one region (`docs/DESIGN.md` §7) — and the same one comes back on every
+    /// heartbeat until a heartbeat shows it happened or it times out.
+    RegionHeartbeat {
+        /// What PD wants this region's leader to do, if anything.
+        operator: Option<Operator>,
+    },
 
     /// Where the key lives.
     GetRegion {
@@ -280,7 +451,7 @@ impl PdResp {
         match self {
             Self::Bootstrap { .. } => Method::PdBootstrap,
             Self::StoreHeartbeat => Method::PdStoreHeartbeat,
-            Self::RegionHeartbeat => Method::PdRegionHeartbeat,
+            Self::RegionHeartbeat { .. } => Method::PdRegionHeartbeat,
             Self::GetRegion { .. } => Method::PdGetRegion,
             Self::AllocId { .. } => Method::PdAllocId,
             Self::Tso { .. } => Method::PdTso,
@@ -293,7 +464,14 @@ impl PdResp {
                 out.put_varint(*cluster_id);
                 encode_opt_region(region.as_ref(), out);
             }
-            Self::StoreHeartbeat | Self::RegionHeartbeat => {}
+            Self::StoreHeartbeat => {}
+            Self::RegionHeartbeat { operator } => match operator {
+                Some(operator) => {
+                    out.put_bool(true);
+                    operator.encode(out);
+                }
+                None => out.put_bool(false),
+            },
             Self::GetRegion {
                 region,
                 leader_peer_id,
@@ -324,7 +502,12 @@ impl PdResp {
                 region: decode_opt_region(input)?,
             },
             Method::PdStoreHeartbeat => Self::StoreHeartbeat,
-            Method::PdRegionHeartbeat => Self::RegionHeartbeat,
+            Method::PdRegionHeartbeat => Self::RegionHeartbeat {
+                operator: input
+                    .get_bool("operator.present")?
+                    .then(|| Operator::decode(input))
+                    .transpose()?,
+            },
             Method::PdGetRegion => {
                 let region = decode_opt_region(input)?;
                 let leader_peer_id = input.get_varint("get_region.leader_peer_id")?;
@@ -492,7 +675,7 @@ impl PdChannel {
         term: u64,
         approximate_size: u64,
         applied_index: u64,
-    ) -> Result<(), ProtoError> {
+    ) -> Result<Option<Operator>, ProtoError> {
         let response = self
             .call(PdReq::RegionHeartbeat {
                 region,
@@ -503,7 +686,7 @@ impl PdChannel {
             })
             .await?;
         match response {
-            PdResp::RegionHeartbeat => Ok(()),
+            PdResp::RegionHeartbeat { operator } => Ok(operator),
             other => Err(mismatch("RegionHeartbeat", &other)),
         }
     }
@@ -579,7 +762,7 @@ fn mismatch(asked: &str, got: &PdResp) -> ProtoError {
 
 #[cfg(test)]
 mod tests {
-    use super::{PdReq, PdResp, StoreInfo};
+    use super::{Operator, PdReq, PdResp, StoreInfo};
     use crate::messages::{Method, SERVICE_PD};
     use crate::region::{Epoch, Peer, Region};
     use crate::{Request, Response};
@@ -635,7 +818,29 @@ mod tests {
                 region: None,
             },
             PdResp::StoreHeartbeat,
-            PdResp::RegionHeartbeat,
+            PdResp::RegionHeartbeat { operator: None },
+            PdResp::RegionHeartbeat {
+                operator: Some(Operator::AddPeer {
+                    region_id: 7,
+                    epoch: Epoch::new(2, 3),
+                    store_id: 4,
+                    peer_id: 41,
+                }),
+            },
+            PdResp::RegionHeartbeat {
+                operator: Some(Operator::RemovePeer {
+                    region_id: 7,
+                    epoch: Epoch::new(2, 3),
+                    peer_id: 11,
+                }),
+            },
+            PdResp::RegionHeartbeat {
+                operator: Some(Operator::TransferLeader {
+                    region_id: 7,
+                    epoch: Epoch::new(2, 3),
+                    to_peer_id: 10,
+                }),
+            },
             PdResp::GetRegion {
                 region: Some(region()),
                 leader_peer_id: 10,
@@ -718,6 +923,31 @@ mod tests {
                 0x0301 + u16::try_from(offset).unwrap(),
                 "{} is out of order",
                 method.name()
+            );
+        }
+    }
+
+    /// A zero kind byte, and one this version does not define, are both errors — the rule
+    /// every tag in this format follows. A zeroed operator must not decode as "add a peer".
+    #[test]
+    fn an_unknown_operator_kind_is_refused() {
+        let good = Response::Pd(PdResp::RegionHeartbeat {
+            operator: Some(Operator::RemovePeer {
+                region_id: 7,
+                epoch: Epoch::new(2, 3),
+                peer_id: 11,
+            }),
+        })
+        .encode();
+        // method:u16 ++ present:u8 ++ kind:u8
+        let kind_at = 3;
+        assert_eq!(good[kind_at], 2, "the kind byte moved");
+        for kind in [0u8, 4, 9, 255] {
+            let mut bytes = good.clone();
+            bytes[kind_at] = kind;
+            assert!(
+                Response::decode(&bytes).is_err(),
+                "operator kind {kind} decoded"
             );
         }
     }
