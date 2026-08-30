@@ -558,19 +558,39 @@ same number to decide whether a transfer is safe.
 
 ### 13.3 Units (one commit each)
 
-| # | Unit | Files |
-|---|---|---|
-| 0 | This section | `docs/plans/phase-4.md` |
-| 1 | `Db::approximate_size`, and 4b's byte counter replaced by it | `esker-engine/src/db/**` (granted), `esker-store/src/split.rs`, `server.rs` |
-| 2 | Raft log compaction: `'s'`'s truncation fields written, a real `LogStorage::snapshot` | `esker-store/src/raft_log.rs`, `peer.rs` |
-| 3 | Send: `checkpoint(range)` → `Stream` frames, chunked and checksummed | `esker-store/src/snapshot.rs` (NEW), `esker-proto/src/messages.rs` |
-| 4 | Receive: the four steps of §13.1, and the restart that resumes them | `esker-store/src/snapshot.rs`, `meta.rs`, `server.rs` |
-| 5 | `AddPeer`/`RemovePeer`: conf-change entries, learner first | `esker-store/src/apply.rs`, `peer.rs`, `regions.rs` |
-| 6 | Operators from heartbeat responses: propose, dedupe, drop the stale | `esker-store/src/heartbeat.rs`, `pd.rs` |
-| 7 | The test battery | `esker-store/tests/snapshot.rs` (NEW), `tests/cluster.rs` |
-| 8 | DESIGN §6's Snapshots bullet, and this section closed | `docs/DESIGN.md`, this plan |
+| # | Unit | Files | Status |
+|---|---|---|---|
+| 0 | This section | `docs/plans/phase-4.md` | `bea2207` |
+| 1 | `Db::approximate_size`, and 4b's byte counter replaced by it | `esker-engine/src/db/**` (granted), `esker-store/src/split.rs`, `server.rs` | `4c28990` |
+| 2 | Raft log compaction: `'s'`'s truncation fields written, a real `LogStorage::snapshot` | `esker-store/src/raft_log.rs`, `peer.rs` | `8005736` |
+| 3 | Send: `checkpoint(range)` → `Stream` frames, chunked and checksummed | `esker-store/src/snapshot.rs` (NEW), `esker-proto/src/messages.rs` | open |
+| 4 | Receive: the four steps of §13.1, and the restart that resumes them | `esker-store/src/snapshot.rs`, `meta.rs`, `server.rs` | open |
+| 5 | `AddPeer`/`RemovePeer`: conf-change entries, learner first | `esker-store/src/apply.rs`, `peer.rs`, `regions.rs` | open |
+| 6 | Operators from heartbeat responses: propose, dedupe, drop the stale | `esker-store/src/heartbeat.rs`, `pd.rs` | open |
+| 7 | The test battery | `esker-store/tests/snapshot.rs` (NEW), `tests/cluster.rs` | open |
+| 8 | DESIGN §6's Snapshots bullet, and this section closed | `docs/DESIGN.md`, this plan | open |
+
+Units 1 and 2 are the foundations the rest stands on and neither existed before: there was no way
+to ask the engine how large a key range is, and **nothing ever compacted a Raft log**, so
+`LogStorage::snapshot` always answered "nothing to send" and the whole `InstallSnapshot` path was
+unreachable code. A follower can now fall behind the start of the log, which is the only way a
+snapshot ever becomes necessary.
 
 ### 13.4 Decisions worth writing down before the code
+
+**The receiver pulls; the sender does not push.** The leader's `InstallSnapshot` message travels
+as an ordinary `RaftBatch` message — ADR 0009 already has the wire carrying the real
+`esker_raft::Message` — and it is the *announcement*. The follower answers it by making its own
+request back to the leader's store, `RaftTransport::Snapshot { region_id, index }` (method
+`0x0402`), and reads the reply as a run of `Stream` frames.
+
+Pull rather than push for two reasons, one structural and one operational. `esker-proto`'s
+streaming is a *reply* shape: a `Service` answers with `Reply::Stream` and the client's
+demultiplexer reassembles it by request id. A push would need inbound `Stream` frames on the
+server side, which the framing does not have and which would be a protocol change to add. And a
+pulling receiver controls its own concurrency and its own retries — it can refuse to start a second
+transfer for a region it is already receiving, which is where §13.1's `'p'` record gets its meaning
+— while a pushing sender would have to track what each follower was in the middle of.
 
 **The Raft message carries the metadata; the files travel beside it.** `InstallSnapshot` goes out
 with `Snapshot::data` **empty** and its `meta` real. `esker-raft` reads only the meta — that is why
