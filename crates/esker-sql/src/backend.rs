@@ -1,0 +1,422 @@
+//! The seam between the executor and storage, and an in-memory transaction to test against.
+//!
+//! [`Backend`] and [`Txn`] are the whole of what the executor may ask of the store. They are shaped
+//! against `esker-client`'s real `TxnClient` and `Transaction` rather than against a sketch, so
+//! wiring the real one in is a matter of writing the impl and nothing above it changes:
+//!
+//! * `put` and `delete` return nothing, because writes are buffered on the client until commit —
+//!   the executor must not be written as though a write can fail where it is issued;
+//! * `commit` yields the commit timestamp, or `None` when the transaction wrote nothing;
+//! * `get` and `scan` take `&self`, because read-your-writes is served out of the buffer.
+//!
+//! # How a unique index is enforced, with nothing added here to do it
+//!
+//! There is deliberately no `put_if_absent`. Uniqueness composes out of the two primitives above,
+//! and between them they cover both ways a duplicate can arrive:
+//!
+//! 1. **The executor reads the index key inside the transaction and requires it absent.** The read
+//!    is at the transaction's snapshot, so a duplicate that is *already committed* is visible and
+//!    is reported as `23505 unique_violation` before anything is written.
+//! 2. **Then it writes the index entry like any other key.** A *concurrent* duplicate needs no
+//!    further help: both transactions read the key as absent, both prewrite the same key, and
+//!    write-write conflict detection (`docs/DESIGN.md` §8) lets exactly one commit. The loser's
+//!    `commit` fails, and the executor reports that as `23505` too.
+//!
+//! The fake below implements the same conflict rule as the real protocol — a commit fails if any
+//! key it wrote gained a version after this transaction's snapshot — so an executor test can
+//! exercise the race rather than assume it. `a_concurrent_duplicate_loses_at_commit` is that test.
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::sync::{Arc, Mutex};
+
+use bytes::Bytes;
+
+use crate::error::{Result, SqlError};
+
+/// Opens transactions. One per SQL node, shared by every session.
+pub trait Backend: fmt::Debug + Send + Sync {
+    /// Starts a transaction at a fresh snapshot.
+    fn begin(&self) -> Result<Box<dyn Txn>>;
+}
+
+/// One transaction's view of storage.
+pub trait Txn: fmt::Debug + Send {
+    /// Reads one key at this transaction's snapshot, its own buffered writes merged in.
+    fn get(&self, key: &[u8]) -> Result<Option<Bytes>>;
+
+    /// Reads `[start, end)` at this transaction's snapshot, in key order, buffered writes merged
+    /// in. `limit` is applied after the merge; 0 means no limit.
+    fn scan(&self, start: &[u8], end: &[u8], limit: u32) -> Result<Vec<(Bytes, Bytes)>>;
+
+    /// Buffers a write. Nothing can fail here — the conflict, if there is one, comes from
+    /// [`Txn::commit`].
+    fn put(&mut self, key: &[u8], value: &[u8]);
+
+    /// Buffers a delete, with the same rule.
+    fn delete(&mut self, key: &[u8]);
+
+    /// Commits, yielding the commit timestamp, or `None` for a transaction that wrote nothing.
+    fn commit(self: Box<Self>) -> Result<Option<u64>>;
+
+    /// Abandons the transaction. Buffered writes are discarded and nothing is visible.
+    fn rollback(self: Box<Self>) -> Result<()>;
+}
+
+/// A buffered write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Write {
+    Put(Bytes),
+    Delete,
+}
+
+/// Every committed version of every key, newest last, plus the clock that stamps them.
+#[derive(Debug, Default)]
+struct Versions {
+    /// `key -> [(commit_ts, value)]`, ascending by timestamp. `None` is a tombstone.
+    keys: BTreeMap<Vec<u8>, Vec<(u64, Option<Bytes>)>>,
+    /// Stands in for the timestamp oracle. Monotone, and the only source of timestamps here, which
+    /// is `CLAUDE.md` invariant 6 kept true even in a fake.
+    clock: u64,
+}
+
+impl Versions {
+    /// The value visible at `ts`: the newest version committed at or before it.
+    fn visible(&self, key: &[u8], ts: u64) -> Option<Bytes> {
+        self.keys
+            .get(key)?
+            .iter()
+            .rev()
+            .find(|(commit_ts, _)| *commit_ts <= ts)
+            .and_then(|(_, value)| value.clone())
+    }
+
+    /// Whether `key` gained a version after `ts` — the write-write conflict Percolator's prewrite
+    /// detects by checking the `write` column family for a commit newer than the snapshot.
+    fn written_since(&self, key: &[u8], ts: u64) -> bool {
+        self.keys
+            .get(key)
+            .is_some_and(|versions| versions.iter().any(|(commit_ts, _)| *commit_ts > ts))
+    }
+}
+
+/// An in-memory transactional store: snapshot reads, buffered writes, and the one conflict rule
+/// that matters.
+///
+/// Good enough to test an executor against, and honest about the thing an executor can get wrong —
+/// it really does refuse a commit whose keys moved underneath it, so a test can watch two
+/// transactions race for the same unique index entry and see one of them lose.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryBackend {
+    versions: Arc<Mutex<Versions>>,
+}
+
+impl MemoryBackend {
+    /// An empty store.
+    #[must_use]
+    pub fn new() -> Self {
+        MemoryBackend::default()
+    }
+
+    /// The value visible at the newest committed timestamp, for assertions in tests.
+    #[must_use]
+    pub fn peek(&self, key: &[u8]) -> Option<Bytes> {
+        let versions = self.lock();
+        versions.visible(key, versions.clock)
+    }
+
+    /// A poisoned lock means another thread panicked while holding it. The data behind it is a
+    /// `BTreeMap` that is still structurally sound, and taking it back is better than propagating
+    /// a panic into a session (`CLAUDE.md` invariant 9).
+    fn lock(&self) -> std::sync::MutexGuard<'_, Versions> {
+        self.versions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Backend for MemoryBackend {
+    fn begin(&self) -> Result<Box<dyn Txn>> {
+        let start_ts = self.lock().clock;
+        Ok(Box::new(MemoryTxn {
+            versions: Arc::clone(&self.versions),
+            start_ts,
+            buffer: BTreeMap::new(),
+        }))
+    }
+}
+
+/// One transaction against a [`MemoryBackend`].
+#[derive(Debug)]
+struct MemoryTxn {
+    versions: Arc<Mutex<Versions>>,
+    start_ts: u64,
+    buffer: BTreeMap<Vec<u8>, Write>,
+}
+
+impl MemoryTxn {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Versions> {
+        self.versions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Txn for MemoryTxn {
+    fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        // Read-your-writes: the buffer wins, and a buffered delete hides a committed value.
+        if let Some(write) = self.buffer.get(key) {
+            return Ok(match write {
+                Write::Put(value) => Some(value.clone()),
+                Write::Delete => None,
+            });
+        }
+        Ok(self.lock().visible(key, self.start_ts))
+    }
+
+    fn scan(&self, start: &[u8], end: &[u8], limit: u32) -> Result<Vec<(Bytes, Bytes)>> {
+        let versions = self.lock();
+        let mut merged: BTreeMap<Vec<u8>, Bytes> = BTreeMap::new();
+        for key in versions.keys.keys() {
+            if key.as_slice() >= start && key.as_slice() < end {
+                if let Some(value) = versions.visible(key, self.start_ts) {
+                    merged.insert(key.clone(), value);
+                }
+            }
+        }
+        drop(versions);
+        // The buffer is applied over the snapshot, so a row this transaction wrote is in its own
+        // range scan and one it deleted is not.
+        for (key, write) in &self.buffer {
+            if key.as_slice() >= start && key.as_slice() < end {
+                match write {
+                    Write::Put(value) => {
+                        merged.insert(key.clone(), value.clone());
+                    }
+                    Write::Delete => {
+                        merged.remove(key);
+                    }
+                }
+            }
+        }
+        let rows = merged.into_iter().map(|(k, v)| (Bytes::from(k), v));
+        // The limit is applied after the merge, or a buffered row could displace a committed one
+        // and the scan would return fewer rows than it should.
+        Ok(if limit == 0 {
+            rows.collect()
+        } else {
+            rows.take(limit as usize).collect()
+        })
+    }
+
+    fn put(&mut self, key: &[u8], value: &[u8]) {
+        self.buffer
+            .insert(key.to_vec(), Write::Put(Bytes::copy_from_slice(value)));
+    }
+
+    fn delete(&mut self, key: &[u8]) {
+        self.buffer.insert(key.to_vec(), Write::Delete);
+    }
+
+    fn commit(self: Box<Self>) -> Result<Option<u64>> {
+        if self.buffer.is_empty() {
+            // Nothing was written, so nothing needs a timestamp.
+            return Ok(None);
+        }
+        let mut versions = self.lock();
+
+        // Prewrite, in one step because there is no network here: every key this transaction wrote
+        // must be untouched since its snapshot. This is the check that makes a unique index work
+        // without a dedicated method — two inserts of the same index key both reach here, and the
+        // second one finds the first one's version.
+        for key in self.buffer.keys() {
+            if versions.written_since(key, self.start_ts) {
+                return Err(SqlError::SerializationFailure(format!(
+                    "key {} was written after this transaction's snapshot",
+                    String::from_utf8_lossy(key)
+                )));
+            }
+        }
+
+        versions.clock += 1;
+        let commit_ts = versions.clock;
+        for (key, write) in &self.buffer {
+            let value = match write {
+                Write::Put(value) => Some(value.clone()),
+                Write::Delete => None,
+            };
+            versions
+                .keys
+                .entry(key.clone())
+                .or_default()
+                .push((commit_ts, value));
+        }
+        Ok(Some(commit_ts))
+    }
+
+    fn rollback(self: Box<Self>) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Backend, MemoryBackend, Txn};
+    use crate::error::SqlError;
+    use crate::sqlstate;
+
+    /// The composition the executor performs for a unique index: read, require absent, then write.
+    /// Returns the error the executor would report.
+    fn insert_unique(txn: &mut Box<dyn Txn>, index_key: &[u8], row: &[u8]) -> crate::Result<()> {
+        if txn.get(index_key)?.is_some() {
+            return Err(SqlError::UniqueViolation("g_b_key".into()));
+        }
+        txn.put(index_key, row);
+        Ok(())
+    }
+
+    #[test]
+    fn a_committed_value_is_visible_to_the_next_transaction_and_not_to_an_older_one() {
+        let backend = MemoryBackend::new();
+        let older = backend.begin().unwrap();
+
+        let mut writer = backend.begin().unwrap();
+        writer.put(b"k", b"v");
+        assert_eq!(writer.commit().unwrap(), Some(1));
+
+        // The transaction that started first still sees its own snapshot.
+        assert_eq!(older.get(b"k").unwrap(), None);
+        let newer = backend.begin().unwrap();
+        assert_eq!(newer.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+    }
+
+    #[test]
+    fn a_transaction_reads_its_own_writes_and_its_own_deletes() {
+        let backend = MemoryBackend::new();
+        let mut setup = backend.begin().unwrap();
+        setup.put(b"a", b"1");
+        setup.commit().unwrap();
+
+        let mut txn = backend.begin().unwrap();
+        txn.put(b"b", b"2");
+        txn.delete(b"a");
+        assert_eq!(txn.get(b"b").unwrap().as_deref(), Some(&b"2"[..]));
+        assert_eq!(txn.get(b"a").unwrap(), None, "a buffered delete hides it");
+
+        let rows = txn.scan(b"a", b"z", 0).unwrap();
+        assert_eq!(rows.len(), 1, "the scan sees the buffer too");
+        assert_eq!(rows[0].0.as_ref(), b"b");
+    }
+
+    #[test]
+    fn a_rolled_back_transaction_leaves_nothing_behind() {
+        let backend = MemoryBackend::new();
+        let mut txn = backend.begin().unwrap();
+        txn.put(b"k", b"v");
+        txn.rollback().unwrap();
+        assert_eq!(backend.peek(b"k"), None);
+    }
+
+    #[test]
+    fn a_transaction_that_wrote_nothing_needs_no_timestamp() {
+        let backend = MemoryBackend::new();
+        let txn = backend.begin().unwrap();
+        assert_eq!(txn.commit().unwrap(), None);
+    }
+
+    /// The first of the two ways a duplicate arrives: it is already committed, so the in-transaction
+    /// read finds it and the executor refuses before writing anything.
+    #[test]
+    fn a_committed_duplicate_is_caught_by_the_read() {
+        let backend = MemoryBackend::new();
+        let mut first = backend.begin().unwrap();
+        insert_unique(&mut first, b"i/alice", b"row1").unwrap();
+        first.commit().unwrap();
+
+        let mut second = backend.begin().unwrap();
+        let error = insert_unique(&mut second, b"i/alice", b"row2").unwrap_err();
+        assert_eq!(error.sqlstate(), sqlstate::UNIQUE_VIOLATION);
+    }
+
+    /// The second way, and the one no read can catch: both transactions look, both see nothing,
+    /// both write. Exactly one commits, and the loser's failure is what the executor turns into
+    /// `23505`. This is why there is no `put_if_absent` — the conflict check already is one.
+    #[test]
+    fn a_concurrent_duplicate_loses_at_commit() {
+        let backend = MemoryBackend::new();
+        let mut left = backend.begin().unwrap();
+        let mut right = backend.begin().unwrap();
+
+        // Both read the index key at their own snapshot; neither sees anything.
+        assert_eq!(left.get(b"i/alice").unwrap(), None);
+        assert_eq!(right.get(b"i/alice").unwrap(), None);
+        insert_unique(&mut left, b"i/alice", b"left").unwrap();
+        insert_unique(&mut right, b"i/alice", b"right").unwrap();
+
+        assert!(left.commit().is_ok(), "the first to commit wins");
+        let loser = right.commit().expect_err(
+            "the second must lose the write-write conflict, or the index is not unique",
+        );
+        assert_eq!(
+            loser.sqlstate(),
+            sqlstate::SERIALIZATION_FAILURE,
+            "a lost race is 40001 here; the executor is what turns it into 23505 for an index key"
+        );
+        assert_eq!(backend.peek(b"i/alice").as_deref(), Some(&b"left"[..]));
+    }
+
+    /// A conflict is about the keys a transaction *wrote*, not the ones it read past. Two
+    /// transactions touching different keys must both commit, or every concurrent insert would
+    /// fail and the fake would be useless for testing anything else.
+    #[test]
+    fn transactions_that_write_different_keys_both_commit() {
+        let backend = MemoryBackend::new();
+        let mut left = backend.begin().unwrap();
+        let mut right = backend.begin().unwrap();
+        left.put(b"a", b"1");
+        right.put(b"b", b"2");
+        assert!(left.commit().is_ok());
+        assert!(right.commit().is_ok(), "different keys do not conflict");
+    }
+
+    /// A scan must not see a version committed after its snapshot, or a query would return rows
+    /// that did not exist when it started.
+    #[test]
+    fn a_scan_reads_only_its_own_snapshot() {
+        let backend = MemoryBackend::new();
+        let mut setup = backend.begin().unwrap();
+        setup.put(b"k1", b"a");
+        setup.commit().unwrap();
+
+        let reader = backend.begin().unwrap();
+        let mut writer = backend.begin().unwrap();
+        writer.put(b"k2", b"b");
+        writer.commit().unwrap();
+
+        let rows = reader.scan(b"k", b"l", 0).unwrap();
+        assert_eq!(rows.len(), 1, "k2 was committed after the reader started");
+    }
+
+    #[test]
+    fn a_scan_respects_its_range_and_limit() {
+        let backend = MemoryBackend::new();
+        let mut txn = backend.begin().unwrap();
+        for key in [&b"a"[..], b"b", b"c", b"d"] {
+            txn.put(key, b"v");
+        }
+        txn.commit().unwrap();
+
+        let reader = backend.begin().unwrap();
+        assert_eq!(
+            reader.scan(b"b", b"d", 0).unwrap().len(),
+            2,
+            "end is exclusive"
+        );
+        assert_eq!(
+            reader.scan(b"a", b"z", 2).unwrap().len(),
+            2,
+            "limit applies"
+        );
+        assert_eq!(reader.scan(b"a", b"z", 0).unwrap().len(), 4);
+    }
+}

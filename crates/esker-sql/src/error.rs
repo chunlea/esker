@@ -115,6 +115,12 @@ pub enum SqlError {
     #[error("{0}")]
     DatatypeMismatch(String),
 
+    /// Two transactions wrote the same key and this one lost the race. The client is expected to
+    /// retry; the executor turns this into a `23505` when the key it lost was a unique index entry,
+    /// because from the user's point of view that is a duplicate and not a race.
+    #[error("could not serialize access due to concurrent update: {0}")]
+    SerializationFailure(String),
+
     /// A statement arrived after an error inside a transaction block.
     #[error("current transaction is aborted, commands ignored until end of transaction block")]
     InFailedTransaction,
@@ -166,6 +172,7 @@ impl SqlError {
             SqlError::NotNullViolation(_) => sqlstate::NOT_NULL_VIOLATION,
             SqlError::InvalidTextRepresentation { .. } => sqlstate::INVALID_TEXT_REPRESENTATION,
             SqlError::DatatypeMismatch(_) => sqlstate::DATATYPE_MISMATCH,
+            SqlError::SerializationFailure(_) => sqlstate::SERIALIZATION_FAILURE,
             SqlError::InFailedTransaction => sqlstate::IN_FAILED_SQL_TRANSACTION,
             SqlError::ActiveTransaction => sqlstate::ACTIVE_SQL_TRANSACTION,
             SqlError::NoActiveTransaction => sqlstate::NO_ACTIVE_SQL_TRANSACTION,

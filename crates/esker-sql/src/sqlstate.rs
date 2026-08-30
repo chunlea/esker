@@ -73,6 +73,13 @@ pub const INVALID_CURSOR_NAME: &str = "34000";
 /// The startup packet asked for a database that does not exist.
 pub const INVALID_CATALOG_NAME: &str = "3D000";
 
+// --- Class 40 — Transaction Rollback ---
+
+/// Two transactions wrote the same key and this one lost. Percolator detects it at prewrite, and
+/// this is the code PostgreSQL uses for the same situation under serializable isolation — a
+/// client is expected to see it and retry.
+pub const SERIALIZATION_FAILURE: &str = "40001";
+
 // --- Class 42 — Syntax Error or Access Rule Violation ---
 
 /// The statement is not valid SQL. Contract C1 says this must never be the answer to a statement
@@ -133,6 +140,7 @@ mod tests {
         ),
         ("DIVISION_BY_ZERO", super::DIVISION_BY_ZERO),
         ("NOT_NULL_VIOLATION", super::NOT_NULL_VIOLATION),
+        ("SERIALIZATION_FAILURE", super::SERIALIZATION_FAILURE),
         ("UNIQUE_VIOLATION", super::UNIQUE_VIOLATION),
         ("ACTIVE_SQL_TRANSACTION", super::ACTIVE_SQL_TRANSACTION),
         (

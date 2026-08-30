@@ -181,7 +181,7 @@ pub trait Txn: fmt::Debug + Send {
 }
 ```
 
-### What the real `TxnClient` says, and the one thing it does not have
+### What the real `TxnClient` says
 
 `esker-client::txn` landed while this plan was being written, so unit 5's trait is aligned to it
 rather than to the sketch it replaced. Three differences worth recording, because each would
@@ -195,14 +195,30 @@ otherwise be discovered as a compile error at wiring time:
 - **`get` and `scan` take `&self`**, because read-your-writes is served from the buffer without
   mutating it.
 
-**The gap: there is no `put_if_absent`.** The sketch had one as the unique-index seam — "this key
-must not exist at commit". Percolator's conflict detection is what really enforces it, and the
-constraint is expressible as an ordinary write to the index key whose collision the prewrite will
-catch, so this is very likely a *naming* question rather than a missing capability. It is recorded
-here as a contract item for unit 5 to settle **with the phase-5 lane** rather than by inventing a
-method on their client: either the index write is an ordinary `put` and uniqueness falls out of the
-key collision, or `TxnClient` grows an explicit assertion. The fake backend simulates the strict
-version in the meantime, so the executor is written against the stricter of the two.
+### Unique indexes, with no new client method (decided)
+
+The sketch wanted a `put_if_absent` as the unique-index seam. **Decided: there is no such method,
+and there will not be one.** Uniqueness composes out of what `TxnClient` already has, and the
+composition covers both of the ways a duplicate can arrive:
+
+1. **`get` the index key inside the transaction; it must come back absent.** This is what catches a
+   duplicate that is *already committed* — the read is at the transaction's snapshot, so a
+   committed index entry is visible and the executor raises `23505 unique_violation` before writing
+   anything.
+2. **Then an ordinary `put`.** This is what catches a *concurrent* duplicate, and it needs no help:
+   two transactions inserting the same value both read the index key as absent, both prewrite the
+   same key, and Percolator's write-write conflict detection means exactly one of them commits. The
+   loser gets a conflict from `commit`, which the executor reports as `23505`.
+
+So the enforcement was never the client's job to expose — it is what the protocol in
+`docs/DESIGN.md` §8 already does, reached by writing the index entry like any other key. A
+dedicated method would have been a second name for prewrite.
+
+`TODO(post-v1)`: the read in step 1 costs a round trip per unique index per row, and a bulk insert
+into an empty table pays it for every row to learn nothing. The optimisation is to presume the key
+absent and let the prewrite conflict be the whole check, reporting `23505` when it fires — correct
+for the concurrent case already, and for the committed case only once the prewrite can distinguish
+"a value exists" from "someone else is writing". Not v1: it trades a clear error for a faster one.
 
 Synchronous, because `esker-client`'s `RawClient` is synchronous and `tokio` is meant to stay at the
 socket edge (`CLAUDE.md`). The session runs the executor on a blocking task.
@@ -437,7 +453,7 @@ its own gap register, and it would be longer.
   and a real `psql` smoke test
 - [ ] 3 — row and tuple encodings
 - [ ] 4 — catalog
-- [ ] 5 — backend trait and fake
+- [x] 5 — backend trait and fake (the executor's half of the unique-index composition is unit 6)
 - [ ] 6 — planner and executor
 - [ ] 7 — `.slt` harness
 
@@ -503,6 +519,19 @@ test:
 The encoder matched all 14 captured backend messages byte for byte on the first run, which is
 evidence for the goldens being right rather than for the encoder being clever: the same reading of
 the specification produced both, and the capture is the only independent party.
+
+**Unit 5.** The trait is the one above, and the fake behind it is a real little MVCC store rather
+than a map: snapshot reads, buffered writes, and the one conflict rule that matters — a commit fails
+if any key it wrote gained a version after its snapshot, which is what `docs/DESIGN.md` §8's
+prewrite check does. That is deliberate. A fake that accepted every commit would let an executor
+test *assume* the unique-index race is handled; this one makes the race observable, and
+`a_concurrent_duplicate_loses_at_commit` watches two transactions read the same index key as absent,
+both write it, and exactly one survive.
+
+A write conflict is `40001 serialization_failure` at this layer, not `23505`. The distinction is
+contract C3: at the storage seam a lost race is a lost race, and it is the *executor* that knows the
+key was a unique index entry and so knows to report a duplicate. Turning every conflict into `23505`
+here would mislabel an ordinary row-level race as a constraint violation.
 
 **Unit 2b.** Six more rules read off captures rather than out of the specification, each now a
 test: `ReadyForQuery` is once per *message* and not once per statement; an error abandons the rest

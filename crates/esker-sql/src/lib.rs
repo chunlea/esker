@@ -42,6 +42,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod backend;
 pub mod error;
 pub mod parse;
 pub mod pgwire;
