@@ -1,0 +1,34 @@
+Cargo.lock
+  h_44076b318daf9c 239-251,271-278,654-662
+Cargo.toml
+  h_44076b318daf9c 20-24,43
+clippy.toml
+  h_44076b318daf9c 1-5
+crates/esker-sql/Cargo.toml
+  h_44076b318daf9c 1-25
+crates/esker-sql/src/bin/esker-sql.rs
+  h_44076b318daf9c 1-12
+crates/esker-sql/src/error.rs
+  h_44076b318daf9c 1-265
+crates/esker-sql/src/lib.rs
+  h_44076b318daf9c 1-49
+crates/esker-sql/src/parse.rs
+  h_44076b318daf9c 1-425
+crates/esker-sql/src/sqlstate.rs
+  h_44076b318daf9c 1-209
+docs/adr/0014-sqlparser.md
+  h_44076b318daf9c 1-98
+docs/plans/phase-6a.md
+  h_44076b318daf9c 1-288
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a887fd65fbb0bc40a96a0557487f15aee1a257a6",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
