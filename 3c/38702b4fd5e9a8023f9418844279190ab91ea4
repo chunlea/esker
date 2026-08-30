@@ -1,0 +1,19 @@
+crates/esker-pd/tests/crash_kill.rs
+  s_04c6c85b29b28a::t_94b50d7b568b00 1-339
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "3c38702b4fd5e9a8023f9418844279190ab91ea4",
+  "prompts": {},
+  "sessions": {
+    "s_04c6c85b29b28a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0e874339-89db-44c7-acd5-0deac94983ec",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
