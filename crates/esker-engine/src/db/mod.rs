@@ -3,6 +3,7 @@
 //! * [`open`] — creating and recovering, including replaying the log
 //! * [`mod@write`] — group commit, and where invariant 1 is enforced
 //! * [`flush`] — switching memtables, and turning the full ones into L0 files
+//! * [`compact`] — running compactions against real files, and the pool that does it
 //! * [`iter`] — many versions in, one entry per user key out
 //! * [`merge`] — several sorted cursors walked as one
 //! * [`read`] — point lookups, through memtables and then down the levels
@@ -24,6 +25,7 @@
 //! publishes the second. Until it does, the writes are durable but invisible, which is exactly
 //! the window in which a half-applied batch would otherwise be readable.
 
+pub mod compact;
 pub mod flush;
 pub mod iter;
 pub mod merge;
@@ -33,7 +35,7 @@ pub mod snapshot;
 pub mod table_cache;
 pub mod write;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -63,6 +65,8 @@ pub struct Db {
     pub(crate) inner: Arc<DbInner>,
     /// `None` only after `Drop` has taken it to join.
     flusher: Option<JoinHandle<()>>,
+    /// The bounded compaction pool (`docs/DESIGN.md` §14: two threads).
+    compactors: Vec<JoinHandle<()>>,
 }
 
 impl Drop for Db {
@@ -70,13 +74,22 @@ impl Drop for Db {
         // The flag is set while holding the lock the background thread waits on, so it either
         // has not taken the lock yet — and will see the flag — or is already waiting and gets
         // the notification. Setting it outside the lock loses the wake-up in between.
+        // Set under both locks the background threads wait on, so no wake-up is lost in the
+        // window between a thread's check and its wait.
         if let Ok(_state) = self.inner.flush.lock() {
             self.inner.shutdown.store(true, Ordering::Release);
-        } else {
+        }
+        if let Ok(_state) = self.inner.compact.lock() {
             self.inner.shutdown.store(true, Ordering::Release);
         }
+        self.inner.shutdown.store(true, Ordering::Release);
         self.inner.flush_wanted.notify_all();
         self.inner.flush_done.notify_all();
+        self.inner.compact_wanted.notify_all();
+        self.inner.compaction_done.notify_all();
+        for handle in self.compactors.drain(..) {
+            let _unused = handle.join();
+        }
         if let Some(handle) = self.flusher.take() {
             // A background thread that panicked has already reported through `flush.error`;
             // there is nothing useful to do with the join result here.
@@ -105,6 +118,20 @@ pub(crate) struct DbInner {
     pub(crate) flush_wanted: Condvar,
     /// Signalled when it has finished a table, to release stalled writers.
     pub(crate) flush_done: Condvar,
+    /// Guards the compaction pool's wake-up flag and its last error.
+    pub(crate) compact: Mutex<CompactState>,
+    /// Signalled to wake a compaction thread.
+    pub(crate) compact_wanted: Condvar,
+    /// Signalled when one finishes, so a waiter can look again.
+    pub(crate) compaction_done: Condvar,
+    /// File numbers a running compaction has claimed, so two never take the same file.
+    pub(crate) compacting: Mutex<BTreeSet<u64>>,
+    /// Files written but not yet named by any version. The obsolete-file sweep skips them.
+    pub(crate) pending_outputs: Mutex<BTreeSet<u64>>,
+    /// Where the last compaction of `(cf, level)` stopped, so the next starts after it.
+    /// In memory only: losing it costs the spreading and nothing else.
+    pub(crate) compact_pointers: Mutex<BTreeMap<(u32, usize), Vec<u8>>>,
+    pub(crate) compactions: AtomicU64,
     pub(crate) shutdown: AtomicBool,
     /// Times a writer was stopped outright, and times it was merely slowed. Both are
     /// properties, because a database that mysteriously goes slow is one nobody can operate.
@@ -115,6 +142,15 @@ pub(crate) struct DbInner {
     /// The highest sequence number a reader may see.
     pub(crate) visible_seqno: AtomicU64,
     pub(crate) snapshots: Arc<SnapshotList>,
+}
+
+/// What the compaction pool is doing, and what went wrong if anything did.
+#[derive(Debug, Default)]
+pub(crate) struct CompactState {
+    /// Set when something has changed that may want compacting.
+    pub(crate) wanted: bool,
+    /// The first background failure.
+    pub(crate) error: Option<String>,
 }
 
 /// What the background flush thread is doing, and what went wrong if anything did.
@@ -310,7 +346,8 @@ impl Db {
     /// Recognised names: `esker.num-column-families`, `esker.snapshots`,
     /// `esker.compaction-floor`, `esker.instance`,
     /// `esker.last-sequence`, `esker.write-stalls`, `esker.write-slowdowns`,
-    /// `esker.open-tables`, `esker.mem-table-size.<cf>`, `esker.num-immutable-mem-table.<cf>`,
+    /// `esker.open-tables`, `esker.compactions`, `esker.compactions-running`,
+    /// `esker.mem-table-size.<cf>`, `esker.num-immutable-mem-table.<cf>`,
     /// `esker.oldest-log.<cf>`, `esker.num-files-at-level<n>.<cf>`.
     pub fn property(&self, name: &str) -> Option<String> {
         let inner = &self.inner;
@@ -323,6 +360,14 @@ impl Db {
             "esker.write-stalls" => Some(inner.stalls.load(Ordering::Relaxed).to_string()),
             "esker.write-slowdowns" => Some(inner.slowdowns.load(Ordering::Relaxed).to_string()),
             "esker.open-tables" => Some(inner.table_cache.len().to_string()),
+            "esker.compactions" => Some(inner.compactions.load(Ordering::Relaxed).to_string()),
+            "esker.compactions-running" => Some(
+                inner
+                    .compacting
+                    .lock()
+                    .map_or(0, |busy| busy.len())
+                    .to_string(),
+            ),
             _ => {
                 let (prefix, cf_name) = name.rsplit_once('.')?;
                 let cf = inner.cf_by_name(cf_name).ok()?;

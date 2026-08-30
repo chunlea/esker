@@ -65,11 +65,17 @@ pub trait CompactionOutput {
     fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()>;
 
     /// Bytes in the file currently being written; zero when none is open.
+    ///
+    /// A size, not a state: an SST builder reports bytes it has actually written, and a small
+    /// file's entries are all still in an unflushed block, so this reads zero while a file is
+    /// very much open. Only [`finish_file`](CompactionOutput::finish_file) knows.
     fn current_file_size(&self) -> u64;
 
-    /// Finishes the open file, if there is one. The next [`add`](CompactionOutput::add) starts
-    /// a new one.
-    fn finish_file(&mut self) -> Result<()>;
+    /// Finishes the open file if there is one, reporting whether that produced a file.
+    ///
+    /// Returns `false` when nothing was open or nothing had been added, which is why the
+    /// caller can end a compaction by calling it unconditionally.
+    fn finish_file(&mut self) -> Result<bool>;
 }
 
 /// What one compaction did. Reported as metrics, and asserted in tests.
@@ -178,8 +184,7 @@ impl CompactionJob<'_> {
             previous_seqno = seqno;
 
             if let Some(emit) = emit {
-                if output.current_file_size() >= self.target_file_size {
-                    output.finish_file()?;
+                if output.current_file_size() >= self.target_file_size && output.finish_file()? {
                     stats.files_written += 1;
                 }
                 if emit == kind {
@@ -198,8 +203,10 @@ impl CompactionJob<'_> {
         // be asked for rather than assumed.
         input.status()?;
 
-        if output.current_file_size() > 0 {
-            output.finish_file()?;
+        // Unconditional: `current_file_size` cannot tell an empty output from an unflushed
+        // one, and mistaking the second for the first drops every entry the compaction wrote
+        // while still deleting its inputs.
+        if output.finish_file()? {
             stats.files_written += 1;
         }
         Ok(stats)
@@ -207,6 +214,9 @@ impl CompactionJob<'_> {
 }
 
 #[cfg(test)]
+// A test filter's name is a literal, which clippy would rather see as `&'static str` — but the
+// trait says `&str`, because a real filter may build its name from its configuration.
+#[allow(clippy::unnecessary_literal_bound)]
 mod tests {
     use super::{
         CompactionFilter, CompactionJob, CompactionOutput, CompactionStats, FilterDecision,
@@ -308,7 +318,7 @@ mod tests {
 
     impl CompactionOutput for Collected {
         fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-            self.bytes += (key.len() + value.len()) as u64;
+            self.bytes += u64::try_from(key.len() + value.len()).unwrap_or(u64::MAX);
             self.open
                 .get_or_insert_with(Vec::new)
                 .push((key.to_vec(), value.to_vec()));
@@ -317,12 +327,16 @@ mod tests {
         fn current_file_size(&self) -> u64 {
             if self.open.is_some() { self.bytes } else { 0 }
         }
-        fn finish_file(&mut self) -> Result<()> {
-            if let Some(file) = self.open.take() {
-                self.files.push(file);
-            }
+
+        fn finish_file(&mut self) -> Result<bool> {
             self.bytes = 0;
-            Ok(())
+            match self.open.take() {
+                Some(file) if !file.is_empty() => {
+                    self.files.push(file);
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
         }
     }
 
@@ -528,6 +542,60 @@ mod tests {
         assert_eq!(stats.dropped_by_filter, 0);
     }
 
+    /// A builder that reports zero until it has enough to flush, as a real one does. The job
+    /// must still write everything: this is the shape that lost a whole compaction the first
+    /// time round.
+    #[test]
+    fn a_small_compaction_is_written_even_though_it_reports_no_size() {
+        #[derive(Debug, Default)]
+        struct NeverFlushes {
+            files: Vec<Vec<Vec<u8>>>,
+            open: Option<Vec<Vec<u8>>>,
+        }
+        impl CompactionOutput for NeverFlushes {
+            fn add(&mut self, key: &[u8], _value: &[u8]) -> Result<()> {
+                self.open.get_or_insert_with(Vec::new).push(key.to_vec());
+                Ok(())
+            }
+            fn current_file_size(&self) -> u64 {
+                0 // Everything is still in an unflushed block.
+            }
+            fn finish_file(&mut self) -> Result<bool> {
+                match self.open.take() {
+                    Some(file) if !file.is_empty() => {
+                        self.files.push(file);
+                        Ok(true)
+                    }
+                    _ => Ok(false),
+                }
+            }
+        }
+
+        let comparator = comparator();
+        let is_bottom = |_: &[u8]| true;
+        let job = CompactionJob {
+            comparator: &comparator,
+            floor: 1000,
+            level: 1,
+            target_file_size: 8 << 20,
+            filter: None,
+            is_bottom: &is_bottom,
+        };
+        let mut input = Input::new(vec![
+            entry("a", 5, EntryKind::Put, "a"),
+            entry("b", 5, EntryKind::Put, "b"),
+        ]);
+        let mut output = NeverFlushes::default();
+        let stats = job.run(&mut input, &mut output).unwrap();
+        assert_eq!(stats.entries_written, 2);
+        assert_eq!(
+            stats.files_written, 1,
+            "the file must be finished even at size zero"
+        );
+        assert_eq!(output.files.len(), 1);
+        assert_eq!(output.files[0].len(), 2);
+    }
+
     /// Output is cut into files at the target size, and the entries are the same either way.
     #[test]
     fn output_is_split_into_files_at_the_target_size() {
@@ -553,7 +621,10 @@ mod tests {
             output.files.len() > 1,
             "twenty entries should not fit in one 40-byte file"
         );
-        assert_eq!(stats.files_written as usize, output.files.len());
+        assert_eq!(
+            usize::try_from(stats.files_written).unwrap(),
+            output.files.len()
+        );
         assert_eq!(stats.entries_written, 20);
 
         let mut written: Vec<Vec<u8>> = output.entries().into_iter().map(|(key, _)| key).collect();

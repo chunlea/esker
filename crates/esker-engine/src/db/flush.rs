@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use crate::dbformat::{Comparator, InternalPrefixExtractor, SeqNo, extract_tag, tag_seqno};
 use crate::error::{Error, IoResultExt, Result};
-use crate::filename::{self, FileKind};
+use crate::filename;
 use crate::memtable::MemTable;
 use crate::sst::{TableBuilder, TableOptions};
 use crate::version::{FileMeta, VersionEdit};
@@ -269,7 +269,10 @@ impl DbInner {
             }
         }
         self.advance_log_number()?;
+        self.drop_pending(number)?;
         self.purge_and_evict()?;
+        // A new L0 file may have pushed the level over its trigger.
+        self.signal_compaction();
         self.flush_done.notify_all();
         Ok(())
     }
@@ -282,6 +285,9 @@ impl DbInner {
         number: u64,
     ) -> Result<Option<FileMeta>> {
         let path = filename::sst(&self.dir, number);
+        // Held before the file exists: until the manifest edit names it, it belongs to no
+        // version, which is exactly what the obsolete-file sweep deletes.
+        self.hold_pending(number)?;
         let file = self.fs.create(&path).at(&path)?;
         let mut builder = TableBuilder::new(self.table_options(cf), file);
 
@@ -311,6 +317,7 @@ impl DbInner {
             // again, rather than leaving a zero-entry SST for compaction to trip over.
             drop(builder);
             let _ = self.fs.delete(&path);
+            self.drop_pending(number)?;
             return Ok(None);
         };
 
@@ -367,17 +374,6 @@ impl DbInner {
         let mut edit = VersionEdit::new();
         edit.log_number = Some(oldest);
         self.log_and_apply(&mut edit)
-    }
-
-    /// Deletes what no version needs, forgetting any table reader for a file that goes.
-    pub(crate) fn purge_and_evict(&self) -> Result<()> {
-        let deleted = lock(&self.versions)?.purge_obsolete_files()?;
-        for path in &deleted {
-            if let Some(FileKind::Sst(number)) = filename::classify_path(path) {
-                self.table_cache.evict(number);
-            }
-        }
-        Ok(())
     }
 }
 

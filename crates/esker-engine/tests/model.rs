@@ -29,11 +29,12 @@
 //!
 //! # `flush` and `compact` must be invisible
 //!
-//! Moving data from a memtable to an L0 file changes where it lives, never what it is, so a
-//! flush is checked as a no-op *for the model*: the whole database and every live snapshot are
-//! re-verified across it. `compact` is not modelled because the engine has no compaction API
-//! yet; [`compaction_still_has_no_public_api`] is the tripwire that says so out loud the day
-//! it appears.
+//! Moving data from a memtable to an L0 file changes where it lives, never what it is, and
+//! compacting merges versions and drops what nothing can see — also invisible from outside. So
+//! both are checked as no-ops *for the model*: the whole database and every live snapshot are
+//! re-verified across each one. A snapshot's history is precisely what a compaction is
+//! entitled to collect and must not, which is why the snapshot clones are re-checked and not
+//! only the current state.
 //!
 //! # Shrinking
 //!
@@ -45,7 +46,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::sync::Arc;
 
 use esker_engine::batch::WriteBatch;
@@ -133,10 +133,9 @@ enum Op {
     },
     SnapshotDrop(u8),
     Flush(u8),
+    /// Compacts one column family end to end. Like `Flush`, a no-op for the model.
+    Compact(u8),
     Reopen,
-    // TODO(spine step 7): a `Compact` variant, once `Db` has a compaction API. It belongs
-    // beside `Flush` — same shape, same assertion, data identical through every live snapshot
-    // and after a reopen. `compaction_still_has_no_public_api` fails when that day comes.
 }
 
 fn mutation() -> impl Strategy<Value = Mutation> {
@@ -162,6 +161,7 @@ fn op() -> impl Strategy<Value = Op> {
         2 => (any::<u8>(), any::<u8>()).prop_map(|(slot, cf)| Op::SnapshotScan { slot, cf }),
         1 => any::<u8>().prop_map(Op::SnapshotDrop),
         2 => any::<u8>().prop_map(Op::Flush),
+        1 => any::<u8>().prop_map(Op::Compact),
         1 => Just(Op::Reopen),
     ]
 }
@@ -294,6 +294,7 @@ impl World {
                 Ok(())
             }
             Op::Flush(cf) => self.flush(*cf),
+            Op::Compact(cf) => self.compact(*cf),
             Op::Reopen => self.reopen(),
         }
     }
@@ -436,6 +437,18 @@ impl World {
         self.db()
             .flush(CFS[cf])
             .map_err(|error| fail("flush", &error))?;
+        self.verify()
+    }
+
+    /// Compacting rewrites files, merges versions and drops what nothing can see. None of
+    /// that is visible from outside, so it is checked as a no-op for the model — through every
+    /// live snapshot as well, because a snapshot's history is exactly what a compaction is
+    /// entitled to collect and must not.
+    fn compact(&self, cf: u8) -> Result<(), TestCaseError> {
+        let cf = cf_index(cf);
+        self.db()
+            .compact_range(CFS[cf], None, None)
+            .map_err(|error| fail("compact", &error))?;
         self.verify()
     }
 
@@ -616,33 +629,5 @@ fn a_snapshot_taken_before_a_reopen_is_refused() {
     assert_ne!(
         stale.instance(),
         db.property("esker.instance").unwrap().parse().unwrap()
-    );
-}
-
-/// The tripwire for the one operation `prompts/01-engine.md` lists that is not modelled.
-///
-/// `Op` has no `Compact` variant because `Db` has no compaction API. This reads the crate's own
-/// source rather than the type system, because the absence of a method is not something a test
-/// can otherwise notice — and the point is to fail loudly the day it appears, so that wiring
-/// compaction into the model is not left to memory.
-#[test]
-fn compaction_still_has_no_public_api() {
-    let db_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/db");
-    let mut found = Vec::new();
-    for entry in std::fs::read_dir(&db_dir).expect("src/db is readable") {
-        let path = entry.expect("a directory entry").path();
-        if path.extension().is_none_or(|ext| ext != "rs") {
-            continue;
-        }
-        let text = std::fs::read_to_string(&path).expect("a source file");
-        if text.contains("pub fn compact") {
-            found.push(path.file_name().map(std::ffi::OsStr::to_os_string));
-        }
-    }
-    assert!(
-        found.is_empty(),
-        "compaction has a public API now ({found:?}). Add a `Compact` op to tests/model.rs \
-         beside `Flush` — same shape, same assertion: the data must be identical through every \
-         live snapshot and after a reopen — then delete this test."
     );
 }

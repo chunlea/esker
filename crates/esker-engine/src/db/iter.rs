@@ -50,6 +50,11 @@ enum Direction {
 #[derive(Debug)]
 struct TableCursor(TableIter);
 
+/// Wraps a table cursor so it can join a merge. Used by iteration and by compaction.
+pub(crate) fn table_cursor(iter: TableIter) -> Box<dyn Cursor + Send> {
+    Box::new(TableCursor(iter))
+}
+
 impl Cursor for TableCursor {
     fn valid(&self) -> bool {
         self.0.valid()
@@ -371,7 +376,7 @@ impl Db {
         for level in 0..levels {
             for file in version.files(cf.id(), level) {
                 let reader = self.inner.table_cache.get(file.number, &table_options)?;
-                children.push(Box::new(TableCursor(reader.iter())));
+                children.push(table_cursor(reader.iter()));
             }
         }
 

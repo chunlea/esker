@@ -1145,3 +1145,226 @@ fn a_snapshot_from_another_database_is_refused() {
         db.last_seqno().to_string()
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// Compaction.
+// ---------------------------------------------------------------------------------------
+
+/// The whole point: data goes down the levels and is still all there.
+#[test]
+fn compaction_moves_data_down_and_keeps_every_key() {
+    let (_, fs) = memfs();
+    let db = open(&fs, options(), &[cf::DEFAULT]).unwrap();
+    for generation in 0..4u32 {
+        for i in 0..50u32 {
+            db.put(
+                cf::DEFAULT,
+                format!("key-{i:03}").as_bytes(),
+                format!("gen{generation}").as_bytes(),
+            )
+            .unwrap();
+        }
+        db.flush(cf::DEFAULT).unwrap();
+    }
+    db.delete(cf::DEFAULT, b"key-007").unwrap();
+    db.compact_range(cf::DEFAULT, None, None).unwrap();
+
+    assert!(db.compactions_run() > 0, "nothing was compacted");
+    assert_eq!(
+        db.property("esker.num-files-at-level0.default").unwrap(),
+        "0"
+    );
+    let deeper: usize = (1..7)
+        .map(|level| {
+            db.property(&format!("esker.num-files-at-level{level}.default"))
+                .unwrap()
+                .parse::<usize>()
+                .unwrap()
+        })
+        .sum();
+    assert!(deeper > 0, "the data has to have landed somewhere");
+
+    for i in 0..50u32 {
+        let key = format!("key-{i:03}");
+        let expected = if i == 7 { None } else { Some(&b"gen3"[..]) };
+        assert_eq!(get(&db, key.as_bytes()).as_deref(), expected, "{key}");
+    }
+    assert_eq!(
+        scan(&db).len(),
+        49,
+        "the deleted key is gone from a scan too"
+    );
+}
+
+/// A compaction may not collect what a snapshot can still read. This is the property the
+/// floor exists for, checked end to end rather than in the picker's unit tests.
+#[test]
+fn a_snapshot_survives_a_compaction_that_would_otherwise_collect_it() {
+    let (_, fs) = memfs();
+    let db = open(&fs, options(), &[cf::DEFAULT]).unwrap();
+    for i in 0..30u32 {
+        db.put(cf::DEFAULT, format!("k{i:02}").as_bytes(), b"first")
+            .unwrap();
+    }
+    db.flush(cf::DEFAULT).unwrap();
+    let snapshot = db.snapshot();
+
+    for i in 0..30u32 {
+        db.put(cf::DEFAULT, format!("k{i:02}").as_bytes(), b"second")
+            .unwrap();
+    }
+    db.delete(cf::DEFAULT, b"k05").unwrap();
+    db.flush(cf::DEFAULT).unwrap();
+    db.compact_range(cf::DEFAULT, None, None).unwrap();
+
+    let at_snapshot = ReadOptions {
+        snapshot: Some(snapshot.clone()),
+        ..ReadOptions::default()
+    };
+    for i in 0..30u32 {
+        let key = format!("k{i:02}");
+        assert_eq!(
+            db.get(cf::DEFAULT, key.as_bytes(), &at_snapshot)
+                .unwrap()
+                .as_deref(),
+            Some(&b"first"[..]),
+            "{key} at the snapshot"
+        );
+    }
+    assert_eq!(
+        db.get(cf::DEFAULT, b"k05", &at_snapshot)
+            .unwrap()
+            .as_deref(),
+        Some(&b"first"[..]),
+        "the snapshot predates the delete"
+    );
+    assert_eq!(get(&db, b"k05"), None, "and the delete is visible now");
+
+    // Once nothing pins it, a second compaction is free to collect the old versions.
+    drop(snapshot);
+    for i in 0..30u32 {
+        db.put(cf::DEFAULT, format!("k{i:02}").as_bytes(), b"third")
+            .unwrap();
+    }
+    db.compact_range(cf::DEFAULT, None, None).unwrap();
+    for i in 0..30u32 {
+        assert_eq!(
+            get(&db, format!("k{i:02}").as_bytes()).as_deref(),
+            Some(&b"third"[..])
+        );
+    }
+}
+
+/// A compacted database has to reopen as itself.
+#[test]
+fn a_compacted_database_reopens_unchanged() {
+    let (_, fs) = memfs();
+    let before;
+    {
+        let db = open(&fs, small_buffer(4 * 1024), &[cf::DEFAULT]).unwrap();
+        for i in 0..300u32 {
+            db.put(cf::DEFAULT, format!("key-{i:04}").as_bytes(), &[b'v'; 32])
+                .unwrap();
+        }
+        db.compact_range(cf::DEFAULT, None, None).unwrap();
+        before = scan(&db);
+        assert_eq!(before.len(), 300);
+    }
+    let db = open(&fs, Options::default(), &[cf::DEFAULT]).unwrap();
+    assert_eq!(scan(&db), before);
+}
+
+/// Writing enough to fill several memtables should make the background pool compact without
+/// anyone asking, and everything must still be readable while it does.
+#[test]
+fn the_background_pool_compacts_by_itself() {
+    let (_, fs) = memfs();
+    let db = open(&fs, small_buffer(2 * 1024), &[cf::DEFAULT]).unwrap();
+    for round in 0..6u32 {
+        for i in 0..200u32 {
+            db.put(
+                cf::DEFAULT,
+                format!("key-{i:04}").as_bytes(),
+                format!("round{round}").as_bytes(),
+            )
+            .unwrap();
+        }
+    }
+    db.flush(cf::DEFAULT).unwrap();
+    // Give the pool a moment; then finish the job synchronously so the test is not a race.
+    db.compact_range(cf::DEFAULT, None, None).unwrap();
+
+    assert!(db.compactions_run() > 0);
+    assert_eq!(db.property("esker.compactions-running").unwrap(), "0");
+    for i in 0..200u32 {
+        assert_eq!(
+            get(&db, format!("key-{i:04}").as_bytes()).as_deref(),
+            Some(&b"round5"[..]),
+            "key-{i:04}"
+        );
+    }
+}
+
+/// The filter is how `esker-txn` will collect MVCC versions below PD's safepoint.
+#[test]
+fn a_compaction_filter_drops_what_it_refuses() {
+    use esker_engine::compaction::{CompactionFilter, FilterDecision};
+
+    #[derive(Debug)]
+    struct DropOddKeys;
+    // The trait returns `&str` because a real filter may build its name from its
+    // configuration; a test one is a literal, which clippy would rather see as `'static`.
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl CompactionFilter for DropOddKeys {
+        fn filter(&self, _level: usize, user_key: &[u8], _value: &[u8]) -> FilterDecision {
+            match user_key.last() {
+                Some(byte) if (byte - b'0') % 2 == 1 => FilterDecision::Remove,
+                _ => FilterDecision::Keep,
+            }
+        }
+        fn name(&self) -> &str {
+            "test.DropOddKeys"
+        }
+    }
+
+    let (_, fs) = memfs();
+    let db = open(
+        &fs,
+        Options {
+            create_if_missing: true,
+            cf_options: CfOptions {
+                compaction_filter: Some(Arc::new(DropOddKeys)),
+                ..CfOptions::default()
+            },
+            ..Options::default()
+        },
+        &[cf::DEFAULT],
+    )
+    .unwrap();
+
+    for i in 0..20u32 {
+        db.put(cf::DEFAULT, format!("k{i:02}").as_bytes(), b"v")
+            .unwrap();
+    }
+    assert_eq!(
+        scan(&db).len(),
+        20,
+        "the filter runs during compaction, not on write"
+    );
+
+    db.compact_range(cf::DEFAULT, None, None).unwrap();
+    let survivors: Vec<String> = scan(&db)
+        .into_iter()
+        .map(|(key, _)| String::from_utf8_lossy(&key).into_owned())
+        .collect();
+    assert_eq!(
+        survivors.len(),
+        10,
+        "half the keys end in an odd digit: {survivors:?}"
+    );
+    assert!(
+        survivors
+            .iter()
+            .all(|key| key.ends_with(['0', '2', '4', '6', '8']))
+    );
+}

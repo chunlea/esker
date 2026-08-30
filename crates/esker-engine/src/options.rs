@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cache_api::BlockCache;
+use crate::compaction::CompactionFilter;
 use crate::db::Snapshot;
 use crate::dbformat::{BytewiseComparator, Comparator};
 
@@ -239,6 +240,9 @@ pub struct CfOptions {
     pub max_bytes_for_level_multiplier: u64,
     /// Bytes an SST written by a compaction may reach before the next key starts a new file.
     pub target_file_size: u64,
+    /// Lets the layer above drop entries during compaction. `esker-txn` uses it to collect
+    /// MVCC versions below PD's safepoint (`docs/DESIGN.md` §8).
+    pub compaction_filter: Option<Arc<dyn CompactionFilter>>,
 }
 
 impl Default for CfOptions {
@@ -258,6 +262,7 @@ impl Default for CfOptions {
             max_bytes_for_level_base: defaults::MAX_BYTES_FOR_LEVEL_BASE,
             max_bytes_for_level_multiplier: defaults::MAX_BYTES_FOR_LEVEL_MULTIPLIER,
             target_file_size: defaults::TARGET_FILE_SIZE,
+            compaction_filter: None,
         }
     }
 }

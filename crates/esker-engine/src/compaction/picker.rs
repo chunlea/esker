@@ -343,7 +343,8 @@ mod tests {
     /// The last level has nowhere to compact into, so however large it is it is never a source.
     #[test]
     fn the_bottom_level_is_never_picked() {
-        let mut files = vec![(LEVELS as u32 - 1, 1u64, "a", "z", 100_000_000u64)];
+        let bottom = u32::try_from(LEVELS).unwrap() - 1;
+        let mut files = vec![(bottom, 1u64, "a", "z", 100_000_000u64)];
         files.push((0, 2, "a", "b", 1));
         let version = version(&files);
         assert_eq!(picker().worst_level(cf(&version)), None);

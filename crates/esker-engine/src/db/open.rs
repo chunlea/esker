@@ -16,10 +16,11 @@
 //! sequence number that has already been used, which puts two different values under one
 //! internal key.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::thread::JoinHandle;
 
 use crate::batch::WriteBatch;
 use crate::dbformat::{InternalKeyComparator, SeqNo};
@@ -31,7 +32,7 @@ use crate::version::{VersionEdit, VersionSet};
 use crate::wal::{LogReader, LogWriter, ReadOutcome};
 
 use super::table_cache::TableCache;
-use super::{ColumnFamily, Db, DbInner, FlushState, SnapshotList, Wal, WriteQueue};
+use super::{ColumnFamily, CompactState, Db, DbInner, FlushState, SnapshotList, Wal, WriteQueue};
 
 /// How many SSTs are kept open at once. Small enough to bound file descriptors, large enough
 /// that a hot working set is not reopened on every lookup.
@@ -134,6 +135,13 @@ impl Db {
             flush: Mutex::new(FlushState::default()),
             flush_wanted: Condvar::new(),
             flush_done: Condvar::new(),
+            compact: Mutex::new(CompactState::default()),
+            compact_wanted: Condvar::new(),
+            compaction_done: Condvar::new(),
+            compacting: Mutex::new(BTreeSet::new()),
+            pending_outputs: Mutex::new(BTreeSet::new()),
+            compact_pointers: Mutex::new(BTreeMap::new()),
+            compactions: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             stalls: AtomicU64::new(0),
             slowdowns: AtomicU64::new(0),
@@ -142,21 +150,12 @@ impl Db {
             snapshots: SnapshotList::new(),
         });
 
-        // One background thread per database, holding a `Weak` so that dropping the last
-        // handle lets the state go even if the thread is mid-wait.
-        let weak = Arc::downgrade(&inner);
-        let flusher = std::thread::Builder::new()
-            .name("esker-flush".to_string())
-            .spawn(move || {
-                if let Some(inner) = weak.upgrade() {
-                    inner.flush_loop();
-                }
-            })
-            .map_err(|err| Error::io(&dir_for_error, err))?;
+        let (flusher, compactors) = spawn_background(&inner, &dir_for_error)?;
 
         let db = Self {
             inner,
             flusher: Some(flusher),
+            compactors,
         };
         db.purge_obsolete_files()?;
         Ok(db)
@@ -168,6 +167,43 @@ impl Db {
         let mut versions = super::lock(&self.inner.versions)?;
         versions.purge_obsolete_files()
     }
+}
+
+/// Starts the flush thread and the compaction pool.
+///
+/// Each holds a `Weak`, so dropping the last handle lets the state go even if a thread is
+/// mid-wait. The pool is bounded rather than one thread per compaction: compaction is
+/// throughput work, and an unbounded pool starves the foreground of the disk
+/// (`docs/DESIGN.md` §4.7).
+fn spawn_background(
+    inner: &Arc<DbInner>,
+    dir: &Path,
+) -> Result<(JoinHandle<()>, Vec<JoinHandle<()>>)> {
+    let weak = Arc::downgrade(inner);
+    let flusher = std::thread::Builder::new()
+        .name("esker-flush".to_string())
+        .spawn(move || {
+            if let Some(inner) = weak.upgrade() {
+                inner.flush_loop();
+            }
+        })
+        .map_err(|err| Error::io(dir, err))?;
+
+    let mut compactors = Vec::new();
+    for index in 0..inner.options.compaction_threads.max(1) {
+        let weak = Arc::downgrade(inner);
+        compactors.push(
+            std::thread::Builder::new()
+                .name(format!("esker-compact-{index}"))
+                .spawn(move || {
+                    if let Some(inner) = weak.upgrade() {
+                        inner.compaction_loop();
+                    }
+                })
+                .map_err(|err| Error::io(dir, err))?,
+        );
+    }
+    Ok((flusher, compactors))
 }
 
 /// Creates or recovers the version set, and makes sure every column family the caller named
