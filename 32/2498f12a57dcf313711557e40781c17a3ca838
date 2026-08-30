@@ -1,0 +1,19 @@
+docs/plans/phase-1.md
+  s_dc640bf0df4adb::t_cebb57a79435a4 1-201
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "322498f12a57dcf313711557e40781c17a3ca838",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
