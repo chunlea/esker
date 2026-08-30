@@ -84,6 +84,13 @@ pub trait RegionHost: Send + Sync + std::fmt::Debug {
     /// so the driver stops and the restart rebuilds the map from the records — which is the same
     /// state this call was trying to produce.
     fn split_applied(&self, parent: &Region, child: &Region) -> Result<()>;
+
+    /// Brings a membership change into effect: the region's peer list and epoch have moved.
+    ///
+    /// `removed_self` means **this store's own peer** was the one removed. The region is then torn
+    /// down — but not from here: this runs on that peer's own driver thread, and stopping a thread
+    /// from inside it is a join on itself. The host arranges the teardown elsewhere.
+    fn conf_change_applied(&self, region: &Region, removed_self: bool) -> Result<()>;
 }
 
 /// A host that refuses to split, for a peer that has no store around it.
@@ -96,6 +103,12 @@ impl RegionHost for NoHost {
             "region {} split, but this peer has no store to put the halves in",
             parent.id
         )))
+    }
+
+    fn conf_change_applied(&self, _region: &Region, _removed_self: bool) -> Result<()> {
+        // A peer with no store around it has no region map to move, and a membership change is
+        // still a fact about its own `region` — which the driver has already updated.
+        Ok(())
     }
 }
 
@@ -129,6 +142,13 @@ pub enum PeerMsg {
     Propose {
         /// The encoded command.
         command: Bytes,
+        /// Where the outcome goes.
+        notify: oneshot::Sender<std::result::Result<Applied, ProtoError>>,
+    },
+    /// A membership change to replicate, answered once it has applied.
+    ProposeConfChange {
+        /// What to change.
+        change: esker_raft::ConfChange,
         /// Where the outcome goes.
         notify: oneshot::Sender<std::result::Result<Applied, ProtoError>>,
     },
@@ -401,6 +421,7 @@ impl PeerCore {
     fn apply(&mut self, entry: &Entry) -> Result<()> {
         let mut batch = WriteBatch::new();
         let mut split_halves = None;
+        let mut conf_change = None;
 
         let outcome: std::result::Result<Applied, ProtoError> = match entry.kind {
             // A leader's no-op carries no payload; it exists so §5.4.2 lets the backlog commit.
@@ -440,14 +461,17 @@ impl PeerCore {
                 }
             }
             EntryKind::ConfChange => {
-                // TODO(phase-4c): membership over the wire. There is still no operator to have
-                // proposed one, so reaching here is worth saying out loud.
-                tracing::warn!(
-                    region_id = self.region_id,
-                    index = entry.index,
-                    "a configuration change was committed; no operator proposes one yet"
-                );
-                Ok(Applied::Done)
+                // The **core** has already moved its own membership — it applies a conf change
+                // when the entry is appended, not when it applies (`esker_raft::conf`). What is
+                // left is the store's half: the region's peer list, its `conf_ver`, and the
+                // record on disk that a restart reads.
+                let change = esker_raft::ConfChange::decode(&entry.data).map_err(|error| {
+                    StoreError::Bootstrap(format!(
+                        "could not apply the conf change at {}: {error}",
+                        entry.index
+                    ))
+                })?;
+                self.stage_conf_change(&mut batch, &mut conf_change, &change)
             }
         };
 
@@ -476,9 +500,74 @@ impl PeerCore {
                 "a region split"
             );
         }
+        if let Some((region, removed_self)) = conf_change {
+            self.region = region.clone();
+            self.host.conf_change_applied(&region, removed_self)?;
+            tracing::info!(
+                region_id = region.id,
+                index = entry.index,
+                peers = region.peers.len(),
+                removed_self,
+                "a region's membership changed"
+            );
+        }
 
         self.complete_proposal(entry, outcome);
         Ok(())
+    }
+
+    /// Stages the store's half of a membership change: the region's new peer list and epoch.
+    ///
+    /// **Idempotent by the peer list**, in the same spirit as a split's boundary check: adding a
+    /// peer that is already a voter, or removing one that is not there, leaves the region as it
+    /// was and does nothing. A replayed entry therefore costs a comparison rather than a second
+    /// `conf_ver` bump, which would make every client's cached epoch stale for no reason.
+    ///
+    /// `applied_conf` moves here and nowhere else. It is the membership **as of the apply index**,
+    /// which is what a compaction records and what a snapshot names — a different value from the
+    /// core's membership in force, which moved when the entry was *appended*.
+    fn stage_conf_change(
+        &mut self,
+        batch: &mut WriteBatch,
+        outcome: &mut Option<(Region, bool)>,
+        change: &esker_raft::ConfChange,
+    ) -> std::result::Result<Applied, ProtoError> {
+        let store_id = crate::apply::decode_conf_change_context(&change.context)?;
+        let moved = crate::apply::apply_conf_change(&self.region, change, store_id)?;
+        if moved.peers == self.region.peers {
+            tracing::debug!(
+                region_id = self.region_id,
+                node = change.node,
+                "a conf change that changes nothing applied as a no-op"
+            );
+            return Ok(Applied::Done);
+        }
+
+        let removed_self = matches!(change.kind, esker_raft::ConfChangeKind::Remove)
+            && change.node == self.peer_id;
+        match change.kind {
+            esker_raft::ConfChangeKind::AddVoter => {
+                self.applied_conf.learners.retain(|id| *id != change.node);
+                if !self.applied_conf.voters.contains(&change.node) {
+                    self.applied_conf.voters.push(change.node);
+                }
+            }
+            esker_raft::ConfChangeKind::AddLearner => {
+                self.applied_conf.voters.retain(|id| *id != change.node);
+                if !self.applied_conf.learners.contains(&change.node) {
+                    self.applied_conf.learners.push(change.node);
+                }
+            }
+            esker_raft::ConfChangeKind::Remove => {
+                self.applied_conf.voters.retain(|id| *id != change.node);
+                self.applied_conf.learners.retain(|id| *id != change.node);
+            }
+        }
+        self.applied_conf.normalize();
+
+        crate::meta::stage_region(batch, self.node.storage().cf(), &moved);
+        *outcome = Some((moved, removed_self));
+        Ok(Applied::Done)
     }
 
     /// Stages both halves of a split, and hands the caller what has to happen once they are
@@ -642,6 +731,9 @@ impl PeerCore {
                 }
             }
             PeerMsg::Propose { command, notify } => self.propose(command, notify),
+            PeerMsg::ProposeConfChange { change, notify } => {
+                self.propose_conf_change(change, notify);
+            }
             PeerMsg::ReadIndex { notify } => self.read_index(notify),
             PeerMsg::Status(notify) => {
                 let _ = notify.send(self.node.status());
@@ -678,6 +770,36 @@ impl PeerCore {
             // Failing the caller is better than leaving it waiting for an entry that will never
             // arrive.
             let _ = notify.send(Err(ProtoError::internal("the proposal appended no entry")));
+            return;
+        }
+        self.pending.push(Pending {
+            index: status.last_index,
+            term: status.term,
+            notify,
+        });
+    }
+
+    /// Proposes a membership change, tracked like any other proposal: the answer comes back when
+    /// the entry *applies*, not when it is accepted.
+    fn propose_conf_change(
+        &mut self,
+        change: esker_raft::ConfChange,
+        notify: oneshot::Sender<std::result::Result<Applied, ProtoError>>,
+    ) {
+        if self.node.role() != Role::Leader {
+            let _ = notify.send(Err(self.not_leader()));
+            return;
+        }
+        let before = self.node.status().last_index;
+        if let Err(error) = self.node.propose_conf_change(change) {
+            let _ = notify.send(Err(propose_error(&error, self.region_id)));
+            return;
+        }
+        let status = self.node.status();
+        if status.last_index == before {
+            let _ = notify.send(Err(ProtoError::internal(
+                "the conf change appended no entry",
+            )));
             return;
         }
         self.pending.push(Pending {
@@ -868,6 +990,32 @@ impl RaftPeer {
     pub async fn snapshot_source(&self) -> std::result::Result<SnapshotSource, ProtoError> {
         let (notify, answer) = oneshot::channel();
         self.send(PeerMsg::SnapshotSource(notify)).await?;
+        answer
+            .await
+            .map_err(|_| ProtoError::internal("the Raft peer stopped"))?
+    }
+
+    /// Proposes a membership change, carrying the store the new replica lives on.
+    ///
+    /// The store id rides in the change's context because `esker-raft` never looks at one: the
+    /// core moves the membership and the store moves the region, from the same entry, without
+    /// either knowing the other's business.
+    pub async fn propose_conf_change(
+        &self,
+        kind: esker_raft::ConfChangeKind,
+        node: NodeId,
+        store_id: u64,
+    ) -> std::result::Result<Applied, ProtoError> {
+        let (notify, answer) = oneshot::channel();
+        self.send(PeerMsg::ProposeConfChange {
+            change: esker_raft::ConfChange {
+                kind,
+                node,
+                context: crate::apply::conf_change_context(store_id),
+            },
+            notify,
+        })
+        .await?;
         answer
             .await
             .map_err(|_| ProtoError::internal("the Raft peer stopped"))?

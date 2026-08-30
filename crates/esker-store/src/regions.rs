@@ -201,6 +201,37 @@ impl RegionMap {
         Ok(())
     }
 
+    /// Replaces a region's metadata, keeping its peer and its place in the range index.
+    ///
+    /// For a change that moves the *epoch and the membership* and not the range — a conf change.
+    /// A range move is a split and goes through [`RegionMap::apply_split`], which has two entries
+    /// to keep consistent rather than one.
+    pub fn replace(&self, region: Region) -> Result<()> {
+        let mut inner = self.write();
+        let Some(existing) = inner.by_id.get(&region.id).cloned() else {
+            return Err(StoreError::RegionConflict(format!(
+                "region {} changed, but this store does not host it",
+                region.id
+            )));
+        };
+        if existing.region().start_key != region.start_key
+            || existing.region().end_key != region.end_key
+        {
+            return Err(StoreError::RegionConflict(format!(
+                "region {}'s range moved without a split, which nothing may do",
+                region.id
+            )));
+        }
+        inner.by_id.insert(
+            region.id,
+            Arc::new(RegionState {
+                meta: RegionMeta::new(region),
+                peer: existing.peer.clone(),
+            }),
+        );
+        Ok(())
+    }
+
     /// Drops a region this store no longer hosts, returning what it held.
     ///
     /// Nothing in 4a calls it; `TODO(phase-4c)` is the `RemovePeer` operator, and its hazard is

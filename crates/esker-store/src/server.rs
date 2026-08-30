@@ -376,6 +376,203 @@ impl Store {
         }
     }
 
+    /// Carries out one operator from the placement driver, or says why it did not.
+    ///
+    /// Three ways an operator is declined, and none of them is an error worth failing anything
+    /// over — PD re-issues from the next heartbeat, against whatever state it has by then:
+    ///
+    /// * **the region is not here**, or is not led here. Only a leader proposes;
+    /// * **the epoch has moved** since PD decided. The operator was reasoned about against a
+    ///   membership or a range that no longer exists, and applying it anyway is how two
+    ///   half-informed schedulers take a region below quorum between them;
+    /// * **it changes nothing** — the peer is already there, or already gone. The apply path is
+    ///   idempotent too, but not proposing at all saves an entry and an epoch bump.
+    ///
+    /// `TransferLeader` is reserved for 4d and is ignored, loudly enough to notice.
+    async fn run_operator(self: &Arc<Self>, operator: &esker_proto::Operator) {
+        use esker_proto::Operator;
+
+        let region_id = operator.region_id();
+        let Some(state) = self.regions.get(region_id) else {
+            tracing::debug!(
+                region_id,
+                "an operator arrived for a region this store does not host"
+            );
+            return;
+        };
+        let current = state.region().epoch;
+        if operator.epoch() != current {
+            tracing::debug!(
+                region_id,
+                theirs = ?operator.epoch(),
+                ours = ?current,
+                "an operator was decided against an epoch this region has moved past"
+            );
+            return;
+        }
+        let Some(peer) = state.peer().map(Arc::clone) else {
+            return;
+        };
+        if !peer.is_leader() {
+            tracing::debug!(
+                region_id,
+                "an operator arrived at a peer that does not lead"
+            );
+            return;
+        }
+
+        let (kind, node, store_id) = match operator {
+            // **Learner first.** A learner receives the log and the snapshot without voting, so
+            // adding one never makes a quorum harder to reach while it catches up. The promotion
+            // is a second operator, which PD issues once it sees the learner in a heartbeat.
+            Operator::AddPeer {
+                store_id, peer_id, ..
+            } => {
+                if state
+                    .region()
+                    .peers
+                    .iter()
+                    .any(|peer| peer.peer_id == *peer_id)
+                {
+                    return;
+                }
+                (esker_raft::ConfChangeKind::AddLearner, *peer_id, *store_id)
+            }
+            Operator::RemovePeer { peer_id, .. } => {
+                let Some(existing) = state
+                    .region()
+                    .peers
+                    .iter()
+                    .find(|peer| peer.peer_id == *peer_id)
+                else {
+                    return;
+                };
+                (
+                    esker_raft::ConfChangeKind::Remove,
+                    *peer_id,
+                    existing.store_id,
+                )
+            }
+            Operator::TransferLeader { to_peer_id, .. } => {
+                tracing::warn!(
+                    region_id,
+                    to_peer_id,
+                    "a TransferLeader operator arrived; leader balance is 4d and this store \
+                     ignores it"
+                );
+                return;
+            }
+        };
+
+        match peer.propose_conf_change(kind, node, store_id).await {
+            Ok(_) => tracing::info!(region_id, node, ?kind, "an operator applied"),
+            Err(error) => tracing::debug!(
+                region_id,
+                node,
+                %error,
+                "an operator did not apply; the placement driver will issue it again"
+            ),
+        }
+    }
+
+    /// Promotes a learner that has caught up, which is the second half of learner-first.
+    ///
+    /// The criterion is the one the store can **actually evaluate**: `esker-raft` exposes no
+    /// per-peer `Progress`, so "the learner's match index is near the leader's last index" is not
+    /// a question this layer can ask (`docs/plans/phase-4.md` §13.2). What it can see is that the
+    /// learner is in the region's membership and that this leader has since committed an entry in
+    /// a term it still holds — the first says the learner is receiving the log, the second that
+    /// the log has moved on with it in place.
+    ///
+    /// More conservative than a match index, deliberately: promoting late costs a delay, and
+    /// promoting early costs a quorum that cannot be reached.
+    pub async fn promote_caught_up_learners(self: &Arc<Self>) {
+        for state in self.regions.states() {
+            let Some(peer) = state.peer().map(Arc::clone) else {
+                continue;
+            };
+            if !peer.is_leader() {
+                continue;
+            }
+            let learners: Vec<Peer> = state
+                .region()
+                .peers
+                .iter()
+                .filter(|peer| peer.role == PeerRole::Learner)
+                .copied()
+                .collect();
+            if learners.is_empty() {
+                continue;
+            }
+            let Ok(status) = peer.status().await else {
+                continue;
+            };
+            // The leader has committed something of its own in this term, so the group — the
+            // learner included — has been following it rather than merely tolerating it.
+            if status.applied < status.commit || status.commit == 0 {
+                continue;
+            }
+            for learner in learners {
+                if let Err(error) = peer
+                    .propose_conf_change(
+                        esker_raft::ConfChangeKind::AddVoter,
+                        learner.peer_id,
+                        learner.store_id,
+                    )
+                    .await
+                {
+                    tracing::debug!(
+                        region_id = state.id(),
+                        peer_id = learner.peer_id,
+                        %error,
+                        "a learner was not promoted; it will be tried again"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Stops serving a region this store has been removed from, and forgets its Raft state.
+    ///
+    /// Spawned rather than done here, because this runs on the removed peer's **own driver
+    /// thread**: stopping it from inside is a join on itself.
+    ///
+    /// The region's **data is left in place**. Removing it would mean point deletes over the whole
+    /// range — the engine has no range tombstones in v1 (ADR 0006) — and the tombstones that
+    /// leaves are keys in the range, which is the state that stops the range ever receiving a
+    /// snapshot again (`docs/plans/phase-4.md` §13.4). So the keys stay, no region covers them, and
+    /// nothing serves them. `TODO(post-v1)`: reclaim them when the engine can drop a range.
+    fn retire_region(self: &Arc<Self>, region_id: u64) {
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        let store = Arc::clone(self);
+        runtime.spawn(async move {
+            let Some(state) = store.regions.remove(region_id) else {
+                return;
+            };
+            if let Some(peer) = state.peer() {
+                let peer = Arc::clone(peer);
+                let _ = tokio::task::spawn_blocking(move || peer.stop()).await;
+            }
+            let db = Arc::clone(&store.db);
+            let removed =
+                tokio::task::spawn_blocking(move || crate::raft_log::destroy(&db, region_id)).await;
+            match removed {
+                Ok(Ok(entries)) => tracing::info!(
+                    region_id,
+                    entries,
+                    "this store was removed from a region; its raft state is gone and its data \
+                     is left where no region covers it"
+                ),
+                Ok(Err(error)) => {
+                    tracing::warn!(region_id, %error, "could not clear a retired region's log");
+                }
+                Err(error) => tracing::warn!(region_id, %error, "the retirement task failed"),
+            }
+        });
+    }
+
     /// Brings a split into effect: narrows the parent and starts the child.
     ///
     /// Called from the **parent's driver thread**, after both halves' records are durable. The map
@@ -418,7 +615,7 @@ impl Store {
         let Some(runtime) = self.runtime.clone() else {
             return;
         };
-        let store = Arc::downgrade(self);
+        let weak = Arc::downgrade(self);
         let store_id = self.store_id;
         let task = runtime.spawn(async move {
             let mut beats = Heartbeats::new(pd, store_id, tick);
@@ -428,21 +625,32 @@ impl Store {
                 interval.tick().await;
                 // A weak reference, so a dropped store ends this task rather than keeping
                 // itself alive through the schedule that reports it.
-                let Some(store) = store.upgrade() else {
+                let Some(store) = weak.upgrade() else {
                     return;
                 };
                 let report = store.report();
                 drop(store);
-                beats = match tokio::task::spawn_blocking(move || {
-                    beats.tick(&report);
-                    beats
+                // The blocking pool refusing means the process is shutting down.
+                let Ok((next, operators)) = tokio::task::spawn_blocking(move || {
+                    let operators = beats.tick(&report);
+                    (beats, operators)
                 })
                 .await
-                {
-                    Ok(beats) => beats,
-                    // The blocking pool is shutting down, which means the process is.
-                    Err(_) => return,
+                else {
+                    return;
                 };
+                beats = next;
+                let Some(store) = weak.upgrade() else {
+                    return;
+                };
+                for operator in operators {
+                    store.run_operator(&operator).await;
+                }
+                // A learner that has caught up is promoted here rather than by an operator: PD
+                // asks for the *replica*, and whether it is ready to vote is a fact only its
+                // leader has.
+                store.promote_caught_up_learners().await;
+                drop(store);
             }
         });
         self.remember(task);
@@ -1358,6 +1566,18 @@ impl RegionHost for StoreHost {
             )));
         };
         store.adopt_split(parent, child)
+    }
+
+    fn conf_change_applied(&self, region: &Region, removed_self: bool) -> Result<()> {
+        let Some(store) = self.store.upgrade() else {
+            // The store is going away and the record is already durable; the next open reads it.
+            return Ok(());
+        };
+        store.regions.replace(region.clone())?;
+        if removed_self {
+            store.retire_region(region.id);
+        }
+        Ok(())
     }
 }
 

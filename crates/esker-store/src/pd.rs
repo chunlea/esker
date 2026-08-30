@@ -27,7 +27,7 @@ use std::fmt;
 #[cfg(any(test, feature = "testing"))]
 use std::{collections::BTreeMap, sync::Mutex};
 
-use esker_proto::{ProtoError, Region};
+use esker_proto::{Operator, ProtoError, Region};
 
 /// What a store tells the placement driver about itself when it registers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,7 +133,12 @@ pub trait PdClient: Send + Sync + fmt::Debug {
     fn store_heartbeat(&self, beat: &StoreHeartbeat) -> Result<(), ProtoError>;
 
     /// Reports one region, from its leader.
-    fn region_heartbeat(&self, beat: &RegionHeartbeat) -> Result<(), ProtoError>;
+    ///
+    /// The answer may carry an [`Operator`]: the placement driver's whole way of asking a store to
+    /// do something. There is no command channel and no push — PD schedules from what heartbeats
+    /// tell it and replies on the same heartbeat, so a store that is not reporting is a store that
+    /// receives no work, which is exactly right for one that may be partitioned away.
+    fn region_heartbeat(&self, beat: &RegionHeartbeat) -> Result<Option<Operator>, ProtoError>;
 }
 
 /// A placement driver in a `BTreeMap`: the whole of [`PdClient`], in memory, in one process.
@@ -162,6 +167,9 @@ struct FakeState {
     leaders: BTreeMap<u64, u64>,
     store_beats: Vec<StoreHeartbeat>,
     region_beats: Vec<RegionHeartbeat>,
+    /// Handed out on the next heartbeat for the region, once each — the same "at most one in
+    /// flight per region" a real placement driver keeps (`docs/DESIGN.md` §7).
+    operators: BTreeMap<u64, Operator>,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -182,6 +190,11 @@ impl FakePd {
     #[must_use]
     pub fn region_beats(&self) -> Vec<RegionHeartbeat> {
         self.lock().region_beats.clone()
+    }
+
+    /// Queues an operator to ride on the next heartbeat for its region.
+    pub fn issue(&self, operator: Operator) {
+        self.lock().operators.insert(operator.region_id(), operator);
     }
 
     /// Forgets the heartbeats so far, so a test can assert about one window.
@@ -280,14 +293,14 @@ impl PdClient for FakePd {
         Ok(())
     }
 
-    fn region_heartbeat(&self, beat: &RegionHeartbeat) -> Result<(), ProtoError> {
+    fn region_heartbeat(&self, beat: &RegionHeartbeat) -> Result<Option<Operator>, ProtoError> {
         let mut state = self.lock();
         state
             .regions
             .insert(beat.region.start_key.clone(), beat.region.clone());
         state.leaders.insert(beat.region.id, beat.leader_peer_id);
         state.region_beats.push(beat.clone());
-        Ok(())
+        Ok(state.operators.remove(&beat.region.id))
     }
 }
 

@@ -43,7 +43,9 @@
 use bytes::Bytes;
 use esker_engine::{Db, ReadOptions, WriteBatch, cf};
 use esker_keys::prefix;
-use esker_proto::{Decoder, Encoder, Epoch, Peer, ProtoError, RawKvReq, RawKvResp, Region};
+use esker_proto::{
+    Decoder, Encoder, Epoch, Peer, PeerRole, ProtoError, RawKvReq, RawKvResp, Region,
+};
 
 use crate::error::engine_to_proto;
 use crate::peer::Applied;
@@ -358,6 +360,95 @@ pub fn check_scope(command: &Command, region: &Region) -> Result<(), ProtoError>
         }
         Command::Split { .. } => Ok(()),
     }
+}
+
+/// The store id a conf change carries in its context, so every peer learns where the new replica
+/// lives without asking the placement driver at apply time.
+///
+/// `esker-raft` never looks at the context (`ConfChange::context`: "caller data carried through the
+/// log — a store id, a peer address. Never interpreted here"), which is exactly what makes it the
+/// right place: the core moves the *membership* and the store moves the *region*, from the same
+/// entry, without either knowing the other's business.
+#[must_use]
+pub fn conf_change_context(store_id: u64) -> Bytes {
+    let mut out = Encoder::new();
+    out.put_u8(COMMAND_FORMAT_VERSION);
+    out.put_varint(store_id);
+    Bytes::from(out.finish())
+}
+
+/// Reads the store id a conf change carries.
+pub fn decode_conf_change_context(context: &Bytes) -> Result<u64, ProtoError> {
+    let mut input = Decoder::new(context);
+    let version = input
+        .get_u8("conf.version")
+        .map_err(|error| ProtoError::corrupt("conf change context", error.to_string()))?;
+    if version != COMMAND_FORMAT_VERSION {
+        return Err(ProtoError::corrupt(
+            "conf change context",
+            format!("format version {version}, expected {COMMAND_FORMAT_VERSION}"),
+        ));
+    }
+    let store_id = input
+        .get_varint("conf.store_id")
+        .map_err(|error| ProtoError::corrupt("conf change context", error.to_string()))?;
+    input
+        .finish()
+        .map_err(|error| ProtoError::corrupt("conf change context", error.to_string()))?;
+    if store_id == 0 {
+        return Err(ProtoError::corrupt(
+            "conf change context",
+            "store id zero is not a store",
+        ));
+    }
+    Ok(store_id)
+}
+
+/// The region a conf change leaves behind: the same range, a moved peer list, a bumped `conf_ver`.
+///
+/// `conf_ver` and not `version`: the two counters move on different events and a client that is
+/// current in one may be stale in the other, which is the whole reason there are two
+/// (`docs/DESIGN.md` §6).
+pub fn apply_conf_change(
+    region: &Region,
+    change: &esker_raft::ConfChange,
+    store_id: u64,
+) -> Result<Region, ProtoError> {
+    use esker_raft::ConfChangeKind;
+
+    let mut peers = region.peers.clone();
+    match change.kind {
+        ConfChangeKind::AddVoter | ConfChangeKind::AddLearner => {
+            let role = if matches!(change.kind, ConfChangeKind::AddVoter) {
+                PeerRole::Voter
+            } else {
+                PeerRole::Learner
+            };
+            match peers.iter_mut().find(|peer| peer.peer_id == change.node) {
+                // Promotion: the peer is already there and only its role moves. This is the
+                // second half of learner-first, and it must not add a duplicate.
+                Some(peer) => peer.role = role,
+                None => peers.push(Peer {
+                    store_id,
+                    peer_id: change.node,
+                    role,
+                }),
+            }
+        }
+        ConfChangeKind::Remove => peers.retain(|peer| peer.peer_id != change.node),
+    }
+    if peers.is_empty() {
+        return Err(ProtoError::invalid(format!(
+            "a conf change would leave region {} with no peers",
+            region.id
+        )));
+    }
+    peers.sort_unstable_by_key(|peer| peer.peer_id);
+    Ok(Region {
+        peers,
+        epoch: Epoch::new(region.epoch.conf_ver + 1, region.epoch.version),
+        ..region.clone()
+    })
 }
 
 /// The two regions a split produces, or a refusal every peer makes identically.

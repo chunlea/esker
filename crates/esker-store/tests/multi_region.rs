@@ -467,7 +467,10 @@ async fn a_placement_driver_that_refuses_fails_the_open() {
         fn store_heartbeat(&self, _: &esker_store::StoreHeartbeat) -> Result<(), ProtoError> {
             Err(ProtoError::internal("unreachable"))
         }
-        fn region_heartbeat(&self, _: &esker_store::RegionHeartbeat) -> Result<(), ProtoError> {
+        fn region_heartbeat(
+            &self,
+            _: &esker_store::RegionHeartbeat,
+        ) -> Result<Option<esker_proto::Operator>, ProtoError> {
             Err(ProtoError::internal("unreachable"))
         }
     }

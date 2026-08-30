@@ -186,12 +186,11 @@ impl PdClient for RemotePd {
         })
     }
 
-    fn region_heartbeat(&self, beat: &RegionHeartbeat) -> Result<(), ProtoError> {
+    fn region_heartbeat(
+        &self,
+        beat: &RegionHeartbeat,
+    ) -> Result<Option<esker_proto::Operator>, ProtoError> {
         let beat = beat.clone();
-        // TODO(phase-4c, store lane): the answer now carries `Option<Operator>` — the
-        // membership change PD wants this region's leader to propose. Dropped here until the
-        // store side of 4c consumes it; PD re-sends it on every heartbeat, so nothing is lost
-        // by ignoring it, and a region simply is not repaired yet.
         self.ask(move |channel| async move {
             channel
                 .region_heartbeat(
@@ -202,7 +201,6 @@ impl PdClient for RemotePd {
                     beat.applied_index,
                 )
                 .await
-                .map(|_operator| ())
         })
     }
 }

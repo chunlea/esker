@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use esker_proto::{Epoch, Region};
+use esker_proto::{Epoch, Operator, Region};
 
 use crate::pd::{PdClient, RegionHeartbeat, StoreHeartbeat};
 use crate::{REGION_HEARTBEAT_MS, STORE_HEARTBEAT_MS};
@@ -132,13 +132,19 @@ impl Heartbeats {
         self.tick
     }
 
-    /// Advances one tick and sends whatever has become due.
+    /// Advances one tick and sends whatever has become due, returning the operators the
+    /// placement driver answered with.
     ///
     /// Failures are logged and dropped rather than returned. PD is advisory to a store — nothing
     /// a store does is blocked on it being reachable — and a heartbeat that could not be sent is
     /// re-sent by the next round, which is exactly what a retry would have done with more code.
-    pub fn tick(&mut self, report: &StoreReport) {
+    ///
+    /// **The operators come back rather than being acted on here.** This type decides *when* a
+    /// store talks to PD; proposing a membership change is the store's business, and a schedule
+    /// that also proposed would need a region map, a runtime and a Raft peer to be testable.
+    pub fn tick(&mut self, report: &StoreReport) -> Vec<Operator> {
         self.tick += 1;
+        let mut operators = Vec::new();
 
         if self.store_due() {
             let beat = self.store_beat(report);
@@ -166,12 +172,14 @@ impl Heartbeats {
                 approximate_size: region.approximate_size,
                 applied_index: region.applied_index,
             };
-            if let Err(error) = self.pd.region_heartbeat(&beat) {
-                tracing::debug!(
+            match self.pd.region_heartbeat(&beat) {
+                Ok(Some(operator)) => operators.push(operator),
+                Ok(None) => {}
+                Err(error) => tracing::debug!(
                     region_id = region.region.id,
                     %error,
                     "a region heartbeat did not land"
-                );
+                ),
             }
             self.last_region.insert(
                 region.region.id,
@@ -186,6 +194,7 @@ impl Heartbeats {
         // A region this store no longer hosts must not hold a slot for ever.
         self.last_region
             .retain(|id, _| report.regions.iter().any(|region| region.region.id == *id));
+        operators
     }
 
     fn store_due(&self) -> bool {
@@ -494,7 +503,7 @@ mod tests {
             fn region_heartbeat(
                 &self,
                 _: &crate::pd::RegionHeartbeat,
-            ) -> Result<(), esker_proto::ProtoError> {
+            ) -> Result<Option<esker_proto::Operator>, esker_proto::ProtoError> {
                 Err(esker_proto::ProtoError::internal("no"))
             }
         }

@@ -163,6 +163,43 @@ pub fn decode_entry(index: Index, bytes: &[u8]) -> Result<Entry> {
     })
 }
 
+/// Removes every trace of a region from the `raft` column family: its entries, its state record
+/// and its metadata record. Returns how many log entries were dropped.
+///
+/// Used when this store is removed from a region. The region's **data** is not touched — see
+/// [`crate::server::Store`]'s retirement path for why.
+pub fn destroy(db: &Db, region_id: u64) -> Result<u64> {
+    let cf_id = db
+        .cf_id(cf::RAFT)
+        .ok_or_else(|| StoreError::Bootstrap("the `raft` column family is missing".into()))?;
+    let mut batch = WriteBatch::new();
+    let mut entries = 0u64;
+
+    let mut iter = db.iter(cf::RAFT, &ReadOptions::default())?;
+    iter.seek(&log_entry_key(region_id, 0));
+    while iter.valid() {
+        let key = iter.key();
+        if key.len() != LOG_KEY_LEN
+            || key[0] != raft_cf::LOG_ENTRY
+            || key[1..9] != region_id.to_be_bytes()
+        {
+            break;
+        }
+        batch.delete(cf_id, key);
+        entries += 1;
+        iter.next();
+    }
+    iter.status()?;
+
+    batch.delete(cf_id, &state_key(region_id));
+    batch.delete(cf_id, &metadata_key(region_id));
+    batch.delete(cf_id, &pending_snapshot_key(region_id));
+    // Synced: a region this store has been removed from must not come back after a crash and
+    // rejoin a group that has already replaced it (`docs/plans/phase-4.md` §6, race 3).
+    db.write(batch, &WriteOptions { sync: true })?;
+    Ok(entries)
+}
+
 fn corrupt(error: &esker_proto::DecodeError) -> StoreError {
     StoreError::Bootstrap(format!("corrupt raft record: {error}"))
 }
