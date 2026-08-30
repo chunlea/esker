@@ -1,6 +1,6 @@
 //! The Raft transport: one connection per store pair, a batch per tick.
 //!
-//! [`RaftTransport`](crate::peer::RaftTransport) is fire-and-forget and infallible, and this is
+//! [`RaftTransport`] is fire-and-forget and infallible, and this is
 //! where that shape earns itself. Raft already retries everything it sends — a lost message is
 //! indistinguishable from a slow one — so a transport that reported failures would hand the driver
 //! a decision it has no better answer to than "send it again next tick". Every failure here is
