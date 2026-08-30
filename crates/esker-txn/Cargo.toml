@@ -8,5 +8,23 @@ license.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+[dependencies]
+# The 'x' namespace, the memcomparable group encoding that keeps one key's versions
+# contiguous, and `enc_ts` (docs/txn-spec.md §1-2). Key semantics live here and nowhere
+# below it (CLAUDE.md invariant 7).
+esker-keys.workspace = true
+# LEB128 varints: the length prefix of every hand-rolled format in Esker (ADR 0004).
+esker-base.workspace = true
+# `Bytes` at API boundaries: a value decoded out of a record is handed on without a copy.
+bytes.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+# `tests/tso_format.rs` asserts this crate's copy of the oracle's timestamp layout still
+# matches PD's. Dev-only: nothing esker-txn ships links the placement driver, and the layer
+# table in CLAUDE.md would not allow it if it did.
+esker-pd.workspace = true
+
 [lints]
 workspace = true

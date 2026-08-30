@@ -44,7 +44,7 @@ Reserved layout (all keys in a cluster):
 
 ```
 'r' ++ user_key                       RawKV namespace (byte-opaque, no MVCC)
-'x' ++ user_key ++ enc_ts             TxnKV namespace (Percolator; see §8)
+'x' ++ enc(user_key) ++ enc_ts        TxnKV namespace (Percolator; see §8)
 't' ++ tenant:u64 ++ table_id:u64 ++ 'r' ++ row_id      SQL rows (phase 6)
 't' ++ tenant:u64 ++ table_id:u64 ++ 'i' ++ index_id ++ cols [++ row_id]   SQL indexes
 'm' ++ ...                            cluster / catalog metadata
@@ -52,6 +52,13 @@ Reserved layout (all keys in a cluster):
 
 `enc_ts` = `!(ts as u64)` big-endian (bitwise NOT), so newer versions sort first within a user key.
 The engine's prefix extractor for versioned CFs is "strip the last 8 bytes".
+
+A versioned key's user part is **group-encoded first** (`enc` above is `encode_bytes`), because
+appending a fixed suffix to a raw key only keeps one key's versions contiguous when keys are
+prefix-free. They are in the SQL layouts and are not in `TxnKV`: raw, `"a"`'s versions interleave
+with `"ab"`'s, and the prefix check that should catch it passes, because `"a"` *is* a prefix of
+`"ab"`. The unversioned `'r'` namespace has no suffix and so needs no encoding.
+[ADR 0015](adr/0015-txn-record-encodings.md) works the bytes through.
 
 ## 4. Storage engine (`esker-engine`)
 
@@ -411,9 +418,15 @@ Percolator, optimistic, snapshot isolation (the TiKV model). Three CFs:
 
 | CF | key | value |
 |---|---|---|
-| `default` | `user_key ++ enc(start_ts)` | value (when > 255 bytes) |
-| `lock` | `user_key` | `{ primary, start_ts, ttl, kind, short_value? }` |
-| `write` | `user_key ++ enc(commit_ts)` | `{ kind: Put/Delete/Rollback/Lock, start_ts, short_value? }` |
+| `default` | `'x' ++ enc(user_key) ++ enc_ts(start_ts)` | value (when > 255 bytes) |
+| `lock` | `'x' ++ enc(user_key)` | `{ kind, start_ts, ttl, primary, short_value? }` |
+| `write` | `'x' ++ enc(user_key) ++ enc_ts(commit_ts)` | `{ kind: Put/Delete/Rollback/Lock, start_ts, short_value? }` |
+
+`enc` is the group encoding of §3 and `enc_ts` the complemented timestamp; every key named in a
+record, on the wire or by a client is the **user key**, and this layer applies the namespace on the
+way to the engine, as the store rather than the client applies `'r'` (§10). `docs/txn-spec.md` is
+this table written out to the byte, with the decision matrix and the SI guarantees; the encodings
+themselves are [ADR 0015](adr/0015-txn-record-encodings.md).
 
 Protocol: `start_ts` from TSO → buffered writes on the client → **Prewrite** all keys (primary first;
 each key checks `write` for commit_ts > start_ts and `lock` for any lock, then writes `lock` +

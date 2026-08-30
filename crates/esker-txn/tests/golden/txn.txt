@@ -1,0 +1,52 @@
+# esker-txn golden vectors, format version 1.
+#
+# One case per line: <kind> <argument> = <hex of the encoding>.
+# Byte arguments are hex; `-` means the empty string.
+#
+# These bytes are the on-disk record and key format of docs/txn-spec.md. A line that changes
+# here is a format change: it needs an ADR and a format version bump, not a re-blessed file.
+lock_key - = 780000000000000000f7
+lock_key 61 = 786100000000000000f8
+lock_key 6162 = 786162000000000000f9
+lock_key 6163636f756e742f31 = 786163636f756e742fff3100000000000000f8
+lock_key 3132333435363738 = 783132333435363738ff0000000000000000f7
+write_key -@0 = 780000000000000000f7ffffffffffffffff
+write_key -@1 = 780000000000000000f7fffffffffffffffe
+write_key -@42 = 780000000000000000f7ffffffffffffffd5
+write_key -@2199023255552 = 780000000000000000f7fffffdffffffffff
+write_key -@18446744073709551615 = 780000000000000000f70000000000000000
+write_key 61@0 = 786100000000000000f8ffffffffffffffff
+write_key 61@1 = 786100000000000000f8fffffffffffffffe
+write_key 61@42 = 786100000000000000f8ffffffffffffffd5
+write_key 61@2199023255552 = 786100000000000000f8fffffdffffffffff
+write_key 61@18446744073709551615 = 786100000000000000f80000000000000000
+write_key 6162@0 = 786162000000000000f9ffffffffffffffff
+write_key 6162@1 = 786162000000000000f9fffffffffffffffe
+write_key 6162@42 = 786162000000000000f9ffffffffffffffd5
+write_key 6162@2199023255552 = 786162000000000000f9fffffdffffffffff
+write_key 6162@18446744073709551615 = 786162000000000000f90000000000000000
+write_key 6163636f756e742f31@0 = 786163636f756e742fff3100000000000000f8ffffffffffffffff
+write_key 6163636f756e742f31@1 = 786163636f756e742fff3100000000000000f8fffffffffffffffe
+write_key 6163636f756e742f31@42 = 786163636f756e742fff3100000000000000f8ffffffffffffffd5
+write_key 6163636f756e742f31@2199023255552 = 786163636f756e742fff3100000000000000f8fffffdffffffffff
+write_key 6163636f756e742f31@18446744073709551615 = 786163636f756e742fff3100000000000000f80000000000000000
+write_key 3132333435363738@0 = 783132333435363738ff0000000000000000f7ffffffffffffffff
+write_key 3132333435363738@1 = 783132333435363738ff0000000000000000f7fffffffffffffffe
+write_key 3132333435363738@42 = 783132333435363738ff0000000000000000f7ffffffffffffffd5
+write_key 3132333435363738@2199023255552 = 783132333435363738ff0000000000000000f7fffffdffffffffff
+write_key 3132333435363738@18446744073709551615 = 783132333435363738ff0000000000000000f70000000000000000
+value_key 6163636f756e742f31@42 = 786163636f756e742fff3100000000000000f8ffffffffffffffd5
+version_range_start 6163636f756e742f31 = 786163636f756e742fff3100000000000000f80000000000000000
+version_range_end 6163636f756e742f31 = 786163636f756e742fff3100000000000000f9
+lock Put/start=42/ttl=default/primary=primary = 012ab817077072696d61727900
+lock Delete/start=42/ttl=default/primary=primary = 022ab817077072696d61727900
+lock Lock/start=42/ttl=default/primary=primary = 042ab817077072696d61727900
+lock Put/start=2199023255552/ttl=60000/primary=p/value=hello = 01808080808040e0d4030170010568656c6c6f
+lock Put/start=7/ttl=default/primary=p/value=- = 0107b81701700100
+lock Put/start=max/ttl=default/primary=p/value=ab*255 = 01ffffffffffffffffff01b817017001ffababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab
+write Put/start=42 = 012a00
+write Delete/start=42 = 022a00
+write Rollback/start=42 = 032a00
+write Lock/start=42 = 042a00
+write Put/start=2199023255552/value=hello = 01808080808040010568656c6c6f
+write Rollback/start=max = 03ffffffffffffffffff0100
