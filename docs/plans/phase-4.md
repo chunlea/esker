@@ -127,14 +127,15 @@ found there is reported, not fixed in place.
 |---|---|---|---|
 | 0 | This plan | `docs/plans/phase-4.md` | done |
 | 1 | `Region`/`Peer`/`PeerRole`/`Epoch` in proto with goldens | `esker-proto/src/region.rs` | done (phase 3) |
-| 2 | The region map: many `RawNode`s per store, keyed by region id | `esker-store/src/regions.rs`, `server.rs` | |
-| 3 | Region metadata persisted at `'m' ++ region_id`; a restart recovers every region it hosted | `esker-store/src/meta.rs`, `raft_log.rs` | |
-| 4 | Ownership checks on every request, with `EpochNotMatch` carrying **every overlapping local region** | `esker-store/src/region.rs`, `regions.rs` | |
-| 5 | `PdClient` + the in-memory fake; bootstrap through it | `esker-store/src/pd.rs`, `server.rs` | |
-| 6 | Tick-driven store and region heartbeats | `esker-store/src/heartbeat.rs` | |
-| 7 | The client's region cache past one entry; a PD-backed resolver | `esker-client/src/region_cache.rs`, `raw.rs` | |
-| 8 | CLI flags: a PD address, a store id, more than one region per store | `esker-cli/src/args.rs`, `cluster.rs` | |
-| 9 | The multi-region test spine | `esker-store/tests/multi_region.rs` | |
+| 2 | The region map: many `RawNode`s per store, keyed by region id | `esker-store/src/regions.rs`, `transport.rs`, `server.rs` | **done** |
+| 3 | Region metadata persisted at `'m' ++ region_id`; a restart recovers every region it hosted | `esker-store/src/meta.rs` | **done** |
+| 4 | Ownership checks on every request, with `EpochNotMatch` carrying **every overlapping local region** | `esker-store/src/region.rs`, `regions.rs` | **done** |
+| 5 | `PdClient` + the in-memory fake; bootstrap through it | `esker-store/src/pd.rs`, `server.rs` | **done** |
+| 5b | That trait over a socket, against the sibling's `PdChannel` | `esker-store/src/pd_remote.rs` | **done** |
+| 6 | Tick-driven store and region heartbeats | `esker-store/src/heartbeat.rs` | **done** |
+| 7 | The client's region cache past one entry; a fallible resolver | `esker-client/src/region_cache.rs`, `raw.rs` | **done** |
+| 8 | CLI: `esker server --pd HOST:PORT` | `esker-cli/src/server.rs`, `args.rs` | **done** (the `args.rs` half is held, §9) |
+| 9 | The multi-region test spine | `esker-store/tests/multi_region.rs`, `tests/pd_client.rs`, `esker-client/tests/multi_region.rs` | **done** |
 
 ## 5. The five decisions worth writing down before the code
 
@@ -215,7 +216,34 @@ Two more the prompt does not name but 4a can lose on its own:
 
 ## 9. Progress
 
-- 4a unit 0 — this plan.
+**4a, store lane: units 0–9 landed.** One commit per unit, `just check`'s gates run per crate at
+each one (`cargo fmt --check`, `clippy -D warnings`, `cargo doc -D warnings`, tests).
+
+| Commit | Unit |
+|---|---|
+| `477cac8` | 0 — this plan |
+| `b64577d` | 1 — the region types' goldens (the move itself predates the plan, §10) |
+| `f2ce2a6` | 2 — one connection per store pair, carrying every region's messages |
+| `63220bf` | 2, 4 — the region map, and `EpochNotMatch` carrying every overlapping region |
+| `85cbe5e` | 3 — the `'m'` record |
+| `86cab14` | 2 — a store hosts a map of regions, read from its own records |
+| `92ba6a0` | 5, 6, 9 — the `PdClient` seam, the heartbeats, `tests/multi_region.rs` |
+| `75f66e6` | 7 — a fallible resolver, `RegionTable`, `esker-client/tests/multi_region.rs` |
+| `6f207ec` | 5b — `RemotePd`, and heartbeat rounds moved off the reactor |
+| `a9ecb71` | 8 — `esker server` builds a `RemotePd` when it is given one |
+
+**Held, not missing:** the `--pd` flag's *parsing* in `crates/esker-cli/src/args.rs`. The
+placement-driver lane began editing that file for its own `esker pd serve|inspect` command while
+this lane's hunk was in the worktree, and sweeping another lane's uncommitted work into a commit is
+the one git rule this project has an incident for. The hunk is written and its test passes; it
+lands as soon as that lane commits. Until then `ServerOptions::pd` is always `None`, which is
+exactly what phase 2's single node and phase 3e's static cluster are — so nothing is broken by the
+wait, only unreachable from the command line.
+
+**Test counts at `a9ecb71`:** `esker-store` 119 unit + 39 integration, `esker-client` 41 unit + 26
+integration, `esker-proto` 79 unit. Every crate this lane touched is green under
+`clippy -D warnings`, `cargo doc -D warnings` and `cargo fmt --check`; `cargo deny check` passes
+with no new dependency.
 
 ## 10. Changes vs plan
 
@@ -234,3 +262,50 @@ Two more the prompt does not name but 4a can lose on its own:
    before the key, then checks that the region actually reaches it. That is the same lookup with the
    same cost and no such case, and the reasoning is already in the module's docs with the test that
    pins it. Kept, not rewritten.
+
+3. **The Raft transport became one connection per *store pair*, which §2 did not list as a unit.**
+   `docs/DESIGN.md` §6 has always said the connection is per `(store, store)` and carries messages
+   for all regions; phase 3e had one region and could not tell the difference. With fifty regions
+   on five stores it is four connections per store instead of two hundred, and one batched frame
+   per tick instead of fifty — so it is part of "many regions per store" rather than an
+   optimisation, and it landed as `f2ce2a6` before the region map.
+
+4. **`RegionResolver::locate` became fallible.** It returned `Option<Route>`, which made an
+   unreachable placement driver indistinguishable from "no region covers this key". The first is
+   retryable and the second is terminal, so the two collapsed together turn a momentary PD outage
+   into a terminal error on every call in the process. It now returns `Result<Option<Route>>` and a
+   resolver failure goes through the same classifier a store's refusal does. Found while writing
+   unit 7 against a real `GetRegion` rather than a constant.
+
+5. **`RemotePd` is a second sync/async bridge, not a use of `BlockingTransport`.** The plan's §3.2
+   pinned `PdClient` as synchronous — correctly, since the store's bootstrap and its heartbeat
+   schedule are both ordinary synchronous code — and the placement-driver lane's `PdChannel` is
+   asynchronous, as the wire is. `esker-proto`'s `BlockingTransport` exists for exactly this and
+   **refuses to run inside a `tokio` runtime**; a heartbeat round runs on `spawn_blocking`, whose
+   threads carry a runtime handle, so the refusal applies. `pd_remote.rs` is therefore a dedicated
+   thread owning a one-worker runtime. This is the one place in the store where the two worlds
+   meet, and the module says so.
+
+6. **The heartbeat round moved onto `spawn_blocking`.** A synchronous `PdClient` called from the
+   reactor holds a worker for a network round trip — and a placement driver that had gone away
+   holds it for the whole timeout, every ten seconds, on every store. Not a design change so much
+   as the consequence of §3.2's synchronous trait, spelled out once the trait had a real
+   implementation behind it.
+
+7. **A store told the cluster already exists hosts nothing, rather than bootstrapping a region of
+   its own.** §5 says PD answers the bootstrap question; it did not say what a store does with
+   `None`. It hosts an empty region map and waits for PD to place a region on it, which is 4c's
+   work. The alternative — falling back to `["", "")` when PD says no or cannot be reached — is a
+   second claim to every key in the cluster, and the two stores would not find out until a client
+   asked one of them. A PD that cannot be reached therefore **fails the open**.
+
+8. **`Store::peer()` and `Store::region()` answer `None` for a store hosting several.** They were
+   written for a store with exactly one of each. Rather than pick one, they say so, and
+   `peer_of(region_id)` / `regions()` are the questions with an answer in every case.
+
+9. **`capacity`, `available`, `applied_bytes` and `approximate_size` are zero, and say so.**
+   Reading a filesystem's size needs `statvfs`, which `std` does not expose and which no crate on
+   the allowlist provides without compiling C — so a real number needs an ADR of its own, and 4d's
+   balance operators are the first thing that needs one. `approximate_size` is 4b's, from SST
+   properties plus the memtable. Each is documented as a placeholder at its field rather than left
+   to look like a measurement.
