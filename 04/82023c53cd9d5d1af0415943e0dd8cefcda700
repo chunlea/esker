@@ -1,0 +1,21 @@
+crates/esker-sim/Cargo.toml
+  s_720b990b4c85a3::t_a204eebf058de2 23-25
+crates/esker-sim/tests/stateright_raft.rs
+  s_720b990b4c85a3::t_dbce03c1de1c5e 1-843
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "0482023c53cd9d5d1af0415943e0dd8cefcda700",
+  "prompts": {},
+  "sessions": {
+    "s_720b990b4c85a3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "227f5c5f-560a-4117-b024-963f1ffc76a1",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
