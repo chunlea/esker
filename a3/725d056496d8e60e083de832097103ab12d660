@@ -1,0 +1,32 @@
+crates/esker-store/src/transport.rs
+  h_44076b318daf9c 40,173-178,184,186,189-195,247-256,258,269-309,313-315,321-323,326,331-334,336,357-360,474-478,489-502,529-534
+crates/esker-proto/tests/golden/messages.hex
+  h_44076b318daf9c 19-20
+Cargo.lock
+  h_44076b318daf9c 18-26,258,260,277,346-351,385-393,417-425,597-607,676-684,794-802,861-876
+crates/esker-store/src/peer.rs
+  h_44076b318daf9c 63-73,356-360,780-802,1196,1274-1277,1286-1287,1297,1301-1314,1341-1344,1347-1353,1402-1449,1526
+crates/esker-store/tests/balance.rs
+  h_44076b318daf9c 1-354
+crates/esker-store/src/server.rs
+  h_44076b318daf9c 406,412,417,684,690,695,1229-1240,1265-1266,1275,1289-1293,1317-1318,1322,1372-1373,1380-1381,1385,1389,1400-1403,1765,1800
+crates/esker-proto/tests/messages.rs
+  h_44076b318daf9c 196,209
+crates/esker-store/src/regions.rs
+  h_44076b318daf9c 49-52,59-63,66,68-72,76-86,169,216-224,251-258
+crates/esker-proto/src/raft.rs
+  h_44076b318daf9c 65-71,81,86,96,106,645,666,670-673
+crates/esker-store/Cargo.toml
+  h_44076b318daf9c 43-45
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a3725d056496d8e60e083de832097103ab12d660",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
