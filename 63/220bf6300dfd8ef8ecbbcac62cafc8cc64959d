@@ -1,0 +1,27 @@
+crates/esker-proto/src/region.rs
+  s_8dc89cd8f6be19::t_17827b2fb68bf4 206-228,420-468
+crates/esker-store/src/error.rs
+  s_8dc89cd8f6be19::t_22b609e215f8fa 33-39,47-49
+crates/esker-store/src/lib.rs
+  s_8dc89cd8f6be19::t_82630d1d728c21 24,43,52-53
+crates/esker-store/src/region.rs
+  s_8dc89cd8f6be19::t_578405461bb9e4 103-114,196-265,268,412-483
+crates/esker-store/src/regions.rs
+  s_8dc89cd8f6be19::t_aee45a47e6dd34 1-589
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "63220bf6300dfd8ef8ecbbcac62cafc8cc64959d",
+  "prompts": {},
+  "sessions": {
+    "s_8dc89cd8f6be19": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "20caabd3-7fb9-42f6-a519-04be2a284eef",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
