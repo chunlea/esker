@@ -24,13 +24,16 @@ use std::sync::{Arc, RwLock};
 
 use esker_engine::{Db, LocalFileSystem, Options, WalSyncMode, cf};
 use esker_proto::{
-    BoxFuture, ProtoError, RawKvReq, RawKvResp, Region, Reply, Request, RequestHeader, Response,
-    Service,
+    BoxFuture, Epoch, ProtoError, RaftBatch, RawKvReq, RawKvResp, Region, Reply, Request,
+    RequestHeader, Response, Service, TransportConfig,
 };
 
 use crate::error::{Result, StoreError};
+use crate::peer::{PeerOptions, RaftPeer};
+use crate::raft_log::RaftLogStorage;
 use crate::rawkv::{self, Limits};
 use crate::region::RegionMeta;
+use crate::transport::{PeerAddress, StoreTransport};
 
 /// How a store is opened.
 #[derive(Debug, Clone)]
@@ -46,6 +49,39 @@ pub struct StoreOptions {
     pub limits: Limits,
     /// How the engine underneath is opened.
     pub engine: Options,
+    /// Replication, when this store is one of several. `None` is a single-node store that writes
+    /// straight to the engine — which is what phase 2 built and what the CLI's `server` command
+    /// still starts.
+    pub raft: Option<RaftOptions>,
+}
+
+/// How this store's region is replicated.
+#[derive(Debug, Clone)]
+pub struct RaftOptions {
+    /// Every peer of the region, this store's included. The peer with `peer_id ==
+    /// `[`StoreOptions::peer_id`] is this one and is never connected to.
+    pub peers: Vec<PeerAddress>,
+    /// Seed for the election-timeout RNG. A whole cluster may share one: the peer id selects the
+    /// stream (`docs/adr/0008-raft-determinism-and-the-driver-contract.md`).
+    pub seed: u64,
+    /// What one Raft tick is worth. `esker-raft` counts ticks and never reads a clock; this is
+    /// the only place a wall clock touches consensus (`docs/DESIGN.md` §14).
+    pub tick: std::time::Duration,
+    /// How the connections between stores are configured.
+    pub transport: TransportConfig,
+}
+
+impl RaftOptions {
+    /// Replication across `peers`, with the project's defaults.
+    #[must_use]
+    pub fn new(peers: Vec<PeerAddress>, seed: u64) -> Self {
+        Self {
+            peers,
+            seed,
+            tick: std::time::Duration::from_millis(esker_raft::TICK_MS),
+            transport: TransportConfig::new(),
+        }
+    }
 }
 
 impl StoreOptions {
@@ -69,6 +105,7 @@ impl StoreOptions {
             peer_id: 1,
             region_id: 1,
             limits: Limits::new(),
+            raft: None,
             engine: Options {
                 create_if_missing: true,
                 wal_sync_mode: WalSyncMode::Never,
@@ -95,7 +132,15 @@ pub struct Store {
     store_id: u64,
     limits: Limits,
     /// Shared by every mutation, exclusive for `CompareAndSwap`. See the module docs.
+    ///
+    /// Only used by a store with no Raft peer. Once there is one, the Raft log is the
+    /// serialisation point and read-modify-write happens at apply time, on every peer alike.
     write_gate: RwLock<()>,
+    /// The region's Raft peer, when this store replicates.
+    peer: Option<Arc<RaftPeer>>,
+    /// Kept so it can be shut down with the store; the peer holds its own reference.
+    transport: Option<Arc<StoreTransport>>,
+    ticker: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Store {
@@ -126,20 +171,122 @@ impl Store {
         // register with the placement driver. Until then every open is a bootstrap, which is
         // correct while there is one region that covers everything and never splits.
         let region = RegionMeta::bootstrap(options.region_id, options.store_id, options.peer_id);
+        let db = Arc::new(db);
+
+        // A replicated store needs a runtime: the transport's tasks and the ticker live in one.
+        // A store with no Raft options is exactly phase 2's and needs nothing.
+        let (peer, transport, ticker) = match options.raft {
+            None => (None, None, None),
+            Some(raft) => {
+                let voters = raft
+                    .peers
+                    .iter()
+                    .map(|peer| peer.peer_id)
+                    .collect::<Vec<_>>();
+                let storage = RaftLogStorage::open(
+                    Arc::clone(&db),
+                    options.region_id,
+                    esker_raft::ConfState::from_voters(voters.clone()),
+                )?;
+                let transport = StoreTransport::spawn(
+                    options.region_id,
+                    region.epoch(),
+                    options.peer_id,
+                    &raft.peers,
+                    raft.transport,
+                );
+                let peer = RaftPeer::start(
+                    PeerOptions {
+                        region_id: options.region_id,
+                        peer_id: options.peer_id,
+                        voters,
+                        seed: raft.seed,
+                    },
+                    storage,
+                    Arc::clone(&transport) as Arc<dyn crate::peer::RaftTransport>,
+                )?;
+                let ticker = peer.spawn_ticker(raft.tick);
+                (Some(peer), Some(transport), Some(ticker))
+            }
+        };
+
         tracing::info!(
             store_id = options.store_id,
             region_id = options.region_id,
+            replicated = peer.is_some(),
             column_families = ?cf::BUILTIN,
             "store opened"
         );
 
         Ok(Arc::new(Self {
-            db: Arc::new(db),
+            db,
             region,
             store_id: options.store_id,
             limits: options.limits,
             write_gate: RwLock::new(()),
+            peer,
+            transport,
+            ticker,
         }))
+    }
+
+    /// The region's Raft peer, when this store replicates.
+    #[must_use]
+    pub fn peer(&self) -> Option<&Arc<RaftPeer>> {
+        self.peer.as_ref()
+    }
+
+    /// Feeds a batch of Raft messages from another store into this one's peer.
+    ///
+    /// A batch for a region this store does not serve is dropped rather than refused: the sender
+    /// cannot act on the answer — Raft has no "you sent that to the wrong place" — and answering
+    /// would only teach it to retry something that will never work.
+    pub async fn receive_raft(&self, batch: RaftBatch) -> std::result::Result<(), ProtoError> {
+        let Some(peer) = &self.peer else {
+            return Err(ProtoError::invalid(
+                "this store does not replicate; it has no Raft peer to receive a batch",
+            ));
+        };
+        for message in batch.messages {
+            if message.region_id != self.region.id() {
+                tracing::debug!(
+                    region_id = message.region_id,
+                    served = self.region.id(),
+                    "dropped a Raft message for a region this store does not serve"
+                );
+                continue;
+            }
+            if self.epoch_is_stale(message.epoch) {
+                tracing::debug!(
+                    region_id = message.region_id,
+                    "dropped a Raft message from a stale epoch"
+                );
+                continue;
+            }
+            peer.step(message.message).await?;
+        }
+        Ok(())
+    }
+
+    /// Whether `epoch` is behind the region's — invariant 5, applied to Raft traffic.
+    ///
+    /// In 3e the epoch never moves, so this never fires. It is here because a message that
+    /// *would* be stale must be dropped by the code that exists, not by the code phase 4 adds.
+    fn epoch_is_stale(&self, epoch: Epoch) -> bool {
+        epoch.is_stale_against(self.region.epoch())
+    }
+
+    /// Stops replication: the ticker, the peer's thread, and every peer connection.
+    pub fn stop(&self) {
+        if let Some(ticker) = &self.ticker {
+            ticker.abort();
+        }
+        if let Some(peer) = &self.peer {
+            peer.stop();
+        }
+        if let Some(transport) = &self.transport {
+            transport.shutdown();
+        }
     }
 
     /// This store's id.
@@ -241,6 +388,10 @@ impl Service for StoreService {
         Box::pin(async move {
             let (header, request) = match request {
                 Request::RawKv { header, request } => (header, request),
+                Request::Raft(batch) => {
+                    store.receive_raft(batch).await?;
+                    return Ok(Reply::Unary(Response::Raft));
+                }
                 // The connection answers `Hello` itself; one reaching a service means the
                 // transport changed underneath us, which is worth an error rather than a
                 // shrug.
