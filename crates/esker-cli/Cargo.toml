@@ -32,6 +32,11 @@ tempfile.workspace = true
 # would leave out exactly the layers those two commands exist to exercise. Dev-only.
 esker-proto.workspace = true
 esker-store.workspace = true
+# `tests/cluster_chaos.rs` drives a cluster this binary started, from outside, and checks the
+# history it produced. The client is how a real caller reaches it; the checker lives in
+# `esker-sim` because DESIGN.md §11 puts it there for exactly this. Both dev-only.
+esker-client.workspace = true
+esker-sim.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "time"] }
 
 [lints]
