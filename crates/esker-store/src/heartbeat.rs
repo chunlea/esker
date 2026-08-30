@@ -47,7 +47,7 @@ pub struct RegionReport {
     pub term: u64,
     /// How far the state machine has applied.
     pub applied_index: u64,
-    /// Approximate bytes of user data, as [`crate::peer::RaftPeer::approximate_size`] measures it.
+    /// Approximate bytes of user data, as [`crate::split::approximate_size`] measures it.
     pub approximate_size: u64,
 }
 

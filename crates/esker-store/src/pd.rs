@@ -71,8 +71,8 @@ pub struct StoreHeartbeat {
     pub region_count: u64,
     /// Regions this store leads.
     pub leader_count: u64,
-    /// Bytes of user data this store's regions have applied — the sum of what each of them
-    /// reports, with the same limits ([`crate::peer::RaftPeer::approximate_size`]).
+    /// Bytes of user data this store holds — the sum of what each of its regions reports, with
+    /// the same limits ([`crate::split::approximate_size`]).
     pub applied_bytes: u64,
 }
 
@@ -89,8 +89,8 @@ pub struct RegionHeartbeat {
     pub leader_peer_id: u64,
     /// Its Raft term.
     pub term: u64,
-    /// Approximate bytes of user data. A hint, with the limits
-    /// [`crate::peer::RaftPeer::approximate_size`] spells out; it is what 4b splits on.
+    /// Approximate bytes of user data, with the limits [`crate::split::approximate_size`] spells
+    /// out. It is what a split triggers on and what PD compares across stores.
     pub approximate_size: u64,
     /// Its apply index, so 4c can rebuild its in-flight operator view from heartbeats alone
     /// after a PD restart (`docs/plans/phase-4.md` §6, race 5).

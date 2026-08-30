@@ -454,29 +454,34 @@ impl Store {
                     return;
                 };
                 let threshold = store.split.region_split_size;
-                let candidates: Vec<Arc<RegionState>> = store
-                    .regions
-                    .states()
-                    .into_iter()
-                    .filter(|state| {
-                        let Some(peer) = state.peer() else {
-                            return false;
-                        };
-                        let size = peer.approximate_size();
-                        peer.is_leader()
-                            && size >= threshold
-                            && refused
-                                .get(&state.id())
-                                .is_none_or(|at| size >= at + threshold)
-                    })
-                    .collect();
-                for state in candidates {
+                // Every led region's size, measured once per round on a blocking thread: the
+                // engine walks each region's files and memtables to answer, which is not work
+                // for the reactor.
+                let sized = {
+                    let store = Arc::clone(&store);
+                    match blocking(move || Ok(store.region_sizes())).await {
+                        Ok(sized) => sized,
+                        Err(error) => {
+                            tracing::debug!(%error, "could not size this store's regions");
+                            continue;
+                        }
+                    }
+                };
+                for (state, size) in sized {
+                    // A region that had no boundary last time is not rescanned until it has
+                    // grown by another threshold: a region of one enormous value would otherwise
+                    // cost a full scan on every tick for ever.
+                    let held_back = refused
+                        .get(&state.id())
+                        .is_some_and(|at| size < at + threshold);
+                    if size < threshold || held_back {
+                        continue;
+                    }
                     match store.split_region(&pd, &state).await {
                         Ok(true) => {
                             refused.remove(&state.id());
                         }
                         Ok(false) => {
-                            let size = state.peer().map_or(0, |peer| peer.approximate_size());
                             refused.insert(state.id(), size);
                         }
                         Err(error) => tracing::debug!(
@@ -536,6 +541,23 @@ impl Store {
         Ok(true)
     }
 
+    /// Every region this store **leads**, with what the engine says it holds.
+    ///
+    /// Synchronous and not cheap — the engine walks each region's files and memtables — so it runs
+    /// on a blocking thread. A region this store merely hosts is not sized: only a leader splits,
+    /// and only a leader's heartbeat reports a size.
+    fn region_sizes(&self) -> Vec<(Arc<RegionState>, u64)> {
+        self.regions
+            .states()
+            .into_iter()
+            .filter(|state| state.peer().is_some_and(|peer| peer.is_leader()))
+            .map(|state| {
+                let size = split::approximate_size(&self.db, state.region()).unwrap_or(0);
+                (state, size)
+            })
+            .collect()
+    }
+
     /// What this store looks like right now, for one heartbeat round.
     ///
     /// Every number is read without waiting on a driver thread: the regions come from the map and
@@ -556,7 +578,9 @@ impl Store {
                         is_leader: peer.is_leader(),
                         term: peer.term(),
                         applied_index: peer.applied_index(),
-                        approximate_size: peer.approximate_size(),
+                        // From the engine, so every peer of a region agrees on it and PD can
+                        // compare one store's regions against another's.
+                        approximate_size: split::approximate_size(&self.db, &region).unwrap_or(0),
                         region,
                     },
                     // An unreplicated region has no consensus to lead, and this store is the only

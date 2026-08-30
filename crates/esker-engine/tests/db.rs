@@ -1652,3 +1652,95 @@ fn delete_range_is_refused_and_deletes_nothing() {
     db.put(cf::DEFAULT, b"after", b"v").unwrap();
     assert_eq!(get(&db, b"after").as_deref(), Some(&b"v"[..]));
 }
+
+/// `approximate_size` is what `esker-store` splits a region on. It has to grow with the bytes in
+/// the range, ignore what is outside it, and survive a flush moving those bytes from a memtable
+/// into a file — a number that only counted one of the two would report a region shrinking every
+/// time it was flushed.
+#[test]
+fn approximate_size_counts_a_range_across_the_memtable_and_the_files() {
+    let (_fs, dynamic) = memfs();
+    let db = open(&dynamic, options(), &cf::BUILTIN).unwrap();
+
+    assert_eq!(db.approximate_size(cf::DEFAULT, None, None).unwrap(), 0);
+
+    // A *different* incompressible kilobyte per key, so the file half and the memtable half of
+    // the answer are comparable. One repeated value would compress across the entries in a block
+    // and the test would be measuring LZ4 rather than the accessor.
+    let mut seed = 0x2026_0830_u32;
+    let mut value = || -> Vec<u8> {
+        (0..1024)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            })
+            .collect()
+    };
+    let mut batch = WriteBatch::new();
+    for n in 0..100u32 {
+        batch.put(
+            db.cf_id(cf::DEFAULT).unwrap(),
+            format!("a{n:04}").as_bytes(),
+            &value(),
+        );
+        batch.put(
+            db.cf_id(cf::DEFAULT).unwrap(),
+            format!("z{n:04}").as_bytes(),
+            &value(),
+        );
+    }
+    db.write(batch, &WriteOptions::default()).unwrap();
+
+    let everything = db.approximate_size(cf::DEFAULT, None, None).unwrap();
+    assert!(
+        everything >= 200 * 1024,
+        "200 KiB of values reported as {everything}"
+    );
+
+    // Half the keys are under `a` and half under `z`, so a bound between them halves the answer.
+    let low = db.approximate_size(cf::DEFAULT, None, Some(b"b")).unwrap();
+    let high = db.approximate_size(cf::DEFAULT, Some(b"b"), None).unwrap();
+    for (name, half) in [("low", low), ("high", high)] {
+        assert!(
+            half > everything / 4 && half < everything,
+            "the {name} half of {everything} came out as {half}"
+        );
+    }
+
+    // A range holding nothing is zero while the data is still in a memtable, where the accessor
+    // can count entries exactly.
+    assert_eq!(
+        db.approximate_size(cf::DEFAULT, Some(b"m"), Some(b"n"))
+            .unwrap(),
+        0
+    );
+
+    // And a flush moves the bytes from the memtable into a file without the answer collapsing.
+    // It does not stay *equal*: a file's size is compressed and a memtable's is not, which the
+    // accessor's documentation names. With incompressible values the two are within a factor.
+    db.flush(cf::DEFAULT).unwrap();
+    let flushed = db.approximate_size(cf::DEFAULT, None, None).unwrap();
+    assert!(
+        flushed >= 150 * 1024,
+        "a flush lost the size: {everything} became {flushed}"
+    );
+    // A range beyond every file is still zero once the data is in files: `overlapping` answers
+    // by the files' own bounds, so a range past them touches nothing.
+    assert_eq!(
+        db.approximate_size(cf::DEFAULT, Some(b"zz"), Some(b"zzz"))
+            .unwrap(),
+        0,
+        "a range past the end of the data was charged for it"
+    );
+
+    // A range *inside* the one file that now holds everything is charged half of it — the
+    // documented coarseness, asserted so that it is a decision rather than a surprise. It must be
+    // less than the whole, which is what makes it worth doing at all.
+    let straddling = db
+        .approximate_size(cf::DEFAULT, Some(b"m"), Some(b"n"))
+        .unwrap();
+    assert!(
+        straddling < flushed && straddling > 0,
+        "a straddling range came out as {straddling} of {flushed}"
+    );
+}

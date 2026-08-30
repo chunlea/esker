@@ -348,6 +348,96 @@ impl Db {
         Ok(lock(&self.inner.wal)?.number)
     }
 
+    /// Roughly how many bytes of `cf` lie in `[begin, end)`, where `None` is unbounded.
+    ///
+    /// Sums the sizes of the SSTs that overlap the range and adds the memtables' share of it.
+    /// **Approximate on purpose**, and in three named directions:
+    ///
+    /// * a file **entirely inside** the range is counted in full and one that only *straddles* a
+    ///   bound is counted as **half**, because interpolating properly means reading the file's
+    ///   index block and this is a number a caller acts on in the large. A region is a contiguous
+    ///   slice, so at most two files per level straddle its bounds — the error is a file or two,
+    ///   not a level;
+    /// * the memtables are counted by the fraction of their *entries* that fall in the range, not
+    ///   their bytes, because a skip-list holds no per-range byte count;
+    /// * overwritten and deleted keys are counted until a compaction drops them.
+    ///
+    /// All three over-count, which is the safe direction for the caller this exists for: a region
+    /// split trigger that fires slightly early costs a split, while one that fires late costs a
+    /// region that has outgrown its bounds (`docs/DESIGN.md` §6, `docs/plans/phase-4.md` §12.3).
+    ///
+    /// # It is bytes on disk, and it drops when a memtable is flushed
+    ///
+    /// A file's size is what the file *is* — compressed. A memtable's is the entries as they sit
+    /// in memory. So the same data reports smaller once it has been flushed, by whatever the
+    /// compression ratio is, and a caller watching the number will see it fall without anything
+    /// having been deleted.
+    ///
+    /// That is the honest number rather than a wart to paper over: what a region costs is what it
+    /// occupies, and `docs/DESIGN.md` §14's 96 MiB is a size on disk. A caller that needs "how
+    /// much data is in here" independent of compression wants an entry count, which is a different
+    /// question and not this one.
+    pub fn approximate_size(
+        &self,
+        cf: &str,
+        begin: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<u64> {
+        let handle = self.inner.cf_by_name(cf)?;
+        let user = self.inner.comparator.user_comparator();
+        let mut total: u64 = 0;
+
+        let version = lock(&self.inner.versions)?.current();
+        if let Some(cf_version) = version.cf(handle.id()) {
+            for level in 0..cf_version.num_levels() {
+                for file in cf_version.overlapping(level, begin, end, user.as_ref()) {
+                    let smallest = crate::dbformat::extract_user_key(&file.smallest);
+                    let largest = crate::dbformat::extract_user_key(&file.largest);
+                    let inside = begin
+                        .is_none_or(|begin| user.cmp(smallest, begin) != std::cmp::Ordering::Less)
+                        && end.is_none_or(|end| user.cmp(largest, end) == std::cmp::Ordering::Less);
+                    total += if inside { file.size } else { file.size / 2 };
+                }
+            }
+        }
+
+        // The memtables hold what has not reached a file yet. A skip-list has a byte count for
+        // the whole table and no way to bound it by key, so the range's share is taken by
+        // counting entries — one walk of the range against one walk of the table.
+        let mem = read_lock(&handle.mem)?;
+        let tables =
+            std::iter::once(&mem.active).chain(mem.immutable.iter().map(|(table, _)| table));
+        for table in tables {
+            let bytes = table.approximate_size() as u64;
+            if bytes == 0 {
+                continue;
+            }
+            let entries = table.len() as u64;
+            if entries == 0 {
+                continue;
+            }
+            let mut cursor = table.iter();
+            let mut in_range: u64 = 0;
+            match begin {
+                Some(begin) => cursor.seek(&crate::dbformat::lookup_key(
+                    begin,
+                    crate::dbformat::MAX_SEQNO,
+                )),
+                None => cursor.seek_to_first(),
+            }
+            while cursor.valid() {
+                let key = crate::dbformat::extract_user_key(cursor.key());
+                if end.is_some_and(|end| user.cmp(key, end) != std::cmp::Ordering::Less) {
+                    break;
+                }
+                in_range += 1;
+                cursor.next();
+            }
+            total += bytes * in_range / entries;
+        }
+        Ok(total)
+    }
+
     /// A named statistic, for `esker-cli` and for tests that need to see a stall rather than
     /// infer one (`docs/DESIGN.md` §4.4, §12).
     ///

@@ -160,6 +160,29 @@ fn midpoint(samples: &[Bytes], region: &Region) -> Option<Bytes> {
         .cloned()
 }
 
+/// Roughly how many bytes `region` holds, from the engine rather than from a counter.
+///
+/// This replaces 4b's applied-bytes hint, which counted what a peer's own apply had staged and so
+/// never shrank on a delete, never counted what was on disk before the process opened, and started
+/// again at zero after a restart (`docs/plans/phase-4.md` §12.3 asked for the accessor; §13.3
+/// swapped to it). The number is now a property of the data, which means every peer agrees on it
+/// and a restarted leader splits as readily as one that has been up for a week.
+///
+/// It is still a *hint* and nothing deterministic reads it — `Db::approximate_size` names the three
+/// directions it over-counts in — but it is now the same hint on every peer, which is what makes a
+/// region heartbeat's `approximate_size` a number PD can compare across stores.
+pub fn approximate_size(db: &Db, region: &Region) -> Result<u64, ProtoError> {
+    let low = prefix::raw_key(&region.start_key);
+    let high = if region.end_key.is_empty() {
+        // The first key past the whole `'r'` namespace, which is where an unbounded region ends.
+        vec![prefix::RAW + 1]
+    } else {
+        prefix::raw_key(&region.end_key)
+    };
+    db.approximate_size(esker_engine::cf::DEFAULT, Some(&low), Some(&high))
+        .map_err(|error| engine_to_proto(&error))
+}
+
 /// Whether `key` divides `region` into two non-empty ranges.
 #[must_use]
 pub fn is_legal_boundary(key: &[u8], region: &Region) -> bool {

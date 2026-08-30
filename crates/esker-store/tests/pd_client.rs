@@ -64,7 +64,8 @@ impl StandIn {
             }
             PdReq::RegionHeartbeat { region, .. } => {
                 state.region_beats.push(region.id);
-                PdResp::RegionHeartbeat
+                // 4c's operator rides here; this stand-in issues none.
+                PdResp::RegionHeartbeat { operator: None }
             }
             PdReq::GetRegion { key } => {
                 let region = Region {
