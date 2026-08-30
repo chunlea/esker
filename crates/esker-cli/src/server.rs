@@ -127,17 +127,28 @@ async fn serve(
         options.store_id,
         options.data_dir.display()
     );
-    println!(
-        "esker server: region {} covers the whole key space",
-        store.region().id
-    );
-    if !options.peers.is_empty() {
+    // Every region this store hosts, in key order. In phase 4a that is one, bootstrapped to
+    // cover everything; `TODO(phase-4b)` a split makes the list grow while the server runs, and
+    // this line only says what it found at open.
+    for region in store.regions().regions() {
         println!(
-            "esker server: peer {} of region {}, replicating with {} peers",
-            options.peer_id,
-            store.region().id,
-            options.peers.len()
+            "esker server: region {} covers [{}, {})",
+            region.id,
+            crate::bytes::escape(&region.start_key),
+            if region.end_key.is_empty() {
+                "+inf".to_owned()
+            } else {
+                crate::bytes::escape(&region.end_key)
+            },
         );
+        if !options.peers.is_empty() {
+            println!(
+                "esker server: peer {} of region {}, replicating with {} peers",
+                options.peer_id,
+                region.id,
+                region.peers.len()
+            );
+        }
     }
 
     server

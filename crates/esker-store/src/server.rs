@@ -1,5 +1,5 @@
-//! [`Store`] — the engine, its column families, its region — and [`StoreService`], which is
-//! what `esker-proto`'s server calls.
+//! [`Store`] — the engine, its column families, the regions it hosts — and [`StoreService`],
+//! which is what `esker-proto`'s server calls.
 //!
 //! # Where async stops
 //!
@@ -22,18 +22,20 @@
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
-use esker_engine::{Db, LocalFileSystem, Options, WalSyncMode, cf};
+use esker_engine::{Db, LocalFileSystem, Options, WalSyncMode, WriteBatch, WriteOptions, cf};
 use esker_proto::{
-    BoxFuture, Epoch, Peer, ProtoError, RaftBatch, RawKvReq, RawKvResp, Region, Reply, Request,
+    BoxFuture, Peer, PeerRole, ProtoError, RaftBatch, RawKvReq, RawKvResp, Region, Reply, Request,
     RequestHeader, Response, Service, TransportConfig,
 };
 
 use crate::apply::Command;
 use crate::error::{Result, StoreError};
+use crate::meta;
 use crate::peer::{PeerOptions, RaftPeer};
 use crate::raft_log::RaftLogStorage;
 use crate::rawkv::{self, Limits};
 use crate::region::RegionMeta;
+use crate::regions::{RegionMap, RegionState};
 use crate::transport::{PeerAddress, StoreAddress, StoreTransport};
 
 /// How a store is opened.
@@ -43,8 +45,11 @@ pub struct StoreOptions {
     pub store_id: u64,
     /// The id of this store's peer in the region it bootstraps.
     pub peer_id: u64,
-    /// The region this store bootstraps, covering the whole key space
-    /// (`docs/DESIGN.md` §7).
+    /// The region this store bootstraps when its database holds no regions yet, covering the
+    /// whole key space (`docs/DESIGN.md` §7).
+    ///
+    /// Ignored on every later open: what a store hosts is read from its own `'m'` records
+    /// ([`crate::meta`]), not re-derived from its configuration.
     pub region_id: u64,
     /// Limits on what one request may return or remove.
     pub limits: Limits,
@@ -122,14 +127,15 @@ impl Default for StoreOptions {
     }
 }
 
-/// One process, one store, one region — for now.
+/// One process, one store id, many regions (`docs/DESIGN.md` §6).
 #[derive(Debug)]
-// `store_id` names the store this *is*, not a store it points at; `id` alone would read as the
-// region's in a type that has one of those too.
+// `store_id` names the store this *is*, not a store it points at; `id` alone would read as a
+// region's in a type that has several of those too.
 #[allow(clippy::struct_field_names)]
 pub struct Store {
     db: Arc<Db>,
-    region: RegionMeta,
+    /// Every region this store hosts, indexed by id and by range.
+    regions: RegionMap,
     store_id: u64,
     limits: Limits,
     /// Shared by every mutation, exclusive for `CompareAndSwap`. See the module docs.
@@ -137,11 +143,15 @@ pub struct Store {
     /// Only used by a store with no Raft peer. Once there is one, the Raft log is the
     /// serialisation point and read-modify-write happens at apply time, on every peer alike.
     write_gate: RwLock<()>,
-    /// The region's Raft peer, when this store replicates.
-    peer: Option<Arc<RaftPeer>>,
-    /// Kept so it can be shut down with the store; the peer holds its own reference.
+    /// One connection per store pair, shared by every region. Kept so it can be shut down with
+    /// the store; each region's view holds its own reference.
     transport: Option<Arc<StoreTransport>>,
-    ticker: Option<tokio::task::JoinHandle<()>>,
+    /// One per replicated region: the timer that feeds its driver thread.
+    ///
+    /// `TODO(phase-4d)`: one timer per region is one task per region. At fifty regions that is
+    /// fifty timers where one wheel would do, which is the same sharding decision as the apply
+    /// worker's and belongs with it.
+    tickers: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Store {
@@ -153,12 +163,15 @@ impl Store {
     /// them later, when `esker-txn` and `esker-raft` arrive, would mean a format change to
     /// every database made before then.
     pub fn open(path: impl AsRef<Path>, options: StoreOptions) -> Result<Arc<Self>> {
-        let db = Db::open_with(
-            path,
-            options.engine,
-            Arc::new(LocalFileSystem::new()),
-            &cf::BUILTIN,
-        )?;
+        let StoreOptions {
+            store_id,
+            peer_id,
+            region_id,
+            limits,
+            engine,
+            raft,
+        } = options;
+        let db = Db::open_with(path, engine, Arc::new(LocalFileSystem::new()), &cf::BUILTIN)?;
 
         for name in cf::BUILTIN {
             if db.cf_id(name).is_none() {
@@ -168,83 +181,105 @@ impl Store {
             }
         }
 
-        // TODO(phase-4): read the region from the `raft` CF instead of bootstrapping one, and
-        // register with the placement driver. Until then every open is a bootstrap, which is
-        // correct while there is one region that covers everything and never splits.
-        let region = match &options.raft {
-            None => RegionMeta::bootstrap(options.region_id, options.store_id, options.peer_id),
-            // Every peer, so that a `NotLeader` hint — which names a *peer* — can be resolved to
-            // the store a client should send to instead.
-            Some(raft) => RegionMeta::replicated(
-                options.region_id,
-                raft.peers
-                    .iter()
-                    .map(|peer| Peer::voter(peer.store_id, peer.peer_id))
-                    .collect(),
-            ),
-        };
         let db = Arc::new(db);
 
-        // A replicated store needs a runtime: the transport's tasks and the ticker live in one.
+        // What this store hosts is what its own `'m'` records say — never what its configuration
+        // says on a later open, and never what the placement driver currently believes. A
+        // database with none is a fresh one, and only then is `options` a bootstrap.
+        let mut hosted = meta::load_regions(&db)?;
+        if hosted.is_empty() {
+            // TODO(phase-4a unit 5): ask the placement driver whether to bootstrap and for the
+            // ids to bootstrap with, rather than taking them from the options.
+            hosted.push(bootstrap_region(
+                &db,
+                region_id,
+                store_id,
+                peer_id,
+                raft.as_ref(),
+            )?);
+        }
+
+        // A replicated store needs a runtime: the transport's tasks and the tickers live in one.
         // A store with no Raft options is exactly phase 2's and needs nothing.
-        let (peer, transport, ticker) = match options.raft {
-            None => (None, None, None),
-            Some(raft) => {
-                let voters = raft
-                    .peers
-                    .iter()
-                    .map(|peer| peer.peer_id)
-                    .collect::<Vec<_>>();
-                let storage = RaftLogStorage::open(
-                    Arc::clone(&db),
-                    options.region_id,
-                    esker_raft::ConfState::from_voters(voters.clone()),
-                )?;
-                let transport = StoreTransport::spawn(
-                    options.store_id,
-                    &StoreAddress::from_peers(&raft.peers),
-                    raft.transport,
+        let transport = raft.as_ref().map(|raft| {
+            StoreTransport::spawn(
+                store_id,
+                &StoreAddress::from_peers(&raft.peers),
+                raft.transport,
+            )
+        });
+
+        let regions = RegionMap::new();
+        let mut tickers = Vec::new();
+        for region in hosted {
+            // A record whose peer list does not name this store is what a crash between
+            // `RemovePeer` applying and this store deleting its data leaves behind
+            // (`docs/plans/phase-4.md` §6, race 3). Starting a peer for it would put a voter back
+            // into a group that has already removed it.
+            if !region.peers.iter().any(|peer| peer.store_id == store_id) {
+                tracing::warn!(
+                    store_id,
+                    region_id = region.id,
+                    "a region record on this store does not list it as a peer; not started"
                 );
-                let peer = RaftPeer::start(
-                    PeerOptions {
-                        region_id: options.region_id,
-                        peer_id: options.peer_id,
-                        voters,
-                        seed: raft.seed,
-                    },
-                    storage,
-                    transport.for_region(options.region_id, region.epoch(), &raft.peers)
-                        as Arc<dyn crate::peer::RaftTransport>,
-                )?;
-                let ticker = peer.spawn_ticker(raft.tick);
-                (Some(peer), Some(transport), Some(ticker))
+                continue;
             }
-        };
+            let state = match (&raft, &transport) {
+                (Some(raft), Some(transport)) => {
+                    let peer = start_peer(&db, &region, store_id, raft, transport)?;
+                    tickers.push(peer.spawn_ticker(raft.tick));
+                    RegionState::replicated(RegionMeta::new(region), peer)
+                }
+                _ => RegionState::unreplicated(RegionMeta::new(region)),
+            };
+            regions.insert(state)?;
+        }
 
         tracing::info!(
-            store_id = options.store_id,
-            region_id = options.region_id,
-            replicated = peer.is_some(),
+            store_id,
+            regions = regions.len(),
+            replicated = transport.is_some(),
             column_families = ?cf::BUILTIN,
             "store opened"
         );
 
         Ok(Arc::new(Self {
             db,
-            region,
-            store_id: options.store_id,
-            limits: options.limits,
+            regions,
+            store_id,
+            limits,
             write_gate: RwLock::new(()),
-            peer,
             transport,
-            ticker,
+            tickers,
         }))
     }
 
-    /// The region's Raft peer, when this store replicates.
+    /// Every region this store hosts, indexed by id and by range.
     #[must_use]
-    pub fn peer(&self) -> Option<&Arc<RaftPeer>> {
-        self.peer.as_ref()
+    pub fn regions(&self) -> &RegionMap {
+        &self.regions
+    }
+
+    /// The Raft peer of the region this store hosts, when it hosts exactly one and replicates it.
+    ///
+    /// A convenience for the single-region tests and for the CLI, which is why it is honest about
+    /// its precondition rather than picking one: a store hosting several has no "the" peer, and a
+    /// caller that wants one names the region ([`Store::peer_of`]).
+    #[must_use]
+    pub fn peer(&self) -> Option<Arc<RaftPeer>> {
+        let states = self.regions.states();
+        match states.as_slice() {
+            [only] => only.peer().map(Arc::clone),
+            _ => None,
+        }
+    }
+
+    /// The Raft peer of one region, when this store hosts and replicates it.
+    #[must_use]
+    pub fn peer_of(&self, region_id: u64) -> Option<Arc<RaftPeer>> {
+        self.regions
+            .get(region_id)
+            .and_then(|state| state.peer().map(Arc::clone))
     }
 
     /// Feeds a batch of Raft messages from another store into this one's peer.
@@ -253,47 +288,50 @@ impl Store {
     /// cannot act on the answer — Raft has no "you sent that to the wrong place" — and answering
     /// would only teach it to retry something that will never work.
     pub async fn receive_raft(&self, batch: RaftBatch) -> std::result::Result<(), ProtoError> {
-        let Some(peer) = &self.peer else {
+        if self.transport.is_none() {
             return Err(ProtoError::invalid(
                 "this store does not replicate; it has no Raft peer to receive a batch",
             ));
-        };
+        }
         for message in batch.messages {
-            if message.region_id != self.region.id() {
+            let Some(state) = self.regions.get(message.region_id) else {
                 tracing::debug!(
                     region_id = message.region_id,
-                    served = self.region.id(),
-                    "dropped a Raft message for a region this store does not serve"
+                    "dropped a Raft message for a region this store does not host"
                 );
                 continue;
-            }
-            if self.epoch_is_stale(message.epoch) {
+            };
+            // Invariant 5, applied to Raft traffic. A batch carries messages for many regions
+            // now, so the epoch it is checked against is the one of the region it names — not
+            // the store's, which is not a thing a store has.
+            if message.epoch.is_stale_against(state.region().epoch) {
                 tracing::debug!(
                     region_id = message.region_id,
                     "dropped a Raft message from a stale epoch"
                 );
                 continue;
             }
+            let Some(peer) = state.peer() else {
+                tracing::debug!(
+                    region_id = message.region_id,
+                    "dropped a Raft message for a region this store does not replicate"
+                );
+                continue;
+            };
             peer.step(message.message).await?;
         }
         Ok(())
     }
 
-    /// Whether `epoch` is behind the region's — invariant 5, applied to Raft traffic.
-    ///
-    /// In 3e the epoch never moves, so this never fires. It is here because a message that
-    /// *would* be stale must be dropped by the code that exists, not by the code phase 4 adds.
-    fn epoch_is_stale(&self, epoch: Epoch) -> bool {
-        epoch.is_stale_against(self.region.epoch())
-    }
-
-    /// Stops replication: the ticker, the peer's thread, and every peer connection.
+    /// Stops replication: every ticker, every peer's thread, and every store connection.
     pub fn stop(&self) {
-        if let Some(ticker) = &self.ticker {
+        for ticker in &self.tickers {
             ticker.abort();
         }
-        if let Some(peer) = &self.peer {
-            peer.stop();
+        for state in self.regions.states() {
+            if let Some(peer) = state.peer() {
+                peer.stop();
+            }
         }
         if let Some(transport) = &self.transport {
             transport.shutdown();
@@ -306,10 +344,18 @@ impl Store {
         self.store_id
     }
 
-    /// The region it serves.
+    /// The region this store hosts, when it hosts exactly one.
+    ///
+    /// `None` for a store hosting several, for the reason [`Store::peer`] gives: there is no
+    /// "the" region to return and choosing one would be a guess. [`Store::regions`] is the
+    /// question with an answer in every case.
     #[must_use]
-    pub fn region(&self) -> &Region {
-        self.region.region()
+    pub fn region(&self) -> Option<Region> {
+        let regions = self.regions.regions();
+        match regions.as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        }
     }
 
     /// The engine underneath, for the CLI's inspection commands and for tests.
@@ -333,7 +379,8 @@ impl Store {
         header: RequestHeader,
         request: RawKvReq,
     ) -> std::result::Result<RawKvResp, ProtoError> {
-        self.region.check(&header)?;
+        let state = self.regions.route(&header, Some(&request))?;
+        let region = state.meta();
 
         match request {
             // The one request that is a read-modify-write, and so the one that needs the
@@ -344,7 +391,7 @@ impl Store {
                 value,
                 sync,
             } => {
-                self.region.check_key(&key)?;
+                region.check_key(&key)?;
                 let _gate = self.write_gate.write().map_err(|_| {
                     ProtoError::internal("a thread panicked while holding the write gate")
                 })?;
@@ -354,9 +401,9 @@ impl Store {
                 let _gate = self.write_gate.read().map_err(|_| {
                     ProtoError::internal("a thread panicked while holding the write gate")
                 })?;
-                rawkv::serve(&self.db, &self.region, &self.limits, other)
+                rawkv::serve(&self.db, region, &self.limits, other)
             }
-            read => rawkv::serve(&self.db, &self.region, &self.limits, read),
+            read => rawkv::serve(&self.db, region, &self.limits, read),
         }
     }
 
@@ -377,9 +424,9 @@ impl Store {
         header: RequestHeader,
         request: RawKvReq,
     ) -> std::result::Result<RawKvResp, ProtoError> {
-        self.region.check(&header)?;
+        let state = self.regions.route(&header, Some(&request))?;
 
-        let Some(peer) = self.peer.clone() else {
+        let Some(peer) = state.peer().map(Arc::clone) else {
             let store = Arc::clone(self);
             return blocking(move || store.handle(header, request)).await;
         };
@@ -390,7 +437,7 @@ impl Store {
         if !peer.is_leader() {
             return Err(peer.not_leader());
         }
-        self.region.check_scope(&request)?;
+        state.meta().check_scope(&request)?;
 
         if let Some(command) = Command::from_request(&request) {
             // An oversized range delete is refused here rather than at apply time: apply must be
@@ -398,9 +445,10 @@ impl Store {
             // once (`crate::apply`).
             if let RawKvReq::DeleteRange { start, end, .. } = &request {
                 let store = Arc::clone(self);
+                let state = Arc::clone(&state);
                 let (start, end) = (start.clone(), end.clone());
                 blocking(move || {
-                    rawkv::count_range(&store.db, &store.region, &store.limits, &start, &end)
+                    rawkv::count_range(&store.db, state.meta(), &store.limits, &start, &end)
                 })
                 .await?;
             }
@@ -412,7 +460,7 @@ impl Store {
             // committed when the read was accepted.
             peer.read_index().await?;
             let store = Arc::clone(self);
-            blocking(move || rawkv::serve(&store.db, &store.region, &store.limits, request)).await
+            blocking(move || rawkv::serve(&store.db, state.meta(), &store.limits, request)).await
         }
     }
 
@@ -427,6 +475,100 @@ impl Store {
     pub fn property(&self, name: &str) -> Option<String> {
         self.db.property(name)
     }
+}
+
+/// Creates the region a fresh store starts with: id 1, covering `["", "")`
+/// (`docs/DESIGN.md` §7, "the first store to register receives region 1").
+///
+/// Its `'m'` record is written **fsynced, before the store serves anything**, because it is what
+/// every later open reads to learn what this store hosts. A bootstrap that served a request before
+/// the record was durable could acknowledge a write into a region that, after a crash, this store
+/// no longer believes it has.
+///
+/// A replicated region lists every peer in [`RaftOptions::peers`], not just this store's: a
+/// `NotLeader` hint names a *peer*, and only the list turns that into the store a client should
+/// send to instead (`docs/DESIGN.md` §10).
+fn bootstrap_region(
+    db: &Arc<Db>,
+    region_id: u64,
+    store_id: u64,
+    peer_id: u64,
+    raft: Option<&RaftOptions>,
+) -> Result<Region> {
+    let region = match raft {
+        None => Region::bootstrap(region_id, store_id, peer_id),
+        Some(raft) => Region {
+            id: region_id,
+            start_key: bytes::Bytes::new(),
+            end_key: bytes::Bytes::new(),
+            peers: raft
+                .peers
+                .iter()
+                .map(|peer| Peer::voter(peer.store_id, peer.peer_id))
+                .collect(),
+            epoch: esker_proto::Epoch::INITIAL,
+        },
+    };
+    let cf_id = db
+        .cf_id(cf::RAFT)
+        .ok_or_else(|| StoreError::Bootstrap("the `raft` column family is missing".into()))?;
+    let mut batch = WriteBatch::new();
+    meta::stage_region(&mut batch, cf_id, &region);
+    db.write(batch, &WriteOptions { sync: true })?;
+    tracing::info!(
+        store_id,
+        region_id = region.id,
+        peers = region.peers.len(),
+        "bootstrapped a region covering the whole key space"
+    );
+    Ok(region)
+}
+
+/// Starts one region's Raft peer: its log storage, and its view of the store-pair transport.
+///
+/// The voters come from the **region's own peer list**, not from the store's configuration. That
+/// is the difference a multi-region store makes: two regions on one store have different
+/// membership, and a store-wide voter list would give each of them the other's.
+fn start_peer(
+    db: &Arc<Db>,
+    region: &Region,
+    store_id: u64,
+    raft: &RaftOptions,
+    transport: &Arc<StoreTransport>,
+) -> Result<Arc<RaftPeer>> {
+    let voters: Vec<u64> = region
+        .peers
+        .iter()
+        .filter(|peer| peer.role == PeerRole::Voter)
+        .map(|peer| peer.peer_id)
+        .collect();
+    let peer_id = region
+        .peers
+        .iter()
+        .find(|peer| peer.store_id == store_id)
+        .map(|peer| peer.peer_id)
+        .ok_or_else(|| {
+            StoreError::Bootstrap(format!(
+                "region {} has no peer on store {store_id}",
+                region.id
+            ))
+        })?;
+    let storage = RaftLogStorage::open(
+        Arc::clone(db),
+        region.id,
+        esker_raft::ConfState::from_voters(voters.clone()),
+    )?;
+    RaftPeer::start(
+        PeerOptions {
+            region_id: region.id,
+            peer_id,
+            voters,
+            seed: raft.seed,
+        },
+        storage,
+        transport.for_region(region.id, region.epoch, &raft.peers)
+            as Arc<dyn crate::peer::RaftTransport>,
+    )
 }
 
 /// Runs synchronous engine work on a blocking thread.
