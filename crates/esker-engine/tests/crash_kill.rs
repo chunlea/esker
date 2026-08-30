@@ -24,13 +24,18 @@
 //! direction is asserted in full: anything readable must be exactly what was written, and
 //! must be an operation that was actually attempted.
 //!
-//! # One direction is checked as far as it can be
+//! # Both directions, and the whole key space
 //!
-//! `readable ⊆ attempted` is checked by point lookup over the whole key space the child could
-//! have written, plus a few keys past the end. It is not yet a *full* scan, because at the
-//! time of writing `Db` has no iterator — the merge iterator is step 6's remaining piece. When
-//! it lands, `verify` should scan the database end to end and compare the whole key set, which
-//! would also catch a recovery that invented a key outside the pattern.
+//! Recovery is checked twice over. A point lookup of every operation the child could have
+//! attempted gives a precise message when one is missing — "acknowledged write 7 was lost"
+//! rather than a set difference. Then the database is scanned end to end, forwards and
+//! backwards, and the recovered set is compared with the pattern: that is what catches a key
+//! recovery *invented*, which no amount of point lookups can see, and it checks values, not
+//! just keys.
+//!
+//! The two containments are `acked ⊆ recovered ⊆ attempted`, not equality, for the reason
+//! above: a kill between `write()` returning and the ack reaching the pipe leaves a durable
+//! write that was never acknowledged.
 //!
 //! # The pipe must not buffer
 //!
@@ -41,6 +46,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -272,6 +278,7 @@ fn verify(dir: &Path, seed: u64, report: &Report) -> Result<usize, String> {
         }
     };
 
+    // First pass: point lookups, which name the operation that went missing.
     for op in 0..OPS {
         let found = match db.get(cf::DEFAULT, &key_for(op), &ReadOptions::default()) {
             Ok(found) => found,
@@ -294,26 +301,88 @@ fn verify(dir: &Path, seed: u64, report: &Report) -> Result<usize, String> {
         }
     }
 
-    // Nothing beyond what the child could have attempted. A point-lookup approximation of
-    // `readable ⊆ attempted`; see the module docs for what it will become.
-    for op in OPS..OPS + 4 {
-        match db.get(cf::DEFAULT, &key_for(op), &ReadOptions::default()) {
-            Ok(Some(_)) => return Err(format!("op {op} is readable but was never written")),
-            Ok(None) => {}
-            Err(error) => return Err(format!("reading op {op} failed: {error}")),
+    // Second pass: the whole database, end to end, both ways.
+    let recovered = scan(&db)?;
+    let expected: BTreeMap<Vec<u8>, Vec<u8>> = (0..OPS)
+        .map(|op| (key_for(op), value_for(seed, op)))
+        .collect();
+
+    for (key, value) in &recovered {
+        match expected.get(key) {
+            None => {
+                return Err(format!(
+                    "recovery invented the key {:?}, which was never written",
+                    String::from_utf8_lossy(key)
+                ));
+            }
+            Some(want) if want != value => {
+                return Err(format!(
+                    "{:?} holds {} bytes that were never written",
+                    String::from_utf8_lossy(key),
+                    value.len()
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    for op in &report.acks {
+        if !recovered.contains_key(&key_for(*op)) {
+            return Err(format!(
+                "acknowledged write {op} is missing from a full scan (it was {} entries long)",
+                recovered.len()
+            ));
         }
     }
 
     verify_tables(dir)
 }
 
+/// Every entry in the default column family, collected forwards and checked backwards.
+///
+/// A reverse scan that disagrees with the forward one is a merge-iterator bug that a forward
+/// scan alone cannot see, so both directions are walked and compared rather than trusting one.
+fn scan(db: &Db) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, String> {
+    let mut iter = db
+        .iter(cf::DEFAULT, &ReadOptions::default())
+        .map_err(|error| format!("opening an iterator: {error}"))?;
+
+    let mut forward = Vec::new();
+    iter.seek_to_first();
+    while iter.valid() {
+        forward.push((iter.key().to_vec(), iter.value().to_vec()));
+        iter.next();
+    }
+    iter.status()
+        .map_err(|error| format!("the forward scan failed: {error}"))?;
+
+    let mut backward = Vec::new();
+    iter.seek_to_last();
+    while iter.valid() {
+        backward.push((iter.key().to_vec(), iter.value().to_vec()));
+        iter.prev();
+    }
+    iter.status()
+        .map_err(|error| format!("the reverse scan failed: {error}"))?;
+    backward.reverse();
+
+    if forward != backward {
+        return Err(format!(
+            "the reverse scan saw {} entries and the forward scan {}",
+            backward.len(),
+            forward.len()
+        ));
+    }
+    Ok(forward.into_iter().collect())
+}
+
 /// Opens and fully scans every sorted string table the crash left behind.
 ///
 /// This is the `sst-dump` check the brief asks for, at library level: `TableReader::open`
 /// verifies the footer, properties, filter and index, and scanning to the end verifies every
-/// data block's checksum. Until the engine flushes memtables to L0 there are none of these to
-/// find, which is itself worth knowing — the count comes back to the caller and the loop
-/// reports it.
+/// data block's checksum. The child writes twenty small entries and never calls `flush`, so a
+/// 64 MiB memtable never fills and there is usually nothing here to find — the count comes
+/// back to the caller and the loop reports it, so it starts meaning something the moment a
+/// run does produce one.
 fn verify_tables(dir: &Path) -> Result<usize, String> {
     let fs = LocalFileSystem::new();
     let entries = fs
