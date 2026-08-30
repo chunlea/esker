@@ -1,0 +1,23 @@
+crates/esker-store/tests/cluster.rs
+  s_720b990b4c85a3::t_84d2bea95c1415 114-125,392-520
+crates/esker-store/tests/restart.rs
+  s_720b990b4c85a3::t_e3780a42001d82 1-242
+docs/plans/phase-3.md
+  s_720b990b4c85a3::t_48514be6631e86 358-361,363-367,434-458
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "986a4ef6c66df0b3e7729a41890f0de7cb28da0c",
+  "prompts": {},
+  "sessions": {
+    "s_720b990b4c85a3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "227f5c5f-560a-4117-b024-963f1ffc76a1",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
