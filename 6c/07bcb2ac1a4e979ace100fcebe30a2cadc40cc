@@ -1,0 +1,23 @@
+crates/esker-store/src/lib.rs
+  s_04c6c85b29b28a::t_35a18203885ba8 34,54,68
+crates/esker-store/src/split.rs
+  s_04c6c85b29b28a::t_07868cee85d4c8 1-382
+docs/adr/0010-split-key-selection.md
+  s_04c6c85b29b28a::t_d38a14f38ea338 1-84
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "6c07bcb2ac1a4e979ace100fcebe30a2cadc40cc",
+  "prompts": {},
+  "sessions": {
+    "s_04c6c85b29b28a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0e874339-89db-44c7-acd5-0deac94983ec",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
