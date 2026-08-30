@@ -15,9 +15,6 @@
 //!   pending, `first_index` and `term` answer from it, because that is what the node will have
 //!   once the driver writes it.
 
-// TODO(step-1): election and replication are the first callers of the read side here.
-#![allow(dead_code)]
-
 use crate::error::{RaftError, Result};
 use crate::storage::LogStorage;
 use crate::types::{Entry, Index, Snapshot, Term, offset};

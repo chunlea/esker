@@ -16,9 +16,6 @@
 //! * [`ProgressState::Snapshot`] — the follower needs entries the leader has compacted away.
 //!   Nothing is sent until the snapshot is acknowledged.
 
-// TODO(step-2): step-2 (replication) is the first caller of every item here.
-#![allow(dead_code)]
-
 use std::collections::VecDeque;
 
 use crate::types::{Index, NodeId};
@@ -71,13 +68,6 @@ impl Inflights {
         while self.window.front().is_some_and(|last| *last <= acked) {
             self.window.pop_front();
         }
-    }
-
-    /// Releases one slot. A heartbeat response proves the follower is alive but says nothing about
-    /// which append it processed, so it buys back exactly one slot — enough to keep a stalled
-    /// pipeline from deadlocking, not enough to pretend the window drained.
-    pub(crate) fn free_one(&mut self) {
-        self.window.pop_front();
     }
 
     pub(crate) fn reset(&mut self) {
@@ -250,10 +240,6 @@ impl ProgressMap {
     }
 
     /// Every peer in id order. The order is part of the algorithm's determinism, not incidental.
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (NodeId, &Progress)> {
-        self.peers.iter().map(|(id, progress)| (*id, progress))
-    }
-
     pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (NodeId, &mut Progress)> {
         self.peers.iter_mut().map(|(id, progress)| (*id, progress))
     }

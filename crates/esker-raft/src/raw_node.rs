@@ -142,7 +142,9 @@ impl<S: LogStorage> RawNode<S> {
     ///
     /// Refused while another change is appended but not committed: overlapping single-server
     /// changes can produce two disjoint majorities (dissertation §4.1).
-    #[allow(clippy::needless_pass_by_value)] // TODO(step-6): the change becomes an entry.
+    // The by-value signature is the pinned one (`docs/DESIGN.md` §5); the core reads the change
+    // rather than taking it apart, so nothing here consumes it.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn propose_conf_change(&mut self, change: ConfChange) -> Result<()> {
         if self.raft.role != Role::Leader {
             return Err(RaftError::NotLeader);

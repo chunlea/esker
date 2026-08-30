@@ -10,7 +10,7 @@
 //! they find are the sibling lane's. What this gives is a fast, exact answer to "given these
 //! nodes and these deliveries, who leads and what did they agree on".
 
-// TODO(step-2): the replication tests are the first callers of a few of these helpers.
+// A test harness offers more than any one test uses; that is what makes it a harness.
 #![allow(dead_code)]
 
 use crate::config::Config;

@@ -419,9 +419,6 @@ impl<S: LogStorage> Raft<S> {
     ///
     /// A pre-vote request is the one message that can reach here with a term *above* this node's,
     /// because §9.6 forbids adopting it.
-    // The handlers that land in the remaining steps consume the message; the signature is the one
-    // they need, so it does not churn under the sibling lane.
-    #[allow(clippy::needless_pass_by_value)] // TODO(step-2..6)
     fn step_current_term(&mut self, message: Message) -> Result<()> {
         match message {
             Message::RequestVote {
