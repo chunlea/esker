@@ -1,0 +1,35 @@
+Cargo.lock
+  s_4b642fc65050df::t_1ce5dc468380f7 90,92,102,164-173
+crates/esker-store/Cargo.toml
+  s_4b642fc65050df::t_59b7e2d35c6b96 11-29
+crates/esker-store/src/error.rs
+  s_4b642fc65050df::t_74de47785c9350 1-175
+crates/esker-store/src/lib.rs
+  s_4b642fc65050df::t_6e725467793cca 18-28,32-41
+crates/esker-store/src/rawkv.rs
+  s_4b642fc65050df::t_003dd954fa9efc 1-449
+crates/esker-store/src/region.rs
+  s_4b642fc65050df::t_60dd3112bffcda 1-304
+crates/esker-store/src/server.rs
+  s_4b642fc65050df::t_754593e76fb924 1-718
+docs/DESIGN.md
+  s_4b642fc65050df::t_9dc7ed138b3282 189-197
+docs/adr/0006-rawkv-delete-range.md
+  s_4b642fc65050df::t_e3ff6e665f15ec 1-83
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "96b68fa7d94322a63f67ef568536388d99ca16cc",
+  "prompts": {},
+  "sessions": {
+    "s_4b642fc65050df": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5213f73d-feb9-40c2-99a7-08164cb70247",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
