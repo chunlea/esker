@@ -32,9 +32,17 @@ One coordinator (Fable, herdr pane `COORD`) directing coding lanes. Phases are g
   - [x] `cl-p1-sst` round 2 — **accepted ~03:10**: ADR 0005, FaultFs (per-op RNG
     derivation; rename applied by fsync_dir), sst-dump. Out-of-lane edits all minimal
     and self-reported.
-  - [~] `cl-p1-sst` round 3: FaultFs sweep DONE and **it found an invariant-1 WAL bug**
-    (see Incidents); SIGKILL loop (unit 2) in progress — unaffected by the bug (a kill
-    cannot tear a write(2) and then append past it).
+  - [x] `cl-p1-sst` round 3 — **accepted ~03:40**: FaultFs sweep (found the WAL bug;
+    fix landed by spine in b9cb5c9, regression un-ignored as
+    `a_torn_append_ends_the_segment`) + SIGKILL loop; **1,000-iteration acceptance run
+    passed** (945 kills, 9,797 acked writes verified, 84.7s). The "123 unopenable" were
+    cuts before CURRENT existed — not databases, nothing acked, correctly reopen-failable.
+  - [ ] `cl-p1-sst` round 4: kill-loop full-scan verification + the BTreeMap model test
+    (10k cases behind --ignored). Kept on Opus, not Sonnet: model-test semantics
+    (per-snapshot views, reopen invalidation) are subtle and the lane carries the
+    context; Sonnet takes the phase-end bulk runs instead.
+  - Standing rule updated: in a crate shared by two lanes, format with
+    `rustfmt --edition 2024 <own files>` — `cargo fmt -p` still sweeps the whole crate.
   - [ ] spine: WAL ✅ batch/internal-key ✅ memtable ✅(assumed, verify at gate)
     manifest/Version in progress → Db → compaction → checkpoint → cli/bench.
 - [ ] Phase 2 — single-node server
