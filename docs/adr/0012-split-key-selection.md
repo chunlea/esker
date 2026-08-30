@@ -1,4 +1,4 @@
-# 0010 — Choosing the key a region splits at
+# 0012 — Choosing the key a region splits at
 
 Status: accepted (phase 4b). Supersedes nothing. See `crates/esker-store/src/split.rs`,
 `docs/plans/phase-4.md` §12, `prompts/04-multiraft-pd.md` 4b.

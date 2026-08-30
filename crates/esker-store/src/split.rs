@@ -1,7 +1,7 @@
 //! Where to cut a region, and when.
 //!
 //! A split has to choose a boundary that divides the region's *data* roughly in half. That is a
-//! question about what is on disk, and `docs/adr/0010-split-key-selection.md` records why the
+//! question about what is on disk, and `docs/adr/0012-split-key-selection.md` records why the
 //! answer here is a bounded sampling scan rather than the SST-property midpoint
 //! `prompts/04-multiraft-pd.md` assumes: the engine exposes no per-range size or key sample
 //! (`docs/plans/phase-4.md` §12.3), so the data itself is the only source there is.

@@ -361,7 +361,7 @@ built and could not make fail can now fail, which is the point.
 |---|---|---|
 | 0 | This section | `docs/plans/phase-4.md` |
 | 1 | Approximate region size, and the leader's periodic check | `esker-store/src/peer.rs`, `split.rs` (NEW) |
-| 2 | Split-key selection, and ADR 0010 | `esker-store/src/split.rs`, `docs/adr/0010-*.md` |
+| 2 | Split-key selection, and ADR 0012 | `esker-store/src/split.rs`, `docs/adr/0012-*.md` |
 | 3 | The `Split` command: proposed by the leader, applied on every peer | `esker-store/src/apply.rs`, `peer.rs`, `regions.rs`, `server.rs` |
 | 4 | Routing after a split: heartbeat on change, both halves in `EpochNotMatch` | falls out of 4a; asserted in unit 5 |
 | 5 | The test battery | `esker-store/tests/split.rs` (NEW), `tests/multi_region.rs` |
