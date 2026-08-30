@@ -1,0 +1,21 @@
+crates/esker-sim/src/raft/cluster/contract.rs
+  s_54136a52dccd02::t_a4a034ebc244ba 1-372
+crates/esker-sim/src/raft/cluster/mod.rs
+  s_54136a52dccd02::t_a76c142c3d84cb 33,38-39,47-48,52,134,715,729
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "3f0d02d3f8b46f660d3e9406589e5e7f03145295",
+  "prompts": {},
+  "sessions": {
+    "s_54136a52dccd02": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7991e833-93be-4b3f-93b2-2e245ecc2446",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
