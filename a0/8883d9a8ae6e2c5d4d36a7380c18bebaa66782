@@ -1,0 +1,29 @@
+crates/esker-raft/src/conf.rs
+  s_34d3e1d2eec97a::t_1db5ad96f7c177 118-123,511-512,514-527,537,543-547,566,568,571-572,588
+crates/esker-raft/src/core.rs
+  s_34d3e1d2eec97a::t_3a8e2236a6c39c 107-108,111-124,182
+crates/esker-raft/src/election.rs
+  s_34d3e1d2eec97a::t_0d4196dbe62d51 175-178
+crates/esker-raft/src/raw_node.rs
+  s_34d3e1d2eec97a::t_7c47b4ff7dd08d 767-782
+crates/esker-sim/src/raft/cluster/mod.rs
+  s_34d3e1d2eec97a::t_03d8bfcc1643d7 851-855,858-859,861-865
+crates/esker-sim/tests/raft_membership.rs
+  s_34d3e1d2eec97a::t_b179cade9cd21c 149-157,168-179,186-188,194
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a08883d9a8ae6e2c5d4d36a7380c18bebaa66782",
+  "prompts": {},
+  "sessions": {
+    "s_34d3e1d2eec97a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9489838b-5536-4d39-8dbe-930a5f0cac17",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
