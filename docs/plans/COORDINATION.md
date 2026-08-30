@@ -32,9 +32,9 @@ One coordinator (Fable, herdr pane `COORD`) directing coding lanes. Phases are g
   - [x] `cl-p1-sst` round 2 — **accepted ~03:10**: ADR 0005, FaultFs (per-op RNG
     derivation; rename applied by fsync_dir), sst-dump. Out-of-lane edits all minimal
     and self-reported.
-  - [ ] `cl-p1-sst` round 3: crash loop (in-process FaultFs sweep + subprocess SIGKILL
-    200×; 1,000 behind --ignored). Bugs in spine files = repro test + report, never a
-    cross-lane fix.
+  - [~] `cl-p1-sst` round 3: FaultFs sweep DONE and **it found an invariant-1 WAL bug**
+    (see Incidents); SIGKILL loop (unit 2) in progress — unaffected by the bug (a kill
+    cannot tear a write(2) and then append past it).
   - [ ] spine: WAL ✅ batch/internal-key ✅ memtable ✅(assumed, verify at gate)
     manifest/Version in progress → Db → compaction → checkpoint → cli/bench.
 - [ ] Phase 2 — single-node server
@@ -80,6 +80,14 @@ One coordinator (Fable, herdr pane `COORD`) directing coding lanes. Phases are g
 
 ## Incidents
 
+- 2026-08-30 ~03:24 **ENGINE BUG (found by the crash sweep, before any real workload)**:
+  after a partial WAL append error, the log writer kept accepting writes past the torn
+  bytes → acknowledged writes after a mid-log tear are lost on recovery (invariant 1).
+  At `9409bc1`: 178/240-op schedules tore, 162 unopenable, 35 acked-then-lost. Fix
+  direction relayed to spine (LevelDB-style sticky background error + tail-only tears);
+  repro committed `#[ignore]`d in `tests/crash_faultfs.rs`; DoD = repro un-ignored as
+  regression + both sweep counts to 0. Spine's in-flight tree already had the ack half
+  fixed (0 acked-after-tear) but 123 schedules still unopenable — root cause required.
 - 2026-08-30 ~03:08: `cl-p1-sst` ran `cargo fmt --all`, reformatting the spine's
   in-flight files (whitespace only, self-reported). Standing rule added to all future
   briefs: **`cargo fmt -p <crate>` only** in a shared tree.
