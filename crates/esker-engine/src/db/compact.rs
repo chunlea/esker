@@ -235,10 +235,19 @@ impl DbInner {
             stats
         };
 
-        self.log_and_apply(&mut edit)?;
-        // A version names them now, so they have stopped being files "being written".
+        let applied = self.log_and_apply_compaction(compaction, &mut edit)?;
+        // Either a version names them now, or nothing ever will: both mean they have stopped
+        // being files "being written", and in the second case the sweep is what reclaims them.
         self.forget_pending(&outputs)?;
         self.purge_and_evict()?;
+        if !applied {
+            tracing::debug!(
+                cf = compaction.cf,
+                level = compaction.level,
+                "dropped a compaction whose inputs had already been compacted away"
+            );
+            return Ok(());
+        }
         self.compactions.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(
             cf = compaction.cf,
@@ -249,6 +258,48 @@ impl DbInner {
             "compaction finished"
         );
         Ok(())
+    }
+
+    /// Installs a compaction's edit, unless the plan has gone stale.
+    ///
+    /// A plan is *picked* against a pinned version and *applied* against `current`, and the two
+    /// can differ. The reservation that keeps two compactions off one file is taken after the
+    /// pick, so a compaction that finished and released its files in between leaves this plan
+    /// naming files `current` no longer holds. Applying it then fails the manifest builder with
+    /// `an edit deleted N files that were not there` — a corruption error for what is really
+    /// just a lost race, surfacing to whoever called `compact_range`.
+    ///
+    /// The check and the apply are under one lock acquisition, so nothing can move between
+    /// them. `Ok(false)` means the plan was stale and nothing was written; the picker will
+    /// offer a fresh one against the version that moved on, which is the same thing `reserve`
+    /// returning false already does one step earlier.
+    fn log_and_apply_compaction(
+        &self,
+        compaction: &Compaction,
+        edit: &mut VersionEdit,
+    ) -> Result<bool> {
+        let mut versions = lock(&self.versions)?;
+        let current = versions.current();
+        let holds = |level: usize, number: u64| {
+            current
+                .files(compaction.cf, level)
+                .iter()
+                .any(|file| file.number == number)
+        };
+        let stale = compaction
+            .inputs
+            .iter()
+            .any(|file| !holds(compaction.level, file.number))
+            || compaction
+                .outputs_overlapped
+                .iter()
+                .any(|file| !holds(compaction.output_level(), file.number));
+        if stale {
+            return Ok(false);
+        }
+        versions.set_last_seqno(self.visible_seqno.load(Ordering::Acquire));
+        versions.log_and_apply(edit)?;
+        Ok(true)
     }
 
     /// Merges the inputs into new files at the output level.
@@ -639,6 +690,108 @@ mod tests {
                 "{key}"
             );
         }
+    }
+
+    /// **Regression.** A compaction plan whose inputs have already gone is dropped, not applied.
+    ///
+    /// A plan is picked against a pinned version and applied against `current`. The reservation
+    /// that keeps two compactions off one file is taken *after* the pick, so this order is
+    /// reachable with two compaction threads:
+    ///
+    /// ```text
+    ///   T2  pins V, picks a plan over {A, B}          (no reservation yet)
+    ///   T1  pins V, picks {A, B}, reserves, compacts, commits, releases
+    ///   T2  reserves — and succeeds, because T1 has let go
+    ///   T2  applies a plan naming A and B, which `current` no longer has
+    /// ```
+    ///
+    /// The last step used to fail the manifest builder with `an edit deleted 2 files that were
+    /// not there`, and that error came back out of whatever called `compact_range` — a
+    /// corruption report for what is only a lost race. This drives the same shape directly,
+    /// which is exact where two threads racing would be a coin flip.
+    #[test]
+    fn a_stale_compaction_plan_is_dropped_rather_than_applied() {
+        let fs: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
+        let db = Db::open_with(
+            "/db",
+            Options {
+                create_if_missing: true,
+                cf_options: CfOptions {
+                    level0_file_num_compaction_trigger: 100,
+                    ..CfOptions::default()
+                },
+                ..Options::default()
+            },
+            Arc::clone(&fs),
+            &[cf::DEFAULT],
+        )
+        .expect("a fresh database");
+
+        for generation in 0..3u32 {
+            for i in 0..40u32 {
+                db.put(
+                    cf::DEFAULT,
+                    format!("k{i:03}").as_bytes(),
+                    format!("g{generation}").as_bytes(),
+                )
+                .expect("a put");
+            }
+            db.flush(cf::DEFAULT).expect("a flush");
+        }
+
+        // The plan T2 picked, against the version as it stands now.
+        let handle = db
+            .inner
+            .cf_by_name(cf::DEFAULT)
+            .expect("the default family");
+        let picker = db.inner.picker(&handle);
+        let pinned = lock(&db.inner.versions).expect("the versions").current();
+        let cf_version = pinned.cf(handle.id()).expect("the family's files");
+        let stale = picker
+            .pick_range(handle.id(), cf_version, 0, None, None)
+            .expect("three L0 files to merge");
+
+        // T1 gets there first and takes those same files away.
+        db.compact_range(cf::DEFAULT, None, None)
+            .expect("the winning compaction");
+        let after_winner = db.compactions_run();
+
+        // T2 applies its plan. Dropping it is the only correct answer: every file it names is
+        // gone, so there is nothing left to do and nothing to report.
+        db.inner
+            .run_compaction(&handle, &pinned, &stale, &picker)
+            .expect("a stale plan is a lost race, not a corrupt manifest");
+        assert_eq!(
+            db.compactions_run(),
+            after_winner,
+            "a dropped plan must not be counted as a compaction that ran"
+        );
+
+        drain(&db, "after the stale plan was dropped");
+
+        // The winner's work stands, undisturbed.
+        for i in 0..40u32 {
+            let key = format!("k{i:03}");
+            assert_eq!(
+                db.get(cf::DEFAULT, key.as_bytes(), &ReadOptions::default())
+                    .expect("a read")
+                    .as_deref(),
+                Some(&b"g2"[..]),
+                "{key}"
+            );
+        }
+
+        // And the database still opens, which is what says the manifest was left consistent.
+        drop(db);
+        let reopened = Db::open_with("/db", Options::default(), Arc::clone(&fs), &[cf::DEFAULT])
+            .expect("a reopen");
+        assert_eq!(
+            reopened
+                .get(cf::DEFAULT, b"k000", &ReadOptions::default())
+                .expect("a read")
+                .as_deref(),
+            Some(&b"g2"[..])
+        );
     }
 
     /// Waits for the register of files being written to empty.
