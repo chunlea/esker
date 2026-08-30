@@ -322,6 +322,27 @@ to fail regardless, never a wrong answer. Closing it properly needs PostgreSQL's
 the thing ADR 0014 declined to reimplement. Recorded as a known divergence; revisit only if a real
 client is confused by it.
 
+### Keeping the oracle, for acceptance
+
+The oracle is not a one-off. It is how this plan's remaining units get their evidence, and it is
+how phase-6a acceptance should do **differential testing**: run a statement against Esker and
+against real PostgreSQL 19 and compare the answers, rather than comparing Esker against what we
+wrote down about PostgreSQL. Value text formats, NULL ordering, SQLSTATE codes and command tags are
+all things a differential run checks for free and a hand-written assertion checks only where
+somebody thought to look.
+
+Reproducing it:
+
+```sh
+docker run -d --name esker-pg19 -e POSTGRES_HOST_AUTH_METHOD=trust \
+    -e POSTGRES_USER=esker -p 55432:5432 postgres:19beta1
+```
+
+`POSTGRES_HOST_AUTH_METHOD=trust` matters: without it the server negotiates SCRAM, and the startup
+goldens would then record an authentication exchange this node does not implement. Byte-level
+captures were taken through a recording proxy sitting between `psql` and that container, which is
+what `tests/golden/pgwire.hex` holds.
+
 ### What the shape of the gap means
 
 Nearly all of it is administrative surface: replication, foreign data wrappers, `VACUUM`, role
