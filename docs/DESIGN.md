@@ -87,11 +87,19 @@ syncs once, then wakes everyone. Sync mode per write; `Options::wal_sync_mode = 
 
 ### 4.3 WAL format (*fixed*)
 
-LevelDB's block format: 32 KiB blocks; record header = `crc32c:u32 ++ len:u16 ++ type:u8` (7 bytes);
-types `FULL/FIRST/MIDDLE/LAST`; a block trailer smaller than 7 bytes is zero-filled. Payload of one record
-= one serialized `WriteBatch`: `seqno:u64 ++ count:u32 ++ entries…`, entry = `cf:u32 ++ kind:u8 ++ key ++ value`
-(length-prefixed varints). One WAL segment per memtable generation, named `NNNNNN.wal`. The CRC is seeded
-with the record type (as LevelDB does) so a header from another position cannot be replayed.
+LevelDB's block format, all integers little-endian: 32 KiB blocks; record header =
+`crc32c:u32 ++ len:u16 ++ type:u8` (7 bytes); types `FULL=1/FIRST=2/MIDDLE=3/LAST=4` (`0` is reserved and
+never valid, so an all-zero header is not an empty record); a block trailer smaller than 7 bytes is
+zero-filled. One WAL segment per memtable generation, named `NNNNNN.wal`. The CRC is seeded with the
+record type (as LevelDB does) so a header from another position cannot be replayed; it covers the type
+byte and the payload and never the checksum field, so LevelDB's rotation *mask* is not applied.
+
+Payload of one record = one serialized `WriteBatch`: a 12-byte header `seqno:u64 ++ count:u32` followed by
+`count` entries, entry = `cf:varint ++ kind:u8 ++ key:varint-prefixed [++ value:varint-prefixed]`.
+`kind` is `Delete=0 / Put=1 / DeleteRange=2`; `Delete` stores no value and `DeleteRange`'s value is the
+exclusive end of the range. Entry `i` of a batch is stored at sequence number `seqno + i`, so a batch of
+`n` entries consumes `n` of them — that is what makes two writes to the same key inside one batch
+ordered rather than ambiguous.
 
 Recovery: read segments in order, verify every record, apply into fresh memtables, stop at the first torn
 record of the **last** segment (normal), fail on corruption anywhere else unless `Options::paranoid = false`.
@@ -100,7 +108,9 @@ record of the **last** segment (normal), fail on corruption anywhere else unless
 
 `crossbeam-skiplist` (the one bought piece of concurrent code; an in-house arena skiplist is a
 post-v1 replacement behind the same `MemTable` trait) keyed by internal key
-`user_key ++ seqno:u56 ++ kind:u8` (LevelDB layout). One
+`user_key ++ tag:u64` little-endian with `tag = (seqno << 8) | kind` (LevelDB layout, so the kind byte
+physically precedes the 56-bit sequence number), ordered by user key ascending then tag **descending** so
+the newest version of a key sorts first. One
 active + a bounded queue of immutable memtables per CF. Flush when active reaches
 `write_buffer_size` (64 MiB *default*). Stall policy: slow down at `max_immutable = 2`, stop at 4 — and
 expose both as metrics so the stall is visible, never mysterious.

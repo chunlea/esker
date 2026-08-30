@@ -26,6 +26,7 @@
 //! | Module | What it decides |
 //! |---|---|
 //! | [`error`] | the one error type; corruption is a value, never a panic |
+//! | [`batch`] | the unit of atomicity, and its own serialisation |
 //! | [`fs`] | every file touch, so the engine can be faulted, simulated and later tiered |
 //! | [`dbformat`] | internal keys, entry kinds, and the comparator seam |
 //! | [`cache_api`] | the block cache shape the read path is written against |
@@ -38,6 +39,7 @@
 #![warn(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod batch;
 pub mod cache;
 pub mod cache_api;
 pub mod dbformat;
@@ -48,6 +50,7 @@ pub mod options;
 pub mod sst;
 pub mod wal;
 
+pub use batch::WriteBatch;
 pub use cache_api::{BlockCache, CacheKey};
 pub use dbformat::{
     BytewiseComparator, Comparator, EntryKind, InternalKeyComparator, MAX_SEQNO, SeqNo,

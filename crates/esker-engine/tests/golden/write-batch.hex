@@ -1,0 +1,16 @@
+# Golden write batch (docs/DESIGN.md 4.3), produced by an independent encoder.
+# batch = seqno:u64 ++ count:u32 ++ entry[count], header little-endian.
+# entry = cf:varint ++ kind:u8 ++ key:varint-prefixed [++ value:varint-prefixed];
+# kind 0 = Delete (no value), 1 = Put, 2 = DeleteRange (value is the range end).
+# Entry i is stored at sequence number seqno + i.
+#
+# seqno = 100, count = 4
+header 640000000000000004000000
+# put(cf=0, "alpha", "one")
+entry 000105616c706861036f6e65
+# delete(cf=1, "beta") -- no value is stored
+entry 01000462657461
+# delete_range(cf=2, "g", "m") -- the value is the exclusive end
+entry 02020167016d
+# put(cf=300, "", "") -- a two-byte column-family varint, empty key and value
+entry ac02010000

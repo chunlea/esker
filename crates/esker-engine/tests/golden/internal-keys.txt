@@ -1,0 +1,20 @@
+# Golden internal keys (docs/DESIGN.md 4.4), produced by an independent encoder.
+# internal = user_key ++ tag:u64 little-endian, tag = (seqno << 8) | kind.
+# Because the tag is little-endian the kind byte physically precedes the sequence
+# number; nothing compares tags as bytes, but the layout is still frozen.
+# Fields: <user_key hex> <seqno decimal> <kind> <internal key hex>
+- 0 Delete 0000000000000000
+61 1 Put 610101000000000000
+616263 1108152157446 Put 6162630106050403020100
+6b6579 281474976710655 DeleteRange 6b657902ffffffffffff00
+ffff 72057594037927935 Put ffff01ffffffffffffff
+#
+# Sorted order: user key ascending, then tag descending (newest first).
+# Fields: order <internal key hex>
+order 610103000000000000
+order 610003000000000000
+order 610102000000000000
+order 610001000000000000
+order 61620109000000000000
+order 620164000000000000
+order 620101000000000000
