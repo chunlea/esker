@@ -1,0 +1,19 @@
+crates/esker-engine/tests/concurrency.rs
+  s_b52c2c840eeae6::t_02885bae3ac884 72-75
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2c5be4494c204e3fb35e2715aa45caa21f4dc214",
+  "prompts": {},
+  "sessions": {
+    "s_b52c2c840eeae6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe005f8d-b378-44b1-824d-4541e546f193",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
