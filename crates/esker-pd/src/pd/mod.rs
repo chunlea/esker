@@ -36,7 +36,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use esker_engine::{
-    Db, LocalFileSystem, Options, ReadOptions, WalSyncMode, WriteBatch, WriteOptions, cf,
+    Db, FileSystem, LocalFileSystem, Options, ReadOptions, WalSyncMode, WriteBatch, WriteOptions,
+    cf,
 };
 use esker_proto::{Operator, Region, StoreInfo};
 
@@ -95,6 +96,15 @@ pub struct PdOptions {
     /// Whether the balance rules run at all. On by default; a test or an operator wanting a
     /// cluster left exactly as it is turns them off, and repair still runs.
     pub balance: bool,
+    /// Where PD's database keeps its bytes. `None` is the real filesystem.
+    ///
+    /// The seam exists for the scheduling tests, which drive tens of thousands of heartbeats:
+    /// every one of them is a durable write, and on a real disk a thousand rounds over a
+    /// hundred regions is eight minutes of `fsync` for a property that has nothing to do with
+    /// durability. `esker_engine::memfs` makes the same test seconds. It changes *where* the
+    /// bytes go and not whether they are flushed, so nothing about invariant 1 is relaxed —
+    /// the crash tests use a real disk, because that is what they are about.
+    pub filesystem: Option<Arc<dyn FileSystem>>,
 }
 
 impl PdOptions {
@@ -117,6 +127,7 @@ impl PdOptions {
             target_replicas: schedule::TARGET_REPLICAS,
             balance_cooldown_ms: BALANCE_COOLDOWN_MS,
             balance: true,
+            filesystem: None,
         }
     }
 
@@ -224,12 +235,11 @@ impl Pd {
     /// [`PdError::NotBootstrapped`] to everything except [`Pd::bootstrap`], rather than
     /// inventing a cluster of its own.
     pub fn open(path: impl AsRef<Path>, options: PdOptions) -> Result<Arc<Self>> {
-        let db = Db::open_with(
-            path,
-            options.engine.clone(),
-            Arc::new(LocalFileSystem::new()),
-            &[cf::DEFAULT],
-        )?;
+        let filesystem = options
+            .filesystem
+            .clone()
+            .unwrap_or_else(|| Arc::new(LocalFileSystem::new()) as Arc<dyn FileSystem>);
+        let db = Db::open_with(path, options.engine.clone(), filesystem, &[cf::DEFAULT])?;
         let cf = db
             .cf_id(cf::DEFAULT)
             .ok_or_else(|| PdError::internal("the default column family is missing after open"))?;

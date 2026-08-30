@@ -83,6 +83,17 @@ pub enum Balance {
 }
 
 impl Balance {
+    /// Whether this is the *second* half of a replica move rather than the start of one.
+    ///
+    /// A region over its replica target is one whose move has landed and needs finishing, and
+    /// finishing it is not the same act as choosing to move it — so the caller's cooldown does
+    /// not apply. Leaving it over-replicated for a cooldown would waste a replica's worth of
+    /// space and traffic for no gain.
+    #[must_use]
+    pub fn finishes_a_move(&self) -> bool {
+        matches!(self, Self::RemovePeer { .. })
+    }
+
     /// The region this move is about.
     #[must_use]
     pub fn region_id(&self) -> u64 {

@@ -147,10 +147,17 @@ impl Pd {
         if let Some(repair) = schedule::repair_for(record, cluster) {
             return Some(Plan::Repair(repair));
         }
-        if !self.balance || state.cooling.contains_key(&record.region.id) {
+        if !self.balance {
             return None;
         }
-        balance::balance_for(record, cluster).map(Plan::Balance)
+        let move_ = balance::balance_for(record, cluster)?;
+        // A cooling region may still *finish* the move it started. The cooldown is there to
+        // stop a region being picked up again, not to strand it over-replicated for five
+        // minutes with the second half of its own move outstanding.
+        if state.cooling.contains_key(&record.region.id) && !move_.finishes_a_move() {
+            return None;
+        }
+        Some(Plan::Balance(move_))
     }
 
     /// Turns a plan into an operator, minting a peer id if it needs one, and records it as in
