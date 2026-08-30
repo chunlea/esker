@@ -1,0 +1,36 @@
+crates/esker-pd/tests/loopback.rs
+  s_dc640bf0df4adb::t_62809855b391a9 177-225,228,230,255-256,258-264,273-275,279,282-283,285-287,289,291-292,306,311-312,316,320,322,324
+  s_dc640bf0df4adb::t_c6b7b07b8f8932 226-227
+  s_dc640bf0df4adb::t_7b5b475f2f8fd8 229
+  s_dc640bf0df4adb::t_351fd3f567d53a 257
+  s_dc640bf0df4adb::t_1a9d32f8fcac1e 265-267,270-272
+  s_dc640bf0df4adb::t_6e70423e610d7e 276-278
+  s_dc640bf0df4adb::t_1094d58754150e 280-281
+  s_dc640bf0df4adb::t_0b659bedb16842 284
+  s_dc640bf0df4adb::t_e933b903da6692 288
+  s_dc640bf0df4adb::t_0f87b92e66d764 290
+  s_dc640bf0df4adb::t_c5492a996c34aa 293-295,303-305
+  s_dc640bf0df4adb::t_0b3cfe38f05836 307-310
+  s_dc640bf0df4adb::t_7c6b598a333122 313-315
+  s_dc640bf0df4adb::t_8500559dbfbe39 317-319
+  s_dc640bf0df4adb::t_a05dcb2952b914 321
+  s_dc640bf0df4adb::t_acc500530522fa 323
+  s_dc640bf0df4adb::t_002e61724ceaa0 325-327
+  s_dc640bf0df4adb::t_59bbd022da0a66 16-18,268-269,296-302,328-329
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "8f95708cd88af8d63d9b1d4c54fef5283cd546a5",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "claude-fable-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
