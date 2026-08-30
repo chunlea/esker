@@ -1,0 +1,21 @@
+docs/plans/phase-5.md
+  s_dc640bf0df4adb::t_ff1422220a98fc 1-195
+docs/txn-spec.md
+  s_dc640bf0df4adb::t_22103eb95657c5 1-311
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "b4e6822eb0b826560f3ace6dc7c3e71f1bff78c8",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "claude-fable-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
