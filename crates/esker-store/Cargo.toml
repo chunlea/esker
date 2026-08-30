@@ -16,6 +16,9 @@ esker-engine.workspace = true
 esker-keys.workspace = true
 # The wire: messages, the typed error, and the Service the server calls.
 esker-proto.workspace = true
+# Consensus. The store is its driver: it owns the RawNode, performs the writes a `Ready`
+# asks for, and enforces the ordering the pure core cannot (docs/DESIGN.md §5).
+esker-raft.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
