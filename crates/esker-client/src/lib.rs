@@ -11,10 +11,26 @@
 //!   `NotLeader`, `EpochNotMatch`, `ServerIsBusy` — are retried, and never forever.
 //! * **Timestamps come from the oracle** (invariant 6); the client never invents one.
 //!
-//! Phase 0 contains only the retry policy; the client is phases 2 and 5
-//! (`prompts/02-single-node-server.md`, `prompts/05-txn.md`).
+//! # Layout
+//!
+//! [`wire`] is the message layer — a stand-in for `esker-proto` until that crate lands;
+//! [`transport`] is the one seam through which bytes leave the process; [`clock`] is the one
+//! seam through which time enters. Everything else — the region cache, the retry loop,
+//! `RawClient` — is ordinary synchronous code with neither, which is what lets
+//! [`testing::FakeTransport`] drive all of it.
+//!
+//! The transaction client is phase 5 (`prompts/05-txn.md`).
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+pub mod clock;
+mod error;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+pub mod transport;
+pub mod wire;
+
+pub use error::{Error, Result};
 
 /// How many times a redirectable error is retried before it is returned to the caller.
 pub const MAX_RETRIES: u32 = 8;

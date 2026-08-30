@@ -8,5 +8,24 @@ license.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+[dependencies]
+# The frame limit and, once the sibling lane lands them, the wire types themselves. Until
+# then `src/wire.rs` is a stand-in for this crate's message layer (see its header).
+esker-proto.workspace = true
+# `Bytes` at API boundaries: a value read out of a response is handed on without a copy.
+bytes.workspace = true
+thiserror.workspace = true
+
+[features]
+# Exposes `esker_client::testing`, the scriptable transport every retry test runs against.
+# Off by default, on the same reasoning as `esker-engine`'s: a normal build carries no
+# machinery whose job is to fail on purpose.
+testing = []
+
+[dev-dependencies]
+# The crate's own test harness, for integration tests that link the library as an ordinary
+# dependency and so cannot reach `#[cfg(test)]` code.
+esker-client = { path = ".", features = ["testing"] }
+
 [lints]
 workspace = true
