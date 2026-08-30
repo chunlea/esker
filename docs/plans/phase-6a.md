@@ -163,24 +163,46 @@ crates/esker-sql/
 The two seams that matter:
 
 ```rust
-/// Everything the executor may ask of storage. Shaped to match `esker-client`'s TxnClient
-/// (phase 5); the fake and the real client are the only implementations.
+/// Everything the executor may ask of storage. Shaped against `esker-client`'s real
+/// `TxnClient`/`Transaction`, read from the phase-5 lane's landed commits rather than guessed.
 pub trait Backend: fmt::Debug + Send + Sync {
     fn begin(&self) -> Result<Box<dyn Txn>>;
 }
 
 pub trait Txn: fmt::Debug + Send {
-    fn get(&mut self, key: &[u8]) -> Result<Option<Bytes>>;
-    fn scan(&mut self, range: KeyRange, limit: usize) -> Result<Vec<(Bytes, Bytes)>>;
-    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()>;
-    fn delete(&mut self, key: &[u8]) -> Result<()>;
-    /// The unique-index seam: "this key must not exist at commit". Real enforcement is
-    /// Percolator's conflict detection; the fake simulates it.
-    fn put_if_absent(&mut self, key: &[u8], value: &[u8]) -> Result<()>;
-    fn commit(self: Box<Self>) -> Result<()>;
+    fn get(&self, key: &[u8]) -> Result<Option<Bytes>>;
+    fn scan(&self, start: &[u8], end: &[u8], limit: u32) -> Result<Vec<(Bytes, Bytes)>>;
+    /// Buffered client-side, so there is nothing to fail yet — see the note below.
+    fn put(&mut self, key: &[u8], value: &[u8]);
+    fn delete(&mut self, key: &[u8]);
+    /// The commit timestamp, or `None` for a transaction that wrote nothing.
+    fn commit(self: Box<Self>) -> Result<Option<u64>>;
     fn rollback(self: Box<Self>) -> Result<()>;
 }
 ```
+
+### What the real `TxnClient` says, and the one thing it does not have
+
+`esker-client::txn` landed while this plan was being written, so unit 5's trait is aligned to it
+rather than to the sketch it replaced. Three differences worth recording, because each would
+otherwise be discovered as a compile error at wiring time:
+
+- **`put` and `delete` return nothing.** Writes are buffered on the client until commit, so there
+  is no failure to report at the call site; a conflict surfaces from `commit`. The trait matches,
+  which also means the executor must not be written as though a write can fail where it is issued.
+- **`commit` returns `Option<u64>`** — the commit timestamp, and `None` when the transaction wrote
+  nothing and therefore never needed one.
+- **`get` and `scan` take `&self`**, because read-your-writes is served from the buffer without
+  mutating it.
+
+**The gap: there is no `put_if_absent`.** The sketch had one as the unique-index seam — "this key
+must not exist at commit". Percolator's conflict detection is what really enforces it, and the
+constraint is expressible as an ordinary write to the index key whose collision the prewrite will
+catch, so this is very likely a *naming* question rather than a missing capability. It is recorded
+here as a contract item for unit 5 to settle **with the phase-5 lane** rather than by inventing a
+method on their client: either the index write is an ordinary `put` and uniqueness falls out of the
+key collision, or `TxnClient` grows an explicit assertion. The fake backend simulates the strict
+version in the meantime, so the executor is written against the stricter of the two.
 
 Synchronous, because `esker-client`'s `RawClient` is synchronous and `tokio` is meant to stay at the
 socket edge (`CLAUDE.md`). The session runs the executor on a blocking task.
