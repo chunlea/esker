@@ -39,6 +39,7 @@
 //! | [`wal`] | the write-ahead log: durability, and torn tails told from corruption |
 //! | [`version`] | which files make up the database, and the manifest that records it |
 //! | [`db`] | the database itself: open, group commit, reads, snapshots |
+//! | [`compaction`] | moving data down the levels, and dropping what nothing can see |
 //! | [`sst`], [`cache`] | the table format and the sharded LRU behind it |
 
 #![warn(unsafe_code)]
@@ -52,6 +53,7 @@
 pub mod batch;
 pub mod cache;
 pub mod cache_api;
+pub mod compaction;
 pub mod db;
 pub mod dbformat;
 pub mod error;

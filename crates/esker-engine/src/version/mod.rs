@@ -22,8 +22,11 @@ pub mod builder;
 pub mod edit;
 pub mod set;
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+
+use crate::dbformat::{Comparator, extract_user_key};
 
 pub use builder::Builder;
 pub use edit::{FileMeta, VersionEdit};
@@ -63,6 +66,57 @@ impl CfVersion {
     /// Every file in the column family, in level order.
     pub fn all_files(&self) -> impl Iterator<Item = &Arc<FileMeta>> {
         self.levels.iter().flatten()
+    }
+
+    /// Files at `level` whose user-key range intersects `[begin, end]`.
+    ///
+    /// `None` for either bound means unbounded on that side. Below L0 the files are disjoint
+    /// and sorted, so this could binary-search; it scans instead, because a level holds tens
+    /// of files and the picker runs once per compaction rather than once per read.
+    pub fn overlapping(
+        &self,
+        level: usize,
+        begin: Option<&[u8]>,
+        end: Option<&[u8]>,
+        user: &dyn Comparator,
+    ) -> Vec<Arc<FileMeta>> {
+        self.files(level)
+            .iter()
+            .filter(|file| {
+                let smallest = extract_user_key(&file.smallest);
+                let largest = extract_user_key(&file.largest);
+                let after_begin =
+                    begin.is_none_or(|begin| user.cmp(largest, begin) != Ordering::Less);
+                let before_end = end.is_none_or(|end| user.cmp(smallest, end) != Ordering::Greater);
+                after_begin && before_end
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The smallest and largest user key across `files`, or `None` if there are none.
+    pub fn range_of(files: &[Arc<FileMeta>], user: &dyn Comparator) -> Option<(Vec<u8>, Vec<u8>)> {
+        let mut bounds: Option<(Vec<u8>, Vec<u8>)> = None;
+        for file in files {
+            let smallest = extract_user_key(&file.smallest).to_vec();
+            let largest = extract_user_key(&file.largest).to_vec();
+            bounds = Some(match bounds {
+                None => (smallest, largest),
+                Some((low, high)) => (
+                    if user.cmp(&smallest, &low) == Ordering::Less {
+                        smallest
+                    } else {
+                        low
+                    },
+                    if user.cmp(&largest, &high) == Ordering::Greater {
+                        largest
+                    } else {
+                        high
+                    },
+                ),
+            });
+        }
+        bounds
     }
 }
 

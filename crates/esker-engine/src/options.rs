@@ -237,6 +237,8 @@ pub struct CfOptions {
     pub max_bytes_for_level_base: u64,
     /// Size ratio between consecutive levels.
     pub max_bytes_for_level_multiplier: u64,
+    /// Bytes an SST written by a compaction may reach before the next key starts a new file.
+    pub target_file_size: u64,
 }
 
 impl Default for CfOptions {
@@ -255,6 +257,7 @@ impl Default for CfOptions {
             level0_stop_writes_trigger: defaults::L0_STOP,
             max_bytes_for_level_base: defaults::MAX_BYTES_FOR_LEVEL_BASE,
             max_bytes_for_level_multiplier: defaults::MAX_BYTES_FOR_LEVEL_MULTIPLIER,
+            target_file_size: defaults::TARGET_FILE_SIZE,
         }
     }
 }
@@ -323,6 +326,12 @@ pub mod defaults {
 
     /// Number of levels, L0 included.
     pub const NUM_LEVELS: usize = 7;
+
+    /// Bytes a compaction output file may reach before the next key starts a new one.
+    ///
+    /// Eight of them fill L1's target, which keeps a single compaction's write amplification
+    /// bounded without making the file count silly.
+    pub const TARGET_FILE_SIZE: u64 = 8 * 1024 * 1024;
 
     /// Block cache capacity in bytes.
     pub const BLOCK_CACHE_CAPACITY: usize = 256 * 1024 * 1024;
@@ -409,6 +418,12 @@ mod tests {
         assert_eq!(defaults::MAX_BYTES_FOR_LEVEL_BASE, 64 << 20);
         assert_eq!(defaults::MAX_BYTES_FOR_LEVEL_MULTIPLIER, 10);
         assert_eq!(defaults::NUM_LEVELS, 7);
+        assert_eq!(defaults::TARGET_FILE_SIZE, 8 << 20);
+        assert_eq!(
+            defaults::MAX_BYTES_FOR_LEVEL_BASE / defaults::TARGET_FILE_SIZE,
+            8,
+            "eight output files fill L1's target"
+        );
         assert_eq!(defaults::BLOCK_CACHE_CAPACITY, 256 << 20);
         assert_eq!(defaults::BLOCK_CACHE_SHARDS, 8);
         assert_eq!(defaults::COMPACTION_THREADS, 2);

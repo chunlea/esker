@@ -325,6 +325,7 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
 | bloom | 10 bits/key, prefix-extracted for versioned CFs |
 | L0 trigger / slowdown / stop | 4 / 8 / 12 files |
 | L1 base / multiplier / levels | 64 MiB / 10 / 7 |
+| compaction output file size | 8 MiB |
 | block cache | 256 MiB, 8 shards |
 | manifest roll size | 64 MiB |
 | compaction threads | 2 |
