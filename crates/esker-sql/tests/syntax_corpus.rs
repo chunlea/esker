@@ -11,25 +11,36 @@
 //! What the corpus asserts is narrow on purpose. It says the statement *parses*. Whether Esker
 //! executes it is contract C2's business, and what it does when it executes is C3's.
 //!
-//! # Gaps
+//! # The invariant this file exists to hold
 //!
-//! Contract C1 is bounded by `sqlparser`'s own coverage, so its enforceable form is that no gap is
-//! silent. A statement PostgreSQL accepts and `sqlparser` cannot parse goes in [`KNOWN_GAPS`] with
-//! the register entry in `docs/plans/phase-6a.md` §9, and stays in the corpus. Two tests hold that
-//! line from both sides: an unlisted failure fails the build, and so does a *listed* one that has
-//! started passing — an upstream release that closes a gap must be noticed, not silently absorbed.
+//! **No statement PostgreSQL 19 accepts is ever answered with a syntax error.** Not "few", not
+//! "only obscure ones" — none, across all 353. There are exactly two acceptable answers:
+//!
+//! * the statement parses; or
+//! * it comes back `0A000 feature_not_supported` **naming the construct**, which is what
+//!   PostgreSQL itself would say about a feature it did not build.
+//!
+//! `42601 syntax_error` about valid PostgreSQL is the failure this file forbids, because it is both
+//! untrue and unactionable: it tells a user to fix a statement that is already correct. Contract C1
+//! is bounded by `sqlparser`'s coverage, but that bound is a reason to *classify* the shortfall,
+//! not to mis-report it. `crate::parse`'s recognizer table is what does the classifying, and
+//! [`KNOWN_GAPS`] records which statements it currently answers for.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use esker_sql::parse::parse;
+use esker_sql::sqlstate;
 
 /// The corpus, verified against PostgreSQL 19beta1. See the module docs for what "verified" means.
 const CORPUS: &str = include_str!("corpus/pg19.sql");
 
 /// Statements PostgreSQL 19 accepts that `sqlparser` 0.62.0 cannot parse.
 ///
-/// Each is a row in `docs/plans/phase-6a.md` §9. Removing one here without the parser actually
-/// having gained the syntax makes `every_statement_postgresql_accepts_parses` fail; leaving one
-/// here after the parser gains it makes `every_known_gap_is_still_a_gap` fail. Neither direction
-/// is quiet.
+/// These are no longer *failures* — every one of them now comes back as `0A000
+/// feature_not_supported` naming the construct, which is the honest rejection contract C2 requires.
+/// What the table records is which of the corpus is answered that way rather than executed, so that
+/// the two directions stay visible: a statement that starts parsing must be delisted, and one that
+/// stops parsing must be added. Each row is a feature in `docs/plans/phase-6a.md` §9.
 const KNOWN_GAPS: &[(&str, &str)] = &[
     // G01 -- partition maintenance
     (
@@ -97,8 +108,6 @@ const KNOWN_GAPS: &[(&str, &str)] = &[
     // G12 -- row-level locking clauses
     ("SELECT a FROM t FOR NO KEY UPDATE OF t NOWAIT;", "G12"),
     ("SELECT a FROM t FOR KEY SHARE;", "G12"),
-    // G13 -- TABLE as a query
-    ("TABLE t;", "G13"),
     // G14 -- SELECT with no list
     ("SELECT;", "G14"),
     // G15 -- JOIN USING alias
@@ -143,7 +152,6 @@ const KNOWN_GAPS: &[(&str, &str)] = &[
         "BEGIN WORK ISOLATION LEVEL SERIALIZABLE READ WRITE DEFERRABLE;",
         "G22",
     ),
-    ("ABORT;", "G22"),
     ("SET CONSTRAINTS ALL DEFERRED;", "G22"),
     // G23 -- two-phase commit
     ("PREPARE TRANSACTION 'gid';", "G23"),
@@ -231,48 +239,131 @@ fn is_known_gap(sql: &str) -> Option<&'static str> {
         .map(|(_, id)| *id)
 }
 
-/// Contract C1. Every failure is collected before anything is asserted, because the first one is
-/// rarely the interesting one — a parser missing a construct usually misses several.
+/// The invariant. Every corpus statement either parses or is honestly refused; nothing PostgreSQL
+/// 19 accepts may come back as a syntax error. Failures are collected before anything is asserted,
+/// because the first is rarely the interesting one.
 #[test]
-fn every_statement_postgresql_accepts_parses() {
+fn no_statement_postgresql_accepts_is_ever_a_syntax_error() {
     let mut failures = Vec::new();
     for entry in corpus() {
-        if is_known_gap(entry.sql).is_some() {
-            continue;
-        }
-        if let Err(error) = parse(entry.sql) {
-            failures.push(format!("  [{}] {}\n      {error}", entry.class, entry.sql));
+        match parse(entry.sql) {
+            Ok(_) => {}
+            Err(error) if error.sqlstate() == sqlstate::FEATURE_NOT_SUPPORTED => {}
+            Err(error) => failures.push(format!(
+                "  [{}] {}\n      {} {error}",
+                entry.class,
+                entry.sql,
+                error.sqlstate()
+            )),
         }
     }
     assert!(
         failures.is_empty(),
-        "{} statements that PostgreSQL 19 accepts did not parse.\n\
-         Each is either a bug here or an upstream gap: if it is a gap, add it to KNOWN_GAPS and to \
-         docs/plans/phase-6a.md §9. Never leave one unlisted -- an unlisted gap is contract C1 \
-         broken silently, which is the one thing the contract forbids.\n{}",
+        "{} statements PostgreSQL 19 accepts came back as something other than a parse or an \
+         honest 0A000.\nEvery one of these is telling a user their correct SQL is malformed. Add \
+         a row to the UNSUPPORTED table in src/parse.rs naming the construct, and a line to \
+         docs/plans/phase-6a.md §9.\n{}",
         failures.len(),
         failures.join("\n")
     );
 }
 
-/// The other direction. A gap that has started parsing means the dependency grew the syntax, and
-/// the register is now wrong — which matters, because the register is what tells a reader what
-/// Esker cannot yet be asked.
+/// The refusal has to be *useful*, which means naming the construct. "not supported" on its own
+/// tells a user nothing about what to change, so an empty or generic name is a failure here.
 #[test]
-fn every_known_gap_is_still_a_gap() {
-    let mut fixed = Vec::new();
-    for (sql, id) in KNOWN_GAPS {
-        if parse(sql).is_ok() {
-            fixed.push(format!("  {id}: {sql}"));
+fn every_refusal_names_the_feature_it_is_refusing() {
+    for entry in corpus() {
+        if let Err(error) = parse(entry.sql) {
+            let message = error.to_string();
+            assert!(
+                message.ends_with(" is not supported"),
+                "[{}] {} produced a message that does not name a feature: {message}",
+                entry.class,
+                entry.sql
+            );
+            let feature = message.trim_end_matches(" is not supported");
+            assert!(
+                feature.len() >= 2,
+                "[{}] {} named its feature as {feature:?}",
+                entry.class,
+                entry.sql
+            );
+        }
+    }
+}
+
+/// Both directions of drift. A listed gap that has started parsing means the dependency grew the
+/// syntax and the register is stale; an unlisted statement that stopped parsing means we lost
+/// ground without noticing. Either way the register in §9 is now wrong, which matters because it
+/// is what tells a reader what Esker cannot yet be asked.
+#[test]
+fn the_register_still_describes_what_the_parser_does() {
+    let mut newly_parsing = Vec::new();
+    let mut newly_refused = Vec::new();
+    for entry in corpus() {
+        let listed = is_known_gap(entry.sql).is_some();
+        let parses = parse(entry.sql).is_ok();
+        if listed && parses {
+            newly_parsing.push(format!("  {}", entry.sql));
+        } else if !listed && !parses {
+            newly_refused.push(format!("  {}", entry.sql));
         }
     }
     assert!(
-        fixed.is_empty(),
-        "{} known gaps now parse. Delete them from KNOWN_GAPS and mark the rows closed in \
+        newly_parsing.is_empty(),
+        "{} statements in KNOWN_GAPS now parse. Delete them here and close their rows in \
          docs/plans/phase-6a.md §9:\n{}",
-        fixed.len(),
-        fixed.join("\n")
+        newly_parsing.len(),
+        newly_parsing.join("\n")
     );
+    assert!(
+        newly_refused.is_empty(),
+        "{} statements outside KNOWN_GAPS stopped parsing:\n{}",
+        newly_refused.len(),
+        newly_refused.join("\n")
+    );
+}
+
+/// The two synonyms PostgreSQL documents and `sqlparser` does not know are rewritten rather than
+/// refused, so they execute like the statements they are defined to be equal to.
+#[test]
+fn documented_synonyms_are_rewritten_not_refused() {
+    let table = parse("TABLE t").expect("TABLE t is SELECT * FROM t");
+    assert_eq!(table[0].to_string(), "SELECT * FROM t");
+
+    let abort = parse("ABORT").expect("ABORT is ROLLBACK");
+    assert_eq!(abort[0].to_string(), "ROLLBACK");
+
+    // The rewrite is a leading-keyword substitution, so the rest of the statement survives it.
+    let ordered = parse("TABLE t ORDER BY a LIMIT 1").expect("TABLE takes query clauses");
+    assert_eq!(ordered[0].to_string(), "SELECT * FROM t ORDER BY a LIMIT 1");
+}
+
+/// The converse of the invariant, and the reason the recognizer is a table of constructs rather
+/// than a blanket "anything that fails to parse is a missing feature". A typo is a syntax error,
+/// and calling it `0A000` would be its own kind of lie.
+#[test]
+fn malformed_sql_is_still_a_syntax_error() {
+    for sql in [
+        "SELCT 1",
+        "INSERT INTO",
+        "SELECT * FROM t WHERE",
+        "((((",
+        "CREATE TABLE",
+        "SELECT 1 +",
+        "UPDATE SET",
+        "SELECT * FROM t GROUP",
+        "INSERT INTO t VALUES",
+        "CREATE INDEX ON",
+    ] {
+        let error = parse(sql).expect_err("this is not valid PostgreSQL");
+        assert_eq!(
+            error.sqlstate(),
+            sqlstate::SYNTAX_ERROR,
+            "{sql} should be a syntax error, got {}",
+            error.sqlstate()
+        );
+    }
 }
 
 /// A corpus that shrank, or that lost a statement class, would keep passing while testing less.

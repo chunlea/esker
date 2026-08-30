@@ -136,14 +136,34 @@ impl StatementClass {
 /// PostgreSQL 19 accepts is a bug, and belongs in the plan's gap register rather than in a user's
 /// error log.
 pub fn parse(sql: &str) -> Result<Vec<Statement>> {
-    let depth = nesting_depth(sql);
-    if depth > MAX_NESTING_DEPTH {
+    let scanned = scan(sql);
+    if scanned.max_depth > MAX_NESTING_DEPTH {
         return Err(SqlError::StatementTooComplex);
     }
-    if depth <= INLINE_PARSE_DEPTH {
-        return parse_inner(sql);
+
+    // A statement PostgreSQL defines as a synonym for one the parser does know.
+    let rewritten = rewrite_synonym(sql, &scanned);
+    let text = rewritten.as_deref().unwrap_or(sql);
+
+    let parsed = if scanned.max_depth <= INLINE_PARSE_DEPTH {
+        parse_inner(text)
+    } else {
+        parse_on_a_deep_stack(text)
+    };
+
+    match parsed {
+        // Contract C2 over contract C1's shortfall. The parser could not read it; if PostgreSQL
+        // could, then what happened is that Esker is missing a feature, and saying "syntax error"
+        // about valid SQL is both untrue and unactionable. `recognize_unsupported` is what tells
+        // the two apart, and a statement it does not recognise really is malformed.
+        Err(SqlError::Syntax { message, position }) => {
+            match recognize_unsupported(sql, &scanned.words) {
+                Some(feature) => Err(SqlError::unsupported(feature)),
+                None => Err(SqlError::Syntax { message, position }),
+            }
+        }
+        other => other,
     }
-    parse_on_a_deep_stack(sql)
 }
 
 /// Parses on a thread sized for [`MAX_NESTING_DEPTH`].
@@ -234,6 +254,249 @@ fn feature_name(statement: &Statement) -> String {
     }
 }
 
+/// A construct PostgreSQL 19 accepts that `sqlparser` cannot read, and the name to call it by.
+///
+/// This table is contract C2 applied to contract C1's shortfall. A statement PostgreSQL parses and
+/// this crate's parser does not is a *missing feature*, not a malformed statement, and the client
+/// is owed `0A000 feature_not_supported` naming the construct rather than `42601 syntax_error`
+/// pointing at a keyword that is perfectly valid. `docs/plans/phase-6a.md` §9 is the register these
+/// rows come from, and `tests/syntax_corpus.rs` is what proves the two still agree.
+///
+/// The table is consulted **only after a parse has already failed**, which is what makes a loose
+/// pattern safe: it can only re-describe something that was going to be an error anyway, and
+/// "BETWEEN SYMMETRIC is not supported" beats "syntax error at or near SYMMETRIC" even when the
+/// statement was malformed for another reason too. What it must never do is swallow an ordinary
+/// typo, which is why no row matches on a bare common keyword.
+struct Unsupported {
+    /// The construct, named as PostgreSQL names it.
+    feature: &'static str,
+    /// Words the statement must begin with; empty means no constraint.
+    leading: &'static [&'static str],
+    /// Words that must appear in this order somewhere; [`ANY`] matches any single word.
+    contains: &'static [&'static str],
+}
+
+/// Matches any single word in an [`Unsupported::contains`] pattern.
+const ANY: &str = "?";
+
+/// Ordered most specific first: `CREATE USER MAPPING` must be tested before `CREATE USER`, or the
+/// shorter row would claim the longer statement and name the feature wrongly.
+const UNSUPPORTED: &[Unsupported] = &[
+    // --- Constructs inside statements this crate does execute. These are the rows a user of the
+    // --- supported subset can actually reach, so they are tested first and named precisely.
+    u("GROUP BY DISTINCT", &[], &["GROUP", "BY", "DISTINCT"]),
+    u(
+        "row-level locking with FOR KEY SHARE",
+        &[],
+        &["FOR", "KEY", "SHARE"],
+    ),
+    u(
+        "row-level locking with FOR NO KEY UPDATE",
+        &[],
+        &["FOR", "NO", "KEY", "UPDATE"],
+    ),
+    u("BETWEEN SYMMETRIC", &[], &["BETWEEN", "SYMMETRIC"]),
+    u("TRIM(BOTH ...)", &[], &["TRIM", "BOTH"]),
+    u("TRIM(LEADING ...)", &[], &["TRIM", "LEADING"]),
+    u("TRIM(TRAILING ...)", &[], &["TRIM", "TRAILING"]),
+    u(
+        "a window frame EXCLUDE clause",
+        &[],
+        &["EXCLUDE", "CURRENT"],
+    ),
+    u("a window frame EXCLUDE clause", &[], &["EXCLUDE", "TIES"]),
+    u("a window frame EXCLUDE clause", &[], &["EXCLUDE", "GROUP"]),
+    u("a window frame EXCLUDE clause", &[], &["EXCLUDE", "NO"]),
+    u("ROWS FROM", &[], &["ROWS", "FROM"]),
+    u("a JSON wrapper clause", &[], &["WITH", "WRAPPER"]),
+    u("a JSON wrapper clause", &[], &["WITHOUT", "WRAPPER"]),
+    u("a JSON quotes clause", &[], &["OMIT", "QUOTES"]),
+    u("a JSON quotes clause", &[], &["KEEP", "QUOTES"]),
+    u("INSERT ... OVERRIDING", &[], &["OVERRIDING"]),
+    u("MERGE ... THEN DO NOTHING", &["MERGE"], &["THEN", "DO"]),
+    u(
+        "an aliased JOIN ... USING clause",
+        &["SELECT"],
+        &["USING", ANY, "AS"],
+    ),
+    u(
+        "the SEARCH clause of a recursive CTE",
+        &[],
+        &["SEARCH", "DEPTH"],
+    ),
+    u(
+        "the SEARCH clause of a recursive CTE",
+        &[],
+        &["SEARCH", "BREADTH"],
+    ),
+    u(
+        "the CYCLE clause of a recursive CTE",
+        &["WITH", "RECURSIVE"],
+        &["CYCLE"],
+    ),
+    // --- Transaction control ---
+    u("PREPARE TRANSACTION", &["PREPARE", "TRANSACTION"], &[]),
+    u("COMMIT PREPARED", &["COMMIT", "PREPARED"], &[]),
+    u("ROLLBACK PREPARED", &["ROLLBACK", "PREPARED"], &[]),
+    u("SET CONSTRAINTS", &["SET", "CONSTRAINTS"], &[]),
+    u("a DEFERRABLE transaction", &["BEGIN"], &["DEFERRABLE"]),
+    u("a DEFERRABLE transaction", &["START"], &["DEFERRABLE"]),
+    // --- Schema objects ---
+    u(
+        "ALTER TABLE ... ATTACH PARTITION",
+        &[],
+        &["ATTACH", "PARTITION"],
+    ),
+    u(
+        "ALTER TABLE ... DETACH PARTITION",
+        &[],
+        &["DETACH", "PARTITION"],
+    ),
+    u("ALTER TABLE ... SET LOGGED", &[], &["SET", "LOGGED"]),
+    u("ALTER TABLE ... SET UNLOGGED", &[], &["SET", "UNLOGGED"]),
+    u("CREATE UNLOGGED TABLE", &["CREATE", "UNLOGGED"], &[]),
+    u("an EXCLUDE constraint", &[], &["EXCLUDE", "USING"]),
+    u(
+        "CREATE TABLE ... LIKE",
+        &["CREATE", "TABLE"],
+        &["INCLUDING"],
+    ),
+    u("a typed table", &["CREATE", "TABLE"], &[ANY, "OF"]),
+    u(
+        "CREATE INDEX ... ON ONLY",
+        &["CREATE", "INDEX"],
+        &["ON", "ONLY"],
+    ),
+    u(
+        "DROP INDEX CONCURRENTLY",
+        &["DROP", "INDEX"],
+        &["CONCURRENTLY"],
+    ),
+    u("REINDEX", &["REINDEX"], &[]),
+    u("CREATE RECURSIVE VIEW", &["CREATE", "RECURSIVE"], &[]),
+    u("CREATE MATERIALIZED VIEW", &["CREATE", "MATERIALIZED"], &[]),
+    u("REFRESH MATERIALIZED VIEW", &["REFRESH"], &[]),
+    u("CREATE SEQUENCE", &["CREATE", "SEQUENCE"], &[]),
+    u("ALTER SEQUENCE", &["ALTER", "SEQUENCE"], &[]),
+    u("CREATE STATISTICS", &["CREATE", "STATISTICS"], &[]),
+    u("DROP STATISTICS", &["DROP", "STATISTICS"], &[]),
+    // --- Routines ---
+    u("a SQL-standard routine body", &[], &["BEGIN", "ATOMIC"]),
+    u("CREATE PROCEDURE", &["CREATE", "PROCEDURE"], &[]),
+    u("CREATE AGGREGATE", &["CREATE", "AGGREGATE"], &[]),
+    u("DO", &["DO"], &[]),
+    // --- Access control ---
+    u("CREATE USER MAPPING", &["CREATE", "USER", "MAPPING"], &[]),
+    u("GRANT", &["GRANT"], &[]),
+    u("REVOKE", &["REVOKE"], &[]),
+    u("CREATE USER", &["CREATE", "USER"], &[]),
+    u("ALTER DEFAULT PRIVILEGES", &["ALTER", "DEFAULT"], &[]),
+    u("SECURITY LABEL", &["SECURITY", "LABEL"], &[]),
+    u("REASSIGN OWNED", &["REASSIGN"], &[]),
+    u("DROP OWNED", &["DROP", "OWNED"], &[]),
+    // --- Cluster administration ---
+    u("VACUUM", &["VACUUM"], &[]),
+    u("CLUSTER", &["CLUSTER"], &[]),
+    u("CHECKPOINT", &["CHECKPOINT"], &[]),
+    u("MOVE", &["MOVE"], &[]),
+    u("CREATE DATABASE", &["CREATE", "DATABASE"], &[]),
+    u("DROP DATABASE", &["DROP", "DATABASE"], &[]),
+    u("ALTER DATABASE", &["ALTER", "DATABASE"], &[]),
+    u("ALTER SYSTEM", &["ALTER", "SYSTEM"], &[]),
+    // --- Replication and foreign data ---
+    u("CREATE PUBLICATION", &["CREATE", "PUBLICATION"], &[]),
+    u("ALTER PUBLICATION", &["ALTER", "PUBLICATION"], &[]),
+    u("DROP PUBLICATION", &["DROP", "PUBLICATION"], &[]),
+    u("CREATE SUBSCRIPTION", &["CREATE", "SUBSCRIPTION"], &[]),
+    u("DROP SUBSCRIPTION", &["DROP", "SUBSCRIPTION"], &[]),
+    u("CREATE FOREIGN TABLE", &["CREATE", "FOREIGN"], &[]),
+    u("IMPORT FOREIGN SCHEMA", &["IMPORT", "FOREIGN"], &[]),
+];
+
+/// Builds a row of [`UNSUPPORTED`]. A free function because a `const` table cannot call a method.
+const fn u(
+    feature: &'static str,
+    leading: &'static [&'static str],
+    contains: &'static [&'static str],
+) -> Unsupported {
+    Unsupported {
+        feature,
+        leading,
+        contains,
+    }
+}
+
+impl Unsupported {
+    fn matches(&self, words: &[&str]) -> bool {
+        if !starts_with_words(words, self.leading) {
+            return false;
+        }
+        self.contains.is_empty() || contains_words(words, self.contains)
+    }
+}
+
+fn word_matches(word: &str, pattern: &str) -> bool {
+    pattern == ANY || word.eq_ignore_ascii_case(pattern)
+}
+
+fn starts_with_words(words: &[&str], pattern: &[&str]) -> bool {
+    words.len() >= pattern.len()
+        && words
+            .iter()
+            .zip(pattern)
+            .all(|(word, expected)| word_matches(word, expected))
+}
+
+fn contains_words(words: &[&str], pattern: &[&str]) -> bool {
+    if pattern.is_empty() || pattern.len() > words.len() {
+        return false;
+    }
+    (0..=words.len() - pattern.len()).any(|start| starts_with_words(&words[start..], pattern))
+}
+
+/// Names the unsupported construct in a statement that would not parse, if one can be named.
+///
+/// `None` means the statement is simply malformed, and the client gets `42601` — the right answer
+/// for a typo and the wrong one for a feature. Telling those two apart is the whole job here.
+fn recognize_unsupported(sql: &str, words: &[&str]) -> Option<&'static str> {
+    // `SELECT` with no target list at all -- PostgreSQL returns one row of no columns. Recognised
+    // from the source rather than from the word list, because a word list holds only bare words:
+    // `SELECT 1 +` also has exactly one of them, and calling that a missing feature instead of the
+    // syntax error it is would be the recognizer lying in the other direction.
+    if sql
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .eq_ignore_ascii_case("SELECT")
+    {
+        return Some("SELECT with an empty target list");
+    }
+    UNSUPPORTED
+        .iter()
+        .find(|candidate| candidate.matches(words))
+        .map(|candidate| candidate.feature)
+}
+
+/// Rewrites the leading keyword of a statement PostgreSQL defines as a synonym for another.
+///
+/// Both substitutions are spelled out in PostgreSQL's own documentation — `TABLE name` is defined
+/// as `SELECT * FROM name`, and `ABORT` is a deprecated synonym for `ROLLBACK` — so this is a
+/// rewrite PostgreSQL sanctions rather than an interpretation of ours. It buys two statements that
+/// are really written: `TABLE t` is a query, and `ABORT` ends a transaction.
+fn rewrite_synonym(sql: &str, scanned: &Scan<'_>) -> Option<String> {
+    let range = scanned.first_word.clone()?;
+    let replacement = match scanned.words.first()? {
+        first if first.eq_ignore_ascii_case("TABLE") => "SELECT * FROM",
+        first if first.eq_ignore_ascii_case("ABORT") => "ROLLBACK",
+        _ => return None,
+    };
+    let mut rewritten = String::with_capacity(sql.len() + replacement.len());
+    rewritten.push_str(sql.get(..range.start)?);
+    rewritten.push_str(replacement);
+    rewritten.push_str(sql.get(range.end..)?);
+    Some(rewritten)
+}
+
 /// The deepest nesting anywhere in the statement.
 ///
 /// Counts three things, and skips everything that only looks like them:
@@ -247,7 +510,32 @@ fn feature_name(statement: &Statement) -> String {
 /// certainly a syntax error, and it is the parser's job to say so with the right message.
 #[must_use]
 pub fn nesting_depth(sql: &str) -> usize {
+    scan(sql).max_depth
+}
+
+/// What one pass over a statement's lexical structure yields.
+///
+/// Both consumers need the same thing understood -- that a `(` inside a string is not nesting and
+/// a `GROUP BY` inside a comment is not a clause -- so the quoting rules are implemented once here
+/// and the depth guard and the feature recognizer are two readings of the same pass.
+struct Scan<'a> {
+    /// The deepest nesting anywhere in the statement.
+    max_depth: usize,
+    /// Every bare word, in order, as it appears in the source. Punctuation, literals, quoted
+    /// identifiers and comments are not words: a recognizer matches keywords, and keywords are
+    /// exactly what survives this filter.
+    words: Vec<&'a str>,
+    /// Byte range of the first word. The synonym rewrites are all leading-keyword substitutions,
+    /// and this is what lets one be made without re-finding the keyword in text that may open with
+    /// whitespace or a comment.
+    first_word: Option<core::ops::Range<usize>>,
+}
+
+#[allow(clippy::too_many_lines)]
+fn scan(sql: &str) -> Scan<'_> {
     let bytes = sql.as_bytes();
+    let mut words: Vec<&str> = Vec::new();
+    let mut first_word: Option<core::ops::Range<usize>> = None;
     let mut index = 0;
     let mut depth: usize = 0;
     let mut max: usize = 0;
@@ -298,6 +586,10 @@ pub fn nesting_depth(sql: &str) -> usize {
             }
             b if is_ident_start(b) => {
                 let end = ident_end(bytes, index);
+                if words.is_empty() {
+                    first_word = Some(index..end);
+                }
+                words.push(&sql[index..end]);
                 match keyword(&bytes[index..end]) {
                     Keyword::Case => {
                         depth += 1;
@@ -322,7 +614,11 @@ pub fn nesting_depth(sql: &str) -> usize {
             }
         }
     }
-    max
+    Scan {
+        max_depth: max,
+        words,
+        first_word,
+    }
 }
 
 /// The three keywords that move the depth. Everything else resets the prefix run.
@@ -627,6 +923,105 @@ mod tests {
             .spawn(move || parse(&sql).is_ok())
             .unwrap();
         assert!(worker.join().unwrap());
+    }
+
+    // --- contract C2 over contract C1's shortfall ---
+
+    /// A statement PostgreSQL accepts and this parser cannot read is a missing feature, and the
+    /// client is owed its name. `42601` here would be telling a user that correct SQL is broken.
+    #[test]
+    fn valid_postgresql_this_parser_cannot_read_names_the_feature() {
+        let cases = [
+            ("VACUUM ANALYZE t", "VACUUM"),
+            ("CREATE PUBLICATION p FOR ALL TABLES", "CREATE PUBLICATION"),
+            ("SELECT a FROM t GROUP BY DISTINCT a", "GROUP BY DISTINCT"),
+            (
+                "SELECT a FROM t FOR KEY SHARE",
+                "row-level locking with FOR KEY SHARE",
+            ),
+            (
+                "SELECT a BETWEEN SYMMETRIC 1 AND 2 FROM t",
+                "BETWEEN SYMMETRIC",
+            ),
+            ("ALTER SYSTEM SET work_mem = '64MB'", "ALTER SYSTEM"),
+            ("SELECT", "SELECT with an empty target list"),
+        ];
+        for (sql, feature) in cases {
+            let error = parse(sql).expect_err("this parser cannot read it");
+            assert_eq!(
+                error.sqlstate(),
+                crate::sqlstate::FEATURE_NOT_SUPPORTED,
+                "{sql} came back as {} instead of 0A000",
+                error.sqlstate()
+            );
+            assert_eq!(error.to_string(), format!("{feature} is not supported"));
+        }
+    }
+
+    /// `CREATE USER MAPPING` must not be claimed by the shorter `CREATE USER` row. Ordering the
+    /// table most-specific-first is the only thing preventing it, so the ordering gets a test.
+    #[test]
+    fn a_longer_pattern_wins_over_the_shorter_one_it_contains() {
+        let error = parse("CREATE USER MAPPING FOR alice SERVER srv OPTIONS (user 'x')")
+            .expect_err("not readable");
+        assert_eq!(error.to_string(), "CREATE USER MAPPING is not supported");
+    }
+
+    /// The recognizer runs only after a parse has failed, so a statement that parses is never
+    /// touched by it however much it looks like one of the patterns. `DELETE ... USING u AS x`
+    /// matches the aliased-JOIN-USING pattern and must still execute.
+    #[test]
+    fn a_statement_that_parses_is_never_reinterpreted() {
+        for sql in [
+            "DELETE FROM t USING u AS x WHERE t.id = x.id",
+            "INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING",
+            "SELECT a FROM t GROUP BY a",
+        ] {
+            assert!(parse(sql).is_ok(), "{sql} must still parse");
+        }
+    }
+
+    /// And a typo is still a typo. A recognizer that answered `0A000` for malformed SQL would be
+    /// lying in the other direction, and would hide real mistakes behind a feature name.
+    #[test]
+    fn a_typo_is_still_a_syntax_error() {
+        for sql in ["SELCT 1", "SELECT 1 +", "CREATE TABLE", "UPDATE SET"] {
+            let error = parse(sql).expect_err("not valid SQL");
+            assert_eq!(
+                error.sqlstate(),
+                crate::sqlstate::SYNTAX_ERROR,
+                "{sql} came back as {}",
+                error.sqlstate()
+            );
+        }
+    }
+
+    /// PostgreSQL defines both of these as synonyms, so they are rewritten and executed rather
+    /// than refused -- the only rewrites allowed, because anything beyond a documented equivalence
+    /// would be inventing semantics.
+    #[test]
+    fn documented_synonyms_become_the_statements_they_equal() {
+        assert_eq!(
+            parse("TABLE t").unwrap()[0].to_string(),
+            "SELECT * FROM t",
+            "TABLE name is defined as SELECT * FROM name"
+        );
+        assert_eq!(parse("ABORT").unwrap()[0].to_string(), "ROLLBACK");
+        assert_eq!(
+            classify(&parse("ABORT").unwrap()[0]),
+            StatementClass::Rollback
+        );
+        assert_eq!(
+            classify(&parse("TABLE t").unwrap()[0]),
+            StatementClass::Query
+        );
+        // Only the leading keyword is replaced; the rest of the statement survives.
+        assert_eq!(
+            parse("TABLE t ORDER BY a LIMIT 1").unwrap()[0].to_string(),
+            "SELECT * FROM t ORDER BY a LIMIT 1"
+        );
+        // A `TABLE` that is not the leading keyword is not a synonym.
+        assert!(parse("CREATE TABLE t (a int8)").is_ok());
     }
 
     // --- invariant 9: nothing a client can send may panic ---

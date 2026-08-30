@@ -22,12 +22,20 @@ time. Directive from the project owner, recorded here because it constrains ever
 Anything PostgreSQL 19 accepts, we accept *as syntax*. Parsing is delegated to `sqlparser`'s
 PostgreSQL dialect (ADR 0014) at the newest published version.
 
-This layer is bounded by something outside our control — `sqlparser`'s own coverage — so the
-enforceable form of C1 is: **no gap is silent.** A valid PG-19 statement that `sqlparser` cannot
-parse goes on the tracked upstream-gap list in §9 with its statement class and a decision (patch
-upstream / pre-transform / accept), and its test stays in the corpus as a known-failing case. C1 is
-violated by an *untracked* rejection, never by a tracked one. A gap discovered and not written into
-§9 in the same commit is the failure mode this rule exists to prevent.
+This layer is bounded by something outside our control — `sqlparser`'s own coverage — so C1's
+enforceable form is stronger than "no gap is silent". It is: **no statement PostgreSQL 19 accepts is
+ever answered with a syntax error.** There are exactly two permitted answers, and a gap in the
+parser changes which one is given, never whether the answer is honest:
+
+* the statement parses; or
+* it comes back `0A000 feature_not_supported` **naming the construct** — C2's answer, reached
+  through the recognizer table in `parse.rs` (§9).
+
+`42601 syntax_error` about valid PostgreSQL is forbidden outright, because it is untrue and
+unactionable: it tells a user to fix a statement that is already correct, and points at a keyword
+that is perfectly valid. Measured over the whole corpus: **283 parse, 70 are refused by name, none
+is a syntax error.** Every gap is also a tracked row in §9, so a gap that is merely *undocumented*
+still fails the build even though the client would have been answered correctly.
 
 Tested by the **syntax corpus** (§7.1, §9): 353 statements across 17 classes — DDL, DML, DCL, TCL,
 CTEs, window functions, set operations, `MERGE`, JSON, arrays, `LATERAL`, `RETURNING`, partitioning,
@@ -269,9 +277,50 @@ not. Two candidates were thrown out that way (`FETCH FIRST … WITH TIES` withou
 `EXCLUDE CURRENT ROW` without a frame clause); both looked correct, which is the argument for
 having an oracle rather than an opinion.
 
-The corpus is **353 statements across 17 classes**. Run through `sqlparser` 0.62.0's PostgreSQL
-dialect, **281 parse and 72 do not** — 79.6% coverage. Those 72 are below, grouped into the 30
-features they come from, and each is in `KNOWN_GAPS` in `tests/syntax_corpus.rs`.
+The corpus is **353 statements across 17 classes**. Of those, **283 parse and 70 come back as
+`0A000 feature_not_supported` naming the construct. None is a syntax error.** That last number is
+the one that matters, and it is asserted by
+`no_statement_postgresql_accepts_is_ever_a_syntax_error`.
+
+Raw parser coverage is 281 of 353 (79.6%); the other two of the 283 are `TABLE t` and `ABORT`,
+which PostgreSQL *defines* as synonyms for `SELECT * FROM t` and `ROLLBACK`, so `parse.rs` rewrites
+the leading keyword and they execute as the statements they are documented to equal. The remaining
+70 are the register below.
+
+### Why none of this is a syntax error any more
+
+The first version of this register recorded 72 statements that came back `42601 syntax_error`. That
+was a defect in its own right, and a worse one than the missing features behind it: telling a user
+that correct PostgreSQL is malformed is both untrue and unactionable, and it points them at a
+keyword that is perfectly valid. A missing feature and a typo are different things and the client
+is owed the difference.
+
+So `parse.rs` carries a recognizer table — leading-keyword and construct patterns, one row per
+feature in this register — that is consulted **only after a parse has already failed**. When it
+names the construct, the answer is `0A000 feature_not_supported` naming it; when it does not, the
+statement really is malformed and the answer stays `42601`. Being consulted only after failure is
+what makes a loose pattern safe: it can only re-describe something that was going to be an error
+anyway.
+
+Two tests hold both directions. `no_statement_postgresql_accepts_is_ever_a_syntax_error` forbids
+`42601` for anything in the corpus, and `malformed_sql_is_still_a_syntax_error` forbids `0A000` for
+a typo — a recognizer that swallowed real syntax errors would pass the first test and be useless.
+That second test found the one false positive this design admits: `SELECT 1 +` has exactly one
+*word*, so an empty-target-list rule matching on word count claimed it. Recognising `SELECT;` from
+the source text rather than the word list fixed it.
+
+### The other direction: statements PostgreSQL rejects and `sqlparser` accepts
+
+Not part of C1, C2 or C3 as written, but found while testing and worth recording rather than
+discovering later. `sqlparser` is in places *more* permissive than PostgreSQL: `SELECT FROM WHERE`
+and `DELETE FROM WHERE` both parse, reading `WHERE` as a table name. PostgreSQL rejects both with
+`42601`.
+
+The practical consequence is small — such a statement fails a moment later with `42P01 relation
+"where" does not exist` instead of a syntax error, so it is a wrong *code* on input that was going
+to fail regardless, never a wrong answer. Closing it properly needs PostgreSQL's grammar, which is
+the thing ADR 0014 declined to reimplement. Recorded as a known divergence; revisit only if a real
+client is confused by it.
 
 ### What the shape of the gap means
 
@@ -280,14 +329,15 @@ management, two-phase commit. Esker will not execute any of it, and a stateless 
 of a distributed store is not where an operator runs `ALTER SYSTEM`.
 
 The rows marked **on the query path** are the ones that matter, because they sit inside the kind of
-statement phase 6a *does* execute — `TABLE t` is a `SELECT`, `GROUP BY DISTINCT` is a query, and
-`SELECT a FROM t FOR KEY SHARE` is a read a real application writes. Today each of those comes back
-as a **syntax error**, which is precisely the contract C1 failure the register exists to make
-visible: the honest answer is `0A000`, naming the feature, and it cannot be given for a statement
-that never parsed. These are therefore the gaps to close first, and closing them is what the
-decision column tracks.
+statement phase 6a *does* execute — `GROUP BY DISTINCT` is a query, and `SELECT a FROM t FOR KEY
+SHARE` is a read a real application writes. Each of those now names itself in a `0A000`, which is
+the honest answer; they remain the rows to close first if they are to be *executed* rather than
+merely refused well.
 
 ### The register
+
+Thirty features, seventy statements. G13 (`TABLE t`) and `ABORT` from G22 are closed: both are
+documented synonyms and are now rewritten rather than refused.
 
 | # | Feature | Statements | Minimal repro | Priority |
 |---|---|---|---|---|
@@ -303,7 +353,6 @@ decision column tracks.
 | G10 | MERGE ... DO NOTHING | 1 | `MERGE INTO t USING u ON t.id = u.id WHEN MATCHED AND u.a > 0 THEN DO NOTHING;` | **on the query path** |
 | G11 | GROUP BY DISTINCT | 1 | `SELECT a FROM t GROUP BY DISTINCT a;` | **on the query path** |
 | G12 | row-level locking clauses | 2 | `SELECT a FROM t FOR NO KEY UPDATE OF t NOWAIT;` | **on the query path** |
-| G13 | TABLE as a query | 1 | `TABLE t;` | **on the query path** |
 | G14 | SELECT with no list | 1 | `SELECT;` | **on the query path** |
 | G15 | JOIN USING alias | 1 | `SELECT * FROM t JOIN u USING (id) AS j;` | **on the query path** |
 | G16 | ROWS FROM | 1 | `SELECT * FROM ROWS FROM (generate_series(1, 2), generate_series(3, 4)) WITH ORDINALITY;` | **on the query path** |
@@ -312,7 +361,7 @@ decision column tracks.
 | G19 | BETWEEN SYMMETRIC | 1 | `SELECT a BETWEEN 1 AND 10, a NOT BETWEEN SYMMETRIC 10 AND 1 FROM t;` | **on the query path** |
 | G20 | TRIM keyword forms | 1 | `SELECT TRIM(BOTH ' ' FROM b), TRIM(LEADING FROM b), TRIM(TRAILING 'x' FROM b) FROM t;` | **on the query path** |
 | G21 | JSON_QUERY wrapper | 1 | `SELECT JSON_QUERY('{"a":1}', '$' WITH WRAPPER);` | **on the query path** |
-| G22 | transaction modes | 3 | `BEGIN WORK ISOLATION LEVEL SERIALIZABLE READ WRITE DEFERRABLE;` | admin / DDL only |
+| G22 | transaction modes | 2 | `BEGIN WORK ISOLATION LEVEL SERIALIZABLE READ WRITE DEFERRABLE;` | admin / DDL only |
 | G23 | two-phase commit | 3 | `PREPARE TRANSACTION 'gid';` | admin / DDL only |
 | G24 | role grants and privileges | 5 | `GRANT alice TO bob WITH ADMIN OPTION;` | admin / DDL only |
 | G25 | VACUUM / CLUSTER / CHECKPOINT | 4 | `VACUUM (FULL, ANALYZE, VERBOSE) t;` | admin / DDL only |
@@ -322,19 +371,23 @@ decision column tracks.
 | G29 | logical replication | 6 | `CREATE PUBLICATION pub FOR TABLE t;` | admin / DDL only |
 | G30 | foreign data wrappers | 2 | `CREATE FOREIGN TABLE ft (a int8) SERVER srv;` | admin / DDL only |
 
-**Decision, for every row above:** carry the gap, do not fork. The corpus keeps each statement, and
+**Decision, for every row above:** refuse honestly, carry the gap, do not fork. The corpus keeps each statement, and
 `every_known_gap_is_still_a_gap` fails the build the day an upstream release starts parsing one, so
 a `sqlparser` upgrade is checked against the register automatically rather than by someone
-remembering to look. For the on-the-query-path rows, the alternative if upstream stays quiet is a
-pre-parse rewrite in `parse.rs` for the handful that are simple aliases — `TABLE t` is
-`SELECT * FROM t` and nothing else — which is cheap and contained. Nothing here justifies a fork of
+remembering to look. The pre-parse rewrite is already taken where PostgreSQL itself
+documents an equivalence: `TABLE t` and `ABORT` are rewritten and gone from the register. That
+mechanism is deliberately limited to documented synonyms — rewriting `GROUP BY DISTINCT` into
+something else would be inventing semantics, and inventing semantics is how a compatibility layer
+starts returning wrong answers instead of honest refusals. Nothing here justifies a fork of
 the parser, and nothing here is a reason to reconsider ADR 0014: a hand-written parser would have
 its own gap register, and it would be longer.
 
 ## 10. Progress
 
 - [x] 1 — plan, ADR 0014, dependency, crate skeleton, SQLSTATE table, error type, parse guard
-- [x] 1b — the syntax corpus: 353 statements, oracle-verified, 72 gaps registered in §9
+- [x] 1b — the syntax corpus: 353 statements, oracle-verified, 70 gaps registered in §9
+- [x] 1c — the feature recognizer: all 353 answered by a parse or an honest `0A000`, none a syntax
+  error; `TABLE`/`ABORT` rewritten as the documented synonyms they are
 - [ ] 2 — pgwire
 - [ ] 3 — row and tuple encodings
 - [ ] 4 — catalog
