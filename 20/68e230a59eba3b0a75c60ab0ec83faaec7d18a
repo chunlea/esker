@@ -1,0 +1,23 @@
+crates/esker-raft/src/lib.rs
+  s_288744f9e8ee11::t_6e791bb32a8265 52-53
+crates/esker-raft/src/raw_node.rs
+  s_288744f9e8ee11::t_7159a9f97952df 283-325,402-498
+crates/esker-raft/src/types.rs
+  s_288744f9e8ee11::t_50655bccf7ceb7 309-335
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2068e230a59eba3b0a75c60ab0ec83faaec7d18a",
+  "prompts": {},
+  "sessions": {
+    "s_288744f9e8ee11": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "69ef5c9d-35ee-4b66-923f-7ff13fc0a37f",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
