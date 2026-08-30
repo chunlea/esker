@@ -1,0 +1,19 @@
+crates/esker-engine/tests/crash_faultfs.rs
+  s_b52c2c840eeae6::t_41dc9710a61a64 36,38-47,357,359-361,363-367,369-370,385-393,402-406,408-409,413,415-418,420-422,424,427,443-445,447-449
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "29cf010003a8c6af5e4d3ab9567e06f7c327ffec",
+  "prompts": {},
+  "sessions": {
+    "s_b52c2c840eeae6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe005f8d-b378-44b1-824d-4541e546f193",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
