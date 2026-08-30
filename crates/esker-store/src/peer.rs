@@ -163,6 +163,10 @@ pub enum PeerMsg {
     },
     /// A snapshot of what this peer believes, for the request path and for tests.
     Status(oneshot::Sender<Status>),
+    /// How far each peer of this region has got, as its leader sees it. Empty on a follower.
+    Progress(oneshot::Sender<Vec<esker_raft::PeerProgress>>),
+    /// Ask this region's leadership to move to another peer.
+    TransferLeader(NodeId),
     /// What a follower needs to be sent: the metadata, and a pinned read of the data it names.
     SnapshotSource(oneshot::Sender<std::result::Result<SnapshotSource, ProtoError>>),
     /// Stop the thread, failing everything outstanding.
@@ -744,6 +748,10 @@ impl PeerCore {
             PeerMsg::SnapshotSource(notify) => {
                 let _ = notify.send(self.snapshot_source());
             }
+            PeerMsg::Progress(notify) => {
+                let _ = notify.send(self.node.progress());
+            }
+            PeerMsg::TransferLeader(target) => self.node.transfer_leader(target),
             PeerMsg::Stop => return false,
         }
         // Published here as well as after driving, because a batch can carry the tick that
@@ -985,6 +993,25 @@ impl RaftPeer {
     /// Feeds one Raft message in.
     pub async fn step(&self, message: Message) -> std::result::Result<(), ProtoError> {
         self.send(PeerMsg::Raft(message)).await
+    }
+
+    /// How far each peer of this region has got, as this peer sees it. Empty unless it leads.
+    pub async fn progress(&self) -> std::result::Result<Vec<esker_raft::PeerProgress>, ProtoError> {
+        let (notify, answer) = oneshot::channel();
+        self.send(PeerMsg::Progress(notify)).await?;
+        answer
+            .await
+            .map_err(|_| ProtoError::internal("the Raft peer stopped"))
+    }
+
+    /// Asks this region's leadership to move to `target`.
+    ///
+    /// Fire and forget, and it has to be: the core sends `TimeoutNow` and the target campaigns,
+    /// so what completes the transfer is an *election*, which nothing here can await. A transfer
+    /// that does not happen leaves the current leader in office, which is why the placement driver
+    /// re-issues from what the next heartbeat reports rather than waiting for an answer.
+    pub async fn transfer_leader(&self, target: NodeId) -> std::result::Result<(), ProtoError> {
+        self.send(PeerMsg::TransferLeader(target)).await
     }
 
     /// What a follower needs to be sent, taken as one consistent pair on the driver thread.

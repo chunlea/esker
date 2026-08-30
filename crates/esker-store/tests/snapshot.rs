@@ -225,7 +225,9 @@ async fn an_operator_against_a_stale_epoch_is_dropped() {
         "an operator from a stale epoch was applied"
     );
 
-    // A `TransferLeader` is reserved for 4d and must also change nothing.
+    // A `TransferLeader` naming a peer this region does not have is dropped too, and it never
+    // moves the epoch either way: who leads is not part of a region's identity, which is why a
+    // client learns it from a `NotLeader` hint rather than from its cache.
     let epoch = node.store.regions().regions()[0].epoch;
     pd.issue(Operator::TransferLeader {
         region_id: 1,
@@ -234,6 +236,10 @@ async fn an_operator_against_a_stale_epoch_is_dropped() {
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(node.store.regions().regions()[0].epoch, epoch);
+    assert!(
+        node.store.peer_of(1).is_some_and(|peer| peer.is_leader()),
+        "a transfer to a peer that does not exist unseated the leader"
+    );
     node.stop().await;
 }
 

@@ -119,6 +119,13 @@ pub const SNAPSHOT_CHUNK_SIZE: usize = 1024 * 1024;
 /// which would close the only channel PD has to correct whatever it got wrong.
 pub const OPERATOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How far behind a peer may be and still be handed leadership.
+///
+/// Not zero: a follower is always a few entries behind a busy leader, and a transfer that waited
+/// for exact equality would never fire. Small enough that the new leader can close the gap from
+/// its own log rather than needing a snapshot the moment it takes office.
+pub const TRANSFER_LAG_ALLOWANCE: u64 = 64;
+
 /// How many snapshot chunks may be queued for the network before the walk waits.
 ///
 /// Small on purpose: a snapshot is megabytes and the point of streaming it is that neither end

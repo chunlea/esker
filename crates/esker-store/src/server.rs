@@ -43,7 +43,7 @@ use crate::regions::{RegionMap, RegionState};
 use crate::snapshot;
 use crate::split::{self, SplitOptions};
 use crate::transport::{PeerAddress, StoreAddress, StoreTransport};
-use crate::{OPERATOR_TIMEOUT, SNAPSHOT_STREAM_DEPTH};
+use crate::{OPERATOR_TIMEOUT, SNAPSHOT_STREAM_DEPTH, TRANSFER_LAG_ALLOWANCE};
 
 /// How a store is opened.
 #[derive(Debug, Clone)]
@@ -520,13 +520,10 @@ impl Store {
                     existing.store_id,
                 )
             }
+            // Leadership moves by the core's own `TimeoutNow` path rather than by a conf change,
+            // so it takes a different route out of here entirely.
             Operator::TransferLeader { to_peer_id, .. } => {
-                tracing::warn!(
-                    region_id,
-                    to_peer_id,
-                    "a TransferLeader operator arrived; leader balance is 4d and this store \
-                     ignores it"
-                );
+                self.transfer_leadership(&state, &peer, *to_peer_id).await;
                 return;
             }
         };
@@ -550,6 +547,76 @@ impl Store {
                 ?kind,
                 "an operator did not commit within its timeout; it may still apply later"
             ),
+        }
+    }
+
+    /// Asks a region's leadership to move, if the target can actually take it.
+    ///
+    /// No conf change and no epoch bump: who leads is not part of a region's identity, which is
+    /// why a client learns it from a `NotLeader` hint rather than from its cache. The core stops
+    /// accepting proposals, brings the target up to date, and tells it to campaign — so what
+    /// *completes* the transfer is an election, and nothing here can await one. A transfer that
+    /// does not happen leaves the current leader in office and PD re-issues from the next
+    /// heartbeat.
+    async fn transfer_leadership(
+        self: &Arc<Self>,
+        state: &Arc<RegionState>,
+        peer: &Arc<RaftPeer>,
+        to_peer_id: u64,
+    ) {
+        let region_id = state.id();
+        let Some(target) = state
+            .region()
+            .peers
+            .iter()
+            .find(|peer| peer.peer_id == to_peer_id)
+        else {
+            tracing::debug!(
+                region_id,
+                to_peer_id,
+                "a transfer named a peer this region does not have"
+            );
+            return;
+        };
+        if target.role == PeerRole::Learner {
+            // A learner cannot win an election, so the transfer would leave the region without a
+            // leader until the old one's timeout brought it back.
+            tracing::debug!(
+                region_id,
+                to_peer_id,
+                "a transfer named a learner, which cannot take office"
+            );
+            return;
+        }
+        if to_peer_id == peer.peer_id() {
+            return;
+        }
+        // A target that is not caught up would campaign on a short log and either lose or win and
+        // then need a snapshot of its own. `RawNode::progress` is what makes this checkable at all
+        // (`docs/plans/phase-4.md` §14.1 unit 4).
+        if let Ok(progress) = peer.progress().await {
+            let own_last = progress
+                .iter()
+                .find(|entry| entry.id == peer.peer_id())
+                .map_or(0, |entry| entry.matched);
+            let theirs = progress
+                .iter()
+                .find(|entry| entry.id == to_peer_id)
+                .map_or(0, |entry| entry.matched);
+            if own_last.saturating_sub(theirs) > TRANSFER_LAG_ALLOWANCE {
+                tracing::debug!(
+                    region_id,
+                    to_peer_id,
+                    behind = own_last - theirs,
+                    "a transfer named a peer that is too far behind to take office"
+                );
+                return;
+            }
+        }
+        if let Err(error) = peer.transfer_leader(to_peer_id).await {
+            tracing::debug!(region_id, to_peer_id, %error, "a transfer was not started");
+        } else {
+            tracing::info!(region_id, to_peer_id, "leadership was asked to move");
         }
     }
 
