@@ -70,7 +70,7 @@ pub use error::{Error, Result};
 pub use fs::{FileSystem, LocalFileSystem, RandomAccessFile, WritableFile};
 pub use memtable::MemTable;
 pub use options::{Compression, PrefixExtractor, WalSyncMode, WriteOptions};
-pub use version::{FileMeta, VersionEdit};
+pub use version::{FileMeta, VersionEdit, VersionSet};
 pub use wal::{LogReader, LogWriter, ReadOutcome};
 
 /// The checksum every engine format uses, re-exported so callers can write

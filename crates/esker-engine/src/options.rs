@@ -210,6 +210,10 @@ pub mod defaults {
 
     /// Batches a group-commit leader will drain before writing.
     pub const GROUP_COMMIT_MAX_BATCHES: usize = 128;
+
+    /// Size at which the manifest is rolled into a fresh one, so that recovery never has to
+    /// replay the whole history of a long-lived database.
+    pub const MANIFEST_MAX_BYTES: u64 = 64 * 1024 * 1024;
 }
 
 #[cfg(test)]
@@ -282,6 +286,7 @@ mod tests {
         assert_eq!(defaults::COMPACTION_THREADS, 2);
         assert_eq!(defaults::GROUP_COMMIT_MAX_BYTES, 1 << 20);
         assert_eq!(defaults::GROUP_COMMIT_MAX_BATCHES, 128);
+        assert_eq!(defaults::MANIFEST_MAX_BYTES, 64 << 20);
         // The stall thresholds have to be ordered for the policy to mean anything.
         assert!(defaults::MEMTABLE_SLOWDOWN < defaults::MEMTABLE_STOP);
         assert!(defaults::L0_COMPACTION_TRIGGER < defaults::L0_SLOWDOWN);

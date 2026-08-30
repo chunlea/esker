@@ -8,6 +8,7 @@
 //!
 //! * [`edit`] — `VersionEdit`, the delta the manifest is a log of
 //! * [`builder`] — applies a run of edits to a version, producing the next one
+//! * [`set`] — the manifest, the file numbers, and which versions are still pinned
 //!
 //! # Why the levels are sorted differently
 //!
@@ -19,12 +20,14 @@
 
 pub mod builder;
 pub mod edit;
+pub mod set;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 pub use builder::Builder;
 pub use edit::{FileMeta, VersionEdit};
+pub use set::VersionSet;
 
 /// The files of one column family, level by level.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

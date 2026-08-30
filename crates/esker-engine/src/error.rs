@@ -64,6 +64,16 @@ pub enum Error {
     /// this rather than a partial result.
     #[error("database is shutting down")]
     ShuttingDown,
+
+    /// An update failed part-way through, so what is in memory and what is on disk may no
+    /// longer agree. Nothing further is attempted; the database has to be reopened, which
+    /// re-derives the state from what actually reached the disk.
+    ///
+    /// This is the honest answer to a failed manifest sync or a failed `CURRENT` rename. The
+    /// alternative — carrying on with an in-memory version the disk does not share — is how a
+    /// storage engine starts returning keys that are not there.
+    #[error("database must be reopened: {0}")]
+    Poisoned(String),
 }
 
 impl Error {

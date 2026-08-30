@@ -326,6 +326,7 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
 | L0 trigger / slowdown / stop | 4 / 8 / 12 files |
 | L1 base / multiplier / levels | 64 MiB / 10 / 7 |
 | block cache | 256 MiB, 8 shards |
+| manifest roll size | 64 MiB |
 | compaction threads | 2 |
 | region split size | 96 MiB |
 | raft tick / election / heartbeat | 100 ms / 10–20 ticks / 2 ticks |
