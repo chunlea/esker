@@ -335,14 +335,63 @@ column family, the store does) — and one region, id 1, covering `["", "")` wit
 ## 8. Progress
 
 - [x] step 0 — this plan
-- [ ] step 1 — framing
-- [ ] step 2 — messages and errors
-- [ ] step 3 — transport
-- [ ] step 4 — store
-- [ ] step 5 — `esker-cli server`
-- [ ] step 6 — integration tests
+- [x] step 1 — framing (`frame.rs`, `codec.rs`, `error.rs`, `region.rs`; golden frames, the
+      chunking proptest, the fuzz decoder)
+- [x] step 2 — messages and errors (`messages.rs`; forty golden bodies covering every method and
+      every error code)
+- [x] step 3 — transport (`transport/{mod,conn,client,server}.rs`; 20 loopback tests including the
+      1,000-concurrent-request demultiplexer case)
+- [x] step 4 — store (`error.rs`, `region.rs`, `rawkv.rs`, `server.rs`, ADR 0006)
+- [x] step 5 — `esker-cli server --data-dir --listen`, graceful shutdown on ctrl-c
+- [x] step 6 — integration tests over real TCP on an ephemeral port
+- [ ] steps 7–9 — the client lane's
+
+**Gate at the end of this lane's work**: `just check` green across the workspace; 708 tests
+passing; 22 of 40 runtime crates (tokio brought `mio`, `libc`, `socket2`, `signal-hook-registry`
+and `tokio-macros`, which ADR 0003 anticipated); 3 golden files
+(`frames.hex`, `messages.hex`, and the phase-1 set unchanged). `esker server` +
+`esker raw put/get/scan/delete` verified end to end against the client lane's build.
 
 ## 9. Changes vs plan
+
+### 9.0 What changed while building it
+
+1. **`ProtoError` gained `NotSent` (15) and `Timeout` (16), and `outcome()`.** The client lane
+   asked for "provably never sent" to be distinguishable from "sent, no answer", and it was right
+   to: without it a client cannot tell a write it may safely repeat from one it may not, and
+   phase 5's `Prewrite` needs the same distinction. Every failure path in the transport is written
+   to preserve it, and `esker-store`'s engine-error mapping is too — an engine failure whose effect
+   on the log is uncertain maps to `Unknown`, which is the safe direction to be wrong in.
+2. **`BlockingTransport`**, wrapping the async `Transport` with an owned runtime and a per-call
+   deadline. The CLI and `bench --remote` are threads rather than futures. It shuts its runtime
+   down in the background on drop, because dropping a `Runtime` inside an async context panics and
+   a type that is unsafe to drop in half the program is a trap rather than a convenience.
+3. **`TransportConfig::shutdown_grace`.** The first version of `Server::serve` waited for every
+   in-flight permit to come back, so one handler wedged on a stuck disk would hold the process open
+   past any patience. The drain is bounded and logs what it abandoned.
+4. **`WriterStop`.** With the drain bounded, an abandoned handler still held a `FrameSink` clone,
+   and the writer task stops when the last one drops — so the socket stayed open and the peer waited
+   out its own 30-second request timeout. Closing is now explicit rather than by last reference.
+   Visible as a loopback suite that took 30 seconds and now takes 0.2.
+5. **`RawKv Scan` has a byte budget as well as a key limit** (`max_scan_bytes`, 4 MiB). A response
+   that will not fit in one frame is a response the transport must refuse, and the client would get
+   nothing rather than a first page. Not in the original plan; found by asking what a scan of large
+   values does.
+6. **`RawKv DeleteRange` does not use the engine's `DeleteRange`.** ADR 0006, and it is a real
+   finding rather than a design choice: `docs/DESIGN.md` §4.7 claimed v1 rejects a wide range with
+   an error, and in fact the engine accepts every range and deletes the key at `begin`. §4.7 now
+   says what v1 actually does. **The engine gap is phase-1 code and is not fixed here** — it is a
+   report line to the coordinator.
+7. **`RegionMeta` holds a `Region`, not a `(region, epoch)` pair** as the brief sketched. The epoch
+   is a field of `Region` because `docs/DESIGN.md` §6 defines it that way, and splitting it would
+   have put the code and the design document in disagreement.
+8. **A `RwLock` write gate.** Every mutation takes the shared side, `CompareAndSwap` the exclusive
+   side. It is not the "global request lock" the brief forbids — writes still run concurrently with
+   each other — and it is what makes a read-modify-write atomic against a concurrent `Put` on a
+   single node. It goes away in phase 3, when the Raft log becomes the serialisation point.
+9. **`ChunkStream`/`ChunkSender` for streamed replies**, exercised by a loopback echo. Phase 4's
+   snapshot transfer is the caller; the point of building it now is that the frame kinds are not
+   written for the first time under a snapshot.
 
 ### 9.1 Frame kinds stay 1-based, against the brief's 0-based numbering
 

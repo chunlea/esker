@@ -206,7 +206,10 @@ database contains is worse than opening more than was asked for. `create_cf` and
 on an open database; both are manifest edits, made durable before memory changes, and a drop is
 followed by file deletion. The names `default`, `lock`, `write` (Percolator, §8) and `raft`
 (Raft logs and region metadata, §6) are constants in `esker_engine::cf` — the set that
-`esker-store` **will** create at bootstrap from phase 2, not something this layer imposes.
+`esker-store` creates at bootstrap, since phase 2, not something this layer imposes. All four are
+created by the first `Store::open` even though phase 2 writes only to `default`: creating the other
+three when `esker-txn` and `esker-raft` arrive would make every database built before then a
+migration.
 
 ### 4.9 Read path
 
@@ -307,14 +310,34 @@ Hand-rolled, pure Rust, no tonic/prost/serde. One TCP connection carries multipl
 frames (*fixed* framing, version 1):
 
 ```
-frame   = len:u32 ++ crc32c:u32 ++ kind:u8 ++ request_id:u64 ++ body
-kind    = Request | Response | Stream(chunk) | StreamEnd | Error | Ping | Pong
-body    = method:u16 ++ hand-encoded fields (varints, length-prefixed bytes) — one `encode/decode`
+frame   = len:u32 ++ crc32c:u32 ++ kind:u8 ++ request_id:u64 ++ body   (all little-endian)
+len     = the bytes after the len field itself: 13 + body.len()
+crc     = crc32c(kind ++ request_id ++ body) — NOT the body alone, and never the len
+kind    = Request 1 | Response 2 | Stream 3 | StreamEnd 4 | Error 5 | Ping 6 | Pong 7
+body    = tag:u16 ++ hand-encoded fields (varints, length-prefixed bytes) — one `encode/decode`
           pair per message type in esker-proto, golden-tested, with an explicit `WIRE_VERSION`
 ```
 
+The checksum covers the kind and the request id because a flipped `request_id` whose body still
+checksummed would deliver a response to the *wrong caller* with both frames otherwise intact — the
+one framing failure no layer above could detect. Kind `0` is reserved and never valid, as in the
+WAL record header (§4.3), so a run of zero bytes is not a readable frame. `tag` is the method in a
+request or a response and the error code in an `Error` frame; `Ping`, `Pong`, `Stream` and
+`StreamEnd` carry no tag, and a stream chunk's body *is* the chunk.
+
 The runtime side is `tokio` TCP with a per-connection writer task and a demultiplexer keyed by
 `request_id`; `max_frame_size` 16 MiB (*default*); streams (snapshot transfer) are chunked frames.
+`request_id` is **client-assigned and unique while in flight**: a duplicate is a typed error, never
+a silently replaced waiter. Nothing on a connection is unbounded — the writer queue, the in-flight
+table and the stream buffers all have limits, and a peer at one answers `ServerIsBusy` rather than
+queueing until it dies. A connection silent for `keepalive_interval` (10 s *default*) is pinged and
+one silent for `idle_timeout` (30 s *default*) is dropped with every waiter failed.
+
+Every failure also says **whether the request may have taken effect**, because a retry is only free
+when the first attempt provably did nothing: `NotSent` means the bytes never left and the request is
+safe to send again, while `Closed` and `Timeout` mean it went out and no usable answer came back.
+Collapsing those two would leave a client unable to tell a write it may repeat from one it may not,
+and `esker-txn`'s `Prewrite` will need the same distinction (§8).
 
 Methods: `RawKv { Get, BatchGet, Put, BatchPut, Delete, DeleteRange, Scan, CompareAndSwap }`
 (namespace `'r'`), `TxnKv { Get, Scan, Prewrite, Commit, Rollback, ResolveLock, Heartbeat, GcSafepoint }`
@@ -323,6 +346,12 @@ Methods: `RawKv { Get, BatchGet, Put, BatchPut, Delete, DeleteRange, Scan, Compa
 typed enum with redirect hints (`NotLeader{leader_hint}`, `EpochNotMatch{current_regions}`,
 `KeyNotInRegion`, `ServerIsBusy`, `Locked{lock_info}`). Unknown methods and fields are errors, not
 ignored — forward compatibility is handled by `WIRE_VERSION` negotiation on connect.
+
+Method numbers are `service:method`, so a service's numbers stay contiguous and one can be reserved
+before it is written: `0x00` system (`0x0001` Hello), `0x01` RawKv (`0x0101`–`0x0108`, in the order
+listed above), with `0x02` TxnKv, `0x03` Pd and `0x04` RaftTransport reserved. `Hello`'s layout is
+frozen for ever — a fixed four-byte version and nothing else — because reading it is how a peer at
+another version turns a mismatch into `WireVersion` rather than a hang.
 
 ## 10. Client (`esker-client`)
 
