@@ -57,9 +57,11 @@ pub mod code {
     pub const INTERNAL: u16 = 14;
     /// [`super::ProtoError::NotSent`].
     pub const NOT_SENT: u16 = 15;
+    /// [`super::ProtoError::Timeout`].
+    pub const TIMEOUT: u16 = 16;
 
     /// Every code this version defines, for the tests that sweep them.
-    pub const ALL: [u16; 15] = [
+    pub const ALL: [u16; 16] = [
         NOT_LEADER,
         EPOCH_NOT_MATCH,
         KEY_NOT_IN_REGION,
@@ -75,6 +77,7 @@ pub mod code {
         DUPLICATE_REQUEST_ID,
         INTERNAL,
         NOT_SENT,
+        TIMEOUT,
     ];
 }
 
@@ -229,6 +232,15 @@ pub enum ProtoError {
         detail: String,
     },
 
+    /// The deadline passed before the peer answered. Its outcome is
+    /// [`RequestOutcome::Unknown`]: giving up on an answer says nothing about whether the peer
+    /// applied the request, so a slow store and a dead one look the same from here.
+    #[error("timed out: {detail}")]
+    Timeout {
+        /// What was being waited for.
+        detail: String,
+    },
+
     /// A request id that is already in flight on this connection. Request ids are assigned by
     /// the client, so a duplicate is the client's bug; replacing the waiter would leave the
     /// first caller waiting for a response that can never arrive.
@@ -267,6 +279,7 @@ impl ProtoError {
             Self::DuplicateRequestId { .. } => code::DUPLICATE_REQUEST_ID,
             Self::Internal { .. } => code::INTERNAL,
             Self::NotSent { .. } => code::NOT_SENT,
+            Self::Timeout { .. } => code::TIMEOUT,
         }
     }
 
@@ -294,6 +307,7 @@ impl ProtoError {
             Self::Corrupt { .. }
             | Self::Io { .. }
             | Self::Closed { .. }
+            | Self::Timeout { .. }
             | Self::Internal { .. } => RequestOutcome::Unknown,
         }
     }
@@ -399,6 +413,7 @@ impl ProtoError {
             | Self::Io { detail }
             | Self::Closed { detail }
             | Self::NotSent { detail }
+            | Self::Timeout { detail }
             | Self::Internal { detail } => out.put_str(detail),
             Self::Corrupt { context, detail } => {
                 out.put_str(context);
@@ -471,6 +486,9 @@ impl ProtoError {
                 detail: input.get_str("detail")?.to_owned(),
             },
             code::NOT_SENT => Self::NotSent {
+                detail: input.get_str("detail")?.to_owned(),
+            },
+            code::TIMEOUT => Self::Timeout {
                 detail: input.get_str("detail")?.to_owned(),
             },
             other => {
@@ -591,6 +609,9 @@ mod tests {
             ProtoError::NotSent {
                 detail: "connection refused".to_owned(),
             },
+            ProtoError::Timeout {
+                detail: "no answer in 30s".to_owned(),
+            },
         ]
     }
 
@@ -657,6 +678,7 @@ mod tests {
                 ProtoError::Corrupt { .. }
                     | ProtoError::Io { .. }
                     | ProtoError::Closed { .. }
+                    | ProtoError::Timeout { .. }
                     | ProtoError::Internal { .. }
             );
             assert_eq!(error.is_ambiguous(), expected, "{error:?}");

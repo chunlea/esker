@@ -40,6 +40,7 @@ pub mod error;
 pub mod frame;
 pub mod messages;
 pub mod region;
+pub mod transport;
 
 pub use codec::{DecodeError, Decoder, Encoder};
 pub use error::{ProtoError, RequestOutcome};
@@ -48,6 +49,10 @@ pub use messages::{
     Hello, HelloAck, Method, RawKvReq, RawKvResp, Request, RequestHeader, Response,
 };
 pub use region::{Epoch, Peer, PeerRole, Region};
+pub use transport::{
+    BlockingTransport, BoxFuture, ChunkSender, ChunkStream, Reply, Server, ServerHandle, Service,
+    StreamResponse, TcpTransport, Transport, TransportConfig,
+};
 
 /// Version of the framing and of every message encoding. Negotiated when a connection opens;
 /// a mismatch is a hard error, not a downgrade (`docs/DESIGN.md` §9).

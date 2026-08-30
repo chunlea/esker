@@ -34,6 +34,9 @@ tokio = { workspace = true, features = [
 
 [dev-dependencies]
 proptest.workspace = true
+# The loopback test shuffles reply order with the project's own seeded generator; `rand` is
+# banned (ADR 0004).
+esker-base.workspace = true
 
 [lints]
 workspace = true

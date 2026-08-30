@@ -300,6 +300,12 @@ fn golden_errors() -> Vec<(&'static str, ProtoError)> {
             },
         ),
         ("not-sent", ProtoError::not_sent("connection refused")),
+        (
+            "timeout",
+            ProtoError::Timeout {
+                detail: "no answer in 30s".to_owned(),
+            },
+        ),
     ]
 }
 
