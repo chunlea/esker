@@ -1,0 +1,37 @@
+crates/esker-proto/Cargo.toml
+  s_4b642fc65050df::t_5f1d2c0d00ceea 37-39
+crates/esker-proto/src/error.rs
+  s_4b642fc65050df::t_9e24c0e0f0248f 60-61,64,80,235-243,282,310,416,491-493,612-614,681
+crates/esker-proto/src/lib.rs
+  s_4b642fc65050df::t_699f32087e2ac2 43,52-55
+crates/esker-proto/src/transport/client.rs
+  s_4b642fc65050df::t_3661d6c303f983 1-539
+crates/esker-proto/src/transport/conn.rs
+  s_4b642fc65050df::t_4e84532d70583e 1-474
+crates/esker-proto/src/transport/mod.rs
+  s_4b642fc65050df::t_8d41f21545f308 1-172
+crates/esker-proto/src/transport/server.rs
+  s_4b642fc65050df::t_51b10fd053764e 1-437
+crates/esker-proto/tests/golden/messages.hex
+  s_4b642fc65050df::t_1c6c8f84c2860d 57
+crates/esker-proto/tests/loopback.rs
+  s_4b642fc65050df::t_2f0c928a6c6706 1-700
+crates/esker-proto/tests/messages.rs
+  s_4b642fc65050df::t_c31401f64c90fb 303-308
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "9fa263c168491a5fa80a5131f01b38917d6e7740",
+  "prompts": {},
+  "sessions": {
+    "s_4b642fc65050df": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5213f73d-feb9-40c2-99a7-08164cb70247",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
