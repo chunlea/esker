@@ -16,10 +16,80 @@
 use std::sync::Arc;
 
 use esker_engine::{Db, ReadOptions, WriteBatch, cf};
+use esker_proto::{Epoch, Region};
 
 use crate::error::Result;
 use crate::keys;
-use crate::record::{RegionRecord, StoreRecord};
+use crate::record::{RegionRecord, StoreRecord, StoreStats};
+
+/// What one store reports about itself, every 10 s (`docs/DESIGN.md` §14).
+///
+/// The field set is the one `docs/plans/phase-4.md` §3.2 pins for the store lane's
+/// `PdClient`, so the two halves map onto each other without a gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreBeat {
+    /// Which store is reporting.
+    pub store_id: u64,
+    /// Its capacity and load.
+    pub stats: StoreStats,
+}
+
+/// What one region's **leader** reports, every 60 s or on a change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionBeat {
+    /// The region as its leader currently sees it: range, peers and epoch.
+    pub region: Region,
+    /// The peer sending this. Zero means the sender does not claim to be the leader.
+    pub leader_peer_id: u64,
+    /// The Raft term it is leading in. The tiebreaker within one epoch — see [`accepts`].
+    pub term: u64,
+    /// Approximate bytes of user data. 4b splits on it; 4a only records it.
+    pub approximate_size: u64,
+    /// The leader's apply index, so 4c can rebuild its operator view from heartbeats alone.
+    pub applied_index: u64,
+}
+
+/// What an upsert did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Upsert {
+    /// The record was written.
+    Applied,
+    /// The heartbeat was older than what PD holds, and was dropped.
+    Stale,
+}
+
+/// Whether a heartbeat may replace what PD already holds for a region.
+///
+/// Heartbeats arrive out of order — a leader changes, the old leader's beat is still in
+/// flight, and the two cross on the network. Overwriting a newer record with an older one
+/// would leave clients being redirected to a peer that lost office, and *the whole point of
+/// the routing table is that it is the best answer PD has*, so the order it accepts them in is
+/// the order they happened, not the order they arrived.
+///
+/// Two rules, in this order:
+///
+/// * **The epoch decides.** `(conf_ver, version)` are compared per-counter, because they move
+///   on different events (`Epoch::is_stale_against`): a heartbeat behind in *either* is stale
+///   and is dropped. Epochs only ever advance for a region, so an epoch behind in one counter
+///   and ahead in the other is impossible in a correct cluster — and it is dropped too, which
+///   is the safe direction to be wrong in.
+/// * **Within one epoch, the term decides.** A conf change or a split bumps the epoch, but a
+///   plain leader election does not; the term is what "newer" means for a leader. A beat from
+///   an older term at the same epoch is a leader that has already lost office, so its hint is
+///   dropped rather than allowed to overwrite its successor's.
+///
+/// A heartbeat at the same epoch and the same term is accepted: it is the same leader
+/// reporting again, with fresher stats.
+#[must_use]
+pub fn accepts(stored: &RegionRecord, epoch: Epoch, term: u64) -> bool {
+    if epoch.is_stale_against(stored.region.epoch) {
+        return false;
+    }
+    if epoch == stored.region.epoch {
+        return term >= stored.term;
+    }
+    true
+}
 
 /// Adds a store record to `batch`.
 pub fn stage_store(batch: &mut WriteBatch, cf: u32, record: &StoreRecord) {

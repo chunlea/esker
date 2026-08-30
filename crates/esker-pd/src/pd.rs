@@ -37,7 +37,7 @@ use crate::clock::{Clock, SystemClock};
 use crate::error::{PdError, Result};
 use crate::keys;
 use crate::record::{AllocRecord, ClusterRecord, RegionRecord, StoreRecord, TsoRecord};
-use crate::routing;
+use crate::routing::{self, RegionBeat, StoreBeat, Upsert};
 use crate::tso::Oracle;
 
 /// How long a store may be silent before it is considered down (`docs/DESIGN.md` §7).
@@ -358,6 +358,75 @@ impl Pd {
         }))
     }
 
+    /// Records a store's capacity and load, and refreshes its liveness.
+    ///
+    /// A heartbeat from a store PD has no record of is **refused**, not auto-registered:
+    /// registration carries the store's address, and a store record with no address is one a
+    /// client cannot be routed to. A store that gets this error should call
+    /// [`Pd::bootstrap`], which is registration, and which it is meant to call on every start
+    /// anyway.
+    pub fn store_heartbeat(&self, beat: &StoreBeat) -> Result<()> {
+        let now_ms = self.clock.now_ms();
+        let _state = self.lock()?;
+        let Some(existing) = routing::read_store(&self.db, beat.store_id)? else {
+            return Err(PdError::invalid(format!(
+                "store {} has not registered; call Bootstrap first",
+                beat.store_id
+            )));
+        };
+        let record = StoreRecord {
+            stats: beat.stats,
+            last_heartbeat_ms: now_ms,
+            ..existing
+        };
+        let mut batch = WriteBatch::new();
+        routing::stage_store(&mut batch, self.cf, &record);
+        self.write(batch)
+    }
+
+    /// Records what a region's leader reports, unless PD already holds something newer.
+    ///
+    /// The guard is [`routing::accepts`]; a dropped heartbeat is [`Upsert::Stale`] rather than
+    /// an error, because an out-of-order beat is a normal consequence of a leader change and
+    /// not something the sender did wrong.
+    pub fn region_heartbeat(&self, beat: &RegionBeat) -> Result<Upsert> {
+        if beat.region.id == 0 {
+            return Err(PdError::invalid("region id zero is not a region"));
+        }
+        if !beat.region.end_key.is_empty() && beat.region.start_key >= beat.region.end_key {
+            return Err(PdError::invalid(format!(
+                "region {} has an empty or inverted range",
+                beat.region.id
+            )));
+        }
+        let now_ms = self.clock.now_ms();
+        let _state = self.lock()?;
+
+        let previous = routing::read_region(&self.db, beat.region.id)?;
+        if let Some(previous) = &previous
+            && !routing::accepts(previous, beat.region.epoch, beat.term)
+        {
+            tracing::debug!(
+                region_id = beat.region.id,
+                "dropping a heartbeat older than the record it would replace"
+            );
+            return Ok(Upsert::Stale);
+        }
+
+        let record = RegionRecord {
+            region: beat.region.clone(),
+            leader_peer_id: beat.leader_peer_id,
+            term: beat.term,
+            approximate_size: beat.approximate_size,
+            applied_index: beat.applied_index,
+            last_heartbeat_ms: now_ms,
+        };
+        let mut batch = WriteBatch::new();
+        routing::stage_region(&mut batch, self.cf, &record, previous.as_ref());
+        self.write(batch)?;
+        Ok(Upsert::Applied)
+    }
+
     /// Every region PD knows about, in id order.
     pub fn regions(&self) -> Result<Vec<RegionRecord>> {
         routing::regions(&self.db)
@@ -444,9 +513,11 @@ fn mint_cluster_id(now_ms: u64, store_id: u64, address: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Pd, PdOptions};
+    use super::{Pd, PdOptions, RegionBeat, StoreBeat, Upsert};
+    use crate::Clock as _;
     use crate::clock::TestClock;
     use crate::error::PdError;
+    use esker_proto::{Epoch, Peer, Region};
     use std::sync::Arc;
 
     fn open() -> (tempfile::TempDir, Arc<TestClock>, Arc<Pd>) {
@@ -488,7 +559,7 @@ mod tests {
         assert_eq!(region.peers.len(), 1);
         assert_eq!(region.peers[0].store_id, 1);
         assert_ne!(region.peers[0].peer_id, region.id, "a peer is not a region");
-        assert_eq!(region.epoch, esker_proto::Epoch::INITIAL);
+        assert_eq!(region.epoch, Epoch::INITIAL);
         assert_ne!(first.cluster_id, 0);
 
         // And it is routable immediately, at both ends of the key space.
@@ -654,6 +725,219 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stored.high_water_ms, pd.tso_high_water_ms().unwrap());
+    }
+
+    fn beat(region: Region, leader: u64, term: u64) -> RegionBeat {
+        RegionBeat {
+            region,
+            leader_peer_id: leader,
+            term,
+            approximate_size: 0,
+            applied_index: 0,
+        }
+    }
+
+    fn ranged(id: u64, start: &'static [u8], end: &'static [u8], epoch: (u64, u64)) -> Region {
+        Region {
+            id,
+            start_key: bytes::Bytes::from_static(start),
+            end_key: bytes::Bytes::from_static(end),
+            peers: vec![Peer::voter(1, id * 10)],
+            epoch: Epoch::new(epoch.0, epoch.1),
+        }
+    }
+
+    /// The heartbeat that arrives second is not necessarily the one that happened second.
+    /// Both orders are tested, because only one of them can be got right by accident.
+    #[test]
+    fn a_stale_heartbeat_never_overwrites_a_newer_epoch() {
+        for reversed in [false, true] {
+            let (_dir, _clock, pd) = open();
+            pd.bootstrap(1, "a").unwrap();
+
+            let old = ranged(1, b"", b"", (1, 1));
+            let new = ranged(1, b"", b"", (1, 2));
+            let (first, second) = if reversed {
+                (beat(new, 20, 5), beat(old, 10, 4))
+            } else {
+                (beat(old, 10, 4), beat(new, 20, 5))
+            };
+
+            assert_eq!(pd.region_heartbeat(&first).unwrap(), Upsert::Applied);
+            let outcome = pd.region_heartbeat(&second).unwrap();
+            assert_eq!(
+                outcome,
+                if reversed {
+                    Upsert::Stale
+                } else {
+                    Upsert::Applied
+                },
+                "arriving {}",
+                if reversed { "newest first" } else { "in order" }
+            );
+
+            // Whichever order they arrived in, PD holds the newer epoch and its leader.
+            let held = pd.regions().unwrap();
+            assert_eq!(held.len(), 1);
+            assert_eq!(held[0].region.epoch, Epoch::new(1, 2));
+            assert_eq!(held[0].leader_peer_id, 20);
+        }
+    }
+
+    /// The counters move on different events, so a beat behind in *either* one is stale.
+    #[test]
+    fn a_heartbeat_behind_in_either_counter_is_stale() {
+        let (_dir, _clock, pd) = open();
+        pd.bootstrap(1, "a").unwrap();
+        pd.region_heartbeat(&beat(ranged(1, b"", b"", (3, 3)), 10, 1))
+            .unwrap();
+
+        for stale in [(2, 3), (3, 2), (2, 4)] {
+            assert_eq!(
+                pd.region_heartbeat(&beat(ranged(1, b"", b"", stale), 99, 9))
+                    .unwrap(),
+                Upsert::Stale,
+                "epoch {stale:?} was accepted over (3, 3)"
+            );
+        }
+        assert_eq!(pd.regions().unwrap()[0].leader_peer_id, 10);
+    }
+
+    /// Within one epoch a leader election is invisible, so the term is what says which of two
+    /// heartbeats is the newer one.
+    #[test]
+    fn within_one_epoch_the_newer_term_wins_and_the_older_is_dropped() {
+        let (_dir, _clock, pd) = open();
+        pd.bootstrap(1, "a").unwrap();
+        let region = || ranged(1, b"", b"", (1, 1));
+
+        pd.region_heartbeat(&beat(region(), 10, 7)).unwrap();
+        assert_eq!(
+            pd.region_heartbeat(&beat(region(), 20, 6)).unwrap(),
+            Upsert::Stale,
+            "a beat from a leader that has already lost office"
+        );
+        assert_eq!(pd.regions().unwrap()[0].leader_peer_id, 10);
+
+        // The same leader reporting again, at the same term, is fresher stats.
+        assert_eq!(
+            pd.region_heartbeat(&beat(region(), 30, 7)).unwrap(),
+            Upsert::Applied
+        );
+        assert_eq!(pd.regions().unwrap()[0].leader_peer_id, 30);
+    }
+
+    /// Three regions, including the one that runs to the end of the key space: every key must
+    /// land in exactly the region that owns it, and the index must not leave a stale entry
+    /// behind when a range changes.
+    #[test]
+    fn a_lookup_finds_the_region_that_owns_the_key() {
+        let (_dir, _clock, pd) = open();
+        pd.bootstrap(1, "a").unwrap();
+
+        // Region 1 shrinks to ["", "m"), and two more cover the rest. This is the shape a
+        // split leaves behind; 4a only ever gets here by heartbeat.
+        for region in [
+            ranged(1, b"", b"m", (1, 2)),
+            ranged(2, b"m", b"t", (1, 2)),
+            ranged(3, b"t", b"", (1, 2)),
+        ] {
+            pd.region_heartbeat(&beat(region, 0, 1)).unwrap();
+        }
+
+        for (key, expected) in [
+            (&b""[..], 1),
+            (b"a", 1),
+            (b"l", 1),
+            (b"m", 2),
+            (b"s", 2),
+            (b"t", 3),
+            (b"z", 3),
+            (b"\xff\xff\xff", 3),
+        ] {
+            let route = pd
+                .get_region(key)
+                .unwrap()
+                .unwrap_or_else(|| panic!("no region owns {key:?}"));
+            assert_eq!(route.region.id, expected, "key {key:?}");
+        }
+
+        // The index holds one entry per region and no orphan from region 1's old range.
+        let index = crate::routing::range_index(pd.db()).unwrap();
+        assert_eq!(index.len(), 3, "the index kept a stale entry: {index:?}");
+    }
+
+    /// A store that never registered has no address, so a heartbeat from one is refused
+    /// rather than inventing a record a client could be routed to.
+    #[test]
+    fn a_heartbeat_from_an_unregistered_store_is_refused() {
+        let (_dir, clock, pd) = open();
+        pd.bootstrap(1, "a").unwrap();
+        let beat = StoreBeat {
+            store_id: 9,
+            stats: crate::StoreStats::default(),
+        };
+        assert!(pd.store_heartbeat(&beat).is_err());
+
+        // And a registered one is recorded, liveness included.
+        clock.advance(1_000);
+        let beat = StoreBeat {
+            store_id: 1,
+            stats: crate::StoreStats {
+                capacity: 100,
+                available: 40,
+                region_count: 3,
+                leader_count: 1,
+                applied_bytes: 7,
+            },
+        };
+        pd.store_heartbeat(&beat).unwrap();
+        let stored = pd.stores().unwrap();
+        assert_eq!(stored[0].stats.available, 40);
+        assert_eq!(stored[0].last_heartbeat_ms, clock.now_ms());
+        assert_eq!(stored[0].address, "a", "the heartbeat lost the address");
+    }
+
+    #[test]
+    fn a_malformed_region_is_refused() {
+        let (_dir, _clock, pd) = open();
+        pd.bootstrap(1, "a").unwrap();
+        assert!(
+            pd.region_heartbeat(&beat(ranged(0, b"", b"", (1, 1)), 1, 1))
+                .is_err(),
+            "region id zero"
+        );
+        assert!(
+            pd.region_heartbeat(&beat(ranged(2, b"z", b"a", (1, 1)), 1, 1))
+                .is_err(),
+            "an inverted range"
+        );
+        assert!(
+            pd.region_heartbeat(&beat(ranged(2, b"a", b"a", (1, 1)), 1, 1))
+                .is_err(),
+            "an empty range"
+        );
+    }
+
+    /// The routing table survives a reopen: it is on disk, not in memory.
+    #[test]
+    fn the_routing_table_survives_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(TestClock::new(1_700_000_000_000));
+        let options = || PdOptions::with_clock(Arc::clone(&clock) as Arc<dyn crate::Clock>);
+        {
+            let pd = Pd::open(dir.path(), options()).unwrap();
+            pd.bootstrap(1, "127.0.0.1:1").unwrap();
+            pd.region_heartbeat(&beat(ranged(1, b"", b"m", (1, 2)), 10, 3))
+                .unwrap();
+            pd.region_heartbeat(&beat(ranged(2, b"m", b"", (1, 2)), 20, 3))
+                .unwrap();
+        }
+        let pd = Pd::open(dir.path(), options()).unwrap();
+        assert_eq!(pd.regions().unwrap().len(), 2);
+        let route = pd.get_region(b"zz").unwrap().unwrap();
+        assert_eq!(route.region.id, 2);
+        assert_eq!(route.leader_peer_id, Some(20));
     }
 
     #[test]
