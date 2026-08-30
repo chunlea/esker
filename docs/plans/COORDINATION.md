@@ -37,10 +37,14 @@ One coordinator (Fable, herdr pane `COORD`) directing coding lanes. Phases are g
     `a_torn_append_ends_the_segment`) + SIGKILL loop; **1,000-iteration acceptance run
     passed** (945 kills, 9,797 acked writes verified, 84.7s). The "123 unopenable" were
     cuts before CURRENT existed — not databases, nothing acked, correctly reopen-failable.
-  - [ ] `cl-p1-sst` round 4: kill-loop full-scan verification + the BTreeMap model test
-    (10k cases behind --ignored). Kept on Opus, not Sonnet: model-test semantics
-    (per-snapshot views, reopen invalidation) are subtle and the lane carries the
-    context; Sonnet takes the phase-end bulk runs instead.
+  - [x] `cl-p1-sst` round 4 — **accepted ~03:55**: full-scan kill-loop (fwd+rev must
+    agree) + model test (11 ops, measured op coverage ~19.7k, failure-verified by two
+    reverted mutations, artificial proptest-regressions correctly deleted). Two API
+    findings relayed to spine: compaction-API canary, and **stale Snapshot accepted
+    across reopen** — must be fixed inside the step-7 floor design, pinned by
+    `a_snapshot_taken_before_a_reopen_is_not_rejected`.
+  - [ ] `cl-p1-sst` round 5: wal-dump, manifest-dump (via public readers only),
+    concurrency test (8w+8r, journals, 30s behind --ignored).
   - Standing rule updated: in a crate shared by two lanes, format with
     `rustfmt --edition 2024 <own files>` — `cargo fmt -p` still sweeps the whole crate.
   - [ ] spine: WAL ✅ batch/internal-key ✅ memtable ✅(assumed, verify at gate)
