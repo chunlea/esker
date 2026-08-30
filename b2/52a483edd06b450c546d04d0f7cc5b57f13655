@@ -1,0 +1,22 @@
+crates/esker-sql/Cargo.toml
+  h_44076b318daf9c 19-21,23
+crates/esker-sql/src/bin/esker-sql.rs
+  h_44076b318daf9c 1,3-40
+crates/esker-sql/src/error.rs
+  h_44076b318daf9c 154-158,188,202
+crates/esker-sql/src/pgwire/mod.rs
+  h_44076b318daf9c 24
+crates/esker-sql/src/pgwire/server.rs
+  h_44076b318daf9c 1-438
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "b252a483edd06b450c546d04d0f7cc5b57f13655",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
