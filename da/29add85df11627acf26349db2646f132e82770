@@ -1,0 +1,27 @@
+crates/esker-sim/Cargo.toml
+  s_720b990b4c85a3::t_6d3972c64e5ea5 14-16
+crates/esker-sim/src/lib.rs
+  s_720b990b4c85a3::t_403e591ecc15f7 23
+crates/esker-sim/src/raft/checkers.rs
+  s_720b990b4c85a3::t_8918e3d3da990f 1-537
+crates/esker-sim/src/raft/mod.rs
+  s_720b990b4c85a3::t_10d85e7211d0cf 1-26
+crates/esker-sim/tests/raft_checkers.rs
+  s_720b990b4c85a3::t_61fd0461cf6ff3 1-325
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "da29add85df11627acf26349db2646f132e82770",
+  "prompts": {},
+  "sessions": {
+    "s_720b990b4c85a3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "227f5c5f-560a-4117-b024-963f1ffc76a1",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
