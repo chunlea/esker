@@ -104,6 +104,16 @@ pub(crate) struct Raft<S: LogStorage> {
     /// The target of an in-flight leadership transfer. While it is set the leader refuses
     /// proposals, so that none is left owned by a leader that is stepping down.
     pub(crate) lead_transferee: Option<NodeId>,
+    /// The index this leader has to commit through before it may propose a configuration change:
+    /// the last index of the log it inherited when it took office (dissertation §4.1).
+    ///
+    /// A new leader cannot tell whether the entries it inherited are committed — §5.4.2 forbids
+    /// it counting replicas of an earlier term's entry — so it cannot tell whether one of them is
+    /// a configuration change that is still revertible. Proposing on top of one is how two
+    /// configurations that are each one server from a common parent, and therefore *two* from each
+    /// other, end up in force at the same time on different branches: their quorums need not
+    /// overlap, and two leaders of one term is what that buys.
+    pub(crate) pending_conf_index: Index,
 }
 
 impl<S: LogStorage> Raft<S> {
@@ -146,6 +156,7 @@ impl<S: LogStorage> Raft<S> {
             check_quorum: config.check_quorum,
             rng: config.rng,
             lead_transferee: None,
+            pending_conf_index: 0,
         };
         raft.rebuild_progress()?;
         raft.reset_election_timeout();

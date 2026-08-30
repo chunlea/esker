@@ -162,6 +162,9 @@ impl<S: LogStorage> Raft<S> {
         self.leader = Some(self.id);
 
         let last = self.log.last_index()?;
+        // §4.1: nothing this leader inherited may be assumed committed until it has committed
+        // something of its own term, so no configuration change may be proposed until then.
+        self.pending_conf_index = last;
         let conf = self.conf.current().clone();
         for peer in conf.members() {
             self.progress.insert(

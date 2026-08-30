@@ -139,19 +139,27 @@ fn membership_changes_under_faults_hold_every_property() {
 ///
 /// # What is left
 ///
-/// Fourteen of the 3000, in five classes. Twelve of them fail identically at 987d472's parent, so
-/// they are what was behind 41213 rather than anything it caused; the other two are seeds that
-/// failed before under a different number, a seed being a schedule that a differently-deciding
-/// core no longer walks.
+/// Five of the 3000, in three classes. The census is what makes that number mean anything: it was
+/// 27 before 987d472 and 14 after, and the 14 turned out to be mostly one bug wearing four
+/// costumes. `ESKER_SIM_SEED=42650` had two leaders in term 12 — node 2 on a stale branch under
+/// `[1, 2, 3]` with votes from 1 and 2, node 3 under `[1, 3, 5]` with votes from 3 and 5, two
+/// configurations one server either side of a common `[1, 2, 3, 5]` and so two servers, and no
+/// shared quorum, from each other. Fixing the rule that allows that (a leader may not propose a
+/// configuration change until it has committed an entry of its own term) took election safety,
+/// all three leader-completeness seeds and the snapshot-metadata seed with it, and four of the
+/// seven committed-twice ones: they were all the same disjoint quorums, seen from different
+/// checkers.
 ///
-/// * **committed twice** (7). Every one has an `InstallSnapshot` restored immediately before it,
+/// * **committed twice** (3). Every one has an `InstallSnapshot` restored immediately before it,
 ///   at an index *above* the one the checker objects to. `esker-raft`'s `RaftLog::restore` moves
 ///   the commit index to the snapshot's index at once and answers `first_index` from the pending
 ///   snapshot, while `NodeSlot::refresh` reads the log out of storage, which the driver has not
 ///   overwritten yet — so the commit index and the log being compared may not be describing the
 ///   same log. Core bug or observation window is the open question.
-/// * **leader completeness** (3), **membership: two nodes, one log** (2), **election safety** (1)
-///   and **snapshot metadata** (1) — each its own question, none of them looked at yet.
+/// * **membership: two nodes, one log** (1) and **membership: core against its log** (1) — both
+///   plausibly the other half of the restart hole the guard only made safe rather than closed:
+///   `RawNode::new` takes the configuration from storage and does not replay the log, so a
+///   restarted node's tracker has no stack and cannot revert a truncated change.
 ///
 /// The default sweep above does not reach any of them and stays green, so this remains a finding
 /// on the acceptance gate rather than a broken build.

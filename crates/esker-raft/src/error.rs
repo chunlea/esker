@@ -52,10 +52,12 @@ pub enum RaftError {
     #[error("not the leader")]
     NotLeader,
 
-    /// A second configuration change was proposed while one is still uncommitted. Single-server
-    /// changes are only safe one at a time (dissertation §4.1), so the core refuses rather than
-    /// queueing — the caller knows better than this layer whether to retry or give up.
-    #[error("a configuration change is already pending at index {0}")]
+    /// A configuration change was proposed while one may still be uncommitted — either one this
+    /// node appended, or anything in the tail a new leader inherited and cannot yet judge.
+    /// Single-server changes are only safe one at a time (dissertation §4.1), so the core refuses
+    /// rather than queueing — the caller knows better than this layer whether to retry or give up.
+    /// The index is the one that has to commit before another change may be proposed.
+    #[error("a configuration change may be pending at or below index {0}")]
     ConfChangePending(Index),
 
     /// A proposal arrived while leadership is being transferred away. The outgoing leader stops

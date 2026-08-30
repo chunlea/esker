@@ -115,6 +115,14 @@ impl<S: LogStorage> Raft<S> {
         if let Some(at) = self.conf.pending() {
             return Err(RaftError::ConfChangePending(at));
         }
+        // The tracker only knows about changes *this* node appended, and a leader inherits a tail
+        // it cannot judge: §5.4.2 says an entry from an earlier term does not commit by counting
+        // replicas, so until this leader commits an entry of its own term it does not know whether
+        // the tail holds a configuration change that is still revertible. Refuse until it does.
+        if self.log.committed < self.pending_conf_index {
+            return Err(RaftError::ConfChangePending(self.pending_conf_index));
+        }
+
         if let Some(target) = self.lead_transferee {
             return Err(RaftError::LeadershipTransferInProgress(target));
         }
@@ -473,6 +481,82 @@ mod tests {
             follower.status().conf.voters,
             vec![1, 2, 3, 4],
             "index 5 still adds voter 4, so voter 4 is still in the configuration"
+        );
+    }
+
+    /// **§4.1, and the reason a new leader waits.** A leader inherits a log tail it cannot judge:
+    /// §5.4.2 forbids it counting replicas of an earlier term's entry, so it cannot tell whether a
+    /// configuration change down there is committed or still revertible. Until it commits an entry
+    /// of its own term it must refuse to propose another one.
+    ///
+    /// The node here has restarted, which is how the tail becomes invisible: `RawNode::new` takes
+    /// the configuration from storage and does not replay the log, so the tracker's stack is
+    /// empty and `pending()` — which only knows about changes *this* node appended — says nothing
+    /// is outstanding. The change at index 2 is nevertheless uncommitted, and proposing over it is
+    /// how two configurations one server either side of a common parent, and so two servers from
+    /// each other, end up in force at once: quorums that need not overlap, and two leaders in one
+    /// term. The simulator reached exactly that on `ESKER_SIM_SEED=42650`.
+    #[test]
+    fn a_new_leader_refuses_a_conf_change_until_it_has_committed_its_own_term() {
+        // Durable state of a node that appended "add voter 4" at index 2 and died before it
+        // committed: the log holds it, and the configuration storage kept is the one that entry
+        // established, exactly as `InitialState::conf_state` is specified.
+        let mut storage = MemStorage::with_conf_state(ConfState::from_voters(vec![1, 2, 3, 4]));
+        storage
+            .append(&[Entry::empty(1, 1), Entry::conf_change(1, 2, &add_voter(4))])
+            .unwrap();
+        storage.set_hard_state(HardState {
+            term: 1,
+            voted_for: None,
+            commit: 1,
+        });
+
+        let mut config = Config::new(1, vec![1, 2, 3, 4], 310);
+        config.pre_vote = false;
+        let mut node = RawNode::new(config, storage).unwrap();
+        assert_eq!(node.commit_index(), 1, "index 2 is not committed");
+
+        // It wins term 2 on votes from 2 and 3 — a quorum of four is three, counting itself.
+        node.campaign().unwrap();
+        for voter in [2, 3] {
+            node.step(Message::RequestVoteResponse {
+                from: voter,
+                to: 1,
+                term: 2,
+                granted: true,
+                pre_vote: false,
+            })
+            .unwrap();
+        }
+        assert_eq!(node.role(), Role::Leader);
+
+        assert!(
+            matches!(
+                node.propose_conf_change(ConfChange::new(ConfChangeKind::Remove, 2)),
+                Err(RaftError::ConfChangePending(2))
+            ),
+            "the inherited tail holds an uncommitted change this leader cannot see"
+        );
+
+        // Its own empty entry of term 2 sits at index 3; committing that commits everything below
+        // it (§5.4.2), which settles the tail and lets the next change through.
+        for follower in [2, 3] {
+            node.step(Message::AppendEntriesResponse {
+                from: follower,
+                to: 1,
+                term: 2,
+                reject: false,
+                index: 3,
+                hint_term: 0,
+                context: Bytes::new(),
+            })
+            .unwrap();
+        }
+        assert_eq!(node.commit_index(), 3, "the leader committed its own term");
+        assert!(
+            node.propose_conf_change(ConfChange::new(ConfChangeKind::Remove, 2))
+                .is_ok(),
+            "with the tail settled there is nothing left to be uncertain about"
         );
     }
 
