@@ -317,16 +317,19 @@ impl NodeSlot {
         self.started
     }
 
-    /// Writes the configuration a restart must recover into storage.
+    /// Writes the configuration a restart must recover into storage: the one as of the index the
+    /// log begins after, which is what [`esker_raft::InitialState::conf_state`] is specified to be.
     ///
-    /// `RawNode::new` reads the membership out of storage and does not replay conf-change
-    /// entries for itself, so a driver that never does this loses every change across a
-    /// restart. It rides with the batch that made those entries durable, which is what
-    /// "membership rides with the log" means in practice (dissertation §4.1).
+    /// Not the configuration as of the last entry, which is the one in force and the tempting
+    /// thing to write. The core replays the log's conf-change entries onto what it finds here, so
+    /// what it needs is a configuration that *predates* them — and writing the current one leaves
+    /// it unable to tell which part of its membership is still revertible. It rides with the batch
+    /// that made those entries durable, which is what "membership rides with the log" means in
+    /// practice (dissertation §4.1).
     pub fn persist_config(&mut self) {
-        let durable = self.durable_config.clone();
+        let anchor = self.config_as_of(self.compacted_through);
         if let Some(node) = self.node.as_mut() {
-            node.storage_mut().set_conf_state(durable);
+            node.storage_mut().set_conf_state(anchor);
         }
     }
 

@@ -133,17 +133,17 @@ impl<S: LogStorage> Raft<S> {
     pub(crate) fn new(config: Config, storage: S) -> Result<Self> {
         config.validate()?;
         let initial = storage.initial_state()?;
-        // A snapshot's metadata carries the membership *as of its own index*, which is an anchor
-        // the entries above it can be replayed onto — and replaying them is the only way the
-        // revertible part of the configuration survives a restart. `InitialState::conf_state` is
-        // not an anchor: it is the membership as of the *last* entry, so replaying the tail onto
-        // it would apply every change a second time, and a node without a snapshot therefore
-        // starts flat, exactly as it always did. What it loses by starting flat is written up on
-        // [`ConfTracker`](crate::conf::ConfTracker)'s stack.
+        // Both of these are the membership as of the index the log begins after — that is what
+        // `InitialState::conf_state` is specified to be, and what a snapshot's metadata carries —
+        // and the snapshot wins when there is one, because it says out loud which index it is the
+        // membership *as of*. Replaying the entries above it is the only way the revertible part
+        // of the configuration survives a restart: without it a change that is truncated away
+        // stays in force on the node that appended it.
         let anchor = storage
             .snapshot()
             .ok()
-            .filter(|snapshot| snapshot.meta.index > 0);
+            .filter(|snapshot| snapshot.meta.index > 0)
+            .filter(|snapshot| snapshot.meta.conf.members().next().is_some());
         let log = RaftLog::new(storage, config.applied)?;
         let conf_state =
             if initial.conf_state.voters.is_empty() && initial.conf_state.learners.is_empty() {
@@ -151,9 +151,12 @@ impl<S: LogStorage> Raft<S> {
             } else {
                 initial.conf_state
             };
-        let (conf_state, conf_index, replay) = match anchor {
-            Some(snapshot) => (snapshot.meta.conf, snapshot.meta.index, true),
-            None => (conf_state, 0, false),
+        // Both are the membership as of the same index for a driver that keeps them in step; the
+        // snapshot is preferred only because it names that index itself. An empty one is not an
+        // answer, and falls through rather than leaving a node with no members at all.
+        let (conf_state, conf_index) = match anchor {
+            Some(snapshot) => (snapshot.meta.conf, snapshot.meta.index),
+            None => (conf_state, log.first_index()?.saturating_sub(1)),
         };
         let mut raft = Self {
             id: config.id,
@@ -181,9 +184,7 @@ impl<S: LogStorage> Raft<S> {
             lead_transferee: None,
             own_term_index: 0,
         };
-        if replay {
-            raft.replay_conf_changes()?;
-        }
+        raft.replay_conf_changes()?;
         raft.rebuild_progress()?;
         raft.reset_election_timeout();
         Ok(raft)

@@ -527,7 +527,8 @@ mod tests {
     /// quorum that shared nobody with the one that had committed node 1's change.
     #[test]
     fn a_new_leader_refuses_a_conf_change_until_it_has_committed_its_own_term() {
-        let mut storage = MemStorage::with_conf_state(ConfState::from_voters(vec![1, 2, 3, 4]));
+        // The anchor is the membership as of index 0; index 2 is how it got to [1, 2, 3, 4].
+        let mut storage = MemStorage::with_conf_state(ConfState::from_voters(vec![1, 2, 3]));
         storage
             .append(&[Entry::empty(1, 1), Entry::conf_change(1, 2, &add_voter(4))])
             .unwrap();
@@ -654,6 +655,55 @@ mod tests {
             vec![1, 2, 3, 4],
             "a truncated change reverts across a restart, or this node counts a quorum of a \
              membership its own log does not justify"
+        );
+    }
+
+    /// The same reconstruction with nothing compacted, where the anchor is
+    /// [`InitialState::conf_state`](crate::InitialState::conf_state) at index 0 rather than a
+    /// snapshot's metadata.
+    ///
+    /// This is the case a snapshot cannot cover, and leaving it out left the hole open for any
+    /// node that restarted before it had ever compacted: `ESKER_SIM_SEED=114249` found two
+    /// leaders in term 4 that way, one under `[1, 2, 3]` and one under `[1, 2, 3, 4, 5]`.
+    #[test]
+    fn a_restart_with_nothing_compacted_can_still_revert_a_truncated_change() {
+        // The anchor is the membership as of index 0, not the one in force: the log's own entries
+        // say how it got from there to here.
+        let mut storage = MemStorage::with_conf_state(ConfState::from_voters(vec![1, 2, 3, 4]));
+        storage
+            .append(&[
+                Entry::empty(1, 1),
+                Entry::conf_change(1, 2, &ConfChange::new(ConfChangeKind::Remove, 4)),
+            ])
+            .unwrap();
+        storage.set_hard_state(HardState {
+            term: 1,
+            voted_for: None,
+            commit: 1,
+        });
+
+        let mut node = RawNode::new(Config::new(2, vec![1, 2, 3, 4], 312), storage).unwrap();
+        assert_eq!(
+            node.status().conf.voters,
+            vec![1, 2, 3],
+            "replayed from index 0"
+        );
+
+        node.step(Message::AppendEntries {
+            from: 1,
+            to: 2,
+            term: 2,
+            prev_log_index: 1,
+            prev_log_term: 1,
+            entries: vec![Entry::empty(2, 2)],
+            leader_commit: 1,
+            context: Bytes::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            node.status().conf.voters,
+            vec![1, 2, 3, 4],
+            "the entry that removed 4 is gone, so 4 is back"
         );
     }
 

@@ -161,22 +161,27 @@ fn membership_changes_under_faults_hold_every_property() {
 /// * A joining server seeded with the configuration that named it rather than the one at index 0,
 ///   so its own derivation started by asserting a membership its log does not justify (0dec4ba).
 /// * A restarted node holding a configuration it could not revert, because `RawNode::new` did not
-///   replay the log's conf-change tail onto the snapshot's anchor. `ESKER_SIM_SEED=42705`: the
-///   change was truncated away, the configuration stayed, and node 2 won a term with two of its
-///   three imagined voters.
+///   replay the log's conf-change tail onto an anchor (570d455, a08883d). `ESKER_SIM_SEED=42705`:
+///   the change was truncated away, the configuration stayed, and node 2 won a term with two of
+///   its three imagined voters. The anchor is what a restart replays *from*, and there was only
+///   one to hand at first — a snapshot's metadata, which says which index its membership is as
+///   of. That left every node that restarted before it had ever compacted still holding the hole,
+///   which `ESKER_SIM_SEED=114249` walked into at 100000 seeds. So the anchor is now what
+///   `InitialState::conf_state` means: the membership as of the index the log begins after,
+///   rather than as of the last entry. A driver persists what predates the log it is keeping, and
+///   the core derives the rest from the entries — which is the same rule the rest of this system
+///   already follows, since a snapshot has always carried its membership that way.
 ///
-/// It is green now, and green over `ESKER_SIM_SEEDS=20000` — which is how the last of those was
-/// found at all, since the acceptance range is what CI can afford rather than the limit of what
-/// is worth running. The census is what keeps the number honest: a sweep that stops at its first
-/// failing seed would have reported each of these as "the" bug in turn.
+/// It is green now, over the 3000 and over `ESKER_SIM_SEEDS=100000`. The census is what keeps
+/// that honest: a sweep that stops at its first failing seed would have reported each of these as
+/// "the" bug in turn.
 ///
 /// # Past the gate
 ///
-/// `ESKER_SIM_SEEDS=100000` is not clean: five seeds, in three classes — `a non-voter was
-/// elected` (86496, 95728), `leader completeness` (62138, 113183) and `election safety` (114249).
-/// They are outside the acceptance range and are not what this gate promises, but they are real,
-/// and they are the next thing to go after. Widening the sweep is how they were found; the number
-/// in the source is a budget, not a claim about where the bugs stop.
+/// `ESKER_SIM_SEEDS` widens the sweep, and widening it is how the last two of those were found at
+/// all: 3000 seeds is what CI can afford, not a claim about where the bugs stop. The last five
+/// only showed up past 60000, and every one of them was the same restart hole seen through a
+/// different checker.
 #[test]
 #[ignore = "the thousands-of-seeds membership run; minutes, not seconds"]
 fn thousands_of_membership_seeds() {

@@ -26,8 +26,20 @@ use crate::types::{ConfState, Entry, HardState, Index, Snapshot, Term, offset};
 pub struct InitialState {
     /// Term, vote and commit index as of the last fsync.
     pub hard_state: HardState,
-    /// The membership as of the last entry in the log — not the last *committed* one, because a
-    /// configuration takes effect when its entry is appended (dissertation §4.1).
+    /// The membership as of `first_index() - 1`: the index the log begins after, which is the
+    /// snapshot's index for a compacted log and `0` for one that has never been compacted.
+    ///
+    /// **Not** the membership as of the last entry, which is what it looks like it should be given
+    /// that a configuration takes effect when its entry is *appended* (dissertation §4.1). The
+    /// core reconstructs that itself, by replaying the log's conf-change entries onto this one —
+    /// and it can only do that from a configuration that predates them. A driver that persists
+    /// the membership as of the last entry instead leaves the core unable to tell which part of
+    /// its configuration is still revertible, and a change that is truncated away then stays in
+    /// force on the node that appended it, which is how two configurations two servers apart end
+    /// up in force at once. It is the same value a snapshot's [`SnapshotMeta::conf`] carries, for
+    /// the same reason, and a driver that compacts should write both from the same derivation.
+    ///
+    /// [`SnapshotMeta::conf`]: crate::SnapshotMeta::conf
     pub conf_state: ConfState,
 }
 
