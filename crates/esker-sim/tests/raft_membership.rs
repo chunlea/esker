@@ -27,7 +27,7 @@
 
 use esker_raft::{ConfChange, ConfChangeKind};
 use esker_sim::FaultPlan;
-use esker_sim::raft::{Cluster, ConfFault, Failure, seeds};
+use esker_sim::raft::{Census, Cluster, ConfFault, Failure, seeds};
 
 /// Tick rounds allowed for the cluster to settle.
 const LIVENESS_TICKS: u64 = 120;
@@ -121,40 +121,37 @@ fn membership_changes_under_faults_hold_every_property() {
 /// cargo test -p esker-sim --release --test raft_membership -- --ignored --nocapture
 /// ```
 ///
-/// # Seed 41213 is fixed; this run is still RED, for other reasons
+/// # It runs every seed, and reports a census
 ///
-/// The membership finding this note was opened for — `ESKER_SIM_SEED=41213`, where node 1's core
-/// had lost a conf change that was still in its own log — is fixed in `esker-raft` by 987d472,
-/// and the reading recorded here was wrong in an instructive way. Index 2 and index 5 held the
-/// same conf change not because one was truncated and re-appended, but because they were two
-/// proposals with a `remove` between them; nothing on node 1 was ever truncated. What broke was
-/// §4.1 applied to an entry that had not been appended: a *duplicate* `AppendEntries` whose
-/// entries the log already held wrote nothing, but its conf entry was re-recorded anyway, which
-/// `ConfTracker` reads as "the entry at that index was replaced" and which dropped the later
-/// change off the stack.
+/// A sweep that stops at its first failing seed reports one bug and hides the rest. That is how
+/// a red acceptance run stays red one reason at a time: each fix reveals the next, and nobody
+/// ever finds out how many there are. So this one runs all 3000 seeds and prints a
+/// [`Census`] — the classes, the seeds in each, and one whole failure per class to start
+/// from — and fails at the end if any of them failed.
+///
+/// It earned that shape the hard way. `ESKER_SIM_SEED=41213`, the membership finding this note
+/// was opened for, was fixed in `esker-raft` by 987d472 — and turned out to have been standing in
+/// front of four other classes the sweep had never reached. The reading recorded here at the time
+/// was also wrong, instructively: index 2 and index 5 held the same conf change because they were
+/// two proposals with a `remove` between them, not because one was truncated and re-appended.
+/// Nothing on node 1 was ever truncated. What broke was §4.1 applied to an entry that had not
+/// been appended.
 ///
 /// # What is left
 ///
-/// The whole class went with it. Over seeds 41000..44000, 27 seeds failed before that fix and 14
-/// after; thirteen of the twenty-seven were `membership: node N derived X from its log but its
-/// core believes Y`, and not one of those is left. Twelve of the fourteen survivors fail before
-/// the fix too, with the same violation text and — for eleven of them; 43063 moves by one — at
-/// the very same event number. The other two are seeds that failed before under a different
-/// number: a seed is a schedule, and a core that decides differently walks a different one, so
-/// the census below is by class rather than by seed. What it is a census *of* is what the
-/// abort-at-first-failure sweep was hiding behind 41213:
+/// Fourteen of the 3000, in five classes. Twelve of them fail identically at 987d472's parent, so
+/// they are what was behind 41213 rather than anything it caused; the other two are seeds that
+/// failed before under a different number, a seed being a schedule that a differently-deciding
+/// core no longer walks.
 ///
-/// * **committed twice** (41226, 41293, 41496, 42411, 42725, 43063, 43540). Every one of them has
-///   an `InstallSnapshot` restored immediately before it, and the index the checker objects to is
-///   *below* that snapshot's index. `esker-raft`'s `RaftLog::restore` moves the commit index to
-///   the snapshot's index at once and answers `first_index` from the pending snapshot, while
-///   `NodeSlot::refresh` reads the log out of storage, which the driver has not overwritten yet.
-///   So the pair the checker compares — an in-memory commit index against a durable log — spans a
-///   window in which they are not describing the same log. Whether that is a core bug or an
-///   observation window in the harness is this crate's to adjudicate.
-/// * **leader completeness** (42256, 42467, 43634), **snapshot metadata** (42397), **election
-///   safety** (42650), and **two nodes deriving different configurations from logs that agree**
-///   (42242, 43909) — between one and three seeds each, and each its own question.
+/// * **committed twice** (7). Every one has an `InstallSnapshot` restored immediately before it,
+///   at an index *above* the one the checker objects to. `esker-raft`'s `RaftLog::restore` moves
+///   the commit index to the snapshot's index at once and answers `first_index` from the pending
+///   snapshot, while `NodeSlot::refresh` reads the log out of storage, which the driver has not
+///   overwritten yet — so the commit index and the log being compared may not be describing the
+///   same log. Core bug or observation window is the open question.
+/// * **leader completeness** (3), **membership: two nodes, one log** (2), **election safety** (1)
+///   and **snapshot metadata** (1) — each its own question, none of them looked at yet.
 ///
 /// The default sweep above does not reach any of them and stays green, so this remains a finding
 /// on the acceptance gate rather than a broken build.
@@ -163,16 +160,16 @@ fn membership_changes_under_faults_hold_every_property() {
 fn thousands_of_membership_seeds() {
     let mut changes = 0;
     let mut joins = 0;
+    let mut census = Census::default();
     for seed in seeds(41_000, 3_000) {
         let mut cluster = Cluster::with_spares(seed, FaultPlan::reconfiguring(), 3, 2).unwrap();
-        cluster
-            .run(EVENTS)
-            .unwrap_or_else(|failure| panic!("{failure}"));
+        census.record(cluster.run(EVENTS));
         changes += cluster.stats().conf_changes;
         joins += cluster.stats().joins;
     }
     println!("3000 seeds x {EVENTS} events: {changes} conf changes, {joins} servers started");
     assert!(changes > 0 && joins > 0);
+    assert!(census.is_clean(), "{census}");
 }
 
 /// A store that recorded the conf-change entry and forgot to act on it. Its configuration and

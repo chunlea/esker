@@ -32,4 +32,4 @@ pub mod report;
 pub use checkers::{EntryDigest, NodeSnapshot, SafetyChecker, Violation};
 pub use cluster::{Cluster, seed_override, seeds, voter_ids};
 pub use driver::{ConfFault, DiskWrite, NodeSlot, PersistedStorage};
-pub use report::{Event, Failure, Settled, Stats};
+pub use report::{Census, Event, Failure, Settled, Stats};

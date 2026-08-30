@@ -332,3 +332,30 @@ pub enum Violation {
         got: Index,
     },
 }
+
+impl Violation {
+    /// What kind of failure this is, for grouping a sweep's failing seeds.
+    ///
+    /// A census wants the property, not the instance: two seeds that break Leader Completeness in
+    /// different terms are one thing to go and fix, and a sweep that lists thirty seeds without
+    /// saying which are the same bug has told the reader nothing they can act on.
+    #[must_use]
+    pub fn class(&self) -> &'static str {
+        match self {
+            Self::ElectionSafety { .. } => "election safety",
+            Self::LogMatching { .. } => "log matching",
+            Self::LeaderCompleteness { .. } => "leader completeness",
+            Self::CommittedTwice { .. } => "committed twice",
+            Self::StateMachineSafety { .. } => "state machine safety",
+            Self::ApplyOutOfOrder { .. } => "apply out of order",
+            Self::SnapshotMismatch { .. } => "snapshot metadata",
+            Self::ReadIndexBeyondCommit { .. } => "read index beyond commit",
+            Self::ConfigDisagreesWithCore { .. } => "membership: core against its log",
+            Self::ConfigDivergence { .. } => "membership: two nodes, one log",
+            Self::ConfigJumped { .. } => "membership: more than one server at a time",
+            Self::NonVoterElected { .. } => "a non-voter was elected",
+            Self::CommittedWithoutQuorum { .. } => "committed without a quorum",
+            Self::MalformedLog { .. } => "malformed log",
+        }
+    }
+}

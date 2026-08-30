@@ -281,6 +281,134 @@ pub enum Failure {
     },
 }
 
+impl Failure {
+    /// The seed that produced it — what a census groups and reprints.
+    #[must_use]
+    pub fn seed(&self) -> u64 {
+        match self {
+            Self::Safety { seed, .. } | Self::Liveness { seed, .. } | Self::Driver { seed, .. } => {
+                *seed
+            }
+        }
+    }
+
+    /// What kind of failure this is, for grouping a sweep's failing seeds.
+    #[must_use]
+    pub fn class(&self) -> &'static str {
+        match self {
+            Self::Safety { violation, .. } => violation.class(),
+            Self::Liveness { .. } => "no progress",
+            Self::Driver { .. } => "driver",
+        }
+    }
+
+    /// The headline without the trace: the seed, the event, and what broke.
+    #[must_use]
+    pub fn headline(&self) -> String {
+        let text = self.to_string();
+        text.lines().take(2).collect::<Vec<_>>().join("  ")
+    }
+}
+
+/// Every seed a sweep failed on, grouped by what broke.
+///
+/// A sweep that stops at its first failing seed reports one bug and hides the rest, which is how
+/// a red acceptance run stays red for one reason at a time: each fix reveals the next, and nobody
+/// ever sees how many there are. So the sweep runs every seed and this collects what happened —
+/// the classes, the seeds in each, and one full failure per class to start from.
+#[derive(Debug, Clone, Default)]
+pub struct Census {
+    /// Every failure, in the order the seeds ran.
+    failures: Vec<Failure>,
+    /// How many seeds were run at all, failing or not.
+    seeds: usize,
+}
+
+impl Census {
+    /// Records one seed's outcome.
+    pub fn record(&mut self, outcome: Result<(), Failure>) {
+        self.seeds += 1;
+        if let Err(failure) = outcome {
+            self.failures.push(failure);
+        }
+    }
+
+    /// Whether every seed passed.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    /// How many seeds failed.
+    #[must_use]
+    pub fn failed(&self) -> usize {
+        self.failures.len()
+    }
+
+    /// The failing seeds of one class, in order.
+    #[must_use]
+    pub fn seeds_of(&self, class: &str) -> Vec<u64> {
+        self.failures
+            .iter()
+            .filter(|failure| failure.class() == class)
+            .map(Failure::seed)
+            .collect()
+    }
+
+    /// The classes present, most seeds first, then alphabetically so the order is stable.
+    #[must_use]
+    pub fn classes(&self) -> Vec<(&'static str, Vec<u64>)> {
+        let mut classes: Vec<(&'static str, Vec<u64>)> = Vec::new();
+        for failure in &self.failures {
+            let class = failure.class();
+            match classes.iter_mut().find(|(name, _)| *name == class) {
+                Some((_, seeds)) => seeds.push(failure.seed()),
+                None => classes.push((class, vec![failure.seed()])),
+            }
+        }
+        classes.sort_by(|left, right| {
+            right
+                .1
+                .len()
+                .cmp(&left.1.len())
+                .then_with(|| left.0.cmp(right.0))
+        });
+        classes
+    }
+
+    /// The first failure of `class`, whole — trace included — to start debugging from.
+    #[must_use]
+    pub fn exemplar(&self, class: &str) -> Option<&Failure> {
+        self.failures
+            .iter()
+            .find(|failure| failure.class() == class)
+    }
+}
+
+impl fmt::Display for Census {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_clean() {
+            return write!(formatter, "{} seeds, all clean", self.seeds);
+        }
+        writeln!(
+            formatter,
+            "{} of {} seeds failed, in {} classes:",
+            self.failures.len(),
+            self.seeds,
+            self.classes().len()
+        )?;
+        for (class, seeds) in self.classes() {
+            writeln!(formatter, "  {} x {class}: {seeds:?}", seeds.len())?;
+        }
+        for (class, _) in self.classes() {
+            if let Some(failure) = self.exemplar(class) {
+                writeln!(formatter, "\n=== first {class} ===\n{failure}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// What a settled cluster looks like.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Settled {
