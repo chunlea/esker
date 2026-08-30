@@ -1,7 +1,7 @@
 //! The database: one directory, many column families, one write-ahead log.
 //!
 //! * [`open`] — creating and recovering, including replaying the log
-//! * [`write`] — group commit, and where invariant 1 is enforced
+//! * [`mod@write`] — group commit, and where invariant 1 is enforced
 //! * [`flush`] — switching memtables, and turning the full ones into L0 files
 //! * [`iter`] — many versions in, one entry per user key out
 //! * [`merge`] — several sorted cursors walked as one

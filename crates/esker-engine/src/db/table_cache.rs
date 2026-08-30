@@ -5,8 +5,8 @@
 //! a point read into five, so readers are cached by file number.
 //!
 //! File numbers are never reused and SSTs are immutable, so an entry can never be stale. The
-//! only reason to remove one is that the file is being deleted, which is what
-//! [`TableCache::evict`] is for.
+//! only reason to remove one is that the file is being deleted, which is what `evict` is
+//! for.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
