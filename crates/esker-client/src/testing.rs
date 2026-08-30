@@ -33,8 +33,7 @@ use bytes::Bytes;
 
 use crate::transport::Transport;
 use crate::wire::{
-    CallError, CallResult, RawMethod, RawRequest, RawResponse, Request, RequestContext,
-    ServerError, TransportError,
+    CallResult, ProtoError, RawMethod, RawRequest, RawResponse, Request, RequestContext,
 };
 
 /// Which requests a rule answers.
@@ -76,18 +75,17 @@ impl Matcher {
 pub enum Outcome {
     /// Answer with this body.
     Reply(RawResponse),
-    /// Refuse, the way a store refuses.
-    Refuse(ServerError),
-    /// Fail without an answer, the way a socket fails.
-    Fail(TransportError),
+    /// Fail with this error — a refusal from the store, or a socket that gave up. One enum
+    /// covers both because `esker-proto` does: what separates them is
+    /// [`ProtoError::outcome`], not which layer raised it.
+    Fail(ProtoError),
 }
 
 impl Outcome {
     fn into_result(self) -> CallResult {
         match self {
             Self::Reply(response) => Ok(response),
-            Self::Refuse(error) => Err(CallError::Server(error)),
-            Self::Fail(error) => Err(CallError::Transport(error)),
+            Self::Fail(error) => Err(error),
         }
     }
 }
@@ -178,9 +176,7 @@ impl FakeTransport {
             inner: Mutex::new(Inner {
                 rules: Vec::new(),
                 log: Vec::new(),
-                unmatched: Outcome::Fail(TransportError::Protocol(
-                    "fake transport: no rule matched".to_owned(),
-                )),
+                unmatched: Outcome::Fail(ProtoError::internal("fake transport: no rule matched")),
                 max_frame_size: esker_proto::MAX_FRAME_SIZE,
             }),
         }
@@ -301,15 +297,14 @@ mod tests {
     use super::{Bytes, FakeTransport, Matcher, Outcome, Rule};
     use crate::transport::Transport;
     use crate::wire::{
-        CallError, Peer, RawMethod, RawRequest, RawResponse, RegionEpoch, Request, RequestContext,
-        ServerError, TransportError,
+        Epoch, Peer, ProtoError, RawMethod, RawRequest, RawResponse, Request, RequestContext,
     };
 
     fn request(body: RawRequest) -> Request {
         Request {
             context: RequestContext {
                 region_id: 1,
-                epoch: RegionEpoch::default(),
+                epoch: Epoch::INITIAL,
                 peer: Peer::voter(1, 1),
             },
             body,
@@ -332,18 +327,14 @@ mod tests {
         transport
             .script(Rule::new(
                 Matcher::Any,
-                Outcome::Refuse(ServerError::ServerIsBusy {
+                Outcome::Fail(ProtoError::ServerIsBusy {
                     reason: "stall".to_owned(),
-                    backoff_ms: 5,
                 }),
             ))
             .script(Rule::new(Matcher::Any, Outcome::Reply(RawResponse::Get(None))).forever());
 
         let first = transport.call(1, &get(b"k"), deadline());
-        assert!(matches!(
-            first,
-            Err(CallError::Server(ServerError::ServerIsBusy { .. }))
-        ));
+        assert!(matches!(first, Err(ProtoError::ServerIsBusy { .. })));
         // The one-shot rule is spent, so the next call falls through to the one behind it.
         for _ in 0..3 {
             assert_eq!(
@@ -400,13 +391,10 @@ mod tests {
     /// A script that does not cover a call is a broken test, and it should say so at once
     /// rather than look like a server that keeps failing.
     #[test]
-    fn an_unmatched_call_is_a_protocol_error_by_default() {
+    fn an_unmatched_call_is_an_internal_error_by_default() {
         let transport = FakeTransport::new();
         let result = transport.call(1, &get(b"k"), deadline());
-        assert!(matches!(
-            result,
-            Err(CallError::Transport(TransportError::Protocol(_)))
-        ));
+        assert!(matches!(result, Err(ProtoError::Internal { .. })));
     }
 
     #[test]
@@ -433,18 +421,14 @@ mod tests {
         let transport = FakeTransport::new();
         transport
             .script(
-                Rule::new(
-                    Matcher::Any,
-                    Outcome::Fail(TransportError::NotSent("refused".to_owned())),
-                )
-                .times(2),
+                Rule::new(Matcher::Any, Outcome::Fail(ProtoError::not_sent("refused"))).times(2),
             )
             .script(Rule::new(Matcher::Any, Outcome::Reply(RawResponse::Get(None))).forever());
 
         for _ in 0..2 {
             assert!(matches!(
                 transport.call(1, &get(b"k"), deadline()),
-                Err(CallError::Transport(TransportError::NotSent(_)))
+                Err(ProtoError::NotSent { .. })
             ));
         }
         assert_eq!(

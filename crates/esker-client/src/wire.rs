@@ -1,106 +1,29 @@
-//! **A stand-in for `esker-proto`.**
+//! The messages this client sends, and where the rest of them come from.
 //!
-//! The wire types belong to `esker-proto`, which has exactly one writer this phase. This
-//! module is the shape this client codes against until that crate lands: the request and
-//! response bodies of `RawKv`, the typed server error with its redirect hints, and the
-//! routing types they carry — all transcribed from `docs/DESIGN.md` §6 and §9 rather than
-//! invented here.
+//! Routing and errors are `esker-proto`'s, re-exported here so that call sites in this crate
+//! name one module rather than two: [`Region`], [`Peer`], [`Epoch`] and the typed
+//! [`ProtoError`] with its redirect hints all come from the protocol crate, which is their
+//! single writer.
 //!
-//! When `esker-proto` lands, this file becomes a set of `pub use` re-exports and nothing
-//! above it changes. That is the whole reason it exists as one module with no logic in it.
+//! What is still local is the `RawKv` request and response bodies, transcribed from
+//! `docs/DESIGN.md` §9. They become `esker_proto::messages` in one commit when that module
+//! lands, and nothing above this file changes when they do.
 //!
 //! # Invariants this file carries
 //!
 //! * **Keys are raw user bytes.** The `'r'` namespace of `docs/DESIGN.md` §3 is applied by the
-//!   *store*, never by the client. A key that goes into a [`RawRequest`] is exactly what the
-//!   caller passed (`prompts/02-single-node-server.md`, deliverable 2).
+//!   *store*, never by the client — on every path, scan bounds and `DeleteRange` included
+//!   (`prompts/02-single-node-server.md`, deliverable 2).
 //! * **Every request carries `{ region_id, epoch, peer }`** so a stale epoch is rejected with
 //!   a redirect hint rather than served (`CLAUDE.md` invariant 5).
 //! * **Byte-opaque.** Nothing here interprets a key or a value (invariant 7).
 
-// TODO(phase-2): replace the bodies of this module with `pub use esker_proto::...` once the
-// sibling lane lands the crate; the swap is meant to be one commit that deletes code.
+// TODO(phase-2): replace the message types below with `pub use esker_proto::messages::...`
+// once the sibling lane lands them; the swap is meant to be one commit that deletes code.
 
 use bytes::Bytes;
 
-/// A region's version pair: `conf_ver` bumps on a membership change, `version` on a split
-/// (`docs/DESIGN.md` §6).
-///
-/// Requests carry it and stores compare it. Two epochs are ordered componentwise; a request
-/// whose epoch is behind the store's is rejected with [`ServerError::EpochNotMatch`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct RegionEpoch {
-    /// Bumped by every configuration change.
-    pub conf_ver: u64,
-    /// Bumped by every split.
-    pub version: u64,
-}
-
-/// What a peer is allowed to do in its Raft group.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PeerRole {
-    /// Votes and may become leader.
-    Voter,
-    /// Receives the log but neither votes nor campaigns.
-    Learner,
-}
-
-/// One replica of one region on one store (`docs/DESIGN.md` §6).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Peer {
-    /// The store hosting this replica.
-    pub store_id: u64,
-    /// Unique within the region; a peer id is never reused after removal.
-    pub peer_id: u64,
-    /// Voter or learner.
-    pub role: PeerRole,
-}
-
-impl Peer {
-    /// A voting peer, the only kind phase 2 creates.
-    #[must_use]
-    pub fn voter(store_id: u64, peer_id: u64) -> Self {
-        Self {
-            store_id,
-            peer_id,
-            role: PeerRole::Voter,
-        }
-    }
-}
-
-/// A contiguous key range replicated by one Raft group (`docs/DESIGN.md` §6).
-///
-/// `end_key` is exclusive, and **empty means unbounded** — the first region is `["", "")`, so
-/// an empty `end_key` sorts after every key rather than before it. Every comparison against it
-/// has to say so explicitly, which is why [`Region::contains`] exists rather than callers
-/// writing the check themselves.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Region {
-    /// Cluster-unique region id.
-    pub id: u64,
-    /// Inclusive lower bound.
-    pub start_key: Bytes,
-    /// Exclusive upper bound; empty means "no upper bound".
-    pub end_key: Bytes,
-    /// Every replica of this region.
-    pub peers: Vec<Peer>,
-    /// Membership and split versions.
-    pub epoch: RegionEpoch,
-}
-
-impl Region {
-    /// Whether `key` falls inside this region.
-    #[must_use]
-    pub fn contains(&self, key: &[u8]) -> bool {
-        key >= &self.start_key[..] && (self.end_key.is_empty() || key < &self.end_key[..])
-    }
-
-    /// The peer on `store_id`, if this region has one.
-    #[must_use]
-    pub fn peer_on(&self, store_id: u64) -> Option<&Peer> {
-        self.peers.iter().find(|peer| peer.store_id == store_id)
-    }
-}
+pub use esker_proto::{Epoch, Peer, PeerRole, ProtoError, Region, RequestOutcome};
 
 /// The `{ region_id, epoch, peer }` header every key-value request carries
 /// (`docs/DESIGN.md` §9).
@@ -109,7 +32,7 @@ pub struct RequestContext {
     /// Which region the client believes owns the key.
     pub region_id: u64,
     /// The epoch the client believes that region is at.
-    pub epoch: RegionEpoch,
+    pub epoch: Epoch,
     /// The peer the request is addressed to.
     pub peer: Peer,
 }
@@ -153,15 +76,13 @@ pub enum RawMethod {
 impl RawMethod {
     /// Whether re-sending the method changes the database differently the second time.
     ///
-    /// This is the property the retry rules turn on, and it is **not** the same question as
-    /// "is it a read". Under last-write-wins a repeated `Put` of the same bytes leaves the
-    /// same state, so `Put` is idempotent here; [`RawMethod::CompareAndSwap`] is not, because
-    /// its second attempt sees the state its first attempt created.
+    /// This is one of the two things a retry decision turns on, and it is **not** the same
+    /// question as "is it a read". Under last-write-wins a repeated `Put` of the same bytes
+    /// leaves the same state, so `Put` is idempotent here; [`RawMethod::CompareAndSwap`] is
+    /// not, because its second attempt sees the state its first attempt created.
     ///
-    /// It is deliberately a property of the *method*, not of a delivery outcome: whether a
-    /// retry is safe also needs to know that the previous attempt did not reach a commit. See
-    /// [`crate::Error::AmbiguousResult`], which is what the client returns when it cannot
-    /// prove that.
+    /// The other thing it turns on is whether the previous attempt reached a commit, which is
+    /// [`ProtoError::outcome`]. Both have to say yes.
     #[must_use]
     pub fn is_idempotent(self) -> bool {
         match self {
@@ -222,16 +143,14 @@ pub enum RawRequest {
     },
     /// Read a bounded run of keys.
     Scan {
-        /// Inclusive lower bound of a forward scan; exclusive upper bound of a reverse one.
+        /// Inclusive lower bound.
         start: Bytes,
-        /// The other end of the range; empty means unbounded.
+        /// Exclusive upper bound; empty means unbounded.
         end: Bytes,
         /// Most entries to return. Bounded by the caller so a response fits one frame.
         limit: u32,
-        /// Walk from `end` down to `start` instead.
+        /// Walk from the top of the range down instead of from the bottom up.
         reverse: bool,
-        /// Return keys without their values.
-        keys_only: bool,
     },
     /// Replace a key's value only if it currently holds `expected`.
     CompareAndSwap {
@@ -277,6 +196,40 @@ impl RawRequest {
             // TODO(phase-4): a reverse scan starts at `end` and walks down, so once there is
             // more than one region it routes by `end` rather than by `start`.
             Self::DeleteRange { start, .. } | Self::Scan { start, .. } => start,
+        }
+    }
+    /// A lower bound on what this request encodes to, in bytes.
+    ///
+    /// Used to refuse an oversized request at the call site rather than have the far end tear
+    /// the connection down mid-frame. It counts the payload exactly and the framing loosely:
+    /// the payload is what actually gets large, and the check has margin because
+    /// `MAX_FRAME_SIZE` sits far above any sane request.
+    #[must_use]
+    pub fn payload_size(&self) -> usize {
+        /// Varint length prefix plus a little slack, per field.
+        const PER_FIELD: usize = 6;
+        match self {
+            Self::Get { key } | Self::Delete { key } => key.len() + PER_FIELD,
+            Self::BatchGet { keys } => {
+                keys.iter().map(|key| key.len() + PER_FIELD).sum::<usize>() + PER_FIELD
+            }
+            Self::Put { key, value } => key.len() + value.len() + 2 * PER_FIELD,
+            Self::BatchPut { pairs } => {
+                pairs
+                    .iter()
+                    .map(|(key, value)| key.len() + value.len() + 2 * PER_FIELD)
+                    .sum::<usize>()
+                    + PER_FIELD
+            }
+            Self::DeleteRange { start, end } | Self::Scan { start, end, .. } => {
+                start.len() + end.len() + 4 * PER_FIELD
+            }
+            Self::CompareAndSwap { key, expected, new } => {
+                key.len()
+                    + expected.as_ref().map_or(0, Bytes::len)
+                    + new.as_ref().map_or(0, Bytes::len)
+                    + 3 * PER_FIELD
+            }
         }
     }
 }
@@ -325,150 +278,12 @@ impl RawResponse {
     }
 }
 
-/// A Percolator lock standing between a reader and a value (`docs/DESIGN.md` §8).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LockInfo {
-    /// The transaction's primary key, which decides whether it committed.
-    pub primary: Bytes,
-    /// The transaction's start timestamp.
-    pub start_ts: u64,
-    /// Milliseconds the lock lives for without a heartbeat.
-    pub ttl: u64,
-    // TODO(phase-5): `kind` and `short_value` from the `lock` CF layout.
-}
-
-/// What the server refused to do, and what the client should do about it
-/// (`docs/DESIGN.md` §9).
-///
-/// Every variant is a *refusal*: the server rejected the request before changing anything.
-/// That is what makes retrying the redirectable ones safe for a write as well as a read, and
-/// it is why a connection that died mid-call is **not** in this enum — see
-/// [`TransportError`].
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ServerError {
-    /// This peer is not the leader. The hint, when present, is where to go next.
-    #[error("peer is not the leader of region {region_id}")]
-    NotLeader {
-        /// The region asked about.
-        region_id: u64,
-        /// Where the leader was last seen, if the peer knows.
-        leader_hint: Option<Peer>,
-    },
-    /// The request's epoch is behind the store's: the region split or changed membership.
-    /// The regions now covering the old range come back so the cache can be repaired.
-    #[error("epoch of region {region_id} has moved on")]
-    EpochNotMatch {
-        /// The region asked about.
-        region_id: u64,
-        /// The regions that now cover the range the request aimed at.
-        current_regions: Vec<Region>,
-    },
-    /// The key is outside the range this region owns.
-    #[error("key is outside region {region_id}")]
-    KeyNotInRegion {
-        /// The region asked about.
-        region_id: u64,
-        /// The key that missed.
-        key: Bytes,
-    },
-    /// The store is shedding load — a write stall, a full queue. Back off and come back.
-    #[error("server is busy: {reason}")]
-    ServerIsBusy {
-        /// What is congested, for a human reading a log.
-        reason: String,
-        /// How long the server suggests waiting, in milliseconds. Advisory.
-        backoff_ms: u64,
-    },
-    /// A transaction holds the key (phase 5).
-    #[error("key is locked by transaction at {}", .lock.start_ts)]
-    Locked {
-        /// Which transaction, and how to resolve it.
-        lock: Box<LockInfo>,
-    },
-    /// The store failed for a reason that has no redirect hint: a corrupt file, an I/O error.
-    #[error("store failed: {0}")]
-    Other(String),
-}
-
-/// Why a call did not produce an answer, from the transport's point of view.
-///
-/// The split between [`TransportError::NotSent`] and [`TransportError::Ambiguous`] is the
-/// whole point of this enum: it is the difference between "the write provably did not happen"
-/// and "nobody can say". A transport that cannot tell the two apart must report
-/// `Ambiguous`, which is the safe direction to be wrong in.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum TransportError {
-    /// The request never reached the wire: the connection could not be established, or the
-    /// transport rejected it before writing a byte of the request frame. The server cannot
-    /// have seen it, so re-sending it is safe for any method.
-    #[error("request was not sent: {0}")]
-    NotSent(String),
-    /// The request went out and no answer came back — the connection died, or the deadline
-    /// passed while waiting. Whether the server applied it is **unknown**.
-    #[error("no answer came back: {0}")]
-    Ambiguous(String),
-    /// Bytes came back that this build cannot make sense of: a bad checksum, an unknown
-    /// method, a response whose kind does not match the request. A bug or a version skew,
-    /// never something to retry.
-    #[error("protocol error: {0}")]
-    Protocol(String),
-}
-
-impl TransportError {
-    /// Whether the server provably never saw the request.
-    #[must_use]
-    pub fn is_provably_unsent(&self) -> bool {
-        matches!(self, Self::NotSent(_))
-    }
-}
-
 /// What a call to a store returns: an answer, or a typed refusal.
-pub type CallResult = Result<RawResponse, CallError>;
-
-/// Either end of the failure story: the server refused, or the transport could not ask.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum CallError {
-    /// The store answered with a refusal.
-    #[error(transparent)]
-    Server(#[from] ServerError),
-    /// No answer was obtained.
-    #[error(transparent)]
-    Transport(#[from] TransportError),
-}
+pub type CallResult = Result<RawResponse, ProtoError>;
 
 #[cfg(test)]
 mod tests {
-    use super::{Bytes, Peer, RawMethod, RawRequest, Region, RegionEpoch, TransportError};
-
-    fn region(start: &[u8], end: &[u8]) -> Region {
-        Region {
-            id: 1,
-            start_key: Bytes::copy_from_slice(start),
-            end_key: Bytes::copy_from_slice(end),
-            peers: vec![Peer::voter(1, 1)],
-            epoch: RegionEpoch::default(),
-        }
-    }
-
-    /// An empty `end_key` means unbounded, and a byte comparison would get that backwards:
-    /// `b""` sorts before everything. Getting this wrong routes every key to the wrong region
-    /// the moment a second one exists.
-    #[test]
-    fn an_empty_end_key_is_the_end_of_the_key_space() {
-        let whole = region(b"", b"");
-        assert!(whole.contains(b""));
-        assert!(whole.contains(b"\xff\xff\xff\xff"));
-
-        let first_half = region(b"", b"m");
-        assert!(first_half.contains(b"a"));
-        assert!(!first_half.contains(b"m"), "end_key is exclusive");
-        assert!(!first_half.contains(b"z"));
-
-        let second_half = region(b"m", b"");
-        assert!(!second_half.contains(b"a"));
-        assert!(second_half.contains(b"m"));
-        assert!(second_half.contains(b"\xff"));
-    }
+    use super::{Bytes, RawMethod, RawRequest};
 
     /// The retry rules turn on this, so it is pinned rather than assumed. `CompareAndSwap` is
     /// the one method whose second attempt sees what its first attempt did.
@@ -516,26 +331,33 @@ mod tests {
                 end: Bytes::new(),
                 limit: 10,
                 reverse: false,
-                keys_only: false,
             }
             .routing_key(),
             b"s"
         );
     }
 
-    /// The one distinction the whole retry story rests on.
+    /// The size check guards against a request nobody could send, so it has to grow with the
+    /// payload and never under-count the bytes themselves.
     #[test]
-    fn only_a_never_sent_request_is_provably_unsent() {
-        assert!(TransportError::NotSent("refused".into()).is_provably_unsent());
-        assert!(!TransportError::Ambiguous("reset".into()).is_provably_unsent());
-        assert!(!TransportError::Protocol("bad crc".into()).is_provably_unsent());
-    }
+    fn the_size_estimate_counts_every_byte_of_the_payload() {
+        let big = Bytes::from(vec![0u8; 4096]);
+        let put = RawRequest::Put {
+            key: Bytes::from_static(b"k"),
+            value: big.clone(),
+        };
+        assert!(put.payload_size() > 4096);
 
-    #[test]
-    fn a_region_finds_its_peer_by_store() {
-        let mut region = region(b"", b"");
-        region.peers = vec![Peer::voter(1, 11), Peer::voter(2, 12)];
-        assert_eq!(region.peer_on(2).map(|peer| peer.peer_id), Some(12));
-        assert_eq!(region.peer_on(3), None);
+        let batch = RawRequest::BatchPut {
+            pairs: vec![
+                (Bytes::from_static(b"a"), big.clone()),
+                (Bytes::from_static(b"b"), big),
+            ],
+        };
+        assert!(batch.payload_size() > 8192);
+        assert!(batch.payload_size() > put.payload_size());
+
+        // An empty request still costs its framing, never zero.
+        assert!(RawRequest::BatchGet { keys: vec![] }.payload_size() > 0);
     }
 }
