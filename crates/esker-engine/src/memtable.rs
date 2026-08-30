@@ -18,7 +18,7 @@
 //!
 //! `crossbeam-skiplist` orders by the key type's [`Ord`], but the order the engine needs is
 //! chosen at runtime — a column family carries its own comparator. So each key carries a
-//! handle to the comparator and delegates to it ([`MemKey`]). That is one `Arc` clone per
+//! handle to the comparator and delegates to it. That is one `Arc` clone per
 //! insert, which the in-house skiplist will remove by holding the comparator once per table.
 
 use std::cmp::Ordering;
