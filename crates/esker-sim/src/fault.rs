@@ -139,6 +139,35 @@ impl FaultPlan {
         }
     }
 
+    /// The plan for five nodes, tuned so that an entry can be replicated to a *minority* and
+    /// then outrun by a later leader — the interleaving §5.4.2's term condition exists to make
+    /// safe, and the one the three-node model checker cannot reach.
+    ///
+    /// It needs a particular shape, not just more chaos: partitions often enough that a leader
+    /// gets isolated with one follower after replicating to it, healing often enough that the
+    /// other three elect someone, and crashes rare enough that the minority pair survives to
+    /// come back with an entry nobody else has. Slow disks widen every window.
+    /// `esker-sim`'s sweep asserts the interleaving was reached, so a plan that stopped
+    /// producing it would fail rather than pass quietly.
+    #[must_use]
+    pub fn figure_eight() -> Self {
+        Self {
+            partition: 0.06,
+            heal: 0.08,
+            crash: 0.01,
+            restart: 0.08,
+            slow_disk: 0.2,
+            slow_disk_events: 14,
+            drop: 0.02,
+            duplicate: 0.02,
+            reorder: 0.1,
+            min_latency_ms: 1,
+            max_latency_ms: 30,
+            reorder_extra_ms: 200,
+            compact_after: 0,
+        }
+    }
+
     /// Everything [`FaultPlan::chaotic`] does, plus a leader that compacts aggressively — so a
     /// follower that comes back from a partition finds the entries it needs are gone and has to
     /// be repaired with a snapshot (`prompts/03-raft.md` 3d).

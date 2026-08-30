@@ -154,6 +154,7 @@ impl Cluster {
     pub fn stats(&self) -> Stats {
         Stats {
             committed: self.checker.committed_upto(),
+            replicated_overwrites: self.checker.replicated_overwrites(),
             applied: self
                 .nodes
                 .values()

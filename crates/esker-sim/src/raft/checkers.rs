@@ -312,6 +312,7 @@ pub struct SafetyChecker {
     committed: BTreeMap<Index, Committed>,
     applied: BTreeMap<Index, (EntryDigest, NodeId)>,
     memo: BTreeMap<NodeId, NodeMemo>,
+    replicated_overwrites: u64,
 }
 
 impl SafetyChecker {
@@ -334,6 +335,17 @@ impl SafetyChecker {
     #[must_use]
     pub fn leader_of(&self, term: Term) -> Option<NodeId> {
         self.leaders.get(&term).copied()
+    }
+
+    /// How many times an entry that *another* node had already recorded was overwritten in
+    /// some node's log.
+    ///
+    /// This is the §5.4.2 interleaving, counted: an entry that was replicated beyond the leader
+    /// that created it, and then replaced by a later leader. A sweep that never produces one
+    /// has not tested the term condition, however many seeds it ran.
+    #[must_use]
+    pub fn replicated_overwrites(&self) -> u64 {
+        self.replicated_overwrites
     }
 
     /// The highest index any node has been observed to commit.
@@ -411,6 +423,22 @@ impl SafetyChecker {
                 .take_while(|((cached, _), current)| cached == *current)
                 .count()
         };
+        // What is about to be truncated away is an entry this node once held and no longer
+        // does. Whether that matters is the §5.4.2 question: an entry that only ever lived on
+        // this node is ordinary repair, but one that another node had also recorded was
+        // *replicated* before being overwritten, which is the interleaving the term condition
+        // exists to make safe. Counting them is how a sweep proves it reached the scenario
+        // rather than merely asserting it did.
+        let mut replicated_overwrites = 0_u64;
+        for (stale, _) in &memo.chain[unchanged..] {
+            if let Some(&(_, first_seen)) = self.prefixes.get(&(stale.index, stale.term))
+                && first_seen != node.id
+            {
+                replicated_overwrites += 1;
+            }
+        }
+        self.replicated_overwrites += replicated_overwrites;
+        let memo = self.memo.entry(node.id).or_default();
         memo.chain.truncate(unchanged);
 
         let mut previous = memo

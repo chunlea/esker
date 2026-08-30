@@ -312,6 +312,9 @@ pub struct Stats {
     pub contexts_delivered: u64,
     /// `ReadIndex` requests answered.
     pub reads_served: u64,
+    /// Entries that another node had already recorded and that were then overwritten — the
+    /// §5.4.2 interleaving, counted rather than assumed.
+    pub replicated_overwrites: u64,
     /// Snapshots a follower adopted from a leader.
     pub snapshots_installed: u64,
     /// Times a node folded applied entries into its snapshot.
