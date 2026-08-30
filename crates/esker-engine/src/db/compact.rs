@@ -18,6 +18,12 @@
 //! belongs to no version — which is exactly what the obsolete-file sweep deletes. Outputs are
 //! registered as pending for that window, by both compaction and flush, and the sweep leaves
 //! them alone. Without it a second thread's sweep deletes a file the first is still writing.
+//!
+//! The register only works if it is read at the same instant as the directory listing it
+//! qualifies. Sampled one after the other the two describe different moments, and a flush that
+//! installs its edit in between falls through the gap: it was in no version when the directory
+//! was read, and is no longer pending by the time the register is. [`DbInner::purge_and_evict`]
+//! therefore takes both under the version lock, which is the lock installing an edit needs.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -314,8 +320,20 @@ impl DbInner {
 
     /// Deletes what no version needs, keeping files that are still being written.
     pub(crate) fn purge_and_evict(&self) -> Result<()> {
-        let obsolete = lock(&self.versions)?.obsolete_files()?;
-        let pending: BTreeSet<u64> = lock(&self.pending_outputs)?.clone();
+        // Both halves of this decision have to describe the same instant. The listing says
+        // which files no live version needs; `pending_outputs` says which of those are outputs
+        // that have been created but not yet named by an edit. Sampled one after the other
+        // they can disagree: a flush that installs its edit in between was not in the version
+        // when the directory was read, and is no longer pending by the time the set is — so
+        // its output looks like garbage twice over and the sweep deletes a file the *current*
+        // version references. Installing an edit takes the version lock, so holding it across
+        // both samples is what makes them one instant.
+        let (obsolete, pending) = {
+            let mut versions = lock(&self.versions)?;
+            let obsolete = versions.obsolete_files()?;
+            let pending: BTreeSet<u64> = lock(&self.pending_outputs)?.clone();
+            (obsolete, pending)
+        };
         for path in obsolete {
             if let Some(FileKind::Sst(number)) = filename::classify_path(&path) {
                 if pending.contains(&number) {
