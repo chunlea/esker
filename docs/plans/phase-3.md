@@ -464,3 +464,43 @@ the read's own position in the order. The driver holds the read until `applied_i
 - **Membership change over the wire.** The core supports it; 3e has no operator to drive it.
 - **The full chaos and linearizability battery.** That is the sibling's and the acceptance lane's;
   this lane builds the store-level spine those drive.
+
+### 11.7 Deviations in the 3e test battery
+
+The battery `prompts/03-raft.md` asks for under "Tests for 3e" is built as two runs rather than
+three, and this records which and why.
+
+**Built.**
+
+| Prompt item | Where | What it does |
+|---|---|---|
+| Linearizability check of the single-key history under leader kills | `esker-client/tests/chaos_linearizability.rs` | Three stores in one process on real sockets, six clients on three shared keys, the leader stopped every few hundred ms. 4 kills by default; the 50-kill acceptance run is `#[ignore]`d. |
+| "3 processes, SIGKILL the leader 50 times under load; no acknowledged write lost, converges within 5 s" | `esker-cli/tests/cluster_chaos.rs` | `esker cluster start --nodes 3`, `kill -9` on the process the client's own redirect names, convergence timed against the 5 s budget. 2 kills by default, 50 `#[ignore]`d. |
+
+Both record every operation into `esker-sim`'s register history and check it with the WGL
+checker. The final read of each key is recorded *into* the history, so "no acknowledged write
+lost" is not a separate assertion: a write that vanished leaves a final read that no ordering
+can explain, and the checker names the operation. Ambiguous outcomes — a request sent and never
+answered — are recorded as maybe-applied, which the model accepts either way; recording them as
+failures would assert something the client cannot know.
+
+**Deferred, deliberately: "simulator-driven cluster test — the real `esker-store` code paths over
+the simulated network".**
+
+The prompt asks for the store's apply loop and transport adapter driven over `esker-sim`'s
+in-memory network. That is out of proportion for 3e as built, for one structural reason: the
+store's transport is `tokio` TCP end to end. `StoreTransport::spawn` opens a task per peer and
+`esker-proto`'s `Server` owns the socket, so putting the simulated network underneath means an
+abstraction over the transport that nothing else needs yet — and the value it would add over the
+two runs above is the *determinism* of the fault schedule, not extra coverage of the store: the
+same code paths are already exercised, against real sockets and a real signal.
+
+Phase 4 makes it worth doing anyway. `prompts/04-multiraft.md` requires a multi-store simulation
+(many regions, splits, and a placement driver moving them), which needs that seam regardless —
+and `esker-sim`'s harness already drives `RawNode`s over the simulated network with the full
+checker battery, so what is missing is the store's side of the seam, not the simulator's.
+
+`TODO(phase-4)`: give `esker-store` a transport trait the simulator can implement, and drive the
+apply loop and the region's request path over `esker-sim`'s `Network` with the phase-3 checkers
+and the linearizability checker attached. Recorded here so it is a decision with a date on it
+rather than an omission.
