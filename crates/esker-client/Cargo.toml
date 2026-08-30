@@ -31,7 +31,12 @@ esker-client = { path = ".", features = ["testing"] }
 # `tests/store_model.rs` drives one proptest through both an engine and this client, so the
 # two have to be in scope together. Dev-only: nothing the client ships links the engine.
 esker-engine.workspace = true
+# `tests/store_model.rs` spawns a real server in-process and drives the same proptest through
+# it, so the network is in the loop rather than assumed away. Dev-only.
+esker-store.workspace = true
 proptest.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "time"] }
 
 [lints]
 workspace = true

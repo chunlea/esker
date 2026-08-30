@@ -29,23 +29,20 @@
 //! than the system's behaviour. Raised with the lane that owns the store; added the moment it
 //! is settled.
 //!
-//! # Running the client half
+//! # The client half runs a real server
 //!
-//! [`the_client_and_the_engine_agree`] is `#[ignore]`d because it needs a running server, and
-//! `esker-store`'s `RawKv` service is the sibling lane's deliverable. With one up:
-//!
-//! ```text
-//! esker-cli server --data-dir /tmp/esker --listen 127.0.0.1:20160 &
-//! cargo test -p esker-client --all-features -- --ignored
-//! ```
-//!
-//! `ESKER_TEST_ADDR` overrides the address. When the service lands in-process, the only change
-//! here is to spawn it in the test instead of reading that variable.
+//! Not a mock and not a loopback stub: [`the_client_and_the_engine_agree`] opens a real
+//! `esker-store` on a temporary directory, binds it to port 0, and drives the same sequences
+//! through a real TCP connection. That is the only arrangement in which the claim above —
+//! *the network must not change the answer* — is actually being tested, because everything a
+//! mock leaves out is exactly where the answer would change.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+use std::net::SocketAddr;
 
 use esker_client::region_cache::StaticRegion;
 use esker_client::{RawClient, TcpStores};
@@ -88,6 +85,12 @@ trait Store {
     fn delete(&self, key: &[u8]) -> Result<(), String>;
     /// Entries of `[start, end)` in key order, at most `limit` of them. An empty `end` runs to
     /// the end of the key space.
+    ///
+    /// An **inverted** range — `start` after a non-empty `end` — is an error, not an empty
+    /// answer. That is the store's rule and this trait follows it rather than inventing a
+    /// second one: bounded scan is the store's API, the engine's iterator has no end bound at
+    /// all, and answering "nothing found" to a caller who swapped two variables hides the bug
+    /// instead of naming it. This test found the two layers disagreeing about it.
     fn scan(&self, start: &[u8], end: &[u8], limit: u32) -> Result<Entries, String>;
     /// Several keys written atomically — one engine write batch either way.
     fn write_batch(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<(), String>;
@@ -121,6 +124,11 @@ impl Store for EngineStore {
     }
 
     fn scan(&self, start: &[u8], end: &[u8], limit: u32) -> Result<Entries, String> {
+        if is_inverted(start, end) {
+            return Err(format!(
+                "invalid request: range start {start:?} is after its end {end:?}"
+            ));
+        }
         let mut iter = self
             .db
             .iter(cf::DEFAULT, &ReadOptions::default())
@@ -221,6 +229,12 @@ enum Op {
     },
 }
 
+/// Whether a range runs backwards. An empty `end` is the end of the key space, so it is never
+/// inverted however large `start` is — the trap that would refuse every unbounded scan.
+fn is_inverted(start: &[u8], end: &[u8]) -> bool {
+    !end.is_empty() && start > end
+}
+
 fn key_of(index: u8) -> Vec<u8> {
     format!("key{:03}", index % KEYS).into_bytes()
 }
@@ -295,9 +309,15 @@ fn step(store: &dyn Store, model: &mut Model, op: &Op) -> Result<(), TestCaseErr
             };
             let limit = u32::from(*limit) + 1;
 
-            let found = store
-                .scan(&start, &end, limit)
-                .map_err(TestCaseError::fail)?;
+            let answer = store.scan(&start, &end, limit);
+            if is_inverted(&start, &end) {
+                prop_assert!(
+                    answer.is_err(),
+                    "an inverted range must be refused, not answered with nothing"
+                );
+                return Ok(());
+            }
+            let found = answer.map_err(TestCaseError::fail)?;
             let expected: Entries = model
                 .range(start.clone()..)
                 .take_while(|(key, _)| end.is_empty() || **key < end)
@@ -378,89 +398,136 @@ proptest! {
     }
 }
 
-/// The same sequences, through the client.
+/// A store, a server and a runtime, alive for as long as this value is.
 ///
-/// `#[ignore]`d until `esker-store`'s `RawKv` service exists — it is the sibling lane's
-/// phase-2 deliverable. With a server running, `cargo test -- --ignored` drives it; the
-/// address comes from `ESKER_TEST_ADDR`, defaulting to the one `esker raw` uses.
-///
-/// When the service lands, the only change here is to spawn it in-process on port 0 instead
-/// of reading that variable.
-#[test]
-#[ignore = "needs a running esker-store RawKv service; see the module header"]
-fn the_client_and_the_engine_agree() {
-    let addr = std::env::var("ESKER_TEST_ADDR").unwrap_or_else(|_| "127.0.0.1:20160".to_owned());
-    let addr: std::net::SocketAddr = addr.parse().expect("ESKER_TEST_ADDR must be host:port");
+/// The field order is the shutdown order: the handle goes first, which stops the server, and
+/// the runtime after it. Reversing them would drop a runtime with live tasks on it.
+struct TestServer {
+    addr: SocketAddr,
+    _handle: esker_proto::transport::ServerHandle,
+    _runtime: tokio::runtime::Runtime,
+    _dir: tempfile::TempDir,
+}
 
-    let stores = TcpStores::connect(addr)
-        .unwrap_or_else(|err| panic!("no server at {addr}: {err}; see the module header"));
+/// Opens a store on a temporary directory and serves it on a port the OS picks.
+fn start_server() -> TestServer {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+
+    let store = esker_store::Store::open(dir.path(), esker_store::StoreOptions::new())
+        .expect("the store opens");
+    let service: Arc<dyn esker_proto::transport::Service> = esker_store::StoreService::new(store);
+
+    let handle = runtime.block_on(async {
+        esker_proto::transport::Server::bind(
+            "127.0.0.1:0",
+            service,
+            esker_proto::transport::TransportConfig::new(),
+        )
+        .await
+        .expect("the server binds")
+        .spawn()
+        .expect("the server starts")
+    });
+
+    TestServer {
+        addr: handle.local_addr(),
+        _handle: handle,
+        _runtime: runtime,
+        _dir: dir,
+    }
+}
+
+/// Connects a client to `server`, routing the way `esker raw` does.
+fn client_store(server: &TestServer) -> ClientStore {
+    let stores = TcpStores::connect(server.addr).expect("the client connects");
     let store_id = stores.only_store().expect("the server named its store");
     let client = RawClient::new(
         Arc::new(stores),
+        // The same assumption `esker raw` makes: region 1 covers everything, and the client
+        // has no opinion about the leader until something tells it otherwise. If the store
+        // ever bootstraps differently, this test is where that is found out.
         Arc::new(StaticRegion::whole_key_space(BOOTSTRAP_REGION, store_id, 0)),
     );
-    let store = ClientStore { client };
+    ClientStore { client }
+}
 
-    // A fixed set of sequences rather than a proptest: this run costs round trips, and the
-    // property has already been established against the engine. What is being checked here is
-    // that the wire does not change the answer, which a handful of sequences covering every
-    // operation is enough to catch.
+proptest! {
+    // Fewer cases than the engine half: each operation here is a round trip, and the property
+    // itself is already established above. What these cases add is the wire, and a few hundred
+    // sequences over it is enough to catch a layer that drops, reorders or truncates.
+    #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+    /// The same sequences, through the client, against a real server.
+    ///
+    /// A failure here that the engine half does not share is the interesting one: it means the
+    /// network changed the answer.
+    #[test]
+    fn the_client_and_the_engine_agree(ops in proptest::collection::vec(op(), 1..24)) {
+        // One server for the whole test would be faster, and would let one case's leftovers
+        // become the next case's starting state — which is exactly the kind of contamination
+        // that makes a proptest failure impossible to read.
+        let server = start_server();
+        run_sequence(&client_store(&server), &ops)?;
+    }
+}
+
+/// The awkward shapes, spelled out rather than left to chance: an inverted range, a scan that
+/// stops at its limit, an unbounded end, and a key that would collide with the store's `'r'`
+/// namespace if the client ever added the prefix too.
+#[test]
+fn the_client_handles_the_edges_of_a_scan() {
+    let server = start_server();
+    let store = client_store(&server);
+
     let sequences: Vec<Vec<Op>> = vec![
         vec![Op::Put(1, 1), Op::Get(1), Op::Delete(1), Op::Get(1)],
-        vec![
-            Op::Put(2, 2),
-            Op::Put(2, 3),
-            Op::Get(2),
-            Op::Scan {
-                lo: 0,
-                hi: 0,
-                limit: 8,
-                unbounded_end: true,
-            },
-        ],
+        // An inverted range is empty, and reachable by an ordinary mistake.
         vec![
             Op::Batch(vec![(3, 3), (4, 4), (5, 5)]),
-            Op::Scan {
-                lo: 3,
-                hi: 5,
-                limit: 8,
-                unbounded_end: false,
-            },
-            Op::Delete(4),
-            Op::Scan {
-                lo: 0,
-                hi: 0,
-                limit: 2,
-                unbounded_end: true,
-            },
-        ],
-        // The awkward ones: an empty range, a limit of one, and a key that would collide with
-        // the store's `'r'` namespace if the client ever added it too.
-        vec![
             Op::Scan {
                 lo: 20,
                 hi: 1,
                 limit: 4,
                 unbounded_end: false,
             },
-            Op::Put(0, 0),
+        ],
+        // A limit that truncates: the page must stop, and stop in the right place.
+        vec![
+            Op::Batch(vec![(6, 6), (7, 7), (8, 8), (9, 9)]),
+            Op::Scan {
+                lo: 6,
+                hi: 0,
+                limit: 0,
+                unbounded_end: true,
+            },
+        ],
+        // Deleting a key that is not there is not an error, and an overwrite of a longer value
+        // must not leave a tail behind.
+        vec![
+            Op::Delete(11),
+            Op::Put(12, 6),
+            Op::Put(12, 0),
+            Op::Get(12),
             Op::Scan {
                 lo: 0,
                 hi: 0,
-                limit: 0,
+                limit: 30,
                 unbounded_end: true,
             },
         ],
     ];
 
     for (index, ops) in sequences.iter().enumerate() {
-        // Each sequence starts from an empty key space, so they cannot contaminate each other.
         clear(&store);
         if let Err(failure) = run_sequence(&store, ops) {
             panic!("sequence {index} disagreed: {failure}");
         }
     }
-    clear(&store);
 }
 
 /// Removes every key the model uses, so one sequence does not leak into the next.

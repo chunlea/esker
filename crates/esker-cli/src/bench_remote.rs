@@ -318,7 +318,98 @@ fn scan_everything(client: &RawClient, options: &Run) -> Result<Vec<Duration>, S
 
 #[cfg(test)]
 mod tests {
-    use super::{SCAN_PAGE, connect};
+    use super::{SCAN_PAGE, connect, run};
+    use crate::bench::{Run, Workload};
+    use crate::testserver::TestServer;
+
+    /// Every workload, over a real socket to a real store. Small on purpose: this is a test of
+    /// the driver, not a measurement — the numbers for `docs/bench/phase-2.md` come from a
+    /// deliberate run, not from `cargo test`.
+    #[test]
+    fn every_workload_runs_against_a_real_server() {
+        let server = TestServer::start();
+        for workload in [
+            Workload::FillSeq,
+            Workload::FillRandom,
+            Workload::Overwrite,
+            Workload::ReadRandom,
+            Workload::ReadMissing,
+            Workload::ReadSeq,
+        ] {
+            let options = Run {
+                workload,
+                num: 200,
+                value_size: 16,
+                batch_size: 1,
+                threads: 2,
+                remote: Some(server.addr()),
+                ..Run::default()
+            };
+            let report = run(&options, &server.addr())
+                .unwrap_or_else(|err| panic!("{workload:?} over the wire: {err}"));
+            assert_eq!(report.workload, workload);
+            assert!(report.operations > 0, "{workload:?} measured nothing");
+        }
+    }
+
+    /// A batch is one round trip, and batching has to actually reduce them — otherwise
+    /// `--batch-size` measures nothing and the phase-2 column is comparing the wrong things.
+    #[test]
+    fn a_batched_write_still_counts_every_key() {
+        let server = TestServer::start();
+        let options = Run {
+            workload: Workload::FillSeq,
+            num: 100,
+            value_size: 8,
+            batch_size: 10,
+            threads: 1,
+            remote: Some(server.addr()),
+            ..Run::default()
+        };
+        let report = run(&options, &server.addr()).expect("a batched fill");
+        assert_eq!(
+            report.operations, 100,
+            "a batch's latency is shared across its keys, so every key is still an operation"
+        );
+    }
+
+    /// A sequential read pages through the range, and the paging must not skip a key or read
+    /// one twice — the cursor arithmetic is where that would go wrong.
+    #[test]
+    fn a_paged_scan_reads_every_key_exactly_once() {
+        let server = TestServer::start();
+        let options = Run {
+            workload: Workload::ReadSeq,
+            num: 2_500,
+            value_size: 8,
+            batch_size: 100,
+            threads: 1,
+            remote: Some(server.addr()),
+            ..Run::default()
+        };
+        let report = run(&options, &server.addr()).expect("a paged scan");
+        assert_eq!(
+            report.operations, 2_500,
+            "the scan read {} pairs across pages of {SCAN_PAGE}",
+            report.operations
+        );
+    }
+
+    /// `--sync` has to reach the wire, or the durable column measures the page cache.
+    #[test]
+    fn a_synced_remote_write_completes() {
+        let server = TestServer::start();
+        let options = Run {
+            workload: Workload::FillSeq,
+            num: 50,
+            value_size: 8,
+            sync: true,
+            remote: Some(server.addr()),
+            ..Run::default()
+        };
+        let report = run(&options, &server.addr()).expect("a synced fill");
+        assert_eq!(report.operations, 50);
+    }
 
     /// A benchmark that cannot reach a store must say so, not panic and not report a zero.
     #[test]

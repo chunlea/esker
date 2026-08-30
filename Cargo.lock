@@ -104,8 +104,13 @@ dependencies = [
  "bytes",
  "esker-base",
  "esker-client",
+ "esker-engine",
  "esker-proto",
+ "esker-store",
+ "proptest",
+ "tempfile",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

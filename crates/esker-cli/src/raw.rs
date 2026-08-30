@@ -245,7 +245,182 @@ fn print_pair(out: &mut impl Write, key: &[u8], value: &[u8], hex: bool) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_ADDR, from_hex, is_safe_text, render, resolve, to_hex};
+    use super::{
+        DEFAULT_ADDR, Outcome, RawCommand, RawOptions, from_hex, is_safe_text, render, resolve,
+        run, to_hex,
+    };
+    use crate::testserver::TestServer;
+
+    /// Runs one command against `server` and returns what it printed.
+    fn go(server: &TestServer, command: RawCommand) -> (Outcome, String) {
+        let options = RawOptions {
+            command,
+            addr: server.addr(),
+            ..RawOptions::default()
+        };
+        let mut out = Vec::new();
+        let outcome = run(&options, &mut out).expect("the call succeeds");
+        (
+            outcome,
+            String::from_utf8(out).expect("printed valid UTF-8"),
+        )
+    }
+
+    /// The phase's acceptance criterion for this lane: `raw put` then `raw get`, end to end,
+    /// over a real socket to a real store.
+    #[test]
+    fn put_then_get_round_trips_through_a_real_server() {
+        let server = TestServer::start();
+
+        let (outcome, printed) = go(
+            &server,
+            RawCommand::Put {
+                key: b"greeting".to_vec(),
+                value: b"hello".to_vec(),
+            },
+        );
+        assert_eq!(outcome, Outcome::Done);
+        assert!(printed.is_empty(), "a put prints nothing: {printed:?}");
+
+        let (outcome, printed) = go(
+            &server,
+            RawCommand::Get {
+                key: b"greeting".to_vec(),
+            },
+        );
+        assert_eq!(outcome, Outcome::Done);
+        assert_eq!(printed, "hello\n");
+    }
+
+    /// A key that is not there is exit code 1, not an error and not an empty line — a script
+    /// has to be able to tell "absent" from "the cluster is down".
+    #[test]
+    fn a_missing_key_is_not_found_rather_than_an_error() {
+        let server = TestServer::start();
+        let (outcome, printed) = go(
+            &server,
+            RawCommand::Get {
+                key: b"never-written".to_vec(),
+            },
+        );
+        assert_eq!(outcome, Outcome::NotFound);
+        assert!(printed.is_empty());
+    }
+
+    #[test]
+    fn delete_removes_a_key_and_an_absent_one_is_not_an_error() {
+        let server = TestServer::start();
+        go(
+            &server,
+            RawCommand::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            },
+        );
+        assert_eq!(
+            go(&server, RawCommand::Delete { key: b"k".to_vec() }).0,
+            Outcome::Done
+        );
+        assert_eq!(
+            go(&server, RawCommand::Get { key: b"k".to_vec() }).0,
+            Outcome::NotFound
+        );
+        // Deleting what is not there succeeds; it is a statement about the end state.
+        assert_eq!(
+            go(&server, RawCommand::Delete { key: b"k".to_vec() }).0,
+            Outcome::Done
+        );
+    }
+
+    #[test]
+    fn scan_prints_key_and_value_in_order() {
+        let server = TestServer::start();
+        for (key, value) in [(&b"a"[..], &b"1"[..]), (b"b", b"2"), (b"c", b"3")] {
+            go(
+                &server,
+                RawCommand::Put {
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                },
+            );
+        }
+
+        let scan = |start: &[u8], end: &[u8], limit: u32, keys_only: bool| {
+            go(
+                &server,
+                RawCommand::Scan {
+                    start: start.to_vec(),
+                    end: end.to_vec(),
+                    limit,
+                    reverse: false,
+                    keys_only,
+                },
+            )
+            .1
+        };
+
+        assert_eq!(scan(b"", b"", 10, false), "a\t1\nb\t2\nc\t3\n");
+        assert_eq!(scan(b"b", b"", 10, false), "b\t2\nc\t3\n");
+        assert_eq!(scan(b"", b"c", 10, false), "a\t1\nb\t2\n");
+        assert_eq!(scan(b"", b"", 2, false), "a\t1\nb\t2\n");
+        assert_eq!(scan(b"", b"", 10, true), "a\nb\nc\n");
+        // An empty range is a real answer, not a miss.
+        assert_eq!(scan(b"x", b"", 10, false), "");
+    }
+
+    /// A value that is not printable text must not reach the terminal raw, and a `--hex` round
+    /// trip has to give back exactly the bytes that went in.
+    #[test]
+    fn a_binary_value_survives_a_hex_round_trip() {
+        let server = TestServer::start();
+        let binary = vec![0x00, 0x1b, 0x5b, 0x32, 0x4a, 0xff];
+        go(
+            &server,
+            RawCommand::Put {
+                key: b"binary".to_vec(),
+                value: binary.clone(),
+            },
+        );
+
+        let (_, printed) = go(
+            &server,
+            RawCommand::Get {
+                key: b"binary".to_vec(),
+            },
+        );
+        assert_eq!(printed.trim_end(), "001b5b324aff");
+        assert_eq!(from_hex(printed.trim_end()).as_deref(), Some(&binary[..]));
+    }
+
+    /// The trap this lane was warned about: the `'r'` namespace is the store's, and a client
+    /// that added it too would double-prefix. A key that *is* `r` is where that would show.
+    #[test]
+    fn a_key_that_looks_like_the_namespace_is_stored_as_itself() {
+        let server = TestServer::start();
+        for key in [&b"r"[..], b"rkey", b"\x00"] {
+            go(
+                &server,
+                RawCommand::Put {
+                    key: key.to_vec(),
+                    value: b"v".to_vec(),
+                },
+            );
+        }
+        let (_, printed) = go(
+            &server,
+            RawCommand::Scan {
+                start: Vec::new(),
+                end: Vec::new(),
+                limit: 10,
+                reverse: false,
+                keys_only: true,
+            },
+        );
+        // Three keys, and not one of them grew a prefix on the way through.
+        assert_eq!(printed.lines().count(), 3, "{printed:?}");
+        assert!(printed.contains("r\n"), "{printed:?}");
+        assert!(printed.contains("rkey\n"), "{printed:?}");
+    }
 
     #[test]
     fn hex_round_trips_every_byte() {
