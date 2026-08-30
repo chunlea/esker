@@ -1,0 +1,31 @@
+crates/esker-raft/proptest-regressions/proptests.txt
+  s_54136a52dccd02::t_a026e1914fb80e 1-9
+crates/esker-raft/src/election.rs
+  s_54136a52dccd02::t_643ad11f048bf4 65-71
+crates/esker-raft/src/lib.rs
+  s_54136a52dccd02::t_f0c6b803bf4c3b 33-34
+crates/esker-raft/src/proptests.rs
+  s_54136a52dccd02::t_982378a116ebb8 1-152
+crates/esker-raft/src/raw_node.rs
+  s_54136a52dccd02::t_541a424ee452dc 38-43,275,277,523-642
+crates/esker-raft/src/testkit.rs
+  s_54136a52dccd02::t_9acfd311f0bd8b 20,28-32,60,122,150-191,266-333
+docs/raft-spec.md
+  s_54136a52dccd02::t_2388be51de3d9a 57,97,99,101,130-147
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "d876d18cf7e88e941e2266efb46e87db5a4051df",
+  "prompts": {},
+  "sessions": {
+    "s_54136a52dccd02": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7991e833-93be-4b3f-93b2-2e245ecc2446",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
