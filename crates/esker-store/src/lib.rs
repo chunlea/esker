@@ -60,7 +60,8 @@ pub use heartbeat::{Heartbeats, RegionReport, StoreReport};
 pub use pd::{Bootstrapped, PdClient, RegionHeartbeat, RegionRoute, StoreHeartbeat, StoreInfo};
 pub use pd_remote::RemotePd;
 pub use peer::{
-    Applied, DiscardTransport, NoHost, PeerOptions, RaftPeer, RaftTransport, RegionHost,
+    Applied, DiscardTransport, LogCompaction, NoHost, PeerOptions, RaftPeer, RaftTransport,
+    RegionHost,
 };
 pub use raft_log::{PersistedState, RaftLogStorage};
 pub use rawkv::Limits;
@@ -97,6 +98,20 @@ pub const REGION_HEARTBEAT_MS: u64 = 60_000;
 
 /// Size of one chunk of a streamed Raft snapshot, in bytes.
 pub const SNAPSHOT_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// How far the log may run past its truncation point before it is compacted.
+///
+/// A log is kept because a follower that falls behind can be caught up from it, which is far
+/// cheaper than shipping the region's files. Past this, the entries are more likely to be paid for
+/// in disk than spent on a follower, and the region's data is the better answer.
+pub const RAFT_LOG_COMPACT_THRESHOLD: u64 = 4096;
+
+/// How many applied entries a compaction leaves behind it.
+///
+/// Not zero, and that is the point: a follower one entry behind the leader must not need a
+/// snapshot. The tail is the window in which a brief network stall is repaired by a few
+/// `AppendEntries` rather than by a megabyte of SSTs.
+pub const RAFT_LOG_KEEP_ENTRIES: u64 = 1024;
 
 #[cfg(test)]
 mod tests {

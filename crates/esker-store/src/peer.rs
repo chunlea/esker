@@ -176,6 +176,48 @@ pub struct PeerOptions {
     /// share one seed and still not campaign in lockstep
     /// (`docs/adr/0008-raft-determinism-and-the-driver-contract.md`).
     pub seed: u64,
+    /// When the Raft log is compacted, and how much of it a compaction leaves.
+    pub compaction: LogCompaction,
+}
+
+/// When a peer throws away the head of its Raft log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogCompaction {
+    /// How far the applied index may run past the truncation point before compacting.
+    pub threshold: u64,
+    /// How many applied entries to keep behind the new truncation point.
+    pub keep: u64,
+}
+
+impl LogCompaction {
+    /// The defaults of [`crate::RAFT_LOG_COMPACT_THRESHOLD`] and [`crate::RAFT_LOG_KEEP_ENTRIES`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            threshold: crate::RAFT_LOG_COMPACT_THRESHOLD,
+            keep: crate::RAFT_LOG_KEEP_ENTRIES,
+        }
+    }
+
+    /// Where a log with `applied` applied and `truncated` thrown away should compact to, or
+    /// `None` if it is not yet worth doing.
+    ///
+    /// Never past `applied`: compacting to an index the state machine has not reached would make
+    /// the log claim a state the data does not hold.
+    #[must_use]
+    pub fn target(self, truncated: Index, applied: Index) -> Option<Index> {
+        if applied.saturating_sub(truncated) < self.threshold.max(1) {
+            return None;
+        }
+        let target = applied.saturating_sub(self.keep);
+        (target > truncated).then_some(target)
+    }
+}
+
+impl Default for LogCompaction {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// The Raft core plus everything the driver thread owns.
@@ -184,6 +226,17 @@ pub struct PeerCore {
     node: RawNode<RaftLogStorage>,
     transport: Arc<dyn RaftTransport>,
     host: Arc<dyn RegionHost>,
+    /// When to throw away the head of the log.
+    compaction: LogCompaction,
+    /// The membership **as of** `applied_index`, which is what a compaction records and what a
+    /// snapshot names. Not the membership in force: a conf change committed above the apply index
+    /// has moved that one and not this one, and writing the wrong one is the mistake `86d9824`
+    /// and `91de89a` were both about.
+    ///
+    /// `TODO(phase-4c unit 5)`: moved by applying a `ConfChange` entry. Until an operator proposes
+    /// one it is the configuration the peer started with, which is the membership as of every
+    /// index it has.
+    applied_conf: ConfState,
     /// This region as the **log** has made it: narrowed by every split this peer has applied.
     ///
     /// The driver thread is its only writer and its only reader, so it needs no lock and cannot go
@@ -264,6 +317,57 @@ impl PeerCore {
 
         self.publish_leader();
         self.answer_ready_reads();
+        self.compact()?;
+        Ok(())
+    }
+
+    /// Throws away the head of the log once it has run far enough past its truncation point.
+    ///
+    /// Runs after the `Ready` loop rather than inside it, so a compaction never lands between the
+    /// steps whose order the contract fixes. Its own write is synced, unlike the apply batch: a
+    /// lost apply batch is replayed from the log, but a lost *compaction* record leaves the state
+    /// record naming entries that the same batch deleted, which is a log that disagrees with
+    /// itself.
+    fn compact(&mut self) -> Result<()> {
+        let storage = self.node.storage();
+        let Some(target) = self
+            .compaction
+            .target(storage.truncated_index(), self.applied_index)
+        else {
+            return Ok(());
+        };
+        // The term of the entry the log will begin after. Asking the core rather than storage:
+        // the core answers from its own view, which is the one the snapshot has to agree with.
+        let term = match esker_raft::LogStorage::term(self.node.storage(), target) {
+            Ok(term) => term,
+            Err(error) => {
+                tracing::warn!(
+                    region_id = self.region_id,
+                    target,
+                    %error,
+                    "could not read the term at the compaction point; leaving the log alone"
+                );
+                return Ok(());
+            }
+        };
+
+        let mut batch = WriteBatch::new();
+        self.node.storage_mut().stage_compact(
+            &mut batch,
+            target,
+            term,
+            self.applied_conf.clone(),
+        )?;
+        // Synced, for the reason in this method's docs.
+        self.node
+            .storage()
+            .db()
+            .write(batch, &WriteOptions { sync: true })?;
+        tracing::debug!(
+            region_id = self.region_id,
+            truncated_to = target,
+            "compacted the raft log"
+        );
         Ok(())
     }
 
@@ -608,10 +712,13 @@ impl RaftPeer {
         let leader = Arc::new(AtomicU64::new(0));
         let published = Arc::new(Published::default());
         published.applied.store(applied_index, Ordering::Release);
+        let applied_conf = node.storage().state().conf_state.clone();
         let core = PeerCore {
             node,
             transport,
             host,
+            compaction: options.compaction,
+            applied_conf,
             region: options.region,
             region_id,
             peer_id: options.peer_id,
@@ -842,7 +949,8 @@ mod tests {
     use esker_raft::{ConfState, LogStorage, Message, Role};
 
     use super::{
-        Applied, DiscardTransport, NoHost, PEER_QUEUE_DEPTH, PeerOptions, RaftPeer, RaftTransport,
+        Applied, DiscardTransport, LogCompaction, NoHost, PEER_QUEUE_DEPTH, PeerOptions, RaftPeer,
+        RaftTransport,
     };
     use crate::apply::Command;
     use crate::raft_log::{PersistedState, RaftLogStorage, decode_entry, log_entry_key, state_key};
@@ -891,6 +999,7 @@ mod tests {
                 peer_id,
                 voters,
                 seed: 7,
+                compaction: LogCompaction::new(),
             },
             storage,
             transport,
@@ -1154,6 +1263,102 @@ mod tests {
         let reopened = RaftLogStorage::open(Arc::clone(&db), REGION, ConfState::default()).unwrap();
         assert_eq!(reopened.applied_index(), 3);
         assert_eq!(reopened.last_index().unwrap(), 3);
+    }
+
+    /// `LogCompaction::target` is arithmetic, and the two ways to get it wrong both cost
+    /// correctness: compacting past the apply index throws away entries whose effect never
+    /// reached the data, and compacting to the apply index leaves no tail, so a follower one
+    /// entry behind needs a whole snapshot.
+    #[test]
+    fn the_compaction_target_keeps_a_tail_and_never_passes_the_apply_index() {
+        let policy = LogCompaction {
+            threshold: 100,
+            keep: 10,
+        };
+        assert_eq!(policy.target(0, 99), None, "not yet worth doing");
+        assert_eq!(policy.target(0, 100), Some(90), "a tail of ten is kept");
+        assert_eq!(policy.target(90, 190), Some(180));
+        assert_eq!(policy.target(180, 185), None, "already close enough");
+        // A tail longer than everything applied leaves nothing to compact.
+        assert_eq!(
+            LogCompaction {
+                threshold: 1,
+                keep: 1_000
+            }
+            .target(0, 500),
+            None
+        );
+        for (truncated, applied) in [(0, 100), (90, 190), (5, 1_000)] {
+            if let Some(target) = policy.target(truncated, applied) {
+                assert!(target <= applied, "compacting past the apply index");
+                assert!(target > truncated, "compacting to where it already is");
+            }
+        }
+    }
+
+    /// The driver compacts on its own once the log has run far enough past its truncation point,
+    /// and what it leaves is a log that still answers for the boundary — a follower whose log
+    /// begins at a snapshot has to be able to run the consistency check against it.
+    #[tokio::test]
+    async fn a_driver_compacts_its_own_log_and_keeps_the_boundary_answerable() {
+        let (_dir, db) = open_db();
+        let storage =
+            RaftLogStorage::open(Arc::clone(&db), REGION, ConfState::from_voters(vec![1])).unwrap();
+        let peer = RaftPeer::start(
+            PeerOptions {
+                region: Region::bootstrap(REGION, 1, 1),
+                peer_id: 1,
+                voters: vec![1],
+                seed: 7,
+                compaction: LogCompaction {
+                    threshold: 8,
+                    keep: 4,
+                },
+            },
+            storage,
+            Arc::new(DiscardTransport),
+            Arc::new(NoHost),
+        )
+        .unwrap();
+        elect_alone(&peer).await;
+
+        for n in 0..24u32 {
+            peer.propose(&Command::Put {
+                key: Bytes::from(format!("k{n:04}")),
+                value: Bytes::from_static(b"v"),
+            })
+            .await
+            .unwrap();
+        }
+        let applied = peer.status().await.unwrap().applied;
+        peer.stop();
+
+        let log = RaftLogStorage::open(Arc::clone(&db), REGION, ConfState::default()).unwrap();
+        let truncated = log.truncated_index();
+        assert!(truncated > 0, "the driver never compacted");
+        assert!(
+            truncated <= applied,
+            "compacted to {truncated} past an apply index of {applied}"
+        );
+        assert!(
+            applied - truncated <= 8,
+            "a tail of {} is more than the threshold asked for",
+            applied - truncated
+        );
+
+        // The boundary is still answerable, and below it the log is honestly gone.
+        assert_eq!(log.first_index().unwrap(), truncated + 1);
+        assert!(LogStorage::term(&log, truncated).is_ok());
+        assert!(matches!(
+            LogStorage::term(&log, truncated - 1),
+            Err(esker_raft::RaftError::Compacted(_))
+        ));
+
+        // And it now has a snapshot to offer, with the membership as of the truncation point.
+        let snapshot = log.snapshot().unwrap();
+        assert!(!snapshot.is_empty());
+        assert_eq!(snapshot.meta.index, truncated);
+        assert_eq!(snapshot.meta.conf.voters, vec![1]);
     }
 
     /// End to end: a command proposed on the leader is replicated, applied, and visible in the

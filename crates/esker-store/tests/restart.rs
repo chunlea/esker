@@ -23,7 +23,7 @@ use esker_keys::prefix;
 use esker_proto::Region;
 use esker_raft::{ConfState, Entry, EntryKind, HardState, LogStorage};
 use esker_store::apply::Command;
-use esker_store::{DiscardTransport, NoHost, PeerOptions, RaftLogStorage, RaftPeer};
+use esker_store::{DiscardTransport, LogCompaction, NoHost, PeerOptions, RaftLogStorage, RaftPeer};
 use tempfile::TempDir;
 
 const REGION: u64 = 1;
@@ -87,6 +87,7 @@ fn start(db: &Arc<Db>) -> Arc<RaftPeer> {
             peer_id: 1,
             voters: vec![1],
             seed: 3,
+            compaction: LogCompaction::new(),
         },
         storage,
         Arc::new(DiscardTransport),

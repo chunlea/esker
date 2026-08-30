@@ -33,7 +33,7 @@ use crate::error::{Result, StoreError};
 use crate::heartbeat::{Heartbeats, RegionReport, StoreReport};
 use crate::meta;
 use crate::pd::{PdClient, StoreInfo};
-use crate::peer::{PeerOptions, RaftPeer, RegionHost};
+use crate::peer::{LogCompaction, PeerOptions, RaftPeer, RegionHost};
 use crate::raft_log::RaftLogStorage;
 use crate::rawkv::{self, Limits};
 use crate::region::RegionMeta;
@@ -98,6 +98,8 @@ pub struct RaftOptions {
     pub tick: std::time::Duration,
     /// How the connections between stores are configured.
     pub transport: TransportConfig,
+    /// When each region's Raft log is compacted.
+    pub compaction: LogCompaction,
 }
 
 impl RaftOptions {
@@ -109,6 +111,7 @@ impl RaftOptions {
             seed,
             tick: std::time::Duration::from_millis(esker_raft::TICK_MS),
             transport: TransportConfig::new(),
+            compaction: LogCompaction::new(),
         }
     }
 }
@@ -976,6 +979,7 @@ fn start_peer(
             peer_id,
             voters,
             seed: raft.seed,
+            compaction: raft.compaction,
         },
         storage,
         transport.for_region(region.id, region.epoch, &raft.peers)

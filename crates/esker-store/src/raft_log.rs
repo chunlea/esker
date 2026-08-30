@@ -429,6 +429,58 @@ impl RaftLogStorage {
         self.stage_state(batch);
     }
 
+    /// Throws away every entry at or below `index`, recording what the log now begins after.
+    ///
+    /// `term` is the term of the entry *at* `index` and `conf` is the membership **as of** that
+    /// index. Both go into the state record in the same batch as the deletions, because they are
+    /// what replaces the entries being deleted: after this, `term(index)` is answered from the
+    /// record rather than from a log entry, and the configuration the core replays conf changes
+    /// onto is this one rather than the one the log started with.
+    ///
+    /// The `conf` argument is the whole reason this takes three parameters instead of one. The
+    /// membership as of `index` is not the membership *in force* — a conf change committed above
+    /// `index` has moved the latter and not the former — and writing the wrong one is the mistake
+    /// `86d9824` and `91de89a` were both about. Only the caller that applies conf changes knows
+    /// it, so only that caller may say.
+    ///
+    /// Compacting to an index the state machine has not applied would be a lie of a different
+    /// kind: the log would claim a state the data does not hold. Refused rather than clamped.
+    pub fn stage_compact(
+        &mut self,
+        batch: &mut WriteBatch,
+        index: Index,
+        term: Term,
+        conf: ConfState,
+    ) -> Result<()> {
+        if index > self.state.applied_index {
+            return Err(StoreError::Bootstrap(format!(
+                "region {} was asked to compact to {index}, past its apply index {}",
+                self.region_id, self.state.applied_index
+            )));
+        }
+        if index <= self.state.truncated_index {
+            // Already at or past it. Not an error: two triggers can agree.
+            return Ok(());
+        }
+        for stale in (self.state.truncated_index + 1)..=index {
+            batch.delete(self.cf, &log_entry_key(self.region_id, stale));
+        }
+        self.state.truncated_index = index;
+        self.state.truncated_term = term;
+        let mut conf = conf;
+        conf.normalize();
+        self.state.conf_state = conf;
+        self.last_index = self.last_index.max(index);
+        self.stage_state(batch);
+        Ok(())
+    }
+
+    /// The index the log begins after, and how far past it the log runs.
+    #[must_use]
+    pub fn truncated_index(&self) -> Index {
+        self.state.truncated_index
+    }
+
     /// The apply index on disk, which is where a restart resumes.
     #[must_use]
     pub fn applied_index(&self) -> Index {
@@ -514,16 +566,25 @@ impl LogStorage for RaftLogStorage {
     }
 
     fn snapshot(&self) -> std::result::Result<Snapshot, RaftError> {
-        // TODO(phase-4): build a snapshot from `engine.checkpoint(range)` and stream it
-        // (`docs/DESIGN.md` §6). A single region that never compacts its log never needs one, so
-        // 3e reports "nothing compacted" rather than pretending.
+        // The **metadata only**. A region's state machine is megabytes of SSTs and they do not
+        // travel in a Raft message: the core reads nothing but `meta`, which is exactly why it
+        // can handle `InstallSnapshot` in a crate that does no I/O (`esker_raft::types`). The
+        // bytes go over their own stream, and the receiver does not step this message until they
+        // have landed (`docs/plans/phase-4.md` §13.4).
         //
-        // Whatever truncates the log has to move `PersistedState::conf_state` with it, in the
-        // same batch: it is the membership as of the index the log begins after, and the entries
-        // that established it are the ones truncation throws away. `SnapshotMeta::conf` is the
-        // same value and must come from the same derivation — the core prefers it, precisely
-        // because a snapshot names the index its membership is as of.
-        Ok(Snapshot::default())
+        // A log that has never compacted has no snapshot to offer and says so with an empty one,
+        // which is what `Snapshot::is_empty` is for.
+        Ok(Snapshot {
+            meta: esker_raft::SnapshotMeta {
+                index: self.state.truncated_index,
+                term: self.state.truncated_term,
+                // The membership as of the truncation point, written with it by `stage_compact`.
+                // The core prefers a snapshot's `conf` precisely because a snapshot names the
+                // index its membership is as of.
+                conf: self.state.conf_state.clone(),
+            },
+            data: Bytes::new(),
+        })
     }
 }
 
@@ -876,12 +937,102 @@ mod tests {
         assert_eq!(reopened_second.last_index().unwrap(), 1);
     }
 
-    /// 3e never compacts, so there is nothing to send. Reporting an empty snapshot is what the
-    /// core reads as "nothing has been compacted"; pretending otherwise would make a leader send
-    /// one that carries no state.
+    /// A log that has never compacted has nothing to send. Reporting an empty snapshot is what the
+    /// core distinguishes from a real one, so it must be the empty one and not a zero-index lie.
     #[test]
     fn a_log_that_has_never_compacted_offers_no_snapshot() {
-        let (_dir, _db, log) = open_log();
+        let (_dir, db) = open_db();
+        let log = RaftLogStorage::open(db, 1, ConfState::from_voters(vec![1])).unwrap();
         assert!(log.snapshot().unwrap().is_empty());
+        assert_eq!(log.truncated_index(), 0);
+    }
+
+    /// Compaction throws away the head of the log and replaces it with three facts: where the log
+    /// now begins, the term of the entry it begins after, and the membership as of that index.
+    /// Everything a follower needs to be told "your log starts here" comes from those three.
+    #[test]
+    fn compaction_moves_the_bounds_and_the_snapshot_it_offers() {
+        let (_dir, db) = open_db();
+        let mut log =
+            RaftLogStorage::open(Arc::clone(&db), 1, ConfState::from_voters(vec![1])).unwrap();
+
+        let entries: Vec<Entry> = (1..=10)
+            .map(|index| Entry {
+                term: if index <= 5 { 1 } else { 2 },
+                index,
+                kind: EntryKind::Normal,
+                data: Bytes::from_static(b"x"),
+            })
+            .collect();
+        let mut batch = WriteBatch::new();
+        log.stage_ready(&mut batch, None, &entries);
+        log.stage_applied(&mut batch, 10);
+        db.write(batch, &WriteOptions { sync: true }).unwrap();
+
+        assert_eq!(log.first_index().unwrap(), 1);
+        let mut batch = WriteBatch::new();
+        log.stage_compact(&mut batch, 6, 2, ConfState::from_voters(vec![1, 2, 3]))
+            .unwrap();
+        db.write(batch, &WriteOptions { sync: true }).unwrap();
+
+        assert_eq!(log.truncated_index(), 6);
+        assert_eq!(log.first_index().unwrap(), 7, "the log begins after 6");
+        assert_eq!(log.last_index().unwrap(), 10);
+        // The term at the boundary is still answerable — a follower whose log begins at a
+        // snapshot must be able to run the consistency check against it.
+        assert_eq!(log.term(6).unwrap(), 2);
+        assert!(matches!(log.term(5), Err(RaftError::Compacted(6))));
+        assert_eq!(log.entries(7, 11, u64::MAX).unwrap().len(), 4);
+
+        let snapshot = log.snapshot().unwrap();
+        assert!(!snapshot.is_empty());
+        assert_eq!(snapshot.meta.index, 6);
+        assert_eq!(snapshot.meta.term, 2);
+        assert_eq!(snapshot.meta.conf.voters, vec![1, 2, 3]);
+        assert!(
+            snapshot.data.is_empty(),
+            "a region's state machine does not travel in a Raft message"
+        );
+
+        // And the three facts survive a reopen, because they are the state record.
+        let reopened = RaftLogStorage::open(db, 1, ConfState::default()).unwrap();
+        assert_eq!(reopened.first_index().unwrap(), 7);
+        assert_eq!(reopened.term(6).unwrap(), 2);
+        assert_eq!(reopened.snapshot().unwrap().meta.conf.voters, vec![1, 2, 3]);
+    }
+
+    /// Compacting past the apply index would make the log claim a state the data does not hold:
+    /// the entries that produced it would be gone and never applied. Refused, not clamped.
+    #[test]
+    fn compaction_never_runs_past_the_apply_index() {
+        let (_dir, db) = open_db();
+        let mut log =
+            RaftLogStorage::open(Arc::clone(&db), 1, ConfState::from_voters(vec![1])).unwrap();
+        let entries: Vec<Entry> = (1..=5)
+            .map(|index| Entry {
+                term: 1,
+                index,
+                kind: EntryKind::Normal,
+                data: Bytes::new(),
+            })
+            .collect();
+        let mut batch = WriteBatch::new();
+        log.stage_ready(&mut batch, None, &entries);
+        log.stage_applied(&mut batch, 3);
+        db.write(batch, &WriteOptions { sync: true }).unwrap();
+
+        let mut batch = WriteBatch::new();
+        assert!(
+            log.stage_compact(&mut batch, 4, 1, ConfState::default())
+                .is_err()
+        );
+        // And compacting to where it already is, or below, is a no-op rather than an error: two
+        // triggers may agree.
+        log.stage_compact(&mut batch, 3, 1, ConfState::from_voters(vec![1]))
+            .unwrap();
+        db.write(batch, &WriteOptions { sync: true }).unwrap();
+        log.stage_compact(&mut WriteBatch::new(), 2, 1, ConfState::default())
+            .unwrap();
+        assert_eq!(log.truncated_index(), 3);
     }
 }
