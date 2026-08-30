@@ -1,0 +1,33 @@
+crates/esker-raft/src/core.rs
+  s_dc640bf0df4adb::t_09514e0d86eb03 281-284,434-443,450-457,459-466
+crates/esker-raft/src/election.rs
+  s_dc640bf0df4adb::t_9a7b0d7be2b50e 171-176
+crates/esker-raft/src/lib.rs
+  s_dc640bf0df4adb::t_7cdc3af6c780f5 35
+crates/esker-raft/src/progress.rs
+  s_dc640bf0df4adb::t_47e785ed8493bd 170-171,173-179,181-183,186-187,190,193
+crates/esker-raft/src/raw_node.rs
+  s_dc640bf0df4adb::t_330b0203835ce6 14-16,127,435
+crates/esker-raft/src/replication.rs
+  s_dc640bf0df4adb::t_e4a9fa8fb4362e 1-942
+crates/esker-raft/src/testkit.rs
+  s_dc640bf0df4adb::t_25d3523c264428 181-200
+docs/raft-spec.md
+  s_dc640bf0df4adb::t_8d808a4fa27b27 22,36-40,80-85,141-142
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "58379282d61df0972ebbb28f063b30c215738516",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
