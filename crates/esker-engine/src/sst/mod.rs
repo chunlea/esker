@@ -55,11 +55,13 @@
 //! supporting `seek`, `seek_for_prev`, `next` and `prev`.
 
 pub mod block;
+pub mod builder;
 pub mod filter;
 pub mod footer;
 pub mod props;
 
 pub use block::{Block, BlockBuilder, BlockIter};
+pub use builder::{TableBuilder, TableOptions};
 pub use filter::{BloomBuilder, BloomFilter, DEFAULT_BITS_PER_KEY, filter_key};
 pub use footer::{BlockHandle, Footer, MAX_TABLE_SIZE};
 pub use props::TableProperties;
