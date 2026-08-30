@@ -22,8 +22,8 @@
 //! The register only works if it is read at the same instant as the directory listing it
 //! qualifies. Sampled one after the other the two describe different moments, and a flush that
 //! installs its edit in between falls through the gap: it was in no version when the directory
-//! was read, and is no longer pending by the time the register is. [`DbInner::purge_and_evict`]
-//! therefore takes both under the version lock, which is the lock installing an edit needs.
+//! was read, and is no longer pending by the time the register is. The sweep therefore takes
+//! both samples under the version lock, which is the lock installing an edit needs.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
