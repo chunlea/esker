@@ -1,0 +1,29 @@
+crates/esker-pd/src/service.rs
+  s_8dc89cd8f6be19::t_b729e90d51ad0b 136
+crates/esker-proto/src/lib.rs
+  s_8dc89cd8f6be19::t_627bb3752e0bfb 55
+crates/esker-proto/src/pd.rs
+  s_8dc89cd8f6be19::t_871225544a9e50 7,36,75-237,406-415,454,467-474,505-510,678,689,765,821-843,929-953
+crates/esker-proto/tests/golden/messages.hex
+  s_8dc89cd8f6be19::t_27b3d65b0d77ae 53-56
+crates/esker-proto/tests/messages.rs
+  s_8dc89cd8f6be19::t_36240f9997c48b 12,256-292
+crates/esker-store/src/pd_remote.rs
+  s_8dc89cd8f6be19::t_844ebb5359690a 191-194,205
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "d8bfab1973e12212e2b752aa762ecfd2b5195477",
+  "prompts": {},
+  "sessions": {
+    "s_8dc89cd8f6be19": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "20caabd3-7fb9-42f6-a519-04be2a284eef",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
