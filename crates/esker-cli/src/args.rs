@@ -27,6 +27,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use crate::bench::{Run as BenchOptions, Workload};
+use crate::cluster::ClusterOptions;
 use crate::manifest_dump::DumpOptions as ManifestDumpOptions;
 use crate::raw::{RawCommand, RawOptions, from_hex};
 use crate::server::ServerOptions;
@@ -52,6 +53,8 @@ pub(crate) enum Command {
     Raw(RawOptions),
     /// Open a store and serve it.
     Server(ServerOptions),
+    /// Start or stop a local cluster of stores replicating one region.
+    Cluster(ClusterOptions),
 }
 
 /// Why the arguments could not be understood.
@@ -135,6 +138,7 @@ Commands:
   manifest-dump <dir>   Print a database's manifest and reconstructed version
   raw <verb> ...        Read or write keys over the network
   server                Open a store and serve the RawKV API
+  cluster start|stop    Start or stop a local cluster replicating one region
 
 Options:
   -V, --version         Print the version
@@ -174,7 +178,9 @@ Raw options:
   raw put <key> <value>     Write one key
   raw delete <key>          Remove one key; removing an absent key succeeds
   raw scan [<start>]        Print key<TAB>value for a run of keys
-      --addr HOST:PORT      The store to talk to (default 127.0.0.1:20160)
+      --addr HOST:PORT      A store to talk to (default 127.0.0.1:20160). Repeat it
+                            once per node of a replicated region, so a NotLeader
+                            redirect has an address to follow
       --hex                 Read arguments as hex and print results as hex
       --no-sync             Do not wait for a write to be durable
       --end E               Exclusive upper bound of a scan (default unbounded)
@@ -217,6 +223,7 @@ where
         "manifest-dump" => parse_manifest_dump(&arguments[1..]),
         "raw" => parse_raw(&arguments[1..]),
         "server" => parse_server(&arguments[1..]),
+        "cluster" => parse_cluster(&arguments[1..]),
         other if other.starts_with('-') => Err(ParseError::UnknownFlag(other.to_owned())),
         other => Err(ParseError::UnknownCommand(other.to_owned())),
     }
@@ -462,6 +469,9 @@ fn parse_manifest_dump(arguments: &[String]) -> Result<Command, ParseError> {
 fn parse_server(arguments: &[String]) -> Result<Command, ParseError> {
     let mut options = ServerOptions::default();
     let mut index = 0;
+    // `--store-id` sets the peer id too unless `--peer-id` was given explicitly, so a
+    // single-region cluster needs one flag rather than two.
+    let mut saw_peer_id = false;
 
     while index < arguments.len() {
         let argument = &arguments[index];
@@ -493,6 +503,46 @@ fn parse_server(arguments: &[String]) -> Result<Command, ParseError> {
                             flag: "--store-id",
                             value: raw.clone(),
                         })?;
+                if !saw_peer_id {
+                    options.peer_id = options.store_id;
+                }
+            }
+            "--peer-id" => {
+                let raw = take_value(arguments, &mut index, inline, "--peer-id")?;
+                options.peer_id =
+                    raw.parse()
+                        .ok()
+                        .filter(|id| *id > 0)
+                        .ok_or(ParseError::InvalidValue {
+                            flag: "--peer-id",
+                            value: raw.clone(),
+                        })?;
+                saw_peer_id = true;
+            }
+            "--peer" => {
+                // `id@address`, repeatable. Splitting on the last `@` rather than the first
+                // leaves an IPv6 address usable, since those contain colons but no `@`.
+                let raw = take_value(arguments, &mut index, inline, "--peer")?;
+                let (id, address) =
+                    raw.split_once('@')
+                        .ok_or_else(|| ParseError::InvalidValue {
+                            flag: "--peer",
+                            value: raw.clone(),
+                        })?;
+                let id: u64 = id.parse().ok().filter(|id| *id > 0).ok_or_else(|| {
+                    ParseError::InvalidValue {
+                        flag: "--peer",
+                        value: raw.clone(),
+                    }
+                })?;
+                options.peers.push((id, address.to_owned()));
+            }
+            "--seed" => {
+                let raw = take_value(arguments, &mut index, inline, "--seed")?;
+                options.seed = raw.parse().map_err(|_| ParseError::InvalidValue {
+                    flag: "--seed",
+                    value: raw.clone(),
+                })?;
             }
             other if other.starts_with('-') => {
                 return Err(ParseError::UnknownFlag(other.to_owned()));
@@ -502,6 +552,77 @@ fn parse_server(arguments: &[String]) -> Result<Command, ParseError> {
     }
 
     Ok(Command::Server(options))
+}
+
+fn parse_cluster(arguments: &[String]) -> Result<Command, ParseError> {
+    let Some(action) = arguments.first() else {
+        return Err(ParseError::MissingArgument("cluster <start|stop>"));
+    };
+    if action == "--help" || action == "-h" {
+        return Ok(Command::Help);
+    }
+
+    let rest = &arguments[1..];
+    let mut nodes = 3_u64;
+    let mut data_dir = PathBuf::from("esker-cluster");
+    let mut base_port = crate::cluster::DEFAULT_BASE_PORT;
+    let mut seed = 0_u64;
+    let mut index = 0;
+
+    while index < rest.len() {
+        let argument = &rest[index];
+        index += 1;
+        if argument == "--help" || argument == "-h" {
+            return Ok(Command::Help);
+        }
+        let (flag, inline) = match argument.split_once('=') {
+            Some((flag, value)) => (flag, Some(value.to_owned())),
+            None => (argument.as_str(), None),
+        };
+        match flag {
+            "--nodes" => {
+                let raw = take_value(rest, &mut index, inline, "--nodes")?;
+                nodes = raw.parse().ok().filter(|count| *count > 0).ok_or(
+                    ParseError::InvalidValue {
+                        flag: "--nodes",
+                        value: raw.clone(),
+                    },
+                )?;
+            }
+            "--data-dir" => {
+                data_dir = PathBuf::from(take_value(rest, &mut index, inline, "--data-dir")?);
+            }
+            "--base-port" => {
+                let raw = take_value(rest, &mut index, inline, "--base-port")?;
+                base_port = raw.parse().map_err(|_| ParseError::InvalidValue {
+                    flag: "--base-port",
+                    value: raw.clone(),
+                })?;
+            }
+            "--seed" => {
+                let raw = take_value(rest, &mut index, inline, "--seed")?;
+                seed = raw.parse().map_err(|_| ParseError::InvalidValue {
+                    flag: "--seed",
+                    value: raw.clone(),
+                })?;
+            }
+            other if other.starts_with('-') => {
+                return Err(ParseError::UnknownFlag(other.to_owned()));
+            }
+            other => return Err(ParseError::UnexpectedArgument(other.to_owned())),
+        }
+    }
+
+    match action.as_str() {
+        "start" => Ok(Command::Cluster(ClusterOptions::Start {
+            nodes,
+            data_dir,
+            base_port,
+            seed,
+        })),
+        "stop" => Ok(Command::Cluster(ClusterOptions::Stop { data_dir })),
+        other => Err(ParseError::UnknownCommand(format!("cluster {other}"))),
+    }
 }
 
 fn parse_raw(arguments: &[String]) -> Result<Command, ParseError> {
@@ -521,6 +642,8 @@ fn parse_raw(arguments: &[String]) -> Result<Command, ParseError> {
     let mut limit: u32 = DEFAULT_SCAN_ROWS;
     let mut reverse = false;
     let mut keys_only = false;
+    // The first `--addr` is the store to try; every later one is a redirect target.
+    let mut saw_addr = false;
     let mut index = 1;
 
     while index < arguments.len() {
@@ -558,7 +681,18 @@ fn parse_raw(arguments: &[String]) -> Result<Command, ParseError> {
         };
 
         match flag {
-            "--addr" => options.addr = take_value(arguments, &mut index, inline, "--addr")?,
+            "--addr" => {
+                // Repeatable: the first is the store to try, the rest are where a redirect may
+                // send the request. A replicated region needs the whole list, because a
+                // `NotLeader` hint names a peer and reaching it needs an address.
+                let value = take_value(arguments, &mut index, inline, "--addr")?;
+                if saw_addr {
+                    options.extra_addrs.push(value);
+                } else {
+                    options.addr = value;
+                    saw_addr = true;
+                }
+            }
             "--end" => end = Some(take_value(arguments, &mut index, inline, "--end")?),
             "--limit" => {
                 let raw = take_value(arguments, &mut index, inline, "--limit")?;
@@ -972,6 +1106,138 @@ mod tests {
             assert!(
                 USAGE.contains(expected),
                 "usage does not mention {expected}"
+            );
+        }
+    }
+    /// A replicated region needs every node's address: the client learns *which* peer leads from
+    /// a `NotLeader` hint and needs somewhere to send the retry.
+    #[test]
+    fn raw_takes_one_address_per_node() {
+        let Command::Raw(options) = parse_ok(&[
+            "raw",
+            "get",
+            "k",
+            "--addr",
+            "127.0.0.1:1",
+            "--addr",
+            "127.0.0.1:2",
+            "--addr=127.0.0.1:3",
+        ]) else {
+            panic!("expected a raw command");
+        };
+        assert_eq!(options.addr, "127.0.0.1:1");
+        assert_eq!(options.extra_addrs, vec!["127.0.0.1:2", "127.0.0.1:3"]);
+    }
+
+    #[test]
+    fn raw_still_defaults_to_one_address() {
+        let Command::Raw(options) = parse_ok(&["raw", "get", "k"]) else {
+            panic!("expected a raw command");
+        };
+        assert_eq!(options.addr, crate::raw::DEFAULT_ADDR);
+        assert!(options.extra_addrs.is_empty());
+    }
+
+    #[test]
+    fn cluster_start_and_stop_parse() {
+        let Command::Cluster(ClusterOptions::Start {
+            nodes,
+            data_dir,
+            base_port,
+            seed,
+        }) = parse_ok(&[
+            "cluster",
+            "start",
+            "--nodes",
+            "5",
+            "--data-dir",
+            "/tmp/c",
+            "--base-port",
+            "30000",
+            "--seed=9",
+        ])
+        else {
+            panic!("expected a cluster start");
+        };
+        assert_eq!((nodes, base_port, seed), (5, 30_000, 9));
+        assert_eq!(data_dir, PathBuf::from("/tmp/c"));
+
+        let Command::Cluster(ClusterOptions::Stop { data_dir }) =
+            parse_ok(&["cluster", "stop", "--data-dir", "/tmp/c"])
+        else {
+            panic!("expected a cluster stop");
+        };
+        assert_eq!(data_dir, PathBuf::from("/tmp/c"));
+    }
+
+    #[test]
+    fn cluster_defaults_to_three_nodes() {
+        let Command::Cluster(ClusterOptions::Start {
+            nodes, base_port, ..
+        }) = parse_ok(&["cluster", "start"])
+        else {
+            panic!("expected a cluster start");
+        };
+        assert_eq!(nodes, 3, "the smallest group that tolerates a failure");
+        assert_eq!(base_port, crate::cluster::DEFAULT_BASE_PORT);
+    }
+
+    #[test]
+    fn a_cluster_action_that_does_not_exist_is_an_error() {
+        assert!(parse(&["cluster".to_owned(), "restart".to_owned()]).is_err());
+        assert!(parse(&["cluster".to_owned()]).is_err());
+        assert!(
+            parse(&[
+                "cluster".to_owned(),
+                "start".to_owned(),
+                "--nodes".to_owned(),
+                "0".to_owned()
+            ])
+            .is_err(),
+            "a cluster of nothing is not a cluster"
+        );
+    }
+
+    /// `--store-id` sets the peer id too, so a single-region cluster needs one flag, and an
+    /// explicit `--peer-id` still wins.
+    #[test]
+    fn server_peers_and_ids_parse() {
+        let Command::Server(options) = parse_ok(&[
+            "server",
+            "--store-id",
+            "2",
+            "--peer",
+            "1@127.0.0.1:1",
+            "--peer=3@127.0.0.1:3",
+            "--seed",
+            "7",
+        ]) else {
+            panic!("expected a server command");
+        };
+        assert_eq!(options.store_id, 2);
+        assert_eq!(options.peer_id, 2, "the store id sets the peer id");
+        assert_eq!(options.seed, 7);
+        assert_eq!(
+            options.peers,
+            vec![(1, "127.0.0.1:1".to_owned()), (3, "127.0.0.1:3".to_owned())]
+        );
+
+        let Command::Server(explicit) = parse_ok(&["server", "--peer-id", "9", "--store-id", "2"])
+        else {
+            panic!("expected a server command");
+        };
+        assert_eq!(
+            explicit.peer_id, 9,
+            "an explicit peer id is not overwritten"
+        );
+    }
+
+    #[test]
+    fn a_malformed_peer_is_an_error() {
+        for bad in ["noatsign", "0@127.0.0.1:1", "x@127.0.0.1:1"] {
+            assert!(
+                parse(&["server".to_owned(), "--peer".to_owned(), bad.to_owned()]).is_err(),
+                "accepted `--peer {bad}`"
             );
         }
     }

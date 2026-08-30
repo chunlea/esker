@@ -13,7 +13,7 @@
 //! belongs to storage and is added afterwards ([`crate::rawkv`]).
 
 use bytes::Bytes;
-use esker_proto::{Epoch, ProtoError, Region, RequestHeader};
+use esker_proto::{Epoch, Peer, ProtoError, Region, RequestHeader};
 
 /// One region as this store holds it.
 ///
@@ -32,6 +32,24 @@ impl RegionMeta {
     pub fn bootstrap(region_id: u64, store_id: u64, peer_id: u64) -> Self {
         Self {
             region: Region::bootstrap(region_id, store_id, peer_id),
+        }
+    }
+
+    /// A region covering the whole key space, replicated by every peer in `peers`.
+    ///
+    /// The peer list is what makes a redirect usable: a client that receives
+    /// `NotLeader { leader_hint }` has a *peer* id, and only this list turns it into the store
+    /// to send to (`docs/DESIGN.md` §10). A single-peer region can never redirect anywhere.
+    #[must_use]
+    pub fn replicated(region_id: u64, peers: Vec<Peer>) -> Self {
+        Self {
+            region: Region {
+                id: region_id,
+                start_key: Bytes::new(),
+                end_key: Bytes::new(),
+                peers,
+                epoch: Epoch::INITIAL,
+            },
         }
     }
 

@@ -53,6 +53,33 @@ impl TcpStores {
         })
     }
 
+    /// Connects to every address, keying each connection by the store id its handshake reports.
+    ///
+    /// This is the stand-in for the placement driver's store list (`docs/DESIGN.md` §7). It is
+    /// what makes a redirect work across sockets: the region's peer list turns a `NotLeader` hint
+    /// into a store id, and this book turns that into the connection to send on. With one address
+    /// a client can learn *who* leads and still have no way to reach it.
+    ///
+    /// An address that cannot be reached is not fatal — a cluster with one node down is still a
+    /// cluster — but every address failing is, because the book would be empty.
+    pub fn connect_all(addrs: &[SocketAddr], config: TransportConfig) -> Result<Self, ProtoError> {
+        let mut connections = BTreeMap::new();
+        let mut last_error = None;
+        for addr in addrs {
+            match BlockingTransport::connect_with(*addr, config) {
+                Ok(connection) => {
+                    connections.insert(connection.hello_ack().store_id, connection);
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        if connections.is_empty() {
+            return Err(last_error
+                .unwrap_or_else(|| ProtoError::not_sent("no addresses were given to connect to")));
+        }
+        Ok(Self { connections })
+    }
+
     /// The store ids this book can reach.
     #[must_use]
     pub fn store_ids(&self) -> Vec<u64> {

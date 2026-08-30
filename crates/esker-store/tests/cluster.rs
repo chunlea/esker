@@ -62,9 +62,12 @@ async fn start_cluster(count: usize) -> Vec<Node> {
         let id = at as u64 + 1;
         let dir = TempDir::new().unwrap();
         let mut raft = RaftOptions::new(peers.clone(), 20_260_830);
-        // Ticks are 100 ms in production; here they are fast, so an election takes milliseconds
-        // rather than seconds. Nothing about the algorithm changes — it counts ticks.
-        raft.tick = Duration::from_millis(5);
+        // Ticks are 100 ms in production; here they are shorter so an election takes a fraction
+        // of a second rather than seconds. Nothing about the algorithm changes — it counts ticks
+        // — but the interval cannot be arbitrarily small: these tests run in parallel, and a
+        // whole file's worth of clusters in one process is enough contention that a 5 ms tick
+        // gets delayed past an election timeout and leadership churns. 25 ms leaves headroom.
+        raft.tick = Duration::from_millis(25);
         let options = StoreOptions {
             store_id: id,
             peer_id: id,
@@ -93,25 +96,34 @@ async fn shutdown(nodes: Vec<Node>) {
     }
 }
 
-/// Waits for exactly one leader, and returns its index.
-async fn wait_for_leader(nodes: &[Node]) -> usize {
+/// Waits until every node agrees who leads, and returns that node's index.
+///
+/// "Exactly one node says it is the leader" is not enough to act on: a follower learns the leader
+/// from an `AppendEntries`, so there is a window in which one has taken office and nobody else
+/// knows. A test that asserts on a redirect hint — or that proposes and expects it to be ordered
+/// — is racing that window. Waiting for unanimity closes it, and costs a few milliseconds.
+async fn settled_leader(nodes: &[Node]) -> usize {
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
-        let mut leaders = Vec::new();
-        for (at, node) in nodes.iter().enumerate() {
-            let status = node.store.peer().unwrap().status().await.unwrap();
-            if status.role == Role::Leader {
-                leaders.push((at, status.term));
-            }
+        let mut beliefs = Vec::new();
+        for node in nodes {
+            beliefs.push(node.store.peer().unwrap().leader());
         }
-        // More than one is legal for an instant — a deposed leader that has not found out yet —
-        // so the test waits for the cluster to agree rather than asserting on the first sighting.
-        if leaders.len() == 1 {
-            return leaders[0].0;
+        if let Some(Some(leader)) = beliefs.first().copied() {
+            let unanimous = beliefs.iter().all(|belief| *belief == Some(leader));
+            let Ok(at) = usize::try_from(leader - 1) else {
+                continue;
+            };
+            if unanimous
+                && at < nodes.len()
+                && nodes[at].store.peer().unwrap().status().await.unwrap().role == Role::Leader
+            {
+                return at;
+            }
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("no single leader within the deadline");
+    panic!("the cluster never agreed on a leader");
 }
 
 /// Waits for every node's applied index to reach `index`.
@@ -135,43 +147,28 @@ async fn wait_for_applied(nodes: &[Node], index: u64) {
 
 /// Three stores with no help elect one leader — which means the transport carried the votes and
 /// the wire decoded them.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn three_stores_elect_a_leader_over_real_tcp() {
     let nodes = start_cluster(3).await;
-    let leader = wait_for_leader(&nodes).await;
+    let leader = settled_leader(&nodes).await;
 
     let status = nodes[leader].store.peer().unwrap().status().await.unwrap();
     assert_eq!(status.role, Role::Leader);
     assert!(status.term >= 1);
-
-    // And the followers agree who it is, which only the leader's heartbeats can have told them.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let leader_id = status.id;
-    loop {
-        let mut agreed = 0;
-        for node in &nodes {
-            if node.store.peer().unwrap().leader() == Some(leader_id) {
-                agreed += 1;
-            }
-        }
-        if agreed == nodes.len() {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the followers never agreed on a leader"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    // `settled_leader` returned only once every node agreed, which only the leader's heartbeats
+    // can have told them.
+    for node in &nodes {
+        assert_eq!(node.store.peer().unwrap().leader(), Some(status.id));
     }
     shutdown(nodes).await;
 }
 
 /// A write proposed on the leader reaches every peer's data column family. This is the whole
 /// stack: propose, replicate over TCP, commit on a quorum, apply on each peer.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_write_on_the_leader_reaches_every_peer() {
     let nodes = start_cluster(3).await;
-    let leader = wait_for_leader(&nodes).await;
+    let leader = settled_leader(&nodes).await;
     let peer = nodes[leader].store.peer().unwrap();
 
     let command = Command::Put {
@@ -197,10 +194,10 @@ async fn a_write_on_the_leader_reaches_every_peer() {
 
 /// A follower cannot order a write, and says so with the redirect a client acts on rather than
 /// an opaque failure.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_follower_refuses_a_proposal_and_names_the_leader() {
     let nodes = start_cluster(3).await;
-    let leader = wait_for_leader(&nodes).await;
+    let leader = settled_leader(&nodes).await;
     let follower = (leader + 1) % nodes.len();
 
     let command = Command::Put {
@@ -233,10 +230,10 @@ async fn a_follower_refuses_a_proposal_and_names_the_leader() {
 
 /// Several writes in a row all land, in order, on every peer — which exercises the transport's
 /// batching rather than a single message crossing once.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_run_of_writes_replicates_in_order() {
     let nodes = start_cluster(3).await;
-    let leader = wait_for_leader(&nodes).await;
+    let leader = settled_leader(&nodes).await;
     let peer = nodes[leader].store.peer().unwrap();
 
     for index in 0..16_u32 {
@@ -268,10 +265,10 @@ async fn a_run_of_writes_replicates_in_order() {
 /// The wire path, end to end: a `RawKv` request to the **leader's** socket is ordered by Raft and
 /// answered from this peer's own apply, and the same request to a **follower** comes back as
 /// `NotLeader` naming the leader — which is what a client's region cache learns from.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_request_over_the_wire_is_served_by_the_leader_and_redirected_by_a_follower() {
     let nodes = start_cluster(3).await;
-    let leader = wait_for_leader(&nodes).await;
+    let leader = settled_leader(&nodes).await;
     let follower = (leader + 1) % nodes.len();
     let header = RequestHeader::new(1, Epoch::INITIAL, 0);
 
@@ -333,10 +330,10 @@ async fn a_request_over_the_wire_is_served_by_the_leader_and_redirected_by_a_fol
 
 /// A `CompareAndSwap` over the wire is decided at apply time on every peer, and its answer comes
 /// back to the caller that proposed it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_compare_and_swap_over_the_wire_is_ordered_by_raft() {
     let nodes = start_cluster(3).await;
-    let leader = wait_for_leader(&nodes).await;
+    let leader = settled_leader(&nodes).await;
     let header = RequestHeader::new(1, Epoch::INITIAL, 0);
     let transport = TcpTransport::connect(nodes[leader].handle.local_addr())
         .await
@@ -390,10 +387,10 @@ async fn a_compare_and_swap_over_the_wire_is_ordered_by_raft() {
 
 /// A linearizable read on the leader comes back at an index the state machine has *already*
 /// applied — the property `ReadIndex` exists for, checked across a real cluster.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_read_index_on_the_leader_is_answered_past_its_apply() {
     let nodes = start_cluster(3).await;
-    let leader = wait_for_leader(&nodes).await;
+    let leader = settled_leader(&nodes).await;
     let peer = nodes[leader].store.peer().unwrap();
 
     peer.propose(&Command::Put {

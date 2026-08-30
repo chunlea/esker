@@ -27,7 +27,7 @@ use std::sync::RwLock;
 
 use bytes::Bytes;
 
-use crate::wire::{Peer, Region};
+use crate::wire::{Epoch, Peer, Region};
 
 /// A region and the peer the client currently believes leads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +79,36 @@ impl StaticRegion {
             route: Route {
                 region: Region::bootstrap(region_id, store_id, peer_id),
                 leader: Some(Peer::voter(store_id, peer_id)),
+            },
+        }
+    }
+
+    /// A region `["", "")` replicated by every store in `store_ids`, with no opinion about which
+    /// leads.
+    ///
+    /// The peer list is what makes a redirect work: `NotLeader { leader_hint }` names a *peer*,
+    /// and only a region that lists more than one can turn that into a different store to send to.
+    /// A one-peer region learns who leads and has nowhere to go with it.
+    ///
+    /// The peer id is taken to equal the store id, which is what a single-region cluster
+    /// bootstraps with. Phase 4's placement driver hands out the real mapping and this goes away.
+    #[must_use]
+    pub fn replicated(region_id: u64, store_ids: &[u64]) -> Self {
+        Self {
+            route: Route {
+                region: Region {
+                    id: region_id,
+                    start_key: Bytes::new(),
+                    end_key: Bytes::new(),
+                    peers: store_ids
+                        .iter()
+                        .map(|store_id| Peer::voter(*store_id, *store_id))
+                        .collect(),
+                    epoch: Epoch::INITIAL,
+                },
+                // No opinion: the first request goes to whichever peer is listed first and, if it
+                // is a follower, comes back with the hint that fixes the cache.
+                leader: None,
             },
         }
     }

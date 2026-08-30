@@ -85,6 +85,8 @@ pub(crate) struct RawOptions {
     pub(crate) command: RawCommand,
     /// `host:port` of the store.
     pub(crate) addr: String,
+    /// Extra stores to connect to, so a `NotLeader` redirect has somewhere to go.
+    pub(crate) extra_addrs: Vec<String>,
     /// Read arguments as hex and print results as hex.
     pub(crate) hex: bool,
     /// Wait for a write to be durable before answering.
@@ -96,6 +98,7 @@ impl Default for RawOptions {
         Self {
             command: RawCommand::Get { key: Vec::new() },
             addr: DEFAULT_ADDR.to_owned(),
+            extra_addrs: Vec::new(),
             hex: false,
             // Durability is an opt-out, never a default (`CLAUDE.md` invariant 1).
             sync: true,
@@ -114,14 +117,27 @@ pub(crate) enum Outcome {
 
 /// Runs one `raw` command against the store at `options.addr`.
 pub(crate) fn run(options: &RawOptions, out: &mut impl Write) -> Result<Outcome, String> {
-    let addr = resolve(&options.addr)?;
+    // Every `--addr` given, in order. One is phase 2's single store; several are a replicated
+    // region, and the extras are what make a redirect usable — a `NotLeader` hint names a peer,
+    // the region's peer list turns that into a store, and this book turns *that* into a socket.
+    // Until the placement driver exists (phase 4) the operator supplies the book.
+    let mut addrs = vec![resolve(&options.addr)?];
+    for extra in &options.extra_addrs {
+        addrs.push(resolve(extra)?);
+    }
     // `ProtoError::NotSent` already names the address it could not reach, so wrapping it in
     // more context would print the address twice.
-    let stores = TcpStores::connect(addr).map_err(|err| err.to_string())?;
-    let store_id = stores
-        .only_store()
-        .ok_or_else(|| "the store did not say which store it is".to_owned())?;
-    let resolver = StaticRegion::whole_key_space(BOOTSTRAP_REGION, store_id, NO_LEADER_OPINION);
+    let stores = TcpStores::connect_all(&addrs, esker_proto::TransportConfig::new())
+        .map_err(|err| err.to_string())?;
+    // One address is phase 2's single store, and the region has one peer. Several is a
+    // replicated region, and the region has to list them all — otherwise the client learns which
+    // peer leads and has no way to reach it.
+    let resolver = match stores.only_store() {
+        Some(store_id) => {
+            StaticRegion::whole_key_space(BOOTSTRAP_REGION, store_id, NO_LEADER_OPINION)
+        }
+        None => StaticRegion::replicated(BOOTSTRAP_REGION, &stores.store_ids()),
+    };
     let client = RawClient::new(Arc::new(stores), Arc::new(resolver));
 
     match &options.command {

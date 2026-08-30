@@ -24,7 +24,7 @@ use std::sync::{Arc, RwLock};
 
 use esker_engine::{Db, LocalFileSystem, Options, WalSyncMode, cf};
 use esker_proto::{
-    BoxFuture, Epoch, ProtoError, RaftBatch, RawKvReq, RawKvResp, Region, Reply, Request,
+    BoxFuture, Epoch, Peer, ProtoError, RaftBatch, RawKvReq, RawKvResp, Region, Reply, Request,
     RequestHeader, Response, Service, TransportConfig,
 };
 
@@ -171,7 +171,18 @@ impl Store {
         // TODO(phase-4): read the region from the `raft` CF instead of bootstrapping one, and
         // register with the placement driver. Until then every open is a bootstrap, which is
         // correct while there is one region that covers everything and never splits.
-        let region = RegionMeta::bootstrap(options.region_id, options.store_id, options.peer_id);
+        let region = match &options.raft {
+            None => RegionMeta::bootstrap(options.region_id, options.store_id, options.peer_id),
+            // Every peer, so that a `NotLeader` hint — which names a *peer* — can be resolved to
+            // the store a client should send to instead.
+            Some(raft) => RegionMeta::replicated(
+                options.region_id,
+                raft.peers
+                    .iter()
+                    .map(|peer| Peer::voter(peer.store_id, peer.peer_id))
+                    .collect(),
+            ),
+        };
         let db = Arc::new(db);
 
         // A replicated store needs a runtime: the transport's tasks and the ticker live in one.

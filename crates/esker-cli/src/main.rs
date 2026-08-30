@@ -10,6 +10,7 @@ mod args;
 mod bench;
 mod bench_remote;
 mod bytes;
+mod cluster;
 mod manifest_dump;
 mod raw;
 mod server;
@@ -101,6 +102,13 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Ok(Command::Cluster(options)) => match cluster::run(&options) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(reason) => {
+                eprintln!("esker cluster: {reason}");
+                ExitCode::from(EXIT_FAILURE)
+            }
+        },
         Err(error) => {
             eprintln!("esker: {error}\n");
             eprint!("{USAGE}");

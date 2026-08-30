@@ -12,7 +12,7 @@ use crate::error::{RaftError, Result};
 use crate::message::Message;
 use crate::storage::LogStorage;
 use crate::types::{
-    ConfChange, Entry, EntryKind, HardState, Index, NodeId, ReadState, Snapshot, Term,
+    ConfChange, ConfState, Entry, EntryKind, HardState, Index, NodeId, ReadState, Snapshot, Term,
 };
 
 /// Everything the core decided since the last [`RawNode::advance`], and the order the driver must
@@ -243,6 +243,29 @@ impl<S: LogStorage> RawNode<S> {
     #[cfg(test)]
     pub(crate) fn raft_mut(&mut self) -> &mut Raft<S> {
         &mut self.raft
+    }
+
+    /// Entries in `[low, high)`, **including the tail that is not yet durable**.
+    ///
+    /// A reader that went to [`storage`](RawNode::storage) instead would see only what the driver
+    /// has already written, and would have to wait for a `Ready` to be discharged before it could
+    /// observe an entry the node has already decided on. This returns the log as the *core* sees
+    /// it: the durable prefix and the unstable tail as one sequence.
+    ///
+    /// Ranges are half-open, as everywhere in [`LogStorage`]. [`RaftError::Compacted`] means the
+    /// entries are only in a snapshot now; [`RaftError::Unavailable`] means `high` is past the end.
+    pub fn log_entries(&self, low: Index, high: Index) -> Result<Vec<Entry>> {
+        self.raft.log.slice(low, high, u64::MAX)
+    }
+
+    /// The configuration in force: the latest in the log, committed or not.
+    ///
+    /// "Committed or not" is the whole subtlety. A membership change takes effect when its entry
+    /// is *appended* (dissertation §4.1), so this can name a configuration that a truncation may
+    /// still take away — which is exactly what an observer watching membership needs to see, and
+    /// what [`Status::conf`](crate::Status::conf) reports as part of a larger snapshot.
+    pub fn conf_state(&self) -> ConfState {
+        self.raft.conf.current().clone()
     }
 
     /// What this node currently believes.
@@ -658,6 +681,89 @@ mod tests {
                 assert_eq!(appends, 2, "no heartbeat on the heartbeat tick");
             }
         }
+    }
+
+    /// The sim lane's checkers read the log as the *core* sees it, not as storage does: an entry
+    /// the node has decided on is visible here before the driver has written it, which is what
+    /// removes the need to wait for a `Ready` to settle before observing one.
+    #[test]
+    fn log_entries_include_the_tail_that_is_not_yet_durable() {
+        let mut leader = RawNode::new(
+            Config {
+                pre_vote: false,
+                ..Config::new(1, vec![1], 77)
+            },
+            MemStorage::with_conf_state(ConfState::from_voters(vec![1])),
+        )
+        .unwrap();
+        leader.campaign().unwrap();
+        leader
+            .propose(bytes::Bytes::from_static(b"payload"))
+            .unwrap();
+
+        // Nothing has been persisted yet: the driver has not taken a `Ready`.
+        assert_eq!(leader.storage().last_index().unwrap(), 0);
+
+        let last = leader.status().last_index;
+        let entries = leader.log_entries(1, last + 1).unwrap();
+        assert_eq!(entries.len(), 2, "the leader's no-op and the proposal");
+        assert_eq!(entries[1].data.as_ref(), b"payload");
+
+        // The bounds behave as they do everywhere: half-open, and past the end is an error.
+        assert!(leader.log_entries(1, 1).unwrap().is_empty());
+        assert!(leader.log_entries(1, last + 2).is_err());
+    }
+
+    /// A membership observation has to show the configuration *in force*, which §4.1 makes the
+    /// latest in the log rather than the latest committed — so a change is visible the moment its
+    /// entry is appended, and disappears again if that entry is truncated.
+    #[test]
+    fn conf_state_reports_the_configuration_in_force_before_it_commits() {
+        let mut leader = RawNode::new(
+            Config {
+                pre_vote: false,
+                check_quorum: false,
+                ..Config::new(1, vec![1, 2, 3], 78)
+            },
+            MemStorage::with_conf_state(ConfState::from_voters(vec![1, 2, 3])),
+        )
+        .unwrap();
+        leader.campaign().unwrap();
+        for voter in [2, 3] {
+            leader
+                .step(Message::RequestVoteResponse {
+                    from: voter,
+                    to: 1,
+                    term: 1,
+                    granted: true,
+                    pre_vote: false,
+                })
+                .unwrap();
+        }
+        assert_eq!(leader.conf_state().voters, vec![1, 2, 3]);
+
+        leader
+            .propose_conf_change(crate::types::ConfChange::new(
+                crate::types::ConfChangeKind::AddLearner,
+                4,
+            ))
+            .unwrap();
+        let conf = leader.conf_state();
+        assert_eq!(conf.voters, vec![1, 2, 3]);
+        assert_eq!(
+            conf.learners,
+            vec![4],
+            "in force at append, before it commits"
+        );
+        assert!(
+            leader.commit_index() < leader.status().last_index,
+            "and the entry that carries it is not committed yet"
+        );
+        assert_eq!(
+            conf,
+            leader.status().conf,
+            "status agrees with the accessor"
+        );
     }
 
     #[test]

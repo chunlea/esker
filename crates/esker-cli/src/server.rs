@@ -15,7 +15,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use esker_proto::{Server, TransportConfig};
-use esker_store::{Store, StoreOptions, StoreService};
+use esker_store::server::RaftOptions;
+use esker_store::{PeerAddress, Store, StoreOptions, StoreService};
 
 /// Where `--listen` points when nothing says otherwise.
 ///
@@ -32,6 +33,15 @@ pub(crate) struct ServerOptions {
     pub(crate) listen: String,
     /// This store's id, reported in the handshake.
     pub(crate) store_id: u64,
+    /// This store's Raft peer id for the region it serves. Defaults to the store id, which is
+    /// what a single-region cluster wants and what `esker cluster start` passes.
+    pub(crate) peer_id: u64,
+    /// Every peer of the region, as `id@address`, this store's included. Empty means an
+    /// unreplicated store — exactly phase 2's, and still the default.
+    pub(crate) peers: Vec<(u64, String)>,
+    /// Seed for the election-timeout RNG. A whole cluster shares one: the peer id selects the
+    /// stream (`docs/adr/0008-raft-determinism-and-the-driver-contract.md`).
+    pub(crate) seed: u64,
 }
 
 impl Default for ServerOptions {
@@ -40,6 +50,9 @@ impl Default for ServerOptions {
             data_dir: PathBuf::from("esker-data"),
             listen: DEFAULT_LISTEN.to_owned(),
             store_id: 1,
+            peer_id: 1,
+            peers: Vec::new(),
+            seed: 0,
         }
     }
 }
@@ -51,24 +64,44 @@ pub(crate) fn run(options: &ServerOptions) -> Result<(), String> {
         .parse()
         .map_err(|error| format!("`--listen {}` is not an address: {error}", options.listen))?;
 
+    // A replicated store's transport tasks and ticker live in a runtime, so the runtime is
+    // built before the store rather than after it.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("building the runtime: {error}"))?;
+    let _guard = runtime.enter();
+
+    let raft = if options.peers.is_empty() {
+        None
+    } else {
+        let mut peers = Vec::with_capacity(options.peers.len());
+        for (id, address) in &options.peers {
+            let addr: SocketAddr = address
+                .parse()
+                .map_err(|error| format!("`--peer {id}@{address}` is not an address: {error}"))?;
+            peers.push(PeerAddress::new(*id, *id, addr));
+        }
+        Some(RaftOptions::new(peers, options.seed))
+    };
+
     let store = Store::open(
         &options.data_dir,
         StoreOptions {
             store_id: options.store_id,
+            peer_id: options.peer_id,
+            raft,
             ..StoreOptions::new()
         },
     )
     .map_err(|error| format!("opening {}: {error}", options.data_dir.display()))?;
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("building the runtime: {error}"))?;
-
     let served = runtime.block_on(serve(Arc::clone(&store), address, options));
 
     // The store outlives the server on purpose: `serve` has returned, so every handler has
-    // finished, and only now is it safe to flush and drop the database.
+    // finished, and only now is it safe to flush and drop the database. Replication stops first:
+    // a peer still driving Raft would keep writing to a database about to be dropped.
+    store.stop();
     if let Err(error) = store.flush() {
         eprintln!("esker server: flushing on shutdown: {error}");
     }
@@ -98,6 +131,14 @@ async fn serve(
         "esker server: region {} covers the whole key space",
         store.region().id
     );
+    if !options.peers.is_empty() {
+        println!(
+            "esker server: peer {} of region {}, replicating with {} peers",
+            options.peer_id,
+            store.region().id,
+            options.peers.len()
+        );
+    }
 
     server
         .serve(shutdown_signal())
