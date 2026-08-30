@@ -1,6 +1,6 @@
 # Phase 4 plan — many regions, and the driver that places them
 
-Status: **in progress** — 4a and 4b accepted, 4c done, 4d–4e gated. Written before implementation; §9 records progress
+Status: **in progress** — 4a–4c accepted, 4d open, 4e gated. Written before implementation; §9 records progress
 and §10 what changed. Spec: `prompts/04-multiraft-pd.md`. Constitution: `CLAUDE.md` (invariant 5 is
 this phase's whole subject). Design: `docs/DESIGN.md` §2, §6, §7, §9, §14.
 
@@ -46,7 +46,7 @@ wire. So:
 | 4a | Regions and routing: many `RawNode`s per store, ownership checks, PD v1, the client's cache | **accepted** |
 | 4b | Split: size check, split key, the `Split` admin entry through Raft, epoch bumps | **done** (§12) |
 | 4c | Snapshot transfer and peer movement: the region streamed, `AddPeer`/`RemovePeer` | **done** (§13) |
-| 4d | Balance: leader and region-count operators, `esker-cli region ls/split/transfer-leader` | after 4c |
+| 4d | Balance: leader and region-count operators, `esker-cli region ls/split/transfer-leader` | now (§14) |
 | 4e | PD high availability: three PDs replicated with `esker-raft`, TSO high-water mark through Raft | after 4d |
 
 ## 2. File list (4a, store lane)
@@ -705,3 +705,55 @@ ways only the battery could show, and both are worth reading.
   operators; the scheduler that decides to issue them is the placement-driver lane's.
 * **`RemovePeer` leaves the region's data.** Reclaiming it needs a range delete the engine does not
   have.
+
+## 14. Sub-phase 4d — balance (store half)
+
+Spec: `prompts/04-multiraft-pd.md` 4d. The placement-driver lane builds the schedulers; this lane
+builds what they act on, plus the two things 4a–4c deferred to here.
+
+### 14.1 Units
+
+| # | Unit | Files |
+|---|---|---|
+| 0 | This section | `docs/plans/phase-4.md` |
+| 1 | The driver worker pool: regions pinned to a fixed set of threads | `esker-store/src/driver.rs` (NEW), `peer.rs`, `server.rs` |
+| 2 | `TransferLeader` operator consumption | `esker-store/src/server.rs`, `peer.rs` |
+| 3 | `esker-cli region ls / split / transfer-leader` | `esker-cli/src/region.rs` (NEW), `args.rs`, `main.rs` |
+| 4 | Per-peer `Progress`, read-only, in `esker-raft` (granted) | `esker-raft/src/raw_node.rs` |
+| 5 | The distribution test | `esker-store/tests/balance.rs` (NEW) |
+| 6 | DESIGN §6 and §14, and this section closed | `docs/DESIGN.md`, this plan |
+
+### 14.2 The threading decision, finally taken
+
+`docs/DESIGN.md` §6 said "one apply worker per store (sharded by region id later)"; 4a shipped
+**one driver thread per region** and 4c's plan §11.1 recorded why neither extreme is right. The
+ruling for 4d is the middle: **a fixed pool of driver threads, each region pinned to one of them by
+its id**.
+
+Pinning and not scheduling, and that is the whole of the correctness argument. A region's messages
+all reach one worker through one channel and are handled in the order they arrive, so per-region
+ordering is exactly what it was when the region had a thread to itself — the property `apply_index`
+and the `Ready` contract both rest on. What changes is only that a worker holding several regions
+interleaves *between* them, which nothing depends on: two regions share no state, no batch and no
+apply index.
+
+**By modulo, not by hash.** Region ids come from PD's allocator in order, so `id % workers` spreads
+them exactly evenly; a hash would only add variance. It is also stable across restarts without
+being written down, which matters because a region that moved workers between opens would be a
+region whose ordering guarantee spanned two threads.
+
+What it buys: an `fsync` for one region no longer holds up every other region's consensus, which
+one-worker-per-store would have made worse than the per-region threads it replaced; and fifty
+regions cost four threads rather than fifty.
+
+### 14.3 Test list
+
+| Area | Tests |
+|---|---|
+| pinning | a region is always given to the same worker; the mapping is stable across a restart |
+| concurrency | N regions on a **2**-worker pool make progress at the same time — one region's slow apply does not stop another's |
+| ordering | every region's entries apply in index order under a pool that is interleaving them |
+| shutdown | retiring one region leaves its worker serving the rest; stopping the pool fails everything outstanding |
+| transfer | a `TransferLeader` operator moves leadership; one against a stale epoch is dropped; one naming a peer the region does not have is dropped |
+| cli | `region ls` against a live cluster; `region split` at a chosen key; `region transfer-leader` |
+| distribution | one store, then three: a few hundred MiB at a low split threshold, and regions **and** leaders spread within a bounded time with no region orphaned |
