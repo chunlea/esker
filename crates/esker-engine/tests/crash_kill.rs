@@ -119,6 +119,14 @@ fn the_child_writes_until_it_is_killed() {
         .unwrap_or(OPS);
 
     let mut out = std::io::stdout().lock();
+    // The harness writes `test <name> ... ` with **no trailing newline** before handing over,
+    // so the first thing printed here arrives glued to that prefix. This newline puts the
+    // first `ACK` at the start of a line; the parent no longer depends on it (see
+    // `marker_in`), but a protocol that only works because the reader is forgiving is a
+    // protocol waiting to break.
+    let _ = writeln!(out);
+    let _ = out.flush();
+
     let options = Options {
         create_if_missing: true,
         ..Options::default()
@@ -164,6 +172,40 @@ fn the_child_writes_until_it_is_killed() {
 // The parent
 // ---------------------------------------------------------------------------------------
 
+/// Whatever follows `marker` in `line`, wherever the marker appears.
+///
+/// Anything before it is the harness's own output sharing the line, which is noise.
+fn marker_in<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
+    line.find(marker).map(|at| &line[at + marker.len()..])
+}
+
+/// Why `acks` is not what the child must have produced, if it is not.
+///
+/// The child writes operations in order and acknowledges each one after its write returns,
+/// and a pipe preserves order — so what the parent sees has to be `0, 1, … n-1`: a prefix,
+/// possibly empty, never with a gap and never starting anywhere but zero. A `SIGKILL` can
+/// truncate the tail; nothing can remove the head.
+///
+/// This exists because the head *was* being removed. The harness prints `test <name> ... `
+/// with no trailing newline, so `ACK 0` arrived glued to it and a prefix-stripping reader
+/// never matched — every iteration of this loop, and of the 1,000-iteration acceptance run,
+/// silently discarded the acknowledgement for operation 0. The containment the test asserts
+/// (`acked ⊆ recovered`) meant that made the loop *weaker* rather than red: a lost operation 0
+/// could not fail it, because operation 0 was never claimed to be acknowledged. This check is
+/// what turns that class of hole into a failure.
+fn acks_are_a_contiguous_prefix(acks: &[u32]) -> Option<String> {
+    for (position, op) in acks.iter().enumerate() {
+        let expected = u32::try_from(position).unwrap_or(u32::MAX);
+        if *op != expected {
+            return Some(format!(
+                "acknowledgement {position} is for op {op}, not op {expected}: either the \
+                 parent lost an acknowledgement or the child wrote out of order (saw {acks:?})"
+            ));
+        }
+    }
+    None
+}
+
 /// What one child did before it died.
 #[derive(Debug, Default)]
 struct Report {
@@ -178,6 +220,10 @@ struct Outcome {
     /// Sorted string tables the run left behind, all of which were verified.
     tables: usize,
     acks: usize,
+    /// Whether operation 0 was acknowledged, and therefore verified by `verify`. Counted
+    /// because it was the operation this loop could not see — see
+    /// [`acks_are_a_contiguous_prefix`].
+    acked_op_zero: bool,
 }
 
 /// Runs one child, kills it, and returns what it reported. Never panics: killing and reaping
@@ -207,16 +253,21 @@ fn run_child(dir: &Path, seed: u64) -> (Report, bool) {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
                 let line = line.trim();
-                if let Some(op) = line.strip_prefix("ACK ") {
-                    if let Ok(op) = op.parse::<u32>() {
+                // Markers are searched for, not stripped as a prefix. The harness's own
+                // `test <name> ... ` has no trailing newline, so whatever the child prints
+                // first shares a line with it — and a reader that can only match at column
+                // zero silently drops that acknowledgement. `FAIL` is tested first because it
+                // is the only marker whose text could contain another.
+                if let Some(reason) = marker_in(line, "FAIL ") {
+                    report.lock().unwrap().failure = Some(reason.to_owned());
+                    settled.store(true, Ordering::SeqCst);
+                } else if let Some(op) = marker_in(line, "ACK ") {
+                    if let Ok(op) = op.trim().parse::<u32>() {
                         report.lock().unwrap().acks.push(op);
                     }
-                } else if line == "DONE" {
+                } else if line.contains("DONE") {
                     // The child ran out of work before the signal arrived. Legal, and counted
                     // separately so the loop can insist the kill usually wins the race.
-                    settled.store(true, Ordering::SeqCst);
-                } else if let Some(reason) = line.strip_prefix("FAIL ") {
-                    report.lock().unwrap().failure = Some(reason.to_owned());
                     settled.store(true, Ordering::SeqCst);
                 }
             }
@@ -430,11 +481,22 @@ fn one_iteration(seed: u64) -> Result<Outcome, String> {
         ));
     }
 
+    // Checked before the database is reopened, so a reader that lost an acknowledgement is
+    // reported as that rather than as a mysteriously missing write.
+    if let Some(problem) = acks_are_a_contiguous_prefix(&report.acks) {
+        let kept = dir.keep();
+        return Err(format!(
+            "seed {seed}: {problem} (killed: {killed}, state kept at {})",
+            kept.display()
+        ));
+    }
+
     match verify(dir.path(), seed, &report) {
         Ok(tables) => Ok(Outcome {
             killed,
             tables,
             acks: report.acks.len(),
+            acked_op_zero: report.acks.first() == Some(&0),
         }),
         Err(reason) => {
             // Keep the evidence, and say where it is.
@@ -452,6 +514,7 @@ fn one_iteration(seed: u64) -> Result<Outcome, String> {
 /// Runs `iterations` children and reports what happened.
 fn kill_loop(iterations: u32, first_seed: u64) {
     let (mut killed, mut clean, mut tables, mut acks) = (0u32, 0u32, 0usize, 0usize);
+    let (mut with_acks, mut op_zero) = (0u32, 0u32);
 
     for i in 0..iterations {
         let seed = first_seed + u64::from(i);
@@ -464,6 +527,12 @@ fn kill_loop(iterations: u32, first_seed: u64) {
                 }
                 tables += outcome.tables;
                 acks += outcome.acks;
+                if outcome.acks > 0 {
+                    with_acks += 1;
+                }
+                if outcome.acked_op_zero {
+                    op_zero += 1;
+                }
             }
             Err(reason) => panic!("crash loop failed at iteration {i}: {reason}"),
         }
@@ -471,7 +540,8 @@ fn kill_loop(iterations: u32, first_seed: u64) {
 
     println!(
         "kill loop: {iterations} iterations, {killed} died to SIGKILL, {clean} finished first, \
-         {acks} acknowledged writes verified, {tables} sorted string tables scanned"
+         {acks} acknowledged writes verified, op 0 among them in {op_zero} of the {with_acks} \
+         runs that acknowledged anything, {tables} sorted string tables scanned"
     );
 
     // A loop where the signal always lost the race would be a loop that never tested a crash.
@@ -483,6 +553,16 @@ fn kill_loop(iterations: u32, first_seed: u64) {
     assert!(
         acks > usize::try_from(iterations).unwrap_or(0),
         "only {acks} writes were acknowledged across {iterations} iterations"
+    );
+    // The child always attempts operation 0 first and the parent waits for at least one
+    // acknowledgement before killing, so every run that acknowledged anything acknowledged
+    // op 0. Asserting equality rather than "more than none" is the point: with the
+    // prefix-stripping reader this file used to have, `op_zero` was **zero** on every run
+    // while `with_acks` was essentially `iterations`, and nothing failed.
+    assert_eq!(
+        op_zero, with_acks,
+        "{with_acks} runs acknowledged writes but only {op_zero} of them acknowledged op 0; \
+         the first acknowledgement of a run is being lost before it is verified"
     );
 }
 
