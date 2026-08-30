@@ -300,10 +300,24 @@ Regions cover the whole key space contiguously; the first region is `["", "")`.
   reach fifty. One worker per store — what this line said before 4a — is not the fix either, because then
   one region's `fsync` blocks every other region's consensus; the shape to measure in 4d is a **pool
   sharded by region id**, sized independently of the region count, as TiKV's store and apply pools are.
-- **Split** *(phase 4 — not yet implemented)*: triggered by a periodic size check (region > 96 MiB *default*, or by an explicit admin
-  command). Leader asks PD for new ids, proposes `Split{split_key, new_region_id, new_peer_ids}`; on
-  apply both halves are created on every peer with the same membership; the new region's Raft group starts
-  with the parent's peers. Merge is post-v1.
+- **Split:** triggered by a periodic size check on the **leader** (region > 96 MiB *default*;
+  `TODO(phase-4d)` an explicit admin command as well). The leader picks a boundary from the region's own
+  data ([ADR 0012](adr/0012-split-key-selection.md) — the engine exposes no per-range key sample, so it is
+  a bounded sampling scan), asks PD for one id per new region plus one per peer, and proposes
+  `Split{split_key, new_region_id, new_peer_ids}` through its own group. On apply, **on every peer**: the
+  parent shrinks to `[start, split_key)` and the child takes `[split_key, end)` with fresh peer ids on the
+  *same stores*, both halves' `version` bumps, and both `'m'` records go into the **same batch as
+  `apply_index`** — so a crash has both or neither. The child's log starts at index 0 and its group elects
+  from scratch; its `conf_state` is the split-time membership, which for a log beginning at index 0 is
+  exactly what `InitialState::conf_state` means. Merge is post-v1.
+  - **A write the split overtook is refused at apply, not at propose.** A command ordered after the
+    `Split` entry is checked against the parent's *narrowed* range and answered `EpochNotMatch` — the
+    proposer routed correctly and the region moved under it, so the refusal is retryable and its hint is
+    what the retry routes from. `KeyNotInRegion` would be terminal, and would fail a write that one
+    refresh completes. Every peer's range at a given entry is the product of the same log prefix, so the
+    refusal is deterministic, which is the only kind apply may make.
+  - **Replay is idempotent by the range.** After the split, `split_key` is no longer strictly inside the
+    parent, so a re-applied entry does nothing. There is no marker to write and nothing to keep in step.
 - **Snapshots** *(phase 4 — TODO(phase-4) markers in raft_log.rs/peer.rs)*: `engine.checkpoint(range)` → SSTs + metadata, streamed as `Stream` frames in 1 MiB
   chunks with checksums; receiver `ingest()`s into place then applies the Raft snapshot metadata.
 - **Transport:** one TCP connection per (store, store) pair carrying `RaftTransport::Batch` frames with

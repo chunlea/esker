@@ -1,6 +1,6 @@
 # Phase 4 plan — many regions, and the driver that places them
 
-Status: **in progress** — 4a accepted, 4b open, 4c–4e gated. Written before implementation; §9 records progress
+Status: **in progress** — 4a accepted, 4b done, 4c–4e gated. Written before implementation; §9 records progress
 and §10 what changed. Spec: `prompts/04-multiraft-pd.md`. Constitution: `CLAUDE.md` (invariant 5 is
 this phase's whole subject). Design: `docs/DESIGN.md` §2, §6, §7, §9, §14.
 
@@ -44,7 +44,7 @@ wire. So:
 | # | Sub-phase | Opens |
 |---|---|---|
 | 4a | Regions and routing: many `RawNode`s per store, ownership checks, PD v1, the client's cache | **accepted** |
-| 4b | Split: size check, split key, the `Split` admin entry through Raft, epoch bumps | now (§12) |
+| 4b | Split: size check, split key, the `Split` admin entry through Raft, epoch bumps | **done** (§12) |
 | 4c | Snapshot transfer and peer movement: `checkpoint(range)` streamed, `AddPeer`/`RemovePeer`, replica repair | after 4b |
 | 4d | Balance: leader and region-count operators, `esker-cli region ls/split/transfer-leader` | after 4c |
 | 4e | PD high availability: three PDs replicated with `esker-raft`, TSO high-water mark through Raft | after 4d |
@@ -357,15 +357,15 @@ built and could not make fail can now fail, which is the point.
 
 ### 12.1 Units (one commit each)
 
-| # | Unit | Files |
+| # | Unit | Commit |
 |---|---|---|
-| 0 | This section | `docs/plans/phase-4.md` |
-| 1 | Approximate region size, and the leader's periodic check | `esker-store/src/peer.rs`, `split.rs` (NEW) |
-| 2 | Split-key selection, and ADR 0012 | `esker-store/src/split.rs`, `docs/adr/0012-*.md` |
-| 3 | The `Split` command: proposed by the leader, applied on every peer | `esker-store/src/apply.rs`, `peer.rs`, `regions.rs`, `server.rs` |
-| 4 | Routing after a split: heartbeat on change, both halves in `EpochNotMatch` | falls out of 4a; asserted in unit 5 |
-| 5 | The test battery | `esker-store/tests/split.rs` (NEW), `tests/multi_region.rs` |
-| 6 | DESIGN §6's Split bullet, and this section closed | `docs/DESIGN.md`, this plan |
+| 0 | This section | `6b6b608` |
+| 1 | Approximate region size, published beside `term` and `applied_index` | `0eba75d` |
+| 2 | Split-key selection, and its ADR (renumbered to 0012 in `0f846b8`) | `6c07bcb` |
+| 3 | The `Split` command: proposed by the leader, applied on every peer | `5ca3ea1` |
+| 4 | Routing after a split | fell out of 4a, as expected; asserted in unit 5 |
+| 5 | The test battery | `2ec192f`, `d080cfb` |
+| 6 | DESIGN §6's Split bullet, and this section closed | *(this commit)* |
 
 ### 12.2 The six decisions worth writing down before the code
 
@@ -456,3 +456,47 @@ wants the same number for a different reason.
 - **Balance operators and `esker-cli region`.** 4d.
 - **The simulator's split coverage** — 50 regions, random splits, 100,000 events per seed. That is
   phase-4 acceptance and belongs to the sim lane; these tests are store-level.
+
+### 12.6 What 4b changed against §12.2
+
+Six decisions were written down before the code; five held. The two entries below are what the
+tests found, and both were found by the tests rather than by review — which is the argument for
+writing the battery before believing the design.
+
+1. **The apply-time refusal is `EpochNotMatch`, not `KeyNotInRegion`.** §12.2 said the proposer
+   "fails with `EpochNotMatch`" and the code answered `KeyNotInRegion`, which is **terminal**. A
+   write the split overtook would have failed its caller outright, when the caller had routed
+   correctly and the region had simply moved underneath it. The hint carries only the narrowed
+   parent, because the driver knows only its own region; the client evicts the stale entry, the key
+   then misses, and one `GetRegion` finds the other half. One extra round trip on a race that
+   happens once per split rather than once per request. The *request path* still answers
+   `KeyNotInRegion`, because there the epoch matched and the range is what the epoch says it is.
+
+2. **The parent's size hint is halved when it splits.** Nothing in §12.2 said what happens to the
+   counter, and the answer turned out to matter: the hint counts bytes *applied*, and a split
+   applies nothing it can subtract, so the parent stayed over the threshold and tried to split
+   again on every tick until it ran out of boundaries. Halving is the honest approximation — the
+   parent gave away roughly half its keys — and it is a hint, so approximate is what it is for.
+
+Two smaller things worth recording:
+
+3. **`MIN_SAMPLED_KEYS`.** The sampling scan halves its sample whenever it fills, so a cap of two
+   collapses to the region's own first key and stays there — the one place a boundary must not be.
+   A floor of 8 turns a bad configuration into a poor sample rather than a broken split.
+
+4. **A boundary is never the first sample.** A region needs two keys before it has a middle;
+   otherwise the left half holds nothing. `midpoint` starts its search at index 1, and a region
+   with fewer than two keys is not split at all — which is not an error, just a region that is
+   large because of one large value.
+
+### 12.7 Still open after 4b
+
+* **The size hint is per-peer and lost on restart** (§12.3). A leader that has just restarted will
+  not split until it has re-applied a threshold's worth of writes. The fix is the engine accessor
+  §12.3 asks for, not more bookkeeping here.
+* **`esker-cli region split`** — an operator-triggered split. 4d, with the rest of the `region`
+  subcommand.
+* **Splits across a real three-store cluster.** `tests/split.rs` replicates with one peer, which
+  exercises the log, the apply and the batching but not the network. `tests/cluster.rs` covers the
+  network for phase-3's single region; the multi-store split belongs to the phase-4 simulator's
+  battery, which is the acceptance lane's.
