@@ -26,6 +26,7 @@ fn node(id: u64, term: u64, commit: u64, log: &[EntryDigest]) -> NodeSnapshot<'_
         term,
         commit,
         compacted_through: 0,
+        snapshot_term: 0,
         prefix_anchor: 0,
         settled: true,
         log,
@@ -285,6 +286,7 @@ fn a_compacted_log_still_matches_an_uncompacted_one() {
         .expect("index 1 term 1 should be recorded");
     let compacted = NodeSnapshot {
         compacted_through: 1,
+        snapshot_term: 1,
         prefix_anchor: anchor,
         log: &full[1..],
         ..node(2, 2, 3, &full[1..])
@@ -296,6 +298,7 @@ fn a_compacted_log_still_matches_an_uncompacted_one() {
     // ...and a wrong anchor — a snapshot that does not describe the prefix it claims — does not.
     let lying = NodeSnapshot {
         compacted_through: 1,
+        snapshot_term: 1,
         prefix_anchor: anchor ^ 1,
         log: &full[1..],
         ..node(3, 2, 3, &full[1..])

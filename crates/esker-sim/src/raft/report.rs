@@ -79,6 +79,37 @@ pub enum Event {
         /// Whether they went out before the write that should have preceded them.
         early: bool,
     },
+    /// A `Ready` was thrown away without being discharged — the driver bug this harness has a
+    /// switch for, so the rule that forbids it can be shown red.
+    Discarded {
+        /// Which node's `Ready`.
+        node: RaftId,
+        /// How many messages went with it.
+        messages: usize,
+    },
+    /// A node answered a `ReadIndex`.
+    Read {
+        /// Which node.
+        node: RaftId,
+        /// The index the read may be served at.
+        index: Index,
+    },
+    /// A node adopted a leader's snapshot.
+    Installed {
+        /// Which node.
+        node: RaftId,
+        /// The index the snapshot covers.
+        through: Index,
+        /// The term at that index.
+        term: Term,
+    },
+    /// A node folded applied entries into its snapshot and deleted them.
+    Compact {
+        /// Which node.
+        node: RaftId,
+        /// The new compaction boundary.
+        through: Index,
+    },
     /// A node's state machine consumed entries.
     Apply {
         /// Which node.
@@ -150,6 +181,27 @@ impl fmt::Display for Event {
                 "send     n{node}  {messages} messages{}",
                 if *early { "  BEFORE PERSISTING" } else { "" }
             ),
+            Event::Installed {
+                node,
+                through,
+                term,
+            } => write!(
+                formatter,
+                "SNAPSHOT n{node}  installed through {through} (term {term})"
+            ),
+            Event::Read { node, index } => {
+                write!(formatter, "read     n{node}  answered at index {index}")
+            }
+            Event::Discarded { node, messages } => write!(
+                formatter,
+                "DISCARD  n{node}  a taken Ready thrown away, {messages} messages lost with it"
+            ),
+            Event::Compact { node, through } => {
+                write!(
+                    formatter,
+                    "compact  n{node}  log now starts after {through}"
+                )
+            }
             Event::Apply { node, upto } => write!(formatter, "apply    n{node}  through {upto}"),
             Event::Lead { node, term } => write!(formatter, "LEADER   n{node} of term {term}"),
             Event::Rejected { node, reason } => {
@@ -244,4 +296,24 @@ pub struct Stats {
     pub committed: Index,
     /// The highest index any state machine has applied.
     pub applied: Index,
+    /// `Ready`s taken from a core. Each one must be discharged or die with its node: a
+    /// `Ready`'s messages are *taken*, not re-offered, so a driver that inspects one and throws
+    /// it away silently loses them (`docs/plans/phase-3.md` §10.2).
+    pub readys_taken: u64,
+    /// `Ready`s fully discharged: persisted, sent, applied, advanced.
+    pub readys_discharged: u64,
+    /// `Ready`s that died with the node holding them. That is not a lost `Ready` — the process
+    /// that would have sent the messages no longer exists.
+    pub readys_lost_to_crash: u64,
+    /// Messages delivered a second or later time, because the plan duplicated them.
+    pub duplicate_deliveries: u64,
+    /// Deliveries carrying a non-empty `context` — the field `ReadIndex` rides on, which the
+    /// fault model has to carry verbatim through a duplicate or a reorder.
+    pub contexts_delivered: u64,
+    /// `ReadIndex` requests answered.
+    pub reads_served: u64,
+    /// Snapshots a follower adopted from a leader.
+    pub snapshots_installed: u64,
+    /// Times a node folded applied entries into its snapshot.
+    pub compactions: u64,
 }

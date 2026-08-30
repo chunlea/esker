@@ -25,7 +25,7 @@
 //! one bug the whole exercise is about, and `tests/raft_persist_order.rs` uses it to prove the
 //! checkers catch it. A checker that has never been shown red is decoration.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use bytes::Bytes;
 use esker_base::hash::{hash64, hash64_with_seed};
@@ -35,7 +35,7 @@ use esker_raft::{Config, Index, Message, NodeId as RaftId, RawNode, Role, TICK_M
 use crate::fault::FaultPlan;
 use crate::net::{NodeId as WireId, SimNetwork};
 
-use super::checkers::{NodeSnapshot, SafetyChecker};
+use super::checkers::{NodeSnapshot, SafetyChecker, Violation};
 use super::driver::{DiskWrite, NodeSlot, PersistedStorage};
 use super::report::{Event, Failure, Settled, Stats};
 
@@ -71,7 +71,18 @@ pub struct Cluster {
     messages: BTreeMap<u64, Message>,
     next_token: u64,
     proposal_counter: u64,
+    /// The highest commit index any node has reported at any point. A read index above it would
+    /// point past everything the cluster has agreed on.
+    commit_high_water: Index,
     violate_persist_order: bool,
+    /// Throws away the next `Ready` a node takes instead of discharging it. Used by one test to
+    /// show that the driver rule below is actually enforced.
+    discard_taken_ready: bool,
+    /// The `context` each message went out with, so a duplicate or a reordered copy can be
+    /// checked against what was sent rather than assumed identical.
+    contexts: BTreeMap<u64, Bytes>,
+    /// Tokens already delivered once.
+    seen: BTreeSet<u64>,
     stats: Stats,
 }
 
@@ -93,7 +104,11 @@ impl Cluster {
             messages: BTreeMap::new(),
             next_token: 0,
             proposal_counter: 0,
+            commit_high_water: 0,
             violate_persist_order: false,
+            discard_taken_ready: false,
+            contexts: BTreeMap::new(),
+            seen: BTreeSet::new(),
             stats: Stats::default(),
         };
         for id in ids {
@@ -108,6 +123,16 @@ impl Cluster {
     /// the checkers go red.
     pub fn violate_persist_order(&mut self, on: bool) {
         self.violate_persist_order = on;
+    }
+
+    /// Throws away every `Ready` a node takes, instead of discharging it.
+    ///
+    /// `docs/plans/phase-3.md` §10.2: a `Ready`'s *state* is re-offered but its *messages* are
+    /// moved out, so a driver that takes one and drops it loses them. The rule is that a taken
+    /// `Ready` is discharged or dies with its node, and [`Cluster::check`] enforces it. This
+    /// switch exists so the enforcement can be shown red.
+    pub fn discard_taken_ready(&mut self, on: bool) {
+        self.discard_taken_ready = on;
     }
 
     /// The seed this run came from.
@@ -210,6 +235,20 @@ impl Cluster {
     pub fn calm(&mut self, plan: FaultPlan) {
         self.plan = plan.clone();
         self.net.set_plan(plan);
+    }
+
+    /// Cuts `side` off from every node that is not in it, replacing any partition in place.
+    ///
+    /// The random `Partition` action draws its own split; this is for a scenario that wants a
+    /// particular one — "the follower that is about to be left behind is *this* one".
+    pub fn partition(&mut self, side: &[RaftId]) {
+        let wire: Vec<WireId> = side.iter().map(|id| WireId(*id)).collect();
+        self.net.heal();
+        self.net.partition(&wire);
+        self.stats.partitions += 1;
+        self.record(Event::Partition {
+            side: side.to_vec(),
+        });
     }
 
     /// Runs `events` events, checking every property after each one.
@@ -360,6 +399,21 @@ impl Cluster {
         accepted
     }
 
+    /// Asks `node` for a read index: the index a linearizable read may be served at, once the
+    /// state machine has applied it (`docs/DESIGN.md` §5).
+    ///
+    /// The answer comes back later, in a `Ready`'s read states, carrying `ctx` — and that
+    /// context rides on `AppendEntries`, which is why the fault model has to carry it verbatim.
+    pub fn read_index_on(&mut self, node: RaftId, ctx: Bytes) {
+        if let Some(raw) = self
+            .nodes
+            .get_mut(&node)
+            .and_then(|slot| slot.node.as_mut())
+        {
+            raw.read_index(ctx);
+        }
+    }
+
     /// A fresh, recognisable payload.
     pub fn next_proposal(&mut self) -> Bytes {
         self.proposal_counter += 1;
@@ -404,6 +458,13 @@ impl Cluster {
         }
         match choice {
             0..=5 if self.deliver_next()? => Ok(()),
+            8 => {
+                if let Some(id) = self.pick(who, true) {
+                    let ctx = self.next_proposal();
+                    self.read_index_on(id, ctx);
+                }
+                Ok(())
+            }
             9 => {
                 if let Some(id) = self.pick(who, true) {
                     let payload = self.next_proposal();
@@ -455,6 +516,10 @@ impl Cluster {
 
     fn crash(&mut self, id: RaftId) {
         if let Some(slot) = self.nodes.get_mut(&id) {
+            if slot.pending.is_some() {
+                // Not a dropped `Ready`: the process that would have sent its messages is gone.
+                self.stats.readys_lost_to_crash += 1;
+            }
             slot.crash();
         }
         self.stats.crashes += 1;
@@ -526,6 +591,21 @@ impl Cluster {
         let term = message.term();
         let from = message.sender();
         self.stats.delivered += 1;
+        if !self.seen.insert(token) {
+            self.stats.duplicate_deliveries += 1;
+        }
+        // `ReadIndex` rides on `AppendEntries`'s context (`docs/plans/phase-3.md` §10.3), so the
+        // fault model has to carry it verbatim — a duplicate is the *same* message, not a
+        // rebuilt one. The network is byte-opaque and carries a token, so nothing can rewrite a
+        // field; this is what would notice if that ever stopped being true.
+        if let Some(sent) = self.contexts.get(&token) {
+            self.stats.contexts_delivered += 1;
+            if context_of(&message).as_ref() != Some(sent) {
+                return Err(self.driver_error(format!(
+                    "message {token} ({kind}) arrived with a different context than it was sent                      with"
+                )));
+            }
+        }
 
         let mut rejected = None;
         let lost = match self
@@ -603,10 +683,19 @@ impl Cluster {
     fn complete_write(&mut self, id: RaftId) -> Result<bool, Failure> {
         let mut outgoing: Vec<Message> = Vec::new();
         let mut events: Vec<Event> = Vec::new();
+        let compact_after = self.plan.compact_after;
+        let (mut installed, mut compacted) = (false, false);
+        let mut reads: Vec<Index> = Vec::new();
 
         let Some(slot) = self.nodes.get_mut(&id) else {
             return Ok(false);
         };
+        // The `Ready` is taken out only once it is certain to be discharged. Taking it first and
+        // bailing out on the next guard would drop it, and a dropped `Ready` loses its messages
+        // for good (`docs/plans/phase-3.md` §10.2).
+        if slot.node.is_none() {
+            return Ok(false);
+        }
         let Some(write) = slot.pending.take() else {
             return Ok(false);
         };
@@ -635,7 +724,17 @@ impl Cluster {
             });
         }
 
-        // 3. Apply, in order.
+        // 3. A snapshot the write installed is state the machine now holds without having
+        //    applied it entry by entry; then apply whatever is left, in order.
+        if let Some(snapshot) = &write.ready.snapshot {
+            slot.install_snapshot(snapshot.meta.index);
+            events.push(Event::Installed {
+                node: id,
+                through: snapshot.meta.index,
+                term: snapshot.meta.term,
+            });
+            installed = true;
+        }
         if !write.ready.committed_entries.is_empty() {
             slot.apply(&write.ready.committed_entries);
             events.push(Event::Apply {
@@ -644,12 +743,58 @@ impl Cluster {
             });
         }
 
+        // A read index may be ahead of *this* node's commit index — a follower's read index is
+        // the leader's — but never ahead of everything the cluster has committed.
+        for read in &write.ready.read_states {
+            reads.push(read.index);
+            events.push(Event::Read {
+                node: id,
+                index: read.index,
+            });
+        }
+
         // 4. Tell the core it may move on.
         if let Some(node) = slot.node.as_mut() {
             node.advance(&write.ready);
         }
+
+        // 5. The store's own housekeeping: fold applied entries into the snapshot so the log
+        //    does not grow without bound. This is what makes `InstallSnapshot` reachable — a
+        //    follower that fell behind the compaction boundary cannot be repaired by an append,
+        //    because the entries it needs no longer exist.
+        if compact_after > 0
+            && let Some(through) = compaction_point(slot, compact_after)
+            && let Some(node) = slot.node.as_mut()
+            && node.storage_mut().compact(through).is_ok()
+        {
+            compacted = true;
+            events.push(Event::Compact { node: id, through });
+        }
         slot.refresh();
 
+        let high_water = self.commit_high_water();
+        for index in reads {
+            self.stats.reads_served += 1;
+            if index > high_water {
+                return Err(Failure::Safety {
+                    seed: self.seed,
+                    event: self.event,
+                    violation: Violation::ReadIndexBeyondCommit {
+                        node: id,
+                        index,
+                        high_water,
+                    },
+                    trace: self.trace_report(),
+                });
+            }
+        }
+        self.stats.readys_discharged += 1;
+        if installed {
+            self.stats.snapshots_installed += 1;
+        }
+        if compacted {
+            self.stats.compactions += 1;
+        }
         self.emit(outgoing);
         for event in events {
             self.record(event);
@@ -678,8 +823,10 @@ impl Cluster {
             0
         };
         let violate = self.violate_persist_order;
+        let discard = self.discard_taken_ready;
         let mut outgoing: Vec<Message> = Vec::new();
         let mut events: Vec<Event> = Vec::new();
+        let taken;
 
         let (leads, term) = {
             let Some(slot) = self.nodes.get_mut(&id) else {
@@ -691,25 +838,38 @@ impl Cluster {
             let ready = node.ready();
             let leads = node.role() == Role::Leader;
             let term = node.term();
+            taken = true;
 
-            if violate && !ready.messages.is_empty() {
-                outgoing.extend(ready.messages.iter().cloned());
-                events.push(Event::Emit {
+            if discard {
+                // The bug the rule forbids: the `Ready` goes out of scope here, and its
+                // messages — which `ready()` moved out of the core — go with it.
+                events.push(Event::Discarded {
                     node: id,
                     messages: ready.messages.len(),
-                    early: true,
                 });
+            } else {
+                if violate && !ready.messages.is_empty() {
+                    outgoing.extend(ready.messages.iter().cloned());
+                    events.push(Event::Emit {
+                        node: id,
+                        messages: ready.messages.len(),
+                        early: true,
+                    });
+                }
+                slot.pending = Some(DiskWrite {
+                    ready,
+                    due: self.event + held,
+                    held,
+                    sent_early: violate,
+                });
+                slot.refresh();
             }
-            slot.pending = Some(DiskWrite {
-                ready,
-                due: self.event + held,
-                held,
-                sent_early: violate,
-            });
-            slot.refresh();
             (leads, term)
         };
 
+        if taken {
+            self.stats.readys_taken += 1;
+        }
         if held > 0 {
             self.stats.slow_writes += 1;
         }
@@ -730,6 +890,11 @@ impl Cluster {
             let (from, to) = (message.sender(), message.recipient());
             let token = self.next_token;
             self.next_token += 1;
+            if let Some(context) = context_of(&message)
+                && !context.is_empty()
+            {
+                self.contexts.insert(token, context);
+            }
             self.messages.insert(token, message);
             let _ = self.net.send(
                 WireId(from),
@@ -742,8 +907,42 @@ impl Cluster {
 
     // --- checking ------------------------------------------------------------------------
 
+    /// The highest commit index any node has reported, refreshed from what they hold now.
+    /// Monotonic: a node whose commit index goes backwards across a restart — which is legal,
+    /// a `HardState` that was never fsynced is gone — does not lower the mark.
+    fn commit_high_water(&mut self) -> Index {
+        let now = self.nodes.values().map(NodeSlot::commit).max().unwrap_or(0);
+        self.commit_high_water = self.commit_high_water.max(now);
+        self.commit_high_water
+    }
+
+    /// The driver rule: a `Ready` that has been taken is discharged, is still on its way to the
+    /// disk, or died with the node that took it. Nothing else.
+    ///
+    /// `docs/plans/phase-3.md` §10.2: `ready()` *moves* the messages out of the core, so a
+    /// driver that takes a `Ready` and drops it loses them — silently, because the state will
+    /// be offered again and the log will look fine. This is the arithmetic that catches it.
+    fn check_driver_rule(&self) -> Result<(), Failure> {
+        let outstanding = self
+            .nodes
+            .values()
+            .filter(|slot| slot.pending.is_some())
+            .count() as u64;
+        let accounted =
+            self.stats.readys_discharged + self.stats.readys_lost_to_crash + outstanding;
+        if accounted == self.stats.readys_taken {
+            return Ok(());
+        }
+        Err(self.driver_error(format!(
+            "{} Ready(s) were taken but only {accounted} are accounted for              ({} discharged, {} lost with a crashed node, {outstanding} still on a disk) —              a taken Ready was dropped, and its messages went with it",
+            self.stats.readys_taken, self.stats.readys_discharged, self.stats.readys_lost_to_crash,
+        )))
+    }
+
     /// Checks all four properties over every node, dead ones included.
     fn check(&mut self) -> Result<(), Failure> {
+        self.commit_high_water();
+        self.check_driver_rule()?;
         let anchors: Vec<u64> = self
             .nodes
             .values()
@@ -751,8 +950,10 @@ impl Cluster {
                 if slot.compacted_through == 0 {
                     0
                 } else {
+                    // The anchor goes with the entry the snapshot ends at, whose term the
+                    // metadata carries — not with whatever term the node happens to be in now.
                     self.checker
-                        .prefix_digest(slot.compacted_through, slot.term())
+                        .prefix_digest(slot.compacted_through, slot.snapshot_term)
                         .unwrap_or(0)
                 }
             })
@@ -770,6 +971,7 @@ impl Cluster {
                     term: slot.term(),
                     commit: slot.commit(),
                     compacted_through: slot.compacted_through,
+                    snapshot_term: slot.snapshot_term,
                     prefix_anchor,
                     settled: slot.settled(),
                     log: &slot.log,
@@ -850,6 +1052,26 @@ impl Cluster {
             trace: self.trace_report(),
         }
     }
+}
+
+/// The `context` a message carries, if its kind has one.
+fn context_of(message: &Message) -> Option<Bytes> {
+    match message {
+        Message::AppendEntries { context, .. } | Message::AppendEntriesResponse { context, .. } => {
+            Some(context.clone())
+        }
+        _ => None,
+    }
+}
+
+/// The index a node should compact to, or `None` if it should not.
+///
+/// Only entries the state machine has applied may be folded away, and `keep` of them are always
+/// left behind: a leader whose log is nothing but a snapshot has no `prev_log_term` to offer a
+/// follower that is one entry behind, and would send a whole snapshot where an append would do.
+fn compaction_point(slot: &NodeSlot, keep: u64) -> Option<Index> {
+    let first = slot.compacted_through + 1;
+    (slot.applied_index >= first + keep).then(|| slot.applied_index - keep)
 }
 
 /// The token a payload carries, or `None` if the network handed back something else.

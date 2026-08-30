@@ -81,6 +81,11 @@ pub struct NodeSnapshot<'a> {
     /// The last index covered by an installed snapshot; entries at or below it are absent from
     /// [`NodeSnapshot::log`] but are still present in the node's state.
     pub compacted_through: Index,
+    /// The term the snapshot's metadata claims for the entry at
+    /// [`NodeSnapshot::compacted_through`]. A snapshot that disagrees with what was committed
+    /// there is a violation in its own right: it is the one part of a node's state the log
+    /// cannot be checked against, so its metadata is.
+    pub snapshot_term: Term,
     /// The prefix digest at [`NodeSnapshot::compacted_through`] — `0` for a log that has never
     /// been compacted. A driver that compacts carries the digest forward; a driver that
     /// installs a snapshot sent by a leader seeds it from
@@ -216,6 +221,40 @@ pub enum Violation {
         /// The index it applied next.
         got: Index,
     },
+    /// A snapshot claims a term that disagrees with what was committed at that index.
+    #[error(
+        "snapshot metadata: node {node} has a snapshot through index {index} claiming term \
+         {claimed}, but term {committed} was committed there"
+    )]
+    SnapshotMismatch {
+        /// The node.
+        node: NodeId,
+        /// The snapshot's last index.
+        index: Index,
+        /// What the metadata says.
+        claimed: Term,
+        /// What was committed.
+        committed: Term,
+    },
+    /// A `ReadIndex` was answered with an index no node has ever committed.
+    ///
+    /// Note what this does *not* say. A follower's read index is the *leader's* commit index,
+    /// so it is routinely ahead of the follower's own — that is the whole point, and it is why
+    /// the driver contract says to answer a read only once the state machine has applied the
+    /// index. What must never happen is a read index beyond anything the cluster committed at
+    /// all: a read served there would return state no quorum agreed on.
+    #[error(
+        "read index: node {node} answered a ReadIndex with index {index}, but no node has \
+         committed past {high_water}"
+    )]
+    ReadIndexBeyondCommit {
+        /// The node that answered.
+        node: NodeId,
+        /// The index it answered with.
+        index: Index,
+        /// The highest commit index any node has reported, at any point in the run.
+        high_water: Index,
+    },
     /// A node reported a log that is not a contiguous ascending run.
     #[error("malformed log: node {node} has index {got} where index {expected} was due")]
     MalformedLog {
@@ -312,6 +351,7 @@ impl SafetyChecker {
             self.check_election_safety(node)?;
             self.check_log_matching(node)?;
             self.record_committed(node)?;
+            self.check_snapshot(node)?;
             self.check_state_machine_safety(node)?;
         }
         // Leader completeness is checked last: it reads the committed record that this round's
@@ -510,6 +550,25 @@ impl SafetyChecker {
         Ok(())
     }
 
+    /// A snapshot's metadata is the only claim about a node's state that no log can be
+    /// compared against, so it is compared against the committed record instead.
+    fn check_snapshot(&mut self, node: &NodeSnapshot<'_>) -> Result<(), Violation> {
+        if node.compacted_through == 0 {
+            return Ok(());
+        }
+        match self.committed.get(&node.compacted_through) {
+            Some(record) if record.entry.term != node.snapshot_term => {
+                Err(Violation::SnapshotMismatch {
+                    node: node.id,
+                    index: node.compacted_through,
+                    claimed: node.snapshot_term,
+                    committed: record.entry.term,
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn check_state_machine_safety(&mut self, node: &NodeSnapshot<'_>) -> Result<(), Violation> {
         let memo = self.memo.entry(node.id).or_default();
         if node.applied.len() < memo.applied_checked {
@@ -523,7 +582,11 @@ impl SafetyChecker {
 
         let mut last_applied = memo.last_applied;
         for entry in &node.applied[start..] {
-            if entry.index != last_applied + 1 && last_applied != 0 {
+            // A gap is a bug unless a snapshot covers it: a node that installs one adopts
+            // everything at or below its index without applying the entries one by one.
+            let covered =
+                entry.index > last_applied + 1 && node.compacted_through + 1 >= entry.index;
+            if entry.index != last_applied + 1 && last_applied != 0 && !covered {
                 return Err(Violation::ApplyOutOfOrder {
                     node: node.id,
                     previous: last_applied,

@@ -49,6 +49,13 @@ pub struct FaultPlan {
     pub slow_disk: f64,
     /// The largest number of events a slow write is held for.
     pub slow_disk_events: u64,
+    /// How many applied entries a node keeps before compacting its log into a snapshot; `0`
+    /// never compacts.
+    ///
+    /// This is what makes `InstallSnapshot` reachable: a follower that was partitioned away
+    /// while the leader compacted past it cannot be repaired by `AppendEntries`, because the
+    /// entries it needs are gone.
+    pub compact_after: u64,
 }
 
 impl FaultPlan {
@@ -69,6 +76,7 @@ impl FaultPlan {
             restart: 0.0,
             slow_disk: 0.0,
             slow_disk_events: 0,
+            compact_after: 0,
         }
     }
 
@@ -128,6 +136,17 @@ impl FaultPlan {
             slow_disk: 0.25,
             slow_disk_events: 16,
             ..Self::lossless()
+        }
+    }
+
+    /// Everything [`FaultPlan::chaotic`] does, plus a leader that compacts aggressively — so a
+    /// follower that comes back from a partition finds the entries it needs are gone and has to
+    /// be repaired with a snapshot (`prompts/03-raft.md` 3d).
+    #[must_use]
+    pub fn compacting() -> Self {
+        Self {
+            compact_after: 4,
+            ..Self::chaotic()
         }
     }
 

@@ -31,6 +31,7 @@ pub struct PersistedStorage {
     durable: MemStorage,
     writes: u64,
     entries_written: u64,
+    compactions: u64,
 }
 
 impl PersistedStorage {
@@ -75,6 +76,24 @@ impl PersistedStorage {
         }
         self.writes += 1;
         Ok(())
+    }
+
+    /// Discards log entries at or below `to_index`, which the state machine has applied and a
+    /// snapshot now covers.
+    ///
+    /// This is the store's compaction, modelled as durable the moment it happens: a real store
+    /// deletes the entries only after the snapshot they are folded into is on disk, so a crash
+    /// either finds the entries or finds the snapshot, never neither.
+    pub fn compact(&mut self, to_index: Index) -> RaftResult<()> {
+        self.durable.compact(to_index)?;
+        self.compactions += 1;
+        Ok(())
+    }
+
+    /// How many times the log has been compacted.
+    #[must_use]
+    pub fn compactions(&self) -> u64 {
+        self.compactions
     }
 
     /// How many `Ready`s have been made durable.
@@ -159,6 +178,8 @@ pub struct NodeSlot {
     pub restarts: u64,
     /// The last index its snapshot covers.
     pub compacted_through: Index,
+    /// The term of the entry at [`NodeSlot::compacted_through`], from the snapshot's metadata.
+    pub snapshot_term: Term,
 }
 
 impl NodeSlot {
@@ -174,6 +195,7 @@ impl NodeSlot {
             log: Vec::new(),
             restarts: 0,
             compacted_through: 0,
+            snapshot_term: 0,
         };
         slot.refresh();
         slot
@@ -258,6 +280,15 @@ impl NodeSlot {
         self.refresh();
     }
 
+    /// Records that the state machine adopted a snapshot: everything at or below
+    /// `through` is now in its state, however it got there.
+    ///
+    /// The entries it already applied stay in [`NodeSlot::applied`] — they are still what it
+    /// did — and the checker allows the gap the snapshot covers.
+    pub fn install_snapshot(&mut self, through: Index) {
+        self.applied_index = self.applied_index.max(through);
+    }
+
     /// Records that the state machine consumed `entries`.
     pub fn apply(&mut self, entries: &[Entry]) {
         for entry in entries {
@@ -285,11 +316,16 @@ impl NodeSlot {
         };
         let Some(storage) = storage else {
             self.compacted_through = 0;
+            self.snapshot_term = 0;
             return;
         };
         let first = storage.first_index().unwrap_or(1);
         let last = storage.last_index().unwrap_or(0);
         self.compacted_through = first.saturating_sub(1);
+        self.snapshot_term = storage
+            .snapshot()
+            .map(|snapshot| snapshot.meta.term)
+            .unwrap_or_default();
         if last >= first
             && let Ok(entries) = storage.entries(first, last + 1, u64::MAX)
         {

@@ -21,6 +21,11 @@ use esker_sim::raft::{Cluster, Stats, seeds};
 /// replicated entries, short enough that a few hundred seeds stay under a second each.
 const EVENTS: u64 = 800;
 
+/// Events per seed in the acceptance run. Longer, because that run is about depth: 10,000 seeds
+/// of 800 events finish in seconds in release, so the budget is better spent on runs long enough
+/// for a node to crash, restart, fall behind and catch up several times over.
+const ACCEPTANCE_EVENTS: u64 = 2_500;
+
 /// The liveness bound, in tick rounds after every fault has been healed.
 ///
 /// A tick is 100 ms (`esker_raft::TICK_MS`) and the randomised election timeout is 10–20 ticks
@@ -195,13 +200,13 @@ fn ten_thousand_seeds_with_faults() {
     let per_plan = 10_000 / plans.len() as u64 + 1;
     for plan in &plans {
         for seed in seeds(1, per_plan) {
-            totals.add(sweep_one(seed, plan, 3, EVENTS));
+            totals.add(sweep_one(seed, plan, 3, ACCEPTANCE_EVENTS));
         }
     }
     let runs = totals.stats.len();
     println!(
-        "{runs} seeds: {} elections, {} crashes, {} restarts, {} partitions, {} slow writes, \
-         {} messages, {} proposals",
+        "{runs} seeds x {ACCEPTANCE_EVENTS} events: {} elections, {} crashes, {} restarts, \
+         {} partitions, {} slow writes, {} messages, {} proposals, highest committed index {}",
         totals.sum(|s| s.elections),
         totals.sum(|s| s.crashes),
         totals.sum(|s| s.restarts),
@@ -209,6 +214,7 @@ fn ten_thousand_seeds_with_faults() {
         totals.sum(|s| s.slow_writes),
         totals.sum(|s| s.sent),
         totals.sum(|s| s.proposals),
+        totals.stats.iter().map(|s| s.committed).max().unwrap_or(0),
     );
     assert!(runs >= 10_000, "only {runs} seeds ran");
     assert_faults_actually_bit(&totals);
@@ -226,6 +232,8 @@ fn assert_faults_actually_bit(totals: &Totals) {
         ("messages sent", totals.sum(|s| s.sent)),
         ("messages delivered", totals.sum(|s| s.delivered)),
         ("proposals accepted", totals.sum(|s| s.proposals)),
+        ("read indexes answered", totals.sum(|s| s.reads_served)),
+        ("Ready(s) taken", totals.sum(|s| s.readys_taken)),
         // Not a fault, but the assertion that stops two of the four properties from being
         // switched off by accident: they are only evaluated on a node whose disk is idle.
         ("committed entries", totals.sum(|s| s.committed)),
