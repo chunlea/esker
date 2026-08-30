@@ -21,6 +21,7 @@
 //! |---|---|
 //! | [`error`] | the store's failures, and which of them a client may safely retry |
 //! | [`region`] | the epoch and key-range checks every request runs |
+//! | [`apply`] | what a Raft entry carries, and what applying one does to the data |
 //! | [`peer`] | one region's `RawNode`, its driver thread, and the `Ready` loop |
 //! | [`raft_log`] | the Raft log and the peer's persistent state, on the `raft` column family |
 //! | [`rawkv`] | the eight `RawKv` methods, over the engine, synchronously |
@@ -31,6 +32,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod apply;
 pub mod error;
 pub mod peer;
 pub mod raft_log;
@@ -38,6 +40,7 @@ pub mod rawkv;
 pub mod region;
 pub mod server;
 
+pub use apply::Command;
 pub use error::{Result, StoreError, engine_to_proto};
 pub use peer::{Applied, DiscardTransport, PeerOptions, RaftPeer, RaftTransport};
 pub use raft_log::{PersistedState, RaftLogStorage};

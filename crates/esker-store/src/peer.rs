@@ -39,6 +39,7 @@ use esker_raft::{
 };
 use tokio::sync::{mpsc, oneshot};
 
+use crate::apply::Command;
 use crate::error::{Result, StoreError};
 use crate::raft_log::RaftLogStorage;
 
@@ -212,11 +213,32 @@ impl PeerCore {
     fn apply(&mut self, entry: &Entry) -> Result<()> {
         let mut batch = WriteBatch::new();
         let outcome = match entry.kind {
-            // TODO(unit-3): decode the command and stage its effect on the data column families.
-            EntryKind::Normal => Applied::Done,
+            // A leader's no-op carries no payload; it exists so §5.4.2 lets the backlog commit.
+            EntryKind::Normal if entry.data.is_empty() => Ok(Applied::Done),
+            EntryKind::Normal => match Command::decode(&entry.data) {
+                // A command that cannot be decoded cannot be applied, and skipping it would make
+                // this peer's state machine differ from every other's. It is a hard failure.
+                Err(error) => Err(error),
+                Ok(command) => crate::apply::stage(self.node.storage().db(), &mut batch, &command),
+            },
             EntryKind::ConfChange => {
-                // TODO(unit-3): bump the region's epoch under the region lock.
-                Applied::Done
+                // TODO(phase-4): membership over the wire. 3e bootstraps one static configuration
+                // and has no operator to change it, so a ConfChange entry cannot arise.
+                tracing::warn!(
+                    region_id = self.region_id,
+                    index = entry.index,
+                    "a configuration change was committed; 3e has no operator to have proposed one"
+                );
+                Ok(Applied::Done)
+            }
+        };
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return Err(StoreError::Bootstrap(format!(
+                    "could not apply entry {}: {error}",
+                    entry.index
+                )));
             }
         };
 
@@ -519,10 +541,19 @@ impl RaftPeer {
         self.send(PeerMsg::Tick).await
     }
 
-    /// Replicates `command` and waits for it to apply.
-    pub async fn propose(&self, command: Bytes) -> std::result::Result<Applied, ProtoError> {
+    /// Replicates `command` and waits for it to *apply*.
+    ///
+    /// Takes a [`Command`] rather than bytes on purpose. An entry whose payload cannot be decoded
+    /// cannot be applied, and skipping it would leave this peer's state machine differing from
+    /// every other's — so the driver treats one as a hard failure. Accepting only commands here
+    /// means the log can never contain a payload the apply loop will refuse.
+    pub async fn propose(&self, command: &Command) -> std::result::Result<Applied, ProtoError> {
         let (notify, answer) = oneshot::channel();
-        self.send(PeerMsg::Propose { command, notify }).await?;
+        self.send(PeerMsg::Propose {
+            command: command.encode(),
+            notify,
+        })
+        .await?;
         answer
             .await
             .map_err(|_| ProtoError::internal("the Raft peer stopped"))?
@@ -628,15 +659,25 @@ mod tests {
 
     use bytes::Bytes;
     use esker_engine::{Db, LocalFileSystem, Options, ReadOptions, WalSyncMode, cf};
+    use esker_keys::prefix;
     use esker_proto::ProtoError;
     use esker_raft::{ConfState, LogStorage, Message, Role};
 
     use super::{
         Applied, DiscardTransport, PEER_QUEUE_DEPTH, PeerOptions, RaftPeer, RaftTransport,
     };
+    use crate::apply::Command;
     use crate::raft_log::{PersistedState, RaftLogStorage, decode_entry, log_entry_key, state_key};
 
     const REGION: u64 = 1;
+
+    /// Any valid command; several tests only need the proposal to be well-formed.
+    fn put(key: &'static [u8]) -> Command {
+        Command::Put {
+            key: Bytes::from_static(key),
+            value: Bytes::from_static(b"v"),
+        }
+    }
 
     fn open_db() -> (tempfile::TempDir, Arc<Db>) {
         let dir = tempfile::tempdir().unwrap();
@@ -781,6 +822,18 @@ mod tests {
         }
     }
 
+    /// Ticks a lone voter until it elects itself, syncing through the driver each time so the
+    /// test is not asking about work that has not happened yet.
+    async fn elect_alone(peer: &Arc<RaftPeer>) {
+        for _ in 0..400 {
+            peer.tick().await.unwrap();
+            if peer.status().await.unwrap().role == Role::Leader {
+                return;
+            }
+        }
+        panic!("a lone voter never elected itself");
+    }
+
     /// Answers everything the peer sends — votes and appends alike — so a single running peer
     /// behaves like a healthy group of three. Without acknowledging the appends, a proposal would
     /// never reach a quorum and the test would wait for ever.
@@ -863,7 +916,11 @@ mod tests {
             let peer = Arc::clone(&peer);
             tokio::spawn(async move {
                 for index in 0..8_u32 {
-                    peer.propose(Bytes::from(index.to_be_bytes().to_vec()))
+                    let command = Command::Put {
+                        key: Bytes::from(index.to_be_bytes().to_vec()),
+                        value: Bytes::from_static(b"v"),
+                    };
+                    peer.propose(&command)
                         .await
                         .expect("a proposal on the leader");
                 }
@@ -901,14 +958,12 @@ mod tests {
         assert!(peer.is_leader(), "a lone voter should elect itself");
         assert_eq!(peer.leader(), Some(1));
 
-        assert_eq!(
-            peer.propose(Bytes::from_static(b"one")).await.unwrap(),
-            Applied::Done
-        );
-        assert_eq!(
-            peer.propose(Bytes::from_static(b"two")).await.unwrap(),
-            Applied::Done
-        );
+        let put = |key: &'static [u8]| Command::Put {
+            key: Bytes::from_static(key),
+            value: Bytes::from_static(b"v"),
+        };
+        assert_eq!(peer.propose(&put(b"one")).await.unwrap(), Applied::Done);
+        assert_eq!(peer.propose(&put(b"two")).await.unwrap(), Applied::Done);
 
         let status = peer.status().await.unwrap();
         assert_eq!(status.role, Role::Leader);
@@ -922,6 +977,64 @@ mod tests {
         assert_eq!(reopened.last_index().unwrap(), 3);
     }
 
+    /// End to end: a command proposed on the leader is replicated, applied, and visible in the
+    /// data column family — with its `apply_index` recorded in the same batch that wrote it.
+    #[tokio::test]
+    async fn a_committed_command_lands_in_the_data_and_the_apply_index_with_it() {
+        let (_dir, db) = open_db();
+        let peer = start(&db, 1, vec![1], Arc::new(DiscardTransport));
+        elect_alone(&peer).await;
+
+        let put = Command::Put {
+            key: Bytes::from_static(b"k"),
+            value: Bytes::from_static(b"v"),
+        };
+        assert_eq!(peer.propose(&put).await.unwrap(), Applied::Done);
+
+        let stored = db
+            .get(cf::DEFAULT, &prefix::raw_key(b"k"), &ReadOptions::default())
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(&b"v"[..]));
+
+        // The apply index moved with it. Both were in one batch, so a crash has both or neither.
+        let state = RaftLogStorage::open(Arc::clone(&db), REGION, ConfState::default()).unwrap();
+        assert_eq!(state.applied_index(), state.last_index().unwrap());
+        assert!(state.applied_index() >= 2, "the no-op and the command");
+        peer.stop();
+    }
+
+    /// A `CompareAndSwap` is decided when the entry applies, not when it is proposed — so its
+    /// answer comes back through the same path a write's does, from this peer's own apply.
+    #[tokio::test]
+    async fn a_compare_and_swap_answers_from_its_apply() {
+        let (_dir, db) = open_db();
+        let peer = start(&db, 1, vec![1], Arc::new(DiscardTransport));
+        elect_alone(&peer).await;
+
+        let swap = |expected: Option<&'static [u8]>, value: Option<&'static [u8]>| {
+            Command::CompareAndSwap {
+                key: Bytes::from_static(b"k"),
+                expected: expected.map(Bytes::from_static),
+                value: value.map(Bytes::from_static),
+            }
+        };
+        assert_eq!(
+            peer.propose(&swap(None, Some(b"one"))).await.unwrap(),
+            Applied::Swapped {
+                swapped: true,
+                previous: None
+            }
+        );
+        assert_eq!(
+            peer.propose(&swap(None, Some(b"two"))).await.unwrap(),
+            Applied::Swapped {
+                swapped: false,
+                previous: Some(Bytes::from_static(b"one"))
+            }
+        );
+        peer.stop();
+    }
+
     /// A peer that does not lead cannot order anything, and says so with the redirect a client
     /// acts on rather than an opaque failure.
     #[tokio::test]
@@ -929,7 +1042,7 @@ mod tests {
         let (_dir, db) = open_db();
         let peer = start(&db, 1, vec![1, 2, 3], Arc::new(DiscardTransport));
 
-        let error = peer.propose(Bytes::from_static(b"x")).await.unwrap_err();
+        let error = peer.propose(&put(b"x")).await.unwrap_err();
         assert!(matches!(
             error,
             ProtoError::NotLeader {
@@ -957,7 +1070,7 @@ mod tests {
                 break;
             }
         }
-        peer.propose(Bytes::from_static(b"one")).await.unwrap();
+        peer.propose(&put(b"one")).await.unwrap();
 
         let index = peer.read_index().await.unwrap();
         let reopened = RaftLogStorage::open(Arc::clone(&db), REGION, ConfState::default()).unwrap();
@@ -977,7 +1090,7 @@ mod tests {
         let peer = start(&db, 1, vec![1, 2, 3], Arc::new(DiscardTransport));
         peer.stop();
 
-        let error = peer.propose(Bytes::from_static(b"x")).await.unwrap_err();
+        let error = peer.propose(&put(b"x")).await.unwrap_err();
         assert!(matches!(error, ProtoError::NotSent { .. }));
         assert_eq!(error.outcome(), esker_proto::RequestOutcome::NotApplied);
     }
