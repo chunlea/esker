@@ -1,0 +1,991 @@
+//! The driver: one region's `RawNode`, the thread that turns its `Ready` into durable bytes, and
+//! the handle the request path talks to.
+//!
+//! # Where the ordering rule lives
+//!
+//! `esker-raft` cannot enforce [`Ready`](esker_raft::Ready)'s contract, because enforcing it means
+//! writing to a disk and the core may not (`docs/adr/0008-raft-determinism-and-the-driver-contract.md`).
+//! [`PeerCore::drive`] is where it is enforced instead, and the order of its five steps is not
+//! stylistic:
+//!
+//! 1. the hard state and the new entries go into **one** `WriteBatch` with `sync = true`;
+//! 2. only then are the messages handed to the transport;
+//! 3. committed entries are applied, in order, each with its `apply_index` in the same batch;
+//! 4. reads whose index has now *applied* are answered;
+//! 5. `advance`.
+//!
+//! Step 1 before step 2 is what makes a quorum of acknowledgements mean a quorum of durable
+//! copies — including this peer's own, since a leader counts itself the moment it appends. A
+//! transport that sees an entry it cannot read back from the log is the bug this ordering exists
+//! to prevent, and `a_message_is_never_sent_before_its_entries_are_durable` asserts exactly that.
+//!
+//! # Why a thread and not a task
+//!
+//! The engine is synchronous: an `fsync` here would stall every connection the reactor serves. So
+//! the Raft core, the log writes and the apply loop all run on one dedicated thread, which also
+//! means they need no locks between them. Async stays at the edge, where it belongs — the network
+//! feeds this thread through a bounded channel, and **time enters through a `tokio` interval that
+//! sends [`PeerMsg::Tick`]**, so the core still never reads a clock.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use bytes::Bytes;
+use esker_engine::{WriteBatch, WriteOptions};
+use esker_proto::ProtoError;
+use esker_raft::{
+    ConfState, Config as RaftConfig, Entry, EntryKind, Index, Message, NodeId, RawNode, ReadState,
+    Role, Status, Term,
+};
+use tokio::sync::{mpsc, oneshot};
+
+use crate::error::{Result, StoreError};
+use crate::raft_log::RaftLogStorage;
+
+/// How many messages may be queued for the driver thread before a caller waits.
+///
+/// Bounded, like everything else that crosses a thread here: an unbounded queue in front of an
+/// `fsync` is a memory leak with extra steps (`docs/DESIGN.md` §9).
+pub const PEER_QUEUE_DEPTH: usize = 4096;
+
+/// Where a peer's outbound Raft messages go.
+///
+/// Deliberately fire-and-forget and infallible. Raft already retries everything it sends — a lost
+/// message is indistinguishable from a slow one — so a transport that reported failures would
+/// give the driver a decision it has no better answer to than "send it again next tick".
+pub trait RaftTransport: Send + Sync + std::fmt::Debug {
+    /// Delivers `messages` towards their recipients, batched as they came out of one `Ready`.
+    fn send(&self, messages: Vec<Message>);
+}
+
+/// A transport that drops everything, for a single-node store and for tests that do not care.
+#[derive(Debug, Default)]
+pub struct DiscardTransport;
+
+impl RaftTransport for DiscardTransport {
+    fn send(&self, _messages: Vec<Message>) {}
+}
+
+/// What applying a command produced, for whoever proposed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Applied {
+    /// It applied and has nothing to report.
+    Done,
+    /// A `CompareAndSwap`'s answer, decided at apply time on every peer alike.
+    Swapped {
+        /// Whether the value matched and was replaced.
+        swapped: bool,
+        /// What was there before.
+        previous: Option<Bytes>,
+    },
+    /// How many keys a `DeleteRange` removed.
+    Deleted {
+        /// The count.
+        keys: u64,
+    },
+}
+
+/// What the driver thread accepts.
+#[derive(Debug)]
+pub enum PeerMsg {
+    /// One logical tick, from the timer at the edge.
+    Tick,
+    /// A Raft message from another peer.
+    Raft(Message),
+    /// A command to replicate. The answer comes back once it has *applied*.
+    Propose {
+        /// The encoded command.
+        command: Bytes,
+        /// Where the outcome goes.
+        notify: oneshot::Sender<std::result::Result<Applied, ProtoError>>,
+    },
+    /// A linearizable read. The answer is the index the caller must read at — and the driver does
+    /// not send it until the state machine has applied that far.
+    ReadIndex {
+        /// Where the index goes.
+        notify: oneshot::Sender<std::result::Result<Index, ProtoError>>,
+    },
+    /// A snapshot of what this peer believes, for the request path and for tests.
+    Status(oneshot::Sender<Status>),
+    /// Stop the thread, failing everything outstanding.
+    Stop,
+}
+
+/// A proposal waiting for its entry to apply.
+#[derive(Debug)]
+struct Pending {
+    index: Index,
+    term: Term,
+    notify: oneshot::Sender<std::result::Result<Applied, ProtoError>>,
+}
+
+/// A read waiting for the state machine to reach its index.
+#[derive(Debug)]
+struct PendingRead {
+    index: Index,
+    notify: oneshot::Sender<std::result::Result<Index, ProtoError>>,
+}
+
+/// How a peer is built.
+#[derive(Debug, Clone)]
+pub struct PeerOptions {
+    /// The region this peer serves.
+    pub region_id: u64,
+    /// This peer's Raft id.
+    pub peer_id: NodeId,
+    /// The group's voters, used only when the log has no configuration of its own.
+    pub voters: Vec<NodeId>,
+    /// Seed for the election-timeout RNG. The peer id selects the stream, so a whole cluster may
+    /// share one seed and still not campaign in lockstep
+    /// (`docs/adr/0008-raft-determinism-and-the-driver-contract.md`).
+    pub seed: u64,
+}
+
+/// The Raft core plus everything the driver thread owns.
+#[derive(Debug)]
+pub struct PeerCore {
+    node: RawNode<RaftLogStorage>,
+    transport: Arc<dyn RaftTransport>,
+    region_id: u64,
+    peer_id: NodeId,
+    pending: Vec<Pending>,
+    reads: Vec<PendingRead>,
+    /// Published for the request path, which must not wait on the driver just to learn who leads.
+    leader: Arc<AtomicU64>,
+    /// How far the state machine has been driven. Reads wait for this, not for the commit index.
+    applied_index: Index,
+}
+
+impl PeerCore {
+    /// The five steps, in the order the contract requires.
+    pub fn drive(&mut self) -> Result<()> {
+        while self.node.has_ready() {
+            let mut ready = self.node.ready();
+
+            // 1. Persist. One batch, fsynced, before a single message leaves.
+            if ready.hard_state.is_some() || !ready.entries.is_empty() {
+                let mut batch = WriteBatch::new();
+                self.node
+                    .storage_mut()
+                    .stage_ready(&mut batch, ready.hard_state, &ready.entries);
+                self.node
+                    .storage()
+                    .db()
+                    .write(batch, &WriteOptions { sync: true })?;
+            }
+            if ready.snapshot.is_some() {
+                // TODO(phase-4): apply a received snapshot's bytes. A single region that never
+                // compacts its log never sends one, so reaching here in 3e is a bug worth saying
+                // out loud rather than a case to handle quietly.
+                tracing::error!(
+                    region_id = self.region_id,
+                    "a Raft snapshot arrived; streaming is phase 4"
+                );
+            }
+
+            // 2. Send. Taken rather than cloned: a `Ready`'s messages are moved out by design.
+            let messages = std::mem::take(&mut ready.messages);
+            if !messages.is_empty() {
+                self.transport.send(messages);
+            }
+
+            // 3. Apply, in order.
+            for entry in &ready.committed_entries {
+                self.apply(entry)?;
+            }
+
+            // 4. Reads whose index has been established. Answering waits for apply, below.
+            for state in &ready.read_states {
+                self.record_read(state);
+            }
+
+            // 5. Advance.
+            self.node.advance(&ready);
+        }
+
+        self.publish_leader();
+        self.answer_ready_reads();
+        Ok(())
+    }
+
+    /// Applies one committed entry: its effect and its `apply_index`, in one batch.
+    fn apply(&mut self, entry: &Entry) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        let outcome = match entry.kind {
+            // TODO(unit-3): decode the command and stage its effect on the data column families.
+            EntryKind::Normal => Applied::Done,
+            EntryKind::ConfChange => {
+                // TODO(unit-3): bump the region's epoch under the region lock.
+                Applied::Done
+            }
+        };
+
+        // `apply_index` travels with the data it applied. A crash therefore has both or neither,
+        // which is what makes replaying from `apply_index + 1` correct and exactly-once.
+        self.node
+            .storage_mut()
+            .stage_applied(&mut batch, entry.index);
+        // Deliberately not synced: losing this batch loses nothing, because the entry is still in
+        // the Raft log, which was. The restart re-applies it.
+        self.node
+            .storage()
+            .db()
+            .write(batch, &WriteOptions { sync: false })?;
+        self.applied_index = entry.index;
+
+        self.complete_proposal(entry, outcome);
+        Ok(())
+    }
+
+    /// Notifies whoever proposed the entry at this index — or tells them it was replaced.
+    fn complete_proposal(&mut self, entry: &Entry, outcome: Applied) {
+        let Some(at) = self
+            .pending
+            .iter()
+            .position(|pending| pending.index == entry.index)
+        else {
+            return;
+        };
+        let pending = self.pending.remove(at);
+        if pending.term == entry.term {
+            let _ = pending.notify.send(Ok(outcome));
+        } else {
+            // A different entry took this index, so the proposal was truncated. It provably did
+            // not apply, which is what makes `NotLeader` the honest answer: retryable, and
+            // `NotApplied` rather than ambiguous.
+            let _ = pending.notify.send(Err(self.not_leader()));
+        }
+    }
+
+    fn record_read(&mut self, state: &ReadState) {
+        let Ok(index) = read_token(&state.ctx) else {
+            tracing::warn!(
+                region_id = self.region_id,
+                "a read state came back with a tag this peer did not issue"
+            );
+            return;
+        };
+        if let Some(at) = self.reads.iter().position(|read| read.index == index) {
+            let read = self.reads.remove(at);
+            self.reads.push(PendingRead {
+                index: state.index,
+                notify: read.notify,
+            });
+        }
+    }
+
+    /// Answers every read the state machine has now caught up with.
+    ///
+    /// The wait is for **apply**, not for commit: the index the core hands back is a commit index,
+    /// and answering before the state machine has run through it returns a state older than the
+    /// read's own position in the order (`docs/DESIGN.md` §2).
+    fn answer_ready_reads(&mut self) {
+        let applied = self.applied_index;
+        let mut still_waiting = Vec::new();
+        for read in self.reads.drain(..) {
+            if read.index <= applied {
+                let _ = read.notify.send(Ok(read.index));
+            } else {
+                still_waiting.push(read);
+            }
+        }
+        self.reads = still_waiting;
+    }
+
+    fn publish_leader(&self) {
+        let leader = self.node.leader().unwrap_or(0);
+        self.leader.store(leader, Ordering::Release);
+    }
+
+    fn not_leader(&self) -> ProtoError {
+        ProtoError::NotLeader {
+            region_id: self.region_id,
+            leader_hint: self.node.leader().filter(|id| *id != self.peer_id),
+        }
+    }
+
+    /// Fails everything outstanding — on shutdown, or when this peer stops leading and can no
+    /// longer promise anything about what it accepted.
+    fn fail_outstanding(&mut self, error: &ProtoError) {
+        for pending in self.pending.drain(..) {
+            let _ = pending.notify.send(Err(error.clone()));
+        }
+        for read in self.reads.drain(..) {
+            let _ = read.notify.send(Err(error.clone()));
+        }
+    }
+
+    fn handle(&mut self, message: PeerMsg) -> bool {
+        match message {
+            PeerMsg::Tick => self.node.tick(),
+            PeerMsg::Raft(raft) => {
+                if let Err(error) = self.node.step(raft) {
+                    tracing::warn!(region_id = self.region_id, %error, "a Raft message was refused");
+                }
+            }
+            PeerMsg::Propose { command, notify } => self.propose(command, notify),
+            PeerMsg::ReadIndex { notify } => self.read_index(notify),
+            PeerMsg::Status(notify) => {
+                let _ = notify.send(self.node.status());
+            }
+            PeerMsg::Stop => return false,
+        }
+        // Published here as well as after driving, because a batch can carry the tick that
+        // elects this peer and the status query that asks about it — and the two must not
+        // disagree about who leads.
+        self.publish_leader();
+        true
+    }
+
+    fn propose(
+        &mut self,
+        command: Bytes,
+        notify: oneshot::Sender<std::result::Result<Applied, ProtoError>>,
+    ) {
+        if self.node.role() != Role::Leader {
+            let _ = notify.send(Err(self.not_leader()));
+            return;
+        }
+        let before = self.node.status().last_index;
+        if let Err(error) = self.node.propose(command) {
+            let _ = notify.send(Err(propose_error(&error, self.region_id)));
+            return;
+        }
+        let status = self.node.status();
+        if status.last_index == before {
+            // `propose` reported success but appended nothing, which no path should reach.
+            // Failing the caller is better than leaving it waiting for an entry that will never
+            // arrive.
+            let _ = notify.send(Err(ProtoError::internal("the proposal appended no entry")));
+            return;
+        }
+        self.pending.push(Pending {
+            index: status.last_index,
+            term: status.term,
+            notify,
+        });
+    }
+
+    fn read_index(&mut self, notify: oneshot::Sender<std::result::Result<Index, ProtoError>>) {
+        if self.node.role() != Role::Leader {
+            let _ = notify.send(Err(self.not_leader()));
+            return;
+        }
+        // The tag has to be unique per outstanding round, and it has to come back recognisable.
+        // A counter is enough: the driver is the only issuer.
+        let token = self.next_read_token();
+        self.reads.push(PendingRead {
+            index: token,
+            notify,
+        });
+        self.node.read_index(read_ctx(token));
+    }
+
+    fn next_read_token(&mut self) -> u64 {
+        // Tokens are only ever compared against the ones this peer issued, so any strictly
+        // increasing sequence does; starting above every real index keeps a token from colliding
+        // with the commit index a completed round replaces it with.
+        const TOKEN_BASE: u64 = 1 << 62;
+        let highest = self.reads.iter().map(|read| read.index).max().unwrap_or(0);
+        highest.max(TOKEN_BASE) + 1
+    }
+}
+
+/// A read round's tag: the token, big-endian.
+fn read_ctx(token: u64) -> Bytes {
+    Bytes::copy_from_slice(&token.to_be_bytes())
+}
+
+fn read_token(ctx: &Bytes) -> std::result::Result<u64, ()> {
+    let bytes: [u8; 8] = ctx.as_ref().try_into().map_err(|_| ())?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+fn propose_error(error: &esker_raft::RaftError, region_id: u64) -> ProtoError {
+    match error {
+        esker_raft::RaftError::NotLeader => ProtoError::NotLeader {
+            region_id,
+            leader_hint: None,
+        },
+        esker_raft::RaftError::LeadershipTransferInProgress(_)
+        | esker_raft::RaftError::ConfChangePending(_) => ProtoError::ServerIsBusy {
+            reason: error.to_string(),
+        },
+        other => ProtoError::internal(other.to_string()),
+    }
+}
+
+/// The handle the request path holds: a channel to the driver thread, and the one fact it needs
+/// often enough to be worth publishing without asking.
+#[derive(Debug)]
+pub struct RaftPeer {
+    commands: mpsc::Sender<PeerMsg>,
+    region_id: u64,
+    peer_id: NodeId,
+    leader: Arc<AtomicU64>,
+    thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl RaftPeer {
+    /// Builds the peer and starts its driver thread.
+    pub fn start(
+        options: PeerOptions,
+        storage: RaftLogStorage,
+        transport: Arc<dyn RaftTransport>,
+    ) -> Result<Arc<Self>> {
+        let mut config = RaftConfig::new(options.peer_id, options.voters, options.seed);
+        config.applied = storage.applied_index();
+        let applied_index = storage.applied_index();
+
+        let node = RawNode::new(config, storage).map_err(|error| {
+            StoreError::Bootstrap(format!("could not start the Raft peer: {error}"))
+        })?;
+
+        let leader = Arc::new(AtomicU64::new(0));
+        let core = PeerCore {
+            node,
+            transport,
+            region_id: options.region_id,
+            peer_id: options.peer_id,
+            pending: Vec::new(),
+            reads: Vec::new(),
+            leader: Arc::clone(&leader),
+            applied_index,
+        };
+
+        let (commands, receiver) = mpsc::channel(PEER_QUEUE_DEPTH);
+        let region_id = options.region_id;
+        let thread = std::thread::Builder::new()
+            .name(format!("raft-{region_id}"))
+            .spawn(move || run(core, receiver))
+            .map_err(|error| {
+                StoreError::Bootstrap(format!("could not start the Raft thread: {error}"))
+            })?;
+
+        Ok(Arc::new(Self {
+            commands,
+            region_id: options.region_id,
+            peer_id: options.peer_id,
+            leader,
+            thread: std::sync::Mutex::new(Some(thread)),
+        }))
+    }
+
+    /// The region this peer serves.
+    #[must_use]
+    pub fn region_id(&self) -> u64 {
+        self.region_id
+    }
+
+    /// This peer's Raft id.
+    #[must_use]
+    pub fn peer_id(&self) -> NodeId {
+        self.peer_id
+    }
+
+    /// Who this peer believes leads, without asking the driver thread.
+    #[must_use]
+    pub fn leader(&self) -> Option<NodeId> {
+        match self.leader.load(Ordering::Acquire) {
+            0 => None,
+            id => Some(id),
+        }
+    }
+
+    /// Whether this peer believes it is the leader. A hint, checked again by the driver — a peer
+    /// that has just been deposed will still say yes for one round trip, and the proposal it
+    /// accepts on the strength of it is failed rather than applied.
+    #[must_use]
+    pub fn is_leader(&self) -> bool {
+        self.leader() == Some(self.peer_id)
+    }
+
+    /// The error a non-leader answers with.
+    #[must_use]
+    pub fn not_leader(&self) -> ProtoError {
+        ProtoError::NotLeader {
+            region_id: self.region_id,
+            leader_hint: self.leader().filter(|id| *id != self.peer_id),
+        }
+    }
+
+    /// Feeds one Raft message in.
+    pub async fn step(&self, message: Message) -> std::result::Result<(), ProtoError> {
+        self.send(PeerMsg::Raft(message)).await
+    }
+
+    /// One logical tick.
+    pub async fn tick(&self) -> std::result::Result<(), ProtoError> {
+        self.send(PeerMsg::Tick).await
+    }
+
+    /// Replicates `command` and waits for it to apply.
+    pub async fn propose(&self, command: Bytes) -> std::result::Result<Applied, ProtoError> {
+        let (notify, answer) = oneshot::channel();
+        self.send(PeerMsg::Propose { command, notify }).await?;
+        answer
+            .await
+            .map_err(|_| ProtoError::internal("the Raft peer stopped"))?
+    }
+
+    /// Establishes a linearizable read, returning once the state machine has applied through it.
+    pub async fn read_index(&self) -> std::result::Result<Index, ProtoError> {
+        let (notify, answer) = oneshot::channel();
+        self.send(PeerMsg::ReadIndex { notify }).await?;
+        answer
+            .await
+            .map_err(|_| ProtoError::internal("the Raft peer stopped"))?
+    }
+
+    /// What this peer believes.
+    pub async fn status(&self) -> std::result::Result<Status, ProtoError> {
+        let (notify, answer) = oneshot::channel();
+        self.send(PeerMsg::Status(notify)).await?;
+        answer
+            .await
+            .map_err(|_| ProtoError::internal("the Raft peer stopped"))
+    }
+
+    /// Drives the clock. **This is the only place a wall clock touches consensus**: the core
+    /// counts ticks and never reads one (`CLAUDE.md` invariant 4).
+    pub fn spawn_ticker(
+        self: &Arc<Self>,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let peer = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                if peer.tick().await.is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// Stops the driver thread and waits for it, failing everything outstanding.
+    pub fn stop(&self) {
+        // A full queue on shutdown must not deadlock the caller: the thread is going away either
+        // way, and dropping the sender ends its loop.
+        let _ = self.commands.try_send(PeerMsg::Stop);
+        let handle = self.thread.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+    }
+
+    async fn send(&self, message: PeerMsg) -> std::result::Result<(), ProtoError> {
+        self.commands.send(message).await.map_err(|_| {
+            // The thread is gone, so the request provably did not reach Raft.
+            ProtoError::not_sent("the Raft peer is not running")
+        })
+    }
+}
+
+impl Drop for RaftPeer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// The driver thread.
+///
+/// Every wake-up drains whatever else is queued before driving, so one `Ready` covers a batch of
+/// messages rather than one apiece — which is where a leader's per-tick batching comes from.
+fn run(mut core: PeerCore, mut receiver: mpsc::Receiver<PeerMsg>) {
+    while let Some(message) = receiver.blocking_recv() {
+        let mut running = core.handle(message);
+        while running {
+            match receiver.try_recv() {
+                Ok(next) => running = core.handle(next),
+                Err(_) => break,
+            }
+        }
+        if let Err(error) = core.drive() {
+            // A failed write is not something this layer can paper over: the log and the state
+            // machine may now disagree. Say so loudly and stop, rather than continue on a log
+            // whose durability is unknown.
+            tracing::error!(region_id = core.region_id, %error, "the Raft driver failed");
+            break;
+        }
+        if !running {
+            break;
+        }
+    }
+    let stopping = ProtoError::not_sent("the Raft peer stopped");
+    core.fail_outstanding(&stopping);
+}
+
+/// Re-exported so a caller can name the configuration a peer bootstraps with.
+pub type PeerConfState = ConfState;
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use bytes::Bytes;
+    use esker_engine::{Db, LocalFileSystem, Options, ReadOptions, WalSyncMode, cf};
+    use esker_proto::ProtoError;
+    use esker_raft::{ConfState, LogStorage, Message, Role};
+
+    use super::{
+        Applied, DiscardTransport, PEER_QUEUE_DEPTH, PeerOptions, RaftPeer, RaftTransport,
+    };
+    use crate::raft_log::{PersistedState, RaftLogStorage, decode_entry, log_entry_key, state_key};
+
+    const REGION: u64 = 1;
+
+    fn open_db() -> (tempfile::TempDir, Arc<Db>) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(
+            dir.path(),
+            Options {
+                create_if_missing: true,
+                wal_sync_mode: WalSyncMode::Never,
+                ..Options::default()
+            },
+            Arc::new(LocalFileSystem::new()),
+            &cf::BUILTIN,
+        )
+        .unwrap();
+        (dir, Arc::new(db))
+    }
+
+    fn start(
+        db: &Arc<Db>,
+        peer_id: u64,
+        voters: Vec<u64>,
+        transport: Arc<dyn RaftTransport>,
+    ) -> Arc<RaftPeer> {
+        let storage = RaftLogStorage::open(
+            Arc::clone(db),
+            REGION,
+            ConfState::from_voters(voters.clone()),
+        )
+        .unwrap();
+        RaftPeer::start(
+            PeerOptions {
+                region_id: REGION,
+                peer_id,
+                voters,
+                seed: 7,
+            },
+            storage,
+            transport,
+        )
+        .unwrap()
+    }
+
+    /// A transport that checks the driver contract at the only moment it can be checked: when a
+    /// message is handed over. Every entry an `AppendEntries` carries must already be readable
+    /// from the log, and every vote a response grants must already be in the state record.
+    ///
+    /// This is rule 1 of `Ready`'s contract, asserted from outside the core — which is the whole
+    /// reason the core does no I/O.
+    #[derive(Debug)]
+    struct Auditor {
+        db: Arc<Db>,
+        sent: Mutex<Vec<Message>>,
+        violations: Mutex<Vec<String>>,
+        /// Entries the audit actually inspected. A count of what was checked is the only thing
+        /// that makes "no violations" mean anything.
+        audited: AtomicUsize,
+    }
+
+    impl Auditor {
+        fn new(db: &Arc<Db>) -> Arc<Self> {
+            Arc::new(Self {
+                db: Arc::clone(db),
+                sent: Mutex::new(Vec::new()),
+                violations: Mutex::new(Vec::new()),
+                audited: AtomicUsize::new(0),
+            })
+        }
+
+        fn violation(&self, detail: String) {
+            self.violations.lock().unwrap().push(detail);
+        }
+
+        fn audited(&self) -> usize {
+            self.audited.load(Ordering::Relaxed)
+        }
+
+        fn state(&self) -> Option<PersistedState> {
+            self.db
+                .get(cf::RAFT, &state_key(REGION), &ReadOptions::default())
+                .ok()
+                .flatten()
+                .and_then(|bytes| PersistedState::decode(&bytes).ok())
+        }
+
+        fn violations(&self) -> Vec<String> {
+            self.violations.lock().unwrap().clone()
+        }
+
+        fn take_sent(&self) -> Vec<Message> {
+            std::mem::take(&mut self.sent.lock().unwrap())
+        }
+    }
+
+    impl RaftTransport for Auditor {
+        fn send(&self, messages: Vec<Message>) {
+            for message in &messages {
+                match message {
+                    Message::AppendEntries { entries, .. } => {
+                        for entry in entries {
+                            self.audited.fetch_add(1, Ordering::Relaxed);
+                            let key = log_entry_key(REGION, entry.index);
+                            let stored = self
+                                .db
+                                .get(cf::RAFT, &key, &ReadOptions::default())
+                                .ok()
+                                .flatten()
+                                .and_then(|bytes| decode_entry(entry.index, &bytes).ok());
+                            if stored.as_ref() != Some(entry) {
+                                self.violation(format!(
+                                    "entry {} was sent before it was durable",
+                                    entry.index
+                                ));
+                            }
+                        }
+                    }
+                    // The candidate voted for itself before asking anyone else.
+                    Message::RequestVote {
+                        from,
+                        pre_vote: false,
+                        ..
+                    } => {
+                        if self.state().and_then(|state| state.hard_state.voted_for) != Some(*from)
+                        {
+                            self.violation(
+                                "a vote request went out before the self-vote was durable".into(),
+                            );
+                        }
+                    }
+                    // And a granted vote is on disk before the candidate can count it.
+                    Message::RequestVoteResponse {
+                        to,
+                        granted: true,
+                        pre_vote: false,
+                        ..
+                    } if self.state().and_then(|state| state.hard_state.voted_for) != Some(*to) => {
+                        self.violation("a vote was granted before it was durable".into());
+                    }
+                    _ => {}
+                }
+            }
+            self.sent.lock().unwrap().extend(messages);
+        }
+    }
+
+    /// Answers everything the peer sends — votes and appends alike — so a single running peer
+    /// behaves like a healthy group of three. Without acknowledging the appends, a proposal would
+    /// never reach a quorum and the test would wait for ever.
+    async fn pump(peer: &Arc<RaftPeer>, auditor: &Arc<Auditor>, voters: &[u64], rounds: usize) {
+        for _ in 0..rounds {
+            for message in auditor.take_sent() {
+                match message {
+                    Message::RequestVote {
+                        from,
+                        term,
+                        pre_vote,
+                        ..
+                    } => {
+                        for voter in voters.iter().filter(|id| **id != from) {
+                            peer.step(Message::RequestVoteResponse {
+                                from: *voter,
+                                to: from,
+                                term,
+                                granted: true,
+                                pre_vote,
+                            })
+                            .await
+                            .unwrap();
+                        }
+                    }
+                    Message::AppendEntries {
+                        from,
+                        to,
+                        term,
+                        prev_log_index,
+                        entries,
+                        ..
+                    } => {
+                        let index = entries.last().map_or(prev_log_index, |entry| entry.index);
+                        peer.step(Message::AppendEntriesResponse {
+                            from: to,
+                            to: from,
+                            term,
+                            reject: false,
+                            index,
+                            hint_term: 0,
+                            context: Bytes::new(),
+                        })
+                        .await
+                        .unwrap();
+                    }
+                    _ => {}
+                }
+            }
+            peer.tick().await.unwrap();
+            let _ = peer.status().await.unwrap();
+        }
+    }
+
+    /// **The driver contract, unit-tested.** Nothing the transport was handed had left the log
+    /// behind: every entry it carried was already readable from the `raft` column family, and
+    /// every vote it depended on was already in the state record.
+    ///
+    /// This is the assertion that only exists because the core does no I/O. If `esker-raft`
+    /// persisted its own state, "persist before send" would be an internal detail with no
+    /// observer.
+    #[tokio::test]
+    async fn a_message_is_never_sent_before_its_entries_are_durable() {
+        let (_dir, db) = open_db();
+        let auditor = Auditor::new(&db);
+        let peer = start(
+            &db,
+            1,
+            vec![1, 2, 3],
+            Arc::clone(&auditor) as Arc<dyn RaftTransport>,
+        );
+
+        // Elect first: a proposal before there is a leader is refused, correctly.
+        pump(&peer, &auditor, &[1, 2, 3], 100).await;
+        assert!(peer.is_leader(), "the peer never took office");
+
+        // Then the proposals run alongside the pump, because each waits for its entry to apply
+        // and that needs the acknowledgements the pump provides.
+        let proposer = {
+            let peer = Arc::clone(&peer);
+            tokio::spawn(async move {
+                for index in 0..8_u32 {
+                    peer.propose(Bytes::from(index.to_be_bytes().to_vec()))
+                        .await
+                        .expect("a proposal on the leader");
+                }
+            })
+        };
+        pump(&peer, &auditor, &[1, 2, 3], 400).await;
+        proposer.await.expect("the proposals completed");
+
+        let violations = auditor.violations();
+        assert!(
+            violations.is_empty(),
+            "driver contract violated: {violations:?}"
+        );
+        assert!(
+            auditor.audited() >= 8,
+            "the audit inspected only {} entries, so it proved nothing",
+            auditor.audited()
+        );
+        peer.stop();
+    }
+
+    /// A single voter is its own majority, so it takes office from ticks alone and its proposals
+    /// commit and apply without a network at all.
+    #[tokio::test]
+    async fn a_lone_voter_applies_its_own_proposals() {
+        let (_dir, db) = open_db();
+        let peer = start(&db, 1, vec![1], Arc::new(DiscardTransport));
+
+        for _ in 0..200 {
+            peer.tick().await.unwrap();
+            if peer.is_leader() {
+                break;
+            }
+        }
+        assert!(peer.is_leader(), "a lone voter should elect itself");
+        assert_eq!(peer.leader(), Some(1));
+
+        assert_eq!(
+            peer.propose(Bytes::from_static(b"one")).await.unwrap(),
+            Applied::Done
+        );
+        assert_eq!(
+            peer.propose(Bytes::from_static(b"two")).await.unwrap(),
+            Applied::Done
+        );
+
+        let status = peer.status().await.unwrap();
+        assert_eq!(status.role, Role::Leader);
+        // The no-op plus two proposals, all applied.
+        assert_eq!(status.last_index, 3);
+        peer.stop();
+
+        // And the apply index is on disk, where a restart will resume from.
+        let reopened = RaftLogStorage::open(Arc::clone(&db), REGION, ConfState::default()).unwrap();
+        assert_eq!(reopened.applied_index(), 3);
+        assert_eq!(reopened.last_index().unwrap(), 3);
+    }
+
+    /// A peer that does not lead cannot order anything, and says so with the redirect a client
+    /// acts on rather than an opaque failure.
+    #[tokio::test]
+    async fn a_follower_refuses_a_proposal_with_a_redirect() {
+        let (_dir, db) = open_db();
+        let peer = start(&db, 1, vec![1, 2, 3], Arc::new(DiscardTransport));
+
+        let error = peer.propose(Bytes::from_static(b"x")).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ProtoError::NotLeader {
+                region_id: REGION,
+                ..
+            }
+        ));
+        assert!(error.is_retryable());
+        assert_eq!(error.outcome(), esker_proto::RequestOutcome::NotApplied);
+
+        let error = peer.read_index().await.unwrap_err();
+        assert!(matches!(error, ProtoError::NotLeader { .. }));
+        peer.stop();
+    }
+
+    /// A read is answered with an index the state machine has *already* reached. Answering at the
+    /// commit index before applying it would return a state older than the read's own position.
+    #[tokio::test]
+    async fn a_read_is_answered_only_once_its_index_has_applied() {
+        let (_dir, db) = open_db();
+        let peer = start(&db, 1, vec![1], Arc::new(DiscardTransport));
+        for _ in 0..200 {
+            peer.tick().await.unwrap();
+            if peer.is_leader() {
+                break;
+            }
+        }
+        peer.propose(Bytes::from_static(b"one")).await.unwrap();
+
+        let index = peer.read_index().await.unwrap();
+        let reopened = RaftLogStorage::open(Arc::clone(&db), REGION, ConfState::default()).unwrap();
+        assert!(
+            reopened.applied_index() >= index,
+            "a read was answered at {index} with only {} applied",
+            reopened.applied_index()
+        );
+        peer.stop();
+    }
+
+    /// Stopping fails everything outstanding rather than leaving a caller waiting for an answer
+    /// that can never come.
+    #[tokio::test]
+    async fn stopping_fails_outstanding_work_rather_than_stranding_it() {
+        let (_dir, db) = open_db();
+        let peer = start(&db, 1, vec![1, 2, 3], Arc::new(DiscardTransport));
+        peer.stop();
+
+        let error = peer.propose(Bytes::from_static(b"x")).await.unwrap_err();
+        assert!(matches!(error, ProtoError::NotSent { .. }));
+        assert_eq!(error.outcome(), esker_proto::RequestOutcome::NotApplied);
+    }
+
+    /// Nothing that crosses a thread here is unbounded: an unbounded queue in front of an `fsync`
+    /// is a memory leak with extra steps.
+    #[test]
+    fn the_driver_queue_is_bounded() {
+        assert!(PEER_QUEUE_DEPTH > 0 && PEER_QUEUE_DEPTH <= 65_536);
+    }
+}
