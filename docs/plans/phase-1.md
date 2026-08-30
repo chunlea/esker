@@ -184,18 +184,40 @@ needed; the kill -9 loop still runs for real durability.
 ## 9. Progress
 
 - [x] step 0 — this plan
-- [ ] step 0b — contract commit (`fs.rs`, `dbformat.rs`, `cache_api.rs`, `options.rs`, `error.rs`,
-      `lib.rs`, empty `sst`/`cache` stubs for the sibling)
-- [ ] step 1 — WAL
-- [ ] step 2 — WriteBatch + internal key
-- [ ] step 3 — memtable
-- [ ] step 4 — SST + block cache *(SST lane)*
-- [ ] step 5 — manifest / VersionSet
-- [ ] step 6 — `Db`
+- [x] step 0b — contract commit (`fs.rs`, `dbformat.rs`, `cache_api.rs`, `options.rs`, `error.rs`,
+      `lib.rs`)
+- [x] step 1 — WAL (`wal/{format,writer,reader}.rs`, `memfs.rs`, golden + exhaustive damage tests)
+- [x] step 2 — WriteBatch + internal key (`batch.rs`, goldens for both layouts)
+- [x] step 3 — memtable (`memtable.rs`, model test + concurrency test)
+- [x] step 4 — SST + block cache *(SST lane, accepted at the coordinator's gate)*
+- [x] step 5 — manifest / `VersionSet` (`filename.rs`, `version/{edit,builder,set}.rs`,
+      the full `CURRENT`-swap crash matrix)
+- [ ] step 6 — `Db` *(in progress)*
 - [ ] step 7 — compaction
 - [ ] step 8 — checkpoint + ingest
 - [ ] step 9 — `esker-cli` tools + bench numbers
 
 ## 10. Changes vs plan
 
-Recorded as they happen.
+1. **`fs.rs` returns `io::Result`, not the crate's `Result`.** An implementation of the
+   filesystem seam then owes nothing to the engine's error type; call sites attach the path
+   with `IoResultExt::at`. §3 of this plan originally sketched it the other way.
+2. **`Comparator`, `FileSystem`, `BlockCache` and `PrefixExtractor` require `Debug`.** Without
+   it nothing holding one can derive `Debug`, which the workspace's
+   `missing_debug_implementations` lint requires of every public type. `WritableFile` and
+   `RandomAccessFile` deliberately do *not*, because the SST lane implements them; `LogWriter`
+   and `LogReader` write their `Debug` out by hand instead.
+3. **`Comparator` gained two provided methods**, `find_shortest_separator` and
+   `find_short_successor`, for SST index separators. They default to doing nothing, which is
+   always correct, so a comparator may ignore them.
+4. **`WriteOptions::sync` defaults to `true`**, unlike LevelDB and RocksDB. `CLAUDE.md`
+   invariant 1 makes the un-durable acknowledgement the thing a caller opts into.
+5. **The WAL omits LevelDB's CRC rotation mask.** It exists there because the checksum covers
+   bytes that can contain checksums; ours covers the type byte and the payload only.
+6. **A new `Error::Poisoned`.** When a manifest sync or a `CURRENT` rename fails, we cannot
+   tell whether the bytes landed, so the version set refuses to continue rather than carry an
+   in-memory version the disk may not share. Reopening re-derives the truth.
+7. **`Error::GroupCommit`** carries a leader's failure to the followers that shared its group.
+8. **`memfs.rs` is a normal module, not test-only.** The simulator will want an in-memory
+   filesystem in a normal build; only deliberate misbehaviour belongs behind a feature, which
+   is where the SST lane put its `testing::FaultFileSystem`.
