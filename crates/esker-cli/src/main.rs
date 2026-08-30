@@ -1,13 +1,16 @@
 //! `esker` — command line tools for the Esker key-value store.
 //!
-//! `sst-dump` inspects a sorted string table; `bench` is still the phase-0 placeholder. The
-//! remaining inspection commands (`wal-dump`, `manifest-dump`, `region`) arrive with the
-//! layers they inspect (`docs/DESIGN.md` §12).
+//! `sst-dump`, `wal-dump` and `manifest-dump` inspect the three on-disk formats; `bench` is
+//! still the phase-0 placeholder, and `region` arrives with the layer it inspects
+//! (`docs/DESIGN.md` §12).
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod args;
+mod bytes;
+mod manifest_dump;
 mod sst_dump;
+mod wal_dump;
 
 use std::process::ExitCode;
 
@@ -44,6 +47,26 @@ fn main() -> ExitCode {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     eprintln!("esker sst-dump: {error}");
+                    ExitCode::from(EXIT_FAILURE)
+                }
+            }
+        }
+        Ok(Command::WalDump(options)) => {
+            let mut stdout = std::io::stdout().lock();
+            match wal_dump::run(&options, &mut stdout) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("esker wal-dump: {error}");
+                    ExitCode::from(EXIT_FAILURE)
+                }
+            }
+        }
+        Ok(Command::ManifestDump(options)) => {
+            let mut stdout = std::io::stdout().lock();
+            match manifest_dump::run(&options, &mut stdout) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("esker manifest-dump: {error}");
                     ExitCode::from(EXIT_FAILURE)
                 }
             }

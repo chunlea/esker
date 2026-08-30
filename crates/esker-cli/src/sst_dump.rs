@@ -32,6 +32,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::bytes::{escape, escape_capped};
 use esker_engine::dbformat::BytewiseComparator;
 use esker_engine::fs::{FileSystem, LocalFileSystem, RandomAccessFile, read_exact_at};
 use esker_engine::options::{Compression, StripSuffix};
@@ -88,35 +89,6 @@ macro_rules! line {
     ($out:expr, $($arg:tt)*) => {
         writeln!($out, $($arg)*).map_err(DumpError::Output)?
     };
-}
-
-/// Renders arbitrary bytes for a terminal: printable ASCII as itself, everything else as
-/// `\xNN`. A key is opaque bytes, so this must assume nothing about it — not UTF-8, not text.
-fn escape(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len());
-    for &byte in bytes {
-        match byte {
-            b'\\' => out.push_str("\\\\"),
-            b'"' => out.push_str("\\\""),
-            0x20..=0x7e => out.push(byte as char),
-            _ => {
-                const HEX: [u8; 16] = *b"0123456789abcdef";
-                out.push('\\');
-                out.push('x');
-                out.push(HEX[usize::from(byte >> 4)] as char);
-                out.push(HEX[usize::from(byte & 0x0f)] as char);
-            }
-        }
-    }
-    out
-}
-
-/// [`escape`], truncated for a summary field.
-fn escape_capped(bytes: &[u8], limit: usize) -> String {
-    if bytes.len() <= limit {
-        return escape(bytes);
-    }
-    format!("{}... ({} bytes)", escape(&bytes[..limit]), bytes.len())
 }
 
 /// Reads a block's stored bytes, refusing a handle that does not lie inside the file.
@@ -490,7 +462,7 @@ pub(crate) fn run(options: &DumpOptions, out: &mut dyn Write) -> Result<(), Dump
 
 #[cfg(test)]
 mod tests {
-    use super::{DumpOptions, escape, escape_capped, run};
+    use super::{DumpOptions, run};
     use std::path::{Path, PathBuf};
 
     /// The golden tables the `cl-p1-sst` lane froze. Reading the tool's output against the
@@ -522,23 +494,6 @@ mod tests {
         let path = dir.path().join("t.sst");
         std::fs::write(&path, bytes).unwrap();
         dump(&options(path))
-    }
-
-    #[test]
-    fn escaping_assumes_nothing_about_a_key() {
-        assert_eq!(escape(b"plain"), "plain");
-        assert_eq!(escape(b""), "");
-        assert_eq!(escape(b"\x00\xff\n"), "\\x00\\xff\\x0a");
-        assert_eq!(escape(b"quote\"back\\slash"), "quote\\\"back\\\\slash");
-        // Every byte renders, and none of them panics.
-        let all: Vec<u8> = (0..=255u8).collect();
-        assert!(!escape(&all).is_empty());
-
-        assert_eq!(escape_capped(b"short", 48), "short");
-        let long = vec![b'x'; 60];
-        let capped = escape_capped(&long, 8);
-        assert!(capped.starts_with("xxxxxxxx..."), "{capped}");
-        assert!(capped.contains("60 bytes"), "{capped}");
     }
 
     /// The whole report, against a table whose bytes are frozen.

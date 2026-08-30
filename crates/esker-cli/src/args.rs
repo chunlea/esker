@@ -11,6 +11,8 @@
 //! esker [--version | -V] [--help | -h]
 //! esker bench [--threads N] [--value-size N] [--duration-secs N] [--help]
 //! esker sst-dump <path> [--verbose | -v] [--prefix-len N] [--help]
+//! esker wal-dump <path> [--verbose | -v] [--help]
+//! esker manifest-dump <dir> [--help]
 //! ```
 //!
 //! Both `--flag value` and `--flag=value` are accepted, because both are what people type.
@@ -18,7 +20,9 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::manifest_dump::DumpOptions as ManifestDumpOptions;
 use crate::sst_dump::DumpOptions;
+use crate::wal_dump::DumpOptions as WalDumpOptions;
 
 /// What the user asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +35,10 @@ pub(crate) enum Command {
     Bench(BenchOptions),
     /// Print the contents of a sorted string table.
     SstDump(DumpOptions),
+    /// Print the contents of a write-ahead log segment.
+    WalDump(WalDumpOptions),
+    /// Print a database's manifest and the version it reconstructs to.
+    ManifestDump(ManifestDumpOptions),
 }
 
 /// Options for the benchmark driver.
@@ -111,6 +119,8 @@ Usage:
 Commands:
   bench                 Run the benchmark driver
   sst-dump <path>       Print the contents of a sorted string table
+  wal-dump <path>       Print the fragments and records of a log segment
+  manifest-dump <dir>   Print a database's manifest and reconstructed version
 
 Options:
   -V, --version         Print the version
@@ -125,6 +135,12 @@ Sst-dump options:
   -v, --verbose         Print every key and value, not just the summary
       --prefix-len N    Rebuild a StripSuffix prefix extractor of this length, so
                         that a prefix-built bloom filter can be used
+
+Wal-dump options:
+  -v, --verbose         Print entry values as well as keys
+
+A torn record at the tail of a log or manifest is what a crash looks like, not
+damage: it is reported with a notice and exit 0. Corruption anywhere exits 1.
 
 Exit codes:
   0  success       1  the file could not be read or is corrupt       2  bad usage
@@ -146,6 +162,8 @@ where
         "--help" | "-h" | "help" => Ok(Command::Help),
         "bench" => parse_bench(&arguments[1..]),
         "sst-dump" => parse_sst_dump(&arguments[1..]),
+        "wal-dump" => parse_wal_dump(&arguments[1..]),
+        "manifest-dump" => parse_manifest_dump(&arguments[1..]),
         other if other.starts_with('-') => Err(ParseError::UnknownFlag(other.to_owned())),
         other => Err(ParseError::UnknownCommand(other.to_owned())),
     }
@@ -253,6 +271,52 @@ fn parse_sst_dump(arguments: &[String]) -> Result<Command, ParseError> {
         path: path.ok_or(ParseError::MissingArgument("<path>"))?,
         verbose,
         prefix_len,
+    }))
+}
+
+/// `wal-dump <path> [--verbose]`.
+fn parse_wal_dump(arguments: &[String]) -> Result<Command, ParseError> {
+    let mut path = None;
+    let mut verbose = false;
+
+    for argument in arguments {
+        match argument.as_str() {
+            "--help" | "-h" => return Ok(Command::Help),
+            "--verbose" | "-v" => verbose = true,
+            other if other.starts_with('-') => {
+                return Err(ParseError::UnknownFlag(other.to_owned()));
+            }
+            other if path.is_none() => path = Some(PathBuf::from(other)),
+            other => return Err(ParseError::UnexpectedArgument(other.to_owned())),
+        }
+    }
+
+    Ok(Command::WalDump(WalDumpOptions {
+        path: path.ok_or(ParseError::MissingArgument("<path>"))?,
+        verbose,
+    }))
+}
+
+/// `manifest-dump <dir>`.
+///
+/// The argument is the database directory, not the manifest: `CURRENT` is what says which
+/// manifest is in force, and naming one directly would invite reading a stale one.
+fn parse_manifest_dump(arguments: &[String]) -> Result<Command, ParseError> {
+    let mut path = None;
+
+    for argument in arguments {
+        match argument.as_str() {
+            "--help" | "-h" => return Ok(Command::Help),
+            other if other.starts_with('-') => {
+                return Err(ParseError::UnknownFlag(other.to_owned()));
+            }
+            other if path.is_none() => path = Some(PathBuf::from(other)),
+            other => return Err(ParseError::UnexpectedArgument(other.to_owned())),
+        }
+    }
+
+    Ok(Command::ManifestDump(ManifestDumpOptions {
+        path: path.ok_or(ParseError::MissingArgument("<dir>"))?,
     }))
 }
 
