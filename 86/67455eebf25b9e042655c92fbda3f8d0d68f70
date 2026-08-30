@@ -1,0 +1,19 @@
+docs/DESIGN.md
+  s_583ba4eb96ad8a::t_56459a3ceb4eff 75-76,82-91,99-116,165-178,192-200
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "8667455eebf25b9e042655c92fbda3f8d0d68f70",
+  "prompts": {},
+  "sessions": {
+    "s_583ba4eb96ad8a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2ac73fb2-9428-4877-ae7d-195e5b69e526",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
