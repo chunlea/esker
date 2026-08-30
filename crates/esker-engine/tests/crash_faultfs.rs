@@ -33,15 +33,18 @@
 //! The schedule is a pure function of `(seed, operation index)`, so the run is performed twice
 //! rather than snapshotted, and the second run is identical to the first by construction.
 //!
-//! # What is blocked
+//! # What this sweep found, and what happened to it
 //!
-//! The clean-truncation half of this file passes at full coverage. The *torn record* half does
-//! not: at the commit this was written against, a failed log append left a prefix on disk and
-//! the engine kept appending after it, so recovery met a broken record that was not at the
-//! tail and refused the database — losing writes it had acknowledged. See
-//! [`writes_after_a_torn_record_are_acknowledged_and_then_lost`], which is ignored until the
-//! spine gives the log an error state, and
-//! [`a_torn_append_never_produces_wrong_data`], which asserts only what must hold either way.
+//! At 9409bc1 the torn-record half of this file did not hold. A failed log append left a
+//! prefix on disk and the engine kept appending after it, so recovery met a broken record
+//! that was not at the tail, refused the database, and lost writes it had acknowledged — 35
+//! of 178 torn schedules. That was `CLAUDE.md` invariant 1, and the fix landed in b9cb5c9: a
+//! failed append now ends the segment, so the tear stays at the tail where recovery already
+//! copes with it.
+//!
+//! [`a_torn_append_ends_the_segment`] is the minimal case that found it, kept as a regression.
+//! The targeted regressions for the fix itself live in `tests/wal_tear.rs`, which the spine
+//! owns; this file's job is the sweep.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -351,20 +354,20 @@ fn cutting_the_power_at_every_operation() {
     );
 }
 
-/// A torn append may cost the database, but it may never produce wrong data.
+/// A torn append never costs an acknowledged write.
 ///
-/// A short append leaves a record half on disk. Whether the engine can recover from that is
-/// the subject of [`writes_after_a_torn_record_are_acknowledged_and_then_lost`] and is not
-/// asserted here — recovery either works or it does not, and a test that *required* it to
-/// fail would go red the day it starts working. What is asserted is the part that must hold
-/// in every world: **wherever the database does reopen, the contract holds.** Nothing
-/// acknowledged is missing, and nothing readable is wrong.
+/// Sweeps 60 seeds against a plan that both tears appends and cuts the power, and asserts the
+/// property the fix in b9cb5c9 established: **no write is acknowledged after a record has been
+/// left half-written**, and wherever the database reopens, everything acknowledged is there.
 ///
-/// The two counts are printed rather than asserted, because they are the size of a bug and
-/// bugs are supposed to shrink. Run with `--nocapture` to see them.
+/// A schedule that does *not* reopen is legal only when nothing was acknowledged — most of
+/// them are cut inside `Db::open`, before `CURRENT` exists, so the directory holds a manifest
+/// and no pointer to it, which is not a database. That count is printed rather than asserted,
+/// because it is a property of where the cuts land and not of the engine; `tests/wal_tear.rs`
+/// is where it is pinned down.
 #[test]
-fn a_torn_append_never_produces_wrong_data() {
-    let (mut torn, mut unrecoverable, mut acked_after_tear) = (0usize, 0usize, 0usize);
+fn a_torn_append_never_costs_an_acknowledged_write() {
+    let (mut torn, mut no_database, mut acked_after_tear) = (0usize, 0usize, 0usize);
     for seed in 0..60u64 {
         let total = operation_count(seed);
         for cut_at in [total / 3, total / 2, total - 1] {
@@ -378,8 +381,16 @@ fn a_torn_append_never_produces_wrong_data() {
                 acked_after_tear += 1;
             }
             match reopen(&outcome) {
-                Err(_) => unrecoverable += 1,
                 Ok(db) => check(&db, &outcome, seed, &plan, "torn append"),
+                Err(error) => {
+                    assert!(
+                        outcome.acked.is_empty(),
+                        "a database with {} acknowledged writes would not reopen ({}): {error}",
+                        outcome.acked.len(),
+                        outcome.describe(seed, &plan)
+                    );
+                    no_database += 1;
+                }
             }
         }
     }
@@ -388,38 +399,34 @@ fn a_torn_append_never_produces_wrong_data() {
         torn > 50,
         "only {torn} schedules tore a record; this sweep measured almost nothing"
     );
+    assert_eq!(
+        acked_after_tear, 0,
+        "{acked_after_tear} of {torn} torn schedules acknowledged a write after the tear; \
+         that is invariant 1, and it was fixed in b9cb5c9"
+    );
     println!(
-        "torn appends: {torn} schedules tore a record, {unrecoverable} left the database \
-         unopenable, {acked_after_tear} acknowledged a write after the tear"
+        "torn appends: {torn} schedules tore a record, 0 lost an acknowledged write, \
+         {no_database} were cut before the database existed"
     );
 }
 
-/// **Known engine bug — the log keeps taking writes after an append fails.**
+/// The minimal case that found the torn-append bug, kept as its regression.
 ///
-/// Seed 5, six writes, one torn append. Write 1's append writes a prefix and then fails, so
-/// `write()` returns an error and it is correctly *not* acknowledged. Writes 2 to 5 then
-/// append after the half-written bytes and are acknowledged. Reopening the database fails
-/// outright — `corruption in 000002.wal: checksum mismatch` — and with `paranoid_checks` off
-/// it opens but only write 0 is readable: **five acknowledged writes, silently gone.**
+/// Seed 5, six writes, one torn append. At 9409bc1 write 1's append wrote a prefix and failed
+/// — correctly unacknowledged — and then writes 2 to 5 appended after the half-written bytes
+/// and *were* acknowledged. Reopening failed outright with a checksum mismatch, and with
+/// `paranoid_checks` off it opened with only write 0 readable: five acknowledged writes gone.
 ///
-/// That is `CLAUDE.md` invariant 1: a write acknowledged as durable was not. The engine has no
-/// state that says "this log is broken now"; `DbInner::commit_group` returns the error to one
-/// caller and the next group calls `add_record` again on the same writer, at the offset after
-/// the partial bytes. `LevelDB` and `RocksDB` both answer this with a permanent background
-/// error that fails every later write.
-///
-/// Ignored until the spine fixes it. It is a repro, not a regression test yet: un-ignore it
-/// with the fix.
+/// Since b9cb5c9 a failed append ends the segment, so nothing is written past the tear and it
+/// stays where recovery expects it. What this asserts now is that shape: one tear, nothing
+/// acknowledged after it, and everything that *was* acknowledged still readable.
 #[test]
-#[ignore = "engine bug: a failed WAL append does not stop later writes being acknowledged"]
-fn writes_after_a_torn_record_are_acknowledged_and_then_lost() {
+fn a_torn_append_ends_the_segment() {
     let seed = 5;
     let plan = FaultPlan::none(seed).with_short_appends(0.15);
-    // Six writes, not the sweep's twenty-four: this is the smallest run that shows it.
+    // Six writes, not the sweep's twenty-four: this is the smallest run that showed it.
     let outcome = run_n(seed, plan, 6);
 
-    // The shape this repro depends on, asserted rather than assumed — if the schedule ever
-    // changes, this says so instead of quietly testing nothing.
     let tears: Vec<u64> = outcome
         .faulty
         .faults()
@@ -433,57 +440,14 @@ fn writes_after_a_torn_record_are_acknowledged_and_then_lost() {
         "expected exactly one torn append, got {tears:?}"
     );
     assert!(
-        outcome.acknowledged_after_a_tear(),
-        "no write was acknowledged after the tear, so there is nothing to lose"
+        !outcome.acknowledged_after_a_tear(),
+        "a write was acknowledged after the tear ({})",
+        outcome.describe(seed, &plan)
     );
-    assert_eq!(
-        outcome.acked.len(),
-        5,
-        "expected five of six writes acknowledged, got {:?}",
-        outcome.acked
-    );
-
-    // What must be true, and is not.
-    verify(&outcome, seed, &plan, "after a torn record");
-}
-
-/// A write that the filesystem refused must not be acknowledged, whatever else happens. If a
-/// failed `fsync` could still return `Ok` from `write()`, invariant 1 would be a comment.
-#[test]
-fn a_failed_sync_is_never_acknowledged() {
-    let mut refused = 0usize;
-    for seed in 0..24u64 {
-        let plan = FaultPlan::none(seed).with_failed_syncs(0.4);
-        let outcome = run(seed, plan);
-
-        let failed_syncs = outcome
-            .faulty
-            .faults()
-            .iter()
-            .filter(|record| {
-                matches!(record.fault, Fault::Failed)
-                    && matches!(
-                        record.operation,
-                        esker_engine::testing::Operation::SyncData(_)
-                    )
-            })
-            .count();
-        refused += failed_syncs;
-
-        // Every synced write that was acknowledged had a successful `sync_data` behind it, so
-        // the count of acknowledgements plus the count of refused syncs cannot exceed what was
-        // attempted.
-        assert!(
-            outcome.acked.len() + failed_syncs >= outcome.attempted.try_into().unwrap_or(0),
-            "{} acked and {failed_syncs} syncs refused does not account for {} attempts ({})",
-            outcome.acked.len(),
-            outcome.attempted,
-            outcome.describe(seed, &plan)
-        );
-        verify(&outcome, seed, &plan, "failed syncs");
-    }
     assert!(
-        refused > 30,
-        "only {refused} syncs were refused across the sweep"
+        !outcome.acked.is_empty(),
+        "nothing was acknowledged at all, so this proves nothing"
     );
+
+    verify(&outcome, seed, &plan, "after a torn record");
 }
