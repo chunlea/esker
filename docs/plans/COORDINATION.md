@@ -92,6 +92,14 @@ One coordinator (Fable, herdr pane `COORD`) directing coding lanes. Phases are g
 
 ## Decisions
 
+- 2026-08-30 ~10:00 (user directive): **pool priority flipped** — burn the `claude` pool
+  (user's own, week resets Mon 09-01 01:00) first for all new lanes; `claude-wy`
+  (resets 09-04) is the reserve. In-flight P3 lanes stay where they are.
+- 2026-08-30 ~10:00 (user directive): **harden phase 3 before phase 4** — acceptance
+  runs an extended soak beyond the 10k-seed minimum (tens of thousands of seeds, longer
+  leader-kill chaos), stateright exhaustive, coordinator reviews driver + apply loop,
+  raft-spec.md rule-to-function map verified complete.
+
 - 2026-08-30: toolchain is rustup **stable** (repo pins via `rust-toolchain.toml` in
   phase 0); `just`, `cargo-deny`, `cargo-nextest` installed via Homebrew on this machine.
 - 2026-08-30: coordinator quota note — `claude` pool Fable week at 69% at start; Fable is
