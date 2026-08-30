@@ -17,11 +17,13 @@ Two lanes build it in parallel, against the types pinned in §3. `esker-raft` ha
 
 | Lane | Owns | Sub-phases |
 |---|---|---|
-| `wy-p3-raft` | `crates/esker-raft/**`, `docs/raft-spec.md`, this plan, raft ADRs (0007+) | 3a, 3d |
+| `wy-p3-raft` | `crates/esker-raft/**`, `docs/raft-spec.md`, this plan, raft ADRs (0007+) | 3a, 3d, **3e** |
 | `cl-p3-sim` | `crates/esker-sim/**`, the stateright model, `docs/bench` entries it produces | 3b, 3c |
 
-3e (one replicated region in `esker-store`) is **not in this phase's lanes** — it opens after 3a–3d
-land, because it needs both a finished core and a simulator that can drive the real store code.
+3e (one replicated region in `esker-store`) opened to the raft lane once 3a–3d were accepted; §11
+is its plan, and it grows that lane to `crates/esker-store/**`, the redirect handling in
+`crates/esker-client/src/**`, `crates/esker-cli/**` and the Raft transport in
+`crates/esker-proto/**`.
 
 The dependency runs one way: the simulator is written against §3 and does not wait for the core to
 be finished. `wy-p3-raft`'s first code commit lands the whole public surface compiling, with
@@ -333,3 +335,80 @@ did **not** catch its mutation, because no test had an unpersisted tail when the
 That interleaving is now `a_snapshot_discards_an_unpersisted_tail`, and it does.
 
 Not done here, by the gate: 3b/3c (`esker-sim`, the sibling lane) and 3e (`esker-store`).
+
+## 11. Sub-phase 3e — one replicated region in `esker-store`
+
+Status: **in progress**. Spec: `prompts/03-raft.md` 3e, `docs/DESIGN.md` §2 (request path), §5 (the
+driver contract), §6 (the `raft` CF key layout), §9 (the wire), §10 (the client's region cache).
+
+Phase 2 built a store whose API already looks distributed: every request carries
+`{ region_id, epoch, peer }`, every error is typed with a redirect hint, and the store already
+refuses a request whose epoch or key range does not match. 3e makes that true rather than
+anticipatory. Nothing about the *shape* of the API changes; what changes is that a write now goes
+through Raft before it goes to the engine, and that two of the three stores holding it will refuse
+to serve it.
+
+### 11.1 Units
+
+| # | Unit | Files |
+|---|---|---|
+| 1 | `RaftLogStorage` over the engine's `raft` CF | `esker-store/src/raft_log.rs` |
+| 2 | The driver: `RawNode` + the `Ready` loop, on its own thread | `esker-store/src/peer.rs` |
+| 3 | The apply loop: committed entries → data CFs + `apply_index`, one batch | `esker-store/src/apply.rs` |
+| 4 | Transport: `RaftTransport::Batch` over `esker-proto` | `esker-proto/src/raft.rs`, `esker-store/src/transport.rs` |
+| 5 | Leader-only serving, `NotLeader` redirects, `ReadIndex` reads; the client learns leaders | `esker-store/src/server.rs`, `esker-client/src/**` |
+| 6 | `esker-cli cluster start --nodes 3` / `cluster stop` | `esker-cli/src/cluster.rs` |
+| 7 | The store-level test spine | `esker-store/tests/**` |
+
+### 11.2 The five decisions worth writing down before the code
+
+**The raft log storage is read through and written through.** `LogStorage`'s reads (`term`,
+`entries`) go to the engine; its bounds (`first_index`, `last_index`, the hard state, the
+configuration) are cached in the struct, because `RawNode` owns its storage exclusively and only
+the driver mutates it — so the cache needs no lock and cannot go stale behind anyone's back.
+
+**The raft state record holds the hard state *and* the apply index, in one key** (`docs/DESIGN.md`
+§6). That creates a hazard worth naming: the persist step and the apply step both write it, and the
+apply step must not overwrite a newer hard state with the copy it read at the start. The driver is
+the single source of truth for both fields and writes the whole record every time, so the value on
+disk is always `(latest hard state, latest apply index)` for whichever of the two batches landed
+last.
+
+**The apply batch is not fsynced; the raft batch is.** A crash that loses the apply batch has not
+lost the write: the entry is still in the raft log, which *was* synced, and the restart re-applies
+it from `apply_index + 1`. Since `apply_index` and the data are in the same batch, a crash either
+has both or neither — never half — so re-applying is exactly right and nothing applies twice.
+
+**An entry's payload is a command, not a `WriteBatch` and not a `RawKvReq`.** Proposing the
+resulting `WriteBatch` would be simpler and is deterministic by construction, but it moves
+`CompareAndSwap`'s read-modify-write to the *leader*, where it is evaluated against state that a
+later leader may not have. Evaluating the command at apply time keeps it deterministic — every peer
+runs it against the same applied state — and correct across a leadership change. It is not
+`RawKvReq` because the raft log is an on-disk format and the wire is not: they must be able to move
+independently (`docs/adr/0002-formats-are-hand-rolled.md`).
+
+**A `ReadIndex` read waits for *apply*, not for commit.** The index the core hands back is a commit
+index; answering the read before the state machine has run through it returns a state older than
+the read's own position in the order. The driver holds the read until `applied_index` reaches it.
+
+### 11.3 Test list
+
+| Area | Tests |
+|---|---|
+| key layout | golden bytes for `'l'`/`'s'`/`'m'`; big-endian so a range scan is in index order; a decoded entry whose index disagrees with its key is corruption, not a silent wrong answer |
+| `LogStorage` | the trait's contract against the engine, mirroring `MemStorage`'s tests: bounds, `term` at the compaction boundary, half-open ranges, the byte budget |
+| driver contract | **persist-before-send asserted with a transport that records the order**; the raft batch is synced; a `Ready` is advanced only after all four steps |
+| apply | `apply_index` and the data are in one batch; apply exactly once across a restart that kills between batches; a proposal whose entry was truncated is failed, not left hanging |
+| reads | a `ReadIndex` read is not answered before its index has *applied* |
+| redirects | a follower answers `NotLeader { leader_hint }`; the client's region cache learns the leader and the retry lands |
+| cluster | three stores over real TCP, one region: writes on the leader, kill the leader, no acknowledged write lost, the cluster converges |
+
+### 11.4 Non-goals for 3e
+
+- **Snapshot bytes.** The core's `InstallSnapshot` metadata path is done; streaming the region's
+  SSTs is phase 4, and a single region that never compacts its raft log never needs one. The send
+  and receive paths are `// TODO(phase-4)`.
+- **Split, merge, multi-region, PD.** One region, one static configuration, bootstrapped.
+- **Membership change over the wire.** The core supports it; 3e has no operator to drive it.
+- **The full chaos and linearizability battery.** That is the sibling's and the acceptance lane's;
+  this lane builds the store-level spine those drive.
