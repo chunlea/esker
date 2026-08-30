@@ -70,3 +70,31 @@ cargo build --release -p esker-cli
 ```
 
 `just bench <args>` runs the same driver through cargo.
+
+## Run 2 — 2026-08-30, bloom before disk on the point-read path
+
+Same machine, toolchain and build as run 1; only the engine changed (`df2a31b`). The level
+lookup now consults the bloom filter before opening a table iterator, which run 1 measured
+without. Recorded separately rather than by editing run 1, so the change is visible.
+
+`--bloom-bits 0` builds no filter, which is how both halves of the trade are measured rather
+than argued about. `readmissing` is new: keys that are absent but sort *between* keys that are
+present, so the file's range check cannot rule them out and only the filter can.
+
+| Workload | Filter | ops/s | MB/s | p50 | p99 |
+|---|:--:|---:|---:|---:|---:|
+| `readrandom` (every key present) | off | 385,863 | 43.79 | 2.5 µs | 3.5 µs |
+| `readrandom` (every key present) | **10 bits/key** | 377,783 | 42.87 | 2.5 µs | 3.5 µs |
+| `readmissing` (no key present) | off | 387,220 | 43.94 | 2.5 µs | 3.4 µs |
+| `readmissing` (no key present) | **10 bits/key** | 3,544,839 | 402.29 | 0.2 µs | 0.4 µs |
+
+**The filter costs 2.1% on reads that hit and saves 9.2× on reads that miss.** A key that is
+there passes the filter and does the index lookup and block read anyway, so the probe is pure
+overhead; a key that is not there never touches the disk at all. That is the whole reason a
+bloom filter is in `docs/DESIGN.md` §4.9, and both halves of it are now numbers.
+
+Run 1's `readrandom` figure of 387,967 ops/s is the *filterless* path and matches the 385,863
+measured here with `--bloom-bits 0`; the two runs agree to within half a percent, which is
+also a small check that the harness is measuring the same thing twice.
+
+Nothing else moved: the write and scan workloads do not consult a filter.
