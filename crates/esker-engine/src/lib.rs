@@ -33,10 +33,16 @@
 //! | [`options`] | knobs, prefix extraction, compression, and the §14 defaults |
 //! | [`mod@format`] | byte sizes that are frozen |
 //! | [`memfs`] | an in-memory filesystem, so damage can be injected without a disk |
+//! | [`memtable`] | the sorted in-memory table every write lands in |
 //! | [`wal`] | the write-ahead log: durability, and torn tails told from corruption |
 //! | [`sst`], [`cache`] | the table format and the sharded LRU behind it |
 
 #![warn(unsafe_code)]
+// The engine's iterators are seekable cursors, not Rust `Iterator`s: `next()` yields nothing,
+// and they must also go backwards and seek to an arbitrary key (`docs/DESIGN.md` §4.1). They
+// are still called `iter()`, because that is what every caller and every LevelDB-shaped
+// engine calls them.
+#![allow(clippy::iter_not_returning_iterator)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod batch;
@@ -46,6 +52,7 @@ pub mod dbformat;
 pub mod error;
 pub mod fs;
 pub mod memfs;
+pub mod memtable;
 pub mod options;
 pub mod sst;
 pub mod wal;
@@ -57,6 +64,7 @@ pub use dbformat::{
 };
 pub use error::{Error, Result};
 pub use fs::{FileSystem, LocalFileSystem, RandomAccessFile, WritableFile};
+pub use memtable::MemTable;
 pub use options::{Compression, PrefixExtractor, WalSyncMode, WriteOptions};
 pub use wal::{LogReader, LogWriter, ReadOutcome};
 
