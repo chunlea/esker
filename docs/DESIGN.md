@@ -228,31 +228,52 @@ etcd/raft-rs's `RawNode`/`Ready` split.
 
 ```rust
 pub struct RawNode<S: LogStorage>;
-impl RawNode {
+impl<S: LogStorage> RawNode<S> {
+  fn new(config: Config, storage: S) -> Result<Self>;
   fn tick(&mut self);                       // one logical tick; election/heartbeat timeouts count ticks
-  fn step(&mut self, msg: Message) -> Result<()>;
+  fn step(&mut self, msg: Message) -> Result<()>;   // never fails on a message's content, never panics
   fn propose(&mut self, data: Bytes) -> Result<()>;
   fn propose_conf_change(&mut self, cc: ConfChange) -> Result<()>;
   fn read_index(&mut self, ctx: Bytes);
+  fn campaign(&mut self) -> Result<()>;     // stand for election now; the simulator drives elections with it
+  fn transfer_leader(&mut self, target: NodeId);
   fn has_ready(&self) -> bool;
-  fn ready(&mut self) -> Ready;             // { hard_state, entries_to_append, snapshot_to_apply, messages, committed_entries, read_states }
-  fn advance(&mut self, rd: Ready);         // caller has persisted hard_state+entries and sent messages
+  fn ready(&mut self) -> Ready;             // { hard_state, entries, snapshot, messages, committed_entries, read_states }
+  fn advance(&mut self, rd: &Ready);        // caller has discharged the contract below
+  fn role(&self) -> Role;  fn term(&self) -> Term;  fn leader(&self) -> Option<NodeId>;
+  fn commit_index(&self) -> Index;  fn status(&self) -> Status;
+  fn storage(&self) -> &S;  fn storage_mut(&mut self) -> &mut S;
 }
 pub trait LogStorage { initial_state, entries(lo, hi, max_bytes), term(idx), first_index, last_index, snapshot }
+pub struct MemStorage;                      // in-memory LogStorage, for tests and the simulator
 ```
 
-Driver contract (implemented in `esker-store`): persist `hard_state` and `entries` (fsync) **before**
-sending `messages`; apply `committed_entries` in order; then `advance()`. Violating the order breaks
-safety — the simulator tests this explicitly.
+Driver contract (implemented in `esker-store`), in order — the normative text is the doc comment on
+`Ready` itself, and `docs/raft-spec.md` gives each rule a row:
+
+1. persist `hard_state` and `entries` (fsync) **before** sending any of `messages`;
+2. apply `snapshot` before `entries` when both are present;
+3. apply `committed_entries` in order, exactly once;
+4. answer a `read_state` only once the state machine has applied through its index;
+5. then `advance()`.
+
+Violating rule 1 breaks safety — it is also what makes the leader's own bookkeeping sound, since a
+leader counts itself as holding an entry before any fsync and may only do so because it cannot send
+before persisting. The simulator tests violations explicitly. A `Ready` that is dropped without
+being advanced re-offers its state; its `messages` are taken, which is safe because the network may
+lose a message anyway.
 
 Features by sub-phase: leader election with randomized timeouts (10–20 ticks *default*, tick = 100 ms),
 log replication with batching and flow control (`max_inflight_msgs`), **pre-vote**, **check-quorum**,
 leader **ReadIndex**, log compaction and **snapshots** (InstallSnapshot streamed by the store), single-server
 **membership change** (add/remove one voter or learner at a time; joint consensus is an ADR for later),
-**learners**, leadership transfer.
+**learners**, leadership transfer. The message set folds heartbeats into `AppendEntries` and
+acknowledges a snapshot with `AppendEntriesResponse` — [ADR 0007](adr/0007-raft-message-set.md).
 
-Determinism rules: no `Instant`, no `rand::thread_rng` — the RNG is injected and seeded; every decision is a
-function of `(state, message | tick)`.
+Determinism rules: no `Instant`, no `rand::thread_rng` — the RNG is injected and seeded, and the node
+id selects its PCG stream so one seed reproduces a whole cluster; no `HashMap` appears in the crate,
+because its iteration order would be a decision input; every decision is a function of
+`(state, message | tick)`. [ADR 0008](adr/0008-raft-determinism-and-the-driver-contract.md).
 
 ## 6. Store (`esker-store`)
 

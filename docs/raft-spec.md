@@ -3,7 +3,10 @@
 Ongaro's dissertation, *Consensus: Bridging Theory and Practice* (2014), Figure 3.1, restated rule by
 rule, plus the features from later chapters that `esker-raft` implements. **Every rule names the
 function that implements it and the test that proves it.** A rule whose "implemented by" column still
-says `TBD` is a rule this crate does not yet obey, and the step it is waiting on is named.
+says `TBD` is a rule this crate does not yet obey, and the step it is waiting on is named. As of
+the end of phase 3a/3d there are none: the two entries that name `esker-sim` are properties of a
+*history*, which no single-process test can observe, and they belong to the sibling lane by
+design.
 
 This file is the checklist for phase 3's acceptance (`prompts/03-raft.md`). It is not a substitute
 for the dissertation: it is an index into our code, written in the dissertation's numbering so the
@@ -95,9 +98,9 @@ system, not of one function, so their "implemented by" is the argument, not a li
 | # | Property | Argued by | Checked by |
 |---|---|---|---|
 | P1 | **Election Safety** — at most one leader per term | V2 (a server votes once per term) plus quorum intersection | `proptests::{three,five}_nodes_never_have_two_leaders_in_one_term`, `an_even_group_never_breaks_a_tie_by_electing_twice`; `esker-sim` |
-| P2 | **Leader Append-Only** — a leader never overwrites or deletes entries in its own log | leaders only append; truncation is a follower path (A3) | TBD (`esker-sim`) |
+| P2 | **Leader Append-Only** — a leader never overwrites or deletes entries in its own log | leaders only append; truncation is a follower path (A3) | `esker-sim` (there is no in-crate check: the property is about a history, not a state) |
 | P3 | **Log Matching** — two logs agreeing at an index and term are identical up to it | A2's induction | `testkit::Harness::check_log_matching`, run after every action of the proptests; `esker-sim` |
-| P4 | **Leader Completeness** — a committed entry is present in every future leader's log | V2's up-to-date check plus L4's term condition | TBD (`esker-sim`) |
+| P4 | **Leader Completeness** — a committed entry is present in every future leader's log | V2's up-to-date check plus L4's term condition | `esker-sim`; its two ingredients are pinned in-crate by `the_up_to_date_check_compares_term_before_length` and `a_prior_term_entry_on_a_majority_does_not_commit_by_counting` |
 | P5 | **State Machine Safety** — no two servers apply different commands at the same index | P4 plus R1 | `testkit::Harness::check_log_matching`'s committed-prefix half, run after every action of the proptests; `esker-sim` |
 
 ## 5. Log compaction and snapshots (dissertation §5)
@@ -157,13 +160,14 @@ is not yet an ADR becomes one before the phase closes (`prompts/03-raft.md`, "Ac
 
 | Decision | Where | Status |
 |---|---|---|
-| Heartbeats are `AppendEntries` with no entries, not their own message | `message.rs` | `docs/plans/phase-3.md` §3; ADR TBD |
-| A `RequestVote` from an older term is **ignored**, not refused — Figure 3.1 says reply false. A stale candidate cannot win whatever we say, and staying quiet keeps a looping node from being answered forever. A stale *pre-vote* is refused, because that reply is how a node behind the cluster learns its term | `core.rs` | ADR TBD |
-| A pre-vote round redraws the election timeout even though it does not reset the term, so two nodes that pre-campaigned together do not do so again | `election.rs` | ADR TBD |
-| A snapshot is acknowledged with `AppendEntriesResponse`, not its own response | `message.rs` | `docs/plans/phase-3.md` §3; ADR TBD |
-| The rejection hint carries a term as well as an index, so a leader skips a term per round trip rather than an index | `message.rs`, `replication.rs` | ADR TBD |
-| An append carrying no entries does not consume the in-flight window — it is a heartbeat by another name, and charging it would throttle the messages that advertise a new commit index | `replication.rs` | ADR TBD |
-| Persistence is the driver's, and the ordering is a documented contract rather than an enforced one | `raw_node.rs` | `docs/plans/phase-3.md` §4; ADR TBD |
+| Heartbeats are `AppendEntries` with no entries, not their own message | `message.rs` | [ADR 0007](adr/0007-raft-message-set.md) |
+| A `RequestVote` from an older term is **ignored**, not refused (Figure 3.1 says reply false); a stale *pre-vote* is refused, because that reply is how a node behind the cluster learns its term | `core.rs` | [ADR 0007](adr/0007-raft-message-set.md) |
+| A pre-vote round redraws the election timeout even though it does not reset the term, so two nodes that pre-campaigned together do not do so again | `election.rs` | [ADR 0008](adr/0008-raft-determinism-and-the-driver-contract.md) |
+| A snapshot is acknowledged with `AppendEntriesResponse`, not its own response | `message.rs` | [ADR 0007](adr/0007-raft-message-set.md) |
+| The rejection hint carries a term as well as an index, so a leader skips a term per round trip rather than an index | `message.rs`, `replication.rs` | [ADR 0007](adr/0007-raft-message-set.md) |
+| An append carrying no entries does not consume the in-flight window — it is a heartbeat by another name, and charging it would throttle the messages that advertise a new commit index | `replication.rs` | [ADR 0007](adr/0007-raft-message-set.md) |
+| Persistence is the driver's, and the ordering is a documented contract rather than an enforced one | `raw_node.rs` | [ADR 0008](adr/0008-raft-determinism-and-the-driver-contract.md) |
 | Single-server membership change only; joint consensus deferred | `conf.rs` | `docs/DESIGN.md` §5 |
 | `ReadIndex` only; no lease reads, which would need a bounded-clock-skew assumption | `readonly.rs` | `docs/DESIGN.md` §5 |
-| The RNG is injected and the node id selects its stream | `config.rs` | ADR TBD |
+| The RNG is injected and the node id selects its stream, so one seed reproduces a whole cluster | `config.rs` | [ADR 0008](adr/0008-raft-determinism-and-the-driver-contract.md) |
+| Progress and votes are sorted `Vec`s; no `HashMap` appears in the crate | `progress.rs`, `election.rs` | [ADR 0008](adr/0008-raft-determinism-and-the-driver-contract.md) |

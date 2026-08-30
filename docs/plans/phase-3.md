@@ -281,8 +281,55 @@ The orderings that break Raft implementations. Each is a named test in this lane
 - [x] step 4 — ReadIndex
 - [x] step 5 — compaction and `InstallSnapshot`
 - [x] step 6 — membership, learners, transfer, pre-vote, check-quorum
-- [ ] step 7 — `docs/raft-spec.md` closed
+- [x] step 7 — `docs/raft-spec.md` closed; ADRs 0007 and 0008; `docs/DESIGN.md` §5 realigned
 
 ## 10. Changes vs plan
 
-Nothing yet.
+The raft lane's steps 0–7 are done. What differs from what §3 and §5 said before the code existed:
+
+1. **`RawNode::advance` takes `&Ready`, not `Ready`.** The driver needs the value after advancing —
+   to answer reads, to log what it wrote — and taking it by value forced a clone at every call site.
+
+2. **`Ready::messages` are taken, not re-offered.** §4 rule 5 originally said a dropped `Ready` is
+   re-offered "unchanged". That is true of the state and false of the messages, which `ready()`
+   moves out. It is safe (the network may lose a message anyway, so Raft already retries
+   everything), but the text was wrong and is now corrected in both places.
+
+3. **`AppendEntries` gained a `context` field**, and its response echoes it. Folding heartbeats into
+   appends (§3) left a `ReadIndex` round with nothing to ride on; etcd puts the context on its
+   separate heartbeat message, and with no separate message it has to go here. Recorded in ADR 0007.
+
+4. **`maybe_append` reports what it truncated.** §4.1's apply-at-append rule needs its inverse —
+   revert-on-truncate — and the layer above the log cannot work out what was truncated for itself.
+   `AppendOutcome { last, truncated_from }` is the smallest thing that says it.
+
+5. **Two files were split** (`election.rs`, `replication.rs`) into implementation plus a
+   `tests.rs` submodule, to stay under `CLAUDE.md`'s ~800-line limit while keeping the tests'
+   crate-internal access.
+
+Five defects were found by tests during the phase, four of them by tests written before the fix:
+
+- **The log seam.** Truncating below the unstable tail emptied it and lowered its offset, so
+  `last_index()` fell through to storage and reported entries the log had just discarded — a
+  follower would advertise a longer log than it holds and could win an election it has no right to.
+- **A follower returning from a partition** was heartbeated forever and never sent the entries it
+  was missing: the leader only replicated when a response moved something, and a partition drops
+  the probe that would have moved it.
+- **A compacted leader never sent a snapshot** when the follower's rejection could not move `next`
+  any further back. The rejection did nothing at all, so the follower stayed broken.
+- **An empty append consumed the in-flight window**, so a leader with a small window throttled the
+  very messages that advertise a new commit index.
+- **`RawNode::campaign()` panicked on a leader** (a debug assert), found by the property test on its
+  first run. It is a public method, so that is an invariant-9 violation.
+
+Two overflow panics on adversarial input were found by the `step()` fuzz test — a snapshot index at
+`u64::MAX`, and term arithmetic at `u64::MAX`. Every index arriving off the network is now clamped
+to what the receiver itself holds, and the arithmetic saturates.
+
+Every safety-critical test was checked against a deliberate mutation of the rule it covers: the
+one-vote-per-term rule, §5.4.2's term condition, the `ReadIndex` quorum round, the snapshot
+replacing the log, apply-at-append and revert-on-truncate. One test — the first snapshot one —
+did **not** catch its mutation, because no test had an unpersisted tail when the snapshot arrived.
+That interleaving is now `a_snapshot_discards_an_unpersisted_tail`, and it does.
+
+Not done here, by the gate: 3b/3c (`esker-sim`, the sibling lane) and 3e (`esker-store`).
