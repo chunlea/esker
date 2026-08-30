@@ -44,8 +44,17 @@ fn raw_body(request: &Request) -> Option<&RawKvReq> {
         // A client never sends `Hello` through a rule — the transport handles it — and never
         // sends Raft traffic at all: that is store-to-store, on connections a client has none of.
         // A `Pd` request has no `RawKv` body and is not addressed to a region, so no rule
-        // written in terms of keys or regions can match one.
-        Request::Hello(_) | Request::Raft(_) | Request::Pd { .. } => None,
+        // written in terms of keys or regions can match one; a snapshot request is a
+        // follower asking a leader, which is store-to-store as well.
+        //
+        // TODO(phase-5): a `TxnKv` request *is* addressed to a region and has keys, so it has
+        // a body a rule should be able to match on. It has none here because this accessor
+        // answers a `RawKvReq`; `txn_body` beside it is the shape that fits.
+        Request::Hello(_)
+        | Request::Raft(_)
+        | Request::Snapshot(_)
+        | Request::Pd { .. }
+        | Request::TxnKv { .. } => None,
     }
 }
 

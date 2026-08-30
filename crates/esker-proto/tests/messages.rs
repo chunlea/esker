@@ -10,6 +10,7 @@
 use bytes::Bytes;
 use esker_proto::messages::{DEFAULT_SCAN_LIMIT, Hello, HelloAck, RawKvReq, RawKvResp};
 use esker_proto::pd::{Operator, PdReq, PdResp, StoreInfo};
+use esker_proto::txn::{LockInfo, TxnKvReq, TxnKvResp, TxnMutation};
 use esker_proto::{
     Epoch, MAX_FRAME_SIZE, Method, Peer, PeerRole, ProtoError, RaftBatch, RaftMessage, Region,
     Request, RequestHeader, Response, WIRE_VERSION,
@@ -42,6 +43,16 @@ fn golden(kind: &str, name: &str) -> Vec<u8> {
         .map(|at| u8::from_str_radix(&text[at..at + 2], 16).expect("bad hex"))
         .collect()
 }
+
+/// The timestamps the transaction goldens use. Named rather than repeated, because a golden
+/// whose numbers drift between two cases pins nothing about the relationship between them.
+const TXN_TS: u64 = 42;
+/// The commit timestamp of the transaction goldens; above [`TXN_TS`], as every commit is.
+const TXN_COMMIT_TS: u64 = 50;
+/// The lock TTL of the transaction goldens: the default of `docs/DESIGN.md` §14.
+const TXN_TTL_MS: u64 = 3_000;
+/// A safepoint big enough that its varint is not one byte.
+const TXN_SAFEPOINT: u64 = 1 << 41;
 
 /// The header every golden request carries: region 1, epoch (2, 3), peer 4.
 fn header() -> RequestHeader {
@@ -240,7 +251,191 @@ fn golden_requests() -> Vec<(&'static str, Request)> {
         ),
     ];
     requests.extend(golden_pd_requests());
+    requests.extend(golden_txn_requests());
     requests
+}
+
+/// The transaction service's ten request goldens (`docs/txn-spec.md`, `docs/DESIGN.md` §8).
+///
+/// `ResolveLock` appears twice, because its `commit_ts` of zero is the whole "roll back"
+/// signal and a golden for the commit case alone would not pin it.
+fn golden_txn_requests() -> Vec<(&'static str, Request)> {
+    let mut requests = golden_txn_read_requests();
+    requests.extend(golden_txn_write_requests());
+    requests
+}
+
+/// `Get` and `Scan`: the two methods that take a snapshot and change nothing.
+fn golden_txn_read_requests() -> Vec<(&'static str, Request)> {
+    let h = header();
+    vec![
+        (
+            "txn-get",
+            Request::txn_kv(
+                h,
+                TxnKvReq::Get {
+                    key: Bytes::from_static(b"key"),
+                    ts: TXN_TS,
+                },
+            ),
+        ),
+        (
+            "txn-scan",
+            Request::txn_kv(
+                h,
+                TxnKvReq::Scan {
+                    start: Bytes::from_static(b"a"),
+                    end: Bytes::from_static(b"z"),
+                    limit: 100,
+                    ts: TXN_TS,
+                    reverse: false,
+                },
+            ),
+        ),
+        (
+            "txn-scan-reverse",
+            Request::txn_kv(
+                h,
+                TxnKvReq::Scan {
+                    start: Bytes::from_static(b"a"),
+                    end: Bytes::from_static(b"z"),
+                    limit: 100,
+                    ts: TXN_TS,
+                    reverse: true,
+                },
+            ),
+        ),
+    ]
+}
+
+/// The six methods that write: two phases, two ways to end, and the two pieces of
+/// housekeeping (a lock's TTL and the collection safepoint).
+fn golden_txn_write_requests() -> Vec<(&'static str, Request)> {
+    let h = header();
+    vec![
+        (
+            "txn-prewrite",
+            Request::txn_kv(
+                h,
+                TxnKvReq::Prewrite {
+                    start_ts: TXN_TS,
+                    primary: Bytes::from_static(b"p"),
+                    ttl_ms: TXN_TTL_MS,
+                    mutations: vec![
+                        TxnMutation::Put {
+                            key: Bytes::from_static(b"a"),
+                            value: Bytes::from_static(b"1"),
+                        },
+                        TxnMutation::Delete {
+                            key: Bytes::from_static(b"b"),
+                        },
+                    ],
+                },
+            ),
+        ),
+        (
+            "txn-commit",
+            Request::txn_kv(
+                h,
+                TxnKvReq::Commit {
+                    start_ts: TXN_TS,
+                    commit_ts: TXN_COMMIT_TS,
+                    keys: vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+                },
+            ),
+        ),
+        (
+            "txn-rollback",
+            Request::txn_kv(
+                h,
+                TxnKvReq::Rollback {
+                    start_ts: TXN_TS,
+                    keys: vec![Bytes::from_static(b"a")],
+                },
+            ),
+        ),
+        (
+            "txn-resolve-commit",
+            Request::txn_kv(
+                h,
+                TxnKvReq::ResolveLock {
+                    start_ts: TXN_TS,
+                    commit_ts: TXN_COMMIT_TS,
+                    keys: vec![],
+                },
+            ),
+        ),
+        (
+            "txn-resolve-rollback",
+            Request::txn_kv(
+                h,
+                TxnKvReq::ResolveLock {
+                    start_ts: TXN_TS,
+                    commit_ts: 0,
+                    keys: vec![Bytes::from_static(b"a")],
+                },
+            ),
+        ),
+        (
+            "txn-heartbeat",
+            Request::txn_kv(
+                h,
+                TxnKvReq::Heartbeat {
+                    start_ts: TXN_TS,
+                    primary: Bytes::from_static(b"p"),
+                    ttl_ms: TXN_TTL_MS,
+                },
+            ),
+        ),
+        (
+            "txn-gc-safepoint",
+            Request::txn_kv(
+                h,
+                TxnKvReq::GcSafepoint {
+                    safepoint: TXN_SAFEPOINT,
+                },
+            ),
+        ),
+    ]
+}
+
+/// The transaction service's response goldens. `Get` appears twice: an absent value and a
+/// present one are different bytes, and a format that confused them would turn a deleted key
+/// into an empty one.
+fn golden_txn_responses() -> Vec<(&'static str, Response)> {
+    vec![
+        (
+            "txn-get",
+            Response::TxnKv(TxnKvResp::Get {
+                value: Some(Bytes::from_static(b"v")),
+            }),
+        ),
+        (
+            "txn-get-absent",
+            Response::TxnKv(TxnKvResp::Get { value: None }),
+        ),
+        (
+            "txn-scan",
+            Response::TxnKv(TxnKvResp::Scan {
+                pairs: vec![(Bytes::from_static(b"a"), Bytes::from_static(b"1"))],
+            }),
+        ),
+        ("txn-prewrite", Response::TxnKv(TxnKvResp::Prewrite)),
+        ("txn-commit", Response::TxnKv(TxnKvResp::Commit)),
+        ("txn-rollback", Response::TxnKv(TxnKvResp::Rollback)),
+        (
+            "txn-resolve-lock",
+            Response::TxnKv(TxnKvResp::ResolveLock { resolved: 3 }),
+        ),
+        (
+            "txn-heartbeat",
+            Response::TxnKv(TxnKvResp::Heartbeat { ttl_ms: TXN_TTL_MS }),
+        ),
+        (
+            "txn-gc-safepoint",
+            Response::TxnKv(TxnKvResp::GcSafepoint { safepoint: 1 << 41 }),
+        ),
+    ]
 }
 
 fn golden_pd_responses() -> Vec<(&'static str, Response)> {
@@ -397,6 +592,7 @@ fn golden_responses() -> Vec<(&'static str, Response)> {
         ("raft-ack", Response::Raft),
     ];
     responses.extend(golden_pd_responses());
+    responses.extend(golden_txn_responses());
     responses
 }
 
@@ -535,6 +731,30 @@ fn golden_errors() -> Vec<(&'static str, ProtoError)> {
     ]
 }
 
+/// The lock that travels inside `ProtoError::Locked`.
+///
+/// The error golden pins the *frame*; those bytes are opaque to it, so without this the one
+/// payload a client has to decode to make progress would be pinned nowhere.
+#[test]
+fn golden_lock_info() {
+    let lock = LockInfo {
+        key: Bytes::from_static(b"account/1"),
+        primary: Bytes::from_static(b"account/0"),
+        start_ts: 1 << 41,
+        ttl_ms: 3_000,
+    };
+    assert_eq!(hex(&lock.encode()), hex(&golden("lockinfo", "account")));
+    assert_eq!(
+        LockInfo::decode(&golden("lockinfo", "account")).unwrap(),
+        lock
+    );
+    // And it survives the error it rides in, which is the only way a client ever sees it.
+    assert_eq!(
+        LockInfo::from_error(&lock.into_error()).unwrap().unwrap(),
+        lock
+    );
+}
+
 #[test]
 fn golden_request_bodies() {
     for (name, request) in golden_requests() {
@@ -650,6 +870,74 @@ proptest! {
         prop_assert_eq!(Request::decode(&message.encode()).unwrap(), message);
     }
 
+    /// The same sweep for the transaction service, including the shapes a golden would not
+    /// think of: an empty key, an empty batch, a `commit_ts` below its `start_ts`.
+    #[test]
+    fn any_txn_kv_request_round_trips(
+        region_id: u64,
+        conf_ver: u64,
+        version: u64,
+        peer: u64,
+        key in proptest::collection::vec(any::<u8>(), 0..64),
+        value in proptest::collection::vec(any::<u8>(), 0..512),
+        start_ts: u64,
+        commit_ts: u64,
+        ttl_ms: u64,
+        limit: u32,
+        reverse: bool,
+        which in 0usize..8,
+    ) {
+        let header = RequestHeader::new(region_id, Epoch::new(conf_ver, version), peer);
+        let key = Bytes::from(key);
+        let value = Bytes::from(value);
+        let request = match which {
+            0 => TxnKvReq::Get { key, ts: start_ts },
+            1 => TxnKvReq::Scan { start: key, end: value, limit, ts: start_ts, reverse },
+            2 => TxnKvReq::Prewrite {
+                start_ts,
+                primary: key.clone(),
+                ttl_ms,
+                mutations: vec![
+                    TxnMutation::Put { key: key.clone(), value },
+                    TxnMutation::Delete { key },
+                ],
+            },
+            3 => TxnKvReq::Commit { start_ts, commit_ts, keys: vec![key, value] },
+            4 => TxnKvReq::Rollback { start_ts, keys: vec![key] },
+            5 => TxnKvReq::ResolveLock { start_ts, commit_ts, keys: vec![] },
+            6 => TxnKvReq::Heartbeat { start_ts, primary: key, ttl_ms },
+            _ => TxnKvReq::GcSafepoint { safepoint: start_ts },
+        };
+        let message = Request::txn_kv(header, request);
+        prop_assert_eq!(Request::decode(&message.encode()).unwrap(), message);
+    }
+
+    /// A lock is the one Percolator shape `esker-proto` carries, and it goes out through an
+    /// error whose payload nothing else validates.
+    #[test]
+    fn any_lock_info_round_trips(
+        key in proptest::collection::vec(any::<u8>(), 0..64),
+        primary in proptest::collection::vec(any::<u8>(), 0..64),
+        start_ts: u64,
+        ttl_ms: u64,
+    ) {
+        let lock = LockInfo {
+            key: Bytes::from(key),
+            primary: Bytes::from(primary),
+            start_ts,
+            ttl_ms,
+        };
+        prop_assert_eq!(LockInfo::decode(&lock.encode()).unwrap(), lock.clone());
+        prop_assert_eq!(LockInfo::from_error(&lock.into_error()).unwrap().unwrap(), lock);
+    }
+
+    /// Arbitrary bytes in a lock payload are an error, never a panic and never a lock made up
+    /// out of noise.
+    #[test]
+    fn random_lock_payloads_never_panic(body in proptest::collection::vec(any::<u8>(), 0..256)) {
+        let _ = LockInfo::decode(&body);
+    }
+
     /// The fuzz case for the body decoder: whatever bytes a frame carried, decoding is a
     /// value or an error, never a panic (`CLAUDE.md` invariant 9).
     #[test]
@@ -663,10 +951,14 @@ proptest! {
     /// a decoder is most tempted to trust a length or a count.
     #[test]
     fn damaged_bodies_never_panic(
-        which in 0usize..12,
+        which: prop::sample::Index,
         damage in proptest::collection::vec((any::<usize>(), any::<u8>()), 1..8),
     ) {
-        let (_, request) = golden_requests().swap_remove(which);
+        // Indexed against the list rather than a constant: a bound written by hand stops
+        // covering the cases added after it, silently, which is how this sweep came to be
+        // fuzzing twelve of thirty-one messages.
+        let mut requests = golden_requests();
+        let (_, request) = requests.swap_remove(which.index(requests.len()));
         let mut bytes = request.encode();
         for (at, value) in damage {
             let at = at % bytes.len();

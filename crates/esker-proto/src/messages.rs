@@ -83,15 +83,30 @@ pub enum Method {
     /// reply shape, and a pulling receiver controls its own retries
     /// (`docs/plans/phase-4.md` §13.4).
     RaftSnapshot = 0x0402,
-    // TODO(phase-5): service 0x02, TxnKv::{Get, Scan, Prewrite, Commit, Rollback,
-    //                ResolveLock, Heartbeat, GcSafepoint}.
+
+    /// `TxnKv::Get` — read one key at a timestamp (`docs/DESIGN.md` §8, [`crate::txn`]).
+    TxnGet = 0x0201,
+    /// `TxnKv::Scan`.
+    TxnScan = 0x0202,
+    /// `TxnKv::Prewrite`.
+    TxnPrewrite = 0x0203,
+    /// `TxnKv::Commit`.
+    TxnCommit = 0x0204,
+    /// `TxnKv::Rollback`.
+    TxnRollback = 0x0205,
+    /// `TxnKv::ResolveLock`.
+    TxnResolveLock = 0x0206,
+    /// `TxnKv::Heartbeat`.
+    TxnHeartbeat = 0x0207,
+    /// `TxnKv::GcSafepoint`.
+    TxnGcSafepoint = 0x0208,
 }
 
 /// Service byte of the system methods — version negotiation and, later, connection control.
 pub const SERVICE_SYSTEM: u8 = 0x00;
 /// Service byte of `RawKv` (`docs/DESIGN.md` §9, namespace `'r'`).
 pub const SERVICE_RAW_KV: u8 = 0x01;
-/// Service byte reserved for `TxnKv` — phase 5.
+/// Service byte of `TxnKv` (`docs/DESIGN.md` §8 and §9, namespace `'x'`).
 pub const SERVICE_TXN_KV: u8 = 0x02;
 /// Service byte reserved for the placement driver — phase 4.
 pub const SERVICE_PD: u8 = 0x03;
@@ -100,7 +115,7 @@ pub const SERVICE_RAFT: u8 = 0x04;
 
 impl Method {
     /// Every method this version defines.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 25] = [
         Self::Hello,
         Self::RawGet,
         Self::RawBatchGet,
@@ -118,6 +133,14 @@ impl Method {
         Self::PdTso,
         Self::RaftBatch,
         Self::RaftSnapshot,
+        Self::TxnGet,
+        Self::TxnScan,
+        Self::TxnPrewrite,
+        Self::TxnCommit,
+        Self::TxnRollback,
+        Self::TxnResolveLock,
+        Self::TxnHeartbeat,
+        Self::TxnGcSafepoint,
     ];
 
     /// The wire tag.
@@ -147,6 +170,14 @@ impl Method {
             0x0306 => Some(Self::PdTso),
             0x0401 => Some(Self::RaftBatch),
             0x0402 => Some(Self::RaftSnapshot),
+            0x0201 => Some(Self::TxnGet),
+            0x0202 => Some(Self::TxnScan),
+            0x0203 => Some(Self::TxnPrewrite),
+            0x0204 => Some(Self::TxnCommit),
+            0x0205 => Some(Self::TxnRollback),
+            0x0206 => Some(Self::TxnResolveLock),
+            0x0207 => Some(Self::TxnHeartbeat),
+            0x0208 => Some(Self::TxnGcSafepoint),
             _ => None,
         }
     }
@@ -188,6 +219,14 @@ impl Method {
             Self::PdTso => "Pd::Tso",
             Self::RaftBatch => "RaftTransport::Batch",
             Self::RaftSnapshot => "RaftTransport::Snapshot",
+            Self::TxnGet => "TxnKv::Get",
+            Self::TxnScan => "TxnKv::Scan",
+            Self::TxnPrewrite => "TxnKv::Prewrite",
+            Self::TxnCommit => "TxnKv::Commit",
+            Self::TxnRollback => "TxnKv::Rollback",
+            Self::TxnResolveLock => "TxnKv::ResolveLock",
+            Self::TxnHeartbeat => "TxnKv::Heartbeat",
+            Self::TxnGcSafepoint => "TxnKv::GcSafepoint",
         }
     }
 
@@ -210,6 +249,12 @@ impl Method {
                 | Self::PdRegionHeartbeat
                 | Self::PdAllocId
                 | Self::PdTso
+                | Self::TxnPrewrite
+                | Self::TxnCommit
+                | Self::TxnRollback
+                | Self::TxnResolveLock
+                | Self::TxnHeartbeat
+                | Self::TxnGcSafepoint
         )
     }
 
@@ -217,6 +262,12 @@ impl Method {
     #[must_use]
     pub fn is_pd(self) -> bool {
         self.service() == SERVICE_PD
+    }
+
+    /// Whether this method belongs to the transaction service.
+    #[must_use]
+    pub fn is_txn_kv(self) -> bool {
+        self.service() == SERVICE_TXN_KV
     }
 }
 
@@ -732,6 +783,14 @@ pub enum Request {
         /// What to do.
         request: RawKvReq,
     },
+    /// A transactional request, with the region it is addressed to
+    /// (`docs/DESIGN.md` §8, [`crate::txn`]).
+    TxnKv {
+        /// Which region, at which epoch, on which peer.
+        header: RequestHeader,
+        /// What to do.
+        request: crate::txn::TxnKvReq,
+    },
     /// A question for the placement driver. It carries a cluster id rather than a
     /// [`RequestHeader`]: PD's answers are about the routing table itself, so there is no
     /// region to address, and the id is what stops one cluster answering for another
@@ -775,12 +834,19 @@ impl Request {
         Self::RawKv { header, request }
     }
 
+    /// A `TxnKv` request addressed to a region.
+    #[must_use]
+    pub fn txn_kv(header: RequestHeader, request: crate::txn::TxnKvReq) -> Self {
+        Self::TxnKv { header, request }
+    }
+
     /// The method this request is sent as.
     #[must_use]
     pub fn method(&self) -> Method {
         match self {
             Self::Hello(_) => Method::Hello,
             Self::RawKv { request, .. } => request.method(),
+            Self::TxnKv { request, .. } => request.method(),
             Self::Pd { request, .. } => request.method(),
             Self::Raft(_) => Method::RaftBatch,
             Self::Snapshot(_) => Method::RaftSnapshot,
@@ -792,7 +858,7 @@ impl Request {
     pub fn header(&self) -> Option<RequestHeader> {
         match self {
             Self::Hello(_) | Self::Raft(_) | Self::Snapshot(_) | Self::Pd { .. } => None,
-            Self::RawKv { header, .. } => Some(*header),
+            Self::RawKv { header, .. } | Self::TxnKv { header, .. } => Some(*header),
         }
     }
 
@@ -804,6 +870,10 @@ impl Request {
         match self {
             Self::Hello(hello) => out.put_u32(hello.version),
             Self::RawKv { header, request } => {
+                header.encode(&mut out);
+                request.encode(&mut out);
+            }
+            Self::TxnKv { header, request } => {
                 header.encode(&mut out);
                 request.encode(&mut out);
             }
@@ -842,6 +912,13 @@ impl Request {
                 cluster_id: input.get_varint("pd.cluster_id")?,
                 request: crate::pd::PdReq::decode(other, &mut input)?,
             },
+            other if other.is_txn_kv() => {
+                let header = RequestHeader::decode(&mut input)?;
+                Self::TxnKv {
+                    header,
+                    request: crate::txn::TxnKvReq::decode(other, &mut input)?,
+                }
+            }
             other => {
                 let header = RequestHeader::decode(&mut input)?;
                 Self::RawKv {
@@ -863,6 +940,8 @@ pub enum Response {
     Hello(HelloAck),
     /// The answer to a key-value request.
     RawKv(RawKvResp),
+    /// The answer to a transactional request ([`crate::txn`]).
+    TxnKv(crate::txn::TxnKvResp),
     /// The placement driver's answer ([`crate::pd`]).
     Pd(crate::pd::PdResp),
     /// A Raft batch was received. It carries nothing: Raft's own retries are what make a lost
@@ -878,6 +957,7 @@ impl Response {
         match self {
             Self::Hello(_) => Method::Hello,
             Self::RawKv(response) => response.method(),
+            Self::TxnKv(response) => response.method(),
             Self::Pd(response) => response.method(),
             Self::Raft => Method::RaftBatch,
         }
@@ -895,6 +975,18 @@ impl Response {
         }
     }
 
+    /// The `TxnKv` answer, or an [`crate::ProtoError::InvalidRequest`] naming what came back
+    /// instead.
+    pub fn into_txn_kv(self) -> Result<crate::txn::TxnKvResp, crate::ProtoError> {
+        match self {
+            Self::TxnKv(response) => Ok(response),
+            other => Err(crate::ProtoError::invalid(format!(
+                "expected a TxnKv response, got {}",
+                other.method().name()
+            ))),
+        }
+    }
+
     /// The body of a `Response` frame: `method:u16 ++ fields`.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -907,6 +999,7 @@ impl Response {
                 out.put_varint(ack.max_frame_size);
             }
             Self::RawKv(response) => response.encode(&mut out),
+            Self::TxnKv(response) => response.encode(&mut out),
             Self::Pd(response) => response.encode(&mut out),
             // The acknowledgement carries nothing: Raft's own retries are what make a lost
             // message survivable, so there is no outcome for the sender to act on.
@@ -927,6 +1020,9 @@ impl Response {
                 max_frame_size: input.get_varint("hello.max_frame_size")?,
             }),
             other if other.is_pd() => Self::Pd(crate::pd::PdResp::decode(other, &mut input)?),
+            other if other.is_txn_kv() => {
+                Self::TxnKv(crate::txn::TxnKvResp::decode(other, &mut input)?)
+            }
             other => Self::RawKv(RawKvResp::decode(other, &mut input)?),
         };
         input.finish()?;
@@ -959,7 +1055,7 @@ fn take_opt(input: &mut Decoder<'_>, field: &'static str) -> Result<Option<Bytes
 mod tests {
     use super::{
         Hello, HelloAck, Method, RawKvReq, RawKvResp, Request, RequestHeader, Response,
-        SERVICE_RAW_KV, SERVICE_SYSTEM,
+        SERVICE_RAW_KV, SERVICE_SYSTEM, SERVICE_TXN_KV,
     };
     use crate::region::Epoch;
     use bytes::Bytes;
@@ -1105,6 +1201,14 @@ mod tests {
                 | Method::PdGetRegion
                 | Method::PdAllocId
                 | Method::PdTso => crate::messages::SERVICE_PD,
+                Method::TxnGet
+                | Method::TxnScan
+                | Method::TxnPrewrite
+                | Method::TxnCommit
+                | Method::TxnRollback
+                | Method::TxnResolveLock
+                | Method::TxnHeartbeat
+                | Method::TxnGcSafepoint => SERVICE_TXN_KV,
                 _ => SERVICE_RAW_KV,
             };
             assert_eq!(method.service(), service, "{method:?}");
@@ -1115,6 +1219,7 @@ mod tests {
         for service in [
             SERVICE_SYSTEM,
             SERVICE_RAW_KV,
+            SERVICE_TXN_KV,
             crate::messages::SERVICE_PD,
             crate::messages::SERVICE_RAFT,
         ] {

@@ -45,6 +45,7 @@ pub mod pd;
 pub mod raft;
 pub mod region;
 pub mod transport;
+pub mod txn;
 
 pub use codec::{DecodeError, Decoder, Encoder};
 pub use error::{ProtoError, RequestOutcome};
@@ -59,6 +60,7 @@ pub use transport::{
     BlockingTransport, BoxFuture, ChunkSender, ChunkStream, Reply, Server, ServerHandle, Service,
     StreamResponse, TcpTransport, Transport, TransportConfig,
 };
+pub use txn::{LockInfo, TxnKvReq, TxnKvResp, TxnMutation};
 
 /// Version of the framing and of every message encoding. Negotiated when a connection opens;
 /// a mismatch is a hard error, not a downgrade (`docs/DESIGN.md` §9).

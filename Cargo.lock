@@ -273,6 +273,7 @@ dependencies = [
  "esker-base",
  "esker-keys",
  "esker-pd",
+ "esker-txn",
  "proptest",
  "thiserror",
 ]
