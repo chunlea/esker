@@ -277,6 +277,12 @@ column family, the store does) — and one region, id 1, covering `["", "")` wit
 * **Every request is checked against the region** — epoch first, then key range — even though one
   region covers everything and its epoch never moves in this phase. `EpochNotMatch` carries the
   current region so a client can refresh its cache; `KeyNotInRegion` carries the range.
+* **The request's `sync` flag decides, and nothing above it.** The store opens the engine with
+  `WalSyncMode::Never`, which means the engine adds no `fsync` of its own rather than that it never
+  syncs — each write's own flag decides. The engine's default, `PerWrite`, syncs whatever the
+  caller asked, which would make `CLAUDE.md` invariant 1's opt-out unreachable and the wire's
+  `sync` field a lie. Requests stay durable by default because `RawKvReq`'s constructors set
+  `sync: true`.
 * **Concurrency is the engine's.** The `Db` is behind an `Arc`, requests run on tokio workers, and
   every engine call goes through `spawn_blocking` so an fsync never stalls the reactor. There is no
   global request lock. The one exception is a `RwLock` whose *read* side every mutation takes and
@@ -392,6 +398,17 @@ and `tokio-macros`, which ADR 0003 anticipated); 3 golden files
 9. **`ChunkStream`/`ChunkSender` for streamed replies**, exercised by a loopback echo. Phase 4's
    snapshot transfer is the caller; the point of building it now is that the frame kinds are not
    written for the first time under a snapshot.
+10. **The store opens the engine with `WalSyncMode::Never`.** Found by the client lane while
+    measuring: `StoreOptions::new()` had been taking `Options::default()`, whose `PerWrite` mode
+    syncs regardless of the per-write flag, so the wire's `sync: false` decoded, reached the
+    handler, and changed nothing. A field with forty golden bytes and no reachable behaviour.
+    Measured before: 213 ops/s unsynced against 216 synced — indistinguishable. After: **216
+    synced, 16,247 unsynced** on the same loopback, which puts the unsynced path in the same range
+    as a read round trip and makes it network-bound rather than `fsync`-bound. It also means
+    `docs/bench/phase-2.md` can compare like with like instead of reading one `fsync` per write as
+    a network cost.
+11. **The engine refuses `DeleteRange`** (`Db::write` → `Error::Unsupported`), on a one-time grant
+    to touch phase-1 code. See §9.2.
 
 ### 9.1 Frame kinds stay 1-based, against the brief's 0-based numbering
 
@@ -406,3 +423,14 @@ contradicted, and the client lane consumes `FrameKind`, never the byte. Kept 1-b
 the coordinator. Reversing it is a one-line change plus one golden file.
 
 `WIRE_VERSION` did move to `u32` as the brief pins, from phase 0's `u16`.
+
+### 9.2 The engine now refuses `DeleteRange`, on a one-time grant
+
+Reported first as an engine finding and then fixed with the coordinator's approval: `Db::write`
+returns `Error::Unsupported` for any batch containing a `DeleteRange`, before the batch is logged,
+naming ADR 0006 and phase 5. The entry kind stays in the frozen `WriteBatch` and log formats so
+phase 5 can make range deletes real without a format change; only the write path refuses, and
+recovery still replays a record containing one, because refusing to open a database is a worse
+answer than replaying a record nothing can write any more.
+
+`docs/DESIGN.md` §4.7 now describes what the code does rather than a check nobody had written.

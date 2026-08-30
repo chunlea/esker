@@ -22,7 +22,7 @@
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
-use esker_engine::{Db, LocalFileSystem, Options, cf};
+use esker_engine::{Db, LocalFileSystem, Options, WalSyncMode, cf};
 use esker_proto::{
     BoxFuture, ProtoError, RawKvReq, RawKvResp, Region, Reply, Request, RequestHeader, Response,
     Service,
@@ -50,6 +50,18 @@ pub struct StoreOptions {
 
 impl StoreOptions {
     /// The defaults: store 1, peer 1, region 1, covering everything.
+    ///
+    /// The engine is opened with **`WalSyncMode::Never`**, which is not what it sounds like: it
+    /// means the engine adds no `fsync` of its own, so each write's own `sync` flag decides.
+    /// That is the only setting under which `CLAUDE.md` invariant 1 is true as written — "a
+    /// write is acknowledged only after its bytes are durable, *unless the caller explicitly
+    /// passed `sync = false`*" — because the engine's own default, `PerWrite`, syncs whatever
+    /// the caller asked and makes the opt-out unreachable.
+    ///
+    /// Requests stay durable by default regardless: `RawKvReq`'s write constructors set
+    /// `sync: true`, so a caller gets an `fsync` without asking for one and gives it up only by
+    /// saying so. This is the same choice phase 1's benchmark driver made — the workload's own
+    /// flag decides and the engine adds nothing.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -59,6 +71,7 @@ impl StoreOptions {
             limits: Limits::new(),
             engine: Options {
                 create_if_missing: true,
+                wal_sync_mode: WalSyncMode::Never,
                 ..Options::default()
             },
         }
@@ -700,6 +713,39 @@ mod tests {
     fn writes_default_to_durable() {
         assert!(RawKvReq::put(&b"k"[..], &b"v"[..]).is_sync());
         assert!(!RawKvReq::put(&b"k"[..], &b"v"[..]).unsynced().is_sync());
+    }
+
+    /// The engine must not sync behind the request's back, or `sync = false` is a wire field
+    /// with no reachable behaviour and invariant 1's opt-out is a promise the store cannot
+    /// keep. `WalSyncMode::PerWrite` — the engine's own default — does exactly that, which is
+    /// why the store overrides it.
+    ///
+    /// This is a configuration pin rather than a behavioural test on purpose. Nothing
+    /// observable in-process distinguishes the two settings: a clean reopen finds an unsynced
+    /// write too, because a clean exit leaves the log intact whether or not it was flushed.
+    /// What distinguishes them is a `kill -9` (the crash lane's) and the benchmark's write
+    /// throughput, where the ratio is about three orders of magnitude.
+    #[test]
+    fn the_engine_adds_no_sync_of_its_own() {
+        assert_eq!(
+            StoreOptions::new().engine.wal_sync_mode,
+            esker_engine::WalSyncMode::Never,
+            "the engine would sync regardless of the request's `sync` flag"
+        );
+    }
+
+    /// And an unsynced write is still a write: the flag changes when it is acknowledged, never
+    /// whether it happened.
+    #[test]
+    fn an_unsynced_write_is_still_applied() {
+        let (_dir, store) = open();
+        call(&store, RawKvReq::put(&b"fast"[..], &b"v"[..]).unsynced());
+        assert_eq!(
+            call(&store, RawKvReq::get(&b"fast"[..])),
+            RawKvResp::Get {
+                value: Some(Bytes::from_static(b"v"))
+            }
+        );
     }
 
     /// The stall metrics `docs/DESIGN.md` §12 names have to be reachable, because the phase's
