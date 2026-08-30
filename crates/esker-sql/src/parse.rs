@@ -36,27 +36,46 @@ use crate::error::{Result, SqlError};
 /// PostgreSQL refuses — contract C1 tolerates a limit, but not a *low* one.
 pub const MAX_NESTING_DEPTH: usize = 1_000;
 
-/// Below this depth a statement is parsed on the caller's own stack.
+/// Stack consumed by the most expensive nesting level `sqlparser` has, with margin.
 ///
-/// Measured, not guessed. On the 2 MiB stack a `tokio` blocking thread gets by default,
-/// `sqlparser` costs about 6 KiB of stack per nested parenthesis and about **40 KiB** per nested
-/// subquery — `SELECT * FROM (SELECT * FROM (…))` overflows 2 MiB at depth 60. Sixteen levels of
-/// the most expensive construct is therefore about 640 KiB, which leaves the rest of the stack to
-/// the session and executor frames above it. Ordinary statements are far below this and never
-/// leave the caller's thread.
-const INLINE_PARSE_DEPTH: usize = 16;
+/// Measured on this project's own dependency rather than assumed, because the number decides
+/// whether the guard works. A nested subquery -- `SELECT * FROM (SELECT * FROM (...))` -- is the
+/// worst construct by a wide margin: about **34 KiB** per level in a release build and about
+/// **205 KiB** in a debug one, against roughly 6 KiB per nested parenthesis. Debug frames are five
+/// times the size, so a single constant would be either unsafe when tests run or absurdly
+/// pessimistic when the server does; the profile is part of the measurement.
+///
+/// The values below round the measurement up by half again, so the two derived constants inherit
+/// that margin instead of each needing their own.
+const STACK_PER_NESTING_LEVEL: usize = if cfg!(debug_assertions) {
+    320 * 1024
+} else {
+    64 * 1024
+};
+
+/// How much of the caller's own stack a parse may use before it is moved off it.
+///
+/// One mebibyte of the 2 MiB a `tokio` blocking thread gets. Parsing happens near the base of a
+/// session's stack -- the session loop calls it almost directly -- so the parser's own consumption
+/// is what this bounds.
+const INLINE_STACK_BUDGET: usize = 1024 * 1024;
+
+/// Below this depth a statement is parsed on the caller's own stack: 16 levels in release, 3 in
+/// debug. Ordinary statements are far below either and never leave the caller's thread.
+const INLINE_PARSE_DEPTH: usize = INLINE_STACK_BUDGET / STACK_PER_NESTING_LEVEL;
 
 /// The stack given to the thread that parses a statement deeper than [`INLINE_PARSE_DEPTH`].
 ///
-/// [`MAX_NESTING_DEPTH`] levels of nested subquery at the measured 40 KiB each is about 40 MiB;
-/// 64 MiB is that with room to spare, and it is reserved address space rather than committed
-/// memory, so a thread that does not use it does not pay for it. Verified by
-/// `the_deepest_admissible_statement_parses`, which parses at exactly the limit.
-const DEEP_PARSE_STACK_BYTES: usize = 64 * 1024 * 1024;
+/// Enough for [`MAX_NESTING_DEPTH`] levels of the worst construct, plus slack for the frames that
+/// are not per-level: 68 MiB in release, 324 MiB in debug. That is reserved address space and not
+/// committed memory, so a thread that does not descend does not pay for it.
+/// `the_deepest_admissible_statement_parses` is the test that keeps this honest -- it parses
+/// nested subqueries at exactly [`MAX_NESTING_DEPTH`], which needed 256 MiB when measured directly.
+const DEEP_PARSE_STACK_BYTES: usize = MAX_NESTING_DEPTH * STACK_PER_NESTING_LEVEL + 4 * 1024 * 1024;
 
 /// The recursion limit handed to `sqlparser` itself.
 ///
-/// Its own default is **50**, which rejects `SELECT ((((…1…))))` at 51 parentheses with a parser
+/// Its own default is **50**, which rejects `SELECT ((((...1...))))` at 51 parentheses with a parser
 /// error. PostgreSQL accepts that statement, so leaving the default in place would break contract
 /// C1 on the first deeply-parenthesised query a client sent. It is raised above anything
 /// [`MAX_NESTING_DEPTH`] admits so that our guard is the one that speaks; if it fires anyway, it is
@@ -196,17 +215,23 @@ pub fn classify(statement: &Statement) -> StatementClass {
 /// alone.
 fn feature_name(statement: &Statement) -> String {
     let rendered = statement.to_string();
-    let mut words = rendered
+    // `sqlparser` renders keywords in upper case and leaves identifiers in the case the user
+    // wrote them, so "already upper case" selects the keywords without transforming anything.
+    // Selecting rather than upper-casing is the point: `SAVEPOINT s` must not come back as
+    // "SAVEPOINT S is not supported", which puts a name the user did not write into their log.
+    let words = rendered
         .split_whitespace()
+        .take_while(|word| {
+            !word.is_empty() && word.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+        })
         .take(2)
-        .filter(|word| word.chars().all(|c| c.is_ascii_alphabetic()))
-        .map(str::to_ascii_uppercase)
         .collect::<Vec<_>>()
         .join(" ");
     if words.is_empty() {
-        words.push_str("this statement");
+        "this statement".to_owned()
+    } else {
+        words
     }
-    words
 }
 
 /// The deepest nesting anywhere in the statement.
@@ -422,4 +447,269 @@ fn dollar_quote(bytes: &[u8], start: usize) -> Option<usize> {
     }
     // Unterminated: consume the rest, and let the parser report the syntax error.
     Some(bytes.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        INLINE_PARSE_DEPTH, MAX_NESTING_DEPTH, StatementClass, classify, nesting_depth, parse,
+    };
+    use crate::error::SqlError;
+    use proptest::strategy::Strategy as _;
+
+    /// `SELECT * FROM (SELECT * FROM (... (SELECT 1) ...))`, the construct that costs the most
+    /// stack per level and therefore the one every stack test uses.
+    fn nested_subqueries(depth: usize) -> String {
+        format!(
+            "SELECT * FROM {}(SELECT 1{}",
+            "(SELECT * FROM ".repeat(depth),
+            ")".repeat(depth + 1)
+        )
+    }
+
+    // --- the guard counts what nests ---
+
+    #[test]
+    fn brackets_nest_and_unnest() {
+        assert_eq!(nesting_depth("SELECT 1"), 0);
+        assert_eq!(nesting_depth("SELECT (1)"), 1);
+        assert_eq!(nesting_depth("SELECT (((1)))"), 3);
+        // Siblings are not nesting: three closed pairs never exceed one level.
+        assert_eq!(nesting_depth("SELECT (1), (2), (3)"), 1);
+        assert_eq!(nesting_depth("SELECT a[1]"), 1);
+    }
+
+    /// `CASE` pairs with `END` exactly as a bracket does, and nests without a parenthesis in sight.
+    #[test]
+    fn case_expressions_nest() {
+        assert_eq!(nesting_depth("SELECT CASE WHEN a THEN 1 END"), 1);
+        assert_eq!(
+            nesting_depth("SELECT CASE WHEN a THEN CASE WHEN b THEN 1 END END"),
+            2
+        );
+        // `END` as a synonym for COMMIT must not drive the count below zero.
+        assert_eq!(nesting_depth("END"), 0);
+    }
+
+    /// A run of prefix operators descends one level each, with no bracket to mark it.
+    #[test]
+    fn prefix_operator_runs_count_as_depth() {
+        assert_eq!(nesting_depth("SELECT NOT TRUE"), 1);
+        assert_eq!(nesting_depth("SELECT NOT NOT NOT TRUE"), 3);
+        assert_eq!(nesting_depth("SELECT - - - 1"), 3);
+        // A binary operator is not a run: the operand between them resets it.
+        assert_eq!(nesting_depth("SELECT 1 - 2 - 3 - 4"), 1);
+        // Runs add to the bracket depth rather than replacing it.
+        assert_eq!(nesting_depth("SELECT (NOT NOT TRUE)"), 3);
+    }
+
+    // --- and skips everything that only looks like it ---
+    //
+    // Each of these would, if miscounted, make the guard refuse a statement PostgreSQL accepts.
+    // That is contract C1 broken, so the guard may only ever err towards accepting.
+
+    #[test]
+    fn brackets_inside_string_literals_are_text() {
+        assert_eq!(nesting_depth("SELECT '((((('"), 0);
+        assert_eq!(nesting_depth("SELECT ('(((((')"), 1);
+        // A doubled quote is a quote, not the end of the string.
+        assert_eq!(nesting_depth("SELECT 'it''s ((('"), 0);
+        // Backslash escapes only exist in an E-string.
+        assert_eq!(nesting_depth(r"SELECT E'\' ((('"), 0);
+        // ... and in an ordinary string the backslash is literal, so this one ends at the quote
+        // and the parenthesis that follows is real.
+        assert_eq!(nesting_depth(r"SELECT '\', ("), 1);
+    }
+
+    #[test]
+    fn brackets_inside_quoted_identifiers_are_part_of_the_name() {
+        assert_eq!(nesting_depth(r#"SELECT "a((((b" FROM t"#), 0);
+        assert_eq!(nesting_depth(r#"SELECT "a""(b" FROM t"#), 0);
+    }
+
+    #[test]
+    fn dollar_quoted_bodies_are_opaque() {
+        assert_eq!(nesting_depth("SELECT $$ ( ( ( $$"), 0);
+        assert_eq!(nesting_depth("SELECT $tag$ ( ( ( $tag$"), 0);
+        // A body may contain something that looks like a different tag.
+        assert_eq!(nesting_depth("SELECT $a$ $b$ ((( $a$"), 0);
+        // ... and quotes and comment markers, which are all just text in there.
+        assert_eq!(nesting_depth("SELECT $$ 'unclosed /* ( $$"), 0);
+    }
+
+    /// `$1` is a parameter, not the start of a dollar-quoted string. Reading it as one would
+    /// swallow the rest of the statement and hide every bracket in it.
+    #[test]
+    fn positional_parameters_are_not_dollar_quotes() {
+        assert_eq!(
+            nesting_depth("SELECT * FROM t WHERE a = $1 AND b = ((2))"),
+            2
+        );
+    }
+
+    #[test]
+    fn comments_are_skipped_and_block_comments_nest() {
+        assert_eq!(nesting_depth("SELECT 1 -- ((((\n"), 0);
+        assert_eq!(nesting_depth("SELECT 1 /* (((( */"), 0);
+        // PostgreSQL nests block comments, so the inner `*/` does not end the outer comment.
+        assert_eq!(nesting_depth("SELECT 1 /* /* (((( */ */ "), 0);
+        assert_eq!(nesting_depth("SELECT /* c */ (1)"), 1);
+    }
+
+    /// An unterminated string is certainly a syntax error, but it is the parser's job to say so
+    /// with the right message. The scan must end rather than hang or panic.
+    #[test]
+    fn unterminated_quoting_ends_the_scan_without_panicking() {
+        assert_eq!(nesting_depth("SELECT 'unclosed ((("), 0);
+        assert_eq!(nesting_depth(r#"SELECT "unclosed ((("#), 0);
+        assert_eq!(nesting_depth("SELECT $$ unclosed ((("), 0);
+        assert_eq!(nesting_depth("SELECT 1 /* unclosed ((("), 0);
+    }
+
+    /// Multi-byte characters must not be mistaken for delimiters. In UTF-8 every byte of one is
+    /// `>= 0x80`, so this is a property of the encoding rather than of the scan -- but it is the
+    /// kind of property that a later rewrite in terms of `char` could quietly lose.
+    #[test]
+    fn multibyte_identifiers_do_not_confuse_the_scan() {
+        assert_eq!(nesting_depth("SELECT \"тест\" FROM t"), 0);
+        assert_eq!(nesting_depth("SELECT (\"日本語\")"), 1);
+        assert_eq!(nesting_depth("SELECT 'ünïcödé (((' "), 0);
+    }
+
+    // --- the guard's decisions ---
+
+    /// Contract C1's first regression test. `sqlparser`'s default recursion limit is 50, so this
+    /// statement -- which PostgreSQL parses without complaint -- came back "recursion limit
+    /// exceeded" until the limit was raised. It is here because nothing about the dependency
+    /// advertised that behaviour; only trying it did.
+    #[test]
+    fn a_statement_deeper_than_the_dependencys_default_limit_still_parses() {
+        let sql = format!("SELECT {}1{}", "(".repeat(51), ")".repeat(51));
+        assert!(parse(&sql).is_ok(), "51 nested parentheses must parse");
+    }
+
+    /// The limit is the limit: at it, we parse; past it, we refuse with the condition PostgreSQL
+    /// uses for the same thing. This also verifies `DEEP_PARSE_STACK_BYTES`, since the worst
+    /// construct at this depth is exactly what the deep stack is sized for.
+    #[test]
+    fn the_deepest_admissible_statement_parses() {
+        let sql = nested_subqueries(MAX_NESTING_DEPTH - 1);
+        assert!(nesting_depth(&sql) <= MAX_NESTING_DEPTH);
+        assert!(parse(&sql).is_ok(), "a statement at the limit must parse");
+    }
+
+    #[test]
+    fn a_statement_past_the_limit_is_refused_as_too_complex() {
+        let sql = format!(
+            "SELECT {}1{}",
+            "(".repeat(MAX_NESTING_DEPTH + 1),
+            ")".repeat(MAX_NESTING_DEPTH + 1)
+        );
+        assert_eq!(parse(&sql), Err(SqlError::StatementTooComplex));
+        // 54001 is what PostgreSQL raises when `max_stack_depth` is exceeded.
+        assert_eq!(
+            SqlError::StatementTooComplex.sqlstate(),
+            crate::sqlstate::STATEMENT_TOO_COMPLEX
+        );
+    }
+
+    /// The inline path is the one with no safety net, so it is the one worth proving. This parses
+    /// the most expensive construct at exactly the inline threshold on a stack the size of a
+    /// `tokio` blocking thread's -- if `INLINE_PARSE_DEPTH` is ever raised past what
+    /// `STACK_PER_NESTING_LEVEL` can pay for, this test overflows and takes the process with it,
+    /// which is a great deal better than a client doing it.
+    #[test]
+    fn a_statement_at_the_inline_threshold_parses_on_a_small_stack() {
+        let sql = nested_subqueries(INLINE_PARSE_DEPTH);
+        assert!(nesting_depth(&sql) >= INLINE_PARSE_DEPTH);
+        let worker = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || parse(&sql).is_ok())
+            .unwrap();
+        assert!(worker.join().unwrap());
+    }
+
+    // --- invariant 9: nothing a client can send may panic ---
+
+    proptest::proptest! {
+        /// The guard runs on bytes that arrived over a socket, before anything has validated them.
+        /// Every branch in it indexes into a slice, so "never panics" is a claim about arithmetic
+        /// as much as about logic (`CLAUDE.md` invariant 9).
+        #[test]
+        fn the_depth_scan_never_panics(input: String) {
+            let depth = nesting_depth(&input);
+            proptest::prop_assert!(depth <= input.len());
+        }
+
+        /// And neither does the parse behind it -- a malformed statement is an error value, never
+        /// an unwind and never an abort.
+        #[test]
+        fn parsing_arbitrary_text_returns_a_value(input: String) {
+            let _ = parse(&input);
+        }
+
+        /// Text that is mostly delimiters is where a scanner's edge cases live: unterminated
+        /// quotes, a `$` at the very end, a comment opener with no body.
+        #[test]
+        fn the_depth_scan_survives_delimiter_soup(
+            input in proptest::collection::vec(
+                proptest::sample::select(vec![
+                    "(", ")", "[", "]", "'", "\"", "$", "$$", "$a$", "--", "/*", "*/",
+                    "\\", "E'", "NOT", "CASE", "END", " ", "\n", "x",
+                ]),
+                0..64,
+            ).prop_map(|parts| parts.concat())
+        ) {
+            let _ = nesting_depth(&input);
+            let _ = parse(&input);
+        }
+    }
+
+    // --- classification ---
+
+    #[test]
+    fn the_statements_this_crate_executes_are_recognised() {
+        let cases = [
+            ("SELECT 1", StatementClass::Query),
+            ("INSERT INTO t VALUES (1)", StatementClass::Insert),
+            ("UPDATE t SET a = 1", StatementClass::Update),
+            ("DELETE FROM t", StatementClass::Delete),
+            ("CREATE TABLE t (a INT8)", StatementClass::CreateTable),
+            ("DROP TABLE t", StatementClass::DropTable),
+            ("CREATE INDEX i ON t (a)", StatementClass::CreateIndex),
+            ("DROP INDEX i", StatementClass::DropIndex),
+            ("BEGIN", StatementClass::Begin),
+            ("START TRANSACTION", StatementClass::Begin),
+            ("COMMIT", StatementClass::Commit),
+            ("ROLLBACK", StatementClass::Rollback),
+            ("EXPLAIN SELECT 1", StatementClass::Explain),
+        ];
+        for (sql, expected) in cases {
+            let statements = parse(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+            assert_eq!(classify(&statements[0]), expected, "{sql}");
+            assert!(classify(&statements[0]).unsupported_feature().is_none());
+        }
+    }
+
+    /// Contract C2: everything else parses, and names itself. The name is what the client reads,
+    /// so it has to be the SQL construct and not the shape of our AST.
+    #[test]
+    fn everything_else_parses_and_names_the_feature_it_is() {
+        let cases = [
+            ("CREATE VIEW v AS SELECT 1", "CREATE VIEW"),
+            ("DROP VIEW v", "DROP VIEW"),
+            ("GRANT SELECT ON t TO alice", "GRANT SELECT"),
+            ("ALTER TABLE t ADD COLUMN b INT8", "ALTER TABLE"),
+            ("SAVEPOINT s", "SAVEPOINT"),
+        ];
+        for (sql, feature) in cases {
+            let statements = parse(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+            let class = classify(&statements[0]);
+            assert_eq!(
+                class.unsupported_feature(),
+                Some(feature),
+                "{sql} named itself wrongly"
+            );
+        }
+    }
 }
