@@ -72,11 +72,22 @@ impl Db {
   fn get(&self, cf, key, ReadOptions { snapshot, fill_cache }) -> Result<Option<Bytes>>;
   fn iter(&self, cf, ReadOptions) -> Result<impl Iterator>;   // prefix_same_as_start option
   fn snapshot(&self) -> Snapshot;
-  fn checkpoint(&self, dir, Option<(cf, range)>) -> Result<()>;   // hard-links SSTs, copies manifest
+  fn create_cf(&self, name, CfOptions) -> Result<u32> / drop_cf(&self, name) -> Result<()>;
+  fn checkpoint(&self, dir, Option<(cf, range)>) -> Result<()>;   // hard-links SSTs, writes a manifest
   fn ingest(&self, cf, sst_paths) -> Result<()>;                   // phase 4 snapshots, phase 6 bulk load
   fn flush(&self, cf) / compact_range(&self, cf, range) / property(&self, name)
 }
 ```
+
+**`WriteOptions::sync` defaults to `true`**, which is the deliberate inverse of LevelDB's and
+RocksDB's default. Invariant 1 says a write is acknowledged only once its bytes are durable
+"unless the caller explicitly passed `sync = false`", so the un-durable acknowledgement is the
+thing a caller opts into rather than the thing they have to know to opt out of. A `Db` used
+without reading its documentation is therefore slow and correct rather than fast and lossy.
+
+A `Snapshot` belongs to the `Db` instance that issued it and is refused by any other: sequence
+numbers survive a reopen, so a stale handle names a plausible number, but the reopened
+database's snapshot list has never heard of it and the compaction floor can pass it by.
 
 ### 4.2 Write path
 
@@ -84,6 +95,24 @@ impl Db {
 memtable of each touched CF → return. Group commit: the first writer to take the write lock becomes
 leader, drains the queue (bounded by 1 MiB or 128 batches, *default*), writes one WAL record group,
 syncs once, then wakes everyone. Sync mode per write; `Options::wal_sync_mode = {PerWrite, Interval(ms), Never}`.
+
+Two rules the implementation is not free to relax. The queue lock is **never held across the
+`fsync`**, or every arriving writer serialises behind a disk flush and group commit becomes a
+queue with extra steps. And a follower learns its sequence number **only after the leader has
+published**, so no batch is observable at a sequence number before it is readable.
+
+The leader does the log write for everyone, so **its failure is everyone's**: each batch in the
+group is refused with `Error::GroupCommit` carrying the leader's message, because reporting
+success to a writer whose bytes never reached the log would break invariant 1 for a write that
+looked fine. A `sync = false` batch that rides a synced group gets durability for free, which
+is correct — `sync = false` is permission to acknowledge early, never a requirement to.
+
+A failed *append* ends the log segment for good. A partial write and a full disk are
+indistinguishable from inside `write(2)`, so after one the segment's length is unknown: writing
+on would lay the next record over the tail of a half-written one, leaving a valid header,
+plausible bytes and a failing checksum — corruption in the middle of a log rather than a torn
+record at its end, which is the difference between a database that reopens and one that does
+not. Every later write on that segment fails until a memtable rotation opens a fresh one.
 
 ### 4.3 WAL format (*fixed*)
 
@@ -133,7 +162,20 @@ instruction behind `cfg(target_feature)`), with a golden test against known vect
 next file number, last seqno, comparator name, CF create/drop). `CURRENT` names the active manifest and is
 replaced by write-temp + fsync + rename. `VersionSet` keeps the live `Version` (per CF, per level: sorted
 file metadata) behind an `Arc`; readers pin a `Version`, compaction installs a new one. Obsolete files are
-deleted only after no `Version` references them.
+deleted only after no `Version` references them — and a file being *written* counts as
+referenced, or a sweep on one thread deletes an output another is still producing.
+
+The order in `log_and_apply` cannot be rearranged: build the new version (so an edit that
+cannot be applied is never logged), append it to the manifest and sync, replace `CURRENT` if
+this is a new manifest, and only then install the version in memory. A crash between any two
+steps leaves the database readable, because a rename either happens or does not.
+
+An **error** between them is the harder case, and the answer is `Error::Poisoned`: after a
+failed manifest sync or a failed `CURRENT` rename we cannot tell whether the bytes landed, so
+the version set refuses every later edit rather than carrying an in-memory version the disk may
+not share. Reopening re-derives the truth from what actually reached the disk. Every edit also
+carries the sequence number reached so far, because once a flush lets the log segments behind
+it be deleted the manifest is the only remaining record of how far numbering got.
 
 ### 4.7 Compaction
 
@@ -147,9 +189,15 @@ across more than one SST boundary with an error (documented limitation, removed 
 ### 4.8 Column families
 
 Shared WAL and seqno space; separate memtables, levels, options (prefix extractor, block size,
-compression, filter). `WriteBatch` across CFs is atomic. Built-in CFs on every store: `default`, `lock`,
-`write` (Percolator, see §8) and `raft` (Raft logs and region metadata, §6). Dropping a CF is a
-manifest edit followed by file deletion.
+compression, filter). `WriteBatch` across CFs is atomic.
+
+The engine creates no column family of its own: `Db::open` opens the ones the caller names,
+creating any that are missing, and also opens any the database already holds — hiding data a
+database contains is worse than opening more than was asked for. `create_cf` and `drop_cf` work
+on an open database; both are manifest edits, made durable before memory changes, and a drop is
+followed by file deletion. The names `default`, `lock`, `write` (Percolator, §8) and `raft`
+(Raft logs and region metadata, §6) are constants in `esker_engine::cf` — the set that
+`esker-store` **will** create at bootstrap from phase 2, not something this layer imposes.
 
 ### 4.9 Read path
 
