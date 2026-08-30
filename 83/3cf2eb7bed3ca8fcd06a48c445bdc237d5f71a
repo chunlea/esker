@@ -1,0 +1,21 @@
+crates/esker-engine/src/db/mod.rs
+  s_b52c2c840eeae6::t_9667d3dfa4ec3b 4
+crates/esker-engine/src/db/table_cache.rs
+  s_b52c2c840eeae6::t_8d01e2ae38d701 8-9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "833cf2eb7bed3ca8fcd06a48c445bdc237d5f71a",
+  "prompts": {},
+  "sessions": {
+    "s_b52c2c840eeae6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe005f8d-b378-44b1-824d-4541e546f193",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
