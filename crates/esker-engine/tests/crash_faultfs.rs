@@ -149,8 +149,14 @@ impl Run {
     }
 }
 
-/// Opens a database on a faulty filesystem, writes the pattern, and drops it.
+/// Opens a database on a faulty filesystem, writes [`OPS`] entries of the pattern, drops it.
 fn run(seed: u64, plan: FaultPlan) -> Run {
+    run_n(seed, plan, OPS)
+}
+
+/// [`run`], with the number of writes chosen by the caller. A minimal repro wants six, not
+/// twenty-four.
+fn run_n(seed: u64, plan: FaultPlan, ops: u32) -> Run {
     let inner = Arc::new(MemFileSystem::new());
     let backing: Arc<dyn FileSystem> = inner.clone();
     let faulty = FaultFileSystem::new(backing, plan);
@@ -165,7 +171,7 @@ fn run(seed: u64, plan: FaultPlan) -> Run {
         Err(_) => open_failed = true,
         Ok(db) => {
             let id = db.cf_id(cf::DEFAULT).expect("the default family exists");
-            for op in 0..OPS {
+            for op in 0..ops {
                 attempted = op + 1;
                 let started_at = faulty.operations();
                 let mut batch = WriteBatch::new();
@@ -409,7 +415,8 @@ fn a_torn_append_never_produces_wrong_data() {
 fn writes_after_a_torn_record_are_acknowledged_and_then_lost() {
     let seed = 5;
     let plan = FaultPlan::none(seed).with_short_appends(0.15);
-    let outcome = run(seed, plan);
+    // Six writes, not the sweep's twenty-four: this is the smallest run that shows it.
+    let outcome = run_n(seed, plan, 6);
 
     // The shape this repro depends on, asserted rather than assumed — if the schedule ever
     // changes, this says so instead of quietly testing nothing.
@@ -429,10 +436,11 @@ fn writes_after_a_torn_record_are_acknowledged_and_then_lost() {
         outcome.acknowledged_after_a_tear(),
         "no write was acknowledged after the tear, so there is nothing to lose"
     );
-    assert!(
-        outcome.acked.len() >= 4,
-        "only {} writes were acknowledged",
-        outcome.acked.len()
+    assert_eq!(
+        outcome.acked.len(),
+        5,
+        "expected five of six writes acknowledged, got {:?}",
+        outcome.acked
     );
 
     // What must be true, and is not.
