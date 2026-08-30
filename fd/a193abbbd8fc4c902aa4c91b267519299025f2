@@ -1,0 +1,37 @@
+Cargo.lock
+  s_4b642fc65050df::t_cab856bb08eae1 98-103,136-143,202-212,341-350,405-430,462-467
+crates/esker-proto/Cargo.toml
+  s_4b642fc65050df::t_a676e25d7127ad 11-37
+crates/esker-proto/src/codec.rs
+  s_4b642fc65050df::t_803c6c1cee6fbf 1-502
+crates/esker-proto/src/error.rs
+  s_4b642fc65050df::t_3204612752d7fa 1-703
+crates/esker-proto/src/frame.rs
+  s_4b642fc65050df::t_46a52a958c1d2b 1-589
+crates/esker-proto/src/lib.rs
+  s_4b642fc65050df::t_513bed7922ea9b 10-12,15,19-23,25-34,38-41,43-46,48-50,54
+crates/esker-proto/src/region.rs
+  s_4b642fc65050df::t_2371df59dc0a66 1-350
+crates/esker-proto/tests/frame.rs
+  s_4b642fc65050df::t_78235581733869 1-303
+crates/esker-proto/tests/golden/frames.hex
+  s_4b642fc65050df::t_b6b209adaf67b7 1-25
+docs/plans/phase-2.md
+  s_4b642fc65050df::t_e71cee3b310b7d 131,142,145,150-164,237-266
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "fda193abbbd8fc4c902aa4c91b267519299025f2",
+  "prompts": {},
+  "sessions": {
+    "s_4b642fc65050df": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5213f73d-feb9-40c2-99a7-08164cb70247",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
