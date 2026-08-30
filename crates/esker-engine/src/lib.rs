@@ -71,6 +71,7 @@ pub mod wal;
 
 pub use batch::WriteBatch;
 pub use cache_api::{BlockCache, CacheKey};
+pub use db::checkpoint::CheckpointRange;
 pub use db::iter::DbIterator;
 pub use db::{ColumnFamily, Db, Snapshot};
 pub use dbformat::{

@@ -4,6 +4,8 @@
 //! * [`mod@write`] — group commit, and where invariant 1 is enforced
 //! * [`flush`] — switching memtables, and turning the full ones into L0 files
 //! * [`compact`] — running compactions against real files, and the pool that does it
+//! * [`checkpoint`] — a consistent copy, made of hard links
+//! * [`ingest`] — adopting an SST that was built elsewhere
 //! * [`iter`] — many versions in, one entry per user key out
 //! * [`merge`] — several sorted cursors walked as one
 //! * [`read`] — point lookups, through memtables and then down the levels
@@ -25,8 +27,10 @@
 //! publishes the second. Until it does, the writes are durable but invisible, which is exactly
 //! the window in which a half-applied batch would otherwise be readable.
 
+pub mod checkpoint;
 pub mod compact;
 pub mod flush;
+pub mod ingest;
 pub mod iter;
 pub mod merge;
 pub mod open;
