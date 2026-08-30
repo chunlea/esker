@@ -1,0 +1,19 @@
+Cargo.lock
+  s_54136a52dccd02::t_cd660074382be9 139,154-155
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "116076a5fa8260cbff4c4a4fd1ae746714ac9a8e",
+  "prompts": {},
+  "sessions": {
+    "s_54136a52dccd02": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7991e833-93be-4b3f-93b2-2e245ecc2446",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
