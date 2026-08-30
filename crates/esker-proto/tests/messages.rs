@@ -337,6 +337,14 @@ fn golden_errors() -> Vec<(&'static str, ProtoError)> {
                 detail: "no answer in 30s".to_owned(),
             },
         ),
+        ("not-bootstrapped", ProtoError::NotBootstrapped),
+        (
+            "cluster-mismatch",
+            ProtoError::ClusterMismatch {
+                expected: 0xDEAD_BEEF,
+                actual: 1,
+            },
+        ),
     ]
 }
 

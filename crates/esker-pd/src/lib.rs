@@ -14,10 +14,34 @@
 //! * **The routing table is advisory to clients and authoritative here.** Clients cache it and
 //!   invalidate on epoch errors; correctness never depends on a client's cache being fresh.
 //!
-//! Phase 0 contains only the timestamp layout; the placement driver is phase 4
-//! (`prompts/04-multiraft-pd.md`).
+//! # Module map
+//!
+//! | Module | What it decides |
+//! |---|---|
+//! | [`error`] | what PD refuses, and the wire error each refusal becomes |
+//! | [`clock`] | the one wall clock in the system, injected so tests can break it |
+//! | [`keys`] | PD's private key space, and how a key lookup becomes one seek |
+//! | [`record`] | the bytes of every record PD stores, and their strict decoders |
+//! | [`alloc`] | ids that are never reused, because the batch end is persisted first |
+//! | [`tso`] | timestamps that never repeat, because the mark is persisted ahead |
+//! | [`routing`] | the region table: epoch-guarded upserts, and where a key lives |
+//! | [`pd`] | the six operations, synchronous, over one database |
+//! | [`service`] | the async edge: PD behind `esker-proto`'s server |
+//!
+//! Phase 4a builds a **single** durable PD. High availability — three PDs replicated with
+//! `esker-raft`, the oracle's mark going through the log — is 4e, and scheduling is 4b–4d
+//! (`prompts/04-multiraft-pd.md`, `docs/plans/phase-4-pd.md`).
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+pub mod clock;
+pub mod error;
+pub mod keys;
+pub mod record;
+
+pub use clock::{Clock, SystemClock};
+pub use error::{PdError, Result};
+pub use record::{ClusterRecord, RegionRecord, StoreRecord, StoreStats};
 
 /// Bits of the logical counter in a timestamp: `ts = physical_ms << 18 | logical`
 /// (`docs/DESIGN.md` §7). Part of the wire format — every timestamp on disk uses it.

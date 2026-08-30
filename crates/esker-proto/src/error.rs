@@ -59,9 +59,13 @@ pub mod code {
     pub const NOT_SENT: u16 = 15;
     /// [`super::ProtoError::Timeout`].
     pub const TIMEOUT: u16 = 16;
+    /// [`super::ProtoError::NotBootstrapped`].
+    pub const NOT_BOOTSTRAPPED: u16 = 17;
+    /// [`super::ProtoError::ClusterMismatch`].
+    pub const CLUSTER_MISMATCH: u16 = 18;
 
     /// Every code this version defines, for the tests that sweep them.
-    pub const ALL: [u16; 16] = [
+    pub const ALL: [u16; 18] = [
         NOT_LEADER,
         EPOCH_NOT_MATCH,
         KEY_NOT_IN_REGION,
@@ -78,6 +82,8 @@ pub mod code {
         INTERNAL,
         NOT_SENT,
         TIMEOUT,
+        NOT_BOOTSTRAPPED,
+        CLUSTER_MISMATCH,
     ];
 }
 
@@ -250,6 +256,28 @@ pub enum ProtoError {
         request_id: u64,
     },
 
+    /// The placement driver was asked about a cluster that has not been bootstrapped yet: no
+    /// store has registered, so there is no cluster id, no region and nothing to route to
+    /// (`docs/DESIGN.md` §7).
+    ///
+    /// Deliberately **not** retryable. Bootstrapping is another actor's job and may never
+    /// happen, so a generic retry loop would spend its budget hiding a misconfiguration; the
+    /// caller that is *waiting* for a cluster to appear — a store starting up beside its
+    /// siblings — waits on purpose, in its own loop, with its own patience.
+    #[error("the cluster is not bootstrapped")]
+    NotBootstrapped,
+
+    /// The request carries another cluster's id. Two clusters sharing an address is a
+    /// misconfiguration, and answering it would mix two clusters' metadata, so this is never
+    /// retryable and never something a client works around.
+    #[error("request is for cluster {actual}, this peer serves cluster {expected}")]
+    ClusterMismatch {
+        /// The cluster this peer serves.
+        expected: u64,
+        /// The cluster the request named.
+        actual: u64,
+    },
+
     /// The server failed at something that is neither the caller's fault nor a known
     /// limitation. The detail is for a log, not for a branch.
     #[error("internal error: {detail}")]
@@ -280,6 +308,8 @@ impl ProtoError {
             Self::Internal { .. } => code::INTERNAL,
             Self::NotSent { .. } => code::NOT_SENT,
             Self::Timeout { .. } => code::TIMEOUT,
+            Self::NotBootstrapped => code::NOT_BOOTSTRAPPED,
+            Self::ClusterMismatch { .. } => code::CLUSTER_MISMATCH,
         }
     }
 
@@ -303,6 +333,8 @@ impl ProtoError {
             | Self::InvalidRequest { .. }
             | Self::Unsupported { .. }
             | Self::DuplicateRequestId { .. }
+            | Self::NotBootstrapped
+            | Self::ClusterMismatch { .. }
             | Self::NotSent { .. } => RequestOutcome::NotApplied,
             Self::Corrupt { .. }
             | Self::Io { .. }
@@ -420,6 +452,11 @@ impl ProtoError {
                 out.put_str(detail);
             }
             Self::DuplicateRequestId { request_id } => out.put_varint(*request_id),
+            Self::NotBootstrapped => {}
+            Self::ClusterMismatch { expected, actual } => {
+                out.put_varint(*expected);
+                out.put_varint(*actual);
+            }
         }
         out.finish()
     }
@@ -490,6 +527,11 @@ impl ProtoError {
             },
             code::TIMEOUT => Self::Timeout {
                 detail: input.get_str("detail")?.to_owned(),
+            },
+            code::NOT_BOOTSTRAPPED => Self::NotBootstrapped,
+            code::CLUSTER_MISMATCH => Self::ClusterMismatch {
+                expected: input.get_varint("expected")?,
+                actual: input.get_varint("actual")?,
             },
             other => {
                 return Err(DecodeError::UnknownTag {
@@ -611,6 +653,11 @@ mod tests {
             },
             ProtoError::Timeout {
                 detail: "no answer in 30s".to_owned(),
+            },
+            ProtoError::NotBootstrapped,
+            ProtoError::ClusterMismatch {
+                expected: 0xDEAD_BEEF,
+                actual: 1,
             },
         ]
     }

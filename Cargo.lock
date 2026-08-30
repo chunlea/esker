@@ -187,6 +187,16 @@ dependencies = [
 [[package]]
 name = "esker-pd"
 version = "0.1.0"
+dependencies = [
+ "bytes",
+ "esker-base",
+ "esker-engine",
+ "esker-proto",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "esker-proto"

@@ -8,5 +8,30 @@ license.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+[features]
+# A clock a test can drive, exposed to the integration tests the way `esker-engine`
+# exposes its fault-injecting filesystem. A normal build has neither.
+testing = []
+
+[dependencies]
+# PD keeps its whole state in its own database, default column family only
+# (docs/DESIGN.md §7).
+esker-engine.workspace = true
+# The wire: the Region/Peer/Epoch types the routing table stores, the encoder the
+# records are written with, and the typed error every method answers with.
+esker-proto.workspace = true
+# `mix64`, for minting a cluster id out of the one-time facts of a bootstrap.
+esker-base.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# Async lives at the network edge only: `PdService` hands the synchronous core to
+# `spawn_blocking` so that an fsync never stalls the reactor.
+tokio = { workspace = true, features = ["rt", "sync"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["net", "time", "rt-multi-thread", "macros"] }
+
 [lints]
 workspace = true

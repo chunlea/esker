@@ -1,0 +1,24 @@
+# Golden PD records and keys (docs/DESIGN.md 7, docs/plans/phase-4-pd.md 3), produced
+# by an encoder written from the format description rather than from the code it pins.
+# record = version:u8 ++ fields. Integers are LEB128 varints; byte strings and strings
+# are varint-length-prefixed. A region is id ++ start ++ end ++ conf_ver ++ version ++
+# count ++ peers, and a peer is store_id ++ peer_id ++ role:u8 (voter 1, learner 2).
+# Keys are 'm' ++ kind, with ids big-endian so that a scan runs in id order, and the
+# range index tagged 1 for a bounded end key and 2 for the region running to +infinity.
+#
+record cluster 01ef9bafcdf8acd191010180d095ffbc31
+record alloc 01e807
+record tso 01b8e795ffbc31
+record store 01030f3132372e302e302e313a323031363080d095ffbc31909e96ffbc318080808080208080808080100c04e707
+record region-bootstrap 010100000101010101010000000000
+record region-full 010703616161036d6d6d030402010a01020b020a05808080309221a0ec96ffbc31
+record range-entry 0107
+#
+key cluster 6d63
+key alloc 6d61
+key tso 6d74
+key store-3 6d730000000000000003
+key region-7 6d720000000000000007
+key range-bounded-mmm 6d6b016d6d6d
+key range-unbounded 6d6b02
+key range-seek-mmm 6d6b016d6d6d00
