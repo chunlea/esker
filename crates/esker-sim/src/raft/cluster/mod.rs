@@ -45,6 +45,7 @@ use super::report::{Event, Failure, Settled, Stats};
 pub const EVENT_STREAM: u64 = 3;
 
 mod contract;
+mod membership;
 
 /// How many `Ready` rounds one node may discharge within a single event. A fast disk lets a
 /// node persist, send, apply and advance several times in a row; the bound is there so that one
@@ -62,7 +63,8 @@ pub struct Cluster {
     plan: FaultPlan,
     net: SimNetwork,
     nodes: BTreeMap<RaftId, NodeSlot>,
-    voters: Vec<RaftId>,
+    /// Every node id that exists, started or not.
+    population: Vec<RaftId>,
     rng: Pcg32,
     checker: SafetyChecker,
     trace: VecDeque<Event>,
@@ -91,14 +93,31 @@ pub struct Cluster {
 impl Cluster {
     /// A cluster of `voters` nodes, ids `1..=voters`, with faults drawn from `seed`.
     pub fn new(seed: u64, plan: FaultPlan, voters: usize) -> Result<Self, Failure> {
+        Self::with_spares(seed, plan, voters, 0)
+    }
+
+    /// A cluster of `voters` nodes plus `spares` that exist but have not been started.
+    ///
+    /// A spare has a node id and an inbox and nothing else — which is what a server waiting to
+    /// be added to a group actually is. It starts the moment a configuration names it, and
+    /// catches up like any other follower that is behind: by appends if the entries it needs
+    /// are still there, by a snapshot if they are not.
+    pub fn with_spares(
+        seed: u64,
+        plan: FaultPlan,
+        voters: usize,
+        spares: usize,
+    ) -> Result<Self, Failure> {
         let ids: Vec<RaftId> = (1..=voters as RaftId).collect();
-        let wire: Vec<WireId> = ids.iter().map(|id| WireId(*id)).collect();
+        let population: Vec<RaftId> = (1..=(voters + spares) as RaftId).collect();
+        let wire: Vec<WireId> = population.iter().map(|id| WireId(*id)).collect();
+        let bootstrap = esker_raft::ConfState::from_voters(ids.clone());
         let mut cluster = Self {
             seed,
             plan: plan.clone(),
             net: SimNetwork::new(seed, plan, &wire),
             nodes: BTreeMap::new(),
-            voters: ids.clone(),
+            population: population.clone(),
             rng: Pcg32::new(seed, EVENT_STREAM),
             checker: SafetyChecker::new(),
             trace: VecDeque::new(),
@@ -113,9 +132,16 @@ impl Cluster {
             seen: BTreeSet::new(),
             stats: Stats::default(),
         };
-        for id in ids {
-            let node = cluster.build_node(id, None, 0)?;
-            cluster.nodes.insert(id, NodeSlot::new(id, node));
+        for id in &ids {
+            let node = cluster.build_node(*id, None, 0, &bootstrap)?;
+            cluster
+                .nodes
+                .insert(*id, NodeSlot::new(*id, node, bootstrap.clone()));
+        }
+        for id in &population[ids.len()..] {
+            cluster
+                .nodes
+                .insert(*id, NodeSlot::spare(*id, bootstrap.clone()));
         }
         Ok(cluster)
     }
@@ -188,13 +214,21 @@ impl Cluster {
         self.nodes.values().filter(|slot| slot.online()).count()
     }
 
+    /// Every node that has ever run — the population minus the spares still waiting to be
+    /// added.
+    #[must_use]
+    pub fn started(&self) -> usize {
+        self.nodes.values().filter(|slot| slot.started()).count()
+    }
+
     /// Every node's log, for debugging a violation.
     #[must_use]
     pub fn dump_logs(&self) -> String {
         let mut out = Vec::new();
         for slot in self.nodes.values() {
             out.push(format!(
-                "n{} online={} leader={} term={} commit={} applied={} pending={:?}",
+                "n{} online={} leader={} term={} commit={} applied={} pending={:?} \
+                 cfg={:?} durable={:?} core={:?} cfg_idx={} snap={} restarts={}",
                 slot.id,
                 slot.online(),
                 slot.is_leader(),
@@ -204,6 +238,12 @@ impl Cluster {
                 slot.pending
                     .as_ref()
                     .map(|w| (w.due, w.ready.entries.len())),
+                slot.config.voters,
+                slot.durable_config.voters,
+                slot.core_config().voters,
+                slot.config_index,
+                slot.compacted_through,
+                slot.restarts,
             ));
             for entry in &slot.log {
                 out.push(format!(
@@ -213,6 +253,32 @@ impl Cluster {
             }
         }
         out.join("\n")
+    }
+
+    /// Checks the deferred property: every committed entry was held by a quorum of the
+    /// configuration in force at its index.
+    ///
+    /// Deferred because an observation lags the acknowledgement it followed. Call it once a run
+    /// has settled — the sweeps do, at the end of every seed.
+    pub fn verify_quorums(&self) -> Result<(), Failure> {
+        self.checker
+            .verify_quorums()
+            .map_err(|violation| Failure::Safety {
+                seed: self.seed,
+                event: self.event,
+                violation,
+                trace: self.trace_report(),
+            })
+    }
+
+    /// The membership every online node has derived, for a test that wants to see it.
+    #[must_use]
+    pub fn configurations(&self) -> Vec<(RaftId, Vec<RaftId>)> {
+        self.nodes
+            .values()
+            .filter(|slot| slot.online())
+            .map(|slot| (slot.id, slot.config_of().voters))
+            .collect()
     }
 
     /// The last events, one per line.
@@ -280,7 +346,7 @@ impl Cluster {
         let dead: Vec<RaftId> = self
             .nodes
             .values()
-            .filter(|slot| !slot.online())
+            .filter(|slot| !slot.online() && slot.started())
             .map(|slot| slot.id)
             .collect();
         for id in dead {
@@ -355,7 +421,7 @@ impl Cluster {
                 format!(
                     "no leader emerged (online: {}/{}, links cut: {})",
                     self.online(),
-                    self.voters.len(),
+                    self.started(),
                     self.net.severed_links(),
                 )
             }
@@ -397,6 +463,9 @@ impl Cluster {
             .is_some_and(|raw| raw.propose(payload).is_ok());
         if accepted {
             self.stats.proposals += 1;
+        }
+        if let Some(slot) = self.nodes.get_mut(&node) {
+            slot.refresh();
         }
         self.record(Event::Propose { node, accepted });
         accepted
@@ -447,7 +516,7 @@ impl Cluster {
             self.record(Event::Heal);
             return Ok(());
         }
-        if partition && self.voters.len() > 1 {
+        if partition && self.population.len() > 1 {
             self.split(split);
             return Ok(());
         }
@@ -461,6 +530,16 @@ impl Cluster {
         }
         match choice {
             0..=5 if self.deliver_next()? => Ok(()),
+            7 => {
+                if self.plan.membership > 0.0
+                    && let Some(change) = self.draw_conf_change(who)
+                {
+                    self.propose_conf_change(change);
+                } else {
+                    self.tick_all();
+                }
+                Ok(())
+            }
             8 => {
                 if let Some(id) = self.pick(who, true) {
                     let ctx = self.next_proposal();
@@ -483,11 +562,15 @@ impl Cluster {
     }
 
     /// One node, drawn from `pick`, that is online (or offline when `online` is false).
+    ///
+    /// "Offline" means *crashed*, not "has never run": a spare waiting to be added to the group
+    /// is not a node that can be restarted, and reviving one would hand it an empty
+    /// configuration and a core that believes it belongs to no cluster at all.
     fn pick(&self, pick: u64, online: bool) -> Option<RaftId> {
         let candidates: Vec<RaftId> = self
             .nodes
             .values()
-            .filter(|slot| slot.online() == online)
+            .filter(|slot| slot.online() == online && (online || slot.started()))
             .map(|slot| slot.id)
             .collect();
         if candidates.is_empty() {
@@ -499,12 +582,12 @@ impl Cluster {
 
     /// Cuts the cluster into two non-empty halves.
     fn split(&mut self, pick: u64) {
-        let count = self.voters.len();
+        let count = self.population.len();
         // A bitmask that is neither empty nor everything: `1 ..= 2^n - 2`.
         let masks = (1_u64 << count) - 2;
         let mask = pick % masks + 1;
         let side: Vec<RaftId> = self
-            .voters
+            .population
             .iter()
             .enumerate()
             .filter(|(at, _)| mask & (1 << at) != 0)
@@ -537,7 +620,8 @@ impl Cluster {
             return Ok(());
         };
         let life = slot.restarts + 1;
-        let node = self.build_node(id, Some(durable), life)?;
+        let conf = slot.config.clone();
+        let node = self.build_node(id, Some(durable), life, &conf)?;
         if let Some(revived) = self.nodes.get_mut(&id) {
             revived.revive(node);
         }
@@ -555,6 +639,9 @@ impl Cluster {
             if let Some(node) = slot.node.as_mut() {
                 node.tick();
             }
+            // A tick can start an election, and a node that wins one appends a no-op the moment
+            // the last vote arrives — so a tick is not free of log changes either.
+            slot.refresh();
         }
         self.record(Event::Tick { at: self.net.now() });
     }
@@ -631,6 +718,11 @@ impl Cluster {
             term,
             lost,
         });
+        // Its log may have changed — the observation is the *core's* log now, not storage's —
+        // so the node that was stepped is refreshed here rather than only when a write lands.
+        if let Some(slot) = self.nodes.get_mut(&target) {
+            slot.refresh();
+        }
         if let Some(reason) = rejected {
             self.stats.rejected += 1;
             self.record(Event::Rejected {
@@ -642,7 +734,7 @@ impl Cluster {
     }
 
     fn inboxes_with_mail(&self) -> Vec<RaftId> {
-        self.voters
+        self.population
             .iter()
             .copied()
             .filter(|id| self.net.inbox_len(WireId(*id)) > 0)
@@ -661,13 +753,13 @@ impl Cluster {
         id: RaftId,
         durable: Option<esker_raft::MemStorage>,
         life: u64,
+        conf: &esker_raft::ConfState,
     ) -> Result<RawNode<PersistedStorage>, Failure> {
-        let conf = esker_raft::ConfState::from_voters(self.voters.clone());
         let storage = match durable {
             Some(durable) => PersistedStorage::from_durable(durable),
-            None => PersistedStorage::new(conf),
+            None => PersistedStorage::new(conf.clone()),
         };
-        let mut config = Config::new(id, self.voters.clone(), self.seed);
+        let mut config = Config::new(id, conf.voters.clone(), self.seed);
         let mut life_bytes = [0_u8; 16];
         life_bytes[..8].copy_from_slice(&id.to_le_bytes());
         life_bytes[8..].copy_from_slice(&life.to_le_bytes());

@@ -94,6 +94,23 @@ pub enum Event {
         /// The index the read may be served at.
         index: Index,
     },
+    /// A membership change was offered to the leader.
+    ConfChange {
+        /// The leader it was offered to.
+        leader: RaftId,
+        /// The server the change is about.
+        node: RaftId,
+        /// What the change asks for.
+        kind: &'static str,
+        /// Whether the leader took it. It refuses while another change is pending, which is
+        /// the single-server rule doing its job.
+        accepted: bool,
+    },
+    /// A server a configuration named started for the first time.
+    Joined {
+        /// Which node.
+        node: RaftId,
+    },
     /// A node adopted a leader's snapshot.
     Installed {
         /// Which node.
@@ -189,6 +206,17 @@ impl fmt::Display for Event {
                 formatter,
                 "SNAPSHOT n{node}  installed through {through} (term {term})"
             ),
+            Event::ConfChange {
+                leader,
+                node,
+                kind,
+                accepted,
+            } => write!(
+                formatter,
+                "CONF     n{leader} asked to {kind} n{node}{}",
+                if *accepted { "" } else { "  refused" }
+            ),
+            Event::Joined { node } => write!(formatter, "JOINED   n{node} started"),
             Event::Read { node, index } => {
                 write!(formatter, "read     n{node}  answered at index {index}")
             }
@@ -315,6 +343,10 @@ pub struct Stats {
     /// Entries that another node had already recorded and that were then overwritten — the
     /// §5.4.2 interleaving, counted rather than assumed.
     pub replicated_overwrites: u64,
+    /// Membership changes a leader accepted.
+    pub conf_changes: u64,
+    /// Servers that started because a configuration named them.
+    pub joins: u64,
     /// Snapshots a follower adopted from a leader.
     pub snapshots_installed: u64,
     /// Times a node folded applied entries into its snapshot.

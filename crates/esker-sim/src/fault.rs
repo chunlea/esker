@@ -49,6 +49,11 @@ pub struct FaultPlan {
     pub slow_disk: f64,
     /// The largest number of events a slow write is held for.
     pub slow_disk_events: u64,
+    /// Probability that an event asks the leader to add or remove one server.
+    ///
+    /// Membership is the fault that is not a fault: the cluster is *supposed* to survive it,
+    /// and it changes who a quorum is while everything else is still going wrong.
+    pub membership: f64,
     /// How many applied entries a node keeps before compacting its log into a snapshot; `0`
     /// never compacts.
     ///
@@ -76,6 +81,7 @@ impl FaultPlan {
             restart: 0.0,
             slow_disk: 0.0,
             slow_disk_events: 0,
+            membership: 0.0,
             compact_after: 0,
         }
     }
@@ -164,7 +170,19 @@ impl FaultPlan {
             min_latency_ms: 1,
             max_latency_ms: 30,
             reorder_extra_ms: 200,
+            membership: 0.0,
             compact_after: 0,
+        }
+    }
+
+    /// Servers joining and leaving while everything else goes wrong, with compaction on so a
+    /// joiner may need a snapshot rather than an append (`prompts/03-raft.md` 3d).
+    #[must_use]
+    pub fn reconfiguring() -> Self {
+        Self {
+            membership: 0.06,
+            compact_after: 4,
+            ..Self::chaotic()
         }
     }
 

@@ -29,14 +29,15 @@ impl Cluster {
 
     /// Gives every node its chance to complete a disk write and to produce a `Ready`.
     pub(super) fn pump(&mut self) -> Result<(), Failure> {
-        for id in self.voters.clone() {
+        for id in self.population.clone() {
             for _ in 0..READY_ROUNDS_PER_EVENT {
                 if !self.pump_once(id)? {
                     break;
                 }
             }
         }
-        Ok(())
+        // A server a configuration now names has to exist before anything can be sent to it.
+        self.start_named_spares()
     }
 
     /// One round for one node. Returns whether anything happened.
@@ -143,13 +144,16 @@ impl Cluster {
         //    because the entries it needs no longer exist.
         if compact_after > 0
             && let Some(through) = compaction_point(slot, compact_after)
-            && let Some(node) = slot.node.as_mut()
-            && node.storage_mut().compact(through).is_ok()
+            && slot.compact(through)
         {
             compacted = true;
             events.push(Event::Compact { node: id, through });
         }
         slot.refresh();
+        // Membership rides with the log: `RawNode::new` reads the configuration out of storage
+        // and does not replay conf-change entries for itself, so a driver that does not derive
+        // and write it here loses every membership change across a restart (dissertation §4.1).
+        slot.persist_config();
 
         let high_water = self.commit_high_water();
         for index in reads {
@@ -338,6 +342,14 @@ impl Cluster {
             })
             .collect();
 
+        // The core's own view, taken before the borrow of `self.nodes` that builds the
+        // snapshots: two derivations of the membership, and a check that they agree.
+        let core_configs: std::collections::BTreeMap<RaftId, esker_raft::ConfState> = self
+            .nodes
+            .values()
+            .map(|slot| (slot.id, slot.core_config()))
+            .collect();
+
         let outcome = {
             let snapshots: Vec<NodeSnapshot<'_>> = self
                 .nodes
@@ -352,7 +364,12 @@ impl Cluster {
                     compacted_through: slot.compacted_through,
                     snapshot_term: slot.snapshot_term,
                     prefix_anchor,
-                    settled: slot.settled(),
+                    config: &slot.config,
+                    config_index: slot.config_index,
+                    lineage: &slot.lineage,
+                    base_config: &slot.base_config,
+                    core_config: core_configs.get(&slot.id).unwrap_or(&slot.config),
+                    comparable_config: slot.comparable_config(),
                     log: &slot.log,
                     applied: &slot.applied,
                 })

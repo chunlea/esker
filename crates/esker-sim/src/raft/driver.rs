@@ -16,8 +16,8 @@
 //! passes vacuously, because the failure the whole exercise is about can no longer happen.
 
 use esker_raft::{
-    Entry, HardState, Index, LogStorage, MemStorage, RawNode, Ready, Result as RaftResult,
-    Snapshot, Term,
+    ConfChange, ConfState, Entry, EntryKind, HardState, Index, LogStorage, MemStorage, NodeId,
+    RawNode, Ready, Result as RaftResult, Snapshot, Term,
 };
 
 use super::checkers::EntryDigest;
@@ -37,7 +37,7 @@ pub struct PersistedStorage {
 impl PersistedStorage {
     /// An empty storage with `conf` as its bootstrap membership.
     #[must_use]
-    pub fn new(conf: esker_raft::ConfState) -> Self {
+    pub fn new(conf: ConfState) -> Self {
         Self {
             durable: MemStorage::with_conf_state(conf),
             ..Self::default()
@@ -88,6 +88,13 @@ impl PersistedStorage {
         self.durable.compact(to_index)?;
         self.compactions += 1;
         Ok(())
+    }
+
+    /// Records the membership alongside the log, which is what makes it survive a restart:
+    /// `RawNode::new` reads the configuration out of storage and does not replay the log's
+    /// conf-change entries for itself.
+    pub fn set_conf_state(&mut self, conf: ConfState) {
+        self.durable.set_conf_state(conf);
     }
 
     /// How many times the log has been compacted.
@@ -157,7 +164,7 @@ pub struct DiskWrite {
 #[derive(Debug)]
 pub struct NodeSlot {
     /// Which node.
-    pub id: esker_raft::NodeId,
+    pub id: NodeId,
     /// The core, or `None` while the node is dead.
     pub node: Option<RawNode<PersistedStorage>>,
     /// The durable bytes, held here while the node is dead so a restart can be built from
@@ -180,11 +187,72 @@ pub struct NodeSlot {
     pub compacted_through: Index,
     /// The term of the entry at [`NodeSlot::compacted_through`], from the snapshot's metadata.
     pub snapshot_term: Term,
+    /// The membership this node started with, and the base every recomputation starts from.
+    pub bootstrap: ConfState,
+    /// The membership the *driver* has derived, independently of the core's own tracker.
+    ///
+    /// A real store keeps this: `RawNode::new` reads the configuration out of storage and does
+    /// not replay the log's conf-change entries, so a driver that does not persist it loses
+    /// every membership change across a restart (`docs/DESIGN.md` §5, dissertation §4.1). Two
+    /// independent derivations of one fact is also a check worth having, and the checkers make
+    /// it one.
+    pub config: ConfState,
+    /// The index of the last conf-change entry folded into [`NodeSlot::config`].
+    pub config_index: Index,
+    /// The configuration in force before the first entry of [`NodeSlot::lineage`]: the
+    /// snapshot's, when the log starts after one, and the bootstrap otherwise.
+    pub base_config: ConfState,
+    /// The configuration after each conf-change entry in this node's log, in log order, each
+    /// beside the entry that produced it.
+    ///
+    /// Reported whole rather than as a running count, because the single-server rule is about
+    /// *adjacent configurations in one log*, and a node's log can be truncated and rebuilt
+    /// between two observations. Comparing across observations — or across nodes — compares
+    /// across branches, where two configurations really can differ by more than one server
+    /// without anything being wrong. Within this vector there are no branches.
+    pub lineage: Vec<(EntryDigest, ConfState)>,
+    /// The configuration a restart would recover: derived from the *durable* log alone, and
+    /// written back to storage so it really is what a restart finds.
+    pub durable_config: ConfState,
+    /// How the driver derives the configuration. Ordinarily faithfully.
+    pub conf_fault: ConfFault,
+    /// Whether this node has ever run. A spare waiting to be added has not; a node that
+    /// crashed before it had written anything *has*, which is why this is recorded rather than
+    /// inferred from an empty log.
+    pub started: bool,
+    /// Whether this node's log has ever been truncated.
+    ///
+    /// It is what disqualifies a node from the cross-check between the driver's configuration
+    /// and the core's. The two derive the same answer from the same appends — but the core
+    /// folds changes forward and *reverts* them when a truncation takes the entry away, while
+    /// the driver refolds the log from its base. Those are the same thing only if the revert is
+    /// exact, which is the core's business to assert, not this harness's to assume. Before a
+    /// truncation there is nothing to assume, so that is where the comparison is made.
+    pub truncated: bool,
+}
+
+/// A way of applying a membership change wrongly, on purpose.
+///
+/// Membership is the part of Raft where a driver's own bookkeeping can diverge from the core's
+/// without anything obviously breaking — the log still matches, entries still commit, and the
+/// cluster carries on with two different ideas of who its members are. These exist so the
+/// checks that catch that can be shown red.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConfFault {
+    /// Apply every change, as a driver should.
+    #[default]
+    None,
+    /// Ignore the first change of each recomputation — a store that recorded the entry but
+    /// forgot to act on it.
+    SkipFirst,
+    /// Apply the change *and* add the next node id as a voter — a store that moved two servers
+    /// at once, which is what single-server change exists to forbid.
+    MoveTwo,
 }
 
 impl NodeSlot {
     /// A live node.
-    pub fn new(id: esker_raft::NodeId, node: RawNode<PersistedStorage>) -> Self {
+    pub fn new(id: NodeId, node: RawNode<PersistedStorage>, bootstrap: ConfState) -> Self {
         let mut slot = Self {
             id,
             node: Some(node),
@@ -196,9 +264,169 @@ impl NodeSlot {
             restarts: 0,
             compacted_through: 0,
             snapshot_term: 0,
+            config: bootstrap.clone(),
+            base_config: bootstrap.clone(),
+            lineage: Vec::new(),
+            durable_config: bootstrap.clone(),
+            bootstrap,
+            config_index: 0,
+            conf_fault: ConfFault::None,
+            started: true,
+            truncated: false,
         };
         slot.refresh();
         slot
+    }
+
+    /// A node that exists but has not been started: it has an inbox on the network and a node
+    /// id, and nothing else. This is what a server waiting to be added to the group looks like.
+    pub fn spare(id: NodeId, bootstrap: ConfState) -> Self {
+        Self {
+            id,
+            node: None,
+            durable: Some(MemStorage::default()),
+            pending: None,
+            applied: Vec::new(),
+            applied_index: 0,
+            log: Vec::new(),
+            restarts: 0,
+            compacted_through: 0,
+            snapshot_term: 0,
+            config: ConfState::default(),
+            base_config: ConfState::default(),
+            lineage: Vec::new(),
+            durable_config: ConfState::default(),
+            bootstrap,
+            config_index: 0,
+            conf_fault: ConfFault::None,
+            started: false,
+            truncated: false,
+        }
+    }
+
+    /// Whether the driver's configuration and the core's were derived the same way, and so can
+    /// be compared at all.
+    #[must_use]
+    pub fn comparable_config(&self) -> bool {
+        self.restarts == 0 && self.compacted_through == 0 && !self.truncated
+    }
+
+    /// Whether this node has ever run.
+    #[must_use]
+    pub fn started(&self) -> bool {
+        self.started
+    }
+
+    /// Writes the configuration a restart must recover into storage.
+    ///
+    /// `RawNode::new` reads the membership out of storage and does not replay conf-change
+    /// entries for itself, so a driver that never does this loses every change across a
+    /// restart. It rides with the batch that made those entries durable, which is what
+    /// "membership rides with the log" means in practice (dissertation §4.1).
+    pub fn persist_config(&mut self) {
+        let durable = self.durable_config.clone();
+        if let Some(node) = self.node.as_mut() {
+            node.storage_mut().set_conf_state(durable);
+        }
+    }
+
+    /// Folds applied entries into the snapshot, with the configuration *as of that index*.
+    ///
+    /// The order matters and is easy to get backwards. A snapshot's metadata carries the
+    /// membership its prefix ends with, so it must be the configuration as of the compaction
+    /// point — not the node's current one, which may already include changes from entries the
+    /// snapshot does not cover. Writing the current one leaves a snapshot claiming a
+    /// configuration from its own future, and every node that later restores from it derives a
+    /// different membership from the same log. Found exactly that way.
+    pub fn compact(&mut self, through: Index) -> bool {
+        let as_of = self.config_as_of(through);
+        let Some(node) = self.node.as_mut() else {
+            return false;
+        };
+        node.storage_mut().set_conf_state(as_of);
+        let compacted = node.storage_mut().compact(through).is_ok();
+        if compacted {
+            self.refresh();
+            self.persist_config();
+        }
+        compacted
+    }
+
+    /// The configuration in force at `index`: the base, plus every conf-change entry at or
+    /// below it.
+    fn config_as_of(&self, index: Index) -> ConfState {
+        let mut config = self.base_config.clone();
+        for (entry, after) in &self.lineage {
+            if entry.index > index {
+                break;
+            }
+            config = after.clone();
+        }
+        config
+    }
+
+    /// Folds the conf-change entries of `entries` onto `base`, wrongly if a fault says so.
+    fn derive(
+        &self,
+        base: &ConfState,
+        base_index: Index,
+        entries: &[Entry],
+    ) -> (ConfState, Index, Vec<(EntryDigest, ConfState)>) {
+        let mut config = base.clone();
+        let mut config_index = base_index;
+        let mut lineage = Vec::new();
+        let mut skipped = false;
+        for entry in entries {
+            if entry.kind != EntryKind::ConfChange {
+                continue;
+            }
+            let Ok(change) = ConfChange::decode(&entry.data) else {
+                continue;
+            };
+            if self.conf_fault == ConfFault::SkipFirst && !skipped {
+                skipped = true;
+                continue;
+            }
+            change.apply_to(&mut config);
+            if self.conf_fault == ConfFault::MoveTwo {
+                // A second server, moved in the same step. Single-server change exists precisely
+                // so that two consecutive configurations always share a quorum, and this is what
+                // breaking that looks like from outside.
+                let extra = config.voters.iter().max().copied().unwrap_or(0) + 1;
+                config.voters.push(extra);
+                config.normalize();
+            }
+            config_index = entry.index;
+            lineage.push((
+                EntryDigest::of(entry.index, entry.term, &entry.data),
+                config.clone(),
+            ));
+        }
+        (config, config_index, lineage)
+    }
+
+    /// The storage behind this node, alive or dead.
+    fn storage(&self) -> Option<&MemStorage> {
+        match (&self.node, &self.durable) {
+            (Some(node), _) => Some(node.storage().durable()),
+            (None, Some(durable)) => Some(durable),
+            (None, None) => None,
+        }
+    }
+
+    /// The configuration the driver has derived. A cloning accessor, so a caller can hold it
+    /// while the slot is borrowed elsewhere.
+    #[must_use]
+    pub fn config_of(&self) -> ConfState {
+        self.config.clone()
+    }
+
+    /// What the *core* believes the membership is, for the cross-check.
+    #[must_use]
+    pub fn core_config(&self) -> ConfState {
+        self.node
+            .as_ref()
+            .map_or_else(|| self.config.clone(), RawNode::conf_state)
     }
 
     /// Whether the node is running.
@@ -276,6 +504,7 @@ impl NodeSlot {
     pub fn revive(&mut self, node: RawNode<PersistedStorage>) {
         self.node = Some(node);
         self.durable = None;
+        self.started = true;
         self.restarts += 1;
         self.refresh();
     }
@@ -287,6 +516,9 @@ impl NodeSlot {
     /// did — and the checker allows the gap the snapshot covers.
     pub fn install_snapshot(&mut self, through: Index) {
         self.applied_index = self.applied_index.max(through);
+        // A snapshot replaces the log wholesale, which is the strongest form of the truncation
+        // that disqualifies this node from the configuration cross-check.
+        self.truncated = true;
     }
 
     /// Records that the state machine consumed `entries`.
@@ -301,51 +533,105 @@ impl NodeSlot {
         }
     }
 
-    /// Rebuilds the log the checkers see: everything durable, plus the write in flight.
+    /// Rebuilds the log the checkers see: the whole of it, durable prefix and unstable tail.
     ///
-    /// The in-flight write is included because those entries really are in the node's log — the
-    /// core can read them out of its unstable tail — even though a crash would lose them. What
-    /// is *not* included is anything the core has appended since it last offered a `Ready`,
-    /// which no accessor exposes and which will appear the moment it does.
+    /// A live node is asked with [`RawNode::log_entries`], which returns the log as the *core*
+    /// sees it. That accessor is what removed a gate this harness used to need: with only
+    /// `storage` to read, the observed log lagged the commit index behind a slow disk, and two
+    /// of the four properties had to be skipped while a node had a write outstanding. A dead
+    /// node has no core to ask, and its durable bytes are its whole log by definition.
     pub fn refresh(&mut self) {
         self.log.clear();
-        let storage: Option<&MemStorage> = match (&self.node, &self.durable) {
-            (Some(node), _) => Some(node.storage().durable()),
-            (None, Some(durable)) => Some(durable),
-            (None, None) => None,
-        };
-        let Some(storage) = storage else {
+        let Some(storage) = self.storage() else {
             self.compacted_through = 0;
             self.snapshot_term = 0;
             return;
         };
         let first = storage.first_index().unwrap_or(1);
         let last = storage.last_index().unwrap_or(0);
-        self.compacted_through = first.saturating_sub(1);
-        self.snapshot_term = storage
+        let compacted_through = first.saturating_sub(1);
+        let snapshot_term = storage
             .snapshot()
             .map(|snapshot| snapshot.meta.term)
             .unwrap_or_default();
-        if last >= first
-            && let Ok(entries) = storage.entries(first, last + 1, u64::MAX)
-        {
-            self.log.extend(
-                entries
-                    .iter()
-                    .map(|entry| EntryDigest::of(entry.index, entry.term, &entry.data)),
-            );
+        let snapshot = storage.snapshot().unwrap_or_default();
+        let (snapshot_index, snapshot_conf) = (snapshot.meta.index, snapshot.meta.conf.clone());
+        let durable: Vec<Entry> = if last >= first {
+            storage
+                .entries(first, last + 1, u64::MAX)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let durable_digests: Vec<EntryDigest> = durable
+            .iter()
+            .map(|entry| EntryDigest::of(entry.index, entry.term, &entry.data))
+            .collect();
+
+        let full = self
+            .node
+            .as_ref()
+            .and_then(|node| Self::full_entries(node, compacted_through));
+
+        let fresh: Vec<EntryDigest> = match &full {
+            Some(entries) => entries
+                .iter()
+                .map(|entry| EntryDigest::of(entry.index, entry.term, &entry.data))
+                .collect(),
+            None => durable_digests,
+        };
+        // A log that is not an extension of what it was has been truncated: some index now
+        // holds a different entry, or the tail is simply gone.
+        // A snapshot on its way to the disk has already replaced the core's log even though
+        // storage still shows the old one, so the two derivations are already using different
+        // bases: the node is out of the comparison from the moment the core accepts it.
+        self.truncated |= self
+            .pending
+            .as_ref()
+            .is_some_and(|write| write.ready.snapshot.is_some());
+        self.truncated |= fresh.len() < self.log.len()
+            || self
+                .log
+                .iter()
+                .zip(fresh.iter())
+                .any(|(before, after)| before != after);
+        self.log = fresh;
+        self.compacted_through = compacted_through;
+        self.snapshot_term = snapshot_term;
+
+        // Two derivations, because they answer two questions. The *current* one includes the
+        // unstable tail, because a membership change takes effect when its entry is appended
+        // (dissertation §4.1) — so that is what the core's own view is compared against, and it
+        // has to be recomputed whenever the log changes, not only when a write lands. The
+        // *durable* one is what a restart would recover, and it is what gets written to storage.
+        let (base, base_index) = if snapshot_index > 0 {
+            (snapshot_conf, snapshot_index)
+        } else {
+            (self.bootstrap.clone(), 0)
+        };
+        let (durable_config, _, _) = self.derive(&base, base_index, &durable);
+        let (config, config_index, lineage) = match &full {
+            Some(entries) => self.derive(&base, base_index, entries),
+            None => self.derive(&base, base_index, &durable),
+        };
+        self.durable_config = durable_config;
+        self.config = config;
+        self.config_index = config_index;
+        self.lineage = lineage;
+        self.base_config = base;
+    }
+
+    /// The core's whole log, or `None` if there is no core to ask.
+    fn full_entries(
+        node: &RawNode<PersistedStorage>,
+        compacted_through: Index,
+    ) -> Option<Vec<Entry>> {
+        let last = node.status().last_index;
+        let first = compacted_through + 1;
+        if last < first {
+            return Some(Vec::new());
         }
-        if let Some(write) = &self.pending {
-            for entry in &write.ready.entries {
-                if entry.index <= self.compacted_through {
-                    continue;
-                }
-                let at = usize::try_from(entry.index - self.compacted_through - 1).unwrap_or(0);
-                self.log.truncate(at);
-                self.log
-                    .push(EntryDigest::of(entry.index, entry.term, &entry.data));
-            }
-        }
+        node.log_entries(first, last + 1).ok()
     }
 
     /// The `HardState` on disk right now, for a report.

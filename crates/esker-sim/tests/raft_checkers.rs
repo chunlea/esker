@@ -6,7 +6,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use esker_raft::ConfState;
 use esker_sim::raft::{EntryDigest, NodeSnapshot, SafetyChecker, Violation};
+
+/// The membership every ordinary test node has: three voters, unchanging.
+fn three_voters() -> ConfState {
+    ConfState::from_voters(vec![1, 2, 3])
+}
 
 /// A log of `(term, payload byte)` pairs starting at index 1.
 fn log(entries: &[(u64, u8)]) -> Vec<EntryDigest> {
@@ -18,6 +24,8 @@ fn log(entries: &[(u64, u8)]) -> Vec<EntryDigest> {
 }
 
 /// A node in the ordinary case: online, following, nothing compacted.
+static CONFIG: std::sync::OnceLock<ConfState> = std::sync::OnceLock::new();
+
 fn node(id: u64, term: u64, commit: u64, log: &[EntryDigest]) -> NodeSnapshot<'_> {
     NodeSnapshot {
         id,
@@ -28,7 +36,12 @@ fn node(id: u64, term: u64, commit: u64, log: &[EntryDigest]) -> NodeSnapshot<'_
         compacted_through: 0,
         snapshot_term: 0,
         prefix_anchor: 0,
-        settled: true,
+        config: CONFIG.get_or_init(three_voters),
+        config_index: 0,
+        lineage: &[],
+        base_config: CONFIG.get_or_init(three_voters),
+        core_config: CONFIG.get_or_init(three_voters),
+        comparable_config: true,
         log,
         applied: &[],
     }
