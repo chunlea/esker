@@ -78,11 +78,79 @@ impl Repair {
     }
 }
 
-/// Everything the rule is allowed to look at.
+/// The load one operator will have moved once it lands.
+///
+/// A store's own reported counts are the truth *as of its last heartbeat*, which is up to a
+/// heartbeat interval behind — and PD issues operators much faster than that. Without this,
+/// balancing a cluster would mean deciding every region's move from the same stale picture and
+/// sending them all to the same emptiest store: the classic thundering herd, and the reason a
+/// naive balancer oscillates instead of converging.
+///
+/// So an operator's effect on the counts is applied the moment it is issued, and withdrawn when
+/// it retires — the entry that carries it *is* the in-flight record ([`crate::operator`]), so
+/// the two can never disagree. It is a delta rather than a count because it describes a move:
+/// something leaves one store and arrives at another.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LoadDelta {
+    /// The store gaining a replica.
+    pub region_to: Option<u64>,
+    /// The store losing one.
+    pub region_from: Option<u64>,
+    /// The store gaining leadership of a region.
+    pub leader_to: Option<u64>,
+    /// The store losing it.
+    pub leader_from: Option<u64>,
+}
+
+impl LoadDelta {
+    /// A replica arriving on `store_id`.
+    #[must_use]
+    pub fn add_peer(store_id: u64) -> Self {
+        Self {
+            region_to: Some(store_id),
+            ..Self::default()
+        }
+    }
+
+    /// A replica leaving `store_id`.
+    ///
+    /// The store is named here rather than on the wire: `RemovePeer` carries a peer id, which is
+    /// all the receiving store needs, and PD knows which store that peer is on at the moment it
+    /// decides — so recording it costs nothing and keeps the wire minimal.
+    #[must_use]
+    pub fn remove_peer(store_id: u64) -> Self {
+        Self {
+            region_from: Some(store_id),
+            ..Self::default()
+        }
+    }
+
+    /// Leadership moving from one store to another. A replica does not move, only its office.
+    #[must_use]
+    pub fn transfer_leader(from_store: u64, to_store: u64) -> Self {
+        Self {
+            leader_from: Some(from_store),
+            leader_to: Some(to_store),
+            ..Self::default()
+        }
+    }
+
+    fn regions_for(self, store_id: u64) -> i64 {
+        i64::from(self.region_to == Some(store_id)) - i64::from(self.region_from == Some(store_id))
+    }
+
+    fn leaders_for(self, store_id: u64) -> i64 {
+        i64::from(self.leader_to == Some(store_id)) - i64::from(self.leader_from == Some(store_id))
+    }
+}
+
+/// Everything the rules are allowed to look at.
 #[derive(Debug, Clone, Copy)]
 pub struct Cluster<'a> {
     /// Every store PD knows about.
     pub stores: &'a [StoreRecord],
+    /// The load every operator already in flight will have moved once it lands.
+    pub pending: &'a [LoadDelta],
     /// PD's clock, now.
     pub now_ms: u64,
     /// Silence after which a store is down.
@@ -109,6 +177,56 @@ impl Cluster<'_> {
             .iter()
             .find(|store| store.store_id == store_id)
             .is_some_and(|store| is_down(store, self.now_ms, self.max_store_down_time_ms))
+    }
+
+    /// Regions `store_id` will hold once everything in flight has landed.
+    ///
+    /// Signed, because a delta can outrun a report: a store that has not beaten since PD asked
+    /// for a replica to leave it reads as one below what it says it has. Balancing on the
+    /// number *after* the moves in flight is what makes the rules converge instead of piling
+    /// every region onto the same store.
+    #[must_use]
+    pub fn effective_regions(&self, store_id: u64) -> i64 {
+        let reported = self
+            .stores
+            .iter()
+            .find(|store| store.store_id == store_id)
+            .map_or(0, |store| {
+                i64::try_from(store.stats.region_count).unwrap_or(i64::MAX)
+            });
+        reported
+            + self
+                .pending
+                .iter()
+                .map(|delta| delta.regions_for(store_id))
+                .sum::<i64>()
+    }
+
+    /// Regions `store_id` will lead once everything in flight has landed.
+    #[must_use]
+    pub fn effective_leaders(&self, store_id: u64) -> i64 {
+        let reported = self
+            .stores
+            .iter()
+            .find(|store| store.store_id == store_id)
+            .map_or(0, |store| {
+                i64::try_from(store.stats.leader_count).unwrap_or(i64::MAX)
+            });
+        reported
+            + self
+                .pending
+                .iter()
+                .map(|delta| delta.leaders_for(store_id))
+                .sum::<i64>()
+    }
+
+    /// The stores that are live, in id order.
+    #[must_use]
+    pub fn live_stores(&self) -> Vec<&StoreRecord> {
+        self.stores
+            .iter()
+            .filter(|store| !is_down(store, self.now_ms, self.max_store_down_time_ms))
+            .collect()
     }
 
     /// The stores PD knows to be down.
@@ -218,7 +336,7 @@ fn healthiest_store_without_a_peer(region: &RegionRecord, cluster: &Cluster<'_>)
 
 #[cfg(test)]
 mod tests {
-    use super::{Cluster, Repair, TARGET_REPLICAS, is_down, repair_for, repairs};
+    use super::{Cluster, LoadDelta, Repair, TARGET_REPLICAS, is_down, repair_for, repairs};
     use crate::record::{RegionRecord, StoreRecord, StoreStats};
     use bytes::Bytes;
     use esker_proto::{Epoch, Peer, Region};
@@ -263,10 +381,57 @@ mod tests {
     fn cluster(stores: &[StoreRecord]) -> Cluster<'_> {
         Cluster {
             stores,
+            pending: &[],
             now_ms: NOW,
             max_store_down_time_ms: DOWN_AFTER,
             target_replicas: TARGET_REPLICAS,
         }
+    }
+
+    /// The counts a rule sees are what the cluster will be, not what its last heartbeats said.
+    /// Without this every region's decision is taken from the same stale picture and they all
+    /// go to the same store.
+    #[test]
+    fn the_effective_counts_include_what_is_already_in_flight() {
+        let stores = [store(1, NOW, 10), store(2, NOW, 4)];
+        let mut with_leaders = stores;
+        with_leaders[0].stats.leader_count = 6;
+        with_leaders[1].stats.leader_count = 1;
+
+        let idle = cluster(&with_leaders);
+        assert_eq!(idle.effective_regions(1), 10);
+        assert_eq!(idle.effective_leaders(1), 6);
+
+        let pending = [
+            LoadDelta::remove_peer(1),
+            LoadDelta::add_peer(2),
+            LoadDelta::transfer_leader(1, 2),
+        ];
+        let moving = Cluster {
+            pending: &pending,
+            ..cluster(&with_leaders)
+        };
+        assert_eq!(moving.effective_regions(1), 9, "one replica is leaving");
+        assert_eq!(moving.effective_regions(2), 5, "and arriving here");
+        assert_eq!(moving.effective_leaders(1), 5);
+        assert_eq!(moving.effective_leaders(2), 2);
+
+        // A store PD has no record of counts as zero plus whatever is in flight for it.
+        assert_eq!(moving.effective_regions(9), 0);
+    }
+
+    /// A delta can outrun a report — a store that has not beaten since PD asked for its last
+    /// replica to leave reads below what it says it has. Signed arithmetic, so the rule sees a
+    /// number rather than a saturated zero that would look like an empty store.
+    #[test]
+    fn an_effective_count_may_go_below_what_a_store_reported() {
+        let stores = [store(1, NOW, 1)];
+        let pending = [LoadDelta::remove_peer(1), LoadDelta::remove_peer(1)];
+        let moving = Cluster {
+            pending: &pending,
+            ..cluster(&stores)
+        };
+        assert_eq!(moving.effective_regions(1), -1);
     }
 
     #[test]

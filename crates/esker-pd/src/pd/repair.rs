@@ -19,7 +19,7 @@ use crate::error::Result;
 use crate::operator::{InFlight, Observed};
 use crate::record::RegionRecord;
 use crate::routing;
-use crate::schedule::{self, Cluster, Repair};
+use crate::schedule::{self, Cluster, LoadDelta, Repair};
 
 impl Pd {
     /// Observes the operator in flight for `record`'s region, and issues one if none is.
@@ -72,8 +72,12 @@ impl Pd {
         }
 
         let stores = routing::stores(&self.db)?;
+        // Every operator still in flight has already committed to moving load; the rules see
+        // the cluster as it will be, not as its last round of heartbeats described it.
+        let pending: Vec<LoadDelta> = state.in_flight.values().map(|flight| flight.load).collect();
         let cluster = Cluster {
             stores: &stores,
+            pending: &pending,
             now_ms,
             max_store_down_time_ms: self.max_store_down_time_ms,
             target_replicas: self.target_replicas,
@@ -82,7 +86,7 @@ impl Pd {
             return Ok(None);
         };
 
-        let operator = match repair {
+        let (operator, load) = match repair {
             Repair::AddPeer {
                 region_id,
                 epoch,
@@ -95,27 +99,42 @@ impl Pd {
                 let db = Arc::clone(&self.db);
                 let cf = self.cf;
                 let peer_id = state.alloc.allocate(1, |end| persist_alloc(&db, cf, end))?;
-                Operator::AddPeer {
-                    region_id,
-                    epoch,
-                    store_id,
-                    peer_id,
-                }
+                (
+                    Operator::AddPeer {
+                        region_id,
+                        epoch,
+                        store_id,
+                        peer_id,
+                    },
+                    LoadDelta::add_peer(store_id),
+                )
             }
             Repair::RemovePeer {
                 region_id,
                 epoch,
                 peer_id,
-            } => Operator::RemovePeer {
-                region_id,
-                epoch,
-                peer_id,
-            },
+            } => {
+                // The store the replica is leaving, resolved here while the record is in hand.
+                let from = record
+                    .region
+                    .peers
+                    .iter()
+                    .find(|peer| peer.peer_id == peer_id)
+                    .map_or(0, |peer| peer.store_id);
+                (
+                    Operator::RemovePeer {
+                        region_id,
+                        epoch,
+                        peer_id,
+                    },
+                    LoadDelta::remove_peer(from),
+                )
+            }
         };
         tracing::info!(region_id, operator = operator.name(), "operator issued");
         state
             .in_flight
-            .insert(region_id, InFlight::new(operator.clone(), now_ms));
+            .insert(region_id, InFlight::new(operator.clone(), now_ms, load));
         Ok(Some(operator))
     }
 

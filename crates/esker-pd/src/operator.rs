@@ -35,6 +35,7 @@
 use esker_proto::{Operator, PeerRole};
 
 use crate::record::RegionRecord;
+use crate::schedule::LoadDelta;
 
 /// How far along an operator is, as far as heartbeats have shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,18 +100,26 @@ pub struct InFlight {
     /// How many times it has been sent. Only for the logs and the tests — a high count means
     /// heartbeats are arriving and nothing is happening.
     pub sends: u32,
+    /// What this operator will have done to the stores' load once it lands.
+    ///
+    /// Recorded here, on the entry, so that it is withdrawn exactly when the operator retires
+    /// — a separate tally kept beside the in-flight set could drift from it, and a balancer
+    /// that double-counts a move it has already forgotten sends the next one to the wrong
+    /// place ([`crate::schedule::LoadDelta`]).
+    pub load: LoadDelta,
 }
 
 impl InFlight {
-    /// An operator just issued.
+    /// An operator just issued, with the load it commits to moving.
     #[must_use]
-    pub fn new(operator: Operator, now_ms: u64) -> Self {
+    pub fn new(operator: Operator, now_ms: u64, load: LoadDelta) -> Self {
         Self {
             operator,
             progress: Progress::Issued,
             issued_ms: now_ms,
             since_ms: now_ms,
             sends: 1,
+            load,
         }
     }
 
@@ -212,6 +221,7 @@ impl InFlight {
 mod tests {
     use super::{Cancelled, InFlight, Observed, Progress};
     use crate::record::RegionRecord;
+    use crate::schedule::LoadDelta;
     use bytes::Bytes;
     use esker_proto::{Epoch, Operator, Peer, PeerRole, Region};
 
@@ -248,7 +258,7 @@ mod tests {
     #[test]
     fn an_add_peer_is_pending_then_started_then_done() {
         let epoch = Epoch::new(1, 1);
-        let mut flight = InFlight::new(add_peer(epoch), 1_000);
+        let mut flight = InFlight::new(add_peer(epoch), 1_000, LoadDelta::add_peer(4));
 
         let nothing_yet = region(epoch, vec![Peer::voter(1, 10)]);
         assert_eq!(
@@ -296,7 +306,7 @@ mod tests {
     #[test]
     fn an_add_peer_that_goes_straight_to_a_voter_is_done() {
         let epoch = Epoch::new(1, 1);
-        let flight = InFlight::new(add_peer(epoch), 1_000);
+        let flight = InFlight::new(add_peer(epoch), 1_000, LoadDelta::add_peer(4));
         let done = region(
             Epoch::new(2, 1),
             vec![Peer::voter(1, 10), Peer::voter(4, 41)],
@@ -314,6 +324,7 @@ mod tests {
                 peer_id: 41,
             },
             1_000,
+            LoadDelta::remove_peer(4),
         );
         let still_there = region(epoch, vec![Peer::voter(1, 10), Peer::voter(4, 41)]);
         assert_eq!(
@@ -328,7 +339,7 @@ mod tests {
     /// else changed the region and the plan this came from is describing a shape that is gone.
     #[test]
     fn an_epoch_that_moved_without_the_effect_cancels() {
-        let flight = InFlight::new(add_peer(Epoch::new(1, 1)), 1_000);
+        let flight = InFlight::new(add_peer(Epoch::new(1, 1)), 1_000, LoadDelta::add_peer(4));
 
         // A split: same peers, `version` bumped.
         let split = region(Epoch::new(1, 2), vec![Peer::voter(1, 10)]);
@@ -350,7 +361,7 @@ mod tests {
 
     #[test]
     fn a_heartbeat_for_another_region_cancels_rather_than_counting() {
-        let flight = InFlight::new(add_peer(Epoch::new(1, 1)), 1_000);
+        let flight = InFlight::new(add_peer(Epoch::new(1, 1)), 1_000, LoadDelta::add_peer(4));
         let mut elsewhere = region(Epoch::new(1, 1), vec![Peer::voter(1, 10)]);
         elsewhere.region.id = 8;
         assert_eq!(
@@ -365,7 +376,7 @@ mod tests {
     #[test]
     fn an_operator_nothing_moves_times_out() {
         let epoch = Epoch::new(1, 1);
-        let flight = InFlight::new(add_peer(epoch), 1_000);
+        let flight = InFlight::new(add_peer(epoch), 1_000, LoadDelta::add_peer(4));
         let unchanged = region(epoch, vec![Peer::voter(1, 10)]);
 
         assert_eq!(
@@ -385,7 +396,7 @@ mod tests {
     /// because one operator in flight means no second one.
     #[test]
     fn a_started_operator_that_stops_moving_still_times_out() {
-        let mut flight = InFlight::new(add_peer(Epoch::new(1, 1)), 1_000);
+        let mut flight = InFlight::new(add_peer(Epoch::new(1, 1)), 1_000, LoadDelta::add_peer(4));
         let catching_up = region(
             Epoch::new(2, 1),
             vec![
@@ -413,7 +424,7 @@ mod tests {
     /// allowance again, because the timeout is on being stuck rather than on taking long.
     #[test]
     fn progress_restarts_the_clock() {
-        let mut flight = InFlight::new(add_peer(Epoch::new(1, 1)), 1_000);
+        let mut flight = InFlight::new(add_peer(Epoch::new(1, 1)), 1_000, LoadDelta::add_peer(4));
         let catching_up = region(
             Epoch::new(2, 1),
             vec![
