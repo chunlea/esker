@@ -19,6 +19,7 @@
 //!
 //! | Module | What it decides |
 //! |---|---|
+//! | [`driver`] | the threads that drive Raft, and how regions are pinned to them |
 //! | [`error`] | the store's failures, and which of them a client may safely retry |
 //! | [`region`] | the epoch and key-range checks every request runs |
 //! | [`regions`] | every region this store hosts, indexed by id and by range |
@@ -41,6 +42,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod apply;
+pub mod driver;
 pub mod error;
 pub mod heartbeat;
 pub mod meta;
@@ -57,6 +59,7 @@ pub mod split;
 pub mod transport;
 
 pub use apply::Command;
+pub use driver::{DRIVER_WORKERS, DriverPool};
 pub use error::{Result, StoreError, engine_to_proto};
 pub use heartbeat::{Heartbeats, RegionReport, StoreReport};
 pub use pd::{Bootstrapped, PdClient, RegionHeartbeat, RegionRoute, StoreHeartbeat, StoreInfo};

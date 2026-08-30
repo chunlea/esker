@@ -28,7 +28,7 @@
 //! sends [`PeerMsg::Tick`]**, so the core still never reads a clock.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use esker_engine::{WriteBatch, WriteOptions};
@@ -37,16 +37,19 @@ use esker_raft::{
     ConfState, Config as RaftConfig, Entry, EntryKind, Index, Message, NodeId, RawNode, ReadState,
     Role, Status, Term,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 use crate::apply::Command;
 use crate::error::{Result, StoreError};
 use crate::raft_log::RaftLogStorage;
 
-/// How many messages may be queued for the driver thread before a caller waits.
+/// How many messages may be queued for a driver worker before a caller waits.
 ///
 /// Bounded, like everything else that crosses a thread here: an unbounded queue in front of an
-/// `fsync` is a memory leak with extra steps (`docs/DESIGN.md` §9).
+/// `fsync` is a memory leak with extra steps (`docs/DESIGN.md` §9). It is now per **worker** and
+/// so shared by the regions pinned to it ([`crate::driver`]), which is the same trade the Raft
+/// transport's per-store queue makes: a region that floods it delays another's tick, and Raft
+/// retries either way.
 pub const PEER_QUEUE_DEPTH: usize = 4096;
 
 /// Where a peer's outbound Raft messages go.
@@ -713,7 +716,7 @@ impl PeerCore {
 
     /// Fails everything outstanding — on shutdown, or when this peer stops leading and can no
     /// longer promise anything about what it accepted.
-    fn fail_outstanding(&mut self, error: &ProtoError) {
+    pub(crate) fn fail_outstanding(&mut self, error: &ProtoError) {
         for pending in self.pending.drain(..) {
             let _ = pending.notify.send(Err(error.clone()));
         }
@@ -722,7 +725,7 @@ impl PeerCore {
         }
     }
 
-    fn handle(&mut self, message: PeerMsg) -> bool {
+    pub(crate) fn handle(&mut self, message: PeerMsg) -> bool {
         match message {
             PeerMsg::Tick => self.node.tick(),
             PeerMsg::Raft(raft) => {
@@ -858,25 +861,29 @@ fn propose_error(error: &esker_raft::RaftError, region_id: u64) -> ProtoError {
     }
 }
 
-/// The handle the request path holds: a channel to the driver thread, and the one fact it needs
-/// often enough to be worth publishing without asking.
+/// The handle the request path holds: a way to reach the worker driving this region, and the few
+/// facts it needs often enough to be worth publishing without asking.
 #[derive(Debug)]
 pub struct RaftPeer {
-    commands: mpsc::Sender<PeerMsg>,
+    /// The pool this region is pinned inside ([`crate::driver`]). Shared with every other region
+    /// on this store; which worker handles this one is fixed by its id.
+    pool: Arc<crate::driver::DriverPool>,
     region_id: u64,
     peer_id: NodeId,
     leader: Arc<AtomicU64>,
     published: Arc<Published>,
-    thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Whether this peer has already been retired, so `stop` and `Drop` do not both do it.
+    retired: AtomicBool,
 }
 
 impl RaftPeer {
-    /// Builds the peer and starts its driver thread.
+    /// Builds the peer and hands it to the pool worker its region is pinned to.
     pub fn start(
         options: PeerOptions,
         storage: RaftLogStorage,
         transport: Arc<dyn RaftTransport>,
         host: Arc<dyn RegionHost>,
+        pool: Arc<crate::driver::DriverPool>,
     ) -> Result<Arc<Self>> {
         let region_id = options.region.id;
         let mut config = RaftConfig::new(options.peer_id, options.voters, options.seed);
@@ -907,21 +914,15 @@ impl RaftPeer {
             applied_index,
         };
 
-        let (commands, receiver) = mpsc::channel(PEER_QUEUE_DEPTH);
-        let thread = std::thread::Builder::new()
-            .name(format!("raft-{region_id}"))
-            .spawn(move || run(core, receiver))
-            .map_err(|error| {
-                StoreError::Bootstrap(format!("could not start the Raft thread: {error}"))
-            })?;
+        pool.register(region_id, Box::new(core))?;
 
         Ok(Arc::new(Self {
-            commands,
+            pool,
             region_id,
             peer_id: options.peer_id,
             leader,
             published,
-            thread: std::sync::Mutex::new(Some(thread)),
+            retired: AtomicBool::new(false),
         }))
     }
 
@@ -1094,22 +1095,24 @@ impl RaftPeer {
         })
     }
 
-    /// Stops the driver thread and waits for it, failing everything outstanding.
+    /// Takes this region off its worker and waits until it is gone, failing everything
+    /// outstanding.
+    ///
+    /// The worker itself keeps running: it holds other regions, and one region stopping is not a
+    /// reason to stop theirs. Waiting is what makes it safe for a caller to flush or drop the
+    /// database next — a worker still holding the core would be applying into it.
     pub fn stop(&self) {
-        // A full queue on shutdown must not deadlock the caller: the thread is going away either
-        // way, and dropping the sender ends its loop.
-        let _ = self.commands.try_send(PeerMsg::Stop);
-        let handle = self.thread.lock().ok().and_then(|mut slot| slot.take());
-        if let Some(handle) = handle {
-            let _ = handle.join();
+        if self.retired.swap(true, Ordering::AcqRel) {
+            return;
         }
+        self.pool.retire(self.region_id);
     }
 
     async fn send(&self, message: PeerMsg) -> std::result::Result<(), ProtoError> {
-        self.commands.send(message).await.map_err(|_| {
-            // The thread is gone, so the request provably did not reach Raft.
-            ProtoError::not_sent("the Raft peer is not running")
-        })
+        if self.retired.load(Ordering::Acquire) {
+            return Err(ProtoError::not_sent("the Raft peer is not running"));
+        }
+        self.pool.deliver(self.region_id, message).await
     }
 }
 
@@ -1117,34 +1120,6 @@ impl Drop for RaftPeer {
     fn drop(&mut self) {
         self.stop();
     }
-}
-
-/// The driver thread.
-///
-/// Every wake-up drains whatever else is queued before driving, so one `Ready` covers a batch of
-/// messages rather than one apiece — which is where a leader's per-tick batching comes from.
-fn run(mut core: PeerCore, mut receiver: mpsc::Receiver<PeerMsg>) {
-    while let Some(message) = receiver.blocking_recv() {
-        let mut running = core.handle(message);
-        while running {
-            match receiver.try_recv() {
-                Ok(next) => running = core.handle(next),
-                Err(_) => break,
-            }
-        }
-        if let Err(error) = core.drive() {
-            // A failed write is not something this layer can paper over: the log and the state
-            // machine may now disagree. Say so loudly and stop, rather than continue on a log
-            // whose durability is unknown.
-            tracing::error!(region_id = core.region_id, %error, "the Raft driver failed");
-            break;
-        }
-        if !running {
-            break;
-        }
-    }
-    let stopping = ProtoError::not_sent("the Raft peer stopped");
-    core.fail_outstanding(&stopping);
 }
 
 /// Re-exported so a caller can name the configuration a peer bootstraps with.
@@ -1166,6 +1141,7 @@ mod tests {
         RaftTransport,
     };
     use crate::apply::Command;
+    use crate::driver::DriverPool;
     use crate::raft_log::{PersistedState, RaftLogStorage, decode_entry, log_entry_key, state_key};
 
     const REGION: u64 = 1;
@@ -1217,6 +1193,7 @@ mod tests {
             storage,
             transport,
             Arc::new(NoHost),
+            Arc::new(DriverPool::new(1).unwrap()),
         )
         .unwrap()
     }
@@ -1531,6 +1508,7 @@ mod tests {
             storage,
             Arc::new(DiscardTransport),
             Arc::new(NoHost),
+            Arc::new(DriverPool::new(1).unwrap()),
         )
         .unwrap();
         elect_alone(&peer).await;
@@ -1574,7 +1552,135 @@ mod tests {
         assert_eq!(snapshot.meta.conf.voters, vec![1]);
     }
 
-    /// End to end: a command proposed on the leader is replicated, applied, and visible in the
+    /// Regions pinned to **different** workers make progress at the same time. One region's slow
+    /// apply is what one-worker-per-store would have made everyone else's problem, and it is the
+    /// whole reason the pool is a pool.
+    ///
+    /// Regions 1 and 2 land on workers 1 and 0 of a two-worker pool. Both are driven to leadership
+    /// and both accept proposals while the other is mid-flight; a serialising pool would deadlock
+    /// this, because each proposal is awaited before the next is sent on the *other* region.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn regions_on_different_workers_run_at_the_same_time() {
+        let (_dir, db) = open_db();
+        let pool = Arc::new(DriverPool::new(2).unwrap());
+        assert_ne!(
+            pool.worker_of(1),
+            pool.worker_of(2),
+            "the test needs two regions on two workers"
+        );
+
+        let mut peers = Vec::new();
+        for region_id in [1u64, 2] {
+            let storage = RaftLogStorage::open(
+                Arc::clone(&db),
+                region_id,
+                ConfState::from_voters(vec![region_id]),
+            )
+            .unwrap();
+            peers.push(
+                RaftPeer::start(
+                    PeerOptions {
+                        region: Region::bootstrap(region_id, 1, region_id),
+                        peer_id: region_id,
+                        voters: vec![region_id],
+                        seed: 7,
+                        compaction: LogCompaction::new(),
+                    },
+                    storage,
+                    Arc::new(DiscardTransport),
+                    Arc::new(NoHost),
+                    Arc::clone(&pool),
+                )
+                .unwrap(),
+            );
+        }
+        for peer in &peers {
+            elect_alone(peer).await;
+        }
+
+        // Interleaved: each region's proposal is awaited before the next is sent to the other, so
+        // both workers have to be running for this to finish at all.
+        for round in 0..8u32 {
+            for (at, peer) in peers.iter().enumerate() {
+                peer.propose(&Command::Put {
+                    key: Bytes::from(format!("r{at}-{round}")),
+                    value: Bytes::from_static(b"v"),
+                })
+                .await
+                .unwrap();
+            }
+        }
+
+        for peer in &peers {
+            let status = peer.status().await.unwrap();
+            assert_eq!(status.role, Role::Leader);
+            // The no-op plus eight proposals, all applied — and applied *in order*, which is what
+            // `applied == last_index` says for a log this peer wrote itself.
+            assert_eq!(status.last_index, 9);
+            assert_eq!(
+                status.applied, 9,
+                "a region applied out of order or fell behind"
+            );
+            peer.stop();
+        }
+        pool.shutdown();
+    }
+
+    /// Two regions pinned to the **same** worker are still independent: stopping one leaves the
+    /// other being driven. A worker that ended its loop when one region stopped would take every
+    /// region it held down with it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stopping_one_region_leaves_its_worker_serving_the_rest() {
+        let (_dir, db) = open_db();
+        let pool = Arc::new(DriverPool::new(1).unwrap());
+
+        let mut peers = Vec::new();
+        for region_id in [1u64, 2] {
+            let storage = RaftLogStorage::open(
+                Arc::clone(&db),
+                region_id,
+                ConfState::from_voters(vec![region_id]),
+            )
+            .unwrap();
+            peers.push(
+                RaftPeer::start(
+                    PeerOptions {
+                        region: Region::bootstrap(region_id, 1, region_id),
+                        peer_id: region_id,
+                        voters: vec![region_id],
+                        seed: 7,
+                        compaction: LogCompaction::new(),
+                    },
+                    storage,
+                    Arc::new(DiscardTransport),
+                    Arc::new(NoHost),
+                    Arc::clone(&pool),
+                )
+                .unwrap(),
+            );
+        }
+        assert_eq!(
+            pool.worker_of(1),
+            pool.worker_of(2),
+            "one worker, both regions"
+        );
+        for peer in &peers {
+            elect_alone(peer).await;
+        }
+
+        peers[0].stop();
+        // The stopped one refuses, provably without having reached Raft.
+        let error = peers[0].propose(&put(b"gone")).await.unwrap_err();
+        assert_eq!(error.outcome(), esker_proto::RequestOutcome::NotApplied);
+
+        // The other is untouched.
+        peers[1].propose(&put(b"still-here")).await.unwrap();
+        assert!(peers[1].is_leader());
+        peers[1].stop();
+        pool.shutdown();
+    }
+
+    /// End to end: a command proposed on the leader is replicated, applied, and visible in the    /// End to end: a command proposed on the leader is replicated, applied, and visible in the
     /// data column family — with its `apply_index` recorded in the same batch that wrote it.
     #[tokio::test]
     async fn a_committed_command_lands_in_the_data_and_the_apply_index_with_it() {

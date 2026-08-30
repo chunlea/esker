@@ -23,7 +23,9 @@ use esker_keys::prefix;
 use esker_proto::Region;
 use esker_raft::{ConfState, Entry, EntryKind, HardState, LogStorage};
 use esker_store::apply::Command;
-use esker_store::{DiscardTransport, LogCompaction, NoHost, PeerOptions, RaftLogStorage, RaftPeer};
+use esker_store::{
+    DiscardTransport, DriverPool, LogCompaction, NoHost, PeerOptions, RaftLogStorage, RaftPeer,
+};
 use tempfile::TempDir;
 
 const REGION: u64 = 1;
@@ -92,6 +94,7 @@ fn start(db: &Arc<Db>) -> Arc<RaftPeer> {
         storage,
         Arc::new(DiscardTransport),
         Arc::new(NoHost),
+        Arc::new(DriverPool::new(1).unwrap()),
     )
     .unwrap()
 }

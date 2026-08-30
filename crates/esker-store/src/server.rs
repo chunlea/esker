@@ -30,6 +30,7 @@ use esker_proto::{
 };
 
 use crate::apply::Command;
+use crate::driver::DriverPool;
 use crate::error::{Result, StoreError};
 use crate::heartbeat::{Heartbeats, RegionReport, StoreReport};
 use crate::meta;
@@ -125,6 +126,9 @@ pub struct RaftOptions {
     pub transport: TransportConfig,
     /// When each region's Raft log is compacted.
     pub compaction: LogCompaction,
+    /// How many driver threads this store runs. Regions are pinned across them by id
+    /// ([`crate::driver`]).
+    pub driver_workers: usize,
 }
 
 impl RaftOptions {
@@ -138,6 +142,7 @@ impl RaftOptions {
             tick: std::time::Duration::from_millis(esker_raft::TICK_MS),
             transport: TransportConfig::new(),
             compaction: LogCompaction::new(),
+            driver_workers: crate::driver::DRIVER_WORKERS,
         }
     }
 }
@@ -207,6 +212,9 @@ pub struct Store {
     /// How regions are replicated, kept because a **split** starts a new peer long after `open`
     /// returned and needs the same address book, seed and tick the others got.
     raft: Option<RaftOptions>,
+    /// The threads every region's Raft is driven on, each region pinned to one of them
+    /// ([`crate::driver`]).
+    drivers: Arc<DriverPool>,
     /// How this store decides to split.
     split: SplitOptions,
     /// The runtime this store was opened on. A split starts the child's peer from the parent's
@@ -319,11 +327,15 @@ impl Store {
             )
         });
 
+        let drivers = Arc::new(DriverPool::new(
+            raft.as_ref().map_or(1, |raft| raft.driver_workers),
+        )?);
         let regions = RegionMap::new();
         tracing::info!(
             store_id,
             regions = hosted.len(),
             replicated = transport.is_some(),
+            drivers = drivers.workers(),
             column_families = ?cf::BUILTIN,
             "store opened"
         );
@@ -336,6 +348,7 @@ impl Store {
             write_gate: RwLock::new(()),
             transport,
             raft,
+            drivers,
             split,
             runtime: tokio::runtime::Handle::try_current().ok(),
             tickers: std::sync::Mutex::new(Vec::new()),
@@ -386,7 +399,15 @@ impl Store {
                 let host: Arc<dyn RegionHost> = Arc::new(StoreHost {
                     store: Arc::downgrade(self),
                 });
-                let peer = start_peer(&self.db, &region, self.store_id, raft, transport, host)?;
+                let peer = start_peer(
+                    &self.db,
+                    &region,
+                    self.store_id,
+                    raft,
+                    transport,
+                    host,
+                    Arc::clone(&self.drivers),
+                )?;
                 self.spawn_ticker(&peer, raft.tick);
                 RegionState::replicated(RegionMeta::new(region), peer)
             }
@@ -588,7 +609,15 @@ impl Store {
                 // Its log is empty, so `RaftLogStorage::open` writes the configuration it is given
                 // as the membership *as of index 0* — which for a region whose log starts there is
                 // exactly the split-time membership, and is the anchor rule of `91de89a`.
-                let peer = start_peer(&self.db, child, self.store_id, raft, transport, host)?;
+                let peer = start_peer(
+                    &self.db,
+                    child,
+                    self.store_id,
+                    raft,
+                    transport,
+                    host,
+                    Arc::clone(&self.drivers),
+                )?;
                 self.spawn_ticker(&peer, raft.tick);
                 RegionState::replicated(RegionMeta::new(child.clone()), peer)
             }
@@ -1277,6 +1306,9 @@ impl Store {
         if let Some(transport) = &self.transport {
             transport.shutdown();
         }
+        // Last: a worker still holding a region would be applying into a database the caller is
+        // about to flush and drop.
+        self.drivers.shutdown();
     }
 
     /// This store's id.
@@ -1530,6 +1562,7 @@ fn start_peer(
     raft: &RaftOptions,
     transport: &Arc<StoreTransport>,
     host: Arc<dyn RegionHost>,
+    pool: Arc<DriverPool>,
 ) -> Result<Arc<RaftPeer>> {
     let voters: Vec<u64> = region
         .peers
@@ -1565,6 +1598,7 @@ fn start_peer(
         transport.for_region(region.id, region.epoch, &raft.peers)
             as Arc<dyn crate::peer::RaftTransport>,
         host,
+        pool,
     )
 }
 
