@@ -1,0 +1,21 @@
+crates/esker-client/Cargo.toml
+  s_7c0605fa746b2a::t_bd06d80f8d39c2 37-42
+crates/esker-client/tests/chaos_linearizability.rs
+  s_7c0605fa746b2a::t_6f2bd370291404 1-524
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "7c2180442873c4a3762d422f94dbb93fd42f37cc",
+  "prompts": {},
+  "sessions": {
+    "s_7c0605fa746b2a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c7f8910e-d362-4826-b9ed-56926ba5f727",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
