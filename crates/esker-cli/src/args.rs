@@ -10,11 +10,15 @@
 //! ```text
 //! esker [--version | -V] [--help | -h]
 //! esker bench [--threads N] [--value-size N] [--duration-secs N] [--help]
+//! esker sst-dump <path> [--verbose | -v] [--prefix-len N] [--help]
 //! ```
 //!
 //! Both `--flag value` and `--flag=value` are accepted, because both are what people type.
 
 use std::fmt;
+use std::path::PathBuf;
+
+use crate::sst_dump::DumpOptions;
 
 /// What the user asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +29,8 @@ pub(crate) enum Command {
     Help,
     /// Run the benchmark driver.
     Bench(BenchOptions),
+    /// Print the contents of a sorted string table.
+    SstDump(DumpOptions),
 }
 
 /// Options for the benchmark driver.
@@ -69,6 +75,8 @@ pub(crate) enum ParseError {
     },
     /// A bare word where none belongs.
     UnexpectedArgument(String),
+    /// A required positional argument was not given.
+    MissingArgument(&'static str),
 }
 
 impl fmt::Display for ParseError {
@@ -85,6 +93,7 @@ impl fmt::Display for ParseError {
             ParseError::UnexpectedArgument(argument) => {
                 write!(formatter, "unexpected argument `{argument}`")
             }
+            ParseError::MissingArgument(name) => write!(formatter, "missing {name}"),
         }
     }
 }
@@ -101,6 +110,7 @@ Usage:
 
 Commands:
   bench                 Run the benchmark driver
+  sst-dump <path>       Print the contents of a sorted string table
 
 Options:
   -V, --version         Print the version
@@ -110,6 +120,14 @@ Bench options:
       --threads N       Concurrent writer threads (default 4)
       --value-size N    Value size in bytes (default 100)
       --duration-secs N How long to run (default 10)
+
+Sst-dump options:
+  -v, --verbose         Print every key and value, not just the summary
+      --prefix-len N    Rebuild a StripSuffix prefix extractor of this length, so
+                        that a prefix-built bloom filter can be used
+
+Exit codes:
+  0  success       1  the file could not be read or is corrupt       2  bad usage
 ";
 
 /// Parses arguments, which must **not** include the program name.
@@ -127,6 +145,7 @@ where
         "--version" | "-V" => Ok(Command::Version),
         "--help" | "-h" | "help" => Ok(Command::Help),
         "bench" => parse_bench(&arguments[1..]),
+        "sst-dump" => parse_sst_dump(&arguments[1..]),
         other if other.starts_with('-') => Err(ParseError::UnknownFlag(other.to_owned())),
         other => Err(ParseError::UnknownCommand(other.to_owned())),
     }
@@ -176,6 +195,65 @@ fn parse_bench(arguments: &[String]) -> Result<Command, ParseError> {
     }
 
     Ok(Command::Bench(options))
+}
+
+/// `sst-dump <path> [--verbose] [--prefix-len N]`.
+///
+/// The path is positional and required: a dump with nothing to dump is a usage error, not an
+/// empty report.
+fn parse_sst_dump(arguments: &[String]) -> Result<Command, ParseError> {
+    let mut path: Option<PathBuf> = None;
+    let mut verbose = false;
+    let mut prefix_len = None;
+    let mut index = 0;
+
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        index += 1;
+
+        if argument == "--help" || argument == "-h" {
+            return Ok(Command::Help);
+        }
+        if argument == "--verbose" || argument == "-v" {
+            verbose = true;
+            continue;
+        }
+
+        let (flag, inline) = match argument.split_once('=') {
+            Some((flag, value)) => (flag, Some(value.to_owned())),
+            None => (argument.as_str(), None),
+        };
+
+        match flag {
+            "--prefix-len" => {
+                let raw = if let Some(value) = inline {
+                    value
+                } else {
+                    let value = arguments
+                        .get(index)
+                        .ok_or(ParseError::MissingValue("--prefix-len"))?;
+                    index += 1;
+                    value.clone()
+                };
+                prefix_len = Some(raw.parse::<usize>().map_err(|_| ParseError::InvalidValue {
+                    flag: "--prefix-len",
+                    value: raw,
+                })?);
+            }
+            other if other.starts_with('-') => {
+                return Err(ParseError::UnknownFlag(other.to_owned()));
+            }
+            // The first bare word is the path; a second one is a mistake worth naming.
+            _ if path.is_none() => path = Some(PathBuf::from(argument)),
+            other => return Err(ParseError::UnexpectedArgument(other.to_owned())),
+        }
+    }
+
+    Ok(Command::SstDump(DumpOptions {
+        path: path.ok_or(ParseError::MissingArgument("<path>"))?,
+        verbose,
+        prefix_len,
+    }))
 }
 
 #[cfg(test)]

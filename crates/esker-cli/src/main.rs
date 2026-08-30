@@ -1,12 +1,13 @@
 //! `esker` — command line tools for the Esker key-value store.
 //!
-//! Phase 0 ships the shell: version, usage, and a `bench` subcommand that says it is not
-//! implemented yet. Inspection commands (`sst-dump`, `wal-dump`, `manifest-dump`, `region`)
-//! arrive with the layers they inspect (`docs/DESIGN.md` §12).
+//! `sst-dump` inspects a sorted string table; `bench` is still the phase-0 placeholder. The
+//! remaining inspection commands (`wal-dump`, `manifest-dump`, `region`) arrive with the
+//! layers they inspect (`docs/DESIGN.md` §12).
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod args;
+mod sst_dump;
 
 use std::process::ExitCode;
 
@@ -14,6 +15,9 @@ use args::{Command, USAGE};
 
 /// Exit code for arguments that could not be parsed.
 const EXIT_USAGE: u8 = 2;
+
+/// Exit code for a command that ran and failed — a corrupt file, a missing one.
+const EXIT_FAILURE: u8 = 1;
 
 fn main() -> ExitCode {
     match args::parse(std::env::args().skip(1)) {
@@ -33,6 +37,16 @@ fn main() -> ExitCode {
                 options.threads, options.value_size, options.duration_secs
             );
             ExitCode::SUCCESS
+        }
+        Ok(Command::SstDump(options)) => {
+            let mut stdout = std::io::stdout().lock();
+            match sst_dump::run(&options, &mut stdout) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("esker sst-dump: {error}");
+                    ExitCode::from(EXIT_FAILURE)
+                }
+            }
         }
         Err(error) => {
             eprintln!("esker: {error}\n");

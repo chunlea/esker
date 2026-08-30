@@ -8,5 +8,13 @@ license.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+[dependencies]
+# `sst-dump` reads real tables through the engine's own reader, so the tool and the
+# engine can never disagree about the format (docs/DESIGN.md §12).
+esker-engine.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true
