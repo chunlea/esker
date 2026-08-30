@@ -59,7 +59,9 @@ pub use error::{Result, StoreError, engine_to_proto};
 pub use heartbeat::{Heartbeats, RegionReport, StoreReport};
 pub use pd::{Bootstrapped, PdClient, RegionHeartbeat, RegionRoute, StoreHeartbeat, StoreInfo};
 pub use pd_remote::RemotePd;
-pub use peer::{Applied, DiscardTransport, PeerOptions, RaftPeer, RaftTransport};
+pub use peer::{
+    Applied, DiscardTransport, NoHost, PeerOptions, RaftPeer, RaftTransport, RegionHost,
+};
 pub use raft_log::{PersistedState, RaftLogStorage};
 pub use rawkv::Limits;
 pub use region::{RegionMeta, request_range};

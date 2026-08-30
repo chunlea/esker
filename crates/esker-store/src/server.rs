@@ -33,11 +33,12 @@ use crate::error::{Result, StoreError};
 use crate::heartbeat::{Heartbeats, RegionReport, StoreReport};
 use crate::meta;
 use crate::pd::{PdClient, StoreInfo};
-use crate::peer::{PeerOptions, RaftPeer};
+use crate::peer::{PeerOptions, RaftPeer, RegionHost};
 use crate::raft_log::RaftLogStorage;
 use crate::rawkv::{self, Limits};
 use crate::region::RegionMeta;
 use crate::regions::{RegionMap, RegionState};
+use crate::split::{self, SplitOptions};
 use crate::transport::{PeerAddress, StoreAddress, StoreTransport};
 
 /// How a store is opened.
@@ -76,6 +77,11 @@ pub struct StoreOptions {
     /// these ([`crate::heartbeat::Heartbeats`]), so this is the resolution of the schedule and
     /// not its period.
     pub heartbeat_tick: std::time::Duration,
+    /// When a region is split, and how finely the boundary is chosen.
+    ///
+    /// Splitting needs cluster-unique ids, so it needs a placement driver: a store with
+    /// [`StoreOptions::pd`] unset never splits, whatever this says.
+    pub split: SplitOptions,
 }
 
 /// How this store's region is replicated.
@@ -132,6 +138,7 @@ impl StoreOptions {
             pd: None,
             address: String::new(),
             heartbeat_tick: std::time::Duration::from_millis(esker_raft::TICK_MS),
+            split: SplitOptions::new(),
             engine: Options {
                 create_if_missing: true,
                 wal_sync_mode: WalSyncMode::Never,
@@ -166,14 +173,25 @@ pub struct Store {
     /// One connection per store pair, shared by every region. Kept so it can be shut down with
     /// the store; each region's view holds its own reference.
     transport: Option<Arc<StoreTransport>>,
+    /// How regions are replicated, kept because a **split** starts a new peer long after `open`
+    /// returned and needs the same address book, seed and tick the others got.
+    raft: Option<RaftOptions>,
+    /// How this store decides to split.
+    split: SplitOptions,
+    /// The runtime this store was opened on. A split starts the child's peer from the parent's
+    /// driver thread, which is a plain OS thread; `tokio::spawn` there is a panic.
+    runtime: Option<tokio::runtime::Handle>,
     /// One per replicated region: the timer that feeds its driver thread.
     ///
     /// `TODO(phase-4d)`: one timer per region is one task per region. At fifty regions that is
     /// fifty timers where one wheel would do, which is the same sharding decision as the apply
     /// worker's and belongs with it.
-    tickers: Vec<tokio::task::JoinHandle<()>>,
-    /// The task that reports to the placement driver, when there is one.
-    heartbeats: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    ///
+    /// Behind a lock because a split adds one, from the parent's driver thread.
+    tickers: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// The store-wide tasks: the heartbeat schedule and the split checker, when there is a
+    /// placement driver for either to talk to.
+    background: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl Store {
@@ -203,6 +221,7 @@ impl Store {
             pd,
             address,
             heartbeat_tick,
+            split,
         } = options;
         let db = Db::open_with(path, engine, Arc::new(LocalFileSystem::new()), &cf::BUILTIN)?;
 
@@ -245,34 +264,9 @@ impl Store {
         });
 
         let regions = RegionMap::new();
-        let mut tickers = Vec::new();
-        for region in hosted {
-            // A record whose peer list does not name this store is what a crash between
-            // `RemovePeer` applying and this store deleting its data leaves behind
-            // (`docs/plans/phase-4.md` §6, race 3). Starting a peer for it would put a voter back
-            // into a group that has already removed it.
-            if !region.peers.iter().any(|peer| peer.store_id == store_id) {
-                tracing::warn!(
-                    store_id,
-                    region_id = region.id,
-                    "a region record on this store does not list it as a peer; not started"
-                );
-                continue;
-            }
-            let state = match (&raft, &transport) {
-                (Some(raft), Some(transport)) => {
-                    let peer = start_peer(&db, &region, store_id, raft, transport)?;
-                    tickers.push(peer.spawn_ticker(raft.tick));
-                    RegionState::replicated(RegionMeta::new(region), peer)
-                }
-                _ => RegionState::unreplicated(RegionMeta::new(region)),
-            };
-            regions.insert(state)?;
-        }
-
         tracing::info!(
             store_id,
-            regions = regions.len(),
+            regions = hosted.len(),
             replicated = transport.is_some(),
             column_families = ?cf::BUILTIN,
             "store opened"
@@ -285,13 +279,95 @@ impl Store {
             limits,
             write_gate: RwLock::new(()),
             transport,
-            tickers,
-            heartbeats: std::sync::Mutex::new(None),
+            raft,
+            split,
+            runtime: tokio::runtime::Handle::try_current().ok(),
+            tickers: std::sync::Mutex::new(Vec::new()),
+            background: std::sync::Mutex::new(Vec::new()),
         });
+
+        // The peers are started only now, because each of them needs a handle back to the store:
+        // a split reaches outside the region it happens in, and the driver that applies it has to
+        // be able to say so ([`crate::peer::RegionHost`]).
+        for region in hosted {
+            store.host_region(region)?;
+        }
+
         if let Some(pd) = pd {
-            store.spawn_heartbeats(pd, heartbeat_tick);
+            store.spawn_heartbeats(Arc::clone(&pd), heartbeat_tick);
+            store.spawn_split_checker(pd, heartbeat_tick);
         }
         Ok(store)
+    }
+
+    /// Adds one region to the map, starting its peer when this store replicates.
+    ///
+    /// A record whose peer list does not name this store is **not** started: that is what a crash
+    /// between `RemovePeer` applying and the data being deleted leaves behind
+    /// (`docs/plans/phase-4.md` §6, race 3), and starting a peer for it would return a voter to a
+    /// group that has already removed it.
+    fn host_region(self: &Arc<Self>, region: Region) -> Result<()> {
+        if !region
+            .peers
+            .iter()
+            .any(|peer| peer.store_id == self.store_id)
+        {
+            tracing::warn!(
+                store_id = self.store_id,
+                region_id = region.id,
+                "a region record on this store does not list it as a peer; not started"
+            );
+            return Ok(());
+        }
+        let state = match (&self.raft, &self.transport) {
+            (Some(raft), Some(transport)) => {
+                let host: Arc<dyn RegionHost> = Arc::new(StoreHost {
+                    store: Arc::downgrade(self),
+                });
+                let peer = start_peer(&self.db, &region, self.store_id, raft, transport, host)?;
+                self.spawn_ticker(&peer, raft.tick);
+                RegionState::replicated(RegionMeta::new(region), peer)
+            }
+            _ => RegionState::unreplicated(RegionMeta::new(region)),
+        };
+        self.regions.insert(state)?;
+        Ok(())
+    }
+
+    /// Starts one peer's ticker, on the runtime this store was opened on.
+    fn spawn_ticker(&self, peer: &Arc<RaftPeer>, tick: std::time::Duration) {
+        let Some(runtime) = &self.runtime else {
+            // A store with no runtime has no transport either, so it has no peers to tick.
+            return;
+        };
+        let ticker = peer.spawn_ticker_on(runtime, tick);
+        if let Ok(mut tickers) = self.tickers.lock() {
+            tickers.push(ticker);
+        }
+    }
+
+    /// Brings a split into effect: narrows the parent and starts the child.
+    ///
+    /// Called from the **parent's driver thread**, after both halves' records are durable. The map
+    /// takes the two changes under one write lock, so no reader ever sees the parent still owning
+    /// what the child now owns — the "key space is a contiguous partition" invariant holds through
+    /// the split rather than after it.
+    fn adopt_split(self: &Arc<Self>, parent: &Region, child: &Region) -> Result<()> {
+        let child_state = match (&self.raft, &self.transport) {
+            (Some(raft), Some(transport)) => {
+                let host: Arc<dyn RegionHost> = Arc::new(StoreHost {
+                    store: Arc::downgrade(self),
+                });
+                // Its log is empty, so `RaftLogStorage::open` writes the configuration it is given
+                // as the membership *as of index 0* — which for a region whose log starts there is
+                // exactly the split-time membership, and is the anchor rule of `91de89a`.
+                let peer = start_peer(&self.db, child, self.store_id, raft, transport, host)?;
+                self.spawn_ticker(&peer, raft.tick);
+                RegionState::replicated(RegionMeta::new(child.clone()), peer)
+            }
+            _ => RegionState::unreplicated(RegionMeta::new(child.clone())),
+        };
+        self.regions.apply_split(parent.clone(), child_state)
     }
 
     /// Starts the task that reports to the placement driver.
@@ -309,9 +385,12 @@ impl Store {
     /// seconds, on every store. The schedule travels into the closure and back out, because it
     /// is the state that must survive the round.
     fn spawn_heartbeats(self: &Arc<Self>, pd: Arc<dyn PdClient>, tick: std::time::Duration) {
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
         let store = Arc::downgrade(self);
         let store_id = self.store_id;
-        let task = tokio::spawn(async move {
+        let task = runtime.spawn(async move {
             let mut beats = Heartbeats::new(pd, store_id, tick);
             let mut interval = tokio::time::interval(tick);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -336,9 +415,125 @@ impl Store {
                 };
             }
         });
-        if let Ok(mut slot) = self.heartbeats.lock() {
-            *slot = Some(task);
+        self.remember(task);
+    }
+
+    /// Keeps a store-wide task so [`Store::stop`] can end it.
+    fn remember(&self, task: tokio::task::JoinHandle<()>) {
+        if let Ok(mut tasks) = self.background.lock() {
+            tasks.push(task);
         }
+    }
+
+    /// Starts the task that splits regions which have grown past the threshold.
+    ///
+    /// **One region at a time, per store.** The check itself is an atomic load, but everything
+    /// after it — a full scan for the boundary, a round trip to the placement driver for ids, a
+    /// Raft round for the entry — is not, and running several at once would turn a store that fell
+    /// behind into a store issuing a burst of splits. Sequential also means "is a split already in
+    /// flight for this region" needs no bookkeeping: there is one, or there is none.
+    ///
+    /// Splitting needs cluster-unique ids, so it needs a placement driver. A store without one
+    /// never splits, which is exactly what phase 2's single node and phase 3e's static cluster are.
+    fn spawn_split_checker(self: &Arc<Self>, pd: Arc<dyn PdClient>, tick: std::time::Duration) {
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        let weak = Arc::downgrade(self);
+        let task = runtime.spawn(async move {
+            let mut interval = tokio::time::interval(tick);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // The size at which each region last failed to find a boundary. A region that cannot
+            // be split is rescanned only once it has grown by another threshold, so a region of
+            // one enormous value does not cost a full scan on every tick for ever.
+            let mut refused: std::collections::BTreeMap<u64, u64> =
+                std::collections::BTreeMap::new();
+            loop {
+                interval.tick().await;
+                let Some(store) = weak.upgrade() else {
+                    return;
+                };
+                let threshold = store.split.region_split_size;
+                let candidates: Vec<Arc<RegionState>> = store
+                    .regions
+                    .states()
+                    .into_iter()
+                    .filter(|state| {
+                        let Some(peer) = state.peer() else {
+                            return false;
+                        };
+                        let size = peer.approximate_size();
+                        peer.is_leader()
+                            && size >= threshold
+                            && refused
+                                .get(&state.id())
+                                .is_none_or(|at| size >= at + threshold)
+                    })
+                    .collect();
+                for state in candidates {
+                    match store.split_region(&pd, &state).await {
+                        Ok(true) => {
+                            refused.remove(&state.id());
+                        }
+                        Ok(false) => {
+                            let size = state.peer().map_or(0, |peer| peer.approximate_size());
+                            refused.insert(state.id(), size);
+                        }
+                        Err(error) => tracing::debug!(
+                            region_id = state.id(),
+                            %error,
+                            "a split did not go through; it will be tried again"
+                        ),
+                    }
+                }
+                drop(store);
+            }
+        });
+        self.remember(task);
+    }
+
+    /// Splits one region: choose a boundary, ask for ids, propose. `Ok(false)` means the region
+    /// has no legal boundary and cannot be split, which is not a failure.
+    async fn split_region(
+        self: &Arc<Self>,
+        pd: &Arc<dyn PdClient>,
+        state: &Arc<RegionState>,
+    ) -> std::result::Result<bool, ProtoError> {
+        let region = state.region().clone();
+        let Some(peer) = state.peer().map(Arc::clone) else {
+            return Ok(false);
+        };
+
+        // A full scan of the region, on a blocking thread — `docs/adr/0012-split-key-selection.md`
+        // explains why it is a scan and what would replace it.
+        let db = Arc::clone(&self.db);
+        let scanned = region.clone();
+        let max_sampled = self.split.max_sampled_keys;
+        let Some(split_key) =
+            blocking(move || split::choose_split_key(&db, &scanned, max_sampled)).await?
+        else {
+            tracing::debug!(
+                region_id = region.id,
+                "the region is over the split threshold but has no key to split at"
+            );
+            return Ok(false);
+        };
+
+        // One id for the child region and one per peer, in a single block: a round trip per id
+        // would put the placement driver on the split path.
+        let pd = Arc::clone(pd);
+        let count = 1 + region.peers.len() as u64;
+        let first = blocking(move || pd.alloc_id(count)).await?;
+        let new_region_id = first;
+        let new_peer_ids: Vec<u64> = (first + 1..first + count).collect();
+
+        peer.propose(&Command::Split {
+            split_key,
+            new_region_id,
+            new_peer_ids,
+        })
+        .await?;
+        Ok(true)
     }
 
     /// What this store looks like right now, for one heartbeat round.
@@ -465,13 +660,15 @@ impl Store {
     /// Stops replication: the heartbeats, every ticker, every peer's thread, and every store
     /// connection.
     pub fn stop(&self) {
-        if let Ok(mut task) = self.heartbeats.lock()
-            && let Some(task) = task.take()
-        {
-            task.abort();
+        if let Ok(mut tasks) = self.background.lock() {
+            for task in tasks.drain(..) {
+                task.abort();
+            }
         }
-        for ticker in &self.tickers {
-            ticker.abort();
+        if let Ok(tickers) = self.tickers.lock() {
+            for ticker in tickers.iter() {
+                ticker.abort();
+            }
         }
         for state in self.regions.states() {
             if let Some(peer) = state.peer() {
@@ -725,6 +922,7 @@ fn start_peer(
     store_id: u64,
     raft: &RaftOptions,
     transport: &Arc<StoreTransport>,
+    host: Arc<dyn RegionHost>,
 ) -> Result<Arc<RaftPeer>> {
     let voters: Vec<u64> = region
         .peers
@@ -750,7 +948,7 @@ fn start_peer(
     )?;
     RaftPeer::start(
         PeerOptions {
-            region_id: region.id,
+            region: region.clone(),
             peer_id,
             voters,
             seed: raft.seed,
@@ -758,7 +956,30 @@ fn start_peer(
         storage,
         transport.for_region(region.id, region.epoch, &raft.peers)
             as Arc<dyn crate::peer::RaftTransport>,
+        host,
     )
+}
+
+/// The store, behind the weak reference a peer's driver holds it by.
+///
+/// Weak because the store owns the peers and the peers would otherwise own the store. A split
+/// arriving after the store has been dropped is a store that is shutting down, and the halves are
+/// already durable — the next open reads them.
+#[derive(Debug)]
+struct StoreHost {
+    store: std::sync::Weak<Store>,
+}
+
+impl RegionHost for StoreHost {
+    fn split_applied(&self, parent: &Region, child: &Region) -> Result<()> {
+        let Some(store) = self.store.upgrade() else {
+            return Err(StoreError::RegionConflict(format!(
+                "region {} split while its store was shutting down",
+                parent.id
+            )));
+        };
+        store.adopt_split(parent, child)
+    }
 }
 
 /// Runs synchronous engine work on a blocking thread.

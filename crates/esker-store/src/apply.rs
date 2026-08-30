@@ -9,17 +9,32 @@
 //! every peer reaches identically, and stays correct across a leadership change.
 //!
 //! Determinism therefore has a rule attached: **applying a command may read only the applied state
-//! of the data column families, and nothing else**. No clock, no configuration, no `Limits` that
-//! could differ between peers — a `DeleteRange` that one peer refuses for exceeding a limit and
-//! another accepts is two different state machines.
+//! of the data column families and its region's own metadata, and nothing else**. No clock, no
+//! configuration, no `Limits` that could differ between peers — a `DeleteRange` that one peer
+//! refuses for exceeding a limit and another accepts is two different state machines. The region's
+//! range is admissible because it too is a product of the log: every peer's range at entry *N* is
+//! whatever the splits before *N* left it as.
+//!
+//! # Two kinds of failure, and only one of them is fatal
+//!
+//! [`check_scope`] is a **deterministic refusal**: the key is outside the region this entry is
+//! being applied to, every peer sees that identically, and the proposer is told so. It is a normal
+//! outcome, and it is the mechanism that stops a write proposed before a split from landing in the
+//! wrong half. A payload that cannot be *decoded* is the other kind: it cannot be applied at all,
+//! and skipping it would leave this peer's state machine differing from every other's, so it stops
+//! the driver.
 //!
 //! # Format (*fixed*, version 1)
 //!
 //! ```text
 //! version:u8 = 1
-//! tag:u8       1 Put, 2 BatchPut, 3 Delete, 4 DeleteRange, 5 CompareAndSwap
+//! tag:u8       1 Put, 2 BatchPut, 3 Delete, 4 DeleteRange, 5 CompareAndSwap, 6 Split
 //! fields       length-prefixed bytes, as each variant documents
 //! ```
+//!
+//! Tag 6 was added in phase 4b. It is an *addition* to the format and not a change to it: every
+//! byte an earlier tag produced still decodes to the same command, and the goldens that pin them
+//! are untouched.
 //!
 //! It is deliberately not `RawKvReq`. The Raft log is an on-disk format and the wire is not; tying
 //! them together would mean a wire change rewriting every log in the cluster
@@ -28,7 +43,7 @@
 use bytes::Bytes;
 use esker_engine::{Db, ReadOptions, WriteBatch, cf};
 use esker_keys::prefix;
-use esker_proto::{Decoder, Encoder, ProtoError, RawKvReq, RawKvResp};
+use esker_proto::{Decoder, Encoder, Epoch, Peer, ProtoError, RawKvReq, RawKvResp, Region};
 
 use crate::error::engine_to_proto;
 use crate::peer::Applied;
@@ -41,6 +56,7 @@ const TAG_BATCH_PUT: u8 = 2;
 const TAG_DELETE: u8 = 3;
 const TAG_DELETE_RANGE: u8 = 4;
 const TAG_COMPARE_AND_SWAP: u8 = 5;
+const TAG_SPLIT: u8 = 6;
 
 /// A mutation, on its way through the Raft log.
 ///
@@ -81,6 +97,23 @@ pub enum Command {
         expected: Option<Bytes>,
         /// What to write, or `None` to delete.
         value: Option<Bytes>,
+    },
+    /// Divide this region in two (`docs/DESIGN.md` §6). The one **admin** command: it touches no
+    /// data column family, only the two regions' metadata.
+    ///
+    /// Applied on every peer under the region lock, so both halves come into existence at the same
+    /// point in every peer's log. The ids come from the placement driver, which is why they are in
+    /// the payload rather than derived: every peer must arrive at the *same* ids, and only one of
+    /// them talked to PD.
+    Split {
+        /// Where to cut. Becomes the parent's new exclusive end and the child's inclusive start.
+        split_key: Bytes,
+        /// The child's cluster-unique region id.
+        new_region_id: u64,
+        /// One peer id per peer of the parent, paired **positionally with the parent's peers
+        /// sorted by `peer_id`**. Positional because every peer has to reach the same answer, and
+        /// a store choosing "the id PD gave me" would put PD in the apply path.
+        new_peer_ids: Vec<u64>,
     },
 }
 
@@ -153,6 +186,19 @@ impl Command {
                 out.put_opt_bytes(expected.as_deref());
                 out.put_opt_bytes(value.as_deref());
             }
+            Self::Split {
+                split_key,
+                new_region_id,
+                new_peer_ids,
+            } => {
+                out.put_u8(TAG_SPLIT);
+                out.put_bytes(split_key);
+                out.put_varint(*new_region_id);
+                out.put_varint(new_peer_ids.len() as u64);
+                for peer_id in new_peer_ids {
+                    out.put_varint(*peer_id);
+                }
+            }
         }
         Bytes::from(out.finish())
     }
@@ -175,43 +221,64 @@ impl Command {
         let tag = input
             .get_u8("command.tag")
             .map_err(|error| ProtoError::corrupt("raft command", error.to_string()))?;
-        let command = match tag {
-            TAG_PUT => Self::Put {
-                key: owned(&mut input, "put.key")?,
-                value: owned(&mut input, "put.value")?,
-            },
-            TAG_BATCH_PUT => {
-                let count = input
-                    .get_count("batch_put.count")
-                    .map_err(|error| ProtoError::corrupt("raft command", error.to_string()))?;
-                let mut pairs = Vec::with_capacity(count.min(1024));
-                for _ in 0..count {
-                    pairs.push((
-                        owned(&mut input, "batch_put.key")?,
-                        owned(&mut input, "batch_put.value")?,
+        let command =
+            match tag {
+                TAG_PUT => Self::Put {
+                    key: owned(&mut input, "put.key")?,
+                    value: owned(&mut input, "put.value")?,
+                },
+                TAG_BATCH_PUT => {
+                    let count = input
+                        .get_count("batch_put.count")
+                        .map_err(|error| ProtoError::corrupt("raft command", error.to_string()))?;
+                    let mut pairs = Vec::with_capacity(count.min(1024));
+                    for _ in 0..count {
+                        pairs.push((
+                            owned(&mut input, "batch_put.key")?,
+                            owned(&mut input, "batch_put.value")?,
+                        ));
+                    }
+                    Self::BatchPut { pairs }
+                }
+                TAG_DELETE => Self::Delete {
+                    key: owned(&mut input, "delete.key")?,
+                },
+                TAG_DELETE_RANGE => Self::DeleteRange {
+                    start: owned(&mut input, "delete_range.start")?,
+                    end: owned(&mut input, "delete_range.end")?,
+                },
+                TAG_COMPARE_AND_SWAP => Self::CompareAndSwap {
+                    key: owned(&mut input, "cas.key")?,
+                    expected: owned_opt(&mut input, "cas.expected")?,
+                    value: owned_opt(&mut input, "cas.value")?,
+                },
+                TAG_SPLIT => {
+                    let split_key = owned(&mut input, "split.key")?;
+                    let new_region_id = input
+                        .get_varint("split.region_id")
+                        .map_err(|error| ProtoError::corrupt("raft command", error.to_string()))?;
+                    let count = input
+                        .get_count("split.peer_count")
+                        .map_err(|error| ProtoError::corrupt("raft command", error.to_string()))?;
+                    let mut new_peer_ids = Vec::with_capacity(count.min(64));
+                    for _ in 0..count {
+                        new_peer_ids.push(input.get_varint("split.peer_id").map_err(|error| {
+                            ProtoError::corrupt("raft command", error.to_string())
+                        })?);
+                    }
+                    Self::Split {
+                        split_key,
+                        new_region_id,
+                        new_peer_ids,
+                    }
+                }
+                other => {
+                    return Err(ProtoError::corrupt(
+                        "raft command",
+                        format!("unknown command tag {other}"),
                     ));
                 }
-                Self::BatchPut { pairs }
-            }
-            TAG_DELETE => Self::Delete {
-                key: owned(&mut input, "delete.key")?,
-            },
-            TAG_DELETE_RANGE => Self::DeleteRange {
-                start: owned(&mut input, "delete_range.start")?,
-                end: owned(&mut input, "delete_range.end")?,
-            },
-            TAG_COMPARE_AND_SWAP => Self::CompareAndSwap {
-                key: owned(&mut input, "cas.key")?,
-                expected: owned_opt(&mut input, "cas.expected")?,
-                value: owned_opt(&mut input, "cas.value")?,
-            },
-            other => {
-                return Err(ProtoError::corrupt(
-                    "raft command",
-                    format!("unknown command tag {other}"),
-                ));
-            }
-        };
+            };
         input
             .finish()
             .map_err(|error| ProtoError::corrupt("raft command", error.to_string()))?;
@@ -240,11 +307,120 @@ fn owned_opt(input: &mut Decoder<'_>, field: &'static str) -> Result<Option<Byte
 /// The wire-level `Limits` still guards the request path, where refusing early costs nothing.
 pub const MAX_DELETE_RANGE_KEYS: u64 = 64 * 1024;
 
+/// Whether every key `command` touches is inside `region`, as the region stands **now**.
+///
+/// This is what stops a write proposed before a split from landing in the wrong half. A `Put`
+/// ordered after the `Split` entry that narrowed its region is applied against the narrowed range,
+/// finds its key outside, and is refused — on every peer, identically, because every peer's range
+/// at that entry is the product of the same log prefix. The proposer learns it as
+/// [`ProtoError::EpochNotMatch`], refreshes, and its retry lands on the half that owns the key.
+///
+/// A **whole-command check, before anything is staged.** A batch is one atomic write and there is
+/// no half of it to keep, so finding the bad key part way through would mean either a partial
+/// application or an undo.
+///
+/// [`Command::Split`] touches no key and is checked by the caller against a different question:
+/// whether its boundary is still inside the region ([`crate::split::is_legal_boundary`]).
+pub fn check_scope(command: &Command, region: &Region) -> Result<(), ProtoError> {
+    let refuse = |key: &[u8]| ProtoError::KeyNotInRegion {
+        key: Bytes::copy_from_slice(key),
+        region_id: region.id,
+        start_key: region.start_key.clone(),
+        end_key: region.end_key.clone(),
+    };
+    let one = |key: &Bytes| {
+        if region.contains(key) {
+            Ok(())
+        } else {
+            Err(refuse(key))
+        }
+    };
+    match command {
+        Command::Put { key, .. }
+        | Command::Delete { key }
+        | Command::CompareAndSwap { key, .. } => one(key),
+        Command::BatchPut { pairs } => pairs.iter().try_for_each(|(key, _)| one(key)),
+        Command::DeleteRange { start, end } => {
+            // The end is *clamped* rather than checked, below: a range delete that ran past the
+            // region's new end deletes this region's share and the client's retry deletes the
+            // rest. Only the start has to be ours.
+            let _ = end;
+            one(start)
+        }
+        Command::Split { .. } => Ok(()),
+    }
+}
+
+/// The two regions a split produces, or a refusal every peer makes identically.
+///
+/// The parent keeps its id and its peers and gives up everything from `split_key` up; the child
+/// takes the rest with fresh peer ids on the **same stores**. Both halves' `version` bumps, which
+/// is what makes every cached copy of either one stale (`docs/DESIGN.md` §6).
+pub fn split_region(
+    parent: &Region,
+    split_key: &Bytes,
+    new_region_id: u64,
+    new_peer_ids: &[u64],
+) -> Result<(Region, Region), ProtoError> {
+    if new_peer_ids.len() != parent.peers.len() {
+        return Err(ProtoError::invalid(format!(
+            "a split of region {} carries {} peer ids for {} peers",
+            parent.id,
+            new_peer_ids.len(),
+            parent.peers.len()
+        )));
+    }
+    if new_region_id == 0 || new_region_id == parent.id || new_peer_ids.contains(&0) {
+        return Err(ProtoError::invalid(format!(
+            "a split of region {} carries an unusable id",
+            parent.id
+        )));
+    }
+
+    // Sorted, so that every peer pairs the same parent peer with the same new id. The parent's own
+    // peer list order is whatever PD or a bootstrap happened to produce and is not a contract.
+    let mut peers = parent.peers.clone();
+    peers.sort_unstable_by_key(|peer| peer.peer_id);
+    let child_peers: Vec<Peer> = peers
+        .iter()
+        .zip(new_peer_ids)
+        .map(|(peer, peer_id)| Peer {
+            store_id: peer.store_id,
+            peer_id: *peer_id,
+            role: peer.role,
+        })
+        .collect();
+
+    let version = parent.epoch.version + 1;
+    let left = Region {
+        end_key: split_key.clone(),
+        epoch: Epoch::new(parent.epoch.conf_ver, version),
+        ..parent.clone()
+    };
+    let right = Region {
+        id: new_region_id,
+        start_key: split_key.clone(),
+        end_key: parent.end_key.clone(),
+        peers: child_peers,
+        epoch: Epoch::new(parent.epoch.conf_ver, version),
+    };
+    Ok((left, right))
+}
+
 /// Stages a command's effect on the data column families and says what it produced.
 ///
 /// The caller adds `apply_index` to the same batch and writes it, so the effect and the record of
-/// having applied it are one atomic step.
-pub fn stage(db: &Db, batch: &mut WriteBatch, command: &Command) -> Result<Applied, ProtoError> {
+/// having applied it are one atomic step, and calls [`check_scope`] first — every key here is
+/// already known to be this region's.
+///
+/// [`Command::Split`] is not staged here: it writes region metadata rather than data, and the
+/// driver stages it beside the same `apply_index` ([`crate::peer`]).
+pub fn stage(
+    db: &Db,
+    batch: &mut WriteBatch,
+    command: &Command,
+    region: &Region,
+) -> Result<Applied, ProtoError> {
     let cf_id = db.cf_id(cf::DEFAULT).ok_or_else(|| {
         ProtoError::internal("the store opened without its `default` column family")
     })?;
@@ -265,6 +441,10 @@ pub fn stage(db: &Db, batch: &mut WriteBatch, command: &Command) -> Result<Appli
             Ok(Applied::Done)
         }
         Command::DeleteRange { start, end } => {
+            // An empty end means "to the end of the region", and *which* region that is has
+            // moved if this entry was ordered after a split. Clamping to the region's current
+            // end deletes this half's share; the client's retry deletes the child's.
+            let end = if end.is_empty() { &region.end_key } else { end };
             let keys = stage_delete_range(db, batch, cf_id, start, end)?;
             Ok(Applied::Deleted { keys })
         }
@@ -291,6 +471,9 @@ pub fn stage(db: &Db, batch: &mut WriteBatch, command: &Command) -> Result<Appli
                 previous: stored,
             })
         }
+        // Its effect is on the two regions' metadata, which the driver stages beside the same
+        // `apply_index`. Nothing reaches a data column family.
+        Command::Split { .. } => Ok(Applied::Done),
     }
 }
 
@@ -372,7 +555,7 @@ mod tests {
     use esker_keys::prefix;
     use esker_proto::{ProtoError, RawKvReq};
 
-    use super::{Command, response, stage};
+    use super::{Command, Region, check_scope, response, split_region, stage};
     use crate::peer::Applied;
 
     fn open() -> (tempfile::TempDir, Arc<Db>) {
@@ -391,9 +574,16 @@ mod tests {
         (dir, Arc::new(db))
     }
 
+    /// The region every test here applies against: everything, so a key is never out of range
+    /// unless the test says so.
+    fn whole() -> Region {
+        Region::bootstrap(1, 1, 1)
+    }
+
     fn apply(db: &Db, command: &Command) -> Applied {
         let mut batch = WriteBatch::new();
-        let outcome = stage(db, &mut batch, command).unwrap();
+        check_scope(command, &whole()).unwrap();
+        let outcome = stage(db, &mut batch, command, &whole()).unwrap();
         db.write(batch, &WriteOptions { sync: false }).unwrap();
         outcome
     }
@@ -641,6 +831,265 @@ mod tests {
         );
     }
 
+    /// The one command that is not a mutation of data. Its payload is a wire format like every
+    /// other entry's, so it round trips and its bytes are pinned.
+    #[test]
+    fn a_split_command_round_trips_and_encodes_to_the_documented_bytes() {
+        let split = Command::Split {
+            split_key: Bytes::from_static(b"m"),
+            new_region_id: 7,
+            new_peer_ids: vec![10, 11, 300],
+        };
+        assert_eq!(Command::decode(&split.encode()).unwrap(), split);
+
+        assert_eq!(
+            split.encode().to_vec(),
+            vec![
+                1,    // format version
+                6,    // tag: Split
+                1,    // split_key: one byte
+                b'm', //
+                7,    // new_region_id
+                3,    // three peer ids
+                10,   //
+                11,   //
+                0xAC, // 300 is two varint bytes
+                0x02, //
+            ]
+        );
+    }
+
+    /// Adding tag 6 must leave every earlier tag's bytes exactly where they were: a log written
+    /// before 4b has to keep decoding to the same commands.
+    #[test]
+    fn the_earlier_tags_are_where_they_were() {
+        for (command, tag) in [
+            (
+                Command::Put {
+                    key: Bytes::from_static(b"k"),
+                    value: Bytes::from_static(b"v"),
+                },
+                1,
+            ),
+            (Command::BatchPut { pairs: Vec::new() }, 2),
+            (
+                Command::Delete {
+                    key: Bytes::from_static(b"k"),
+                },
+                3,
+            ),
+            (
+                Command::DeleteRange {
+                    start: Bytes::from_static(b"a"),
+                    end: Bytes::from_static(b"m"),
+                },
+                4,
+            ),
+            (
+                Command::CompareAndSwap {
+                    key: Bytes::from_static(b"k"),
+                    expected: None,
+                    value: None,
+                },
+                5,
+            ),
+        ] {
+            assert_eq!(command.encode()[1], tag, "{command:?}");
+            assert_eq!(Command::decode(&command.encode()).unwrap(), command);
+        }
+    }
+
+    /// The check that stops a write proposed before a split from landing in the wrong half. It is
+    /// a whole-command check: a batch is one atomic write and there is no half of it to keep.
+    #[test]
+    fn a_key_outside_the_region_is_refused_before_anything_is_staged() {
+        let narrowed = Region {
+            end_key: Bytes::from_static(b"m"),
+            ..whole()
+        };
+        let inside = Bytes::from_static(b"a");
+        let outside = Bytes::from_static(b"z");
+
+        check_scope(
+            &Command::Put {
+                key: inside.clone(),
+                value: Bytes::new(),
+            },
+            &narrowed,
+        )
+        .unwrap();
+        let error = check_scope(
+            &Command::Put {
+                key: outside.clone(),
+                value: Bytes::new(),
+            },
+            &narrowed,
+        )
+        .unwrap_err();
+        match error {
+            ProtoError::KeyNotInRegion { key, end_key, .. } => {
+                assert_eq!(key, outside);
+                assert_eq!(
+                    end_key,
+                    Bytes::from_static(b"m"),
+                    "the range that refused it"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // A batch is refused whole, however late the bad key comes.
+        assert!(
+            check_scope(
+                &Command::BatchPut {
+                    pairs: vec![
+                        (inside.clone(), Bytes::new()),
+                        (outside.clone(), Bytes::new()),
+                    ],
+                },
+                &narrowed,
+            )
+            .is_err()
+        );
+
+        // A split's own boundary is not a key it touches, so it is not checked here.
+        check_scope(
+            &Command::Split {
+                split_key: outside,
+                new_region_id: 2,
+                new_peer_ids: vec![9],
+            },
+            &narrowed,
+        )
+        .unwrap();
+    }
+
+    /// A range delete with no upper bound means "to the end of the region", and after a split that
+    /// is a different place. It is clamped rather than refused: this half deletes its share and the
+    /// client's retry deletes the child's.
+    #[test]
+    fn an_unbounded_range_delete_is_clamped_to_the_region_it_applies_in() {
+        let (_dir, db) = open();
+        for key in [&b"a"[..], b"g", b"q", b"z"] {
+            apply(
+                &db,
+                &Command::Put {
+                    key: Bytes::copy_from_slice(key),
+                    value: Bytes::from_static(b"v"),
+                },
+            );
+        }
+
+        let narrowed = Region {
+            end_key: Bytes::from_static(b"m"),
+            ..whole()
+        };
+        let mut batch = WriteBatch::new();
+        let outcome = stage(
+            &db,
+            &mut batch,
+            &Command::DeleteRange {
+                start: Bytes::from_static(b"a"),
+                end: Bytes::new(),
+            },
+            &narrowed,
+        )
+        .unwrap();
+        db.write(batch, &WriteOptions { sync: false }).unwrap();
+
+        assert_eq!(outcome, Applied::Deleted { keys: 2 }, "only `a` and `g`");
+        assert_eq!(read(&db, b"a"), None);
+        assert_eq!(read(&db, b"g"), None);
+        assert!(
+            read(&db, b"q").is_some(),
+            "the child's keys were not touched"
+        );
+        assert!(read(&db, b"z").is_some());
+    }
+
+    /// The arithmetic of a split, which every peer performs identically from the same entry.
+    #[test]
+    fn a_split_divides_the_range_and_bumps_both_halves() {
+        let parent = Region {
+            id: 1,
+            start_key: Bytes::from_static(b"a"),
+            end_key: Bytes::from_static(b"z"),
+            // Deliberately out of peer-id order: the pairing sorts, so the parent's own order is
+            // not a contract.
+            peers: vec![
+                esker_proto::Peer::voter(3, 30),
+                esker_proto::Peer::voter(1, 10),
+                esker_proto::Peer::voter(2, 20),
+            ],
+            epoch: esker_proto::Epoch::new(4, 7),
+        };
+        let (left, right) =
+            split_region(&parent, &Bytes::from_static(b"m"), 9, &[100, 200, 300]).unwrap();
+
+        assert_eq!(left.id, 1, "the parent keeps its id");
+        assert_eq!(left.start_key, Bytes::from_static(b"a"));
+        assert_eq!(left.end_key, Bytes::from_static(b"m"));
+        assert_eq!(left.peers, parent.peers, "and its peers");
+        assert_eq!(left.epoch, esker_proto::Epoch::new(4, 8));
+
+        assert_eq!(right.id, 9);
+        assert_eq!(right.start_key, Bytes::from_static(b"m"));
+        assert_eq!(right.end_key, Bytes::from_static(b"z"));
+        assert_eq!(right.epoch, esker_proto::Epoch::new(4, 8));
+        // Paired with the parent's peers sorted by peer id: 10→100, 20→200, 30→300, on the same
+        // stores. A store deciding which id was "its" would need the placement driver here.
+        assert_eq!(
+            right
+                .peers
+                .iter()
+                .map(|peer| (peer.store_id, peer.peer_id))
+                .collect::<Vec<_>>(),
+            vec![(1, 100), (2, 200), (3, 300)]
+        );
+
+        // The two halves tile the parent exactly: no gap, no overlap.
+        assert_eq!(left.end_key, right.start_key);
+        assert_eq!(left.start_key, parent.start_key);
+        assert_eq!(right.end_key, parent.end_key);
+    }
+
+    /// An unbounded parent gives its unbounded end to the child, which is the only half that can
+    /// have one.
+    #[test]
+    fn splitting_the_last_region_leaves_the_child_unbounded() {
+        let parent = Region::bootstrap(1, 1, 1);
+        let (left, right) = split_region(&parent, &Bytes::from_static(b"m"), 2, &[9]).unwrap();
+        assert_eq!(left.start_key, Bytes::new());
+        assert_eq!(left.end_key, Bytes::from_static(b"m"));
+        assert_eq!(
+            right.end_key,
+            Bytes::new(),
+            "still the end of the key space"
+        );
+    }
+
+    /// A malformed split is refused the same way on every peer, so it is an answer to the
+    /// proposer rather than a failure of the store.
+    #[test]
+    fn a_split_carrying_unusable_ids_is_refused() {
+        let parent = Region::bootstrap(1, 1, 1);
+        let key = Bytes::from_static(b"m");
+        assert!(
+            split_region(&parent, &key, 2, &[]).is_err(),
+            "one peer, no peer id"
+        );
+        assert!(
+            split_region(&parent, &key, 2, &[9, 10]).is_err(),
+            "one peer, two peer ids"
+        );
+        assert!(split_region(&parent, &key, 0, &[9]).is_err(), "region id 0");
+        assert!(
+            split_region(&parent, &key, 1, &[9]).is_err(),
+            "the child cannot be the parent"
+        );
+        assert!(split_region(&parent, &key, 2, &[0]).is_err(), "peer id 0");
+    }
+
     /// The batch is atomic: nothing it stages is visible until it is written.
     #[test]
     fn staging_writes_nothing_until_the_batch_lands() {
@@ -653,6 +1102,7 @@ mod tests {
                 key: Bytes::from_static(b"k"),
                 value: Bytes::from_static(b"v"),
             },
+            &whole(),
         )
         .unwrap();
         assert_eq!(read(&db, b"k"), None, "staging is not writing");
@@ -722,6 +1172,7 @@ mod tests {
                 key: Bytes::from_static(b"k"),
                 value: Bytes::from_static(b"v"),
             },
+            &whole(),
         );
         assert!(matches!(outcome, Err(ProtoError::Internal { .. })));
     }

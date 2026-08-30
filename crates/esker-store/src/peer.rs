@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use esker_engine::{WriteBatch, WriteOptions};
-use esker_proto::ProtoError;
+use esker_proto::{ProtoError, Region};
 use esker_raft::{
     ConfState, Config as RaftConfig, Entry, EntryKind, Index, Message, NodeId, RawNode, ReadState,
     Role, Status, Term,
@@ -65,6 +65,38 @@ pub struct DiscardTransport;
 
 impl RaftTransport for DiscardTransport {
     fn send(&self, _messages: Vec<Message>) {}
+}
+
+/// The store, as one region's driver needs it: the two things a split cannot do for itself.
+///
+/// A driver owns its `RawNode` exclusively and knows nothing about the store around it, which is
+/// what makes it lock-free. A split has to reach outside that: the region map has to gain the
+/// child and lose half of the parent, and the child needs a peer of its own with a transport and a
+/// ticker. This is that reach, and it is a trait so the peer tests can drive a split without a
+/// store.
+///
+/// Called from the parent's driver thread **after** the batch carrying both halves' metadata is
+/// durable, so an implementation may assume the split is already a fact on disk.
+pub trait RegionHost: Send + Sync + std::fmt::Debug {
+    /// Brings a split into effect: narrows the parent in the region map, and starts the child.
+    ///
+    /// Failing here is a failure of the store, not of the split: the metadata is already durable,
+    /// so the driver stops and the restart rebuilds the map from the records — which is the same
+    /// state this call was trying to produce.
+    fn split_applied(&self, parent: &Region, child: &Region) -> Result<()>;
+}
+
+/// A host that refuses to split, for a peer that has no store around it.
+#[derive(Debug, Default)]
+pub struct NoHost;
+
+impl RegionHost for NoHost {
+    fn split_applied(&self, parent: &Region, _child: &Region) -> Result<()> {
+        Err(StoreError::RegionConflict(format!(
+            "region {} split, but this peer has no store to put the halves in",
+            parent.id
+        )))
+    }
 }
 
 /// What applying a command produced, for whoever proposed it.
@@ -130,8 +162,12 @@ struct PendingRead {
 /// How a peer is built.
 #[derive(Debug, Clone)]
 pub struct PeerOptions {
-    /// The region this peer serves.
-    pub region_id: u64,
+    /// The region this peer serves, as it stands when the peer starts.
+    ///
+    /// The driver keeps its own copy and narrows it when a split applies, so the range every entry
+    /// is checked against is the one the log has produced — never one read from a map another
+    /// thread is also writing.
+    pub region: Region,
     /// This peer's Raft id.
     pub peer_id: NodeId,
     /// The group's voters, used only when the log has no configuration of its own.
@@ -147,6 +183,13 @@ pub struct PeerOptions {
 pub struct PeerCore {
     node: RawNode<RaftLogStorage>,
     transport: Arc<dyn RaftTransport>,
+    host: Arc<dyn RegionHost>,
+    /// This region as the **log** has made it: narrowed by every split this peer has applied.
+    ///
+    /// The driver thread is its only writer and its only reader, so it needs no lock and cannot go
+    /// stale behind anyone's back — the same argument that lets the log storage cache its bounds.
+    /// The region map holds a copy for the request path, updated just after this one.
+    region: Region,
     region_id: u64,
     peer_id: NodeId,
     pending: Vec<Pending>,
@@ -227,35 +270,62 @@ impl PeerCore {
     }
 
     /// Applies one committed entry: its effect and its `apply_index`, in one batch.
+    ///
+    /// Two failures live here and only one is fatal. A **deterministic refusal** — a key outside
+    /// the region as this entry finds it — completes one proposal with an error and moves on; the
+    /// entry still applied, as a no-op, so `apply_index` still advances. A payload that cannot be
+    /// **decoded** cannot be applied at all, and skipping it would leave this peer's state machine
+    /// differing from every other's, so it stops the driver.
     fn apply(&mut self, entry: &Entry) -> Result<()> {
         let mut batch = WriteBatch::new();
-        let outcome = match entry.kind {
+        let mut split_halves = None;
+
+        let outcome: std::result::Result<Applied, ProtoError> = match entry.kind {
             // A leader's no-op carries no payload; it exists so §5.4.2 lets the backlog commit.
             EntryKind::Normal if entry.data.is_empty() => Ok(Applied::Done),
-            EntryKind::Normal => match Command::decode(&entry.data) {
-                // A command that cannot be decoded cannot be applied, and skipping it would make
-                // this peer's state machine differ from every other's. It is a hard failure.
-                Err(error) => Err(error),
-                Ok(command) => crate::apply::stage(self.node.storage().db(), &mut batch, &command),
-            },
+            EntryKind::Normal => {
+                let command = Command::decode(&entry.data).map_err(|error| {
+                    StoreError::Bootstrap(format!("could not apply entry {}: {error}", entry.index))
+                })?;
+                match &command {
+                    Command::Split {
+                        split_key,
+                        new_region_id,
+                        new_peer_ids,
+                    } => self.stage_split(
+                        &mut batch,
+                        &mut split_halves,
+                        split_key,
+                        *new_region_id,
+                        new_peer_ids,
+                    ),
+                    _ => match crate::apply::check_scope(&command, &self.region) {
+                        // Refused, deterministically, on every peer alike. Nothing is staged.
+                        Err(refusal) => Err(refusal),
+                        Ok(()) => Ok(crate::apply::stage(
+                            self.node.storage().db(),
+                            &mut batch,
+                            &command,
+                            &self.region,
+                        )
+                        .map_err(|error| {
+                            StoreError::Bootstrap(format!(
+                                "could not apply entry {}: {error}",
+                                entry.index
+                            ))
+                        })?),
+                    },
+                }
+            }
             EntryKind::ConfChange => {
-                // TODO(phase-4): membership over the wire. 3e bootstraps one static configuration
-                // and has no operator to change it, so a ConfChange entry cannot arise.
+                // TODO(phase-4c): membership over the wire. There is still no operator to have
+                // proposed one, so reaching here is worth saying out loud.
                 tracing::warn!(
                     region_id = self.region_id,
                     index = entry.index,
-                    "a configuration change was committed; 3e has no operator to have proposed one"
+                    "a configuration change was committed; no operator proposes one yet"
                 );
                 Ok(Applied::Done)
-            }
-        };
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                return Err(StoreError::Bootstrap(format!(
-                    "could not apply entry {}: {error}",
-                    entry.index
-                )));
             }
         };
 
@@ -265,12 +335,13 @@ impl PeerCore {
         let staged = batch.byte_size() as u64;
 
         // `apply_index` travels with the data it applied. A crash therefore has both or neither,
-        // which is what makes replaying from `apply_index + 1` correct and exactly-once.
+        // which is what makes replaying from `apply_index + 1` correct and exactly-once — and, for
+        // a split, what makes both halves' records land together or not at all.
         self.node
             .storage_mut()
             .stage_applied(&mut batch, entry.index);
         // Deliberately not synced: losing this batch loses nothing, because the entry is still in
-        // the Raft log, which was. The restart re-applies it.
+        // the Raft log, which was. The restart re-applies it, and a replayed split is a no-op.
         self.node
             .storage()
             .db()
@@ -278,12 +349,59 @@ impl PeerCore {
         self.applied_index = entry.index;
         self.published.size.fetch_add(staged, Ordering::Relaxed);
 
+        // Only now, with both records durable, does the split become visible to anything else.
+        if let Some((parent, child)) = split_halves {
+            self.region = parent.clone();
+            self.host.split_applied(&parent, &child)?;
+            tracing::info!(
+                region_id = parent.id,
+                child_id = child.id,
+                index = entry.index,
+                "a region split"
+            );
+        }
+
         self.complete_proposal(entry, outcome);
         Ok(())
     }
 
+    /// Stages both halves of a split, and hands the caller what has to happen once they are
+    /// durable.
+    ///
+    /// **Idempotent by the range, not by a flag.** After a split the parent ends at `split_key`,
+    /// so `split_key` is no longer strictly inside it — and that one question is the whole replay
+    /// check. A split entry re-applied after a restart answers "no" and does nothing, with no
+    /// marker to write and nothing to keep in step.
+    fn stage_split(
+        &mut self,
+        batch: &mut WriteBatch,
+        halves: &mut Option<(Region, Region)>,
+        split_key: &Bytes,
+        new_region_id: u64,
+        new_peer_ids: &[u64],
+    ) -> std::result::Result<Applied, ProtoError> {
+        if !crate::split::is_legal_boundary(split_key, &self.region) {
+            tracing::debug!(
+                region_id = self.region_id,
+                "a split entry whose boundary is no longer inside this region applied as a no-op"
+            );
+            return Ok(Applied::Done);
+        }
+        let (parent, child) =
+            crate::apply::split_region(&self.region, split_key, new_region_id, new_peer_ids)?;
+        let cf = self.node.storage().cf();
+        crate::meta::stage_region(batch, cf, &parent);
+        crate::meta::stage_region(batch, cf, &child);
+        *halves = Some((parent, child));
+        Ok(Applied::Done)
+    }
+
     /// Notifies whoever proposed the entry at this index — or tells them it was replaced.
-    fn complete_proposal(&mut self, entry: &Entry, outcome: Applied) {
+    fn complete_proposal(
+        &mut self,
+        entry: &Entry,
+        outcome: std::result::Result<Applied, ProtoError>,
+    ) {
         let Some(at) = self
             .pending
             .iter()
@@ -293,7 +411,7 @@ impl PeerCore {
         };
         let pending = self.pending.remove(at);
         if pending.term == entry.term {
-            let _ = pending.notify.send(Ok(outcome));
+            let _ = pending.notify.send(outcome);
         } else {
             // A different entry took this index, so the proposal was truncated. It provably did
             // not apply, which is what makes `NotLeader` the honest answer: retryable, and
@@ -484,7 +602,9 @@ impl RaftPeer {
         options: PeerOptions,
         storage: RaftLogStorage,
         transport: Arc<dyn RaftTransport>,
+        host: Arc<dyn RegionHost>,
     ) -> Result<Arc<Self>> {
+        let region_id = options.region.id;
         let mut config = RaftConfig::new(options.peer_id, options.voters, options.seed);
         config.applied = storage.applied_index();
         let applied_index = storage.applied_index();
@@ -499,7 +619,9 @@ impl RaftPeer {
         let core = PeerCore {
             node,
             transport,
-            region_id: options.region_id,
+            host,
+            region: options.region,
+            region_id,
             peer_id: options.peer_id,
             pending: Vec::new(),
             reads: Vec::new(),
@@ -509,7 +631,6 @@ impl RaftPeer {
         };
 
         let (commands, receiver) = mpsc::channel(PEER_QUEUE_DEPTH);
-        let region_id = options.region_id;
         let thread = std::thread::Builder::new()
             .name(format!("raft-{region_id}"))
             .spawn(move || run(core, receiver))
@@ -519,7 +640,7 @@ impl RaftPeer {
 
         Ok(Arc::new(Self {
             commands,
-            region_id: options.region_id,
+            region_id,
             peer_id: options.peer_id,
             leader,
             published,
@@ -653,8 +774,21 @@ impl RaftPeer {
         self: &Arc<Self>,
         interval: std::time::Duration,
     ) -> tokio::task::JoinHandle<()> {
+        self.spawn_ticker_on(&tokio::runtime::Handle::current(), interval)
+    }
+
+    /// [`RaftPeer::spawn_ticker`], on a runtime named explicitly.
+    ///
+    /// A split starts the child's peer from the **parent's driver thread**, which is a plain OS
+    /// thread with no runtime of its own; `tokio::spawn` there is a panic. The store holds a handle
+    /// from the runtime it was opened on and passes it here.
+    pub fn spawn_ticker_on(
+        self: &Arc<Self>,
+        runtime: &tokio::runtime::Handle,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
         let peer = Arc::clone(self);
-        tokio::spawn(async move {
+        runtime.spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -730,11 +864,11 @@ mod tests {
     use bytes::Bytes;
     use esker_engine::{Db, LocalFileSystem, Options, ReadOptions, WalSyncMode, cf};
     use esker_keys::prefix;
-    use esker_proto::ProtoError;
+    use esker_proto::{ProtoError, Region};
     use esker_raft::{ConfState, LogStorage, Message, Role};
 
     use super::{
-        Applied, DiscardTransport, PEER_QUEUE_DEPTH, PeerOptions, RaftPeer, RaftTransport,
+        Applied, DiscardTransport, NoHost, PEER_QUEUE_DEPTH, PeerOptions, RaftPeer, RaftTransport,
     };
     use crate::apply::Command;
     use crate::raft_log::{PersistedState, RaftLogStorage, decode_entry, log_entry_key, state_key};
@@ -779,13 +913,14 @@ mod tests {
         .unwrap();
         RaftPeer::start(
             PeerOptions {
-                region_id: REGION,
+                region: Region::bootstrap(REGION, 1, peer_id),
                 peer_id,
                 voters,
                 seed: 7,
             },
             storage,
             transport,
+            Arc::new(NoHost),
         )
         .unwrap()
     }

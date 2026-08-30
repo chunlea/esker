@@ -155,6 +155,52 @@ impl RegionMap {
         self.read().by_id.get(&region_id).cloned()
     }
 
+    /// Replaces a region with its two halves, in one step.
+    ///
+    /// The parent keeps its id, its start key and its **peer** — its Raft group is unchanged by a
+    /// split — and gives up everything from the child's start key up. The child arrives with its
+    /// own peer already built.
+    ///
+    /// Both changes happen under one write lock, which is the whole reason this is not two calls.
+    /// A reader between them would see the parent still claiming what the child now owns, and
+    /// "regions tile the key space" would be false for as long as that took — an invariant that
+    /// holds *except briefly* is not one a routing decision can be made against.
+    pub fn apply_split(&self, parent: Region, child: RegionState) -> Result<()> {
+        let mut inner = self.write();
+        let Some(existing) = inner.by_id.get(&parent.id).cloned() else {
+            return Err(StoreError::RegionConflict(format!(
+                "region {} split, but this store does not host it",
+                parent.id
+            )));
+        };
+        if inner.by_id.contains_key(&child.id()) {
+            return Err(StoreError::RegionConflict(format!(
+                "region {} split into {}, which this store already hosts",
+                parent.id,
+                child.id()
+            )));
+        }
+        if existing.region().start_key != parent.start_key {
+            return Err(StoreError::RegionConflict(format!(
+                "a split moved region {}'s start key, which a split never does",
+                parent.id
+            )));
+        }
+
+        let child_start = child.region().start_key.clone();
+        let child_id = child.id();
+        inner.by_id.insert(
+            parent.id,
+            Arc::new(RegionState {
+                meta: RegionMeta::new(parent),
+                peer: existing.peer.clone(),
+            }),
+        );
+        inner.by_start.insert(child_start, child_id);
+        inner.by_id.insert(child_id, Arc::new(child));
+        Ok(())
+    }
+
     /// Drops a region this store no longer hosts, returning what it held.
     ///
     /// Nothing in 4a calls it; `TODO(phase-4c)` is the `RemovePeer` operator, and its hazard is

@@ -20,9 +20,10 @@ use esker_engine::{
     Db, LocalFileSystem, Options, ReadOptions, WalSyncMode, WriteBatch, WriteOptions, cf,
 };
 use esker_keys::prefix;
+use esker_proto::Region;
 use esker_raft::{ConfState, Entry, EntryKind, HardState, LogStorage};
 use esker_store::apply::Command;
-use esker_store::{DiscardTransport, PeerOptions, RaftLogStorage, RaftPeer};
+use esker_store::{DiscardTransport, NoHost, PeerOptions, RaftLogStorage, RaftPeer};
 use tempfile::TempDir;
 
 const REGION: u64 = 1;
@@ -82,15 +83,21 @@ fn start(db: &Arc<Db>) -> Arc<RaftPeer> {
         RaftLogStorage::open(Arc::clone(db), REGION, ConfState::from_voters(vec![1])).unwrap();
     RaftPeer::start(
         PeerOptions {
-            region_id: REGION,
+            region: whole_key_space(),
             peer_id: 1,
             voters: vec![1],
             seed: 3,
         },
         storage,
         Arc::new(DiscardTransport),
+        Arc::new(NoHost),
     )
     .unwrap()
+}
+
+/// The region this test's peer serves: everything, as a bootstrapped store's is.
+fn whole_key_space() -> Region {
+    Region::bootstrap(REGION, 1, 1)
 }
 
 /// Drives the peer until it has applied through `index`.
