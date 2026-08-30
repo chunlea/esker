@@ -1,0 +1,19 @@
+crates/esker-client/tests/load.rs
+  s_4b642fc65050df::t_15b128557c3ff0 152-161,234-252,269,314-315
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "e1ce56eababf9870047603c1033ad70b1f7ca38c",
+  "prompts": {},
+  "sessions": {
+    "s_4b642fc65050df": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5213f73d-feb9-40c2-99a7-08164cb70247",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
