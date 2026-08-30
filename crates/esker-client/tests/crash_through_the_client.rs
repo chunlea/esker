@@ -60,6 +60,12 @@ const ROUNDS_IGNORED: u32 = 200;
 
 const REGION: u64 = 1;
 
+/// How long the parent waits for a child to say where it is listening.
+///
+/// Generous — a cold start under a loaded machine is slow — but finite. The point is that the
+/// failure mode is a message, never a wedged test run.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+
 // ---------------------------------------------------------------------------------------
 // The child
 // ---------------------------------------------------------------------------------------
@@ -143,25 +149,56 @@ impl Child {
                 .expect("spawning the child");
 
         let stdout = process.stdout.take().expect("the child's stdout is a pipe");
-        let mut lines = BufReader::new(stdout).lines();
-        let addr = loop {
-            let Some(Ok(line)) = lines.next() else {
+
+        // Read on another thread and wait with a deadline. A test that can block forever is
+        // worse than one that fails: it wedges `just check` for whoever runs it next, with no
+        // output to say why. Anything that stops the child from reporting — a store that will
+        // not open, a port that will not bind, a panic before the first write — has to come
+        // back as a failed assertion, not as silence.
+        let (found, addr_line) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                // Searched for rather than stripped as a prefix: the harness writes
+                // `test <name> ... ` with no trailing newline, so whatever the child prints
+                // first shares a line with it. The child writes a leading newline to avoid
+                // that, and this handles it anyway — a parser that can only match at column
+                // zero turns a formatting detail into a hang.
+                if let Some(at) = line.find("ADDR ") {
+                    let _ = found.send(Ok(line[at + "ADDR ".len()..].trim().to_owned()));
+                    return;
+                }
+                if line.contains("FAIL") {
+                    let _ = found.send(Err(line));
+                    return;
+                }
+            }
+            let _ = found.send(Err(
+                "the child ended without reporting an address".to_owned()
+            ));
+        });
+
+        let reported = match addr_line.recv_timeout(STARTUP_TIMEOUT) {
+            Ok(Ok(line)) => line,
+            Ok(Err(why)) => {
                 let _ = process.kill();
-                panic!("the child never reported an address");
-            };
-            assert!(!line.contains("FAIL"), "the child failed to start: {line}");
-            // Searched for rather than stripped as a prefix: the harness's own `test <name>
-            // ... ` has no trailing newline, so anything the child prints first shares a line
-            // with it. The child writes a leading newline to avoid that, and this handles it
-            // anyway — a parser that can only match at column zero turns a formatting detail
-            // into a hang.
-            if let Some(at) = line.find("ADDR ") {
-                let rest = line[at + "ADDR ".len()..].trim();
-                break rest.parse::<SocketAddr>().unwrap_or_else(|err| {
-                    panic!("the child reported {rest:?}, which is not an address: {err}")
-                });
+                let _ = process.wait();
+                panic!("the child failed to start: {why}");
+            }
+            Err(_) => {
+                let _ = process.kill();
+                let _ = process.wait();
+                panic!(
+                    "the child did not report an address within {STARTUP_TIMEOUT:?}; \
+                     killed rather than left to block the run"
+                );
             }
         };
+        let addr = reported.parse::<SocketAddr>().unwrap_or_else(|err| {
+            let _ = process.kill();
+            let _ = process.wait();
+            panic!("the child reported {reported:?}, which is not an address: {err}")
+        });
         Self { process, addr }
     }
 
