@@ -1,0 +1,21 @@
+crates/esker-store/src/server.rs
+  s_84bf31abd6a949::t_eec3f8677f4ad7 25,53-64,74,718-750
+docs/plans/phase-2.md
+  s_84bf31abd6a949::t_a6ee372dc95067 280-285,401-411,426-436
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2726ddd848569fecbd27b85909af9d8511c998f8",
+  "prompts": {},
+  "sessions": {
+    "s_84bf31abd6a949": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "efbdd5ba-687c-4b5c-b773-9bc846ae2e20",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
