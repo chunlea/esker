@@ -179,6 +179,13 @@ Server options:
                         (default ./esker-data)
       --listen HOST:PORT  Address to serve on (default 127.0.0.1:20160)
       --store-id N      This store's id, reported in the handshake (default 1)
+      --peer-id N       This store's Raft peer id (default: the store id)
+      --peer ID@ADDR    A peer of the region, repeatable, this store's included
+      --pd HOST:PORT    The placement driver to register with and report to. With
+                        one, PD decides which store creates region 1 and this store
+                        reports its regions on the schedule of DESIGN.md §14.
+                        Without one, the store bootstraps a region of its own and
+                        reports to nobody, which is what a single node wants
 
 Ctrl-C stops the listener, lets in-flight requests finish and closes the
 database. A second one does not wait.
@@ -601,6 +608,16 @@ fn parse_server(arguments: &[String]) -> Result<Command, ParseError> {
                     flag: "--seed",
                     value: raw.clone(),
                 })?;
+            }
+            "--pd" => {
+                let raw = take_value(arguments, &mut index, inline, "--pd")?;
+                if raw.is_empty() {
+                    return Err(ParseError::InvalidValue {
+                        flag: "--pd",
+                        value: raw.clone(),
+                    });
+                }
+                options.pd = Some(raw);
             }
             other if other.starts_with('-') => {
                 return Err(ParseError::UnknownFlag(other.to_owned()));
@@ -1288,6 +1305,33 @@ mod tests {
             explicit.peer_id, 9,
             "an explicit peer id is not overwritten"
         );
+    }
+
+    /// `--pd` is what turns a store from "bootstraps its own region 1" into "asks the placement
+    /// driver whether it is the one that should". Absent by default, because that is what phase
+    /// 2's single node and phase 3e's static cluster are.
+    #[test]
+    fn the_placement_driver_address_is_optional_and_must_not_be_empty() {
+        let Command::Server(plain) = parse_ok(&["server"]) else {
+            panic!("not a server command");
+        };
+        assert_eq!(plain.pd, None);
+
+        let Command::Server(with_pd) = parse_ok(&["server", "--pd", "127.0.0.1:2379"]) else {
+            panic!("not a server command");
+        };
+        assert_eq!(with_pd.pd.as_deref(), Some("127.0.0.1:2379"));
+
+        let Command::Server(inline) = parse_ok(&["server", "--pd=127.0.0.1:2379"]) else {
+            panic!("not a server command");
+        };
+        assert_eq!(inline.pd.as_deref(), Some("127.0.0.1:2379"));
+
+        assert!(matches!(
+            parse(["server", "--pd", ""].iter().copied()),
+            Err(ParseError::InvalidValue { flag: "--pd", .. })
+        ));
+        assert!(parse(["server", "--pd"].iter().copied()).is_err());
     }
 
     #[test]
