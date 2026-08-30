@@ -31,7 +31,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 
-use crate::transport::Transport;
+use crate::transport::StoreTransport;
 use crate::wire::{
     CallResult, Method, ProtoError, RawKvReq, RawKvResp, Request, RequestHeader, routing_key,
 };
@@ -183,7 +183,7 @@ struct Inner {
     max_frame_size: usize,
 }
 
-/// A [`Transport`] that answers from a script and remembers everything it was asked.
+/// A [`StoreTransport`] that answers from a script and remembers everything it was asked.
 ///
 /// Rules are tried front to back; the first live rule whose matcher matches answers the call
 /// and spends one of its uses. A call that matches nothing gets [`FakeTransport::unmatched`],
@@ -254,7 +254,7 @@ impl FakeTransport {
     /// The `n`th call, if it happened.
     ///
     /// Named `nth_call` and not `call` because an inherent method of that name would shadow
-    /// [`Transport::call`] at every call site in this crate's tests.
+    /// [`StoreTransport::call`] at every call site in this crate's tests.
     #[must_use]
     pub fn nth_call(&self, index: usize) -> Option<Call> {
         self.lock().log.get(index).cloned()
@@ -312,7 +312,7 @@ impl FakeTransport {
     }
 }
 
-impl Transport for FakeTransport {
+impl StoreTransport for FakeTransport {
     fn call(&self, store_id: u64, request: &Request, _deadline: Instant) -> CallResult {
         let mut inner = self.lock();
         inner.log.push(Call {
@@ -342,7 +342,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{Bytes, FakeTransport, Matcher, Outcome, Rule};
-    use crate::transport::Transport;
+    use crate::transport::StoreTransport;
     use crate::wire::{Epoch, Method, ProtoError, RawKvReq, RawKvResp, Request, RequestHeader};
 
     fn request(body: RawKvReq) -> Request {

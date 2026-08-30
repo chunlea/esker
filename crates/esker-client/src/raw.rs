@@ -2,7 +2,7 @@
 //!
 //! Everything the client does around a call is here, and all of it is ordinary synchronous
 //! code — no sockets, no wall clock, no threads of its own. Bytes leave through
-//! [`Transport`], time enters through [`Clock`], and both are injected, which is why every
+//! [`StoreTransport`], time enters through [`Clock`], and both are injected, which is why every
 //! rule below is tested against a script rather than a cluster.
 //!
 //! # What one call does
@@ -44,7 +44,7 @@ use crate::error::{Error, Result};
 use crate::gate::Gate;
 use crate::region_cache::{RegionCache, RegionResolver, Route};
 use crate::retry::{CALL_TIMEOUT_MS, Jitter, Redirect, RetryPolicy, Verdict, classify};
-use crate::transport::Transport;
+use crate::transport::StoreTransport;
 use crate::wire::{
     DEFAULT_SCAN_LIMIT, Method, ProtoError, RawKvReq, RawKvResp, Request, RequestHeader,
     RequestOutcome, payload_size, routing_key,
@@ -91,7 +91,7 @@ impl Default for ClientOptions {
 /// The `RawKv` client: a region cache, bounded retries, and one method per `RawKv` verb.
 #[derive(Debug)]
 pub struct RawClient {
-    transport: Arc<dyn Transport>,
+    transport: Arc<dyn StoreTransport>,
     resolver: Arc<dyn RegionResolver>,
     clock: Arc<dyn Clock>,
     cache: RegionCache,
@@ -103,14 +103,14 @@ pub struct RawClient {
 impl RawClient {
     /// A client with the default options, the real clock, and one region.
     #[must_use]
-    pub fn new(transport: Arc<dyn Transport>, resolver: Arc<dyn RegionResolver>) -> Self {
+    pub fn new(transport: Arc<dyn StoreTransport>, resolver: Arc<dyn RegionResolver>) -> Self {
         Self::with_options(transport, resolver, ClientOptions::default())
     }
 
     /// A client configured explicitly.
     #[must_use]
     pub fn with_options(
-        transport: Arc<dyn Transport>,
+        transport: Arc<dyn StoreTransport>,
         resolver: Arc<dyn RegionResolver>,
         options: ClientOptions,
     ) -> Self {

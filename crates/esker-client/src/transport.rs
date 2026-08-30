@@ -1,4 +1,4 @@
-//! The seam between the client and the network.
+//! The seam between the client and a store.
 //!
 //! Everything above this trait — routing, retries, backoff, deadlines — is ordinary
 //! synchronous code with no sockets and no clock of its own, which is what makes it testable
@@ -20,9 +20,12 @@
 //! job. Until PD exists the mapping is a one-entry table inside the transport
 //! (`// TODO(phase-4)`).
 
-// TODO(phase-2): the TCP implementation of this trait is `esker-proto`'s, whose single writer
-// is the sibling lane. The trait itself stays here: it is the client's seam, and the client is
-// what needs it injectable.
+//! # Not `esker_proto::transport::Transport`
+//!
+//! That trait is the *connection*: async, one peer, `Request` in and `Response` out. This one
+//! is the *routing* layer above it: it addresses a **store id**, answers with a `RawKvResp`
+//! already unwrapped, and is synchronous. [`crate::tcp::TcpStores`] is the adapter between
+//! them, and it is the only place in this crate that knows a socket exists.
 
 use std::fmt;
 use std::time::Instant;
@@ -30,7 +33,7 @@ use std::time::Instant;
 use crate::wire::{CallResult, Request};
 
 /// One round trip to one store.
-pub trait Transport: fmt::Debug + Send + Sync {
+pub trait StoreTransport: fmt::Debug + Send + Sync {
     /// Sends `request` to `store_id` and waits for its answer, giving up at `deadline`.
     ///
     /// Returning `Err` must say which side of the ambiguity the failure is on, through

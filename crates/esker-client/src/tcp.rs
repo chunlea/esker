@@ -1,0 +1,132 @@
+//! The one place in this crate that knows a socket exists.
+//!
+//! [`TcpStores`] adapts `esker-proto`'s blocking connection — one peer, `Request` in and
+//! `Response` out — to the client's [`StoreTransport`], which addresses a **store id** and
+//! answers with a `RawKvResp`. Everything above it routes by region and peer and never learns
+//! what an address is.
+//!
+//! # Where the address book comes from
+//!
+//! From `--addr`, today, and the store id is **learned rather than guessed**: the handshake's
+//! `HelloAck` says which store answered, so the book is keyed by what the server calls itself.
+//! A `Peer` carries a store id, and turning that into a socket address is the placement
+//! driver's job (`docs/DESIGN.md` §7): phase 4 replaces this map with the store list PD hands
+//! out, and nothing above this file changes when it does.
+//!
+//! A call for a store this book has never heard of is [`ProtoError::NotSent`] — provably
+//! never on the wire, so a caller may repeat it safely, and not retryable here because
+//! waiting cannot conjure an address.
+
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::time::Instant;
+
+use esker_proto::transport::{BlockingTransport, TransportConfig};
+
+use crate::transport::StoreTransport;
+use crate::wire::{CallResult, ProtoError, Request};
+
+/// Connections to the stores of a cluster, one per store.
+#[derive(Debug)]
+pub struct TcpStores {
+    connections: BTreeMap<u64, BlockingTransport>,
+}
+
+impl TcpStores {
+    /// Connects to one store — phase 2's whole cluster.
+    ///
+    /// The store id comes from the handshake rather than from the caller: `HelloAck` says
+    /// which store answered, and keying the book by anything else would let a client route
+    /// confidently to a store that is not the one on the other end of the socket.
+    pub fn connect(addr: SocketAddr) -> Result<Self, ProtoError> {
+        Self::connect_with(addr, TransportConfig::new())
+    }
+
+    /// [`TcpStores::connect`], with the transport configured explicitly.
+    pub fn connect_with(addr: SocketAddr, config: TransportConfig) -> Result<Self, ProtoError> {
+        let connection = BlockingTransport::connect_with(addr, config)?;
+        let store_id = connection.hello_ack().store_id;
+        Ok(Self {
+            // TODO(phase-4): PD's store list replaces this, and one connection becomes one
+            // case of a book that grows as regions are learned.
+            connections: BTreeMap::from([(store_id, connection)]),
+        })
+    }
+
+    /// The store ids this book can reach.
+    #[must_use]
+    pub fn store_ids(&self) -> Vec<u64> {
+        self.connections.keys().copied().collect()
+    }
+
+    /// The one store this book knows, while there is only one.
+    #[must_use]
+    pub fn only_store(&self) -> Option<u64> {
+        let mut ids = self.connections.keys();
+        match (ids.next(), ids.next()) {
+            (Some(only), None) => Some(*only),
+            _ => None,
+        }
+    }
+
+    /// Whether every connection is still up.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.connections.values().any(BlockingTransport::is_closed)
+    }
+}
+
+impl StoreTransport for TcpStores {
+    fn call(&self, store_id: u64, request: &Request, deadline: Instant) -> CallResult {
+        let Some(connection) = self.connections.get(&store_id) else {
+            return Err(ProtoError::not_sent(format!(
+                "no address is known for store {store_id}"
+            )));
+        };
+        connection
+            .call(request.clone(), deadline)
+            .and_then(esker_proto::messages::Response::into_raw_kv)
+    }
+
+    fn max_frame_size(&self) -> usize {
+        // Every connection is built from one config, so any of them answers for all. An empty
+        // book has no connection to ask and no call to bound; the protocol default is the
+        // honest answer rather than zero, which would refuse every request.
+        self.connections.values().next().map_or(
+            crate::wire::MAX_FRAME_SIZE,
+            BlockingTransport::max_frame_size,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::TcpStores;
+    use crate::transport::StoreTransport;
+    use crate::wire::{Epoch, ProtoError, RawKvReq, Request, RequestHeader};
+
+    /// An empty book is the state before anything is connected, and it must refuse rather
+    /// than panic — and refuse in the way that says the request never left.
+    #[test]
+    fn a_store_with_no_address_is_refused_as_never_sent() {
+        let book = TcpStores {
+            connections: std::collections::BTreeMap::new(),
+        };
+        let request = Request::raw_kv(
+            RequestHeader::new(1, Epoch::INITIAL, 1),
+            RawKvReq::get(b"k".as_slice()),
+        );
+        let error = book
+            .call(7, &request, Instant::now() + Duration::from_secs(1))
+            .expect_err("no address");
+        assert!(matches!(error, ProtoError::NotSent { .. }));
+        assert!(
+            error.outcome() == crate::wire::RequestOutcome::NotApplied,
+            "a request with nowhere to go provably did not happen"
+        );
+        assert!(book.store_ids().is_empty());
+        assert_eq!(book.max_frame_size(), crate::wire::MAX_FRAME_SIZE);
+    }
+}

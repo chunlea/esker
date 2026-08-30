@@ -14,6 +14,9 @@ publish.workspace = true
 esker-engine.workspace = true
 # `bench` needs a seeded generator, and `CLAUDE.md` allows exactly one (`rand` is banned).
 esker-base.workspace = true
+# `raw` and `bench --remote` drive the network API through the client, so the tool exercises
+# the same routing and retry code an application would (docs/DESIGN.md §10).
+esker-client.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

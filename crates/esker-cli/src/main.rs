@@ -10,6 +10,7 @@ mod args;
 mod bench;
 mod bytes;
 mod manifest_dump;
+mod raw;
 mod sst_dump;
 mod wal_dump;
 
@@ -20,8 +21,13 @@ use args::{Command, USAGE};
 /// Exit code for arguments that could not be parsed.
 const EXIT_USAGE: u8 = 2;
 
-/// Exit code for a command that ran and failed — a corrupt file, a missing one.
+/// Exit code for a command that ran and failed — a corrupt file, a missing one, or a key that
+/// is not there.
 const EXIT_FAILURE: u8 = 1;
+
+/// Exit code for a request the server refused, or a server that could not be reached. Distinct
+/// from [`EXIT_FAILURE`] so a script can tell "the key is absent" from "the cluster is down".
+const EXIT_SERVER: u8 = 3;
 
 fn main() -> ExitCode {
     match args::parse(std::env::args().skip(1)) {
@@ -70,6 +76,17 @@ fn main() -> ExitCode {
                 Err(error) => {
                     eprintln!("esker manifest-dump: {error}");
                     ExitCode::from(EXIT_FAILURE)
+                }
+            }
+        }
+        Ok(Command::Raw(options)) => {
+            let mut stdout = std::io::stdout().lock();
+            match raw::run(&options, &mut stdout) {
+                Ok(raw::Outcome::Done) => ExitCode::SUCCESS,
+                Ok(raw::Outcome::NotFound) => ExitCode::from(EXIT_FAILURE),
+                Err(reason) => {
+                    eprintln!("esker raw: {reason}");
+                    ExitCode::from(EXIT_SERVER)
                 }
             }
         }
