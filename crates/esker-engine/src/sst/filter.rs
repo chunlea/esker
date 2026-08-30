@@ -22,11 +22,8 @@
 //! about a key that is present, because `get` believes it. The way that happens in practice
 //! is a mismatch between the bytes hashed at build time and at probe time: build over the
 //! prefix, probe with the whole key, and every lookup of a present key misses. [`filter_key`]
-//! is therefore the *only* place the choice is made, and both paths call it — see
-//! [`whole_key_probe_against_a_prefix_filter_still_finds_keys`].
-//!
-//! [`whole_key_probe_against_a_prefix_filter_still_finds_keys`]:
-//!     tests::whole_key_probe_against_a_prefix_filter_still_finds_keys
+//! is therefore the *only* place the choice is made, and both paths call it. The test
+//! `whole_key_probe_against_a_prefix_filter_still_finds_keys` in this module pins it.
 
 use std::sync::Arc;
 
@@ -36,9 +33,8 @@ use crate::error::{Error, Result};
 use crate::options::PrefixExtractor;
 
 /// Bits of filter per key, the `docs/DESIGN.md` §14 default. At this size the false-positive
-/// rate is under 1%, and [`false_positive_rate_is_under_two_percent`] holds it there.
-///
-/// [`false_positive_rate_is_under_two_percent`]: tests::false_positive_rate_is_under_two_percent
+/// rate is under 1%, and the `false_positive_rate_is_under_two_percent` test measures it and
+/// holds it under 2%.
 pub const DEFAULT_BITS_PER_KEY: usize = 10;
 
 /// Smallest bit array we will build. Below this a handful of keys collide so often that the

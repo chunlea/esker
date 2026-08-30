@@ -13,7 +13,8 @@
 //!
 //! The classic LRU is a hash map beside an intrusive doubly-linked list, which in Rust means
 //! either `unsafe` raw pointers or `Rc<RefCell<..>>` in every node. This uses neither: nodes
-//! live in one `Vec<Slot>` and the links are `u32` indices into it, with [`NIL`] for "no
+//! live in one `Vec<Slot>` and the links are `u32` indices into it, with a `u32::MAX`
+//! sentinel for "no
 //! node". Freed slots are recycled through a free list threaded on the same `next` field, so
 //! a steady-state cache never allocates. `CLAUDE.md` invariant 8 asks for safe code until a
 //! profile says otherwise, and this costs a bounds check per link hop.
@@ -37,9 +38,7 @@ use crate::options::defaults;
 pub const SHARDS: usize = defaults::BLOCK_CACHE_SHARDS;
 
 /// Mask that turns a hash into a shard index. Correct only while [`SHARDS`] is a power of
-/// two, which [`shards_is_a_power_of_two`] asserts.
-///
-/// [`shards_is_a_power_of_two`]: tests::shards_is_a_power_of_two
+/// two, which the `shards_is_a_power_of_two` test asserts.
 const SHARD_MASK: u64 = 7;
 
 /// The null link. A `u32` index can address every slot a shard will ever hold, because a
