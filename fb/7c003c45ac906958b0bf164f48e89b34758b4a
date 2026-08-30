@@ -1,0 +1,27 @@
+Cargo.lock
+  s_dc640bf0df4adb::t_69e49f105e5162 166
+crates/esker-sim/Cargo.toml
+  s_dc640bf0df4adb::t_8f51cd3482061c 16-20
+crates/esker-sim/src/lib.rs
+  s_dc640bf0df4adb::t_ae7eb2b1374b5e 2-5,21,26
+crates/esker-sim/src/lin.rs
+  s_dc640bf0df4adb::t_79b085d012473c 1-681
+crates/esker-sim/tests/lin_register.rs
+  s_dc640bf0df4adb::t_c7373514360914 1-433
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "fb7c003c45ac906958b0bf164f48e89b34758b4a",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
