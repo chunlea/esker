@@ -57,7 +57,17 @@ One coordinator (Fable, herdr pane `COORD`) directing coding lanes. Phases are g
     `rustfmt --edition 2024 <own files>` — `cargo fmt -p` still sweeps the whole crate.
   - [ ] spine: WAL ✅ batch/internal-key ✅ memtable ✅(assumed, verify at gate)
     manifest/Version in progress → Db → compaction → checkpoint → cli/bench.
-- [ ] Phase 2 — single-node server
+- [x] **Phase 2 — single-node server: ACCEPTED 2026-08-30 ~07:50.** Lanes `wy-p2-proto`
+  (framing/40 golden bodies/transport/store/server) + `cl-p2-client` (RawClient
+  retries with injected clock/CLI/remote bench) + `p2-accept` (Sonnet). GATE PASS:
+  714+ tests; e2e CLI verified; load test 64 clients×60s twice (867k + 501k ops, zero
+  errors, zero stalls); crash-through-client; model-through-TCP; coverage proto 94%,
+  store 92%, client ~93% (total 93.5% region); deps 22/40; DRIFT zero contradictions.
+  bench: remote unsynced 15.3k ops/s vs in-process 468k (46 µs RTT), sync 216 —
+  recorded in docs/bench/phase-2.md with the gap explained. Notable finds fixed
+  in-phase: wire sync:false was unreachable (would have mislabeled a 1600× fsync gap
+  as network cost); engine DeleteRange silently point-deleted (now refused, typed);
+  phase-1 crash-loop op-0 hole closed retroactively (1,000/1,000 verified).
 - [ ] Phase 3 — raft
 - [ ] Phase 4 — multi-raft + PD
 - [ ] Phase 5 — txn
