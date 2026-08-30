@@ -1,0 +1,19 @@
+crates/esker-sim/src/raft/cluster/membership.rs
+  s_7c0605fa746b2a::t_333544f1e341f7 19-30,36-37,41,43,46-47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "0dec4ba0c1ae5a06fe3ec2997a1471a544741cac",
+  "prompts": {},
+  "sessions": {
+    "s_7c0605fa746b2a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c7f8910e-d362-4826-b9ed-56926ba5f727",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
