@@ -1,0 +1,30 @@
+Cargo.lock
+  h_44076b318daf9c 8-10,23-25,54-108
+crates/esker-base/Cargo.toml
+  h_44076b318daf9c 11-13
+crates/esker-base/src/crc32c.rs
+  h_44076b318daf9c 1-299
+crates/esker-base/src/hash.rs
+  h_44076b318daf9c 1-137
+crates/esker-base/src/lib.rs
+  h_44076b318daf9c 25-28
+crates/esker-base/src/rng.rs
+  h_44076b318daf9c 1-319
+crates/esker-base/src/varint.rs
+  h_44076b318daf9c 1-261
+crates/esker-engine/Cargo.toml
+  h_44076b318daf9c 11-13
+crates/esker-engine/src/lib.rs
+  h_44076b318daf9c 28-32,100-106
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "95ad7b3c885e1d610d5cb81af05e2ba901e6f38d",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
