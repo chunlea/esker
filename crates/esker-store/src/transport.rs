@@ -37,7 +37,7 @@
 //! per batch, and a batch only exists when there is something to say.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use esker_proto::{
     Epoch, RaftBatch, RaftMessage, Request, TcpTransport, Transport, TransportConfig,
@@ -170,25 +170,29 @@ impl StoreTransport {
     /// `peers` is the region's whole membership, this store's own peer included; the entry for
     /// this store is kept in the table and never dispatched, because a message addressed to it
     /// would be Raft talking to itself.
+    ///
+    /// The routing table comes from the **region's own peer list**, not from the address book.
+    /// They are different questions and 4d is where the difference bit: a region's peer ids are
+    /// allocated by the placement driver per replica, so a peer added after the store started is
+    /// not in the address book at all — and every message to it was silently dropped. The address
+    /// book answers *where a store is*; the region answers *which store a peer is on*.
     #[must_use]
     pub fn for_region(
         self: &Arc<Self>,
         region_id: u64,
         epoch: Epoch,
-        peers: &[PeerAddress],
+        peers: &[esker_proto::Peer],
     ) -> Arc<RegionTransport> {
-        let mut routes: Vec<(NodeId, u64)> = peers
-            .iter()
-            .map(|peer| (peer.peer_id, peer.store_id))
-            .collect();
-        routes.sort_unstable_by_key(|(peer_id, _)| *peer_id);
-        routes.dedup_by_key(|(peer_id, _)| *peer_id);
-        Arc::new(RegionTransport {
+        let view = RegionTransport {
             transport: Arc::clone(self),
             region_id,
-            epoch,
-            routes,
-        })
+            membership: Mutex::new(Membership {
+                epoch,
+                routes: Vec::new(),
+            }),
+        };
+        view.follow(epoch, peers);
+        Arc::new(view)
     }
 
     /// Stops every store task. Anything still queued is dropped, which is what a peer going away
@@ -240,13 +244,18 @@ impl Drop for StoreTransport {
 pub struct RegionTransport {
     transport: Arc<StoreTransport>,
     region_id: u64,
-    /// Stamped onto every message so the far end can drop one from an epoch it has moved past.
-    ///
-    /// Fixed for the life of this view. The epoch only moves on a split or a membership change,
-    /// and both rebuild the region's peer — so a stale stamp cannot outlive the driver that sends
-    /// it. `TODO(phase-4b)`: assert that in the split path, where it stops being free.
+    /// The region's identity as it stands, behind a lock because it **moves**: a split bumps the
+    /// epoch and a membership change adds or removes a peer, and a view that kept the values it
+    /// was built with would stamp a stale epoch and drop every message to a peer added since.
+    membership: Mutex<Membership>,
+}
+
+/// What a region's transport view has to keep current.
+#[derive(Debug)]
+struct Membership {
+    /// Stamped onto every message, so the far end can drop one from an epoch it has moved past.
     epoch: Epoch,
-    /// `peer_id → store_id`, sorted by peer id.
+    /// `peer_id → store_id`, sorted by peer id, taken from the region's own peer list.
     routes: Vec<(NodeId, u64)>,
 }
 
@@ -257,24 +266,74 @@ impl RegionTransport {
         self.region_id
     }
 
+    /// Adopts a region's current epoch and peer list.
+    ///
+    /// Called whenever the region moves — a split, a conf change — so that the next message is
+    /// stamped and routed by what the region *is* rather than by what it was at open.
+    pub fn follow(&self, epoch: Epoch, peers: &[esker_proto::Peer]) {
+        let mut routes: Vec<(NodeId, u64)> = peers
+            .iter()
+            .map(|peer| (peer.peer_id, peer.store_id))
+            .collect();
+        routes.sort_unstable_by_key(|(peer_id, _)| *peer_id);
+        routes.dedup_by_key(|(peer_id, _)| *peer_id);
+        if let Ok(mut membership) = self.membership.lock() {
+            membership.epoch = epoch;
+            membership.routes = routes;
+        }
+    }
+
+    /// Adds one peer's store to the routes, without moving the epoch.
+    ///
+    /// §4.1 of the dissertation: a configuration takes effect when its entry is **appended**, not
+    /// when it commits. So the leader may address a brand-new peer in the very `Ready` that
+    /// carries the entry adding it — a full round trip before the region record moves and
+    /// [`follow`](Self::follow) hears about it. A route that waits for apply is a route that
+    /// arrives after the first message that needed it.
+    ///
+    /// Dropping that first message is not merely a retry: if it was an `InstallSnapshot` the
+    /// leader's progress for that peer is now `Snapshot`, which is paused until the peer answers
+    /// a snapshot it was never sent (`docs/plans/phase-4.md` §14.5).
+    pub fn learn(&self, peer: NodeId, store_id: u64) {
+        let Ok(mut membership) = self.membership.lock() else {
+            return;
+        };
+        match membership
+            .routes
+            .binary_search_by_key(&peer, |(peer_id, _)| *peer_id)
+        {
+            Ok(at) => membership.routes[at].1 = store_id,
+            Err(at) => membership.routes.insert(at, (peer, store_id)),
+        }
+    }
+
     /// The epoch stamped onto every message it sends.
     #[must_use]
     pub fn epoch(&self) -> Epoch {
-        self.epoch
+        self.membership
+            .lock()
+            .map_or(Epoch::INITIAL, |membership| membership.epoch)
     }
 
     /// The store hosting `peer`, if this region knows of it.
     #[must_use]
     pub fn store_of(&self, peer: NodeId) -> Option<u64> {
-        self.routes
+        let membership = self.membership.lock().ok()?;
+        membership
+            .routes
             .binary_search_by_key(&peer, |(peer_id, _)| *peer_id)
             .ok()
-            .map(|at| self.routes[at].1)
+            .map(|at| membership.routes[at].1)
     }
 }
 
 impl RaftTransport for RegionTransport {
+    fn learn(&self, peer: NodeId, store_id: u64) {
+        RegionTransport::learn(self, peer, store_id);
+    }
+
     fn send(&self, messages: Vec<Message>) {
+        let epoch = self.epoch();
         for message in messages {
             let to = message.recipient();
             let Some(store) = self.store_of(to) else {
@@ -295,8 +354,10 @@ impl RaftTransport for RegionTransport {
                 );
                 continue;
             }
-            self.transport
-                .dispatch(store, RaftMessage::new(self.region_id, self.epoch, message));
+            self.transport.dispatch(
+                store,
+                RaftMessage::new(self.region_id, epoch, self.transport.store_id(), message),
+            );
         }
     }
 }
@@ -410,7 +471,11 @@ mod tests {
         // Two other stores; never a queue back to this one.
         assert_eq!(transport.stores.len(), 2);
 
-        let region = transport.for_region(7, Epoch::INITIAL, &peers);
+        let members: Vec<esker_proto::Peer> = peers
+            .iter()
+            .map(|peer| esker_proto::Peer::voter(peer.store_id, peer.peer_id))
+            .collect();
+        let region = transport.for_region(7, Epoch::INITIAL, &members);
         assert_eq!(region.region_id(), 7);
         assert_eq!(region.store_of(2), Some(2));
         assert_eq!(region.store_of(3), Some(3));
@@ -420,6 +485,20 @@ mod tests {
             "this store's own peer stays in the table; it is dropped at send time"
         );
         assert_eq!(region.store_of(99), None);
+
+        // A peer added after the view was built is routable once the region says so — which is
+        // the whole reason the routes come from the region rather than from the address book.
+        region.follow(
+            Epoch::new(2, 1),
+            &[
+                esker_proto::Peer::voter(1, 1),
+                esker_proto::Peer::voter(2, 2),
+                esker_proto::Peer::voter(3, 3),
+                esker_proto::Peer::voter(2, 4_000),
+            ],
+        );
+        assert_eq!(region.store_of(4_000), Some(2));
+        assert_eq!(region.epoch(), Epoch::new(2, 1));
 
         // Neither of the two messages a region must not dispatch panics or reaches a queue: one
         // names a peer nobody knows, one names this store's own.
@@ -447,8 +526,12 @@ mod tests {
         ];
         let transport =
             StoreTransport::spawn(1, &StoreAddress::from_peers(&peers), TransportConfig::new());
-        let first = transport.for_region(1, Epoch::INITIAL, &peers);
-        let second = transport.for_region(2, Epoch::INITIAL, &peers);
+        let members: Vec<esker_proto::Peer> = peers
+            .iter()
+            .map(|peer| esker_proto::Peer::voter(peer.store_id, peer.peer_id))
+            .collect();
+        let first = transport.for_region(1, Epoch::INITIAL, &members);
+        let second = transport.for_region(2, Epoch::INITIAL, &members);
 
         for region in [&first, &second] {
             region.send(vec![Message::TimeoutNow {

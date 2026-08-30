@@ -46,21 +46,44 @@ use crate::region::RegionMeta;
 pub struct RegionState {
     meta: RegionMeta,
     peer: Option<Arc<RaftPeer>>,
+    /// This region's view of the store-pair transport, kept so that a membership change or a
+    /// split can tell it what the region has become. Without that, a peer added after the view was
+    /// built has no route and every message to it is dropped.
+    transport: Option<Arc<crate::transport::RegionTransport>>,
 }
 
 impl RegionState {
     /// A region with no replication: the phase-2 store, which writes straight to the engine.
     #[must_use]
     pub fn unreplicated(meta: RegionMeta) -> Self {
-        Self { meta, peer: None }
+        Self {
+            meta,
+            peer: None,
+            transport: None,
+        }
     }
 
-    /// A region replicated by `peer`.
+    /// A region replicated by `peer`, over `transport`.
     #[must_use]
-    pub fn replicated(meta: RegionMeta, peer: Arc<RaftPeer>) -> Self {
+    pub fn replicated(
+        meta: RegionMeta,
+        peer: Arc<RaftPeer>,
+        transport: Arc<crate::transport::RegionTransport>,
+    ) -> Self {
         Self {
             meta,
             peer: Some(peer),
+            transport: Some(transport),
+        }
+    }
+
+    /// Tells this region's transport what the region has become.
+    ///
+    /// Called whenever the metadata moves — a split, a conf change — so the next message is
+    /// stamped with the region's epoch and routed by its current peer list.
+    fn follow(&self) {
+        if let Some(transport) = &self.transport {
+            transport.follow(self.meta.epoch(), &self.meta.region().peers);
         }
     }
 
@@ -143,6 +166,7 @@ impl RegionMap {
                 other.end_key,
             )));
         }
+        state.follow();
         let state = Arc::new(state);
         inner.by_start.insert(region.start_key.clone(), region.id);
         inner.by_id.insert(region.id, Arc::clone(&state));
@@ -189,13 +213,15 @@ impl RegionMap {
 
         let child_start = child.region().start_key.clone();
         let child_id = child.id();
-        inner.by_id.insert(
-            parent.id,
-            Arc::new(RegionState {
-                meta: RegionMeta::new(parent),
-                peer: existing.peer.clone(),
-            }),
-        );
+        child.follow();
+        let parent_id = parent.id;
+        let narrowed = RegionState {
+            meta: RegionMeta::new(parent),
+            peer: existing.peer.clone(),
+            transport: existing.transport.clone(),
+        };
+        narrowed.follow();
+        inner.by_id.insert(parent_id, Arc::new(narrowed));
         inner.by_start.insert(child_start, child_id);
         inner.by_id.insert(child_id, Arc::new(child));
         Ok(())
@@ -222,13 +248,14 @@ impl RegionMap {
                 region.id
             )));
         }
-        inner.by_id.insert(
-            region.id,
-            Arc::new(RegionState {
-                meta: RegionMeta::new(region),
-                peer: existing.peer.clone(),
-            }),
-        );
+        let region_id = region.id;
+        let moved = RegionState {
+            meta: RegionMeta::new(region),
+            peer: existing.peer.clone(),
+            transport: existing.transport.clone(),
+        };
+        moved.follow();
+        inner.by_id.insert(region_id, Arc::new(moved));
         Ok(())
     }
 

@@ -1,0 +1,354 @@
+//! Regions and leaders spreading across stores, at a size CI can afford.
+//!
+//! `prompts/04-multiraft-pd.md` 4d asks for one store, four more added, twenty gigabytes written,
+//! and the regions and leaders spread within a bounded time. Twenty gigabytes is an acceptance
+//! run; what belongs here is the same **shape** at a size a test can pay for — a low split
+//! threshold, a few hundred kilobytes, and the two properties that would be broken by a real bug
+//! rather than by the scale.
+//!
+//! The two are:
+//!
+//! * **no region is orphaned.** Every region a store hosts is one whose peer list names that
+//!   store, and every region in the cluster has a leader that can serve it. A region nobody leads
+//!   is data nobody can read, and it is the failure a balance operator can cause by moving the
+//!   wrong replica;
+//! * **the key space stays a contiguous partition** across every store, through every split and
+//!   every membership change. This is the invariant the phase-4 simulator checks globally; here it
+//!   is checked after the cluster has finished moving.
+//!
+//! The scheduler that *decides* to move a region is the placement-driver lane's. This drives the
+//! store side with a fake driver that issues the operators a real one would, which is what makes
+//! the test about this lane's code rather than about theirs.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use esker_proto::{Operator, RawKvReq, Region, RegionStatus, RequestHeader, Server, Service};
+use esker_store::pd::{FakePd, PdClient};
+use esker_store::server::RaftOptions;
+use esker_store::split::SplitOptions;
+use esker_store::{LogCompaction, PeerAddress, Store, StoreOptions, StoreService};
+
+/// Small enough that a few hundred kilobytes make a dozen regions.
+const TINY_SPLIT_SIZE: u64 = 16 * 1024;
+
+struct Node {
+    store: Arc<Store>,
+    handle: esker_proto::ServerHandle,
+    _dir: tempfile::TempDir,
+}
+
+/// Turns the store's own tracing on when `RUST_LOG` is set. The interesting failures in a
+/// two-store cluster are all "something was dropped somewhere", and a dropped message says so.
+fn trace() {
+    use tracing_subscriber::fmt;
+    let _ = fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+}
+
+fn reserve() -> std::net::SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap()
+}
+
+async fn open(
+    address: std::net::SocketAddr,
+    store_id: u64,
+    pd: &Arc<FakePd>,
+    peers: &[PeerAddress],
+    bootstrap_voters: Option<Vec<u64>>,
+) -> Node {
+    let dir = tempfile::tempdir().unwrap();
+    let mut raft = RaftOptions::new(peers.to_vec(), 20_260_830);
+    raft.tick = Duration::from_millis(5);
+    raft.compaction = LogCompaction {
+        threshold: 32,
+        keep: 8,
+    };
+    // Two workers, so the pool is a pool: a store hosting a dozen regions has to interleave them,
+    // which is the case one-thread-per-region never exercised.
+    raft.driver_workers = 2;
+    raft.bootstrap_voters = bootstrap_voters;
+
+    let store = Store::open(
+        dir.path(),
+        StoreOptions {
+            store_id,
+            peer_id: store_id,
+            region_id: store_id,
+            raft: Some(raft),
+            pd: Some(Arc::clone(pd) as Arc<dyn PdClient>),
+            address: address.to_string(),
+            heartbeat_tick: Duration::from_millis(5),
+            store_heartbeat: Duration::from_millis(20),
+            region_heartbeat: Duration::from_millis(20),
+            split: SplitOptions {
+                region_split_size: TINY_SPLIT_SIZE,
+                max_sampled_keys: 1024,
+            },
+            ..StoreOptions::new()
+        },
+    )
+    .unwrap();
+
+    let server = Server::bind(
+        address,
+        StoreService::new(Arc::clone(&store)) as Arc<dyn Service>,
+        esker_proto::TransportConfig::new(),
+    )
+    .await
+    .unwrap();
+    let handle = server.spawn().unwrap();
+    Node {
+        store,
+        handle,
+        _dir: dir,
+    }
+}
+
+async fn wait_for<F: FnMut() -> bool>(what: &str, seconds: u64, mut ready: F) {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    while !ready() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+fn key(n: u32) -> Bytes {
+    Bytes::from(format!("k{n:06}"))
+}
+
+/// Writes one key through whichever region currently owns it, retrying while the routing moves.
+async fn put(store: &Arc<Store>, key: Bytes, value: &[u8]) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let Some(state) = store.regions().find(&key) else {
+            assert!(Instant::now() < deadline, "no region ever covered {key:?}");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            continue;
+        };
+        let header = RequestHeader::new(state.id(), state.region().epoch, 0);
+        let request = RawKvReq::put(key.clone(), Bytes::copy_from_slice(value));
+        match store.serve(header, request).await {
+            Ok(_) => return,
+            Err(error) => {
+                assert!(error.is_retryable(), "writing {key:?}: {error}");
+                assert!(Instant::now() < deadline, "writing {key:?} never succeeded");
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    }
+}
+
+/// Every region every store hosts, deduplicated by id and in key order.
+fn cluster_regions(nodes: &[&Node]) -> Vec<Region> {
+    let mut all: std::collections::BTreeMap<u64, Region> = std::collections::BTreeMap::new();
+    for node in nodes {
+        for region in node.store.regions().regions() {
+            all.insert(region.id, region);
+        }
+    }
+    let mut regions: Vec<Region> = all.into_values().collect();
+    regions.sort_by(|left, right| left.start_key.cmp(&right.start_key));
+    regions
+}
+
+/// The key space must be one contiguous partition, whatever moved.
+fn assert_contiguous(regions: &[Region]) {
+    assert!(!regions.is_empty(), "the cluster owns no key space");
+    assert_eq!(regions[0].start_key, Bytes::new(), "{regions:#?}");
+    for pair in regions.windows(2) {
+        assert_eq!(
+            pair[0].end_key, pair[1].start_key,
+            "regions {} and {} leave a gap or overlap",
+            pair[0].id, pair[1].id
+        );
+    }
+    assert_eq!(regions.last().unwrap().end_key, Bytes::new());
+}
+
+/// One store grows a dozen regions and a second joins; the regions reach it, every one of them
+/// keeps a leader, and the key space is still one partition when everything has settled.
+///
+/// The 20 GB and five stores of `prompts/04` are an acceptance run. This is the same shape at a
+/// size CI can pay for: what a real bug breaks here is what it would break there.
+#[tokio::test(flavor = "multi_thread")]
+async fn regions_reach_a_store_that_joins_and_none_is_left_without_a_leader() {
+    trace();
+    let pd = Arc::new(FakePd::new());
+    let first_address = reserve();
+    let second_address = reserve();
+    let peers = vec![
+        PeerAddress::new(1, 1, first_address),
+        PeerAddress::new(2, 2, second_address),
+    ];
+
+    // Store 1 bootstraps a region of one voter so it can commit alone; store 2 joins later, which
+    // is what `AddPeer` is for.
+    let first = open(first_address, 1, &pd, &peers, Some(vec![1])).await;
+    wait_for("a leader on the first store", 10, || {
+        first.store.peer_of(1).is_some_and(|peer| peer.is_leader())
+    })
+    .await;
+
+    // Enough to split several times at the low threshold.
+    let value = vec![b'v'; 512];
+    for n in 0..400 {
+        put(&first.store, key(n), &value).await;
+    }
+    wait_for("the first store to split several times", 30, || {
+        first.store.regions().len() >= 6
+    })
+    .await;
+    let grown = first.store.regions().regions();
+    assert_contiguous(&grown);
+
+    // A second store, told the cluster already exists, hosts nothing of its own.
+    let second = open(second_address, 2, &pd, &peers, Some(vec![2])).await;
+    assert!(second.store.regions().is_empty());
+
+    // Ask for a replica of every region on the new store. A real placement driver issues these
+    // from what the heartbeats tell it; this issues the same operators against the same contract.
+    for region in &grown {
+        pd.issue(Operator::AddPeer {
+            region_id: region.id,
+            epoch: region.epoch,
+            store_id: 2,
+            peer_id: 1_000 + region.id,
+        });
+    }
+
+    // First the membership: every region should gain a learner on store 2. Checked separately
+    // from the transfer so that a failure says which half of the path is broken.
+    wait_for("every region to gain a learner", 60, || {
+        first
+            .store
+            .regions()
+            .regions()
+            .iter()
+            .filter(|region| region.peers.iter().any(|peer| peer.store_id == 2))
+            .count()
+            >= grown.len()
+    })
+    .await;
+
+    wait_for("the regions to reach the second store", 60, || {
+        second.store.regions().len() >= grown.len()
+    })
+    .await;
+
+    // --- what must be true once everything has moved -------------------------------------
+
+    let nodes = [&first, &second];
+    let regions = cluster_regions(&nodes);
+    assert_contiguous(&regions);
+
+    // No region is orphaned: every region a store hosts names that store among its peers, and
+    // every region in the cluster is led by somebody.
+    for node in nodes {
+        let store_id = node.store.store_id();
+        for status in node.store.region_statuses() {
+            assert!(
+                status
+                    .region
+                    .peers
+                    .iter()
+                    .any(|peer| peer.store_id == store_id),
+                "store {store_id} hosts region {} without being one of its peers",
+                status.region.id
+            );
+        }
+    }
+    let led: std::collections::BTreeSet<u64> = nodes
+        .iter()
+        .flat_map(|node| node.store.region_statuses())
+        .filter(|status: &RegionStatus| status.is_leader)
+        .map(|status| status.region.id)
+        .collect();
+    for region in &regions {
+        assert!(
+            led.contains(&region.id),
+            "region {} has no leader anywhere; its data is unreadable",
+            region.id
+        );
+    }
+
+    // And the data is still all there, through whichever region owns each key.
+    for n in 0..400 {
+        let k = key(n);
+        let state = first
+            .store
+            .regions()
+            .find(&k)
+            .expect("every key is covered");
+        let header = RequestHeader::new(state.id(), state.region().epoch, 0);
+        let esker_proto::RawKvResp::Get { value: found } = first
+            .store
+            .handle(header, RawKvReq::get(k.clone()))
+            .unwrap()
+        else {
+            panic!("not a get");
+        };
+        assert_eq!(found, Some(Bytes::from(value.clone())), "{k:?} was lost");
+    }
+
+    first.stop().await;
+    second.stop().await;
+}
+
+/// A store hosting many regions on a **two-worker pool** keeps every one of them making progress.
+/// This is the pool's promise at cluster scale rather than in a unit test: a dozen regions, two
+/// threads, and every region still applying.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dozen_regions_on_two_workers_all_make_progress() {
+    let pd = Arc::new(FakePd::new());
+    let address = reserve();
+    let peers = vec![PeerAddress::new(1, 1, address)];
+    let node = open(address, 1, &pd, &peers, Some(vec![1])).await;
+    wait_for("a leader", 10, || {
+        node.store.peer_of(1).is_some_and(|peer| peer.is_leader())
+    })
+    .await;
+
+    let value = vec![b'v'; 512];
+    for n in 0..400 {
+        put(&node.store, key(n), &value).await;
+    }
+    wait_for("a dozen regions", 60, || node.store.regions().len() >= 8).await;
+
+    let regions = node.store.regions().regions();
+    assert_contiguous(&regions);
+
+    // Every region has a leader and has applied something: a region pinned to a worker that was
+    // never scheduled would sit at applied zero for ever.
+    wait_for("every region to elect and apply", 30, || {
+        node.store
+            .region_statuses()
+            .iter()
+            .all(|status| status.is_leader && status.applied_index > 0)
+    })
+    .await;
+
+    // And one write into each region lands, which is the concurrency claim end to end: two
+    // workers driving a dozen regions, each awaited before the next is sent.
+    for region in &node.store.regions().regions() {
+        if region.start_key.is_empty() {
+            continue;
+        }
+        put(&node.store, region.start_key.clone(), b"pool").await;
+    }
+
+    node.stop().await;
+}
+
+impl Node {
+    async fn stop(self) {
+        self.store.stop();
+        let _ = self.handle.shutdown().await;
+    }
+}

@@ -60,6 +60,17 @@ pub const PEER_QUEUE_DEPTH: usize = 4096;
 pub trait RaftTransport: Send + Sync + std::fmt::Debug {
     /// Delivers `messages` towards their recipients, batched as they came out of one `Ready`.
     fn send(&self, messages: Vec<Message>);
+
+    /// Learns where a peer lives, ahead of the region record that will say so.
+    ///
+    /// Called for every conf change the moment its entry is **persisted**, because that is when
+    /// the configuration takes effect (§4.1) and therefore when the leader may first address the
+    /// peer it adds. A transport that routes by the applied region record would not know the peer
+    /// for another round trip, and the message it dropped in the meantime can be the one that
+    /// matters — see [`RegionTransport::learn`](crate::transport::RegionTransport::learn).
+    ///
+    /// The default does nothing, which is right for a transport that has no routing table.
+    fn learn(&self, _peer: NodeId, _store_id: u64) {}
 }
 
 /// A transport that drops everything, for a single-node store and for tests that do not care.
@@ -341,6 +352,11 @@ impl PeerCore {
                     "a Raft snapshot arrived; streaming is phase 4"
                 );
             }
+
+            // 1b. Route before send. A conf change is in force from the moment its entry is on
+            // disk, so the peer it adds has to be addressable *now* — the same `Ready` that
+            // carries the entry can carry the first message to that peer.
+            self.learn_routes(&ready.entries);
 
             // 2. Send. Taken rather than cloned: a `Ready`'s messages are moved out by design.
             let messages = std::mem::take(&mut ready.messages);
@@ -761,6 +777,29 @@ impl PeerCore {
         true
     }
 
+    /// Tells the transport where each peer a persisted conf change adds can be reached.
+    ///
+    /// The store id rides in the change's context precisely so that this is possible without the
+    /// region record: a peer id is region-local and names no store by itself. A context that does
+    /// not decode is a conf change from a version that did not carry one, which is a routing gap
+    /// rather than an apply failure — apply will refuse it, loudly, in its own place.
+    fn learn_routes(&self, entries: &[Entry]) {
+        for entry in entries {
+            if entry.kind != EntryKind::ConfChange {
+                continue;
+            }
+            let Ok(change) = esker_raft::ConfChange::decode(&entry.data) else {
+                continue;
+            };
+            if change.kind == esker_raft::ConfChangeKind::Remove {
+                continue;
+            }
+            if let Ok(store_id) = crate::apply::decode_conf_change_context(&change.context) {
+                self.transport.learn(change.node, store_id);
+            }
+        }
+    }
+
     fn propose(
         &mut self,
         command: Bytes,
@@ -1154,6 +1193,7 @@ pub type PeerConfState = ConfState;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1231,6 +1271,10 @@ mod tests {
     ///
     /// This is rule 1 of `Ready`'s contract, asserted from outside the core — which is the whole
     /// reason the core does no I/O.
+    ///
+    /// It audits the routing rule alongside it: a peer a conf change adds must have been
+    /// [`learn`](RaftTransport::learn)ed before anything is sent to it, since a real transport
+    /// silently drops what it cannot route.
     #[derive(Debug)]
     struct Auditor {
         db: Arc<Db>,
@@ -1239,6 +1283,8 @@ mod tests {
         /// Entries the audit actually inspected. A count of what was checked is the only thing
         /// that makes "no violations" mean anything.
         audited: AtomicUsize,
+        /// `peer_id → store_id` as the transport was told them, plus the peers it started with.
+        routes: Mutex<BTreeMap<super::NodeId, u64>>,
     }
 
     impl Auditor {
@@ -1248,7 +1294,22 @@ mod tests {
                 sent: Mutex::new(Vec::new()),
                 violations: Mutex::new(Vec::new()),
                 audited: AtomicUsize::new(0),
+                routes: Mutex::new(BTreeMap::new()),
             })
+        }
+
+        /// The peers the region already had when it opened, which need no learning.
+        fn seeded_with(self: &Arc<Self>, peers: &[super::NodeId]) -> Arc<Self> {
+            let mut routes = self.routes.lock().unwrap();
+            for peer in peers {
+                routes.insert(*peer, 1);
+            }
+            drop(routes);
+            Arc::clone(self)
+        }
+
+        fn route_of(&self, peer: super::NodeId) -> Option<u64> {
+            self.routes.lock().unwrap().get(&peer).copied()
         }
 
         fn violation(&self, detail: String) {
@@ -1277,8 +1338,19 @@ mod tests {
     }
 
     impl RaftTransport for Auditor {
+        fn learn(&self, peer: super::NodeId, store_id: u64) {
+            self.routes.lock().unwrap().insert(peer, store_id);
+        }
+
         fn send(&self, messages: Vec<Message>) {
             for message in &messages {
+                // Rule 2: a message to a peer the transport cannot route is a message dropped.
+                let to = message.recipient();
+                if self.route_of(to).is_none() {
+                    self.violation(format!(
+                        "a message went to peer {to} before the transport knew where it lives"
+                    ));
+                }
                 match message {
                     Message::AppendEntries { entries, .. } => {
                         for entry in entries {
@@ -1325,6 +1397,54 @@ mod tests {
             }
             self.sent.lock().unwrap().extend(messages);
         }
+    }
+
+    /// A peer a conf change adds is routable from the moment the entry is on disk, not from the
+    /// moment it applies.
+    ///
+    /// §4.1 puts a configuration in force at the **append**, so the leader may address the new
+    /// peer in the same `Ready` that carries the entry — a full round trip before apply moves the
+    /// region record. A transport that learned its routes only from that record would drop the
+    /// first message, and `tests/balance.rs` showed what that costs: the dropped message was an
+    /// `InstallSnapshot`, the leader's progress went to `Snapshot`, and `Snapshot` is paused until
+    /// the follower answers a snapshot it never received. One region never reached its new store.
+    ///
+    /// The auditor fails any message sent to a peer it has not been told about, so the assertion
+    /// is that the transport heard of peer 4 *before* peer 4 was written to.
+    #[tokio::test]
+    async fn a_peer_a_conf_change_adds_is_routable_before_the_entry_applies() {
+        let (_dir, db) = open_db();
+        let auditor = Auditor::new(&db).seeded_with(&[1]);
+        let peer = start(
+            &db,
+            1,
+            vec![1],
+            Arc::clone(&auditor) as Arc<dyn RaftTransport>,
+        );
+        elect_alone(&peer).await;
+
+        peer.propose_conf_change(esker_raft::ConfChangeKind::AddLearner, 4, 9)
+            .await
+            .expect("a conf change on the leader");
+
+        assert_eq!(
+            auditor.route_of(4),
+            Some(9),
+            "the transport was never told which store peer 4 is on"
+        );
+        let violations = auditor.violations();
+        assert!(
+            violations.is_empty(),
+            "driver contract violated: {violations:?}"
+        );
+        assert!(
+            auditor
+                .take_sent()
+                .iter()
+                .any(|message| message.recipient() == 4),
+            "nothing was sent to the new peer, so the ordering was never put to the test"
+        );
+        peer.stop();
     }
 
     /// Ticks a lone voter until it elects itself, syncing through the driver each time so the
@@ -1403,7 +1523,7 @@ mod tests {
     #[tokio::test]
     async fn a_message_is_never_sent_before_its_entries_are_durable() {
         let (_dir, db) = open_db();
-        let auditor = Auditor::new(&db);
+        let auditor = Auditor::new(&db).seeded_with(&[1, 2, 3]);
         let peer = start(
             &db,
             1,

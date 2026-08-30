@@ -62,6 +62,13 @@ pub struct RaftMessage {
     pub epoch: Epoch,
     /// The sending peer.
     pub from_peer: u64,
+    /// The **store** the sending peer is on.
+    ///
+    /// A peer id is region-local — the placement driver allocates one per replica — so a receiver
+    /// cannot turn `from_peer` into an address on its own. It matters for exactly one thing and
+    /// that thing is load-bearing: a store receiving traffic for a region it does not host asks
+    /// the sender for that region (`docs/DESIGN.md` §6), and without this it has nowhere to ask.
+    pub from_store: u64,
     /// The receiving peer.
     pub to_peer: u64,
     /// The message itself.
@@ -71,11 +78,12 @@ pub struct RaftMessage {
 impl RaftMessage {
     /// A message for one region, routed between two peers.
     #[must_use]
-    pub fn new(region_id: u64, epoch: Epoch, message: Message) -> Self {
+    pub fn new(region_id: u64, epoch: Epoch, from_store: u64, message: Message) -> Self {
         Self {
             region_id,
             epoch,
             from_peer: message.sender(),
+            from_store,
             to_peer: message.recipient(),
             message,
         }
@@ -85,6 +93,7 @@ impl RaftMessage {
         out.put_varint(self.region_id);
         self.epoch.encode(out);
         out.put_varint(self.from_peer);
+        out.put_varint(self.from_store);
         out.put_varint(self.to_peer);
         encode_message(&self.message, out);
     }
@@ -94,6 +103,7 @@ impl RaftMessage {
             region_id: input.get_varint("raft.region_id")?,
             epoch: Epoch::decode(input)?,
             from_peer: input.get_varint("raft.from_peer")?,
+            from_store: input.get_varint("raft.from_store")?,
             to_peer: input.get_varint("raft.to_peer")?,
             message: decode_message(input)?,
         })
@@ -632,7 +642,7 @@ mod tests {
         let batch = RaftBatch::new(
             every_message()
                 .into_iter()
-                .map(|message| RaftMessage::new(7, Epoch::new(2, 5), message))
+                .map(|message| RaftMessage::new(7, Epoch::new(2, 5), 9, message))
                 .collect(),
         );
         let request = Request::Raft(batch.clone());
@@ -653,10 +663,14 @@ mod tests {
             to: 5,
             term: 1,
         };
-        let wrapped = RaftMessage::new(3, Epoch::INITIAL, message);
+        let wrapped = RaftMessage::new(3, Epoch::INITIAL, 6, message);
         assert_eq!(wrapped.from_peer, 4);
         assert_eq!(wrapped.to_peer, 5);
         assert_eq!(wrapped.region_id, 3);
+        assert_eq!(
+            wrapped.from_store, 6,
+            "the store is the caller's: a peer id does not name one"
+        );
     }
 
     /// The acknowledgement carries nothing, and still has to survive a round trip: a peer that

@@ -403,17 +403,18 @@ impl Store {
                 let host: Arc<dyn RegionHost> = Arc::new(StoreHost {
                     store: Arc::downgrade(self),
                 });
+                let view = transport.for_region(region.id, region.epoch, &region.peers);
                 let peer = start_peer(
                     &self.db,
                     &region,
                     self.store_id,
                     raft,
-                    transport,
+                    Arc::clone(&view),
                     host,
                     Arc::clone(&self.drivers),
                 )?;
                 self.spawn_ticker(&peer, raft.tick);
-                RegionState::replicated(RegionMeta::new(region), peer)
+                RegionState::replicated(RegionMeta::new(region), peer, view)
             }
             _ => RegionState::unreplicated(RegionMeta::new(region)),
         };
@@ -680,17 +681,18 @@ impl Store {
                 // Its log is empty, so `RaftLogStorage::open` writes the configuration it is given
                 // as the membership *as of index 0* — which for a region whose log starts there is
                 // exactly the split-time membership, and is the anchor rule of `91de89a`.
+                let view = transport.for_region(child.id, child.epoch, &child.peers);
                 let peer = start_peer(
                     &self.db,
                     child,
                     self.store_id,
                     raft,
-                    transport,
+                    Arc::clone(&view),
                     host,
                     Arc::clone(&self.drivers),
                 )?;
                 self.spawn_ticker(&peer, raft.tick);
-                RegionState::replicated(RegionMeta::new(child.clone()), peer)
+                RegionState::replicated(RegionMeta::new(child.clone()), peer, view)
             }
             _ => RegionState::unreplicated(RegionMeta::new(child.clone())),
         };
@@ -1224,7 +1226,18 @@ impl Store {
                 // too, and is refused: the sender checks the asking peer against the region's
                 // membership, which is the right place for that check to live.
                 let index = Self::snapshot_announcement(&message.message).unwrap_or(0);
-                self.start_snapshot(message.region_id, message.message.sender(), index);
+                // The peer id to ask *as* comes from the message's recipient, not from the
+                // address book. A region's peer ids are its own — the placement driver allocates
+                // one per replica — so the entry a store has for itself in the cluster's address
+                // book is a different number, and asking with it is refused by the sender's
+                // membership check. Found by `tests/balance.rs`, which uses peer ids that do not
+                // happen to equal store ids.
+                self.start_snapshot(
+                    message.region_id,
+                    message.from_store,
+                    message.message.recipient(),
+                    index,
+                );
                 continue;
             };
             // Invariant 5, applied to Raft traffic. A batch carries messages for many regions
@@ -1249,7 +1262,8 @@ impl Store {
         Ok(())
     }
 
-    /// Starts fetching a region from the peer that offered it, unless one is already in flight.
+    /// Starts fetching a region from the **store** that offered it, unless one is already in
+    /// flight.
     ///
     /// Spawned rather than awaited: `receive_raft` answers a `RaftBatch` frame, and holding that
     /// answer open for the length of a snapshot would stall every other region's Raft traffic on
@@ -1258,7 +1272,7 @@ impl Store {
     ///
     /// **One at a time per region.** A leader re-announces every heartbeat, and each announcement
     /// would otherwise start another transfer of the same megabytes.
-    fn start_snapshot(self: &Arc<Self>, region_id: u64, from_peer: u64, index: u64) {
+    fn start_snapshot(self: &Arc<Self>, region_id: u64, from_store: u64, as_peer: u64, index: u64) {
         let Some(runtime) = self.runtime.clone() else {
             return;
         };
@@ -1272,7 +1286,11 @@ impl Store {
         }
         let store = Arc::clone(self);
         runtime.spawn(async move {
-            match store.fetch_snapshot(region_id, from_peer, index).await {
+            tracing::debug!(region_id, from_store, as_peer, index, "asking for a region");
+            match store
+                .fetch_snapshot(region_id, from_store, as_peer, index)
+                .await
+            {
                 Ok(()) => tracing::info!(region_id, index, "a region arrived by snapshot"),
                 Err(error) => tracing::warn!(
                     region_id,
@@ -1296,11 +1314,12 @@ impl Store {
     async fn fetch_snapshot(
         self: &Arc<Self>,
         region_id: u64,
-        from_peer: u64,
+        from_store: u64,
+        as_peer: u64,
         index: u64,
     ) -> std::result::Result<(), ProtoError> {
         let mut stream = self
-            .open_snapshot_stream(region_id, from_peer, index)
+            .open_snapshot_stream(region_id, from_store, as_peer, index)
             .await?;
 
         // 1. The header says which region this is and which index it is as of.
@@ -1350,30 +1369,26 @@ impl Store {
     async fn open_snapshot_stream(
         &self,
         region_id: u64,
-        from_peer: u64,
+        from_store: u64,
+        as_peer: u64,
         index: u64,
     ) -> std::result::Result<esker_proto::StreamResponse, ProtoError> {
         let raft = self
             .raft
             .as_ref()
             .ok_or_else(|| ProtoError::invalid("this store has no peer configuration"))?;
+        // By **store**, not by peer: a region's peer ids are allocated per replica and a store's
+        // address book knows stores. This is why the batch carries the sender's store id.
         let address = raft
             .peers
             .iter()
-            .find(|peer| peer.peer_id == from_peer)
+            .find(|peer| peer.store_id == from_store)
             .map(|peer| peer.addr)
             .ok_or_else(|| {
                 ProtoError::invalid(format!(
-                    "no address for peer {from_peer}, which offered a snapshot"
+                    "no address for store {from_store}, which offered a snapshot"
                 ))
             })?;
-        // Which peer *this* store is in the region being fetched. The sender checks it against
-        // the region's membership, so a store with no claim to the range is refused a copy.
-        let peer_id = raft
-            .peers
-            .iter()
-            .find(|peer| peer.store_id == self.store_id)
-            .map_or(self.store_id, |peer| peer.peer_id);
 
         // A connection of its own: a snapshot is megabytes and would sit in front of every Raft
         // batch queued behind it on the shared store-pair connection.
@@ -1382,7 +1397,10 @@ impl Store {
             .call_stream(Request::Snapshot(SnapshotRequest {
                 region_id,
                 index,
-                peer_id,
+                // Which peer this store is **in that region**, taken from the message that
+                // announced it. A region's peer ids are its own and are not the store's entry in
+                // the cluster's address book.
+                peer_id: as_peer,
             }))
             .await
     }
@@ -1744,7 +1762,7 @@ fn start_peer(
     region: &Region,
     store_id: u64,
     raft: &RaftOptions,
-    transport: &Arc<StoreTransport>,
+    transport: Arc<crate::transport::RegionTransport>,
     host: Arc<dyn RegionHost>,
     pool: Arc<DriverPool>,
 ) -> Result<Arc<RaftPeer>> {
@@ -1779,8 +1797,7 @@ fn start_peer(
             compaction: raft.compaction,
         },
         storage,
-        transport.for_region(region.id, region.epoch, &raft.peers)
-            as Arc<dyn crate::peer::RaftTransport>,
+        transport as Arc<dyn crate::peer::RaftTransport>,
         host,
         pool,
     )

@@ -193,6 +193,7 @@ fn golden_requests() -> Vec<(&'static str, Request)> {
             Request::Raft(RaftBatch::new(vec![RaftMessage::new(
                 1,
                 Epoch::new(2, 3),
+                8,
                 Message::TimeoutNow {
                     from: 5,
                     to: 6,
@@ -205,6 +206,7 @@ fn golden_requests() -> Vec<(&'static str, Request)> {
             Request::Raft(RaftBatch::new(vec![RaftMessage::new(
                 1,
                 Epoch::new(2, 3),
+                8,
                 Message::AppendEntries {
                     from: 1,
                     to: 2,
