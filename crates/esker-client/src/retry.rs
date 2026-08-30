@@ -22,7 +22,7 @@
 //! Under last-write-wins, re-sending a `Put` that *did* commit is harmless — the same bytes
 //! land twice. The danger is the case nobody can rule out: the request went out and the
 //! connection died, so the write may be in the log and the client cannot tell. That is not a
-//! `ServerError` at all, it is [`crate::wire::TransportError::Ambiguous`], and this module
+//! refusal at all: `esker-proto` marks it [`RequestOutcome::Unknown`], and this module
 //! deliberately does not retry it. It becomes [`crate::Error::AmbiguousResult`] and the
 //! caller decides. `prompts/05-txn.md` builds on that distinction, which is why it is drawn
 //! here rather than left to a comment.

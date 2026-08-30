@@ -17,12 +17,12 @@
 //!
 //! ```
 //! use esker_client::testing::{FakeTransport, Matcher, Outcome, Rule};
-//! use esker_client::wire::{RawMethod, RawResponse};
+//! use esker_client::wire::{Method, RawKvResp};
 //!
 //! let transport = FakeTransport::new();
 //! transport.script(Rule::new(
-//!     Matcher::Method(RawMethod::Get),
-//!     Outcome::Reply(RawResponse::Get(None)),
+//!     Matcher::Method(Method::RawGet),
+//!     Outcome::Reply(RawKvResp::Get { value: None }),
 //! ));
 //! ```
 
@@ -33,8 +33,17 @@ use bytes::Bytes;
 
 use crate::transport::Transport;
 use crate::wire::{
-    CallResult, ProtoError, RawMethod, RawRequest, RawResponse, Request, RequestContext,
+    CallResult, Method, ProtoError, RawKvReq, RawKvResp, Request, RequestHeader, routing_key,
 };
+
+/// The `RawKv` body of a request, when it has one.
+#[must_use]
+fn raw_body(request: &Request) -> Option<&RawKvReq> {
+    match request {
+        Request::RawKv { request, .. } => Some(request),
+        Request::Hello(_) => None,
+    }
+}
 
 /// Which requests a rule answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,13 +51,15 @@ pub enum Matcher {
     /// Every request.
     Any,
     /// Requests of one method.
-    Method(RawMethod),
+    Method(Method),
     /// Requests addressed to one store.
     Store(u64),
     /// Requests whose routing key is exactly these bytes.
     Key(Bytes),
     /// Requests for one region.
     Region(u64),
+    /// Requests addressed to one peer.
+    Peer(u64),
     /// Requests matching every one of these.
     All(Vec<Matcher>),
 }
@@ -59,10 +70,13 @@ impl Matcher {
     pub fn matches(&self, store_id: u64, request: &Request) -> bool {
         match self {
             Self::Any => true,
-            Self::Method(method) => request.body.method() == *method,
+            Self::Method(method) => request.method() == *method,
             Self::Store(id) => store_id == *id,
-            Self::Key(key) => request.body.routing_key() == &key[..],
-            Self::Region(id) => request.context.region_id == *id,
+            Self::Key(key) => raw_body(request).is_some_and(|body| routing_key(body) == &key[..]),
+            Self::Region(id) => request
+                .header()
+                .is_some_and(|header| header.region_id == *id),
+            Self::Peer(id) => request.header().is_some_and(|header| header.peer == *id),
             Self::All(matchers) => matchers
                 .iter()
                 .all(|matcher| matcher.matches(store_id, request)),
@@ -74,7 +88,7 @@ impl Matcher {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// Answer with this body.
-    Reply(RawResponse),
+    Reply(RawKvResp),
     /// Fail with this error — a refusal from the store, or a socket that gave up. One enum
     /// covers both because `esker-proto` does: what separates them is
     /// [`ProtoError::outcome`], not which layer raised it.
@@ -137,10 +151,28 @@ impl Rule {
 pub struct Call {
     /// The store it was addressed to.
     pub store_id: u64,
-    /// The routing header it carried.
-    pub context: RequestContext,
-    /// The body, exactly as the client built it.
-    pub body: RawRequest,
+    /// The request, exactly as the client built it.
+    pub request: Request,
+}
+
+impl Call {
+    /// The `RawKv` body, when this was a key-value call.
+    #[must_use]
+    pub fn body(&self) -> Option<&RawKvReq> {
+        raw_body(&self.request)
+    }
+
+    /// The routing header, when this was a key-value call.
+    #[must_use]
+    pub fn header(&self) -> Option<RequestHeader> {
+        self.request.header()
+    }
+
+    /// The key the client routed by.
+    #[must_use]
+    pub fn key(&self) -> Option<&[u8]> {
+        self.body().map(routing_key)
+    }
 }
 
 #[derive(Debug)]
@@ -155,7 +187,7 @@ struct Inner {
 ///
 /// Rules are tried front to back; the first live rule whose matcher matches answers the call
 /// and spends one of its uses. A call that matches nothing gets [`FakeTransport::unmatched`],
-/// which by default is a protocol error — a mis-scripted test then fails at once instead of
+/// which by default is an internal error — a mis-scripted test then fails at once instead of
 /// looping through a retry budget.
 #[derive(Debug)]
 pub struct FakeTransport {
@@ -177,7 +209,7 @@ impl FakeTransport {
                 rules: Vec::new(),
                 log: Vec::new(),
                 unmatched: Outcome::Fail(ProtoError::internal("fake transport: no rule matched")),
-                max_frame_size: esker_proto::MAX_FRAME_SIZE,
+                max_frame_size: crate::wire::MAX_FRAME_SIZE,
             }),
         }
     }
@@ -230,12 +262,28 @@ impl FakeTransport {
 
     /// The methods of every call so far, which is what most assertions actually want.
     #[must_use]
-    pub fn methods(&self) -> Vec<RawMethod> {
+    pub fn methods(&self) -> Vec<Method> {
         self.lock()
             .log
             .iter()
-            .map(|call| call.body.method())
+            .map(|call| call.request.method())
             .collect()
+    }
+
+    /// The peer each call was addressed to, which is how a `NotLeader` redirect is checked.
+    #[must_use]
+    pub fn peers(&self) -> Vec<u64> {
+        self.lock()
+            .log
+            .iter()
+            .filter_map(|call| call.header().map(|header| header.peer))
+            .collect()
+    }
+
+    /// The store each call was addressed to.
+    #[must_use]
+    pub fn stores(&self) -> Vec<u64> {
+        self.lock().log.iter().map(|call| call.store_id).collect()
     }
 
     /// Rules that still have uses left.
@@ -255,8 +303,8 @@ impl FakeTransport {
     }
 
     /// A `Mutex` is only poisoned by a panic in another test thread, and every test in this
-    /// crate is single-threaded over its own transport. Recovering the guard keeps one
-    /// failing assertion from turning into a second, confusing panic in the teardown.
+    /// crate is single-threaded over its own transport. Recovering the guard keeps one failing
+    /// assertion from turning into a second, confusing panic in the teardown.
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner
             .lock()
@@ -269,8 +317,7 @@ impl Transport for FakeTransport {
         let mut inner = self.lock();
         inner.log.push(Call {
             store_id,
-            context: request.context.clone(),
-            body: request.body.clone(),
+            request: request.clone(),
         });
 
         for rule in &mut inner.rules {
@@ -296,25 +343,14 @@ mod tests {
 
     use super::{Bytes, FakeTransport, Matcher, Outcome, Rule};
     use crate::transport::Transport;
-    use crate::wire::{
-        Epoch, Peer, ProtoError, RawMethod, RawRequest, RawResponse, Request, RequestContext,
-    };
+    use crate::wire::{Epoch, Method, ProtoError, RawKvReq, RawKvResp, Request, RequestHeader};
 
-    fn request(body: RawRequest) -> Request {
-        Request {
-            context: RequestContext {
-                region_id: 1,
-                epoch: Epoch::INITIAL,
-                peer: Peer::voter(1, 1),
-            },
-            body,
-        }
+    fn request(body: RawKvReq) -> Request {
+        Request::raw_kv(RequestHeader::new(1, Epoch::INITIAL, 1), body)
     }
 
     fn get(key: &'static [u8]) -> Request {
-        request(RawRequest::Get {
-            key: Bytes::from_static(key),
-        })
+        request(RawKvReq::get(Bytes::from_static(key)))
     }
 
     fn deadline() -> Instant {
@@ -331,7 +367,9 @@ mod tests {
                     reason: "stall".to_owned(),
                 }),
             ))
-            .script(Rule::new(Matcher::Any, Outcome::Reply(RawResponse::Get(None))).forever());
+            .script(
+                Rule::new(Matcher::Any, Outcome::Reply(RawKvResp::Get { value: None })).forever(),
+            );
 
         let first = transport.call(1, &get(b"k"), deadline());
         assert!(matches!(first, Err(ProtoError::ServerIsBusy { .. })));
@@ -339,7 +377,7 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(
                 transport.call(1, &get(b"k"), deadline()),
-                Ok(RawResponse::Get(None))
+                Ok(RawKvResp::Get { value: None })
             );
         }
         assert_eq!(transport.call_count(), 4);
@@ -353,39 +391,39 @@ mod tests {
             .script(
                 Rule::new(
                     Matcher::All(vec![
-                        Matcher::Method(RawMethod::Get),
+                        Matcher::Method(Method::RawGet),
                         Matcher::Store(2),
                         Matcher::Key(Bytes::from_static(b"wanted")),
                     ]),
-                    Outcome::Reply(RawResponse::Get(Some(Bytes::from_static(b"v")))),
+                    Outcome::Reply(RawKvResp::Get {
+                        value: Some(Bytes::from_static(b"v")),
+                    }),
                 )
                 .forever(),
             )
-            .unmatched(Outcome::Reply(RawResponse::Get(None)));
+            .unmatched(Outcome::Reply(RawKvResp::Get { value: None }));
 
-        assert_eq!(
-            transport.call(2, &get(b"wanted"), deadline()),
-            Ok(RawResponse::Get(Some(Bytes::from_static(b"v"))))
-        );
+        let hit = RawKvResp::Get {
+            value: Some(Bytes::from_static(b"v")),
+        };
+        let miss = RawKvResp::Get { value: None };
+        assert_eq!(transport.call(2, &get(b"wanted"), deadline()), Ok(hit));
         // Right key, wrong store.
         assert_eq!(
             transport.call(1, &get(b"wanted"), deadline()),
-            Ok(RawResponse::Get(None))
+            Ok(miss.clone())
         );
         // Right store, wrong key.
         assert_eq!(
             transport.call(2, &get(b"other"), deadline()),
-            Ok(RawResponse::Get(None))
+            Ok(miss.clone())
         );
         // Right store and key, wrong method.
-        let put = request(RawRequest::Put {
-            key: Bytes::from_static(b"wanted"),
-            value: Bytes::from_static(b"v"),
-        });
-        assert_eq!(
-            transport.call(2, &put, deadline()),
-            Ok(RawResponse::Get(None))
-        );
+        let put = request(RawKvReq::put(
+            Bytes::from_static(b"wanted"),
+            Bytes::from_static(b"v"),
+        ));
+        assert_eq!(transport.call(2, &put, deadline()), Ok(miss));
     }
 
     /// A script that does not cover a call is a broken test, and it should say so at once
@@ -400,17 +438,18 @@ mod tests {
     #[test]
     fn the_log_keeps_the_request_as_it_was_sent() {
         let transport = FakeTransport::new();
-        transport.script(Rule::new(Matcher::Any, Outcome::Reply(RawResponse::Delete)).forever());
-        let body = RawRequest::Delete {
-            key: Bytes::from_static(b"raw-user-key"),
-        };
+        transport.script(Rule::new(Matcher::Any, Outcome::Reply(RawKvResp::Delete)).forever());
+        let body = RawKvReq::delete(Bytes::from_static(b"raw-user-key"));
         let _unused = transport.call(7, &request(body.clone()), deadline());
 
         let call = transport.nth_call(0).expect("one call was made");
         assert_eq!(call.store_id, 7);
-        assert_eq!(call.body, body);
-        assert_eq!(call.context.region_id, 1);
-        assert_eq!(transport.methods(), vec![RawMethod::Delete]);
+        assert_eq!(call.body(), Some(&body));
+        assert_eq!(call.key(), Some(&b"raw-user-key"[..]));
+        assert_eq!(call.header().map(|header| header.region_id), Some(1));
+        assert_eq!(transport.methods(), vec![Method::RawDelete]);
+        assert_eq!(transport.stores(), vec![7]);
+        assert_eq!(transport.peers(), vec![1]);
 
         transport.clear_log();
         assert_eq!(transport.call_count(), 0);
@@ -423,7 +462,9 @@ mod tests {
             .script(
                 Rule::new(Matcher::Any, Outcome::Fail(ProtoError::not_sent("refused"))).times(2),
             )
-            .script(Rule::new(Matcher::Any, Outcome::Reply(RawResponse::Get(None))).forever());
+            .script(
+                Rule::new(Matcher::Any, Outcome::Reply(RawKvResp::Get { value: None })).forever(),
+            );
 
         for _ in 0..2 {
             assert!(matches!(
@@ -433,14 +474,14 @@ mod tests {
         }
         assert_eq!(
             transport.call(1, &get(b"k"), deadline()),
-            Ok(RawResponse::Get(None))
+            Ok(RawKvResp::Get { value: None })
         );
     }
 
     #[test]
     fn the_frame_limit_is_adjustable_for_tests() {
         let transport = FakeTransport::new();
-        assert_eq!(transport.max_frame_size(), esker_proto::MAX_FRAME_SIZE);
+        assert_eq!(transport.max_frame_size(), crate::wire::MAX_FRAME_SIZE);
         transport.set_max_frame_size(64);
         assert_eq!(transport.max_frame_size(), 64);
     }

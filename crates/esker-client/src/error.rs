@@ -10,7 +10,7 @@
 
 use bytes::Bytes;
 
-use crate::wire::{ProtoError, RawMethod, RequestOutcome};
+use crate::wire::{Method, ProtoError, RequestOutcome};
 
 /// A failed client call.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -50,7 +50,7 @@ pub enum Error {
     #[error("the {method:?} may or may not have been applied: {source}")]
     AmbiguousResult {
         /// The method whose fate is unknown.
-        method: RawMethod,
+        method: Method,
         /// How the answer was lost.
         source: Box<ProtoError>,
     },
@@ -78,9 +78,9 @@ pub enum Error {
     #[error("asked for {expected:?} and got {actual:?}")]
     UnexpectedResponse {
         /// What was sent.
-        expected: RawMethod,
+        expected: Method,
         /// What came back.
-        actual: RawMethod,
+        actual: Method,
     },
 }
 
@@ -118,7 +118,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[cfg(test)]
 mod tests {
     use super::Error;
-    use crate::wire::{ProtoError, RawMethod};
+    use crate::wire::{Method, ProtoError};
 
     #[test]
     fn only_an_unanswered_write_leaves_the_database_in_doubt() {
@@ -143,7 +143,7 @@ mod tests {
         );
         assert!(
             !Error::AmbiguousResult {
-                method: RawMethod::Put,
+                method: Method::RawPut,
                 source: Box::new(ProtoError::Closed {
                     detail: "reset".to_owned(),
                 }),
@@ -152,8 +152,8 @@ mod tests {
         );
         assert!(
             !Error::UnexpectedResponse {
-                expected: RawMethod::Put,
-                actual: RawMethod::Get,
+                expected: Method::RawPut,
+                actual: Method::RawGet,
             }
             .changed_nothing(),
             "answering the wrong method proves the store did something, not nothing"

@@ -20,8 +20,9 @@
 //! job. Until PD exists the mapping is a one-entry table inside the transport
 //! (`// TODO(phase-4)`).
 
-// TODO(phase-2): `Transport` belongs to `esker-proto`, whose single writer is the sibling
-// lane. When it lands, this module keeps only the doc comment and re-exports the real trait.
+// TODO(phase-2): the TCP implementation of this trait is `esker-proto`'s, whose single writer
+// is the sibling lane. The trait itself stays here: it is the client's seam, and the client is
+// what needs it injectable.
 
 use std::fmt;
 use std::time::Instant;
@@ -32,11 +33,11 @@ use crate::wire::{CallResult, Request};
 pub trait Transport: fmt::Debug + Send + Sync {
     /// Sends `request` to `store_id` and waits for its answer, giving up at `deadline`.
     ///
-    /// Returning `Err` must say which side of the ambiguity the failure is on: an
-    /// implementation that cannot prove the request never left is required to report
-    /// [`crate::wire::TransportError::Ambiguous`], because the caller turns that into a
-    /// typed refusal to retry a write. Reporting `NotSent` for a request that may have
-    /// arrived is the one way this trait can be implemented wrongly and lose data.
+    /// Returning `Err` must say which side of the ambiguity the failure is on, through
+    /// [`esker_proto::ProtoError::outcome`]: an implementation that cannot prove the request
+    /// never left must report an error whose outcome is `Unknown`, because the caller turns
+    /// that into a typed refusal to retry a write. Answering `NotSent` for a request that may
+    /// have arrived is the one way this trait can be implemented wrongly and lose data.
     fn call(&self, store_id: u64, request: &Request, deadline: Instant) -> CallResult;
 
     /// Largest frame this transport will carry, in bytes.
