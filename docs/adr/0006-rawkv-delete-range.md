@@ -37,7 +37,8 @@ multi-node phases must not need to change" would gain a working method in phase 
 
 **(b) Pass the request to the engine's `WriteBatch::delete_range`.** One entry, atomic, cheap —
 and wrong, in the specific way that is hardest to find later. It is the option that requires
-nobody to write any code.
+nobody to write any code. (Since this ADR was accepted, the engine refuses it outright, so (b) is
+no longer available to anyone: `Db::write` returns `Error::Unsupported`. See the consequences.)
 
 **(c) Implement the range delete in the store**, as a scan of the range followed by point deletes
 in one `WriteBatch`. Correct, atomic, and bounded by how many keys the range holds.
@@ -69,12 +70,13 @@ Two properties this buys, and one it does not:
 * A `DeleteRange` costs a scan of the range. Deleting a million keys is a hundred requests of ten
   thousand rather than one request, which is a visible cost in the API rather than a hidden one in
   the engine.
-* `docs/DESIGN.md` §4.7 is now inaccurate about what v1 *does*: it says v1 rejects a wide
-  `DeleteRange` with an error, and in fact v1 accepts it and under-deletes. §4.7 gains a sentence
-  saying so, because a design document that describes a check nobody wrote is worse than one that
-  admits the gap. **The gap is inside the engine and is not fixed here** — `esker-engine` is
-  phase-1 code and frozen to this lane. It is reported to the coordinator as an engine finding,
-  with the suggestion that the engine either implement the §4.7 rejection or drop the claim.
+* `docs/DESIGN.md` §4.7 described a check that was never written: it said v1 rejects a wide
+  `DeleteRange` with an error, and in fact v1 accepted it and under-deleted. This was reported to
+  the coordinator as an engine finding rather than fixed here, because `esker-engine` is phase-1
+  code — and then fixed on a one-time grant to touch it: **`Db::write` now refuses any batch
+  containing a `DeleteRange`** with `Error::Unsupported`, before the batch is logged. The entry
+  kind stays in the frozen format. So the workaround below is no longer a choice between a correct
+  path and a silently wrong one; it is the only path, and the engine says so.
 * When range tombstones land in phase 5, this store path becomes one entry again and the bound can
   go. The wire format does not change: `DeleteRange { start, end, sync }` and
   `DeleteRange { deleted }` are the same messages either way, and `deleted` stops being a count the

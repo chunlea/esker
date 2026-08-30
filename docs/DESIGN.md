@@ -183,17 +183,20 @@ Leveled. L0 flush trigger 4 files, slowdown 8, stop 12 (*default*). L1 base 64 M
 levels (*default*). Score-based picking; L0→L1 merges all overlapping L0 files. Compaction runs on a
 bounded thread pool (2 threads *default*) via a `CompactionJob` that is a pure function of its inputs (so it
 is unit-testable without the `Db`). `CompactionFilter` trait lets `esker-txn` drop MVCC versions below
-the safepoint. Range deletions are implemented as range tombstones in v2; v1 rejects `DeleteRange`
-across more than one SST boundary with an error (documented limitation, removed in phase 5).
+the safepoint.
 
-**What v1 actually does is weaker than that sentence, and phase 2 found it out.** The engine
-accepts every `DeleteRange` and stores it as an entry kind, but every read path — memtable, `get`
-and the iterators alike — treats it as a point `Delete` at the range's `begin` key. Nothing
-rejects a wide range, so a caller is told a range was deleted when one key was. The check
-described above is not implemented. Until it is, no layer above may call
-`WriteBatch::delete_range`: `esker-store` serves `RawKv DeleteRange` as a bounded scan plus point
-deletes in one atomic batch (ADR 0006), and the engine keeps the format so that making the
-tombstone real in phase 5 is not a format change.
+**Range deletions.** `DeleteRange` is a *format* in v1 and not a feature. The entry kind exists in
+the `WriteBatch` and log layouts (§4.3) so that making range deletes real in phase 5 is not a
+format change — but no read path honours it: the memtable, `get` and both iterators treat it as a
+point `Delete` at the range's `begin`. So **the engine refuses it**: `Db::write` returns
+`Error::Unsupported` for any batch containing one, before the batch is logged, and a refused batch
+changes nothing. Storing it instead would delete one key while telling the caller a range was
+gone, which is the failure mode this rule exists to prevent — and which phase 2 found from the far
+side of a socket, where `esker-store` had to answer for it.
+
+Until phase 5, a **ranged delete is the store's job**: `RawKv DeleteRange` is served as a bounded
+scan plus point deletes in one atomic batch (ADR 0006). Real range tombstones land in phase 5 with
+`esker-txn`, and remove both the store's workaround and this refusal.
 
 ### 4.8 Column families
 

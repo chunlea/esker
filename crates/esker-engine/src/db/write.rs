@@ -26,7 +26,7 @@
 use std::sync::atomic::Ordering;
 
 use crate::batch::WriteBatch;
-use crate::dbformat::SeqNo;
+use crate::dbformat::{EntryKind, SeqNo};
 use crate::error::{Error, Result};
 use crate::options::{WalSyncMode, WriteOptions};
 
@@ -74,7 +74,7 @@ impl Db {
 
 impl DbInner {
     fn write(&self, batch: WriteBatch, options: WriteOptions) -> Result<SeqNo> {
-        self.check_column_families(&batch)?;
+        self.check_batch(&batch)?;
         let sync = options.sync || self.options.wal_sync_mode == WalSyncMode::PerWrite;
 
         // Before anything is logged: make room, which may switch a memtable, roll the log
@@ -221,7 +221,22 @@ impl DbInner {
     }
 
     /// Rejects a batch naming a column family that does not exist, before anything is logged.
-    fn check_column_families(&self, batch: &WriteBatch) -> Result<()> {
+    /// Refuses a batch this version cannot honour, before any of it is logged.
+    ///
+    /// Two reasons, and the second is a limitation rather than a mistake:
+    ///
+    /// * a column family the database does not have;
+    /// * a [`EntryKind::DeleteRange`], which **v1 does not implement**. The entry kind is part
+    ///   of the frozen `WriteBatch` and log formats ([`crate::batch`], `docs/DESIGN.md` §4.3)
+    ///   so that making it real in phase 5 is not a format change — but no read path honours
+    ///   it: the memtable, `get` and both iterators treat it as a point `Delete` at the
+    ///   range's `begin`. Storing one would therefore delete a single key while telling the
+    ///   caller a range was gone, which is a silent wrong answer and the worst kind. Refusing
+    ///   it is the honest version of the check `docs/DESIGN.md` §4.7 always described.
+    ///
+    /// Both checks happen before `make_room`, before the log append and before any memtable
+    /// insert, so a refused batch changes nothing.
+    fn check_batch(&self, batch: &WriteBatch) -> Result<()> {
         let cfs = read_lock(&self.cfs)?;
         for entry in batch {
             let entry = entry?;
@@ -230,6 +245,17 @@ impl DbInner {
                     "no column family with id {}",
                     entry.cf
                 )));
+            }
+            if entry.kind == EntryKind::DeleteRange {
+                return Err(Error::Unsupported(
+                    "DeleteRange is not implemented in v1: the entry kind is part of the \
+                     format, but no read path honours it, so storing one would delete only \
+                     the key at the range's start. Delete a range through esker-store, which \
+                     does it as a bounded scan and point deletes in one atomic batch \
+                     (docs/adr/0006-rawkv-delete-range.md); real range tombstones are phase 5 \
+                     (docs/DESIGN.md §4.7)"
+                        .to_owned(),
+                ));
             }
         }
         Ok(())
