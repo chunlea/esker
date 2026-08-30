@@ -53,6 +53,9 @@ pub(crate) fn run(options: &Run, addr: &str) -> Result<Report, String> {
         Workload::ReadMissing => parallel(&client, options, read_missing)?,
         Workload::FillSeq => parallel(&client, options, write_sequential)?,
         Workload::FillRandom | Workload::Overwrite => parallel(&client, options, write_random)?,
+        // Unreachable by construction: `bench::run` refuses a placement-driver workload with
+        // `--remote` before it gets here, because this speaks `RawKv` to a store.
+        other => return Err(format!("{} does not run over RawKv", other.name())),
     };
     let elapsed = started.elapsed();
 

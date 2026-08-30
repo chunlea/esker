@@ -107,7 +107,7 @@ impl fmt::Display for ParseError {
             ParseError::UnknownWorkload(workload) => write!(
                 formatter,
                 "unknown workload `{workload}`; expected fillseq, fillrandom, overwrite, \
-                 readrandom, readmissing or readseq"
+                 readrandom, readmissing, readseq, tso or allocid"
             ),
             ParseError::MissingArgument(name) => write!(formatter, "missing {name}"),
             ParseError::UnknownRawCommand(verb) => write!(
@@ -156,10 +156,11 @@ Options:
 
 Bench options:
   <workload>            fillseq | fillrandom | overwrite | readrandom | readmissing
-                        | readseq (default fillrandom)
+                        | readseq | tso | allocid (default fillrandom)
       --num N           Keys in the database, and operations measured (default 100000)
       --value-size N    Value size in bytes (default 100)
-      --batch-size N    Entries per write batch (default 1)
+      --batch-size N    Entries per write batch; for tso and allocid, values per
+                        call to the placement driver (default 1)
       --threads N       Concurrent workers; readseq always uses one (default 1)
       --sync            Wait for each write to be durable (default off)
       --dir PATH        Where to put the database (default a temporary directory)
@@ -168,6 +169,9 @@ Bench options:
       --remote HOST:PORT  Drive the workload over the network against a running
                         server instead of an in-process database. The engine
                         options above belong to that server and are ignored.
+                        Refused for tso and allocid: those measure a placement
+                        driver in this process, and --remote speaks RawKV to a
+                        store.
 
 Sst-dump options:
   -v, --verbose         Print every key and value, not just the summary

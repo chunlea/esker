@@ -8,6 +8,7 @@
 
 mod args;
 mod bench;
+mod bench_pd;
 mod bench_remote;
 mod bytes;
 mod cluster;

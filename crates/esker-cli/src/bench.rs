@@ -29,7 +29,7 @@ use esker_engine::batch::WriteBatch;
 use esker_engine::options::{CfOptions, Options, ReadOptions, WalSyncMode, WriteOptions};
 use esker_engine::{Db, cf};
 
-/// One of the five workloads.
+/// One of the workloads: six over the engine, two over the placement driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Workload {
     /// Write every key once, in order.
@@ -47,6 +47,14 @@ pub(crate) enum Workload {
     ReadMissing,
     /// Iterate the whole database.
     ReadSeq,
+    /// Take timestamps from the placement driver's oracle ([`crate::bench_pd`]).
+    ///
+    /// Not an engine workload: phase 5 takes two of these per transaction
+    /// (`docs/DESIGN.md` §8), so the oracle is on the critical path of everything above it and
+    /// needs a number of its own.
+    Tso,
+    /// Take cluster-unique ids from the placement driver's allocator.
+    AllocId,
 }
 
 impl Workload {
@@ -59,6 +67,8 @@ impl Workload {
             "readrandom" => Some(Self::ReadRandom),
             "readmissing" => Some(Self::ReadMissing),
             "readseq" => Some(Self::ReadSeq),
+            "tso" => Some(Self::Tso),
+            "allocid" => Some(Self::AllocId),
             _ => None,
         }
     }
@@ -71,7 +81,17 @@ impl Workload {
             Self::ReadRandom => "readrandom",
             Self::ReadMissing => "readmissing",
             Self::ReadSeq => "readseq",
+            Self::Tso => "tso",
+            Self::AllocId => "allocid",
         }
+    }
+
+    /// Whether this workload measures the placement driver rather than the engine.
+    ///
+    /// The two are different processes with different state, so they cannot share a setup:
+    /// one opens a `Db` and the other a `Pd`. This is the fork in [`run`].
+    pub(crate) fn is_placement_driver(self) -> bool {
+        matches!(self, Self::Tso | Self::AllocId)
     }
 
     /// Whether the database has to be populated before the measured phase.
@@ -198,13 +218,27 @@ pub(crate) fn value_of(size: u32, seed: u64) -> Vec<u8> {
 /// its own database; the engine options here are that server's business and are ignored.
 pub(crate) fn run(options: &Run) -> Result<Report, String> {
     if let Some(addr) = &options.remote {
+        // `--remote` drives `RawKv` against a store, and a placement driver is not one.
+        // Refused rather than ignored: a flag that quietly measures something else is worse
+        // than one that does not work.
+        if options.workload.is_placement_driver() {
+            return Err(format!(
+                "`--remote {addr}` drives RawKv against a store; the `{}` workload measures a \
+                 placement driver in this process",
+                options.workload.name()
+            ));
+        }
         return crate::bench_remote::run(options, addr);
     }
     let (dir, temporary) = match &options.dir {
         Some(dir) => (dir.clone(), false),
         None => (temp_dir(), true),
     };
-    let result = run_in(options, &dir);
+    let result = if options.workload.is_placement_driver() {
+        crate::bench_pd::run(options, &dir)
+    } else {
+        run_in(options, &dir)
+    };
     if temporary {
         // Best effort: a benchmark that leaves a directory behind is untidy, not broken.
         let _unused = std::fs::remove_dir_all(&dir);
@@ -245,6 +279,13 @@ fn run_in(options: &Run, dir: &Path) -> Result<Report, String> {
         Workload::ReadMissing => measure_parallel(&db, options, read_missing)?,
         Workload::FillSeq => measure_parallel(&db, options, write_sequential)?,
         Workload::FillRandom | Workload::Overwrite => measure_parallel(&db, options, write_random)?,
+        // Unreachable by construction: `run` forks the placement-driver workloads into
+        // `bench_pd` before a database is opened. An error rather than a panic, because a
+        // fork that grew a hole should say so and not abort (`CLAUDE.md` invariant 9).
+        other if other.is_placement_driver() => {
+            return Err(format!("{} does not run against a database", other.name()));
+        }
+        other => return Err(format!("{} has no measured phase", other.name())),
     };
     let elapsed = started.elapsed();
 
@@ -496,11 +537,24 @@ fn measure_scan(db: &Arc<Db>, options: &Run) -> Result<Vec<Duration>, String> {
 }
 
 /// A fresh directory under the system temporary directory.
+/// A directory no other run is using.
+///
+/// The counter is not decoration. `SystemTime::now()` is not nanosecond-granular — on this
+/// machine 96% of consecutive reads in a tight loop return the *same* value — so two runs
+/// starting at once used to be handed the same path, and the first to finish deleted the
+/// other's database out from under it. The process id separates processes and the counter
+/// separates threads within one; the timestamp is left in because it makes a leftover
+/// directory readable.
 fn temp_dir() -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_nanos());
-    std::env::temp_dir().join(format!("esker-bench-{}-{nanos}", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "esker-bench-{}-{nanos}-{unique}",
+        std::process::id()
+    ))
 }
 
 #[cfg(test)]
@@ -531,6 +585,8 @@ mod tests {
             "overwrite",
             "readrandom",
             "readseq",
+            "tso",
+            "allocid",
         ] {
             let workload = Workload::parse(name).expect(name);
             assert_eq!(workload.name(), name);
@@ -567,12 +623,32 @@ mod tests {
             Workload::ReadRandom,
             Workload::ReadMissing,
             Workload::ReadSeq,
+            Workload::Tso,
+            Workload::AllocId,
         ] {
             let report = run(&small(workload)).unwrap_or_else(|err| panic!("{workload:?}: {err}"));
             assert_eq!(report.workload, workload);
             assert!(report.operations > 0, "{workload:?} measured nothing");
             assert!(report.elapsed > Duration::ZERO);
         }
+    }
+
+    /// Two runs starting at the same instant must not be handed the same directory. They were:
+    /// the path was the process id and a timestamp, and the timestamp is not fine-grained
+    /// enough to separate two threads, so one run's cleanup deleted the other's database. It
+    /// surfaced as a one-in-many failure of the workload sweep once the placement-driver
+    /// workloads added three more concurrent runs to this file.
+    #[test]
+    fn concurrent_runs_never_share_a_directory() {
+        let handles: Vec<_> = (0..16)
+            .map(|_| std::thread::spawn(|| (0..64).map(|_| super::temp_dir()).collect::<Vec<_>>()))
+            .collect();
+        let paths: Vec<std::path::PathBuf> = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("a worker panicked"))
+            .collect();
+        let unique: std::collections::BTreeSet<&std::path::PathBuf> = paths.iter().collect();
+        assert_eq!(unique.len(), paths.len(), "two runs shared a directory");
     }
 
     /// `--sync` is the difference between a benchmark that measures the disk and one that
