@@ -1,0 +1,98 @@
+crates/esker-store/src/meta.rs
+  s_dc640bf0df4adb::t_9cae75eb6a145d 43,168-173,179-181,184-190,192,194-226,228,231-232,234-238
+  s_dc640bf0df4adb::t_262e8a30eb25aa 53-62,92-102,182
+  s_dc640bf0df4adb::t_5f36325c4f8a7b 167
+  s_dc640bf0df4adb::t_cdfea195bdde24 174-178
+  s_dc640bf0df4adb::t_79b95b1525861b 183
+  s_dc640bf0df4adb::t_3d4ae26cc0a0fa 191
+  s_dc640bf0df4adb::t_ebac3f16602a5c 193
+  s_dc640bf0df4adb::t_f3ddc819019a36 227
+  s_dc640bf0df4adb::t_8cdb5a31a3e383 229-230
+  s_dc640bf0df4adb::t_bdb5b3088b6ef2 233
+  s_dc640bf0df4adb::t_543b478fa6bb05 239
+crates/esker-store/src/server.rs
+  s_dc640bf0df4adb::t_a34fdf4da11161 32,43,201-203,250-269,316,574-669,775,790,820,825,831-832,834,837-839,849-850,853-855,859,864,871,877-878,885,887-888,912,915-916,918-919,922-924,929-930,932,943,954,958,960,990,994,997,1005,1007-1008,1016-1017,1021-1022,1026-1027,1030-1031,1037
+  s_dc640bf0df4adb::t_fbe38825e8c248 774
+  s_dc640bf0df4adb::t_e1fe0322b22aeb 776-777
+  s_dc640bf0df4adb::t_53bc7fb26c71f7 787-789
+  s_dc640bf0df4adb::t_2b26243405fb16 819
+  s_dc640bf0df4adb::t_b162ec3907da3b 821-824
+  s_dc640bf0df4adb::t_a98a96d328fd5b 826-830
+  s_dc640bf0df4adb::t_ca00f730b72db5 833
+  s_dc640bf0df4adb::t_3018473b523428 835-836
+  s_dc640bf0df4adb::t_4d1e71fa680710 840-842,846-848
+  s_dc640bf0df4adb::t_a04ddad82f1bfd 851-852
+  s_dc640bf0df4adb::t_c8f65348363970 856-858
+  s_dc640bf0df4adb::t_06e637801546dc 860-863
+  s_dc640bf0df4adb::t_859ecd5c771461 865-870
+  s_dc640bf0df4adb::t_102b21fa574a04 872-876
+  s_dc640bf0df4adb::t_1243ff19f5500d 879-884
+  s_dc640bf0df4adb::t_8f44ce86993dda 886
+  s_dc640bf0df4adb::t_9bbe6c4c47cce2 889-891,909-911
+  s_dc640bf0df4adb::t_20a4266d346098 913-914
+  s_dc640bf0df4adb::t_b9a8f9042ae77a 917
+  s_dc640bf0df4adb::t_d930fe0717d41c 920-921
+  s_dc640bf0df4adb::t_7292222327630f 925-928
+  s_dc640bf0df4adb::t_d99f90949a0e80 931
+  s_dc640bf0df4adb::t_ddeb2d59189c57 933-935,940-942
+  s_dc640bf0df4adb::t_f1b04451930d07 944-946,951-953
+  s_dc640bf0df4adb::t_ec098083a478be 955-957
+  s_dc640bf0df4adb::t_85f16e834c8c84 959
+  s_dc640bf0df4adb::t_5397267cffe8a4 961-963,987-989
+  s_dc640bf0df4adb::t_e1751efba8bab5 991-993
+  s_dc640bf0df4adb::t_08a181407483dd 995-996
+  s_dc640bf0df4adb::t_e5c696851666ae 998-1000,1002-1004
+  s_dc640bf0df4adb::t_a1d1718c2b059c 1006
+  s_dc640bf0df4adb::t_c5f57a6627bf3e 1009-1011,1013-1015
+  s_dc640bf0df4adb::t_3905367cd6e6e3 1018-1020
+  s_dc640bf0df4adb::t_fe1c337d1e552a 1023-1025
+  s_dc640bf0df4adb::t_873ff67eb2e683 1028-1029
+  s_dc640bf0df4adb::t_e24d88208763fe 1032-1036
+  s_dc640bf0df4adb::t_8f369c3195f0e9 25,29,785-786,843-845,892-908,936-939,947-950,964-986,1001,1012,1280-1281,1416-1420
+crates/esker-store/src/lib.rs
+  s_dc640bf0df4adb::t_262e8a30eb25aa 34,55
+  s_dc640bf0df4adb::t_9cae75eb6a145d 87-94,97
+  s_dc640bf0df4adb::t_a34fdf4da11161 112-117
+crates/esker-store/src/snapshot.rs
+  s_dc640bf0df4adb::t_262e8a30eb25aa 413,416,441,463-605,618,621
+  s_dc640bf0df4adb::t_fc03a3d65f8bdc 410-412
+  s_dc640bf0df4adb::t_c494d7ebbe0e22 414-415
+  s_dc640bf0df4adb::t_8607835c4f2996 417-419,438-440
+  s_dc640bf0df4adb::t_cf5d90a92ad727 442-444,460-462
+  s_dc640bf0df4adb::t_11a2144d634ca4 606-608,615-617
+  s_dc640bf0df4adb::t_c15a2ce3c56961 619-620
+  s_dc640bf0df4adb::t_98c4ca96f282bc 622-624
+  s_dc640bf0df4adb::t_1ebf734415a24c 1-409,420-437,445-459,609-614,625
+crates/esker-store/src/raft_log.rs
+  s_dc640bf0df4adb::t_9cae75eb6a145d 87-95
+crates/esker-proto/src/lib.rs
+  s_dc640bf0df4adb::t_7403170f37cfd6 53
+crates/esker-proto/src/messages.rs
+  s_dc640bf0df4adb::t_b799b5245904f0 79-85,103,120,149,154-163,190,749-768,786,794,818-822,836-840,1101
+crates/esker-proto/tests/golden/messages.hex
+  s_dc640bf0df4adb::t_5ea68a85bba051 36
+crates/esker-proto/tests/messages.rs
+  s_dc640bf0df4adb::t_6d2a63eed8679b 135,154-161,591-604
+crates/esker-store/src/peer.rs
+  s_dc640bf0df4adb::t_93fe827e865474 143-144,149-166,574-606,649-651,867-875
+docs/plans/phase-5.md
+  s_dc640bf0df4adb::t_ff1422220a98fc 1-195
+docs/txn-spec.md
+  s_dc640bf0df4adb::t_22103eb95657c5 1-311
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "9958e0b01f7a7798852cb868c6cab8d868e237af",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "claude-fable-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
