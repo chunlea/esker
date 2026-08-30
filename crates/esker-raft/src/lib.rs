@@ -35,6 +35,7 @@ mod proptests;
 mod raw_node;
 mod readonly;
 mod replication;
+mod snapshot;
 mod storage;
 #[cfg(test)]
 mod testkit;

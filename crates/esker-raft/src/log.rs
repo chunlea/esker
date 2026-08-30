@@ -190,7 +190,9 @@ impl<S: LogStorage> RaftLog<S> {
         if !self.matches(prev_index, prev_term) {
             return Ok(None);
         }
-        let first_new = entries.first().map_or(prev_index + 1, |entry| entry.index);
+        let first_new = entries
+            .first()
+            .map_or(prev_index.saturating_add(1), |entry| entry.index);
         let last_new = entries.last().map_or(prev_index, |entry| entry.index);
         if let Some(conflict) = self.find_conflict(&entries)? {
             if conflict <= self.committed {
@@ -330,6 +332,13 @@ impl<S: LogStorage> RaftLog<S> {
     /// Whether a snapshot at `index` is worth installing: only if it carries the log past where
     /// this node already is. A snapshot the log has passed is stale, not an error.
     pub(crate) fn should_restore(&self, snapshot: &Snapshot) -> bool {
+        // A snapshot at the end of the index space cannot be real: no log reaches there, and the
+        // arithmetic that follows one would wrap. Messages come off a network this crate does not
+        // trust, so this is a value to reject rather than a case to assume away
+        // (`CLAUDE.md` invariant 9).
+        if snapshot.meta.index == Index::MAX {
+            return false;
+        }
         if snapshot.meta.index <= self.committed {
             return false;
         }
@@ -346,7 +355,7 @@ impl<S: LogStorage> RaftLog<S> {
         self.committed = snapshot.meta.index;
         self.applied = self.applied.max(snapshot.meta.index);
         self.unstable.clear();
-        self.unstable_offset = snapshot.meta.index + 1;
+        self.unstable_offset = snapshot.meta.index.saturating_add(1);
         self.unstable_snapshot = Some(snapshot);
     }
 

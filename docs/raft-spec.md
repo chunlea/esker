@@ -106,9 +106,11 @@ system, not of one function, so their "implemented by" is the argument, not a li
 |---|---|---|---|
 | N1 | A snapshot records the last included index and term, and the configuration at that point | `types::SnapshotMeta` | `restoring_a_snapshot_replaces_the_log_and_answers_from_its_metadata` |
 | N2 | Discarded entries are still answerable for the term at the boundary, which the consistency check needs | `storage::MemStorage::term`, `log::RaftLog::term` | `compaction_keeps_the_term_at_the_boundary_and_loses_everything_below` |
-| N3 | A leader sends `InstallSnapshot` when the entries a follower needs have been compacted | TBD (step 5) | TBD (step 5) |
-| N4 | A follower installing a snapshot discards its log and adopts the snapshot's state and configuration | `log::RaftLog::restore` | `a_snapshot_that_disagrees_with_the_log_replaces_it_entirely` |
-| N5 | A snapshot that the log has already passed, or that it already matches, is ignored | `log::RaftLog::should_restore` | `a_snapshot_the_log_has_already_passed_is_not_worth_installing`, `a_snapshot_the_log_already_matches_is_not_worth_installing` |
+| N3 | A leader sends `InstallSnapshot` when the entries a follower needs have been compacted | `snapshot::Raft::send_snapshot`, reached from `replication::Raft::{send_append, send_heartbeat}` | `a_compacted_leader_sends_a_snapshot_and_waits_for_it`, `a_snapshot_in_flight_is_not_counted_as_replicated` |
+| N4 | A follower installing a snapshot discards its log and adopts the snapshot's state and configuration | `snapshot::Raft::{handle_install_snapshot, restore}`, `log::RaftLog::restore` | `installing_a_snapshot_replaces_the_log_and_acknowledges_its_index`, `a_snapshot_discards_an_unpersisted_tail`, `a_snapshot_that_disagrees_with_the_log_replaces_it_entirely` |
+| N6 | After installing, the follower's position comes from the snapshot's metadata, and it refuses appends below it | `log::RaftLog::{last_index, term}` | `a_node_that_installed_a_snapshot_still_refuses_a_shorter_candidate`, `an_append_below_the_installed_snapshot_is_refused` |
+| N7 | A snapshot in flight is recorded but not counted as replicated; the follower acknowledges with an ordinary `AppendEntriesResponse` | `progress::Progress::become_snapshot`, `snapshot::Raft::handle_install_snapshot` | `a_snapshot_in_flight_is_not_counted_as_replicated`, `a_rejected_snapshot_returns_the_follower_to_probing` |
+| N5 | A snapshot that the log has already passed, or that it already matches, is ignored | `log::RaftLog::should_restore` | `a_snapshot_the_log_has_already_passed_is_not_worth_installing`, `a_snapshot_the_log_already_matches_is_not_worth_installing`, `a_snapshot_the_log_has_passed_is_acknowledged_but_not_installed`, `a_snapshot_at_the_end_of_the_index_space_is_refused` |
 
 ## 6. Beyond Figure 3.1
 
@@ -138,7 +140,7 @@ algorithm and into `Ready`'s documentation.
 | # | Rule | Implemented by | Tested by |
 |---|---|---|---|
 | D1 | Persist `hard_state` and `entries` before sending `messages` from the same `Ready` | `raw_node::Ready` (documentation), `testkit::Harness::drain_ready` (a driver that obeys it) | `the_ready_that_grants_a_vote_carries_the_vote_it_recorded`, `a_message_never_precedes_the_entries_it_depends_on`; violations are `esker-sim`'s to inject |
-| D2 | Apply `snapshot` before `entries` | `raw_node::RawNode::advance` | TBD (step 5) |
+| D2 | Apply `snapshot` before `entries` | `raw_node::RawNode::advance`, `testkit::Harness::drain_ready` | `a_snapshot_discards_an_unpersisted_tail`, `a_compacted_leader_sends_a_snapshot_and_waits_for_it` |
 | D3 | Apply `committed_entries` in order, exactly once | `raw_node::RawNode::{ready, advance}` | `committed_entries_are_durable_or_carried_alongside`, `nothing_is_offered_twice_after_advance` |
 | D4 | Answer a read only past its index | `readonly`, `raw_node::Ready::read_states` | the rule is the driver's; `testkit::Harness::drain_ready` records read states as a driver would, and `esker-sim` injects violations |
 | D5 | A `Ready` not advanced is re-offered unchanged | `raw_node::RawNode::ready` | `a_ready_that_is_not_advanced_is_offered_again` |

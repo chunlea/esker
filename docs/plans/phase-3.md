@@ -279,7 +279,7 @@ The orderings that break Raft implementations. Each is a named test in this lane
 - [x] step 2 — replication
 - [x] step 3 — Ready/advance, the election-safety proptest
 - [x] step 4 — ReadIndex
-- [ ] step 5 — compaction and InstallSnapshot
+- [x] step 5 — compaction and `InstallSnapshot`
 - [ ] step 6 — membership, learners, transfer, pre-vote, check-quorum
 - [ ] step 7 — `docs/raft-spec.md` closed
 

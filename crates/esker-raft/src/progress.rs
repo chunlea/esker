@@ -128,9 +128,9 @@ impl Progress {
         // index, so probing restarts from there rather than from scratch.
         if self.state == ProgressState::Snapshot {
             let pending = self.pending_snapshot;
-            self.next = self.matched.max(pending) + 1;
+            self.next = self.matched.max(pending).saturating_add(1);
         } else {
-            self.next = self.matched + 1;
+            self.next = self.matched.saturating_add(1);
         }
         self.state = ProgressState::Probe;
         self.pending_snapshot = 0;
@@ -141,7 +141,7 @@ impl Progress {
     /// Agreement is known; start pipelining.
     pub(crate) fn become_replicate(&mut self) {
         self.state = ProgressState::Replicate;
-        self.next = self.matched + 1;
+        self.next = self.matched.saturating_add(1);
         self.pending_snapshot = 0;
         self.probe_sent = false;
         self.inflights.reset();
@@ -163,7 +163,7 @@ impl Progress {
             self.matched = acked;
             self.probe_sent = false;
         }
-        self.next = self.next.max(acked + 1);
+        self.next = self.next.max(acked.saturating_add(1));
         advanced
     }
 
@@ -176,7 +176,13 @@ impl Progress {
     /// a stale rejection — one the leader has already backed off past — a no-op rather than a step
     /// backwards into work already done.
     pub(crate) fn maybe_decr_to(&mut self, probe: Index) -> bool {
-        let candidate = probe.max(self.matched + 1);
+        let candidate = probe.max(self.matched.saturating_add(1));
+        if self.state == ProgressState::Snapshot {
+            // The snapshot did not take. Nothing else was in flight, so start guessing again from
+            // whatever this follower does have.
+            self.become_probe();
+            return true;
+        }
         if self.state == ProgressState::Replicate {
             // A rejection in replicate mode means the leader's picture is wrong: the logs do not
             // agree where it thought they did. Guessing starts again.

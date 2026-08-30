@@ -88,7 +88,8 @@ impl<S: LogStorage> Raft<S> {
 
         let (Ok(prev_term), Ok(entries)) = (
             self.log.term(prev_index),
-            self.log.slice(next, last + 1, self.max_size_per_msg),
+            self.log
+                .slice(next, last.saturating_add(1), self.max_size_per_msg),
         ) else {
             // What this follower needs has been compacted away.
             return self.send_snapshot(to);
@@ -272,21 +273,34 @@ impl<S: LogStorage> Raft<S> {
         if self.role != Role::Leader || !self.progress.contains(from) {
             return Ok(());
         }
+        // A follower cannot hold more than this leader has sent it, so an index above the leader's
+        // own end is a lie or a bug. Clamping it here keeps one bad message from corrupting the
+        // progress map — and keeps the arithmetic below inside the index space.
+        let index = index.min(self.log.last_index()?);
         if let Some(progress) = self.progress.get_mut(from) {
             progress.recent_active = true;
         }
 
         if reject {
             let probe = if hint_term > 0 {
-                self.find_conflict_by_term(index, hint_term) + 1
+                self.find_conflict_by_term(index, hint_term)
+                    .saturating_add(1)
             } else {
-                index + 1
+                index.saturating_add(1)
             };
-            let moved = self
-                .progress
-                .get_mut(from)
-                .is_some_and(|progress| progress.maybe_decr_to(probe));
-            if moved {
+            let mut retry = false;
+            if let Some(progress) = self.progress.get_mut(from) {
+                progress.maybe_decr_to(probe);
+                // The outstanding probe has been answered, so another is allowed — whether or not
+                // the hint moved `next`. A rejection that moves nothing means the leader is
+                // already probing as far back as it can, and since index 0 matches every log,
+                // that can only mean its own log has been compacted past what this follower
+                // holds. The retry is what discovers that and turns into a snapshot; without it
+                // the follower is heartbeated forever and never actually repaired.
+                progress.probe_sent = false;
+                retry = !progress.is_paused();
+            }
+            if retry {
                 tracing::debug!(
                     id = self.id,
                     follower = from,
@@ -375,22 +389,6 @@ impl<S: LogStorage> Raft<S> {
         // read was waiting for.
         self.flush_postponed_reads()?;
         Ok(true)
-    }
-}
-
-// The seam replication leans on that belongs to a later step. It is reachable only through a
-// feature that step introduces — a snapshot needs a compaction — so until then it is quiet by
-// construction rather than by accident.
-impl<S: LogStorage> Raft<S> {
-    /// TODO(step-5): send an `InstallSnapshot` to a follower whose entries have been compacted.
-    #[allow(clippy::unnecessary_wraps)]
-    fn send_snapshot(&mut self, to: NodeId) -> Result<()> {
-        tracing::warn!(
-            id = self.id,
-            follower = to,
-            "a follower needs entries that have been compacted; snapshots land in step 5"
-        );
-        Ok(())
     }
 }
 

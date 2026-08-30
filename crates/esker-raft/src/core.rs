@@ -469,8 +469,21 @@ impl<S: LogStorage> Raft<S> {
                 self.handle_read_index_response(index, ctx);
                 Ok(())
             }
-            other => {
-                // TODO(step-5..6): snapshots and leadership transfer.
+            Message::InstallSnapshot {
+                from,
+                term,
+                snapshot,
+                ..
+            } => {
+                // A candidate that hears from a leader of its own term concedes, exactly as it
+                // does for an append — a snapshot is an append that could not be expressed as one.
+                if matches!(self.role, Role::Candidate | Role::PreCandidate) {
+                    self.become_follower(term, Some(from));
+                }
+                self.handle_install_snapshot(from, snapshot)
+            }
+            other @ Message::TimeoutNow { .. } => {
+                // TODO(step-6): leadership transfer.
                 tracing::trace!(
                     id = self.id,
                     term = self.term,
