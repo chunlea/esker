@@ -301,6 +301,13 @@ impl Store {
     /// and for the same reason. A tick that is late because the process was busy is skipped
     /// rather than replayed: `MissedTickBehavior::Delay` would make a stalled store send a burst
     /// of identical heartbeats the moment it recovered.
+    ///
+    /// The round itself runs on a **blocking thread**. [`PdClient`] is synchronous, like
+    /// everything else in this store that is not the network edge, so a round that ran on the
+    /// reactor would hold a worker for a network round trip to the placement driver — and a
+    /// placement driver that had gone away would hold it for the whole timeout, every ten
+    /// seconds, on every store. The schedule travels into the closure and back out, because it
+    /// is the state that must survive the round.
     fn spawn_heartbeats(self: &Arc<Self>, pd: Arc<dyn PdClient>, tick: std::time::Duration) {
         let store = Arc::downgrade(self);
         let store_id = self.store_id;
@@ -310,12 +317,23 @@ impl Store {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
+                // A weak reference, so a dropped store ends this task rather than keeping
+                // itself alive through the schedule that reports it.
                 let Some(store) = store.upgrade() else {
                     return;
                 };
                 let report = store.report();
                 drop(store);
-                beats.tick(&report);
+                beats = match tokio::task::spawn_blocking(move || {
+                    beats.tick(&report);
+                    beats
+                })
+                .await
+                {
+                    Ok(beats) => beats,
+                    // The blocking pool is shutting down, which means the process is.
+                    Err(_) => return,
+                };
             }
         });
         if let Ok(mut slot) = self.heartbeats.lock() {
