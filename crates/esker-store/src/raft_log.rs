@@ -163,7 +163,18 @@ fn corrupt(error: &esker_proto::DecodeError) -> StoreError {
 pub struct PersistedState {
     /// Term, vote and commit index — Raft's persistent state.
     pub hard_state: HardState,
-    /// The membership as of the last entry in the log.
+    /// The membership as of `truncated_index` — the index the log begins after — which is what
+    /// [`esker_raft::InitialState::conf_state`] is specified to be.
+    ///
+    /// Not the membership *in force*, which is the tempting thing to keep: the core replays the
+    /// log's conf-change entries onto this one, so what it needs is a configuration that predates
+    /// the entries it still holds. Writing the current one instead would apply every change twice
+    /// and leave the core unable to tell which part of its membership is still revertible.
+    ///
+    /// Nothing writes this after `open`, and nothing has to while the log starts at index 1: the
+    /// membership the region was bootstrapped with *is* the membership as of index 0, and the
+    /// entries say the rest. That stops being true the moment the log is truncated — see the
+    /// `TODO(phase-4)` on [`RaftLogStorage::snapshot`].
     pub conf_state: ConfState,
     /// The highest index the state machine has applied, written with the data it applied.
     pub applied_index: Index,
@@ -506,6 +517,12 @@ impl LogStorage for RaftLogStorage {
         // TODO(phase-4): build a snapshot from `engine.checkpoint(range)` and stream it
         // (`docs/DESIGN.md` §6). A single region that never compacts its log never needs one, so
         // 3e reports "nothing compacted" rather than pretending.
+        //
+        // Whatever truncates the log has to move `PersistedState::conf_state` with it, in the
+        // same batch: it is the membership as of the index the log begins after, and the entries
+        // that established it are the ones truncation throws away. `SnapshotMeta::conf` is the
+        // same value and must come from the same derivation — the core prefers it, precisely
+        // because a snapshot names the index its membership is as of.
         Ok(Snapshot::default())
     }
 }
@@ -516,7 +533,10 @@ mod tests {
 
     use bytes::Bytes;
     use esker_engine::{Db, LocalFileSystem, Options, WalSyncMode, WriteBatch, WriteOptions, cf};
-    use esker_raft::{ConfState, Entry, EntryKind, HardState, LogStorage, RaftError};
+    use esker_raft::{
+        ConfChange, ConfChangeKind, ConfState, Config, Entry, EntryKind, HardState, LogStorage,
+        RaftError, RawNode,
+    };
 
     use super::{
         LOG_KEY_LEN, PersistedState, REGION_KEY_LEN, RaftLogStorage, decode_entry, encode_entry,
@@ -774,6 +794,51 @@ mod tests {
         assert_eq!(
             reopened.initial_state().unwrap().conf_state.voters,
             vec![1, 2, 3]
+        );
+    }
+
+    /// **What a restart recovers the membership from.** The store keeps the configuration as of
+    /// the index the log begins after, and the core replays the log's conf-change entries onto it
+    /// — so a peer comes back with the membership its own log establishes, without this layer
+    /// keeping a second copy of it in step with the entries.
+    ///
+    /// Before that rule this record was documented as the membership as of the *last* entry, and
+    /// nothing here ever wrote it: a peer restarted with the configuration it was bootstrapped
+    /// with and lost every change that had been made since. It recovers them now because they are
+    /// in the log, which is where they always were.
+    #[test]
+    fn a_restart_recovers_the_membership_from_the_log() {
+        let (_dir, db, mut log) = open_log();
+        let mut ready = entries(&[(1, 1)]);
+        ready.push(Entry::conf_change(
+            1,
+            2,
+            &ConfChange::new(ConfChangeKind::AddVoter, 4),
+        ));
+        ready.push(Entry::empty(1, 3));
+        append(
+            &db,
+            &mut log,
+            &ready,
+            Some(HardState {
+                term: 1,
+                voted_for: None,
+                commit: 3,
+            }),
+        );
+
+        let reopened = RaftLogStorage::open(Arc::clone(&db), 7, ConfState::default()).unwrap();
+        assert_eq!(
+            reopened.initial_state().unwrap().conf_state.voters,
+            vec![1, 2, 3],
+            "what is on disk is the anchor: the membership as of index 0"
+        );
+
+        let node = RawNode::new(Config::new(1, vec![1, 2, 3], 41), reopened).unwrap();
+        assert_eq!(
+            node.status().conf.voters,
+            vec![1, 2, 3, 4],
+            "and index 2 is what makes 4 a member of it"
         );
     }
 
