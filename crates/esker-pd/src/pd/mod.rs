@@ -46,7 +46,9 @@ use crate::clock::{Clock, SystemClock};
 use crate::error::{PdError, Result};
 use crate::keys;
 use crate::operator::InFlight;
-use crate::record::{AllocRecord, ClusterRecord, RegionRecord, StoreRecord, TsoRecord};
+use crate::record::{
+    AllocRecord, ClusterRecord, HistoryRecord, OperatorEvent, RegionRecord, StoreRecord, TsoRecord,
+};
 use crate::routing::{self, RegionBeat, StoreBeat, Upsert};
 use crate::schedule;
 use crate::tso::Oracle;
@@ -220,6 +222,11 @@ pub(crate) struct State {
     /// reconciling a remembered plan with a cluster that moved on while PD was down, which is
     /// strictly harder than recomputing.
     pub(crate) in_flight: BTreeMap<u64, InFlight>,
+    /// The last few things PD asked for, mirrored to disk on every change.
+    ///
+    /// Held here as well as on disk so that appending is a push rather than a read-modify-write
+    /// of the whole ring, and so that [`Pd::history`] answers without touching the engine.
+    pub(crate) history: HistoryRecord,
     /// When each region becomes eligible for a *balance* move again, by region id.
     ///
     /// Memory, like the in-flight set: a restart forgets it, and the worst that costs is one
@@ -254,6 +261,10 @@ impl Pd {
         let mark = read(&db, &keys::tso_key())?
             .map(|bytes| TsoRecord::decode(&bytes))
             .transpose()?;
+        let history = read(&db, &keys::history_key())?
+            .map(|bytes| HistoryRecord::decode(&bytes))
+            .transpose()?
+            .unwrap_or_default();
         // `max(clock, mark)`, the restart rule, is inside `Oracle::load`.
         let oracle = Oracle::load(mark, options.clock.now_ms(), options.tso_save_interval_ms);
 
@@ -272,6 +283,7 @@ impl Pd {
                 oracle,
                 in_flight: BTreeMap::new(),
                 cooling: BTreeMap::new(),
+                history,
             }),
         }))
     }
@@ -530,6 +542,26 @@ impl Pd {
             },
             operator,
         })
+    }
+
+    /// The last few things PD asked for, oldest first.
+    ///
+    /// A debugging record: no decision reads it, and losing it costs an explanation rather than
+    /// a repair ([`crate::record::HistoryRecord`]).
+    pub fn history(&self) -> Result<Vec<OperatorEvent>> {
+        Ok(self.lock()?.history.events.clone())
+    }
+
+    /// Appends one event to the history, on disk and in memory.
+    ///
+    /// Called with the lock held. The write is durable like every other write PD makes, which
+    /// costs one small `fsync` per operator transition — a handful per region per repair, and
+    /// the price of being able to answer "what did PD do" after the process is gone.
+    pub(crate) fn record_event(&self, state: &mut State, event: OperatorEvent) -> Result<()> {
+        state.history.push(event);
+        let mut batch = WriteBatch::new();
+        batch.put(self.cf, &keys::history_key(), &state.history.encode());
+        self.write(batch)
     }
 
     /// Every region PD knows about, in id order.

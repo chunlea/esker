@@ -9,6 +9,7 @@
 //! ```text
 //! 'm' 'c'                        cluster record: the cluster id, minted once
 //! 'm' 'a'                        allocator record: the end of the reserved id batch
+//! 'm' 'h'                        operator history: the last few things PD asked for
 //! 'm' 'k' ++ tag:u8 ++ end_key   range index:     which region ends here
 //! 'm' 'r' ++ region_id:u64 BE    region record:   the Region, the leader hint, the last beat
 //! 'm' 's' ++ store_id:u64 BE     store record:    address, stats, the last beat
@@ -45,6 +46,8 @@ pub const PREFIX: u8 = b'm';
 pub const CLUSTER: u8 = b'c';
 /// Second byte of the allocator record's key.
 pub const ALLOC: u8 = b'a';
+/// Second byte of the operator history's key.
+pub const HISTORY: u8 = b'h';
 /// Second byte of the range index's keys.
 pub const RANGE: u8 = b'k';
 /// Second byte of a region record's key.
@@ -74,6 +77,12 @@ pub fn cluster_key() -> [u8; 2] {
 #[must_use]
 pub fn alloc_key() -> [u8; 2] {
     [PREFIX, ALLOC]
+}
+
+/// `'m' 'h'` — the operator history.
+#[must_use]
+pub fn history_key() -> [u8; 2] {
+    [PREFIX, HISTORY]
 }
 
 /// `'m' 't'` — the oracle's high-water mark.
@@ -170,15 +179,15 @@ pub fn end_key_in_range_key(key: &[u8]) -> Option<Option<&[u8]>> {
 mod tests {
     use super::{
         ID_KEY_LEN, RANGE, REGION, STORE, TAG_BOUNDED, TAG_UNBOUNDED, alloc_key, cluster_key,
-        end_key_in_range_key, id_in_key, prefix, range_key, range_seek_key, region_key, store_key,
-        tso_key,
+        end_key_in_range_key, history_key, id_in_key, prefix, range_key, range_seek_key,
+        region_key, store_key, tso_key,
     };
 
     /// Every key in this space is distinct from every other, and none is a prefix of another
     /// kind's. Two records sharing a key is a corruption that no checksum can see.
     #[test]
     fn the_singleton_keys_are_distinct() {
-        let keys = [cluster_key(), alloc_key(), tso_key()];
+        let keys = [cluster_key(), alloc_key(), tso_key(), history_key()];
         let unique: std::collections::BTreeSet<[u8; 2]> = keys.into_iter().collect();
         assert_eq!(unique.len(), keys.len());
         for key in keys {

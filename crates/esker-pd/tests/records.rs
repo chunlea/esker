@@ -13,8 +13,8 @@
 use bytes::Bytes;
 use esker_pd::keys;
 use esker_pd::record::{
-    AllocRecord, ClusterRecord, RegionRecord, StoreRecord, StoreStats, TsoRecord,
-    decode_range_entry, encode_range_entry,
+    AllocRecord, ClusterRecord, EventKind, EventOutcome, HistoryRecord, OperatorEvent,
+    RegionRecord, StoreRecord, StoreStats, TsoRecord, decode_range_entry, encode_range_entry,
 };
 use esker_proto::{Epoch, Peer, PeerRole, Region};
 
@@ -80,6 +80,55 @@ fn region_full() -> RegionRecord {
     }
 }
 
+/// The four events the golden pins: one of each outcome, and three of the four operator kinds.
+fn history() -> HistoryRecord {
+    let mut history = HistoryRecord::default();
+    for (at_ms, region_id, kind, outcome, store_id, peer_id) in [
+        (
+            1_700_000_000_000,
+            7,
+            EventKind::AddPeer,
+            EventOutcome::Issued,
+            4,
+            41,
+        ),
+        (
+            1_700_000_060_000,
+            7,
+            EventKind::AddPeer,
+            EventOutcome::Done,
+            4,
+            41,
+        ),
+        (
+            1_700_000_120_000,
+            7,
+            EventKind::RemovePeer,
+            EventOutcome::Cancelled,
+            0,
+            30,
+        ),
+        (
+            1_700_000_180_000,
+            9,
+            EventKind::TransferLeader,
+            EventOutcome::TimedOut,
+            0,
+            90,
+        ),
+    ] {
+        history.push(OperatorEvent {
+            at_ms,
+            region_id,
+            kind,
+            outcome,
+            store_id,
+            peer_id,
+        });
+    }
+    history
+}
+
 #[test]
 fn every_record_matches_its_golden_bytes() {
     let cluster = ClusterRecord {
@@ -111,6 +160,7 @@ fn every_record_matches_its_golden_bytes() {
         golden("record", "region-full")
     );
     assert_eq!(hex(&encode_range_entry(7)), golden("record", "range-entry"));
+    assert_eq!(hex(&history().encode()), golden("record", "history"));
 }
 
 /// The bytes in the file must also *decode*, or the golden would only prove that two encoders
@@ -148,6 +198,7 @@ fn the_golden_bytes_decode_to_the_records_that_made_them() {
         RegionRecord::new(Region::bootstrap(1, 1, 1), 0)
     );
     assert_eq!(decode_range_entry(&bytes("range-entry")).unwrap(), 7);
+    assert_eq!(HistoryRecord::decode(&bytes("history")).unwrap(), history());
 }
 
 /// A key layout that drifts does not fail loudly: it stops finding records that are already

@@ -18,9 +18,30 @@ use super::{Pd, State, persist_alloc};
 use crate::balance::{self, Balance};
 use crate::error::Result;
 use crate::operator::{InFlight, Observed};
-use crate::record::RegionRecord;
+use crate::record::{EventKind, EventOutcome, OperatorEvent, RegionRecord};
 use crate::routing;
 use crate::schedule::{self, Cluster, LoadDelta, Repair};
+
+/// One line of the history, from an operator and what became of it.
+fn event_of(operator: &Operator, outcome: EventOutcome, at_ms: u64) -> OperatorEvent {
+    let (kind, store_id, peer_id) = match operator {
+        Operator::AddPeer {
+            store_id, peer_id, ..
+        } => (EventKind::AddPeer, *store_id, *peer_id),
+        // `RemovePeer` names a peer and not a store, because the store it is sent to needs only
+        // the peer id. The history says nothing PD does not have on the wire.
+        Operator::RemovePeer { peer_id, .. } => (EventKind::RemovePeer, 0, *peer_id),
+        Operator::TransferLeader { to_peer_id, .. } => (EventKind::TransferLeader, 0, *to_peer_id),
+    };
+    OperatorEvent {
+        at_ms,
+        region_id: operator.region_id(),
+        kind,
+        outcome,
+        store_id,
+        peer_id,
+    }
+}
 
 /// What the operator already in flight for a region means for this heartbeat.
 #[derive(Debug)]
@@ -58,7 +79,7 @@ impl Pd {
         record: &RegionRecord,
         now_ms: u64,
     ) -> Result<Option<Operator>> {
-        if let Waiting(answer) = self.observe_in_flight(state, record, now_ms) {
+        if let Waiting(answer) = self.observe_in_flight(state, record, now_ms)? {
             return Ok(answer);
         }
 
@@ -85,15 +106,20 @@ impl Pd {
     /// [`Waiting`] means the operator lives on and carries what to send — which is `None` when
     /// the store has demonstrably started, because it has the work and asking again would only
     /// earn a refusal. [`Free`] means the region has no operator and may be decided afresh.
-    fn observe_in_flight(&self, state: &mut State, record: &RegionRecord, now_ms: u64) -> Step {
+    fn observe_in_flight(
+        &self,
+        state: &mut State,
+        record: &RegionRecord,
+        now_ms: u64,
+    ) -> Result<Step> {
         let region_id = record.region.id;
         let Some(flight) = state.in_flight.get_mut(&region_id) else {
-            return Free;
+            return Ok(Free);
         };
 
-        match flight.observe(record, now_ms, self.operator_timeout_ms) {
+        let outcome = match flight.observe(record, now_ms, self.operator_timeout_ms) {
             Observed::Pending(progress) => {
-                return Waiting(flight.advance(progress, now_ms).cloned());
+                return Ok(Waiting(flight.advance(progress, now_ms).cloned()));
             }
             Observed::Done => {
                 tracing::info!(
@@ -101,6 +127,7 @@ impl Pd {
                     operator = flight.operator.name(),
                     "operator done"
                 );
+                EventOutcome::Done
             }
             Observed::Cancelled(why) => {
                 tracing::info!(
@@ -109,6 +136,7 @@ impl Pd {
                     why = why.name(),
                     "operator cancelled"
                 );
+                EventOutcome::Cancelled
             }
             Observed::TimedOut => {
                 tracing::warn!(
@@ -117,8 +145,10 @@ impl Pd {
                     sends = flight.sends,
                     "operator timed out with nothing observed; it will be re-derived"
                 );
+                EventOutcome::TimedOut
             }
-        }
+        };
+        let event = event_of(&flight.operator, outcome, now_ms);
         // Every outcome but `Pending` finishes the operator. Dropping it here is what lets the
         // rules issue a replacement on this same heartbeat rather than the next.
         state.in_flight.remove(&region_id);
@@ -127,7 +157,8 @@ impl Pd {
         state
             .cooling
             .insert(region_id, now_ms.saturating_add(self.balance_cooldown_ms));
-        Free
+        self.record_event(state, event)?;
+        Ok(Free)
     }
 
     /// What this region needs, if anything.
@@ -247,6 +278,7 @@ impl Pd {
 
         let region_id = record.region.id;
         tracing::info!(region_id, operator = operator.name(), "operator issued");
+        self.record_event(state, event_of(&operator, EventOutcome::Issued, now_ms))?;
         state
             .in_flight
             .insert(region_id, InFlight::new(operator.clone(), now_ms, load));

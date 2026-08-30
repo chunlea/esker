@@ -30,6 +30,9 @@ esker-pd.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros"] }
 
 [dev-dependencies]
+# `pd inspect`'s tests drive a clock by hand rather than sleeping, the same way `esker-pd`'s
+# own tests do. Dev-only: the feature exposes a test clock and nothing else.
+esker-pd = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 # `raw` and `bench --remote` are tested against a real server on a real socket, because a mock
 # would leave out exactly the layers those two commands exist to exercise. Dev-only.

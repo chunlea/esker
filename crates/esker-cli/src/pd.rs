@@ -135,6 +135,31 @@ async fn shutdown_signal() {
     }
 }
 
+/// Prints what PD has asked the cluster to do.
+///
+/// The in-flight set is memory and is gone with the process
+/// (`docs/adr/0013-repair-operators-are-requests-not-commands.md`), so this ring is the only
+/// thing that can answer "why is my cluster shaped like this" after the fact.
+fn print_history(pd: &Pd, out: &mut impl std::io::Write) -> Result<(), String> {
+    let write = |error: std::io::Error| format!("writing: {error}");
+    let history = pd.history().map_err(|error| error.to_string())?;
+    writeln!(out, "\noperator history ({})", history.len()).map_err(write)?;
+    for event in &history {
+        writeln!(
+            out,
+            "  {:>14} ms  region {:<5} {:<15} {:<10} store {:<4} peer {}",
+            event.at_ms,
+            event.region_id,
+            event.kind.name(),
+            event.outcome.name(),
+            event.store_id,
+            event.peer_id,
+        )
+        .map_err(write)?;
+    }
+    Ok(())
+}
+
 /// Prints PD's whole state: the cluster, the allocator, the oracle's mark, every store and
 /// every region.
 ///
@@ -224,6 +249,8 @@ pub(crate) fn inspect(
         }
     }
 
+    print_history(&pd, out)?;
+
     // The index is what a lookup actually walks, so a disagreement between it and the records
     // is the failure that would make routing wrong while everything above still looked right.
     let index = esker_pd::routing::range_index(pd.db()).map_err(|error| error.to_string())?;
@@ -300,7 +327,86 @@ mod tests {
         assert!(text.contains("regions (1)"), "{text}");
         assert!(text.contains("[, +inf)"), "the unbounded region: {text}");
         assert!(text.contains("range index (1)"), "{text}");
+        assert!(text.contains("operator history (0)"), "{text}");
         assert!(!text.contains("WARNING"), "{text}");
+    }
+
+    /// The history is the whole reason `pd inspect` is useful after a repair: the in-flight set
+    /// is memory and is gone with the process, so without this a stopped PD could not say what
+    /// it had asked the cluster to do.
+    #[test]
+    fn inspect_prints_what_pd_asked_the_cluster_to_do() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            // A clock driven by hand, so "store 3 has been quiet for a minute" is a fact rather
+            // than a race with the test's own scheduling.
+            let clock = Arc::new(esker_pd::clock::TestClock::new(1_700_000_000_000));
+            let pd = esker_pd::Pd::open(
+                dir.path(),
+                esker_pd::PdOptions::with_clock(Arc::clone(&clock) as Arc<dyn esker_pd::Clock>),
+            )
+            .unwrap();
+            for store_id in 1..=4 {
+                pd.bootstrap(store_id, &format!("127.0.0.1:{store_id}"))
+                    .unwrap();
+            }
+            let region = esker_proto::Region {
+                id: 1,
+                start_key: bytes::Bytes::new(),
+                end_key: bytes::Bytes::new(),
+                peers: vec![
+                    esker_proto::Peer::voter(1, 10),
+                    esker_proto::Peer::voter(2, 20),
+                    esker_proto::Peer::voter(3, 30),
+                ],
+                epoch: esker_proto::Epoch::new(1, 1),
+            };
+            let beat = |region: esker_proto::Region| esker_pd::RegionBeat {
+                region,
+                leader_peer_id: 10,
+                term: 4,
+                approximate_size: 0,
+                applied_index: 0,
+            };
+            assert_eq!(
+                pd.region_heartbeat(&beat(region.clone())).unwrap().operator,
+                None,
+                "nothing is wrong yet"
+            );
+            assert!(pd.history().unwrap().is_empty());
+
+            // Store 3 goes quiet; the others keep beating.
+            clock.advance(esker_pd::pd::MAX_STORE_DOWN_TIME_MS + 1);
+            for store_id in [1, 2, 4] {
+                pd.store_heartbeat(&esker_pd::StoreBeat {
+                    store_id,
+                    stats: esker_pd::StoreStats::default(),
+                })
+                .unwrap();
+            }
+            assert!(
+                pd.region_heartbeat(&beat(region))
+                    .unwrap()
+                    .operator
+                    .is_some(),
+                "store 3 is down and the region is short a replica"
+            );
+        }
+
+        let mut out = Vec::new();
+        inspect(
+            &InspectOptions {
+                data_dir: dir.path().to_path_buf(),
+            },
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("operator history (1)"), "{text}");
+        assert!(text.contains("AddPeer"), "{text}");
+        assert!(text.contains("issued"), "{text}");
     }
 
     /// A PD nothing has bootstrapped says so rather than printing a cluster id of zero.

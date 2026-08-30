@@ -308,6 +308,198 @@ impl RegionRecord {
     }
 }
 
+/// What PD did about one operator, one line at a time (*fixed*, version 1).
+///
+/// The in-flight set is memory — a restart forgets it, deliberately
+/// ([ADR 0013](../../docs/adr/0013-repair-operators-are-requests-not-commands.md)) — which
+/// leaves "what did PD do to my cluster, and why is it shaped like this" a question nothing
+/// could answer after the fact. This is that answer: a bounded ring of the last
+/// [`HISTORY_CAPACITY`] events, on disk, so `esker pd inspect` can show it for a PD that is not
+/// even running.
+///
+/// It is a **debugging record and nothing more**. No decision reads it; losing it costs an
+/// explanation, never a repair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperatorEvent {
+    /// When it happened, on PD's clock.
+    pub at_ms: u64,
+    /// The region it was about.
+    pub region_id: u64,
+    /// Which operator.
+    pub kind: EventKind,
+    /// What happened to it.
+    pub outcome: EventOutcome,
+    /// The store it named — where a replica was going or leaving, or taking office.
+    pub store_id: u64,
+    /// The peer it named.
+    pub peer_id: u64,
+}
+
+/// Which operator an [`OperatorEvent`] is about (*fixed*). Zero is reserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum EventKind {
+    /// `AddPeer`.
+    AddPeer = 1,
+    /// `RemovePeer`.
+    RemovePeer = 2,
+    /// `TransferLeader`.
+    TransferLeader = 3,
+}
+
+/// What became of it (*fixed*). Zero is reserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum EventOutcome {
+    /// PD asked for it.
+    Issued = 1,
+    /// A heartbeat showed it done.
+    Done = 2,
+    /// The region changed underneath it.
+    Cancelled = 3,
+    /// Nothing moved for the whole timeout.
+    TimedOut = 4,
+}
+
+impl EventKind {
+    /// The wire byte.
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// The kind for a byte, or `None` for one this version does not define.
+    #[must_use]
+    pub fn from_u8(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(Self::AddPeer),
+            2 => Some(Self::RemovePeer),
+            3 => Some(Self::TransferLeader),
+            _ => None,
+        }
+    }
+
+    /// The name a report prints.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::AddPeer => "AddPeer",
+            Self::RemovePeer => "RemovePeer",
+            Self::TransferLeader => "TransferLeader",
+        }
+    }
+}
+
+impl EventOutcome {
+    /// The wire byte.
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// The outcome for a byte, or `None` for one this version does not define.
+    #[must_use]
+    pub fn from_u8(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(Self::Issued),
+            2 => Some(Self::Done),
+            3 => Some(Self::Cancelled),
+            4 => Some(Self::TimedOut),
+            _ => None,
+        }
+    }
+
+    /// The name a report prints.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Issued => "issued",
+            Self::Done => "done",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed out",
+        }
+    }
+}
+
+/// Events the history keeps. Oldest dropped when it is full.
+///
+/// Sixty-four is a few minutes of a busy repair and several hours of a quiet cluster, and it
+/// keeps the whole ring in one record of a couple of kilobytes — which is why the ring is one
+/// record rather than one key per event: a bounded thing that is written whole cannot leak keys,
+/// and there is no cursor to keep.
+pub const HISTORY_CAPACITY: usize = 64;
+
+/// The ring of recent operator events.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistoryRecord {
+    /// Oldest first.
+    pub events: Vec<OperatorEvent>,
+}
+
+impl HistoryRecord {
+    /// Appends `event`, dropping the oldest if the ring is full.
+    pub fn push(&mut self, event: OperatorEvent) {
+        if self.events.len() >= HISTORY_CAPACITY {
+            let over = self.events.len() - HISTORY_CAPACITY + 1;
+            self.events.drain(..over);
+        }
+        self.events.push(event);
+    }
+
+    /// The record's bytes.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Encoder::new();
+        start(&mut out);
+        out.put_varint(self.events.len() as u64);
+        for event in &self.events {
+            out.put_varint(event.at_ms);
+            out.put_varint(event.region_id);
+            out.put_u8(event.kind.as_u8());
+            out.put_u8(event.outcome.as_u8());
+            out.put_varint(event.store_id);
+            out.put_varint(event.peer_id);
+        }
+        out.finish()
+    }
+
+    /// Reads the record back.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        const WHAT: &str = "history";
+        let mut input = open(WHAT, bytes)?;
+        let count = input.get_count("history.count").map_err(field(WHAT))?;
+        let mut events = Vec::with_capacity(count);
+        for _ in 0..count {
+            let at_ms = input.get_varint("event.at_ms").map_err(field(WHAT))?;
+            let region_id = input.get_varint("event.region_id").map_err(field(WHAT))?;
+            let kind = input.get_u8("event.kind").map_err(field(WHAT))?;
+            let outcome = input.get_u8("event.outcome").map_err(field(WHAT))?;
+            let Some(kind) = EventKind::from_u8(kind) else {
+                return Err(PdError::corrupt(WHAT, format!("operator kind {kind}")));
+            };
+            let Some(outcome) = EventOutcome::from_u8(outcome) else {
+                return Err(PdError::corrupt(WHAT, format!("outcome {outcome}")));
+            };
+            events.push(OperatorEvent {
+                at_ms,
+                region_id,
+                kind,
+                outcome,
+                store_id: input.get_varint("event.store_id").map_err(field(WHAT))?,
+                peer_id: input.get_varint("event.peer_id").map_err(field(WHAT))?,
+            });
+        }
+        close(WHAT, input)?;
+        if events.len() > HISTORY_CAPACITY {
+            return Err(PdError::corrupt(
+                WHAT,
+                format!("{} events, more than the ring holds", events.len()),
+            ));
+        }
+        Ok(Self { events })
+    }
+}
+
 /// The value of a range-index entry: which region ends at that key.
 #[must_use]
 pub fn encode_range_entry(region_id: u64) -> Vec<u8> {
@@ -516,6 +708,56 @@ mod tests {
                 let _ = StoreRecord::decode(short);
                 let _ = RegionRecord::decode(short);
                 let _ = decode_range_entry(short);
+            }
+        }
+    }
+
+    fn event(region_id: u64, outcome: super::EventOutcome) -> super::OperatorEvent {
+        super::OperatorEvent {
+            at_ms: 1_700_000_000_000,
+            region_id,
+            kind: super::EventKind::AddPeer,
+            outcome,
+            store_id: 4,
+            peer_id: 41,
+        }
+    }
+
+    #[test]
+    fn the_history_round_trips_and_keeps_the_newest() {
+        let mut history = super::HistoryRecord::default();
+        for region_id in 0..u64::try_from(super::HISTORY_CAPACITY).unwrap() + 10 {
+            history.push(event(region_id, super::EventOutcome::Issued));
+        }
+        assert_eq!(history.events.len(), super::HISTORY_CAPACITY);
+        assert_eq!(
+            history.events[0].region_id, 10,
+            "the ring dropped from the front"
+        );
+        assert_eq!(
+            super::HistoryRecord::decode(&history.encode()).unwrap(),
+            history
+        );
+    }
+
+    /// A kind or an outcome this version does not define is an error, not a default — the same
+    /// rule every tag in this codebase follows.
+    #[test]
+    fn an_unknown_kind_or_outcome_is_refused() {
+        let mut history = super::HistoryRecord::default();
+        history.push(event(7, super::EventOutcome::Done));
+        let good = history.encode();
+        // version ++ count ++ at_ms(6) ++ region_id(1) ++ kind ++ outcome
+        let kind_at = good.len() - 4;
+        assert_eq!(good[kind_at], super::EventKind::AddPeer.as_u8());
+        for byte in [0u8, 4, 200] {
+            let mut bytes = good.clone();
+            bytes[kind_at] = byte;
+            assert!(super::HistoryRecord::decode(&bytes).is_err(), "kind {byte}");
+            let mut bytes = good.clone();
+            bytes[kind_at + 1] = byte.wrapping_add(u8::from(byte == 4));
+            if super::EventOutcome::from_u8(bytes[kind_at + 1]).is_none() {
+                assert!(super::HistoryRecord::decode(&bytes).is_err());
             }
         }
     }
