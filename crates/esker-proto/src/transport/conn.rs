@@ -73,6 +73,21 @@ impl FrameSink {
         self.max_frame_size
     }
 
+    /// The same sink, narrowed to whichever limit is smaller.
+    ///
+    /// A client narrows its sink to the peer's advertised `max_frame_size` once the handshake
+    /// has said what that is. An oversized request then fails *here*, before a byte goes out,
+    /// rather than being refused by the peer's frame reader — which cannot answer it, because a
+    /// bad length means the reader no longer knows where the next frame starts, so it closes
+    /// the connection and every other request on it. Narrowing turns a lost connection into one
+    /// refused call.
+    ///
+    /// Only the sending side narrows. What this end will *accept* stays its own configuration.
+    pub(crate) fn narrowed_to(mut self, limit: usize) -> Self {
+        self.max_frame_size = self.max_frame_size.min(limit);
+        self
+    }
+
     /// Whether the writer task has stopped, which means the connection is finished.
     pub(crate) fn is_closed(&self) -> bool {
         self.frames.is_closed()

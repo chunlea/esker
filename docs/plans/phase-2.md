@@ -410,27 +410,31 @@ and `tokio-macros`, which ADR 0003 anticipated); 3 golden files
 11. **The engine refuses `DeleteRange`** (`Db::write` → `Error::Unsupported`), on a one-time grant
     to touch phase-1 code. See §9.2.
 
-### 9.3 Open, and whose it is: the client does not adopt the server's frame limit
+### 9.3 The client adopts the server's frame limit
 
-`HelloAck` carries the server's `max_frame_size` precisely so a client can refuse an oversized
-request locally instead of spending a round trip discovering it. Nothing adopts it.
-`Transport::max_frame_size` — `crates/esker-proto/src/transport/client.rs`, `TcpTransport`'s impl —
-returns `self.shared.sink.max_frame_size()`, which is the client's *own* configured limit, and
-`esker-client` checks request sizes against that. A client configured more generously than its
-server therefore passes its own check, sends the frame, and gets a framing refusal that closes the
-connection.
+`HelloAck` carries the server's `max_frame_size` so a client can refuse an oversized request
+locally instead of spending a round trip discovering it. For most of the phase nothing adopted it:
+`Transport::max_frame_size` returned the client's own configured limit, so a client configured more
+generously than its server passed its own check, sent the frame, and got a framing refusal.
 
-It is a wasted round trip, never a wrong answer, and it only arises when the two ends are
-configured differently — which no default configuration does. Documented in `docs/DESIGN.md` §9
-rather than fixed, because this wrap-up unit is documentation only.
+**Landed.** `TcpTransport::connect_with` narrows its sending sink to the advertised limit once the
+handshake has reported it (`FrameSink::narrowed_to`), so `call`, `call_stream` and
+`Transport::max_frame_size` all honour it without a second check anywhere. Only the *sending* side
+narrows — what this end will accept stays its own configuration.
 
-**The fix is one line and it is in this lane's file, not the client's** (the assignment note had it
-the other way round): `TcpTransport::max_frame_size` should return
-`self.shared.sink.max_frame_size().min(self.shared.ack.max_frame_size as usize)`. `esker-client`'s
-existing check then becomes correct with no change on its side, and
-`an_oversized_frame_is_refused_and_the_server_survives` in `crates/esker-store/tests/server.rs`
-would need its generous client to bypass the check to keep testing the server's refusal. Left for
-whoever the coordinator assigns it to.
+What the fix is really about is which failure the caller gets, not a saved round trip. A frame the
+peer will not accept cannot be *answered* by the peer: a bad length leaves its frame reader unable
+to say where the next frame begins, so it closes the connection and fails every other request on
+it. Narrowing turns one caller's mistake into one refused call — `NotApplied`, connection intact —
+instead of a connection-wide failure whose outcome is ambiguous for everyone else in flight.
+
+Two tests, because the fix does not remove the need for the old behaviour to work:
+`a_client_adopts_the_limit_its_server_advertised` (`crates/esker-proto/tests/loopback.rs`) pins the
+narrowing and that the connection survives it, and
+`an_oversized_frame_is_refused_and_the_server_survives`
+(`crates/esker-store/tests/server.rs`) now has two halves — the client refusing locally, and a
+hand-rolled peer that ignores the advertised limit still being refused by the server's reader
+without taking the server with it.
 
 ### 9.1 Frame kinds stay 1-based, against the brief's 0-based numbering
 

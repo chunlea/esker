@@ -16,8 +16,8 @@ use bytes::Bytes;
 use esker_proto::messages::Hello;
 use esker_proto::{
     Epoch, Frame, FrameDecoder, FrameKind, MAX_FRAME_SIZE, ProtoError, RawKvReq, RawKvResp,
-    Request, RequestHeader, Server, ServerHandle, TcpTransport, Transport, TransportConfig,
-    WIRE_VERSION,
+    Request, RequestHeader, RequestOutcome, Server, ServerHandle, TcpTransport, Transport,
+    TransportConfig, WIRE_VERSION,
 };
 use esker_store::{Store, StoreOptions, StoreService};
 use tempfile::TempDir;
@@ -279,8 +279,15 @@ async fn a_request_for_another_region_is_refused() {
     running.handle.shutdown().await.unwrap();
 }
 
-/// A frame larger than the server accepts is refused, and the refusal does not take the server
-/// with it: another client connects and works immediately afterwards.
+/// A frame larger than the server accepts never reaches it, and one that arrives anyway is
+/// refused without taking the server down.
+///
+/// Two halves, because the fix for the first does not remove the need for the second. Since the
+/// handshake reports the server's `max_frame_size`, a client narrows its own sending limit to it
+/// and refuses an oversized request locally — one failed call, connection intact. A peer that did
+/// not (an older build, a hostile one) still gets its frame refused by the reader, which cannot
+/// answer it: a bad length means the reader no longer knows where the next frame begins, so it
+/// closes the connection rather than guessing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_oversized_frame_is_refused_and_the_server_survives() {
     let small = TransportConfig {
@@ -291,20 +298,63 @@ async fn an_oversized_frame_is_refused_and_the_server_survives() {
     let running = start_at(dir.path(), small).await;
     let address = running.handle.local_addr();
 
-    // A client whose own limit is the default, so it will happily send what the server refuses.
+    // A client whose *own* limit is the 16 MiB default, so only the handshake stops it.
     let generous = TcpTransport::connect_with(address, TransportConfig::new())
         .await
         .unwrap();
+    assert_eq!(
+        generous.max_frame_size(),
+        64 * 1024,
+        "the client did not adopt the limit the server advertised"
+    );
+
     let huge = RawKvReq::put(&b"k"[..], Bytes::from(vec![b'v'; 256 * 1024]));
     let error = call(&generous, huge)
         .await
-        .expect_err("the server accepted an oversized frame");
+        .expect_err("an oversized request was sent");
+    assert_eq!(
+        error.outcome(),
+        RequestOutcome::NotApplied,
+        "a request refused before it was sent cannot have applied: {error:?}"
+    );
+    // Refused locally, so the connection is untouched and still usable.
     assert!(
-        !matches!(error, ProtoError::Unsupported { .. }),
-        "expected a framing refusal, got {error:?}"
+        !generous.is_closed(),
+        "a local refusal closed the connection"
+    );
+    assert_eq!(
+        call(&generous, RawKvReq::put(&b"small"[..], &b"v"[..]))
+            .await
+            .unwrap(),
+        RawKvResp::Put
     );
 
-    // The server is still there.
+    // And a peer that ignores the advertised limit: the frame is refused, the connection goes,
+    // and the server does not.
+    let mut rude = TcpStream::connect(address).await.unwrap();
+    let hello = Frame::new(
+        FrameKind::Request,
+        1,
+        Bytes::from(Request::Hello(Hello::current()).encode()),
+    );
+    rude.write_all(&hello.encode(MAX_FRAME_SIZE).unwrap())
+        .await
+        .unwrap();
+    let oversized = Frame::new(FrameKind::Request, 2, Bytes::from(vec![0u8; 256 * 1024]));
+    let _ = rude
+        .write_all(&oversized.encode(MAX_FRAME_SIZE).unwrap())
+        .await;
+
+    // The server closes on us. Whatever it had already queued drains first, so read until the
+    // end of the stream; the loop ending at all is the assertion — a server that kept the
+    // connection would leave this read waiting until the test's own timeout.
+    let mut scratch = [0u8; 4096];
+    while let Ok(read) = rude.read(&mut scratch).await {
+        if read == 0 {
+            break;
+        }
+    }
+
     let second = TcpTransport::connect_with(address, small).await.unwrap();
     assert_eq!(
         call(&second, RawKvReq::put(&b"after"[..], &b"ok"[..]))

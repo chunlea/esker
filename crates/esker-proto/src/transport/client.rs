@@ -123,6 +123,10 @@ impl TcpTransport {
             });
         }
 
+        // The peer said what it will accept; honour it, so an oversized request is one failed
+        // call rather than a framing error that closes the connection.
+        let sink = sink.narrowed_to(usize::try_from(ack.max_frame_size).unwrap_or(usize::MAX));
+
         Ok(Self {
             shared: Arc::new(Shared {
                 sink,

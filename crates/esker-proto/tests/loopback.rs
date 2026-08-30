@@ -410,6 +410,58 @@ async fn the_handshake_reports_the_store_and_its_frame_limit() {
     server.shutdown().await.unwrap();
 }
 
+/// A client adopts the limit the server advertised in its handshake, even when its own is
+/// larger.
+///
+/// The point is which failure the caller gets. A frame the peer will not accept cannot be
+/// *answered* by the peer — a bad length leaves its reader unable to find the next frame, so it
+/// closes the connection and every other request on it. Narrowing the sending limit at the
+/// handshake turns that into one refused call on a connection that keeps working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_adopts_the_limit_its_server_advertised() {
+    let strict = TransportConfig {
+        max_frame_size: 2048,
+        ..TransportConfig::new()
+    };
+    let server = serve(Echo::new(18), strict).await;
+
+    // The client's own limit is the 16 MiB default; only the handshake constrains it.
+    let transport = TcpTransport::connect_with(server.local_addr(), TransportConfig::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        transport.max_frame_size(),
+        2048,
+        "the peer's limit was ignored"
+    );
+
+    let oversized = Request::raw_kv(header(), RawKvReq::get(Bytes::from(vec![b'k'; 8192])));
+    let error = transport
+        .call(oversized)
+        .await
+        .expect_err("an oversized request went out");
+    assert_eq!(error.outcome(), RequestOutcome::NotApplied);
+    assert!(
+        !transport.is_closed(),
+        "a local refusal closed the connection"
+    );
+
+    // Still usable, which is the whole difference from letting the server refuse it.
+    assert_eq!(
+        transport
+            .call(get("still fine"))
+            .await
+            .unwrap()
+            .into_raw_kv()
+            .unwrap(),
+        RawKvResp::Get {
+            value: Some(Bytes::from_static(b"still fine"))
+        }
+    );
+
+    server.shutdown().await.unwrap();
+}
+
 /// A request too big for the connection never reaches the socket, so the caller is told
 /// `NotSent` and may safely send something else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
