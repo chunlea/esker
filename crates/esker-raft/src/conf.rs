@@ -168,6 +168,28 @@ impl<S: LogStorage> Raft<S> {
         Ok(())
     }
 
+    /// Rebuilds the stack from the log, at open, on top of the anchor a snapshot provided.
+    ///
+    /// Every conf-change entry above the snapshot is recorded as though it had just been
+    /// appended, and then the committed prefix is folded away — which leaves exactly the
+    /// revertible tail. Without this a restarted node holds a configuration it cannot undo: the
+    /// entry that established it is still in its log, so a new leader truncating that entry away
+    /// leaves the node counting quorums over a membership its own log no longer justifies. The
+    /// simulator found that as two leaders in one term, on `ESKER_SIM_SEED=42705`.
+    ///
+    /// The cost is one pass over the entries a snapshot does not cover, once, at startup.
+    pub(crate) fn replay_conf_changes(&mut self) -> RaftResult<()> {
+        let first = self.log.first_index()?;
+        let last = self.log.last_index()?;
+        if last < first {
+            return Ok(());
+        }
+        let entries = self.log.slice(first, last.saturating_add(1), u64::MAX)?;
+        self.record_conf_changes(&entries)?;
+        self.advance_conf_commit();
+        Ok(())
+    }
+
     /// Reverts every configuration change appended at or above `index` — the truncation path.
     pub(crate) fn revert_conf_to(&mut self, index: Index) -> RaftResult<()> {
         if self.conf.truncate_from(index) {
@@ -214,7 +236,9 @@ mod tests {
     use crate::raw_node::RawNode;
     use crate::storage::MemStorage;
     use crate::testkit::Harness;
-    use crate::types::{ConfChange, ConfChangeKind, ConfState, Entry, EntryKind, HardState};
+    use crate::types::{
+        ConfChange, ConfChangeKind, ConfState, Entry, EntryKind, HardState, Snapshot, SnapshotMeta,
+    };
 
     fn add_voter(node: u64) -> ConfChange {
         ConfChange::new(ConfChangeKind::AddVoter, node)
@@ -557,6 +581,74 @@ mod tests {
             node.propose_conf_change(ConfChange::new(ConfChangeKind::Remove, 2))
                 .is_ok(),
             "with the tail settled there is nothing left to be uncertain about"
+        );
+    }
+
+    /// **Race 3, across a restart.** A configuration applied at append has to be revertible, and
+    /// a restarted node can only revert what it can reconstruct.
+    ///
+    /// `RawNode::new` used to start with a flat stack, so the change at index 10 below — still
+    /// uncommitted, still in the log — was in force and could not be taken back. When a new
+    /// leader overwrote index 10, the entry went and the configuration stayed, leaving this node
+    /// counting quorums of `[1, 2, 3]` while the log says `[1, 2, 3, 4]`. The simulator reached
+    /// that on `ESKER_SIM_SEED=42705` and reported it as Leader Completeness: node 2 won a term
+    /// with two of its three imagined voters, against a cluster whose quorum did not include
+    /// either of them.
+    ///
+    /// The snapshot is what makes the reconstruction possible: its metadata carries the
+    /// membership as of its own index, which the entries above it replay onto.
+    #[test]
+    fn a_restart_over_a_snapshot_can_still_revert_a_truncated_change() {
+        let mut storage = MemStorage::with_conf_state(ConfState::from_voters(vec![1, 2, 3, 4]));
+        storage
+            .apply_snapshot(Snapshot {
+                meta: SnapshotMeta {
+                    index: 6,
+                    term: 1,
+                    conf: ConfState::from_voters(vec![1, 2, 3, 4]),
+                },
+                data: Bytes::new(),
+            })
+            .unwrap();
+        storage
+            .append(&[
+                Entry::empty(1, 7),
+                Entry::empty(1, 8),
+                Entry::empty(1, 9),
+                Entry::conf_change(1, 10, &ConfChange::new(ConfChangeKind::Remove, 4)),
+            ])
+            .unwrap();
+        storage.set_hard_state(HardState {
+            term: 1,
+            voted_for: None,
+            commit: 9,
+        });
+
+        let mut node = RawNode::new(Config::new(2, vec![1, 2, 3, 4], 311), storage).unwrap();
+        assert_eq!(
+            node.status().conf.voters,
+            vec![1, 2, 3],
+            "the change at index 10 is in force: §4.1 applies it at the append"
+        );
+
+        // A leader of term 2 has something else at index 10. The entry goes, and the
+        // configuration it established has to go with it.
+        node.step(Message::AppendEntries {
+            from: 1,
+            to: 2,
+            term: 2,
+            prev_log_index: 9,
+            prev_log_term: 1,
+            entries: vec![Entry::empty(2, 10)],
+            leader_commit: 9,
+            context: Bytes::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            node.status().conf.voters,
+            vec![1, 2, 3, 4],
+            "a truncated change reverts across a restart, or this node counts a quorum of a \
+             membership its own log does not justify"
         );
     }
 

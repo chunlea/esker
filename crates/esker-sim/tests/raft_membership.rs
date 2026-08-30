@@ -137,30 +137,35 @@ fn membership_changes_under_faults_hold_every_property() {
 /// Nothing on node 1 was ever truncated. What broke was §4.1 applied to an entry that had not
 /// been appended.
 ///
-/// # What is left
+/// # What it took to get clean
 ///
-/// One of the 3000. The census is what makes that number mean anything: it was 27 before
-/// 987d472, 14 after, 5 after b668af3, and the classes fell in groups rather than one by one
-/// because they were never as many bugs as they were checkers.
+/// Twenty-seven of these 3000 seeds failed when the census was first taken, and they were never
+/// twenty-seven bugs. They were five, and the classes fell in groups because one cause is seen by
+/// several checkers at once:
 ///
-/// * `ESKER_SIM_SEED=42650` had two leaders in term 12 — node 2 on a stale branch under
-///   `[1, 2, 3]`, node 3 under `[1, 3, 5]`, two configurations one server either side of a common
-///   `[1, 2, 3, 5]` and so two servers, and no shared quorum, from each other. The rule that
-///   allows that (a leader proposing a configuration change before it has committed an entry of
-///   its own term) took election safety, all three leader-completeness seeds, the snapshot-
-///   metadata seed and four of the seven committed-twice seeds with it.
-/// * The remaining committed-twice seeds, and the last `core against its log` seed, were this
-///   harness reading a boundary out of storage against a commit index out of the core: for as
-///   long as a snapshot the core has accepted has not been written, those describe two different
-///   logs. [`esker_raft::RawNode::snapshot_boundary`] is where the boundary comes from now.
+/// * A configuration change re-applied from a *duplicate* append, which dropped every later
+///   change off the tracker's stack while the entries stayed in the log (987d472). Thirteen
+///   seeds, all of them `membership: core against its log`.
+/// * A leader proposing a configuration change before it had committed an entry of its own term,
+///   so it could not know whether the tail it inherited held one already (b668af3). That is how
+///   `ESKER_SIM_SEED=42650` got two leaders in term 12 — node 2 under `[1, 2, 3]`, node 3 under
+///   `[1, 3, 5]`, one server either side of a common `[1, 2, 3, 5]` and so two servers, and no
+///   shared quorum, from each other. It took election safety, all three leader-completeness
+///   seeds, the snapshot-metadata seed and four committed-twice seeds with it.
+/// * This harness reading a compaction boundary out of storage against a commit index out of the
+///   core, which are two different logs for as long as a snapshot the core has accepted has not
+///   been written (15f34fc). Three committed-twice seeds and one membership seed.
+/// * A joining server seeded with the configuration that named it rather than the one at index 0,
+///   so its own derivation started by asserting a membership its log does not justify (0dec4ba).
+/// * A restarted node holding a configuration it could not revert, because `RawNode::new` did not
+///   replay the log's conf-change tail onto the snapshot's anchor. `ESKER_SIM_SEED=42705`: the
+///   change was truncated away, the configuration stayed, and node 2 won a term with two of its
+///   three imagined voters.
 ///
-/// * **membership: two nodes, one log** (41872) — two nodes that agree on the log through some
-///   index derive different configurations from it. Not looked at yet.
-///
-/// The default sweep above does not reach any of them and stays green, so this remains a finding
-/// on the acceptance gate rather than a broken build.
+/// It is green now, and the census is what keeps it honest: a sweep that stops at its first
+/// failing seed would have reported each of those five as "the" bug in turn.
 #[test]
-#[ignore = "the thousands-of-seeds membership run; still RED on 14 of the first 3000 seeds, see above"]
+#[ignore = "the thousands-of-seeds membership run; minutes, not seconds"]
 fn thousands_of_membership_seeds() {
     let mut changes = 0;
     let mut joins = 0;
