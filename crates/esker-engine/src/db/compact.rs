@@ -202,6 +202,9 @@ impl DbInner {
         // would quietly skip it — and a caller who asked for a compaction expecting the filter
         // to run would get a no-op.
         let trivial = compaction.is_trivial_move() && cf.options().compaction_filter.is_none();
+        // Kept past the branch: once the edit naming them is durable, these are the numbers
+        // the register has no further reason to hold.
+        let mut outputs: Vec<FileMeta> = Vec::new();
         let stats = if trivial {
             // The bytes would come out identical under a different number, so only the
             // manifest has any work to do.
@@ -219,22 +222,22 @@ impl DbInner {
             );
             CompactionStats::default()
         } else {
-            let (outputs, stats) = self.merge_inputs(cf, version, compaction, picker)?;
-            for file in &outputs {
+            let (produced, stats) = self.merge_inputs(cf, version, compaction, picker)?;
+            for file in &produced {
                 edit.add_file(
                     compaction.cf,
                     level_u32(compaction.output_level()),
                     file.clone(),
                 );
             }
-            self.remember_pointer(compaction, &outputs)?;
+            self.remember_pointer(compaction, &produced)?;
+            outputs = produced;
             stats
         };
 
         self.log_and_apply(&mut edit)?;
-        // The inputs are unreferenced now, and any output that did not make it into the edit
-        // is unreferenced too.
-        self.forget_pending(compaction)?;
+        // A version names them now, so they have stopped being files "being written".
+        self.forget_pending(&outputs)?;
         self.purge_and_evict()?;
         self.compactions.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(
@@ -283,8 +286,17 @@ impl DbInner {
             filter: cf.options().compaction_filter.as_deref(),
             is_bottom: &is_bottom,
         };
-        let stats = job.run(&mut input, &mut output)?;
-        Ok((output.finished, stats))
+        match job.run(&mut input, &mut output) {
+            Ok(stats) => Ok((output.finished, stats)),
+            Err(err) => {
+                // No edit will ever name what was written, so stop holding it: reclaiming a
+                // half-finished compaction is the sweep's job and the sweep skips anything
+                // still registered. The original error is what the caller needs to see, so a
+                // failure to release is not allowed to replace it.
+                let _unused = output.release_held();
+                Err(err)
+            }
+        }
     }
 
     /// Records where this compaction stopped, so the next one starts after it.
@@ -312,9 +324,21 @@ impl DbInner {
         Ok(())
     }
 
-    fn forget_pending(&self, compaction: &Compaction) -> Result<()> {
+    /// Stops holding a finished compaction's **outputs**.
+    ///
+    /// Only ever called once the edit naming them is durable: until then they belong to no
+    /// version and the sweep would take them for garbage, which is the whole reason the
+    /// register exists. Afterwards a version names them, and holding them any longer costs
+    /// twice over — the register grows for the life of the process, and the sweep skips every
+    /// number in it, so those files are never reclaimed however obsolete they become.
+    ///
+    /// The *inputs* need no release. They were named by a version from the start and were
+    /// never registered, so retaining against them removed nothing and left every output held.
+    fn forget_pending(&self, outputs: &[FileMeta]) -> Result<()> {
         let mut pending = lock(&self.pending_outputs)?;
-        pending.retain(|number| !compaction.all_inputs().any(|file| file.number == *number));
+        for file in outputs {
+            pending.remove(&file.number);
+        }
         Ok(())
     }
 
@@ -415,6 +439,10 @@ struct TableWriter<'a> {
     smallest_seqno: SeqNo,
     largest_seqno: SeqNo,
     finished: Vec<FileMeta>,
+    /// Every number this writer has held, so a compaction that fails part-way can let them go.
+    /// Nothing will ever name those files, and a register that keeps them stops the sweep
+    /// reclaiming them.
+    held: Vec<u64>,
 }
 
 impl<'a> TableWriter<'a> {
@@ -428,7 +456,22 @@ impl<'a> TableWriter<'a> {
             smallest_seqno: SeqNo::MAX,
             largest_seqno: 0,
             finished: Vec::new(),
+            held: Vec::new(),
         }
+    }
+
+    /// Releases every number this writer held.
+    ///
+    /// For the failure path only. On success the outputs are released by
+    /// [`DbInner::forget_pending`] *after* the edit that names them is durable, which is
+    /// strictly later than this writer is dropped — releasing here instead would hand the
+    /// sweep a file the compaction is about to name.
+    fn release_held(&self) -> Result<()> {
+        let mut pending = lock(&self.inner.pending_outputs)?;
+        for number in &self.held {
+            pending.remove(number);
+        }
+        Ok(())
     }
 }
 
@@ -438,6 +481,7 @@ impl CompactionOutput for TableWriter<'_> {
             let number = lock(&self.inner.versions)?.new_file_number();
             // Held before the file exists, so no sweep can see it unreferenced and delete it.
             self.inner.hold_pending(number)?;
+            self.held.push(number);
             let path = filename::sst(&self.inner.dir, number);
             let file = self.inner.fs.create(&path).at(&path)?;
             self.builder = Some((number, TableBuilder::new(self.options.clone(), file)));
@@ -497,5 +541,123 @@ impl CompactionOutput for TableWriter<'_> {
             largest_seqno: self.largest_seqno,
         });
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::fs::FileSystem;
+    use crate::memfs::MemFileSystem;
+    use crate::options::{CfOptions, Options, ReadOptions};
+    use crate::{Db, cf};
+
+    /// **Regression.** A finished compaction has to let go of the outputs it held.
+    ///
+    /// The register of files being written is what stops one thread's sweep deleting another
+    /// thread's half-written output, so the sweep skips every number in it. Releasing the
+    /// wrong numbers — the *inputs*, which a version named from the start and which were never
+    /// registered — removed nothing and left every output held for the life of the process:
+    /// the register grew without bound, and the sweep could never reclaim those files however
+    /// obsolete they became.
+    ///
+    /// # Why this drives one compaction by hand
+    ///
+    /// `compact_range` walks every level, so the file an L0→L1 compaction produces becomes the
+    /// *input* of the L1→L2 pass a moment later — and the old code did release input numbers,
+    /// so the register drained anyway and the bug stayed invisible. The leak is what happens to
+    /// an output that is **not** immediately compacted again, which is the ordinary case for
+    /// the background pool: one L0→L1 compaction, and its output sits at L1 until the level
+    /// outgrows its target. So this runs exactly that, once.
+    #[test]
+    fn a_finished_compaction_releases_the_outputs_it_held() {
+        let fs: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
+        let db = Db::open_with(
+            "/db",
+            Options {
+                create_if_missing: true,
+                cf_options: CfOptions {
+                    // Out of reach, so the background pool cannot run a compaction of its own
+                    // and be mid-flight, holding a number, when the register is read.
+                    level0_file_num_compaction_trigger: 100,
+                    ..CfOptions::default()
+                },
+                ..Options::default()
+            },
+            Arc::clone(&fs),
+            &[cf::DEFAULT],
+        )
+        .expect("a fresh database");
+
+        // Three overlapping generations, so the compaction rewrites rather than moving a file
+        // down a level: a trivial move produces no output and would not exercise this at all.
+        for generation in 0..3u32 {
+            for i in 0..40u32 {
+                db.put(
+                    cf::DEFAULT,
+                    format!("k{i:03}").as_bytes(),
+                    format!("g{generation}").as_bytes(),
+                )
+                .expect("a put");
+            }
+            db.flush(cf::DEFAULT).expect("a flush");
+        }
+        drain(&db, "after the flushes");
+
+        // Exactly one L0 → L1 compaction, and nothing after it to take the output as an input.
+        let handle = db
+            .inner
+            .cf_by_name(cf::DEFAULT)
+            .expect("the default family");
+        let picker = db.inner.picker(&handle);
+        let version = lock(&db.inner.versions).expect("the versions").current();
+        let cf_version = version.cf(handle.id()).expect("the family's files");
+        let compaction = picker
+            .pick_range(handle.id(), cf_version, 0, None, None)
+            .expect("three L0 files to merge");
+        assert!(
+            !compaction.is_trivial_move(),
+            "the compaction has to write an output for there to be anything to release"
+        );
+        db.inner
+            .run_compaction(&handle, &version, &compaction, &picker)
+            .expect("the compaction");
+
+        drain(&db, "after the compaction");
+
+        // And the data is untouched, which is what says the release was not a sweep quietly
+        // deleting live files.
+        for i in 0..40u32 {
+            let key = format!("k{i:03}");
+            assert_eq!(
+                db.get(cf::DEFAULT, key.as_bytes(), &ReadOptions::default())
+                    .expect("a read")
+                    .as_deref(),
+                Some(&b"g2"[..]),
+                "{key}"
+            );
+        }
+    }
+
+    /// Waits for the register of files being written to empty.
+    ///
+    /// A deadline rather than an instant reading, because a flush releases its own number a
+    /// moment after `flush` returns and an exact reading would race it. What has to be true is
+    /// that the register empties at all.
+    fn drain(db: &Db, when: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let held = db.inner.pending_outputs.lock().expect("the register").len();
+            if held == 0 {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the register still holds {held} number(s) {when}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }
