@@ -12,7 +12,7 @@
 //! * **All randomness comes from one seeded [`Pcg32`]**, drawn in a fixed order per message.
 //!   No `Instant`, no OS entropy.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use bytes::Bytes;
 use esker_base::hash::hash64;
@@ -110,6 +110,18 @@ pub enum TraceEvent {
         /// When the copy is due.
         deliver_at: Millis,
     },
+    /// A message was stopped by a partition: either refused at send time because the link was
+    /// severed, or discarded in flight when the link went down under it.
+    Partitioned {
+        /// When it was stopped.
+        at: Millis,
+        /// Sender.
+        from: NodeId,
+        /// Recipient.
+        to: NodeId,
+        /// Hash of the payload.
+        payload: u64,
+    },
     /// A message reached its recipient's inbox.
     Delivered {
         /// When it arrived.
@@ -145,6 +157,10 @@ pub struct SimNetwork {
     in_flight: BTreeMap<(Millis, u64), Envelope>,
     /// One inbox per node, in node order.
     inboxes: BTreeMap<NodeId, VecDeque<Envelope>>,
+    /// Directed links that are currently cut. A `BTreeSet` because a partition decides what is
+    /// delivered, and iteration order that depends on a hasher would decide it differently on
+    /// two runs.
+    severed: BTreeSet<(NodeId, NodeId)>,
     trace: Vec<TraceEvent>,
     next_sequence: u64,
 }
@@ -163,6 +179,7 @@ impl SimNetwork {
             plan,
             in_flight: BTreeMap::new(),
             inboxes,
+            severed: BTreeSet::new(),
             trace: Vec::new(),
             next_sequence: 0,
         }
@@ -201,6 +218,18 @@ impl SimNetwork {
         }
         let at = self.clock.now();
         let digest = hash64(&payload);
+
+        // Checked before any random draw: a severed link is a fact about the topology, not a
+        // probability, so a partition must not shift the fault stream's position.
+        if self.severed.contains(&(from, to)) {
+            self.trace.push(TraceEvent::Partitioned {
+                at,
+                from,
+                to,
+                payload: digest,
+            });
+            return Ok(());
+        }
 
         if self.rng.chance(self.plan.drop) {
             self.trace.push(TraceEvent::Dropped {
@@ -260,6 +289,70 @@ impl SimNetwork {
             },
         );
         (sequence, deliver_at)
+    }
+
+    /// Cuts the directed link `from -> to`, and discards anything already in flight on it.
+    ///
+    /// Discarding is the stronger model and the one a test wants: a partition that still lets
+    /// the last few messages through is a partition that proves nothing. A message already in
+    /// the recipient's inbox has arrived and stays there.
+    pub fn sever(&mut self, from: NodeId, to: NodeId) {
+        self.severed.insert((from, to));
+        self.discard_in_flight(from, to);
+    }
+
+    /// Cuts both directions between `side` and every node that is not in it.
+    ///
+    /// This is the partition a Raft test means: two groups that cannot talk, one of which may
+    /// still have a quorum.
+    pub fn partition(&mut self, side: &[NodeId]) {
+        let inside: BTreeSet<NodeId> = side.iter().copied().collect();
+        let all: Vec<NodeId> = self.inboxes.keys().copied().collect();
+        for &near in &all {
+            for &far in &all {
+                if inside.contains(&near) != inside.contains(&far) {
+                    self.sever(near, far);
+                }
+            }
+        }
+    }
+
+    /// Restores every severed link. Messages discarded while a link was down stay gone.
+    pub fn heal(&mut self) {
+        self.severed.clear();
+    }
+
+    /// Whether `from -> to` is currently cut.
+    #[must_use]
+    pub fn is_severed(&self, from: NodeId, to: NodeId) -> bool {
+        self.severed.contains(&(from, to))
+    }
+
+    /// How many directed links are cut.
+    #[must_use]
+    pub fn severed_links(&self) -> usize {
+        self.severed.len()
+    }
+
+    /// Throws away every in-flight message on one directed link.
+    fn discard_in_flight(&mut self, from: NodeId, to: NodeId) {
+        let doomed: Vec<(Millis, u64)> = self
+            .in_flight
+            .iter()
+            .filter(|(_, envelope)| envelope.from == from && envelope.to == to)
+            .map(|(key, _)| *key)
+            .collect();
+        let at = self.clock.now();
+        for key in doomed {
+            if let Some(envelope) = self.in_flight.remove(&key) {
+                self.trace.push(TraceEvent::Partitioned {
+                    at,
+                    from: envelope.from,
+                    to: envelope.to,
+                    payload: hash64(&envelope.payload),
+                });
+            }
+        }
     }
 
     /// When the next message is due, if any.
@@ -444,6 +537,129 @@ mod tests {
         assert_eq!(
             received, sorted,
             "equal deadlines were delivered out of order"
+        );
+    }
+
+    #[test]
+    fn a_severed_link_delivers_nothing_in_either_direction_it_was_cut() {
+        let mut net = SimNetwork::new(11, FaultPlan::perfect(), &nodes());
+        net.sever(NodeId(1), NodeId(2));
+        net.send(NodeId(1), NodeId(2), Bytes::from_static(b"blocked"))
+            .unwrap();
+        assert_eq!(net.in_flight(), 0, "a severed link accepted a message");
+        net.run_to_quiescence();
+        assert!(net.recv(NodeId(2)).is_none());
+
+        // The other direction was not cut.
+        net.send(NodeId(2), NodeId(1), Bytes::from_static(b"reply"))
+            .unwrap();
+        net.run_to_quiescence();
+        assert!(
+            net.recv(NodeId(1)).is_some(),
+            "the healthy direction was cut"
+        );
+
+        net.heal();
+        net.send(NodeId(1), NodeId(2), Bytes::from_static(b"after heal"))
+            .unwrap();
+        net.run_to_quiescence();
+        assert!(
+            net.recv(NodeId(2)).is_some(),
+            "healing did not restore the link"
+        );
+    }
+
+    /// A partition that lets the last few messages through is not a partition.
+    #[test]
+    fn partitioning_discards_what_was_already_in_flight() {
+        let mut net = SimNetwork::new(
+            12,
+            FaultPlan {
+                min_latency_ms: 50,
+                max_latency_ms: 50,
+                ..FaultPlan::perfect()
+            },
+            &nodes(),
+        );
+        net.send(NodeId(1), NodeId(2), Bytes::from_static(b"in flight"))
+            .unwrap();
+        assert_eq!(net.in_flight(), 1);
+
+        net.partition(&[NodeId(1)]);
+        assert_eq!(net.in_flight(), 0, "a message crossed a partition");
+        assert!(net.is_severed(NodeId(1), NodeId(2)));
+        assert!(net.is_severed(NodeId(2), NodeId(1)));
+        assert_eq!(net.severed_links(), 2);
+
+        net.run_to_quiescence();
+        assert!(net.recv(NodeId(2)).is_none());
+        assert!(
+            net.trace()
+                .iter()
+                .any(|event| matches!(event, TraceEvent::Partitioned { .. })),
+            "the discard was not traced"
+        );
+    }
+
+    /// A partition splits the cluster; nodes on the same side still talk.
+    #[test]
+    fn a_partition_only_cuts_across_the_split() {
+        let three = [NodeId(1), NodeId(2), NodeId(3)];
+        let mut net = SimNetwork::new(13, FaultPlan::perfect(), &three);
+        net.partition(&[NodeId(1), NodeId(2)]);
+        assert!(!net.is_severed(NodeId(1), NodeId(2)));
+        assert!(!net.is_severed(NodeId(2), NodeId(1)));
+        assert!(net.is_severed(NodeId(1), NodeId(3)));
+        assert!(net.is_severed(NodeId(3), NodeId(2)));
+        assert_eq!(
+            net.severed_links(),
+            4,
+            "one link per direction per crossing pair"
+        );
+    }
+
+    /// A severed link must cost no random draws, or turning a partition on would change what
+    /// happened to every *other* message and a scenario could never be compared with itself.
+    ///
+    /// `quiet` never sends on the doomed link at all; `cut` sends on it every round with the
+    /// link severed. What happened to the messages on the healthy link has to be identical.
+    #[test]
+    fn a_severed_link_costs_no_random_draws() {
+        let three = [NodeId(1), NodeId(2), NodeId(3)];
+        let mut quiet = SimNetwork::new(17, FaultPlan::hostile(), &three);
+        let mut cut = SimNetwork::new(17, FaultPlan::hostile(), &three);
+        cut.sever(NodeId(1), NodeId(3));
+
+        for round in 0..50u8 {
+            quiet
+                .send(NodeId(1), NodeId(2), Bytes::copy_from_slice(&[round]))
+                .unwrap();
+            cut.send(NodeId(1), NodeId(2), Bytes::copy_from_slice(&[round]))
+                .unwrap();
+            cut.send(NodeId(1), NodeId(3), Bytes::copy_from_slice(&[round]))
+                .unwrap();
+        }
+
+        let healthy_link = |net: &SimNetwork| -> Vec<TraceEvent> {
+            net.trace()
+                .iter()
+                .filter(|event| {
+                    !matches!(
+                        event,
+                        TraceEvent::Sent { to, .. }
+                            | TraceEvent::Dropped { to, .. }
+                            | TraceEvent::Duplicated { to, .. }
+                            | TraceEvent::Partitioned { to, .. }
+                            if *to == NodeId(3)
+                    )
+                })
+                .copied()
+                .collect()
+        };
+        assert_eq!(
+            healthy_link(&quiet),
+            healthy_link(&cut),
+            "sending on a severed link changed what happened on the healthy one"
         );
     }
 
