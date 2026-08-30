@@ -1,0 +1,25 @@
+[package]
+name = "esker-sql"
+description = "Stateless PostgreSQL-speaking node: wire protocol, catalog, planner and executor over Esker transactions."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+esker-base.workspace = true
+esker-keys.workspace = true
+# Contained to src/parse.rs by rule (docs/adr/0014-sqlparser.md); a `use sqlparser::`
+# anywhere else in this crate is a review failure.
+sqlparser.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

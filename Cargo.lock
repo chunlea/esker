@@ -237,6 +237,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "esker-sql"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "esker-base",
+ "esker-keys",
+ "proptest",
+ "sqlparser",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "esker-store"
 version = "0.1.0"
 dependencies = [
@@ -255,6 +268,14 @@ dependencies = [
 [[package]]
 name = "esker-txn"
 version = "0.1.0"
+dependencies = [
+ "bytes",
+ "esker-base",
+ "esker-keys",
+ "esker-pd",
+ "proptest",
+ "thiserror",
+]
 
 [[package]]
 name = "fastrand"
@@ -628,6 +649,15 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys",
+]
+
+[[package]]
+name = "sqlparser"
+version = "0.62.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13c6d1b651dc4edf07eead2a0c6c78016ce971bc2c10da5266861b13f25e7cec"
+dependencies = [
+ "log",
 ]
 
 [[package]]

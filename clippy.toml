@@ -1,0 +1,5 @@
+# `PostgreSQL` is a product name, not an identifier. `esker-sql` mentions it in almost every
+# doc comment it has -- the crate exists to imitate it -- and clippy's `doc_markdown` lint wants
+# every such word in backticks. Backticking a proper noun thirty-odd times makes the prose worse
+# and says something false: that the word names a type. The `..` keeps clippy's own default list.
+doc-valid-idents = ["PostgreSQL", ".."]
