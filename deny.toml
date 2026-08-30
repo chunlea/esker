@@ -1,0 +1,86 @@
+# Dependency policy enforcement for the pure-Rust rule in CLAUDE.md.
+#
+# Esker is 100% Rust. No crate that compiles C, C++ or assembly may appear anywhere in the
+# runtime dependency graph, including transitively. This file is one half of that guard; the
+# other half is crates/esker-cli/tests/dep_budget.rs, which counts the graph and checks names
+# against the same patterns. Both exist because they fail differently: cargo-deny catches a
+# crate we already know about, the test catches a shape we have not seen yet.
+#
+# The transitive runtime crate budget. The test reads this line, so keep the format exact.
+# Lowering it is welcome; raising it needs an ADR (docs/adr/0003-dependencies.md).
+# esker-dep-budget = 40
+
+[graph]
+# The two platforms CI builds. Without this, cargo-deny would also consider the Windows
+# dependency tree, which nothing here is built for.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+# The pure-Rust rule is about what we ship. Test-only tools (proptest, criterion) may pull in
+# whatever they like -- proptest depends on `rand`, which is banned at runtime.
+exclude-dev = true
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# The allow list is forward-looking: an entry nobody uses yet is not a problem, a crate whose
+# licence is missing from it is.
+unused-allowed-license = "allow"
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+# A build script is how C ends up in a "pure Rust" graph, so anything that has one has to be
+# looked at by a human rather than discovered in a profile six months later.
+deny = [
+    # --- compiles C/C++/assembly, or wraps something that does ---
+    { crate = "cc" },
+    { crate = "openssl" },
+    { crate = "openssl-sys" },
+    { crate = "native-tls" },
+    { crate = "ring" },
+    { crate = "aws-lc-rs" },
+    { crate = "aws-lc-sys" },
+    { crate = "libz-sys" },
+    { crate = "libz-ng-sys" },
+    { crate = "zstd" },
+    { crate = "zstd-safe" },
+    { crate = "zstd-sys" },
+    { crate = "bzip2-sys" },
+    { crate = "lz4-sys" },
+    { crate = "librocksdb-sys" },
+    # --- the point of the project is to write these ourselves (CLAUDE.md) ---
+    { crate = "rocksdb" },
+    { crate = "sled" },
+    { crate = "openraft" },
+    { crate = "raft" },
+    { crate = "raft-proto" },
+    { crate = "crc32c" },
+    { crate = "crc32fast" },
+    { crate = "rand" },
+    { crate = "lru" },
+    { crate = "snap" },
+    { crate = "pgwire" },
+    # --- hand-rolled framing and formats, never serde or prost (ADR 0002) ---
+    { crate = "serde" },
+    { crate = "serde_derive" },
+    { crate = "prost" },
+    { crate = "tonic" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

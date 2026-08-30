@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# One job per platform, both running exactly `just check`. If the gate diverges from what a
+# developer runs locally, a green local check stops meaning anything.
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: just check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the channel; this installs exactly that and nothing else.
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain
+          rustup component add rustfmt clippy
+          cargo --version
+          rustc --version
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-deny,cargo-nextest
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: just check
+        run: just check
