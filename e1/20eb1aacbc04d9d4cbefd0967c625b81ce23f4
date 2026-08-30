@@ -1,0 +1,19 @@
+docs/plans/COORDINATION.md
+  s_dc640bf0df4adb::t_1c3be7ba1dc8f7 26-35
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "e120eb1aacbc04d9d4cbefd0967c625b81ce23f4",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "claude-fable-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
