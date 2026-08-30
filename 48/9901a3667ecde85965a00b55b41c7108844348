@@ -1,0 +1,27 @@
+crates/esker-engine/src/db/checkpoint.rs
+  s_583ba4eb96ad8a::t_9b12bbd8086e60 1-187
+crates/esker-engine/src/db/ingest.rs
+  s_583ba4eb96ad8a::t_8c641d02ab0add 1-217
+crates/esker-engine/src/db/mod.rs
+  s_583ba4eb96ad8a::t_f48752e98a8512 7-8,30,33
+crates/esker-engine/src/lib.rs
+  s_583ba4eb96ad8a::t_f229dfae326e42 74
+crates/esker-engine/tests/checkpoint.rs
+  s_583ba4eb96ad8a::t_25354965fe6cd0 1-367
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "489901a3667ecde85965a00b55b41c7108844348",
+  "prompts": {},
+  "sessions": {
+    "s_583ba4eb96ad8a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2ac73fb2-9428-4877-ae7d-195e5b69e526",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
