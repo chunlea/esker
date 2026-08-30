@@ -1,0 +1,29 @@
+crates/esker-raft/src/core.rs
+  s_54136a52dccd02::t_ecfa5a41892a7c 22,262-272,298-305,313-332,406-411,413-455
+crates/esker-raft/src/election.rs
+  s_54136a52dccd02::t_9a803875ab3445 1-825
+crates/esker-raft/src/lib.rs
+  s_54136a52dccd02::t_639e958aed747c 28,36-37
+crates/esker-raft/src/raw_node.rs
+  s_54136a52dccd02::t_e3a49500aea4c0 10,160-165,220-226
+crates/esker-raft/src/testkit.rs
+  s_54136a52dccd02::t_47d525cad448dd 1-216
+docs/raft-spec.md
+  s_54136a52dccd02::t_580288b4815a08 19,47-48,64,70-73,80,117,123-125,136-137
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "3d52c6cf1f720fa7e5875ca52529dd54fb1ae9cd",
+  "prompts": {},
+  "sessions": {
+    "s_54136a52dccd02": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7991e833-93be-4b3f-93b2-2e245ecc2446",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
