@@ -13,7 +13,9 @@ use bytes::Bytes;
 use esker_pd::clock::TestClock;
 use esker_pd::{Clock, Pd, PdOptions, PdService};
 use esker_proto::transport::{Server, ServerHandle, TransportConfig};
-use esker_proto::{Epoch, PdChannel, Peer, ProtoError, Region, StoreInfo, TcpTransport, Transport};
+use esker_proto::{
+    Epoch, Operator, PdChannel, Peer, ProtoError, Region, StoreInfo, TcpTransport, Transport,
+};
 
 /// A PD on an ephemeral port, and the clock driving it.
 struct Cluster {
@@ -172,6 +174,60 @@ async fn the_refusals_arrive_as_themselves() {
     }
 }
 
+/// A stale heartbeat still gets an operator: PD schedules against the record it *holds*, not
+/// against the beat it was sent. A leader whose beat crossed a newer one on the network is
+/// still the leader that has to do the work.
+#[tokio::test]
+async fn a_stale_heartbeat_still_carries_the_repair() {
+    let cluster = Cluster::start().await;
+    let pd = cluster.channel().await;
+    let (_, region) = pd
+        .bootstrap(StoreInfo::new(1, "127.0.0.1:1"))
+        .await
+        .unwrap();
+    let region = region.unwrap();
+    for store_id in 2..=4 {
+        pd.bootstrap(StoreInfo::new(store_id, format!("127.0.0.1:{store_id}")))
+            .await
+            .unwrap();
+    }
+    let peers = vec![
+        Peer::voter(1, region.peers[0].peer_id),
+        Peer::voter(2, 20),
+        Peer::voter(3, 30),
+    ];
+    let current = Region {
+        peers: peers.clone(),
+        epoch: Epoch::new(4, 1),
+        ..region.clone()
+    };
+    pd.region_heartbeat(current, 10, 9, 0, 0).await.unwrap();
+
+    cluster
+        .clock
+        .advance(esker_pd::pd::MAX_STORE_DOWN_TIME_MS + 1);
+    for store_id in [1, 2, 4] {
+        pd.store_heartbeat(store_id, 0, 0, 0, 0, 0).await.unwrap();
+    }
+
+    // A beat from an older term at an older epoch: dropped from the table, answered anyway.
+    let behind = Region {
+        peers,
+        epoch: Epoch::new(3, 1),
+        ..region
+    };
+    let operator = pd
+        .region_heartbeat(behind, 10, 8, 0, 0)
+        .await
+        .unwrap()
+        .expect("the repair the region needs");
+    assert_eq!(
+        operator.epoch(),
+        Epoch::new(4, 1),
+        "the operator is addressed to the epoch PD holds, not the one the beat carried"
+    );
+}
+
 /// A heartbeat for an epoch PD has already moved past is dropped, and the answer is the same
 /// as for one that was applied — the sender has nothing to do differently.
 #[tokio::test]
@@ -194,6 +250,81 @@ async fn a_stale_heartbeat_is_accepted_on_the_wire_and_dropped_in_the_table() {
     assert_eq!(held.len(), 1);
     assert_eq!(held[0].region.epoch, Epoch::new(1, 5));
     assert_eq!(held[0].leader_peer_id, 10, "the stale beat won");
+}
+
+/// 4c over the wire: a store goes quiet, and the next heartbeat from a surviving leader comes
+/// back carrying the repair. The whole point of putting the operator on the heartbeat response
+/// is that no new call and no new connection is needed for it, and that is what this checks.
+#[tokio::test]
+async fn a_dead_store_earns_a_repair_on_the_heartbeat_response() {
+    let cluster = Cluster::start().await;
+    let pd = cluster.channel().await;
+
+    let (_, region) = pd
+        .bootstrap(StoreInfo::new(1, "127.0.0.1:1"))
+        .await
+        .unwrap();
+    let region = region.unwrap();
+    for store_id in 2..=4 {
+        pd.bootstrap(StoreInfo::new(store_id, format!("127.0.0.1:{store_id}")))
+            .await
+            .unwrap();
+    }
+
+    // Three replicas, all live.
+    let three = Region {
+        peers: vec![
+            Peer::voter(1, region.peers[0].peer_id),
+            Peer::voter(2, 20),
+            Peer::voter(3, 30),
+        ],
+        ..region
+    };
+    assert_eq!(
+        pd.region_heartbeat(three.clone(), 10, 4, 0, 0)
+            .await
+            .unwrap(),
+        None,
+        "a healthy region is left alone"
+    );
+
+    // Store 3 stops beating; the others carry on.
+    cluster
+        .clock
+        .advance(esker_pd::pd::MAX_STORE_DOWN_TIME_MS + 1);
+    for store_id in [1, 2, 4] {
+        pd.store_heartbeat(store_id, 1 << 40, 1 << 39, 1, 0, 0)
+            .await
+            .unwrap();
+    }
+
+    let operator = pd
+        .region_heartbeat(three.clone(), 10, 4, 0, 0)
+        .await
+        .unwrap()
+        .expect("a repair on the heartbeat response");
+    match operator {
+        Operator::AddPeer {
+            region_id,
+            store_id,
+            epoch,
+            ..
+        } => {
+            assert_eq!(region_id, three.id);
+            assert_eq!(store_id, 4, "the only live store without a peer");
+            assert_eq!(epoch, three.epoch);
+        }
+        other => panic!("expected an AddPeer, got {other:?}"),
+    }
+
+    // The same operator until something changes — never a second one.
+    let again = pd
+        .region_heartbeat(three, 10, 4, 0, 0)
+        .await
+        .unwrap()
+        .expect("still asking");
+    assert_eq!(again, operator);
+    assert_eq!(cluster.pd.in_flight().unwrap().len(), 1);
 }
 
 /// PD is not a store. A client that reached it by mistake is told so, rather than being
