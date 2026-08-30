@@ -1,0 +1,33 @@
+crates/esker-client/src/error.rs
+  s_4b642fc65050df::t_ccece240761592 13,53,81,83,121,146,155-156
+crates/esker-client/src/lib.rs
+  s_4b642fc65050df::t_ee136e3d8343f6 32,41
+crates/esker-client/src/raw.rs
+  s_4b642fc65050df::t_fe10afd8f1ec60 1-456
+crates/esker-client/src/retry.rs
+  s_4b642fc65050df::t_617c17c867d3fe 25
+crates/esker-client/src/testing.rs
+  s_4b642fc65050df::t_53a0854cf7f868 20,24-25,36,39-47,54,61-62,73,75-79,91,154-175,190,212,265-275,279,283-288,306-307,320,346-349,353,370-372,380,394,398-400,404,406-410,414,419,422-426,441-442,447-452,465-467,477,484
+crates/esker-client/src/transport.rs
+  s_4b642fc65050df::t_73a9d65faf8125 23-25,36-40
+crates/esker-client/src/wire.rs
+  s_4b642fc65050df::t_66dc2f16b6fcfa 1-2,4-7,9-11,13,24-27,29-30,32,34-36,38-51,55-68,70-76,78-79,81-90,95-109,113-115,117-118,121-127,129-132,136,139,141,143,146-151,153,156-167,175-176,178-183,186
+crates/esker-client/tests/retry.rs
+  s_4b642fc65050df::t_05be37af37070b 1-639
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "7f9bdab1b70256d90f6a7e378a6081f7f29e4f52",
+  "prompts": {},
+  "sessions": {
+    "s_4b642fc65050df": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5213f73d-feb9-40c2-99a7-08164cb70247",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
