@@ -1,0 +1,26 @@
+crates/esker-txn/Cargo.toml
+  h_44076b318daf9c 22-27,29-31
+crates/esker-txn/src/lib.rs
+  h_44076b318daf9c 12-13,15-16,29-34,41-43,47-53
+crates/esker-txn/src/mutation.rs
+  h_44076b318daf9c 1-186
+crates/esker-txn/src/percolator.rs
+  h_44076b318daf9c 1-693
+crates/esker-txn/src/snapshot.rs
+  h_44076b318daf9c 1-254
+crates/esker-txn/tests/protocol.rs
+  h_44076b318daf9c 1-873
+docs/txn-spec.md
+  h_44076b318daf9c 138-140,144-149,171,174-175,177-179
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "b9f28fa89d2fc722df89a90af3861e0ae1605506",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
