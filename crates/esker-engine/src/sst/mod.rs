@@ -54,6 +54,8 @@
 //! file_number, TableOptions, Option<Arc<dyn BlockCache>>)` with `get` and an iterator
 //! supporting `seek`, `seek_for_prev`, `next` and `prev`.
 
+pub mod block;
 pub mod filter;
 
+pub use block::{Block, BlockBuilder, BlockIter};
 pub use filter::{BloomBuilder, BloomFilter, DEFAULT_BITS_PER_KEY, filter_key};
