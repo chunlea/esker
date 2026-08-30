@@ -165,10 +165,13 @@ impl MemTable {
     }
 
     /// A cursor over the table, positioned nowhere until it is seeked.
-    pub fn iter(&self) -> MemTableIter<'_> {
+    ///
+    /// Takes an `Arc` and keeps it: a cursor outlives the memtable switch that retires the
+    /// table it is reading, which is what lets a scan carry on across a flush.
+    pub fn iter(self: &Arc<Self>) -> MemTableIter {
         MemTableIter {
-            table: self,
-            entry: None,
+            table: Arc::clone(self),
+            current: None,
         }
     }
 
@@ -184,33 +187,35 @@ impl MemTable {
 ///
 /// The shape every iterator in the engine shares (`docs/DESIGN.md` §4.1), so that the merge
 /// iterator can drive memtables and SSTs through the same calls.
+///
+/// # Why it navigates by key
+///
+/// `crossbeam-skiplist` hands out entries that borrow the map, so a cursor built from one
+/// would have to hold both the `Arc<MemTable>` and a reference into it — a self-referential
+/// struct, which in safe Rust means either a lifetime the caller has to thread through
+/// everything above, or a crate we are not allowed to add. Instead the cursor remembers its
+/// position as a key and re-finds it, which makes each step `O(log n)` and copies the entry
+/// it lands on.
+///
+/// That is a real cost and it is taken deliberately: `CLAUDE.md` says to prefer safe code and
+/// to optimise after a profile. `TODO(post-v1)`: the in-house arena skiplist that replaces
+/// this one can hand out an owned cursor, and this goes back to `O(1)`.
 #[derive(Debug)]
-pub struct MemTableIter<'a> {
-    table: &'a MemTable,
-    entry: Option<SkipEntry<'a, MemKey, Vec<u8>>>,
+pub struct MemTableIter {
+    table: Arc<MemTable>,
+    /// The entry under the cursor: its internal key and its value.
+    current: Option<(Vec<u8>, Vec<u8>)>,
 }
 
-impl MemTableIter<'_> {
+impl MemTableIter {
     /// Whether the cursor is on an entry.
     pub fn valid(&self) -> bool {
-        self.entry.is_some()
+        self.current.is_some()
     }
 
-    /// The internal key under the cursor.
-    ///
-    /// # Panics
-    ///
-    /// If the cursor is not [`valid`](Self::valid). Callers check first; this mirrors the
-    /// `LevelDB` iterator contract, where reading an invalid position is a caller bug rather
-    /// than a runtime condition.
+    /// The internal key under the cursor, empty when the cursor is not valid.
     pub fn key(&self) -> &[u8] {
-        #[allow(clippy::expect_used)] // The invariant is stated on the method and checked here.
-        self.entry
-            .as_ref()
-            .expect("key() on an invalid iterator")
-            .key()
-            .bytes
-            .as_slice()
+        self.current.as_ref().map_or(&[], |(key, _)| key.as_slice())
     }
 
     /// The user key under the cursor, without its tag.
@@ -218,50 +223,99 @@ impl MemTableIter<'_> {
         extract_user_key(self.key())
     }
 
-    /// The value under the cursor. Empty for a tombstone.
-    ///
-    /// # Panics
-    ///
-    /// If the cursor is not [`valid`](Self::valid); see [`key`](Self::key).
+    /// The value under the cursor, empty for a tombstone or an invalid cursor.
     pub fn value(&self) -> &[u8] {
-        #[allow(clippy::expect_used)] // As above.
-        self.entry
+        self.current
             .as_ref()
-            .expect("value() on an invalid iterator")
-            .value()
-            .as_slice()
+            .map_or(&[], |(_, value)| value.as_slice())
     }
 
     /// Positions the cursor on the first entry at or after `target` (an internal key).
     pub fn seek(&mut self, target: &[u8]) {
-        let target = self.table.key(target.to_vec());
-        self.entry = self.table.map.lower_bound(Bound::Included(&target));
+        let key = self.table.key(target.to_vec());
+        self.current = take(self.table.map.lower_bound(Bound::Included(&key)));
     }
 
     /// Positions the cursor on the last entry at or before `target` (an internal key).
     pub fn seek_for_prev(&mut self, target: &[u8]) {
-        let target = self.table.key(target.to_vec());
-        self.entry = self.table.map.upper_bound(Bound::Included(&target));
+        let key = self.table.key(target.to_vec());
+        self.current = take(self.table.map.upper_bound(Bound::Included(&key)));
     }
 
     /// Positions the cursor on the first entry.
     pub fn seek_to_first(&mut self) {
-        self.entry = self.table.map.front();
+        self.current = take(self.table.map.front());
     }
 
     /// Positions the cursor on the last entry.
     pub fn seek_to_last(&mut self) {
-        self.entry = self.table.map.back();
+        self.current = take(self.table.map.back());
     }
 
-    /// Advances forward. Becomes invalid past the end.
+    /// Advances forward. Becomes invalid past the end; a no-op when already invalid.
     pub fn next(&mut self) {
-        self.entry = self.entry.as_ref().and_then(SkipEntry::next);
+        let Some((key, _)) = self.current.take() else {
+            return;
+        };
+        let key = self.table.key(key);
+        self.current = take(self.table.map.lower_bound(Bound::Excluded(&key)));
     }
 
-    /// Steps backward. Becomes invalid before the start.
+    /// Steps backward. Becomes invalid before the start; a no-op when already invalid.
     pub fn prev(&mut self) {
-        self.entry = self.entry.as_ref().and_then(SkipEntry::prev);
+        let Some((key, _)) = self.current.take() else {
+            return;
+        };
+        let key = self.table.key(key);
+        self.current = take(self.table.map.upper_bound(Bound::Excluded(&key)));
+    }
+}
+
+/// Copies an entry out of the skiplist, which is what makes the cursor owned.
+fn take(entry: Option<SkipEntry<'_, MemKey, Vec<u8>>>) -> Option<(Vec<u8>, Vec<u8>)> {
+    entry.map(|entry| (entry.key().bytes.clone(), entry.value().clone()))
+}
+
+impl crate::iterator::Cursor for MemTableIter {
+    fn valid(&self) -> bool {
+        Self::valid(self)
+    }
+
+    fn key(&self) -> &[u8] {
+        Self::key(self)
+    }
+
+    fn value(&self) -> &[u8] {
+        Self::value(self)
+    }
+
+    fn seek(&mut self, target: &[u8]) {
+        Self::seek(self, target);
+    }
+
+    fn seek_for_prev(&mut self, target: &[u8]) {
+        Self::seek_for_prev(self, target);
+    }
+
+    fn seek_to_first(&mut self) {
+        Self::seek_to_first(self);
+    }
+
+    fn seek_to_last(&mut self) {
+        Self::seek_to_last(self);
+    }
+
+    fn next(&mut self) {
+        Self::next(self);
+    }
+
+    fn prev(&mut self) {
+        Self::prev(self);
+    }
+
+    /// A memtable lives in memory: there is nothing that can fail to be read.
+    fn status(&self) -> crate::error::Result<()> {
+        Ok(())
     }
 }
 
@@ -274,14 +328,15 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    fn table() -> MemTable {
-        MemTable::new(Arc::new(InternalKeyComparator::new(Arc::new(
-            BytewiseComparator,
+    /// Tests hold the table through an `Arc`, because a cursor keeps one.
+    fn table() -> Arc<MemTable> {
+        Arc::new(MemTable::new(Arc::new(InternalKeyComparator::new(
+            Arc::new(BytewiseComparator),
         ))))
     }
 
     /// Every (user key, seqno) pair in the table, in iteration order.
-    fn walk(table: &MemTable) -> Vec<(Vec<u8>, u64)> {
+    fn walk(table: &Arc<MemTable>) -> Vec<(Vec<u8>, u64)> {
         let mut iter = table.iter();
         iter.seek_to_first();
         let mut out = Vec::new();
@@ -467,7 +522,7 @@ mod tests {
     /// rather than a locked map.
     #[test]
     fn readers_and_writers_run_concurrently() {
-        let table = Arc::new(table());
+        let table = table();
         let writers: Vec<_> = (0..4u64)
             .map(|worker| {
                 let table = Arc::clone(&table);

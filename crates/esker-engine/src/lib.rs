@@ -32,6 +32,7 @@
 //! | [`cache_api`] | the block cache shape the read path is written against |
 //! | [`options`] | knobs, prefix extraction, compression, and the §14 defaults |
 //! | [`mod@format`] | byte sizes that are frozen |
+//! | [`iterator`] | the cursor shape every layer iterates through |
 //! | [`memfs`] | an in-memory filesystem, so damage can be injected without a disk |
 //! | [`memtable`] | the sorted in-memory table every write lands in |
 //! | [`filename`] | every file name, derived from a number that is never reused |
@@ -56,6 +57,7 @@ pub mod dbformat;
 pub mod error;
 pub mod filename;
 pub mod fs;
+pub mod iterator;
 pub mod memfs;
 pub mod memtable;
 pub mod options;
@@ -73,6 +75,7 @@ pub use dbformat::{
 };
 pub use error::{Error, Result};
 pub use fs::{FileSystem, LocalFileSystem, RandomAccessFile, WritableFile};
+pub use iterator::Cursor;
 pub use memtable::MemTable;
 pub use options::{
     CfOptions, Compression, Options, PrefixExtractor, ReadOptions, WalSyncMode, WriteOptions,
