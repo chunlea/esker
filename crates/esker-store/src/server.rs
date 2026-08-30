@@ -349,7 +349,7 @@ impl Store {
     /// regions would report a state fifty `fsync`s old.
     #[must_use]
     pub fn report(&self) -> StoreReport {
-        let regions = self
+        let regions: Vec<RegionReport> = self
             .regions
             .states()
             .into_iter()
@@ -361,7 +361,7 @@ impl Store {
                         is_leader: peer.is_leader(),
                         term: peer.term(),
                         applied_index: peer.applied_index(),
-                        approximate_size: 0,
+                        approximate_size: peer.approximate_size(),
                         region,
                     },
                     // An unreplicated region has no consensus to lead, and this store is the only
@@ -381,13 +381,14 @@ impl Store {
                 }
             })
             .collect();
-        // TODO(phase-4b): `approximate_size` per region from SST properties plus the memtable,
-        // and `applied_bytes` from the same measurement. 4b's split trigger is the first thing
-        // that needs a number here rather than a zero.
+        // `applied_bytes` is the store's share of the same hint each region publishes. Its
+        // limits are `RaftPeer::approximate_size`'s; `capacity` and `available` stay zero until
+        // the engine can be asked how large a key range is (`docs/plans/phase-4.md` §12.3).
+        let applied_bytes = regions.iter().map(|region| region.approximate_size).sum();
         StoreReport {
             capacity: 0,
             available: 0,
-            applied_bytes: 0,
+            applied_bytes,
             regions,
         }
     }

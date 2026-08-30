@@ -170,6 +170,8 @@ pub struct PeerCore {
 pub struct Published {
     term: AtomicU64,
     applied: AtomicU64,
+    /// Bytes this peer's apply has staged, ever. See [`RaftPeer::approximate_size`].
+    size: AtomicU64,
 }
 
 impl PeerCore {
@@ -257,6 +259,11 @@ impl PeerCore {
             }
         };
 
+        // What this entry actually staged, counted before `apply_index` is added to the batch so
+        // that the bookkeeping does not count itself. It is a hint and nothing deterministic reads
+        // it (`docs/plans/phase-4.md` §12.3), which is what lets it be per-peer and approximate.
+        let staged = batch.byte_size() as u64;
+
         // `apply_index` travels with the data it applied. A crash therefore has both or neither,
         // which is what makes replaying from `apply_index + 1` correct and exactly-once.
         self.node
@@ -269,6 +276,7 @@ impl PeerCore {
             .db()
             .write(batch, &WriteOptions { sync: false })?;
         self.applied_index = entry.index;
+        self.published.size.fetch_add(staged, Ordering::Relaxed);
 
         self.complete_proposal(entry, outcome);
         Ok(())
@@ -564,6 +572,24 @@ impl RaftPeer {
     #[must_use]
     pub fn applied_index(&self) -> Index {
         self.published.applied.load(Ordering::Acquire)
+    }
+
+    /// Roughly how many bytes this region holds — the trigger for a split, and what a region
+    /// heartbeat reports (`docs/DESIGN.md` §6).
+    ///
+    /// It is the bytes this peer's *apply* has staged since the process started, and it is wrong
+    /// in three known directions: it does not shrink when a key is deleted or a compaction drops
+    /// an overwrite, it does not count what was on disk before this process opened the database,
+    /// and two peers of one region will not agree on it.
+    ///
+    /// All three are acceptable because **nothing deterministic reads it**. A number that fed into
+    /// apply would have to be identical on every peer or the peers would be two state machines;
+    /// this one only decides when a leader *looks* at its region, and the split key that follows
+    /// comes from the data itself. The honest number needs a per-range size from the engine, which
+    /// it does not expose — `docs/plans/phase-4.md` §12.3 names the accessor and asks for it.
+    #[must_use]
+    pub fn approximate_size(&self) -> u64 {
+        self.published.size.load(Ordering::Relaxed)
     }
 
     /// The error a non-leader answers with.
@@ -1019,6 +1045,51 @@ mod tests {
         let reopened = RaftLogStorage::open(Arc::clone(&db), REGION, ConfState::default()).unwrap();
         assert_eq!(reopened.applied_index(), 3);
         assert_eq!(reopened.last_index().unwrap(), 3);
+    }
+
+    /// The split trigger's input. It has to grow with what was actually written — a counter that
+    /// moved per *entry* rather than per byte would fire a split on a region of a million empty
+    /// keys and never on one holding a single large value.
+    #[tokio::test]
+    async fn the_size_hint_grows_with_the_bytes_that_were_applied() {
+        let (_dir, db) = open_db();
+        let peer = start(&db, 1, vec![1], Arc::new(DiscardTransport));
+        elect_alone(&peer).await;
+
+        // The leader's own no-op has already applied, and it stages nothing but the state record.
+        let empty = peer.approximate_size();
+
+        peer.propose(&Command::Put {
+            key: Bytes::from_static(b"k"),
+            value: Bytes::from(vec![b'v'; 4096]),
+        })
+        .await
+        .unwrap();
+        let after_big = peer.approximate_size();
+        assert!(
+            after_big >= empty + 4096,
+            "4 KiB of value did not reach the hint: {empty} then {after_big}"
+        );
+
+        peer.propose(&Command::Put {
+            key: Bytes::from_static(b"j"),
+            value: Bytes::from_static(b"v"),
+        })
+        .await
+        .unwrap();
+        let after_small = peer.approximate_size();
+        assert!(after_small > after_big, "a small write moved it not at all");
+        assert!(
+            after_small - after_big < 4096,
+            "a one-byte value cost as much as a 4 KiB one"
+        );
+        peer.stop();
+
+        // It is a hint held in memory, and it says so by starting again from nothing. A restart
+        // therefore delays a split rather than mis-sizing one, which is the safe direction.
+        let restarted = start(&db, 1, vec![1], Arc::new(DiscardTransport));
+        assert_eq!(restarted.approximate_size(), 0);
+        restarted.stop();
     }
 
     /// End to end: a command proposed on the leader is replicated, applied, and visible in the

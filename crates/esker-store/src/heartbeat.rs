@@ -47,7 +47,7 @@ pub struct RegionReport {
     pub term: u64,
     /// How far the state machine has applied.
     pub applied_index: u64,
-    /// Approximate bytes of user data. Zero in 4a; `TODO(phase-4b)` measures it.
+    /// Approximate bytes of user data, as [`crate::peer::RaftPeer::approximate_size`] measures it.
     pub approximate_size: u64,
 }
 
@@ -58,7 +58,7 @@ pub struct StoreReport {
     pub capacity: u64,
     /// Bytes free. Zero in 4a.
     pub available: u64,
-    /// Bytes of user data applied. Zero in 4a.
+    /// Bytes of user data applied, across every region this store hosts.
     pub applied_bytes: u64,
     /// Every region this store hosts.
     pub regions: Vec<RegionReport>,
