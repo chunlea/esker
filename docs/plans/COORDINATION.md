@@ -100,6 +100,15 @@ One coordinator (Fable, herdr pane `COORD`) directing coding lanes. Phases are g
 
 ## Incidents
 
+- 2026-08-30 ~07:00 **TEST HOLE (found by cl-p2-client)**: phase-1 `crash_kill.rs`
+  ACK parser never matches the first ACK (libtest glues its line to the child's), so
+  **operation 0 was never verified** in the accepted 1,000-iteration runs. Containment
+  assertion ⇒ weakened, not broken. Fix + tightened assertion + 200-iteration re-run
+  assigned to `cl-p2-client` under a one-time phase-1-test grant.
+- 2026-08-30 ~06:50: `cl-p2-client`'s crash test hung the sibling's workspace test run
+  for 8 minutes via a no-deadline pipe read (self-reported, orphans killed, fixed in
+  d8a7b25 with a 30s deadline). Standing note: any blocking read in a test gets a
+  deadline.
 - 2026-08-30 ~06:40 **ENGINE FINDING (phase-2 lane)**: DESIGN §4.7 claimed v1 rejects
   multi-SST DeleteRange; the engine actually accepted every range and silently treated
   it as a point delete at `begin`. Store works around it (ADR 0006: bounded scan +
