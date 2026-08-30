@@ -1,0 +1,23 @@
+.claude/settings.json
+  s_dc640bf0df4adb::t_212247eab7a80c 1-37
+docs/plans/COORDINATION.md
+  s_dc640bf0df4adb::t_14fce0cdac3dd9 1-38
+.gitignore
+  s_dc640bf0df4adb::t_e45e732d404304 1-3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "c032215cd6f9c6a21b25b731fd0468c481cd4123",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "claude-fable-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
