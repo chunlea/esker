@@ -77,6 +77,14 @@ fn always(outcome: Outcome) -> Rule {
     Rule::new(Matcher::Any, outcome).forever()
 }
 
+/// The limit a scan actually went out with, which is what the capping rules are about.
+fn limit_of(call: &Call) -> u32 {
+    match call.body() {
+        Some(RawKvReq::Scan { limit, .. }) => *limit,
+        other => panic!("expected a scan, got {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // The retry budget
 // ---------------------------------------------------------------------------------------
@@ -483,13 +491,6 @@ fn a_scan_limit_is_capped_and_zero_means_the_protocol_default() {
     harness
         .transport
         .script(always(Outcome::Reply(RawKvResp::Scan { pairs: vec![] })));
-
-    fn limit_of(call: &Call) -> u32 {
-        match call.body() {
-            Some(RawKvReq::Scan { limit, .. }) => *limit,
-            other => panic!("expected a scan, got {other:?}"),
-        }
-    }
 
     harness.client.scan(b"a", b"z", u32::MAX).expect("scan");
     assert_eq!(

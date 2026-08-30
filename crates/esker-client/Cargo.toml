@@ -28,6 +28,10 @@ testing = []
 # The crate's own test harness, for integration tests that link the library as an ordinary
 # dependency and so cannot reach `#[cfg(test)]` code.
 esker-client = { path = ".", features = ["testing"] }
+# `tests/store_model.rs` drives one proptest through both an engine and this client, so the
+# two have to be in scope together. Dev-only: nothing the client ships links the engine.
+esker-engine.workspace = true
+proptest.workspace = true
 
 [lints]
 workspace = true
