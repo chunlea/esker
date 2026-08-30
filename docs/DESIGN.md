@@ -186,6 +186,15 @@ is unit-testable without the `Db`). `CompactionFilter` trait lets `esker-txn` dr
 the safepoint. Range deletions are implemented as range tombstones in v2; v1 rejects `DeleteRange`
 across more than one SST boundary with an error (documented limitation, removed in phase 5).
 
+**What v1 actually does is weaker than that sentence, and phase 2 found it out.** The engine
+accepts every `DeleteRange` and stores it as an entry kind, but every read path — memtable, `get`
+and the iterators alike — treats it as a point `Delete` at the range's `begin` key. Nothing
+rejects a wide range, so a caller is told a range was deleted when one key was. The check
+described above is not implemented. Until it is, no layer above may call
+`WriteBatch::delete_range`: `esker-store` serves `RawKv DeleteRange` as a bounded scan plus point
+deletes in one atomic batch (ADR 0006), and the engine keeps the format so that making the
+tombstone real in phase 5 is not a format change.
+
 ### 4.8 Column families
 
 Shared WAL and seqno space; separate memtables, levels, options (prefix extractor, block size,

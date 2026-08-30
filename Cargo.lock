@@ -87,7 +87,9 @@ dependencies = [
 name = "esker-cli"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "esker-base",
+ "esker-client",
  "esker-engine",
  "tempfile",
 ]
@@ -97,6 +99,7 @@ name = "esker-client"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "esker-base",
  "esker-client",
  "esker-proto",
  "thiserror",
@@ -158,6 +161,16 @@ dependencies = [
 [[package]]
 name = "esker-store"
 version = "0.1.0"
+dependencies = [
+ "bytes",
+ "esker-engine",
+ "esker-keys",
+ "esker-proto",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "esker-txn"

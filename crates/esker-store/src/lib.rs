@@ -15,10 +15,29 @@
 //! * **Apply is deterministic.** Every peer applying the same committed entry produces the
 //!   same `WriteBatch`, including the `apply_index` written with it.
 //!
-//! Phase 0 contains only the raft-CF key prefixes and the scheduling defaults; the store is
-//! phases 2 and 4 (`prompts/02-single-node-server.md`, `prompts/04-multiraft-pd.md`).
+//! # Module map
+//!
+//! | Module | What it decides |
+//! |---|---|
+//! | [`error`] | the store's failures, and which of them a client may safely retry |
+//! | [`region`] | the epoch and key-range checks every request runs |
+//! | [`rawkv`] | the eight `RawKv` methods, over the engine, synchronously |
+//! | [`server`] | opening the database and its column families, and the wire service |
+//!
+//! Phase 2 builds the single-region store (`prompts/02-single-node-server.md`); the apply
+//! loop, splits and snapshots are phase 4 (`prompts/04-multiraft-pd.md`).
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+pub mod error;
+pub mod rawkv;
+pub mod region;
+pub mod server;
+
+pub use error::{Result, StoreError, engine_to_proto};
+pub use rawkv::Limits;
+pub use region::RegionMeta;
+pub use server::{Store, StoreOptions, StoreService};
 
 /// Key prefixes inside the `raft` column family (`docs/DESIGN.md` §6).
 ///

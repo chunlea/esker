@@ -8,5 +8,24 @@ license.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+[dependencies]
+# The storage this store puts a network in front of.
+esker-engine.workspace = true
+# The `'r'` namespace every RawKV key is stored under. A client never sends the prefix, so
+# this is the only place it is applied (docs/DESIGN.md §3, CLAUDE.md invariant 7).
+esker-keys.workspace = true
+# The wire: messages, the typed error, and the Service the server calls.
+esker-proto.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# Async lives at the network edge only. The store uses `spawn_blocking` to keep the
+# synchronous engine off the reactor, and nothing else here is async.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["net", "time"] }
+
 [lints]
 workspace = true
