@@ -92,6 +92,10 @@ One coordinator (Fable, herdr pane `COORD`) directing coding lanes. Phases are g
 
 ## Incidents
 
+- 2026-08-30 ~04:50: watcher blind spot — a lane whose turn ended at 4:23 with a leftover
+  shell kept reporting `working`, so the coordinator missed ~25 idle minutes. Watcher now
+  also detects the "· done H:MM" footer. Lesson: agent_status alone does not mean the
+  agent is busy.
 - 2026-08-30 ~03:24 **ENGINE BUG (found by the crash sweep, before any real workload)**:
   after a partial WAL append error, the log writer kept accepting writes past the torn
   bytes → acknowledged writes after a mid-log tear are lost on recovery (invariant 1).
