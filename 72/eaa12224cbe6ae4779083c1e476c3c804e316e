@@ -1,0 +1,19 @@
+crates/esker-engine/src/db/compact.rs
+  s_54136a52dccd02::t_c0e7a253ad1829 21-26,323-336
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "72eaa12224cbe6ae4779083c1e476c3c804e316e",
+  "prompts": {},
+  "sessions": {
+    "s_54136a52dccd02": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7991e833-93be-4b3f-93b2-2e245ecc2446",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
