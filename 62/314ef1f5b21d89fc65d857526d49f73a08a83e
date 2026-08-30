@@ -1,0 +1,27 @@
+crates/esker-client/Cargo.toml
+  s_4b642fc65050df::t_e8f8fe69914217 15-16
+crates/esker-client/src/gate.rs
+  s_4b642fc65050df::t_21863b5fdc6d2e 1-168
+crates/esker-client/src/lib.rs
+  s_4b642fc65050df::t_635e8c5383d4cc 10-13,18-23,31-33,40-42
+crates/esker-client/src/region_cache.rs
+  s_4b642fc65050df::t_52444a40b8eb9b 1-385
+crates/esker-client/src/retry.rs
+  s_4b642fc65050df::t_00e5c16a4c0847 1-456
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "62314ef1f5b21d89fc65d857526d49f73a08a83e",
+  "prompts": {},
+  "sessions": {
+    "s_4b642fc65050df": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5213f73d-feb9-40c2-99a7-08164cb70247",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
