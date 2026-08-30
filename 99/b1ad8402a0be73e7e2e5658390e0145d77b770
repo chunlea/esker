@@ -1,0 +1,23 @@
+crates/esker-engine/src/db/flush.rs
+  s_583ba4eb96ad8a::t_2c32512d1c6d7b 373
+crates/esker-engine/src/db/mod.rs
+  s_583ba4eb96ad8a::t_ffe86a9431c899 249-289
+crates/esker-engine/tests/db.rs
+  s_583ba4eb96ad8a::t_c4e12c23cac9f2 980-1071
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "99b1ad8402a0be73e7e2e5658390e0145d77b770",
+  "prompts": {},
+  "sessions": {
+    "s_583ba4eb96ad8a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2ac73fb2-9428-4877-ae7d-195e5b69e526",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
