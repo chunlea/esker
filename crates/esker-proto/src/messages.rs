@@ -59,11 +59,23 @@ pub enum Method {
     /// `RawKv::CompareAndSwap`.
     RawCompareAndSwap = 0x0108,
 
+    /// `Pd::Bootstrap` — register a store, and create the cluster if it is the first
+    /// (`docs/DESIGN.md` §7, [`crate::pd`]).
+    PdBootstrap = 0x0301,
+    /// `Pd::StoreHeartbeat`.
+    PdStoreHeartbeat = 0x0302,
+    /// `Pd::RegionHeartbeat`.
+    PdRegionHeartbeat = 0x0303,
+    /// `Pd::GetRegion`.
+    PdGetRegion = 0x0304,
+    /// `Pd::AllocId`.
+    PdAllocId = 0x0305,
+    /// `Pd::Tso`.
+    PdTso = 0x0306,
+
     /// `RaftTransport::Batch` — a tick's worth of Raft messages between two stores
     /// (`docs/DESIGN.md` §6, [ADR 0009](../../docs/adr/0009-the-wire-carries-the-raft-message.md)).
     RaftBatch = 0x0401,
-    // TODO(phase-4): service 0x03, Pd::{Bootstrap, StoreHeartbeat, RegionHeartbeat,
-    //                GetRegion, AllocId, Tso}.
     // TODO(phase-5): service 0x02, TxnKv::{Get, Scan, Prewrite, Commit, Rollback,
     //                ResolveLock, Heartbeat, GcSafepoint}.
 }
@@ -81,7 +93,7 @@ pub const SERVICE_RAFT: u8 = 0x04;
 
 impl Method {
     /// Every method this version defines.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 16] = [
         Self::Hello,
         Self::RawGet,
         Self::RawBatchGet,
@@ -91,6 +103,12 @@ impl Method {
         Self::RawDeleteRange,
         Self::RawScan,
         Self::RawCompareAndSwap,
+        Self::PdBootstrap,
+        Self::PdStoreHeartbeat,
+        Self::PdRegionHeartbeat,
+        Self::PdGetRegion,
+        Self::PdAllocId,
+        Self::PdTso,
         Self::RaftBatch,
     ];
 
@@ -113,6 +131,12 @@ impl Method {
             0x0106 => Some(Self::RawDeleteRange),
             0x0107 => Some(Self::RawScan),
             0x0108 => Some(Self::RawCompareAndSwap),
+            0x0301 => Some(Self::PdBootstrap),
+            0x0302 => Some(Self::PdStoreHeartbeat),
+            0x0303 => Some(Self::PdRegionHeartbeat),
+            0x0304 => Some(Self::PdGetRegion),
+            0x0305 => Some(Self::PdAllocId),
+            0x0306 => Some(Self::PdTso),
             0x0401 => Some(Self::RaftBatch),
             _ => None,
         }
@@ -137,6 +161,12 @@ impl Method {
             Self::RawDeleteRange => "RawKv::DeleteRange",
             Self::RawScan => "RawKv::Scan",
             Self::RawCompareAndSwap => "RawKv::CompareAndSwap",
+            Self::PdBootstrap => "Pd::Bootstrap",
+            Self::PdStoreHeartbeat => "Pd::StoreHeartbeat",
+            Self::PdRegionHeartbeat => "Pd::RegionHeartbeat",
+            Self::PdGetRegion => "Pd::GetRegion",
+            Self::PdAllocId => "Pd::AllocId",
+            Self::PdTso => "Pd::Tso",
             Self::RaftBatch => "RaftTransport::Batch",
         }
     }
@@ -155,7 +185,18 @@ impl Method {
                 | Self::RawDelete
                 | Self::RawDeleteRange
                 | Self::RawCompareAndSwap
+                | Self::PdBootstrap
+                | Self::PdStoreHeartbeat
+                | Self::PdRegionHeartbeat
+                | Self::PdAllocId
+                | Self::PdTso
         )
+    }
+
+    /// Whether this method belongs to the placement driver's service.
+    #[must_use]
+    pub fn is_pd(self) -> bool {
+        self.service() == SERVICE_PD
     }
 }
 
@@ -526,10 +567,10 @@ impl RawKvReq {
                 value: take_opt(input, "value")?,
                 sync: input.get_bool("sync")?,
             },
-            Method::Hello | Method::RaftBatch => {
+            other => {
                 return Err(DecodeError::invalid(
                     "method",
-                    format!("{} is not a RawKv method", method.name()),
+                    format!("{} is not a RawKv method", other.name()),
                 ));
             }
         };
@@ -648,10 +689,10 @@ impl RawKvResp {
                 swapped: input.get_bool("swapped")?,
                 previous: take_opt(input, "previous")?,
             },
-            Method::Hello | Method::RaftBatch => {
+            other => {
                 return Err(DecodeError::invalid(
                     "method",
-                    format!("{} is not a RawKv method", method.name()),
+                    format!("{} is not a RawKv method", other.name()),
                 ));
             }
         };
@@ -671,6 +712,17 @@ pub enum Request {
         /// What to do.
         request: RawKvReq,
     },
+    /// A question for the placement driver. It carries a cluster id rather than a
+    /// [`RequestHeader`]: PD's answers are about the routing table itself, so there is no
+    /// region to address, and the id is what stops one cluster answering for another
+    /// ([`crate::pd`]).
+    Pd {
+        /// The cluster the caller believes it is talking to. Zero means "not known yet",
+        /// which only `Bootstrap` may send.
+        cluster_id: u64,
+        /// What to ask.
+        request: crate::pd::PdReq,
+    },
     /// Raft traffic between two stores. It carries no [`RequestHeader`], because one batch may
     /// hold messages for many regions and each carries its own (`docs/DESIGN.md` §6).
     Raft(RaftBatch),
@@ -689,6 +741,7 @@ impl Request {
         match self {
             Self::Hello(_) => Method::Hello,
             Self::RawKv { request, .. } => request.method(),
+            Self::Pd { request, .. } => request.method(),
             Self::Raft(_) => Method::RaftBatch,
         }
     }
@@ -697,7 +750,7 @@ impl Request {
     #[must_use]
     pub fn header(&self) -> Option<RequestHeader> {
         match self {
-            Self::Hello(_) | Self::Raft(_) => None,
+            Self::Hello(_) | Self::Raft(_) | Self::Pd { .. } => None,
             Self::RawKv { header, .. } => Some(*header),
         }
     }
@@ -711,6 +764,13 @@ impl Request {
             Self::Hello(hello) => out.put_u32(hello.version),
             Self::RawKv { header, request } => {
                 header.encode(&mut out);
+                request.encode(&mut out);
+            }
+            Self::Pd {
+                cluster_id,
+                request,
+            } => {
+                out.put_varint(*cluster_id);
                 request.encode(&mut out);
             }
             Self::Raft(batch) => batch.encode(&mut out),
@@ -727,6 +787,10 @@ impl Request {
                 version: input.get_u32("hello.version")?,
             }),
             Method::RaftBatch => Self::Raft(RaftBatch::decode(&mut input)?),
+            other if other.is_pd() => Self::Pd {
+                cluster_id: input.get_varint("pd.cluster_id")?,
+                request: crate::pd::PdReq::decode(other, &mut input)?,
+            },
             other => {
                 let header = RequestHeader::decode(&mut input)?;
                 Self::RawKv {
@@ -748,6 +812,8 @@ pub enum Response {
     Hello(HelloAck),
     /// The answer to a key-value request.
     RawKv(RawKvResp),
+    /// The placement driver's answer ([`crate::pd`]).
+    Pd(crate::pd::PdResp),
     /// A Raft batch was received. It carries nothing: Raft's own retries are what make a lost
     /// message survivable, so there is no outcome for the sender to act on
     /// ([`RaftTransport`](crate::raft) is fire-and-forget by design).
@@ -761,6 +827,7 @@ impl Response {
         match self {
             Self::Hello(_) => Method::Hello,
             Self::RawKv(response) => response.method(),
+            Self::Pd(response) => response.method(),
             Self::Raft => Method::RaftBatch,
         }
     }
@@ -789,6 +856,7 @@ impl Response {
                 out.put_varint(ack.max_frame_size);
             }
             Self::RawKv(response) => response.encode(&mut out),
+            Self::Pd(response) => response.encode(&mut out),
             // The acknowledgement carries nothing: Raft's own retries are what make a lost
             // message survivable, so there is no outcome for the sender to act on.
             Self::Raft => {}
@@ -807,6 +875,7 @@ impl Response {
                 store_id: input.get_varint("hello.store_id")?,
                 max_frame_size: input.get_varint("hello.max_frame_size")?,
             }),
+            other if other.is_pd() => Self::Pd(crate::pd::PdResp::decode(other, &mut input)?),
             other => Self::RawKv(RawKvResp::decode(other, &mut input)?),
         };
         input.finish()?;
@@ -979,6 +1048,12 @@ mod tests {
             let service = match method {
                 Method::Hello => SERVICE_SYSTEM,
                 Method::RaftBatch => crate::messages::SERVICE_RAFT,
+                Method::PdBootstrap
+                | Method::PdStoreHeartbeat
+                | Method::PdRegionHeartbeat
+                | Method::PdGetRegion
+                | Method::PdAllocId
+                | Method::PdTso => crate::messages::SERVICE_PD,
                 _ => SERVICE_RAW_KV,
             };
             assert_eq!(method.service(), service, "{method:?}");
@@ -989,6 +1064,7 @@ mod tests {
         for service in [
             SERVICE_SYSTEM,
             SERVICE_RAW_KV,
+            crate::messages::SERVICE_PD,
             crate::messages::SERVICE_RAFT,
         ] {
             let mut numbers: Vec<u16> = Method::ALL

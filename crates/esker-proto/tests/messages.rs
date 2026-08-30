@@ -9,6 +9,7 @@
 
 use bytes::Bytes;
 use esker_proto::messages::{DEFAULT_SCAN_LIMIT, Hello, HelloAck, RawKvReq, RawKvResp};
+use esker_proto::pd::{PdReq, PdResp, StoreInfo};
 use esker_proto::{
     Epoch, MAX_FRAME_SIZE, Method, Peer, PeerRole, ProtoError, RaftBatch, RaftMessage, Region,
     Request, RequestHeader, Response, WIRE_VERSION,
@@ -47,9 +48,93 @@ fn header() -> RequestHeader {
     RequestHeader::new(1, Epoch::new(2, 3), 4)
 }
 
+/// The region the `Pd` goldens carry: bounded below, running to the end of the key space
+/// above, and with two peers — so the golden pins the `+infinity` end key as well as the
+/// ordinary fields.
+fn pd_region() -> Region {
+    Region {
+        id: 7,
+        start_key: Bytes::from_static(b"a"),
+        end_key: Bytes::new(),
+        peers: vec![Peer::voter(1, 10), Peer::voter(2, 11)],
+        epoch: Epoch::new(2, 3),
+    }
+}
+
+/// The cluster id every `Pd` golden but `Bootstrap` carries.
+const PD_CLUSTER: u64 = 0xABCD;
+
+/// The `Pd` goldens, in their own function: `docs/DESIGN.md` §9 gives the service six methods,
+/// and a corpus function holding every message of every service is one nobody reads.
+fn golden_pd_requests() -> Vec<(&'static str, Request)> {
+    vec![
+        (
+            "pd-bootstrap",
+            Request::Pd {
+                // Zero: the caller does not know the cluster id yet, which is the whole
+                // reason it is asking.
+                cluster_id: 0,
+                request: PdReq::Bootstrap {
+                    store: StoreInfo::new(1, "127.0.0.1:20160"),
+                },
+            },
+        ),
+        (
+            "pd-store-heartbeat",
+            Request::Pd {
+                cluster_id: PD_CLUSTER,
+                request: PdReq::StoreHeartbeat {
+                    store_id: 1,
+                    capacity: 1 << 40,
+                    available: 1 << 39,
+                    region_count: 3,
+                    leader_count: 1,
+                    applied_bytes: 99,
+                },
+            },
+        ),
+        (
+            "pd-region-heartbeat",
+            Request::Pd {
+                cluster_id: PD_CLUSTER,
+                request: PdReq::RegionHeartbeat {
+                    region: pd_region(),
+                    leader_peer_id: 10,
+                    term: 4,
+                    approximate_size: 1 << 20,
+                    applied_index: 77,
+                },
+            },
+        ),
+        (
+            "pd-get-region",
+            Request::Pd {
+                cluster_id: PD_CLUSTER,
+                request: PdReq::GetRegion {
+                    key: Bytes::from_static(b"key"),
+                },
+            },
+        ),
+        (
+            "pd-alloc-id",
+            Request::Pd {
+                cluster_id: PD_CLUSTER,
+                request: PdReq::AllocId { count: 2 },
+            },
+        ),
+        (
+            "pd-tso",
+            Request::Pd {
+                cluster_id: PD_CLUSTER,
+                request: PdReq::Tso { count: 16 },
+            },
+        ),
+    ]
+}
+
 fn golden_requests() -> Vec<(&'static str, Request)> {
     let h = header();
-    vec![
+    let mut requests = vec![
         ("hello", Request::Hello(Hello::current())),
         ("get", Request::raw_kv(h, RawKvReq::get(&b"key"[..]))),
         (
@@ -144,11 +229,66 @@ fn golden_requests() -> Vec<(&'static str, Request)> {
             "cas-absent",
             Request::raw_kv(h, RawKvReq::compare_and_swap(&b"k"[..], None, None)),
         ),
+    ];
+    requests.extend(golden_pd_requests());
+    requests
+}
+
+fn golden_pd_responses() -> Vec<(&'static str, Response)> {
+    vec![
+        (
+            "pd-bootstrap",
+            Response::Pd(PdResp::Bootstrap {
+                cluster_id: PD_CLUSTER,
+                region: Some(pd_region()),
+            }),
+        ),
+        (
+            // The answer to every `Bootstrap` but the first in the life of a cluster: the
+            // cluster is there and this caller did not create it.
+            "pd-bootstrap-registered",
+            Response::Pd(PdResp::Bootstrap {
+                cluster_id: PD_CLUSTER,
+                region: None,
+            }),
+        ),
+        ("pd-store-heartbeat", Response::Pd(PdResp::StoreHeartbeat)),
+        ("pd-region-heartbeat", Response::Pd(PdResp::RegionHeartbeat)),
+        (
+            "pd-get-region",
+            Response::Pd(PdResp::GetRegion {
+                region: Some(pd_region()),
+                leader_peer_id: 10,
+                stores: vec![StoreInfo::new(1, "127.0.0.1:20160")],
+            }),
+        ),
+        (
+            "pd-get-region-none",
+            Response::Pd(PdResp::GetRegion {
+                region: None,
+                leader_peer_id: 0,
+                stores: Vec::new(),
+            }),
+        ),
+        (
+            "pd-alloc-id",
+            Response::Pd(PdResp::AllocId {
+                start: 1_000,
+                count: 2,
+            }),
+        ),
+        (
+            "pd-tso",
+            Response::Pd(PdResp::Tso {
+                start_ts: 0x1234_5678_9ABC,
+                count: 16,
+            }),
+        ),
     ]
 }
 
 fn golden_responses() -> Vec<(&'static str, Response)> {
-    vec![
+    let mut responses = vec![
         (
             "hello",
             Response::Hello(HelloAck {
@@ -210,7 +350,9 @@ fn golden_responses() -> Vec<(&'static str, Response)> {
             }),
         ),
         ("raft-ack", Response::Raft),
-    ]
+    ];
+    responses.extend(golden_pd_responses());
+    responses
 }
 
 // A list of sixteen literals, one per error code. Splitting it to satisfy a line count would
