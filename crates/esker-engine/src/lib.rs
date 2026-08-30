@@ -37,6 +37,7 @@
 //! | [`filename`] | every file name, derived from a number that is never reused |
 //! | [`wal`] | the write-ahead log: durability, and torn tails told from corruption |
 //! | [`version`] | which files make up the database, and the manifest that records it |
+//! | [`db`] | the database itself: open, group commit, reads, snapshots |
 //! | [`sst`], [`cache`] | the table format and the sharded LRU behind it |
 
 #![warn(unsafe_code)]
@@ -50,6 +51,7 @@
 pub mod batch;
 pub mod cache;
 pub mod cache_api;
+pub mod db;
 pub mod dbformat;
 pub mod error;
 pub mod filename;
@@ -65,13 +67,16 @@ pub mod wal;
 
 pub use batch::WriteBatch;
 pub use cache_api::{BlockCache, CacheKey};
+pub use db::{ColumnFamily, Db, Snapshot};
 pub use dbformat::{
     BytewiseComparator, Comparator, EntryKind, InternalKeyComparator, MAX_SEQNO, SeqNo,
 };
 pub use error::{Error, Result};
 pub use fs::{FileSystem, LocalFileSystem, RandomAccessFile, WritableFile};
 pub use memtable::MemTable;
-pub use options::{Compression, PrefixExtractor, WalSyncMode, WriteOptions};
+pub use options::{
+    CfOptions, Compression, Options, PrefixExtractor, ReadOptions, WalSyncMode, WriteOptions,
+};
 pub use version::{FileMeta, VersionEdit, VersionSet};
 pub use wal::{LogReader, LogWriter, ReadOutcome};
 

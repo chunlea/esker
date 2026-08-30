@@ -4,13 +4,19 @@
 //! here as constants rather than as literals at their use sites so that the design document
 //! and the code can be checked against each other by reading two screens, not twenty.
 //!
-//! The full `Options` / `CfOptions` / `ReadOptions` structures arrive with the `Db` itself
-//! (step 6). What is here is what both lanes of phase 1 need to agree on now: the compression
-//! codes that go on disk, the prefix extractor a bloom filter is built over, and the write
-//! options that decide when a write is durable.
+//! [`Options`] configures the database, [`CfOptions`] one column family, and [`ReadOptions`]
+//! and [`WriteOptions`] one operation. Column families share a write-ahead log, a sequence
+//! number space and a comparator; everything else about them — how big their memtable is, how
+//! their blocks are built, whether they have a prefix bloom filter — is per family
+//! (`docs/DESIGN.md` §4.8).
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
+
+use crate::cache_api::BlockCache;
+use crate::db::Snapshot;
+use crate::dbformat::{BytewiseComparator, Comparator};
 
 /// The per-block compression codec.
 ///
@@ -153,6 +159,128 @@ impl WriteOptions {
     /// Acknowledged before the bytes are durable. A deliberate, explicit trade.
     pub fn unsynced() -> Self {
         Self { sync: false }
+    }
+}
+
+/// How a database is opened.
+#[derive(Debug, Clone)]
+pub struct Options {
+    /// Create the database if the directory does not hold one.
+    pub create_if_missing: bool,
+    /// Fail if it does. Useful when a caller means "this must be new".
+    pub error_if_exists: bool,
+    /// Treat corruption anywhere but a log's final record as fatal. Off, recovery salvages
+    /// what it can and says what it dropped; on, it refuses to open a damaged database.
+    pub paranoid_checks: bool,
+    /// The order keys are stored in. Recorded in the manifest and checked on every reopen.
+    pub comparator: Arc<dyn Comparator>,
+    /// When the engine syncs the log of its own accord.
+    pub wal_sync_mode: WalSyncMode,
+    /// Levels per column family, L0 included.
+    pub num_levels: usize,
+    /// Bytes a group-commit leader drains from the queue before writing.
+    pub group_commit_max_bytes: usize,
+    /// Batches a group-commit leader drains before writing.
+    pub group_commit_max_batches: usize,
+    /// Shared by every column family that does not bring its own.
+    pub block_cache: Option<Arc<dyn BlockCache>>,
+    /// Threads in the compaction pool.
+    pub compaction_threads: usize,
+    /// Defaults for column families this call creates.
+    pub cf_options: CfOptions,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            create_if_missing: false,
+            error_if_exists: false,
+            paranoid_checks: true,
+            comparator: Arc::new(BytewiseComparator),
+            wal_sync_mode: WalSyncMode::default(),
+            num_levels: defaults::NUM_LEVELS,
+            group_commit_max_bytes: defaults::GROUP_COMMIT_MAX_BYTES,
+            group_commit_max_batches: defaults::GROUP_COMMIT_MAX_BATCHES,
+            block_cache: None,
+            compaction_threads: defaults::COMPACTION_THREADS,
+            cf_options: CfOptions::default(),
+        }
+    }
+}
+
+/// How one column family stores its data.
+#[derive(Debug, Clone)]
+pub struct CfOptions {
+    /// Bytes in the active memtable before it is made immutable and flushed.
+    pub write_buffer_size: usize,
+    /// Immutable memtables at which writers are slowed down.
+    pub memtable_slowdown: usize,
+    /// Immutable memtables at which writers are stopped.
+    pub memtable_stop: usize,
+    /// Uncompressed size of an SST data block.
+    pub block_size: usize,
+    /// Entries between restart points inside a block.
+    pub restart_interval: usize,
+    /// Bloom filter bits per key; zero disables the filter.
+    pub bloom_bits_per_key: usize,
+    /// What the filter is built over. `None` means whole keys.
+    pub prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
+    /// Block compression.
+    pub compression: Compression,
+    /// L0 files that trigger a compaction.
+    pub level0_file_num_compaction_trigger: usize,
+    /// L0 files at which writers are slowed down.
+    pub level0_slowdown_writes_trigger: usize,
+    /// L0 files at which writers are stopped.
+    pub level0_stop_writes_trigger: usize,
+    /// Target total bytes of L1.
+    pub max_bytes_for_level_base: u64,
+    /// Size ratio between consecutive levels.
+    pub max_bytes_for_level_multiplier: u64,
+}
+
+impl Default for CfOptions {
+    fn default() -> Self {
+        Self {
+            write_buffer_size: defaults::WRITE_BUFFER_SIZE,
+            memtable_slowdown: defaults::MEMTABLE_SLOWDOWN,
+            memtable_stop: defaults::MEMTABLE_STOP,
+            block_size: defaults::BLOCK_SIZE,
+            restart_interval: defaults::RESTART_INTERVAL,
+            bloom_bits_per_key: defaults::BLOOM_BITS_PER_KEY,
+            prefix_extractor: None,
+            compression: Compression::default(),
+            level0_file_num_compaction_trigger: defaults::L0_COMPACTION_TRIGGER,
+            level0_slowdown_writes_trigger: defaults::L0_SLOWDOWN,
+            level0_stop_writes_trigger: defaults::L0_STOP,
+            max_bytes_for_level_base: defaults::MAX_BYTES_FOR_LEVEL_BASE,
+            max_bytes_for_level_multiplier: defaults::MAX_BYTES_FOR_LEVEL_MULTIPLIER,
+        }
+    }
+}
+
+/// Per-read options.
+#[derive(Debug, Clone)]
+pub struct ReadOptions {
+    /// Read as of this snapshot. `None` means "everything written so far".
+    pub snapshot: Option<Snapshot>,
+    /// Put blocks this read touches into the block cache. Off for a scan that would evict
+    /// everything useful.
+    pub fill_cache: bool,
+    /// Stop an iterator once the key's prefix changes, rather than running to the end of the
+    /// key space (`docs/DESIGN.md` §4.9).
+    pub prefix_same_as_start: bool,
+}
+
+impl Default for ReadOptions {
+    fn default() -> Self {
+        Self {
+            snapshot: None,
+            // Caching what a read touches is what a cache is for; a scan that would evict
+            // everything useful turns it off deliberately.
+            fill_cache: true,
+            prefix_same_as_start: false,
+        }
     }
 }
 

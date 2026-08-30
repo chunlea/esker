@@ -65,6 +65,15 @@ pub enum Error {
     #[error("database is shutting down")]
     ShuttingDown,
 
+    /// This write shared a group commit with another that failed.
+    ///
+    /// Group commit means one writer does the log append and the `fsync` for everyone queued
+    /// behind it, so one failure belongs to all of them. The leader gets the original error;
+    /// everyone else gets this, carrying its message. Reporting success to a follower whose
+    /// bytes never reached the log would break invariant 1 for a write that looked fine.
+    #[error("group commit failed: {0}")]
+    GroupCommit(String),
+
     /// An update failed part-way through, so what is in memory and what is on disk may no
     /// longer agree. Nothing further is attempted; the database has to be reopened, which
     /// re-derives the state from what actually reached the disk.
