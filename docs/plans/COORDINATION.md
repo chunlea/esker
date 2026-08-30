@@ -22,7 +22,15 @@ One coordinator (Fable, herdr pane `COORD`) directing coding lanes. Phases are g
   8 commits, 115 tests, `just check` green (verified independently by coordinator),
   7/40 runtime crates; coordinator reviewed `codec.rs`, `crc32c.rs`, `deny.toml`,
   workspace manifest in full.
-- [ ] Phase 1 — engine (lanes `wy-p1-spine` + `cl-p1-sst`, test lane later)
+- [x] **Phase 1 — engine: ACCEPTED 2026-08-30 ~05:45.** Acceptance battery (Sonnet lane
+  `p1-accept`): GATE PASS — 473 tests; model 10,000 cases; FaultFs 178 torn/0 lost;
+  SIGKILL 1,000 iters/9,796 acks verified; concurrency 2.82M writes; bloom FP 0.88%;
+  coverage region/line 92.7%/93.7% (engine 92/93, keys 99/100, base 95/94); bench
+  fillrandom 342k ops/s, readrandom 378k, readmissing 3.54M (bloom 9.2×), fillseq --sync
+  231 (one honest fsync per write), group commit 117×; deps 15/40; 5/5 golden formats.
+  Four DESIGN drift items found and fixed (bloom-before-disk implemented, §4.8/4.1/4.2/4.6
+  corrected). Coordinator reviewed codec/footer/bloom-probe/WAL-poison in full.
+  One invariant-1 bug found by fault injection and fixed before any real workload.
   - [x] step 4 SST layer (`cl-p1-sst`) — **accepted 2026-08-30 ~03:00**: builder/reader/
     bloom/block/framing + 84 tests; corrupt-any-byte proves the only unchecked bytes are
     the footer's zero padding; coordinator reviewed `footer.rs` in full and the bloom
