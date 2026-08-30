@@ -848,11 +848,19 @@ pub fn seed_override() -> Option<u64> {
 }
 
 /// The seeds a sweep should run: the one in `ESKER_SIM_SEED` if it is set, else `count` of them
-/// starting at `from`.
+/// starting at `from` — or as many as `ESKER_SIM_SEEDS` asks for.
+///
+/// The count is overridable because "the sweep is clean" is a claim about how many seeds were
+/// looked at, and the number in the source is the one CI can afford rather than the largest one
+/// worth running. Widening it is how a fix is checked past the range that found the bug.
 #[must_use]
 pub fn seeds(from: u64, count: u64) -> Vec<u64> {
-    match seed_override() {
-        Some(seed) => vec![seed],
-        None => (from..from + count).collect(),
+    if let Some(seed) = seed_override() {
+        return vec![seed];
     }
+    let count = std::env::var("ESKER_SIM_SEEDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(count);
+    (from..from.saturating_add(count)).collect()
 }

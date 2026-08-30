@@ -764,6 +764,22 @@ mod tests {
         }
         assert_eq!(leader.conf_state().voters, vec![1, 2, 3]);
 
+        // Its own empty entry of term 1 has to commit before it may move a server: until then
+        // there could be a configuration change on a branch it cannot see (§4.1, and
+        // `conf::tests::a_new_leader_refuses_a_conf_change_until_it_has_committed_its_own_term`).
+        for follower in [2, 3] {
+            leader
+                .step(Message::AppendEntriesResponse {
+                    from: follower,
+                    to: 1,
+                    term: 1,
+                    reject: false,
+                    index: 1,
+                    hint_term: 0,
+                    context: bytes::Bytes::new(),
+                })
+                .unwrap();
+        }
         leader
             .propose_conf_change(crate::types::ConfChange::new(
                 crate::types::ConfChangeKind::AddLearner,

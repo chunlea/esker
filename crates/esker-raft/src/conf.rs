@@ -115,12 +115,12 @@ impl<S: LogStorage> Raft<S> {
         if let Some(at) = self.conf.pending() {
             return Err(RaftError::ConfChangePending(at));
         }
-        // The tracker only knows about changes *this* node appended, and a leader inherits a tail
-        // it cannot judge: §5.4.2 says an entry from an earlier term does not commit by counting
-        // replicas, so until this leader commits an entry of its own term it does not know whether
-        // the tail holds a configuration change that is still revertible. Refuse until it does.
-        if self.log.committed < self.pending_conf_index {
-            return Err(RaftError::ConfChangePending(self.pending_conf_index));
+        // The tracker only knows about changes *this* node appended, and there may be a branch
+        // this leader has never seen carrying one that is still in force where it was appended.
+        // Committing an entry of its own term is what rules that out: it puts this branch on a
+        // quorum, so every future leader has it and no other branch can commit anything again.
+        if self.log.committed < self.own_term_index {
+            return Err(RaftError::ConfChangePending(self.own_term_index));
         }
 
         if let Some(target) = self.lead_transferee {
@@ -508,23 +508,25 @@ mod tests {
         );
     }
 
-    /// **§4.1, and the reason a new leader waits.** A leader inherits a log tail it cannot judge:
-    /// §5.4.2 forbids it counting replicas of an earlier term's entry, so it cannot tell whether a
-    /// configuration change down there is committed or still revertible. Until it commits an entry
-    /// of its own term it must refuse to propose another one.
+    /// **§4.1, and the reason a new leader waits.** A leader may not move a server until it has
+    /// committed an entry of its *own term*.
     ///
-    /// The node here has restarted, which is how the tail becomes invisible: `RawNode::new` takes
-    /// the configuration from storage and does not replay the log, so the tracker's stack is
-    /// empty and `pending()` — which only knows about changes *this* node appended — says nothing
-    /// is outstanding. The change at index 2 is nevertheless uncommitted, and proposing over it is
-    /// how two configurations one server either side of a common parent, and so two servers from
-    /// each other, end up in force at once: quorums that need not overlap, and two leaders in one
-    /// term. The simulator reached exactly that on `ESKER_SIM_SEED=42650`.
+    /// Everything this node inherited is committed — `commit` and `last` are both 2 when it takes
+    /// office, and the change at index 2 is settled — so there is nothing it can see that is
+    /// outstanding. It must still wait, because what it cannot see is the point: another node may
+    /// hold a branch, higher up than anything here, carrying a configuration change that is in
+    /// force where it was appended. Two changes from one committed parent are one server either
+    /// side of it and so two servers, and no shared quorum, from each other.
+    ///
+    /// Committing an entry of its own term is exactly what rules that out. It puts this branch on
+    /// a quorum, so every later leader has it (§5.4) and the other branch can never commit
+    /// anything again. Waiting only for the *inherited* tail is not the same test and does not
+    /// catch this: on `ESKER_SIM_SEED=53017` node 1 took office with `commit == last`, passed
+    /// that weaker test on the spot, removed a server — and node 2, still holding an uncommitted
+    /// removal of a different server from the same parent, went on to win a later term against a
+    /// quorum that shared nobody with the one that had committed node 1's change.
     #[test]
     fn a_new_leader_refuses_a_conf_change_until_it_has_committed_its_own_term() {
-        // Durable state of a node that appended "add voter 4" at index 2 and died before it
-        // committed: the log holds it, and the configuration storage kept is the one that entry
-        // established, exactly as `InitialState::conf_state` is specified.
         let mut storage = MemStorage::with_conf_state(ConfState::from_voters(vec![1, 2, 3, 4]));
         storage
             .append(&[Entry::empty(1, 1), Entry::conf_change(1, 2, &add_voter(4))])
@@ -532,13 +534,17 @@ mod tests {
         storage.set_hard_state(HardState {
             term: 1,
             voted_for: None,
-            commit: 1,
+            commit: 2,
         });
 
         let mut config = Config::new(1, vec![1, 2, 3, 4], 310);
         config.pre_vote = false;
         let mut node = RawNode::new(config, storage).unwrap();
-        assert_eq!(node.commit_index(), 1, "index 2 is not committed");
+        assert_eq!(
+            node.commit_index(),
+            2,
+            "everything it inherited is committed"
+        );
 
         // It wins term 2 on votes from 2 and 3 — a quorum of four is three, counting itself.
         node.campaign().unwrap();
@@ -557,13 +563,13 @@ mod tests {
         assert!(
             matches!(
                 node.propose_conf_change(ConfChange::new(ConfChangeKind::Remove, 2)),
-                Err(RaftError::ConfChangePending(2))
+                Err(RaftError::ConfChangePending(3))
             ),
-            "the inherited tail holds an uncommitted change this leader cannot see"
+            "nothing of this leader's own term is committed yet, so its branch is not settled"
         );
 
-        // Its own empty entry of term 2 sits at index 3; committing that commits everything below
-        // it (§5.4.2), which settles the tail and lets the next change through.
+        // Its own empty entry of term 2 sits at index 3. Committing that settles this branch, and
+        // there is nothing left to be uncertain about.
         for follower in [2, 3] {
             node.step(Message::AppendEntriesResponse {
                 from: follower,
@@ -579,8 +585,7 @@ mod tests {
         assert_eq!(node.commit_index(), 3, "the leader committed its own term");
         assert!(
             node.propose_conf_change(ConfChange::new(ConfChangeKind::Remove, 2))
-                .is_ok(),
-            "with the tail settled there is nothing left to be uncertain about"
+                .is_ok()
         );
     }
 

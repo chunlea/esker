@@ -162,9 +162,6 @@ impl<S: LogStorage> Raft<S> {
         self.leader = Some(self.id);
 
         let last = self.log.last_index()?;
-        // §4.1: nothing this leader inherited may be assumed committed until it has committed
-        // something of its own term, so no configuration change may be proposed until then.
-        self.pending_conf_index = last;
         let conf = self.conf.current().clone();
         for peer in conf.members() {
             self.progress.insert(
@@ -175,6 +172,10 @@ impl<S: LogStorage> Raft<S> {
 
         let index = last.saturating_add(1);
         self.log.append(vec![Entry::empty(self.term, index)])?;
+        // §4.1: until *this* entry commits, this leader's branch is not yet the one the cluster
+        // has settled on, and no configuration change may be proposed over what might still be
+        // out there.
+        self.own_term_index = index;
         if let Some(own) = self.progress.get_mut(self.id) {
             own.matched = index;
             own.become_replicate();

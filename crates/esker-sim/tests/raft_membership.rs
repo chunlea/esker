@@ -146,12 +146,15 @@ fn membership_changes_under_faults_hold_every_property() {
 /// * A configuration change re-applied from a *duplicate* append, which dropped every later
 ///   change off the tracker's stack while the entries stayed in the log (987d472). Thirteen
 ///   seeds, all of them `membership: core against its log`.
-/// * A leader proposing a configuration change before it had committed an entry of its own term,
-///   so it could not know whether the tail it inherited held one already (b668af3). That is how
-///   `ESKER_SIM_SEED=42650` got two leaders in term 12 — node 2 under `[1, 2, 3]`, node 3 under
-///   `[1, 3, 5]`, one server either side of a common `[1, 2, 3, 5]` and so two servers, and no
-///   shared quorum, from each other. It took election safety, all three leader-completeness
-///   seeds, the snapshot-metadata seed and four committed-twice seeds with it.
+/// * A leader proposing a configuration change before it had committed an entry of its own term
+///   (b668af3). That is how `ESKER_SIM_SEED=42650` got two leaders in term 12 — node 2 under
+///   `[1, 2, 3]`, node 3 under `[1, 3, 5]`, one server either side of a common `[1, 2, 3, 5]` and
+///   so two servers, and no shared quorum, from each other. It took election safety, all three
+///   leader-completeness seeds, the snapshot-metadata seed and four committed-twice seeds with
+///   it. The first version of that rule tested the wrong thing — whether the *inherited* tail was
+///   committed, which is satisfied on the spot by a leader whose log was already fully committed
+///   when it won — and `ESKER_SIM_SEED=53017`, past the 3000, walked straight through it. The
+///   test is now the leader's own entry, which is the thing that actually settles the branch.
 /// * This harness reading a compaction boundary out of storage against a commit index out of the
 ///   core, which are two different logs for as long as a snapshot the core has accepted has not
 ///   been written (15f34fc). Three committed-twice seeds and one membership seed.
@@ -162,21 +165,33 @@ fn membership_changes_under_faults_hold_every_property() {
 ///   change was truncated away, the configuration stayed, and node 2 won a term with two of its
 ///   three imagined voters.
 ///
-/// It is green now, and the census is what keeps it honest: a sweep that stops at its first
-/// failing seed would have reported each of those five as "the" bug in turn.
+/// It is green now, and green over `ESKER_SIM_SEEDS=20000` — which is how the last of those was
+/// found at all, since the acceptance range is what CI can afford rather than the limit of what
+/// is worth running. The census is what keeps the number honest: a sweep that stops at its first
+/// failing seed would have reported each of these as "the" bug in turn.
+///
+/// # Past the gate
+///
+/// `ESKER_SIM_SEEDS=100000` is not clean: five seeds, in three classes — `a non-voter was
+/// elected` (86496, 95728), `leader completeness` (62138, 113183) and `election safety` (114249).
+/// They are outside the acceptance range and are not what this gate promises, but they are real,
+/// and they are the next thing to go after. Widening the sweep is how they were found; the number
+/// in the source is a budget, not a claim about where the bugs stop.
 #[test]
 #[ignore = "the thousands-of-seeds membership run; minutes, not seconds"]
 fn thousands_of_membership_seeds() {
     let mut changes = 0;
     let mut joins = 0;
     let mut census = Census::default();
-    for seed in seeds(41_000, 3_000) {
+    let sweep = seeds(41_000, 3_000);
+    let count = sweep.len();
+    for seed in sweep {
         let mut cluster = Cluster::with_spares(seed, FaultPlan::reconfiguring(), 3, 2).unwrap();
         census.record(cluster.run(EVENTS));
         changes += cluster.stats().conf_changes;
         joins += cluster.stats().joins;
     }
-    println!("3000 seeds x {EVENTS} events: {changes} conf changes, {joins} servers started");
+    println!("{count} seeds x {EVENTS} events: {changes} conf changes, {joins} servers started");
     assert!(changes > 0 && joins > 0);
     assert!(census.is_clean(), "{census}");
 }

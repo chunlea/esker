@@ -104,16 +104,24 @@ pub(crate) struct Raft<S: LogStorage> {
     /// The target of an in-flight leadership transfer. While it is set the leader refuses
     /// proposals, so that none is left owned by a leader that is stepping down.
     pub(crate) lead_transferee: Option<NodeId>,
-    /// The index this leader has to commit through before it may propose a configuration change:
-    /// the last index of the log it inherited when it took office (dissertation §4.1).
+    /// The index of the first entry this leader appended in its own term. Until that entry is
+    /// committed, no configuration change may be proposed (dissertation §4.1).
     ///
     /// A new leader cannot tell whether the entries it inherited are committed — §5.4.2 forbids
-    /// it counting replicas of an earlier term's entry — so it cannot tell whether one of them is
-    /// a configuration change that is still revertible. Proposing on top of one is how two
-    /// configurations that are each one server from a common parent, and therefore *two* from each
-    /// other, end up in force at the same time on different branches: their quorums need not
-    /// overlap, and two leaders of one term is what that buys.
-    pub(crate) pending_conf_index: Index,
+    /// it counting replicas of an earlier term's entry — and it cannot see the branches it does
+    /// *not* hold at all. Either way there may be a configuration change out there that is still
+    /// revertible, and proposing over one is how two configurations that are each one server from
+    /// a common parent, and therefore *two* from each other, end up in force at the same time on
+    /// different branches: their quorums need not overlap, and two leaders of one term is what
+    /// that buys.
+    ///
+    /// Committing an entry of its own term is exactly what settles that. It puts this leader's
+    /// branch on a quorum, so every future leader has it (§5.4) and no other branch can commit
+    /// anything again — including any configuration change on one. Committing through the last
+    /// index it *inherited* is not the same thing and is not enough: those entries can all be
+    /// committed already while another branch, higher up and invisible from here, still carries a
+    /// change that is in force on the node that appended it.
+    pub(crate) own_term_index: Index,
 }
 
 impl<S: LogStorage> Raft<S> {
@@ -171,7 +179,7 @@ impl<S: LogStorage> Raft<S> {
             check_quorum: config.check_quorum,
             rng: config.rng,
             lead_transferee: None,
-            pending_conf_index: 0,
+            own_term_index: 0,
         };
         if replay {
             raft.replay_conf_changes()?;
