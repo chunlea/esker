@@ -1,6 +1,6 @@
 # Phase 4 plan — many regions, and the driver that places them
 
-Status: **in progress** — 4a open, 4b–4e gated. Written before implementation; §9 records progress
+Status: **in progress** — 4a accepted, 4b open, 4c–4e gated. Written before implementation; §9 records progress
 and §10 what changed. Spec: `prompts/04-multiraft-pd.md`. Constitution: `CLAUDE.md` (invariant 5 is
 this phase's whole subject). Design: `docs/DESIGN.md` §2, §6, §7, §9, §14.
 
@@ -43,8 +43,8 @@ wire. So:
 
 | # | Sub-phase | Opens |
 |---|---|---|
-| 4a | Regions and routing: many `RawNode`s per store, ownership checks, PD v1, the client's cache | now |
-| 4b | Split: size check, split key, the `Split` admin entry through Raft, epoch bumps | after 4a |
+| 4a | Regions and routing: many `RawNode`s per store, ownership checks, PD v1, the client's cache | **accepted** |
+| 4b | Split: size check, split key, the `Split` admin entry through Raft, epoch bumps | now (§12) |
 | 4c | Snapshot transfer and peer movement: `checkpoint(range)` streamed, `AddPeer`/`RemovePeer`, replica repair | after 4b |
 | 4d | Balance: leader and region-count operators, `esker-cli region ls/split/transfer-leader` | after 4c |
 | 4e | PD high availability: three PDs replicated with `esker-raft`, TSO high-water mark through Raft | after 4d |
@@ -344,3 +344,115 @@ this one.
 
 The client's region cache is keyed by `start_key`, not by `end_key` (§10, item 2). Ratified: the
 `end_key` keying the brief asked for is the trap, and this shape is the one to build on.
+
+## 12. Sub-phase 4b — split
+
+Spec: `prompts/04-multiraft-pd.md` 4b, `docs/DESIGN.md` §6's Split bullet — whose *"(phase 4 — not
+yet implemented)"* qualifier comes off in the commit that implements it. The rows of §6's race list
+that involve a split are this sub-phase's test targets.
+
+4a made the key space something a store can hold several pieces of. 4b makes the pieces *move*: one
+region becomes two, on every peer, atomically, while writes are in flight. Every ownership check 4a
+built and could not make fail can now fail, which is the point.
+
+### 12.1 Units (one commit each)
+
+| # | Unit | Files |
+|---|---|---|
+| 0 | This section | `docs/plans/phase-4.md` |
+| 1 | Approximate region size, and the leader's periodic check | `esker-store/src/peer.rs`, `split.rs` (NEW) |
+| 2 | Split-key selection, and ADR 0010 | `esker-store/src/split.rs`, `docs/adr/0010-*.md` |
+| 3 | The `Split` command: proposed by the leader, applied on every peer | `esker-store/src/apply.rs`, `peer.rs`, `regions.rs`, `server.rs` |
+| 4 | Routing after a split: heartbeat on change, both halves in `EpochNotMatch` | falls out of 4a; asserted in unit 5 |
+| 5 | The test battery | `esker-store/tests/split.rs` (NEW), `tests/multi_region.rs` |
+| 6 | DESIGN §6's Split bullet, and this section closed | `docs/DESIGN.md`, this plan |
+
+### 12.2 The six decisions worth writing down before the code
+
+**A split is a `Command`, not a new `EntryKind`.** `esker-raft` has `Normal` and `ConfChange` and is
+another lane's crate; more to the point, invariant 4 says the core is byte-opaque, so an admin entry
+it could *recognise* would be a leak of store semantics into consensus. `Command` gains tag 6.
+Existing tags and their goldens are untouched — this is an addition to the payload format, not a
+change to it.
+
+**The parent stops serving keys ≥ `split_key` at apply, and the check that enforces it is at apply
+too.** A write proposed before the split entry but ordered after it must not land in the parent.
+Carrying the proposer's epoch in the payload would work and would be a format change; it is not
+needed, because the *range* is the observable content of the epoch for this question. `apply::stage`
+takes the region's **current** range and refuses a key outside it. Every peer applies the same
+entries in the same order, so every peer's range at entry *N* is identical and the refusal is
+deterministic — which is the only kind of refusal apply is allowed to make. The proposer's pending
+notify fails with `EpochNotMatch`, the client refreshes, and the retry lands on the right half.
+
+That has a consequence worth naming: `apply` must now tell a **deterministic refusal** from a
+**corrupt payload**. The first completes one proposal with an error and moves on; the second is
+still a hard failure of the driver, because a payload that cannot be decoded cannot be applied and
+skipping it would make this peer's state machine differ from every other's.
+
+**Replay is made idempotent by the range, not by a flag.** After a split, the parent is
+`[start, split_key)` and `split_key` is no longer *strictly inside* it. So "is `split_key` strictly
+inside my current range?" is the whole idempotence check: a replayed split entry answers no and is a
+no-op. No marker, no second record, nothing to keep in step.
+
+**Both halves' `'m'` records go in the same batch as `apply_index`.** A crash therefore has both or
+neither — the same argument phase 3 made for `apply_index` travelling with the data it applied. The
+in-memory region map is updated *after* the batch lands; if the process dies in between, the map is
+gone anyway and `Store::open` rebuilds it from the records, which did land. The map update itself
+replaces the parent and inserts the child **under one write lock**, so the two never overlap even
+transiently.
+
+**The child's log starts at index 0, and its `conf_state` is the split-time membership.** This is
+the anchor rule of `91de89a` applied to a region that has no history: `InitialState::conf_state` is
+specified as the membership *as of the index the log begins after*, and the child's log begins after
+index 0 — so the split-time membership is exactly right, and `RaftLogStorage::open` writing it at
+bootstrap is exactly the right write. The child's group then elects from scratch. The parent's
+leader usually wins, because its peer is on the store with the parent's data and the others start at
+the same index — but nothing may assume it, and no code here does.
+
+**The child's peer ids are paired positionally with the parent's, sorted.** `Split` carries
+`new_peer_ids`; every peer sorts the parent's peers by `peer_id` and takes `new_peer_ids[i]` for
+`parent.peers[i]`. Deterministic on every peer, which is what matters — a store deciding "my child
+peer id is the one PD gave *me*" would need PD in the apply path.
+
+### 12.3 Approximate size — and the engine accessor that is missing
+
+`prompts/04` asks for "approximate size from SST properties + memtable". **The engine exposes
+neither per range.** `Db::property` offers `esker.mem-table-size.<cf>` (a whole column family, not a
+key range) and `esker.num-files-at-level<n>.<cf>` (a count, not bytes); `Version::overlapping` and
+`FileMeta::file_size` are exactly what is wanted and `Db`'s `versions` field is `pub(crate)`.
+`Db::checkpoint` reaches them but only to copy files.
+
+Reported rather than worked around, per this lane's brief. **What 4b does instead:** each peer keeps
+an in-memory counter of the bytes its own apply has staged, published beside `term` and
+`applied_index` for readers that must not wait on the driver. It is a *hint* and nothing
+deterministic reads it — a counter that differed between peers would be a second state machine — so
+being per-peer, never shrinking on delete, and resetting to zero on restart are all acceptable. Its
+only jobs are to trigger the size check and to fill in `RegionHeartbeat::approximate_size`, which
+4a had to report as zero.
+
+The accessor `esker-engine` would need is one method:
+`Db::approximate_size(cf, begin, end) -> Result<u64>`, summing `file_size` over
+`Version::overlapping` plus the memtables' share. **Requested for 4c**, where snapshot transfer
+wants the same number for a different reason.
+
+### 12.4 Test list
+
+| Area | Tests |
+|---|---|
+| size | the counter grows with applied bytes and is published without asking the driver; a restart starts it at zero and says so |
+| split key | strictly inside `(start, end)` for a region with 1, 2 and many keys; a region whose keys cannot be split — one key, or all keys equal to `start` — is refused rather than split degenerately; the midpoint of a skewed distribution is still a legal boundary |
+| apply | both halves' records and `apply_index` land in one batch; the parent's range narrows and its `version` bumps; the child's `conf_state` is the split-time membership; a replayed split entry is a no-op |
+| the transient invariant | after the apply, the map's ranges are a contiguous partition with no overlap — asserted inside the split test, since the phase-4 simulator checks it globally only later |
+| the parent's new bound | a write to a key ≥ `split_key` proposed before the split and ordered after it is refused at apply, and the proposer is told `EpochNotMatch` rather than left waiting |
+| routing | a stale-epoch request to the parent gets **both** halves; the client's cache replaces the parent with the two and the next call to either is served from cache |
+| the prompt's | continuous writes across a region that splits **ten** times at a low threshold: every write durable and readable afterwards, and a scan across every boundary in order |
+| race: split × leader change | the leader is killed while a split is in flight; on reopen every peer shows both halves or neither, and the cluster converges |
+| race: stale epoch after split | the epoch matrix extended — parent stale, child unknown to the client, child's id not yet in PD |
+
+### 12.5 Non-goals for 4b
+
+- **Merge.** Post-v1, as `docs/DESIGN.md` §6 says.
+- **Snapshot transfer**, `AddPeer`/`RemovePeer`, replica repair. 4c.
+- **Balance operators and `esker-cli region`.** 4d.
+- **The simulator's split coverage** — 50 regions, random splits, 100,000 events per seed. That is
+  phase-4 acceptance and belongs to the sim lane; these tests are store-level.
