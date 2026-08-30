@@ -195,8 +195,9 @@ needed; the kill -9 loop still runs for real durability.
 - [x] step 6 — `Db` — open/recovery/group commit/snapshots (6a), memtable switch, background
       flush to L0 and level reads (6b), the merge cursor and `DbIterator` (6c), runtime
       `create_cf`/`drop_cf` (6d)
-- [ ] step 7 — compaction *(next)*
-- [ ] step 8 — checkpoint + ingest
+- [x] step 7 — compaction: the picker (7a), `CompactionJob` and `CompactionFilter` (7b), the
+      bounded pool, `compact_range` and the file-level wiring (7c)
+- [ ] step 8 — checkpoint + ingest *(next)*
 - [ ] step 9 — `esker-cli` tools + bench numbers
 
 ## 10. Changes vs plan
@@ -246,3 +247,16 @@ needed; the kill -9 loop still runs for real durability.
 13. **`Error` gained `GroupCommit` and `Poisoned`.** A failed group commit belongs to every
     writer in it; a failed manifest write means memory and disk may disagree, and the honest
     answer is to stop rather than guess.
+14. **A snapshot belongs to one open database.** Sequence numbers survive a reopen, so a stale
+    handle names a plausible number and used to be believed. The reopened database's list has
+    never heard of it, so the compaction floor can sit above it and collect what it pinned.
+    Every list carries an instance id and both read paths refuse a foreign handle.
+15. **Compaction pointers stay in memory.** They are a scheduling hint; persisting them would
+    be a manifest format change for something whose loss costs only the spreading of
+    compactions across the key space.
+16. **`CompactionOutput::finish_file` reports whether it produced a file**, and the job calls
+    it unconditionally. An SST builder reports *bytes written*, which is zero while a small
+    file's entries are still in an unflushed block — so a size-based check made a compaction
+    delete its inputs and write nothing.
+17. **A trivial move is skipped when a compaction filter is configured.** The move is only
+    trivial while the output would be byte-identical, and a filter may change it.
