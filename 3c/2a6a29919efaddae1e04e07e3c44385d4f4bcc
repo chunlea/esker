@@ -1,0 +1,18 @@
+crates/esker-sql/tests/corpus/pg19.sql
+  h_44076b318daf9c 1-396
+docs/plans/phase-6a.md
+  h_44076b318daf9c 32-37,204-208,262,264-292,294-332,337,358-366
+crates/esker-sql/tests/syntax_corpus.rs
+  h_44076b318daf9c 1-317
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "3c2a6a29919efaddae1e04e07e3c44385d4f4bcc",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
