@@ -105,6 +105,47 @@ accepts a `DeleteRange` and does not honour it is the exact failure §4.7 refuse
 worse than the refusal: the refusal is loud and the acceptance is silent, and by the time anyone
 noticed, the logs would contain entries the reader disagrees with.
 
+## Decision 6 (open): how a tombstone reaches below L0
+
+**Not settled. The format above does not depend on it, which is why this ADR lands ahead of it.**
+
+Decision 3 widens a table's key bounds to span its tombstones, and that is safe at L0, whose files
+overlap by design and are all consulted. It is **not** safe below L0 as written, and the reason is
+worth recording because it is not obvious:
+
+`DbInner::search_levels` finds the one file per level that can hold a key with
+`partition_point(|file| file.largest < target)`. That is correct only because a level's files
+partition the key space, so `largest` is non-decreasing across the level. Widening one file's bounds
+to span a tombstone can push its `largest` past the next file's `smallest`, and then the binary
+search can return the earlier file for a key the later one holds — a read that misses the key
+entirely, silently.
+
+Three ways out, in increasing order of how much they change:
+
+**(i) Clip tombstones to output boundaries at compaction.** Each output file carries the part of each
+tombstone that falls in `[its first key, the next output's first key)`. `largest` then never passes
+the next file's `smallest` by more than the single boundary key, so the partition invariant survives
+and `search_levels` needs only to scan forward from the partition point while the file still covers
+the key — at most two files. This is what RocksDB does. It needs the compaction's input selection to
+already cover the tombstones' full range, or a tombstone that reaches beyond the compaction loses the
+keys it should have covered outside it.
+
+**(ii) Discharge tombstones at L0 and never propagate them.** A compaction whose inputs carry a
+tombstone must also take every lower-level file overlapping its range; it then drops the covered keys
+and drops the tombstone with them. Nothing below L0 ever holds one, `search_levels` is untouched, and
+reads consult only the memtable, the immutables and L0. The cost is that a `DeleteRange` forces one
+compaction over the deleted range — which for `DROP TABLE` and a GC sweep is work that has to happen
+anyway, and happens once.
+
+**(iii) A per-level tombstone index on the `Version`.** File bounds stay untouched and the read path
+asks the version rather than a file. It needs `FileMeta` to record whether a file has tombstones,
+which is a manifest format change, and it moves state into the version set that has to be rebuilt on
+open.
+
+(ii) is the smaller change and is enough for both of phase 5's users; (i) is the general one. Whoever
+implements the read half should pick before writing any of it, because the choice decides whether
+compaction or the picker is the piece that moves.
+
 ## Consequences
 
 - `EntryKind::DeleteRange` and the `WriteBatch`/WAL layouts are unchanged, which is what freezing
@@ -114,5 +155,8 @@ noticed, the logs would contain entries the reader disagrees with.
   why it existed.
 - A compaction at the bottom level drops entries covered by a tombstone outright, and drops the
   tombstone with them once nothing below it survives — the same rule that governs point deletes.
+- Until decision 6 is settled and the read paths honour tombstones, `Db::write` keeps refusing
+  `DeleteRange` and `esker-store` keeps ADR 0006's workaround. Decision 5 is why: a database that
+  accepts a range delete it does not honour is worse than one that refuses it.
 - The GC compaction filter phase 5's store half needs is now expressible: a safepoint sweep is a
   range delete per key prefix rather than a scan.
