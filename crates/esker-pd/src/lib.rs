@@ -38,6 +38,7 @@ pub mod alloc;
 pub mod clock;
 pub mod error;
 pub mod keys;
+pub mod operator;
 pub mod pd;
 pub mod record;
 pub mod routing;
@@ -46,6 +47,7 @@ pub mod tso;
 
 pub use clock::{Clock, SystemClock};
 pub use error::{PdError, Result};
+pub use operator::{Cancelled, InFlight, Observed, Progress};
 pub use pd::{Bootstrapped, Pd, PdOptions, RegionRoute};
 pub use record::{ClusterRecord, RegionRecord, StoreRecord, StoreStats};
 pub use routing::{RegionBeat, StoreBeat, Upsert};
