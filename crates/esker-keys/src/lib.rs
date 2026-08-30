@@ -18,4 +18,10 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-// TODO(phase-0): codec and prefix modules land in the next commits.
+pub mod codec;
+pub mod prefix;
+
+pub use codec::{
+    CodecError, Value, ValueKind, dec_ts, decode_bytes, decode_i64, decode_tuple, decode_u64,
+    enc_ts, encode_bytes, encode_i64, encode_tuple, encode_u64,
+};
