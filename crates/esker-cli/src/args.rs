@@ -31,6 +31,7 @@ use crate::cluster::ClusterOptions;
 use crate::manifest_dump::DumpOptions as ManifestDumpOptions;
 use crate::pd::{InspectOptions, PdCommand, ServeOptions};
 use crate::raw::{RawCommand, RawOptions, from_hex};
+use crate::region::{RegionCommand, RegionOptions};
 use crate::server::ServerOptions;
 use crate::sst_dump::DumpOptions;
 use crate::wal_dump::DumpOptions as WalDumpOptions;
@@ -58,6 +59,8 @@ pub(crate) enum Command {
     Cluster(ClusterOptions),
     /// Run the placement driver, or print what it has stored.
     Pd(PdCommand),
+    /// Look at, split, or hand over a region.
+    Region(RegionOptions),
 }
 
 /// Why the arguments could not be understood.
@@ -86,6 +89,8 @@ pub(crate) enum ParseError {
     UnknownRawCommand(String),
     /// A `pd` verb this build does not know.
     UnknownPdCommand(String),
+    /// A `region` verb this build does not know.
+    UnknownRegionCommand(String),
     /// `--hex` was given and an argument is not hex.
     InvalidHex(String),
 }
@@ -118,6 +123,10 @@ impl fmt::Display for ParseError {
                 formatter,
                 "unknown pd command `{verb}`; expected serve or inspect"
             ),
+            ParseError::UnknownRegionCommand(verb) => write!(
+                formatter,
+                "unknown region command `{verb}`; expected ls, split or transfer-leader"
+            ),
             ParseError::InvalidHex(value) => write!(
                 formatter,
                 "`{value}` is not hex; --hex needs an even number of hex digits"
@@ -149,6 +158,7 @@ Commands:
   server                Open a store and serve the RawKV API
   cluster start|stop    Start or stop a local cluster replicating one region
   pd serve|inspect      Run the placement driver, or print what it has stored
+  region <verb> ...     Look at, split, or hand over a region
 
 Options:
   -V, --version         Print the version
@@ -193,6 +203,19 @@ Server options:
 
 Ctrl-C stops the listener, lets in-flight requests finish and closes the
 database. A second one does not wait.
+
+Region options:
+  region ls                 Print every region in the cluster, in key order
+  region split <key>        Split the region covering <key>, at <key>
+  region transfer-leader <region-id> <peer-id>
+                            Hand a region's leadership to one of its peers
+      --pd HOST:PORT        The placement driver to route through
+                            (default 127.0.0.1:2379)
+      --hex                 Read <key> as hex, and print keys as hex
+
+Routing goes through the placement driver; the work goes to the region's
+leader, which refuses rather than forwarding if it is not the leader. A
+transfer is *asked for*: what completes it is an election.
 
 Raw options:
   raw get <key>             Print the value, or exit 1 if the key is absent
@@ -246,6 +269,7 @@ where
         "server" => parse_server(&arguments[1..]),
         "cluster" => parse_cluster(&arguments[1..]),
         "pd" => parse_pd(&arguments[1..]),
+        "region" => parse_region(&arguments[1..]),
         other if other.starts_with('-') => Err(ParseError::UnknownFlag(other.to_owned())),
         other => Err(ParseError::UnknownCommand(other.to_owned())),
     }
@@ -488,6 +512,93 @@ fn parse_manifest_dump(arguments: &[String]) -> Result<Command, ParseError> {
 ///
 /// The verb decides how many bare words are expected, so a missing value is named rather than
 /// silently defaulted — the same rule the rest of this parser follows.
+/// `esker region ls | split <key> | transfer-leader <region> <peer>`.
+fn parse_region(arguments: &[String]) -> Result<Command, ParseError> {
+    let Some(verb) = arguments.first() else {
+        return Err(ParseError::MissingArgument("a region command"));
+    };
+    if verb == "--help" || verb == "-h" {
+        return Ok(Command::Help);
+    }
+
+    let mut options = RegionOptions::default();
+    let mut words: Vec<String> = Vec::new();
+    let mut index = 1;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        index += 1;
+        if argument == "--help" || argument == "-h" {
+            return Ok(Command::Help);
+        }
+        let (flag, inline) = match argument.split_once('=') {
+            Some((flag, value)) => (flag, Some(value.to_owned())),
+            None => (argument.as_str(), None),
+        };
+        match flag {
+            "--pd" => options.pd = take_value(arguments, &mut index, inline, "--pd")?,
+            "--hex" => options.hex = true,
+            other if other.starts_with('-') => {
+                return Err(ParseError::UnknownFlag(other.to_owned()));
+            }
+            other => words.push(other.to_owned()),
+        }
+    }
+
+    // `--hex` has to be known before a key is read, which is why the words are collected first
+    // and interpreted afterwards rather than as they arrive.
+    options.command = match verb.as_str() {
+        "ls" | "list" => {
+            if !words.is_empty() {
+                return Err(ParseError::UnexpectedArgument(words[0].clone()));
+            }
+            RegionCommand::Ls
+        }
+        "split" => {
+            let [key] = words.as_slice() else {
+                return Err(ParseError::MissingArgument("region split <key>"));
+            };
+            RegionCommand::Split {
+                key: read_key(key, options.hex)?,
+            }
+        }
+        "transfer-leader" => {
+            let [region, peer] = words.as_slice() else {
+                return Err(ParseError::MissingArgument(
+                    "region transfer-leader <region-id> <peer-id>",
+                ));
+            };
+            RegionCommand::TransferLeader {
+                region_id: positive_id(region, "region-id")?,
+                to_peer_id: positive_id(peer, "peer-id")?,
+            }
+        }
+        other => return Err(ParseError::UnknownRegionCommand(other.to_owned())),
+    };
+    Ok(Command::Region(options))
+}
+
+/// A positive id from a bare word, or the error naming which one was wrong.
+fn positive_id(word: &str, flag: &'static str) -> Result<u64, ParseError> {
+    word.parse()
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or(ParseError::InvalidValue {
+            flag,
+            value: word.to_owned(),
+        })
+}
+
+/// A key from the command line, hex-decoded when `--hex` was given.
+fn read_key(word: &str, hex: bool) -> Result<bytes::Bytes, ParseError> {
+    if hex {
+        from_hex(word)
+            .map(bytes::Bytes::from)
+            .ok_or_else(|| ParseError::InvalidHex(word.to_owned()))
+    } else {
+        Ok(bytes::Bytes::copy_from_slice(word.as_bytes()))
+    }
+}
+
 /// `esker pd serve|inspect [--data-dir PATH] [--listen HOST:PORT]`.
 fn parse_pd(arguments: &[String]) -> Result<Command, ParseError> {
     let Some(verb) = arguments.first() else {
@@ -1309,6 +1420,78 @@ mod tests {
             explicit.peer_id, 9,
             "an explicit peer id is not overwritten"
         );
+    }
+
+    /// Every `region` verb, its words, and the two flags that change how a key is read.
+    #[test]
+    fn region_takes_a_verb_and_the_words_it_needs() {
+        let Command::Region(ls) = parse_ok(&["region", "ls"]) else {
+            panic!("not a region command");
+        };
+        assert_eq!(ls.command, RegionCommand::Ls);
+        assert_eq!(ls.pd, "127.0.0.1:2379");
+
+        let Command::Region(split) = parse_ok(&["region", "split", "m", "--pd", "10.0.0.1:2379"])
+        else {
+            panic!("not a region command");
+        };
+        assert_eq!(
+            split.command,
+            RegionCommand::Split {
+                key: bytes::Bytes::from_static(b"m")
+            }
+        );
+        assert_eq!(split.pd, "10.0.0.1:2379");
+
+        // `--hex` decides how the key is read, and it works whichever side of the word it is on:
+        // the words are collected first and interpreted afterwards for exactly this reason.
+        for arguments in [
+            vec!["region", "split", "--hex", "6d"],
+            vec!["region", "split", "6d", "--hex"],
+        ] {
+            let Command::Region(options) = parse_ok(&arguments) else {
+                panic!("not a region command");
+            };
+            assert_eq!(
+                options.command,
+                RegionCommand::Split {
+                    key: bytes::Bytes::from_static(b"m")
+                },
+                "{arguments:?}"
+            );
+        }
+
+        let Command::Region(transfer) = parse_ok(&["region", "transfer-leader", "3", "7"]) else {
+            panic!("not a region command");
+        };
+        assert_eq!(
+            transfer.command,
+            RegionCommand::TransferLeader {
+                region_id: 3,
+                to_peer_id: 7
+            }
+        );
+    }
+
+    /// A region command that cannot be carried out is refused here rather than sent: an operator
+    /// finds out from their shell, not from a cluster.
+    #[test]
+    fn region_refuses_what_it_cannot_carry_out() {
+        for bad in [
+            vec!["region"],
+            vec!["region", "nonsense"],
+            vec!["region", "split"],
+            vec!["region", "transfer-leader", "3"],
+            vec!["region", "transfer-leader", "0", "7"],
+            vec!["region", "transfer-leader", "3", "0"],
+            vec!["region", "transfer-leader", "three", "7"],
+            vec!["region", "ls", "extra"],
+            vec!["region", "split", "--hex", "odd"],
+            vec!["region", "ls", "--nonsense"],
+        ] {
+            assert!(parse(bad.iter().copied()).is_err(), "{bad:?} was accepted");
+        }
+        assert_eq!(parse_ok(&["region", "--help"]), Command::Help);
     }
 
     /// `--pd` is what turns a store from "bootstraps its own region 1" into "asks the placement

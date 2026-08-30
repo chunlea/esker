@@ -38,6 +38,10 @@ pub trait Service: Send + Sync + std::fmt::Debug + 'static {
 
 /// A service's answer: one response, or a stream of chunks.
 #[derive(Debug)]
+// `Response` grew an `Admin` variant carrying two whole regions, so it is now much larger than a
+// `ChunkStream`'s two pointers. Boxing it would put an allocation on every reply for the sake of
+// the one that streams, which is the rarer of the two by orders of magnitude.
+#[allow(clippy::large_enum_variant)]
 pub enum Reply {
     /// One `Response` frame.
     Unary(Response),

@@ -163,6 +163,24 @@ fn golden_requests() -> Vec<(&'static str, Request)> {
             Request::raw_kv(h, RawKvReq::put(&b"k"[..], &b"v"[..])),
         ),
         (
+            "admin-split",
+            Request::Admin(esker_proto::AdminReq::Split {
+                region_id: 3,
+                split_key: Bytes::from_static(b"m"),
+            }),
+        ),
+        (
+            "admin-transfer-leader",
+            Request::Admin(esker_proto::AdminReq::TransferLeader {
+                region_id: 3,
+                to_peer_id: 7,
+            }),
+        ),
+        (
+            "admin-regions",
+            Request::Admin(esker_proto::AdminReq::Regions),
+        ),
+        (
             "raft-snapshot",
             Request::Snapshot(esker_proto::SnapshotRequest {
                 region_id: 3,
@@ -573,7 +591,37 @@ fn golden_pd_responses() -> Vec<(&'static str, Response)> {
 }
 
 fn golden_responses() -> Vec<(&'static str, Response)> {
+    let region = |id: u64| Region {
+        id,
+        start_key: Bytes::from_static(b"a"),
+        end_key: Bytes::from_static(b"m"),
+        peers: vec![Peer::voter(1, 10)],
+        epoch: Epoch::new(1, 2),
+    };
     let mut responses = vec![
+        (
+            "admin-split",
+            Response::Admin(esker_proto::AdminResp::Split {
+                left: region(1),
+                right: region(2),
+            }),
+        ),
+        (
+            "admin-transfer-leader",
+            Response::Admin(esker_proto::AdminResp::TransferLeader),
+        ),
+        (
+            "admin-regions",
+            Response::Admin(esker_proto::AdminResp::Regions {
+                regions: vec![esker_proto::RegionStatus {
+                    region: region(1),
+                    leader_peer_id: 10,
+                    is_leader: true,
+                    approximate_size: 4096,
+                    applied_index: 42,
+                }],
+            }),
+        ),
         (
             "hello",
             Response::Hello(HelloAck {

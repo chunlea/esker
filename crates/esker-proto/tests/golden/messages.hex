@@ -97,6 +97,9 @@ request txn-resolve-commit 0602010203042a3200
 request txn-resolve-rollback 0602010203042a00010161
 request txn-heartbeat 0702010203042a0170b817
 request txn-gc-safepoint 080201020304808080808040
+request admin-split 010503016d
+request admin-transfer-leader 02050307
+request admin-regions 0305
 
 response txn-get 0102010176
 response txn-get-absent 010200
@@ -111,6 +114,9 @@ response txn-rollback-committed 05020432
 response txn-resolve-lock 060203
 response txn-heartbeat 0702b817
 response txn-gc-safepoint 0802808080808040
+response admin-split 0105010161016d010201010a01020161016d010201010a01
+response admin-transfer-leader 0205
+response admin-regions 030501010161016d010201010a010a0180202a
 
 # The payload inside an Error frame's `Locked`: { key, primary, start_ts, ttl_ms }.
 lockinfo account 096163636f756e742f31096163636f756e742f30808080808040b817

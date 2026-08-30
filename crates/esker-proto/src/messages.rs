@@ -23,7 +23,7 @@ use bytes::Bytes;
 
 use crate::codec::{DecodeError, Decoder, Encoder};
 use crate::raft::RaftBatch;
-use crate::region::Epoch;
+use crate::region::{Epoch, Region};
 
 /// The largest number of key-value pairs a `Scan` returns when the caller names no limit.
 ///
@@ -76,6 +76,13 @@ pub enum Method {
     /// `RaftTransport::Batch` — a tick's worth of Raft messages between two stores
     /// (`docs/DESIGN.md` §6, [ADR 0009](../../docs/adr/0009-the-wire-carries-the-raft-message.md)).
     RaftBatch = 0x0401,
+    /// `Admin::Split` — split a region at a chosen key (`esker-cli region split`).
+    AdminSplit = 0x0501,
+    /// `Admin::TransferLeader` — move a region's leadership (`esker-cli region transfer-leader`).
+    AdminTransferLeader = 0x0502,
+    /// `Admin::Regions` — what this store hosts, for `esker-cli region ls`.
+    AdminRegions = 0x0503,
+
     /// `RaftTransport::Snapshot` — a follower asking a leader for a region's contents.
     ///
     /// The only **streamed** method: its answer is a run of `Stream` frames rather than one
@@ -112,10 +119,17 @@ pub const SERVICE_TXN_KV: u8 = 0x02;
 pub const SERVICE_PD: u8 = 0x03;
 /// Service byte reserved for the Raft transport — phase 3.
 pub const SERVICE_RAFT: u8 = 0x04;
+/// Service byte of `Admin` — the operator-facing requests `esker-cli region` sends.
+///
+/// Separate from `Pd` because these are addressed to a **store**: the placement driver schedules,
+/// and an operator asking for one specific thing on one specific region talks to the store that
+/// leads it. Separate from `RawKv` because they are not key-value work and must not be counted as
+/// it by anything watching request rates.
+pub const SERVICE_ADMIN: u8 = 0x05;
 
 impl Method {
     /// Every method this version defines.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 28] = [
         Self::Hello,
         Self::RawGet,
         Self::RawBatchGet,
@@ -141,6 +155,9 @@ impl Method {
         Self::TxnResolveLock,
         Self::TxnHeartbeat,
         Self::TxnGcSafepoint,
+        Self::AdminSplit,
+        Self::AdminTransferLeader,
+        Self::AdminRegions,
     ];
 
     /// The wire tag.
@@ -178,6 +195,9 @@ impl Method {
             0x0206 => Some(Self::TxnResolveLock),
             0x0207 => Some(Self::TxnHeartbeat),
             0x0208 => Some(Self::TxnGcSafepoint),
+            0x0501 => Some(Self::AdminSplit),
+            0x0502 => Some(Self::AdminTransferLeader),
+            0x0503 => Some(Self::AdminRegions),
             _ => None,
         }
     }
@@ -217,6 +237,9 @@ impl Method {
             Self::PdGetRegion => "Pd::GetRegion",
             Self::PdAllocId => "Pd::AllocId",
             Self::PdTso => "Pd::Tso",
+            Self::AdminSplit => "Admin::Split",
+            Self::AdminTransferLeader => "Admin::TransferLeader",
+            Self::AdminRegions => "Admin::Regions",
             Self::RaftBatch => "RaftTransport::Batch",
             Self::RaftSnapshot => "RaftTransport::Snapshot",
             Self::TxnGet => "TxnKv::Get",
@@ -811,6 +834,99 @@ pub enum Request {
     /// The answer is a **stream**, not a response frame: a region is megabytes and a Raft
     /// message is not where megabytes go.
     Snapshot(SnapshotRequest),
+    /// An operator asking a store to do one specific thing (`esker-cli region`).
+    ///
+    /// It carries no [`RequestHeader`]: an operator names a region by id and does not hold an
+    /// epoch to be checked against — the store checks what it can and refuses what it cannot.
+    Admin(AdminReq),
+}
+
+/// What an operator asks a store to do (`docs/DESIGN.md` §12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminReq {
+    /// Split a region at a chosen key, rather than waiting for it to grow past the threshold.
+    Split {
+        /// Which region.
+        region_id: u64,
+        /// Where to cut. Refused if it is not strictly inside the region.
+        split_key: Bytes,
+    },
+    /// Move a region's leadership to one of its peers.
+    TransferLeader {
+        /// Which region.
+        region_id: u64,
+        /// Which peer should take office.
+        to_peer_id: u64,
+    },
+    /// Every region this store hosts, with what it knows about each.
+    Regions,
+}
+
+impl AdminReq {
+    /// The method this is sent as.
+    #[must_use]
+    pub fn method(&self) -> Method {
+        match self {
+            Self::Split { .. } => Method::AdminSplit,
+            Self::TransferLeader { .. } => Method::AdminTransferLeader,
+            Self::Regions => Method::AdminRegions,
+        }
+    }
+
+    fn encode(&self, out: &mut Encoder) {
+        match self {
+            Self::Split {
+                region_id,
+                split_key,
+            } => {
+                out.put_varint(*region_id);
+                out.put_bytes(split_key);
+            }
+            Self::TransferLeader {
+                region_id,
+                to_peer_id,
+            } => {
+                out.put_varint(*region_id);
+                out.put_varint(*to_peer_id);
+            }
+            Self::Regions => {}
+        }
+    }
+
+    fn decode(method: Method, input: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        Ok(match method {
+            Method::AdminSplit => Self::Split {
+                region_id: input.get_varint("admin.region_id")?,
+                split_key: Bytes::copy_from_slice(input.get_bytes("admin.split_key")?),
+            },
+            Method::AdminTransferLeader => Self::TransferLeader {
+                region_id: input.get_varint("admin.region_id")?,
+                to_peer_id: input.get_varint("admin.to_peer_id")?,
+            },
+            Method::AdminRegions => Self::Regions,
+            other => {
+                return Err(DecodeError::invalid(
+                    "method",
+                    format!("{} is not an Admin method", other.name()),
+                ));
+            }
+        })
+    }
+}
+
+/// One region as a store reports it to an operator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionStatus {
+    /// The region: range, peers and epoch.
+    pub region: Region,
+    /// The peer this store believes leads it; `0` for "no opinion".
+    pub leader_peer_id: u64,
+    /// Whether *this* store leads it.
+    pub is_leader: bool,
+    /// Roughly how many bytes it holds.
+    pub approximate_size: u64,
+    /// How far its state machine has applied.
+    pub applied_index: u64,
 }
 
 /// A follower's request for a region's contents (`docs/DESIGN.md` §6).
@@ -850,6 +966,7 @@ impl Request {
             Self::Pd { request, .. } => request.method(),
             Self::Raft(_) => Method::RaftBatch,
             Self::Snapshot(_) => Method::RaftSnapshot,
+            Self::Admin(request) => request.method(),
         }
     }
 
@@ -857,7 +974,11 @@ impl Request {
     #[must_use]
     pub fn header(&self) -> Option<RequestHeader> {
         match self {
-            Self::Hello(_) | Self::Raft(_) | Self::Snapshot(_) | Self::Pd { .. } => None,
+            Self::Hello(_)
+            | Self::Raft(_)
+            | Self::Snapshot(_)
+            | Self::Admin(_)
+            | Self::Pd { .. } => None,
             Self::RawKv { header, .. } | Self::TxnKv { header, .. } => Some(*header),
         }
     }
@@ -890,6 +1011,7 @@ impl Request {
                 out.put_varint(request.index);
                 out.put_varint(request.peer_id);
             }
+            Self::Admin(request) => request.encode(&mut out),
         }
         out.finish()
     }
@@ -903,6 +1025,9 @@ impl Request {
                 version: input.get_u32("hello.version")?,
             }),
             Method::RaftBatch => Self::Raft(RaftBatch::decode(&mut input)?),
+            method if method.service() == SERVICE_ADMIN => {
+                Self::Admin(AdminReq::decode(method, &mut input)?)
+            }
             Method::RaftSnapshot => Self::Snapshot(SnapshotRequest {
                 region_id: input.get_varint("snapshot.region_id")?,
                 index: input.get_varint("snapshot.index")?,
@@ -948,6 +1073,91 @@ pub enum Response {
     /// message survivable, so there is no outcome for the sender to act on
     /// ([`RaftTransport`](crate::raft) is fire-and-forget by design).
     Raft,
+    /// The answer to an operator's request.
+    Admin(AdminResp),
+}
+
+/// What a store answers an operator with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminResp {
+    /// The split was proposed and applied. It carries the two halves, so an operator sees what it
+    /// got rather than having to ask again.
+    Split {
+        /// The parent, narrowed.
+        left: Region,
+        /// The half that was created.
+        right: Region,
+    },
+    /// Leadership was *asked* to move. It carries nothing, because what completes a transfer is
+    /// an election and the answer would be a guess (`docs/DESIGN.md` §6).
+    TransferLeader,
+    /// What this store hosts.
+    Regions {
+        /// One entry per region, in key order.
+        regions: Vec<RegionStatus>,
+    },
+}
+
+impl AdminResp {
+    /// The method this answers.
+    #[must_use]
+    pub fn method(&self) -> Method {
+        match self {
+            Self::Split { .. } => Method::AdminSplit,
+            Self::TransferLeader => Method::AdminTransferLeader,
+            Self::Regions { .. } => Method::AdminRegions,
+        }
+    }
+
+    fn encode(&self, out: &mut Encoder) {
+        match self {
+            Self::Split { left, right } => {
+                left.encode(out);
+                right.encode(out);
+            }
+            Self::TransferLeader => {}
+            Self::Regions { regions } => {
+                out.put_varint(regions.len() as u64);
+                for status in regions {
+                    status.region.encode(out);
+                    out.put_varint(status.leader_peer_id);
+                    out.put_bool(status.is_leader);
+                    out.put_varint(status.approximate_size);
+                    out.put_varint(status.applied_index);
+                }
+            }
+        }
+    }
+
+    fn decode(method: Method, input: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        Ok(match method {
+            Method::AdminSplit => Self::Split {
+                left: Region::decode(input)?,
+                right: Region::decode(input)?,
+            },
+            Method::AdminTransferLeader => Self::TransferLeader,
+            Method::AdminRegions => {
+                let count = input.get_count("admin.regions")?;
+                let mut regions = Vec::with_capacity(count.min(1024));
+                for _ in 0..count {
+                    regions.push(RegionStatus {
+                        region: Region::decode(input)?,
+                        leader_peer_id: input.get_varint("admin.leader")?,
+                        is_leader: input.get_bool("admin.is_leader")?,
+                        approximate_size: input.get_varint("admin.size")?,
+                        applied_index: input.get_varint("admin.applied")?,
+                    });
+                }
+                Self::Regions { regions }
+            }
+            other => {
+                return Err(DecodeError::invalid(
+                    "method",
+                    format!("{} is not an Admin method", other.name()),
+                ));
+            }
+        })
+    }
 }
 
 impl Response {
@@ -960,6 +1170,7 @@ impl Response {
             Self::TxnKv(response) => response.method(),
             Self::Pd(response) => response.method(),
             Self::Raft => Method::RaftBatch,
+            Self::Admin(response) => response.method(),
         }
     }
 
@@ -1004,6 +1215,7 @@ impl Response {
             // The acknowledgement carries nothing: Raft's own retries are what make a lost
             // message survivable, so there is no outcome for the sender to act on.
             Self::Raft => {}
+            Self::Admin(response) => response.encode(&mut out),
         }
         out.finish()
     }
@@ -1014,6 +1226,9 @@ impl Response {
         let method = read_method(&mut input)?;
         let response = match method {
             Method::RaftBatch => Self::Raft,
+            method if method.service() == SERVICE_ADMIN => {
+                Self::Admin(AdminResp::decode(method, &mut input)?)
+            }
             Method::Hello => Self::Hello(HelloAck {
                 version: input.get_u32("hello.version")?,
                 store_id: input.get_varint("hello.store_id")?,
@@ -1055,7 +1270,7 @@ fn take_opt(input: &mut Decoder<'_>, field: &'static str) -> Result<Option<Bytes
 mod tests {
     use super::{
         Hello, HelloAck, Method, RawKvReq, RawKvResp, Request, RequestHeader, Response,
-        SERVICE_RAW_KV, SERVICE_SYSTEM, SERVICE_TXN_KV,
+        SERVICE_ADMIN, SERVICE_RAW_KV, SERVICE_SYSTEM, SERVICE_TXN_KV,
     };
     use crate::region::Epoch;
     use bytes::Bytes;
@@ -1195,6 +1410,9 @@ mod tests {
             let service = match method {
                 Method::Hello => SERVICE_SYSTEM,
                 Method::RaftBatch | Method::RaftSnapshot => crate::messages::SERVICE_RAFT,
+                Method::AdminSplit | Method::AdminTransferLeader | Method::AdminRegions => {
+                    SERVICE_ADMIN
+                }
                 Method::PdBootstrap
                 | Method::PdStoreHeartbeat
                 | Method::PdRegionHeartbeat

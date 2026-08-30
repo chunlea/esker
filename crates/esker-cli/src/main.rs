@@ -15,6 +15,7 @@ mod cluster;
 mod manifest_dump;
 mod pd;
 mod raw;
+mod region;
 mod server;
 mod sst_dump;
 #[cfg(test)]
@@ -104,6 +105,13 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Ok(Command::Region(options)) => match region::run(&options) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(reason) => {
+                eprintln!("esker region: {reason}");
+                ExitCode::from(EXIT_FAILURE)
+            }
+        },
         Ok(Command::Cluster(options)) => match cluster::run(&options) {
             Ok(()) => ExitCode::SUCCESS,
             Err(reason) => {

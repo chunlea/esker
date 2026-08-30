@@ -215,6 +215,9 @@ pub struct Store {
     /// The threads every region's Raft is driven on, each region pinned to one of them
     /// ([`crate::driver`]).
     drivers: Arc<DriverPool>,
+    /// The placement driver, kept because an **operator-requested split** needs cluster-unique
+    /// ids long after `open` returned (`esker-cli region split`).
+    pd: Option<Arc<dyn PdClient>>,
     /// How this store decides to split.
     split: SplitOptions,
     /// The runtime this store was opened on. A split starts the child's peer from the parent's
@@ -349,6 +352,7 @@ impl Store {
             transport,
             raft,
             drivers,
+            pd: pd.clone(),
             split,
             runtime: tokio::runtime::Handle::try_current().ok(),
             tickers: std::sync::Mutex::new(Vec::new()),
@@ -976,6 +980,119 @@ impl Store {
             }
         });
         Ok(Reply::Stream(stream))
+    }
+
+    /// Answers one operator request (`esker-cli region`).
+    ///
+    /// Everything here is **addressed to a store and refused by a store**: an operator names a
+    /// region, and a store that does not host it, or does not lead it, says so rather than
+    /// forwarding. Forwarding would make an operator's "which store did this" unanswerable, which
+    /// is the one thing an operator's tool is for.
+    async fn serve_admin(
+        self: &Arc<Self>,
+        request: esker_proto::AdminReq,
+    ) -> std::result::Result<esker_proto::AdminResp, ProtoError> {
+        use esker_proto::{AdminReq, AdminResp};
+
+        match request {
+            AdminReq::Regions => Ok(AdminResp::Regions {
+                regions: self.region_statuses(),
+            }),
+            AdminReq::TransferLeader {
+                region_id,
+                to_peer_id,
+            } => {
+                let (state, peer) = self.led_region(region_id)?;
+                self.transfer_leadership(&state, &peer, to_peer_id).await;
+                Ok(AdminResp::TransferLeader)
+            }
+            AdminReq::Split {
+                region_id,
+                split_key,
+            } => {
+                let (state, peer) = self.led_region(region_id)?;
+                let region = state.region().clone();
+                if !split::is_legal_boundary(&split_key, &region) {
+                    return Err(ProtoError::invalid(format!(
+                        "{split_key:?} is not strictly inside region {region_id}'s range \
+                         [{:?}, {:?})",
+                        region.start_key, region.end_key
+                    )));
+                }
+                let pd = self.pd.clone().ok_or_else(|| {
+                    ProtoError::invalid(
+                        "a split needs cluster-unique ids and this store has no placement driver",
+                    )
+                })?;
+                let count = 1 + region.peers.len() as u64;
+                let first = blocking(move || pd.alloc_id(count)).await?;
+                peer.propose(&Command::Split {
+                    split_key: split_key.clone(),
+                    new_region_id: first,
+                    new_peer_ids: (first + 1..first + count).collect(),
+                })
+                .await?;
+
+                // Read the halves back rather than computing them: what the operator is told is
+                // what the store now holds, which is the question they asked.
+                let left = self
+                    .regions
+                    .get(region_id)
+                    .map(|state| state.region().clone());
+                let right = self.regions.get(first).map(|state| state.region().clone());
+                match (left, right) {
+                    (Some(left), Some(right)) => Ok(AdminResp::Split { left, right }),
+                    _ => Err(ProtoError::internal(format!(
+                        "region {region_id} split but this store cannot find both halves"
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// A region this store hosts **and leads**, or the refusal that says which it is not.
+    fn led_region(
+        &self,
+        region_id: u64,
+    ) -> std::result::Result<(Arc<RegionState>, Arc<RaftPeer>), ProtoError> {
+        let state = self
+            .regions
+            .get(region_id)
+            .ok_or(ProtoError::RegionNotFound { region_id })?;
+        let peer = state.peer().map(Arc::clone).ok_or_else(|| {
+            ProtoError::invalid(format!(
+                "region {region_id} is not replicated on this store"
+            ))
+        })?;
+        if !peer.is_leader() {
+            return Err(peer.not_leader());
+        }
+        Ok((state, peer))
+    }
+
+    /// Every region this store hosts, in key order, as an operator sees it.
+    #[must_use]
+    pub fn region_statuses(&self) -> Vec<esker_proto::RegionStatus> {
+        let mut statuses: Vec<esker_proto::RegionStatus> = self
+            .regions
+            .states()
+            .into_iter()
+            .map(|state| {
+                let region = state.region().clone();
+                let (leader, is_leader) = state.peer().map_or((0, false), |peer| {
+                    (peer.leader().unwrap_or(0), peer.is_leader())
+                });
+                esker_proto::RegionStatus {
+                    leader_peer_id: leader,
+                    is_leader,
+                    approximate_size: split::approximate_size(&self.db, &region).unwrap_or(0),
+                    applied_index: state.peer().map_or(0, |peer| peer.applied_index()),
+                    region,
+                }
+            })
+            .collect();
+        statuses.sort_by(|left, right| left.region.start_key.cmp(&right.region.start_key));
+        statuses
     }
 
     /// Every region this store **leads**, with what the engine says it holds.
@@ -1759,6 +1876,13 @@ impl Service for StoreService {
                 // returns from here rather than falling through to the `RawKv` path below.
                 Request::Snapshot(ask) => {
                     return store.send_snapshot(ask).await;
+                }
+                // An operator asking for one specific thing (`esker-cli region`).
+                Request::Admin(request) => {
+                    return store
+                        .serve_admin(request)
+                        .await
+                        .map(|response| Reply::Unary(Response::Admin(response)));
                 }
                 // A store is not a placement driver. Answering anything but a refusal — even a
                 // helpful-looking one — would let a misconfigured client believe it had reached
