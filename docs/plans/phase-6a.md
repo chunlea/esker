@@ -29,10 +29,12 @@ upstream / pre-transform / accept), and its test stays in the corpus as a known-
 violated by an *untracked* rejection, never by a tracked one. A gap discovered and not written into
 §9 in the same commit is the failure mode this rule exists to prevent.
 
-Tested by the **syntax corpus** (§7.1): statements drawn from the PG-19 documentation covering every
-statement class — DDL, DML, DCL, TCL, CTEs, window functions, set operations, `MERGE`, arrays,
-composite and range types, `LATERAL`, `RETURNING`, partitioning, `EXPLAIN` variants. The corpus
-asserts `parse(sql).is_ok()` and nothing more; what a statement *does* is C2's or C3's business.
+Tested by the **syntax corpus** (§7.1, §9): 353 statements across 17 classes — DDL, DML, DCL, TCL,
+CTEs, window functions, set operations, `MERGE`, JSON, arrays, `LATERAL`, `RETURNING`, partitioning,
+`EXPLAIN` variants. Every one of them was put to a real **PostgreSQL 19beta1** server and kept only
+because that server's parser accepted it, so the corpus is a record of what PostgreSQL does rather
+than of what we believe it does. It asserts `parse(sql).is_ok()` and nothing more; what a statement
+*does* is C2's or C3's business.
 
 ### C2 — Honesty: parsed but unimplemented is PostgreSQL's own rejection
 
@@ -199,9 +201,11 @@ panic (`CLAUDE.md` invariants 2 and 9).
 
 Required kinds per `docs/DESIGN.md` §11, plus the two the contract adds.
 
-1. **Syntax corpus** (C1) — PG-19 documentation statements per statement class, asserting only that
-   the parse succeeds; known upstream gaps are `#[ignore]`d with a `// GAP-nn` comment pointing at
-   §9, so removing a gap from §9 without fixing it breaks the build.
+1. **Syntax corpus** (C1) — 353 statements per statement class, each verified against a real
+   PostgreSQL 19beta1 server, asserting only that the parse succeeds. Known upstream gaps live in
+   one `KNOWN_GAPS` table beside the test and are held from both sides: an *unlisted* failure fails
+   the build, and so does a *listed* gap that has started passing, so a `sqlparser` upgrade that
+   closes one is noticed instead of silently absorbed.
 2. **Contract tests** (C2) — every unimplemented statement class returns `0A000` naming the feature,
    and the session state machine is correct afterwards, inside and outside a transaction block.
 3. **Parity tests** (C3) — the four tables in §1.
@@ -255,17 +259,82 @@ Required kinds per `docs/DESIGN.md` §11, plus the two the contract adds.
 
 ## 9. Upstream gap register — `sqlparser` 0.62.0 vs PostgreSQL 19
 
-Empty until the corpus finds one. Every row is a statement class, a minimal reproducing statement,
-and a decision. A gap is never closed by deleting its corpus entry.
+### How this was measured
 
-| # | Statement class | Minimal repro | Status | Decision |
+Not from memory. A real **PostgreSQL 19beta1** server (`postgres:19beta1`, the target release in
+beta at the time of writing) was run locally and every candidate statement put to it. A statement
+earns its place in `tests/corpus/pg19.sql` when that server answers with anything other than
+`42601 syntax_error` — "no such table" means the grammar was satisfied and only the catalog was
+not. Two candidates were thrown out that way (`FETCH FIRST … WITH TIES` without `ORDER BY`,
+`EXCLUDE CURRENT ROW` without a frame clause); both looked correct, which is the argument for
+having an oracle rather than an opinion.
+
+The corpus is **353 statements across 17 classes**. Run through `sqlparser` 0.62.0's PostgreSQL
+dialect, **281 parse and 72 do not** — 79.6% coverage. Those 72 are below, grouped into the 30
+features they come from, and each is in `KNOWN_GAPS` in `tests/syntax_corpus.rs`.
+
+### What the shape of the gap means
+
+Nearly all of it is administrative surface: replication, foreign data wrappers, `VACUUM`, role
+management, two-phase commit. Esker will not execute any of it, and a stateless SQL node in front
+of a distributed store is not where an operator runs `ALTER SYSTEM`.
+
+The rows marked **on the query path** are the ones that matter, because they sit inside the kind of
+statement phase 6a *does* execute — `TABLE t` is a `SELECT`, `GROUP BY DISTINCT` is a query, and
+`SELECT a FROM t FOR KEY SHARE` is a read a real application writes. Today each of those comes back
+as a **syntax error**, which is precisely the contract C1 failure the register exists to make
+visible: the honest answer is `0A000`, naming the feature, and it cannot be given for a statement
+that never parsed. These are therefore the gaps to close first, and closing them is what the
+decision column tracks.
+
+### The register
+
+| # | Feature | Statements | Minimal repro | Priority |
 |---|---|---|---|---|
-| — | — | — | — | (none recorded yet) |
+| G01 | partition maintenance | 2 | `ALTER TABLE t ATTACH PARTITION p FOR VALUES FROM (1) TO (10);` | admin / DDL only |
+| G02 | unlogged / logged tables | 2 | `CREATE UNLOGGED TABLE t (a int8);` | admin / DDL only |
+| G03 | CREATE TABLE LIKE / OF | 2 | `CREATE TABLE t (LIKE u INCLUDING ALL);` | admin / DDL only |
+| G04 | exclusion constraints | 2 | `CREATE TABLE t (a int8, EXCLUDE USING gist (a WITH =));` | admin / DDL only |
+| G05 | index maintenance | 4 | `CREATE INDEX i ON ONLY t (a);` | admin / DDL only |
+| G06 | views: recursive, materialized | 3 | `CREATE RECURSIVE VIEW v (n) AS SELECT 1;` | admin / DDL only |
+| G07 | sequence options | 2 | `CREATE SEQUENCE s START WITH 1 INCREMENT BY 1;` | admin / DDL only |
+| G08 | routine bodies | 5 | `CREATE FUNCTION f() RETURNS int8 BEGIN ATOMIC SELECT 1; END;` | admin / DDL only |
+| G09 | INSERT OVERRIDING | 1 | `INSERT INTO t (a) OVERRIDING SYSTEM VALUE VALUES (1);` | **on the query path** |
+| G10 | MERGE ... DO NOTHING | 1 | `MERGE INTO t USING u ON t.id = u.id WHEN MATCHED AND u.a > 0 THEN DO NOTHING;` | **on the query path** |
+| G11 | GROUP BY DISTINCT | 1 | `SELECT a FROM t GROUP BY DISTINCT a;` | **on the query path** |
+| G12 | row-level locking clauses | 2 | `SELECT a FROM t FOR NO KEY UPDATE OF t NOWAIT;` | **on the query path** |
+| G13 | TABLE as a query | 1 | `TABLE t;` | **on the query path** |
+| G14 | SELECT with no list | 1 | `SELECT;` | **on the query path** |
+| G15 | JOIN USING alias | 1 | `SELECT * FROM t JOIN u USING (id) AS j;` | **on the query path** |
+| G16 | ROWS FROM | 1 | `SELECT * FROM ROWS FROM (generate_series(1, 2), generate_series(3, 4)) WITH ORDINALITY;` | **on the query path** |
+| G17 | recursive CTE SEARCH/CYCLE | 2 | `WITH RECURSIVE w (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM w WHERE n < 5) SEARCH DEPTH FIRST BY n SET o SELECT * FROM w;` | **on the query path** |
+| G18 | window frame EXCLUDE | 2 | `SELECT sum(a) OVER (ORDER BY b GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE TIES) FROM t;` | **on the query path** |
+| G19 | BETWEEN SYMMETRIC | 1 | `SELECT a BETWEEN 1 AND 10, a NOT BETWEEN SYMMETRIC 10 AND 1 FROM t;` | **on the query path** |
+| G20 | TRIM keyword forms | 1 | `SELECT TRIM(BOTH ' ' FROM b), TRIM(LEADING FROM b), TRIM(TRAILING 'x' FROM b) FROM t;` | **on the query path** |
+| G21 | JSON_QUERY wrapper | 1 | `SELECT JSON_QUERY('{"a":1}', '$' WITH WRAPPER);` | **on the query path** |
+| G22 | transaction modes | 3 | `BEGIN WORK ISOLATION LEVEL SERIALIZABLE READ WRITE DEFERRABLE;` | admin / DDL only |
+| G23 | two-phase commit | 3 | `PREPARE TRANSACTION 'gid';` | admin / DDL only |
+| G24 | role grants and privileges | 5 | `GRANT alice TO bob WITH ADMIN OPTION;` | admin / DDL only |
+| G25 | VACUUM / CLUSTER / CHECKPOINT | 4 | `VACUUM (FULL, ANALYZE, VERBOSE) t;` | admin / DDL only |
+| G26 | cursor MOVE | 1 | `MOVE BACKWARD 1 IN c;` | admin / DDL only |
+| G27 | database and system admin | 8 | `CREATE DATABASE d WITH OWNER alice ENCODING 'UTF8';` | admin / DDL only |
+| G28 | extended statistics | 2 | `CREATE STATISTICS st ON a, b FROM t;` | admin / DDL only |
+| G29 | logical replication | 6 | `CREATE PUBLICATION pub FOR TABLE t;` | admin / DDL only |
+| G30 | foreign data wrappers | 2 | `CREATE FOREIGN TABLE ft (a int8) SERVER srv;` | admin / DDL only |
+
+**Decision, for every row above:** carry the gap, do not fork. The corpus keeps each statement, and
+`every_known_gap_is_still_a_gap` fails the build the day an upstream release starts parsing one, so
+a `sqlparser` upgrade is checked against the register automatically rather than by someone
+remembering to look. For the on-the-query-path rows, the alternative if upstream stays quiet is a
+pre-parse rewrite in `parse.rs` for the handful that are simple aliases — `TABLE t` is
+`SELECT * FROM t` and nothing else — which is cheap and contained. Nothing here justifies a fork of
+the parser, and nothing here is a reason to reconsider ADR 0014: a hand-written parser would have
+its own gap register, and it would be longer.
 
 ## 10. Progress
 
 - [x] 1 — plan, ADR 0014, dependency, crate skeleton, SQLSTATE table, error type, parse guard
-- [ ] 1b — the syntax corpus (split out of unit 1; it is the C1 gate and wants its own commit)
+- [x] 1b — the syntax corpus: 353 statements, oracle-verified, 72 gaps registered in §9
 - [ ] 2 — pgwire
 - [ ] 3 — row and tuple encodings
 - [ ] 4 — catalog
@@ -286,3 +355,12 @@ and a decision. A gap is never closed by deleting its corpus entry.
 - *A second risk appeared and was closed the same day* (§8.1b): the dependency's own recursion
   limit is 50, which rejects SQL that PostgreSQL accepts. It was found by measuring, not by
   reading, which is the argument for building the corpus next rather than last.
+
+**Unit 1b.** The corpus was going to be written from the PostgreSQL documentation. It is instead
+written against a **running PostgreSQL 19beta1**, because a container of the target release turned
+out to be one `docker run` away and an oracle beats a recollection — it immediately rejected two
+statements that had looked right. The result is the first hard number this contract has: of 353
+statements real PostgreSQL 19 accepts, `sqlparser` parses **281**. The other 72 are registered in
+§9, and the thirteen of them that sit on the query path are now the most concrete piece of work
+this plan has, because each is a statement a user could write today and get a syntax error for
+where the contract promises `0A000`.
