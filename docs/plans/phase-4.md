@@ -231,19 +231,13 @@ each one (`cargo fmt --check`, `clippy -D warnings`, `cargo doc -D warnings`, te
 | `75f66e6` | 7 — a fallible resolver, `RegionTable`, `esker-client/tests/multi_region.rs` |
 | `6f207ec` | 5b — `RemotePd`, and heartbeat rounds moved off the reactor |
 | `a9ecb71` | 8 — `esker server` builds a `RemotePd` when it is given one |
+| `c8593be` | 8 — `--pd`, once the sibling lane had committed its own edits to `args.rs` |
+| *(this commit)* | DESIGN §6 and §10 brought into line with the code |
 
-**Held, not missing:** the `--pd` flag's *parsing* in `crates/esker-cli/src/args.rs`. The
-placement-driver lane began editing that file for its own `esker pd serve|inspect` command while
-this lane's hunk was in the worktree, and sweeping another lane's uncommitted work into a commit is
-the one git rule this project has an incident for. The hunk is written and its test passes; it
-lands as soon as that lane commits. Until then `ServerOptions::pd` is always `None`, which is
-exactly what phase 2's single node and phase 3e's static cluster are — so nothing is broken by the
-wait, only unreachable from the command line.
-
-**Test counts at `a9ecb71`:** `esker-store` 119 unit + 39 integration, `esker-client` 41 unit + 26
-integration, `esker-proto` 79 unit. Every crate this lane touched is green under
-`clippy -D warnings`, `cargo doc -D warnings` and `cargo fmt --check`; `cargo deny check` passes
-with no new dependency.
+**At the 4a gate:** `just check` green on the whole workspace — `cargo fmt --check`,
+`clippy --all-targets --all-features -D warnings`, `cargo deny check`, the full test suite, and
+`cargo doc -D warnings`. `esker-store` 119 unit + 39 integration tests, `esker-client` 41 + 26,
+`esker-proto` 85. No dependency was added.
 
 ## 10. Changes vs plan
 
@@ -310,16 +304,16 @@ with no new dependency.
    properties plus the memtable. Each is documented as a placeholder at its field rather than left
    to look like a measurement.
 
-## 11. Outstanding after 4a
+## 11. Closed after 4a
 
-Two items this lane could not close on its own. Both are recorded here rather than left as silence.
+Both items §11 opened are now closed; the coordinator's rulings are recorded with them.
 
-### 11.1 `docs/DESIGN.md` §6 has two lines that no longer match the code
+### 11.1 `docs/DESIGN.md` §6 — **done**
 
-The constitution says code and DESIGN must not drift within a change, and these two do. The edit is
-written below rather than made, because the placement-driver lane is rewriting §7 of the same file
-in its worktree right now and staging `DESIGN.md` would sweep that in. It lands the moment that
-lane commits.
+§6 now describes what exists: the `'m'` record as the anchor a restart replays from, `apply_index`
+per region with no batch spanning two, the heartbeat cadences counted in ticks with "or on change"
+defined, and the placeholder fields named as placeholders. §10 gained the `start_key` keying and the
+`Ok(None)` / `Err` distinction. What §6 said before, and why it was not simply corrected:
 
 1. **"Apply loop: one worker per store (sharded by region id later)."** What 4a ships is **one
    driver thread per region** — phase 3e's `raft-{region_id}` thread, one per entry in the region
@@ -337,10 +331,16 @@ lane commits.
 
 2. **"Heartbeats *(phase 4 — `esker-pd` is a stub until then)*."** Built: `heartbeat.rs` counts
    ticks, a store beats every 10 s and a region's leader every 60 s *or on a change*, where a
-   change is an epoch bump or a leader change. The parenthetical goes and the "or on change" gets
+   change is an epoch bump or a leader change. The parenthetical is gone and the "or on change" has
    its definition.
 
-### 11.2 The `--pd` flag's parsing
+### 11.2 The `--pd` flag's parsing — **done**
 
-Written, tested, and held out of a commit for the same shared-file reason (§9). `esker server`
-already builds a `RemotePd` when `ServerOptions::pd` is set; nothing else is missing.
+Landed once the placement-driver lane committed its own edits to `args.rs`. Coordinator ruling on
+the overlap: `crates/esker-cli/src/pd.rs` belongs to that lane, everything else in `esker-cli` to
+this one.
+
+### 11.3 The one deviation the coordinator ratified as the standard
+
+The client's region cache is keyed by `start_key`, not by `end_key` (§10, item 2). Ratified: the
+`end_key` keying the brief asked for is the trap, and this shape is the one to build on.

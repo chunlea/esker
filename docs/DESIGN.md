@@ -281,12 +281,25 @@ One process = one store id, hosting many **regions**. `Region { id, start_key, e
 Regions cover the whole key space contiguously; the first region is `["", "")`.
 
 - **Raft log storage:** engine CF `raft`, keys `'l' ++ region_id:u64 ++ index:u64` → entry;
-  `'s' ++ region_id` → hard state + apply state; `'m' ++ region_id` → region metadata. One WriteBatch per
+  `'s' ++ region_id` → hard state + apply state; `'m' ++ region_id` → region metadata. Ids and indices are
+  big-endian, so a scan over one region's entries runs in index order. One WriteBatch per
   Ready (entries + hard state), `sync = true`. (TODO(post-v1): move to a bitcask-style log like TiKV's
   Raft Engine once measured to be the bottleneck.)
-- **Apply loop:** one worker per store (sharded by region id later); each committed entry is decoded into
+- **The `'m'` record is what a restart replays from.** A store reads every `'m'` record at open and starts
+  a peer for each — never re-deriving its region set from its configuration, and never taking it from PD's
+  reply, which is a different question: PD's view is built out of this store's own heartbeats. A record
+  whose peer list does not name this store is **not** started; that is what a crash between `RemovePeer`
+  applying and the data being deleted leaves behind, and starting it would return a voter to a group that
+  has removed it. A fresh database with no records is the only bootstrap.
+- **Apply loop** *(4a: one driver thread per region; pooling is 4d)*: each committed entry is decoded into
   a `WriteBatch` on data CFs plus `apply_index`, written atomically; admin entries (split, conf change)
-  are applied under the region lock and bump the epoch.
+  are applied under the region lock and bump the epoch. **`apply_index` is per region and one batch never
+  spans two regions**, so a restart replays each region from its own `apply_index + 1` and entries of one
+  region can never interleave with another's. Where that work *runs* is the part still open: 4a gives each
+  region the driver thread phase 3e gave the single one, which is one OS thread per region and does not
+  reach fifty. One worker per store — what this line said before 4a — is not the fix either, because then
+  one region's `fsync` blocks every other region's consensus; the shape to measure in 4d is a **pool
+  sharded by region id**, sized independently of the region count, as TiKV's store and apply pools are.
 - **Split** *(phase 4 — not yet implemented)*: triggered by a periodic size check (region > 96 MiB *default*, or by an explicit admin
   command). Leader asks PD for new ids, proposes `Split{split_key, new_region_id, new_peer_ids}`; on
   apply both halves are created on every peer with the same membership; the new region's Raft group starts
@@ -295,8 +308,17 @@ Regions cover the whole key space contiguously; the first region is `["", "")`.
   chunks with checksums; receiver `ingest()`s into place then applies the Raft snapshot metadata.
 - **Transport:** one TCP connection per (store, store) pair carrying `RaftTransport::Batch` frames with
   `RaftMessage`s for all regions, batched per tick.
-- **Heartbeats** *(phase 4 — esker-pd is a stub until then)*: store heartbeat (capacity, load) every
-  10 s; region heartbeat from each leader every 60 s or on change.
+- **Heartbeats:** store heartbeat (capacity, load, region and leader counts) every 10 s; region heartbeat
+  from each leader — and only from a leader — every 60 s **or on change**, where a change is an epoch bump
+  or a leader change. The "or on change" half is the one that matters: an epoch bump is a split or a
+  membership change, and every client cache in the cluster is wrong until PD knows, so waiting out the
+  sixty seconds would leave `EpochNotMatch`'s hint as the only repair — which is the load that hint exists
+  to avoid. Both cadences are counted in **ticks**, not read from a clock, so "every 60 s or on change" is
+  a rule a test drives rather than waits for. `capacity`, `available`, `applied_bytes` and a region's
+  `approximate_size` are reported as **zero in 4a** and documented as placeholders at each field: a
+  filesystem's size needs `statvfs`, which `std` does not expose and no allowlisted crate provides without
+  compiling C (an ADR of its own, when 4d's balance operators need the number), and per-region size comes
+  from SST properties in 4b.
 
 ## 7. Placement driver (`esker-pd`)
 
@@ -445,9 +467,14 @@ core is synchronous and has no I/O of its own: bytes leave through a `StoreTrans
 `Clock`. Both are injected, so every rule below is tested against a scripted transport and a clock
 that jumps rather than waits.
 
-- **Region cache** keyed by range, `GetRegion` on miss (`RegionResolver`; one static region until
-  phase 4). It is a *hint, never an authority*: every request carries the epoch the cache believes
-  and the store checks it, so a stale entry costs a redirect and never a wrong answer.
+- **Region cache** keyed by range, `GetRegion` on miss (`RegionResolver`). It is a *hint, never an
+  authority*: every request carries the epoch the cache believes and the store checks it, so a stale
+  entry costs a redirect and never a wrong answer. Keyed by **`start_key`**, walked backwards to the
+  last region starting at or before the key and then checked to reach it: an empty `end_key` means
+  `+∞` but sorts *below* every key, so a map keyed by `end_key` loses the last region of the cluster
+  for ever. A resolver answers `Ok(None)` for a key no region covers — terminal, since waiting does
+  not create one — and `Err` when it could not say, which is usually retryable; collapsing the two
+  would turn a momentary PD outage into a terminal error on every call in the process.
 - **Retries** are bounded by both a budget (8 retries *default*) and a per-call deadline (10 s
   *default*), whichever ends first. Which errors are retryable is `ProtoError::is_retryable()` —
   asked, not duplicated, so the client and the store cannot drift: `NotLeader` (follow the peer-id
