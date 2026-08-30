@@ -1,0 +1,27 @@
+crates/esker-proto/src/transport/client.rs
+  s_dc640bf0df4adb::t_6bba4945199e22 126-129
+crates/esker-proto/src/transport/conn.rs
+  s_dc640bf0df4adb::t_a90e50ca0b89e3 76-90
+crates/esker-proto/tests/loopback.rs
+  s_dc640bf0df4adb::t_463e8924af67d2 413-464
+crates/esker-store/tests/server.rs
+  s_dc640bf0df4adb::t_170c433e86dbad 19-20,282-290,301,305-310,314-320,322-323,325-356
+docs/plans/phase-2.md
+  s_dc640bf0df4adb::t_8002746b2cef12 413-437
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "124824952425579dc4f0f852a1981ebb5e029e5f",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
