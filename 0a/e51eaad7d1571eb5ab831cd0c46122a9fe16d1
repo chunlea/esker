@@ -1,0 +1,16 @@
+crates/esker-sql/src/pgwire/session.rs
+  h_44076b318daf9c 28-29,32,72-80,97-120,125-130,137,260-507,538,555-571,573-581,590,893-1237
+docs/plans/phase-6a.md
+  h_44076b318daf9c 450,452-453,467,546-568
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "0ae51eaad7d1571eb5ab831cd0c46122a9fe16d1",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
