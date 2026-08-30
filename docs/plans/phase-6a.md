@@ -447,55 +447,66 @@ its own gap register, and it would be longer.
 - [x] 1b — the syntax corpus: 353 statements, oracle-verified, 70 gaps registered in §9
 - [x] 1c — the feature recognizer: all 353 answered by a parse or an honest `0A000`, none a syntax
   error; `TABLE`/`ABORT` rewritten as the documented synonyms they are
-- [~] 2 — pgwire: **2a, 2b and 2c landed** — framing, message codec, startup +
-  `NegotiateProtocolVersion`, `ErrorResponse` fields, goldens, decoder fuzz (2a); the session state
-  machine and the simple query protocol (2b); the extended protocol's statement and portal
-  lifecycle (2c). **2d** is all that remains: the `tokio` listener and a real `psql` smoke test
+- [x] 2 — pgwire, complete: framing, message codec, startup + `NegotiateProtocolVersion`,
+  `ErrorResponse` fields, goldens, decoder fuzz (2a); the session state machine and the simple
+  query protocol (2b); the extended protocol's statement and portal lifecycle (2c); the `tokio`
+  listener, and a real `psql` connecting to it (2d)
 - [ ] 3 — row and tuple encodings
 - [ ] 4 — catalog
 - [x] 5 — backend trait and fake (the executor's half of the unique-index composition is unit 6)
 - [ ] 6 — planner and executor
 - [ ] 7 — `.slt` harness
 
-## 10a. Handoff — where the next session picks up
+## 10a. Handoff — where a fresh lane picks up
 
-Everything below is committed, green under `just check`'s per-crate equivalents, and needs no
-context that is not in this file.
+Unit 2 is complete and unit 5 is complete. Everything is committed and green: 98 tests, `clippy
+-D warnings` clean, `cargo deny` clean, 24 of 40 runtime crates.
 
-**Next, in order:**
+**A real `psql` 18.6 connects to `esker-sql`, gets a prompt, and is answered correctly** — the
+default `sslmode` (`SSLRequest` → `N` → startup), `max_protocol_version=latest` (3.2 downgraded via
+`NegotiateProtocolVersion`), `\conninfo`, and the transaction state machine including `25P02` after
+a failure inside a block. `tests/psql_smoke.rs` holds that as an automated test which skips when
+`psql` is absent, alongside five pipe-driven tests that need nothing installed.
 
-1. ~~**2c — the extended query protocol.**~~ **Done.** `Parse`/`Bind`/`Describe`/`Execute`/`Sync` decode already
-   and are golden-tested against real `psql` bytes; what is missing is the *lifecycle* on top of
-   [`Session`]: named and unnamed prepared statements and portals, and the rule that after an error
-   everything is refused **until `Sync`** — distinct from the simple protocol's "until the block
-   ends", and the trap the brief calls out. `Sync` is what sends `ReadyForQuery` in this protocol,
-   not the end of a message. Capture first: `psql` with `\bind` through the recording proxy (§9 has
-   the container recipe), including a deliberate error before `Sync`, then assert the sequence.
-2. **2d — the `tokio` listener.** One socket to one session; the length-prefixed reader is the only
-   new logic and `MAX_MESSAGE_LEN` is already the cap it should enforce. Then a real `psql` smoke
-   test, which is the first moment this crate is exercised end to end.
-3. **Units 3, 4, 6, 7** as originally planned. **Unit 5 is done** — the trait and the MVCC fake
-   are in `src/backend.rs`.
+### What is left, in order
 
-   Unit 6 owns the executor's half of the unique-index rule, and it is two specific obligations,
-   not a design question (§5 settles the design):
-   - before writing a unique index entry, `get` the index key in the same transaction and raise
-     `23505 unique_violation` if it is present;
-   - when `commit` returns `40001 serialization_failure` and the losing key was a unique index
-     entry, report it to the client as `23505`, because from the user's side that is a duplicate
-     and not a race. `a_concurrent_duplicate_loses_at_commit` in `backend.rs` is the scenario to
-     write that against.
+| Unit | What it is | Notes |
+|---|---|---|
+| 3 | Row and tuple encodings | §6 has the format. Version byte first, golden-tested, unknown version a typed error. |
+| 4 | Catalog in the `'m'` space | §6 again; the per-transaction version check is the part with a real invariant in it. |
+| 6 | Planner and executor | The big one. See the obligations below. |
+| 7 | The `.slt` harness | Over the fake backend; the real `sqllogictest` crate is acceptance. |
 
-**Two things to know before touching this code:**
+### Unit 6 inherits three concrete obligations, not design questions
 
-- Two seams, and they are different. `pgwire::session::Execute` is how the protocol reaches the
+1. **Implement `pgwire::session::Execute`.** `NotYetExecuting` in `pgwire::server` is the placeholder
+   it replaces; the trait is already what the protocol needs, including `describe` for the extended
+   protocol's `Describe`.
+2. **Unique indexes, exactly as ruled** (§5): read the index key in-transaction and raise `23505` if
+   present; and when `commit` returns `40001`, report `23505` if the losing key was a unique index
+   entry. `backend::tests::a_concurrent_duplicate_loses_at_commit` is the scenario to write against.
+3. **`ParameterDescription` currently reports declared types, not inferred ones** —
+   `TODO(unit-6)` at the call site in `pgwire::session::describe`. Real inference needs the planner
+   to type the expressions a parameter appears in.
+
+### Three things worth knowing before touching any of it
+
+- **Two seams, easily confused.** `pgwire::session::Execute` is how the protocol reaches the
   executor; `backend::Backend`/`Txn` is how the executor reaches storage. Unit 6 implements the
   first and consumes the second. `backend::Txn` is already aligned to the real `TxnClient`, so
   wiring the live one in is an impl and nothing above it changes.
-- The method that has worked all phase is *capture first, implement second*. Four defects were found
-  that way and none by reading the specification: the parser's recursion limit of 50, the
-  `ROLLBACK` command tag on a failed commit, protocol 3.2's 32-byte cancel key, and a warning that
-  sent no `CommandComplete`. The PostgreSQL 19 container in §9 is how that continues.
+- **`sqlparser` types stop at `parse.rs`** (ADR 0014). `parse::Parsed` is the opaque handle the rest
+  of the crate holds. Unit 6 is where the lowering to our own plan types belongs, and it should stay
+  inside that boundary — a `use sqlparser::` elsewhere is what turns a one-file replacement into a
+  rewrite.
+- **Capture first.** Seven defects were found this phase by asking a real PostgreSQL 19 and none by
+  reading the specification: the parser's recursion limit of 50; the `ROLLBACK` command tag on a
+  failed commit; protocol 3.2's 32-byte cancel key; a warning that sent no `CommandComplete`; the
+  wrong SQLSTATE class for a write conflict; `Describe`-statement sending two messages where
+  `Describe`-portal sends one; and the total silence a failed extended batch owes the client until
+  `Sync`. §9 has the container recipe. For units 3, 4 and 6 the same oracle answers a different
+  kind of question — value text formats, NULL ordering, command tag arithmetic — and differential
+  testing against it is what acceptance should do.
 
 ## 11. What changed, and why
 
@@ -542,6 +553,18 @@ A write conflict is `40001 serialization_failure` at this layer, not `23505`. Th
 contract C3: at the storage seam a lost race is a lost race, and it is the *executor* that knows the
 key was a unique index entry and so knows to report a duplicate. Turning every conflict into `23505`
 here would mislabel an ordinary row-level race as a constraint violation.
+
+**Unit 2d.** The listener is the only place in the crate that knows what a socket is, and
+`Connection` is generic over the stream rather than tied to `TcpStream`, so the whole handshake is
+driven over an in-memory pipe in five tests that need nothing installed. The sixth is a real `psql`,
+and it is the only test in the crate whose other end was written by someone else — which is the only
+way to find out whether our reading of the protocol and theirs agree. It skips when `psql` is
+absent, because that is a fact about the machine and not a defect in the server.
+
+Two details in it are load-bearing. An error that ends the connection is reported `FATAL` even when
+the condition is ordinary, because a client told `ERROR` waits for a `ReadyForQuery` that is never
+coming. And the message-length cap is enforced at the read, before the body is reserved, so a client
+claiming a gigabyte gets an error rather than the allocation.
 
 **Unit 2c.** `psql` cannot drive the extended protocol finely enough to answer the question this
 unit turns on — what a server does with messages sent *after* a failure and *before* `Sync` — so the
