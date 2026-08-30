@@ -1,0 +1,19 @@
+crates/esker-sim/tests/raft_membership.rs
+  s_34d3e1d2eec97a::t_c12b79c80529da 123-140,142
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "7c24c448c4c3157f13d3f346fa931790bfc92916",
+  "prompts": {},
+  "sessions": {
+    "s_34d3e1d2eec97a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9489838b-5536-4d39-8dbe-930a5f0cac17",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
