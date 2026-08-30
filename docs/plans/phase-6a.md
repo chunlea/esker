@@ -474,14 +474,24 @@ context that is not in this file.
 2. **2d — the `tokio` listener.** One socket to one session; the length-prefixed reader is the only
    new logic and `MAX_MESSAGE_LEN` is already the cap it should enforce. Then a real `psql` smoke
    test, which is the first moment this crate is exercised end to end.
-3. **Units 3–7** as originally planned, unchanged.
+3. **Units 3, 4, 6, 7** as originally planned. **Unit 5 is done** — the trait and the MVCC fake
+   are in `src/backend.rs`.
+
+   Unit 6 owns the executor's half of the unique-index rule, and it is two specific obligations,
+   not a design question (§5 settles the design):
+   - before writing a unique index entry, `get` the index key in the same transaction and raise
+     `23505 unique_violation` if it is present;
+   - when `commit` returns `40001 serialization_failure` and the losing key was a unique index
+     entry, report it to the client as `23505`, because from the user's side that is a duplicate
+     and not a race. `a_concurrent_duplicate_loses_at_commit` in `backend.rs` is the scenario to
+     write that against.
 
 **Two things to know before touching this code:**
 
-- The `Execute` trait in `pgwire::session` is the executor's seam and is deliberately narrow. Unit 5
-  must reconcile it with what `esker-client`'s `TxnClient` actually exposes; that lane has landed
-  its encodings and its `TxnClient` work, so read those commits rather than guessing (the brief says
-  to report a mismatch, not to invent one).
+- Two seams, and they are different. `pgwire::session::Execute` is how the protocol reaches the
+  executor; `backend::Backend`/`Txn` is how the executor reaches storage. Unit 6 implements the
+  first and consumes the second. `backend::Txn` is already aligned to the real `TxnClient`, so
+  wiring the live one in is an impl and nothing above it changes.
 - The method that has worked all phase is *capture first, implement second*. Four defects were found
   that way and none by reading the specification: the parser's recursion limit of 50, the
   `ROLLBACK` command tag on a failed commit, protocol 3.2's 32-byte cancel key, and a warning that
