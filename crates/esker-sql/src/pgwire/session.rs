@@ -25,9 +25,11 @@
 //!   happened.
 //! * **An empty query string gets `EmptyQueryResponse` and no `CommandComplete`.**
 
+use std::collections::BTreeMap;
+
 use crate::error::{Result, SqlError};
 use crate::parse::{Parsed, StatementClass, parse_statements};
-use crate::pgwire::message::{Backend, FieldDescription, TransactionStatus};
+use crate::pgwire::message::{Backend, FieldDescription, Frontend, Target, TransactionStatus};
 use crate::pgwire::{error_fields, error_message};
 
 /// What executing one statement produced.
@@ -67,6 +69,15 @@ pub trait Execute {
     /// Runs one statement that is not transaction control.
     fn execute(&mut self, parsed: &Parsed) -> Result<Outcome>;
 
+    /// The columns a statement would return, without running it — what `Describe` needs.
+    ///
+    /// `None` means the statement returns no rows, which the protocol spells `NoData`. The default
+    /// says that for everything, which is right until the planner can answer properly.
+    fn describe(&mut self, parsed: &Parsed) -> Result<Option<Vec<FieldDescription>>> {
+        let _ = parsed;
+        Ok(None)
+    }
+
     /// Opens a transaction.
     fn begin(&mut self) -> Result<()> {
         Ok(())
@@ -83,19 +94,47 @@ pub trait Execute {
     }
 }
 
+/// A statement that has been parsed and named, waiting to be bound.
+///
+/// `parsed` is `None` for the empty statement — `Parse` with an empty query string is legal, binds
+/// and describes normally, and yields `EmptyQueryResponse` when executed. A real capture confirms
+/// each of those, and treating it as an error instead would break any driver that probes with one.
+#[derive(Debug, Clone)]
+struct Prepared {
+    parsed: Option<Parsed>,
+    /// Parameter type OIDs as the client declared them in `Parse`.
+    param_types: Vec<u32>,
+}
+
+/// A prepared statement with its parameters bound, ready to run.
+#[derive(Debug, Clone)]
+struct Portal {
+    statement: String,
+    /// Kept so a second `Execute` after a `PortalSuspended` can resume, and so `Describe` can
+    /// answer without the statement being re-bound.
+    #[allow(dead_code)]
+    params: Vec<Option<Vec<u8>>>,
+    /// Rows already returned by earlier `Execute`s against this portal.
+    delivered: usize,
+}
+
 /// One client connection's state.
 #[derive(Debug, Default)]
 pub struct Session {
     status: TransactionStatus,
+    statements: BTreeMap<String, Prepared>,
+    portals: BTreeMap<String, Portal>,
+    /// Set by any failure in the extended protocol. While it is set, every message but `Sync` is
+    /// discarded in silence — not answered, not refused. `Sync` clears it and is the only thing
+    /// that sends `ReadyForQuery`.
+    skipping_until_sync: bool,
 }
 
 impl Session {
     /// A session that has just finished starting up: idle, no transaction.
     #[must_use]
     pub fn new() -> Self {
-        Session {
-            status: TransactionStatus::Idle,
-        }
+        Session::default()
     }
 
     /// What the next `ReadyForQuery` will report.
@@ -218,6 +257,254 @@ impl Session {
         result.map(|()| Outcome::done("ROLLBACK"))
     }
 
+    /// Handles one frontend message, appending whatever it should answer with.
+    ///
+    /// The one entry point a connection needs: `Query` runs the simple protocol and answers with
+    /// its own `ReadyForQuery`, while the extended-protocol messages answer piecemeal and only
+    /// `Sync` reports readiness.
+    pub fn handle(&mut self, message: &Frontend, executor: &mut dyn Execute, out: &mut Vec<u8>) {
+        // After a failure, everything up to the next `Sync` is discarded without a word. Captured
+        // from a real server: a `Bind` and an `Execute` sent after a failed `Parse` produced no
+        // bytes at all, and only `Sync` answered. A server that replied to them instead would put
+        // one extra message in the stream and desynchronise the client for the rest of the session.
+        if self.skipping_until_sync && !matches!(message, Frontend::Sync | Frontend::Terminate) {
+            return;
+        }
+        match message {
+            Frontend::Query(sql) => self.simple_query(sql, executor, out),
+            Frontend::Parse {
+                statement,
+                sql,
+                param_types,
+            } => self.parse_message(statement, sql, param_types, out),
+            Frontend::Bind {
+                portal,
+                statement,
+                params,
+                ..
+            } => self.bind(portal, statement, params, out),
+            Frontend::Describe { target, name } => self.describe(*target, name, executor, out),
+            Frontend::Execute { portal, max_rows } => {
+                self.execute(portal, *max_rows, executor, out);
+            }
+            Frontend::Close { target, name } => self.close(*target, name, out),
+            Frontend::Sync => self.sync(out),
+            // Nothing here buffers, so there is nothing for `Flush` to push.
+            Frontend::Flush | Frontend::Terminate => {}
+            Frontend::Password(_) | Frontend::Unknown { .. } => {
+                self.extended_failure(
+                    &SqlError::ProtocolViolation(
+                        "message is not valid at this point in the session".to_owned(),
+                    ),
+                    out,
+                );
+            }
+        }
+    }
+
+    /// `Parse`: name a statement.
+    fn parse_message(
+        &mut self,
+        statement: &str,
+        sql: &str,
+        param_types: &[u32],
+        out: &mut Vec<u8>,
+    ) {
+        let parsed = match parse_statements(sql) {
+            Ok(statements) if statements.len() > 1 => {
+                // PostgreSQL refuses this: a prepared statement is one statement, and allowing two
+                // would make the row description and the command tag ambiguous.
+                return self.extended_failure(
+                    &SqlError::Syntax {
+                        message: "cannot insert multiple commands into a prepared statement"
+                            .to_owned(),
+                        position: None,
+                    },
+                    out,
+                );
+            }
+            Ok(mut statements) => statements.pop(),
+            Err(error) => return self.extended_failure(&error, out),
+        };
+        self.statements.insert(
+            statement.to_owned(),
+            Prepared {
+                parsed,
+                param_types: param_types.to_vec(),
+            },
+        );
+        Backend::ParseComplete.encode(out);
+    }
+
+    /// `Bind`: fix a statement's parameters into a portal.
+    fn bind(
+        &mut self,
+        portal: &str,
+        statement: &str,
+        params: &[Option<Vec<u8>>],
+        out: &mut Vec<u8>,
+    ) {
+        if !self.statements.contains_key(statement) {
+            return self.extended_failure(
+                &SqlError::InvalidSqlStatementName(statement.to_owned()),
+                out,
+            );
+        }
+        self.portals.insert(
+            portal.to_owned(),
+            Portal {
+                statement: statement.to_owned(),
+                params: params.to_vec(),
+                delivered: 0,
+            },
+        );
+        Backend::BindComplete.encode(out);
+    }
+
+    /// `Describe`: what a statement takes, or what a portal returns.
+    ///
+    /// A statement is answered with **two** messages, `ParameterDescription` then the row shape; a
+    /// portal with only the row shape, since its parameters are already bound. Captured from a real
+    /// server, and getting the count wrong desynchronises the client rather than merely confusing
+    /// it.
+    fn describe(
+        &mut self,
+        target: Target,
+        name: &str,
+        executor: &mut dyn Execute,
+        out: &mut Vec<u8>,
+    ) {
+        let prepared = match self.prepared_for(target, name) {
+            Ok(prepared) => prepared.clone(),
+            Err(error) => return self.extended_failure(&error, out),
+        };
+        if target == Target::Statement {
+            // TODO(unit-6): these are the types the client declared, not types we inferred. Real
+            // inference needs the planner to type the expressions a parameter appears in; until
+            // then a client that declares nothing is told nothing, which is honest but is not yet
+            // what PostgreSQL answers.
+            Backend::ParameterDescription(&prepared.param_types).encode(out);
+        }
+        let fields = match prepared.parsed.as_ref() {
+            None => None,
+            Some(parsed) => match executor.describe(parsed) {
+                Ok(fields) => fields,
+                Err(error) => return self.extended_failure(&error, out),
+            },
+        };
+        match fields {
+            Some(fields) => Backend::RowDescription(&fields).encode(out),
+            None => Backend::NoData.encode(out),
+        }
+    }
+
+    /// `Execute`: run a portal, up to `max_rows` (0 meaning all of them).
+    fn execute(
+        &mut self,
+        portal: &str,
+        max_rows: u32,
+        executor: &mut dyn Execute,
+        out: &mut Vec<u8>,
+    ) {
+        let Some(open) = self.portals.get(portal).cloned() else {
+            return self.extended_failure(&SqlError::InvalidCursorName(portal.to_owned()), out);
+        };
+        let Some(prepared) = self.statements.get(&open.statement).cloned() else {
+            return self.extended_failure(&SqlError::InvalidSqlStatementName(open.statement), out);
+        };
+        let Some(parsed) = prepared.parsed else {
+            // The empty statement. Captured: it binds and describes normally and executes to this.
+            Backend::EmptyQueryResponse.encode(out);
+            return;
+        };
+
+        if self.status == TransactionStatus::Failed && !ends_a_transaction(parsed.class()) {
+            return self.extended_failure(&SqlError::InFailedTransaction, out);
+        }
+
+        let outcome = match parsed.class() {
+            StatementClass::Begin => self.begin(executor, out),
+            StatementClass::Commit => self.commit(executor, out),
+            StatementClass::Rollback => self.rollback(executor, out),
+            _ => executor.execute(&parsed),
+        };
+        match outcome {
+            Ok(Outcome::Rows { rows, tag, .. }) => {
+                // `Execute` sends no `RowDescription`; the client already asked for it with
+                // `Describe`, and sending it again would be one message too many.
+                let limit = if max_rows == 0 {
+                    rows.len()
+                } else {
+                    max_rows as usize
+                };
+                let remaining = rows.len().saturating_sub(open.delivered);
+                let taking = limit.min(remaining);
+                for row in rows.iter().skip(open.delivered).take(taking) {
+                    Backend::DataRow(row).encode(out);
+                }
+                if let Some(open) = self.portals.get_mut(portal) {
+                    open.delivered += taking;
+                }
+                if max_rows != 0 && taking == limit && remaining > taking {
+                    // The portal is still open and the client may ask again.
+                    Backend::PortalSuspended.encode(out);
+                } else {
+                    Backend::CommandComplete(&tag).encode(out);
+                }
+            }
+            Ok(Outcome::Done { tag }) => Backend::CommandComplete(&tag).encode(out),
+            Err(error) => self.extended_failure(&error, out),
+        }
+    }
+
+    /// `Close`: forget a statement or a portal. Closing one that does not exist is not an error.
+    fn close(&mut self, target: Target, name: &str, out: &mut Vec<u8>) {
+        match target {
+            Target::Statement => {
+                self.statements.remove(name);
+                // A portal outlives nothing: closing its statement closes it too.
+                self.portals.retain(|_, portal| portal.statement != name);
+            }
+            Target::Portal => {
+                self.portals.remove(name);
+            }
+        }
+        Backend::CloseComplete.encode(out);
+    }
+
+    /// `Sync`: end the batch, clear any failure, and report readiness.
+    ///
+    /// The only message in the extended protocol that sends `ReadyForQuery`.
+    fn sync(&mut self, out: &mut Vec<u8>) {
+        self.skipping_until_sync = false;
+        // An implicit transaction opened by the batch ends here; an explicit block does not.
+        Backend::ReadyForQuery(self.status).encode(out);
+    }
+
+    fn prepared_for(&self, target: Target, name: &str) -> Result<&Prepared> {
+        match target {
+            Target::Statement => self
+                .statements
+                .get(name)
+                .ok_or_else(|| SqlError::InvalidSqlStatementName(name.to_owned())),
+            Target::Portal => {
+                let portal = self
+                    .portals
+                    .get(name)
+                    .ok_or_else(|| SqlError::InvalidCursorName(name.to_owned()))?;
+                self.statements
+                    .get(&portal.statement)
+                    .ok_or_else(|| SqlError::InvalidSqlStatementName(portal.statement.clone()))
+            }
+        }
+    }
+
+    /// A failure in the extended protocol: report it, then go quiet until `Sync`.
+    fn extended_failure(&mut self, error: &SqlError, out: &mut Vec<u8>) {
+        self.fail(error, out);
+        self.skipping_until_sync = true;
+    }
+
     /// Emits a failure and moves the transaction into the failed state if there is one.
     ///
     /// An error outside a transaction block leaves the status idle: there is no block to poison,
@@ -248,7 +535,7 @@ mod tests {
     use super::{Execute, Outcome, Session};
     use crate::error::{Result, SqlError};
     use crate::parse::Parsed;
-    use crate::pgwire::message::{FieldDescription, TransactionStatus};
+    use crate::pgwire::message::{FieldDescription, Frontend, Target, TransactionStatus};
     use crate::sqlstate;
 
     /// Stands in for the executor until unit 6. It answers every statement the same way, because
@@ -265,7 +552,33 @@ mod tests {
         calls: Vec<String>,
     }
 
+    impl Fake {
+        /// The one column this fake ever returns. Shared by `execute` and `describe`, because a
+        /// `Describe` that disagreed with the following `Execute` would be a bug a real client
+        /// would notice and these tests would not.
+        fn fields() -> Vec<FieldDescription> {
+            vec![FieldDescription {
+                name: "?column?".to_owned(),
+                table_oid: 0,
+                column_id: 0,
+                type_oid: 23,
+                type_size: 4,
+                type_modifier: -1,
+                format: 0,
+            }]
+        }
+    }
+
     impl Execute for Fake {
+        fn describe(&mut self, parsed: &Parsed) -> Result<Option<Vec<FieldDescription>>> {
+            self.calls.push(format!("describe {}", parsed.rendered()));
+            Ok(if self.rows == 0 {
+                None
+            } else {
+                Some(Fake::fields())
+            })
+        }
+
         fn execute(&mut self, parsed: &Parsed) -> Result<Outcome> {
             self.calls.push(format!("execute {}", parsed.rendered()));
             if let Some(error) = self.fail.take() {
@@ -274,15 +587,7 @@ mod tests {
             if self.rows == 0 {
                 return Ok(Outcome::done("SELECT 0"));
             }
-            let fields = vec![FieldDescription {
-                name: "?column?".to_owned(),
-                table_oid: 0,
-                column_id: 0,
-                type_oid: 23,
-                type_size: 4,
-                type_modifier: -1,
-                format: 0,
-            }];
+            let fields = Fake::fields();
             let rows = (0..self.rows)
                 .map(|n| vec![Some(n.to_string().into_bytes())])
                 .collect();
@@ -583,6 +888,351 @@ mod tests {
             TransactionStatus::Idle,
             "the block is gone even though the commit failed"
         );
+    }
+
+    // --- the extended protocol ---
+    //
+    // Each of these mirrors a sequence captured from PostgreSQL 19beta1 by a raw protocol client,
+    // which is the only way to see what a server does with messages sent *after* a failure and
+    // before a Sync.
+
+    fn parse_msg(name: &str, sql: &str) -> Frontend {
+        Frontend::Parse {
+            statement: name.to_owned(),
+            sql: sql.to_owned(),
+            param_types: Vec::new(),
+        }
+    }
+
+    fn bind_msg(portal: &str, statement: &str) -> Frontend {
+        Frontend::Bind {
+            portal: portal.to_owned(),
+            statement: statement.to_owned(),
+            param_formats: Vec::new(),
+            params: Vec::new(),
+            result_formats: Vec::new(),
+        }
+    }
+
+    fn execute_msg(portal: &str, max_rows: u32) -> Frontend {
+        Frontend::Execute {
+            portal: portal.to_owned(),
+            max_rows,
+        }
+    }
+
+    /// Drives a batch of messages and returns everything the session answered with.
+    fn batch(session: &mut Session, fake: &mut Fake, messages: &[Frontend]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for message in messages {
+            session.handle(message, fake, &mut out);
+        }
+        out
+    }
+
+    /// Captured: `Parse` `Bind` `Execute` `Sync` answers `1` `2` `D...` `C` `Z`.
+    #[test]
+    fn a_whole_extended_batch_answers_in_order() {
+        let mut session = Session::new();
+        let mut fake = Fake {
+            rows: 2,
+            ..Fake::default()
+        };
+        let reply = batch(
+            &mut session,
+            &mut fake,
+            &[
+                parse_msg("", "SELECT a FROM g"),
+                bind_msg("", ""),
+                execute_msg("", 0),
+                Frontend::Sync,
+            ],
+        );
+        assert_eq!(tags(&reply), "12DDCZ");
+    }
+
+    /// The rule this unit exists for, and the one a specification alone gets wrong. Captured: a
+    /// failed `Parse` answers `E` immediately, the `Bind` and `Execute` that follow answer
+    /// **nothing at all**, and `Sync` alone sends `ReadyForQuery`.
+    #[test]
+    fn after_a_failure_everything_is_discarded_until_sync() {
+        let mut session = Session::new();
+        let mut fake = Fake::default();
+
+        let mut out = Vec::new();
+        session.handle(&parse_msg("", "SELCT 1"), &mut fake, &mut out);
+        assert_eq!(tags(&out), "E", "the failure is reported at once");
+
+        let mut after = Vec::new();
+        session.handle(&bind_msg("", ""), &mut fake, &mut after);
+        session.handle(&execute_msg("", 0), &mut fake, &mut after);
+        session.handle(
+            &Frontend::Describe {
+                target: Target::Portal,
+                name: String::new(),
+            },
+            &mut fake,
+            &mut after,
+        );
+        assert!(
+            after.is_empty(),
+            "messages after a failure must produce no bytes at all, not an error each: \
+             answering them would put extra messages in the stream and desynchronise the client"
+        );
+
+        let mut synced = Vec::new();
+        session.handle(&Frontend::Sync, &mut fake, &mut synced);
+        assert_eq!(tags(&synced), "Z", "only Sync reports readiness");
+
+        // And the session is usable again.
+        let reply = batch(
+            &mut session,
+            &mut fake,
+            &[parse_msg("", "SELECT 1"), Frontend::Sync],
+        );
+        assert_eq!(tags(&reply), "1Z");
+    }
+
+    /// Captured: describing a *statement* sends two messages, `t` then the row shape; describing a
+    /// *portal* sends only the row shape, because its parameters are already bound. One message too
+    /// many here desynchronises the client rather than merely confusing it.
+    #[test]
+    fn describing_a_statement_and_a_portal_differ_by_one_message() {
+        let mut session = Session::new();
+        let mut fake = Fake {
+            rows: 1,
+            ..Fake::default()
+        };
+        let reply = batch(
+            &mut session,
+            &mut fake,
+            &[
+                parse_msg("st", "SELECT a FROM g"),
+                Frontend::Describe {
+                    target: Target::Statement,
+                    name: "st".to_owned(),
+                },
+                bind_msg("po", "st"),
+                Frontend::Describe {
+                    target: Target::Portal,
+                    name: "po".to_owned(),
+                },
+                Frontend::Sync,
+            ],
+        );
+        assert_eq!(tags(&reply), "1tT2TZ");
+    }
+
+    /// A statement that returns nothing is `NoData`, not an empty `RowDescription`.
+    #[test]
+    fn describing_a_statement_with_no_rows_is_nodata() {
+        let mut session = Session::new();
+        let mut fake = Fake::default();
+        let reply = batch(
+            &mut session,
+            &mut fake,
+            &[
+                parse_msg("st", "SELECT 1"),
+                Frontend::Describe {
+                    target: Target::Statement,
+                    name: "st".to_owned(),
+                },
+                Frontend::Sync,
+            ],
+        );
+        assert_eq!(tags(&reply), "1tnZ");
+    }
+
+    /// Captured: `Execute` with a row limit answers `s` `PortalSuspended` and not
+    /// `CommandComplete`, and the portal stays open so the client may ask for the rest.
+    #[test]
+    fn a_row_limit_suspends_the_portal_and_a_second_execute_finishes_it() {
+        let mut session = Session::new();
+        let mut fake = Fake {
+            rows: 3,
+            ..Fake::default()
+        };
+        let reply = batch(
+            &mut session,
+            &mut fake,
+            &[
+                parse_msg("", "SELECT a FROM g"),
+                bind_msg("", ""),
+                execute_msg("", 2),
+                Frontend::Sync,
+            ],
+        );
+        assert_eq!(tags(&reply), "12DDsZ", "two rows, then suspended");
+
+        // The portal resumes where it left off rather than starting again.
+        let reply = batch(
+            &mut session,
+            &mut fake,
+            &[execute_msg("", 0), Frontend::Sync],
+        );
+        assert_eq!(tags(&reply), "DCZ", "the third row, then the tag");
+    }
+
+    /// A limit that the result does not reach completes normally: suspending there would leave the
+    /// client waiting for rows that do not exist.
+    #[test]
+    fn a_row_limit_larger_than_the_result_completes_normally() {
+        let mut session = Session::new();
+        let mut fake = Fake {
+            rows: 1,
+            ..Fake::default()
+        };
+        let reply = batch(
+            &mut session,
+            &mut fake,
+            &[
+                parse_msg("", "SELECT a FROM g"),
+                bind_msg("", ""),
+                execute_msg("", 10),
+                Frontend::Sync,
+            ],
+        );
+        assert_eq!(tags(&reply), "12DCZ");
+    }
+
+    /// Captured: binding a statement that was never parsed is `26000`, and then the batch goes
+    /// quiet until `Sync` like any other failure.
+    #[test]
+    fn binding_a_statement_that_does_not_exist_is_26000() {
+        let mut session = Session::new();
+        let mut fake = Fake::default();
+        let mut out = Vec::new();
+        session.handle(&bind_msg("", "nope"), &mut fake, &mut out);
+        let framed = messages(&out);
+        assert_eq!(
+            field(&framed[0].1, b'C').as_deref(),
+            Some(sqlstate::INVALID_SQL_STATEMENT_NAME)
+        );
+        assert_eq!(
+            field(&framed[0].1, b'M').as_deref(),
+            Some("prepared statement \"nope\" does not exist")
+        );
+    }
+
+    /// Captured: the empty statement parses, binds, and executes to `EmptyQueryResponse`; then
+    /// `Close` acknowledges. A driver that probes the connection with an empty statement must not
+    /// be met with an error.
+    #[test]
+    fn the_empty_statement_parses_binds_and_executes_to_an_empty_response() {
+        let mut session = Session::new();
+        let mut fake = Fake::default();
+        let reply = batch(
+            &mut session,
+            &mut fake,
+            &[
+                parse_msg("e", ""),
+                bind_msg("", "e"),
+                execute_msg("", 0),
+                Frontend::Close {
+                    target: Target::Statement,
+                    name: "e".to_owned(),
+                },
+                Frontend::Sync,
+            ],
+        );
+        assert_eq!(tags(&reply), "12I3Z");
+    }
+
+    /// A prepared statement is one statement. Two would make the row description and the command
+    /// tag ambiguous, and PostgreSQL refuses it for that reason.
+    #[test]
+    fn a_prepared_statement_may_not_hold_two_statements() {
+        let mut session = Session::new();
+        let mut fake = Fake::default();
+        let mut out = Vec::new();
+        session.handle(&parse_msg("", "SELECT 1; SELECT 2"), &mut fake, &mut out);
+        let framed = messages(&out);
+        assert_eq!(
+            field(&framed[0].1, b'C').as_deref(),
+            Some(sqlstate::SYNTAX_ERROR)
+        );
+        assert_eq!(
+            field(&framed[0].1, b'M').as_deref(),
+            Some("syntax error: cannot insert multiple commands into a prepared statement")
+        );
+    }
+
+    /// Closing a statement closes the portals built from it: a portal outliving its statement
+    /// would be executable against something that no longer exists.
+    #[test]
+    fn closing_a_statement_closes_its_portals() {
+        let mut session = Session::new();
+        let mut fake = Fake::default();
+        batch(
+            &mut session,
+            &mut fake,
+            &[parse_msg("st", "SELECT 1"), bind_msg("po", "st")],
+        );
+        let mut out = Vec::new();
+        session.handle(
+            &Frontend::Close {
+                target: Target::Statement,
+                name: "st".to_owned(),
+            },
+            &mut fake,
+            &mut out,
+        );
+        assert_eq!(tags(&out), "3");
+
+        let mut after = Vec::new();
+        session.handle(&execute_msg("po", 0), &mut fake, &mut after);
+        let framed = messages(&after);
+        assert_eq!(
+            field(&framed[0].1, b'C').as_deref(),
+            Some(sqlstate::INVALID_CURSOR_NAME),
+            "the portal went with its statement"
+        );
+    }
+
+    /// The extended protocol's failure state and the transaction's are separate things. An error
+    /// inside a block sets both: quiet until `Sync`, and `E` in the `ReadyForQuery` that `Sync`
+    /// sends.
+    #[test]
+    fn a_failure_inside_a_transaction_reports_e_at_the_next_sync() {
+        let mut session = Session::new();
+        let mut fake = Fake::default();
+        run(&mut session, "BEGIN", &mut fake);
+        assert_eq!(session.status(), TransactionStatus::InTransaction);
+
+        fake.fail = Some(SqlError::UndefinedTable("nope".into()));
+        let reply = batch(
+            &mut session,
+            &mut fake,
+            &[
+                parse_msg("", "SELECT * FROM nope"),
+                bind_msg("", ""),
+                execute_msg("", 0),
+                Frontend::Sync,
+            ],
+        );
+        // Parse and Bind succeed; Execute fails; Sync reports the failed block.
+        assert_eq!(tags(&reply), "12EZ");
+        let framed = messages(&reply);
+        assert_eq!(framed[3].1, b"E", "ReadyForQuery must say the block failed");
+        assert_eq!(session.status(), TransactionStatus::Failed);
+    }
+
+    /// A simple `Query` in the middle of a session clears the extended protocol's failure state,
+    /// because it carries its own `ReadyForQuery` and ends the batch by definition.
+    #[test]
+    fn a_simple_query_ends_a_failed_extended_batch() {
+        let mut session = Session::new();
+        let mut fake = Fake::default();
+        let mut out = Vec::new();
+        session.handle(&parse_msg("", "SELCT 1"), &mut fake, &mut out);
+        session.handle(&Frontend::Sync, &mut fake, &mut out);
+
+        let reply = batch(
+            &mut session,
+            &mut fake,
+            &[Frontend::Query("SELECT 1".to_owned())],
+        );
+        assert_eq!(tags(&reply), "CZ");
     }
 
     /// A syntax error is reported and nothing runs, and the session is still usable.

@@ -447,10 +447,10 @@ its own gap register, and it would be longer.
 - [x] 1b — the syntax corpus: 353 statements, oracle-verified, 70 gaps registered in §9
 - [x] 1c — the feature recognizer: all 353 answered by a parse or an honest `0A000`, none a syntax
   error; `TABLE`/`ABORT` rewritten as the documented synonyms they are
-- [~] 2 — pgwire: **2a and 2b landed** — framing, message codec, startup +
+- [~] 2 — pgwire: **2a, 2b and 2c landed** — framing, message codec, startup +
   `NegotiateProtocolVersion`, `ErrorResponse` fields, goldens, decoder fuzz (2a); the session state
-  machine and the simple query protocol (2b). 2c is the extended protocol; 2d the `tokio` listener
-  and a real `psql` smoke test
+  machine and the simple query protocol (2b); the extended protocol's statement and portal
+  lifecycle (2c). **2d** is all that remains: the `tokio` listener and a real `psql` smoke test
 - [ ] 3 — row and tuple encodings
 - [ ] 4 — catalog
 - [x] 5 — backend trait and fake (the executor's half of the unique-index composition is unit 6)
@@ -464,7 +464,7 @@ context that is not in this file.
 
 **Next, in order:**
 
-1. **2c — the extended query protocol.** `Parse`/`Bind`/`Describe`/`Execute`/`Sync` decode already
+1. ~~**2c — the extended query protocol.**~~ **Done.** `Parse`/`Bind`/`Describe`/`Execute`/`Sync` decode already
    and are golden-tested against real `psql` bytes; what is missing is the *lifecycle* on top of
    [`Session`]: named and unnamed prepared statements and portals, and the rule that after an error
    everything is refused **until `Sync`** — distinct from the simple protocol's "until the block
@@ -542,6 +542,29 @@ A write conflict is `40001 serialization_failure` at this layer, not `23505`. Th
 contract C3: at the storage seam a lost race is a lost race, and it is the *executor* that knows the
 key was a unique index entry and so knows to report a duplicate. Turning every conflict into `23505`
 here would mislabel an ordinary row-level race as a constraint violation.
+
+**Unit 2c.** `psql` cannot drive the extended protocol finely enough to answer the question this
+unit turns on — what a server does with messages sent *after* a failure and *before* `Sync` — so the
+capture was taken with a raw protocol client instead. The answer settles the trap the brief named:
+
+- **A failure answers immediately, and then the server goes completely silent.** The `Bind` and
+  `Execute` that followed a failed `Parse` produced *no bytes at all* — not an error each. A server
+  that answered them would put extra messages in the stream and desynchronise the client for the
+  rest of the session, which is worse than the original error and far harder to diagnose.
+- **`Sync` alone sends `ReadyForQuery`**, and it is what clears the skip state.
+- **`Describe` on a statement sends two messages** (`ParameterDescription`, then the row shape) and
+  on a portal **one**, since a portal's parameters are already bound. One message too many here
+  desynchronises rather than confuses.
+- **`Execute` with a row limit answers `PortalSuspended`, not `CommandComplete`**, and the portal
+  stays open — a second `Execute` resumes where the first stopped.
+- **The empty statement is legal all the way through**: it parses, binds, describes, and executes to
+  `EmptyQueryResponse`. Drivers probe with it, so refusing it would break them.
+
+Two things are deliberately not done. `ParameterDescription` reports the types the client
+*declared* rather than inferred ones, because inference needs the planner to type the expressions a
+parameter appears in — marked `TODO(unit-6)` at the call site. And the extended protocol's failure
+state is kept separate from the transaction's: an error inside a block sets both, and `Sync` reports
+`E` while still clearing the skip.
 
 **Unit 2b.** Six more rules read off captures rather than out of the specification, each now a
 test: `ReadyForQuery` is once per *message* and not once per statement; an error abandons the rest
