@@ -9,11 +9,11 @@
 //!   `write` record exists. Every reader that meets a lock resolves it by inspecting the
 //!   primary — rolling forward if it committed, back if its TTL expired — and never by
 //!   guessing. A secondary committed before its primary leaves a state the resolution rules
-//!   classify *wrongly*, so `commit_secondary` will not be callable without evidence the
-//!   primary is durable.
+//!   classify *wrongly*, so [`commit_secondary`] cannot be called without a
+//!   [`PrimaryCommitted`] token, and the only source of one is the primary's applied plan.
 //! * **Prewrite is atomic per key.** The `lock` entry and the `default` value are one
-//!   mutation list, and so are the `write` entry and the lock's removal at commit; the store
-//!   turns each into one `WriteBatch` through Raft.
+//!   [`Mutations`] list, and so are the `write` entry and the lock's removal at commit; the
+//!   store turns each into one `WriteBatch` through Raft.
 //! * **Prewrite checks both column families.** `write` for a commit newer than the snapshot
 //!   *and* `lock` for any lock. Either one alone is a silent isolation break.
 //! * **Timestamps come only from the oracle** (`CLAUDE.md` invariant 6). Even lock expiry is
@@ -26,19 +26,31 @@
 //!
 //! # Layout
 //!
-//! This crate is a **library of decisions, not a service**. [`key`] builds the engine keys and
-//! [`codec`] the record bytes; the snapshot trait and the protocol rules follow in the same
-//! phase. There are no threads, no sockets and no clock in here; the `esker-store` handler
-//! that phase 4 unblocks is `decode → call → write batch through Raft`.
+//! This crate is a **library of decisions, not a service**. [`key`] builds the engine keys,
+//! [`codec`] the record bytes, [`snapshot`] is the five-question trait the store implements
+//! over an engine snapshot, and [`percolator`] is every rule of the protocol as a pure
+//! function from a snapshot to a [`Mutations`] list. There are no threads, no sockets and no
+//! clock in here; the `esker-store` handler that phase 4 unblocks is `decode → call → write
+//! batch through Raft`.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod codec;
 pub mod error;
 pub mod key;
+pub mod mutation;
+pub mod percolator;
+pub mod snapshot;
 
 pub use codec::{Kind, LOCK_TTL_MS, LockRecord, SHORT_VALUE_MAX_LEN, WriteRecord};
 pub use error::{Result, TxnError};
+pub use mutation::{Cf, Mutation, Mutations};
+pub use percolator::{
+    CommitDecision, Op, Prewrite, PrewriteDecision, PrimaryCommit, PrimaryCommitted, PrimaryState,
+    ReadOutcome, Resolution, check_prewrite, commit_primary, commit_secondary, primary_state, read,
+    resolve, rollback,
+};
+pub use snapshot::{TxnSnapshot, Version};
 
 /// Bits of the logical counter in a timestamp: `ts = physical_ms << 18 | logical`.
 ///

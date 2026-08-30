@@ -19,7 +19,16 @@ esker-base.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 
+[features]
+# Exposes `snapshot::MemoryStore`, the in-memory three-column-family store the protocol matrix
+# runs against. Off by default, on the same reasoning as `esker-engine`'s and
+# `esker-client`'s: a normal build carries no machinery whose job is to stand in for a store.
+testing = []
+
 [dev-dependencies]
+# The crate's own test harness, for integration tests that link the library as an ordinary
+# dependency and so cannot reach `#[cfg(test)]` code.
+esker-txn = { path = ".", features = ["testing"] }
 proptest.workspace = true
 # `tests/tso_format.rs` asserts this crate's copy of the oracle's timestamp layout still
 # matches PD's. Dev-only: nothing esker-txn ships links the placement driver, and the layer

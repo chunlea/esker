@@ -135,10 +135,17 @@ The snapshot answers five questions (`TxnSnapshot`):
 ```
 get_lock(k)                      → the lock on k, if any
 seek_write(k, ts)                → the newest (commit_ts, WriteRecord) with commit_ts ≤ ts
-get_write_at(k, commit_ts)       → the record at exactly commit_ts
-get_write_newer_than(k, ts)      → the newest (commit_ts, WriteRecord) with commit_ts > ts
+newest_write_after(k, ts)        → the newest (commit_ts, WriteRecord) with commit_ts > ts
+write_of_txn(k, start_ts)        → the record the transaction at start_ts left here:
+                                   its commit, or its rollback marker
 get_value(k, start_ts)           → the `default` entry
 ```
+
+Four of the five are a point get or a single seek. `write_of_txn` is a **bounded scan**: a
+transaction's own record is filed under some `commit_ts ≥ start_ts`, so the walk runs from the
+newest version down to `start_ts` and stops. There is no index from `start_ts` to `commit_ts`, and
+adding one would be a second structure to keep consistent with the first; TiKV's resolver does the
+same walk for the same reason.
 
 `seek_write(k, ts)` is one forward seek to `'x' ++ enc(k) ++ !ts` followed by a prefix check, and
 that is the whole reason `enc_ts` is complemented. **The boundary is inclusive**: a version committed
@@ -161,12 +168,15 @@ at exactly `ts` is visible at `ts`, because `!commit_ts == !ts` makes the seek l
 
 Two checks, and **both** are load-bearing:
 
-1. `get_write_newer_than(k, start_ts)`. A commit newer than our snapshot is a **write-write
+1. `newest_write_after(k, start_ts)`. A commit newer than our snapshot is a **write-write
    conflict**: another transaction wrote what we read. Fail; the client aborts and may retry with a
    fresh `start_ts`. *(Skipping this check breaks snapshot isolation's lost-update guarantee.)*
-2. `get_write_at(k, start_ts)`. A `Rollback` there means this transaction was already rolled back by
+   A record whose `start_ts` is *our own* is not a conflict with ourselves — see check 2.
+2. `write_of_txn(k, start_ts)`. A `Rollback` means this transaction was already rolled back by
    someone who found its lock expired. Fail — resurrecting it would commit a transaction another
-   party has already told a reader is dead.
+   party has already told a reader is dead. A *commit* there is our own, from an attempt whose
+   answer was lost: succeed and write nothing. Neither is reachable from check 1, because a
+   rollback marker sits at `commit_ts == start_ts`, below the range that check looks at.
 3. `get_lock(k)`. Any lock with a different `start_ts` is a **lock conflict**: answer
    `Locked{lock_info}` so the client can resolve it. A lock with *our* `start_ts` is our own earlier
    attempt: succeed and write nothing, which is what makes `Prewrite` idempotent and what makes an
