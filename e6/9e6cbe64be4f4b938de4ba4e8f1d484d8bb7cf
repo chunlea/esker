@@ -1,0 +1,35 @@
+crates/esker-engine/src/lib.rs
+  s_583ba4eb96ad8a::t_1edd91abede9a5 34-35,46,49,58
+crates/esker-engine/src/memfs.rs
+  s_583ba4eb96ad8a::t_7eea91524482fd 1-326
+crates/esker-engine/src/wal/format.rs
+  s_583ba4eb96ad8a::t_f409c174fe3426 1-159
+crates/esker-engine/src/wal/mod.rs
+  s_583ba4eb96ad8a::t_baa950556fd354 1-18
+crates/esker-engine/src/wal/reader.rs
+  s_583ba4eb96ad8a::t_1c845b2ed69bea 1-439
+crates/esker-engine/src/wal/writer.rs
+  s_583ba4eb96ad8a::t_475276040b8b08 1-266
+crates/esker-engine/tests/golden/wal-small.hex
+  s_583ba4eb96ad8a::t_cacd170e8fb841 1-8
+crates/esker-engine/tests/golden/wal-spanning.txt
+  s_583ba4eb96ad8a::t_d27c6e5dacc109 1-8
+crates/esker-engine/tests/wal.rs
+  s_583ba4eb96ad8a::t_3297c2b946c0b6 1-349
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "e69e6cbe64be4f4b938de4ba4e8f1d484d8bb7cf",
+  "prompts": {},
+  "sessions": {
+    "s_583ba4eb96ad8a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2ac73fb2-9428-4877-ae7d-195e5b69e526",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
