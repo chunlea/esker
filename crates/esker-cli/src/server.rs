@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use esker_proto::{Server, TransportConfig};
 use esker_store::server::RaftOptions;
-use esker_store::{PeerAddress, Store, StoreOptions, StoreService};
+use esker_store::{PdClient, PeerAddress, RemotePd, Store, StoreOptions, StoreService};
 
 /// Where `--listen` points when nothing says otherwise.
 ///
@@ -42,6 +42,10 @@ pub(crate) struct ServerOptions {
     /// Seed for the election-timeout RNG. A whole cluster shares one: the peer id selects the
     /// stream (`docs/adr/0008-raft-determinism-and-the-driver-contract.md`).
     pub(crate) seed: u64,
+    /// The placement driver to register with and report to. `None` is a store that bootstraps
+    /// its own region and reports to nobody — phase 2's single node and phase 3e's static
+    /// cluster, both of which this command still starts.
+    pub(crate) pd: Option<String>,
 }
 
 impl Default for ServerOptions {
@@ -53,6 +57,7 @@ impl Default for ServerOptions {
             peer_id: 1,
             peers: Vec::new(),
             seed: 0,
+            pd: None,
         }
     }
 }
@@ -85,12 +90,30 @@ pub(crate) fn run(options: &ServerOptions) -> Result<(), String> {
         Some(RaftOptions::new(peers, options.seed))
     };
 
+    // Connecting is lazy, so a placement driver that is not up yet fails the *bootstrap* with
+    // a message naming it rather than failing here with one about a socket.
+    let pd = match &options.pd {
+        None => None,
+        Some(listed) => {
+            let addr: SocketAddr = listed
+                .parse()
+                .map_err(|error| format!("`--pd {listed}` is not an address: {error}"))?;
+            let client = RemotePd::connect(addr)
+                .map_err(|error| format!("starting the placement-driver client: {error}"))?;
+            Some(Arc::new(client) as Arc<dyn PdClient>)
+        }
+    };
+
     let store = Store::open(
         &options.data_dir,
         StoreOptions {
             store_id: options.store_id,
             peer_id: options.peer_id,
             raft,
+            pd,
+            // What PD records as this store's address is the address it was told to listen on,
+            // not the one it resolved to: `0.0.0.0:0` resolves to something no peer can use.
+            address: options.listen.clone(),
             ..StoreOptions::new()
         },
     )
@@ -127,6 +150,9 @@ async fn serve(
         options.store_id,
         options.data_dir.display()
     );
+    if let Some(pd) = &options.pd {
+        println!("esker server: registered with the placement driver at {pd}");
+    }
     // Every region this store hosts, in key order. In phase 4a that is one, bootstrapped to
     // cover everything; `TODO(phase-4b)` a split makes the list grow while the server runs, and
     // this line only says what it found at open.
