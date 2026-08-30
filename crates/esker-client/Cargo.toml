@@ -12,6 +12,8 @@ publish.workspace = true
 # The frame limit and, once the sibling lane lands them, the wire types themselves. Until
 # then `src/wire.rs` is a stand-in for this crate's message layer (see its header).
 esker-proto.workspace = true
+# The seeded generator the retry jitter draws from; `rand` is banned (ADR 0004).
+esker-base.workspace = true
 # `Bytes` at API boundaries: a value read out of a response is handed on without a copy.
 bytes.workspace = true
 thiserror.workspace = true
