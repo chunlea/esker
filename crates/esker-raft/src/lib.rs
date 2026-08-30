@@ -49,8 +49,8 @@ pub use crate::message::Message;
 pub use crate::raw_node::{RawNode, Ready};
 pub use crate::storage::{InitialState, LogStorage, MemStorage};
 pub use crate::types::{
-    ConfChange, ConfChangeKind, ConfState, Entry, EntryKind, HardState, Index, NodeId, ReadState,
-    Snapshot, SnapshotMeta, Term,
+    ConfChange, ConfChangeKind, ConfState, Entry, EntryKind, HardState, Index, NodeId,
+    PeerProgress, ReadState, Snapshot, SnapshotMeta, Term,
 };
 
 /// Wall-clock duration a caller should map onto one `tick()`, in milliseconds. The core

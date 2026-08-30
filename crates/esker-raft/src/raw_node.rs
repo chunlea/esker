@@ -280,6 +280,49 @@ impl<S: LogStorage> RawNode<S> {
         Ok((index, self.raft.log.term(index)?))
     }
 
+    /// What this node, as leader, knows about how far each of its peers has got.
+    ///
+    /// Empty on a follower, which knows nothing about anyone else — that is what being a follower
+    /// is. On a leader it is one entry per member of the configuration, learners included, in
+    /// node-id order.
+    ///
+    /// **Read-only, and a snapshot rather than a view.** The core owns its progress and moves it
+    /// on every acknowledgement; handing out a borrow would either freeze the core or let a caller
+    /// read a value that had already changed underneath it. What a caller does with this is
+    /// *report* it, or make a decision it can afford to be a moment late on — which is what both
+    /// callers are: `esker-store` promoting a learner that has caught up, and the placement driver
+    /// deciding whether moving a replica is safe (`docs/plans/phase-4.md` §13.2 asked for it).
+    ///
+    /// Deliberately not part of [`Status`](crate::Status): `status()` is on the request path and
+    /// this allocates per peer.
+    #[must_use]
+    pub fn progress(&self) -> Vec<crate::types::PeerProgress> {
+        if self.raft.role != Role::Leader {
+            return Vec::new();
+        }
+        let mut peers: Vec<crate::types::PeerProgress> = self
+            .raft
+            .progress
+            .ids()
+            .into_iter()
+            .filter_map(|id| {
+                self.raft
+                    .progress
+                    .get(id)
+                    .map(|progress| crate::types::PeerProgress {
+                        id,
+                        matched: progress.matched,
+                        next: progress.next,
+                        is_learner: progress.is_learner,
+                        recent_active: progress.recent_active,
+                        pending_snapshot: progress.pending_snapshot,
+                    })
+            })
+            .collect();
+        peers.sort_unstable_by_key(|peer| peer.id);
+        peers
+    }
+
     /// The configuration in force: the latest in the log, committed or not.
     ///
     /// "Committed or not" is the whole subtlety. A membership change takes effect when its entry
@@ -354,6 +397,103 @@ mod tests {
         assert_eq!(node.leader(), None);
         assert_eq!(node.status().conf, ConfState::from_voters(vec![1, 2, 3]));
         assert!(!node.has_ready());
+    }
+
+    /// A follower knows nothing about anyone else — that is what being a follower is — and a
+    /// leader knows one entry per member, learners included, in node-id order.
+    #[test]
+    fn progress_is_the_leaders_view_and_only_the_leaders() {
+        let mut node = node(1);
+        assert!(
+            node.progress().is_empty(),
+            "a follower reported someone else's progress"
+        );
+
+        // Pre-vote first, then the real one: a node that skipped the pre-vote round would never
+        // reach office here.
+        node.campaign().unwrap();
+        for pre_vote in [true, false] {
+            let term = node.term() + u64::from(pre_vote);
+            node.step(Message::RequestVoteResponse {
+                from: 2,
+                to: 1,
+                term,
+                granted: true,
+                pre_vote,
+            })
+            .unwrap();
+        }
+        assert_eq!(node.role(), Role::Leader);
+
+        let progress = node.progress();
+        assert_eq!(
+            progress.iter().map(|peer| peer.id).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "a leader reports every member, in id order"
+        );
+        assert!(progress.iter().all(|peer| !peer.is_learner));
+        assert!(progress.iter().all(|peer| peer.pending_snapshot == 0));
+
+        // `matched` is the "has it caught up" number, and it is what a caller promoting a learner
+        // or moving a replica reads. The leader knows its own is its last index; it has heard
+        // nothing from the others yet.
+        let last = node.status().last_index;
+        let own = progress.iter().find(|peer| peer.id == 1).unwrap();
+        assert_eq!(own.matched, last);
+        assert!(
+            progress
+                .iter()
+                .filter(|peer| peer.id != 1)
+                .all(|peer| peer.matched < last),
+            "the leader claimed a peer had acknowledged something it had not"
+        );
+
+        // An acknowledgement moves it, which is the whole point of exposing it.
+        node.step(Message::AppendEntriesResponse {
+            from: 2,
+            to: 1,
+            term: node.term(),
+            reject: false,
+            index: last,
+            hint_term: 0,
+            context: bytes::Bytes::new(),
+        })
+        .unwrap();
+        let caught_up = node
+            .progress()
+            .into_iter()
+            .find(|peer| peer.id == 2)
+            .unwrap();
+        assert_eq!(caught_up.matched, last);
+        assert!(caught_up.recent_active);
+    }
+
+    /// A learner is reported like anyone else and is marked as one, because a caller deciding
+    /// whether to promote it has to be able to tell which peers are candidates.
+    #[test]
+    fn a_learner_is_reported_and_named_as_one() {
+        let mut node = RawNode::new(
+            Config::new(1, vec![1], 3),
+            MemStorage::with_conf_state(ConfState {
+                voters: vec![1],
+                learners: vec![4],
+            }),
+        )
+        .unwrap();
+        node.campaign().unwrap();
+        assert_eq!(node.role(), Role::Leader);
+
+        let progress = node.progress();
+        assert_eq!(progress.len(), 2);
+        let learner = progress.iter().find(|peer| peer.id == 4).unwrap();
+        assert!(learner.is_learner);
+        assert!(
+            !progress
+                .iter()
+                .find(|peer| peer.id == 1)
+                .unwrap()
+                .is_learner
+        );
     }
 
     /// A restarting node's log is the authority on who is in the group — never the configuration

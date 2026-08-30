@@ -306,6 +306,33 @@ impl ConfChange {
     }
 }
 
+/// A leader's view of one of its peers (`RawNode::progress`).
+///
+/// A **snapshot** of what the leader believed when it was asked, not a live view: every field
+/// moves as acknowledgements arrive. Callers use it to report, or to make a decision they can
+/// afford to be a moment late on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerProgress {
+    /// The peer.
+    pub id: NodeId,
+    /// The highest index the leader knows is replicated on it. This is the "has it caught up"
+    /// number: a peer whose `matched` is near the leader's last index is one whose promotion to
+    /// voter will not stall a quorum.
+    pub matched: Index,
+    /// The next index the leader will send. A guess while the leader is probing for the peer's
+    /// tail, a fact once it is replicating.
+    pub next: Index,
+    /// Whether the peer replicates without voting.
+    pub is_learner: bool,
+    /// Whether the peer has been heard from within the current election timeout. A leader that
+    /// cannot see a quorum of `recent_active` peers steps down (§6.2), and a peer that is `false`
+    /// is one a scheduler should not move work onto.
+    pub recent_active: bool,
+    /// The index of a snapshot in flight to this peer, or `0`. Non-zero means the peer is being
+    /// caught up by state rather than by log, and its `matched` will jump rather than climb.
+    pub pending_snapshot: Index,
+}
+
 /// What a snapshot says about the log it replaces.
 ///
 /// The core reads only this. It is the whole reason `InstallSnapshot` is safe to handle in a
