@@ -30,6 +30,13 @@ pub enum StoreError {
     /// region is not what the manifest says it is.
     #[error("bootstrap: {0}")]
     Bootstrap(String),
+
+    /// The set of regions this store holds would stop being a set: a second peer of a region it
+    /// already hosts, or a range overlapping one it already claims. Refused rather than
+    /// reconciled — either means a routing question has already been answered wrongly, and a map
+    /// that cannot be right must not serve.
+    #[error("regions: {0}")]
+    RegionConflict(String),
 }
 
 impl From<StoreError> for ProtoError {
@@ -37,7 +44,9 @@ impl From<StoreError> for ProtoError {
         match error {
             StoreError::Engine(engine) => engine_to_proto(&engine),
             StoreError::Proto(proto) => proto,
-            StoreError::Bootstrap(detail) => Self::internal(detail),
+            StoreError::Bootstrap(detail) | StoreError::RegionConflict(detail) => {
+                Self::internal(detail)
+            }
         }
     }
 }

@@ -100,13 +100,18 @@ impl RegionMeta {
                 current_regions: vec![self.region.clone()],
             });
         }
-        if header.peer != 0
-            && !self
-                .region
-                .peers
-                .iter()
-                .any(|peer| peer.peer_id == header.peer)
-        {
+        self.check_peer(header.peer)
+    }
+
+    /// Checks that a header names a peer this region actually has.
+    ///
+    /// `peer == 0` means "no opinion about the leader", which is the truth for a client that has
+    /// just connected and has not been told one. It is accepted. A header naming a peer this
+    /// region does not have is [`ProtoError::NotLeader`] with a peer that exists as the hint —
+    /// including when that peer belongs to a *different* region on this same store, which is the
+    /// mistake a store-wide peer list would make.
+    pub fn check_peer(&self, peer: u64) -> Result<(), ProtoError> {
+        if peer != 0 && !self.region.peers.iter().any(|have| have.peer_id == peer) {
             return Err(ProtoError::NotLeader {
                 region_id: self.region.id,
                 leader_hint: self.region.peers.first().map(|peer| peer.peer_id),
@@ -188,9 +193,79 @@ impl RegionMeta {
     }
 }
 
+/// The key range a request touches, as `[start, end)` with an **empty `end` meaning the end of
+/// the key space** — the convention every region comparison uses.
+///
+/// This is what turns a refusal into a useful one: an `EpochNotMatch` answers with every local
+/// region overlapping *this* range, so a client whose cached region has split learns about both
+/// halves from one round trip ([`crate::regions::RegionMap::route`]).
+///
+/// A single key becomes `[key, key ++ 0x00)` rather than `[key, key]`, because an empty upper
+/// bound is `+∞` here: `[b"", b"")` would be the whole key space, which is the opposite of what a
+/// `Get` of the empty key asks for. An empty batch has no keys to bound, so it takes the start of
+/// the key space, which is where the client's own `routing_key` sends it too.
+#[must_use]
+pub fn request_range(request: &esker_proto::RawKvReq) -> (Bytes, Bytes) {
+    use esker_proto::RawKvReq;
+
+    /// The smallest key strictly greater than `key`. Appending a zero byte always works and never
+    /// overflows, which is why the exclusive end of a point range is written this way.
+    fn successor(key: &[u8]) -> Bytes {
+        let mut out = Vec::with_capacity(key.len() + 1);
+        out.extend_from_slice(key);
+        out.push(0);
+        Bytes::from(out)
+    }
+
+    fn point(key: &[u8]) -> (Bytes, Bytes) {
+        (Bytes::copy_from_slice(key), successor(key))
+    }
+
+    fn span<'a>(keys: impl Iterator<Item = &'a [u8]>) -> (Bytes, Bytes) {
+        let mut low: Option<&[u8]> = None;
+        let mut high: Option<&[u8]> = None;
+        for key in keys {
+            if low.is_none_or(|seen| key < seen) {
+                low = Some(key);
+            }
+            if high.is_none_or(|seen| key > seen) {
+                high = Some(key);
+            }
+        }
+        match (low, high) {
+            (Some(low), Some(high)) => (Bytes::copy_from_slice(low), successor(high)),
+            _ => point(b""),
+        }
+    }
+
+    match request {
+        RawKvReq::Get { key }
+        | RawKvReq::Put { key, .. }
+        | RawKvReq::Delete { key, .. }
+        | RawKvReq::CompareAndSwap { key, .. } => point(key),
+        RawKvReq::BatchGet { keys } => span(keys.iter().map(|key| &key[..])),
+        RawKvReq::BatchPut { pairs, .. } => span(pairs.iter().map(|(key, _)| &key[..])),
+        RawKvReq::DeleteRange { start, end, .. } => (start.clone(), end.clone()),
+        // A reverse scan names its *upper* bound first, so the range it touches is still
+        // `[low, high)` once the two are put back in order.
+        RawKvReq::Scan {
+            start,
+            end,
+            reverse,
+            ..
+        } => {
+            if *reverse {
+                (end.clone(), start.clone())
+            } else {
+                (start.clone(), end.clone())
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::RegionMeta;
+    use super::{RegionMeta, request_range};
     use bytes::Bytes;
     use esker_proto::{Epoch, Peer, ProtoError, Region, RequestHeader};
 
@@ -332,6 +407,78 @@ mod tests {
         assert!(meta.check_keys(keys).is_err());
         let good: Vec<&[u8]> = vec![b"a", b"b"];
         meta.check_keys(good).unwrap();
+    }
+
+    /// A point request must not become the whole key space. `[b"", b"")` is `+∞` in this
+    /// convention, so the exclusive end of a single key is the key with a zero byte appended —
+    /// and `Get(b"")` is the case that proves it, because it is the one where a naive
+    /// `(key, key)` reads as "everything".
+    #[test]
+    fn a_point_request_covers_one_key_and_not_the_key_space() {
+        assert_eq!(
+            request_range(&esker_proto::RawKvReq::get(&b""[..])),
+            (Bytes::new(), Bytes::from_static(b"\0"))
+        );
+        assert_eq!(
+            request_range(&esker_proto::RawKvReq::put(&b"k"[..], &b"v"[..])),
+            (Bytes::from_static(b"k"), Bytes::from_static(b"k\0"))
+        );
+        assert_eq!(
+            request_range(&esker_proto::RawKvReq::delete(&b"\xff"[..])),
+            (Bytes::from_static(b"\xff"), Bytes::from_static(b"\xff\0")),
+            "the top of the key space has a successor too"
+        );
+    }
+
+    /// A batch spans from its lowest key to just past its highest, whatever order it arrived in.
+    #[test]
+    fn a_batch_spans_its_keys() {
+        let request = esker_proto::RawKvReq::BatchGet {
+            keys: vec![
+                Bytes::from_static(b"m"),
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"z"),
+            ],
+        };
+        assert_eq!(
+            request_range(&request),
+            (Bytes::from_static(b"a"), Bytes::from_static(b"z\0"))
+        );
+
+        // An empty batch has no keys to bound and routes to the start of the key space, which is
+        // where the client sends it too.
+        assert_eq!(
+            request_range(&esker_proto::RawKvReq::BatchGet { keys: vec![] }),
+            (Bytes::new(), Bytes::from_static(b"\0"))
+        );
+    }
+
+    /// A reverse scan names its upper bound first. Reporting the range in that order would make
+    /// every overlap check on it read backwards.
+    #[test]
+    fn a_reverse_scan_reports_its_range_in_order() {
+        let forward = esker_proto::RawKvReq::scan(&b"a"[..], &b"m"[..], 0);
+        assert_eq!(
+            request_range(&forward),
+            (Bytes::from_static(b"a"), Bytes::from_static(b"m"))
+        );
+
+        let reverse = esker_proto::RawKvReq::Scan {
+            start: Bytes::from_static(b"m"),
+            end: Bytes::from_static(b"a"),
+            limit: 0,
+            reverse: true,
+        };
+        assert_eq!(
+            request_range(&reverse),
+            (Bytes::from_static(b"a"), Bytes::from_static(b"m"))
+        );
+
+        // An unbounded scan keeps its empty end, which is what makes it +infinity.
+        assert_eq!(
+            request_range(&esker_proto::RawKvReq::scan(&b""[..], &b""[..], 0)),
+            (Bytes::new(), Bytes::new())
+        );
     }
 
     #[test]

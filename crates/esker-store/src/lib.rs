@@ -21,6 +21,7 @@
 //! |---|---|
 //! | [`error`] | the store's failures, and which of them a client may safely retry |
 //! | [`region`] | the epoch and key-range checks every request runs |
+//! | [`regions`] | every region this store hosts, indexed by id and by range |
 //! | [`apply`] | what a Raft entry carries, and what applying one does to the data |
 //! | [`peer`] | one region's `RawNode`, its driver thread, and the `Ready` loop |
 //! | [`raft_log`] | the Raft log and the peer's persistent state, on the `raft` column family |
@@ -39,6 +40,7 @@ pub mod peer;
 pub mod raft_log;
 pub mod rawkv;
 pub mod region;
+pub mod regions;
 pub mod server;
 pub mod transport;
 
@@ -47,7 +49,8 @@ pub use error::{Result, StoreError, engine_to_proto};
 pub use peer::{Applied, DiscardTransport, PeerOptions, RaftPeer, RaftTransport};
 pub use raft_log::{PersistedState, RaftLogStorage};
 pub use rawkv::Limits;
-pub use region::RegionMeta;
+pub use region::{RegionMeta, request_range};
+pub use regions::{RegionMap, RegionState};
 pub use server::{Store, StoreOptions, StoreService};
 pub use transport::{PeerAddress, RegionTransport, StoreAddress, StoreTransport};
 

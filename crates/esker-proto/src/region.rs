@@ -203,6 +203,29 @@ impl Region {
         end <= &self.end_key[..]
     }
 
+    /// Whether this region shares any key with `[start, end)`, where an **empty `end` means the
+    /// end of the key space** — the same convention as [`Region::end_key`].
+    ///
+    /// This is the question `EpochNotMatch` is answered with: a client whose cached region has
+    /// split is asking for a range that is now several regions, and every local one that overlaps
+    /// it is a region the client needs. Written out rather than left to `Ord` for the reason the
+    /// module doc gives — `b""` as an upper bound sorts below every key, so a comparison that
+    /// forgets the convention silently reports no overlap for the last region in the cluster.
+    ///
+    /// An empty request range — `start == end`, both non-empty — is a point at `start`: it
+    /// overlaps the region containing `start` and nothing else.
+    #[must_use]
+    pub fn overlaps(&self, start: &[u8], end: &[u8]) -> bool {
+        if start == end && !start.is_empty() {
+            return self.contains(start);
+        }
+        // `self` ends at or before the request begins.
+        let before = !self.end_key.is_empty() && &self.end_key[..] <= start;
+        // The request ends at or before `self` begins.
+        let after = !end.is_empty() && end <= &self.start_key[..];
+        !(before || after)
+    }
+
     pub(crate) fn encode(&self, out: &mut Encoder) {
         out.put_varint(self.id);
         out.put_bytes(&self.start_key);
@@ -392,6 +415,55 @@ mod tests {
                 1, // peers[0].role: Voter
             ],
         );
+    }
+
+    /// The comparison `EpochNotMatch` is built from. Every case that a naive `Ord` on the two
+    /// key pairs would get wrong is here: the unbounded region, the unbounded request, and the
+    /// two ranges that merely touch at a boundary without sharing a key.
+    #[test]
+    fn overlap_is_decided_with_the_empty_end_key_convention() {
+        let middle = Region {
+            id: 2,
+            start_key: Bytes::from_static(b"g"),
+            end_key: Bytes::from_static(b"q"),
+            peers: Vec::new(),
+            epoch: Epoch::INITIAL,
+        };
+
+        assert!(middle.overlaps(b"g", b"q"), "exactly itself");
+        assert!(middle.overlaps(b"", b""), "the whole key space");
+        assert!(middle.overlaps(b"a", b"h"), "straddles the start");
+        assert!(middle.overlaps(b"p", b"z"), "straddles the end");
+        assert!(middle.overlaps(b"h", b"i"), "strictly inside");
+        assert!(
+            middle.overlaps(b"a", b""),
+            "an unbounded request from below"
+        );
+        assert!(!middle.overlaps(b"a", b"g"), "ends where the region starts");
+        assert!(!middle.overlaps(b"q", b"z"), "starts where the region ends");
+        assert!(
+            !middle.overlaps(b"q", b""),
+            "unbounded, but starting past it"
+        );
+        assert!(!middle.overlaps(b"a", b"f"), "entirely below");
+
+        // A point request is the key it names.
+        assert!(middle.overlaps(b"h", b"h"));
+        assert!(!middle.overlaps(b"z", b"z"));
+
+        // The last region in the cluster is the case a forgotten convention loses: its end is
+        // empty, so every request above its start overlaps it.
+        let last = Region {
+            id: 3,
+            start_key: Bytes::from_static(b"q"),
+            end_key: Bytes::new(),
+            peers: Vec::new(),
+            epoch: Epoch::INITIAL,
+        };
+        assert!(last.overlaps(b"z", b""));
+        assert!(last.overlaps(b"z", b"zz"));
+        assert!(last.overlaps(b"\xff\xff", b"\xff\xff"));
+        assert!(!last.overlaps(b"a", b"q"));
     }
 
     #[test]
