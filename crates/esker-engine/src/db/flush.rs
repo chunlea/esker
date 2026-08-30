@@ -249,6 +249,9 @@ impl DbInner {
         let number = lock(&self.versions)?.new_file_number();
         let meta = self.build_table(cf, table, number)?;
 
+        #[cfg(any(test, feature = "testing"))]
+        self.pause_at(crate::testing::PausePoint::FlushedTableBeforeEdit);
+
         let mut edit = VersionEdit::new();
         if let Some(meta) = meta {
             tracing::debug!(

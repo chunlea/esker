@@ -331,6 +331,8 @@ impl DbInner {
         let (obsolete, pending) = {
             let mut versions = lock(&self.versions)?;
             let obsolete = versions.obsolete_files()?;
+            #[cfg(any(test, feature = "testing"))]
+            self.pause_at(crate::testing::PausePoint::SweptDirectoryBeforePending);
             let pending: BTreeSet<u64> = lock(&self.pending_outputs)?.clone();
             (obsolete, pending)
         };

@@ -20,7 +20,9 @@
 //! the deliberate misbehaviour belongs behind a feature.
 
 pub mod fault_fs;
+pub mod pause;
 pub mod plan;
 
 pub use fault_fs::FaultFileSystem;
+pub use pause::{PauseHook, PausePoint};
 pub use plan::{Fault, FaultPlan, FaultRecord, Operation};

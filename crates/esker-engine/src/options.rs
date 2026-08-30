@@ -189,6 +189,13 @@ pub struct Options {
     pub compaction_threads: usize,
     /// Defaults for column families this call creates.
     pub cf_options: CfOptions,
+    /// Where a test may hold a thread still, so that a race between two threads can be
+    /// reproduced by construction rather than by sleeping. See [`crate::testing::pause`].
+    ///
+    /// Behind the `testing` feature, like the fault-injecting filesystem: a normal build has
+    /// neither this field nor the calls that would consult it.
+    #[cfg(any(test, feature = "testing"))]
+    pub pause_hook: Option<Arc<dyn crate::testing::PauseHook>>,
 }
 
 impl Default for Options {
@@ -205,6 +212,8 @@ impl Default for Options {
             block_cache: None,
             compaction_threads: defaults::COMPACTION_THREADS,
             cf_options: CfOptions::default(),
+            #[cfg(any(test, feature = "testing"))]
+            pause_hook: None,
         }
     }
 }

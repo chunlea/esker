@@ -437,6 +437,14 @@ impl DbInner {
         versions.log_and_apply(edit)
     }
 
+    /// Runs the installed pause hook, if a test installed one. Absent from a normal build.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn pause_at(&self, point: crate::testing::PausePoint) {
+        if let Some(hook) = &self.options.pause_hook {
+            hook.pause(point);
+        }
+    }
+
     /// The column family called `name`.
     pub(crate) fn cf_by_name(&self, name: &str) -> Result<Arc<ColumnFamily>> {
         let cfs = read_lock(&self.cfs)?;
