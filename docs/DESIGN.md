@@ -376,11 +376,32 @@ durable state is what 4a ships, and it is a single point of failure by design ra
   has `physical < mark`**; a restart resumes at `max(clock, mark)` and therefore cannot repeat one even
   when the wall clock jumps backwards. This is the only place in Esker that reads a wall clock, and it
   reads it through an injected `Clock` so that a test can make it misbehave.
-- **Liveness:** a store is down when its last heartbeat is older than `max_store_down_time`. Recorded and
-  reported in 4a; *acted on in 4c*, where replica repair lives.
-- **Scheduling (phase 4b–4d):** replica repair (down store → add peer elsewhere), leader balance,
-  region-count balance. Every operator is a small state machine with a timeout; PD never sends a second
-  operator for a region while one is in flight.
+- **Liveness:** a store is down when PD has not heard from it for `max_store_down_time`. The age is on
+  **PD's clock** — the last-heartbeat stamp is written when the beat arrives and never taken from the
+  store's own report, because comparing wall clocks across nodes is what invariant 6 forbids. A store PD
+  has no record of is *not* down: unknown is not evidence, and a PD that read it as one would try to
+  repair every region in the cluster on its first heartbeat after a restart.
+- **Replica repair (4c):** every region with a peer on a down store and fewer than `target_replicas`
+  live ones gets an `AddPeer` onto the emptiest live store that has no peer of that region (lowest store
+  id breaks the tie, so the same data always chooses the same place); once the new replica is a voter,
+  the dead peer gets a `RemovePeer`. **Add before remove**, always: removing first takes a three-replica
+  region with one dead peer down to one live replica out of two. A region that is merely
+  under-replicated is left alone — growing a healthy cluster to its target is balance, not repair.
+- **Operators ride on the heartbeat response.** At most one per region is in flight, and the same one is
+  re-sent on every heartbeat until a heartbeat *shows* it happened, it is contradicted, or it stops
+  making progress for `operator_timeout`. Progress is observed and never assumed: the peer list and the
+  epoch are the only evidence. The receiving store checks the epoch the operator carries, so a repeat is
+  refused rather than applied twice — which is what makes re-sending safe and a lost response cost one
+  heartbeat interval. Scheduling happens **on the heartbeat and nowhere else**: a store going down is
+  noticed by absence, so the trigger is a surviving leader's beat, and repair latency is
+  `max_store_down_time` plus one region-heartbeat interval with no timer thread anywhere.
+- **In-flight operators are not persisted.** A PD restart forgets them and re-derives what is needed
+  from the next round of heartbeats, which is why the repair rule is a pure function of (routing table,
+  store liveness, in-flight set). A re-derived `AddPeer` mints a *fresh* peer id from the persisted
+  allocator: reusing one PD has forgotten could put two peers under one id while the first is still
+  being added.
+- **Scheduling still to come (4d):** leader balance and region-count balance. `TransferLeader` is on the
+  wire and reserved; nothing issues one yet.
 - **Tools:** `esker pd serve --data-dir --listen` runs it; `esker pd inspect --data-dir` prints the whole
   state above, including the range index beside the records it points at.
 
@@ -569,6 +590,8 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
 | PD id allocation batch | 1,000 ids per persist |
 | PD TSO save interval | 3 s ahead of what is handed out |
 | `max_store_down_time` | 30 s |
+| `operator_timeout` | 300 s, measured from the last observed progress |
+| `target_replicas` | 3 |
 | txn lock TTL | 3 s (heartbeat-extended) |
 | transport (`TransportConfig`) | §9 has the table — seven knobs, listed there because each one only means something next to the rule it bounds |
 | store WAL sync mode | `Never` — the engine adds no `fsync` of its own, so each request's `sync` flag decides (§4.2, and `CLAUDE.md` invariant 1's opt-out) |

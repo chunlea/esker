@@ -1,6 +1,6 @@
 # Phase 4a — the placement driver, lane `cl-p4-pd`
 
-Status: **4a landed** (§10). The lane plan for `crates/esker-pd/**`, the `Pd` service section of
+Status: **4a and 4c landed** (§10, §12). The lane plan for `crates/esker-pd/**`, the `Pd` service section of
 `crates/esker-proto/**`, and the `esker pd` subcommand. It hangs under `docs/plans/phase-4.md`,
 which the store lane owns and which pins the cross-lane contract in its §3; nothing here may
 contradict that file. Spec: `prompts/04-multiraft-pd.md` (4a), `docs/DESIGN.md` §7 and §9,
@@ -285,3 +285,59 @@ flux; the order inside the lane is otherwise the one above.
 9. **No benchmark.** `esker-cli bench`'s workloads are the store lane's file, and PD has no workload
    in 4a. A TSO/`AllocId` throughput number is worth having before phase 5 puts the oracle on every
    transaction's critical path; offered to the coordinator rather than taken.
+
+---
+
+## 12. 4c — replica repair scheduling (PD side)
+
+Re-tasked after 4b closed. The 4a seams were the foundation the brief said they were: liveness
+already derived from heartbeat age on PD's clock, and region records already carrying the term
+and applied index an operator's progress is read from.
+
+| # | Unit | Commit |
+|---|---|---|
+| 1 | The operator on the wire, four goldens, `TransferLeader` reserved | `feat(proto): an operator rides on the answer…` |
+| 2 | One operator's life: observed, cancelled, timed out | `feat(pd): one operator's life, observed from heartbeats…` |
+| 3 | The repair rule, pure | `feat(pd): the replica-repair rule, as a function of…` |
+| 4 | The in-flight set and the heartbeat that drives it | `feat(pd): repair is scheduled on the heartbeat that reports the damage` |
+| — | `pd.rs` at 1,445 lines split into three files under 600 | `refactor(pd): pd.rs at 1,445 lines becomes three files…` |
+| 5 | The repair over real TCP, and a stale beat that still earns one | `test(pd): the repair arrives on a heartbeat response…` |
+| 6 | DESIGN §7 and §14, ADR 0013 | `docs(design): what replica repair does…` |
+
+### 12.1 What the tests found
+
+- **A started operator could never time out.** The first `observe` returned `Started` from the
+  effect check before consulting the clock, so a learner that stopped catching up would hold its
+  region for ever — one operator in flight means no second one. Fresh progress now beats the
+  clock and a stuck operator does not; `a_started_operator_that_stops_moving_still_times_out`
+  is the regression.
+- **Mutation-checked, each reverted after:** reversing add-before-remove turns five schedule
+  tests red; dropping the in-flight check turns the "same operator, not a second" assertions red.
+
+### 12.2 Changes vs the brief
+
+1. **`RegionHeartbeat`'s response became a struct, and `Pd::region_heartbeat` returns `Beat`**
+   rather than `Upsert`. The upsert outcome and the operator both belong to one heartbeat and
+   have to be computed under one lock, so returning them separately would have meant two calls
+   and a race between them.
+2. **A stale heartbeat still earns an operator.** The brief does not say either way. PD schedules
+   against the record it *holds*, so a beat that lost the epoch race is still answered — the
+   leader that sent it is still the leader that has to do the work, and its beat is the only
+   channel to it.
+3. **`Progress::Started` stops the re-send.** Once a heartbeat shows the store acting (a learner
+   in the peer list), PD stops asking: the store has the work, and re-sending an operator
+   addressed to the pre-`AddPeer` epoch would only earn a refusal.
+4. **`pd.rs` was split.** 4c took it to 1,445 lines against CLAUDE.md's ~800. Now `pd/mod.rs`,
+   `pd/repair.rs` (a child module, so it can read the parent's private state) and
+   `tests/cluster.rs` for 4a's suite, moved unchanged.
+
+### 12.3 Not built, deliberately
+
+- **`TransferLeader` is encoded and never issued.** Leader balance is 4d; a test pins that
+  nothing in 4c issues one.
+- **No scheduler loop, no timer thread.** Scheduling happens on the heartbeat that reports the
+  damage. If repair latency ever matters, the knob is the region-heartbeat interval.
+- **In-flight operators are invisible to `esker pd inspect`**, which opens a stopped PD's
+  database. Live operators need a status endpoint on a running PD — an observability item for
+  4d, not a gap in the durable state.
+
