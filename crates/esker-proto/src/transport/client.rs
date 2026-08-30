@@ -345,7 +345,7 @@ impl Demux {
                 .map_err(ProtoError::from)
                 .and_then(|response| match response {
                     Response::Hello(ack) => Ok(ack),
-                    other @ Response::RawKv(_) => Err(ProtoError::invalid(format!(
+                    other => Err(ProtoError::invalid(format!(
                         "expected a Hello acknowledgement, got {}",
                         other.method().name()
                     ))),

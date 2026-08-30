@@ -22,6 +22,7 @@
 use bytes::Bytes;
 
 use crate::codec::{DecodeError, Decoder, Encoder};
+use crate::raft::RaftBatch;
 use crate::region::Epoch;
 
 /// The largest number of key-value pairs a `Scan` returns when the caller names no limit.
@@ -57,7 +58,10 @@ pub enum Method {
     RawScan = 0x0107,
     /// `RawKv::CompareAndSwap`.
     RawCompareAndSwap = 0x0108,
-    // TODO(phase-3): service 0x04, RaftTransport::Batch.
+
+    /// `RaftTransport::Batch` — a tick's worth of Raft messages between two stores
+    /// (`docs/DESIGN.md` §6, [ADR 0009](../../docs/adr/0009-the-wire-carries-the-raft-message.md)).
+    RaftBatch = 0x0401,
     // TODO(phase-4): service 0x03, Pd::{Bootstrap, StoreHeartbeat, RegionHeartbeat,
     //                GetRegion, AllocId, Tso}.
     // TODO(phase-5): service 0x02, TxnKv::{Get, Scan, Prewrite, Commit, Rollback,
@@ -77,7 +81,7 @@ pub const SERVICE_RAFT: u8 = 0x04;
 
 impl Method {
     /// Every method this version defines.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Hello,
         Self::RawGet,
         Self::RawBatchGet,
@@ -87,6 +91,7 @@ impl Method {
         Self::RawDeleteRange,
         Self::RawScan,
         Self::RawCompareAndSwap,
+        Self::RaftBatch,
     ];
 
     /// The wire tag.
@@ -108,6 +113,7 @@ impl Method {
             0x0106 => Some(Self::RawDeleteRange),
             0x0107 => Some(Self::RawScan),
             0x0108 => Some(Self::RawCompareAndSwap),
+            0x0401 => Some(Self::RaftBatch),
             _ => None,
         }
     }
@@ -131,6 +137,7 @@ impl Method {
             Self::RawDeleteRange => "RawKv::DeleteRange",
             Self::RawScan => "RawKv::Scan",
             Self::RawCompareAndSwap => "RawKv::CompareAndSwap",
+            Self::RaftBatch => "RaftTransport::Batch",
         }
     }
 
@@ -519,10 +526,10 @@ impl RawKvReq {
                 value: take_opt(input, "value")?,
                 sync: input.get_bool("sync")?,
             },
-            Method::Hello => {
+            Method::Hello | Method::RaftBatch => {
                 return Err(DecodeError::invalid(
                     "method",
-                    "Hello is not a RawKv method",
+                    format!("{} is not a RawKv method", method.name()),
                 ));
             }
         };
@@ -641,10 +648,10 @@ impl RawKvResp {
                 swapped: input.get_bool("swapped")?,
                 previous: take_opt(input, "previous")?,
             },
-            Method::Hello => {
+            Method::Hello | Method::RaftBatch => {
                 return Err(DecodeError::invalid(
                     "method",
-                    "Hello is not a RawKv method",
+                    format!("{} is not a RawKv method", method.name()),
                 ));
             }
         };
@@ -664,6 +671,9 @@ pub enum Request {
         /// What to do.
         request: RawKvReq,
     },
+    /// Raft traffic between two stores. It carries no [`RequestHeader`], because one batch may
+    /// hold messages for many regions and each carries its own (`docs/DESIGN.md` §6).
+    Raft(RaftBatch),
 }
 
 impl Request {
@@ -679,6 +689,7 @@ impl Request {
         match self {
             Self::Hello(_) => Method::Hello,
             Self::RawKv { request, .. } => request.method(),
+            Self::Raft(_) => Method::RaftBatch,
         }
     }
 
@@ -686,7 +697,7 @@ impl Request {
     #[must_use]
     pub fn header(&self) -> Option<RequestHeader> {
         match self {
-            Self::Hello(_) => None,
+            Self::Hello(_) | Self::Raft(_) => None,
             Self::RawKv { header, .. } => Some(*header),
         }
     }
@@ -702,6 +713,7 @@ impl Request {
                 header.encode(&mut out);
                 request.encode(&mut out);
             }
+            Self::Raft(batch) => batch.encode(&mut out),
         }
         out.finish()
     }
@@ -714,6 +726,7 @@ impl Request {
             Method::Hello => Self::Hello(Hello {
                 version: input.get_u32("hello.version")?,
             }),
+            Method::RaftBatch => Self::Raft(RaftBatch::decode(&mut input)?),
             other => {
                 let header = RequestHeader::decode(&mut input)?;
                 Self::RawKv {
@@ -735,6 +748,10 @@ pub enum Response {
     Hello(HelloAck),
     /// The answer to a key-value request.
     RawKv(RawKvResp),
+    /// A Raft batch was received. It carries nothing: Raft's own retries are what make a lost
+    /// message survivable, so there is no outcome for the sender to act on
+    /// ([`RaftTransport`](crate::raft) is fire-and-forget by design).
+    Raft,
 }
 
 impl Response {
@@ -744,6 +761,7 @@ impl Response {
         match self {
             Self::Hello(_) => Method::Hello,
             Self::RawKv(response) => response.method(),
+            Self::Raft => Method::RaftBatch,
         }
     }
 
@@ -752,9 +770,10 @@ impl Response {
     pub fn into_raw_kv(self) -> Result<RawKvResp, crate::ProtoError> {
         match self {
             Self::RawKv(response) => Ok(response),
-            Self::Hello(_) => Err(crate::ProtoError::invalid(
-                "expected a RawKv response, got a Hello",
-            )),
+            other => Err(crate::ProtoError::invalid(format!(
+                "expected a RawKv response, got {}",
+                other.method().name()
+            ))),
         }
     }
 
@@ -770,6 +789,9 @@ impl Response {
                 out.put_varint(ack.max_frame_size);
             }
             Self::RawKv(response) => response.encode(&mut out),
+            // The acknowledgement carries nothing: Raft's own retries are what make a lost
+            // message survivable, so there is no outcome for the sender to act on.
+            Self::Raft => {}
         }
         out.finish()
     }
@@ -779,6 +801,7 @@ impl Response {
         let mut input = Decoder::new(body);
         let method = read_method(&mut input)?;
         let response = match method {
+            Method::RaftBatch => Self::Raft,
             Method::Hello => Self::Hello(HelloAck {
                 version: input.get_u32("hello.version")?,
                 store_id: input.get_varint("hello.store_id")?,
@@ -951,12 +974,32 @@ mod tests {
         assert_eq!(unique.len(), Method::ALL.len(), "two methods share a tag");
         assert!(!unique.contains(&0), "zero is not a method");
 
-        assert_eq!(Method::Hello.service(), SERVICE_SYSTEM);
         for method in Method::ALL {
             assert_eq!(Method::from_u16(method.as_u16()), Some(method));
-            if method != Method::Hello {
-                assert_eq!(method.service(), SERVICE_RAW_KV, "{method:?}");
-            }
+            let service = match method {
+                Method::Hello => SERVICE_SYSTEM,
+                Method::RaftBatch => crate::messages::SERVICE_RAFT,
+                _ => SERVICE_RAW_KV,
+            };
+            assert_eq!(method.service(), service, "{method:?}");
+        }
+
+        // `docs/DESIGN.md` §9: a service's numbers stay contiguous from 1, so a gap means a
+        // method was removed rather than reserved — and a reserved number has to stay reserved.
+        for service in [
+            SERVICE_SYSTEM,
+            SERVICE_RAW_KV,
+            crate::messages::SERVICE_RAFT,
+        ] {
+            let mut numbers: Vec<u16> = Method::ALL
+                .into_iter()
+                .filter(|method| method.service() == service)
+                .map(|method| method.as_u16() & 0x00FF)
+                .collect();
+            numbers.sort_unstable();
+            let count = u16::try_from(numbers.len()).expect("a service has few methods");
+            let expected: Vec<u16> = (1..=count).collect();
+            assert_eq!(numbers, expected, "service {service:#04x} has a gap");
         }
     }
 

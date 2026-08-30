@@ -31,6 +31,7 @@
 //! | [`frame`] | the envelope: length, checksum, kind, request id |
 //! | [`region`] | regions, epochs and peers — what a request is addressed to |
 //! | [`messages`] | one `encode`/`decode` pair per message, and the method numbers |
+//! | [`raft`] | service `0x04`: `esker_raft::Message` on the wire, with its routing |
 //! | [`transport`] | tokio TCP: the writer task, the demultiplexer, keepalive and streams |
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -39,6 +40,7 @@ pub mod codec;
 pub mod error;
 pub mod frame;
 pub mod messages;
+pub mod raft;
 pub mod region;
 pub mod transport;
 
@@ -48,6 +50,7 @@ pub use frame::{FRAME_HEADER_SIZE, Frame, FrameDecoder, FrameKind, MAX_BODY_SIZE
 pub use messages::{
     Hello, HelloAck, Method, RawKvReq, RawKvResp, Request, RequestHeader, Response,
 };
+pub use raft::{RaftBatch, RaftMessage};
 pub use region::{Epoch, Peer, PeerRole, Region};
 pub use transport::{
     BlockingTransport, BoxFuture, ChunkSender, ChunkStream, Reply, Server, ServerHandle, Service,

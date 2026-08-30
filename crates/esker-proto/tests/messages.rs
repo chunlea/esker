@@ -10,9 +10,10 @@
 use bytes::Bytes;
 use esker_proto::messages::{DEFAULT_SCAN_LIMIT, Hello, HelloAck, RawKvReq, RawKvResp};
 use esker_proto::{
-    Epoch, MAX_FRAME_SIZE, Method, Peer, PeerRole, ProtoError, Region, Request, RequestHeader,
-    Response, WIRE_VERSION,
+    Epoch, MAX_FRAME_SIZE, Method, Peer, PeerRole, ProtoError, RaftBatch, RaftMessage, Region,
+    Request, RequestHeader, Response, WIRE_VERSION,
 };
+use esker_raft::{Entry, Message};
 use proptest::prelude::*;
 
 const GOLDEN: &str = include_str!("golden/messages.hex");
@@ -63,6 +64,35 @@ fn golden_requests() -> Vec<(&'static str, Request)> {
         (
             "put",
             Request::raw_kv(h, RawKvReq::put(&b"k"[..], &b"v"[..])),
+        ),
+        (
+            "raft-timeout-now",
+            Request::Raft(RaftBatch::new(vec![RaftMessage::new(
+                1,
+                Epoch::new(2, 3),
+                Message::TimeoutNow {
+                    from: 5,
+                    to: 6,
+                    term: 7,
+                },
+            )])),
+        ),
+        (
+            "raft-append",
+            Request::Raft(RaftBatch::new(vec![RaftMessage::new(
+                1,
+                Epoch::new(2, 3),
+                Message::AppendEntries {
+                    from: 1,
+                    to: 2,
+                    term: 3,
+                    prev_log_index: 4,
+                    prev_log_term: 3,
+                    entries: vec![Entry::empty(3, 5)],
+                    leader_commit: 4,
+                    context: Bytes::new(),
+                },
+            )])),
         ),
         (
             "put-unsynced",
@@ -179,6 +209,7 @@ fn golden_responses() -> Vec<(&'static str, Response)> {
                 previous: None,
             }),
         ),
+        ("raft-ack", Response::Raft),
     ]
 }
 

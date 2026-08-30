@@ -191,6 +191,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "esker-base",
+ "esker-raft",
  "proptest",
  "thiserror",
  "tokio",
