@@ -848,6 +848,122 @@ fn snapshot_isolation_allows_write_skew() {
     );
 }
 
+// -- check-then-insert, the shape a unique index is built on -------------------------------
+
+/// Two transactions each read a key, find nothing, and both try to claim it. Exactly one
+/// commits — and the loser is refused **before** it writes anything.
+///
+/// `esker-sql` builds unique-index enforcement on this composition (`docs/txn-spec.md` §6.1):
+/// the index entry is the key, a snapshot read proves it absent, and an ordinary `Put` claims
+/// it. This is the ordering where the loser arrives *after* the winner has committed, so
+/// prewrite's first check catches it directly.
+#[test]
+fn two_inserts_of_one_new_key_leave_one_winner() {
+    let mut store = MemoryStore::new();
+    let (winner, loser) = (10, 11);
+
+    // Both read the key at their own snapshot and find nothing. That is the read a unique
+    // index does before it claims the entry.
+    assert_eq!(
+        read(&store, b"index/email/a@b", winner).unwrap(),
+        ReadOutcome::NotFound
+    );
+    assert_eq!(
+        read(&store, b"index/email/a@b", loser).unwrap(),
+        ReadOutcome::NotFound
+    );
+
+    // The winner claims it.
+    lock_key(
+        &mut store,
+        &prewrite(
+            b"index/email/a@b",
+            b"index/email/a@b",
+            winner,
+            put(b"row-1"),
+        ),
+    );
+    let CommitDecision::Commit(plan) =
+        commit_primary(&store, b"index/email/a@b", winner, 20).unwrap()
+    else {
+        panic!("refused");
+    };
+    store.apply(plan.mutations());
+
+    // The loser's claim is refused, and nothing of it is written.
+    assert_eq!(
+        check_prewrite(
+            &store,
+            &prewrite(b"index/email/a@b", b"index/email/a@b", loser, put(b"row-2"))
+        )
+        .unwrap(),
+        PrewriteDecision::Conflict { commit_ts: 20 },
+        "the second insert of a unique key must lose"
+    );
+    assert_eq!(store.len(Cf::Lock), 0, "a refused prewrite writes nothing");
+    assert_eq!(
+        read(&store, b"index/email/a@b", u64::MAX).unwrap(),
+        ReadOutcome::Value(key(b"row-1")),
+        "the winner's row is the one that stands"
+    );
+}
+
+/// The same race, in the ordering that takes two round trips: the loser arrives while the
+/// winner still holds its lock, so it is told `Locked` rather than refused. It resolves the
+/// lock — which rolls the winner forward — and only then does prewrite's *first* check see the
+/// commit and refuse it.
+///
+/// Both orderings matter: a reading of the protocol that only ever tested the second would
+/// pass while leaving the first as a lock conflict the caller might retry for ever.
+#[test]
+fn a_second_insert_that_arrives_before_the_commit_still_loses() {
+    let mut store = MemoryStore::new();
+    let (winner, loser) = (10, 11);
+
+    lock_key(
+        &mut store,
+        &prewrite(b"unique/k", b"unique/k", winner, put(b"row-1")),
+    );
+
+    // The loser meets the winner's lock. Not a conflict yet — nothing has committed.
+    let lock = match check_prewrite(
+        &store,
+        &prewrite(b"unique/k", b"unique/k", loser, put(b"row-2")),
+    )
+    .unwrap()
+    {
+        PrewriteDecision::Locked(lock) => lock,
+        other => panic!("expected a lock conflict, got {other:?}"),
+    };
+    assert_eq!(lock.start_ts, winner);
+
+    // The winner commits; the loser resolves the lock and rolls it forward.
+    let CommitDecision::Commit(plan) = commit_primary(&store, b"unique/k", winner, 20).unwrap()
+    else {
+        panic!("refused");
+    };
+    store.apply(plan.mutations());
+    let state = primary_state(&store, &lock.primary, lock.start_ts).unwrap();
+    assert_eq!(
+        resolve(&lock, &state, ts(1, 0)),
+        Resolution::RollForward { commit_ts: 20 }
+    );
+
+    // Now the retry is refused by the write-conflict check, which is the durable answer.
+    assert_eq!(
+        check_prewrite(
+            &store,
+            &prewrite(b"unique/k", b"unique/k", loser, put(b"row-2"))
+        )
+        .unwrap(),
+        PrewriteDecision::Conflict { commit_ts: 20 }
+    );
+    assert_eq!(
+        read(&store, b"unique/k", u64::MAX).unwrap(),
+        ReadOutcome::Value(key(b"row-1"))
+    );
+}
+
 /// A `Lock`-kind record — reserved for `SELECT … FOR UPDATE` — is bookkeeping like a rollback
 /// marker: it enters the conflict check but is not a version a read returns.
 #[test]

@@ -291,6 +291,39 @@ Two things would fix it, and both cost:
 cross-transaction ordering beyond what the timestamps say — the oracle is the only clock
 (`CLAUDE.md` invariant 6).
 
+### 6.1 What the guarantees compose into: a unique constraint
+
+The lost-update guarantee is stronger than it first looks, and one composition of it is worth
+stating outright because a layer above depends on it. **Check-then-insert on a single key is
+safe.** A transaction that
+
+1. reads key `k` at its own `start_ts` and finds nothing, then
+2. writes `k` and commits,
+
+cannot both succeed alongside another transaction doing the same thing to the same `k`. Exactly one
+commits; the other is refused, and refused *before* it writes anything.
+
+This is not a new rule — it is §5.2's two checks applied to a key that did not exist — but the two
+orderings it can take are worth spelling out, because only one of them is the obvious one:
+
+- **The loser arrives while the winner still holds its lock.** Prewrite's check 3 answers
+  `Locked`, the loser resolves the lock (§5.5), finds the winner committed, rolls it forward, and
+  retries — and *now* check 1 sees a commit above its snapshot and answers a conflict. Two
+  round trips, one refusal.
+- **The loser arrives after the winner committed.** Check 1 answers a conflict immediately.
+
+Either way the refusal is a write-write conflict on `k` and the loser must start again at a fresh
+`start_ts` — at which point its read of `k` finds the winner's row, and the constraint holds.
+
+`esker-sql` builds unique-index enforcement on exactly this: the index entry is the key, a snapshot
+read proves it absent, and an ordinary `Put` claims it. No `SELECT … FOR UPDATE` and no `Lock`-kind
+record is needed, because the conflict is on a key the transaction **writes**, which is the half of
+the read/write set prewrite checks. (The half it does not check is what §6's write skew is about,
+and a uniqueness constraint does not fall in it: it is one key, and the transaction writes it.)
+
+`crates/esker-txn/tests/protocol.rs` tests both orderings — `two_inserts_of_one_new_key_leave_one
+_winner` and its lock-first sibling — so the property is pinned rather than inferred.
+
 ## 7. Garbage collection, and the one rule that is easy to get wrong
 
 PD publishes a **safepoint**: the ts below which old MVCC versions may go. A compaction filter walks
