@@ -325,6 +325,75 @@ mod tests {
         );
     }
 
+    /// The golden. These bytes are a wire format — a region travels in `EpochNotMatch`, in
+    /// `GetRegion` and in every region heartbeat — so changing them is a format change and needs
+    /// an ADR and a `WIRE_VERSION` bump (`docs/adr/0002-formats-are-hand-rolled.md`).
+    ///
+    /// Written out by hand rather than captured from the encoder, so it disagrees when the
+    /// encoder moves instead of moving with it.
+    #[test]
+    fn a_region_encodes_to_the_documented_bytes() {
+        let region = Region {
+            id: 2,
+            start_key: Bytes::from_static(b"d"),
+            end_key: Bytes::from_static(b"m"),
+            peers: vec![
+                Peer::voter(1, 10),
+                Peer {
+                    store_id: 2,
+                    peer_id: 300,
+                    role: PeerRole::Learner,
+                },
+            ],
+            epoch: Epoch::new(3, 4),
+        };
+        let mut out = Encoder::new();
+        region.encode(&mut out);
+        assert_eq!(
+            out.finish(),
+            vec![
+                2,    // id
+                1,    // start_key: one byte
+                b'd', //
+                1,    // end_key: one byte
+                b'm', //
+                3,    // epoch.conf_ver
+                4,    // epoch.version
+                2,    // peers: two of them
+                1,    // peers[0].store_id
+                10,   // peers[0].peer_id
+                1,    // peers[0].role: Voter
+                2,    // peers[1].store_id
+                0xAC, // peers[1].peer_id: 300 is two varint bytes
+                0x02, //
+                2,    // peers[1].role: Learner
+            ],
+        );
+    }
+
+    /// Region 1 as a cluster bootstraps it, byte for byte. Both key fields are an empty
+    /// length-prefixed string — *not* absent, and not a sentinel: the emptiness of `end_key` is
+    /// what means "+∞", and it has to be on the wire for the far end to read it.
+    #[test]
+    fn the_bootstrap_region_encodes_to_the_documented_bytes() {
+        let mut out = Encoder::new();
+        Region::bootstrap(1, 1, 1).encode(&mut out);
+        assert_eq!(
+            out.finish(),
+            vec![
+                1, // id
+                0, // start_key: empty
+                0, // end_key: empty, meaning the end of the key space
+                1, // epoch.conf_ver
+                1, // epoch.version
+                1, // peers: one
+                1, // peers[0].store_id
+                1, // peers[0].peer_id
+                1, // peers[0].role: Voter
+            ],
+        );
+    }
+
     #[test]
     fn peer_roles_are_distinct_and_nonzero() {
         assert_eq!(PeerRole::from_u8(0), None);
