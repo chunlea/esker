@@ -1458,7 +1458,11 @@ fn a_point_read_consults_the_bloom_filter_before_opening_a_table() {
 
     // 999, not 1000: `key-01999` is past the largest key stored, so the file's range rules it
     // out before the filter is ever needed. The cheap check runs first, which is the point.
-    assert_eq!(skips + probes, 999, "one table consulted per absent key inside the range");
+    assert_eq!(
+        skips + probes,
+        999,
+        "one table consulted per absent key inside the range"
+    );
     // 10 bits/key is a ~1% false-positive rate, so almost every one of these should be a skip.
     assert!(
         skips >= 950,
