@@ -17,11 +17,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use esker_engine::{Db, LocalFileSystem, Options, WalSyncMode, WriteBatch, WriteOptions, cf};
 use esker_proto::{ProtoError, RawKvReq, RawKvResp, Region, RequestHeader};
+use esker_raft::{ConfState, Entry, EntryKind, HardState};
+use esker_store::apply::Command;
 use esker_store::pd::{FakePd, PdClient};
 use esker_store::server::RaftOptions;
 use esker_store::split::SplitOptions;
-use esker_store::{PeerAddress, Store, StoreOptions};
+use esker_store::{PeerAddress, RaftLogStorage, Store, StoreOptions, meta};
 
 /// A region is split once it holds this many bytes — small enough that a few hundred keys reach
 /// it, so a test that splits ten times takes milliseconds rather than gigabytes.
@@ -486,4 +489,187 @@ async fn a_small_region_is_left_alone() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(harness.store.regions().len(), 1);
     assert_contiguous_partition(&harness.store.regions().regions());
+}
+
+// -- the crash inside the split -----------------------------------------------------------
+
+/// **Both or neither, constructed rather than raced.**
+///
+/// A `kill -9` during a split apply leaves one of exactly two states, because both halves' records
+/// and `apply_index` are in the same batch: either the batch landed — both halves on disk, the
+/// entry behind `apply_index` — or it did not, and neither half exists while the entry is still in
+/// the log. There is no third state to test for, and the second is the one worth constructing: the
+/// restart has to *finish* the split rather than forget it.
+///
+/// Built by hand, like `tests/restart.rs`: a durable, committed `Split` entry with the apply index
+/// left behind it, which is exactly what losing power between the two writes produces.
+/// Leaves a database in the state a crash *inside* a split apply produces: region 1 bootstrapped,
+/// a committed `Split` entry in its log, and `apply_index` still behind it.
+fn crash_inside_a_split(dir: &tempfile::TempDir, split_key: &Bytes) {
+    let db = Arc::new(
+        Db::open_with(
+            dir.path(),
+            Options {
+                create_if_missing: true,
+                wal_sync_mode: WalSyncMode::Never,
+                ..Options::default()
+            },
+            Arc::new(LocalFileSystem::new()),
+            &cf::BUILTIN,
+        )
+        .unwrap(),
+    );
+    // Region 1 as a bootstrap leaves it: the whole key space, one peer on this store.
+    let cf_id = db.cf_id(cf::RAFT).unwrap();
+    let mut batch = WriteBatch::new();
+    meta::stage_region(&mut batch, cf_id, &Region::bootstrap(1, 1, 1));
+    db.write(batch, &WriteOptions { sync: true }).unwrap();
+
+    let entries = vec![
+        Entry {
+            term: 1,
+            index: 1,
+            kind: EntryKind::Normal,
+            data: Bytes::new(),
+        },
+        Entry {
+            term: 1,
+            index: 2,
+            kind: EntryKind::Normal,
+            data: Command::Split {
+                split_key: split_key.clone(),
+                new_region_id: 7,
+                new_peer_ids: vec![70],
+            }
+            .encode(),
+        },
+    ];
+    let mut storage =
+        RaftLogStorage::open(Arc::clone(&db), 1, ConfState::from_voters(vec![1])).unwrap();
+    let mut batch = WriteBatch::new();
+    storage.stage_ready(
+        &mut batch,
+        Some(HardState {
+            term: 1,
+            voted_for: Some(1),
+            commit: 2,
+        }),
+        &entries,
+    );
+    db.write(batch, &WriteOptions { sync: true }).unwrap();
+    assert_eq!(storage.applied_index(), 0, "the apply index is behind");
+}
+
+/// **Both or neither, constructed rather than raced.**
+///
+/// A `kill -9` during a split apply leaves one of exactly two states, because both halves' records
+/// and `apply_index` are in the same batch: either the batch landed — both halves on disk, the
+/// entry behind `apply_index` — or it did not, and neither half exists while the entry is still in
+/// the log. There is no third state to test for, and the second is the one worth constructing: the
+/// restart has to *finish* the split rather than forget it.
+///
+/// Built by hand, like `tests/restart.rs`: a durable, committed `Split` entry with the apply index
+/// left behind it, which is exactly what losing power between the two writes produces.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_split_committed_but_not_applied_is_finished_by_the_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let split_key = Bytes::from_static(b"m");
+    crash_inside_a_split(&dir, &split_key);
+
+    // Reopened with the threshold out of reach, so a second region can only have come from the
+    // entry that was already in the log.
+    let pd = Arc::new(FakePd::new());
+    let mut raft = RaftOptions::new(
+        vec![PeerAddress::new(1, 1, "127.0.0.1:1".parse().unwrap())],
+        20_260_830,
+    );
+    raft.tick = Duration::from_millis(5);
+    let store = Store::open(
+        dir.path(),
+        StoreOptions {
+            store_id: 1,
+            peer_id: 1,
+            region_id: 1,
+            raft: Some(raft),
+            pd: Some(Arc::clone(&pd) as Arc<dyn PdClient>),
+            address: "127.0.0.1:20160".to_owned(),
+            heartbeat_tick: Duration::from_millis(5),
+            split: SplitOptions {
+                region_split_size: u64::MAX,
+                max_sampled_keys: 1024,
+            },
+            ..StoreOptions::new()
+        },
+    )
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while store.regions().len() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the restart never finished the split"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let regions = store.regions().regions();
+    assert_eq!(regions.len(), 2, "{regions:?}");
+    assert_contiguous_partition(&regions);
+    assert_eq!(regions[0].id, 1);
+    assert_eq!(regions[0].end_key, split_key);
+    assert_eq!(regions[1].id, 7, "the id the entry named, not a fresh one");
+    assert_eq!(regions[1].start_key, split_key);
+    assert_eq!(
+        regions[1]
+            .peers
+            .iter()
+            .map(|p| p.peer_id)
+            .collect::<Vec<_>>(),
+        vec![70],
+        "the peer ids the entry named"
+    );
+    for region in &regions {
+        assert_eq!(region.epoch.version, 2);
+    }
+    store.stop();
+}
+
+/// The repair loop, end to end. A client holding the pre-split region is refused, takes the
+/// regions the refusal carried, picks the one covering its key, and its next attempt succeeds —
+/// which is the whole reason the refusal carries them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_client_can_route_from_what_the_refusal_carried() {
+    let harness = tiny();
+    harness.wait_for_leader().await;
+    let stale = harness.header_for(b"k000050").expect("covered");
+
+    let value = vec![b'v'; 256];
+    for n in 0..64 {
+        harness.put(&key(n), &value).await;
+    }
+    harness.wait_for_regions(2).await;
+
+    // The client still believes the pre-split region and asks for its key.
+    let request = RawKvReq::get(Bytes::from(key(50)));
+    let error = harness
+        .store
+        .serve(stale, request.clone())
+        .await
+        .unwrap_err();
+    let ProtoError::EpochNotMatch { current_regions } = error else {
+        panic!("expected an epoch refusal");
+    };
+
+    // It learns them, finds the one that owns its key, and asks again — no `GetRegion` needed.
+    let owner = current_regions
+        .iter()
+        .find(|region| region.contains(&key(50)))
+        .expect("the refusal named every region the request touched");
+    let repaired = RequestHeader::new(owner.id, owner.epoch, 0);
+    assert_eq!(
+        harness.store.serve(repaired, request).await.unwrap(),
+        RawKvResp::Get {
+            value: Some(Bytes::from(value))
+        }
+    );
 }
