@@ -12,6 +12,9 @@ publish.workspace = true
 # The checksum on every frame, and the varints every body is built from. Sharing them with
 # the engine is why they live in `esker-base` (ADR 0004).
 esker-base.workspace = true
+# The Raft messages service 0x04 carries. The wire knows the shape of what it carries, as it
+# already does for RawKv; a mirrored enum would drift silently (ADR 0009).
+esker-raft.workspace = true
 # `Bytes` at API boundaries: a frame body is split from the read buffer without a copy.
 bytes.workspace = true
 thiserror.workspace = true
