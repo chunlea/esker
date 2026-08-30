@@ -1,0 +1,23 @@
+docs/DESIGN.md
+  s_8dc89cd8f6be19::t_82c24a3b0c120a 446-461,662-664
+docs/adr/0018-balance-moves-the-spread-by-two.md
+  s_8dc89cd8f6be19::t_0f72e138fb3a9a 1-93
+docs/plans/phase-4-pd.md
+  s_8dc89cd8f6be19::t_67b621aa49e9ef 3,344-399
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "536b88c01fa3e6451ebaa2ca11edf9ccdbd8ac7b",
+  "prompts": {},
+  "sessions": {
+    "s_8dc89cd8f6be19": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "20caabd3-7fb9-42f6-a519-04be2a284eef",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
