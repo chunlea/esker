@@ -1,0 +1,22 @@
+crates/esker-sql/src/backend.rs
+  h_44076b318daf9c 1-422
+crates/esker-sql/src/error.rs
+  h_44076b318daf9c 118-123,175
+crates/esker-sql/src/lib.rs
+  h_44076b318daf9c 45
+crates/esker-sql/src/sqlstate.rs
+  h_44076b318daf9c 76-82,143
+docs/plans/phase-6a.md
+  h_44076b318daf9c 184,198-221,456,523-535
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "aa853a2fb64faa1e3261ea3a8ec099331a80c868",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
