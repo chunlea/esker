@@ -167,29 +167,30 @@ impl Progress {
         advanced
     }
 
-    /// Applies a rejection, using the follower's hint to skip a whole term instead of walking back
-    /// one index per round trip.
+    /// Applies a rejection, backing `next` off to the probe point the leader worked out from the
+    /// follower's hint.
     ///
-    /// Returns whether `next` moved. A rejection that does not move it is stale — the leader
-    /// already backed off past it — and acting on it would undo real progress.
-    pub(crate) fn maybe_decr_to(&mut self, rejected: Index, hint_index: Index) -> bool {
+    /// Returns whether `next` moved. Two rules keep this safe under a network that duplicates and
+    /// reorders. `next` never drops to or below `matched`, because those entries are acknowledged
+    /// and re-sending them would be pointless. And `next` never *rises* on a rejection, which makes
+    /// a stale rejection — one the leader has already backed off past — a no-op rather than a step
+    /// backwards into work already done.
+    pub(crate) fn maybe_decr_to(&mut self, probe: Index) -> bool {
+        let candidate = probe.max(self.matched + 1);
         if self.state == ProgressState::Replicate {
-            // In replicate mode `next` is known, so only a rejection below `matched` is news, and
-            // that cannot happen: `matched` entries are acknowledged. Anything else is stale.
-            if rejected <= self.matched {
+            // A rejection in replicate mode means the leader's picture is wrong: the logs do not
+            // agree where it thought they did. Guessing starts again.
+            if probe <= self.matched {
                 return false;
             }
-            self.next = self.matched + 1;
+            self.become_probe();
+            self.next = candidate;
             return true;
         }
-        if self.next == 0 || rejected != self.next - 1 {
-            // Not the rejection for the message we are waiting on.
+        if candidate >= self.next {
             return false;
         }
-        self.next = hint_index
-            .max(1)
-            .min(self.next.saturating_sub(1))
-            .max(self.matched + 1);
+        self.next = candidate;
         self.probe_sent = false;
         true
     }

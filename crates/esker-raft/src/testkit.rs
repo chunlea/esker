@@ -178,6 +178,26 @@ impl Harness {
         }
     }
 
+    /// Proposes on `id` and settles.
+    pub(crate) fn propose(&mut self, id: NodeId, data: &'static [u8]) {
+        self.node_mut(id)
+            .propose(bytes::Bytes::from_static(data))
+            .expect("propose");
+        self.settle();
+    }
+
+    /// Severs every link between `side` and the rest, leaving each side able to talk to itself.
+    pub(crate) fn partition(&mut self, side: &[NodeId]) {
+        let ids: Vec<NodeId> = self.nodes.iter().map(|(id, _)| *id).collect();
+        for near in &ids {
+            for far in &ids {
+                if side.contains(near) != side.contains(far) {
+                    self.severed.push((*near, *far));
+                }
+            }
+        }
+    }
+
     /// Every node that currently believes it is the leader, with its term.
     pub(crate) fn leaders(&self) -> Vec<(NodeId, crate::types::Term)> {
         self.nodes

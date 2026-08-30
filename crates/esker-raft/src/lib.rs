@@ -32,6 +32,7 @@ mod message;
 mod progress;
 mod raw_node;
 mod readonly;
+mod replication;
 mod storage;
 #[cfg(test)]
 mod testkit;

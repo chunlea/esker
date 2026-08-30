@@ -11,7 +11,9 @@ use crate::election::CampaignKind;
 use crate::error::{RaftError, Result};
 use crate::message::Message;
 use crate::storage::LogStorage;
-use crate::types::{ConfChange, Entry, HardState, Index, NodeId, ReadState, Snapshot, Term};
+use crate::types::{
+    ConfChange, Entry, EntryKind, HardState, Index, NodeId, ReadState, Snapshot, Term,
+};
 
 /// Everything the core decided since the last [`RawNode::advance`], and the order the driver must
 /// discharge it in.
@@ -115,7 +117,6 @@ impl<S: LogStorage> RawNode<S> {
     }
 
     /// Proposes an opaque payload. Fails with [`RaftError::NotLeader`] anywhere but the leader.
-    #[allow(clippy::needless_pass_by_value)] // TODO(step-2): the payload becomes an entry.
     pub fn propose(&mut self, data: Bytes) -> Result<()> {
         if self.raft.role != Role::Leader {
             return Err(RaftError::NotLeader);
@@ -123,9 +124,7 @@ impl<S: LogStorage> RawNode<S> {
         if let Some(target) = self.raft.lead_transferee {
             return Err(RaftError::LeadershipTransferInProgress(target));
         }
-        let _ = data;
-        // TODO(step-2): append to the log and replicate.
-        Ok(())
+        self.raft.propose_entry(EntryKind::Normal, data).map(|_| ())
     }
 
     /// Proposes a single-server membership change.
@@ -433,6 +432,7 @@ mod tests {
         .unwrap();
         assert_eq!(node.term(), 9);
         assert_eq!(node.leader(), Some(2));
+        let _ = node.ready();
 
         // Now the stale one.
         node.step(Message::AppendEntries {

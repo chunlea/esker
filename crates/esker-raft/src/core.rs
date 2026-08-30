@@ -278,7 +278,10 @@ impl<S: LogStorage> Raft<S> {
         self.election_elapsed += 1;
         if self.heartbeat_elapsed >= self.heartbeat_tick {
             self.heartbeat_elapsed = 0;
-            // TODO(step-2): broadcast heartbeats.
+            let context = self.read_only.last_pending_ctx().unwrap_or_default();
+            if let Err(error) = self.bcast_heartbeat(&context) {
+                tracing::warn!(id = self.id, %error, "could not send heartbeats");
+            }
         }
         if self.check_quorum && self.election_elapsed >= self.randomized_election_timeout {
             self.election_elapsed = 0;
@@ -428,19 +431,39 @@ impl<S: LogStorage> Raft<S> {
                 pre_vote,
                 ..
             } => self.handle_vote_response(from, granted, pre_vote),
-            Message::AppendEntries { from, term, .. } => {
+            Message::AppendEntries {
+                from,
+                term,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+                context,
+                ..
+            } => {
                 // Figure 3.1, C3: a candidate that hears from a leader of its own term concedes.
                 // The leader is real — it could only have been elected by a majority — so
                 // continuing to campaign would just cost the cluster another term.
                 if matches!(self.role, Role::Candidate | Role::PreCandidate) {
                     self.become_follower(term, Some(from));
-                } else if self.role == Role::Follower {
-                    self.leader = Some(from);
-                    self.election_elapsed = 0;
                 }
-                // TODO(step-2): the consistency check, the splice and the response.
-                Ok(())
+                self.handle_append_entries(
+                    from,
+                    prev_log_index,
+                    prev_log_term,
+                    entries,
+                    leader_commit,
+                    context,
+                )
             }
+            Message::AppendEntriesResponse {
+                from,
+                reject,
+                index,
+                hint_term,
+                context,
+                ..
+            } => self.handle_append_response(from, reject, index, hint_term, &context),
             other => {
                 // TODO(step-2..6): replication responses, snapshots, transfer and reads.
                 tracing::trace!(

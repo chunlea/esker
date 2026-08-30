@@ -168,7 +168,12 @@ impl<S: LogStorage> Raft<S> {
             own.recent_active = true;
         }
         tracing::debug!(id = self.id, term = self.term, index, "became leader");
-        Ok(())
+
+        // A single-voter group has already committed the entry; a larger one starts replicating
+        // it now rather than at the next heartbeat, because until it commits nothing this leader
+        // inherited can commit either.
+        self.maybe_commit()?;
+        self.bcast_append()
     }
 
     /// Records a vote and says whether the election is decided.

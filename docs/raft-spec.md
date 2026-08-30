@@ -19,7 +19,7 @@ Paths are relative to `crates/esker-raft/src/`. Test names are the `#[test]` fun
 | S2 | `votedFor`: candidate voted for in `currentTerm`, or none, **persistent** | `types::HardState::voted_for`, `election::Raft::handle_vote_request` | `the_ready_that_grants_a_vote_carries_the_vote_it_recorded`, `a_recorded_vote_survives_a_restart_and_is_not_cast_twice` |
 | S3 | `log[]`: entries with a command and the term when received, **persistent**, first index 1 | `types::Entry`, `storage::LogStorage`, `log::RaftLog` | `appended_entries_come_back_by_index_and_term` |
 | S4 | `commitIndex`, `lastApplied`: volatile, initialised to 0 | `log::RaftLog::committed`, `log::RaftLog::applied` | `committed_entries_are_handed_out_once_and_in_order` |
-| S5 | `nextIndex[]`, `matchIndex[]`: volatile on leaders, reinitialised after election | `progress::Progress::{next, matched}`, `core::Raft::rebuild_progress` | TBD (step 2) |
+| S5 | `nextIndex[]`, `matchIndex[]`: volatile on leaders, reinitialised after election | `progress::Progress::{next, matched}`, `election::Raft::become_leader` | `the_in_flight_window_stops_a_leader_running_away_from_a_slow_follower` |
 
 Our departure from S1–S3: they are persisted by the **driver**, not by this crate, because this
 crate does no I/O. `raw_node::Ready` carries them out and its documentation is the contract; see §7.
@@ -33,10 +33,11 @@ round's tag (§6); a heartbeat is this message with `entries` empty.
 | # | Rule | Implemented by | Tested by |
 |---|---|---|---|
 | A1 | Reply false if `term < currentTerm` | `core::Raft::step_lower_term` | `an_append_from_an_older_term_is_answered_so_its_sender_learns` |
-| A2 | Reply false if the log has no entry at `prevLogIndex` whose term is `prevLogTerm` | `log::RaftLog::{matches, maybe_append}` | `an_append_whose_previous_entry_does_not_match_is_rejected` |
-| A3 | If an existing entry conflicts with a new one (same index, different term), delete it and everything after it | `log::RaftLog::{find_conflict, truncate_and_append}` | `an_append_that_conflicts_truncates_from_the_conflict_and_no_earlier`, `truncating_into_the_durable_prefix_shortens_the_log` |
-| A4 | Append any new entries not already in the log | `log::RaftLog::maybe_append` | `a_duplicated_append_does_not_shorten_the_log` |
-| A5 | If `leaderCommit > commitIndex`, set `commitIndex = min(leaderCommit, index of last new entry)` | `log::RaftLog::maybe_append` | `a_follower_never_commits_past_what_it_holds` |
+| A1b | The rejection hint: report the term at the conflict, so the leader skips a term per round trip rather than an entry | `replication::Raft::{conflict_hint, find_conflict_by_term}` | `the_rejection_hint_costs_a_round_trip_per_term_not_per_entry`, `an_append_past_the_end_of_the_log_is_refused_with_the_logs_own_end` |
+| A2 | Reply false if the log has no entry at `prevLogIndex` whose term is `prevLogTerm` | `replication::Raft::handle_append_entries`, `log::RaftLog::{matches, maybe_append}` | `an_append_whose_previous_entry_does_not_match_is_rejected`, `an_append_past_the_end_of_the_log_is_refused_with_the_logs_own_end` |
+| A3 | If an existing entry conflicts with a new one (same index, different term), delete it and everything after it | `log::RaftLog::{find_conflict, truncate_and_append}` | `an_append_that_conflicts_truncates_from_the_conflict_and_no_earlier`, `truncating_into_the_durable_prefix_shortens_the_log`, `a_follower_replaces_a_divergent_tail` |
+| A4 | Append any new entries not already in the log | `log::RaftLog::maybe_append` | `a_duplicated_append_does_not_shorten_the_log`, `replaying_an_append_leaves_the_log_alone` |
+| A5 | If `leaderCommit > commitIndex`, set `commitIndex = min(leaderCommit, index of last new entry)` | `log::RaftLog::maybe_append`, `replication::Raft::send_heartbeat` | `a_follower_never_commits_past_what_it_holds`, `a_heartbeat_never_advertises_a_commit_index_past_the_follower` |
 
 ## 2. RequestVote (Figure 3.1, "RequestVote RPC")
 
@@ -76,11 +77,12 @@ Arguments: `term`, `candidateId`, `lastLogIndex`, `lastLogTerm`. Results: `term`
 
 | # | Rule | Implemented by | Tested by |
 |---|---|---|---|
-| L1 | On election, and then periodically, send empty `AppendEntries` to every server so it does not time out | `core::Raft::tick_heartbeat`, TBD (step 2) | TBD (step 2) |
-| L0 | On election, append an empty entry of the new term, so §5.4.2 lets the backlog commit | `election::Raft::become_leader` | `a_new_leader_appends_an_empty_entry_of_its_own_term` |
-| L2 | On a client command, append the entry, then apply it once committed | TBD (step 2) | TBD (step 2) |
-| L3 | If `lastLogIndex >= nextIndex[f]`, send `AppendEntries` from `nextIndex[f]`; on success update `nextIndex[f]` and `matchIndex[f]`, on failure decrement `nextIndex[f]` and retry | TBD (step 2) | TBD (step 2) |
-| L4 | If a majority has `matchIndex >= N` for some `N > commitIndex` **and `log[N].term == currentTerm`**, set `commitIndex = N` (§5.4.2) | TBD (step 2) | TBD (step 2) |
+| L1 | On election, and then periodically, send empty `AppendEntries` to every server so it does not time out | `core::Raft::tick_heartbeat`, `replication::Raft::{bcast_heartbeat, send_heartbeat}` | `heartbeats_keep_a_follower_from_campaigning`, `a_returning_node_does_not_depose_a_healthy_leader` |
+| L0 | On election, append an empty entry of the new term, so §5.4.2 lets the backlog commit | `election::Raft::become_leader` | `a_new_leader_appends_an_empty_entry_of_its_own_term`, `a_new_leader_commits_its_inherited_entries_behind_its_own_no_op` |
+| L5 | Flow control: at most `max_inflight_msgs` entry-carrying appends outstanding per follower, and at most `max_size_per_msg` bytes in one | `progress::Inflights`, `replication::Raft::send_append` | `the_in_flight_window_stops_a_leader_running_away_from_a_slow_follower`, `an_append_is_bounded_by_the_byte_budget` |
+| L2 | On a client command, append the entry, then apply it once committed | `replication::Raft::propose_entry`, `raw_node::RawNode::propose` | `a_proposal_replicates_and_commits_everywhere`, `a_follower_refuses_a_proposal` |
+| L3 | If `lastLogIndex >= nextIndex[f]`, send `AppendEntries` from `nextIndex[f]`; on success update `nextIndex[f]` and `matchIndex[f]`, on failure decrement `nextIndex[f]` and retry | `replication::Raft::{send_append, handle_append_response}`, `progress::Progress::{maybe_update, maybe_decr_to}` | `the_rejection_hint_costs_a_round_trip_per_term_not_per_entry`, `a_leader_without_a_majority_appends_but_does_not_commit` |
+| L4 | If a majority has `matchIndex >= N` for some `N > commitIndex` **and `log[N].term == currentTerm`**, set `commitIndex = N` (§5.4.2) | `replication::Raft::maybe_commit` | **`a_prior_term_entry_on_a_majority_does_not_commit_by_counting`**, `a_new_leader_commits_its_inherited_entries_behind_its_own_no_op` |
 
 L4's term condition is the one this project treats as a first-class trap: committing a prior-term
 entry by counting replicas is safe-looking and wrong (`docs/plans/phase-3.md` §6 race 2).
@@ -136,7 +138,8 @@ is not yet an ADR becomes one before the phase closes (`prompts/03-raft.md`, "Ac
 | A `RequestVote` from an older term is **ignored**, not refused — Figure 3.1 says reply false. A stale candidate cannot win whatever we say, and staying quiet keeps a looping node from being answered forever. A stale *pre-vote* is refused, because that reply is how a node behind the cluster learns its term | `core.rs` | ADR TBD |
 | A pre-vote round redraws the election timeout even though it does not reset the term, so two nodes that pre-campaigned together do not do so again | `election.rs` | ADR TBD |
 | A snapshot is acknowledged with `AppendEntriesResponse`, not its own response | `message.rs` | `docs/plans/phase-3.md` §3; ADR TBD |
-| The rejection hint carries a term as well as an index, so a leader skips a term per round trip rather than an index | `message.rs`, `progress.rs` | ADR TBD (step 2) |
+| The rejection hint carries a term as well as an index, so a leader skips a term per round trip rather than an index | `message.rs`, `replication.rs` | ADR TBD |
+| An append carrying no entries does not consume the in-flight window — it is a heartbeat by another name, and charging it would throttle the messages that advertise a new commit index | `replication.rs` | ADR TBD |
 | Persistence is the driver's, and the ordering is a documented contract rather than an enforced one | `raw_node.rs` | `docs/plans/phase-3.md` §4; ADR TBD |
 | Single-server membership change only; joint consensus deferred | `conf.rs` | `docs/DESIGN.md` §5 |
 | `ReadIndex` only; no lease reads, which would need a bounded-clock-skew assumption | `readonly.rs` | `docs/DESIGN.md` §5 |
