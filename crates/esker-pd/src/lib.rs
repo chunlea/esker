@@ -34,13 +34,17 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod alloc;
 pub mod clock;
 pub mod error;
 pub mod keys;
+pub mod pd;
 pub mod record;
+pub mod routing;
 
 pub use clock::{Clock, SystemClock};
 pub use error::{PdError, Result};
+pub use pd::{Bootstrapped, Pd, PdOptions, RegionRoute};
 pub use record::{ClusterRecord, RegionRecord, StoreRecord, StoreStats};
 
 /// Bits of the logical counter in a timestamp: `ts = physical_ms << 18 | logical`
