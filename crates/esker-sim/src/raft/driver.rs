@@ -547,18 +547,23 @@ impl NodeSlot {
             self.snapshot_term = 0;
             return;
         };
-        let first = storage.first_index().unwrap_or(1);
+        let durable_first = storage.first_index().unwrap_or(1);
         let last = storage.last_index().unwrap_or(0);
-        let compacted_through = first.saturating_sub(1);
-        let snapshot_term = storage
-            .snapshot()
-            .map(|snapshot| snapshot.meta.term)
-            .unwrap_or_default();
         let snapshot = storage.snapshot().unwrap_or_default();
         let (snapshot_index, snapshot_conf) = (snapshot.meta.index, snapshot.meta.conf.clone());
-        let durable: Vec<Entry> = if last >= first {
+        // The boundary comes from wherever the log does. A snapshot the core has accepted moves
+        // its commit index and drops its log below that index *before* the driver writes it, so a
+        // boundary read out of storage against a commit index read out of the core describes two
+        // different logs — and the entries in between are ones this node no longer holds any
+        // opinion about. A dead node has no core to ask and its durable bytes are the whole truth.
+        let (compacted_through, snapshot_term) = self
+            .node
+            .as_ref()
+            .and_then(|node| node.snapshot_boundary().ok())
+            .unwrap_or((durable_first.saturating_sub(1), snapshot.meta.term));
+        let durable: Vec<Entry> = if last >= durable_first {
             storage
-                .entries(first, last + 1, u64::MAX)
+                .entries(durable_first, last + 1, u64::MAX)
                 .unwrap_or_default()
         } else {
             Vec::new()
@@ -568,12 +573,21 @@ impl NodeSlot {
             .map(|entry| EntryDigest::of(entry.index, entry.term, &entry.data))
             .collect();
 
-        let full = self
+        // Two ranges, because they answer to two boundaries. What the safety checkers read starts
+        // at the core's, so that the log and the commit index beside it are the same log. The
+        // configuration derivation starts at the durable one, because its base is the snapshot
+        // *storage* holds — replaying from a higher boundary onto that base would silently skip
+        // any conf change in the gap.
+        let observed = self
             .node
             .as_ref()
             .and_then(|node| Self::full_entries(node, compacted_through));
+        let full = self
+            .node
+            .as_ref()
+            .and_then(|node| Self::full_entries(node, durable_first.saturating_sub(1)));
 
-        let fresh: Vec<EntryDigest> = match &full {
+        let fresh: Vec<EntryDigest> = match &observed {
             Some(entries) => entries
                 .iter()
                 .map(|entry| EntryDigest::of(entry.index, entry.term, &entry.data))

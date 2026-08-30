@@ -138,7 +138,7 @@ mod tests {
     use crate::message::Message;
     use crate::progress::ProgressState;
     use crate::raw_node::RawNode;
-    use crate::storage::MemStorage;
+    use crate::storage::{LogStorage, MemStorage};
     use crate::testkit::Harness;
     use crate::types::{ConfState, Entry, HardState, Index, Snapshot, SnapshotMeta, Term};
 
@@ -208,6 +208,41 @@ mod tests {
             ),
             "a snapshot is acknowledged with the index it left the follower at"
         );
+    }
+
+    /// The boundary an observer reads has to be the *core's*, and it moves the moment the core
+    /// accepts a snapshot — not when the driver writes one.
+    ///
+    /// For the length of that window the core's commit index is at the snapshot's index and its
+    /// log below it is gone, while storage still holds the entries the snapshot replaced. Anything
+    /// that took the boundary from storage and the commit index from the core would be reading two
+    /// different logs and would find committed entries this node no longer holds any opinion
+    /// about. The simulator did exactly that, and reported it as State Machine Safety.
+    #[test]
+    fn the_snapshot_boundary_moves_when_the_core_accepts_it_not_when_the_driver_writes_it() {
+        let mut node = follower(&[1, 1, 2], 5);
+        assert_eq!(
+            node.snapshot_boundary().unwrap(),
+            (0, 0),
+            "nothing compacted"
+        );
+
+        node.step(install(9, 4)).unwrap();
+        assert_eq!(node.snapshot_boundary().unwrap(), (9, 4));
+        assert_eq!(node.commit_index(), 9, "and the commit index went with it");
+        assert_eq!(
+            node.storage().first_index().unwrap(),
+            1,
+            "while storage still holds the entries it replaced"
+        );
+
+        // The driver catches up: now both agree, and they go on agreeing.
+        let ready = node.ready();
+        let snapshot = ready.snapshot.clone().expect("a snapshot to write");
+        node.storage_mut().apply_snapshot(snapshot).unwrap();
+        node.advance(&ready);
+        assert_eq!(node.snapshot_boundary().unwrap(), (9, 4));
+        assert_eq!(node.storage().first_index().unwrap(), 10);
     }
 
     /// A snapshot that arrives while entries are still unpersisted has to discard them too. They

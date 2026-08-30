@@ -258,6 +258,28 @@ impl<S: LogStorage> RawNode<S> {
         self.raft.log.slice(low, high, u64::MAX)
     }
 
+    /// Where the core's log begins: the index a snapshot has replaced everything up to, and the
+    /// term of the entry that was there — `(0, 0)` for a log that has never been compacted.
+    ///
+    /// Like [`log_entries`](RawNode::log_entries), this is the *core's* view rather than the
+    /// driver's, and the two differ for exactly as long as a snapshot the core has accepted has
+    /// not been written yet. In that window the core's commit index has already moved to the
+    /// snapshot's index and its log below that index is gone, while storage still holds the
+    /// entries the snapshot replaced. An observer that took the boundary from storage and the
+    /// commit index from here would be reading two different logs, and would see committed
+    /// entries that this node no longer has any opinion about.
+    ///
+    /// # Errors
+    ///
+    /// Only if storage cannot answer for the boundary it reported.
+    pub fn snapshot_boundary(&self) -> Result<(Index, Term)> {
+        let index = self.raft.log.first_index()?.saturating_sub(1);
+        if index == 0 {
+            return Ok((0, 0));
+        }
+        Ok((index, self.raft.log.term(index)?))
+    }
+
     /// The configuration in force: the latest in the log, committed or not.
     ///
     /// "Committed or not" is the whole subtlety. A membership change takes effect when its entry
