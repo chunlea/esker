@@ -287,16 +287,16 @@ Regions cover the whole key space contiguously; the first region is `["", "")`.
 - **Apply loop:** one worker per store (sharded by region id later); each committed entry is decoded into
   a `WriteBatch` on data CFs plus `apply_index`, written atomically; admin entries (split, conf change)
   are applied under the region lock and bump the epoch.
-- **Split:** triggered by a periodic size check (region > 96 MiB *default*, or by an explicit admin
+- **Split** *(phase 4 — not yet implemented)*: triggered by a periodic size check (region > 96 MiB *default*, or by an explicit admin
   command). Leader asks PD for new ids, proposes `Split{split_key, new_region_id, new_peer_ids}`; on
   apply both halves are created on every peer with the same membership; the new region's Raft group starts
   with the parent's peers. Merge is post-v1.
-- **Snapshots:** `engine.checkpoint(range)` → SSTs + metadata, streamed as `Stream` frames in 1 MiB
+- **Snapshots** *(phase 4 — TODO(phase-4) markers in raft_log.rs/peer.rs)*: `engine.checkpoint(range)` → SSTs + metadata, streamed as `Stream` frames in 1 MiB
   chunks with checksums; receiver `ingest()`s into place then applies the Raft snapshot metadata.
 - **Transport:** one TCP connection per (store, store) pair carrying `RaftTransport::Batch` frames with
   `RaftMessage`s for all regions, batched per tick.
-- **Heartbeats:** store heartbeat (capacity, load) every 10 s; region heartbeat from each leader every
-  60 s or on change.
+- **Heartbeats** *(phase 4 — esker-pd is a stub until then)*: store heartbeat (capacity, load) every
+  10 s; region heartbeat from each leader every 60 s or on change.
 
 ## 7. Placement driver (`esker-pd`)
 
