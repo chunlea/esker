@@ -189,10 +189,13 @@ impl DbInner {
     ) -> Result<Option<Lookup>> {
         let reader = self.table_cache.get(file.number, &self.table_options(cf))?;
 
-        // TODO(sibling): this bypasses the bloom filter, which `TableReader::get` applies but
-        // which only helps an exact match — and an MVCC lookup is a seek, not an exact match.
-        // A filter-aware "seek to this internal key" on the reader would restore it; the
-        // filter is already built over user keys, so nothing else has to change.
+        // TODO(post-v1): this bypasses the bloom filter. `TableReader::get` applies it, but
+        // only for an exact internal-key match, and an MVCC lookup is a seek — the key being
+        // looked for is `(user_key, snapshot)`, which is almost never stored verbatim. A
+        // filter-aware "seek to this internal key" on the reader would restore it; the filter
+        // is already built over user keys (see `InternalPrefixExtractor`), so nothing else
+        // here has to change. Until then every level lookup pays a block read the filter
+        // would have avoided.
         let mut iter = reader.iter();
         iter.seek(target);
         // A block that could not be read ends iteration exactly like reaching the end, so the

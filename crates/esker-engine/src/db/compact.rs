@@ -252,6 +252,9 @@ impl DbInner {
     ) -> Result<(Vec<FileMeta>, CompactionStats)> {
         let table_options = self.table_options(cf);
         let mut children: Vec<Box<dyn Cursor + Send>> = Vec::new();
+        // A compaction reads every entry of every input, so the bloom filter would not help
+        // here even if the cursor consulted it — unlike the point-read path, which has the
+        // same gap and does care. See `TODO(post-v1)` in `db/read.rs`.
         for file in compaction.all_inputs() {
             let reader = self.table_cache.get(file.number, &table_options)?;
             children.push(table_cursor(reader.iter()));
