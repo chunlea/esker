@@ -1,0 +1,18 @@
+crates/esker-sql/Cargo.toml
+  h_44076b318daf9c 21
+crates/esker-sql/tests/psql_smoke.rs
+  h_44076b318daf9c 1-320
+docs/plans/phase-6a.md
+  h_44076b318daf9c 450-453,460-494,498-509,557-568
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "c5a71e35b6fb5faed9adaa9455b13a92c5da1adb",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
