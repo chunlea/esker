@@ -1,12 +1,13 @@
 //! `esker` — command line tools for the Esker key-value store.
 //!
-//! `sst-dump`, `wal-dump` and `manifest-dump` inspect the three on-disk formats; `bench` is
-//! still the phase-0 placeholder, and `region` arrives with the layer it inspects
+//! `sst-dump`, `wal-dump` and `manifest-dump` inspect the three on-disk formats, `bench`
+//! drives a workload against a real database, and `region` arrives with the layer it inspects
 //! (`docs/DESIGN.md` §12).
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod args;
+mod bench;
 mod bytes;
 mod manifest_dump;
 mod sst_dump;
@@ -32,15 +33,16 @@ fn main() -> ExitCode {
             print!("{USAGE}");
             ExitCode::SUCCESS
         }
-        Ok(Command::Bench(options)) => {
-            // TODO(phase-1): drive a real workload against esker-engine and record the
-            // numbers as docs/bench/README.md describes.
-            println!(
-                "bench: not implemented (threads={}, value-size={}, duration-secs={})",
-                options.threads, options.value_size, options.duration_secs
-            );
-            ExitCode::SUCCESS
-        }
+        Ok(Command::Bench(options)) => match bench::run(&options) {
+            Ok(report) => {
+                report.print();
+                ExitCode::SUCCESS
+            }
+            Err(reason) => {
+                eprintln!("esker bench: {reason}");
+                ExitCode::from(EXIT_FAILURE)
+            }
+        },
         Ok(Command::SstDump(options)) => {
             let mut stdout = std::io::stdout().lock();
             match sst_dump::run(&options, &mut stdout) {

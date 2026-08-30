@@ -12,6 +12,8 @@ publish.workspace = true
 # `sst-dump` reads real tables through the engine's own reader, so the tool and the
 # engine can never disagree about the format (docs/DESIGN.md §12).
 esker-engine.workspace = true
+# `bench` needs a seeded generator, and `CLAUDE.md` allows exactly one (`rand` is banned).
+esker-base.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

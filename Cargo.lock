@@ -87,6 +87,7 @@ dependencies = [
 name = "esker-cli"
 version = "0.1.0"
 dependencies = [
+ "esker-base",
  "esker-engine",
  "tempfile",
 ]

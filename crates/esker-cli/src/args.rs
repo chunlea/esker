@@ -9,7 +9,8 @@
 //!
 //! ```text
 //! esker [--version | -V] [--help | -h]
-//! esker bench [--threads N] [--value-size N] [--duration-secs N] [--help]
+//! esker bench [<workload>] [--num N] [--value-size N] [--batch-size N] [--threads N]
+//!             [--sync] [--dir PATH] [--duration-secs N] [--help]
 //! esker sst-dump <path> [--verbose | -v] [--prefix-len N] [--help]
 //! esker wal-dump <path> [--verbose | -v] [--help]
 //! esker manifest-dump <dir> [--help]
@@ -20,6 +21,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::bench::{Run as BenchOptions, Workload};
 use crate::manifest_dump::DumpOptions as ManifestDumpOptions;
 use crate::sst_dump::DumpOptions;
 use crate::wal_dump::DumpOptions as WalDumpOptions;
@@ -41,30 +43,6 @@ pub(crate) enum Command {
     ManifestDump(ManifestDumpOptions),
 }
 
-/// Options for the benchmark driver.
-///
-/// The driver itself is phase 1 (`docs/bench/README.md`); these are parsed and validated now
-/// so that the shape of the command does not change under anyone later.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BenchOptions {
-    /// Concurrent writer threads.
-    pub(crate) threads: u32,
-    /// Value size in bytes.
-    pub(crate) value_size: u32,
-    /// How long to run, in seconds.
-    pub(crate) duration_secs: u32,
-}
-
-impl Default for BenchOptions {
-    fn default() -> Self {
-        Self {
-            threads: 4,
-            value_size: 100,
-            duration_secs: 10,
-        }
-    }
-}
-
 /// Why the arguments could not be understood.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ParseError {
@@ -83,6 +61,8 @@ pub(crate) enum ParseError {
     },
     /// A bare word where none belongs.
     UnexpectedArgument(String),
+    /// A workload name `bench` does not have.
+    UnknownWorkload(String),
     /// A required positional argument was not given.
     MissingArgument(&'static str),
 }
@@ -101,6 +81,11 @@ impl fmt::Display for ParseError {
             ParseError::UnexpectedArgument(argument) => {
                 write!(formatter, "unexpected argument `{argument}`")
             }
+            ParseError::UnknownWorkload(workload) => write!(
+                formatter,
+                "unknown workload `{workload}`; expected fillseq, fillrandom, overwrite, \
+                 readrandom or readseq"
+            ),
             ParseError::MissingArgument(name) => write!(formatter, "missing {name}"),
         }
     }
@@ -127,9 +112,15 @@ Options:
   -h, --help            Print this message
 
 Bench options:
-      --threads N       Concurrent writer threads (default 4)
+  <workload>            fillseq | fillrandom | overwrite | readrandom | readseq
+                        (default fillrandom)
+      --num N           Keys in the database, and operations measured (default 100000)
       --value-size N    Value size in bytes (default 100)
-      --duration-secs N How long to run (default 10)
+      --batch-size N    Entries per write batch (default 1)
+      --threads N       Concurrent workers; readseq always uses one (default 1)
+      --sync            Wait for each write to be durable (default off)
+      --dir PATH        Where to put the database (default a temporary directory)
+      --duration-secs N Stop the measured phase early after this long (default 0, no limit)
 
 Sst-dump options:
   -v, --verbose         Print every key and value, not just the summary
@@ -169,9 +160,20 @@ where
     }
 }
 
+/// Which numeric field a flag sets. Named so the parse loop can read a value once and assign
+/// it once, rather than repeating the same three lines per flag.
+enum Target {
+    Num,
+    ValueSize,
+    BatchSize,
+    Threads,
+    DurationSecs,
+}
+
 fn parse_bench(arguments: &[String]) -> Result<Command, ParseError> {
     let mut options = BenchOptions::default();
     let mut index = 0;
+    let mut chose_workload = false;
 
     while index < arguments.len() {
         let argument = &arguments[index];
@@ -180,45 +182,108 @@ fn parse_bench(arguments: &[String]) -> Result<Command, ParseError> {
         if argument == "--help" || argument == "-h" {
             return Ok(Command::Help);
         }
+        if argument == "--sync" {
+            options.sync = true;
+            continue;
+        }
+        if argument == "--no-sync" {
+            options.sync = false;
+            continue;
+        }
 
         let (flag, inline) = match argument.split_once('=') {
             Some((flag, value)) => (flag, Some(value.to_owned())),
             None => (argument.as_str(), None),
         };
 
-        let (target, name): (&mut u32, &'static str) = match flag {
-            "--threads" => (&mut options.threads, "--threads"),
-            "--value-size" => (&mut options.value_size, "--value-size"),
-            "--duration-secs" => (&mut options.duration_secs, "--duration-secs"),
+        if flag == "--dir" {
+            let raw = take_value(arguments, &mut index, inline, "--dir")?;
+            options.dir = Some(PathBuf::from(raw));
+            continue;
+        }
+
+        let (target, name): (Target, &'static str) = match flag {
+            "--num" => (Target::Num, "--num"),
+            "--value-size" => (Target::ValueSize, "--value-size"),
+            "--batch-size" => (Target::BatchSize, "--batch-size"),
+            "--threads" => (Target::Threads, "--threads"),
+            "--duration-secs" => (Target::DurationSecs, "--duration-secs"),
             other if other.starts_with('-') => {
                 return Err(ParseError::UnknownFlag(other.to_owned()));
             }
-            other => return Err(ParseError::UnexpectedArgument(other.to_owned())),
+            other => {
+                // The one positional argument: which workload to run.
+                if chose_workload {
+                    return Err(ParseError::UnexpectedArgument(other.to_owned()));
+                }
+                let Some(workload) = Workload::parse(other) else {
+                    return Err(ParseError::UnknownWorkload(other.to_owned()));
+                };
+                options.workload = workload;
+                chose_workload = true;
+                continue;
+            }
         };
 
-        let raw = if let Some(value) = inline {
-            value
-        } else {
-            let value = arguments.get(index).ok_or(ParseError::MissingValue(name))?;
-            index += 1;
-            value.clone()
-        };
-
-        *target = raw.parse::<u32>().ok().filter(|parsed| *parsed > 0).ok_or(
-            ParseError::InvalidValue {
-                flag: name,
-                value: raw,
-            },
-        )?;
+        let raw = take_value(arguments, &mut index, inline, name)?;
+        match target {
+            Target::Num => {
+                options.num = raw.parse().ok().filter(|num| *num > 0).ok_or_else(|| {
+                    ParseError::InvalidValue {
+                        flag: name,
+                        value: raw.clone(),
+                    }
+                })?;
+            }
+            Target::ValueSize => options.value_size = positive(name, &raw)?,
+            Target::BatchSize => options.batch_size = positive(name, &raw)?,
+            Target::Threads => options.threads = positive(name, &raw)?,
+            // Zero is the only sensible "no limit", so it is allowed here and nowhere else.
+            Target::DurationSecs => options.duration_secs = number(name, &raw)?,
+        }
     }
 
     Ok(Command::Bench(options))
 }
 
-/// `sst-dump <path> [--verbose] [--prefix-len N]`.
-///
-/// The path is positional and required: a dump with nothing to dump is a usage error, not an
-/// empty report.
+/// Reads a flag's value, whether it came after an `=` or as the next argument.
+fn take_value(
+    arguments: &[String],
+    index: &mut usize,
+    inline: Option<String>,
+    name: &'static str,
+) -> Result<String, ParseError> {
+    if let Some(value) = inline {
+        return Ok(value);
+    }
+    let Some(value) = arguments.get(*index) else {
+        return Err(ParseError::MissingValue(name));
+    };
+    *index += 1;
+    Ok(value.clone())
+}
+
+fn number(name: &'static str, raw: &str) -> Result<u32, ParseError> {
+    raw.parse().map_err(|_| ParseError::InvalidValue {
+        flag: name,
+        value: raw.to_owned(),
+    })
+}
+
+/// Like [`number`], but zero is nonsense: zero threads run nothing, and a zero-byte value or
+/// batch measures nothing. A default quietly standing in for one of those would be a
+/// benchmark of something the caller did not ask for.
+fn positive(name: &'static str, raw: &str) -> Result<u32, ParseError> {
+    let value = number(name, raw)?;
+    if value == 0 {
+        return Err(ParseError::InvalidValue {
+            flag: name,
+            value: raw.to_owned(),
+        });
+    }
+    Ok(value)
+}
+
 fn parse_sst_dump(arguments: &[String]) -> Result<Command, ParseError> {
     let mut path: Option<PathBuf> = None;
     let mut verbose = false;
@@ -363,6 +428,56 @@ mod tests {
         assert_eq!(options.duration_secs, BenchOptions::default().duration_secs);
     }
 
+    /// The workload is the one positional argument, and an unknown one is refused rather than
+    /// silently replaced by the default.
+    #[test]
+    fn bench_takes_a_workload_and_the_acceptance_flags() {
+        let Command::Bench(options) = parse_ok(&[
+            "bench",
+            "fillrandom",
+            "--value-size",
+            "100",
+            "--num",
+            "1000000",
+        ]) else {
+            panic!("expected a bench command");
+        };
+        assert_eq!(options.workload, Workload::FillRandom);
+        assert_eq!(options.num, 1_000_000);
+        assert_eq!(options.value_size, 100);
+
+        assert_eq!(
+            parse(["bench", "fillfast"]),
+            Err(ParseError::UnknownWorkload("fillfast".to_owned()))
+        );
+        assert_eq!(
+            parse(["bench", "fillseq", "readseq"]),
+            Err(ParseError::UnexpectedArgument("readseq".to_owned()))
+        );
+    }
+
+    #[test]
+    fn bench_sync_is_a_flag_without_a_value() {
+        let Command::Bench(options) = parse_ok(&["bench", "fillseq", "--sync"]) else {
+            panic!("expected a bench command");
+        };
+        assert!(options.sync);
+        assert_eq!(options.workload, Workload::FillSeq);
+
+        let Command::Bench(options) = parse_ok(&["bench", "--sync", "--no-sync"]) else {
+            panic!("expected a bench command");
+        };
+        assert!(!options.sync, "the last one wins");
+    }
+
+    #[test]
+    fn bench_takes_a_directory() {
+        let Command::Bench(options) = parse_ok(&["bench", "--dir=/tmp/esker"]) else {
+            panic!("expected a bench command");
+        };
+        assert_eq!(options.dir, Some(PathBuf::from("/tmp/esker")));
+    }
+
     /// An unknown flag is an error, not something silently dropped. The same rule the wire
     /// protocol follows (`docs/DESIGN.md` §9).
     #[test]
@@ -379,9 +494,11 @@ mod tests {
             parse(["bench", "--jitter"]),
             Err(ParseError::UnknownFlag("--jitter".to_owned()))
         );
+        // `bench` now takes a workload as its one positional argument, so a bare word there
+        // is a workload that does not exist rather than an argument that does not belong.
         assert_eq!(
             parse(["bench", "extra"]),
-            Err(ParseError::UnexpectedArgument("extra".to_owned()))
+            Err(ParseError::UnknownWorkload("extra".to_owned()))
         );
     }
 
@@ -402,6 +519,8 @@ mod tests {
             ("--threads", "-1"),
             ("--threads", "many"),
             ("--value-size", "0"),
+            ("--num", "0"),
+            ("--batch-size", "0"),
             ("--duration-secs", "99999999999999999999"),
         ] {
             let result = parse(["bench", flag, value]);
