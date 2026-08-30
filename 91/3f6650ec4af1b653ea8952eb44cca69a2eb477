@@ -1,0 +1,20 @@
+.github/workflows/ci.yml
+  h_44076b318daf9c 1-41
+deny.toml
+  h_44076b318daf9c 1-86
+docs/bench/README.md
+  h_44076b318daf9c 1-45
+justfile
+  h_44076b318daf9c 1-48
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "913f6650ec4af1b653ea8952eb44cca69a2eb477",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
