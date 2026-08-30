@@ -1,0 +1,12 @@
+[package]
+name = "esker-base"
+description = "In-house primitives for Esker: CRC32C, varints, hash64 and a seeded PCG32."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

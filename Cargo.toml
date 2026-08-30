@@ -1,0 +1,69 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0 OR MIT"
+authors = ["Esker contributors"]
+publish = false
+
+# Every version lives here exactly once. Adding an entry that is not on the
+# allowlist in CLAUDE.md requires an ADR (see docs/adr/0003-dependencies.md).
+[workspace.dependencies]
+# --- runtime allowlist ---
+bytes = { version = "1", default-features = false }
+crossbeam-skiplist = { version = "0.1", default-features = false, features = ["std"] }
+lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
+thiserror = { version = "2", default-features = false, features = ["std"] }
+tokio = { version = "1", default-features = false }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "ansi", "env-filter"] }
+# --- dev-only allowlist ---
+criterion = { version = "0.5", default-features = false }
+proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }
+stateright = { version = "0.30", default-features = false }
+tempfile = { version = "3", default-features = false }
+# --- workspace-internal ---
+esker-base = { path = "crates/esker-base", version = "0.1.0" }
+esker-client = { path = "crates/esker-client", version = "0.1.0" }
+esker-engine = { path = "crates/esker-engine", version = "0.1.0" }
+esker-keys = { path = "crates/esker-keys", version = "0.1.0" }
+esker-pd = { path = "crates/esker-pd", version = "0.1.0" }
+esker-proto = { path = "crates/esker-proto", version = "0.1.0" }
+esker-raft = { path = "crates/esker-raft", version = "0.1.0" }
+esker-sim = { path = "crates/esker-sim", version = "0.1.0" }
+esker-store = { path = "crates/esker-store", version = "0.1.0" }
+esker-txn = { path = "crates/esker-txn", version = "0.1.0" }
+
+# Inherited by every crate via `[lints] workspace = true`. That line is mandatory
+# in every manifest: without it the crate is silently unlinted.
+[workspace.lints.rust]
+# CLAUDE.md invariant 8. `esker-engine` relaxes this to "warn" in its own manifest.
+unsafe_code = "deny"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# CLAUDE.md invariant 9: no panics on user input or on-disk data. These are
+# "restriction" lints, on deliberately; a proven-local invariant gets a targeted
+# `#[allow]` with a comment saying why, which is exactly the rule we want.
+unwrap_used = "warn"
+expect_used = "warn"
+# --- pedantic, selectively allowed ---
+# `esker_keys::KeyError`, `esker_sim::SimNetwork`: the repetition reads better at call sites.
+module_name_repetitions = "allow"
+# Error conditions are documented in the function's prose, not a mandatory `# Errors` heading.
+missing_errors_doc = "allow"
+# `#[must_use]` is added where ignoring the value is a bug, not on every getter.
+must_use_candidate = "allow"
+# Several tests deliberately pin relationships between compile-time constants — "the election
+# timeout must dominate the heartbeat interval", "the inline-value cutoff must fit in one
+# length byte". Those assertions have constant values on purpose; that is the point of them.
+assertions_on_constants = "allow"

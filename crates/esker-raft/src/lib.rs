@@ -1,0 +1,74 @@
+//! Raft as a pure state machine, modelled on the `RawNode`/`Ready` split: time enters through
+//! `tick()`, messages through `step()`, and every effect leaves through a `Ready` that the
+//! caller must persist before acting on. Leader election, log replication, pre-vote,
+//! check-quorum, `ReadIndex`, snapshots and single-server membership change live here
+//! (`docs/DESIGN.md` §5).
+//!
+//! # Invariants
+//!
+//! * **No threads, no timers, no sockets, no file I/O.** This is what makes the algorithm
+//!   simulatable and model-checkable, and it is not traded away for convenience
+//!   (`CLAUDE.md` invariant 4).
+//! * **Every decision is a function of `(state, message | tick)`.** No wall clock, no ambient
+//!   randomness: the election timeout is drawn from an injected [`esker_base::rng::Pcg32`].
+//! * **The driver contract is part of correctness.** The caller persists `hard_state` and
+//!   entries — with fsync — *before* sending any message from the same `Ready`. Violating the
+//!   order breaks Raft's safety guarantee, so the simulator tests it explicitly.
+//! * **Byte-opaque.** Proposals are opaque payloads; nothing here interprets a key.
+//!
+//! Phase 0 contains only the timing constants; the state machine is phase 3
+//! (`prompts/03-raft.md`).
+
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+/// Wall-clock duration a caller should map onto one `tick()`, in milliseconds. The core
+/// counts ticks and never reads a clock itself (`docs/DESIGN.md` §14).
+pub const TICK_MS: u64 = 100;
+
+/// Lower bound of the randomised election timeout, in ticks.
+pub const ELECTION_TIMEOUT_MIN_TICKS: u64 = 10;
+
+/// Upper bound of the randomised election timeout, in ticks. The spread is what stops two
+/// followers from campaigning in lockstep forever.
+pub const ELECTION_TIMEOUT_MAX_TICKS: u64 = 20;
+
+/// Ticks between heartbeats from a leader.
+pub const HEARTBEAT_TICKS: u64 = 2;
+
+/// How many append messages may be in flight to one follower before the leader stops sending.
+pub const MAX_INFLIGHT_MSGS: usize = 256;
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ELECTION_TIMEOUT_MAX_TICKS, ELECTION_TIMEOUT_MIN_TICKS, HEARTBEAT_TICKS, MAX_INFLIGHT_MSGS,
+        TICK_MS,
+    };
+
+    /// Raft's liveness argument requires the election timeout to be a comfortable multiple of
+    /// the broadcast interval. If a heartbeat cannot cross the network and be processed
+    /// several times over before a follower gives up, the cluster churns leaders instead of
+    /// making progress.
+    #[test]
+    fn election_timeout_dominates_the_heartbeat_interval() {
+        assert!(ELECTION_TIMEOUT_MIN_TICKS >= HEARTBEAT_TICKS * 5);
+        assert!(ELECTION_TIMEOUT_MAX_TICKS > ELECTION_TIMEOUT_MIN_TICKS);
+    }
+
+    /// The randomised window has to be wide enough that split votes are unlikely; a window of
+    /// one tick is not randomisation.
+    #[test]
+    fn election_timeout_window_is_wide_enough_to_break_ties() {
+        let window = ELECTION_TIMEOUT_MAX_TICKS - ELECTION_TIMEOUT_MIN_TICKS;
+        assert!(window >= ELECTION_TIMEOUT_MIN_TICKS / 2);
+    }
+
+    #[test]
+    fn timing_constants_are_usable() {
+        assert!(TICK_MS > 0);
+        assert!(MAX_INFLIGHT_MSGS > 0);
+        // A default election timeout of one to two seconds at 100 ms per tick.
+        assert_eq!(ELECTION_TIMEOUT_MIN_TICKS * TICK_MS, 1_000);
+        assert_eq!(ELECTION_TIMEOUT_MAX_TICKS * TICK_MS, 2_000);
+    }
+}

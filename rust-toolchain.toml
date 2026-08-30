@@ -1,0 +1,7 @@
+# The repository pins the stable channel on purpose: this machine's default
+# toolchain is nightly, and code that silently relies on nightly features would
+# break CI (which runs stable) long after it was written.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

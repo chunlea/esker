@@ -1,0 +1,95 @@
+//! The log-structured storage engine: a write-ahead log, memtables, sorted string tables, a
+//! manifest and compaction, all over byte-opaque keys ordered by a pluggable comparator.
+//! One directory is one [`Db`] with many column families sharing a single WAL and one
+//! sequence-number space (`docs/DESIGN.md` §4).
+//!
+//! # Invariants
+//!
+//! * **Log before state, fsync before ack.** A write is acknowledged only once its WAL bytes
+//!   are durable, unless the caller passed `sync = false`. These steps are never reordered
+//!   (`CLAUDE.md` invariant 1).
+//! * **Every on-disk byte is checksummed** with [`crc32c`], and every file carries a magic
+//!   number and a format version. Corruption is an error value, never a panic and never a
+//!   silent skip (invariant 2).
+//! * **Immutable files, atomic pointers.** SSTs and closed WAL segments are never modified in
+//!   place; the only mutable pointer is `CURRENT`, replaced by fsync-then-rename (invariant 3).
+//! * **Byte-opaque.** The engine never interprets a key. Tenants, tables and MVCC suffixes
+//!   live in `esker-keys` and above, so nothing here may depend on that crate (invariant 7).
+//! * This is the one crate where `unsafe` is a warning rather than an error, for the arena
+//!   allocator and intrinsics we expect to need. Each site still needs a `// SAFETY:` comment
+//!   and a test (invariant 8).
+//!
+//! Phase 0 contains only the fixed format constants and the checksum re-export; the engine
+//! itself is phase 1 (`prompts/01-engine.md`).
+
+#![warn(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+/// Names of the column families every store creates at bootstrap (`docs/DESIGN.md` §4.8).
+pub mod cf {
+    /// User data, and the long values of transactions (`docs/DESIGN.md` §8).
+    pub const DEFAULT: &str = "default";
+    /// Percolator locks, one live entry per locked key.
+    pub const LOCK: &str = "lock";
+    /// Percolator commit records, keyed by user key and commit timestamp.
+    pub const WRITE: &str = "write";
+    /// Raft logs, hard state and region metadata (`docs/DESIGN.md` §6).
+    pub const RAFT: &str = "raft";
+
+    /// All built-in column families, in creation order.
+    pub const BUILTIN: [&str; 4] = [DEFAULT, LOCK, WRITE, RAFT];
+}
+
+/// Byte layouts that are frozen. Changing any of these is a format change: it needs an ADR,
+/// a format-version bump and a migration story (`docs/DESIGN.md` §4).
+pub mod format {
+    /// Size of one write-ahead-log block. Records are split to never straddle a block.
+    pub const WAL_BLOCK_SIZE: usize = 32 * 1024;
+
+    /// `crc32c:u32 ++ len:u16 ++ type:u8`. A block tail shorter than this is zero-filled.
+    pub const WAL_HEADER_SIZE: usize = 7;
+
+    /// Trailing magic of a sorted string table: the ASCII bytes `ESKERSST1`.
+    pub const SST_MAGIC: [u8; 9] = *b"ESKERSST1";
+
+    /// Fixed footer size: index handle, filter handle, properties handle, version, magic.
+    pub const SST_FOOTER_SIZE: usize = 48;
+
+    /// Version of the SST layout this build reads and writes.
+    pub const SST_FORMAT_VERSION: u32 = 1;
+
+    /// Every block ends with `compression_type:u8 ++ crc32c:u32`.
+    pub const BLOCK_TRAILER_SIZE: usize = 5;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cf, format};
+
+    #[test]
+    fn column_family_names_are_distinct() {
+        let unique: std::collections::BTreeSet<&str> = cf::BUILTIN.into_iter().collect();
+        assert_eq!(
+            unique.len(),
+            cf::BUILTIN.len(),
+            "two built-in column families share a name"
+        );
+        assert!(unique.iter().all(|name| !name.is_empty()));
+    }
+
+    /// The magic is written into every SST footer, so its bytes are part of the format.
+    #[test]
+    fn sst_magic_is_frozen() {
+        assert_eq!(&format::SST_MAGIC, b"ESKERSST1");
+        assert_eq!(format::SST_MAGIC.len(), 9);
+        assert!(format::SST_FOOTER_SIZE > format::SST_MAGIC.len());
+    }
+
+    /// A WAL record needs its header plus at least one payload byte, so a block has to be
+    /// meaningfully larger than a header for the format to make sense.
+    #[test]
+    fn wal_block_can_hold_records() {
+        assert!(format::WAL_BLOCK_SIZE > format::WAL_HEADER_SIZE * 16);
+        assert_eq!(format::WAL_BLOCK_SIZE % 1024, 0);
+    }
+}
