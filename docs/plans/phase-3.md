@@ -338,7 +338,7 @@ Not done here, by the gate: 3b/3c (`esker-sim`, the sibling lane) and 3e (`esker
 
 ## 11. Sub-phase 3e — one replicated region in `esker-store`
 
-Status: **in progress**. Spec: `prompts/03-raft.md` 3e, `docs/DESIGN.md` §2 (request path), §5 (the
+Status: **in progress** — units 1–3 landed, 4–7 open. Spec: `prompts/03-raft.md` 3e, `docs/DESIGN.md` §2 (request path), §5 (the
 driver contract), §6 (the `raft` CF key layout), §9 (the wire), §10 (the client's region cache).
 
 Phase 2 built a store whose API already looks distributed: every request carries
@@ -350,15 +350,20 @@ to serve it.
 
 ### 11.1 Units
 
-| # | Unit | Files |
-|---|---|---|
-| 1 | `RaftLogStorage` over the engine's `raft` CF | `esker-store/src/raft_log.rs` |
-| 2 | The driver: `RawNode` + the `Ready` loop, on its own thread | `esker-store/src/peer.rs` |
-| 3 | The apply loop: committed entries → data CFs + `apply_index`, one batch | `esker-store/src/apply.rs` |
-| 4 | Transport: `RaftTransport::Batch` over `esker-proto` | `esker-proto/src/raft.rs`, `esker-store/src/transport.rs` |
-| 5 | Leader-only serving, `NotLeader` redirects, `ReadIndex` reads; the client learns leaders | `esker-store/src/server.rs`, `esker-client/src/**` |
-| 6 | `esker-cli cluster start --nodes 3` / `cluster stop` | `esker-cli/src/cluster.rs` |
-| 7 | The store-level test spine | `esker-store/tests/**` |
+| # | Unit | Files | Status |
+|---|---|---|---|
+| 1 | `RaftLogStorage` over the engine's `raft` CF | `esker-store/src/raft_log.rs` | **done** |
+| 2 | The driver: `RawNode` + the `Ready` loop, on its own thread | `esker-store/src/peer.rs` | **done** |
+| 3 | The apply loop: committed entries → data CFs + `apply_index`, one batch | `esker-store/src/apply.rs` | **done** |
+| 4 | Transport: `RaftTransport::Batch` over `esker-proto` | `esker-proto/src/raft.rs`, `esker-store/src/transport.rs` | to do |
+| 5 | Leader-only serving, `NotLeader` redirects, `ReadIndex` reads; the client learns leaders | `esker-store/src/server.rs`, `esker-client/src/**` | to do |
+| 6 | `esker-cli cluster start --nodes 3` / `cluster stop` | `esker-cli/src/cluster.rs` | to do |
+| 7 | The store-level test spine | `esker-store/tests/**` | to do |
+
+Units 1–3 are the spine: a peer can now be started over a real database, elect itself, replicate,
+apply commands to the data column families and answer a linearizable read — everything except
+reaching another process. What remains is the network (unit 4), the request path in front of it
+(unit 5), the way to start three of them (unit 6), and the cross-process tests (unit 7).
 
 ### 11.2 The five decisions worth writing down before the code
 
@@ -403,7 +408,29 @@ the read's own position in the order. The driver holds the read until `applied_i
 | redirects | a follower answers `NotLeader { leader_hint }`; the client's region cache learns the leader and the retry lands |
 | cluster | three stores over real TCP, one region: writes on the leader, kill the leader, no acknowledged write lost, the cluster converges |
 
-### 11.4 Non-goals for 3e
+### 11.4 What units 1–3 changed against §11.2
+
+1. **`RaftPeer::propose` takes a `Command`, not `Bytes`.** An entry whose payload cannot be decoded
+   cannot be applied, and skipping it would leave one peer's state machine differing from every
+   other's — so the driver treats it as a hard failure. Making the type the guarantee means the log
+   can never hold a payload the apply loop will refuse. Three tests found this the honest way, by
+   proposing raw bytes and killing the driver.
+
+2. **`DeleteRange`'s key limit is a constant in `apply`, not the request path's `Limits`.** §11.2's
+   determinism rule has this consequence and the plan did not spell it out: a bound one peer applies
+   and another does not is two different state machines. The configurable limit still guards the
+   request path, where refusing early costs nothing.
+
+3. **The Raft core runs on a dedicated OS thread, not a task.** The plan said "on its own thread"
+   without saying why: the engine is synchronous, so an `fsync` on a reactor thread would stall
+   every connection the process serves. Time reaches it through a `tokio` interval that sends a
+   tick, which is the only place a wall clock touches consensus.
+
+4. **The last index is scanned at open rather than read from the state record.** The record and the
+   entries are written in one batch, so they agree — but a torn tail could still leave the record
+   describing entries that are not there, and seeking to the end costs one iterator.
+
+### 11.5 Non-goals for 3e
 
 - **Snapshot bytes.** The core's `InstallSnapshot` metadata path is done; streaming the region's
   SSTs is phase 4, and a single region that never compacts its raft log never needs one. The send
