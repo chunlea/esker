@@ -1,0 +1,18 @@
+crates/esker-sql/src/parse.rs
+  h_44076b318daf9c 139-140,143-165,257-499,513-535,537-538,589-592,617-621,928-1026
+crates/esker-sql/tests/syntax_corpus.rs
+  h_44076b318daf9c 14,16-29,32,39-43,242-244,246,249-257,262-265,271-298,300-309,313-314,316-323,327-368
+docs/plans/phase-6a.md
+  h_44076b318daf9c 25-38,280-323,332-335,339-341,364,374,377-381,388-390
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "8310611457ac40ab43431220970b6dcd128d1c2a",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
