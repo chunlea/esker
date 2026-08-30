@@ -11,7 +11,7 @@
 //! to be built from heartbeats that may arrive late, out of order, or not at all: a stale
 //! answer costs a client one redirect, because the store it is sent to checks the epoch itself
 //! (`CLAUDE.md` invariant 5). It is also why a heartbeat is never allowed to move the table
-//! *backwards* — see [`upsert_region`].
+//! *backwards* — see [`accepts`], which is the guard every heartbeat passes through.
 
 use std::sync::Arc;
 
