@@ -28,6 +28,7 @@ use esker_proto::{
     RequestHeader, Response, Service, TransportConfig,
 };
 
+use crate::apply::Command;
 use crate::error::{Result, StoreError};
 use crate::peer::{PeerOptions, RaftPeer};
 use crate::raft_log::RaftLogStorage;
@@ -349,6 +350,62 @@ impl Store {
         }
     }
 
+    /// Serves one `RawKv` request, taking the replicated path when this store has a Raft peer.
+    ///
+    /// The two paths differ in where a write is ordered and where a read is anchored:
+    ///
+    /// * **Unreplicated** — the engine is the order, and a read sees whatever is written.
+    /// * **Replicated** — only the leader serves. A mutation becomes a command in the Raft log
+    ///   and its answer comes from *this peer's own apply*, so a `CompareAndSwap` is decided
+    ///   against the state every peer reaches. A read is anchored by a `ReadIndex` round and does
+    ///   not run until the state machine has applied through it (`docs/DESIGN.md` §2).
+    ///
+    /// A follower answers [`ProtoError::NotLeader`] with the peer it believes leads, which is what
+    /// the client's region cache learns from.
+    pub async fn serve(
+        self: &Arc<Self>,
+        header: RequestHeader,
+        request: RawKvReq,
+    ) -> std::result::Result<RawKvResp, ProtoError> {
+        self.region.check(&header)?;
+
+        let Some(peer) = self.peer.clone() else {
+            let store = Arc::clone(self);
+            return blocking(move || store.handle(header, request)).await;
+        };
+
+        // A hint, not an authority: a peer deposed a moment ago still says yes here, and the
+        // proposal it accepts on the strength of that is failed by the driver rather than
+        // applied. Checking early only saves a round trip through the driver thread.
+        if !peer.is_leader() {
+            return Err(peer.not_leader());
+        }
+        self.region.check_scope(&request)?;
+
+        if let Some(command) = Command::from_request(&request) {
+            // An oversized range delete is refused here rather than at apply time: apply must be
+            // deterministic, so a refusal there would be a failure of the store on every peer at
+            // once (`crate::apply`).
+            if let RawKvReq::DeleteRange { start, end, .. } = &request {
+                let store = Arc::clone(self);
+                let (start, end) = (start.clone(), end.clone());
+                blocking(move || {
+                    rawkv::count_range(&store.db, &store.region, &store.limits, &start, &end)
+                })
+                .await?;
+            }
+            let applied = peer.propose(&command).await?;
+            Ok(crate::apply::response(&request, &applied))
+        } else {
+            // A linearizable read. `read_index` returns only once the state machine has applied
+            // through the index it established, so the engine read below sees at least everything
+            // committed when the read was accepted.
+            peer.read_index().await?;
+            let store = Arc::clone(self);
+            blocking(move || rawkv::serve(&store.db, &store.region, &store.limits, request)).await
+        }
+    }
+
     /// Flushes every column family, so a caller that is about to stop knows what is on disk.
     pub fn flush(&self) -> Result<()> {
         self.db.flush_all()?;
@@ -360,6 +417,20 @@ impl Store {
     pub fn property(&self, name: &str) -> Option<String> {
         self.db.property(name)
     }
+}
+
+/// Runs synchronous engine work on a blocking thread.
+///
+/// `esker-engine` is synchronous and stays that way, so an `fsync` that takes ten milliseconds
+/// must block a blocking thread and not the reactor every other connection is served on.
+async fn blocking<T, F>(work: F) -> std::result::Result<T, ProtoError>
+where
+    F: FnOnce() -> std::result::Result<T, ProtoError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| ProtoError::internal(format!("the request task failed: {error}")))?
 }
 
 /// The store behind the wire.
@@ -402,11 +473,9 @@ impl Service for StoreService {
                 }
             };
 
-            // The engine is synchronous, so its work happens on a blocking thread: an `fsync`
-            // must never stall the reactor every other connection is served on.
-            tokio::task::spawn_blocking(move || store.handle(header, request))
+            store
+                .serve(header, request)
                 .await
-                .map_err(|error| ProtoError::internal(format!("the request task failed: {error}")))?
                 .map(|response| Reply::Unary(Response::RawKv(response)))
         })
     }

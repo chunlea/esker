@@ -120,6 +120,29 @@ impl RegionMeta {
         Ok(())
     }
 
+    /// Checks every key a request touches against this region's range.
+    ///
+    /// The direct path checks these inside each handler. The replicated path has to check them
+    /// *before* proposing, because an entry that reaches the log is applied on every peer — a
+    /// key-range mistake caught at apply time would be caught three times and fix nothing.
+    pub fn check_scope(&self, request: &esker_proto::RawKvReq) -> Result<(), ProtoError> {
+        use esker_proto::RawKvReq;
+        match request {
+            RawKvReq::Get { key }
+            | RawKvReq::Delete { key, .. }
+            | RawKvReq::Put { key, .. }
+            | RawKvReq::CompareAndSwap { key, .. } => self.check_key(key),
+            RawKvReq::BatchGet { keys } => self.check_keys(keys.iter().map(|key| &key[..])),
+            RawKvReq::BatchPut { pairs, .. } => {
+                self.check_keys(pairs.iter().map(|(key, _)| &key[..]))
+            }
+            RawKvReq::DeleteRange { start, end, .. } => self.check_range(start, end),
+            // A scan's bounds are clamped to the region rather than refused, which is what
+            // `rawkv::scan_bounds` does on the direct path.
+            RawKvReq::Scan { .. } => Ok(()),
+        }
+    }
+
     /// Checks that `[start, end)` is inside this region, where an empty `end` means the end of
     /// the key space.
     ///

@@ -41,7 +41,9 @@ use crate::wire::{
 fn raw_body(request: &Request) -> Option<&RawKvReq> {
     match request {
         Request::RawKv { request, .. } => Some(request),
-        Request::Hello(_) => None,
+        // A client never sends `Hello` through a rule — the transport handles it — and never
+        // sends Raft traffic at all: that is store-to-store, on connections a client has none of.
+        Request::Hello(_) | Request::Raft(_) => None,
     }
 }
 

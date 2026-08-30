@@ -16,7 +16,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use esker_proto::{Server, ServerHandle, TransportConfig};
+use esker_proto::{
+    Epoch, RawKvReq, RawKvResp, Request, RequestHeader, RequestOutcome, Server, ServerHandle,
+    TcpTransport, Transport, TransportConfig,
+};
 use esker_raft::Role;
 use esker_store::apply::Command;
 use esker_store::server::RaftOptions;
@@ -258,6 +261,129 @@ async fn a_run_of_writes_replicates_in_order() {
                 at + 1
             );
         }
+    }
+    shutdown(nodes).await;
+}
+
+/// The wire path, end to end: a `RawKv` request to the **leader's** socket is ordered by Raft and
+/// answered from this peer's own apply, and the same request to a **follower** comes back as
+/// `NotLeader` naming the leader — which is what a client's region cache learns from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_over_the_wire_is_served_by_the_leader_and_redirected_by_a_follower() {
+    let nodes = start_cluster(3).await;
+    let leader = wait_for_leader(&nodes).await;
+    let follower = (leader + 1) % nodes.len();
+    let header = RequestHeader::new(1, Epoch::INITIAL, 0);
+
+    let to_leader = TcpTransport::connect(nodes[leader].handle.local_addr())
+        .await
+        .unwrap();
+    let answer = to_leader
+        .call(Request::raw_kv(
+            header,
+            RawKvReq::put(&b"wire"[..], &b"value"[..]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(answer.into_raw_kv().unwrap(), RawKvResp::Put);
+
+    // A linearizable read on the leader sees it.
+    let answer = to_leader
+        .call(Request::raw_kv(header, RawKvReq::get(&b"wire"[..])))
+        .await
+        .unwrap();
+    assert_eq!(
+        answer.into_raw_kv().unwrap(),
+        RawKvResp::Get {
+            value: Some(Bytes::from_static(b"value"))
+        }
+    );
+
+    // The same request to a follower is refused with the hint a client redirects on.
+    let to_follower = TcpTransport::connect(nodes[follower].handle.local_addr())
+        .await
+        .unwrap();
+    let error = to_follower
+        .call(Request::raw_kv(
+            header,
+            RawKvReq::put(&b"wire"[..], &b"other"[..]),
+        ))
+        .await
+        .unwrap_err();
+    match error {
+        esker_proto::ProtoError::NotLeader {
+            region_id,
+            leader_hint,
+        } => {
+            assert_eq!(region_id, 1);
+            assert_eq!(leader_hint, Some(leader as u64 + 1));
+        }
+        other => panic!("expected NotLeader from a follower, got {other:?}"),
+    }
+    // And it is the retryable, provably-not-applied kind, so a client may follow the hint.
+    let error = to_follower
+        .call(Request::raw_kv(header, RawKvReq::get(&b"wire"[..])))
+        .await
+        .unwrap_err();
+    assert!(error.is_retryable());
+    assert_eq!(error.outcome(), RequestOutcome::NotApplied);
+
+    shutdown(nodes).await;
+}
+
+/// A `CompareAndSwap` over the wire is decided at apply time on every peer, and its answer comes
+/// back to the caller that proposed it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_compare_and_swap_over_the_wire_is_ordered_by_raft() {
+    let nodes = start_cluster(3).await;
+    let leader = wait_for_leader(&nodes).await;
+    let header = RequestHeader::new(1, Epoch::INITIAL, 0);
+    let transport = TcpTransport::connect(nodes[leader].handle.local_addr())
+        .await
+        .unwrap();
+
+    let swap = |expected: Option<&'static [u8]>, value: Option<&'static [u8]>| {
+        Request::raw_kv(
+            header,
+            RawKvReq::CompareAndSwap {
+                key: Bytes::from_static(b"cas"),
+                expected: expected.map(Bytes::from_static),
+                value: value.map(Bytes::from_static),
+                sync: true,
+            },
+        )
+    };
+
+    let answer = transport.call(swap(None, Some(b"first"))).await.unwrap();
+    assert_eq!(
+        answer.into_raw_kv().unwrap(),
+        RawKvResp::CompareAndSwap {
+            swapped: true,
+            previous: None
+        }
+    );
+    let answer = transport.call(swap(None, Some(b"second"))).await.unwrap();
+    assert_eq!(
+        answer.into_raw_kv().unwrap(),
+        RawKvResp::CompareAndSwap {
+            swapped: false,
+            previous: Some(Bytes::from_static(b"first"))
+        }
+    );
+
+    // Every peer agrees, because the comparison happened at apply time on each of them.
+    let index = nodes[leader]
+        .store
+        .peer()
+        .unwrap()
+        .status()
+        .await
+        .unwrap()
+        .applied;
+    wait_for_applied(&nodes, index).await;
+    for node in &nodes {
+        let stored = esker_store::rawkv::get(node.store.db(), b"cas").unwrap();
+        assert_eq!(stored.as_deref(), Some(&b"first"[..]));
     }
     shutdown(nodes).await;
 }

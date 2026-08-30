@@ -220,6 +220,41 @@ pub fn compare_and_swap(
 /// (ADR 0006): the engine's v1 range tombstone answers for the key at `begin` and no other, so
 /// using it would report a range deleted while leaving nearly all of it in place. The deletes
 /// go in one `WriteBatch`, so the range disappears atomically.
+/// Counts the keys a range delete would remove, refusing past the limit.
+///
+/// The replicated path needs the refusal *before* the command is proposed: an entry that reaches
+/// the log is applied on every peer, and a limit enforced at apply time would fail all of them at
+/// once rather than answering the caller (`crate::apply`).
+pub fn count_range(
+    db: &Db,
+    region: &RegionMeta,
+    limits: &Limits,
+    start: &[u8],
+    end: &[u8],
+) -> Result<u64, ProtoError> {
+    let (low, high) = scan_bounds(region, start, end, false)?;
+    let mut iter = db
+        .iter(cf::DEFAULT, &ReadOptions::default())
+        .map_err(|error| engine_to_proto(&error))?;
+    let mut counted = 0_usize;
+    iter.seek(&low);
+    while iter.valid() && iter.key() < &high[..] {
+        if counted == limits.max_delete_range_keys {
+            return Err(ProtoError::Unsupported {
+                detail: format!(
+                    "DeleteRange over more than {} keys is not supported in this version; \
+                     delete in smaller ranges (ADR 0006)",
+                    limits.max_delete_range_keys
+                ),
+            });
+        }
+        counted += 1;
+        iter.next();
+    }
+    iter.status().map_err(|error| engine_to_proto(&error))?;
+    Ok(counted as u64)
+}
+
 fn delete_range(
     db: &Db,
     region: &RegionMeta,
