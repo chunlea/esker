@@ -203,6 +203,14 @@ impl SimNetwork {
         self.in_flight.len()
     }
 
+    /// Replaces the fault plan, leaving the generator's position alone.
+    ///
+    /// This is how a scenario stops injecting faults part-way through — the run continues on the
+    /// same stream, so what happened before the change is untouched.
+    pub fn set_plan(&mut self, plan: FaultPlan) {
+        self.plan = plan;
+    }
+
     /// A handle that lets `node` use this network through the [`Network`] trait.
     pub fn node(&mut self, node: NodeId) -> NodeView<'_> {
         NodeView { net: self, node }
@@ -402,6 +410,15 @@ impl SimNetwork {
     /// finish, so this is for one-shot exchanges.
     pub fn run_to_quiescence(&mut self) {
         while self.step() {}
+    }
+
+    /// How many delivered messages are waiting in `node`'s inbox.
+    ///
+    /// A driver needs this to choose *which* node processes a message next without popping one
+    /// to find out — the choice has to come from the seeded generator, not from node order.
+    #[must_use]
+    pub fn inbox_len(&self, node: NodeId) -> usize {
+        self.inboxes.get(&node).map_or(0, VecDeque::len)
     }
 
     /// Takes the next delivered message for `node`.

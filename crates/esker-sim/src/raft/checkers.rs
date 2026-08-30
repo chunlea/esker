@@ -86,6 +86,17 @@ pub struct NodeSnapshot<'a> {
     /// installs a snapshot sent by a leader seeds it from
     /// [`SafetyChecker::prefix_digest`].
     pub prefix_anchor: u64,
+    /// Whether everything the node's core has decided is visible here: it has no disk write
+    /// outstanding and nothing left to hand its driver.
+    ///
+    /// While a slow disk holds a write, the core keeps accepting entries that no accessor
+    /// exposes, so [`NodeSnapshot::commit`] can name an index that [`NodeSnapshot::log`] still
+    /// shows the *previous* leader's entry at. The two properties that read the commit index
+    /// against the log — the committed record and leader completeness — are therefore only
+    /// evaluated on a settled node. The other two never are: a role and a term are facts about
+    /// what the node believes right now, and every entry in `log` is one the node really held,
+    /// whether or not it still does.
+    pub settled: bool,
     /// The node's log, ascending and contiguous, starting at `compacted_through + 1`.
     pub log: &'a [EntryDigest],
     /// Everything the node's state machine has consumed, in the order it consumed it.
@@ -148,6 +159,28 @@ pub enum Violation {
         /// What the leader has at that index instead.
         found: String,
     },
+    /// Two different entries were committed at one index.
+    #[error(
+        "committed twice: node {node} has index {index} committed as term {term}, payload \
+         {payload:#018x}, but node {other} committed term {other_term}, payload \
+         {other_payload:#018x} there"
+    )]
+    CommittedTwice {
+        /// The index committed twice.
+        index: Index,
+        /// The node observed now.
+        node: NodeId,
+        /// Its entry's term.
+        term: Term,
+        /// Its entry's payload digest.
+        payload: u64,
+        /// The node that established the record.
+        other: NodeId,
+        /// The recorded term.
+        other_term: Term,
+        /// The recorded payload digest.
+        other_payload: u64,
+    },
     /// Two nodes applied different entries at the same position.
     #[error(
         "state machine safety: node {node} applied (index {index}, term {term}, \
@@ -199,6 +232,8 @@ pub enum Violation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Committed {
     entry: EntryDigest,
+    /// The node that first observed this index as committed.
+    by: NodeId,
     /// The term of the node that first observed this index as committed. A leader of a higher
     /// term must have the entry.
     observed_in: Term,
@@ -370,6 +405,9 @@ impl SafetyChecker {
     /// Records everything this node considers committed, and rejects a second, different
     /// entry at an index that is already committed.
     fn record_committed(&mut self, node: &NodeSnapshot<'_>) -> Result<(), Violation> {
+        if !node.settled {
+            return Ok(());
+        }
         let last = node.log.last().map_or(node.compacted_through, |e| e.index);
         let top = node.commit.min(last);
         let memo = self.memo.entry(node.id).or_default();
@@ -385,20 +423,14 @@ impl SafetyChecker {
             };
             match self.committed.get(&index) {
                 Some(record) if record.entry != *entry => {
-                    // Two different entries committed at one index. That is the sharpest form
-                    // of a log-matching failure, so it is reported as one.
-                    let (expected, other) = self
-                        .prefixes
-                        .get(&(index, record.entry.term))
-                        .copied()
-                        .unwrap_or((0, node.id));
-                    return Err(Violation::LogMatching {
+                    return Err(Violation::CommittedTwice {
                         index,
-                        term: record.entry.term,
                         node: node.id,
-                        other,
-                        found: entry.payload,
-                        expected,
+                        term: entry.term,
+                        payload: entry.payload,
+                        other: record.by,
+                        other_term: record.entry.term,
+                        other_payload: record.entry.payload,
                     });
                 }
                 Some(_) => {}
@@ -407,6 +439,7 @@ impl SafetyChecker {
                         index,
                         Committed {
                             entry: *entry,
+                            by: node.id,
                             observed_in: node.term,
                         },
                     );
@@ -417,6 +450,11 @@ impl SafetyChecker {
     }
 
     fn check_leader_completeness(&mut self, node: &NodeSnapshot<'_>) -> Result<(), Violation> {
+        if node.is_leader && !node.settled {
+            // Its log is not all visible yet; the check is not skipped, only deferred, and a
+            // leader that is genuinely missing a committed entry does not heal by persisting.
+            return Ok(());
+        }
         if !node.is_leader {
             if let Some(memo) = self.memo.get_mut(&node.id) {
                 memo.leading = None;

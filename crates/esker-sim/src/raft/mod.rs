@@ -8,6 +8,9 @@
 //! # What lives here
 //!
 //! * [`checkers`] — the four safety properties, checked after every event.
+//! * [`cluster`] — the discrete-event loop over N nodes and one network.
+//! * [`driver`] — the persistence boundary and one node's half of the `Ready` contract.
+//! * [`report`] — the compact event trace and the shape of a failure.
 //!
 //! # Invariants
 //!
@@ -22,5 +25,11 @@
 //!   vacuously.
 
 pub mod checkers;
+pub mod cluster;
+pub mod driver;
+pub mod report;
 
 pub use checkers::{EntryDigest, NodeSnapshot, SafetyChecker, Violation};
+pub use cluster::{Cluster, seed_override, seeds, voter_ids};
+pub use driver::{DiskWrite, NodeSlot, PersistedStorage};
+pub use report::{Event, Failure, Settled, Stats};

@@ -27,6 +27,7 @@ fn node(id: u64, term: u64, commit: u64, log: &[EntryDigest]) -> NodeSnapshot<'_
         commit,
         compacted_through: 0,
         prefix_anchor: 0,
+        settled: true,
         log,
         applied: &[],
     }
@@ -250,8 +251,8 @@ fn a_second_entry_committed_at_an_already_committed_index_is_caught() {
         .observe(&[node(2, 2, 2, &second)])
         .expect_err("index 2 was committed twice with different entries");
     assert!(
-        matches!(violation, Violation::LogMatching { index: 2, .. }),
-        "expected a log matching violation at index 2, got {violation}"
+        matches!(violation, Violation::CommittedTwice { index: 2, .. }),
+        "expected a double-commit violation at index 2, got {violation}"
     );
 }
 
