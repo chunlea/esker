@@ -16,10 +16,11 @@
 //! * **Bounded.** The search is exponential in the worst case, so it runs against a step
 //!   budget and reports [`CheckOutcome::Inconclusive`] rather than hanging a test. A checker
 //!   that hangs is a checker that gets deleted.
-//! * **An unknown result is not a free pass.** An operation that timed out may have taken
-//!   effect or not, so it is given a wildcard result and — if it never responded — an
-//!   infinite response time, which lets it be linearized anywhere after its invocation
-//!   *including at the very end*, where it is indistinguishable from never having happened.
+//! * **An unknown result is not a free pass, and not a claim either.** An operation that timed
+//!   out may have taken effect or not, so it is given a wildcard result *and* an unbounded
+//!   response time: the search may place it anywhere after its invocation, including at the
+//!   very end, where nothing observes it and it is indistinguishable from never having
+//!   happened. What it may not do is invent a value nobody wrote.
 //!
 //! # Example
 //!
@@ -147,6 +148,9 @@ pub enum Completion<O> {
     /// It responded at `at`, but what it did is unknown — a timeout, a dropped connection, an
     /// ambiguous error. It may or may not have taken effect, and the checker must consider
     /// both.
+    ///
+    /// `at` is kept for the report and is deliberately *not* used to bound the operation:
+    /// see [`Completion::response_time`].
     Unknown {
         /// When the client gave up.
         at: u64,
@@ -156,12 +160,22 @@ pub enum Completion<O> {
 }
 
 impl<O> Completion<O> {
-    /// When the operation stopped being able to affect other operations. A pending operation
-    /// never does, so it gets `u64::MAX`.
+    /// When the operation stopped being able to affect other operations.
+    ///
+    /// Only a completion that *said what it did* bounds anything. An operation whose outcome is
+    /// unknown may or may not have taken effect at all, so it is unbounded exactly like a
+    /// pending one: the checker may place it anywhere after its invocation, including at the
+    /// very end, where nothing observes it and it is indistinguishable from never having
+    /// happened.
+    ///
+    /// Bounding it by the moment the client gave up would be a different and wrong claim — that
+    /// it definitely happened, and happened by then. A three-node cluster losing its leader
+    /// produces those constantly, and a checker that insists they all happened rejects
+    /// histories that are perfectly legal. That is how this was found.
     fn response_time(&self) -> u64 {
         match self {
-            Completion::Ok { at, .. } | Completion::Unknown { at } => *at,
-            Completion::Pending => u64::MAX,
+            Completion::Ok { at, .. } => *at,
+            Completion::Unknown { .. } | Completion::Pending => u64::MAX,
         }
     }
 

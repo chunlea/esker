@@ -225,6 +225,46 @@ fn an_unknown_response_takes_any_result() {
     );
 }
 
+/// An operation whose outcome the client never learned may not have happened at all, so the
+/// checker has to be free to place it *after* everything that did. Bounding it by the moment
+/// the client gave up would claim it happened, and reject histories that are perfectly legal.
+///
+/// A three-node cluster losing its leader produces exactly this shape constantly, which is
+/// where it was found: an ambiguous write in the middle of a run, followed by a
+/// compare-and-swap that succeeded against the value from *before* it.
+#[test]
+fn an_ambiguous_write_may_be_placed_after_everything_that_followed_it() {
+    let mut history = History::new();
+    let settled = history.invoke(1, RegisterInput::Write(value(1)));
+    history.respond(settled, RegisterOutput::Written).unwrap();
+
+    // The client asked, and never learned. It responded — so it is not pending — but what it
+    // did is unknown.
+    let ambiguous = history.invoke(2, RegisterInput::Write(value(9)));
+    history.respond_unknown(ambiguous).unwrap();
+
+    // ...and afterwards, a swap from the *earlier* value succeeds, which is only possible if
+    // the ambiguous write never took effect before it.
+    let swap = history.invoke(
+        3,
+        RegisterInput::Cas {
+            expected: Some(value(1)),
+            new: value(2),
+        },
+    );
+    history
+        .respond(swap, RegisterOutput::Swapped(true))
+        .unwrap();
+    let read = history.invoke(3, RegisterInput::Read);
+    history.respond(read, read_of(2)).unwrap();
+
+    let outcome = check(&history);
+    assert!(
+        outcome.is_linearizable(),
+        "an ambiguous write was treated as having definitely happened:\n{outcome}"
+    );
+}
+
 #[test]
 fn an_empty_history_is_linearizable() {
     let history: History<RegisterInput, RegisterOutput> = History::new();
