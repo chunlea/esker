@@ -149,16 +149,22 @@ impl Failure {
     }
 }
 
-fn run_load(seconds: u64) {
-    let harness = start();
-    let deadline = Instant::now() + Duration::from_secs(seconds);
+/// What one run of the load produced.
+struct Outcome {
+    /// Which writes each client was told had succeeded.
+    acked_by_client: BTreeMap<u32, Vec<u64>>,
+    failures: Vec<Failure>,
+    operations: u64,
+}
+
+/// Puts `CLIENTS` clients on the store until `deadline`, and collects what happened.
+fn drive(addr: SocketAddr, deadline: Instant) -> Outcome {
     let stop = Arc::new(AtomicBool::new(false));
     let failures: Arc<Mutex<Vec<Failure>>> = Arc::new(Mutex::new(Vec::new()));
     let operations = Arc::new(AtomicU64::new(0));
 
     let workers: Vec<_> = (0..CLIENTS)
         .map(|client| {
-            let addr = harness.addr;
             let stop = Arc::clone(&stop);
             let failures = Arc::clone(&failures);
             let operations = Arc::clone(&operations);
@@ -225,12 +231,27 @@ fn run_load(seconds: u64) {
     }
     stop.store(true, Ordering::Relaxed);
 
+    Outcome {
+        acked_by_client,
+        failures: Arc::try_unwrap(failures)
+            .expect("every worker is done")
+            .into_inner()
+            .unwrap(),
+        operations: operations.load(Ordering::Relaxed),
+    }
+}
+
+fn run_load(seconds: u64) {
+    let harness = start();
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let Outcome {
+        acked_by_client,
+        failures,
+        operations,
+    } = drive(harness.addr, deadline);
+
     // -- what the store said -------------------------------------------------------------
 
-    let failures = Arc::try_unwrap(failures)
-        .expect("every worker is done")
-        .into_inner()
-        .unwrap();
     let busy = failures.iter().filter(|f| f.is_server_busy()).count();
     let other: Vec<&Failure> = failures.iter().filter(|f| !f.is_server_busy()).collect();
 
@@ -245,9 +266,8 @@ fn run_load(seconds: u64) {
 
     assert!(
         other.is_empty(),
-        "{} of {} operations failed with something other than ServerIsBusy: {:?}",
+        "{} of {operations} operations failed with something other than ServerIsBusy: {:?}",
         other.len(),
-        operations.load(Ordering::Relaxed),
         other
             .iter()
             .map(|f| (f.operation, f.error.to_string()))
@@ -291,10 +311,8 @@ fn run_load(seconds: u64) {
         "no client acknowledged a single write, so the run proved nothing"
     );
     println!(
-        "load: {CLIENTS} clients, {}s, {} operations, {verified} acknowledged writes verified, \
-         {busy} ServerIsBusy, {stalls} engine stalls, {slowdowns} slowdowns",
-        seconds,
-        operations.load(Ordering::Relaxed),
+        "load: {CLIENTS} clients, {seconds}s, {operations} operations, {verified} acknowledged \
+         writes verified, {busy} ServerIsBusy, {stalls} engine stalls, {slowdowns} slowdowns"
     );
 }
 
