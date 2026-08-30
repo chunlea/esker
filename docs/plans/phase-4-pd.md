@@ -356,16 +356,31 @@ and applied index an operator's progress is read from.
 
 ### 13.1 The numbers
 
-100 regions at 60/30/10 across three stores settle to **[33, 34, 33] in two rounds**; leadership
-at 60/30/10 settles to **[34, 33, 33] in one**. A thousand further rounds produce **no operator at
-all** — which is the assertion that matters, because a balancer that converges and then churns
-looks identical to a settled one in a snapshot of the counts.
+100 regions at 60/30/10 across three stores settle to **[33, 34, 33]**, leadership at 60/30/10 to
+**[34, 33, 33]**, and a thousand further rounds produce **no operator at all** — the assertion
+that matters, because a balancer that converges and then churns looks identical to a settled one
+in a snapshot of the counts.
 
-The region convergence costs 120 operators against a theoretical minimum near 54. A region on the
-middle store moves to the empty store early and a region from the full store then takes its
-place: every decision was right when it was made, and only the whole sequence is more than the
-minimum. That is the price of deciding one region at a time on its own heartbeat, and ADR 0018
-argues it is worth paying.
+Region convergence costs **85 operators against a floor of 81** (27 moves of three steps, since a
+move whose replica is the leader's transfers the office first); leadership costs 28 against 26.
+Without the in-flight cap the region figure is 417, which is what the cap is for.
+
+### 13.1.1 Three bugs, and what found them
+
+The first version of these tests converged in two rounds and 120 operators, and all of it was
+wrong. The fairness model gave its regions **no leader**, and "settled" meant *the counts look
+even* — under which a cluster with 58 half-finished moves passes, because a region mid-move is
+counted on both its stores.
+
+Giving every region a real leader and redefining settled as *PD has stopped asking for anything,
+and the replica count still equals the region count* turned up three bugs at once (ADR 0018): a
+region whose only replica leads it could never move; finishing a move could drop the replica just
+added; and a transfer that was finishing a move was subject to the cooldown, stranding the region
+on two stores. The last is why the in-flight cap the brief asked for — and which I had skipped as
+unnecessary — is not optional: a half-done move corrupts the numbers every later decision uses.
+
+The lesson is the ordinary one, and worth the entry: a model that is easier than reality tests
+something easier than reality.
 
 ### 13.2 Changes vs the brief
 
@@ -383,17 +398,20 @@ argues it is worth paying.
 4. **The 1,000-round soak is `--ignored`; 100 rounds run inline.** A hundred rounds is twenty
    cooldown periods, so anything that oscillates does it many times over before the inline run is
    done; the full thousand is one `--ignored` command away.
-5. **A cooling region may still finish its own move.** The cooldown stops a region being picked up
-   again; stranding it over-replicated for five minutes with the second half of its own move
-   outstanding is not what it is for.
+5. **Nothing that pauses a move may apply to the steps that finish one.** Neither the cooldown nor
+   the in-flight cap. The cooldown stops a region being picked up again and the cap stops too many
+   being picked up at once; stranding a region on two stores is what both would otherwise do.
+6. **The in-flight cap was built after all.** §13.3 of an earlier draft argued effective counts
+   made it unnecessary. They do not: they correct for the operator, not for a replica that
+   genuinely exists in two places until its move finishes.
 
 ### 13.3 Not built, deliberately
 
 - **No global optimiser.** ADR 0018 records why the greedy per-region rule is the right trade
   under a heartbeat-driven scheduler, and what it costs.
-- **No store-level operator limit.** Effective counts make one unnecessary for convergence; if a
-  future workload wants to cap concurrent movement for I/O reasons rather than for correctness,
-  that is a knob and not a redesign.
+- **No *per-store* operator limit.** The cap is cluster-wide. If a future workload wants to bound
+  movement per store for I/O reasons rather than for arithmetic, that is a knob and not a
+  redesign.
 - **No `esker-cli region` subcommands.** `region ls / split / transfer-leader` are the store
   lane's unit 3.
 
