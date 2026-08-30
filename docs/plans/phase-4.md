@@ -1,6 +1,6 @@
 # Phase 4 plan — many regions, and the driver that places them
 
-Status: **in progress** — 4a and 4b accepted, 4c open, 4d–4e gated. Written before implementation; §9 records progress
+Status: **in progress** — 4a and 4b accepted, 4c done, 4d–4e gated. Written before implementation; §9 records progress
 and §10 what changed. Spec: `prompts/04-multiraft-pd.md`. Constitution: `CLAUDE.md` (invariant 5 is
 this phase's whole subject). Design: `docs/DESIGN.md` §2, §6, §7, §9, §14.
 
@@ -45,7 +45,7 @@ wire. So:
 |---|---|---|
 | 4a | Regions and routing: many `RawNode`s per store, ownership checks, PD v1, the client's cache | **accepted** |
 | 4b | Split: size check, split key, the `Split` admin entry through Raft, epoch bumps | **done** (§12) |
-| 4c | Snapshot transfer and peer movement: `checkpoint(range)` streamed, `AddPeer`/`RemovePeer`, replica repair | now (§13) |
+| 4c | Snapshot transfer and peer movement: the region streamed, `AddPeer`/`RemovePeer` | **done** (§13) |
 | 4d | Balance: leader and region-count operators, `esker-cli region ls/split/transfer-leader` | after 4c |
 | 4e | PD high availability: three PDs replicated with `esker-raft`, TSO high-water mark through Raft | after 4d |
 
@@ -563,12 +563,10 @@ same number to decide whether a transfer is safe.
 | 0 | This section | `docs/plans/phase-4.md` | `bea2207` |
 | 1 | `Db::approximate_size`, and 4b's byte counter replaced by it | `esker-engine/src/db/**` (granted), `esker-store/src/split.rs`, `server.rs` | `4c28990` |
 | 2 | Raft log compaction: `'s'`'s truncation fields written, a real `LogStorage::snapshot` | `esker-store/src/raft_log.rs`, `peer.rs` | `8005736` |
-| 3 | Send: `checkpoint(range)` → `Stream` frames, chunked and checksummed | `esker-store/src/snapshot.rs` (NEW), `esker-proto/src/messages.rs` | open |
-| 4 | Receive: the four steps of §13.1, and the restart that resumes them | `esker-store/src/snapshot.rs`, `meta.rs`, `server.rs` | open |
-| 5 | `AddPeer`/`RemovePeer`: conf-change entries, learner first | `esker-store/src/apply.rs`, `peer.rs`, `regions.rs` | open |
-| 6 | Operators from heartbeat responses: propose, dedupe, drop the stale | `esker-store/src/heartbeat.rs`, `pd.rs` | open |
-| 7 | The test battery | `esker-store/tests/snapshot.rs` (NEW), `tests/cluster.rs` | open |
-| 8 | DESIGN §6's Snapshots bullet, and this section closed | `docs/DESIGN.md`, this plan | open |
+| 3–4 | Send and receive: the stream, and the four steps of §13.1 | `esker-store/src/snapshot.rs` (NEW), `meta.rs`, `server.rs`, `esker-proto` | `8e67246` |
+| 5–6 | `AddPeer`/`RemovePeer` and the operators that ask for them | `esker-store/src/apply.rs`, `peer.rs`, `regions.rs`, `heartbeat.rs`, `pd.rs` | `5cddb25` |
+| 7 | The test battery | `esker-store/tests/snapshot.rs` (NEW) | `33e95e9` |
+| 8 | DESIGN §6 and §14, and this section closed | `docs/DESIGN.md`, this plan | *(this commit)* |
 
 Units 1 and 2 are the foundations the rest stands on and neither existed before: there was no way
 to ask the engine how large a key range is, and **nothing ever compacted a Raft log**, so
@@ -652,3 +650,58 @@ rule as `91de89a`, same reason, third place it applies.
 - **`TransferLeader`.** The operator variant is reserved in the contract and ignored here. 4d.
 - **Merge, balance, `esker-cli region`.** Post-v1 and 4d.
 - **Resuming a partial snapshot.** See 13.4.
+
+### 13.7 What 4c changed against §13.4
+
+Five decisions were written down before the code. Three held exactly. The other two were wrong in
+ways only the battery could show, and both are worth reading.
+
+1. **Key-value pairs, not `checkpoint` + `ingest`.** §13.2 knew `ingest` refuses overlap; what it
+   missed is that a checkpoint links *whole files*, and a file straddles a region boundary. The
+   receiver would be handed its neighbour's keys — data it has no claim to, and which `ingest`
+   itself refuses if that neighbour lives on the same store. Range-precision is not something file
+   granularity can offer, so the stream is pairs. DESIGN §6 is updated with the reasoning and the
+   `TODO(post-v1)` that makes the link-only transfer possible again.
+
+2. **The promotion criterion in §13.4 was unsafe.** It said: promote once "the snapshot transfer
+   completed and the leader has since committed an entry in a term it still leads in". The second
+   half is a fact about the *leader* and says nothing about the learner, and the first was never
+   wired to the promotion at all — so what shipped promoted immediately. A learner with no data
+   entered the quorum, the group stopped committing, and the conf change waited for an apply that
+   could not happen, wedging the heartbeat round that carried it.
+
+   **Promotion is PD's call now**, on the contract as it stands: `AddPeer` for an unknown peer adds
+   a learner, the same operator for a peer already a learner promotes it. That is where the
+   information is — PD sees every store's region heartbeats, including the learner's own
+   `applied_index`, and the leader sees neither. The `Progress` accessor §13.2 asked for would let
+   a leader decide for itself; until then this is not a workaround but the better placement, and
+   4d should weigh keeping it there.
+
+3. **A store with no region cannot ask Raft for a snapshot.** The intended flow was the ordinary
+   one: the follower rejects an `AppendEntries`, the leader backs off past its own log start and
+   offers a snapshot. A store that does not host the region has no peer to reject *with*, so it
+   drops the message, the leader sees no rejection and offers nothing. **The traffic itself is the
+   signal**: any Raft message for an unhosted region makes the store ask its sender for that
+   region. A store legitimately removed from a region asks too and is refused, by the sender's
+   membership check — which is the right place for it.
+
+4. **`RaftOptions::peers` was doing two jobs.** It is the address book — where a peer id can be
+   found — and it was also the bootstrap membership, so a store could not know how to reach a peer
+   it was about to be told it had. `bootstrap_voters` separates them.
+
+5. **An operator's proposal is bounded by a timeout.** Nothing said what happens when a membership
+   change cannot reach a quorum; the answer was "the heartbeat schedule stops", which closes the
+   only channel PD has to correct its own mistake.
+
+### 13.8 Still open after 4c
+
+* **Catching up an existing peer by snapshot.** Only a range this store holds nothing in can
+  receive one (§13.2). A peer that fell behind *and* has data is refused and stays behind. The
+  engine's v2 sequence-number rewriting is what removes the restriction.
+* **`esker-raft` has no per-peer `Progress`.** Requested for 4d, where the balance operators want
+  the same number to decide whether a transfer is safe.
+* **Replica repair end to end** — a store killed for good, PD noticing and issuing the operators,
+  three replicas restored. The store side is complete and tested against a fake driver that issues
+  operators; the scheduler that decides to issue them is the placement-driver lane's.
+* **`RemovePeer` leaves the region's data.** Reclaiming it needs a range delete the engine does not
+  have.

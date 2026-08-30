@@ -325,8 +325,44 @@ Regions cover the whole key space contiguously; the first region is `["", "")`.
     refusal is deterministic, which is the only kind apply may make.
   - **Replay is idempotent by the range.** After the split, `split_key` is no longer strictly inside the
     parent, so a re-applied entry does nothing. There is no marker to write and nothing to keep in step.
-- **Snapshots** *(phase 4 — TODO(phase-4) markers in raft_log.rs/peer.rs)*: `engine.checkpoint(range)` → SSTs + metadata, streamed as `Stream` frames in 1 MiB
-  chunks with checksums; receiver `ingest()`s into place then applies the Raft snapshot metadata.
+- **Snapshots:** a peer whose next index is below the leader's first index has a hole no
+  `AppendEntries` can fill, so it is sent the region's *state*. The **receiver asks**
+  (`RaftTransport::Snapshot`, §9) and the leader answers with a run of `Stream` frames in 1 MiB
+  chunks, each checksummed; the `InstallSnapshot` Raft message is only the announcement and carries
+  no data, because the core reads nothing but its metadata (§5).
+  - **Key-value pairs, not SST files, in v1.** §6 originally described `engine.checkpoint(range)` →
+    `ingest()`, and two things stop it: a checkpoint links *whole files* and a file straddles a
+    region boundary, so the receiver would get its neighbour's keys; and `Db::ingest` refuses any
+    overlap including tombstones (§4.1), so a receive retried after a partial one could never
+    ingest again. The bytes cross a network either way, so what is given up is one write on the
+    receiver. `TODO(post-v1)`: sequence-number rewriting plus a range-clipped checkpoint makes the
+    link-only transfer possible, and only `esker-store/src/snapshot.rs` changes.
+  - **A snapshot is never half-visible**, which is the property everything else is arranged around.
+    The receive is four durable steps — announce, stage, ingest, adopt — and nothing serves the
+    region until the last. A crash leaves an announcement record naming the region, and the next
+    open clears the keys that record's *range* names, so the retry finds the empty range it needs.
+  - **Only into a range this store holds nothing in**, which is the case a new replica is. A peer
+    that already has data is refused and stays behind; PD sees it in the heartbeats.
+- **Membership:** `AddPeer` and `RemovePeer` ride on the answer to a region heartbeat (§7) and the
+  leader proposes the matching conf-change entry. The **store id of a new replica travels in the
+  change's context**, which `esker-raft` never interprets — so the core moves the membership and
+  the store moves the region's peer list and `conf_ver` from the same entry.
+  - **Learner first.** An `AddPeer` for an unknown peer adds a *learner*, which receives the log
+    without voting and so never makes a quorum harder to reach while it catches up. The same
+    operator for a peer that is already a learner is the **promotion** — and it is PD's call, not
+    the leader's, because "has it caught up" is a comparison of two stores' applied indices and PD
+    is the only party that sees both. A leader promoting on a guess puts a peer with no data into
+    the quorum and the group stops committing.
+  - **`RemovePeer` tears down the raft state and leaves the data.** Removing the keys means point
+    deletes over the range (no range tombstones in v1, ADR 0006), and the tombstones that leaves
+    are keys in the range — which is exactly the state that stops the range ever receiving a
+    snapshot again. The keys stay, no region covers them, and nothing serves them.
+- **Log compaction:** a peer throws away the head of its log once the apply index has run
+  `RAFT_LOG_COMPACT_THRESHOLD` entries past the truncation point, keeping `RAFT_LOG_KEEP_ENTRIES`
+  behind it so that a follower one entry behind does not need a snapshot. The record written with
+  the truncation carries the term of the entry the log now begins after and **the membership as of
+  that index** — not the membership in force, which a conf change above the index has already
+  moved.
 - **Transport:** one TCP connection per (store, store) pair carrying `RaftTransport::Batch` frames with
   `RaftMessage`s for all regions, batched per tick.
 - **Heartbeats:** store heartbeat (capacity, load, region and leader counts) every 10 s; region heartbeat
@@ -492,7 +528,8 @@ and `esker-txn`'s `Prewrite` will need the same distinction (§8).
 Methods: `RawKv { Get, BatchGet, Put, BatchPut, Delete, DeleteRange, Scan, CompareAndSwap }`
 (namespace `'r'`), `TxnKv { Get, Scan, Prewrite, Commit, Rollback, ResolveLock, Heartbeat, GcSafepoint }`
 (namespace `'x'`), `Pd { Bootstrap, StoreHeartbeat, RegionHeartbeat, GetRegion, AllocId, Tso }`,
-`RaftTransport { Batch }`. Every KV request carries `{ region_id, epoch, peer }` and every error is a
+`RaftTransport { Batch, Snapshot }` — `Snapshot` is the one **streamed** method, answered with a run
+of `Stream` frames rather than a `Response` (§6). Every KV request carries `{ region_id, epoch, peer }` and every error is a
 typed enum with redirect hints (`NotLeader{leader_hint}`, `EpochNotMatch{current_regions}`,
 `KeyNotInRegion`, `ServerIsBusy`, `Locked{lock_info}`). A `Pd` request carries the **cluster id** in
 place of the region header, since PD's answers are about the routing table rather than about a region,
@@ -599,7 +636,10 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
 | region split size | 96 MiB |
 | raft tick / election / heartbeat | 100 ms / 10–20 ticks / 2 ticks |
 | max inflight raft msgs | 256 |
-| store / region heartbeat | 10 s / 60 s |
+| store / region heartbeat | 10 s / 60 s — the region interval is also the latency of a PD operator, which has no other way to reach a store |
+| raft log compact threshold / tail kept | 4096 / 1024 entries |
+| snapshot chunk / stream depth | 1 MiB / 4 chunks |
+| PD operator timeout (store side) | 5 s |
 | PD id allocation batch | 1,000 ids per persist |
 | PD TSO save interval | 3 s ahead of what is handed out |
 | `max_store_down_time` | 30 s |
