@@ -1,0 +1,14 @@
+crates/esker-proto/src/error.rs
+  h_44076b318daf9c 155-163,166
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "7ac5bb7758d5f415a2de0c27e93e5bf06192684e",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
