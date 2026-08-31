@@ -324,8 +324,15 @@ fn agree(
 ) -> std::result::Result<(), String> {
     let expected = reference(rows, fragment);
     for prune in [true, false] {
-        let actual =
-            evaluate_with(reader, fragment, ScanOptions { prune }).map(|result| result.output);
+        let actual = evaluate_with(
+            reader,
+            fragment,
+            &ScanOptions {
+                prune,
+                visibility: None,
+            },
+        )
+        .map(|result| result.output);
         match (&expected, &actual) {
             (Ok(expected), Ok(actual)) => {
                 if !same_output(expected, actual) {
@@ -608,7 +615,7 @@ fn the_answer_does_not_depend_on_where_stripes_fall() {
         let (_fs, reader) = write(&rows, stripe_rows);
         assert!(agree(&reader, &rows, &fragment).is_ok());
         answers.push(
-            evaluate_with(&reader, &fragment, ScanOptions::default())
+            evaluate_with(&reader, &fragment, &ScanOptions::default())
                 .unwrap()
                 .output,
         );

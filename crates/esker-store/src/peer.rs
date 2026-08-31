@@ -178,6 +178,18 @@ pub enum PeerMsg {
     ReadIndex {
         /// Where the index goes.
         notify: oneshot::Sender<std::result::Result<Index, ProtoError>>,
+        /// Whether this peer must **lead** to answer.
+        ///
+        /// `true` for a row read, because only the leader serves those: a follower asked for one
+        /// should be redirected, not made to run a round it will not use the answer to.
+        ///
+        /// `false` for a columnar learner satisfying a fragment's `min_apply_index`
+        /// (ADR 0022 Decision 4). A learner cannot lead and never will, but it *can* establish a
+        /// read index — `esker-raft` forwards the request to the leader and the leader answers any
+        /// forwarder, with the only voter check being the quorum count of heartbeat acks, which
+        /// correctly excludes learners. So refusing here on the strength of the role would deny a
+        /// learner a mechanism raft already gives it.
+        require_leader: bool,
     },
     /// A snapshot of what this peer believes, for the request path and for tests.
     Status(oneshot::Sender<Status>),
@@ -978,7 +990,10 @@ impl PeerCore {
             PeerMsg::ProposeConfChange { change, notify } => {
                 self.propose_conf_change(change, notify);
             }
-            PeerMsg::ReadIndex { notify } => self.read_index(notify),
+            PeerMsg::ReadIndex {
+                notify,
+                require_leader,
+            } => self.read_index(notify, require_leader),
             PeerMsg::Status(notify) => {
                 let _ = notify.send(self.node.status());
             }
@@ -1081,8 +1096,17 @@ impl PeerCore {
         });
     }
 
-    fn read_index(&mut self, notify: oneshot::Sender<std::result::Result<Index, ProtoError>>) {
-        if self.node.role() != Role::Leader {
+    /// Establishes a read index, for a caller that is entitled to one.
+    ///
+    /// The guard is about **what the caller is entitled to**, not about the role. A row read needs
+    /// leadership because only a leader serves rows; a fragment needs only that a round can
+    /// complete, which a learner can do by forwarding (see [`PeerMsg::ReadIndex::require_leader`]).
+    fn read_index(
+        &mut self,
+        notify: oneshot::Sender<std::result::Result<Index, ProtoError>>,
+        require_leader: bool,
+    ) {
+        if require_leader && self.node.role() != Role::Leader {
             let _ = notify.send(Err(self.not_leader()));
             return;
         }
@@ -1356,9 +1380,33 @@ impl RaftPeer {
     }
 
     /// Establishes a linearizable read, returning once the state machine has applied through it.
+    ///
+    /// Refuses on a peer that does not lead, because only a leader serves row reads.
     pub async fn read_index(&self) -> std::result::Result<Index, ProtoError> {
+        self.read_index_inner(true).await
+    }
+
+    /// [`RaftPeer::read_index`] for a peer that will never lead.
+    ///
+    /// A columnar learner satisfies a fragment's `min_apply_index` with exactly this round
+    /// (ADR 0022 Decision 4): `esker-raft` forwards it to the leader, and the leader answers any
+    /// forwarder. Separate from [`RaftPeer::read_index`] rather than a loosened version of it, so
+    /// that the row path keeps its redirect and no caller gets the learner's behaviour by
+    /// accident.
+    pub async fn read_index_as_learner(&self) -> std::result::Result<Index, ProtoError> {
+        self.read_index_inner(false).await
+    }
+
+    async fn read_index_inner(
+        &self,
+        require_leader: bool,
+    ) -> std::result::Result<Index, ProtoError> {
         let (notify, answer) = oneshot::channel();
-        self.send(PeerMsg::ReadIndex { notify }).await?;
+        self.send(PeerMsg::ReadIndex {
+            notify,
+            require_leader,
+        })
+        .await?;
         answer
             .await
             .map_err(|_| ProtoError::internal("the Raft peer stopped"))?

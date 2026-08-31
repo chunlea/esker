@@ -30,6 +30,7 @@
 //! the footer, which is the extreme case of the property this crate exists for.
 
 pub mod group;
+pub mod visible;
 
 use std::collections::BTreeMap;
 
@@ -97,8 +98,19 @@ pub struct FragmentResult {
 }
 
 /// How a scan is run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// No longer `Copy`: [`ScanOptions::visibility`] owns the key columns it names, and a scan's
+/// switches are set once per scan rather than in a loop, so cloning them costs nothing worth
+/// keeping a `Copy` bound for.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanOptions {
+    /// Resolve MVCC versions while scanning, keeping the newest visible one per key.
+    ///
+    /// `None` scans every row in the file, which is what a run of one version per key wants and
+    /// what M1 and M2 were written against. `Some` is a columnar learner answering a fragment at a
+    /// read timestamp (ADR 0022 Decision 4) — see [`visible`] for why this is a mode rather than a
+    /// filter, and why it **turns pruning off**.
+    pub visibility: Option<visible::Visibility>,
+
     /// Whether to skip stripes whose statistics rule them out.
     ///
     /// A switch rather than a constant, for the reason ADR 0022 gives for the session GUC it
@@ -112,7 +124,10 @@ pub struct ScanOptions {
 
 impl Default for ScanOptions {
     fn default() -> Self {
-        Self { prune: true }
+        Self {
+            prune: true,
+            visibility: None,
+        }
     }
 }
 
@@ -121,14 +136,14 @@ impl Default for ScanOptions {
 /// Every refusal happens in [`Fragment::validate`], before a byte is read, so a fragment that
 /// gets past the first line here will be evaluated in full or fail on damaged data.
 pub fn evaluate(reader: &Reader, fragment: &Fragment) -> Result<FragmentResult> {
-    evaluate_with(reader, fragment, ScanOptions::default())
+    evaluate_with(reader, fragment, &ScanOptions::default())
 }
 
 /// [`evaluate`], with the scan's switches exposed.
 pub fn evaluate_with(
     reader: &Reader,
     fragment: &Fragment,
-    options: ScanOptions,
+    options: &ScanOptions,
 ) -> Result<FragmentResult> {
     let slots = fragment.validate(reader.schema())?;
     let needed = needed_slots(fragment, slots.len());
@@ -138,6 +153,9 @@ pub fn evaluate_with(
     }
 
     let mut stats = ScanStats::default();
+    // Carried across stripes: a key's versions may span them, so "already settled" is a fact about
+    // the scan and not about one stripe.
+    let mut resolver = visible::Resolver::default();
     let mut rows = Vec::new();
     let mut groups: BTreeMap<GroupKey, Vec<Accumulator>> = BTreeMap::new();
     let limit = match &fragment.output {
@@ -150,7 +168,15 @@ pub fn evaluate_with(
         if limit.is_some_and(|limit| stats.rows_matched >= limit) {
             continue;
         }
-        if options.prune && !stripe_can_match(stripe, &conjuncts, fragment, &slots) {
+        // **Pruning is unsound under visibility**, so `Visibility` overrides the switch rather
+        // than trusting the caller to have turned it off. Pruning skips a stripe that cannot match
+        // the *filter*, but visibility chooses the candidate row *before* the filter sees it, so a
+        // pruned stripe can hide the version that should have won and let an overwritten one
+        // through. `visible`'s header works the case through.
+        if options.prune
+            && options.visibility.is_none()
+            && !stripe_can_match(stripe, &conjuncts, fragment, &slots)
+        {
             continue;
         }
         stats.stripes_read += 1;
@@ -162,6 +188,16 @@ pub fn evaluate_with(
             .map(|column| column.as_ref().map(Column::iter))
             .collect();
 
+        let visibility_columns = match &options.visibility {
+            Some(visibility) => Some(visibility.columns(reader, index)?),
+            None => None,
+        };
+        let mut visibility_cursors: Vec<crate::column::ColumnIter<'_>> = visibility_columns
+            .iter()
+            .flatten()
+            .map(Column::iter)
+            .collect();
+
         let mut row: Vec<ValueRef<'_>> = vec![ValueRef::Null; slots.len()];
         for _ in 0..stripe.rows {
             for (slot, cursor) in cursors.iter_mut().enumerate() {
@@ -171,6 +207,11 @@ pub fn evaluate_with(
                     .unwrap_or(ValueRef::Null);
             }
             stats.rows_scanned += 1;
+            if let Some(visibility) = &options.visibility
+                && !next_is_visible(visibility, &mut visibility_cursors, &mut resolver)
+            {
+                continue;
+            }
             if let Some(filter) = &fragment.filter
                 && !filter.matches(&row)
             {
@@ -283,6 +324,32 @@ fn decode_needed(
 }
 
 /// Which projection slots something in the fragment actually names.
+/// Advances the version cursors one row and says whether that row is the visible one.
+///
+/// Split out of [`evaluate_with`] to keep it readable, and because "is this row visible" is a
+/// question about the *run's* columns rather than about the fragment's slots — the two sets are
+/// independent, and a fragment need not project a single column this reads.
+fn next_is_visible(
+    visibility: &visible::Visibility,
+    cursors: &mut [crate::column::ColumnIter<'_>],
+    resolver: &mut visible::Resolver,
+) -> bool {
+    let mut seen: Vec<ValueRef<'_>> = Vec::with_capacity(cursors.len());
+    for cursor in cursors.iter_mut() {
+        seen.push(cursor.next().unwrap_or(ValueRef::Null));
+    }
+    let keys = visibility.key_columns.len();
+    let commit_ts = match seen.get(keys) {
+        Some(ValueRef::Int(ts)) => *ts,
+        // A run whose timestamp column is not an integer is one this build did not write.
+        // Treating it as the beginning of time hides nothing: it can only ever be a candidate,
+        // and the key still settles on it.
+        _ => i64::MIN,
+    };
+    let deleted = matches!(seen.get(keys + 1), Some(ValueRef::Bool(true)));
+    resolver.visible(&seen[..keys], commit_ts, deleted, visibility.ts)
+}
+
 fn needed_slots(fragment: &Fragment, width: usize) -> Vec<bool> {
     fn mark(needed: &mut [bool], slot: u32) {
         if let Some(entry) = needed.get_mut(slot as usize) {

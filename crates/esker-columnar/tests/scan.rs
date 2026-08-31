@@ -266,7 +266,15 @@ fn pruning_changes_nothing_but_the_work() {
         let mut fragment = Fragment::scan(table(), vec![0, 1, 2, 3]);
         fragment.filter = Some(filter.clone());
         let pruned = evaluate(&reader, &fragment).unwrap();
-        let whole = evaluate_with(&reader, &fragment, ScanOptions { prune: false }).unwrap();
+        let whole = evaluate_with(
+            &reader,
+            &fragment,
+            &ScanOptions {
+                prune: false,
+                visibility: None,
+            },
+        )
+        .unwrap();
         assert_eq!(pruned.output, whole.output, "pruning changed {filter:?}");
         assert!(
             pruned.stats.stripes_read <= whole.stats.stripes_read,
