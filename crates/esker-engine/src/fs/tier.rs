@@ -98,7 +98,7 @@ pub struct TierOptions {
     /// Who this database is, for the prefix's claim marker. `None` skips the claim entirely,
     /// which is what the tier's own unit tests and any single-prefix embedding want.
     ///
-    /// See [`claim`](super::claim): a prefix is claimed by the first database to open it, and a
+    /// See [`super::claim`]: a prefix is claimed by the first database to open it, and a
     /// database that is not the claimant is refused rather than left to overwrite the other's
     /// SSTs in silence.
     pub identity: Option<Identity>,
