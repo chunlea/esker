@@ -768,14 +768,21 @@ impl Transaction {
     /// The order is the mirror of the commit's, and for the same reason: **the primary is
     /// settled first**, and everything else follows the fact it leaves behind.
     fn resolve(&self, lock: &LockInfo, keys: Vec<Bytes>, attempt: u32) -> Result<()> {
-        let Some(verdict) = self.classify(lock)? else {
+        let verdict = match self.classify(lock)? {
+            Classified::Settled(verdict) => verdict,
             // Its owner is inside its lease. Waiting is the whole answer: the caller retries,
             // and by then the owner has committed, or its lease has run out and this returns a
             // verdict instead. Killing it here would abort a live transaction.
-            self.router
-                .clock()
-                .sleep(Duration::from_millis(backoff_ms(attempt)));
-            return Ok(());
+            //
+            // Never longer than the lease has left, because that instant is when the answer
+            // can change: sleeping through it would spend a round of the budget on a lock that
+            // had become settleable while this thread was asleep. The backoff is still the
+            // ceiling — a long lease is waited on the way any other contended resource is.
+            Classified::Alive { lease_ms } => {
+                let wait = backoff_ms(attempt).min(lease_ms).max(1);
+                self.router.clock().sleep(Duration::from_millis(wait));
+                return Ok(());
+            }
         };
         // The primary is already settled — `classify` settled it — so only the rest is left.
         let rest: Vec<Bytes> = keys
@@ -797,15 +804,13 @@ impl Transaction {
     }
 
     /// What the transaction holding `lock` did, settling it if its lease has run out.
-    ///
-    /// `None` is "its owner is still alive" — the one answer that is not a verdict.
-    fn classify(&self, lock: &LockInfo) -> Result<Option<Verdict>> {
+    fn classify(&self, lock: &LockInfo) -> Result<Classified> {
         // From the oracle, not from a clock (`CLAUDE.md` invariant 6). A fresh timestamp
         // rather than this transaction's own `start_ts`: both are conservative, but a reader
         // that began long ago would judge every lock alive for ever and never make progress.
         let now = self.oracle.timestamp()?;
         if !is_expired(lock.start_ts, lock.ttl_ms, now) {
-            return Ok(None);
+            return Ok(Classified::alive(lock, now));
         }
         // The lock in hand may be a *secondary's*, and a `Heartbeat` extends the primary's
         // lease alone — so a secondary's TTL can say "dead" about a transaction whose primary
@@ -815,9 +820,9 @@ impl Transaction {
         if let Some(primary) = self.lock_on_primary(lock)?
             && !is_expired(primary.start_ts, primary.ttl_ms, now)
         {
-            return Ok(None);
+            return Ok(Classified::alive(&primary, now));
         }
-        self.settle_primary(lock).map(Some)
+        self.settle_primary(lock).map(Classified::Settled)
     }
 
     /// The lock the transaction still holds on its own primary, if it holds one.
@@ -867,6 +872,28 @@ impl Transaction {
                 )))),
             },
             other => Err(unexpected(Method::TxnRollback, &other)),
+        }
+    }
+}
+
+/// What a resolver found when it looked at a lock's owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Classified {
+    /// It is finished, one way or the other, and its keys can be settled.
+    Settled(Verdict),
+    /// It is inside its lease, with this many milliseconds of it left.
+    Alive {
+        /// What remains of the lease, in the physical milliseconds of the oracle's timestamps.
+        lease_ms: u64,
+    },
+}
+
+impl Classified {
+    /// A live lock, with what is left of its lease measured against `now`.
+    fn alive(lock: &LockInfo, now: u64) -> Self {
+        let ends_ms = physical_ms(lock.start_ts).saturating_add(lock.ttl_ms);
+        Self::Alive {
+            lease_ms: ends_ms.saturating_sub(physical_ms(now)).saturating_add(1),
         }
     }
 }

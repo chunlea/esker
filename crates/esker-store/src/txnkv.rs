@@ -38,6 +38,8 @@
 //! `esker_txn::key` — the same rule that keeps `'r'` out of `RawKv` requests
 //! (`docs/DESIGN.md` §10).
 
+use std::collections::BTreeSet;
+
 use bytes::Bytes;
 use esker_engine::{Db, ReadOptions, Snapshot, WriteBatch, cf};
 use esker_proto::txn::{LockInfo, TxnStatus};
@@ -231,11 +233,22 @@ pub fn scan(
     Ok(TxnKvResp::Scan { pairs })
 }
 
-/// The distinct user keys with any version in `[start, end)`.
+/// The distinct user keys in `[start, end)` that a read at some timestamp could answer for:
+/// every key with a version, **and every key that is only locked**.
 ///
 /// A scan of the `write` column family sees one entry per *version*, so the keys have to be
 /// collapsed before they are read at a timestamp — otherwise a key rewritten a hundred times
 /// would fill a hundred slots of the caller's limit with one row.
+///
+/// The `lock` column family is the half that is easy to leave out, and leaving it out is a
+/// silent wrong answer. A key prewritten by a transaction that has since **committed its
+/// primary** has a lock and no `write` record: the transaction is committed, so the row exists,
+/// and until someone resolves that lock there is nothing in the `write` CF to find it by. A
+/// scan built from versions alone answers without the row and reports no lock, so the caller
+/// has nothing to resolve and no way to notice — which is the failure `scan`'s own header
+/// promises not to have. Including the key means `read` meets the lock and refuses, the client
+/// resolves it and asks again, and the row appears (or does not, if the transaction was rolled
+/// back) for a reason rather than by luck.
 fn user_keys_in(
     db: &Db,
     snapshot: &EngineSnapshot<'_>,
@@ -249,25 +262,37 @@ fn user_keys_in(
     } else {
         key::prefix(end)
     };
+    // Enough to fill any limit the caller could have asked for, and a bound so a scan of a
+    // region with millions of keys cannot be made to collect them all.
+    let ceiling = MAX_SCAN_LIMIT as usize;
+    // A set rather than a run of adjacent duplicates: the two column families are walked
+    // separately and a key can be in both. Memcomparable order is user-key order, so what
+    // comes out is still sorted.
+    let mut keys: BTreeSet<Vec<u8>> = BTreeSet::new();
 
-    let mut iter = db
+    let mut versions = db
         .iter(cf::WRITE, &snapshot.options)
         .map_err(|error| engine_to_proto(&error))?;
-    let mut keys: Vec<Vec<u8>> = Vec::new();
-    iter.seek(&low);
-    while iter.valid() && iter.key() < high.as_slice() {
-        let (user_key, _) = key::split(iter.key()).map_err(txn_to_proto)?;
-        if keys.last().is_none_or(|last| *last != user_key) {
-            keys.push(user_key);
-        }
-        // Enough to fill any limit the caller could have asked for, and a bound so a scan of a
-        // region with millions of keys cannot be made to collect them all.
-        if keys.len() >= MAX_SCAN_LIMIT as usize {
-            break;
-        }
-        iter.next();
+    versions.seek(&low);
+    while versions.valid() && versions.key() < high.as_slice() && keys.len() < ceiling {
+        let (user_key, _) = key::split(versions.key()).map_err(txn_to_proto)?;
+        keys.insert(user_key);
+        versions.next();
     }
-    iter.status().map_err(|error| engine_to_proto(&error))?;
+    versions.status().map_err(|error| engine_to_proto(&error))?;
+
+    // The same snapshot, so the two halves are one view and not two.
+    let mut locks = db
+        .iter(cf::LOCK, &snapshot.options)
+        .map_err(|error| engine_to_proto(&error))?;
+    locks.seek(&low);
+    while locks.valid() && locks.key() < high.as_slice() && keys.len() < ceiling {
+        keys.insert(key::split_lock(locks.key()).map_err(txn_to_proto)?);
+        locks.next();
+    }
+    locks.status().map_err(|error| engine_to_proto(&error))?;
+
+    let mut keys: Vec<Vec<u8>> = keys.into_iter().collect();
     if reverse {
         keys.reverse();
     }

@@ -634,6 +634,115 @@ async fn a_scan_reads_one_row_per_key_at_its_timestamp() {
     );
 }
 
+/// A key that is **only locked** is part of a scan's answer, not something it walks past.
+///
+/// The lock CF is the whole of a prewritten key's existence: there is no `write` record until
+/// it commits. So a scan built from the `write` column family alone would answer without it —
+/// with no lock reported, nothing for the client to resolve, and no way to tell the difference
+/// between a row that is not there and a row nobody looked in the right place for.
+///
+/// The case that makes it a lost row rather than a slow one: a transaction that has **committed
+/// its primary** in another region and not yet its secondary. It is committed; its row exists;
+/// and until someone resolves that lock the only trace of it here is the lock. That is the
+/// state the bank test's crashed clients leave behind constantly, and it is how this was found.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scan_reports_a_key_that_is_only_locked() {
+    let running = start().await;
+    let transport = TcpTransport::connect(running.handle.local_addr())
+        .await
+        .unwrap();
+
+    commit_one(&transport, b"a", b"1", 10, 20).await;
+    // `b` is prewritten and never committed here: its primary is `a`, which in a real cluster
+    // is where the transaction's fate is written and may well be another region.
+    call(
+        &transport,
+        TxnKvReq::Prewrite {
+            start_ts: 30,
+            primary: key(b"a"),
+            ttl_ms: 3_000,
+            mutations: vec![put(b"b", b"pending")],
+        },
+    )
+    .await
+    .unwrap();
+
+    // A scan at a timestamp above the lock must refuse rather than answer: the row may be
+    // there, and only resolving the lock can say.
+    let refused = call(
+        &transport,
+        TxnKvReq::Scan {
+            start: key(b"a"),
+            end: Bytes::new(),
+            limit: 100,
+            ts: 1_000,
+            reverse: false,
+        },
+    )
+    .await
+    .expect_err("a scan that meets a lock refuses");
+    match refused {
+        ProtoError::Locked { lock_info } => {
+            let lock = LockInfo::decode(&lock_info).expect("a lock the client can read");
+            assert_eq!(lock.key, key(b"b"), "the key that is in the way");
+            assert_eq!(lock.start_ts, 30);
+        }
+        other => panic!("expected a Locked refusal, got {other:?}"),
+    }
+
+    // A scan *below* the lock is unaffected: a lock above the snapshot is not in its way.
+    let older = call(
+        &transport,
+        TxnKvReq::Scan {
+            start: key(b"a"),
+            end: Bytes::new(),
+            limit: 100,
+            ts: 25,
+            reverse: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        older,
+        TxnKvResp::Scan {
+            pairs: vec![(key(b"a"), key(b"1"))]
+        }
+    );
+
+    // Resolved forward — which is what a reader does once it finds the primary committed — and
+    // the row is there.
+    call(
+        &transport,
+        TxnKvReq::ResolveLock {
+            start_ts: 30,
+            commit_ts: 40,
+            keys: vec![key(b"b")],
+        },
+    )
+    .await
+    .unwrap();
+    let after = call(
+        &transport,
+        TxnKvReq::Scan {
+            start: key(b"a"),
+            end: Bytes::new(),
+            limit: 100,
+            ts: 1_000,
+            reverse: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        after,
+        TxnKvResp::Scan {
+            pairs: vec![(key(b"a"), key(b"1")), (key(b"b"), key(b"pending"))],
+        },
+        "the row a committed transaction wrote is in the scan"
+    );
+}
+
 /// The safepoint rises and never falls. A number that moved backwards would promise a reader
 /// history that has already been collected.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
