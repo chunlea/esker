@@ -183,6 +183,15 @@ impl Pd {
     /// Repair first, always: a region a failure away from losing quorum is not a region to
     /// optimise the placement of. Balance is asked only when nothing is broken, the region is
     /// not cooling from its last move, and balancing is switched on at all.
+    ///
+    /// **One region at a time.** PD decides on the beat of the region it is deciding about, so
+    /// there is no queue here to sort: the order repairs are issued in is the order the beats
+    /// arrive, and a region at the quorum boundary is served by its own leader's next heartbeat
+    /// rather than by jumping a line. [`schedule::Urgency`] is the order for anything that sees
+    /// the cluster at once ([`schedule::repairs`]); here it is what the log says about the
+    /// region PD is about to act on, which is how a stretch of `below_quorum` in a debug log
+    /// tells an operator that repair has run out of road
+    /// (`docs/adr/0026-the-quorum-loss-boundary.md`).
     fn plan(
         &self,
         state: &mut State,
@@ -193,6 +202,12 @@ impl Pd {
         state.cooling.retain(|_, until| *until > cluster.now_ms);
 
         if let Some(repair) = schedule::repair_for(record, cluster) {
+            tracing::debug!(
+                region_id = record.region.id,
+                urgency = ?schedule::urgency_for(record, cluster),
+                repair = ?repair,
+                "region is short of its replica target"
+            );
             return Some(Plan::Repair(repair));
         }
         if !self.balance {

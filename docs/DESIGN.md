@@ -481,15 +481,31 @@ log, PD elects a leader, and clients discover it.
   store's own report, because comparing wall clocks across nodes is what invariant 6 forbids. A store PD
   has no record of is *not* down: unknown is not evidence, and a PD that read it as one would try to
   repair every region in the cluster on its first heartbeat after a restart.
-- **Replica repair (4c):** every region with a peer on a down store and fewer than `target_replicas`
-  live ones gets an `AddPeer` onto the emptiest live store that has no peer of that region (lowest store
-  id breaks the tie, so the same data always chooses the same place); once the new replica is a voter,
-  the dead peer gets a `RemovePeer`. **Add before remove**, always: removing first takes a three-replica
-  region with one dead peer down to one live replica out of two. "Back at the target" is counted in
-  **voters**, because a learner is not in the configuration that votes: dropping the dead peer while the
-  replacement is still catching up is the same mistake made one step later, and it is the one the phase-4
-  retest hit once an `AddPeer` had timed out and been re-derived. A region that is merely
-  under-replicated is left alone — growing a healthy cluster to its target is balance, not repair.
+- **Replica repair (4c):** every region with fewer than `target_replicas` **live** replicas gets an
+  `AddPeer` onto the emptiest live store that has no peer of that region — emptiest by *effective*
+  region count, with the lowest store id breaking the tie, so the same data always chooses the same
+  place and a round of repairs spreads instead of piling onto one store. Once the new replica is a
+  voter, a peer on a down store gets a `RemovePeer`. **Add before remove**, always: removing first takes
+  a three-replica region with one dead peer down to one live replica out of two. "Back at the target" is
+  counted in **voters**, because a learner is not in the configuration that votes: dropping the dead
+  peer while the replacement is still catching up is the same mistake made one step later, and it is the
+  one the phase-4 retest hit once an `AddPeer` had timed out and been re-derived.
+- **A death is only one way to be short.** The trigger is the *state*, not the event: a region that
+  never finished growing to its target is repaired exactly like one whose store died. The older,
+  death-scoped rule — which left a merely under-replicated region alone, on the reasoning that growing
+  a healthy cluster was balance's job — was priced by phase 4's acceptance run: region 27 sat at two
+  voters with every store alive, and when one of those two died the region could no longer commit even
+  its own repair (`docs/bench/phase-4.md` Run 4). Regions are ordered by urgency — **exactly a quorum
+  of live voters first**, because that is the one a single further failure ends — for any caller that
+  sees more than one at a time; PD's own path decides one region on its own heartbeat and is therefore
+  ordered by arrival.
+- **Past the quorum boundary, repair stops and an operator starts.** A region with fewer live voters
+  than a quorum cannot commit the membership change that would save it, stops electing a leader, and so
+  stops beating to PD at all — PD cannot even be *told* to fix it, since operators ride on heartbeats.
+  PD never forces a configuration on its own: "down" means silent to PD, not gone, and a forced
+  configuration on that evidence is two groups serving one range. The way out is a future
+  operator-invoked `esker region unsafe-recover`, lossy by construction and outside the heartbeat path
+  ([ADR 0026](adr/0026-the-quorum-loss-boundary.md)).
 - **Operators ride on the heartbeat response.** At most one per region is in flight, and the same one is
   re-sent on every heartbeat until a heartbeat *shows* it happened, it is contradicted, or it stops
   making progress for `operator_timeout`. Progress is observed and never assumed: the peer list and the
