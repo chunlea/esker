@@ -1,0 +1,18 @@
+crates/esker-sql/tests/slt/rowsort_check.slt
+  h_44076b318daf9c 1-56
+crates/esker-sql/tests/slt_harness/mod.rs
+  h_44076b318daf9c 51-58,97-100,147-151,172-179,217-218,226,260-261,338-351,364-365
+crates/esker-sql/tests/sqllogictest.rs
+  h_44076b318daf9c 105-108
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "c285158bd824446dda810d5a72bce0686707b57f",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
