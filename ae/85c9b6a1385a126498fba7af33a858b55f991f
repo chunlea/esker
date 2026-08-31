@@ -1,0 +1,14 @@
+crates/esker-client/src/testing.rs
+  h_44076b318daf9c 49,60-66,85
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "ae85c9b6a1385a126498fba7af33a858b55f991f",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
