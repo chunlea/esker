@@ -245,37 +245,91 @@ where
     Ok(())
 }
 
-/// Whether this store may accept a snapshot for `region`.
+/// Empties a region's key range so a snapshot can refill it, and proves that it did.
 ///
-/// Two conditions, and the second is the v1 limitation
-/// (`docs/plans/phase-4.md` §13.2): the store must not already host the region, and its data range
-/// must hold nothing. A region already hosted is caught up from the log or not at all; a dirty
-/// range cannot be cleared and refilled, because the tombstones a clearing leaves are keys in the
-/// range and every path that would remove them removes the data with it.
-pub fn may_receive(db: &Db, region: &Region) -> Result<(), ProtoError> {
+/// **This is what lets a peer that already holds data be caught up by a snapshot**, which 4c could
+/// not do and which phase-4 acceptance showed is not an edge case: a learner adopts a snapshot, the
+/// leader writes on and compacts past it, and from then on the log cannot catch it up and a second
+/// snapshot was refused. The region then sat at one voter for ever
+/// (`docs/plans/phase-4.md` §17).
+///
+/// Three steps, and each is needed for a reason the previous one creates:
+///
+/// 1. `delete_range` over the region's range. On its own this is not enough: a deletion is a
+///    *stored entry*, so the range now holds tombstones, and the pairs written over them would
+///    leave anything the snapshot does not contain hidden rather than gone;
+/// 2. `flush`, which moves the tombstone out of the memtable and into L0 — the only level a range
+///    tombstone can live in ([ADR 0017](../../../docs/adr/0017-range-tombstones.md));
+/// 3. `compact_range` over the same range, which **discharges** it: the compaction applies the
+///    tombstone and drops every file it covers rather than propagating it.
+///
+/// The discharge only runs when every live reader already sees the delete — `seqno <= floor`,
+/// where the floor is the oldest pinned snapshot. **So this must be called with no engine snapshot
+/// held**, which is why it takes `&Db` and not a reader: a snapshot pinned by this very code path
+/// would hold the floor below its own tombstone and block the discharge it is waiting for.
+///
+/// # The emptiness check is load-bearing
+///
+/// It is not a debug assertion. If the discharge could not fully empty the range — a tombstone
+/// still above the floor because something else pinned a snapshot, say — then refilling would
+/// leave the region serving a mix of its own state and whatever survived, and the mix would look
+/// exactly like correct data. Rather than weaken the check, this refuses and says so: catching the
+/// peer up is then still impossible, which is where it was before, and the failure is loud.
+pub fn clear_range(db: &Db, region: &Region) -> Result<(), ProtoError> {
+    let (low, high) = range_bounds(region);
+    let cf_id = db
+        .cf_id(cf::DEFAULT)
+        .ok_or_else(|| ProtoError::internal("the default column family is missing"))?;
+
+    if first_key_in(db, &low, &high)?.is_none() {
+        // Nothing to clear, which is the ordinary case: a replica placed on a store that never
+        // held this range. No tombstone is written for it, so no discharge has to be waited for.
+        return Ok(());
+    }
+
+    let mut batch = WriteBatch::new();
+    batch.delete_range(cf_id, &low, &high);
+    db.write(batch, &WriteOptions { sync: true })
+        .map_err(|error| engine_to_proto(&error))?;
+    db.flush(cf::DEFAULT)
+        .map_err(|error| engine_to_proto(&error))?;
+    db.compact_range(cf::DEFAULT, Some(&low), Some(&high))
+        .map_err(|error| engine_to_proto(&error))?;
+
+    if let Some(survivor) = first_key_in(db, &low, &high)? {
+        return Err(ProtoError::Unsupported {
+            detail: format!(
+                "region {}: clearing [{:?}, {:?}) left key {:?} behind, so the range cannot be \
+                 refilled from a snapshot without serving a mix of two states. The discharge \
+                 could not run, which means a tombstone is still above the compaction floor — \
+                 something is holding an engine snapshot open (docs/plans/phase-4.md §18)",
+                region.id, region.start_key, region.end_key, survivor
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The `'r'`-namespaced bounds of a region's range, with the open end handled once.
+fn range_bounds(region: &Region) -> (Vec<u8>, Vec<u8>) {
     let low = prefix::raw_key(&region.start_key);
     let high = if region.end_key.is_empty() {
         vec![prefix::RAW + 1]
     } else {
         prefix::raw_key(&region.end_key)
     };
+    (low, high)
+}
+
+/// The first key in `[low, high)`, if the store holds one.
+fn first_key_in(db: &Db, low: &[u8], high: &[u8]) -> Result<Option<Vec<u8>>, ProtoError> {
     let mut iter = db
         .iter(cf::DEFAULT, &ReadOptions::default())
         .map_err(|error| engine_to_proto(&error))?;
-    iter.seek(&low);
-    let dirty = iter.valid() && iter.key() < &high[..];
+    iter.seek(low);
+    let found = (iter.valid() && iter.key() < high).then(|| iter.key().to_vec());
     iter.status().map_err(|error| engine_to_proto(&error))?;
-    if dirty {
-        return Err(ProtoError::Unsupported {
-            detail: format!(
-                "region {} cannot receive a snapshot: this store already holds keys in \
-                 [{:?}, {:?}), and clearing a range to refill it is not supported in this \
-                 version (docs/plans/phase-4.md §13.2)",
-                region.id, region.start_key, region.end_key
-            ),
-        });
-    }
-    Ok(())
+    Ok(found)
 }
 
 /// Writes a batch of a snapshot's pairs into the data column family.
@@ -393,9 +447,11 @@ fn get_ids(input: &mut Decoder<'_>, field: &'static str) -> Result<Vec<u64>, Pro
 
 #[cfg(test)]
 mod tests {
+    use esker_keys::prefix;
+
     use super::{
-        CHUNK_TARGET_BYTES, SnapshotHeader, decode_pairs, encode_pairs, may_receive, read_pairs,
-        stage_pairs,
+        CHUNK_TARGET_BYTES, SnapshotHeader, clear_range, decode_pairs, encode_pairs, first_key_in,
+        read_pairs, stage_pairs,
     };
     use bytes::Bytes;
     use esker_engine::{Db, LocalFileSystem, Options, cf};
@@ -605,21 +661,60 @@ mod tests {
         );
     }
 
-    /// The v1 limitation, checked before a single byte is written: a range this store already
-    /// holds keys in cannot be cleared and refilled, so the snapshot is refused rather than
-    /// half-applied.
+    /// A range that already holds keys is **emptied** so a snapshot can refill it, and the
+    /// neighbours on either side are left exactly as they were.
+    ///
+    /// The range half is what phase-4 acceptance needed and 4c refused. The neighbour half is what
+    /// makes it safe to do at all: a discharge that took a file spanning a boundary would delete
+    /// another region's data, and a store commonly holds the regions on both sides.
     #[test]
-    fn a_range_that_already_holds_keys_refuses_a_snapshot() {
+    fn a_range_that_already_holds_keys_is_cleared_for_a_snapshot() {
         let (_dir, db) = open();
-        may_receive(&db, &region(b"d", b"m")).unwrap();
+        // A clean range needs no clearing and says so by succeeding.
+        clear_range(&db, &region(b"d", b"m")).unwrap();
 
-        stage_pairs(&db, &[(Bytes::from_static(b"e"), Bytes::from_static(b"v"))]).unwrap();
-        let error = may_receive(&db, &region(b"d", b"m")).unwrap_err();
-        assert!(
-            matches!(error, esker_proto::ProtoError::Unsupported { .. }),
-            "{error:?}"
+        stage_pairs(
+            &db,
+            &[
+                (Bytes::from_static(b"a"), Bytes::from_static(b"before")),
+                (Bytes::from_static(b"e"), Bytes::from_static(b"v")),
+                (Bytes::from_static(b"f"), Bytes::from_static(b"v")),
+                (Bytes::from_static(b"z"), Bytes::from_static(b"after")),
+            ],
+        )
+        .unwrap();
+
+        clear_range(&db, &region(b"d", b"m")).unwrap();
+
+        let low = prefix::raw_key(b"d");
+        let high = prefix::raw_key(b"m");
+        assert_eq!(
+            first_key_in(&db, &low, &high).unwrap(),
+            None,
+            "the range was not emptied, so refilling it would serve a mix of two states"
         );
-        // A neighbouring range is still clean, so one dirty region does not block another.
-        may_receive(&db, &region(b"m", b"")).unwrap();
+        // And only that range: the keys on either side of it are untouched.
+        for (key, what) in [(&b"a"[..], "below"), (&b"z"[..], "above")] {
+            let full = prefix::raw_key(key);
+            assert!(
+                first_key_in(&db, &full, &[prefix::RAW + 1])
+                    .unwrap()
+                    .is_some(),
+                "clearing a region's range took a key {what} it"
+            );
+        }
+    }
+
+    /// Clearing is idempotent, because a retried transfer runs it again on a range its own
+    /// previous attempt already emptied.
+    #[test]
+    fn clearing_a_range_twice_is_the_same_as_clearing_it_once() {
+        let (_dir, db) = open();
+        stage_pairs(&db, &[(Bytes::from_static(b"e"), Bytes::from_static(b"v"))]).unwrap();
+        clear_range(&db, &region(b"d", b"m")).unwrap();
+        clear_range(&db, &region(b"d", b"m")).unwrap();
+        let low = prefix::raw_key(b"d");
+        let high = prefix::raw_key(b"m");
+        assert_eq!(first_key_in(&db, &low, &high).unwrap(), None);
     }
 }

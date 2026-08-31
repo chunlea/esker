@@ -485,7 +485,7 @@ async fn an_interrupted_receive_is_cleared_by_the_restart() {
     );
 
     // The range is clean again, so the retry may start.
-    esker_store::snapshot::may_receive(store.db(), &region).expect("the range was not cleared");
+    esker_store::snapshot::clear_range(store.db(), &region).expect("the range was not cleared");
     // And the announcement is gone, so the next open does not clear it a second time.
     assert!(
         esker_store::meta::load_pending_snapshots(store.db())
@@ -516,16 +516,24 @@ async fn a_dirty_range_refuses_a_snapshot_rather_than_half_applying_one() {
     let store = Store::open(dir.path(), StoreOptions::new()).unwrap();
     let region = store.regions().regions()[0].clone();
 
-    esker_store::snapshot::may_receive(store.db(), &region).expect("a fresh store is clean");
+    esker_store::snapshot::clear_range(store.db(), &region).expect("a fresh store is clean");
     store
         .handle(
             RequestHeader::new(region.id, region.epoch, 0),
             RawKvReq::put(key(0), Bytes::from_static(b"v")),
         )
         .unwrap();
+    // It is emptied rather than refused now, which is what lets a peer that has fallen behind
+    // its leader's compaction boundary be repaired at all (`docs/plans/phase-4.md` §18).
+    esker_store::snapshot::clear_range(store.db(), &region).expect("the range was cleared");
     assert!(
-        esker_store::snapshot::may_receive(store.db(), &region).is_err(),
-        "a range holding keys accepted a snapshot"
+        store
+            .handle(
+                RequestHeader::new(region.id, region.epoch, 0),
+                RawKvReq::get(key(0)),
+            )
+            .is_ok_and(|answer| matches!(answer, RawKvResp::Get { value: None })),
+        "a cleared range still served a key"
     );
 }
 

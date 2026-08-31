@@ -194,6 +194,30 @@ impl<S: LogStorage> Raft<S> {
         self.leader = Some(from);
         self.election_elapsed = 0;
 
+        // **An append below this node's commit index is answered, not rejected.** Everything at or
+        // below `committed` is settled — no leader can ever contradict it — so there is nothing to
+        // check and the only useful thing to say is where this node actually is.
+        //
+        // Rejecting instead is a deadlock, and phase-4 acceptance found it. A follower caught up
+        // by a snapshot has a log that begins at the snapshot's index, so an append from below it
+        // cannot be verified and was refused; the leader's `maybe_decr_to` walks `next` *down* on
+        // a rejection and by rule never back up, so once it had probed past the boundary it probed
+        // there for ever — 526 back-offs in one run that backed off nothing, against a follower
+        // that was answering every one of them. `handle_install_snapshot` already answers this way
+        // for the same reason; this is the same rule for the message that carries entries.
+        if prev_log_index < self.log.committed {
+            self.send(Message::AppendEntriesResponse {
+                from: self.id,
+                to: from,
+                term: self.term,
+                reject: false,
+                index: self.log.committed,
+                hint_term: 0,
+                context,
+            });
+            return Ok(());
+        }
+
         // Kept before the entries are consumed: §4.1 says a configuration takes effect when its
         // entry is *appended*, so these have to be applied the moment the append succeeds. Which
         // of them count is a question only the append can answer, so the filtering waits for it.

@@ -623,6 +623,27 @@ impl Store {
         }
     }
 
+    /// Retires a region and **waits** for it, so the caller may reuse its range immediately.
+    ///
+    /// [`retire_region`](Self::retire_region) spawns and returns, which is right when a conf change
+    /// has removed this store and nothing is waiting. It is wrong when the range is about to be
+    /// emptied and refilled: a peer still applying into it while `clear_range` runs would write
+    /// under the tombstone and survive the discharge, and the emptiness check would then refuse a
+    /// transfer that was only racing itself.
+    ///
+    /// The raft state is left alone. The snapshot about to be adopted overwrites it wholesale, and
+    /// destroying it first would turn a failed transfer into a peer that has lost its log as well
+    /// as its data.
+    async fn retire_region_now(self: &Arc<Self>, region_id: u64) {
+        let Some(state) = self.regions.remove(region_id) else {
+            return;
+        };
+        if let Some(peer) = state.peer() {
+            let peer = Arc::clone(peer);
+            let _ = tokio::task::spawn_blocking(move || peer.stop()).await;
+        }
+    }
+
     /// Stops serving a region this store has been removed from, and forgets its Raft state.
     ///
     /// Spawned rather than done here, because this runs on the removed peer's **own driver
@@ -1443,11 +1464,15 @@ impl Store {
             // limitation is now what happens — the offer is declined and the peer stays behind,
             // visible in PD's heartbeats — rather than something that looked like a repair.
             if let Some(index) = Self::snapshot_announcement(&message.message) {
-                tracing::debug!(
-                    region_id = message.region_id,
+                // The peer hosts this region and has fallen behind what its leader still has, so
+                // the log cannot catch it up. It fetches the region again and replaces what it
+                // holds — which the range clearing in `snapshot::clear_range` is what makes
+                // possible (`docs/plans/phase-4.md` §18).
+                self.start_snapshot(
+                    message.region_id,
+                    message.from_store,
+                    message.message.recipient(),
                     index,
-                    "declined a snapshot for a region this store already holds; \
-                     catching up a peer that has data is a documented v1 limitation"
                 );
                 continue;
             }
@@ -1530,13 +1555,19 @@ impl Store {
                 header.region.id
             )));
         }
-        if self.regions.get(region_id).is_some() {
-            return Err(ProtoError::Unsupported {
-                detail: format!(
-                    "region {region_id} is already on this store; catching an existing peer up by \
-                     snapshot is not supported in this version (docs/plans/phase-4.md §13.2)"
-                ),
-            });
+        // A region this store already hosts is **replaced**, not refused. Refusing it was 4c's
+        // limitation and phase-4 acceptance showed it is not an edge case: a peer that falls
+        // behind its leader's compaction boundary can only be repaired this way, and until now it
+        // could not be repaired at all (`docs/plans/phase-4.md` §18). The old peer is retired
+        // first so that nothing is driving the region while its range is emptied and refilled.
+        let replacing = self.regions.get(region_id).is_some();
+        if replacing {
+            tracing::info!(
+                region_id,
+                index,
+                "replacing a region this store already holds with a snapshot of it"
+            );
+            self.retire_region_now(region_id).await;
         }
 
         // 2. Announce, before a single key is written.
@@ -1609,12 +1640,15 @@ impl Store {
         let region = header.region.clone();
         let index = header.meta.index;
         blocking(move || {
-            snapshot::may_receive(&db, &region)?;
+            // The pending record goes down **first**, and then the range is emptied. A crash
+            // between them leaves a record saying this range is mid-replacement, which is what the
+            // next open cleans up and retries from; doing it the other way round would leave a
+            // cleared range with nothing to say why.
             let mut batch = WriteBatch::new();
             meta::stage_pending_snapshot(&mut batch, cf_id, &region, index);
             db.write(batch, &WriteOptions { sync: true })
-                .map(|_| ())
-                .map_err(|error| crate::error::engine_to_proto(&error))
+                .map_err(|error| crate::error::engine_to_proto(&error))?;
+            snapshot::clear_range(&db, &region)
         })
         .await
     }

@@ -1112,3 +1112,66 @@ which is the single case it existed for.
 
 The repro is `crates/esker-store/tests/promotion.rs`, `#[ignore]`d with all of this in its doc
 comment, per the ruling that a repro belongs in the tree.
+
+## 18. Ruling (A): a snapshot can replace a range that already holds data
+
+`snapshot::clear_range` is the piece 4c did not have, and `DeleteRange` landing in the engine
+(`cc2c891`) is what made it possible. Three steps, each needed because of what the one before it
+leaves behind:
+
+1. **`delete_range`** over the region's range. Not enough on its own — a deletion is a *stored
+   entry*, so the range now holds tombstones and anything the snapshot does not contain would be
+   hidden rather than gone;
+2. **`flush`**, which moves the tombstone out of the memtable into L0, the only level a range
+   tombstone can live in (ADR 0017);
+3. **`compact_range`** over the same range, which **discharges** it: the compaction applies the
+   tombstone and drops the files it covers rather than propagating it.
+
+The two things the ruling asked to be verified are both real and both handled.
+
+**No engine snapshot may be held.** `Picker::can_discharge` requires every tombstone's `seqno <=
+compaction_floor()`, and the floor is the oldest pinned snapshot. A reader pinned by this very path
+would hold the floor below its own tombstone and block the discharge it is waiting for, so
+`clear_range` takes `&Db` and pins nothing.
+
+**The emptiness check is load-bearing.** If the discharge could not empty the range, refilling would
+leave the region serving a mix of its own state and whatever survived — and the mix would look like
+correct data. It refuses and says so, naming the floor as the thing to look at, rather than being
+weakened.
+
+Around it: `fetch_snapshot` **replaces** a region this store already hosts instead of refusing it
+(the old peer is retired and waited for, so nothing is applying into the range while it is emptied),
+and a snapshot announcement for a hosted region now starts a fetch rather than being declined.
+
+### 18.1 The deadlock underneath, and a rule of Figure 3.1 corrected
+
+Clearing alone changed nothing, because the leader never got as far as offering a second snapshot.
+The core's own tracing showed why: **526 "backing off after a rejected append" and not one snapshot
+offered.**
+
+A follower caught up by a snapshot has a log beginning at the snapshot's index. An append from
+below it cannot be verified, so it was rejected — and `Progress::maybe_decr_to` walks `next` *down*
+on a rejection and by rule never back up, so a leader that had probed past the boundary probed there
+for ever, against a follower answering every single one. The follower's hint was correct and the
+leader was structurally unable to act on it.
+
+The fix is etcd's rule, which this crate was missing: **an append below the follower's commit index
+is answered, not rejected**, with the follower's own commit index. Everything at or below
+`committed` is settled by quorum — no leader can contradict it — so there is nothing to verify and
+the only useful answer is where this node actually is. `handle_install_snapshot` already answered
+that way for exactly this reason; this is the same rule for the message that carries entries.
+
+`an_append_below_the_installed_snapshot_is_refused` asserted the old behaviour and is now
+`..._is_answered_from_where_the_node_is`. **The rule it encoded was the bug**, and raft-spec's N6
+row is updated with it. Race 5's real content — the log is not rewound by an append from below it —
+still holds and is still asserted.
+
+### 18.2 Where this leaves the repro
+
+`tests/promotion.rs` now **passes some runs** (one in 9.9 s) and still stalls in others. The
+learners get far further than before — `applied` 58 where it used to be 18 — so what remains is
+narrower than what was fixed. It stays `#[ignore]`d until it is reliably green.
+
+Not yet chased: (B), which compaction pass bypasses `hold_for_lagging_peers`. The likeliest answer
+is that `RawNode::progress` is empty on a peer that is not leader at that instant, so a pass during
+a leadership flap compacts by the tail rule alone — and one such pass is permanent.

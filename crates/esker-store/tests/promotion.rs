@@ -122,7 +122,9 @@ fn key(n: u32) -> Bytes {
 
 /// Writes one key through whichever region currently owns it, retrying while the routing moves.
 async fn put(store: &Arc<Store>, key: Bytes, value: &[u8]) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // Generous, because a region being *replaced* moves its routing far more than a split does
+    // and every retry here is a legitimate `EpochNotMatch`.
+    let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         let Some(state) = store.regions().find(&key) else {
             assert!(Instant::now() < deadline, "no region ever covered {key:?}");
@@ -339,7 +341,10 @@ async fn watch_until_every_learner_votes(
                 }
             }
         }
-        if writer.is_finished() && promoted.len() >= 3 && first_seen.len() == promoted.len() {
+        // Every learner that appeared has been promoted, and there was at least one to promote.
+        // Not a bigger number: with two stores at `target_replicas` two, two is all the placement
+        // driver ever has reason to create.
+        if writer.is_finished() && !promoted.is_empty() && first_seen.len() == promoted.len() {
             break;
         }
         assert!(

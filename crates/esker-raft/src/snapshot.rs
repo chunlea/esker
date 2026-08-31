@@ -437,10 +437,20 @@ mod tests {
         );
     }
 
-    /// Race 5. An append the follower can no longer verify — its `prev_log_index` is below the
-    /// snapshot — has to be refused, not guessed at.
+    /// Race 5, corrected. An append below the snapshot is answered with **where this node
+    /// actually is**, and its log is not rewound.
+    ///
+    /// This test asserted a rejection until phase-4 acceptance showed that rule was a deadlock.
+    /// The reasoning behind it — "an append the follower cannot verify must not be guessed at" —
+    /// is sound for an *uncommitted* index and wrong below `committed`: everything there is
+    /// settled by quorum, no leader can contradict it, so there is nothing to verify and the only
+    /// useful answer is the node's own position. Rejecting instead left the leader probing at an
+    /// index the follower would refuse for ever, because `maybe_decr_to` never raises `next`.
+    ///
+    /// What race 5 was really protecting is the second assertion, and it still holds: the log is
+    /// not rewound by an append from below it.
     #[test]
-    fn an_append_below_the_installed_snapshot_is_refused() {
+    fn an_append_below_the_installed_snapshot_is_answered_from_where_the_node_is() {
         let mut node = follower(&[1], 5);
         node.step(install(9, 4)).unwrap();
         let ready = node.ready();
@@ -460,10 +470,21 @@ mod tests {
             context: Bytes::new(),
         })
         .unwrap();
-        assert!(matches!(
-            node.ready().messages.as_slice(),
-            [Message::AppendEntriesResponse { reject: true, .. }]
-        ));
+        let ready = node.ready();
+        let [
+            Message::AppendEntriesResponse {
+                reject: false,
+                index,
+                ..
+            },
+        ] = ready.messages.as_slice()
+        else {
+            panic!("expected one answer carrying this node's position: {ready:?}");
+        };
+        assert_eq!(
+            *index, 9,
+            "the answer has to name where this node is, or the leader learns nothing from it"
+        );
         assert_eq!(node.status().last_index, 9, "and the log was not rewound");
     }
 
