@@ -1,0 +1,65 @@
+crates/esker-engine/tests/tier.rs
+  s_dc640bf0df4adb::t_06bafb8e5a27a4 1-7,9-59,66-99,101,103-269,272-282,289-364,368-379,383-462
+  s_dc640bf0df4adb::t_f42f0336d2c27e 8
+  s_dc640bf0df4adb::t_ecc0a48412e9b7 60-65
+  s_dc640bf0df4adb::t_adaec59868379d 100
+  s_dc640bf0df4adb::t_466f5f061f2184 102
+  s_dc640bf0df4adb::t_416c8d0d2e3e66 270-271
+  s_dc640bf0df4adb::t_2041b78deea1dd 283-288
+  s_dc640bf0df4adb::t_8114188cab5daa 365-367
+  s_dc640bf0df4adb::t_0212e8d0d1d7e4 380-382
+Cargo.lock
+  s_dc640bf0df4adb::t_935f1fdb535d31 329,363
+crates/esker-engine/Cargo.toml
+  s_dc640bf0df4adb::t_f9fd418cece3fb 13-16
+crates/esker-engine/src/compaction/picker.rs
+  s_dc640bf0df4adb::t_4b42214541b5da 394,425
+crates/esker-engine/src/db/compact.rs
+  s_dc640bf0df4adb::t_69f5cbfa43ae3a 39,312-318,492,495-499,503,520-526,691
+crates/esker-engine/src/db/flush.rs
+  s_dc640bf0df4adb::t_946f1bb1394a40 39,307,319-327,371,453
+crates/esker-engine/src/db/ingest.rs
+  s_dc640bf0df4adb::t_c99f4dab53d80f 33,120
+crates/esker-engine/src/db/mod.rs
+  s_dc640bf0df4adb::t_7d60f215aa3ad1 40,75-76,92-94,100-103,154-161,182-193
+crates/esker-engine/src/db/open.rs
+  s_dc640bf0df4adb::t_b60b81a1fa5a2f 29,155-156,164,170,190-193,218-240
+crates/esker-engine/src/db/tier.rs
+  s_dc640bf0df4adb::t_1b67ef72d7e896 1-154
+crates/esker-engine/src/fs/mod.rs
+  s_dc640bf0df4adb::t_efc77953a0def6 34-36,97-154
+crates/esker-engine/src/fs/tier.rs
+  s_dc640bf0df4adb::t_78414d296cfe32 1-744
+crates/esker-engine/src/version/builder.rs
+  s_dc640bf0df4adb::t_dfc6620a4bf65f 20,29-30,43,82-88,113,156-172,239,257
+crates/esker-engine/src/version/edit.rs
+  s_dc640bf0df4adb::t_92cd1cb7dce0a1 43-88,106-111,133-139,155-161,165-169,218-224,263,267-286,386-387,397,466-556,560-561
+crates/esker-engine/src/version/mod.rs
+  s_dc640bf0df4adb::t_3173ce8318380e 32,150-164,202,213
+crates/esker-engine/src/version/set.rs
+  s_dc640bf0df4adb::t_be1ae0eff74a4a 406,426-440
+crates/esker-engine/tests/tier_minio.rs
+  s_dc640bf0df4adb::t_54841eee220be9 1-304
+crates/esker-engine/tests/version.rs
+  s_dc640bf0df4adb::t_e788e43271c36d 6,49,82,296,393,558
+crates/esker-s3/src/memory.rs
+  s_dc640bf0df4adb::t_c234dbbc93b303 1,9
+docs/adr/0024-tiering-failure-semantics.md
+  s_dc640bf0df4adb::t_f39f14e64e60bf 66-77,152-158
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "720abf085cdb612284f7f104c92b391d39e5a500",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "claude-fable-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
