@@ -1,0 +1,53 @@
+crates/esker-sql/src/catalog/mod.rs
+  s_a54678688ddc33::t_ab722da940f1f4 720-725,732,741,747,765,771
+crates/esker-sql/src/catalog/record.rs
+  s_a54678688ddc33::t_58f53352aea3e6 275-280,286,290,296-297,301,310
+crates/esker-sql/src/error.rs
+  s_a54678688ddc33::t_6be072c0f28775 445-453,621-623
+crates/esker-sql/src/exec/ddl.rs
+  s_a54678688ddc33::t_dd8a09d0e0a0d1 287,340-362
+crates/esker-sql/src/exec/job.rs
+  s_a54678688ddc33::t_24ef8fdc5237fa 173-196
+crates/esker-sql/src/exec/mod.rs
+  s_a54678688ddc33::t_1c1142fba313ba 736-747
+crates/esker-sql/src/exec/verbs.rs
+  s_a54678688ddc33::t_4a50414247cdec 224-228,254,304-320,332,345,348-403
+crates/esker-sql/src/parse/lower.rs
+  s_a54678688ddc33::t_4b698b7c6de66e 38-43,88-93
+crates/esker-sql/src/parse/mod.rs
+  s_a54678688ddc33::t_bc732be20261da 158-170,202-207,220-222,227-231,236-264,276-281
+crates/esker-sql/src/plan/ddl.rs
+  s_a54678688ddc33::t_3a342630ddcfc0 100-105
+crates/esker-sql/src/plan/mod.rs
+  s_a54678688ddc33::t_6a7957ad279876 96-112
+crates/esker-sql/tests/corpus/pg19.sql
+  s_a54678688ddc33::t_f4491e3d55179e 56-57
+crates/esker-sql/tests/schema_change.rs
+  s_a54678688ddc33::t_7ccc15722090f1 436,438-443,446,853-855,924,926,1002-1152
+crates/esker-sql/tests/slt/index.slt
+  s_a54678688ddc33::t_837440fc67ebe9 86,89,116,124-180
+crates/esker-sql/tests/syntax_corpus.rs
+  s_a54678688ddc33::t_8e49d79b5bd612 17
+docs/adr/0020-online-schema-change.md
+  s_a54678688ddc33::t_14c21f9ea945e9 90-109
+docs/plans/phase-6a.md
+  s_a54678688ddc33::t_2b261f1422eaa5 440
+docs/plans/phase-6e.md
+  s_a54678688ddc33::t_5b9b809753bbf7 74-76,311-322
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "69eea88badbb42d0bac49fe635e7f0e6a858a605",
+  "prompts": {},
+  "sessions": {
+    "s_a54678688ddc33": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5f80ef1c-2a51-422f-beb6-dba4320b1635",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
