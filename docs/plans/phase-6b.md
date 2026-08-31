@@ -250,15 +250,19 @@ written; this section is the diff.
   full-GET fallback, already paid for. ADR 0024 decision 6 was corrected to match.
 - **No prefix-collision marker.** The plan listed a `TIER-ID` marker object guarding against two
   databases sharing one prefix, sequenced last so it could be dropped. It was dropped. Two
-  databases sharing an `--sst-store` prefix will overwrite each other's `000007.sst` **silently**
-  — the sharpest edge this lane is leaving behind, and the first thing to build in 6c.
+  databases sharing an `--sst-store` prefix would overwrite each other's `000007.sst`
+  **silently** — the sharpest edge this lane left behind.
+  **Paid** in the 6c debt wave: `esker_engine::fs::claim`, [ADR
+  0029](../adr/0029-the-sst-store-claim.md), `docs/plans/debt-c1.md`. Identity turned out not to
+  be `(cluster_id, store_id)` — two benchmarks have neither — but a random id kept in the
+  database's own directory.
 
 ### Debt, in the order it should be paid
 
 1. **Connection reuse in `esker_s3::transport`.** One TCP connection per request costs ~692 µs
    per cold read on loopback and dominates the cold-cache p99 (`docs/bench/phase-6b.md` §3).
    Local to one implementor of one trait.
-2. **The prefix-collision marker**, above.
+2. ~~**The prefix-collision marker**, above.~~ Done; see the note above.
 3. **TLS** — ADR 0025 §"what has to be true before TLS lands" is the checklist.
 4. **An offline object reconciler** in `esker-cli`: a `DeleteObject` that fails leaks the
    object, deliberately, because a leaked object costs storage and a wrongly deleted one costs

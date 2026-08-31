@@ -35,6 +35,7 @@
 
 use std::sync::Arc;
 
+use esker_engine::fs::claim::{Identity, id_for_directory};
 use esker_engine::fs::tier::{TierOptions, TieredFileSystem};
 use esker_engine::fs::{FileSystem, LocalFileSystem};
 use esker_engine::{Db, Options, ReadOptions};
@@ -75,6 +76,53 @@ fn tiered_fs(dir: &std::path::Path, prefix: &str, budget: Option<u64>) -> Arc<dy
         },
     )
     .expect("opening the tier")
+}
+
+/// The same, but claiming the prefix as `identity` — the real-S3 half of the claim marker.
+fn claiming_fs(
+    dir: &std::path::Path,
+    prefix: &str,
+    identity: Identity,
+    adopt: bool,
+) -> std::io::Result<Arc<TieredFileSystem>> {
+    let endpoint =
+        esker_s3::Endpoint::parse(&env_or("ESKER_S3_ENDPOINT", "http://localhost:19000"))
+            .expect("the endpoint must parse");
+    let config = esker_s3::Config::from_store_url(
+        &format!(
+            "s3://{}/engine/{prefix}",
+            env_or("ESKER_S3_BUCKET", "esker")
+        ),
+        endpoint,
+        "us-east-1",
+        esker_s3::Credentials::new(
+            env_or("ESKER_S3_KEY", "eskertest"),
+            env_or("ESKER_S3_SECRET", "eskertest123"),
+        ),
+    )
+    .expect("the store URL must parse");
+    let key_prefix = config.prefix.clone();
+
+    TieredFileSystem::new(
+        Arc::new(LocalFileSystem::new()),
+        Arc::new(esker_s3::S3Client::new(config)),
+        dir,
+        TierOptions {
+            key_prefix,
+            background: false,
+            identity: Some(identity),
+            adopt_unclaimed: adopt,
+            ..TierOptions::default()
+        },
+    )
+}
+
+/// A unique prefix per run, so a re-run does not meet its own claim from last time.
+fn unique_prefix(what: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    format!("{what}-{nanos:x}")
 }
 
 fn open(dir: &std::path::Path, prefix: &str, budget: Option<u64>) -> Db {
@@ -301,4 +349,36 @@ fn a_cold_point_read_over_http_is_a_handful_of_ranges() {
         stats.ranged_reads
     );
     assert_eq!(stats.fetches, 0, "nothing should have been fetched whole");
+}
+
+/// **The claim marker against a real object store.** `tests/tier_claim.rs` decides all of the
+/// behaviour against `MemoryStore`; what only a real endpoint can tell us is that the marker
+/// survives a genuine `PutObject`/`GetObject` round trip — that a 37-byte object comes back as
+/// 37 bytes with its CRC intact, and that a missing marker arrives as a 404 the claim path
+/// recognises rather than as an error it reports.
+#[test]
+#[ignore = "needs the MinIO container; see this file's header"]
+fn a_prefix_claimed_over_http_refuses_the_second_database() {
+    let prefix = unique_prefix("claim");
+    let first_dir = tempfile::tempdir().unwrap();
+    let second_dir = tempfile::tempdir().unwrap();
+    let local = LocalFileSystem::new();
+    let first = Identity::new(id_for_directory(&local, first_dir.path()).unwrap()).of(1, 1);
+    let second = Identity::new(id_for_directory(&local, second_dir.path()).unwrap()).of(1, 2);
+
+    // A 404 for the marker is the ordinary first-open case, not a failure.
+    claiming_fs(first_dir.path(), &prefix, first, false).expect("the first database claims it");
+
+    // And it round-trips: the same database reopens over HTTP, reading back what it wrote.
+    claiming_fs(first_dir.path(), &prefix, first, false).expect("the claimant reopens");
+
+    let error = claiming_fs(second_dir.path(), &prefix, second, false)
+        .expect_err("a second database must be refused over HTTP too");
+    let text = error.to_string();
+    assert!(text.contains(&first.claim.to_string()), "{text}");
+    assert!(text.contains(&second.claim.to_string()), "{text}");
+    assert!(
+        text.contains("store 1") && text.contains("store 2"),
+        "{text}"
+    );
 }

@@ -337,11 +337,14 @@ fn run_in(options: &Run, dir: &Path) -> Result<Report, String> {
     // `background: false`: a benchmark wants a steady state, not a measurement of the
     // uploader fetching files back while the measured phase reads them. Uploads are driven
     // explicitly by `drain_the_tier` below, before the clock starts.
+    // A benchmark has no cluster and no store id, so its claim is the id in its own directory
+    // and nothing else — which is exactly the case `(cluster_id, store_id)` could not tell apart.
     let fs = crate::sst_store::filesystem(
         options.sst_store.as_deref(),
         dir,
         options.sst_cache_bytes,
         false,
+        crate::sst_store::Claim::default(),
     )?;
     let db = Db::open_with(
         dir,

@@ -31,6 +31,7 @@
 //! shape, so a Windows port is a design change, not a `cfg` — and `deny.toml` builds exactly
 //! two targets, both of them unix.
 
+pub mod claim;
 pub mod tier;
 
 use std::collections::BTreeSet;

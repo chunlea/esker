@@ -56,6 +56,14 @@ pub(crate) struct ServerOptions {
     /// (`crate::sst_store`). `esker cluster start` derives a per-node prefix for exactly that
     /// reason; an operator running `esker server` by hand owns it.
     pub(crate) sst_store: Option<String>,
+    /// Claim an `--sst-store` prefix that already holds objects but carries no claim marker.
+    ///
+    /// The escape hatch, and deliberately an awkward one. A prefix with objects and no marker
+    /// was either written before markers existed or had its marker deleted, and from outside
+    /// there is no way to tell that from a prefix another live database is still using. Refusing
+    /// is the default; this says "I have checked, it is mine"
+    /// (`docs/adr/0029-the-sst-store-claim.md`).
+    pub(crate) adopt_sst_store: bool,
     /// The placement driver to register with and report to. `None` is a store that bootstraps
     /// its own region and reports to nobody — phase 2's single node and phase 3e's static
     /// cluster, both of which this command still starts.
@@ -73,6 +81,7 @@ impl Default for ServerOptions {
             seed: 0,
             write_buffer_size: None,
             sst_store: None,
+            adopt_sst_store: false,
             pd: None,
         }
     }
@@ -123,8 +132,20 @@ pub(crate) fn run(options: &ServerOptions) -> Result<(), String> {
     // Built before the store, and a failure here is a startup failure: a `--sst-store` that
     // cannot be reached is a misconfiguration, and a store that started anyway would write
     // SSTs nobody asked it to keep locally and report success.
-    let fs =
-        crate::sst_store::filesystem(options.sst_store.as_deref(), &options.data_dir, None, true)?;
+    // The cluster id is not known until PD answers, and PD is not asked until the store opens,
+    // so the marker carries the store id and the cluster the operator named. They are the
+    // informational half of the claim; the authority is the id in the data directory.
+    let fs = crate::sst_store::filesystem(
+        options.sst_store.as_deref(),
+        &options.data_dir,
+        None,
+        true,
+        crate::sst_store::Claim {
+            cluster_id: 0,
+            store_id: options.store_id,
+            adopt: options.adopt_sst_store,
+        },
+    )?;
 
     let mut engine = StoreOptions::new().engine;
     if let Some(size) = options.write_buffer_size {

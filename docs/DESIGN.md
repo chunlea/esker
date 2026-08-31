@@ -740,7 +740,13 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
   and it is not a pending output — taken from the version set rather than a directory listing, because an
   evicted file is absent from the listing. The S3 client (`esker-s3`) is in-house: `PutObject`, ranged
   `GetObject`, `ListObjectsV2`, `DeleteObject`, SigV4 over `esker-base`'s SHA-256/HMAC, and an HTTP/1.1
-  codec, with **no external dependency at any depth**.
+  codec, with **no external dependency at any depth**. A prefix is **claimed**: the first database to
+  open one writes a versioned, CRC'd marker naming itself, and any other database is refused at startup
+  with both identities in the message, because two databases sharing a prefix overwrite each other's
+  `000007.sst` in silence — file numbers restart at one in every database. Identity is a random id kept
+  in the database's own directory rather than `(cluster_id, store_id)`, which two benchmarks do not have
+  and two misconfigured stores share (ADR 0029). A prefix holding objects and no marker — every pre-6c
+  prefix — is refused until `--adopt-sst-store` says otherwise; nothing is ever adopted silently.
 - **TLS — settled by ADR 0025, and deferred.** Option (a): plain HTTP to `MinIO` or to a TLS-terminating
   sidecar. `Endpoint::parse` **refuses** `https://` with a message pointing at the ADR, rather than
   accepting it and speaking plaintext — a configuration that looks encrypted and is not is the worst of

@@ -213,7 +213,11 @@ Server options:
                         WAL and the Raft log local. The endpoint and credentials
                         come from ESKER_S3_ENDPOINT, ESKER_S3_KEY, ESKER_S3_SECRET
                         and ESKER_S3_REGION, never from a flag. One prefix per
-                        store: two sharing one overwrite each other's SSTs
+                        store: the first database to open one claims it, and any
+                        other is refused at startup rather than overwriting it
+      --adopt-sst-store Claim an --sst-store prefix that already holds objects but
+                        no claim marker, instead of refusing. Only do this when you
+                        know no other database is using those objects
       --pd HOST:PORT    The placement driver to register with and report to. With
                         one, PD decides which store creates region 1 and this store
                         reports its regions on the schedule of DESIGN.md §14.
@@ -709,6 +713,8 @@ fn parse_server(arguments: &[String]) -> Result<Command, ParseError> {
             "--sst-store" => {
                 options.sst_store = Some(take_value(arguments, &mut index, inline, "--sst-store")?);
             }
+            // A bare switch: nothing to configure, only a decision to make out loud.
+            "--adopt-sst-store" => options.adopt_sst_store = true,
             "--write-buffer-size" => {
                 let raw = take_value(arguments, &mut index, inline, "--write-buffer-size")?;
                 options.write_buffer_size = Some(raw.parse().ok().filter(|size| *size > 0).ok_or(
@@ -1185,6 +1191,21 @@ mod tests {
             panic!("expected a server command");
         };
         assert_eq!(options.sst_store.as_deref(), Some("s3://esker/tier"));
+        assert!(
+            !options.adopt_sst_store,
+            "adopting somebody else's objects is never the default"
+        );
+
+        // The escape hatch is a bare switch, and it has to be asked for.
+        let Command::Server(options) = parse_ok(&[
+            "server",
+            "--sst-store",
+            "s3://esker/tier",
+            "--adopt-sst-store",
+        ]) else {
+            panic!("expected a server command");
+        };
+        assert!(options.adopt_sst_store);
 
         let Command::Server(options) = parse_ok(&["server", "--write-buffer-size", "262144"])
         else {

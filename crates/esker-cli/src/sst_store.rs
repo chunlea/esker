@@ -20,16 +20,36 @@
 //!
 //! Two databases sharing an `--sst-store` prefix would overwrite each other's `000007.sst`,
 //! silently, because the object key is derived from a file number and file numbers restart at
-//! one in every database. Nothing here can detect that — a marker object guarding it is
-//! recorded as debt in `docs/plans/phase-6b.md` — so [`for_node`] exists to make the
-//! *derivation* of a per-store prefix something the CLI does rather than something an operator
-//! has to remember.
+//! one in every database. Two things stop that now:
+//!
+//! * [`for_node`] derives a per-store prefix, so an operator who gets the cluster right cannot
+//!   get this wrong by hand;
+//! * and the prefix itself is **claimed**. The first database to open one writes a marker naming
+//!   itself; a database that is not the claimant is refused at startup with both identities in
+//!   the message ([`esker_engine::fs::claim`], `docs/adr/0029-the-sst-store-claim.md`). The
+//!   derivation is the convenience; the claim is the guarantee.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use esker_engine::fs::tier::{TierOptions, TieredFileSystem};
-use esker_engine::fs::{FileSystem, LocalFileSystem};
+use esker_engine::fs::{FileSystem, LocalFileSystem, claim};
+
+/// What the CLI knows about the database asking for a tier.
+///
+/// The ids are informational — they are in the claim marker so that a refusal names something an
+/// operator recognises rather than only a random number — and `adopt` is the one decision that
+/// must be made out loud.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Claim {
+    /// The cluster, or `0` when there is none (a benchmark, a standalone store).
+    pub(crate) cluster_id: u64,
+    /// The store, or `0`.
+    pub(crate) store_id: u64,
+    /// Claim a prefix that holds objects but no marker. `false` refuses, which is the default:
+    /// those objects may belong to a live database written before markers existed.
+    pub(crate) adopt: bool,
+}
 
 /// Reads `name` from the environment, or returns `fallback`.
 fn env_or(name: &str, fallback: &str) -> String {
@@ -60,6 +80,7 @@ pub(crate) fn filesystem(
     dir: &Path,
     local_budget: Option<u64>,
     background: bool,
+    who: Claim,
 ) -> Result<Arc<dyn FileSystem>, String> {
     let local = Arc::new(LocalFileSystem::new());
     let Some(store_url) = store_url else {
@@ -79,8 +100,16 @@ pub(crate) fn filesystem(
     let key_prefix = config.prefix.clone();
     let client = Arc::new(esker_s3::S3Client::new(config));
 
-    // The directory has to exist before the tier lists it for half-written fetches.
+    // The directory has to exist before the tier lists it for half-written fetches — and before
+    // the claim id is written into it.
     std::fs::create_dir_all(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+
+    // Who this database is. Drawn once and kept in its own directory, so it is the *database*
+    // that owns a prefix and not the flags it was started with: two `esker bench` runs share
+    // every flag they have and must still not share a prefix.
+    let claim = claim::id_for_directory(local.as_ref(), dir)
+        .map_err(|err| format!("{}/{}: {err}", dir.display(), claim::CLAIM_ID_FILE))?;
+    let identity = claim::Identity::new(claim).of(who.cluster_id, who.store_id);
 
     TieredFileSystem::new(
         local,
@@ -90,6 +119,8 @@ pub(crate) fn filesystem(
             key_prefix,
             local_budget,
             background,
+            identity: Some(identity),
+            adopt_unclaimed: who.adopt,
             ..TierOptions::default()
         },
     )
@@ -100,7 +131,7 @@ pub(crate) fn filesystem(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{filesystem, for_node};
+    use super::{Claim, filesystem, for_node};
 
     #[test]
     fn a_node_gets_its_own_prefix() {
@@ -114,7 +145,7 @@ mod tests {
     #[test]
     fn no_store_url_is_the_local_filesystem() {
         let dir = tempfile::tempdir().unwrap();
-        let fs = filesystem(None, dir.path(), None, true).unwrap();
+        let fs = filesystem(None, dir.path(), None, true, Claim::default()).unwrap();
         assert!(
             esker_engine::fs::FileSystem::tier(fs.as_ref()).is_none(),
             "a store that asked for no tier must not have one"
@@ -130,9 +161,11 @@ mod tests {
     #[test]
     fn a_bad_store_url_fails_early_and_says_why() {
         let dir = tempfile::tempdir().unwrap();
-        let err = filesystem(Some("esker/tier"), dir.path(), None, true).unwrap_err();
+        let err =
+            filesystem(Some("esker/tier"), dir.path(), None, true, Claim::default()).unwrap_err();
         assert!(err.contains("s3://"), "{err}");
-        let err = filesystem(Some("s3:///tier"), dir.path(), None, true).unwrap_err();
+        let err =
+            filesystem(Some("s3:///tier"), dir.path(), None, true, Claim::default()).unwrap_err();
         assert!(err.contains("no bucket"), "{err}");
     }
 }
