@@ -1,0 +1,16 @@
+crates/esker-sql/tests/psql_smoke.rs
+  h_44076b318daf9c 328-473
+docs/plans/phase-6a.md
+  h_44076b318daf9c 3,486-487,489-493,495,497-501,503-523,527-536
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "84155fc09bb19b2be8180729200d304698aa1738",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
