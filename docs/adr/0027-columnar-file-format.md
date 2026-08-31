@@ -25,6 +25,25 @@ stripe := chunk*                        one chunk per column, in schema order
 chunk  := payload ++ codec:u8 ++ crc32c:u32
 ```
 
+**Amendment, format version 2 (2026-08-31, during milestone 2).** A chunk's checksum now covers
+its **offset** as well as its bytes: `crc32c(offset_le ++ payload ++ codec)`. The offset is not
+stored — both sides know where the chunk is — so the layout above is unchanged and only the four
+checksum bytes differ.
+
+The reason is a failure the milestone-2 fuzz produced on its first real run, and it is worth
+stating in general terms because it is easy to get wrong twice: **a checksum proves a block is
+intact, not that it is the block that was asked for.** A whole chunk copied over another one —
+which is what a misdirected write or a partial restore looks like — carries its own valid
+checksum, decodes cleanly, and answers a query with another stripe's rows. No layer reports
+anything. Version 1 had exactly that hole, and the campaign found it by copying a region of a file
+over another region of the same file, which is one of the six mutations it makes.
+
+Binding the checksum to the position closes it for a chunk that moves *within* a file. It does not
+close the case of a chunk taken from the same offset in a *different* columnar file; a random file
+identity in the trailer would, and it is deliberately not added, because this build has no entropy
+source (`CLAUDE.md` allows only a seeded `Pcg32`) and a deterministic identity would not be
+unique. Recorded so that the residual is a known one rather than a forgotten one.
+
 This is the Parquet/ORC shape and there is no interesting alternative. What is worth recording is
 the **trailer**, which those formats do differently and which we spend 32 fixed bytes on:
 
