@@ -284,6 +284,17 @@ the compressor. The uncompressed file pins the encodings; the LZ4 file pins what
 disk, `lz4_flex`'s output included, so a dependency bump that moves those bytes fails a test
 rather than silently rewriting every file the next compaction touches.
 
+**A stripe is capped at 4Mi rows, and the fuzz did not find that.** A review pass after unit 7
+found the one allocation shape the cursor's rule does not catch. Every count in this format is
+refused when its items cannot fit in the bytes behind it — but a one-bit encoding satisfies that
+rule honestly: a 256 MB chunk really does hold two billion one-bit values, and decoding them into
+`u64`s asks for sixteen gigabytes. The same shape is reachable through a dictionary's entry count.
+Two caps close it, the row count and the unpacked output, and the row cap outranks the writer's
+options because a limit a writer can be configured past is not a limit. Worth recording *how* it
+was found: the fuzz corpus is five kilobytes, so no mutation of it could ever produce a chunk
+large enough to matter. A fuzz proves the decoders survive the inputs it can build, and the size
+of its corpus is part of what it does not prove.
+
 **`docs/bench/` was out of the lane**, so the compression measurement lives in
 `crates/esker-columnar/tests/compression.rs` and its numbers are below. It asserts floors rather
 than tracking a curve, so it is a regression guard; a proper bench entry belongs with milestone 2,
