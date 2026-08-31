@@ -1,0 +1,20 @@
+crates/esker-client/src/error.rs
+  h_44076b318daf9c 95-103
+crates/esker-client/src/txn.rs
+  h_44076b318daf9c 446-453,522-524,535,586-590,596
+crates/esker-client/tests/txn.rs
+  h_44076b318daf9c 394,398-403,410-492,500
+docs/txn-spec.md
+  h_44076b318daf9c 323-330
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "ee9a525a97925a17423adfc63df3b2e603d51496",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
