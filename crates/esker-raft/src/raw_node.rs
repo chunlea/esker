@@ -201,8 +201,9 @@ impl<S: LogStorage> RawNode<S> {
     /// does not report leaves the peer stranded for the rest of the leader's term — the bytes are
     /// the driver's business (invariant 4), so the driver is the only party that can know.
     ///
-    /// Call it once per transfer, with [`SnapshotStatus::Finished`] when the bytes were delivered
-    /// and [`SnapshotStatus::Failed`] when they were not. Both are statements about the
+    /// Call it once per transfer, with [`SnapshotStatus::Finished`](crate::SnapshotStatus)
+    /// when the bytes were delivered and [`SnapshotStatus::Failed`](crate::SnapshotStatus) when
+    /// they were not. Both are statements about the
     /// *transfer*, never about whether the follower is caught up: that stays the
     /// `AppendEntriesResponse`'s job, and a `Finished` the follower never acts on is corrected by
     /// the probe that follows it.
