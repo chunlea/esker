@@ -22,6 +22,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -49,6 +50,39 @@ fn trace() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
         .try_init();
+}
+
+/// The deadline every store-reaching await in this file gets, so a wedge becomes a failure.
+///
+/// Sixty seconds is far past anything here needs — this file runs in about two seconds on a
+/// quiet box and under thirty on a saturated one — so it can only fire on a wait that was never
+/// going to end.
+const AWAIT_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Awaits `future`, failing with `what` rather than wedging on it.
+///
+/// **The store's own awaits have no upper bound.** [`esker_store::peer::RaftPeer::propose`]
+/// waits on a oneshot that only `complete_proposal` resolves, and that runs when an entry
+/// applies at the proposal's index — so a proposal whose index never applies, on a peer nobody
+/// stops, waits for ever. A test that inherits that wait does not fail slowly; it does not fail
+/// at all.
+///
+/// Observed rather than theorised: a build of this test from before the tick change sat on
+/// `a_region_reaches_a_store_that_never_had_it` for **twenty-one hours**, its main thread parked
+/// in `block_on` while the store's tickers kept polling beside it. A flake costs a re-run; a
+/// wedge costs a CI agent until a human notices. The deadline does not fix the underlying
+/// unbounded wait — that is product code and is written up in `docs/plans/debt-c1.md` section 7
+/// — it makes the symptom a diagnosis instead of a silence.
+async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
+    tokio::time::timeout(AWAIT_DEADLINE, future)
+        .await
+        .unwrap_or_else(|_: tokio::time::error::Elapsed| {
+            panic!(
+                "timed out after {AWAIT_DEADLINE:?} waiting for {what}. This is a wait with no \
+                 end rather than a slow one: most likely a proposal whose index never applied, \
+                 which the store has no timeout of its own for."
+            )
+        })
 }
 
 fn reserve() -> std::net::SocketAddr {
@@ -144,9 +178,19 @@ async fn put(store: &Arc<Store>, key: Bytes, value: &[u8]) {
         };
         let header = RequestHeader::new(state.id(), state.region().epoch, 0);
         let request = RawKvReq::put(key.clone(), Bytes::copy_from_slice(value));
-        match store.serve(header, request).await {
+        match within("a put to be applied", store.serve(header, request)).await {
             Ok(_) => return,
             Err(error) => {
+                // **An ambiguous answer is not a retryable one in general.** A leader that
+                // stepped down with this proposal in its log answers `Unknown`: the entry may
+                // still commit, so a client that repeated the write could apply it twice
+                // (`esker-store`'s pending-proposal invariant). Repeating is safe *here*, and
+                // only here, because every write in this test is an idempotent `Put` of one
+                // fixed value from a single writer, so a second apply cannot be observed.
+                // Before the store answered this case at all, it was a hang.
+                if error.is_ambiguous() {
+                    continue;
+                }
                 assert!(error.is_retryable(), "writing {key:?}: {error}");
                 assert!(Instant::now() < deadline, "writing {key:?} never succeeded");
                 tokio::time::sleep(Duration::from_millis(2)).await;
@@ -359,6 +403,6 @@ async fn a_dozen_regions_on_two_workers_all_make_progress() {
 impl Node {
     async fn stop(self) {
         self.store.stop();
-        let _ = self.handle.shutdown().await;
+        let _ = within("the server to shut down", self.handle.shutdown()).await;
     }
 }

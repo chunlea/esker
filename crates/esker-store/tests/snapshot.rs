@@ -8,6 +8,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -31,7 +32,7 @@ struct Node {
 impl Node {
     async fn stop(self) {
         self.store.stop();
-        let _ = self.handle.shutdown().await;
+        let _ = within("the server to shut down", self.handle.shutdown()).await;
     }
 }
 
@@ -64,6 +65,39 @@ fn trace() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
         .try_init();
+}
+
+/// The deadline every store-reaching await in this file gets, so a wedge becomes a failure.
+///
+/// Sixty seconds is far past anything here needs — this file runs in about two seconds on a
+/// quiet box and under thirty on a saturated one — so it can only fire on a wait that was never
+/// going to end.
+const AWAIT_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Awaits `future`, failing with `what` rather than wedging on it.
+///
+/// **The store's own awaits have no upper bound.** [`esker_store::peer::RaftPeer::propose`]
+/// waits on a oneshot that only `complete_proposal` resolves, and that runs when an entry
+/// applies at the proposal's index — so a proposal whose index never applies, on a peer nobody
+/// stops, waits for ever. A test that inherits that wait does not fail slowly; it does not fail
+/// at all.
+///
+/// Observed rather than theorised: a build of this test from before the tick change sat on
+/// `a_region_reaches_a_store_that_never_had_it` for **twenty-one hours**, its main thread parked
+/// in `block_on` while the store's tickers kept polling beside it. A flake costs a re-run; a
+/// wedge costs a CI agent until a human notices. The deadline does not fix the underlying
+/// unbounded wait — that is product code and is written up in `docs/plans/debt-c1.md` section 7
+/// — it makes the symptom a diagnosis instead of a silence.
+async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
+    tokio::time::timeout(AWAIT_DEADLINE, future)
+        .await
+        .unwrap_or_else(|_: tokio::time::error::Elapsed| {
+            panic!(
+                "timed out after {AWAIT_DEADLINE:?} waiting for {what}. This is a wait with no \
+                 end rather than a slow one: most likely a proposal whose index never applied, \
+                 which the store has no timeout of its own for."
+            )
+        })
 }
 
 /// Takes a free port and releases it, so two stores can be told each other's addresses before
@@ -157,9 +191,19 @@ async fn put(store: &Arc<Store>, region: &Region, key: Bytes, value: &[u8]) {
             .map_or(region.epoch, |state| state.region().epoch);
         let header = RequestHeader::new(region.id, epoch, 0);
         let request = RawKvReq::put(key.clone(), Bytes::copy_from_slice(value));
-        match store.serve(header, request).await {
+        match within("a put to be applied", store.serve(header, request)).await {
             Ok(_) => return,
             Err(error) => {
+                // **An ambiguous answer is not a retryable one in general.** A leader that
+                // stepped down with this proposal in its log answers `Unknown`: the entry may
+                // still commit, so a client that repeated the write could apply it twice
+                // (`esker-store`'s pending-proposal invariant). Repeating is safe *here*, and
+                // only here, because every write in this test is an idempotent `Put` of one
+                // fixed value from a single writer, so a second apply cannot be observed.
+                // Before the store answered this case at all, it was a hang.
+                if error.is_ambiguous() {
+                    continue;
+                }
                 assert!(error.is_retryable(), "writing {key:?}: {error}");
                 assert!(
                     Instant::now() < deadline,
@@ -168,6 +212,14 @@ async fn put(store: &Arc<Store>, region: &Region, key: Bytes, value: &[u8]) {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
         }
+    }
+}
+
+/// Any well-formed command; the routing test only needs the proposal to be refused or accepted.
+fn put_command() -> esker_store::apply::Command {
+    esker_store::apply::Command::Put {
+        key: key(0),
+        value: Bytes::from_static(b"after"),
     }
 }
 
@@ -393,6 +445,148 @@ async fn a_region_reaches_a_store_that_never_had_it() {
             "key {n} did not arrive"
         );
     }
+
+    first.stop().await;
+    second.stop().await;
+}
+
+/// Announces a snapshot to `second` for the region it holds, until its old peer is retired.
+///
+/// Returns whether the retire was observed. See the caller for why this is a loop.
+async fn announce_until_retired(
+    first: &Node,
+    second: &Node,
+    old: &Arc<esker_store::RaftPeer>,
+) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        for n in 40..120 {
+            let region = first.store.regions().regions()[0].clone();
+            put(&first.store, &region, key(n), b"value").await;
+        }
+        let leader = first.store.peer_of(1).expect("the leader");
+        let Some(state) = second.store.regions().get(1) else {
+            return true;
+        };
+        let announcement = esker_proto::RaftMessage::new(
+            1,
+            state.region().epoch,
+            1,
+            esker_raft::Message::InstallSnapshot {
+                from: 1,
+                to: 2,
+                term: leader.status().await.unwrap().term,
+                snapshot: esker_raft::Snapshot {
+                    meta: esker_raft::SnapshotMeta {
+                        index: leader.applied_index(),
+                        term: 1,
+                        conf: esker_raft::ConfState::default(),
+                    },
+                    data: Bytes::new(),
+                },
+            },
+        );
+        second
+            .store
+            .receive_raft(esker_proto::RaftBatch::new(vec![announcement]))
+            .await
+            .expect("an announcement is accepted");
+
+        let settle = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < settle {
+            let replaced = second
+                .store
+                .peer_of(1)
+                .is_none_or(|now| !Arc::ptr_eq(&now, old));
+            if replaced && old.propose(&put_command()).await.is_err() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    false
+}
+
+/// **A snapshot that replaces a region this store already holds retires the old peer first.**
+///
+/// `Store::fetch_snapshot` step 1 calls `retire_region_now` before it writes a byte, and that is
+/// what answers anything still outstanding on the peer being replaced — the snapshot half of the
+/// rule stated on [`esker_store::peer`]'s pending queue: *a pending proposal is resolved on every
+/// path that can make its index unreachable*. The step-down half has its own regressions next to
+/// that queue; this pins the routing, because a refactor of `fetch_snapshot` that dropped the
+/// retire would put the leak back without failing anything else.
+///
+/// Driven by handing the store the announcement directly rather than by arranging for a leader to
+/// send one: `receive_raft` is the entry point either way, and naming an index the learner cannot
+/// have reached makes the held-region branch a fact rather than a race.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_replacing_a_held_region_routes_through_a_retire() {
+    trace();
+    let pd = Arc::new(FakePd::new());
+    let first_address = reserve();
+    let second_address = reserve();
+    let peers = vec![
+        PeerAddress::new(1, 1, first_address),
+        PeerAddress::new(2, 2, second_address),
+    ];
+    let compaction = LogCompaction {
+        threshold: 8,
+        keep: 2,
+        ..LogCompaction::new()
+    };
+    let first = open(
+        first_address,
+        1,
+        &pd,
+        raft_options(peers.clone(), compaction, Some(vec![1])),
+        1,
+    )
+    .await;
+    wait_for("a leader", || {
+        first.store.peer_of(1).is_some_and(|peer| peer.is_leader())
+    })
+    .await;
+    let region = first.store.regions().regions()[0].clone();
+    for n in 0..40 {
+        put(&first.store, &region, key(n), b"value").await;
+    }
+
+    let second = open(
+        second_address,
+        2,
+        &pd,
+        raft_options(peers.clone(), compaction, Some(vec![2])),
+        2,
+    )
+    .await;
+    let epoch = first.store.regions().regions()[0].epoch;
+    pd.issue(Operator::AddPeer {
+        region_id: 1,
+        epoch,
+        store_id: 2,
+        peer_id: 2,
+    });
+    wait_for("the region to arrive on the second store", || {
+        second.store.regions().get(1).is_some()
+    })
+    .await;
+
+    // The peer that is about to be replaced.
+    let old = second
+        .store
+        .peer_of(1)
+        .expect("the arrived region has a peer");
+
+    // Two conditions have to hold at once and they pull in opposite directions: `receive_raft`
+    // acts only when the learner's apply index is **below** the announced one, and the sender
+    // refuses anything **above** what it can offer. The index has to sit in the gap, and the gap
+    // only exists while the learner is catching up — so [`announce_until_retired`] opens one with
+    // a burst of writes and takes losing the race as another round rather than as a failure.
+    let retired = announce_until_retired(&first, &second, &old).await;
+    assert!(
+        retired,
+        "the old peer was never retired, so the snapshot did not route through one"
+    );
 
     first.stop().await;
     second.stop().await;

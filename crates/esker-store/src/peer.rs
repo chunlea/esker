@@ -334,8 +334,35 @@ pub struct PeerCore {
     region: Region,
     region_id: u64,
     peer_id: NodeId,
+    /// Proposals waiting for their entry to apply.
+    ///
+    /// **Every one of these is resolved on every path that can make its index unreachable.** A
+    /// proposal is answered by [`PeerCore::complete_proposal`] when an entry applies at its index,
+    /// so one still sitting here is a caller blocked on a oneshot that has no timeout of its own
+    /// ([`RaftPeer::propose`]). If its index can never be applied, that caller waits *for ever* —
+    /// a hang, not a slow failure, and `esker-proto` already writes the rule this breaks down in
+    /// as many words: "a blocking call with no deadline is a hang"
+    /// (`esker-proto/src/transport/client.rs`).
+    ///
+    /// The paths are enumerable because this vector is only ever populated **on a leader** —
+    /// [`PeerCore::propose`] and [`PeerCore::propose_conf_change`] both refuse otherwise — so
+    /// every entry here belongs to a term in which this peer led. Each path has a handler:
+    ///
+    /// * **the entry applies** — [`PeerCore::complete_proposal`]. That includes a *different*
+    ///   entry taking the index, which is the one case that may honestly answer `NotLeader`,
+    ///   because such an entry provably did not apply;
+    /// * **the peer is stopped, retired, or its driver shuts down** —
+    ///   [`PeerCore::fail_outstanding`]. A snapshot install reaches this too: replacing a region
+    ///   this store already holds retires its peer first (`Store::fetch_snapshot` step 1);
+    /// * **the peer stops leading** — [`PeerCore::resolve_unreachable_proposals`].
+    ///
+    /// Observed as a test process parked for twenty-one hours on a wait that was never going to
+    /// end (`docs/plans/debt-c1.md` section 7).
     pending: Vec<Pending>,
     reads: Vec<PendingRead>,
+    /// Whether this peer led at the end of the last [`PeerCore::drive`], so that a step-down is
+    /// noticed once rather than re-scanned on every pass.
+    led: bool,
     /// Published for the request path, which must not wait on the driver just to learn who leads.
     leader: Arc<AtomicU64>,
     /// Published beside it, for the same reason and one more: a region heartbeat carries the
@@ -413,10 +440,79 @@ impl PeerCore {
             self.node.advance(&ready);
         }
 
+        self.resolve_unreachable_proposals();
         self.publish_leader();
         self.answer_ready_reads();
         self.compact()?;
+        // The invariant in its checkable form. `pending` is only populated on a leader, and a
+        // peer that has stopped leading has just had its orphans resolved above — so a
+        // non-leader holding a proposal is precisely the leak this whole rule exists to stop.
+        debug_assert!(
+            self.node.role() == Role::Leader || self.pending.is_empty(),
+            "region {} is not leading and still holds {} unanswered proposal(s)",
+            self.region_id,
+            self.pending.len()
+        );
         Ok(())
+    }
+
+    /// Answers the proposals this peer can no longer promise anything about, having stopped
+    /// leading. See [`PeerCore::pending`] for the invariant and why the other paths are covered.
+    ///
+    /// **The outcome is `Unknown`, never `NotLeader`.** `NotLeader` is `RequestOutcome::NotApplied`
+    /// — "provably did not take effect" — and that is the one thing that cannot be promised here:
+    /// the entry is in this peer's log, and a quorum it can no longer see may yet commit it.
+    /// Answering `NotApplied` would be the same double-apply this store shipped through
+    /// `fail_outstanding` until `e06acbf`; this is that bug one path over, and the client side
+    /// already resolves `Unknown` by asking again rather than by assuming.
+    ///
+    /// Only proposals **above the apply index**: at or below it the entry has applied and
+    /// `complete_proposal` has already answered.
+    ///
+    /// Reads are failed too, and with `NotLeader` rather than `Unknown`, because they are the
+    /// honest opposite: a `ReadIndex` that never completed established nothing and changed
+    /// nothing, so it is both `NotApplied` and worth retrying elsewhere.
+    fn resolve_unreachable_proposals(&mut self) {
+        if self.node.role() == Role::Leader {
+            self.led = true;
+            return;
+        }
+        if !std::mem::take(&mut self.led) {
+            return;
+        }
+
+        let applied = self.applied_index;
+        let (unreachable, still_answerable): (Vec<Pending>, Vec<Pending>) =
+            std::mem::take(&mut self.pending)
+                .into_iter()
+                .partition(|pending| pending.index > applied);
+        self.pending = still_answerable;
+
+        let orphaned_reads = std::mem::take(&mut self.reads);
+        if unreachable.is_empty() && orphaned_reads.is_empty() {
+            return;
+        }
+        tracing::info!(
+            region_id = self.region_id,
+            proposals = unreachable.len(),
+            reads = orphaned_reads.len(),
+            applied,
+            "stopped leading; answering what this peer can no longer promise"
+        );
+
+        let unknown = ProtoError::Closed {
+            detail: format!(
+                "region {} stopped leading with this proposal in its log; it may still commit",
+                self.region_id
+            ),
+        };
+        for pending in unreachable {
+            let _ = pending.notify.send(Err(unknown.clone()));
+        }
+        let not_leader = self.not_leader();
+        for read in orphaned_reads {
+            let _ = read.notify.send(Err(not_leader.clone()));
+        }
     }
 
     /// Lowers a compaction target to keep the entries a lagging peer still needs.
@@ -1083,6 +1179,7 @@ impl RaftPeer {
             peer_id: options.peer_id,
             pending: Vec::new(),
             reads: Vec::new(),
+            led: false,
             leader: Arc::clone(&leader),
             published: Arc::clone(&published),
             applied_index,
@@ -2239,6 +2336,191 @@ mod tests {
             !error.is_retryable(),
             "a write whose outcome is unknown must not be retried automatically"
         );
+    }
+
+    /// Steps `peer` down by telling it somebody else won a later term.
+    async fn depose(peer: &Arc<RaftPeer>) {
+        let term = peer.status().await.unwrap().term;
+        peer.step(Message::AppendEntries {
+            from: 2,
+            to: 1,
+            term: term + 1,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: Vec::new(),
+            leader_commit: 0,
+            context: Bytes::new(),
+        })
+        .await
+        .unwrap();
+        peer.tick().await.unwrap();
+        assert_ne!(
+            peer.status().await.unwrap().role,
+            Role::Leader,
+            "the step-down did not happen, so this test proves nothing"
+        );
+    }
+
+    /// Elects `peer` in a two-voter group whose other voter grants its vote and then says nothing
+    /// — a leader that can append and can never commit, which is what makes a proposal sit.
+    async fn lead_without_a_quorum(peer: &Arc<RaftPeer>, auditor: &Arc<Auditor>) {
+        for _ in 0..400 {
+            for message in auditor.take_sent() {
+                if let Message::RequestVote {
+                    from,
+                    term,
+                    pre_vote,
+                    ..
+                } = message
+                {
+                    peer.step(Message::RequestVoteResponse {
+                        from: 2,
+                        to: from,
+                        term,
+                        granted: true,
+                        pre_vote,
+                    })
+                    .await
+                    .unwrap();
+                }
+            }
+            peer.tick().await.unwrap();
+            if peer.status().await.unwrap().role == Role::Leader {
+                return;
+            }
+        }
+        panic!("the peer never took office");
+    }
+
+    /// **(a) A proposal orphaned by a step-down is answered, promptly, with `Unknown`.**
+    ///
+    /// The hang this exists to stop: `propose` waits on a oneshot that only `complete_proposal`
+    /// resolves, and `complete_proposal` runs when an entry applies at the proposal's index. A
+    /// peer that stops leading may never apply that index at all, and nothing else was ever going
+    /// to answer. Observed as a test process parked for twenty-one hours, its main thread in
+    /// `block_on` while the store's tickers polled beside it (`docs/plans/debt-c1.md` section 7).
+    ///
+    /// `Unknown` and not `NotLeader`: the entry is in this peer's log and a quorum may yet commit
+    /// it, so "provably did not apply" is the one thing that cannot be said.
+    #[tokio::test]
+    async fn a_proposal_orphaned_by_a_step_down_is_answered_unknown_rather_than_hanging() {
+        let (_dir, db) = open_db();
+        let auditor = Auditor::new(&db).seeded_with(&[1, 2]);
+        let peer = start(
+            &db,
+            1,
+            vec![1, 2],
+            Arc::clone(&auditor) as Arc<dyn RaftTransport>,
+        );
+        lead_without_a_quorum(&peer, &auditor).await;
+        let before = peer.status().await.unwrap();
+
+        let proposing = {
+            let peer = Arc::clone(&peer);
+            tokio::spawn(async move { peer.propose(&put(b"orphan")).await })
+        };
+        let mut appended = false;
+        for _ in 0..400 {
+            let status = peer.status().await.unwrap();
+            if status.last_index > before.last_index {
+                assert_eq!(status.commit, before.commit, "it must not have committed");
+                appended = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(appended, "the proposal never reached the log");
+
+        depose(&peer).await;
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), proposing)
+            .await
+            .expect("the proposal must be answered rather than left waiting for ever")
+            .expect("the proposing task")
+            .expect_err("a proposal that may never apply is not a success");
+        assert_eq!(
+            error.outcome(),
+            esker_proto::RequestOutcome::Unknown,
+            "a step-down answered {error}, which a client reads as safe to repeat"
+        );
+        peer.stop();
+    }
+
+    /// **(b) The same, for the path a snapshot install takes.**
+    ///
+    /// `Store::fetch_snapshot` step 1 retires the peer of a region it is about to replace, so a
+    /// snapshot that jumps past a pending index reaches [`PeerCore::fail_outstanding`] through
+    /// `Job::Retire` rather than through the step-down handler. This drives that same retire
+    /// directly — the mechanism, deterministically — rather than staging a whole snapshot
+    /// install to arrive at it.
+    #[tokio::test]
+    async fn a_proposal_a_retire_jumps_past_is_answered_unknown() {
+        let (_dir, db) = open_db();
+        let auditor = Auditor::new(&db).seeded_with(&[1, 2]);
+        let peer = start(
+            &db,
+            1,
+            vec![1, 2],
+            Arc::clone(&auditor) as Arc<dyn RaftTransport>,
+        );
+        lead_without_a_quorum(&peer, &auditor).await;
+        let before = peer.status().await.unwrap();
+
+        let proposing = {
+            let peer = Arc::clone(&peer);
+            tokio::spawn(async move { peer.propose(&put(b"replaced")).await })
+        };
+        let mut appended = false;
+        for _ in 0..400 {
+            if peer.status().await.unwrap().last_index > before.last_index {
+                appended = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(appended, "the proposal never reached the log");
+
+        // What `fetch_snapshot` does before it writes a byte.
+        peer.stop();
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), proposing)
+            .await
+            .expect("the proposal must be answered rather than left waiting for ever")
+            .expect("the proposing task")
+            .expect_err("a proposal whose region was replaced is not a success");
+        assert_eq!(error.outcome(), esker_proto::RequestOutcome::Unknown);
+    }
+
+    /// **(c) The complement: a proposal that applied keeps its own answer.**
+    ///
+    /// The step-down handler resolves proposals *above* the apply index only. One at or below it
+    /// has already been answered by `complete_proposal`, and stealing that answer — or sending a
+    /// second one — would be the opposite bug. A lone voter commits alone, so the proposal here
+    /// genuinely applies before the peer is deposed.
+    #[tokio::test]
+    async fn a_proposal_that_applied_before_the_step_down_keeps_its_own_outcome() {
+        let (_dir, db) = open_db();
+        let peer = start(&db, 1, vec![1], Arc::new(DiscardTransport));
+        elect_alone(&peer).await;
+
+        let applied = peer
+            .propose(&put(b"landed"))
+            .await
+            .expect("a lone voter applies its own proposals");
+        assert!(
+            matches!(applied, Applied::Done),
+            "the proposal did not apply: {applied:?}"
+        );
+
+        depose(&peer).await;
+
+        // And the peer really has stopped leading, so the run above was not vacuous.
+        let error = peer.propose(&put(b"after")).await.unwrap_err();
+        assert!(
+            matches!(error, ProtoError::NotLeader { .. }),
+            "a deposed peer accepted a proposal: {error}"
+        );
+        peer.stop();
     }
 
     /// Nothing that crosses a thread here is unbounded: an unbounded queue in front of an `fsync`

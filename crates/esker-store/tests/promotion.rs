@@ -146,6 +146,16 @@ async fn put(stores: &[&Arc<Store>], key: Bytes, value: &[u8]) {
             match store.serve(header, request).await {
                 Ok(_) => return,
                 Err(error) => {
+                    // **An ambiguous answer is not a retryable one in general.** A leader that
+                    // stepped down with this proposal in its log answers `Unknown`: the entry may
+                    // still commit, so a client that repeated the write could apply it twice
+                    // (`esker-store`'s pending-proposal invariant). Repeating is safe *here*, and
+                    // only here, because every write in this test is an idempotent `Put` of one
+                    // fixed value from a single writer, so a second apply cannot be observed.
+                    // Before the store answered this case at all, it was a hang.
+                    if error.is_ambiguous() {
+                        continue;
+                    }
                     assert!(error.is_retryable(), "writing {key:?}: {error}");
                     last = Some(error.to_string());
                 }

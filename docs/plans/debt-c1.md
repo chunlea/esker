@@ -241,6 +241,54 @@ starvation belongs to a 1799-test run and did not reproduce synthetically. The c
 not rest on a repro — the fix removes the dependence on scheduling rather than making it less
 likely, and the production evidence is the failure message itself.
 
+## 7. The invariant behind all of it
+
+wy-c2's autopsy of the twenty-one-hour orphan named the shape the rest of this file had been
+circling. Their located mechanism was wrong — `wait_for` has a 20 s deadline and did at
+`8ba2b49^` too — but the smell was right, and reading `peer.rs` found the real one:
+
+```
+put() -> Store::serve() -> RaftPeer::propose() -> answer.await     <- oneshot, no timeout
+```
+
+That oneshot is resolved by `complete_proposal`, which runs when an entry **applies at the
+proposal's index**, or by `fail_outstanding`, which runs on stop, retire and driver shutdown.
+Nothing resolved it when a leader merely **stepped down** — so a proposal whose index was never
+applied left its caller waiting for ever. `esker-proto` already writes the rule this breaks:
+*"a blocking call with no deadline is a hang"* (`transport/client.rs`).
+
+**The invariant is exhaustive, and that is what makes it checkable.** `pending` is only ever
+populated on a leader — both propose paths refuse otherwise — so every pending proposal belongs
+to a term in which this peer led, and the ways its index becomes unreachable can be enumerated:
+
+| Path | Handler |
+|---|---|
+| the entry applies, including a *different* entry taking the index | `complete_proposal` — the one case that may honestly answer `NotLeader` |
+| the peer is stopped, retired, or its driver shuts down | `fail_outstanding` (`e06acbf`) |
+| a snapshot install replaces a region this store holds | the same, via `fetch_snapshot` step 1's `retire_region_now` |
+| **the peer stops leading** | `resolve_unreachable_proposals` — the gap |
+
+Its checkable form is a `debug_assert` at the end of `drive`: a non-leader holding an unanswered
+proposal is precisely the leak.
+
+The outcome is **`Unknown`, never `NotLeader`.** `NotLeader` is `NotApplied` — "provably did not
+take effect" — and that is the one thing that cannot be promised: the entry is in this peer's log
+and a quorum may yet commit it. It is `e06acbf` one path over. Reads are failed too, and with
+`NotLeader`, because they are the honest opposite: a `ReadIndex` that never established its index
+changed nothing.
+
+**Blast radius, measured rather than asserted.** `Transport::call_with_deadline` wraps every call
+in `timeout_at` and `Router::call` adds its own, so nothing reached through `esker-client` can
+wedge. The exposure is exactly in-process holders of a `Store`.
+
+**What it cost elsewhere, and the fourth assumption.** Turning the hang into an answer broke
+`promotion::a_learner_on_a_fresh_store_becomes_a_voter_under_load`, whose writer asserted every
+error it saw was retryable. `Unknown` is not retryable, deliberately. That assertion had only ever
+been true because the alternative was a hang — the same shape as the other three. The writers now
+treat an ambiguous answer as what it is, and repeat only because every write in these tests is an
+idempotent `Put` of one fixed value from a single writer, so a second apply cannot be observed.
+That is a licence these tests have and a client does not.
+
 ## What this lane did not do
 
 * **The simultaneous-claim race** is narrowed to two round trips by a read-back, not closed.
