@@ -1,0 +1,23 @@
+crates/esker-cli/src/bench_txn.rs
+  s_88c85077107b97::t_4e59ae4d727504 26-31
+docs/bench/phase-5.md
+  s_88c85077107b97::t_78d2d0d1545fc0 1-123
+docs/plans/phase-5.md
+  s_88c85077107b97::t_508323db657e94 331-332,334-336,390-477
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "cf8b0bbcfec1cad10e561b3d8e55cc2615f521c7",
+  "prompts": {},
+  "sessions": {
+    "s_88c85077107b97": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e65761d1-f1de-4347-93cc-b0b75ed50b76",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
