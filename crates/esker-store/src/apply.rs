@@ -28,13 +28,13 @@
 //!
 //! ```text
 //! version:u8 = 1
-//! tag:u8       1 Put, 2 BatchPut, 3 Delete, 4 DeleteRange, 5 CompareAndSwap, 6 Split
+//! tag:u8       1 Put, 2 BatchPut, 3 Delete, 4 DeleteRange, 5 CompareAndSwap, 6 Split, 7 Txn
 //! fields       length-prefixed bytes, as each variant documents
 //! ```
 //!
-//! Tag 6 was added in phase 4b. It is an *addition* to the format and not a change to it: every
-//! byte an earlier tag produced still decodes to the same command, and the goldens that pin them
-//! are untouched.
+//! Tag 6 was added in phase 4b and tag 7 in phase 5. Both are *additions* to the format and not
+//! changes to it: every byte an earlier tag produced still decodes to the same command, and the
+//! goldens that pin them are untouched.
 //!
 //! It is deliberately not `RawKvReq`. The Raft log is an on-disk format and the wire is not; tying
 //! them together would mean a wire change rewriting every log in the cluster
@@ -59,6 +59,7 @@ const TAG_DELETE: u8 = 3;
 const TAG_DELETE_RANGE: u8 = 4;
 const TAG_COMPARE_AND_SWAP: u8 = 5;
 const TAG_SPLIT: u8 = 6;
+const TAG_TXN: u8 = 7;
 
 /// A mutation, on its way through the Raft log.
 ///
@@ -100,6 +101,12 @@ pub enum Command {
         /// What to write, or `None` to delete.
         value: Option<Bytes>,
     },
+    /// A transactional write (`docs/DESIGN.md` §8, [`crate::txn_command`]).
+    ///
+    /// Carries the **request**, not the mutations it becomes: the decision is a read-modify-write
+    /// and making it before the log would leave a window two prewrites of one key could race in
+    /// (`docs/plans/phase-5.md` §10.1). Every peer decides at apply, against identical state.
+    Txn(crate::txn_command::TxnCommand),
     /// Divide this region in two (`docs/DESIGN.md` §6). The one **admin** command: it touches no
     /// data column family, only the two regions' metadata.
     ///
@@ -188,6 +195,10 @@ impl Command {
                 out.put_opt_bytes(expected.as_deref());
                 out.put_opt_bytes(value.as_deref());
             }
+            Self::Txn(command) => {
+                out.put_u8(TAG_TXN);
+                command.encode_to(&mut out);
+            }
             Self::Split {
                 split_key,
                 new_region_id,
@@ -254,6 +265,7 @@ impl Command {
                     expected: owned_opt(&mut input, "cas.expected")?,
                     value: owned_opt(&mut input, "cas.value")?,
                 },
+                TAG_TXN => Self::Txn(crate::txn_command::TxnCommand::decode_from(&mut input)?),
                 TAG_SPLIT => {
                     let split_key = owned(&mut input, "split.key")?;
                     let new_region_id = input
@@ -350,6 +362,10 @@ pub fn check_scope(command: &Command, region: &Region) -> Result<(), ProtoError>
         Command::Put { key, .. }
         | Command::Delete { key }
         | Command::CompareAndSwap { key, .. } => one(key),
+        // Every key it touches, not just the first: a transaction's primary may be in another
+        // region entirely, so a batch of secondaries has to be checked against the keys it
+        // actually writes (`crate::txn_command::TxnCommand::keys`).
+        Command::Txn(command) => command.keys().try_for_each(&one),
         Command::BatchPut { pairs } => pairs.iter().try_for_each(|(key, _)| one(key)),
         Command::DeleteRange { start, end } => {
             // The end is *clamped* rather than checked, below: a range delete that ran past the
@@ -570,6 +586,42 @@ pub fn stage(
                 swapped: true,
                 previous: stored,
             })
+        }
+        // The decision is made *here*, against the state this peer holds at this log index,
+        // which is identical on every peer — so every peer stages the same batch and answers
+        // the same thing (`docs/plans/phase-5.md` §10.1). Nothing below reads a clock.
+        Command::Txn(txn) => {
+            use crate::txn_command::{TxnCommand, TxnWrite};
+            let response = match txn {
+                TxnCommand::Prewrite {
+                    start_ts,
+                    primary,
+                    ttl_ms,
+                    writes,
+                } => {
+                    let mutations: Vec<_> = writes.iter().map(TxnWrite::to_wire).collect();
+                    crate::txnkv::prewrite(db, batch, *start_ts, primary, *ttl_ms, &mutations)?
+                }
+                TxnCommand::Commit {
+                    start_ts,
+                    commit_ts,
+                    keys,
+                } => crate::txnkv::commit(db, batch, *start_ts, *commit_ts, keys)?,
+                TxnCommand::Rollback { start_ts, keys } => {
+                    crate::txnkv::rollback(db, batch, *start_ts, keys)?
+                }
+                TxnCommand::ResolveLock {
+                    start_ts,
+                    commit_ts,
+                    keys,
+                } => crate::txnkv::resolve_lock(db, batch, *start_ts, *commit_ts, keys)?,
+                TxnCommand::Heartbeat {
+                    start_ts,
+                    primary,
+                    ttl_ms,
+                } => crate::txnkv::heartbeat(db, batch, *start_ts, primary, *ttl_ms)?,
+            };
+            Ok(Applied::Txn(Box::new(response)))
         }
         // Its effect is on the two regions' metadata, which the driver stages beside the same
         // `apply_index`. Nothing reaches a data column family.

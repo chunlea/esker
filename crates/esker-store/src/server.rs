@@ -26,7 +26,7 @@ use bytes::Bytes;
 use esker_engine::{Db, LocalFileSystem, Options, WalSyncMode, WriteBatch, WriteOptions, cf};
 use esker_proto::{
     BoxFuture, Peer, PeerRole, ProtoError, RaftBatch, RawKvReq, RawKvResp, Region, Reply, Request,
-    RequestHeader, Response, Service, SnapshotRequest, TransportConfig,
+    RequestHeader, Response, Service, SnapshotRequest, TransportConfig, TxnKvReq, TxnKvResp,
 };
 
 use crate::apply::Command;
@@ -35,7 +35,7 @@ use crate::error::{Result, StoreError};
 use crate::heartbeat::{Heartbeats, RegionReport, StoreReport};
 use crate::meta;
 use crate::pd::{PdClient, StoreInfo};
-use crate::peer::{LogCompaction, PeerOptions, RaftPeer, RegionHost};
+use crate::peer::{Applied, LogCompaction, PeerOptions, RaftPeer, RegionHost};
 use crate::raft_log::RaftLogStorage;
 use crate::rawkv::{self, Limits};
 use crate::region::RegionMeta;
@@ -201,6 +201,9 @@ pub struct Store {
     regions: RegionMap,
     store_id: u64,
     limits: Limits,
+    /// The garbage-collection safepoint the placement driver last published: the timestamp
+    /// below which old MVCC versions may go (`docs/DESIGN.md` §8). Raised, never lowered.
+    safepoint: std::sync::atomic::AtomicU64,
     /// Shared by every mutation, exclusive for `CompareAndSwap`. See the module docs.
     ///
     /// Only used by a store with no Raft peer. Once there is one, the Raft log is the
@@ -239,6 +242,24 @@ pub struct Store {
     receiving: std::sync::Mutex<std::collections::BTreeSet<u64>>,
 }
 
+/// Opens the engine and checks it has every column family the store needs.
+///
+/// A missing one is a bootstrap failure rather than a lazily-created family: `Db::open` creates
+/// what it is asked for, so a name absent afterwards means the database disagrees with this
+/// build about what it holds — and finding that at the first write instead would find it on a
+/// path that cannot report it usefully (`docs/DESIGN.md` §4.8).
+fn open_engine(path: impl AsRef<Path>, engine: Options) -> Result<Db> {
+    let db = Db::open_with(path, engine, Arc::new(LocalFileSystem::new()), &cf::BUILTIN)?;
+    for name in cf::BUILTIN {
+        if db.cf_id(name).is_none() {
+            return Err(StoreError::Bootstrap(format!(
+                "the `{name}` column family is missing after open"
+            )));
+        }
+    }
+    Ok(db)
+}
+
 impl Store {
     /// Opens the database in `path`, creating the four built-in column families.
     ///
@@ -270,17 +291,7 @@ impl Store {
             region_heartbeat,
             split,
         } = options;
-        let db = Db::open_with(path, engine, Arc::new(LocalFileSystem::new()), &cf::BUILTIN)?;
-
-        for name in cf::BUILTIN {
-            if db.cf_id(name).is_none() {
-                return Err(StoreError::Bootstrap(format!(
-                    "the `{name}` column family is missing after open"
-                )));
-            }
-        }
-
-        let db = Arc::new(db);
+        let db = Arc::new(open_engine(path, engine)?);
 
         // What this store hosts is what its own `'m'` records say — never what its configuration
         // says on a later open, and never what the placement driver currently believes. A
@@ -348,6 +359,7 @@ impl Store {
             regions,
             store_id,
             limits,
+            safepoint: std::sync::atomic::AtomicU64::new(0),
             write_gate: RwLock::new(()),
             transport,
             raft,
@@ -1892,6 +1904,138 @@ impl Store {
         }
     }
 
+    /// Serves one `TxnKv` request (`docs/DESIGN.md` §8, `docs/txn-spec.md`).
+    ///
+    /// The same two paths as [`Store::serve`], for the same reasons — a read is anchored by a
+    /// `ReadIndex` round and a write becomes a command in the log — with one difference that is
+    /// the whole of `docs/plans/phase-5.md` §10.1: a transactional write carries the **request**
+    /// and is decided at apply, because deciding it here would leave a window two prewrites of
+    /// one key could race in.
+    ///
+    /// `GcSafepoint` takes neither path. It sets a store-local threshold, every store learns it
+    /// from the placement driver, and applying it is idempotent and monotonic — so replicating
+    /// it would put a number in the log that nothing reads back.
+    pub async fn serve_txn(
+        self: &Arc<Self>,
+        header: RequestHeader,
+        request: TxnKvReq,
+    ) -> std::result::Result<TxnKvResp, ProtoError> {
+        if let TxnKvReq::GcSafepoint { safepoint } = request {
+            return Ok(self.set_safepoint(safepoint));
+        }
+
+        let state = self
+            .regions
+            .route_range(&header, Some(crate::region::txn_request_range(&request)))?;
+        let Some(peer) = state.peer().map(Arc::clone) else {
+            let store = Arc::clone(self);
+            return blocking(move || store.handle_txn(&state, request)).await;
+        };
+
+        // A hint, not an authority: a peer deposed a moment ago still says yes here, and the
+        // proposal it accepts on the strength of that is failed by the driver rather than
+        // applied. Checking early only saves a round trip through the driver thread.
+        if !peer.is_leader() {
+            return Err(peer.not_leader());
+        }
+
+        if let Some(command) = crate::txn_command::TxnCommand::from_request(&request) {
+            let applied = peer.propose(&Command::Txn(command)).await?;
+            return match applied {
+                Applied::Txn(response) => Ok(*response),
+                // Every other outcome belongs to another command, so reaching one here is a
+                // driver that mismatched a proposal with its answer rather than anything a
+                // client did.
+                other => Err(ProtoError::internal(format!(
+                    "a transactional command applied as {other:?}"
+                ))),
+            };
+        }
+
+        // A linearizable read. `read_index` returns only once the state machine has applied
+        // through the index it established, so the snapshot below sees at least everything
+        // committed when the read was accepted.
+        peer.read_index().await?;
+        let store = Arc::clone(self);
+        blocking(move || store.handle_txn(&state, request)).await
+    }
+
+    /// Serves one `TxnKv` request against the engine directly, for a store with no Raft peer
+    /// for the region — and for the read half of the replicated path, after its `ReadIndex`.
+    ///
+    /// Synchronous, because the engine is.
+    pub fn handle_txn(
+        &self,
+        state: &Arc<RegionState>,
+        request: TxnKvReq,
+    ) -> std::result::Result<TxnKvResp, ProtoError> {
+        match request {
+            TxnKvReq::Get { key, ts } => {
+                state.meta().check_key(&key)?;
+                crate::txnkv::get(&self.db, &key, ts)
+            }
+            TxnKvReq::Scan {
+                start,
+                end,
+                limit,
+                ts,
+                reverse,
+            } => {
+                state.meta().check_range(&start, &end)?;
+                crate::txnkv::scan(&self.db, &start, &end, limit, ts, reverse)
+            }
+            TxnKvReq::GcSafepoint { safepoint } => Ok(self.set_safepoint(safepoint)),
+            // A write on a store with no peer for this region: no log to put it in, so it is
+            // decided and applied here. The decision is the same one apply would make.
+            other => {
+                let Some(command) = crate::txn_command::TxnCommand::from_request(&other) else {
+                    return Err(ProtoError::internal(
+                        "a TxnKv request that is neither a read nor a command",
+                    ));
+                };
+                for key in command.keys() {
+                    state.meta().check_key(key)?;
+                }
+                let _gate = self.write_gate.write().map_err(|_| {
+                    ProtoError::internal("a thread panicked while holding the write gate")
+                })?;
+                let mut batch = WriteBatch::new();
+                let applied = crate::apply::stage(
+                    &self.db,
+                    &mut batch,
+                    &Command::Txn(command),
+                    state.region(),
+                )?;
+                rawkv::write(&self.db, batch, true)?;
+                match applied {
+                    Applied::Txn(response) => Ok(*response),
+                    other => Err(ProtoError::internal(format!(
+                        "a transactional command applied as {other:?}"
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// Raises this store's garbage-collection safepoint, and answers with the one now in force.
+    ///
+    /// **Never lowers it.** A safepoint that moved backwards would promise a reader history that
+    /// has already been collected, and PD's own safepoint only ever rises — so a lower number
+    /// here is a stale message overtaking a fresh one, not a decision.
+    fn set_safepoint(&self, safepoint: u64) -> TxnKvResp {
+        let now = self
+            .safepoint
+            .fetch_max(safepoint, std::sync::atomic::Ordering::AcqRel)
+            .max(safepoint);
+        TxnKvResp::GcSafepoint { safepoint: now }
+    }
+
+    /// The garbage-collection safepoint this store is working to.
+    #[must_use]
+    pub fn safepoint(&self) -> u64 {
+        self.safepoint.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Flushes every column family, so a caller that is about to stop knows what is on disk.
     pub fn flush(&self) -> Result<()> {
         self.db.flush_all()?;
@@ -2180,18 +2324,12 @@ impl Service for StoreService {
                         store.store_id()
                     )));
                 }
-                // TODO(phase-5): the `TxnKv` handlers. The wire codecs and the decision
-                // library exist (`esker_proto::txn`, `esker-txn`); what is missing is this
-                // store's side, which is deliberately not built while phase 4 is open
-                // (`docs/plans/phase-5.md` §1). A refusal that names the method is what a
-                // client should meet until then — not a default, and not silence.
-                Request::TxnKv { request, .. } => {
-                    return Err(ProtoError::Unsupported {
-                        detail: format!(
-                            "{} is not served yet: the store half of phase 5",
-                            request.method().name()
-                        ),
-                    });
+                // Transactions take their own path: the decision is made at apply, on every
+                // peer alike, so the answer comes back from there rather than from a handler
+                // run here (`docs/plans/phase-5.md` §10.1).
+                Request::TxnKv { header, request } => {
+                    let response = store.serve_txn(header, request).await?;
+                    return Ok(Reply::Unary(Response::TxnKv(response)));
                 }
             };
 

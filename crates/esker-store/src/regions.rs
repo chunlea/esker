@@ -334,6 +334,17 @@ impl RegionMap {
         header: &RequestHeader,
         request: Option<&RawKvReq>,
     ) -> std::result::Result<Arc<RegionState>, ProtoError> {
+        self.route_range(header, request.map(crate::region::request_range))
+    }
+
+    /// [`RegionMap::route`], for a caller that has already worked out the key range its request
+    /// touches — which is every `TxnKv` request, whose ranges are `crate::region`'s to compute
+    /// and not this function's to match on a second time.
+    pub fn route_range(
+        &self,
+        header: &RequestHeader,
+        range: Option<(Bytes, Bytes)>,
+    ) -> std::result::Result<Arc<RegionState>, ProtoError> {
         let inner = self.read();
         let Some(state) = inner.by_id.get(&header.region_id).cloned() else {
             return Err(ProtoError::RegionNotFound {
@@ -343,13 +354,10 @@ impl RegionMap {
         if header.epoch != state.region().epoch {
             // With no request to bound the answer, the region that was asked for is the answer:
             // a header alone says nothing about which keys the caller wanted.
-            let (start, end) = request.map_or_else(
-                || {
-                    let region = state.region();
-                    (region.start_key.clone(), region.end_key.clone())
-                },
-                crate::region::request_range,
-            );
+            let (start, end) = range.unwrap_or_else(|| {
+                let region = state.region();
+                (region.start_key.clone(), region.end_key.clone())
+            });
             let current_regions = inner
                 .overlapping(&start, &end)
                 .map(|state| state.region().clone())

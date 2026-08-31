@@ -57,6 +57,8 @@ pub mod server;
 pub mod snapshot;
 pub mod split;
 pub mod transport;
+pub mod txn_command;
+pub mod txnkv;
 
 pub use apply::Command;
 pub use driver::{DRIVER_WORKERS, DriverPool};

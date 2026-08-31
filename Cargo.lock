@@ -452,6 +452,7 @@ dependencies = [
  "esker-proto",
  "esker-raft",
  "esker-store",
+ "esker-txn",
  "tempfile",
  "thiserror",
  "tokio",

@@ -201,6 +201,27 @@ impl PrimaryCommitted {
     pub fn primary(&self) -> &[u8] {
         &self.primary
     }
+
+    /// Evidence taken **on trust** from a caller that applied the primary's commit elsewhere.
+    ///
+    /// [`PrimaryCommit::applied`] is the safe constructor and the one any caller that holds
+    /// both keys should use. This one exists because a transaction's primary and its
+    /// secondaries may live in **different regions, on different stores**: the store applying
+    /// a secondary's commit cannot read the record that would witness the primary, so the
+    /// evidence has to travel with the request instead of being observed.
+    ///
+    /// What makes it true is the client: its commit path cannot send a secondary commit until
+    /// the primary's own batch was applied, and that ordering is enforced by this very type on
+    /// the client's side. The constructor is named to be conspicuous, because a call to it is a
+    /// place where the guarantee is being *asserted* rather than *held*.
+    #[must_use]
+    pub fn on_trust(primary: Bytes, start_ts: u64, commit_ts: u64) -> Self {
+        Self {
+            start_ts,
+            commit_ts,
+            primary,
+        }
+    }
 }
 
 /// The primary's commit, before it has been applied.

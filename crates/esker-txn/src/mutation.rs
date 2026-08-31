@@ -116,6 +116,21 @@ impl Mutations {
         self.entries.iter()
     }
 
+    /// Appends every mutation of `other`, in order.
+    ///
+    /// One request may decide several keys — a `Prewrite` batch, a `Commit` of many — and the
+    /// whole lot has to reach the engine as one atomic batch, so the per-key lists are merged
+    /// rather than applied one at a time.
+    pub fn extend(&mut self, other: Self) {
+        self.entries.extend(other.entries);
+    }
+
+    /// Stages a lock record at `user_key`. Public because a `Heartbeat` rewrites a lock in
+    /// place rather than deciding anything, so it has no decision function to come from.
+    pub fn put_lock_record(&mut self, user_key: &[u8], record: &LockRecord) {
+        self.put_lock(user_key, record);
+    }
+
     pub(crate) fn put(&mut self, cf: Cf, key: Vec<u8>, value: Vec<u8>) {
         self.entries.push(Mutation::Put { cf, key, value });
     }

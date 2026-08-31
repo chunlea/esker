@@ -193,6 +193,60 @@ impl RegionMeta {
     }
 }
 
+/// The key range one `TxnKv` request touches, so a stale epoch can be answered with the regions
+/// that now cover it rather than with the one that was asked for.
+///
+/// A `Prewrite`'s range is over the keys it **writes**, not its primary: the primary may be in
+/// another region entirely, and a batch of secondaries has to be routed by what it touches. A
+/// request with no keys at all takes the empty range, which matches no region — the honest
+/// answer, rather than the whole key space.
+#[must_use]
+pub fn txn_request_range(request: &esker_proto::TxnKvReq) -> (Bytes, Bytes) {
+    use esker_proto::TxnKvReq;
+
+    fn successor(key: &[u8]) -> Bytes {
+        let mut out = Vec::with_capacity(key.len() + 1);
+        out.extend_from_slice(key);
+        out.push(0);
+        Bytes::from(out)
+    }
+
+    fn span<'a>(keys: impl Iterator<Item = &'a [u8]>) -> (Bytes, Bytes) {
+        let mut low: Option<&[u8]> = None;
+        let mut high: Option<&[u8]> = None;
+        for key in keys {
+            if low.is_none_or(|current| key < current) {
+                low = Some(key);
+            }
+            if high.is_none_or(|current| key > current) {
+                high = Some(key);
+            }
+        }
+        match (low, high) {
+            (Some(low), Some(high)) => (Bytes::copy_from_slice(low), successor(high)),
+            // A batch with no keys touches nothing, and an empty range matches no region — which
+            // is the honest answer rather than the whole key space.
+            _ => (Bytes::new(), Bytes::new()),
+        }
+    }
+
+    match request {
+        TxnKvReq::Get { key, .. } => (Bytes::copy_from_slice(key), successor(key)),
+        TxnKvReq::Scan { start, end, .. } => (start.clone(), end.clone()),
+        TxnKvReq::Prewrite { mutations, .. } => {
+            span(mutations.iter().map(|mutation| &mutation.key()[..]))
+        }
+        TxnKvReq::Commit { keys, .. }
+        | TxnKvReq::Rollback { keys, .. }
+        | TxnKvReq::ResolveLock { keys, .. } => span(keys.iter().map(|key| &key[..])),
+        TxnKvReq::Heartbeat { primary, .. } => {
+            (Bytes::copy_from_slice(primary), successor(primary))
+        }
+        // Store-local: it is addressed to a store rather than to a range.
+        TxnKvReq::GcSafepoint { .. } => (Bytes::new(), Bytes::new()),
+    }
+}
+
 /// The key range a request touches, as `[start, end)` with an **empty `end` meaning the end of
 /// the key space** — the convention every region comparison uses.
 ///

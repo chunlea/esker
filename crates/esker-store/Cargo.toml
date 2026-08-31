@@ -16,6 +16,9 @@ esker-engine.workspace = true
 esker-keys.workspace = true
 # The wire: messages, the typed error, and the Service the server calls.
 esker-proto.workspace = true
+# Percolator's decisions, records and keys. The store owns none of them: it decodes a request,
+# asks this crate what to write, and writes it through Raft (docs/plans/phase-5.md §10).
+esker-txn.workspace = true
 # Consensus. The store is its driver: it owns the RawNode, performs the writes a `Ready`
 # asks for, and enforces the ordering the pure core cannot (docs/DESIGN.md §5).
 esker-raft.workspace = true

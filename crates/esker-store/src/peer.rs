@@ -143,6 +143,13 @@ pub enum Applied {
         /// The count.
         keys: u64,
     },
+    /// A transactional write's answer, decided at apply time on every peer alike — the same
+    /// reason `Swapped` is here (`docs/plans/phase-5.md` §10.1).
+    ///
+    /// It is the wire response outright rather than a summary of it, because every one of the
+    /// five verbs answers something different and a summary would be five fields of which four
+    /// are always absent.
+    Txn(Box<esker_proto::TxnKvResp>),
 }
 
 /// What the driver thread accepts.
