@@ -17,14 +17,32 @@
 //! whether the run was legal. An acknowledged write that vanished makes the final read
 //! unexplainable, and the checker says so — with the operation that broke it.
 //!
-//! # Ambiguous outcomes
+//! # What a failed call is worth recording as
 //!
-//! A client whose request was sent and never answered does not know whether it happened.
-//! [`Error::AmbiguousResult`] is exactly that, and it is recorded as a *maybe-applied*
-//! operation: the model accepts either, and the checker is free to place it anywhere after its
-//! invocation — including at the very end, where it is indistinguishable from never having
-//! happened. Recording those as failures instead would be a lie in whichever direction the run
-//! happened to go.
+//! A call that fails has one of two fates, and the client already knows which:
+//! [`Error::changed_nothing`] is the predicate the transaction layer branches on, and it defers
+//! to [`esker_proto::ProtoError::outcome`] so that the client and the protocol can never
+//! disagree.
+//!
+//! * **The store refused.** A `NotLeader`, an epoch that moved, a retry budget spent on
+//!   redirects: the request provably did not take effect. It is not in the history at all,
+//!   because a history is a record of what the cluster *did* and this is a record of it
+//!   declining to.
+//! * **Nobody learned.** The request went out and no usable answer came back
+//!   ([`Error::AmbiguousResult`]). It is recorded as a *maybe-applied* operation: the model
+//!   accepts either, and the checker may place it anywhere after its invocation — including at
+//!   the very end, where it is indistinguishable from never having happened. Recording those as
+//!   failures instead would be a lie in whichever direction the run happened to go.
+//!
+//! Keeping them apart is not bookkeeping, it is what makes the check affordable. A maybe-applied
+//! operation is **unbounded**: its response time is infinite, so it overlaps every operation
+//! after it and the search must consider placing it at every point. Each one roughly doubles the
+//! space. Recording refusals as maybe-applied put hundreds of them in a run's histories — a
+//! three-second run with four kills recorded *eleven* acknowledged writes and *two hundred and
+//! forty* refusals — and a search over fifty unbounded operations does not finish at any budget
+//! anybody would wait for. That is the whole of why this test used to exhaust under load: a
+//! saturated cluster spends longer with no leader, so it refuses more, and every refusal was
+//! being written down as something that might have happened.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -34,240 +52,164 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use esker_client::region_cache::StaticRegion;
-use esker_client::{Error, RawClient, TcpStores};
-use esker_proto::{Server, ServerHandle, TransportConfig};
-use esker_raft::Role;
+use esker_client::Error;
 use esker_sim::lin::{
-    CheckOutcome, Checker, History, OpId, Register, RegisterInput, RegisterOutput,
+    CheckOutcome, Checker, Completion, History, Op, Register, RegisterInput, RegisterOutput,
 };
-use esker_store::server::RaftOptions;
-use esker_store::{PeerAddress, Store, StoreOptions, StoreService};
-use tempfile::TempDir;
 
-const REGION: u64 = 1;
+#[path = "chaos_cluster/mod.rs"]
+mod chaos_cluster;
+
+use chaos_cluster::{Cluster, connect};
+
 /// Keys the clients share. Few on purpose: collisions are what make a history worth checking.
 ///
-/// Five rather than three, and the reason is the checker's cost rather than its coverage. The
-/// search is superlinear in one key's history length: at three keys a run recorded about 67
-/// operations per key, and a 67-operation history was measured taking **more than 73 million
-/// search steps — 146 seconds — and still not deciding**, where a 66-operation one decided
-/// inside a million. That is a cliff, not a slope, and the cheap side of it is a shorter
-/// per-key history. Six clients over five keys still collide constantly, which is what the
-/// histories are for; the run's total operation count under the kills is unchanged.
-const KEYS: usize = 5;
+/// This was raised to five to make per-key histories shorter, on the reading that the search
+/// was superlinear in a history's *length*. It is not: it is exponential in how many of the
+/// operations are **unbounded**, and the 67-operation histories that could not be decided were
+/// about sixty refusals apiece — operations the cluster provably never performed. With those no
+/// longer recorded (see the module docs) a key's history is the handful of calls that actually
+/// answered, and spreading those over five keys buys nothing while costing exactly what few
+/// keys are for: collisions. So it is back to three, where six clients contend hard enough to
+/// be worth checking.
+const KEYS: usize = 3;
 /// Concurrent clients.
 const CLIENTS: usize = 6;
-/// The seed every node's election timer is drawn from.
-const SEED: u64 = 20_260_830;
 
-/// One store: its server and the directory that outlives it.
-struct Node {
-    store: Arc<Store>,
-    handle: ServerHandle,
-}
-
-/// A three-node cluster that can lose a node and get it back.
-struct Cluster {
-    runtime: tokio::runtime::Runtime,
-    peers: Vec<PeerAddress>,
-    addrs: Vec<SocketAddr>,
-    dirs: Vec<TempDir>,
-    /// `None` while that node is down.
-    nodes: Vec<Mutex<Option<Node>>>,
-}
-
-/// Reserves `count` ports by binding and releasing them.
+/// Whether a call that failed belongs in the history at all.
 ///
-/// Every store has to know every peer's address before any server exists, so the addresses
-/// cannot come from the servers. A released port is rebound microseconds later; a peer that is
-/// briefly unreachable simply has its messages dropped and retried, which is the transport's
-/// ordinary behaviour.
-fn reserve_ports(count: usize) -> Vec<SocketAddr> {
-    let listeners: Vec<std::net::TcpListener> = (0..count)
-        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    listeners
-        .iter()
-        .map(|listener| listener.local_addr().unwrap())
-        .collect()
+/// The two answers are [`Error::changed_nothing`]'s two answers, and deferring to it is the
+/// point: the client and the protocol already agree about what each failure means, and a test
+/// that decided it a second time would be a third opinion to keep in step. See the module docs
+/// for why the distinction is what makes the search affordable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fate {
+    /// The store refused, or the request never went out. It did not happen, so there is
+    /// nothing to explain and nothing to record.
+    DidNotHappen,
+    /// It went out and no usable answer came back. Recorded, unbounded.
+    MaybeApplied,
 }
 
-impl Cluster {
-    fn start(count: usize) -> Arc<Self> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .build()
-            .unwrap();
-        let addrs = reserve_ports(count);
-        let peers: Vec<PeerAddress> = (0..count)
-            .map(|at| PeerAddress::new(at as u64 + 1, at as u64 + 1, addrs[at]))
-            .collect();
-        let dirs: Vec<TempDir> = (0..count).map(|_| TempDir::new().unwrap()).collect();
-
-        let cluster = Arc::new(Self {
-            runtime,
-            peers,
-            addrs,
-            dirs,
-            nodes: (0..count).map(|_| Mutex::new(None)).collect(),
-        });
-        for at in 0..count {
-            cluster.start_node(at);
-        }
-        cluster
-    }
-
-    /// Starts node `at` on its own address and directory. A restart reopens the same database,
-    /// which is the point: what it recovers is what it had made durable.
-    fn start_node(&self, at: usize) {
-        let id = at as u64 + 1;
-        let mut raft = RaftOptions::new(self.peers.clone(), SEED);
-        // Shorter than production's 100 ms so an election takes a fraction of a second. The
-        // algorithm counts ticks, so nothing about it changes — but this file kills a node every
-        // few hundred milliseconds, and a tick that is too short churns leadership on scheduler
-        // noise alone.
-        raft.tick = Duration::from_millis(25);
-        let options = StoreOptions {
-            store_id: id,
-            peer_id: id,
-            region_id: REGION,
-            raft: Some(raft),
-            ..StoreOptions::new()
-        };
-        // Inside the runtime: opening a store spawns the transport's per-peer tasks, and
-        // `tokio::spawn` needs a runtime to spawn onto.
-        let store = {
-            let _guard = self.runtime.enter();
-            Store::open(self.dirs[at].path(), options).unwrap()
-        };
-        let addr = self.addrs[at];
-        let service = StoreService::new(Arc::clone(&store));
-        let handle = self.runtime.block_on(async move {
-            Server::bind(addr, service, TransportConfig::new())
-                .await
-                .unwrap()
-                .spawn()
-                .unwrap()
-        });
-        *self.nodes[at].lock().unwrap() = Some(Node { store, handle });
-    }
-
-    /// Takes node `at` away: the server stops answering and the store stops replicating.
-    ///
-    /// This is the in-process stand-in for a `SIGKILL`. It is not one — a thread cannot be shot,
-    /// and anything still inside the engine finishes — so what it proves is bounded: every
-    /// acknowledged write is durable *and* recoverable across losing the process that
-    /// acknowledged it. The unbounded version, with a real signal and a real process, is
-    /// `esker-cli/tests/cluster_chaos.rs`.
-    fn kill_node(&self, at: usize) {
-        let node = self.nodes[at].lock().unwrap().take();
-        if let Some(node) = node {
-            node.store.stop();
-            self.runtime.block_on(async {
-                let _ = node.handle.shutdown().await;
-            });
-        }
-    }
-
-    /// The index of the node that believes it leads, if exactly one does.
-    fn leader(&self) -> Option<usize> {
-        for at in 0..self.nodes.len() {
-            let guard = self.nodes[at].lock().unwrap();
-            let Some(node) = guard.as_ref() else { continue };
-            let Some(peer) = node.store.peer() else {
-                continue;
-            };
-            let role = self.runtime.block_on(peer.status()).ok().map(|s| s.role);
-            if role == Some(Role::Leader) {
-                return Some(at);
-            }
-        }
-        None
-    }
-
-    /// Waits until some node leads and every live node agrees, or the deadline passes.
-    fn settle(&self, within: Duration) -> bool {
-        let deadline = Instant::now() + within;
-        while Instant::now() < deadline {
-            if let Some(at) = self.leader() {
-                let id = at as u64 + 1;
-                let agreed = (0..self.nodes.len()).all(|other| {
-                    let guard = self.nodes[other].lock().unwrap();
-                    guard.as_ref().is_none_or(|node| {
-                        node.store
-                            .peer()
-                            .is_none_or(|peer| peer.leader() == Some(id))
-                    })
-                });
-                if agreed {
-                    return true;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        false
-    }
-
-    fn shutdown(&self) {
-        for at in 0..self.nodes.len() {
-            self.kill_node(at);
-        }
-    }
-}
-
-/// The histories, one per key, each recording every client's operations on it in the order they
-/// were observed.
+/// A call that has been stamped but has not ended yet.
 ///
-/// One mutex per key, taken to stamp an invocation and taken again to stamp the response — never
+/// It carries everything its operation will need, because nothing is written down until the
+/// call ends and it is known whether there is anything to write down.
+struct InFlight {
+    key: usize,
+    client: u64,
+    input: RegisterInput,
+    invoked: u64,
+}
+
+impl InFlight {
+    fn into_op(self, completion: Completion<RegisterOutput>) -> Op<RegisterInput, RegisterOutput> {
+        Op {
+            client: self.client,
+            input: self.input,
+            invoked: self.invoked,
+            completion,
+        }
+    }
+}
+
+/// One key's operations and the clock that stamps them.
+///
+/// The clock ticks once per observed event — a call starting, a call ending — whether or not
+/// the event becomes an operation. Ticking for a refusal too keeps the stamps a record of
+/// *when things were observed* rather than of what survived the recording.
+struct Log {
+    ops: Vec<Op<RegisterInput, RegisterOutput>>,
+    clock: u64,
+}
+
+impl Log {
+    fn tick(&mut self) -> u64 {
+        let now = self.clock;
+        self.clock += 1;
+        now
+    }
+}
+
+/// The logs, one per key, each recording every client's operations on it in the order they were
+/// observed.
+///
+/// One mutex per key, taken to stamp the start of a call and taken again when it ends — never
 /// held across the call itself. That is what makes the recorded order the *observed* order: two
 /// operations that really overlapped are recorded as overlapping, and two that did not are not.
 struct Recorder {
-    keys: Vec<Mutex<History<RegisterInput, RegisterOutput>>>,
+    keys: Vec<Mutex<Log>>,
 }
 
 impl Recorder {
     fn new() -> Self {
         Self {
-            keys: (0..KEYS).map(|_| Mutex::new(History::new())).collect(),
+            keys: (0..KEYS)
+                .map(|_| {
+                    Mutex::new(Log {
+                        ops: Vec::new(),
+                        clock: 0,
+                    })
+                })
+                .collect(),
         }
     }
 
-    fn invoke(&self, key: usize, client: u64, input: RegisterInput) -> OpId {
-        self.keys[key].lock().unwrap().invoke(client, input)
+    /// Stamps the start of a call.
+    fn begin(&self, key: usize, client: u64, input: RegisterInput) -> InFlight {
+        let invoked = self.keys[key].lock().unwrap().tick();
+        InFlight {
+            key,
+            client,
+            input,
+            invoked,
+        }
     }
 
-    fn responded(&self, key: usize, op: OpId, output: RegisterOutput) {
-        let _ = self.keys[key].lock().unwrap().respond(op, output);
+    /// The call answered, and said what it did.
+    fn responded(&self, op: InFlight, output: RegisterOutput) {
+        let mut log = self.keys[op.key].lock().unwrap();
+        let at = log.tick();
+        log.ops.push(op.into_op(Completion::Ok { at, output }));
     }
 
-    /// The client asked and never learned the answer. It may have happened; it may not.
-    fn maybe(&self, key: usize, op: OpId) {
-        let _ = self.keys[key].lock().unwrap().respond_unknown(op);
+    /// The call failed. Whether it is recorded at all is [`Fate`]'s answer, not this
+    /// function's.
+    fn ended(&self, op: InFlight, fate: Fate) {
+        let mut log = self.keys[op.key].lock().unwrap();
+        let at = log.tick();
+        if fate == Fate::MaybeApplied {
+            log.ops.push(op.into_op(Completion::Unknown { at }));
+        }
     }
+
+    /// One key's history, in invocation order.
+    ///
+    /// Built at the end rather than kept: an operation is appended when its call *ends*, so the
+    /// log is in completion order, and [`History::ops`] promises invocation order.
+    fn history(&self, key: usize) -> History<RegisterInput, RegisterOutput> {
+        let mut ops = self.keys[key].lock().unwrap().ops.clone();
+        ops.sort_by_key(|op| op.invoked);
+        History::from_ops(ops).expect("the clock stamps every ending after its own beginning")
+    }
+}
+
+/// How many of a history's operations the checker may place anywhere.
+///
+/// The ones nobody learned the outcome of: their response time is infinite, so each of them
+/// overlaps everything after it. This is the number the search's cost is exponential in, which
+/// is why it is the number the reports carry — the count of *pending* operations, which is what
+/// they used to carry, is zero in every run this file can produce.
+fn unbounded(history: &History<RegisterInput, RegisterOutput>) -> usize {
+    history
+        .ops()
+        .iter()
+        .filter(|op| !matches!(op.completion, Completion::Ok { .. }))
+        .count()
 }
 
 fn key_bytes(key: usize) -> Vec<u8> {
     format!("chaos-{key:02}").into_bytes()
-}
-
-/// Connects a client to every store, retrying until the cluster has someone listening.
-///
-/// Rebuilt rather than repaired after a node is killed: `TcpStores` opens its connections once,
-/// so a client that has lost one reconnects, which is what a real client does.
-fn connect(addrs: &[SocketAddr], deadline: Instant) -> Option<RawClient> {
-    while Instant::now() < deadline {
-        if let Ok(stores) = TcpStores::connect_all(addrs, TransportConfig::new()) {
-            let ids = stores.store_ids();
-            return Some(RawClient::new(
-                Arc::new(stores),
-                Arc::new(StaticRegion::replicated(REGION, &ids)),
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    None
 }
 
 /// What one client did, for the report.
@@ -311,29 +253,29 @@ fn drive(
         let mut reconnect = false;
         match choice {
             0 | 1 => {
-                let op = recorder.invoke(key, client_id, RegisterInput::Write(value.clone()));
+                let op = recorder.begin(key, client_id, RegisterInput::Write(value.clone()));
                 match client.put(&bytes, &value) {
                     Ok(()) => {
-                        recorder.responded(key, op, RegisterOutput::Written);
+                        recorder.responded(op, RegisterOutput::Written);
                         tally.acked_writes += 1;
                         writes.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(error) => {
-                        reconnect = classify(&error, &mut tally);
-                        recorder.maybe(key, op);
+                        reconnect = true;
+                        recorder.ended(op, fate(&error, &mut tally));
                     }
                 }
             }
             2 => {
-                let op = recorder.invoke(key, client_id, RegisterInput::Read);
+                let op = recorder.begin(key, client_id, RegisterInput::Read);
                 match client.get(&bytes) {
                     Ok(found) => {
-                        recorder.responded(key, op, RegisterOutput::Value(found));
+                        recorder.responded(op, RegisterOutput::Value(found));
                         tally.reads += 1;
                     }
                     Err(error) => {
-                        reconnect = classify(&error, &mut tally);
-                        recorder.maybe(key, op);
+                        reconnect = true;
+                        recorder.ended(op, fate(&error, &mut tally));
                     }
                 }
             }
@@ -341,7 +283,7 @@ fn drive(
                 // Compare-and-swap from whatever the client last saw. `expected` being wrong is
                 // ordinary — another client got there first — and the model says so.
                 let expected = client.get(&bytes).ok().flatten();
-                let op = recorder.invoke(
+                let op = recorder.begin(
                     key,
                     client_id,
                     RegisterInput::Cas {
@@ -351,15 +293,15 @@ fn drive(
                 );
                 match client.compare_and_swap(&bytes, expected.as_deref(), Some(&value)) {
                     Ok((swapped, _)) => {
-                        recorder.responded(key, op, RegisterOutput::Swapped(swapped));
+                        recorder.responded(op, RegisterOutput::Swapped(swapped));
                         tally.swaps += 1;
                         if swapped {
                             writes.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     Err(error) => {
-                        reconnect = classify(&error, &mut tally);
-                        recorder.maybe(key, op);
+                        reconnect = true;
+                        recorder.ended(op, fate(&error, &mut tally));
                     }
                 }
             }
@@ -372,16 +314,19 @@ fn drive(
     tally
 }
 
-/// Counts an error, and says whether the client should reconnect.
-fn classify(error: &Error, tally: &mut Tally) -> bool {
-    if matches!(error, Error::AmbiguousResult { .. }) {
-        tally.ambiguous += 1;
-    } else {
+/// What a failed call means for the history, counted on the way past.
+///
+/// The answer is [`Error::changed_nothing`]'s: the client already carries the protocol's
+/// verdict outwards, and the transaction layer branches on the same call. Deciding it here a
+/// second time would be a third opinion to keep in step with the other two.
+fn fate(error: &Error, tally: &mut Tally) -> Fate {
+    if error.changed_nothing() {
         tally.refused += 1;
+        Fate::DidNotHappen
+    } else {
+        tally.ambiguous += 1;
+        Fate::MaybeApplied
     }
-    // Either way the client reconnects: `TcpStores` opens its connections once, so a client
-    // that has lost the store it was talking to has to build a new book to find another.
-    true
 }
 
 /// Runs the battery: `kills` leader kills, then settles and checks every key's history.
@@ -469,7 +414,7 @@ fn final_reads(addrs: &[SocketAddr], recorder: &Recorder) {
     };
     for key in 0..KEYS {
         let bytes = key_bytes(key);
-        let op = recorder.invoke(key, 0, RegisterInput::Read);
+        let op = recorder.begin(key, 0, RegisterInput::Read);
         // Retried, because a settled cluster can still refuse one call while a connection is
         // being re-established, and a missing final read would weaken the check rather than fail
         // it honestly.
@@ -484,8 +429,11 @@ fn final_reads(addrs: &[SocketAddr], recorder: &Recorder) {
             }
         }
         match found {
-            Some(value) => recorder.responded(key, op, RegisterOutput::Value(value)),
-            None => recorder.maybe(key, op),
+            Some(value) => recorder.responded(op, RegisterOutput::Value(value)),
+            // A read that never answered saw nothing and changed nothing, so it anchors
+            // nothing. Recording it as maybe-applied would cost the search a dimension to say
+            // exactly as little.
+            None => recorder.ended(op, Fate::DidNotHappen),
         }
     }
 }
@@ -569,15 +517,15 @@ fn verdict_from(history: &History<RegisterInput, RegisterOutput>, first: u64) ->
 /// Every key's history has to be linearizable against the register model.
 fn check_histories(recorder: &Recorder, killed: u32) {
     for key in 0..KEYS {
-        let history = recorder.keys[key].lock().unwrap();
+        let history = recorder.history(key);
         if history.is_empty() {
             continue;
         }
         match verdict_for(&history) {
             Verdict::Linearizable { placed } => {
                 println!(
-                    "key {key}: {placed} operations linearizable ({} pending)",
-                    history.pending()
+                    "key {key}: {placed} operations linearizable ({} unbounded)",
+                    unbounded(&history)
                 );
             }
             Verdict::Violation { report } => panic!(
@@ -588,9 +536,11 @@ fn check_histories(recorder: &Recorder, killed: u32) {
                 "key {key}: the linearizability search ran out of budget after {steps} steps at \
                  {budget}, having grown it {BUDGET_ATTEMPTS} times from {FIRST_BUDGET}. This is \
                  EXHAUSTION, not a violation: no order was ruled out. The history has {} \
-                 operations ({} pending); raise FIRST_BUDGET or shorten the run.",
+                 operations, of which {} are unbounded — and it is that second number the cost \
+                 is exponential in, so a run that reaches this has started recording operations \
+                 nobody learned the outcome of far more often than a leader kill can explain.",
                 history.len(),
-                history.pending()
+                unbounded(&history)
             ),
         }
     }
