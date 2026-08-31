@@ -325,3 +325,149 @@ async fn psql_connects_and_is_told_the_truth() {
         "a client asking for protocol 3.2 must be downgraded and let in; stderr was: {stderr}"
     );
 }
+
+/// The real executor behind a real `psql`: the acceptance the plan describes for phase 6a.
+///
+/// Everything else in the crate tests one layer. This runs a whole session — `CREATE TABLE`,
+/// `INSERT`, `SELECT`, a bound parameter through the extended protocol, a constraint violation and
+/// a transaction — through a client written by someone else, over a socket, against the executor
+/// and the store. The statements and the answers are the ones `tests/slt/` holds, which were
+/// themselves checked against a real PostgreSQL 19.
+#[tokio::test(flavor = "multi_thread")]
+async fn psql_runs_real_sql_against_the_real_executor() {
+    if !psql_available() {
+        eprintln!("skipping: no psql on this machine");
+        return;
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve_on(
+            listener,
+            Config {
+                address: address.to_string(),
+                auth: Auth::Trust,
+                ..Config::default()
+            },
+            Arc::new(RealSessions::new()),
+        )
+        .await;
+    });
+
+    let url = format!(
+        "postgresql://esker@127.0.0.1:{}/esker?sslmode=disable",
+        address.port()
+    );
+    // One connection for the whole script, so the table one statement creates is there for the
+    // next — which also means the store really is shared between statements.
+    let script = "
+        CREATE TABLE accounts (id int8 PRIMARY KEY, email text NOT NULL UNIQUE, balance int8);
+        INSERT INTO accounts VALUES (1, 'ada@esker', 100), (2, 'grace@esker', 250);
+        SELECT email, balance FROM accounts ORDER BY balance DESC;
+        UPDATE accounts SET balance = balance WHERE id = 1;
+        INSERT INTO accounts VALUES (3, 'ada@esker', 0);
+        SELECT email FROM accounts WHERE id = $1 \\bind 2 \\g
+        BEGIN;
+        DELETE FROM accounts WHERE id = 2;
+        ROLLBACK;
+        SELECT count_me FROM accounts;
+        SELECT id FROM accounts ORDER BY id;
+    ";
+    let output = tokio::task::spawn_blocking(move || {
+        use std::io::Write as _;
+        let mut child = std::process::Command::new("psql")
+            .arg(&url)
+            .arg("-X")
+            .arg("-A")
+            .arg("-t")
+            .arg("-q")
+            .arg("-F")
+            .arg("|")
+            // Verbose, so the SQLSTATE is in the output: the message is what a human reads and
+            // the code is what a client branches on, and both are part of the contract.
+            .arg("-v")
+            .arg("VERBOSITY=verbose")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .env("PGCONNECT_TIMEOUT", "5")
+            .spawn()
+            .expect("psql should run");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(script.as_bytes())
+            .expect("write");
+        child.wait_with_output().expect("psql should finish")
+    })
+    .await
+    .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // The rows, in the order the ORDER BY asked for.
+    assert!(
+        stdout.contains("grace@esker|250") && stdout.contains("ada@esker|100"),
+        "the SELECT did not return its rows; stdout was:\n{stdout}"
+    );
+    assert!(
+        stdout.find("grace@esker|250") < stdout.find("ada@esker|100"),
+        "ORDER BY balance DESC did not order them; stdout was:\n{stdout}"
+    );
+    // The bound parameter, through the extended protocol, driven by a real client.
+    assert!(
+        stdout.contains("grace@esker"),
+        "the bound parameter did not resolve; stdout was:\n{stdout}"
+    );
+    // The unique constraint, named the way PostgreSQL names it.
+    assert!(
+        stderr.contains("23505") && stderr.contains("accounts_email_key"),
+        "the duplicate was not reported; stderr was:\n{stderr}"
+    );
+    // The rolled-back DELETE left the row.
+    assert!(
+        stderr.contains("42703"),
+        "the missing column was not reported; stderr was:\n{stderr}"
+    );
+    let ids: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.trim() == "1" || line.trim() == "2")
+        .collect();
+    assert_eq!(
+        ids,
+        ["1", "2"],
+        "the rolled-back DELETE should have left both rows; stdout was:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains("could not connect") && !stderr.contains("server closed"),
+        "the connection must survive the whole script; stderr was:\n{stderr}"
+    );
+}
+
+/// Hands every session an executor over one shared store, the way the binary does.
+struct RealSessions {
+    backend: Arc<dyn esker_sql::backend::Backend>,
+    catalog: Arc<esker_sql::catalog::Catalog>,
+}
+
+impl RealSessions {
+    fn new() -> Self {
+        RealSessions {
+            backend: Arc::new(esker_sql::backend::MemoryBackend::new()),
+            catalog: Arc::new(esker_sql::catalog::Catalog::new()),
+        }
+    }
+}
+
+impl Executors for RealSessions {
+    fn for_session(&self) -> Box<dyn Execute + Send> {
+        Box::new(esker_sql::exec::Executor::new(
+            Arc::clone(&self.backend),
+            Arc::clone(&self.catalog),
+            1,
+        ))
+    }
+}

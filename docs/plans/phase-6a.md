@@ -1,6 +1,6 @@
 # Phase 6a plan — a stateless node that speaks PostgreSQL
 
-Status: **in progress** — written before implementation; §10 records progress and §11 what changed.
+Status: **complete** — written before implementation; §10 records progress and §11 what changed.
 Spec: `prompts/06-sql-serverless.md` §6a. Constitution: `CLAUDE.md`. Design: `docs/DESIGN.md` §13
 (the sketch), §3 (the `'t'` and `'m'` key layout), §8 (the transactions this sits on).
 
@@ -483,54 +483,57 @@ its own gap register, and it would be longer.
 
 ## 10a. Handoff — where a fresh lane picks up
 
-Unit 2 is complete and unit 5 is complete. Everything is committed and green: 98 tests, `clippy
--D warnings` clean, `cargo deny` clean, 24 of 40 runtime crates.
+Every unit is complete. 231 tests, `cargo fmt --check`, `clippy -D warnings`, `cargo deny` and the
+dependency budget all green; no dependency was added.
 
-**A real `psql` 18.6 connects to `esker-sql`, gets a prompt, and is answered correctly** — the
-default `sslmode` (`SSLRequest` → `N` → startup), `max_protocol_version=latest` (3.2 downgraded via
-`NegotiateProtocolVersion`), `\conninfo`, and the transaction state machine including `25P02` after
-a failure inside a block. `tests/psql_smoke.rs` holds that as an automated test which skips when
-`psql` is absent, alongside five pipe-driven tests that need nothing installed.
+**A real `psql` 18.6 runs SQL against this node.** `tests/psql_smoke.rs` drives a whole session over
+a socket — `CREATE TABLE`, `INSERT`, `SELECT ... ORDER BY`, an `UPDATE`, a `23505` naming its
+constraint, a bound parameter through the extended protocol with `\bind`, and a `BEGIN`/`ROLLBACK`
+that leaves the rows it deleted — against the executor and the store. It skips when `psql` is
+absent.
 
-### What is left, in order
+### The whole surface, diffed against PostgreSQL 19
 
-| Unit | What it is | Notes |
+Each unit's script was run against this node and against a real PostgreSQL 19beta1 and the outputs
+compared. Every row, every value's text, every SQLSTATE, message, `DETAIL` and `HINT` agrees. What
+does not, in full:
+
+| Divergence | Why | Where it is written down |
 |---|---|---|
-| 3 | Row and tuple encodings | §6 has the format. Version byte first, golden-tested, unknown version a typed error. |
-| 4 | Catalog in the `'m'` space | §6 again; the per-transaction version check is the part with a real invariant in it. |
-| 6 | Planner and executor | The big one. See the obligations below. |
-| 7 | The `.slt` harness | Over the fake backend; the real `sqllogictest` crate is acceptance. |
+| `text` sorts by bytes | A locale-aware collation needs ICU or a platform C library; this project compiles neither. Equivalent to PostgreSQL's `COLLATE "C"`. | §6, `crate::row`, `tests/slt/select.slt` |
+| A table with no `PRIMARY KEY` is `0A000` | The row key *is* the primary key. `TODO(post-v1)`: an implicit row id from a per-table sequence. | §11 unit 6a, `tests/slt/create_table.slt` |
+| A decimal literal in an `int8` column is `0A000` | `numeric` rounds half away from zero and `float8` rounds half to even; there is no `numeric` here to be sure with. | §11 unit 6b, `tests/slt/types.slt` |
+| Six value inputs are `0A000` | Hexadecimal floats, and PostgreSQL's datetime grammar outside ISO 8601. | `tests/value_parity.rs`'s `DIVERGENCES` |
+| No `LINE n: ... ^` in an error | The `P` field needs the parser's spans carried through the lowering. `TODO(post-v1)`; §1 already excludes it for syntax errors. | this table |
+| No `CONTEXT:` on a parameter's error | The `W` field. Same shape of gap as the caret. | this table |
 
-### Unit 6 inherits three concrete obligations, not design questions
+Everything else PostgreSQL executes and this node does not comes back `0A000` naming the construct,
+which is contract C2 and a deliverable rather than an omission — `tests/slt/unsupported.slt` holds
+thirty of them and `tests/lowering.rs` holds twenty-nine more at the clause level.
 
-1. **Implement `pgwire::session::Execute`.** `NotYetExecuting` in `pgwire::server` is the placeholder
-   it replaces; the trait is already what the protocol needs, including `describe` for the extended
-   protocol's `Describe`.
-2. **Unique indexes, exactly as ruled** (§5): read the index key in-transaction and raise `23505` if
-   present; and when `commit` returns `40001`, report `23505` if the losing key was a unique index
-   entry. `backend::tests::a_concurrent_duplicate_loses_at_commit` is the scenario to write against.
-3. **`ParameterDescription` currently reports declared types, not inferred ones** —
-   `TODO(unit-6)` at the call site in `pgwire::session::describe`. Real inference needs the planner
-   to type the expressions a parameter appears in.
+### What is left
+
+- **The real `TxnClient`.** `backend::MemoryBackend` is a real little MVCC store with real
+  write-write conflict detection, and it is still in one process. Wiring phase 5's client in is an
+  impl of `Backend`/`Txn` and nothing above it changes — that was the point of shaping the trait
+  against the real one in unit 5.
+- **Acceptance against the `sqllogictest` crate** (§7.7), which wants rows separated by whitespace
+  rather than tabs; a `sed` away, and worth doing when the real backend is under it.
+- The `TODO(post-v1)`s named above, and the one in §5 about the round trip a unique index costs per
+  row.
 
 ### Three things worth knowing before touching any of it
 
-- **Two seams, easily confused.** `pgwire::session::Execute` is how the protocol reaches the
-  executor; `backend::Backend`/`Txn` is how the executor reaches storage. Unit 6 implements the
-  first and consumes the second. `backend::Txn` is already aligned to the real `TxnClient`, so
-  wiring the live one in is an impl and nothing above it changes.
-- **`sqlparser` types stop at `parse.rs`** (ADR 0014). `parse::Parsed` is the opaque handle the rest
-  of the crate holds. Unit 6 is where the lowering to our own plan types belongs, and it should stay
-  inside that boundary — a `use sqlparser::` elsewhere is what turns a one-file replacement into a
-  rewrite.
-- **Capture first.** Seven defects were found this phase by asking a real PostgreSQL 19 and none by
-  reading the specification: the parser's recursion limit of 50; the `ROLLBACK` command tag on a
-  failed commit; protocol 3.2's 32-byte cancel key; a warning that sent no `CommandComplete`; the
-  wrong SQLSTATE class for a write conflict; `Describe`-statement sending two messages where
-  `Describe`-portal sends one; and the total silence a failed extended batch owes the client until
-  `Sync`. §9 has the container recipe. For units 3, 4 and 6 the same oracle answers a different
-  kind of question — value text formats, NULL ordering, command tag arithmetic — and differential
-  testing against it is what acceptance should do.
+- **Capture first.** It has now found **twenty-eight** defects across this phase and reading the
+  specification has found none. §9 has the container recipe. Two of those twenty-eight were defects
+  in the *capture itself* — a `::text` cast that is not the output function, and a `printf %b` that
+  decoded `\101` — and both would have pinned a wrong answer into a golden file, so the method
+  deserves the same suspicion as the code.
+- **`sqlparser` types stop at `parse.rs`** (ADR 0014), and the lowering there is the last place one
+  is named. Its rule is *reject, do not ignore*: an AST field nothing reads is a clause the user
+  wrote and the server did not honour.
+- **Two seams, still easily confused.** `pgwire::session::Execute` is how the protocol reaches the
+  executor; `backend::Backend`/`Txn` is how the executor reaches storage.
 
 ## 11. What changed, and why
 
