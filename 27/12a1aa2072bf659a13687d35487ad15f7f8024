@@ -1,0 +1,20 @@
+crates/esker-sql/src/catalog/mod.rs
+  h_44076b318daf9c 1-790
+crates/esker-sql/src/catalog/record.rs
+  h_44076b318daf9c 1-341
+crates/esker-sql/src/lib.rs
+  h_44076b318daf9c 46
+docs/plans/phase-6a.md
+  h_44076b318daf9c 254-258,471-472,610-633
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2712a1aa2072bf659a13687d35487ad15f7f8024",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
