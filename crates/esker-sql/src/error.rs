@@ -131,6 +131,16 @@ pub enum SqlError {
     #[error("column \"{0}\" specified more than once")]
     DuplicateColumn(String),
 
+    /// A bare column name that more than one table in the query has. PostgreSQL says "column
+    /// reference", not "column", because what is ambiguous is the reference and not the column.
+    #[error("column reference \"{0}\" is ambiguous")]
+    AmbiguousColumn(String),
+
+    /// `SELECT wrong.a FROM t` — a qualifier naming a table the query does not have. `42P01` like
+    /// any other missing relation, and with PostgreSQL's own sentence for this shape of it.
+    #[error("missing FROM-clause entry for table \"{0}\"")]
+    MissingFromEntry(String),
+
     /// `ALTER TABLE ... ADD COLUMN` naming a column the table already has. The same `42701` as
     /// above and a different sentence: PostgreSQL names the relation here, because the column it
     /// is talking about is one that already exists rather than one the statement repeated.
@@ -280,6 +290,21 @@ pub enum SqlError {
     #[error("there is no parameter ${0}")]
     UndefinedParameter(u32),
 
+    /// A **qualified** column reference — `o.nosuch` — that the named table does not have.
+    ///
+    /// Three sentences for one condition, and all three are PostgreSQL's, captured rather than
+    /// guessed: a bare reference is `column "nosuch" does not exist`, this one is `column
+    /// o.nosuch does not exist` — dotted and *unquoted* — and an `UPDATE`'s `SET` target is
+    /// `column "nosuch" of relation "o" does not exist`. A client that matches on the text sees a
+    /// different one in each place, so writing one of them everywhere would be wrong in two.
+    #[error("column {qualifier}.{column} does not exist")]
+    UndefinedQualifiedColumn {
+        /// The table the reference named.
+        qualifier: String,
+        /// The column it asked that table for.
+        column: String,
+    },
+
     /// A column named in a statement about one relation. PostgreSQL says which relation here,
     /// where a bare column reference elsewhere gets the shorter message.
     #[error("column \"{column}\" of relation \"{relation}\" does not exist")]
@@ -410,9 +435,10 @@ impl SqlError {
             SqlError::FeatureNotSupported(_) => sqlstate::FEATURE_NOT_SUPPORTED,
             SqlError::Syntax { .. } | SqlError::InsertTooManyExpressions => sqlstate::SYNTAX_ERROR,
             SqlError::StatementTooComplex => sqlstate::STATEMENT_TOO_COMPLEX,
-            SqlError::UndefinedTable(_) | SqlError::UndefinedTableForDrop(_) => {
-                sqlstate::UNDEFINED_TABLE
-            }
+            SqlError::UndefinedTable(_)
+            | SqlError::UndefinedTableForDrop(_)
+            | SqlError::MissingFromEntry(_) => sqlstate::UNDEFINED_TABLE,
+            SqlError::AmbiguousColumn(_) => sqlstate::AMBIGUOUS_COLUMN,
             SqlError::UndefinedIndex(_) => sqlstate::UNDEFINED_OBJECT,
             SqlError::DependentObjectsStillExist { .. } => sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
             SqlError::WrongObjectType { .. } | SqlError::AlterActionOnWrongObject { .. } => {
@@ -420,6 +446,7 @@ impl SqlError {
             }
             SqlError::UndefinedColumn(_)
             | SqlError::UndefinedColumnInKey(_)
+            | SqlError::UndefinedQualifiedColumn { .. }
             | SqlError::UndefinedColumnInRelation { .. } => sqlstate::UNDEFINED_COLUMN,
             SqlError::DuplicateTable(_) | SqlError::AlreadyExistsSkipping(_) => {
                 sqlstate::DUPLICATE_TABLE

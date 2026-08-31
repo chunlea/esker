@@ -407,7 +407,11 @@ fn an_expression_we_do_not_evaluate_is_refused_by_name() {
         ("SELECT DISTINCT n FROM s1", "SELECT DISTINCT"),
         ("SELECT id FROM s1 GROUP BY id", "GROUP BY"),
         ("SELECT a.id FROM s1 a", "a table alias"),
-        ("SELECT * FROM s1 JOIN s1 b ON true", "JOIN"),
+        // An inner join runs now; the ones that keep rows an inner join drops do not.
+        ("SELECT * FROM s1 LEFT JOIN s2 ON true", "LEFT JOIN"),
+        ("SELECT * FROM s1 FULL JOIN s2 ON true", "FULL JOIN"),
+        ("SELECT * FROM s1 NATURAL JOIN s2", "NATURAL JOIN"),
+        ("SELECT * FROM s1 JOIN s2 USING (id)", "USING"),
         ("SELECT * FROM s1 UNION SELECT * FROM s1", "UNION"),
     ] {
         let error = node.run(sql).unwrap_err();
@@ -479,4 +483,114 @@ fn a_negative_zero_literal_loses_its_sign_but_a_quoted_one_does_not() {
     node.run("INSERT INTO z VALUES (1, -0.0), (2, '-0')")
         .unwrap();
     assert_eq!(node.column("SELECT d FROM z ORDER BY id"), ["0", "-0"]);
+}
+
+/// The join, and the choice `EXPLAIN` has to show: whether the inner side costs one key read per
+/// outer row or a pass over the whole table. That is the difference a user changes their schema
+/// over, so a plan that did not say which would be a plan they could not act on.
+#[test]
+fn explain_shows_how_the_inner_side_of_a_join_is_reached() {
+    let mut node = Node::loaded();
+    node.run("CREATE TABLE c (id int8 PRIMARY KEY, email text UNIQUE, note text)")
+        .unwrap();
+    node.run("CREATE TABLE o (id int8 PRIMARY KEY, cid int8, tag text)")
+        .unwrap();
+
+    let plan = |node: &mut Node, sql: &str| node.column(sql).join("\n");
+
+    // The inner table's primary key: one point read per outer row.
+    let key = plan(
+        &mut node,
+        "EXPLAIN SELECT o.id FROM o JOIN c ON o.cid = c.id",
+    );
+    assert!(key.contains("Nested Loop"), "{key}");
+    assert!(key.contains("Inner: Point Get on c"), "{key}");
+    assert!(
+        !key.contains("Join Filter"),
+        "the probe answers the condition"
+    );
+
+    // Written the other way round, which is the same plan: the planner decides which side is
+    // inner, not the order the user typed the operands in.
+    let flipped = plan(
+        &mut node,
+        "EXPLAIN SELECT o.id FROM o JOIN c ON c.id = o.cid",
+    );
+    assert_eq!(flipped, key);
+
+    // A unique index on the inner table, named so a user can see which one was used.
+    let unique = plan(
+        &mut node,
+        "EXPLAIN SELECT o.id FROM o JOIN c ON o.tag = c.email",
+    );
+    assert!(
+        unique.contains("Inner: Index Lookup on c using c_email_key"),
+        "{unique}"
+    );
+
+    // Nothing usable: the inner table is read once and every pair is checked, and the condition
+    // that could not become a probe is shown as the filter it became instead.
+    let materialize = plan(
+        &mut node,
+        "EXPLAIN SELECT o.id FROM o JOIN c ON o.tag = c.note",
+    );
+    assert!(
+        materialize.contains("Inner: Materialize on c"),
+        "{materialize}"
+    );
+    assert!(materialize.contains("Join Filter"), "{materialize}");
+
+    // A CROSS JOIN has no condition at all, so there is no filter to show either.
+    let cross = plan(&mut node, "EXPLAIN SELECT o.id FROM o CROSS JOIN c");
+    assert!(cross.contains("Inner: Materialize on c"), "{cross}");
+    assert!(!cross.contains("Join Filter"), "{cross}");
+
+    // The outer side is still planned: a `WHERE` that belongs to it narrows the scan under the
+    // join rather than filtering above it.
+    let outer = plan(
+        &mut node,
+        "EXPLAIN SELECT o.id FROM o JOIN c ON o.cid = c.id WHERE o.id = 3",
+    );
+    assert!(outer.contains("Point Get on o"), "{outer}");
+}
+
+/// Resolution across two tables, with the three answers PostgreSQL gives — each captured, because
+/// they are three different sentences for what looks like one condition.
+#[test]
+fn a_column_reference_across_two_tables_resolves_the_way_postgresql_resolves_it() {
+    let mut node = Node::loaded();
+    node.run("CREATE TABLE c (id int8 PRIMARY KEY, note text)")
+        .unwrap();
+    node.run("CREATE TABLE o (id int8 PRIMARY KEY, cid int8)")
+        .unwrap();
+
+    let error = node
+        .run("SELECT id FROM o JOIN c ON o.cid = c.id")
+        .unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::AMBIGUOUS_COLUMN);
+    assert_eq!(error.to_string(), "column reference \"id\" is ambiguous");
+
+    let error = node
+        .run("SELECT wrong.id FROM o JOIN c ON o.cid = c.id")
+        .unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::UNDEFINED_TABLE);
+    assert_eq!(
+        error.to_string(),
+        "missing FROM-clause entry for table \"wrong\""
+    );
+
+    // Qualified and missing: dotted and unquoted, which is not how the bare form reads.
+    let error = node
+        .run("SELECT o.nosuch FROM o JOIN c ON o.cid = c.id")
+        .unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::UNDEFINED_COLUMN);
+    assert_eq!(error.to_string(), "column o.nosuch does not exist");
+
+    // A name only one of them has needs no qualifier.
+    node.run("SELECT note, cid FROM o JOIN c ON o.cid = c.id")
+        .unwrap();
+
+    // And the qualifier is checked even with one table, which it used to be dropped for.
+    let error = node.run("SELECT wrong.id FROM o").unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::UNDEFINED_TABLE);
 }

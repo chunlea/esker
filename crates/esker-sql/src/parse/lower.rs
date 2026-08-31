@@ -18,9 +18,9 @@
 use sqlparser::ast::{
     AlterTableOperation, AssignmentTarget, BinaryOperator, ColumnOption, CreateTableOptions,
     DataType, DollarQuotedString, ExactNumberInfo, Expr, FromTable, GroupByExpr, Ident,
-    IndexColumn, IndexType, LimitClause, NullsDistinctOption, ObjectName, ObjectType, OffsetRows,
-    OrderByKind, Query, SelectItem, SetExpr, Statement, TableConstraint, TableFactor, TableObject,
-    TimezoneInfo, UnaryOperator, Value,
+    IndexColumn, IndexType, JoinConstraint, JoinOperator, LimitClause, NullsDistinctOption,
+    ObjectName, ObjectType, OffsetRows, OrderByKind, Query, SelectItem, SetExpr, Statement,
+    TableConstraint, TableFactor, TableObject, TimezoneInfo, UnaryOperator, Value,
 };
 
 use crate::catalog::fold_identifier;
@@ -421,12 +421,18 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             expr,
         } => lower_expr(expr),
         Expr::Nested(inner) => lower_expr(inner),
-        Expr::Identifier(name) => Ok(plan::Expr::Column(ident(name))),
+        Expr::Identifier(name) => Ok(plan::Expr::Column {
+            table: None,
+            name: ident(name),
+        }),
         Expr::CompoundIdentifier(parts) => match parts.as_slice() {
-            // `t.a` where `t` is the only table in the query: the qualifier adds nothing, and
-            // dropping it silently would be wrong the moment there were two tables. There is only
-            // ever one here, so it is checked against the FROM item by the planner.
-            [_, column] => Ok(plan::Expr::Column(ident(column))),
+            // `t.a`. The qualifier is carried, not dropped: the planner checks it against the
+            // query's tables, which is the only way `SELECT wrong.a FROM t` can be the `42P01` a
+            // real server gives.
+            [table, column] => Ok(plan::Expr::Column {
+                table: Some(ident(table)),
+                name: ident(column),
+            }),
             _ => Err(SqlError::unsupported(format!(
                 "the qualified column {}",
                 parts
@@ -551,12 +557,21 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
     refuse_if(select.exclude.is_some(), "EXCLUDE")?;
     refuse_if(!select.optimizer_hints.is_empty(), "an optimizer hint")?;
 
-    let from = match select.from.as_slice() {
-        [] => None,
+    let (from, join) = match select.from.as_slice() {
+        [] => (None, None),
         [table] => {
-            refuse_if(!table.joins.is_empty(), "a JOIN")?;
-            Some(table_factor(&table.relation)?)
+            let left = table_factor(&table.relation)?;
+            let join = match table.joins.as_slice() {
+                [] => None,
+                [one] => Some(lower_join(one)?),
+                _ => return Err(SqlError::unsupported("more than one JOIN")),
+            };
+            (Some(left), join)
         }
+        // `FROM a, b` is a cross join in PostgreSQL, and writing it that way is how a user asks
+        // for one. Refused by name rather than lowered to a cross join, because the comma form
+        // usually means a `WHERE` was meant to join them and saying so is more useful than
+        // running the cartesian product.
         _ => return Err(SqlError::unsupported("a comma-separated FROM list")),
     };
 
@@ -634,12 +649,53 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
 
     Ok(plan::Select {
         from,
+        join,
         projection,
         filter,
         order_by,
         limit,
         offset,
     })
+}
+
+/// One `JOIN`, lowered. Every join this crate does not run is named rather than approximated.
+fn lower_join(join: &sqlparser::ast::Join) -> Result<plan::Join> {
+    let table = table_factor(&join.relation)?;
+    refuse_if(join.global, "a GLOBAL JOIN")?;
+    let on = match &join.join_operator {
+        JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => {
+            join_constraint(constraint)?
+        }
+        JoinOperator::CrossJoin(constraint) => join_constraint(constraint)?,
+        // Each of these keeps rows an inner join drops, so running one as an inner join would
+        // silently return fewer rows than the user asked for -- the worst thing a join can do.
+        other => {
+            return Err(SqlError::unsupported(match other {
+                JoinOperator::Left(_) | JoinOperator::LeftOuter(_) => "a LEFT JOIN",
+                JoinOperator::Right(_) | JoinOperator::RightOuter(_) => "a RIGHT JOIN",
+                JoinOperator::FullOuter(_) => "a FULL JOIN",
+                JoinOperator::LeftSemi(_) | JoinOperator::Semi(_) => "a SEMI JOIN",
+                JoinOperator::LeftAnti(_) | JoinOperator::Anti(_) => "an ANTI JOIN",
+                JoinOperator::CrossApply | JoinOperator::OuterApply => "APPLY",
+                JoinOperator::AsOf { .. } => "an ASOF JOIN",
+                JoinOperator::StraightJoin(_) => "a STRAIGHT_JOIN",
+                _ => "this join type",
+            }));
+        }
+    };
+    Ok(plan::Join { table, on })
+}
+
+fn join_constraint(constraint: &JoinConstraint) -> Result<Option<plan::Expr>> {
+    match constraint {
+        JoinConstraint::On(expr) => Ok(Some(lower_expr(expr)?)),
+        // `USING (a)` also *merges* the two columns into one in the output, which is a projection
+        // rule and not only a condition; running it as `ON a.x = b.x` would give the wrong number
+        // of columns for `SELECT *`.
+        JoinConstraint::Using(_) => Err(SqlError::unsupported("a JOIN ... USING clause")),
+        JoinConstraint::Natural => Err(SqlError::unsupported("a NATURAL JOIN")),
+        JoinConstraint::None => Ok(None),
+    }
 }
 
 fn table_factor(factor: &TableFactor) -> Result<String> {

@@ -22,11 +22,96 @@
 //! query, and reading only its range would silently lose the rows the other branch matches — which
 //! is the kind of wrong answer nothing reports.
 
-use crate::catalog::TableDef;
+use crate::catalog::{ColumnDef, TableDef};
 use crate::error::{Result, SqlError};
 use crate::plan::{BinaryOp, Expr, Node, Select, SelectItem, SortKey};
 use crate::row;
 use crate::value::{ColumnType, Datum};
+
+/// The tables a column reference in one query may name, in the order their columns appear in a
+/// row.
+///
+/// A join's output row is the outer table's columns followed by the inner table's, so a scope of
+/// two tables is also the map from a name to a position in that combined row — which is the whole
+/// of what resolution needs, and the reason this is a list rather than a pair.
+#[derive(Debug, Default)]
+pub(super) struct Scope<'a> {
+    tables: Vec<&'a TableDef>,
+}
+
+impl<'a> Scope<'a> {
+    /// No tables: `SELECT 1`.
+    fn empty() -> Self {
+        Scope { tables: Vec::new() }
+    }
+
+    /// One table, which is every statement that is not a join.
+    pub(super) fn single(table: &'a TableDef) -> Self {
+        Scope {
+            tables: vec![table],
+        }
+    }
+
+    /// Where `table`'s columns start in a row.
+    fn offset(&self, table: usize) -> usize {
+        self.tables[..table]
+            .iter()
+            .map(|table| table.columns.len())
+            .sum()
+    }
+
+    /// Every column a user can name, with its position in the combined row.
+    fn user_columns(&self) -> impl Iterator<Item = (usize, &'a ColumnDef)> {
+        self.tables
+            .iter()
+            .enumerate()
+            .flat_map(move |(index, table)| {
+                let offset = self.offset(index);
+                table
+                    .user_columns()
+                    .map(move |(at, column)| (offset + at, column))
+            })
+    }
+
+    /// A column reference, resolved to a position in the combined row.
+    ///
+    /// The three failures are PostgreSQL's, captured from a real server rather than invented:
+    /// a qualifier naming a table the query does not have is `42P01 missing FROM-clause entry for
+    /// table "x"`; a name no table has is `42703`; and a bare name **two** tables have is `42702
+    /// column reference "x" is ambiguous` — which is an error rather than a silent choice of the
+    /// first one, because the user's intent is genuinely unknown and guessing it returns the wrong
+    /// column without saying so.
+    fn resolve_column(&self, qualifier: Option<&str>, name: &str) -> Result<(usize, ColumnType)> {
+        if let Some(qualifier) = qualifier {
+            let index = self
+                .tables
+                .iter()
+                .position(|table| table.name == qualifier)
+                .ok_or_else(|| SqlError::MissingFromEntry(qualifier.to_owned()))?;
+            let at = self.tables[index].column(name).ok_or_else(|| {
+                if let Some(system) = SYSTEM_COLUMNS.iter().find(|system| **system == name) {
+                    return SqlError::unsupported(format!("the system column {system}"));
+                }
+                SqlError::UndefinedQualifiedColumn {
+                    qualifier: qualifier.to_owned(),
+                    column: name.to_owned(),
+                }
+            })?;
+            return Ok((self.offset(index) + at, self.tables[index].columns[at].ty));
+        }
+
+        let mut found = None;
+        for (index, table) in self.tables.iter().enumerate() {
+            if let Some(at) = table.column(name) {
+                if found.is_some() {
+                    return Err(SqlError::AmbiguousColumn(name.to_owned()));
+                }
+                found = Some((self.offset(index) + at, table.columns[at].ty));
+            }
+        }
+        found.ok_or_else(|| undefined_column(name))
+    }
+}
 
 /// A planned query, with everything the executor needs to describe its output before running it.
 #[derive(Debug)]
@@ -51,7 +136,7 @@ pub(super) struct Planned {
 pub(super) fn matching_rows(filter: Option<&Expr>, tenant: u64, table: &TableDef) -> Result<Node> {
     let mut node = access_path(filter, tenant, table)?;
     if let Some(filter) = filter {
-        let predicate = resolve(filter, Some(table))?;
+        let predicate = resolve(filter, &Scope::single(table))?;
         check_predicate(&predicate)?;
         node = Node::Filter {
             input: Box::new(node),
@@ -64,14 +149,42 @@ pub(super) fn matching_rows(filter: Option<&Expr>, tenant: u64, table: &TableDef
 /// Turns a lowered `SELECT` into a plan against a table.
 ///
 /// `table` is `None` for `SELECT 1`, which has no table and one row.
-pub(super) fn plan(select: &Select, tenant: u64, table: Option<&TableDef>) -> Result<Planned> {
-    let mut node = match table {
-        None => Node::OneRow,
-        Some(table) => access_path(select.filter.as_ref(), tenant, table)?,
+pub(super) fn plan(
+    select: &Select,
+    tenant: u64,
+    table: Option<&TableDef>,
+    inner: Option<&TableDef>,
+) -> Result<Planned> {
+    let scope = match (table, inner) {
+        (None, _) => Scope::empty(),
+        (Some(table), None) => Scope::single(table),
+        (Some(outer), Some(inner)) => Scope {
+            tables: vec![outer, inner],
+        },
     };
 
+    let mut node = match table {
+        None => Node::OneRow,
+        // With a join the outer access path only gets the `WHERE` when the whole of it belongs to
+        // the outer table. A predicate mentioning the inner one cannot narrow the outer scan --
+        // its value is not known until an outer row has been read -- and handing it to
+        // `access_path`, which resolves against one table, would be an error rather than a plan.
+        Some(table) => {
+            let usable = select
+                .filter
+                .as_ref()
+                .filter(|filter| inner.is_none() || mentions_only(filter, table));
+            access_path(usable, tenant, table)?
+        }
+    };
+
+    if let Some(join) = &select.join {
+        let inner = inner.ok_or_else(|| SqlError::UndefinedTable(join.table.clone()))?;
+        node = join_node(node, join, &scope, inner)?;
+    }
+
     if let Some(filter) = &select.filter {
-        let predicate = resolve(filter, table)?;
+        let predicate = resolve(filter, &scope)?;
         check_predicate(&predicate)?;
         // A predicate the access path already guarantees is not re-checked -- but one it only
         // *narrowed* still is, because a range is not an equality.
@@ -91,7 +204,7 @@ pub(super) fn plan(select: &Select, tenant: u64, table: Option<&TableDef>) -> Re
             .iter()
             .map(|item| {
                 Ok(SortKey {
-                    expr: resolve(&dealias(&item.expr, select), table)?,
+                    expr: resolve(&dealias(&item.expr, select), &scope)?,
                     descending: item.descending,
                     // PostgreSQL's default is NULLS LAST ascending and NULLS FIRST descending,
                     // which is one rule: NULL is the largest value, and `DESC` reverses the order
@@ -106,8 +219,8 @@ pub(super) fn plan(select: &Select, tenant: u64, table: Option<&TableDef>) -> Re
         };
     }
 
-    let columns = output_columns(select, table)?;
-    let exprs = projection_exprs(select, table)?;
+    let columns = output_columns(select, &scope)?;
+    let exprs = projection_exprs(select, &scope)?;
     node = Node::Project {
         input: Box::new(node),
         exprs,
@@ -125,14 +238,114 @@ pub(super) fn plan(select: &Select, tenant: u64, table: Option<&TableDef>) -> Re
         node,
         columns,
         table: table.map_or_else(|| "-".to_owned(), |table| table.name.clone()),
-        column_names: table.map_or_else(Vec::new, |table| {
-            table
-                .columns
-                .iter()
-                .map(|column| column.name.clone())
-                .collect()
-        }),
+        // Every column of every table in scope, in row order, so `EXPLAIN` can print the name a
+        // user typed for any position the executor resolved.
+        column_names: scope
+            .tables
+            .iter()
+            .flat_map(|table| table.columns.iter().map(|column| column.name.clone()))
+            .collect(),
     })
+}
+
+/// Whether every column reference in an expression belongs to `table`.
+fn mentions_only(expr: &Expr, table: &TableDef) -> bool {
+    let mut only = true;
+    for_each_column(expr, &mut |qualifier, name| {
+        only &= qualifier.is_none_or(|qualifier| qualifier == table.name)
+            && table.column(name).is_some();
+    });
+    only
+}
+
+fn for_each_column(expr: &Expr, visit: &mut impl FnMut(Option<&str>, &str)) {
+    match expr {
+        Expr::Column { table, name } => visit(table.as_deref(), name),
+        Expr::Binary { left, right, .. } => {
+            for_each_column(left, visit);
+            for_each_column(right, visit);
+        }
+        Expr::Not(operand) | Expr::IsNull { operand, .. } => for_each_column(operand, visit),
+        _ => {}
+    }
+}
+
+/// The join, and the choice this whole unit exists to make: read the inner table once per outer
+/// row, or read one key.
+///
+/// A probe is possible when the `ON` condition is an equality between one outer column and one
+/// inner column, and that inner column is the inner table's whole primary key or the whole key of
+/// one of its unique indexes. Those are the two access paths the planner already has for a
+/// `WHERE` — a join is a `WHERE` whose right-hand side changes per row — and reusing them is why
+/// this is a small addition rather than a second planner.
+///
+/// Anything else materialises the inner table and pairs every outer row with all of it, which is
+/// always correct and, for a large inner table, always slow. `EXPLAIN` says which, because that is
+/// the difference a user changes their schema over.
+fn join_node(
+    outer: Node,
+    join: &crate::plan::Join,
+    scope: &Scope<'_>,
+    inner: &TableDef,
+) -> Result<Node> {
+    let probe = join
+        .on
+        .as_ref()
+        .and_then(|on| probe_for(on, scope, inner))
+        .unwrap_or(crate::plan::Probe::Materialize);
+    // A probe answers the equality exactly, so the condition it came from is not re-checked. A
+    // materialised inner side has nothing to answer it, so the whole condition is the filter.
+    let residual = match (&probe, &join.on) {
+        (crate::plan::Probe::Materialize, Some(on)) => Some(resolve(on, scope)?),
+        _ => None,
+    };
+    Ok(Node::NestedLoop {
+        outer: Box::new(outer),
+        inner_table_id: inner.id,
+        inner_table: inner.name.clone(),
+        inner_columns: inner.column_types(),
+        probe,
+        residual,
+    })
+}
+
+/// The probe an `ON` condition allows, or `None` for one that needs the inner table read whole.
+fn probe_for(on: &Expr, scope: &Scope<'_>, inner: &TableDef) -> Option<crate::plan::Probe> {
+    let Expr::Binary {
+        op: BinaryOp::Eq,
+        left,
+        right,
+    } = on
+    else {
+        return None;
+    };
+    // The inner table's columns start where the outer's end, so a resolved position at or above
+    // that offset belongs to the inner side.
+    let boundary = scope.offset(scope.tables.len() - 1);
+    let (left, right) = (resolve(left, scope).ok()?, resolve(right, scope).ok()?);
+    let (Expr::Ordinal { at: a, .. }, Expr::Ordinal { at: b, .. }) = (&left, &right) else {
+        return None;
+    };
+    let (outer_at, inner_at) = match (*a < boundary, *b < boundary) {
+        (true, false) => (*a, *b - boundary),
+        (false, true) => (*b, *a - boundary),
+        // Both sides on one table joins nothing; it is a filter, and the materialised path
+        // applies it correctly.
+        _ => return None,
+    };
+    if inner.primary_key == [inner_at] {
+        return Some(crate::plan::Probe::PrimaryKey { outer: outer_at });
+    }
+    inner
+        .indexes
+        .iter()
+        .find(|index| index.unique && index.columns == [inner_at])
+        .map(|index| crate::plan::Probe::UniqueIndex {
+            index_id: index.id,
+            index_name: index.name.clone(),
+            outer: outer_at,
+            primary_key_types: inner.primary_key_types(),
+        })
 }
 
 /// Rule 1, 2 and 3 from `plan::query`: pin the whole primary key, bound its first column, or pin a
@@ -262,8 +475,8 @@ fn collect_bounds(
         Expr::Binary { op, left, right } if op.is_comparison() => {
             // `5 < id` is `id > 5` with the operands the other way round.
             let (name, literal, op) = match (left.as_ref(), right.as_ref()) {
-                (Expr::Column(name), Expr::Literal(literal)) => (name, literal, *op),
-                (Expr::Literal(literal), Expr::Column(name)) => (name, literal, flip(*op)),
+                (Expr::Column { name, .. }, Expr::Literal(literal)) => (name, literal, *op),
+                (Expr::Literal(literal), Expr::Column { name, .. }) => (name, literal, flip(*op)),
                 _ => return,
             };
             if table.column(name) != Some(ordinal) {
@@ -320,8 +533,8 @@ fn collect_equalities(
             right,
         } => {
             let pair = match (left.as_ref(), right.as_ref()) {
-                (Expr::Column(name), Expr::Literal(literal))
-                | (Expr::Literal(literal), Expr::Column(name)) => (name, literal),
+                (Expr::Column { name, .. }, Expr::Literal(literal))
+                | (Expr::Literal(literal), Expr::Column { name, .. }) => (name, literal),
                 _ => return Ok(()),
             };
             let Some(ordinal) = table.column(pair.0) else {
@@ -355,12 +568,12 @@ fn pinned(ordinals: &[usize], equalities: &[(usize, Datum)]) -> Option<Vec<Datum
 
 /// Resolves a column reference against one table — what `UPDATE`'s `SET` expressions need.
 pub(super) fn resolve_against(expr: &Expr, table: &TableDef) -> Result<Expr> {
-    resolve(expr, Some(table))
+    resolve(expr, &Scope::single(table))
 }
 
 /// `ORDER BY x` where `x` is an output alias means the expression that alias names.
 fn dealias(expr: &Expr, select: &Select) -> Expr {
-    let Expr::Column(name) = expr else {
+    let Expr::Column { table: None, name } = expr else {
         return expr.clone();
     };
     for item in &select.projection {
@@ -400,18 +613,14 @@ fn undefined_column(name: &str) -> SqlError {
 
 const SYSTEM_COLUMNS: [&str; 6] = ["ctid", "xmin", "xmax", "cmin", "cmax", "tableoid"];
 
-fn resolve(expr: &Expr, table: Option<&TableDef>) -> Result<Expr> {
+fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
     Ok(match expr {
-        Expr::Column(name) => {
-            let table = table.ok_or_else(|| SqlError::UndefinedColumn(name.clone()))?;
-            let at = table.column(name).ok_or_else(|| undefined_column(name))?;
-            Expr::Ordinal {
-                at,
-                ty: table.columns[at].ty,
-            }
+        Expr::Column { table, name } => {
+            let (at, ty) = scope.resolve_column(table.as_deref(), name)?;
+            Expr::Ordinal { at, ty }
         }
         Expr::Binary { op, left, right } => {
-            let (left, right) = (resolve(left, table)?, resolve(right, table)?);
+            let (left, right) = (resolve(left, scope)?, resolve(right, scope)?);
             let (left, right) = if op.is_comparison() {
                 // A literal has no type until something gives it one, and here that something is
                 // the other operand. Without this the comparison would run between a `text` and an
@@ -426,9 +635,9 @@ fn resolve(expr: &Expr, table: Option<&TableDef>) -> Result<Expr> {
                 right: Box::new(right),
             }
         }
-        Expr::Not(operand) => Expr::Not(Box::new(resolve(operand, table)?)),
+        Expr::Not(operand) => Expr::Not(Box::new(resolve(operand, scope)?)),
         Expr::IsNull { operand, negated } => Expr::IsNull {
-            operand: Box::new(resolve(operand, table)?),
+            operand: Box::new(resolve(operand, scope)?),
             negated: *negated,
         },
         other => other.clone(),
@@ -523,27 +732,30 @@ fn check_predicate(expr: &Expr) -> Result<()> {
 ///
 /// A bare column keeps its name; anything else is `?column?`, which is PostgreSQL's own answer and
 /// what `psql` prints as a header.
-fn output_columns(select: &Select, table: Option<&TableDef>) -> Result<Vec<(String, ColumnType)>> {
+fn output_columns(select: &Select, scope: &Scope<'_>) -> Result<Vec<(String, ColumnType)>> {
     let mut columns = Vec::new();
     for item in &select.projection {
         match item {
             SelectItem::Wildcard => {
-                let table = table.ok_or_else(|| SqlError::Syntax {
-                    message: "SELECT * with no tables specified is not valid".to_owned(),
-                    position: None,
-                })?;
+                if scope.tables.is_empty() {
+                    return Err(SqlError::Syntax {
+                        message: "SELECT * with no tables specified is not valid".to_owned(),
+                        position: None,
+                    });
+                }
                 // The user's columns, so an internal row id stays hidden: `SELECT *` on a table
-                // with no declared key returns what the user declared and nothing else.
+                // with no declared key returns what the user declared and nothing else. Across a
+                // join it is every table's, left to right, which is the order PostgreSQL gives.
                 columns.extend(
-                    table
+                    scope
                         .user_columns()
                         .map(|(_, column)| (column.name.clone(), column.ty)),
                 );
             }
             SelectItem::Expr { expr, alias } => {
-                let ty = expr_type(expr, table)?;
+                let ty = expr_type(expr, scope)?;
                 let name = alias.clone().unwrap_or_else(|| match expr {
-                    Expr::Column(name) => name.clone(),
+                    Expr::Column { name, .. } => name.clone(),
                     _ => "?column?".to_owned(),
                 });
                 columns.push((name, ty));
@@ -554,22 +766,24 @@ fn output_columns(select: &Select, table: Option<&TableDef>) -> Result<Vec<(Stri
 }
 
 /// One expression per output column, with `*` expanded.
-fn projection_exprs(select: &Select, table: Option<&TableDef>) -> Result<Vec<Expr>> {
+fn projection_exprs(select: &Select, scope: &Scope<'_>) -> Result<Vec<Expr>> {
     let mut exprs = Vec::new();
     for item in &select.projection {
         match item {
             SelectItem::Wildcard => {
-                let table = table.ok_or_else(|| SqlError::Syntax {
-                    message: "SELECT * with no tables specified is not valid".to_owned(),
-                    position: None,
-                })?;
+                if scope.tables.is_empty() {
+                    return Err(SqlError::Syntax {
+                        message: "SELECT * with no tables specified is not valid".to_owned(),
+                        position: None,
+                    });
+                }
                 exprs.extend(
-                    table
+                    scope
                         .user_columns()
                         .map(|(at, column)| Expr::Ordinal { at, ty: column.ty }),
                 );
             }
-            SelectItem::Expr { expr, .. } => exprs.push(resolve(expr, table)?),
+            SelectItem::Expr { expr, .. } => exprs.push(resolve(expr, scope)?),
         }
     }
     Ok(exprs)
@@ -577,14 +791,10 @@ fn projection_exprs(select: &Select, table: Option<&TableDef>) -> Result<Vec<Exp
 
 /// What type an output column has. A literal with no column to take a type from falls back the way
 /// PostgreSQL does: a quoted string is `text`, an integer is `bigint`.
-fn expr_type(expr: &Expr, table: Option<&TableDef>) -> Result<ColumnType> {
+fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
     use crate::plan::Literal;
     Ok(match expr {
-        Expr::Column(name) => {
-            let table = table.ok_or_else(|| SqlError::UndefinedColumn(name.clone()))?;
-            let at = table.column(name).ok_or_else(|| undefined_column(name))?;
-            table.columns[at].ty
-        }
+        Expr::Column { table, name } => scope.resolve_column(table.as_deref(), name)?.1,
         Expr::Ordinal { ty, .. } => *ty,
         Expr::Literal(Literal::Integer(_)) => ColumnType::Int8,
         Expr::Literal(Literal::Decimal(_)) => ColumnType::Double,

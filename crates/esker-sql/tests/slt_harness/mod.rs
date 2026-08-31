@@ -100,6 +100,7 @@ pub(crate) const FILES: &[(&str, &str)] = &[
     ),
     ("index.slt", include_str!("../slt/index.slt")),
     ("insert.slt", include_str!("../slt/insert.slt")),
+    ("join.slt", include_str!("../slt/join.slt")),
     ("limits.slt", include_str!("../slt/limits.slt")),
     (
         "no_primary_key.slt",

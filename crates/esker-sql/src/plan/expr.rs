@@ -42,7 +42,18 @@ pub enum Expr {
     /// `$1`, one-based as PostgreSQL writes it.
     Parameter(u32),
     /// A column of the row being evaluated, by name. The planner resolves it to a position.
-    Column(String),
+    Column {
+        /// The table it was qualified with — `a` in `a.id` — or `None` for a bare name.
+        ///
+        /// Carried rather than dropped, which it used to be. With one table in a query a
+        /// qualifier adds nothing *when it is right*, and the first version of this threw it away
+        /// on that argument; the argument is wrong, because it also throws away the case where it
+        /// is **not** right. `SELECT wrong.a FROM t` is `42P01` on a real server and was answered
+        /// here as though the user had written `a`.
+        table: Option<String>,
+        /// The column's name.
+        name: String,
+    },
     /// A column already resolved to its position, which is what the executor evaluates.
     Ordinal {
         /// Position in the row.
@@ -262,7 +273,7 @@ fn describe(expr: &Expr) -> &'static str {
     match expr {
         Expr::Literal(_) => "a literal",
         Expr::Parameter(_) => "a parameter",
-        Expr::Column(_) | Expr::Ordinal { .. } => "a column reference",
+        Expr::Column { .. } | Expr::Ordinal { .. } => "a column reference",
         Expr::Binary { .. } => "an operator",
         Expr::Not(_) => "NOT",
         Expr::IsNull { .. } => "IS NULL",

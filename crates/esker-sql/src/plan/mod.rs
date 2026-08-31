@@ -29,7 +29,7 @@ pub use ddl::{
 };
 pub use dml::{Delete, Insert, Update};
 pub use expr::{BinaryOp, Expr, Literal};
-pub use query::{Node, OrderItem, Select, SelectItem, SortKey};
+pub use query::{Join, Node, OrderItem, Probe, Select, SelectItem, SortKey};
 
 /// One statement, lowered.
 ///

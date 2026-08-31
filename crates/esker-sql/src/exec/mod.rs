@@ -164,13 +164,17 @@ impl Executor {
         Ok(Outcome::Rows { fields, rows, tag })
     }
 
-    /// Resolves the table a `SELECT` names and plans against it.
+    /// Resolves the tables a `SELECT` names and plans against them.
     fn plan_select(&self, txn: &dyn Txn, select: &crate::plan::Select) -> Result<query::Planned> {
         let table = match &select.from {
             Some(name) => Some(self.require_table(txn, name)?),
             None => None,
         };
-        query::plan(select, self.tenant, table.as_deref())
+        let inner = match &select.join {
+            Some(join) => Some(self.require_table(txn, &join.table)?),
+            None => None,
+        };
+        query::plan(select, self.tenant, table.as_deref(), inner.as_deref())
     }
 
     /// `EXPLAIN`: the plan, as rows, and nothing run.
@@ -422,7 +426,7 @@ impl Execute for Executor {
         bind::substitute_placeholders(&mut statement, &types);
         let fields = match &statement {
             Statement::Select(select) => Some(
-                query::plan(select, self.tenant, table.as_deref())?
+                query::plan(select, self.tenant, table.as_deref(), None)?
                     .columns
                     .into_iter()
                     .map(|(name, ty)| FieldDescription::computed(name, ty))

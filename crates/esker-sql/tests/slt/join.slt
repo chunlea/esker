@@ -1,0 +1,122 @@
+# The one join this node runs: an inner join of two tables, as a nested loop.
+#
+# What makes it worth planning rather than pairing everything with everything is the inner side:
+# when the join condition equates an outer column with the inner table's primary key or the whole
+# key of one of its unique indexes, each outer row costs one key read. Otherwise the inner table is
+# read once and every pair is checked. EXPLAIN says which, and select.rs pins that.
+#
+# Replayed against a real PostgreSQL 19beta1: every row and every ordering below is what that
+# server answered.
+
+statement ok
+CREATE TABLE c (id int8 PRIMARY KEY, name text, email text UNIQUE)
+
+statement ok
+CREATE TABLE o (id int8 PRIMARY KEY, cid int8, amount int8)
+
+# tag: INSERT 0 3
+statement ok
+INSERT INTO c VALUES (1,'ann','a@x'),(2,'bob','b@x'),(3,'cid','c@x')
+
+# Order 13 points at a customer that does not exist, which an inner join drops.
+# tag: INSERT 0 4
+statement ok
+INSERT INTO o VALUES (10,1,100),(11,1,200),(12,2,300),(13,9,400)
+
+# The inner side is c's primary key: one point read per outer row.
+query IT
+SELECT o.id, c.name FROM o JOIN c ON o.cid = c.id ORDER BY o.id
+----
+10	ann
+11	ann
+12	bob
+
+# `SELECT *` is the outer table's columns then the inner table's, and a name appearing in both
+# appears twice -- `id` here. That is PostgreSQL's output and not a quirk of ours.
+query IIIITT
+SELECT * FROM o JOIN c ON o.cid = c.id ORDER BY o.id
+----
+10	1	100	1	ann	a@x
+11	1	200	1	ann	a@x
+12	2	300	2	bob	b@x
+
+# The operands may be written either way round; which side is the inner one is the planner's to
+# decide and not the user's to spell.
+query I
+SELECT o.id FROM o JOIN c ON c.id = o.cid ORDER BY o.id
+----
+10
+11
+12
+
+# A WHERE alongside the join, on the outer table.
+query I
+SELECT o.id FROM o JOIN c ON o.cid = c.id WHERE o.id = 11
+----
+11
+
+# And on the inner table, which the outer access path cannot use and the filter above the join can.
+query II
+SELECT o.id, c.id FROM o JOIN c ON o.cid = c.id WHERE c.email = 'a@x' ORDER BY o.id
+----
+10	1
+11	1
+
+# A join whose condition matches no index at all: correct, and the inner side is materialised.
+query II
+SELECT o.id, c.id FROM o JOIN c ON o.amount = c.id ORDER BY o.id
+----
+
+# A NULL in the join column keeps no pair: `NULL = 1` is unknown, and unknown is not true.
+# tag: INSERT 0 1
+statement ok
+INSERT INTO o VALUES (14,NULL,500)
+
+query I
+SELECT o.id FROM o JOIN c ON o.cid = c.id ORDER BY o.id
+----
+10
+11
+12
+
+# CROSS JOIN pairs everything with everything: five orders and three customers.
+query I
+SELECT o.id FROM o CROSS JOIN c ORDER BY o.id LIMIT 4
+----
+10
+10
+10
+11
+
+# A bare name that both tables have is ambiguous, and PostgreSQL says so rather than choosing.
+statement error (42702)
+SELECT id FROM o JOIN c ON o.cid = c.id
+
+# A qualifier naming a table the query does not have.
+statement error (42P01)
+SELECT wrong.id FROM o JOIN c ON o.cid = c.id
+
+# A column no table has is still just missing.
+statement error (42703)
+SELECT o.nosuch FROM o JOIN c ON o.cid = c.id
+
+# The joins that keep rows an inner join drops are refused by name, never approximated: running a
+# LEFT JOIN as an inner one would silently return fewer rows than the user asked for.
+statement error (0A000)
+SELECT o.id FROM o LEFT JOIN c ON o.cid = c.id
+
+statement error (0A000)
+SELECT o.id FROM o RIGHT JOIN c ON o.cid = c.id
+
+statement error (0A000)
+SELECT o.id FROM o FULL JOIN c ON o.cid = c.id
+
+statement error (0A000)
+SELECT o.id FROM o NATURAL JOIN c
+
+statement error (0A000)
+SELECT o.id FROM o JOIN c USING (id)
+
+# Two joins in one statement is the next unit's work, and says so.
+statement error (0A000)
+SELECT o.id FROM o JOIN c ON o.cid = c.id JOIN c AS d ON o.cid = d.id

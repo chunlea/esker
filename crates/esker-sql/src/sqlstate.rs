@@ -123,6 +123,8 @@ pub const SYNTAX_ERROR: &str = "42601";
 pub const UNDEFINED_COLUMN: &str = "42703";
 /// A table name that resolves to nothing.
 pub const UNDEFINED_TABLE: &str = "42P01";
+/// A bare column name that more than one table in the query has.
+pub const AMBIGUOUS_COLUMN: &str = "42702";
 /// `CREATE TABLE` for a name that already exists.
 pub const DUPLICATE_TABLE: &str = "42P07";
 /// Two columns of one table share a name.
@@ -234,6 +236,7 @@ mod tests {
         ("SYNTAX_ERROR", super::SYNTAX_ERROR),
         ("UNDEFINED_COLUMN", super::UNDEFINED_COLUMN),
         ("UNDEFINED_TABLE", super::UNDEFINED_TABLE),
+        ("AMBIGUOUS_COLUMN", super::AMBIGUOUS_COLUMN),
         ("DUPLICATE_TABLE", super::DUPLICATE_TABLE),
         ("DUPLICATE_COLUMN", super::DUPLICATE_COLUMN),
         ("DUPLICATE_OBJECT", super::DUPLICATE_OBJECT),

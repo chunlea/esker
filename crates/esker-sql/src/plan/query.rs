@@ -22,12 +22,27 @@
 use crate::plan::{Expr, Literal};
 use crate::value::{ColumnType, Datum};
 
+/// One `JOIN`, as written.
+///
+/// Exactly one, and inner only. A second join, an outer join and a `USING` clause are each refused
+/// by name (contract C2) rather than approximated: an outer join that silently behaved like an
+/// inner one would drop rows, which is the worst thing a join can do.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Join {
+    /// The right-hand table.
+    pub table: String,
+    /// `ON`, or `None` for `CROSS JOIN` — every pair of rows.
+    pub on: Option<Expr>,
+}
+
 /// `SELECT`, as written.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
     /// The table, or `None` for `SELECT 1` — a single row of no table at all, which drivers use to
-    /// check a connection.
+    /// check a connection. With a [`Select::join`] it is the left-hand one.
     pub from: Option<String>,
+    /// The one join this crate runs, if the statement has one.
+    pub join: Option<Join>,
     /// What to return.
     pub projection: Vec<SelectItem>,
     /// `WHERE`.
@@ -52,6 +67,36 @@ pub enum SelectItem {
         expr: Expr,
         /// `AS name`.
         alias: Option<String>,
+    },
+}
+
+/// How the inner side of a nested-loop join produces rows for one outer row.
+///
+/// The three that are not [`Probe::Materialize`] are the reason a join is worth planning at all:
+/// each turns "read the inner table again" into "read one key". They are the *same* two access
+/// paths the planner already knows for a `WHERE` (this module's rules 1 and 3), reached from
+/// an outer row's value instead of from a constant — a join is a `WHERE` whose right-hand side
+/// changes per row, and nothing more.
+#[derive(Debug, Clone)]
+pub enum Probe {
+    /// Read the inner table once into memory and pair every outer row with all of it, filtering by
+    /// the join condition. Always correct, and what a join with no usable index gets.
+    Materialize,
+    /// The inner table's whole primary key is one outer column: one point read per outer row.
+    PrimaryKey {
+        /// Position of the value in the outer row.
+        outer: usize,
+    },
+    /// A unique index's whole key is one outer column: one index read and one point read.
+    UniqueIndex {
+        /// The index.
+        index_id: u64,
+        /// Its name, for `EXPLAIN`.
+        index_name: String,
+        /// Position of the value in the outer row.
+        outer: usize,
+        /// Types of the primary key columns, for decoding what the entry points at.
+        primary_key_types: Vec<ColumnType>,
     },
 }
 
@@ -132,6 +177,26 @@ pub enum Node {
         /// Keys, in significance order.
         keys: Vec<SortKey>,
     },
+    /// A nested-loop join: for every row of `outer`, the rows of the inner table that match.
+    ///
+    /// The output row is the outer row's columns followed by the inner row's, which is the order
+    /// `FROM a JOIN b` gives them and therefore the order `SELECT *` returns.
+    NestedLoop {
+        /// The left side, pulled once.
+        outer: Box<Node>,
+        /// The inner table.
+        inner_table_id: u64,
+        /// Its name, for `EXPLAIN`.
+        inner_table: String,
+        /// Its column types, for decoding.
+        inner_columns: Vec<ColumnType>,
+        /// How one outer row produces inner rows.
+        probe: Probe,
+        /// What is left of `ON` after the probe, over the **combined** row. A probe answers an
+        /// equality exactly, so this is `None` for a probe and the whole condition for a
+        /// materialised inner side.
+        residual: Option<Expr>,
+    },
     /// `LIMIT` and `OFFSET`.
     Limit {
         /// Where the rows come from.
@@ -208,6 +273,34 @@ impl Node {
                         .join(", ")
                 )),
             ),
+            // The one node with two sides. The outer subtree is printed as a child; the inner
+            // side has no subtree of its own, so its access path is the `extra` line -- which is
+            // exactly the thing a user reads an `EXPLAIN` of a join to find out.
+            Node::NestedLoop {
+                outer,
+                inner_table,
+                probe,
+                residual,
+                ..
+            } => {
+                let access = match probe {
+                    Probe::Materialize => format!("Materialize on {inner_table}"),
+                    Probe::PrimaryKey { .. } => format!("Point Get on {inner_table}"),
+                    Probe::UniqueIndex { index_name, .. } => {
+                        format!("Index Lookup on {inner_table} using {index_name}")
+                    }
+                };
+                let extra = match residual {
+                    Some(condition) => {
+                        format!(
+                            "Inner: {access}\n{indent}  Join Filter: {}",
+                            render(condition, columns)
+                        )
+                    }
+                    None => format!("Inner: {access}"),
+                };
+                ("Nested Loop".to_owned(), Some(outer), Some(extra))
+            }
             Node::Limit {
                 input,
                 offset,
@@ -223,7 +316,9 @@ impl Node {
         };
         lines.push(format!("{indent}{line}"));
         if let Some(extra) = extra {
-            lines.push(format!("{indent}  {extra}"));
+            // One `extra` may carry more than one line: a join prints its inner access path and
+            // its residual condition, and both belong to the node rather than to a child of it.
+            lines.extend(extra.split('\n').map(|line| format!("{indent}  {line}")));
         }
         if let Some(child) = child {
             child.explain_into(table, columns, depth + 1, lines);
@@ -241,7 +336,7 @@ fn render(expr: &Expr, columns: &[String]) -> String {
     match expr {
         Expr::Literal(literal) => render_literal(literal),
         Expr::Parameter(number) => format!("${number}"),
-        Expr::Column(name) => name.clone(),
+        Expr::Column { name, .. } => name.clone(),
         // Resolved to a position by the planner; put the name back for the reader. A position with
         // no name behind it can only be a bug, and saying so beats printing a number.
         Expr::Ordinal { at, .. } => columns

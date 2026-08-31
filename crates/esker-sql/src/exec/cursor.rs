@@ -19,7 +19,7 @@ use std::cmp::Ordering;
 use crate::backend::Txn;
 use crate::error::{Result, SqlError};
 use crate::exec::query::successor;
-use crate::plan::{BinaryOp, Expr, Node, SortKey};
+use crate::plan::{BinaryOp, Expr, Node, Probe, SortKey};
 use crate::row;
 use crate::value::{ColumnType, Datum};
 
@@ -72,6 +72,19 @@ enum Kind<'a> {
         to_skip: usize,
         remaining: Option<usize>,
     },
+    /// A nested-loop join. The outer side streams; the inner side is either one probe per outer
+    /// row (at most one row back) or the whole inner table, read once and paired with each.
+    NestedLoop {
+        outer: Box<Cursor<'a>>,
+        inner_table_id: u64,
+        inner_columns: Vec<ColumnType>,
+        probe: Probe,
+        residual: Option<Expr>,
+        /// The outer row being matched, and how far through the materialised inner side it is.
+        current: Option<(Vec<Datum>, usize)>,
+        /// The inner table, read once, for [`Probe::Materialize`] only.
+        materialized: Vec<Vec<Datum>>,
+    },
 }
 
 impl<'a> Cursor<'a> {
@@ -94,6 +107,53 @@ impl<'a> Cursor<'a> {
                 node: node.clone(),
                 looked: false,
             },
+            Node::NestedLoop {
+                outer,
+                inner_table_id,
+                inner_columns,
+                probe,
+                residual,
+                ..
+            } => {
+                // A materialised inner side is read once, here, rather than re-scanned per outer
+                // row. It is bounded by the same limit a sort is, and for the same reason: an
+                // unbounded buffer on behalf of a client is a stall nobody asked for.
+                let materialized = if matches!(probe, Probe::Materialize) {
+                    let (start, end) = row::table_row_range(tenant, *inner_table_id);
+                    let mut rows = Vec::new();
+                    let mut scan = Cursor {
+                        txn,
+                        tenant,
+                        kind: Kind::Scan {
+                            columns: inner_columns.clone(),
+                            next: start,
+                            end,
+                            batch: Vec::new().into_iter(),
+                        },
+                    };
+                    while let Some(row) = scan.next()? {
+                        if rows.len() == SORT_LIMIT {
+                            return Err(SqlError::ConfigurationLimitExceeded(format!(
+                                "a join whose inner side is more than {SORT_LIMIT} rows needs \
+                                 more memory than this server will use for one query"
+                            )));
+                        }
+                        rows.push(row);
+                    }
+                    rows
+                } else {
+                    Vec::new()
+                };
+                Kind::NestedLoop {
+                    outer: Box::new(Cursor::open(txn, tenant, outer)?),
+                    inner_table_id: *inner_table_id,
+                    inner_columns: inner_columns.clone(),
+                    probe: probe.clone(),
+                    residual: residual.clone(),
+                    current: None,
+                    materialized,
+                }
+            }
             Node::Filter { input, predicate } => Kind::Filter {
                 input: Box::new(Cursor::open(txn, tenant, input)?),
                 predicate: predicate.clone(),
@@ -164,6 +224,78 @@ impl<'a> Cursor<'a> {
                 }
                 point(self.txn, self.tenant, node)
             }
+
+            Kind::NestedLoop {
+                outer,
+                inner_table_id,
+                inner_columns,
+                probe,
+                residual,
+                current,
+                materialized,
+            } => loop {
+                let Some((row, position)) = current else {
+                    let Some(next) = outer.next()? else {
+                        return Ok(None);
+                    };
+                    *current = Some((next, 0));
+                    continue;
+                };
+
+                match probe {
+                    // At most one inner row per outer row, so the probe is taken once and the
+                    // outer row is done with either way. This is the whole point of the node:
+                    // one key read instead of a pass over the inner table.
+                    Probe::PrimaryKey { .. } | Probe::UniqueIndex { .. } => {
+                        if *position > 0 {
+                            *current = None;
+                            continue;
+                        }
+                        *position = 1;
+                        // `NULL = anything` is unknown, and unknown keeps no pair. Probing with a
+                        // NULL would build a key out of it -- which a primary key cannot hold --
+                        // so three-valued logic has to be applied *before* the read, not after.
+                        let at = match probe {
+                            Probe::PrimaryKey { outer } | Probe::UniqueIndex { outer, .. } => {
+                                *outer
+                            }
+                            Probe::Materialize => unreachable!("handled below"),
+                        };
+                        if matches!(row[at], Datum::Null) {
+                            *current = None;
+                            continue;
+                        }
+                        let node = probe_node(probe, *inner_table_id, inner_columns, row);
+                        if let Some(inner) = point(self.txn, self.tenant, &node)? {
+                            let mut joined = row.clone();
+                            joined.extend(inner);
+                            *current = None;
+                            return Ok(Some(joined));
+                        }
+                        *current = None;
+                    }
+                    Probe::Materialize => {
+                        let Some(inner) = materialized.get(*position) else {
+                            *current = None;
+                            continue;
+                        };
+                        *position += 1;
+                        let mut joined = row.clone();
+                        joined.extend(inner.iter().cloned());
+                        // NULL is not true here either: a join condition that is unknown keeps
+                        // no pair, which is the same rule a `WHERE` follows.
+                        let keep = match residual {
+                            None => true,
+                            Some(condition) => {
+                                matches!(evaluate(condition, &joined)?, Datum::Bool(true))
+                            }
+                        };
+                        if keep {
+                            return Ok(Some(joined));
+                        }
+                    }
+                }
+            },
 
             Kind::Filter { input, predicate } => {
                 while let Some(row) = input.next()? {
@@ -243,6 +375,36 @@ impl<'a> Cursor<'a> {
 }
 
 /// A point read or an index lookup: at most one row, and the store asked at most twice.
+/// The single-row access the probe describes, built for one outer row.
+///
+/// A `Node` rather than a bespoke read, so that a join's inner side and a `WHERE`'s access path
+/// go through exactly the same code — there is one implementation of "a point read" and one of
+/// "a unique index lookup", and a join cannot drift away from what a `WHERE` does.
+fn probe_node(probe: &Probe, table_id: u64, columns: &[ColumnType], outer: &[Datum]) -> Node {
+    match probe {
+        Probe::PrimaryKey { outer: at } => Node::PointGet {
+            table_id,
+            columns: columns.to_vec(),
+            key: vec![outer[*at].clone()],
+        },
+        Probe::UniqueIndex {
+            index_id,
+            index_name,
+            outer: at,
+            primary_key_types,
+        } => Node::IndexLookup {
+            table_id,
+            columns: columns.to_vec(),
+            index_id: *index_id,
+            index_name: index_name.clone(),
+            key: vec![outer[*at].clone()],
+            primary_key_types: primary_key_types.clone(),
+        },
+        // Never built: the materialised path does not probe.
+        Probe::Materialize => Node::OneRow,
+    }
+}
+
 fn point(txn: &dyn Txn, tenant: u64, node: &Node) -> Result<Option<Vec<Datum>>> {
     match node {
         Node::PointGet {
@@ -325,7 +487,7 @@ pub(super) fn evaluate(expr: &Expr, row: &[Datum]) -> Result<Datum> {
         Expr::Literal(Literal::Decimal(digits)) => Datum::from_text(ColumnType::Double, digits)?,
         Expr::Literal(Literal::String(text)) => Datum::Text(text.clone()),
         Expr::Literal(Literal::Typed(value)) => (**value).clone(),
-        Expr::Column(name) => {
+        Expr::Column { name, .. } => {
             return Err(SqlError::Internal(format!(
                 "column \"{name}\" reached the executor unresolved"
             )));

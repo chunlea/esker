@@ -108,10 +108,12 @@ the design and neither is safe to assume:
 **In**, as executed features: `CREATE TABLE` / `DROP TABLE` (`INT8`, `TEXT`, `BOOL`, `BYTEA`,
 `TIMESTAMPTZ`, `DOUBLE`; `PRIMARY KEY`, `UNIQUE`, `NOT NULL`), `CREATE INDEX` / `DROP INDEX`,
 `INSERT` (multi-row, `RETURNING` later), `SELECT` with projection / `WHERE` / `ORDER BY` / `LIMIT` /
-`OFFSET`, `UPDATE`, `DELETE`, `BEGIN` / `COMMIT` / `ROLLBACK`, `EXPLAIN`.
+`OFFSET`, one **inner `JOIN`** of two tables, `UPDATE`, `DELETE`, `BEGIN` / `COMMIT` / `ROLLBACK`,
+`EXPLAIN`.
 
 **Out**, as executed features — and therefore *in* as C2 `0A000` responses, which is a deliverable,
-not an omission: joins, aggregates and `GROUP BY`, subqueries, CTEs, window functions, set
+not an omission: outer, natural and `USING` joins and any second join in one statement, aggregates
+and `GROUP BY`, subqueries, CTEs, window functions, set
 operations, `MERGE`, `COPY`, views, triggers, sequences and `SERIAL`, DCL (`GRANT`/`REVOKE`),
 savepoints, cursors, every type outside the six, and every `SET` that would change behaviour we do
 not implement. `ALTER TABLE` was here too; it is now in, for `ADD COLUMN` of a nullable column
@@ -512,6 +514,10 @@ its own gap register, and it would be longer.
 - [x] 9 — tables with no `PRIMARY KEY`: an internal row id at column 0, leased a batch at a time so
   that two writers to one keyless table do not conflict on its counter; the six system columns
   refused by name rather than reported missing
+- [x] 10 — one inner `JOIN`, as a nested loop whose inner side is a point read or a unique-index
+  lookup when the condition allows one and a materialised table when it does not; two-table name
+  resolution with PostgreSQL's three answers for a reference that does not resolve; `EXPLAIN` names
+  the inner access path
 
 ## 10a. Handoff — where a fresh lane picks up
 

@@ -177,8 +177,8 @@ fn walk_predicate(expr: &Expr, table: Option<&TableDef>, seen: &mut impl FnMut(u
                 && let Some(table) = table
             {
                 let pair = match (left.as_ref(), right.as_ref()) {
-                    (Expr::Column(name), Expr::Parameter(number))
-                    | (Expr::Parameter(number), Expr::Column(name)) => Some((name, *number)),
+                    (Expr::Column { name, .. }, Expr::Parameter(number))
+                    | (Expr::Parameter(number), Expr::Column { name, .. }) => Some((name, *number)),
                     _ => None,
                 };
                 if let Some((name, number)) = pair
