@@ -25,6 +25,7 @@
 //! quietly returned.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use esker_engine::fs::{FileSystem, RandomAccessFile};
 
@@ -36,11 +37,26 @@ use crate::format::COLUMNAR_TRAILER_SIZE;
 use crate::frame::decode_chunk;
 use crate::value::Schema;
 
+/// What a reader has actually read, since it was opened or last reset.
+///
+/// The instrument behind "decode only the columns that were projected", which is the claim the
+/// whole crate rests on and which nothing else can check: a refactor that quietly read every
+/// column would still return the right answers. A test counts these instead of trusting the code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReadCounters {
+    /// Column chunks decoded.
+    pub columns_decoded: u64,
+    /// Bytes read from the file, chunk framing included, the footer excluded.
+    pub bytes_read: u64,
+}
+
 /// One open columnar file.
 pub struct Reader {
     file: Box<dyn RandomAccessFile>,
     path: PathBuf,
     footer: Footer,
+    columns_decoded: AtomicU64,
+    bytes_read: AtomicU64,
 }
 
 /// Hand-written because a [`RandomAccessFile`] is a trait object with no `Debug` of its own.
@@ -116,6 +132,8 @@ impl Reader {
             file,
             path: path.to_path_buf(),
             footer,
+            columns_decoded: AtomicU64::new(0),
+            bytes_read: AtomicU64::new(0),
         })
     }
 
@@ -135,6 +153,21 @@ impl Reader {
     #[must_use]
     pub fn rows(&self) -> u64 {
         self.footer.rows()
+    }
+
+    /// What this reader has read so far.
+    #[must_use]
+    pub fn counters(&self) -> ReadCounters {
+        ReadCounters {
+            columns_decoded: self.columns_decoded.load(Ordering::Relaxed),
+            bytes_read: self.bytes_read.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Zeroes the counters, so a test can measure one scan rather than a reader's whole life.
+    pub fn reset_counters(&self) {
+        self.columns_decoded.store(0, Ordering::Relaxed);
+        self.bytes_read.store(0, Ordering::Relaxed);
     }
 
     /// Decodes one column of one stripe, reading only that chunk's bytes.
@@ -166,6 +199,8 @@ impl Reader {
         })?;
         let mut raw = vec![0u8; len];
         read_exact_at(&*self.file, &self.path, chunk.offset, &mut raw)?;
+        self.columns_decoded.fetch_add(1, Ordering::Relaxed);
+        self.bytes_read.fetch_add(chunk.len, Ordering::Relaxed);
         let context = format!("{} stripe {stripe} column {column}", self.path.display());
         let payload = decode_chunk(&raw, &context)?;
         decode_column(ty, meta.rows, chunk.encoding, &payload)

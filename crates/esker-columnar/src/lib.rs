@@ -55,6 +55,7 @@ pub mod footer;
 pub mod fragment;
 pub mod frame;
 pub mod reader;
+pub mod scan;
 pub mod stats;
 pub mod value;
 pub mod writer;
@@ -66,7 +67,10 @@ pub use error::{Error, Result};
 pub use footer::{ChunkMeta, Footer, StripeMeta, Trailer};
 pub use fragment::{Aggregate, CompareOp, Expr, Fragment, KeyRange, Output, TableRef};
 pub use frame::Compression;
-pub use reader::Reader;
+pub use reader::{ReadCounters, Reader};
+pub use scan::{
+    FragmentOutput, FragmentResult, Group, Partial, ScanOptions, ScanStats, evaluate, evaluate_with,
+};
 pub use stats::{Bound, ColumnStats};
 pub use value::{ColumnDef, ColumnType, Schema, Value, ValueRef};
 pub use writer::{FileSummary, Writer, WriterOptions};

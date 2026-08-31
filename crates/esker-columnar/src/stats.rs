@@ -30,7 +30,7 @@ use crate::column::{Column, ColumnData};
 use crate::cursor::Cursor;
 use crate::error::{Error, Result};
 use crate::format::MAX_BOUND_LEN;
-use crate::value::{ColumnType, pg_cmp_f64};
+use crate::value::{ColumnType, Value, pg_cmp_f64};
 
 /// Bit 0 of `flags`: a minimum is present.
 const FLAG_HAS_MIN: u8 = 1 << 0;
@@ -93,6 +93,24 @@ impl Bound {
             [1] => Some(true),
             _ => None,
         }
+    }
+
+    /// This bound as a value of type `ty`, comparable with [`crate::Value::pg_cmp`].
+    ///
+    /// A text bound comes back as [`Value::Bytea`] rather than [`Value::Text`], on purpose: a
+    /// truncated one is a prefix and may split a code point, so it is not valid UTF-8 and is not
+    /// a *value* at all. Comparison does not care — text and bytes both compare as bytes here —
+    /// and pretending otherwise would mean a bound that cannot be read back.
+    #[must_use]
+    pub fn as_value(&self, ty: ColumnType) -> Option<Value> {
+        let fixed = || <[u8; 8]>::try_from(self.bytes.as_slice()).ok();
+        Some(match ty {
+            ColumnType::Int8 => Value::Int8(i64::from_le_bytes(fixed()?)),
+            ColumnType::TimestampTz => Value::TimestampTz(i64::from_le_bytes(fixed()?)),
+            ColumnType::Double => Value::Double(f64::from_le_bytes(fixed()?)),
+            ColumnType::Bool => Value::Bool(self.as_bool()?),
+            ColumnType::Text | ColumnType::Bytea => Value::Bytea(self.bytes.clone()),
+        })
     }
 
     /// A lower bound for `value`: the value itself, or a prefix of it, which sorts no higher.
