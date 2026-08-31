@@ -1,6 +1,7 @@
 # Phase 6d plan — the time machine, as a SQL surface
 
-Status: **in progress** — written before implementation; §8 records progress and §9 what changed.
+Status: **complete** — written before implementation; §8 records progress and §9 what changed.
+All four units landed; §5 is what was deliberately not built.
 Design: [ADR 0021](../adr/0021-time-machine.md). Milestone: `docs/plans/phase-6a.md` §12, M2.
 Constitution: `CLAUDE.md`. The compatibility contract this inherits whole: `docs/plans/phase-6a.md`
 §1 (C1, C2, C3).

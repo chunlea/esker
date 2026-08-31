@@ -1,9 +1,11 @@
 # 0021 — The time machine
 
-Status: **being built.** Decision 1 (the historical read, its bound and the retention DDL) and
-Decision 4's records are implemented in `esker-sql`; the checkpoint verbs and `DIFF` are in
-progress and `FLASHBACK` is deliberately not. The plan is `docs/plans/phase-6d.md`, the milestone
-is `docs/plans/phase-6a.md` §12. See `docs/txn-spec.md` §7, `docs/DESIGN.md` §8,
+Status: **built, except `FLASHBACK`.** Decision 1 (the historical read, its bound and the retention
+DDL), Decision 3's first three verbs (a checkpoint, reading at one, and `DIFF`) and Decision 4's
+records are implemented across `esker-client` and `esker-sql`. `FLASHBACK` is deliberately not: it
+is `O(rows changed)` writes in one transaction and needs the batching-with-a-durable-cursor that
+ADR 0020's backfill needs. The plan is `docs/plans/phase-6d.md`, the milestone is
+`docs/plans/phase-6a.md` §12. See `docs/txn-spec.md` §7, `docs/DESIGN.md` §8,
 [ADR 0020](0020-online-schema-change.md).
 
 ## Context
