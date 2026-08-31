@@ -1,0 +1,27 @@
+crates/esker-raft/src/replication.rs
+  s_04c6c85b29b28a::t_a141178d753b39 147-164
+crates/esker-raft/src/snapshot.rs
+  s_04c6c85b29b28a::t_3bbd9137c2a015 755-808
+crates/esker-store/src/lib.rs
+  s_04c6c85b29b28a::t_0983337b3816a7 129-138
+crates/esker-store/src/server.rs
+  s_04c6c85b29b28a::t_11cecda60f651f 483-488,490-497,507-508,760-762,769-894,1415-1421,1425-1426
+docs/plans/phase-4.md
+  s_04c6c85b29b28a::t_f4f92547980d9a 982-1065
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "8b76592aac7d001808afc0c8302cf64916258aec",
+  "prompts": {},
+  "sessions": {
+    "s_04c6c85b29b28a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0e874339-89db-44c7-acd5-0deac94983ec",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
