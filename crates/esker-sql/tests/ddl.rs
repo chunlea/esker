@@ -62,6 +62,16 @@ impl Node {
             .collect()
     }
 
+    /// A second session on the same node: its own executor, the same store and the same catalog
+    /// cache. That shared cache is the thing worth testing across two of them.
+    fn session(&self) -> Executor {
+        Executor::new(
+            Arc::clone(&self.backend) as Arc<dyn Backend>,
+            Arc::clone(&self.catalog),
+            1,
+        )
+    }
+
     /// The table as the catalog holds it, read in a fresh transaction.
     fn table(&self, name: &str) -> Option<esker_sql::catalog::TableDef> {
         let txn = self.backend.begin().unwrap();
@@ -373,5 +383,44 @@ fn the_wrong_object_type_carries_postgresqls_own_hint() {
     assert_eq!(
         node.run("DROP INDEX t").unwrap_err().hint(),
         Some("Use DROP TABLE to remove a table.")
+    );
+}
+
+/// A DDL statement that rolls back must leave nothing of itself on the node.
+///
+/// Two sessions share one catalog cache, and catalog versions are reused after a rollback -- the
+/// bump is `read + 1` inside the transaction, so the abandoned number is the very next one a
+/// committing DDL takes. Before the executor started reading through the cache for a transaction
+/// that has written the catalog, the second session's `SELECT` here answered from a table the
+/// first session had rolled back.
+#[test]
+fn a_rolled_back_ddl_is_invisible_to_the_next_session() {
+    let mut node = Node::new();
+    let mut other = node.session();
+
+    // `BEGIN`/`ROLLBACK` are the session's, not the executor's, so a test that drives the
+    // executor directly opens the block through the same trait the session uses.
+    node.executor.begin().unwrap();
+    node.run("CREATE TABLE ghost (id int8 PRIMARY KEY)")
+        .unwrap();
+    // The writer sees its own DDL, which is what puts the definition in reach of the cache.
+    node.run("SELECT id FROM ghost").unwrap();
+    node.executor.rollback().unwrap();
+
+    // A different DDL commits, and lands on the catalog version the rolled-back one abandoned.
+    for parsed in parse_statements("CREATE TABLE real (id int8 PRIMARY KEY)").unwrap() {
+        other.execute(&parsed, &Params::NONE).unwrap();
+    }
+
+    let error = node.run("SELECT id FROM ghost").unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::UNDEFINED_TABLE);
+    let error = {
+        let parsed = parse_statements("SELECT id FROM ghost").unwrap();
+        other.execute(&parsed[0], &Params::NONE).unwrap_err()
+    };
+    assert_eq!(error.sqlstate(), sqlstate::UNDEFINED_TABLE);
+    assert!(
+        node.table("real").is_some(),
+        "the one that committed is there"
     );
 }

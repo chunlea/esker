@@ -22,6 +22,21 @@
 //! A transaction whose snapshot is *older* than what the cache holds reads through to the store
 //! instead: its snapshot is real, the cache is just newer than it, and serving from the cache
 //! would show it a definition from its own future.
+//!
+//! # And the second thing it must never do: cache a definition nobody has committed
+//!
+//! A transaction that has run DDL reads its *own* catalog writes back, version bump included, so
+//! its view sits at a version no committed transaction has reached yet. Caching what it reads
+//! would publish an uncommitted definition to every session on the node — and version numbers are
+//! reused after a rollback, because the bump is `read + 1` inside the transaction, so the next DDL
+//! that really does commit lands on the same number and finds the abandoned entry waiting for it.
+//! The failure is a `SELECT` against a table that was never created, or worse, a row written
+//! against a column list that was rolled back.
+//!
+//! So a transaction that has written the catalog gets [`Catalog::view_uncached`]: it reads through
+//! for every lookup, which is also what makes its own uncommitted DDL visible to itself, and it
+//! puts nothing back. DDL is rare and this is the statement that just paid for a round trip
+//! anyway.
 
 mod record;
 
@@ -196,14 +211,30 @@ impl Catalog {
     ///
     /// This is the whole of the consistency mechanism: one read, at the transaction's snapshot,
     /// and every definition it then sees belongs to that version.
+    ///
+    /// Only for a transaction that has **not** written the catalog itself — see
+    /// [`Catalog::view_uncached`], which is what a transaction that has run DDL must use.
     pub fn view<'a>(&'a self, txn: &'a dyn Txn, tenant: u64) -> Result<View<'a>> {
+        self.view_at(txn, tenant, true)
+    }
+
+    /// The same view, reading through the cache and never filling it.
+    ///
+    /// This is what a transaction that has run DDL gets. Its reads answer with its own
+    /// uncommitted definitions, which are exactly the ones that must not be published to the
+    /// other sessions sharing this node (see the module docs).
+    pub fn view_uncached<'a>(&'a self, txn: &'a dyn Txn, tenant: u64) -> Result<View<'a>> {
+        self.view_at(txn, tenant, false)
+    }
+
+    fn view_at<'a>(&'a self, txn: &'a dyn Txn, tenant: u64, cached: bool) -> Result<View<'a>> {
         let version = match txn.get(&record::version_key())? {
             Some(bytes) => record::decode_counter(&bytes)?,
             // No DDL has ever run. Version 0 is the empty catalog.
             None => 0,
         };
         Ok(View {
-            catalog: self,
+            catalog: cached.then_some(self),
             txn,
             tenant,
             version,
@@ -236,7 +267,9 @@ impl Catalog {
 /// One transaction's consistent view of the catalog.
 #[derive(Debug)]
 pub struct View<'a> {
-    catalog: &'a Catalog,
+    /// The cache to answer from and fill, or `None` for a transaction that has written the
+    /// catalog and whose reads are therefore its own uncommitted DDL.
+    catalog: Option<&'a Catalog>,
     txn: &'a dyn Txn,
     tenant: u64,
     version: u64,
@@ -251,17 +284,19 @@ impl View<'_> {
 
     /// What a name is, or `None` when nothing of that name exists.
     pub fn relation(&self, name: &str) -> Result<Option<Relation>> {
-        let cacheable = self.catalog.usable_at(self.version);
+        let cache = self.cache();
         let key = (self.tenant, name.to_owned());
-        if cacheable && let Some(hit) = self.catalog.lock().names.get(&key) {
+        if let Some(cache) = cache
+            && let Some(hit) = cache.lock().names.get(&key)
+        {
             return Ok(*hit);
         }
         let found = match self.txn.get(&record::name_key(self.tenant, name))? {
             Some(bytes) => Some(record::decode_relation(&bytes)?),
             None => None,
         };
-        if cacheable {
-            self.catalog.lock().names.insert(key, found);
+        if let Some(cache) = cache {
+            cache.lock().names.insert(key, found);
         }
         Ok(found)
     }
@@ -277,19 +312,28 @@ impl View<'_> {
 
     /// A table by id.
     pub fn table_by_id(&self, table_id: u64) -> Result<Option<Arc<TableDef>>> {
-        let cacheable = self.catalog.usable_at(self.version);
+        let cache = self.cache();
         let key = (self.tenant, table_id);
-        if cacheable && let Some(hit) = self.catalog.lock().tables.get(&key) {
+        if let Some(cache) = cache
+            && let Some(hit) = cache.lock().tables.get(&key)
+        {
             return Ok(Some(Arc::clone(hit)));
         }
         let Some(bytes) = self.txn.get(&record::table_key(self.tenant, table_id))? else {
             return Ok(None);
         };
         let table = Arc::new(record::decode_table(&bytes)?);
-        if cacheable {
-            self.catalog.lock().tables.insert(key, Arc::clone(&table));
+        if let Some(cache) = cache {
+            cache.lock().tables.insert(key, Arc::clone(&table));
         }
         Ok(Some(table))
+    }
+
+    /// The cache this view may use, or `None` — either because the transaction has written the
+    /// catalog, or because the cache holds a version this view cannot be answered from.
+    fn cache(&self) -> Option<&Catalog> {
+        self.catalog
+            .filter(|catalog| catalog.usable_at(self.version))
     }
 
     /// A table by name, or `42P01` — the shape almost every statement wants.
@@ -788,6 +832,45 @@ mod tests {
             allocate_id(&mut *next, 1).unwrap(),
             3,
             "and it survives a commit"
+        );
+    }
+
+    /// A rolled-back DDL must leave nothing behind in the cache every session shares.
+    ///
+    /// The trap is that catalog versions are *reused*: the bump is `read + 1` inside the
+    /// transaction, so a DDL that rolls back leaves its number free and the next DDL that really
+    /// commits lands on it — and finds the abandoned entry waiting. Before
+    /// [`Catalog::view_uncached`] this returned a table nobody had ever created.
+    #[test]
+    fn a_rolled_back_ddl_leaves_nothing_in_the_cache() {
+        let backend = MemoryBackend::new();
+        let catalog = Catalog::new();
+
+        // Session A: BEGIN; CREATE TABLE accounts; look at it; ROLLBACK.
+        let mut a = backend.begin().unwrap();
+        create_table(&mut *a, 1, &accounts(1)).unwrap();
+        {
+            let view = catalog.view_uncached(&*a, 1).unwrap();
+            assert_eq!(view.version(), 1);
+            assert!(view.table("accounts").unwrap().is_some(), "its own writes");
+        }
+        a.rollback().unwrap();
+
+        // Session B commits a different DDL, which reaches the same catalog version.
+        let mut b = backend.begin().unwrap();
+        let mut ledger = accounts(3);
+        ledger.name = "ledger".into();
+        ledger.primary_key_name = "ledger_pkey".into();
+        ledger.indexes[0].name = "ledger_email_key".into();
+        create_table(&mut *b, 1, &ledger).unwrap();
+        b.commit().unwrap();
+
+        let c = backend.begin().unwrap();
+        let view = catalog.view(&*c, 1).unwrap();
+        assert_eq!(view.version(), 1);
+        assert!(
+            view.table("accounts").unwrap().is_none(),
+            "a table nobody committed came back from the cache"
         );
     }
 

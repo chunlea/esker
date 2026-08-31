@@ -64,6 +64,23 @@ pub enum Statement {
 }
 
 impl Statement {
+    /// Whether running this statement writes the catalog.
+    ///
+    /// The executor asks so that every later lookup in the same transaction reads through the
+    /// shared cache instead of filling it: after this statement the transaction can see its own
+    /// uncommitted DDL, and nothing uncommitted may be published to the node (`crate::catalog`).
+    /// `EXPLAIN` is false because it runs nothing.
+    #[must_use]
+    pub fn writes_catalog(&self) -> bool {
+        matches!(
+            self,
+            Statement::CreateTable(_)
+                | Statement::DropTable(_)
+                | Statement::CreateIndex(_)
+                | Statement::DropIndex(_)
+        )
+    }
+
     /// The command tag a successful run reports, for statements whose tag does not carry a count.
     ///
     /// PostgreSQL's tags are part of the compatibility surface: `psql` prints them and scripts

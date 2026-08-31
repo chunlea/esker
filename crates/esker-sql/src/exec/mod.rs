@@ -56,6 +56,10 @@ pub struct Executor {
     written: Written,
     /// Notices produced by the statement that just ran, waiting for the session to send them.
     notices: Vec<SqlError>,
+    /// Whether the open transaction has run DDL. From then on its catalog lookups read through
+    /// rather than from the shared cache: they answer with its own uncommitted definitions, which
+    /// must not reach the other sessions on this node (`crate::catalog`).
+    catalog_written: bool,
 }
 
 impl Executor {
@@ -69,6 +73,7 @@ impl Executor {
             open: None,
             written: Written::default(),
             notices: Vec::new(),
+            catalog_written: false,
         }
     }
 
@@ -86,6 +91,7 @@ impl Executor {
         }
 
         let mut txn = self.backend.begin()?;
+        self.catalog_written = false;
         let mut written = Written::default();
         let bound = match self.bound(&*txn, statement, params) {
             Ok(bound) => bound,
@@ -94,7 +100,7 @@ impl Executor {
                 return Err(error);
             }
         };
-        match self.run_recording(&mut *txn, &bound, &mut written) {
+        let outcome = match self.run_recording(&mut *txn, &bound, &mut written) {
             Ok(outcome) => match txn.commit() {
                 Ok(_) => Ok(outcome),
                 Err(error) => Err(self.explain_conflict(error, &written)),
@@ -105,7 +111,9 @@ impl Executor {
                 let _ = txn.rollback();
                 Err(error)
             }
-        }
+        };
+        self.catalog_written = false;
+        outcome
     }
 
     fn run_recording(
@@ -114,6 +122,9 @@ impl Executor {
         statement: &Statement,
         written: &mut Written,
     ) -> Result<Outcome> {
+        // Before the statement rather than after it: a DDL statement that fails part-way has
+        // still written, and the reads it makes on the way are its own uncommitted catalog.
+        self.catalog_written |= statement.writes_catalog();
         match statement {
             Statement::CreateTable(create) => ddl::create_table(self, txn, create),
             Statement::DropTable(drop) => ddl::drop_table(self, txn, drop),
@@ -240,6 +251,9 @@ impl Executor {
 
     /// This transaction's view of the catalog, pinned to one version.
     fn catalog_view<'a>(&'a self, txn: &'a dyn Txn) -> Result<crate::catalog::View<'a>> {
+        if self.catalog_written {
+            return self.catalog.view_uncached(txn, self.tenant);
+        }
         self.catalog.view(txn, self.tenant)
     }
 
@@ -354,11 +368,13 @@ impl Execute for Executor {
         // and leaves the block alone.
         self.open = Some(self.backend.begin()?);
         self.written = Written::default();
+        self.catalog_written = false;
         Ok(())
     }
 
     fn commit(&mut self) -> Result<()> {
         let written = std::mem::take(&mut self.written);
+        self.catalog_written = false;
         let Some(txn) = self.open.take() else {
             return Ok(());
         };
@@ -372,6 +388,7 @@ impl Execute for Executor {
 
     fn rollback(&mut self) -> Result<()> {
         self.written = Written::default();
+        self.catalog_written = false;
         let Some(txn) = self.open.take() else {
             return Ok(());
         };
