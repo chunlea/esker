@@ -1,0 +1,23 @@
+crates/esker-base/src/hmac.rs
+  s_3138696d8fbc01::t_e4da4b5f91d079 1-128
+crates/esker-base/src/lib.rs
+  s_3138696d8fbc01::t_758c5d9c6126f8 15-16,27,29
+crates/esker-base/src/sha256.rs
+  s_3138696d8fbc01::t_a9b4f722aeb0c1 1-313
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "527bec1ef2c476c89ca75f07cce85d2890a17073",
+  "prompts": {},
+  "sessions": {
+    "s_3138696d8fbc01": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "de1cd601-bbfb-4a44-a756-dae1c4fcb152",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
