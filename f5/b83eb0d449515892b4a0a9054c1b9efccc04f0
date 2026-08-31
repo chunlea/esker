@@ -1,0 +1,27 @@
+crates/esker-pd/src/pd/repair.rs
+  s_c79c917aec8864::t_2287145cba9d14 186-194,205-210
+crates/esker-pd/src/schedule.rs
+  s_c79c917aec8864::t_ebdaa182068706 27,29-52,64-138,340-348,390-402,418,421-427,434,437-446,451-462,483,489-492,681-744,746-877,968,993-1003
+crates/esker-pd/tests/repair.rs
+  s_c79c917aec8864::t_70891c8da6515b 1-161
+docs/DESIGN.md
+  s_c79c917aec8864::t_8c753897a48d31 484-508
+docs/adr/0026-the-quorum-loss-boundary.md
+  s_c79c917aec8864::t_8fe9204a4e3b7b 1-97
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "f5b83eb0d449515892b4a0a9054c1b9efccc04f0",
+  "prompts": {},
+  "sessions": {
+    "s_c79c917aec8864": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "776efd72-f92f-467e-b1d4-57e510c7c328",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
