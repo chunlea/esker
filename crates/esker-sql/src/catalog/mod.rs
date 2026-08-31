@@ -157,6 +157,18 @@ impl SchemaState {
         )
     }
 
+    /// The next state towards `Absent`, or `None` at it — the direction a **removal** runs, and
+    /// the direction a failed change unwinds in.
+    #[must_use]
+    pub fn backward(self) -> Option<SchemaState> {
+        match self {
+            SchemaState::Public => Some(SchemaState::WriteOnly),
+            SchemaState::WriteOnly => Some(SchemaState::DeleteOnly),
+            SchemaState::DeleteOnly => Some(SchemaState::Absent),
+            SchemaState::Absent => None,
+        }
+    }
+
     /// The next state towards `Public`, or `None` at it.
     #[must_use]
     pub fn forward(self) -> Option<SchemaState> {
@@ -667,9 +679,16 @@ pub fn advance_index_state(
                 table.name
             ))
         })?;
+    // **One step, in either direction.** Forwards is a change being added and backwards is one
+    // being removed — or one being unwound after it failed — and both need the same rule: a node
+    // one step behind must never be two, whichever way the cluster is moving.
+    //
     // Idempotent for the state it is already in, so a job that crashed after writing and before
     // recording resumes rather than failing.
-    if index.state != to && index.state.forward() != Some(to) {
+    let one_step = index.state == to
+        || index.state.forward() == Some(to)
+        || index.state.backward() == Some(to);
+    if !one_step {
         return Err(SqlError::Internal(format!(
             "index \"{}\" cannot go from {} to {} in one step",
             index.name,
@@ -681,6 +700,68 @@ pub fn advance_index_state(
     index.state_since = next_version;
     replace_table(txn, tenant, table, &updated)?;
     Ok(updated)
+}
+
+/// A schema-change job in flight: which table, how far its backfill got, and whether it finished.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobRecord {
+    /// The index being built.
+    pub index_id: u64,
+    /// The table it is on.
+    pub table_id: u64,
+    /// The row key the next batch starts at. Empty means "from the beginning".
+    ///
+    /// **Durable, and that is the point.** A backfill is many small transactions, and a node that
+    /// dies mid-job must resume rather than restart — on a large table, restarting is how a job
+    /// never finishes.
+    pub cursor: Vec<u8>,
+    /// Whether the backfill has reached the end of the table.
+    pub done: bool,
+}
+
+/// Records a job, or moves its cursor on.
+pub fn put_job(txn: &mut dyn Txn, tenant: u64, job: &JobRecord) {
+    txn.put(
+        &record::job_key(tenant, job.index_id),
+        &record::encode_job(job.table_id, &job.cursor, job.done),
+    );
+}
+
+/// One job, or `None`.
+pub fn job(txn: &dyn Txn, tenant: u64, index_id: u64) -> Result<Option<JobRecord>> {
+    let Some(bytes) = txn.get(&record::job_key(tenant, index_id))? else {
+        return Ok(None);
+    };
+    let (table_id, cursor, done) = record::decode_job(&bytes)?;
+    Ok(Some(JobRecord {
+        index_id,
+        table_id,
+        cursor,
+        done,
+    }))
+}
+
+/// Forgets a job. Called when it reaches `public`, or when it unwinds.
+pub fn drop_job(txn: &mut dyn Txn, tenant: u64, index_id: u64) {
+    txn.delete(&record::job_key(tenant, index_id));
+}
+
+/// The `[start, end)` key range holding one tenant's jobs, in index-id order.
+#[must_use]
+pub fn job_range(tenant: u64) -> (Vec<u8>, Vec<u8>) {
+    record::job_range(tenant)
+}
+
+/// One listed job, out of its key and its value.
+pub fn decode_job(tenant: u64, key: &[u8], value: &[u8]) -> Result<JobRecord> {
+    let index_id = record::job_index_id(tenant, key)?;
+    let (table_id, cursor, done) = record::decode_job(value)?;
+    Ok(JobRecord {
+        index_id,
+        table_id,
+        cursor,
+        done,
+    })
 }
 
 /// Sets the retention override for one table, in milliseconds.

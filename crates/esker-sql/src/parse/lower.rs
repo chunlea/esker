@@ -169,6 +169,15 @@ fn lower_verb(query: &Query) -> Result<Option<plan::TimeMachineVerb>> {
                 }
             }));
         }
+        if called == "esker_schema_jobs" {
+            refuse_if(!table.joins.is_empty(), "a JOIN on esker_schema_jobs()")?;
+            refuse_if(select.selection.is_some(), "a WHERE on esker_schema_jobs()")?;
+            refuse_if(
+                !matches!(select.projection.as_slice(), [SelectItem::Wildcard(_)]),
+                "a target list on esker_schema_jobs() other than *",
+            )?;
+            return Ok(Some(plan::TimeMachineVerb::ListSchemaJobs));
+        }
         if called == "esker_checkpoints" {
             // Nothing else may be attached: this returns what it returns, and a `WHERE` silently
             // ignored would answer a different question than the one asked.
@@ -202,9 +211,20 @@ fn lower_verb(query: &Query) -> Result<Option<plan::TimeMachineVerb>> {
         ("esker_drop_checkpoint", Some([name])) => {
             Some(plan::TimeMachineVerb::DropCheckpoint { name: name.clone() })
         }
+        ("esker_schema_step", Some([index])) => Some(plan::TimeMachineVerb::SchemaStep {
+            // An index *name*, folded the way every relation name is — unlike a checkpoint's,
+            // which is a string literal PostgreSQL would not fold.
+            index: fold_identifier(index, false).0,
+        }),
         // A verb called with the wrong arguments is PostgreSQL's `42883`, not a silent fallthrough
         // to "that column does not exist".
-        ("pg_export_snapshot" | "esker_checkpoint" | "esker_drop_checkpoint", _) => {
+        (
+            "pg_export_snapshot"
+            | "esker_checkpoint"
+            | "esker_drop_checkpoint"
+            | "esker_schema_step",
+            _,
+        ) => {
             return Err(SqlError::unsupported(format!(
                 "{called} with these arguments"
             )));
@@ -765,7 +785,6 @@ fn alter_action_name(operation: &AlterTableOperation) -> String {
 }
 
 fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<plan::CreateIndex> {
-    refuse_if(create.concurrently, "CREATE INDEX CONCURRENTLY")?;
     refuse_if(!create.include.is_empty(), "CREATE INDEX ... INCLUDE")?;
     refuse_if(
         create.nulls_distinct.is_some(),
@@ -795,6 +814,7 @@ fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<plan::Crea
         columns: index_columns(&create.columns)?,
         unique: create.unique,
         if_not_exists: create.if_not_exists,
+        concurrently: create.concurrently,
     })
 }
 

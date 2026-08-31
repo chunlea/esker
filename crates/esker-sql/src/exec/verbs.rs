@@ -31,7 +31,8 @@
 use crate::backend::Txn;
 use crate::catalog;
 use crate::error::Result;
-use crate::exec::{Executor, for_each_page};
+use crate::error::SqlError;
+use crate::exec::{Executor, for_each_page, job};
 use crate::pgwire::message::FieldDescription;
 use crate::pgwire::session::Outcome;
 use crate::plan::TimeMachineVerb;
@@ -49,6 +50,8 @@ pub(super) fn run(
         TimeMachineVerb::DropCheckpoint { name } => drop_one(executor, name),
         TimeMachineVerb::ListCheckpoints => list(executor, txn),
         TimeMachineVerb::Diff { table, from, to } => diff(executor, table, from, to.as_deref()),
+        TimeMachineVerb::ListSchemaJobs => list_jobs(executor, txn),
+        TimeMachineVerb::SchemaStep { index } => schema_step(executor, txn, index),
     }
 }
 
@@ -137,6 +140,138 @@ fn list(executor: &mut Executor, txn: &mut dyn Txn) -> Result<Outcome> {
         rows,
         tag,
     })
+}
+
+/// `SELECT * FROM esker_schema_jobs()` — every schema change in flight, and where each one is.
+///
+/// The `psql`-visible progress ADR 0020 asks for. Four columns, because a human watching a
+/// `CREATE INDEX CONCURRENTLY` needs to tell *slow* from *stuck*: the state says how far the
+/// change has got, and the cursor says whether the backfill is still moving.
+fn list_jobs(executor: &Executor, txn: &mut dyn Txn) -> Result<Outcome> {
+    let tenant = executor.tenant;
+    let (start, end) = catalog::job_range(tenant);
+    let mut rows = Vec::new();
+    let mut jobs = Vec::new();
+    for_each_page(txn, &start, &end, |_, page| {
+        for (key, value) in page {
+            jobs.push(catalog::decode_job(tenant, key, value)?);
+        }
+        Ok(())
+    })?;
+    for job in jobs {
+        let table = executor.table_by_id(txn, job.table_id)?;
+        let index = table.indexes.iter().find(|index| index.id == job.index_id);
+        rows.push(vec![
+            Some(table.name.clone().into_bytes()),
+            Some(
+                index
+                    .map_or_else(|| job.index_id.to_string(), |index| index.name.clone())
+                    .into_bytes(),
+            ),
+            Some(
+                index
+                    .map_or("gone", |index| index.state.name())
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            Some(
+                if job.done {
+                    "backfilled".to_owned()
+                } else if job.cursor.is_empty() {
+                    "not started".to_owned()
+                } else {
+                    format!("{} rows in", job.cursor.len())
+                }
+                .into_bytes(),
+            ),
+        ]);
+    }
+    let tag = format!("SELECT {}", rows.len());
+    Ok(Outcome::Rows {
+        fields: ["table", "index", "state", "backfill"]
+            .into_iter()
+            .map(|name| FieldDescription::computed(name, ColumnType::Text))
+            .collect(),
+        rows,
+        tag,
+    })
+}
+
+/// `SELECT esker_schema_step('<index>')` — one step of one job.
+///
+/// **The step, separated from the wait.** PD publishes how long a step must wait
+/// ([ADR 0028](../../../docs/adr/0028-the-schema-lease.md)); this takes it. Separating them is what
+/// makes the state machine testable without a timer, and what lets an operator move a stuck job.
+///
+/// The sequence is the ADR's: `absent → delete-only → write-only`, then the backfill a batch at a
+/// time, then `public`. A failed backfill unwinds the states and forgets the job, so a change that
+/// fails on data leaves no half-built index behind.
+///
+/// # The wait is between **state transitions**, not between batches
+///
+/// The answer says which happened, and a driver must read it: `delete-only`, `write-only` and
+/// `public` are transitions and the next step must wait the interval PD published;
+/// `backfilling` changed no state at all and the next batch may start immediately.
+///
+/// Waiting between batches instead would be a real cost rather than a pedantic one. Measured on a
+/// 20,000-row table: 82 steps, of which 79 are batches. At an eight-second interval, waiting after
+/// every step is **656 seconds**; waiting only after the three transitions is **24 seconds and a
+/// seventh** — the same safety, twenty-seven times faster. Every batch runs at write-only, so no
+/// state moves and no node can fall a step behind while they run, which is why the wait buys
+/// nothing there.
+fn schema_step(executor: &mut Executor, txn: &mut dyn Txn, index: &str) -> Result<Outcome> {
+    let tenant = executor.tenant;
+    let relation = executor.catalog_view(txn)?.relation(index)?;
+    let Some(catalog::Relation::Index { index_id, .. }) = relation else {
+        return Err(SqlError::UndefinedIndex(index.to_owned()));
+    };
+    let Some(job) = catalog::job(txn, tenant, index_id)? else {
+        return Err(SqlError::Internal(format!(
+            "index \"{index}\" has no schema-change job in flight"
+        )));
+    };
+    let table = executor.table_by_id(txn, job.table_id)?;
+    let state = table
+        .indexes
+        .iter()
+        .find(|def| def.id == index_id)
+        .map(|def| def.state)
+        .ok_or_else(|| SqlError::UndefinedIndex(index.to_owned()))?;
+
+    let said = match state {
+        catalog::SchemaState::Absent => {
+            job::advance(executor, index_id, catalog::SchemaState::DeleteOnly)?;
+            "delete-only".to_owned()
+        }
+        catalog::SchemaState::DeleteOnly => {
+            job::advance(executor, index_id, catalog::SchemaState::WriteOnly)?;
+            "write-only".to_owned()
+        }
+        catalog::SchemaState::WriteOnly => match job::backfill_batch(executor, index_id) {
+            Ok(true) => {
+                job::advance(executor, index_id, catalog::SchemaState::Public)?;
+                let mut own = executor.plain_read()?;
+                catalog::drop_job(&mut *own, tenant, index_id);
+                own.commit()?;
+                "public".to_owned()
+            }
+            Ok(false) => "backfilling".to_owned(),
+            Err(error) => {
+                // A duplicate is the one way a schema change fails on *data*. The states unwind so
+                // that a failed change leaves nothing half-built, and the error the user gets is
+                // the one they caused.
+                job::unwind(executor, index_id)?;
+                return Err(error);
+            }
+        },
+        catalog::SchemaState::Public => {
+            let mut own = executor.plain_read()?;
+            catalog::drop_job(&mut *own, tenant, index_id);
+            own.commit()?;
+            "public".to_owned()
+        }
+    };
+    Ok(one_text("esker_schema_step", said))
 }
 
 /// One row of one text column, which is the shape every scalar verb here returns.

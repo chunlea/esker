@@ -805,3 +805,190 @@ fn a_node_with_no_lease_source_is_not_treated_as_expired() {
     node.run("INSERT INTO t VALUES (1)").unwrap();
     assert_eq!(node.rows("SELECT id FROM t"), [[Some("1".to_owned())]]);
 }
+
+// --- The job: a staged CREATE INDEX ------------------------------------------------------------
+
+/// Drives a job to completion, one step at a time, and says how many steps it took.
+fn drive(node: &mut Node, index: &str) -> usize {
+    for step in 1..500 {
+        let said = node.rows(&format!("SELECT esker_schema_step('{index}')"))[0][0]
+            .clone()
+            .unwrap();
+        if said == "public" {
+            return step;
+        }
+    }
+    panic!("the job did not finish");
+}
+
+/// `CREATE INDEX CONCURRENTLY` on a populated table: the states advance, the backfill runs in
+/// batches, and the index is complete and readable at the end.
+#[test]
+fn a_concurrent_create_index_walks_the_states_and_ends_complete() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY, a int8)")
+        .unwrap();
+    for id in 1..=5 {
+        node.run(&format!("INSERT INTO t VALUES ({id}, {})", id * 10))
+            .unwrap();
+    }
+
+    node.run("CREATE UNIQUE INDEX CONCURRENTLY ti ON t (a)")
+        .unwrap();
+
+    // The statement returns immediately, with the index at `absent` and nothing readable through
+    // it: that is what CONCURRENTLY means.
+    assert_eq!(
+        index_state(&node, "t"),
+        esker_sql::catalog::SchemaState::Absent
+    );
+    let jobs = node.rows("SELECT * FROM esker_schema_jobs()");
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0][1], Some("ti".to_owned()));
+    assert_eq!(jobs[0][2], Some("absent".to_owned()));
+
+    // Step by step, in the ADR's order.
+    for expected in ["delete-only", "write-only"] {
+        let said = node.rows("SELECT esker_schema_step('ti')")[0][0]
+            .clone()
+            .unwrap();
+        assert_eq!(said, expected);
+        assert_eq!(index_state(&node, "t").name(), expected);
+    }
+
+    drive(&mut node, "ti");
+    assert_eq!(
+        index_state(&node, "t"),
+        esker_sql::catalog::SchemaState::Public
+    );
+    assert_eq!(index_entries(&node, "t"), 5, "every row that predated it");
+    assert!(
+        node.rows("SELECT * FROM esker_schema_jobs()").is_empty(),
+        "a finished job is forgotten"
+    );
+
+    // And the index answers, which is the point of building it.
+    assert_eq!(
+        node.rows("SELECT id FROM t WHERE a = 30"),
+        [[Some("3".to_owned())]]
+    );
+}
+
+/// A table larger than one batch is **completely** indexed — the assertion that the cursor is
+/// doing its job rather than the first batch looking like the whole table.
+#[test]
+fn a_table_larger_than_one_batch_is_completely_indexed() {
+    let rows = esker_sql::exec::BATCH_ROWS * 2 + 7;
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY, a int8)")
+        .unwrap();
+    for id in 1..=rows {
+        node.run(&format!("INSERT INTO t VALUES ({id}, {id})"))
+            .unwrap();
+    }
+
+    node.run("CREATE INDEX CONCURRENTLY ti ON t (a)").unwrap();
+    let steps = drive(&mut node, "ti");
+    assert!(steps > 3, "more than one backfill batch ran: {steps} steps");
+    assert_eq!(index_entries(&node, "t"), rows);
+}
+
+/// **Resume, not restart.** A node that dies mid-backfill leaves a durable cursor, and the next
+/// one picks up from it — on a table large enough to need a job, restarting is how a job never
+/// finishes.
+#[test]
+fn a_backfill_resumes_from_its_cursor_rather_than_restarting() {
+    let rows = esker_sql::exec::BATCH_ROWS + 5;
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY, a int8)")
+        .unwrap();
+    for id in 1..=rows {
+        node.run(&format!("INSERT INTO t VALUES ({id}, {id})"))
+            .unwrap();
+    }
+    node.run("CREATE INDEX CONCURRENTLY ti ON t (a)").unwrap();
+    node.run("SELECT esker_schema_step('ti')").unwrap();
+    node.run("SELECT esker_schema_step('ti')").unwrap();
+    node.run("SELECT esker_schema_step('ti')").unwrap();
+
+    let after_one_batch = index_entries(&node, "t");
+    assert_eq!(after_one_batch, esker_sql::exec::BATCH_ROWS);
+    let jobs = node.rows("SELECT * FROM esker_schema_jobs()");
+    assert_eq!(jobs[0][2], Some("write-only".to_owned()));
+    assert_ne!(
+        jobs[0][3],
+        Some("not started".to_owned()),
+        "the cursor moved"
+    );
+
+    // The node dies. A **different** session, sharing only the store, finishes the job.
+    let mut fresh = other_session(&node);
+    drive(&mut fresh, "ti");
+    assert_eq!(index_entries(&node, "t"), rows, "resumed, not restarted");
+}
+
+/// A `UNIQUE` backfill that meets a duplicate fails the **whole change** with `23505`, and the
+/// states unwind so that nothing half-built is left behind. The one place a schema change fails on
+/// *data* rather than on a conflict.
+#[test]
+fn a_unique_backfill_meeting_a_duplicate_fails_and_unwinds() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY, a int8)")
+        .unwrap();
+    node.run("INSERT INTO t VALUES (1, 10), (2, 10)").unwrap();
+
+    node.run("CREATE UNIQUE INDEX CONCURRENTLY ti ON t (a)")
+        .unwrap();
+    node.run("SELECT esker_schema_step('ti')").unwrap();
+    node.run("SELECT esker_schema_step('ti')").unwrap();
+
+    let error = node.fails("SELECT esker_schema_step('ti')");
+    assert_eq!(error.sqlstate(), sqlstate::UNIQUE_VIOLATION);
+    assert!(error.to_string().contains("ti"), "{error}");
+
+    assert_eq!(
+        index_state(&node, "t"),
+        esker_sql::catalog::SchemaState::Absent,
+        "the states unwind"
+    );
+    assert!(
+        node.rows("SELECT * FROM esker_schema_jobs()").is_empty(),
+        "and the job is forgotten"
+    );
+    // The table is untouched, which is what "fails the whole change" has to mean.
+    assert_eq!(node.rows("SELECT id FROM t ORDER BY id").len(), 2);
+}
+
+/// Live traffic during the backfill: a row inserted at **write-only** is maintained by its own
+/// writer, and the backfill writing the same entry is a no-op rather than a conflict.
+#[test]
+fn dml_during_the_backfill_converges_with_it() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY, a int8)")
+        .unwrap();
+    for id in 1..=3 {
+        node.run(&format!("INSERT INTO t VALUES ({id}, {id})"))
+            .unwrap();
+    }
+    node.run("CREATE UNIQUE INDEX CONCURRENTLY ti ON t (a)")
+        .unwrap();
+    node.run("SELECT esker_schema_step('ti')").unwrap();
+    node.run("SELECT esker_schema_step('ti')").unwrap();
+    assert_eq!(index_state(&node, "t").name(), "write-only");
+
+    // Written while the index is write-only: its writer maintains it, so its entry exists before
+    // the backfill ever reaches it.
+    node.run("INSERT INTO t VALUES (4, 4)").unwrap();
+    assert_eq!(index_entries(&node, "t"), 1, "the writer's own entry");
+
+    drive(&mut node, "ti");
+    assert_eq!(
+        index_entries(&node, "t"),
+        4,
+        "one entry per row, no duplicates"
+    );
+    assert_eq!(
+        node.rows("SELECT id FROM t WHERE a = 4"),
+        [[Some("4".to_owned())]]
+    );
+}

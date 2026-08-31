@@ -82,6 +82,14 @@ pub struct CreateIndex {
     pub unique: bool,
     /// `IF NOT EXISTS`.
     pub if_not_exists: bool,
+    /// `CONCURRENTLY`: build it as a **staged job** rather than inside this statement.
+    ///
+    /// PostgreSQL's own distinction, and the same one: the concurrent form does not hold the table
+    /// against writers, and pays for it by taking longer and by being able to leave an invalid
+    /// index behind if it fails. Here it is ADR 0020's four states and a batched backfill; the
+    /// plain form is still one transaction, which is correct for a small table and is the
+    /// `TODO(post-v1)` for a large one.
+    pub concurrently: bool,
 }
 
 /// `DROP INDEX`.

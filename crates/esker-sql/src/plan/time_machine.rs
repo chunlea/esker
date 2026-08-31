@@ -36,6 +36,21 @@ pub enum TimeMachineVerb {
     },
     /// `SELECT * FROM esker_checkpoints()`. A name you cannot list is a name you cannot use.
     ListCheckpoints,
+    /// `SELECT * FROM esker_schema_jobs()` — what schema changes are in flight, and where each is.
+    ///
+    /// The `psql`-visible progress ADR 0020 asks for: a human watching a `CREATE INDEX
+    /// CONCURRENTLY` sees the state advance, which is the only way to tell "slow" from "stuck".
+    ListSchemaJobs,
+    /// `SELECT esker_schema_step('<index>')` — take the next step of one job, and say what it did.
+    ///
+    /// **The step clock made explicit.** PD publishes the interval a step must wait
+    /// ([ADR 0028](../../../docs/adr/0028-the-schema-lease.md)); this is the step itself, so that
+    /// what waits and what acts are separable — which is what makes the whole state machine
+    /// testable without a timer, and what lets an operator drive a stuck job by hand.
+    SchemaStep {
+        /// The index whose job to step.
+        index: String,
+    },
     /// `SELECT * FROM esker_diff('<table>', '<from>'[, '<to>'])`.
     ///
     /// Two scans and a merge, and **not a changelog** — saying so matters, because "diff" invites

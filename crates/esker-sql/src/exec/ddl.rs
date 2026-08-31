@@ -257,13 +257,39 @@ pub(super) fn create_index(
         unique: create.unique,
         columns,
         // Public the moment it is declared, because it is built inside this statement's own
-        // transaction: no other node ever sees it half-made. That is what makes this correct and
-        // also what makes it `TODO(post-v1)` for a table large enough to matter — the whole
-        // backfill is one transaction. `docs/plans/phase-6e.md` unit 5 is where it becomes a job
-        // and starts at `Absent` instead.
-        state: catalog::SchemaState::Public,
+        // transaction: no other node ever sees it half-made. That is what makes the plain form
+        // correct and also what makes it `TODO(post-v1)` for a table large enough to matter — the
+        // whole backfill is one transaction. `CONCURRENTLY` is the staged one, below.
+        state: if create.concurrently {
+            catalog::SchemaState::Absent
+        } else {
+            catalog::SchemaState::Public
+        },
         state_since: table.schema_version,
     };
+
+    if create.concurrently {
+        // Declared at `absent` and built by the job: no backfill here, and nothing reads it until
+        // the job has taken it all the way to `public`.
+        let mut updated = (*table).clone();
+        updated.schema_version += 1;
+        let index_id = index.id;
+        updated.indexes.push(index);
+        catalog::replace_table(txn, executor.tenant, &table, &updated)?;
+        catalog::put_job(
+            txn,
+            executor.tenant,
+            &catalog::JobRecord {
+                index_id,
+                table_id: updated.id,
+                cursor: Vec::new(),
+                done: false,
+            },
+        );
+        // The statement returns as soon as the job exists, which is what `CONCURRENTLY` means:
+        // `esker_schema_jobs()` is where a human watches the states advance.
+        return Ok(Outcome::done("CREATE INDEX"));
+    }
     // An index over a table that already has rows has to be *built*, not just declared. An index
     // that exists and is empty is worse than no index: the planner will use it, and it will answer
     // every lookup with no rows. The tests caught exactly that.

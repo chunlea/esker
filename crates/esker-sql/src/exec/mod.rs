@@ -28,6 +28,9 @@ mod bind;
 mod cursor;
 mod ddl;
 mod dml;
+mod job;
+
+pub use job::BATCH_ROWS;
 pub(crate) mod query;
 mod verbs;
 

@@ -9,6 +9,7 @@
 //! 'm' ++ "sql" ++ 'r' ++ tenant:u64 ++ id:u64  one table's retention override
 //! 'm' ++ "sql" ++ 'a' ++ tenant:u64 ++ id:u64  one table's next internal row id
 //! 'm' ++ "sql" ++ 'c' ++ tenant:u64 ++ name    a checkpoint: a name and the timestamp it means
+//! 'm' ++ "sql" ++ 'j' ++ tenant:u64 ++ id:u64  a schema-change job, and how far its backfill got
 //! ```
 //!
 //! The two retention records are read by the **garbage collector**, which lives below this crate
@@ -68,6 +69,7 @@ const KIND_RETENTION_DEFAULT: u8 = b'd';
 const KIND_RETENTION: u8 = b'r';
 const KIND_ROW_ID: u8 = b'a';
 const KIND_CHECKPOINT: u8 = b'c';
+const KIND_JOB: u8 = b'j';
 
 /// Tags for [`ColumnType`] as stored. Ours rather than PostgreSQL's OIDs, because these are a
 /// format we own and must never move; the OIDs stay on the wire where they belong.
@@ -239,6 +241,75 @@ pub(super) fn checkpoint_range(tenant: u64) -> (Vec<u8>, Vec<u8>) {
     let last = end.len() - 1;
     end[last] += 1;
     (start, end)
+}
+
+/// `'m' ++ "sql" ++ 'j' ++ tenant ++ index_id`. A schema-change job in flight.
+///
+/// Keyed by the **index**, not the table, because a job is about one index and two jobs on one
+/// table are two records. One scan of the kind byte lists everything in flight, which is what
+/// `esker_schema_jobs()` reads and what a node picks up after a restart.
+#[must_use]
+pub(super) fn job_key(tenant: u64, index_id: u64) -> Vec<u8> {
+    let mut suffix = [SQL, &[KIND_JOB]].concat();
+    codec::encode_u64(tenant, &mut suffix);
+    codec::encode_u64(index_id, &mut suffix);
+    prefix::meta_key(&suffix)
+}
+
+/// Every job of one tenant: `[start, end)` over the `'j'` space.
+#[must_use]
+pub(super) fn job_range(tenant: u64) -> (Vec<u8>, Vec<u8>) {
+    let mut suffix = [SQL, &[KIND_JOB]].concat();
+    codec::encode_u64(tenant, &mut suffix);
+    let start = prefix::meta_key(&suffix);
+    let mut end = start.clone();
+    let last = end.len() - 1;
+    end[last] += 1;
+    (start, end)
+}
+
+/// A job: which table and index, and **how far the backfill got**.
+///
+/// The cursor is the whole reason this record exists. A backfill is many small transactions rather
+/// than one — one transaction over a large table holds locks for its whole duration, conflicts
+/// with everything, and outlives the lock TTL the step arithmetic depends on (ADR 0020) — and many
+/// small transactions need somewhere durable to say where they got to, or a node that dies
+/// restarts instead of resuming.
+#[must_use]
+pub(super) fn encode_job(table_id: u64, cursor: &[u8], done: bool) -> Vec<u8> {
+    let mut out = vec![CATALOG_FORMAT_VERSION];
+    out.extend_from_slice(&table_id.to_le_bytes());
+    out.push(u8::from(done));
+    varint::put_u64(cursor.len() as u64, &mut out);
+    out.extend_from_slice(cursor);
+    out
+}
+
+/// Reads a job back: `(table_id, cursor, done)`.
+pub(super) fn decode_job(bytes: &[u8]) -> Result<(u64, Vec<u8>, bool)> {
+    let mut reader = Reader::new(bytes)?;
+    let table_id = reader.u64_le()?;
+    let done = reader.flag()?;
+    let len = reader.count()?;
+    let (cursor, rest) = reader
+        .bytes
+        .split_at_checked(len)
+        .ok_or_else(|| corrupt(format!("a job cursor of {len} bytes is truncated")))?;
+    let cursor = cursor.to_vec();
+    reader.bytes = rest;
+    reader.finish()?;
+    Ok((table_id, cursor, done))
+}
+
+/// The index id out of a job key, for listing.
+pub(super) fn job_index_id(tenant: u64, key: &[u8]) -> Result<u64> {
+    let (prefix, _) = job_range(tenant);
+    let rest = key
+        .strip_prefix(prefix.as_slice())
+        .ok_or_else(|| corrupt("a job key outside the job range"))?;
+    codec::decode_u64(rest)
+        .map(|(id, _)| id)
+        .map_err(|error| corrupt(format!("a job key with no index id: {error}")))
 }
 
 /// A checkpoint's timestamp, behind the same version byte as every other record.

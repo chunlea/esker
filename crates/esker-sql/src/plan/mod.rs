@@ -115,6 +115,11 @@ impl Statement {
             // a present-time transaction of its own (`crate::exec::verbs`), precisely so that the
             // moment a user most wants to name — the one they are reading — is one they can name.
             // Refusing them here would make a checkpoint of the past impossible.
+            // A schema step writes the catalog, and at a past snapshot that is refused like any
+            // other write. The checkpoint verbs are not writes of *this* transaction — they use
+            // one of their own (`crate::exec::verbs`) — but a schema step is a real DDL move and
+            // has no business happening under a read of the past.
+            Statement::TimeMachine(TimeMachineVerb::SchemaStep { .. }) => Some("esker_schema_step"),
             Statement::TimeMachine(_)
             | Statement::Select(_)
             | Statement::Explain(_)

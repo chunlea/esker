@@ -65,3 +65,59 @@ CREATE UNIQUE INDEX dupes_v_key ON dupes (v)
 
 statement ok
 CREATE INDEX dupes_v_idx ON dupes (v)
+
+# --- CREATE INDEX CONCURRENTLY, as a staged job --------------------------------------------------
+# ADR 0020, docs/plans/phase-6e.md. PostgreSQL's own distinction between the two forms: the plain
+# one builds inside the statement and the concurrent one does not hold the table against writers,
+# paying for it in time and in being able to leave nothing behind if it fails. Here that is four
+# states and a batched backfill, and `esker_schema_step` is the step with the wait taken out --
+# which is what makes the state machine testable without a timer.
+
+statement ok
+CREATE TABLE cj (id int8 PRIMARY KEY, a int8)
+
+statement ok
+INSERT INTO cj VALUES (1, 10), (2, 20)
+
+statement ok
+CREATE UNIQUE INDEX CONCURRENTLY cji ON cj (a)
+
+# The statement returns at once, with the index at absent: nothing reads it yet.
+query TTTT rowsort
+SELECT * FROM esker_schema_jobs()
+----
+cj	cji	absent	not started
+
+# One step per state, in the ADR's order. Each of these three is a transition, and a driver waits
+# PD's published interval after each; the backfill batches between them change no state and wait
+# for nothing.
+query T
+SELECT esker_schema_step('cji')
+----
+delete-only
+
+query T
+SELECT esker_schema_step('cji')
+----
+write-only
+
+# The backfill, then public. Two rows fit in one batch, so the batch is followed by the transition.
+query T
+SELECT esker_schema_step('cji')
+----
+backfilling
+
+query T
+SELECT esker_schema_step('cji')
+----
+public
+
+# A finished job is forgotten, and the index answers.
+query TTTT rowsort
+SELECT * FROM esker_schema_jobs()
+----
+
+query I
+SELECT id FROM cj WHERE a = 20
+----
+2

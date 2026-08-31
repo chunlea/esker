@@ -47,6 +47,12 @@ ALTER TABLE t ADD COLUMN n int8 NOT NULL DEFAULT 7;
 ALTER TABLE t ADD COLUMN r float8 DEFAULT random();
 ALTER TABLE t ALTER COLUMN c SET DEFAULT 'y';
 ALTER TABLE t ALTER COLUMN c DROP DEFAULT;
+# The staged schema change (ADR 0020, docs/plans/phase-6e.md). CONCURRENTLY is PostgreSQL's own
+# word for "do not hold the table against writers", and it means the same thing here.
+CREATE INDEX CONCURRENTLY ci ON t (a);
+CREATE UNIQUE INDEX CONCURRENTLY cu ON t (a);
+SELECT * FROM esker_schema_jobs();
+SELECT esker_schema_step('ti');
 ALTER TABLE t DROP COLUMN b;
 ALTER TABLE t ALTER COLUMN a TYPE text USING a::text;
 ALTER TABLE t ALTER COLUMN a SET NOT NULL;

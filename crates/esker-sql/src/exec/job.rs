@@ -1,0 +1,207 @@
+//! The staged schema change, driven: four states and a backfill, one step per transaction.
+//!
+//! [ADR 0020](../../../docs/adr/0020-online-schema-change.md), `docs/plans/phase-6e.md` units 4 and
+//! 5. `CREATE INDEX CONCURRENTLY` is what starts one; the states and what each is for live in
+//! [`crate::catalog::SchemaState`].
+//!
+//! # The backfill is many transactions, and the cursor is why
+//!
+//! One transaction over a large table holds locks for its whole duration, conflicts with
+//! everything, and outlives the lock TTL that the step arithmetic depends on — so the ADR requires
+//! many small ones. Many small ones need somewhere durable to say where they got to, or a node
+//! that dies mid-job restarts rather than resumes, and on a table large enough to need a job at all
+//! restarting is how a job never finishes. That is [`crate::catalog::JobRecord::cursor`].
+//!
+//! Two properties make it safe to run beside live traffic, and both are already true:
+//!
+//! * it runs while every node is at **write-only**, so a row written or deleted during the
+//!   backfill is maintained by its own writer. The backfill and the writer may both write the same
+//!   entry — identical bytes, so the second is a no-op, and a lost race is an ordinary
+//!   conflict-and-retry;
+//! * a `UNIQUE` index whose backfill meets a duplicate fails the **whole change** with `23505`
+//!   naming the row, which is the one place a schema change fails on *data* rather than on a
+//!   conflict. The states then unwind, so a failed change leaves no half-built index behind.
+//!
+//! # Who drives it, and how that differs from ADR 0020
+//!
+//! The ADR puts the step clock in PD. PD publishes the **interval** and the **lease** (ADR 0028)
+//! and that is where the arithmetic belongs, but PD does not drive the steps: a step is a *catalog
+//! transaction*, the catalog is `esker-sql`'s, and PD is byte-opaque by `CLAUDE.md` invariant 7 —
+//! it cannot read a table definition, let alone write one. So the job record lives in the catalog
+//! where every node can see it, and a node drives it using PD's published interval as the wait.
+//!
+//! That is a real deviation and it is the honest one: what PD owns is the *number*, because a
+//! cluster-wide bound needs one writer, and what a SQL node owns is the *transaction*, because a
+//! schema change is one. Recorded in `docs/plans/phase-6e.md` §10 rather than left as a surprise.
+
+use crate::catalog::{self, JobRecord, SchemaState, TableDef};
+use crate::error::{Result, SqlError};
+use crate::exec::Executor;
+use crate::value::Datum;
+
+/// Rows a single backfill transaction reads and indexes.
+///
+/// Small on purpose. The ceiling that matters is the **lock TTL**: a batch that takes longer than
+/// one holds locks past the point a resolver will roll it back, which both loses the work and
+/// breaks the step arithmetic that assumes a writer cannot outlive its TTL (ADR 0020). A few
+/// hundred rows is far inside three seconds for a point write, and the cost of being wrong in this
+/// direction is one extra round trip per batch.
+pub const BATCH_ROWS: usize = 256;
+
+/// Runs one batch of a job's backfill, moving the cursor.
+///
+/// Returns whether the backfill is now finished. Each call is **one transaction of its own**, which
+/// is what makes it a batch rather than a chunk of a long one.
+pub(super) fn backfill_batch(executor: &Executor, index_id: u64) -> Result<bool> {
+    let tenant = executor.tenant;
+    let mut txn = executor.plain_read()?;
+
+    let Some(job) = catalog::job(&*txn, tenant, index_id)? else {
+        return Err(SqlError::Internal(format!(
+            "no schema-change job for index {index_id}"
+        )));
+    };
+    if job.done {
+        return Ok(true);
+    }
+    let table = executor.table_by_id(&*txn, job.table_id)?;
+    let index = table
+        .indexes
+        .iter()
+        .find(|index| index.id == index_id)
+        .ok_or_else(|| {
+            SqlError::Internal(format!("index {index_id} left table \"{}\"", table.name))
+        })?
+        .clone();
+
+    let (start, end) = crate::row::table_row_range(tenant, table.id);
+    let from = if job.cursor.is_empty() {
+        start
+    } else {
+        job.cursor.clone()
+    };
+
+    let read = txn.scan(&from, &end, u32::try_from(BATCH_ROWS).unwrap_or(u32::MAX))?;
+    let Some((last, _)) = read.last() else {
+        // An **empty** read is the end of the range, and only an empty one: a short read is not
+        // evidence of anything, because the store may cap a scan below what was asked
+        // (`crate::exec::for_each_page`).
+        let done = JobRecord { done: true, ..job };
+        catalog::put_job(&mut *txn, tenant, &done);
+        txn.commit()?;
+        return Ok(true);
+    };
+    let next = crate::exec::query::successor(last);
+
+    let schema = table.row_schema();
+    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(read.len());
+    for (_, value) in &read {
+        let row = crate::row::decode_row(&schema, value)?;
+        let (key, entry) = index_entry(tenant, &table, &index, &row)?;
+        entries.push((key, entry));
+    }
+
+    for (key, entry) in entries {
+        // **A duplicate is the user's, and it fails the whole change.** Checked against what is
+        // already there rather than against this batch alone, because the row it collides with may
+        // have been indexed by an earlier batch or written by live traffic at write-only.
+        if index.unique
+            && let Some(existing) = txn.get(&key)?
+            && existing != entry
+        {
+            return Err(SqlError::UniqueViolation {
+                constraint: index.name.clone(),
+                key: None,
+            });
+        }
+        txn.put(&key, &entry);
+    }
+
+    let moved = JobRecord {
+        cursor: next,
+        ..job
+    };
+    catalog::put_job(&mut *txn, tenant, &moved);
+    txn.commit()?;
+    Ok(false)
+}
+
+/// The index key and value for one row — the same encoding `crate::exec::dml` writes, because an
+/// entry a backfill wrote and one a writer wrote have to be the same bytes or the two would
+/// conflict forever.
+fn index_entry(
+    tenant: u64,
+    table: &TableDef,
+    index: &catalog::IndexDef,
+    row: &[Datum],
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let columns: Vec<Datum> = index
+        .columns
+        .iter()
+        .map(|&ordinal| row[ordinal].clone())
+        .collect();
+    let primary_key: Vec<Datum> = table
+        .primary_key
+        .iter()
+        .map(|&ordinal| row[ordinal].clone())
+        .collect();
+    let by_value = index.unique && crate::row::unique_index_key_is_unique_by_value(&columns);
+    let suffix = if by_value {
+        None
+    } else {
+        Some(primary_key.as_slice())
+    };
+    let key = crate::row::index_key(tenant, table.id, index.id, &columns, suffix)?;
+    let value = crate::row::encode_row(&table.primary_key_types(), &primary_key)?;
+    Ok((key, value))
+}
+
+/// Moves an index one state on, in a transaction of its own.
+///
+/// One step, and [`catalog::advance_index_state`] is what refuses two — the two-version invariant
+/// is a property of the primitive rather than of anybody's discipline.
+pub(super) fn advance(executor: &Executor, index_id: u64, to: SchemaState) -> Result<()> {
+    let mut txn = executor.plain_read()?;
+    let job = catalog::job(&*txn, executor.tenant, index_id)?
+        .ok_or_else(|| SqlError::Internal(format!("no schema-change job for index {index_id}")))?;
+    let table = executor.table_by_id(&*txn, job.table_id)?;
+    catalog::advance_index_state(&mut *txn, executor.tenant, &table, index_id, to)?;
+    txn.commit()?;
+    Ok(())
+}
+
+/// Unwinds a change that failed, back to `absent`, and forgets the job.
+///
+/// Backwards through every state rather than straight to `absent`, for the same reason the forward
+/// direction goes one at a time: a node one step behind must never be two. The entries the backfill
+/// wrote are left for the delete-only pass to clear as rows change — an index at `absent` is not
+/// read, so what it holds cannot be wrong, only wasteful.
+pub(super) fn unwind(executor: &Executor, index_id: u64) -> Result<()> {
+    for to in [
+        SchemaState::WriteOnly,
+        SchemaState::DeleteOnly,
+        SchemaState::Absent,
+    ] {
+        let mut txn = executor.plain_read()?;
+        let Some(job) = catalog::job(&*txn, executor.tenant, index_id)? else {
+            return Ok(());
+        };
+        let table = executor.table_by_id(&*txn, job.table_id)?;
+        let current = table
+            .indexes
+            .iter()
+            .find(|index| index.id == index_id)
+            .map(|index| index.state);
+        // Only the states it actually passed through, so unwinding from write-only does not try to
+        // step down from a state it never reached.
+        if current.is_some_and(|state| state > to) {
+            catalog::advance_index_state(&mut *txn, executor.tenant, &table, index_id, to)?;
+            txn.commit()?;
+        }
+    }
+
+    let mut txn = executor.plain_read()?;
+    catalog::drop_job(&mut *txn, executor.tenant, index_id);
+    txn.commit()?;
+    Ok(())
+}

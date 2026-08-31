@@ -275,6 +275,15 @@ state that guards it is skipped, which is what makes them tests of the rule rath
 
 ## 9. Progress
 
+- [x] 6 — **parity and `.slt`.** `CREATE INDEX CONCURRENTLY` out of the unsupported list and into
+  `tests/slt/index.slt` as a driven job; four new corpus statements verified against 19beta1; two
+  new divergence rows in `docs/plans/phase-6a.md` §10a.
+- [x] 5 — **`CREATE INDEX` becomes the job.** `CONCURRENTLY` declares the index at `absent` and
+  records a job; `esker_schema_step('<index>')` takes one step and says which; `SELECT * FROM
+  esker_schema_jobs()` is the `psql`-visible progress.
+- [x] 4 — **the backfill as a resumable job.** Batched `[cursor, cursor + 256)` transactions with
+  the cursor durable in the catalog, resume-not-restart across sessions, live DML converging with
+  the backfill, and a `UNIQUE` duplicate failing the whole change and unwinding the states.
 - [x] 3 — **the lease, and the step arithmetic.** A new PD method `SchemaLease` (0x0307) rather
   than a field on `Tso`; PD computing `lease + lock_ttl` and reporting the removal term separately;
   the executor refusing every **write** past the lease and serving every read. Two new golden lines
@@ -292,6 +301,20 @@ state that guards it is skipped, which is what makes them tests of the rule rath
   §10a of phase 6a records. 12 new tests, 5 new corpus statements, `.slt` updated.
 
 ## 10. What changed from this plan
+
+**The wait belongs between state *transitions*, not between backfill batches** — and the number is
+what showed it. A 20,000-row backfill is 82 steps, of which 79 are batches; waiting the eight-second
+interval after every step is **656 seconds**, and waiting only after the three transitions is
+**24 seconds**. Same safety: every batch runs at write-only, so no state moves and no node can fall
+a step behind while they run. `esker_schema_step`'s answer says which kind of step it took, so a
+driver can tell.
+
+**PD publishes the interval; a SQL node drives the steps.** ADR 0020 puts the step clock in PD, and
+the arithmetic *is* PD's — a cluster-wide bound needs one writer. Driving is not: a step is a catalog
+transaction, the catalog is `esker-sql`'s, and PD is byte-opaque by `CLAUDE.md` invariant 7 and
+cannot read a table definition, let alone write one. So the job record lives in the catalog where
+every node can see it, and the step is a verb rather than a timer — which is also what makes the
+whole state machine testable without one.
 
 **The lease is a new method, not a field on `Tso` — and the constitution is what bought the better
 design.** The plan proposed piggybacking on the timestamp, which would have made fail-closed free.
