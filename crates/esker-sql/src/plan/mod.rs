@@ -1,7 +1,7 @@
 //! Statements, in types this crate owns.
 //!
 //! Everything the executor runs is one of these. They are produced by [`crate::parse`], which is
-//! the only file allowed to name a `sqlparser` type (`docs/adr/0014-sqlparser.md`), and they are
+//! the only module allowed to name a `sqlparser` type (`docs/adr/0014-sqlparser.md`), and they are
 //! deliberately *smaller* than the AST they come from: a lowered statement holds what phase 6a
 //! executes and nothing else.
 //!

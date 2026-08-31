@@ -30,7 +30,8 @@
 //!   from the error, never from the call site (contract C3 is only checkable if the mapping is in
 //!   one place).
 //! * **The parser is contained.** `sqlparser` types appear in [`parse`] and nowhere else, which is
-//!   what keeps replacing it a one-file job (`docs/adr/0014-sqlparser.md`).
+//!   what keeps replacing it a one-module job (`docs/adr/0014-sqlparser.md`). `tests/containment.rs`
+//!   is what makes that a fact rather than an intention.
 //! * **The stack is guarded before the parser is entered.** The dependency is built without its
 //!   recursion protection, so [`parse::nesting_depth`] is what stands between a deeply nested
 //!   statement and an aborted process (`CLAUDE.md` invariant 9).

@@ -522,20 +522,25 @@ thirty of them and `tests/lowering.rs` holds twenty-nine more at the clause leve
 - The `TODO(post-v1)`s named above, and the one in §5 about the round trip a unique index costs per
   row.
 
-### One rule this crate cannot keep, and why
+### Containment is one module, and now a test
 
-`CLAUDE.md` says to keep files under ~800 lines. `src/parse.rs` is 1851 and cannot be split without
-breaking the rule that matters more: ADR 0014 says `sqlparser` is named in **one file**, and that
-containment is the whole argument for taking the dependency — it is what makes replacing it a
-bounded job. The lowering is what grew it, and the lowering is precisely the part that has to touch
-the AST.
+ADR 0014 originally said `sqlparser` is named in one **file**, and unit 6's lowering — the part that
+must touch the AST, and so must live inside the boundary — had taken `parse.rs` to 1851 lines,
+past `CLAUDE.md`'s ~800-line guideline with no way to satisfy both rules at once.
 
-Two ways out, both for the project owner rather than for a lane to take unilaterally: amend ADR 0014
-to say "one module" and split into `parse/mod.rs` + `parse/lower.rs`, which keeps the containment
-property and the size rule at once; or accept the file. Recorded here so the next reader knows it
-was weighed rather than missed. Everything else in the crate is inside the guideline —
-`exec/query.rs` was split into the planner and the pull pipeline when it crossed it, which was the
-right seam anyway.
+Ruled by the project owner: the ADR is amended to one **module**. The intent was always that no
+`sqlparser` type leaks past the boundary, and a module boundary carries that exactly as well. It is
+now `src/parse/mod.rs` (the depth guard, the lexical scan, the classifier, the recognizer — 807
+lines of code) and `src/parse/lower.rs` (the AST into `crate::plan` — 705).
+
+`tests/containment.rs` is the other half of the ruling, and the more important half: the rule was a
+sentence in an ADR and a reviewer's attention, and its failure mode is that nothing goes wrong until
+the day you try to replace the dependency. The test reads the crate's own source and fails if the
+name appears outside `src/parse/`. It is textual rather than type-based on purpose — a `use` is only
+one of the ways to name a crate — with two exceptions that are prose about the rule rather than a
+way around it: a citation of the ADR's own filename, and the bare backticked name in a doc comment.
+The second is narrow enough that a doc *link* to a type still fails, which is checked by breaking it
+three ways and watching it catch all three.
 
 ### Three things worth knowing before touching any of it
 

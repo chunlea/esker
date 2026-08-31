@@ -46,7 +46,7 @@ parser; without protection, `SELECT ((((…1…))))` nested deeply enough overfl
 stack overflow on user input is an abort — which violates `CLAUDE.md` invariant 9 ("never panic on
 user input") in the least recoverable way available.
 
-So `esker-sql/src/parse.rs` carries a **pre-parse depth guard**: a token-level nesting count,
+So `esker-sql/src/parse/` carries a **pre-parse depth guard**: a token-level nesting count,
 refusing anything past a documented limit before the parser is ever entered. The error it returns is
 SQLSTATE **`54001 statement_too_complex`** — which is precisely what PostgreSQL raises when
 `max_stack_depth` is exceeded. The guard is therefore not a deviation from PostgreSQL that we
@@ -79,9 +79,9 @@ supersede.
 
 **3. Swap `sqlparser` for another Rust crate.** The cost is bounded and low, which is the real
 argument for taking the dependency at all. `sqlparser`'s AST is used in exactly one module —
-`parse.rs` lowers it into our own `plan::Logical` types immediately, and nothing downstream of that
-module mentions a `sqlparser` type. Replacing it is rewriting one file. The rule is enforced by
-the crate boundary: `sqlparser` may not be named outside `parse.rs`.
+`parse` lowers it into our own `plan` types immediately, and nothing downstream of that module
+mentions a `sqlparser` type. Replacing it is rewriting one module. The rule is enforced by the
+module boundary: `sqlparser` may not be named outside `esker-sql/src/parse/`.
 
 ## Consequences
 
@@ -91,8 +91,32 @@ the crate boundary: `sqlparser` may not be named outside `parse.rs`.
 - The pin is exact and lives in `[workspace.dependencies]`. Upgrades are deliberate: a new
   `sqlparser` release is a chance to close rows in the §9 gap register, and the syntax corpus is the
   test that says whether it did.
-- **Containment is a rule, not a habit.** `sqlparser` types stop at `parse.rs`. A `use sqlparser::`
-  anywhere else in the crate is a review failure — it is what turns a one-file replacement into a
-  rewrite.
+- **Containment is a rule, not a habit, and it is now a test.** `sqlparser` types stop at
+  `src/parse/`. A `use sqlparser::` anywhere else in the crate is a review failure — it is what
+  turns a one-module replacement into a rewrite — and
+  `esker-sql/tests/containment.rs` reads the crate's own source and fails the build rather than
+  leaving it to a reviewer's attention.
 - We are responsible for the recursion depth the crate would otherwise have handled, and for
   noticing if a future `sqlparser` version makes `recursive-protection` non-optional.
+
+## Amendment, 2026-08-30 — one *module*, not one file
+
+Accepted by the project owner. The containment rule above originally said "one file", naming
+`src/parse.rs`, and the two paragraphs it appears in have been updated to say `src/parse/`.
+
+Nothing about the decision changed; the wording had picked the wrong noun for what it meant.
+Containment is the property that **no `sqlparser` type leaks past the boundary**, and a module
+boundary carries that exactly as well as a file does — a `pub(crate)` item does not escape a
+directory any more than it escapes a file, and "replacing it is rewriting one module" is the same
+bounded cost the ADR was arguing for.
+
+The wording was costing something real. Unit 6's lowering — the part that *must* touch the AST, and
+so the part that must live inside the boundary — took `parse.rs` past 1851 lines, well beyond
+`CLAUDE.md`'s ~800-line guideline, with no way to satisfy both rules at once. It is now
+`src/parse/mod.rs` (the guard, the classifier, the recognizer) and `src/parse/lower.rs` (the AST to
+`crate::plan`), each inside the guideline and each single-purpose.
+
+The amendment also makes the rule cheaper to enforce than to remember: `tests/containment.rs`
+reads every source file in the crate and fails if the string `sqlparser` appears outside
+`src/parse/` or the `Cargo.toml` that declares it. Before, the rule was a sentence in an ADR and a
+reviewer's attention.
