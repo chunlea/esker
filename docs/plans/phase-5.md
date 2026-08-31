@@ -324,14 +324,66 @@ makes a late `Prewrite` fail for ever, and §7's GC rule is what keeps it alive 
 
 ### 10.4 Units
 
-| # | Unit | Lands |
-|---|---|---|
-| S1 | `TxnKv` handlers: the snapshot over the engine, `Command::Txn`, apply, dispatch | the seven verbs |
-| S2 | GC: the retention policy from ADR 0021's records, the compaction filter, `GcSafepoint` | collection |
-| S3 | Bank test under the simulator's fault plan | 1,000 seeds `--ignored`, a smaller default |
-| S4 | Crash between prewrite and commit at every boundary | resolution proved |
-| S5 | GC verification: 1,000 versions, a safepoint, one version left | §7 proved |
-| S6 | `docs/bench/phase-5.md` | the 2PC + MVCC ratio, explained |
+| # | Unit | Lands | State |
+|---|---|---|---|
+| S1 | `TxnKv` handlers: the snapshot over the engine, `Command::Txn`, apply, dispatch | the seven verbs | **done** |
+| S2 | GC: the retention policy from ADR 0021's records, the compaction filter, `GcSafepoint` | collection | **done** |
+| S3 | Bank test under the simulator's fault plan | 1,000 seeds `--ignored`, a smaller default | open |
+| S4 | Crash between prewrite and commit at every boundary | resolution proved | open |
+| S5 | GC verification: many versions, a safepoint, one version left | §7 proved | **done**, with S2 |
+| S6 | `docs/bench/phase-5.md` | the 2PC + MVCC ratio, explained | open |
+
+### 10.6 What landed, and the three things it found
+
+**S1** (`2e109dd`). The decision happens at apply, per §10.1, and `Command::Txn` carries the
+request. What the plan did not predict: **a transaction's primary may be in another region on
+another store**, so the store must never classify a transaction by reading its primary — that read
+answers "missing" for a transaction perfectly alive elsewhere and rolls back a committed one.
+`ResolveLock` applies a verdict the client made against the primary's own region;
+`PrimaryCommitted::on_trust` is where that assertion is made, named to be conspicuous.
+
+**The decoder** (`fa039b2`). `esker_keys::prefix::split_table`, where ADR 0021 said it belongs. Its
+golden test reads the ids back out of the **frozen** bytes rather than out of the encoder, because
+encoder and decoder could drift together and every round trip would still pass — which is the
+failure that would apply one table's retention window to another table's rows.
+
+**S2 + S5** (`2fe7f16`). The filter takes a `RetentionPolicy`. The engine gained per-column-family
+option overrides, because the collector must run on `write` and nowhere else. The GC test found a
+bug on its first run, which is what it was for: a key is compacted again at every level it descends,
+and state recording only *that* a version had been kept dropped the survivor on the second pass. It
+records *which* version now, by timestamp, so the filter is idempotent — and that also makes the
+shared state safe under two concurrent compactions, since an interleaving makes it keep a version it
+could have dropped, which is the only safe direction.
+
+**The scan fix** (`7d49293`), from the SQL lane's report. A `TxnKv Scan` reaches one region and a
+store answers only for the keys it owns, so a range spanning a boundary came back holding the first
+region's keys and nothing else. The client walks regions now, and two of the tests are against real
+stores rather than a scripted transport — a fake answers whatever it is told to, and cannot show you
+that a real store stops at its own boundary.
+
+### 10.7 Where the store half stands, for whoever picks up S3
+
+Everything S3 needs is built and green. A `TxnClient` over one or many real stores works end to end
+(`crates/esker-client/tests/txn_multi_region.rs` is the shortest example of the multi-region setup,
+including a transaction whose primary and secondaries land in different regions).
+
+Three things to know before writing the bank test:
+
+- **Timestamps.** `CountingOracle` is correct for one client and wrong for two, which is the point
+  of `CLAUDE.md` invariant 6. A bank test with M concurrent clients needs one oracle shared between
+  them, or PD's.
+- **The TTL judgement is the client's** (§10.2), so a crashed client's locks are cleared by whichever
+  live client next meets them — which is a path the bank test exercises heavily and nothing else
+  does. `Transaction::prewrite` resolves every reported lock in one round.
+- **What to assert.** The sum of balances read at any single snapshot ts is invariant, and every
+  committed transfer is visible at a later ts. The second half is what catches a commit that landed
+  on the primary and was lost on a secondary.
+
+S4's boundaries, in the order a transaction crosses them: after the primary's prewrite, after the
+secondaries', after the primary's commit, after each secondary's. Only the third is the commit
+point; a crash before it must roll back and a crash after it must roll forward, and
+`crates/esker-txn/tests/protocol.rs::a_crash_at_every_step_resolves_the_way_the_primary_says` is the
+same claim proved against three `BTreeMap`s.
 
 ### 10.5 What S2 consumes from ADR 0021
 
