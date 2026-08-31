@@ -1,6 +1,7 @@
 # Phase 5 plan — Percolator: the front half
 
-Status: **in progress** — this file covers the lane `wy-p5-txn` only. Written before implementation;
+Status: **in progress** — the front half is accepted; §10 is the store half, open since phase 4
+closed. This file covers the lane `wy-p5-txn` only. Written before implementation;
 §8 records progress and §9 what changed. Spec: `prompts/05-txn.md`. Constitution: `CLAUDE.md`
 (invariants 1, 5, 6 and 9 are the ones this phase leans on). Design: `docs/DESIGN.md` §3, §8, §9,
 §10, §4.7. Byte-level companion: `docs/txn-spec.md`.
@@ -250,3 +251,103 @@ non-exhaustive and the workspace stopped compiling. The arm added there is six l
 `Unsupported` with the method's name — the store half of phase 5 is deferred (§1), and a client that
 reaches for it should meet a refusal that says so rather than a default or silence. It was swept
 into the store lane's commit `33e95e9` before this lane could stage it on its own.
+
+## 10. The store half
+
+Open. Phase 4 is accepted, `crates/esker-store/**` is this lane's, and the six pieces the front half
+deferred (§1) are now in scope. The front half was built so this would be mechanical; two things
+below are not, and they are the ones worth writing down before any code.
+
+### 10.1 The decision happens at **apply**, not at propose
+
+A Percolator operation is a read-modify-write: what to write depends on what is there. There are two
+places to put that read, and only one of them is safe.
+
+**At propose**, the leader reads its engine, runs `check_prewrite`, and proposes the resulting
+`Mutations`. Two concurrent prewrites of the same key both read "no lock", both propose, both apply —
+and the second silently overwrites the first's lock, so two live transactions hold one key. That is
+the race `CompareAndSwap` takes the exclusive write gate to avoid, and a gate around every
+transactional write would serialise the whole store.
+
+**At apply**, the peer reads its own state *at that log index* and decides there. Apply is already
+sequential per region and every peer has identical state at the same index, so the decision is a pure
+function of `(state, request)` and every peer reaches the same one — no gate, and no read-then-propose
+window to race in. `Command::CompareAndSwap` is the precedent: it reads inside `apply` for exactly
+this reason (`crates/esker-store/src/apply.rs`), and its answer travels back through `Applied`.
+
+So `Command::Txn(..)` carries the **request**, not the mutations, and the apply path is
+`decode → TxnSnapshot over the engine → esker-txn's decision → stage the batch → Applied`.
+
+### 10.2 Apply must not read a clock, so the TTL judgement moves to the client
+
+`percolator::resolve` needs `now_ts` to decide whether a lock's lease has run out. If apply read a
+clock, two peers would read different ones and diverge — the one thing apply may never do
+(`CLAUDE.md` invariant 4's reasoning, applied one layer up).
+
+It does not have to. `LockInfo` already carries `start_ts` and `ttl_ms`, and the **client** already
+holds a timestamp from the oracle: its own `start_ts`. A transaction that began at `T` knows time is
+at least `T`, so judging `physical(T) > physical(lock.start_ts) + ttl_ms` is *conservative* — it can
+be late in declaring a lock dead, never early. Being late costs latency; being early aborts a live
+transaction.
+
+So the split is:
+
+| Who | Decides |
+|---|---|
+| client | whether a lock's lease has expired, from `LockInfo` and its own `start_ts` |
+| store, at apply | what the **primary's `write` record** says — committed, rolled back, or nothing |
+
+`ResolveLock`'s `commit_ts` is the caller's verdict for the case the record cannot settle: zero means
+"I judged it dead, roll it back". The store honours it **unless the primary says committed**, because
+a record outranks a lease (`docs/txn-spec.md` §5.5) and a resolver working from a stale `LockInfo`
+must not undo a commit.
+
+This needs no wire change. It is written here because the alternative — a `now_ts` field, or a
+`CheckTxnStatus` method — looks equally reasonable until you notice apply cannot use it.
+
+### 10.3 The transient-to-permanent checklist, applied to these handlers
+
+Phase 4's six defects all turned a *transient* condition into a *permanent* one
+(`docs/plans/phase-4.md` §20.1). Every handler here gets the same question asked of it:
+
+| Transient condition | Must stay revisitable |
+|---|---|
+| not the leader this instant | `NotLeader` with a hint — never a wrong answer, never a permanent refusal |
+| epoch mid-split | `EpochNotMatch` with the replacements |
+| a lock in the way right now | a `Locked` status the caller resolves and retries — never a terminal error |
+| a prewrite whose answer was lost | idempotent: our own lock re-prewrites to `AlreadyLocked` |
+| a lock whose owner is merely slow | `Wait`, judged against a *conservative* clock, so late not early |
+| a safepoint read at the wrong instant | never moves backwards, and a missed pass collects next time |
+
+The one that is *not* revisitable, deliberately: a `Rollback` marker. That is the point of it — it
+makes a late `Prewrite` fail for ever, and §7's GC rule is what keeps it alive long enough to.
+
+### 10.4 Units
+
+| # | Unit | Lands |
+|---|---|---|
+| S1 | `TxnKv` handlers: the snapshot over the engine, `Command::Txn`, apply, dispatch | the seven verbs |
+| S2 | GC: the retention policy from ADR 0021's records, the compaction filter, `GcSafepoint` | collection |
+| S3 | Bank test under the simulator's fault plan | 1,000 seeds `--ignored`, a smaller default |
+| S4 | Crash between prewrite and commit at every boundary | resolution proved |
+| S5 | GC verification: 1,000 versions, a safepoint, one version left | §7 proved |
+| S6 | `docs/bench/phase-5.md` | the 2PC + MVCC ratio, explained |
+
+### 10.5 What S2 consumes from ADR 0021
+
+Records, already built by the phase-6 lane and not to be re-invented here:
+
+```text
+'m' ++ "sql" ++ 'd'                          cluster default retention
+'m' ++ "sql" ++ 'r' ++ tenant:u64 ++ id:u64  one table's override
+value, both: version:u8 = 2 ++ retention_ms:u64 little-endian
+```
+
+`effective_safepoint(table) = min(published, published + ((default_ms - table_ms) << 18))` — an
+override may make a table keep **more**, never less, until PD learns to publish the cluster's
+smallest retention. Two traps the ADR names and this lane must not fall into: `RETENTION_FOREVER`
+(`u64::MAX`) is a sentinel meaning *collect nothing*, not a duration to subtract; and a table with no
+override takes the cluster default, which is not the same as a retention of zero.
+
+The filter takes a `RetentionPolicy`, never a bare timestamp — the whole point of the directive that
+put this design in before the code.
