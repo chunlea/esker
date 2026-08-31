@@ -668,6 +668,75 @@ internals: it said a duplicate would surface as "an internal-sounding failure", 
 undifferentiated error would read *to a user*. No `Error::Internal` was observed on a conflict path
 and none was being claimed.
 
+### Handoff to the ADR-implementation era
+
+Three designs are decided and unbuilt (§12): online schema change
+([0020](../adr/0020-online-schema-change.md)), the time machine
+([0021](../adr/0021-time-machine.md)) and the columnar learner
+([0022](../adr/0022-columnar-learner-replica.md)). What follows is what this crate already has for
+them, what it does not, and the two or three places where a plausible-looking assumption is wrong.
+Every pointer below was checked against the code at the time of writing rather than remembered.
+
+**The `AS OF` seam is one constructor, and it really is one.** `TxnClient::begin`
+(`crates/esker-client/src/txn.rs`) takes a `start_ts` from the oracle and hands it to a
+`Transaction` literal; `begin_at(start_ts)` is that literal with the number passed in. Nothing else
+in that crate looks at where it came from — locks, resolution, read-your-writes and commit are all
+written against `self.start_ts` as a value. Above it, `Backend::begin` is the only place this crate
+opens a transaction, so a historical read is a second method there and an `Option<u64>` reaching
+`StoreBackend`. The three refusals ADR 0021 §1 names (read-only, not below the safepoint, not in
+the future) belong at that seam and not lower: `esker-client` has no opinion about them and should
+not grow one.
+
+**`TableDef::schema_version` exists and is deliberately not load-bearing.** It is `1` from
+`CREATE TABLE` and one more per `ALTER TABLE` *statement* — not per column added, because a
+statement's columns become visible together. Nothing reads it to decode a row: a row carries its
+own column count (ADR 0019), which is what makes it safe to bump the version without touching data.
+It is there for ADR 0020 to hang per-column state from, and the field's own doc comment says so, so
+that nobody later "fixes" an apparently unused field.
+
+**What the catalog can express today, and what it cannot.** `ColumnDef` is `{ name, ty, not_null }`
+and `IndexDef` is `{ id, name, unique, columns }`. Neither has a *state*, so the catalog can say
+that a column or an index **exists** and nothing about whether it is delete-only, write-only or
+public. ADR 0020's four states are therefore a field on each plus the schema version it entered, and
+that is `CATALOG_FORMAT_VERSION` 2 → 3 with the table-record golden re-captured — a format change
+with a golden, so it goes to the project owner first (`CLAUDE.md`). Budget it as part of the work
+rather than discovering it.
+
+Two things that *are* already there and are easy to miss:
+
+* **The retention records the collector reads** — `'m' ++ "sql" ++ 'd'` for the cluster default and
+  `'m' ++ "sql" ++ 'r' ++ tenant ++ table_id` for an override, with `set_table_retention`,
+  `clear_table_retention`, `table_retention` and `default_retention` beside them, golden-tested down
+  to the key bytes. There is no SQL surface yet; the record format was built first because the GC
+  filter consumes it and a format cannot wait for the feature on top of it.
+* **`allocate_row_ids` is the template for any counter a hot path bumps.** It is leased a batch at a
+  time in a transaction of the session's own, because a counter bumped inside the statement's
+  transaction is a key every writer conflicts on. ADR 0020's backfill cursor has exactly this shape
+  and should be written the same way — and it inherits the same consequence, which is gaps, which is
+  what a PostgreSQL sequence does anyway.
+
+**Three assumptions that look safe and are not.**
+
+1. **A transaction that has written the catalog must not fill the shared cache.** It reads its own
+   uncommitted DDL, and catalog versions are *reused* after a rollback, so an abandoned entry is
+   waiting for the next DDL that lands on the same number. `Catalog::view_uncached` is the rule and
+   `Executor::catalog_written` is what selects it. An online schema change writes the catalog
+   repeatedly, per state, and every one of those transactions is in this category.
+2. **A whole range cannot be asked for in one call.** `Txn::scan`'s `limit` of 0 means "no limit" to
+   this crate's trait and a *page* to the real client. Everything that walks a range goes through
+   `exec::for_each_page`, which resumes from the last key and stops on an **empty** read, not a
+   short one — a short page is not evidence of anything. A backfill written as one big scan will
+   silently index a prefix.
+3. **`DROP COLUMN` is not a catalog change.** The row format carries a column *count*, not column
+   identity, so dropping the second of three columns leaves rows whose count is 3 and whose second
+   value belongs to a column that no longer exists. It needs row format version 3 with a column id
+   per value, which ADR 0019 names. `ADD COLUMN` was cheap for a reason that does not generalise.
+
+**Where a conflict's meaning is decided.** `SqlError::SerializationFailure` carries the key that
+lost (`docs/txn-spec.md` §6.1) and `Executor::explain_conflict` turns it into the `23505` a user
+actually caused. Anything that writes on a user's behalf — a backfill, a `FLASHBACK`'s compensating
+writes — inherits that translation only if it records what it wrote in `Written::unique_keys`.
+
 ### Containment is one module, and now a test
 
 ADR 0014 originally said `sqlparser` is named in one **file**, and unit 6's lowering — the part that
