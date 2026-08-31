@@ -644,8 +644,42 @@ fn the_blocking_transport_works_from_an_ordinary_thread() {
     runtime.block_on(handle.shutdown()).unwrap();
 }
 
-/// Blocking inside a runtime is what `tokio` panics on. Here it is an error value instead
-/// (`CLAUDE.md` invariant 9).
+/// The blocking wrapper called from `spawn_blocking`, which is where a synchronous client
+/// belongs and where it was refused.
+///
+/// `tokio` sets its handle on a blocking-pool thread as well as on a worker, so a guard that
+/// tested `Handle::try_current().is_ok()` refused both — and blocking on a pool thread is not the
+/// hazard, it is the sanctioned way to avoid it. Measured rather than argued: a `block_on` on
+/// another runtime from inside `spawn_blocking` completes normally, which is what this pins.
+///
+/// Without the fix this is the error `esker-sql`'s node hit on **every statement** the moment its
+/// store stopped being in-process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_blocking_transport_works_from_the_blocking_pool() {
+    let server = serve(Echo::new(16), TransportConfig::new()).await;
+    let addr = server.local_addr();
+
+    let response = tokio::task::spawn_blocking(move || {
+        let transport = esker_proto::BlockingTransport::connect(addr).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        transport.call(get("from the blocking pool"), deadline)
+    })
+    .await
+    .unwrap()
+    .expect("a call from the blocking pool is exactly what this wrapper is for");
+    assert_eq!(
+        response.into_raw_kv().unwrap(),
+        RawKvResp::Get {
+            value: Some(Bytes::from_static(b"from the blocking pool"))
+        }
+    );
+
+    server.shutdown().await.unwrap();
+}
+
+/// Blocking on a thread that is **driving** a runtime is what `tokio` panics on. Here it is an
+/// error value instead (`CLAUDE.md` invariant 9) — and it must stay one, because that thread is
+/// the runtime's to poll with and taking it is the hazard the guard exists for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_blocking_transport_refuses_to_run_inside_a_runtime() {
     let server = serve(Echo::new(14), TransportConfig::new()).await;
@@ -656,10 +690,15 @@ async fn the_blocking_transport_refuses_to_run_inside_a_runtime() {
             .await
             .unwrap();
 
+    // Called straight from this async task, on a worker thread the runtime is driving.
     let error = transport
         .call(get("nope"), Instant::now() + Duration::from_secs(1))
-        .expect_err("blocking inside a runtime was allowed");
+        .expect_err("blocking on a runtime's own worker thread was allowed");
     assert!(matches!(error, ProtoError::Internal { .. }), "{error:?}");
+    assert!(
+        error.to_string().contains("spawn_blocking"),
+        "the refusal must say where the call belongs instead: {error}"
+    );
 
     // And dropping it here — on a runtime thread — must not panic either, which is why it
     // shuts its runtime down in the background rather than waiting for it.

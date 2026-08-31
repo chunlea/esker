@@ -460,6 +460,19 @@ pub struct BlockingTransport {
     transport: TcpTransport,
 }
 
+/// Whether a caught panic is `tokio` refusing to start a runtime inside one.
+///
+/// Matched on the message because that is all a panic payload carries. Anything else is resumed:
+/// a panic from inside the call is a bug, and reporting it as "wrong thread" would send whoever
+/// reads it to the wrong place.
+fn is_nested_runtime(panic: &(dyn std::any::Any + Send)) -> bool {
+    let message = panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str));
+    message.is_some_and(|message| message.contains("runtime from within a runtime"))
+}
+
 impl BlockingTransport {
     /// Connects to `addr`, building the runtime this connection lives on.
     pub fn connect(addr: SocketAddr) -> Result<Self, ProtoError> {
@@ -486,19 +499,46 @@ impl BlockingTransport {
 
     /// Sends `request` and waits for its answer, up to `deadline`.
     ///
-    /// Calling this from inside a `tokio` runtime is an error rather than a panic, which is
-    /// what `tokio` itself would do (`CLAUDE.md` invariant 9).
+    /// Calling this from a thread that is **driving** a `tokio` runtime is an error rather than a
+    /// panic, which is what `tokio` itself would do (`CLAUDE.md` invariant 9).
+    ///
+    /// # Which threads are allowed, and why the obvious test is wrong
+    ///
+    /// Blocking is illegal on a thread that is *driving* a runtime and is exactly what a thread
+    /// from `spawn_blocking` is *for* — and `tokio` sets its handle on **both**, so
+    /// `Handle::try_current().is_ok()` cannot tell them apart. This guard used to be that test,
+    /// and it refused every caller that was doing the right thing: a synchronous client run from
+    /// the blocking pool, which is the only place a synchronous client belongs.
+    ///
+    /// `tokio`'s own predicate is `EnterRuntime::is_entered`, and it is `pub(crate)`; every public
+    /// API that consults it *panics* rather than reporting. So the question is put to `tokio` and
+    /// its refusal is turned into ours — which is what this guard was always documented to do. It
+    /// simply used to guess the answer instead of asking for it.
+    ///
+    /// The fast path is unchanged: with no runtime handle at all there is nothing to ask, and the
+    /// call goes straight through. Only a caller that *has* a handle pays for the question, and
+    /// only one that is genuinely on a driving thread ever reaches the refusal — where `tokio`'s
+    /// own panic message is printed by the default hook on the way past, which is a misuse being
+    /// reported loudly rather than a cost anybody pays twice.
     pub fn call(&self, request: Request, deadline: Instant) -> Result<Response, ProtoError> {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            return Err(ProtoError::internal(
-                "BlockingTransport::call was used inside an async runtime; use the async \
-                 Transport there",
-            ));
-        }
         let Some(runtime) = self.runtime.as_ref() else {
             return Err(ProtoError::internal("the transport is shutting down"));
         };
-        runtime.block_on(self.transport.call_with_deadline(request, deadline))
+        if tokio::runtime::Handle::try_current().is_err() {
+            return runtime.block_on(self.transport.call_with_deadline(request, deadline));
+        }
+
+        let call = self.transport.call_with_deadline(request, deadline);
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(call))) {
+            Ok(answer) => answer,
+            Err(panic) if is_nested_runtime(panic.as_ref()) => Err(ProtoError::internal(
+                "BlockingTransport::call was used on a thread that is driving a tokio runtime; \
+                 call it from `spawn_blocking`, or use the async Transport there",
+            )),
+            // Not `tokio` refusing: something inside the call panicked, and swallowing that would
+            // turn a bug into a confusing error about the wrong thing.
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
     /// The largest frame this connection will send.
