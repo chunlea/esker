@@ -1,0 +1,21 @@
+crates/esker-engine/src/fs/claim.rs
+  s_b3f6a712d611c9::t_4ce8b6aaa9f3a7 44,217-221,231-325
+crates/esker-engine/src/fs/tier.rs
+  s_b3f6a712d611c9::t_e0066b7369d05f 54,257-265,276-278
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2a6136229b3d9d770db6794b0c0bde2bbb5f1ae9",
+  "prompts": {},
+  "sessions": {
+    "s_b3f6a712d611c9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "78adef9a-88ef-4c89-a340-f825de3d2ab7",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
