@@ -1,0 +1,21 @@
+crates/esker-store/tests/server.rs
+  s_dc640bf0df4adb::t_524a9d63e5cead 13,564-598
+docs/plans/debt-c1.md
+  s_dc640bf0df4adb::t_a1456455383e32 206-243
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a6425662da545460179a1993f562fc1f9b9e07a1",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
