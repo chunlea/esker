@@ -721,7 +721,7 @@ builds what they act on, plus the two things 4a–4c deferred to here.
 | 3 | `esker-cli region ls / split / transfer-leader` | `esker-cli/src/region.rs` (NEW), `args.rs`, `main.rs` |
 | 4 | Per-peer `Progress`, read-only, in `esker-raft` (granted) | `esker-raft/src/raw_node.rs` |
 | 5 | The distribution test | `esker-store/tests/balance.rs` (NEW) |
-| 6 | DESIGN §6 and §14, and this section closed | `docs/DESIGN.md`, this plan |
+| 6 | DESIGN §5, §6, §9, §12 and §14, and this section closed | `docs/DESIGN.md`, this plan |
 
 ### 14.2 The threading decision, finally taken
 
@@ -757,3 +757,66 @@ regions cost four threads rather than fifty.
 | transfer | a `TransferLeader` operator moves leadership; one against a stale epoch is dropped; one naming a peer the region does not have is dropped |
 | cli | `region ls` against a live cluster; `region split` at a chosen key; `region transfer-leader` |
 | distribution | one store, then three: a few hundred MiB at a low split threshold, and regions **and** leaders spread within a bounded time with no region orphaned |
+
+### 14.4 What 4d changed against §14.2
+
+The threading decision held exactly as written: pinned by modulo, ordering unchanged, and the pool
+is what `tests/balance.rs` runs a two-worker cluster on. Three things around it did not.
+
+1. **A driver error must retire one region, not the worker.** The per-region threads had nowhere
+   to put this question: a thread that died took its only region with it. A worker holding a dozen
+   regions cannot exit on one region's failure, so a `drive()` error retires that region and the
+   worker goes back to the queue.
+
+2. **`retire` has to be acknowledged.** A caller that retires a region and immediately flushes the
+   next thing — a split installing the child, a snapshot replacing the peer — must know the worker
+   has finished with the old core. `Job::Retire` carries a `SyncSender` and the caller waits on it
+   (5 s), which is the one place the pool is synchronous.
+
+3. **The transfer refusals are the store's, not PD's.** §14.2 said nothing about who checks. The
+   store drops a `TransferLeader` for a peer the region does not have, for a learner, and for a
+   peer more than `TRANSFER_LAG_ALLOWANCE` entries behind — silently, because a refusal a scheduler
+   cannot act on is noise it would only retry. The third check is the whole reason unit 4 asked for
+   `RawNode::progress()`.
+
+### 14.5 The two bugs the distribution test found, and the core gap behind them
+
+Both are the same confusion in different clothes: **a peer id names a replica, not a store.** It has
+now produced three bugs across 4c and 4d, which is why DESIGN §6 and §9 both say so explicitly.
+
+1. **A snapshot was asked for by peer id.** A store receiving traffic for a region it does not host
+   asks the sender for it, and resolved the sender's address out of the store's address book by the
+   *peer* id. PD allocates a peer id per replica, so after a split the offering peer is in no
+   address book anywhere. `esker_proto::RaftMessage` now carries `from_store` — one varint, and a
+   **golden-affecting wire change**, made on the same reasoning as 4b's `Command` tag 6: the format
+   has no deployment to be compatible with, and the alternative was a lookup that cannot be made to
+   work. `raft-timeout-now` and `raft-append` were updated in the same commit.
+
+2. **A conf change was routable only after it applied.** §4.1 puts a configuration in force at the
+   **append**, so the leader addresses the peer it adds in the same `Ready` that carries the entry —
+   a round trip before apply moves the `'m'` record the transport routed by. The first message was
+   therefore *always* dropped. Usually invisible: the next heartbeat gets through and the receiver
+   asks for the region. Not invisible when the region's log had been compacted, because then the
+   first message is an `InstallSnapshot`, and that is the gap below. Routes are now learned from
+   every conf change at persist time, before the send, out of the store id its context already
+   carried; `peer.rs`'s `Auditor` audits it as its second ordering rule.
+
+**The core gap, reported and not worked around** (the third for this lane, after §13.2's two).
+`ProgressState::Snapshot` is paused unconditionally, and nothing leaves it but a message *from* the
+follower. A single lost `InstallSnapshot` therefore strands a replica for ever: the leader believes
+a snapshot is in flight, sends nothing further — `send_heartbeat` for a follower below the
+compaction boundary delegates to `send_append`, which is paused too — and the follower never learns
+it should ask. etcd/raft closes this with `ReportSnapshot(Failure)` from the transport plus an abort
+when `pending_snapshot <= matched`; `esker-raft` has neither. Fixing #2 removes the only *systematic*
+way to lose that message, so nothing here is left broken — but a network that drops one still
+strands a replica, and a `report_snapshot` (or a resend after an election timeout) is what would
+make it recover. Out of 4d's grant, which is read-only in the core.
+
+### 14.6 Still open after 4d
+
+* **A lost `InstallSnapshot` strands a replica** — the core gap above.
+* Everything §13.8 lists that 4d did not touch: catching up an existing peer by snapshot,
+  `RemovePeer` leaving the region's data, and replica repair end to end against the real scheduler
+  rather than a fake driver.
+* **`region ls` walks the key space one `GetRegion` at a time.** Correct and O(regions) round trips;
+  a `ScanRegions` on the Pd service would make it one. Not this lane's to add.

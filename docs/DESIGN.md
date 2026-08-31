@@ -249,11 +249,19 @@ impl<S: LogStorage> RawNode<S> {
   fn advance(&mut self, rd: &Ready);        // caller has discharged the contract below
   fn role(&self) -> Role;  fn term(&self) -> Term;  fn leader(&self) -> Option<NodeId>;
   fn commit_index(&self) -> Index;  fn status(&self) -> Status;
+  fn progress(&self) -> Vec<PeerProgress>;  // a leader's view of each peer; empty on a follower (4d)
   fn storage(&self) -> &S;  fn storage_mut(&mut self) -> &mut S;
 }
 pub trait LogStorage { initial_state, entries(lo, hi, max_bytes), term(idx), first_index, last_index, snapshot }
 pub struct MemStorage;                      // in-memory LogStorage, for tests and the simulator
 ```
+
+`progress()` is a **snapshot, not a view**: `{ id, matched, next, is_learner, recent_active,
+pending_snapshot }` per peer, sorted by id, copied out. It is deliberately not part of `Status`,
+which is what a peer knows about itself and is answered by every role; this is what a *leader*
+knows about others and is empty on anyone else, so a caller that reads it from a follower gets
+nothing rather than a stale answer. The store uses it to refuse a leadership transfer to a peer too
+far behind to take office (§6).
 
 Driver contract (implemented in `esker-store`), in order — the normative text is the doc comment on
 `Ready` itself, and `docs/raft-spec.md` gives each rule a row:
@@ -298,17 +306,22 @@ Regions cover the whole key space contiguously; the first region is `["", "")`.
   whose peer list does not name this store is **not** started; that is what a crash between `RemovePeer`
   applying and the data being deleted leaves behind, and starting it would return a voter to a group that
   has removed it. A fresh database with no records is the only bootstrap.
-- **Apply loop** *(4a: one driver thread per region; pooling is 4d)*: each committed entry is decoded into
-  a `WriteBatch` on data CFs plus `apply_index`, written atomically; admin entries (split, conf change)
-  are applied under the region lock and bump the epoch. **`apply_index` is per region and one batch never
-  spans two regions**, so a restart replays each region from its own `apply_index + 1` and entries of one
-  region can never interleave with another's. Where that work *runs* is the part still open: 4a gives each
-  region the driver thread phase 3e gave the single one, which is one OS thread per region and does not
-  reach fifty. One worker per store — what this line said before 4a — is not the fix either, because then
-  one region's `fsync` blocks every other region's consensus; the shape to measure in 4d is a **pool
-  sharded by region id**, sized independently of the region count, as TiKV's store and apply pools are.
-- **Split:** triggered by a periodic size check on the **leader** (region > 96 MiB *default*;
-  `TODO(phase-4d)` an explicit admin command as well). The leader picks a boundary from the region's own
+- **Apply loop**: each committed entry is decoded into a `WriteBatch` on data CFs plus `apply_index`,
+  written atomically; admin entries (split, conf change) are applied under the region lock and bump the
+  epoch. **`apply_index` is per region and one batch never spans two regions**, so a restart replays each
+  region from its own `apply_index + 1` and entries of one region can never interleave with another's.
+- **Where that work runs: a fixed pool, regions pinned by id** *(4d; 4a shipped one thread per region)*.
+  `DRIVER_WORKERS` threads, and region `id % workers` is the worker that drives it — for its whole life,
+  and across restarts, because PD allocates ids in order and modulo therefore spreads them exactly evenly
+  without anything being written down. Pinning, not scheduling: a region's messages reach one worker
+  through one channel and are handled in arrival order, so per-region ordering is what it was when the
+  region had a thread to itself. A worker holding several regions interleaves *between* them, which
+  nothing depends on — two regions share no state, no batch and no apply index. One worker per store is
+  the shape this rules out, because then one region's `fsync` blocks every other region's consensus; one
+  thread per region is the shape 4a shipped, and it does not reach fifty. A driver error retires that one
+  region and the worker keeps serving the rest.
+- **Split:** triggered by a periodic size check on the **leader** (region > 96 MiB *default*), or by an
+  operator through the Admin service (§9). The leader picks a boundary from the region's own
   data ([ADR 0012](adr/0012-split-key-selection.md) — the engine exposes no per-range key sample, so it is
   a bounded sampling scan), asks PD for one id per new region plus one per peer, and proposes
   `Split{split_key, new_region_id, new_peer_ids}` through its own group. On apply, **on every peer**: the
@@ -357,6 +370,21 @@ Regions cover the whole key space contiguously; the first region is `["", "")`.
     deletes over the range (no range tombstones in v1, ADR 0006), and the tombstones that leaves
     are keys in the range — which is exactly the state that stops the range ever receiving a
     snapshot again. The keys stay, no region covers them, and nothing serves them.
+  - **A new peer is routable at the append, not at the apply.** A configuration is in force from
+    the moment its entry is on disk (§4.1 of the dissertation), so the leader may address the peer
+    it adds in the very `Ready` that carries the entry — a full round trip before apply moves the
+    `'m'` record. The transport therefore takes `peer → store` from every conf change it persists,
+    not only from the region record. Routing by the record alone drops that first message, and if
+    the region's log has been compacted the message is an `InstallSnapshot`: the leader's progress
+    for that peer goes to `Snapshot`, which is paused until the peer answers a snapshot it never
+    received, and the replica is stranded for ever (found by `esker-store/tests/balance.rs`).
+- **`TransferLeader` moves leadership, and the store refuses three cases.** PD issues it to spread
+  leaders; the store checks what only it can see and drops the operator silently otherwise, because
+  a refusal a scheduler cannot act on is noise it would only retry. A target the region does not
+  have; a target that is a **learner**, which cannot win an election and so would leave the region
+  leaderless until the old leader's timeout; and a target more than `TRANSFER_LAG_ALLOWANCE`
+  entries behind the leader's own `matched`, which would campaign on a short log. The third is what
+  `RawNode::progress()` exists for (§5).
 - **Log compaction:** a peer throws away the head of its log once the apply index has run
   `RAFT_LOG_COMPACT_THRESHOLD` entries past the truncation point, keeping `RAFT_LOG_KEEP_ENTRIES`
   behind it so that a follower one entry behind does not need a snapshot. The record written with
@@ -364,7 +392,9 @@ Regions cover the whole key space contiguously; the first region is `["", "")`.
   that index** — not the membership in force, which a conf change above the index has already
   moved.
 - **Transport:** one TCP connection per (store, store) pair carrying `RaftTransport::Batch` frames with
-  `RaftMessage`s for all regions, batched per tick.
+  `RaftMessage`s for all regions, batched per tick. Each carries the **sending store's id** as well as the
+  sending peer's: a peer id is region-local, so a receiver holding no copy of the region — the case that
+  asks for a snapshot, above — could not otherwise turn the sender into an address.
 - **Heartbeats:** store heartbeat (capacity, load, region and leader counts) every 10 s; region heartbeat
   from each leader — and only from a leader — every 60 s **or on change**, where a change is an epoch bump
   or a leader change. The "or on change" half is the one that matters: an epoch bump is a split or a
@@ -546,7 +576,11 @@ Methods: `RawKv { Get, BatchGet, Put, BatchPut, Delete, DeleteRange, Scan, Compa
 (namespace `'r'`), `TxnKv { Get, Scan, Prewrite, Commit, Rollback, ResolveLock, Heartbeat, GcSafepoint }`
 (namespace `'x'`), `Pd { Bootstrap, StoreHeartbeat, RegionHeartbeat, GetRegion, AllocId, Tso }`,
 `RaftTransport { Batch, Snapshot }` — `Snapshot` is the one **streamed** method, answered with a run
-of `Stream` frames rather than a `Response` (§6). Every KV request carries `{ region_id, epoch, peer }` and every error is a
+of `Stream` frames rather than a `Response` (§6) — and `Admin { Split, TransferLeader, Regions }`,
+which is the operator's door rather than a client's: `esker-cli region` resolves a region through PD
+and then asks its leader directly, so a human can force a split or move a leader without waiting for
+a scheduler to decide the same thing. `Regions` is what `region ls` reads, and it answers for the
+regions **this store hosts**, leader flag and applied index included. Every KV request carries `{ region_id, epoch, peer }` and every error is a
 typed enum with redirect hints (`NotLeader{leader_hint}`, `EpochNotMatch{current_regions}`,
 `KeyNotInRegion`, `ServerIsBusy`, `Locked{lock_info}`). A `Pd` request carries the **cluster id** in
 place of the region header, since PD's answers are about the routing table rather than about a region,
@@ -556,8 +590,9 @@ ignored — forward compatibility is handled by `WIRE_VERSION` negotiation on co
 
 Method numbers are `service:method`, so a service's numbers stay contiguous and one can be reserved
 before it is written: `0x00` system (`0x0001` Hello), `0x01` RawKv (`0x0101`–`0x0108`, in the order
-listed above), `0x03` Pd (`0x0301`–`0x0306`, in the order listed above) and `0x04` RaftTransport
-(`0x0401`), with `0x02` TxnKv reserved. `Hello`'s layout is
+listed above), `0x03` Pd (`0x0301`–`0x0306`, in the order listed above), `0x04` RaftTransport
+(`0x0401` Batch, `0x0402` Snapshot) and `0x05` Admin (`0x0501`–`0x0503`, in the order listed above),
+with `0x02` TxnKv reserved. `Hello`'s layout is
 frozen for ever — a fixed four-byte version and nothing else — because reading it is how a peer at
 another version turns a mismatch into `WireVersion` rather than a hang.
 
@@ -614,7 +649,7 @@ seed; every seed is reproducible.
 
 `tracing` spans per request with region/peer ids; Prometheus metrics (write stall state, L0 file count,
 pending compaction bytes, raft proposal latency, apply lag, region count, TSO rate); `esker-cli` commands:
-`sst-dump`, `wal-dump`, `manifest-dump`, `region ls`, `region split`, `bench`.
+`sst-dump`, `wal-dump`, `manifest-dump`, `region ls`, `region split`, `region transfer-leader`, `bench`.
 
 ## 13. Roadmap hooks for SQL and serverless
 
@@ -656,6 +691,8 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
 | store / region heartbeat | 10 s / 60 s — the region interval is also the latency of a PD operator, which has no other way to reach a store |
 | raft log compact threshold / tail kept | 4096 / 1024 entries |
 | snapshot chunk / stream depth | 1 MiB / 4 chunks |
+| driver workers per store | 4 threads; region `id % workers` picks one |
+| leadership-transfer lag allowance | 64 entries behind the leader's `matched` |
 | PD operator timeout (store side) | 5 s |
 | PD id allocation batch | 1,000 ids per persist |
 | PD TSO save interval | 3 s ahead of what is handed out |
