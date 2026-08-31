@@ -1,0 +1,19 @@
+crates/esker-columnar/tests/differential.rs
+  s_cf8601956e2620::t_b74e7458c0dc6b 1-723
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "b013aa798d7dcde6bd63733554ee1936b815a9ba",
+  "prompts": {},
+  "sessions": {
+    "s_cf8601956e2620": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "732aecbc-5268-4943-836e-a49ba67b2585",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
