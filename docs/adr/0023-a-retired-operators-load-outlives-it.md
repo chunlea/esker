@@ -30,10 +30,13 @@ The operator log says it in one shape, sixteen times over — every `AddLearner`
 ...                                             ... twelve more pairs ...
 ```
 
-The 5-store scale-out of `docs/bench/phase-4.md` Run 2 is the same fault from the other side:
+The 5-store scale-out of `docs/bench/phase-4.md` Run 2 shows the same *shape* from the other side:
 *"peers landed on 4 of the 5 stores; store 4 received nothing in this run's window"*. A live store
 holding no replica of anything while the others hold many, arrived at either by being emptied or
-by never being filled.
+by never being filled. Whether that particular store was starved by this defect is **not**
+established — the same run records 26 of 38 peers still unpromoted when measurement began, and a
+window too short to finish is a sufficient explanation on its own. What is established is that PD
+must not be the reason, and that is now a property with a test.
 
 **The hole.** Stores report every `store_heartbeat` interval; PD issues operators between two of
 them. An operator that *finished* a moment ago is therefore in neither place PD looks: not in the
@@ -51,7 +54,7 @@ just destroyed a fifth of the cluster's placement.
 
 ## Decision
 
-**A retired operator's `LoadDelta` is held until every store it names has reported since.**
+**A retired operator's `LoadDelta` is held until the reports have absorbed it.**
 
 ```rust
 /// The load of operators that have finished, still corrected for because the stores they
@@ -62,9 +65,24 @@ pub(crate) settling: Vec<(LoadDelta, u64)>,
 - When an operator leaves the in-flight set — `Done`, `Cancelled` or `TimedOut` alike — its load
   is pushed here with PD's clock.
 - The rules' `pending` slice is the in-flight deltas **and** these.
-- An entry is dropped once every store it names has `last_heartbeat_ms >= retired_ms`, and
-  unconditionally once it is older than `max_store_down_time` — past which a store that has not
-  reported is down and its counts mean nothing anyway.
+- An entry is dropped once **the oldest report among the live stores** is stamped at or after
+  `retired_ms`, and unconditionally once it is older than `max_store_down_time`.
+
+One instant for the whole list rather than a question per store. Exact would be per store — a
+delta naming only store 3 could go as soon as store 3 reported — but this runs on every region
+heartbeat that reaches the rules, and exact costs a scan of the store table per entry per beat.
+The whole imprecision is that a correction may outlive its usefulness by up to one store
+heartbeat, which is the interval it exists to cover.
+
+**Live stores only.** A store that is down has a frozen stamp, so counting it would let one dead
+store pin every correction in the cluster until the age rule swept it — this defect inverted — and
+its counts mean nothing anyway.
+
+**At or after, not strictly after.** The store applied the change before its leader sent the
+region heartbeat, and PD stamped the retirement when that heartbeat arrived; a report stamped no
+earlier was computed no earlier than the change, so it contains it. Holding it one interval longer
+looks safer and is not — it double-counts a move the numbers already show, and `tests/balance.rs`
+then settles at `[33, 34, 35]` with two moves outstanding instead of stopping.
 
 Held for `Cancelled` and `TimedOut` too, deliberately: PD cannot tell which end of a cancelled
 operator actually happened, and holding a correction that turns out to be unnecessary costs one

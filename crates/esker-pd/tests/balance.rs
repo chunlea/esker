@@ -642,12 +642,14 @@ fn a_sweep_against_one_frozen_store_report_stops_at_the_fair_share() {
     );
 }
 
-/// The same fault from the other side, and the acceptance run's own words for it: *"peers landed
-/// on 4 of the 5 stores; store 4 received nothing in this run's window"*
-/// (`docs/bench/phase-4.md`, Run 2). A store that joins a cluster and is given nothing is the
-/// same defect as a store that is emptied — a live store holding no replica of anything while
-/// the others hold many — and it is the one an operator notices, because the capacity they paid
-/// for does no work.
+/// The same shape from the other side, in the acceptance run's own words: *"peers landed on 4 of
+/// the 5 stores; store 4 received nothing in this run's window"* (`docs/bench/phase-4.md`,
+/// Run 2). A store that joins and is given nothing looks to an operator exactly like a store that
+/// was emptied — the capacity they paid for does no work either way.
+///
+/// That run does not establish PD as the cause: it also records 26 of 38 peers still unpromoted
+/// when measurement began, and a window too short to finish explains it on its own. What this
+/// test pins is the half PD owns — given time, a store that joins is given its share.
 ///
 /// Twelve regions at three replicas already spread over four stores, and a fifth joins. Thirty-six
 /// replicas over five stores is seven or eight each; nothing is an answer this must not reach.
