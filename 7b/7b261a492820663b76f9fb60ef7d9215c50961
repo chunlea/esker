@@ -1,0 +1,16 @@
+crates/esker-sql/tests/slt/empty_vs_null.slt
+  h_44076b318daf9c 1-120
+crates/esker-sql/tests/slt_harness/mod.rs
+  h_44076b318daf9c 94-97
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "7b7b261a492820663b76f9fb60ef7d9215c50961",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
