@@ -69,7 +69,7 @@ pub fn value(user_key: &[u8], start_ts: u64) -> Vec<u8> {
 /// Where a read at `ts` starts looking in the `write` column family.
 ///
 /// The first key at or after this one, still under [`prefix`], is the newest version with
-/// `commit_ts <= ts`. Same bytes as [`write`]; a separate name because the two are asking
+/// `commit_ts <= ts`. Same bytes as [`write()`]; a separate name because the two are asking
 /// opposite questions and a future change to one is unlikely to be right for the other.
 #[must_use]
 pub fn seek_write(user_key: &[u8], ts: u64) -> Vec<u8> {
@@ -98,7 +98,7 @@ pub fn version_range(user_key: &[u8]) -> (Vec<u8>, Vec<u8>) {
 
 /// Splits an engine key back into its user key and its timestamp.
 ///
-/// The inverse of [`write`] and [`value`]. Used by the compaction filter and by tooling; the
+/// The inverse of [`write()`] and [`value()`]. Used by the compaction filter and by tooling; the
 /// read path never needs it, because it seeks to a key it built itself.
 pub fn split(engine_key: &[u8]) -> Result<(Vec<u8>, u64)> {
     let rest = engine_key.strip_prefix(&[TXN]).ok_or_else(|| {

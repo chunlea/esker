@@ -6,7 +6,7 @@
 //! the way two-phase commit needs it: a primary, and everything else grouped by region.
 //!
 //! Like the rest of this crate it has no I/O and no clock of its own. Bytes leave through
-//! [`StoreTransport`], time enters through [`Clock`], and timestamps come from a
+//! [`StoreTransport`], time enters through [`crate::clock::Clock`], and timestamps come from a
 //! [`TimestampOracle`] — all three injected, so every rule below is tested against a script
 //! and a clock that jumps rather than waits.
 //!
@@ -23,9 +23,12 @@
 //! 6. Commit the secondaries. This is cleanup: a reader that gets there first does it instead,
 //!    and the answer is the same either way.
 //!
-//! Steps 2 and 5 are strictly ordered against 3 and 6 by [`esker_txn`]'s API rather than by
-//! this module remembering to: `commit_secondary` demands a `PrimaryCommitted` token which
-//! only the primary's applied plan can mint.
+//! Steps 2 and 5 are strictly ordered against 3 and 6 by `esker-txn`'s API rather than by this
+//! module remembering to: `commit_secondary` demands a `PrimaryCommitted` token which only the
+//! primary's applied plan can mint. That crate is not a dependency here — this client speaks to
+//! a store over the wire and never links the transaction library — so the ordering it enforces
+//! on the store's side is mirrored here by sending the two phases in the order that makes the
+//! token obtainable.
 //!
 //! # Why an ambiguous `Prewrite` is survivable
 //!
