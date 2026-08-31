@@ -28,9 +28,12 @@
 //! nesting, and counting it would make us reject a statement PostgreSQL accepts, which is contract
 //! C1 broken (`docs/plans/phase-6a.md` §1). The guard may only ever err towards accepting.
 //!
-//! The third is **lowering**, in [`lower`]: the parser's tree into `crate::plan`, which is where
-//! the AST stops travelling. It is a child module rather than more of this file because it is a
-//! different job with a different reason to change, and because together they were 1851 lines.
+//! The third is **lowering**, in `src/parse/lower.rs`: the parser's tree into `crate::plan`, which
+//! is where the AST stops travelling. It is a child module rather than more of this file because
+//! it is a different job with a different reason to change, and because together they were 1851
+//! lines. The reference is textual on purpose — the module is private, and it has to stay that way
+//! or its signatures would put `sqlparser` types in this crate's public API, which is the one thing
+//! ADR 0014 exists to prevent.
 
 mod lower;
 
