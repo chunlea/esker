@@ -30,6 +30,7 @@ use crate::parse::{Parsed, feature_name};
 use crate::plan;
 use crate::time_machine;
 use crate::value::{ColumnType, Datum};
+use crate::value::{PgDatum};
 
 impl Parsed {
     /// Lowers this statement into the plan types the executor runs, or names the construct that

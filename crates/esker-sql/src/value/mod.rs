@@ -36,57 +36,35 @@ use std::cmp::Ordering;
 
 use crate::error::{Result, SqlError};
 
+pub use esker_keys::value::{ColumnType, Datum, f64_of_sort_bits, sort_bits_of_f64};
 pub use timestamp::{MAX_MICROS, MIN_MICROS, NEG_INFINITY, POS_INFINITY};
 
-/// The 64 bits whose big-endian order is [`Datum::pg_cmp`]'s order over floats, for an index key.
-/// Lives here rather than in `crate::row` because which floats are the same value is a fact about
-/// the type, not about the key encoding that has to respect it.
-#[must_use]
-pub fn sort_bits_of_f64(value: f64) -> u64 {
-    float::sort_bits(value)
-}
-
-/// The inverse of [`sort_bits_of_f64`], up to the canonicalisation it performs.
-#[must_use]
-pub fn f64_of_sort_bits(bits: u64) -> f64 {
-    float::from_sort_bits(bits)
-}
-
-/// One of the six types phase 6a executes (`docs/plans/phase-6a.md` §3).
+/// What a stored type *means* to a PostgreSQL client.
 ///
-/// The OIDs are PostgreSQL's own and go on the wire in `RowDescription` and
-/// `ParameterDescription`; a client uses them to pick a decoder, so they are as much a part of the
-/// compatibility contract as the text formats are.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum ColumnType {
-    /// 64-bit integer. PostgreSQL calls it `bigint` in messages and `int8` in DDL.
-    Int8,
-    /// Variable-length UTF-8 string.
-    Text,
-    /// Two-valued, with no third state but NULL.
-    Bool,
-    /// Variable-length byte string.
-    Bytea,
-    /// An instant, stored as microseconds from 2000-01-01 UTC.
-    TimestampTz,
-    /// IEEE-754 binary64.
-    Double,
-}
-
-impl ColumnType {
-    /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 6] = [
-        ColumnType::Int8,
-        ColumnType::Text,
-        ColumnType::Bool,
-        ColumnType::Bytea,
-        ColumnType::TimestampTz,
-        ColumnType::Double,
-    ];
-
+/// The six shapes themselves are [`esker_keys::value`]'s — the storage layer's shared vocabulary,
+/// named by the codecs that write them. Everything here is contract C3's surface instead, and none
+/// of it was written from documentation: each rule was put to a running 19beta1 and recorded in
+/// `tests/corpus/pg19_values.txt`.
+///
+/// A trait rather than inherent methods because the type is another crate's now, and that is the
+/// seam working as intended: a crate that owns byte layout cannot accidentally answer a question
+/// about what a client renders. See `docs/adr/0030-the-row-codec-moves-down.md`.
+pub trait PgType: Copy {
     /// PostgreSQL's type OID, as it appears in `RowDescription`.
     #[must_use]
-    pub fn oid(self) -> u32 {
+    fn oid(self) -> u32;
+    /// The name PostgreSQL uses when it talks *about* the type — in an `invalid input syntax`
+    /// message, for instance. Not the DDL spelling: a column is declared `int8` and complained
+    /// about as `bigint`.
+    #[must_use]
+    fn name(self) -> &'static str;
+    /// The width `RowDescription` reports: the fixed size in bytes, or -1 for a varlena.
+    #[must_use]
+    fn type_len(self) -> i16;
+}
+
+impl PgType for ColumnType {
+    fn oid(self) -> u32 {
         match self {
             ColumnType::Bool => 16,
             ColumnType::Bytea => 17,
@@ -97,11 +75,7 @@ impl ColumnType {
         }
     }
 
-    /// The name PostgreSQL uses when it talks *about* the type — in an `invalid input syntax`
-    /// message, for instance. Not the DDL spelling: a column is declared `int8` and complained
-    /// about as `bigint`.
-    #[must_use]
-    pub fn name(self) -> &'static str {
+    fn name(self) -> &'static str {
         match self {
             ColumnType::Int8 => "bigint",
             ColumnType::Text => "text",
@@ -112,9 +86,7 @@ impl ColumnType {
         }
     }
 
-    /// The width `RowDescription` reports: the fixed size in bytes, or -1 for a varlena.
-    #[must_use]
-    pub fn type_len(self) -> i16 {
+    fn type_len(self) -> i16 {
         match self {
             ColumnType::Bool => 1,
             ColumnType::Int8 | ColumnType::TimestampTz | ColumnType::Double => 8,
@@ -123,81 +95,58 @@ impl ColumnType {
     }
 }
 
-/// One column's value, or its absence.
+/// What a [`Datum`] means to a PostgreSQL client: its text, its binary form, and its order.
 ///
-/// `PartialEq` compares floats by their **bits**, not by IEEE equality, so `NaN` equals itself and
-/// `-0.0` does not equal `0.0`. That is the right question for an encoding module — "did this
-/// value survive the round trip" — and the wrong one for SQL, where PostgreSQL says both the
-/// opposite things. SQL's comparison is [`Datum::pg_cmp`], and it is a separate function precisely
-/// so neither can be mistaken for the other.
-#[derive(Debug, Clone)]
-pub enum Datum {
-    /// SQL NULL, of whatever the column's type is.
-    Null,
-    /// [`ColumnType::Int8`].
-    Int8(i64),
-    /// [`ColumnType::Text`]. Always valid UTF-8: the server encoding is UTF8, and bytes that are
-    /// not are refused on the way in the way PostgreSQL refuses them.
-    Text(String),
-    /// [`ColumnType::Bool`].
-    Bool(bool),
-    /// [`ColumnType::Bytea`].
-    Bytea(Vec<u8>),
-    /// [`ColumnType::TimestampTz`], in microseconds from 2000-01-01 00:00:00 UTC — PostgreSQL's
-    /// own epoch and its own representation, including [`POS_INFINITY`] and [`NEG_INFINITY`].
-    TimestampTz(i64),
-    /// [`ColumnType::Double`].
-    Double(f64),
-}
-
-impl PartialEq for Datum {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Datum::Null, Datum::Null) => true,
-            (Datum::Int8(a), Datum::Int8(b)) | (Datum::TimestampTz(a), Datum::TimestampTz(b)) => {
-                a == b
-            }
-            (Datum::Text(a), Datum::Text(b)) => a == b,
-            (Datum::Bool(a), Datum::Bool(b)) => a == b,
-            (Datum::Bytea(a), Datum::Bytea(b)) => a == b,
-            // Bitwise, so a round-trip test cannot pass by turning -0.0 into 0.0 or one NaN
-            // payload into another.
-            (Datum::Double(a), Datum::Double(b)) => a.to_bits() == b.to_bits(),
-            _ => false,
-        }
-    }
-}
-
-impl Eq for Datum {}
-
-impl Datum {
-    /// The type this value belongs to, or `None` for NULL, which belongs to all of them.
-    #[must_use]
-    pub fn column_type(&self) -> Option<ColumnType> {
-        Some(match self {
-            Datum::Null => return None,
-            Datum::Int8(_) => ColumnType::Int8,
-            Datum::Text(_) => ColumnType::Text,
-            Datum::Bool(_) => ColumnType::Bool,
-            Datum::Bytea(_) => ColumnType::Bytea,
-            Datum::TimestampTz(_) => ColumnType::TimestampTz,
-            Datum::Double(_) => ColumnType::Double,
-        })
-    }
-
-    /// Whether this value fits a column of `ty`. NULL fits every type.
-    #[must_use]
-    pub fn fits(&self, ty: ColumnType) -> bool {
-        self.column_type().is_none_or(|actual| actual == ty)
-    }
-
+/// [`PgDatum::pg_cmp`] **disagrees with `Datum`'s `PartialEq`**, and is meant to. `PartialEq` is
+/// bitwise, so a round-trip test cannot pass by turning `-0.0` into `0.0` or one `NaN` payload
+/// into another. `pg_cmp` says `NaN` equals itself and sorts above `Infinity`, which is what
+/// `WHERE x > 5` has to agree with. Storage asks whether the bytes survived; SQL asks how a user
+/// orders them, and the two questions have different answers.
+pub trait PgDatum: Sized {
     /// The characters PostgreSQL puts in a text-format `DataRow`, or `None` for NULL.
     ///
     /// NULL is `None` rather than an empty string because the protocol spells it as a length of
     /// -1: an empty `text` and a NULL `text` are different bytes on the wire, and a client that
     /// could not tell them apart would read every empty string as a missing value.
     #[must_use]
-    pub fn to_text(&self) -> Option<String> {
+    fn to_text(&self) -> Option<String>;
+    /// Reads a value of `ty` out of the text a client sent, exactly as PostgreSQL's input function
+    /// would, or fails with the SQLSTATE PostgreSQL would have failed with.
+    ///
+    /// Where the real input function accepts something this one does not, the answer is contract
+    /// C2's `0A000` naming the construct — never a wrong value and never a syntax error about
+    /// valid input. `tests/value_parity.rs` holds the list of those from both sides.
+    fn from_text(ty: ColumnType, text: &str) -> Result<Datum>;
+    /// The bytes PostgreSQL puts in a **binary**-format field, or `None` for NULL.
+    ///
+    /// Big-endian throughout, which is the one place this project is: everything it writes for
+    /// itself is little-endian and everything on this wire is not. The formats were captured with
+    /// `COPY ... TO STDOUT (FORMAT binary)`, which uses the same `typsend` functions the protocol
+    /// does, and one of them settled a bet made back in unit 3 — a `timestamptz` really is
+    /// microseconds from 2000-01-01 with `i64::MAX` for `infinity`, so a value goes onto the wire
+    /// exactly as it is stored, with no arithmetic at all.
+    #[must_use]
+    fn to_binary(&self) -> Option<Vec<u8>>;
+    /// Reads a value out of a binary-format parameter.
+    ///
+    /// A wrong length is an error, never a partial read: a client that sends four bytes for an
+    /// `int8` has a bug, and guessing at what it meant would turn that bug into a wrong number.
+    fn from_binary(ty: ColumnType, bytes: &[u8]) -> Result<Datum>;
+    /// The order PostgreSQL sorts these values in, which is not the order their bits are in.
+    ///
+    /// Three of its rules are its own and were confirmed against the server: `-0.0` and `0.0`
+    /// compare equal, `NaN` compares greater than every other float including `Infinity` (and
+    /// equal to itself), and NULL sorts **last**, which is what `ORDER BY x` means with no
+    /// `NULLS FIRST`. [`crate::row`] encodes keys so that byte order reproduces this.
+    ///
+    /// Comparing two different types is not something a schema can produce; it falls back to a
+    /// fixed order over the variants so the function is total.
+    #[must_use]
+    fn pg_cmp(&self, other: &Self) -> Ordering;
+}
+
+impl PgDatum for Datum {
+    fn to_text(&self) -> Option<String> {
         Some(match self {
             Datum::Null => return None,
             Datum::Int8(v) => v.to_string(),
@@ -219,13 +168,7 @@ impl Datum {
         })
     }
 
-    /// Reads a value of `ty` out of the text a client sent, exactly as PostgreSQL's input function
-    /// would, or fails with the SQLSTATE PostgreSQL would have failed with.
-    ///
-    /// Where the real input function accepts something this one does not, the answer is contract
-    /// C2's `0A000` naming the construct — never a wrong value and never a syntax error about
-    /// valid input. `tests/value_parity.rs` holds the list of those from both sides.
-    pub fn from_text(ty: ColumnType, text: &str) -> Result<Datum> {
+    fn from_text(ty: ColumnType, text: &str) -> Result<Datum> {
         Ok(match ty {
             ColumnType::Int8 => Datum::Int8(parse_int8(text)?),
             ColumnType::Text => Datum::Text(text.to_owned()),
@@ -236,16 +179,7 @@ impl Datum {
         })
     }
 
-    /// The bytes PostgreSQL puts in a **binary**-format field, or `None` for NULL.
-    ///
-    /// Big-endian throughout, which is the one place this project is: everything it writes for
-    /// itself is little-endian and everything on this wire is not. The formats were captured with
-    /// `COPY ... TO STDOUT (FORMAT binary)`, which uses the same `typsend` functions the protocol
-    /// does, and one of them settled a bet made back in unit 3 — a `timestamptz` really is
-    /// microseconds from 2000-01-01 with `i64::MAX` for `infinity`, so a value goes onto the wire
-    /// exactly as it is stored, with no arithmetic at all.
-    #[must_use]
-    pub fn to_binary(&self) -> Option<Vec<u8>> {
+    fn to_binary(&self) -> Option<Vec<u8>> {
         Some(match self {
             Datum::Null => return None,
             Datum::Int8(v) | Datum::TimestampTz(v) => v.to_be_bytes().to_vec(),
@@ -256,11 +190,7 @@ impl Datum {
         })
     }
 
-    /// Reads a value out of a binary-format parameter.
-    ///
-    /// A wrong length is an error, never a partial read: a client that sends four bytes for an
-    /// `int8` has a bug, and guessing at what it meant would turn that bug into a wrong number.
-    pub fn from_binary(ty: ColumnType, bytes: &[u8]) -> Result<Datum> {
+    fn from_binary(ty: ColumnType, bytes: &[u8]) -> Result<Datum> {
         let fixed = |width: usize| {
             (bytes.len() == width).then_some(bytes).ok_or_else(|| {
                 SqlError::ProtocolViolation(format!(
@@ -298,17 +228,7 @@ impl Datum {
         })
     }
 
-    /// The order PostgreSQL sorts these values in, which is not the order their bits are in.
-    ///
-    /// Three of its rules are its own and were confirmed against the server: `-0.0` and `0.0`
-    /// compare equal, `NaN` compares greater than every other float including `Infinity` (and
-    /// equal to itself), and NULL sorts **last**, which is what `ORDER BY x` means with no
-    /// `NULLS FIRST`. [`crate::row`] encodes keys so that byte order reproduces this.
-    ///
-    /// Comparing two different types is not something a schema can produce; it falls back to a
-    /// fixed order over the variants so the function is total.
-    #[must_use]
-    pub fn pg_cmp(&self, other: &Self) -> Ordering {
+    fn pg_cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
             (Datum::Null, Datum::Null) => Ordering::Equal,
             // NULLS LAST, PostgreSQL's default for ascending order.
@@ -323,20 +243,25 @@ impl Datum {
             (Datum::Bool(a), Datum::Bool(b)) => a.cmp(b),
             (Datum::Bytea(a), Datum::Bytea(b)) => a.cmp(b),
             (Datum::Double(a), Datum::Double(b)) => float::pg_cmp(*a, *b),
-            (a, b) => a.variant_rank().cmp(&b.variant_rank()),
+            (a, b) => variant_rank(a).cmp(&variant_rank(b)),
         }
     }
+}
 
-    fn variant_rank(&self) -> u8 {
-        match self {
-            Datum::Bool(_) => 0,
-            Datum::Int8(_) => 1,
-            Datum::Double(_) => 2,
-            Datum::TimestampTz(_) => 3,
-            Datum::Text(_) => 4,
-            Datum::Bytea(_) => 5,
-            Datum::Null => 6,
-        }
+/// Which variant a value is, for the total order `pg_cmp` puts across types.
+///
+/// A free function rather than a method: [`Datum`] belongs to `esker-keys` now, so this crate
+/// cannot give it inherent methods — and this one is an implementation detail of the ordering
+/// rather than something a client can ask for.
+fn variant_rank(value: &Datum) -> u8 {
+    match value {
+        Datum::Bool(_) => 0,
+        Datum::Int8(_) => 1,
+        Datum::Double(_) => 2,
+        Datum::TimestampTz(_) => 3,
+        Datum::Text(_) => 4,
+        Datum::Bytea(_) => 5,
+        Datum::Null => 6,
     }
 }
 
@@ -496,6 +421,7 @@ fn parse_bytea_escape(text: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{ColumnType, Datum, MAX_MICROS, MIN_MICROS, NEG_INFINITY, POS_INFINITY};
+    use super::{PgDatum, PgType};
     use crate::sqlstate;
     use std::cmp::Ordering;
 
@@ -627,6 +553,7 @@ mod tests {
 
 #[cfg(test)]
 mod binary_tests {
+    use super::PgDatum;
     use super::{ColumnType, Datum, MIN_MICROS, NEG_INFINITY, POS_INFINITY};
 
     /// The bytes a real PostgreSQL 19 wrote for these values, taken from

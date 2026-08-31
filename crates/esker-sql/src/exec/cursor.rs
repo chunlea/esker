@@ -27,6 +27,7 @@ use crate::value::{ColumnType, Datum};
 /// Rows read from the store in one round trip. Shared with everything else that walks a range
 /// ([`crate::exec::for_each_page`]).
 use crate::exec::SCAN_CHUNK;
+use crate::value::{PgDatum};
 
 /// The most rows a `Sort` will hold. Past it, `53400` rather than an unbounded allocation.
 pub(super) const SORT_LIMIT: usize = 1_000_000;
@@ -417,6 +418,7 @@ fn point(txn: &dyn Txn, tenant: u64, node: &Node) -> Result<Option<Vec<Datum>>> 
             txn.get(&key)?
                 .map(|value| row::decode_row(columns, &value))
                 .transpose()
+                .map_err(SqlError::from)
         }
         Node::IndexLookup {
             table_id,
@@ -433,7 +435,7 @@ fn point(txn: &dyn Txn, tenant: u64, node: &Node) -> Result<Option<Vec<Datum>>> 
             let primary_key = row::decode_row(primary_key_types, &entry)?;
             let key = row::row_key(tenant, *table_id, &primary_key)?;
             match txn.get(&key)? {
-                Some(value) => row::decode_row(columns, &value).map(Some),
+                Some(value) => row::decode_row(columns, &value).map(Some).map_err(SqlError::from),
                 // An index entry pointing at a row that is not there is corruption, not a miss:
                 // the entry and the row are written by one transaction.
                 None => Err(SqlError::DataCorrupted(format!(

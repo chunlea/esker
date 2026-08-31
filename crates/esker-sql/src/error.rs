@@ -752,6 +752,25 @@ impl SqlError {
     }
 }
 
+/// The row codec's failures, mapped to the conditions a client is told about.
+///
+/// Three variants and three destinations, and the mapping is the reason `esker_keys::row` has
+/// three rather than one. Corruption is `DataCorrupted`; a mismatch is `Internal`, because only a
+/// bug above this layer produces one; and invalid UTF-8 keeps PostgreSQL's own `22021`, with the
+/// offending byte, because that one is a condition a *user* can cause and a client reads the
+/// message. Collapsing them here would lose two sqlstates
+/// ([ADR 0029](../../docs/adr/0030-the-row-codec-moves-down.md)).
+impl From<esker_keys::row::RowError> for SqlError {
+    fn from(error: esker_keys::row::RowError) -> Self {
+        use esker_keys::row::RowError;
+        match error {
+            RowError::Corrupt(what) => SqlError::DataCorrupted(what),
+            RowError::Mismatch(what) => SqlError::Internal(what),
+            RowError::InvalidUtf8(byte) => SqlError::InvalidByteSequence(byte),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Severity, SqlError};

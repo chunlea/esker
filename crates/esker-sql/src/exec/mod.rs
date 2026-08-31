@@ -47,6 +47,7 @@ use crate::pgwire::session::{Described, Execute, Outcome, Params};
 use crate::plan::Statement;
 use crate::time_machine;
 use crate::value::ColumnType;
+use crate::value::{PgDatum, PgType};
 
 /// Runs statements for one connection.
 #[derive(Debug)]

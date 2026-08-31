@@ -19,6 +19,7 @@ use crate::error::{Result, SqlError};
 use crate::pgwire::session::Params;
 use crate::plan::{BinaryOp, Expr, Literal, Statement};
 use crate::value::{ColumnType, Datum};
+use crate::value::{PgDatum, PgType};
 
 /// Every parameter's type, indexed from zero for `$1`.
 pub(super) fn infer(

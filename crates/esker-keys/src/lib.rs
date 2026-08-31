@@ -20,6 +20,8 @@
 
 pub mod codec;
 pub mod prefix;
+pub mod row;
+pub mod value;
 
 pub use codec::{
     CodecError, Value, ValueKind, dec_ts, decode_bytes, decode_i64, decode_tuple, decode_u64,

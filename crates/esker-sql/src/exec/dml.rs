@@ -31,6 +31,7 @@ use crate::pgwire::session::Outcome;
 use crate::plan::{Delete, Insert, Update};
 use crate::row;
 use crate::value::Datum;
+use crate::value::{PgDatum, PgType};
 
 pub(super) fn insert(
     executor: &mut Executor,

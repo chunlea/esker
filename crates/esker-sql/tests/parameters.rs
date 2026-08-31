@@ -20,6 +20,7 @@ use esker_sql::parse::parse_statements;
 use esker_sql::pgwire::session::{Execute, Outcome, Params};
 use esker_sql::sqlstate;
 use esker_sql::value::{ColumnType, Datum};
+use esker_sql::value::{PgDatum, PgType};
 
 struct Node {
     executor: Executor,

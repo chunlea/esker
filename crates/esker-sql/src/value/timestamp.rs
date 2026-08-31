@@ -25,6 +25,7 @@
 //! displacement past `±15:59` is `22009` and not `22008`; and an era suffix prints *after* the
 //! offset, as `0001-01-01 00:00:00+00 BC`.
 
+use super::PgType;
 use crate::error::{Result, SqlError};
 use crate::value::ColumnType;
 

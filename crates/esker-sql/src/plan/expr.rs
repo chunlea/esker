@@ -28,6 +28,7 @@
 
 use crate::error::{Result, SqlError};
 use crate::value::{ColumnType, Datum};
+use crate::value::{PgDatum, PgType};
 
 /// An expression, as far as phase 6a needs one.
 ///

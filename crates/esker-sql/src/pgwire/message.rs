@@ -23,6 +23,7 @@
 //! * **Text is not assumed to be UTF-8 until it is checked.** A client may send anything.
 
 use crate::error::{Result, SqlError};
+use crate::value::{PgType};
 
 /// The `SSLRequest` code, in place of a protocol version: 1234 in the high 16 bits, 5679 in the low.
 pub const SSL_REQUEST_CODE: u32 = 80_877_103;

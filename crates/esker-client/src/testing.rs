@@ -47,6 +47,9 @@ fn txn_body(request: &Request) -> Option<&TxnKvReq> {
         | Request::Snapshot(_)
         | Request::Pd { .. }
         | Request::Admin(_)
+        // A fragment has a body, but not this one: it is a plan for a columnar replica, and this
+        // crate carries it without interpreting it ([`esker_proto::fragment`]).
+        | Request::Fragment { .. }
         | Request::RawKv { .. } => None,
     }
 }
@@ -62,8 +65,10 @@ fn routed_key(request: &Request) -> Option<&[u8]> {
         | Request::Snapshot(_)
         | Request::Pd { .. }
         // An operator's request names a region by id and carries no key, so no rule written in
-        // terms of keys can match one.
-        | Request::Admin(_) => None,
+        // terms of keys can match one. A fragment addresses a region the same way: its key range
+        // is inside the opaque fragment bytes, which this crate does not decode.
+        | Request::Admin(_)
+        | Request::Fragment { .. } => None,
     }
 }
 
@@ -83,6 +88,7 @@ fn raw_body(request: &Request) -> Option<&RawKvReq> {
         | Request::Snapshot(_)
         | Request::Pd { .. }
         | Request::Admin(_)
+        | Request::Fragment { .. }
         | Request::TxnKv { .. } => None,
     }
 }

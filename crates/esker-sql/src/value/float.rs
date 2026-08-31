@@ -13,6 +13,7 @@
 
 use std::cmp::Ordering;
 
+use super::PgType;
 use crate::error::{Result, SqlError};
 use crate::value::ColumnType;
 
@@ -140,34 +141,3 @@ pub(super) fn pg_cmp(a: f64, b: f64) -> Ordering {
             .unwrap_or_else(|| unreachable!("neither operand is NaN")),
     }
 }
-
-/// The 64 bits whose unsigned big-endian order is [`pg_cmp`], for an index key.
-///
-/// Two steps. The value is canonicalised first, because PostgreSQL has fewer floats than IEEE
-/// does: `-0.0` and `0.0` are one value and so is every `NaN`, and two keys that compare equal
-/// must encode to the same bytes or a unique index would admit both. Then the sign-magnitude
-/// layout is turned into an ordered integer — negatives inverted, non-negatives given the top bit
-/// — which puts `-Infinity` lowest and leaves the canonical quiet `NaN` above `Infinity`, exactly
-/// where PostgreSQL sorts it.
-pub(super) fn sort_bits(value: f64) -> u64 {
-    let canonical = if value.is_nan() {
-        f64::NAN
-    } else if value == 0.0 {
-        0.0
-    } else {
-        value
-    };
-    let bits = canonical.to_bits();
-    if bits & SIGN == 0 { bits | SIGN } else { !bits }
-}
-
-/// The inverse of [`sort_bits`], up to the canonicalisation it performs.
-pub(super) fn from_sort_bits(bits: u64) -> f64 {
-    f64::from_bits(if bits & SIGN == 0 {
-        !bits
-    } else {
-        bits & !SIGN
-    })
-}
-
-const SIGN: u64 = 1 << 63;

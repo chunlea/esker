@@ -22,6 +22,7 @@ use esker_sql::parse::parse_statements;
 use esker_sql::pgwire::session::{Execute, Outcome, Params};
 use esker_sql::sqlstate;
 use esker_sql::value::ColumnType;
+use esker_sql::value::{PgType};
 
 struct Node {
     backend: Arc<MemoryBackend>,

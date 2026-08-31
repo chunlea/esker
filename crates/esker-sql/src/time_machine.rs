@@ -34,6 +34,7 @@ use esker_client::{TSO_LOGICAL_BITS, physical_ms, ts_at_ms};
 
 use crate::error::{Result, SqlError};
 use crate::value::{ColumnType, Datum};
+use crate::value::{PgDatum};
 
 /// The GUC a session reads the past through.
 ///

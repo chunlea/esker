@@ -38,6 +38,7 @@ use crate::pgwire::session::Outcome;
 use crate::plan::TimeMachineVerb;
 use crate::time_machine::{check_name, render, token};
 use crate::value::{ColumnType, Datum};
+use crate::value::PgDatum;
 
 /// Runs one verb.
 pub(super) fn run(
