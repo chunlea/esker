@@ -1,0 +1,19 @@
+crates/esker-columnar/proptest-regressions/stats.txt
+  s_cf8601956e2620::t_b476449c967f90 1-7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "50c34299f0d00b8c0aaf5b9f46ba053440dcbb5d",
+  "prompts": {},
+  "sessions": {
+    "s_cf8601956e2620": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "732aecbc-5268-4943-836e-a49ba67b2585",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
