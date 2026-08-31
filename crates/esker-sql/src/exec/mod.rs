@@ -25,6 +25,7 @@
 //! conflict really was an ordinary row-level race, which stays `40001` and stays retryable.
 
 mod bind;
+mod cursor;
 mod ddl;
 mod dml;
 mod query;
@@ -129,7 +130,7 @@ impl Executor {
     /// `SELECT`: plan it, then pull every row through.
     fn select(&mut self, txn: &mut dyn Txn, select: &crate::plan::Select) -> Result<Outcome> {
         let planned = self.plan_select(txn, select)?;
-        let mut cursor = query::Cursor::open(txn, self.tenant, &planned.node)?;
+        let mut cursor = cursor::Cursor::open(txn, self.tenant, &planned.node)?;
         let mut rows = Vec::new();
         while let Some(row) = cursor.next()? {
             rows.push(

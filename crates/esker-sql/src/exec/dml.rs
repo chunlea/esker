@@ -25,8 +25,8 @@
 use crate::backend::Txn;
 use crate::catalog::TableDef;
 use crate::error::{Result, SqlError};
-use crate::exec::query;
 use crate::exec::{Executor, Unique, Written};
+use crate::exec::{cursor, query};
 use crate::pgwire::session::Outcome;
 use crate::plan::{Delete, Insert, Update};
 use crate::row;
@@ -221,7 +221,7 @@ pub(super) fn update(
                 crate::plan::Expr::Literal(literal) => literal.assign(column.ty, &column.name)?,
                 other => {
                     let resolved = query::resolve_against(other, &table)?;
-                    query::evaluate(&resolved, &old)?
+                    cursor::evaluate(&resolved, &old)?
                 }
             };
             if !evaluated.fits(column.ty) {
@@ -264,7 +264,7 @@ fn collect(
     table: &TableDef,
 ) -> Result<Vec<Vec<Datum>>> {
     let node = query::matching_rows(filter, executor.tenant, table)?;
-    let mut cursor = query::Cursor::open(txn, executor.tenant, &node)?;
+    let mut cursor = cursor::Cursor::open(txn, executor.tenant, &node)?;
     let mut rows = Vec::new();
     while let Some(row) = cursor.next()? {
         rows.push(row);
