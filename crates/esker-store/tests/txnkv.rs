@@ -835,20 +835,46 @@ async fn a_committed_transaction_survives_a_restart() {
 
 // -- garbage collection --------------------------------------------------------------------
 
-/// `prompts/05-txn.md`'s GC acceptance: many versions of one key, a safepoint, a compaction —
-/// and the visible read is unchanged while the versions are gone.
+/// `prompts/05-txn.md`'s GC acceptance, at the number it asks for: **a thousand versions** of
+/// one key, a safepoint, a compaction — and the visible read is unchanged while the SST holds
+/// one version.
+///
+/// Two halves, and the second is why the count is taken rather than inferred: a read answers
+/// with one value however many versions are behind it, so a collector that ran and a collector
+/// that did not look identical through the front door. What is asserted is that the versions
+/// left *on disk* are one — after a flush, so nothing is in a memtable, and after a compaction,
+/// which is the only thing that applies the filter.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_safepoint_collects_every_version_but_the_visible_one() {
-    // Enough that the collector's work is visible in a count, small enough that the test stays
-    // a second rather than a minute.
-    const VERSIONS: u64 = 200;
+    // Enough that the collector's work is visible in a count, small enough that `just check`
+    // stays seconds. The prompt's thousand is the run below, which is the same code.
+    collect_after_versions(200).await;
+}
 
+/// The acceptance criterion at the number `prompts/05-txn.md` states: a thousand versions.
+///
+/// Behind `--ignored` because a thousand committed versions is a thousand `fsync`ed round
+/// trips — half a minute of them — and the two hundred above prove the same property on every
+/// change.
+///
+/// ```text
+/// cargo test -p esker-store --release --test txnkv -- --ignored a_thousand_versions
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a thousand committed versions; tens of seconds"]
+async fn a_thousand_versions_collect_to_one() {
+    collect_after_versions(1_000).await;
+}
+
+/// Commits `versions` versions of one key, publishes a safepoint above all of them, compacts,
+/// and checks both halves: the visible read is unchanged, and one version is left on disk.
+async fn collect_after_versions(versions: u64) {
     let running = start().await;
     let transport = TcpTransport::connect(running.handle.local_addr())
         .await
         .unwrap();
 
-    for round in 1..=VERSIONS {
+    for round in 1..=versions {
         let start_ts = round * 10;
         call(
             &transport,
@@ -876,7 +902,7 @@ async fn a_safepoint_collects_every_version_but_the_visible_one() {
         .unwrap();
     }
 
-    let newest = Bytes::from(format!("v{VERSIONS}"));
+    let newest = Bytes::from(format!("v{versions}"));
     assert_eq!(
         get(&transport, b"hot", u64::MAX).await,
         Some(newest.clone())
@@ -888,7 +914,7 @@ async fn a_safepoint_collects_every_version_but_the_visible_one() {
     call(
         &transport,
         TxnKvReq::GcSafepoint {
-            safepoint: VERSIONS * 10 + 5,
+            safepoint: versions * 10 + 5,
         },
     )
     .await
@@ -900,11 +926,37 @@ async fn a_safepoint_collects_every_version_but_the_visible_one() {
     // that dropped the newest version below the safepoint would break.
     assert_eq!(get(&transport, b"hot", u64::MAX).await, Some(newest));
 
-    // And the versions really went: one survivor rather than two hundred.
+    // And the versions really went: one survivor rather than every one of them.
     let left = running.store.write_records(b"hot").unwrap();
     assert_eq!(
         left, 1,
         "the newest version below the safepoint survives and the rest are collected"
+    );
+
+    // On *disk*, and not merely in the answer: the `write` memtable is empty after the flush,
+    // so the one record the count above found is in an SST and nowhere else. Without this the
+    // test would pass on a collector that never ran, as long as reads went to a memtable that
+    // happened to hold the newest version.
+    let in_memory = running
+        .store
+        .property("esker.mem-table-size.write")
+        .and_then(|size| size.parse::<u64>().ok())
+        .expect("the write column family reports its memtable size");
+    assert_eq!(
+        in_memory, 0,
+        "the flush left nothing in memory, so the surviving version is the one in the SST"
+    );
+    let files: u64 = (0..7)
+        .filter_map(|level| {
+            running
+                .store
+                .property(&format!("esker.num-files-at-level{level}.write"))
+        })
+        .filter_map(|count| count.parse::<u64>().ok())
+        .sum();
+    assert!(
+        files >= 1,
+        "every committed version was flushed, so at least one SST is behind the answer"
     );
 }
 

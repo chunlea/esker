@@ -471,23 +471,32 @@ fn crashed_transfer(
     }
 }
 
-/// Reads every account at **one** snapshot and answers with the total, or `None` if the read
-/// could not be completed — which is not a failure, it is a cluster mid-election.
-fn audit(client: &TxnClient) -> Option<u64> {
-    let txn = client.begin().ok()?;
+/// Why an audit could not be taken. Not failures — a cluster mid-election or a key someone is
+/// mid-way through writing — but worth counting, because an audit that never succeeds is an
+/// assertion that is never made and a run that says so is honest about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoAudit {
+    /// The scan could not be answered: a lock that would not clear, or nobody leading.
+    Unreadable,
+    /// Fewer accounts came back than exist. Adding those up would turn a partial read into a
+    /// broken invariant, so it is not added up.
+    Short(usize),
+}
+
+/// Reads every account at **one** snapshot and answers with the total.
+fn audit(client: &TxnClient) -> Result<u64, NoAudit> {
+    let txn = client.begin().map_err(|_| NoAudit::Unreadable)?;
     let pairs = txn
         .scan(
             ACCOUNTS_FROM,
             ACCOUNTS_TO,
             u32::try_from(ACCOUNTS).unwrap_or(u32::MAX) * 2,
         )
-        .ok()?;
-    // A short answer is not a sum. It means a region could not be reached, or the walk stopped
-    // — and adding up what came back would turn that into a broken invariant.
+        .map_err(|_| NoAudit::Unreadable)?;
     if pairs.len() != usize::try_from(ACCOUNTS).unwrap_or(usize::MAX) {
-        return None;
+        return Err(NoAudit::Short(pairs.len()));
     }
-    Some(pairs.iter().map(|(_, value)| balance_of(value)).sum())
+    Ok(pairs.iter().map(|(_, value)| balance_of(value)).sum())
 }
 
 /// The whole run.
@@ -523,6 +532,9 @@ fn bank(plan: &Plan) {
     // the transfers and the kills are happening. Checking it only at the end would let a
     // cluster that broke it in the middle and healed itself pass.
     let attempts = Arc::new(AtomicU64::new(0));
+    let unreadable = Arc::new(AtomicU64::new(0));
+    let short = Arc::new(AtomicU64::new(0));
+    let shortest = Arc::new(AtomicU64::new(u64::MAX));
     let auditor = {
         let (cluster, stop, audits, attempts, label) = (
             Arc::clone(&cluster),
@@ -531,26 +543,55 @@ fn bank(plan: &Plan) {
             Arc::clone(&attempts),
             label.clone(),
         );
+        let (unreadable, short, shortest) = (
+            Arc::clone(&unreadable),
+            Arc::clone(&short),
+            Arc::clone(&shortest),
+        );
         std::thread::spawn(move || {
             // A wider lock budget than a transfer's: an audit reads every account at one
             // snapshot, so it meets whatever any writer is holding at that instant and has to
             // wait each of them out. A transfer that gave up would simply try again; an audit
             // that gave up would be an assertion not made.
-            let Some(client) = cluster
-                .client_within(999, Duration::from_secs(20))
-                .map(|client| client.with_max_lock_resolutions(32))
-            else {
+            let auditing = |cluster: &Cluster| {
+                cluster
+                    .client_within(999, Duration::from_secs(20))
+                    .map(|client| client.with_max_lock_resolutions(32))
+            };
+            let Some(mut client) = auditing(&cluster) else {
                 return;
             };
+            // A client whose store was killed has a dead connection and fails instantly for
+            // ever after: `TcpStores` opens its book once. Rebuilding after a run of failures
+            // is what a real client does, and without it an auditor stops auditing at the first
+            // kill while still looking busy.
+            let mut consecutive = 0u32;
             while !stop.load(Ordering::Relaxed) {
                 attempts.fetch_add(1, Ordering::Relaxed);
-                if let Some(total) = audit(&client) {
-                    assert_eq!(
-                        total, TOTAL,
-                        "{label}: the sum of the balances at one snapshot changed — a transfer \
-                         was applied to one account and not the other"
-                    );
-                    audits.fetch_add(1, Ordering::Relaxed);
+                if consecutive >= 5 {
+                    consecutive = 0;
+                    if let Some(fresh) = auditing(&cluster) {
+                        client = fresh;
+                    }
+                }
+                match audit(&client) {
+                    Ok(total) => {
+                        assert_eq!(
+                            total, TOTAL,
+                            "{label}: the sum of the balances at one snapshot changed — a \
+                             transfer was applied to one account and not the other"
+                        );
+                        audits.fetch_add(1, Ordering::Relaxed);
+                        consecutive = 0;
+                    }
+                    Err(NoAudit::Unreadable) => {
+                        unreadable.fetch_add(1, Ordering::Relaxed);
+                        consecutive += 1;
+                    }
+                    Err(NoAudit::Short(seen)) => {
+                        short.fetch_add(1, Ordering::Relaxed);
+                        shortest.fetch_min(seen as u64, Ordering::Relaxed);
+                    }
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -603,6 +644,15 @@ fn bank(plan: &Plan) {
         tally.crashed,
         audits.load(Ordering::Relaxed),
         attempts.load(Ordering::Relaxed)
+    );
+    let fewest = match shortest.load(Ordering::Relaxed) {
+        u64::MAX => "none were short".to_owned(),
+        seen => format!("fewest accounts seen: {seen}"),
+    };
+    println!(
+        "{label}: audits not taken — {} unreadable, {} short ({fewest})",
+        unreadable.load(Ordering::Relaxed),
+        short.load(Ordering::Relaxed)
     );
     assert!(
         tally.committed > 0,
