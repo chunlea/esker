@@ -1,0 +1,23 @@
+crates/esker-raft/src/core.rs
+  s_b3f6a712d611c9::t_d2ca1a83ea1645 230-249,255-259,261-265
+crates/esker-raft/src/transfer.rs
+  s_b3f6a712d611c9::t_b33c1683134b91 197-289
+docs/plans/debt-c1.md
+  s_b3f6a712d611c9::t_295d3a496077bd 1-107
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "b73a294d2702d25f0b77825db4a4c77fc08bae26",
+  "prompts": {},
+  "sessions": {
+    "s_b3f6a712d611c9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "78adef9a-88ef-4c89-a340-f825de3d2ab7",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
