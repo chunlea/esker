@@ -203,6 +203,44 @@ rather than fails, and a hanging test tells CI nothing.
 §1 and §2, so every measurement in this file was taken under *more* load than it claims, not
 less. The 0/20 runs were re-run on a clean machine afterwards and are the numbers reported.
 
+## 6. A fourth: a guard whose truth was assumed
+
+The full `--workspace` run that was meant to be this lane's last gate came back with one failure,
+in this lane's own crate:
+
+```text
+FAIL esker-store::server shutdown_answers_the_requests_already_running
+     panicked at crates/esker-store/tests/server.rs:576:5:
+     the shutdown answered nothing at all
+```
+
+`written > 0` is **not the property that test is about.** The property is the comment beside it —
+an answer must never say a write succeeded when the store was already closed — together with
+`pairs.len() >= written`. Both of those hold when nothing was ever in flight, *vacuously*. So
+`written > 0` is a **vacuity guard**: the thing that stops the test passing while testing
+nothing. And the `tokio::time::sleep(1 ms)` above it was the bet that the guard would be true.
+
+Under a 1799-test saturated run the bet loses. Sixty-four freshly spawned tasks need not have
+been scheduled at all inside a millisecond; the shutdown then refuses all sixty-four, `written`
+is zero, and the guard fires. **The guard worked.** The failure's real content is "this test did
+not run" — a false failure, but not noise.
+
+Not `70405ae`, and checked rather than assumed: that store opens with `StoreOptions::new()`,
+whose `raft` is `None`, so it has no `RaftPeer`, so no job ever reaches the `DriverPool`. The
+writes take the `blocking(handle)` path and the shutdown flag cannot be on it. Confirmed
+independently by lane wy-c2 against `esker-store/src`.
+
+Fixed by making non-vacuity a **fact** instead of a hope: wait until the store has actually
+applied one of the writes, then shut down. The one that landed is answered, so the guard is true
+by construction; the other sixty-three are still in flight, which is what the test is for. A
+longer sleep would only have moved the bet.
+
+**Honest limit on the evidence.** The local repro was not achieved: 0 of 24 under the
+same-test saturation harness, and 0 of 20 against twenty looping `balance` processes. That exact
+starvation belongs to a 1799-test run and did not reproduce synthetically. The claim here does
+not rest on a repro — the fix removes the dependence on scheduling rather than making it less
+likely, and the production evidence is the failure message itself.
+
 ## What this lane did not do
 
 * **The simultaneous-claim race** is narrowed to two round trips by a read-back, not closed.

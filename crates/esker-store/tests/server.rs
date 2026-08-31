@@ -10,7 +10,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use esker_proto::messages::Hello;
@@ -561,8 +561,41 @@ async fn shutdown_answers_the_requests_already_running() {
         }));
     }
 
-    // Stop while those are in flight.
-    tokio::time::sleep(Duration::from_millis(1)).await;
+    // Stop while those are in flight — but only once at least one of them has demonstrably
+    // reached the store.
+    //
+    // **`written > 0` below is a vacuity guard, not the property.** The property is the comment
+    // beside it: an answer must never say a write succeeded when the store was already closed.
+    // That, and `pairs.len() >= written`, both hold when nothing was ever in flight — so the
+    // guard is what stops the test passing while testing nothing, and a fixed sleep only *bets*
+    // that the guard will be true. Under a saturated `--workspace` run the bet loses: sixty-four
+    // freshly spawned tasks need not have been scheduled at all inside a millisecond, the
+    // shutdown then refuses all sixty-four, and the failure reads "the shutdown answered nothing
+    // at all" when what actually happened is that the test did not run
+    // (`docs/plans/debt-c1.md` section 6).
+    //
+    // Waiting on the store's own state instead makes non-vacuity a fact. The write that landed
+    // is answered, so the guard is true by construction; the rest are still in flight, which is
+    // what the test is for. A longer sleep would only have moved the bet.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let RawKvResp::Scan { pairs } = running
+            .store
+            .handle(header(), RawKvReq::scan(&b""[..], &b""[..], 0))
+            .unwrap()
+        else {
+            panic!("not a scan response");
+        };
+        if !pairs.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "not one of the writes reached the store, so there was nothing in flight to shut \
+             down and this test could not have tested anything"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
     running.handle.shutdown().await.unwrap();
 
     let mut written = 0;
