@@ -46,6 +46,7 @@ fn txn_body(request: &Request) -> Option<&TxnKvReq> {
         | Request::Raft(_)
         | Request::Snapshot(_)
         | Request::Pd { .. }
+        | Request::Admin(_)
         | Request::RawKv { .. } => None,
     }
 }
@@ -56,7 +57,13 @@ fn routed_key(request: &Request) -> Option<&[u8]> {
     match request {
         Request::RawKv { request, .. } => Some(routing_key(request)),
         Request::TxnKv { request, .. } => Some(request.routing_key()),
-        Request::Hello(_) | Request::Raft(_) | Request::Snapshot(_) | Request::Pd { .. } => None,
+        Request::Hello(_)
+        | Request::Raft(_)
+        | Request::Snapshot(_)
+        | Request::Pd { .. }
+        // An operator's request names a region by id and carries no key, so no rule written in
+        // terms of keys can match one.
+        | Request::Admin(_) => None,
     }
 }
 
@@ -75,6 +82,7 @@ fn raw_body(request: &Request) -> Option<&RawKvReq> {
         | Request::Raft(_)
         | Request::Snapshot(_)
         | Request::Pd { .. }
+        | Request::Admin(_)
         | Request::TxnKv { .. } => None,
     }
 }
