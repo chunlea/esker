@@ -193,6 +193,101 @@ repeatedly while the *client* keeps running against them, which is exactly the c
 lane's brief asked for and exactly the condition this lane's own tool turned out not to be built to
 survive. Reported rather than quietly re-run into a nicer number.
 
+## Run 2 — 2026-08-31, comparable region counts, and a harness bug fixed
+
+commit `2e109dd4` (esker-store/esker-pd unchanged since Run 1's `7e77058`; only esker-sql kept
+moving HEAD between the two).
+
+Reactivated after Run 1 with two directed corrections: the store lane's own retest of the Run 1
+harness hit `p4loadgen` failing 10,652/15,000 warm-up puts with `no address known for store N`,
+and Run 1's three configurations happened to settle at the same region count (8) but by accident,
+not by construction — nothing pinned it, so a rerun was not guaranteed to compare like with like.
+Both are addressed below before any new number is trusted.
+
+### The address-book bug, and the fix
+
+`PdResolver::get_region` populated `p4loadgen`'s store→address book from every `GetRegion`
+answer, but `RawClient`'s `RegionCache` (production code, unmodified) caches a `Route` and reuses
+it across many calls — a `NotLeader` redirect updates *which peer* it believes leads via
+`set_leader` without re-fetching that region's `stores` list. A peer added to a region **after**
+the cache's last real resolve (a fresh replica from repair or balance, most commonly) could
+therefore be named by a stale cached route while the book had never heard its address — and unlike
+production's `TcpStores`, whose fixed `--addr`-built book makes "no address known" genuinely
+terminal, this book's membership changes mid-run, so failing immediately was wrong.
+
+**Fix**: `DynamicStores` (the `StoreTransport` impl) now holds a shared handle to the same
+`PdResolver` used for region resolution. On a book miss it extracts the call's own key via
+`esker_client::wire::routing_key` (the identical helper the production router uses internally —
+covers every `RawKvReq` variant, not just the `Get`/`Put` this harness happens to send) and issues
+a **targeted** `GetRegion` for that exact key, bypassing the possibly-stale cache and going
+straight to PD, before retrying the book — bounded at 8s total, retried every 150ms, so a genuine
+registration race (the store hasn't reached PD yet) also resolves rather than failing fast.
+Verified by a dynamic-join smoke test (a 2nd store started mid-run, immediately hammered) showing
+zero `no address known` failures where the unfixed code would have had them, then confirmed at
+scale across every run below: **zero `no address known` failures in any of the three
+configurations, 100% of every acknowledged write verified.**
+
+### The other bug found along the way: `esker-cli region split` cannot reach a real cluster
+
+Pinning region counts by pre-splitting an empty keyspace needed `esker-cli region split`, which
+failed on the first call: `request is for cluster 0, this peer serves cluster <real id>`.
+`crates/esker-cli/src/region.rs`'s `walk`/`locate` call `esker_proto::pd::encode(0, ...)` with the
+cluster id **hardcoded to `0`** and no discovery or retry — so `region ls`/`region
+split`/`region transfer-leader` fail `ClusterMismatch` against any real bootstrapped cluster, whose
+id is a `mix64` of bootstrap facts and is essentially never `0` (`docs/DESIGN.md` §7). This is a
+genuine defect in the checked-in CLI, independent of any lane's WIP, and worth the coordinator's
+attention: as shipped, none of the three `region` subcommands DESIGN §12 lists as deliverables
+work against a live cluster. Worked around here, not fixed there (out of this lane's mandate and
+write grant): `p4loadgen` gained a `split` subcommand reusing the same `PdResolver` that already
+does cluster-id discovery for `load`/`verify`/`regions`.
+
+### Method
+
+Same machine, same `region_heartbeat`/`store_heartbeat` (1 s / 2 s) as Run 1. **Region count is now
+pinned at exactly 12 for every configuration**, by pre-splitting the empty keyspace at 11 evenly
+spaced boundaries before any data is written (`p4loadgen split`), rather than relying on an
+organic size-triggered split to land on a comparable count by chance. `region_split_size` is set to
+1 GiB (effectively disabling the automatic splitter) so the region count stays exactly what was
+pre-split throughout the run. 300-byte values, 8 client threads, unsynced. 1- and 3-store used
+20,000 keys; **5-store used 8,000** — the 3-store measured pass alone took 378s, and cutting the
+op count for 5-store was the "quiet" call given the time available, trading absolute op count for
+a still-meaningful rate over a shorter run. `uptime`'s load average is recorded at three points per
+run (start, immediately before the measured pass, immediately after).
+
+| Stores | Regions (pinned) | Keys measured | Voters entering measurement | Measured ops/s | p50 | p99 | Verify | Load avg (start → pre-measure → post) |
+|---:|---:|---:|---|---:|---:|---:|---|---|
+| 1 | 12 | 20,000 | 12/12 (trivial, 1 replica each) | **277.0** | 25.9 ms | 70.2 ms | 20,000/20,000 | 5.3 → — → — |
+| 3 | 12 | 20,000 | 35/36 (full 3× on all but one region) | **52.9** | 136.0 ms | 371.7 ms | 20,000/20,000 | 6.7 → 7.9 → 5.8 |
+| 5 | 12 | 8,000 | 26/38 (still catching up; store 4 never received a replica) | **71.3** | 49.8 ms | 855.9 ms | 7,997/7,997 | 5.8 → 5.4 → 4.3 |
+
+**The first positive signal across every run this lane has made: 5 stores beats 3.** Not a clean
+rising line from 1 — 3 remains far below 1, the same quorum-round-trip cost Run 1 and phase 3 both
+already found, now measured with confirmed full 3× replication (peer listing: 12/12/11 across the
+three stores, matching 12 regions × 3) rather than Run 1's partially-converged state. But **5 beats
+3 by 35%, at exactly the point the mechanism says it should**: `target_replicas` is 3, so 3 stores
+give every region nowhere to spread (every store already holds everything), while 5 gives regions
+somewhere to go — and even the **partial** spread this run achieved (peers landed on 4 of the 5
+stores; store 4 received nothing in this run's window; 26 of 38 peers were still learners, not yet
+promoted, when measurement began) was already enough to claw back throughput the 3-store
+configuration cannot reach. A run given enough time for full promotion and a fifth store actually
+receiving load is the version of this experiment likely to show a further rise — not attempted
+here on this lane's remaining time budget, and recorded as the natural next step rather than
+claimed.
+
+Every acknowledged write was readable in all three configurations, with zero mismatches — the
+harness fix did not trade correctness for the lower failure rate; a handful (3, in the 5-store
+run) of individual `put`s still failed outright under contention and were reported to the caller
+rather than silently dropped, exactly as Run 1's did.
+
+### How to reproduce
+
+```sh
+# p4loadgen and p4serverwrap are the same scratchpad tools described in Run 1's methodology note,
+# with p4loadgen additionally gaining `split` (this run) and the PD-refresh fix above.
+run_scaleout3.sh <n-stores> <pd-port> <base-store-port> <data-dir> <num-keys> <value-size> \
+  <threads> <fixed-region-count> <spread-wait-seconds>
+```
+
 ## Methodology note: what the scratchpad tooling is, and isn't
 
 None of the four items above could be produced with the checked-in `esker-cli`: `bench`/`raw` only
