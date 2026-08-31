@@ -66,7 +66,7 @@ impl Node {
         for parsed in parse_statements(sql)? {
             last = match parsed.class() {
                 StatementClass::Begin => {
-                    self.executor.begin()?;
+                    self.executor.begin(parsed.begins_read_only())?;
                     Outcome::done("BEGIN")
                 }
                 StatementClass::Commit => {

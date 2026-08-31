@@ -341,12 +341,12 @@ fn an_index_on_a_column_that_is_not_there_is_42703() {
 #[test]
 fn ddl_rolls_back_with_its_transaction() {
     let mut node = Node::new();
-    node.executor.begin().unwrap();
+    node.executor.begin(false).unwrap();
     node.run("CREATE TABLE t (a int8 PRIMARY KEY)").unwrap();
     node.executor.rollback().unwrap();
     assert!(node.table("t").is_none(), "the CREATE went with the block");
 
-    node.executor.begin().unwrap();
+    node.executor.begin(false).unwrap();
     node.run("CREATE TABLE t (a int8 PRIMARY KEY)").unwrap();
     node.executor.commit().unwrap();
     assert!(node.table("t").is_some());
@@ -496,7 +496,7 @@ fn a_rolled_back_ddl_is_invisible_to_the_next_session() {
 
     // `BEGIN`/`ROLLBACK` are the session's, not the executor's, so a test that drives the
     // executor directly opens the block through the same trait the session uses.
-    node.executor.begin().unwrap();
+    node.executor.begin(false).unwrap();
     node.run("CREATE TABLE ghost (id int8 PRIMARY KEY)")
         .unwrap();
     // The writer sees its own DDL, which is what puts the definition in reach of the cache.
@@ -673,7 +673,7 @@ fn ddl_inside_a_transaction_is_visible_to_itself_and_to_nobody_else() {
     node.run("CREATE TABLE a (id int8 PRIMARY KEY)").unwrap();
     node.run("INSERT INTO a VALUES (1)").unwrap();
 
-    node.executor.begin().unwrap();
+    node.executor.begin(false).unwrap();
     node.run("ALTER TABLE a ADD COLUMN x text").unwrap();
     // Its own view sees it, and can write against it.
     node.run("INSERT INTO a VALUES (2, 'two')").unwrap();
@@ -859,8 +859,8 @@ fn two_sessions_insert_into_a_keyless_table_without_conflicting() {
         Ok(last)
     };
 
-    node.executor.begin().unwrap();
-    other.begin().unwrap();
+    node.executor.begin(false).unwrap();
+    other.begin(false).unwrap();
     run(&mut node.executor, "INSERT INTO t VALUES (1)").unwrap();
     run(&mut other, "INSERT INTO t VALUES (2)").unwrap();
     node.executor.commit().unwrap();
@@ -880,7 +880,7 @@ fn a_rolled_back_insert_leaves_a_gap_in_the_row_ids() {
     let mut node = Node::new();
     node.run("CREATE TABLE t (a int8)").unwrap();
 
-    node.executor.begin().unwrap();
+    node.executor.begin(false).unwrap();
     node.run("INSERT INTO t VALUES (1)").unwrap();
     node.executor.rollback().unwrap();
 

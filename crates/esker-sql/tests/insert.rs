@@ -314,8 +314,8 @@ fn a_concurrent_duplicate_is_reported_as_a_duplicate() {
     .unwrap();
 
     let (mut left, mut right) = (node.session(), node.session());
-    left.begin().unwrap();
-    right.begin().unwrap();
+    left.begin(false).unwrap();
+    right.begin(false).unwrap();
 
     // Both read the index key at their own snapshot; neither sees anything.
     run(&mut left, "INSERT INTO t VALUES (1, 'a@b')").unwrap();
@@ -342,8 +342,8 @@ fn a_concurrent_duplicate_primary_key_is_also_a_duplicate() {
     run(&mut setup, "CREATE TABLE t (id int8 PRIMARY KEY)").unwrap();
 
     let (mut left, mut right) = (node.session(), node.session());
-    left.begin().unwrap();
-    right.begin().unwrap();
+    left.begin(false).unwrap();
+    right.begin(false).unwrap();
     run(&mut left, "INSERT INTO t VALUES (1)").unwrap();
     run(&mut right, "INSERT INTO t VALUES (1)").unwrap();
 
@@ -363,8 +363,8 @@ fn a_concurrent_duplicate_primary_key_is_also_a_duplicate() {
 fn a_lost_race_on_a_key_no_constraint_covers_is_still_40001() {
     let node = Node::new();
     let (mut left, mut right) = (node.session(), node.session());
-    left.begin().unwrap();
-    right.begin().unwrap();
+    left.begin(false).unwrap();
+    right.begin(false).unwrap();
     run(&mut left, "CREATE TABLE a (id int8 PRIMARY KEY)").unwrap();
     run(&mut right, "CREATE TABLE b (id int8 PRIMARY KEY)").unwrap();
 

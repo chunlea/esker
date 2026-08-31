@@ -105,8 +105,8 @@ fn a_lost_race_on_a_unique_index_is_a_duplicate_key() {
 
     // Both transactions open before either writes, so neither can see the other's row and the
     // read each does finds the index key absent. Exactly one may commit.
-    first.executor.begin().unwrap();
-    second.executor.begin().unwrap();
+    first.executor.begin(false).unwrap();
+    second.executor.begin(false).unwrap();
     first.run("INSERT INTO u VALUES (1, 'same@x')").unwrap();
     second.run("INSERT INTO u VALUES (2, 'same@x')").unwrap();
 
@@ -156,7 +156,7 @@ fn a_rollback_leaves_nothing_on_any_store() {
     session.run("CREATE TABLE t (id int8 PRIMARY KEY)").unwrap();
     session.run("INSERT INTO t VALUES (1)").unwrap();
 
-    session.executor.begin().unwrap();
+    session.executor.begin(false).unwrap();
     session.run("INSERT INTO t VALUES (2)").unwrap();
     session
         .run("CREATE TABLE ghost (id int8 PRIMARY KEY)")

@@ -164,6 +164,28 @@ impl Parsed {
         &self.class
     }
 
+    /// Whether this `BEGIN` asked for a **read-only** transaction.
+    ///
+    /// PostgreSQL's `BEGIN READ ONLY` refuses every write in the block with `25006`, and this node
+    /// used to parse the words and ignore them — a clause the user wrote and the server did not
+    /// honour, which is the defect class `crate::plan`'s lowering exists to prevent. It was
+    /// invisible because `BEGIN` never reaches the lowering at all: transaction control belongs to
+    /// the session, so the mode had to be read here.
+    ///
+    /// `READ WRITE` is the default and says nothing, so it is not carried.
+    #[must_use]
+    pub fn begins_read_only(&self) -> bool {
+        use sqlparser::ast::{TransactionAccessMode, TransactionMode};
+
+        matches!(&self.statement, Statement::StartTransaction { modes, .. }
+        if modes.iter().any(|mode| {
+            matches!(
+                mode,
+                TransactionMode::AccessMode(TransactionAccessMode::ReadOnly)
+            )
+        }))
+    }
+
     /// The statement rendered back to SQL, for `EXPLAIN` output and diagnostics.
     #[must_use]
     pub fn rendered(&self) -> String {

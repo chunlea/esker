@@ -238,7 +238,12 @@ Written before the code, and each is one of the kinds `DESIGN.md` §11 requires 
   describes it: two read-only transactions, one scan each over the same row range, and a merge that
   buffers one row per side. Four text columns, each side rendered with its own snapshot's schema.
   `EXCEPT` stays `0A000`. Runs against three real stores.
-- [ ] 4 — the tests, and where PostgreSQL parity ends
+- [x] 4 — **the tests, and where PostgreSQL parity ends.**
+  `tests/corpus/pg19_time_machine.txt` holds 25 scripts captured off a real PostgreSQL 19beta1,
+  replayed by `tests/time_machine_parity.rs` against this node with every difference in a
+  `DIVERGENCES` list checked from both sides. `tests/slt/time_machine.slt` runs under both `.slt`
+  runners and against three real stores. The divergence table in `docs/plans/phase-6a.md` §10a has
+  four new rows.
 
 ## 9. What changed from this plan
 
@@ -309,6 +314,29 @@ of the already-decoded row costs nothing and couples the diff to no key format.
 ADR 0019 makes it rewrite no row, so a row nobody touched has the same bytes on both sides even
 though it now decodes to one more column. A comment claiming the opposite was written and then
 corrected by the test.
+
+**`BEGIN READ ONLY` parsed and was ignored.** The capture found it: PostgreSQL answers `25006` for
+every write in such a block and this node answered `ok`, executing them. It was invisible because
+`BEGIN` never reaches the lowering — transaction control belongs to the session, so the "reject, do
+not ignore" rule that `crate::plan` enforces had no way to see the clause. `Parsed::begins_read_only`
+reads it, `Execute::begin` takes it, and the executor's `25006` check now ORs it in. The machinery
+was already there for the historical read; the clause simply had nobody reading it.
+
+**An off-by-one at the window's floor**, also found by the capture. `Window::new` shifted the
+retention and subtracted it from `now`, so the floor carried `now`'s logical bits while a request
+built from an instant has its logical bits zeroed by design. Exactly one retention back was refused
+— with a message naming a range whose lower end *rendered as the instant it had just rejected*,
+which is how obvious a nonsense message it was. The floor is subtracted in milliseconds and then
+shifted, so both ends are millisecond-aligned, which is also the resolution the message can express.
+
+**The fake clock's comment said 2026-08-30 and its bits said 2026-08-23.** A week out, and the only
+symptom was a parity case that looked like a bug. There is now a test asserting the constant renders
+as the date its comment claims.
+
+**Syntax-error *messages* are `sqlparser`'s and were never claimed to be PostgreSQL's**
+(`docs/plans/phase-6a.md` §1 excludes them). The parity replay compares `42601` by code alone rather
+than listing three near-identical divergences; what contract C1 promises — that a statement
+PostgreSQL accepts never gets this code — is held by `tests/corpus/pg19.sql`.
 
 **Two test harnesses sent `BEGIN` through `execute`**, where it is `0A000 BEGIN is not supported`:
 transaction control belongs to `pgwire::session` and reaches the executor as a call. Neither

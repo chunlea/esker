@@ -213,7 +213,9 @@ pub(crate) fn run(executor: &mut Executor, sql: &str) -> esker_sql::Result<Outco
     let mut last = Outcome::done("");
     for parsed in parse_statements(sql)? {
         last = match parsed.class() {
-            StatementClass::Begin => executor.begin().map(|()| Outcome::done("BEGIN"))?,
+            StatementClass::Begin => executor
+                .begin(parsed.begins_read_only())
+                .map(|()| Outcome::done("BEGIN"))?,
             StatementClass::Commit => executor.commit().map(|()| Outcome::done("COMMIT"))?,
             StatementClass::Rollback => executor.rollback().map(|()| Outcome::done("ROLLBACK"))?,
             _ => executor.execute(&parsed, &Params::NONE)?,

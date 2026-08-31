@@ -269,13 +269,20 @@ impl Window {
     /// The window `retention_ms` gives, as of `now`.
     #[must_use]
     pub fn new(now: u64, retention_ms: u64) -> Self {
+        // Subtracted in **milliseconds**, then shifted — not shifted and subtracted from `now`.
+        // The difference is the logical bits, and it is an off-by-one that refuses a read the
+        // window should admit: a request built from an instant has its logical bits zeroed by
+        // design, so a floor carrying `now`'s logical counter sits strictly above the first
+        // timestamp of its own millisecond. Exactly one retention back was then refused, with a
+        // message naming a range whose lower end rendered as the very instant it had just
+        // rejected. Both ends are millisecond-aligned now, which is also the resolution the
+        // message can express.
+        //
         // `RETENTION_FOREVER` is a sentinel and not a duration: subtracting it underflows, and the
         // rule it stands for is "collect nothing", which is a window with no floor. So is any
-        // retention too long to express as a timestamp distance — the shift would drop its high
-        // bits and name a floor far *nearer* than the user asked for, which would refuse reads a
-        // longer retention was meant to allow.
+        // retention too long to express as a distance.
         let floor = (retention_ms <= (u64::MAX >> TSO_LOGICAL_BITS))
-            .then(|| now.saturating_sub(retention_ms << TSO_LOGICAL_BITS));
+            .then(|| ts_at_ms(physical_ms(now).saturating_sub(retention_ms)));
         Window { now, floor }
     }
 
@@ -316,8 +323,9 @@ mod tests {
     /// One millisecond, as a timestamp distance.
     const MS: u64 = 1 << TSO_LOGICAL_BITS;
 
-    /// A plausible present: 2026-08-30 14:00:00+00 in Unix milliseconds.
-    const NOW_MS: u64 = 1_787_493_600_000;
+    /// A plausible present: 2026-08-30 14:00:00+00 in Unix milliseconds, and the same instant
+    /// [`crate::backend::MemoryBackend`]'s clock starts at.
+    const NOW_MS: u64 = 1_788_098_400_000;
 
     #[test]
     fn an_interval_is_a_distance_back_from_now() {
@@ -381,6 +389,13 @@ mod tests {
         );
     }
 
+    /// The constant means the date its comment claims. Asserted rather than trusted: the first
+    /// version was a week out, and the only symptom was a parity case that looked like a bug.
+    #[test]
+    fn the_fake_clock_starts_at_the_instant_its_comment_names() {
+        assert_eq!(render(ts_at_ms(NOW_MS)), "2026-08-30 14:00:00+00");
+    }
+
     #[test]
     fn a_token_round_trips() {
         let ts = ts_at_ms(1_756_000_000_000);
@@ -434,6 +449,25 @@ mod tests {
         assert!(window.admits(now - 3_600_000 * MS).is_ok());
         assert!(window.admits(now - 3_600_001 * MS).is_err());
         assert!(window.admits(now + MS).is_err());
+    }
+
+    /// **Exactly one retention back is inside the window**, even when `now` carries logical bits.
+    ///
+    /// The floor is subtracted in milliseconds and then shifted, so both ends are the first
+    /// timestamp of their millisecond — the same alignment `resolve` gives a request built from an
+    /// instant. Shifting the retention and subtracting it from `now` instead left the floor a few
+    /// logical ticks high, and `SET esker.read_as_of = '-1h'` under an hour of retention was
+    /// refused with a message whose lower bound rendered as the instant it had just rejected.
+    #[test]
+    fn one_retention_back_is_admitted_even_when_now_has_logical_bits() {
+        let now = ts_at_ms(NOW_MS) + 7;
+        let window = Window::new(now, 3_600_000);
+        let asked = resolve("-1h", now).unwrap();
+        assert!(
+            window.admits(asked).is_ok(),
+            "the floor is {:?} and the request is {asked}",
+            window.floor
+        );
     }
 
     /// `RETENTION_FOREVER` is a sentinel, not a duration. Subtracting it underflows, and the rule

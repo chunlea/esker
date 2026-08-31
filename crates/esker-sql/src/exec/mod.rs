@@ -73,6 +73,11 @@ pub struct Executor {
     /// PostgreSQL's rule and exactly the right one: a `start_ts` cannot change under a transaction
     /// that has already read at it.
     open_used: bool,
+    /// `BEGIN READ ONLY`: every write in this block is `25006`, as PostgreSQL does it.
+    ///
+    /// Separate from the transaction's own read-only-ness, which comes from reading the past: a
+    /// block may be read-only because the user asked, because the snapshot is historical, or both.
+    block_read_only: bool,
 }
 
 /// What a session was told to read at, and what it was told in.
@@ -106,6 +111,7 @@ impl Executor {
             catalog_written: false,
             read_as_of: None,
             open_used: false,
+            block_read_only: false,
         }
     }
 
@@ -173,7 +179,7 @@ impl Executor {
         // A write at a past snapshot is refused *here*, before anything is planned. It cannot be
         // caught later: `Txn::put` is buffered and returns nothing, so a write in a read-only
         // transaction would be dropped in silence and the statement would report success.
-        if txn.is_read_only()
+        if (txn.is_read_only() || self.block_read_only)
             && let Some(command) = statement.write_command()
         {
             return Err(SqlError::ReadOnlyTransaction(command));
@@ -409,6 +415,7 @@ impl Executor {
     /// transaction.
     fn end_of_block(&mut self) {
         self.open_used = false;
+        self.block_read_only = false;
         if self.read_as_of.as_ref().is_some_and(|as_of| as_of.local) {
             self.read_as_of = None;
         }
@@ -762,9 +769,10 @@ impl Execute for Executor {
         std::mem::take(&mut self.notices)
     }
 
-    fn begin(&mut self) -> Result<()> {
+    fn begin(&mut self, read_only: bool) -> Result<()> {
         // A second `BEGIN` never reaches here: the session answers it with PostgreSQL's warning
         // and leaves the block alone.
+        self.block_read_only = read_only;
         self.open = Some(self.open_txn()?);
         self.open_used = false;
         self.written = Written::default();

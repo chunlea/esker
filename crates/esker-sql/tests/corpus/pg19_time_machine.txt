@@ -1,0 +1,44 @@
+# What a real PostgreSQL 19beta1 does with the time machine's surface -- contract C3's gate for
+# the half of this feature that PostgreSQL *has* (docs/plans/phase-6d.md §2).
+#
+# Nothing here was written from the documentation. Every line was produced by running the script
+# against a PostgreSQL 19beta1 in the `esker-pg19` container with `\set VERBOSITY verbose`, and
+# recording either `ok` or the SQLSTATE and message it refused with.
+#
+#   script <tab> ok                the last statement succeeded
+#   script <tab> !SQLSTATE msg     PostgreSQL refused it
+#
+# A script is `;`-separated and the answer is the **last** statement's; everything before it is
+# setup, because half of these conditions only exist inside a transaction block. `#` starts a
+# comment and a blank line is ignored.
+#
+# The other half of this feature has no oracle at all: PostgreSQL 19 has no time travel, so what a
+# read at a past snapshot *returns* cannot be checked against it. `tests/time_machine.rs` and
+# `tests/slt/time_machine.slt` cover that half against this node, with CockroachDB's
+# `AS OF SYSTEM TIME` as the semantic reference (docs/adr/0021-time-machine.md).
+
+SET esker.read_as_of = '-1h'	ok
+SET esker.read_as_of TO '-30m'	ok
+BEGIN; SET LOCAL esker.read_as_of = '-30m'	ok
+SET esker.read_as_of = DEFAULT	ok
+SET esker.read_as_of = '-1h'; SHOW esker.read_as_of	ok
+SET esker.read_as_of = '-1h'; RESET esker.read_as_of; SHOW esker.read_as_of	ok
+SHOW esker.never_set_here	!42704 unrecognized configuration parameter "esker.never_set_here"
+RESET esker.read_as_of	ok
+SET nonamespace_thing = '1'	!42704 unrecognized configuration parameter "nonamespace_thing"
+SET TRANSACTION SNAPSHOT 'nope'	!0A000 a snapshot-importing transaction must have isolation level SERIALIZABLE or REPEATABLE READ
+BEGIN ISOLATION LEVEL REPEATABLE READ; SET TRANSACTION SNAPSHOT 'nope'	!22023 invalid snapshot identifier: "nope"
+BEGIN ISOLATION LEVEL REPEATABLE READ; SET TRANSACTION SNAPSHOT '00000003-0000001B-1'	!42704 snapshot "00000003-0000001B-1" does not exist
+BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1; SET TRANSACTION SNAPSHOT 'nope'	!25001 SET TRANSACTION SNAPSHOT must be called before any query
+BEGIN; SET TRANSACTION SNAPSHOT 'nope'	!0A000 a snapshot-importing transaction must have isolation level SERIALIZABLE or REPEATABLE READ
+BEGIN READ ONLY; INSERT INTO ro_probe VALUES (1)	!25006 cannot execute INSERT in a read-only transaction
+BEGIN READ ONLY; UPDATE ro_probe SET a = 1	!25006 cannot execute UPDATE in a read-only transaction
+BEGIN READ ONLY; DELETE FROM ro_probe	!25006 cannot execute DELETE in a read-only transaction
+BEGIN READ ONLY; CREATE TABLE ro_new (a int8)	!25006 cannot execute CREATE TABLE in a read-only transaction
+CHECKPOINT nightly	!42601 syntax error at or near "nightly"
+SELECT * FROM ro_probe AS OF SYSTEM TIME '-1h'	!42601 syntax error at or near "SYSTEM"
+SELECT * FROM ro_probe FOR SYSTEM_TIME AS OF '2026-08-30 14:00:00+00'	!42601 syntax error at or near "SYSTEM_TIME"
+SELECT * FROM ro_probe AS OF CHECKPOINT 'nightly'	!42601 syntax error at or near "CHECKPOINT"
+ALTER TABLE ro_probe SET (retention = '7d')	!22023 unrecognized parameter "retention"
+SELECT esker_checkpoint('nightly')	!42883 function esker_checkpoint(unknown) does not exist
+SELECT * FROM esker_diff('ro_probe', 'a')	!42883 function esker_diff(unknown, unknown) does not exist

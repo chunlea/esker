@@ -148,9 +148,13 @@ impl Default for Versions {
 
 /// Where a [`MemoryBackend`]'s clock starts: 2026-08-30 14:00:00 UTC, in Unix milliseconds.
 ///
+/// Checked against the value rather than asserted in a comment: `a_plausible_instant` below is
+/// the test, because a constant whose comment says one date and whose bits say another is a
+/// trap for whoever reads the next failing assertion.
+///
 /// Any plausible instant would do. What matters is that it is not zero, so that the physical half
 /// of every timestamp the fake hands out is a real date a test can write down.
-const FAKE_START_MS: u64 = 1_787_493_600_000;
+const FAKE_START_MS: u64 = 1_788_098_400_000;
 
 impl Versions {
     /// The value visible at `ts`: the newest version committed at or before it.

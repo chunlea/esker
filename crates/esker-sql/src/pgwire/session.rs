@@ -138,7 +138,10 @@ pub trait Execute {
     }
 
     /// Opens a transaction.
-    fn begin(&mut self) -> Result<()> {
+    /// Opens an explicit transaction block. `read_only` is `BEGIN READ ONLY`, which refuses every
+    /// write in the block with `25006` exactly as PostgreSQL does.
+    fn begin(&mut self, read_only: bool) -> Result<()> {
+        let _ = read_only;
         Ok(())
     }
 
@@ -243,7 +246,7 @@ impl Session {
         }
 
         let outcome = match class {
-            StatementClass::Begin => self.begin(executor, out),
+            StatementClass::Begin => self.begin(parsed, executor, out),
             StatementClass::Commit => self.commit(executor, out),
             StatementClass::Rollback => self.rollback(executor, out),
             // A simple query carries no parameters: the protocol has no way to send one, which
@@ -280,7 +283,12 @@ impl Session {
 
     /// `BEGIN`. Inside a transaction it is a warning that changes nothing, which is PostgreSQL's
     /// own answer and not a leniency of ours.
-    fn begin(&mut self, executor: &mut dyn Execute, out: &mut Vec<u8>) -> Result<Outcome> {
+    fn begin(
+        &mut self,
+        parsed: &Parsed,
+        executor: &mut dyn Execute,
+        out: &mut Vec<u8>,
+    ) -> Result<Outcome> {
         if self.status == TransactionStatus::InTransaction {
             // A warning, and then the command completes anyway with its own tag. Returning this
             // as an error instead would send the notice and no `CommandComplete`, and a client
@@ -288,7 +296,7 @@ impl Session {
             warn(&SqlError::ActiveTransaction, out);
             return Ok(Outcome::done("BEGIN"));
         }
-        executor.begin()?;
+        executor.begin(parsed.begins_read_only())?;
         self.status = TransactionStatus::InTransaction;
         Ok(Outcome::done("BEGIN"))
     }
@@ -496,7 +504,7 @@ impl Session {
         }
 
         let outcome = match parsed.class() {
-            StatementClass::Begin => self.begin(executor, out),
+            StatementClass::Begin => self.begin(&parsed, executor, out),
             StatementClass::Commit => self.commit(executor, out),
             StatementClass::Rollback => self.rollback(executor, out),
             _ => executor.execute(
@@ -690,8 +698,9 @@ mod tests {
             })
         }
 
-        fn begin(&mut self) -> Result<()> {
-            self.calls.push("begin".to_owned());
+        fn begin(&mut self, read_only: bool) -> Result<()> {
+            self.calls
+                .push(if read_only { "begin ro" } else { "begin" }.to_owned());
             Ok(())
         }
 
