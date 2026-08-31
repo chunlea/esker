@@ -1,0 +1,56 @@
+crates/esker-s3/src/http.rs
+  s_dc640bf0df4adb::t_ebf2a446fe9231 319-653
+  s_dc640bf0df4adb::t_7421a28a94d209 316-318
+  s_dc640bf0df4adb::t_ea0ee5e8852afa 654-656
+  s_dc640bf0df4adb::t_154a37dba1501f 1-315,657-729
+crates/esker-s3/src/transport.rs
+  s_dc640bf0df4adb::t_ebf2a446fe9231 87-89
+  s_dc640bf0df4adb::t_a904d390566a13 84-86
+  s_dc640bf0df4adb::t_203644c0cf3639 90-92
+  s_dc640bf0df4adb::t_ec2cd22098bf36 1-83,93-127
+crates/esker-s3/src/client.rs
+  s_dc640bf0df4adb::t_ebf2a446fe9231 64-828,830,843,850,854,857
+  s_dc640bf0df4adb::t_a4fc96ef29c0ce 61-63
+  s_dc640bf0df4adb::t_a88f86d4de13df 829
+  s_dc640bf0df4adb::t_6831d87fad71ad 831-833,840-842
+  s_dc640bf0df4adb::t_114e1e47c4d5b2 844-849
+  s_dc640bf0df4adb::t_07333858ae2800 851-853
+  s_dc640bf0df4adb::t_787ee1dfcfe184 855-856
+  s_dc640bf0df4adb::t_76bacbe665dd5c 858-860
+  s_dc640bf0df4adb::t_75f0f3c0ab7c24 1-60,834-839
+crates/esker-s3/src/sigv4.rs
+  s_dc640bf0df4adb::t_ebf2a446fe9231 1-624
+  s_dc640bf0df4adb::t_f3999ae506a998 625-627
+Cargo.lock
+  s_dc640bf0df4adb::t_d615985988f4d7 343,417-426,445,447-448,452
+Cargo.toml
+  s_dc640bf0df4adb::t_3765145c70b355 47
+crates/esker-s3/Cargo.toml
+  s_dc640bf0df4adb::t_51b04f5fe0fec7 1-25
+crates/esker-s3/src/error.rs
+  s_dc640bf0df4adb::t_830fbaf783c3de 1-107
+crates/esker-s3/src/lib.rs
+  s_dc640bf0df4adb::t_6a932297a13f89 1-116
+crates/esker-s3/src/memory.rs
+  s_dc640bf0df4adb::t_4c9521e8b736e0 1-269
+crates/esker-s3/src/xml.rs
+  s_dc640bf0df4adb::t_13c5d3cbe49784 1-178
+crates/esker-s3/tests/minio.rs
+  s_dc640bf0df4adb::t_8e937a8d2d64f2 1-189
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a12166d5cc04259bf319cda45ffe57d0e17098ff",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "claude-fable-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
