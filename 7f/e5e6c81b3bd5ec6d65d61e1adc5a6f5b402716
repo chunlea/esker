@@ -1,0 +1,26 @@
+crates/esker-columnar/src/error.rs
+  h_44076b318daf9c 59-79,102-118
+crates/esker-columnar/src/fragment/codec.rs
+  h_44076b318daf9c 1-447
+crates/esker-columnar/src/fragment/expr.rs
+  h_44076b318daf9c 1-442
+crates/esker-columnar/src/fragment/mod.rs
+  h_44076b318daf9c 1-568
+crates/esker-columnar/src/lib.rs
+  h_44076b318daf9c 55,67
+crates/esker-columnar/src/value.rs
+  h_44076b318daf9c 162-194,222-264
+crates/esker-columnar/tests/fragment_golden.rs
+  h_44076b318daf9c 1-394
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "7fe5e6c81b3bd5ec6d65d61e1adc5a6f5b402716",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
