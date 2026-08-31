@@ -44,6 +44,7 @@ esker-keys = { path = "crates/esker-keys", version = "0.1.0" }
 esker-pd = { path = "crates/esker-pd", version = "0.1.0" }
 esker-proto = { path = "crates/esker-proto", version = "0.1.0" }
 esker-raft = { path = "crates/esker-raft", version = "0.1.0" }
+esker-s3 = { path = "crates/esker-s3", version = "0.1.0" }
 esker-sim = { path = "crates/esker-sim", version = "0.1.0" }
 esker-sql = { path = "crates/esker-sql", version = "0.1.0" }
 esker-store = { path = "crates/esker-store", version = "0.1.0" }

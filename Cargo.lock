@@ -340,6 +340,7 @@ dependencies = [
  "esker-base",
  "esker-client",
  "esker-engine",
+ "esker-pd",
  "esker-proto",
  "esker-raft",
  "esker-sim",
@@ -414,6 +415,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "esker-s3"
+version = "0.1.0"
+dependencies = [
+ "esker-base",
+ "proptest",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "esker-sim"
 version = "0.1.0"
 dependencies = [
@@ -431,10 +442,14 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "esker-base",
+ "esker-client",
  "esker-keys",
+ "esker-proto",
+ "esker-store",
  "proptest",
  "sqllogictest",
  "sqlparser",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

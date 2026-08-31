@@ -1,0 +1,25 @@
+[package]
+name = "esker-s3"
+description = "A minimal S3 client: SigV4 over an in-house HTTP/1.1, for SST tiering."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+# SHA-256 and HMAC for SigV4, and the PCG32 the retry jitter draws from. Nothing else:
+# this crate deliberately costs zero against the runtime budget in deny.toml (ADR 0025).
+esker-base.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# The response parser is fed bytes we did not write, so it gets a property test that throws
+# arbitrary ones at it (CLAUDE.md invariant 9). Dev-only, so the pure-Rust rule does not reach
+# it and it costs nothing against the runtime budget.
+proptest.workspace = true
+
+[lints]
+workspace = true
