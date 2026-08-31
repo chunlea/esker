@@ -1,6 +1,6 @@
 # Phase 4 plan — many regions, and the driver that places them
 
-Status: **in progress** — 4a–4c accepted, 4d open, 4e gated. Written before implementation; §9 records progress
+Status: **4a–4d accepted; 4e deferred past v1** (§15). Written before implementation; §9 records progress
 and §10 what changed. Spec: `prompts/04-multiraft-pd.md`. Constitution: `CLAUDE.md` (invariant 5 is
 this phase's whole subject). Design: `docs/DESIGN.md` §2, §6, §7, §9, §14.
 
@@ -47,7 +47,7 @@ wire. So:
 | 4b | Split: size check, split key, the `Split` admin entry through Raft, epoch bumps | **done** (§12) |
 | 4c | Snapshot transfer and peer movement: the region streamed, `AddPeer`/`RemovePeer` | **done** (§13) |
 | 4d | Balance: leader and region-count operators, `esker-cli region ls/split/transfer-leader` | now (§14) |
-| 4e | PD high availability: three PDs replicated with `esker-raft`, TSO high-water mark through Raft | after 4d |
+| 4e | PD high availability: three PDs replicated with `esker-raft`, TSO high-water mark through Raft | **deferred** (§15) |
 
 ## 2. File list (4a, store lane)
 
@@ -211,7 +211,8 @@ Two more the prompt does not name but 4a can lose on its own:
 - **Snapshot bytes.** `engine.checkpoint(range)` and the `Stream` frames stay `TODO(phase-4c)`.
 - **Membership operators.** `AddPeer`/`RemovePeer` exist in the Raft core and have no driver here.
 - **Balance, `esker-cli region`.** 4d.
-- **PD HA.** One PD with durable state, as `docs/DESIGN.md` §7 permits until 4e.
+- **PD HA.** One PD with durable state, as `docs/DESIGN.md` §7 permits — and, from the 4d gate on,
+  past v1 as well (§15).
 - **Sharded apply.** One apply worker per store, as §6 of the design says.
 
 ## 9. Progress
@@ -820,3 +821,69 @@ make it recover. Out of 4d's grant, which is read-only in the core.
   rather than a fake driver.
 * **`region ls` walks the key space one `GetRegion` at a time.** Correct and O(regions) round trips;
   a `ScanRegions` on the Pd service would make it one. Not this lane's to add.
+
+
+---
+
+## 15. 4e — PD high availability, deferred past v1
+
+**Ruling at the 4d gate: phase 4 ships the single durable PD.** This is the escape hatch
+`prompts/04-multiraft-pd.md` writes into 4e itself — *"if time is short, ship 4a–4d with single PD
+and record this as the next milestone; never ship TSO without the persisted high-water mark"* —
+taken deliberately, with the milestone recorded here rather than left as an unwritten intention.
+
+The condition attached to the hatch is met. The oracle has persisted its high-water mark since 4a:
+the mark is fsynced 3 s ahead of what is handed out, every timestamp given away has
+`physical < mark`, and a restart resumes at `max(clock, mark)` — so a PD that dies and comes back,
+even on a machine whose clock has gone backwards, cannot repeat a timestamp
+([ADR 0010](../adr/0010-pd-durable-state.md), `crates/esker-pd/tests/crash_kill.rs`). That is the
+part 4e could not have been allowed to substitute for, and it is done.
+
+### What deferring costs
+
+While PD is down, a cluster keeps serving. Stores hold their own regions, their own Raft logs and
+their own membership on disk (§6), and a client's region cache is a hint the store checks against
+its epoch — so a stale cache costs a redirect, never a wrong answer (`CLAUDE.md` invariant 5).
+What stops is everything that needs PD to *decide*:
+
+| Down | Effect |
+|---|---|
+| `Tso` | no new transaction can start or commit — phase 5's hard stop |
+| `AllocId` | no split, no new peer: the cluster cannot grow or repair |
+| `Bootstrap` | a new store cannot join |
+| `GetRegion` | a client with a cold cache cannot route; a warm one carries on |
+| heartbeats | repair and balance stop being scheduled; existing operators are forgotten |
+
+Reads and writes through a warm client against a healthy cluster are unaffected. The exposure is
+therefore *availability of change*, not availability of data — which is what makes it a milestone
+rather than a blocker.
+
+### What 4e would add
+
+Nothing that changes the rules above it — only where their state lives:
+
+1. **Three PDs, replicated with `esker-raft`.** The cluster record, the store and region records,
+   the range index and the allocator become entries in a Raft log rather than writes to one
+   engine, with the same records and the same key space (ADR 0010) behind it.
+2. **The oracle's mark through the log.** The rule is unchanged — persist ahead, fsync before the
+   timestamp leaves, resume at `max(clock, mark)` — and only the meaning of "persisted" moves,
+   from one fsync to a committed entry. `Oracle` and `Allocator` take a persist *callback* for
+   exactly this reason: the *what* can change without the *when* moving.
+3. **Leader election for PD, and discovery for clients.** A `PdChannel` that follows a redirect to
+   the current leader, which is the same shape as `NotLeader` on the KV path.
+4. **Nothing for the scheduler.** The in-flight set is already memory that a restart re-derives
+   from heartbeats, and the repair and balance rules are already pure functions of the routing
+   table and store liveness ([ADR 0013](../adr/0013-repair-operators-are-requests-not-commands.md),
+   [ADR 0018](../adr/0018-balance-moves-the-spread-by-two.md)). A PD that loses leadership is, to
+   the scheduler, a PD that restarted — a case that is already tested.
+
+That last point is why deferring is cheap: the parts of PD that would have been hardest to make
+highly available are the ones deliberately built with no durable state of their own.
+
+### The one thing to check first, when 4e opens
+
+Every timestamp handed out must still have `physical < mark` when the mark is a committed Raft
+entry rather than a completed fsync — which means the mark's commit must be observed, not merely
+proposed, before a timestamp above the old mark leaves. `crates/esker-pd/tests/crash_kill.rs` is
+the test to point at the new implementation, and its own limit still applies: a `SIGKILL` proves
+the ordering and the restart rule, not the durability of the write underneath.

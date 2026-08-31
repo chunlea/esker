@@ -417,8 +417,13 @@ Regions cover the whole key space contiguously; the first region is `["", "")`.
 ## 7. Placement driver (`esker-pd`)
 
 Single binary, state kept in its own `esker-engine` instance (default column family only); made highly
-available by running three PDs replicated with `esker-raft` (*sub-phase 4e — until then, one PD with
-durable state is what 4a ships, and it is a single point of failure by design rather than by oversight*).
+available by running three PDs replicated with `esker-raft` — **deferred past v1 as a recorded
+milestone** (`docs/plans/phase-4.md` §15): phase 4 ships the single durable PD, which is a single
+point of failure by decision rather than by oversight, and which satisfies the one rule
+`prompts/04-multiraft-pd.md` refuses to bend — *never ship TSO without the persisted high-water
+mark*, which §7's oracle has had since 4a. What HA would add is replication of the state below,
+not a change to it: the routing table, the allocator and the mark move from one engine into a Raft
+log, PD elects a leader, and clients discover it.
 
 - **State (*fixed*, version 1).** PD's own key space, under the `'m'` metadata prefix of §3, with ids
   big-endian so a scan runs in id order:
