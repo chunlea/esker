@@ -161,6 +161,48 @@ Tested: `esker-engine/tests/tier_claim.rs` (11, `MemoryStore`), the format's own
 `esker-cli/tests/tier_acceptance.rs` unchanged and green — three store processes on derived
 `node-N` prefixes, losing a disk and rebuilding from the bucket, which is requirement (d).
 
+## 5. A third bug, found by looking at the harness rather than at the code
+
+Killing the leftovers from the early repro runs turned up two `balance` processes still alive an
+hour after their harness had given up on them. A test that **hangs** is worse than one that
+flakes — CI loses a slot until the job timeout, and the run says nothing about why — so they were
+worth a stack before they were worth a `kill -9`. `sample(1)` gave one:
+
+```text
+Thread raft-driver-0:   driver::run -> mpsc::Receiver::blocking_recv -> park
+Thread tokio-rt-worker: task::cancel_task -> drop Arc<RaftPeer>
+                        -> Arc<DriverPool>::drop_slow -> DriverPool::shutdown
+                        -> std::thread::JoinHandle::join
+```
+
+`DriverPool::shutdown` offers each worker a `Job::Stop` with `try_send`, which fails on a full
+queue. The failure was swallowed — *"a full queue on shutdown must not deadlock the caller: the
+worker is going away either way, and a closed channel ends its loop just as well"* — but **the
+channel does not close.** The senders live in the `DriverPool` that is being dropped, and a
+struct's fields are not dropped until its `Drop::drop` returns. So the worker parked in
+`blocking_recv` for ever and `shutdown` blocked in `join` behind it.
+
+`raft-driver-1` had exited on its `Stop`; `raft-driver-0` never got one — asymmetric because the
+full queue was the busier worker's. Two workers, twelve regions, a 5 ms tick and a tenfold
+oversubscribed box is how a 4096-deep queue gets full.
+
+This is a **production** hang and not only a test one: dropping a `Store` takes exactly this
+path, so a store on a loaded machine could fail to shut down at all.
+
+Fixed with a flag the workers read on every wake, set before the `Stop`s go out. That makes the
+cases exhaustive without a lock on the send path: either the queue had room and the `Stop`
+landed, or it was full — and a full queue means a job is pending, means the worker wakes, and the
+first thing it now does on waking is read the flag.
+
+The test drives `run` directly, because "a job was in the queue ahead of the `Stop`" is one job
+in a channel of one — deterministic, where filling 4096 slots against a draining worker is a
+race. It asserts on *termination* from a thread with a deadline, since without the fix it hangs
+rather than fails, and a hanging test tells CI nothing.
+
+**What this says about the earlier numbers.** The hung processes were burning cores throughout
+§1 and §2, so every measurement in this file was taken under *more* load than it claims, not
+less. The 0/20 runs were re-run on a clean machine afterwards and are the numbers reported.
+
 ## What this lane did not do
 
 * **The simultaneous-claim race** is narrowed to two round trips by a read-back, not closed.
