@@ -15,7 +15,31 @@
 //! UTF-8 and is validated on the way out of a decoder. That check is not decoration — a `String`
 //! built from unchecked bytes is how a corrupt file turns into undefined behaviour further up.
 
+use std::cmp::Ordering;
+
 use crate::error::{Error, Result};
+
+/// The order this system puts two doubles in, which is **not** IEEE's.
+///
+/// PostgreSQL's `float8` ordering, mirrored from `esker_sql::value::Datum::pg_cmp` and confirmed
+/// there against a real server: **`NaN` is greater than every other value, `Infinity` included,
+/// and equal to itself**, and `-0.0` equals `0.0`. It is the ordering `WHERE x > 5` uses, so a
+/// `NaN` row really does match that predicate — which is exactly why statistics computed under
+/// IEEE's rules cannot be pruned with here.
+///
+/// Kept as a function of its own rather than inlined, because it is the *specification* two
+/// independent implementations have to share: the evaluator compares with it and the differential
+/// harness's reference interpreter does too.
+#[must_use]
+pub fn pg_cmp_f64(left: f64, right: f64) -> Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        // Neither is NaN, so the comparison is total; `-0.0 == 0.0` falls out of IEEE equality.
+        (false, false) => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
+    }
+}
 
 /// One of the six types a row carries (`esker_sql::value::ColumnType`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

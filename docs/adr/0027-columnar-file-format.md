@@ -131,11 +131,23 @@ read the chunk, which is not a pruner.
 
 Two rules are not the obvious ones, and both are what Parquet learned the hard way:
 
-* **`NaN` is not in the range.** It is excluded from both bounds, and a chunk of nothing but `NaN`
-  has no bounds. A `NaN` in a comparison produces a bound that fails every test, and a pruner
-  would then skip a stripe that contains matching rows — a missing row, which is the worst failure
-  mode this feature has (ADR 0022 says so about the two engines disagreeing, and it is just as
-  true within one).
+* **`NaN` is the largest value.** *(Amended 2026-08-31, during milestone 2 — the rule first
+  recorded here was Parquet's, and it was the wrong one for this system.)* Parquet excludes `NaN`
+  from both bounds, and Parquet is right under IEEE semantics: every comparison with `NaN` is
+  false, so a `NaN` row can never match a range predicate and leaving it out of the bounds costs
+  nothing.
+
+  This system does not have IEEE semantics. `esker_sql::value::Datum::pg_cmp` implements
+  PostgreSQL's `float8` ordering — measured against a real server — in which **`NaN` is greater
+  than every other value, `Infinity` included, and equal to itself**. `WHERE x > 5` therefore
+  matches a `NaN` row. Under the excluded rule a chunk holding `[1.0, NaN]` records a maximum of
+  `1.0`, a pruner skips it for that predicate, and the row disappears with no error anywhere — a
+  missing row, which is the worst failure mode this feature has (ADR 0022 says so about the two
+  engines disagreeing, and it is just as true within one).
+
+  The rule, stated so it cannot be got wrong again: **bounds are computed in the ordering the
+  query engine uses.** Importing a bound rule from a format with a different comparison is
+  importing an answer to a different question.
 * **Zero is signed and comparison is not.** A minimum of `0.0` is stored as `-0.0` and a maximum of
   `0.0` as `+0.0`, so the bound holds whether the reader compares numerically or bitwise.
 

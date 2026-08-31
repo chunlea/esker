@@ -30,7 +30,7 @@ use crate::column::{Column, ColumnData};
 use crate::cursor::Cursor;
 use crate::error::{Error, Result};
 use crate::format::MAX_BOUND_LEN;
-use crate::value::ColumnType;
+use crate::value::{ColumnType, pg_cmp_f64};
 
 /// Bit 0 of `flags`: a minimum is present.
 const FLAG_HAS_MIN: u8 = 1 << 0;
@@ -161,9 +161,13 @@ impl ColumnStats {
     ///
     /// Two floating-point rules are not the obvious ones, and both are what a pruner needs:
     ///
-    /// * **`NaN` is excluded from the range.** It compares false against everything, so including
-    ///   it would produce a bound that fails every test and a pruner would skip a stripe holding
-    ///   matching rows. A chunk of nothing but `NaN` therefore has no bounds at all.
+    /// * **`NaN` is the largest value, not an excluded one.** Parquet excludes it, and Parquet is
+    ///   right for IEEE semantics, where every comparison with `NaN` is false and a `NaN` row can
+    ///   never match a range predicate. This system uses [`pg_cmp_f64`], PostgreSQL's ordering,
+    ///   where `NaN` sorts above `Infinity` and `WHERE x > 5` genuinely matches it — so a chunk
+    ///   of `[1.0, NaN]` whose maximum was `1.0` would be pruned out of a query it belongs to,
+    ///   and the row would vanish with no error anywhere. **Bounds are computed in the ordering
+    ///   the query engine uses**, which is the only rule that makes them safe to prune with.
     /// * **Zero is signed and comparison is not.** A minimum of `0.0` is written as `-0.0` and a
     ///   maximum of `0.0` as `+0.0`, so the bound holds whether a reader compares numerically or
     ///   bitwise.
@@ -328,27 +332,27 @@ impl ColumnStats {
 }
 
 /// The minimum and maximum of a run of doubles, under the two rules [`ColumnStats::of`] documents.
+///
+/// Everything here is decided by [`pg_cmp_f64`] rather than by `<`, which is the whole correction:
+/// a fold with `partial_cmp` silently drops `NaN`, and dropping it is what made these bounds
+/// unsound to prune with.
 fn double_bounds(values: &[f64]) -> (Option<Bound>, Option<Bound>) {
-    let mut low = f64::INFINITY;
-    let mut high = f64::NEG_INFINITY;
-    let mut seen = false;
+    let mut low: Option<f64> = None;
+    let mut high: Option<f64> = None;
     for value in values {
-        if value.is_nan() {
-            continue;
+        if low.is_none_or(|current| pg_cmp_f64(*value, current).is_lt()) {
+            low = Some(*value);
         }
-        seen = true;
-        if *value < low {
-            low = *value;
-        }
-        if *value > high {
-            high = *value;
+        if high.is_none_or(|current| pg_cmp_f64(*value, current).is_gt()) {
+            high = Some(*value);
         }
     }
-    if !seen {
+    let (Some(mut low), Some(mut high)) = (low, high) else {
         return (None, None);
-    }
-    // `-0.0 == 0.0`, so the comparisons above may have kept either; widen to the side that holds
-    // under a bitwise reading too.
+    };
+
+    // `-0.0 == 0.0` under this ordering, so the fold may have kept either. Widen each bound to
+    // the side that also holds if somebody compares the stored bytes rather than the values.
     if low == 0.0 {
         low = -0.0;
     }
@@ -369,7 +373,7 @@ mod tests {
     use crate::column::Column;
     use crate::cursor::Cursor;
     use crate::format::MAX_BOUND_LEN;
-    use crate::value::{ColumnType, Value};
+    use crate::value::{ColumnType, Value, pg_cmp_f64};
 
     fn round_trip(stats: &ColumnStats) -> ColumnStats {
         let mut bytes = Vec::new();
@@ -525,9 +529,13 @@ mod tests {
         assert_eq!(both.null_count, 1);
     }
 
-    /// The rule a pruner depends on: a `NaN` never narrows the range.
+    /// The rule a pruner depends on, and the one M1 got wrong: `NaN` is the top of the range.
+    ///
+    /// Parquet excludes it, which is right where every comparison with `NaN` is false. Here
+    /// `WHERE x > 5` matches a `NaN` row, so a maximum that excluded it would prune away a stripe
+    /// the query wants and lose the row silently. See [`crate::value::pg_cmp_f64`].
     #[test]
-    fn nan_is_not_in_the_range() {
+    fn nan_is_the_largest_value() {
         let stats = stats_of(
             ColumnType::Double,
             &[
@@ -538,15 +546,30 @@ mod tests {
             ],
         );
         assert_eq!(stats.min.as_ref().unwrap().as_f64(), Some(-1.0));
-        assert_eq!(stats.max.as_ref().unwrap().as_f64(), Some(3.0));
-
-        let only_nan = stats_of(ColumnType::Double, &vec![Value::Double(f64::NAN); 5]);
         assert!(
-            only_nan.min.is_none() && only_nan.max.is_none(),
-            "a chunk of NaN has no range"
+            stats.max.as_ref().unwrap().as_f64().unwrap().is_nan(),
+            "a chunk holding a NaN has NaN as its maximum"
         );
+
+        // The case that made this a bug rather than a preference: without it, `x > 5` prunes this
+        // stripe away and the NaN row it contains is lost with no error anywhere.
+        let hazard = stats_of(
+            ColumnType::Double,
+            &[Value::Double(1.0), Value::Double(f64::NAN)],
+        );
+        let max = hazard.max.as_ref().unwrap().as_f64().unwrap();
+        assert!(
+            pg_cmp_f64(max, 5.0).is_gt(),
+            "the maximum does not admit a row that matches x > 5"
+        );
+
+        // Nothing but NaN is still a range — of NaN, which is equal to itself.
+        let only_nan = stats_of(ColumnType::Double, &vec![Value::Double(f64::NAN); 5]);
+        assert!(only_nan.min.as_ref().unwrap().as_f64().unwrap().is_nan());
+        assert!(only_nan.max.as_ref().unwrap().as_f64().unwrap().is_nan());
         assert_eq!(only_nan.null_count, 0, "a NaN is not a NULL");
 
+        // And a chunk with no NaN is bounded by its ordinary extremes, infinities included.
         let infinities = stats_of(
             ColumnType::Double,
             &[
@@ -690,11 +713,12 @@ mod tests {
                     min.as_bool().is_some_and(|low| low <= *v)
                         && max.as_bool().is_some_and(|high| *v <= high)
                 }
-                // A NaN is outside every range by construction, which is the rule.
+                // Under this system's ordering a NaN is *inside* the range, at the top of it.
                 Value::Double(v) => {
-                    v.is_nan()
-                        || (min.as_f64().is_some_and(|low| low <= *v)
-                            && max.as_f64().is_some_and(|high| *v <= high))
+                    min.as_f64().is_some_and(|low| pg_cmp_f64(low, *v).is_le())
+                        && max
+                            .as_f64()
+                            .is_some_and(|high| pg_cmp_f64(*v, high).is_le())
                 }
                 Value::Text(v) => {
                     min.bytes.as_slice() <= v.as_bytes() && v.as_bytes() <= max.bytes.as_slice()
