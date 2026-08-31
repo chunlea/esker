@@ -472,10 +472,11 @@ its own gap register, and it would be longer.
 - [x] 4 — catalog: the `'m'`-space records with a golden, the per-transaction version check,
   and a cache that cannot serve a definition from a snapshot's future
 - [x] 5 — backend trait and fake (the executor's half of the unique-index composition is unit 6)
-- [ ] 6 — planner and executor: **6a and 6b done** — the lowering out of the parser's AST, the DDL
+- [ ] 6 — planner and executor: **6a, 6b and 6c done** — the lowering out of the parser's AST, the DDL
   executor over the catalog, `Execute` implemented and a real `psql` driving `CREATE`/`DROP`
   against it (6a); `INSERT` with its indexes and both halves of the unique-index ruling (6b);
-  `SELECT`, `UPDATE`, `DELETE`, bound parameters and the plan tree remain
+  the planner, the pull-based executor and `EXPLAIN` (6c); `UPDATE`, `DELETE` and bound parameters
+  remain
 - [ ] 7 — `.slt` harness
 
 ## 10a. Handoff — where a fresh lane picks up
@@ -733,6 +734,56 @@ One conversion is refused on purpose. A decimal literal in an `int8` column is `
 because `numeric` rounds half away from zero (`2.5` becomes `3`) and a `float8` rounds half to even
 (`2.5` becomes `2`), and there is no `numeric` here to be sure with. A silently wrong number is
 worse than a named gap.
+
+**Unit 6c.** `SELECT`: a rule-based planner, a pull-based executor and `EXPLAIN`. Diffing the whole
+surface against a real PostgreSQL 19 — every row, every value's text, every error — leaves exactly
+two differences, and both are already written down: the `text` collation (§6) and the `LINE n: ^`
+caret (unit 6a's note).
+
+The planner has three rules and `EXPLAIN` prints which one fired: a `WHERE` that pins the whole
+primary key is a point read, one that pins a unique index's whole key is a lookup, and one that
+bounds a single-column primary key narrows the scanned range. Everything else is a scan with a
+filter, which is always correct. Two things about the rules are load-bearing:
+
+- **Only conjunctions count.** A constant under an `OR` is not required by the query, and reading
+  only its range would silently lose the rows the other branch matches.
+- **`narrowing_a_range_never_loses_a_row`** checks every combination of bound against the rows a
+  plain scan returns, because a pushdown that is subtly too tight returns fewer rows and nothing
+  reports it.
+
+The executor is a pull pipeline, so `LIMIT 10` over a large table reads one chunk of keys and
+stops. Two nodes cannot be lazy and both say so: `Sort` drains its input by definition (its input's
+last row can be its output's first) and is bounded at a million rows with `53400` rather than an
+unbounded allocation, and the scan reads in chunks because `Txn::scan` returns a `Vec` and asking
+for a whole table would be a whole table in memory.
+
+The tests found three real defects that reading the code would not have:
+
+- **`Sort` was above `Project`**, so `ORDER BY` read positions out of the *projected* row and
+  ordered by nothing in particular. It belongs below, which also makes `SELECT n FROM t ORDER BY
+  id` work — ordinary SQL that a sort above the projection cannot express at all. An `ORDER BY`
+  naming an output alias is substituted first, which is the other half of what PostgreSQL allows.
+- **`CREATE INDEX` did not build the index.** An index that exists and is empty is worse than no
+  index: the planner picks it and it answers every lookup with no rows. It now backfills from the
+  table's rows in the same transaction, and a `UNIQUE` index built over rows that already violate
+  it fails with the `23505` an `INSERT` would have raised.
+- **Comparison is stricter than assignment**, and using one rule for both is a wrong answer rather
+  than a missing feature. PostgreSQL stores `42` in a `text` column happily — an assignment cast —
+  and answers `WHERE txt = 42` with `operator does not exist: text = integer`. With the assignment
+  rule, that error became a silent `false`.
+
+Three more parity details came off the server:
+
+- **`numeric` has no signed zero.** `-0.0` in a `double precision` column stores `0`, because the
+  literal is a `numeric` on the way in; `'-0'` — a quoted literal, read by `float8`'s own input
+  function — keeps the sign. Two paths, two answers, and only a capture would ever have shown it.
+- **A negative `LIMIT` and a negative `OFFSET` carry different codes**, `2201W` and `2201X`, so a
+  client is told which clause it got wrong.
+- **`LIMIT NULL` means no limit**, which is a rule and not an oversight.
+
+`EXPLAIN` output is deliberately not PostgreSQL-shaped: there is no cost model here, so there are
+no costs. What it does print is the access path and the filter, which is the part a user changes
+their schema over.
 
 **Unit 2a.** The goldens are recorded, not written. A proxy between `psql` 18.6 and the
 PostgreSQL 19beta1 container logged both directions of five real sessions, and

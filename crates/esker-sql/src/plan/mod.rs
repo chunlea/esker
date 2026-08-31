@@ -21,13 +21,15 @@
 mod ddl;
 mod dml;
 mod expr;
+mod query;
 
 pub use ddl::{
     Column, CreateIndex, CreateTable, DropIndex, DropTable, UniqueConstraint, index_name,
     primary_key_name, unique_constraint_name,
 };
 pub use dml::Insert;
-pub use expr::{Expr, Literal};
+pub use expr::{BinaryOp, Expr, Literal};
+pub use query::{Node, OrderItem, Select, SelectItem, SortKey};
 
 /// One statement, lowered.
 ///
@@ -50,6 +52,8 @@ pub enum Statement {
     DropIndex(DropIndex),
     /// `INSERT`.
     Insert(Insert),
+    /// `SELECT`.
+    Select(Select),
     /// `EXPLAIN`, and the statement it is about. The inner statement is planned and described,
     /// never run.
     Explain(Box<Statement>),
@@ -68,8 +72,9 @@ impl Statement {
             Statement::DropTable(_) => "DROP TABLE",
             Statement::CreateIndex(_) => "CREATE INDEX",
             Statement::DropIndex(_) => "DROP INDEX",
-            // `INSERT` never uses this: its tag carries a count, which only the executor knows.
+            // Neither of these uses this: their tags carry a count, which only the executor knows.
             Statement::Insert(_) => "INSERT",
+            Statement::Select(_) => "SELECT",
             Statement::Explain(_) => "EXPLAIN",
         }
     }

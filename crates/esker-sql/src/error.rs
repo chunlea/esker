@@ -272,6 +272,22 @@ pub enum SqlError {
         row: Option<String>,
     },
 
+    /// A negative `LIMIT` or `OFFSET`. They carry *different* codes — `2201W` and `2201X` — so a
+    /// client is told which clause it got wrong.
+    #[error("{0} must not be negative")]
+    NegativeLimit(&'static str),
+
+    /// An operator applied to types it is not defined for, named the way PostgreSQL names it.
+    #[error("operator does not exist: {left} {op} {right}")]
+    UndefinedOperator {
+        /// The left operand's type.
+        left: &'static str,
+        /// The operator symbol.
+        op: &'static str,
+        /// The right operand's type.
+        right: &'static str,
+    },
+
     /// An operator or function met types it is not defined for.
     #[error("{0}")]
     DatatypeMismatch(String),
@@ -400,6 +416,9 @@ impl SqlError {
                 sqlstate::DATATYPE_MISMATCH
             }
             SqlError::UndefinedParameter(_) => sqlstate::UNDEFINED_PARAMETER,
+            SqlError::UndefinedOperator { .. } => sqlstate::UNDEFINED_FUNCTION,
+            SqlError::NegativeLimit("LIMIT") => sqlstate::INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
+            SqlError::NegativeLimit(_) => sqlstate::INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
             SqlError::SerializationFailure(_) => sqlstate::SERIALIZATION_FAILURE,
             SqlError::DoesNotExistSkipping { .. } => sqlstate::SUCCESSFUL_COMPLETION,
             SqlError::IdentifierTruncated { .. } => sqlstate::NAME_TOO_LONG,
@@ -446,6 +465,9 @@ impl SqlError {
             SqlError::NotNullViolationInRelation { row: Some(row), .. } => {
                 Some(format!("Failing row contains ({row})."))
             }
+            SqlError::UndefinedOperator { .. } => {
+                Some("No operator of that name accepts the given argument types.".to_owned())
+            }
             _ => None,
         }
     }
@@ -469,6 +491,9 @@ impl SqlError {
             SqlError::DependentObjectsStillExist { .. } => Some("You can drop the table instead."),
             SqlError::DatatypeMismatchInColumn { .. } => {
                 Some("You will need to rewrite or cast the expression.")
+            }
+            SqlError::UndefinedOperator { .. } => {
+                Some("You might need to add explicit type casts.")
             }
             _ => None,
         }

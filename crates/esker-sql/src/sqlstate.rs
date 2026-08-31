@@ -55,6 +55,12 @@ pub const CHARACTER_NOT_IN_REPERTOIRE: &str = "22021";
 /// neighbouring failures in the same input function are `22P02` — and captured, not assumed.
 pub const INVALID_PARAMETER_VALUE: &str = "22023";
 
+/// A negative `LIMIT`.
+pub const INVALID_ROW_COUNT_IN_LIMIT_CLAUSE: &str = "2201W";
+/// A negative `OFFSET`. Its own code, not the same one — captured, because collapsing them would
+/// tell a client the wrong clause was wrong.
+pub const INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE: &str = "2201X";
+
 // --- Class 23 — Integrity Constraint Violation ---
 
 /// A NULL reached a `NOT NULL` column.
@@ -190,6 +196,14 @@ mod tests {
             super::CHARACTER_NOT_IN_REPERTOIRE,
         ),
         ("INVALID_PARAMETER_VALUE", super::INVALID_PARAMETER_VALUE),
+        (
+            "INVALID_ROW_COUNT_IN_LIMIT_CLAUSE",
+            super::INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
+        ),
+        (
+            "INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE",
+            super::INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
+        ),
         ("NOT_NULL_VIOLATION", super::NOT_NULL_VIOLATION),
         ("SERIALIZATION_FAILURE", super::SERIALIZATION_FAILURE),
         ("UNIQUE_VIOLATION", super::UNIQUE_VIOLATION),

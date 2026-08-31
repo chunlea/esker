@@ -30,12 +30,89 @@ use crate::error::{Result, SqlError};
 use crate::value::{ColumnType, Datum};
 
 /// An expression, as far as phase 6a needs one.
+///
+/// Arithmetic is deliberately absent. `a + 1` is refused by name rather than implemented, because
+/// every operator brings its own overflow, division and type-resolution rules and each of them is
+/// a way to return a confidently wrong number. §3's scope is projection, `WHERE`, `ORDER BY`,
+/// `LIMIT` and `OFFSET`, and this is exactly what those need.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     /// A constant as written.
     Literal(Literal),
     /// `$1`, one-based as PostgreSQL writes it.
     Parameter(u32),
+    /// A column of the row being evaluated, by name. The planner resolves it to a position.
+    Column(String),
+    /// A column already resolved to its position, which is what the executor evaluates.
+    Ordinal {
+        /// Position in the row.
+        at: usize,
+        /// The column's type, so a comparison against it can resolve a literal.
+        ty: ColumnType,
+    },
+    /// A comparison or a logical connective.
+    Binary {
+        /// Which one.
+        op: BinaryOp,
+        /// Left operand.
+        left: Box<Expr>,
+        /// Right operand.
+        right: Box<Expr>,
+    },
+    /// `NOT x`.
+    Not(Box<Expr>),
+    /// `x IS NULL`, or `IS NOT NULL` when negated. Never NULL itself — that is the whole point of
+    /// the operator, and the reason `x = NULL` is not a way to write it.
+    IsNull {
+        /// What is being tested.
+        operand: Box<Expr>,
+        /// `IS NOT NULL`.
+        negated: bool,
+    },
+}
+
+/// The operators phase 6a evaluates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryOp {
+    /// `=`.
+    Eq,
+    /// `<>`, and `!=` which PostgreSQL treats as the same operator.
+    NotEq,
+    /// `<`.
+    Lt,
+    /// `<=`.
+    LtEq,
+    /// `>`.
+    Gt,
+    /// `>=`.
+    GtEq,
+    /// `AND`.
+    And,
+    /// `OR`.
+    Or,
+}
+
+impl BinaryOp {
+    /// The symbol, for the `operator does not exist: text = integer` message.
+    #[must_use]
+    pub fn symbol(self) -> &'static str {
+        match self {
+            BinaryOp::Eq => "=",
+            BinaryOp::NotEq => "<>",
+            BinaryOp::Lt => "<",
+            BinaryOp::LtEq => "<=",
+            BinaryOp::Gt => ">",
+            BinaryOp::GtEq => ">=",
+            BinaryOp::And => "AND",
+            BinaryOp::Or => "OR",
+        }
+    }
+
+    /// Whether this is a comparison rather than a connective.
+    #[must_use]
+    pub fn is_comparison(self) -> bool {
+        !matches!(self, BinaryOp::And | BinaryOp::Or)
+    }
 }
 
 /// A constant, still untyped.
@@ -52,6 +129,10 @@ pub enum Literal {
     String(String),
     /// `TRUE` or `FALSE`.
     Bool(bool),
+    /// A value the planner already resolved against a column's type — a `timestamptz` read out of
+    /// a quoted literal, say. It carries no ambiguity left to resolve, which is the point: the
+    /// executor evaluates it and nothing re-reads the text.
+    Typed(Box<Datum>),
 }
 
 impl Literal {
@@ -66,7 +147,27 @@ impl Literal {
             Literal::Integer(value) if i32::try_from(*value).is_ok() => "integer",
             Literal::Integer(_) => "bigint",
             Literal::Decimal(_) => "numeric",
+            Literal::Typed(value) => value.column_type().map_or("unknown", ColumnType::name),
             Literal::Bool(_) => "boolean",
+        }
+    }
+
+    /// Whether this literal can be *compared* against a column of `ty`.
+    ///
+    /// Comparison is stricter than assignment, and the difference is not a detail: PostgreSQL
+    /// stores `42` in a `text` column happily — that is an assignment cast — and answers
+    /// `WHERE txt = 42` with `operator does not exist: text = integer`, because there is no such
+    /// operator to call. Using the assignment rule for both would turn that error into a silent
+    /// `false`, which is a wrong answer rather than a missing feature. Measured on both sides.
+    #[must_use]
+    pub fn comparable_with(&self, ty: ColumnType) -> bool {
+        match self {
+            // `unknown` takes whatever type the other side has -- if it can be read as one.
+            Literal::Null | Literal::String(_) => true,
+            Literal::Integer(_) => matches!(ty, ColumnType::Int8 | ColumnType::Double),
+            Literal::Decimal(_) => matches!(ty, ColumnType::Int8 | ColumnType::Double),
+            Literal::Bool(_) => matches!(ty, ColumnType::Bool),
+            Literal::Typed(value) => value.fits(ty),
         }
     }
 
@@ -102,7 +203,17 @@ impl Literal {
             },
 
             Literal::Decimal(digits) => match ty {
-                ColumnType::Double => Datum::from_text(ColumnType::Double, digits),
+                // `numeric` has no signed zero, so `-0.0` in a `double precision` column is `0`
+                // and not `-0`. Measured: the literal goes through `numeric` on its way, and that
+                // is where the sign is lost.
+                ColumnType::Double => {
+                    Datum::from_text(ColumnType::Double, digits).map(|value| match value {
+                        // `0.0` as a pattern already matches `-0.0`, which is
+                        // exactly the case being normalised away.
+                        Datum::Double(0.0) => Datum::Double(0.0),
+                        other => other,
+                    })
+                }
                 // The digits as written, which is what `numeric`'s own text is.
                 ColumnType::Text => Ok(Datum::Text(digits.clone())),
                 ColumnType::Int8 => Err(SqlError::unsupported(format!(
@@ -110,6 +221,10 @@ impl Literal {
                 ))),
                 ColumnType::Bool | ColumnType::Bytea | ColumnType::TimestampTz => mismatch(),
             },
+
+            // Already resolved. It fits the column it was resolved against and nothing else.
+            Literal::Typed(value) if value.fits(ty) => Ok((**value).clone()),
+            Literal::Typed(_) => mismatch(),
 
             Literal::Bool(value) => match ty {
                 ColumnType::Bool => Ok(Datum::Bool(*value)),
@@ -127,7 +242,7 @@ impl Literal {
 }
 
 impl Expr {
-    /// Evaluates to a value for a column of `ty`.
+    /// Evaluates to a value for a column of `ty`, which is what `INSERT` needs.
     ///
     /// A `$1` with nothing bound to it is `42P02`, which is what PostgreSQL answers a simple query
     /// that contains one — the simple query protocol has no way to carry a parameter.
@@ -135,6 +250,21 @@ impl Expr {
         match self {
             Expr::Literal(literal) => literal.assign(ty, column),
             Expr::Parameter(number) => Err(SqlError::UndefinedParameter(*number)),
+            other => Err(SqlError::unsupported(format!(
+                "{} in a VALUES list",
+                describe(other)
+            ))),
         }
+    }
+}
+
+fn describe(expr: &Expr) -> &'static str {
+    match expr {
+        Expr::Literal(_) => "a literal",
+        Expr::Parameter(_) => "a parameter",
+        Expr::Column(_) | Expr::Ordinal { .. } => "a column reference",
+        Expr::Binary { .. } => "an operator",
+        Expr::Not(_) => "NOT",
+        Expr::IsNull { .. } => "IS NULL",
     }
 }

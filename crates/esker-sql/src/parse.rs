@@ -24,9 +24,11 @@
 //! C1 broken (`docs/plans/phase-6a.md` §1). The guard may only ever err towards accepting.
 
 use sqlparser::ast::{
-    ColumnOption, CreateTableOptions, DataType, DollarQuotedString, ExactNumberInfo, Expr, Ident,
-    IndexColumn, IndexType, NullsDistinctOption, ObjectName, ObjectType, SetExpr, Statement,
-    TableConstraint, TableObject, TimezoneInfo, UnaryOperator, Value,
+    BinaryOperator, ColumnOption, CreateTableOptions, DataType, DollarQuotedString,
+    ExactNumberInfo, Expr, GroupByExpr, Ident, IndexColumn, IndexType, LimitClause,
+    NullsDistinctOption, ObjectName, ObjectType, OffsetRows, OrderByKind, Query, SelectItem,
+    SetExpr, Statement, TableConstraint, TableFactor, TableObject, TimezoneInfo, UnaryOperator,
+    Value,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::{Parser, ParserError};
@@ -822,6 +824,7 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
         Statement::CreateTable(create) => {
             Ok(plan::Statement::CreateTable(lower_create_table(create)?))
         }
+        Statement::Query(query) => Ok(plan::Statement::Select(lower_query(query)?)),
         Statement::Insert(insert) => Ok(plan::Statement::Insert(lower_insert(insert)?)),
         Statement::CreateIndex(create) => {
             Ok(plan::Statement::CreateIndex(lower_create_index(create)?))
@@ -1104,6 +1107,53 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             expr,
         } => lower_expr(expr),
         Expr::Nested(inner) => lower_expr(inner),
+        Expr::Identifier(name) => Ok(plan::Expr::Column(ident(name))),
+        Expr::CompoundIdentifier(parts) => match parts.as_slice() {
+            // `t.a` where `t` is the only table in the query: the qualifier adds nothing, and
+            // dropping it silently would be wrong the moment there were two tables. There is only
+            // ever one here, so it is checked against the FROM item by the planner.
+            [_, column] => Ok(plan::Expr::Column(ident(column))),
+            _ => Err(SqlError::unsupported(format!(
+                "the qualified column {}",
+                parts
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(".")
+            ))),
+        },
+        Expr::IsNull(operand) => Ok(plan::Expr::IsNull {
+            operand: Box::new(lower_expr(operand)?),
+            negated: false,
+        }),
+        Expr::IsNotNull(operand) => Ok(plan::Expr::IsNull {
+            operand: Box::new(lower_expr(operand)?),
+            negated: true,
+        }),
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr,
+        } => Ok(plan::Expr::Not(Box::new(lower_expr(expr)?))),
+        Expr::BinaryOp { op, left, right } => {
+            let op = match op {
+                BinaryOperator::Eq => plan::BinaryOp::Eq,
+                BinaryOperator::NotEq => plan::BinaryOp::NotEq,
+                BinaryOperator::Lt => plan::BinaryOp::Lt,
+                BinaryOperator::LtEq => plan::BinaryOp::LtEq,
+                BinaryOperator::Gt => plan::BinaryOp::Gt,
+                BinaryOperator::GtEq => plan::BinaryOp::GtEq,
+                BinaryOperator::And => plan::BinaryOp::And,
+                BinaryOperator::Or => plan::BinaryOp::Or,
+                other => {
+                    return Err(SqlError::unsupported(format!("the operator {other}")));
+                }
+            };
+            Ok(plan::Expr::Binary {
+                op,
+                left: Box::new(lower_expr(left)?),
+                right: Box::new(lower_expr(right)?),
+            })
+        }
         other => Err(SqlError::unsupported(format!("the expression {other}"))),
     }
 }
@@ -1142,6 +1192,162 @@ fn lower_value(value: &Value, negated: bool) -> Result<plan::Expr> {
         other => return Err(SqlError::unsupported(format!("the literal {other}"))),
     };
     Ok(plan::Expr::Literal(literal))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "most of it is the refusal list, which is the point: one line per clause not honoured"
+)]
+fn lower_query(query: &Query) -> Result<plan::Select> {
+    refuse_if(query.with.is_some(), "WITH")?;
+    refuse_if(!query.locks.is_empty(), "a row-level locking clause")?;
+    refuse_if(query.fetch.is_some(), "FETCH FIRST")?;
+    refuse_if(query.for_clause.is_some(), "FOR XML/JSON")?;
+    refuse_if(query.settings.is_some(), "SETTINGS")?;
+    refuse_if(query.format_clause.is_some(), "FORMAT")?;
+    refuse_if(!query.pipe_operators.is_empty(), "a pipe operator")?;
+
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        // `VALUES (...)`, `UNION`, `TABLE t` after the rewrite -- each is its own feature.
+        return Err(SqlError::unsupported(match query.body.as_ref() {
+            SetExpr::Values(_) => "a bare VALUES list".to_owned(),
+            SetExpr::SetOperation { op, .. } => format!("{op}"),
+            other => format!("the query body {other}"),
+        }));
+    };
+
+    refuse_if(select.distinct.is_some(), "SELECT DISTINCT")?;
+    refuse_if(select.top.is_some(), "SELECT TOP")?;
+    refuse_if(select.into.is_some(), "SELECT INTO")?;
+    refuse_if(!select.lateral_views.is_empty(), "a LATERAL VIEW")?;
+    refuse_if(select.prewhere.is_some(), "PREWHERE")?;
+    refuse_if(
+        !matches!(select.group_by, GroupByExpr::Expressions(ref e, ref m) if e.is_empty() && m.is_empty()),
+        "GROUP BY",
+    )?;
+    refuse_if(!select.cluster_by.is_empty(), "CLUSTER BY")?;
+    refuse_if(!select.distribute_by.is_empty(), "DISTRIBUTE BY")?;
+    refuse_if(!select.sort_by.is_empty(), "SORT BY")?;
+    refuse_if(select.having.is_some(), "HAVING")?;
+    refuse_if(!select.named_window.is_empty(), "WINDOW")?;
+    refuse_if(select.qualify.is_some(), "QUALIFY")?;
+    refuse_if(!select.connect_by.is_empty(), "CONNECT BY")?;
+    refuse_if(select.value_table_mode.is_some(), "a value table")?;
+    refuse_if(select.window_before_qualify, "WINDOW before QUALIFY")?;
+    refuse_if(select.exclude.is_some(), "EXCLUDE")?;
+    refuse_if(!select.optimizer_hints.is_empty(), "an optimizer hint")?;
+
+    let from = match select.from.as_slice() {
+        [] => None,
+        [table] => {
+            refuse_if(!table.joins.is_empty(), "a JOIN")?;
+            Some(table_factor(&table.relation)?)
+        }
+        _ => return Err(SqlError::unsupported("a comma-separated FROM list")),
+    };
+
+    let projection = select
+        .projection
+        .iter()
+        .map(|item| match item {
+            SelectItem::UnnamedExpr(expr) => Ok(plan::SelectItem::Expr {
+                expr: lower_expr(expr)?,
+                alias: None,
+            }),
+            SelectItem::ExprWithAlias { expr, alias } => Ok(plan::SelectItem::Expr {
+                expr: lower_expr(expr)?,
+                alias: Some(ident(alias)),
+            }),
+            SelectItem::Wildcard(options) => {
+                refuse_if(options.opt_exclude.is_some(), "SELECT * EXCLUDE")?;
+                refuse_if(options.opt_except.is_some(), "SELECT * EXCEPT")?;
+                refuse_if(options.opt_replace.is_some(), "SELECT * REPLACE")?;
+                refuse_if(options.opt_rename.is_some(), "SELECT * RENAME")?;
+                Ok(plan::SelectItem::Wildcard)
+            }
+            SelectItem::QualifiedWildcard(..) => Err(SqlError::unsupported("a qualified SELECT *")),
+            SelectItem::ExprWithAliases { .. } => {
+                Err(SqlError::unsupported("a multi-column alias"))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let filter = select.selection.as_ref().map(lower_expr).transpose()?;
+
+    let order_by = match &query.order_by {
+        None => Vec::new(),
+        Some(order_by) => {
+            let OrderByKind::Expressions(exprs) = &order_by.kind else {
+                return Err(SqlError::unsupported("ORDER BY ALL"));
+            };
+            refuse_if(order_by.interpolate.is_some(), "INTERPOLATE")?;
+            exprs
+                .iter()
+                .map(|item| {
+                    refuse_if(item.with_fill.is_some(), "WITH FILL")?;
+                    Ok(plan::OrderItem {
+                        expr: lower_expr(&item.expr)?,
+                        descending: item.options.asc == Some(false),
+                        nulls_first: item.options.nulls_first,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
+    };
+
+    let (limit, offset) = match &query.limit_clause {
+        None => (None, None),
+        Some(LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        }) => {
+            refuse_if(!limit_by.is_empty(), "LIMIT BY")?;
+            let offset = match offset {
+                None => None,
+                Some(offset) => {
+                    refuse_if(
+                        !matches!(offset.rows, OffsetRows::None | OffsetRows::Rows),
+                        "OFFSET ... ROW",
+                    )?;
+                    Some(lower_expr(&offset.value)?)
+                }
+            };
+            (limit.as_ref().map(lower_expr).transpose()?, offset)
+        }
+        Some(other) => return Err(SqlError::unsupported(format!("the limit clause {other}"))),
+    };
+
+    Ok(plan::Select {
+        from,
+        projection,
+        filter,
+        order_by,
+        limit,
+        offset,
+    })
+}
+
+fn table_factor(factor: &TableFactor) -> Result<String> {
+    match factor {
+        TableFactor::Table {
+            name,
+            alias,
+            args,
+            with_hints,
+            version,
+            partitions,
+            ..
+        } => {
+            refuse_if(alias.is_some(), "a table alias")?;
+            refuse_if(args.is_some(), "a table function")?;
+            refuse_if(!with_hints.is_empty(), "a table hint")?;
+            refuse_if(version.is_some(), "a table version")?;
+            refuse_if(!partitions.is_empty(), "a partition list")?;
+            object_name(name)
+        }
+        other => Err(SqlError::unsupported(format!("the FROM item {other}"))),
+    }
 }
 
 /// The six types, under every spelling PostgreSQL accepts for them.

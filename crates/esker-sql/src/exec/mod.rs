@@ -26,6 +26,7 @@
 
 mod ddl;
 mod dml;
+mod query;
 
 use std::sync::Arc;
 
@@ -33,6 +34,7 @@ use crate::backend::{Backend, Txn};
 use crate::catalog::Catalog;
 use crate::error::{Result, SqlError};
 use crate::parse::Parsed;
+use crate::pgwire::message::FieldDescription;
 use crate::pgwire::session::{Execute, Outcome};
 use crate::plan::Statement;
 
@@ -106,18 +108,61 @@ impl Executor {
             Statement::CreateIndex(create) => ddl::create_index(self, txn, create),
             Statement::DropIndex(drop) => ddl::drop_index(self, txn, drop),
             Statement::Insert(insert) => dml::insert(self, txn, insert, written),
-            Statement::Explain(inner) => Ok(Self::explain(inner)),
+            Statement::Select(select) => self.select(txn, select),
+            Statement::Explain(inner) => self.explain(txn, inner),
         }
     }
 
+    /// `SELECT`: plan it, then pull every row through.
+    fn select(&mut self, txn: &mut dyn Txn, select: &crate::plan::Select) -> Result<Outcome> {
+        let planned = self.plan_select(txn, select)?;
+        let mut cursor = query::Cursor::open(txn, self.tenant, &planned.node)?;
+        let mut rows = Vec::new();
+        while let Some(row) = cursor.next()? {
+            rows.push(
+                row.iter()
+                    .map(|value| value.to_text().map(String::into_bytes))
+                    .collect(),
+            );
+        }
+        let fields = planned
+            .columns
+            .iter()
+            .map(|(name, ty)| FieldDescription::computed(name.clone(), *ty))
+            .collect();
+        let tag = format!("SELECT {}", rows.len());
+        Ok(Outcome::Rows { fields, rows, tag })
+    }
+
+    /// Resolves the table a `SELECT` names and plans against it.
+    fn plan_select(&self, txn: &dyn Txn, select: &crate::plan::Select) -> Result<query::Planned> {
+        let table = match &select.from {
+            Some(name) => Some(self.require_table(txn, name)?),
+            None => None,
+        };
+        query::plan(select, self.tenant, table.as_deref())
+    }
+
     /// `EXPLAIN`: the plan, as rows, and nothing run.
-    fn explain(statement: &Statement) -> Outcome {
+    fn explain(&self, txn: &dyn Txn, statement: &Statement) -> Result<Outcome> {
+        // A `SELECT`'s plan is the whole point of `EXPLAIN`, and building it needs the catalog.
+        let lines = match statement {
+            Statement::Select(select) => {
+                let planned = self.plan_select(txn, select)?;
+                planned.node.explain(&planned.table)
+            }
+            other => explain_lines(other),
+        };
+        Ok(Self::explain_rows(lines))
+    }
+
+    fn explain_rows(lines: Vec<String>) -> Outcome {
         Outcome::Rows {
-            fields: vec![crate::pgwire::message::FieldDescription::computed(
+            fields: vec![FieldDescription::computed(
                 "QUERY PLAN",
                 crate::value::ColumnType::Text,
             )],
-            rows: explain_lines(statement)
+            rows: lines
                 .into_iter()
                 .map(|line| vec![Some(line.into_bytes())])
                 .collect(),
@@ -203,6 +248,9 @@ fn explain_lines(statement: &Statement) -> Vec<String> {
         Statement::DropTable(drop) => vec![format!("Drop Table on {}", drop.names.join(", "))],
         Statement::CreateIndex(create) => vec![format!("Create Index on {}", create.table)],
         Statement::DropIndex(drop) => vec![format!("Drop Index on {}", drop.names.join(", "))],
+        // A `SELECT`'s plan is the interesting one, and it needs the catalog to be built, so
+        // `EXPLAIN SELECT` is handled where the catalog is in reach rather than here.
+        Statement::Select(_) => vec!["Select".to_owned()],
         Statement::Insert(insert) => vec![format!(
             "Insert on {} ({} row{})",
             insert.table,

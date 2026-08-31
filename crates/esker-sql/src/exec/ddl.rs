@@ -17,6 +17,7 @@ use crate::error::{Result, SqlError};
 use crate::exec::Executor;
 use crate::pgwire::session::Outcome;
 use crate::plan::{self, CreateIndex, CreateTable, DropIndex, DropTable};
+use crate::value::Datum;
 
 pub(super) fn create_table(
     executor: &mut Executor,
@@ -188,16 +189,19 @@ pub(super) fn create_index(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let mut updated = (*table).clone();
-    updated.indexes.push(IndexDef {
+    let index = IndexDef {
         id: catalog::allocate_id(txn, executor.tenant)?,
         name,
         unique: create.unique,
         columns,
-    });
-    // Building the index over rows that already exist is the executor's job once there are rows to
-    // build it from; until `INSERT` lands there are none.
-    // TODO(unit-6b): backfill the index from the table's existing rows.
+    };
+    // An index over a table that already has rows has to be *built*, not just declared. An index
+    // that exists and is empty is worse than no index: the planner will use it, and it will answer
+    // every lookup with no rows. The tests caught exactly that.
+    backfill(executor, txn, &table, &index)?;
+
+    let mut updated = (*table).clone();
+    updated.indexes.push(index);
     catalog::replace_table(txn, executor.tenant, &table, &updated)?;
     Ok(Outcome::done("CREATE INDEX"))
 }
@@ -254,4 +258,63 @@ fn existing_relation(
     name: &str,
 ) -> Result<Option<catalog::Relation>> {
     executor.catalog_view(txn)?.relation(name)
+}
+
+/// Writes an index entry for every row the table already has.
+///
+/// The whole table is read to do it, in the transaction the statement runs in, so a `CREATE INDEX`
+/// on a table someone is writing to conflicts and one of the two retries. `TODO(post-v1)`: a
+/// concurrent build, which is what `CREATE INDEX CONCURRENTLY` is for and which needs a background
+/// job phase 6a does not have — the clause is refused by name until then.
+///
+/// A `UNIQUE` index built over rows that already violate it fails here, with the same `23505` an
+/// `INSERT` would have raised, which is what PostgreSQL does too.
+fn backfill(
+    executor: &Executor,
+    txn: &mut dyn Txn,
+    table: &TableDef,
+    index: &IndexDef,
+) -> Result<()> {
+    let tenant = executor.tenant;
+    let (start, end) = crate::row::table_row_range(tenant, table.id);
+    let types = table.column_types();
+    let primary_key_types = table.primary_key_types();
+    let rows = txn.scan(&start, &end, 0)?;
+
+    let mut entries = Vec::with_capacity(rows.len());
+    for (_, value) in &rows {
+        let row = crate::row::decode_row(&types, value)?;
+        let columns: Vec<Datum> = index
+            .columns
+            .iter()
+            .map(|&ordinal| row[ordinal].clone())
+            .collect();
+        let primary_key: Vec<Datum> = table
+            .primary_key
+            .iter()
+            .map(|&ordinal| row[ordinal].clone())
+            .collect();
+        let by_value = index.unique && crate::row::unique_index_key_is_unique_by_value(&columns);
+        let suffix = if by_value {
+            None
+        } else {
+            Some(primary_key.as_slice())
+        };
+        let key = crate::row::index_key(tenant, table.id, index.id, &columns, suffix)?;
+        if by_value && entries.iter().any(|(existing, _)| existing == &key) {
+            return Err(SqlError::UniqueViolation {
+                constraint: index.name.clone(),
+                key: None,
+            });
+        }
+        entries.push((
+            key,
+            crate::row::encode_row(&primary_key_types, &primary_key)?,
+        ));
+    }
+
+    for (key, value) in entries {
+        txn.put(&key, &value);
+    }
+    Ok(())
 }
