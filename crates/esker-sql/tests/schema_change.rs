@@ -686,3 +686,122 @@ fn an_index_cannot_skip_a_state() {
     assert_eq!(error.sqlstate(), sqlstate::INTERNAL_ERROR);
     assert!(error.to_string().contains("in one step"), "{error}");
 }
+
+// --- The lease ---------------------------------------------------------------------------------
+//
+// ADR 0028. The lease is about **writers**: a node past it may be acting on a schema the cluster
+// has moved two states beyond, which is the one thing the four states do not make safe. A reader's
+// snapshot already agrees with the rows it can see, so gating reads would add stalls, close no
+// hole, and turn a node that has lost PD from degraded into useless.
+
+/// A backend whose schema lease a test can take away.
+#[derive(Debug)]
+struct Leased {
+    inner: MemoryBackend,
+    held: std::sync::atomic::AtomicBool,
+}
+
+impl Backend for Leased {
+    fn begin(&self) -> esker_sql::Result<Box<dyn esker_sql::backend::Txn>> {
+        self.inner.begin()
+    }
+    fn begin_at(&self, start_ts: u64) -> esker_sql::Result<Box<dyn esker_sql::backend::Txn>> {
+        self.inner.begin_at(start_ts)
+    }
+    fn now(&self) -> esker_sql::Result<u64> {
+        self.inner.now()
+    }
+    fn schema_lease_remaining(&self) -> Option<std::time::Duration> {
+        self.held
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then_some(std::time::Duration::from_secs(5))
+    }
+}
+
+/// A node whose lease can be taken away mid-session.
+fn leased_node() -> (Arc<Leased>, Executor) {
+    let backend = Arc::new(Leased {
+        inner: MemoryBackend::new(),
+        held: std::sync::atomic::AtomicBool::new(true),
+    });
+    let executor = Executor::new(
+        Arc::clone(&backend) as Arc<dyn Backend>,
+        Arc::new(Catalog::new()),
+        TENANT,
+    );
+    (backend, executor)
+}
+
+fn run_on(executor: &mut Executor, sql: &str) -> esker_sql::Result<Outcome> {
+    let mut last = Outcome::done("");
+    for parsed in parse_statements(sql)? {
+        last = executor.execute(&parsed, &Params::NONE)?;
+    }
+    Ok(last)
+}
+
+/// A node past its lease refuses **writes** and still serves **reads** — both halves, because
+/// either one alone would be the wrong design. Refusing neither ships the missing index entry the
+/// whole ADR exists to prevent; refusing both adds stalls that protect nothing.
+#[test]
+fn a_node_past_its_lease_refuses_writes_and_still_reads() {
+    let (backend, mut executor) = leased_node();
+    run_on(
+        &mut executor,
+        "CREATE TABLE t (id int8 PRIMARY KEY, a int8)",
+    )
+    .unwrap();
+    run_on(&mut executor, "INSERT INTO t VALUES (1, 10)").unwrap();
+
+    // The lease runs out and cannot be renewed.
+    backend
+        .held
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    for (sql, command) in [
+        ("INSERT INTO t VALUES (2, 20)", "INSERT"),
+        ("UPDATE t SET a = 1 WHERE id = 1", "UPDATE"),
+        ("DELETE FROM t WHERE id = 1", "DELETE"),
+        ("CREATE TABLE u (a int8)", "CREATE TABLE"),
+        ("CREATE INDEX ti ON t (a)", "CREATE INDEX"),
+    ] {
+        let error = run_on(&mut executor, sql).expect_err("a write past the lease must be refused");
+        assert_eq!(
+            error.sqlstate(),
+            sqlstate::READ_ONLY_SQL_TRANSACTION,
+            "{sql}"
+        );
+        assert!(
+            error.to_string().contains("schema lease has expired"),
+            "{sql}: {error}"
+        );
+        assert!(
+            error.to_string().contains(command),
+            "{sql}: the message must name the command, got {error}"
+        );
+    }
+
+    // And the read still answers, which is the other half of the rule.
+    let Outcome::Rows { rows, .. } = run_on(&mut executor, "SELECT a FROM t WHERE id = 1").unwrap()
+    else {
+        panic!("not rows");
+    };
+    assert_eq!(rows, [[Some(b"10".to_vec())]]);
+
+    // Renewing puts writes back, with nothing else to do.
+    backend
+        .held
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    run_on(&mut executor, "INSERT INTO t VALUES (2, 20)").unwrap();
+}
+
+/// A node with **no lease source at all** writes freely: a cluster with no placement driver has no
+/// staged schema change to be behind on. The distinction is between "nobody is coordinating" and
+/// "I have lost the thing that coordinates", and only the second is a reason to stop.
+#[test]
+fn a_node_with_no_lease_source_is_not_treated_as_expired() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY)").unwrap();
+    node.run("INSERT INTO t VALUES (1)").unwrap();
+    assert_eq!(node.rows("SELECT id FROM t"), [[Some("1".to_owned())]]);
+}

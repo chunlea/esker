@@ -113,7 +113,7 @@ thing to get right: a node that cannot reach PD cannot get a timestamp, cannot b
 and therefore cannot write. There is no separate liveness path to go wrong.
 
 **The wire change is one field on one message.** `esker-proto` is in this lane and `PdResp::Tso` has
-a golden test, so this is a format change with an ADR (`docs/adr/0027-the-schema-lease.md`, written
+a golden test, so this is a format change with an ADR (`docs/adr/0028-the-schema-lease.md`, written
 with the unit that lands it) and a golden that updates alongside a new-version golden.
 
 The node side is a `PdOracle` implementing `esker_client::TimestampOracle` — implementing another
@@ -275,6 +275,11 @@ state that guards it is skipped, which is what makes them tests of the rule rath
 
 ## 9. Progress
 
+- [x] 3 — **the lease, and the step arithmetic.** A new PD method `SchemaLease` (0x0307) rather
+  than a field on `Tso`; PD computing `lease + lock_ttl` and reporting the removal term separately;
+  the executor refusing every **write** past the lease and serving every read. Two new golden lines
+  and **no existing golden byte moved**. `docs/adr/0028-the-schema-lease.md` records the decision.
+  PD *driving* the job is folded into unit 5, where there is a job to drive.
 - [x] 2 — **the four states.** `SchemaState` on every `IndexDef` with the schema version it was
   entered at, in catalog v3 beside unit 1's fields and behind the same v2 fallback; the planner
   refusing a non-public index; the DML writing entries at write-only and public and removing them
@@ -287,6 +292,28 @@ state that guards it is skipped, which is what makes them tests of the rule rath
   §10a of phase 6a records. 12 new tests, 5 new corpus statements, `.slt` updated.
 
 ## 10. What changed from this plan
+
+**The lease is a new method, not a field on `Tso` — and the constitution is what bought the better
+design.** The plan proposed piggybacking on the timestamp, which would have made fail-closed free.
+`CLAUDE.md` says to stop and ask before changing a wire format with a golden test, and `PdResp::Tso`
+has one; a widened lane is not a blanket permission. Looking for a shape that did not need the
+change produced an *additive* one: no existing message's bytes move, every existing golden is
+byte-identical, and the extra round trip is once per lease period rather than once per timestamp —
+cheaper than the rejected shape rather than dearer. `docs/adr/0028-the-schema-lease.md`.
+
+**PD is told the step interval's inputs rather than keeping copies of them.** The lock TTL is the
+client's and the retention window is the SQL layer's; both crates sit above PD, which does not link
+them. Copies drift, and a step interval short by exactly the drift is unsafe rather than merely
+wrong. They are `PdOptions` fields whose defaults name their sources; the interval itself stays
+computed.
+
+**The lease source is a trait, not a `PdClient`**, because the test that proves fail-closed has to
+be able to stop answering. Untested fail-closed is fail-open with good intentions. And a node with
+*no* lease source writes freely — "nobody is coordinating" and "I have lost the thing that
+coordinates" are different facts, and only the second is a reason to stop.
+
+**ADR 0027 was taken by the columnar lane**, which committed first, so this is 0028
+([[esker-adr-numbering-rule]]).
 
 **Delete-only is unreachable through the executor, and that is correction 1 taken to its
 conclusion.** The ADR's "skip delete-only" story needs a deleter at an *earlier* state than the

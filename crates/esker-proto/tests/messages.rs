@@ -140,6 +140,13 @@ fn golden_pd_requests() -> Vec<(&'static str, Request)> {
                 request: PdReq::Tso { count: 16 },
             },
         ),
+        (
+            "pd-schema-lease",
+            Request::Pd {
+                cluster_id: PD_CLUSTER,
+                request: PdReq::SchemaLease,
+            },
+        ),
     ]
 }
 
@@ -609,6 +616,14 @@ fn golden_pd_responses() -> Vec<(&'static str, Response)> {
             Response::Pd(PdResp::Tso {
                 start_ts: 0x1234_5678_9ABC,
                 count: 16,
+            }),
+        ),
+        (
+            "pd-schema-lease",
+            Response::Pd(PdResp::SchemaLease {
+                lease_ms: 5_000,
+                step_interval_ms: 8_000,
+                removal_extra_ms: 3_600_000,
             }),
         ),
     ]

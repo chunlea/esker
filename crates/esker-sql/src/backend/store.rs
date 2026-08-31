@@ -33,6 +33,24 @@ use crate::error::{Result, SqlError};
 pub struct StoreBackend {
     client: Arc<TxnClient>,
     oracle: Arc<dyn TimestampOracle>,
+    /// Where this node's schema lease comes from, or `None` for a node with no placement driver.
+    lease: Option<Arc<dyn SchemaLease>>,
+}
+
+/// Where a node's schema lease comes from
+/// ([ADR 0028](../../../docs/adr/0028-the-schema-lease.md)).
+///
+/// A trait rather than a `PdClient` field for one reason that matters: **the test that proves fail
+/// closed has to be able to stop answering.** A lease source that could only be a live PD would
+/// leave "PD is unreachable" untestable, and untested fail-closed is fail-open with good
+/// intentions.
+pub trait SchemaLease: std::fmt::Debug + Send + Sync {
+    /// How long this node may still serve writes, or `None` if it cannot say.
+    ///
+    /// `None` is the whole safety property: a node that cannot renew must **stop writing**, so
+    /// that PD's step clock can advance on a timer rather than on a poll of nodes it may not be
+    /// able to reach.
+    fn remaining(&self) -> Option<std::time::Duration>;
 }
 
 impl StoreBackend {
@@ -44,7 +62,22 @@ impl StoreBackend {
     /// this crate wants from it (`CLAUDE.md` invariant 6: never a wall clock).
     #[must_use]
     pub fn new(client: Arc<TxnClient>, oracle: Arc<dyn TimestampOracle>) -> Self {
-        StoreBackend { client, oracle }
+        StoreBackend {
+            client,
+            oracle,
+            lease: None,
+        }
+    }
+
+    /// The same backend, holding a schema lease from PD.
+    ///
+    /// Without one this node writes freely, which is right for a cluster with no placement driver
+    /// — every test cluster in this crate, and the in-process fake — and wrong for one with a
+    /// schema change in flight. `esker-sql`'s binary attaches it when it is told PD's address.
+    #[must_use]
+    pub fn with_schema_lease(mut self, lease: Arc<dyn SchemaLease>) -> Self {
+        self.lease = Some(lease);
+        self
     }
 }
 
@@ -66,6 +99,19 @@ impl Backend for StoreBackend {
         Ok(Box::new(StoreTxn {
             inner: Some(self.client.begin_at(start_ts).map_err(translate)?),
         }))
+    }
+
+    /// This node's lease, or an unbounded one when nothing is publishing them.
+    ///
+    /// **`None` only when a lease source exists and has run out**, which is the difference between
+    /// "no schema changes are being coordinated here" and "I have lost the thing that coordinates
+    /// them". A cluster with no placement driver has no staged schema change to be behind on; a
+    /// node that *had* a lease and lost it does.
+    fn schema_lease_remaining(&self) -> Option<std::time::Duration> {
+        match &self.lease {
+            Some(lease) => lease.remaining(),
+            None => Some(std::time::Duration::MAX),
+        }
     }
 
     fn now(&self) -> Result<u64> {

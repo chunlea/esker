@@ -160,6 +160,14 @@ fn serve(pd: &Pd, cluster_id: u64, request: &PdReq) -> Result<PdResp, ProtoError
             start_ts: pd.tso(*count)?,
             count: *count,
         },
+        PdReq::SchemaLease => {
+            let lease = pd.schema_lease();
+            PdResp::SchemaLease {
+                lease_ms: lease.lease_ms,
+                step_interval_ms: lease.step_interval_ms,
+                removal_extra_ms: lease.removal_extra_ms,
+            }
+        }
     })
 }
 
@@ -219,6 +227,7 @@ mod tests {
             },
             PdReq::AllocId { count: 1 },
             PdReq::Tso { count: 1 },
+            PdReq::SchemaLease,
         ];
         for request in requests {
             let name = request.method().name();

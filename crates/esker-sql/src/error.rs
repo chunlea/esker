@@ -497,6 +497,24 @@ pub enum SqlError {
     #[error("cannot execute {0} in a read-only transaction")]
     ReadOnlyTransaction(&'static str),
 
+    /// This node's schema lease has run out and it could not renew it, so it will not write
+    /// ([ADR 0028](../../docs/adr/0028-the-schema-lease.md)).
+    ///
+    /// **Fail closed**, and the message says which half is refused, because the other half still
+    /// works: reads are never gated by the lease. `40003 statement_completion_unknown` would be
+    /// wrong — nothing was attempted — and `08006` would blame the store, which may be perfectly
+    /// reachable. PostgreSQL has no condition for "this node is not allowed to write right now",
+    /// so this is `25006`, which is exactly what it means to the client: a transaction that may
+    /// not write.
+    #[error(
+        "cannot execute {command} in a read-only transaction: this node's schema lease has \
+         expired and the placement driver is unreachable"
+    )]
+    SchemaLeaseExpired {
+        /// The command, named as PostgreSQL names it.
+        command: &'static str,
+    },
+
     /// A query needs more of a bounded resource than this node will give it.
     #[error("{0}")]
     ConfigurationLimitExceeded(String),
@@ -603,7 +621,9 @@ impl SqlError {
             SqlError::SnapshotDoesNotExist(_) | SqlError::UnrecognizedParameter(_) => {
                 sqlstate::UNDEFINED_OBJECT
             }
-            SqlError::ReadOnlyTransaction(_) => sqlstate::READ_ONLY_SQL_TRANSACTION,
+            SqlError::ReadOnlyTransaction(_) | SqlError::SchemaLeaseExpired { .. } => {
+                sqlstate::READ_ONLY_SQL_TRANSACTION
+            }
             SqlError::ConfigurationLimitExceeded(_) => sqlstate::CONFIGURATION_LIMIT_EXCEEDED,
             SqlError::ProtocolViolation(_) => sqlstate::PROTOCOL_VIOLATION,
             SqlError::InvalidSqlStatementName(_) => sqlstate::INVALID_SQL_STATEMENT_NAME,
@@ -688,6 +708,9 @@ impl SqlError {
                 ..
             } => Some("Use DROP TABLE to remove a table."),
             SqlError::DependentObjectsStillExist { .. } => Some("You can drop the table instead."),
+            SqlError::SchemaLeaseExpired { .. } => Some(
+                "Reads are unaffected. Writes resume when this node can reach the placement driver.",
+            ),
             SqlError::DatatypeMismatchInColumn { .. } => {
                 Some("You will need to rewrite or cast the expression.")
             }

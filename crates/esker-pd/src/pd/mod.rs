@@ -58,6 +58,48 @@ mod repair;
 /// How long a store may be silent before it is considered down (`docs/DESIGN.md` §7).
 pub const MAX_STORE_DOWN_TIME_MS: u64 = 30_000;
 
+/// How long a SQL node may serve **writes** from a cached schema before asking PD again
+/// ([ADR 0028](../../../docs/adr/0028-the-schema-lease.md), ADR 0020 as amended).
+///
+/// Writes only. A reader's snapshot already agrees with the rows it can see, so gating reads would
+/// add stalls and close no hole — and a node that cannot renew must **stop writing**, which is what
+/// lets [`Pd::schema_lease`]'s step interval be a timer rather than a poll of nodes PD may not be
+/// able to reach.
+///
+/// Five seconds: comfortably above the lock TTL a writer is already bounded by, and short enough
+/// that a schema change is tens of seconds rather than minutes.
+pub const SCHEMA_LEASE_MS: u64 = 5_000;
+
+/// The schema lease, and the step arithmetic that depends on it.
+///
+/// The **interval is computed**, never configured: one that somebody could tune is one somebody
+/// could tune below the bound it exists to keep (`docs/plans/phase-6e.md` §3). Its *inputs* are a
+/// different matter — the lock TTL and the retention window belong to layers above PD, which does
+/// not link them, so PD is **told** them ([`PdOptions`]) rather than keeping copies that could
+/// drift. ADR 0020 said PD already owned both; it does not, and being told is the honest shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaLease {
+    /// How long a node may serve writes from a cached schema. [`SCHEMA_LEASE_MS`].
+    pub lease_ms: u64,
+    /// `lease_ms + lock_ttl_ms` — how long a step in the **adding** direction must wait before the
+    /// next one.
+    ///
+    /// Two terms, and each is a bound on how stale a *writer* can be. The lease is how long a node
+    /// may act without hearing from PD; the lock TTL is how long a transaction that has already
+    /// started may still commit (`docs/txn-spec.md` §5.2). Past their sum, no writer can still be
+    /// acting on a state two steps behind — which is ADR 0020's two-version invariant.
+    pub step_interval_ms: u64,
+    /// What a **removing** step waits on top of [`SchemaLease::step_interval_ms`]: the MVCC
+    /// retention window.
+    ///
+    /// Separate rather than folded in, because for an *add* it is inert and retention is an hour:
+    /// a reader that sees an index as public does so from a snapshot above the backfill, so the
+    /// index it reads is complete at any age. For a *remove* it is real — a reader at `public`
+    /// reads entries a node at `absent` has already deleted, and retention is what keeps them
+    /// readable (ADR 0020, as amended by `docs/plans/phase-6e.md` §1).
+    pub removal_extra_ms: u64,
+}
+
 /// How long after an operator retires before that region may be moved for **balance** again.
 ///
 /// Balance is an optimisation, and a region that has just been moved has nothing to gain from
@@ -103,6 +145,19 @@ pub struct PdOptions {
     pub tso_save_interval_ms: u64,
     /// How long a store may be silent before it is down, and its regions are repaired.
     pub max_store_down_time_ms: u64,
+    /// A writing transaction's lease on its locks — `esker_client::LOCK_TTL_MS`.
+    ///
+    /// One of the two bounds in [`Pd::schema_lease`]'s step interval, and it belongs to the client,
+    /// which sits *above* PD in `CLAUDE.md`'s layer table and which PD therefore does not link. It
+    /// is told rather than copied: a copy is a number that can drift, and a step interval short by
+    /// exactly the drift is a step interval that is unsafe rather than merely wrong.
+    pub lock_ttl_ms: u64,
+    /// The MVCC retention window — `esker_sql::catalog::DEFAULT_RETENTION_MS`.
+    ///
+    /// The other bound, and it is what a **removing** step waits on top of the interval. Told for
+    /// the same reason, from a crate that is even further above. A test sets it small, which is the
+    /// only way a staged removal is testable at all.
+    pub retention_ms: u64,
     /// How long an operator may make no observable progress before it is abandoned.
     pub operator_timeout_ms: u64,
     /// Replicas a region should have. Repair restores this; it does not grow past it.
@@ -141,6 +196,10 @@ impl PdOptions {
             alloc_batch: ALLOC_BATCH,
             tso_save_interval_ms: crate::TSO_SAVE_INTERVAL_MS,
             max_store_down_time_ms: MAX_STORE_DOWN_TIME_MS,
+            // The defaults name their sources. A cluster that runs a different lock TTL has to say
+            // so here, and the consequence of not saying so is written down in ADR 0028.
+            lock_ttl_ms: 3_000,
+            retention_ms: 60 * 60 * 1_000,
             operator_timeout_ms: OPERATOR_TIMEOUT_MS,
             target_replicas: schedule::TARGET_REPLICAS,
             balance_cooldown_ms: BALANCE_COOLDOWN_MS,
@@ -217,6 +276,10 @@ pub struct Pd {
     cf: u32,
     clock: Arc<dyn Clock>,
     max_store_down_time_ms: u64,
+    /// See [`PdOptions::lock_ttl_ms`]. Read only by [`Pd::schema_lease`].
+    lock_ttl_ms: u64,
+    /// See [`PdOptions::retention_ms`]. Read only by [`Pd::schema_lease`].
+    retention_ms: u64,
     operator_timeout_ms: u64,
     target_replicas: usize,
     balance_cooldown_ms: u64,
@@ -311,6 +374,8 @@ impl Pd {
             cf,
             clock: options.clock,
             max_store_down_time_ms: options.max_store_down_time_ms,
+            lock_ttl_ms: options.lock_ttl_ms,
+            retention_ms: options.retention_ms,
             operator_timeout_ms: options.operator_timeout_ms,
             target_replicas: options.target_replicas,
             balance_cooldown_ms: options.balance_cooldown_ms,
@@ -470,6 +535,23 @@ impl Pd {
     /// The oracle's high-water mark, for the inspector and the tests.
     pub fn tso_high_water_ms(&self) -> Result<u64> {
         Ok(self.lock()?.oracle.high_water_ms())
+    }
+
+    /// The schema lease and the step arithmetic derived from it
+    /// ([ADR 0028](../../../docs/adr/0028-the-schema-lease.md)).
+    ///
+    /// Infallible and stateless today: three published numbers and one addition. It is a method on
+    /// [`Pd`] rather than a free function because that is where it will read a *configured*
+    /// retention from when a cluster has one, and because the arithmetic having one home is the
+    /// point — a node that held its own opinion about how long it is safe to be behind would be a
+    /// node PD cannot reason about.
+    #[must_use]
+    pub fn schema_lease(&self) -> SchemaLease {
+        SchemaLease {
+            lease_ms: SCHEMA_LEASE_MS,
+            step_interval_ms: SCHEMA_LEASE_MS + self.lock_ttl_ms,
+            removal_extra_ms: self.retention_ms,
+        }
     }
 
     /// The region covering `key`, with the leader PD last heard about and the addresses of the
@@ -693,4 +775,75 @@ fn mint_cluster_id(now_ms: u64, store_id: u64, address: &str) -> u64 {
         ^ esker_base::hash::mix64(store_id)
         ^ esker_base::hash::hash64(address.as_bytes());
     if mixed == 0 { 1 } else { mixed }
+}
+
+#[cfg(test)]
+mod schema_lease_tests {
+    use super::{Pd, PdOptions, SCHEMA_LEASE_MS};
+
+    fn pd(options: PdOptions) -> std::sync::Arc<Pd> {
+        let dir = tempfile::tempdir().unwrap();
+        let pd = Pd::open(dir.path(), options).unwrap();
+        std::mem::forget(dir);
+        pd
+    }
+
+    /// The interval is **the three inputs**, computed — not a constant. Changing an input changes
+    /// it, and that is the assertion: a step interval somebody could tune independently of the
+    /// bounds it exists to keep would be one somebody could tune below them.
+    #[test]
+    fn the_step_interval_is_computed_from_its_inputs() {
+        let lease = pd(PdOptions {
+            lock_ttl_ms: 3_000,
+            retention_ms: 60 * 60 * 1_000,
+            ..PdOptions::new()
+        })
+        .schema_lease();
+        assert_eq!(lease.lease_ms, SCHEMA_LEASE_MS);
+        assert_eq!(lease.step_interval_ms, SCHEMA_LEASE_MS + 3_000);
+        assert_eq!(lease.removal_extra_ms, 60 * 60 * 1_000);
+
+        // A cluster with a longer lock TTL waits longer between steps, by exactly that much.
+        let longer = pd(PdOptions {
+            lock_ttl_ms: 9_000,
+            retention_ms: 60 * 60 * 1_000,
+            ..PdOptions::new()
+        })
+        .schema_lease();
+        assert_eq!(longer.step_interval_ms, lease.step_interval_ms + 6_000);
+    }
+
+    /// **The removal term is separate, and that is what keeps a schema change from taking an
+    /// hour.** For something being added it is inert (ADR 0020 as amended): a reader that sees an
+    /// index as public does so from a snapshot above the backfill, so the index is complete at any
+    /// age. Folding retention into every step would price every `CREATE INDEX` at the retention
+    /// window.
+    #[test]
+    fn the_removal_term_is_not_in_the_ordinary_interval() {
+        let lease = pd(PdOptions {
+            lock_ttl_ms: 3_000,
+            retention_ms: 60 * 60 * 1_000,
+            ..PdOptions::new()
+        })
+        .schema_lease();
+        assert!(
+            lease.step_interval_ms < 60_000,
+            "an add must not wait out the retention window: {}ms",
+            lease.step_interval_ms
+        );
+        assert_eq!(lease.removal_extra_ms, 60 * 60 * 1_000);
+    }
+
+    /// The lease has to exceed nothing in particular, but it must be **positive**: a lease of zero
+    /// is a node that may never write, and one that is not above the lock TTL would let a
+    /// transaction outlive the deadline that is supposed to bound it.
+    #[test]
+    fn the_lease_is_positive_and_above_the_lock_ttl() {
+        let options = PdOptions::new();
+        assert!(SCHEMA_LEASE_MS > 0);
+        assert!(
+            SCHEMA_LEASE_MS > options.lock_ttl_ms,
+            "a lease at or below the lock TTL bounds nothing a transaction does not already bound"
+        );
+    }
 }

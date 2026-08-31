@@ -295,6 +295,14 @@ pub enum PdReq {
         /// How many, consecutive as integers.
         count: u32,
     },
+
+    /// How long a node may act on a cached schema before it must ask again
+    /// ([ADR 0028](../../docs/adr/0028-the-schema-lease.md)).
+    ///
+    /// Asked by a SQL node, which is the first thing above the store that is neither a store nor a
+    /// region and therefore has nothing else to say to PD. It carries no arguments: the answer is
+    /// a cluster-wide number with one writer, exactly like the GC safepoint.
+    SchemaLease,
 }
 
 impl PdReq {
@@ -308,6 +316,7 @@ impl PdReq {
             Self::GetRegion { .. } => Method::PdGetRegion,
             Self::AllocId { .. } => Method::PdAllocId,
             Self::Tso { .. } => Method::PdTso,
+            Self::SchemaLease => Method::PdSchemaLease,
         }
     }
 
@@ -345,6 +354,8 @@ impl PdReq {
             Self::GetRegion { key } => out.put_bytes(key),
             Self::AllocId { count } => out.put_varint(*count),
             Self::Tso { count } => out.put_varint(u64::from(*count)),
+            // No fields, so nothing to write. The method is the whole request.
+            Self::SchemaLease => {}
         }
     }
 
@@ -377,6 +388,7 @@ impl PdReq {
             Method::PdTso => Self::Tso {
                 count: input.get_varint_u32("tso.count")?,
             },
+            Method::PdSchemaLease => Self::SchemaLease,
             other => {
                 return Err(DecodeError::invalid(
                     "method",
@@ -442,6 +454,29 @@ pub enum PdResp {
         /// How many were granted.
         count: u32,
     },
+
+    /// The schema lease, and the step interval derived from it.
+    SchemaLease {
+        /// How long a node may serve **writes** from a cached schema before asking again.
+        ///
+        /// Writes only: a reader's snapshot already agrees with the rows it can see, so gating
+        /// reads would add stalls and close no hole (ADR 0020, as amended).
+        lease_ms: u64,
+        /// How long a schema-change step must wait before the next one, for a change in the
+        /// **adding** direction: `lease_ms + lock_ttl_ms`.
+        ///
+        /// Sent rather than derived by the caller so that the arithmetic has one home — PD's — and
+        /// a node cannot hold a different opinion about how long it is safe to be behind.
+        step_interval_ms: u64,
+        /// The extra a **removing** step must wait on top of [`PdResp::SchemaLease::step_interval_ms`],
+        /// which is the MVCC retention window: a reader at `public` reads entries a node at
+        /// `absent` has already deleted, and retention is what keeps them readable.
+        ///
+        /// Zero when nothing is being removed, which is why it is separate rather than folded in:
+        /// retention is an hour by default, and adding it to every step would make every schema
+        /// change take one.
+        removal_extra_ms: u64,
+    },
 }
 
 impl PdResp {
@@ -455,6 +490,7 @@ impl PdResp {
             Self::GetRegion { .. } => Method::PdGetRegion,
             Self::AllocId { .. } => Method::PdAllocId,
             Self::Tso { .. } => Method::PdTso,
+            Self::SchemaLease { .. } => Method::PdSchemaLease,
         }
     }
 
@@ -491,6 +527,15 @@ impl PdResp {
             Self::Tso { start_ts, count } => {
                 out.put_varint(*start_ts);
                 out.put_varint(u64::from(*count));
+            }
+            Self::SchemaLease {
+                lease_ms,
+                step_interval_ms,
+                removal_extra_ms,
+            } => {
+                out.put_varint(*lease_ms);
+                out.put_varint(*step_interval_ms);
+                out.put_varint(*removal_extra_ms);
             }
         }
     }
@@ -529,6 +574,11 @@ impl PdResp {
             Method::PdTso => Self::Tso {
                 start_ts: input.get_varint("tso.start_ts")?,
                 count: input.get_varint_u32("tso.count")?,
+            },
+            Method::PdSchemaLease => Self::SchemaLease {
+                lease_ms: input.get_varint("schema_lease.lease_ms")?,
+                step_interval_ms: input.get_varint("schema_lease.step_interval_ms")?,
+                removal_extra_ms: input.get_varint("schema_lease.removal_extra_ms")?,
             },
             other => {
                 return Err(DecodeError::invalid(
@@ -744,6 +794,25 @@ impl PdChannel {
         }
     }
 
+    /// How long this node may act on a cached schema before asking again, and the step arithmetic
+    /// that depends on it ([ADR 0028](../../docs/adr/0028-the-schema-lease.md)).
+    ///
+    /// A SQL node calls this when its lease is running out. **Not being able to call it is the
+    /// point**: a node that cannot reach PD holds no lease, and a node holding no lease refuses to
+    /// write, which is how the step clock can advance on a timer rather than on a poll of nodes it
+    /// may not be able to reach.
+    pub async fn schema_lease(&self) -> Result<(u64, u64, u64), ProtoError> {
+        let response = self.call(PdReq::SchemaLease).await?;
+        match response {
+            PdResp::SchemaLease {
+                lease_ms,
+                step_interval_ms,
+                removal_extra_ms,
+            } => Ok((lease_ms, step_interval_ms, removal_extra_ms)),
+            other => Err(mismatch("SchemaLease", &other)),
+        }
+    }
+
     async fn call(&self, request: PdReq) -> Result<PdResp, ProtoError> {
         let response = self
             .transport
@@ -804,6 +873,7 @@ mod tests {
             PdReq::GetRegion { key: Bytes::new() },
             PdReq::AllocId { count: 2 },
             PdReq::Tso { count: 16 },
+            PdReq::SchemaLease,
         ]
     }
 
@@ -861,6 +931,11 @@ mod tests {
             PdResp::Tso {
                 start_ts: 0x1234_5678_9ABC,
                 count: 16,
+            },
+            PdResp::SchemaLease {
+                lease_ms: 5_000,
+                step_interval_ms: 8_000,
+                removal_extra_ms: 3_600_000,
             },
         ]
     }

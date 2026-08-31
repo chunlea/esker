@@ -39,7 +39,7 @@ use bytes::Bytes;
 
 use crate::error::{Result, SqlError};
 
-pub use store::StoreBackend;
+pub use store::{SchemaLease, StoreBackend};
 
 /// Opens transactions. One per SQL node, shared by every session.
 pub trait Backend: fmt::Debug + Send + Sync {
@@ -58,6 +58,24 @@ pub trait Backend: fmt::Debug + Send + Sync {
     /// writer committed *after* the snapshot and *before* the write, so Percolator's conflict
     /// check would not catch it.
     fn begin_at(&self, start_ts: u64) -> Result<Box<dyn Txn>>;
+
+    /// How long this node may still serve **writes** from a cached schema, or `None` when it has
+    /// no lease at all.
+    ///
+    /// [ADR 0028](../../../docs/adr/0028-the-schema-lease.md). `None` is **fail closed**: a node
+    /// that cannot reach PD holds no lease and refuses to write, which is what lets PD's step
+    /// clock advance on a timer rather than on a poll of nodes it may not be able to reach.
+    ///
+    /// Reads are never gated by it. A reader's snapshot already agrees with the rows it can see
+    /// (ADR 0020), so gating reads would add stalls and close no hole — and it would take a node
+    /// that has lost PD from *degraded* to *useless*, which is the wrong trade for a bound that
+    /// only writers can violate.
+    ///
+    /// The default is an unexpired lease of unbounded length, which is what an in-process fake
+    /// with no cluster to lose contact with means. `StoreBackend` overrides it.
+    fn schema_lease_remaining(&self) -> Option<std::time::Duration> {
+        Some(std::time::Duration::MAX)
+    }
 
     /// The oracle's current timestamp.
     ///

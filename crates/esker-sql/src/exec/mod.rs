@@ -176,13 +176,21 @@ impl Executor {
         statement: &Statement,
         written: &mut Written,
     ) -> Result<Outcome> {
-        // A write at a past snapshot is refused *here*, before anything is planned. It cannot be
-        // caught later: `Txn::put` is buffered and returns nothing, so a write in a read-only
-        // transaction would be dropped in silence and the statement would report success.
-        if (txn.is_read_only() || self.block_read_only)
-            && let Some(command) = statement.write_command()
-        {
-            return Err(SqlError::ReadOnlyTransaction(command));
+        // Every reason this statement may not write, checked *here*, before anything is planned.
+        // It cannot be caught later: `Txn::put` is buffered and returns nothing, so a write that
+        // was going to be refused would be dropped in silence and the statement would report
+        // success.
+        if let Some(command) = statement.write_command() {
+            if txn.is_read_only() || self.block_read_only {
+                return Err(SqlError::ReadOnlyTransaction(command));
+            }
+            // **The schema lease, and only for writes.** A node past its lease may be acting on a
+            // schema the cluster has moved two states beyond, which is the one thing ADR 0020's
+            // states do not make safe. Reads are untouched: a reader's snapshot already agrees
+            // with the rows it can see.
+            if self.backend.schema_lease_remaining().is_none() {
+                return Err(SqlError::SchemaLeaseExpired { command });
+            }
         }
         // Before the statement rather than after it: a DDL statement that fails part-way has
         // still written, and the reads it makes on the way are its own uncommitted catalog.

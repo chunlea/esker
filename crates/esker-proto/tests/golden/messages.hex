@@ -33,6 +33,7 @@ request pd-region-heartbeat 0303cdd70207016100020302010a01020b010a048080404d
 request pd-get-region 0403cdd702036b6579
 request pd-alloc-id 0503cdd70202
 request pd-tso 0603cdd70210
+request pd-schema-lease 0703cdd702
 request raft-snapshot 0204032a07
 response hello 0100010000000780808008
 response get 0101010176
@@ -59,6 +60,7 @@ response pd-get-region 04030107016100020302010a01020b010a01010f3132372e302e302e3
 response pd-get-region-none 0403000000
 response pd-alloc-id 0503e80702
 response pd-tso 0603bcb5e2b3c5c60410
+response pd-schema-lease 07038827c03e80dddb01
 error not-leader 0100010107
 error not-leader-blind 01000100
 error epoch-not-match 0200020100016d01020101020102016d00010201010302
