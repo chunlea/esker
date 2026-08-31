@@ -1,0 +1,23 @@
+crates/esker-client/tests/anomalies.rs
+  s_7b671d2e699216::t_8b7d26a8eab47f 1-313
+crates/esker-client/tests/bank.rs
+  s_7b671d2e699216::t_ac3db5491ec29d 474-488,495,497,499,535-537,546-550,556-561,564-568,571-594,648-656
+crates/esker-store/tests/txnkv.rs
+  s_7b671d2e699216::t_23c814e003d5b5 838-846,849-867,869-871,877,905,917,929,935-960
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a0a1aee7d29af27f1cefe51c61824c41eb04654e",
+  "prompts": {},
+  "sessions": {
+    "s_7b671d2e699216": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "efbb1686-4851-4ab6-9a2b-0781e263df25",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
