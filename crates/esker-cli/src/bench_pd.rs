@@ -72,6 +72,8 @@ pub(crate) fn run(options: &Run, dir: &Path) -> Result<Report, String> {
         elapsed,
         p50: percentile(&latencies, 0.50),
         p99: percentile(&latencies, 0.99),
+        // No database in this process, so no tier to report on.
+        tier: None,
     })
 }
 

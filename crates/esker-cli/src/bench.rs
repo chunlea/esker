@@ -26,6 +26,8 @@ use std::time::{Duration, Instant};
 
 use esker_base::rng::Pcg32;
 use esker_engine::batch::WriteBatch;
+use esker_engine::fs::tier::{TierOptions, TieredFileSystem};
+use esker_engine::fs::{FileSystem, LocalFileSystem};
 use esker_engine::options::{CfOptions, Options, ReadOptions, WalSyncMode, WriteOptions};
 use esker_engine::{Db, cf};
 
@@ -135,6 +137,12 @@ pub(crate) struct Report {
     pub(crate) p50: Duration,
     /// 99th percentile operation latency.
     pub(crate) p99: Duration,
+    /// What the SST tier did during the measured phase, when there was one.
+    ///
+    /// Taken after the clock stops and before the database is dropped: the counters are the
+    /// only way to say whether a "cold cache" run was actually cold, and a p99 without them is
+    /// a number nobody can interpret six months later.
+    pub(crate) tier: Option<esker_engine::fs::tier::TierStats>,
 }
 
 impl Report {
@@ -169,6 +177,21 @@ impl Report {
             micros(self.p50),
             micros(self.p99),
         );
+        if let Some(tier) = &self.tier {
+            let hit_rate = tier
+                .hit_rate()
+                .map_or_else(|| "n/a".to_string(), |rate| format!("{:.1}%", rate * 100.0));
+            println!(
+                "{:<11} tier: hit rate {hit_rate}  opens {}/{}  ranged reads {}  \
+                 fetches {}  evictions {}",
+                "",
+                tier.cache_hits,
+                tier.cache_hits + tier.cache_misses,
+                tier.ranged_reads,
+                tier.fetches,
+                tier.evictions,
+            );
+        }
     }
 }
 
@@ -199,6 +222,16 @@ pub(crate) struct Run {
     /// database in this process. The engine options above are the server's business then, not
     /// this driver's, and are ignored.
     pub(crate) remote: Option<String>,
+    /// Tier the SSTs into `s3://bucket/prefix` instead of leaving them on local disk.
+    ///
+    /// The endpoint and the credentials come from the environment — `ESKER_S3_ENDPOINT`,
+    /// `ESKER_S3_KEY`, `ESKER_S3_SECRET`, `ESKER_S3_REGION` — and not from flags, because a
+    /// secret on a command line is a secret in everybody's `ps` output.
+    pub(crate) sst_store: Option<String>,
+    /// Local SST bytes the tier may keep. `None` keeps everything, which is a warm cache;
+    /// `Some(0)` keeps nothing, which is the cold-cache number `docs/bench/phase-6b.md`
+    /// records. Ignored without `--sst-store`.
+    pub(crate) sst_cache_bytes: Option<u64>,
 }
 
 impl Default for Run {
@@ -217,6 +250,8 @@ impl Default for Run {
             duration_secs: 0,
             bloom_bits: 10,
             remote: None,
+            sst_store: None,
+            sst_cache_bytes: None,
         }
     }
 }
@@ -277,9 +312,76 @@ pub(crate) fn run(options: &Run) -> Result<Report, String> {
     result
 }
 
+/// Builds the filesystem the database will run on: the local one, or a tiered one when
+/// `--sst-store` was given.
+///
+/// The tier runs with `background: false` for the whole bench. That is not how a store runs —
+/// [ADR 0024](../../../docs/adr/0024-tiering-failure-semantics.md) puts the uploader on its own
+/// thread precisely so a flush never waits — but a benchmark wants a *steady state*, and an
+/// uploader fetching files back while the measured phase reads them would be measuring the
+/// interference. Uploads are driven explicitly between the populate and the measurement
+/// instead, and nothing moves after that.
+fn build_filesystem(options: &Run, dir: &Path) -> Result<Arc<dyn FileSystem>, String> {
+    let local = Arc::new(LocalFileSystem::new());
+    let Some(store_url) = &options.sst_store else {
+        return Ok(local);
+    };
+
+    let endpoint_url =
+        std::env::var("ESKER_S3_ENDPOINT").unwrap_or_else(|_| "http://localhost:19000".to_string());
+    let endpoint = esker_s3::Endpoint::parse(&endpoint_url).map_err(|err| err.to_string())?;
+    let credentials = esker_s3::Credentials::new(
+        std::env::var("ESKER_S3_KEY").unwrap_or_else(|_| "eskertest".to_string()),
+        std::env::var("ESKER_S3_SECRET").unwrap_or_else(|_| "eskertest123".to_string()),
+    );
+    let region = std::env::var("ESKER_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+
+    let config = esker_s3::Config::from_store_url(store_url, endpoint, region, credentials)
+        .map_err(|err| err.to_string())?;
+    let key_prefix = config.prefix.clone();
+    let client = Arc::new(esker_s3::S3Client::new(config));
+
+    TieredFileSystem::new(
+        local,
+        client,
+        dir,
+        TierOptions {
+            key_prefix,
+            local_budget: options.sst_cache_bytes,
+            background: false,
+            ..TierOptions::default()
+        },
+    )
+    .map(|tier| tier as Arc<dyn FileSystem>)
+    .map_err(|err| format!("opening the SST tier at {store_url}: {err}"))
+}
+
+/// Uploads everything the populate phase wrote, then lets the governor settle.
+///
+/// Loops until a pass moves nothing: one pass handles `batch` files, and a populate can leave
+/// many more than that. Does nothing at all when the filesystem has no tier.
+fn drain_the_tier(db: &Db) -> Result<(), String> {
+    if db.tier_stats().is_none() {
+        return Ok(());
+    }
+    // Bounded so that a store that is refusing every upload ends the bench with a message
+    // rather than spinning: each pass that moves nothing still runs the governor, so two
+    // consecutive empty passes mean there is nothing left to do or nothing that can be done.
+    let mut empty_passes = 0;
+    for _ in 0..10_000 {
+        let moved = db.tier_maintenance().map_err(|err| err.to_string())?;
+        empty_passes = if moved == 0 { empty_passes + 1 } else { 0 };
+        if empty_passes >= 2 {
+            break;
+        }
+    }
+    Ok(())
+}
+
 fn run_in(options: &Run, dir: &Path) -> Result<Report, String> {
     std::fs::create_dir_all(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
-    let db = Db::open(
+    let fs = build_filesystem(options, dir)?;
+    let db = Db::open_with(
         dir,
         Options {
             create_if_missing: true,
@@ -292,6 +394,8 @@ fn run_in(options: &Run, dir: &Path) -> Result<Report, String> {
             },
             ..Options::default()
         },
+        fs,
+        &cf::BUILTIN,
     )
     .map_err(|err| format!("opening {}: {err}", dir.display()))?;
     let db = Arc::new(db);
@@ -302,6 +406,10 @@ fn run_in(options: &Run, dir: &Path) -> Result<Report, String> {
         populate(&db, options)?;
         db.flush(cf::DEFAULT).map_err(|err| err.to_string())?;
     }
+    // Untimed for the same reason, and *before* the clock starts so that the measured phase
+    // sees whatever steady state the budget implies: everything local, nothing local, or the
+    // mixture in between that makes the hit rate a number worth recording.
+    drain_the_tier(&db)?;
 
     let started = Instant::now();
     let latencies = match options.workload {
@@ -319,6 +427,8 @@ fn run_in(options: &Run, dir: &Path) -> Result<Report, String> {
         other => return Err(format!("{} has no measured phase", other.name())),
     };
     let elapsed = started.elapsed();
+    // After the clock, before the drop: the tier's counters describe the measured phase.
+    let tier = db.tier_stats();
 
     let operations = u64::try_from(latencies.len()).unwrap_or(u64::MAX);
     // Key plus value either way: a read moves the same bytes a write did.
@@ -334,6 +444,7 @@ fn run_in(options: &Run, dir: &Path) -> Result<Report, String> {
         elapsed,
         p50: percentile(&latencies, 0.50),
         p99: percentile(&latencies, 0.99),
+        tier,
     })
 }
 
@@ -605,6 +716,8 @@ mod tests {
             duration_secs: 0,
             bloom_bits: 10,
             remote: None,
+            sst_store: None,
+            sst_cache_bytes: None,
         }
     }
 

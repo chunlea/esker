@@ -25,6 +25,9 @@ esker-proto.workspace = true
 # `pd serve` puts the wire in front of a placement driver, and `pd inspect` reads the state
 # it keeps in its own engine (docs/DESIGN.md §7).
 esker-pd.workspace = true
+# `bench --sst-store` opens the database on a tiered filesystem, which needs the S3 client to
+# point it at (phase 6b, docs/bench/phase-6b.md).
+esker-s3.workspace = true
 # The runtime `server` runs on, and the ctrl-c it stops on. This is the only command that
 # builds one: `raw` and `bench --remote` go through the client's blocking transport.
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros"] }

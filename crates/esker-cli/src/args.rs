@@ -177,6 +177,12 @@ Bench options:
       --dir PATH        Where to put the database (default a temporary directory)
       --duration-secs N Stop the measured phase early after this long (default 0, no limit)
       --bloom-bits N    Bloom filter bits per key; 0 builds none (default 10)
+      --sst-store URL   Tier SSTs into s3://bucket/prefix; the endpoint and credentials
+                        come from ESKER_S3_ENDPOINT, ESKER_S3_KEY, ESKER_S3_SECRET and
+                        ESKER_S3_REGION, never from a flag
+      --sst-cache-bytes N
+                        Local SST bytes the tier may keep; 0 is a cold cache. Needs
+                        --sst-store
       --remote HOST:PORT  Drive the workload over the network against a running
                         server instead of an in-process database. The engine
                         options above belong to that server and are ignored.
@@ -322,6 +328,20 @@ fn parse_bench(arguments: &[String]) -> Result<Command, ParseError> {
         }
         if flag == "--remote" {
             options.remote = Some(take_value(arguments, &mut index, inline, "--remote")?);
+            continue;
+        }
+        if flag == "--sst-store" {
+            options.sst_store = Some(take_value(arguments, &mut index, inline, "--sst-store")?);
+            continue;
+        }
+        if flag == "--sst-cache-bytes" {
+            let raw = take_value(arguments, &mut index, inline, "--sst-cache-bytes")?;
+            // Zero is the point of the flag — it is what makes the cache cold — so this
+            // parses a plain `u64` and does not reject it.
+            options.sst_cache_bytes = Some(raw.parse().map_err(|_| ParseError::InvalidValue {
+                flag: "--sst-cache-bytes",
+                value: raw.clone(),
+            })?);
             continue;
         }
 
@@ -1073,6 +1093,48 @@ mod tests {
             panic!("expected a bench command");
         };
         assert_eq!(options.dir, Some(PathBuf::from("/tmp/esker")));
+    }
+
+    /// The tiering flags, in both forms. `--sst-cache-bytes 0` is the cold-cache run
+    /// `docs/bench/phase-6b.md` records, so zero has to parse rather than be rejected as a
+    /// nonsense size the way `--threads 0` is.
+    #[test]
+    fn bench_takes_the_tiering_flags() {
+        let Command::Bench(options) = parse_ok(&[
+            "bench",
+            "readrandom",
+            "--sst-store=s3://esker/tier",
+            "--sst-cache-bytes",
+            "0",
+        ]) else {
+            panic!("expected a bench command");
+        };
+        assert_eq!(options.sst_store.as_deref(), Some("s3://esker/tier"));
+        assert_eq!(options.sst_cache_bytes, Some(0));
+
+        let Command::Bench(options) = parse_ok(&["bench", "--sst-cache-bytes=1048576"]) else {
+            panic!("expected a bench command");
+        };
+        assert_eq!(options.sst_cache_bytes, Some(1024 * 1024));
+
+        // Absent means local SSTs, which is every run before this phase.
+        let Command::Bench(options) = parse_ok(&["bench"]) else {
+            panic!("expected a bench command");
+        };
+        assert_eq!(options.sst_store, None);
+        assert_eq!(options.sst_cache_bytes, None);
+
+        assert_eq!(
+            parse(["bench", "--sst-cache-bytes", "lots"]),
+            Err(ParseError::InvalidValue {
+                flag: "--sst-cache-bytes",
+                value: "lots".to_owned()
+            })
+        );
+        assert_eq!(
+            parse(["bench", "--sst-store"]),
+            Err(ParseError::MissingValue("--sst-store"))
+        );
     }
 
     /// An unknown flag is an error, not something silently dropped. The same rule the wire
