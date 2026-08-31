@@ -1,0 +1,19 @@
+docs/bench/phase-4.md
+  s_afe85b170e9777::t_b2310ecdeded41 196-290
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a37c42f1431a2505dbd8fdced918f2d0c12085e4",
+  "prompts": {},
+  "sessions": {
+    "s_afe85b170e9777": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9d2ba3cf-8922-46e7-833a-93e8265a013f",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
