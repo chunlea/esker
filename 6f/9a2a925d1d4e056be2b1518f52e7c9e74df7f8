@@ -1,0 +1,23 @@
+crates/esker-store/src/columnar/decode.rs
+  s_dc640bf0df4adb::t_706190457b2507 1-317
+crates/esker-store/src/columnar/mod.rs
+  s_dc640bf0df4adb::t_75edb94d56dd1c 37,52-69,88,90-91,136-137,140-141,181,190-192,204,206,225-234,259,263,266-267,293,296-298,382-383,481-484,534,556,558,570
+crates/esker-store/tests/columnar_differential.rs
+  s_dc640bf0df4adb::t_c5afa1023a9541 77-85,144-146,265-266,374-376
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "6f9a2a925d1d4e056be2b1518f52e7c9e74df7f8",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
