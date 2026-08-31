@@ -1,0 +1,21 @@
+crates/esker-s3/src/client.rs
+  s_88c85077107b97::t_13c7738cd7f84d 435,478
+crates/esker-s3/src/xml.rs
+  s_88c85077107b97::t_86867685499115 95-123,127,207-240
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "8aa81ec416cb56354f192fbf72f27cbaaa2e41f3",
+  "prompts": {},
+  "sessions": {
+    "s_88c85077107b97": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e65761d1-f1de-4347-93cc-b0b75ed50b76",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
