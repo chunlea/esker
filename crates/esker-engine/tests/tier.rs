@@ -460,3 +460,83 @@ fn an_object_that_changed_underneath_us_is_an_error_not_wrong_bytes() {
         "reading a replaced object returned {result:?} instead of failing"
     );
 }
+
+/// **Regression: an idle column family must not pin the write-ahead log.**
+///
+/// `roll_log_and_switch` updates `active_log` only for the families it switches, so a family
+/// that goes idle keeps a stale one — and `oldest_log` used to answer it unconditionally, which
+/// pinned `advance_log_number` for ever. A store with four families and traffic to one then
+/// retained every WAL segment it had ever written.
+///
+/// Two things go wrong when it does, and the second is worse than the first: the data directory
+/// grows without bound, and every write ever made stays in the log, so a node that loses its
+/// SSTs loses nothing and a tier that is doing its job cannot be told from one that is not.
+/// This test lives here rather than beside the other flush tests because that is how it was
+/// found — `losing_every_local_sst_loses_no_data` at the store level quietly proved nothing.
+#[test]
+fn an_idle_column_family_does_not_pin_the_write_ahead_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = Options {
+        create_if_missing: true,
+        compaction_threads: 1,
+        cf_options: esker_engine::options::CfOptions {
+            // Small, so a few hundred keys roll the log many times.
+            write_buffer_size: 64 * 1024,
+            ..esker_engine::options::CfOptions::default()
+        },
+        ..Options::default()
+    };
+    // Two families; only one is ever written to. `idle` is `esker-store`'s `lock` and `write`.
+    let db = Db::open_with(
+        dir.path(),
+        options,
+        Arc::new(LocalFileSystem::new()) as Arc<dyn FileSystem>,
+        &["default", "idle"],
+    )
+    .unwrap();
+
+    let value = vec![b'v'; 512];
+    for round in 0..40 {
+        for index in 0..100u32 {
+            db.put(
+                "default",
+                format!("k{round:02}{index:04}").as_bytes(),
+                &value,
+            )
+            .unwrap();
+        }
+        db.flush("default").unwrap();
+    }
+
+    let wal_segments = LocalFileSystem::new()
+        .list(dir.path())
+        .unwrap()
+        .into_iter()
+        .filter(|path| {
+            matches!(
+                esker_engine::filename::classify_path(path),
+                Some(esker_engine::filename::FileKind::Wal(_))
+            )
+        })
+        .count();
+    assert!(
+        wal_segments <= 3,
+        "{wal_segments} WAL segments survived 40 flushes — an idle family is pinning the log"
+    );
+
+    // And the data is all still there, which is the half that matters more.
+    for round in [0u32, 20, 39] {
+        assert_eq!(
+            db.get(
+                "default",
+                format!("k{round:02}0050").as_bytes(),
+                &ReadOptions::default()
+            )
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+            value.as_slice(),
+            "round {round}"
+        );
+    }
+}

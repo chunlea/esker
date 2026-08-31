@@ -474,14 +474,23 @@ impl DbInner {
 
     /// Moves the log number up to the oldest segment any memtable still depends on.
     fn advance_log_number(&self) -> Result<()> {
+        // Captured *before* the scan below, and this ordering is load-bearing. A family that
+        // reads as empty may take a write an instant later; that write goes into whatever
+        // segment is current *then*, which is this number or a later one. Retiring everything
+        // below it is therefore safe. Reading it afterwards would let the log roll in between
+        // and retire a segment a family's memtable had just been filled from.
+        let current = lock(&self.wal)?.number;
+
         let families: Vec<Arc<ColumnFamily>> = read_lock(&self.cfs)?.values().cloned().collect();
         let mut oldest = u64::MAX;
         for cf in &families {
             let mem = read_lock(&cf.mem)?;
             oldest = oldest.min(oldest_log(&mem));
         }
+        // Every family is empty, so no segment is holding anyone's unflushed data and the
+        // whole history behind the current one can go.
         if oldest == u64::MAX {
-            return Ok(());
+            oldest = current;
         }
         {
             let mut versions = lock(&self.versions)?;
@@ -496,9 +505,36 @@ impl DbInner {
     }
 }
 
-/// The oldest log segment a column family's memtables still depend on.
+/// The oldest log segment a column family's memtables still depend on, or [`u64::MAX`] when it
+/// depends on none.
+///
+/// # Why an empty family must answer "none"
+///
+/// `roll_log_and_switch` updates `active_log` only for the families it actually switches — the
+/// full ones — so a family that goes idle keeps whatever segment it was last switched onto,
+/// for ever. Answering `active_log` unconditionally then pins `advance_log_number` at that
+/// stale segment and **no WAL segment is ever retired again**.
+///
+/// That is not a theoretical shape. `esker-store` opens four families and a RawKV-only
+/// workload writes to two of them; `lock` and `write` sit empty and pin the log at the segment
+/// they were created in. The symptom is a data directory that grows without bound and a
+/// recovery that replays the entire history of the database — and, because every write ever
+/// made is still in the log, a store that appears not to need its SSTs at all. Found by the
+/// phase-6b acceptance test, which deleted a node's SSTs and lost nothing.
+///
+/// An empty active memtable genuinely depends on no segment: everything the family ever held
+/// has been flushed, and a write arriving after this returns lands in whatever segment is
+/// current then, which is never one being retired (see `advance_log_number`).
+///
+/// A **non-empty** active memtable still answers `active_log`, which may be older than the
+/// segment its data is really in for the same stale-`active_log` reason. That direction is
+/// safe: it retains more than it must, never less.
 fn oldest_log(mem: &MemState) -> u64 {
-    mem.immutable
-        .first()
-        .map_or(mem.active_log, |(_, log)| *log)
+    if let Some((_, log)) = mem.immutable.first() {
+        return *log;
+    }
+    if mem.active.is_empty() {
+        return u64::MAX;
+    }
+    mem.active_log
 }
