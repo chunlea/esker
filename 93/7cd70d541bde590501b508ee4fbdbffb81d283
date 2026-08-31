@@ -1,0 +1,26 @@
+crates/esker-sql/src/lib.rs
+  h_44076b318daf9c 33-34
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 1-705
+crates/esker-sql/src/parse/mod.rs
+  h_44076b318daf9c 3-8,30-33,35-37
+crates/esker-sql/src/plan/mod.rs
+  h_44076b318daf9c 4
+crates/esker-sql/tests/containment.rs
+  h_44076b318daf9c 1-154
+docs/adr/0014-sqlparser.md
+  h_44076b318daf9c 49,82-84,94-98,101-122
+docs/plans/phase-6a.md
+  h_44076b318daf9c 525-543
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "937cd70d541bde590501b508ee4fbdbffb81d283",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
