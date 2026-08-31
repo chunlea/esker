@@ -65,7 +65,16 @@ async fn open(
 ) -> Node {
     let dir = tempfile::tempdir().unwrap();
     let mut raft = RaftOptions::new(peers.to_vec(), 20_260_830);
-    raft.tick = Duration::from_millis(5);
+    // **25 ms and not 5.** `esker-raft` counts ticks and never reads a clock, so the election
+    // timeout is 10-20 of these: 250-500 ms here against production's 1-2 s (`TICK_MS` = 100).
+    // At 5 ms it was 50-100 ms, and a 50 ms election timeout is a bet that the box will schedule
+    // this thread within 50 ms. Under a saturated `--workspace` run it will not, and the trace is
+    // unmistakable — a two-voter region racing its term 22 -> 97 in fifteen seconds, both peers
+    // alternately campaigning, no leader for long enough to apply anything. That is correct Raft
+    // on a machine that has been taken away from it, not a bug to find; the bug was compressing
+    // the timeout twentyfold while scheduling jitter did not compress with it
+    // (`docs/plans/debt-c1.md` section 3).
+    raft.tick = Duration::from_millis(25);
     raft.compaction = LogCompaction {
         threshold: 32,
         keep: 8,

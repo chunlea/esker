@@ -105,3 +105,70 @@ compress with it.
 
 So the second broken assumption is the harness's: **a 5 ms raft tick is deliverable**. See §3.
 
+## 3. The harness assumption: a 5 ms raft tick is deliverable
+
+`esker-raft` counts ticks and never reads a clock, so an election timeout is 10-20 ticks of
+whatever the caller says a tick is worth. Production says 100 ms (`TICK_MS`), giving 1-2 s. Both
+tests said **5 ms**, giving 50-100 ms — a twentyfold compression, made to keep the tests fast.
+
+Scheduling jitter does not compress with it. A 50 ms election timeout is a bet that the machine
+will schedule this thread within 50 ms, and under a saturated `--workspace` run it will not. The
+trace is a two-voter region racing its term 22 → 97 in fifteen seconds with no leader long enough
+to apply anything. Nothing there is a defect to find: it is correct Raft on a machine that has
+been taken away from it.
+
+Both tests now use `tick = 25 ms` — 250-500 ms, a fivefold compression instead of twentyfold —
+with the reasoning in a comment at each site so the next person to reach for 5 ms sees why.
+
+`snapshot.rs`'s `put` also stopped unwrapping. A one-shot write made "leadership does not move"
+a silent precondition of every test in the file, which is not that file's subject and is not
+true: once `AddPeer`'s learner is promoted the region has two voters, and a starved box
+legitimately elects the other one. That is what fifteen of twenty failures were after §1's fix
+— `NotLeader { leader_hint: Some(2) }`, three lines after the region had arrived exactly as the
+test wanted. It now retries retryable answers against a fresh epoch, and still fails on the spot
+for anything else.
+
+### Result
+
+| | before | after §1 | after §3 |
+|---|---|---|---|
+| `a_region_reaches_a_store_that_never_had_it` | 19/30 failed | 18/20 failed | **0/20 failed** |
+| `regions_reach_a_store_that_joins_...` | 12/30 failed | 10/20 failed | **0/20 failed** |
+
+Ten copies at once on sixteen cores, twice over: the DoD's twenty consecutive runs each, at a
+load meaningfully harsher than the saturated nextest run that produced the original flake.
+
+## 4. The claim marker (task 2)
+
+Design and consequences are [ADR 0029](../adr/0029-the-sst-store-claim.md). What is worth
+repeating here is the one thing that changed shape during the work: **identity is not
+`(cluster_id, store_id)`.** Two `esker bench` runs have neither id and would have been judged the
+same database; two stores misconfigured with one store id are exactly the collision worth
+catching. So the authority is a random id drawn once and kept in the database's *own* directory,
+with the cluster and store ids carried along so a refusal names something an operator recognises.
+
+Built:
+
+* `esker_engine::fs::claim` — the format (37 fixed bytes, magic, version, CRC32C), the local
+  id file, and the typed errors. Golden test; every single-bit flip refused.
+* `TieredFileSystem::new` claims or verifies before it lists the bucket, so a database that is
+  going to be refused never learns another database's file numbers.
+* `esker server --adopt-sst-store` — the explicit hatch for a prefix that holds objects and no
+  marker, which is every pre-6c prefix.
+
+Tested: `esker-engine/tests/tier_claim.rs` (11, `MemoryStore`), the format's own unit tests (8),
+`tier_minio.rs::a_prefix_claimed_over_http_refuses_the_second_database` (real `MinIO`), and
+`esker-cli/tests/tier_acceptance.rs` unchanged and green — three store processes on derived
+`node-N` prefixes, losing a disk and rebuilding from the bucket, which is requirement (d).
+
+## What this lane did not do
+
+* **The simultaneous-claim race** is narrowed to two round trips by a read-back, not closed.
+  Closing it wants `PutObject` with `If-None-Match: *`; ADR 0029 records why that waits for the
+  next change to `esker-s3`.
+* **`esker bench` has no `--adopt-sst-store`.** A benchmark pointed at a stale prefix should get
+  a fresh one, not adopt somebody's objects; `esker server` is where an operator has a database
+  worth keeping.
+* **Nothing was done about the store-level heartbeat intervals** (`heartbeat_tick` and friends
+  at 5-20 ms in these tests). They are a schedule resolution, not a correctness threshold, and
+  the traces never implicated them. Left alone deliberately.

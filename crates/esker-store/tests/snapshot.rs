@@ -41,10 +41,29 @@ fn raft_options(
     bootstrap_voters: Option<Vec<u64>>,
 ) -> RaftOptions {
     let mut raft = RaftOptions::new(peers, 20_260_830);
-    raft.tick = Duration::from_millis(5);
+    // **25 ms and not 5.** `esker-raft` counts ticks and never reads a clock, so the election
+    // timeout is 10-20 of these: 250-500 ms here against production's 1-2 s (`TICK_MS` = 100).
+    // At 5 ms it was 50-100 ms, and a 50 ms election timeout is a bet that the box will schedule
+    // this thread within 50 ms. Under a saturated `--workspace` run it will not, and the trace is
+    // unmistakable — a two-voter region racing its term 22 -> 97 in fifteen seconds, both peers
+    // alternately campaigning, no leader for long enough to apply anything. That is correct Raft
+    // on a machine that has been taken away from it, not a bug to find; the bug was compressing
+    // the timeout twentyfold while scheduling jitter did not compress with it
+    // (`docs/plans/debt-c1.md` section 3).
+    raft.tick = Duration::from_millis(25);
     raft.compaction = compaction;
     raft.bootstrap_voters = bootstrap_voters;
     raft
+}
+
+/// Turns the store's own tracing on when `RUST_LOG` is set. A transfer that does not happen is
+/// always "something was dropped somewhere", and only the log says which something.
+fn trace() {
+    use tracing_subscriber::fmt;
+    let _ = fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
 }
 
 /// Takes a free port and releases it, so two stores can be told each other's addresses before
@@ -115,12 +134,41 @@ fn key(n: u32) -> Bytes {
     Bytes::from(format!("k{n:05}"))
 }
 
+/// Writes one key, retrying while the answer is one the caller is told to retry.
+///
+/// **Not `unwrap`.** A one-shot write makes "leadership does not move, and no epoch changes
+/// underneath us" a silent precondition of every test in this file, and that precondition is not
+/// this file's subject — a region *arriving* is. It is also false: once `AddPeer`'s learner is
+/// promoted the region has two voters, and a two-voter group on a box that will not schedule its
+/// threads legitimately elects the other one. Under saturation that is what happened, fifteen
+/// times in twenty runs, as `NotLeader { leader_hint: Some(2) }` out of a `put` three lines
+/// after the region had arrived exactly as the test wanted (`docs/plans/debt-c1.md` section 3).
+///
+/// Retrying is the honest reading of a retryable error, and a non-retryable one still fails the
+/// test on the spot. The epoch is re-read each time round, because the reason to retry is that
+/// something moved.
 async fn put(store: &Arc<Store>, region: &Region, key: Bytes, value: &[u8]) {
-    let header = RequestHeader::new(region.id, region.epoch, 0);
-    store
-        .serve(header, RawKvReq::put(key, Bytes::copy_from_slice(value)))
-        .await
-        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        // The region as it stands now, not as the caller last saw it.
+        let epoch = store
+            .regions()
+            .get(region.id)
+            .map_or(region.epoch, |state| state.region().epoch);
+        let header = RequestHeader::new(region.id, epoch, 0);
+        let request = RawKvReq::put(key.clone(), Bytes::copy_from_slice(value));
+        match store.serve(header, request).await {
+            Ok(_) => return,
+            Err(error) => {
+                assert!(error.is_retryable(), "writing {key:?}: {error}");
+                assert!(
+                    Instant::now() < deadline,
+                    "writing {key:?} never succeeded; last answer {error}"
+                );
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    }
 }
 
 // -- membership -------------------------------------------------------------------------
@@ -250,6 +298,7 @@ async fn an_operator_against_a_stale_epoch_is_dropped() {
 /// with its data intact.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_region_reaches_a_store_that_never_had_it() {
+    trace();
     let pd = Arc::new(FakePd::new());
     let first_address = reserve();
     let second_address = reserve();
