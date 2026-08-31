@@ -596,3 +596,49 @@ into history while a sibling lane was committing to the same branch:
   half-way through a scan has already done work somebody might use. It type-checks as well:
   comparing text with an integer answers `operator does not exist`, which is what a real server
   says, rather than a silent `false`.
+
+**Format version 2: a chunk now proves where it belongs.** The biggest thing this milestone found,
+and the fuzz found it rather than a reading. Unit 4 extended the file campaign to run *fragments*
+against mutated files, and on its first real run one of them answered with **another stripe's
+rows**, with no error anywhere. The mutation was the campaign's "copy a region of the file over
+another region", which happened to land chunk-aligned: a whole valid chunk — payload, codec byte
+and checksum together — laid over a different one. Every check passed, because every check only
+ever asked whether the bytes were *intact*. They were; they were the wrong bytes.
+
+That is what a misdirected write looks like, and the general form is worth keeping: **a checksum
+proves a block is intact, not that it is the block that was asked for.** A chunk's CRC now covers
+its offset, which is not stored because both sides know it, so the layout is unchanged and only
+four bytes per chunk moved. The goldens were re-blessed — which the golden test forbids except for
+a real format change with a version bump and an ADR, and this is the first one. ADR 0027 records
+the residual it does not close: a chunk taken from the same offset in a *different* columnar file
+still verifies, and closing that needs a random file identity this build has no entropy source to
+generate.
+
+**Decoding follows what is *named*, not what is projected.** The plan said "decode only the
+projected columns"; the evaluator decodes the union of the slots the filter, the grouping and the
+aggregates actually reference, which is narrower. `count(*)` therefore decodes nothing.
+
+**Pruning is a switch, not a constant.** `ScanOptions::prune` exists for the reason ADR 0022 gives
+for the session GUC it asks the planner to have — somebody who knows better, and somebody
+bisecting a wrong answer. It is also what lets the soundness test run every generated fragment
+both ways.
+
+**`count(*)` is not answered from the footer, though it could be.** A fragment with no filter whose
+only aggregate is `count(*)` is the sum of the stripe index, and the evaluator still walks the
+rows. Leaving the special case out is deliberate: it is a branch in the hot path that this
+milestone has not earned, and `docs/bench/columnar-m2.md` records the number it would improve.
+
+### The numbers, and the one that is not flattering
+
+`docs/bench/columnar-m2.md` has the tables. Two are worth restating here:
+
+* **3.5×** between the same scan over one column and over six — the ratio ADR 0022 states its cost
+  rule in, and the number that answers "what does columnar buy".
+* **13.56 against 17.04 M rows/s**: reading *every* column is **slower** columnar than row-wise.
+  Which is what the cost rule predicts, and why ADR 0022's rule 1 keeps point reads and small
+  bounded ranges on a row replica. Reporting the first without the second would be marketing.
+
+The differential campaign ran 1,619,880 fragments in 75 seconds, 1,419,144 of them evaluable
+rather than refused, with no disagreement. The extended fuzz ran 1,854,320 damaged files against
+five fragments each — 2,688,984 answers survived a damaged file and every one was the *right*
+answer — plus 402 million cases through the fragment decoder.
