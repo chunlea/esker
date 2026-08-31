@@ -1,0 +1,19 @@
+docs/plans/phase-7-columnar.md
+  s_cf8601956e2620::t_96cf6d68e0567c 579-598
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "f60e15fdcf1f886fdb0c04cf4ff912aba3389b32",
+  "prompts": {},
+  "sessions": {
+    "s_cf8601956e2620": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "732aecbc-5268-4943-836e-a49ba67b2585",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
