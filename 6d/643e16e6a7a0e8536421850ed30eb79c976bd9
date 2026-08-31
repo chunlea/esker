@@ -1,0 +1,39 @@
+crates/esker-sql/src/catalog/mod.rs
+  s_81a3dd1e652b18::t_b11d37b12d264a 815-861,1496-1552
+crates/esker-sql/src/catalog/record.rs
+  s_81a3dd1e652b18::t_084df9d4ce62fc 75-82,222-280,728-736
+crates/esker-sql/src/exec/ddl.rs
+  s_81a3dd1e652b18::t_f4d861fded77a7 425-442,444
+crates/esker-sql/src/exec/verbs.rs
+  s_81a3dd1e652b18::t_75c05eee5f250a 41,56,205-239
+crates/esker-sql/src/parse/lower.rs
+  s_81a3dd1e652b18::t_65ef8b064d9352 32,193-207,484-488,559-580
+crates/esker-sql/src/plan/ddl.rs
+  s_81a3dd1e652b18::t_3e0c6132d59f04 218-233
+crates/esker-sql/src/plan/time_machine.rs
+  s_81a3dd1e652b18::t_ca50c71cdf17b9 59-65
+crates/esker-sql/tests/corpus/pg19_storage_parameters.txt
+  s_81a3dd1e652b18::t_5a11f8aa1cd65d 1-29
+crates/esker-sql/tests/ddl.rs
+  s_81a3dd1e652b18::t_a50d1fd2528a53 25,73-86,946-1022
+docs/adr/0022-columnar-learner-replica.md
+  s_81a3dd1e652b18::t_d11b84a9872710 132-156
+docs/plans/phase-6a.md
+  s_81a3dd1e652b18::t_8b18d4c7e91792 388-408
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "6d643e16e6a7a0e8536421850ed30eb79c976bd9",
+  "prompts": {},
+  "sessions": {
+    "s_81a3dd1e652b18": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a496fe55-1dd5-47a0-acee-877c11a897d0",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
