@@ -1,0 +1,33 @@
+crates/esker-client/Cargo.toml
+  s_4dac2a9786305f::t_1b6f7facbd75d1 43-48
+crates/esker-client/src/lib.rs
+  s_4dac2a9786305f::t_fed997ae7e56f4 50-53
+crates/esker-client/src/txn.rs
+  s_4dac2a9786305f::t_ea332b485813a9 61,67,78-107,561,589-592,596-597,600,602-603,749,760-787,789-791,798-894
+crates/esker-client/tests/txn.rs
+  s_4dac2a9786305f::t_819058207ac774 25-45,701-750,754-755,757-762,785-792,794-795,797-816,822-829,836-956,975,977,998-1000,1025,1054-1055,1076,1091,1114,1159-1165,1192-1193,1197-1198,1202-1205,1209-1211,1213-1215,1217-1226,1231,1234-1244,1246-1248,1251,1253,1255-1256
+crates/esker-client/tests/txn_cluster/mod.rs
+  s_4dac2a9786305f::t_93c25841f79047 1-458
+crates/esker-client/tests/txn_crash_boundaries.rs
+  s_4dac2a9786305f::t_376966f3e92f6c 1-351
+crates/esker-client/tests/txn_ttl.rs
+  s_4dac2a9786305f::t_cdec0a0995a06b 1-71
+docs/txn-spec.md
+  s_4dac2a9786305f::t_2c29dede535a32 263-284
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "3d11f73bf4a9c984aa3fa59bc8d328b5599bc03e",
+  "prompts": {},
+  "sessions": {
+    "s_4dac2a9786305f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c856055d-e868-42d6-b63f-7ca0cbb2c857",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
