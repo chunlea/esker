@@ -39,6 +39,7 @@
 
 pub mod codec;
 pub mod error;
+pub mod fragment;
 pub mod frame;
 pub mod messages;
 pub mod pd;

@@ -8,6 +8,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use bytes::Bytes;
+use esker_proto::fragment::{
+    AggregateKind, Body, FragmentReq, FragmentResp, Group, Partial, RefusalReason, ScanStats,
+    Value, ValueType,
+};
 use esker_proto::messages::{DEFAULT_SCAN_LIMIT, Hello, HelloAck, RawKvReq, RawKvResp};
 use esker_proto::pd::{Operator, PdReq, PdResp, StoreInfo};
 use esker_proto::txn::{LockInfo, TxnKvReq, TxnKvResp, TxnMutation, TxnStatus};
@@ -279,6 +283,7 @@ fn golden_requests() -> Vec<(&'static str, Request)> {
     ];
     requests.extend(golden_pd_requests());
     requests.extend(golden_txn_requests());
+    requests.extend(golden_fragment_requests());
     requests
 }
 
@@ -725,6 +730,7 @@ fn golden_responses() -> Vec<(&'static str, Response)> {
     ];
     responses.extend(golden_pd_responses());
     responses.extend(golden_txn_responses());
+    responses.extend(golden_fragment_responses());
     responses
 }
 
@@ -885,6 +891,110 @@ fn golden_lock_info() {
         LockInfo::from_error(&lock.into_error()).unwrap().unwrap(),
         lock
     );
+}
+
+/// The fragment goldens' opaque payload. **Not a real fragment**: this crate never parses one,
+/// and a golden that carried a valid `esker_columnar` fragment would suggest it did.
+const FRAGMENT_BYTES: &[u8] = &[0x01, 0xAA, 0xBB];
+/// Big enough that its varint is three bytes, so the golden pins a multi-byte one.
+const MIN_APPLY_INDEX: u64 = 1 << 20;
+
+fn golden_fragment_requests() -> Vec<(&'static str, Request)> {
+    vec![(
+        "fragment-evaluate",
+        Request::Fragment {
+            header: header(),
+            request: FragmentReq {
+                fragment: Bytes::from_static(FRAGMENT_BYTES),
+                ts: TXN_TS,
+                min_apply_index: MIN_APPLY_INDEX,
+            },
+        },
+    )]
+}
+
+/// The rows result the response golden carries, and a golden of the result format in its own
+/// right. Two columns and two rows, the second row's text NULL, so the golden pins a declared
+/// type list, a value of every shape it names, and the NULL that costs one byte.
+fn golden_result_rows() -> Body {
+    Body::Rows {
+        types: vec![ValueType::Int8, ValueType::Text],
+        rows: vec![
+            vec![Value::Int8(7), Value::Text("ok".to_owned())],
+            vec![Value::Int8(-1), Value::Null],
+        ],
+    }
+}
+
+/// A groups result: one key column, a `count` and a `sum`, and a group whose sum is NULL over no
+/// rows — which is the same byte an absent value is, deliberately.
+fn golden_result_groups() -> Body {
+    Body::Groups {
+        key_types: vec![ValueType::Text],
+        aggregates: vec![
+            (AggregateKind::Count, None),
+            (AggregateKind::Sum, Some(ValueType::Int8)),
+        ],
+        groups: vec![
+            Group {
+                key: vec![Value::Text("a".to_owned())],
+                partials: vec![Partial::Count(3), Partial::Sum(Some(Value::Int8(10)))],
+            },
+            Group {
+                key: vec![Value::Text("b".to_owned())],
+                partials: vec![Partial::Count(0), Partial::Sum(None)],
+            },
+        ],
+    }
+}
+
+fn golden_fragment_responses() -> Vec<(&'static str, Response)> {
+    vec![
+        (
+            "fragment-result",
+            Response::Fragment(FragmentResp::Result {
+                result: Bytes::from(
+                    esker_proto::fragment::encode_result(&golden_result_rows()).unwrap(),
+                ),
+                stats: ScanStats {
+                    stripes_considered: 9,
+                    stripes_read: 4,
+                    chunks_decoded: 12,
+                    rows_scanned: 5_000,
+                    rows_matched: 37,
+                },
+            }),
+        ),
+        (
+            "fragment-refused",
+            Response::Fragment(FragmentResp::Refused {
+                reason: RefusalReason::Unsupported,
+                detail: "no such aggregate: stddev".to_owned(),
+            }),
+        ),
+    ]
+}
+
+/// The result format is pinned on its own, not only inside the response that carries it: it has
+/// its own version and its own checksum because it survives being cached, spilled or forwarded
+/// without a frame around it, and a format with its own version needs its own golden.
+#[test]
+fn golden_fragment_results() {
+    for (name, body) in [
+        ("rows", golden_result_rows()),
+        ("groups", golden_result_groups()),
+    ] {
+        let encoded = esker_proto::fragment::encode_result(&body).unwrap();
+        assert_eq!(
+            hex(&encoded),
+            hex(&golden("result", name)),
+            "result `{name}` drifted"
+        );
+        assert_eq!(
+            esker_proto::fragment::decode_result(&golden("result", name)).unwrap(),
+            body
+        );
+    }
 }
 
 #[test]

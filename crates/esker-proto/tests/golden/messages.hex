@@ -126,3 +126,23 @@ response admin-regions 030501010161016d010201010a010a0180202a
 
 # The payload inside an Error frame's `Locked`: { key, primary, start_ts, ttl_ms }.
 lockinfo account 096163636f756e742f31096163636f756e742f30808080808040b817
+
+# Fragment (service 0x06, ADR 0022). The request carries esker-columnar's fragment bytes
+# OPAQUELY -- `01aabb` here is not a real fragment and is never parsed by this crate -- plus the
+# read ts and the minimum apply index, which are two fields on purpose.
+request fragment-evaluate 0106010203040301aabb2a808040
+# A refusal is a RESPONSE, never an error frame: kind 1, reason 1 (Unsupported), then a detail
+# for a human. A rolling upgrade must not look like a fault.
+response fragment-refused 01060101196e6f2073756368206167677265676174653a20737464646576
+# An evaluated fragment: kind 0, the result format below as a length-prefixed blob, then the
+# five scan counters.
+response fragment-result 0106002101000201020201070000000000000002026f6b01ffffffffffffffff0047b5dd8e09040c882725
+
+# The fragment RESULT format, pinned on its own because it is its own format with its own
+# version and checksum -- it survives being cached, spilled or forwarded without this frame.
+# version ++ kind ++ body ++ crc32c LE. Types are declared once in a header, not per value.
+# rows: columns (Int8, Text); rows (7, "ok") and (-1, NULL).
+result rows 01000201020201070000000000000002026f6b01ffffffffffffffff0047b5dd8e
+# groups: key column (Text); aggregates count and sum(Int8); groups ("a", 3, 10) and
+# ("b", 0, NULL) -- a sum over no rows is NULL, which is the same 0x00 an absent value is.
+result groups 0101010202000001010202016103010a00000000000000020162000049b60f5b

@@ -110,6 +110,10 @@ pub enum Method {
     TxnHeartbeat = 0x0207,
     /// `TxnKv::GcSafepoint`.
     TxnGcSafepoint = 0x0208,
+
+    /// `Fragment::Evaluate` — run a plan fragment against a node's columnar copy of a region
+    /// ([ADR 0022](../../docs/adr/0022-columnar-learner-replica.md), [`crate::fragment`]).
+    FragmentEvaluate = 0x0601,
 }
 
 /// Service byte of the system methods — version negotiation and, later, connection control.
@@ -122,6 +126,13 @@ pub const SERVICE_TXN_KV: u8 = 0x02;
 pub const SERVICE_PD: u8 = 0x03;
 /// Service byte reserved for the Raft transport — phase 3.
 pub const SERVICE_RAFT: u8 = 0x04;
+/// Service byte of `Fragment` — asking a columnar replica to evaluate a plan fragment.
+///
+/// Its own service rather than a seventh `TxnKv` method, for the reason [`SERVICE_ADMIN`] gives
+/// for itself: a fragment is a *plan* run on a node that may hold no voter, and anything routing
+/// or metering on the service byte has to tell it from key-value work without decoding a body.
+pub const SERVICE_FRAGMENT: u8 = 0x06;
+
 /// Service byte of `Admin` — the operator-facing requests `esker-cli region` sends.
 ///
 /// Separate from `Pd` because these are addressed to a **store**: the placement driver schedules,
@@ -132,7 +143,7 @@ pub const SERVICE_ADMIN: u8 = 0x05;
 
 impl Method {
     /// Every method this version defines.
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::Hello,
         Self::RawGet,
         Self::RawBatchGet,
@@ -162,6 +173,7 @@ impl Method {
         Self::AdminSplit,
         Self::AdminTransferLeader,
         Self::AdminRegions,
+        Self::FragmentEvaluate,
     ];
 
     /// The wire tag.
@@ -190,6 +202,7 @@ impl Method {
             0x0305 => Some(Self::PdAllocId),
             0x0306 => Some(Self::PdTso),
             0x0307 => Some(Self::PdSchemaLease),
+            0x0601 => Some(Self::FragmentEvaluate),
             0x0401 => Some(Self::RaftBatch),
             0x0402 => Some(Self::RaftSnapshot),
             0x0201 => Some(Self::TxnGet),
@@ -242,6 +255,7 @@ impl Method {
             Self::PdGetRegion => "Pd::GetRegion",
             Self::PdAllocId => "Pd::AllocId",
             Self::PdTso => "Pd::Tso",
+            Self::FragmentEvaluate => "Fragment::Evaluate",
             Self::PdSchemaLease => "Pd::SchemaLease",
             Self::AdminSplit => "Admin::Split",
             Self::AdminTransferLeader => "Admin::TransferLeader",
@@ -291,6 +305,12 @@ impl Method {
     #[must_use]
     pub fn is_pd(self) -> bool {
         self.service() == SERVICE_PD
+    }
+
+    /// Whether this method belongs to the fragment service ([`crate::fragment`]).
+    #[must_use]
+    pub fn is_fragment(self) -> bool {
+        self.service() == SERVICE_FRAGMENT
     }
 
     /// Whether this method belongs to the transaction service.
@@ -831,6 +851,15 @@ pub enum Request {
         /// What to ask.
         request: crate::pd::PdReq,
     },
+    /// A plan fragment for a columnar replica, with the region it is addressed to
+    /// ([`crate::fragment`], [ADR 0022](../../docs/adr/0022-columnar-learner-replica.md)).
+    Fragment {
+        /// Which region, at which epoch, on which peer. Invariant 5 applies here as to a row
+        /// read, which is why the fragment body carries no epoch of its own.
+        header: RequestHeader,
+        /// What to evaluate.
+        request: crate::fragment::FragmentReq,
+    },
     /// Raft traffic between two stores. It carries no [`RequestHeader`], because one batch may
     /// hold messages for many regions and each carries its own (`docs/DESIGN.md` §6).
     Raft(RaftBatch),
@@ -970,6 +999,7 @@ impl Request {
             Self::RawKv { request, .. } => request.method(),
             Self::TxnKv { request, .. } => request.method(),
             Self::Pd { request, .. } => request.method(),
+            Self::Fragment { request, .. } => request.method(),
             Self::Raft(_) => Method::RaftBatch,
             Self::Snapshot(_) => Method::RaftSnapshot,
             Self::Admin(request) => request.method(),
@@ -985,7 +1015,9 @@ impl Request {
             | Self::Snapshot(_)
             | Self::Admin(_)
             | Self::Pd { .. } => None,
-            Self::RawKv { header, .. } | Self::TxnKv { header, .. } => Some(*header),
+            Self::RawKv { header, .. }
+            | Self::TxnKv { header, .. }
+            | Self::Fragment { header, .. } => Some(*header),
         }
     }
 
@@ -1009,6 +1041,10 @@ impl Request {
                 request,
             } => {
                 out.put_varint(*cluster_id);
+                request.encode(&mut out);
+            }
+            Self::Fragment { header, request } => {
+                header.encode(&mut out);
                 request.encode(&mut out);
             }
             Self::Raft(batch) => batch.encode(&mut out),
@@ -1043,6 +1079,13 @@ impl Request {
                 cluster_id: input.get_varint("pd.cluster_id")?,
                 request: crate::pd::PdReq::decode(other, &mut input)?,
             },
+            other if other.is_fragment() => {
+                let header = RequestHeader::decode(&mut input)?;
+                Self::Fragment {
+                    header,
+                    request: crate::fragment::FragmentReq::decode(&mut input)?,
+                }
+            }
             other if other.is_txn_kv() => {
                 let header = RequestHeader::decode(&mut input)?;
                 Self::TxnKv {
@@ -1079,6 +1122,8 @@ pub enum Response {
     /// message survivable, so there is no outcome for the sender to act on
     /// ([`RaftTransport`](crate::raft) is fire-and-forget by design).
     Raft,
+    /// A columnar replica's answer to a fragment ([`crate::fragment`]).
+    Fragment(crate::fragment::FragmentResp),
     /// The answer to an operator's request.
     Admin(AdminResp),
 }
@@ -1175,6 +1220,7 @@ impl Response {
             Self::RawKv(response) => response.method(),
             Self::TxnKv(response) => response.method(),
             Self::Pd(response) => response.method(),
+            Self::Fragment(_) => Method::FragmentEvaluate,
             Self::Raft => Method::RaftBatch,
             Self::Admin(response) => response.method(),
         }
@@ -1218,6 +1264,7 @@ impl Response {
             Self::RawKv(response) => response.encode(&mut out),
             Self::TxnKv(response) => response.encode(&mut out),
             Self::Pd(response) => response.encode(&mut out),
+            Self::Fragment(response) => response.encode(&mut out),
             // The acknowledgement carries nothing: Raft's own retries are what make a lost
             // message survivable, so there is no outcome for the sender to act on.
             Self::Raft => {}
@@ -1241,6 +1288,9 @@ impl Response {
                 max_frame_size: input.get_varint("hello.max_frame_size")?,
             }),
             other if other.is_pd() => Self::Pd(crate::pd::PdResp::decode(other, &mut input)?),
+            other if other.is_fragment() => {
+                Self::Fragment(crate::fragment::FragmentResp::decode(&mut input)?)
+            }
             other if other.is_txn_kv() => {
                 Self::TxnKv(crate::txn::TxnKvResp::decode(other, &mut input)?)
             }
@@ -1434,6 +1484,7 @@ mod tests {
                 | Method::TxnResolveLock
                 | Method::TxnHeartbeat
                 | Method::TxnGcSafepoint => SERVICE_TXN_KV,
+                Method::FragmentEvaluate => crate::messages::SERVICE_FRAGMENT,
                 _ => SERVICE_RAW_KV,
             };
             assert_eq!(method.service(), service, "{method:?}");
@@ -1447,6 +1498,7 @@ mod tests {
             SERVICE_TXN_KV,
             crate::messages::SERVICE_PD,
             crate::messages::SERVICE_RAFT,
+            crate::messages::SERVICE_FRAGMENT,
         ] {
             let mut numbers: Vec<u16> = Method::ALL
                 .into_iter()
