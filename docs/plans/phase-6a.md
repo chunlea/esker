@@ -235,10 +235,20 @@ panic (`CLAUDE.md` invariants 2 and 9).
   The bitmap is first so a projection can skip a NULL column without decoding it.
 - **Primary key** — `'t' ++ tenant:u64 ++ table_id:u64 ++ 'r' ++ memcomparable(pk columns)` via
   `esker-keys`, which is already prefix-free, so a composite PK cannot alias.
-- **Index key** — `'t' ++ tenant ++ table_id ++ 'i' ++ index_id ++ memcomparable(index columns)
-  [++ memcomparable(pk)]`. The trailing PK is present for a non-unique index (it is what makes the
-  key unique) and absent for a unique one (its absence is what makes the uniqueness a key
-  collision, which is exactly the conflict Percolator detects).
+- **Index key** — `'t' ++ tenant ++ table_id ++ 'i' ++ index_id ++ (null_marker:u8 ++
+  memcomparable(index column))* [++ memcomparable(pk)]`. The trailing PK is present for a
+  non-unique index (it is what makes the key unique) and absent for a unique one (its absence is
+  what makes the uniqueness a key collision, which is exactly the conflict Percolator detects) —
+  **except** for a unique entry with a NULL in it, which keeps the suffix, because PostgreSQL
+  admits any number of NULLs in a `UNIQUE` column and two of them must not collide. The marker
+  byte is `0x00` for a value and `0x01` for a NULL, so NULLs sort last, which is PostgreSQL's
+  default for an ascending index; without it a NULL and an empty string would encode alike
+  (built in unit 3).
+- **Text ordering is byte ordering.** A key space compares bytes, so `ORDER BY` and an index scan
+  over `TEXT` give what PostgreSQL gives under `COLLATE "C"` and not what its `en_US.utf8` default
+  gives — `B` before `a`, not `a` before `B`. Declared, not stumbled into: a locale-aware
+  collation means ICU or a platform C library and this project compiles no C. The ordering fixture
+  is captured with `COLLATE "C"` for exactly this reason.
 - **Catalog** — `'m' ++ "sql" ++ kind ++ tenant ++ id`, value a versioned record. A monotone
   `catalog_version:u64` at `'m' ++ "sql" ++ 'v'` is read once per transaction; a cached definition
   from an older version is discarded.
@@ -451,7 +461,9 @@ its own gap register, and it would be longer.
   `ErrorResponse` fields, goldens, decoder fuzz (2a); the session state machine and the simple
   query protocol (2b); the extended protocol's statement and portal lifecycle (2c); the `tokio`
   listener, and a real `psql` connecting to it (2d)
-- [ ] 3 — row and tuple encodings
+- [x] 3 — row and tuple encodings: the six types' text formats against a real server (3a), the
+  row value, primary key and index key encodings with goldens, proptests and a captured ordering
+  fixture (3b)
 - [ ] 4 — catalog
 - [x] 5 — backend trait and fake (the executor's half of the unique-index composition is unit 6)
 - [ ] 6 — planner and executor
@@ -521,6 +533,74 @@ a failure inside a block. `tests/psql_smoke.rs` holds that as an automated test 
 - *A second risk appeared and was closed the same day* (§8.1b): the dependency's own recursion
   limit is 50, which rejects SQL that PostgreSQL accepts. It was found by measuring, not by
   reading, which is the argument for building the corpus next rather than last.
+
+**Unit 3.** The formats are in `src/value/` and `src/row.rs` rather than the single `row.rs` §5
+sketched. The split is along a real seam: `value/` is the six types and the text a client reads
+them as — the compatibility surface — and `row.rs` is the two encodings that put them in the key
+space. Each is well under the file-size rule and each has its own reason to change.
+
+The method was the same as unit 2's and it paid the same way. **Ten more facts came off a running
+PostgreSQL 19beta1 that reading would not have produced**, and two of them were defects in the
+*capture* rather than in the code, which is worth recording because both would have pinned a wrong
+answer into a golden file:
+
+- **A boolean on the wire is `t`, not `true`.** The first capture asked for `value::text` and got
+  `true`, because PostgreSQL has a real cast function for boolean that its *output function* — the
+  one that fills a `DataRow` — does not go through. Every other one of the six agrees between the
+  two, so the artifact would have shown up only in the one place it mattered. The capture now takes
+  the raw field.
+- **`printf %b` decodes `\101` as an octal byte**, so the first `bytea` capture recorded inputs the
+  server had never been given, and PostgreSQL's answers to *different* inputs. The generator now
+  unescapes exactly the three sequences the corpus file documents. Both the escape-format rules
+  below were wrong before this was found.
+- **`float8` switches to exponent notation outside `10^-4 .. 10^14`**, and the boundary does not
+  depend on how many significant digits the value has: `999999999999999` prints in full and `1e+15`
+  does not, `0.0001` is plain and `1e-05` is not. It is not `%g`'s rule, which is what a reading
+  would have given. The digits themselves are Rust's own shortest round-trip formatting, which is
+  the same thing PostgreSQL's Ryu produces, so nothing here reimplements Ryu.
+- **`int8` input takes `1_000`, `0x1f`, `0o17` and `0b101`** — PostgreSQL 16 gave the input function
+  the non-decimal literals the lexer had.
+- **`boolean` input takes any unambiguous prefix**: `tr` and `ye` are true, `of` is false, and `o`
+  is an error because it could be `on` or `off`.
+- **`bytea`'s hexadecimal errors are `22023`**, not the `22P02` its neighbours in the same input
+  function use, and its escape-format error quotes nothing back. Octal escapes need exactly three
+  digits: `\101` is a byte and `\1` is an error.
+- **The datetime type has its own condition, `22007`**, not `22P02`; a field out of range is
+  `22008`; a zone displacement past `±15:59` is `22009`. Three codes where one was expected.
+- **`24:00:00` and `23:59:60` are both legal ways to write the next midnight**, and `24:00:01` is
+  not — so the check belongs on the whole time and not on the hour.
+- **Fractional seconds round rather than truncate**, and the rounding carries: `.9999999` becomes
+  the next second.
+- **An era suffix prints after the offset**: `0001-01-01 00:00:00+00 BC`.
+- **The range ends are Julian day 0 and 294276-12-31**, both confirmed by accepting one value and
+  refusing the next microsecond past it.
+
+`tests/corpus/pg19_values.txt` is 184 of those answers and `tests/value_parity.rs` replays every one
+in both directions — the same characters for a value, the same SQLSTATE *and* message for a refusal.
+It passed on the first run after the two capture defects were fixed, which is evidence about the
+capture and not about the code: the corpus is the only independent party.
+
+Three decisions the plan did not have, each recorded because a later reader could reasonably reverse
+it:
+
+- **Text sorts by bytes.** §6 now says so. The database captured against sorts `a` before `B` under
+  `en_US.utf8`; a byte-ordered key space sorts `B` first, which is PostgreSQL's `COLLATE "C"`. A
+  locale-aware collation needs ICU or a platform C library and this project compiles neither, so the
+  choice was between declaring byte ordering and pretending. The ordering fixture is captured with
+  `COLLATE "C"` so the divergence is a line in a file rather than a surprise in a query.
+- **A value PostgreSQL reads and we do not is `0A000`, naming the construct** — contract C2 applied
+  one level down, to a value rather than a statement. It covers hexadecimal float input and the
+  parts of PostgreSQL's datetime grammar outside ISO 8601 (`DateStyle`-dependent dates, named time
+  zones, `now`/`epoch`). The alternative was answering `22007 invalid input syntax` about input that
+  is in fact valid, which is the exact lie C1 forbids one level up. `DecodeDateTime` is a large
+  parser with a time zone database behind it, and implementing *part* of it is how a server returns
+  a confidently wrong instant. The six divergences are listed in `tests/value_parity.rs` and held
+  from both sides.
+- **A unique index entry containing a NULL keeps its primary key suffix.** The unique-index design
+  in §5 turns a duplicate into a collision on one key by leaving the suffix off — but PostgreSQL
+  admits any number of NULLs in a `UNIQUE` column, confirmed against the server, so those entries
+  would have collided with each other and the second NULL row would have been reported as a
+  duplicate. `row::unique_index_key_is_unique_by_value` is the predicate, and unit 6 consumes it.
 
 **Unit 2a.** The goldens are recorded, not written. A proxy between `psql` 18.6 and the
 PostgreSQL 19beta1 container logged both directions of five real sessions, and

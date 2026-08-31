@@ -46,6 +46,9 @@ pub mod backend;
 pub mod error;
 pub mod parse;
 pub mod pgwire;
+pub mod row;
 pub mod sqlstate;
+pub mod value;
 
 pub use error::{Result, Severity, SqlError};
+pub use value::{ColumnType, Datum};

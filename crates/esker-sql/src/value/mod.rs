@@ -1,0 +1,564 @@
+//! The six types phase 6a stores, and the text a client reads them as.
+//!
+//! This is contract C3's smallest surface and its sharpest one. A row that comes back with the
+//! right rows and the wrong bytes in them is worse than an error, because nothing reports it: a
+//! client that renders `true` where PostgreSQL renders `t`, or `1e-5` where PostgreSQL renders
+//! `1e-05`, has silently disagreed with every other PostgreSQL client in the world.
+//!
+//! So none of the formats here were written from the documentation. Each one was put to a running
+//! PostgreSQL 19beta1 and the answer recorded in `tests/corpus/pg19_values.txt`, which
+//! `tests/value_parity.rs` replays against this module in both directions. Four of the rules below
+//! came back different from what reading alone would have produced:
+//!
+//! * **A boolean on the wire is `t`, not `true`.** `true::text` really is `true` — PostgreSQL has
+//!   a cast function that says so — but the *output function*, which is what fills a `DataRow`,
+//!   writes one character. Capturing the cast instead of the value would have pinned the wrong
+//!   format in a golden file.
+//! * **`float8` switches to exponent notation outside `10^-4 .. 10^14`**, so `100000000000000`
+//!   prints in full and `1e+15` does not, and the exponent carries a sign and at least two digits
+//!   (`1e-05`). The boundary was measured, not guessed; it is not `%g`'s.
+//! * **`int8` input accepts `1_000`, `0x1f`, `0o17` and `0b101`** — PostgreSQL 16 gave the input
+//!   function the non-decimal integer literals the lexer had, and a client can send any of them.
+//! * **`boolean` input accepts any unambiguous prefix**: `tr` is true and `ye` is true, `of` is
+//!   false, and `o` is an error because it could be either `on` or `off`.
+//!
+//! # NULL is not a value here
+//!
+//! [`Datum::Null`] is a variant rather than an `Option<Datum>` wrapper because a column's value
+//! and its absence travel together everywhere in this crate — in a row encoding's bitmap, in an
+//! index key's leading byte, in a `DataRow`'s -1 length. Keeping them in one type is what lets a
+//! single `match` be exhaustive over what a column can hold.
+
+mod float;
+mod timestamp;
+
+use std::cmp::Ordering;
+
+use crate::error::{Result, SqlError};
+
+pub use timestamp::{MAX_MICROS, MIN_MICROS, NEG_INFINITY, POS_INFINITY};
+
+/// The 64 bits whose big-endian order is [`Datum::pg_cmp`]'s order over floats, for an index key.
+/// Lives here rather than in `crate::row` because which floats are the same value is a fact about
+/// the type, not about the key encoding that has to respect it.
+#[must_use]
+pub fn sort_bits_of_f64(value: f64) -> u64 {
+    float::sort_bits(value)
+}
+
+/// The inverse of [`sort_bits_of_f64`], up to the canonicalisation it performs.
+#[must_use]
+pub fn f64_of_sort_bits(bits: u64) -> f64 {
+    float::from_sort_bits(bits)
+}
+
+/// One of the six types phase 6a executes (`docs/plans/phase-6a.md` §3).
+///
+/// The OIDs are PostgreSQL's own and go on the wire in `RowDescription` and
+/// `ParameterDescription`; a client uses them to pick a decoder, so they are as much a part of the
+/// compatibility contract as the text formats are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ColumnType {
+    /// 64-bit integer. PostgreSQL calls it `bigint` in messages and `int8` in DDL.
+    Int8,
+    /// Variable-length UTF-8 string.
+    Text,
+    /// Two-valued, with no third state but NULL.
+    Bool,
+    /// Variable-length byte string.
+    Bytea,
+    /// An instant, stored as microseconds from 2000-01-01 UTC.
+    TimestampTz,
+    /// IEEE-754 binary64.
+    Double,
+}
+
+impl ColumnType {
+    /// Every type, for tests that must not silently skip one.
+    pub const ALL: [ColumnType; 6] = [
+        ColumnType::Int8,
+        ColumnType::Text,
+        ColumnType::Bool,
+        ColumnType::Bytea,
+        ColumnType::TimestampTz,
+        ColumnType::Double,
+    ];
+
+    /// PostgreSQL's type OID, as it appears in `RowDescription`.
+    #[must_use]
+    pub fn oid(self) -> u32 {
+        match self {
+            ColumnType::Bool => 16,
+            ColumnType::Bytea => 17,
+            ColumnType::Int8 => 20,
+            ColumnType::Text => 25,
+            ColumnType::Double => 701,
+            ColumnType::TimestampTz => 1184,
+        }
+    }
+
+    /// The name PostgreSQL uses when it talks *about* the type — in an `invalid input syntax`
+    /// message, for instance. Not the DDL spelling: a column is declared `int8` and complained
+    /// about as `bigint`.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            ColumnType::Int8 => "bigint",
+            ColumnType::Text => "text",
+            ColumnType::Bool => "boolean",
+            ColumnType::Bytea => "bytea",
+            ColumnType::TimestampTz => "timestamp with time zone",
+            ColumnType::Double => "double precision",
+        }
+    }
+
+    /// The width `RowDescription` reports: the fixed size in bytes, or -1 for a varlena.
+    #[must_use]
+    pub fn type_len(self) -> i16 {
+        match self {
+            ColumnType::Bool => 1,
+            ColumnType::Int8 | ColumnType::TimestampTz | ColumnType::Double => 8,
+            ColumnType::Text | ColumnType::Bytea => -1,
+        }
+    }
+}
+
+/// One column's value, or its absence.
+///
+/// `PartialEq` compares floats by their **bits**, not by IEEE equality, so `NaN` equals itself and
+/// `-0.0` does not equal `0.0`. That is the right question for an encoding module — "did this
+/// value survive the round trip" — and the wrong one for SQL, where PostgreSQL says both the
+/// opposite things. SQL's comparison is [`Datum::pg_cmp`], and it is a separate function precisely
+/// so neither can be mistaken for the other.
+#[derive(Debug, Clone)]
+pub enum Datum {
+    /// SQL NULL, of whatever the column's type is.
+    Null,
+    /// [`ColumnType::Int8`].
+    Int8(i64),
+    /// [`ColumnType::Text`]. Always valid UTF-8: the server encoding is UTF8, and bytes that are
+    /// not are refused on the way in the way PostgreSQL refuses them.
+    Text(String),
+    /// [`ColumnType::Bool`].
+    Bool(bool),
+    /// [`ColumnType::Bytea`].
+    Bytea(Vec<u8>),
+    /// [`ColumnType::TimestampTz`], in microseconds from 2000-01-01 00:00:00 UTC — PostgreSQL's
+    /// own epoch and its own representation, including [`POS_INFINITY`] and [`NEG_INFINITY`].
+    TimestampTz(i64),
+    /// [`ColumnType::Double`].
+    Double(f64),
+}
+
+impl PartialEq for Datum {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Datum::Null, Datum::Null) => true,
+            (Datum::Int8(a), Datum::Int8(b)) | (Datum::TimestampTz(a), Datum::TimestampTz(b)) => {
+                a == b
+            }
+            (Datum::Text(a), Datum::Text(b)) => a == b,
+            (Datum::Bool(a), Datum::Bool(b)) => a == b,
+            (Datum::Bytea(a), Datum::Bytea(b)) => a == b,
+            // Bitwise, so a round-trip test cannot pass by turning -0.0 into 0.0 or one NaN
+            // payload into another.
+            (Datum::Double(a), Datum::Double(b)) => a.to_bits() == b.to_bits(),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Datum {}
+
+impl Datum {
+    /// The type this value belongs to, or `None` for NULL, which belongs to all of them.
+    #[must_use]
+    pub fn column_type(&self) -> Option<ColumnType> {
+        Some(match self {
+            Datum::Null => return None,
+            Datum::Int8(_) => ColumnType::Int8,
+            Datum::Text(_) => ColumnType::Text,
+            Datum::Bool(_) => ColumnType::Bool,
+            Datum::Bytea(_) => ColumnType::Bytea,
+            Datum::TimestampTz(_) => ColumnType::TimestampTz,
+            Datum::Double(_) => ColumnType::Double,
+        })
+    }
+
+    /// Whether this value fits a column of `ty`. NULL fits every type.
+    #[must_use]
+    pub fn fits(&self, ty: ColumnType) -> bool {
+        self.column_type().is_none_or(|actual| actual == ty)
+    }
+
+    /// The characters PostgreSQL puts in a text-format `DataRow`, or `None` for NULL.
+    ///
+    /// NULL is `None` rather than an empty string because the protocol spells it as a length of
+    /// -1: an empty `text` and a NULL `text` are different bytes on the wire, and a client that
+    /// could not tell them apart would read every empty string as a missing value.
+    #[must_use]
+    pub fn to_text(&self) -> Option<String> {
+        Some(match self {
+            Datum::Null => return None,
+            Datum::Int8(v) => v.to_string(),
+            Datum::Text(v) => v.clone(),
+            // One character. See the module note: the `::text` cast says `true`, the output
+            // function says `t`, and the wire carries the output function.
+            Datum::Bool(v) => (if *v { "t" } else { "f" }).to_string(),
+            Datum::Bytea(v) => {
+                let mut out = String::with_capacity(2 + 2 * v.len());
+                out.push_str("\\x");
+                for byte in v {
+                    out.push(HEX[(byte >> 4) as usize] as char);
+                    out.push(HEX[(byte & 0x0f) as usize] as char);
+                }
+                out
+            }
+            Datum::TimestampTz(v) => timestamp::to_text(*v),
+            Datum::Double(v) => float::to_text(*v),
+        })
+    }
+
+    /// Reads a value of `ty` out of the text a client sent, exactly as PostgreSQL's input function
+    /// would, or fails with the SQLSTATE PostgreSQL would have failed with.
+    ///
+    /// Where the real input function accepts something this one does not, the answer is contract
+    /// C2's `0A000` naming the construct — never a wrong value and never a syntax error about
+    /// valid input. `tests/value_parity.rs` holds the list of those from both sides.
+    pub fn from_text(ty: ColumnType, text: &str) -> Result<Datum> {
+        Ok(match ty {
+            ColumnType::Int8 => Datum::Int8(parse_int8(text)?),
+            ColumnType::Text => Datum::Text(text.to_owned()),
+            ColumnType::Bool => Datum::Bool(parse_bool(text)?),
+            ColumnType::Bytea => Datum::Bytea(parse_bytea(text)?),
+            ColumnType::TimestampTz => Datum::TimestampTz(timestamp::from_text(text)?),
+            ColumnType::Double => Datum::Double(float::from_text(text)?),
+        })
+    }
+
+    /// The order PostgreSQL sorts these values in, which is not the order their bits are in.
+    ///
+    /// Three of its rules are its own and were confirmed against the server: `-0.0` and `0.0`
+    /// compare equal, `NaN` compares greater than every other float including `Infinity` (and
+    /// equal to itself), and NULL sorts **last**, which is what `ORDER BY x` means with no
+    /// `NULLS FIRST`. [`crate::row`] encodes keys so that byte order reproduces this.
+    ///
+    /// Comparing two different types is not something a schema can produce; it falls back to a
+    /// fixed order over the variants so the function is total.
+    #[must_use]
+    pub fn pg_cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (Datum::Null, Datum::Null) => Ordering::Equal,
+            // NULLS LAST, PostgreSQL's default for ascending order.
+            (Datum::Null, _) => Ordering::Greater,
+            (_, Datum::Null) => Ordering::Less,
+            (Datum::Int8(a), Datum::Int8(b)) | (Datum::TimestampTz(a), Datum::TimestampTz(b)) => {
+                a.cmp(b)
+            }
+            // Byte order, not the database's collation: see `crate::row` for why that is a
+            // decision and not an oversight.
+            (Datum::Text(a), Datum::Text(b)) => a.as_bytes().cmp(b.as_bytes()),
+            (Datum::Bool(a), Datum::Bool(b)) => a.cmp(b),
+            (Datum::Bytea(a), Datum::Bytea(b)) => a.cmp(b),
+            (Datum::Double(a), Datum::Double(b)) => float::pg_cmp(*a, *b),
+            (a, b) => a.variant_rank().cmp(&b.variant_rank()),
+        }
+    }
+
+    fn variant_rank(&self) -> u8 {
+        match self {
+            Datum::Bool(_) => 0,
+            Datum::Int8(_) => 1,
+            Datum::Double(_) => 2,
+            Datum::TimestampTz(_) => 3,
+            Datum::Text(_) => 4,
+            Datum::Bytea(_) => 5,
+            Datum::Null => 6,
+        }
+    }
+}
+
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+/// PostgreSQL's `pg_strtoint64_safe`, which is more than a decimal parser: it takes the
+/// non-decimal literals the lexer gained in PostgreSQL 16 and the digit separators with them.
+fn parse_int8(text: &str) -> Result<i64> {
+    let bad = || SqlError::InvalidTextRepresentation {
+        ty: ColumnType::Int8.name(),
+        value: text.to_owned(),
+    };
+    let overflow = || SqlError::IntegerOutOfRange {
+        ty: ColumnType::Int8.name(),
+        value: text.to_owned(),
+    };
+
+    let body = text.trim_matches(|c: char| c.is_ascii_whitespace());
+    let (negative, digits) = match body.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, body.strip_prefix('+').unwrap_or(body)),
+    };
+    let (radix, digits) = match digits.as_bytes() {
+        [b'0', b'x' | b'X', rest @ ..] => (16, rest),
+        [b'0', b'o' | b'O', rest @ ..] => (8, rest),
+        [b'0', b'b' | b'B', rest @ ..] => (2, rest),
+        rest => (10, rest),
+    };
+    if digits.is_empty() {
+        return Err(bad());
+    }
+
+    // Accumulated as a negative number so that i64::MIN, which has no positive counterpart, needs
+    // no special case.
+    let mut value: i64 = 0;
+    let mut last_was_digit = false;
+    for &byte in digits {
+        if byte == b'_' {
+            // A separator is only a separator between two digits: `_1` and `1_` are errors.
+            if !last_was_digit {
+                return Err(bad());
+            }
+            last_was_digit = false;
+            continue;
+        }
+        let digit = (byte as char).to_digit(radix).ok_or_else(bad)?;
+        value = value
+            .checked_mul(i64::from(radix))
+            .and_then(|v| v.checked_sub(i64::from(digit)))
+            .ok_or_else(overflow)?;
+        last_was_digit = true;
+    }
+    if !last_was_digit {
+        return Err(bad());
+    }
+
+    if negative {
+        Ok(value)
+    } else {
+        value.checked_neg().ok_or_else(overflow)
+    }
+}
+
+/// PostgreSQL's `parse_bool_with_len`: case-insensitive, whitespace-trimmed, and satisfied by any
+/// prefix that can only be one word. `o` is the one that cannot, because `on` and `off` both start
+/// with it.
+fn parse_bool(text: &str) -> Result<bool> {
+    let body = text.trim_matches(|c: char| c.is_ascii_whitespace());
+    let lower = body.to_ascii_lowercase();
+    let prefix_of = |word: &str| !lower.is_empty() && word.starts_with(lower.as_str());
+    match lower.as_bytes().first() {
+        Some(b't') if prefix_of("true") => Ok(true),
+        Some(b'f') if prefix_of("false") => Ok(false),
+        Some(b'y') if prefix_of("yes") => Ok(true),
+        Some(b'n') if prefix_of("no") => Ok(false),
+        Some(b'o') if lower.len() >= 2 && prefix_of("on") => Ok(true),
+        Some(b'o') if lower.len() >= 2 && prefix_of("off") => Ok(false),
+        Some(b'1') if lower.len() == 1 => Ok(true),
+        Some(b'0') if lower.len() == 1 => Ok(false),
+        _ => Err(SqlError::InvalidTextRepresentation {
+            ty: ColumnType::Bool.name(),
+            value: text.to_owned(),
+        }),
+    }
+}
+
+/// PostgreSQL's `byteain`: the hex format when the text starts with a lowercase `\x`, and the
+/// legacy escape format otherwise.
+fn parse_bytea(text: &str) -> Result<Vec<u8>> {
+    match text.strip_prefix("\\x") {
+        Some(hex) => parse_bytea_hex(hex),
+        None => parse_bytea_escape(text),
+    }
+}
+
+fn parse_bytea_hex(hex: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let mut high: Option<u8> = None;
+    for character in hex.chars() {
+        // Whitespace between digits is ignored, which is what makes `\x de ad` legal.
+        if character.is_ascii_whitespace() {
+            continue;
+        }
+        let nibble = character
+            .to_digit(16)
+            .ok_or(SqlError::InvalidHexDigit(character))?;
+        #[allow(clippy::cast_possible_truncation, reason = "a hex digit is four bits")]
+        let nibble = nibble as u8;
+        match high.take() {
+            None => high = Some(nibble),
+            Some(first) => out.push((first << 4) | nibble),
+        }
+    }
+    if high.is_some() {
+        return Err(SqlError::OddHexDigits);
+    }
+    Ok(out)
+}
+
+fn parse_bytea_escape(text: &str) -> Result<Vec<u8>> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        match bytes.get(i + 1) {
+            Some(b'\\') => {
+                out.push(b'\\');
+                i += 2;
+            }
+            // Exactly three octal digits, and no more than a byte's worth. `\1` and `\777` are
+            // both errors, which a capture confirmed against a guess that either might work.
+            Some(_) => {
+                let digits = bytes
+                    .get(i + 1..i + 4)
+                    .ok_or(SqlError::InvalidByteaFormat)?;
+                let mut value: u32 = 0;
+                for &digit in digits {
+                    let digit = (digit as char)
+                        .to_digit(8)
+                        .ok_or(SqlError::InvalidByteaFormat)?;
+                    value = value * 8 + digit;
+                }
+                out.push(u8::try_from(value).map_err(|_| SqlError::InvalidByteaFormat)?);
+                i += 4;
+            }
+            None => return Err(SqlError::InvalidByteaFormat),
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ColumnType, Datum, MAX_MICROS, MIN_MICROS, NEG_INFINITY, POS_INFINITY};
+    use crate::sqlstate;
+    use std::cmp::Ordering;
+
+    /// These OIDs go on the wire in `RowDescription`. A client picks its decoder from them, so a
+    /// wrong one is not a wrong label -- it is a wrong parse of every value in the column.
+    #[test]
+    fn the_oids_are_postgresqls_own() {
+        assert_eq!(ColumnType::Bool.oid(), 16);
+        assert_eq!(ColumnType::Bytea.oid(), 17);
+        assert_eq!(ColumnType::Int8.oid(), 20);
+        assert_eq!(ColumnType::Text.oid(), 25);
+        assert_eq!(ColumnType::Double.oid(), 701);
+        assert_eq!(ColumnType::TimestampTz.oid(), 1184);
+        for ty in ColumnType::ALL {
+            assert_eq!(
+                ty.type_len() == -1,
+                matches!(ty, ColumnType::Text | ColumnType::Bytea),
+                "{ty:?} reports the wrong width"
+            );
+        }
+    }
+
+    /// PostgreSQL complains about `bigint`, not about `int8`. The DDL spelling and the message
+    /// spelling are different words for the six types and a parity test compares the message.
+    #[test]
+    fn the_names_are_the_ones_that_appear_in_messages() {
+        assert_eq!(ColumnType::Int8.name(), "bigint");
+        assert_eq!(ColumnType::Double.name(), "double precision");
+        assert_eq!(ColumnType::TimestampTz.name(), "timestamp with time zone");
+    }
+
+    /// NULL on the wire is a length of -1, not an empty string, and the two must not collapse.
+    #[test]
+    fn null_prints_as_no_text_at_all_and_an_empty_string_prints_as_one() {
+        assert_eq!(Datum::Null.to_text(), None);
+        assert_eq!(Datum::Text(String::new()).to_text(), Some(String::new()));
+        assert_eq!(Datum::Null.column_type(), None);
+        assert!(Datum::Null.fits(ColumnType::Int8) && Datum::Null.fits(ColumnType::Text));
+        assert!(!Datum::Int8(1).fits(ColumnType::Text));
+    }
+
+    /// Three rules PostgreSQL confirmed and IEEE contradicts: one NaN, above everything; `-0.0`
+    /// tied with `0.0`; and NULL last. `crate::row` encodes index keys to reproduce this order,
+    /// so getting it wrong here would be a wrong answer to `ORDER BY`, not just a wrong sort.
+    #[test]
+    fn values_sort_the_way_postgresql_sorts_them() {
+        let ordered = [
+            Datum::Double(f64::NEG_INFINITY),
+            Datum::Double(-1.0),
+            Datum::Double(-0.0),
+            Datum::Double(0.0),
+            Datum::Double(1.0),
+            Datum::Double(f64::INFINITY),
+            Datum::Double(f64::NAN),
+            Datum::Null,
+        ];
+        for (index, left) in ordered.iter().enumerate() {
+            for right in &ordered[index + 1..] {
+                assert_ne!(
+                    left.pg_cmp(right),
+                    Ordering::Greater,
+                    "{left:?} must not sort after {right:?}"
+                );
+            }
+        }
+        assert_eq!(
+            Datum::Double(-0.0).pg_cmp(&Datum::Double(0.0)),
+            Ordering::Equal,
+            "PostgreSQL says -0.0 = 0.0"
+        );
+        assert_eq!(
+            Datum::Double(f64::NAN).pg_cmp(&Datum::Double(f64::NAN)),
+            Ordering::Equal,
+            "PostgreSQL says NaN = NaN"
+        );
+        assert_eq!(
+            Datum::Null.pg_cmp(&Datum::Null),
+            Ordering::Equal,
+            "two NULLs tie in the sort even though NULL = NULL is unknown"
+        );
+    }
+
+    /// Equality here is about bytes surviving a round trip, which is the opposite question from
+    /// the one `pg_cmp` answers. Both are needed and neither may stand in for the other.
+    #[test]
+    fn equality_is_bitwise_where_the_sort_order_is_not() {
+        assert_ne!(Datum::Double(-0.0), Datum::Double(0.0));
+        assert_eq!(Datum::Double(f64::NAN), Datum::Double(f64::NAN));
+    }
+
+    /// The two ends of the type's range, which a real PostgreSQL 19 confirmed by accepting the
+    /// first of each pair and refusing the second. `MIN_MICROS` is the start of Julian day 0.
+    #[test]
+    fn the_range_ends_where_postgresqls_does() {
+        assert_eq!(MIN_MICROS, -2_451_545 * 86_400 * 1_000_000);
+        assert_eq!(
+            Datum::TimestampTz(MIN_MICROS).to_text().as_deref(),
+            Some("4714-11-24 00:00:00+00 BC")
+        );
+        assert_eq!(
+            Datum::TimestampTz(MAX_MICROS).to_text().as_deref(),
+            Some("294276-12-31 23:59:59.999999+00")
+        );
+        assert!(MIN_MICROS > NEG_INFINITY && MAX_MICROS < POS_INFINITY);
+    }
+
+    /// The sentinels are values, not overflow: `infinity` must not be confusable with the largest
+    /// instant, or a comparison against it would be wrong at exactly one point.
+    #[test]
+    fn the_infinities_print_as_words() {
+        assert_eq!(
+            Datum::TimestampTz(POS_INFINITY).to_text().as_deref(),
+            Some("infinity")
+        );
+        assert_eq!(
+            Datum::TimestampTz(NEG_INFINITY).to_text().as_deref(),
+            Some("-infinity")
+        );
+    }
+
+    /// An instant one microsecond past the end is out of range rather than wrapped.
+    #[test]
+    fn an_instant_past_the_end_is_refused_and_not_wrapped() {
+        let error = Datum::from_text(ColumnType::TimestampTz, "294277-01-01 00:00:00+00")
+            .expect_err("past the end");
+        assert_eq!(error.sqlstate(), sqlstate::DATETIME_FIELD_OVERFLOW);
+    }
+}

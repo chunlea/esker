@@ -1,0 +1,212 @@
+# What a real PostgreSQL 19beta1 does with a value -- contract C3's gate for the six types
+# phase 6a stores (docs/plans/phase-6a.md §1, §6).
+#
+# Nothing here was written from the documentation. Every line was produced by putting the input
+# text to a running PostgreSQL 19beta1 as `SELECT $ek$<input>$ek$::<type>` -- dollar-quoted, so
+# the bytes the server's input function saw are exactly the bytes in this file -- and recording
+# either what its output function printed or the SQLSTATE and message it refused with.
+#
+#   type <tab> input <tab> output          the value, as PostgreSQL prints it in a text DataRow
+#   type <tab> input <tab> !SQLSTATE msg   PostgreSQL refused the input
+#
+# `\\` is one backslash, `\t` a tab, `\n` a newline, and `\N` on its own is SQL NULL. A `#` at
+# the start of a line is a comment and a blank line is ignored.
+#
+# The output column is the *output function's* result, not a `::text` cast: `true::text` is
+# `true` but a boolean on the wire is `t`, and capturing the cast would have taught us the wrong
+# format for the one type where the two differ.
+#
+# tests/value_parity.rs reads this file and requires our own input and output functions to agree
+# with it, holding the divergences we accept from both sides.
+
+
+# int8 -- the whole input grammar, including the non-decimal literals PG 16 added
+int8	0	0
+int8	1	1
+int8	-1	-1
+int8	42	42
+int8	+42	42
+int8	042	42
+int8	 42 	42
+int8	9223372036854775807	9223372036854775807
+int8	-9223372036854775808	-9223372036854775808
+int8	9223372036854775808	!22003 value "9223372036854775808" is out of range for type bigint
+int8	-9223372036854775809	!22003 value "-9223372036854775809" is out of range for type bigint
+int8	1_000	1000
+int8	1_000_000	1000000
+int8	0x1f	31
+int8	0X1F	31
+int8	-0xff	-255
+int8	0o17	15
+int8	0b101	5
+int8	0b1_0000	16
+int8		!22P02 invalid input syntax for type bigint: ""
+int8	4 2	!22P02 invalid input syntax for type bigint: "4 2"
+int8	1e3	!22P02 invalid input syntax for type bigint: "1e3"
+int8	42.0	!22P02 invalid input syntax for type bigint: "42.0"
+int8	abc	!22P02 invalid input syntax for type bigint: "abc"
+int8	-	!22P02 invalid input syntax for type bigint: "-"
+int8	_1	!22P02 invalid input syntax for type bigint: "_1"
+int8	1_	!22P02 invalid input syntax for type bigint: "1_"
+int8	0x	!22P02 invalid input syntax for type bigint: "0x"
+# bool -- prefix matching is the part that is easy to get wrong
+bool	t	t
+bool	true	t
+bool	TRUE	t
+bool	True	t
+bool	T	t
+bool	tr	t
+bool	tru	t
+bool	y	t
+bool	yes	t
+bool	YES	t
+bool	on	t
+bool	1	t
+bool	f	f
+bool	false	f
+bool	FALSE	f
+bool	F	f
+bool	fa	f
+bool	n	f
+bool	no	f
+bool	off	f
+bool	0	f
+bool	 true 	t
+bool	truex	!22P02 invalid input syntax for type boolean: "truex"
+bool		!22P02 invalid input syntax for type boolean: ""
+bool	2	!22P02 invalid input syntax for type boolean: "2"
+bool	o	!22P02 invalid input syntax for type boolean: "o"
+bool	ye	t
+bool	of	f
+# text -- the identity function, but the bytes still have to survive
+text		
+text	hello	hello
+text	héllo wörld	héllo wörld
+text	  padded  	  padded  
+text	a\tb	a\tb
+text	a\nb	a\nb
+text	back\\slash	back\\slash
+text	quote's	quote's
+text	🌊 esker	🌊 esker
+text	\N	\\N
+# bytea -- hex on the way out, hex or escape on the way in
+bytea	\\x	\\x
+bytea	\\x00	\\x00
+bytea	\\xdeadbeef	\\xdeadbeef
+bytea	\\xDEADBEEF	\\xdeadbeef
+bytea	\\x00ff107f80	\\x00ff107f80
+bytea	\\x de ad	\\xdead
+bytea	abc	\\x616263
+bytea	a\\\\b	\\x615c62
+bytea	\\101	\\x41
+bytea	x\\101y	\\x784179
+bytea	\\000	\\x00
+bytea	\\x0	!22023 invalid hexadecimal data: odd number of digits
+bytea	\\xzz	!22023 invalid hexadecimal digit: "z"
+bytea	\\xg0	!22023 invalid hexadecimal digit: "g"
+bytea	\\X00	!22P02 invalid input syntax for type bytea
+bytea	\\1	!22P02 invalid input syntax for type bytea
+bytea	\\12	!22P02 invalid input syntax for type bytea
+bytea	\\777	!22P02 invalid input syntax for type bytea
+bytea	\\	!22P02 invalid input syntax for type bytea
+# float8 -- the notation boundary is at 10^-4 and 10^15, measured, not assumed
+float8	0	0
+float8	-0	-0
+float8	1	1
+float8	-1	-1
+float8	100	100
+float8	-2.5	-2.5
+float8	0.1	0.1
+float8	0.001	0.001
+float8	0.0001	0.0001
+float8	0.00001	1e-05
+float8	0.000123	0.000123
+float8	1e13	10000000000000
+float8	1e14	100000000000000
+float8	999999999999999	999999999999999
+float8	1e15	1e+15
+float8	1e16	1e+16
+float8	1e20	1e+20
+float8	1e100	1e+100
+float8	1e-100	1e-100
+float8	1e308	1e+308
+float8	5e-324	5e-324
+float8	2.2250738585072014e-308	2.2250738585072014e-308
+float8	1.7976931348623157e308	1.7976931348623157e+308
+float8	3.141592653589793	3.141592653589793
+float8	0.3333333333333333	0.3333333333333333
+float8	123456789012345678	1.2345678901234568e+17
+float8	1234567890123456	1.234567890123456e+15
+float8	9007199254740993	9.007199254740992e+15
+float8	inf	Infinity
+float8	Infinity	Infinity
+float8	-inf	-Infinity
+float8	-Infinity	-Infinity
+float8	nan	NaN
+float8	NaN	NaN
+float8	NAN	NaN
+float8	  1.5  	1.5
+float8	+1.5	1.5
+float8	.5	0.5
+float8	5.	5
+float8	0x10	16
+float8	1e400	!22003 "1e400" is out of range for type double precision
+float8	1e-400	!22003 "1e-400" is out of range for type double precision
+float8		!22P02 invalid input syntax for type double precision: ""
+float8	abc	!22P02 invalid input syntax for type double precision: "abc"
+float8	1.5e	!22P02 invalid input syntax for type double precision: "1.5e"
+float8	--1	!22P02 invalid input syntax for type double precision: "--1"
+float8	0x1p3	8
+float8	1_000.5	!22P02 invalid input syntax for type double precision: "1_000.5"
+float8	1.5d3	!22P02 invalid input syntax for type double precision: "1.5d3"
+float8	infinity	Infinity
+float8	+inf	Infinity
+# timestamptz -- ISO in, ISO out, and the two ends of the range
+timestamptz	2000-01-01 00:00:00+00	2000-01-01 00:00:00+00
+timestamptz	1970-01-01 00:00:00+00	1970-01-01 00:00:00+00
+timestamptz	2024-02-29 12:34:56.789012+00	2024-02-29 12:34:56.789012+00
+timestamptz	2024-02-29 12:34:56.1+00	2024-02-29 12:34:56.1+00
+timestamptz	2024-02-29 12:34:56.100000+00	2024-02-29 12:34:56.1+00
+timestamptz	2024-02-29 12:34:56.000001+00	2024-02-29 12:34:56.000001+00
+timestamptz	1999-12-31 23:59:59.999999+00	1999-12-31 23:59:59.999999+00
+timestamptz	2024-01-01	2024-01-01 00:00:00+00
+timestamptz	2024-01-01 10:00	2024-01-01 10:00:00+00
+timestamptz	2024-01-01T10:00:00Z	2024-01-01 10:00:00+00
+timestamptz	2024-01-01 10:00:00+05:30	2024-01-01 04:30:00+00
+timestamptz	2024-01-01 10:00:00-07	2024-01-01 17:00:00+00
+timestamptz	2024-01-01 10:00:00.1234567	2024-01-01 10:00:00.123457+00
+timestamptz	0001-01-01 00:00:00+00	0001-01-01 00:00:00+00
+timestamptz	0001-01-01 00:00:00 BC	0001-01-01 00:00:00+00 BC
+timestamptz	4713-01-01 00:00:00 BC	4713-01-01 00:00:00+00 BC
+timestamptz	294276-12-31 23:59:59+00	294276-12-31 23:59:59+00
+timestamptz	294277-01-01 00:00:00+00	!22008 timestamp out of range: "294277-01-01 00:00:00+00"
+timestamptz	infinity	infinity
+timestamptz	-infinity	-infinity
+timestamptz	Infinity	infinity
+timestamptz	2024-13-01	!22008 date/time field value out of range: "2024-13-01"
+timestamptz	2024-02-30	!22008 date/time field value out of range: "2024-02-30"
+timestamptz	abc	!22007 invalid input syntax for type timestamp with time zone: "abc"
+timestamptz		!22007 invalid input syntax for type timestamp with time zone: ""
+timestamptz	2024-01-01 25:00:00+00	!22008 date/time field value out of range: "2024-01-01 25:00:00+00"
+timestamptz	01/02/2024	2024-01-02 00:00:00+00
+timestamptz	2024-01-01 10:00:00 America/New_York	2024-01-01 15:00:00+00
+timestamptz	epoch	1970-01-01 00:00:00+00
+timestamptz	2024-06-01 12:00:00	2024-06-01 12:00:00+00
+timestamptz	2024-1-1	2024-01-01 00:00:00+00
+timestamptz	 2024-01-01 	2024-01-01 00:00:00+00
+timestamptz	2024-01-01 10:00:00.123456789+00	2024-01-01 10:00:00.123457+00
+timestamptz	20240101	2024-01-01 00:00:00+00
+timestamptz	2024-01-01 10:00:00.5+00	2024-01-01 10:00:00.5+00
+timestamptz	4714-11-24 00:00:00 BC	4714-11-24 00:00:00+00 BC
+timestamptz	4714-11-23 00:00:00 BC	!22008 timestamp out of range: "4714-11-23 00:00:00 BC"
+timestamptz	2024-01-01 24:00:00+00	2024-01-02 00:00:00+00
+timestamptz	2024-01-01 24:00:01+00	!22008 date/time field value out of range: "2024-01-01 24:00:01+00"
+timestamptz	2024-01-01 23:59:60+00	2024-01-02 00:00:00+00
+timestamptz	2024-01-01 10:00:00+15	2023-12-31 19:00:00+00
+timestamptz	2024-01-01 10:00:00+16	!22009 time zone displacement out of range: "2024-01-01 10:00:00+16"
+timestamptz	2024-01-01 10	!22007 invalid input syntax for type timestamp with time zone: "2024-01-01 10"
+timestamptz	2024-01-01 10:00:00.9999999+00	2024-01-01 10:00:01+00
+timestamptz	2024-01-01 10:00:00 UTC	2024-01-01 10:00:00+00
+timestamptz	2024-01-01 10:00:00+0530	2024-01-01 04:30:00+00
+timestamptz	2024-02-29T00:00:00+00	2024-02-29 00:00:00+00
+timestamptz	2023-02-29	!22008 date/time field value out of range: "2023-02-29"

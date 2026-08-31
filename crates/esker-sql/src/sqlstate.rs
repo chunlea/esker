@@ -32,6 +32,19 @@ pub const INVALID_TEXT_REPRESENTATION: &str = "22P02";
 pub const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
 /// Division by zero, including modulo.
 pub const DIVISION_BY_ZERO: &str = "22012";
+/// A datetime literal PostgreSQL's own parser would also refuse — `'abc'::timestamptz`. Note that
+/// this is *not* `22P02`: the datetime types have their own condition, and a client that branches
+/// on the code would see the difference.
+pub const INVALID_DATETIME_FORMAT: &str = "22007";
+/// A datetime field is out of range — a thirteenth month, or an instant past the type's end.
+pub const DATETIME_FIELD_OVERFLOW: &str = "22008";
+/// A time zone displacement past `±15:59`, which is its own condition and not a field overflow.
+pub const INVALID_TIME_ZONE_DISPLACEMENT_VALUE: &str = "22009";
+/// Bytes that are not valid in the server encoding.
+pub const CHARACTER_NOT_IN_REPERTOIRE: &str = "22021";
+/// What `bytea`'s hexadecimal input reports a bad digit or an odd count with. Surprising — the
+/// neighbouring failures in the same input function are `22P02` — and captured, not assumed.
+pub const INVALID_PARAMETER_VALUE: &str = "22023";
 
 // --- Class 23 — Integrity Constraint Violation ---
 
@@ -123,6 +136,9 @@ pub const TOO_MANY_COLUMNS: &str = "54011";
 
 /// A bug here, not a mistake there. Nothing reachable from user input may report this.
 pub const INTERNAL_ERROR: &str = "XX000";
+/// Bytes came back from storage that this node cannot read as what they should be. Never a panic
+/// and never silently skipped (`CLAUDE.md` invariant 2).
+pub const DATA_CORRUPTED: &str = "XX001";
 
 #[cfg(test)]
 mod tests {
@@ -139,6 +155,17 @@ mod tests {
             super::NUMERIC_VALUE_OUT_OF_RANGE,
         ),
         ("DIVISION_BY_ZERO", super::DIVISION_BY_ZERO),
+        ("INVALID_DATETIME_FORMAT", super::INVALID_DATETIME_FORMAT),
+        ("DATETIME_FIELD_OVERFLOW", super::DATETIME_FIELD_OVERFLOW),
+        (
+            "INVALID_TIME_ZONE_DISPLACEMENT_VALUE",
+            super::INVALID_TIME_ZONE_DISPLACEMENT_VALUE,
+        ),
+        (
+            "CHARACTER_NOT_IN_REPERTOIRE",
+            super::CHARACTER_NOT_IN_REPERTOIRE,
+        ),
+        ("INVALID_PARAMETER_VALUE", super::INVALID_PARAMETER_VALUE),
         ("NOT_NULL_VIOLATION", super::NOT_NULL_VIOLATION),
         ("SERIALIZATION_FAILURE", super::SERIALIZATION_FAILURE),
         ("UNIQUE_VIOLATION", super::UNIQUE_VIOLATION),
@@ -179,6 +206,7 @@ mod tests {
         ("STATEMENT_TOO_COMPLEX", super::STATEMENT_TOO_COMPLEX),
         ("TOO_MANY_COLUMNS", super::TOO_MANY_COLUMNS),
         ("INTERNAL_ERROR", super::INTERNAL_ERROR),
+        ("DATA_CORRUPTED", super::DATA_CORRUPTED),
     ];
 
     /// The wire format gives the code field no length prefix, so a code of the wrong width would

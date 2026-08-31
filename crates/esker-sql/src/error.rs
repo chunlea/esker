@@ -111,6 +111,67 @@ pub enum SqlError {
         value: String,
     },
 
+    /// An integer literal is well-formed and too big. PostgreSQL phrases the two numeric ranges
+    /// differently — this one leads with `value` and [`SqlError::FloatOutOfRange`] does not — and
+    /// both are copied verbatim because a client may be matching on either.
+    #[error("value \"{value}\" is out of range for type {ty}")]
+    IntegerOutOfRange {
+        /// The PostgreSQL type name, as it appears in the message.
+        ty: &'static str,
+        /// The text that would not fit.
+        value: String,
+    },
+
+    /// A float literal is well-formed and outside the type's range, in either direction:
+    /// PostgreSQL raises this for `1e-400` as well as for `1e400`, rather than rounding to zero.
+    #[error("\"{value}\" is out of range for type {ty}")]
+    FloatOutOfRange {
+        /// The PostgreSQL type name, as it appears in the message.
+        ty: &'static str,
+        /// The text that would not fit.
+        value: String,
+    },
+
+    /// A datetime literal could not be read. The datetime types have their own condition
+    /// (`22007`), not the `22P02` every other type uses.
+    #[error("invalid input syntax for type {ty}: \"{value}\"")]
+    InvalidDatetimeFormat {
+        /// The PostgreSQL type name, as it appears in the message.
+        ty: &'static str,
+        /// The text that could not be read.
+        value: String,
+    },
+
+    /// A datetime field is outside its own range — a thirteenth month, a thirtieth of February.
+    #[error("date/time field value out of range: \"{0}\"")]
+    DatetimeFieldOutOfRange(String),
+
+    /// Every field was in range and the instant they name is not: past 294276 AD, or before
+    /// 4714 BC.
+    #[error("timestamp out of range: \"{0}\"")]
+    TimestampOutOfRange(String),
+
+    /// A time zone displacement past `±15:59`. Its own condition, not a field overflow.
+    #[error("time zone displacement out of range: \"{0}\"")]
+    TimeZoneDisplacementOutOfRange(String),
+
+    /// A `bytea` hexadecimal literal contains something that is not a hexadecimal digit.
+    #[error("invalid hexadecimal digit: \"{0}\"")]
+    InvalidHexDigit(char),
+
+    /// A `bytea` hexadecimal literal has a half byte at the end.
+    #[error("invalid hexadecimal data: odd number of digits")]
+    OddHexDigits,
+
+    /// A `bytea` escape-format literal has a backslash that starts nothing valid. PostgreSQL does
+    /// not quote the input back in this one, which a capture is the only way to know.
+    #[error("invalid input syntax for type bytea")]
+    InvalidByteaFormat,
+
+    /// Bytes arrived that are not valid UTF-8, which is the server encoding.
+    #[error("invalid byte sequence for encoding \"UTF8\": 0x{0:02x}")]
+    InvalidByteSequence(u8),
+
     /// An operator or function met types it is not defined for.
     #[error("{0}")]
     DatatypeMismatch(String),
@@ -156,6 +217,11 @@ pub enum SqlError {
     #[error("password authentication failed for user \"{0}\"")]
     InvalidPassword(String),
 
+    /// Bytes came back from storage that could not be read as the row or key they should be.
+    /// Distinct from [`SqlError::Internal`] because it says where to look: the data, not the code.
+    #[error("corrupt data: {0}")]
+    DataCorrupted(String),
+
     /// A bug here, not a mistake there. Nothing driven by user input may produce this.
     #[error("internal error: {0}")]
     Internal(String),
@@ -175,7 +241,23 @@ impl SqlError {
             SqlError::DuplicateColumn(_) => sqlstate::DUPLICATE_COLUMN,
             SqlError::UniqueViolation(_) => sqlstate::UNIQUE_VIOLATION,
             SqlError::NotNullViolation(_) => sqlstate::NOT_NULL_VIOLATION,
-            SqlError::InvalidTextRepresentation { .. } => sqlstate::INVALID_TEXT_REPRESENTATION,
+            SqlError::InvalidTextRepresentation { .. } | SqlError::InvalidByteaFormat => {
+                sqlstate::INVALID_TEXT_REPRESENTATION
+            }
+            SqlError::IntegerOutOfRange { .. } | SqlError::FloatOutOfRange { .. } => {
+                sqlstate::NUMERIC_VALUE_OUT_OF_RANGE
+            }
+            SqlError::InvalidDatetimeFormat { .. } => sqlstate::INVALID_DATETIME_FORMAT,
+            SqlError::DatetimeFieldOutOfRange(_) | SqlError::TimestampOutOfRange(_) => {
+                sqlstate::DATETIME_FIELD_OVERFLOW
+            }
+            SqlError::TimeZoneDisplacementOutOfRange(_) => {
+                sqlstate::INVALID_TIME_ZONE_DISPLACEMENT_VALUE
+            }
+            SqlError::InvalidHexDigit(_) | SqlError::OddHexDigits => {
+                sqlstate::INVALID_PARAMETER_VALUE
+            }
+            SqlError::InvalidByteSequence(_) => sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
             SqlError::DatatypeMismatch(_) => sqlstate::DATATYPE_MISMATCH,
             SqlError::SerializationFailure(_) => sqlstate::SERIALIZATION_FAILURE,
             SqlError::InFailedTransaction => sqlstate::IN_FAILED_SQL_TRANSACTION,
@@ -186,6 +268,7 @@ impl SqlError {
             SqlError::InvalidSqlStatementName(_) => sqlstate::INVALID_SQL_STATEMENT_NAME,
             SqlError::InvalidCursorName(_) => sqlstate::INVALID_CURSOR_NAME,
             SqlError::InvalidPassword(_) => sqlstate::INVALID_PASSWORD,
+            SqlError::DataCorrupted(_) => sqlstate::DATA_CORRUPTED,
             SqlError::Internal(_) => sqlstate::INTERNAL_ERROR,
         }
     }
