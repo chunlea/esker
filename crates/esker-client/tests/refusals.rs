@@ -26,15 +26,21 @@
 //! one. After the kills the cluster is settled and every refused key is read back. A key that
 //! exists is a write the client was told had not happened.
 //!
-//! # Known failure
-//!
-//! This fails today, and the cause is not in this crate. `esker-store`'s `PeerCore::propose`
-//! records a proposal in `pending` only *after* the Raft node has appended it, so a pending
-//! proposal is an entry in the leader's log that a surviving majority may still commit. When the
-//! peer stops, `driver.rs` fails those with `ProtoError::not_sent`, which `esker-proto`
-//! documents as *"a request that provably never left this process"* and maps to
-//! `RequestOutcome::NotApplied`. It left, and it may have been applied. Owned by the
-//! `esker-store` lane; this test is what says when it is fixed.
+// The bug it was written for
+//
+// It failed when it was written, and the cause was not in this crate. `esker-store`'s
+// `PeerCore::propose` records a proposal in `pending` only *after* the Raft node has appended
+// it, so a pending proposal is an entry in the leader's log that a surviving majority may still
+// commit. When the peer stopped, `driver.rs` failed those with `ProtoError::not_sent` — which
+// `esker-proto` documents as *"a request that provably never left this process"* and maps to
+// `RequestOutcome::NotApplied`, "safe to send again". It had left, and it had sometimes been
+// applied: nine of thirty-two refused writes were in the database.
+//
+// Fixed in `e06acbf`: `fail_outstanding` now takes the reason and picks the outcome itself, so
+// proposals get `Closed` (`Unknown`) and only the reads — a `ReadIndex` token, no entry, no
+// effect — keep `NotSent`. This is the regression test, and it is not a narrow one: it asserts
+// the promise rather than the shape of that particular mistake, so any other way of breaking it
+// fails here too.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
