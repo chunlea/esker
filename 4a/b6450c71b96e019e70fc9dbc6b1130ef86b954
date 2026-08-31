@@ -1,0 +1,25 @@
+crates/esker-sql/src/catalog/mod.rs
+  s_543d4c9b3ee38c::t_80fd7025ded901 54-67,418-420,456-498,535-538,544-551,585,951-1043
+crates/esker-sql/src/catalog/record.rs
+  s_543d4c9b3ee38c::t_17ad8c17163115 8-9,12-18,52-53,121-160
+docs/adr/0021-time-machine.md
+  s_543d4c9b3ee38c::t_87ceb4c3ebadf1 1-281
+docs/plans/phase-6a.md
+  s_543d4c9b3ee38c::t_002d035d8dba87 1104
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "4ab6450c71b96e019e70fc9dbc6b1130ef86b954",
+  "prompts": {},
+  "sessions": {
+    "s_543d4c9b3ee38c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "befd6192-73a4-4b10-9f4b-cd092c10ce31",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
