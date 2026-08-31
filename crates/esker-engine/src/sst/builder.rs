@@ -195,11 +195,13 @@ impl TableBuilder {
 
     /// Attaches the range tombstones this table carries.
     ///
-    /// They are written as a block of their own, and the table's key bounds are widened to
-    /// span them: a read for a key inside a deleted range has to open the file that says so,
-    /// and files are picked by their bounds
-    /// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)). Call before
-    /// [`TableBuilder::finish`]; calling twice replaces the set.
+    /// They are written as a block of their own. Their `begin` and `end` are **user** keys,
+    /// which is what the block format stores, and this layer never interprets them — widening
+    /// the *file's* bounds to span them is the engine's job, because the bounds are internal
+    /// keys and building one would mean understanding a key, which invariant 7 forbids here
+    /// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)).
+    ///
+    /// Call before [`TableBuilder::finish`]; calling twice replaces the set.
     pub fn set_range_tombstones(&mut self, tombstones: RangeTombstones) {
         self.range_tombstones = tombstones;
     }
@@ -298,7 +300,6 @@ impl TableBuilder {
         // properties rather than the footer, which is 48 bytes forever and has no room for a
         // fourth ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)).
         if !self.range_tombstones.is_empty() {
-            self.widen_bounds_for_tombstones();
             let payload = self.range_tombstones.encode();
             let handle = write_block(
                 self.file.as_mut(),
@@ -355,35 +356,6 @@ impl TableBuilder {
 
         self.props.file_size = self.offset;
         Ok(self.props)
-    }
-
-    /// Grows the table's key bounds to span its tombstones.
-    ///
-    /// `Version::overlapping` picks files by `smallest_key`/`largest_key`, so a tombstone
-    /// reaching outside them would be invisible to exactly the reads that need it — and the
-    /// failure would be silent: the read returns the value from a lower level with nothing
-    /// reporting an error.
-    ///
-    /// The bounds are *user* keys here, and a tombstone's `end` is exclusive; recording it as
-    /// the largest key overstates the table's reach by one key, which costs an extra file
-    /// opened and never a wrong answer. An empty table takes the tombstones' bounds outright.
-    fn widen_bounds_for_tombstones(&mut self) {
-        let comparator = self.options.comparator.as_ref();
-        let Some((low, high)) = self.range_tombstones.key_bounds(comparator) else {
-            return;
-        };
-        let (low, high) = (low.to_vec(), high.to_vec());
-        if self.props.entry_count == 0 {
-            self.props.smallest_key = low;
-            self.props.largest_key = high;
-            return;
-        }
-        if comparator.cmp(&low, &self.props.smallest_key) == Ordering::Less {
-            self.props.smallest_key = low;
-        }
-        if comparator.cmp(&high, &self.props.largest_key) == Ordering::Greater {
-            self.props.largest_key = high;
-        }
     }
 }
 

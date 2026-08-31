@@ -23,11 +23,13 @@
 
 use std::cmp::Ordering;
 use std::ops::Bound;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 
 use crossbeam_skiplist::SkipMap;
 use crossbeam_skiplist::map::Entry as SkipEntry;
+
+use crate::range_del::{RangeTombstone, RangeTombstones};
 
 use crate::dbformat::{
     Comparator, EntryKind, InternalKeyComparator, SeqNo, append_internal_key, extract_user_key,
@@ -74,15 +76,33 @@ impl Eq for MemKey {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Lookup {
     /// The newest visible entry is a value.
-    Found(Vec<u8>),
+    Found {
+        /// The value.
+        value: Vec<u8>,
+        /// The sequence number it was written at.
+        ///
+        /// The caller needs it to ask whether a range tombstone from this source or a newer
+        /// one hides it: a tombstone hides an entry only when it is strictly newer
+        /// ([ADR 0017](../../docs/adr/0017-range-tombstones.md)).
+        seqno: SeqNo,
+    },
     /// The newest visible entry is a tombstone. The key does not exist at this snapshot.
     Deleted,
 }
 
-/// One memtable: a sorted, append-only map of internal keys to values.
+/// One memtable: a sorted, append-only map of internal keys to values, plus the ranges
+/// deleted while it was active.
+///
+/// The tombstones sit *beside* the map rather than in it, because a range delete hides keys
+/// that are not in the map and keys that do not exist yet
+/// ([ADR 0017](../../docs/adr/0017-range-tombstones.md)). Behind a `Mutex` and not a skiplist
+/// because there are very few of them — a range delete is an administrative act, not something
+/// a write path emits per key — and because a reader takes a whole snapshot of them at once
+/// rather than seeking within them.
 #[derive(Debug)]
 pub struct MemTable {
     map: SkipMap<MemKey, Vec<u8>>,
+    range_tombstones: Mutex<RangeTombstones>,
     comparator: Arc<InternalKeyComparator>,
     approximate_size: AtomicUsize,
 }
@@ -92,6 +112,7 @@ impl MemTable {
     pub fn new(comparator: Arc<InternalKeyComparator>) -> Self {
         Self {
             map: SkipMap::new(),
+            range_tombstones: Mutex::new(RangeTombstones::new()),
             comparator,
             approximate_size: AtomicUsize::new(0),
         }
@@ -119,6 +140,49 @@ impl MemTable {
             .fetch_add(charge, AtomicOrdering::Relaxed);
     }
 
+    /// Records that `[begin, end)` was deleted at `seqno`.
+    ///
+    /// Kept beside the map: putting it at `begin` in the map is the v1 behaviour
+    /// `docs/DESIGN.md` §4.7 refuses, which deletes one key while claiming a range.
+    ///
+    /// A poisoned lock is reported by the *next* read rather than here, because a write that
+    /// has already been logged cannot be un-logged: see [`MemTable::range_tombstones`].
+    pub fn add_range(&self, seqno: SeqNo, begin: &[u8], end: &[u8]) {
+        let charge = begin.len() + end.len() + ENTRY_OVERHEAD;
+        if let Ok(mut tombstones) = self.range_tombstones.lock() {
+            tombstones.push(
+                RangeTombstone::new(begin.to_vec(), end.to_vec(), seqno),
+                self.comparator.user_comparator().as_ref(),
+            );
+        }
+        self.approximate_size
+            .fetch_add(charge, AtomicOrdering::Relaxed);
+    }
+
+    /// The ranges this table declares deleted.
+    ///
+    /// Cloned rather than borrowed: a reader holds the set for the whole of a lookup while
+    /// writers carry on adding, and a lock held across a multi-level read would make one
+    /// `delete_range` block every write behind it.
+    ///
+    /// A poisoned lock answers *empty*, which is wrong in the safe direction only in the sense
+    /// that it is the same answer a table with no tombstones gives — and a poisoned memtable
+    /// lock means a writer panicked mid-insert, which the layers above already treat as fatal.
+    pub fn range_tombstones(&self) -> RangeTombstones {
+        self.range_tombstones
+            .lock()
+            .map(|tombstones| tombstones.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether this table has any range tombstones at all. The common answer is `false`, and
+    /// the read path short-circuits on it.
+    pub fn has_range_tombstones(&self) -> bool {
+        self.range_tombstones
+            .lock()
+            .is_ok_and(|tombstones| !tombstones.is_empty())
+    }
+
     /// The newest entry for `user_key` visible at `snapshot`, or `None` if this table has
     /// nothing to say about it.
     ///
@@ -137,11 +201,14 @@ impl MemTable {
             return None;
         }
         match split_internal_key(internal) {
-            Some((_, _, EntryKind::Put)) => Some(Lookup::Found(entry.value().clone())),
-            // TODO(phase-5): a range tombstone hides every key in `[begin, end)`, but this
-            // lookup only sees the one stored at `begin`, so it answers for that key and no
-            // other. Keys strictly inside the range are the documented v1 limitation of
-            // `docs/DESIGN.md` §4.7.
+            Some((_, seqno, EntryKind::Put)) => Some(Lookup::Found {
+                value: entry.value().clone(),
+                seqno,
+            }),
+            // `DeleteRange` never reaches the map — `add_range` puts it in the tombstone list
+            // instead ([ADR 0017](../../docs/adr/0017-range-tombstones.md)). A tag saying
+            // otherwise is memory corruption; reading it as a point delete is the safe way to
+            // be wrong, because it hides a key rather than resurrecting one.
             Some((_, _, EntryKind::Delete | EntryKind::DeleteRange)) => Some(Lookup::Deleted),
             // An unreadable tag cannot come from `add`, so this is memory corruption rather
             // than disk corruption. Report "nothing here" instead of panicking (invariant 9).
@@ -159,9 +226,14 @@ impl MemTable {
         self.map.len()
     }
 
-    /// Whether nothing has been written to this table.
+    /// Whether nothing has been written to this table — **range deletes included**.
+    ///
+    /// A table holding only `delete_range` entries has an empty map and is not empty: the
+    /// flush path uses this to decide whether there is anything to write, and answering "yes,
+    /// empty" would drop the deletes on the floor at the next memtable switch
+    /// ([ADR 0017](../../docs/adr/0017-range-tombstones.md)).
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.map.is_empty() && !self.has_range_tombstones()
     }
 
     /// A cursor over the table, positioned nowhere until it is seeked.
@@ -348,15 +420,20 @@ mod tests {
         out
     }
 
+    /// The value a lookup should answer with, at the sequence number it was written at.
+    fn found(value: &[u8], seqno: crate::dbformat::SeqNo) -> Lookup {
+        Lookup::Found {
+            value: value.to_vec(),
+            seqno,
+        }
+    }
+
     #[test]
     fn a_put_is_visible_at_and_above_its_sequence_number() {
         let table = table();
         table.add(5, EntryKind::Put, b"key", b"value");
-        assert_eq!(table.get(b"key", 5), Some(Lookup::Found(b"value".to_vec())));
-        assert_eq!(
-            table.get(b"key", 100),
-            Some(Lookup::Found(b"value".to_vec()))
-        );
+        assert_eq!(table.get(b"key", 5), Some(found(b"value", 5)));
+        assert_eq!(table.get(b"key", 100), Some(found(b"value", 5)));
         assert_eq!(
             table.get(b"key", 4),
             None,
@@ -372,9 +449,9 @@ mod tests {
         table.add(1, EntryKind::Put, b"k", b"one");
         table.add(2, EntryKind::Put, b"k", b"two");
         table.add(3, EntryKind::Put, b"k", b"three");
-        assert_eq!(table.get(b"k", 3), Some(Lookup::Found(b"three".to_vec())));
-        assert_eq!(table.get(b"k", 2), Some(Lookup::Found(b"two".to_vec())));
-        assert_eq!(table.get(b"k", 1), Some(Lookup::Found(b"one".to_vec())));
+        assert_eq!(table.get(b"k", 3), Some(found(b"three", 3)));
+        assert_eq!(table.get(b"k", 2), Some(found(b"two", 2)));
+        assert_eq!(table.get(b"k", 1), Some(found(b"one", 1)));
         assert_eq!(table.len(), 3, "every version is still stored");
     }
 
@@ -386,7 +463,7 @@ mod tests {
         table.add(1, EntryKind::Put, b"k", b"value");
         table.add(2, EntryKind::Delete, b"k", b"");
         assert_eq!(table.get(b"k", 2), Some(Lookup::Deleted));
-        assert_eq!(table.get(b"k", 1), Some(Lookup::Found(b"value".to_vec())));
+        assert_eq!(table.get(b"k", 1), Some(found(b"value", 1)));
         assert_eq!(table.get(b"gone", 2), None, "never written is not deleted");
         assert_eq!(table.len(), 2, "the tombstone is stored, not applied");
     }
@@ -505,8 +582,11 @@ mod tests {
                 let expected = model
                     .range((key.to_vec(), 0)..=(key.to_vec(), snapshot))
                     .next_back()
-                    .map(|(_, value)| match value {
-                        Some(value) => Lookup::Found(value.clone()),
+                    .map(|((_, seqno), value)| match value {
+                        Some(value) => Lookup::Found {
+                            value: value.clone(),
+                            seqno: *seqno,
+                        },
                         None => Lookup::Deleted,
                     });
                 assert_eq!(

@@ -34,6 +34,7 @@ use crate::dbformat::{SeqNo, extract_tag, tag_seqno};
 use crate::error::{Error, IoResultExt, Result};
 use crate::filename::{self, FileKind};
 use crate::iterator::Cursor;
+use crate::range_del::RangeTombstones;
 use crate::sst::{TableBuilder, TableOptions};
 use crate::version::{CfVersion, FileMeta, Version, VersionEdit};
 
@@ -78,14 +79,28 @@ impl Db {
                 else {
                     break;
                 };
+                // The same discharge rule as the background loop: a tombstone in the inputs
+                // takes every file it covers ([ADR 0017] decision 6). An explicit
+                // `compact_range` is in fact how an operator forces one to happen now.
+                let tombstones = self.inner.tombstones_of(&handle, &compaction)?;
+                let compaction = if tombstones.is_empty() {
+                    compaction
+                } else if Picker::can_discharge(&tombstones, self.inner.compaction_floor()) {
+                    picker.discharge(cf_version, compaction, &tombstones)
+                } else {
+                    // The picker would keep offering this same compaction, so leaving the
+                    // level is the only way out that is not a spin. The tombstone stays in L0
+                    // and is honoured from there.
+                    break;
+                };
                 if !self.inner.reserve(&compaction)? {
                     // Someone else has these files. Wait for them rather than spin.
                     self.inner.wait_for_compaction()?;
                     continue;
                 }
-                let outcome = self
-                    .inner
-                    .run_compaction(&handle, &version, &compaction, &picker);
+                let outcome =
+                    self.inner
+                        .run_compaction(&handle, &version, &compaction, &picker, &tombstones);
                 self.inner.release(&compaction)?;
                 outcome?;
             }
@@ -124,15 +139,60 @@ impl DbInner {
             let Some(compaction) = picker.pick(cf.id(), cf_version, &pointers) else {
                 continue;
             };
+            // A tombstone in the inputs turns this into a discharge: it takes every file the
+            // tombstone covers, at every level, applies it and drops it
+            // ([ADR 0017](../../../docs/adr/0017-range-tombstones.md) decision 6). This is
+            // what the *scheduler* does with a `delete_range`; the write that produced the
+            // tombstone acknowledged long ago, and reads have been honouring it out of the
+            // memtable and L0 ever since (invariant 1 is untouched).
+            let tombstones = self.tombstones_of(&cf, &compaction)?;
+            let compaction = if tombstones.is_empty() {
+                compaction
+            } else if Picker::can_discharge(&tombstones, self.compaction_floor()) {
+                picker.discharge(cf_version, compaction, &tombstones)
+            } else {
+                // A snapshot older than the delete is still open. Leave the tombstone in L0,
+                // where reads honour it, and try again when that snapshot goes.
+                continue;
+            };
             if !self.reserve(&compaction)? {
                 continue; // Someone else has these files; the picker will offer them again.
             }
-            let outcome = self.run_compaction(&cf, &version, &compaction, &picker);
+            let outcome = self.run_compaction(&cf, &version, &compaction, &picker, &tombstones);
             self.release(&compaction)?;
             outcome?;
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// The range tombstones a compaction's inputs carry.
+    ///
+    /// Only L0 files can hold any, because a discharge drops them rather than propagating them
+    /// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md) decision 6) — so this is a
+    /// no-op for every compaction below L0, and the `debug_assert` is what keeps the claim
+    /// honest rather than assumed.
+    fn tombstones_of(
+        &self,
+        cf: &Arc<ColumnFamily>,
+        compaction: &Compaction,
+    ) -> Result<RangeTombstones> {
+        let table_options = self.table_options(cf);
+        let user = self.comparator.user_comparator();
+        let mut tombstones = RangeTombstones::new();
+        for file in compaction.all_inputs() {
+            let reader = self.table_cache.get(file.number, &table_options)?;
+            if reader.range_tombstones().is_empty() {
+                continue;
+            }
+            debug_assert_eq!(
+                compaction.level, 0,
+                "a range tombstone in a file below L0: file {} at level {}",
+                file.number, compaction.level
+            );
+            tombstones.extend(reader.range_tombstones(), user.as_ref());
+        }
+        Ok(tombstones)
     }
 
     /// Claims every input of `compaction`, or nothing at all.
@@ -184,24 +244,33 @@ impl DbInner {
         version: &Version,
         compaction: &Compaction,
         picker: &Picker,
+        tombstones: &RangeTombstones,
     ) -> Result<()> {
         let mut edit = VersionEdit::new();
         for file in &compaction.inputs {
             edit.delete_file(compaction.cf, level_u32(compaction.level), file.number);
         }
+        // `outputs_overlapped` is always `level + 1`, which is the output level only when this
+        // is not a discharge — a discharge writes deeper, so the level has to be named rather
+        // than inferred.
         for file in &compaction.outputs_overlapped {
-            edit.delete_file(
-                compaction.cf,
-                level_u32(compaction.output_level()),
-                file.number,
-            );
+            edit.delete_file(compaction.cf, level_u32(compaction.level + 1), file.number);
+        }
+        for (level, file) in &compaction.discharge {
+            edit.delete_file(compaction.cf, level_u32(*level), file.number);
         }
 
         // A move is only trivial while the output would be byte-identical. A compaction
         // filter is entitled to change what is written, so with one configured the shortcut
         // would quietly skip it — and a caller who asked for a compaction expecting the filter
         // to run would get a no-op.
-        let trivial = compaction.is_trivial_move() && cf.options().compaction_filter.is_none();
+        // A move is only trivial while the output would be byte-identical, and a tombstone in
+        // the inputs guarantees it would not be: the whole point of taking it is to apply it
+        // and drop it. Moving the file instead would carry the tombstone to L1 and break the
+        // invariant that nothing below L0 holds one.
+        let trivial = compaction.is_trivial_move()
+            && cf.options().compaction_filter.is_none()
+            && tombstones.is_empty();
         // Kept past the branch: once the edit naming them is durable, these are the numbers
         // the register has no further reason to hold.
         let mut outputs: Vec<FileMeta> = Vec::new();
@@ -222,7 +291,8 @@ impl DbInner {
             );
             CompactionStats::default()
         } else {
-            let (produced, stats) = self.merge_inputs(cf, version, compaction, picker)?;
+            let (produced, stats) =
+                self.merge_inputs(cf, version, compaction, picker, tombstones)?;
             for file in &produced {
                 edit.add_file(
                     compaction.cf,
@@ -293,7 +363,11 @@ impl DbInner {
             || compaction
                 .outputs_overlapped
                 .iter()
-                .any(|file| !holds(compaction.output_level(), file.number));
+                .any(|file| !holds(compaction.level + 1, file.number))
+            || compaction
+                .discharge
+                .iter()
+                .any(|(level, file)| !holds(*level, file.number));
         if stale {
             return Ok(false);
         }
@@ -309,6 +383,7 @@ impl DbInner {
         version: &Version,
         compaction: &Compaction,
         picker: &Picker,
+        tombstones: &RangeTombstones,
     ) -> Result<(Vec<FileMeta>, CompactionStats)> {
         let table_options = self.table_options(cf);
         let mut children: Vec<Box<dyn Cursor + Send>> = Vec::new();
@@ -324,8 +399,11 @@ impl DbInner {
         let cf_version = version
             .cf(compaction.cf)
             .ok_or_else(|| Error::InvalidArgument("the column family vanished".to_string()))?;
+        // Measured from the *output* level, which a discharge pushes deeper than `level + 1`.
+        // Asking about `level` would answer for a level the outputs are not going to, and a
+        // tombstone dropped on that answer resurrects a key.
         let is_bottom = |user_key: &[u8]| {
-            picker.is_bottom_level_for_key(cf_version, compaction.level, user_key)
+            picker.is_bottom_level_for_key(cf_version, compaction.output_level() - 1, user_key)
         };
 
         let mut output = TableWriter::new(self, table_options);
@@ -336,6 +414,7 @@ impl DbInner {
             target_file_size: compaction.target_file_size,
             filter: cf.options().compaction_filter.as_deref(),
             is_bottom: &is_bottom,
+            tombstones,
         };
         match job.run(&mut input, &mut output) {
             Ok(stats) => Ok((output.finished, stats)),
@@ -673,7 +752,13 @@ mod tests {
             "the compaction has to write an output for there to be anything to release"
         );
         db.inner
-            .run_compaction(&handle, &version, &compaction, &picker)
+            .run_compaction(
+                &handle,
+                &version,
+                &compaction,
+                &picker,
+                &RangeTombstones::new(),
+            )
             .expect("the compaction");
 
         drain(&db, "after the compaction");
@@ -759,7 +844,7 @@ mod tests {
         // T2 applies its plan. Dropping it is the only correct answer: every file it names is
         // gone, so there is nothing left to do and nothing to report.
         db.inner
-            .run_compaction(&handle, &pinned, &stale, &picker)
+            .run_compaction(&handle, &pinned, &stale, &picker, &RangeTombstones::new())
             .expect("a stale plan is a lost race, not a corrupt manifest");
         assert_eq!(
             db.compactions_run(),

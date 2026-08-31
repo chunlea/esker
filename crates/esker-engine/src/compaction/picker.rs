@@ -23,8 +23,9 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use crate::dbformat::{Comparator, InternalKeyComparator, extract_user_key};
+use crate::dbformat::{Comparator, InternalKeyComparator, SeqNo, extract_user_key};
 use crate::options::CfOptions;
+use crate::range_del::RangeTombstones;
 use crate::version::{CfVersion, FileMeta};
 
 /// One compaction: which files, from which level, into which.
@@ -38,6 +39,18 @@ pub struct Compaction {
     pub inputs: Vec<Arc<FileMeta>>,
     /// Files from `level + 1` that overlap them.
     pub outputs_overlapped: Vec<Arc<FileMeta>>,
+    /// Extra inputs from levels *below* `level + 1`, with the level each came from.
+    ///
+    /// Empty for every ordinary compaction. Non-empty only for a **discharge**: a compaction
+    /// whose inputs carry a range tombstone, which must take every file the tombstone covers
+    /// so that the covered keys can be dropped and the tombstone itself dropped with them
+    /// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md) decision 6). A range tombstone
+    /// never reaches an SST below L0, and this is the mechanism that keeps that true.
+    pub discharge: Vec<(usize, Arc<FileMeta>)>,
+    /// The level the outputs go to: `level + 1` normally, and the deepest level a discharge
+    /// reached when there is one. Writing them any higher would put a key above a level that
+    /// still holds an older version of it.
+    pub output_level: usize,
     /// Bytes an output file may reach before the next key starts a new one.
     pub target_file_size: u64,
 }
@@ -45,20 +58,30 @@ pub struct Compaction {
 impl Compaction {
     /// The level outputs are written to.
     pub fn output_level(&self) -> usize {
-        self.level + 1
+        self.output_level
     }
 
     /// Every file this compaction reads.
     pub fn all_inputs(&self) -> impl Iterator<Item = &Arc<FileMeta>> {
-        self.inputs.iter().chain(self.outputs_overlapped.iter())
+        self.inputs
+            .iter()
+            .chain(self.outputs_overlapped.iter())
+            .chain(self.discharge.iter().map(|(_, file)| file))
+    }
+
+    /// Whether this compaction exists to discharge a range tombstone.
+    pub fn is_discharge(&self) -> bool {
+        !self.discharge.is_empty() || self.output_level > self.level + 1
     }
 
     /// Whether the files can simply be re-labelled as belonging to the next level.
     ///
     /// One input, nothing to merge it with: rewriting it would produce the same bytes under a
     /// different number. The manifest edit alone does the whole job.
+    ///
+    /// Never true for a discharge: the whole point of one is that the bytes change.
     pub fn is_trivial_move(&self) -> bool {
-        self.inputs.len() == 1 && self.outputs_overlapped.is_empty()
+        self.inputs.len() == 1 && self.outputs_overlapped.is_empty() && !self.is_discharge()
     }
 
     /// Total bytes read.
@@ -219,8 +242,94 @@ impl Picker {
             level,
             inputs,
             outputs_overlapped: overlapped,
+            discharge: Vec::new(),
+            output_level: level + 1,
             target_file_size: self.options.target_file_size,
         }
+    }
+
+    /// Grows a compaction into a **discharge** of the range tombstones its inputs carry.
+    ///
+    /// Ruling (ii) of [ADR 0017](../../../docs/adr/0017-range-tombstones.md) decision 6: a
+    /// range tombstone is applied and dropped at L0 and never written below it. That is only
+    /// sound if the compaction that applies it sees *every* version the tombstone covers —
+    /// otherwise a key dropped from this output would be resurrected by an older version left
+    /// behind in a level nobody touched.
+    ///
+    /// So every file at every level below, overlapping the tombstones' key range, becomes an
+    /// input, and the outputs go to the deepest level any of them came from. Ordinary input
+    /// selection does not do this: it stops at `level + 1` and it is bounded by the *inputs'*
+    /// key range, which a tombstone routinely reaches past — a `DROP TABLE` deletes a range
+    /// far wider than the one file that happens to record the delete.
+    ///
+    /// Returns the compaction unchanged when there is nothing to discharge.
+    pub fn discharge(
+        &self,
+        version: &CfVersion,
+        mut compaction: Compaction,
+        tombstones: &RangeTombstones,
+    ) -> Compaction {
+        let user = self.comparator.user_comparator().as_ref();
+        let Some((low, high)) = tombstones.key_bounds(user) else {
+            return compaction;
+        };
+
+        // The sweep covers the **union** of the tombstone's range and the inputs' own, not
+        // just the tombstone's. The outputs land at the deepest level reached, so anything
+        // between the inputs and there that overlaps what is being written has to come too —
+        // otherwise a file left at an intermediate level would sit *above* the output holding
+        // an older version of a key, and the read path consults it first. That is a lost
+        // write, and it has nothing to do with the tombstone that caused the deep compaction.
+        let (mut low, mut high) = (low.to_vec(), high.to_vec());
+        if let Some((input_low, input_high)) =
+            CfVersion::range_of(&compaction.all_inputs().cloned().collect::<Vec<_>>(), user)
+        {
+            let input_low = extract_user_key(&input_low).to_vec();
+            let input_high = extract_user_key(&input_high).to_vec();
+            if user.cmp(&input_low, &low) == Ordering::Less {
+                low = input_low;
+            }
+            if user.cmp(&input_high, &high) == Ordering::Greater {
+                high = input_high;
+            }
+        }
+
+        let mut deepest = compaction.output_level;
+        for level in (compaction.level + 1)..version.num_levels() {
+            for file in version.overlapping(level, Some(&low), Some(&high), user) {
+                let already = compaction
+                    .outputs_overlapped
+                    .iter()
+                    .chain(compaction.discharge.iter().map(|(_, held)| held))
+                    .any(|held| held.number == file.number);
+                if already {
+                    continue;
+                }
+                if level == compaction.level + 1 {
+                    compaction.outputs_overlapped.push(file);
+                } else {
+                    compaction.discharge.push((level, file));
+                }
+                deepest = deepest.max(level);
+            }
+        }
+        compaction.output_level = deepest;
+        compaction
+    }
+
+    /// Whether a compaction may consume these tombstones, or must leave them where they are.
+    ///
+    /// A discharge *drops* the tombstone once it has applied it, so it may only run when the
+    /// tombstone has nothing left to say to anyone: every live reader must already see the
+    /// delete, which is `seqno <= floor`. A snapshot taken before the delete still needs to see
+    /// what was deleted, and dropping the tombstone on its behalf would lose the deletion for
+    /// *everyone* ([ADR 0017](../../../docs/adr/0017-range-tombstones.md) decision 6).
+    ///
+    /// When this is false the compaction is simply not run. The tombstone stays in L0, reads
+    /// keep honouring it out of there, and the next round tries again — which is what "the
+    /// discharge is scheduled" means when the schedule has to wait.
+    pub fn can_discharge(tombstones: &RangeTombstones, floor: SeqNo) -> bool {
+        tombstones.iter().all(|tombstone| tombstone.seqno <= floor)
     }
 
     /// Whether no level below `level + 1` holds `user_key`.
@@ -281,6 +390,7 @@ mod tests {
     use super::Picker;
     use crate::dbformat::{BytewiseComparator, EntryKind, InternalKeyComparator, internal_key};
     use crate::options::CfOptions;
+    use crate::range_del::RangeTombstones;
     use crate::version::{Builder, CfVersion, FileMeta, Version, VersionEdit};
     use std::sync::Arc;
 
@@ -452,6 +562,130 @@ mod tests {
         assert!(
             !picked.contains(&4),
             "the closure stops at files that really do not overlap"
+        );
+    }
+
+    #[test]
+    fn a_discharge_reaches_past_what_ordinary_selection_would_take() {
+        // L0 holds one small file over `d`..`e`. Ordinary selection takes it and whatever it
+        // overlaps at L1 — file 3 — and stops there. The tombstone deletes `d`..`t`, which
+        // reaches files 4 and 5 at L2 and L4 that nothing about the *inputs* would have named.
+        let version = version(&[
+            (0, 1, "d", "e", 10),
+            (1, 3, "d", "f", 10),
+            (2, 4, "m", "p", 10),
+            (4, 5, "q", "s", 10),
+            // Outside the tombstone and outside the inputs: it must be left alone, or a
+            // discharge would grow into a full compaction of the database.
+            (2, 6, "u", "z", 10),
+        ]);
+        let picker = picker();
+        let ordinary = picker
+            .pick_range(0, cf(&version), 0, None, None)
+            .expect("L0 has a file");
+        assert_eq!(numbers(&ordinary.inputs), vec![1]);
+        assert_eq!(
+            numbers(&ordinary.outputs_overlapped),
+            vec![3],
+            "ordinary selection stops at what the inputs overlap"
+        );
+        assert!(ordinary.discharge.is_empty());
+        assert_eq!(ordinary.output_level(), 1);
+
+        let mut tombstones = RangeTombstones::new();
+        tombstones.push(
+            crate::range_del::RangeTombstone::new(b"d".to_vec(), b"t".to_vec(), 900),
+            comparator().user_comparator().as_ref(),
+        );
+        let discharge = picker.discharge(cf(&version), ordinary, &tombstones);
+
+        assert!(discharge.is_discharge());
+        assert_eq!(
+            numbers(&discharge.outputs_overlapped),
+            vec![3],
+            "L1 is still L1"
+        );
+        let pulled: Vec<(usize, u64)> = discharge
+            .discharge
+            .iter()
+            .map(|(level, file)| (*level, file.number))
+            .collect();
+        assert_eq!(
+            pulled,
+            vec![(2, 4), (4, 5)],
+            "every file the tombstone covers, at every level below"
+        );
+        assert!(
+            !pulled.iter().any(|(_, number)| *number == 6),
+            "a file outside the tombstone and outside the inputs is left alone"
+        );
+        assert_eq!(
+            discharge.output_level(),
+            4,
+            "the outputs go to the deepest level reached, or a file left above them would \
+             shadow what they hold"
+        );
+        // Never a trivial move: the whole point is that the bytes change.
+        assert!(!discharge.is_trivial_move());
+    }
+
+    /// The sweep covers the inputs' own range too, not only the tombstone's. A file at an
+    /// intermediate level overlapping what is being *written* has to come along, or it would
+    /// sit above the output holding an older version of a key — and the read path consults it
+    /// first, so the older version wins.
+    #[test]
+    fn a_discharge_takes_what_lies_between_it_and_its_output_level() {
+        let version = version(&[
+            // The L0 file carries the tombstone over `d`..`f` and also holds `z`.
+            (0, 1, "d", "z", 10),
+            (3, 2, "e", "e", 10),
+            // Overlaps the *inputs* (through `z`) but not the tombstone. Left behind, it would
+            // sit at L1 above an output at L3 that holds a newer `z`.
+            (1, 3, "y", "z", 10),
+        ]);
+        let picker = picker();
+        let ordinary = picker
+            .pick_range(0, cf(&version), 0, None, None)
+            .expect("L0 has a file");
+        let mut tombstones = RangeTombstones::new();
+        tombstones.push(
+            crate::range_del::RangeTombstone::new(b"d".to_vec(), b"f".to_vec(), 900),
+            comparator().user_comparator().as_ref(),
+        );
+        let discharge = picker.discharge(cf(&version), ordinary, &tombstones);
+
+        assert_eq!(discharge.output_level(), 3);
+        assert_eq!(
+            numbers(&discharge.outputs_overlapped),
+            vec![3],
+            "the L1 file overlapping the inputs comes too"
+        );
+        assert_eq!(
+            discharge
+                .discharge
+                .iter()
+                .map(|(level, file)| (*level, file.number))
+                .collect::<Vec<_>>(),
+            vec![(3, 2)]
+        );
+    }
+
+    /// A tombstone newer than the floor cannot be discharged: a snapshot taken before the
+    /// delete still has to see what it deleted, and dropping the tombstone on its behalf would
+    /// lose the deletion for everyone.
+    #[test]
+    fn a_tombstone_above_the_floor_is_not_dischargeable() {
+        let mut tombstones = RangeTombstones::new();
+        tombstones.push(
+            crate::range_del::RangeTombstone::new(b"a".to_vec(), b"z".to_vec(), 100),
+            comparator().user_comparator().as_ref(),
+        );
+        assert!(Picker::can_discharge(&tombstones, 100), "at the floor");
+        assert!(Picker::can_discharge(&tombstones, 200), "below it");
+        assert!(!Picker::can_discharge(&tombstones, 99), "above it");
+        assert!(
+            Picker::can_discharge(&RangeTombstones::new(), 0),
+            "nothing to discharge is always dischargeable"
         );
     }
 

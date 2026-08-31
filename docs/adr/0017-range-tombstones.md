@@ -105,9 +105,9 @@ accepts a `DeleteRange` and does not honour it is the exact failure §4.7 refuse
 worse than the refusal: the refusal is loud and the acceptance is silent, and by the time anyone
 noticed, the logs would contain entries the reader disagrees with.
 
-## Decision 6 (open): how a tombstone reaches below L0
+## Decision 6: a tombstone never reaches below L0 — it is discharged there
 
-**Not settled. The format above does not depend on it, which is why this ADR lands ahead of it.**
+**Ruled: option (ii).**
 
 Decision 3 widens a table's key bounds to span its tombstones, and that is safe at L0, whose files
 overlap by design and are all consulted. It is **not** safe below L0 as written, and the reason is
@@ -120,7 +120,8 @@ to span a tombstone can push its `largest` past the next file's `smallest`, and 
 search can return the earlier file for a key the later one holds — a read that misses the key
 entirely, silently.
 
-Three ways out, in increasing order of how much they change:
+Three ways out were priced. **(ii) is the ruling**; the others are recorded because the reasoning
+matters more than the choice:
 
 **(i) Clip tombstones to output boundaries at compaction.** Each output file carries the part of each
 tombstone that falls in `[its first key, the next output's first key)`. `largest` then never passes
@@ -142,9 +143,43 @@ asks the version rather than a file. It needs `FileMeta` to record whether a fil
 which is a manifest format change, and it moves state into the version set that has to be rebuilt on
 open.
 
-(ii) is the smaller change and is enough for both of phase 5's users; (i) is the general one. Whoever
-implements the read half should pick before writing any of it, because the choice decides whether
-compaction or the picker is the piece that moves.
+**The ruling is (ii).** v1's two `DeleteRange` consumers — `DROP TABLE` and MVCC garbage collection —
+*want* that compaction: the covered keys have to be physically removed either way, and a discharge is
+exactly that work, done once. `search_levels` keeps the binary search that assumes a level partitions
+the key space, untouched and unhardened. (i)'s price is a cliff — the compaction's input selection
+must already span every tombstone or the tombstone silently loses coverage outside it — and that is
+`RocksDB` paying for a workload v1 does not have: many small range deletes, continuously, across a
+deep tree.
+
+**(i) is the post-v1 evolution.** When range deletes become frequent enough that forcing a compaction
+per delete is the wrong trade, clipping is what replaces this — and it needs `search_levels` hardened
+to scan forward from the partition point, which (ii) deliberately avoids needing.
+
+### What (ii) requires of the implementation
+
+1. **The discharge is scheduled, not synchronous.** `Db::write` logs a range delete and acknowledges
+   exactly as it does any other entry, so `CLAUDE.md` invariant 1 is untouched and no write waits on a
+   compaction. Until a discharge runs, reads honour the tombstone out of the memtable, the immutables
+   and L0 — which is where it is, and which is why the wait costs nothing but space.
+2. **The forced lower-level inclusion is a rule, not an accident.** `Picker::discharge` takes every
+   file at every level below that overlaps the tombstones — *and* the inputs' own range, because the
+   outputs land at the deepest level reached and a file left at an intermediate level overlapping what
+   is being written would sit above the output holding an older version of a key. Ordinary selection
+   never does this: it stops at `level + 1` and is bounded by the inputs' range, which a tombstone
+   routinely reaches past. `a_discharge_reaches_past_what_ordinary_selection_would_take` and
+   `a_discharge_takes_what_lies_between_it_and_its_output_level` are the proof.
+3. **A tombstone is only consumed when it can be fully discharged.** `Picker::can_discharge` refuses
+   while any tombstone sits above the compaction floor: a snapshot taken before the delete still has
+   to see what was deleted, and dropping the tombstone on its behalf would lose the deletion for
+   everyone. The compaction is simply not run, and the next round tries again.
+4. **No SST below L0 ever holds a range tombstone.** `debug_assert`s in `db/read.rs`, `db/iter.rs` and
+   `db/compact.rs`; `esker-cli sst-dump` prints `range_deletions` and lists them; and
+   `no_sst_below_l0_ever_holds_a_range_tombstone` sweeps every file of a real database through
+   `Db::files_by_level` after a compaction.
+
+A consequence worth naming: **a compaction whose inputs carry a tombstone is never a trivial move.**
+Relabelling the file into L1 would carry the tombstone down and break the invariant in the one path
+that writes no bytes at all.
 
 ## Consequences
 

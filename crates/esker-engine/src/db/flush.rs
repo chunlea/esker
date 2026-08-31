@@ -27,15 +27,66 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crate::dbformat::{Comparator, InternalPrefixExtractor, SeqNo, extract_tag, tag_seqno};
+use crate::dbformat::{
+    Comparator, EntryKind, InternalKeyComparator, InternalPrefixExtractor, MAX_SEQNO, SeqNo,
+    append_internal_key, extract_tag, extract_user_key, tag_seqno,
+};
 use crate::error::{Error, IoResultExt, Result};
 use crate::filename;
 use crate::memtable::MemTable;
+use crate::range_del::RangeTombstones;
 use crate::sst::{TableBuilder, TableOptions};
 use crate::version::{FileMeta, VersionEdit};
 use crate::wal::LogWriter;
 
 use super::{ColumnFamily, Db, DbInner, MemState, lock, read_lock, write_lock};
+
+/// Grows a file's internal-key bounds to span its range tombstones.
+///
+/// `Version::overlapping` and the read path's `covers` pick files by these bounds, so a
+/// tombstone reaching outside them would be invisible to the reads that need it — and the
+/// failure would be silent, the read taking a value from a lower level with nothing reporting
+/// an error ([ADR 0017](../../../docs/adr/0017-range-tombstones.md) decision 3).
+///
+/// The bounds are **internal** keys and a tombstone's are user keys, so each end is given the
+/// tag that makes it sort outside every real entry for the same user key: the largest possible
+/// tag at the bottom, the smallest at the top. A tombstone's `end` is exclusive, so taking it
+/// as the file's largest key overstates the reach by up to one user key — which costs an extra
+/// file opened and never a wrong answer.
+///
+/// Empty bounds mean a file with no entries at all, whose reach is entirely its tombstones.
+fn widen(
+    comparator: &Arc<InternalKeyComparator>,
+    smallest: Vec<u8>,
+    largest: Vec<u8>,
+    tombstones: &RangeTombstones,
+) -> (Vec<u8>, Vec<u8>) {
+    let user = comparator.user_comparator();
+    let Some((low, high)) = tombstones.key_bounds(user.as_ref()) else {
+        return (smallest, largest);
+    };
+
+    let mut low_key = Vec::with_capacity(low.len() + 8);
+    append_internal_key(low, MAX_SEQNO, EntryKind::MAX, &mut low_key);
+    let mut high_key = Vec::with_capacity(high.len() + 8);
+    append_internal_key(high, 0, EntryKind::Delete, &mut high_key);
+
+    let smallest = if smallest.is_empty()
+        || user.cmp(low, extract_user_key(&smallest)) == std::cmp::Ordering::Less
+    {
+        low_key
+    } else {
+        smallest
+    };
+    let largest = if largest.is_empty()
+        || user.cmp(high, extract_user_key(&largest)) == std::cmp::Ordering::Greater
+    {
+        high_key
+    } else {
+        largest
+    };
+    (smallest, largest)
+}
 
 /// How long a stalled writer waits before looking again, so that a background thread that has
 /// died cannot wedge the process silently.
@@ -280,6 +331,36 @@ impl DbInner {
         Ok(())
     }
 
+    /// Finishes a file that holds nothing but range tombstones.
+    ///
+    /// A memtable can be exactly this: `delete_range` and nothing else. The file has no data
+    /// blocks and no entries, and its whole reach comes from its tombstones — so its bounds
+    /// are theirs.
+    fn finish_tombstone_only_table(
+        &self,
+        mut builder: TableBuilder,
+        number: u64,
+        tombstones: &RangeTombstones,
+    ) -> Result<Option<FileMeta>> {
+        let (mut smallest_seqno, mut largest_seqno) = (SeqNo::MAX, 0);
+        for tombstone in tombstones {
+            smallest_seqno = smallest_seqno.min(tombstone.seqno);
+            largest_seqno = largest_seqno.max(tombstone.seqno);
+        }
+        builder.set_seqno_range(smallest_seqno, largest_seqno);
+        builder.set_range_tombstones(tombstones.clone());
+        let properties = builder.finish()?;
+        let (smallest, largest) = widen(&self.comparator, Vec::new(), Vec::new(), tombstones);
+        Ok(Some(FileMeta {
+            number,
+            size: properties.file_size,
+            smallest,
+            largest,
+            smallest_seqno,
+            largest_seqno,
+        }))
+    }
+
     /// Builds an SST from `table`. `Ok(None)` means the table was empty and no file was made.
     fn build_table(
         &self,
@@ -315,19 +396,42 @@ impl DbInner {
             iter.next();
         }
 
+        // The ranges deleted while this table was active. They go with it: a flush is the
+        // only way a tombstone reaches an SST, because a compaction discharges them rather
+        // than propagating them ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)
+        // decision 6).
+        let tombstones = table.range_tombstones();
+
         let Some(smallest) = smallest else {
-            // Nothing to write. Drop the builder without finishing it and take the file away
-            // again, rather than leaving a zero-entry SST for compaction to trip over.
-            drop(builder);
-            let _ = self.fs.delete(&path);
-            self.drop_pending(number)?;
-            return Ok(None);
+            if tombstones.is_empty() {
+                // Nothing to write. Drop the builder without finishing it and take the file
+                // away again, rather than leaving a zero-entry SST for compaction to trip
+                // over.
+                drop(builder);
+                let _ = self.fs.delete(&path);
+                self.drop_pending(number)?;
+                return Ok(None);
+            }
+            // A memtable holding only range deletes is not empty in the way that matters: its
+            // tombstones still have to reach a file, or the deletes are lost at the flush.
+            return self.finish_tombstone_only_table(builder, number, &tombstones);
         };
 
         // The SST layer cannot read a sequence number out of a key — that would mean
         // understanding one, which invariant 7 forbids — so the engine hands them over.
+        for tombstone in &tombstones {
+            smallest_seqno = smallest_seqno.min(tombstone.seqno);
+            largest_seqno = largest_seqno.max(tombstone.seqno);
+        }
         builder.set_seqno_range(smallest_seqno, largest_seqno);
+        builder.set_range_tombstones(tombstones.clone());
         let properties = builder.finish()?;
+
+        // The file's bounds are widened to span its tombstones, in internal-key space, because
+        // `Version::overlapping` and the read path's `covers` pick files by these — and a
+        // tombstone reaching outside them would be invisible to exactly the reads that need
+        // it, silently ([ADR 0017](../../../docs/adr/0017-range-tombstones.md) decision 3).
+        let (smallest, largest) = widen(&self.comparator, smallest, largest, &tombstones);
         Ok(Some(FileMeta {
             number,
             size: properties.file_size,

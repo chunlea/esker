@@ -199,8 +199,16 @@ impl DbInner {
             match cfs.get(&entry.cf) {
                 Some(cf) => {
                     let mem = read_lock(&cf.mem)?;
-                    mem.active
-                        .add(entry.seqno, entry.kind, entry.key, entry.value);
+                    if entry.kind == EntryKind::DeleteRange {
+                        // Beside the map, never in it: a range delete hides keys the map has
+                        // never seen ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)).
+                        // The entry's `value` is the range's exclusive end
+                        // ([`crate::batch::WriteBatch::delete_range`]).
+                        mem.active.add_range(entry.seqno, entry.key, entry.value);
+                    } else {
+                        mem.active
+                            .add(entry.seqno, entry.kind, entry.key, entry.value);
+                    }
                 }
                 None => {
                     // Dropped between the check at the top of `write` and here. The record is
@@ -221,21 +229,25 @@ impl DbInner {
     }
 
     /// Rejects a batch naming a column family that does not exist, before anything is logged.
-    /// Refuses a batch this version cannot honour, before any of it is logged.
+    /// Refuses a batch this database cannot honour, before any of it is logged.
     ///
-    /// Two reasons, and the second is a limitation rather than a mistake:
+    /// Two reasons, and both are caller errors:
     ///
     /// * a column family the database does not have;
-    /// * a [`EntryKind::DeleteRange`], which **v1 does not implement**. The entry kind is part
-    ///   of the frozen `WriteBatch` and log formats ([`crate::batch`], `docs/DESIGN.md` §4.3)
-    ///   so that making it real in phase 5 is not a format change — but no read path honours
-    ///   it: the memtable, `get` and both iterators treat it as a point `Delete` at the
-    ///   range's `begin`. Storing one would therefore delete a single key while telling the
-    ///   caller a range was gone, which is a silent wrong answer and the worst kind. Refusing
-    ///   it is the honest version of the check `docs/DESIGN.md` §4.7 always described.
+    /// * a [`EntryKind::DeleteRange`] whose `end` is not strictly above its `begin`. `RocksDB`
+    ///   treats that as a no-op; this engine refuses it, because "nothing happened" and
+    ///   "everything from `begin` was deleted" are far enough apart that guessing between them
+    ///   is worse than saying so ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)
+    ///   decision 4). There is no convention that an empty `end` means the end of the key
+    ///   space: the engine is byte-opaque and an empty `end` sorts *below* everything, so a
+    ///   caller wanting a whole namespace passes that namespace's successor.
     ///
     /// Both checks happen before `make_room`, before the log append and before any memtable
     /// insert, so a refused batch changes nothing.
+    ///
+    /// The refusal of `DeleteRange` itself is gone: `docs/DESIGN.md` §4.7's limitation was
+    /// that no read path honoured one, and they now do
+    /// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)).
     fn check_batch(&self, batch: &WriteBatch) -> Result<()> {
         let cfs = read_lock(&self.cfs)?;
         for entry in batch {
@@ -247,15 +259,17 @@ impl DbInner {
                 )));
             }
             if entry.kind == EntryKind::DeleteRange {
-                return Err(Error::Unsupported(
-                    "DeleteRange is not implemented in v1: the entry kind is part of the \
-                     format, but no read path honours it, so storing one would delete only \
-                     the key at the range's start. Delete a range through esker-store, which \
-                     does it as a bounded scan and point deletes in one atomic batch \
-                     (docs/adr/0006-rawkv-delete-range.md); real range tombstones are phase 5 \
-                     (docs/DESIGN.md §4.7)"
-                        .to_owned(),
-                ));
+                let end = entry.value;
+                if self.comparator.user_comparator().cmp(entry.key, end) != std::cmp::Ordering::Less
+                {
+                    return Err(Error::InvalidArgument(format!(
+                        "delete_range({:02x?}, {:02x?}) covers nothing: an end at or below \
+                         the begin is a caller error rather than a no-op, because the two \
+                         readings differ and only one of them is what the caller meant \
+                         (docs/adr/0017-range-tombstones.md)",
+                        entry.key, end
+                    )));
+                }
             }
         }
         Ok(())

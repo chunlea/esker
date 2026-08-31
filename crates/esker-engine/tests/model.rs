@@ -119,6 +119,11 @@ enum Mutation {
 enum Op {
     Put(u8, u8, u8),
     Delete(u8, u8),
+    /// Deletes every key in `[lo, hi)`. `lo >= hi` is refused by the engine rather than
+    /// treated as a no-op, so the model refuses it too
+    /// ([ADR 0017](../../docs/adr/0017-range-tombstones.md) decision 4) — which makes the
+    /// refusal itself part of what this test checks.
+    DeleteRange(u8, u8, u8),
     Get(u8, u8),
     /// Several changes, possibly across column families, applied atomically.
     Batch(Vec<Mutation>),
@@ -166,6 +171,10 @@ fn op() -> impl Strategy<Value = Op> {
         6 => (any::<u8>(), any::<u8>(), any::<u8>())
             .prop_map(|(cf, key, value)| Op::Put(cf, key, value)),
         3 => (any::<u8>(), any::<u8>()).prop_map(|(cf, key)| Op::Delete(cf, key)),
+        // The canary. Rare enough that the ordinary shapes still get exercised, common enough
+        // that a run of a few hundred ops meets one alongside a flush and a compaction.
+        2 => (any::<u8>(), any::<u8>(), any::<u8>())
+            .prop_map(|(cf, lo, hi)| Op::DeleteRange(cf, lo, hi)),
         3 => (any::<u8>(), any::<u8>()).prop_map(|(cf, key)| Op::Get(cf, key)),
         2 => prop::collection::vec(mutation(), 1..5).prop_map(Op::Batch),
         4 => (any::<u8>(), any::<u8>(), any::<u8>(), any::<bool>())
@@ -287,6 +296,7 @@ impl World {
         match op {
             Op::Put(cf, key, value) => self.put(*cf, *key, *value),
             Op::Delete(cf, key) => self.delete(*cf, *key),
+            Op::DeleteRange(cf, lo, hi) => self.delete_range(*cf, *lo, *hi),
             Op::Get(cf, key) => self.get(*cf, *key),
             Op::Batch(mutations) => self.batch(mutations),
             Op::Scan {
@@ -335,6 +345,34 @@ impl World {
             .delete(CFS[cf], &key)
             .map_err(|error| fail("delete", &error))?;
         self.model.remove(&(cf, key));
+        Ok(())
+    }
+
+    /// `delete_range`, against the model's own `retain`.
+    ///
+    /// The two halves this checks are the two the engine can get wrong: that *every* key in
+    /// `[lo, hi)` goes — not just the one at `lo`, which is what `docs/DESIGN.md` §4.7 refused
+    /// to ship — and that nothing outside it does.
+    fn delete_range(&mut self, cf: u8, lo: u8, hi: u8) -> Result<(), TestCaseError> {
+        let cf = cf_index(cf);
+        let (begin, end) = (key_of(lo), key_of(hi));
+        let id = self.db().cf_id(CFS[cf]).expect("a built-in family");
+        let mut batch = WriteBatch::new();
+        batch.delete_range(id, &begin, &end);
+        let outcome = self.db().write(batch, &WriteOptions::default());
+
+        if begin >= end {
+            // An empty or inverted range is a caller error, and a refused batch changes
+            // nothing — so the model does not move either.
+            prop_assert!(
+                outcome.is_err(),
+                "delete_range({begin:?}, {end:?}) covers nothing and must be refused"
+            );
+            return Ok(());
+        }
+        outcome.map_err(|error| fail("delete_range", &error))?;
+        self.model
+            .retain(|(at, key), _| *at != cf || key < &begin || key >= &end);
         Ok(())
     }
 

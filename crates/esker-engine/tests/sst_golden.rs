@@ -210,16 +210,13 @@ fn golden_files_read_back() {
         assert_eq!(props.smallest_key, entries[0].0, "{name}");
         assert_eq!(props.range_del_count, tombstones.len() as u64, "{name}");
         assert_eq!(table.range_tombstones(), &tombstones, "{name}");
-        if tombstones.is_empty() {
-            assert_eq!(props.largest_key, entries[entries.len() - 1].0, "{name}");
-        } else {
-            // A tombstone reaching above every key widens the table's bounds, or a read for a
-            // key inside the deleted range would never open the file that says so.
-            assert!(
-                props.largest_key.as_slice() > entries[entries.len() - 1].0.as_slice(),
-                "{name}: the bounds were not widened to span the tombstones"
-            );
-        }
+        // The table's *properties* record its entries, tombstones or not: widening the bounds
+        // to span a tombstone is the engine's job, in internal-key space, because the bounds a
+        // reader picks files by are internal keys and building one here would mean
+        // understanding a key — which `CLAUDE.md` invariant 7 forbids the SST layer
+        // ([ADR 0017](../../docs/adr/0017-range-tombstones.md)). `db/flush.rs::widen` does it,
+        // and `tests/range_del.rs` is where that is checked.
+        assert_eq!(props.largest_key, entries[entries.len() - 1].0, "{name}");
         assert_eq!(props.smallest_seqno, 1, "{name}");
         assert_eq!(props.largest_seqno, 4096, "{name}");
         assert_eq!(props.compression, options.compression, "{name}");

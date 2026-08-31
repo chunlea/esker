@@ -507,6 +507,27 @@ impl Db {
             }
         }
     }
+
+    /// Every SST this database currently holds for `cf`, as `(level, file number)`.
+    ///
+    /// Exists for the invariant that keeps range tombstones sound — *no SST below L0 holds
+    /// one* ([ADR 0017](../../docs/adr/0017-range-tombstones.md) decision 6) — which cannot be
+    /// checked without knowing which level a file is at. `esker-cli sst-dump` reports the
+    /// tombstone count for one file; this is how a test sweeps all of them.
+    pub fn files_by_level(&self, cf: &str) -> Result<Vec<(usize, u64)>> {
+        let handle = self.inner.cf_by_name(cf)?;
+        let version = lock(&self.inner.versions)?.current();
+        let levels = version
+            .cf(handle.id())
+            .map_or(0, crate::version::CfVersion::num_levels);
+        let mut out = Vec::new();
+        for level in 0..levels {
+            for file in version.files(handle.id(), level) {
+                out.push((level, file.number));
+            }
+        }
+        Ok(out)
+    }
 }
 
 impl DbInner {

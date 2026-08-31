@@ -188,9 +188,8 @@ short. `docs/DESIGN.md` §15 lists "range tombstones design" as an open question
 - [x] unit 3 — the Percolator decision library and its matrix (39 protocol cases)
 - [x] unit 4 — `TxnKv` on the wire (ADR 0016, 141 tests in `esker-proto`)
 - [x] unit 5 — `TxnClient` (23 cases, and the `Router` both clients now share)
-- [~] unit 6 — engine range tombstones: **the format half is in** (ADR 0017, `range_del.rs`, the
-  SST block and its golden). The read/flush/compaction half is not, and `Db::write` still refuses
-  `DeleteRange` — deliberately, per ADR 0017 decision 5.
+- [x] unit 6 — engine range tombstones (ADR 0017, decision 6 ruled option (ii)): the block, the
+  memtable list, `get`, both iterators, flush, the discharge compaction, and the lifted refusal
 
 ## 9. What changed, and why
 
@@ -225,20 +224,26 @@ included — had never been damaged; it indexes against the list's real length n
 sweep that demands a golden request *and* response per method is what made the eight `TxnKv` pairs
 mandatory rather than a judgement call.
 
-**Unit 6 stopped after its format half, on purpose.** ADR 0017 decision 5 says the refusal in
-`Db::write` is lifted in the *same* commit that teaches `get`, both iterators, flush and compaction
-to honour tombstones — because a database that accepts a range delete it does not honour is worse
-than one that refuses it, the refusal being loud and the acceptance silent. So the format landed on
-its own with the refusal intact, and the tree is in a state that is correct rather than half-true.
+**Unit 6 landed in two commits, and the split was the point.** ADR 0017 decision 5 says the refusal
+in `Db::write` is lifted in the *same* commit that teaches the read paths to honour tombstones — a
+database that accepts a range delete it does not honour is worse than one that refuses it, the
+refusal being loud and the acceptance silent. So the format landed first with the refusal intact, and
+the refusal went in the commit that made reads honour it.
 
-What the next lane needs before writing any of the read half is ADR 0017 **decision 6**, which is
-recorded open rather than guessed at. Widening a table's key bounds to span its tombstones is safe at
-L0 and *not* safe below it: `search_levels` finds one file per level with
-`partition_point(|f| f.largest < target)`, which is correct only while a level's files partition the
-key space, and widening can push one file's `largest` past the next file's `smallest` — after which
-the binary search returns the wrong file and the read misses a key that is there, silently. The ADR
-prices the three ways out and says which is smaller. Picking one decides whether the compaction job
-or the picker is the piece that moves, so it has to be picked first.
+Between them, decision 6 was ruled: **discharge at L0, never propagate**. Widening a file's key
+bounds to span its tombstones is safe at L0 and silently wrong below it — `search_levels` finds one
+file per level with `partition_point(|f| f.largest < target)`, correct only while a level partitions
+the key space — so nothing below L0 ever holds one. Implementing the ruling turned up three things
+the design did not predict:
+
+- a **trivial move** carries a tombstone to L1 without writing a byte, so a compaction whose inputs
+  carry one is never trivial;
+- a discharge that lands its outputs at a deeper level must also take every file *between* that
+  overlaps what it is writing, or a file left at an intermediate level shadows the output with an
+  older version of a key that has nothing to do with the tombstone;
+- a tombstone above the compaction floor cannot be consumed at all, because a snapshot older than the
+  delete still has to see what was deleted — so the discharge waits, which is what "scheduled" means
+  when the schedule has to.
 
 **One edit outside the lane.** Adding `Request::TxnKv` made `esker-store`'s dispatch `match`
 non-exhaustive and the workspace stopped compiling. The arm added there is six lines answering

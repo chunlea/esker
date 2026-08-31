@@ -247,6 +247,37 @@ fn print_footer(out: &mut dyn Write, footer: &Footer) -> Result<(), DumpError> {
     Ok(())
 }
 
+/// Prints the ranges this table declares deleted, if any.
+///
+/// The standing invariant is that **no SST below L0 holds one**: a compaction discharges a
+/// range tombstone rather than propagating it, which is what lets the read path keep the binary
+/// search that assumes a level partitions the key space
+/// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md) decision 6). A file is not
+/// self-describing about its level, so this prints what it holds and leaves the judgement to
+/// whoever knows where the file sits — which is the operator, and `Db::files_by_level` in a
+/// test.
+fn print_range_deletions(out: &mut dyn Write, table: &TableReader) -> Result<(), DumpError> {
+    let tombstones = table.range_tombstones();
+    if tombstones.is_empty() {
+        return Ok(());
+    }
+    line!(out, "range deletions ({})", tombstones.len());
+    line!(
+        out,
+        "  a file below L0 holding any of these breaks ADR 0017 decision 6"
+    );
+    for tombstone in tombstones {
+        line!(
+            out,
+            "  [\"{}\", \"{}\") @ {}",
+            escape_capped(&tombstone.begin, 48),
+            escape_capped(&tombstone.end, 48),
+            tombstone.seqno
+        );
+    }
+    Ok(())
+}
+
 fn print_properties(
     out: &mut dyn Write,
     table: &TableReader,
@@ -262,6 +293,7 @@ fn print_properties(
     line!(out, "  index_size            {}", props.index_size);
     line!(out, "  filter_size           {}", props.filter_size);
     line!(out, "  bloom_bits_per_key    {}", props.bloom_bits_per_key);
+    line!(out, "  range_deletions       {}", props.range_del_count);
     line!(out, "  compression           {:?}", props.compression);
     line!(out, "  comparator            {}", props.comparator_name);
     line!(
@@ -450,6 +482,7 @@ pub(crate) fn run(options: &DumpOptions, out: &mut dyn Write) -> Result<(), Dump
     };
     let table = TableReader::open(open_file(fs, path)?, 0, table_options, None)?;
     print_properties(out, &table, options)?;
+    print_range_deletions(out, &table)?;
 
     let rows = verify_all_blocks(file.as_ref(), file_size, &footer, path)?;
     print_blocks(out, &rows)?;

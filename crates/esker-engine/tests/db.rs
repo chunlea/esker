@@ -1591,17 +1591,16 @@ fn reads_are_correct_without_a_bloom_filter() {
     }
 }
 
-/// v1 has no range tombstones, so a `DeleteRange` is **refused** rather than stored.
+/// A `DeleteRange` deletes its whole range — the thing `docs/DESIGN.md` §4.7 refused to do
+/// until [ADR 0017](../../docs/adr/0017-range-tombstones.md) made it real.
 ///
-/// The entry kind stays in the `WriteBatch` and log formats — `docs/DESIGN.md` §4.3 freezes
-/// them, and keeping it means phase 5 can make range deletes real without a format change —
-/// but no read path honours it: the memtable, `get` and both iterators treat it as a point
-/// `Delete` at the range's `begin`. Storing one would delete a single key while telling the
-/// caller a range was gone. Phase 2 found that out from the far side of a socket, where the
-/// store had to answer for it (ADR 0006); this is the check `docs/DESIGN.md` §4.7 always
-/// described, finally written.
+/// This test used to assert the refusal. It asserts the opposite now, and the two halves it
+/// keeps from that version are the ones that mattered: that the range really is a *range*
+/// rather than the single key at its start, and that a batch mixing a range delete with a put
+/// is atomic either way. `tests/range_del.rs` holds the rest — the discharge, the invariant,
+/// and the interaction with snapshots.
 #[test]
-fn delete_range_is_refused_and_deletes_nothing() {
+fn delete_range_deletes_its_whole_range() {
     let (_memfs, fs) = memfs();
     let db = open(&fs, options(), &[cf::DEFAULT]).unwrap();
     let id = db.cf_id(cf::DEFAULT).unwrap();
@@ -1611,46 +1610,35 @@ fn delete_range_is_refused_and_deletes_nothing() {
 
     let mut batch = WriteBatch::new();
     batch.delete_range(id, b"b", b"d");
-    let error = db
-        .write(batch, &WriteOptions::default())
-        .expect_err("a DeleteRange was accepted");
+    db.write(batch, &WriteOptions::default())
+        .expect("a DeleteRange was refused");
 
-    // A documented limitation, not a caller error: it names what to do instead and when it
-    // goes away, so the refusal is actionable rather than a dead end.
-    match &error {
-        Error::Unsupported(detail) => {
-            assert!(detail.contains("DeleteRange"), "{detail}");
-            assert!(detail.contains("0006"), "{detail}");
-            assert!(detail.contains("phase 5"), "{detail}");
-        }
-        other => panic!("expected Unsupported, got {other:?}"),
-    }
+    // The whole range, not the key at its start — which is exactly what the old behaviour
+    // would have done while claiming the range was gone.
+    assert_eq!(
+        get(&db, b"a").as_deref(),
+        Some(&b"v"[..]),
+        "below the range"
+    );
+    assert_eq!(get(&db, b"b"), None, "the start is inside");
+    assert_eq!(get(&db, b"c"), None, "and so is the middle");
+    assert_eq!(
+        get(&db, b"d").as_deref(),
+        Some(&b"v"[..]),
+        "the end is exclusive"
+    );
 
-    // Nothing was deleted — not even the key at the range's start, which is what the old
-    // behaviour would have removed while claiming the whole range.
-    for key in [&b"a"[..], b"b", b"c", b"d"] {
-        assert_eq!(
-            get(&db, key).as_deref(),
-            Some(&b"v"[..]),
-            "{key:?} was removed by a refused DeleteRange"
-        );
-    }
-
-    // And a batch that mixes one in is refused whole, because the check runs before anything
-    // is logged: the put is not applied either.
+    // An empty or inverted range is a caller error rather than a no-op (ADR 0017 decision 4),
+    // and a refused batch changes nothing — including the put that rode with it.
     let mut mixed = WriteBatch::new();
     mixed.put(id, b"new", b"v");
-    mixed.delete_range(id, b"a", b"z");
+    mixed.delete_range(id, b"z", b"a");
     assert!(db.write(mixed, &WriteOptions::default()).is_err());
     assert_eq!(
         get(&db, b"new"),
         None,
         "a refused batch applied part of itself"
     );
-
-    // The database is unharmed: an ordinary write still works afterwards.
-    db.put(cf::DEFAULT, b"after", b"v").unwrap();
-    assert_eq!(get(&db, b"after").as_deref(), Some(&b"v"[..]));
 }
 
 /// `approximate_size` is what `esker-store` splits a region on. It has to grow with the bytes in

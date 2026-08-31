@@ -340,8 +340,17 @@ fn apply_to_memtables(
                 let mem = cf.mem.read().map_err(|_| {
                     Error::Poisoned("a thread panicked while holding a memtable lock".to_string())
                 })?;
-                mem.active
-                    .add(entry.seqno, entry.kind, entry.key, entry.value);
+                // A range delete replays into the tombstone list beside the map, exactly as
+                // it was applied when it was written
+                // ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)). Replaying it into
+                // the map instead would make a recovered database disagree with the one that
+                // crashed, which is the one thing recovery may never do.
+                if entry.kind == crate::dbformat::EntryKind::DeleteRange {
+                    mem.active.add_range(entry.seqno, entry.key, entry.value);
+                } else {
+                    mem.active
+                        .add(entry.seqno, entry.kind, entry.key, entry.value);
+                }
             }
             None => {
                 // The record's checksum passed, so the column family id is intact: this is a

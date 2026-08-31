@@ -192,18 +192,25 @@ bounded thread pool (2 threads *default*) via a `CompactionJob` that is a pure f
 is unit-testable without the `Db`). `CompactionFilter` trait lets `esker-txn` drop MVCC versions below
 the safepoint.
 
-**Range deletions.** `DeleteRange` is a *format* in v1 and not a feature. The entry kind exists in
-the `WriteBatch` and log layouts (§4.3) so that making range deletes real in phase 5 is not a
-format change — but no read path honours it: the memtable, `get` and both iterators treat it as a
-point `Delete` at the range's `begin`. So **the engine refuses it**: `Db::write` returns
-`Error::Unsupported` for any batch containing one, before the batch is logged, and a refused batch
-changes nothing. Storing it instead would delete one key while telling the caller a range was
-gone, which is the failure mode this rule exists to prevent — and which phase 2 found from the far
-side of a socket, where `esker-store` had to answer for it.
+**Range deletions.** `DeleteRange` is real ([ADR 0017](adr/0017-range-tombstones.md)). A range
+tombstone `[begin, end)` is stored *beside* the sorted run rather than in it — a list in the
+memtable, a block in the tables a flush writes — because it hides keys the run has never seen. A key
+found at seqno `s` is hidden from a read at snapshot `t` when a tombstone covers it with
+`s < tombstone.seqno <= t`; both bounds matter, and the first is what lets a write *after* a range
+delete survive it. An empty or inverted range is refused as `InvalidArgument` rather than treated as
+a no-op.
 
-Until phase 5, a **ranged delete is the store's job**: `RawKv DeleteRange` is served as a bounded
-scan plus point deletes in one atomic batch (ADR 0006). Real range tombstones land in phase 5 with
-`esker-txn`, and remove both the store's workaround and this refusal.
+**A tombstone never reaches an SST below L0.** A compaction whose inputs carry one becomes a
+*discharge*: it takes every file at every level that the tombstone covers, drops the covered keys
+outright, and drops the tombstone with them. That keeps the read path's per-level binary search — which
+assumes a level partitions the key space — correct without change, at the cost of one compaction over
+the deleted range. It runs on the compaction thread pool, not on the write: a range delete is logged
+and acknowledged like any other entry (invariant 1), and reads honour it from the memtable and L0
+until the discharge comes round. A tombstone above the compaction floor is not consumed at all, because
+a snapshot older than the delete still has to see what it deleted.
+
+`esker-store`'s `RawKv DeleteRange` workaround — a bounded scan plus point deletes in one atomic batch
+(ADR 0006) — can now become one `WriteBatch` entry.
 
 ### 4.8 Column families
 
@@ -709,6 +716,6 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
 
 ## 15. Open questions (turn into ADRs as they are decided)
 
-Joint consensus vs single-server changes only · separate Raft log store · async commit / 1PC · range
-tombstones design · leader leases vs ReadIndex only · PD HA timing · secondary-index encoding for
+Joint consensus vs single-server changes only · separate Raft log store · async commit / 1PC ·
+leader leases vs ReadIndex only · PD HA timing · secondary-index encoding for
 composite keys · how much Postgres surface for the first SQL milestone.

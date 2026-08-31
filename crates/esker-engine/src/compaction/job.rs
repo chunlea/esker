@@ -31,6 +31,7 @@ use std::fmt;
 use crate::dbformat::{EntryKind, InternalKeyComparator, SeqNo, internal_key, split_internal_key};
 use crate::error::{Error, Result};
 use crate::iterator::Cursor;
+use crate::range_del::RangeTombstones;
 
 /// What a filter decides about one entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +92,8 @@ pub struct CompactionStats {
     pub dropped_tombstones: u64,
     /// Entries the filter refused.
     pub dropped_by_filter: u64,
+    /// Entries dropped because a range tombstone this compaction is discharging covers them.
+    pub dropped_by_range: u64,
     /// Output files produced.
     pub files_written: u64,
 }
@@ -110,6 +113,17 @@ pub struct CompactionJob<'a> {
     pub filter: Option<&'a dyn CompactionFilter>,
     /// Whether no level below the output level holds this user key.
     pub is_bottom: &'a dyn Fn(&[u8]) -> bool,
+    /// The range tombstones this compaction is **discharging**.
+    ///
+    /// Empty for every ordinary compaction. When it is not, this compaction has taken every
+    /// file at every level that the tombstones cover
+    /// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md) decision 6), so an entry a
+    /// tombstone hides can be dropped outright rather than propagated: there is no older
+    /// version left anywhere for it to resurrect.
+    ///
+    /// The tombstones themselves are **never written to the output**. That is the whole of the
+    /// invariant "no SST below L0 holds a range tombstone", and the caller asserts it.
+    pub tombstones: &'a RangeTombstones,
 }
 
 impl fmt::Debug for CompactionJob<'_> {
@@ -162,7 +176,21 @@ impl CompactionJob<'_> {
             }
 
             let mut emit = Some(kind);
-            if previous_seqno <= self.floor {
+            // A range tombstone hides an entry strictly older than it, and this compaction
+            // holds every file the tombstone covers — so "hidden" and "gone" are the same
+            // thing here. The `floor` guard is the ordinary one: a reader whose snapshot
+            // predates the delete must still see what it deleted.
+            if !self.tombstones.is_empty()
+                && self
+                    .tombstones
+                    .newest_covering(user_key, self.floor, user)
+                    .is_some_and(|covering| covering > seqno)
+            {
+                stats.dropped_by_range += 1;
+                // Nothing older survives anywhere, so this needs no tombstone standing in for
+                // it — unlike the filter's case below, where lower levels are untouched.
+                emit = None;
+            } else if previous_seqno <= self.floor {
                 // A newer version of this key is visible to every reader that is left.
                 emit = None;
                 stats.dropped_shadowed += 1;
@@ -227,6 +255,7 @@ mod tests {
     };
     use crate::error::Result;
     use crate::iterator::Cursor;
+    use crate::range_del::{RangeTombstone, RangeTombstones};
     use std::cmp::Ordering;
     use std::sync::Arc;
 
@@ -367,6 +396,104 @@ mod tests {
         )
     }
 
+    /// Runs a job discharging `tombstones`, with every key at the bottom — which is what a
+    /// discharge arranges by taking every file the tombstone covers.
+    fn run_discharging(
+        entries: Vec<(&str, SeqNo, EntryKind)>,
+        floor: SeqNo,
+        tombstones: &RangeTombstones,
+    ) -> (Collected, CompactionStats) {
+        let comparator = comparator();
+        let mut input = Input::new(
+            entries
+                .into_iter()
+                .map(|(key, seqno, kind)| entry(key, seqno, kind, "v"))
+                .collect(),
+        );
+        let mut output = Collected::default();
+        let is_bottom = |_: &[u8]| true;
+        let job = CompactionJob {
+            comparator: &comparator,
+            floor,
+            level: 0,
+            target_file_size: u64::MAX,
+            filter: None,
+            is_bottom: &is_bottom,
+            tombstones,
+        };
+        let stats = job.run(&mut input, &mut output).unwrap();
+        (output, stats)
+    }
+
+    /// The discharge: an entry a tombstone covers is dropped outright, because this compaction
+    /// holds every file the tombstone reaches and there is no older version left to resurrect
+    /// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md) decision 6).
+    #[test]
+    fn a_discharge_drops_the_entries_its_tombstone_covers() {
+        let mut tombstones = RangeTombstones::new();
+        tombstones.push(
+            RangeTombstone::new(b"b".to_vec(), b"d".to_vec(), 50),
+            &BytewiseComparator,
+        );
+        let (output, stats) = run_discharging(
+            vec![
+                ("a", 10, EntryKind::Put),
+                ("b", 10, EntryKind::Put),
+                ("c", 10, EntryKind::Put),
+                ("d", 10, EntryKind::Put),
+            ],
+            100,
+            &tombstones,
+        );
+        assert_eq!(
+            output.decoded(),
+            vec![
+                ("a".to_string(), 10, EntryKind::Put),
+                ("d".to_string(), 10, EntryKind::Put),
+            ],
+            "`[b, d)` went, and the half-open bounds held"
+        );
+        assert_eq!(stats.dropped_by_range, 2);
+    }
+
+    /// A write *after* the delete survives it: the tombstone hides only what is strictly older.
+    #[test]
+    fn a_discharge_keeps_what_was_written_after_the_delete() {
+        let mut tombstones = RangeTombstones::new();
+        tombstones.push(
+            RangeTombstone::new(b"a".to_vec(), b"z".to_vec(), 50),
+            &BytewiseComparator,
+        );
+        let (output, stats) = run_discharging(
+            vec![("k", 60, EntryKind::Put), ("m", 40, EntryKind::Put)],
+            100,
+            &tombstones,
+        );
+        assert_eq!(
+            output.decoded(),
+            vec![("k".to_string(), 60, EntryKind::Put)],
+            "60 is above the tombstone, 40 is below it"
+        );
+        assert_eq!(stats.dropped_by_range, 1);
+    }
+
+    /// And a reader whose snapshot predates the delete still has to see what it deleted, so a
+    /// tombstone above the floor drops nothing.
+    #[test]
+    fn a_tombstone_above_the_floor_drops_nothing() {
+        let mut tombstones = RangeTombstones::new();
+        tombstones.push(
+            RangeTombstone::new(b"a".to_vec(), b"z".to_vec(), 50),
+            &BytewiseComparator,
+        );
+        let (output, stats) = run_discharging(vec![("k", 10, EntryKind::Put)], 20, &tombstones);
+        assert_eq!(
+            output.decoded(),
+            vec![("k".to_string(), 10, EntryKind::Put)]
+        );
+        assert_eq!(stats.dropped_by_range, 0);
+    }
+
     /// Runs a job with `floor`, treating every key as being at the bottom unless told
     /// otherwise.
     fn run(
@@ -384,6 +511,7 @@ mod tests {
             target_file_size: u64::MAX,
             filter,
             is_bottom: &is_bottom,
+            tombstones: &RangeTombstones::new(),
         };
         let mut input = Input::new(entries);
         let mut output = Collected::default();
@@ -580,6 +708,7 @@ mod tests {
             target_file_size: 8 << 20,
             filter: None,
             is_bottom: &is_bottom,
+            tombstones: &RangeTombstones::new(),
         };
         let mut input = Input::new(vec![
             entry("a", 5, EntryKind::Put, "a"),
@@ -612,6 +741,7 @@ mod tests {
             target_file_size: 40,
             filter: None,
             is_bottom: &is_bottom,
+            tombstones: &RangeTombstones::new(),
         };
         let mut input = Input::new(entries.clone());
         let mut output = Collected::default();

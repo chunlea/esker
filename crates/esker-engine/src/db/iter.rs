@@ -29,6 +29,7 @@ use crate::dbformat::{
 use crate::error::{Error, Result};
 use crate::iterator::Cursor;
 use crate::options::{PrefixExtractor, ReadOptions};
+use crate::range_del::RangeTombstones;
 use crate::sst::TableIter;
 use crate::version::Version;
 
@@ -97,6 +98,11 @@ pub struct DbIterator {
     direction: Direction,
     /// The user key and value the cursor is on.
     current: Option<(Vec<u8>, Vec<u8>)>,
+    /// Every range tombstone any source of this scan declares, collected when the iterator was
+    /// built. A tombstone hides keys that are nowhere in the merged run, so there is no entry
+    /// to meet it at — the set has to be held and asked
+    /// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)).
+    tombstones: RangeTombstones,
     /// Set by [`ReadOptions::prefix_same_as_start`]: iteration ends when the prefix changes.
     prefix: Option<Vec<u8>>,
     extractor: Option<Arc<dyn PrefixExtractor>>,
@@ -220,11 +226,14 @@ impl DbIterator {
                         return;
                     }
                     match kind {
-                        EntryKind::Put => {
+                        EntryKind::Put if !self.hidden(user, seqno) => {
                             self.current = Some((user.to_vec(), self.merger.value().to_vec()));
                             return;
                         }
-                        EntryKind::Delete | EntryKind::DeleteRange => {
+                        // A covered `Put` behaves exactly like a tombstone: it is not a value,
+                        // and every older version of the same key is covered too — the
+                        // tombstone that hides this one is newer than all of them.
+                        EntryKind::Put | EntryKind::Delete | EntryKind::DeleteRange => {
                             skipping = Some(user.to_vec());
                         }
                     }
@@ -254,16 +263,31 @@ impl DbIterator {
                     break;
                 }
                 match kind {
-                    EntryKind::Put => {
+                    EntryKind::Put if !self.hidden(user, seqno) => {
                         found = Some((user.to_vec(), self.merger.value().to_vec()));
                     }
-                    // A tombstone cancels the older versions seen so far for this key.
-                    EntryKind::Delete | EntryKind::DeleteRange => found = None,
+                    // A tombstone cancels the older versions seen so far for this key, and a
+                    // `Put` a range tombstone covers cancels them for the same reason.
+                    EntryKind::Put | EntryKind::Delete | EntryKind::DeleteRange => found = None,
                 }
             }
             self.merger.prev();
         }
         self.current = found.filter(|(user, _)| self.in_prefix(user));
+    }
+
+    /// Whether a range tombstone hides this entry from this scan's snapshot.
+    ///
+    /// The check is skipped entirely when there are no tombstones, which is every ordinary
+    /// scan.
+    fn hidden(&self, user: &[u8], seqno: SeqNo) -> bool {
+        !self.tombstones.is_empty()
+            && self.tombstones.hides(
+                user,
+                seqno,
+                self.snapshot,
+                self.comparator.user_comparator().as_ref(),
+            )
     }
 
     /// Moves the underlying cursor past every version of `user`, going forward.
@@ -356,11 +380,23 @@ impl Db {
         let cf = self.inner.cf_by_name(cf)?;
         let snapshot = self.inner.read_seqno(options)?;
 
+        // The tombstone set for the whole scan, collected once up front rather than per key:
+        // a range delete hides keys the merged run has never seen, so there is nothing to
+        // consult it *at* ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)).
+        let user_order = self.inner.comparator.user_comparator();
+        let mut tombstones = RangeTombstones::new();
+
         let mut children: Vec<Box<dyn Cursor + Send>> = Vec::new();
         {
             let mem = read_lock(&cf.mem)?;
+            if mem.active.has_range_tombstones() {
+                tombstones.extend(&mem.active.range_tombstones(), user_order.as_ref());
+            }
             children.push(Box::new(mem.active.iter()));
             for (table, _) in &mem.immutable {
+                if table.has_range_tombstones() {
+                    tombstones.extend(&table.range_tombstones(), user_order.as_ref());
+                }
                 children.push(Box::new(table.iter()));
             }
         }
@@ -376,6 +412,15 @@ impl Db {
         for level in 0..levels {
             for file in version.files(cf.id(), level) {
                 let reader = self.inner.table_cache.get(file.number, &table_options)?;
+                if !reader.range_tombstones().is_empty() {
+                    debug_assert_eq!(
+                        level, 0,
+                        "a range tombstone below L0 in file {}: ADR 0017 decision 6 says a \
+                         compaction discharges them and never writes one out",
+                        file.number
+                    );
+                    tombstones.extend(reader.range_tombstones(), user_order.as_ref());
+                }
                 children.push(table_cursor(reader.iter()));
             }
         }
@@ -386,6 +431,7 @@ impl Db {
             snapshot,
             direction: Direction::Forward,
             current: None,
+            tombstones,
             prefix: None,
             extractor: options
                 .prefix_same_as_start
