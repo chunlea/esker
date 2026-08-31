@@ -51,7 +51,7 @@ use std::sync::{Arc, Mutex};
 
 use esker_s3::{Error as S3Error, ObjectStore};
 
-use super::claim::{CLAIM_LEN, CLAIM_OBJECT, ClaimError, Identity};
+use super::claim::{self, Identity};
 use super::{FileSystem, RandomAccessFile, SstTier, WritableFile};
 use crate::filename::{self, FileKind};
 
@@ -254,117 +254,17 @@ impl TieredFileSystem {
         // Before anything is adopted from the bucket: a prefix that is not ours is a startup
         // failure, and a database that listed it, cached what it found and *then* refused would
         // already have taught itself another database's file numbers.
-        tier.settle_claim()?;
+        if let Some(ours) = tier.options.identity {
+            claim::settle(
+                tier.store.as_ref(),
+                &tier.options.key_prefix,
+                ours,
+                tier.options.adopt_unclaimed,
+            )
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        }
         tier.adopt_bucket()?;
         Ok(tier)
-    }
-
-    /// The claim marker's object key.
-    fn claim_key(&self) -> String {
-        format!("{}{CLAIM_OBJECT}", self.options.key_prefix)
-    }
-
-    /// Establishes that this prefix is this database's, or refuses to open.
-    ///
-    /// Three outcomes, and the middle one is the whole point:
-    ///
-    /// * **the marker is ours** — or we just wrote it — and the open proceeds;
-    /// * **the marker is somebody else's** — refused, naming both databases
-    ///   ([`ClaimError::Claimed`]);
-    /// * **there is no marker.** An empty prefix is claimed. A prefix that already holds objects
-    ///   is refused ([`ClaimError::Unclaimed`]) unless the operator passed `adopt_unclaimed`,
-    ///   because objects with no marker may be a live database's, written before markers
-    ///   existed. Adopting them silently is the corruption this whole module exists to stop.
-    ///
-    /// # Crashing in the middle
-    ///
-    /// The marker is written before any SST can be uploaded — this runs inside
-    /// [`TieredFileSystem::new`], before the engine has the filesystem at all — so a crash
-    /// between the two leaves a marker over an empty prefix. The next open reads its own marker,
-    /// matches, and carries on. A crash *before* the marker landed leaves an empty prefix, which
-    /// the next open claims. Neither needs a recovery path, which is why there is not one.
-    ///
-    /// # The race this does not win
-    ///
-    /// Two databases claiming an empty prefix at the same instant cannot be separated by a
-    /// `PutObject`, because S3 has no conditional put in the subset
-    /// [`ObjectStore`](esker_s3::ObjectStore) exposes. The claim is therefore read back after it
-    /// is written: the loser of a simultaneous claim reads the winner's marker and refuses, and
-    /// the window narrows to two overlapping round trips rather than the lifetime of a database.
-    /// [ADR 0029](../../../docs/adr/0029-the-sst-store-claim.md) records why that is enough and
-    /// what would close it.
-    fn settle_claim(&self) -> io::Result<()> {
-        let Some(ours) = self.options.identity else {
-            return Ok(());
-        };
-        let key = self.claim_key();
-        let prefix = self.options.key_prefix.clone();
-
-        match self.store.get(&key) {
-            Ok(response) => return Self::verify_claim(&prefix, &ours, &response.body),
-            Err(error) if error.is_not_found() => {}
-            Err(error) => return Err(to_io_error(&error)),
-        }
-
-        // No marker. An empty prefix is ours for the taking; one with objects in it is not.
-        let listed = self
-            .store
-            .list(&prefix)
-            .map_err(|err| to_io_error(&err))?
-            .into_iter()
-            .filter(|object| object.key != key)
-            .count();
-        if listed > 0 && !self.options.adopt_unclaimed {
-            return Err(io::Error::other(
-                ClaimError::Unclaimed {
-                    prefix,
-                    objects: listed,
-                }
-                .to_string(),
-            ));
-        }
-        if listed > 0 {
-            tracing::warn!(
-                prefix,
-                objects = listed,
-                identity = %ours,
-                "adopting an SST store prefix that holds objects but no claim marker, because \
-                 adoption was asked for explicitly"
-            );
-        }
-
-        self.store
-            .put(&key, &ours.encode())
-            .map_err(|err| to_io_error(&err))?;
-        // Read back, so a simultaneous claim by another database is caught here rather than by
-        // whichever of the two later reads the other's SST.
-        let written = self.store.get(&key).map_err(|err| to_io_error(&err))?;
-        Self::verify_claim(&prefix, &ours, &written.body)?;
-        tracing::info!(prefix, identity = %ours, "claimed the SST store prefix");
-        Ok(())
-    }
-
-    /// Checks a marker's bytes against who we are.
-    fn verify_claim(prefix: &str, ours: &Identity, body: &[u8]) -> io::Result<()> {
-        let theirs = Identity::decode(body).map_err(|error| {
-            // A marker that cannot be read is not a marker that can be overruled: refusing is
-            // the same answer as for one that names somebody else, because it might.
-            io::Error::other(format!(
-                "{error} (the claim marker of the SST store prefix {prefix:?},                  {} bytes; expected {CLAIM_LEN})",
-                body.len()
-            ))
-        })?;
-        if theirs.claim == ours.claim {
-            return Ok(());
-        }
-        Err(io::Error::other(
-            ClaimError::Claimed {
-                prefix: prefix.to_owned(),
-                ours: Box::new(*ours),
-                theirs: Box::new(theirs),
-            }
-            .to_string(),
-        ))
     }
 
     /// The object key for a file number.
@@ -373,6 +273,9 @@ impl TieredFileSystem {
     }
 
     /// The file number a key ends with, if it names an SST of ours.
+    ///
+    /// `None` for the claim marker, which is not `NNNNNN.sst`-shaped and so is never mistaken
+    /// for a file this tier may upload, evict or reclaim.
     fn number_of(&self, key: &str) -> Option<u64> {
         let rest = key.strip_prefix(&self.options.key_prefix)?;
         match filename::classify(rest) {

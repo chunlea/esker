@@ -41,6 +41,7 @@ use std::path::Path;
 
 use esker_base::rng::Pcg32;
 use esker_base::{crc32c, hash};
+use esker_s3::ObjectStore;
 
 /// The marker's magic.
 pub const CLAIM_MAGIC: [u8; 8] = *b"ESKERCLM";
@@ -213,6 +214,11 @@ pub enum ClaimError {
     #[error("{0}")]
     Malformed(String),
 
+    /// The object store itself failed. Carried as a string because a claim's caller reports it
+    /// as a startup failure and never branches on it.
+    #[error("the object store, while claiming a prefix: {0}")]
+    Store(String),
+
     /// A marker written at a version this build does not know. Refusing is the only safe
     /// answer: a newer format may mean something this build would misread.
     #[error(
@@ -220,6 +226,101 @@ pub enum ClaimError {
          {CLAIM_FORMAT_VERSION}. A newer esker wrote this prefix."
     )]
     Version(u8),
+}
+
+/// Establishes that `prefix` in `store` is this database's, or says why it is not.
+///
+/// Three outcomes, and the middle one is the whole point:
+///
+/// * **the marker is ours** — or we have just written it — and the caller may proceed;
+/// * **the marker is somebody else's** — [`ClaimError::Claimed`], naming both databases;
+/// * **there is no marker.** An empty prefix is claimed. A prefix that already holds objects is
+///   [`ClaimError::Unclaimed`] unless `adopt_unclaimed`, because objects with no marker may be a
+///   live database's, written before markers existed. Adopting them silently is the corruption
+///   this module exists to stop.
+///
+/// Callers run this **before** learning anything else about the prefix, so a database that is
+/// going to be refused never takes on another database's file numbers.
+///
+/// # Crashing in the middle
+///
+/// The marker is written before the caller can upload anything, so a crash between the two
+/// leaves a marker over an empty prefix: the next open reads its own marker, matches, and
+/// carries on. A crash before the marker landed leaves an empty prefix, which the next open
+/// claims. Neither needs a recovery path, which is why there is not one.
+///
+/// # The race this does not win
+///
+/// Two databases claiming an empty prefix in the same instant cannot be separated by a
+/// `PutObject`: S3 has no conditional put in the subset [`ObjectStore`] exposes. So the claim is
+/// **read back** after it is written — the loser of a simultaneous claim reads the winner's
+/// marker and refuses, and the window narrows from the lifetime of a database to two overlapping
+/// round trips. [ADR 0029](../../../docs/adr/0029-the-sst-store-claim.md) records why that is
+/// enough today and what would close it.
+pub fn settle(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    ours: Identity,
+    adopt_unclaimed: bool,
+) -> Result<(), ClaimError> {
+    let key = format!("{prefix}{CLAIM_OBJECT}");
+
+    match store.get(&key) {
+        Ok(response) => return verify(prefix, ours, &response.body),
+        Err(error) if error.is_not_found() => {}
+        Err(error) => return Err(ClaimError::Store(error.to_string())),
+    }
+
+    // No marker. An empty prefix is ours for the taking; one with objects in it is not.
+    let listed = store
+        .list(prefix)
+        .map_err(|error| ClaimError::Store(error.to_string()))?
+        .into_iter()
+        .filter(|object| object.key != key)
+        .count();
+    if listed > 0 && !adopt_unclaimed {
+        return Err(ClaimError::Unclaimed {
+            prefix: prefix.to_owned(),
+            objects: listed,
+        });
+    }
+    if listed > 0 {
+        tracing::warn!(
+            prefix,
+            objects = listed,
+            identity = %ours,
+            "adopting an SST store prefix that holds objects but no claim marker, because \
+             adoption was asked for explicitly"
+        );
+    }
+
+    store
+        .put(&key, &ours.encode())
+        .map_err(|error| ClaimError::Store(error.to_string()))?;
+    // Read back, so a simultaneous claim by another database is caught here rather than by
+    // whichever of the two later reads the other's SST.
+    let written = store
+        .get(&key)
+        .map_err(|error| ClaimError::Store(error.to_string()))?;
+    verify(prefix, ours, &written.body)?;
+    tracing::info!(prefix, identity = %ours, "claimed the SST store prefix");
+    Ok(())
+}
+
+/// Checks a marker's bytes against who we are.
+///
+/// A marker that cannot be read is not a marker that can be overruled: it is refused the same
+/// way as one naming somebody else, because it might be one.
+fn verify(prefix: &str, ours: Identity, body: &[u8]) -> Result<(), ClaimError> {
+    let theirs = Identity::decode(body)?;
+    if theirs.claim == ours.claim {
+        return Ok(());
+    }
+    Err(ClaimError::Claimed {
+        prefix: prefix.to_owned(),
+        ours: Box::new(ours),
+        theirs: Box::new(theirs),
+    })
 }
 
 /// The length of the local claim-id file: the id and a CRC32C over it.
