@@ -1,0 +1,19 @@
+crates/esker-client/tests/refusals.rs
+  s_81a3dd1e652b18::t_2b042699abd8c7 29-43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "be5c75c05b2602913ea5210f2d23b3c3763d9cc1",
+  "prompts": {},
+  "sessions": {
+    "s_81a3dd1e652b18": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a496fe55-1dd5-47a0-acee-877c11a897d0",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
