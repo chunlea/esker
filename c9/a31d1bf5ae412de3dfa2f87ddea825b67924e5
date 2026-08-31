@@ -1,0 +1,39 @@
+crates/esker-sql/src/backend/mod.rs
+  s_b3f6a712d611c9::t_29ba85cd43c2f6 80-96,105-128
+crates/esker-sql/src/backend/store.rs
+  s_b3f6a712d611c9::t_954b9ef8254e8d 54-61,125-135
+crates/esker-sql/src/bin/esker-sql.rs
+  s_b3f6a712d611c9::t_01767f44282253 20,73-102
+crates/esker-sql/src/exec/job.rs
+  s_b3f6a712d611c9::t_0a9ab4054cbddb 159-160,164-181,186-195,198,206,209-218,232
+crates/esker-sql/src/exec/mod.rs
+  s_b3f6a712d611c9::t_d5ebf1e8cae253 36
+crates/esker-sql/src/exec/redrive.rs
+  s_b3f6a712d611c9::t_76b8ac68029472 1-358
+crates/esker-sql/src/exec/verbs.rs
+  s_b3f6a712d611c9::t_8ca170169bbc8d 290,294-380,388-391,393-394,396-397,407,410-414,417-421,425-447,459,488,491-495,498-502,505-509,514-518
+crates/esker-sql/tests/redrive.rs
+  s_b3f6a712d611c9::t_d2f7e7d7779e42 1-578
+docs/adr/0020-online-schema-change.md
+  s_b3f6a712d611c9::t_f88f00c30fda5c 224-248
+docs/plans/debt-c2.md
+  s_b3f6a712d611c9::t_9436ed2c87063b 1-155
+docs/plans/phase-6e.md
+  s_b3f6a712d611c9::t_5be3b253e6ad25 348-355
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "c9a31d1bf5ae412de3dfa2f87ddea825b67924e5",
+  "prompts": {},
+  "sessions": {
+    "s_b3f6a712d611c9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "78adef9a-88ef-4c89-a340-f825de3d2ab7",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
