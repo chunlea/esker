@@ -60,3 +60,66 @@ impl TestServer {
         self.addr.to_string()
     }
 }
+
+/// A real placement driver on a real socket, already bootstrapped.
+///
+/// Bootstrapped on purpose, and it is the whole point: a fresh PD has no cluster id, and a
+/// bootstrapped one has a random non-zero one that every later call has to carry. A tool tested
+/// only against an empty PD would never find out that it was addressing cluster `0`.
+#[derive(Debug)]
+pub(crate) struct TestPd {
+    addr: SocketAddr,
+    cluster_id: u64,
+    _handle: ServerHandle,
+    _runtime: tokio::runtime::Runtime,
+    _dir: tempfile::TempDir,
+}
+
+impl TestPd {
+    /// Opens a placement driver on a temporary directory, registers `stores` of them, and serves
+    /// it on a free port.
+    pub(crate) fn start(stores: u64) -> Self {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+
+        let pd = esker_pd::Pd::open(dir.path(), esker_pd::PdOptions::new()).expect("PD opens");
+        let mut cluster_id = 0;
+        for store_id in 1..=stores {
+            cluster_id = pd
+                .bootstrap(store_id, &format!("127.0.0.1:{}", 20_160 + store_id))
+                .expect("the store registers")
+                .cluster_id;
+        }
+        let service: Arc<dyn Service> = esker_pd::PdService::new(pd);
+
+        let handle = runtime.block_on(async {
+            Server::bind("127.0.0.1:0", service, TransportConfig::new())
+                .await
+                .expect("the server binds")
+                .spawn()
+                .expect("the server starts")
+        });
+
+        Self {
+            addr: handle.local_addr(),
+            cluster_id,
+            _handle: handle,
+            _runtime: runtime,
+            _dir: dir,
+        }
+    }
+
+    /// Where it is listening, as `--pd` would be given it.
+    pub(crate) fn addr(&self) -> String {
+        self.addr.to_string()
+    }
+
+    /// The cluster it created, which is not zero.
+    pub(crate) fn cluster_id(&self) -> u64 {
+        self.cluster_id
+    }
+}
