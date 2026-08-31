@@ -23,7 +23,10 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
-use esker_engine::{Db, LocalFileSystem, Options, WalSyncMode, WriteBatch, WriteOptions, cf};
+use esker_engine::compaction::CompactionFilter;
+use esker_engine::{
+    Db, LocalFileSystem, Options, ReadOptions, WalSyncMode, WriteBatch, WriteOptions, cf,
+};
 use esker_proto::{
     BoxFuture, Peer, PeerRole, ProtoError, RaftBatch, RawKvReq, RawKvResp, Region, Reply, Request,
     RequestHeader, Response, Service, SnapshotRequest, TransportConfig, TxnKvReq, TxnKvResp,
@@ -32,6 +35,7 @@ use esker_proto::{
 use crate::apply::Command;
 use crate::driver::DriverPool;
 use crate::error::{Result, StoreError};
+use crate::gc::{DEFAULT_RETENTION_MS, MvccCollector, RetentionPolicy};
 use crate::heartbeat::{Heartbeats, RegionReport, StoreReport};
 use crate::meta;
 use crate::pd::{PdClient, StoreInfo};
@@ -201,9 +205,10 @@ pub struct Store {
     regions: RegionMap,
     store_id: u64,
     limits: Limits,
-    /// The garbage-collection safepoint the placement driver last published: the timestamp
-    /// below which old MVCC versions may go (`docs/DESIGN.md` §8). Raised, never lowered.
-    safepoint: std::sync::atomic::AtomicU64,
+    /// The MVCC collector, installed on the `write` column family at open and updated in place
+    /// as the placement driver publishes safepoints ([`crate::gc`]). It holds the safepoint this
+    /// store is working to, so there is no second copy of that number to keep in step.
+    collector: Arc<MvccCollector>,
     /// Shared by every mutation, exclusive for `CompareAndSwap`. See the module docs.
     ///
     /// Only used by a store with no Raft peer. Once there is one, the Raft log is the
@@ -242,13 +247,44 @@ pub struct Store {
     receiving: std::sync::Mutex<std::collections::BTreeSet<u64>>,
 }
 
+/// Reads the retention policy out of the catalog and hands it to the collector.
+///
+/// A failure leaves the policy that was working rather than falling back to the default,
+/// because the two differ in the direction that matters: an unreadable catalog should make the
+/// collector keep *more* than it would have, never less. It is re-read on every safepoint, not
+/// cached, because a `retention` DDL writes a record and bumps no version — deliberately
+/// ([ADR 0021](../../docs/adr/0021-time-machine.md) decision 4) — so the collector's own next
+/// pass is where a change is meant to be noticed.
+fn load_retention(db: &Db, collector: &MvccCollector) {
+    match RetentionPolicy::load(db, DEFAULT_RETENTION_MS) {
+        Ok(policy) => collector.set_policy(policy),
+        Err(error) => tracing::warn!(
+            %error,
+            "could not read the retention policy; keeping the one in force"
+        ),
+    }
+}
+
 /// Opens the engine and checks it has every column family the store needs.
 ///
 /// A missing one is a bootstrap failure rather than a lazily-created family: `Db::open` creates
 /// what it is asked for, so a name absent afterwards means the database disagrees with this
 /// build about what it holds — and finding that at the first write instead would find it on a
 /// path that cannot report it usefully (`docs/DESIGN.md` §4.8).
-fn open_engine(path: impl AsRef<Path>, engine: Options) -> Result<Db> {
+fn open_engine(
+    path: impl AsRef<Path>,
+    mut engine: Options,
+    collector: &Arc<MvccCollector>,
+) -> Result<Db> {
+    // Only on `write`. The collector reads a `WriteRecord` out of every value it is offered, and
+    // the other three column families hold something else — it would keep everything it met
+    // there, which is safe and pointless (`docs/txn-spec.md` §7).
+    let mut write_options = engine.cf_options.clone();
+    write_options.compaction_filter = Some(Arc::clone(collector) as Arc<dyn CompactionFilter>);
+    engine
+        .cf_overrides
+        .insert(cf::WRITE.to_string(), write_options);
+
     let db = Db::open_with(path, engine, Arc::new(LocalFileSystem::new()), &cf::BUILTIN)?;
     for name in cf::BUILTIN {
         if db.cf_id(name).is_none() {
@@ -291,7 +327,15 @@ impl Store {
             region_heartbeat,
             split,
         } = options;
-        let db = Arc::new(open_engine(path, engine)?);
+        // The collector is built before the engine, because the engine has to be opened *with*
+        // it: a compaction filter is a column-family setting and this one belongs to `write`
+        // alone, whose entries are the only ones it understands ([`crate::gc`]).
+        let collector = Arc::new(MvccCollector::new(
+            RetentionPolicy::uniform(DEFAULT_RETENTION_MS),
+            0,
+        ));
+        let db = Arc::new(open_engine(path, engine, &collector)?);
+        load_retention(&db, &collector);
 
         // What this store hosts is what its own `'m'` records say — never what its configuration
         // says on a later open, and never what the placement driver currently believes. A
@@ -359,7 +403,7 @@ impl Store {
             regions,
             store_id,
             limits,
-            safepoint: std::sync::atomic::AtomicU64::new(0),
+            collector,
             write_gate: RwLock::new(()),
             transport,
             raft,
@@ -2023,17 +2067,53 @@ impl Store {
     /// has already been collected, and PD's own safepoint only ever rises — so a lower number
     /// here is a stale message overtaking a fresh one, not a decision.
     fn set_safepoint(&self, safepoint: u64) -> TxnKvResp {
-        let now = self
-            .safepoint
-            .fetch_max(safepoint, std::sync::atomic::Ordering::AcqRel)
-            .max(safepoint);
+        let now = self.collector.set_published(safepoint);
+        // The policy is re-read on every safepoint rather than cached for ever: a `retention`
+        // DDL writes a catalog record and bumps nothing, deliberately (ADR 0021 decision 4), so
+        // the collector's own next pass is where a change is meant to be picked up. A failure
+        // to read it leaves the policy that was working, which keeps more rather than less.
+        load_retention(&self.db, &self.collector);
         TxnKvResp::GcSafepoint { safepoint: now }
     }
 
     /// The garbage-collection safepoint this store is working to.
     #[must_use]
     pub fn safepoint(&self) -> u64 {
-        self.safepoint.load(std::sync::atomic::Ordering::Acquire)
+        self.collector.published()
+    }
+
+    /// The MVCC collector, for a test that wants to see what it is working to.
+    #[must_use]
+    pub fn collector(&self) -> &Arc<MvccCollector> {
+        &self.collector
+    }
+
+    /// Compacts the whole `write` column family, so the collector runs over every version now
+    /// rather than when the level scores say so.
+    ///
+    /// For an operator forcing a collection, and for the tests that check one happened: a
+    /// safepoint changes nothing until a compaction reads the entries it applies to.
+    pub fn compact_write_cf(&self) -> Result<()> {
+        self.db.compact_range(cf::WRITE, None, None)?;
+        Ok(())
+    }
+
+    /// How many `write` records this store holds for one user key.
+    ///
+    /// The version count MVCC garbage collection is about, which is otherwise invisible from
+    /// outside: a read answers with one value however many versions are behind it, so a
+    /// collector that ran and a collector that did not look identical through the front door.
+    pub fn write_records(&self, user_key: &[u8]) -> Result<u64> {
+        let prefix = esker_txn::key::prefix(user_key);
+        let mut iter = self.db.iter(cf::WRITE, &ReadOptions::default())?;
+        let mut count = 0;
+        iter.seek(&prefix);
+        while iter.valid() && iter.key().starts_with(&prefix) {
+            count += 1;
+            iter.next();
+        }
+        iter.status()?;
+        Ok(count)
     }
 
     /// Flushes every column family, so a caller that is about to stop knows what is on disk.

@@ -189,6 +189,15 @@ pub struct Options {
     pub compaction_threads: usize,
     /// Defaults for column families this call creates.
     pub cf_options: CfOptions,
+    /// Options for named column families, overriding [`Options::cf_options`] for those.
+    ///
+    /// Column families are not interchangeable — Percolator's three hold different shapes and
+    /// the `raft` one holds a log — so a setting that is right for one is routinely wrong for
+    /// another. The MVCC collector is the case that forced this: it must run on `write`, whose
+    /// entries it understands, and nowhere else (`docs/txn-spec.md` §7).
+    ///
+    /// A name with no entry takes `cf_options`, so a caller that needs no override writes none.
+    pub cf_overrides: std::collections::BTreeMap<String, CfOptions>,
     /// Where a test may hold a thread still, so that a race between two threads can be
     /// reproduced by construction rather than by sleeping. See [`crate::testing::pause`].
     ///
@@ -212,6 +221,7 @@ impl Default for Options {
             block_cache: None,
             compaction_threads: defaults::COMPACTION_THREADS,
             cf_options: CfOptions::default(),
+            cf_overrides: std::collections::BTreeMap::new(),
             #[cfg(any(test, feature = "testing"))]
             pause_hook: None,
         }

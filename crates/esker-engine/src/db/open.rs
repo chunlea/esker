@@ -74,12 +74,19 @@ impl Db {
         // segment the recovered data came from.
         let mut families: BTreeMap<u32, Arc<ColumnFamily>> = BTreeMap::new();
         for (id, name) in versions.column_families().clone() {
+            // A named override, or the defaults. Families are not interchangeable, and the
+            // MVCC collector is the setting that must reach exactly one of them.
+            let cf_options = options
+                .cf_overrides
+                .get(&name)
+                .cloned()
+                .unwrap_or_else(|| options.cf_options.clone());
             families.insert(
                 id,
                 Arc::new(ColumnFamily::new(
                     id,
                     name,
-                    options.cf_options.clone(),
+                    cf_options,
                     &comparator,
                     versions.log_number(),
                 )),

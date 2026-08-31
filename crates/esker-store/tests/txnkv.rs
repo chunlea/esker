@@ -723,3 +723,144 @@ async fn a_committed_transaction_survives_a_restart() {
         "the lock survived the restart"
     );
 }
+
+// -- garbage collection --------------------------------------------------------------------
+
+/// `prompts/05-txn.md`'s GC acceptance: many versions of one key, a safepoint, a compaction —
+/// and the visible read is unchanged while the versions are gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_safepoint_collects_every_version_but_the_visible_one() {
+    // Enough that the collector's work is visible in a count, small enough that the test stays
+    // a second rather than a minute.
+    const VERSIONS: u64 = 200;
+
+    let running = start().await;
+    let transport = TcpTransport::connect(running.handle.local_addr())
+        .await
+        .unwrap();
+
+    for round in 1..=VERSIONS {
+        let start_ts = round * 10;
+        call(
+            &transport,
+            TxnKvReq::Prewrite {
+                start_ts,
+                primary: key(b"hot"),
+                ttl_ms: 3_000,
+                mutations: vec![TxnMutation::Put {
+                    key: key(b"hot"),
+                    value: Bytes::from(format!("v{round}")),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        call(
+            &transport,
+            TxnKvReq::Commit {
+                start_ts,
+                commit_ts: start_ts + 1,
+                keys: vec![key(b"hot")],
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let newest = Bytes::from(format!("v{VERSIONS}"));
+    assert_eq!(
+        get(&transport, b"hot", u64::MAX).await,
+        Some(newest.clone())
+    );
+
+    // A safepoint above every version, so all but the newest are collectable. The collector's
+    // window is the cluster default, and these timestamps have a physical half of zero — so
+    // the default retention pushes nothing back and the published safepoint is the line.
+    call(
+        &transport,
+        TxnKvReq::GcSafepoint {
+            safepoint: VERSIONS * 10 + 5,
+        },
+    )
+    .await
+    .unwrap();
+    running.store.flush().unwrap();
+    running.store.compact_write_cf().unwrap();
+
+    // The visible read is unchanged — which is the half that matters, and the half a collector
+    // that dropped the newest version below the safepoint would break.
+    assert_eq!(get(&transport, b"hot", u64::MAX).await, Some(newest));
+
+    // And the versions really went: one survivor rather than two hundred.
+    let left = running.store.write_records(b"hot").unwrap();
+    assert_eq!(
+        left, 1,
+        "the newest version below the safepoint survives and the rest are collected"
+    );
+}
+
+/// A reader below the safepoint still sees what it is entitled to, because the safepoint is a
+/// floor PD sets from the oldest active read — the collector never collects above it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_version_above_the_safepoint_is_not_collected() {
+    let running = start().await;
+    let transport = TcpTransport::connect(running.handle.local_addr())
+        .await
+        .unwrap();
+
+    commit_one(&transport, b"k", b"old", 10, 20).await;
+    commit_one(&transport, b"k", b"new", 30, 40).await;
+
+    // Below both commits: nothing is collectable.
+    call(&transport, TxnKvReq::GcSafepoint { safepoint: 15 })
+        .await
+        .unwrap();
+    running.store.flush().unwrap();
+    running.store.compact_write_cf().unwrap();
+
+    assert_eq!(
+        running.store.write_records(b"k").unwrap(),
+        2,
+        "a safepoint below a version does not collect it"
+    );
+    assert_eq!(get(&transport, b"k", 20).await, Some(key(b"old")));
+    assert_eq!(get(&transport, b"k", 40).await, Some(key(b"new")));
+}
+
+/// A table with a longer retention keeps more, which is the whole of the time-machine hook
+/// ([ADR 0021](../../docs/adr/0021-time-machine.md)): the window a reader may travel back
+/// through *is* the distance the collector leaves alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_longer_retention_keeps_more_of_one_table() {
+    use esker_store::gc::RetentionPolicy;
+
+    let running = start().await;
+    // One table keeps an hour where the cluster keeps ten minutes.
+    running
+        .store
+        .collector()
+        .set_policy(RetentionPolicy::uniform(10 * 60 * 1_000).with_table(1, 7, 60 * 60 * 1_000));
+
+    let published = (2 * 60 * 60 * 1_000u64) << esker_store::TSO_LOGICAL_BITS;
+    let policy = running.store.collector().policy();
+
+    let mut kept = esker_keys::prefix::table_row_prefix(1, 7);
+    kept.extend_from_slice(b"row");
+    let mut ordinary = esker_keys::prefix::table_row_prefix(1, 9);
+    ordinary.extend_from_slice(b"row");
+
+    let kept_at = policy
+        .effective_safepoint(&esker_txn::key::write(&kept, 1), published)
+        .unwrap();
+    let ordinary_at = policy
+        .effective_safepoint(&esker_txn::key::write(&ordinary, 1), published)
+        .unwrap();
+    assert!(
+        kept_at < ordinary_at,
+        "the table with the longer window has its safepoint pushed further back"
+    );
+    assert_eq!(
+        ordinary_at, published,
+        "a table with no override takes the cluster default, not retention zero"
+    );
+}

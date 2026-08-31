@@ -44,6 +44,11 @@
 pub mod apply;
 pub mod driver;
 pub mod error;
+/// Bits of the logical counter in a timestamp, re-exported so a caller working in
+/// milliseconds can turn one into a timestamp distance without linking `esker-txn`.
+pub const TSO_LOGICAL_BITS: u32 = esker_txn::TSO_LOGICAL_BITS;
+
+pub mod gc;
 pub mod heartbeat;
 pub mod meta;
 pub mod pd;
