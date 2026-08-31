@@ -1,0 +1,38 @@
+crates/esker-pd/tests/balance.rs
+  s_dc640bf0df4adb::t_03cfbb89078260 591-602,638,642,658,660-664,667,672,692,696
+  s_dc640bf0df4adb::t_fe286fc3b9ac82 588-590
+  s_dc640bf0df4adb::t_d3d194de1acb6f 603-605,635-637
+  s_dc640bf0df4adb::t_6e297a58d8198e 639-641
+  s_dc640bf0df4adb::t_3d6394b1db17da 643-645,655-657
+  s_dc640bf0df4adb::t_5805a1ed16deee 659
+  s_dc640bf0df4adb::t_1ced42a1083775 665-666
+  s_dc640bf0df4adb::t_28bf12a310b01a 668-671
+  s_dc640bf0df4adb::t_43dcb62b730c7e 673-675,689-691
+  s_dc640bf0df4adb::t_019b131354b0b1 693-695
+  s_dc640bf0df4adb::t_e75f768738136e 697-699
+  s_dc640bf0df4adb::t_70e2b94e81dee3 51,111-140,246-250,255-274,280,282,296-298,302-304,308-323,325,512-514,558-587,606-634,646-654,676-688,700
+crates/esker-pd/src/pd/mod.rs
+  s_dc640bf0df4adb::t_68b7b76c0ca432 53,254-273,325
+crates/esker-pd/src/pd/repair.rs
+  s_dc640bf0df4adb::t_70eb6964e15d24 21,88-97,162-171,313-338,679-880
+docs/DESIGN.md
+  s_dc640bf0df4adb::t_f49744eb4ea631 521-528
+docs/adr/0023-a-retired-operators-load-outlives-it.md
+  s_dc640bf0df4adb::t_c4e13a618e2630 1-132
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "7316218d510e808174bd3a53ac228661cf8d0148",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "claude-fable-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
