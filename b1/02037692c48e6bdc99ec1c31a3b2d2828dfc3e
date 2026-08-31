@@ -1,0 +1,23 @@
+crates/esker-client/tests/chaos_cluster/mod.rs
+  s_b3f6a712d611c9::t_0bd7569e03d769 1-204
+crates/esker-client/tests/chaos_linearizability.rs
+  s_b3f6a712d611c9::t_9e4d1f18158323 20,22-45,55,57,60-64,67-75,79-91,94,96-102,105-111,114,116-124,126-130,134-135,137,141,147-154,158-166,169-173,176-183,186-194,197,199-212,256,259,264-265,270,273,277-278,286,296,303-304,317-323,325-328,417,432-436,520,527-528,539-541,543
+crates/esker-client/tests/refusals.rs
+  s_b3f6a712d611c9::t_79f2e71977865d 1-214
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "b102037692c48e6bdc99ec1c31a3b2d2828dfc3e",
+  "prompts": {},
+  "sessions": {
+    "s_b3f6a712d611c9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "78adef9a-88ef-4c89-a340-f825de3d2ab7",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
