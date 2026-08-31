@@ -251,7 +251,11 @@ panic (`CLAUDE.md` invariants 2 and 9).
   is captured with `COLLATE "C"` for exactly this reason.
 - **Catalog** — `'m' ++ "sql" ++ kind ++ tenant ++ id`, value a versioned record. A monotone
   `catalog_version:u64` at `'m' ++ "sql" ++ 'v'` is read once per transaction; a cached definition
-  from an older version is discarded.
+  from an older version is discarded. As built (unit 4) the kinds are `'t'` a table — **with its
+  indexes inside it**, so that a cache entry and a consistency unit are the same thing — `'n'` a
+  name, and the two counters `'v'` and `'s'` (the per-tenant relation-id sequence). One name map
+  serves tables and indexes together, because PostgreSQL keeps both in `pg_class` and really does
+  answer `42P07` when an index takes a table's name.
 
 ## 7. Tests
 
@@ -464,7 +468,8 @@ its own gap register, and it would be longer.
 - [x] 3 — row and tuple encodings: the six types' text formats against a real server (3a), the
   row value, primary key and index key encodings with goldens, proptests and a captured ordering
   fixture (3b)
-- [ ] 4 — catalog
+- [x] 4 — catalog: the `'m'`-space records with a golden, the per-transaction version check,
+  and a cache that cannot serve a definition from a snapshot's future
 - [x] 5 — backend trait and fake (the executor's half of the unique-index composition is unit 6)
 - [ ] 6 — planner and executor
 - [ ] 7 — `.slt` harness
@@ -601,6 +606,30 @@ it:
   admits any number of NULLs in a `UNIQUE` column, confirmed against the server, so those entries
   would have collided with each other and the second NULL row would have been reported as a
   duplicate. `row::unique_index_key_is_unique_by_value` is the predicate, and unit 6 consumes it.
+
+**Unit 4.** The catalog is `src/catalog/` — the types, the cache and the DDL writes in `mod.rs`,
+the keys and the record bytes in `record.rs`. Four things came out differently from §6's sketch,
+three of them from asking the server.
+
+- **A table's indexes live inside its record**, not under keys of their own. The sketch implied one
+  record per relation. The argument for embedding is not brevity: a cache entry is a whole table,
+  and if the index list were a separate key a cached table could be current while its index list
+  was stale — the one kind of staleness that *corrupts* rather than merely returning old data,
+  because a row would be written with no entry in an index that exists. Embedding makes the unit of
+  caching and the unit of consistency the same object.
+- **Tables and indexes share one namespace.** `CREATE INDEX dup ON t (a)` where a table `dup`
+  exists answers `42P07 relation "dup" already exists`. This started as two name maps and is one.
+- **Identifiers fold only ASCII `A`–`Z`.** A UTF-8 server leaves `Ébc` alone; `str::to_lowercase`
+  would have quietly renamed every non-ASCII identifier. Truncation is at 63 **bytes** and is a
+  `42622` *notice*, not an error — a 70-character name became a 63-character table.
+- **A transaction older than the cache reads through it.** The version check as sketched discards a
+  cache that is *behind*; it also has to refuse to serve one that is *ahead*, or a transaction
+  would see a definition from its own future.
+  `a_cache_warmed_by_a_newer_transaction_does_not_leak_into_an_older_one` is that test.
+
+Concurrent DDL needs nothing new: every DDL statement writes `catalog_version`, so two of them
+conflict and one is told to retry, and two `CREATE TABLE`s of one name conflict on the name key by
+the same read-then-write composition `backend.rs` documents for a unique index.
 
 **Unit 2a.** The goldens are recorded, not written. A proxy between `psql` 18.6 and the
 PostgreSQL 19beta1 container logged both directions of five real sessions, and
