@@ -51,6 +51,14 @@ pub trait SchemaLease: std::fmt::Debug + Send + Sync {
     /// that PD's step clock can advance on a timer rather than on a poll of nodes it may not be
     /// able to reach.
     fn remaining(&self) -> Option<std::time::Duration>;
+
+    /// The step interval from the same PD answer, or `None` if it cannot say.
+    ///
+    /// One source rather than two, because the numbers arrive together: PD computes the interval
+    /// *from* the lease (`step_interval_ms = lease_ms + lock_ttl_ms`), so a node holding one
+    /// without the other would be holding half an arithmetic. A source that has lost PD answers
+    /// `None` to both.
+    fn step_interval(&self) -> Option<crate::backend::StepInterval>;
 }
 
 impl StoreBackend {
@@ -112,6 +120,17 @@ impl Backend for StoreBackend {
             Some(lease) => lease.remaining(),
             None => Some(std::time::Duration::MAX),
         }
+    }
+
+    /// The interval this node's lease source publishes, and `None` when there is no source.
+    ///
+    /// Note that this defaults the *opposite* way to the lease above, on purpose. A node with no
+    /// lease source writes freely — "nobody is coordinating" is not a reason to stop. A node with
+    /// no interval source does not **re-drive**, because re-driving without knowing the wait
+    /// would mean inventing one, and an invented interval that is short is exactly the unsafety
+    /// the number exists to prevent. Not writing is a stall; stepping early is wrong.
+    fn schema_step_interval(&self) -> Option<crate::backend::StepInterval> {
+        self.lease.as_ref()?.step_interval()
     }
 
     fn now(&self) -> Result<u64> {

@@ -33,6 +33,7 @@ mod job;
 
 pub use job::BATCH_ROWS;
 pub(crate) mod query;
+pub mod redrive;
 mod verbs;
 
 use std::sync::Arc;

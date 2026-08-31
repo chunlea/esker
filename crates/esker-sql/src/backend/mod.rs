@@ -77,12 +77,53 @@ pub trait Backend: fmt::Debug + Send + Sync {
         Some(std::time::Duration::MAX)
     }
 
+    /// The step interval PD publishes, or `None` when nothing publishes one.
+    ///
+    /// The number a driver waits between the state transitions of a schema change, and the extra
+    /// a *removing* change waits before its last step ([`StepInterval`]). It comes from the same
+    /// PD answer the lease does, for the same reason: a cluster-wide bound needs one writer, and
+    /// a node that kept its own copy would drift — and an interval short by exactly the drift is
+    /// unsafe rather than merely wrong (`docs/plans/phase-6e.md` §10).
+    ///
+    /// `None` is not a default interval, it is the absence of one, and
+    /// [`crate::exec::redrive::ReDriver`] will not step a job without it. A node that cannot be
+    /// told how long to wait must not guess: guessing short breaks the two-version invariant the
+    /// interval exists for. The in-process fake answers `None` because it has no PD, which is
+    /// also why re-driving is off by default in tests.
+    fn schema_step_interval(&self) -> Option<StepInterval> {
+        None
+    }
+
     /// The oracle's current timestamp.
     ///
     /// `CLAUDE.md` invariant 6: no node uses its wall clock for ordering, so "now" is a number from
     /// the timestamp oracle like every other. This is what bounds a historical read from above —
     /// a read at a timestamp that has not happened would see a prefix of it and call it complete.
     fn now(&self) -> Result<u64>;
+}
+
+/// How long a driver waits between the steps of a schema change.
+///
+/// PD's `SchemaLease` answer, the two fields of it a driver needs. Mirrors
+/// `esker_pd::SchemaLease` rather than sharing it: `esker-sql` does not depend on `esker-pd`, and
+/// the numbers arrive over the wire in any case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepInterval {
+    /// `lease_ms + lock_ttl_ms` — the wait after a state transition, in either direction.
+    ///
+    /// Each term bounds how stale a *writer* can be: the lease is how long a node may act without
+    /// hearing from PD, the lock TTL how long a transaction that has already started may still
+    /// commit. Past their sum no writer can be acting on a state two behind, which is ADR 0020's
+    /// two-version invariant.
+    pub step_ms: u64,
+    /// What a **removing** change waits on top of `step_ms`, and only before its final step: the
+    /// MVCC retention window.
+    ///
+    /// Inert for an add, real for a remove — a reader still at `public` reads entries a node at
+    /// `absent` has already deleted, and retention is what keeps them readable. Folding it into
+    /// `step_ms` would price every `CREATE INDEX` at the retention window
+    /// (`crate::exec::verbs`, "why the last step is the expensive one").
+    pub removal_extra_ms: u64,
 }
 
 /// One transaction's view of storage.

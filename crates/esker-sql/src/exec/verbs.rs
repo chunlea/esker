@@ -283,14 +283,100 @@ fn list_jobs(executor: &Executor, txn: &mut dyn Txn) -> Result<Outcome> {
 /// state moves and no node can fall a step behind while they run, which is why the wait buys
 /// nothing there.
 fn schema_step(executor: &mut Executor, txn: &mut dyn Txn, index: &str) -> Result<Outcome> {
-    let tenant = executor.tenant;
     let relation = executor.catalog_view(txn)?.relation(index)?;
     let Some(catalog::Relation::Index { index_id, .. }) = relation else {
         return Err(SqlError::UndefinedIndex(index.to_owned()));
     };
-    let Some(job) = catalog::job(txn, tenant, index_id)? else {
+    if catalog::job(txn, executor.tenant, index_id)?.is_none() {
         return Err(SqlError::Internal(format!(
             "index \"{index}\" has no schema-change job in flight"
+        )));
+    }
+    let stepped = step_job(executor, txn, index_id, None)?;
+    Ok(one_text("esker_schema_step", stepped.said().to_owned()))
+}
+
+/// What one step did, and therefore whether the next one has to wait.
+///
+/// **The wait belongs between state transitions, not between backfill batches**
+/// (`docs/plans/phase-6e.md` §10). Every batch runs at write-only, so no state moves and no node
+/// can fall a step behind while they run; waiting the interval after every step prices a
+/// 20,000-row backfill at 656 seconds instead of 24.
+///
+/// `esker_schema_step` has always said which it took, in words. That was enough while every
+/// driver was a human or a script, and it is not enough now: the re-driver
+/// ([`crate::exec::redrive`]) is the first driver in this tree, it has to get the distinction
+/// right on every step, and a driver that got it wrong by mistyping a word would step early —
+/// which is the one way to break the two-version invariant the interval exists for. So it is a
+/// type, and the words are what the type prints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Stepped {
+    /// A state moved. The next step must wait the interval PD publishes.
+    Transition(String),
+    /// A backfill batch. No state moved, so the next step may start at once.
+    Batch(String),
+    /// Somebody else took this step first, between this driver reading the state and writing it.
+    ///
+    /// Not an error and not a step: the change is exactly one further on than it was, just not by
+    /// this caller. A driver's next move is to look again — and to wait first, because the step
+    /// that did happen happened just now (`crate::exec::job::advance`).
+    Overtaken,
+    /// The change was already finished; this only cleared what it left behind.
+    ///
+    /// A job record outlives its change by exactly as long as it takes to delete it, and that
+    /// delete is its own transaction which can lose a race. Whoever finds the leftover forgets
+    /// it — and says that no state moved, because none did. Counting this as a transition would
+    /// make a cluster look like it had stepped an index to `public` twice.
+    Cleared(String),
+}
+
+impl Stepped {
+    /// What `esker_schema_step` answers with.
+    pub(crate) fn said(&self) -> &str {
+        match self {
+            Self::Transition(said) | Self::Batch(said) | Self::Cleared(said) => said,
+            Self::Overtaken => "overtaken",
+        }
+    }
+
+    /// Whether **this** call moved a state, and so whether it did any work at all.
+    pub(crate) fn moved_a_state(&self) -> bool {
+        matches!(self, Self::Transition(_))
+    }
+
+    /// Whether a driver must stop here rather than taking another step at once.
+    ///
+    /// Everything except a backfill batch. A transition and an overtaking both mean a state moved
+    /// just now — the second is the one that is easy to get wrong, because it moved somewhere
+    /// else — so the interval starts either way. A cleared job has nothing left to step.
+    pub(crate) fn starts_the_wait(&self) -> bool {
+        !matches!(self, Self::Batch(_))
+    }
+}
+
+/// One step of the job on `index_id`, by id rather than by name.
+///
+/// The shared middle of `esker_schema_step` and the re-driver, so that the two cannot come to
+/// differ about what a step is. A driver that reimplemented the state machine would be a second
+/// definition of the invariant, and the whole point of ADR 0020's states is that there is one.
+///
+/// `expected` is what the caller believes the state to be, and it is how a driver that decided
+/// to step *earlier* than now says so. The re-driver decides a job is idle by looking at it and
+/// then looking again an interval later; between that decision and this call another node may
+/// have stepped it, and taking the next step on top would be taking it moments after the last
+/// one rather than an interval after — the two-version invariant broken with nothing to show
+/// for it. `None` is a caller who is deciding right now, which is what `esker_schema_step` is:
+/// a human or a script asking for one step of whatever it finds, and the wait is theirs.
+pub(crate) fn step_job(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    index_id: u64,
+    expected: Option<catalog::SchemaState>,
+) -> Result<Stepped> {
+    let tenant = executor.tenant;
+    let Some(job) = catalog::job(txn, tenant, index_id)? else {
+        return Err(SqlError::Internal(format!(
+            "index {index_id} has no schema-change job in flight"
         )));
     };
     let table = executor.table_by_id(txn, job.table_id)?;
@@ -299,14 +385,16 @@ fn schema_step(executor: &mut Executor, txn: &mut dyn Txn, index: &str) -> Resul
         .iter()
         .find(|def| def.id == index_id)
         .map(|def| def.state)
-        .ok_or_else(|| SqlError::UndefinedIndex(index.to_owned()))?;
+        .ok_or_else(|| SqlError::UndefinedIndex(index_id.to_string()))?;
+    if expected.is_some_and(|expected| expected != state) {
+        return Ok(Stepped::Overtaken);
+    }
 
-    let said = if job.removing {
-        removing_step(executor, index_id, state, &table)?
+    if job.removing {
+        removing_step(executor, index_id, state, &table)
     } else {
-        adding_step(executor, index_id, state, tenant)?
-    };
-    Ok(one_text("esker_schema_step", said))
+        adding_step(executor, index_id, state, tenant)
+    }
 }
 
 /// A step of a change that is **adding** an index: forwards through the states, with the backfill
@@ -316,23 +404,48 @@ fn adding_step(
     index_id: u64,
     state: catalog::SchemaState,
     tenant: u64,
-) -> Result<String> {
+) -> Result<Stepped> {
     Ok(match state {
         catalog::SchemaState::Absent => {
-            job::advance(executor, index_id, catalog::SchemaState::DeleteOnly)?;
-            "delete-only".to_owned()
+            if job::advance(executor, index_id, state, catalog::SchemaState::DeleteOnly)? {
+                Stepped::Transition("delete-only".to_owned())
+            } else {
+                Stepped::Overtaken
+            }
         }
         catalog::SchemaState::DeleteOnly => {
-            job::advance(executor, index_id, catalog::SchemaState::WriteOnly)?;
-            "write-only".to_owned()
+            if job::advance(executor, index_id, state, catalog::SchemaState::WriteOnly)? {
+                Stepped::Transition("write-only".to_owned())
+            } else {
+                Stepped::Overtaken
+            }
         }
         catalog::SchemaState::WriteOnly => match job::backfill_batch(executor, index_id) {
             Ok(true) => {
-                job::advance(executor, index_id, catalog::SchemaState::Public)?;
-                forget(executor, tenant, index_id)?;
-                "public".to_owned()
+                if job::advance(executor, index_id, state, catalog::SchemaState::Public)? {
+                    // The index is readable from here; forgetting the job is bookkeeping in a
+                    // transaction of its own, and it can lose a race with another driver's last
+                    // batch. Reporting *that* as the failure of this step would tell a driver
+                    // nothing moved at the moment the index became public. What is left behind
+                    // is a record with no change attached, and the arm below clears it.
+                    let _ = forget(executor, tenant, index_id);
+                    Stepped::Transition("public".to_owned())
+                } else {
+                    Stepped::Overtaken
+                }
             }
-            Ok(false) => "backfilling".to_owned(),
+            Ok(false) => Stepped::Batch("backfilling".to_owned()),
+            // **A lost race is not a failed change.** A backfill runs beside live traffic on
+            // purpose — that is what running it at write-only buys — so a batch and a writer
+            // touching the same row at the same moment is the ordinary case, and
+            // `crate::exec::job` says as much: "a lost race is an ordinary conflict-and-retry".
+            // The cursor is still where it was and the batch is idempotent, so the answer is to
+            // run it again. Unwinding here would throw a whole schema change away because two
+            // transactions overlapped, and on a table busy enough to need `CONCURRENTLY` that is
+            // a change that can never finish.
+            Err(error) if error.sqlstate() == crate::sqlstate::SERIALIZATION_FAILURE => {
+                return Err(error);
+            }
             Err(error) => {
                 // A duplicate is the one way a schema change fails on *data*. The states unwind so
                 // that a failed change leaves nothing half-built, and the error the user gets is
@@ -343,7 +456,7 @@ fn adding_step(
         },
         catalog::SchemaState::Public => {
             forget(executor, tenant, index_id)?;
-            "public".to_owned()
+            Stepped::Cleared("public".to_owned())
         }
     })
 }
@@ -372,25 +485,37 @@ fn removing_step(
     index_id: u64,
     state: catalog::SchemaState,
     table: &catalog::TableDef,
-) -> Result<String> {
+) -> Result<Stepped> {
     Ok(match state {
         catalog::SchemaState::Public => {
-            job::advance(executor, index_id, catalog::SchemaState::WriteOnly)?;
-            "write-only".to_owned()
+            if job::advance(executor, index_id, state, catalog::SchemaState::WriteOnly)? {
+                Stepped::Transition("write-only".to_owned())
+            } else {
+                Stepped::Overtaken
+            }
         }
         catalog::SchemaState::WriteOnly => {
-            job::advance(executor, index_id, catalog::SchemaState::DeleteOnly)?;
-            "delete-only".to_owned()
+            if job::advance(executor, index_id, state, catalog::SchemaState::DeleteOnly)? {
+                Stepped::Transition("delete-only".to_owned())
+            } else {
+                Stepped::Overtaken
+            }
         }
         catalog::SchemaState::DeleteOnly => {
-            job::advance(executor, index_id, catalog::SchemaState::Absent)?;
-            "absent".to_owned()
+            if job::advance(executor, index_id, state, catalog::SchemaState::Absent)? {
+                Stepped::Transition("absent".to_owned())
+            } else {
+                Stepped::Overtaken
+            }
         }
         // At `absent` nothing reads it and nothing writes it, so the entries and the definition can
         // go. This is the step a driver waits `removal_extra_ms` *before*.
         catalog::SchemaState::Absent => {
-            job::remove(executor, index_id, table)?;
-            "dropped".to_owned()
+            if job::remove(executor, index_id, table)? {
+                Stepped::Transition("dropped".to_owned())
+            } else {
+                Stepped::Overtaken
+            }
         }
     })
 }

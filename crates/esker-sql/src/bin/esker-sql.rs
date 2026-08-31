@@ -17,6 +17,7 @@ use std::sync::Arc;
 use esker_sql::backend::{Backend, MemoryBackend, StoreBackend};
 use esker_sql::catalog::Catalog;
 use esker_sql::exec::Executor;
+use esker_sql::exec::redrive::ReDriver;
 use esker_sql::pgwire::server::{Auth, Config, Executors, serve};
 use esker_sql::pgwire::session::Execute;
 
@@ -69,10 +70,36 @@ async fn main() -> std::io::Result<()> {
             Arc::new(StoreBackend::new(Arc::new(client), oracle))
         }
     };
-    let sessions = Sessions {
-        backend,
-        catalog: Arc::new(Catalog::new()),
-    };
+    let catalog = Arc::new(Catalog::new());
+
+    // Every node runs a re-driver, so a schema change whose node died is finished by whichever
+    // node notices rather than by a human calling `esker_schema_step` (ADR 0020 as amended,
+    // `docs/plans/debt-c2.md`). It is a thread of its own rather than a task: it sleeps a step
+    // interval between passes and would hold a runtime worker for the whole of one.
+    //
+    // It does nothing until this node holds a schema lease, because the lease is what carries
+    // PD's step interval and a node that cannot be told the wait must not invent one. Nothing
+    // attaches a lease yet — see `connect`'s `TODO(phase-6a)`, which is the same reason — so on
+    // this binary today it starts, finds no interval, and waits. That is the honest state: the
+    // mechanism is wired and inert, rather than absent and forgotten.
+    let redriver = ReDriver::new(Arc::clone(&backend), Arc::clone(&catalog), TENANT);
+    if let Some(interval) = redriver.interval() {
+        tracing::info!(
+            step_ms = interval.step_ms,
+            removal_extra_ms = interval.removal_extra_ms,
+            "re-driving orphaned schema-change jobs"
+        );
+    } else {
+        tracing::info!(
+            "no schema step interval published to this node: orphaned schema-change jobs will \
+             wait for esker_schema_step"
+        );
+    }
+    std::thread::Builder::new()
+        .name("schema-redriver".to_owned())
+        .spawn(move || redriver.run())?;
+
+    let sessions = Sessions { backend, catalog };
     serve(config, Arc::new(sessions)).await
 }
 

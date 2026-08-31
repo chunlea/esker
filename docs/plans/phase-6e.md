@@ -345,7 +345,14 @@ state it reached until any node or an operator calls `esker_schema_step('<index>
 — the job record and its cursor are durable, and a different session finishing a half-done job is
 one of the tests. Nothing is unsafe either: the index is not readable until `public`, and every node
 maintains it at whatever state it is stuck in, so a stalled job is a slow schema change and never a
-wrong answer. Automatic re-drive is future work.
+wrong answer. ~~Automatic re-drive is future work.~~
+
+> **Closed in the debt wave.** Every node runs a re-driver; a job idle for a whole pass is picked up
+> by whoever sees it, and the pass period is the step interval so the wait is taken by construction.
+> Two bugs that only appear with more than one driver came out of it: a step decided against one
+> state could be applied to a later one, and a backfill batch that lost an ordinary write-write race
+> unwound the entire change instead of retrying it. `docs/plans/debt-c2.md`, ADR 0020 as amended
+> again.
 
 **PD publishes the interval; a SQL node drives the steps.** ADR 0020 puts the step clock in PD, and
 the arithmetic *is* PD's — a cluster-wide bound needs one writer. Driving is not: a step is a catalog

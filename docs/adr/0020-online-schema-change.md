@@ -221,9 +221,31 @@ is how that TODO closes.
   > whatever state it reached until *any* node or an operator calls `esker_schema_step`. **Nothing
   > is lost and nothing is unsafe**: the job record and its cursor are durable, the index is not
   > readable until it is `public`, and every node maintains it at whatever state it is stuck in, so
-  > a stalled job is a slow schema change and never a wrong answer. Automatic re-drive — a node
-  > that notices an idle job and picks it up, or PD asking one to — is future work, and it is
-  > liveness rather than safety. `docs/plans/phase-6e.md` §10.
+  > a stalled job is a slow schema change and never a wrong answer. `docs/plans/phase-6e.md` §10.
+  >
+  > **Amended again (debt wave): it no longer stalls, and "a human notices" was never a liveness
+  > mechanism.** Every SQL node runs a re-driver (`crates/esker-sql/src/exec/redrive.rs`): a
+  > background pass that scans the jobs and steps any whose fingerprint — state, cursor, done —
+  > has not changed for a whole pass. The pass period *is* the step interval, so a job that
+  > survives one has been still for at least an interval and the wait an interactive driver takes
+  > has already been taken. Idleness is counted in passes rather than measured on a clock, which
+  > keeps invariant 7's wall clock out of it and keeps a "stepped at" timestamp out of the catalog
+  > record.
+  >
+  > **Nothing coordinates the re-drivers, because a step is already a catalog transaction.** Two
+  > that overlap write the same table record and one is rolled back with `40001`; one that merely
+  > *follows* another is refused by the step itself, which takes the state its caller expected and
+  > answers `overtaken` if it has moved. Both halves are needed: without the second, two drivers
+  > that never overlap take consecutive transitions moments apart, each legal alone and together
+  > exactly the acceleration this interval forbids. A lock would be a second mechanism to keep in
+  > step with the first, and it would have a holder that can die — which is the failure being
+  > survived.
+  >
+  > A node that cannot be told the interval does not re-drive at all, and that is the opposite
+  > default to the lease's on purpose: a node with no lease source still writes, because "nobody is
+  > coordinating" is not a reason to stop, but stepping without an interval means inventing one and
+  > an invented interval that is short is the unsafety the number exists to prevent.
+  > `docs/plans/debt-c2.md`.
 * **`esker-proto`** — the messages PD needs to hand a schema-change job out and collect its
   progress, and the lease. **Amended (phase 6e):** the lease is a method of its own,
   `Pd::SchemaLease` (0x0307), rather than a field on a message PD already sends — PD sends a SQL

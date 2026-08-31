@@ -156,18 +156,46 @@ fn index_entry(
     Ok((key, value))
 }
 
-/// Moves an index one state on, in a transaction of its own.
+/// Moves an index one state on, in a transaction of its own, **if it is still where the caller
+/// found it**.
 ///
 /// One step, and [`catalog::advance_index_state`] is what refuses two — the two-version invariant
 /// is a property of the primitive rather than of anybody's discipline.
-pub(super) fn advance(executor: &Executor, index_id: u64, to: SchemaState) -> Result<()> {
+///
+/// `from` is that discipline's other half, and it exists because a step is *two* transactions: a
+/// caller reads the state, decides which move it implies, and then makes it. Between those, a
+/// second driver can take the same move — and the danger is not that the state ends up two on,
+/// which `advance_index_state` refuses, but that it ends up one on **twice as fast**. The second
+/// driver would be stepping a transition that happened moments ago rather than an interval ago,
+/// and the interval is the whole bound on how stale a writer may be.
+///
+/// Two drivers that overlap conflict on the table record and one is rolled back; two that merely
+/// *follow* each other do not overlap, and this is what stops the second. Returns whether it
+/// moved: `false` means somebody else did it first, which is an ordinary outcome and not an
+/// error.
+pub(super) fn advance(
+    executor: &Executor,
+    index_id: u64,
+    from: SchemaState,
+    to: SchemaState,
+) -> Result<bool> {
     let mut txn = executor.plain_read()?;
     let job = catalog::job(&*txn, executor.tenant, index_id)?
         .ok_or_else(|| SqlError::Internal(format!("no schema-change job for index {index_id}")))?;
     let table = executor.table_by_id(&*txn, job.table_id)?;
+    // Read inside the transaction that writes, so that what is checked is what is committed
+    // against: a reader outside it would be checking a snapshot the write does not share.
+    if table
+        .indexes
+        .iter()
+        .find(|index| index.id == index_id)
+        .is_none_or(|index| index.state != from)
+    {
+        return Ok(false);
+    }
     catalog::advance_index_state(&mut *txn, executor.tenant, &table, index_id, to)?;
     txn.commit()?;
-    Ok(())
+    Ok(true)
 }
 
 /// Takes an index away for good: its entries, its definition, its name and its job.
@@ -175,9 +203,19 @@ pub(super) fn advance(executor: &Executor, index_id: u64, to: SchemaState) -> Re
 /// Only ever called at [`SchemaState::Absent`], where nothing reads the index and nothing writes
 /// it — so what is removed is something no live transaction can still want. The wait that makes
 /// that true is the caller's (`crate::exec::verbs::removing_step`).
-pub(super) fn remove(executor: &Executor, index_id: u64, table: &TableDef) -> Result<()> {
+pub(super) fn remove(executor: &Executor, index_id: u64, table: &TableDef) -> Result<bool> {
     let tenant = executor.tenant;
     let mut txn = executor.plain_read()?;
+    // The same check `advance` makes and for the same reason, with one more thing to be sure of:
+    // an index another driver has already removed is not there to remove again.
+    let current = executor.table_by_id(&*txn, table.id)?;
+    if !current
+        .indexes
+        .iter()
+        .any(|index| index.id == index_id && index.state == SchemaState::Absent)
+    {
+        return Ok(false);
+    }
     let (start, end) = crate::row::index_range(tenant, table.id, index_id);
     crate::exec::for_each_page(&mut *txn, &start, &end, |txn, page| {
         for (key, _) in page {
@@ -191,7 +229,7 @@ pub(super) fn remove(executor: &Executor, index_id: u64, table: &TableDef) -> Re
     catalog::replace_table(&mut *txn, tenant, table, &updated)?;
     catalog::drop_job(&mut *txn, tenant, index_id);
     txn.commit()?;
-    Ok(())
+    Ok(true)
 }
 
 /// Unwinds a change that failed, back to `absent`, and forgets the job.
