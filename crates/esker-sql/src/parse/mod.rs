@@ -199,7 +199,8 @@ impl Parsed {
         }))
     }
 
-    /// Whether a `DROP INDEX` asked for `CONCURRENTLY`. See [`Parsed::concurrently`].
+    /// Whether a `DROP INDEX` asked for `CONCURRENTLY`, which is stripped from the source
+    /// before `sqlparser` sees it and remembered rather than inferred.
     #[must_use]
     pub fn is_concurrently(&self) -> bool {
         self.concurrently
