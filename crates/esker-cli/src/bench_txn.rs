@@ -23,11 +23,12 @@
 //!
 //! `CountingOracle`, in this process, not PD. It is a correct oracle for one client
 //! (`CLAUDE.md` invariant 6) and this driver is one client, so the numbers are honest about
-//! everything except the oracle round trip — which is deliberately **excluded**, because it is
-//! a different machine's latency and it already has a benchmark of its own: `bench tso`, whose
-//! numbers are in `docs/bench/phase-4-pd.md`. A reader wanting the production figure adds two
-//! TSO calls per transaction to `txnput` and one to `txnget`. Folding a fake oracle's zero cost
-//! into the ratio silently would be the dishonest version of the same choice.
+//! everything except the **round trip** to the oracle, which is deliberately excluded: it is a
+//! different machine's latency, and the oracle's own cost is already measured by `bench tso`
+//! (`docs/bench/phase-4-pd.md`, 13M timestamps a second in-process — it is the wire that costs,
+//! not the counter). A reader wanting the production figure adds two of those round trips to a
+//! `txnput` and one to a `txnget`. Folding a fake oracle's zero cost into the ratio without
+//! saying so would be the dishonest version of the same choice.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

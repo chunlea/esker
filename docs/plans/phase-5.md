@@ -328,10 +328,12 @@ makes a late `Prewrite` fail for ever, and §7's GC rule is what keeps it alive 
 |---|---|---|---|
 | S1 | `TxnKv` handlers: the snapshot over the engine, `Command::Txn`, apply, dispatch | the seven verbs | **done** |
 | S2 | GC: the retention policy from ADR 0021's records, the compaction filter, `GcSafepoint` | collection | **done** |
-| S3 | Bank test under the simulator's fault plan | 1,000 seeds `--ignored`, a smaller default | open |
-| S4 | Crash between prewrite and commit at every boundary | resolution proved | open |
+| S3 | Bank test under the fault plan | 1,000 seeds `--ignored`, a smaller default | **done** |
+| S4 | Crash between prewrite and commit at every boundary | resolution proved | **done** |
 | S5 | GC verification: many versions, a safepoint, one version left | §7 proved | **done**, with S2 |
-| S6 | `docs/bench/phase-5.md` | the 2PC + MVCC ratio, explained | open |
+| S6 | `docs/bench/phase-5.md` | the 2PC + MVCC ratio, explained | **done** |
+| S7 | Anomaly battery through the whole stack (`prompts/05` test 2) | SI's guarantees, and its one allowance | **done** |
+| S8 | Single-key transactional histories through the register checker | `prompts/05`'s last test line | **done** |
 
 ### 10.6 What landed, and the three things it found
 
@@ -384,6 +386,94 @@ secondaries', after the primary's commit, after each secondary's. Only the third
 point; a crash before it must roll back and a crash after it must roll forward, and
 `crates/esker-txn/tests/protocol.rs::a_crash_at_every_step_resolves_the_way_the_primary_says` is the
 same claim proved against three `BTreeMap`s.
+
+### 10.8 The close-out, and the two lost rows it found
+
+**S4 first, because it is the smaller claim and it broke.** The four boundaries of a two-phase
+commit, driven by hand against six real stores in two Raft groups
+(`crates/esker-client/tests/txn_crash_boundaries.rs`). Three passed. The third —
+*after the primary's commit* — did not, and the failure was a key of a **committed** transaction
+reading as absent.
+
+The client's lock resolution had drifted from the spec it was written against. It sent
+`ResolveLock { commit_ts: 0 }` for the stuck key and nothing else: no lease judgement, no look
+at the primary. Zero is a **verdict**, not a question (§10.2, and `txnkv::resolve_lock`'s own
+header) — so a reader that met the leftover lock of a transaction which had committed its
+primary told the store to roll that key back. The commit was acknowledged, the client was told
+it succeeded, and one key of it silently vanished. The mirror case is as bad: a lock inside its
+lease is a live transaction, and killing it aborts work that was going fine.
+
+`Transaction::resolve` now does `docs/txn-spec.md` §5.5 as written — judge the lease against a
+fresh oracle timestamp; if the lock is a secondary's, read the primary, because a `Heartbeat`
+extends the primary's lease alone; `Rollback` the primary, which is the verdict and the act in
+one apply; carry that verdict to the stuck keys. The wait is capped at what is left of the
+lease, since sleeping past the instant a lock becomes settleable spends a round of the budget on
+a moment that has already passed.
+
+**S3 then found the second one, and this time in the store.** `TxnKv Scan` built its candidate
+keys from the `write` column family alone. A key that has been prewritten and not yet committed
+has *no* `write` record — the lock is its whole existence — so such a key was not in the answer
+and no lock was reported for the caller to resolve. For a transaction that had committed its
+primary in another region, that is a committed row a scan walks past in silence. The scan reads
+the `lock` CF at the same snapshot now, so the key reaches `read`, which refuses with the lock,
+and the client resolves it and asks again.
+
+Both bugs are the same shape and it is worth naming: **a state that only a half-finished
+transaction produces**, reached by every reader and by no test that finished its transactions.
+That is what the bank test's crashed clients are for, and both were found within minutes of it
+first running.
+
+**What the bank test asserts.** Sixteen accounts, half either side of the region boundary, so an
+audit's scan walks both regions and a transfer usually spans two Raft groups. Every transfer
+writes a **witness** key beside the two balances, in the region the primary is not in — so the
+"every committed transfer is visible later" half is about a *secondary* commit rather than about
+the primary again. An outcome is `Committed` only when the client was told so, `Refused` only
+when a store determined it, and **everything else is unknown**: unknowns are decided at the end
+by reading the witness, which makes the final reconciliation exact rather than approximate — the
+opening balance plus every transfer that actually applied, per account, not merely a total that
+adds up.
+
+Three runs, all green: the three-second default in `just check`, the sixty-second run under the
+fault plan (404 transfers committed, 79 clients killed mid-commit, 12 leader kills), and a
+thousand seeds. Two shapes in the sweep, chosen by the seed itself: every fourth seed replicates
+and kills a leader, the rest run unreplicated so the hour goes on interleavings rather than on
+cluster startup.
+
+**One number worth knowing.** In the sixty-second run only 13 of 163 audits complete. An audit
+reads every account at one snapshot, so it meets whatever any of the six writers holds at that
+instant and must wait each of them out; under that much contention most attempts exhaust the
+lock budget and return a refusal. That is a *refusal, not a wrong answer*, and the end-of-run
+reconciliation is strictly stronger than the audit — but it means the sum invariant is checked
+around a dozen times per run rather than continuously. A wait proportional to the lease rather
+than to the router's backoff would improve it; it is written down here rather than tuned.
+
+### 10.9 The acceptance runs, and what they cost
+
+| Run | Command | Result |
+|---|---|---|
+| bank, default | `cargo test -p esker-client --test bank` | green, ~5 s; in `just check` |
+| bank, sixty seconds | `--release --test bank -- --ignored sixty` | green in 98 s: 404 transfers committed, 79 clients killed mid-commit, 12 leader kills, 13 complete audits |
+| bank, a thousand seeds | `--release --test bank -- --ignored thousand` | **green, 1,000 seeds in 3,660 s** (61 min, ~3.7 s a seed) |
+| crash boundaries | `--test txn_crash_boundaries` (+ `--ignored`) | green; the `--ignored` run kills both regions' leaders at every boundary |
+| anomalies | `--test anomalies` | green, under a second |
+| linearizability | `--test txn_linearizability` | green; every key's history linearizes, with and without leader kills |
+| GC, a thousand versions | `cargo test -p esker-store --release --test txnkv -- --ignored` | green in 12 s |
+
+`prompts/05-txn.md`'s acceptance list is then: bank test across 1,000 seeds ✓, anomaly tests ✓,
+GC verified ✓, `txn-put`/`txn-get` recorded against the RawKV numbers and explained ✓
+(`docs/bench/phase-5.md`), DESIGN.md §8 and `docs/txn-spec.md` matching the code ✓ — §8's summary
+of resolution ("rolled forward if the primary is committed, rolled back if its TTL expired, else
+wait/backoff") is what the client now does, and §5.5 gained the four steps it does it in.
+
+**The bench's own finding, since it is a fact about the design rather than about the machine.**
+A transactional write costs almost exactly **two** synced `RawKv` writes — 1.96× the latency —
+because a transaction has to be durable twice, at prewrite and at commit. MVCC's bookkeeping does
+not appear at all, and neither does it on the read side, where a transactional read is inside the
+noise of a raw one. What does appear is that four concurrent transactional writers get no more
+throughput than one on a single-node store: the no-Raft path takes an **exclusive** gate for every
+transactional command where `RawKv` takes a shared one, so they queue. §10.1 is why a replicated
+store should not need that gate; measuring it needs a cluster benchmark driver that does not exist
+yet.
 
 ### 10.5 What S2 consumes from ADR 0021
 
