@@ -895,7 +895,10 @@ mod tests {
     fn a_failed_commit_still_ends_the_transaction() {
         let mut session = Session::new();
         let mut fake = Fake {
-            fail_commit: Some(SqlError::UniqueViolation("g_pkey".into())),
+            fail_commit: Some(SqlError::UniqueViolation {
+                constraint: "g_pkey".into(),
+                key: None,
+            }),
             ..Fake::default()
         };
         run(&mut session, "BEGIN", &mut fake);

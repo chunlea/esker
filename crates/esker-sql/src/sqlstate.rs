@@ -133,6 +133,8 @@ pub const WRONG_OBJECT_TYPE: &str = "42809";
 pub const DATATYPE_MISMATCH: &str = "42804";
 /// No such function.
 pub const UNDEFINED_FUNCTION: &str = "42883";
+/// A `$1` with nothing bound to it.
+pub const UNDEFINED_PARAMETER: &str = "42P02";
 /// A table definition that cannot be built — no primary key, in our case.
 pub const INVALID_TABLE_DEFINITION: &str = "42P16";
 /// An identifier longer than 63 bytes. A *notice*, not an error: PostgreSQL truncates and carries
@@ -227,6 +229,7 @@ mod tests {
         ("UNDEFINED_FUNCTION", super::UNDEFINED_FUNCTION),
         ("INVALID_TABLE_DEFINITION", super::INVALID_TABLE_DEFINITION),
         ("NAME_TOO_LONG", super::NAME_TOO_LONG),
+        ("UNDEFINED_PARAMETER", super::UNDEFINED_PARAMETER),
         ("SUCCESSFUL_COMPLETION", super::SUCCESSFUL_COMPLETION),
         (
             "CONFIGURATION_LIMIT_EXCEEDED",

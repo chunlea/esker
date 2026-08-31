@@ -269,7 +269,10 @@ mod tests {
     /// Returns the error the executor would report.
     fn insert_unique(txn: &mut Box<dyn Txn>, index_key: &[u8], row: &[u8]) -> crate::Result<()> {
         if txn.get(index_key)?.is_some() {
-            return Err(SqlError::UniqueViolation("g_b_key".into()));
+            return Err(SqlError::UniqueViolation {
+                constraint: "g_b_key".into(),
+                key: None,
+            });
         }
         txn.put(index_key, row);
         Ok(())

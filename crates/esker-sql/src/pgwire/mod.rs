@@ -42,6 +42,9 @@ pub fn error_fields(error: &SqlError) -> Vec<(ErrorField, String)> {
         (ErrorField::CODE, error.sqlstate().to_owned()),
         (ErrorField::MESSAGE, error.to_string()),
     ];
+    if let Some(detail) = error.detail() {
+        fields.push((ErrorField::DETAIL, detail));
+    }
     if let Some(hint) = error.hint() {
         fields.push((ErrorField::HINT, hint.to_owned()));
     }

@@ -25,6 +25,7 @@
 //! conflict really was an ordinary row-level race, which stays `40001` and stays retryable.
 
 mod ddl;
+mod dml;
 
 use std::sync::Arc;
 
@@ -40,9 +41,14 @@ use crate::plan::Statement;
 pub struct Executor {
     backend: Arc<dyn Backend>,
     catalog: Arc<Catalog>,
-    tenant: u64,
+    pub(crate) tenant: u64,
     /// The transaction an explicit `BEGIN` opened. `None` means the next statement gets its own.
     open: Option<Box<dyn Txn>>,
+    /// What the open transaction has written that changes how a failed commit reads. It
+    /// accumulates across the whole block, because the commit that fails is the block's and not
+    /// any one statement's — the first version of this recorded per statement and lost the
+    /// translation entirely for a client that used `BEGIN`.
+    written: Written,
     /// Notices produced by the statement that just ran, waiting for the session to send them.
     notices: Vec<SqlError>,
 }
@@ -56,6 +62,7 @@ impl Executor {
             catalog,
             tenant,
             open: None,
+            written: Written::default(),
             notices: Vec::new(),
         }
     }
@@ -64,8 +71,10 @@ impl Executor {
     /// and rolled back on failure.
     fn in_a_transaction(&mut self, statement: &Statement) -> Result<Outcome> {
         if let Some(mut txn) = self.open.take() {
-            let outcome = self.run(&mut *txn, statement);
+            let mut written = std::mem::take(&mut self.written);
+            let outcome = self.run_recording(&mut *txn, statement, &mut written);
             self.open = Some(txn);
+            self.written = written;
             return outcome;
         }
 
@@ -85,22 +94,18 @@ impl Executor {
         }
     }
 
-    fn run(&mut self, txn: &mut dyn Txn, statement: &Statement) -> Result<Outcome> {
-        self.run_recording(txn, statement, &mut Written::default())
-    }
-
     fn run_recording(
         &mut self,
         txn: &mut dyn Txn,
         statement: &Statement,
         written: &mut Written,
     ) -> Result<Outcome> {
-        let _ = written;
         match statement {
             Statement::CreateTable(create) => ddl::create_table(self, txn, create),
             Statement::DropTable(drop) => ddl::drop_table(self, txn, drop),
             Statement::CreateIndex(create) => ddl::create_index(self, txn, create),
             Statement::DropIndex(drop) => ddl::drop_index(self, txn, drop),
+            Statement::Insert(insert) => dml::insert(self, txn, insert, written),
             Statement::Explain(inner) => Ok(Self::explain(inner)),
         }
     }
@@ -129,9 +134,12 @@ impl Executor {
         let Ok(txn) = self.backend.begin() else {
             return error;
         };
-        for (key, constraint) in &written.unique_keys {
-            if matches!(txn.get(key), Ok(Some(_))) {
-                return SqlError::UniqueViolation(constraint.clone());
+        for unique in &written.unique_keys {
+            if matches!(txn.get(&unique.key), Ok(Some(_))) {
+                return SqlError::UniqueViolation {
+                    constraint: unique.constraint.clone(),
+                    key: Some(unique.detail.clone()),
+                };
             }
         }
         // Nobody took any of them: an ordinary row-level race, and still retryable.
@@ -166,11 +174,25 @@ impl Executor {
     }
 }
 
-/// What a statement wrote that changes how a failed commit should be reported.
+/// What a transaction wrote that changes how a failed commit should be reported.
 #[derive(Debug, Default)]
-struct Written {
-    /// Unique index entries, with the constraint each one belongs to.
-    unique_keys: Vec<(Vec<u8>, String)>,
+pub(crate) struct Written {
+    /// Unique index entries, with what to say if one of them turns out to have been taken.
+    pub(crate) unique_keys: Vec<Unique>,
+}
+
+/// One unique index entry this transaction wrote, and the error it becomes if it lost the race.
+///
+/// The message is built *here*, while the row's values are still to hand — after the commit fails
+/// there is no transaction left to ask what they were.
+#[derive(Debug)]
+pub(crate) struct Unique {
+    /// The key, so a second look can see whether somebody took it.
+    pub(crate) key: Vec<u8>,
+    /// The constraint's name.
+    pub(crate) constraint: String,
+    /// `Key (id)=(1)`, for the `DETAIL` field.
+    pub(crate) detail: String,
 }
 
 /// The `EXPLAIN` output for a statement. One line per plan node, indented by depth, which is the
@@ -181,6 +203,12 @@ fn explain_lines(statement: &Statement) -> Vec<String> {
         Statement::DropTable(drop) => vec![format!("Drop Table on {}", drop.names.join(", "))],
         Statement::CreateIndex(create) => vec![format!("Create Index on {}", create.table)],
         Statement::DropIndex(drop) => vec![format!("Drop Index on {}", drop.names.join(", "))],
+        Statement::Insert(insert) => vec![format!(
+            "Insert on {} ({} row{})",
+            insert.table,
+            insert.rows.len(),
+            if insert.rows.len() == 1 { "" } else { "s" }
+        )],
         // `EXPLAIN EXPLAIN ...` is not something PostgreSQL's grammar admits, so this is
         // unreachable through the parser and is written as a value rather than a panic anyway.
         Statement::Explain(_) => vec!["Explain".to_owned()],
@@ -201,17 +229,25 @@ impl Execute for Executor {
         // A second `BEGIN` never reaches here: the session answers it with PostgreSQL's warning
         // and leaves the block alone.
         self.open = Some(self.backend.begin()?);
+        self.written = Written::default();
         Ok(())
     }
 
     fn commit(&mut self) -> Result<()> {
+        let written = std::mem::take(&mut self.written);
         let Some(txn) = self.open.take() else {
             return Ok(());
         };
-        txn.commit().map(|_| ())
+        match txn.commit() {
+            Ok(_) => Ok(()),
+            // The same translation the autocommit path does. A block's commit is where a client
+            // that wrote several rows finds out it lost, and it deserves the same answer.
+            Err(error) => Err(self.explain_conflict(error, &written)),
+        }
     }
 
     fn rollback(&mut self) -> Result<()> {
+        self.written = Written::default();
         let Some(txn) = self.open.take() else {
             return Ok(());
         };

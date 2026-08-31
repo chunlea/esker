@@ -19,18 +19,26 @@
 //! impossible.
 
 mod ddl;
+mod dml;
+mod expr;
 
 pub use ddl::{
     Column, CreateIndex, CreateTable, DropIndex, DropTable, UniqueConstraint, index_name,
     primary_key_name, unique_constraint_name,
 };
+pub use dml::Insert;
+pub use expr::{Expr, Literal};
 
 /// One statement, lowered.
 ///
 /// Transaction control is not here: `BEGIN`, `COMMIT` and `ROLLBACK` move the status a client sees
 /// in every `ReadyForQuery` and so belong to the session, which handles them before the executor
 /// is reached (`crate::pgwire::session`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Not `Eq`: an expression can hold a float literal, and two of those are compared the way floats
+/// are compared everywhere else in this crate rather than by an equality that pretends `NaN`
+/// equals itself.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     /// `CREATE TABLE`.
     CreateTable(CreateTable),
@@ -40,6 +48,8 @@ pub enum Statement {
     CreateIndex(CreateIndex),
     /// `DROP INDEX`.
     DropIndex(DropIndex),
+    /// `INSERT`.
+    Insert(Insert),
     /// `EXPLAIN`, and the statement it is about. The inner statement is planned and described,
     /// never run.
     Explain(Box<Statement>),
@@ -58,6 +68,8 @@ impl Statement {
             Statement::DropTable(_) => "DROP TABLE",
             Statement::CreateIndex(_) => "CREATE INDEX",
             Statement::DropIndex(_) => "DROP INDEX",
+            // `INSERT` never uses this: its tag carries a count, which only the executor knows.
+            Statement::Insert(_) => "INSERT",
             Statement::Explain(_) => "EXPLAIN",
         }
     }

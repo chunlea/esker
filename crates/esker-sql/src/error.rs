@@ -132,8 +132,17 @@ pub enum SqlError {
     DuplicateColumn(String),
 
     /// A duplicate reached a unique index.
-    #[error("duplicate key value violates unique constraint \"{0}\"")]
-    UniqueViolation(String),
+    #[error("duplicate key value violates unique constraint \"{constraint}\"")]
+    UniqueViolation {
+        /// The constraint's name, which is what a client matches on.
+        constraint: String,
+        /// `Key (a, b)=(1, x)` for the `DETAIL` field, or `None` when the values are not to hand.
+        ///
+        /// PostgreSQL renders this with no quoting at all — a text value containing `, y)` comes
+        /// out as `Key (a, b)=(1, x, y))`, unbalanced parentheses and all. Copied exactly, because
+        /// a client that parses the field has been written against *that*.
+        key: Option<String>,
+    },
 
     /// A NULL reached a `NOT NULL` column.
     #[error("null value in column \"{0}\" violates not-null constraint")]
@@ -158,6 +167,17 @@ pub enum SqlError {
         /// The text that would not fit.
         value: String,
     },
+
+    /// An integer *literal* too large for `bigint`. PostgreSQL words this one in three words,
+    /// where the same overflow reached through the type's input function gets
+    /// [`SqlError::IntegerOutOfRange`]'s longer message. Two paths, two messages, both captured.
+    #[error("bigint out of range")]
+    IntegerLiteralOutOfRange,
+
+    /// More expressions in a `VALUES` tuple than there are columns to put them in. PostgreSQL
+    /// calls this a *syntax* error, which it decides before looking at any of the values.
+    #[error("INSERT has more expressions than target columns")]
+    InsertTooManyExpressions,
 
     /// A float literal is well-formed and outside the type's range, in either direction:
     /// PostgreSQL raises this for `1e-400` as well as for `1e400`, rather than rounding to zero.
@@ -208,6 +228,49 @@ pub enum SqlError {
     /// Bytes arrived that are not valid UTF-8, which is the server encoding.
     #[error("invalid byte sequence for encoding \"UTF8\": 0x{0:02x}")]
     InvalidByteSequence(u8),
+
+    /// A value is being put in a column of another type, and no assignment cast covers it.
+    #[error(
+        "column \"{column}\" is of type {column_type} but expression is of type {expression_type}"
+    )]
+    DatatypeMismatchInColumn {
+        /// The column being assigned to.
+        column: String,
+        /// Its type, as PostgreSQL names it.
+        column_type: &'static str,
+        /// The expression's type, as PostgreSQL names it — `integer` for a small constant, not
+        /// `bigint`.
+        expression_type: &'static str,
+    },
+
+    /// A `$1` with nothing bound to it. The simple query protocol has no way to carry one, so a
+    /// parameter in a `Query` message is always this.
+    #[error("there is no parameter ${0}")]
+    UndefinedParameter(u32),
+
+    /// A column named in a statement about one relation. PostgreSQL says which relation here,
+    /// where a bare column reference elsewhere gets the shorter message.
+    #[error("column \"{column}\" of relation \"{relation}\" does not exist")]
+    UndefinedColumnInRelation {
+        /// The column that is not there.
+        column: String,
+        /// The relation it was looked for in.
+        relation: String,
+    },
+
+    /// A NULL reached a `NOT NULL` column, with the relation named the way PostgreSQL names it.
+    #[error(
+        "null value in column \"{column}\" of relation \"{relation}\" violates not-null constraint"
+    )]
+    NotNullViolationInRelation {
+        /// The column.
+        column: String,
+        /// The table it belongs to.
+        relation: String,
+        /// The whole offending row for the `DETAIL` field, rendered the way PostgreSQL renders it:
+        /// values joined with `, ` and `null` for a NULL, with no quoting.
+        row: Option<String>,
+    },
 
     /// An operator or function met types it is not defined for.
     #[error("{0}")]
@@ -297,7 +360,7 @@ impl SqlError {
     pub fn sqlstate(&self) -> &'static str {
         match self {
             SqlError::FeatureNotSupported(_) => sqlstate::FEATURE_NOT_SUPPORTED,
-            SqlError::Syntax { .. } => sqlstate::SYNTAX_ERROR,
+            SqlError::Syntax { .. } | SqlError::InsertTooManyExpressions => sqlstate::SYNTAX_ERROR,
             SqlError::StatementTooComplex => sqlstate::STATEMENT_TOO_COMPLEX,
             SqlError::UndefinedTable(_) | SqlError::UndefinedTableForDrop(_) => {
                 sqlstate::UNDEFINED_TABLE
@@ -305,21 +368,23 @@ impl SqlError {
             SqlError::UndefinedIndex(_) => sqlstate::UNDEFINED_OBJECT,
             SqlError::DependentObjectsStillExist { .. } => sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
             SqlError::WrongObjectType { .. } => sqlstate::WRONG_OBJECT_TYPE,
-            SqlError::UndefinedColumn(_) | SqlError::UndefinedColumnInKey(_) => {
-                sqlstate::UNDEFINED_COLUMN
-            }
+            SqlError::UndefinedColumn(_)
+            | SqlError::UndefinedColumnInKey(_)
+            | SqlError::UndefinedColumnInRelation { .. } => sqlstate::UNDEFINED_COLUMN,
             SqlError::DuplicateTable(_) | SqlError::AlreadyExistsSkipping(_) => {
                 sqlstate::DUPLICATE_TABLE
             }
             SqlError::DuplicateColumn(_) => sqlstate::DUPLICATE_COLUMN,
-            SqlError::UniqueViolation(_) => sqlstate::UNIQUE_VIOLATION,
-            SqlError::NotNullViolation(_) => sqlstate::NOT_NULL_VIOLATION,
+            SqlError::UniqueViolation { .. } => sqlstate::UNIQUE_VIOLATION,
+            SqlError::NotNullViolation(_) | SqlError::NotNullViolationInRelation { .. } => {
+                sqlstate::NOT_NULL_VIOLATION
+            }
             SqlError::InvalidTextRepresentation { .. } | SqlError::InvalidByteaFormat => {
                 sqlstate::INVALID_TEXT_REPRESENTATION
             }
-            SqlError::IntegerOutOfRange { .. } | SqlError::FloatOutOfRange { .. } => {
-                sqlstate::NUMERIC_VALUE_OUT_OF_RANGE
-            }
+            SqlError::IntegerOutOfRange { .. }
+            | SqlError::FloatOutOfRange { .. }
+            | SqlError::IntegerLiteralOutOfRange => sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
             SqlError::InvalidDatetimeFormat { .. } => sqlstate::INVALID_DATETIME_FORMAT,
             SqlError::DatetimeFieldOutOfRange(_) | SqlError::TimestampOutOfRange(_) => {
                 sqlstate::DATETIME_FIELD_OVERFLOW
@@ -331,7 +396,10 @@ impl SqlError {
                 sqlstate::INVALID_PARAMETER_VALUE
             }
             SqlError::InvalidByteSequence(_) => sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
-            SqlError::DatatypeMismatch(_) => sqlstate::DATATYPE_MISMATCH,
+            SqlError::DatatypeMismatch(_) | SqlError::DatatypeMismatchInColumn { .. } => {
+                sqlstate::DATATYPE_MISMATCH
+            }
+            SqlError::UndefinedParameter(_) => sqlstate::UNDEFINED_PARAMETER,
             SqlError::SerializationFailure(_) => sqlstate::SERIALIZATION_FAILURE,
             SqlError::DoesNotExistSkipping { .. } => sqlstate::SUCCESSFUL_COMPLETION,
             SqlError::IdentifierTruncated { .. } => sqlstate::NAME_TOO_LONG,
@@ -365,6 +433,23 @@ impl SqlError {
         }
     }
 
+    /// The `DETAIL` field, when there is one.
+    ///
+    /// It is the part of a `23505` a user actually reads — the constraint name says *which* rule
+    /// was broken and the detail says *what broke it*.
+    #[must_use]
+    pub fn detail(&self) -> Option<String> {
+        match self {
+            SqlError::UniqueViolation { key: Some(key), .. } => {
+                Some(format!("{key} already exists."))
+            }
+            SqlError::NotNullViolationInRelation { row: Some(row), .. } => {
+                Some(format!("Failing row contains ({row})."))
+            }
+            _ => None,
+        }
+    }
+
     /// The `HINT` field, when PostgreSQL sends one.
     ///
     /// A hint is not decoration: told `"t_b_key" is not a table`, a user's next question is what to
@@ -382,6 +467,9 @@ impl SqlError {
                 ..
             } => Some("Use DROP TABLE to remove a table."),
             SqlError::DependentObjectsStillExist { .. } => Some("You can drop the table instead."),
+            SqlError::DatatypeMismatchInColumn { .. } => {
+                Some("You will need to rewrite or cast the expression.")
+            }
             _ => None,
         }
     }
@@ -451,7 +539,11 @@ mod tests {
             "relation \"accounts\" does not exist"
         );
         assert_eq!(
-            SqlError::UniqueViolation("accounts_pkey".into()).to_string(),
+            SqlError::UniqueViolation {
+                constraint: "accounts_pkey".into(),
+                key: None,
+            }
+            .to_string(),
             "duplicate key value violates unique constraint \"accounts_pkey\""
         );
         assert_eq!(

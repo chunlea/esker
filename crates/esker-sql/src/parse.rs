@@ -24,9 +24,9 @@
 //! C1 broken (`docs/plans/phase-6a.md` §1). The guard may only ever err towards accepting.
 
 use sqlparser::ast::{
-    ColumnOption, CreateTableOptions, DataType, ExactNumberInfo, Expr, Ident, IndexColumn,
-    IndexType, NullsDistinctOption, ObjectName, ObjectType, Statement, TableConstraint,
-    TimezoneInfo,
+    ColumnOption, CreateTableOptions, DataType, DollarQuotedString, ExactNumberInfo, Expr, Ident,
+    IndexColumn, IndexType, NullsDistinctOption, ObjectName, ObjectType, SetExpr, Statement,
+    TableConstraint, TableObject, TimezoneInfo, UnaryOperator, Value,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::{Parser, ParserError};
@@ -822,6 +822,7 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
         Statement::CreateTable(create) => {
             Ok(plan::Statement::CreateTable(lower_create_table(create)?))
         }
+        Statement::Insert(insert) => Ok(plan::Statement::Insert(lower_insert(insert)?)),
         Statement::CreateIndex(create) => {
             Ok(plan::Statement::CreateIndex(lower_create_index(create)?))
         }
@@ -1016,6 +1017,131 @@ fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<plan::Crea
         unique: create.unique,
         if_not_exists: create.if_not_exists,
     })
+}
+
+fn lower_insert(insert: &sqlparser::ast::Insert) -> Result<plan::Insert> {
+    refuse_if(insert.or.is_some(), "INSERT OR")?;
+    refuse_if(insert.ignore, "INSERT IGNORE")?;
+    refuse_if(insert.overwrite, "INSERT OVERWRITE")?;
+    refuse_if(insert.replace_into, "REPLACE INTO")?;
+    refuse_if(insert.on.is_some(), "INSERT ... ON CONFLICT")?;
+    refuse_if(insert.returning.is_some(), "INSERT ... RETURNING")?;
+    refuse_if(insert.table_alias.is_some(), "INSERT ... AS")?;
+    refuse_if(insert.partitioned.is_some(), "INSERT ... PARTITION")?;
+    refuse_if(!insert.after_columns.is_empty(), "INSERT ... AFTER")?;
+    refuse_if(!insert.assignments.is_empty(), "INSERT ... SET")?;
+    refuse_if(insert.priority.is_some(), "an INSERT priority")?;
+    refuse_if(insert.insert_alias.is_some(), "INSERT ... AS")?;
+    refuse_if(insert.settings.is_some(), "INSERT ... SETTINGS")?;
+    refuse_if(insert.format_clause.is_some(), "INSERT ... FORMAT")?;
+    refuse_if(insert.output.is_some(), "INSERT ... OUTPUT")?;
+    refuse_if(
+        insert.multi_table_insert_type.is_some() || !insert.multi_table_into_clauses.is_empty(),
+        "a multi-table INSERT",
+    )?;
+    refuse_if(!insert.optimizer_hints.is_empty(), "an optimizer hint")?;
+
+    let table = match &insert.table {
+        TableObject::TableName(name) => object_name(name)?,
+        other => return Err(SqlError::unsupported(format!("INSERT INTO {other}"))),
+    };
+    let columns = if insert.columns.is_empty() {
+        None
+    } else {
+        Some(
+            insert
+                .columns
+                .iter()
+                .map(object_name)
+                .collect::<Result<Vec<_>>>()?,
+        )
+    };
+
+    let source = insert
+        .source
+        .as_ref()
+        .ok_or_else(|| SqlError::unsupported("INSERT with no source"))?;
+    refuse_if(source.with.is_some(), "INSERT ... WITH")?;
+    refuse_if(source.order_by.is_some(), "INSERT ... ORDER BY")?;
+    refuse_if(source.limit_clause.is_some(), "INSERT ... LIMIT")?;
+    refuse_if(source.fetch.is_some(), "INSERT ... FETCH")?;
+    refuse_if(!source.locks.is_empty(), "INSERT with a locking clause")?;
+
+    let SetExpr::Values(values) = source.body.as_ref() else {
+        // `INSERT INTO t SELECT ...` needs the query executor, which unit 6c brings.
+        return Err(SqlError::unsupported("INSERT ... SELECT"));
+    };
+    refuse_if(values.explicit_row, "INSERT ... VALUES ROW(...)")?;
+
+    let rows = values
+        .rows
+        .iter()
+        .map(|row| row.iter().map(lower_expr).collect::<Result<Vec<_>>>())
+        .collect::<Result<Vec<_>>>()?;
+    Ok(plan::Insert {
+        table,
+        columns,
+        rows,
+    })
+}
+
+/// An expression, as far as phase 6a's `VALUES` needs one.
+///
+/// A negative number arrives as a unary minus over a positive literal, which is folded here so
+/// that `-1` is one literal rather than an operator this crate would otherwise have to run.
+fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
+    match expr {
+        Expr::Value(value) => lower_value(&value.value, false),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => match expr.as_ref() {
+            Expr::Value(value) => lower_value(&value.value, true),
+            other => Err(SqlError::unsupported(format!("the expression -{other}"))),
+        },
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => lower_expr(expr),
+        Expr::Nested(inner) => lower_expr(inner),
+        other => Err(SqlError::unsupported(format!("the expression {other}"))),
+    }
+}
+
+fn lower_value(value: &Value, negated: bool) -> Result<plan::Expr> {
+    let sign = if negated { "-" } else { "" };
+    let literal = match value {
+        Value::Null => plan::Literal::Null,
+        Value::Boolean(value) => plan::Literal::Bool(*value),
+        Value::Number(digits, _) => {
+            let text = format!("{sign}{digits}");
+            if digits.contains(['.', 'e', 'E']) {
+                plan::Literal::Decimal(text)
+            } else {
+                // `bigint out of range`, not the input function's longer message: a literal
+                // too large is caught on a different path in PostgreSQL and says so differently.
+                plan::Literal::Integer(
+                    text.parse()
+                        .map_err(|_| SqlError::IntegerLiteralOutOfRange)?,
+                )
+            }
+        }
+        Value::SingleQuotedString(text)
+        | Value::DollarQuotedString(DollarQuotedString { value: text, .. }) => {
+            refuse_if(negated, "a negated string literal")?;
+            plan::Literal::String(text.clone())
+        }
+        Value::Placeholder(name) => {
+            refuse_if(negated, "a negated parameter")?;
+            let number = name
+                .strip_prefix('$')
+                .and_then(|digits| digits.parse().ok())
+                .ok_or_else(|| SqlError::unsupported(format!("the placeholder {name}")))?;
+            return Ok(plan::Expr::Parameter(number));
+        }
+        other => return Err(SqlError::unsupported(format!("the literal {other}"))),
+    };
+    Ok(plan::Expr::Literal(literal))
 }
 
 /// The six types, under every spelling PostgreSQL accepts for them.

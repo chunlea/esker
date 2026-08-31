@@ -472,9 +472,10 @@ its own gap register, and it would be longer.
 - [x] 4 — catalog: the `'m'`-space records with a golden, the per-transaction version check,
   and a cache that cannot serve a definition from a snapshot's future
 - [x] 5 — backend trait and fake (the executor's half of the unique-index composition is unit 6)
-- [ ] 6 — planner and executor: **6a done** — the lowering out of the parser's AST, the DDL
+- [ ] 6 — planner and executor: **6a and 6b done** — the lowering out of the parser's AST, the DDL
   executor over the catalog, `Execute` implemented and a real `psql` driving `CREATE`/`DROP`
-  against it; `INSERT`, `SELECT`, `UPDATE`, `DELETE` and the plan tree remain
+  against it (6a); `INSERT` with its indexes and both halves of the unique-index ruling (6b);
+  `SELECT`, `UPDATE`, `DELETE`, bound parameters and the plan tree remain
 - [ ] 7 — `.slt` harness
 
 ## 10a. Handoff — where a fresh lane picks up
@@ -685,6 +686,53 @@ Two decisions and one remaining divergence:
   diff against the real server. It is the `P` field, and filling it needs the parser's spans
   carried through the lowering. `TODO(post-v1)`, and consistent with §1's existing exclusion of
   caret positions for syntax errors.
+
+**Unit 6b.** `INSERT`, and with it the executor's half of the unique-index ruling — the one §5 and
+§10a both name. `a_concurrent_duplicate_is_reported_as_a_duplicate` is `backend.rs`'s
+`a_concurrent_duplicate_loses_at_commit` run against the real executor: two sessions, two
+transactions, both reading the index key as absent, both writing it, one committing. The loser is
+told `23505` naming the constraint, because what the *user* did was insert a duplicate and telling
+them `40001` would be telling them to retry something that can never succeed.
+
+Two things about that translation came out of writing it rather than out of the plan:
+
+- **The recording has to span the block, not the statement.** The first version recorded unique
+  keys per statement, which meant a client using `BEGIN` — the case the whole ruling is about —
+  got the untranslated `40001`. `Written` now accumulates across the open transaction and
+  `Execute::commit` runs the same translation the autocommit path does. The test caught it.
+- **The message needs the values, and after a failed commit there is no transaction left to ask.**
+  So the `DETAIL` is rendered at write time, while the row is still to hand, and carried alongside
+  the key. On a `40001` the executor opens a fresh transaction and looks: the keys that are now
+  present are the ones it collided with, and a key nobody took means the conflict really was an
+  ordinary race and stays retryable.
+
+Diffing the `INSERT` surface against a real PostgreSQL 19 closed four more differences:
+
+- **`DETAIL` is not decoration.** `Key (id)=(1) already exists.` is the part of a `23505` a user
+  reads to find out *what* collided, and `SqlError` had no way to carry one. PostgreSQL renders it
+  with **no quoting at all** — a text value containing `, y)` really does come back as
+  `Key (a, b)=(1, x, y))`, unbalanced parentheses included — and that is copied exactly, because a
+  client parsing the field was written against that.
+- **An integer literal too large for `bigint` is three words**, `bigint out of range`, where the
+  same overflow reached through the type's input function keeps its longer message. Two paths, two
+  messages.
+- **`INSERT has more expressions than target columns` is a `42601`** and PostgreSQL says exactly
+  that, with no `syntax error:` in front of it.
+- **A `NOT NULL` violation names the relation**, and so does a column the table does not have —
+  `column "nope" of relation "t" does not exist` — where the same conditions elsewhere use the
+  shorter form.
+
+Assignment casts are the value layer doing its second job. A quoted literal is PostgreSQL's
+`unknown` type, so assigning one is `Datum::from_text`, which the value corpus already checks for
+all six types in both directions; that one function replaces six rules. The rest were measured and
+two of them are not what a reading would give: **`true` in a `text` column stores `true`**, the
+cast's word and not the `t` the output function writes, and **`1.5` stores the digits as written**,
+because PostgreSQL types a decimal literal `numeric` and `numeric`'s text is its own digits.
+
+One conversion is refused on purpose. A decimal literal in an `int8` column is `0A000` naming it,
+because `numeric` rounds half away from zero (`2.5` becomes `3`) and a `float8` rounds half to even
+(`2.5` becomes `2`), and there is no `numeric` here to be sure with. A silently wrong number is
+worse than a named gap.
 
 **Unit 2a.** The goldens are recorded, not written. A proxy between `psql` 18.6 and the
 PostgreSQL 19beta1 container logged both directions of five real sessions, and
