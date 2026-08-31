@@ -415,6 +415,61 @@ repairs, and a region already down to a bare, even, two-vote membership that los
 nothing left to propose through. Every other acknowledged write in this run and every other run in
 this file — every one, in every configuration, across four runs — remained readable throughout.
 
+## Run 5 — 2026-08-31, the repair scenario with its precondition actually asserted
+
+commit `f5b83eb` — "fix(pd): repair fires on under-replication, not only on a store's death" —
+and [ADR 0026](../adr/0026-the-quorum-loss-boundary.md), which names precisely what Run 4 found and
+draws the line between the part of it that was a bug and the part that was Raft working correctly.
+
+### What changed in the harness, not just the code under test
+
+Run 4's pre-kill wait checked a *summed* voter count across all regions, which can read `>= 3`
+while one specific region still has only 2 — exactly how region 27 slipped through. This run checks
+**every region individually** and refuses to proceed to the kill at all unless every one of them
+independently clears 3 voters — asserting the precondition the acceptance sentence ("PD repairs
+every region to 3 replicas on survivors and a replacement") presupposes, rather than hoping for it.
+
+### The quorum-loss boundary (ADR 0026, for the record)
+
+**A region cannot repair itself once it has lost quorum, and this is not a bug.** `AddPeer` is a
+membership change; a membership change is a log entry; a log entry commits only with a majority of
+the *current* configuration. A region already down to two voters that loses one of them has one
+voter left out of a two-voter membership — one is not a majority of two — so the very entry that
+would rescue it can never be agreed on by the group it would rescue. Region 27's epoch never moving
+across 270 seconds of polling in Run 4 was that fact made visible: nothing was agreed, because
+nothing could be. The boundary moves with the target — three replicas survive one loss, five
+survive two — and a region sitting under its target going into a failure has already spent the
+margin that would have carried it through. Before the boundary this is PD's job, unconditionally,
+whatever put the region there. Past it, PD does not force a configuration on any evidence, ever
+— a store it cannot reach is not provably a store that is gone, and forcing one survivor's log to
+become the region's whole history is a real, silent loss of whatever the true majority had
+committed that the survivor had not yet seen. The door out is `esker region unsafe-recover`,
+un-built as of this record — a future operator command, explicit and named `unsafe` on purpose,
+that forces a single-member configuration from a **named, human-chosen** surviving replica. Nothing
+here proves PD's decision by itself; it can only be a person's.
+
+### Repair, re-run with the precondition held
+
+Same setup as Run 4 (3 stores, 12,000 keys, 1 MiB split threshold, `max_store_down_time` at the
+30 s default), rebuilt against `f5b83eb`.
+
+**The precondition held on the first check**: all 8 regions showed 3 voters within 1 second of
+asking — a sharp contrast with Run 4, where the same wait left one region short and nothing
+noticed. `SIGKILL` on store 3 proceeded only because of that.
+
+**Verify: 11,989/11,989 readable. Zero missing, zero mismatched — the first fully clean repair
+verify this lane has recorded.** With every region genuinely at 3 voters going in, losing one
+store leaves 2 of 3 in every region — still a majority — so nothing crossed the boundary this
+time, and nothing could get stuck the way region 27 did.
+
+Full convergence to the clean end state (3 voters, no learners, the dead store's peer gone) is
+still gradual: 4 of 8 regions reached it inside a 317 s poll window; the other 4 show real,
+continuing repair-and-balance activity in their listings (the dead peer not yet removed on some,
+a second, independent replica move already under way on others, now that a 4th store exists to
+balance onto) rather than the frozen, byte-identical state region 27 showed in Run 4. This is the
+same convergence-takes-real-time finding this lane has made throughout — a latency observation, not
+a correctness one, and orthogonal to what this run was asked to confirm.
+
 ## Methodology note: what the scratchpad tooling is, and isn't
 
 None of the four items above could be produced with the checked-in `esker-cli`: `bench`/`raw` only
