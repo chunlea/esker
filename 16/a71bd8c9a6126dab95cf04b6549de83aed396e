@@ -1,0 +1,41 @@
+crates/esker-sql/src/catalog/mod.rs
+  s_afe85b170e9777::t_dcb48cb1954b89 97-108,124-128,143-145,148-150,154-172,463,465-467,486-493,548-575
+crates/esker-sql/src/catalog/record.rs
+  s_afe85b170e9777::t_f74688272060e1 10,55,163-175
+crates/esker-sql/src/exec/bind.rs
+  s_afe85b170e9777::t_7a5c7534f0e0ef 117-119
+crates/esker-sql/src/exec/ddl.rs
+  s_afe85b170e9777::t_976ea0fe573463 14,16-29,79-102,104-109,134
+crates/esker-sql/src/exec/dml.rs
+  s_afe85b170e9777::t_a6e012dd32d944 58-62,76-78,112-121,127-135
+crates/esker-sql/src/exec/mod.rs
+  s_afe85b170e9777::t_5897999e240f1b 59-61,79,221-256
+crates/esker-sql/src/exec/query.rs
+  s_afe85b170e9777::t_a085a493fe2d6b 381-402,407,535-536,539-540,566-570,585
+crates/esker-sql/tests/ddl.rs
+  s_afe85b170e9777::t_562ea845c53d7e 140-141,143,145-212,839-919
+crates/esker-sql/tests/slt/create_table.slt
+  s_afe85b170e9777::t_15b83f10f291d1 45-47
+crates/esker-sql/tests/slt/no_primary_key.slt
+  s_afe85b170e9777::t_06d43c3daabd47 1-104
+crates/esker-sql/tests/slt_harness/mod.rs
+  s_afe85b170e9777::t_0e3ca07c1753d5 69-72,104-107
+docs/plans/phase-6a.md
+  s_afe85b170e9777::t_746fa26ae1dea8 512-514,536
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "16a71bd8c9a6126dab95cf04b6549de83aed396e",
+  "prompts": {},
+  "sessions": {
+    "s_afe85b170e9777": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9d2ba3cf-8922-46e7-833a-93e8265a013f",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
