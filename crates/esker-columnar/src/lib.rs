@@ -69,7 +69,8 @@ pub use fragment::{Aggregate, CompareOp, Expr, Fragment, KeyRange, Output, Table
 pub use frame::Compression;
 pub use reader::{ReadCounters, Reader};
 pub use scan::{
-    FragmentOutput, FragmentResult, Group, Partial, ScanOptions, ScanStats, evaluate, evaluate_with,
+    FragmentOutput, FragmentResult, Group, Partial, ScanOptions, ScanStats, evaluate,
+    evaluate_merged, evaluate_with,
 };
 pub use stats::{Bound, ColumnStats};
 pub use value::{ColumnDef, ColumnType, Schema, Value, ValueRef};

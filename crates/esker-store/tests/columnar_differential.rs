@@ -1,0 +1,391 @@
+//! The columnar apply target against a reference that resolves versions the obvious way.
+//!
+//! ADR 0022 names the two engines disagreeing as the worst failure this feature can have,
+//! *"because it is silent"*. `esker-columnar`'s own differential defends the evaluator; this
+//! defends the layer above it — **the apply target, the sort it produces, the merge, and MVCC
+//! visibility over all three** — which is where a wrong answer would come from now.
+//!
+//! # What is actually independent
+//!
+//! The reference never opens a run. It resolves versions from the **workload the region was fed**,
+//! with its own rule written out longhand: group by key, take the newest version at or below the
+//! read, drop it if it is a tombstone. So a disagreement can come from anywhere in the path — the
+//! decoder, the seal, the sort, the merge, the stripe boundaries, the resolver, the scan.
+//!
+//! That the two share the *rule* is the point; sharing a rule is not sharing an implementation. A
+//! reference that called [`esker_columnar::scan::visible::Resolver`] would agree with itself and
+//! prove nothing, which is the trap `docs/plans/phase-8-learner.md` names under RULED-2.
+//!
+//! # What this cannot yet cover, stated rather than left to be noticed
+//!
+//! The corpus does not interleave DDL, because the row codec that would make an `ADD COLUMN` with
+//! a non-`NULL` default meaningful is still moving into `esker-keys` (RULED-1). That case — rows
+//! written **before** an `ADD COLUMN ... DEFAULT 42` reading `42` row-side and `NULL` here — is the
+//! one this harness would otherwise be built blind to, so it is named in the plan's test list and
+//! is the first thing to add when the codec lands.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use esker_base::rng::Pcg32;
+use esker_columnar::scan::visible::Visibility;
+use esker_columnar::{
+    ColumnDef, ColumnType, Fragment, FragmentOutput, Reader, ScanOptions, Schema, TableRef, Value,
+    evaluate_merged,
+};
+use esker_engine::fs::{FileSystem, LocalFileSystem};
+use esker_store::columnar::{ColumnarApply, ColumnarOptions, RowDecoder, compact};
+use esker_store::error::Result;
+
+/// One write the region applied: a version of a key, or a tombstone for it.
+#[derive(Debug, Clone)]
+struct Version {
+    key: i64,
+    /// `None` is a delete.
+    name: Option<String>,
+    commit_ts: u64,
+}
+
+/// `id:int8, name:text`, keyed on `id`. The apply target adds `__commit_ts` and `__deleted`.
+#[derive(Debug)]
+struct Decoder {
+    schema: Schema,
+}
+
+impl Decoder {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            schema: Schema::new(vec![
+                ColumnDef::new("id", ColumnType::Int8),
+                ColumnDef::new("name", ColumnType::Text),
+            ])
+            .unwrap(),
+        })
+    }
+}
+
+impl RowDecoder for Decoder {
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn key_slots(&self) -> &[usize] {
+        &[0]
+    }
+
+    fn decode(&self, key: &[u8], value: Option<&[u8]>) -> Result<Vec<Value>> {
+        let mut id = [0u8; 8];
+        id.copy_from_slice(&key[..8]);
+        Ok(vec![
+            Value::Int8(i64::from_be_bytes(id)),
+            match value {
+                None => Value::Null,
+                Some(bytes) => Value::Text(String::from_utf8_lossy(bytes).into_owned()),
+            },
+        ])
+    }
+}
+
+fn versioned_key(id: i64, ts: u64) -> Vec<u8> {
+    let mut key = id.to_be_bytes().to_vec();
+    key.extend_from_slice(&esker_keys::prefix::txn_key(&[], ts)[1..]);
+    key
+}
+
+/// **The reference.** Written longhand, from the workload, never from a file.
+///
+/// For each key: the versions at or below `at`, newest first, take the first, and report it only
+/// if it is not a tombstone. That is the rule in one sentence and this is it in one loop.
+fn reference(workload: &[Version], at: u64) -> BTreeMap<i64, String> {
+    let mut by_key: BTreeMap<i64, Vec<&Version>> = BTreeMap::new();
+    for version in workload {
+        by_key.entry(version.key).or_default().push(version);
+    }
+    let mut visible = BTreeMap::new();
+    for (key, mut versions) in by_key {
+        versions.retain(|version| version.commit_ts <= at);
+        versions.sort_by_key(|version| std::cmp::Reverse(version.commit_ts));
+        if let Some(newest) = versions.first()
+            && let Some(name) = &newest.name
+        {
+            visible.insert(key, name.clone());
+        }
+    }
+    visible
+}
+
+/// What the columnar copy says, read at `at` across every live run.
+fn columnar(apply: &ColumnarApply, at: u64) -> BTreeMap<i64, String> {
+    let fs = LocalFileSystem::new();
+    let runs = apply.runs();
+    // **Every live run at once.** Resolving per run answers "the newest version in this run",
+    // which is a different question — and the one this harness caught the first time it ran.
+    let readers: Vec<Reader> = runs
+        .live()
+        .iter()
+        .map(|number| Reader::open(&fs, &runs.path_of(*number)).unwrap())
+        .collect();
+    if readers.is_empty() {
+        return BTreeMap::new();
+    }
+    let fragment = Fragment::scan(
+        TableRef {
+            tenant: 1,
+            table_id: 1,
+        },
+        vec![0, 1],
+    );
+    let result = evaluate_merged(
+        &readers,
+        &fragment,
+        &ScanOptions {
+            prune: true,
+            visibility: Some(Visibility {
+                key_columns: vec![0],
+                ts_column: 2,
+                deleted_column: 3,
+                ts: i64::try_from(at).unwrap(),
+            }),
+        },
+    )
+    .unwrap();
+    let FragmentOutput::Rows(rows) = result.output else {
+        panic!("a scan fragment returned groups");
+    };
+    let mut seen = BTreeMap::new();
+    for row in rows {
+        match (&row[0], &row[1]) {
+            (Value::Int8(id), Value::Text(name)) => {
+                seen.insert(*id, name.clone());
+            }
+            other => panic!("unexpected row: {other:?}"),
+        }
+    }
+    seen
+}
+
+/// Mixed puts, rewrites and deletes over a small key space, so keys collect several versions and
+/// tombstones land in the middle of them rather than only at the end.
+fn workload(count: usize, keys: i64, seed: u64) -> Vec<Version> {
+    let mut rng = Pcg32::from_seed(seed);
+    let mut out = Vec::with_capacity(count);
+    for index in 0..count {
+        let key = i64::from(rng.below(u32::try_from(keys).unwrap()));
+        let commit_ts = (index as u64 + 1) * 10;
+        // One write in four is a delete, so a key is repeatedly killed and rewritten.
+        let name = if rng.below(4) == 0 {
+            None
+        } else {
+            Some(format!("k{key}@{commit_ts}"))
+        };
+        out.push(Version {
+            key,
+            name,
+            commit_ts,
+        });
+    }
+    out
+}
+
+/// Applies `workload`, sealing every `seal_rows` so the corpus spans several runs.
+///
+/// The apply target owns its own [`RunSet`], so the numbers a seal takes and the numbers the
+/// manifest names come from one sequence. The read below goes through that manifest rather than a
+/// directory listing, which is the property `runs.rs` exists to provide.
+fn apply_all(dir: &std::path::Path, workload: &[Version], seal_rows: usize) -> ColumnarApply {
+    let fs: Arc<dyn FileSystem> = Arc::new(LocalFileSystem::new());
+    let mut apply = ColumnarApply::open(
+        fs,
+        dir,
+        Decoder::new(),
+        ColumnarOptions {
+            seal_rows,
+            ..ColumnarOptions::default()
+        },
+    )
+    .unwrap();
+    for version in workload {
+        apply
+            .apply(
+                &versioned_key(version.key, version.commit_ts),
+                version.name.as_ref().map(String::as_bytes),
+            )
+            .unwrap();
+    }
+    apply.seal().unwrap();
+    apply
+}
+
+/// The whole claim, over a generated corpus at every interesting instant.
+#[test]
+fn the_columnar_copy_agrees_with_the_reference_at_every_timestamp() {
+    for seed in 0..8u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let load = workload(200, 12, 900 + seed);
+        let apply = apply_all(dir.path(), &load, 37);
+
+        // Before anything, between every pair of writes, and after everything.
+        let mut instants = vec![0u64, u64::from(u32::MAX)];
+        instants.extend(load.iter().map(|version| version.commit_ts));
+        instants.extend(load.iter().map(|version| version.commit_ts + 5));
+        for at in instants {
+            assert_eq!(
+                columnar(&apply, at),
+                reference(&load, at),
+                "seed {seed} disagreed at ts {at}"
+            );
+        }
+    }
+}
+
+/// And it still agrees after a merge, which is the operation most able to lose or duplicate a
+/// version while looking like it worked.
+#[test]
+fn a_merge_changes_no_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let load = workload(300, 9, 4242);
+    let mut apply = apply_all(dir.path(), &load, 29);
+    assert!(
+        apply.runs().live().len() >= 3,
+        "the corpus did not span runs"
+    );
+
+    let before: Vec<BTreeMap<i64, String>> = load
+        .iter()
+        .map(|version| columnar(&apply, version.commit_ts))
+        .collect();
+
+    let fs: Arc<dyn FileSystem> = Arc::new(LocalFileSystem::new());
+    let schema = apply.schema().clone();
+    let inputs = apply.runs().live().to_vec();
+    compact::merge(
+        &fs,
+        apply.runs_mut(),
+        &schema,
+        &[0],
+        2,
+        &inputs,
+        &esker_columnar::WriterOptions::default(),
+    )
+    .unwrap()
+    .expect("the merge produced a run");
+    assert_eq!(
+        apply.runs().live().len(),
+        1,
+        "the merge did not collapse the runs"
+    );
+
+    for (index, version) in load.iter().enumerate() {
+        assert_eq!(
+            columnar(&apply, version.commit_ts),
+            before[index],
+            "the merge changed the answer at ts {}",
+            version.commit_ts
+        );
+        assert_eq!(
+            columnar(&apply, version.commit_ts),
+            reference(&load, version.commit_ts)
+        );
+    }
+}
+
+/// **The regression this harness was built to catch, named for it.**
+///
+/// A tombstone in a *later* run must delete a row from an *earlier* one. The first version of the
+/// fragment path resolved visibility per run, which answers "the newest version of this key **in
+/// this run**" — a different question. A run whose only word on a key is a tombstone resolves it
+/// to *nothing*, so nothing removed the older, live-looking row an earlier run had every right to
+/// return. The result was a deleted row served as live.
+///
+/// Asserted under **both** output shapes on purpose. `Rows` is where it was found; `Aggregates` is
+/// where it could never have been repaired after the fact, because combining per-run partials
+/// cannot express "this run's candidate was overruled by another run's" — a `count(*)` would have
+/// counted the dead row for ever with no way to notice.
+#[test]
+fn a_tombstone_in_a_later_run_deletes_a_row_from_an_earlier_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs: Arc<dyn FileSystem> = Arc::new(LocalFileSystem::new());
+    let mut apply = ColumnarApply::open(
+        Arc::clone(&fs),
+        dir.path(),
+        Decoder::new(),
+        ColumnarOptions {
+            // One row per run, so the write and its tombstone cannot share a file.
+            seal_rows: 1,
+            ..ColumnarOptions::default()
+        },
+    )
+    .unwrap();
+
+    apply.apply(&versioned_key(1, 10), Some(b"alive")).unwrap();
+    apply.apply(&versioned_key(2, 10), Some(b"other")).unwrap();
+    apply.apply(&versioned_key(1, 20), None).unwrap();
+    apply.seal().unwrap();
+    assert!(
+        apply.runs().live().len() >= 3,
+        "the versions shared a run, so this test proves nothing"
+    );
+
+    // Rows: key 1 is gone after its delete, and was there before it.
+    assert_eq!(
+        columnar(&apply, 15),
+        BTreeMap::from([(1, "alive".to_string()), (2, "other".to_string())]),
+        "a read before the delete lost the row"
+    );
+    assert_eq!(
+        columnar(&apply, 25),
+        BTreeMap::from([(2, "other".to_string())]),
+        "a tombstone in a later run did not delete the row in the earlier one"
+    );
+
+    // Aggregates: the same claim where no after-the-fact repair could have reached.
+    assert_eq!(count_at(&apply, 15), 2);
+    assert_eq!(
+        count_at(&apply, 25),
+        1,
+        "count(*) counted a row whose tombstone was in another run"
+    );
+}
+
+/// `count(*)` over the visible rows at `at`.
+fn count_at(apply: &ColumnarApply, at: u64) -> u64 {
+    let fs = LocalFileSystem::new();
+    let runs = apply.runs();
+    let readers: Vec<Reader> = runs
+        .live()
+        .iter()
+        .map(|number| Reader::open(&fs, &runs.path_of(*number)).unwrap())
+        .collect();
+    let fragment = Fragment::aggregate(
+        TableRef {
+            tenant: 1,
+            table_id: 1,
+        },
+        vec![0, 1],
+        Vec::new(),
+        vec![esker_columnar::Aggregate::CountStar],
+    );
+    let result = evaluate_merged(
+        &readers,
+        &fragment,
+        &ScanOptions {
+            prune: true,
+            visibility: Some(Visibility {
+                key_columns: vec![0],
+                ts_column: 2,
+                deleted_column: 3,
+                ts: i64::try_from(at).unwrap(),
+            }),
+        },
+    )
+    .unwrap();
+    match result.output {
+        FragmentOutput::Groups(groups) => match groups.first().map(|group| &group.aggregates[0]) {
+            Some(esker_columnar::Partial::Count(count)) => *count,
+            other => panic!("not a count: {other:?}"),
+        },
+        FragmentOutput::Rows(rows) => panic!("not groups: {rows:?}"),
+    }
+}

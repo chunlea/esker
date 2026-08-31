@@ -45,6 +45,7 @@ use esker_columnar::{
 };
 use esker_engine::fs::FileSystem;
 
+use self::runs::RunSet;
 use crate::error::{Result, StoreError};
 
 /// The column carrying a version's commit timestamp.
@@ -125,8 +126,12 @@ pub struct ColumnarApply {
     ts_slot: usize,
     buffered: Vec<Row>,
     buffered_bytes: usize,
-    /// The number the next sealed run takes.
-    next_run: u64,
+    /// The live runs, and the manifest that names them.
+    ///
+    /// Owned here rather than beside here, because sealing is the only thing that creates a run
+    /// and the number it takes must come from the same place the manifest's does. Two counters
+    /// for one sequence is how a sealed file ends up named something the manifest never says.
+    runs: RunSet,
 }
 
 impl fmt::Debug for ColumnarApply {
@@ -135,7 +140,7 @@ impl fmt::Debug for ColumnarApply {
             .field("dir", &self.dir)
             .field("buffered", &self.buffered.len())
             .field("buffered_bytes", &self.buffered_bytes)
-            .field("next_run", &self.next_run)
+            .field("runs", &self.runs.live().len())
             .finish_non_exhaustive()
     }
 }
@@ -155,6 +160,7 @@ impl ColumnarApply {
         let dir = dir.as_ref().to_path_buf();
         fs.create_dir_all(&dir)
             .map_err(|error| StoreError::Bootstrap(format!("{}: {error}", dir.display())))?;
+        let runs = RunSet::open(Arc::clone(&fs), &dir)?;
 
         let table = decoder.schema();
         for reserved in [COMMIT_TS_COLUMN, DELETED_COLUMN] {
@@ -189,7 +195,7 @@ impl ColumnarApply {
             ts_slot,
             buffered: Vec::new(),
             buffered_bytes: 0,
-            next_run: 0,
+            runs,
         })
     }
 
@@ -203,6 +209,17 @@ impl ColumnarApply {
     #[must_use]
     pub fn buffered(&self) -> usize {
         self.buffered.len()
+    }
+
+    /// The live runs this region's reads must cover.
+    #[must_use]
+    pub fn runs(&self) -> &RunSet {
+        &self.runs
+    }
+
+    /// The live runs, mutably, for the compaction that replaces them.
+    pub fn runs_mut(&mut self) -> &mut RunSet {
+        &mut self.runs
     }
 
     /// Applies one committed version.
@@ -263,7 +280,8 @@ impl ColumnarApply {
             right.values[ts_slot].pg_cmp(&left.values[ts_slot])
         });
 
-        let path = self.dir.join(run_name(self.next_run));
+        let number = self.runs.reserve();
+        let path = self.runs.path_of(number);
         let mut writer = Writer::create(
             self.fs.as_ref(),
             &path,
@@ -284,9 +302,11 @@ impl ColumnarApply {
             bytes = summary.bytes,
             "sealed a columnar run"
         );
+        // The manifest write is the commit point: until it lands the file is an orphan the sweep
+        // would collect, which is exactly right for a seal that crashed half way.
+        self.runs.commit(number)?;
         self.buffered.clear();
         self.buffered_bytes = 0;
-        self.next_run += 1;
         Ok(Some(path))
     }
 }

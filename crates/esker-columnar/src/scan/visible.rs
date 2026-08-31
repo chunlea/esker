@@ -112,19 +112,20 @@ fn matches_key(key: &[ValueRef<'_>], settled: &[Value]) -> bool {
             .all(|(left, right)| same(left, right))
 }
 
-/// Compares without owning, because this runs once per row per key column.
+/// Whether two key values are the same key.
+///
+/// **This must be the ordering the runs are sorted by, and nothing else.** The apply target's seal
+/// and the merge both place rows with [`ValueRef::pg_cmp`], so "adjacent" means "`pg_cmp` says
+/// equal" — and a resolver using a different notion of sameness would split a key the file
+/// considers whole and emit two visible versions of it.
+///
+/// The case that catches it is `-0.0` against `0.0`: bitwise they differ, `pg_cmp` calls them
+/// equal, and an earlier draft of this function compared bits. It would have shown up only for a
+/// floating-point key holding both signs of zero — rare, silent, and wrong. `Datum`'s `PartialEq`
+/// in `esker-keys` is deliberately bitwise for the opposite reason (storage asks whether bytes
+/// survived); this is the SQL question, so it asks the SQL comparison.
 fn same(left: &ValueRef<'_>, right: &Value) -> bool {
-    match (left, right) {
-        (ValueRef::Null, Value::Null) => true,
-        (ValueRef::Int(a), Value::Int8(b) | Value::TimestampTz(b)) => a == b,
-        (ValueRef::Bool(a), Value::Bool(b)) => a == b,
-        // Bit-equality, so that the two NaNs a key could hold compare equal here as they do in
-        // `pg_cmp`. A float key is a bad idea, but it is not this function's job to refuse one.
-        (ValueRef::Double(a), Value::Double(b)) => a.to_bits() == b.to_bits(),
-        (ValueRef::Bytes(a), Value::Text(b)) => *a == b.as_bytes(),
-        (ValueRef::Bytes(a), Value::Bytea(b)) => *a == b.as_slice(),
-        _ => false,
-    }
+    left.pg_cmp(&right.as_ref()) == std::cmp::Ordering::Equal
 }
 
 fn owned(value: &ValueRef<'_>) -> Value {
@@ -235,6 +236,23 @@ mod tests {
             !resolver.visible(&k, 10, false, 25),
             "a text key did not match itself across rows"
         );
+    }
+
+    /// Key sameness follows `pg_cmp`, because that is what the runs are sorted by. `-0.0` and
+    /// `0.0` are one key to the sort, so they must be one key here — a bitwise comparison would
+    /// split them and report two visible versions of one row.
+    #[test]
+    fn a_key_is_the_same_key_the_sort_thinks_it_is() {
+        let mut resolver = Resolver::default();
+        assert!(resolver.visible(&[ValueRef::Double(0.0)], 20, false, 25));
+        assert!(
+            !resolver.visible(&[ValueRef::Double(-0.0)], 10, false, 25),
+            "-0.0 and 0.0 are one key to pg_cmp, so they must be one key here"
+        );
+        // And NaN, which `pg_cmp` also calls equal to itself.
+        let mut resolver = Resolver::default();
+        assert!(resolver.visible(&[ValueRef::Double(f64::NAN)], 20, false, 25));
+        assert!(!resolver.visible(&[ValueRef::Double(f64::NAN)], 10, false, 25));
     }
 
     #[test]

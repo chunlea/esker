@@ -30,12 +30,13 @@
 //! the footer, which is the extreme case of the property this crate exists for.
 
 pub mod group;
+pub mod merged;
 pub mod visible;
 
 use std::collections::BTreeMap;
 
 use crate::column::Column;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::footer::StripeMeta;
 use crate::fragment::expr::{CompareOp, Expr};
 use crate::fragment::{Fragment, Output};
@@ -131,10 +132,118 @@ impl Default for ScanOptions {
     }
 }
 
+/// Where matched rows go, and the only place a fragment's `output` is interpreted.
+///
+/// Shared by both scan paths so that the merged one cannot drift from the single-file one: a
+/// filter, a projection or an accumulation written twice is two chances to be different, and the
+/// difference would show up as two engines disagreeing, which ADR 0022 names as the worst failure
+/// this feature can have.
+struct Sink<'a> {
+    fragment: &'a Fragment,
+    slots: &'a [ColumnType],
+    limit: Option<u64>,
+    rows: Vec<Vec<Value>>,
+    groups: BTreeMap<GroupKey, Vec<Accumulator>>,
+}
+
+impl<'a> Sink<'a> {
+    fn new(fragment: &'a Fragment, slots: &'a [ColumnType]) -> Self {
+        Self {
+            fragment,
+            slots,
+            limit: match &fragment.output {
+                Output::Rows { limit } => *limit,
+                Output::Aggregates { .. } => None,
+            },
+            rows: Vec::new(),
+            groups: BTreeMap::new(),
+        }
+    }
+
+    /// Offers one row, already known visible. Returns `false` when the limit is reached.
+    fn push(&mut self, row: &[ValueRef<'_>], stats: &mut ScanStats) -> Result<bool> {
+        if let Some(filter) = &self.fragment.filter
+            && !filter.matches(row)
+        {
+            return Ok(true);
+        }
+        stats.rows_matched += 1;
+        match &self.fragment.output {
+            Output::Rows { .. } => {
+                self.rows.push(
+                    row.iter()
+                        .zip(self.slots)
+                        .map(|(value, ty)| value.to_value(*ty))
+                        .collect::<Result<Vec<_>>>()?,
+                );
+                Ok(self.limit.is_none_or(|limit| stats.rows_matched < limit))
+            }
+            Output::Aggregates {
+                group_by,
+                aggregates,
+            } => {
+                let key = GroupKey::new(
+                    group_by
+                        .iter()
+                        .map(|slot| row[*slot as usize].to_value(self.slots[*slot as usize]))
+                        .collect::<Result<Vec<_>>>()?,
+                );
+                let slots = self.slots;
+                let accumulators = self.groups.entry(key).or_insert_with(|| {
+                    aggregates
+                        .iter()
+                        .map(|aggregate| Accumulator::new(*aggregate, slots))
+                        .collect()
+                });
+                for accumulator in accumulators.iter_mut() {
+                    accumulator.push(row)?;
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    fn finish(mut self) -> FragmentOutput {
+        match &self.fragment.output {
+            Output::Rows { .. } => FragmentOutput::Rows(self.rows),
+            Output::Aggregates {
+                group_by,
+                aggregates,
+            } => {
+                // **An ungrouped aggregate over no rows is one group, not none.**
+                // `SELECT count(*) FROM t WHERE false` is `0`, and a scan that returned no groups
+                // would make it *no row at all*. A `GROUP BY` over no rows really is no groups,
+                // which is why this is conditioned on there being no grouping slots.
+                if group_by.is_empty() && self.groups.is_empty() {
+                    self.groups.insert(
+                        GroupKey::new(Vec::new()),
+                        aggregates
+                            .iter()
+                            .map(|aggregate| Accumulator::new(*aggregate, self.slots))
+                            .collect(),
+                    );
+                }
+                FragmentOutput::Groups(
+                    self.groups
+                        .into_iter()
+                        .map(|(key, accumulators)| Group {
+                            key: key.into_values(),
+                            aggregates: accumulators.iter().map(Accumulator::finish).collect(),
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            }
+        }
+    }
+}
+
 /// Evaluates `fragment` against `reader`.
 ///
 /// Every refusal happens in [`Fragment::validate`], before a byte is read, so a fragment that
 /// gets past the first line here will be evaluated in full or fail on damaged data.
+///
+/// One file only. A region's columnar copy is several runs, and resolving MVCC visibility over
+/// them one at a time is wrong — see [`evaluate_merged`].
 pub fn evaluate(reader: &Reader, fragment: &Fragment) -> Result<FragmentResult> {
     evaluate_with(reader, fragment, &ScanOptions::default())
 }
@@ -156,16 +265,11 @@ pub fn evaluate_with(
     // Carried across stripes: a key's versions may span them, so "already settled" is a fact about
     // the scan and not about one stripe.
     let mut resolver = visible::Resolver::default();
-    let mut rows = Vec::new();
-    let mut groups: BTreeMap<GroupKey, Vec<Accumulator>> = BTreeMap::new();
-    let limit = match &fragment.output {
-        Output::Rows { limit } => *limit,
-        Output::Aggregates { .. } => None,
-    };
+    let mut sink = Sink::new(fragment, &slots);
 
     for (index, stripe) in reader.stripes().iter().enumerate() {
         stats.stripes_considered += 1;
-        if limit.is_some_and(|limit| stats.rows_matched >= limit) {
+        if sink.limit.is_some_and(|limit| stats.rows_matched >= limit) {
             continue;
         }
         // **Pruning is unsound under visibility**, so `Visibility` overrides the switch rather
@@ -212,118 +316,55 @@ pub fn evaluate_with(
             {
                 continue;
             }
-            if let Some(filter) = &fragment.filter
-                && !filter.matches(&row)
-            {
-                continue;
-            }
-            stats.rows_matched += 1;
-
-            match &fragment.output {
-                Output::Rows { .. } => {
-                    rows.push(
-                        row.iter()
-                            .zip(&slots)
-                            .map(|(value, ty)| value.to_value(*ty))
-                            .collect::<Result<Vec<_>>>()?,
-                    );
-                    if limit.is_some_and(|limit| stats.rows_matched >= limit) {
-                        break;
-                    }
-                }
-                Output::Aggregates {
-                    group_by,
-                    aggregates,
-                } => {
-                    let key = GroupKey::new(
-                        group_by
-                            .iter()
-                            .map(|slot| row[*slot as usize].to_value(slots[*slot as usize]))
-                            .collect::<Result<Vec<_>>>()?,
-                    );
-                    let accumulators = groups.entry(key).or_insert_with(|| {
-                        aggregates
-                            .iter()
-                            .map(|aggregate| Accumulator::new(*aggregate, &slots))
-                            .collect()
-                    });
-                    for accumulator in accumulators.iter_mut() {
-                        accumulator.push(&row)?;
-                    }
-                }
+            if !sink.push(&row, &mut stats)? {
+                break;
             }
         }
     }
 
-    let output = finish(fragment, rows, groups, &slots);
-    Ok(FragmentResult { output, stats })
+    Ok(FragmentResult {
+        output: sink.finish(),
+        stats,
+    })
 }
 
-/// Turns what the scan accumulated into the fragment's answer.
+/// [`evaluate_with`], over **every live run of a region at once**.
 ///
-/// The one subtlety is the empty grouping: a fragment with no `GROUP BY` has exactly one group
-/// whether or not any row matched, because `SELECT count(*) FROM t WHERE false` answers 0 rather
-/// than answering nothing. A fragment that *does* group produces no group at all in that case,
-/// which is also PostgreSQL.
-fn finish(
+/// # Why this exists, and why per-run evaluation is wrong
+///
+/// MVCC visibility is a property of the **region**, not of a file. Resolving it per run answers
+/// "the newest version of this key *in this run*", which is not the newest version — and the two
+/// differ exactly when a key's history spans runs, which is the normal case for anything that has
+/// been written to more than once.
+///
+/// Caught by the store's differential rather than reasoned out in advance: a key whose tombstone
+/// landed in a later run kept returning its older, live-looking row, because the run holding the
+/// tombstone resolves that key to *nothing* and so has nothing to say about it. There is no way to
+/// repair that by combining per-run answers afterwards — for `Rows` you would have to carry each
+/// candidate's timestamp and take the maximum, and **for aggregates it is impossible in
+/// principle**, because a run cannot know its candidate was overruled by another run's.
+///
+/// So the runs are merged into one stream first. Each is already sorted `(key, commit_ts DESC)`,
+/// so a k-way merge is globally sorted and the resolver works over it unchanged — the same thing
+/// an LSM read does across its levels, for the same reason.
+///
+/// # The cost, stated rather than hidden
+///
+/// The merged path materialises each row as owned [`Value`]s, where the single-run path borrows
+/// straight out of the decoded chunk. One run keeps the fast path; several pay for the merge. That
+/// is measured in the phase's bench rather than asserted here.
+pub fn evaluate_merged(
+    readers: &[Reader],
     fragment: &Fragment,
-    rows: Vec<Vec<Value>>,
-    mut groups: BTreeMap<GroupKey, Vec<Accumulator>>,
-    slots: &[ColumnType],
-) -> FragmentOutput {
-    let Output::Aggregates {
-        group_by,
-        aggregates,
-    } = &fragment.output
-    else {
-        return FragmentOutput::Rows(rows);
-    };
-
-    if group_by.is_empty() && groups.is_empty() {
-        groups.insert(
-            GroupKey::new(Vec::new()),
-            aggregates
-                .iter()
-                .map(|aggregate| Accumulator::new(*aggregate, slots))
-                .collect(),
-        );
+    options: &ScanOptions,
+) -> Result<FragmentResult> {
+    match readers {
+        [] => Err(Error::InvalidArgument("a region with no runs".into())),
+        [only] => evaluate_with(only, fragment, options),
+        _ => merged::evaluate(readers, fragment, options),
     }
-    FragmentOutput::Groups(
-        groups
-            .into_iter()
-            .map(|(key, accumulators)| Group {
-                key: key.into_values(),
-                aggregates: accumulators.iter().map(Accumulator::finish).collect(),
-            })
-            .collect(),
-    )
 }
 
-/// Decodes the chunks this fragment names, and only those.
-///
-/// A slot nobody reads comes back `None`, and reading one would yield NULL — which the
-/// differential harness catches at once, because its reference decodes every column and compares.
-/// That is what lets this be an optimisation rather than something to prove separately.
-fn decode_needed(
-    reader: &Reader,
-    stripe: usize,
-    fragment: &Fragment,
-    needed: &[bool],
-) -> Result<Vec<Option<Column>>> {
-    needed
-        .iter()
-        .zip(&fragment.projection)
-        .map(|(wanted, column)| {
-            if *wanted {
-                reader.read_column(stripe, *column as usize).map(Some)
-            } else {
-                Ok(None)
-            }
-        })
-        .collect()
-}
-
-/// Which projection slots something in the fragment actually names.
 /// Advances the version cursors one row and says whether that row is the visible one.
 ///
 /// Split out of [`evaluate_with`] to keep it readable, and because "is this row visible" is a
@@ -348,6 +389,30 @@ fn next_is_visible(
     };
     let deleted = matches!(seen.get(keys + 1), Some(ValueRef::Bool(true)));
     resolver.visible(&seen[..keys], commit_ts, deleted, visibility.ts)
+}
+
+/// Decodes the chunks this fragment names, and only those.
+///
+/// A slot nobody reads comes back `None`, and reading one would yield NULL — which the
+/// differential harness catches at once, because its reference decodes every column and compares.
+/// That is what lets this be an optimisation rather than something to prove separately.
+fn decode_needed(
+    reader: &Reader,
+    stripe: usize,
+    fragment: &Fragment,
+    needed: &[bool],
+) -> Result<Vec<Option<Column>>> {
+    needed
+        .iter()
+        .zip(&fragment.projection)
+        .map(|(wanted, column)| {
+            if *wanted {
+                reader.read_column(stripe, *column as usize).map(Some)
+            } else {
+                Ok(None)
+            }
+        })
+        .collect()
 }
 
 fn needed_slots(fragment: &Fragment, width: usize) -> Vec<bool> {

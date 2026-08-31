@@ -24,7 +24,8 @@
 //! Phase 2 taught the row engine that a file is obsolete only if no live version names it **and it
 //! is not a pending output** — the second half being the one that costs data, because a sweep that
 //! runs between a merge allocating its number and the manifest naming it would delete the file out
-//! from under the merge. That is why [`RunSet::pending`] exists and why the sweep consults it.
+//! from under the merge. That is why [`RunSet`] tracks the numbers a merge has reserved, and why
+//! the sweep consults them.
 //!
 //! At **open** there is no such window: nothing is in flight, so an unnamed run is a merge that did
 //! not commit and deleting it is right.
