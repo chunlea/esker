@@ -177,30 +177,37 @@ bound and is written absent. Both cases set their truncation flag.
 ```text
 crates/esker-columnar/
   Cargo.toml
-  src/lib.rs          crate docs, the frozen constants, re-exports
-      error.rs        Error / Result: Corruption, Unsealed, Io, InvalidArgument, Unsupported
+  src/lib.rs          crate docs, the frozen constants and limits, re-exports
+      error.rs        Error / Result: Io, Corruption, Unsealed, InvalidArgument
+      cursor.rs       the bounds-checked reader every decode path goes through
       value.rs        ColumnType, Value, ValueRef, ColumnDef, Schema
-      format.rs       Trailer, Footer, StripeMeta, ChunkMeta — encode and decode
+      footer.rs       Trailer, Footer, StripeMeta, ChunkMeta — encode and decode
       frame.rs        chunk framing: LZ4 + codec byte + CRC32C
-      column.rs       Column, ColumnData, NullMask, the row-order iterator
-      stats.rs        ColumnStats, the accumulators, bound truncation
-      encode/mod.rs   Encoding tag, encode_column / decode_column dispatch
-      encode/bitpack.rs   the bit-width packer
+      column.rs       Column, ColumnData, NullMask, ColumnBuilder, the row-order iterator
+      stats.rs        ColumnStats, the accumulator, bound truncation
+      encode/mod.rs   Encoding tag, encode_column / decode_column
+      encode/bitpack.rs   the bit-width packer, and frame-of-reference over u64
       encode/boolean.rs   bitpacked / RLE, and the null mask
       encode/integer.rs   frame-of-reference / delta
       encode/bytes.rs     plain / dictionary
       encode/double.rs    plain
-      writer.rs       StripeWriter: append_row, seal_stripe, finish
-      reader.rs       Reader: open, schema, stripes, read_column
+      writer.rs       Writer: append_row, seal_stripe, finish
+      reader.rs       Reader: open, schema, stripes, read_column, read_stripe
+  tests/corpus.rs     the deterministic ledger batch the fixtures are built from
   tests/golden/*.col  frozen files, byte for byte
-  tests/golden.rs     rebuild-and-compare, plus read-the-committed-file
-  tests/crash.rs      every truncation point, and every single-byte flip
-  tests/fuzz_decode.rs arbitrary bytes into every decode entry point
-  tests/roundtrip.rs  writer → reader over generated batches
+  tests/golden.rs     rebuild-and-compare, read-the-committed-file, flip-every-byte
+  tests/crash.rs      every truncation point, of a finished file and of a temporary
+  tests/fuzz_decode.rs arbitrary bytes, and mutations of a valid file
+  tests/roundtrip.rs  writer → reader over generated schemas and batches
+  tests/statistics.rs the footer's claims, checked against the chunks
+  tests/compression.rs the measurement, with floors as a regression guard
 ```
 
 Files stay under ~800 lines; `encode/` is split by type for that reason and because a per-type
-proptest belongs next to the type it exercises.
+proptest belongs next to the type it exercises. Two departures from the sketch above as first
+drafted: the layout module is `footer.rs` rather than `format.rs` (the frozen constants live in
+`lib.rs::format`, matching `esker_engine::format`), and `cursor.rs` was added — see
+[what changed](#what-changed-while-building).
 
 ## Tests
 
