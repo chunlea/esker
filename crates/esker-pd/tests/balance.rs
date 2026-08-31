@@ -48,6 +48,7 @@ use std::sync::Arc;
 
 use esker_engine::memfs::MemFileSystem;
 use esker_pd::clock::TestClock;
+use esker_pd::pd::MAX_BALANCE_OPERATORS;
 use esker_pd::{Clock, Pd, PdOptions, RegionBeat, StoreBeat, StoreStats};
 use esker_proto::{Epoch, Operator, Peer, Region};
 
@@ -104,6 +105,36 @@ impl Model {
         Self {
             shards,
             stores: (1..=u64::try_from(layout.len()).unwrap()).collect(),
+        }
+    }
+
+    /// `regions` regions already grown to three replicas: one on store 1, two spread evenly
+    /// over the rest — a cluster that has finished scaling *out* and not yet scaled *across*.
+    ///
+    /// The state the phase-4 retest was in when it emptied its bootstrap store, built directly
+    /// rather than played up to.
+    fn grown(regions: u64, stores: u64) -> Self {
+        let mut shards = BTreeMap::new();
+        for id in 1..=regions {
+            let others = stores - 1;
+            let first = 2 + (id - 1) % others;
+            let second = 2 + id % others;
+            let peers: Vec<Peer> = [1, first, second]
+                .into_iter()
+                .map(|store_id| Peer::voter(store_id, id * 100 + store_id))
+                .collect();
+            shards.insert(
+                id,
+                Shard {
+                    leader_peer_id: id * 100 + 1,
+                    peers,
+                    epoch: Epoch::INITIAL,
+                },
+            );
+        }
+        Self {
+            shards,
+            stores: (1..=stores).collect(),
         }
     }
 
@@ -212,18 +243,43 @@ struct Harness {
     pd: Arc<Pd>,
     model: Model,
     operators: usize,
+    /// How far the clock moves per round.
+    tick_ms: u64,
+    /// Rounds between store reports. `1` is a store whose numbers are never stale.
+    store_report_every: usize,
+    rounds: usize,
 }
 
 impl Harness {
     fn start(model: Model, target_replicas: usize) -> Self {
+        Self::start_with(
+            model,
+            PdOptions {
+                target_replicas,
+                ..PdOptions::new()
+            },
+            60_000,
+            1,
+        )
+    }
+
+    /// The same, with the two things a real cluster has that the default harness does not: a
+    /// clock that moves in region-heartbeat intervals, and store reports that arrive less often
+    /// than decisions are made.
+    fn start_with(
+        model: Model,
+        options: PdOptions,
+        tick_ms: u64,
+        store_report_every: usize,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let clock = Arc::new(TestClock::new(1_700_000_000_000));
         let pd = Pd::open(
             dir.path(),
             PdOptions {
-                target_replicas,
+                clock: Arc::clone(&clock) as Arc<dyn Clock>,
                 filesystem: Some(Arc::new(MemFileSystem::new())),
-                ..PdOptions::with_clock(Arc::clone(&clock) as Arc<dyn Clock>)
+                ..options
             },
         )
         .unwrap();
@@ -237,29 +293,36 @@ impl Harness {
             pd,
             model,
             operators: 0,
+            tick_ms,
+            store_report_every,
+            rounds: 0,
         }
     }
 
-    /// One round: every store reports, then every region's leader does, and every operator PD
-    /// answers with is applied. Returns how many operators this round produced.
+    /// One round: the stores report if this is a round they report on, then every region's leader
+    /// does, and every operator PD answers with is applied. Returns how many operators this round
+    /// produced.
     fn round(&mut self) -> usize {
         // A round is a region-heartbeat interval (`docs/DESIGN.md` §14), so a region's balance
         // cooldown expires after a few of them rather than never.
-        self.clock.advance(60_000);
-        for store_id in &self.model.stores {
-            self.pd
-                .store_heartbeat(&StoreBeat {
-                    store_id: *store_id,
-                    stats: StoreStats {
-                        region_count: self.model.regions_on(*store_id),
-                        leader_count: self.model.leaders_on(*store_id),
-                        capacity: 1 << 40,
-                        available: 1 << 39,
-                        applied_bytes: 0,
-                    },
-                })
-                .unwrap();
+        self.clock.advance(self.tick_ms);
+        if self.rounds % self.store_report_every == 0 {
+            for store_id in &self.model.stores {
+                self.pd
+                    .store_heartbeat(&StoreBeat {
+                        store_id: *store_id,
+                        stats: StoreStats {
+                            region_count: self.model.regions_on(*store_id),
+                            leader_count: self.model.leaders_on(*store_id),
+                            capacity: 1 << 40,
+                            available: 1 << 39,
+                            applied_bytes: 0,
+                        },
+                    })
+                    .unwrap();
+            }
         }
+        self.rounds += 1;
 
         let ids: Vec<u64> = self.model.shards.keys().copied().collect();
         let mut issued = 0;
@@ -446,6 +509,9 @@ fn no_more_moves_are_started_than_the_cap_allows() {
         pd,
         model,
         operators: 0,
+        tick_ms: 60_000,
+        store_report_every: 1,
+        rounds: 0,
     };
 
     // One round of heartbeats with nothing applied: every region asks, and only the cap's
@@ -487,6 +553,149 @@ fn no_more_moves_are_started_than_the_cap_allows() {
     harness.settle(400);
     assert!(region_spread(&harness.model) <= 1);
     assert_eq!(harness.replicas(), 100);
+}
+
+/// The phase-4 retest's sweep, distilled to the condition that caused it: **one store report,
+/// many decisions**.
+///
+/// Sixteen regions at three replicas over five stores. The bootstrap store holds all sixteen and
+/// the four that joined hold eight each — and then PD is asked about every region, over and over,
+/// without a single store reporting again. That is not an artificial cruelty: stores report every
+/// two seconds and PD answered thirty-two operators in four and a half of them, so most of that
+/// run's decisions were taken against numbers that had already stopped being true.
+///
+/// What the retest measured is what a balancer does in that state with nothing to stop it — it
+/// takes **every one** of the busy store's replicas, because each region reads the same unchanged
+/// count and each concludes, correctly on its own terms, that it is the one to leave:
+///
+/// ```text
+/// stores-with-a-replica=5 min=3  max=16 gap=13
+/// stores-with-a-replica=4 min=12 max=12 gap=0     <- store 1 holds nothing at all
+/// ```
+///
+/// The spread threshold cannot see it. Every move in that sequence strictly reduced the spread,
+/// which is all the threshold promises; sixteen of them in a row still emptied a store. It is a
+/// sweep and not an oscillation, and hysteresis is no defence against a sweep.
+///
+/// The per-region **cooldown is off** here and the in-flight **cap is left on**, because they do
+/// different jobs and only one of them is a defence. The cooldown merely slows a sweep down — and
+/// slowing it down is why the ordinary soak above never found this, since a slow sweep against a
+/// report that refreshes in between self-corrects. The cap is the real bound on a burst: it is
+/// how many decisions can be taken before the first of them shows up in the numbers, which is
+/// exactly the "in-flight allowance" a store may dip below its share by.
+///
+/// Mutation check: dropping `State::settling` — the correction a retired operator leaves behind
+/// — turns this red at round 9 with the store at 4 and falling.
+#[test]
+fn a_sweep_against_one_frozen_store_report_stops_at_the_fair_share() {
+    let mut harness = Harness::start_with(
+        Model::grown(16, 5),
+        PdOptions {
+            target_replicas: 3,
+            balance_cooldown_ms: 0,
+            ..PdOptions::new()
+        },
+        1_000,
+        // Report once, at the start, and never again: every decision below is taken against
+        // that one set of numbers.
+        usize::MAX,
+    );
+    assert_eq!(harness.model.region_counts(), vec![16, 8, 8, 8, 8]);
+
+    // Forty-eight replicas over five stores: nine each, and the store that starts with sixteen
+    // has seven to give.
+    let share = (16 * 3) / 5;
+    // The allowance: decisions taken before the first of them can appear in any store's report.
+    let allowance = u64::try_from(MAX_BALANCE_OPERATORS).unwrap();
+    for round in 1..=50 {
+        harness.round();
+        let counts = harness.model.region_counts();
+        assert!(
+            counts[0] + allowance >= share,
+            "round {round}: the store PD is unloading is at {} of a fair share of {share}, \
+             which is more than the in-flight allowance of {allowance} below it; counts \
+             {counts:?}",
+            counts[0],
+        );
+        // Every region is at three replicas or, mid-move, at four. Anything else is a replica
+        // conjured or lost, which no sequence of balance operators may do.
+        let half_done = harness
+            .model
+            .shards
+            .values()
+            .filter(|shard| shard.peers.len() > 3)
+            .count();
+        assert_eq!(
+            counts.iter().sum::<u64>(),
+            48 + u64::try_from(half_done).unwrap(),
+            "round {round}: replicas appeared or vanished; counts {counts:?}",
+        );
+    }
+    let counts = harness.model.region_counts();
+    assert!(
+        region_spread(&harness.model) <= 1,
+        "the sweep stopped, but not at a balanced cluster: {counts:?}"
+    );
+    println!(
+        "one frozen report, fifty rounds: {counts:?}, {} operators",
+        harness.operators
+    );
+}
+
+/// The same fault from the other side, and the acceptance run's own words for it: *"peers landed
+/// on 4 of the 5 stores; store 4 received nothing in this run's window"*
+/// (`docs/bench/phase-4.md`, Run 2). A store that joins a cluster and is given nothing is the
+/// same defect as a store that is emptied — a live store holding no replica of anything while
+/// the others hold many — and it is the one an operator notices, because the capacity they paid
+/// for does no work.
+///
+/// Twelve regions at three replicas already spread over four stores, and a fifth joins. Thirty-six
+/// replicas over five stores is seven or eight each; nothing is an answer this must not reach.
+#[test]
+fn a_store_that_joins_receives_its_share_rather_than_nothing() {
+    let mut model = Model::grown(12, 4);
+    model.stores.push(5);
+    let mut harness = Harness::start_with(
+        model,
+        PdOptions {
+            target_replicas: 3,
+            ..PdOptions::new()
+        },
+        1_000,
+        // The retest's ratio: stores report every two seconds, regions every one.
+        2,
+    );
+    assert_eq!(
+        harness.model.region_counts(),
+        vec![12, 8, 8, 8, 0],
+        "the newcomer starts with nothing, which is the only round it is allowed to"
+    );
+
+    let mut quiet = 0;
+    for _ in 1..=2_000 {
+        if harness.round() == 0 {
+            quiet += 1;
+            if quiet >= QUIET_RUN {
+                break;
+            }
+        } else {
+            quiet = 0;
+        }
+    }
+    assert!(quiet >= QUIET_RUN, "never settled");
+
+    let counts = harness.model.region_counts();
+    assert_eq!(
+        harness.replicas(),
+        36,
+        "settled with moves half done: {counts:?}"
+    );
+    assert!(
+        counts.iter().all(|count| *count > 0),
+        "a live store received nothing: {counts:?}"
+    );
+    assert!(region_spread(&harness.model) <= 1, "settled at {counts:?}");
+    println!("a fifth store joined and the cluster became {counts:?}");
 }
 
 /// A cluster that is already balanced is not touched at all — the property every "and then

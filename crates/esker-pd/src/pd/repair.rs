@@ -18,7 +18,7 @@ use super::{Pd, State, persist_alloc};
 use crate::balance::{self, Balance};
 use crate::error::Result;
 use crate::operator::{InFlight, Observed};
-use crate::record::{EventKind, EventOutcome, OperatorEvent, RegionRecord};
+use crate::record::{EventKind, EventOutcome, OperatorEvent, RegionRecord, StoreRecord};
 use crate::routing;
 use crate::schedule::{self, Cluster, LoadDelta, Repair};
 
@@ -85,8 +85,16 @@ impl Pd {
 
         let stores = routing::stores(&self.db)?;
         // Every operator still in flight has already committed to moving load; the rules see
-        // the cluster as it will be, not as its last round of heartbeats described it.
-        let pending: Vec<LoadDelta> = state.in_flight.values().map(|flight| flight.load).collect();
+        // the cluster as it will be, not as its last round of heartbeats described it. And an
+        // operator that has just *finished* is corrected for too, until the stores it moved have
+        // reported since — see `State::settling`, and `settled` below for the rule.
+        self.retire_settled(state, &stores, now_ms);
+        let pending: Vec<LoadDelta> = state
+            .in_flight
+            .values()
+            .map(|flight| flight.load)
+            .chain(state.settling.iter().map(|(load, _)| *load))
+            .collect();
         let cluster = Cluster {
             stores: &stores,
             pending: &pending,
@@ -151,7 +159,16 @@ impl Pd {
         let event = event_of(&flight.operator, outcome, now_ms);
         // Every outcome but `Pending` finishes the operator. Dropping it here is what lets the
         // rules issue a replacement on this same heartbeat rather than the next.
-        state.in_flight.remove(&region_id);
+        //
+        // Its *load* is not dropped with it. `Done` means the stores have moved the replica and
+        // will say so in their own time; until they do, forgetting the move would show the
+        // rules a cluster that has not moved at all. `Cancelled` and `TimedOut` mean nothing
+        // happened — but PD cannot tell which of the two ends actually did, and holding a
+        // correction that turns out to be unnecessary costs one deferred move, while dropping
+        // one that was necessary costs a sweep.
+        if let Some(flight) = state.in_flight.remove(&region_id) {
+            state.settling.push((flight.load, now_ms));
+        }
         // A region that has just been moved is not moved again for balance until it has
         // settled. Repair is not subject to this — see `BALANCE_COOLDOWN_MS`.
         state
@@ -291,6 +308,32 @@ impl Pd {
             .in_flight
             .insert(region_id, InFlight::new(operator.clone(), now_ms, load));
         Ok(operator)
+    }
+
+    /// Drops the corrections whose stores have caught up, and the ones too old to mean anything.
+    ///
+    /// "Caught up" is per store and on PD's clock: a delta is held until **every** store it
+    /// names has sent a report stamped after the operator retired, because a delta corrects both
+    /// ends of a move and half a correction is worse than none. A store PD has no record of is
+    /// treated as caught up — there is nothing to correct.
+    fn retire_settled(&self, state: &mut State, stores: &[StoreRecord], now_ms: u64) {
+        let reported_since = |store_id: Option<u64>, retired_ms: u64| {
+            let Some(store_id) = store_id else {
+                return true;
+            };
+            stores
+                .iter()
+                .find(|store| store.store_id == store_id)
+                .is_none_or(|store| store.last_heartbeat_ms >= retired_ms)
+        };
+        let too_old = now_ms.saturating_sub(self.max_store_down_time_ms);
+        state.settling.retain(|(load, retired_ms)| {
+            *retired_ms > too_old
+                && !(reported_since(load.region_to, *retired_ms)
+                    && reported_since(load.region_from, *retired_ms)
+                    && reported_since(load.leader_to, *retired_ms)
+                    && reported_since(load.leader_from, *retired_ms))
+        });
     }
 
     /// One cluster-unique peer id, persisted before it is handed out ([`crate::alloc`]).
@@ -631,6 +674,208 @@ mod tests {
             }
             other => panic!("expected two AddPeers, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------------------------
+    // The phase-4 retest's repair, replayed
+    // ------------------------------------------------------------------------------------
+
+    /// Region 12 of the retest, from the state repair inherited, driven to the end.
+    ///
+    /// The trace: store 3 is killed and PD asks for a replacement on store 1; the store adds it
+    /// as a learner and does not promote it; thirty seconds later the operator times out, PD
+    /// re-derives — and **removed the dead voter anyway**, because [`crate::schedule::repair_for`]
+    /// counted the learner as a live replica. The region spent the rest of the run at two voters
+    /// with a learner beside them, and the acceptance poll gave up at 164 s having repaired
+    /// nothing:
+    ///
+    /// ```text
+    /// AddLearner node=31   (store 1)
+    /// ...30 s, the learner is never promoted...
+    /// Remove     node=15   (store 3, the dead voter)   <- two voters left
+    /// ```
+    ///
+    /// What it has to be instead is two operators and no more: add the replacement, and remove
+    /// the dead peer once — and only once — the replacement can vote.
+    ///
+    /// Mutation check: counting the learner as a replica again (`live_voters` back to
+    /// `live_replicas` in `repair_for`) puts the `RemovePeer` back at the timeout and turns the
+    /// sequence assertion red.
+    #[test]
+    fn a_repair_is_two_operators_and_never_drops_the_dead_voter_onto_a_learner() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(TestClock::new(1_700_000_000_000));
+        let pd = Pd::open(
+            dir.path(),
+            PdOptions {
+                // The retest's setting, and the point of the test: the operator does not
+                // outlive it, so PD re-derives with the learner still a learner.
+                operator_timeout_ms: 30_000,
+                ..PdOptions::with_clock(Arc::clone(&clock) as Arc<dyn crate::Clock>)
+            },
+        )
+        .unwrap();
+        cluster_of_four(&pd);
+
+        // The region as repair found it: peers 13 and 27 alive on stores 2 and 4, peer 15 on
+        // store 3, which has just been killed. Store 1 is the only live store with no peer of
+        // it, so it is where the replacement has to go.
+        let region = |peers: Vec<Peer>, conf_ver: u64| Region {
+            id: 12,
+            start_key: bytes::Bytes::new(),
+            end_key: bytes::Bytes::new(),
+            peers,
+            epoch: Epoch::new(conf_ver, 4),
+        };
+        let dying = vec![Peer::voter(2, 13), Peer::voter(3, 15), Peer::voter(4, 27)];
+
+        clock.advance(MAX_STORE_DOWN_TIME_MS + 1);
+        for store_id in [1, 2, 4] {
+            alive(&pd, store_id, 5);
+        }
+
+        let mut issued = Vec::new();
+        let ask = |pd: &Pd, peers: Vec<Peer>, conf_ver: u64| {
+            pd.region_heartbeat(&beat(region(peers, conf_ver), 13, 4))
+                .unwrap()
+                .operator
+        };
+
+        // 1. The replacement, on the one live store that has no peer of this region.
+        let first = ask(&pd, dying.clone(), 5).expect("a repair");
+        issued.push(first.clone());
+        let Operator::AddPeer {
+            store_id, peer_id, ..
+        } = first
+        else {
+            panic!("expected an AddPeer, got {first:?}");
+        };
+        assert_eq!(store_id, 1, "the only live store without a peer");
+
+        // 2. The store adds it as a learner. PD has been shown progress and waits.
+        let catching_up = || {
+            let mut peers = dying.clone();
+            peers.push(Peer {
+                store_id: 1,
+                peer_id,
+                role: esker_proto::PeerRole::Learner,
+            });
+            peers
+        };
+        assert_eq!(ask(&pd, catching_up(), 6), None, "the store has the work");
+
+        // 3. Thirty seconds later nothing has promoted it and the operator is abandoned. This
+        //    is the heartbeat the retest failed on: the region is four peers, one of them dead,
+        //    and it still has only two votes.
+        clock.advance(30_001);
+        for store_id in [1, 2, 4] {
+            alive(&pd, store_id, 5);
+        }
+        if let Some(operator) = ask(&pd, catching_up(), 6) {
+            issued.push(operator);
+        }
+
+        // 4. The learner is promoted at last. Now the region can afford to lose the dead voter.
+        let promoted = || {
+            let mut peers = dying.clone();
+            peers.push(Peer::voter(1, peer_id));
+            peers
+        };
+        let second = ask(&pd, promoted(), 7).expect("the dead peer may go now");
+        issued.push(second);
+
+        // 5. And once it is gone, nothing more.
+        let repaired = vec![
+            Peer::voter(2, 13),
+            Peer::voter(4, 27),
+            Peer::voter(1, peer_id),
+        ];
+        assert_eq!(ask(&pd, repaired, 8), None, "the repair is finished");
+
+        assert_eq!(
+            issued,
+            vec![
+                Operator::AddPeer {
+                    region_id: 12,
+                    epoch: Epoch::new(5, 4),
+                    store_id: 1,
+                    peer_id,
+                },
+                Operator::RemovePeer {
+                    region_id: 12,
+                    epoch: Epoch::new(7, 4),
+                    peer_id: 15,
+                },
+            ],
+            "a repair is add-then-remove-the-dead-peer and nothing else",
+        );
+        assert!(pd.in_flight().unwrap().is_empty());
+    }
+
+    /// The other half of the retest's churn, at the rule that caused it: while a region is
+    /// mid-repair, balance must not shed anything. In the trace it shed the *healthy* replica on
+    /// store 1 — `Remove node=14` — and repair then had to add one back on store 1 four seconds
+    /// later, which is two of the five membership changes a two-change repair spent.
+    ///
+    /// Mutation check: dropping the `mid_repair` guard from `region_balance` makes this a
+    /// `RemovePeer` for peer 14.
+    #[test]
+    fn balance_sheds_nothing_from_a_region_that_is_mid_repair() {
+        let (_dir, clock, pd) = open();
+        cluster_of_four(&pd);
+        clock.advance(MAX_STORE_DOWN_TIME_MS + 1);
+        // Stores 1 and 2 tie for busiest, which is how store 1 came to be chosen: the tie
+        // breaks to the lowest id. Store 4 has just joined and is empty.
+        alive(&pd, 1, 6);
+        alive(&pd, 2, 6);
+        alive(&pd, 4, 0);
+
+        // Region 12 exactly as the trace has it: the replacement on store 4 has landed as a
+        // learner and the dead peer is still there, so the region is four peers with only two
+        // votes. Repair has nothing to ask for until the learner is promoted — which is what
+        // leaves balance holding the decision.
+        let region = |peers: Vec<Peer>, conf_ver: u64| Region {
+            id: 12,
+            start_key: bytes::Bytes::new(),
+            end_key: bytes::Bytes::new(),
+            peers,
+            epoch: Epoch::new(conf_ver, 4),
+        };
+        let catching_up = vec![
+            Peer::voter(2, 13),
+            Peer::voter(1, 14),
+            Peer::voter(3, 15),
+            Peer {
+                store_id: 4,
+                peer_id: 27,
+                role: esker_proto::PeerRole::Learner,
+            },
+        ];
+        assert_eq!(
+            pd.region_heartbeat(&beat(region(catching_up, 6), 13, 4))
+                .unwrap()
+                .operator,
+            None,
+            "balance shed peer 14, the healthy replica on store 1, from a region mid-repair",
+        );
+
+        // And once the replacement can vote, the peer that goes is the dead one.
+        let promoted = vec![
+            Peer::voter(2, 13),
+            Peer::voter(1, 14),
+            Peer::voter(3, 15),
+            Peer::voter(4, 27),
+        ];
+        assert_eq!(
+            pd.region_heartbeat(&beat(region(promoted, 7), 13, 4))
+                .unwrap()
+                .operator,
+            Some(Operator::RemovePeer {
+                region_id: 12,
+                epoch: Epoch::new(7, 4),
+                peer_id: 15,
+            }),
+        );
     }
 
     /// 4d's operator is on the wire and nothing in 4c issues one. If this ever fails, leader

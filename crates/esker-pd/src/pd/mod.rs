@@ -50,7 +50,7 @@ use crate::record::{
     AllocRecord, ClusterRecord, HistoryRecord, OperatorEvent, RegionRecord, StoreRecord, TsoRecord,
 };
 use crate::routing::{self, RegionBeat, StoreBeat, Upsert};
-use crate::schedule;
+use crate::schedule::{self, LoadDelta};
 use crate::tso::Oracle;
 
 mod repair;
@@ -251,6 +251,26 @@ pub(crate) struct State {
     /// move that would otherwise have waited. Entries older than now are pruned as they are
     /// passed, so this does not grow with the number of regions ever balanced.
     pub(crate) cooling: BTreeMap<u64, u64>,
+    /// The load of operators that have **finished**, still corrected for because the stores
+    /// they moved have not said so themselves yet.
+    ///
+    /// [`crate::schedule::LoadDelta`] exists because a store's own counts are a heartbeat
+    /// behind, and it corrects them for every operator in flight. The correction has to outlive
+    /// the operator, and this is the piece that was missing: a store reports every
+    /// `store_heartbeat` interval while PD issues operators between two of them, so a move that
+    /// landed a moment ago is in neither the in-flight set nor the report — and every region
+    /// that heartbeats before the report arrives reads the busy store at its full, unmoved
+    /// count and decides, one region at a time, that it should be the next to leave.
+    ///
+    /// That is a **sweep** rather than an oscillation, which is why the spread threshold cannot
+    /// see it: each move on its own strictly reduces the spread, and sixteen of them in a row
+    /// still empty a store (`docs/adr/0023-a-retired-operators-load-outlives-it.md`).
+    ///
+    /// Memory, and bounded twice over: an entry is dropped as soon as every store it names has
+    /// reported since the operator retired, and unconditionally once it is older than
+    /// `max_store_down_time` — past which a store that has not reported is down and its counts
+    /// mean nothing anyway.
+    pub(crate) settling: Vec<(LoadDelta, u64)>,
 }
 
 impl Pd {
@@ -302,6 +322,7 @@ impl Pd {
                 oracle,
                 in_flight: BTreeMap::new(),
                 cooling: BTreeMap::new(),
+                settling: Vec::new(),
                 history,
             }),
         }))
