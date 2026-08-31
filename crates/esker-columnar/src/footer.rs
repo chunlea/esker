@@ -429,7 +429,7 @@ mod tests {
             // trailer_crc32c: u32 LE over the sixteen bytes above
             0x7b, 0xdd, 0x82, 0x61,
             // format_version: u32 LE
-            0x01, 0x00, 0x00, 0x00,
+            0x02, 0x00, 0x00, 0x00,
             // magic
             b'E', b'S', b'K', b'E', b'R', b'C', b'O', b'L',
         ];
@@ -437,6 +437,8 @@ mod tests {
             bytes, expected,
             "the trailer layout changed; it is fixed forever (ADR + version bump)"
         );
+        // The only byte that has ever moved here is the version itself, which is what a version
+        // bump is supposed to look like: everything around it stayed where it was.
         assert_eq!(Trailer::decode(&bytes).unwrap(), trailer);
         assert!(Trailer::sealed(&bytes));
     }
@@ -480,12 +482,22 @@ mod tests {
 
         // A future format version says so instead of guessing.
         let mut bytes = Trailer::new(1, b"footer").encode();
-        bytes[20] = 2;
+        bytes[20] = 3;
         assert!(
             Trailer::decode(&bytes)
                 .unwrap_err()
                 .to_string()
-                .contains("format version 2")
+                .contains("format version 3")
+        );
+
+        // And so does version 1, which bound a chunk's checksum to nothing but its own bytes.
+        let mut bytes = Trailer::new(1, b"footer").encode();
+        bytes[20] = 1;
+        assert!(
+            Trailer::decode(&bytes)
+                .unwrap_err()
+                .to_string()
+                .contains("format version 1")
         );
 
         // A footer length nothing could hold.
@@ -503,7 +515,7 @@ mod tests {
     fn the_magic_is_frozen() {
         assert_eq!(COLUMNAR_MAGIC, *b"ESKERCOL");
         assert_eq!(COLUMNAR_TRAILER_SIZE, 32);
-        assert_eq!(COLUMNAR_FORMAT_VERSION, 1);
+        assert_eq!(COLUMNAR_FORMAT_VERSION, 2);
     }
 
     #[test]

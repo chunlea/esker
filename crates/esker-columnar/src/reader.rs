@@ -202,7 +202,7 @@ impl Reader {
         self.columns_decoded.fetch_add(1, Ordering::Relaxed);
         self.bytes_read.fetch_add(chunk.len, Ordering::Relaxed);
         let context = format!("{} stripe {stripe} column {column}", self.path.display());
-        let payload = decode_chunk(&raw, &context)?;
+        let payload = decode_chunk(&raw, chunk.offset, &context)?;
         decode_column(ty, meta.rows, chunk.encoding, &payload)
     }
 

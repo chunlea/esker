@@ -51,6 +51,11 @@ use esker_engine::fs::FileSystem;
 use esker_engine::memfs::MemFileSystem;
 use proptest::prelude::*;
 
+#[path = "compare.rs"]
+mod compare;
+
+use compare::same_output;
+
 /// Seed of the generated campaign. Printed on failure so a case reproduces.
 const SEED: u64 = 0xD1FF_2026;
 
@@ -310,59 +315,6 @@ fn reference(rows: &[Vec<Value>], fragment: &Fragment) -> Result<FragmentOutput>
 // ---------------------------------------------------------------------------------------------
 // Comparison
 // ---------------------------------------------------------------------------------------------
-
-/// Whether two values are the same, comparing floating point **by bits** so that a `NaN` really
-/// is compared and a signed zero cannot slip through.
-fn same_value(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::Double(a), Value::Double(b)) => a.to_bits() == b.to_bits(),
-        (a, b) => a == b,
-    }
-}
-
-fn same_partial(left: &Partial, right: &Partial) -> bool {
-    match (left, right) {
-        (Partial::Count(a), Partial::Count(b)) => a == b,
-        (Partial::Sum(a), Partial::Sum(b))
-        | (Partial::Min(a), Partial::Min(b))
-        | (Partial::Max(a), Partial::Max(b)) => match (a, b) {
-            (None, None) => true,
-            (Some(a), Some(b)) => same_value(a, b),
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
-fn same_output(left: &FragmentOutput, right: &FragmentOutput) -> bool {
-    match (left, right) {
-        (FragmentOutput::Rows(a), FragmentOutput::Rows(b)) => {
-            a.len() == b.len()
-                && a.iter().zip(b).all(|(left, right)| {
-                    left.len() == right.len()
-                        && left.iter().zip(right).all(|(a, b)| same_value(a, b))
-                })
-        }
-        (FragmentOutput::Groups(a), FragmentOutput::Groups(b)) => {
-            a.len() == b.len()
-                && a.iter().zip(b).all(|(left, right)| {
-                    left.key.len() == right.key.len()
-                        && left
-                            .key
-                            .iter()
-                            .zip(&right.key)
-                            .all(|(a, b)| same_value(a, b))
-                        && left.aggregates.len() == right.aggregates.len()
-                        && left
-                            .aggregates
-                            .iter()
-                            .zip(&right.aggregates)
-                            .all(|(a, b)| same_partial(a, b))
-                })
-        }
-        _ => false,
-    }
-}
 
 /// Runs one fragment both ways, with pruning on and off, and requires all three to agree.
 fn agree(

@@ -13,7 +13,9 @@
 //!
 //! A change to either file is a format change: it needs an ADR and a version bump, never a
 //! re-bless. `ESKER_BLESS=1 cargo test -p esker-columnar --test golden` regenerates them, and
-//! that is for *new* cases only.
+//! that is for *new* cases only — or for a change that really is a format change, which has
+//! happened exactly once: **format version 2** binds each chunk's checksum to its offset, so
+//! every chunk's last four bytes moved (ADR 0027, and the fuzz that found the need for it).
 //!
 //! The LZ4 file also pins `lz4_flex`'s output, so a dependency bump that changes its bytes fails
 //! here. That is deliberate: the compressed form is what is on disk, and finding out that it

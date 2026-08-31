@@ -85,7 +85,11 @@ pub mod format {
     pub const COLUMNAR_TRAILER_SIZE: usize = 32;
 
     /// Version of the layout this build reads and writes.
-    pub const COLUMNAR_FORMAT_VERSION: u32 = 1;
+    ///
+    /// Version 2 binds each chunk's checksum to its offset, so a chunk copied elsewhere in a file
+    /// fails instead of answering with another stripe's rows. Version 1 was never written outside
+    /// this repository's own golden files and is not read.
+    pub const COLUMNAR_FORMAT_VERSION: u32 = 2;
 
     /// Every chunk ends with `codec:u8 ++ crc32c:u32`.
     pub const CHUNK_TRAILER_SIZE: usize = 5;
@@ -132,7 +136,7 @@ mod tests {
     fn the_format_constants_are_frozen() {
         assert_eq!(&COLUMNAR_MAGIC, b"ESKERCOL");
         assert_eq!(COLUMNAR_TRAILER_SIZE, 32);
-        assert_eq!(COLUMNAR_FORMAT_VERSION, 1);
+        assert_eq!(COLUMNAR_FORMAT_VERSION, 2);
         assert!(COLUMNAR_MAGIC.len() < COLUMNAR_TRAILER_SIZE);
     }
 }

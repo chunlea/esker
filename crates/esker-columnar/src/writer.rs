@@ -204,8 +204,8 @@ impl<'a> Writer<'a> {
                     payload.len()
                 )));
             }
-            let framed = encode_chunk(&payload, self.options.compression);
             let offset = self.offset;
+            let framed = encode_chunk(&payload, self.options.compression, offset);
             self.append(&framed)?;
             chunks.push(ChunkMeta {
                 offset,
