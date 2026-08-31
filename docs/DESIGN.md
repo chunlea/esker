@@ -485,7 +485,10 @@ log, PD elects a leader, and clients discover it.
   live ones gets an `AddPeer` onto the emptiest live store that has no peer of that region (lowest store
   id breaks the tie, so the same data always chooses the same place); once the new replica is a voter,
   the dead peer gets a `RemovePeer`. **Add before remove**, always: removing first takes a three-replica
-  region with one dead peer down to one live replica out of two. A region that is merely
+  region with one dead peer down to one live replica out of two. "Back at the target" is counted in
+  **voters**, because a learner is not in the configuration that votes: dropping the dead peer while the
+  replacement is still catching up is the same mistake made one step later, and it is the one the phase-4
+  retest hit once an `AddPeer` had timed out and been re-derived. A region that is merely
   under-replicated is left alone — growing a healthy cluster to its target is balance, not repair.
 - **Operators ride on the heartbeat response.** At most one per region is in flight, and the same one is
   re-sent on every heartbeat until a heartbeat *shows* it happened, it is contradicted, or it stops
@@ -515,6 +518,13 @@ log, PD elects a leader, and clients discover it.
   every later decision uses — which is why at most `max_balance_operators` moves are *started* at once,
   and why neither that cap nor the per-region `balance_cooldown` may pause a move in progress. Repair is
   subject to neither. Balance can be switched off with repair left on.
+- **Balance never touches a region that is mid-repair.** A region can be over its replica target for two
+  reasons — a balance move has landed, or repair has put a replacement beside a peer on a down store —
+  and only the first is balance's to finish. Told apart by the state: a peer on a down store means the
+  second, and then the peer that goes is the dead one and repair alone says when the region can afford
+  to lose it. Without this, balance shed a *healthy* replica from a region under repair and repair had
+  to put one back on the same store, which is two of the five membership changes a two-change repair
+  spent in the retest.
 - **Operator history.** The last 64 operator events — issued, done, cancelled, timed out — are kept in
   one bounded record on disk, so `esker pd inspect` can say what PD asked a cluster to do after the
   process is gone. A debugging record only: no decision reads it, and losing it costs an explanation

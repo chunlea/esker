@@ -139,10 +139,27 @@ pub fn region_balance(region: &RegionRecord, cluster: &Cluster<'_>) -> Option<Ba
     let epoch = region.region.epoch;
     let region_id = region.region.id;
 
+    // A region can be over its replica target for two different reasons, and only one of them
+    // is balance's. Either a move balance started has landed — and the copy on the busiest
+    // store is the one to shed — or **repair** put a replacement beside a peer on a store that
+    // is down, in which case the peer that should go is the dead one and repair is the only
+    // rule entitled to say when the region can afford to lose it.
+    //
+    // Told apart by the state and not by memory: a peer on a down store means the second. The
+    // phase-4 retest is what this is written from — balance, asked about a region mid-repair,
+    // shed the *healthy* replica on the store that happened to tie for busiest, and repair then
+    // had to put one back on that same store. Five membership changes for a repair that needed
+    // two.
+    let mid_repair = region
+        .region
+        .peers
+        .iter()
+        .any(|peer| cluster.is_store_down(peer.store_id));
+
     // The second half first: a region over its replica target is one whose move has landed and
     // needs finishing. Doing this before considering a new move is what stops PD starting a
     // second move while the first is half done.
-    if region.region.peers.len() > cluster.target_replicas {
+    if region.region.peers.len() > cluster.target_replicas && !mid_repair {
         // The replica that goes is the one on the busiest store — that is the whole point of
         // the move, so nothing may override it. Picking any other replica would undo the move
         // that was just made, and the two halves would chase each other for ever.
@@ -184,6 +201,13 @@ pub fn region_balance(region: &RegionRecord, cluster: &Cluster<'_>) -> Option<Ba
             peer_id: heaviest.peer_id,
             from_store: heaviest.store_id,
         });
+    }
+
+    if mid_repair {
+        // Over target or under it, a region with a peer on a down store belongs to repair until
+        // repair is finished with it. Balance moving a replica of it now would be optimising a
+        // region that is a failure away from losing quorum — the module's own first rule.
+        return None;
     }
 
     // The first half: is one of this region's stores meaningfully busier than somewhere this
@@ -535,6 +559,42 @@ mod tests {
                 from_store: 1,
             })
         );
+    }
+
+    /// A region with a peer on a down store belongs to repair, over its target or under it.
+    ///
+    /// Both halves matter. Over target, balance would shed the replica on the busiest *live*
+    /// store while the dead one stayed — the retest's `Remove node=14`, a healthy replica on
+    /// store 1 taken from a region whose store-3 peer was already gone. Under target, balance
+    /// would start a fresh move on a region that is a failure away from losing quorum.
+    #[test]
+    fn a_region_with_a_dead_peer_is_left_to_repair() {
+        let mut stores = [
+            store(1, 6, 0),
+            store(2, 6, 0),
+            store(3, 6, 0),
+            store(4, 0, 0),
+        ];
+        stores[2].last_heartbeat_ms = NOW - DOWN_AFTER - 1;
+        let cluster = cluster(&stores);
+
+        // Over target: the replacement on store 4 has landed, the dead peer is still there.
+        let over = region(&[(2, 13), (1, 14), (3, 15), (4, 27)], 13);
+        assert_eq!(region_balance(&over, &cluster), None);
+
+        // At target, with one of the three on the down store: not a region to optimise.
+        let under = region(&[(2, 13), (1, 14), (3, 15)], 13);
+        assert_eq!(region_balance(&under, &cluster), None);
+
+        // And with store 3 alive it is ordinary balance again, which is what makes the guard a
+        // guard rather than a rule that never fires.
+        let healthy = [
+            store(1, 6, 0),
+            store(2, 6, 0),
+            store(3, 6, 0),
+            store(4, 0, 0),
+        ];
+        assert!(region_balance(&under, &self::cluster(&healthy)).is_some());
     }
 
     /// A balanced cluster asks for nothing — the property that makes "converge and stop" true.

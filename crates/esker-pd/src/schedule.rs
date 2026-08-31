@@ -33,7 +33,7 @@
 
 use std::collections::BTreeSet;
 
-use esker_proto::Epoch;
+use esker_proto::{Epoch, PeerRole};
 
 use crate::record::{RegionRecord, StoreRecord};
 
@@ -250,6 +250,21 @@ impl Cluster<'_> {
 /// back at the target does the dead peer get a `RemovePeer`. Removing first would take a
 /// three-replica region with one dead peer down to one live replica out of two — a single
 /// further failure from losing quorum, and for no gain (`docs/DESIGN.md` §7).
+///
+/// # "Back at the target" is counted in voters
+///
+/// A learner is not in the configuration that votes (`docs/DESIGN.md` §5), so a region with two
+/// live voters and a learner catching up is still a two-voter region: dropping its dead voter
+/// there is the same mistake as removing first, made one step later. The distinction only shows
+/// once the `AddPeer` is no longer in flight — while it is, [`crate::operator::Progress::Started`]
+/// is what keeps PD waiting — so it surfaces exactly when the operator times out or PD restarts,
+/// which is where the phase-4 retest found it: a repair that had already been re-derived once
+/// dropped the dead voter onto a learner and left the region at two voters for the rest of the
+/// run.
+///
+/// Adding is counted in *replicas*, though, and deliberately: a live learner is a replacement
+/// already on its way, and asking for a second one would grow the region by a replica per
+/// operator timeout without bringing the voter it is waiting for any closer.
 #[must_use]
 pub fn repair_for(region: &RegionRecord, cluster: &Cluster<'_>) -> Option<Repair> {
     let dead: Vec<u64> = region
@@ -264,7 +279,15 @@ pub fn repair_for(region: &RegionRecord, cluster: &Cluster<'_>) -> Option<Repair
         return None;
     }
 
-    let live_replicas = region.region.peers.len() - dead.len();
+    let live = || {
+        region
+            .region
+            .peers
+            .iter()
+            .filter(|peer| !cluster.is_store_down(peer.store_id))
+    };
+    let live_replicas = live().count();
+    let live_voters = live().filter(|peer| peer.role == PeerRole::Voter).count();
     let epoch = region.region.epoch;
     let region_id = region.region.id;
 
@@ -274,6 +297,11 @@ pub fn repair_for(region: &RegionRecord, cluster: &Cluster<'_>) -> Option<Repair
             epoch,
             store_id,
         });
+    }
+    if live_voters < cluster.target_replicas {
+        // The replacement exists and is catching up. Nothing to ask for and nothing to give up:
+        // the dead peer stays until the region can afford to lose it.
+        return None;
     }
 
     // Back at the target, so the dead replica can go. The lowest id, so that two PDs — or one
@@ -339,7 +367,7 @@ mod tests {
     use super::{Cluster, LoadDelta, Repair, TARGET_REPLICAS, is_down, repair_for, repairs};
     use crate::record::{RegionRecord, StoreRecord, StoreStats};
     use bytes::Bytes;
-    use esker_proto::{Epoch, Peer, Region};
+    use esker_proto::{Epoch, Peer, PeerRole, Region};
     use std::collections::BTreeSet;
 
     const DOWN_AFTER: u64 = 30_000;
@@ -492,6 +520,37 @@ mod tests {
         // And when it is gone there is nothing left to do.
         let healthy = region(&[(1, 10), (2, 20), (4, 41)]);
         assert_eq!(repair_for(&healthy, &cluster(&stores)), None);
+    }
+
+    /// The retest's stuck shape, at the rule: the replacement is on a live store but is still a
+    /// **learner**, so the region has two votes and cannot spare the dead one. Removing it here
+    /// is "remove before add" with an extra step, and it is what left a region at two voters for
+    /// the rest of an acceptance run.
+    ///
+    /// And nothing is added either: the replacement is already on its way, and a second one
+    /// would grow the region by a replica every time the first operator timed out.
+    #[test]
+    fn a_dead_voter_outlives_a_replacement_that_cannot_vote_yet() {
+        let stores = [
+            store(1, NOW, 5),
+            store(2, NOW, 5),
+            store(3, NOW - DOWN_AFTER - 1, 5), // dead
+            store(4, NOW, 1),
+        ];
+        let mut catching_up = region(&[(1, 10), (2, 20), (3, 30), (4, 41)]);
+        catching_up.region.peers[3].role = PeerRole::Learner;
+        assert_eq!(repair_for(&catching_up, &cluster(&stores)), None);
+
+        // Promoted, and now the dead voter may go.
+        let promoted = region(&[(1, 10), (2, 20), (3, 30), (4, 41)]);
+        assert_eq!(
+            repair_for(&promoted, &cluster(&stores)),
+            Some(Repair::RemovePeer {
+                region_id: 7,
+                epoch: Epoch::new(1, 1),
+                peer_id: 30,
+            })
+        );
     }
 
     /// The scope rule: a healthy region below the replica target is *not* repaired. Growing a
