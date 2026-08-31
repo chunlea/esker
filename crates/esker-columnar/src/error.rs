@@ -15,7 +15,7 @@
 //!   actionable in a crash report and the caller always knew what it asked for.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The result of every fallible operation in this crate.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -77,5 +77,20 @@ impl Error {
     #[must_use]
     pub fn is_unsealed(&self) -> bool {
         matches!(self, Self::Unsealed { .. })
+    }
+}
+
+/// Attaches the path to an [`io::Error`], which never carries one of its own.
+pub(crate) trait IoResultExt<T> {
+    /// Names `path` as where the operation failed.
+    fn at(self, path: &Path) -> Result<T>;
+}
+
+impl<T> IoResultExt<T> for io::Result<T> {
+    fn at(self, path: &Path) -> Result<T> {
+        self.map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })
     }
 }

@@ -53,8 +53,10 @@ pub mod encode;
 pub mod error;
 pub mod footer;
 pub mod frame;
+pub mod reader;
 pub mod stats;
 pub mod value;
+pub mod writer;
 
 pub(crate) mod cursor;
 
@@ -62,8 +64,10 @@ pub use column::{Column, ColumnBuilder, ColumnData, NullMask};
 pub use error::{Error, Result};
 pub use footer::{ChunkMeta, Footer, StripeMeta, Trailer};
 pub use frame::Compression;
+pub use reader::Reader;
 pub use stats::{Bound, ColumnStats};
 pub use value::{ColumnDef, ColumnType, Schema, Value, ValueRef};
+pub use writer::{FileSummary, Writer, WriterOptions};
 
 /// Byte layouts that are frozen. Changing any of these is a format change: it needs an ADR, a
 /// format-version bump and a migration story (ADR 0002).
