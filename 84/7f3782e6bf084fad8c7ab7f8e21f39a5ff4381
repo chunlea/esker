@@ -1,0 +1,37 @@
+crates/esker-sql/src/exec/mod.rs
+  s_cf8601956e2620::t_9190e26e2d5632 31,352-378
+crates/esker-sql/src/exec/verbs.rs
+  s_cf8601956e2620::t_36d322deb122f7 39,51,150-356
+crates/esker-sql/src/parse/lower.rs
+  s_cf8601956e2620::t_670fda25d8f7fc 138-171,216-237
+crates/esker-sql/src/plan/time_machine.rs
+  s_cf8601956e2620::t_5c4a9ace44992a 39-55
+crates/esker-sql/tests/corpus/pg19.sql
+  s_cf8601956e2620::t_237238171d66b3 469-472
+crates/esker-sql/tests/real_backend.rs
+  s_cf8601956e2620::t_afcde623316883 351-413
+crates/esker-sql/tests/slt/time_machine.slt
+  s_cf8601956e2620::t_fb3a52af6e4e9a 197-252
+crates/esker-sql/tests/syntax_corpus.rs
+  s_cf8601956e2620::t_ce937b4af8e668 17
+crates/esker-sql/tests/time_machine.rs
+  s_cf8601956e2620::t_68b4a3d6688f0d 822-1003
+docs/plans/phase-6d.md
+  s_cf8601956e2620::t_cf0b9b10c007f0 237-240,297-312
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "847f3782e6bf084fad8c7ab7f8e21f39a5ff4381",
+  "prompts": {},
+  "sessions": {
+    "s_cf8601956e2620": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "732aecbc-5268-4943-836e-a49ba67b2585",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
