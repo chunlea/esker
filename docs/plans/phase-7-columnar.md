@@ -430,7 +430,7 @@ range      := start_len:varint ++ start ++ end_len:varint ++ end
 projection := count:varint ++ column:varint *          indexes into the file's schema
 filter     := present:u8 ++ [expr]
 output     := kind:u8 ++ (rows | aggregates)
-  rows       := limit:varint                           0 means unbounded
+  rows       := has_limit:u8 ++ [limit:varint]         LIMIT 0 is a real query
   aggregates := group_count:varint ++ slot:varint *
              ++ agg_count:varint ++ (kind:u8 ++ [slot:varint]) *
 
