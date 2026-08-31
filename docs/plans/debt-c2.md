@@ -163,7 +163,8 @@ operations, and the number the search cost is exponential in, across all 120 key
  3 unbounded:  30
 ```
 
-**Worst case six.** Before the fix, a single key's history carried about fifty, which is the
+**Worst case six** — but see the re-take below, which moved it and is the reason this section
+now says "observed" everywhere it used to say "bounded". Before the fix, a single key's history carried about fifty, which is the
 difference between a search of 2^6 and one of 2^50 — and it is why the old failure was a cliff
 rather than a slope. The distribution is also the structural claim holding up in practice: a kill
 strands at most one in-flight call per client, so six clients over four kills bounds this whatever
@@ -176,6 +177,49 @@ the timing does, and nothing in 120 samples came near the bound.
 | exhaustion returned as `Linearizable` (going blind) | `exhaustion_is_never_reported_as_a_violation` |
 | a decided violation returned as `Exhausted` | `the_checker_still_catches_a_lost_write`, `a_grown_budget_still_reaches_the_decision` |
 | `BUDGET_ATTEMPTS` 2 → 1 (no growth) | `a_grown_budget_still_reaches_the_decision` |
+
+### Re-taken after the step-down fix, and one claim corrected
+
+`79aff25` closed the other half of the stranded-proposal bug: a proposal orphaned by a leader
+merely **stepping down** is now answered with `Closed` (`Unknown`) rather than left on a oneshot
+for ever. That adds paths that end in "nobody learned", which is the input the search cost is
+exponential in — so the histogram was re-taken identically, 40 fresh processes on a quiet box.
+
+| | pre (`666d32a`) | post (`79aff25`) |
+|---|---|---|
+| standalone | 40/40 | 40/40 |
+| acknowledged writes per run | 59.0 | 59.4 |
+| ambiguous per run | 8.6 | 8.7 |
+| refused per run | 15.6 | 17.9 |
+| unbounded per key, mean | 2.87 | 2.89 |
+| unbounded per key, **observed max** | **6** | **7** |
+
+The middle of the distribution did not move. Two things did, and they explain each other: refusals
+rose about 15% because a read stranded by a step-down is now answered promptly with `NotLeader`
+— honestly `NotApplied`, so it is dropped from the history rather than recorded — while ambiguous
+counts stayed flat, because a *write* stranded that way was already reaching the client as
+`Unknown`, just via a ten-second transport timeout instead of at once. Faster, same
+classification. The tail moved by one, two samples out of 120, on a distribution whose mean moved
+by 0.02; that is sampling noise and not a mechanism.
+
+**The claim that has to be corrected is "worst case six", because that was a sample and it was
+written as though it were a bound.** Across both re-takes — 240 key-histories — the observed range
+is 0–7 with a mean of 2.9. The *structural* statement is the one worth keeping, and it is weaker
+than the original section implied:
+
+> An unbounded operation needs a call in flight to a node that stops answering, and each client
+> has at most one call in flight. So a single stranding event can produce at most `CLIENTS` of
+> them, and a four-kill run at most `4 × 6 = 24` across all keys.
+
+That ceiling is **not proven safe**: 24 on one key would be a search of about 2²⁴, past both
+budgets, and the test would then fail naming exhaustion. What keeps it far away is that stranding
+needs an in-flight call to the *dying* node, and the measured rate is about 1.5 per kill rather
+than six — 8.7 per run over three keys. Two hundred and forty samples reached seven. Nothing in
+this file should be read as saying it cannot reach more; it says it does not, and by a wide
+margin, and that the failure if it ever did would be an honest exhaustion rather than a silent
+pass. A construction that made the ceiling as low as the observation — rotating a key once its
+unbounded count reaches a threshold, so each history is closed and complete by design — is
+available and was not built, because the measurements did not call for it.
 
 ## Status
 
