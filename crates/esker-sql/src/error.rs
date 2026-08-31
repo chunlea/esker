@@ -131,6 +131,38 @@ pub enum SqlError {
     #[error("column \"{0}\" specified more than once")]
     DuplicateColumn(String),
 
+    /// `ALTER TABLE ... ADD COLUMN` naming a column the table already has. The same `42701` as
+    /// above and a different sentence: PostgreSQL names the relation here, because the column it
+    /// is talking about is one that already exists rather than one the statement repeated.
+    #[error("column \"{column}\" of relation \"{relation}\" already exists")]
+    DuplicateColumnInRelation {
+        /// The column that is already there.
+        column: String,
+        /// The table it belongs to.
+        relation: String,
+    },
+
+    /// The same, under `IF NOT EXISTS`: a notice, and PostgreSQL keeps `42701` on it rather than
+    /// dropping to `00000` the way the `DROP ... IF EXISTS` notice does. Captured, because the
+    /// asymmetry is not one anybody would invent.
+    #[error("column \"{column}\" of relation \"{relation}\" already exists, skipping")]
+    DuplicateColumnSkipping {
+        /// The column that is already there.
+        column: String,
+        /// The table it belongs to.
+        relation: String,
+    },
+
+    /// `ALTER TABLE` naming an index. PostgreSQL names the *action* rather than saying "is not a
+    /// table", because an index is a relation and the action is what cannot be performed on it.
+    #[error("ALTER action {action} cannot be performed on relation \"{name}\"")]
+    AlterActionOnWrongObject {
+        /// The action, as PostgreSQL spells it: `ADD COLUMN`.
+        action: &'static str,
+        /// The relation that was named.
+        name: String,
+    },
+
     /// A duplicate reached a unique index.
     #[error("duplicate key value violates unique constraint \"{constraint}\"")]
     UniqueViolation {
@@ -383,14 +415,18 @@ impl SqlError {
             }
             SqlError::UndefinedIndex(_) => sqlstate::UNDEFINED_OBJECT,
             SqlError::DependentObjectsStillExist { .. } => sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-            SqlError::WrongObjectType { .. } => sqlstate::WRONG_OBJECT_TYPE,
+            SqlError::WrongObjectType { .. } | SqlError::AlterActionOnWrongObject { .. } => {
+                sqlstate::WRONG_OBJECT_TYPE
+            }
             SqlError::UndefinedColumn(_)
             | SqlError::UndefinedColumnInKey(_)
             | SqlError::UndefinedColumnInRelation { .. } => sqlstate::UNDEFINED_COLUMN,
             SqlError::DuplicateTable(_) | SqlError::AlreadyExistsSkipping(_) => {
                 sqlstate::DUPLICATE_TABLE
             }
-            SqlError::DuplicateColumn(_) => sqlstate::DUPLICATE_COLUMN,
+            SqlError::DuplicateColumn(_)
+            | SqlError::DuplicateColumnInRelation { .. }
+            | SqlError::DuplicateColumnSkipping { .. } => sqlstate::DUPLICATE_COLUMN,
             SqlError::UniqueViolation { .. } => sqlstate::UNIQUE_VIOLATION,
             SqlError::NotNullViolation(_) | SqlError::NotNullViolationInRelation { .. } => {
                 sqlstate::NOT_NULL_VIOLATION
@@ -445,6 +481,7 @@ impl SqlError {
         match self {
             SqlError::AlreadyExistsSkipping(_)
             | SqlError::DoesNotExistSkipping { .. }
+            | SqlError::DuplicateColumnSkipping { .. }
             | SqlError::IdentifierTruncated { .. } => Severity::Notice,
             SqlError::ActiveTransaction | SqlError::NoActiveTransaction => Severity::Warning,
             SqlError::ProtocolViolation(_) | SqlError::InvalidPassword(_) => Severity::Fatal,
@@ -467,6 +504,11 @@ impl SqlError {
             }
             SqlError::UndefinedOperator { .. } => {
                 Some("No operator of that name accepts the given argument types.".to_owned())
+            }
+            // The only relations here that are not tables are indexes, so PostgreSQL's own
+            // sentence is exact.
+            SqlError::AlterActionOnWrongObject { .. } => {
+                Some("This operation is not supported for indexes.".to_owned())
             }
             _ => None,
         }

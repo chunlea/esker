@@ -130,6 +130,7 @@ impl Executor {
             Statement::DropTable(drop) => ddl::drop_table(self, txn, drop),
             Statement::CreateIndex(create) => ddl::create_index(self, txn, create),
             Statement::DropIndex(drop) => ddl::drop_index(self, txn, drop),
+            Statement::AlterTable(alter) => ddl::alter_table(self, txn, alter),
             Statement::Insert(insert) => dml::insert(self, txn, insert, written),
             Statement::Select(select) => self.select(txn, select),
             Statement::Update(update) => dml::update(self, txn, update, written),
@@ -304,6 +305,7 @@ fn explain_lines(statement: &Statement) -> Vec<String> {
         Statement::DropTable(drop) => vec![format!("Drop Table on {}", drop.names.join(", "))],
         Statement::CreateIndex(create) => vec![format!("Create Index on {}", create.table)],
         Statement::DropIndex(drop) => vec![format!("Drop Index on {}", drop.names.join(", "))],
+        Statement::AlterTable(alter) => vec![format!("Alter Table on {}", alter.name)],
         // A `SELECT`'s plan is the interesting one, and it needs the catalog to be built, so
         // `EXPLAIN SELECT` is handled where the catalog is in reach rather than here.
         Statement::Select(_) => vec!["Select".to_owned()],

@@ -33,11 +33,11 @@ parser changes which one is given, never whether the answer is honest:
 
 `42601 syntax_error` about valid PostgreSQL is forbidden outright, because it is untrue and
 unactionable: it tells a user to fix a statement that is already correct, and points at a keyword
-that is perfectly valid. Measured over the whole corpus: **283 parse, 70 are refused by name, none
+that is perfectly valid. Measured over the whole corpus: **307 parse, 95 are refused by name, none
 is a syntax error.** Every gap is also a tracked row in §9, so a gap that is merely *undocumented*
 still fails the build even though the client would have been answered correctly.
 
-Tested by the **syntax corpus** (§7.1, §9): 353 statements across 17 classes — DDL, DML, DCL, TCL,
+Tested by the **syntax corpus** (§7.1, §9): 402 statements across 17 classes — DDL, DML, DCL, TCL,
 CTEs, window functions, set operations, `MERGE`, JSON, arrays, `LATERAL`, `RETURNING`, partitioning,
 `EXPLAIN` variants. Every one of them was put to a real **PostgreSQL 19beta1** server and kept only
 because that server's parser accepted it, so the corpus is a record of what PostgreSQL does rather
@@ -113,8 +113,9 @@ the design and neither is safe to assume:
 **Out**, as executed features — and therefore *in* as C2 `0A000` responses, which is a deliverable,
 not an omission: joins, aggregates and `GROUP BY`, subqueries, CTEs, window functions, set
 operations, `MERGE`, `COPY`, views, triggers, sequences and `SERIAL`, DCL (`GRANT`/`REVOKE`),
-`ALTER TABLE`, savepoints, cursors, every type outside the six, and every `SET` that would change
-behaviour we do not implement.
+savepoints, cursors, every type outside the six, and every `SET` that would change behaviour we do
+not implement. `ALTER TABLE` was here too; it is now in, for `ADD COLUMN` of a nullable column
+only, and every other action of it is a `0A000` naming itself (§11, the ALTER continuation).
 
 **Not in this crate at all**: the store-side execution of transactions (phase 5), region routing
 (phase 4), and `COPY`-based bulk load (the acceptance target uses batched `INSERT`).
@@ -264,7 +265,7 @@ panic (`CLAUDE.md` invariants 2 and 9).
 
 Required kinds per `docs/DESIGN.md` §11, plus the two the contract adds.
 
-1. **Syntax corpus** (C1) — 353 statements per statement class, each verified against a real
+1. **Syntax corpus** (C1) — 402 statements per statement class, each verified against a real
    PostgreSQL 19beta1 server, asserting only that the parse succeeds. Known upstream gaps live in
    one `KNOWN_GAPS` table beside the test and are held from both sides: an *unlisted* failure fails
    the build, and so does a *listed* gap that has started passing, so a `sqlparser` upgrade that
@@ -332,15 +333,20 @@ not. Two candidates were thrown out that way (`FETCH FIRST … WITH TIES` withou
 `EXCLUDE CURRENT ROW` without a frame clause); both looked correct, which is the argument for
 having an oracle rather than an opinion.
 
-The corpus is **353 statements across 17 classes**. Of those, **283 parse and 70 come back as
+The corpus is **402 statements across 17 classes**. Of those, **307 parse and 95 come back as
 `0A000 feature_not_supported` naming the construct. None is a syntax error.** That last number is
 the one that matters, and it is asserted by
 `no_statement_postgresql_accepts_is_ever_a_syntax_error`.
 
-Raw parser coverage is 281 of 353 (79.6%); the other two of the 283 are `TABLE t` and `ABORT`,
+Raw parser coverage is 305 of 402 (75.9%); the other two of the 307 are `TABLE t` and `ABORT`,
 which PostgreSQL *defines* as synonyms for `SELECT * FROM t` and `ROLLBACK`, so `parse.rs` rewrites
 the leading keyword and they execute as the statements they are documented to equal. The remaining
-70 are the register below.
+95 are the register below.
+
+The corpus grew by 47 statements and the register by 25 when the `ALTER TABLE` grammar was swept in
+one pass (§11, the ALTER continuation). The coverage *percentage* went down as a result, which is
+the right direction for it to move: it was measuring a corpus that had not looked at that grammar,
+not a parser that could read it.
 
 ### Why none of this is a syntax error any more
 
@@ -412,8 +418,16 @@ merely refused well.
 
 ### The register
 
-Thirty features, seventy statements. G13 (`TABLE t`) and `ABORT` from G22 are closed: both are
-documented synonyms and are now rewritten rather than refused.
+Thirty-seven features, ninety-five statements. G13 (`TABLE t`) and `ABORT` from G22 are closed:
+both are documented synonyms and are now rewritten rather than refused.
+
+G32 to G39 came from one sweep of the `ALTER TABLE` grammar while `ADD COLUMN` was being built
+(§11, the ALTER continuation). The corpus had fifteen `ALTER TABLE` lines and the grammar has some
+thirty actions, so **eighteen statements PostgreSQL 19 accepts were coming back `42601`** — contract
+C1 broken, silently, for a year of the plan's life. The lesson is the one §7 already states and this
+is the sharpest evidence for it: a corpus is only a gate for what somebody thought to put in it, and
+the cheapest way to find what is missing is to sweep a whole statement's grammar at the server
+rather than to add the lines a feature happens to need.
 
 | # | Feature | Statements | Minimal repro | Priority |
 |---|---|---|---|---|
@@ -447,6 +461,14 @@ documented synonyms and are now rewritten rather than refused.
 | G29 | logical replication | 6 | `CREATE PUBLICATION pub FOR TABLE t;` | admin / DDL only |
 | G30 | foreign data wrappers | 2 | `CREATE FOREIGN TABLE ft (a int8) SERVER srv;` | admin / DDL only |
 | G31 | `UNIQUE NULLS NOT DISTINCT` as a **column option** | 1 | `CREATE TABLE t (a int8 UNIQUE NULLS NOT DISTINCT);` | **on the query path** — the table-constraint and index spellings of the same clause parse, so only this one is a gap |
+| G32 | `ALTER TABLE ... ALTER COLUMN`, every action beyond the four `sqlparser` reads (`SET`/`DROP NOT NULL`, `SET DEFAULT`, `SET DATA TYPE`, `ADD GENERATED`) | 11 | `ALTER TABLE t ALTER COLUMN a SET STATISTICS 100;` | admin / DDL only |
+| G33 | moving a table between schemas | 1 | `ALTER TABLE t SET SCHEMA s;` | admin / DDL only |
+| G34 | tablespaces | 2 | `ALTER TABLE t SET TABLESPACE ts;` | admin / DDL only |
+| G35 | table access methods | 1 | `ALTER TABLE t SET ACCESS METHOD heap;` | admin / DDL only |
+| G36 | clustering, and the OID legacy | 3 | `ALTER TABLE t CLUSTER ON i;` | admin / DDL only |
+| G37 | resetting storage parameters | 2 | `ALTER TABLE t RESET (fillfactor);` | admin / DDL only |
+| G38 | table inheritance | 2 | `ALTER TABLE t INHERIT u;` | admin / DDL only |
+| G39 | a table of a composite type | 2 | `ALTER TABLE t OF sometype;` | admin / DDL only |
 
 **Decision, for every row above:** refuse honestly, carry the gap, do not fork. The corpus keeps each statement, and
 `every_known_gap_is_still_a_gap` fails the build the day an upstream release starts parsing one, so
@@ -462,8 +484,8 @@ its own gap register, and it would be longer.
 ## 10. Progress
 
 - [x] 1 — plan, ADR 0014, dependency, crate skeleton, SQLSTATE table, error type, parse guard
-- [x] 1b — the syntax corpus: 353 statements, oracle-verified, 70 gaps registered in §9
-- [x] 1c — the feature recognizer: all 353 answered by a parse or an honest `0A000`, none a syntax
+- [x] 1b — the syntax corpus: 402 statements, oracle-verified, 95 gaps registered in §9
+- [x] 1c — the feature recognizer: all 402 answered by a parse or an honest `0A000`, none a syntax
   error; `TABLE`/`ABORT` rewritten as the documented synonyms they are
 - [x] 2 — pgwire, complete: framing, message codec, startup + `NegotiateProtocolVersion`,
   `ErrorResponse` fields, goldens, decoder fuzz (2a); the session state machine and the simple
@@ -484,6 +506,9 @@ its own gap register, and it would be longer.
 - [x] 7 — the `.slt` harness: fourteen files, 295 directives, run by **two** runners (ours and
   the `sqllogictest` crate) and replayed against the real server to check that they record
   PostgreSQL's answers and not ours
+- [x] 8 — `ALTER TABLE ADD COLUMN` (the continuation): the catalog cache fix it uncovered, the row
+  and catalog format change that makes it rewrite nothing (ADR 0019), the statement itself, and the
+  `ALTER TABLE` grammar sweep that closed eighteen contract-C1 violations nobody had looked for
 
 ## 10a. Handoff — where a fresh lane picks up
 
@@ -507,6 +532,7 @@ does not, in full:
 | `text` sorts by bytes | A locale-aware collation needs ICU or a platform C library; this project compiles neither. Equivalent to PostgreSQL's `COLLATE "C"`. | §6, `crate::row`, `tests/slt/select.slt` |
 | A table with no `PRIMARY KEY` is `0A000` | The row key *is* the primary key. `TODO(post-v1)`: an implicit row id from a per-table sequence. | §11 unit 6a, `tests/slt/create_table.slt` |
 | A decimal literal in an `int8` column is `0A000` | `numeric` rounds half away from zero and `float8` rounds half to even; there is no `numeric` here to be sure with. | §11 unit 6b, `tests/slt/types.slt` |
+| `ADD COLUMN ... NOT NULL` is `0A000` even on an empty table | PostgreSQL accepts it there, because there is no row to violate it. Accepting it would mean scanning the table to find out, and the `ALTER` is supposed to touch no row; the restriction is stated rather than conditional. | §11 unit 8, `tests/slt/unsupported.slt` |
 | Six value inputs are `0A000` | Hexadecimal floats, and PostgreSQL's datetime grammar outside ISO 8601. | `tests/value_parity.rs`'s `DIVERGENCES` |
 | No `LINE n: ... ^` in an error | The `P` field needs the parser's spans carried through the lowering. `TODO(post-v1)`; §1 already excludes it for syntax errors. | this table |
 | No `CONTEXT:` on a parameter's error | The `W` field. Same shape of gap as the caret. | this table |
@@ -1058,8 +1084,9 @@ planner.
 **Unit 1b.** The corpus was going to be written from the PostgreSQL documentation. It is instead
 written against a **running PostgreSQL 19beta1**, because a container of the target release turned
 out to be one `docker run` away and an oracle beats a recollection — it immediately rejected two
-statements that had looked right. The result is the first hard number this contract has: of 353
-statements real PostgreSQL 19 accepts, `sqlparser` parses **281**. The other 72 are registered in
-§9, and the thirteen of them that sit on the query path are now the most concrete piece of work
-this plan has, because each is a statement a user could write today and get a syntax error for
-where the contract promises `0A000`.
+statements that had looked right. The result is the first hard number this contract has: of the 353
+statements real PostgreSQL 19 accepts that the corpus held then, `sqlparser` parses **281**. The
+other 72 are registered in §9, and the thirteen of them that sit on the query path are now the most
+concrete piece of work this plan has, because each is a statement a user could write today and get a
+syntax error for where the contract promises `0A000`. (Both numbers moved later, when the `ALTER
+TABLE` sweep took the corpus to 402.)

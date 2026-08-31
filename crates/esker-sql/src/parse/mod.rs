@@ -416,6 +416,62 @@ const UNSUPPORTED: &[Unsupported] = &[
     ),
     u("ALTER TABLE ... SET LOGGED", &[], &["SET", "LOGGED"]),
     u("ALTER TABLE ... SET UNLOGGED", &[], &["SET", "UNLOGGED"]),
+    // `sqlparser` 0.62.0 reads four `ALTER TABLE` actions and PostgreSQL has some thirty
+    // (G32-G39). None of the rest is executed here either, so each is named the way the lowering
+    // names the ones that *do* parse -- a user gets one sentence for a construct whether the gap
+    // is upstream or ours. `ALTER COLUMN` is one row on purpose: the parser reads four of its
+    // dozen actions, none of which this crate runs, so the action makes no difference to the
+    // answer. It comes first because `ALTER COLUMN a RESET (...)` would otherwise be claimed by
+    // the table-level `RESET` row below and named for the wrong level.
+    u(
+        "ALTER TABLE ... ALTER COLUMN",
+        &["ALTER", "TABLE"],
+        &["ALTER", "COLUMN"],
+    ),
+    u(
+        "ALTER TABLE ALL IN TABLESPACE",
+        &["ALTER", "TABLE", "ALL"],
+        &[],
+    ),
+    u(
+        "ALTER TABLE ... SET SCHEMA",
+        &["ALTER", "TABLE"],
+        &["SET", "SCHEMA"],
+    ),
+    u(
+        "ALTER TABLE ... SET TABLESPACE",
+        &["ALTER", "TABLE"],
+        &["SET", "TABLESPACE"],
+    ),
+    u(
+        "ALTER TABLE ... SET ACCESS METHOD",
+        &["ALTER", "TABLE"],
+        &["SET", "ACCESS", "METHOD"],
+    ),
+    u(
+        "ALTER TABLE ... SET WITHOUT CLUSTER",
+        &["ALTER", "TABLE"],
+        &["SET", "WITHOUT", "CLUSTER"],
+    ),
+    u(
+        "ALTER TABLE ... SET WITHOUT OIDS",
+        &["ALTER", "TABLE"],
+        &["SET", "WITHOUT", "OIDS"],
+    ),
+    u("ALTER TABLE ... RESET", &["ALTER", "TABLE"], &["RESET"]),
+    u(
+        "ALTER TABLE ... CLUSTER ON",
+        &["ALTER", "TABLE"],
+        &["CLUSTER", "ON"],
+    ),
+    // Covers `NO INHERIT` too: it is the same feature, table inheritance, and naming the two
+    // separately would say nothing a reader does not already see in their own statement.
+    u("ALTER TABLE ... INHERIT", &["ALTER", "TABLE"], &["INHERIT"]),
+    u(
+        "ALTER TABLE ... OF a type",
+        &["ALTER", "TABLE"],
+        &[ANY, "OF"],
+    ),
     u("CREATE UNLOGGED TABLE", &["CREATE", "UNLOGGED"], &[]),
     u("an EXCLUDE constraint", &[], &["EXCLUDE", "USING"]),
     u(

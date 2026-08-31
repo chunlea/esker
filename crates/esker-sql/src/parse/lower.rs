@@ -16,11 +16,11 @@
 //! each asserting that the clause's own name comes back.
 
 use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, ColumnOption, CreateTableOptions, DataType,
-    DollarQuotedString, ExactNumberInfo, Expr, FromTable, GroupByExpr, Ident, IndexColumn,
-    IndexType, LimitClause, NullsDistinctOption, ObjectName, ObjectType, OffsetRows, OrderByKind,
-    Query, SelectItem, SetExpr, Statement, TableConstraint, TableFactor, TableObject, TimezoneInfo,
-    UnaryOperator, Value,
+    AlterTableOperation, AssignmentTarget, BinaryOperator, ColumnOption, CreateTableOptions,
+    DataType, DollarQuotedString, ExactNumberInfo, Expr, FromTable, GroupByExpr, Ident,
+    IndexColumn, IndexType, LimitClause, NullsDistinctOption, ObjectName, ObjectType, OffsetRows,
+    OrderByKind, Query, SelectItem, SetExpr, Statement, TableConstraint, TableFactor, TableObject,
+    TimezoneInfo, UnaryOperator, Value,
 };
 
 use crate::catalog::fold_identifier;
@@ -49,6 +49,7 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
         Statement::CreateIndex(create) => {
             Ok(plan::Statement::CreateIndex(lower_create_index(create)?))
         }
+        Statement::AlterTable(alter) => Ok(plan::Statement::AlterTable(lower_alter_table(alter)?)),
         Statement::Drop {
             object_type,
             if_exists,
@@ -206,6 +207,99 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
         primary_key_name,
         unique,
     })
+}
+
+/// `ALTER TABLE`, of which exactly one action is executed.
+///
+/// Everything else is named and refused (contract C2). The naming is done from *our* side rather
+/// than from the AST's `Display`, because the name is what the user is told to change and
+/// `sqlparser` renders an action with the identifiers the user wrote in it — a message that
+/// echoes a column name back is a message that cannot be searched for.
+fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTable> {
+    // `ONLY` is about inheritance, which there is none of here; honouring it silently would be
+    // honouring a word we do not implement.
+    refuse_if(alter.only, "ALTER TABLE ONLY")?;
+    refuse_if(alter.location.is_some(), "ALTER TABLE ... SET LOCATION")?;
+    refuse_if(alter.on_cluster.is_some(), "ALTER TABLE ... ON CLUSTER")?;
+    refuse_if(alter.table_type.is_some(), "ALTER of a table of that type")?;
+
+    let mut actions = Vec::with_capacity(alter.operations.len());
+    for operation in &alter.operations {
+        let AlterTableOperation::AddColumn {
+            column_keyword: _,
+            if_not_exists,
+            column_def,
+            column_position,
+        } = operation
+        else {
+            return Err(SqlError::unsupported(alter_action_name(operation)));
+        };
+        // MySQL's `FIRST`/`AFTER c`. A column added anywhere but the end is a column the row
+        // format cannot place, since a row is decoded by position.
+        refuse_if(
+            column_position.is_some(),
+            "ALTER TABLE ... ADD COLUMN at a position",
+        )?;
+        for option in &column_def.options {
+            let named = match &option.option {
+                // The two that would need every row already stored to hold a value it does not
+                // hold. Refusing them is what keeps the ALTER free of a rewrite -- and it is a
+                // real divergence for `NOT NULL` on an *empty* table, which PostgreSQL accepts.
+                ColumnOption::NotNull => "ALTER TABLE ... ADD COLUMN ... NOT NULL",
+                ColumnOption::Default(_) => "ALTER TABLE ... ADD COLUMN ... DEFAULT",
+                ColumnOption::PrimaryKey(_) => "ALTER TABLE ... ADD COLUMN ... PRIMARY KEY",
+                ColumnOption::Unique(_) => "ALTER TABLE ... ADD COLUMN ... UNIQUE",
+                // `NULL` is the default and says nothing; honouring it is honouring nothing.
+                ColumnOption::Null => continue,
+                other => return Err(SqlError::unsupported(column_option_name(other))),
+            };
+            return Err(SqlError::unsupported(named));
+        }
+        actions.push(plan::AlterTableAction::AddColumn {
+            column: plan::Column {
+                name: ident(&column_def.name),
+                ty: lower_type(&column_def.data_type)?,
+                not_null: false,
+            },
+            if_not_exists: *if_not_exists,
+        });
+    }
+
+    Ok(plan::AlterTable {
+        name: object_name(&alter.name)?,
+        if_exists: alter.if_exists,
+        actions,
+    })
+}
+
+/// What to call an `ALTER TABLE` action the executor does not run.
+///
+/// The three column actions are named the way PostgreSQL's own documentation names them, because
+/// they are the ones a user of this subset actually reaches. The rest fall back to the action's
+/// leading keywords, which is the same rule [`crate::parse::feature_name`] uses for a statement.
+fn alter_action_name(operation: &AlterTableOperation) -> String {
+    match operation {
+        AlterTableOperation::DropColumn { .. } => "ALTER TABLE ... DROP COLUMN".into(),
+        AlterTableOperation::RenameColumn { .. } => "ALTER TABLE ... RENAME COLUMN".into(),
+        AlterTableOperation::AlterColumn { .. } => "ALTER TABLE ... ALTER COLUMN".into(),
+        AlterTableOperation::RenameTable { .. } => "ALTER TABLE ... RENAME TO".into(),
+        AlterTableOperation::AddConstraint { .. } => "ALTER TABLE ... ADD CONSTRAINT".into(),
+        AlterTableOperation::DropConstraint { .. } => "ALTER TABLE ... DROP CONSTRAINT".into(),
+        other => {
+            let rendered = other.to_string();
+            let words = rendered
+                .split_whitespace()
+                .take_while(|word| word.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" ");
+            if words.is_empty() {
+                "this ALTER TABLE action".to_owned()
+            } else {
+                format!("ALTER TABLE ... {words}")
+            }
+        }
+    }
 }
 
 fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<plan::CreateIndex> {

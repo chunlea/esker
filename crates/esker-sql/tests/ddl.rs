@@ -424,3 +424,181 @@ fn a_rolled_back_ddl_is_invisible_to_the_next_session() {
         "the one that committed is there"
     );
 }
+
+/// `ALTER TABLE ADD COLUMN`: the catalog gains the column, the table's schema version moves, and
+/// no row is touched. Every message and code here was captured from a real PostgreSQL 19beta1.
+#[test]
+fn add_column_appends_to_the_catalog_and_bumps_the_schema_version() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE a (id int8 PRIMARY KEY, name text)")
+        .unwrap();
+    let before = node.table("a").expect("committed");
+    assert_eq!(before.schema_version, 1, "CREATE TABLE leaves it at one");
+
+    let outcome = node.run("ALTER TABLE a ADD COLUMN note text").unwrap();
+    assert_eq!(outcome, Outcome::done("ALTER TABLE"));
+
+    let after = node.table("a").expect("committed");
+    assert_eq!(after.schema_version, 2);
+    assert_eq!(
+        after
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.ty, column.not_null))
+            .collect::<Vec<_>>(),
+        [
+            ("id", ColumnType::Int8, true),
+            ("name", ColumnType::Text, false),
+            // Nullable, always: every row already stored is missing it.
+            ("note", ColumnType::Text, false),
+        ]
+    );
+    assert_eq!(after.id, before.id, "the same table, not a new one");
+    assert_eq!(after.indexes, before.indexes);
+
+    // Several actions in one statement are one shape change and one version bump.
+    node.run("ALTER TABLE a ADD COLUMN m1 text, ADD COLUMN m2 bool")
+        .unwrap();
+    let after = node.table("a").expect("committed");
+    assert_eq!(after.schema_version, 3);
+    assert_eq!(after.columns.len(), 5);
+}
+
+/// The refusals, with the codes and sentences a real server gives.
+#[test]
+fn add_column_refuses_what_postgresql_refuses() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE a (id int8 PRIMARY KEY, name text)")
+        .unwrap();
+
+    let error = node.run("ALTER TABLE a ADD COLUMN name text").unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::DUPLICATE_COLUMN);
+    assert_eq!(
+        error.to_string(),
+        "column \"name\" of relation \"a\" already exists"
+    );
+
+    // `IF NOT EXISTS` is a notice -- and PostgreSQL keeps `42701` on it rather than dropping to
+    // `00000` the way its `DROP ... IF EXISTS` notice does. Captured, not assumed.
+    node.run("ALTER TABLE a ADD COLUMN IF NOT EXISTS name text")
+        .unwrap();
+    assert_eq!(
+        node.notices(),
+        ["column \"name\" of relation \"a\" already exists, skipping"]
+    );
+
+    let error = node.run("ALTER TABLE nope ADD COLUMN c text").unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::UNDEFINED_TABLE);
+    assert_eq!(error.to_string(), "relation \"nope\" does not exist");
+
+    node.run("ALTER TABLE IF EXISTS nope ADD COLUMN c text")
+        .unwrap();
+    assert_eq!(
+        node.notices(),
+        ["relation \"nope\" does not exist, skipping"]
+    );
+
+    // An index is a relation, so PostgreSQL does not say "is not a table" here.
+    let error = node
+        .run("ALTER TABLE a_pkey ADD COLUMN c text")
+        .unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::WRONG_OBJECT_TYPE);
+    assert_eq!(
+        error.to_string(),
+        "ALTER action ADD COLUMN cannot be performed on relation \"a_pkey\""
+    );
+    assert_eq!(
+        error.detail().as_deref(),
+        Some("This operation is not supported for indexes.")
+    );
+
+    // A statement whose every action skips changes no shape, so it must not move the version --
+    // a bump would make every node discard its cache and every concurrent DDL conflict for
+    // nothing.
+    let before = node.table("a").expect("committed").schema_version;
+    node.run("ALTER TABLE a ADD COLUMN IF NOT EXISTS name text")
+        .unwrap();
+    assert_eq!(node.table("a").expect("committed").schema_version, before);
+}
+
+/// The versioned catalog is what makes another node see the change. Two sessions share the cache;
+/// the second one must not answer a query with the shape it read before the first one's ALTER.
+#[test]
+fn a_second_session_sees_the_new_column_through_the_version_check() {
+    let mut node = Node::new();
+    let mut other = node.session();
+
+    node.run("CREATE TABLE a (id int8 PRIMARY KEY, name text)")
+        .unwrap();
+    node.run("INSERT INTO a VALUES (1, 'one')").unwrap();
+
+    // The second session reads the table, which is what puts it in the shared cache.
+    let run_other = |other: &mut Executor, sql: &str| -> esker_sql::Result<Outcome> {
+        let mut last = Outcome::done("");
+        for parsed in parse_statements(sql).unwrap() {
+            last = other.execute(&parsed, &Params::NONE)?;
+        }
+        Ok(last)
+    };
+    run_other(&mut other, "SELECT id, name FROM a").unwrap();
+
+    node.run("ALTER TABLE a ADD COLUMN note text").unwrap();
+
+    // The cached definition is from an older catalog version, so it is discarded rather than
+    // served. Without the version check this is `42703 column "note" does not exist`.
+    let outcome = run_other(&mut other, "SELECT id, note FROM a").unwrap();
+    let Outcome::Rows { rows, .. } = outcome else {
+        panic!("not rows");
+    };
+    assert_eq!(rows, [[Some(b"1".to_vec()), None]], "the padded NULL");
+
+    // And it can write the new shape.
+    run_other(&mut other, "INSERT INTO a VALUES (2, 'two', 'hi')").unwrap();
+    let Outcome::Rows { rows, .. } = node.run("SELECT id, note FROM a ORDER BY id").unwrap() else {
+        panic!("not rows");
+    };
+    assert_eq!(
+        rows,
+        [
+            [Some(b"1".to_vec()), None],
+            [Some(b"2".to_vec()), Some(b"hi".to_vec())],
+        ]
+    );
+}
+
+/// PostgreSQL's DDL is transactional and so is this: the column is visible to the transaction that
+/// added it and to nobody else until it commits, and a rollback takes the rows written against it
+/// with it. Captured from a real server, which is where the `25P02` after a failed ALTER comes
+/// from too.
+#[test]
+fn ddl_inside_a_transaction_is_visible_to_itself_and_to_nobody_else() {
+    let mut node = Node::new();
+    let mut other = node.session();
+    node.run("CREATE TABLE a (id int8 PRIMARY KEY)").unwrap();
+    node.run("INSERT INTO a VALUES (1)").unwrap();
+
+    node.executor.begin().unwrap();
+    node.run("ALTER TABLE a ADD COLUMN x text").unwrap();
+    // Its own view sees it, and can write against it.
+    node.run("INSERT INTO a VALUES (2, 'two')").unwrap();
+    let Outcome::Rows { rows, .. } = node.run("SELECT id, x FROM a ORDER BY id").unwrap() else {
+        panic!("not rows");
+    };
+    assert_eq!(rows.len(), 2);
+
+    // Another session, at its own snapshot, sees neither the column nor the row.
+    let parsed = parse_statements("SELECT id, x FROM a").unwrap();
+    let error = other.execute(&parsed[0], &Params::NONE).unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::UNDEFINED_COLUMN);
+
+    node.executor.rollback().unwrap();
+
+    // After the rollback the column is gone, and so is the row that used it.
+    let error = node.run("SELECT id, x FROM a").unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::UNDEFINED_COLUMN);
+    let Outcome::Rows { rows, .. } = node.run("SELECT id FROM a").unwrap() else {
+        panic!("not rows");
+    };
+    assert_eq!(rows, [[Some(b"1".to_vec())]]);
+    assert_eq!(node.table("a").expect("committed").schema_version, 1);
+}

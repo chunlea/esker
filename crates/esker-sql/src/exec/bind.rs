@@ -159,7 +159,8 @@ fn walk(statement: &Statement, table: Option<&TableDef>, seen: &mut impl FnMut(u
         Statement::CreateTable(_)
         | Statement::DropTable(_)
         | Statement::CreateIndex(_)
-        | Statement::DropIndex(_) => {}
+        | Statement::DropIndex(_)
+        | Statement::AlterTable(_) => {}
     }
 }
 
@@ -241,7 +242,8 @@ fn walk_mut(statement: &mut Statement, visit: &mut impl FnMut(&mut Expr)) {
         Statement::CreateTable(_)
         | Statement::DropTable(_)
         | Statement::CreateIndex(_)
-        | Statement::DropIndex(_) => {}
+        | Statement::DropIndex(_)
+        | Statement::AlterTable(_) => {}
     }
 }
 
@@ -268,7 +270,10 @@ pub(super) fn table_name(statement: &Statement) -> Option<&str> {
         Statement::CreateTable(_)
         | Statement::DropTable(_)
         | Statement::CreateIndex(_)
-        | Statement::DropIndex(_) => None,
+        | Statement::DropIndex(_)
+        // DDL over a table, but nothing here needs its column types: a parameter cannot appear
+        // in an `ALTER TABLE`, so there is nothing to infer against.
+        | Statement::AlterTable(_) => None,
     }
 }
 
@@ -317,7 +322,8 @@ fn for_each_expr(statement: &Statement, visit: &mut impl FnMut(&Expr)) {
         Statement::CreateTable(_)
         | Statement::DropTable(_)
         | Statement::CreateIndex(_)
-        | Statement::DropIndex(_) => {}
+        | Statement::DropIndex(_)
+        | Statement::AlterTable(_) => {}
     }
 }
 

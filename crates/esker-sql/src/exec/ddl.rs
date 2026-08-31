@@ -3,6 +3,14 @@
 //! Each one is a read of the catalog, a check, and a write — all inside the caller's transaction,
 //! so DDL is atomic with whatever else that transaction did and invisible until it commits.
 //!
+//! # `ALTER TABLE ADD COLUMN` rewrites nothing
+//!
+//! Appending a nullable column is a catalog write and nothing else. The rows already stored say
+//! how many columns they hold ([ADR 0019](../../../docs/adr/0019-a-row-says-how-many-columns-it-has.md)),
+//! so a reader pads the new column to NULL, which is what PostgreSQL shows for it anyway. That is
+//! the whole feature, and it is why the restrictions are what they are: `NOT NULL` and `DEFAULT`
+//! both need every existing row to hold a value it does not hold, and each is refused by name.
+//!
 //! # A table needs a primary key
 //!
 //! The row key *is* the primary key (`crate::row`), so a table without one has no key space to
@@ -16,7 +24,9 @@ use crate::catalog::{self, ColumnDef, IndexDef, TableDef};
 use crate::error::{Result, SqlError};
 use crate::exec::Executor;
 use crate::pgwire::session::Outcome;
-use crate::plan::{self, CreateIndex, CreateTable, DropIndex, DropTable};
+use crate::plan::{
+    self, AlterTable, AlterTableAction, CreateIndex, CreateTable, DropIndex, DropTable,
+};
 use crate::value::Datum;
 
 pub(super) fn create_table(
@@ -252,6 +262,81 @@ pub(super) fn drop_index(
         catalog::replace_table(txn, executor.tenant, &table, &updated)?;
     }
     Ok(Outcome::done("DROP INDEX"))
+}
+
+/// `ALTER TABLE ... ADD COLUMN`, the only action this crate executes.
+///
+/// Every action in one statement is applied to one copy of the definition and written once, which
+/// is what makes `ALTER TABLE t ADD COLUMN a text, ADD COLUMN b text` atomic the way PostgreSQL's
+/// is. A statement whose actions all skip writes nothing at all: it has changed no shape, and
+/// bumping the catalog version for it would make every node discard its cache and every concurrent
+/// DDL conflict, for nothing.
+pub(super) fn alter_table(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    alter: &AlterTable,
+) -> Result<Outcome> {
+    let done = Ok(Outcome::done("ALTER TABLE"));
+    let table = match existing_relation(executor, txn, &alter.name)? {
+        Some(catalog::Relation::Table { table_id }) => executor.table_by_id(txn, table_id)?,
+        // An index is a relation, so PostgreSQL does not say "is not a table" here -- it says the
+        // action cannot be performed on it, and adds that indexes do not take one. Captured.
+        Some(catalog::Relation::Index { .. } | catalog::Relation::PrimaryKey { .. }) => {
+            return Err(SqlError::AlterActionOnWrongObject {
+                action: "ADD COLUMN",
+                name: alter.name.clone(),
+            });
+        }
+        None => {
+            if alter.if_exists {
+                executor.notice(SqlError::DoesNotExistSkipping {
+                    kind: "relation",
+                    name: alter.name.clone(),
+                });
+                return done;
+            }
+            return Err(SqlError::UndefinedTable(alter.name.clone()));
+        }
+    };
+
+    let mut updated = (*table).clone();
+    let mut changed = false;
+    for action in &alter.actions {
+        let AlterTableAction::AddColumn {
+            column,
+            if_not_exists,
+        } = action;
+        if updated.column(&column.name).is_some() {
+            if *if_not_exists {
+                executor.notice(SqlError::DuplicateColumnSkipping {
+                    column: column.name.clone(),
+                    relation: alter.name.clone(),
+                });
+                continue;
+            }
+            return Err(SqlError::DuplicateColumnInRelation {
+                column: column.name.clone(),
+                relation: alter.name.clone(),
+            });
+        }
+        updated.columns.push(ColumnDef {
+            name: column.name.clone(),
+            ty: column.ty,
+            // The lowering refuses `NOT NULL`, so this is the only value it can have -- and it
+            // has to be this one, because every row already stored is missing the column.
+            not_null: false,
+        });
+        changed = true;
+    }
+    if !changed {
+        return done;
+    }
+
+    // One statement, one shape change, whatever the number of columns it added: they become
+    // visible together.
+    updated.schema_version += 1;
+    catalog::replace_table(txn, executor.tenant, &table, &updated)?;
+    done
 }
 
 fn existing_relation(

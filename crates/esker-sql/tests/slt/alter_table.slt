@@ -1,0 +1,131 @@
+# ALTER TABLE ADD COLUMN, which is the whole of ALTER TABLE that this node executes.
+#
+# The point of the feature is what it does *not* do: no row is rewritten. A row written before the
+# column existed says how many columns it holds, so it reads back with the new one NULL --
+# ADR 0019. Everything here was replayed against a real PostgreSQL 19beta1.
+
+statement ok
+CREATE TABLE a (id int8 PRIMARY KEY, name text)
+
+# tag: INSERT 0 2
+statement ok
+INSERT INTO a VALUES (1, 'one'), (2, 'two')
+
+# tag: ALTER TABLE
+statement ok
+ALTER TABLE a ADD COLUMN note text
+
+# The rows written before the column exists read back with it NULL, and nothing rewrote them.
+query ITT
+SELECT id, name, note FROM a ORDER BY id
+----
+1	one	NULL
+2	two	NULL
+
+# A second one, because one ALTER is the easy case and two is where a column count that was really
+# a boolean would fall over.
+# tag: ALTER TABLE
+statement ok
+ALTER TABLE a ADD COLUMN score int8
+
+query ITTI
+SELECT id, name, note, score FROM a ORDER BY id
+----
+1	one	NULL	NULL
+2	two	NULL	NULL
+
+# A row written after the ALTER carries the new columns, and the old rows still do not.
+# tag: INSERT 0 1
+statement ok
+INSERT INTO a VALUES (3, 'three', 'hi', 42)
+
+query ITTI
+SELECT id, name, note, score FROM a ORDER BY id
+----
+1	one	NULL	NULL
+2	two	NULL	NULL
+3	three	hi	42
+
+# `SELECT *` sees the new columns in the order they were added, which is the order they are stored
+# in.
+query ITTI
+SELECT * FROM a ORDER BY id
+----
+1	one	NULL	NULL
+2	two	NULL	NULL
+3	three	hi	42
+
+# The new column is writable like any other.
+# tag: UPDATE 1
+statement ok
+UPDATE a SET score = 7 WHERE id = 1
+
+query II
+SELECT id, score FROM a ORDER BY id
+----
+1	7
+2	NULL
+3	42
+
+# And filterable: a NULL in a column that was added is a NULL like any other.
+query I
+SELECT id FROM a WHERE score IS NULL
+----
+2
+
+# A column that is already there is 42701, and IF NOT EXISTS makes it a notice instead.
+statement error (42701)
+ALTER TABLE a ADD COLUMN note text
+
+# tag: ALTER TABLE
+statement ok
+ALTER TABLE a ADD COLUMN IF NOT EXISTS note text
+
+# A missing table is 42P01, and IF EXISTS makes that one a notice too.
+statement error (42P01)
+ALTER TABLE nope ADD COLUMN c text
+
+# tag: ALTER TABLE
+statement ok
+ALTER TABLE IF EXISTS nope ADD COLUMN c text
+
+# An index is a relation, so PostgreSQL does not say "is not a table" -- it says the action cannot
+# be performed on it.
+statement error (42809)
+ALTER TABLE a_pkey ADD COLUMN c text
+
+# Several actions in one statement are one atomic change.
+# tag: ALTER TABLE
+statement ok
+ALTER TABLE a ADD COLUMN m1 text, ADD COLUMN m2 bool
+
+query ITB
+SELECT id, m1, m2 FROM a ORDER BY id
+----
+1	NULL	NULL
+2	NULL	NULL
+3	NULL	NULL
+
+# An index built after the ALTER covers the padded NULLs, which is the case that would break if
+# the backfill decoded an old row against the new column list and failed.
+# tag: CREATE INDEX
+statement ok
+CREATE INDEX a_score_idx ON a (score)
+
+query I
+SELECT id FROM a WHERE score = 42
+----
+3
+
+# A new column takes part in a unique index like any other, NULLs included -- PostgreSQL admits
+# any number of NULLs in a UNIQUE column.
+# tag: CREATE INDEX
+statement ok
+CREATE UNIQUE INDEX a_m1_key ON a (m1)
+
+# tag: UPDATE 1
+statement ok
+UPDATE a SET m1 = 'only' WHERE id = 1
+
+statement error (23505)
+UPDATE a SET m1 = 'only' WHERE id = 2

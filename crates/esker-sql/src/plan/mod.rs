@@ -24,8 +24,8 @@ mod expr;
 mod query;
 
 pub use ddl::{
-    Column, CreateIndex, CreateTable, DropIndex, DropTable, UniqueConstraint, index_name,
-    primary_key_name, unique_constraint_name,
+    AlterTable, AlterTableAction, Column, CreateIndex, CreateTable, DropIndex, DropTable,
+    UniqueConstraint, index_name, primary_key_name, unique_constraint_name,
 };
 pub use dml::{Delete, Insert, Update};
 pub use expr::{BinaryOp, Expr, Literal};
@@ -50,6 +50,8 @@ pub enum Statement {
     CreateIndex(CreateIndex),
     /// `DROP INDEX`.
     DropIndex(DropIndex),
+    /// `ALTER TABLE`, of which only `ADD COLUMN` is executed.
+    AlterTable(AlterTable),
     /// `INSERT`.
     Insert(Insert),
     /// `SELECT`.
@@ -93,6 +95,7 @@ impl Statement {
             Statement::DropTable(_) => "DROP TABLE",
             Statement::CreateIndex(_) => "CREATE INDEX",
             Statement::DropIndex(_) => "DROP INDEX",
+            Statement::AlterTable(_) => "ALTER TABLE",
             // Neither of these uses this: their tags carry a count, which only the executor knows.
             Statement::Insert(_) => "INSERT",
             Statement::Select(_) => "SELECT",

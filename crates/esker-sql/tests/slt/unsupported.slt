@@ -78,8 +78,34 @@ CREATE INDEX ON t (a) WHERE a > 0
 statement error (0A000)
 CREATE INDEX CONCURRENTLY ci ON t (a)
 
+# `ALTER TABLE ADD COLUMN` of a nullable column runs (see alter_table.slt). Everything else about
+# ALTER TABLE does not, and each is named rather than lumped together.
 statement error (0A000)
-ALTER TABLE t ADD COLUMN c int8
+ALTER TABLE t ADD COLUMN c int8 NOT NULL
+
+statement error (0A000)
+ALTER TABLE t ADD COLUMN c int8 DEFAULT 0
+
+statement error (0A000)
+ALTER TABLE t ADD COLUMN c int8 UNIQUE
+
+statement error (0A000)
+ALTER TABLE t ADD COLUMN c int8 PRIMARY KEY
+
+statement error (0A000)
+ALTER TABLE t DROP COLUMN a
+
+statement error (0A000)
+ALTER TABLE t RENAME COLUMN a TO b
+
+statement error (0A000)
+ALTER TABLE t ALTER COLUMN a TYPE text
+
+statement error (0A000)
+ALTER TABLE t RENAME TO t2
+
+statement error (0A000)
+ALTER TABLE ONLY t ADD COLUMN c int8
 
 statement error (0A000)
 CREATE VIEW v AS SELECT * FROM t

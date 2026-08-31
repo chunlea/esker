@@ -149,3 +149,36 @@ mod tests {
         assert_eq!(primary_key_name(&long).len(), MAX_IDENTIFIER_BYTES);
     }
 }
+
+/// `ALTER TABLE`.
+///
+/// PostgreSQL takes a list of actions in one statement and applies them together
+/// (`ALTER TABLE t ADD COLUMN a text, ADD COLUMN b text` is one atomic change), so this carries a
+/// list rather than a single action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterTable {
+    /// The table's name, folded.
+    pub name: String,
+    /// `IF EXISTS`: a missing table is a notice rather than a `42P01`.
+    pub if_exists: bool,
+    /// In the order they were written, which is the order the columns land in.
+    pub actions: Vec<AlterTableAction>,
+}
+
+/// One action of an `ALTER TABLE`.
+///
+/// Only `ADD COLUMN` is here. Every other action parses and comes back `0A000` naming itself
+/// (contract C2) — `DROP COLUMN` and a type change because the row format carries a column
+/// *count* and not column identity ([ADR 0019](../../../docs/adr/0019-a-row-says-how-many-columns-it-has.md)),
+/// and the rest because nothing below this crate implements them yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlterTableAction {
+    /// `ADD [COLUMN] [IF NOT EXISTS] <column> <type>`, nullable and with no default — the only
+    /// shape that needs no row rewritten.
+    AddColumn {
+        /// The column to append. Always nullable: `NOT NULL` and `DEFAULT` are refused by name.
+        column: Column,
+        /// `IF NOT EXISTS`: a column that is already there is a notice rather than a `42701`.
+        if_not_exists: bool,
+    },
+}

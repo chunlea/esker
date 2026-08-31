@@ -90,6 +90,7 @@ use esker_sql::pgwire::session::{Execute, Outcome, Params};
 /// visible change and a file cannot go missing without the build noticing.
 pub(crate) const FILES: &[(&str, &str)] = &[
     ("access_paths.slt", include_str!("../slt/access_paths.slt")),
+    ("alter_table.slt", include_str!("../slt/alter_table.slt")),
     ("create_table.slt", include_str!("../slt/create_table.slt")),
     (
         "empty_vs_null.slt",
