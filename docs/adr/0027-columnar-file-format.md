@@ -89,6 +89,15 @@ column with no NULLs pays two bytes for the count and the mask is absent entirel
 duplication: a decoder must not resolve a disagreement between two regions in favour of whichever
 it read first. They disagreeing is corruption and is reported as such.
 
+**A stripe is capped at 4Mi rows**, and that cap is a decode guard before it is a layout choice.
+The row count sizes the null mask and, for any one-bit encoding, an array sixty-four times the
+size of the bytes behind it. The rule every other count in this format obeys — *no count larger
+than the bytes that remain* — does not catch that one, because those bits genuinely are there: a
+chunk of 256 MB really does contain two billion one-bit values, and decoding them into `u64`s
+asks for sixteen gigabytes. So the row count has an absolute limit and the unpacked *output* has
+one too. The cap outranks the writer's options, because a limit a writer can be configured past
+is not a limit.
+
 ## Decision 4: the encoding is chosen by encoding it both ways and keeping the smaller
 
 | Type | Candidates |

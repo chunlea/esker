@@ -84,6 +84,16 @@ pub mod format {
     /// Every chunk ends with `codec:u8 ++ crc32c:u32`.
     pub const CHUNK_TRAILER_SIZE: usize = 5;
 
+    /// Most rows one stripe may hold: 4 Mi.
+    ///
+    /// A pruning granularity nothing wants to exceed — the writer's default is 64Ki and its byte
+    /// budget usually seals sooner — and, more to the point, a decode guard. A chunk's row count
+    /// sizes the null mask and, for a one-bit encoding, an array 64 times the size of the bytes
+    /// behind it: without a cap, a corrupt count of two billion asks for sixteen gigabytes from a
+    /// chunk that is merely large. The cursor's "no count larger than the bytes behind it" rule
+    /// does not catch that one on its own, because those bits really are there.
+    pub const MAX_STRIPE_ROWS: usize = 4 * 1024 * 1024;
+
     /// Longest single text or bytea value this format stores: 64 MiB.
     ///
     /// A decode guard as much as a limit. A corrupt length prefix asking for more than this is

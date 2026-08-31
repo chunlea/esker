@@ -20,6 +20,7 @@ use esker_base::varint;
 
 use crate::cursor::Cursor;
 use crate::error::{Error, Result};
+use crate::format::MAX_COLUMN_BYTES;
 
 /// Bits needed to hold every value up to and including `max`. Zero when `max` is zero.
 pub(crate) fn bit_width(max: u64) -> u32 {
@@ -97,6 +98,16 @@ pub(crate) fn unpack(
             format!("{field} of {count} values at {width} bits cannot be counted"),
         )
     })?;
+    // A narrow width expands: a one-bit run of `n` values is `n/8` bytes on disk and `8n` in
+    // memory, a factor of sixty-four. The cursor's rule — no count larger than the bytes behind
+    // it — is satisfied by such a run and is not enough on its own, so the *output* is bounded
+    // too, by the same limit a decoded column has.
+    if count.saturating_mul(8) > MAX_COLUMN_BYTES {
+        return Err(Error::corruption(
+            "bit packing",
+            format!("{field} of {count} values would decode to more than {MAX_COLUMN_BYTES} bytes"),
+        ));
+    }
     let bytes = cursor.bytes(needed, field)?;
 
     let mut out = Vec::with_capacity(count);
@@ -153,6 +164,7 @@ mod tests {
 
     use super::{bit_width, mask, pack, pack_for, packed_len, unpack, unpack_for};
     use crate::cursor::Cursor;
+    use crate::format::MAX_COLUMN_BYTES;
 
     /// One bit at a time, which is the definition the fast path has to match.
     fn reference_pack(values: &[u64], width: u32) -> Vec<u8> {
@@ -219,6 +231,26 @@ mod tests {
             );
             assert_eq!(cursor.remaining(), 0, "width {width} left bytes behind");
         }
+    }
+
+    /// A narrow width expands sixty-four to one, so the *output* is bounded as well as the
+    /// input. Reachable through a dictionary's entry count, which is bounded only by the bytes
+    /// behind it — 200 MB of one-byte entries would ask for 1.6 GB of `u64`s.
+    #[test]
+    fn a_run_that_would_expand_past_the_column_limit_is_refused() {
+        let mut cursor = Cursor::new(&[], "test");
+        let error = unpack(&mut cursor, MAX_COLUMN_BYTES / 8 + 1, 1, "v").unwrap_err();
+        assert!(error.is_corruption(), "{error}");
+        assert!(
+            error.to_string().contains("would decode to more"),
+            "{error}"
+        );
+
+        // The guard runs before any read, so it is not a disguised short-buffer error: one under
+        // the limit reaches the cursor and fails there instead.
+        let mut cursor = Cursor::new(&[], "test");
+        let error = unpack(&mut cursor, MAX_COLUMN_BYTES / 8, 1, "v").unwrap_err();
+        assert!(error.to_string().contains("remain"), "{error}");
     }
 
     #[test]

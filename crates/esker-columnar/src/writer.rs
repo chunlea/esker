@@ -38,7 +38,7 @@ use crate::column::ColumnBuilder;
 use crate::encode::encode_column;
 use crate::error::{Error, IoResultExt, Result};
 use crate::footer::{ChunkMeta, Footer, StripeMeta, Trailer};
-use crate::format::MAX_COLUMN_BYTES;
+use crate::format::{MAX_COLUMN_BYTES, MAX_STRIPE_ROWS};
 use crate::frame::{Compression, encode_chunk};
 use crate::stats::ColumnStats;
 use crate::value::{Schema, Value};
@@ -167,9 +167,7 @@ impl<'a> Writer<'a> {
         }
         self.stripe_rows += 1;
 
-        if self.stripe_rows >= self.options.stripe_rows
-            || self.accumulated() >= self.options.stripe_bytes
-        {
+        if is_full(self.stripe_rows, self.accumulated(), &self.options) {
             self.seal_stripe()?;
         }
         Ok(())
@@ -279,6 +277,16 @@ impl<'a> Writer<'a> {
     }
 }
 
+/// Whether a stripe holding `rows` rows and `bytes` of accumulated values is full.
+///
+/// [`MAX_STRIPE_ROWS`] is the **format's** cap and outranks the options, because a caller may
+/// legitimately set `stripe_rows` to `usize::MAX` and lean entirely on the byte budget — and a
+/// narrow table would then build a stripe with more rows than any reader will accept. A limit a
+/// writer can be configured past is not a limit.
+fn is_full(rows: usize, bytes: usize, options: &WriterOptions) -> bool {
+    rows >= options.stripe_rows.min(MAX_STRIPE_ROWS) || bytes >= options.stripe_bytes
+}
+
 /// `<path>.tmp`, by extending the file name rather than replacing its extension — a columnar file
 /// may legitimately have none, and `with_extension` would then rewrite the name itself.
 fn temp_path(path: &Path) -> PathBuf {
@@ -294,7 +302,7 @@ mod tests {
     use esker_engine::fs::FileSystem;
     use esker_engine::memfs::MemFileSystem;
 
-    use super::{Writer, WriterOptions, temp_path};
+    use super::{Writer, WriterOptions, is_full, temp_path};
     use crate::value::{ColumnDef, ColumnType, Schema, Value};
 
     fn schema() -> Schema {
@@ -420,5 +428,36 @@ mod tests {
         assert_eq!(summary.rows, 0);
         assert_eq!(summary.stripes, 0);
         assert!(fs.exists(path).unwrap());
+    }
+
+    /// The format's own cap outranks the options, so a caller leaning entirely on the byte
+    /// budget cannot build a stripe no reader would accept.
+    ///
+    /// Four million rows is too slow to write in a test, so the decision itself is the unit —
+    /// which is why it is a function rather than a condition inlined in `append_row`.
+    #[test]
+    fn no_stripe_exceeds_the_format_cap() {
+        use crate::format::MAX_STRIPE_ROWS;
+
+        let unbounded = WriterOptions {
+            stripe_rows: usize::MAX,
+            stripe_bytes: usize::MAX,
+            ..WriterOptions::default()
+        };
+        assert!(!is_full(MAX_STRIPE_ROWS - 1, 0, &unbounded));
+        assert!(
+            is_full(MAX_STRIPE_ROWS, 0, &unbounded),
+            "an unbounded option let a stripe past the format's own cap"
+        );
+
+        // And the ordinary budgets still decide below it.
+        let small = WriterOptions {
+            stripe_rows: 10,
+            stripe_bytes: 100,
+            ..WriterOptions::default()
+        };
+        assert!(!is_full(9, 99, &small));
+        assert!(is_full(10, 0, &small), "the row budget");
+        assert!(is_full(0, 100, &small), "the byte budget");
     }
 }

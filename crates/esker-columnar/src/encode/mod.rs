@@ -22,6 +22,7 @@ use esker_base::varint;
 use crate::column::{Column, ColumnData, NullMask, count_nulls};
 use crate::cursor::Cursor;
 use crate::error::{Error, Result};
+use crate::format::MAX_STRIPE_ROWS;
 use crate::value::ColumnType;
 
 /// Encodes one column into a chunk payload, choosing the encoding and returning both.
@@ -100,6 +101,12 @@ pub fn decode_column(
     }
     let rows = usize::try_from(rows)
         .map_err(|_| Error::corruption("column chunk", format!("{rows} rows in one chunk")))?;
+    if rows > MAX_STRIPE_ROWS {
+        return Err(Error::corruption(
+            "column chunk",
+            format!("{rows} rows in one chunk, over the {MAX_STRIPE_ROWS} a stripe may hold"),
+        ));
+    }
 
     let null_count = cursor.varint("chunk null count")?;
     let null_count = usize::try_from(null_count).unwrap_or(usize::MAX);
@@ -436,5 +443,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The allocation hazard a small fuzz corpus cannot reach: a chunk that claims two billion
+    /// rows of one-bit values. The bits really are there, so the cursor's "no count larger than
+    /// the bytes behind it" rule is satisfied — and the array it would decode into is sixty-four
+    /// times the size of the chunk. Two separate caps refuse it.
+    #[test]
+    fn a_chunk_claiming_more_rows_than_a_stripe_may_hold_is_refused() {
+        use crate::format::MAX_STRIPE_ROWS;
+
+        let mut payload = vec![Encoding::Bitpacked.as_u8()];
+        esker_base::varint::put_u64(MAX_STRIPE_ROWS as u64 + 1, &mut payload);
+        esker_base::varint::put_u64(0, &mut payload);
+        payload.resize(payload.len() + (MAX_STRIPE_ROWS + 1).div_ceil(8), 0);
+
+        let error = decode_column(
+            ColumnType::Bool,
+            MAX_STRIPE_ROWS as u64 + 1,
+            Encoding::Bitpacked,
+            &payload,
+        )
+        .unwrap_err();
+        assert!(error.is_corruption(), "{error}");
+        assert!(error.to_string().contains("a stripe may hold"), "{error}");
+
+        // And one row under the cap is accepted for its shape, so the guard is a cap and not a
+        // blanket refusal — it fails on the missing bytes instead.
+        let mut payload = vec![Encoding::Bitpacked.as_u8()];
+        esker_base::varint::put_u64(MAX_STRIPE_ROWS as u64, &mut payload);
+        esker_base::varint::put_u64(0, &mut payload);
+        let error = decode_column(
+            ColumnType::Bool,
+            MAX_STRIPE_ROWS as u64,
+            Encoding::Bitpacked,
+            &payload,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("remain"), "{error}");
     }
 }
