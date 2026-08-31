@@ -213,11 +213,7 @@ impl<'a> Writer<'a> {
                 offset,
                 len: framed.len() as u64,
                 encoding,
-                stats: ColumnStats {
-                    null_count: column.nulls().nulls() as u64,
-                    min: None,
-                    max: None,
-                },
+                stats: ColumnStats::of(&column),
             });
         }
 

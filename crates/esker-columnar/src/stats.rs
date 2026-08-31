@@ -26,9 +26,11 @@
 
 use esker_base::varint;
 
+use crate::column::{Column, ColumnData};
 use crate::cursor::Cursor;
 use crate::error::{Error, Result};
 use crate::format::MAX_BOUND_LEN;
+use crate::value::ColumnType;
 
 /// Bit 0 of `flags`: a minimum is present.
 const FLAG_HAS_MIN: u8 = 1 << 0;
@@ -62,6 +64,73 @@ impl Bound {
             truncated: false,
         }
     }
+
+    /// The bound of an `Int8` or `TimestampTz` column, or `None` if the bytes are not one.
+    #[must_use]
+    pub fn as_i64(&self) -> Option<i64> {
+        self.bytes
+            .as_slice()
+            .try_into()
+            .ok()
+            .map(i64::from_le_bytes)
+    }
+
+    /// The bound of a `Double` column, or `None` if the bytes are not one.
+    #[must_use]
+    pub fn as_f64(&self) -> Option<f64> {
+        self.bytes
+            .as_slice()
+            .try_into()
+            .ok()
+            .map(f64::from_le_bytes)
+    }
+
+    /// The bound of a `Bool` column, or `None` if the bytes are not one.
+    #[must_use]
+    pub fn as_bool(&self) -> Option<bool> {
+        match self.bytes.as_slice() {
+            [0] => Some(false),
+            [1] => Some(true),
+            _ => None,
+        }
+    }
+
+    /// A lower bound for `value`: the value itself, or a prefix of it, which sorts no higher.
+    fn lower(value: &[u8]) -> Self {
+        if value.len() <= MAX_BOUND_LEN {
+            return Self::exact(value.to_vec());
+        }
+        Self {
+            bytes: value[..MAX_BOUND_LEN].to_vec(),
+            truncated: true,
+        }
+    }
+
+    /// An upper bound for `value`, or `None` when no short one exists.
+    ///
+    /// Take the first [`MAX_BOUND_LEN`] bytes, drop the trailing `0xFF`s and increment what is
+    /// left: the result sorts above every string that starts with that prefix, which includes the
+    /// value it came from. A prefix that is *all* `0xFF` has no such successor, and the honest
+    /// answer is then no upper bound at all rather than one that is subtly wrong — pruning with a
+    /// max that is too low is how a query loses rows.
+    fn upper(value: &[u8]) -> Option<Self> {
+        if value.len() <= MAX_BOUND_LEN {
+            return Some(Self::exact(value.to_vec()));
+        }
+        let mut bytes = value[..MAX_BOUND_LEN].to_vec();
+        while let Some(last) = bytes.last_mut() {
+            if *last == 0xff {
+                bytes.pop();
+            } else {
+                *last += 1;
+                return Some(Self {
+                    bytes,
+                    truncated: true,
+                });
+            }
+        }
+        None
+    }
 }
 
 /// What is known about one column chunk without reading it.
@@ -82,6 +151,87 @@ impl ColumnStats {
     #[must_use]
     pub fn empty() -> Self {
         Self::default()
+    }
+
+    /// Computes the statistics of a decoded column.
+    ///
+    /// Called by the writer on the same [`Column`] it is about to encode, so the statistics
+    /// describe what was actually stored rather than what was handed in. Bounds are over the
+    /// values **present**: a NULL is counted, never compared.
+    ///
+    /// Two floating-point rules are not the obvious ones, and both are what a pruner needs:
+    ///
+    /// * **`NaN` is excluded from the range.** It compares false against everything, so including
+    ///   it would produce a bound that fails every test and a pruner would skip a stripe holding
+    ///   matching rows. A chunk of nothing but `NaN` therefore has no bounds at all.
+    /// * **Zero is signed and comparison is not.** A minimum of `0.0` is written as `-0.0` and a
+    ///   maximum of `0.0` as `+0.0`, so the bound holds whether a reader compares numerically or
+    ///   bitwise.
+    ///
+    /// Text and byte bounds are compared as **bytes**, which is the order the row side's keys use
+    /// (`esker_sql::row`: text sorts by bytes, not by a collation). A truncated text bound may
+    /// therefore split a code point and is not valid UTF-8 — it is a bound, not a value, and its
+    /// truncation flag says so.
+    #[must_use]
+    pub fn of(column: &Column) -> Self {
+        let null_count = column.nulls().nulls() as u64;
+        let (min, max) = match column.data() {
+            ColumnData::Ints(values) => match (values.iter().min(), values.iter().max()) {
+                (Some(low), Some(high)) => (
+                    Some(Bound::exact(low.to_le_bytes().to_vec())),
+                    Some(Bound::exact(high.to_le_bytes().to_vec())),
+                ),
+                _ => (None, None),
+            },
+            ColumnData::Doubles(values) => double_bounds(values),
+            ColumnData::Bools(values) => {
+                if values.is_empty() {
+                    (None, None)
+                } else {
+                    let any_false = values.iter().any(|value| !*value);
+                    let any_true = values.iter().any(|value| *value);
+                    (
+                        Some(Bound::exact(vec![u8::from(!any_false)])),
+                        Some(Bound::exact(vec![u8::from(any_true)])),
+                    )
+                }
+            }
+            ColumnData::Bytes { offsets, data } => {
+                let values = offsets
+                    .windows(2)
+                    .map(|pair| &data[pair[0] as usize..pair[1] as usize]);
+                match values.clone().min().zip(values.max()) {
+                    Some((low, high)) => (Some(Bound::lower(low)), Bound::upper(high)),
+                    None => (None, None),
+                }
+            }
+        };
+        Self {
+            null_count,
+            min,
+            max,
+        }
+    }
+
+    /// Whether the bounds are shaped for a column of type `ty`.
+    ///
+    /// A fixed-width type's bound is always its own width and is never truncated; a variable
+    /// length one's is at most [`MAX_BOUND_LEN`]. Checked by the writer's tests rather than on the
+    /// read path, where the type is already known and a wrong width simply fails to interpret.
+    #[must_use]
+    pub fn fit(&self, ty: ColumnType) -> bool {
+        let width = match ty {
+            ColumnType::Int8 | ColumnType::TimestampTz | ColumnType::Double => Some(8),
+            ColumnType::Bool => Some(1),
+            ColumnType::Text | ColumnType::Bytea => None,
+        };
+        [self.min.as_ref(), self.max.as_ref()]
+            .into_iter()
+            .flatten()
+            .all(|bound| match width {
+                Some(width) => bound.bytes.len() == width && !bound.truncated,
+                None => bound.bytes.len() <= MAX_BOUND_LEN,
+            })
     }
 
     /// Whether both bounds are values found in the chunk rather than approximations.
@@ -177,11 +327,49 @@ impl ColumnStats {
     }
 }
 
+/// The minimum and maximum of a run of doubles, under the two rules [`ColumnStats::of`] documents.
+fn double_bounds(values: &[f64]) -> (Option<Bound>, Option<Bound>) {
+    let mut low = f64::INFINITY;
+    let mut high = f64::NEG_INFINITY;
+    let mut seen = false;
+    for value in values {
+        if value.is_nan() {
+            continue;
+        }
+        seen = true;
+        if *value < low {
+            low = *value;
+        }
+        if *value > high {
+            high = *value;
+        }
+    }
+    if !seen {
+        return (None, None);
+    }
+    // `-0.0 == 0.0`, so the comparisons above may have kept either; widen to the side that holds
+    // under a bitwise reading too.
+    if low == 0.0 {
+        low = -0.0;
+    }
+    if high == 0.0 {
+        high = 0.0;
+    }
+    (
+        Some(Bound::exact(low.to_le_bytes().to_vec())),
+        Some(Bound::exact(high.to_le_bytes().to_vec())),
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::{Bound, ColumnStats};
+    use crate::column::Column;
     use crate::cursor::Cursor;
     use crate::format::MAX_BOUND_LEN;
+    use crate::value::{ColumnType, Value};
 
     fn round_trip(stats: &ColumnStats) -> ColumnStats {
         let mut bytes = Vec::new();
@@ -279,6 +467,304 @@ mod tests {
         for cut in 0..bytes.len() {
             let mut cursor = Cursor::new(&bytes[..cut], "test");
             let _ = ColumnStats::decode_from(&mut cursor);
+        }
+    }
+
+    fn stats_of(ty: ColumnType, values: &[Value]) -> ColumnStats {
+        ColumnStats::of(&Column::build(ty, values).unwrap())
+    }
+
+    #[test]
+    fn integer_bounds_are_the_extremes_that_are_there() {
+        let stats = stats_of(
+            ColumnType::Int8,
+            &[
+                Value::Int8(7),
+                Value::Null,
+                Value::Int8(i64::MIN),
+                Value::Int8(i64::MAX),
+            ],
+        );
+        assert_eq!(stats.null_count, 1);
+        assert_eq!(stats.min.as_ref().unwrap().as_i64(), Some(i64::MIN));
+        assert_eq!(stats.max.as_ref().unwrap().as_i64(), Some(i64::MAX));
+        assert!(stats.bounds_are_exact());
+        assert!(stats.fit(ColumnType::Int8));
+    }
+
+    /// A chunk with nothing in it has nothing to bound, and says so rather than guessing.
+    #[test]
+    fn a_column_of_nothing_but_nulls_has_no_bounds() {
+        for ty in ColumnType::ALL {
+            let stats = stats_of(ty, &vec![Value::Null; 20]);
+            assert_eq!(stats.null_count, 20, "{ty:?}");
+            assert!(stats.min.is_none() && stats.max.is_none(), "{ty:?}");
+            assert!(stats.fit(ty));
+
+            let empty = stats_of(ty, &[]);
+            assert_eq!(empty, ColumnStats::empty(), "{ty:?}");
+        }
+    }
+
+    #[test]
+    fn boolean_bounds_say_which_values_occur() {
+        let all_true = stats_of(ColumnType::Bool, &vec![Value::Bool(true); 3]);
+        assert_eq!(all_true.min.as_ref().unwrap().as_bool(), Some(true));
+        assert_eq!(all_true.max.as_ref().unwrap().as_bool(), Some(true));
+
+        let all_false = stats_of(ColumnType::Bool, &vec![Value::Bool(false); 3]);
+        assert_eq!(all_false.min.as_ref().unwrap().as_bool(), Some(false));
+        assert_eq!(all_false.max.as_ref().unwrap().as_bool(), Some(false));
+
+        let both = stats_of(
+            ColumnType::Bool,
+            &[Value::Bool(false), Value::Null, Value::Bool(true)],
+        );
+        assert_eq!(both.min.as_ref().unwrap().as_bool(), Some(false));
+        assert_eq!(both.max.as_ref().unwrap().as_bool(), Some(true));
+        assert_eq!(both.null_count, 1);
+    }
+
+    /// The rule a pruner depends on: a `NaN` never narrows the range.
+    #[test]
+    fn nan_is_not_in_the_range() {
+        let stats = stats_of(
+            ColumnType::Double,
+            &[
+                Value::Double(f64::NAN),
+                Value::Double(3.0),
+                Value::Double(-1.0),
+                Value::Double(f64::NAN),
+            ],
+        );
+        assert_eq!(stats.min.as_ref().unwrap().as_f64(), Some(-1.0));
+        assert_eq!(stats.max.as_ref().unwrap().as_f64(), Some(3.0));
+
+        let only_nan = stats_of(ColumnType::Double, &vec![Value::Double(f64::NAN); 5]);
+        assert!(
+            only_nan.min.is_none() && only_nan.max.is_none(),
+            "a chunk of NaN has no range"
+        );
+        assert_eq!(only_nan.null_count, 0, "a NaN is not a NULL");
+
+        let infinities = stats_of(
+            ColumnType::Double,
+            &[
+                Value::Double(f64::NEG_INFINITY),
+                Value::Double(f64::INFINITY),
+            ],
+        );
+        assert_eq!(
+            infinities.min.as_ref().unwrap().as_f64(),
+            Some(f64::NEG_INFINITY)
+        );
+        assert_eq!(
+            infinities.max.as_ref().unwrap().as_f64(),
+            Some(f64::INFINITY)
+        );
+    }
+
+    /// The other rule: a zero bound is widened to the side that holds bitwise as well.
+    #[test]
+    fn a_zero_bound_is_signed_to_the_safe_side() {
+        let stats = stats_of(
+            ColumnType::Double,
+            &[Value::Double(0.0), Value::Double(5.0)],
+        );
+        assert_eq!(
+            stats.min.as_ref().unwrap().as_f64().unwrap().to_bits(),
+            (-0.0f64).to_bits(),
+            "a minimum of zero must be negative zero"
+        );
+
+        let stats = stats_of(
+            ColumnType::Double,
+            &[Value::Double(-5.0), Value::Double(-0.0)],
+        );
+        assert_eq!(
+            stats.max.as_ref().unwrap().as_f64().unwrap().to_bits(),
+            0.0f64.to_bits(),
+            "a maximum of zero must be positive zero"
+        );
+    }
+
+    /// A long value is bounded, not stored: the flags say the bounds are approximate.
+    #[test]
+    fn long_values_are_truncated_into_bounds_that_still_hold() {
+        let low = vec![b'a'; MAX_BOUND_LEN + 40];
+        let high = {
+            let mut bytes = vec![b'z'; MAX_BOUND_LEN + 40];
+            bytes[MAX_BOUND_LEN - 1] = b'm';
+            bytes
+        };
+        let stats = stats_of(
+            ColumnType::Bytea,
+            &[Value::Bytea(low.clone()), Value::Bytea(high.clone())],
+        );
+
+        let min = stats.min.as_ref().unwrap();
+        let max = stats.max.as_ref().unwrap();
+        assert!(min.truncated && max.truncated);
+        assert!(!stats.bounds_are_exact());
+        assert_eq!(min.bytes.len(), MAX_BOUND_LEN);
+        assert!(
+            min.bytes.as_slice() <= low.as_slice(),
+            "the minimum does not bound"
+        );
+        assert!(
+            max.bytes.as_slice() >= high.as_slice(),
+            "the maximum does not bound"
+        );
+        assert!(stats.fit(ColumnType::Bytea));
+
+        // A value exactly at the limit is stored whole and is exact.
+        let exact = stats_of(ColumnType::Text, &[Value::Text("x".repeat(MAX_BOUND_LEN))]);
+        assert!(exact.bounds_are_exact());
+    }
+
+    /// The one case with no short upper bound at all, answered honestly rather than wrongly.
+    #[test]
+    fn a_value_of_all_ones_has_no_upper_bound() {
+        let stats = stats_of(
+            ColumnType::Bytea,
+            &[Value::Bytea(vec![0xff; MAX_BOUND_LEN + 1])],
+        );
+        assert!(stats.min.is_some(), "a lower bound always exists");
+        assert!(
+            stats.max.is_none(),
+            "no 64-byte string sorts above one of all 0xff"
+        );
+
+        // One byte below the top still has one.
+        let mut nearly = vec![0xff; MAX_BOUND_LEN + 1];
+        nearly[MAX_BOUND_LEN - 1] = 0xfe;
+        let stats = stats_of(ColumnType::Bytea, &[Value::Bytea(nearly.clone())]);
+        let max = stats.max.as_ref().unwrap();
+        assert!(max.truncated);
+        assert!(max.bytes.as_slice() >= nearly.as_slice());
+    }
+
+    fn value_of(ty: ColumnType) -> impl Strategy<Value = Value> {
+        let present = match ty {
+            ColumnType::Int8 => any::<i64>().prop_map(Value::Int8).boxed(),
+            ColumnType::TimestampTz => any::<i64>().prop_map(Value::TimestampTz).boxed(),
+            ColumnType::Bool => any::<bool>().prop_map(Value::Bool).boxed(),
+            ColumnType::Double => prop_oneof![
+                Just(Value::Double(f64::NAN)),
+                Just(Value::Double(-0.0)),
+                any::<f64>().prop_map(Value::Double),
+            ]
+            .boxed(),
+            ColumnType::Text => prop::collection::vec(any::<char>(), 0..90)
+                .prop_map(|chars| Value::Text(chars.into_iter().collect()))
+                .boxed(),
+            ColumnType::Bytea => prop::collection::vec(any::<u8>(), 0..90)
+                .prop_map(Value::Bytea)
+                .boxed(),
+        };
+        prop_oneof![1 => Just(Value::Null), 5 => present]
+    }
+
+    /// Statistics are checked against the values themselves, never against the accumulator that
+    /// produced them: a bound that is subtly false is worse than one that is absent, because a
+    /// pruner would drop rows rather than report an error.
+    fn bounds_hold(ty: ColumnType, values: &[Value], stats: &ColumnStats) -> Result<(), String> {
+        let present: Vec<&Value> = values.iter().filter(|value| !value.is_null()).collect();
+        let expected_nulls = (values.len() - present.len()) as u64;
+        if stats.null_count != expected_nulls {
+            return Err(format!("{} nulls, not {expected_nulls}", stats.null_count));
+        }
+        if !stats.fit(ty) {
+            return Err("bounds of the wrong shape for the type".into());
+        }
+
+        let (Some(min), Some(max)) = (stats.min.as_ref(), stats.max.as_ref()) else {
+            return Ok(());
+        };
+        for value in present {
+            let inside = match value {
+                Value::Int8(v) | Value::TimestampTz(v) => {
+                    min.as_i64() <= Some(*v) && Some(*v) <= max.as_i64()
+                }
+                Value::Bool(v) => {
+                    min.as_bool().is_some_and(|low| low <= *v)
+                        && max.as_bool().is_some_and(|high| *v <= high)
+                }
+                // A NaN is outside every range by construction, which is the rule.
+                Value::Double(v) => {
+                    v.is_nan()
+                        || (min.as_f64().is_some_and(|low| low <= *v)
+                            && max.as_f64().is_some_and(|high| *v <= high))
+                }
+                Value::Text(v) => {
+                    min.bytes.as_slice() <= v.as_bytes() && v.as_bytes() <= max.bytes.as_slice()
+                }
+                Value::Bytea(v) => {
+                    min.bytes.as_slice() <= v.as_slice() && v.as_slice() <= max.bytes.as_slice()
+                }
+                Value::Null => true,
+            };
+            if !inside {
+                return Err(format!("{value:?} is outside {min:?}..{max:?}"));
+            }
+        }
+        Ok(())
+    }
+
+    proptest! {
+        #[test]
+        fn int_statistics_hold(values in prop::collection::vec(value_of(ColumnType::Int8), 0..60)) {
+            let stats = stats_of(ColumnType::Int8, &values);
+            prop_assert!(bounds_hold(ColumnType::Int8, &values, &stats).is_ok());
+        }
+
+        #[test]
+        fn timestamp_statistics_hold(
+            values in prop::collection::vec(value_of(ColumnType::TimestampTz), 0..60),
+        ) {
+            let stats = stats_of(ColumnType::TimestampTz, &values);
+            prop_assert!(bounds_hold(ColumnType::TimestampTz, &values, &stats).is_ok());
+        }
+
+        #[test]
+        fn bool_statistics_hold(values in prop::collection::vec(value_of(ColumnType::Bool), 0..60)) {
+            let stats = stats_of(ColumnType::Bool, &values);
+            prop_assert!(bounds_hold(ColumnType::Bool, &values, &stats).is_ok());
+        }
+
+        #[test]
+        fn double_statistics_hold(
+            values in prop::collection::vec(value_of(ColumnType::Double), 0..60),
+        ) {
+            let stats = stats_of(ColumnType::Double, &values);
+            prop_assert!(bounds_hold(ColumnType::Double, &values, &stats).is_ok());
+        }
+
+        #[test]
+        fn text_statistics_hold(values in prop::collection::vec(value_of(ColumnType::Text), 0..40)) {
+            let stats = stats_of(ColumnType::Text, &values);
+            if let Err(why) = bounds_hold(ColumnType::Text, &values, &stats) {
+                prop_assert!(false, "{}", why);
+            }
+        }
+
+        #[test]
+        fn bytea_statistics_hold(
+            values in prop::collection::vec(value_of(ColumnType::Bytea), 0..40),
+        ) {
+            let stats = stats_of(ColumnType::Bytea, &values);
+            if let Err(why) = bounds_hold(ColumnType::Bytea, &values, &stats) {
+                prop_assert!(false, "{}", why);
+            }
+        }
+
+        /// And the statistics survive the footer they are written into.
+        #[test]
+        fn statistics_round_trip_through_the_footer(
+            values in prop::collection::vec(value_of(ColumnType::Bytea), 0..40),
+        ) {
+            let stats = stats_of(ColumnType::Bytea, &values);
+            prop_assert_eq!(round_trip(&stats), stats);
         }
     }
 }
