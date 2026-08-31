@@ -1,0 +1,23 @@
+crates/esker-columnar/src/stats.rs
+  s_cf8601956e2620::t_a071ffeb793b17 29,33,67-133,156-236,330-363,366-367,369,372,472-769
+crates/esker-columnar/src/writer.rs
+  s_cf8601956e2620::t_33d5f2832ab6d7 216
+crates/esker-columnar/tests/statistics.rs
+  s_cf8601956e2620::t_b5e61300fa4a84 1-189
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "9cd4ba27d7f159d887eec75c34f0aa1b8962ebb3",
+  "prompts": {},
+  "sessions": {
+    "s_cf8601956e2620": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "732aecbc-5268-4943-836e-a49ba67b2585",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
