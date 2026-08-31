@@ -324,9 +324,19 @@ Either way the refusal is a write-write conflict on `k` and the loser must start
 ([ADR 0016](adr/0016-txnkv-on-the-wire.md) decision 1), so the refusal names the key rather than only
 the transaction — and it has to, because a lost race on an ordinary row and a lost race on a unique
 index entry are the same event to this layer and different events to the one above it.
-`esker_client::Error::TxnConflict` carries `key: Option<Bytes>`; `None` means the method that refused
-does not answer per key (`Commit`, `Rollback`) and no key was named, which is not the same as no key
-having lost.
+The refusal is a **struct variant**, and this is its shape — match against it as written:
+
+```rust
+esker_client::Error::TxnConflict {
+    start_ts: u64,          // the losing transaction's snapshot
+    commit_ts: u64,         // the winner's commit timestamp
+    key: Option<Bytes>,     // which key lost, when the method answered per key
+}
+```
+
+`key` is `Some` for a `Prewrite`, which answers per key; `None` for a `Commit` or a `Rollback`, which
+answer for the batch. `None` means **no key was named**, which is not the same as no key having lost
+— this layer will not invent one to fill the field.
 
 `esker-sql` builds unique-index enforcement on exactly this: the index entry is the key, a snapshot
 read proves it absent, and an ordinary `Put` claims it. No `SELECT … FOR UPDATE` and no `Lock`-kind
