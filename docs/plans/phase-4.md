@@ -958,3 +958,24 @@ seeds, so they pass with a few followers stranded; this one heals a cut-off foll
 that drops one message in three and requires **every** seed to repair it. In the simulator no
 driver streams bytes, so no report is possible — the only mechanism that can satisfy it is the tick
 timeout, which is why dropping that one line turns it red. It costs a second.
+
+## 16. The PD→store operator seam, checked
+
+The placement-driver lane's close-out flagged `pd_remote.rs` as dropping the operator from a
+region-heartbeat response, which would mean no decided operator ever reaches a store over a real
+wire. **It does not**, at HEAD: `tests/pd_wire.rs` stands a placement driver up on a socket, has it
+answer a region heartbeat with `AddPeer`, and requires the region's own peer list to gain the peer
+— which happens only after the conf-change entry has been proposed, committed and applied.
+
+The test is worth keeping whatever the report was about, because the seam it covers is the one an
+in-process fake skips entirely. Every other operator test hands the store a `FakePd` directly, so
+`PdResp::RegionHeartbeat`'s encoding, `PdChannel`, the blocking bridge in `pd_remote.rs` and the
+heartbeat schedule that collects the answer are all unexercised — and an operator dropped anywhere
+along that path is a placement driver whose decisions silently never happen, with nothing failing.
+Mutation-checked: making `RemotePd::region_heartbeat` return `Ok(None)`, which is the reported bug
+exactly, turns it red.
+
+The other half was already covered from the far end: `esker-pd/tests/loopback.rs` has a real
+placement driver decide an `AddPeer` and reads it back over a socket through a `PdChannel`. The two
+tests meet at `PdChannel`, so the path from a scheduler's decision to a Raft proposal is now
+covered end to end by tests on both sides of it.
