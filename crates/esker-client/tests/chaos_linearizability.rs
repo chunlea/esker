@@ -47,7 +47,15 @@ use tempfile::TempDir;
 
 const REGION: u64 = 1;
 /// Keys the clients share. Few on purpose: collisions are what make a history worth checking.
-const KEYS: usize = 3;
+///
+/// Five rather than three, and the reason is the checker's cost rather than its coverage. The
+/// search is superlinear in one key's history length: at three keys a run recorded about 67
+/// operations per key, and a 67-operation history was measured taking **more than 73 million
+/// search steps — 146 seconds — and still not deciding**, where a 66-operation one decided
+/// inside a million. That is a cliff, not a slope, and the cheap side of it is a shorter
+/// per-key history. Six clients over five keys still collide constantly, which is what the
+/// histories are for; the run's total operation count under the kills is unchanged.
+const KEYS: usize = 5;
 /// Concurrent clients.
 const CLIENTS: usize = 6;
 /// The seed every node's election timer is drawn from.
@@ -482,6 +490,75 @@ fn final_reads(addrs: &[SocketAddr], recorder: &Recorder) {
     }
 }
 
+/// The first search budget, and how it grows when the search runs out of it.
+///
+/// The search is deterministic, so a history that exhausts a budget exhausts it again at the same
+/// size: the only way forward is a bigger one. Growth is by a fixed factor from a fixed start, so
+/// which budgets were tried is a property of the code and not of the day — a run that reports
+/// exhaustion reports exactly which three numbers it tried.
+const FIRST_BUDGET: u64 = 1_000_000;
+const BUDGET_GROWTH: u64 = 8;
+const BUDGET_ATTEMPTS: u32 = 3;
+
+/// What checking one key's history concluded. **Exhaustion is not a violation**, and keeping them
+/// apart is the whole point of this type.
+///
+/// A checker that fails on exhaustion cries wolf: the run is reported as a lost write when nothing
+/// was lost, and the next person to see it re-runs the test until it passes. One that *passes* on
+/// exhaustion is worse — it is blind on exactly the histories that are hardest to explain, which
+/// are the ones a real violation lives in. So the search is retried at a larger budget, a bounded
+/// number of times, and if it still cannot decide the run fails **naming exhaustion** rather than
+/// claiming a violation it did not find.
+#[derive(Debug)]
+enum Verdict {
+    /// Some sequential order explains the history.
+    Linearizable {
+        /// How many operations the order placed.
+        placed: usize,
+    },
+    /// No order explains it. This is the failure the test exists for.
+    Violation {
+        /// The checker's rendering, for the message.
+        report: String,
+    },
+    /// The search could not decide within the budgets it was given.
+    Exhausted {
+        /// Steps taken on the final, largest attempt.
+        steps: u64,
+        /// The budget that attempt was given.
+        budget: u64,
+    },
+}
+
+/// Checks one history, growing the budget while the search keeps running out of it.
+fn verdict_for(history: &History<RegisterInput, RegisterOutput>) -> Verdict {
+    verdict_from(history, FIRST_BUDGET)
+}
+
+/// [`verdict_for`], starting from a given budget so that the controls can reach the exhaustion
+/// path without building a history that takes a million steps to decide.
+fn verdict_from(history: &History<RegisterInput, RegisterOutput>, first: u64) -> Verdict {
+    let mut budget = first;
+    for attempt in 1..=BUDGET_ATTEMPTS {
+        match Checker::with_budget(budget).check(&Register, history) {
+            CheckOutcome::Linearizable { order } => {
+                return Verdict::Linearizable {
+                    placed: order.len(),
+                };
+            }
+            // A decided violation is decided at any budget: the search proved no order exists.
+            CheckOutcome::NotLinearizable { report, .. } => return Verdict::Violation { report },
+            CheckOutcome::Inconclusive { steps } => {
+                if attempt == BUDGET_ATTEMPTS {
+                    return Verdict::Exhausted { steps, budget };
+                }
+                budget *= BUDGET_GROWTH;
+            }
+        }
+    }
+    unreachable!("the loop returns on its last attempt")
+}
+
 /// Every key's history has to be linearizable against the register model.
 fn check_histories(recorder: &Recorder, killed: u32) {
     for key in 0..KEYS {
@@ -489,18 +566,24 @@ fn check_histories(recorder: &Recorder, killed: u32) {
         if history.is_empty() {
             continue;
         }
-        let outcome = Checker::new().check(&Register, &history);
-        match outcome {
-            CheckOutcome::Linearizable { order } => {
+        match verdict_for(&history) {
+            Verdict::Linearizable { placed } => {
                 println!(
-                    "key {key}: {} operations linearizable ({} pending)",
-                    order.len(),
+                    "key {key}: {placed} operations linearizable ({} pending)",
                     history.pending()
                 );
             }
-            other => panic!(
+            Verdict::Violation { report } => panic!(
                 "key {key}: the history of a three-node cluster with {killed} leader kills is \
-                 not linearizable.\n{other}"
+                 NOT linearizable — an acknowledged write was lost or reordered.\n{report}"
+            ),
+            Verdict::Exhausted { steps, budget } => panic!(
+                "key {key}: the linearizability search ran out of budget after {steps} steps at \
+                 {budget}, having grown it {BUDGET_ATTEMPTS} times from {FIRST_BUDGET}. This is \
+                 EXHAUSTION, not a violation: no order was ruled out. The history has {} \
+                 operations ({} pending); raise FIRST_BUDGET or shorten the run.",
+                history.len(),
+                history.pending()
             ),
         }
     }
@@ -521,4 +604,69 @@ fn a_killed_leader_never_costs_an_acknowledged_write() {
 #[ignore = "the 50-kill acceptance run; minutes, not seconds"]
 fn fifty_leader_kills_under_load() {
     battery(50, Duration::from_millis(500));
+}
+
+// ---------------------------------------------------------------------------------------------
+// The controls
+//
+// House doctrine: a test that cannot fail proves nothing on the day the mechanism breaks. The
+// linearizability check is the whole assertion of this file, so these three run in the gate — not
+// behind `#[ignore]` — and each one puts a *known* answer through the same `verdict_from` the real
+// test uses, rather than through a copy of it.
+// ---------------------------------------------------------------------------------------------
+
+/// A history in which an acknowledged write vanished. Strictly sequential — the write is answered
+/// before the read is invoked — so the only possible order is `[write, read]` and the read must
+/// see the written value. Seeing an absent key instead is exactly the failure this whole file
+/// exists to catch: a lost log entry.
+fn a_lost_write() -> History<RegisterInput, RegisterOutput> {
+    let mut history = History::new();
+    let write = history.invoke(1, RegisterInput::Write(Bytes::from_static(b"1")));
+    let _ = history.respond(write, RegisterOutput::Written);
+    let read = history.invoke(2, RegisterInput::Read);
+    let _ = history.respond(read, RegisterOutput::Value(None));
+    history
+}
+
+/// The control that matters: the checker still catches a real violation.
+#[test]
+fn the_checker_still_catches_a_lost_write() {
+    match verdict_for(&a_lost_write()) {
+        Verdict::Violation { report } => assert!(!report.is_empty(), "a violation with no report"),
+        other => panic!(
+            "a lost acknowledged write was not reported as a violation: {other:?}\n\
+             the assertion of this whole file is this check, and it just proved it cannot fail"
+        ),
+    }
+}
+
+/// The other half of the same claim: exhaustion is **never** dressed up as a violation.
+///
+/// The same history, given a budget of nothing. The search cannot rule anything out, so the
+/// honest answer is that it does not know — and the code says so with a different variant, which
+/// is what stops a hard history from being reported as a lost write.
+#[test]
+fn exhaustion_is_never_reported_as_a_violation() {
+    match verdict_from(&a_lost_write(), 0) {
+        Verdict::Exhausted { budget, .. } => assert_eq!(budget, 0, "the budget grew from nothing"),
+        other => panic!("a search with no budget claimed to have decided something: {other:?}"),
+    }
+}
+
+/// And the retry is a retry, not a shrug: a history the first budget cannot decide is decided by
+/// a later one, and comes back as the *decision*.
+///
+/// One step is not enough to disprove even a two-operation history; eight is. So this run goes
+/// through the exhaustion branch, grows the budget, and still ends at `Violation` — which is the
+/// behaviour that makes the flake fix safe rather than merely quiet.
+#[test]
+fn a_grown_budget_still_reaches_the_decision() {
+    assert!(
+        BUDGET_ATTEMPTS > 1 && BUDGET_GROWTH > 1,
+        "there is no growth to test"
+    );
+    match verdict_from(&a_lost_write(), 1) {
+        Verdict::Violation { .. } => {}
+        other => panic!("growing the budget lost the decision: {other:?}"),
+    }
 }
