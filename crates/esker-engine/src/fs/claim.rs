@@ -206,9 +206,15 @@ pub enum ClaimError {
         objects: usize,
     },
 
-    /// The marker is there and unreadable.
-    #[error("the claim marker under {0}")]
-    Corrupt(String),
+    /// The marker is there and cannot be read. Refused rather than overruled — including under
+    /// `adopt_unclaimed`, because a marker that will not parse might still be somebody's.
+    #[error("the SST store prefix {prefix:?} carries a claim marker that cannot be read: {why}")]
+    Unreadable {
+        /// The prefix that was asked for.
+        prefix: String,
+        /// What is wrong with the bytes.
+        why: Box<ClaimError>,
+    },
 
     /// The marker's bytes are not a marker this build understands.
     #[error("{0}")]
@@ -312,7 +318,13 @@ pub fn settle(
 /// A marker that cannot be read is not a marker that can be overruled: it is refused the same
 /// way as one naming somebody else, because it might be one.
 fn verify(prefix: &str, ours: Identity, body: &[u8]) -> Result<(), ClaimError> {
-    let theirs = Identity::decode(body)?;
+    // The prefix goes into the message here rather than being left to the caller: an operator
+    // reading "the claim marker's CRC32C is ..." needs to be told *which* prefix's marker, and
+    // by the time this reaches a log the caller's context is gone.
+    let theirs = Identity::decode(body).map_err(|error| ClaimError::Unreadable {
+        prefix: prefix.to_owned(),
+        why: Box::new(error),
+    })?;
     if theirs.claim == ours.claim {
         return Ok(());
     }
