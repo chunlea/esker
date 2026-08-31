@@ -1,0 +1,146 @@
+# LIMIT and OFFSET at their edges.
+#
+# The interesting cases are all the ones where something is zero, absent, or past the end, because
+# those are where an off-by-one hides: a `LIMIT 0` that returns one row and an `OFFSET` past the end
+# that wraps are both the sort of bug a test with round numbers never sees.
+#
+# Every answer here came from a real PostgreSQL 19.
+
+statement ok
+CREATE TABLE l (id int8 PRIMARY KEY, n int8)
+
+# tag: INSERT 0 5
+statement ok
+INSERT INTO l VALUES (1, 10), (2, NULL), (3, 30), (4, NULL), (5, 50)
+
+# --- zero ----------------------------------------------------------------------------------------
+
+query I
+SELECT id FROM l ORDER BY id LIMIT 0
+----
+
+# An OFFSET under a LIMIT 0 changes nothing: there is nothing to skip into.
+query I
+SELECT id FROM l ORDER BY id LIMIT 0 OFFSET 2
+----
+
+# `OFFSET 0` is not "no offset applied differently" -- it is the whole result.
+query I
+SELECT id FROM l ORDER BY id OFFSET 0
+----
+1
+2
+3
+4
+5
+
+# --- past the end ---------------------------------------------------------------------------------
+#
+# Exactly the row count, and well past it, are both empty rather than an error and rather than a
+# wrap to the start.
+
+query I
+SELECT id FROM l ORDER BY id OFFSET 5
+----
+
+query I
+SELECT id FROM l ORDER BY id OFFSET 99
+----
+
+query I
+SELECT id FROM l ORDER BY id LIMIT 2 OFFSET 99
+----
+
+# One short of the end returns the one row that is left.
+query I
+SELECT id FROM l ORDER BY id OFFSET 4
+----
+5
+
+# A LIMIT larger than what remains takes what remains.
+query I
+SELECT id FROM l ORDER BY id LIMIT 99 OFFSET 3
+----
+4
+5
+
+# --- NULL means "no limit", which is a rule and not an oversight ------------------------------------
+
+query I
+SELECT id FROM l ORDER BY id LIMIT NULL
+----
+1
+2
+3
+4
+5
+
+# And it composes with an OFFSET that is still applied.
+query I
+SELECT id FROM l ORDER BY id LIMIT NULL OFFSET 3
+----
+4
+5
+
+# `OFFSET NULL` is zero, not "skip everything".
+query I
+SELECT id FROM l ORDER BY id OFFSET NULL
+----
+1
+2
+3
+4
+5
+
+# --- an empty result underneath --------------------------------------------------------------------
+
+query I
+SELECT id FROM l WHERE id = 99 ORDER BY id LIMIT 3
+----
+
+query I
+SELECT id FROM l WHERE id = 99 ORDER BY id LIMIT 3 OFFSET 2
+----
+
+# --- the window is taken after the sort, not before -------------------------------------------------
+#
+# This is the one that would look right with a stable storage order and be wrong the moment the sort
+# mattered: rows 2 and 4 hold the NULLs and are last by id, so a LIMIT applied before the ORDER BY
+# would return 1 and 2.
+
+query I
+SELECT id FROM l ORDER BY n NULLS FIRST, id LIMIT 2
+----
+2
+4
+
+query I
+SELECT id FROM l ORDER BY n DESC, id LIMIT 2
+----
+2
+4
+
+query I
+SELECT id FROM l ORDER BY n NULLS LAST, id LIMIT 2 OFFSET 1
+----
+3
+5
+
+# --- and it is taken after the filter, not before ----------------------------------------------------
+
+query I
+SELECT id FROM l WHERE n IS NOT NULL ORDER BY id LIMIT 2
+----
+1
+3
+
+# --- negative is an error, and the two clauses have different codes ------------------------------------
+
+statement error (2201W)
+SELECT id FROM l LIMIT -1
+
+statement error (2201X)
+SELECT id FROM l OFFSET -1
+
+statement error (2201W)
+SELECT id FROM l ORDER BY id LIMIT -1 OFFSET 2
