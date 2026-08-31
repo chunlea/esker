@@ -480,19 +480,21 @@ impl Store {
         }
 
         let (kind, node, store_id) = match operator {
-            // **Learner first, and PD decides when the second step happens.** An `AddPeer` for a
-            // peer this region has never heard of adds a *learner*: it receives the log and the
-            // snapshot without voting, so it never makes a quorum harder to reach while it is
-            // catching up. The same operator for a peer that is *already a learner* is the
-            // promotion.
+            // **Learner first, and the store finishes the job.** An `AddPeer` for a peer this
+            // region has never heard of adds a *learner*: it receives the log and the snapshot
+            // without voting, so it never makes a quorum harder to reach while it is catching up.
+            // The promotion that follows is the leader's, on
+            // [`Store::promote_caught_up_learners`], because "has this learner caught up" is a
+            // statement about its match index and the leader is the only party that can see one.
             //
-            // Splitting it that way is not a shortcut around the contract, it is where the
-            // information is. "Has this learner caught up" is a statement about its match index,
-            // which `esker-raft` does not expose (`docs/plans/phase-4.md` §13.2) — but PD sees
-            // every store's region heartbeats, including the learner's own `applied_index`, so PD
-            // can compare them and this store cannot. A leader that promoted on a guess would put
-            // a peer that is not caught up into the quorum, and the group would stop committing
-            // until it was.
+            // 4c put the promotion here instead, as "the same operator for a peer that is already
+            // a learner", and that is what phase-4 acceptance stalled on: PD stops re-sending an
+            // operator once it can see the learner, so the second step was never asked for. The
+            // reasoning that made it look sound is corrected at the promotion itself.
+            //
+            // Arriving here for a peer that is already a learner is therefore a *repeat* rather
+            // than a second step — PD re-deriving after a timeout — and is answered by the same
+            // promotion criterion, which is to say by leaving it to the round that checks it.
             Operator::AddPeer {
                 store_id, peer_id, ..
             } => match state
@@ -502,12 +504,8 @@ impl Store {
                 .find(|peer| peer.peer_id == *peer_id)
             {
                 None => (esker_raft::ConfChangeKind::AddLearner, *peer_id, *store_id),
-                Some(peer) if peer.role == PeerRole::Learner => (
-                    esker_raft::ConfChangeKind::AddVoter,
-                    *peer_id,
-                    peer.store_id,
-                ),
-                // Already a voter: nothing to do.
+                // Already here. A learner is on its way to being a voter under its own criterion,
+                // and a voter is what was asked for: either way there is nothing to propose.
                 Some(_) => return,
             },
             Operator::RemovePeer { peer_id, .. } => {
@@ -759,10 +757,139 @@ impl Store {
                 for operator in operators {
                     store.run_operator(&operator).await;
                 }
+                // On the same schedule, because it is the second half of the same job: an
+                // `AddPeer` is not finished until the replica votes.
+                store.promote_caught_up_learners().await;
                 drop(store);
             }
         });
         self.remember(task);
+    }
+
+    /// Promotes every learner that has caught up, in the regions this store leads.
+    ///
+    /// **The leader decides, and it has to be the leader.** 4c put this with the placement driver,
+    /// on the reasoning — written into this file — that PD "sees every store's region heartbeats,
+    /// including the learner's own `applied_index`". That is false, and it is what stalled phase-4
+    /// acceptance. A region heartbeat comes from a region's *leader* and only from its leader
+    /// (`docs/DESIGN.md` §7), so a learner, which leads nothing, is invisible to PD entirely: PD
+    /// could see that a learner had appeared and never that it had caught up. It therefore held
+    /// the `AddPeer` open waiting for a promotion nobody was going to ask for, and the region sat
+    /// at two voters until the operator timed out and was re-derived into the same wait.
+    ///
+    /// The leader is the one party that does know — `matched` per peer is exactly the number, and
+    /// since 4d it can read it ([`esker_raft::RawNode::progress`]). So an `AddPeer` means "put a
+    /// replica here" and the store fulfils it in two steps: add the learner, promote it once it
+    /// has caught up. That also makes PD's belief that re-asking "would only earn a refusal" true
+    /// rather than merely assumed.
+    ///
+    /// Three things must hold, and each is a way the 4c deadlock came back:
+    ///
+    /// * the learner is within [`PROMOTION_LAG_ALLOWANCE`] of the leader's own `matched`;
+    /// * it is **not** waiting on a snapshot. A peer being caught up by state has whatever
+    ///   `matched` it had before the transfer started, which says nothing about what it holds;
+    /// * it has acknowledged something at all. A `matched` of zero on a short log passes a lag
+    ///   test that means nothing — the peer has never answered.
+    ///
+    /// Every learner in v1 is a step toward a voter; nothing creates a permanent one, so a
+    /// caught-up learner is always one to promote. `TODO(post-v1)`: read-only replicas would need
+    /// PD to say which learners are meant to stay learners.
+    async fn promote_caught_up_learners(self: &Arc<Self>) {
+        for region in self.regions.regions() {
+            let Some(state) = self.regions.get(region.id) else {
+                continue;
+            };
+            let learners: Vec<u64> = region
+                .peers
+                .iter()
+                .filter(|peer| peer.role == PeerRole::Learner)
+                .map(|peer| peer.peer_id)
+                .collect();
+            if learners.is_empty() {
+                continue;
+            }
+            let Some(peer) = state.peer().map(Arc::clone) else {
+                continue;
+            };
+            if !peer.is_leader() {
+                continue;
+            }
+            let Ok(progress) = peer.progress().await else {
+                continue;
+            };
+            let leader_matched = progress
+                .iter()
+                .find(|entry| entry.id == peer.peer_id())
+                .map_or(0, |entry| entry.matched);
+
+            for learner in learners {
+                let Some(entry) = progress.iter().find(|entry| entry.id == learner) else {
+                    tracing::debug!(
+                        region_id = region.id,
+                        learner,
+                        "not promoting: the leader has no progress for this peer"
+                    );
+                    continue;
+                };
+                if entry.pending_snapshot != 0
+                    || entry.matched == 0
+                    || leader_matched.saturating_sub(entry.matched) > crate::PROMOTION_LAG_ALLOWANCE
+                {
+                    // Logged rather than silent: "the learner never caught up" is the shape of
+                    // every stall this path exists to end, and the three numbers are what
+                    // distinguish them.
+                    tracing::debug!(
+                        region_id = region.id,
+                        learner,
+                        matched = entry.matched,
+                        next = entry.next,
+                        leader_matched,
+                        pending_snapshot = entry.pending_snapshot,
+                        recent_active = entry.recent_active,
+                        "not promoting: the learner has not caught up"
+                    );
+                    continue;
+                }
+                let Some(store_id) = region
+                    .peers
+                    .iter()
+                    .find(|peer| peer.peer_id == learner)
+                    .map(|peer| peer.store_id)
+                else {
+                    continue;
+                };
+                tracing::info!(
+                    region_id = region.id,
+                    learner,
+                    store_id,
+                    matched = entry.matched,
+                    leader_matched,
+                    "a learner has caught up; promoting it to voter"
+                );
+                let proposal = peer.propose_conf_change(
+                    esker_raft::ConfChangeKind::AddVoter,
+                    learner,
+                    store_id,
+                );
+                match tokio::time::timeout(OPERATOR_TIMEOUT, proposal).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => tracing::debug!(
+                        region_id = region.id,
+                        learner,
+                        %error,
+                        "a promotion was refused; the next round tries again"
+                    ),
+                    Err(_) => tracing::warn!(
+                        region_id = region.id,
+                        learner,
+                        "a promotion did not commit within the operator timeout"
+                    ),
+                }
+                // One membership change at a time, per region and per round: the next round sees
+                // the result of this one rather than racing it.
+                break;
+            }
+        }
     }
 
     /// Keeps a store-wide task so [`Store::stop`] can end it.
@@ -1285,9 +1412,18 @@ impl Store {
             // Invariant 5, applied to Raft traffic. A batch carries messages for many regions
             // now, so the epoch it is checked against is the one of the region it names — not
             // the store's, which is not a thing a store has.
+            //
+            // A `conf_ver` difference is a **lead**, not a settled question: the regions whose
+            // learners stalled in phase-4 acceptance are exactly the regions that logged this
+            // drop, and a peer caught up by snapshot adopts its record from the snapshot header,
+            // which can be a `conf_ver` ahead of what its leader's transport is still stamping.
+            // Checking `version` alone was tried and did not fix the stall, so it is not the
+            // cause and the check is left as it was (`docs/plans/phase-4.md` §17).
             if message.epoch.is_stale_against(state.region().epoch) {
                 tracing::debug!(
                     region_id = message.region_id,
+                    theirs = ?message.epoch,
+                    ours = ?state.region().epoch,
                     "dropped a Raft message from a stale epoch"
                 );
                 continue;

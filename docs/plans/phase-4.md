@@ -979,3 +979,87 @@ The other half was already covered from the far end: `esker-pd/tests/loopback.rs
 placement driver decide an `AddPeer` and reads it back over a socket through a `PdChannel`. The two
 tests meet at `PdChannel`, so the path from a scheduler's decision to a Raft proposal is now
 covered end to end by tests on both sides of it.
+
+## 17. The phase-4 acceptance promotion stall
+
+Acceptance reported two findings: learner→voter promotion never completes (repair reached no
+region at 3 voters in 4 minutes, with zero data loss; balance did not converge in 240 s), and
+scale-out inverted — 255 → 194 → 176 ops/s at 1 → 3 → 5 stores.
+
+### 17.1 Load or logic: the logs answer without a re-run
+
+The acceptance box was CPU-contended, so the first question is whether this is a timeout-abort-retry
+loop (load-sensitive) or a criterion that never fires (logic). The run's own artefacts settle it,
+and the answer is **logic**:
+
+* the balance run's final listing has **every** region at `epoch=(3,5)` with exactly one voter, on
+  store 1, plus two learners. `conf_ver` 3 is two conf changes — the two `AddLearner`s — and then
+  nothing. A load-sensitive retry loop churns `conf_ver`; this is the minimum possible value and
+  every region holds it;
+* the repair run went `(3,4)` → `(5,4)`: remove the dead store's learner, add the new store's
+  learner. Again the minimum, again no promotion, again exactly one voter per region throughout;
+* across both runs the store logs carry **52 operators applied and not one** "an operator did not
+  commit", so the store's 5 s `OPERATOR_TIMEOUT` never fired; 45 snapshots arrived, 2 did not and
+  were retried; zero `WARN` or `ERROR` on store 1 in either run.
+
+Nothing was aborting and retrying. Nothing was slow. The second step was never *asked for*.
+
+### 17.2 Why it was never asked for
+
+Two contracts, each sound alone, that compose into a deadlock:
+
+* **the store's, from 4c:** an `AddPeer` for a peer that is already a learner *is* the promotion —
+  so the store needs the operator **re-sent** to take the second step;
+* **PD's:** `InFlight::advance` returns `None` for `Progress::Started`, because an operator whose
+  learner PD can already see "has demonstrably started, and asking again would only earn a refusal"
+  — so PD **stops sending** the moment the learner appears.
+
+Nobody asks, nobody promotes. After `operator_timeout` PD re-derives, `repair_for` counts the
+learner among `region.peers` and sees no under-replication, and the region stays where it is.
+
+Behind that is a plain factual error, written into `server.rs` in 4c and quoted in §13.7: that PD
+"sees every store's region heartbeats, including the learner's own `applied_index`". **A region
+heartbeat comes from a region's leader and only from its leader** (§7). A learner leads nothing, so
+it is invisible to PD entirely — PD could see that a learner had appeared and never that it had
+caught up. The criterion 4c placed with PD had no input and never could have had one.
+
+This also explains finding 2 without any separate cause. A learner cannot take office, so leader
+balance can never move anything: every region's leader stayed on store 1 in all three
+configurations. Added stores took no leadership and served no reads, while store 1 fed each of them
+the log and a snapshot per region. More stores, strictly more work for the one that does everything.
+
+### 17.3 The fix: the leader promotes, on the number only it can see
+
+`Store::promote_caught_up_learners`, on the region-heartbeat schedule. `AddPeer` now means "put a
+replica here" and the store fulfils it in two steps. The criterion is **progress, not a clock** —
+which matters on a loaded box, where a clock is the thing that lies: the learner is within
+`PROMOTION_LAG_ALLOWANCE` of the leader's own `matched`, is not waiting on a snapshot, and has
+acknowledged something at all. Each of the three is a way the 4c promotion deadlock came back.
+
+Measured on `tests/promotion.rs`: **0 of 63 learners promoted before, 62 of 63 after**, and 14 of 14
+in the smaller configuration.
+
+### 17.4 A second defect the first was masking
+
+With promotion working, a residual appears: some learners caught up by snapshot are never replicated
+to at all — `matched` 0, `recent_active` **false**, `pending_snapshot` 0, `next` = the leader's last
+index + 1. The leader has heard nothing from them, ever.
+
+One mechanism found and fixed, in the core, under the same gate-blocker grant. A follower below the
+compaction boundary cannot be heartbeated — there is no index to anchor an empty append at — so
+`send_heartbeat` delegates to `send_append`, which is **paused** after its one outstanding probe.
+`probe_sent` clears only on an answer, so if that single probe is the message that goes missing, the
+leader sends that peer nothing for the rest of its term. For such a follower the probe *is* the
+heartbeat, and a heartbeat is not subject to flow control anywhere else in Raft; it is not here
+either. `Snapshot` is deliberately left paused, since `SNAPSHOT_TIMEOUT_TICKS` paces those re-offers.
+Mutation-checked. It reduced stuck observations by about a hundredfold.
+
+**Still open.** `tests/promotion.rs` fails about three runs in four: a learner still occasionally
+stalls in exactly that shape. One lead, recorded and *not* acted on: the regions that stall are
+**exactly** the regions that log "dropped a Raft message from a stale epoch" — 14 regions, identical
+sets. A peer caught up by snapshot adopts its record from the snapshot header, which is the leader's
+record as of the transfer and can be a `conf_ver` ahead of what that leader's transport is still
+stamping; every message from its own leader is then dropped as stale. Checking `version` alone was
+tried and did **not** fix the stall, so the correlation is not yet a cause and the check is left as
+it was. A second lead: one `a Raft snapshot arrived; streaming is phase 4` — a core-delivered
+snapshot the store still ignores — appeared on a stalled region.

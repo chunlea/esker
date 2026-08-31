@@ -752,6 +752,60 @@ mod tests {
         assert_eq!(progress.snapshot_elapsed, 0, "and a fresh clock with it");
     }
 
+    /// A follower the leader cannot heartbeat is probed again every heartbeat, even though
+    /// probing is paused.
+    ///
+    /// For such a follower the probe **is** the heartbeat. Its `matched` is below the compaction
+    /// boundary, so no empty append can be anchored at it and `send_heartbeat` has nowhere to go
+    /// but `send_append` — which is paused after the one outstanding probe. `probe_sent` clears
+    /// only on an answer, so if that single probe is the message that goes missing, the leader
+    /// sends that peer nothing for the rest of its term. Phase-4 acceptance hit this behind the
+    /// promotion stall: a learner caught up by snapshot, probed once, `matched` 0 and
+    /// `recent_active` false for minutes (`docs/plans/phase-4.md` §17).
+    ///
+    /// A heartbeat is not subject to flow control anywhere else in Raft, and it is not here.
+    #[test]
+    fn a_follower_that_cannot_be_heartbeated_is_probed_again_anyway() {
+        let mut node = leader_awaiting_a_snapshot(217);
+        // Out of `Snapshot` and into `Probe` above the boundary, which is where a peer sits once
+        // its transfer has been reported delivered.
+        node.report_snapshot(2, SnapshotStatus::Finished);
+        let _ = node.ready();
+
+        // The one probe that `become_probe` allowed goes out, and is lost.
+        for _ in 0..2 {
+            node.tick();
+        }
+        let _ = node.ready();
+        assert!(
+            node.raft_mut().progress.get(2).unwrap().is_paused(),
+            "the probe is outstanding, so the leader is now paused on this peer"
+        );
+        assert_eq!(
+            node.raft_mut().progress.get(2).unwrap().matched,
+            0,
+            "and nothing was ever acknowledged"
+        );
+
+        // Heartbeats keep coming, and each one has to reach a peer that cannot be heartbeated any
+        // other way.
+        let mut sent = 0;
+        for _ in 0..8 {
+            node.tick();
+            sent += node
+                .ready()
+                .messages
+                .iter()
+                .filter(|message| message.recipient() == 2)
+                .count();
+        }
+        assert!(
+            sent > 0,
+            "a follower below the compaction boundary was sent nothing for eight ticks, so one \
+             lost probe strands it"
+        );
+    }
+
     /// An acknowledgement that reaches the pending index ends the snapshot whatever became of the
     /// transfer, because there is no longer anything to wait for.
     ///

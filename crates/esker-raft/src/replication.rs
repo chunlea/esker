@@ -144,6 +144,24 @@ impl<S: LogStorage> Raft<S> {
         let Ok(anchor_term) = self.log.term(anchor) else {
             // Everything this follower has is below our compaction boundary, so no heartbeat can
             // describe its position. Send what it actually needs instead.
+            //
+            // **And send it even though probing is paused.** For this follower the probe *is* the
+            // heartbeat: there is no message the leader can anchor at `matched`, so the ordinary
+            // heartbeat — which is never subject to flow control — has nowhere else to go. Leaving
+            // the pause in place wedges the peer for the rest of the term, because `probe_sent` is
+            // cleared only by an answer and the one outstanding probe is the message that did not
+            // arrive. Phase-4 acceptance hit exactly this: a learner caught up by snapshot, sent
+            // one append, and never heard from again — `matched` 0 and `recent_active` false for
+            // four minutes (`docs/plans/phase-4.md` §17).
+            //
+            // `Snapshot` is deliberately not unpaused here. A snapshot in flight is re-offered on
+            // its own timeout (`SNAPSHOT_TIMEOUT_TICKS`), which is a far longer interval than a
+            // heartbeat and is the pacing that stops a leader re-announcing megabytes every tick.
+            if let Some(progress) = self.progress.get_mut(to)
+                && progress.state == ProgressState::Probe
+            {
+                progress.probe_sent = false;
+            }
             return self.send_append(to);
         };
         // Never advertise a commit index past what this follower holds: it would commit an entry

@@ -126,6 +126,16 @@ pub const OPERATOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// its own log rather than needing a snapshot the moment it takes office.
 pub const TRANSFER_LAG_ALLOWANCE: u64 = 64;
 
+/// How far behind a learner may be and still be promoted to voter.
+///
+/// A promotion puts the peer into the quorum, so from that entry on nothing commits without a
+/// majority that may include it. Promoting one that is still catching up is how a group stops
+/// committing — 4c did exactly that and wedged the conf change that caused it
+/// (`docs/plans/phase-4.md` §13.7). Not zero for the same reason as
+/// [`TRANSFER_LAG_ALLOWANCE`]: a replica is always a few entries behind a busy leader, and a
+/// criterion that waited for equality under load would never fire.
+pub const PROMOTION_LAG_ALLOWANCE: u64 = 64;
+
 /// How many snapshot chunks may be queued for the network before the walk waits.
 ///
 /// Small on purpose: a snapshot is megabytes and the point of streaming it is that neither end
