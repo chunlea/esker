@@ -77,6 +77,50 @@ const MAX_TRANSFER: u64 = 50;
 /// seconds of it waiting out each one.
 const TTL_MS: u64 = 400;
 
+/// How far behind the present the audit reads
+/// ([ADR 0021](../../docs/adr/0021-time-machine.md) decision 1).
+///
+/// **Derived from the lease, not chosen.** A read at `T` is blocked only by locks with
+/// `start_ts ≤ T` that are still unsettled, so an audit at `now` collides with every transfer
+/// in flight — six writers on sixteen accounts means there is nearly always one. An audit one
+/// full lease *plus a margin* into the past collides with almost none: a transaction that
+/// started that long ago has either committed, or is dead and past its TTL, and a dead lock is
+/// **resolved in one round** rather than waited out.
+///
+/// The margin is what stops the boundary case — a lock exactly at its expiry, where the reader
+/// must judge the lease and can still be told to wait.
+///
+/// A lease is the floor, and it is not enough on its own: a transfer under contention waits on
+/// *other* transactions' locks before it commits, so the snapshot has to be behind the whole of
+/// that, not behind one lease. Measured rather than guessed — the curve is in
+/// `docs/bench/phase-5.md`, and 600 ms still collides most of the time where 2 s does not.
+///
+/// **A lag cannot usefully exceed the run**, which is why this is per-plan and not one number:
+/// a snapshot from before the accounts were opened is a complete and perfectly true audit of
+/// nothing, and a short seed run reading two seconds back would only ever see that.
+const AUDIT_LAG_MS: u64 = 2_000;
+
+/// The lag for a run of a given length: [`AUDIT_LAG_MS`], but never more than a quarter of the
+/// run, so three quarters of it is spent auditing a moment the run has actually reached.
+///
+/// A snapshot from before the accounts were opened is a complete and perfectly true audit of
+/// nothing. A short run reading two seconds back would see only that — which is not a
+/// hypothetical: it is what the `audits > 0` assertion caught the first time this lag was one
+/// number for every plan.
+fn audit_lag_for(duration: Duration) -> Duration {
+    Duration::from_millis(AUDIT_LAG_MS).min(duration / 4)
+}
+
+/// `ESKER_BANK_AUDIT_LAG_MS` overrides whatever the plan says, which is how the completion rate
+/// is recorded as a *curve* rather than a point. Zero puts the audit back at the present, which
+/// is where it read before the time machine.
+fn audit_lag(plan: &Plan) -> Duration {
+    std::env::var("ESKER_BANK_AUDIT_LAG_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map_or(plan.audit_lag, Duration::from_millis)
+}
+
 /// One account's key. `a00…` in the low region, `n00…` in the high one.
 fn account_key(account: u64) -> Vec<u8> {
     if account < ACCOUNTS_PER_REGION {
@@ -145,6 +189,8 @@ struct Plan {
     kills: u32,
     /// How often a transfer is driven by hand and abandoned part-way.
     crash_rate: f64,
+    /// How far behind the present the audit reads. See [`AUDIT_LAG_MS`].
+    audit_lag: Duration,
     topology: Topology,
 }
 
@@ -157,6 +203,7 @@ impl Plan {
             duration: Duration::from_secs(3),
             kills: 1,
             crash_rate: 0.10,
+            audit_lag: audit_lag_for(Duration::from_secs(3)),
             topology: Topology::two_regions(seed),
         }
     }
@@ -167,6 +214,7 @@ impl Plan {
             duration: Duration::from_secs(60),
             kills: 12,
             clients: 6,
+            audit_lag: audit_lag_for(Duration::from_secs(60)),
             ..Self::fast(seed)
         }
     }
@@ -187,12 +235,14 @@ impl Plan {
             return Self {
                 duration: Duration::from_millis(1_500),
                 kills: 1,
+                audit_lag: audit_lag_for(Duration::from_millis(1_500)),
                 ..Self::fast(seed)
             };
         }
         Self {
             duration: Duration::from_millis(1_200),
             kills: 0,
+            audit_lag: audit_lag_for(Duration::from_millis(1_200)),
             topology: Topology::unreplicated(seed),
             ..Self::fast(seed)
         }
@@ -501,9 +551,21 @@ enum NoAudit {
     Short(usize),
 }
 
-/// Reads every account at **one** snapshot and answers with the total.
-fn audit(client: &TxnClient) -> Result<u64, NoAudit> {
-    let txn = client.begin().map_err(|_| NoAudit::Unreadable)?;
+/// Reads every account at **one** snapshot, [`AUDIT_LAG_MS`] in the past, and answers with the
+/// total.
+///
+/// The sum invariant holds at *every* timestamp, so reading an old one gives up nothing: a
+/// transfer moves money between two accounts inside one transaction, and that is as true of a
+/// snapshot from a second ago as of one from now. What it buys is that the snapshot is behind
+/// the transactions still in flight, so the audit is not queueing behind them
+/// ([ADR 0021](../../docs/adr/0021-time-machine.md) decision 1 — this is the feature's first
+/// customer, and `docs/bench/phase-5.md` records what it did to the completion rate).
+fn audit(client: &TxnClient, lag: Duration) -> Result<u64, NoAudit> {
+    let txn = if lag.is_zero() {
+        client.begin().map_err(|_| NoAudit::Unreadable)?
+    } else {
+        client.begin_ago(lag).map_err(|_| NoAudit::Unreadable)?
+    };
     let pairs = txn
         .scan(
             ACCOUNTS_FROM,
@@ -566,6 +628,7 @@ fn bank(plan: &Plan) {
             Arc::clone(&short),
             Arc::clone(&shortest),
         );
+        let lag = audit_lag(plan);
         std::thread::spawn(move || {
             // A wider lock budget than a transfer's: an audit reads every account at one
             // snapshot, so it meets whatever any writer is holding at that instant and has to
@@ -592,7 +655,7 @@ fn bank(plan: &Plan) {
                         client = fresh;
                     }
                 }
-                match audit(&client) {
+                match audit(&client, lag) {
                     Ok(total) => {
                         assert_eq!(
                             total, TOTAL,
@@ -619,7 +682,10 @@ fn bank(plan: &Plan) {
     // The fault plan: a leader killed and restarted under the traffic, spread over the run.
     let mut rng = Pcg32::from_seed(plan.seed ^ 0xfa17);
     let mut killed = 0;
-    let interval = plan.duration / (plan.kills.max(1) + 1);
+    // One interval before each kill and one at the end, so a run with no kills is one interval
+    // of the full duration rather than half of it — which is what `kills.max(1)` made it, and
+    // what left the unreplicated seeds running for half as long as they said.
+    let interval = plan.duration / (plan.kills + 1);
     for _ in 0..plan.kills {
         std::thread::sleep(interval);
         let group =
@@ -668,7 +734,8 @@ fn bank(plan: &Plan) {
         seen => format!("fewest accounts seen: {seen}"),
     };
     println!(
-        "{label}: audits not taken — {} unreadable, {} short ({fewest})",
+        "{label}: audit lag {} ms; audits not taken — {} unreadable, {} short ({fewest})",
+        audit_lag(plan).as_millis(),
         unreadable.load(Ordering::Relaxed),
         short.load(Ordering::Relaxed)
     );

@@ -107,6 +107,50 @@ Two things follow, and neither is a tuning task for this phase:
   of them. That is the first thing to look at if transactional write throughput ever matters, and
   the profile should come before the change (`docs/bench/README.md`, "profile before optimising").
 
+## Run 2 — 2026-08-31, what the time machine did to the bank audit
+
+[ADR 0021](../adr/0021-time-machine.md)'s first customer, and the number it is worth.
+
+The bank test's auditor reads every account **at one snapshot** and asserts the sum. Reading at
+the *present* means the snapshot is contemporary with every transfer in flight, so the audit
+blocks on their locks: six writers on sixteen accounts, and there is nearly always one. Run 1's
+sixty-second run completed **13 of 163** audits for that reason, which was recorded at the time
+as a known weakness with a guess attached (a wait proportional to the lease). The guess was
+wrong about the fix. The audit does not need to wait better — it needs to **not be there**.
+
+An audit does not care about freshness at all: the sum invariant holds at every timestamp, so a
+snapshot from two seconds ago is as valid an audit as one from now. `begin_ago` moves it behind
+the traffic.
+
+| audit lag | audits complete / attempted | completion rate | complete audits |
+|---:|---:|---:|---:|
+| 0 ms (at the present) | 14 / 163 | 8.6% | 14 |
+| 600 ms | 37 / 198 | 18.7% | 37 |
+| **2,000 ms** (the default) | 623 / 954 | 65.3% | **623** |
+| 5,000 ms | 1,488 / 1,925 | 77.3% | **1,488** |
+
+Same binary, same plan (`sixty_seconds`, seed `20260831`, release, 12 leader kills, ~75 clients
+crashed mid-commit per run), one run each, `ESKER_BANK_AUDIT_LAG_MS` the only variable. A
+confirming run at the committed default landed at 523/827 (63.2%), so the 2,000 ms row is a
+representative draw and not a lucky one.
+
+**Two mechanisms, and the second is the surprise.** The completion *rate* rises because the
+snapshot is behind the locks — that is the one the feature was built for. But the number of
+audits *attempted* also rises 12× (163 → 1,925), because a blocked audit is not merely a failed
+audit, it is a **slow** one: it waits out leases with backoff and only then gives up. Removing
+the collisions takes an attempt from ~370 ms to ~11 ms. The invariant is checked 106× more often
+at 5 s of lag, and the run says so.
+
+**What does not improve, and should not.** At 5 s, 360 attempts are still unreadable: those are
+the leader-kill windows, where the region has no leader and no timestamp helps. 77 are "short" —
+the snapshot predates the accounts being opened, which is the first seconds of the run and is a
+complete, true audit of nothing. The default lag is a quarter of the run for exactly that
+reason: a short seed run reading 2 s back would see nothing else, and the `audits > 0` assertion
+caught that the first time this was one constant for every plan.
+
+The cost is one extra round trip per historical transaction — `begin_at` asks a store for the
+safepoint before it will answer — and at 11 ms an audit that is plainly affordable.
+
 ### How to reproduce
 
 ```sh
@@ -121,3 +165,11 @@ cargo build --release -p esker-cli
 
 `txnput` and `txnget` require `--remote`: a transaction's decisions happen at apply, inside a
 store, and there is no in-process form of one to measure.
+
+Run 2, one row of the curve at a time:
+
+```sh
+cargo test -p esker-client --release --test bank --no-run
+ESKER_BANK_AUDIT_LAG_MS=2000 ./target/release/deps/bank-<hash> \
+    --ignored --nocapture --exact sixty_seconds_of_transfers_under_faults
+```

@@ -447,6 +447,12 @@ reconciliation is strictly stronger than the audit — but it means the sum inva
 around a dozen times per run rather than continuously. A wait proportional to the lease rather
 than to the router's backoff would improve it; it is written down here rather than tuned.
 
+**Resolved, and not the way that line guessed** (`docs/bench/phase-5.md`, run 2). The audit did
+not need to wait better — it needed not to be there. Reading two seconds into the past with
+ADR 0021's `begin_ago` puts the snapshot behind every transfer in flight, and the completion rate
+goes from 13 of 163 to 523 of 827, with the attempt rate itself rising twelvefold: a blocked
+audit was a *slow* one, not merely a failed one.
+
 ### 10.9 The acceptance runs, and what they cost
 
 | Run | Command | Result |
