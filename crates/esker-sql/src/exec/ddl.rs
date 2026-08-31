@@ -146,19 +146,22 @@ pub(super) fn drop_table(
         // has none, so every key is deleted individually -- correct, and `TODO(post-v1)` for a
         // table large enough that this is a problem.
         //
-        // TODO(phase-6a-wiring): a `limit` of 0 is "everything" to `Txn` and 1024 to the real
-        // `TxnClient` (`docs/plans/phase-6a.md` §10a, "Two seam mismatches"). These two scans and
-        // the one in `drop_index` must page before the real backend is under them, or a table of
-        // more than a page keeps its rows and its index entries after being dropped.
+        // Paged, because a whole range cannot be asked for in one call ([`super::for_each_page`]).
         let (start, end) = crate::row::table_row_range(executor.tenant, table.id);
-        for (key, _) in txn.scan(&start, &end, 0)? {
-            txn.delete(&key);
-        }
+        super::for_each_page(txn, &start, &end, |txn, page| {
+            for (key, _) in page {
+                txn.delete(key);
+            }
+            Ok(())
+        })?;
         for index in &table.indexes {
             let (start, end) = crate::row::index_range(executor.tenant, table.id, index.id);
-            for (key, _) in txn.scan(&start, &end, 0)? {
-                txn.delete(&key);
-            }
+            super::for_each_page(txn, &start, &end, |txn, page| {
+                for (key, _) in page {
+                    txn.delete(key);
+                }
+                Ok(())
+            })?;
         }
         catalog::drop_table(txn, executor.tenant, &table)?;
     }
@@ -259,9 +262,12 @@ pub(super) fn drop_index(
         };
         let table = executor.table_by_id(txn, table_id)?;
         let (start, end) = crate::row::index_range(executor.tenant, table_id, index_id);
-        for (key, _) in txn.scan(&start, &end, 0)? {
-            txn.delete(&key);
-        }
+        super::for_each_page(txn, &start, &end, |txn, page| {
+            for (key, _) in page {
+                txn.delete(key);
+            }
+            Ok(())
+        })?;
         let mut updated = (*table).clone();
         updated.indexes.retain(|index| index.id != index_id);
         catalog::replace_table(txn, executor.tenant, &table, &updated)?;
@@ -362,12 +368,11 @@ fn existing_relation(
 /// A `UNIQUE` index built over rows that already violate it fails here, with the same `23505` an
 /// `INSERT` would have raised, which is what PostgreSQL does too.
 ///
-/// `TODO(phase-6a-wiring)`: the scan below asks for every row with a `limit` of 0, which is what
-/// [`crate::backend::Txn`] promises and **not** what the real `TxnClient` does — it reads 0 as
-/// 1024 (`docs/plans/phase-6a.md` §10a, "Two seam mismatches"). Left as it is against the fake,
-/// which honours the contract; it must page before the real backend is wired, or this builds an
-/// index that is missing every row past the first page and every query that uses it then returns
-/// fewer rows than the same query without it.
+/// The scan is **paged** ([`super::for_each_page`]), which is not a detail: a `limit` of 0 means
+/// "everything" to [`crate::backend::Txn`] and a page to the real `TxnClient`, and an index built
+/// from one page of a larger table is an index that makes a query return *fewer* rows than the
+/// same query without it. That is the wrong-answer shape, reached through a statement that
+/// succeeded.
 fn backfill(
     executor: &Executor,
     txn: &mut dyn Txn,
@@ -378,39 +383,44 @@ fn backfill(
     let (start, end) = crate::row::table_row_range(tenant, table.id);
     let types = table.column_types();
     let primary_key_types = table.primary_key_types();
-    let rows = txn.scan(&start, &end, 0)?;
 
-    let mut entries = Vec::with_capacity(rows.len());
-    for (_, value) in &rows {
-        let row = crate::row::decode_row(&types, value)?;
-        let columns: Vec<Datum> = index
-            .columns
-            .iter()
-            .map(|&ordinal| row[ordinal].clone())
-            .collect();
-        let primary_key: Vec<Datum> = table
-            .primary_key
-            .iter()
-            .map(|&ordinal| row[ordinal].clone())
-            .collect();
-        let by_value = index.unique && crate::row::unique_index_key_is_unique_by_value(&columns);
-        let suffix = if by_value {
-            None
-        } else {
-            Some(primary_key.as_slice())
-        };
-        let key = crate::row::index_key(tenant, table.id, index.id, &columns, suffix)?;
-        if by_value && entries.iter().any(|(existing, _)| existing == &key) {
-            return Err(SqlError::UniqueViolation {
-                constraint: index.name.clone(),
-                key: None,
-            });
+    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    super::for_each_page(txn, &start, &end, |_, page| {
+        for (_, value) in page {
+            let row = crate::row::decode_row(&types, value)?;
+            let columns: Vec<Datum> = index
+                .columns
+                .iter()
+                .map(|&ordinal| row[ordinal].clone())
+                .collect();
+            let primary_key: Vec<Datum> = table
+                .primary_key
+                .iter()
+                .map(|&ordinal| row[ordinal].clone())
+                .collect();
+            let by_value =
+                index.unique && crate::row::unique_index_key_is_unique_by_value(&columns);
+            let suffix = if by_value {
+                None
+            } else {
+                Some(primary_key.as_slice())
+            };
+            let key = crate::row::index_key(tenant, table.id, index.id, &columns, suffix)?;
+            if by_value && entries.iter().any(|(existing, _)| existing == &key) {
+                // Out of the walk as well as out of the page: the index cannot be built and
+                // reading the rest of the table would learn nothing.
+                return Err(SqlError::UniqueViolation {
+                    constraint: index.name.clone(),
+                    key: None,
+                });
+            }
+            entries.push((
+                key,
+                crate::row::encode_row(&primary_key_types, &primary_key)?,
+            ));
         }
-        entries.push((
-            key,
-            crate::row::encode_row(&primary_key_types, &primary_key)?,
-        ));
-    }
+        Ok(())
+    })?;
 
     for (key, value) in entries {
         txn.put(&key, &value);

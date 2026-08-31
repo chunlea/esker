@@ -23,8 +23,9 @@ use crate::plan::{BinaryOp, Expr, Node, SortKey};
 use crate::row;
 use crate::value::{ColumnType, Datum};
 
-/// Rows read from the store in one round trip.
-const SCAN_CHUNK: u32 = 1024;
+/// Rows read from the store in one round trip. Shared with everything else that walks a range
+/// ([`crate::exec::for_each_page`]).
+use crate::exec::SCAN_CHUNK;
 
 /// The most rows a `Sort` will hold. Past it, `53400` rather than an unbounded allocation.
 pub(super) const SORT_LIMIT: usize = 1_000_000;
@@ -49,7 +50,6 @@ enum Kind<'a> {
         next: Vec<u8>,
         end: Vec<u8>,
         batch: std::vec::IntoIter<(bytes::Bytes, bytes::Bytes)>,
-        exhausted: bool,
     },
     /// At most one row, already found or not yet looked for.
     Point { node: Node, looked: bool },
@@ -89,7 +89,6 @@ impl<'a> Cursor<'a> {
                 next: start.clone(),
                 end: end.clone(),
                 batch: Vec::new().into_iter(),
-                exhausted: false,
             },
             Node::PointGet { .. } | Node::IndexLookup { .. } => Kind::Point {
                 node: node.clone(),
@@ -139,20 +138,19 @@ impl<'a> Cursor<'a> {
                 next,
                 end,
                 batch,
-                exhausted,
             } => {
                 loop {
                     if let Some((key, value)) = batch.next() {
                         *next = successor(&key);
                         return Ok(Some(row::decode_row(columns, &value)?));
                     }
-                    if *exhausted {
-                        return Ok(None);
-                    }
+                    // An **empty** chunk ends the range, not a short one. A short chunk is not
+                    // evidence of anything: the store may cap a scan below what was asked
+                    // (`esker_client::Router::bounded_limit` does, at a ceiling the operator
+                    // configures), and this used to stop on one -- so a `max_scan_limit` under
+                    // `SCAN_CHUNK` would have made every `SELECT` return a prefix of its rows and
+                    // say nothing. The price is one extra round trip per scan.
                     let read = self.txn.scan(next, end, SCAN_CHUNK)?;
-                    // A short chunk means the range is finished; a full one might not be, so the
-                    // next call asks again from after the last key it saw.
-                    *exhausted = read.len() < SCAN_CHUNK as usize;
                     if read.is_empty() {
                         return Ok(None);
                     }

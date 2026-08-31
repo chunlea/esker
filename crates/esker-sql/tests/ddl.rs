@@ -31,7 +31,22 @@ struct Node {
 
 impl Node {
     fn new() -> Self {
-        let backend = Arc::new(MemoryBackend::new());
+        Node::on(MemoryBackend::new())
+    }
+
+    /// A node whose store answers scans a page at a time, the way the real `TxnClient` does.
+    ///
+    /// Two is small enough that any code walking a range without paging comes back with two rows
+    /// and stops. That is the whole point: with the fake answering a `limit` of 0 as "everything",
+    /// a `DROP TABLE` that left rows and a `CREATE INDEX` that indexed a prefix both looked
+    /// correct here and would have truncated silently against the real backend
+    /// (`docs/plans/phase-6a.md` §10a).
+    fn paged() -> Self {
+        Node::on(MemoryBackend::new().with_scan_limit(2))
+    }
+
+    fn on(backend: MemoryBackend) -> Self {
+        let backend = Arc::new(backend);
         let catalog = Arc::new(Catalog::new());
         let executor = Executor::new(
             Arc::clone(&backend) as Arc<dyn Backend>,
@@ -70,6 +85,23 @@ impl Node {
             Arc::clone(&self.catalog),
             1,
         )
+    }
+
+    /// How many keys are left in `[start, end)`, counted by walking it in pages so that the
+    /// counting cannot itself be the thing that truncates.
+    fn keys_in(&self, (start, end): (Vec<u8>, Vec<u8>)) -> usize {
+        let txn = self.backend.begin().unwrap();
+        let mut next = start;
+        let mut total = 0;
+        loop {
+            let read = txn.scan(&next, &end, 1024).unwrap();
+            let Some((last, _)) = read.last() else {
+                return total;
+            };
+            total += read.len();
+            next = last.to_vec();
+            next.push(0);
+        }
     }
 
     /// The table as the catalog holds it, read in a fresh transaction.
@@ -601,4 +633,142 @@ fn ddl_inside_a_transaction_is_visible_to_itself_and_to_nobody_else() {
     };
     assert_eq!(rows, [[Some(b"1".to_vec())]]);
     assert_eq!(node.table("a").expect("committed").schema_version, 1);
+}
+
+/// Everything that walks a whole key range has to page, because `Txn::scan`'s `limit` of 0 means
+/// "everything" to this crate's trait and a *page* to the real `TxnClient`
+/// (`docs/plans/phase-6a.md` §10a). These four tests are one per call site, run against a store
+/// that answers two rows at a time; every one of them fails without the paging.
+///
+/// The last is the one that matters most, because it is the only failure here that returns a
+/// *wrong answer* rather than leaving rubbish behind: an index built from one page makes a query
+/// that uses it return fewer rows than the same query without it.
+mod paging {
+    use super::{Node, Outcome};
+
+    /// Five rows, three unique-index entries' worth of range — enough that a two-row page cannot
+    /// be mistaken for the whole thing.
+    fn five_rows(node: &mut Node) {
+        node.run("CREATE TABLE t (id int8 PRIMARY KEY, a int8, b text)")
+            .unwrap();
+        node.run("INSERT INTO t VALUES (1,10,'a'),(2,20,'b'),(3,30,'c'),(4,40,'d'),(5,50,'e')")
+            .unwrap();
+    }
+
+    fn count(node: &mut Node, sql: &str) -> usize {
+        let Outcome::Rows { rows, .. } = node.run(sql).unwrap() else {
+            panic!("not rows");
+        };
+        rows.len()
+    }
+
+    /// A scan itself has to walk past the page boundary, or every `SELECT` returns a prefix.
+    #[test]
+    fn a_select_reads_past_the_page_boundary() {
+        let mut node = Node::paged();
+        five_rows(&mut node);
+        assert_eq!(count(&mut node, "SELECT id FROM t"), 5);
+        assert_eq!(count(&mut node, "SELECT id FROM t ORDER BY id"), 5);
+    }
+
+    /// `DROP TABLE` deletes every row, not the first page of them.
+    #[test]
+    fn drop_table_deletes_every_row() {
+        let mut node = Node::paged();
+        five_rows(&mut node);
+        let id = node.table("t").expect("committed").id;
+        assert_eq!(node.keys_in(esker_sql::row::table_row_range(1, id)), 5);
+
+        node.run("DROP TABLE t").unwrap();
+
+        // The table is gone from the catalog either way; what is being checked is that its rows
+        // went with it, which only the store can answer.
+        assert_eq!(
+            node.keys_in(esker_sql::row::table_row_range(1, id)),
+            0,
+            "rows outlived the table that owned them"
+        );
+    }
+
+    /// And every index entry.
+    #[test]
+    fn drop_table_deletes_every_index_entry() {
+        let mut node = Node::paged();
+        five_rows(&mut node);
+        node.run("CREATE INDEX t_a_idx ON t (a)").unwrap();
+        let table = node.table("t").expect("committed");
+        let range = esker_sql::row::index_range(1, table.id, table.indexes[0].id);
+        assert_eq!(node.keys_in(range.clone()), 5, "one entry per row");
+
+        node.run("DROP TABLE t").unwrap();
+        assert_eq!(node.keys_in(range), 0);
+    }
+
+    /// `DROP INDEX` likewise.
+    #[test]
+    fn drop_index_deletes_every_entry() {
+        let mut node = Node::paged();
+        five_rows(&mut node);
+        node.run("CREATE INDEX t_a_idx ON t (a)").unwrap();
+        let table = node.table("t").expect("committed");
+        let range = esker_sql::row::index_range(1, table.id, table.indexes[0].id);
+        assert_eq!(
+            node.keys_in(range.clone()),
+            5,
+            "one per row, before the drop"
+        );
+
+        node.run("DROP INDEX t_a_idx").unwrap();
+        assert_eq!(node.keys_in(range), 0);
+    }
+
+    /// The wrong-answer one. An index built from a prefix of the table makes a query that uses it
+    /// miss rows -- and the `CREATE INDEX` that built it said nothing.
+    #[test]
+    fn an_index_is_built_over_every_row_not_the_first_page() {
+        let mut node = Node::paged();
+        five_rows(&mut node);
+        node.run("CREATE INDEX t_a_idx ON t (a)").unwrap();
+        let table = node.table("t").expect("committed");
+        assert_eq!(
+            node.keys_in(esker_sql::row::index_range(
+                1,
+                table.id,
+                table.indexes[0].id
+            )),
+            5,
+            "one entry per row"
+        );
+
+        // Rows 3, 4 and 5 are past the first page. Each has to be findable *through* the index,
+        // which is the path a lookup on an indexed column takes.
+        for (value, id) in [(10, 1), (20, 2), (30, 3), (40, 4), (50, 5)] {
+            let Outcome::Rows { rows, .. } = node
+                .run(&format!("SELECT id FROM t WHERE a = {value}"))
+                .unwrap()
+            else {
+                panic!("not rows");
+            };
+            assert_eq!(
+                rows,
+                [[Some(id.to_string().into_bytes())]],
+                "a = {value} was not found through the index"
+            );
+        }
+    }
+
+    /// A unique index built over rows that already violate it still fails, and the duplicate is
+    /// past the first page -- so the check has to survive the walk rather than only see page one.
+    #[test]
+    fn a_duplicate_past_the_first_page_still_fails_the_build() {
+        let mut node = Node::paged();
+        node.run("CREATE TABLE t (id int8 PRIMARY KEY, a int8)")
+            .unwrap();
+        node.run("INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40),(5,30)")
+            .unwrap();
+        let error = node
+            .run("CREATE UNIQUE INDEX t_a_key ON t (a)")
+            .unwrap_err();
+        assert_eq!(error.sqlstate(), esker_sql::sqlstate::UNIQUE_VIOLATION);
+    }
 }

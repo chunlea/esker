@@ -276,6 +276,43 @@ impl Executor {
     }
 }
 
+/// Keys read from the store in one round trip, by everything that walks a whole range.
+///
+/// The same number [`cursor`] uses, and for the same reason: a range has to be read a page at a
+/// time or a scan of a large table is a large table in memory.
+pub(crate) const SCAN_CHUNK: u32 = 1024;
+
+/// Walks `[start, end)` a page at a time, handing each page to `page`.
+///
+/// **A whole range cannot be asked for in one call**, and the reason is a seam rather than a
+/// preference. [`Txn::scan`]'s `limit` of 0 means "no limit" to this crate's trait and a *page* to
+/// the real `TxnClient`, which turns 0 into its protocol default and then caps it
+/// (`docs/plans/phase-6a.md` §10a). A caller that asked for everything and got a page would get no
+/// error and no clue: a `DROP TABLE` that left rows, or — the one that returns wrong answers — a
+/// `CREATE INDEX` whose index is missing every row past the first page, so that a query *using* it
+/// answers with fewer rows than the same query without it.
+///
+/// The loop stops on an **empty** read rather than on a short one. A short page is not evidence
+/// that a range is finished: the store may cap a scan below what was asked for, and it answers for
+/// one region at a time. That costs one extra round trip at the end of every walk, which is the
+/// right price for a termination rule that does not depend on a limit anybody can configure.
+pub(crate) fn for_each_page(
+    txn: &mut dyn Txn,
+    start: &[u8],
+    end: &[u8],
+    mut page: impl FnMut(&mut dyn Txn, &[(bytes::Bytes, bytes::Bytes)]) -> Result<()>,
+) -> Result<()> {
+    let mut next = start.to_vec();
+    loop {
+        let read = txn.scan(&next, end, SCAN_CHUNK)?;
+        let Some((last, _)) = read.last() else {
+            return Ok(());
+        };
+        next = query::successor(last);
+        page(txn, &read)?;
+    }
+}
+
 /// What a transaction wrote that changes how a failed commit should be reported.
 #[derive(Debug, Default)]
 pub(crate) struct Written {

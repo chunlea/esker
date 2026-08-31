@@ -109,6 +109,9 @@ impl Versions {
 #[derive(Debug, Clone, Default)]
 pub struct MemoryBackend {
     versions: Arc<Mutex<Versions>>,
+    /// The largest page [`Txn::scan`] will answer with, and what a `limit` of 0 becomes. Zero
+    /// means no ceiling, which is [`Txn`]'s own contract. See [`MemoryBackend::with_scan_limit`].
+    max_scan: u32,
 }
 
 impl MemoryBackend {
@@ -116,6 +119,26 @@ impl MemoryBackend {
     #[must_use]
     pub fn new() -> Self {
         MemoryBackend::default()
+    }
+
+    /// Caps every scan at `max` pairs, and reads a `limit` of 0 as `max` rather than as "no
+    /// limit".
+    ///
+    /// **This is the real client's behaviour, not a fault injected for fun.**
+    /// `esker_client::Transaction::scan` puts every limit through
+    /// `Router::bounded_limit(limit, DEFAULT_SCAN_LIMIT)`, which turns 0 into 1024 and then caps
+    /// it at `max_scan_limit`. A fake that answered 0 as "everything" let code that asked for a
+    /// whole range look correct here and truncate silently against the real backend — a `DROP
+    /// TABLE` that left rows, and a `CREATE INDEX` whose index made a query return *fewer* rows
+    /// than the same query without it (`docs/plans/phase-6a.md` §10a).
+    ///
+    /// So this exists to make that difference *visible to a test*: set it to two and any code
+    /// that does not page comes back with two rows. Everything that walks a range goes through
+    /// the executor's `for_each_page`, and the tests that pin it set this.
+    #[must_use]
+    pub fn with_scan_limit(mut self, max: u32) -> Self {
+        self.max_scan = max;
+        self
     }
 
     /// The value visible at the newest committed timestamp, for assertions in tests.
@@ -142,8 +165,21 @@ impl Backend for MemoryBackend {
             versions: Arc::clone(&self.versions),
             start_ts,
             buffer: BTreeMap::new(),
+            max_scan: self.max_scan,
         }))
     }
+}
+
+/// What a scan will actually answer with, given what was asked and the store's ceiling.
+///
+/// Shaped after `esker_client::Router::bounded_limit`: with a ceiling, a `limit` of 0 means the
+/// ceiling rather than "everything", and anything above it is capped. With no ceiling — the
+/// default — [`Txn`]'s own contract applies and 0 is unlimited.
+fn bounded_limit(limit: u32, max: u32) -> u32 {
+    if max == 0 {
+        return limit;
+    }
+    if limit == 0 { max } else { limit.min(max) }
 }
 
 /// One transaction against a [`MemoryBackend`].
@@ -152,6 +188,8 @@ struct MemoryTxn {
     versions: Arc<Mutex<Versions>>,
     start_ts: u64,
     buffer: BTreeMap<Vec<u8>, Write>,
+    /// The store's scan ceiling; see [`MemoryBackend::with_scan_limit`].
+    max_scan: u32,
 }
 
 impl MemoryTxn {
@@ -202,6 +240,7 @@ impl Txn for MemoryTxn {
         let rows = merged.into_iter().map(|(k, v)| (Bytes::from(k), v));
         // The limit is applied after the merge, or a buffered row could displace a committed one
         // and the scan would return fewer rows than it should.
+        let limit = bounded_limit(limit, self.max_scan);
         Ok(if limit == 0 {
             rows.collect()
         } else {
