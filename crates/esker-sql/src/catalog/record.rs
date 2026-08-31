@@ -7,6 +7,7 @@
 //! 'm' ++ "sql" ++ 'n' ++ tenant:u64 ++ name    a name, and what relation it is
 //! 'm' ++ "sql" ++ 'd'                          the cluster's default MVCC retention
 //! 'm' ++ "sql" ++ 'r' ++ tenant:u64 ++ id:u64  one table's retention override
+//! 'm' ++ "sql" ++ 'a' ++ tenant:u64 ++ id:u64  one table's next internal row id
 //! ```
 //!
 //! The two retention records are read by the **garbage collector**, which lives below this crate
@@ -51,6 +52,7 @@ const KIND_INDEX: u8 = b'i';
 const KIND_PRIMARY_KEY: u8 = b'p';
 const KIND_RETENTION_DEFAULT: u8 = b'd';
 const KIND_RETENTION: u8 = b'r';
+const KIND_ROW_ID: u8 = b'a';
 
 /// Tags for [`ColumnType`] as stored. Ours rather than PostgreSQL's OIDs, because these are a
 /// format we own and must never move; the OIDs stay on the wire where they belong.
@@ -156,6 +158,19 @@ pub(super) fn decode_retention(bytes: &[u8]) -> Result<u64> {
     let retention = reader.u64_le()?;
     reader.finish()?;
     Ok(retention)
+}
+
+/// `'m' ++ "sql" ++ 'a' ++ tenant ++ table_id`. The next unhanded-out row id for one table.
+///
+/// Its own key per table, and not the tenant's relation-id sequence: row ids are handed out per
+/// *insert* rather than per relation, so one counter for a tenant would be a key every writer in
+/// the tenant conflicts on.
+#[must_use]
+pub(super) fn row_id_key(tenant: u64, table_id: u64) -> Vec<u8> {
+    let mut suffix = [SQL, &[KIND_ROW_ID]].concat();
+    codec::encode_u64(tenant, &mut suffix);
+    codec::encode_u64(table_id, &mut suffix);
+    prefix::meta_key(&suffix)
 }
 
 /// A monotone counter as stored: little-endian, like every other record body here.

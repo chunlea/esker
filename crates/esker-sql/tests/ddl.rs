@@ -137,15 +137,79 @@ fn create_table_puts_the_columns_the_key_and_the_unique_indexes_in_the_catalog()
     assert_eq!(table.indexes[0].columns, [1]);
 }
 
-/// The row key *is* the primary key, so a table without one has nowhere to live. PostgreSQL allows
-/// it, so contract C2 says the answer is `0A000` naming it -- not a syntax error and not a table
-/// that quietly cannot be written to.
+/// A table with no declared key gets an internal row id, and every trace of it is hidden: it is
+/// not in `SELECT *`, not fillable by an `INSERT`, and not nameable under any spelling.
 #[test]
-fn a_table_without_a_primary_key_is_refused_by_name() {
+fn a_table_without_a_primary_key_gets_a_hidden_row_id() {
     let mut node = Node::new();
-    let error = node.run("CREATE TABLE t (a int8)").unwrap_err();
-    assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED);
-    assert!(error.to_string().contains("PRIMARY KEY"), "{error}");
+    node.run("CREATE TABLE t (a int8, b text)").unwrap();
+
+    let table = node.table("t").expect("committed");
+    assert_eq!(table.columns.len(), 3, "two declared and one internal");
+    assert_eq!(table.row_id(), Some(0));
+    assert_eq!(table.primary_key, [0], "the row key is the internal id");
+    assert!(
+        table.primary_key_name.is_empty(),
+        "no constraint was declared, so none is named"
+    );
+    assert_eq!(
+        table
+            .user_columns()
+            .map(|(_, column)| column.name.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+
+    // A table that *does* declare one has no row id and keeps its constraint name.
+    node.run("CREATE TABLE k (id int8 PRIMARY KEY)").unwrap();
+    let keyed = node.table("k").expect("committed");
+    assert_eq!(keyed.row_id(), None);
+    assert_eq!(keyed.primary_key_name, "k_pkey");
+}
+
+/// `t_pkey` is free on a table that declared no primary key, because there is no constraint to own
+/// it. Captured: `CREATE TABLE nk (a int8); CREATE INDEX nk_pkey ON nk (a);` succeeds on a real
+/// server.
+#[test]
+fn the_pkey_name_is_free_when_no_key_was_declared() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (a int8)").unwrap();
+    node.run("CREATE INDEX t_pkey ON t (a)").unwrap();
+
+    // And still taken on a table that has one.
+    node.run("CREATE TABLE k (id int8 PRIMARY KEY)").unwrap();
+    let error = node.run("CREATE INDEX k_pkey ON k (id)").unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::DUPLICATE_TABLE);
+}
+
+/// The internal row id is unnameable, and PostgreSQL's own row identity is refused by name rather
+/// than answered with something that behaves differently.
+#[test]
+fn the_row_id_cannot_be_named_and_ctid_is_refused_by_name() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (a int8)").unwrap();
+    node.run("INSERT INTO t VALUES (1)").unwrap();
+
+    // The six system columns a real PostgreSQL 19 answers -- measured, and `oid` is not among them
+    // because a table's OID column went away in PostgreSQL 12.
+    for name in ["ctid", "xmin", "xmax", "cmin", "cmax", "tableoid"] {
+        let error = node.run(&format!("SELECT {name} FROM t")).unwrap_err();
+        assert_eq!(
+            error.sqlstate(),
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "{name} was not refused by name"
+        );
+        assert!(error.to_string().contains(name), "{error}");
+    }
+
+    // `oid` really is a missing column, on a real server too.
+    let error = node.run("SELECT oid FROM t").unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::UNDEFINED_COLUMN);
+
+    // And the hidden column itself is not reachable by the empty name either, which is the one
+    // spelling that could in principle have matched it -- PostgreSQL rejects it as a syntax error
+    // before it reaches us, so this goes through the executor directly.
+    assert!(node.table("t").expect("committed").column("").is_none());
 }
 
 #[test]
@@ -771,4 +835,85 @@ mod paging {
             .unwrap_err();
         assert_eq!(error.sqlstate(), esker_sql::sqlstate::UNIQUE_VIOLATION);
     }
+}
+
+/// The whole reason row ids are leased a batch at a time rather than taken per insert: two
+/// sessions writing to the same keyless table must not conflict on the counter.
+///
+/// Both transactions are open at once and both commit. If the counter were bumped inside the
+/// statement's transaction, the second would lose a write-write race on that one key and a table
+/// with no primary key would accept one writer at a time.
+#[test]
+fn two_sessions_insert_into_a_keyless_table_without_conflicting() {
+    let mut node = Node::new();
+    let mut other = node.session();
+    node.run("CREATE TABLE t (a int8)").unwrap();
+
+    let run = |executor: &mut Executor, sql: &str| -> esker_sql::Result<Outcome> {
+        let mut last = Outcome::done("");
+        for parsed in parse_statements(sql).unwrap() {
+            last = executor.execute(&parsed, &Params::NONE)?;
+        }
+        Ok(last)
+    };
+
+    node.executor.begin().unwrap();
+    other.begin().unwrap();
+    run(&mut node.executor, "INSERT INTO t VALUES (1)").unwrap();
+    run(&mut other, "INSERT INTO t VALUES (2)").unwrap();
+    node.executor.commit().unwrap();
+    other.commit().unwrap();
+
+    let Outcome::Rows { rows, .. } = node.run("SELECT a FROM t ORDER BY a").unwrap() else {
+        panic!("not rows");
+    };
+    assert_eq!(rows.len(), 2, "both sessions' rows are there");
+}
+
+/// Row ids are allowed to have gaps, and this is what makes them: a statement that rolls back
+/// consumed the ids it reserved. PostgreSQL's sequences behave the same way -- `nextval` is
+/// non-transactional -- so it is a property to pin rather than a defect to fix.
+#[test]
+fn a_rolled_back_insert_leaves_a_gap_in_the_row_ids() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (a int8)").unwrap();
+
+    node.executor.begin().unwrap();
+    node.run("INSERT INTO t VALUES (1)").unwrap();
+    node.executor.rollback().unwrap();
+
+    node.run("INSERT INTO t VALUES (2)").unwrap();
+
+    // The row that survived is the second one, and the ids behind them are not adjacent. The ids
+    // are unreachable through SQL by design, so the assertion is about what a user *can* see:
+    // exactly one row, and the rollback took the other with it.
+    let Outcome::Rows { rows, .. } = node.run("SELECT a FROM t").unwrap() else {
+        panic!("not rows");
+    };
+    assert_eq!(rows, [[Some(b"2".to_vec())]]);
+}
+
+/// An index over a keyless table carries the internal row id as its suffix, which is what keeps
+/// two identical indexed values apart. Without it the second entry would overwrite the first and
+/// a lookup would find one row where there are two.
+#[test]
+fn an_index_on_a_keyless_table_keeps_identical_values_apart() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (a int8, b text)").unwrap();
+    node.run("INSERT INTO t VALUES (1,'x'),(1,'y'),(2,'z')")
+        .unwrap();
+    node.run("CREATE INDEX t_a_idx ON t (a)").unwrap();
+
+    let Outcome::Rows { rows, .. } = node.run("SELECT b FROM t WHERE a = 1").unwrap() else {
+        panic!("not rows");
+    };
+    assert_eq!(rows.len(), 2, "both rows with a = 1 are found");
+
+    // And the same after a rebuild from rows that already existed, which is the backfill path.
+    node.run("DROP INDEX t_a_idx").unwrap();
+    node.run("CREATE INDEX t_a_idx ON t (a)").unwrap();
+    let Outcome::Rows { rows, .. } = node.run("SELECT b FROM t WHERE a = 1").unwrap() else {
+        panic!("not rows");
+    };
+    assert_eq!(rows.len(), 2);
 }

@@ -114,7 +114,9 @@ fn walk(statement: &Statement, table: Option<&TableDef>, seen: &mut impl FnMut(u
             let Some(table) = table else { return };
             let targets: Vec<usize> = match &insert.columns {
                 Some(names) => names.iter().filter_map(|name| table.column(name)).collect(),
-                None => (0..table.columns.len()).collect(),
+                // The user's columns only, matching what `exec::dml` fills: a `$1` in the first
+                // position is the first column the user declared, not an internal row id.
+                None => table.user_columns().map(|(at, _)| at).collect(),
             };
             for row in &insert.rows {
                 for (target, expr) in targets.iter().zip(row) {

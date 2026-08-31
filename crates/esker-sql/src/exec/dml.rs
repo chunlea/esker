@@ -55,6 +55,11 @@ pub(super) fn insert(
             let column = &table.columns[*target];
             row[*target] = expr.evaluate(column.ty, &column.name)?;
         }
+        // A table with no declared key carries an internal row id the user cannot write, so the
+        // executor fills it (`crate::catalog::TableDef::row_id`).
+        if let Some(at) = table.row_id() {
+            row[at] = Datum::Int8(executor.next_row_id(table.id)?);
+        }
 
         check_not_null(&table, &row)?;
         write_row(executor, txn, &table, &row, written)?;
@@ -68,7 +73,9 @@ pub(super) fn insert(
 /// Which column each value in a `VALUES` tuple is for.
 fn target_columns(table: &TableDef, insert: &Insert) -> Result<Vec<usize>> {
     let Some(names) = &insert.columns else {
-        return Ok((0..table.columns.len()).collect());
+        // The user's columns, in order. An internal row id is not one of them: `INSERT INTO t
+        // VALUES (1, 2)` fills the two columns the user declared.
+        return Ok(table.user_columns().map(|(at, _)| at).collect());
     };
     names
         .iter()
@@ -102,16 +109,30 @@ fn write_row(
     // The primary key is a unique index whose entry is the row itself.
     let detail = render_key(table, &table.primary_key, &primary_key);
     if txn.get(&key)?.is_some() {
+        // An internal row id is handed out once and never reused, so a taken key here is not a
+        // user's duplicate -- it is this crate having lost track of the sequence, and reporting it
+        // as a `23505` would name a constraint that does not exist and blame the wrong party.
+        if table.row_id().is_some() {
+            return Err(SqlError::Internal(format!(
+                "internal row id {} of table \"{}\" is already taken",
+                render_values(&primary_key),
+                table.name
+            )));
+        }
         return Err(SqlError::UniqueViolation {
             constraint: table.primary_key_name.clone(),
             key: Some(detail.clone()),
         });
     }
-    written.unique_keys.push(Unique {
-        key: key.clone(),
-        constraint: table.primary_key_name.clone(),
-        detail,
-    });
+    // Only a *declared* key is a constraint a lost race can be reported against; an internal row
+    // id cannot collide, so recording it would only add a key for `explain_conflict` to probe.
+    if table.row_id().is_none() {
+        written.unique_keys.push(Unique {
+            key: key.clone(),
+            constraint: table.primary_key_name.clone(),
+            detail,
+        });
+    }
 
     for index in &table.indexes {
         let columns: Vec<Datum> = index

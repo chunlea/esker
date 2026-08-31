@@ -56,6 +56,9 @@ pub struct Executor {
     written: Written,
     /// Notices produced by the statement that just ran, waiting for the session to send them.
     notices: Vec<SqlError>,
+    /// Row ids reserved for this session but not yet handed out: `table_id -> (next, end)`.
+    /// See [`Executor::next_row_id`].
+    row_ids: std::collections::BTreeMap<u64, (u64, u64)>,
     /// Whether the open transaction has run DDL. From then on its catalog lookups read through
     /// rather than from the shared cache: they answer with its own uncommitted definitions, which
     /// must not reach the other sessions on this node (`crate::catalog`).
@@ -73,6 +76,7 @@ impl Executor {
             open: None,
             written: Written::default(),
             notices: Vec::new(),
+            row_ids: std::collections::BTreeMap::new(),
             catalog_written: false,
         }
     }
@@ -212,6 +216,42 @@ impl Executor {
         }
         // Nobody took any of them: an ordinary row-level race, and still retryable.
         error
+    }
+
+    /// The next internal row id for a table that has no primary key of its own.
+    ///
+    /// Reserved a batch at a time **in a transaction of its own**, which is the point rather than
+    /// an optimisation: the counter is one key per table, so bumping it inside the statement's
+    /// transaction would make two concurrent inserts into the same table conflict on it and one of
+    /// them always lose. A session takes [`catalog::ROW_ID_BATCH`] ids, commits that, and hands
+    /// them out from memory (`crate::catalog::allocate_row_ids`, which carries the argument and
+    /// the consequence — gaps, exactly as a PostgreSQL sequence leaves them).
+    fn next_row_id(&mut self, table_id: u64) -> Result<i64> {
+        if let Some((next, end)) = self.row_ids.get_mut(&table_id)
+            && *next < *end
+        {
+            let id = *next;
+            *next += 1;
+            return Ok(i64::try_from(id).unwrap_or(i64::MAX));
+        }
+
+        let mut txn = self.backend.begin()?;
+        let first = match crate::catalog::allocate_row_ids(
+            &mut *txn,
+            self.tenant,
+            table_id,
+            crate::catalog::ROW_ID_BATCH,
+        ) {
+            Ok(first) => first,
+            Err(error) => {
+                let _ = txn.rollback();
+                return Err(error);
+            }
+        };
+        txn.commit()?;
+        self.row_ids
+            .insert(table_id, (first + 1, first + crate::catalog::ROW_ID_BATCH));
+        Ok(i64::try_from(first).unwrap_or(i64::MAX))
     }
 
     /// Adds a notice for the session to send before this statement's `CommandComplete`.

@@ -1,0 +1,104 @@
+# A table with no PRIMARY KEY, which PostgreSQL allows and this node now does too.
+#
+# The row key *is* the primary key here, so such a table gets an internal row id: a column the user
+# cannot name, holding an int8 from a per-table sequence. Everything below is what a user sees of
+# it, which is meant to be nothing at all beyond the table working. Replayed against a real
+# PostgreSQL 19beta1.
+
+statement ok
+CREATE TABLE nk (a int8, b text)
+
+# Duplicate rows are the point: with no key there is nothing to make them collide.
+# tag: INSERT 0 3
+statement ok
+INSERT INTO nk VALUES (1,'x'),(1,'x'),(2,'y')
+
+query IT
+SELECT a, b FROM nk ORDER BY a, b
+----
+1	x
+1	x
+2	y
+
+# `SELECT *` is the two columns the user declared, in the order they were declared.
+query IT
+SELECT * FROM nk ORDER BY a, b
+----
+1	x
+1	x
+2	y
+
+# An UPDATE matching two identical rows updates both, and they stay two rows.
+# tag: UPDATE 2
+statement ok
+UPDATE nk SET b = 'w' WHERE a = 1
+
+query IT
+SELECT * FROM nk ORDER BY a, b
+----
+1	w
+1	w
+2	y
+
+# And a DELETE takes both.
+# tag: DELETE 2
+statement ok
+DELETE FROM nk WHERE a = 1
+
+query IT
+SELECT * FROM nk ORDER BY a
+----
+2	y
+
+# An index over a keyless table: its entries carry the internal row id as their suffix, which is
+# what keeps two identical indexed values apart.
+# tag: CREATE INDEX
+statement ok
+CREATE INDEX nk_a_idx ON nk (a)
+
+# tag: INSERT 0 2
+statement ok
+INSERT INTO nk VALUES (3,'z'),(3,'z')
+
+query IT
+SELECT a, b FROM nk WHERE a = 3
+----
+3	z
+3	z
+
+# A UNIQUE constraint still works without a primary key, and still refuses a duplicate.
+statement ok
+CREATE TABLE nu (a int8 UNIQUE, b text)
+
+# tag: INSERT 0 1
+statement ok
+INSERT INTO nu VALUES (1,'x')
+
+statement error (23505)
+INSERT INTO nu VALUES (1,'y')
+
+# `<table>_pkey` is free when nothing declared a primary key -- there is no constraint to own the
+# name. Captured: this succeeds on a real server.
+# tag: CREATE INDEX
+statement ok
+CREATE INDEX nk_pkey ON nk (a)
+
+# DIVERGES from PostgreSQL, deliberately. Every PostgreSQL table has six system columns; this one
+# has none of them, and the interesting one is `ctid`. PostgreSQL's ctid is a *physical* address
+# that moves whenever the row is rewritten; the row id here is a *logical* identity that never
+# moves, because an index entry points at the row key and a key that moved would mean rewriting
+# every index on every update. They are not the same thing under different names, so ctid is
+# refused by name rather than answered with something that behaves differently.
+statement error (0A000)
+SELECT ctid FROM nk
+
+statement error (0A000)
+SELECT xmin FROM nk
+
+statement error (0A000)
+SELECT tableoid FROM nk
+
+# `oid` is not a system column -- a table's OID went away in PostgreSQL 12, and a real server says
+# the column does not exist. Measured, because the two answers are easy to swap.
+statement error (42703)
+SELECT oid FROM nk

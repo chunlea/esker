@@ -509,6 +509,9 @@ its own gap register, and it would be longer.
 - [x] 8 — `ALTER TABLE ADD COLUMN` (the continuation): the catalog cache fix it uncovered, the row
   and catalog format change that makes it rewrite nothing (ADR 0019), the statement itself, and the
   `ALTER TABLE` grammar sweep that closed eighteen contract-C1 violations nobody had looked for
+- [x] 9 — tables with no `PRIMARY KEY`: an internal row id at column 0, leased a batch at a time so
+  that two writers to one keyless table do not conflict on its counter; the six system columns
+  refused by name rather than reported missing
 
 ## 10a. Handoff — where a fresh lane picks up
 
@@ -530,7 +533,7 @@ does not, in full:
 | Divergence | Why | Where it is written down |
 |---|---|---|
 | `text` sorts by bytes | A locale-aware collation needs ICU or a platform C library; this project compiles neither. Equivalent to PostgreSQL's `COLLATE "C"`. | §6, `crate::row`, `tests/slt/select.slt` |
-| A table with no `PRIMARY KEY` is `0A000` | The row key *is* the primary key. `TODO(post-v1)`: an implicit row id from a per-table sequence. | §11 unit 6a, `tests/slt/create_table.slt` |
+| A table with no `PRIMARY KEY` has no `ctid`, `xmin`, `xmax`, `cmin`, `cmax` or `tableoid` | The table itself works — it gets an internal row id (§11 unit 9) — but PostgreSQL's six system columns do not exist here and are `0A000` naming themselves. `ctid` is the one that matters: PostgreSQL's is a *physical* address that moves when a row is rewritten, ours is a *logical* identity that never moves, and answering one with the other would behave differently the first time somebody updated a row. | §11 unit 9, `tests/slt/no_primary_key.slt` |
 | A decimal literal in an `int8` column is `0A000` | `numeric` rounds half away from zero and `float8` rounds half to even; there is no `numeric` here to be sure with. | §11 unit 6b, `tests/slt/types.slt` |
 | `ADD COLUMN ... NOT NULL` is `0A000` even on an empty table | PostgreSQL accepts it there, because there is no row to violate it. Accepting it would mean scanning the table to find out, and the `ALTER` is supposed to touch no row; the restriction is stated rather than conditional. | §11 unit 8, `tests/slt/unsupported.slt` |
 | Six value inputs are `0A000` | Hexadecimal floats, and PostgreSQL's datetime grammar outside ISO 8601. | `tests/value_parity.rs`'s `DIVERGENCES` |

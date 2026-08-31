@@ -11,13 +11,22 @@
 //! the whole feature, and it is why the restrictions are what they are: `NOT NULL` and `DEFAULT`
 //! both need every existing row to hold a value it does not hold, and each is refused by name.
 //!
-//! # A table needs a primary key
+//! # A table with no primary key gets a hidden one
 //!
-//! The row key *is* the primary key (`crate::row`), so a table without one has no key space to
-//! live in. PostgreSQL allows such a table and gives its rows a hidden identity; we do not, and
-//! contract C2 says what to do about a statement PostgreSQL accepts and we cannot run — `0A000`,
-//! naming it. `TODO(post-v1)`: an implicit row id from a per-table sequence, which is how this is
-//! usually closed, and which needs a sequence phase 6a does not have.
+//! The row key *is* the primary key (`crate::row`), so a table without one would have no key space
+//! to live in. PostgreSQL allows such a table and gives its rows an identity of its own, so this
+//! does too: a column the user cannot name, holding an `int8` from a per-table sequence, at
+//! position 0 with the primary key pointing at it. Every layer below is then unchanged — the row
+//! key, the index suffix, `UPDATE` and `DELETE` all work on a primary key like any other.
+//!
+//! **The divergence from PostgreSQL is honest and worth stating.** PostgreSQL's `ctid` is a
+//! *physical* address, `(block, offset)`, and it moves whenever the row is rewritten — an `UPDATE`
+//! changes it, and `VACUUM FULL` changes every one of them. Ours is a *logical* identity that
+//! never changes for the life of the row, because the row key is what an index entry points at and
+//! a moving key would mean rewriting every index on every update. So: `ctid` is not implemented and
+//! is `0A000` (there is no block and no offset to report), the hidden column cannot be selected
+//! under any spelling, and the only user-visible consequence of its existence is that a table
+//! without a key can now be created, written and read.
 
 use crate::backend::Txn;
 use crate::catalog::{self, ColumnDef, IndexDef, TableDef};
@@ -67,18 +76,37 @@ pub(super) fn create_table(
             .ok_or_else(|| SqlError::UndefinedColumnInKey(name.clone()))
     };
 
-    if create.primary_key.is_empty() {
-        return Err(SqlError::unsupported(format!(
-            "a table without a PRIMARY KEY (\"{}\")",
-            create.name
-        )));
-    }
-    let primary_key = create
-        .primary_key
-        .iter()
-        .map(key_position)
-        .collect::<Result<Vec<_>>>()?;
+    // No declared key: the table gets an internal row id at position 0, and the primary key
+    // points at it. Position 0 rather than the end so that a later `ALTER TABLE ADD COLUMN`
+    // appends after the user's columns and cannot move it.
+    let (columns, primary_key, primary_key_name) = if create.primary_key.is_empty() {
+        let mut with_row_id = Vec::with_capacity(columns.len() + 1);
+        with_row_id.push(ColumnDef {
+            name: catalog::INTERNAL_ROW_ID_NAME.to_owned(),
+            ty: crate::value::ColumnType::Int8,
+            not_null: true,
+        });
+        with_row_id.extend(columns);
+        (with_row_id, vec![0], String::new())
+    } else {
+        let primary_key = create
+            .primary_key
+            .iter()
+            .map(key_position)
+            .collect::<Result<Vec<_>>>()?;
+        let name = create
+            .primary_key_name
+            .clone()
+            .unwrap_or_else(|| plan::primary_key_name(&create.name));
+        (columns, primary_key, name)
+    };
 
+    let key_position = |name: &String| {
+        columns
+            .iter()
+            .position(|column: &ColumnDef| &column.name == name)
+            .ok_or_else(|| SqlError::UndefinedColumnInKey(name.clone()))
+    };
     let mut indexes = Vec::with_capacity(create.unique.len());
     for constraint in &create.unique {
         let ordinals = constraint
@@ -103,10 +131,7 @@ pub(super) fn create_table(
         columns,
         primary_key,
         indexes,
-        primary_key_name: create
-            .primary_key_name
-            .clone()
-            .unwrap_or_else(|| plan::primary_key_name(&create.name)),
+        primary_key_name,
         // A table starts at schema version 1; `ALTER TABLE ADD COLUMN` moves it.
         schema_version: 1,
     };

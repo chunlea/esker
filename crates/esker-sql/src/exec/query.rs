@@ -378,13 +378,33 @@ fn dealias(expr: &Expr, select: &Select) -> Expr {
 
 /// Replaces every column name with its position and type. A name the table does not have is
 /// `42703` here rather than a wrong answer later.
+/// The six columns every PostgreSQL table has and this one does not, so that asking for one is
+/// answered by name (contract C2) rather than with `42703 column "ctid" does not exist`, which
+/// would be untrue — on a real server it does.
+///
+/// Measured rather than recalled: these six answer on a real PostgreSQL 19 and `oid` does not,
+/// because a table's OID column went away in PostgreSQL 12.
+///
+/// `ctid` is the interesting one and the reason this list exists at all. It is a *physical*
+/// address — `(block, offset)` — and it moves when the row is rewritten. The internal row id a
+/// keyless table gets here is a *logical* identity that never moves, because an index entry points
+/// at the row key and a key that moved would mean rewriting every index on every update. They are
+/// not the same thing under different names, so `ctid` is refused rather than answered with
+/// something that would behave differently the first time somebody updated a row.
+fn undefined_column(name: &str) -> SqlError {
+    if let Some(system) = SYSTEM_COLUMNS.iter().find(|system| **system == name) {
+        return SqlError::unsupported(format!("the system column {system}"));
+    }
+    SqlError::UndefinedColumn(name.to_owned())
+}
+
+const SYSTEM_COLUMNS: [&str; 6] = ["ctid", "xmin", "xmax", "cmin", "cmax", "tableoid"];
+
 fn resolve(expr: &Expr, table: Option<&TableDef>) -> Result<Expr> {
     Ok(match expr {
         Expr::Column(name) => {
             let table = table.ok_or_else(|| SqlError::UndefinedColumn(name.clone()))?;
-            let at = table
-                .column(name)
-                .ok_or_else(|| SqlError::UndefinedColumn(name.clone()))?;
+            let at = table.column(name).ok_or_else(|| undefined_column(name))?;
             Expr::Ordinal {
                 at,
                 ty: table.columns[at].ty,
@@ -512,11 +532,12 @@ fn output_columns(select: &Select, table: Option<&TableDef>) -> Result<Vec<(Stri
                     message: "SELECT * with no tables specified is not valid".to_owned(),
                     position: None,
                 })?;
+                // The user's columns, so an internal row id stays hidden: `SELECT *` on a table
+                // with no declared key returns what the user declared and nothing else.
                 columns.extend(
                     table
-                        .columns
-                        .iter()
-                        .map(|column| (column.name.clone(), column.ty)),
+                        .user_columns()
+                        .map(|(_, column)| (column.name.clone(), column.ty)),
                 );
             }
             SelectItem::Expr { expr, alias } => {
@@ -542,10 +563,11 @@ fn projection_exprs(select: &Select, table: Option<&TableDef>) -> Result<Vec<Exp
                     message: "SELECT * with no tables specified is not valid".to_owned(),
                     position: None,
                 })?;
-                exprs.extend((0..table.columns.len()).map(|at| Expr::Ordinal {
-                    at,
-                    ty: table.columns[at].ty,
-                }));
+                exprs.extend(
+                    table
+                        .user_columns()
+                        .map(|(at, column)| Expr::Ordinal { at, ty: column.ty }),
+                );
             }
             SelectItem::Expr { expr, .. } => exprs.push(resolve(expr, table)?),
         }
@@ -560,9 +582,7 @@ fn expr_type(expr: &Expr, table: Option<&TableDef>) -> Result<ColumnType> {
     Ok(match expr {
         Expr::Column(name) => {
             let table = table.ok_or_else(|| SqlError::UndefinedColumn(name.clone()))?;
-            let at = table
-                .column(name)
-                .ok_or_else(|| SqlError::UndefinedColumn(name.clone()))?;
+            let at = table.column(name).ok_or_else(|| undefined_column(name))?;
             table.columns[at].ty
         }
         Expr::Ordinal { ty, .. } => *ty,

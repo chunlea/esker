@@ -42,10 +42,9 @@ CREATE TABLE dup (a int8 PRIMARY KEY, a text)
 statement error (42703)
 CREATE TABLE badkey (a int8, PRIMARY KEY (b))
 
-# DIVERGES from PostgreSQL, deliberately. The row key *is* the primary key, so a table without one
-# has nowhere to live; PostgreSQL allows it and gives its rows a hidden identity. Contract C2 says
-# what to do about a statement PostgreSQL accepts and we cannot run: name it.
-statement error (0A000)
+# A table with no primary key is allowed, and gets an internal row id (see no_primary_key.slt).
+# tag: CREATE TABLE
+statement ok
 CREATE TABLE nokey (a int8)
 
 statement error (42P01)

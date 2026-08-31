@@ -94,6 +94,18 @@ pub struct IndexDef {
     pub columns: Vec<usize>,
 }
 
+/// The name the internal row id column carries: **no name at all**.
+///
+/// It cannot collide with anything a user writes, and that is a fact about PostgreSQL rather than
+/// a convention of ours: a zero-length delimited identifier is `42601 zero-length delimited
+/// identifier`, measured against the server, so `""` is a name no statement can ever mention. That
+/// makes the column unnameable by construction instead of by a reserved word somebody could
+/// legitimately want — no `_rowid` that a user is then forbidden to call their own column.
+pub const INTERNAL_ROW_ID_NAME: &str = "";
+
+/// How many row ids a session reserves at a time (see [`allocate_row_ids`]).
+pub const ROW_ID_BATCH: u64 = 256;
+
 /// A table, its columns, its primary key and its indexes — everything needed to write a row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableDef {
@@ -109,6 +121,11 @@ pub struct TableDef {
     pub indexes: Vec<IndexDef>,
     /// The primary key constraint's name, which is a relation name like any other even though it
     /// has no index behind it. It is what a `23505` on the key quotes back.
+    ///
+    /// **Empty means the user declared no primary key**, in which case [`TableDef::row_id`] is
+    /// `Some` and the key is an internal row id. Empty is unambiguous rather than convenient: a
+    /// zero-length identifier is a syntax error in PostgreSQL (see [`INTERNAL_ROW_ID_NAME`]), so
+    /// no constraint a user names can be spelled this way.
     pub primary_key_name: String,
     /// How many times this table's *shape* has changed. `1` for a table as `CREATE TABLE` left
     /// it; each `ALTER TABLE ADD COLUMN` adds one.
@@ -123,9 +140,34 @@ pub struct TableDef {
 
 impl TableDef {
     /// The position of a column by name, or `None`.
+    ///
+    /// A user's name never finds the internal row id, because that column's name is one no
+    /// statement can contain ([`INTERNAL_ROW_ID_NAME`]).
     #[must_use]
     pub fn column(&self, name: &str) -> Option<usize> {
+        if name.is_empty() {
+            return None;
+        }
         self.columns.iter().position(|column| column.name == name)
+    }
+
+    /// The position of the internal row id, or `None` for a table whose user declared a primary
+    /// key.
+    ///
+    /// It is always column 0 when it is there, so a later `ALTER TABLE ADD COLUMN` appends after
+    /// the user's columns and cannot move it.
+    #[must_use]
+    pub fn row_id(&self) -> Option<usize> {
+        self.primary_key_name.is_empty().then_some(0)
+    }
+
+    /// The columns a user can see: every column except the internal row id.
+    ///
+    /// This is what `SELECT *` expands to and what an `INSERT` with no column list fills, which is
+    /// the whole of what makes the row id *hidden* rather than merely unnamed.
+    pub fn user_columns(&self) -> impl Iterator<Item = (usize, &ColumnDef)> {
+        let skip = usize::from(self.row_id().is_some());
+        self.columns.iter().enumerate().skip(skip)
     }
 
     /// Every column's type, in encoding order — what [`crate::row`] needs.
@@ -418,8 +460,11 @@ pub fn drop_table(txn: &mut dyn Txn, tenant: u64, table: &TableDef) -> Result<()
     // A relation id is never reused, so an orphan override could not be mistaken for another
     // table's -- but it would sit in the collector's scan of every override for ever.
     clear_table_retention(txn, tenant, table.id);
+    txn.delete(&record::row_id_key(tenant, table.id));
     txn.delete(&record::name_key(tenant, &table.name));
-    txn.delete(&record::name_key(tenant, &table.primary_key_name));
+    if !table.primary_key_name.is_empty() {
+        txn.delete(&record::name_key(tenant, &table.primary_key_name));
+    }
     for index in &table.indexes {
         txn.delete(&record::name_key(tenant, &index.name));
     }
@@ -438,10 +483,14 @@ fn write_table(txn: &mut dyn Txn, tenant: u64, table: &TableDef) {
     // The primary key constraint's name is a relation name and has to be taken, even though there
     // is no index behind it -- the row key is the primary key. PostgreSQL answers `42P07` to
     // `CREATE INDEX t_pkey ON t (a)` and so must this.
-    txn.put(
-        &record::name_key(tenant, &table.primary_key_name),
-        &record::encode_relation(&Relation::PrimaryKey { table_id: table.id }),
-    );
+    // A table with no declared key has no constraint and so takes no name: `CREATE TABLE t (a
+    // int8); CREATE INDEX t_pkey ON t (a);` succeeds on a real server.
+    if !table.primary_key_name.is_empty() {
+        txn.put(
+            &record::name_key(tenant, &table.primary_key_name),
+            &record::encode_relation(&Relation::PrimaryKey { table_id: table.id }),
+        );
+    }
     for index in &table.indexes {
         txn.put(
             &record::name_key(tenant, &index.name),
@@ -494,6 +543,34 @@ pub fn default_retention(txn: &dyn Txn) -> Result<u64> {
         Some(bytes) => record::decode_retention(&bytes),
         None => Ok(DEFAULT_RETENTION_MS),
     }
+}
+
+/// Reserves `count` consecutive row ids for one table and answers with the first.
+///
+/// **This is called in a transaction of its own, not the statement's**, and the reason is the
+/// whole design. The counter is one key per table; if every `INSERT` bumped it inside its own
+/// transaction then two concurrent inserts into the same table would conflict on that key and one
+/// would always lose — a table with no primary key would accept one writer at a time. So a session
+/// reserves a batch ([`ROW_ID_BATCH`]) in a short transaction of its own and hands ids out from
+/// memory.
+///
+/// The consequence is **gaps**, and they are not a defect: ids reserved by a statement that rolls
+/// back, or by a session that ends, are never handed out. That is exactly what a PostgreSQL
+/// sequence does — `nextval` is non-transactional and a rolled-back `INSERT` still consumed its
+/// value — so a user who knows PostgreSQL already expects it. Nothing user-visible depends on the
+/// ids being dense; they are the row's identity and never its data.
+pub fn allocate_row_ids(txn: &mut dyn Txn, tenant: u64, table_id: u64, count: u64) -> Result<u64> {
+    let key = record::row_id_key(tenant, table_id);
+    let next = match txn.get(&key)? {
+        Some(bytes) => record::decode_counter(&bytes)?,
+        // Ids start at 1, so 0 is never a row.
+        None => 1,
+    };
+    let after = next
+        .checked_add(count)
+        .ok_or_else(|| SqlError::Internal("the row id sequence is exhausted".into()))?;
+    txn.put(&key, &record::encode_counter(after));
+    Ok(next)
 }
 
 /// Takes the next relation id for a tenant. Ids start at 1, so 0 is never a real relation.

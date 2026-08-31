@@ -66,8 +66,10 @@
 //!
 //! * `unsupported.slt` in its entirety, which is contract C2 — every statement in it is one
 //!   PostgreSQL runs and this node answers `0A000` for, by design;
-//! * three lines marked `DIVERGES`, each with the reason beside it: a table with no primary key, a
-//!   decimal literal in an integer column, and `text` ordering by bytes rather than by a locale.
+//! * the lines marked `DIVERGES`, each with the reason beside it: a decimal literal in an integer
+//!   column, `text` ordering by bytes rather than by a locale, and the six system columns a
+//!   PostgreSQL table has and this one does not (`no_primary_key.slt`, where `ctid` is the one
+//!   worth reading about).
 //!
 //! Rows are one per line with columns separated by a **tab**, and a NULL is the four characters
 //! `NULL`.
@@ -99,6 +101,10 @@ pub(crate) const FILES: &[(&str, &str)] = &[
     ("index.slt", include_str!("../slt/index.slt")),
     ("insert.slt", include_str!("../slt/insert.slt")),
     ("limits.slt", include_str!("../slt/limits.slt")),
+    (
+        "no_primary_key.slt",
+        include_str!("../slt/no_primary_key.slt"),
+    ),
     ("nulls.slt", include_str!("../slt/nulls.slt")),
     ("ordering.slt", include_str!("../slt/ordering.slt")),
     (
