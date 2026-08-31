@@ -61,6 +61,16 @@ SELECT c.*, o.id FROM o JOIN c ON o.cid = c.id ORDER BY o.id
 statement error (42P01)
 SELECT wrong.* FROM o JOIN c ON o.cid = c.id
 
+# The tables may be written either way round too, and the answer -- rows *and* column order --
+# must not change with it. Only the plan does (see select.rs): the planner drives the loop from
+# whichever side lets the other be probed.
+query ITTIII
+SELECT * FROM c JOIN o ON c.id = o.cid ORDER BY o.id
+----
+1	ann	a@x	10	1	100
+1	ann	a@x	11	1	200
+2	bob	b@x	12	2	300
+
 # The operands may be written either way round; which side is the inner one is the planner's to
 # decide and not the user's to spell.
 query I

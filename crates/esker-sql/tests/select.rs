@@ -545,6 +545,17 @@ fn explain_shows_how_the_inner_side_of_a_join_is_reached() {
     assert!(cross.contains("Inner: Materialize on c"), "{cross}");
     assert!(!cross.contains("Join Filter"), "{cross}");
 
+    // Written with the probeable table *first*, the planner drives the loop from the other side
+    // rather than materialising. An inner join is commutative, so this is free -- and without it
+    // the same query costs a pass over the whole of `o` per row of `c`, which is a plan a user
+    // would have had to know to avoid by typing the tables in the other order.
+    let swapped = plan(
+        &mut node,
+        "EXPLAIN SELECT o.id FROM c JOIN o ON c.id = o.cid",
+    );
+    assert!(swapped.contains("Inner: Point Get on c"), "{swapped}");
+    assert!(swapped.contains("Seq Scan on o"), "{swapped}");
+
     // The outer side is still planned: a `WHERE` that belongs to it narrows the scan under the
     // join rather than filtering above it.
     let outer = plan(

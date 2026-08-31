@@ -36,19 +36,38 @@ use crate::value::{ColumnType, Datum};
 /// of what resolution needs, and the reason this is a list rather than a pair.
 #[derive(Debug, Default)]
 pub(super) struct Scope<'a> {
+    /// In the order their columns appear in a row — which for a join is the order the executor
+    /// reads them, outer first, and **not** necessarily the order the user wrote them in.
     tables: Vec<&'a TableDef>,
+    /// Indexes into `tables`, in the order the user wrote them. `SELECT *` expands in this order,
+    /// because the columns a user gets back must not depend on which side the planner chose to
+    /// drive the loop from.
+    written: Vec<usize>,
 }
 
 impl<'a> Scope<'a> {
     /// No tables: `SELECT 1`.
     fn empty() -> Self {
-        Scope { tables: Vec::new() }
+        Scope {
+            tables: Vec::new(),
+            written: Vec::new(),
+        }
     }
 
     /// One table, which is every statement that is not a join.
     pub(super) fn single(table: &'a TableDef) -> Self {
         Scope {
             tables: vec![table],
+            written: vec![0],
+        }
+    }
+
+    /// Two tables: the first is the one the loop is driven from, and `swapped` says whether that
+    /// is the one the user wrote second.
+    fn joined(outer: &'a TableDef, inner: &'a TableDef, swapped: bool) -> Self {
+        Scope {
+            tables: vec![outer, inner],
+            written: if swapped { vec![1, 0] } else { vec![0, 1] },
         }
     }
 
@@ -82,12 +101,11 @@ impl<'a> Scope<'a> {
             return Ok(columns.into_iter());
         }
         let columns: Vec<_> = self
-            .tables
+            .written
             .iter()
-            .enumerate()
-            .flat_map(|(index, table)| {
+            .flat_map(|&index| {
                 let offset = self.offset(index);
-                table
+                self.tables[index]
                     .user_columns()
                     .map(move |(at, column)| (offset + at, column))
             })
@@ -177,15 +195,38 @@ pub(super) fn plan(
     table: Option<&TableDef>,
     inner: Option<&TableDef>,
 ) -> Result<Planned> {
-    let scope = match (table, inner) {
-        (None, _) => Scope::empty(),
-        (Some(table), None) => Scope::single(table),
-        (Some(outer), Some(inner)) => Scope {
-            tables: vec![outer, inner],
-        },
+    // Which side drives the loop. An inner join is commutative, so this is free to choose — and
+    // it has to choose, because the probe only works on the *inner* side: without this, `FROM c
+    // JOIN o ON c.id = o.cid` reads the whole of `o` for every row of `c`, while the same query
+    // written the other way round costs one key read per row. A user should not have to know
+    // which order to type.
+    let (scope, swapped) = match (table, inner) {
+        (None, _) => (Scope::empty(), false),
+        (Some(table), None) => (Scope::single(table), false),
+        (Some(left), Some(right)) => {
+            let on = select.join.as_ref().and_then(|join| join.on.as_ref());
+            // As written first: a probe on the right-hand table keeps the order the user chose,
+            // which keeps `EXPLAIN` easiest to read when both would work.
+            if on.is_some_and(|on| {
+                probe_for(on, &Scope::joined(left, right, false), right).is_some()
+            }) {
+                (Scope::joined(left, right, false), false)
+            } else if on
+                .is_some_and(|on| probe_for(on, &Scope::joined(right, left, true), left).is_some())
+            {
+                (Scope::joined(right, left, true), true)
+            } else {
+                (Scope::joined(left, right, false), false)
+            }
+        }
+    };
+    let (outer_table, inner_table) = match (table, inner, swapped) {
+        (Some(left), Some(right), false) => (Some(left), Some(right)),
+        (Some(left), Some(right), true) => (Some(right), Some(left)),
+        (table, _, _) => (table, None),
     };
 
-    let mut node = match table {
+    let mut node = match outer_table {
         None => Node::OneRow,
         // With a join the outer access path only gets the `WHERE` when the whole of it belongs to
         // the outer table. A predicate mentioning the inner one cannot narrow the outer scan --
@@ -195,13 +236,13 @@ pub(super) fn plan(
             let usable = select
                 .filter
                 .as_ref()
-                .filter(|filter| inner.is_none() || mentions_only(filter, table));
+                .filter(|filter| inner_table.is_none() || mentions_only(filter, table));
             access_path(usable, tenant, table)?
         }
     };
 
     if let Some(join) = &select.join {
-        let inner = inner.ok_or_else(|| SqlError::UndefinedTable(join.table.clone()))?;
+        let inner = inner_table.ok_or_else(|| SqlError::UndefinedTable(join.table.clone()))?;
         node = join_node(node, join, &scope, inner)?;
     }
 
@@ -259,7 +300,7 @@ pub(super) fn plan(
     Ok(Planned {
         node,
         columns,
-        table: table.map_or_else(|| "-".to_owned(), |table| table.name.clone()),
+        table: outer_table.map_or_else(|| "-".to_owned(), |table| table.name.clone()),
         // Every column of every table in scope, in row order, so `EXPLAIN` can print the name a
         // user typed for any position the executor resolved.
         column_names: scope
