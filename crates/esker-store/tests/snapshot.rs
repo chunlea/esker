@@ -263,6 +263,7 @@ async fn a_region_reaches_a_store_that_never_had_it() {
     let compaction = LogCompaction {
         threshold: 8,
         keep: 2,
+        ..LogCompaction::new()
     };
     let first = open(
         first_address,

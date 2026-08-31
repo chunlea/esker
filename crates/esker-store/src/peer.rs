@@ -254,6 +254,13 @@ pub struct LogCompaction {
     pub threshold: u64,
     /// How many applied entries to keep behind the new truncation point.
     pub keep: u64,
+    /// How far behind a peer may be and still have the leader keep its entries.
+    ///
+    /// A peer within this distance is one the log can still catch up cheaply, so the leader holds
+    /// what it needs rather than compacting it into needing a snapshot it may not be able to
+    /// receive. Past it the peer is abandoned to the snapshot path: holding a busy leader's log
+    /// open for a replica that is not coming back is how a leader runs out of disk.
+    pub slow_peer_allowance: u64,
 }
 
 impl LogCompaction {
@@ -263,6 +270,7 @@ impl LogCompaction {
         Self {
             threshold: crate::RAFT_LOG_COMPACT_THRESHOLD,
             keep: crate::RAFT_LOG_KEEP_ENTRIES,
+            slow_peer_allowance: crate::SLOW_PEER_LOG_ALLOWANCE,
         }
     }
 
@@ -353,12 +361,16 @@ impl PeerCore {
                     .write(batch, &WriteOptions { sync: true })?;
             }
             if ready.snapshot.is_some() {
-                // TODO(phase-4): apply a received snapshot's bytes. A single region that never
-                // compacts its log never sends one, so reaching here in 3e is a bug worth saying
-                // out loud rather than a case to handle quietly.
+                // Unreachable by construction, and loud because of what it meant when it was not.
+                // A snapshot reaches the core only by stepping an `InstallSnapshot`, and the store
+                // never steps one — the message is an announcement and the bytes travel over their
+                // own stream (`Store::receive_raft`). Until 4d's acceptance this arm was a
+                // phase-3 stub that logged and dropped, and dropping it is what left a peer with a
+                // log position it had no data for and a membership its region record disagreed
+                // with (`docs/plans/phase-4.md` §17).
                 tracing::error!(
                     region_id = self.region_id,
-                    "a Raft snapshot arrived; streaming is phase 4"
+                    "a snapshot reached the core, which this store never steps into it"
                 );
             }
 
@@ -393,6 +405,37 @@ impl PeerCore {
         Ok(())
     }
 
+    /// Lowers a compaction target to keep the entries a lagging peer still needs.
+    ///
+    /// Only a leader has anything to answer with — `progress` is empty on anyone else — and only a
+    /// leader's log is what others are fed from, so a follower compacts on its own schedule.
+    ///
+    /// Bounded by `slow_peer_allowance`: past that distance a peer is abandoned to the snapshot
+    /// path, because holding a busy leader's log open for a replica that is not coming back is how
+    /// a leader runs out of disk.
+    fn hold_for_lagging_peers(&self, target: Index) -> Index {
+        let allowance = self.compaction.slow_peer_allowance;
+        let mut held = target;
+        for peer in self.node.progress() {
+            if peer.id == self.peer_id {
+                continue;
+            }
+            // Where the peer will be once what is already on its way has landed. One with a
+            // snapshot in flight will need the entries *after* that snapshot's index, so that
+            // index — not its stale `matched` — is what has to be kept.
+            //
+            // **`matched == 0` is held for, not skipped.** A peer that has acknowledged nothing is
+            // the one with the most to lose and the least to say: a learner just added, or one
+            // caught up by a snapshot whose first probes have not been answered yet. Skipping it
+            // would step over the single case this exists for.
+            let position = peer.matched.max(peer.pending_snapshot);
+            if target.saturating_sub(position) <= allowance {
+                held = held.min(position);
+            }
+        }
+        held
+    }
+
     /// Throws away the head of the log once it has run far enough past its truncation point.
     ///
     /// Runs after the `Ready` loop rather than inside it, so a compaction never lands between the
@@ -408,6 +451,18 @@ impl PeerCore {
         else {
             return Ok(());
         };
+        // **Never past a peer that is still catching up**, which is the difference between a
+        // follower that is behind and a follower that can never stop being behind. A peer below
+        // the boundary needs a snapshot, and a peer that already holds data cannot receive one in
+        // v1 (`docs/plans/phase-4.md` §13.2) — so compacting past a learner halfway through
+        // catching up strands it for good. Phase-4 acceptance is what that looks like: the learner
+        // adopted a snapshot at index 18, the leader wrote forty more entries and compacted to 48
+        // before it could be fed any of them, and from then on every probe was rejected and every
+        // re-offer declined (§17).
+        let target = self.hold_for_lagging_peers(target);
+        if target <= storage.truncated_index() {
+            return Ok(());
+        }
         // The term of the entry the log will begin after. Asking the core rather than storage:
         // the core answers from its own view, which is the one the snapshot has to agree with.
         let term = match esker_raft::LogStorage::term(self.node.storage(), target) {
@@ -1635,12 +1690,60 @@ mod tests {
     /// `LogCompaction::target` is arithmetic, and the two ways to get it wrong both cost
     /// correctness: compacting past the apply index throws away entries whose effect never
     /// reached the data, and compacting to the apply index leaves no tail, so a follower one
+    /// A leader keeps what a lagging peer still needs, and stops keeping it once that peer is
+    /// further away than the log is worth holding open.
+    ///
+    /// Compacting past a peer converts "behind" into "needs a snapshot", and a peer that already
+    /// holds data cannot receive one in v1 — so on a busy region that conversion is permanent
+    /// (`docs/plans/phase-4.md` §17). The bound is the other half: a replica that has gone away
+    /// must not hold a leader's log open for ever.
+    #[test]
+    fn a_compaction_keeps_what_a_lagging_peer_still_needs() {
+        let policy = LogCompaction {
+            threshold: 4,
+            keep: 1,
+            slow_peer_allowance: 100,
+        };
+        // With no peers to hold for, the tail rule is all there is.
+        assert_eq!(policy.target(0, 200), Some(199));
+
+        // A peer within the allowance drags the target down to it: the entries from there on are
+        // what that peer is about to be sent, and throwing them away is what turns "behind" into
+        // "needs a snapshot".
+        assert_eq!(hold(&policy, 199, &[(2, 150, 0)]), 150);
+        // One that has acknowledged nothing is held for at its position, zero — which is to say
+        // the log is not compacted at all while a new peer is still finding its feet.
+        assert_eq!(hold(&policy, 60, &[(2, 0, 0)]), 0);
+        // A snapshot in flight names where the peer *will* be, so that is what is kept rather
+        // than the stale `matched` it still reports.
+        assert_eq!(hold(&policy, 199, &[(2, 0, 150)]), 150);
+        // Further away than the allowance: abandoned to the snapshot path rather than held for,
+        // because a replica that is not coming back must not hold the log open.
+        assert_eq!(hold(&policy, 199, &[(2, 20, 0)]), 199);
+        // The slowest peer still within the allowance is the one that decides.
+        assert_eq!(hold(&policy, 199, &[(2, 150, 0), (3, 120, 0)]), 120);
+    }
+
+    /// `PeerCore::hold_for_lagging_peers`'s rule, over a hand-built progress list.
+    fn hold(policy: &LogCompaction, target: u64, peers: &[(u64, u64, u64)]) -> u64 {
+        let mut held = target;
+        for (id, matched, pending_snapshot) in peers {
+            let _ = id;
+            let position = (*matched).max(*pending_snapshot);
+            if target.saturating_sub(position) <= policy.slow_peer_allowance {
+                held = held.min(position);
+            }
+        }
+        held
+    }
+
     /// entry behind needs a whole snapshot.
     #[test]
     fn the_compaction_target_keeps_a_tail_and_never_passes_the_apply_index() {
         let policy = LogCompaction {
             threshold: 100,
             keep: 10,
+            ..LogCompaction::new()
         };
         assert_eq!(policy.target(0, 99), None, "not yet worth doing");
         assert_eq!(policy.target(0, 100), Some(90), "a tail of ten is kept");
@@ -1650,7 +1753,8 @@ mod tests {
         assert_eq!(
             LogCompaction {
                 threshold: 1,
-                keep: 1_000
+                keep: 1_000,
+                ..LogCompaction::new()
             }
             .target(0, 500),
             None
@@ -1680,6 +1784,7 @@ mod tests {
                 compaction: LogCompaction {
                     threshold: 8,
                     keep: 4,
+                    ..LogCompaction::new()
                 },
             },
             storage,

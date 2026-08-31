@@ -40,6 +40,11 @@ esker-store = { path = ".", features = ["testing"] }
 # writing into the `raft` column family directly. Already a runtime dependency; listed again so
 # the integration tests can name it.
 esker-engine.workspace = true
+# `tests/promotion.rs` drives a **real** placement driver, because the phase-4 acceptance stall was
+# a disagreement between PD's scheduler and this store's operator handling that neither side's own
+# fake could show. Workspace-internal and dev-only: it adds nothing to the runtime graph or to
+# `deny.toml`'s budget, and `esker-pd` does not depend on this crate, so there is no cycle.
+esker-pd.workspace = true
 # `tests/balance.rs` runs a two-store cluster whose interesting failures are all "something was
 # dropped somewhere"; without a subscriber the store's own tracing goes nowhere. Dev-only.
 tracing-subscriber.workspace = true

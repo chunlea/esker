@@ -69,6 +69,7 @@ async fn open(
     raft.compaction = LogCompaction {
         threshold: 32,
         keep: 8,
+        ..LogCompaction::new()
     };
     // Two workers, so the pool is a pool: a store hosting a dozen regions has to interleave them,
     // which is the case one-thread-per-region never exercised.

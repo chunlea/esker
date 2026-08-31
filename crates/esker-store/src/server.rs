@@ -1412,18 +1412,9 @@ impl Store {
             // Invariant 5, applied to Raft traffic. A batch carries messages for many regions
             // now, so the epoch it is checked against is the one of the region it names — not
             // the store's, which is not a thing a store has.
-            //
-            // A `conf_ver` difference is a **lead**, not a settled question: the regions whose
-            // learners stalled in phase-4 acceptance are exactly the regions that logged this
-            // drop, and a peer caught up by snapshot adopts its record from the snapshot header,
-            // which can be a `conf_ver` ahead of what its leader's transport is still stamping.
-            // Checking `version` alone was tried and did not fix the stall, so it is not the
-            // cause and the check is left as it was (`docs/plans/phase-4.md` §17).
             if message.epoch.is_stale_against(state.region().epoch) {
                 tracing::debug!(
                     region_id = message.region_id,
-                    theirs = ?message.epoch,
-                    ours = ?state.region().epoch,
                     "dropped a Raft message from a stale epoch"
                 );
                 continue;
@@ -1435,6 +1426,31 @@ impl Store {
                 );
                 continue;
             };
+            // **An `InstallSnapshot` is an announcement and is never stepped.** It carries no data
+            // in this design (`docs/DESIGN.md` §6) — the bytes come over their own stream and the
+            // receiver does not step the message until they have landed
+            // (`docs/plans/phase-4.md` §13.4). Stepping it here let the core `restore` from the
+            // metadata alone: the peer's log jumped to the snapshot's index and its membership to
+            // the snapshot's `conf_state`, while this store wrote no data and did not move the
+            // region record. The `Ready` that carried it then hit a phase-3 stub in `drive` that
+            // logged and dropped it, so the core kept a position it had no data for and a
+            // membership its own region record disagreed with — which is a peer that answers
+            // nothing and stamps an epoch nobody expects (`docs/plans/phase-4.md` §17).
+            //
+            // A peer that *hosts* the region and has fallen behind past the leader's compaction
+            // boundary cannot be caught up by snapshot in v1 at all: `Db::ingest` refuses any
+            // overlap, so only a range this store holds nothing in can receive one (§13.2). That
+            // limitation is now what happens — the offer is declined and the peer stays behind,
+            // visible in PD's heartbeats — rather than something that looked like a repair.
+            if let Some(index) = Self::snapshot_announcement(&message.message) {
+                tracing::debug!(
+                    region_id = message.region_id,
+                    index,
+                    "declined a snapshot for a region this store already holds; \
+                     catching up a peer that has data is a documented v1 limitation"
+                );
+                continue;
+            }
             peer.step(message.message).await?;
         }
         Ok(())

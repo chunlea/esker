@@ -126,6 +126,15 @@ pub const OPERATOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// its own log rather than needing a snapshot the moment it takes office.
 pub const TRANSFER_LAG_ALLOWANCE: u64 = 64;
 
+/// How far behind a peer may be and still have its leader keep the entries it needs.
+///
+/// A leader that compacts past a peer turns "behind" into "needs a snapshot", and a peer that
+/// already holds data cannot receive one in v1 (`docs/plans/phase-4.md` §13.2) — so on a busy
+/// region that is not a delay, it is permanent. Generous, because keeping entries is cheap and
+/// stranding a replica is not; bounded, because a replica that has gone away must not hold a
+/// leader's log open for ever.
+pub const SLOW_PEER_LOG_ALLOWANCE: u64 = 8_192;
+
 /// How far behind a learner may be and still be promoted to voter.
 ///
 /// A promotion puts the peer into the quorum, so from that entry on nothing commits without a

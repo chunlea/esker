@@ -1063,3 +1063,52 @@ stamping; every message from its own leader is then dropped as stale. Checking `
 tried and did **not** fix the stall, so the correlation is not yet a cause and the check is left as
 it was. A second lead: one `a Raft snapshot arrived; streaming is phase 4` — a core-delivered
 snapshot the store still ignores — appeared on a stalled region.
+
+### 17.5 Chasing clue (b): who still called the stub
+
+The ruling was to chase `a Raft snapshot arrived; streaming is phase 4` first, and it was a real
+bug. `Ready.snapshot` is set only by `RaftLog::restore`, which only `handle_install_snapshot` calls
+— so the only way to reach that stub is to **step an `InstallSnapshot` into the core**, and
+`receive_raft`'s hosted branch stepped every message it was given.
+
+The consequence is worse than the dropped log line. The core restored from the metadata alone: the
+peer's log jumped to the snapshot's index and its membership to the snapshot's `conf_state`, while
+this store wrote no data and did not move the region record. `drive` then logged and dropped the
+`Ready`, and `advance` cleared it — leaving a peer holding a log position it had no data for and a
+membership its own region record disagreed with. That is a peer that stamps an epoch nobody expects,
+which is where the `conf_ver` half of the stale-epoch correlation came from.
+
+An `InstallSnapshot` is an announcement in this design and is never stepped now. A hosted peer that
+has fallen behind the boundary declines it, which is §13.2's documented v1 limitation happening
+visibly instead of something that looked like a repair. The stub is kept as a loud invariant breach.
+
+### 17.6 What the residual actually is, and what it is not
+
+Counting messages in both directions for a stalled region: **333 dispatched leader→learner, 238
+stepped by the learner, 238 back**, and the learner's own store reports it applying. The learner is
+alive, replicating and answering. The leader's `matched` for it stays 0 regardless.
+
+The loop is: the learner adopts a snapshot at some index; the leader writes on and compacts past it;
+every probe is then rejected; the re-offered snapshot is declined because catching up a peer that
+already holds data is the v1 limitation; repeat for ever. It is §13.2 reached in ordinary operation,
+which 4c assumed could not happen — "4c only applies a snapshot into a range this store holds
+nothing in, which is exactly the case 4c creates" — because the peer 4c creates falls behind before
+it can be fed.
+
+Two things ruled out rather than assumed, both of which had looked like the answer:
+
+* **`recent_active = false` is not evidence the leader never heard from the peer.** Check-quorum
+  clears it every election timeout, about ten times a second at this test's 5 ms tick. Reading it
+  as "never active" is what pointed at the transport for two rounds.
+* **The stale-epoch drops are a symptom.** They correlate exactly with the stalled regions — 14
+  regions, identical sets — but checking `version` alone did not fix the stall, so that change was
+  reverted rather than shipped, and so was removing the check entirely.
+
+`hold_for_lagging_peers` keeps a leader from compacting past a peer it could still catch up cheaply,
+bounded by `SLOW_PEER_LOG_ALLOWANCE` so a departed replica cannot hold the log open. It is right on
+its own merits and unit-tested, and it did **not** clear the repro — recorded as hardening, not as
+the fix. The first attempt at it silently did nothing, because it skipped peers with `matched == 0`,
+which is the single case it existed for.
+
+The repro is `crates/esker-store/tests/promotion.rs`, `#[ignore]`d with all of this in its doc
+comment, per the ruling that a repro belongs in the tree.
