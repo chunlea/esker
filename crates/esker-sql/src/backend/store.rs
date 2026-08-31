@@ -55,22 +55,17 @@ impl Backend for StoreBackend {
         }))
     }
 
-    /// **The one stub in this crate, and it refuses rather than approximates.**
+    /// ADR 0021 Decision 1, and it really is three lines.
     ///
-    /// ADR 0021 Decision 1 makes this three lines — `TxnClient::begin_at(start_ts)`, which is
-    /// `begin` with the timestamp handed in — and that constructor is another lane's and does not
-    /// exist yet (`docs/plans/phase-6d.md` §3). Until it does, a historical read against a real
-    /// cluster is `0A000` **naming what is missing**.
-    ///
-    /// Reading the present instead would be the defect this crate's lowering exists to prevent: a
-    /// user asks for an hour ago, gets now, and nothing tells them. `MemoryBackend` implements the
-    /// real behaviour, so the feature above this line is fully tested either way.
-    fn begin_at(&self, _start_ts: u64) -> Result<Box<dyn Txn>> {
-        // TODO(phase-6d): `Ok(Box::new(StoreTxn { inner: Some(self.client.begin_at(start_ts)?) }))`
-        // once `esker-client` has the constructor. Nothing else here changes.
-        Err(SqlError::FeatureNotSupported(
-            "reading as of a past timestamp against a real store".to_owned(),
-        ))
+    /// The client's `begin_at` is `begin` with the timestamp handed in rather than allocated, and
+    /// it enforces the two bounds this layer can only *advise* on: the future, and the **real**
+    /// safepoint, which is PD's and not something the SQL layer can compute from retention. Both
+    /// come back as `22023` here, carrying the number the store named — so a user who asked too
+    /// far back is told the floor that is actually in force rather than the one this node guessed.
+    fn begin_at(&self, start_ts: u64) -> Result<Box<dyn Txn>> {
+        Ok(Box::new(StoreTxn {
+            inner: Some(self.client.begin_at(start_ts).map_err(translate)?),
+        }))
     }
 
     fn now(&self) -> Result<u64> {
@@ -109,6 +104,21 @@ impl StoreTxn {
 }
 
 impl Txn for StoreTxn {
+    fn start_ts(&self) -> u64 {
+        // A transaction that has ended has no snapshot to report; every caller reaches this
+        // through a live one, and zero is a timestamp no oracle hands out.
+        self.inner.as_ref().map_or(0, Transaction::start_ts)
+    }
+
+    /// **Not the trait's default.** The default is `false`, and taking it here was a real defect
+    /// for as long as it stood: the executor's `25006` check asks this, so a write at a past
+    /// snapshot was refused against the fake and not against a real cluster — where it instead
+    /// reached the store, was buffered, and failed at commit with a different code. A test over
+    /// the fake could not have caught it, which is why `tests/real_backend.rs` asks.
+    fn is_read_only(&self) -> bool {
+        self.inner.as_ref().is_some_and(Transaction::is_read_only)
+    }
+
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.open()?.get(key).map_err(translate)
     }
@@ -156,6 +166,29 @@ impl Txn for StoreTxn {
 ///   dressing it up as a user error would send the user looking in the wrong place.
 fn translate(error: ClientError) -> SqlError {
     match error {
+        // The time machine's three refusals, which the client raises and this layer renames. Each
+        // keeps the number the store named: a floor this node guessed from retention would be a
+        // different number, and telling a user the wrong one is worse than telling them none.
+        ClientError::SnapshotTooOld { requested, floor } => SqlError::ParameterOutOfRange {
+            value: crate::time_machine::render(requested),
+            name: crate::time_machine::READ_AS_OF,
+            low: crate::time_machine::render(floor),
+            high: "now".to_owned(),
+        },
+        ClientError::SnapshotInTheFuture { requested, now } => SqlError::ParameterOutOfRange {
+            value: crate::time_machine::render(requested),
+            name: crate::time_machine::READ_AS_OF,
+            low: "the safepoint".to_owned(),
+            high: crate::time_machine::render(now),
+        },
+        // Unreachable through SQL — the executor refuses a write at a past snapshot before it
+        // plans, naming the command, which is the message PostgreSQL sends. Translated anyway,
+        // because a `25006` that arrived from below is still a `25006` and must not become an
+        // internal error if some path ever reaches it.
+        ClientError::ReadOnlyTransaction { .. } => SqlError::ReadOnlyTransaction("this statement"),
+        ClientError::NoSuchSnapshot { name } => {
+            SqlError::SnapshotDoesNotExist(String::from_utf8_lossy(&name).into_owned())
+        }
         ClientError::TxnConflict {
             start_ts,
             commit_ts,

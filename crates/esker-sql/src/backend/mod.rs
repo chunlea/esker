@@ -83,15 +83,27 @@ pub trait Txn: fmt::Debug + Send {
     /// Buffers a delete, with the same rule.
     fn delete(&mut self, key: &[u8]);
 
+    /// The snapshot this transaction reads at.
+    ///
+    /// What `pg_export_snapshot()` hands out, and it must be **this** transaction's rather than a
+    /// fresh one: PostgreSQL's verb exports what the exporting transaction sees, so that a second
+    /// session importing the token reads exactly the state the first one was reading. Allocating a
+    /// new timestamp would export a moment nobody had looked at.
+    fn start_ts(&self) -> u64;
+
     /// Whether this transaction may write.
     ///
     /// False for one opened by [`Backend::begin_at`]. The executor asks *before* it plans, so that
     /// a write at a past snapshot is `25006` naming the command rather than a write that is
     /// buffered and then quietly dropped. [`Txn::put`] and [`Txn::delete`] cannot report anything —
     /// they are buffered and return nothing — which is exactly why the check has to be here.
-    fn is_read_only(&self) -> bool {
-        false
-    }
+    ///
+    /// **No default**, deliberately. It had one — `false` — and `StoreBackend` inherited it, so the
+    /// executor's `25006` fired against the fake and not against a real cluster: there the write
+    /// reached the store, was buffered, and failed at commit under a different code. A default that
+    /// is right for one implementor and silently wrong for the other is the shape of that bug, so
+    /// there is none.
+    fn is_read_only(&self) -> bool;
 
     /// Commits, yielding the commit timestamp, or `None` for a transaction that wrote nothing.
     fn commit(self: Box<Self>) -> Result<Option<u64>>;
@@ -299,6 +311,10 @@ impl MemoryTxn {
 }
 
 impl Txn for MemoryTxn {
+    fn start_ts(&self) -> u64 {
+        self.start_ts
+    }
+
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         // Read-your-writes: the buffer wins, and a buffered delete hides a committed value.
         if let Some(write) = self.buffer.get(key) {

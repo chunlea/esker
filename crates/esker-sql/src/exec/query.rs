@@ -812,6 +812,7 @@ fn output_columns(select: &Select, scope: &Scope<'_>) -> Result<Vec<(String, Col
                     return Err(SqlError::Syntax {
                         message: "SELECT * with no tables specified is not valid".to_owned(),
                         position: None,
+                        hint: None,
                     });
                 }
                 // The user's columns, so an internal row id stays hidden: `SELECT *` on a table
@@ -847,6 +848,7 @@ fn projection_exprs(select: &Select, scope: &Scope<'_>) -> Result<Vec<Expr>> {
                     return Err(SqlError::Syntax {
                         message: "SELECT * with no tables specified is not valid".to_owned(),
                         position: None,
+                        hint: None,
                     });
                 }
                 exprs.extend(

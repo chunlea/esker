@@ -390,6 +390,7 @@ impl Session {
                         message: "cannot insert multiple commands into a prepared statement"
                             .to_owned(),
                         position: None,
+                        hint: None,
                     },
                     out,
                 );

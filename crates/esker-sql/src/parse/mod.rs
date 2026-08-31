@@ -211,12 +211,20 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
         // could, then what happened is that Esker is missing a feature, and saying "syntax error"
         // about valid SQL is both untrue and unactionable. `recognize_unsupported` is what tells
         // the two apart, and a statement it does not recognise really is malformed.
-        Err(SqlError::Syntax { message, position }) => {
-            match recognize_unsupported(sql, &scanned.words) {
-                Some(feature) => Err(SqlError::unsupported(feature)),
-                None => Err(SqlError::Syntax { message, position }),
-            }
-        }
+        Err(SqlError::Syntax {
+            message, position, ..
+        }) => match recognize_unsupported(sql, &scanned.words) {
+            Some(feature) => Err(SqlError::unsupported(feature)),
+            // Not a feature gap and not valid PostgreSQL either — PostgreSQL 19 answers `42601`
+            // for these too, so the code stays. What is added is a `HINT` naming the spelling that
+            // works here, which turns a dead end into a redirect without inventing a syntax that
+            // this node would accept and the oracle would reject.
+            None => Err(SqlError::Syntax {
+                message,
+                position,
+                hint: recognize_redirect(&scanned.words),
+            }),
+        },
         other => other,
     }
 }
@@ -252,6 +260,7 @@ fn parse_inner(sql: &str) -> Result<Vec<Statement>> {
             other => SqlError::Syntax {
                 message: other.to_string(),
                 position: None,
+                hint: None,
             },
         })
 }
@@ -336,6 +345,16 @@ const ANY: &str = "?";
 
 /// Ordered most specific first: `CREATE USER MAPPING` must be tested before `CREATE USER`, or the
 /// shorter row would claim the longer statement and name the feature wrongly.
+/// What to write instead of `CHECKPOINT`, which the table below already refuses by name.
+///
+/// The redirect belongs on a `0A000` here rather than in [`recognize_redirect`], because
+/// `CHECKPOINT` never reaches the parser: it is PostgreSQL's own statement, this node does not
+/// force a WAL checkpoint, and the answer is contract C2's. What the answer was missing is that a
+/// user who wrote it was almost certainly reaching for a *named* checkpoint, which exists here
+/// under a spelling PostgreSQL parses (ADR 0021 Decision 3: the word must not be taken, because
+/// PostgreSQL owns it for something else).
+pub(crate) const CHECKPOINT_FEATURE: &str = "CHECKPOINT";
+
 const UNSUPPORTED: &[Unsupported] = &[
     // --- Constructs inside statements this crate does execute. These are the rows a user of the
     // --- supported subset can actually reach, so they are tested first and named precisely.
@@ -593,6 +612,41 @@ fn recognize_unsupported(sql: &str, words: &[&str]) -> Option<&'static str> {
         .iter()
         .find(|candidate| candidate.matches(words))
         .map(|candidate| candidate.feature)
+}
+
+/// A spelling a user reaching for the time machine is likely to try, and what to write instead.
+///
+/// Every one of these is `42601` on a real PostgreSQL 19 as well as here
+/// (`docs/plans/phase-6d.md` §1), so the *code* is parity and nothing is being invented. What a
+/// bare syntax error does not carry is the fact that this node **has** the feature under another
+/// name, and a user who wrote `AS OF SYSTEM TIME` because `CockroachDB` spells it that way has no
+/// way to discover that. The hint is the whole difference between a dead end and a redirect.
+///
+/// Consulted only after a parse has already failed, like the table above, so a row can only ever
+/// improve an error that was going to be raised anyway.
+fn recognize_redirect(words: &[&str]) -> Option<&'static str> {
+    const REDIRECTS: &[(&[&str], &str)] = &[
+        (
+            &["AS", "OF", "SYSTEM", "TIME"],
+            "Esker reads the past with SET esker.read_as_of = '<timestamp>' or an interval \
+             such as '-1h'. See docs/adr/0021-time-machine.md.",
+        ),
+        (
+            &["AS", "OF", "CHECKPOINT"],
+            "Read at a checkpoint with SET TRANSACTION SNAPSHOT '<name>', inside a transaction \
+             block. See docs/adr/0021-time-machine.md.",
+        ),
+        (
+            &["FOR", "SYSTEM_TIME", "AS", "OF"],
+            "Esker reads the past with SET esker.read_as_of = '<timestamp>' or an interval \
+             such as '-1h'. See docs/adr/0021-time-machine.md.",
+        ),
+    ];
+
+    REDIRECTS
+        .iter()
+        .find(|(pattern, _)| contains_words(words, pattern))
+        .map(|(_, hint)| *hint)
 }
 
 /// Rewrites the leading keyword of a statement PostgreSQL defines as a synonym for another.

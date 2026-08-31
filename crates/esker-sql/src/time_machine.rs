@@ -100,6 +100,19 @@ pub fn parse_snapshot_id(id: &str) -> Result<SnapshotId> {
     Ok(SnapshotId::Checkpoint(id.to_owned()))
 }
 
+/// Whether a string may be a checkpoint's name.
+///
+/// The **same rule** [`parse_snapshot_id`] reads a name by, and shared rather than restated: a name
+/// that could be written and then not imported would be a checkpoint nobody could use.
+pub fn check_name(name: &str) -> Result<()> {
+    match parse_snapshot_id(name)? {
+        SnapshotId::Checkpoint(_) => Ok(()),
+        // A name shaped like an exported token would shadow the token it looks like: importing it
+        // would read the timestamp out of the string and never reach the record.
+        SnapshotId::Timestamp(_) => Err(SqlError::InvalidSnapshotIdentifier(name.to_owned())),
+    }
+}
+
 /// Reads what a user set [`READ_AS_OF`] to, against the oracle's `now`.
 ///
 /// Two spellings, and the reason there are two is that a user has one of two things: an instant

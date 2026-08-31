@@ -8,6 +8,7 @@
 //! 'm' ++ "sql" ++ 'd'                          the cluster's default MVCC retention
 //! 'm' ++ "sql" ++ 'r' ++ tenant:u64 ++ id:u64  one table's retention override
 //! 'm' ++ "sql" ++ 'a' ++ tenant:u64 ++ id:u64  one table's next internal row id
+//! 'm' ++ "sql" ++ 'c' ++ tenant:u64 ++ name    a checkpoint: a name and the timestamp it means
 //! ```
 //!
 //! The two retention records are read by the **garbage collector**, which lives below this crate
@@ -53,6 +54,7 @@ const KIND_PRIMARY_KEY: u8 = b'p';
 const KIND_RETENTION_DEFAULT: u8 = b'd';
 const KIND_RETENTION: u8 = b'r';
 const KIND_ROW_ID: u8 = b'a';
+const KIND_CHECKPOINT: u8 = b'c';
 
 /// Tags for [`ColumnType`] as stored. Ours rather than PostgreSQL's OIDs, because these are a
 /// format we own and must never move; the OIDs stay on the wire where they belong.
@@ -158,6 +160,70 @@ pub(super) fn decode_retention(bytes: &[u8]) -> Result<u64> {
     let retention = reader.u64_le()?;
     reader.finish()?;
     Ok(retention)
+}
+
+/// `'m' ++ "sql" ++ 'c' ++ tenant ++ name`. A checkpoint, absent until somebody names one.
+///
+/// The name is the whole rest of the key, like a relation name, so one scan of
+/// `'m' ++ "sql" ++ 'c' ++ tenant` lists a tenant's checkpoints in name order and a name cannot be
+/// confused with a longer one.
+///
+/// **A checkpoint is a claim, not a guarantee** ([ADR 0021](../../../../docs/adr/0021-time-machine.md)
+/// Decision 3). It costs one record: no snapshot, no copy, no flush, because the data it refers to
+/// is kept by retention whether anybody named it or not. The catch is exactly that — a checkpoint
+/// older than the window names history that is gone, and reading at it is refused with the window
+/// named, which is where the claim gets checked.
+#[must_use]
+pub(super) fn checkpoint_key(tenant: u64, name: &str) -> Vec<u8> {
+    let mut suffix = [SQL, &[KIND_CHECKPOINT]].concat();
+    codec::encode_u64(tenant, &mut suffix);
+    suffix.extend_from_slice(name.as_bytes());
+    prefix::meta_key(&suffix)
+}
+
+/// Every checkpoint of one tenant: `[start, end)` over the `'c'` space.
+#[must_use]
+pub(super) fn checkpoint_range(tenant: u64) -> (Vec<u8>, Vec<u8>) {
+    let mut suffix = [SQL, &[KIND_CHECKPOINT]].concat();
+    codec::encode_u64(tenant, &mut suffix);
+    let start = prefix::meta_key(&suffix);
+    let mut end = start.clone();
+    // One past the last key with this prefix. The tenant id is fixed-width and memcomparable, so
+    // incrementing the last byte of the prefix is exact; a name cannot carry it past the boundary
+    // because every key here begins with the whole prefix.
+    let last = end.len() - 1;
+    end[last] += 1;
+    (start, end)
+}
+
+/// A checkpoint's timestamp, behind the same version byte as every other record.
+#[must_use]
+pub(super) fn encode_checkpoint(start_ts: u64) -> Vec<u8> {
+    let mut out = vec![CATALOG_FORMAT_VERSION];
+    out.extend_from_slice(&start_ts.to_le_bytes());
+    out
+}
+
+/// Reads a checkpoint's timestamp back.
+pub(super) fn decode_checkpoint(bytes: &[u8]) -> Result<u64> {
+    let mut reader = Reader::new(bytes)?;
+    let start_ts = reader.u64_le()?;
+    reader.finish()?;
+    Ok(start_ts)
+}
+
+/// The name out of a checkpoint key, for listing them.
+///
+/// A decode and not a parse: the prefix is fixed-width, so the name is whatever follows it.
+pub(super) fn checkpoint_name(tenant: u64, key: &[u8]) -> Result<String> {
+    let (prefix, _) = checkpoint_range(tenant);
+    let Some(name) = key.strip_prefix(prefix.as_slice()) else {
+        return Err(SqlError::DataCorrupted(
+            "a checkpoint key outside the checkpoint range".to_owned(),
+        ));
+    };
+    String::from_utf8(name.to_vec())
+        .map_err(|_| SqlError::DataCorrupted("a checkpoint name that is not UTF-8".to_owned()))
 }
 
 /// `'m' ++ "sql" ++ 'a' ++ tenant ++ table_id`. The next unhanded-out row id for one table.

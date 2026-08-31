@@ -1,0 +1,48 @@
+//! The time machine's verbs, lowered.
+//!
+//! Each is spelled as a **function call**, which is not a stylistic choice: it is the only spelling
+//! a real PostgreSQL 19 parses. `docs/plans/phase-6d.md` §1 has the measurement — `CHECKPOINT
+//! <name>` and `SELECT ... AS OF CHECKPOINT '<name>'` are `42601` on that server and unreadable to
+//! `sqlparser`, so taking either would put this node outside contract C1's boundary in the one
+//! direction the contract does not police, and would do it inside ADR 0014's containment.
+//!
+//! `pg_export_snapshot()` is PostgreSQL's own, and it already means this: take a snapshot, hand
+//! back a token, let another transaction read at it. The named variant is the one divergence, and
+//! it is a superset — PostgreSQL's exported snapshot lives only while the exporting transaction is
+//! open, and a checkpoint outlives its session until retention passes it, which is what makes it a
+//! checkpoint rather than a handle.
+
+/// One time-machine verb.
+///
+/// Each runs in a transaction like any other statement, which is why these are `plan::Statement`
+/// variants rather than session statements: naming a checkpoint writes a record, and a record is
+/// written the way every record here is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimeMachineVerb {
+    /// `pg_export_snapshot()`, and `esker_checkpoint('<name>')` for the named variant.
+    ///
+    /// **Free**, and the reason is structural rather than an optimisation: it writes one small
+    /// record and *nothing else* — no snapshot, no copy, no flush. A checkpoint is a number, and
+    /// the data it refers to is kept by retention whether anybody named it or not.
+    ExportSnapshot {
+        /// `None` for the anonymous PostgreSQL verb, whose token carries the timestamp itself and
+        /// needs no record at all.
+        name: Option<String>,
+    },
+    /// `esker_drop_checkpoint('<name>')`. Forgets the name; the versions it named are retention's.
+    DropCheckpoint {
+        /// The checkpoint to forget.
+        name: String,
+    },
+    /// `SELECT * FROM esker_checkpoints()`. A name you cannot list is a name you cannot use.
+    ListCheckpoints,
+}
+
+impl TimeMachineVerb {
+    /// The command tag. Every one of these is reached through a `SELECT`, so every one is
+    /// PostgreSQL's `SELECT <count>` — built by the executor, which knows the count.
+    #[must_use]
+    pub fn tag(&self) -> &'static str {
+        "SELECT"
+    }
+}

@@ -575,3 +575,247 @@ fn an_unreadable_retention_is_22023() {
         "invalid value for parameter \"retention\": \"a week\""
     );
 }
+
+// --- The checkpoint verbs --------------------------------------------------------------------
+
+/// PostgreSQL's own verb, and it means here what it means there: export what *this* transaction
+/// sees, so that a second session importing the token reads exactly that state.
+#[test]
+fn pg_export_snapshot_hands_out_a_token_that_reads_back() {
+    let mut node = Node::new();
+    let before = a_row_with_a_past(&mut node);
+
+    node.run("BEGIN").unwrap();
+    node.run(&format!("SET TRANSACTION SNAPSHOT '{}'", token(before)))
+        .unwrap();
+    let exported = node.rows("SELECT pg_export_snapshot()")[0][0]
+        .clone()
+        .unwrap();
+    node.run("COMMIT").unwrap();
+
+    // The token names the snapshot the exporting transaction was reading, not a fresh one.
+    node.run("BEGIN").unwrap();
+    node.run(&format!("SET TRANSACTION SNAPSHOT '{exported}'"))
+        .unwrap();
+    assert_eq!(node.rows("SELECT note FROM t"), [[Some("one".to_owned())]]);
+    node.run("ROLLBACK").unwrap();
+}
+
+/// A checkpoint is a **name and a number**, and it costs one record: no snapshot, no copy, no
+/// flush. What proves it is that the name outlives the session that took it.
+#[test]
+fn a_checkpoint_outlives_the_session_that_took_it() {
+    let mut node = Node::new();
+    let before = a_row_with_a_past(&mut node);
+
+    node.run("BEGIN").unwrap();
+    node.run(&format!("SET TRANSACTION SNAPSHOT '{}'", token(before)))
+        .unwrap();
+    node.run("SELECT esker_checkpoint('nightly')").unwrap();
+    node.run("COMMIT").unwrap();
+
+    // A different session, which never saw the name being taken.
+    let mut other = node.session();
+    other.run("BEGIN").unwrap();
+    other.run("SET TRANSACTION SNAPSHOT 'nightly'").unwrap();
+    assert_eq!(other.rows("SELECT note FROM t"), [[Some("one".to_owned())]]);
+    other.run("ROLLBACK").unwrap();
+}
+
+/// The name is a **string literal**, and PostgreSQL does not case-fold those. A checkpoint called
+/// `Nightly` is not the same one as `nightly`, which is the behaviour a user who quoted it expects.
+#[test]
+fn a_checkpoint_name_keeps_the_case_it_was_written_in() {
+    let mut node = Node::new();
+    a_row_with_a_past(&mut node);
+    node.run("SELECT esker_checkpoint('Nightly')").unwrap();
+
+    assert_eq!(
+        node.rows("SELECT * FROM esker_checkpoints()")
+            .into_iter()
+            .map(|row| row[0].clone().unwrap())
+            .collect::<Vec<_>>(),
+        ["Nightly"]
+    );
+    node.run("BEGIN").unwrap();
+    assert_eq!(
+        node.fails("SET TRANSACTION SNAPSHOT 'nightly'").sqlstate(),
+        sqlstate::UNDEFINED_OBJECT
+    );
+}
+
+/// A name you cannot list is a name you cannot use, so listing carries the two things a user
+/// needs: the token to paste into `SET TRANSACTION SNAPSHOT`, and the instant to compare against
+/// the window.
+#[test]
+fn checkpoints_list_with_their_tokens_and_their_instants() {
+    let mut node = Node::new();
+    let before = a_row_with_a_past(&mut node);
+
+    node.run("BEGIN").unwrap();
+    node.run(&format!("SET TRANSACTION SNAPSHOT '{}'", token(before)))
+        .unwrap();
+    node.run("SELECT esker_checkpoint('a')").unwrap();
+    node.run("COMMIT").unwrap();
+    node.run("SELECT esker_checkpoint('b')").unwrap();
+
+    let listed = node.rows("SELECT * FROM esker_checkpoints()");
+    assert_eq!(listed.len(), 2, "in name order: {listed:?}");
+    assert_eq!(listed[0][0], Some("a".to_owned()));
+    assert_eq!(listed[0][1], Some(token(before)));
+    assert_eq!(listed[1][0], Some("b".to_owned()));
+    // The instant is what a user compares against the window, so it must be the checkpoint's own.
+    assert_eq!(listed[0][2], Some(esker_sql::time_machine::render(before)));
+}
+
+/// Dropping forgets the name; the versions it named are retention's business and are untouched.
+/// A name that was not there answers `f` rather than raising — a client cleaning up after itself
+/// should not have to look first.
+#[test]
+fn dropping_a_checkpoint_forgets_the_name_and_nothing_else() {
+    let mut node = Node::new();
+    let before = a_row_with_a_past(&mut node);
+
+    node.run("BEGIN").unwrap();
+    node.run(&format!("SET TRANSACTION SNAPSHOT '{}'", token(before)))
+        .unwrap();
+    node.run("SELECT esker_checkpoint('nightly')").unwrap();
+    node.run("COMMIT").unwrap();
+
+    assert_eq!(
+        node.rows("SELECT esker_drop_checkpoint('nightly')"),
+        [[Some("t".to_owned())]]
+    );
+    assert_eq!(
+        node.rows("SELECT esker_drop_checkpoint('nightly')"),
+        [[Some("f".to_owned())]],
+        "dropping what is not there is not an error"
+    );
+    assert!(node.rows("SELECT * FROM esker_checkpoints()").is_empty());
+
+    // The data the name pointed at is still there, reachable by the token it no longer needs.
+    node.run("BEGIN").unwrap();
+    node.run(&format!("SET TRANSACTION SNAPSHOT '{}'", token(before)))
+        .unwrap();
+    assert_eq!(node.rows("SELECT note FROM t"), [[Some("one".to_owned())]]);
+    node.run("ROLLBACK").unwrap();
+
+    // And the name is `42704`, which is what a real server answers for an id it does not hold.
+    node.run("BEGIN").unwrap();
+    assert_eq!(
+        node.fails("SET TRANSACTION SNAPSHOT 'nightly'").sqlstate(),
+        sqlstate::UNDEFINED_OBJECT
+    );
+}
+
+/// A name shaped like an exported token would shadow the token it looks like — importing it would
+/// read the timestamp out of the string and never reach the record.
+#[test]
+fn a_checkpoint_may_not_be_named_like_a_token() {
+    let mut node = Node::new();
+    a_row_with_a_past(&mut node);
+    let error = node.fails("SELECT esker_checkpoint('esker-0000000000000001')");
+    assert_eq!(error.sqlstate(), sqlstate::INVALID_PARAMETER_VALUE);
+}
+
+/// **A checkpoint of the past is the point of the feature**, so it must not be refused as a write.
+///
+/// The record is written in a present-time transaction of its own (`crate::exec::verbs`), because
+/// the transaction doing the reading is read-only by construction and could never commit one. The
+/// value it stores is that transaction's snapshot, which is what makes the name mean the moment
+/// the user was looking at.
+#[test]
+fn a_checkpoint_can_be_taken_of_the_past_a_session_is_reading() {
+    let mut node = Node::new();
+    let before = a_row_with_a_past(&mut node);
+    let as_of = esker_sql::time_machine::render(before);
+    node.run(&format!("SET esker.read_as_of = '{as_of}'"))
+        .unwrap();
+
+    // The session's snapshot is the *instant*, whose logical bits are zero by design, so that is
+    // what both the export and the checkpoint name.
+    let exported = node.rows("SELECT pg_export_snapshot()")[0][0]
+        .clone()
+        .unwrap();
+    node.run("SELECT esker_checkpoint('before-the-incident')")
+        .unwrap();
+    node.run("RESET esker.read_as_of").unwrap();
+
+    let listed = node.rows("SELECT * FROM esker_checkpoints()");
+    assert_eq!(listed[0][0], Some("before-the-incident".to_owned()));
+    assert_eq!(listed[0][1], Some(exported), "the name means what was read");
+    assert_eq!(listed[0][2], Some(as_of));
+
+    // And it reads back as the past it named.
+    node.run("BEGIN").unwrap();
+    node.run("SET TRANSACTION SNAPSHOT 'before-the-incident'")
+        .unwrap();
+    assert_eq!(node.rows("SELECT note FROM t"), [[Some("one".to_owned())]]);
+    node.run("ROLLBACK").unwrap();
+}
+
+// --- The spellings that are not ours, and the redirect they get ------------------------------
+
+/// The whole argument for the shape this feature took. Each of these is `42601` on a real
+/// PostgreSQL 19 *and* here, so the code is parity and nothing is invented — but a bare syntax
+/// error cannot say that the feature exists under another name, and the `HINT` can.
+#[test]
+fn an_invented_spelling_gets_postgresqls_code_and_a_redirect() {
+    for sql in [
+        "SELECT * FROM t AS OF SYSTEM TIME '-1h'",
+        "SELECT * FROM t FOR SYSTEM_TIME AS OF '2026-08-30 14:00:00+00'",
+    ] {
+        let error = parse_statements(sql).unwrap_err();
+        assert_eq!(error.sqlstate(), sqlstate::SYNTAX_ERROR, "{sql}");
+        assert_eq!(
+            error.hint(),
+            Some(
+                "Esker reads the past with SET esker.read_as_of = '<timestamp>' or an interval \
+                 such as '-1h'. See docs/adr/0021-time-machine.md."
+            ),
+            "{sql}"
+        );
+    }
+
+    let error = parse_statements("SELECT * FROM t AS OF CHECKPOINT 'n'").unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::SYNTAX_ERROR);
+    assert!(
+        error.hint().unwrap().contains("SET TRANSACTION SNAPSHOT"),
+        "{error:?}"
+    );
+}
+
+/// `CHECKPOINT` stays PostgreSQL's, refused by name as it always was. ADR 0021 is explicit that
+/// the word must not be taken — PostgreSQL owns it for forcing a WAL checkpoint — so what changes
+/// is the hint, not the answer.
+#[test]
+fn checkpoint_stays_postgresqls_word_and_gains_a_redirect() {
+    for sql in ["CHECKPOINT", "CHECKPOINT nightly"] {
+        let error = parse_statements(sql).unwrap_err();
+        assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED, "{sql}");
+        assert_eq!(error.to_string(), "CHECKPOINT is not supported", "{sql}");
+        assert!(
+            error.hint().unwrap().contains("esker_checkpoint"),
+            "{sql}: {error:?}"
+        );
+    }
+}
+
+/// A verb buried in an expression is not honoured half-way: it falls through to the ordinary path
+/// and is `0A000` naming the expression, rather than exporting a snapshot and then failing to use
+/// it.
+#[test]
+fn a_verb_inside_an_expression_is_refused_rather_than_half_run() {
+    let mut node = Node::new();
+    a_row_with_a_past(&mut node);
+    let before = node.rows("SELECT * FROM esker_checkpoints()").len();
+    assert_eq!(
+        node.fails("SELECT esker_checkpoint('n') || 'x'").sqlstate(),
+        sqlstate::FEATURE_NOT_SUPPORTED
+    );
+    assert_eq!(
+        node.rows("SELECT * FROM esker_checkpoints()").len(),
+        before,
+        "nothing was written"
+    );
+}

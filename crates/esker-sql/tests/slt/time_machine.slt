@@ -1,0 +1,238 @@
+# The time machine (docs/adr/0021-time-machine.md, docs/plans/phase-6d.md).
+#
+# **Where PostgreSQL parity ends.** Every other file here records what a real PostgreSQL 19 does.
+# This one cannot: PostgreSQL has no time travel, so what a read at a past snapshot *returns* has
+# no oracle. What is still parity, and is asserted as such, is the whole error surface — the custom
+# GUC, SET TRANSACTION SNAPSHOT's preconditions, 22023 against 42704 for a bad snapshot id, and
+# 25006 for a write in a read-only transaction. All of those were captured off 19beta1.
+#
+# The semantic reference for the rest is CockroachDB's AS OF SYSTEM TIME: a snapshot is a read
+# timestamp, a read at it is read-only, and how far back it may go is retention. Its *syntax* is
+# deliberately not copied -- neither sqlparser nor PostgreSQL parses it, so taking it would make
+# this node accept what the oracle rejects.
+#
+# Every past read here is reached through a **checkpoint of the present**, not through an instant,
+# and every assertion below is oracle-independent. That is not a shortcut, it is a requirement:
+# these files run against the in-process fake *and* against three real stores (real_corpus.rs),
+# and the real cluster's oracle is a CountingOracle whose timestamps have no wall-clock half. An
+# instant means nothing against one -- every version sits inside the first millisecond of 1970 --
+# so `SET esker.read_as_of = '-1h'` would be a 22023 there and an ok here, and a file cannot assert
+# both. The instant and interval forms are covered in tests/time_machine.rs, over a fake whose
+# clock is shaped like a real TSO. What is left here is the surface that needs no clock at all,
+# which is also what a user would write when the moment they want is one they are standing in.
+
+statement ok
+CREATE TABLE t (id int8 PRIMARY KEY, note text)
+
+statement ok
+INSERT INTO t VALUES (1, 'one')
+
+# --- SET esker.read_as_of
+# A namespaced custom GUC, which a real PostgreSQL accepts, stores, and hands back to SHOW. Only
+# the forms that resolve to nothing are here; see the header for why an instant is not.
+statement ok
+SET esker.read_as_of = DEFAULT
+
+statement ok
+RESET esker.read_as_of
+
+# A value the grammar cannot read is PostgreSQL's own condition for a bad SET.
+statement error (22023)
+SET esker.read_as_of = 'yesterday'
+
+# PostgreSQL's interval words are a documented divergence, not a half-parser: '-1 hour' is refused
+# rather than read as something near enough.
+statement error (22023)
+SET esker.read_as_of = '-1 hour'
+
+# A parameter this node does not have. Not 0A000 -- the statement is one it executes, and what is
+# missing is the parameter, which is the condition a real server reports.
+statement error (42704)
+SHOW esker.no_such_parameter
+
+# --- SET, another parameter
+# Contract C2's answer, naming the parameter rather than the statement.
+statement error (0A000)
+SET search_path = 'public'
+
+# --- pg_export_snapshot
+# PostgreSQL's own verb. Free: it writes nothing at all, because the token carries the timestamp.
+statement ok
+SELECT pg_export_snapshot()
+
+# --- esker_checkpoint
+# The named variant, and the one divergence from PostgreSQL's verb, stated rather than discovered:
+# an exported snapshot there lives only while the exporting transaction is open, and a checkpoint
+# here outlives its session until retention passes it. That is what makes it a checkpoint rather
+# than a handle, and it is a superset -- every PostgreSQL program keeps working.
+statement ok
+SELECT esker_checkpoint('before')
+
+statement ok
+INSERT INTO t VALUES (2, 'two')
+
+query IT rowsort
+SELECT id, note FROM t
+----
+1	one
+2	two
+
+# --- SET TRANSACTION SNAPSHOT
+# The read at the checkpoint: the second row was written after it and is not there.
+statement ok
+BEGIN
+
+statement ok
+SET TRANSACTION SNAPSHOT 'before'
+
+query IT rowsort
+SELECT id, note FROM t
+----
+1	one
+
+# --- 25006
+# Read-only, and each write named the way PostgreSQL names it. This is a correctness rule and not
+# a policy: a commit at a commit_ts above an old snapshot is a lost update Percolator's conflict
+# check does not catch, because the conflicting writer committed after the snapshot and before the
+# write -- the one window snapshot isolation does not close.
+statement error (25006)
+INSERT INTO t VALUES (3, 'three')
+
+statement error (25006)
+UPDATE t SET note = 'x' WHERE id = 1
+
+statement error (25006)
+DELETE FROM t WHERE id = 1
+
+statement error (25006)
+CREATE TABLE u (a int8)
+
+statement ok
+ROLLBACK
+
+# The block wrote nothing, whatever it tried.
+query IT rowsort
+SELECT id, note FROM t
+----
+1	one
+2	two
+
+# --- SET TRANSACTION SNAPSHOT, outside a block
+# A real server sends a 25P01 warning and *then* fails the statement with 0A000. The warning is a
+# notice here; the error is what the directive sees.
+statement error (0A000)
+SET TRANSACTION SNAPSHOT 'before'
+
+# --- 25001
+# The rule that matters most, and the one an invented syntax would have had to discover the hard
+# way: a start_ts cannot change under a transaction that has already read at it.
+statement ok
+BEGIN
+
+query I
+SELECT id FROM t WHERE id = 1
+----
+1
+
+statement error (25001)
+SET TRANSACTION SNAPSHOT 'before'
+
+statement ok
+ROLLBACK
+
+# --- 22023 against 42704
+# Two conditions where a reading would have collapsed one: what cannot be a snapshot identifier at
+# all is 22023, and what is well formed and simply not there is 42704. Both captured.
+statement ok
+BEGIN
+
+statement error (22023)
+SET TRANSACTION SNAPSHOT ''
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+# PostgreSQL's own id shape: well formed, and belonging to another server.
+statement error (42704)
+SET TRANSACTION SNAPSHOT '00000003-0000001B-1'
+
+statement ok
+ROLLBACK
+
+# --- esker_checkpoints
+# Three columns: the name, the token to paste into SET TRANSACTION SNAPSHOT, and the instant to
+# compare against the window. Two of the three are the oracle's, so what is written down here is
+# that the path runs; the row's content is asserted in tests/time_machine.rs, where the clock is
+# known. What *is* portable is the pair below -- a name that was there, and then was not.
+statement ok
+SELECT * FROM esker_checkpoints()
+
+# --- esker_drop_checkpoint
+# Forgetting a bookmark, not burning the book: the versions the name pointed at are retention's
+# business and are untouched.
+query T
+SELECT esker_drop_checkpoint('before')
+----
+t
+
+# Dropping what is not there answers f rather than raising: a client cleaning up after itself
+# should not have to look first.
+query T
+SELECT esker_drop_checkpoint('before')
+----
+f
+
+statement ok
+BEGIN
+
+statement error (42704)
+SET TRANSACTION SNAPSHOT 'before'
+
+statement ok
+ROLLBACK
+
+# --- ALTER TABLE ... SET (retention)
+# The travel window is retention, and there is no second mechanism: how far back you can read is
+# how far back the collector has not yet swept, and those must be one number or the feature is a
+# promise the storage layer does not keep.
+statement ok
+ALTER TABLE t SET (retention = '7d')
+
+statement ok
+ALTER TABLE t SET (retention = 604800000)
+
+# A sentinel, not a duration: subtracting it would underflow, and the rule it stands for is
+# "collect nothing for this table".
+statement ok
+ALTER TABLE t SET (retention = 'forever')
+
+# DEFAULT deletes the override rather than storing a zero. A table with no override is not
+# "retention zero", it is the cluster default, and the difference is an absent key against a key
+# holding zero.
+statement ok
+ALTER TABLE t SET (retention = DEFAULT)
+
+statement error (22023)
+ALTER TABLE t SET (retention = 'a week')
+
+# Every other storage parameter is contract C2's, naming the parameter.
+statement error (0A000)
+ALTER TABLE t SET (fillfactor = 70)
+
+# --- the spellings that are not ours
+# CockroachDB's, SQL:2011's, and a named CHECKPOINT. Each is 42601 on a real PostgreSQL 19 as well
+# as here, so the code is parity and nothing is invented -- what this node adds is a HINT naming
+# the spelling that works, which turns a dead end into a redirect. CHECKPOINT keeps its 0A000
+# because PostgreSQL accepts the bare word for forcing a WAL checkpoint and this node does not
+# take it for something else.
+statement error (42601)
+SELECT * FROM t AS OF SYSTEM TIME '-1h'
+
+statement error (42601)
+SELECT * FROM t FOR SYSTEM_TIME AS OF '2026-08-30 14:00:00+00'
+
+statement error (0A000)
+CHECKPOINT

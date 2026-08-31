@@ -29,6 +29,7 @@ mod cursor;
 mod ddl;
 mod dml;
 mod query;
+mod verbs;
 
 use std::sync::Arc;
 
@@ -191,6 +192,7 @@ impl Executor {
             Statement::Update(update) => dml::update(self, txn, update, written),
             Statement::Delete(delete) => dml::delete(self, txn, delete),
             Statement::Explain(inner) => self.explain(txn, inner),
+            Statement::TimeMachine(verb) => verbs::run(self, txn, verb),
             // Handled before a transaction is opened; `execute` never routes one here.
             Statement::Session(_) => Err(SqlError::Internal(
                 "a session statement reached the transaction path".into(),
@@ -275,14 +277,13 @@ impl Executor {
         }
 
         let start_ts = match time_machine::parse_snapshot_id(id)? {
+            // A token carries its timestamp, so this path does no lookup at all — which is the
+            // half of ADR 0021's checkpoint design that costs nothing.
             time_machine::SnapshotId::Timestamp(start_ts) => start_ts,
-            // TODO(phase-6d unit 2): look the name up in the catalog's checkpoint records. Until
-            // they exist, a name is a snapshot that is not there — which is the same answer a real
-            // server gives for an id it does not hold, and the same one a dropped checkpoint will
-            // get afterwards.
-            time_machine::SnapshotId::Checkpoint(name) => {
-                return Err(SqlError::SnapshotDoesNotExist(name));
-            }
+            // A name is looked up **at the present**, however far back it points: the record says
+            // what the name means now, and a checkpoint that has been dropped is `42704` exactly
+            // as an id a real server does not hold is.
+            time_machine::SnapshotId::Checkpoint(name) => self.checkpoint_at(&name)?,
         };
         let now = self.backend.now()?;
         let retention_ms = self.cluster_retention()?;
@@ -326,6 +327,38 @@ impl Executor {
                 Err(error)
             }
         }
+    }
+
+    /// Runs `write` in a present-time transaction of its own, committed on success.
+    ///
+    /// Always at the **present**, never at the session's snapshot, and that is the point: the two
+    /// callers are the checkpoint verbs, and the moment a user most wants to name is one they are
+    /// already reading — a transaction that is read-only by construction and could never commit a
+    /// record. The value written is that transaction's `start_ts`; the write is this one.
+    ///
+    /// The same shape as [`Executor::next_row_id`], which needs its own transaction for a
+    /// different structural reason, and the same trade: what it writes is outside the surrounding
+    /// block's atomicity, so a `ROLLBACK` does not take it back.
+    fn in_its_own_transaction(&self, write: impl FnOnce(&mut dyn Txn) -> Result<()>) -> Result<()> {
+        let mut txn = self.backend.begin()?;
+        if let Err(error) = write(&mut *txn) {
+            let _ = txn.rollback();
+            return Err(error);
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// The timestamp a checkpoint names, or `42704`.
+    ///
+    /// Read in a transaction of its own **at the present**, and not at the snapshot the session is
+    /// moving to: a name means what the catalog says it means now. Looking it up in the past would
+    /// make a checkpoint invisible to the very read it was taken for.
+    fn checkpoint_at(&self, name: &str) -> Result<u64> {
+        let txn = self.backend.begin()?;
+        let found = crate::catalog::checkpoint_at(&*txn, self.tenant, name);
+        let _ = txn.rollback();
+        found?.ok_or_else(|| SqlError::SnapshotDoesNotExist(name.to_owned()))
     }
 
     /// The cluster's default retention, which is the travel window
@@ -643,6 +676,8 @@ fn explain_lines(statement: &Statement) -> Vec<String> {
         // `EXPLAIN SET ...` is not PostgreSQL's grammar either, and a session statement has no
         // plan to print: it touches no table and reads no row.
         Statement::Session(session) => vec![session.tag().to_owned()],
+        // A checkpoint verb has no access path to choose: it is one key, by name.
+        Statement::TimeMachine(_) => vec!["Time Machine".to_owned()],
     }
 }
 

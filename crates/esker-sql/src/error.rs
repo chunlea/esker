@@ -70,6 +70,14 @@ pub enum SqlError {
         /// One-based character offset, when the parser reported one. PostgreSQL sends this in the
         /// `P` field and `psql` uses it to draw the caret.
         position: Option<u32>,
+        /// What to write instead, for the handful of spellings a user is likely to try because
+        /// another database has them.
+        ///
+        /// PostgreSQL answers `42601` for those too, so the *code* is parity and nothing here is
+        /// invented syntax. What a bare syntax error cannot carry is that this node has the
+        /// feature under another name (`crate::parse`'s redirect table), and a user who wrote
+        /// `CockroachDB`'s `AS OF SYSTEM TIME` has no other way to find out.
+        hint: Option<&'static str>,
     },
 
     /// The statement nests deeper than the parser may safely descend
@@ -659,6 +667,18 @@ impl SqlError {
     #[must_use]
     pub fn hint(&self) -> Option<&'static str> {
         match self {
+            SqlError::Syntax { hint, .. } => *hint,
+            // PostgreSQL owns `CHECKPOINT` for forcing a WAL checkpoint, so this node refuses it
+            // by name (contract C2) and does not take the word for something else. A user who
+            // wrote it was almost certainly reaching for a named checkpoint, which exists here.
+            SqlError::FeatureNotSupported(feature)
+                if feature == crate::parse::CHECKPOINT_FEATURE =>
+            {
+                Some(
+                    "Esker names a timestamp with SELECT esker_checkpoint('<name>'). \
+                     PostgreSQL's CHECKPOINT forces a WAL checkpoint and takes no name.",
+                )
+            }
             SqlError::WrongObjectType {
                 expected: "a table",
                 ..

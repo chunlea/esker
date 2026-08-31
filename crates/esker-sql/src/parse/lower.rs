@@ -44,7 +44,13 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
         Statement::CreateTable(create) => {
             Ok(plan::Statement::CreateTable(lower_create_table(create)?))
         }
-        Statement::Query(query) => Ok(plan::Statement::Select(lower_query(query)?)),
+        // The time machine's verbs are function calls, which is the only spelling PostgreSQL 19
+        // parses (`docs/plans/phase-6d.md` §1). Tried before the ordinary query path so that a
+        // `SELECT` naming one is the verb rather than a column reference that does not resolve.
+        Statement::Query(query) => match lower_verb(query)? {
+            Some(verb) => Ok(plan::Statement::TimeMachine(verb)),
+            None => Ok(plan::Statement::Select(lower_query(query)?)),
+        },
         Statement::Update(update) => Ok(plan::Statement::Update(lower_update(update)?)),
         Statement::Delete(delete) => Ok(plan::Statement::Delete(lower_delete(delete)?)),
         Statement::Insert(insert) => Ok(plan::Statement::Insert(lower_insert(insert)?)),
@@ -105,6 +111,97 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
         Statement::Reset(reset) => lower_reset(reset),
         other => Err(SqlError::unsupported(feature_name(other))),
     }
+}
+
+/// The time machine's verbs, each recognised as the function call it is spelled as.
+///
+/// `None` when the query is an ordinary one, which is every query that does not name one of the
+/// four functions below. The recognition is deliberately narrow: a *bare* call in the target list
+/// with nothing else in the query, or a table function as the only `FROM` item. A verb buried in
+/// an expression — `SELECT pg_export_snapshot() || 'x'` — is not recognised and falls through to
+/// the ordinary path, where it is `0A000` naming the expression, because honouring half of it
+/// would export a snapshot and then fail to use it.
+fn lower_verb(query: &Query) -> Result<Option<plan::TimeMachineVerb>> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+
+    // `SELECT * FROM esker_checkpoints()` — a table function, and the only one.
+    if let [table] = select.from.as_slice()
+        && let TableFactor::Table {
+            name,
+            args: Some(_),
+            ..
+        } = &table.relation
+    {
+        let called = name.to_string().to_ascii_lowercase();
+        if called == "esker_checkpoints" {
+            // Nothing else may be attached: this returns what it returns, and a `WHERE` silently
+            // ignored would answer a different question than the one asked.
+            refuse_if(!table.joins.is_empty(), "a JOIN on esker_checkpoints()")?;
+            refuse_if(select.selection.is_some(), "a WHERE on esker_checkpoints()")?;
+            refuse_if(
+                !matches!(select.projection.as_slice(), [SelectItem::Wildcard(_)]),
+                "a target list on esker_checkpoints() other than *",
+            )?;
+            return Ok(Some(plan::TimeMachineVerb::ListCheckpoints));
+        }
+        return Ok(None);
+    }
+
+    // `SELECT pg_export_snapshot()` and friends — a scalar call, and no `FROM` at all.
+    if !select.from.is_empty() {
+        return Ok(None);
+    }
+    let [SelectItem::UnnamedExpr(Expr::Function(function))] = select.projection.as_slice() else {
+        return Ok(None);
+    };
+    let called = function.name.to_string().to_ascii_lowercase();
+    let arguments = verb_arguments(function);
+    Ok(match (called.as_str(), arguments.as_deref()) {
+        ("pg_export_snapshot", Some([])) => {
+            Some(plan::TimeMachineVerb::ExportSnapshot { name: None })
+        }
+        ("esker_checkpoint", Some([name])) => Some(plan::TimeMachineVerb::ExportSnapshot {
+            name: Some(name.clone()),
+        }),
+        ("esker_drop_checkpoint", Some([name])) => {
+            Some(plan::TimeMachineVerb::DropCheckpoint { name: name.clone() })
+        }
+        // A verb called with the wrong arguments is PostgreSQL's `42883`, not a silent fallthrough
+        // to "that column does not exist".
+        ("pg_export_snapshot" | "esker_checkpoint" | "esker_drop_checkpoint", _) => {
+            return Err(SqlError::unsupported(format!(
+                "{called} with these arguments"
+            )));
+        }
+        _ => None,
+    })
+}
+
+/// A verb's arguments as strings, or `None` when any of them is not a plain string literal.
+///
+/// Every argument these verbs take is a name, and a name is a literal. An expression would have to
+/// be evaluated, and a verb whose argument depended on a row is not a verb.
+fn verb_arguments(function: &sqlparser::ast::Function) -> Option<Vec<String>> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+
+    let FunctionArguments::List(list) = &function.args else {
+        return Some(Vec::new());
+    };
+    if !list.clauses.is_empty() {
+        return None;
+    }
+    list.args
+        .iter()
+        .map(|argument| match argument {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(value))) => match &value.value {
+                Value::SingleQuotedString(text) => Some(text.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
 }
 
 /// `SET`, of which this node executes two spellings and refuses the rest by name.

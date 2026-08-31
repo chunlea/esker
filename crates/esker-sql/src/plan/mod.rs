@@ -23,6 +23,7 @@ mod dml;
 mod expr;
 mod query;
 mod session;
+mod time_machine;
 
 pub use ddl::{
     AlterTable, AlterTableAction, Column, CreateIndex, CreateTable, DropIndex, DropTable,
@@ -32,6 +33,7 @@ pub use dml::{Delete, Insert, Update};
 pub use expr::{BinaryOp, Expr, Literal};
 pub use query::{Join, Node, OrderItem, Probe, Select, SelectItem, SortKey};
 pub use session::SessionStatement;
+pub use time_machine::TimeMachineVerb;
 
 /// One statement, lowered.
 ///
@@ -68,6 +70,9 @@ pub enum Statement {
     /// `SET`, `SHOW`, `RESET` — the statements that change the session rather than the store.
     /// Run outside any transaction, because one of them replaces the transaction itself.
     Session(SessionStatement),
+    /// A time-machine verb, each spelled as the function call PostgreSQL parses
+    /// (`docs/adr/0021-time-machine.md` Decision 3).
+    TimeMachine(TimeMachineVerb),
 }
 
 impl Statement {
@@ -106,7 +111,14 @@ impl Statement {
             Statement::CreateIndex(_) => Some("CREATE INDEX"),
             Statement::DropIndex(_) => Some("DROP INDEX"),
             Statement::AlterTable(_) => Some("ALTER TABLE"),
-            Statement::Select(_) | Statement::Explain(_) | Statement::Session(_) => None,
+            // **Not writes of this statement's transaction.** A checkpoint's record is written in
+            // a present-time transaction of its own (`crate::exec::verbs`), precisely so that the
+            // moment a user most wants to name — the one they are reading — is one they can name.
+            // Refusing them here would make a checkpoint of the past impossible.
+            Statement::TimeMachine(_)
+            | Statement::Select(_)
+            | Statement::Explain(_)
+            | Statement::Session(_) => None,
         }
     }
 
@@ -130,6 +142,7 @@ impl Statement {
             Statement::Delete(_) => "DELETE",
             Statement::Explain(_) => "EXPLAIN",
             Statement::Session(session) => session.tag(),
+            Statement::TimeMachine(verb) => verb.tag(),
         }
     }
 }

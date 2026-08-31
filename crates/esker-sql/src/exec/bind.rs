@@ -169,7 +169,8 @@ fn walk(
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
         | Statement::AlterTable(_)
-        | Statement::Session(_) => {}
+        | Statement::Session(_)
+        | Statement::TimeMachine(_) => {}
     }
 }
 
@@ -276,7 +277,8 @@ fn walk_mut(statement: &mut Statement, visit: &mut impl FnMut(&mut Expr)) {
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
         | Statement::AlterTable(_)
-        | Statement::Session(_) => {}
+        | Statement::Session(_)
+        | Statement::TimeMachine(_) => {}
     }
 }
 
@@ -313,8 +315,11 @@ pub(super) fn table_names(statement: &Statement) -> Vec<&str> {
         // DDL over a table, but nothing here needs its column types: a parameter cannot appear
         // in an `ALTER TABLE`, so there is nothing to infer against.
         | Statement::AlterTable(_)
-        // A session statement is about no table at all.
-        | Statement::Session(_) => Vec::new(),
+        // Neither a session statement nor a time-machine verb is about a table this crate has
+        // to resolve names against: the checkpoint verbs take a name that is their own, and a
+        // `DIFF`'s table is resolved where it is scanned, in its own snapshot.
+        | Statement::Session(_)
+        | Statement::TimeMachine(_) => Vec::new(),
     }
 }
 
@@ -367,7 +372,8 @@ fn for_each_expr(statement: &Statement, visit: &mut impl FnMut(&Expr)) {
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
         | Statement::AlterTable(_)
-        | Statement::Session(_) => {}
+        | Statement::Session(_)
+        | Statement::TimeMachine(_) => {}
     }
 }
 

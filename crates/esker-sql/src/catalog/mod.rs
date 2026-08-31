@@ -545,6 +545,46 @@ pub fn default_retention(txn: &dyn Txn) -> Result<u64> {
     }
 }
 
+/// Names a timestamp: one record, and nothing else.
+///
+/// A checkpoint is **free** ([ADR 0021](../../../docs/adr/0021-time-machine.md) Decision 3) — no
+/// snapshot, no copy, no flush — because the data it refers to is kept by retention whether
+/// anybody named it or not. Re-using a name replaces it, which is what `pg_export_snapshot()`'s
+/// named variant should do: a name is a label a user moves, not a unique key they have to free.
+pub fn set_checkpoint(txn: &mut dyn Txn, tenant: u64, name: &str, start_ts: u64) {
+    txn.put(
+        &record::checkpoint_key(tenant, name),
+        &record::encode_checkpoint(start_ts),
+    );
+}
+
+/// The timestamp a checkpoint names, or `None` if there is no such checkpoint.
+pub fn checkpoint_at(txn: &dyn Txn, tenant: u64, name: &str) -> Result<Option<u64>> {
+    match txn.get(&record::checkpoint_key(tenant, name))? {
+        Some(bytes) => Ok(Some(record::decode_checkpoint(&bytes)?)),
+        None => Ok(None),
+    }
+}
+
+/// Forgets a checkpoint. The versions it named are retention's business and are not touched.
+pub fn drop_checkpoint(txn: &mut dyn Txn, tenant: u64, name: &str) {
+    txn.delete(&record::checkpoint_key(tenant, name));
+}
+
+/// The `[start, end)` key range holding one tenant's checkpoints, in name order.
+#[must_use]
+pub fn checkpoint_range(tenant: u64) -> (Vec<u8>, Vec<u8>) {
+    record::checkpoint_range(tenant)
+}
+
+/// One listed checkpoint: the name out of its key, and the timestamp out of its value.
+pub fn decode_checkpoint(tenant: u64, key: &[u8], value: &[u8]) -> Result<(String, u64)> {
+    Ok((
+        record::checkpoint_name(tenant, key)?,
+        record::decode_checkpoint(value)?,
+    ))
+}
+
 /// Reserves `count` consecutive row ids for one table and answers with the first.
 ///
 /// **This is called in a transaction of its own, not the statement's**, and the reason is the

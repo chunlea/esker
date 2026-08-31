@@ -227,7 +227,13 @@ Written before the code, and each is one of the kinds `DESIGN.md` §11 requires 
   preconditions in PostgreSQL's measured precedence, the three refusals, and
   `ALTER TABLE ... SET (retention = ...)`. 21 new tests plus 11 corpus statements; `begin_at` on
   `StoreBackend` refuses by name, asserted against a real three-store cluster.
-- [ ] 2 — checkpoints
+- [x] 2 — **checkpoints, and the real `begin_at`.** `pg_export_snapshot()`,
+  `esker_checkpoint('<name>')`, `esker_drop_checkpoint('<name>')`,
+  `SELECT * FROM esker_checkpoints()`, a checkpoint record in the `'m'` space, and
+  `SET TRANSACTION SNAPSHOT '<name>'` resolving one. `TxnClient::begin_at` landed mid-unit and the
+  stub is gone: the historical read now runs against three real stores. The invented spellings gain
+  a `HINT` naming what to write instead. `tests/slt/time_machine.slt` joins the corpus, so the
+  surface runs under both `.slt` runners and against real stores.
 - [ ] 3 — `DIFF`
 - [ ] 4 — the tests, and where PostgreSQL parity ends
 
@@ -264,6 +270,26 @@ version assigned `read_as_of` and *then* reopened the transaction, so a `SET` re
 left the session holding a snapshot the node had already refused — poisoning every later statement
 after the user had been told the `SET` did not work. `Executor::move_to` now applies the setting
 only when the move succeeds.
+
+**The read-only guard never fired against a real store.** The worst find of the unit and the one
+only a real cluster could have made. `Txn::is_read_only` had a default of `false`; `MemoryTxn`
+overrode it and `StoreTxn` inherited it, so `25006` was raised against the fake and *not* against
+three real stores — where the write instead reached the store, was buffered, and failed at commit
+under a different code. `StoreTxn` implements it now, and **the default is gone**: a default that
+is right for one implementor and silently wrong for the other is the shape of that bug.
+
+**A checkpoint must be writable while reading the past**, which is the case it exists for — "I am
+looking at an hour ago; remember this moment." The transaction doing the reading is read-only by
+construction, so the record is written in a present-time transaction of its own, the same shape as
+`next_row_id`, with the reading transaction's `start_ts` as its value. The first version refused it
+as a write and would have made the most useful checkpoint the one nobody could take.
+
+**`tests/slt/time_machine.slt` had to become oracle-independent.** These files run against the
+fake *and* against three real stores, and the real cluster's `CountingOracle` has no wall-clock
+half — so `SET esker.read_as_of = '-1h'` is `22023` there and `ok` here, and one file cannot assert
+both. Every past read in that file is reached through a checkpoint, which needs no clock; the
+instant and interval forms are asserted in `tests/time_machine.rs` over a fake whose clock is
+shaped like a real TSO.
 
 **Two test harnesses sent `BEGIN` through `execute`**, where it is `0A000 BEGIN is not supported`:
 transaction control belongs to `pgwire::session` and reaches the executor as a call. Neither

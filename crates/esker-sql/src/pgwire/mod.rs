@@ -230,6 +230,7 @@ mod tests {
         let error = SqlError::Syntax {
             message: "bad".into(),
             position: Some(15),
+            hint: None,
         };
         let fields = error_fields(&error);
         assert_eq!(

@@ -282,13 +282,12 @@ fn a_bound_parameter_round_trips_through_the_cluster() {
     assert_eq!(rows, [[Some(b"ann".to_vec())]]);
 }
 
-/// The one stub in this crate, asserted where a real backend exists.
+/// A historical read against a **real** three-store cluster, through the client's `begin_at`.
 ///
-/// `TxnClient::begin_at` is another lane's and does not exist yet (`docs/plans/phase-6d.md` §3),
-/// so a historical read against a real cluster is `0A000` **naming what is missing**. This test is
-/// what keeps the refusal from quietly becoming a fallback: a `begin_at` that read the present
-/// would answer a user who asked for an hour ago with *now*, and nothing would tell them. When the
-/// constructor lands, this test is the one that has to change, which is the point of writing it.
+/// This test was written against a stub that refused by name, and it is the one that changed when
+/// `TxnClient::begin_at` landed — which is what it was for. What it asserts now is the whole of
+/// ADR 0021 Decision 1 end to end: the snapshot is a number, the read at it sees the old row, the
+/// present still sees the new one, and a write at it is refused.
 ///
 /// A **token**, not an instant, and the reason is worth writing down: this cluster's oracle is a
 /// `CountingOracle`, whose timestamps are a counter rather than `physical_ms << 18`. The physical
@@ -298,7 +297,7 @@ fn a_bound_parameter_round_trips_through_the_cluster() {
 /// before PD's real TSO is wired in — `src/bin/esker-sql.rs` still builds a `CountingOracle`, and
 /// `esker_pd::tso` is the real one.
 #[test]
-fn a_historical_read_against_a_real_store_is_refused_by_name() {
+fn a_historical_read_against_real_stores_sees_the_old_row() {
     let cluster = Cluster::start();
     let mut session = cluster.session();
 
@@ -307,36 +306,45 @@ fn a_historical_read_against_a_real_store_is_refused_by_name() {
         .unwrap();
     session.run("INSERT INTO t VALUES (1, 'one')").unwrap();
 
-    // Inside a block the refusal arrives at the `SET` itself, because that is where the session
-    // tries to move: the node will not *enter* the past, rather than entering it and failing on
-    // the next query.
+    // A snapshot of the present, named. `pg_export_snapshot()` is PostgreSQL's own verb for this
+    // and costs one record: no copy, no flush.
+    let before = session.rows("SELECT pg_export_snapshot()")[0][0]
+        .clone()
+        .unwrap();
+
+    session
+        .run("UPDATE t SET note = 'two' WHERE id = 1")
+        .unwrap();
+    assert_eq!(
+        session.rows("SELECT note FROM t"),
+        [[Some("two".to_owned())]]
+    );
+
     session.run("BEGIN").unwrap();
+    session
+        .run(&format!("SET TRANSACTION SNAPSHOT '{before}'"))
+        .unwrap();
+    assert_eq!(
+        session.rows("SELECT note FROM t"),
+        [[Some("one".to_owned())]],
+        "the past, out of three real stores"
+    );
+
+    // A write at that snapshot is refused before anything is planned, naming the command the way
+    // PostgreSQL names it.
     let error = session
-        .run("SET TRANSACTION SNAPSHOT 'esker-0000000000000001'")
+        .run("UPDATE t SET note = 'three' WHERE id = 1")
         .unwrap_err();
-    assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED);
+    assert_eq!(error.sqlstate(), sqlstate::READ_ONLY_SQL_TRANSACTION);
     assert_eq!(
         error.to_string(),
-        "reading as of a past timestamp against a real store is not supported"
+        "cannot execute UPDATE in a read-only transaction"
     );
     session.run("ROLLBACK").unwrap();
 
-    // Outside a block there is no transaction to reopen, so the `SET` is recorded and the refusal
-    // arrives at the first statement that would have read the past. Both moments are honest; what
-    // matters is that neither of them reads the present.
-    //
-    // The instant is the epoch because that is where a `CountingOracle`'s "now" is: with no
-    // wall-clock half, `1970-01-01` is the present here and anything later is the future.
-    session
-        .run("SET esker.read_as_of = '1970-01-01 00:00:00+00'")
-        .unwrap();
-    let error = session.run("SELECT note FROM t").unwrap_err();
-    assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED);
-
-    // And the present still reads, which is what makes the refusal a bound rather than an outage.
-    session.run("RESET esker.read_as_of").unwrap();
-    let Outcome::Rows { rows, .. } = session.run("SELECT note FROM t").unwrap() else {
-        panic!("not rows");
-    };
-    assert_eq!(rows, [[Some(b"one".to_vec())]]);
+    assert_eq!(
+        session.rows("SELECT note FROM t"),
+        [[Some("two".to_owned())]],
+        "and the present is where the block left it"
+    );
 }

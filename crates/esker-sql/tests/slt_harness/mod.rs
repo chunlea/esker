@@ -113,6 +113,7 @@ pub(crate) const FILES: &[(&str, &str)] = &[
         include_str!("../slt/rowsort_check.slt"),
     ),
     ("select.slt", include_str!("../slt/select.slt")),
+    ("time_machine.slt", include_str!("../slt/time_machine.slt")),
     (
         "update_delete.slt",
         include_str!("../slt/update_delete.slt"),
