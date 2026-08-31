@@ -166,7 +166,11 @@ instruction behind `cfg(target_feature)`), with a golden test against known vect
 ### 4.6 Manifest and versions
 
 `MANIFEST-NNNNNN` is a WAL-format log of `VersionEdit`s (add/delete file per level per CF, log number,
-next file number, last seqno, comparator name, CF create/drop). `CURRENT` names the active manifest and is
+next file number, last seqno, comparator name, CF create/drop, and since phase 6b a file's tier
+location). The location travels as its own record rather than as a field of the add, because an upload
+finishes *after* the edit that names the file (§13, ADR 0024) and a promotion should cost four varints
+rather than a second copy of every key bound. It is emitted only when the location is not `Local`, so a
+database that never tiers writes byte-identical manifests to a phase-5 one. `CURRENT` names the active manifest and is
 replaced by write-temp + fsync + rename. `VersionSet` keeps the live `Version` (per CF, per level: sorted
 file metadata) behind an `Arc`; readers pin a `Version`, compaction installs a new one. Obsolete files are
 deleted only after no `Version` references them — and a file being *written* counts as
@@ -714,14 +718,26 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
 
 ## 13. Roadmap hooks for SQL and serverless
 
-- **SST tiering:** all SST reads go through a `FileSystem` trait (`open`, `read_at`, `list`, `rename`,
-  `delete`, `fsync_dir`) with a local implementation now and an S3-backed one later; the block cache plus
-  a local SST disk cache make S3-resident SSTs viable. WAL and Raft log stay local. The S3 client is a
-  small in-house implementation of the handful of calls we need (PutObject, GetObject with range, List,
-  Delete, SigV4 signing over an in-house SHA-256/HMAC). **TLS is the known hard case for the pure-Rust
-  rule:** options, to be settled by ADR in phase 6b, are (a) plain HTTP to a local MinIO / a TLS-terminating
-  sidecar, (b) `rustls` with a pure-Rust crypto provider, (c) accepting one vetted exception. Design so
-  the transport is a trait and the choice is local to one module.
+- **SST tiering — built (phase 6b).** All SST reads go through the `FileSystem` trait; `LocalFileSystem`
+  and `fs::tier::TieredFileSystem` are the two implementations. The tiered one routes by file *kind*:
+  only `NNNNNN.sst` reaches object storage, and the WAL, the manifest and `CURRENT` stay local, because
+  they are the log and invariant 1 is a statement about local durability. **The database directory is the
+  cache**: a resident tiered SST is simply the local file, evicting it is deleting that file, and
+  refilling it is fetching the object back to the same path — so the engine is never told which of its
+  files are resident. A cold read is *ranged*, one `GetObject` per block touched, with the block cache in
+  front; a whole-file fetch to answer a point read would be a three-orders-of-magnitude amplification.
+  An upload happens **after** the manifest edit that names the file, never before, and an upload that
+  fails fails nothing else (ADR 0024). An object is deleted only when no live version names its number
+  and it is not a pending output — taken from the version set rather than a directory listing, because an
+  evicted file is absent from the listing. The S3 client (`esker-s3`) is in-house: `PutObject`, ranged
+  `GetObject`, `ListObjectsV2`, `DeleteObject`, SigV4 over `esker-base`'s SHA-256/HMAC, and an HTTP/1.1
+  codec, with **no external dependency at any depth**.
+- **TLS — settled by ADR 0025, and deferred.** Option (a): plain HTTP to `MinIO` or to a TLS-terminating
+  sidecar. `Endpoint::parse` **refuses** `https://` with a message pointing at the ADR, rather than
+  accepting it and speaking plaintext — a configuration that looks encrypted and is not is the worst of
+  the three outcomes. `esker_s3::Transport` is a trait with a blocking `std::net` implementation, so
+  `rustls` arrives as a second implementor rather than a refactor; ADR 0025 lists the four things that
+  have to be true first.
 - **Stateless SQL nodes (`esker-sql`):** in-house PostgreSQL wire protocol v3 (startup, simple and
   extended query, `psql` compatibility — ~2k lines, no `pgwire` crate) → SQL parser (the one expected
   large dependency exception, `sqlparser`, PostgreSQL dialect, by ADR) → catalog in `'m'` key space →
@@ -744,6 +760,9 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
 | L1 base / multiplier / levels | 64 MiB / 10 / 7 |
 | compaction output file size | 8 MiB |
 | block cache | 256 MiB, 8 shards |
+| SST tier local budget | 4 GiB (`TierOptions::local_budget`); `None` never evicts. Only *uploaded* files are ever candidates |
+| SST tier upload batch | 8 distinct files per maintenance pass — which is also the retry backoff (ADR 0024) |
+| SST tier idle tick | 5 s; the uploader also wakes whenever an SST becomes durable |
 | manifest roll size | 64 MiB |
 | compaction threads | 2 |
 | region split size | 96 MiB |
