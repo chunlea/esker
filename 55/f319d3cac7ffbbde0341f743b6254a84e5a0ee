@@ -1,0 +1,66 @@
+crates/esker-sql/src/error.rs
+  s_dc640bf0df4adb::t_cbd74782fcb358 73-80,670
+  s_dc640bf0df4adb::t_deeff6a09d46d9 671-673
+  s_dc640bf0df4adb::t_4a4777a07d567a 674-681
+crates/esker-sql/src/exec/mod.rs
+  s_dc640bf0df4adb::t_af31acf463ff61 280-281,283-286,332-361
+  s_dc640bf0df4adb::t_ec580d17faf648 362-363
+  s_dc640bf0df4adb::t_5f64aa6a15f752 32,195,679-680
+crates/esker-sql/src/parse/mod.rs
+  s_dc640bf0df4adb::t_cbd74782fcb358 214-227,263,348-357,617-649
+  s_dc640bf0df4adb::t_6f429e9a09d92a 650-651
+crates/esker-sql/src/pgwire/session.rs
+  s_dc640bf0df4adb::t_89a11509aa7075 393
+crates/esker-sql/src/backend/mod.rs
+  s_dc640bf0df4adb::t_0187fd1d681a77 86-93,100-106,314-317
+crates/esker-sql/src/backend/store.rs
+  s_dc640bf0df4adb::t_43bcc5458cde04 58,60-68,107-121,169-191
+crates/esker-sql/src/catalog/mod.rs
+  s_dc640bf0df4adb::t_d654f29d70a870 548-587
+crates/esker-sql/src/catalog/record.rs
+  s_dc640bf0df4adb::t_414988a2d13f20 11,57,165-228
+crates/esker-sql/src/exec/bind.rs
+  s_dc640bf0df4adb::t_813d1f821b0a55 172-173,280-281,318-322,375-376
+crates/esker-sql/src/exec/query.rs
+  s_dc640bf0df4adb::t_f13ff338612490 815,851
+crates/esker-sql/src/exec/verbs.rs
+  s_dc640bf0df4adb::t_a81724afd3f58e 1-148
+crates/esker-sql/src/parse/lower.rs
+  s_dc640bf0df4adb::t_db19401c592d4d 47-53,116-206
+crates/esker-sql/src/pgwire/mod.rs
+  s_dc640bf0df4adb::t_07e2a9cc2c3e5a 233
+crates/esker-sql/src/plan/mod.rs
+  s_dc640bf0df4adb::t_a0cf5b8a99bb94 26,36,73-75,114-121,145
+crates/esker-sql/src/plan/time_machine.rs
+  s_dc640bf0df4adb::t_188512d576fa08 1-48
+crates/esker-sql/src/time_machine.rs
+  s_dc640bf0df4adb::t_305d7b0bf42403 103-115
+crates/esker-sql/tests/real_backend.rs
+  s_dc640bf0df4adb::t_c814fcca13da1c 285,287-290,300,309-322,324-334,336,338,341,345-349
+crates/esker-sql/tests/slt/time_machine.slt
+  s_dc640bf0df4adb::t_aa380eacf69644 1-238
+crates/esker-sql/tests/slt_harness/mod.rs
+  s_dc640bf0df4adb::t_e82560698bda8f 116
+crates/esker-sql/tests/time_machine.rs
+  s_dc640bf0df4adb::t_7532a509a5557d 578-821
+docs/plans/phase-6a.md
+  s_dc640bf0df4adb::t_deb7819bb53cfb 560-563
+docs/plans/phase-6d.md
+  s_dc640bf0df4adb::t_473f573654f5e3 230-236,274-293
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "55f319d3cac7ffbbde0341f743b6254a84e5a0ee",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "claude-fable-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
