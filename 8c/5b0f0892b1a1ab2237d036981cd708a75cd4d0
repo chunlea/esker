@@ -1,0 +1,16 @@
+crates/esker-sql/tests/slt/limits.slt
+  h_44076b318daf9c 1-146
+crates/esker-sql/tests/slt_harness/mod.rs
+  h_44076b318daf9c 100
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "8c5b0f0892b1a1ab2237d036981cd708a75cd4d0",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
