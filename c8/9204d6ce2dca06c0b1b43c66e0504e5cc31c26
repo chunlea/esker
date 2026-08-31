@@ -1,0 +1,19 @@
+crates/esker-store/tests/pd_client.rs
+  s_cf8601956e2620::t_5a954bd6e40aeb 90-95
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "c89204d6ce2dca06c0b1b43c66e0504e5cc31c26",
+  "prompts": {},
+  "sessions": {
+    "s_cf8601956e2620": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "732aecbc-5268-4943-836e-a49ba67b2585",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
