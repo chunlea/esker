@@ -1,6 +1,7 @@
 # Phase 6e plan — online schema change
 
-Status: **in progress** — written before implementation; §9 records progress and §10 what changed.
+Status: **units 0-6 complete**, unit 7 (`FLASHBACK`) not reached — written before
+implementation; §9 records progress and §10 what changed.
 Design: [ADR 0020](../adr/0020-online-schema-change.md), resting on
 [ADR 0019](../adr/0019-a-row-says-how-many-columns-it-has.md) (the row format) and
 [ADR 0021](../adr/0021-time-machine.md) (retention, which turns out to be the same number as the
