@@ -1,0 +1,19 @@
+docs/adr/0027-columnar-file-format.md
+  s_cf8601956e2620::t_2cb6c82c992a1f 28-46
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "92913db3f6ce22ee0d8109833e3b05fb508ceef5",
+  "prompts": {},
+  "sessions": {
+    "s_cf8601956e2620": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "732aecbc-5268-4943-836e-a49ba67b2585",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
