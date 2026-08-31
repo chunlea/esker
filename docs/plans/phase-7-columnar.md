@@ -250,4 +250,77 @@ workspace-member line in the root `Cargo.toml`, this file, and the ADR that reco
 
 ## What changed while building
 
-*(Filled in as the units land.)*
+All seven units landed as planned. Five things are worth recording, four of them decisions the
+plan did not anticipate and one a number that came in below the ADR's estimate.
+
+**The trailer grew a checksum over itself.** The plan had it carrying the footer's CRC and its own
+magic. That is not enough: a torn write that happens to leave the magic intact hands a reader a
+`footer_offset` and a `footer_len` that nothing has questioned yet, and believing them for one
+read is believing an attacker-chosen length. Four more bytes make the trailer self-verifying
+before any of its fields is used, and it is now the first check that runs. Recorded in
+[ADR 0027](../adr/0027-columnar-file-format.md), decision 1.
+
+**`encode_column` and `decode_column` are public.** They were going to be internal to the writer
+and reader. Making them the crate's core public operation costs nothing, is what the fuzz feeds
+directly, and is what milestone 2 will want when it has a chunk's bytes and no file — a fragment
+evaluator reading from object storage does not necessarily hold a `Reader`.
+
+**`Column` is the shape in both directions.** The plan had a builder for writing and a decoded
+column for reading. Collapsing them into one type means a round-trip test is `decode(encode(c))
+== c` over a single type with no adapter in between that could quietly correct a mistake. It also
+forced `Column::identical`, which compares floating point by bits — `NaN != NaN` would have made
+every round-trip assertion over doubles pass without proving anything, which is the sort of test
+that is worse than no test.
+
+**Two golden files rather than one.** An LZ4 file alone would let an encoding change hide behind
+the compressor. The uncompressed file pins the encodings; the LZ4 file pins what is actually on
+disk, `lz4_flex`'s output included, so a dependency bump that moves those bytes fails a test
+rather than silently rewriting every file the next compaction touches.
+
+**`docs/bench/` was out of the lane**, so the compression measurement lives in
+`crates/esker-columnar/tests/compression.rs` and its numbers are below. It asserts floors rather
+than tracking a curve, so it is a regression guard; a proper bench entry belongs with milestone 2,
+which is the first thing that will have a *read* worth timing.
+
+### The numbers
+
+50,000 rows of a mixed ledger corpus — ascending ids and timestamps, a five-value label, a boolean
+that runs, amounts in a narrow band, and a payload of random bytes. Two handicaps keep it honest:
+the row baseline counts **values only**, though every row in an SST also carries a key, and the
+random payload column is incompressible and puts a hard floor under every ratio.
+
+```text
+raw rows            2 329 831 bytes
+lz4 rows (4 KiB)    1 643 314          1.42x
+columnar, plain     1 020 068          2.28x vs raw   (the encodings alone)
+columnar, lz4         896 176          2.60x vs raw, 1.83x vs lz4 rows
+```
+
+ADR 0022 assumed **3×** against what Esker already stores. The measured answer on this corpus is
+**1.83×**, and the gap is entirely the incompressible column: it is roughly a third of the bytes
+and no layout can do anything with it. Against the uncompressed baseline the published figures are
+quoted against, the answer is 2.60×. The ADR's disk arithmetic should be read with 1.8–2.6× rather
+than 3×, which moves "one columnar learner costs +11%" to about +40–55% of one replica — still
+single-digit to low-double-digit percent of a three-replica total, so the conclusion stands and
+the number does not.
+
+### What the tests actually ran
+
+* **Goldens:** two frozen files; rebuilt byte-for-byte, re-read from disk, and every single byte
+  flipped at two bit positions — 42,000 mutations, every one detected. No region of this format is
+  uncovered by a checksum, and that test is what says so.
+* **Crash:** every one of ~9,000 truncation points of a finished file and of a half-written
+  temporary. Not one read back as complete; almost all were reported unfinished and the handful
+  landing inside the trailer were reported corrupt.
+* **Fuzz:** 90 seconds in release over two campaigns — 4,579,520 mutated whole files and
+  2,403,072 with the footer left intact so the damage lands in the stripe data. No panic, no
+  inconsistent answer. The committed budget is two seconds; `ESKER_FUZZ_SECONDS=60` runs a real
+  one.
+
+### Owed to milestone 2
+
+* Nothing prunes. The statistics are written, proven true, and read by nothing.
+* The reader decodes into owned buffers. Whether that costs anything is a question for the first
+  scan that exists.
+* The differential test ADR 0022 asks for — every query answered both ways and compared — cannot
+  be written until there is a query. It is milestone 2's first deliverable, not its last.
