@@ -1,0 +1,14 @@
+crates/esker-sql/src/parse/mod.rs
+  h_44076b318daf9c 31-36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "51aaac712dc13d4b4afb6ad4bab53d06b37cae2a",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
