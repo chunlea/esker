@@ -48,6 +48,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod column;
 pub mod encode;
 pub mod error;
 pub mod footer;
@@ -57,6 +58,7 @@ pub mod value;
 
 pub(crate) mod cursor;
 
+pub use column::{Column, ColumnBuilder, ColumnData, NullMask};
 pub use error::{Error, Result};
 pub use footer::{ChunkMeta, Footer, StripeMeta, Trailer};
 pub use frame::Compression;
@@ -77,6 +79,21 @@ pub mod format {
 
     /// Every chunk ends with `codec:u8 ++ crc32c:u32`.
     pub const CHUNK_TRAILER_SIZE: usize = 5;
+
+    /// Longest single text or bytea value this format stores: 64 MiB.
+    ///
+    /// A decode guard as much as a limit. A corrupt length prefix asking for more than this is
+    /// refused before a byte is allocated, which is half of why an arbitrary byte sequence cannot
+    /// exhaust memory in a decoder (the other half is that no count may exceed the bytes behind
+    /// it).
+    pub const MAX_VALUE_LEN: usize = 64 * 1024 * 1024;
+
+    /// Most bytes one column chunk may decode to: 256 MiB.
+    ///
+    /// A dictionary makes expansion possible — a thousand codes into one long entry decode to a
+    /// thousand copies of it — so the bound is on the *decoded* size and is checked as the total
+    /// accumulates, not after.
+    pub const MAX_COLUMN_BYTES: usize = 256 * 1024 * 1024;
 
     /// Longest min/max bound stored in a chunk's statistics.
     ///
