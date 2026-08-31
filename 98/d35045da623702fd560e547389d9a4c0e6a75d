@@ -1,0 +1,34 @@
+crates/esker-columnar/src/encode/mod.rs
+  s_dc640bf0df4adb::t_59ad58d4ba0104 50,57,67,92,100,111,126,134,144,150-151,164-166,221-256,283-439
+  s_dc640bf0df4adb::t_5395da02c6a144 14-49,51-56,58-66,68-91,93-99,101-110,112-125,127-133,135-143,145-149,152-163,167-169
+crates/esker-columnar/src/column.rs
+  s_dc640bf0df4adb::t_9b1ea7b3e6a8dd 1-619
+crates/esker-columnar/src/encode/bitpack.rs
+  s_dc640bf0df4adb::t_5ec5667bb44960 1-314
+crates/esker-columnar/src/encode/boolean.rs
+  s_dc640bf0df4adb::t_50998dafb97757 1-366
+crates/esker-columnar/src/encode/bytes.rs
+  s_dc640bf0df4adb::t_afa5be0d8ddb2d 1-348
+crates/esker-columnar/src/encode/double.rs
+  s_dc640bf0df4adb::t_d7889e5d94da98 1-141
+crates/esker-columnar/src/encode/integer.rs
+  s_dc640bf0df4adb::t_3f5bb05fd33164 1-243
+crates/esker-columnar/src/lib.rs
+  s_dc640bf0df4adb::t_4f3dbfe97936cb 51,61,83-97
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "98d35045da623702fd560e547389d9a4c0e6a75d",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "claude-fable-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
