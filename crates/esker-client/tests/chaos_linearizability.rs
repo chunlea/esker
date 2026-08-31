@@ -498,7 +498,14 @@ fn final_reads(addrs: &[SocketAddr], recorder: &Recorder) {
 /// exhaustion reports exactly which three numbers it tried.
 const FIRST_BUDGET: u64 = 1_000_000;
 const BUDGET_GROWTH: u64 = 8;
-const BUDGET_ATTEMPTS: u32 = 3;
+/// Two attempts — 1M then 8M — and the ceiling is deliberately low.
+///
+/// The cost is not in the history's *length* but in how much of it is concurrent, and that makes
+/// the search a cliff rather than a slope: every history ever observed here either decided inside
+/// the first million steps or did not decide at 64 million either. A third attempt was measured
+/// costing **146 seconds** and deciding nothing, twice. Spending two minutes to reach the same
+/// answer eight times slower is not thoroughness, so the ceiling stops where the evidence does.
+const BUDGET_ATTEMPTS: u32 = 2;
 
 /// What checking one key's history concluded. **Exhaustion is not a violation**, and keeping them
 /// apart is the whole point of this type.
