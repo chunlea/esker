@@ -144,6 +144,13 @@ fn write_row(
     }
 
     for index in &table.indexes {
+        // **Write-only and public write an entry; delete-only and absent do not.** One state later
+        // than [`SchemaState::maintained`], and the asymmetry is the design: removal has to lead
+        // creation, or a node that does not yet know about the index deletes a row and leaves an
+        // entry pointing at nothing (ADR 0020, "skip delete-only").
+        if !index.state.written() {
+            continue;
+        }
         let columns: Vec<Datum> = index
             .columns
             .iter()
@@ -330,6 +337,17 @@ fn remove_row(
         .collect();
 
     for index in &table.indexes {
+        // **Delete-only removes, and that is one state earlier than write-only inserts.** The
+        // asymmetry is the whole reason there are four states rather than three: every node has to
+        // be removing entries before any node starts creating them, or a node still at `Absent`
+        // deletes a row and leaves behind an entry that a scan will later return as a row the
+        // table does not contain (ADR 0020, "skip delete-only").
+        //
+        // Deleting an entry that is not there costs one tombstone and is correct, which is what
+        // makes "remove first, ask later" affordable.
+        if !index.state.maintained() {
+            continue;
+        }
         let columns: Vec<Datum> = index
             .columns
             .iter()

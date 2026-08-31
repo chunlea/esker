@@ -275,6 +275,11 @@ state that guards it is skipped, which is what makes them tests of the rule rath
 
 ## 9. Progress
 
+- [x] 2 — **the four states.** `SchemaState` on every `IndexDef` with the schema version it was
+  entered at, in catalog v3 beside unit 1's fields and behind the same v2 fallback; the planner
+  refusing a non-public index; the DML writing entries at write-only and public and removing them
+  from delete-only on. `advance_index_state` refuses a two-step move, so no caller can break the
+  two-version invariant. Six new tests including all three anomaly repros, each mutation-checked.
 - [x] 1 — **`ADD COLUMN ... DEFAULT <constant>`, the PostgreSQL 11 way.** Catalog v3 with a
   `default` and a `missing` on every column, v2 still decoding and both goldens kept;
   `RowSchema` so a types list and a pad list cannot drift apart; the insert path filling omitted
@@ -282,6 +287,28 @@ state that guards it is skipped, which is what makes them tests of the rule rath
   §10a of phase 6a records. 12 new tests, 5 new corpus statements, `.slt` updated.
 
 ## 10. What changed from this plan
+
+**Delete-only is unreachable through the executor, and that is correction 1 taken to its
+conclusion.** The ADR's "skip delete-only" story needs a deleter at an *earlier* state than the
+inserter of a row it can see. A transaction's schema is the schema at its own snapshot and states
+only move forward, so a transaction that can see a row committed at `S_r` reads a state of at least
+`S_r` — and `written` implies `maintained`, so if the insert wrote an entry the delete removes it.
+The interleaving cannot be built with two sessions; the second one simply cannot see the row.
+
+That does **not** make delete-only ceremony. It makes it the rule that saves a node whose schema is
+stale *independently of its snapshot* — which is precisely the failure the lease bounds and the one
+ADR 0020 calls the hard part. So there are two tests: one drives the rule directly by winding the
+catalog back, and one asserts *why* the interleaving cannot be built, because that property is what
+makes the step arithmetic sufficient and a future cached `TableDef` would break it silently.
+
+**Only a *unique* index has a read path here**, so the "skip the backfill" repro goes through one.
+Rules 1 and 3 of `crate::plan::query` choose a point read or a unique-index lookup; a non-unique
+index is never read, so it has no way to answer wrongly. The anomaly is observable exactly where the
+planner can reach it, which is also the only place it can hurt.
+
+**`ColumnDef` did not get a state.** The plan said both defs; a column state is for the *removal*
+direction (`DROP COLUMN`), which is explicitly out of this phase, and ADR 0019 warns in as many
+words about a field that looks load-bearing and is not. It lands with the DDL that needs it.
 
 **A column needs two fields, not one, and unit 1 is bigger than "the missing value".** The plan
 named `missing`; the measurement said a *default* is a separate thing that PostgreSQL lets diverge

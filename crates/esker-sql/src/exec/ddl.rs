@@ -134,6 +134,11 @@ pub(super) fn create_table(
                 .unwrap_or_else(|| plan::unique_constraint_name(&create.name, &constraint.columns)),
             unique: true,
             columns: ordinals,
+            // Born public. Nothing predates a `UNIQUE` declared with the table, so there is no
+            // interleaving for the states to protect: the ADR's whole argument is about rows and
+            // writers that already exist (`docs/plans/phase-6e.md` §2).
+            state: catalog::SchemaState::Public,
+            state_since: 1,
         });
     }
 
@@ -251,6 +256,13 @@ pub(super) fn create_index(
         name,
         unique: create.unique,
         columns,
+        // Public the moment it is declared, because it is built inside this statement's own
+        // transaction: no other node ever sees it half-made. That is what makes this correct and
+        // also what makes it `TODO(post-v1)` for a table large enough to matter — the whole
+        // backfill is one transaction. `docs/plans/phase-6e.md` unit 5 is where it becomes a job
+        // and starts at `Absent` instead.
+        state: catalog::SchemaState::Public,
+        state_since: table.schema_version,
     };
     // An index over a table that already has rows has to be *built*, not just declared. An index
     // that exists and is empty is worse than no index: the planner will use it, and it will answer

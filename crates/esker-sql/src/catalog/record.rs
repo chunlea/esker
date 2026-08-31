@@ -31,7 +31,7 @@
 use esker_base::varint;
 use esker_keys::{codec, prefix};
 
-use crate::catalog::{ColumnDef, IndexDef, Relation, TableDef};
+use crate::catalog::{ColumnDef, IndexDef, Relation, SchemaState, TableDef};
 use crate::error::{Result, SqlError};
 use crate::value::{ColumnType, Datum};
 
@@ -77,6 +77,38 @@ const TAG_BOOL: u8 = 3;
 const TAG_BYTEA: u8 = 4;
 const TAG_TIMESTAMPTZ: u8 = 5;
 const TAG_DOUBLE: u8 = 6;
+
+/// Tags for [`SchemaState`] as stored. Ours, and they must never move: an index read as the wrong
+/// state is an index a node writes when it should not, which is the whole failure ADR 0020 is about.
+const TAG_ABSENT: u8 = 0;
+const TAG_DELETE_ONLY: u8 = 1;
+const TAG_WRITE_ONLY: u8 = 2;
+const TAG_PUBLIC: u8 = 3;
+
+fn state_tag(state: SchemaState) -> u8 {
+    match state {
+        SchemaState::Absent => TAG_ABSENT,
+        SchemaState::DeleteOnly => TAG_DELETE_ONLY,
+        SchemaState::WriteOnly => TAG_WRITE_ONLY,
+        SchemaState::Public => TAG_PUBLIC,
+    }
+}
+
+fn state_of(tag: u8) -> Result<SchemaState> {
+    Ok(match tag {
+        TAG_ABSENT => SchemaState::Absent,
+        TAG_DELETE_ONLY => SchemaState::DeleteOnly,
+        TAG_WRITE_ONLY => SchemaState::WriteOnly,
+        TAG_PUBLIC => SchemaState::Public,
+        // Never a guess: an unknown state is not "probably public", it is a record this build did
+        // not write.
+        other => {
+            return Err(corrupt(format!(
+                "schema state tag {other} is not one of ours"
+            )));
+        }
+    })
+}
 
 fn tag_of(ty: ColumnType) -> u8 {
     match ty {
@@ -303,6 +335,10 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         out.extend_from_slice(&index.id.to_le_bytes());
         put_str(&index.name, &mut out);
         out.push(u8::from(index.unique));
+        // Version 3. A version 2 index has neither, and reads back `Public` at the table's own
+        // schema version — which is what an index that never staged a change means.
+        out.push(state_tag(index.state));
+        varint::put_u64(index.state_since, &mut out);
         varint::put_u64(index.columns.len() as u64, &mut out);
         for &ordinal in &index.columns {
             varint::put_u64(ordinal as u64, &mut out);
@@ -349,6 +385,11 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
         let id = reader.u64_le()?;
         let name = reader.string()?;
         let unique = reader.flag()?;
+        let (state, state_since) = if reader.version >= 3 {
+            (state_of(reader.byte()?)?, reader.varint()?)
+        } else {
+            (SchemaState::Public, schema_version)
+        };
         let mut index_columns = Vec::with_capacity(reader.count()?);
         for _ in 0..index_columns.capacity() {
             index_columns.push(reader.ordinal(columns.len())?);
@@ -358,6 +399,8 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
             name,
             unique,
             columns: index_columns,
+            state,
+            state_since,
         });
     }
 

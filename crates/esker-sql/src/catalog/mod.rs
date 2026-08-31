@@ -100,6 +100,86 @@ pub struct ColumnDef {
     pub missing: Option<Datum>,
 }
 
+/// Where an index or a column is in a staged schema change (ADR 0020).
+///
+/// Four states, moved one at a time, and each exists because the pair on either side of it is safe
+/// together and the pair you would get by skipping it is not. The variants carry that argument;
+/// `tests/schema_change.rs` carries the repro for each, written so that it **fails** if the state
+/// it guards is skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SchemaState {
+    /// Nobody reads it, nobody writes it, nobody removes from it. What an index is before a
+    /// `CREATE INDEX` starts and after a `DROP INDEX` finishes.
+    Absent,
+    /// A **delete** removes an entry if one is there; nothing reads and nothing inserts.
+    ///
+    /// Exists so that *every* node removes entries before *any* node creates them. Skipping it
+    /// leaves an entry pointing at a row a node that did not know about the index deleted — and
+    /// the moment the index goes public, a scan through it returns a row the table does not
+    /// contain (ADR 0020, "skip delete-only").
+    DeleteOnly,
+    /// Inserts, updates and deletes all maintain it; nothing reads it.
+    ///
+    /// Exists so that *every* node maintains the index before *any* node trusts it. Skipping it
+    /// lets a node behind insert a row and write no entry, while a node ahead answers a query
+    /// from the index and does not find it (ADR 0020, "skip write-only").
+    WriteOnly,
+    /// Read, written and removed from: an ordinary index.
+    ///
+    /// Reached only after the **backfill**, which is what makes it complete. Skipping that leaves
+    /// every row written before write-only invisible to an index scan — the same wrong answer with
+    /// a wider blast radius (ADR 0020, "skip the backfill").
+    Public,
+}
+
+impl SchemaState {
+    /// Whether a query may answer *from* this index.
+    #[must_use]
+    pub fn readable(self) -> bool {
+        self == SchemaState::Public
+    }
+
+    /// Whether an insert or an update writes an entry into it.
+    #[must_use]
+    pub fn written(self) -> bool {
+        matches!(self, SchemaState::WriteOnly | SchemaState::Public)
+    }
+
+    /// Whether a delete removes an entry from it.
+    ///
+    /// True one state *earlier* than [`SchemaState::written`], and that asymmetry is the whole
+    /// design: removal has to lead creation, or an entry outlives the row it names.
+    #[must_use]
+    pub fn maintained(self) -> bool {
+        matches!(
+            self,
+            SchemaState::DeleteOnly | SchemaState::WriteOnly | SchemaState::Public
+        )
+    }
+
+    /// The next state towards `Public`, or `None` at it.
+    #[must_use]
+    pub fn forward(self) -> Option<SchemaState> {
+        match self {
+            SchemaState::Absent => Some(SchemaState::DeleteOnly),
+            SchemaState::DeleteOnly => Some(SchemaState::WriteOnly),
+            SchemaState::WriteOnly => Some(SchemaState::Public),
+            SchemaState::Public => None,
+        }
+    }
+
+    /// How it is stored, and how it reads in `esker_schema_jobs()`.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            SchemaState::Absent => "absent",
+            SchemaState::DeleteOnly => "delete-only",
+            SchemaState::WriteOnly => "write-only",
+            SchemaState::Public => "public",
+        }
+    }
+}
+
 /// One index on one table. Its columns are positions into the table's column list, so renaming a
 /// column cannot orphan an index.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +192,19 @@ pub struct IndexDef {
     pub unique: bool,
     /// Positions into [`TableDef::columns`].
     pub columns: Vec<usize>,
+    /// Where this index is in a staged schema change (ADR 0020).
+    ///
+    /// [`SchemaState::Public`] for an index that was built the old way — one statement, one
+    /// transaction — and for every index a version 2 catalog holds, which is what a table that has
+    /// never staged a change means.
+    pub state: SchemaState,
+    /// The [`TableDef::schema_version`] this index entered [`IndexDef::state`] at.
+    ///
+    /// The number ADR 0020's two-version invariant is stated over: the step clock may advance only
+    /// when no node can still be acting on a state two behind this one, and this is what "behind"
+    /// is measured in. It is written on every transition and read by the job, never by a read or a
+    /// write of a row.
+    pub state_since: u64,
 }
 
 /// The name the internal row id column carries: **no name at all**.
@@ -543,6 +636,53 @@ fn write_table(txn: &mut dyn Txn, tenant: u64, table: &TableDef) -> Result<()> {
     Ok(())
 }
 
+/// Moves one index to a new state, bumping the table's schema version.
+///
+/// **One step is all a caller may take**, and the check is here rather than in the caller because
+/// this is the primitive every path goes through — the job, and a test staging a state by hand.
+/// Two steps at once is exactly the two-version invariant broken (ADR 0020): a node whose snapshot
+/// predates the write would be two states behind a node whose snapshot follows it, and no pair of
+/// states two apart is safe together.
+///
+/// It bumps `schema_version`, which is what makes the transition a *table* event that
+/// `IndexDef::state_since` can be compared against — the cluster-wide catalog version says only
+/// that something moved.
+pub fn advance_index_state(
+    txn: &mut dyn Txn,
+    tenant: u64,
+    table: &TableDef,
+    index_id: u64,
+    to: SchemaState,
+) -> Result<TableDef> {
+    let next_version = table.schema_version + 1;
+    let mut updated = table.clone();
+    updated.schema_version = next_version;
+    let index = updated
+        .indexes
+        .iter_mut()
+        .find(|index| index.id == index_id)
+        .ok_or_else(|| {
+            SqlError::Internal(format!(
+                "index {index_id} is not on table \"{}\"",
+                table.name
+            ))
+        })?;
+    // Idempotent for the state it is already in, so a job that crashed after writing and before
+    // recording resumes rather than failing.
+    if index.state != to && index.state.forward() != Some(to) {
+        return Err(SqlError::Internal(format!(
+            "index \"{}\" cannot go from {} to {} in one step",
+            index.name,
+            index.state.name(),
+            to.name()
+        )));
+    }
+    index.state = to;
+    index.state_since = next_version;
+    replace_table(txn, tenant, table, &updated)?;
+    Ok(updated)
+}
+
 /// Sets the retention override for one table, in milliseconds.
 ///
 /// It does **not** bump the catalog version, and that is deliberate. Retention changes nothing
@@ -691,8 +831,8 @@ pub fn bump_version(txn: &mut dyn Txn) -> Result<()> {
 mod tests {
     use super::{
         Catalog, ColumnDef, DEFAULT_RETENTION_MS, IndexDef, MAX_IDENTIFIER_BYTES,
-        RETENTION_FOREVER, Relation, TableDef, allocate_id, clear_table_retention, create_table,
-        default_retention, drop_table, fold_identifier, record, replace_table,
+        RETENTION_FOREVER, Relation, SchemaState, TableDef, allocate_id, clear_table_retention,
+        create_table, default_retention, drop_table, fold_identifier, record, replace_table,
         set_default_retention, set_table_retention, table_retention,
     };
     use crate::backend::{Backend, MemoryBackend};
@@ -741,6 +881,8 @@ mod tests {
                 name: "accounts_email_key".into(),
                 unique: true,
                 columns: vec![1],
+                state: SchemaState::Public,
+                state_since: 1,
             }],
             primary_key_name: "accounts_pkey".into(),
             schema_version: 1,
@@ -779,6 +921,8 @@ mod tests {
                 "0800000000000000",                       // index id 8
                 "126163636f756e74735f656d61696c5f6b6579", // "accounts_email_key"
                 "01",                                     // unique
+                "03",                                     // state: public
+                "01",                                     // entered at schema version 1
                 "01",
                 "01", // one column, column 1
             )
@@ -1027,6 +1171,8 @@ mod tests {
             name: "accounts_id_idx".into(),
             unique: false,
             columns: vec![0],
+            state: SchemaState::Public,
+            state_since: 1,
         });
         replace_table(&mut *adding, 1, &accounts(1), &with_more).unwrap();
         adding.commit().unwrap();
@@ -1081,6 +1227,8 @@ mod tests {
             name: "accounts".into(),
             unique: false,
             columns: vec![0],
+            state: SchemaState::Public,
+            state_since: 1,
         });
         let error = replace_table(&mut *ddl, 1, &table, &clash).unwrap_err();
         assert_eq!(error.sqlstate(), sqlstate::DUPLICATE_TABLE);

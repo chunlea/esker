@@ -432,6 +432,13 @@ fn access_path(filter: Option<&Expr>, tenant: u64, table: &TableDef) -> Result<N
     // Rule 3: a unique index's whole key, pinned. A key with a NULL in it is not pinned at all --
     // `= NULL` is never true -- so this cannot pick up the many-NULLs case by accident.
     for index in &table.indexes {
+        // **Only a public index may be read.** Anything earlier is either incomplete (the backfill
+        // has not run) or not yet maintained by every node, and a plan that chose one would answer
+        // a correct-looking query with missing rows — ADR 0020's "skip write-only" and "skip the
+        // backfill", which are the two anomalies a *reader* can cause.
+        if !index.state.readable() {
+            continue;
+        }
         if !index.unique {
             continue;
         }
