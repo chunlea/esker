@@ -217,6 +217,27 @@ pub struct FieldDescription {
     pub format: i16,
 }
 
+impl FieldDescription {
+    /// A column of type `ty`, described as a computed value.
+    ///
+    /// `table_oid` and `column_id` are zero, which the protocol defines as "not a plain column
+    /// reference". PostgreSQL fills them in for a column that came straight out of a table; ours
+    /// are `u64` relation ids and would not fit the `u32` field, and a truncated one could name a
+    /// different relation. Zero is the honest answer and the one the protocol provides for it.
+    #[must_use]
+    pub fn computed(name: impl Into<String>, ty: crate::value::ColumnType) -> Self {
+        FieldDescription {
+            name: name.into(),
+            table_oid: 0,
+            column_id: 0,
+            type_oid: ty.oid(),
+            type_size: ty.type_len(),
+            type_modifier: -1,
+            format: 0,
+        }
+    }
+}
+
 /// One field of an `ErrorResponse` or `NoticeResponse`.
 ///
 /// The wire carries a one-byte code and a string; the codes are single letters whose meanings are

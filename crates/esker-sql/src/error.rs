@@ -82,6 +82,43 @@ pub enum SqlError {
     #[error("relation \"{0}\" does not exist")]
     UndefinedTable(String),
 
+    /// A `PRIMARY KEY` or `UNIQUE` clause naming a column the table does not have. PostgreSQL
+    /// words this one differently from an ordinary missing column, and the extra three words are
+    /// what tell a user to look at the constraint rather than at the column list.
+    #[error("column \"{0}\" named in key does not exist")]
+    UndefinedColumnInKey(String),
+
+    /// No such table, said the way `DROP TABLE` says it. PostgreSQL words the same condition
+    /// differently depending on the statement — a query says `relation`, a `DROP TABLE` says
+    /// `table` — and both were captured rather than assumed.
+    #[error("table \"{0}\" does not exist")]
+    UndefinedTableForDrop(String),
+
+    /// No such index.
+    #[error("index \"{0}\" does not exist")]
+    UndefinedIndex(String),
+
+    /// The name exists and is the wrong kind of thing: `DROP TABLE` naming an index. Distinct from
+    /// "does not exist", and a client told the wrong one would go looking for the wrong bug.
+    #[error("\"{name}\" is not {expected}")]
+    WrongObjectType {
+        /// The name that resolved.
+        name: String,
+        /// What the statement needed, with its article: `a table`, `an index`.
+        expected: &'static str,
+    },
+
+    /// `DROP INDEX` naming the index a primary key constraint owns. PostgreSQL refuses it and
+    /// says what to drop instead; so do we, with the difference that here there is no index at all
+    /// — the row key is the primary key — and the answer is the same either way.
+    #[error("cannot drop index {index} because constraint {index} on table {table} requires it")]
+    DependentObjectsStillExist {
+        /// The constraint's name, which is also the index's.
+        index: String,
+        /// The table it is on.
+        table: String,
+    },
+
     /// No such column.
     #[error("column \"{0}\" does not exist")]
     UndefinedColumn(String),
@@ -182,6 +219,33 @@ pub enum SqlError {
     #[error("could not serialize access due to concurrent update: {0}")]
     SerializationFailure(String),
 
+    /// `CREATE ... IF NOT EXISTS` for something that is already there. A notice: the statement
+    /// succeeded and did nothing.
+    #[error("relation \"{0}\" already exists, skipping")]
+    AlreadyExistsSkipping(String),
+
+    /// `DROP ... IF EXISTS` for something that is not there. Also a notice — and one that carries
+    /// SQLSTATE `00000`, where the notice above carries `42P07`. The asymmetry is PostgreSQL's and
+    /// was captured, not assumed.
+    #[error("{kind} \"{name}\" does not exist, skipping")]
+    DoesNotExistSkipping {
+        /// The object word PostgreSQL uses here — `table`, `index`. Note that the *already
+        /// exists* notice says `relation` for both.
+        kind: &'static str,
+        /// The name that was not found.
+        name: String,
+    },
+
+    /// An identifier longer than 63 bytes. PostgreSQL truncates and carries on, so this is a
+    /// notice and the statement still runs against the shortened name.
+    #[error("identifier \"{original}\" will be truncated to \"{truncated}\"")]
+    IdentifierTruncated {
+        /// As the client wrote it.
+        original: String,
+        /// As it will be stored.
+        truncated: String,
+    },
+
     /// A statement arrived after an error inside a transaction block.
     #[error("current transaction is aborted, commands ignored until end of transaction block")]
     InFailedTransaction,
@@ -235,9 +299,18 @@ impl SqlError {
             SqlError::FeatureNotSupported(_) => sqlstate::FEATURE_NOT_SUPPORTED,
             SqlError::Syntax { .. } => sqlstate::SYNTAX_ERROR,
             SqlError::StatementTooComplex => sqlstate::STATEMENT_TOO_COMPLEX,
-            SqlError::UndefinedTable(_) => sqlstate::UNDEFINED_TABLE,
-            SqlError::UndefinedColumn(_) => sqlstate::UNDEFINED_COLUMN,
-            SqlError::DuplicateTable(_) => sqlstate::DUPLICATE_TABLE,
+            SqlError::UndefinedTable(_) | SqlError::UndefinedTableForDrop(_) => {
+                sqlstate::UNDEFINED_TABLE
+            }
+            SqlError::UndefinedIndex(_) => sqlstate::UNDEFINED_OBJECT,
+            SqlError::DependentObjectsStillExist { .. } => sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+            SqlError::WrongObjectType { .. } => sqlstate::WRONG_OBJECT_TYPE,
+            SqlError::UndefinedColumn(_) | SqlError::UndefinedColumnInKey(_) => {
+                sqlstate::UNDEFINED_COLUMN
+            }
+            SqlError::DuplicateTable(_) | SqlError::AlreadyExistsSkipping(_) => {
+                sqlstate::DUPLICATE_TABLE
+            }
             SqlError::DuplicateColumn(_) => sqlstate::DUPLICATE_COLUMN,
             SqlError::UniqueViolation(_) => sqlstate::UNIQUE_VIOLATION,
             SqlError::NotNullViolation(_) => sqlstate::NOT_NULL_VIOLATION,
@@ -260,6 +333,8 @@ impl SqlError {
             SqlError::InvalidByteSequence(_) => sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
             SqlError::DatatypeMismatch(_) => sqlstate::DATATYPE_MISMATCH,
             SqlError::SerializationFailure(_) => sqlstate::SERIALIZATION_FAILURE,
+            SqlError::DoesNotExistSkipping { .. } => sqlstate::SUCCESSFUL_COMPLETION,
+            SqlError::IdentifierTruncated { .. } => sqlstate::NAME_TOO_LONG,
             SqlError::InFailedTransaction => sqlstate::IN_FAILED_SQL_TRANSACTION,
             SqlError::ActiveTransaction => sqlstate::ACTIVE_SQL_TRANSACTION,
             SqlError::NoActiveTransaction => sqlstate::NO_ACTIVE_SQL_TRANSACTION,
@@ -281,9 +356,33 @@ impl SqlError {
     #[must_use]
     pub fn severity(&self) -> Severity {
         match self {
+            SqlError::AlreadyExistsSkipping(_)
+            | SqlError::DoesNotExistSkipping { .. }
+            | SqlError::IdentifierTruncated { .. } => Severity::Notice,
             SqlError::ActiveTransaction | SqlError::NoActiveTransaction => Severity::Warning,
             SqlError::ProtocolViolation(_) | SqlError::InvalidPassword(_) => Severity::Fatal,
             _ => Severity::Error,
+        }
+    }
+
+    /// The `HINT` field, when PostgreSQL sends one.
+    ///
+    /// A hint is not decoration: told `"t_b_key" is not a table`, a user's next question is what to
+    /// do instead, and PostgreSQL answers it in the same message. Only the conditions where a real
+    /// server was seen to send one have one here.
+    #[must_use]
+    pub fn hint(&self) -> Option<&'static str> {
+        match self {
+            SqlError::WrongObjectType {
+                expected: "a table",
+                ..
+            } => Some("Use DROP INDEX to remove an index."),
+            SqlError::WrongObjectType {
+                expected: "an index",
+                ..
+            } => Some("Use DROP TABLE to remove a table."),
+            SqlError::DependentObjectsStillExist { .. } => Some("You can drop the table instead."),
+            _ => None,
         }
     }
 

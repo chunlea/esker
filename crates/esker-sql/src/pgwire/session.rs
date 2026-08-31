@@ -78,6 +78,17 @@ pub trait Execute {
         Ok(None)
     }
 
+    /// Notices the statement that just ran produced, which the session sends before its
+    /// `CommandComplete`.
+    ///
+    /// A notice is not an outcome: `CREATE TABLE IF NOT EXISTS` for a table that is already there
+    /// *succeeds*, and PostgreSQL says `relation "t" already exists, skipping` on the way. Draining
+    /// them after the call keeps them out of [`Outcome`], which is about what a statement produced
+    /// rather than what it remarked on.
+    fn take_notices(&mut self) -> Vec<SqlError> {
+        Vec::new()
+    }
+
     /// Opens a transaction.
     fn begin(&mut self) -> Result<()> {
         Ok(())
@@ -187,6 +198,13 @@ impl Session {
             StatementClass::Rollback => self.rollback(executor, out),
             _ => executor.execute(parsed),
         };
+
+        // Notices come before whatever the statement produced, error or not: a `CREATE TABLE IF
+        // NOT EXISTS` that skipped succeeded *and* had something to say, and a client that saw the
+        // `CommandComplete` first would attribute the notice to the next statement.
+        for notice in executor.take_notices() {
+            warn(&notice, out);
+        }
 
         match outcome {
             Ok(Outcome::Rows { fields, rows, tag }) => {
@@ -428,6 +446,11 @@ impl Session {
             StatementClass::Rollback => self.rollback(executor, out),
             _ => executor.execute(&parsed),
         };
+        // Same rule as the simple query path: what the statement remarked on goes out before what
+        // it produced.
+        for notice in executor.take_notices() {
+            warn(&notice, out);
+        }
         match outcome {
             Ok(Outcome::Rows { rows, tag, .. }) => {
                 // `Execute` sends no `RowDescription`; the client already asked for it with

@@ -415,10 +415,11 @@ pub async fn serve_on(
 /// Silences the unused-import warning for `Backend` while the executor is still unit 6's work.
 const _: Option<&dyn Backend> = None;
 
-/// The error a session executor returns until the real one lands.
+/// An executor that runs nothing, for the tests that are about the protocol alone.
 ///
-/// Contract C2 all the way to the socket: a statement we parse and cannot run is `0A000` naming
-/// the feature, never a crash and never a wrong answer.
+/// The real one is [`crate::exec::Executor`]. This one answers every statement with `0A000`
+/// naming it, which is contract C2 at the socket, and it lets a test drive a whole session --
+/// startup, transaction status, extended-protocol failure -- without a store behind it.
 #[derive(Debug, Default)]
 pub struct NotYetExecuting;
 

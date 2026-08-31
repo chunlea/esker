@@ -78,6 +78,9 @@ pub struct TableDef {
     pub primary_key: Vec<usize>,
     /// Every index, including the unique ones a `UNIQUE` constraint creates.
     pub indexes: Vec<IndexDef>,
+    /// The primary key constraint's name, which is a relation name like any other even though it
+    /// has no index behind it. It is what a `23505` on the key quotes back.
+    pub primary_key_name: String,
 }
 
 impl TableDef {
@@ -118,6 +121,16 @@ pub enum Relation {
         table_id: u64,
         /// The index's own id.
         index_id: u64,
+    },
+    /// A primary key constraint's name — `<table>_pkey`.
+    ///
+    /// It points at no index because there is none to point at: the row key *is* the primary key
+    /// (`crate::row`), so the constraint is enforced by the key space itself. The name is still
+    /// taken, though, and has to be: PostgreSQL answers `42P07` to `CREATE INDEX t_pkey ON t (a)`,
+    /// and it is the name a `23505` on the primary key quotes back.
+    PrimaryKey {
+        /// The table whose primary key it is.
+        table_id: u64,
     },
 }
 
@@ -258,7 +271,7 @@ impl View<'_> {
     pub fn table(&self, name: &str) -> Result<Option<Arc<TableDef>>> {
         match self.relation(name)? {
             Some(Relation::Table { table_id }) => self.table_by_id(table_id),
-            Some(Relation::Index { .. }) | None => Ok(None),
+            Some(Relation::Index { .. } | Relation::PrimaryKey { .. }) | None => Ok(None),
         }
     }
 
@@ -293,7 +306,10 @@ impl View<'_> {
 /// is already committed; a *concurrent* `CREATE TABLE` of the same name is caught by the write
 /// conflict on the same key, and one of the two loses at commit.
 pub fn create_table(txn: &mut dyn Txn, tenant: u64, table: &TableDef) -> Result<()> {
-    for name in std::iter::once(&table.name).chain(table.indexes.iter().map(|i| &i.name)) {
+    let names = [&table.name, &table.primary_key_name]
+        .into_iter()
+        .chain(table.indexes.iter().map(|index| &index.name));
+    for name in names {
         if txn.get(&record::name_key(tenant, name))?.is_some() {
             return Err(SqlError::DuplicateTable(name.clone()));
         }
@@ -333,6 +349,7 @@ pub fn replace_table(
 pub fn drop_table(txn: &mut dyn Txn, tenant: u64, table: &TableDef) -> Result<()> {
     txn.delete(&record::table_key(tenant, table.id));
     txn.delete(&record::name_key(tenant, &table.name));
+    txn.delete(&record::name_key(tenant, &table.primary_key_name));
     for index in &table.indexes {
         txn.delete(&record::name_key(tenant, &index.name));
     }
@@ -347,6 +364,13 @@ fn write_table(txn: &mut dyn Txn, tenant: u64, table: &TableDef) {
     txn.put(
         &record::name_key(tenant, &table.name),
         &record::encode_relation(&Relation::Table { table_id: table.id }),
+    );
+    // The primary key constraint's name is a relation name and has to be taken, even though there
+    // is no index behind it -- the row key is the primary key. PostgreSQL answers `42P07` to
+    // `CREATE INDEX t_pkey ON t (a)` and so must this.
+    txn.put(
+        &record::name_key(tenant, &table.primary_key_name),
+        &record::encode_relation(&Relation::PrimaryKey { table_id: table.id }),
     );
     for index in &table.indexes {
         txn.put(
@@ -425,6 +449,7 @@ mod tests {
                 unique: true,
                 columns: vec![1],
             }],
+            primary_key_name: "accounts_pkey".into(),
         }
     }
 
@@ -445,7 +470,11 @@ mod tests {
                 "01",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
-                "02",                 // two columns
+                // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
+                // relation name like any other and has to be reserved, even though there is no
+                // index behind it: the row key *is* the primary key.
+                "0d6163636f756e74735f706b6579",
+                "02", // two columns
                 "026964",
                 "01",
                 "01", // "id", INT8, NOT NULL
@@ -612,6 +641,7 @@ mod tests {
         let mut second = backend.begin().unwrap();
         let mut ledger = accounts(3);
         ledger.name = "ledger".into();
+        ledger.primary_key_name = "ledger_pkey".into();
         ledger.indexes[0].name = "ledger_email_key".into();
         create_table(&mut *second, 1, &ledger).unwrap();
         second.commit().unwrap();

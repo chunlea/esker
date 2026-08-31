@@ -42,6 +42,9 @@ const CORPUS: &str = include_str!("corpus/pg19.sql");
 /// the two directions stay visible: a statement that starts parsing must be delisted, and one that
 /// stops parsing must be added. Each row is a feature in `docs/plans/phase-6a.md` §9.
 const KNOWN_GAPS: &[(&str, &str)] = &[
+    // G31 -- the column-option spelling of NULLS NOT DISTINCT; the table-constraint and
+    // index spellings parse, which is what makes this one row rather than three.
+    ("CREATE TABLE t (a int8 UNIQUE NULLS NOT DISTINCT);", "G31"),
     // G01 -- partition maintenance
     (
         "ALTER TABLE t ATTACH PARTITION p FOR VALUES FROM (1) TO (10);",

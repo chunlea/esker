@@ -23,11 +23,18 @@
 //! nesting, and counting it would make us reject a statement PostgreSQL accepts, which is contract
 //! C1 broken (`docs/plans/phase-6a.md` §1). The guard may only ever err towards accepting.
 
-use sqlparser::ast::{ObjectType, Statement};
+use sqlparser::ast::{
+    ColumnOption, CreateTableOptions, DataType, ExactNumberInfo, Expr, Ident, IndexColumn,
+    IndexType, NullsDistinctOption, ObjectName, ObjectType, Statement, TableConstraint,
+    TimezoneInfo,
+};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::{Parser, ParserError};
 
+use crate::catalog::fold_identifier;
 use crate::error::{Result, SqlError};
+use crate::plan;
+use crate::value::ColumnType;
 
 /// How deep a statement may nest before it is refused with SQLSTATE `54001`.
 ///
@@ -335,6 +342,13 @@ const UNSUPPORTED: &[Unsupported] = &[
         "row-level locking with FOR NO KEY UPDATE",
         &[],
         &["FOR", "NO", "KEY", "UPDATE"],
+    ),
+    // The *column-option* spelling only. The table-constraint and index spellings parse, so
+    // they never reach the recognizer -- which is why matching the three bare words is safe.
+    u(
+        "UNIQUE NULLS NOT DISTINCT on a column",
+        &[],
+        &["NULLS", "NOT", "DISTINCT"],
     ),
     u("BETWEEN SYMMETRIC", &[], &["BETWEEN", "SYMMETRIC"]),
     u("TRIM(BOTH ...)", &[], &["TRIM", "BOTH"]),
@@ -784,6 +798,304 @@ fn dollar_quote(bytes: &[u8], start: usize) -> Option<usize> {
     }
     // Unterminated: consume the rest, and let the parser report the syntax error.
     Some(bytes.len())
+}
+
+// --- lowering: sqlparser's AST into types this crate owns ---------------------------------------
+//
+// Everything below turns the parser's tree into `crate::plan`, and it is the last place a
+// `sqlparser` type is named. Its rule is that **an unread field is a refused statement**: a clause
+// this crate cannot honour comes back as contract C2's `0A000` naming the clause, never as a
+// statement quietly executed without it. `CREATE TEMPORARY TABLE` run as a permanent table is the
+// failure this rule exists to prevent -- nothing reports it, and the next session finds a table it
+// did not expect.
+
+impl Parsed {
+    /// Lowers this statement into the plan types the executor runs, or names the construct that
+    /// stopped it (contract C2).
+    pub fn lower(&self) -> Result<plan::Statement> {
+        lower_statement(&self.statement)
+    }
+}
+
+fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
+    match statement {
+        Statement::CreateTable(create) => {
+            Ok(plan::Statement::CreateTable(lower_create_table(create)?))
+        }
+        Statement::CreateIndex(create) => {
+            Ok(plan::Statement::CreateIndex(lower_create_index(create)?))
+        }
+        Statement::Drop {
+            object_type,
+            if_exists,
+            names,
+            cascade,
+            restrict,
+            purge,
+            temporary,
+            ..
+        } => {
+            refuse_if(*cascade, "DROP ... CASCADE")?;
+            refuse_if(*restrict, "DROP ... RESTRICT")?;
+            refuse_if(*purge, "DROP ... PURGE")?;
+            refuse_if(*temporary, "DROP TEMPORARY")?;
+            let names = names.iter().map(object_name).collect::<Result<Vec<_>>>()?;
+            Ok(match object_type {
+                ObjectType::Table => plan::Statement::DropTable(plan::DropTable {
+                    names,
+                    if_exists: *if_exists,
+                }),
+                ObjectType::Index => plan::Statement::DropIndex(plan::DropIndex {
+                    names,
+                    if_exists: *if_exists,
+                }),
+                other => return Err(SqlError::unsupported(format!("DROP {other}"))),
+            })
+        }
+        Statement::Explain {
+            describe_alias,
+            analyze,
+            verbose,
+            query_plan,
+            estimate,
+            statement,
+            format,
+            options,
+        } => {
+            refuse_if(*analyze, "EXPLAIN ANALYZE")?;
+            refuse_if(*verbose, "EXPLAIN VERBOSE")?;
+            refuse_if(*query_plan, "EXPLAIN QUERY PLAN")?;
+            refuse_if(*estimate, "EXPLAIN ESTIMATE")?;
+            refuse_if(format.is_some(), "EXPLAIN (FORMAT ...)")?;
+            refuse_if(options.is_some(), "EXPLAIN with options")?;
+            let _ = describe_alias;
+            Ok(plan::Statement::Explain(Box::new(lower_statement(
+                statement,
+            )?)))
+        }
+        other => Err(SqlError::unsupported(feature_name(other))),
+    }
+}
+
+fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::CreateTable> {
+    refuse_if(create.or_replace, "CREATE OR REPLACE TABLE")?;
+    refuse_if(create.temporary, "CREATE TEMPORARY TABLE")?;
+    refuse_if(create.external, "CREATE EXTERNAL TABLE")?;
+    refuse_if(create.global.is_some(), "CREATE GLOBAL/LOCAL TABLE")?;
+    refuse_if(create.transient, "CREATE TRANSIENT TABLE")?;
+    refuse_if(create.volatile, "CREATE VOLATILE TABLE")?;
+    refuse_if(create.iceberg, "CREATE ICEBERG TABLE")?;
+    refuse_if(create.query.is_some(), "CREATE TABLE ... AS")?;
+    refuse_if(create.like.is_some(), "CREATE TABLE ... LIKE")?;
+    refuse_if(create.clone.is_some(), "CREATE TABLE ... CLONE")?;
+    refuse_if(create.inherits.is_some(), "CREATE TABLE ... INHERITS")?;
+    refuse_if(
+        create.partition_of.is_some(),
+        "CREATE TABLE ... PARTITION OF",
+    )?;
+    refuse_if(
+        create.partition_by.is_some(),
+        "CREATE TABLE ... PARTITION BY",
+    )?;
+    refuse_if(create.on_commit.is_some(), "CREATE TABLE ... ON COMMIT")?;
+    refuse_if(create.without_rowid, "CREATE TABLE ... WITHOUT ROWID")?;
+    refuse_if(create.strict, "CREATE TABLE ... STRICT")?;
+    refuse_if(create.comment.is_some(), "CREATE TABLE ... COMMENT")?;
+    refuse_if(create.order_by.is_some(), "CREATE TABLE ... ORDER BY")?;
+    refuse_if(create.cluster_by.is_some(), "CREATE TABLE ... CLUSTER BY")?;
+    refuse_if(
+        !matches!(create.table_options, CreateTableOptions::None),
+        "CREATE TABLE ... WITH",
+    )?;
+
+    let name = object_name(&create.name)?;
+    let mut columns = Vec::with_capacity(create.columns.len());
+    let mut primary_key = Vec::new();
+    let mut primary_key_name = None;
+    let mut unique = Vec::new();
+
+    for column in &create.columns {
+        let column_name = ident(&column.name);
+        let mut not_null = false;
+        for option in &column.options {
+            match &option.option {
+                ColumnOption::NotNull => not_null = true,
+                ColumnOption::Null => {}
+                ColumnOption::Unique(constraint) => {
+                    refuse_if(
+                        constraint.nulls_distinct != NullsDistinctOption::None,
+                        "UNIQUE NULLS [NOT] DISTINCT",
+                    )?;
+                    unique.push(plan::UniqueConstraint {
+                        name: option.name.as_ref().map(ident),
+                        columns: vec![column_name.clone()],
+                    });
+                }
+                ColumnOption::PrimaryKey(_) => {
+                    primary_key.push(column_name.clone());
+                    primary_key_name = primary_key_name.or_else(|| option.name.as_ref().map(ident));
+                }
+                other => return Err(SqlError::unsupported(column_option_name(other))),
+            }
+        }
+        columns.push(plan::Column {
+            name: column_name,
+            ty: lower_type(&column.data_type)?,
+            not_null,
+        });
+    }
+
+    for constraint in &create.constraints {
+        match constraint {
+            TableConstraint::PrimaryKey(key) => {
+                refuse_if(key.index_name.is_some(), "PRIMARY KEY USING INDEX")?;
+                primary_key.extend(index_columns(&key.columns)?);
+                primary_key_name = primary_key_name.or_else(|| key.name.as_ref().map(ident));
+            }
+            TableConstraint::Unique(key) => {
+                refuse_if(
+                    key.nulls_distinct != NullsDistinctOption::None,
+                    "UNIQUE NULLS [NOT] DISTINCT",
+                )?;
+                unique.push(plan::UniqueConstraint {
+                    name: key.name.as_ref().map(ident),
+                    columns: index_columns(&key.columns)?,
+                });
+            }
+            TableConstraint::ForeignKey(_) => {
+                return Err(SqlError::unsupported("FOREIGN KEY"));
+            }
+            TableConstraint::Check(_) => return Err(SqlError::unsupported("CHECK")),
+            other => {
+                return Err(SqlError::unsupported(format!(
+                    "the table constraint {other}"
+                )));
+            }
+        }
+    }
+
+    Ok(plan::CreateTable {
+        name,
+        if_not_exists: create.if_not_exists,
+        columns,
+        primary_key,
+        primary_key_name,
+        unique,
+    })
+}
+
+fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<plan::CreateIndex> {
+    refuse_if(create.concurrently, "CREATE INDEX CONCURRENTLY")?;
+    refuse_if(!create.include.is_empty(), "CREATE INDEX ... INCLUDE")?;
+    refuse_if(
+        create.nulls_distinct.is_some(),
+        "CREATE INDEX ... NULLS [NOT] DISTINCT",
+    )?;
+    refuse_if(!create.with.is_empty(), "CREATE INDEX ... WITH")?;
+    refuse_if(create.predicate.is_some(), "a partial index")?;
+    refuse_if(
+        !create.index_options.is_empty(),
+        "CREATE INDEX with options",
+    )?;
+    refuse_if(
+        !create.alter_options.is_empty(),
+        "CREATE INDEX with table options",
+    )?;
+    if let Some(using) = &create.using {
+        // Every index here is a range of the ordered key space, which is what a btree is. Saying
+        // `USING hash` and getting one would be a different index than the user asked for.
+        refuse_if(
+            !matches!(using, IndexType::BTree),
+            format!("an index USING {using}"),
+        )?;
+    }
+    Ok(plan::CreateIndex {
+        name: create.name.as_ref().map(object_name).transpose()?,
+        table: object_name(&create.table_name)?,
+        columns: index_columns(&create.columns)?,
+        unique: create.unique,
+        if_not_exists: create.if_not_exists,
+    })
+}
+
+/// The six types, under every spelling PostgreSQL accepts for them.
+fn lower_type(data_type: &DataType) -> Result<ColumnType> {
+    Ok(match data_type {
+        DataType::Int8(None) | DataType::BigInt(None) => ColumnType::Int8,
+        DataType::Text => ColumnType::Text,
+        DataType::Bool | DataType::Boolean => ColumnType::Bool,
+        DataType::Bytea => ColumnType::Bytea,
+        DataType::Float8 | DataType::DoublePrecision | DataType::Double(ExactNumberInfo::None) => {
+            ColumnType::Double
+        }
+        DataType::Timestamp(None, TimezoneInfo::Tz | TimezoneInfo::WithTimeZone) => {
+            ColumnType::TimestampTz
+        }
+        other => return Err(SqlError::unsupported(format!("the type {other}"))),
+    })
+}
+
+/// An index's columns, which must be plain names: an expression index is a different feature.
+fn index_columns(columns: &[IndexColumn]) -> Result<Vec<String>> {
+    columns
+        .iter()
+        .map(|column| {
+            refuse_if(column.operator_class.is_some(), "an index operator class")?;
+            refuse_if(
+                column.column.options.asc == Some(false),
+                "a DESC index column",
+            )?;
+            refuse_if(
+                column.column.options.nulls_first.is_some(),
+                "NULLS FIRST/LAST on an index",
+            )?;
+            refuse_if(column.column.with_fill.is_some(), "WITH FILL")?;
+            match &column.column.expr {
+                Expr::Identifier(name) => Ok(ident(name)),
+                other => Err(SqlError::unsupported(format!(
+                    "the index expression {other}"
+                ))),
+            }
+        })
+        .collect()
+}
+
+/// A name, folded and truncated the way PostgreSQL stores it. Schema qualification is refused
+/// rather than ignored: `other.t` and `t` are different tables and answering about the second
+/// would be a wrong answer, not a missing feature.
+fn object_name(name: &ObjectName) -> Result<String> {
+    match name.0.as_slice() {
+        [part] => part
+            .as_ident()
+            .map(ident)
+            .ok_or_else(|| SqlError::unsupported(format!("the name {name}"))),
+        _ => Err(SqlError::unsupported(format!("the qualified name {name}"))),
+    }
+}
+
+/// An identifier, folded unless it was quoted -- which is the only thing `quote_style` is for.
+fn ident(ident: &Ident) -> String {
+    fold_identifier(&ident.value, ident.quote_style.is_some()).0
+}
+
+fn refuse_if(condition: bool, feature: impl Into<String>) -> Result<()> {
+    if condition {
+        return Err(SqlError::unsupported(feature));
+    }
+    Ok(())
+}
+
+fn column_option_name(option: &ColumnOption) -> String {
+    match option {
+        ColumnOption::Default(_) => "DEFAULT".into(),
+        ColumnOption::ForeignKey(_) => "REFERENCES".into(),
+        ColumnOption::Check(_) => "CHECK".into(),
+        ColumnOption::Generated { .. } => "GENERATED".into(),
+        ColumnOption::Identity(_) => "IDENTITY".into(),
+        ColumnOption::Collation(name) => format!("COLLATE {name}"),
+        ColumnOption::Comment(_) => "COMMENT".into(),
+        other => format!("the column option {other}"),
+    }
 }
 
 #[cfg(test)]

@@ -443,6 +443,7 @@ documented synonyms and are now rewritten rather than refused.
 | G28 | extended statistics | 2 | `CREATE STATISTICS st ON a, b FROM t;` | admin / DDL only |
 | G29 | logical replication | 6 | `CREATE PUBLICATION pub FOR TABLE t;` | admin / DDL only |
 | G30 | foreign data wrappers | 2 | `CREATE FOREIGN TABLE ft (a int8) SERVER srv;` | admin / DDL only |
+| G31 | `UNIQUE NULLS NOT DISTINCT` as a **column option** | 1 | `CREATE TABLE t (a int8 UNIQUE NULLS NOT DISTINCT);` | **on the query path** — the table-constraint and index spellings of the same clause parse, so only this one is a gap |
 
 **Decision, for every row above:** refuse honestly, carry the gap, do not fork. The corpus keeps each statement, and
 `every_known_gap_is_still_a_gap` fails the build the day an upstream release starts parsing one, so
@@ -471,7 +472,9 @@ its own gap register, and it would be longer.
 - [x] 4 — catalog: the `'m'`-space records with a golden, the per-transaction version check,
   and a cache that cannot serve a definition from a snapshot's future
 - [x] 5 — backend trait and fake (the executor's half of the unique-index composition is unit 6)
-- [ ] 6 — planner and executor
+- [ ] 6 — planner and executor: **6a done** — the lowering out of the parser's AST, the DDL
+  executor over the catalog, `Execute` implemented and a real `psql` driving `CREATE`/`DROP`
+  against it; `INSERT`, `SELECT`, `UPDATE`, `DELETE` and the plan tree remain
 - [ ] 7 — `.slt` harness
 
 ## 10a. Handoff — where a fresh lane picks up
@@ -630,6 +633,58 @@ three of them from asking the server.
 Concurrent DDL needs nothing new: every DDL statement writes `catalog_version`, so two of them
 conflict and one is told to retry, and two `CREATE TABLE`s of one name conflict on the name key by
 the same read-then-write composition `backend.rs` documents for a unique index.
+
+**Unit 6a.** The lowering, and the DDL half of the executor. `crate::plan` holds statements in
+types this crate owns, `parse.rs` produces them (it stays the only file naming a `sqlparser` type),
+and `exec::Executor` is the `Execute` the session has been calling into a placeholder since unit 2.
+
+The rule the lowering is built on is **reject, do not ignore**. A lowered statement holds far less
+than the tree it came from, and an unread field is a clause the user wrote and the server did not
+honour — `CREATE TEMPORARY TABLE t` executed as a permanent table is a failure nothing reports.
+So every clause that changes what a statement means is named and refused with `0A000`, and
+`tests/lowering.rs` is written from that side: 28 statements, each carrying a clause phase 6a does
+not honour, each asserting its own name comes back.
+
+Running the same DDL script against a real PostgreSQL 19 and against this node found **six**
+differences, all now closed:
+
+- **`sqlparser` cannot parse `UNIQUE NULLS NOT DISTINCT` as a column option**, though it parses the
+  table-constraint and index spellings of the same clause. PostgreSQL 19 accepts all three, so this
+  was a live contract C1 violation — a `42601` about valid SQL — found by the lowering tests rather
+  than by the corpus, which had never contained the statement. It is now gap **G31** in §9, the
+  recognizer names it, and the corpus holds both spellings.
+- **`DROP TABLE` words a missing table differently from a query**: `table "x" does not exist`
+  against a query's `relation "x" does not exist`. Two conditions, not one.
+- **A name that exists and is the wrong kind is `42809`, not `42P01`** — `"t_b_key" is not a table`
+  — and `IF EXISTS` does not excuse it. Telling a user their index does not exist would send them
+  looking for the wrong bug.
+- **`CREATE INDEX ON t (a)` twice is not an error.** PostgreSQL disambiguates a name it derived
+  itself: three of them gave `t_a_idx`, `t_a_idx1`, `t_a_idx2`. A name the *user* chose still
+  collides. This had been written down as a `TODO(post-v1)` on the assumption it was cosmetic; the
+  capture showed it changes whether the statement succeeds.
+- **A key clause naming a missing column says `column "b" named in key does not exist`**, three
+  words longer than the ordinary message and pointing at the constraint rather than the column list.
+- **PostgreSQL sends a `HINT`** with the `42809`s — "Use DROP INDEX to remove an index." — and
+  `SqlError` had no way to carry one. It does now.
+
+Two decisions and one remaining divergence:
+
+- **A table must have a primary key**, because the row key *is* the primary key (`crate::row`) and
+  a table without one has no key space to live in. PostgreSQL allows it, so the answer is contract
+  C2's `0A000` naming it rather than a syntax error or a table that quietly cannot be written to.
+  `TODO(post-v1)`: an implicit row id from a per-table sequence, which is how this is usually
+  closed and which needs a sequence phase 6a does not have.
+- **The primary key constraint's name is a relation name.** `<table>_pkey` is reserved in the same
+  namespace as tables and indexes even though there is no index behind it, because PostgreSQL
+  answers `42P07` to `CREATE INDEX t_pkey ON t (a)` and because it is the name a `23505` on the key
+  will quote back. That needed a field in the catalog record, which is a format change to something
+  with a golden test — asked and approved, with the version byte left at 1 since nothing has ever
+  written those bytes to disk. A `CONSTRAINT my_pk PRIMARY KEY (a)` keeps `my_pk`; without the
+  field the name would have had to be derived, and the user's own name silently dropped.
+- **The `LINE n: ... ^` caret is the one thing still missing** from an otherwise byte-identical
+  diff against the real server. It is the `P` field, and filling it needs the parser's spans
+  carried through the lowering. `TODO(post-v1)`, and consistent with §1's existing exclusion of
+  caret positions for syntax errors.
 
 **Unit 2a.** The goldens are recorded, not written. A proxy between `psql` 18.6 and the
 PostgreSQL 19beta1 container logged both directions of five real sessions, and

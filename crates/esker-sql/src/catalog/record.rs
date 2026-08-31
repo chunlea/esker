@@ -34,6 +34,8 @@ const KIND_VERSION: u8 = b'v';
 const KIND_NEXT_ID: u8 = b's';
 const KIND_TABLE: u8 = b't';
 const KIND_NAME: u8 = b'n';
+const KIND_INDEX: u8 = b'i';
+const KIND_PRIMARY_KEY: u8 = b'p';
 
 /// Tags for [`ColumnType`] as stored. Ours rather than PostgreSQL's OIDs, because these are a
 /// format we own and must never move; the OIDs stay on the wire where they belong.
@@ -127,6 +129,8 @@ pub(super) fn encode_table(table: &TableDef) -> Vec<u8> {
     out.extend_from_slice(&table.id.to_le_bytes());
     put_str(&table.name, &mut out);
 
+    put_str(&table.primary_key_name, &mut out);
+
     varint::put_u64(table.columns.len() as u64, &mut out);
     for column in &table.columns {
         put_str(&column.name, &mut out);
@@ -157,6 +161,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
     let mut reader = Reader::new(bytes)?;
     let id = reader.u64_le()?;
     let name = reader.string()?;
+    let primary_key_name = reader.string()?;
 
     let mut columns = Vec::with_capacity(reader.count()?);
     for _ in 0..columns.capacity() {
@@ -196,6 +201,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
         columns,
         primary_key,
         indexes,
+        primary_key_name,
     })
 }
 
@@ -208,9 +214,13 @@ pub(super) fn encode_relation(relation: &Relation) -> Vec<u8> {
             out.extend_from_slice(&table_id.to_le_bytes());
         }
         Relation::Index { table_id, index_id } => {
-            out.push(b'i');
+            out.push(KIND_INDEX);
             out.extend_from_slice(&table_id.to_le_bytes());
             out.extend_from_slice(&index_id.to_le_bytes());
+        }
+        Relation::PrimaryKey { table_id } => {
+            out.push(KIND_PRIMARY_KEY);
+            out.extend_from_slice(&table_id.to_le_bytes());
         }
     }
     out
@@ -223,9 +233,12 @@ pub(super) fn decode_relation(bytes: &[u8]) -> Result<Relation> {
         KIND_TABLE => Relation::Table {
             table_id: reader.u64_le()?,
         },
-        b'i' => Relation::Index {
+        KIND_INDEX => Relation::Index {
             table_id: reader.u64_le()?,
             index_id: reader.u64_le()?,
+        },
+        KIND_PRIMARY_KEY => Relation::PrimaryKey {
+            table_id: reader.u64_le()?,
         },
         other => return Err(corrupt(format!("relation kind byte {other}"))),
     };

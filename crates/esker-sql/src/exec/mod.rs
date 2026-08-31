@@ -1,0 +1,220 @@
+//! The thing that runs statements, and the transaction each one runs in.
+//!
+//! [`Executor`] implements [`crate::pgwire::session::Execute`], which is the seam between the
+//! protocol and everything below it. One executor per connection; the store and the catalog cache
+//! behind it are shared by all of them.
+//!
+//! # Every statement is in a transaction, whether the client said so or not
+//!
+//! A statement inside a `BEGIN` block runs in the transaction that block opened. A statement
+//! outside one gets its own, committed if it succeeded and rolled back if it did not — PostgreSQL's
+//! autocommit, and the reason a single `INSERT` is atomic without anybody asking.
+//!
+//! # A lost race on a unique index is a duplicate, not a race
+//!
+//! `docs/plans/phase-6a.md` §5 rules that uniqueness composes out of a read and an ordinary write,
+//! and it leaves the executor two obligations. The first is easy: read the index key in the
+//! transaction and raise `23505` if it is there. The second is this module's, and it is the harder
+//! half — when `commit` comes back `40001`, the transaction lost a write-write race, and if the
+//! key it lost was a unique index entry then what the *user* did was insert a duplicate.
+//!
+//! Reporting that needs to know *which* constraint, and the transaction that could have told us is
+//! gone. So the executor records every unique index key it wrote, and on a `40001` it opens a
+//! fresh transaction and looks: the keys that are now present are the ones it collided with, and
+//! the first of those names the constraint. A key that is absent means nobody took it and the
+//! conflict really was an ordinary row-level race, which stays `40001` and stays retryable.
+
+mod ddl;
+
+use std::sync::Arc;
+
+use crate::backend::{Backend, Txn};
+use crate::catalog::Catalog;
+use crate::error::{Result, SqlError};
+use crate::parse::Parsed;
+use crate::pgwire::session::{Execute, Outcome};
+use crate::plan::Statement;
+
+/// Runs statements for one connection.
+#[derive(Debug)]
+pub struct Executor {
+    backend: Arc<dyn Backend>,
+    catalog: Arc<Catalog>,
+    tenant: u64,
+    /// The transaction an explicit `BEGIN` opened. `None` means the next statement gets its own.
+    open: Option<Box<dyn Txn>>,
+    /// Notices produced by the statement that just ran, waiting for the session to send them.
+    notices: Vec<SqlError>,
+}
+
+impl Executor {
+    /// An executor over a store and a shared catalog cache.
+    #[must_use]
+    pub fn new(backend: Arc<dyn Backend>, catalog: Arc<Catalog>, tenant: u64) -> Self {
+        Executor {
+            backend,
+            catalog,
+            tenant,
+            open: None,
+            notices: Vec::new(),
+        }
+    }
+
+    /// Runs `statement` in the open transaction, or in one of its own that is committed on success
+    /// and rolled back on failure.
+    fn in_a_transaction(&mut self, statement: &Statement) -> Result<Outcome> {
+        if let Some(mut txn) = self.open.take() {
+            let outcome = self.run(&mut *txn, statement);
+            self.open = Some(txn);
+            return outcome;
+        }
+
+        let mut txn = self.backend.begin()?;
+        let mut written = Written::default();
+        match self.run_recording(&mut *txn, statement, &mut written) {
+            Ok(outcome) => match txn.commit() {
+                Ok(_) => Ok(outcome),
+                Err(error) => Err(self.explain_conflict(error, &written)),
+            },
+            Err(error) => {
+                // The rollback's own failure is not what the client asked about; the statement's
+                // error is. Reporting the second would hide the first.
+                let _ = txn.rollback();
+                Err(error)
+            }
+        }
+    }
+
+    fn run(&mut self, txn: &mut dyn Txn, statement: &Statement) -> Result<Outcome> {
+        self.run_recording(txn, statement, &mut Written::default())
+    }
+
+    fn run_recording(
+        &mut self,
+        txn: &mut dyn Txn,
+        statement: &Statement,
+        written: &mut Written,
+    ) -> Result<Outcome> {
+        let _ = written;
+        match statement {
+            Statement::CreateTable(create) => ddl::create_table(self, txn, create),
+            Statement::DropTable(drop) => ddl::drop_table(self, txn, drop),
+            Statement::CreateIndex(create) => ddl::create_index(self, txn, create),
+            Statement::DropIndex(drop) => ddl::drop_index(self, txn, drop),
+            Statement::Explain(inner) => Ok(Self::explain(inner)),
+        }
+    }
+
+    /// `EXPLAIN`: the plan, as rows, and nothing run.
+    fn explain(statement: &Statement) -> Outcome {
+        Outcome::Rows {
+            fields: vec![crate::pgwire::message::FieldDescription::computed(
+                "QUERY PLAN",
+                crate::value::ColumnType::Text,
+            )],
+            rows: explain_lines(statement)
+                .into_iter()
+                .map(|line| vec![Some(line.into_bytes())])
+                .collect(),
+            tag: "EXPLAIN".to_owned(),
+        }
+    }
+
+    /// Turns a `40001` from `commit` into the `23505` it is, when the key that lost was a unique
+    /// index entry. See the module docs for why this needs a second look at the store.
+    fn explain_conflict(&self, error: SqlError, written: &Written) -> SqlError {
+        if !matches!(error, SqlError::SerializationFailure(_)) || written.unique_keys.is_empty() {
+            return error;
+        }
+        let Ok(txn) = self.backend.begin() else {
+            return error;
+        };
+        for (key, constraint) in &written.unique_keys {
+            if matches!(txn.get(key), Ok(Some(_))) {
+                return SqlError::UniqueViolation(constraint.clone());
+            }
+        }
+        // Nobody took any of them: an ordinary row-level race, and still retryable.
+        error
+    }
+
+    /// Adds a notice for the session to send before this statement's `CommandComplete`.
+    fn notice(&mut self, notice: SqlError) {
+        self.notices.push(notice);
+    }
+
+    /// This transaction's view of the catalog, pinned to one version.
+    fn catalog_view<'a>(&'a self, txn: &'a dyn Txn) -> Result<crate::catalog::View<'a>> {
+        self.catalog.view(txn, self.tenant)
+    }
+
+    /// A table by name, or `42P01`.
+    fn require_table(&self, txn: &dyn Txn, name: &str) -> Result<Arc<crate::catalog::TableDef>> {
+        self.catalog_view(txn)?.require_table(name)
+    }
+
+    /// A table by id. A name that resolved to an id whose record is missing is corruption, not a
+    /// missing table: the two keys are written by one transaction.
+    fn table_by_id(&self, txn: &dyn Txn, table_id: u64) -> Result<Arc<crate::catalog::TableDef>> {
+        self.catalog_view(txn)?
+            .table_by_id(table_id)?
+            .ok_or_else(|| {
+                SqlError::DataCorrupted(format!(
+                    "a name points at table {table_id}, which is not there"
+                ))
+            })
+    }
+}
+
+/// What a statement wrote that changes how a failed commit should be reported.
+#[derive(Debug, Default)]
+struct Written {
+    /// Unique index entries, with the constraint each one belongs to.
+    unique_keys: Vec<(Vec<u8>, String)>,
+}
+
+/// The `EXPLAIN` output for a statement. One line per plan node, indented by depth, which is the
+/// shape `psql` renders and users read.
+fn explain_lines(statement: &Statement) -> Vec<String> {
+    match statement {
+        Statement::CreateTable(create) => vec![format!("Create Table on {}", create.name)],
+        Statement::DropTable(drop) => vec![format!("Drop Table on {}", drop.names.join(", "))],
+        Statement::CreateIndex(create) => vec![format!("Create Index on {}", create.table)],
+        Statement::DropIndex(drop) => vec![format!("Drop Index on {}", drop.names.join(", "))],
+        // `EXPLAIN EXPLAIN ...` is not something PostgreSQL's grammar admits, so this is
+        // unreachable through the parser and is written as a value rather than a panic anyway.
+        Statement::Explain(_) => vec!["Explain".to_owned()],
+    }
+}
+
+impl Execute for Executor {
+    fn execute(&mut self, parsed: &Parsed) -> Result<Outcome> {
+        let statement = parsed.lower()?;
+        self.in_a_transaction(&statement)
+    }
+
+    fn take_notices(&mut self) -> Vec<SqlError> {
+        std::mem::take(&mut self.notices)
+    }
+
+    fn begin(&mut self) -> Result<()> {
+        // A second `BEGIN` never reaches here: the session answers it with PostgreSQL's warning
+        // and leaves the block alone.
+        self.open = Some(self.backend.begin()?);
+        Ok(())
+    }
+
+    fn commit(&mut self) -> Result<()> {
+        let Some(txn) = self.open.take() else {
+            return Ok(());
+        };
+        txn.commit().map(|_| ())
+    }
+
+    fn rollback(&mut self) -> Result<()> {
+        let Some(txn) = self.open.take() else {
+            return Ok(());
+        };
+        txn.rollback()
+    }
+}

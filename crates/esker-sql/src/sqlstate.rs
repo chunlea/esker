@@ -13,6 +13,15 @@
 /// A SQLSTATE is always exactly five characters.
 pub const LEN: usize = 5;
 
+// --- Class 00 — Successful Completion ---
+
+/// Not an error. It rides on a `NoticeResponse`, which is how PostgreSQL says
+/// `table "t" does not exist, skipping` for a `DROP TABLE IF EXISTS` that did nothing — the
+/// statement succeeded and the notice is the whole of what happened. Captured, because the
+/// symmetric notice (`relation "t" already exists, skipping`) carries `42P07` instead, and the
+/// asymmetry is not something a reading would have produced.
+pub const SUCCESSFUL_COMPLETION: &str = "00000";
+
 // --- Class 08 — Connection Exception ---
 
 /// The frontend sent something the protocol does not allow.
@@ -76,6 +85,12 @@ pub const INVALID_PASSWORD: &str = "28P01";
 /// The role does not exist, or is not permitted to connect.
 pub const INVALID_AUTHORIZATION_SPECIFICATION: &str = "28000";
 
+// --- Class 2B — Dependent Privilege/Object Still Exist ---
+
+/// Something else needs the object being dropped — `DROP INDEX t_pkey` when a primary key
+/// constraint is what put that index there.
+pub const DEPENDENT_OBJECTS_STILL_EXIST: &str = "2BP01";
+
 // --- Class 34 — Invalid Cursor Name ---
 
 /// `Bind`/`Execute`/`Close` naming a portal that does not exist.
@@ -110,12 +125,19 @@ pub const DUPLICATE_COLUMN: &str = "42701";
 pub const DUPLICATE_OBJECT: &str = "42710";
 /// An index name that resolves to nothing.
 pub const UNDEFINED_OBJECT: &str = "42704";
+/// A name that exists and is the wrong kind of thing — `DROP TABLE` naming an index. Not
+/// `42P01`: the object is there, it is just not what the statement can act on. Captured, because
+/// collapsing the two would tell a user their index does not exist.
+pub const WRONG_OBJECT_TYPE: &str = "42809";
 /// An operator or function applied to types it is not defined for.
 pub const DATATYPE_MISMATCH: &str = "42804";
 /// No such function.
 pub const UNDEFINED_FUNCTION: &str = "42883";
 /// A table definition that cannot be built — no primary key, in our case.
 pub const INVALID_TABLE_DEFINITION: &str = "42P16";
+/// An identifier longer than 63 bytes. A *notice*, not an error: PostgreSQL truncates and carries
+/// on, so a client that treated this as a failure would disagree with every other one.
+pub const NAME_TOO_LONG: &str = "42622";
 
 // --- Class 53 — Insufficient Resources ---
 
@@ -188,6 +210,10 @@ mod tests {
             super::INVALID_AUTHORIZATION_SPECIFICATION,
         ),
         ("INVALID_CURSOR_NAME", super::INVALID_CURSOR_NAME),
+        (
+            "DEPENDENT_OBJECTS_STILL_EXIST",
+            super::DEPENDENT_OBJECTS_STILL_EXIST,
+        ),
         ("INVALID_CATALOG_NAME", super::INVALID_CATALOG_NAME),
         ("SYNTAX_ERROR", super::SYNTAX_ERROR),
         ("UNDEFINED_COLUMN", super::UNDEFINED_COLUMN),
@@ -196,9 +222,12 @@ mod tests {
         ("DUPLICATE_COLUMN", super::DUPLICATE_COLUMN),
         ("DUPLICATE_OBJECT", super::DUPLICATE_OBJECT),
         ("UNDEFINED_OBJECT", super::UNDEFINED_OBJECT),
+        ("WRONG_OBJECT_TYPE", super::WRONG_OBJECT_TYPE),
         ("DATATYPE_MISMATCH", super::DATATYPE_MISMATCH),
         ("UNDEFINED_FUNCTION", super::UNDEFINED_FUNCTION),
         ("INVALID_TABLE_DEFINITION", super::INVALID_TABLE_DEFINITION),
+        ("NAME_TOO_LONG", super::NAME_TOO_LONG),
+        ("SUCCESSFUL_COMPLETION", super::SUCCESSFUL_COMPLETION),
         (
             "CONFIGURATION_LIMIT_EXCEEDED",
             super::CONFIGURATION_LIMIT_EXCEEDED,
@@ -236,9 +265,16 @@ mod tests {
     }
 
     /// Class 00 means success. An error that reported one would be read as "no error".
+    ///
+    /// `SUCCESSFUL_COMPLETION` is the one code that is *meant* to be in it, because PostgreSQL
+    /// really does send `00000` on a `NoticeResponse` for a `DROP ... IF EXISTS` that skipped. It
+    /// is exempt by name rather than by omission, so the exemption is visible.
     #[test]
     fn no_error_is_in_the_success_class() {
         for (name, code) in ALL {
+            if *name == "SUCCESSFUL_COMPLETION" {
+                continue;
+            }
             assert_ne!(&code[..2], "00", "{name} is in the success class");
         }
     }
