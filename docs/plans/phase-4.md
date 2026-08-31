@@ -1219,3 +1219,50 @@ twice — 5 of 8 green with, 4 of 6 without — which is noise, so the change wa
 times** rather than shipped on the strength of a plausible story. The argument for it stands and is
 recorded here: a peer that is behind necessarily holds a stale epoch, so dropping its replies is
 circular. Something else has to distinguish the two before it is worth making.
+
+## 19.5 The epoch check on Raft delivery: confirmed as a defect, refuted as *the* cause
+
+The §19.4 experiment was underpowered, as ruled. Redone properly, and the answer has two halves
+that must not be run together.
+
+### The defect is real, and it is `conf_ver`
+
+Tracing a stalled run to the message level shows the mechanism directly rather than by inference.
+The stuck learner's region logged nothing but this, repeated indefinitely:
+
+    dropped a Raft message from a stale epoch
+        region_id=15 theirs=Epoch { conf_ver: 3, version: 6 } ours=Epoch { conf_ver: 4, version: 6 }
+
+One `conf_ver` apart — from the promotion that peer had not applied. §4.1 puts a configuration in
+force at the **append**, and each peer applies it when its own log reaches it, so peers on different
+`conf_ver`s is not a fault but the normal transient state of a membership change. The check turned
+that transient into a permanent partition: the lagging peer's traffic was dropped, so it never
+received what would have let it apply the change, so its `conf_ver` never moved. `applied` stayed at
+exactly 0 for the whole run.
+
+The line is now drawn where TiKV draws it. **Epoch guards belong on client requests and admin
+proposals**, where a stale epoch means the caller is addressing a range this store no longer owns.
+Between a region's own peers, the region id says which region, the peer id says which replica, and
+staleness within a group is what Raft's term and index rules exist to settle.
+
+`a_raft_message_from_a_peer_a_conf_change_behind_is_still_delivered` pins it deterministically —
+no cluster, no timing — and is mutation-checked: restoring the check turns it red.
+
+### It is *not* the cause of the remaining stall
+
+With the check removed the repro passes **13 of 20**, which is what it passed *with* the check. So
+this defect is real and worth fixing on its own merits, and it is **not** what the residual stall is
+made of. There is at least one more.
+
+### The pass-rate instrument is exhausted
+
+The same variant measured 17/20, then 8/14, then 5/5, then 13/20 across the day — the same code
+spanning 36% to 100%. That variance is the machine, and it means this instrument cannot resolve
+effects of the size being looked for, however large `n` gets within an affordable run. Two more
+sampling rounds would buy nothing.
+
+**The next step has to be a deterministic reproduction of the remaining stall**, the way
+`a_raft_message_from_a_peer_a_conf_change_behind_is_still_delivered` is deterministic for this one:
+take the stalled state observed in a trace, build it directly, and assert the peer recovers. Every
+defect this family has given up has been found by a trace and pinned by a unit test; none of them
+was found by counting runs.

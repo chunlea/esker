@@ -1430,25 +1430,28 @@ impl Store {
                 );
                 continue;
             };
-            // Invariant 5, applied to Raft traffic. A batch carries messages for many regions
-            // now, so the epoch it is checked against is the one of the region it names — not
-            // the store's, which is not a thing a store has.
+            // **No epoch check here.** Invariant 5 guards *client* requests and admin proposals,
+            // where a stale epoch means the caller is addressing a range this store no longer
+            // owns. Raft traffic between a region's own peers is a different question: the region
+            // id says which region, the peer id says which replica, and staleness within a group
+            // is what Raft's own term and index rules exist to settle.
             //
-            // A behind peer necessarily holds a stale epoch — that is what being behind means —
-            // so this drops its replies and is arguably circular: a stalled learner was observed
-            // at `applied=0` and version 6 while its leader was healthy at version 7. Removing the
-            // check was measured twice, at 4/6 and 5/8 runs green against 4/6 without it, which is
-            // noise. Kept as it is until something distinguishes them (`docs/plans/phase-4.md`
-            // §19).
-            if message.epoch.is_stale_against(state.region().epoch) {
-                tracing::debug!(
-                    region_id = message.region_id,
-                    theirs = ?message.epoch,
-                    ours = ?state.region().epoch,
-                    "dropped a Raft message from a stale epoch"
-                );
-                continue;
-            }
+            // Checking it here converts a *transient* disagreement into a permanent partition. A
+            // conf change takes effect at different times on different peers by design, so a peer
+            // that has not yet applied one stamps the `conf_ver` it has — and a peer that has
+            // applied it then drops those messages, which is precisely what stops the first one
+            // ever applying it. It cannot catch up until its traffic is accepted, and its traffic
+            // is not accepted until it has caught up.
+            //
+            // Observed, not inferred (`docs/plans/phase-4.md` §19.5): a learner stuck at
+            // `applied=0` for the whole run, with its region's log carrying nothing but
+            //
+            //     dropped a Raft message from a stale epoch
+            //         theirs=Epoch { conf_ver: 3, version: 6 }
+            //         ours=Epoch { conf_ver: 4, version: 6 }
+            //
+            // repeated indefinitely — one `conf_ver` apart, from the promotion that peer had not
+            // applied and now never could.
             let Some(peer) = state.peer() else {
                 tracing::debug!(
                     region_id = message.region_id,

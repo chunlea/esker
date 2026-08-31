@@ -550,3 +550,80 @@ fn a_store_without_a_placement_driver_reports_to_nobody() {
     assert!(report.regions[0].is_leader);
     assert_eq!(report.capacity, 0, "4a reports a placeholder, and says so");
 }
+
+/// A Raft message stamped with an older `conf_ver` than this peer's record is **delivered**, not
+/// dropped.
+///
+/// Invariant 5 guards client requests, where a stale epoch means the caller is addressing a range
+/// this store no longer owns. It does not belong on Raft traffic between a region's own peers, and
+/// phase-4 acceptance is what that cost. A conf change takes effect at different times on different
+/// peers *by design* — §4.1 puts it in force at the append, and each peer applies it when its own
+/// log gets there — so a peer that has not yet applied one stamps the `conf_ver` it has. Dropping
+/// those messages is what stops it ever applying the change: it cannot catch up until its traffic
+/// is accepted, and its traffic was not accepted until it had caught up.
+///
+/// The observed shape was a learner stuck at `applied = 0` for a whole run, its region's log
+/// carrying nothing but `dropped a Raft message from a stale epoch, theirs conf_ver 3, ours
+/// conf_ver 4` — one conf change apart, from a promotion it had not applied and now never could.
+///
+/// A message from a *higher term* is the probe here, because stepping one is observable from
+/// outside: the peer adopts the term. A dropped message leaves it where it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_raft_message_from_a_peer_a_conf_change_behind_is_still_delivered() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(
+        dir.path(),
+        StoreOptions {
+            raft: Some(esker_store::server::RaftOptions::new(
+                vec![esker_store::PeerAddress::new(
+                    1,
+                    1,
+                    "127.0.0.1:1".parse().unwrap(),
+                )],
+                7,
+            )),
+            ..StoreOptions::new()
+        },
+    )
+    .unwrap();
+
+    let region = store.regions().regions()[0].clone();
+    let peer = store.peer_of(region.id).expect("the region is replicated");
+    let before = peer.status().await.unwrap().term;
+
+    // The sender is one conf change behind this store's record, which is exactly what a peer that
+    // has not yet applied a membership change looks like.
+    let theirs = Epoch::new(
+        region.epoch.conf_ver.saturating_sub(1),
+        region.epoch.version,
+    );
+    assert!(
+        theirs.is_stale_against(region.epoch),
+        "the test must actually be sending a stale epoch"
+    );
+
+    let message = esker_raft::Message::AppendEntries {
+        from: 9,
+        to: region.peers[0].peer_id,
+        term: before + 5,
+        prev_log_index: 0,
+        prev_log_term: 0,
+        entries: Vec::new(),
+        leader_commit: 0,
+        context: Bytes::new(),
+    };
+    store
+        .receive_raft(esker_proto::RaftBatch::new(vec![
+            esker_proto::RaftMessage::new(region.id, theirs, 9, message),
+        ]))
+        .await
+        .expect("a batch from a peer that is behind is not an error");
+
+    let after = peer.status().await.unwrap().term;
+    assert_eq!(
+        after,
+        before + 5,
+        "the message was dropped, so a peer one conf change behind can never catch up"
+    );
+    store.stop();
+}
