@@ -342,3 +342,238 @@ the number does not.
   scan that exists.
 * The differential test ADR 0022 asks for — every query answered both ways and compared — cannot
   be written until there is a query. It is milestone 2's first deliverable, not its last.
+
+---
+
+# Milestone 2 — the scan path and the fragment, locally
+
+[ADR 0022](../adr/0022-columnar-learner-replica.md) "Milestones" item **2**, and only item 2:
+*"a scan path and the fragment protocol, evaluated locally against that format, with the
+differential test against the row engine standing up from the first query."*
+
+M1 is accepted and the format is frozen. This milestone makes it answer questions.
+
+## What this phase is
+
+A **fragment** is a piece of a plan — a table, a key range, a projection, a filter over the
+projected columns, and a set of aggregates with an optional grouping. ADR 0022 decision 3 puts it
+on the seam `TxnKvReq::Scan` already establishes: a request that carries work rather than a range,
+and returns what the work produced rather than what it read. This phase defines the fragment's
+bytes and evaluates one **locally**, against a columnar file, with no service and no wire.
+
+The load-bearing unit is not the evaluator. It is the **differential harness**: a second,
+deliberately naive interpreter that answers the same fragment by materialising every row and
+looping over it, and a proptest that generates fragments until the two disagree. ADR 0022 names
+the two engines disagreeing as the worst failure this feature can have, "because it is silent",
+and says the defence "has to be built *before* the routing rule and not after". This is that
+defence, built one milestone before there is a routing rule to defend.
+
+## Scope
+
+In:
+
+1. The fragment as a **format**: version byte, hand-written little-endian body, CRC32C, golden.
+   Unknown version, node tag, operator or aggregate refuses the **whole** fragment.
+2. A local evaluator: stripe pruning from M1's statistics, decoding only projected columns,
+   three-valued filtering, and partial aggregates.
+3. The differential harness, and the generated-fragment proptest behind it.
+4. A fragment-decoder fuzz, and the M1 file fuzz extended to run fragments against mutated files.
+5. `docs/bench/columnar-m2.md`: scan throughput, the projection effect, the pruning effect, and
+   M1's compression table, which owed itself a bench home.
+6. One new `docs/DESIGN.md` section.
+
+Out — named so nobody looks for them:
+
+- **No wire service.** The fragment's bytes are defined here and `esker-proto` is another lane's;
+  what it must add is a report item, not a commit. Nothing here opens a socket.
+- **No planner routing, no cost rule, no `EXPLAIN`, no session GUC.** ADR 0022 milestone 4.
+- **No learner feed and no tiering rewrite.** Milestone 3 picks one; this phase feeds neither.
+- **No MPP, no exchange.** Milestone 5, and only if measured.
+- **No cross-file or cross-region combination.** A fragment is evaluated against one file. The
+  two-level finish belongs to whatever calls many of them, and the float-association question it
+  raises is recorded below rather than answered here.
+- **No `ORDER BY`, `LIMIT` on aggregates, `HAVING`, `DISTINCT`, joins or arithmetic.** The
+  fragment is scan, filter, project, aggregate, exactly as ADR 0022 scopes it. `LIMIT` exists on
+  the row output only, where it is a bound on work rather than an operator.
+
+## The correction M2 forces on M1
+
+**M1's floating-point statistics are unsound for pruning in this system, and the differential
+harness is what would have found it.** M1 took Parquet's rule — exclude `NaN` from `min`/`max` —
+and Parquet is right, for IEEE semantics, where every comparison with `NaN` is false and a `NaN`
+row can never match a range predicate.
+
+This system does not have IEEE semantics. `esker_sql::value::Datum::pg_cmp` implements
+PostgreSQL's ordering, where **`NaN` is greater than every other float, `Infinity` included, and
+equal to itself** — measured against a real server, and the reason `WHERE x > 5` genuinely
+matches a `NaN` row. So a chunk holding `[1.0, NaN]` gets `max = 1.0` under M1's rule, a pruner
+skips it for `x > 5`, and the `NaN` row is lost. A missing row, silently, which is the exact
+failure mode the statistics were tested so hard against.
+
+The fix is one line of principle: **bounds are computed in the ordering the query engine uses.**
+`NaN` is therefore the maximum, and `min` is `NaN` only when every value present is one. The
+signed-zero rule survives unchanged. No golden byte moves — the golden corpus contains no `NaN` —
+and ADR 0027 is amended, because the rule it records is the wrong one. It lands before the pruner,
+so the pruner is never briefly built on it.
+
+## The fragment
+
+A message, not a file: no magic and no trailer, because it arrives inside a frame that already
+said how long it is.
+
+```text
+fragment := version:u8 ++ body ++ crc32c:u32          the CRC covers version ++ body
+body     := table ++ range ++ projection ++ filter ++ output
+
+table      := tenant:varint ++ table_id:varint
+range      := start_len:varint ++ start ++ end_len:varint ++ end
+projection := count:varint ++ column:varint *          indexes into the file's schema
+filter     := present:u8 ++ [expr]
+output     := kind:u8 ++ (rows | aggregates)
+  rows       := limit:varint                           0 means unbounded
+  aggregates := group_count:varint ++ slot:varint *
+             ++ agg_count:varint ++ (kind:u8 ++ [slot:varint]) *
+
+expr := node:u8 ++ ...
+  1 Column  ++ slot:varint
+  2 Literal ++ type_tag:u8 ++ value                    type_tag 0 is NULL, 1..6 are M1's tags
+  3 Compare ++ op:u8 ++ expr ++ expr                   1 =, 2 <>, 3 <, 4 <=, 5 >, 6 >=
+  4 And     ++ expr ++ expr
+  5 Or      ++ expr ++ expr
+  6 Not     ++ expr
+  7 IsNull  ++ negated:u8 ++ expr
+```
+
+**Everything after the projection refers to projection *slots*, never to table columns.** A filter
+cannot name a column the projection did not ask for, which makes "decode only what was projected"
+a property of the format rather than a discipline the evaluator has to keep. It is also what makes
+the invocation-counting test below meaningful rather than decorative.
+
+**The expression tree has a depth limit** (32), enforced while decoding. A recursive decoder
+without one is a stack overflow reachable from a wire message, which is a panic on untrusted input
+by another name (invariant 9).
+
+### Refuse, never partially honour
+
+ADR 0022 decision 3 and `crate::plan`'s own rule. A fragment this build cannot evaluate comes back
+as `Error::Refused` — a new variant, distinct from `Corruption` (the bytes are damaged) and from
+`InvalidArgument` (the caller of this crate made a mistake) — and the caller falls back to a row
+scan. Refused, specifically:
+
+* an unknown version byte, node tag, comparison operator, aggregate kind or output kind;
+* a projection slot, group slot or aggregate slot outside the projection;
+* a column index outside the file's schema;
+* `sum` of anything but `int8` or `double`;
+* **a key range that is not unbounded.** A columnar file records no key range, so this build
+  cannot honour one. Carrying the field and ignoring it is precisely the defect the rule exists
+  for; M3 gives the field meaning, and until then a bounded range is refused.
+
+## Aggregate semantics, which the row side does not have
+
+`crates/esker-sql/src/parse/lower.rs` refuses `GROUP BY`, `HAVING` and `SELECT DISTINCT` with
+`0A000`, and `crate::plan::Expr` has no function node at all: **there are no aggregates on the row
+side to match.** So they are defined here, against PostgreSQL rather than against a sibling, and
+the differential harness tests both sides against the definition.
+
+| Rule | Why |
+|---|---|
+| `count(*)` counts rows, including all-NULL ones | PostgreSQL |
+| `count(col)` skips NULLs | PostgreSQL |
+| `sum`, `min`, `max` over no rows or only NULLs are **NULL**, not zero | PostgreSQL; a zero here is a wrong answer that looks like data |
+| `min`/`max` order by `pg_cmp` — `NaN` largest, `-0.0 == 0.0`, text by bytes | the ordering everything else in this system uses |
+| grouping identity is `pg_cmp` equality; NULL forms one group of its own | PostgreSQL's `GROUP BY`; `pg_cmp` makes NULL equal only to NULL |
+| groups come back in `pg_cmp` order of their keys, and a group's key is the first one seen | determinism, which a byte-comparing harness requires |
+| `sum(int8)` overflowing is a typed error on both sides | **a declared divergence.** PostgreSQL's `sum(bigint)` returns `numeric` and cannot overflow; phase 6a has no `numeric` (ADR: `crate::plan::expr` refuses decimal-to-`int8` for the same reason). Returning a wrapped number would be silently wrong, so it is `Error::Overflow` |
+| `sum(double)` accumulates left to right in **row order across the whole file** | so that a fragment's answer does not depend on where stripe boundaries fell |
+
+That last row is the one to read twice. Floating-point addition is not associative, so summing per
+stripe and adding the partials gives a different answer from a flat fold. This phase therefore
+keeps **one accumulator per group across every stripe** rather than combining per-stripe partials
+— the result is a flat left fold in row order, which the reference reproduces exactly. Combining
+partials *between files* changes the answer, and that is milestone 4's problem to state; it is
+recorded here so it is a decision there rather than a discovery.
+
+## Pruning, and why it is sound
+
+For each stripe, each **top-level conjunct** of the filter is tested against the chunk statistics
+of the column it names. Only conjunctions count — a comparison under an `OR` constrains nothing —
+which is the same rule `esker_sql::exec::query` applies to required constants, arrived at
+independently and for the same reason.
+
+```text
+col < lit  or  col <= lit     skip when lit is below min
+col > lit  or  col >= lit     skip when lit is above max
+col =  lit                    skip when lit is outside [min, max]
+any comparison                skip when the chunk is entirely NULL
+IS NULL                       skip when null_count is 0
+IS NOT NULL                   skip when null_count is the row count
+```
+
+Soundness rests on one fact: **truncation only ever widens a bound.** A truncated minimum sorts at
+or below the true minimum and a truncated maximum at or above the true maximum, so a range that
+excludes the whole widened interval excludes the true one. No rule above concludes *equality* from
+a bound, which is the one thing a widened bound cannot support and the reason M1 wrote the
+truncation flags.
+
+Two tests hold it, because an argument is not a proof:
+
+* **Pruning off must equal pruning on**, over every generated fragment in the differential
+  proptest. A pruner that lies fails here immediately.
+* **Pruning must actually happen**: a corpus and a fragment where the stripes read are provably
+  fewer than the stripes present, so a pruner that silently stopped pruning is caught too.
+
+## Files
+
+```text
+crates/esker-columnar/src/
+    fragment/mod.rs     Fragment, Output, Aggregate — the type and its validation
+    fragment/expr.rs    Expr, CompareOp, Literal, and pg_cmp over this crate's values
+    fragment/codec.rs   encode / decode, the depth limit, the CRC
+    scan.rs             evaluate(): prune, decode, filter, aggregate
+    scan/group.rs       GroupKey, Partial, and how partials combine
+    reader.rs           + ScanStats: stripes considered, stripes read, chunks decoded
+    stats.rs            (amended) bounds in pg_cmp order
+crates/esker-columnar/tests/
+    fragment_golden.rs  frozen fragment bytes, and every way one is refused
+    differential.rs     the reference interpreter, and the generated-fragment proptest
+    scan.rs             pruning on == pruning off, pruning happens, projection is respected
+    fuzz_decode.rs      (extended) fragments into mutated files
+```
+
+## Tests
+
+| Kind | What it holds |
+|---|---|
+| Fragment golden | frozen bytes for a realistic fragment; a change is a format change |
+| Refusal | every unknown tag, every out-of-range slot, a bounded key range, `sum(text)` — each refusing the whole fragment |
+| Differential, hand-written | the nasty corpus: NULLs everywhere, `NaN`, `-0.0`, both infinities, `i64::MIN`/`MAX`, empty strings, groups that come out empty |
+| Differential, generated | random projections, filters and groupings over a seeded mixed corpus, columnar against the reference, **including the error case** — both sides must fail the same way |
+| Pruning soundness | pruning on equals pruning off, over the same generated fragments |
+| Pruning efficacy | a stripe that is provably skipped |
+| Projection | untouched columns are never decoded, by counting decoder invocations |
+| Fuzz | arbitrary bytes into the fragment decoder; fragments against mutated files |
+
+## Risks
+
+* **The two engines disagreeing is the failure this phase exists to prevent**, and a harness that
+  shares code with what it checks does not prevent it. The reference shares exactly one thing with
+  the evaluator: `pg_cmp`, which is the *specification* and not an implementation. Everything
+  else — scanning, pruning, decoding, grouping, accumulating — is written twice.
+* **Floating point in the harness.** Comparing sums with `==` would pass on `NaN` by accident and
+  fail on `-0.0` by accident. The harness compares by bits, as M1's `Column::identical` does.
+* **A generated fragment that is always refused proves nothing.** The generator draws from the
+  file's own schema so that most fragments are evaluable, and the proptest asserts a floor on how
+  many actually ran.
+* **The depth limit is a stack overflow if it is wrong.** It is enforced in the decoder, where the
+  recursion starts, and the fuzz feeds deliberately nested bytes.
+
+## Not doing, restated
+
+No wire service, no `esker-proto`, no planner routing, no learner feed, no tiering rewrite, no
+MPP, no cross-file combination, no new dependency, and no edit outside
+`crates/esker-columnar/**`, this file, `docs/bench/columnar-m2.md`, one new `docs/DESIGN.md`
+section, and an amendment to ADR 0027.
+
+## M2 — what changed while building
+
+*(Filled in as the units land.)*
