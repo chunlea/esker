@@ -87,6 +87,12 @@ impl StandIn {
                 PdResp::AllocId { start, count }
             }
             PdReq::Tso { count } => PdResp::Tso { start_ts: 1, count },
+            // ADR 0020's lease; this stand-in answers a fixed one and removes nothing.
+            PdReq::SchemaLease => PdResp::SchemaLease {
+                lease_ms: 1_000,
+                step_interval_ms: 1_500,
+                removal_extra_ms: 0,
+            },
         }
     }
 }
