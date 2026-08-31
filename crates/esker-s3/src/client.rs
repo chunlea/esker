@@ -432,7 +432,7 @@ impl ObjectStore for S3Client {
             }
             let response = self.send("ListObjectsV2", prefix, request)?;
             let body = String::from_utf8_lossy(&response.body).into_owned();
-            let (page, next) = parse_list_page(&body);
+            let (page, next) = xml::parse_list_page(&body);
             summaries.extend(page);
 
             match next {
@@ -472,37 +472,10 @@ fn parse_content_range(header: Option<&str>) -> Option<(u64, u64)> {
     Some((first.trim().parse().ok()?, total.trim().parse().ok()?))
 }
 
-/// One page of a `ListObjectsV2` response: its objects and the token for the next page.
-fn parse_list_page(body: &str) -> (Vec<ObjectSummary>, Option<String>) {
-    let mut summaries = Vec::new();
-    let mut cursor = 0usize;
-    while let Some((contents, next)) = xml::element(body, "Contents", cursor) {
-        cursor = next;
-        let key = xml::element(contents, "Key", 0).map(|(text, _)| xml::unescape(text));
-        let Some(key) = key else { continue };
-        let size = xml::element(contents, "Size", 0)
-            .and_then(|(text, _)| text.trim().parse().ok())
-            .unwrap_or(0);
-        let etag = xml::element(contents, "ETag", 0)
-            .map(|(text, _)| xml::normalise_etag(text))
-            .unwrap_or_default();
-        summaries.push(ObjectSummary { key, size, etag });
-    }
-
-    // The token only counts when the listing says it is truncated: S3 omits the element on the
-    // last page, but a gateway that sends an empty one would otherwise loop us.
-    let truncated = xml::element(body, "IsTruncated", 0)
-        .is_some_and(|(text, _)| text.trim().eq_ignore_ascii_case("true"));
-    let next = xml::element(body, "NextContinuationToken", 0)
-        .map(|(text, _)| xml::unescape(text))
-        .filter(|token| truncated && !token.is_empty());
-    (summaries, next)
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{Config, Endpoint, S3Client, parse_content_range, parse_list_page};
+    use super::{Config, Endpoint, S3Client, parse_content_range};
     use crate::error::Error;
     use crate::http::Response;
     use crate::sigv4::Credentials;
@@ -778,41 +751,6 @@ mod tests {
         assert_eq!(parse_content_range(Some("items 0-4/11")), None);
         assert_eq!(parse_content_range(Some("nonsense")), None);
         assert_eq!(parse_content_range(None), None);
-    }
-
-    #[test]
-    fn a_listing_page_is_scanned_for_what_it_holds() {
-        let body = "<?xml version=\"1.0\"?>\
-            <ListBucketResult>\
-              <IsTruncated>true</IsTruncated>\
-              <NextContinuationToken>tok/en+1=</NextContinuationToken>\
-              <Contents><Key>tier/000007.sst</Key><Size>4096</Size>\
-                <ETag>&quot;abc&quot;</ETag></Contents>\
-              <Contents><Key>tier/a&amp;b.sst</Key><Size>1</Size><ETag>&quot;def&quot;</ETag></Contents>\
-            </ListBucketResult>";
-        let (page, next) = parse_list_page(body);
-        assert_eq!(page.len(), 2);
-        assert_eq!(page[0].key, "tier/000007.sst");
-        assert_eq!(page[0].size, 4096);
-        assert_eq!(page[0].etag, "abc");
-        assert_eq!(page[1].key, "tier/a&b.sst", "entities are decoded");
-        assert_eq!(next.as_deref(), Some("tok/en+1="));
-    }
-
-    /// The last page has no token even if the element is present but empty, and a page that is
-    /// not truncated never continues. Getting this wrong is an infinite listing.
-    #[test]
-    fn a_final_page_does_not_continue() {
-        let (_, next) = parse_list_page(
-            "<ListBucketResult><IsTruncated>false</IsTruncated>\
-             <NextContinuationToken>x</NextContinuationToken></ListBucketResult>",
-        );
-        assert_eq!(next, None);
-        let (page, next) = parse_list_page("<ListBucketResult></ListBucketResult>");
-        assert!(page.is_empty());
-        assert_eq!(next, None);
-        let (_, next) = parse_list_page("not xml at all");
-        assert_eq!(next, None);
     }
 
     #[test]
