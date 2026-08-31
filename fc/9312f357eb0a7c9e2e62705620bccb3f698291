@@ -1,0 +1,21 @@
+docs/DESIGN.md
+  s_dc640bf0df4adb::t_d77c767fc8d8b6 420-426
+docs/plans/phase-4.md
+  s_dc640bf0df4adb::t_794728f98be0cd 3,50,214-215,824-889
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "fc9312f357eb0a7c9e2e62705620bccb3f698291",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
