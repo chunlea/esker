@@ -1,0 +1,28 @@
+crates/esker-client/src/testing.rs
+  h_44076b318daf9c 136-143,159,163-169,404,406
+crates/esker-client/src/txn.rs
+  h_44076b318daf9c 402-413,415-469,479-494,496-503,594-599,638,653,658,664
+crates/esker-client/tests/txn.rs
+  h_44076b318daf9c 99,384,428,446,534-536,538,541-542,545-556,565-681,686-689,693-744,746
+crates/esker-proto/src/txn.rs
+  h_44076b318daf9c 64-66,71-87,94,130-142,144,166-171,177,181-197,204,208,212,214,219-222,233-237,580-590,592-594,627-634,660-665,668,688-695,697,700,902-903,907,915,917-977,990,992,1001,1004-1005,1025
+crates/esker-proto/tests/golden/messages.hex
+  h_44076b318daf9c 87-91,109-113
+crates/esker-proto/tests/messages.rs
+  h_44076b318daf9c 445-448,450,452-466,472,474,480,483-486
+docs/adr/0016-txnkv-on-the-wire.md
+  h_44076b318daf9c 13,15-70,72,84,88-91
+docs/txn-spec.md
+  h_44076b318daf9c 180-189
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2d73e2924625ccb3097ad5f8212a180d765df284",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
