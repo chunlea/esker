@@ -1,0 +1,19 @@
+crates/esker-store/src/driver.rs
+  s_b3f6a712d611c9::t_2e840e5c202cf5 37-38,94-108,117,120,123,133,203-205,207-208,221,225-232,315,359-416
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "70405aed76ab1ef6e7a559ffbe71d361af88428e",
+  "prompts": {},
+  "sessions": {
+    "s_b3f6a712d611c9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "78adef9a-88ef-4c89-a340-f825de3d2ab7",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
