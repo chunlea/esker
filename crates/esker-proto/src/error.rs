@@ -152,13 +152,18 @@ pub enum ProtoError {
         reason: String,
     },
 
-    /// A transactional lock is in the way. Reserved for phase 5; the payload is opaque here
-    /// because `esker-proto` must not learn Percolator's lock layout before `esker-txn`
-    /// defines it (`docs/DESIGN.md` §8).
-    // TODO(phase-5): replace the opaque bytes with the typed LockInfo of DESIGN §8.
+    /// A transactional lock is in the way (`docs/DESIGN.md` §8).
+    ///
+    /// The payload stays opaque **by decision**, not for want of a type:
+    /// [ADR 0016](../../docs/adr/0016-txnkv-on-the-wire.md) declined to make it a typed
+    /// `LockInfo` here, because that would rewrite an error frame whose golden has been frozen
+    /// since phase 2 for no change in behaviour. The bytes are
+    /// [`crate::txn::LockInfo::encode`], they have a golden line of their own, and
+    /// `LockInfo::into_error` and `LockInfo::from_error` are the only two places that cross
+    /// the boundary.
     #[error("key is locked")]
     Locked {
-        /// The encoded lock, to be interpreted by `esker-txn`.
+        /// The encoded lock — [`crate::txn::LockInfo`].
         lock_info: Bytes,
     },
 
