@@ -134,6 +134,49 @@ waits. Wired and inert rather than absent and forgotten; the node logs which of 
 Tests never spawn it. `pass()` is separate from `run()` precisely so the whole thing is testable
 without a timer, which is the same reason `esker_schema_step` is a verb rather than a clock.
 
+## Evidence
+
+Taken at `666d32a` (at or past `a87e5ad`, so the `DriverPool::shutdown` fix is present) on a box
+verified clean first — a twenty-one-hour-old orphaned `snapshot` test binary was eating a core
+until it was killed, which means every timing number taken on this machine earlier in the day was
+taken about a sixteenth short.
+
+**Three consecutive full `--workspace` nextest runs, all green.**
+
+| run | tests | result | wall |
+|---|---|---|---|
+| 1 | 2176 | 2176 passed, 0 failed, 30 skipped | 78.6 s |
+| 2 | 2176 | 2176 passed, 0 failed, 30 skipped | 79.4 s |
+| 3 | 2176 | 2176 passed, 0 failed, 30 skipped | 78.8 s |
+
+No failures at all, mine or any other lane's. `chaos_linearizability` took 5.36 s, 5.77 s and
+5.94 s under 2176-test saturation — the condition it used to exhaust in. All three in-gate
+controls and all seven re-driver tests passed in every run.
+
+**Forty fresh processes, standalone: 40 passed, 0 failed.** Per-key histories of 34–57
+operations, and the number the search cost is exponential in, across all 120 key-histories:
+
+```
+ 0 unbounded:   3      4 unbounded:  23
+ 1 unbounded:  16      5 unbounded:  14
+ 2 unbounded:  32      6 unbounded:   2
+ 3 unbounded:  30
+```
+
+**Worst case six.** Before the fix, a single key's history carried about fifty, which is the
+difference between a search of 2^6 and one of 2^50 — and it is why the old failure was a cliff
+rather than a slope. The distribution is also the structural claim holding up in practice: a kill
+strands at most one in-flight call per client, so six clients over four kills bounds this whatever
+the timing does, and nothing in 120 samples came near the bound.
+
+**The controls were shown able to fail**, each by the mutation aimed at it:
+
+| mutation | control that caught it |
+|---|---|
+| exhaustion returned as `Linearizable` (going blind) | `exhaustion_is_never_reported_as_a_violation` |
+| a decided violation returned as `Exhausted` | `the_checker_still_catches_a_lost_write`, `a_grown_budget_still_reaches_the_decision` |
+| `BUDGET_ATTEMPTS` 2 → 1 (no growth) | `a_grown_budget_still_reaches_the_decision` |
+
 ## Status
 
 * `crates/esker-client/tests/chaos_linearizability.rs` — green, deciding, controls untouched.
