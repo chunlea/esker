@@ -1,0 +1,42 @@
+docs/adr/0027-columnar-file-format.md
+  s_cf8601956e2620::t_d7c2f015c5a67d 1-150
+crates/esker-columnar/src/lib.rs
+  s_cf8601956e2620::t_0c8ba64a51a9f5 1-101
+crates/esker-columnar/Cargo.toml
+  s_cf8601956e2620::t_cacc33c01b1b71 1-29
+Cargo.toml
+  s_cf8601956e2620::t_7fb37834c6fbc2 42
+crates/esker-columnar/src/footer.rs
+  s_cf8601956e2620::t_806ce427949714 1-556
+crates/esker-columnar/src/value.rs
+  s_cf8601956e2620::t_71805f2ce3c4bc 1-401
+crates/esker-columnar/src/encode/mod.rs
+  s_cf8601956e2620::t_13ae9bd7c2dac4 1-92
+crates/esker-columnar/src/frame.rs
+  s_cf8601956e2620::t_a33a34500e1dd9 1-265
+crates/esker-columnar/src/stats.rs
+  s_cf8601956e2620::t_a5928880f8ca6d 1-284
+Cargo.lock
+  h_44076b318daf9c 356
+  s_cf8601956e2620::t_bd17121d6d7f4e 357-368
+crates/esker-columnar/src/cursor.rs
+  s_cf8601956e2620::t_4b506096ee5c8c 1-188
+crates/esker-columnar/src/error.rs
+  s_cf8601956e2620::t_7e4c1abc7b7edf 1-81
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "fd02c42242aebe9b3a595ee9c79c65e0a0431730",
+  "prompts": {},
+  "sessions": {
+    "s_cf8601956e2620": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "732aecbc-5268-4943-836e-a49ba67b2585",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
