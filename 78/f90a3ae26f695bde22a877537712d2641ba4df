@@ -1,0 +1,31 @@
+Cargo.lock
+  s_b3f6a712d611c9::t_f9b0598de93f4e 480-481
+crates/esker-store/Cargo.toml
+  s_b3f6a712d611c9::t_d6c8058a475456 16
+crates/esker-store/src/columnar/compact.rs
+  s_b3f6a712d611c9::t_a0213c6dba3242 1-236
+crates/esker-store/src/columnar/mod.rs
+  s_b3f6a712d611c9::t_934f709095a252 1-568
+crates/esker-store/src/columnar/runs.rs
+  s_b3f6a712d611c9::t_26a1a0a39a7907 1-460
+crates/esker-store/src/server.rs
+  s_b3f6a712d611c9::t_e87592e91c3833 1797-1799
+docs/plans/phase-8-learner.md
+  s_b3f6a712d611c9::t_d9b7a48c350f99 158-190,199-204
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "78f90a3ae26f695bde22a877537712d2641ba4df",
+  "prompts": {},
+  "sessions": {
+    "s_b3f6a712d611c9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "78adef9a-88ef-4c89-a340-f825de3d2ab7",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
