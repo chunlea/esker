@@ -546,11 +546,53 @@ thirty of them and `tests/lowering.rs` holds twenty-nine more at the clause leve
 - **The real `TxnClient`.** `backend::MemoryBackend` is a real little MVCC store with real
   write-write conflict detection, and it is still in one process. Wiring phase 5's client in is an
   impl of `Backend`/`Txn` and nothing above it changes — that was the point of shaping the trait
-  against the real one in unit 5.
+  against the real one in unit 5. **Two mismatches are already visible, and both are silent**;
+  they are written out below rather than left to be found at wiring time.
 - **Acceptance against the `sqllogictest` crate** (§7.7), which wants rows separated by whitespace
   rather than tabs; a `sed` away, and worth doing when the real backend is under it.
 - The `TODO(post-v1)`s named above, and the one in §5 about the round trip a unique index costs per
   row.
+
+### Two seam mismatches, found by reading the client before the signal
+
+`crates/esker-client/src/txn.rs` was read against `backend::Txn` ahead of the wiring unit. Every
+signature lines up — `get` and `scan` take `&self`, `put` and `delete` return nothing, `commit`
+yields `Option<u64>`, `rollback` takes `self` — which is what shaping the trait against the real
+one bought. Two things do not line up, and neither would fail to compile.
+
+**1. `scan(.., 0)` means "everything" here and "a page" there.** [`backend::Txn::scan`]'s contract
+is that a `limit` of 0 is no limit; `Transaction::scan` runs it through
+`Router::bounded_limit(limit, DEFAULT_SCAN_LIMIT)`, which turns 0 into **1024** and then caps it at
+`max_scan_limit`. Four call sites in `exec/ddl.rs` pass 0 meaning *every row*:
+
+| Call site | What silently truncating does |
+|---|---|
+| `drop_table`, the row range | a table over 1024 rows keeps its rows after `DROP TABLE` |
+| `drop_table`, each index range | and its index entries |
+| `drop_index` | leaves entries behind |
+| `backfill` | **builds an index missing every row past the first 1024** |
+
+The last one is the serious one, and it is the worst shape a bug can have: `CREATE INDEX` succeeds,
+and afterwards a query that uses the index returns fewer rows than the same query without it. The
+read path is already safe — `exec::cursor` pages with `SCAN_CHUNK` and does not rely on 0 — so the
+fix is to give those four sites the same paging: scan a chunk, resume from the last key's successor,
+stop on a short read. It is about thirty lines including a `MemoryBackend` that can be told to
+return short reads, which is what makes the paging testable at all; without that knob the fake
+answers 0 as "everything" and no test can see the difference.
+
+**2. A write conflict has no way to arrive as one.** `explain_conflict` (`exec/mod.rs`) turns a
+lost race on a unique index key into the `23505` the user actually caused, and it keys off
+`SqlError::SerializationFailure`. `esker_client::Error` has no conflict variant — a refusal arrives
+as `Error::Store(ProtoError)` — and `ProtoError` has no `WriteConflict` either. `esker-txn` *does*
+(`TxnError::WriteConflict`, and its `only_a_lock_conflict_is_resolvable` test turns on the
+distinction), but nothing maps it onto the wire yet. So unless one is added, every duplicate key
+that loses a race will reach the client as a generic store error, `explain_conflict` will not fire,
+and the user will get an internal-sounding failure where PostgreSQL gives `23505` naming their
+constraint.
+
+That one is **not this lane's to fix**: the mapping belongs to `esker-proto` and `esker-store`.
+It is recorded here so that the phase-5 lane can add the variant while it is still cheap, and so
+that the wiring unit does not discover it as a mystery.
 
 ### Containment is one module, and now a test
 

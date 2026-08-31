@@ -145,6 +145,11 @@ pub(super) fn drop_table(
         // The rows go with the table. A range delete is what this wants and the transaction layer
         // has none, so every key is deleted individually -- correct, and `TODO(post-v1)` for a
         // table large enough that this is a problem.
+        //
+        // TODO(phase-6a-wiring): a `limit` of 0 is "everything" to `Txn` and 1024 to the real
+        // `TxnClient` (`docs/plans/phase-6a.md` §10a, "Two seam mismatches"). These two scans and
+        // the one in `drop_index` must page before the real backend is under them, or a table of
+        // more than a page keeps its rows and its index entries after being dropped.
         let (start, end) = crate::row::table_row_range(executor.tenant, table.id);
         for (key, _) in txn.scan(&start, &end, 0)? {
             txn.delete(&key);
@@ -356,6 +361,13 @@ fn existing_relation(
 ///
 /// A `UNIQUE` index built over rows that already violate it fails here, with the same `23505` an
 /// `INSERT` would have raised, which is what PostgreSQL does too.
+///
+/// `TODO(phase-6a-wiring)`: the scan below asks for every row with a `limit` of 0, which is what
+/// [`crate::backend::Txn`] promises and **not** what the real `TxnClient` does — it reads 0 as
+/// 1024 (`docs/plans/phase-6a.md` §10a, "Two seam mismatches"). Left as it is against the fake,
+/// which honours the contract; it must page before the real backend is wired, or this builds an
+/// index that is missing every row past the first page and every query that uses it then returns
+/// fewer rows than the same query without it.
 fn backfill(
     executor: &Executor,
     txn: &mut dyn Txn,
