@@ -1,0 +1,21 @@
+crates/esker-sql/src/exec/ddl.rs
+  s_543d4c9b3ee38c::t_75b1956bf797f5 148-152,364-370
+docs/plans/phase-6a.md
+  s_543d4c9b3ee38c::t_57dc9c4c836b25 549-550,556-596
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "3be48ddaffc465511deef292bcaf844633d79aef",
+  "prompts": {},
+  "sessions": {
+    "s_543d4c9b3ee38c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "befd6192-73a4-4b10-9f4b-cd092c10ce31",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
