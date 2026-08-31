@@ -42,7 +42,10 @@ fn startup_packet(minor: u16, extra: &[(&str, &str)]) -> Vec<u8> {
         body.push(0);
     }
     body.push(0);
-    let mut packet = u32::try_from(body.len() + 4).unwrap().to_be_bytes().to_vec();
+    let mut packet = u32::try_from(body.len() + 4)
+        .unwrap()
+        .to_be_bytes()
+        .to_vec();
     packet.extend_from_slice(&body);
     packet
 }
@@ -201,7 +204,11 @@ async fn a_statement_is_refused_by_name_and_the_session_carries_on() {
         error.windows(7).any(|w| w == b"C0A000\0"),
         "the refusal carries 0A000"
     );
-    assert_eq!(frames(&reply)[1].1, b"I", "and the session is idle, not stuck");
+    assert_eq!(
+        frames(&reply)[1].1,
+        b"I",
+        "and the session is idle, not stuck"
+    );
 }
 
 // --- and the same thing, against software we did not write ------------------------------------
