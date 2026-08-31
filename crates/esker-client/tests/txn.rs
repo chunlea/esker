@@ -1015,14 +1015,25 @@ fn a_prewrite_that_meets_several_locks_clears_them_in_one_round() {
         "one call per *holding transaction*, not per locked key"
     );
     // Grouped by the transaction that holds them, because that is what a ResolveLock names.
-    let by_txn: Vec<u64> = resolves
+    //
+    // **Sorted, deliberately.** The two resolutions go out on two threads — that is the point
+    // of `resolve_all`, one round however many transactions collided — so which of them reaches
+    // the transport's log first is a race, and asserting an order here would pin the opposite of
+    // what the code promises. `fan_out` returning its *results* in group order is what makes
+    // that easy to miss: the answers are ordered, the side effects are not.
+    let mut by_txn: Vec<u64> = resolves
         .iter()
         .map(|request| match request {
             TxnKvReq::ResolveLock { start_ts, .. } => *start_ts,
             other => panic!("{other:?}"),
         })
         .collect();
-    assert_eq!(by_txn, vec![DEAD_TS, OTHER_DEAD_TS]);
+    by_txn.sort_unstable();
+    assert_eq!(
+        by_txn,
+        vec![DEAD_TS, OTHER_DEAD_TS],
+        "one resolution per holding transaction, and both holders are named"
+    );
 
     // One resolution round: the secondaries were prewritten, resolved, prewritten again — and
     // not once per lock.
