@@ -288,6 +288,72 @@ run_scaleout3.sh <n-stores> <pd-port> <base-store-port> <data-dir> <num-keys> <v
   <threads> <fixed-region-count> <spread-wait-seconds>
 ```
 
+## Run 3 — 2026-08-31, confirming the landed PD fixes
+
+commit range `8726a1a..f028d2e` landed between Run 2 and this run:
+`8726a1a` fix(pd): a repair is not finished by a replica that cannot vote ·
+`7316218` fix(pd): a retired operator's load outlives it ·
+`1aadebf` fix(cli): esker region asks PD which cluster it is talking to ·
+`93a0b77` perf(pd): retiring a settled correction is one question, not one per store ·
+`f028d2e` docs(pd): [ADR 0023](../adr/0023-a-retired-operators-load-outlives-it.md).
+ADR 0023 names the exact defect Run 2's 5-store run exposed: an operator's load-delta accounting
+had a gap the width of one heartbeat, and under it PD grew a region to three replicas and then, in
+one four-and-a-half-second thundering-herd cascade, took **all sixteen** of the bootstrap store's
+replicas away — the mechanism-level cause of Run 2's "store 4 received nothing." A harness note
+from the PD lane also flagged that Run 2's `max_store_down_time=8s` (against a 30s default, with a
+2s store-heartbeat) manufactures spurious down-store detection under this machine's contention,
+adding repair churn on top of whatever balance was doing. **This run corrects both**: rebuilt
+`storewrap`/`pdwrap`/`p4loadgen` against the new commits, and `max_store_down_time` restored to the
+30s default (30,000 ms; `operator_timeout` is left at 30s rather than the true 300s default,
+because a stuck-operator recognition window of 5 minutes does not fit this lane's time budget —
+flagged rather than silently kept, per the same standard just applied to the other knob).
+
+Same pinned-12-region methodology as Run 2, 5 stores, 8,000 keys (matching Run 2's reduced 5-store
+count for a fair before/after comparison).
+
+| | Run 2 (pre-fix, `max_store_down_time=8s`) | Run 3 (post-fix, `max_store_down_time=30s`, the default) |
+|---|---|---|
+| ops/s | 71.3 | **86.6** |
+| Voters entering measurement | 26/38 | 27/39 (comparable — convergence remains partial in both) |
+| Peers per store | store1=12(9L+3V) store2=12(7L+5V) store3=7V store5=5V **store4=0** | store1=6 store2=12 store3=2 store4=12 store5=4 — **every store holds something** |
+| Failures other than address-book | 3 | 0 |
+| Load average (start→pre-measure→post) | 5.8 → 5.4 → 4.3 | 7.0 → 10.6 → 7.4 (measurably *more* contended machine, not less) |
+| Verify | 7,997/7,997 | 8,000/8,000 |
+
+**The store-emptying defect is gone, directly confirmed**: no store holds zero replicas in this
+run, where Run 2 left store 4 completely empty. Throughput rose 21% (71.3 → 86.6 ops/s) **despite
+a more heavily loaded machine during this run than during Run 2** (load average peaked at 10.6
+here against 5.9 there) — the fix's effect is if anything understated by the raw numbers. 5 stores
+now beats 3 stores (52.9, Run 2) by 64%, the clearest scale-out signal this lane has produced.
+Voter convergence is still partial (27/39, materially unchanged from Run 2's 26/38) — the fix ADR
+0023 describes is about the load-accounting race that emptied a store, not about how fast a
+learner is promoted, so this is expected rather than a sign the fix is incomplete for what it
+targets.
+
+Two more spot-checks, made possible by rebuilding against the new commits, and directly relevant
+to this record even though neither is the 5-store run this section is otherwise about:
+
+- **`cargo doc -D warnings -p esker-client` now passes.** The broken intra-doc links this lane's
+  first report flagged (`crates/esker-client/src/txn.rs` lines 9, 26) are gone at current HEAD —
+  `just check`'s doc step, red for that reason in the first report, is clear of it now. (Not
+  independently attributed to a specific commit here; whichever lane touched `txn.rs` since fixed
+  it as a side effect or directly — this record only re-confirms the symptom is gone.)
+- **`esker-cli region ls` now succeeds against a live, freshly bootstrapped cluster** (`1aadebf`,
+  confirmed live: a 1-store cluster, `region ls` lists region 1 correctly, no `ClusterMismatch`).
+  The workaround this lane built into `p4loadgen split` (Run 2) is no longer necessary for `ls`,
+  though it is left in place here since `region split`/`region transfer-leader` were not
+  individually re-checked and this lane's own `split` is already proven correct across three runs.
+
+**What this run does not re-establish**: the item-3 repair scenario (kill store 3 permanently, add
+store 4, time to full repair) and the item-4 balance-convergence scenario (1 store, add 4) were
+run once each in this lane's first report, both showing the learner-promotion pattern ADR 0023's
+fix is adjacent to but not identical with — `8726a1a`'s "a repair is not finished by a replica
+that cannot vote" reads as directly relevant to that exact pattern, but this lane has not re-run
+either scenario against the fixed code. This run's evidence is cross-cutting (the same
+replica-growth machinery, exercised by 12 regions growing from 1 to 3 replicas apiece) rather than
+a literal repeat of those two scripts, and is reported as exactly that — strong, relevant,
+corroborating, not a substitute for re-running the two scenarios by name.
+
 ## Methodology note: what the scratchpad tooling is, and isn't
 
 None of the four items above could be produced with the checked-in `esker-cli`: `bench`/`raw` only
