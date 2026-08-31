@@ -1,0 +1,50 @@
+crates/esker-cli/src/sst_dump.rs
+  h_44076b318daf9c 250-280,296,485
+crates/esker-engine/src/compaction/job.rs
+  h_44076b318daf9c 34,95-96,116-126,179-193,258,399-496,514,711,744
+crates/esker-engine/src/compaction/picker.rs
+  h_44076b318daf9c 26,28,42-53,61,66-74,81-82,84,245-246,251-334,393,568-691
+crates/esker-engine/src/db/compact.rs
+  h_44076b318daf9c 37,82-95,101-103,142-157,161,169-197,247,253-255,257-260,267-273,294-295,366-370,386,402-404,406,417,755-761,847
+crates/esker-engine/src/db/flush.rs
+  h_44076b318daf9c 30-33,37,44-90,334-363,399-404,406-417,422-425,427,429-434
+crates/esker-engine/src/db/iter.rs
+  h_44076b318daf9c 32,101-105,229,233-236,266,269-271,279-292,383-388,392-394,397-399,415-423,434
+crates/esker-engine/src/db/mod.rs
+  h_44076b318daf9c 510-530
+crates/esker-engine/src/db/open.rs
+  h_44076b318daf9c 343-353
+crates/esker-engine/src/db/read.rs
+  h_44076b318daf9c 19-34,47,141-145,150,158-185,194,200-202,207-214,233-243,257-258,261-281,307-315,325-354,364
+crates/esker-engine/src/db/write.rs
+  h_44076b318daf9c 202-211,232,234,237-243,247-250,262-272
+crates/esker-engine/src/memtable.rs
+  h_44076b318daf9c 27,32-33,79-88,93-101,105,115,143-185,204-211,229-234,236,423-430,435-436,452-454,466,585-589
+crates/esker-engine/src/sst/builder.rs
+  h_44076b318daf9c 198-204
+crates/esker-engine/tests/db.rs
+  h_44076b318daf9c 1594-1595,1597-1601,1603,1613-1614,1616-1629,1631-1632,1635
+crates/esker-engine/tests/model.rs
+  h_44076b318daf9c 122-126,174-177,299,351-378
+crates/esker-engine/tests/range_del.rs
+  h_44076b318daf9c 1-330
+crates/esker-engine/tests/sst_golden.rs
+  h_44076b318daf9c 213-219
+docs/DESIGN.md
+  h_44076b318daf9c 195-213,719-720
+docs/adr/0017-range-tombstones.md
+  h_44076b318daf9c 108,110,123-124,146-182
+docs/plans/phase-5.md
+  h_44076b318daf9c 191-192,227-246
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "cc2c89175bb31806f099a32daf20cd0d4c4eedb2",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
