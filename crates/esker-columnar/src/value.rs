@@ -159,6 +159,39 @@ impl Value {
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
+
+    /// The type this value has, or `None` for NULL, which has none and fits every column.
+    #[must_use]
+    pub fn column_type(&self) -> Option<ColumnType> {
+        Some(match self {
+            Value::Null => return None,
+            Value::Int8(_) => ColumnType::Int8,
+            Value::Text(_) => ColumnType::Text,
+            Value::Bool(_) => ColumnType::Bool,
+            Value::Bytea(_) => ColumnType::Bytea,
+            Value::TimestampTz(_) => ColumnType::TimestampTz,
+            Value::Double(_) => ColumnType::Double,
+        })
+    }
+
+    /// This value, borrowed.
+    #[must_use]
+    pub fn as_ref(&self) -> ValueRef<'_> {
+        match self {
+            Value::Null => ValueRef::Null,
+            Value::Int8(v) | Value::TimestampTz(v) => ValueRef::Int(*v),
+            Value::Bool(v) => ValueRef::Bool(*v),
+            Value::Double(v) => ValueRef::Double(*v),
+            Value::Text(v) => ValueRef::Bytes(v.as_bytes()),
+            Value::Bytea(v) => ValueRef::Bytes(v),
+        }
+    }
+
+    /// [`ValueRef::pg_cmp`], over owned values.
+    #[must_use]
+    pub fn pg_cmp(&self, other: &Self) -> Ordering {
+        self.as_ref().pg_cmp(&other.as_ref())
+    }
 }
 
 /// One column of a decoded chunk, borrowed from the buffers the reader owns.
@@ -184,6 +217,49 @@ impl ValueRef<'_> {
     #[must_use]
     pub fn is_null(&self) -> bool {
         matches!(self, ValueRef::Null)
+    }
+
+    /// The order this system puts two values in, which is PostgreSQL's and not the bits'.
+    ///
+    /// Mirrored from `esker_sql::value::Datum::pg_cmp`, whose rules were confirmed against a real
+    /// server, and it is the **specification** rather than an implementation detail: the fragment
+    /// evaluator compares with it, statistics are computed in it, groups are identified by it, and
+    /// the differential harness's reference interpreter uses it too. Three rules are its own:
+    ///
+    /// * **NULL sorts last** and is equal only to NULL — which is what makes a NULL its own
+    ///   `GROUP BY` group. It is *not* what makes `x = NULL` unknown; that is a separate rule, and
+    ///   it lives in the evaluator, which never reaches this function with a NULL operand.
+    /// * **`NaN` is the largest float**, above `Infinity`, and equal to itself
+    ///   ([`pg_cmp_f64`]).
+    /// * **Text sorts by bytes**, not by a collation — a declared divergence this project makes
+    ///   everywhere (`esker_sql::row`), because a locale-aware collation means linking C.
+    ///
+    /// Two values of different shapes cannot arise from a validated fragment, but the function is
+    /// total anyway: it falls back to a fixed order over the variants so that no input can panic.
+    #[must_use]
+    pub fn pg_cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
+            // NULLS LAST, PostgreSQL's default for ascending order.
+            (ValueRef::Null, _) => Ordering::Greater,
+            (_, ValueRef::Null) => Ordering::Less,
+            (ValueRef::Int(a), ValueRef::Int(b)) => a.cmp(b),
+            (ValueRef::Bool(a), ValueRef::Bool(b)) => a.cmp(b),
+            (ValueRef::Double(a), ValueRef::Double(b)) => pg_cmp_f64(*a, *b),
+            (ValueRef::Bytes(a), ValueRef::Bytes(b)) => a.cmp(b),
+            (a, b) => a.rank().cmp(&b.rank()),
+        }
+    }
+
+    /// A fixed order over the shapes, so that [`pg_cmp`](Self::pg_cmp) is total.
+    fn rank(&self) -> u8 {
+        match self {
+            ValueRef::Bool(_) => 0,
+            ValueRef::Int(_) => 1,
+            ValueRef::Double(_) => 2,
+            ValueRef::Bytes(_) => 3,
+            ValueRef::Null => 4,
+        }
     }
 
     /// This reference as an owned [`Value`] of type `ty`.

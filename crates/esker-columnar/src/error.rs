@@ -56,6 +56,27 @@ pub enum Error {
     /// value of the wrong type, a column or stripe that does not exist.
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+
+    /// This build will not evaluate this fragment, and has done none of it.
+    ///
+    /// [ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) decision 3: *"a fragment the
+    /// columnar node cannot evaluate is refused, never partially honoured."* An unknown expression
+    /// node, an aggregate over a type that has no sum, a key range this build cannot restrict to —
+    /// each refuses the **whole** fragment, and the caller falls back to a row scan. Honouring the
+    /// half it understood would silently drop a filter, which returns extra rows rather than an
+    /// error, and is the defect class the rule exists for.
+    #[error("fragment refused: {0}")]
+    Refused(String),
+
+    /// An aggregate ran out of range.
+    ///
+    /// A declared divergence from PostgreSQL, which returns `numeric` from `sum(bigint)` and
+    /// therefore cannot overflow. Phase 6a has no `numeric` (`esker_sql::plan::expr` refuses
+    /// decimal-to-`int8` for the same reason), so the honest answer is an error rather than a
+    /// wrapped number — a wrong total is worse than a missing one. A SQL node maps this to
+    /// PostgreSQL's `22003 numeric_value_out_of_range`.
+    #[error("value out of range: {0}")]
+    Overflow(String),
 }
 
 impl Error {
@@ -77,6 +98,23 @@ impl Error {
     #[must_use]
     pub fn is_unsealed(&self) -> bool {
         matches!(self, Self::Unsealed { .. })
+    }
+
+    /// A refusal, with the reason a caller can log before falling back to a row scan.
+    pub fn refused(reason: impl Into<String>) -> Self {
+        Self::Refused(reason.into())
+    }
+
+    /// Whether this build declined the whole fragment, having evaluated none of it.
+    #[must_use]
+    pub fn is_refused(&self) -> bool {
+        matches!(self, Self::Refused(_))
+    }
+
+    /// Whether an aggregate ran out of range.
+    #[must_use]
+    pub fn is_overflow(&self) -> bool {
+        matches!(self, Self::Overflow(_))
     }
 }
 
