@@ -196,6 +196,55 @@ proptest! {
         prop_assert_eq!(&stripped[1..], &key_a[..]);
     }
 
+    /// A table key decodes back to the ids that built it, whatever they are — and the decoder
+    /// is what the garbage collector looks a retention window up by
+    /// ([ADR 0021](../../docs/adr/0021-time-machine.md)), so a wrong answer would apply one
+    /// table's retention to another's rows.
+    #[test]
+    fn table_keys_decode_back_to_their_ids(
+        tenant: u64,
+        table_id: u64,
+        index_id: u64,
+        suffix in prop::collection::vec(any::<u8>(), 0..24),
+    ) {
+        let mut row = prefix::table_row_prefix(tenant, table_id);
+        row.extend_from_slice(&suffix);
+        prop_assert_eq!(
+            prefix::split_table(&row).unwrap(),
+            Some((tenant, table_id, prefix::TablePart::Row))
+        );
+
+        let mut index = prefix::table_index_prefix(tenant, table_id, index_id);
+        index.extend_from_slice(&suffix);
+        prop_assert_eq!(
+            prefix::split_table(&index).unwrap(),
+            Some((tenant, table_id, prefix::TablePart::Index))
+        );
+    }
+
+    /// The important one: arbitrary bytes are an answer or an error, never a panic and never a
+    /// table that was never written (`CLAUDE.md` invariant 9). A collector runs this over every
+    /// key in a column family.
+    #[test]
+    fn arbitrary_bytes_never_decode_to_a_table_that_was_not_written(
+        bytes in prop::collection::vec(any::<u8>(), 0..64),
+    ) {
+        if let Ok(Some((tenant, table_id, part))) = prefix::split_table(&bytes) {
+            // Whatever it answered, re-encoding it has to reproduce the prefix it came from —
+            // or the decode invented ids that are not in those bytes.
+            let rebuilt = match part {
+                prefix::TablePart::Row => prefix::table_row_prefix(tenant, table_id),
+                prefix::TablePart::Index => {
+                    let mut out = prefix::table_row_prefix(tenant, table_id);
+                    out.pop();
+                    out.push(prefix::SQL_INDEX);
+                    out
+                }
+            };
+            prop_assert!(bytes.starts_with(&rebuilt));
+        }
+    }
+
     #[test]
     fn tuples_round_trip(
         first: u64,

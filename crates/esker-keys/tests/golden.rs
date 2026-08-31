@@ -181,6 +181,46 @@ fn encodings_match_the_golden_file() {
     }
 }
 
+/// The decoder is tied to the **frozen** bytes, not just to the encoder.
+///
+/// `split_table` and `table_row_prefix` could drift together and every round-trip property
+/// would still pass. This reads the ids back out of the bytes the golden file holds, which is
+/// the only version of the check that a matched pair of mistakes cannot satisfy — and it
+/// matters because the garbage collector looks a retention window up by what this returns
+/// ([ADR 0021](../../docs/adr/0021-time-machine.md)).
+#[test]
+fn the_frozen_table_keys_decode_to_the_ids_they_name() {
+    let row = golden_bytes("table_row_prefix", "tenant=1,table=7");
+    assert_eq!(
+        prefix::split_table(&row).unwrap(),
+        Some((1, 7, prefix::TablePart::Row))
+    );
+
+    let index = golden_bytes("table_index_prefix", "tenant=1,table=7,index=2");
+    assert_eq!(
+        prefix::split_table(&index).unwrap(),
+        Some((1, 7, prefix::TablePart::Index))
+    );
+
+    // And a key from another namespace, taken from the same file, is not a table's.
+    let raw = golden_bytes("raw_key", &hex(b"k1"));
+    assert_eq!(prefix::split_table(&raw).unwrap(), None);
+}
+
+/// The bytes the golden file holds for one case.
+fn golden_bytes(kind: &str, argument: &str) -> Vec<u8> {
+    let text = std::fs::read_to_string(golden_path()).expect("golden file is missing");
+    let prefix = format!("{kind} {argument} = ");
+    let line = text
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("no `{prefix}` line in the golden file"));
+    (0..line.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&line[at..at + 2], 16).expect("bad hex"))
+        .collect()
+}
+
 /// A golden file that silently covers nothing would pass forever.
 #[test]
 fn the_golden_file_covers_every_encoding() {

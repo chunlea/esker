@@ -114,6 +114,52 @@ pub fn table_index_prefix(tenant: u64, table_id: u64, index_id: u64) -> Vec<u8> 
     out
 }
 
+/// Which part of a table's key space a key belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TablePart {
+    /// A row: `'t' ++ tenant ++ table_id ++ 'r' ++ row_id`.
+    Row,
+    /// An index entry: `'t' ++ tenant ++ table_id ++ 'i' ++ index_id ++ …`.
+    Index,
+}
+
+/// The table a SQL key belongs to: `(tenant, table_id, which part)`.
+///
+/// The inverse of [`table_row_prefix`] and [`table_index_prefix`], and it lives here for the
+/// reason `CLAUDE.md` invariant 7 gives: key semantics belong in `esker-keys` and nowhere
+/// below it. The garbage collector needs it — a per-table retention window is looked up by the
+/// table a version's key names ([ADR 0021](../../docs/adr/0021-time-machine.md)) — and the
+/// collector sits in `esker-store`, which must not learn to parse a key layout that is
+/// described here.
+///
+/// A **decode, not a parse**: the ids are memcomparable fixed-width, so this reads them rather
+/// than searching for delimiters.
+///
+/// `None` for a key that is not in the SQL namespace at all — a `RawKV` key, a transactional
+/// one, a metadata one. That is not an error: a collector sees every key in a column family and
+/// most of them are nobody's table.
+pub fn split_table(key: &[u8]) -> Result<Option<(u64, u64, TablePart)>, CodecError> {
+    let Some(rest) = key.strip_prefix(&[SQL]) else {
+        return Ok(None);
+    };
+    // Too short to be a table key. Not an error for the same reason as the namespace check: a
+    // key that is not one of these is simply not one of these.
+    if rest.len() < FIXED_INT_SIZE * 2 + 1 {
+        return Ok(None);
+    }
+    let (tenant, rest) = codec::decode_u64(rest)?;
+    let (table_id, rest) = codec::decode_u64(rest)?;
+    let part = match rest.first() {
+        Some(&SQL_ROW) => TablePart::Row,
+        Some(&SQL_INDEX) => TablePart::Index,
+        // A `'t'` key whose third field is neither. Nothing this crate writes produces one, so
+        // it is a key from somewhere else rather than damage — and answering `None` leaves it
+        // to whatever owns it.
+        _ => return Ok(None),
+    };
+    Ok(Some((tenant, table_id, part)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +223,54 @@ mod tests {
         assert_ne!(raw[0], txn[0]);
         assert_ne!(raw[0], meta[0]);
         assert_ne!(txn[0], meta[0]);
+    }
+
+    /// The decoder is the inverse of the two encoders, for a row and for an index alike.
+    #[test]
+    fn a_table_key_decodes_back_to_the_table_that_built_it() {
+        let mut row = table_row_prefix(7, 42);
+        row.extend_from_slice(b"row-id");
+        assert_eq!(split_table(&row).unwrap(), Some((7, 42, TablePart::Row)));
+
+        let mut index = table_index_prefix(7, 42, 3);
+        index.extend_from_slice(b"cols");
+        assert_eq!(
+            split_table(&index).unwrap(),
+            Some((7, 42, TablePart::Index))
+        );
+
+        // The bare prefixes, with nothing appended, decode too: a collector may meet one.
+        assert_eq!(
+            split_table(&table_row_prefix(0, 0)).unwrap(),
+            Some((0, 0, TablePart::Row))
+        );
+        assert_eq!(
+            split_table(&table_index_prefix(u64::MAX, u64::MAX, 1)).unwrap(),
+            Some((u64::MAX, u64::MAX, TablePart::Index))
+        );
+    }
+
+    /// A key that is not a table's is `None` and not an error. A collector sees every key in a
+    /// column family and most of them are nobody's table; failing on one would stop the sweep.
+    #[test]
+    fn a_key_that_is_not_a_table_s_is_not_an_error() {
+        assert_eq!(split_table(b"").unwrap(), None, "empty");
+        assert_eq!(split_table(&raw_key(b"k")).unwrap(), None, "RawKV");
+        assert_eq!(split_table(&txn_key(b"k", 1)).unwrap(), None, "TxnKV");
+        assert_eq!(
+            split_table(&meta_key(b"cluster")).unwrap(),
+            None,
+            "metadata"
+        );
+        // In the SQL namespace but too short to carry two ids.
+        assert_eq!(split_table(b"t").unwrap(), None);
+        assert_eq!(split_table(&[SQL; 16]).unwrap(), None);
+        // Two ids, and a third field that is neither a row nor an index.
+        let mut odd = vec![SQL];
+        codec::encode_u64(1, &mut odd);
+        codec::encode_u64(2, &mut odd);
+        odd.push(b'?');
+        assert_eq!(split_table(&odd).unwrap(), None);
     }
 
     #[test]
