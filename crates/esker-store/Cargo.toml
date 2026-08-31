@@ -13,6 +13,7 @@ publish.workspace = true
 esker-engine.workspace = true
 # The `'r'` namespace every RawKV key is stored under. A client never sends the prefix, so
 # this is the only place it is applied (docs/DESIGN.md §3, CLAUDE.md invariant 7).
+esker-base.workspace = true
 esker-keys.workspace = true
 # The columnar apply target (ADR 0022 Decision 1). The first edge into this crate; it shares
 # nothing with the row engine but the `FileSystem` trait and `esker-base`.

@@ -1794,7 +1794,9 @@ impl Store {
     /// Every negative answer here is a [`FragmentResp::Refused`] and never a `ProtoError`. A
     /// refusal is a *normal* response meaning "fall back to a row scan"; an error frame would
     /// make a stale route or a rolling upgrade look like a fault.
-    async fn serve_fragment(
+    /// Not `async` yet, and it will be: unit 3's `ReadIndex` round awaits the leader. Kept
+    /// synchronous until then rather than carrying an `async` with nothing to await in it.
+    fn serve_fragment(
         self: &Arc<Self>,
         header: RequestHeader,
         _request: esker_proto::fragment::FragmentReq,
@@ -2443,7 +2445,6 @@ impl Service for StoreService {
                 Request::Fragment { header, request } => {
                     return store
                         .serve_fragment(header, request)
-                        .await
                         .map(|response| Reply::Unary(Response::Fragment(response)));
                 }
                 // A store is not a placement driver. Answering anything but a refusal — even a

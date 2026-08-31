@@ -477,6 +477,8 @@ name = "esker-store"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "esker-base",
+ "esker-columnar",
  "esker-engine",
  "esker-keys",
  "esker-pd",

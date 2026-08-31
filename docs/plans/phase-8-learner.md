@@ -155,6 +155,39 @@ So this lane's service:
 * The learner **never votes and never serves row reads.** Its applied index reports to PD like any
   learner; `heartbeat.rs` is untouched.
 
+## The schema the decoder is built from, and the ordering it needs
+
+RULED-1's port needs a schema pushed to it. Three things settled that shape, none of them obvious
+from this side of the seam:
+
+* **One current schema, never versioned by `ts`.** `DROP COLUMN` does not exist yet (`0A000`), and
+  ADR 0019 Decision 3 says it arrives as row format **v3 with per-value column identity** — not a
+  renumbering and not a rewrite. Position stops mattering, so current-schema decode stays sound in
+  both directions and no schema history is needed.
+* **The schema is a *pair*, not a type list.** `RowSchema` is `{ types, missing }`, and `missing`
+  is PostgreSQL 11's `attmissingval` — what makes `ADD COLUMN ... DEFAULT <constant>` instant on a
+  populated table. A decoder built from types alone pads `NULL` where the row store pads the
+  default, so for a table that took `ADD COLUMN c int8 NOT NULL DEFAULT 42` **every row written
+  before that ALTER reads 42 through the row store and NULL through the columnar copy** — silently,
+  and only for the old rows. Found by wy-c2 reading `row.rs`, which says of itself that this is
+  "the hardest case to notice".
+* **The push must be ordered against the log, and lateness is absorbed as lag.** `decode_row`
+  *refuses* a row wider than its schema — that is corruption, not a case to tolerate — so a stale
+  schema does not read wrong, it stalls the apply path. Carrying the schema in the log does **not**
+  fix this: the catalog record lives wherever its key falls and the table's rows live in the regions
+  covering theirs, so they are different Raft logs with no ordering between them, and the ordering
+  is only free in the single-region case that ends at the first split.
+
+  So the apply path **waits** — and the wait must not block, because a driver worker holds many
+  regions and parking one parks the rest (wave C). It is not a sleep: the region stops advancing its
+  applied index until the schema arrives. The pleasant consequence is that this degrades into a
+  state the system already handles: *a learner that cannot apply is a learner that is behind*, which
+  the heartbeat reports, `min_apply_index` catches, and `RefusalReason::TooFarBehind` turns into a
+  row-scan fallback. No retry policy, no backoff, no deadline.
+
+The monotonic number is `TableDef::schema_version` (ADR 0019 Decision 4), which already increments
+on exactly this event. A push carrying an older one is refused over a newer.
+
 ## Tests
 
 * **Unit 1**: apply a known stream, read the run back, assert the cells and their `commit_ts`;
@@ -163,6 +196,12 @@ So this lane's service:
   acknowledged row is lost, no obsolete file is deleted that a live version names.
 * **Unit 3**: epoch mismatch refuses; a lagging learner blocks on `ReadIndex` and then answers; a
   deadline refuses with the typed response and never an error frame.
+* **The differential corpus must contain the case that hides.** An `ADD COLUMN` with a **non-NULL
+  default** and rows written **before** it, because that is the shape the `missing`-value bug above
+  produces and it is invisible to every other. A harness that generates schemas up front and then
+  fills them will never produce it, and would pass while the columnar copy answered `NULL` where the
+  row store answered `42`. Corpus generation therefore has to interleave DDL with writes rather than
+  ordering them.
 * **Unit 4, the load-bearing one — the end-to-end differential.** A real region: three voters and
   one columnar learner, writes through Raft (mixed puts, deletes and rewrites across stripe
   boundaries), then **every generated fragment evaluated both ways** — columnar learner against a
