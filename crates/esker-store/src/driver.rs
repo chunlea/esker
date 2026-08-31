@@ -221,9 +221,7 @@ fn run(mut inbox: mpsc::Receiver<Job>) {
                 // serving the others, because one region's disk is not another's.
                 tracing::error!(region_id, %error, "the Raft driver failed for a region");
                 if let Some(mut core) = cores.remove(&region_id) {
-                    core.fail_outstanding(&ProtoError::internal(
-                        "this region's Raft driver stopped",
-                    ));
+                    core.fail_outstanding("this region's Raft driver stopped");
                 }
             }
         }
@@ -232,9 +230,8 @@ fn run(mut inbox: mpsc::Receiver<Job>) {
         }
     }
 
-    let stopping = ProtoError::not_sent("the Raft driver stopped");
     for core in cores.values_mut() {
-        core.fail_outstanding(&stopping);
+        core.fail_outstanding("the Raft driver stopped");
     }
 }
 
@@ -256,7 +253,7 @@ fn handle(cores: &mut BTreeMap<u64, PeerCore>, touched: &mut BTreeSet<u64>, job:
             if !core.handle(message) {
                 // `Stop`. The region goes; the worker stays, because it holds others.
                 if let Some(mut core) = cores.remove(&region_id) {
-                    core.fail_outstanding(&ProtoError::not_sent("the Raft peer stopped"));
+                    core.fail_outstanding("the Raft peer stopped");
                 }
                 touched.remove(&region_id);
                 return true;
@@ -266,7 +263,7 @@ fn handle(cores: &mut BTreeMap<u64, PeerCore>, touched: &mut BTreeSet<u64>, job:
         Job::Stop => return false,
         Job::Retire { region_id, done } => {
             if let Some(mut core) = cores.remove(&region_id) {
-                core.fail_outstanding(&ProtoError::not_sent("the Raft peer stopped"));
+                core.fail_outstanding("the Raft peer stopped");
             }
             touched.remove(&region_id);
             // Only after the core is gone, so a caller that was about to flush knows nothing is

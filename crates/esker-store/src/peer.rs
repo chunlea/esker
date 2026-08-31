@@ -837,12 +837,36 @@ impl PeerCore {
 
     /// Fails everything outstanding — on shutdown, or when this peer stops leading and can no
     /// longer promise anything about what it accepted.
-    pub(crate) fn fail_outstanding(&mut self, error: &ProtoError) {
+    ///
+    /// **The two queues get different errors, and the difference is a correctness one.** A
+    /// proposal reaches `pending` only *after* [`RawNode::propose`] appended it at `last_index`
+    /// (see [`PeerCore::propose`]): it is in this peer's log and may already have been
+    /// replicated to — and committed by — a majority. Its outcome is therefore
+    /// [`RequestOutcome::Unknown`](esker_proto::RequestOutcome::Unknown), and
+    /// [`ProtoError::Closed`] is the variant that says so. A `ReadIndex` that never completed
+    /// really did change nothing, so `self.reads` are honestly [`ProtoError::NotSent`].
+    ///
+    /// Failing a proposal as `NotSent` was a live double-apply: `NotSent` is documented as "a
+    /// request that provably never left this process" and maps to `NotApplied`, which
+    /// `esker-client`'s retry loop and every `CompareAndSwap` caller read as "safe to send
+    /// again". Kill a leader with a proposal in flight and the surviving majority commits the
+    /// entry while the client is told nothing happened; the client repeats it, and the write
+    /// lands twice. Found by `esker-client`'s `chaos_linearizability` (lane wy-c2), which made
+    /// the test drop operations the store said changed nothing and got a linearizability
+    /// violation on every run: a final read returning a value whose only write had been
+    /// refused with `NotSent`.
+    pub(crate) fn fail_outstanding(&mut self, what: &str) {
+        // Deliberately not `not_sent`: see above. The detail says why the outcome is unknown,
+        // because that is what a human reading the client's log needs in order to trust it.
+        let appended = ProtoError::Closed {
+            detail: format!("{what}; a proposal already in the Raft log may still commit"),
+        };
         for pending in self.pending.drain(..) {
-            let _ = pending.notify.send(Err(error.clone()));
+            let _ = pending.notify.send(Err(appended.clone()));
         }
+        let never_ran = ProtoError::not_sent(what);
         for read in self.reads.drain(..) {
-            let _ = read.notify.send(Err(error.clone()));
+            let _ = read.notify.send(Err(never_ran.clone()));
         }
     }
 
@@ -2111,6 +2135,10 @@ mod tests {
 
     /// Stopping fails everything outstanding rather than leaving a caller waiting for an answer
     /// that can never come.
+    ///
+    /// This is the *refused* path: the peer is already stopped, so the proposal never reaches the
+    /// driver and `NotApplied` is the truth. The path where it reached the log is the test below,
+    /// and the two must not be confused — this one alone passed while that one was broken.
     #[tokio::test]
     async fn stopping_fails_outstanding_work_rather_than_stranding_it() {
         let (_dir, db) = open_db();
@@ -2120,6 +2148,97 @@ mod tests {
         let error = peer.propose(&put(b"x")).await.unwrap_err();
         assert!(matches!(error, ProtoError::NotSent { .. }));
         assert_eq!(error.outcome(), esker_proto::RequestOutcome::NotApplied);
+    }
+
+    /// **A proposal that reached the log is never answered "provably not applied".**
+    ///
+    /// `NotSent` means the request demonstrably had no effect, and `esker-client` retries on it.
+    /// But a proposal is only ever queued *after* it has been appended at `last_index`, so when
+    /// the peer stops the entry is sitting in the Raft log where a surviving majority can still
+    /// commit and apply it. Answering `NotSent` there tells a client it is safe to send a write
+    /// that is on its way to being applied — and the retry applies it twice.
+    ///
+    /// Found by `esker-client`'s `chaos_linearizability` (lane wy-c2): dropping the operations
+    /// the store said changed nothing produced a linearizability violation on every run, each a
+    /// final read returning a value whose only write had been refused with
+    /// `NotSent { "the Raft peer stopped" }`.
+    ///
+    /// The two-voter group with one silent voter is what makes this reachable on purpose: node 1
+    /// can take office and append, and can never commit, so the proposal is still outstanding
+    /// when the peer is stopped.
+    #[tokio::test]
+    async fn a_proposal_already_in_the_log_is_answered_with_an_unknown_outcome() {
+        let (_dir, db) = open_db();
+        let auditor = Auditor::new(&db).seeded_with(&[1, 2]);
+        let peer = start(
+            &db,
+            1,
+            vec![1, 2],
+            Arc::clone(&auditor) as Arc<dyn RaftTransport>,
+        );
+
+        // Grant the votes, acknowledge nothing: a leader that cannot reach a quorum of two.
+        for _ in 0..400 {
+            for message in auditor.take_sent() {
+                if let Message::RequestVote {
+                    from,
+                    term,
+                    pre_vote,
+                    ..
+                } = message
+                {
+                    peer.step(Message::RequestVoteResponse {
+                        from: 2,
+                        to: from,
+                        term,
+                        granted: true,
+                        pre_vote,
+                    })
+                    .await
+                    .unwrap();
+                }
+            }
+            peer.tick().await.unwrap();
+            if peer.status().await.unwrap().role == Role::Leader {
+                break;
+            }
+        }
+        let before = peer.status().await.unwrap();
+        assert_eq!(before.role, Role::Leader, "the peer never took office");
+
+        let proposing = {
+            let peer = Arc::clone(&peer);
+            tokio::spawn(async move { peer.propose(&put(b"x")).await })
+        };
+
+        // Wait for the entry to be *in the log* — that is the precondition the claim is about,
+        // and asserting it is what stops this test passing for the wrong reason.
+        let mut appended = false;
+        for _ in 0..400 {
+            let status = peer.status().await.unwrap();
+            if status.last_index > before.last_index {
+                assert_eq!(status.commit, before.commit, "it must not have committed");
+                appended = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(appended, "the proposal never reached the log");
+
+        peer.stop();
+        let error = proposing
+            .await
+            .expect("the proposing task")
+            .expect_err("a proposal that cannot commit must not report success");
+        assert_eq!(
+            error.outcome(),
+            esker_proto::RequestOutcome::Unknown,
+            "a proposal in the log was answered {error}, which a client reads as safe to repeat"
+        );
+        assert!(
+            !error.is_retryable(),
+            "a write whose outcome is unknown must not be retried automatically"
+        );
     }
 
     /// Nothing that crosses a thread here is unbounded: an unbounded queue in front of an `fsync`
