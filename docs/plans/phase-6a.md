@@ -478,8 +478,8 @@ its own gap register, and it would be longer.
   planner, the pull-based executor and `EXPLAIN` (6c); `UPDATE` and `DELETE` with their index
   maintenance (6d); bound parameters in both wire formats and inferred `ParameterDescription` (6e).
   All three obligations from §10a are discharged.
-- [x] 7 — the `.slt` harness: ten files, 228 directives, run by **two** runners (ours and the
-  `sqllogictest` crate) and replayed against the real server to check that they record
+- [x] 7 — the `.slt` harness: fourteen files, 295 directives, run by **two** runners (ours and
+  the `sqllogictest` crate) and replayed against the real server to check that they record
   PostgreSQL's answers and not ours
 
 ## 10a. Handoff — where a fresh lane picks up
@@ -923,6 +923,43 @@ plan that cannot be checked against the query.
 The whole-corpus replay now accounts for every disagreement exactly: **30** in `unsupported.slt`
 (contract C2 by design), **5** `EXPLAIN` blocks (no cost model here, marked `DIVERGES` in the file),
 and **3** marked divergences. Nothing else.
+
+**Unit 7, third pass — the edge semantics the container had already answered.**
+
+Four more files, taking the corpus to 295 directives across fourteen. Nothing new in the server;
+these are cases the pg19 captures had settled during units 3 and 6 and that no test had written
+down.
+
+- **`ordering.slt`** — where NULL sits in a *sort*, which is a different rule from what it does to a
+  *predicate* and only one of the two is three-valued. In a `WHERE`, NULL is neither true nor false
+  and the row is dropped; in an `ORDER BY`, NULL is the largest value there is and the row is kept.
+  All six types, both directions, both overrides, and `infinity` sorting above every finite instant
+  and still below NULL — a type that confused a value with a missing one would put them adjacent.
+- **`empty_vs_null.slt`** — the distinction the row encoding is built around. A predicate separates
+  them one way (`= ''` finds one, `IS NULL` the other, `<> ''` finds neither) and a unique index the
+  other (two empty strings collide, two NULLs do not). Both print as nothing in most clients, which
+  is why collapsing them would be a wrong answer nothing reports.
+- **`limits.slt`** — zero, absent, and past the end, which is where an off-by-one hides. Two of the
+  cases are about ordering rather than arithmetic: the window is taken after the sort and after the
+  filter, and the first would look right under a stable storage order.
+- **`rowsort_check.slt`** — the one directive where the two runners could silently disagree.
+
+`rowsort` is now supported by our harness as well as the crate's, which is what lets the corpus say
+**the order is not part of the answer**. A `SELECT` with no `ORDER BY`, or one whose `ORDER BY`
+leaves ties, has no order to promise — PostgreSQL does not guarantee one and neither does this node
+— and writing such a result down as though it did pins an accident that the first change to the scan
+or the sort would break. Ours sorts column vectors exactly as the crate does, and
+`rowsort_check.slt` is there because if the two ever sorted differently, every `rowsort` result in
+the corpus would be checked against the wrong thing by one of them.
+
+The replay against PostgreSQL 19 adds exactly one disagreement across all four files, and it is the
+`A`/`a` collation pair `select.slt` already argues. Everything else agrees.
+
+Three limitations of the `.slt` format have now been found and all three are recorded where they
+bite: the whitespace join cannot express an empty column (hence the tab-joining validator); a NULL
+renders as the letters `NULL` and so sorts where an `N` would under `rowsort`; and a single-column
+row holding `''` renders as a blank line, which is what ends an expected block, so a possibly-empty
+column goes first and never last. None of the three is the server's.
 
 **Unit 2a.** The goldens are recorded, not written. A proxy between `psql` 18.6 and the
 PostgreSQL 19beta1 container logged both directions of five real sessions, and
