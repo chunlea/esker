@@ -433,11 +433,17 @@ fn set_state(node: &Node, state: esker_sql::catalog::SchemaState) {
     txn.commit().unwrap();
 }
 
-/// How many entries the index holds right now.
+/// How many entries the table's first index holds right now.
 fn index_entries(node: &Node, table: &str) -> usize {
     let def = node.table(table);
+    index_entries_of(node, table, def.indexes[0].id)
+}
+
+/// How many entries one index id holds — by id, so it can be asked after the index is gone.
+fn index_entries_of(node: &Node, table: &str, index_id: u64) -> usize {
+    let def = node.table(table);
     let txn = node.backend.begin().unwrap();
-    let (start, end) = esker_sql::row::index_range(TENANT, def.id, def.indexes[0].id);
+    let (start, end) = esker_sql::row::index_range(TENANT, def.id, index_id);
     txn.scan(&start, &end, 0).unwrap().len()
 }
 
@@ -844,8 +850,9 @@ fn a_concurrent_create_index_walks_the_states_and_ends_complete() {
     );
     let jobs = node.rows("SELECT * FROM esker_schema_jobs()");
     assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0][1], Some("ti".to_owned()));
-    assert_eq!(jobs[0][2], Some("absent".to_owned()));
+    assert_eq!(jobs[0][1], Some("adding".to_owned()));
+    assert_eq!(jobs[0][2], Some("ti".to_owned()));
+    assert_eq!(jobs[0][3], Some("absent".to_owned()));
 
     // Step by step, in the ADR's order.
     for expected in ["delete-only", "write-only"] {
@@ -914,9 +921,9 @@ fn a_backfill_resumes_from_its_cursor_rather_than_restarting() {
     let after_one_batch = index_entries(&node, "t");
     assert_eq!(after_one_batch, esker_sql::exec::BATCH_ROWS);
     let jobs = node.rows("SELECT * FROM esker_schema_jobs()");
-    assert_eq!(jobs[0][2], Some("write-only".to_owned()));
+    assert_eq!(jobs[0][3], Some("write-only".to_owned()));
     assert_ne!(
-        jobs[0][3],
+        jobs[0][4],
         Some("not started".to_owned()),
         "the cursor moved"
     );
@@ -991,4 +998,155 @@ fn dml_during_the_backfill_converges_with_it() {
         node.rows("SELECT id FROM t WHERE a = 4"),
         [[Some("4".to_owned())]]
     );
+}
+
+// --- The removal direction ----------------------------------------------------------------------
+//
+// `DROP INDEX CONCURRENTLY`: the same four states, walked backwards, and only then are the entries
+// taken away. The three state moves are bounded by the same thing an adding change is — a *writer*
+// one step behind, bounded by the lock TTL. The **final removal** is not: what it has to outlast is
+// a *reader*, and that is where correction 2's safepoint term goes live.
+
+/// The states run backwards, and the index is not gone until the last step.
+#[test]
+fn a_concurrent_drop_walks_the_states_backwards_before_removing_anything() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY, a int8)")
+        .unwrap();
+    node.run("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
+    node.run("CREATE UNIQUE INDEX ti ON t (a)").unwrap();
+    assert_eq!(index_entries(&node, "t"), 2);
+
+    node.run("DROP INDEX CONCURRENTLY ti").unwrap();
+    let jobs = node.rows("SELECT * FROM esker_schema_jobs()");
+    assert_eq!(jobs[0][1], Some("removing".to_owned()));
+    assert_eq!(jobs[0][3], Some("public".to_owned()));
+
+    for expected in ["write-only", "delete-only", "absent"] {
+        let said = node.rows("SELECT esker_schema_step('ti')")[0][0]
+            .clone()
+            .unwrap();
+        assert_eq!(said, expected);
+        assert_eq!(index_state(&node, "t").name(), expected);
+        // Nothing is removed until the very last step: at every intermediate state the entries are
+        // still there, because a node one step behind may still be reading or writing them.
+        assert_eq!(
+            index_entries(&node, "t"),
+            2,
+            "{expected}: the entries are still there"
+        );
+    }
+
+    assert_eq!(
+        node.rows("SELECT esker_schema_step('ti')")[0][0],
+        Some("dropped".to_owned())
+    );
+    assert!(node.table("t").indexes.is_empty(), "and now it is gone");
+    assert!(node.rows("SELECT * FROM esker_schema_jobs()").is_empty());
+    // The table still answers, out of itself.
+    assert_eq!(
+        node.rows("SELECT id FROM t WHERE a = 20"),
+        [[Some("2".to_owned())]]
+    );
+}
+
+/// **Why the last step waits the retention window, and the three before it do not.**
+///
+/// A transaction that began while the index was `public` reads through it, and its catalog *and*
+/// its entries are both at its own snapshot — so it keeps answering correctly after the entries are
+/// deleted, because MVCC keeps the versions it can see. This test is that fact: an old reader still
+/// gets the right answer through an index the cluster has already removed.
+///
+/// What bounds it is retention, not the states: a read below the GC safepoint is refused
+/// (`docs/txn-spec.md` §7). So waiting the retention window before the removal means no live reader
+/// can still be at `public` when the entries go — and correctness stops resting on retained
+/// versions that a shorter retention would silently take away. That is
+/// `PdResp::SchemaLease::removal_extra_ms`, and it is why the term is separate from the ordinary
+/// interval: an adding change never needs it.
+#[test]
+fn an_old_reader_at_public_still_reads_entries_a_removal_deleted() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY, a int8)")
+        .unwrap();
+    node.run("INSERT INTO t VALUES (1, 10)").unwrap();
+    node.run("CREATE UNIQUE INDEX ti ON t (a)").unwrap();
+
+    // A reader that begins while the index is public. Its snapshot is pinned here.
+    let mut reader = other_session(&node);
+    reader.run("BEGIN").unwrap();
+    assert_eq!(
+        reader.rows("SELECT id FROM t WHERE a = 10"),
+        [[Some("1".to_owned())]],
+        "it reads through the index, and that is the state it is pinned at"
+    );
+
+    // The cluster removes the index entirely, entries and all.
+    node.run("DROP INDEX CONCURRENTLY ti").unwrap();
+    for _ in 0..4 {
+        node.run("SELECT esker_schema_step('ti')").unwrap();
+    }
+    assert!(node.table("t").indexes.is_empty());
+    assert_eq!(
+        index_entries_of(&node, "t", 0),
+        0,
+        "the entries are deleted"
+    );
+
+    // **And the old reader is still right.** Its snapshot predates every one of those writes, so
+    // MVCC hands it the index and the entries as they were — which is exactly what retention keeps
+    // alive, and exactly what the removal step waits for before taking them away.
+    assert_eq!(
+        reader.rows("SELECT id FROM t WHERE a = 10"),
+        [[Some("1".to_owned())]],
+        "retention is what makes this safe, and the wait is what makes it finite"
+    );
+    reader.run("COMMIT").unwrap();
+
+    // A reader that starts now uses the table, and gets the same answer by a different path.
+    assert_eq!(
+        node.rows("SELECT id FROM t WHERE a = 10"),
+        [[Some("1".to_owned())]]
+    );
+}
+
+/// PostgreSQL refuses either concurrent form inside a transaction block with `25001` — captured,
+/// and the reason is the same on both servers: a concurrent change is many transactions, so it
+/// cannot be part of one.
+#[test]
+fn a_concurrent_change_inside_a_transaction_block_is_25001() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY, a int8)")
+        .unwrap();
+    node.run("CREATE INDEX ti ON t (a)").unwrap();
+
+    for (sql, named) in [
+        ("DROP INDEX CONCURRENTLY ti", "DROP INDEX CONCURRENTLY"),
+        (
+            "CREATE INDEX CONCURRENTLY tj ON t (a)",
+            "CREATE INDEX CONCURRENTLY",
+        ),
+    ] {
+        node.run("BEGIN").unwrap();
+        let error = node.fails(sql);
+        assert_eq!(error.sqlstate(), sqlstate::ACTIVE_SQL_TRANSACTION, "{sql}");
+        assert_eq!(
+            error.to_string(),
+            format!("{named} cannot run inside a transaction block")
+        );
+        node.run("ROLLBACK").unwrap();
+    }
+}
+
+/// `DROP INDEX CONCURRENTLY` on a name that is not there is `42704`, and `IF EXISTS` makes it a
+/// notice — both captured from 19beta1, and both the same answers the blocking form gives.
+#[test]
+fn a_concurrent_drop_of_a_missing_index_answers_the_way_the_blocking_one_does() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY)").unwrap();
+    assert_eq!(
+        node.fails("DROP INDEX CONCURRENTLY nosuch").sqlstate(),
+        sqlstate::UNDEFINED_OBJECT
+    );
+    node.run("DROP INDEX CONCURRENTLY IF EXISTS nosuch")
+        .unwrap();
 }

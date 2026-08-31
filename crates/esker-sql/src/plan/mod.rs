@@ -93,6 +93,23 @@ impl Statement {
         )
     }
 
+    /// The statement's name, when it is a `CONCURRENTLY` form that may not run inside a
+    /// transaction block — PostgreSQL's `25001`, captured.
+    ///
+    /// Both forms, for one reason: a concurrent change is *many* transactions, so it cannot be
+    /// part of one, and a block that could roll it back would be a block that could roll back half
+    /// a schema change.
+    #[must_use]
+    pub fn concurrently(&self) -> Option<&'static str> {
+        match self {
+            Statement::CreateIndex(create) if create.concurrently => {
+                Some("CREATE INDEX CONCURRENTLY")
+            }
+            Statement::DropIndex(drop) if drop.concurrently => Some("DROP INDEX CONCURRENTLY"),
+            _ => None,
+        }
+    }
+
     /// The command PostgreSQL names when refusing this statement in a read-only transaction, or
     /// `None` when it writes nothing.
     ///

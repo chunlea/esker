@@ -437,7 +437,7 @@ rather than to add the lines a feature happens to need.
 | G02 | unlogged / logged tables | 2 | `CREATE UNLOGGED TABLE t (a int8);` | admin / DDL only |
 | G03 | CREATE TABLE LIKE / OF | 2 | `CREATE TABLE t (LIKE u INCLUDING ALL);` | admin / DDL only |
 | G04 | exclusion constraints | 2 | `CREATE TABLE t (a int8, EXCLUDE USING gist (a WITH =));` | admin / DDL only |
-| G05 | index maintenance | 4 | `CREATE INDEX i ON ONLY t (a);` | admin / DDL only |
+| G05 | index maintenance | 3 | `CREATE INDEX i ON ONLY t (a);` | admin / DDL only. **Narrowed in phase 6e**: `DROP INDEX CONCURRENTLY` left this row — the parser cannot read the keyword, so the source is rewritten and the fact carried alongside (`crate::parse::Parsed::concurrently`), which is what `rewrite_synonym` already does for `TABLE t` and `ABORT`. |
 | G06 | views: recursive, materialized | 3 | `CREATE RECURSIVE VIEW v (n) AS SELECT 1;` | admin / DDL only |
 | G07 | sequence options | 2 | `CREATE SEQUENCE s START WITH 1 INCREMENT BY 1;` | admin / DDL only |
 | G08 | routine bodies | 5 | `CREATE FUNCTION f() RETURNS int8 BEGIN ATOMIC SELECT 1; END;` | admin / DDL only |

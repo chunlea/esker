@@ -733,6 +733,18 @@ impl Execute for Executor {
         if let Statement::Session(session) = &statement {
             return self.session_statement(session);
         }
+        // PostgreSQL's `25001`, captured: a concurrent change is *many* transactions, so it cannot
+        // be part of one, and a block that could roll it back would be a block that could roll back
+        // half a schema change.
+        //
+        // Checked **here** rather than beside the write gate, and the reason is a trap worth
+        // naming: `in_a_transaction` *takes* the open transaction out of `self` before it runs the
+        // statement, so a check for "am I in a block" further down always reads `None`.
+        if self.open.is_some()
+            && let Some(named) = statement.concurrently()
+        {
+            return Err(SqlError::ConcurrentlyInTransactionBlock(named));
+        }
         // After the session statements, because `SET TRANSACTION SNAPSHOT` is the one thing a
         // block may run before it counts as having read anything.
         self.open_used = true;

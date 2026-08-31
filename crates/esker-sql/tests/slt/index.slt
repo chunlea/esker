@@ -83,10 +83,10 @@ statement ok
 CREATE UNIQUE INDEX CONCURRENTLY cji ON cj (a)
 
 # The statement returns at once, with the index at absent: nothing reads it yet.
-query TTTT rowsort
+query TTTTT rowsort
 SELECT * FROM esker_schema_jobs()
 ----
-cj	cji	absent	not started
+cj	adding	cji	absent	not started
 
 # One step per state, in the ADR's order. Each of these three is a transition, and a driver waits
 # PD's published interval after each; the backfill batches between them change no state and wait
@@ -113,7 +113,7 @@ SELECT esker_schema_step('cji')
 public
 
 # A finished job is forgotten, and the index answers.
-query TTTT rowsort
+query TTTTT rowsort
 SELECT * FROM esker_schema_jobs()
 ----
 
@@ -121,3 +121,60 @@ query I
 SELECT id FROM cj WHERE a = 20
 ----
 2
+
+# --- DROP INDEX CONCURRENTLY, the removal direction ----------------------------------------------
+# The same four states, walked backwards, and nothing is removed until the last step. The three
+# state moves are bounded by a *writer* one step behind, like an adding change; the final removal is
+# bounded by a *reader*, which is where the retention term in PD's step interval goes live
+# (ADR 0020 as amended, docs/plans/phase-6e.md §1).
+
+statement ok
+DROP INDEX CONCURRENTLY cji
+
+query TTTTT rowsort
+SELECT * FROM esker_schema_jobs()
+----
+cj	removing	cji	public	backfilled
+
+query T
+SELECT esker_schema_step('cji')
+----
+write-only
+
+query T
+SELECT esker_schema_step('cji')
+----
+delete-only
+
+query T
+SELECT esker_schema_step('cji')
+----
+absent
+
+# Only now, and this is the step a driver waits the retention window before: at absent nothing reads
+# the index and nothing writes it, so what is taken away is something no live transaction can want.
+query T
+SELECT esker_schema_step('cji')
+----
+dropped
+
+query TTTTT rowsort
+SELECT * FROM esker_schema_jobs()
+----
+
+# The table still answers, out of itself.
+query I
+SELECT id FROM cj WHERE a = 20
+----
+2
+
+# PostgreSQL refuses either concurrent form inside a transaction block, and so does this: a
+# concurrent change is many transactions, so it cannot be part of one.
+statement ok
+BEGIN
+
+statement error (25001)
+CREATE INDEX CONCURRENTLY cjk ON cj (a)
+
+statement ok
+ROLLBACK

@@ -35,7 +35,12 @@ impl Parsed {
     /// Lowers this statement into the plan types the executor runs, or names the construct that
     /// stopped it (contract C2).
     pub fn lower(&self) -> Result<plan::Statement> {
-        lower_statement(&self.statement)
+        let mut lowered = lower_statement(&self.statement)?;
+        // The one thing the parser could not carry (`crate::parse::Parsed::concurrently`).
+        if let plan::Statement::DropIndex(drop) = &mut lowered {
+            drop.concurrently = self.is_concurrently();
+        }
+        Ok(lowered)
     }
 }
 
@@ -80,6 +85,12 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
                 }),
                 ObjectType::Index => plan::Statement::DropIndex(plan::DropIndex {
                     names,
+                    // `sqlparser` 0.62.0's `Drop` has no `concurrently` field, so the word is read
+                    // from the source. Measured rather than assumed: the statement parses and the
+                    // keyword is dropped, which would silently give the *blocking* drop to somebody
+                    // who asked for the concurrent one — the failure this crate's lowering exists
+                    // to prevent.
+                    concurrently: false,
                     if_exists: *if_exists,
                 }),
                 other => return Err(SqlError::unsupported(format!("DROP {other}"))),

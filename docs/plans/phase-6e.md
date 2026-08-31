@@ -71,9 +71,9 @@ right owner and this phase makes it one, but it is an addition rather than a fac
 carries column *identity* rather than a count (ADR 0019 Decision 3, a future version 3), and that
 is explicitly out. `ALTER COLUMN TYPE` stays `0A000`.
 
-`DROP INDEX` runs the states backwards and is the natural second; it is **not** in this phase's
-units, because the removal direction is what makes the safepoint term live and that deserves its
-own unit rather than a rider on this one.
+`DROP INDEX` runs the states backwards and is the natural second. **Built, as unit 8** — the
+removal direction is what makes the safepoint term live, which is why it got a unit rather than a
+rider on the adding one.
 
 ## 3. The lease, designed here because it is the one new safety property
 
@@ -220,8 +220,6 @@ Only if units 1–6 are green and there is budget.
 * **`DROP COLUMN`** — needs row format v3 (column identity), ADR 0019 Decision 3. Stays `0A000`.
 * **`ALTER COLUMN TYPE`** — same answer, different reason: a type change is a rewrite, and a rewrite
   is unit 4's machinery pointed at every row rather than at an index.
-* **`DROP INDEX` as a staged job** — the removal direction, where the safepoint term goes live. Its
-  own unit, not this phase's.
 * **Anything in `esker-client`, `esker-store`, `esker-txn`, `esker-engine`, `esker-raft`.** ADR 0020
   says they grow nothing. If one of them must, that is a report.
 * **A rewrite for a volatile default.** Unit 1 refuses it by name.
@@ -309,6 +307,18 @@ interval after every step is **656 seconds**, and waiting only after the three t
 **24 seconds**. Same safety: every batch runs at write-only, so no state moves and no node can fall
 a step behind while they run. `esker_schema_step`'s answer says which kind of step it took, so a
 driver can tell.
+
+**`DROP INDEX CONCURRENTLY` does not parse, and PostgreSQL accepts it — so the source is rewritten.**
+`sqlparser` 0.62.0's `Statement::Drop` has no `concurrently` field and the parser stops at the
+keyword. Unlike `AS OF SYSTEM TIME` or `FLASHBACK TABLE`, this is a spelling PostgreSQL 19 *takes*,
+which makes it a contract C1 gap rather than a syntax question — so it uses the mechanism this crate
+already had for that, `rewrite_synonym`'s: strip the word from the source and carry the fact on
+`Parsed`. Carried rather than inferred, because a rewrite that dropped it silently would give the
+**blocking** drop to somebody who asked for the concurrent one. Gap register row G05 narrowed.
+
+**The `25001` check has to run before `in_a_transaction`, not inside it.** That function *takes*
+the open transaction out of `self` before running the statement, so a check for "am I in a block"
+further down always reads `None`. Found by the test, which is the only way it would have been.
 
 **`FLASHBACK` is `esker_diff` applied backwards, and reusing the merge is the point.** A flashback
 that disagreed with the diff about what changed would be a flashback whose preview was a lie. Its

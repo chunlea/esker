@@ -14,7 +14,7 @@
 //! # The invariant this file exists to hold
 //!
 //! **No statement PostgreSQL 19 accepts is ever answered with a syntax error.** Not "few", not
-//! "only obscure ones" — none, across all 426. There are exactly two acceptable answers:
+//! "only obscure ones" — none, across all 428. There are exactly two acceptable answers:
 //!
 //! * the statement parses; or
 //! * it comes back `0A000 feature_not_supported` **naming the construct**, which is what
@@ -68,7 +68,6 @@ const KNOWN_GAPS: &[(&str, &str)] = &[
     ),
     // G05 -- index maintenance
     ("CREATE INDEX i ON ONLY t (a);", "G05"),
-    ("DROP INDEX CONCURRENTLY IF EXISTS i;", "G05"),
     ("REINDEX INDEX i;", "G05"),
     ("REINDEX TABLE CONCURRENTLY t;", "G05"),
     // G06 -- views: recursive, materialized

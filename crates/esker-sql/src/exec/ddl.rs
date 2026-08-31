@@ -284,6 +284,7 @@ pub(super) fn create_index(
                 table_id: updated.id,
                 cursor: Vec::new(),
                 done: false,
+                removing: false,
             },
         );
         // The statement returns as soon as the job exists, which is what `CONCURRENTLY` means:
@@ -336,6 +337,29 @@ pub(super) fn drop_index(
             }
         };
         let table = executor.table_by_id(txn, table_id)?;
+
+        if drop.concurrently {
+            // The **removal direction**: the index stays where it is and a job walks it backwards,
+            // `public → write-only → delete-only → absent`, before anything is removed. Dropping it
+            // here instead would take a node from `public` to gone in one step, and a node still at
+            // `public` reads an index a node at `absent` has stopped maintaining — ADR 0020's
+            // anomalies, read backwards.
+            catalog::put_job(
+                txn,
+                executor.tenant,
+                &catalog::JobRecord {
+                    index_id,
+                    table_id,
+                    cursor: Vec::new(),
+                    // A removal has no backfill: there is nothing to build, only entries to stop
+                    // writing and then to take away.
+                    done: true,
+                    removing: true,
+                },
+            );
+            continue;
+        }
+
         let (start, end) = crate::row::index_range(executor.tenant, table_id, index_id);
         super::for_each_page(txn, &start, &end, |txn, page| {
             for (key, _) in page {

@@ -170,6 +170,30 @@ pub(super) fn advance(executor: &Executor, index_id: u64, to: SchemaState) -> Re
     Ok(())
 }
 
+/// Takes an index away for good: its entries, its definition, its name and its job.
+///
+/// Only ever called at [`SchemaState::Absent`], where nothing reads the index and nothing writes
+/// it — so what is removed is something no live transaction can still want. The wait that makes
+/// that true is the caller's (`crate::exec::verbs::removing_step`).
+pub(super) fn remove(executor: &Executor, index_id: u64, table: &TableDef) -> Result<()> {
+    let tenant = executor.tenant;
+    let mut txn = executor.plain_read()?;
+    let (start, end) = crate::row::index_range(tenant, table.id, index_id);
+    crate::exec::for_each_page(&mut *txn, &start, &end, |txn, page| {
+        for (key, _) in page {
+            txn.delete(key);
+        }
+        Ok(())
+    })?;
+    let mut updated = table.clone();
+    updated.schema_version += 1;
+    updated.indexes.retain(|index| index.id != index_id);
+    catalog::replace_table(&mut *txn, tenant, table, &updated)?;
+    catalog::drop_job(&mut *txn, tenant, index_id);
+    txn.commit()?;
+    Ok(())
+}
+
 /// Unwinds a change that failed, back to `absent`, and forgets the job.
 ///
 /// Backwards through every state rather than straight to `absent`, for the same reason the forward

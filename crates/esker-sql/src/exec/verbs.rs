@@ -222,6 +222,11 @@ fn list_jobs(executor: &Executor, txn: &mut dyn Txn) -> Result<Outcome> {
         rows.push(vec![
             Some(table.name.clone().into_bytes()),
             Some(
+                if job.removing { "removing" } else { "adding" }
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            Some(
                 index
                     .map_or_else(|| job.index_id.to_string(), |index| index.name.clone())
                     .into_bytes(),
@@ -246,7 +251,7 @@ fn list_jobs(executor: &Executor, txn: &mut dyn Txn) -> Result<Outcome> {
     }
     let tag = format!("SELECT {}", rows.len());
     Ok(Outcome::Rows {
-        fields: ["table", "index", "state", "backfill"]
+        fields: ["table", "direction", "index", "state", "backfill"]
             .into_iter()
             .map(|name| FieldDescription::computed(name, ColumnType::Text))
             .collect(),
@@ -296,7 +301,23 @@ fn schema_step(executor: &mut Executor, txn: &mut dyn Txn, index: &str) -> Resul
         .map(|def| def.state)
         .ok_or_else(|| SqlError::UndefinedIndex(index.to_owned()))?;
 
-    let said = match state {
+    let said = if job.removing {
+        removing_step(executor, index_id, state, &table)?
+    } else {
+        adding_step(executor, index_id, state, tenant)?
+    };
+    Ok(one_text("esker_schema_step", said))
+}
+
+/// A step of a change that is **adding** an index: forwards through the states, with the backfill
+/// between write-only and public.
+fn adding_step(
+    executor: &mut Executor,
+    index_id: u64,
+    state: catalog::SchemaState,
+    tenant: u64,
+) -> Result<String> {
+    Ok(match state {
         catalog::SchemaState::Absent => {
             job::advance(executor, index_id, catalog::SchemaState::DeleteOnly)?;
             "delete-only".to_owned()
@@ -308,9 +329,7 @@ fn schema_step(executor: &mut Executor, txn: &mut dyn Txn, index: &str) -> Resul
         catalog::SchemaState::WriteOnly => match job::backfill_batch(executor, index_id) {
             Ok(true) => {
                 job::advance(executor, index_id, catalog::SchemaState::Public)?;
-                let mut own = executor.plain_read()?;
-                catalog::drop_job(&mut *own, tenant, index_id);
-                own.commit()?;
+                forget(executor, tenant, index_id)?;
                 "public".to_owned()
             }
             Ok(false) => "backfilling".to_owned(),
@@ -323,13 +342,65 @@ fn schema_step(executor: &mut Executor, txn: &mut dyn Txn, index: &str) -> Resul
             }
         },
         catalog::SchemaState::Public => {
-            let mut own = executor.plain_read()?;
-            catalog::drop_job(&mut *own, tenant, index_id);
-            own.commit()?;
+            forget(executor, tenant, index_id)?;
             "public".to_owned()
         }
-    };
-    Ok(one_text("esker_schema_step", said))
+    })
+}
+
+/// A step of a change that is **removing** an index: backwards through the states, and only then
+/// are the entries and the definition taken away.
+///
+/// # Why the last step is the expensive one
+///
+/// The three state moves are bounded by the same thing an adding change is: a *writer* can be one
+/// step behind, and a writer's lifetime is the lock TTL. The **final removal** is different,
+/// because what it has to outlast is a *reader*.
+///
+/// A transaction that began while the index was `public` reads through it, and its catalog and its
+/// entries are both at its own snapshot — so it keeps working after the entries are deleted,
+/// because MVCC keeps the versions it can see. What bounds *that* is retention: a read below the
+/// GC safepoint is refused (`docs/txn-spec.md` §7). So waiting the retention window before removing
+/// means no live reader can still be at `public` when the entries go, and correctness stops
+/// resting on retained versions that a shorter retention would take away.
+///
+/// That is why `PdResp::SchemaLease::removal_extra_ms` exists and why it is **separate** from the
+/// ordinary interval: an adding change never needs it, and folding it in would price every
+/// `CREATE INDEX` at the retention window (ADR 0020, as amended).
+fn removing_step(
+    executor: &mut Executor,
+    index_id: u64,
+    state: catalog::SchemaState,
+    table: &catalog::TableDef,
+) -> Result<String> {
+    Ok(match state {
+        catalog::SchemaState::Public => {
+            job::advance(executor, index_id, catalog::SchemaState::WriteOnly)?;
+            "write-only".to_owned()
+        }
+        catalog::SchemaState::WriteOnly => {
+            job::advance(executor, index_id, catalog::SchemaState::DeleteOnly)?;
+            "delete-only".to_owned()
+        }
+        catalog::SchemaState::DeleteOnly => {
+            job::advance(executor, index_id, catalog::SchemaState::Absent)?;
+            "absent".to_owned()
+        }
+        // At `absent` nothing reads it and nothing writes it, so the entries and the definition can
+        // go. This is the step a driver waits `removal_extra_ms` *before*.
+        catalog::SchemaState::Absent => {
+            job::remove(executor, index_id, table)?;
+            "dropped".to_owned()
+        }
+    })
+}
+
+/// Forgets a finished job, in a transaction of its own.
+fn forget(executor: &Executor, tenant: u64, index_id: u64) -> Result<()> {
+    let mut own = executor.plain_read()?;
+    catalog::drop_job(&mut *own, tenant, index_id);
+    own.commit()?;
+    Ok(())
 }
 
 /// One row of one text column, which is the shape every scalar verb here returns.

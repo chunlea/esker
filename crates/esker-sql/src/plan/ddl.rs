@@ -97,6 +97,12 @@ pub struct CreateIndex {
 pub struct DropIndex {
     /// One or more, folded.
     pub names: Vec<String>,
+    /// `CONCURRENTLY`: run the states **backwards** as a staged job rather than dropping it here.
+    ///
+    /// The removal direction (ADR 0020): `public → write-only → delete-only → absent`, and only
+    /// then are the entries removed. Each step waits longer than an adding one, because what a
+    /// removal has to outlast is a *reader* rather than a writer.
+    pub concurrently: bool,
     /// `IF EXISTS`.
     pub if_exists: bool,
 }

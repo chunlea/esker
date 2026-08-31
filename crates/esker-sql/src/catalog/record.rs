@@ -272,26 +272,33 @@ pub(super) fn job_range(tenant: u64) -> (Vec<u8>, Vec<u8>) {
 
 /// A job: which table and index, and **how far the backfill got**.
 ///
-/// The cursor is the whole reason this record exists. A backfill is many small transactions rather
+/// The **direction** is stored beside the cursor because the two ends of a schema change are not
+/// symmetric in what they cost: an adding step waits the ordinary interval, and a removing one
+/// waits the retention window on top of it (ADR 0020, as amended; `docs/plans/phase-6e.md` §1).
+/// A driver that could not tell them apart would have to assume the expensive one always.
+///
+/// The cursor is the other reason this record exists. A backfill is many small transactions rather
 /// than one — one transaction over a large table holds locks for its whole duration, conflicts
 /// with everything, and outlives the lock TTL the step arithmetic depends on (ADR 0020) — and many
 /// small transactions need somewhere durable to say where they got to, or a node that dies
 /// restarts instead of resuming.
 #[must_use]
-pub(super) fn encode_job(table_id: u64, cursor: &[u8], done: bool) -> Vec<u8> {
+pub(super) fn encode_job(table_id: u64, cursor: &[u8], done: bool, removing: bool) -> Vec<u8> {
     let mut out = vec![CATALOG_FORMAT_VERSION];
     out.extend_from_slice(&table_id.to_le_bytes());
     out.push(u8::from(done));
+    out.push(u8::from(removing));
     varint::put_u64(cursor.len() as u64, &mut out);
     out.extend_from_slice(cursor);
     out
 }
 
-/// Reads a job back: `(table_id, cursor, done)`.
-pub(super) fn decode_job(bytes: &[u8]) -> Result<(u64, Vec<u8>, bool)> {
+/// Reads a job back: `(table_id, cursor, done, removing)`.
+pub(super) fn decode_job(bytes: &[u8]) -> Result<(u64, Vec<u8>, bool, bool)> {
     let mut reader = Reader::new(bytes)?;
     let table_id = reader.u64_le()?;
     let done = reader.flag()?;
+    let removing = reader.flag()?;
     let len = reader.count()?;
     let (cursor, rest) = reader
         .bytes
@@ -300,7 +307,7 @@ pub(super) fn decode_job(bytes: &[u8]) -> Result<(u64, Vec<u8>, bool)> {
     let cursor = cursor.to_vec();
     reader.bytes = rest;
     reader.finish()?;
-    Ok((table_id, cursor, done))
+    Ok((table_id, cursor, done, removing))
 }
 
 /// The index id out of a job key, for listing.

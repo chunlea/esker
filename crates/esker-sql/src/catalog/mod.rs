@@ -717,13 +717,19 @@ pub struct JobRecord {
     pub cursor: Vec<u8>,
     /// Whether the backfill has reached the end of the table.
     pub done: bool,
+    /// Whether this change is **removing** the index rather than adding it.
+    ///
+    /// The states run backwards for a removal — `public → write-only → delete-only → absent` — and
+    /// a removing step waits the retention window on top of the ordinary interval, because what it
+    /// has to outlast is a *reader* rather than a writer.
+    pub removing: bool,
 }
 
 /// Records a job, or moves its cursor on.
 pub fn put_job(txn: &mut dyn Txn, tenant: u64, job: &JobRecord) {
     txn.put(
         &record::job_key(tenant, job.index_id),
-        &record::encode_job(job.table_id, &job.cursor, job.done),
+        &record::encode_job(job.table_id, &job.cursor, job.done, job.removing),
     );
 }
 
@@ -732,12 +738,13 @@ pub fn job(txn: &dyn Txn, tenant: u64, index_id: u64) -> Result<Option<JobRecord
     let Some(bytes) = txn.get(&record::job_key(tenant, index_id))? else {
         return Ok(None);
     };
-    let (table_id, cursor, done) = record::decode_job(&bytes)?;
+    let (table_id, cursor, done, removing) = record::decode_job(&bytes)?;
     Ok(Some(JobRecord {
         index_id,
         table_id,
         cursor,
         done,
+        removing,
     }))
 }
 
@@ -755,12 +762,13 @@ pub fn job_range(tenant: u64) -> (Vec<u8>, Vec<u8>) {
 /// One listed job, out of its key and its value.
 pub fn decode_job(tenant: u64, key: &[u8], value: &[u8]) -> Result<JobRecord> {
     let index_id = record::job_index_id(tenant, key)?;
-    let (table_id, cursor, done) = record::decode_job(value)?;
+    let (table_id, cursor, done, removing) = record::decode_job(value)?;
     Ok(JobRecord {
         index_id,
         table_id,
         cursor,
         done,
+        removing,
     })
 }
 

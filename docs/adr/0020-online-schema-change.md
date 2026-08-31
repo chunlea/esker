@@ -87,6 +87,26 @@ These are the same three anomalies for a column being dropped, read backwards: a
 public → absent in one step is read by a node that still thinks it is there, out of rows a node
 that thinks it is gone has already rewritten without it.
 
+> **Amended (phase 6e): what the removal direction costs that the adding one does not.** `DROP
+> INDEX CONCURRENTLY` runs `public → write-only → delete-only → absent` and only *then* takes the
+> entries and the definition away. The three state moves are bounded by exactly what an adding
+> change's are — a **writer** one step behind, whose lifetime is the lock TTL — so they wait the
+> ordinary interval.
+>
+> The **final removal** is bounded by something else, and this is where the safepoint term in the
+> step interval goes live. A transaction that began while the index was `public` reads through it,
+> and its catalog *and* its entries are both at its own snapshot — so it keeps answering correctly
+> after the entries are deleted, because MVCC keeps the versions it can see
+> (`crates/esker-sql/tests/schema_change.rs::an_old_reader_at_public_still_reads_entries_a_removal_deleted`
+> is that fact). What bounds *that* reader is retention: a read below the GC safepoint is refused
+> (`docs/txn-spec.md` §7).
+>
+> So waiting the retention window before the removal means no live reader can still be at `public`
+> when the entries go, and correctness stops resting on retained versions that a shorter retention
+> would silently take away. That is `removal_extra_ms` in [ADR 0028](0028-the-schema-lease.md), and
+> it is **separate** from the ordinary interval rather than folded in: an adding change never needs
+> it, and retention is an hour by default.
+
 ## The rule that makes one state at a time enough
 
 **At most two adjacent states may be in use in the cluster at any instant.** That is F1's

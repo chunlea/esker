@@ -155,6 +155,19 @@ impl StatementClass {
 pub struct Parsed {
     statement: Statement,
     class: StatementClass,
+    /// `CONCURRENTLY` on a `DROP INDEX`, which the parser cannot carry.
+    ///
+    /// `sqlparser` 0.62.0's `Statement::Drop` has no field for it, so the statement does not parse
+    /// at all — the keyword is where the parser stops. PostgreSQL 19 **accepts** it, which makes it
+    /// a contract C1 gap rather than a syntax question, and the fix is the mechanism this module
+    /// already has for a statement the parser cannot read: rewrite the source and remember what was
+    /// taken out ([`strip_drop_index_concurrently`]).
+    ///
+    /// Carried here rather than inferred later because the alternative is worse than a field: a
+    /// rewrite that dropped the word silently would give the **blocking** drop to somebody who
+    /// asked for the concurrent one, which is precisely the class of failure `crate::plan`'s
+    /// lowering exists to make impossible.
+    concurrently: bool,
 }
 
 impl Parsed {
@@ -186,6 +199,12 @@ impl Parsed {
         }))
     }
 
+    /// Whether a `DROP INDEX` asked for `CONCURRENTLY`. See [`Parsed::concurrently`].
+    #[must_use]
+    pub fn is_concurrently(&self) -> bool {
+        self.concurrently
+    }
+
     /// The statement rendered back to SQL, for `EXPLAIN` output and diagnostics.
     #[must_use]
     pub fn rendered(&self) -> String {
@@ -198,13 +217,49 @@ impl Parsed {
 /// A simple-query message may carry several statements in one string, which is why this returns a
 /// list and why the session runs them in order and stops at the first failure.
 pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
+    // `parse` does the rewriting; this only has to *notice*, because the keyword it removes is a
+    // fact about the statement that the parsed tree cannot carry.
+    let concurrently = strip_drop_index_concurrently(sql, &scan(sql)).is_some();
     Ok(parse(sql)?
         .into_iter()
         .map(|statement| {
             let class = classify(&statement);
-            Parsed { statement, class }
+            Parsed {
+                statement,
+                class,
+                concurrently,
+            }
         })
         .collect())
+}
+
+/// `DROP INDEX CONCURRENTLY x` with the keyword taken out, or `None` if that is not what this is.
+///
+/// The same shape as [`rewrite_synonym`] and for the same reason: a statement PostgreSQL 19 accepts
+/// and `sqlparser` cannot read is a **gap in the parser**, not a malformed statement, and this
+/// module's job is to keep that distinction from reaching a user. `CREATE INDEX CONCURRENTLY` needs
+/// none of this — `sqlparser`'s `CreateIndex` has the flag — which is the whole reason only one
+/// direction is rewritten here.
+///
+/// Deliberately narrow: only when the statement *begins* `DROP INDEX CONCURRENTLY`, so it cannot
+/// touch a table called `concurrently` or the word inside a string.
+fn strip_drop_index_concurrently(sql: &str, scanned: &Scan<'_>) -> Option<String> {
+    let [first, second, third, ..] = scanned.words.as_slice() else {
+        return None;
+    };
+    if !first.eq_ignore_ascii_case("DROP")
+        || !second.eq_ignore_ascii_case("INDEX")
+        || !third.eq_ignore_ascii_case("CONCURRENTLY")
+    {
+        return None;
+    }
+    // Case-insensitively, on the first occurrence, which the check above has pinned to the third
+    // word of the statement.
+    let at = sql.to_ascii_uppercase().find("CONCURRENTLY")?;
+    let mut rewritten = String::with_capacity(sql.len());
+    rewritten.push_str(sql.get(..at)?);
+    rewritten.push_str(sql.get(at + "CONCURRENTLY".len()..)?);
+    Some(rewritten)
 }
 
 /// Parses one statement string into statements, guarding the stack first.
@@ -218,8 +273,12 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
         return Err(SqlError::StatementTooComplex);
     }
 
-    // A statement PostgreSQL defines as a synonym for one the parser does know.
-    let rewritten = rewrite_synonym(sql, &scanned);
+    // A statement PostgreSQL defines as a synonym for one the parser does know, and one whose
+    // *keyword* the parser cannot read. Both are source rewrites for the same reason: the statement
+    // is valid PostgreSQL and the gap is the parser's, so the honest fix is to make it parse rather
+    // than to report a syntax error about correct SQL (contract C1).
+    let rewritten =
+        rewrite_synonym(sql, &scanned).or_else(|| strip_drop_index_concurrently(sql, &scanned));
     let text = rewritten.as_deref().unwrap_or(sql);
 
     let parsed = if scanned.max_depth <= INLINE_PARSE_DEPTH {
@@ -525,11 +584,6 @@ const UNSUPPORTED: &[Unsupported] = &[
         "CREATE INDEX ... ON ONLY",
         &["CREATE", "INDEX"],
         &["ON", "ONLY"],
-    ),
-    u(
-        "DROP INDEX CONCURRENTLY",
-        &["DROP", "INDEX"],
-        &["CONCURRENTLY"],
     ),
     u("REINDEX", &["REINDEX"], &[]),
     u("CREATE RECURSIVE VIEW", &["CREATE", "RECURSIVE"], &[]),

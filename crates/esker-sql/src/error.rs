@@ -442,6 +442,15 @@ pub enum SqlError {
     )]
     SnapshotIsolationRequired,
 
+    /// `CREATE`/`DROP INDEX CONCURRENTLY` inside a transaction block.
+    ///
+    /// PostgreSQL's own refusal, captured: `25001 DROP INDEX CONCURRENTLY cannot run inside a
+    /// transaction block`. The reason is the same on both servers and worth stating — a concurrent
+    /// build is *many* transactions, so it cannot be part of one, and a block that could roll it
+    /// back would be a block that could roll back half a schema change.
+    #[error("{0} cannot run inside a transaction block")]
+    ConcurrentlyInTransactionBlock(&'static str),
+
     /// `SET TRANSACTION SNAPSHOT` after the block has already read something. Exactly right, and
     /// the reason it is worth copying: a `start_ts` cannot change under a transaction that has
     /// already read at it.
@@ -609,9 +618,9 @@ impl SqlError {
             SqlError::DoesNotExistSkipping { .. } => sqlstate::SUCCESSFUL_COMPLETION,
             SqlError::IdentifierTruncated { .. } => sqlstate::NAME_TOO_LONG,
             SqlError::InFailedTransaction => sqlstate::IN_FAILED_SQL_TRANSACTION,
-            SqlError::ActiveTransaction | SqlError::SnapshotAfterQuery => {
-                sqlstate::ACTIVE_SQL_TRANSACTION
-            }
+            SqlError::ActiveTransaction
+            | SqlError::SnapshotAfterQuery
+            | SqlError::ConcurrentlyInTransactionBlock(_) => sqlstate::ACTIVE_SQL_TRANSACTION,
             SqlError::NoActiveTransaction | SqlError::SetTransactionOutsideBlock => {
                 sqlstate::NO_ACTIVE_SQL_TRANSACTION
             }
