@@ -1,0 +1,19 @@
+crates/esker-sql/src/bin/esker-sql.rs
+  s_dc640bf0df4adb::t_8b01a9a5d58c49 3-11,15-18,21-28,32-36,57-61
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "d76d2a35e65c1370c7a43a7e0709c3861c56c402",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "claude-fable-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
