@@ -1175,3 +1175,47 @@ narrower than what was fixed. It stays `#[ignore]`d until it is reliably green.
 Not yet chased: (B), which compaction pass bypasses `hold_for_lagging_peers`. The likeliest answer
 is that `RawNode::progress` is empty on a peer that is not leader at that instant, so a pass during
 a leadership flap compacts by the tail rule alone — and one such pass is permanent.
+
+## 19. Ruling (B): the hold's inputs are durable, and what the repro now shows
+
+### 19.1 Fail-safe, not fail-open
+
+`RawNode::progress` is a *leader's* view and is empty on anyone else, so the first version of
+`hold_for_lagging_peers` saw no peers whenever this peer was not leading that instant, held nothing,
+and compacted by the tail rule alone. Fail-open, and one such pass is permanent — the same
+transient-condition-permanent-consequence shape as everything else in this bug family. Leadership
+flaps constantly under load: twenty-one elections in one run of `tests/promotion.rs`.
+
+The hold now computes from **durable inputs** — the region record's peer list and this peer's own
+apply index — rather than from leadership state, which is exactly what cannot be relied on. A peer
+that has peers it cannot see keeps `SLOW_PEER_LOG_ALLOWANCE` entries instead of the tail. Bounded,
+so a follower's log still compacts; never aggressive while it is blind.
+
+### 19.2 Two guards on replacing a live region
+
+Replacing a region this store already holds is the heaviest thing that can be done to one: the peer
+stops, the range is emptied, and nothing serves that range until the transfer finishes. Without
+guards, a single stale announcement during a leadership flap tore down a live region. A peer that
+**leads** the region is never behind it, and one whose apply index already reaches the announcement
+has nothing to fetch; both now decline.
+
+### 19.3 The load generator was measuring the bug
+
+Three of six failures were writes timing out with `NotLeader`, and the cause was the test: it wrote
+only ever to store 1. That worked while every leader stayed on store 1 — **which was the bug**. A
+cluster whose leadership actually spreads refuses those writes, correctly. The generator follows the
+leader now, and the test moved to **three stores at `target_replicas` three**, as every acceptance
+scenario uses: two voters is a trap, because the quorum is then two and one replica falling slightly
+behind stops the region committing.
+
+### 19.4 Where the repro stands
+
+**0 of 6 green before this section, 4 of 6 after** (24–26 s per green run). It is not yet
+consistently green, so it stays `#[ignore]`d.
+
+The one remaining shape is a learner reporting `applied=0` with a region record a `version` behind
+its leader's, receiving nothing. Removing the epoch check on Raft traffic was measured against it
+twice — 5 of 8 green with, 4 of 6 without — which is noise, so the change was **reverted both
+times** rather than shipped on the strength of a plausible story. The argument for it stands and is
+recorded here: a peer that is behind necessarily holds a stale epoch, so dropping its replies is
+circular. Something else has to distinguish the two before it is worth making.

@@ -1433,9 +1433,18 @@ impl Store {
             // Invariant 5, applied to Raft traffic. A batch carries messages for many regions
             // now, so the epoch it is checked against is the one of the region it names — not
             // the store's, which is not a thing a store has.
+            //
+            // A behind peer necessarily holds a stale epoch — that is what being behind means —
+            // so this drops its replies and is arguably circular: a stalled learner was observed
+            // at `applied=0` and version 6 while its leader was healthy at version 7. Removing the
+            // check was measured twice, at 4/6 and 5/8 runs green against 4/6 without it, which is
+            // noise. Kept as it is until something distinguishes them (`docs/plans/phase-4.md`
+            // §19).
             if message.epoch.is_stale_against(state.region().epoch) {
                 tracing::debug!(
                     region_id = message.region_id,
+                    theirs = ?message.epoch,
+                    ours = ?state.region().epoch,
                     "dropped a Raft message from a stale epoch"
                 );
                 continue;
@@ -1464,10 +1473,23 @@ impl Store {
             // limitation is now what happens — the offer is declined and the peer stays behind,
             // visible in PD's heartbeats — rather than something that looked like a repair.
             if let Some(index) = Self::snapshot_announcement(&message.message) {
-                // The peer hosts this region and has fallen behind what its leader still has, so
-                // the log cannot catch it up. It fetches the region again and replaces what it
-                // holds — which the range clearing in `snapshot::clear_range` is what makes
-                // possible (`docs/plans/phase-4.md` §18).
+                // Replacing a region this store already holds is the heaviest thing it can do to
+                // one — the peer stops, the range is emptied, and nothing serves that range until
+                // the transfer finishes — so it happens only when the log genuinely cannot catch
+                // this peer up. Two guards, and both were learned by leaving them out: without
+                // them a single stale announcement during a leadership flap tore down a live
+                // region and the writes to its range stalled for as long as the refetch took.
+                //
+                // A peer that **leads** the region is never behind it, and one whose apply index
+                // already reaches the announcement has nothing to fetch.
+                if peer.is_leader() || peer.applied_index() >= index {
+                    tracing::debug!(
+                        region_id = message.region_id,
+                        index,
+                        "ignored a snapshot offer for a region this peer is not behind on"
+                    );
+                    continue;
+                }
                 self.start_snapshot(
                     message.region_id,
                     message.from_store,

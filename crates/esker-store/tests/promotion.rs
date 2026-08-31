@@ -120,27 +120,42 @@ fn key(n: u32) -> Bytes {
     Bytes::from(format!("k{n:06}"))
 }
 
-/// Writes one key through whichever region currently owns it, retrying while the routing moves.
-async fn put(store: &Arc<Store>, key: Bytes, value: &[u8]) {
-    // Generous, because a region being *replaced* moves its routing far more than a split does
-    // and every retry here is a legitimate `EpochNotMatch`.
+/// Writes one key through whichever store currently **leads** the region that owns it.
+///
+/// Following the leader is the whole of it, and it is what the two-store version of this test did
+/// not have to do: while every leader stayed on store 1 — which was the bug — writing to store 1
+/// always worked. A cluster whose leadership actually spreads refuses those writes with
+/// `NotLeader`, correctly, so a load generator that only knows one store measures the bug rather
+/// than the fix.
+async fn put(stores: &[&Arc<Store>], key: Bytes, value: &[u8]) {
     let deadline = Instant::now() + Duration::from_secs(90);
+    let mut last: Option<String> = None;
     loop {
-        let Some(state) = store.regions().find(&key) else {
-            assert!(Instant::now() < deadline, "no region ever covered {key:?}");
-            tokio::time::sleep(Duration::from_millis(2)).await;
-            continue;
-        };
-        let header = RequestHeader::new(state.id(), state.region().epoch, 0);
-        let request = RawKvReq::put(key.clone(), Bytes::copy_from_slice(value));
-        match store.serve(header, request).await {
-            Ok(_) => return,
-            Err(error) => {
-                assert!(error.is_retryable(), "writing {key:?}: {error}");
-                assert!(Instant::now() < deadline, "writing {key:?} never succeeded");
-                tokio::time::sleep(Duration::from_millis(2)).await;
+        for store in stores {
+            let Some(state) = store.regions().find(&key) else {
+                continue;
+            };
+            let Some(peer) = store.peer_of(state.id()) else {
+                continue;
+            };
+            if !peer.is_leader() {
+                continue;
+            }
+            let header = RequestHeader::new(state.id(), state.region().epoch, 0);
+            let request = RawKvReq::put(key.clone(), Bytes::copy_from_slice(value));
+            match store.serve(header, request).await {
+                Ok(_) => return,
+                Err(error) => {
+                    assert!(error.is_retryable(), "writing {key:?}: {error}");
+                    last = Some(error.to_string());
+                }
             }
         }
+        assert!(
+            Instant::now() < deadline,
+            "writing {key:?} never succeeded; the last refusal was: {last:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
@@ -203,20 +218,26 @@ async fn a_learner_on_a_fresh_store_becomes_a_voter_under_load() {
         .with_test_writer()
         .try_init();
     let pd_address = reserve();
-    let first_address = reserve();
-    let second_address = reserve();
-    let peers = vec![
-        PeerAddress::new(1, 1, first_address),
-        PeerAddress::new(2, 2, second_address),
-    ];
+    let addresses: Vec<std::net::SocketAddr> = (0..3).map(|_| reserve()).collect();
+    let peers: Vec<PeerAddress> = addresses
+        .iter()
+        .enumerate()
+        .map(|(at, address)| {
+            let id = at as u64 + 1;
+            PeerAddress::new(id, id, *address)
+        })
+        .collect();
 
     let pd_dir = tempfile::tempdir().unwrap();
     let pd = Pd::open(
         pd_dir.path(),
         PdOptions {
-            // Two, because two stores is what this test has: PD must want a replica on the store
-            // that joins, and must consider the job done when it votes.
-            target_replicas: 2,
+            // **Three, as every acceptance scenario uses.** Two is the tempting size for a test
+            // and it is a trap: a two-voter group has a quorum of two, so every write needs both
+            // and a replica that falls a little behind stops the region committing. That stalls
+            // the load rather than the promotion, which is a fault of the configuration and not of
+            // the code under test.
+            target_replicas: 3,
             // Short, so a stall shows up as a stall rather than as a slow success.
             operator_timeout_ms: 5_000,
             balance_cooldown_ms: 500,
@@ -234,7 +255,7 @@ async fn a_learner_on_a_fresh_store_becomes_a_voter_under_load() {
     .unwrap();
     let pd_handle = pd_server.spawn().unwrap();
 
-    let first = open_store(first_address, 1, pd_address, &peers).await;
+    let first = open_store(addresses[0], 1, pd_address, &peers).await;
     wait_for("a leader on the first store", 20, || {
         first
             .store
@@ -249,23 +270,26 @@ async fn a_learner_on_a_fresh_store_becomes_a_voter_under_load() {
     // Enough to split a few times, so the cluster has regions to place rather than one.
     let value = vec![b'v'; 512];
     for n in 0..300 {
-        put(&first.store, key(n), &value).await;
+        put(&[&first.store], key(n), &value).await;
     }
     wait_for("the first store to split", 60, || {
         first.store.regions().len() >= 2
     })
     .await;
 
-    let second = open_store(second_address, 2, pd_address, &peers).await;
+    let second = open_store(addresses[1], 2, pd_address, &peers).await;
+    let third = open_store(addresses[2], 3, pd_address, &peers).await;
 
     // Load keeps running while the cluster grows, which is the case the lag criterion has to work
     // under: a learner is never exactly level with a leader that is still taking writes.
     let writer = {
         let store = Arc::clone(&first.store);
+        let store2 = Arc::clone(&second.store);
+        let store3 = Arc::clone(&third.store);
         let value = value.clone();
         tokio::spawn(async move {
             for n in 300..900 {
-                put(&store, key(n), &value).await;
+                put(&[&store, &store2, &store3], key(n), &value).await;
             }
         })
     };
@@ -275,11 +299,12 @@ async fn a_learner_on_a_fresh_store_becomes_a_voter_under_load() {
     // the load keeps splitting, so there is nearly always one that is merely new. A learner that
     // is *still* a learner after `PROMOTION_DEADLINE` is exactly the acceptance finding, where
     // every region held two of them for four minutes and for ever after.
-    watch_until_every_learner_votes(&pd, &second, &writer).await;
+    watch_until_every_learner_votes(&pd, &[&second, &third], &writer).await;
     writer.await.expect("the load completed");
 
     first.stop().await;
     second.stop().await;
+    third.stop().await;
     let _ = pd_handle.shutdown().await;
 }
 
@@ -288,7 +313,7 @@ async fn a_learner_on_a_fresh_store_becomes_a_voter_under_load() {
 /// new is not mistaken for one that is stranded.
 async fn watch_until_every_learner_votes(
     pd: &Arc<Pd>,
-    second: &Node,
+    joined: &[&Node],
     writer: &tokio::task::JoinHandle<()>,
 ) {
     let mut first_seen: BTreeMap<(u64, u64), Instant> = BTreeMap::new();
@@ -300,7 +325,7 @@ async fn watch_until_every_learner_votes(
         for region in pd_regions(pd) {
             for peer in &region.peers {
                 let id = (region.id, peer.peer_id);
-                if peer.store_id == 2 {
+                if peer.store_id != 1 {
                     placed_on_second = true;
                 }
                 match peer.role {
@@ -310,10 +335,9 @@ async fn watch_until_every_learner_votes(
                             // What the *learner's own store* thinks, which is the half the
                             // leader's progress cannot show — and the half that proved it was
                             // alive and applying all along.
-                            let theirs: Vec<String> = second
-                                .store
-                                .region_statuses()
-                                .into_iter()
+                            let theirs: Vec<String> = joined
+                                .iter()
+                                .flat_map(|node| node.store.region_statuses())
                                 .filter(|status| status.region.id == region.id)
                                 .map(|status| {
                                     format!(
@@ -358,6 +382,6 @@ async fn watch_until_every_learner_votes(
 
     assert!(
         placed_on_second,
-        "no replica was ever placed on the second store, so nothing was tested"
+        "no replica was ever placed on a store that joined, so nothing was tested"
     );
 }

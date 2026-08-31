@@ -415,8 +415,31 @@ impl PeerCore {
     /// a leader runs out of disk.
     fn hold_for_lagging_peers(&self, target: Index) -> Index {
         let allowance = self.compaction.slow_peer_allowance;
+        let progress = self.node.progress();
+
+        // **Blind means conservative, not permissive.** `progress` is a *leader's* view of its
+        // peers and is empty on anyone else — so a peer that is not leading this instant sees no
+        // peers at all, and the first version of this treated that as "nothing to hold for" and
+        // compacted by the tail rule alone. That is fail-open, and one such pass is permanent: the
+        // same transient-condition-permanent-consequence shape as every other bug in this family.
+        // Leadership flaps constantly under load (twenty-one elections in one run of
+        // `tests/promotion.rs`), so this is not a rare window.
+        //
+        // The inputs here are deliberately durable ones — the region record's peer list and this
+        // peer's own apply index — rather than the core's leadership state, which is exactly what
+        // cannot be relied on. A region with peers it cannot see keeps `slow_peer_allowance`
+        // entries; that is bounded, so a follower's log still compacts, just never aggressively
+        // while it has no idea who is behind it.
+        if progress.is_empty() {
+            if self.region.peers.len() > 1 {
+                return target.min(self.applied_index.saturating_sub(allowance));
+            }
+            // A region of one has nobody to feed but itself.
+            return target;
+        }
+
         let mut held = target;
-        for peer in self.node.progress() {
+        for peer in progress {
             if peer.id == self.peer_id {
                 continue;
             }
