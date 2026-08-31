@@ -58,10 +58,13 @@ pub struct Cluster {
     pub catalog: Arc<Catalog>,
     _handles: Vec<ServerHandle>,
     _dirs: Vec<tempfile::TempDir>,
-    _runtime: tokio::runtime::Runtime,
+    /// The runtime the stores were started on, when this cluster owns one. `None` when the caller
+    /// was already inside a runtime and lent us theirs — a runtime built inside a runtime panics,
+    /// which is why [`Cluster::start_on_this_runtime`] exists at all.
+    runtime: Option<tokio::runtime::Runtime>,
 }
 
-fn start_store(runtime: &tokio::runtime::Runtime, id: u64) -> (ServerHandle, tempfile::TempDir) {
+async fn start_store(id: u64) -> (ServerHandle, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let store = Store::open(
         dir.path(),
@@ -73,17 +76,15 @@ fn start_store(runtime: &tokio::runtime::Runtime, id: u64) -> (ServerHandle, tem
         },
     )
     .expect("the store opens");
-    let handle = runtime.block_on(async {
-        esker_proto::transport::Server::bind(
-            "127.0.0.1:0",
-            StoreService::new(store),
-            TransportConfig::new(),
-        )
-        .await
-        .expect("the server binds")
-        .spawn()
-        .expect("the server starts")
-    });
+    let handle = esker_proto::transport::Server::bind(
+        "127.0.0.1:0",
+        StoreService::new(store),
+        TransportConfig::new(),
+    )
+    .await
+    .expect("the server binds")
+    .spawn()
+    .expect("the server starts");
     (handle, dir)
 }
 
@@ -101,21 +102,39 @@ fn route(id: u64, start: &[u8], end: &[u8]) -> Route {
 }
 
 impl Cluster {
-    /// Starts three stores and points a SQL node at them.
+    /// Starts three stores on a runtime of its own, for a synchronous test.
     pub fn start() -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
             .build()
             .expect("a runtime");
+        let mut cluster = runtime.block_on(Cluster::start_on_this_runtime());
+        cluster.runtime = Some(runtime);
+        cluster
+    }
 
-        let started: Vec<_> = (1..=3).map(|id| start_store(&runtime, id)).collect();
+    /// The same, on the caller's runtime — for a test that is already inside one, where building
+    /// a second would panic.
+    pub async fn start_on_this_runtime() -> Self {
+        let mut started = Vec::new();
+        for id in 1..=3 {
+            started.push(start_store(id).await);
+        }
         let addresses: Vec<_> = started
             .iter()
             .map(|(handle, _)| handle.local_addr())
             .collect();
-        let stores = TcpStores::connect_all(&addresses, TransportConfig::new())
-            .expect("the client connects to all three");
+        // `connect_all` is synchronous and blocks, so it cannot run on a runtime thread -- which
+        // is where this function is. `spawn_blocking` is the seam for exactly that, and it is the
+        // same one the SQL node uses to run the executor (`CLAUDE.md`: async only at the network
+        // edge).
+        let stores = tokio::task::spawn_blocking(move || {
+            TcpStores::connect_all(&addresses, TransportConfig::new())
+        })
+        .await
+        .expect("the connect task runs")
+        .expect("the client connects to all three");
         assert_eq!(stores.store_ids(), vec![1, 2, 3]);
 
         let resolver: Arc<dyn RegionResolver> = Arc::new(RegionTable::from_routes([
@@ -143,7 +162,7 @@ impl Cluster {
             catalog: Arc::new(Catalog::new()),
             _handles: handles,
             _dirs: dirs,
-            _runtime: runtime,
+            runtime: None,
         }
     }
 

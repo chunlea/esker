@@ -1,9 +1,11 @@
 //! The SQL node: listen, and speak PostgreSQL.
 //!
 //! One process, one listener, one executor per connection over a store shared by all of them.
-//! Until phase 5's client is wired in, that store is the in-memory transactional fake
-//! (`esker_sql::backend::MemoryBackend`) — real MVCC with real write-write conflict detection, but
-//! only in this process and only until it exits. `TODO(phase-6a)`: the real `TxnClient`.
+//!
+//! The store is a real cluster when store addresses are given and the in-memory transactional fake
+//! otherwise. The fake is real MVCC with real write-write conflict detection and is still only in
+//! this process, which makes it right for a demonstration and wrong for anything else — so the
+//! node says which one it opened, in a line an operator will see before they wonder.
 //!
 //! Everything the executor cannot run is answered `0A000 feature_not_supported` naming the
 //! construct, which is contract C2 working as intended rather than a placeholder: a client
@@ -12,7 +14,7 @@
 
 use std::sync::Arc;
 
-use esker_sql::backend::{Backend, MemoryBackend};
+use esker_sql::backend::{Backend, MemoryBackend, StoreBackend};
 use esker_sql::catalog::Catalog;
 use esker_sql::exec::Executor;
 use esker_sql::pgwire::server::{Auth, Config, Executors, serve};
@@ -46,17 +48,59 @@ async fn main() -> std::io::Result<()> {
         )
         .init();
 
-    let address = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "127.0.0.1:5432".to_owned());
+    // `esker-sql [listen] [store...]`. With no stores the node runs on the in-process fake.
+    let mut args = std::env::args().skip(1);
+    let address = args.next().unwrap_or_else(|| "127.0.0.1:5432".to_owned());
+    let stores: Vec<String> = args.collect();
     let config = Config {
         address,
         auth: Auth::Trust,
         ..Config::default()
     };
+    let backend: Arc<dyn Backend> = if stores.is_empty() {
+        tracing::warn!(
+            "no store addresses given: running on the in-process fake, which keeps nothing"
+        );
+        Arc::new(MemoryBackend::new())
+    } else {
+        tracing::info!(stores = ?stores, "connecting to the cluster");
+        Arc::new(StoreBackend::new(Arc::new(connect(&stores)?)))
+    };
     let sessions = Sessions {
-        backend: Arc::new(MemoryBackend::new()),
+        backend,
         catalog: Arc::new(Catalog::new()),
     };
     serve(config, Arc::new(sessions)).await
+}
+
+/// Builds a client over the given stores, with routing that asks them where the regions are.
+///
+/// `TODO(phase-6a)`: the routing table comes from PD once this node speaks to it; until then a
+/// node started against real stores is told about them on the command line.
+fn connect(stores: &[String]) -> std::io::Result<esker_client::TxnClient> {
+    use esker_proto::transport::TransportConfig;
+
+    let addresses: Vec<std::net::SocketAddr> = stores
+        .iter()
+        .map(|address| {
+            address.parse().map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{address} is not a store address: {error}"),
+                )
+            })
+        })
+        .collect::<std::io::Result<_>>()?;
+    let transport = esker_client::TcpStores::connect_all(&addresses, TransportConfig::default())
+        .map_err(std::io::Error::other)?;
+    // One region over every store given, which is what a cluster bootstraps with and what a
+    // redirect needs to be able to follow. `TODO(phase-6a)`: the real routing table comes from
+    // PD, and then a node is told where PD is rather than where the stores are.
+    let store_ids = transport.store_ids();
+    let resolver = Arc::new(esker_client::StaticRegion::replicated(1, &store_ids));
+    let router = esker_client::Router::new(Arc::new(transport), resolver);
+    Ok(esker_client::TxnClient::on_router(
+        Arc::new(router),
+        Arc::new(esker_client::CountingOracle::starting_at(1)),
+    ))
 }

@@ -125,7 +125,15 @@ pub(crate) const FILES: &[(&str, &str)] = &[
 /// One file, in its own node: a file is a self-contained story and must not depend on another
 /// having run first.
 pub(crate) fn run_file(name: &str, body: &str) -> usize {
-    let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    run_file_on(name, body, Arc::new(MemoryBackend::new()))
+}
+
+/// The same, over a backend the caller chose — which is how the corpus is replayed against a real
+/// cluster (`tests/real_corpus.rs`) rather than only against the fake.
+///
+/// The whole corpus, unchanged, is the point: a file that had to be written differently for the
+/// real store would be testing the file rather than the store.
+pub(crate) fn run_file_on(name: &str, body: &str, backend: Arc<dyn Backend>) -> usize {
     let mut executor = Executor::new(backend, Arc::new(Catalog::new()), 1);
     let mut directives = 0;
 

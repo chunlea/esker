@@ -15,6 +15,9 @@ esker-base.workspace = true
 # the dependency budget moves: its own dependencies are the ones this crate already has.
 esker-client.workspace = true
 esker-keys.workspace = true
+# The wire types the client's constructors take (`TransportConfig`). Already in this crate's
+# graph through esker-client; naming it here is what lets the binary build one.
+esker-proto.workspace = true
 # Contained to src/parse.rs by rule (docs/adr/0014-sqlparser.md); a `use sqlparser::`
 # anywhere else in this crate is a review failure.
 sqlparser.workspace = true
@@ -26,7 +29,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-esker-proto.workspace = true
 # The end-to-end tests run the corpus against real stores over real sockets, which is the only
 # way to prove the wiring rather than the fake.
 esker-store.workspace = true

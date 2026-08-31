@@ -101,10 +101,25 @@ pub async fn serve(config: Config, executors: Arc<dyn Executors>) -> std::io::Re
 pub struct Connection<S> {
     stream: S,
     config: Config,
-    session: Session,
     /// The role the client asked to connect as, for the authentication failure message.
     user: String,
     /// Reused between messages so a busy session is not allocating a buffer per reply.
+    ///
+    /// It travels to the blocking thread with the session and comes back, so "reused" survives
+    /// that trip — which is the point of moving the whole bundle rather than copying out of it.
+    out: Vec<u8>,
+}
+
+/// What one message's worth of work owns while it runs.
+///
+/// It is a bundle because it has to **move**: everything below [`Execute`] is synchronous and
+/// talks to the network, so a statement cannot run on a runtime thread
+/// (`docs/plans/phase-6a.md` §5). Running it there was harmless while the store was in this
+/// process and stops the node dead against a real one — `BlockingTransport::call was used inside
+/// an async runtime`, once per statement, for every client.
+struct Work {
+    session: Session,
+    executor: Box<dyn Execute + Send>,
     out: Vec<u8>,
 }
 
@@ -114,7 +129,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         Connection {
             stream,
             config,
-            session: Session::new(),
+
             user: String::new(),
             out: Vec::with_capacity(8 * 1024),
         }
@@ -126,10 +141,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     ///
     /// Any I/O failure. A *protocol* failure is reported to the client and ends the connection
     /// cleanly rather than surfacing here.
-    pub async fn run(&mut self, mut executor: Box<dyn Execute + Send>) -> std::io::Result<()> {
+    pub async fn run(&mut self, executor: Box<dyn Execute + Send>) -> std::io::Result<()> {
         if !self.startup().await? {
             return Ok(());
         }
+        let mut work = Work {
+            session: Session::new(),
+            executor,
+            out: std::mem::take(&mut self.out),
+        };
         loop {
             let Some((tag, body)) = self.read_message().await? else {
                 return Ok(());
@@ -147,11 +167,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             if matches!(message, crate::pgwire::message::Frontend::Terminate) {
                 return Ok(());
             }
-            self.out.clear();
-            self.session
-                .handle(&message, executor.as_mut(), &mut self.out);
-            if !self.out.is_empty() {
-                self.stream.write_all(&self.out).await?;
+            // Onto a blocking thread and back. `spawn_blocking` rather than `block_in_place`
+            // because a node serves many connections at once: blocking a *worker* thread per
+            // statement would starve the runtime of the threads it needs to read the next
+            // message, where the blocking pool exists to be blocked.
+            work.out.clear();
+            // The bundle moves in and comes back out, so the buffer really is reused across
+            // messages rather than reallocated per statement.
+            work = tokio::task::spawn_blocking(move || {
+                let mut work = work;
+                work.session
+                    .handle(&message, work.executor.as_mut(), &mut work.out);
+                work
+            })
+            .await
+            .map_err(std::io::Error::other)?;
+            if !work.out.is_empty() {
+                self.stream.write_all(&work.out).await?;
                 self.stream.flush().await?;
             }
         }

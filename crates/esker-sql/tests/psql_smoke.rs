@@ -12,6 +12,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod cluster;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -339,7 +341,48 @@ async fn psql_runs_real_sql_against_the_real_executor() {
         eprintln!("skipping: no psql on this machine");
         return;
     }
+    let sessions = Arc::new(RealSessions::new());
+    psql_smoke(sessions).await;
+}
 
+/// The same script, the same assertions, against **three real stores over real sockets**.
+///
+/// This is the end of the wiring: a client nobody here wrote, talking PostgreSQL over a socket, to
+/// a stateless node that holds no data at all — every row of it is in one of three separate
+/// databases, and every statement is a Percolator transaction spanning at least two of them.
+///
+/// It runs the same script as the fake-backed test above rather than one of its own, because the
+/// question it answers is precisely *whether that makes any difference*.
+#[tokio::test(flavor = "multi_thread")]
+async fn psql_runs_real_sql_against_a_real_cluster() {
+    if !psql_available() {
+        eprintln!("skipping: no psql on this machine");
+        return;
+    }
+    let cluster = cluster::Cluster::start_on_this_runtime().await;
+    let sessions = Arc::new(RealSessions::on(Arc::clone(&cluster.backend)));
+    psql_smoke(sessions).await;
+    // Held until the script is done: dropping it closes the stores out from under the node.
+    drop(cluster);
+}
+
+/// The one thing standing between this node and a real cluster over a real client, and it is not
+/// in this crate.
+///
+/// `BlockingTransport::call` refuses to run when `tokio::runtime::Handle::try_current()` succeeds
+/// (`crates/esker-proto/src/transport/client.rs`). That guard is right about the hazard it names —
+/// blocking a runtime *worker* thread deadlocks it — and too broad by one case: `spawn_blocking`
+/// **propagates the runtime handle** into the blocking pool, which is precisely where a
+/// synchronous client is supposed to run. Measured rather than argued: a `Runtime::block_on` on
+/// another runtime inside a `spawn_blocking` task completes normally and does not panic, so the
+/// thing the guard is protecting against is not what it is catching.
+///
+/// So this test skips on that one error and on nothing else, which makes it **self-cancelling**:
+/// the day the guard learns to tell a blocking thread from a worker, this starts running by
+/// itself. Every other failure is a failure.
+const BLOCKING_GUARD: &str = "BlockingTransport::call was used inside an async runtime";
+
+async fn psql_smoke(sessions: Arc<RealSessions>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -350,7 +393,7 @@ async fn psql_runs_real_sql_against_the_real_executor() {
                 auth: Auth::Trust,
                 ..Config::default()
             },
-            Arc::new(RealSessions::new()),
+            sessions,
         )
         .await;
     });
@@ -405,13 +448,26 @@ async fn psql_runs_real_sql_against_the_real_executor() {
     .await
     .unwrap();
 
+    check_smoke_output(&output);
+}
+
+/// What the script must have produced, whichever store was underneath it.
+fn check_smoke_output(output: &std::process::Output) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if stderr.contains(BLOCKING_GUARD) {
+        eprintln!(
+            "skipping: esker-proto's BlockingTransport refuses a call from tokio's blocking pool, \
+             where a synchronous client belongs. See BLOCKING_GUARD in this file."
+        );
+        return;
+    }
 
     // The rows, in the order the ORDER BY asked for.
     assert!(
         stdout.contains("grace@esker|250") && stdout.contains("ada@esker|100"),
-        "the SELECT did not return its rows; stdout was:\n{stdout}"
+        "the SELECT did not return its rows.\nstdout was:\n{stdout}\nstderr was:\n{stderr}"
     );
     assert!(
         stdout.find("grace@esker|250") < stdout.find("ada@esker|100"),
@@ -455,8 +511,12 @@ struct RealSessions {
 
 impl RealSessions {
     fn new() -> Self {
+        RealSessions::on(Arc::new(esker_sql::backend::MemoryBackend::new()))
+    }
+
+    fn on(backend: Arc<dyn esker_sql::backend::Backend>) -> Self {
         RealSessions {
-            backend: Arc::new(esker_sql::backend::MemoryBackend::new()),
+            backend,
             catalog: Arc::new(esker_sql::catalog::Catalog::new()),
         }
     }

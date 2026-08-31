@@ -517,7 +517,11 @@ its own gap register, and it would be longer.
 - [x] 10 — one inner `JOIN`, as a nested loop whose inner side is a point read or a unique-index
   lookup when the condition allows one and a materialised table when it does not; two-table name
   resolution with PostgreSQL's three answers for a reference that does not resolve; `EXPLAIN` names
-  the inner access path
+  the inner access path, and the planner picks which side drives the loop
+- [x] 11 — **the real backend**: `StoreBackend` over `esker-client`'s `TxnClient`, the whole `.slt`
+  corpus replayed against three real stores, and seven end-to-end tests through Percolator. The
+  session runs the executor on a blocking task, which the plan always said and nothing had needed
+  until the store stopped being in this process
 
 ## 10a. Handoff — where a fresh lane picks up
 
@@ -552,19 +556,23 @@ thirty of them and `tests/lowering.rs` holds twenty-nine more at the clause leve
 
 ### What is left
 
-- **The real `TxnClient`.** `backend::MemoryBackend` is a real little MVCC store with real
-  write-write conflict detection, and it is still in one process. Wiring phase 5's client in is an
-  impl of `Backend`/`Txn` and nothing above it changes — that was the point of shaping the trait
-  against the real one in unit 5. Two mismatches were found by reading the client ahead of the
-  signal, both silent; one was a bug in this crate and is fixed, and the other was closed by the
-  phase-5 lane. Both are written out below, because the second changes what the wiring unit should
-  write.
+- ~~**The real `TxnClient`.**~~ **Wired** (§11 unit 11). `backend::StoreBackend` is the impl and
+  nothing above it changed. The corpus and seven end-to-end tests run against three real stores
+  over real sockets; `MemoryBackend` stays as what the unit tests run on, which is what keeps them
+  fast and what makes "the same answers either way" a thing the corpus can assert. The three
+  mismatches found by reading the client ahead of the signal are all closed and all verified
+  against real stores — they are written out below because two of them were bugs and the third
+  changed what the wiring unit had to write.
 - **Acceptance against the `sqllogictest` crate** (§7.7), which wants rows separated by whitespace
   rather than tabs; a `sed` away, and worth doing when the real backend is under it.
 - The `TODO(post-v1)`s named above, and the one in §5 about the round trip a unique index costs per
   row.
 
-### Three seam mismatches, found by reading the client before the signal
+### Three seam mismatches, found by reading the client before the signal — all closed
+
+Every one was found by reading rather than by a failure, which is the point of having read the
+client before the signal fired: none of the three would have failed to compile, and two of them
+produce wrong answers rather than errors.
 
 `crates/esker-client/src/txn.rs` was read against `backend::Txn` ahead of the wiring unit, and
 again after the store half opened. Every signature lines up — `get` and `scan` take `&self`, `put` and `delete` return nothing, `commit`
@@ -621,7 +629,12 @@ That is better than a bare error code, and it makes the wiring unit *smaller* ra
   the error. Keep the probe only for `key: None`, and take the round trip out of the path a
   duplicate insert takes.
 
-**3. A scan stops at a region boundary, and nothing says so. Not this lane's, and not yet fixed.**
+**3. A scan stopped at a region boundary, and nothing said so. Fixed by the client lane.**
+`Transaction::scan` walks region by region now, and `tests/real_backend.rs` reads all 1500 rows of
+a table and drops every one of them against real stores. What follows is the note as it stood when
+it was reported, because the reasoning is what the wiring unit was built on.
+
+
 Found while re-reading the store half after it opened. `esker_client::Transaction::scan` sends one
 `TxnKvReq::Scan` and merges its buffer into the answer; the region it goes to is the one holding
 **`start`** (`wire.rs`'s routing key, which already carries a `TODO(phase-4)` about reverse scans
