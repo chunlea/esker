@@ -1,0 +1,75 @@
+CLAUDE.md
+  s_b3f6a712d611c9::t_a1982d339cd2f4 35
+crates/esker-client/src/testing.rs
+  s_b3f6a712d611c9::t_5cdf212283804f 50-52,68-71,91
+crates/esker-keys/src/lib.rs
+  s_b3f6a712d611c9::t_d44780732fbce9 23-24
+crates/esker-keys/src/row.rs
+  s_b3f6a712d611c9::t_c01a69fa737e04 1-975
+crates/esker-keys/src/value.rs
+  s_b3f6a712d611c9::t_ebd18711a96260 1-158
+crates/esker-sql/src/error.rs
+  s_b3f6a712d611c9::t_fbeb151ea21dc0 755-773
+crates/esker-sql/src/exec/bind.rs
+  s_b3f6a712d611c9::t_56eaef3a07e120 22
+crates/esker-sql/src/exec/cursor.rs
+  s_b3f6a712d611c9::t_b202b50dbd47b5 30,421,438
+crates/esker-sql/src/exec/dml.rs
+  s_b3f6a712d611c9::t_9dbe706ebbae8e 34
+crates/esker-sql/src/exec/mod.rs
+  s_b3f6a712d611c9::t_4b6b6013a3db8f 50
+crates/esker-sql/src/exec/query.rs
+  s_b3f6a712d611c9::t_ebfde68b7e839e 30
+crates/esker-sql/src/exec/verbs.rs
+  s_b3f6a712d611c9::t_7991381c03ca5f 41
+crates/esker-sql/src/parse/lower.rs
+  s_b3f6a712d611c9::t_f6457d37c80d5c 33
+crates/esker-sql/src/pgwire/message.rs
+  s_b3f6a712d611c9::t_bdf9fd8c2ec391 26
+crates/esker-sql/src/plan/expr.rs
+  s_b3f6a712d611c9::t_122eb0a80bb7ba 31
+crates/esker-sql/src/plan/query.rs
+  s_b3f6a712d611c9::t_b5b2ce7834de16 25
+crates/esker-sql/src/row.rs
+  s_b3f6a712d611c9::t_4f7a4ffffb9c32 1,3-6,8-9,11-14,18-31,35,68,82,99,114
+crates/esker-sql/src/time_machine.rs
+  s_b3f6a712d611c9::t_b37a87d841f5cd 37
+crates/esker-sql/src/value/float.rs
+  s_b3f6a712d611c9::t_149a35ad3b7cff 16
+crates/esker-sql/src/value/mod.rs
+  s_b3f6a712d611c9::t_1c741e05b77e8b 39,42,44-52,55-67,78,89,98,100-105,112-149,171,182,193,231,246,249,251-264,424,556
+crates/esker-sql/src/value/timestamp.rs
+  s_b3f6a712d611c9::t_7216ec5fa29c97 28
+crates/esker-sql/tests/ddl.rs
+  s_b3f6a712d611c9::t_b57ac8c73a044d 25
+crates/esker-sql/tests/insert.rs
+  s_b3f6a712d611c9::t_d99c92339d38b5 25
+crates/esker-sql/tests/parameters.rs
+  s_b3f6a712d611c9::t_8b3840a8f5f240 23
+crates/esker-sql/tests/real_backend.rs
+  s_b3f6a712d611c9::t_e0200f25a1b9b8 19
+crates/esker-sql/tests/row_order.rs
+  s_b3f6a712d611c9::t_8dc261f0623523 17
+crates/esker-sql/tests/select.rs
+  s_b3f6a712d611c9::t_e2fe32945198f8 24
+crates/esker-sql/tests/value_parity.rs
+  s_b3f6a712d611c9::t_dd5ac0b448ef95 23
+docs/adr/0030-the-row-codec-moves-down.md
+  s_b3f6a712d611c9::t_a2091961a71aea 1-88
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "bef19e194a66916b74e74b274b2c5c4731d401ef",
+  "prompts": {},
+  "sessions": {
+    "s_b3f6a712d611c9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "78adef9a-88ef-4c89-a340-f825de3d2ab7",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
