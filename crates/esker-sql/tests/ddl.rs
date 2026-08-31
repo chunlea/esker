@@ -804,8 +804,10 @@ mod paging {
             "one entry per row"
         );
 
-        // Rows 3, 4 and 5 are past the first page. Each has to be findable *through* the index,
-        // which is the path a lookup on an indexed column takes.
+        // Rows 3, 4 and 5 are past the first page, and each has to be findable. The entry count
+        // above is what pins the index itself: a *non-unique* index is not an access path this
+        // planner chooses, so these queries are scans and would answer correctly even from a
+        // half-built index. Both assertions are needed and neither is enough.
         for (value, id) in [(10, 1), (20, 2), (30, 3), (40, 4), (50, 5)] {
             let Outcome::Rows { rows, .. } = node
                 .run(&format!("SELECT id FROM t WHERE a = {value}"))
@@ -816,7 +818,7 @@ mod paging {
             assert_eq!(
                 rows,
                 [[Some(id.to_string().into_bytes())]],
-                "a = {value} was not found through the index"
+                "a = {value} is missing"
             );
         }
     }
@@ -894,8 +896,9 @@ fn a_rolled_back_insert_leaves_a_gap_in_the_row_ids() {
 }
 
 /// An index over a keyless table carries the internal row id as its suffix, which is what keeps
-/// two identical indexed values apart. Without it the second entry would overwrite the first and
-/// a lookup would find one row where there are two.
+/// two identical indexed values apart. Without it the second entry would overwrite the first, and
+/// the entry count is what shows it — the `SELECT`s below are scans, because a non-unique index is
+/// not an access path this planner chooses.
 #[test]
 fn an_index_on_a_keyless_table_keeps_identical_values_apart() {
     let mut node = Node::new();
@@ -903,6 +906,14 @@ fn an_index_on_a_keyless_table_keeps_identical_values_apart() {
     node.run("INSERT INTO t VALUES (1,'x'),(1,'y'),(2,'z')")
         .unwrap();
     node.run("CREATE INDEX t_a_idx ON t (a)").unwrap();
+
+    let table = node.table("t").expect("committed");
+    let range = esker_sql::row::index_range(1, table.id, table.indexes[0].id);
+    assert_eq!(
+        node.keys_in(range),
+        3,
+        "three rows, three entries -- two of them sharing the value 1"
+    );
 
     let Outcome::Rows { rows, .. } = node.run("SELECT b FROM t WHERE a = 1").unwrap() else {
         panic!("not rows");
