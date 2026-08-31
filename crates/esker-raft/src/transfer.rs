@@ -194,6 +194,99 @@ mod tests {
         ));
     }
 
+    /// A learner promoted mid-window does not depose the leader that promoted it.
+    ///
+    /// `check_quorum` asks whether a majority answered within *this* election-timeout window. A
+    /// peer that became a voter part-way through one has had no chance to answer as a voter in
+    /// the part already elapsed — and a promoted learner arrives with its flag cleared *by
+    /// construction*, because [`Raft::check_quorum_active`] clears `recent_active` on every
+    /// non-voter each window, however busily it was replicating a millisecond earlier.
+    ///
+    /// Counting that silence deposed the leader at the exact moment its region grew a replica.
+    /// Under CPU starvation, where the window is wide in ticks and narrow in wall clock, a dozen
+    /// regions promoted their caught-up learners and a dozen leaders stepped down inside the
+    /// following second — regions with no leader, and `AddPeer` operators arriving at peers that
+    /// could no longer propose (`docs/plans/debt-c1.md`).
+    ///
+    /// Every offset into the window is tried: the bug is a race, and only the offsets near the
+    /// boundary lose it.
+    #[test]
+    fn a_promoted_voter_does_not_depose_the_leader_that_promoted_it() {
+        const WINDOW: u64 = 10;
+        for late in 0..WINDOW {
+            // Pinned to one value, so "this many ticks before the boundary" is a fact about the
+            // test rather than a draw from the election RNG.
+            let mut group = Harness::with_config(&[1], 404, |config| {
+                config.election_tick = (WINDOW, WINDOW);
+            });
+            group.campaign(1);
+            group.settle();
+            group
+                .node_mut(1)
+                .propose_conf_change(ConfChange::new(ConfChangeKind::AddLearner, 2))
+                .unwrap();
+            group.settle();
+
+            // `late` ticks into the window, promote. Node 2 is not in this harness and so never
+            // answers: the claim is that its silence *within this window* is not evidence, not
+            // that it is reachable.
+            group.tick(1, late);
+            group
+                .node_mut(1)
+                .propose_conf_change(ConfChange::new(ConfChangeKind::AddVoter, 2))
+                .unwrap();
+            assert_eq!(
+                group.node(1).status().conf.quorum(),
+                2,
+                "the promotion did not take, so this run proves nothing"
+            );
+
+            // Cross the boundary the window was already heading for.
+            group.tick(1, WINDOW - late);
+            assert_eq!(
+                group.node(1).role(),
+                Role::Leader,
+                "a learner promoted {late} ticks into the window deposed the leader"
+            );
+        }
+    }
+
+    /// And the safeguard is intact: a voter that has had a whole window of its own to answer and
+    /// has not still deposes the leader. What the promotion buys is one window of patience, not
+    /// an exemption from §6.2.
+    #[test]
+    fn a_voter_silent_for_a_full_window_still_deposes_the_leader() {
+        const WINDOW: u64 = 10;
+        let mut group = Harness::with_config(&[1], 405, |config| {
+            config.election_tick = (WINDOW, WINDOW);
+        });
+        group.campaign(1);
+        group.settle();
+        group
+            .node_mut(1)
+            .propose_conf_change(ConfChange::new(ConfChangeKind::AddLearner, 2))
+            .unwrap();
+        group.settle();
+        group
+            .node_mut(1)
+            .propose_conf_change(ConfChange::new(ConfChangeKind::AddVoter, 2))
+            .unwrap();
+
+        group.tick(1, WINDOW);
+        assert_eq!(
+            group.node(1).role(),
+            Role::Leader,
+            "the window the promotion landed in is the one that is forgiven"
+        );
+
+        group.tick(1, WINDOW);
+        assert_eq!(
+            group.node(1).role(),
+            Role::Follower,
+            "a voter that said nothing for a window of its own must cost the leader its office"
+        );
+    }
+
     /// A lagging target is brought up to date first. Ordering it to campaign immediately either
     /// fails §5.4.1's check or — worse — succeeds, and a leader elected on a short log is how
     /// committed entries disappear.

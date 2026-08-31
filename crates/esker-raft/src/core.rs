@@ -227,17 +227,42 @@ impl<S: LogStorage> Raft<S> {
 
     /// Rebuilds the progress map from the current configuration, keeping what is still known about
     /// peers that survived the change.
+    ///
+    /// **A peer that becomes a voter here starts out recently active.** `check_quorum` asks
+    /// whether a majority has been heard from within *this* election-timeout window, and a peer
+    /// promoted or added part-way through one has had no chance to answer as a voter in the part
+    /// already elapsed. Counting that silence against it deposes the leader at the very moment
+    /// the region grew a replica — and for a promoted learner it is not even a race:
+    /// [`check_quorum_active`](Self::check_quorum_active) clears the flag on every non-voter each
+    /// window, so a learner arrives at its promotion with `recent_active` false *by
+    /// construction*, however busily it was replicating a millisecond earlier.
+    ///
+    /// Observed under CPU starvation, where the window is wide in ticks and narrow in wall clock:
+    /// a dozen regions promoted their caught-up learners and a dozen leaders stepped down inside
+    /// the following second, leaving regions with no leader and `AddPeer` operators landing on
+    /// peers that could no longer propose (`docs/plans/debt-c1.md`). Contrast `become_leader`,
+    /// which has the same false start but resets `election_elapsed` with it, so a new leader
+    /// always gets a whole window to hear from everyone.
+    ///
+    /// This costs one window of detection on a voter that really is unreachable: it is false at
+    /// the next boundary and the leader steps down then. `check_quorum` is a liveness safeguard,
+    /// never a safety one, so a window of patience cannot cost correctness.
     pub(crate) fn rebuild_progress(&mut self) -> Result<()> {
         let next = self.log.last_index()?.saturating_add(1);
         let conf = self.conf.current().clone();
         for id in conf.members() {
             let is_learner = conf.is_learner(id);
-            match self.progress.get_mut(id) {
-                Some(progress) => progress.is_learner = is_learner,
-                None => {
-                    self.progress
-                        .insert(id, Progress::new(next, self.max_inflight_msgs, is_learner));
+            if let Some(progress) = self.progress.get_mut(id) {
+                // `is_learner` is still the *old* role until it is overwritten below, so this is
+                // exactly "was a learner, is a voter": a promotion, and nothing else.
+                if progress.is_learner && !is_learner {
+                    progress.recent_active = true;
                 }
+                progress.is_learner = is_learner;
+            } else {
+                let mut progress = Progress::new(next, self.max_inflight_msgs, is_learner);
+                progress.recent_active = !is_learner;
+                self.progress.insert(id, progress);
             }
         }
         for id in self.progress.ids() {
