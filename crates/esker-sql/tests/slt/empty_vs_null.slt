@@ -1,0 +1,120 @@
+# An empty string is a value; a NULL is the absence of one. Everything below turns on that, and the
+# row encoding is built around it: the NULL bitmap says "absent" and a zero-length varlena says
+# "present, and empty". Collapsing the two would be a wrong answer that nothing reports, because
+# both print as nothing in most clients.
+#
+# Every answer here came from a real PostgreSQL 19.
+
+statement ok
+CREATE TABLE q (id int8 PRIMARY KEY, t text UNIQUE, y bytea)
+
+# tag: INSERT 0 3
+statement ok
+INSERT INTO q VALUES (1, '', '\x'), (2, NULL, NULL), (3, 'x', '\x00')
+
+# --- a predicate can tell them apart, and only one way round ------------------------------------
+
+query I
+SELECT id FROM q WHERE t = ''
+----
+1
+
+query I
+SELECT id FROM q WHERE t IS NULL
+----
+2
+
+# `<> ''` excludes the empty string *and* the NULL: the first because it is equal, the second
+# because the comparison is unknown and unknown does not keep a row.
+query I
+SELECT id FROM q WHERE t <> ''
+----
+3
+
+# But `IS NOT NULL` keeps the empty string, because it is there.
+query I
+SELECT id FROM q WHERE t IS NOT NULL ORDER BY id
+----
+1
+3
+
+query I
+SELECT id FROM q WHERE y = '\x'
+----
+1
+
+# --- and a unique index tells them apart the other way ------------------------------------------
+#
+# Two empty strings are two of the same value and collide. Two NULLs are two absences and do not,
+# which is the rule `crate::row` keeps the primary key suffix for.
+
+statement error (23505)
+INSERT INTO q VALUES (4, '', '\x')
+
+# tag: INSERT 0 1
+statement ok
+INSERT INTO q VALUES (5, NULL, NULL)
+
+query I
+SELECT id FROM q WHERE t IS NULL ORDER BY id
+----
+2
+5
+
+# --- the empty string is where the byte order starts ---------------------------------------------
+#
+# Below every other string, including a single space, and a long way below NULL.
+
+# tag: INSERT 0 2
+statement ok
+INSERT INTO q VALUES (6, ' ', NULL), (7, 'a', NULL)
+
+query TI
+SELECT t, id FROM q ORDER BY t, id
+----
+	1
+ 	6
+a	7
+x	3
+NULL	2
+NULL	5
+
+# --- and it survives a round trip through storage -----------------------------------------------
+#
+# The value goes in as a literal, is encoded, is read back, and prints as nothing. What proves it
+# is not a NULL is the column beside it.
+
+query TI
+SELECT t, id FROM q WHERE id = 1
+----
+	1
+
+query XI
+SELECT y, id FROM q WHERE id = 1
+----
+\x	1
+
+# --- turning one into the other ------------------------------------------------------------------
+#
+# An UPDATE from the empty string to NULL frees the value for another row, which is only true if
+# the index entry really moved.
+
+statement ok
+UPDATE q SET t = NULL WHERE id = 1
+
+query I
+SELECT id FROM q WHERE t = ''
+----
+
+# tag: INSERT 0 1
+statement ok
+INSERT INTO q VALUES (8, '', NULL)
+
+query I
+SELECT id FROM q WHERE t = ''
+----
+8
+
+# And back again: NULL to the empty string collides with whoever holds it.
+statement error (23505)
+UPDATE q SET t = '' WHERE id = 2

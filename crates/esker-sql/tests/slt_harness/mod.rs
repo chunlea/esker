@@ -91,6 +91,10 @@ use esker_sql::pgwire::session::{Execute, Outcome, Params};
 pub(crate) const FILES: &[(&str, &str)] = &[
     ("access_paths.slt", include_str!("../slt/access_paths.slt")),
     ("create_table.slt", include_str!("../slt/create_table.slt")),
+    (
+        "empty_vs_null.slt",
+        include_str!("../slt/empty_vs_null.slt"),
+    ),
     ("index.slt", include_str!("../slt/index.slt")),
     ("insert.slt", include_str!("../slt/insert.slt")),
     ("nulls.slt", include_str!("../slt/nulls.slt")),
