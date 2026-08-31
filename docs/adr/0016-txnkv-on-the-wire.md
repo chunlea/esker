@@ -10,11 +10,66 @@ This ADR fills the seam in. The method numbers were decided then; what was not d
 locked key is reported, what a request carries, and how much of Percolator `esker-proto` is allowed
 to know.
 
-## Decision 1: a lock in the way is an `Error` frame, not a response variant
+## Decision 1: a lock in the way is an `Error` frame — except for `Prewrite`
 
-A `Get`, `Scan` or `Prewrite` that meets another transaction's lock answers
+**Amended before implementation of the store half.** The original ruling and its pricing are kept
+below, because the pricing is the record of why it looked sufficient and the amendment is what that
+pricing missed.
+
+A `Get` or a `Scan` that meets another transaction's lock answers
+`ProtoError::Locked { lock_info }`, with the payload a [`LockInfo`]. A **`Prewrite` answers per
+key**: `TxnKvResp::Prewrite { keys: Vec<TxnStatus> }`, one status per mutation, and
+`TxnStatus::Locked(LockInfo)` is one of them.
+
+### Why `Prewrite` is different
+
+The original decision priced first-only reporting as acceptable: "a batch that collides with several
+costs one round trip per lock… acceptable because prewrite is idempotent so a retry after resolution
+is free, and because contention on many keys of one batch is the case where backing off is wanted
+anyway."
+
+Both halves of that are true and neither is the point. The cost is not the *retry*, it is that the
+client cannot learn about the second lock until it has resolved the first and been refused again —
+so a batch of `n` contended keys costs `n` resolution rounds, serially, exactly when the client is
+already losing races and exactly where a bank-test workload lives. TiKV reports a per-key `KeyError`
+for this reason, and that precedent is evidence rather than fashion: it is the same protocol meeting
+the same workload.
+
+Deciding it now costs one response variant. Deciding it after a bank test says so costs a handler
+rewrite, because a handler written to stop at the first conflict has thrown away the others.
+
+**A lock is still a refusal to serve**, and the line decision 1 drew — refusals in the error channel,
+determinations about the transaction in the response — is not abandoned. It is that a `Prewrite` asks
+about *many keys at once*, and **one refusal cannot describe many keys**. Where one question gets one
+answer, the error channel still carries it; `Get` and `Scan` are unchanged.
+
+`TxnStatus::Locked` is therefore legal only in a `Prewrite` result, and a `Commit` or `Rollback`
+carrying one is a decoding error — the same rule that keeps a `Rollback` out of the `lock` column
+family: the format admits the shape and the meaning does not exist.
+
+### What the client does with it
+
+Resolve **every** reported lock, the groups in parallel, then prewrite again. The grouping is by the
+transaction that holds them rather than by key, because a `ResolveLock` names a `start_ts` and that
+transaction's keys — so the common case under contention, one competitor holding several of the keys
+we want, is one call and not one per key.
+
+A round is still bounded. A key can be locked again by a *different* transaction between the
+resolution and the retry, which is progress being undone by someone else rather than a failure to
+make it, so it gets another round rather than an error.
+
+A terminal status anywhere in the list ends the transaction immediately, without resolving anything:
+work spent clearing locks for a transaction that has already lost is work thrown away.
+
+And the client checks the list's **length** against the batch's. A store that answers a different
+number has said nothing about some key, and reading a short list as "the rest were fine" is precisely
+the silent wrong answer this codebase refuses.
+
+### The original decision, kept as the record
+
+*A `Get`, `Scan` or `Prewrite` that meets another transaction's lock answers
 `ProtoError::Locked { lock_info }`, with the payload a [`LockInfo`]. It is not a `TxnKvResp`
-variant.
+variant.*
 
 **Options.** (a) A response variant — `TxnKvResp::Locked { locks }` — which would let one answer
 carry every lock a batch collided with, and would let a `Scan` return the rows it did read
@@ -26,11 +81,14 @@ a successful response would be the one refusal that bypasses it, and every calle
 remember to look. `Locked` is already `RequestOutcome::NotApplied`, which is exactly right: the
 store wrote nothing.
 
-**Consequences.** One lock is reported at a time, so a batch that collides with several costs one
+*Consequences. One lock is reported at a time, so a batch that collides with several costs one
 round trip per lock. That is acceptable because prewrite is idempotent (`docs/txn-spec.md` §5.2) so
 a retry after resolution is free, and because contention on many keys of one batch is the case
 where backing off is wanted anyway. Batching them later means adding a response variant, not
-changing this one — the format allows it without a version bump.
+changing this one — the format allows it without a version bump.*
+
+That last sentence was right about the mechanism and wrong about the timing: the variant was cheap to
+add, and it was cheap **because it was added before a handler consumed the old shape**.
 
 ### The other half of the line: what *is* a response
 

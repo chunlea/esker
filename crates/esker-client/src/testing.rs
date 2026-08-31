@@ -133,6 +133,14 @@ pub enum Outcome {
     Reply(RawKvResp),
     /// Answer with this `TxnKv` body (`docs/DESIGN.md` §8).
     TxnReply(TxnKvResp),
+    /// Answer a `Prewrite` with "every key locked", sized from the request.
+    ///
+    /// A `Prewrite` answers one status per mutation
+    /// ([ADR 0016](../../docs/adr/0016-txnkv-on-the-wire.md) decision 1), and a client that
+    /// checks the length — this one does — would refuse a fixed-size answer to a batch of a
+    /// different size. Counting the request's mutations is what a store does, so the fake does
+    /// it too rather than making every test spell the number out.
+    PrewriteOk,
     /// Fail with this error — a refusal from the store, or a socket that gave up. One enum
     /// covers both because `esker-proto` does: what separates them is
     /// [`ProtoError::outcome`], not which layer raised it.
@@ -148,10 +156,17 @@ impl Outcome {
         Self::Fail(lock.into_error())
     }
 
-    fn into_result(self) -> CallResult {
+    fn into_result(self, request: &Request) -> CallResult {
         match self {
             Self::Reply(response) => Ok(Response::RawKv(response)),
             Self::TxnReply(response) => Ok(Response::TxnKv(response)),
+            Self::PrewriteOk => {
+                let count = match txn_body(request) {
+                    Some(TxnKvReq::Prewrite { mutations, .. }) => mutations.len(),
+                    _ => 0,
+                };
+                Ok(Response::TxnKv(TxnKvResp::prewrite_ok(count)))
+            }
             Self::Fail(error) => Err(error),
         }
     }
@@ -386,9 +401,9 @@ impl StoreTransport for FakeTransport {
             if let Some(remaining) = rule.remaining.as_mut() {
                 *remaining -= 1;
             }
-            return rule.outcome.clone().into_result();
+            return rule.outcome.clone().into_result(request);
         }
-        inner.unmatched.clone().into_result()
+        inner.unmatched.clone().into_result(request)
     }
 
     fn max_frame_size(&self) -> usize {

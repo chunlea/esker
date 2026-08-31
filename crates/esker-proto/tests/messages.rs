@@ -442,25 +442,47 @@ fn golden_txn_responses() -> Vec<(&'static str, Response)> {
         ),
         // Every status has a golden. Four of the five are terminal for a transaction, and a
         // sentinel with a golden for only its happy case is a sentinel nobody has tested.
+        // A `Prewrite` answers per key, so its goldens pin the *list*: two keys locked, a
+        // batch that met two locks at once — the case first-only reporting could not express —
+        // the two terminal shapes, and the empty batch.
+        ("txn-prewrite", Response::TxnKv(TxnKvResp::prewrite_ok(2))),
         (
-            "txn-prewrite",
+            "txn-prewrite-locked",
             Response::TxnKv(TxnKvResp::Prewrite {
-                status: TxnStatus::Ok,
+                keys: vec![
+                    TxnStatus::Ok,
+                    TxnStatus::Locked(LockInfo {
+                        key: Bytes::from_static(b"account/1"),
+                        primary: Bytes::from_static(b"account/0"),
+                        start_ts: TXN_SAFEPOINT,
+                        ttl_ms: TXN_TTL_MS,
+                    }),
+                    TxnStatus::Locked(LockInfo {
+                        key: Bytes::from_static(b"account/2"),
+                        primary: Bytes::from_static(b"account/0"),
+                        start_ts: TXN_SAFEPOINT,
+                        ttl_ms: TXN_TTL_MS,
+                    }),
+                ],
             }),
         ),
         (
             "txn-prewrite-conflict",
             Response::TxnKv(TxnKvResp::Prewrite {
-                status: TxnStatus::Conflict {
+                keys: vec![TxnStatus::Conflict {
                     commit_ts: TXN_COMMIT_TS,
-                },
+                }],
             }),
         ),
         (
             "txn-prewrite-rolledback",
             Response::TxnKv(TxnKvResp::Prewrite {
-                status: TxnStatus::RolledBack,
+                keys: vec![TxnStatus::RolledBack],
             }),
+        ),
+        (
+            "txn-prewrite-empty",
+            Response::TxnKv(TxnKvResp::Prewrite { keys: vec![] }),
         ),
         (
             "txn-commit",

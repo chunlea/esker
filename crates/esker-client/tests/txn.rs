@@ -96,15 +96,7 @@ fn client_on(
 /// Answers every method of a whole successful commit.
 fn script_a_clean_commit(transport: &FakeTransport) {
     transport
-        .script(
-            Rule::new(
-                Matcher::Method(Method::TxnPrewrite),
-                Outcome::TxnReply(TxnKvResp::Prewrite {
-                    status: TxnStatus::Ok,
-                }),
-            )
-            .forever(),
-        )
+        .script(Rule::new(Matcher::Method(Method::TxnPrewrite), Outcome::PrewriteOk).forever())
         .script(
             Rule::new(
                 Matcher::Method(Method::TxnCommit),
@@ -389,7 +381,7 @@ fn a_transaction_cannot_be_finished_twice() {
 fn a_prewrite_conflict_ends_the_transaction() {
     let transport = Arc::new(FakeTransport::new());
     transport.unmatched(Outcome::TxnReply(TxnKvResp::Prewrite {
-        status: TxnStatus::Conflict { commit_ts: 42 },
+        keys: vec![TxnStatus::Conflict { commit_ts: 42 }],
     }));
     let client = client(&transport);
     let mut txn = client.begin().unwrap();
@@ -433,7 +425,7 @@ fn a_conflict_changed_nothing() {
 fn a_transaction_rolled_back_under_us_is_settled() {
     let transport = Arc::new(FakeTransport::new());
     transport.unmatched(Outcome::TxnReply(TxnKvResp::Prewrite {
-        status: TxnStatus::RolledBack,
+        keys: vec![TxnStatus::RolledBack],
     }));
     let client = client(&transport);
     let mut txn = client.begin().unwrap();
@@ -451,15 +443,7 @@ fn a_transaction_rolled_back_under_us_is_settled() {
 fn a_failed_secondary_commit_does_not_fail_a_committed_transaction() {
     let transport = Arc::new(FakeTransport::new());
     transport
-        .script(
-            Rule::new(
-                Matcher::Method(Method::TxnPrewrite),
-                Outcome::TxnReply(TxnKvResp::Prewrite {
-                    status: TxnStatus::Ok,
-                }),
-            )
-            .forever(),
-        )
+        .script(Rule::new(Matcher::Method(Method::TxnPrewrite), Outcome::PrewriteOk).forever())
         // The primary's commit succeeds; every one after it fails.
         .script(Rule::new(
             Matcher::Method(Method::TxnCommit),
@@ -547,15 +531,29 @@ fn a_read_that_meets_a_lock_resolves_it_and_tries_again() {
     }
 }
 
-/// A prewrite that meets someone else's lock resolves it too — a writer is a reader of the
-/// `lock` CF like any other.
+/// The reason a `Prewrite` answers per key: a batch that collides with **several** locks
+/// reports all of them, and the client clears them in one round rather than one round trip per
+/// contended key ([ADR 0016](../../docs/adr/0016-txnkv-on-the-wire.md) decision 1).
 #[test]
-fn a_prewrite_that_meets_a_lock_resolves_it_and_tries_again() {
+fn a_prewrite_that_meets_several_locks_clears_them_in_one_round() {
     let transport = Arc::new(FakeTransport::new());
     transport
+        // Rules are tried in order, so the first answers the primary's own one-key batch and
+        // the second answers the secondaries' — which is the batch that meets the locks.
         .script(Rule::new(
             Matcher::Method(Method::TxnPrewrite),
-            Outcome::locked(&a_lock(b"k", b"other", 5)),
+            Outcome::PrewriteOk,
+        ))
+        // Three secondaries, two of them locked by two different transactions.
+        .script(Rule::new(
+            Matcher::Method(Method::TxnPrewrite),
+            Outcome::TxnReply(TxnKvResp::Prewrite {
+                keys: vec![
+                    TxnStatus::Locked(a_lock(b"b", b"other-1", 5)),
+                    TxnStatus::Ok,
+                    TxnStatus::Locked(a_lock(b"d", b"other-2", 6)),
+                ],
+            }),
         ))
         .script(
             Rule::new(
@@ -564,15 +562,188 @@ fn a_prewrite_that_meets_a_lock_resolves_it_and_tries_again() {
             )
             .forever(),
         )
+        .script(Rule::new(Matcher::Method(Method::TxnPrewrite), Outcome::PrewriteOk).forever())
         .script(
             Rule::new(
-                Matcher::Method(Method::TxnPrewrite),
-                Outcome::TxnReply(TxnKvResp::Prewrite {
+                Matcher::Method(Method::TxnCommit),
+                Outcome::TxnReply(TxnKvResp::Commit {
                     status: TxnStatus::Ok,
                 }),
             )
             .forever(),
+        );
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+    for k in [b"a".as_slice(), b"b", b"c", b"d"] {
+        txn.put(k, b"v");
+    }
+    assert!(txn.commit().is_ok());
+
+    let resolves: Vec<TxnKvReq> = (0..transport.call_count())
+        .map(|index| nth_txn(&transport, index))
+        .filter(|request| matches!(request, TxnKvReq::ResolveLock { .. }))
+        .collect();
+    assert_eq!(
+        resolves.len(),
+        2,
+        "one call per *holding transaction*, not per locked key"
+    );
+    // Grouped by the transaction that holds them, because that is what a ResolveLock names.
+    let by_txn: Vec<u64> = resolves
+        .iter()
+        .map(|request| match request {
+            TxnKvReq::ResolveLock { start_ts, .. } => *start_ts,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(by_txn, vec![5, 6]);
+
+    // One resolution round: the secondaries were prewritten, resolved, prewritten again — and
+    // not once per lock.
+    let prewrites = transport
+        .methods()
+        .iter()
+        .filter(|method| **method == Method::TxnPrewrite)
+        .count();
+    assert_eq!(
+        prewrites, 3,
+        "primary, secondaries, and the one retry after resolving both locks"
+    );
+}
+
+/// Two locks held by the *same* transaction are one `ResolveLock`, because that is what the
+/// message names: a `start_ts` and the keys of that transaction.
+#[test]
+fn locks_held_by_one_transaction_are_resolved_in_one_call() {
+    let transport = Arc::new(FakeTransport::new());
+    transport
+        .script(Rule::new(
+            Matcher::Method(Method::TxnPrewrite),
+            Outcome::PrewriteOk,
+        ))
+        .script(Rule::new(
+            Matcher::Method(Method::TxnPrewrite),
+            Outcome::TxnReply(TxnKvResp::Prewrite {
+                keys: vec![
+                    TxnStatus::Locked(a_lock(b"b", b"other", 5)),
+                    TxnStatus::Locked(a_lock(b"c", b"other", 5)),
+                ],
+            }),
+        ))
+        .script(
+            Rule::new(
+                Matcher::Method(Method::TxnResolveLock),
+                Outcome::TxnReply(TxnKvResp::ResolveLock { resolved: 2 }),
+            )
+            .forever(),
         )
+        .script(Rule::new(Matcher::Method(Method::TxnPrewrite), Outcome::PrewriteOk).forever())
+        .script(
+            Rule::new(
+                Matcher::Method(Method::TxnCommit),
+                Outcome::TxnReply(TxnKvResp::Commit {
+                    status: TxnStatus::Ok,
+                }),
+            )
+            .forever(),
+        );
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+    for k in [b"a".as_slice(), b"b", b"c"] {
+        txn.put(k, b"v");
+    }
+    assert!(txn.commit().is_ok());
+
+    let resolves: Vec<TxnKvReq> = (0..transport.call_count())
+        .map(|index| nth_txn(&transport, index))
+        .filter(|request| matches!(request, TxnKvReq::ResolveLock { .. }))
+        .collect();
+    assert_eq!(resolves.len(), 1, "one holder, one call");
+    match &resolves[0] {
+        TxnKvReq::ResolveLock { start_ts, keys, .. } => {
+            assert_eq!(*start_ts, 5);
+            assert_eq!(keys, &vec![key(b"b"), key(b"c")]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A terminal status ends the transaction *now*, even when other keys report locks: resolving
+/// them would be work for a transaction that is already dead.
+#[test]
+fn a_conflict_beside_a_lock_ends_it_without_resolving() {
+    let transport = Arc::new(FakeTransport::new());
+    transport
+        // The primary succeeds; the secondaries' batch carries a lock *and* a conflict.
+        .script(Rule::new(
+            Matcher::Method(Method::TxnPrewrite),
+            Outcome::PrewriteOk,
+        ))
+        .script(
+            Rule::new(
+                Matcher::Method(Method::TxnPrewrite),
+                Outcome::TxnReply(TxnKvResp::Prewrite {
+                    keys: vec![
+                        TxnStatus::Locked(a_lock(b"b", b"other", 5)),
+                        TxnStatus::Conflict { commit_ts: 42 },
+                    ],
+                }),
+            )
+            .forever(),
+        );
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+    txn.put(b"a", b"1");
+    txn.put(b"b", b"2");
+    txn.put(b"c", b"3");
+
+    let error = txn.commit().unwrap_err();
+    assert!(
+        matches!(error, Error::TxnConflict { commit_ts: 42, .. }),
+        "got {error:?}"
+    );
+    assert!(
+        !transport.methods().contains(&Method::TxnResolveLock),
+        "nothing should be resolved for a transaction that has already lost"
+    );
+}
+
+/// A store that answers a different number of statuses than the batch had mutations has said
+/// nothing about some key. Reading a short list as "the rest were fine" is the silent wrong
+/// answer, so it is refused.
+#[test]
+fn a_prewrite_answered_with_the_wrong_number_of_statuses_is_refused() {
+    let transport = Arc::new(FakeTransport::new());
+    transport.unmatched(Outcome::TxnReply(TxnKvResp::prewrite_ok(3)));
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+    txn.put(b"only", b"v");
+    assert!(matches!(
+        txn.commit().unwrap_err(),
+        Error::Store(ProtoError::InvalidRequest { .. })
+    ));
+}
+
+/// A prewrite that meets someone else's lock resolves it too — a writer is a reader of the
+/// `lock` CF like any other.
+#[test]
+fn a_prewrite_that_meets_a_lock_resolves_it_and_tries_again() {
+    let transport = Arc::new(FakeTransport::new());
+    transport
+        .script(Rule::new(
+            Matcher::Method(Method::TxnPrewrite),
+            Outcome::TxnReply(TxnKvResp::Prewrite {
+                keys: vec![TxnStatus::Locked(a_lock(b"k", b"other", 5))],
+            }),
+        ))
+        .script(
+            Rule::new(
+                Matcher::Method(Method::TxnResolveLock),
+                Outcome::TxnReply(TxnKvResp::ResolveLock { resolved: 1 }),
+            )
+            .forever(),
+        )
+        .script(Rule::new(Matcher::Method(Method::TxnPrewrite), Outcome::PrewriteOk).forever())
         .script(
             Rule::new(
                 Matcher::Method(Method::TxnCommit),

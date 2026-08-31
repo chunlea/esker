@@ -399,10 +399,74 @@ impl Transaction {
 
     // -- the phases --------------------------------------------------------------------
 
-    /// Prewrites one region's worth of keys.
+    /// Prewrites one region's worth of keys, resolving whatever locks come back.
+    ///
+    /// A `Prewrite` answers **per key**, so a batch that collides with several locks reports
+    /// all of them at once ([ADR 0016](../../docs/adr/0016-txnkv-on-the-wire.md) decision 1).
+    /// This resolves every one of them **in parallel** and prewrites again — one resolution
+    /// round however many keys collided, rather than a round trip per contended key, which is
+    /// the shape that matters exactly when the client is already losing races.
+    ///
+    /// A round is still bounded, because a key can be locked again by a *different*
+    /// transaction between the resolution and the retry. That is progress being undone by
+    /// someone else rather than a failure to make it, so it gets another round rather than an
+    /// error — up to the budget.
     fn prewrite(&self, primary: &Bytes, keys: &[Bytes]) -> Result<()> {
-        let mutations = keys
-            .iter()
+        let request = TxnKvReq::Prewrite {
+            start_ts: self.start_ts,
+            primary: primary.clone(),
+            ttl_ms: self.lock_ttl_ms,
+            mutations: self.mutations_for(keys),
+        };
+
+        for round in 0..=self.max_lock_resolutions {
+            let statuses = match self.call(&request)? {
+                TxnKvResp::Prewrite { keys: statuses } => statuses,
+                other => return Err(unexpected(Method::TxnPrewrite, &other)),
+            };
+            // One status per mutation, positionally. A store that answers a different number
+            // has said nothing about some key, and reading a short list as "the rest were
+            // fine" is exactly the silent wrong answer this codebase refuses.
+            let expected = match &request {
+                TxnKvReq::Prewrite { mutations, .. } => mutations.len(),
+                _ => 0,
+            };
+            if statuses.len() != expected {
+                return Err(Error::Store(ProtoError::invalid(format!(
+                    "a Prewrite of {expected} keys was answered with {} statuses",
+                    statuses.len()
+                ))));
+            }
+
+            // A terminal status ends the transaction, and it ends it now: resolving locks on
+            // the other keys would be work for a transaction that is already dead.
+            if let Some(fatal) = statuses.iter().find(|status| status.is_fatal()) {
+                return self.check(fatal.clone());
+            }
+            let locks: Vec<LockInfo> = statuses
+                .iter()
+                .filter_map(TxnStatus::lock)
+                .cloned()
+                .collect();
+            if locks.is_empty() {
+                return Ok(());
+            }
+            if round == self.max_lock_resolutions {
+                return Err(Error::LockNotCleared {
+                    start_ts: locks[0].start_ts,
+                });
+            }
+            self.resolve_all(&locks)?;
+        }
+        // The loop above returns on every path; `0..=n` is never empty.
+        Err(Error::Internal(
+            "the prewrite resolution loop fell through".to_owned(),
+        ))
+    }
+
+    /// The mutations for `keys`, taken from the write buffer.
+    fn mutations_for(&self, keys: &[Bytes]) -> Vec<TxnMutation> {
+        keys.iter()
             .map(|key| match self.buffer.get(key) {
                 Some(Write::Put(value)) => TxnMutation::Put {
                     key: key.clone(),
@@ -412,17 +476,31 @@ impl Transaction {
                 // from the buffer's own keys. `Delete` is the safe reading if it ever were.
                 Some(Write::Delete) | None => TxnMutation::Delete { key: key.clone() },
             })
-            .collect();
-        let request = TxnKvReq::Prewrite {
-            start_ts: self.start_ts,
-            primary: primary.clone(),
-            ttl_ms: self.lock_ttl_ms,
-            mutations,
-        };
-        match self.call_resolving(&request)? {
-            TxnKvResp::Prewrite { status } => self.check(status),
-            other => Err(unexpected(Method::TxnPrewrite, &other)),
+            .collect()
+    }
+
+    /// Resolves every lock a prewrite reported, the groups in parallel.
+    ///
+    /// Grouped by the transaction that holds them rather than by key: one `ResolveLock` names
+    /// a `start_ts` and the keys of *that* transaction, and the common case under contention is
+    /// one competitor holding several of the keys we want — which is then one call, not one per
+    /// key.
+    fn resolve_all(&self, locks: &[LockInfo]) -> Result<()> {
+        let mut by_txn: BTreeMap<u64, Vec<Bytes>> = BTreeMap::new();
+        for lock in locks {
+            by_txn
+                .entry(lock.start_ts)
+                .or_default()
+                .push(lock.key.clone());
         }
+        let groups: Vec<(u64, Vec<Bytes>)> = by_txn.into_iter().collect();
+        for outcome in fan_out(groups.len(), |index| {
+            let (start_ts, keys) = &groups[index];
+            self.resolve(*start_ts, keys.clone())
+        }) {
+            outcome?;
+        }
+        Ok(())
     }
 
     fn commit_keys(&self, commit_ts: u64, keys: &[Bytes]) -> Result<()> {
@@ -513,6 +591,12 @@ impl Transaction {
                 start_ts: self.start_ts,
                 detail: "its lock is gone and no record says what happened to it".to_owned(),
             }),
+            // Not a verdict: `prewrite` resolves these and comes back, and no other method can
+            // answer with one — the decoder refuses it (ADR 0016 decision 1). Reaching here
+            // means the caller skipped the resolution, which is a bug in this crate.
+            TxnStatus::Locked(lock) => Err(Error::LockNotCleared {
+                start_ts: lock.start_ts,
+            }),
         }
     }
 
@@ -551,7 +635,7 @@ impl Transaction {
                     start_ts: lock.start_ts,
                 });
             }
-            self.resolve(&lock)?;
+            self.resolve(lock.start_ts, vec![lock.key.clone()])?;
         }
         // The loop above returns on every path; `0..=n` is never empty.
         Err(Error::Internal(
@@ -566,18 +650,18 @@ impl Transaction {
     /// off when the answer is "its owner is still alive". The wait is a `Locked` on the
     /// *primary*, which is the store's way of saying the lease has not run out — so the
     /// backoff is the router's, and no wall clock is consulted here either.
-    fn resolve(&self, lock: &LockInfo) -> Result<()> {
+    fn resolve(&self, start_ts: u64, keys: Vec<Bytes>) -> Result<()> {
         // Reading the primary at the lock's own `start_ts` is what classifies it: a `write`
         // record there means the transaction committed, a rollback marker means it did not,
         // and a lock still in the way means its owner is inside its lease.
         let request = TxnKvReq::ResolveLock {
-            start_ts: lock.start_ts,
+            start_ts,
             // Zero is "roll back"; the store replaces it with the primary's commit timestamp
             // when the primary turns out to be committed. The client does not read the primary
             // itself, because a decision made from two round trips could be made from a
             // snapshot that moved between them.
             commit_ts: 0,
-            keys: vec![lock.key.clone()],
+            keys,
         };
         match self.call(&request)? {
             TxnKvResp::ResolveLock { .. } => Ok(()),

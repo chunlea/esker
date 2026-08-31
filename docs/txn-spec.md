@@ -177,11 +177,16 @@ Two checks, and **both** are load-bearing:
    party has already told a reader is dead. A *commit* there is our own, from an attempt whose
    answer was lost: succeed and write nothing. Neither is reachable from check 1, because a
    rollback marker sits at `commit_ts == start_ts`, below the range that check looks at.
-3. `get_lock(k)`. Any lock with a different `start_ts` is a **lock conflict**: answer
-   `Locked{lock_info}` so the client can resolve it. A lock with *our* `start_ts` is our own earlier
-   attempt: succeed and write nothing, which is what makes `Prewrite` idempotent and what makes an
-   ambiguous `Prewrite` safe to resolve rather than fatal. *(Skipping this check lets two live
-   transactions both hold the key.)*
+3. `get_lock(k)`. Any lock with a different `start_ts` is a **lock conflict**: report it so the
+   client can resolve it. A lock with *our* `start_ts` is our own earlier attempt: succeed and write
+   nothing, which is what makes `Prewrite` idempotent and what makes an ambiguous `Prewrite` safe to
+   resolve rather than fatal. *(Skipping this check lets two live transactions both hold the key.)*
+
+A `Prewrite` is a **batch**, and it reports a status for every key rather than stopping at the first
+refusal ([ADR 0016](adr/0016-txnkv-on-the-wire.md) decision 1). The batch is still one decision — if
+any key is refused, none is written — but the client learns about every lock at once and clears them
+in one round, instead of one round per contended key. A `Get` or a `Scan`, which ask about one thing,
+still answer a lock through `Locked{lock_info}`.
 
 Mutations on success:
 
