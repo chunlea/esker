@@ -60,7 +60,7 @@ fn stored(node: &Node, table: &str, key: &[Datum]) -> Option<Vec<Datum>> {
     let view = node.catalog.view(&*txn, 1).unwrap();
     let table = view.table(table).unwrap()?;
     let bytes = txn.get(&row::row_key(1, table.id, key).unwrap()).unwrap()?;
-    Some(row::decode_row(&table.column_types(), &bytes).unwrap())
+    Some(row::decode_row(&table.row_schema(), &bytes).unwrap())
 }
 
 #[test]

@@ -11,7 +11,7 @@
 //! recognise ours if we invented them.
 
 use crate::catalog::fold_identifier;
-use crate::value::ColumnType;
+use crate::value::{ColumnType, Datum};
 
 /// `CREATE TABLE`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +42,13 @@ pub struct Column {
     /// Whether `NOT NULL` was declared. A primary key column becomes `NOT NULL` whether or not it
     /// said so, which the executor applies.
     pub not_null: bool,
+    /// `DEFAULT <constant>`, already read as a value of the column's own type.
+    ///
+    /// A constant, and the lowering is where that is enforced: a **volatile** default such as
+    /// `random()` differs per row and so cannot be one value in the catalog, and an unfolded
+    /// expression such as `(1+1)` would need a folder this crate does not have. Both are `0A000`
+    /// naming what they are, rather than a value that is wrong for every row but the first.
+    pub default: Option<Datum>,
 }
 
 /// A `UNIQUE` constraint, which becomes a unique index.

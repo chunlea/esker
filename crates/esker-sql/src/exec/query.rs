@@ -25,7 +25,7 @@
 use crate::catalog::{ColumnDef, TableDef};
 use crate::error::{Result, SqlError};
 use crate::plan::{BinaryOp, Expr, Node, Select, SelectItem, SortKey};
-use crate::row;
+use crate::row::{self, RowSchema};
 use crate::value::{ColumnType, Datum};
 
 /// The tables a column reference in one query may name, in the order their columns appear in a
@@ -366,7 +366,7 @@ fn join_node(
         outer: Box::new(outer),
         inner_table_id: inner.id,
         inner_table: inner.name.clone(),
-        inner_columns: inner.column_types(),
+        inner_columns: inner.row_schema(),
         probe,
         residual,
     })
@@ -407,14 +407,14 @@ fn probe_for(on: &Expr, scope: &Scope<'_>, inner: &TableDef) -> Option<crate::pl
             index_id: index.id,
             index_name: index.name.clone(),
             outer: outer_at,
-            primary_key_types: inner.primary_key_types(),
+            primary_key_types: RowSchema::nullable(inner.primary_key_types()),
         })
 }
 
 /// Rule 1, 2 and 3 from `plan::query`: pin the whole primary key, bound its first column, or pin a
 /// unique index's whole key. Otherwise a scan.
 fn access_path(filter: Option<&Expr>, tenant: u64, table: &TableDef) -> Result<Node> {
-    let columns = table.column_types();
+    let columns = table.row_schema();
     let Some(filter) = filter else {
         return Ok(seq_scan(tenant, table, &columns, false));
     };
@@ -444,7 +444,7 @@ fn access_path(filter: Option<&Expr>, tenant: u64, table: &TableDef) -> Result<N
                 index_id: index.id,
                 index_name: index.name.clone(),
                 key,
-                primary_key_types: table.primary_key_types(),
+                primary_key_types: RowSchema::nullable(table.primary_key_types()),
             });
         }
     }
@@ -453,11 +453,11 @@ fn access_path(filter: Option<&Expr>, tenant: u64, table: &TableDef) -> Result<N
     Ok(narrowed_scan(tenant, table, &columns, filter))
 }
 
-fn seq_scan(tenant: u64, table: &TableDef, columns: &[ColumnType], narrowed: bool) -> Node {
+fn seq_scan(tenant: u64, table: &TableDef, columns: &RowSchema, narrowed: bool) -> Node {
     let (start, end) = row::table_row_range(tenant, table.id);
     Node::SeqScan {
         table_id: table.id,
-        columns: columns.to_vec(),
+        columns: columns.clone(),
         start,
         end,
         narrowed,
@@ -471,7 +471,7 @@ fn seq_scan(tenant: u64, table: &TableDef, columns: &[ColumnType], narrowed: boo
 /// `(a, b)` does not mean anything about where to start, because the rows for `b = 9` are spread
 /// through every value of `a`. The filter still runs either way; narrowing only decides how much
 /// is read.
-fn narrowed_scan(tenant: u64, table: &TableDef, columns: &[ColumnType], filter: &Expr) -> Node {
+fn narrowed_scan(tenant: u64, table: &TableDef, columns: &RowSchema, filter: &Expr) -> Node {
     let (mut start, mut end) = row::table_row_range(tenant, table.id);
     let mut narrowed = false;
 
@@ -505,7 +505,7 @@ fn narrowed_scan(tenant: u64, table: &TableDef, columns: &[ColumnType], filter: 
 
     Node::SeqScan {
         table_id: table.id,
-        columns: columns.to_vec(),
+        columns: columns.clone(),
         start,
         end,
         narrowed,

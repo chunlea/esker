@@ -142,10 +142,22 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
 /// is data, and data never panics this crate (`CLAUDE.md` invariant 9).
 ///
 /// A row written with *fewer* columns than `types` — every row written before an `ALTER TABLE ADD
-/// COLUMN` — is padded with NULL, which is what PostgreSQL shows for those columns and is why the
-/// `ALTER` rewrites nothing. A row that claims *more* is corruption: rows and the catalog are read
-/// at one snapshot, so a row from a schema the reader cannot see cannot be visible to it either.
-pub fn decode_row(types: &[ColumnType], bytes: &[u8]) -> Result<Vec<Datum>> {
+/// COLUMN` — is padded from `missing`, which is why the `ALTER` rewrites nothing. A row that claims
+/// *more* is corruption: rows and the catalog are read at one snapshot, so a row from a schema the
+/// reader cannot see cannot be visible to it either.
+///
+/// # The pad travels with the types, in one value
+///
+/// [`RowSchema`] is the pair, and it is one type rather than two arguments so that a types list and
+/// a pad list cannot drift apart — which they would, given four plan nodes each carrying both.
+/// What a column pads with is PostgreSQL 11's `attmissingval`
+/// (`crate::catalog::ColumnDef::missing`), and it is what makes `ADD COLUMN ... DEFAULT <constant>`
+/// instant on a populated table. [`RowSchema::nullable`] is every column padding NULL, which is ADR
+/// 0019's original rule, still the answer for a column added without a default, and the right
+/// answer for a tuple that is not a table row at all — an index entry's primary key, a value out of
+/// a catalog record.
+pub fn decode_row(schema: &RowSchema, bytes: &[u8]) -> Result<Vec<Datum>> {
+    let (types, missing) = (schema.types.as_slice(), schema.missing.as_slice());
     let (&version, rest) = bytes.split_first().ok_or_else(|| corrupt("row is empty"))?;
     if version != ROW_FORMAT_VERSION {
         return Err(corrupt(format!(
@@ -186,10 +198,65 @@ pub fn decode_row(types: &[ColumnType], bytes: &[u8]) -> Result<Vec<Datum>> {
             rest.len()
         )));
     }
-    // Columns added after this row was written. The `ALTER` that added them refuses `NOT NULL`,
-    // so NULL is a value they are allowed to hold.
-    values.resize(types.len(), Datum::Null);
+    // Columns added after this row was written, each padded with what the catalog says an absent
+    // value means. NULL where nothing says otherwise — the `ALTER` that adds a column with no
+    // default refuses `NOT NULL`, so NULL is a value it is allowed to hold; a column added *with*
+    // a constant default is `NOT NULL`-able precisely because this pad is that constant.
+    for index in values.len()..types.len() {
+        values.push(missing.get(index).cloned().flatten().unwrap_or(Datum::Null));
+    }
     Ok(values)
+}
+
+/// How one table's rows decode: a type per column, and what an absent column reads as.
+///
+/// The two lists are the same length by construction. They are one value because a plan node that
+/// carried them separately would have two chances to be built with the wrong pair, and the symptom
+/// would be a column reading NULL instead of its default — only for rows written before it was
+/// added, which is the hardest case to notice.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowSchema {
+    types: Vec<ColumnType>,
+    missing: Vec<Option<Datum>>,
+}
+
+impl RowSchema {
+    /// A schema whose columns pad with the values given, shortest wins: an entry past the end of
+    /// `missing` pads NULL.
+    #[must_use]
+    pub fn new(types: Vec<ColumnType>, mut missing: Vec<Option<Datum>>) -> Self {
+        missing.resize(types.len(), None);
+        RowSchema { types, missing }
+    }
+
+    /// A schema whose columns all pad NULL.
+    ///
+    /// ADR 0019's rule, and the right one for anything that is not a table row: an index entry's
+    /// primary key and a constant in a catalog record are tuples of exactly their own width, so
+    /// there is nothing for a pad to answer for.
+    #[must_use]
+    pub fn nullable(types: Vec<ColumnType>) -> Self {
+        let missing = vec![None; types.len()];
+        RowSchema { types, missing }
+    }
+
+    /// The column types, in encoding order.
+    #[must_use]
+    pub fn types(&self) -> &[ColumnType] {
+        &self.types
+    }
+
+    /// How many columns the schema has.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.types.len()
+    }
+
+    /// Whether the schema has no columns at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.types.is_empty()
+    }
 }
 
 fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
@@ -420,8 +487,8 @@ fn successor(mut prefix: Vec<u8>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ROW_FORMAT_VERSION, decode_key_columns, decode_row, encode_row, index_key, index_range,
-        row_key, table_row_range, unique_index_key_is_unique_by_value,
+        ROW_FORMAT_VERSION, RowSchema, decode_key_columns, decode_row, encode_row, index_key,
+        index_range, row_key, table_row_range, unique_index_key_is_unique_by_value,
     };
     use crate::sqlstate;
     use crate::value::{ColumnType, Datum, MAX_MICROS, MIN_MICROS, NEG_INFINITY, POS_INFINITY};
@@ -471,7 +538,11 @@ mod tests {
             )
         );
         assert_eq!(
-            decode_row(&types, &encode_row(&types, &values).unwrap()).unwrap(),
+            decode_row(
+                &RowSchema::nullable(types.to_vec()),
+                &encode_row(&types, &values).unwrap()
+            )
+            .unwrap(),
             values
         );
     }
@@ -496,7 +567,10 @@ mod tests {
                 "0800000000000000", // column 8
             )
         );
-        assert_eq!(decode_row(&types, &encoded).unwrap(), values);
+        assert_eq!(
+            decode_row(&RowSchema::nullable(types.to_vec()), &encoded).unwrap(),
+            values
+        );
     }
 
     /// The point of the column count: a row written before `ALTER TABLE ADD COLUMN` reads back
@@ -508,7 +582,7 @@ mod tests {
 
         let after = [ColumnType::Int8, ColumnType::Text, ColumnType::Bool];
         assert_eq!(
-            decode_row(&after, &row).unwrap(),
+            decode_row(&RowSchema::nullable(after.to_vec()), &row).unwrap(),
             [Datum::Int8(1), Datum::Text("one".into()), Datum::Null]
         );
 
@@ -520,7 +594,7 @@ mod tests {
             ColumnType::Double,
         ];
         assert_eq!(
-            decode_row(&after, &row).unwrap(),
+            decode_row(&RowSchema::nullable(after.to_vec()), &row).unwrap(),
             [
                 Datum::Int8(1),
                 Datum::Text("one".into()),
@@ -544,7 +618,10 @@ mod tests {
         let nine = [ColumnType::Int8; 9];
         let mut expected = values;
         expected.push(Datum::Null);
-        assert_eq!(decode_row(&nine, &row).unwrap(), expected);
+        assert_eq!(
+            decode_row(&RowSchema::nullable(nine.to_vec()), &row).unwrap(),
+            expected
+        );
     }
 
     /// The other direction is corruption, not padding. A row and the catalog are read at one
@@ -556,7 +633,7 @@ mod tests {
             &[Datum::Int8(1), Datum::Int8(2)],
         )
         .unwrap();
-        let error = decode_row(&[ColumnType::Int8], &row).unwrap_err();
+        let error = decode_row(&RowSchema::nullable(vec![ColumnType::Int8]), &row).unwrap_err();
         assert_eq!(error.sqlstate(), sqlstate::DATA_CORRUPTED);
     }
 
@@ -568,10 +645,13 @@ mod tests {
         let null = encode_row(&types, &[Datum::Null]).unwrap();
         assert_ne!(empty, null);
         assert_eq!(
-            decode_row(&types, &empty).unwrap(),
+            decode_row(&RowSchema::nullable(types.to_vec()), &empty).unwrap(),
             [Datum::Text(String::new())]
         );
-        assert_eq!(decode_row(&types, &null).unwrap(), [Datum::Null]);
+        assert_eq!(
+            decode_row(&RowSchema::nullable(types.to_vec()), &null).unwrap(),
+            [Datum::Null]
+        );
     }
 
     /// Invariant 2: an unknown version is an error value, never a guess and never a panic.
@@ -579,7 +659,7 @@ mod tests {
     fn a_row_from_a_future_version_is_refused() {
         let mut row = encode_row(&[ColumnType::Int8], &[Datum::Int8(1)]).unwrap();
         row[0] = ROW_FORMAT_VERSION + 1;
-        let error = decode_row(&[ColumnType::Int8], &row).unwrap_err();
+        let error = decode_row(&RowSchema::nullable(vec![ColumnType::Int8]), &row).unwrap_err();
         assert_eq!(error.sqlstate(), sqlstate::DATA_CORRUPTED);
     }
 
@@ -598,14 +678,14 @@ mod tests {
         .unwrap();
         for cut in 0..row.len() {
             assert!(
-                decode_row(&types, &row[..cut]).is_err(),
+                decode_row(&RowSchema::nullable(types.to_vec()), &row[..cut]).is_err(),
                 "{cut} bytes decoded as a whole row"
             );
         }
         let mut trailing = row.clone();
         trailing.push(0);
         assert!(
-            decode_row(&types, &trailing).is_err(),
+            decode_row(&RowSchema::nullable(types.to_vec()), &trailing).is_err(),
             "trailing bytes are corruption too"
         );
     }
@@ -724,7 +804,10 @@ mod tests {
             Datum::TimestampTz(POS_INFINITY),
         ];
         let row = encode_row(&types, &values).unwrap();
-        assert_eq!(decode_row(&types, &row).unwrap(), values);
+        assert_eq!(
+            decode_row(&RowSchema::nullable(types.to_vec()), &row).unwrap(),
+            values
+        );
 
         let keys: Vec<_> = values
             .iter()
@@ -752,7 +835,7 @@ mod tests {
     fn a_text_column_that_is_not_utf8_is_refused() {
         let mut row = encode_row(&[ColumnType::Text], &[Datum::Text("ab".into())]).unwrap();
         *row.last_mut().unwrap() = 0xff;
-        let error = decode_row(&[ColumnType::Text], &row).unwrap_err();
+        let error = decode_row(&RowSchema::nullable(vec![ColumnType::Text]), &row).unwrap_err();
         assert_eq!(error.sqlstate(), sqlstate::CHARACTER_NOT_IN_REPERTOIRE);
         assert_eq!(
             error.to_string(),
@@ -852,14 +935,14 @@ mod tests {
             widened.extend_from_slice(&added);
             let mut expected = rows[0].clone();
             expected.resize(widened.len(), Datum::Null);
-            proptest::prop_assert_eq!(decode_row(&widened, &row).unwrap(), expected);
+            proptest::prop_assert_eq!(decode_row(&RowSchema::nullable(widened.clone()), &row).unwrap(), expected);
         }
 
         #[test]
         fn any_row_survives_encode_and_decode((types, rows) in schema_and_rows(0..12, 1)) {
             let values = &rows[0];
             let encoded = encode_row(&types, values).unwrap();
-            proptest::prop_assert_eq!(&decode_row(&types, &encoded).unwrap(), values);
+            proptest::prop_assert_eq!(&decode_row(&RowSchema::nullable(types.clone()), &encoded).unwrap(), values);
         }
 
         /// Byte order is value order. This is the property the whole key encoding exists for: get
@@ -914,7 +997,7 @@ mod tests {
             bytes in proptest::collection::vec(proptest::arbitrary::any::<u8>(), 0..64)
         ) {
             let types = [ColumnType::Int8, ColumnType::Text, ColumnType::Double];
-            let _ = decode_row(&types, &bytes);
+            let _ = decode_row(&RowSchema::nullable(types.to_vec()), &bytes);
             let _ = decode_key_columns(&types, &bytes);
         }
     }

@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::backend::Txn;
 use crate::error::{Result, SqlError};
-use crate::value::ColumnType;
+use crate::value::{ColumnType, Datum};
 
 /// The version byte on every catalog record. An unknown one is an error, never a guess
 /// (`CLAUDE.md` invariant 2).
@@ -78,6 +78,26 @@ pub struct ColumnDef {
     pub ty: ColumnType,
     /// Whether a NULL is refused. Primary key columns are always `NOT NULL`.
     pub not_null: bool,
+    /// What an `INSERT` that omits this column writes. `None` is NULL.
+    ///
+    /// A **constant**, not an expression: `DEFAULT 7` and `DEFAULT 'x'` are stored, `DEFAULT
+    /// random()` is refused by name (`docs/plans/phase-6e.md` §5 unit 1). PostgreSQL folds a
+    /// constant expression like `(1+1)` to `2` before storing it; there is no folder here, so a
+    /// parenthesised expression is refused rather than half-read.
+    pub default: Option<Datum>,
+    /// What a **row narrower than this column** reads as. `None` is NULL.
+    ///
+    /// PostgreSQL 11's `attmissingval`, and the reason `ALTER TABLE ... ADD COLUMN ... DEFAULT` is
+    /// instant on a populated table: rather than rewriting every row to carry the value, the
+    /// *catalog* remembers it and the decoder pads with it. ADR 0019's pad rule generalised — that
+    /// rule pads with NULL, which is this field's `None`.
+    ///
+    /// **Separate from [`ColumnDef::default`], and the two really do diverge.** Measured on
+    /// PostgreSQL 19beta1: after `ADD COLUMN c text DEFAULT 'old'`, a later
+    /// `ALTER COLUMN c SET DEFAULT 'new'` leaves `attmissingval` at `old` — rows that predate the
+    /// column still read `old` and new rows get `new`. Storing one field for both would rewrite
+    /// history the first time somebody changed a default.
+    pub missing: Option<Datum>,
 }
 
 /// One index on one table. Its columns are positions into the table's column list, so renaming a
@@ -174,6 +194,26 @@ impl TableDef {
     #[must_use]
     pub fn column_types(&self) -> Vec<ColumnType> {
         self.columns.iter().map(|column| column.ty).collect()
+    }
+
+    /// How this table's rows decode: [`TableDef::column_types`] and [`TableDef::column_missing`]
+    /// as the one value [`crate::row::decode_row`] takes.
+    #[must_use]
+    pub fn row_schema(&self) -> crate::row::RowSchema {
+        crate::row::RowSchema::new(self.column_types(), self.column_missing())
+    }
+
+    /// What each column reads as in a row too narrow to hold it, in the same order.
+    ///
+    /// The second half of what [`crate::row::decode_row`] needs for a **table row**, and the reason
+    /// `ALTER TABLE ADD COLUMN ... DEFAULT <constant>` rewrites nothing: the value lives here
+    /// rather than in every row (`ColumnDef::missing`).
+    #[must_use]
+    pub fn column_missing(&self) -> Vec<Option<Datum>> {
+        self.columns
+            .iter()
+            .map(|column| column.missing.clone())
+            .collect()
     }
 
     /// The types of the primary key columns, in key order.
@@ -423,7 +463,7 @@ pub fn create_table(txn: &mut dyn Txn, tenant: u64, table: &TableDef) -> Result<
             return Err(SqlError::DuplicateTable(name.clone()));
         }
     }
-    write_table(txn, tenant, table);
+    write_table(txn, tenant, table)?;
     bump_version(txn)
 }
 
@@ -449,7 +489,7 @@ pub fn replace_table(
             return Err(SqlError::DuplicateTable(index.name.clone()));
         }
     }
-    write_table(txn, tenant, table);
+    write_table(txn, tenant, table)?;
     bump_version(txn)
 }
 
@@ -471,10 +511,10 @@ pub fn drop_table(txn: &mut dyn Txn, tenant: u64, table: &TableDef) -> Result<()
     bump_version(txn)
 }
 
-fn write_table(txn: &mut dyn Txn, tenant: u64, table: &TableDef) {
+fn write_table(txn: &mut dyn Txn, tenant: u64, table: &TableDef) -> Result<()> {
     txn.put(
         &record::table_key(tenant, table.id),
-        &record::encode_table(table),
+        &record::encode_table(table)?,
     );
     txn.put(
         &record::name_key(tenant, &table.name),
@@ -500,6 +540,7 @@ fn write_table(txn: &mut dyn Txn, tenant: u64, table: &TableDef) {
             }),
         );
     }
+    Ok(())
 }
 
 /// Sets the retention override for one table, in milliseconds.
@@ -658,6 +699,14 @@ mod tests {
     use crate::sqlstate;
     use crate::value::ColumnType;
 
+    /// The other direction, for a golden that is written down rather than produced.
+    fn decode_hex(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
+            .collect()
+    }
+
     fn hex(bytes: &[u8]) -> String {
         use std::fmt::Write as _;
         bytes.iter().fold(String::new(), |mut out, byte| {
@@ -675,11 +724,15 @@ mod tests {
                     name: "id".into(),
                     ty: ColumnType::Int8,
                     not_null: true,
+                    default: None,
+                    missing: None,
                 },
                 ColumnDef {
                     name: "email".into(),
                     ty: ColumnType::Text,
                     not_null: false,
+                    default: None,
+                    missing: None,
                 },
             ],
             primary_key: vec![0],
@@ -697,11 +750,11 @@ mod tests {
     /// The golden. A catalog record is an on-disk format like any other, and these bytes are it.
     #[test]
     fn a_table_record_is_a_version_and_then_the_definition() {
-        let encoded = record::encode_table(&accounts(7));
+        let encoded = record::encode_table(&accounts(7)).unwrap();
         assert_eq!(
             hex(&encoded),
             concat!(
-                "02",                 // catalog format version
+                "03",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -713,9 +766,13 @@ mod tests {
                 "026964",
                 "01",
                 "01", // "id", INT8, NOT NULL
+                "00", // no DEFAULT
+                "00", // and no missing value
                 "05656d61696c",
                 "02",
                 "00", // "email", TEXT, nullable
+                "00", // no DEFAULT
+                "00", // and no missing value
                 "01",
                 "00",                                     // primary key: one column, column 0
                 "01",                                     // one index
@@ -729,18 +786,65 @@ mod tests {
         assert_eq!(record::decode_table(&encoded).unwrap(), accounts(7));
     }
 
+    /// The **version 2** golden, kept rather than replaced.
+    ///
+    /// These are the bytes version 2 wrote, and a cluster that ran phase 6a or 6d has them on
+    /// disk. A format change that replaced its golden would be a format change nothing could
+    /// prove it had survived, so the old bytes stay and this test decodes them: every column comes
+    /// back with no default and no missing value, which is what a column nobody gave one means.
+    #[test]
+    fn a_version_2_table_record_still_decodes() {
+        let v2 = decode_hex(concat!(
+            "02",                 // catalog format version 2
+            "0700000000000000",   // table id 7
+            "086163636f756e7473", // varint 8, "accounts"
+            "0d6163636f756e74735f706b6579",
+            "01", // schema version 1
+            "02", // two columns
+            "026964",
+            "01",
+            "01", // "id", INT8, NOT NULL -- and nothing after it
+            "05656d61696c",
+            "02",
+            "00", // "email", TEXT, nullable
+            "01",
+            "00",                                     // primary key: one column, column 0
+            "01",                                     // one index
+            "0800000000000000",                       // index id 8
+            "126163636f756e74735f656d61696c5f6b6579", // "accounts_email_key"
+            "01",
+            "01",
+            "01",
+        ));
+        assert_eq!(record::decode_table(&v2).unwrap(), accounts(7));
+    }
+
+    /// Version 3 changed the **table** record's layout and nothing else's, so a version 2 record of
+    /// any other kind decodes unchanged. Refusing them because the byte moved would break a cluster
+    /// that had run phase 6d over a change that does not touch them.
+    #[test]
+    fn a_version_2_record_of_another_kind_decodes_unchanged() {
+        let mut v2 = record::encode_retention(60_000);
+        v2[0] = 2;
+        assert_eq!(record::decode_retention(&v2).unwrap(), 60_000);
+
+        let mut v2 = record::encode_checkpoint(1_234);
+        v2[0] = 2;
+        assert_eq!(record::decode_checkpoint(&v2).unwrap(), 1_234);
+    }
+
     /// Invariant 2 again: a record from a version we do not know is an error, and every truncation
     /// of a record we do know is one too (invariant 9).
     #[test]
     fn a_record_that_is_not_ours_is_refused_rather_than_guessed_at() {
-        let mut encoded = record::encode_table(&accounts(1));
+        let mut encoded = record::encode_table(&accounts(1)).unwrap();
         encoded[0] = super::CATALOG_FORMAT_VERSION + 1;
         assert_eq!(
             record::decode_table(&encoded).unwrap_err().sqlstate(),
             sqlstate::DATA_CORRUPTED
         );
 
-        let encoded = record::encode_table(&accounts(1));
+        let encoded = record::encode_table(&accounts(1)).unwrap();
         for cut in 0..encoded.len() {
             assert!(
                 record::decode_table(&encoded[..cut]).is_err(),
@@ -760,8 +864,8 @@ mod tests {
         let mut on_second = accounts(1);
         on_second.primary_key = vec![1];
         let (a, b) = (
-            record::encode_table(&on_first),
-            record::encode_table(&on_second),
+            record::encode_table(&on_first).unwrap(),
+            record::encode_table(&on_second).unwrap(),
         );
         let differing: Vec<usize> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
         assert_eq!(differing.len(), 1, "exactly one byte is the ordinal");
@@ -1074,7 +1178,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "02",               // catalog format version
+                "03",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );
@@ -1177,7 +1281,7 @@ mod tests {
             at in 0usize..64,
             byte in proptest::arbitrary::any::<u8>(),
         ) {
-            let mut encoded = record::encode_table(&accounts(1));
+            let mut encoded = record::encode_table(&accounts(1)).unwrap();
             if at < encoded.len() {
                 encoded[at] = byte;
             }

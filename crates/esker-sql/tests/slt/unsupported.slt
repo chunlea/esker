@@ -57,8 +57,10 @@ CREATE TEMPORARY TABLE tmp (id int8 PRIMARY KEY)
 statement error (0A000)
 CREATE TABLE copy AS SELECT * FROM t
 
+# `DEFAULT <constant>` runs now (alter_table.slt); a volatile one does not, for the reason a
+# volatile one on ADD COLUMN does not.
 statement error (0A000)
-CREATE TABLE d (id int8 PRIMARY KEY, a int8 DEFAULT 1)
+CREATE TABLE d (id int8 PRIMARY KEY, a float8 DEFAULT random())
 
 statement error (0A000)
 CREATE TABLE f (id int8 PRIMARY KEY, a int8, FOREIGN KEY (a) REFERENCES t (id))
@@ -78,13 +80,23 @@ CREATE INDEX ON t (a) WHERE a > 0
 statement error (0A000)
 CREATE INDEX CONCURRENTLY ci ON t (a)
 
-# `ALTER TABLE ADD COLUMN` of a nullable column runs (see alter_table.slt). Everything else about
-# ALTER TABLE does not, and each is named rather than lumped together.
+# `ALTER TABLE ADD COLUMN` runs for a nullable column and for one with a **constant** default
+# (see alter_table.slt). What is left is what would need a row rewritten, and each is named rather
+# than lumped together.
+#
+# `NOT NULL` with no default: nothing to pad the rows already stored with. The refusal names the
+# pair, because `NOT NULL DEFAULT 7` is accepted.
 statement error (0A000)
 ALTER TABLE t ADD COLUMN c int8 NOT NULL
 
+# A volatile default differs per row, so it cannot be one constant in the catalog. PostgreSQL
+# rewrites the table for it; this node has no rewrite yet and says so.
 statement error (0A000)
-ALTER TABLE t ADD COLUMN c int8 DEFAULT 0
+ALTER TABLE t ADD COLUMN r float8 DEFAULT random()
+
+# PostgreSQL folds this to 2 before storing it. There is no folder here.
+statement error (0A000)
+ALTER TABLE t ADD COLUMN e int8 DEFAULT (1+1)
 
 statement error (0A000)
 ALTER TABLE t ADD COLUMN c int8 UNIQUE

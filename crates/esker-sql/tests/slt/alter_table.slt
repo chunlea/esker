@@ -129,3 +129,70 @@ UPDATE a SET m1 = 'only' WHERE id = 1
 
 statement error (23505)
 UPDATE a SET m1 = 'only' WHERE id = 2
+
+# --- a constant DEFAULT, and the rows that predate the column ------------------------------------
+# PostgreSQL 11's missing value (ADR 0020, docs/plans/phase-6e.md §5 unit 1): the constant is stored
+# on the *column* and the decoder pads with it, so a populated table is altered without a row being
+# rewritten. ADR 0019's pad rule generalised -- that rule pads with NULL, and NULL is still what a
+# column with no default pads with.
+
+statement ok
+CREATE TABLE d (id int8 PRIMARY KEY)
+
+statement ok
+INSERT INTO d VALUES (1), (2)
+
+statement ok
+ALTER TABLE d ADD COLUMN c text DEFAULT 'old'
+
+# Rows written before the column existed read the default. No row was rewritten to make this true.
+query IT rowsort
+SELECT id, c FROM d
+----
+1	old
+2	old
+
+# A row written *after* takes the default too -- through the other field. What an INSERT omits is
+# the column's default; what a narrow row is missing is its missing value, and the two are separate
+# because PostgreSQL lets them diverge.
+statement ok
+INSERT INTO d (id) VALUES (3)
+
+statement ok
+INSERT INTO d (id, c) VALUES (4, 'given')
+
+query IT rowsort
+SELECT id, c FROM d
+----
+1	old
+2	old
+3	old
+4	given
+
+# NOT NULL with a constant default is instant, here and on a real server: the constant is what every
+# row already stored holds.
+statement ok
+ALTER TABLE d ADD COLUMN n int8 NOT NULL DEFAULT 7
+
+query II rowsort
+SELECT id, n FROM d
+----
+1	7
+2	7
+3	7
+4	7
+
+statement error (23502)
+INSERT INTO d (id, n) VALUES (5, NULL)
+
+# And a column added with no default still pads NULL, which is where this started.
+statement ok
+ALTER TABLE d ADD COLUMN e text
+
+query T rowsort
+SELECT e FROM d
+----
+NULL
+NULL
+NULL
+NULL

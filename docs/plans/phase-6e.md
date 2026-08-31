@@ -275,8 +275,28 @@ state that guards it is skipped, which is what makes them tests of the rule rath
 
 ## 9. Progress
 
-(one line per unit as it lands)
+- [x] 1 — **`ADD COLUMN ... DEFAULT <constant>`, the PostgreSQL 11 way.** Catalog v3 with a
+  `default` and a `missing` on every column, v2 still decoding and both goldens kept;
+  `RowSchema` so a types list and a pad list cannot drift apart; the insert path filling omitted
+  columns from the default. `NOT NULL DEFAULT <constant>` is instant, which narrows a divergence
+  §10a of phase 6a records. 12 new tests, 5 new corpus statements, `.slt` updated.
 
 ## 10. What changed from this plan
 
-(and why)
+**A column needs two fields, not one, and unit 1 is bigger than "the missing value".** The plan
+named `missing`; the measurement said a *default* is a separate thing that PostgreSQL lets diverge
+from it (`ALTER COLUMN SET DEFAULT` moves one and not the other). And column defaults did not exist
+in this crate at all — `CREATE TABLE t (a int8 DEFAULT 1)` was `0A000` — so `ADD COLUMN c DEFAULT
+'x'` giving old rows `'x'` and new rows NULL would have been incoherent. Both fields, on both
+statements, is the smallest thing that is not wrong.
+
+**`decode_row` grew a `RowSchema` rather than a second argument.** Four plan nodes carry a column
+list, and a parallel pad list would have been four chances to build a node with the wrong pair —
+whose symptom is a column reading NULL instead of its default, only for rows written before it was
+added, which is the hardest case to notice. One value carries both.
+
+**Version 3 reads version 2 for *every* record kind, not just the table's.** The first version made
+`Reader::new` strict and only the table record tolerant, which would have made a phase-6d cluster's
+retention and checkpoint records `DATA_CORRUPTED` on upgrade — a break caused by a layout change
+that does not touch them. The version byte names the catalog format; only the table record's layout
+moved.

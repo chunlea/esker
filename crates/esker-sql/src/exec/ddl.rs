@@ -8,8 +8,12 @@
 //! Appending a nullable column is a catalog write and nothing else. The rows already stored say
 //! how many columns they hold ([ADR 0019](../../../docs/adr/0019-a-row-says-how-many-columns-it-has.md)),
 //! so a reader pads the new column to NULL, which is what PostgreSQL shows for it anyway. That is
-//! the whole feature, and it is why the restrictions are what they are: `NOT NULL` and `DEFAULT`
-//! both need every existing row to hold a value it does not hold, and each is refused by name.
+//! the whole feature. A **constant** `DEFAULT` is admitted on the same argument, one step further
+//! on: the value is stored on the column as its *missing value* and the decoder pads with that
+//! instead of with NULL, which is PostgreSQL 11's `attmissingval` and is why `ADD COLUMN ... NOT
+//! NULL DEFAULT 7` is instant there too. What stays refused is what would need a row rewritten —
+//! a **volatile** default like `random()`, whose value differs per row and so cannot be one
+//! constant in the catalog, and bare `NOT NULL` with no default, which has no value to pad with.
 //!
 //! # A table with no primary key gets a hidden one
 //!
@@ -66,6 +70,11 @@ pub(super) fn create_table(
             // A primary key column is NOT NULL whether or not it said so, which is PostgreSQL's
             // rule and also ours by necessity: a NULL cannot be part of a row key.
             not_null: column.not_null || create.primary_key.contains(&column.name),
+            default: column.default.clone(),
+            // **No missing value at `CREATE TABLE`**, whatever the default is. Nothing predates a
+            // column the table was created with, so there is no narrower row for a pad to answer
+            // for — and writing one would be a claim about rows that cannot exist.
+            missing: None,
         });
     }
 
@@ -85,6 +94,9 @@ pub(super) fn create_table(
             name: catalog::INTERNAL_ROW_ID_NAME.to_owned(),
             ty: crate::value::ColumnType::Int8,
             not_null: true,
+            // The executor fills it on every insert, so it has neither.
+            default: None,
+            missing: None,
         });
         with_row_id.extend(columns);
         (with_row_id, vec![0], String::new())
@@ -378,9 +390,18 @@ pub(super) fn alter_table(
         updated.columns.push(ColumnDef {
             name: column.name.clone(),
             ty: column.ty,
-            // The lowering refuses `NOT NULL`, so this is the only value it can have -- and it
-            // has to be this one, because every row already stored is missing the column.
-            not_null: false,
+            // `NOT NULL` is admissible **only with a constant default**, which is what makes every
+            // row already stored hold a value: the missing value below is that value, and the
+            // decoder pads with it. Without one the lowering refuses `NOT NULL`, because the
+            // alternative is a rewrite and this `ALTER` touches no row.
+            not_null: column.not_null,
+            default: column.default.clone(),
+            // **The missing value is frozen here**, at `ADD COLUMN` time, and a later
+            // `ALTER COLUMN SET DEFAULT` must not touch it. Measured on PostgreSQL 19beta1: after
+            // `SET DEFAULT 'new'`, rows that predate the column still read `old`
+            // (`docs/plans/phase-6e.md` §5 unit 1). One field for both would rewrite history the
+            // first time somebody changed a default.
+            missing: column.default.clone(),
         });
         changed = true;
     }
@@ -426,13 +447,13 @@ fn backfill(
 ) -> Result<()> {
     let tenant = executor.tenant;
     let (start, end) = crate::row::table_row_range(tenant, table.id);
-    let types = table.column_types();
+    let schema = table.row_schema();
     let primary_key_types = table.primary_key_types();
 
     let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     super::for_each_page(txn, &start, &end, |_, page| {
         for (_, value) in page {
-            let row = crate::row::decode_row(&types, value)?;
+            let row = crate::row::decode_row(&schema, value)?;
             let columns: Vec<Datum> = index
                 .columns
                 .iter()

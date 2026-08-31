@@ -48,9 +48,18 @@ pub(super) fn insert(
             return Err(SqlError::InsertTooManyExpressions);
         }
 
-        // Every column starts NULL: `INSERT INTO t (a) VALUES (1)` leaves the rest NULL, and so
-        // does a `VALUES` tuple shorter than the column list.
-        let mut row = vec![Datum::Null; table.columns.len()];
+        // Every column starts at its **default**, which is NULL unless one was declared:
+        // `INSERT INTO t (a) VALUES (1)` leaves the rest at theirs, and so does a `VALUES` tuple
+        // shorter than the column list.
+        //
+        // The default and the *missing* value are different fields and this is the one that reads
+        // the default (`crate::catalog::ColumnDef`). A row written now is written at full width,
+        // so nothing about it is missing; the other field answers for rows that predate the column.
+        let mut row: Vec<Datum> = table
+            .columns
+            .iter()
+            .map(|column| column.default.clone().unwrap_or(Datum::Null))
+            .collect();
         for (target, expr) in targets.iter().zip(values) {
             let column = &table.columns[*target];
             row[*target] = expr.evaluate(column.ty, &column.name)?;

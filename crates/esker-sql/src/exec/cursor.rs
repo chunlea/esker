@@ -21,6 +21,7 @@ use crate::error::{Result, SqlError};
 use crate::exec::query::successor;
 use crate::plan::{BinaryOp, Expr, Node, Probe, SortKey};
 use crate::row;
+use crate::row::RowSchema;
 use crate::value::{ColumnType, Datum};
 
 /// Rows read from the store in one round trip. Shared with everything else that walks a range
@@ -46,7 +47,7 @@ enum Kind<'a> {
     One(bool),
     /// A key range, read a chunk at a time.
     Scan {
-        columns: Vec<ColumnType>,
+        columns: RowSchema,
         next: Vec<u8>,
         end: Vec<u8>,
         batch: std::vec::IntoIter<(bytes::Bytes, bytes::Bytes)>,
@@ -77,7 +78,7 @@ enum Kind<'a> {
     NestedLoop {
         outer: Box<Cursor<'a>>,
         inner_table_id: u64,
-        inner_columns: Vec<ColumnType>,
+        inner_columns: RowSchema,
         probe: Probe,
         residual: Option<Expr>,
         /// The outer row being matched, and how far through the materialised inner side it is.
@@ -380,11 +381,11 @@ impl<'a> Cursor<'a> {
 /// A `Node` rather than a bespoke read, so that a join's inner side and a `WHERE`'s access path
 /// go through exactly the same code — there is one implementation of "a point read" and one of
 /// "a unique index lookup", and a join cannot drift away from what a `WHERE` does.
-fn probe_node(probe: &Probe, table_id: u64, columns: &[ColumnType], outer: &[Datum]) -> Node {
+fn probe_node(probe: &Probe, table_id: u64, columns: &RowSchema, outer: &[Datum]) -> Node {
     match probe {
         Probe::PrimaryKey { outer: at } => Node::PointGet {
             table_id,
-            columns: columns.to_vec(),
+            columns: columns.clone(),
             key: vec![outer[*at].clone()],
         },
         Probe::UniqueIndex {
@@ -394,7 +395,7 @@ fn probe_node(probe: &Probe, table_id: u64, columns: &[ColumnType], outer: &[Dat
             primary_key_types,
         } => Node::IndexLookup {
             table_id,
-            columns: columns.to_vec(),
+            columns: columns.clone(),
             index_id: *index_id,
             index_name: index_name.clone(),
             key: vec![outer[*at].clone()],

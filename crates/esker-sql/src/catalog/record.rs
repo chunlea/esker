@@ -33,14 +33,27 @@ use esker_keys::{codec, prefix};
 
 use crate::catalog::{ColumnDef, IndexDef, Relation, TableDef};
 use crate::error::{Result, SqlError};
-use crate::value::ColumnType;
+use crate::value::{ColumnType, Datum};
 
 /// The version byte on every catalog record.
 ///
-/// Version 2 added a table's schema version (ADR 0019). Version 1 is not read: nothing has ever
-/// persisted a catalog outside a test, and a compatibility path for data that does not exist is
-/// one nothing can check.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 2;
+/// Version 2 added a table's schema version (ADR 0019). Version 3 added a column's default and its
+/// missing value, and the schema state on every column and index (ADR 0020,
+/// `docs/plans/phase-6e.md` §4).
+///
+/// Version 1 is not read: nothing had ever persisted a catalog when version 2 landed, so a
+/// compatibility path for it was one nothing could check. **Version 2 is different** — this crate
+/// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
+/// them: a v2 column has no default and no missing value, which is what a column that was never
+/// given one means.
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 3;
+
+/// The oldest catalog record this crate reads.
+///
+/// Version 2. Version 1 is refused because no version 1 data has ever existed outside a test on the
+/// same commit (ADR 0019 Decision 2); version 2 data **does** exist — this crate has had a real
+/// backend since phase 6a unit 11 — so it is read rather than refused.
+const OLDEST_TABLE_VERSION: u8 = 2;
 
 /// What every catalog key begins with, after the `'m'` namespace byte.
 const SQL: &[u8] = b"sql";
@@ -260,7 +273,7 @@ pub(super) fn decode_counter(bytes: &[u8]) -> Result<u64> {
 /// the index list lived under its own keys a cached table could be current while its index list
 /// was stale — which is the one kind of staleness that corrupts data rather than returning old
 /// data, because a row would be written without an entry in an index that exists.
-pub(super) fn encode_table(table: &TableDef) -> Vec<u8> {
+pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
     let mut out = vec![CATALOG_FORMAT_VERSION];
     out.extend_from_slice(&table.id.to_le_bytes());
     put_str(&table.name, &mut out);
@@ -274,6 +287,10 @@ pub(super) fn encode_table(table: &TableDef) -> Vec<u8> {
         put_str(&column.name, &mut out);
         out.push(tag_of(column.ty));
         out.push(u8::from(column.not_null));
+        // Version 3. Two constants, each present-or-absent, each in the column's own type — so a
+        // reader that knows the type knows the length, and neither needs a tag of its own.
+        put_value(column.default.as_ref(), column.ty, &mut out)?;
+        put_value(column.missing.as_ref(), column.ty, &mut out)?;
     }
 
     varint::put_u64(table.primary_key.len() as u64, &mut out);
@@ -291,12 +308,12 @@ pub(super) fn encode_table(table: &TableDef) -> Vec<u8> {
             varint::put_u64(ordinal as u64, &mut out);
         }
     }
-    out
+    Ok(out)
 }
 
 /// Reads a table record back. Every failure is typed: a catalog is on-disk data like any other.
 pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
-    let mut reader = Reader::new(bytes)?;
+    let mut reader = Reader::at_least(bytes, OLDEST_TABLE_VERSION)?;
     let id = reader.u64_le()?;
     let name = reader.string()?;
     let primary_key_name = reader.string()?;
@@ -304,10 +321,21 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
 
     let mut columns = Vec::with_capacity(reader.count()?);
     for _ in 0..columns.capacity() {
+        let name = reader.string()?;
+        let ty = type_of(reader.byte()?)?;
+        let not_null = reader.flag()?;
+        // A version 2 column has neither, which is what a column nobody gave a default means.
+        let (default, missing) = if reader.version >= 3 {
+            (reader.value(ty)?, reader.value(ty)?)
+        } else {
+            (None, None)
+        };
         columns.push(ColumnDef {
-            name: reader.string()?,
-            ty: type_of(reader.byte()?)?,
-            not_null: reader.flag()?,
+            name,
+            ty,
+            not_null,
+            default,
+            missing,
         });
     }
 
@@ -391,22 +419,57 @@ fn put_str(value: &str, out: &mut Vec<u8>) {
     out.extend_from_slice(value.as_bytes());
 }
 
+/// A constant of a column's own type, present or absent.
+///
+/// Encoded as a **one-column row** rather than as a format of its own, so that a value in the
+/// catalog is written by exactly the code that writes it in a table and is covered by the same
+/// goldens. The presence byte is what distinguishes "no default" from "`DEFAULT NULL`" — which
+/// PostgreSQL also treats as the same thing, but a format that could not tell them apart would be
+/// deciding that rather than recording it.
+fn put_value(value: Option<&Datum>, ty: ColumnType, out: &mut Vec<u8>) -> Result<()> {
+    let Some(value) = value else {
+        out.push(0);
+        return Ok(());
+    };
+    out.push(1);
+    let encoded = crate::row::encode_row(&[ty], std::slice::from_ref(value))?;
+    varint::put_u64(encoded.len() as u64, out);
+    out.extend_from_slice(&encoded);
+    Ok(())
+}
+
 /// A cursor that fails rather than panics, whatever the bytes are (`CLAUDE.md` invariant 9).
 struct Reader<'a> {
     bytes: &'a [u8],
+    /// The version byte this record carried, for the one record whose layout grew.
+    version: u8,
 }
 
 impl<'a> Reader<'a> {
+    /// A reader over a catalog record of any version this crate reads.
+    ///
+    /// **Every** record, not just the table's. The version byte names the *catalog* format, and
+    /// version 3 changed only the table record's layout — a retention, a checkpoint and a counter
+    /// are byte-identical under 2 and 3. Refusing them because the byte moved would break a
+    /// cluster that had run phase 6d, for a layout change that does not touch them.
     fn new(bytes: &'a [u8]) -> Result<Self> {
+        Reader::at_least(bytes, OLDEST_TABLE_VERSION)
+    }
+
+    /// A reader over a record of `oldest` or newer.
+    fn at_least(bytes: &'a [u8], oldest: u8) -> Result<Self> {
         let (&version, rest) = bytes
             .split_first()
             .ok_or_else(|| corrupt("a catalog record is empty"))?;
-        if version != CATALOG_FORMAT_VERSION {
+        if version < oldest || version > CATALOG_FORMAT_VERSION {
             return Err(corrupt(format!(
-                "catalog format version {version} is not {CATALOG_FORMAT_VERSION}"
+                "catalog format version {version} is not {oldest}..={CATALOG_FORMAT_VERSION}"
             )));
         }
-        Ok(Reader { bytes: rest })
+        Ok(Reader {
+            bytes: rest,
+            version,
+        })
     }
 
     fn byte(&mut self) -> Result<u8> {
@@ -476,6 +539,25 @@ impl<'a> Reader<'a> {
             .ok_or_else(|| corrupt(format!("a name of {len} bytes is truncated")))?;
         self.bytes = rest;
         String::from_utf8(body.to_vec()).map_err(|_| corrupt("a name that is not UTF-8"))
+    }
+
+    /// The other half of [`put_value`].
+    fn value(&mut self, ty: ColumnType) -> Result<Option<Datum>> {
+        if !self.flag()? {
+            return Ok(None);
+        }
+        let len = self.count()?;
+        let (body, rest) = self
+            .bytes
+            .split_at_checked(len)
+            .ok_or_else(|| corrupt(format!("a value of {len} bytes is truncated")))?;
+        self.bytes = rest;
+        let mut row = crate::row::decode_row(&crate::row::RowSchema::nullable(vec![ty]), body)?;
+        // One column in, one column out; a row that decoded to another width is corruption in the
+        // catalog rather than something to work around.
+        row.pop()
+            .ok_or_else(|| corrupt("a catalog value decoded to no columns"))
+            .map(Some)
     }
 
     fn finish(self) -> Result<()> {

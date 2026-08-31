@@ -29,7 +29,7 @@ use crate::error::{Result, SqlError};
 use crate::parse::{Parsed, feature_name};
 use crate::plan;
 use crate::time_machine;
-use crate::value::ColumnType;
+use crate::value::{ColumnType, Datum};
 
 impl Parsed {
     /// Lowers this statement into the plan types the executor runs, or names the construct that
@@ -433,6 +433,65 @@ fn lower_storage_parameters(
     })
 }
 
+/// `DEFAULT <expression>` on a column, as a constant of that column's type.
+///
+/// **Constants only, and the refusals are the interesting part.** PostgreSQL evaluates a default at
+/// insert time and, for `ADD COLUMN`, decides between storing a *missing value* and rewriting every
+/// row by asking one question: is the expression volatile? Measured on 19beta1 — `DEFAULT 'old'`
+/// and `DEFAULT (1+1)` set `atthasmissing` and rewrite nothing; `DEFAULT random()` clears it and
+/// rewrites the table.
+///
+/// This node stores a value and never rewrites, so it takes the half PostgreSQL does not rewrite
+/// for and refuses the other half **by name**:
+///
+/// * a literal is read as the column's type, which is the same conversion an `INSERT` does, so
+///   `DEFAULT 'x'` in an `int8` column is the same `22P02` it would be in a value list;
+/// * a function call is refused as *volatile* even when it is not (`length('x')` is immutable),
+///   because deciding otherwise needs a volatility catalog and guessing would store one row's
+///   answer for every row;
+/// * `(1+1)` is refused as an unfolded expression, which PostgreSQL folds. Naming it is the honest
+///   answer: a folder is a feature, not an oversight to paper over.
+///
+/// `DEFAULT NULL` normalises to `None` — the same thing as no default, which is what PostgreSQL
+/// makes of it too.
+fn column_default(expr: &Expr, ty: ColumnType) -> Result<Option<Datum>> {
+    let literal = match expr {
+        Expr::Value(value) => &value.value,
+        Expr::UnaryOp { .. } => {
+            // A signed number: `DEFAULT -1`. Rendered back and read as the column's type, which is
+            // how a negative literal reaches `Datum` everywhere else in this crate.
+            return Datum::from_text(ty, &expr.to_string())
+                .map(Some)
+                .map_err(|_| default_not_constant(expr));
+        }
+        Expr::Function(_) => {
+            return Err(SqlError::unsupported(format!(
+                "DEFAULT {expr}, which may be volatile"
+            )));
+        }
+        _ => return Err(default_not_constant(expr)),
+    };
+    match literal {
+        Value::Null => Ok(None),
+        Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => {
+            Datum::from_text(ty, text).map(Some)
+        }
+        Value::Number(digits, _) => Datum::from_text(ty, digits).map(Some),
+        Value::Boolean(flag) => {
+            Datum::from_text(ty, if *flag { "true" } else { "false" }).map(Some)
+        }
+        other => Err(default_not_constant_text(&other.to_string())),
+    }
+}
+
+fn default_not_constant(expr: &Expr) -> SqlError {
+    default_not_constant_text(&expr.to_string())
+}
+
+fn default_not_constant_text(rendered: &str) -> SqlError {
+    SqlError::unsupported(format!("DEFAULT {rendered}, which is not a constant"))
+}
+
 /// A retention value: an interval, `'forever'`, or `DEFAULT`.
 ///
 /// The same interval grammar the read timestamp uses, because they are the same kind of quantity
@@ -466,7 +525,12 @@ fn lower_retention(value: &Expr) -> Result<Option<u64>> {
     time_machine::retention_ms(&text).map(Some)
 }
 
-fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::CreateTable> {
+/// The clauses of `CREATE TABLE` that change what the statement means, each refused by name.
+///
+/// Split from [`lower_create_table`] so that the sweep and the column walk are two things a reader
+/// can take one at a time; together they are more than one screen, which is the point at which a
+/// function stops being read and starts being skimmed.
+fn refuse_create_table_clauses(create: &sqlparser::ast::CreateTable) -> Result<()> {
     refuse_if(create.or_replace, "CREATE OR REPLACE TABLE")?;
     refuse_if(create.temporary, "CREATE TEMPORARY TABLE")?;
     refuse_if(create.external, "CREATE EXTERNAL TABLE")?;
@@ -497,6 +561,12 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
         "CREATE TABLE ... WITH",
     )?;
 
+    Ok(())
+}
+
+fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::CreateTable> {
+    refuse_create_table_clauses(create)?;
+
     let name = object_name(&create.name)?;
     let mut columns = Vec::with_capacity(create.columns.len());
     let mut primary_key = Vec::new();
@@ -505,11 +575,14 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
 
     for column in &create.columns {
         let column_name = ident(&column.name);
+        let ty = lower_type(&column.data_type)?;
         let mut not_null = false;
+        let mut default = None;
         for option in &column.options {
             match &option.option {
                 ColumnOption::NotNull => not_null = true,
                 ColumnOption::Null => {}
+                ColumnOption::Default(expr) => default = column_default(expr, ty)?,
                 ColumnOption::Unique(constraint) => {
                     refuse_if(
                         constraint.nulls_distinct != NullsDistinctOption::None,
@@ -529,8 +602,9 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
         }
         columns.push(plan::Column {
             name: column_name,
-            ty: lower_type(&column.data_type)?,
+            ty,
             not_null,
+            default,
         });
     }
 
@@ -608,13 +682,23 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
             column_position.is_some(),
             "ALTER TABLE ... ADD COLUMN at a position",
         )?;
+        let ty = lower_type(&column_def.data_type)?;
+        let mut not_null = false;
+        let mut default = None;
         for option in &column_def.options {
             let named = match &option.option {
-                // The two that would need every row already stored to hold a value it does not
-                // hold. Refusing them is what keeps the ALTER free of a rewrite -- and it is a
-                // real divergence for `NOT NULL` on an *empty* table, which PostgreSQL accepts.
-                ColumnOption::NotNull => "ALTER TABLE ... ADD COLUMN ... NOT NULL",
-                ColumnOption::Default(_) => "ALTER TABLE ... ADD COLUMN ... DEFAULT",
+                // A **constant** default is admitted: it is stored as the column's missing value
+                // and the decoder pads with it, so no row is rewritten (ADR 0019's pad rule
+                // generalised; `crate::catalog::ColumnDef::missing`). Volatility and unfolded
+                // expressions are refused inside `column_default`, by name.
+                ColumnOption::Default(expr) => {
+                    default = column_default(expr, ty)?;
+                    continue;
+                }
+                ColumnOption::NotNull => {
+                    not_null = true;
+                    continue;
+                }
                 ColumnOption::PrimaryKey(_) => "ALTER TABLE ... ADD COLUMN ... PRIMARY KEY",
                 ColumnOption::Unique(_) => "ALTER TABLE ... ADD COLUMN ... UNIQUE",
                 // `NULL` is the default and says nothing; honouring it is honouring nothing.
@@ -623,11 +707,21 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
             };
             return Err(SqlError::unsupported(named));
         }
+        // `NOT NULL` needs a value for every row already stored, and a constant default is exactly
+        // that value. Without one there is nothing to pad with, and the alternative is a rewrite
+        // this `ALTER` is defined not to do — so it stays refused, and the refusal names the pair
+        // rather than the keyword, because `NOT NULL DEFAULT 7` *is* accepted.
+        if not_null && default.is_none() {
+            return Err(SqlError::unsupported(
+                "ALTER TABLE ... ADD COLUMN ... NOT NULL without a DEFAULT",
+            ));
+        }
         actions.push(plan::AlterTableAction::AddColumn {
             column: plan::Column {
                 name: ident(&column_def.name),
-                ty: lower_type(&column_def.data_type)?,
-                not_null: false,
+                ty,
+                not_null,
+                default,
             },
             if_not_exists: *if_not_exists,
         });

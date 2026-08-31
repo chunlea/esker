@@ -39,6 +39,14 @@ DROP TABLE t;
 DROP TABLE IF EXISTS t, u CASCADE;
 ALTER TABLE t ADD COLUMN b text;
 ALTER TABLE t ADD COLUMN IF NOT EXISTS b text NOT NULL DEFAULT '';
+# PostgreSQL 11's missing value (docs/plans/phase-6e.md §5 unit 1): a constant default on a
+# populated table rewrites no row there and none here, and a volatile one rewrites the table there
+# and is refused by name here.
+ALTER TABLE t ADD COLUMN c text DEFAULT 'x';
+ALTER TABLE t ADD COLUMN n int8 NOT NULL DEFAULT 7;
+ALTER TABLE t ADD COLUMN r float8 DEFAULT random();
+ALTER TABLE t ALTER COLUMN c SET DEFAULT 'y';
+ALTER TABLE t ALTER COLUMN c DROP DEFAULT;
 ALTER TABLE t DROP COLUMN b;
 ALTER TABLE t ALTER COLUMN a TYPE text USING a::text;
 ALTER TABLE t ALTER COLUMN a SET NOT NULL;

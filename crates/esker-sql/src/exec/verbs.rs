@@ -233,7 +233,7 @@ fn diff(executor: &mut Executor, table: &str, from: &str, to: Option<&str>) -> R
 struct Side<'a> {
     txn: &'a dyn Txn,
     table: std::sync::Arc<catalog::TableDef>,
-    types: Vec<ColumnType>,
+    schema: crate::row::RowSchema,
     next: Vec<u8>,
     end: Vec<u8>,
     batch: std::vec::IntoIter<(bytes::Bytes, bytes::Bytes)>,
@@ -251,7 +251,7 @@ impl<'a> Side<'a> {
         let (next, end) = crate::row::table_row_range(tenant, table.id);
         Ok(Side {
             txn,
-            types: table.column_types(),
+            schema: table.row_schema(),
             table,
             next,
             end,
@@ -282,7 +282,7 @@ impl<'a> Side<'a> {
     /// aborting the diff, because a row that will not decode is a fact about the data and hiding
     /// it would make the diff look complete.
     fn values(&self, value: &[u8]) -> std::result::Result<Vec<Datum>, String> {
-        crate::row::decode_row(&self.types, value).map_err(|error| error.to_string())
+        crate::row::decode_row(&self.schema, value).map_err(|error| error.to_string())
     }
 
     /// A row rendered the way PostgreSQL renders a composite: `(1, ann, t)`, `null` for a NULL.

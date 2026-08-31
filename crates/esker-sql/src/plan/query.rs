@@ -20,7 +20,8 @@
 //! cannot fix.
 
 use crate::plan::{Expr, Literal};
-use crate::value::{ColumnType, Datum};
+use crate::row::RowSchema;
+use crate::value::Datum;
 
 /// One `JOIN`, as written.
 ///
@@ -99,8 +100,9 @@ pub enum Probe {
         index_name: String,
         /// Position of the value in the outer row.
         outer: usize,
-        /// Types of the primary key columns, for decoding what the entry points at.
-        primary_key_types: Vec<ColumnType>,
+        /// The primary key columns, for decoding what the entry points at. A key is exactly its
+        /// own width, so it pads nothing.
+        primary_key_types: RowSchema,
     },
 }
 
@@ -126,8 +128,8 @@ pub enum Node {
     SeqScan {
         /// The table.
         table_id: u64,
-        /// Column types, for decoding.
-        columns: Vec<ColumnType>,
+        /// How the table's rows decode: types, and what an absent column reads as.
+        columns: RowSchema,
         /// Inclusive start of the scanned range.
         start: Vec<u8>,
         /// Exclusive end.
@@ -139,8 +141,8 @@ pub enum Node {
     PointGet {
         /// The table.
         table_id: u64,
-        /// Column types, for decoding.
-        columns: Vec<ColumnType>,
+        /// How the table's rows decode: types, and what an absent column reads as.
+        columns: RowSchema,
         /// The key values, in key order.
         key: Vec<Datum>,
     },
@@ -148,16 +150,17 @@ pub enum Node {
     IndexLookup {
         /// The table.
         table_id: u64,
-        /// Column types, for decoding the row.
-        columns: Vec<ColumnType>,
+        /// How the table's rows decode.
+        columns: RowSchema,
         /// The index.
         index_id: u64,
         /// Its name, for `EXPLAIN`.
         index_name: String,
         /// The indexed values, in index order.
         key: Vec<Datum>,
-        /// Types of the primary key columns, for decoding what the entry points at.
-        primary_key_types: Vec<ColumnType>,
+        /// The primary key columns, for decoding what the entry points at. A key is exactly its
+        /// own width, so it pads nothing.
+        primary_key_types: RowSchema,
     },
     /// Keeps the rows its predicate is true for. NULL is not true.
     Filter {
@@ -192,8 +195,8 @@ pub enum Node {
         inner_table_id: u64,
         /// Its name, for `EXPLAIN`.
         inner_table: String,
-        /// Its column types, for decoding.
-        inner_columns: Vec<ColumnType>,
+        /// How the inner table's rows decode.
+        inner_columns: RowSchema,
         /// How one outer row produces inner rows.
         probe: Probe,
         /// What is left of `ON` after the probe, over the **combined** row. A probe answers an

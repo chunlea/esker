@@ -1,9 +1,11 @@
 # 0020 — Distributed online schema change
 
-Status: **design only, accepted as the plan of record.** No code. It names the states, the rule
-that makes them safe, and what each crate has to grow; the milestone is in
-`docs/plans/phase-6a.md` §12. See [ADR 0019](0019-a-row-says-how-many-columns-it-has.md) (the row
-format this rests on), `crates/esker-sql/src/catalog/`, `docs/txn-spec.md` §5 and §7.
+Status: **being built**, and **amended by what building it found**. The states, the rule and the
+crate list below stand; three claims about *why* the rule works did not survive reading the code,
+and are corrected in place below — each marked **Amended (phase 6e)**, with the full argument in
+`docs/plans/phase-6e.md` §1. The milestone is in `docs/plans/phase-6a.md` §12. See
+[ADR 0019](0019-a-row-says-how-many-columns-it-has.md) (the row format this rests on),
+`crates/esker-sql/src/catalog/`, `docs/txn-spec.md` §5 and §7.
 
 ## Context
 
@@ -91,10 +93,23 @@ that thinks it is gone has already rewritten without it.
 two-version invariant, and everything below is how we get it out of machinery that already exists.
 
 **A cached schema has a lease.** A node may answer from a cached definition only while its lease is
-unexpired; past that it must re-read the catalog version before it serves anything. Today's cache
-(`crate::catalog`) already discards on a version change and re-reads per transaction — what it does
-not have is a *deadline* by which a node is guaranteed to have noticed. The lease is that deadline,
-and it is the one new safety property this needs.
+unexpired; past that it must re-read the catalog version before it serves anything.
+
+> **Amended (phase 6e).** This paragraph originally said the lease was the deadline by which a node
+> is guaranteed to have noticed, and implied that nothing else bounded a writer's staleness.
+> Reading `crate::catalog` to build the thing showed otherwise: `Catalog::view` reads the
+> `catalog_version` key **inside the transaction, at that transaction's own snapshot**, on every
+> transaction. So a writer's schema is never older than its own `start_ts`, and its lifetime is
+> already bounded by the lock TTL — a step interval above that gives the two-version invariant on
+> its own.
+>
+> The lease is therefore not the *primary* bound; it is three other things, and they are worth
+> having: it makes a node cut off from PD **stop writing**, so the step clock can advance on a
+> timer rather than on a poll of nodes it may not be able to reach; it bounds the damage if a
+> future edit ever caches a definition *across* transactions, which would break the property above
+> silently; and it is a published number PD can put in the step arithmetic instead of a constant
+> somebody tunes. The property it backs up is now asserted by a test rather than inherited
+> (`docs/plans/phase-6e.md` §8, test 1).
 
 **A schema-change step waits longer than a lease plus the longest transaction.** Then no
 transaction can still be running under a state two steps behind. Both bounds are already published
@@ -108,7 +123,23 @@ by PD and already enforced:
   window the same number — worth knowing before either is tuned.
 
 So a step interval of `lease + max(lock TTL, safepoint distance)` is sufficient, and PD is where
-that arithmetic belongs because PD already owns both inputs.
+that arithmetic belongs.
+
+> **Amended (phase 6e), twice.**
+>
+> **The safepoint term is inert for something being *added*.** A reader that sees an index as
+> `public` does so from a snapshot above the DDL that made it public, which is above the backfill
+> too — so the index it reads is complete at any age, and a reader further behind simply does not
+> use it. The term goes live for a **removal**, where a reader at `public` reads entries a node at
+> `absent` has already deleted and MVCC retention is what keeps them readable. Keeping the term
+> unconditionally is not free: retention defaults to an hour, so it would make every schema change
+> take one. PD is told which direction a job runs and drops the term when it cannot bite.
+>
+> **PD does not own both inputs today.** The lock TTL is `esker_client::LOCK_TTL_MS`; the GC
+> safepoint is set *store-side* by whoever sends `TxnKvReq::GcSafepoint`, and nothing computes it.
+> PD is still the right owner — it is a cluster-wide number with one writer, the same argument as
+> the safepoint's own — but publishing it is an addition this phase makes rather than a fact to
+> build on.
 
 **A schema-change step is itself an ordinary transaction**, so two concurrent schema changes on one
 table conflict on the catalog version key and one retries — which is the serialisation the catalog

@@ -35,7 +35,16 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
         ),
         ("CREATE TABLE t AS SELECT 1", "CREATE TABLE ... AS"),
         ("CREATE UNLOGGED TABLE t (a int8)", "UNLOGGED"),
-        ("CREATE TABLE t (a int8 DEFAULT 1)", "DEFAULT"),
+        // `DEFAULT <constant>` is honoured now (phase 6e unit 1). What stays refused is what
+        // would need a row rewritten or a folder we do not have.
+        (
+            "CREATE TABLE t (a int8 DEFAULT random())",
+            "DEFAULT random(), which may be volatile",
+        ),
+        (
+            "CREATE TABLE t (a int8 DEFAULT (1+1))",
+            "DEFAULT (1 + 1), which is not a constant",
+        ),
         ("CREATE TABLE t (a int8 REFERENCES u (b))", "REFERENCES"),
         ("CREATE TABLE t (a int8 CHECK (a > 0))", "CHECK"),
         (
@@ -122,8 +131,8 @@ fn every_alter_table_action_but_add_column_is_refused_by_name() {
             "ADD COLUMN ... NOT NULL",
         ),
         (
-            "ALTER TABLE t ADD COLUMN c int8 DEFAULT 0",
-            "ADD COLUMN ... DEFAULT",
+            "ALTER TABLE t ADD COLUMN c int8 DEFAULT random()",
+            "DEFAULT random(), which may be volatile",
         ),
         (
             "ALTER TABLE t ADD COLUMN c int8 UNIQUE",
