@@ -34,6 +34,7 @@
 //! only under time travel — which is the worst way to be wrong.
 
 pub mod compact;
+pub mod decode;
 pub mod runs;
 
 use std::fmt;
@@ -47,6 +48,24 @@ use esker_engine::fs::FileSystem;
 
 use self::runs::RunSet;
 use crate::error::{Result, StoreError};
+
+/// The column carrying a version's identity: the row key's own bytes.
+///
+/// **Identity is the key, not the decoded primary key**, and that is a decision rather than a
+/// convenience. Three things fall out of it:
+///
+/// * a **tombstone has an identity** without decoding anything. A delete carries no value, and
+///   `esker-keys` has no public decoder for a *row* key's columns — `decode_key_columns` reads
+///   *index* keys, which are marker-prefixed because an index column may be NULL, while a row
+///   key's columns are not. Bytes need no decoder;
+/// * the encoding is **memcomparable**, so ordering the bytes orders the primary key. Sorting by
+///   this column groups a key's versions exactly as sorting by its decoded columns would;
+/// * a row whose *value* cannot be decoded — the schema-lag case — still has a usable identity,
+///   so identity never depends on being up to date.
+///
+/// The primary key's columns still appear as ordinary data columns, because the row value carries
+/// every column including them (`esker_sql`'s `encode_row(&table.column_types(), row)`).
+pub const KEY_COLUMN: &str = "__key";
 
 /// The column carrying a version's commit timestamp.
 pub const COMMIT_TS_COLUMN: &str = "__commit_ts";
@@ -66,16 +85,10 @@ pub trait RowDecoder: Send + Sync + fmt::Debug {
     /// The table's own columns, in slot order. The run adds two of its own after these.
     fn schema(&self) -> &Schema;
 
-    /// Which slots form the primary key, in key order.
+    /// Decodes one committed row's **data** columns, in `schema()` order.
     ///
-    /// The run is sorted by these before `__commit_ts`, so they are what "the newest version of a
-    /// key" is a statement about.
-    fn key_slots(&self) -> &[usize];
-
-    /// Decodes one committed row.
-    ///
-    /// `value` is `None` for a delete, whose non-key columns come back NULL: a tombstone still
-    /// has an identity, and it is the identity the visibility pass needs.
+    /// `value` is `None` for a delete, whose columns all come back NULL. A tombstone's *identity*
+    /// does not come from here: see [`KEY_COLUMN`].
     fn decode(&self, key: &[u8], value: Option<&[u8]>) -> Result<Vec<Value>>;
 }
 
@@ -120,10 +133,12 @@ pub struct ColumnarApply {
     options: ColumnarOptions,
     /// The run schema: the decoder's columns plus `__commit_ts` and `__deleted`.
     schema: Schema,
-    /// Slots the run is sorted by, before `__commit_ts`.
-    key_slots: Vec<usize>,
+    /// The slot `__key` landed in: the run's sort key and its identity.
+    key_slot: usize,
     /// The slot `__commit_ts` landed in.
     ts_slot: usize,
+    /// The table's own column count, which is what a decoder must return.
+    data_columns: usize,
     buffered: Vec<Row>,
     buffered_bytes: usize,
     /// The live runs, and the manifest that names them.
@@ -163,7 +178,7 @@ impl ColumnarApply {
         let runs = RunSet::open(Arc::clone(&fs), &dir)?;
 
         let table = decoder.schema();
-        for reserved in [COMMIT_TS_COLUMN, DELETED_COLUMN] {
+        for reserved in [KEY_COLUMN, COMMIT_TS_COLUMN, DELETED_COLUMN] {
             if table.columns().iter().any(|column| column.name == reserved) {
                 return Err(StoreError::Bootstrap(format!(
                     "a columnar table may not have a column named {reserved}: the apply target \
@@ -172,18 +187,13 @@ impl ColumnarApply {
             }
         }
         let mut columns = table.columns().to_vec();
-        let ts_slot = columns.len();
+        let key_slot = columns.len();
+        let ts_slot = key_slot + 1;
+        columns.push(ColumnDef::new(KEY_COLUMN, ColumnType::Bytea));
         columns.push(ColumnDef::new(COMMIT_TS_COLUMN, ColumnType::Int8));
         columns.push(ColumnDef::new(DELETED_COLUMN, ColumnType::Bool));
         let schema = Schema::new(columns)
             .map_err(|error| StoreError::Bootstrap(format!("the run schema: {error}")))?;
-
-        let key_slots = decoder.key_slots().to_vec();
-        if key_slots.is_empty() || key_slots.iter().any(|slot| *slot >= ts_slot) {
-            return Err(StoreError::Bootstrap(format!(
-                "the key slots {key_slots:?} are empty or name a column the table does not have"
-            )));
-        }
 
         Ok(Self {
             fs,
@@ -191,8 +201,9 @@ impl ColumnarApply {
             decoder,
             options,
             schema,
-            key_slots,
+            key_slot,
             ts_slot,
+            data_columns: key_slot,
             buffered: Vec::new(),
             buffered_bytes: 0,
             runs,
@@ -209,6 +220,16 @@ impl ColumnarApply {
     #[must_use]
     pub fn buffered(&self) -> usize {
         self.buffered.len()
+    }
+
+    /// Where `__key`, `__commit_ts` and `__deleted` landed, for a read that resolves versions.
+    #[must_use]
+    pub fn visibility_slots(&self) -> (u32, u32, u32) {
+        (
+            u32::try_from(self.key_slot).unwrap_or(u32::MAX),
+            u32::try_from(self.ts_slot).unwrap_or(u32::MAX),
+            u32::try_from(self.ts_slot + 1).unwrap_or(u32::MAX),
+        )
     }
 
     /// The live runs this region's reads must cover.
@@ -235,13 +256,15 @@ impl ColumnarApply {
         })?;
         let deleted = value.is_none();
         let mut values = self.decoder.decode(user_key, value)?;
-        if values.len() != self.ts_slot {
+        if values.len() != self.data_columns {
             return Err(StoreError::Bootstrap(format!(
                 "the decoder returned {} values for a {}-column table",
                 values.len(),
-                self.ts_slot
+                self.data_columns
             )));
         }
+        // Identity first: the key's own bytes, memcomparable and decoder-independent.
+        values.push(Value::Bytea(user_key.to_vec()));
         // `commit_ts` is a `u64` off the key and the column is PostgreSQL's `bigint`. A timestamp
         // past `i64::MAX` is not reachable from a TSO, and saturating is the honest answer to a
         // corrupt key: it sorts last rather than wrapping to the beginning of time.
@@ -267,14 +290,12 @@ impl ColumnarApply {
         if self.buffered.is_empty() {
             return Ok(None);
         }
-        let key_slots = self.key_slots.clone();
+        let key_slot = self.key_slot;
         let ts_slot = self.ts_slot;
         self.buffered.sort_by(|left, right| {
-            for slot in &key_slots {
-                let ordering = left.values[*slot].pg_cmp(&right.values[*slot]);
-                if ordering != std::cmp::Ordering::Equal {
-                    return ordering;
-                }
+            let ordering = left.values[key_slot].pg_cmp(&right.values[key_slot]);
+            if ordering != std::cmp::Ordering::Equal {
+                return ordering;
             }
             // Newest first, so a read at `ts` takes the first row it sees at or below it.
             right.values[ts_slot].pg_cmp(&left.values[ts_slot])
@@ -358,7 +379,8 @@ mod tests {
     use esker_engine::fs::{FileSystem, LocalFileSystem};
 
     use super::{
-        COMMIT_TS_COLUMN, ColumnarApply, ColumnarOptions, DELETED_COLUMN, RowDecoder, run_name,
+        COMMIT_TS_COLUMN, ColumnarApply, ColumnarOptions, DELETED_COLUMN, KEY_COLUMN, RowDecoder,
+        run_name,
     };
     use crate::error::{Result, StoreError};
 
@@ -388,10 +410,6 @@ mod tests {
     impl RowDecoder for FakeDecoder {
         fn schema(&self) -> &Schema {
             &self.schema
-        }
-
-        fn key_slots(&self) -> &[usize] {
-            &[0]
         }
 
         fn decode(&self, key: &[u8], value: Option<&[u8]>) -> Result<Vec<Value>> {
@@ -460,7 +478,10 @@ mod tests {
             .iter()
             .map(|column| column.name.as_str())
             .collect();
-        assert_eq!(names, ["id", "name", COMMIT_TS_COLUMN, DELETED_COLUMN]);
+        assert_eq!(
+            names,
+            ["id", "name", KEY_COLUMN, COMMIT_TS_COLUMN, DELETED_COLUMN]
+        );
     }
 
     /// A table that already has one of those names is refused at open, where an operator can act
@@ -472,9 +493,6 @@ mod tests {
         impl RowDecoder for Colliding {
             fn schema(&self) -> &Schema {
                 &self.0
-            }
-            fn key_slots(&self) -> &[usize] {
-                &[0]
             }
             fn decode(&self, _: &[u8], _: Option<&[u8]>) -> Result<Vec<Value>> {
                 unreachable!()
@@ -513,7 +531,7 @@ mod tests {
 
         let seen: Vec<(i64, i64)> = rows_of(&path)
             .iter()
-            .map(|row| match (&row[0], &row[2]) {
+            .map(|row| match (&row[0], &row[3]) {
                 (Value::Int8(id), Value::Int8(ts)) => (*id, *ts),
                 other => panic!("unexpected row shape: {other:?}"),
             })
@@ -535,9 +553,9 @@ mod tests {
         let rows = rows_of(&path);
         assert_eq!(rows.len(), 2, "the tombstone was dropped: {rows:?}");
         // Newest first: the delete, then the row it deleted.
-        assert_eq!(rows[0][3], Value::Bool(true), "{:?}", rows[0]);
+        assert_eq!(rows[0][4], Value::Bool(true), "{:?}", rows[0]);
         assert_eq!(rows[0][1], Value::Null, "a tombstone carries no value");
-        assert_eq!(rows[1][3], Value::Bool(false), "{:?}", rows[1]);
+        assert_eq!(rows[1][4], Value::Bool(false), "{:?}", rows[1]);
         assert_eq!(rows[1][1], Value::Text("seven".into()));
     }
 
@@ -549,7 +567,7 @@ mod tests {
         let mut apply = open(dir.path(), ColumnarOptions::default());
         apply.apply(&versioned(1, 424_242), Some(b"x")).unwrap();
         let path = apply.seal().unwrap().unwrap();
-        assert_eq!(rows_of(&path)[0][2], Value::Int8(424_242));
+        assert_eq!(rows_of(&path)[0][3], Value::Int8(424_242));
     }
 
     /// Sealing by row count produces the run it claims, and starts the next one from empty.

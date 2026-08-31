@@ -71,20 +71,18 @@ impl RowDecoder for Decoder {
         &self.schema
     }
 
-    fn key_slots(&self) -> &[usize] {
-        &[0]
-    }
-
     fn decode(&self, key: &[u8], value: Option<&[u8]>) -> Result<Vec<Value>> {
         let mut id = [0u8; 8];
         id.copy_from_slice(&key[..8]);
-        Ok(vec![
-            Value::Int8(i64::from_be_bytes(id)),
-            match value {
-                None => Value::Null,
-                Some(bytes) => Value::Text(String::from_utf8_lossy(bytes).into_owned()),
-            },
-        ])
+        Ok(match value {
+            // A tombstone's data columns are NULL; its identity is the `__key` column the apply
+            // target adds from the key's own bytes.
+            None => vec![Value::Null, Value::Null],
+            Some(bytes) => vec![
+                Value::Int8(i64::from_be_bytes(id)),
+                Value::Text(String::from_utf8_lossy(bytes).into_owned()),
+            ],
+        })
     }
 }
 
@@ -143,9 +141,9 @@ fn columnar(apply: &ColumnarApply, at: u64) -> BTreeMap<i64, String> {
         &ScanOptions {
             prune: true,
             visibility: Some(Visibility {
-                key_columns: vec![0],
-                ts_column: 2,
-                deleted_column: 3,
+                key_columns: vec![2],
+                ts_column: 3,
+                deleted_column: 4,
                 ts: i64::try_from(at).unwrap(),
             }),
         },
@@ -264,8 +262,8 @@ fn a_merge_changes_no_answer() {
         &fs,
         apply.runs_mut(),
         &schema,
-        &[0],
-        2,
+        &[2],
+        3,
         &inputs,
         &esker_columnar::WriterOptions::default(),
     )
@@ -373,9 +371,9 @@ fn count_at(apply: &ColumnarApply, at: u64) -> u64 {
         &ScanOptions {
             prune: true,
             visibility: Some(Visibility {
-                key_columns: vec![0],
-                ts_column: 2,
-                deleted_column: 3,
+                key_columns: vec![2],
+                ts_column: 3,
+                deleted_column: 4,
                 ts: i64::try_from(at).unwrap(),
             }),
         },
