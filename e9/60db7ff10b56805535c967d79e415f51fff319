@@ -1,0 +1,21 @@
+docs/adr/0022-columnar-learner-replica.md
+  s_543d4c9b3ee38c::t_6f8e509524d3f6 1-262
+docs/plans/phase-6a.md
+  s_543d4c9b3ee38c::t_52431543f98fe9 1105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "e960db7ff10b56805535c967d79e415f51fff319",
+  "prompts": {},
+  "sessions": {
+    "s_543d4c9b3ee38c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "befd6192-73a4-4b10-9f4b-cd092c10ce31",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
