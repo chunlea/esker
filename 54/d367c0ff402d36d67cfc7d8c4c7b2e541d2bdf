@@ -1,0 +1,25 @@
+crates/esker-store/Cargo.toml
+  s_b3f6a712d611c9::t_255e6fa6fe0234 17-19
+crates/esker-store/src/columnar.rs
+  s_b3f6a712d611c9::t_49d58378b26dc9 1-552
+crates/esker-store/src/lib.rs
+  s_b3f6a712d611c9::t_d185f56bcbc03f 45
+crates/esker-store/src/server.rs
+  s_b3f6a712d611c9::t_e04e6cc719e6f2 1788-1814,2435-2448
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "54d367c0ff402d36d67cfc7d8c4c7b2e541d2bdf",
+  "prompts": {},
+  "sessions": {
+    "s_b3f6a712d611c9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "78adef9a-88ef-4c89-a340-f825de3d2ab7",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
