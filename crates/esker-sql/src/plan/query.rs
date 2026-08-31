@@ -60,6 +60,10 @@ pub struct Select {
 pub enum SelectItem {
     /// `*`.
     Wildcard,
+    /// `t.*` — every column of one table in the query. Its own variant rather than a flag on
+    /// [`SelectItem::Wildcard`], because a qualifier that names no table in the query is `42P01`
+    /// and an absent one never can be.
+    QualifiedWildcard(String),
     /// An expression, with the name it will be reported under. `None` means PostgreSQL's own
     /// default: a bare column keeps its name and anything else is `?column?`.
     Expr {

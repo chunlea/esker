@@ -23,7 +23,7 @@ use crate::value::{ColumnType, Datum};
 /// Every parameter's type, indexed from zero for `$1`.
 pub(super) fn infer(
     statement: &Statement,
-    table: Option<&TableDef>,
+    tables: &[std::sync::Arc<TableDef>],
     declared: &[u32],
 ) -> Vec<ColumnType> {
     // Sized by the highest `$n` the statement mentions anywhere, not only where a type comes from:
@@ -36,7 +36,7 @@ pub(super) fn infer(
     });
 
     let mut found: Vec<Option<ColumnType>> = vec![None; count];
-    walk(statement, table, &mut |number, ty| {
+    walk(statement, tables, &mut |number, ty| {
         let at = (number as usize).saturating_sub(1);
         if found.len() <= at {
             found.resize(at + 1, None);
@@ -108,10 +108,14 @@ fn from_oid(oid: u32) -> Option<ColumnType> {
 }
 
 /// Visits every parameter with the type its context gives it.
-fn walk(statement: &Statement, table: Option<&TableDef>, seen: &mut impl FnMut(u32, ColumnType)) {
+fn walk(
+    statement: &Statement,
+    tables: &[std::sync::Arc<TableDef>],
+    seen: &mut impl FnMut(u32, ColumnType),
+) {
     match statement {
         Statement::Insert(insert) => {
-            let Some(table) = table else { return };
+            let Some(table) = tables.first() else { return };
             let targets: Vec<usize> = match &insert.columns {
                 Some(names) => names.iter().filter_map(|name| table.column(name)).collect(),
                 // The user's columns only, matching what `exec::dml` fills: a `$1` in the first
@@ -128,7 +132,7 @@ fn walk(statement: &Statement, table: Option<&TableDef>, seen: &mut impl FnMut(u
         }
         Statement::Select(select) => {
             if let Some(filter) = &select.filter {
-                walk_predicate(filter, table, seen);
+                walk_predicate(filter, tables, seen);
             }
             // `LIMIT $1` is a count, whatever else is going on.
             for clause in [select.limit.as_ref(), select.offset.as_ref()]
@@ -141,7 +145,7 @@ fn walk(statement: &Statement, table: Option<&TableDef>, seen: &mut impl FnMut(u
             }
         }
         Statement::Update(update) => {
-            if let Some(table) = table {
+            if let Some(table) = tables.first() {
                 for (name, value) in &update.assignments {
                     if let (Some(at), Expr::Parameter(number)) = (table.column(name), value) {
                         seen(*number, table.columns[at].ty);
@@ -149,15 +153,15 @@ fn walk(statement: &Statement, table: Option<&TableDef>, seen: &mut impl FnMut(u
                 }
             }
             if let Some(filter) = &update.filter {
-                walk_predicate(filter, table, seen);
+                walk_predicate(filter, tables, seen);
             }
         }
         Statement::Delete(delete) => {
             if let Some(filter) = &delete.filter {
-                walk_predicate(filter, table, seen);
+                walk_predicate(filter, tables, seen);
             }
         }
-        Statement::Explain(inner) => walk(inner, table, seen),
+        Statement::Explain(inner) => walk(inner, tables, seen),
         Statement::CreateTable(_)
         | Statement::DropTable(_)
         | Statement::CreateIndex(_)
@@ -168,33 +172,54 @@ fn walk(statement: &Statement, table: Option<&TableDef>, seen: &mut impl FnMut(u
 
 /// A parameter compared against a column takes that column's type. That is the whole of the
 /// inference in a `WHERE`, and it is what `WHERE id = $1` needs.
-fn walk_predicate(expr: &Expr, table: Option<&TableDef>, seen: &mut impl FnMut(u32, ColumnType)) {
+fn walk_predicate(
+    expr: &Expr,
+    tables: &[std::sync::Arc<TableDef>],
+    seen: &mut impl FnMut(u32, ColumnType),
+) {
     match expr {
         Expr::Binary { op, left, right }
             if op.is_comparison() || *op == BinaryOp::And || *op == BinaryOp::Or =>
         {
-            if op.is_comparison()
-                && let Some(table) = table
-            {
+            if op.is_comparison() {
                 let pair = match (left.as_ref(), right.as_ref()) {
-                    (Expr::Column { name, .. }, Expr::Parameter(number))
-                    | (Expr::Parameter(number), Expr::Column { name, .. }) => Some((name, *number)),
+                    (Expr::Column { table, name }, Expr::Parameter(number))
+                    | (Expr::Parameter(number), Expr::Column { table, name }) => {
+                        Some((table.as_deref(), name, *number))
+                    }
                     _ => None,
                 };
-                if let Some((name, number)) = pair
-                    && let Some(at) = table.column(name)
-                {
-                    seen(number, table.columns[at].ty);
+                // Across a join, the column may belong to either table, and a qualifier says
+                // which. An ambiguous bare name types nothing rather than the first match: the
+                // planner will refuse the statement anyway, and guessing a type here would put a
+                // `ParameterDescription` on the wire for a query that is about to fail.
+                if let Some((qualifier, name, number)) = pair {
+                    let mut found = None;
+                    for candidate in tables {
+                        if qualifier.is_some_and(|qualifier| qualifier != candidate.name) {
+                            continue;
+                        }
+                        if let Some(at) = candidate.column(name) {
+                            if found.is_some() {
+                                found = None;
+                                break;
+                            }
+                            found = Some(candidate.columns[at].ty);
+                        }
+                    }
+                    if let Some(ty) = found {
+                        seen(number, ty);
+                    }
                 }
             }
-            walk_predicate(left, table, seen);
-            walk_predicate(right, table, seen);
+            walk_predicate(left, tables, seen);
+            walk_predicate(right, tables, seen);
         }
         Expr::Binary { left, right, .. } => {
-            walk_predicate(left, table, seen);
-            walk_predicate(right, table, seen);
+            walk_predicate(left, tables, seen);
+            walk_predicate(right, tables, seen);
         }
-        Expr::Not(operand) | Expr::IsNull { operand, .. } => walk_predicate(operand, table, seen),
+        Expr::Not(operand) | Expr::IsNull { operand, .. } => walk_predicate(operand, tables, seen),
         _ => {}
     }
 }
@@ -262,20 +287,26 @@ fn walk_expr_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr)) {
 }
 
 /// The table a statement is about, by name, so the inference has column types to work from.
-pub(super) fn table_name(statement: &Statement) -> Option<&str> {
+pub(super) fn table_names(statement: &Statement) -> Vec<&str> {
     match statement {
-        Statement::Insert(insert) => Some(&insert.table),
-        Statement::Select(select) => select.from.as_deref(),
-        Statement::Update(update) => Some(&update.table),
-        Statement::Delete(delete) => Some(&delete.table),
-        Statement::Explain(inner) => table_name(inner),
+        Statement::Insert(insert) => vec![insert.table.as_str()],
+        // A join's two tables, outer first, which is the order their columns appear in a row.
+        Statement::Select(select) => select
+            .from
+            .as_deref()
+            .into_iter()
+            .chain(select.join.iter().map(|join| join.table.as_str()))
+            .collect(),
+        Statement::Update(update) => vec![update.table.as_str()],
+        Statement::Delete(delete) => vec![delete.table.as_str()],
+        Statement::Explain(inner) => table_names(inner),
         Statement::CreateTable(_)
         | Statement::DropTable(_)
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
         // DDL over a table, but nothing here needs its column types: a parameter cannot appear
         // in an `ALTER TABLE`, so there is nothing to infer against.
-        | Statement::AlterTable(_) => None,
+        | Statement::AlterTable(_) => Vec::new(),
     }
 }
 

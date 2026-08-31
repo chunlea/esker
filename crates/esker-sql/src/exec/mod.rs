@@ -274,24 +274,30 @@ impl Executor {
         if params.values.is_empty() && !bind::has_parameters(&statement) {
             return Ok(statement);
         }
-        let table = self.table_for(txn, &statement)?;
-        let types = bind::infer(&statement, table.as_deref(), params.declared);
+        let tables = self.tables_for(txn, &statement)?;
+        let types = bind::infer(&statement, &tables, params.declared);
         bind::substitute(&mut statement, params, &types)?;
         Ok(statement)
     }
 
-    /// The table a statement is about, when it is about one that exists.
-    fn table_for(
+    /// The tables a statement is about, in the order their columns appear in a row.
+    ///
+    /// A join has two, and both are needed wherever names are resolved — which is `Describe` as
+    /// much as it is `Execute`. The first version of this returned one, and a prepared `SELECT`
+    /// over a join could not be described at all: every driver that prepares its statements, which
+    /// is most of them, would have failed on the first join it sent.
+    fn tables_for(
         &self,
         txn: &dyn Txn,
         statement: &Statement,
-    ) -> Result<Option<Arc<crate::catalog::TableDef>>> {
-        match bind::table_name(statement) {
-            // A name that is not there is not this function's error to raise: the statement will
-            // reach it and report it with the message that statement uses.
-            Some(name) => Ok(self.catalog_view(txn)?.table(name)?),
-            None => Ok(None),
-        }
+    ) -> Result<Vec<Arc<crate::catalog::TableDef>>> {
+        let view = self.catalog_view(txn)?;
+        // A name that is not there is not this function's error to raise: the statement will
+        // reach it and report it with the message that statement uses.
+        bind::table_names(statement)
+            .into_iter()
+            .filter_map(|name| view.table(name).transpose())
+            .collect()
     }
 
     /// This transaction's view of the catalog, pinned to one version.
@@ -416,8 +422,8 @@ impl Execute for Executor {
         // catalog and the catalog is data like any other. It writes nothing, so it costs a
         // snapshot and no conflict.
         let txn = self.backend.begin()?;
-        let table = self.table_for(&*txn, &statement)?;
-        let types = bind::infer(&statement, table.as_deref(), declared);
+        let tables = self.tables_for(&*txn, &statement)?;
+        let types = bind::infer(&statement, &tables, declared);
         let parameters = types.iter().copied().map(ColumnType::oid).collect();
 
         // Planning needs every expression to have a type, and a `$1` has none until now. Nothing
@@ -426,11 +432,16 @@ impl Execute for Executor {
         bind::substitute_placeholders(&mut statement, &types);
         let fields = match &statement {
             Statement::Select(select) => Some(
-                query::plan(select, self.tenant, table.as_deref(), None)?
-                    .columns
-                    .into_iter()
-                    .map(|(name, ty)| FieldDescription::computed(name, ty))
-                    .collect(),
+                query::plan(
+                    select,
+                    self.tenant,
+                    tables.first().map(AsRef::as_ref),
+                    tables.get(1).map(AsRef::as_ref),
+                )?
+                .columns
+                .into_iter()
+                .map(|(name, ty)| FieldDescription::computed(name, ty))
+                .collect(),
             ),
             Statement::Explain(_) => Some(vec![FieldDescription::computed(
                 "QUERY PLAN",

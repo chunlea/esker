@@ -302,3 +302,74 @@ fn a_binary_parameter_of_the_wrong_length_is_a_protocol_violation() {
         .unwrap_err();
     assert_eq!(error.sqlstate(), sqlstate::PROTOCOL_VIOLATION);
 }
+
+/// Describing a statement over a **join** resolves against both tables, and a prepared join has to
+/// work at all.
+///
+/// This is where the join unit was broken and nothing said so: `Describe` planned with the inner
+/// table missing, so every prepared `SELECT` over a join came back `42P01 relation "c" does not
+/// exist` — naming a table that plainly did exist. A driver that prepares its statements, which is
+/// most of them, would have failed on the first join it sent, while `psql`'s simple query protocol
+/// worked fine.
+#[test]
+fn a_join_can_be_prepared_and_its_parameters_come_from_either_table() {
+    let mut node = Node::loaded();
+    node.plain("CREATE TABLE c (id int8 PRIMARY KEY, email text UNIQUE, at2 timestamptz)")
+        .unwrap();
+    node.plain("CREATE TABLE o (id int8 PRIMARY KEY, cid int8, tag text)")
+        .unwrap();
+
+    // A parameter compared against a column of the *inner* table takes that column's type.
+    assert_eq!(
+        node.describe(
+            "SELECT o.id FROM o JOIN c ON o.cid = c.id WHERE c.email = $1",
+            &[]
+        )
+        .unwrap(),
+        [ColumnType::Text.oid()]
+    );
+    // And one against the outer table's.
+    assert_eq!(
+        node.describe(
+            "SELECT o.id FROM o JOIN c ON o.cid = c.id WHERE o.id = $1",
+            &[]
+        )
+        .unwrap(),
+        [ColumnType::Int8.oid()]
+    );
+    // Two, one from each side, in `$n` order rather than in the order they appear.
+    assert_eq!(
+        node.describe(
+            "SELECT o.id FROM o JOIN c ON o.cid = c.id WHERE c.at2 = $2 AND o.id = $1",
+            &[],
+        )
+        .unwrap(),
+        [ColumnType::Int8.oid(), ColumnType::TimestampTz.oid()]
+    );
+
+    // A bare name both tables have is refused at *describe* time, not left to execution --
+    // which is what a real server does with the same statement under `PREPARE`, because Describe
+    // plans the statement and planning is where the ambiguity is found.
+    let error = node
+        .describe(
+            "SELECT o.cid FROM o JOIN c ON o.cid = c.id WHERE id = $1",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::AMBIGUOUS_COLUMN);
+
+    // And the whole thing runs bound, which is what a driver actually does.
+    node.plain("INSERT INTO c VALUES (1,'a@x',NULL)").unwrap();
+    node.plain("INSERT INTO o VALUES (10,1,'t')").unwrap();
+    let outcome = node
+        .bound(
+            "SELECT o.id FROM o JOIN c ON o.cid = c.id WHERE c.email = $1",
+            &[Some(b"a@x".to_vec())],
+            &[],
+        )
+        .unwrap();
+    let Outcome::Rows { rows, .. } = outcome else {
+        panic!("not rows");
+    };
+    assert_eq!(rows, [[Some(b"10".to_vec())]]);
+}

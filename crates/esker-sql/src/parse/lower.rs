@@ -19,8 +19,9 @@ use sqlparser::ast::{
     AlterTableOperation, AssignmentTarget, BinaryOperator, ColumnOption, CreateTableOptions,
     DataType, DollarQuotedString, ExactNumberInfo, Expr, FromTable, GroupByExpr, Ident,
     IndexColumn, IndexType, JoinConstraint, JoinOperator, LimitClause, NullsDistinctOption,
-    ObjectName, ObjectType, OffsetRows, OrderByKind, Query, SelectItem, SetExpr, Statement,
-    TableConstraint, TableFactor, TableObject, TimezoneInfo, UnaryOperator, Value,
+    ObjectName, ObjectType, OffsetRows, OrderByKind, Query, SelectItem,
+    SelectItemQualifiedWildcardKind, SetExpr, Statement, TableConstraint, TableFactor, TableObject,
+    TimezoneInfo, UnaryOperator, Value,
 };
 
 use crate::catalog::fold_identifier;
@@ -594,7 +595,22 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
                 refuse_if(options.opt_rename.is_some(), "SELECT * RENAME")?;
                 Ok(plan::SelectItem::Wildcard)
             }
-            SelectItem::QualifiedWildcard(..) => Err(SqlError::unsupported("a qualified SELECT *")),
+            SelectItem::QualifiedWildcard(kind, options) => {
+                refuse_if(options.opt_ilike.is_some(), "SELECT * ILIKE")?;
+                refuse_if(options.opt_exclude.is_some(), "SELECT * EXCLUDE")?;
+                refuse_if(options.opt_except.is_some(), "SELECT * EXCEPT")?;
+                refuse_if(options.opt_replace.is_some(), "SELECT * REPLACE")?;
+                refuse_if(options.opt_rename.is_some(), "SELECT * RENAME")?;
+                match kind {
+                    SelectItemQualifiedWildcardKind::ObjectName(name) => {
+                        Ok(plan::SelectItem::QualifiedWildcard(object_name(name)?))
+                    }
+                    // `STRUCT('x').*` and friends: an expression, not a table.
+                    SelectItemQualifiedWildcardKind::Expr(_) => {
+                        Err(SqlError::unsupported("a SELECT * over an expression"))
+                    }
+                }
+            }
             SelectItem::ExprWithAliases { .. } => {
                 Err(SqlError::unsupported("a multi-column alias"))
             }

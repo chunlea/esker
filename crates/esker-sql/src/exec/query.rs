@@ -60,17 +60,39 @@ impl<'a> Scope<'a> {
             .sum()
     }
 
-    /// Every column a user can name, with its position in the combined row.
-    fn user_columns(&self) -> impl Iterator<Item = (usize, &'a ColumnDef)> {
-        self.tables
+    /// The columns `t.*` expands to, or every column for `*`.
+    ///
+    /// A qualifier that names no table in the query is the same `42P01` a qualified *column*
+    /// reference gives, which is what a real server answers for `SELECT wrong.* FROM o`.
+    fn expand(
+        &self,
+        qualifier: Option<&str>,
+    ) -> Result<std::vec::IntoIter<(usize, &'a ColumnDef)>> {
+        if let Some(qualifier) = qualifier {
+            let index = self
+                .tables
+                .iter()
+                .position(|table| table.name == qualifier)
+                .ok_or_else(|| SqlError::MissingFromEntry(qualifier.to_owned()))?;
+            let offset = self.offset(index);
+            let columns: Vec<_> = self.tables[index]
+                .user_columns()
+                .map(|(at, column)| (offset + at, column))
+                .collect();
+            return Ok(columns.into_iter());
+        }
+        let columns: Vec<_> = self
+            .tables
             .iter()
             .enumerate()
-            .flat_map(move |(index, table)| {
+            .flat_map(|(index, table)| {
                 let offset = self.offset(index);
                 table
                     .user_columns()
                     .map(move |(at, column)| (offset + at, column))
             })
+            .collect();
+        Ok(columns.into_iter())
     }
 
     /// A column reference, resolved to a position in the combined row.
@@ -732,11 +754,19 @@ fn check_predicate(expr: &Expr) -> Result<()> {
 ///
 /// A bare column keeps its name; anything else is `?column?`, which is PostgreSQL's own answer and
 /// what `psql` prints as a header.
+/// The table a `*` is qualified with, if any.
+fn qualifier_of(item: &SelectItem) -> Option<&str> {
+    match item {
+        SelectItem::QualifiedWildcard(table) => Some(table),
+        _ => None,
+    }
+}
+
 fn output_columns(select: &Select, scope: &Scope<'_>) -> Result<Vec<(String, ColumnType)>> {
     let mut columns = Vec::new();
     for item in &select.projection {
         match item {
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
                 if scope.tables.is_empty() {
                     return Err(SqlError::Syntax {
                         message: "SELECT * with no tables specified is not valid".to_owned(),
@@ -745,10 +775,11 @@ fn output_columns(select: &Select, scope: &Scope<'_>) -> Result<Vec<(String, Col
                 }
                 // The user's columns, so an internal row id stays hidden: `SELECT *` on a table
                 // with no declared key returns what the user declared and nothing else. Across a
-                // join it is every table's, left to right, which is the order PostgreSQL gives.
+                // join it is every table's, left to right, which is the order PostgreSQL gives,
+                // and `t.*` is one table's.
                 columns.extend(
                     scope
-                        .user_columns()
+                        .expand(qualifier_of(item))?
                         .map(|(_, column)| (column.name.clone(), column.ty)),
                 );
             }
@@ -770,7 +801,7 @@ fn projection_exprs(select: &Select, scope: &Scope<'_>) -> Result<Vec<Expr>> {
     let mut exprs = Vec::new();
     for item in &select.projection {
         match item {
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
                 if scope.tables.is_empty() {
                     return Err(SqlError::Syntax {
                         message: "SELECT * with no tables specified is not valid".to_owned(),
@@ -779,7 +810,7 @@ fn projection_exprs(select: &Select, scope: &Scope<'_>) -> Result<Vec<Expr>> {
                 }
                 exprs.extend(
                     scope
-                        .user_columns()
+                        .expand(qualifier_of(item))?
                         .map(|(at, column)| Expr::Ordinal { at, ty: column.ty }),
                 );
             }

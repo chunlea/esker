@@ -40,6 +40,27 @@ SELECT * FROM o JOIN c ON o.cid = c.id ORDER BY o.id
 11	1	200	1	ann	a@x
 12	2	300	2	bob	b@x
 
+# `t.*` is one table's columns. It is the natural thing to write with a join, and the reason the
+# unqualified form cannot serve: `SELECT *` here would be six columns, two of them called `id`.
+query III
+SELECT o.* FROM o JOIN c ON o.cid = c.id ORDER BY o.id
+----
+10	1	100
+11	1	200
+12	2	300
+
+# Either side, and mixed with ordinary items. The order is the order they were written.
+query ITTI
+SELECT c.*, o.id FROM o JOIN c ON o.cid = c.id ORDER BY o.id
+----
+1	ann	a@x	10
+1	ann	a@x	11
+2	bob	b@x	12
+
+# A qualifier naming no table in the query is the same 42P01 a qualified column gets.
+statement error (42P01)
+SELECT wrong.* FROM o JOIN c ON o.cid = c.id
+
 # The operands may be written either way round; which side is the inner one is the planner's to
 # decide and not the user's to spell.
 query I
