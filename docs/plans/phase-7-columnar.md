@@ -576,4 +576,23 @@ section, and an amendment to ADR 0027.
 
 ## M2 — what changed while building
 
-*(Filled in as the units land.)*
+**A `LIMIT 0` needed a presence byte.** The layout above first spelled the row limit as a bare
+varint with `0` meaning unbounded, which makes `LIMIT 0` — a legal query — unrepresentable. It is
+`has_limit:u8 ++ [limit:varint]` instead, and a test says so.
+
+**Unit 1's commit message was truncated by a shell-quoting slip** (`git commit -m` with an inner
+double quote), so three paragraphs of its reasoning are recorded here instead of being rewritten
+into history while a sibling lane was committing to the same branch:
+
+* *Corruption and refusal are different answers, decided in that order.* The checksum runs first,
+  so bytes that are intact but carry an unknown version, node, operator, aggregate or type tag are
+  a build that does not implement them, not a damaged message: refused, all of it, and the caller
+  falls back to a row scan. Getting this backwards would report every rolling upgrade as data
+  corruption, and both look like "an error" from a distance, which is why there is a test per tag.
+* *The refuse rule's clearest case is the key range.* A columnar file records none, so this build
+  cannot restrict to one, and carrying the field while ignoring it is exactly the defect the rule
+  exists for. A bounded range is refused; milestone 3 gives the field meaning.
+* *Validation happens against the file's schema before a byte is read*, because a fragment refused
+  half-way through a scan has already done work somebody might use. It type-checks as well:
+  comparing text with an integer answers `operator does not exist`, which is what a real server
+  says, rather than a silent `false`.
