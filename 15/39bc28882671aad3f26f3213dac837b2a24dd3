@@ -1,0 +1,29 @@
+crates/esker-sql/src/catalog/mod.rs
+  s_543d4c9b3ee38c::t_b4e723e1ea8f3f 99-107,506,524,531
+crates/esker-sql/src/catalog/record.rs
+  s_543d4c9b3ee38c::t_5d354e30a1bda2 28-32,138-139,171,212
+crates/esker-sql/src/exec/ddl.rs
+  s_543d4c9b3ee38c::t_216646f8e08e95 100-101
+crates/esker-sql/src/row.rs
+  s_543d4c9b3ee38c::t_e50a7a80084753 21-22,25-41,70-74,84-87,98,100-102,106,138,143-147,156-168,174,189-191,438-440,442,462-463,491-492,502-562,831-857
+docs/adr/0019-a-row-says-how-many-columns-it-has.md
+  s_543d4c9b3ee38c::t_2bb486d3b56830 1-103
+docs/plans/phase-6a.md
+  s_543d4c9b3ee38c::t_0050fb5bd1033f 231-235
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "1539bc28882671aad3f26f3213dac837b2a24dd3",
+  "prompts": {},
+  "sessions": {
+    "s_543d4c9b3ee38c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "befd6192-73a4-4b10-9f4b-cd092c10ce31",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
