@@ -314,6 +314,9 @@ impl<S: LogStorage> Raft<S> {
     fn tick_heartbeat(&mut self) {
         self.heartbeat_elapsed += 1;
         self.election_elapsed += 1;
+        // Before the heartbeat, so a snapshot that has just run out of patience is probed for in
+        // this round rather than the next.
+        self.expire_pending_snapshots(crate::SNAPSHOT_TIMEOUT_TICKS);
         if self.heartbeat_elapsed >= self.heartbeat_tick {
             self.heartbeat_elapsed = 0;
             let context = self.read_only.last_pending_ctx().unwrap_or_default();

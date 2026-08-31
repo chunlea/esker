@@ -257,6 +257,7 @@ impl<S: LogStorage> RawNode<S> {
   fn role(&self) -> Role;  fn term(&self) -> Term;  fn leader(&self) -> Option<NodeId>;
   fn commit_index(&self) -> Index;  fn status(&self) -> Status;
   fn progress(&self) -> Vec<PeerProgress>;  // a leader's view of each peer; empty on a follower (4d)
+  fn report_snapshot(&mut self, to: NodeId, status: SnapshotStatus);  // Finished | Failed (4d)
   fn storage(&self) -> &S;  fn storage_mut(&mut self) -> &mut S;
 }
 pub trait LogStorage { initial_state, entries(lo, hi, max_bytes), term(idx), first_index, last_index, snapshot }
@@ -277,7 +278,17 @@ Driver contract (implemented in `esker-store`), in order — the normative text 
 2. apply `snapshot` before `entries` when both are present;
 3. apply `committed_entries` in order, exactly once;
 4. answer a `read_state` only once the state machine has applied through its index;
-5. then `advance()`.
+5. then `advance()`;
+6. **report what became of a snapshot transfer** it carried out, with `report_snapshot`.
+
+Rule 6 is not an ordering rule like the others, and it is the one that cost a stranded replica. A
+leader that has offered a snapshot sends that peer nothing else — the wait ends only when the
+follower acknowledges — so a transfer the follower never received is a wait with no end. The core
+never saw a byte of it, so only the driver can say. Two backstops sit behind the report because a
+report can be impossible rather than merely late: an acknowledgement at or past the pending index
+makes the snapshot moot whatever happened, and after `SNAPSHOT_TIMEOUT_TICKS` the leader offers it
+again anyway — which is what covers the case nobody owes a report for at all, an offer lost before
+any transfer began.
 
 Violating rule 1 breaks safety — it is also what makes the leader's own bookkeeping sound, since a
 leader counts itself as holding an entry before any fsync and may only do so because it cannot send
@@ -350,6 +361,10 @@ Regions cover the whole key space contiguously; the first region is `["", "")`.
   (`RaftTransport::Snapshot`, §9) and the leader answers with a run of `Stream` frames in 1 MiB
   chunks, each checksummed; the `InstallSnapshot` Raft message is only the announcement and carries
   no data, because the core reads nothing but its metadata (§5).
+  - **The store that served the stream reports how it went** (`report_snapshot`, §5 rule 6), from
+    the task that walked the region — so every way out of that walk, the receiver hanging up
+    included, produces an answer. Without it the leader waits on an acknowledgement the follower
+    has no reason to send, and the replica is stranded for the rest of the term.
   - **Key-value pairs, not SST files, in v1.** §6 originally described `engine.checkpoint(range)` →
     `ingest()`, and two things stop it: a checkpoint links *whole files* and a file straddles a
     region boundary, so the receiver would get its neighbour's keys; and `Db::ingest` refuses any
@@ -702,6 +717,7 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
 | max inflight raft msgs | 256 |
 | store / region heartbeat | 10 s / 60 s — the region interval is also the latency of a PD operator, which has no other way to reach a store |
 | raft log compact threshold / tail kept | 4096 / 1024 entries |
+| snapshot offer timeout | 100 ticks (10 s) — one store-heartbeat interval; the driver's report is the fast path |
 | snapshot chunk / stream depth | 1 MiB / 4 chunks |
 | driver workers per store | 4 threads; region `id % workers` picks one |
 | leadership-transfer lag allowance | 64 entries behind the leader's `matched` |

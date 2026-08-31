@@ -26,11 +26,12 @@
 
 use bytes::Bytes;
 
-use crate::core::Raft;
+use crate::core::{Raft, Role};
 use crate::error::{RaftError, Result};
 use crate::message::Message;
+use crate::progress::ProgressState;
 use crate::storage::LogStorage;
-use crate::types::{NodeId, Snapshot};
+use crate::types::{NodeId, Snapshot, SnapshotStatus};
 
 impl<S: LogStorage> Raft<S> {
     /// Sends the follower a snapshot, because what it needs has been compacted away.
@@ -74,6 +75,62 @@ impl<S: LogStorage> Raft<S> {
             progress.become_snapshot(index);
         }
         Ok(())
+    }
+
+    /// Takes the driver's word for what became of a transfer, and ends the wait either way.
+    ///
+    /// Everything about `ProgressState::Snapshot` rests on the follower answering, and a transfer
+    /// that never reached it produces no answer — so without this the peer is stranded until the
+    /// leader loses office. Only a leader has progress to correct, and only a peer actually in
+    /// `Snapshot` has a wait to end: a late report about a transfer the follower has already
+    /// acknowledged must not drag a healthy peer back into probing.
+    pub(crate) fn report_snapshot(&mut self, to: NodeId, status: SnapshotStatus) {
+        if self.role != Role::Leader {
+            return;
+        }
+        let Some(progress) = self.progress.get_mut(to) else {
+            return;
+        };
+        if progress.state != ProgressState::Snapshot {
+            return;
+        }
+        match status {
+            SnapshotStatus::Finished => progress.become_probe(),
+            SnapshotStatus::Failed => progress.abort_snapshot(),
+        }
+        tracing::debug!(
+            id = self.id,
+            follower = to,
+            ?status,
+            "a snapshot transfer was reported on; probing again"
+        );
+        // Nothing is sent from here. The retry rides on the next heartbeat or proposal, which is
+        // what paces it: a follower that keeps failing costs one announcement per heartbeat
+        // interval rather than one per report.
+    }
+
+    /// Gives up on snapshots nobody has reported on, one tick at a time.
+    ///
+    /// The driver that owed a report may be gone — killed mid-transfer, or holding a region this
+    /// store no longer has — and a report that will never come cannot be waited for. Called from
+    /// the leader's tick, so it costs one pass over the peers per tick and nothing at all for a
+    /// group with no snapshot in flight.
+    pub(crate) fn expire_pending_snapshots(&mut self, limit: u64) {
+        let mut expired: Vec<NodeId> = Vec::new();
+        for (id, progress) in self.progress.iter_mut() {
+            if progress.snapshot_tick(limit) {
+                progress.abort_snapshot();
+                expired.push(id);
+            }
+        }
+        for id in expired {
+            tracing::warn!(
+                id = self.id,
+                follower = id,
+                limit,
+                "a snapshot was never reported on; probing again"
+            );
+        }
     }
 
     /// Installs a snapshot from the leader, or explains why it was not needed.
@@ -140,10 +197,75 @@ mod tests {
     use crate::raw_node::RawNode;
     use crate::storage::{LogStorage, MemStorage};
     use crate::testkit::Harness;
-    use crate::types::{ConfState, Entry, HardState, Index, Snapshot, SnapshotMeta, Term};
+    use crate::types::{
+        ConfState, Entry, HardState, Index, Snapshot, SnapshotMeta, SnapshotStatus, Term,
+    };
 
     fn voters() -> ConfState {
         ConfState::from_voters(vec![1, 2, 3])
+    }
+
+    /// A leader of `{1, 2, 3}` with a log through index 5 and a snapshot at that index in flight
+    /// to node 2, and nothing else to distract from it. Every test below starts here because the
+    /// state that strands a replica is exactly this one.
+    ///
+    /// **Check-quorum off.** These tests tick out a whole snapshot timeout without either follower
+    /// answering, which is precisely what a leader steps down for. Leaving it on would test the
+    /// step-down instead of the thing under test.
+    fn leader_awaiting_a_snapshot(seed: u64) -> RawNode<MemStorage> {
+        let mut node = RawNode::new(
+            Config {
+                pre_vote: false,
+                check_quorum: false,
+                ..Config::new(1, vec![1, 2, 3], seed)
+            },
+            MemStorage::with_conf_state(voters()),
+        )
+        .unwrap();
+        node.campaign().unwrap();
+        for voter in [2, 3] {
+            node.step(Message::RequestVoteResponse {
+                from: voter,
+                to: 1,
+                term: 1,
+                granted: true,
+                pre_vote: false,
+            })
+            .unwrap();
+        }
+        // Four proposals on top of the leader's own empty entry: a log through index 5, so the
+        // snapshot in flight names an index the leader actually has.
+        for _ in 0..4 {
+            node.propose(Bytes::from_static(b"x")).unwrap();
+        }
+        let ready = node.ready();
+        node.storage_mut().append(&ready.entries).unwrap();
+        node.advance(&ready);
+        assert_eq!(node.status().last_index, 5);
+
+        // Compacted past everything node 2 has, which is what makes a snapshot the only thing left
+        // to send it — and what makes the heartbeat no help either, since a heartbeat has to be
+        // anchored at an index the leader can still name a term for.
+        node.storage_mut().compact(5).unwrap();
+        node.step(Message::AppendEntriesResponse {
+            from: 2,
+            to: 1,
+            term: 1,
+            reject: true,
+            index: 1,
+            hint_term: 1,
+            context: Bytes::new(),
+        })
+        .unwrap();
+
+        let progress = node.raft_mut().progress.get(2).unwrap().clone();
+        assert_eq!(progress.state, ProgressState::Snapshot);
+        assert_eq!(progress.pending_snapshot, 5);
+        assert!(
+            progress.is_paused(),
+            "the state under test is the paused one"
+        );
+        node
     }
 
     fn follower(terms: &[Term], hard_term: Term) -> RawNode<MemStorage> {
@@ -494,6 +616,230 @@ mod tests {
                 .any(|message| message.recipient() == 2),
             "the leader kept sending to a follower that is installing a snapshot"
         );
+    }
+
+    /// The strand itself, stated as a test: nothing the *leader* does ends a wait for a snapshot
+    /// that never arrived.
+    ///
+    /// This is the shape that stranded a replica in `esker-store/tests/balance.rs` — the
+    /// announcement was dropped by a transport that did not yet know where the new peer lived, so
+    /// no bytes were ever sent, no acknowledgement was ever owed, and the leader sent that peer
+    /// nothing for the rest of its term. Heartbeats do not help: a follower below the compaction
+    /// boundary has no anchor to heartbeat at, so `send_heartbeat` delegates to `send_append`,
+    /// which is paused for exactly this reason.
+    ///
+    /// The assertion is the strand, and the two tests after it are the two ways out.
+    #[test]
+    fn a_leader_waiting_on_a_snapshot_sends_that_follower_nothing() {
+        let mut node = leader_awaiting_a_snapshot(210);
+        let _ = node.ready();
+
+        for _ in 0..(crate::SNAPSHOT_TIMEOUT_TICKS - 1) {
+            node.tick();
+        }
+        node.propose(Bytes::from_static(b"x")).unwrap();
+
+        assert_eq!(
+            node.raft_mut().progress.get(2).unwrap().state,
+            ProgressState::Snapshot,
+            "the leader gave up on its own, which it has no way to do"
+        );
+        assert!(
+            !node
+                .ready()
+                .messages
+                .iter()
+                .any(|message| message.recipient() == 2),
+            "nothing reaches a follower whose snapshot is in flight"
+        );
+    }
+
+    /// Way out one: the driver says the transfer failed, and the leader probes from what the
+    /// follower is actually known to have.
+    ///
+    /// `next` is the assertion that matters. Probing from the *promised* index would send an
+    /// append the follower must reject — the leader would be asking about entries it just failed
+    /// to deliver — so `pending_snapshot` is forgotten before the probe point is worked out.
+    #[test]
+    fn a_failed_report_probes_from_what_the_follower_has() {
+        let mut node = leader_awaiting_a_snapshot(211);
+        let _ = node.ready();
+
+        node.report_snapshot(2, SnapshotStatus::Failed);
+
+        let progress = node.raft_mut().progress.get(2).unwrap().clone();
+        assert_eq!(progress.state, ProgressState::Probe);
+        assert_eq!(progress.pending_snapshot, 0, "the promise was forgotten");
+        assert_eq!(
+            progress.next,
+            progress.matched + 1,
+            "the probe restarts from the truth, not from the promise"
+        );
+        assert!(!progress.is_paused(), "and the leader may send again");
+
+        // And it does: the next proposal reaches the follower rather than being swallowed.
+        node.propose(Bytes::from_static(b"x")).unwrap();
+        assert!(
+            node.ready()
+                .messages
+                .iter()
+                .any(|message| message.recipient() == 2),
+            "the follower is still being sent nothing"
+        );
+    }
+
+    /// Way out two: the driver says the bytes landed, and the leader probes from the index they
+    /// carried rather than from scratch.
+    ///
+    /// `Finished` is a statement about the *transfer*, never about whether the follower is caught
+    /// up — that stays the acknowledgement's job. What it buys is the probe point: the follower
+    /// holds at least the snapshot's index, so starting below it would re-send entries the
+    /// snapshot already carried.
+    #[test]
+    fn a_finished_report_probes_from_the_snapshot_it_delivered() {
+        let mut node = leader_awaiting_a_snapshot(212);
+        let _ = node.ready();
+
+        node.report_snapshot(2, SnapshotStatus::Finished);
+
+        let progress = node.raft_mut().progress.get(2).unwrap().clone();
+        assert_eq!(progress.state, ProgressState::Probe);
+        assert_eq!(
+            progress.next, 6,
+            "the snapshot at 5 is credited to the peer"
+        );
+        assert_eq!(
+            progress.matched, 0,
+            "delivered is not acknowledged; only the follower can say that"
+        );
+    }
+
+    /// Way out three, for the driver that never got to report at all — a killed process, a store
+    /// that lost the region under it. Slower on purpose: it must never cut short a large region's
+    /// transfer, so it is the last line rather than the first.
+    #[test]
+    fn a_snapshot_nobody_reports_on_expires_and_the_leader_probes_again() {
+        let mut node = leader_awaiting_a_snapshot(213);
+        let _ = node.ready();
+
+        for _ in 0..(crate::SNAPSHOT_TIMEOUT_TICKS - 1) {
+            node.tick();
+        }
+        assert_eq!(
+            node.raft_mut().progress.get(2).unwrap().state,
+            ProgressState::Snapshot,
+            "it gave up early"
+        );
+
+        node.tick();
+
+        // The expiry does not merely change a field: the follower is offered the snapshot again,
+        // which is the whole point. The leader goes back through `Probe` and straight into a fresh
+        // `Snapshot` in the same tick, because a compacted follower has nothing else it can be
+        // sent — so what is asserted is the *offer*, and that the clock started over with it.
+        assert!(
+            node.ready()
+                .messages
+                .iter()
+                .any(|message| matches!(message, Message::InstallSnapshot { to: 2, .. })),
+            "the follower was left stranded after the timeout"
+        );
+        let progress = node.raft_mut().progress.get(2).unwrap().clone();
+        assert_eq!(
+            progress.pending_snapshot, 5,
+            "a fresh offer, not the old one"
+        );
+        assert_eq!(progress.snapshot_elapsed, 0, "and a fresh clock with it");
+    }
+
+    /// An acknowledgement that reaches the pending index ends the snapshot whatever became of the
+    /// transfer, because there is no longer anything to wait for.
+    ///
+    /// This is the case a report cannot cover: the follower was caught up by some other route —
+    /// an earlier snapshot it had already installed, a leader change, a duplicate delivery — so
+    /// nobody owes a report at all.
+    ///
+    /// **`Replicate`, not `Probe`, is the assertion.** The follower has just told the leader the
+    /// exact index it holds, so there is nothing left to guess at; making it prove the same thing
+    /// again through a probe costs a round trip during which the leader sends it nothing. That
+    /// only happens because the snapshot is made moot *inside* the acknowledgement, before the
+    /// state is read — a peer still in `Snapshot` at that point takes the slower path by design,
+    /// because an acknowledgement below the pending index really has not answered the question.
+    #[test]
+    fn an_acknowledgement_past_the_pending_index_ends_the_snapshot() {
+        let mut node = leader_awaiting_a_snapshot(214);
+        let _ = node.ready();
+
+        node.step(Message::AppendEntriesResponse {
+            from: 2,
+            to: 1,
+            term: 1,
+            reject: false,
+            index: 5,
+            hint_term: 0,
+            context: Bytes::new(),
+        })
+        .unwrap();
+
+        let progress = node.raft_mut().progress.get(2).unwrap().clone();
+        assert_eq!(progress.state, ProgressState::Replicate);
+        assert_eq!(progress.pending_snapshot, 0);
+        assert_eq!(progress.matched, 5);
+
+        // And one below the pending index does not: that peer is still waiting on state it has
+        // not got, so the wait stands.
+        let mut node = leader_awaiting_a_snapshot(216);
+        let _ = node.ready();
+        node.step(Message::AppendEntriesResponse {
+            from: 2,
+            to: 1,
+            term: 1,
+            reject: false,
+            index: 3,
+            hint_term: 0,
+            context: Bytes::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            node.raft_mut().progress.get(2).unwrap().state,
+            ProgressState::Probe,
+            "an acknowledgement short of the snapshot goes back to guessing, not to pipelining"
+        );
+    }
+
+    /// A report is a correction to a wait, so a peer that is not waiting must not be moved by one.
+    ///
+    /// Both halves matter. A late `Failed` about a transfer the follower has since acknowledged
+    /// would drag a replicating peer back into probing and undo its pipelining; and a follower has
+    /// no progress to correct at all, so a report reaching the wrong node is a no-op rather than a
+    /// panic (invariant 9).
+    #[test]
+    fn a_report_moves_nothing_that_is_not_waiting_on_a_snapshot() {
+        let mut node = leader_awaiting_a_snapshot(215);
+        let _ = node.ready();
+        node.step(Message::AppendEntriesResponse {
+            from: 2,
+            to: 1,
+            term: 1,
+            reject: false,
+            index: 5,
+            hint_term: 0,
+            context: Bytes::new(),
+        })
+        .unwrap();
+        let before = node.raft_mut().progress.get(2).unwrap().clone();
+
+        node.report_snapshot(2, SnapshotStatus::Failed);
+        let after = node.raft_mut().progress.get(2).unwrap().clone();
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.next, before.next);
+        assert_eq!(after.matched, before.matched);
+
+        // A peer the leader has never heard of, and a report on a node that leads nothing.
+        node.report_snapshot(99, SnapshotStatus::Finished);
+        let mut lone = follower(&[1], 5);
+        lone.report_snapshot(1, SnapshotStatus::Failed);
+        assert_eq!(lone.role(), Role::Follower);
     }
 
     /// A snapshot that does not take puts the follower back into probing rather than leaving the

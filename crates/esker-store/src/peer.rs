@@ -178,6 +178,15 @@ pub enum PeerMsg {
     Progress(oneshot::Sender<Vec<esker_raft::PeerProgress>>),
     /// Ask this region's leadership to move to another peer.
     TransferLeader(NodeId),
+    /// What became of a snapshot transfer this store was serving to `to`. The core stops sending
+    /// to a peer it has offered a snapshot, so this is what ends that wait when the transfer,
+    /// rather than the follower, is what failed.
+    ReportSnapshot {
+        /// The follower the snapshot was being sent to.
+        to: NodeId,
+        /// Whether the bytes got there.
+        status: esker_raft::SnapshotStatus,
+    },
     /// What a follower needs to be sent: the metadata, and a pinned read of the data it names.
     SnapshotSource(oneshot::Sender<std::result::Result<SnapshotSource, ProtoError>>),
     /// Stop the thread, failing everything outstanding.
@@ -768,6 +777,7 @@ impl PeerCore {
                 let _ = notify.send(self.node.progress());
             }
             PeerMsg::TransferLeader(target) => self.node.transfer_leader(target),
+            PeerMsg::ReportSnapshot { to, status } => self.node.report_snapshot(to, status),
             PeerMsg::Stop => return false,
         }
         // Published here as well as after driving, because a batch can carry the tick that
@@ -1051,6 +1061,26 @@ impl RaftPeer {
     /// re-issues from what the next heartbeat reports rather than waiting for an answer.
     pub async fn transfer_leader(&self, target: NodeId) -> std::result::Result<(), ProtoError> {
         self.send(PeerMsg::TransferLeader(target)).await
+    }
+
+    /// Tells the core what became of a snapshot transfer this store was serving.
+    ///
+    /// **The driver's half of the `Ready` contract, not a courtesy.** A leader that has sent an
+    /// `InstallSnapshot` sends that follower nothing else until the follower acknowledges, and a
+    /// transfer the follower never received is never acknowledged — so a store that streams the
+    /// bytes and says nothing about how it went strands the replica for the rest of the term. Only
+    /// the store knows: the core does no I/O and never saw a byte of it
+    /// (`docs/plans/phase-4.md` §15).
+    ///
+    /// Fire and forget, and it is safe to be: a report that arrives after the follower has already
+    /// acknowledged is a no-op in the core, and a report that never arrives is covered, more
+    /// slowly, by `esker_raft::SNAPSHOT_TIMEOUT_TICKS`.
+    pub async fn report_snapshot(
+        &self,
+        to: NodeId,
+        status: esker_raft::SnapshotStatus,
+    ) -> std::result::Result<(), ProtoError> {
+        self.send(PeerMsg::ReportSnapshot { to, status }).await
     }
 
     /// What a follower needs to be sent, taken as one consistent pair on the driver thread.

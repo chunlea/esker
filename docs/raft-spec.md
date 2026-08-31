@@ -114,6 +114,7 @@ system, not of one function, so their "implemented by" is the argument, not a li
 | N6 | After installing, the follower's position comes from the snapshot's metadata, and it refuses appends below it | `log::RaftLog::{last_index, term}` | `a_node_that_installed_a_snapshot_still_refuses_a_shorter_candidate`, `an_append_below_the_installed_snapshot_is_refused` |
 | N7 | A snapshot in flight is recorded but not counted as replicated; the follower acknowledges with an ordinary `AppendEntriesResponse` | `progress::Progress::become_snapshot`, `snapshot::Raft::handle_install_snapshot` | `a_snapshot_in_flight_is_not_counted_as_replicated`, `a_rejected_snapshot_returns_the_follower_to_probing` |
 | N5 | A snapshot that the log has already passed, or that it already matches, is ignored | `log::RaftLog::should_restore` | `a_snapshot_the_log_has_already_passed_is_not_worth_installing`, `a_snapshot_the_log_already_matches_is_not_worth_installing`, `a_snapshot_the_log_has_passed_is_acknowledged_but_not_installed`, `a_snapshot_at_the_end_of_the_index_space_is_refused` |
+| N8 | A snapshot in flight that will never be acknowledged is given up on, so the peer is not stranded: the driver reports the transfer's outcome, an acknowledgement at or past the pending index makes it moot, and a tick timeout covers the driver that never reported | `snapshot::Raft::{report_snapshot, expire_pending_snapshots}`, `progress::Progress::{abort_snapshot, snapshot_is_moot, snapshot_tick}` | `a_leader_waiting_on_a_snapshot_sends_that_follower_nothing`, `a_failed_report_probes_from_what_the_follower_has`, `a_finished_report_probes_from_the_snapshot_it_delivered`, `a_snapshot_nobody_reports_on_expires_and_the_leader_probes_again`, `an_acknowledgement_past_the_pending_index_ends_the_snapshot`, `a_report_moves_nothing_that_is_not_waiting_on_a_snapshot`, `esker-sim`'s `a_snapshot_the_network_loses_is_offered_again` |
 
 ## 6. Beyond Figure 3.1
 
@@ -138,7 +139,7 @@ Features from later chapters, each of which this crate implements.
 ### The driver contract
 
 Not in Figure 3.1 at all, because the paper assumes a server that persists its own state. Splitting
-the decision from the I/O is what makes this crate simulatable, and it moves five rules out of the
+the decision from the I/O is what makes this crate simulatable, and it moves six rules out of the
 algorithm and into `Ready`'s documentation.
 
 | # | Rule | Implemented by | Tested by |
@@ -148,6 +149,14 @@ algorithm and into `Ready`'s documentation.
 | D3 | Apply `committed_entries` in order, exactly once | `raw_node::RawNode::{ready, advance}` | `committed_entries_are_durable_or_carried_alongside`, `nothing_is_offered_twice_after_advance` |
 | D4 | Answer a read only past its index | `readonly`, `raw_node::Ready::read_states` | the rule is the driver's; `testkit::Harness::drain_ready` records read states as a driver would, and `esker-sim` injects violations |
 | D5 | A `Ready` not advanced re-offers its state; its messages are taken once (losing a message is always safe — the network may lose one anyway) | `raw_node::RawNode::ready` | `a_ready_that_is_not_advanced_is_offered_again` |
+| D6 | Report what became of a snapshot transfer the driver carried out | `raw_node::RawNode::report_snapshot`, `types::SnapshotStatus`; the store's side is `esker-store`'s `RaftPeer::report_snapshot`, called from `Store::send_snapshot` | `a_failed_report_probes_from_what_the_follower_has`, `a_finished_report_probes_from_the_snapshot_it_delivered` |
+
+D6 is the one that is not merely a matter of ordering. `ProgressState::Snapshot` is paused
+unconditionally and only the follower's acknowledgement ends it, so a transfer that never reached
+the follower is a wait with no end — and the core, which never saw a byte of it, is the one party
+that cannot know. A driver that streams the bytes and says nothing strands that replica for the
+rest of the leader's term. `SNAPSHOT_TIMEOUT_TICKS` is the backstop for a driver that could not
+report at all, and for the case no report covers: an offer lost before any transfer began.
 
 D1 is also what makes the leader's own bookkeeping sound: a leader counts itself as holding an entry
 the moment it appends one, before any fsync, and that is safe only because no follower can

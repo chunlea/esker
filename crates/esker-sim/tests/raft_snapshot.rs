@@ -73,6 +73,60 @@ fn a_follower_cut_off_past_the_compaction_boundary_is_repaired_by_a_snapshot() {
     );
 }
 
+/// The same repair, over a network that loses messages: **every** seed must still repair the
+/// follower, not just most of them.
+///
+/// A snapshot the network loses is the one an `AppendEntries` retry cannot cover, because the
+/// leader stops sending to a peer it has offered a snapshot — `ProgressState::Snapshot` is paused
+/// until the follower acknowledges, and a follower that received nothing has nothing to
+/// acknowledge. The offer is a single message, so on a lossy link losing it is ordinary.
+///
+/// The sweeps above sum `snapshots_installed` across seeds and so pass with a few followers
+/// stranded; this asserts per seed, which is what makes the retry the thing under test. The only
+/// mechanism that can satisfy it here is `SNAPSHOT_TIMEOUT_TICKS`: the sim drives `RawNode`
+/// directly and streams no bytes, so there is no driver to report an outcome
+/// (`docs/plans/phase-4.md` §15).
+#[test]
+fn a_snapshot_the_network_loses_is_offered_again() {
+    for seed in seeds(7_500, 16) {
+        let plan = FaultPlan {
+            compact_after: 2,
+            ..FaultPlan::lossless()
+        };
+        let mut cluster = Cluster::new(seed, plan, 3).unwrap();
+        cluster
+            .settle(LIVENESS_TICKS)
+            .unwrap_or_else(|failure| panic!("{failure}"));
+
+        let leader = cluster.leader().expect("settled without a leader");
+        let victim = (1..=3).find(|id| *id != leader).expect("three nodes");
+        cluster.partition(&[victim]);
+        for _ in 0..12 {
+            cluster
+                .settle(LIVENESS_TICKS)
+                .unwrap_or_else(|failure| panic!("{failure}"));
+        }
+
+        // Healed, but onto a link that drops one message in three. The first offer is very likely
+        // lost, and nothing but a re-offer follows it.
+        cluster.heal().unwrap_or_else(|failure| panic!("{failure}"));
+        cluster.calm(FaultPlan {
+            drop: 0.34,
+            compact_after: 2,
+            ..FaultPlan::lossless()
+        });
+        cluster
+            .run(1_200)
+            .unwrap_or_else(|failure| panic!("{failure}"));
+
+        assert!(
+            cluster.stats().snapshots_installed > 0,
+            "seed {seed}: the follower was offered a snapshot the network lost and was never \
+             offered another, so it is stranded for the rest of the term"
+        );
+    }
+}
+
 /// The same faults as the main sweep, plus compaction. Every property, every event, hundreds of
 /// seeds — this is where a snapshot that disagrees with what was committed would be caught.
 #[test]

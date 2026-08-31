@@ -15,6 +15,15 @@
 //!   `max_inflight_msgs` batches without waiting.
 //! * [`ProgressState::Snapshot`] — the follower needs entries the leader has compacted away.
 //!   Nothing is sent until the snapshot is acknowledged.
+//!
+//! The third state is the one that can strand a replica, because it is paused unconditionally and
+//! only the follower can end it. A snapshot that never arrives — the announcement lost, the stream
+//! refused, the receiving process killed — leaves the leader waiting for an acknowledgement of
+//! something that was never delivered, and the follower never learns it should ask. Three rules
+//! close that, in the order they fire: the driver [reports](crate::SnapshotStatus) what became of
+//! the transfer it was actually running; an acknowledgement that reaches or passes the pending
+//! index makes the snapshot moot whatever the report said; and, for a driver that died without
+//! reporting at all, `snapshot_elapsed` runs out.
 
 use std::collections::VecDeque;
 
@@ -92,6 +101,10 @@ pub(crate) struct Progress {
     pub(crate) probe_sent: bool,
     /// The index of the snapshot in flight, or 0.
     pub(crate) pending_snapshot: Index,
+    /// Ticks since the snapshot in flight was sent. Only meaningful in
+    /// [`ProgressState::Snapshot`], and the last line of defence against a transfer nobody ever
+    /// reports on.
+    pub(crate) snapshot_elapsed: u64,
     /// Learners replicate but do not count toward a quorum.
     pub(crate) is_learner: bool,
     /// The in-flight window used in [`ProgressState::Replicate`].
@@ -107,6 +120,7 @@ impl Progress {
             recent_active: false,
             probe_sent: false,
             pending_snapshot: 0,
+            snapshot_elapsed: 0,
             is_learner,
             inflights: Inflights::new(max_inflight),
         }
@@ -124,6 +138,7 @@ impl Progress {
         }
         self.state = ProgressState::Probe;
         self.pending_snapshot = 0;
+        self.snapshot_elapsed = 0;
         self.probe_sent = false;
         self.inflights.reset();
     }
@@ -133,6 +148,7 @@ impl Progress {
         self.state = ProgressState::Replicate;
         self.next = self.matched.saturating_add(1);
         self.pending_snapshot = 0;
+        self.snapshot_elapsed = 0;
         self.probe_sent = false;
         self.inflights.reset();
     }
@@ -141,8 +157,41 @@ impl Progress {
     pub(crate) fn become_snapshot(&mut self, index: Index) {
         self.state = ProgressState::Snapshot;
         self.pending_snapshot = index;
+        self.snapshot_elapsed = 0;
         self.probe_sent = false;
         self.inflights.reset();
+    }
+
+    /// The snapshot did not arrive: go back to guessing from what the follower actually has.
+    ///
+    /// **The order matters.** Clearing `pending_snapshot` first is what makes
+    /// [`become_probe`](Self::become_probe) restart from `matched + 1` rather than from the index
+    /// the follower was promised and never received — probing from a promise would send an
+    /// `AppendEntries` the follower must reject, and buy nothing over probing from the truth.
+    pub(crate) fn abort_snapshot(&mut self) {
+        self.pending_snapshot = 0;
+        self.become_probe();
+    }
+
+    /// Whether an acknowledgement has made the snapshot in flight pointless.
+    ///
+    /// The follower is at or past the index the snapshot carries, so whatever happened to the
+    /// transfer it is no longer what this peer needs — and waiting for an acknowledgement of it
+    /// would be waiting for a message the follower has no reason to send.
+    pub(crate) fn snapshot_is_moot(&self) -> bool {
+        self.state == ProgressState::Snapshot && self.matched >= self.pending_snapshot
+    }
+
+    /// Counts one tick against a snapshot in flight, and says whether it has run out of patience.
+    ///
+    /// Only ever `true` in [`ProgressState::Snapshot`]: this is the case where the driver never
+    /// reported at all, which a report cannot cover because the process that owed it is gone.
+    pub(crate) fn snapshot_tick(&mut self, limit: u64) -> bool {
+        if self.state != ProgressState::Snapshot {
+            return false;
+        }
+        self.snapshot_elapsed = self.snapshot_elapsed.saturating_add(1);
+        self.snapshot_elapsed >= limit
     }
 
     /// Records an acknowledgement. Returns whether it moved `matched` forward — a duplicate or
@@ -154,6 +203,12 @@ impl Progress {
             self.probe_sent = false;
         }
         self.next = self.next.max(acked.saturating_add(1));
+        // An acknowledgement that reaches the pending index ends the snapshot whatever became of
+        // it. `become_probe` keeps `pending_snapshot` in its arithmetic on purpose: the follower
+        // is known to hold at least that much, so the probe starts there rather than from scratch.
+        if self.snapshot_is_moot() {
+            self.become_probe();
+        }
         advanced
     }
 

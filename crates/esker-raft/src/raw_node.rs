@@ -192,6 +192,29 @@ impl<S: LogStorage> RawNode<S> {
         }
     }
 
+    /// Tells the leader what became of a snapshot transfer it started.
+    ///
+    /// **This is part of the driver contract, not an optimisation.** The core sends an
+    /// `InstallSnapshot` and then stops sending to that peer entirely, because there is nothing
+    /// useful to send until the state arrives; only the follower's acknowledgement ends the wait.
+    /// A transfer that never reached the follower produces no acknowledgement, so a driver that
+    /// does not report leaves the peer stranded for the rest of the leader's term — the bytes are
+    /// the driver's business (invariant 4), so the driver is the only party that can know.
+    ///
+    /// Call it once per transfer, with [`SnapshotStatus::Finished`] when the bytes were delivered
+    /// and [`SnapshotStatus::Failed`] when they were not. Both are statements about the
+    /// *transfer*, never about whether the follower is caught up: that stays the
+    /// `AppendEntriesResponse`'s job, and a `Finished` the follower never acts on is corrected by
+    /// the probe that follows it.
+    ///
+    /// A no-op anywhere but a leader, for a peer it does not have, or for a peer that is not
+    /// waiting on a snapshot — a report that arrives after the follower has already acknowledged
+    /// must not drag a healthy peer back into probing. A driver that cannot report at all is
+    /// covered, more slowly, by [`SNAPSHOT_TIMEOUT_TICKS`](crate::SNAPSHOT_TIMEOUT_TICKS).
+    pub fn report_snapshot(&mut self, to: NodeId, status: crate::types::SnapshotStatus) {
+        self.raft.report_snapshot(to, status);
+    }
+
     /// Whether there is anything for the driver to do.
     pub fn has_ready(&self) -> bool {
         !self.raft.messages.is_empty()

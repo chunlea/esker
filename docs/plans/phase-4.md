@@ -887,3 +887,74 @@ entry rather than a completed fsync — which means the mark's commit must be ob
 proposed, before a timestamp above the old mark leaves. `crates/esker-pd/tests/crash_kill.rs` is
 the test to point at the new implementation, and its own limit still applies: a `SIGKILL` proves
 the ordering and the restart rule, not the durability of the write underneath.
+
+## 15. The `ProgressState::Snapshot` strand (post-4d, gate blocker)
+
+§14.5 reported this as a core gap and left it. The ruling made it a **phase-4 gate blocker** — the
+acceptance simulator drops messages by design, so a strand that needs one lost message is a strand
+the acceptance run will hit — and granted the core fix. This is that unit.
+
+### 15.1 The failure, exactly
+
+A leader that has offered a snapshot sends that peer nothing else: `ProgressState::Snapshot` is
+paused unconditionally, and only an `AppendEntriesResponse` from the follower ends it. Heartbeats
+are no escape, because a follower below the compaction boundary has no index the leader can anchor
+a heartbeat at, so `send_heartbeat` delegates to the same paused `send_append`.
+
+So a follower that never received the offer never answers, and never will. The replica is stranded
+for the rest of the leader's term. Three ways in, all of them ordinary:
+
+* the offer was lost — the case `tests/balance.rs` hit, where the transport had no route yet;
+* the transfer failed after it began — the receiver hung up, the walk errored;
+* the store serving it died mid-stream, so nobody was left to say anything.
+
+### 15.2 Three rules, in the order they fire
+
+**The driver reports** (`RawNode::report_snapshot`, `SnapshotStatus::{Finished, Failed}`). The core
+does no I/O and never saw a byte, so the driver is the only party that can know: this is a new rule
+of the `Ready` contract (`docs/raft-spec.md` D6), not an optimisation. `Finished` probes from the
+snapshot's index — the follower holds at least that much, even though it has not said so.
+`Failed` forgets the index first and probes from `matched + 1`, because probing from an index the
+leader just failed to deliver would only earn a rejection. Neither is a claim the follower is caught
+up; that stays the acknowledgement's job.
+
+**An acknowledgement at or past the pending index ends it**, whatever became of the transfer, and
+does so *inside* `maybe_update` — before the response handler reads the state. That ordering is the
+whole of its value: the follower has just named the exact index it holds, so it goes straight to
+`Replicate` rather than spending a round trip proving it again through `Probe`. An acknowledgement
+*short* of the pending index still takes the slow path, because it genuinely has not answered the
+question.
+
+**`SNAPSHOT_TIMEOUT_TICKS` covers what no report can.** Not the second-guess of a report — the case
+where nobody owes one: the offer was lost before any transfer began, so no stream was ever served.
+100 ticks, one store-heartbeat interval, so a lost offer is repaired before a scheduler could see
+the stall. Re-offering a transfer genuinely in progress is not the hazard it looks like: an offer
+carries no data, and the receiving store already de-duplicates by region.
+
+### 15.3 Why the store can report at all
+
+The store's snapshot path is receiver-pull, so the **leader serves the stream** and therefore knows
+how it ended. `Store::send_snapshot`'s walk was extracted into `stream_snapshot`, which returns
+whether every byte got there — extracted for exactly one reason: every way out of the walk now has
+to produce an answer, and an early `return` that skipped one is the bug this whole section exists
+to fix.
+
+### 15.4 Tests, and what proves they test something
+
+Six unit tests in `esker-raft/src/snapshot.rs`, one sim test, and the mutation check the ruling
+asked for. Each rule was removed in turn and the suite re-run:
+
+| Mutation | Went red |
+|---|---|
+| `report_snapshot`'s match dropped | `a_failed_report_probes_from_what_the_follower_has`, `a_finished_report_probes_from_the_snapshot_it_delivered` |
+| the moot rule dropped from `maybe_update` | `an_acknowledgement_past_the_pending_index_ends_the_snapshot` |
+| `expire_pending_snapshots` dropped from the tick | `a_snapshot_nobody_reports_on_expires_and_the_leader_probes_again`, and `esker-sim`'s `a_snapshot_the_network_loses_is_offered_again` |
+
+`a_leader_waiting_on_a_snapshot_sends_that_follower_nothing` states the strand itself: nothing the
+leader does on its own ends the wait. It is what the other tests are the ways out of.
+
+The sim test earns its place. The existing compaction sweeps sum `snapshots_installed` across
+seeds, so they pass with a few followers stranded; this one heals a cut-off follower onto a link
+that drops one message in three and requires **every** seed to repair it. In the simulator no
+driver streams bytes, so no report is possible — the only mechanism that can satisfy it is the tick
+timeout, which is why dropping that one line turns it red. It costs a second.

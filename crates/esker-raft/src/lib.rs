@@ -50,7 +50,7 @@ pub use crate::raw_node::{RawNode, Ready};
 pub use crate::storage::{InitialState, LogStorage, MemStorage};
 pub use crate::types::{
     ConfChange, ConfChangeKind, ConfState, Entry, EntryKind, HardState, Index, NodeId,
-    PeerProgress, ReadState, Snapshot, SnapshotMeta, Term,
+    PeerProgress, ReadState, Snapshot, SnapshotMeta, SnapshotStatus, Term,
 };
 
 /// Wall-clock duration a caller should map onto one `tick()`, in milliseconds. The core
@@ -69,6 +69,20 @@ pub const HEARTBEAT_TICKS: u64 = 2;
 
 /// How many append messages may be in flight to one follower before the leader stops sending.
 pub const MAX_INFLIGHT_MSGS: usize = 256;
+
+/// Ticks a leader waits for a snapshot in flight before offering it again.
+///
+/// The **second** line, not the first: a driver that finishes or fails a transfer says so with
+/// [`RawNode::report_snapshot`] in milliseconds. This covers what no report can — the driver that
+/// never got to say anything, and, the case that actually stranded a replica, the announcement
+/// that was lost before any transfer began, where nobody owes a report at all.
+///
+/// Ten seconds at [`TICK_MS`], which is one store-heartbeat interval (`docs/DESIGN.md` §14): a
+/// lost announcement is repaired before a scheduler could notice the stall. Cutting short a
+/// transfer genuinely in progress is not the hazard it looks like — the leader re-*offers*, and an
+/// offer carries no data, so the cost is one message every ten seconds and a receiver that is
+/// already fetching ignores it.
+pub const SNAPSHOT_TIMEOUT_TICKS: u64 = 100;
 
 #[cfg(test)]
 mod tests {

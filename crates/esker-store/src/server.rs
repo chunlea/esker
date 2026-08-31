@@ -946,42 +946,84 @@ impl Store {
             region: source.region.clone(),
             meta: source.meta.clone(),
         };
+        let to_peer = ask.peer_id;
+        let region_id = ask.region_id;
+        let reporting = Arc::clone(&peer);
         tokio::spawn(async move {
-            if sender.send(header.encode()).await.is_err() {
-                return;
-            }
-            // The walk is synchronous engine work and the sending is not, so the two are joined
-            // by a channel rather than by one of them pretending to be the other.
-            let (chunks, mut chunk_rx) = tokio::sync::mpsc::channel::<Bytes>(1);
-            let region = header.region.clone();
-            let read = source.read;
-            let walk = tokio::task::spawn_blocking(move || {
-                snapshot::read_pairs(&db, &region, read, snapshot::CHUNK_TARGET_BYTES, |pairs| {
-                    chunks
-                        .blocking_send(snapshot::encode_pairs(&pairs))
-                        .map_err(|_| ProtoError::Closed {
-                            detail: "the snapshot's reader has gone".to_owned(),
-                        })
-                })
-            });
-            while let Some(chunk) = chunk_rx.recv().await {
-                if sender.send(chunk).await.is_err() {
-                    return;
-                }
-            }
-            match walk.await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => sender.fail(error).await,
-                Err(error) => {
-                    sender
-                        .fail(ProtoError::internal(format!(
-                            "the snapshot walk failed: {error}"
-                        )))
-                        .await;
-                }
+            let delivered = Self::stream_snapshot(sender, db, header, source.read).await;
+            // The core's half of this is `ProgressState::Snapshot`, which is paused until the
+            // follower acknowledges — and a transfer the follower never received is never
+            // acknowledged. Saying how it went is what ends that wait; the alternative is a
+            // replica stranded for the rest of the leader's term (`docs/plans/phase-4.md` §15).
+            let status = if delivered {
+                esker_raft::SnapshotStatus::Finished
+            } else {
+                esker_raft::SnapshotStatus::Failed
+            };
+            if let Err(error) = reporting.report_snapshot(to_peer, status).await {
+                tracing::debug!(
+                    region_id,
+                    to_peer,
+                    %error,
+                    "a snapshot's outcome could not be reported; the tick timeout covers it"
+                );
             }
         });
         Ok(Reply::Stream(stream))
+    }
+
+    /// Walks a region into the stream, and says whether every byte of it got there.
+    ///
+    /// Split out of [`send_snapshot`](Self::send_snapshot) for one reason: every way out of the
+    /// walk has to produce an answer, because the caller owes the core a report either way. An
+    /// early `return` that skipped it is exactly the bug this whole path exists to fix.
+    async fn stream_snapshot(
+        sender: esker_proto::ChunkSender,
+        db: Arc<Db>,
+        header: snapshot::SnapshotHeader,
+        read: esker_engine::Snapshot,
+    ) -> bool {
+        if sender.send(header.encode()).await.is_err() {
+            return false;
+        }
+        // The walk is synchronous engine work and the sending is not, so the two are joined
+        // by a channel rather than by one of them pretending to be the other.
+        let (chunks, mut chunk_rx) = tokio::sync::mpsc::channel::<Bytes>(1);
+        let region = header.region.clone();
+        let walk = tokio::task::spawn_blocking(move || {
+            snapshot::read_pairs(&db, &region, read, snapshot::CHUNK_TARGET_BYTES, |pairs| {
+                chunks
+                    .blocking_send(snapshot::encode_pairs(&pairs))
+                    .map_err(|_| ProtoError::Closed {
+                        detail: "the snapshot's reader has gone".to_owned(),
+                    })
+            })
+        });
+        let mut delivered = true;
+        while let Some(chunk) = chunk_rx.recv().await {
+            if sender.send(chunk).await.is_err() {
+                // The receiver has gone. The walk still has to be drained, or its blocking thread
+                // stays parked on a channel nobody is reading.
+                delivered = false;
+                break;
+            }
+        }
+        while chunk_rx.recv().await.is_some() {}
+        match walk.await {
+            Ok(Ok(())) => delivered,
+            Ok(Err(error)) => {
+                sender.fail(error).await;
+                false
+            }
+            Err(error) => {
+                sender
+                    .fail(ProtoError::internal(format!(
+                        "the snapshot walk failed: {error}"
+                    )))
+                    .await;
+                false
+            }
+        }
     }
 
     /// Answers one operator request (`esker-cli region`).

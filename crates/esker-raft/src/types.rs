@@ -333,6 +333,27 @@ pub struct PeerProgress {
     pub pending_snapshot: Index,
 }
 
+/// What became of a snapshot transfer the driver was running.
+///
+/// The core sends an `InstallSnapshot` and then waits: `ProgressState::Snapshot` is paused
+/// unconditionally, and only the follower can end it. That is sound as long as the follower
+/// eventually answers — and a snapshot the network lost, the receiver refused, or a killed process
+/// abandoned produces no answer at all, so the replica is stranded for the leader's whole term.
+///
+/// The bytes are the driver's business (invariant 4), so only the driver knows. Reporting is how
+/// it says. Neither answer is a promise the follower is caught up — that is still an
+/// `AppendEntriesResponse`'s job — only a statement about the *transfer*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotStatus {
+    /// The bytes were delivered. The leader may probe from the snapshot's index: the follower
+    /// holds at least that much, even though it has not said so yet.
+    Finished,
+    /// The transfer did not complete. The leader forgets the index it promised and probes from
+    /// what the follower is actually known to have, which is what makes the next attempt start
+    /// from the truth rather than from the promise.
+    Failed,
+}
+
 /// What a snapshot says about the log it replaces.
 ///
 /// The core reads only this. It is the whole reason `InstallSnapshot` is safe to handle in a
