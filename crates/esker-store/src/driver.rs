@@ -34,7 +34,8 @@
 //! a leader's per-tick batching comes from (`docs/DESIGN.md` §6).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use esker_proto::ProtoError;
 use tokio::sync::mpsc;
@@ -90,6 +91,21 @@ impl std::fmt::Debug for Job {
 pub struct DriverPool {
     workers: Vec<mpsc::Sender<Job>>,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// Set once, by [`DriverPool::shutdown`], and read by every worker each time it wakes.
+    ///
+    /// **This is what makes the shutdown terminate.** `Job::Stop` is delivered with `try_send`,
+    /// which loses to a full queue — and a `Stop` dropped there used to be a worker that parked
+    /// in `blocking_recv` for ever while `shutdown` blocked in `join` waiting for it. Observed
+    /// under saturation: a test process wedged for over an hour, one worker exited on its
+    /// `Stop`, the other parked, and a tokio worker thread sat in
+    /// `Arc<DriverPool>::drop -> shutdown -> JoinHandle::join` behind it
+    /// (`docs/plans/debt-c1.md` section 5).
+    ///
+    /// The flag closes the gap without a lock on the send path. It is set *before* the `Stop` is
+    /// offered, so the two cases are exhaustive: either the queue had room and the `Stop` landed,
+    /// or it was full — which means a job is pending, which means the worker wakes, and the first
+    /// thing it does on waking is read this.
+    stopping: Arc<AtomicBool>,
 }
 
 impl DriverPool {
@@ -98,11 +114,13 @@ impl DriverPool {
         let workers = workers.max(1);
         let mut senders = Vec::with_capacity(workers);
         let mut threads = Vec::with_capacity(workers);
+        let stopping = Arc::new(AtomicBool::new(false));
         for index in 0..workers {
             let (sender, inbox) = mpsc::channel(WORKER_QUEUE_DEPTH);
+            let stopping = Arc::clone(&stopping);
             let thread = std::thread::Builder::new()
                 .name(format!("raft-driver-{index}"))
-                .spawn(move || run(inbox))
+                .spawn(move || run(inbox, &stopping))
                 .map_err(|error| {
                     StoreError::Bootstrap(format!("could not start a Raft driver thread: {error}"))
                 })?;
@@ -112,6 +130,7 @@ impl DriverPool {
         Ok(Self {
             workers: senders,
             threads: Mutex::new(threads),
+            stopping,
         })
     }
 
@@ -181,9 +200,12 @@ impl DriverPool {
         let Some(threads) = threads else {
             return;
         };
+        // Before the `Stop`s, never after: a worker that wakes to drain a full queue must find
+        // this already true. See [`DriverPool::stopping`].
+        self.stopping.store(true, Ordering::Release);
         for sender in &self.workers {
-            // A full queue on shutdown must not deadlock the caller: the worker is going away
-            // either way, and a closed channel ends its loop just as well.
+            // Best-effort, and that is now safe: a full queue means the worker has a job waiting,
+            // so it wakes and reads the flag instead of taking this message.
             let _ = sender.try_send(Job::Stop);
         }
         for thread in threads {
@@ -196,10 +218,18 @@ impl DriverPool {
 const RETIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// One worker: hold some regions, drive the ones that were touched.
-fn run(mut inbox: mpsc::Receiver<Job>) {
+fn run(mut inbox: mpsc::Receiver<Job>, stopping: &AtomicBool) {
     let mut cores: BTreeMap<u64, PeerCore> = BTreeMap::new();
 
     while let Some(job) = inbox.blocking_recv() {
+        // Read on every wake, before the job is even looked at. A worker that woke to a queue
+        // too full to have taken a `Stop` finds out here that it is going away, which is the
+        // half of the shutdown `try_send` cannot deliver ([`DriverPool::stopping`]). Whatever is
+        // still queued is dropped: the pool is being torn down, and every caller waiting on one
+        // of those jobs is answered by the `fail_outstanding` below.
+        if stopping.load(Ordering::Acquire) {
+            break;
+        }
         // Everything queued travels together, then each region that was touched is driven once.
         // That is the per-region thread's rule, applied across the regions this worker holds.
         let mut touched = BTreeSet::new();
@@ -282,7 +312,7 @@ impl Drop for DriverPool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DRIVER_WORKERS, DriverPool};
+    use super::{DRIVER_WORKERS, DriverPool, Job, PeerMsg, mpsc, run};
 
     /// Pinning is by modulo, so consecutive region ids land on consecutive workers and the
     /// mapping is the same on every open — a region that moved workers between two opens would be
@@ -325,5 +355,63 @@ mod tests {
         let pool = DriverPool::new(2).unwrap();
         pool.shutdown();
         pool.shutdown();
+    }
+
+    /// **A worker stops even when no `Job::Stop` could be queued for it.**
+    ///
+    /// `Stop` goes out with `try_send`, which fails on a full queue. That failure used to be
+    /// swallowed: the worker never got the `Stop`, the sender was still alive inside the pool so
+    /// the channel never closed, `blocking_recv` parked for ever, and `shutdown` blocked in
+    /// `join` behind it.
+    ///
+    /// Found by accident under saturation, not by looking: a `balance` test process wedged for
+    /// over an hour with `raft-driver-1` exited on its `Stop`, `raft-driver-0` parked in
+    /// `blocking_recv`, and a tokio worker thread stuck in
+    /// `Arc<DriverPool>::drop -> DriverPool::shutdown -> JoinHandle::join`. It is a production
+    /// hang and not only a test one — that is the path a `Store` shutdown takes
+    /// (`docs/plans/debt-c1.md` section 5).
+    ///
+    /// Driven at `run` rather than through the pool, because the condition is "a job was in the
+    /// queue ahead of the `Stop`" and one job in a channel of one is that condition exactly —
+    /// deterministic, where filling a 4096-deep queue against a draining worker is a race. **The
+    /// sender is deliberately kept alive**: a live sender is what stops the channel closing, and
+    /// a channel that never closes is what left the old worker parked.
+    ///
+    /// The assertion is on *termination*, so it is run on a thread with a deadline: without the
+    /// fix this hangs rather than fails, and a hanging test tells CI nothing.
+    #[test]
+    fn a_worker_stops_on_the_flag_when_no_stop_could_be_queued() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, mpsc as std_mpsc};
+        use std::time::Duration;
+
+        let (sender, inbox) = mpsc::channel(1);
+        let stopping = Arc::new(AtomicBool::new(false));
+
+        // The job that is in the way. A region this worker does not hold, which `handle` logs
+        // and ignores — what matters is that it occupies the queue, not what it is.
+        sender
+            .try_send(Job::Deliver {
+                region_id: 7,
+                message: PeerMsg::Tick,
+            })
+            .expect("the channel has room for exactly this");
+        // Now the queue is full, so a `Stop` could not be queued. This is what `shutdown` does
+        // before it offers one.
+        stopping.store(true, Ordering::Release);
+
+        let flag = Arc::clone(&stopping);
+        let (done, finished) = std_mpsc::channel();
+        std::thread::spawn(move || {
+            run(inbox, &flag);
+            let _ = done.send(());
+        });
+
+        assert!(
+            finished.recv_timeout(Duration::from_secs(30)).is_ok(),
+            "the worker never returned: a `Stop` that could not be queued left it parked in \
+             `blocking_recv`, and `shutdown` would wait for it in `join` for ever"
+        );
+        drop(sender);
     }
 }
