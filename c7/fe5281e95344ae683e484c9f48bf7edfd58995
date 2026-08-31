@@ -1,0 +1,21 @@
+crates/esker-columnar/tests/bench_scan.rs
+  s_cf8601956e2620::t_1b4710c5b7ff8b 1-271
+docs/bench/columnar-m2.md
+  s_cf8601956e2620::t_55bbec1668a87e 1-116
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "c7fe5281e95344ae683e484c9f48bf7edfd58995",
+  "prompts": {},
+  "sessions": {
+    "s_cf8601956e2620": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "732aecbc-5268-4943-836e-a49ba67b2585",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
