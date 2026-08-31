@@ -22,6 +22,7 @@ mod ddl;
 mod dml;
 mod expr;
 mod query;
+mod session;
 
 pub use ddl::{
     AlterTable, AlterTableAction, Column, CreateIndex, CreateTable, DropIndex, DropTable,
@@ -30,6 +31,7 @@ pub use ddl::{
 pub use dml::{Delete, Insert, Update};
 pub use expr::{BinaryOp, Expr, Literal};
 pub use query::{Join, Node, OrderItem, Probe, Select, SelectItem, SortKey};
+pub use session::SessionStatement;
 
 /// One statement, lowered.
 ///
@@ -63,6 +65,9 @@ pub enum Statement {
     /// `EXPLAIN`, and the statement it is about. The inner statement is planned and described,
     /// never run.
     Explain(Box<Statement>),
+    /// `SET`, `SHOW`, `RESET` — the statements that change the session rather than the store.
+    /// Run outside any transaction, because one of them replaces the transaction itself.
+    Session(SessionStatement),
 }
 
 impl Statement {
@@ -81,6 +86,28 @@ impl Statement {
                 | Statement::CreateIndex(_)
                 | Statement::DropIndex(_)
         )
+    }
+
+    /// The command PostgreSQL names when refusing this statement in a read-only transaction, or
+    /// `None` when it writes nothing.
+    ///
+    /// It is the *command*, not the tag: PostgreSQL's message is `cannot execute INSERT in a
+    /// read-only transaction`, and it names what the user typed so that one statement out of a
+    /// block can be identified. `EXPLAIN` runs nothing at all, so it is allowed either way — which
+    /// is how a user reading the past can still ask what a write *would* have done.
+    #[must_use]
+    pub fn write_command(&self) -> Option<&'static str> {
+        match self {
+            Statement::Insert(_) => Some("INSERT"),
+            Statement::Update(_) => Some("UPDATE"),
+            Statement::Delete(_) => Some("DELETE"),
+            Statement::CreateTable(_) => Some("CREATE TABLE"),
+            Statement::DropTable(_) => Some("DROP TABLE"),
+            Statement::CreateIndex(_) => Some("CREATE INDEX"),
+            Statement::DropIndex(_) => Some("DROP INDEX"),
+            Statement::AlterTable(_) => Some("ALTER TABLE"),
+            Statement::Select(_) | Statement::Explain(_) | Statement::Session(_) => None,
+        }
     }
 
     /// The command tag a successful run reports, for statements whose tag does not carry a count.
@@ -102,6 +129,7 @@ impl Statement {
             Statement::Update(_) => "UPDATE",
             Statement::Delete(_) => "DELETE",
             Statement::Explain(_) => "EXPLAIN",
+            Statement::Session(session) => session.tag(),
         }
     }
 }

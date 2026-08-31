@@ -181,4 +181,17 @@ pub enum AlterTableAction {
         /// `IF NOT EXISTS`: a column that is already there is a notice rather than a `42701`.
         if_not_exists: bool,
     },
+    /// `SET (retention = '7d' | 'forever' | DEFAULT)` — how far back this table can be read.
+    ///
+    /// A storage parameter, which is PostgreSQL's own shape for a per-table knob and one this
+    /// node needs no grammar of its own to accept. It is the travel window
+    /// (`docs/adr/0021-time-machine.md` Decision 2): how far back you can read is how far back
+    /// the collector has not yet swept, and those must be one number or the feature is a promise
+    /// the storage layer does not keep.
+    SetRetention {
+        /// Milliseconds, [`crate::catalog::RETENTION_FOREVER`] for `'forever'`, or `None` for
+        /// `DEFAULT`, which deletes the override rather than storing a zero. An absent key and a
+        /// key holding zero are different things to the collector.
+        retention_ms: Option<u64>,
+    },
 }

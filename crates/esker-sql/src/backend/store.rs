@@ -23,7 +23,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use esker_client::{Error as ClientError, Transaction, TxnClient};
+use esker_client::{Error as ClientError, TimestampOracle, Transaction, TxnClient};
 
 use crate::backend::{Backend, Txn};
 use crate::error::{Result, SqlError};
@@ -32,14 +32,19 @@ use crate::error::{Result, SqlError};
 #[derive(Debug)]
 pub struct StoreBackend {
     client: Arc<TxnClient>,
+    oracle: Arc<dyn TimestampOracle>,
 }
 
 impl StoreBackend {
     /// A backend over a client. One per SQL node, shared by every session — the client holds the
     /// region cache, and a cache warmed by one session is warm for all of them.
+    ///
+    /// The oracle is passed alongside rather than reached through the client because the caller
+    /// already built one to construct the client, and because a timestamp is the *only* thing
+    /// this crate wants from it (`CLAUDE.md` invariant 6: never a wall clock).
     #[must_use]
-    pub fn new(client: Arc<TxnClient>) -> Self {
-        StoreBackend { client }
+    pub fn new(client: Arc<TxnClient>, oracle: Arc<dyn TimestampOracle>) -> Self {
+        StoreBackend { client, oracle }
     }
 }
 
@@ -48,6 +53,30 @@ impl Backend for StoreBackend {
         Ok(Box::new(StoreTxn {
             inner: Some(self.client.begin().map_err(translate)?),
         }))
+    }
+
+    /// **The one stub in this crate, and it refuses rather than approximates.**
+    ///
+    /// ADR 0021 Decision 1 makes this three lines — `TxnClient::begin_at(start_ts)`, which is
+    /// `begin` with the timestamp handed in — and that constructor is another lane's and does not
+    /// exist yet (`docs/plans/phase-6d.md` §3). Until it does, a historical read against a real
+    /// cluster is `0A000` **naming what is missing**.
+    ///
+    /// Reading the present instead would be the defect this crate's lowering exists to prevent: a
+    /// user asks for an hour ago, gets now, and nothing tells them. `MemoryBackend` implements the
+    /// real behaviour, so the feature above this line is fully tested either way.
+    fn begin_at(&self, _start_ts: u64) -> Result<Box<dyn Txn>> {
+        // TODO(phase-6d): `Ok(Box::new(StoreTxn { inner: Some(self.client.begin_at(start_ts)?) }))`
+        // once `esker-client` has the constructor. Nothing else here changes.
+        Err(SqlError::FeatureNotSupported(
+            "reading as of a past timestamp against a real store".to_owned(),
+        ))
+    }
+
+    fn now(&self) -> Result<u64> {
+        self.oracle
+            .timestamp()
+            .map_err(|error| SqlError::StoreUnavailable(error.to_string()))
     }
 }
 

@@ -222,8 +222,50 @@ Written before the code, and each is one of the kinds `DESIGN.md` §11 requires 
 
 ## 8. Progress
 
-(one line per unit as it lands)
+- [x] 1 — **the historical read, its bound and the retention DDL.** `SET esker.read_as_of`
+  (`SET LOCAL`, `SHOW`, `RESET`, `= DEFAULT`), `SET TRANSACTION SNAPSHOT` with all five
+  preconditions in PostgreSQL's measured precedence, the three refusals, and
+  `ALTER TABLE ... SET (retention = ...)`. 21 new tests plus 11 corpus statements; `begin_at` on
+  `StoreBackend` refuses by name, asserted against a real three-store cluster.
+- [ ] 2 — checkpoints
+- [ ] 3 — `DIFF`
+- [ ] 4 — the tests, and where PostgreSQL parity ends
 
 ## 9. What changed from this plan
 
-(and why)
+**A `CountingOracle` has no wall clock, so an instant means nothing against one.** The largest thing
+the build found, and it is a property of the system rather than a defect. `esker_pd::tso` composes
+`ts = physical_ms << 18 | logical` from a real clock, so `SET esker.read_as_of = '2026-08-30
+14:00:00+00'` means what it says against PD. `CountingOracle` — which `src/bin/esker-sql.rs`'s
+`connect()` still builds under a `TODO(phase-6a)`, and which every test cluster uses — is a pure
+counter, so the physical half of every timestamp it hands out is zero: every version sits inside the
+first millisecond of 1970 and no instant distinguishes two of them.
+
+This is *why the snapshot token exists*, and it changed the test plan rather than the design. A
+token carries a `start_ts` directly and needs no clock, so `SET TRANSACTION SNAPSHOT` works against
+any oracle today; the GUC's instant form starts meaning something the moment this node takes its
+timestamps from PD. `tests/real_backend.rs` uses the token form for exactly this reason and says so.
+
+**The fake's clock was wrong in a way that would have made the tests prove nothing.**
+`MemoryBackend`'s clock was a counter starting at zero, which is the same defect: every version in
+the first millisecond of 1970. A test written against it would have passed on data no cluster
+produces. It now starts at a plausible instant and advances the *logical* half per commit, with
+`MemoryBackend::advance_ms` for a test that needs its versions in different milliseconds — which is
+what a read *as of an instant* requires, because that timestamp has its logical bits zeroed by
+design.
+
+**ADR 0021's `42704` for a bad snapshot id was half the answer.** A second capture found two
+conditions where the ADR named one: `22023 invalid snapshot identifier` for a string that cannot be
+an identifier, `42704 snapshot "..." does not exist` for one that is well formed and absent. The
+ADR is corrected.
+
+**A failed `SET` must not leave its setting applied.** Found while wiring the stub: the first
+version assigned `read_as_of` and *then* reopened the transaction, so a `SET` refused by the backend
+left the session holding a snapshot the node had already refused — poisoning every later statement
+after the user had been told the `SET` did not work. `Executor::move_to` now applies the setting
+only when the move succeeds.
+
+**Two test harnesses sent `BEGIN` through `execute`**, where it is `0A000 BEGIN is not supported`:
+transaction control belongs to `pgwire::session` and reaches the executor as a call. Neither
+harness had needed a block before. Both now route it the way the session does, which is what makes
+`SET TRANSACTION SNAPSHOT`'s in-a-block preconditions testable at all.

@@ -64,7 +64,10 @@ async fn main() -> std::io::Result<()> {
         Arc::new(MemoryBackend::new())
     } else {
         tracing::info!(stores = ?stores, "connecting to the cluster");
-        Arc::new(StoreBackend::new(Arc::new(connect(&stores)?)))
+        {
+            let (client, oracle) = connect(&stores)?;
+            Arc::new(StoreBackend::new(Arc::new(client), oracle))
+        }
     };
     let sessions = Sessions {
         backend,
@@ -77,7 +80,15 @@ async fn main() -> std::io::Result<()> {
 ///
 /// `TODO(phase-6a)`: the routing table comes from PD once this node speaks to it; until then a
 /// node started against real stores is told about them on the command line.
-fn connect(stores: &[String]) -> std::io::Result<esker_client::TxnClient> {
+/// The oracle comes back beside the client because the backend needs a timestamp of its own — the
+/// bound on a historical read is "not in the future", and the future is what the oracle says it is
+/// (`CLAUDE.md` invariant 6).
+fn connect(
+    stores: &[String],
+) -> std::io::Result<(
+    esker_client::TxnClient,
+    Arc<dyn esker_client::TimestampOracle>,
+)> {
     use esker_proto::transport::TransportConfig;
 
     let addresses: Vec<std::net::SocketAddr> = stores
@@ -99,8 +110,10 @@ fn connect(stores: &[String]) -> std::io::Result<esker_client::TxnClient> {
     let store_ids = transport.store_ids();
     let resolver = Arc::new(esker_client::StaticRegion::replicated(1, &store_ids));
     let router = esker_client::Router::new(Arc::new(transport), resolver);
-    Ok(esker_client::TxnClient::on_router(
-        Arc::new(router),
-        Arc::new(esker_client::CountingOracle::starting_at(1)),
+    let oracle: Arc<dyn esker_client::TimestampOracle> =
+        Arc::new(esker_client::CountingOracle::starting_at(1));
+    Ok((
+        esker_client::TxnClient::on_router(Arc::new(router), Arc::clone(&oracle)),
+        oracle,
     ))
 }

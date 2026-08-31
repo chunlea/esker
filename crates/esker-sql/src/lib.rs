@@ -52,6 +52,7 @@ pub mod pgwire;
 pub mod plan;
 pub mod row;
 pub mod sqlstate;
+pub mod time_machine;
 pub mod value;
 
 pub use error::{Result, Severity, SqlError};

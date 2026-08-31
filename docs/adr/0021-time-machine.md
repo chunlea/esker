@@ -1,10 +1,10 @@
 # 0021 — The time machine
 
-Status: **design, with one piece built.** The catalog records for retention exist and are
-golden-tested (`crates/esker-sql/src/catalog/`, §4 below) because the garbage collector consumes
-them and a format cannot wait for the feature on top of it. Everything else here is design: no
-historical reads, no `DIFF`, no `FLASHBACK`. The milestone is `docs/plans/phase-6a.md` §12. See
-`docs/txn-spec.md` §7, `docs/DESIGN.md` §8, [ADR 0020](0020-online-schema-change.md).
+Status: **being built.** Decision 1 (the historical read, its bound and the retention DDL) and
+Decision 4's records are implemented in `esker-sql`; the checkpoint verbs and `DIFF` are in
+progress and `FLASHBACK` is deliberately not. The plan is `docs/plans/phase-6d.md`, the milestone
+is `docs/plans/phase-6a.md` §12. See `docs/txn-spec.md` §7, `docs/DESIGN.md` §8,
+[ADR 0020](0020-online-schema-change.md).
 
 ## Context
 
@@ -85,7 +85,12 @@ from the server rather than recalled, and every one of them is a rule we want an
   already read at it;
 * under `READ COMMITTED`: the same `0A000`. Percolator gives snapshot isolation, which is
   PostgreSQL's `REPEATABLE READ`, so the precondition is one this node satisfies by construction;
-* an id that is not there: `ERROR 42704 snapshot "..." does not exist`.
+* an id that is not there: `ERROR 42704 snapshot "..." does not exist` — and, **corrected by a
+  second capture while unit 1 was built**, a string that cannot be an identifier at all is a
+  *different* condition: `ERROR 22023 invalid snapshot identifier: "nope"`. PostgreSQL has two
+  answers here and the distinction is real; the first draft of this ADR had only one. Measured
+  precedence, which the implementation follows: block-check → isolation-check → before-any-query →
+  malformed id → absent id.
 
 So the *whole* error surface of the feature is PostgreSQL's, already, including the one about
 calling it too late — which is a rule an invented syntax would have had to discover the hard way.
@@ -269,7 +274,22 @@ the unit that builds the rest, and it lands with `AS OF` rather than ahead of it
 * **`esker-sql`** — the surface: `SET TRANSACTION SNAPSHOT` and the `esker.read_as_of` GUC (neither
   of which needs a parser change), the retention DDL, the checkpoint record and its export function,
   `DIFF` as a two-cursor merge over the existing scan, and `FLASHBACK` as a batched compensating
-  transaction.
+  transaction. **Built from `docs/plans/phase-6d.md`**; the GUC, the snapshot import, the three
+  refusals and the retention DDL are unit 1.
+
+## One thing this design assumed and the build found
+
+**A read timestamp built from a wall-clock instant is only as good as the oracle's physical half.**
+`esker_pd::tso` composes `ts = physical_ms << 18 | logical` from a real clock, so `SET
+esker.read_as_of = '2026-08-30 14:00:00+00'` means what it says against PD. `CountingOracle` — what
+`esker-sql`'s `connect()` still builds, and what every test cluster uses — is a pure counter, so the
+physical half of every timestamp it hands out is zero: every version sits inside the first
+millisecond of 1970 and no instant a user could name distinguishes two of them.
+
+That is not a defect in either piece, and it is *why the snapshot token exists*. A token carries a
+`start_ts` directly and needs no clock, so `SET TRANSACTION SNAPSHOT` works against any oracle,
+while the GUC's instant form starts meaning something the moment this node takes its timestamps
+from PD. Both halves of the surface are built; only one of them depends on the wiring.
 * **`esker-proto`** — one field on the GC safepoint message, and nothing else.
 
 ## The one thing this shares with ADR 0020

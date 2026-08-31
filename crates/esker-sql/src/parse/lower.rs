@@ -28,6 +28,7 @@ use crate::catalog::fold_identifier;
 use crate::error::{Result, SqlError};
 use crate::parse::{Parsed, feature_name};
 use crate::plan;
+use crate::time_machine;
 use crate::value::ColumnType;
 
 impl Parsed {
@@ -99,8 +100,217 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
                 statement,
             )?)))
         }
+        Statement::Set(set) => lower_set(set),
+        Statement::ShowVariable { variable } => lower_show(variable),
+        Statement::Reset(reset) => lower_reset(reset),
         other => Err(SqlError::unsupported(feature_name(other))),
     }
+}
+
+/// `SET`, of which this node executes two spellings and refuses the rest by name.
+///
+/// The two are PostgreSQL's own (`docs/plans/phase-6d.md` §1): a namespaced custom GUC, which a
+/// real server accepts and stores, and `SET TRANSACTION SNAPSHOT`, which a real server *acts* on
+/// and whose every precondition is one this feature wants anyway.
+fn lower_set(set: &sqlparser::ast::Set) -> Result<plan::Statement> {
+    use sqlparser::ast::{ContextModifier, Set};
+
+    match set {
+        Set::SingleAssignment {
+            scope,
+            hivevar,
+            variable,
+            values,
+        } if guc_name(variable).as_deref() == Some(time_machine::READ_AS_OF) => {
+            refuse_if(*hivevar, "SET HIVEVAR")?;
+            let [value] = values.as_slice() else {
+                // PostgreSQL takes a list for some parameters. Not for this one, and a list
+                // silently taking its first element would honour something nobody wrote.
+                return Err(SqlError::unsupported(
+                    "a list of values for esker.read_as_of",
+                ));
+            };
+            Ok(plan::Statement::Session(
+                plan::SessionStatement::SetReadAsOf {
+                    value: guc_value(value),
+                    local: matches!(scope, Some(ContextModifier::Local)),
+                },
+            ))
+        }
+        Set::SetTransaction {
+            modes,
+            snapshot: Some(snapshot),
+            session,
+        } => {
+            refuse_if(*session, "SET SESSION CHARACTERISTICS ... SNAPSHOT")?;
+            // PostgreSQL's grammar admits both in one statement; nothing here reads the modes,
+            // and a mode silently dropped is a mode the user asked for and did not get.
+            refuse_if(!modes.is_empty(), "SET TRANSACTION SNAPSHOT with modes")?;
+            let Value::SingleQuotedString(id) = &snapshot.value else {
+                return Err(SqlError::InvalidSnapshotIdentifier(snapshot.to_string()));
+            };
+            Ok(plan::Statement::Session(
+                plan::SessionStatement::SetSnapshot(id.clone()),
+            ))
+        }
+        other => Err(SqlError::unsupported(set_feature_name(other))),
+    }
+}
+
+/// `SHOW <parameter>`. Only the one this node has; every other name is PostgreSQL's `42704`.
+///
+/// A `SHOW` of an unknown parameter is *not* contract C2's `0A000`: the statement is one this node
+/// executes, and what is missing is the parameter, which is the condition PostgreSQL reports.
+fn lower_show(variable: &[Ident]) -> Result<plan::Statement> {
+    // `SHOW esker.read_as_of` arrives as two idents, because the parser splits on the dot.
+    let name = variable
+        .iter()
+        .map(|ident| ident.value.as_str())
+        .collect::<Vec<_>>()
+        .join(".");
+    if name.eq_ignore_ascii_case(time_machine::READ_AS_OF) {
+        return Ok(plan::Statement::Session(
+            plan::SessionStatement::ShowReadAsOf,
+        ));
+    }
+    if name.is_empty() || name.eq_ignore_ascii_case("ALL") {
+        return Err(SqlError::unsupported("SHOW ALL"));
+    }
+    Err(SqlError::UnrecognizedParameter(name))
+}
+
+/// `RESET <parameter>` — `SET <parameter> = DEFAULT` by another name, and PostgreSQL treats them
+/// as the same operation.
+fn lower_reset(reset: &sqlparser::ast::ResetStatement) -> Result<plan::Statement> {
+    use sqlparser::ast::Reset;
+
+    match &reset.reset {
+        Reset::ConfigurationParameter(name)
+            if guc_name(name).as_deref() == Some(time_machine::READ_AS_OF) =>
+        {
+            Ok(plan::Statement::Session(
+                plan::SessionStatement::SetReadAsOf {
+                    value: None,
+                    local: false,
+                },
+            ))
+        }
+        Reset::ALL => Err(SqlError::unsupported("RESET ALL")),
+        // Named with `guc_name` rather than `object_name`: a parameter is not a relation, so a
+        // qualified one must not be refused as "a qualified name". `esker.no_such_thing` is a
+        // parameter this node does not have, which is `42704` and not a feature gap.
+        Reset::ConfigurationParameter(name) => Err(SqlError::UnrecognizedParameter(
+            guc_name(name).unwrap_or_else(|| name.to_string()),
+        )),
+    }
+}
+
+/// A parameter name as PostgreSQL spells it, lower-cased: GUC names are case-insensitive, and a
+/// namespaced one arrives as two parts.
+fn guc_name(name: &ObjectName) -> Option<String> {
+    let joined = name
+        .0
+        .iter()
+        .map(|part| part.as_ident().map(|ident| ident.value.as_str()))
+        .collect::<Option<Vec<_>>>()?
+        .join(".");
+    Some(joined.to_ascii_lowercase())
+}
+
+/// The text a `SET` assigns, or `None` for `DEFAULT`.
+///
+/// A bare identifier that is not `DEFAULT` is a value PostgreSQL would take unquoted; taking it
+/// here keeps `SET esker.read_as_of TO now` from being a syntax-shaped surprise, and the value
+/// grammar refuses it with `22023` a moment later, which is the right condition for it.
+fn guc_value(value: &Expr) -> Option<String> {
+    match value {
+        Expr::Identifier(ident) if ident.value.eq_ignore_ascii_case("DEFAULT") => None,
+        Expr::Identifier(ident) => Some(ident.value.clone()),
+        Expr::Value(value) => match &value.value {
+            Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => Some(text.clone()),
+            other => Some(other.to_string()),
+        },
+        other => Some(other.to_string()),
+    }
+}
+
+/// The feature name for a `SET` this node does not execute.
+///
+/// Rendered from the statement rather than from the AST variant, so a user is told the construct
+/// they wrote — and a *named* parameter is named, because "SET is not supported" tells somebody
+/// who set `search_path` nothing about which of their statements to remove.
+fn set_feature_name(set: &sqlparser::ast::Set) -> String {
+    use sqlparser::ast::Set;
+
+    match set {
+        Set::SingleAssignment { variable, .. } => match guc_name(variable) {
+            Some(name) => format!("SET {name}"),
+            None => "SET".to_owned(),
+        },
+        Set::SetTransaction { .. } => "SET TRANSACTION".to_owned(),
+        other => feature_name(&Statement::Set(other.clone())),
+    }
+}
+
+/// `ALTER TABLE t SET (<parameter> = <value>)`, of which this node has exactly one.
+///
+/// PostgreSQL's storage-parameter syntax, which is where a per-table knob belongs and which needs
+/// no grammar of our own. Every parameter but `retention` is `0A000` **naming the parameter**: a
+/// user who wrote `fillfactor` is told about `fillfactor`, not about `ALTER TABLE`.
+fn lower_storage_parameters(
+    options: &[sqlparser::ast::SqlOption],
+) -> Result<plan::AlterTableAction> {
+    use sqlparser::ast::SqlOption;
+
+    let [SqlOption::KeyValue { key, value }] = options else {
+        // More than one at a time would have to be applied atomically or not at all, and there is
+        // only one parameter to combine it with.
+        return Err(SqlError::unsupported(
+            "ALTER TABLE ... SET with more than one storage parameter",
+        ));
+    };
+    if !key.value.eq_ignore_ascii_case("retention") {
+        return Err(SqlError::unsupported(format!(
+            "the storage parameter {}",
+            key.value
+        )));
+    }
+    Ok(plan::AlterTableAction::SetRetention {
+        retention_ms: lower_retention(value)?,
+    })
+}
+
+/// A retention value: an interval, `'forever'`, or `DEFAULT`.
+///
+/// The same interval grammar the read timestamp uses, because they are the same kind of quantity
+/// and a user who learned `'-1h'` for one should not have to learn a second spelling for the
+/// other. A retention is a *distance* and so is written without a sign; `'forever'` is the
+/// sentinel and `DEFAULT` deletes the override, which is not the same as storing a zero.
+fn lower_retention(value: &Expr) -> Result<Option<u64>> {
+    let text = match value {
+        Expr::Identifier(ident) if ident.value.eq_ignore_ascii_case("DEFAULT") => return Ok(None),
+        Expr::Identifier(ident) => ident.value.clone(),
+        Expr::Value(value) => match &value.value {
+            Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => text.clone(),
+            // A bare number is milliseconds, which is the unit the record stores. Read here
+            // rather than handed to the interval grammar, which requires a unit on purpose:
+            // `'7'` with no unit is ambiguous and `7` alone is not.
+            Value::Number(digits, _) => {
+                return digits.parse::<u64>().map(Some).map_err(|_| {
+                    SqlError::InvalidParameterValue {
+                        name: "retention",
+                        value: digits.clone(),
+                    }
+                });
+            }
+            other => other.to_string(),
+        },
+        other => other.to_string(),
+    };
+    if text.eq_ignore_ascii_case("forever") {
+        return Ok(Some(crate::catalog::RETENTION_FOREVER));
+    }
+    time_machine::retention_ms(&text).map(Some)
 }
 
 fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::CreateTable> {
@@ -226,6 +436,10 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
 
     let mut actions = Vec::with_capacity(alter.operations.len());
     for operation in &alter.operations {
+        if let AlterTableOperation::SetOptionsParens { options } = operation {
+            actions.push(lower_storage_parameters(options)?);
+            continue;
+        }
         let AlterTableOperation::AddColumn {
             column_keyword: _,
             if_not_exists,

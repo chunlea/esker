@@ -39,6 +39,7 @@ use crate::parse::Parsed;
 use crate::pgwire::message::FieldDescription;
 use crate::pgwire::session::{Described, Execute, Outcome, Params};
 use crate::plan::Statement;
+use crate::time_machine;
 use crate::value::ColumnType;
 
 /// Runs statements for one connection.
@@ -63,6 +64,30 @@ pub struct Executor {
     /// rather than from the shared cache: they answer with its own uncommitted definitions, which
     /// must not reach the other sessions on this node (`crate::catalog`).
     catalog_written: bool,
+    /// The snapshot this session reads at, when it is not reading the present.
+    read_as_of: Option<ReadAsOf>,
+    /// Whether the open transaction has run a statement.
+    ///
+    /// `SET TRANSACTION SNAPSHOT` may only be called before any query in the block, which is
+    /// PostgreSQL's rule and exactly the right one: a `start_ts` cannot change under a transaction
+    /// that has already read at it.
+    open_used: bool,
+}
+
+/// What a session was told to read at, and what it was told in.
+#[derive(Debug, Clone)]
+struct ReadAsOf {
+    /// The resolved snapshot.
+    start_ts: u64,
+    /// What the user wrote, for `SHOW` to hand back. PostgreSQL echoes the text of a `SET`, not
+    /// what the server made of it, and a user who wrote `-1h` is better served by `-1h` than by
+    /// the instant it became.
+    text: String,
+    /// Retention as it was when this was set, so the window can be recomputed against a `now`
+    /// that has moved on without a round trip per statement (`crate::time_machine::Window`).
+    retention_ms: u64,
+    /// `SET LOCAL`: undone when the transaction ends, whichever way it ends.
+    local: bool,
 }
 
 impl Executor {
@@ -78,7 +103,25 @@ impl Executor {
             notices: Vec::new(),
             row_ids: std::collections::BTreeMap::new(),
             catalog_written: false,
+            read_as_of: None,
+            open_used: false,
         }
+    }
+
+    /// Opens a transaction at whatever snapshot this session reads at.
+    ///
+    /// The one place `begin` and `begin_at` are chosen between, so that no statement can be
+    /// written in a way that reads the present by accident. The window is checked **here** rather
+    /// than only where it was set: retention moves the floor forward under a session that set
+    /// `esker.read_as_of` an hour ago, and a snapshot that has fallen out of the window must stop
+    /// answering rather than answer approximately.
+    fn open_txn(&self) -> Result<Box<dyn Txn>> {
+        let Some(as_of) = &self.read_as_of else {
+            return self.backend.begin();
+        };
+        let now = self.backend.now()?;
+        time_machine::Window::new(now, as_of.retention_ms).admits(as_of.start_ts)?;
+        self.backend.begin_at(as_of.start_ts)
     }
 
     /// Runs `statement` in the open transaction, or in one of its own that is committed on success
@@ -94,7 +137,7 @@ impl Executor {
             return outcome;
         }
 
-        let mut txn = self.backend.begin()?;
+        let mut txn = self.open_txn()?;
         self.catalog_written = false;
         let mut written = Written::default();
         let bound = match self.bound(&*txn, statement, params) {
@@ -126,6 +169,14 @@ impl Executor {
         statement: &Statement,
         written: &mut Written,
     ) -> Result<Outcome> {
+        // A write at a past snapshot is refused *here*, before anything is planned. It cannot be
+        // caught later: `Txn::put` is buffered and returns nothing, so a write in a read-only
+        // transaction would be dropped in silence and the statement would report success.
+        if txn.is_read_only()
+            && let Some(command) = statement.write_command()
+        {
+            return Err(SqlError::ReadOnlyTransaction(command));
+        }
         // Before the statement rather than after it: a DDL statement that fails part-way has
         // still written, and the reads it makes on the way are its own uncommitted catalog.
         self.catalog_written |= statement.writes_catalog();
@@ -140,6 +191,166 @@ impl Executor {
             Statement::Update(update) => dml::update(self, txn, update, written),
             Statement::Delete(delete) => dml::delete(self, txn, delete),
             Statement::Explain(inner) => self.explain(txn, inner),
+            // Handled before a transaction is opened; `execute` never routes one here.
+            Statement::Session(_) => Err(SqlError::Internal(
+                "a session statement reached the transaction path".into(),
+            )),
+        }
+    }
+
+    /// `SET`, `SHOW` and `RESET`, which run outside any transaction the client opened.
+    ///
+    /// Outside, because one of them *replaces* that transaction: `SET TRANSACTION SNAPSHOT` moves
+    /// the block's `start_ts`, and a block that had already read at the old one cannot have it
+    /// changed underneath — which is exactly the rule PostgreSQL enforces with `25001`.
+    fn session_statement(&mut self, statement: &crate::plan::SessionStatement) -> Result<Outcome> {
+        use crate::plan::SessionStatement;
+
+        match statement {
+            SessionStatement::SetReadAsOf { value, local } => {
+                self.set_read_as_of(value.as_deref(), *local)?;
+                Ok(Outcome::done("SET"))
+            }
+            SessionStatement::ShowReadAsOf => Ok(Outcome::Rows {
+                fields: vec![FieldDescription::computed(
+                    time_machine::READ_AS_OF,
+                    ColumnType::Text,
+                )],
+                // Unset reads back as the empty string rather than as an error, which is what a
+                // real server does for a custom GUC that has been set and then reset. It diverges
+                // from PostgreSQL only for a parameter that was *never* set, where a real server
+                // answers `42704` because it has never heard of it and this node always has.
+                rows: vec![vec![Some(
+                    self.read_as_of
+                        .as_ref()
+                        .map(|as_of| as_of.text.clone())
+                        .unwrap_or_default()
+                        .into_bytes(),
+                )]],
+                tag: "SHOW".to_owned(),
+            }),
+            SessionStatement::SetSnapshot(id) => {
+                self.set_snapshot(id)?;
+                Ok(Outcome::done("SET"))
+            }
+        }
+    }
+
+    /// `SET esker.read_as_of = '...'`, resolved once and checked against the window.
+    fn set_read_as_of(&mut self, value: Option<&str>, local: bool) -> Result<()> {
+        let Some(text) = value else {
+            return self.move_to(None);
+        };
+        let now = self.backend.now()?;
+        let start_ts = time_machine::resolve(text, now)?;
+        // One transaction to read the retention the window is computed from. It is a rare
+        // statement and a single point read; every *later* statement recomputes the window from
+        // the number cached here and a fresh `now`, so the check costs nothing per query.
+        let retention_ms = self.cluster_retention()?;
+        time_machine::Window::new(now, retention_ms).admits(start_ts)?;
+        self.move_to(Some(ReadAsOf {
+            start_ts,
+            text: text.to_owned(),
+            retention_ms,
+            local,
+        }))
+    }
+
+    /// `SET TRANSACTION SNAPSHOT '<id>'`, with PostgreSQL's preconditions in PostgreSQL's order.
+    ///
+    /// Every one of them was captured off a real server (`docs/plans/phase-6d.md` §2), and every
+    /// one is a rule this feature wants anyway. The isolation-level check is the exception that
+    /// proves it: Percolator gives snapshot isolation, which is PostgreSQL's `REPEATABLE READ`, so
+    /// inside a block the precondition holds by construction and is never raised.
+    fn set_snapshot(&mut self, id: &str) -> Result<()> {
+        if self.open.is_none() {
+            // Both, in this order. PostgreSQL warns that the statement is out of place and *then*
+            // fails it for the second reason, and a client that only saw one of the two would be
+            // told half of what a real server says.
+            self.notice(SqlError::SetTransactionOutsideBlock);
+            return Err(SqlError::SnapshotIsolationRequired);
+        }
+        if self.open_used {
+            return Err(SqlError::SnapshotAfterQuery);
+        }
+
+        let start_ts = match time_machine::parse_snapshot_id(id)? {
+            time_machine::SnapshotId::Timestamp(start_ts) => start_ts,
+            // TODO(phase-6d unit 2): look the name up in the catalog's checkpoint records. Until
+            // they exist, a name is a snapshot that is not there — which is the same answer a real
+            // server gives for an id it does not hold, and the same one a dropped checkpoint will
+            // get afterwards.
+            time_machine::SnapshotId::Checkpoint(name) => {
+                return Err(SqlError::SnapshotDoesNotExist(name));
+            }
+        };
+        let now = self.backend.now()?;
+        let retention_ms = self.cluster_retention()?;
+        time_machine::Window::new(now, retention_ms).admits(start_ts)?;
+        self.move_to(Some(ReadAsOf {
+            start_ts,
+            text: id.to_owned(),
+            retention_ms,
+            // A snapshot is imported into *this* transaction, so it ends with it.
+            local: true,
+        }))
+    }
+
+    /// Moves the session to a snapshot, reopening the block's transaction there.
+    ///
+    /// **The setting is applied only if the move succeeds**, which is why the new value is passed
+    /// in rather than assigned by the caller. A `SET` that failed must leave the session where it
+    /// was: applying it anyway would poison every later statement with a snapshot the node had
+    /// already refused, and the user would have been told the `SET` did not work.
+    ///
+    /// Reopening is only reachable before the block has read anything — every caller checks — so
+    /// the transaction being discarded has done nothing and rolling it back loses no work. That is
+    /// what makes the eager `BEGIN` in [`Execute::begin`] compatible with changing the snapshot
+    /// afterwards, and it is why PostgreSQL's "before any query" rule is what makes this safe
+    /// rather than merely tidy.
+    fn move_to(&mut self, as_of: Option<ReadAsOf>) -> Result<()> {
+        let previous = std::mem::replace(&mut self.read_as_of, as_of);
+        let Some(txn) = self.open.take() else {
+            return Ok(());
+        };
+        let _ = txn.rollback();
+        match self.open_txn() {
+            Ok(reopened) => {
+                self.open = Some(reopened);
+                Ok(())
+            }
+            Err(error) => {
+                // The block is over either way — its transaction is gone and the session will see
+                // the error and mark it failed — but the *setting* must not survive a refusal.
+                self.read_as_of = previous;
+                Err(error)
+            }
+        }
+    }
+
+    /// The cluster's default retention, which is the travel window
+    /// (`docs/adr/0021-time-machine.md` Decision 2).
+    ///
+    /// Read in a transaction of its own, at the present: the record says how far back the
+    /// collector has *not yet swept*, which is a fact about now and not about the snapshot being
+    /// asked for.
+    fn cluster_retention(&self) -> Result<u64> {
+        let txn = self.backend.begin()?;
+        let retention = crate::catalog::default_retention(&*txn);
+        let _ = txn.rollback();
+        retention
+    }
+
+    /// What a `COMMIT` or a `ROLLBACK` undoes besides the writes.
+    ///
+    /// `SET LOCAL` is scoped to the transaction and PostgreSQL undoes it whichever way the block
+    /// ends — including a `ROLLBACK`, which is the case that is easy to miss and the one a failed
+    /// block takes. An imported snapshot is local by the same rule: it was imported into *this*
+    /// transaction.
+    fn end_of_block(&mut self) {
+        self.open_used = false;
+        if self.read_as_of.as_ref().is_some_and(|as_of| as_of.local) {
+            self.read_as_of = None;
         }
     }
 
@@ -429,12 +640,21 @@ fn explain_lines(statement: &Statement) -> Vec<String> {
         // `EXPLAIN EXPLAIN ...` is not something PostgreSQL's grammar admits, so this is
         // unreachable through the parser and is written as a value rather than a panic anyway.
         Statement::Explain(_) => vec!["Explain".to_owned()],
+        // `EXPLAIN SET ...` is not PostgreSQL's grammar either, and a session statement has no
+        // plan to print: it touches no table and reads no row.
+        Statement::Session(session) => vec![session.tag().to_owned()],
     }
 }
 
 impl Execute for Executor {
     fn execute(&mut self, parsed: &Parsed, params: &Params<'_>) -> Result<Outcome> {
         let statement = parsed.lower()?;
+        if let Statement::Session(session) = &statement {
+            return self.session_statement(session);
+        }
+        // After the session statements, because `SET TRANSACTION SNAPSHOT` is the one thing a
+        // block may run before it counts as having read anything.
+        self.open_used = true;
         self.in_a_transaction(statement, params)
     }
 
@@ -442,8 +662,9 @@ impl Execute for Executor {
         let statement = parsed.lower()?;
         // Describing takes a transaction of its own, because typing the parameters needs the
         // catalog and the catalog is data like any other. It writes nothing, so it costs a
-        // snapshot and no conflict.
-        let txn = self.backend.begin()?;
+        // snapshot and no conflict — and it takes the *session's* snapshot, so that a statement
+        // prepared under `esker.read_as_of` is described against the schema it will run on.
+        let txn = self.open_txn()?;
         let tables = self.tables_for(&*txn, &statement)?;
         let types = bind::infer(&statement, &tables, declared);
         let parameters = types.iter().copied().map(ColumnType::oid).collect();
@@ -482,7 +703,8 @@ impl Execute for Executor {
     fn begin(&mut self) -> Result<()> {
         // A second `BEGIN` never reaches here: the session answers it with PostgreSQL's warning
         // and leaves the block alone.
-        self.open = Some(self.backend.begin()?);
+        self.open = Some(self.open_txn()?);
+        self.open_used = false;
         self.written = Written::default();
         self.catalog_written = false;
         Ok(())
@@ -491,6 +713,7 @@ impl Execute for Executor {
     fn commit(&mut self) -> Result<()> {
         let written = std::mem::take(&mut self.written);
         self.catalog_written = false;
+        self.end_of_block();
         let Some(txn) = self.open.take() else {
             return Ok(());
         };
@@ -505,6 +728,7 @@ impl Execute for Executor {
     fn rollback(&mut self) -> Result<()> {
         self.written = Written::default();
         self.catalog_written = false;
+        self.end_of_block();
         let Some(txn) = self.open.take() else {
             return Ok(());
         };

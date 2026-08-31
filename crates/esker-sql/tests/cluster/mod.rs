@@ -41,11 +41,12 @@ use std::sync::Arc;
 use bytes::Bytes;
 use esker_client::region_cache::{RegionResolver, RegionTable, Route};
 use esker_client::router::{ClientOptions, Router};
-use esker_client::{CountingOracle, TcpStores, TxnClient};
+use esker_client::{CountingOracle, TcpStores, TimestampOracle, TxnClient};
 use esker_proto::{Epoch, Peer, Region, ServerHandle, TransportConfig};
 use esker_sql::backend::{Backend, StoreBackend};
 use esker_sql::catalog::Catalog;
 use esker_sql::exec::Executor;
+use esker_sql::parse::StatementClass;
 use esker_sql::pgwire::session::{Execute, Outcome, Params};
 use esker_store::{Store, StoreOptions, StoreService};
 
@@ -150,15 +151,13 @@ impl Cluster {
                 ..ClientOptions::default()
             },
         );
-        let client = TxnClient::on_router(
-            Arc::new(router),
-            // Starting well above zero so that a timestamp is never mistaken for an absent one.
-            Arc::new(CountingOracle::starting_at(1_000)),
-        );
+        // Starting well above zero so that a timestamp is never mistaken for an absent one.
+        let oracle: Arc<dyn TimestampOracle> = Arc::new(CountingOracle::starting_at(1_000));
+        let client = TxnClient::on_router(Arc::new(router), Arc::clone(&oracle));
 
         let (handles, dirs) = started.into_iter().unzip();
         Cluster {
-            backend: Arc::new(StoreBackend::new(Arc::new(client))),
+            backend: Arc::new(StoreBackend::new(Arc::new(client), oracle)),
             catalog: Arc::new(Catalog::new()),
             _handles: handles,
             _dirs: dirs,
@@ -182,10 +181,29 @@ pub struct Session {
 
 impl Session {
     /// Runs every statement in the string, stopping at the first failure, as a session would.
+    ///
+    /// Transaction control goes to the executor's own `begin`/`commit`/`rollback` rather than to
+    /// `execute`, because that is where `esker_sql::pgwire::session` sends it: `BEGIN` moves the
+    /// status a client sees in every `ReadyForQuery`, so it belongs to the session and reaches the
+    /// executor as a call and not as a statement.
     pub fn run(&mut self, sql: &str) -> esker_sql::Result<Outcome> {
         let mut last = Outcome::done("");
         for parsed in esker_sql::parse::parse_statements(sql)? {
-            last = self.executor.execute(&parsed, &Params::NONE)?;
+            last = match parsed.class() {
+                StatementClass::Begin => {
+                    self.executor.begin()?;
+                    Outcome::done("BEGIN")
+                }
+                StatementClass::Commit => {
+                    self.executor.commit()?;
+                    Outcome::done("COMMIT")
+                }
+                StatementClass::Rollback => {
+                    self.executor.rollback()?;
+                    Outcome::done("ROLLBACK")
+                }
+                _ => self.executor.execute(&parsed, &Params::NONE)?,
+            };
         }
         Ok(last)
     }

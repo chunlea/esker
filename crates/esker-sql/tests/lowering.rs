@@ -301,7 +301,10 @@ fn alter_table_lowers_its_actions_in_order() {
     let esker_sql::plan::AlterTableAction::AddColumn {
         column,
         if_not_exists,
-    } = &alter.actions[0];
+    } = &alter.actions[0]
+    else {
+        panic!("not an ADD COLUMN");
+    };
     assert_eq!(column.name, "note");
     assert_eq!(column.ty, ColumnType::Text);
     assert!(!column.not_null, "a column added by ALTER is nullable");
@@ -310,7 +313,10 @@ fn alter_table_lowers_its_actions_in_order() {
     let esker_sql::plan::AlterTableAction::AddColumn {
         column,
         if_not_exists,
-    } = &alter.actions[1];
+    } = &alter.actions[1]
+    else {
+        panic!("not an ADD COLUMN");
+    };
     assert_eq!(column.name, "score");
     assert_eq!(column.ty, ColumnType::Int8);
     assert!(if_not_exists);

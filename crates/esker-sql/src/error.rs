@@ -417,6 +417,78 @@ pub enum SqlError {
     #[error("there is no transaction in progress")]
     NoActiveTransaction,
 
+    /// `SET TRANSACTION` outside a transaction block. A **warning**, and PostgreSQL sends it and
+    /// then fails the statement for a second reason — both, in that order, which is why this is
+    /// its own condition and not a variant of [`SqlError::NoActiveTransaction`].
+    #[error("SET TRANSACTION can only be used in transaction blocks")]
+    SetTransactionOutsideBlock,
+
+    /// `SET TRANSACTION SNAPSHOT` where a snapshot cannot be imported. PostgreSQL's own sentence,
+    /// and the one it sends outside a transaction block after the warning above.
+    ///
+    /// Inside a block this node never raises it: Percolator gives snapshot isolation, which is
+    /// PostgreSQL's `REPEATABLE READ`, so the precondition holds by construction
+    /// (`docs/adr/0021-time-machine.md`).
+    #[error(
+        "a snapshot-importing transaction must have isolation level SERIALIZABLE or REPEATABLE READ"
+    )]
+    SnapshotIsolationRequired,
+
+    /// `SET TRANSACTION SNAPSHOT` after the block has already read something. Exactly right, and
+    /// the reason it is worth copying: a `start_ts` cannot change under a transaction that has
+    /// already read at it.
+    #[error("SET TRANSACTION SNAPSHOT must be called before any query")]
+    SnapshotAfterQuery,
+
+    /// A string that cannot be a snapshot identifier at all.
+    ///
+    /// Distinct from [`SqlError::SnapshotDoesNotExist`], and the distinction is PostgreSQL's:
+    /// `'nope'` is `22023` and a well-formed `'00000003-0000001B-1'` that is not there is `42704`.
+    /// Captured, because nobody would invent two codes for one apparent condition.
+    #[error("invalid snapshot identifier: \"{0}\"")]
+    InvalidSnapshotIdentifier(String),
+
+    /// A snapshot identifier that is well formed and names nothing.
+    #[error("snapshot \"{0}\" does not exist")]
+    SnapshotDoesNotExist(String),
+
+    /// A `SET` whose value the parameter cannot read.
+    #[error("invalid value for parameter \"{name}\": \"{value}\"")]
+    InvalidParameterValue {
+        /// The parameter, as the user spelled it.
+        name: &'static str,
+        /// The text it would not take.
+        value: String,
+    },
+
+    /// A `SET` whose value is well formed and outside what the parameter admits.
+    ///
+    /// PostgreSQL's own sentence for this, measured rather than recalled: `-5 ms is outside the
+    /// valid range for parameter "lock_timeout" (0 ms .. 2147483647 ms)`. It is the shape a
+    /// travel-window refusal wants, because what the user needs back is the pair of instants they
+    /// *can* ask for (`docs/adr/0021-time-machine.md` Decision 1).
+    #[error("{value} is outside the valid range for parameter \"{name}\" ({low} .. {high})")]
+    ParameterOutOfRange {
+        /// What was asked for.
+        value: String,
+        /// The parameter.
+        name: &'static str,
+        /// The low end, inclusive.
+        low: String,
+        /// The high end, inclusive.
+        high: String,
+    },
+
+    /// A parameter this node does not have. PostgreSQL's answer for an un-namespaced custom `SET`
+    /// and for a `SHOW` of anything it was never told about.
+    #[error("unrecognized configuration parameter \"{0}\"")]
+    UnrecognizedParameter(String),
+
+    /// A write in a transaction that may not write, which here is every transaction reading the
+    /// past. PostgreSQL names the command, so a user sees which of several statements it was.
+    #[error("cannot execute {0} in a read-only transaction")]
+    ReadOnlyTransaction(&'static str),
+
     /// A query needs more of a bounded resource than this node will give it.
     #[error("{0}")]
     ConfigurationLimitExceeded(String),
@@ -453,7 +525,9 @@ impl SqlError {
     #[must_use]
     pub fn sqlstate(&self) -> &'static str {
         match self {
-            SqlError::FeatureNotSupported(_) => sqlstate::FEATURE_NOT_SUPPORTED,
+            SqlError::FeatureNotSupported(_) | SqlError::SnapshotIsolationRequired => {
+                sqlstate::FEATURE_NOT_SUPPORTED
+            }
             SqlError::Syntax { .. } | SqlError::InsertTooManyExpressions => sqlstate::SYNTAX_ERROR,
             SqlError::StatementTooComplex => sqlstate::STATEMENT_TOO_COMPLEX,
             SqlError::UndefinedTable(_)
@@ -509,8 +583,19 @@ impl SqlError {
             SqlError::DoesNotExistSkipping { .. } => sqlstate::SUCCESSFUL_COMPLETION,
             SqlError::IdentifierTruncated { .. } => sqlstate::NAME_TOO_LONG,
             SqlError::InFailedTransaction => sqlstate::IN_FAILED_SQL_TRANSACTION,
-            SqlError::ActiveTransaction => sqlstate::ACTIVE_SQL_TRANSACTION,
-            SqlError::NoActiveTransaction => sqlstate::NO_ACTIVE_SQL_TRANSACTION,
+            SqlError::ActiveTransaction | SqlError::SnapshotAfterQuery => {
+                sqlstate::ACTIVE_SQL_TRANSACTION
+            }
+            SqlError::NoActiveTransaction | SqlError::SetTransactionOutsideBlock => {
+                sqlstate::NO_ACTIVE_SQL_TRANSACTION
+            }
+            SqlError::InvalidSnapshotIdentifier(_)
+            | SqlError::InvalidParameterValue { .. }
+            | SqlError::ParameterOutOfRange { .. } => sqlstate::INVALID_PARAMETER_VALUE,
+            SqlError::SnapshotDoesNotExist(_) | SqlError::UnrecognizedParameter(_) => {
+                sqlstate::UNDEFINED_OBJECT
+            }
+            SqlError::ReadOnlyTransaction(_) => sqlstate::READ_ONLY_SQL_TRANSACTION,
             SqlError::ConfigurationLimitExceeded(_) => sqlstate::CONFIGURATION_LIMIT_EXCEEDED,
             SqlError::ProtocolViolation(_) => sqlstate::PROTOCOL_VIOLATION,
             SqlError::InvalidSqlStatementName(_) => sqlstate::INVALID_SQL_STATEMENT_NAME,
@@ -533,7 +618,9 @@ impl SqlError {
             | SqlError::DoesNotExistSkipping { .. }
             | SqlError::DuplicateColumnSkipping { .. }
             | SqlError::IdentifierTruncated { .. } => Severity::Notice,
-            SqlError::ActiveTransaction | SqlError::NoActiveTransaction => Severity::Warning,
+            SqlError::ActiveTransaction
+            | SqlError::NoActiveTransaction
+            | SqlError::SetTransactionOutsideBlock => Severity::Warning,
             SqlError::ProtocolViolation(_) | SqlError::InvalidPassword(_) => Severity::Fatal,
             _ => Severity::Error,
         }

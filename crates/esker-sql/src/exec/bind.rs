@@ -162,11 +162,14 @@ fn walk(
             }
         }
         Statement::Explain(inner) => walk(inner, tables, seen),
+        // Neither DDL nor a session statement can carry a parameter: there is no expression in
+        // either that a `$1` could stand in.
         Statement::CreateTable(_)
         | Statement::DropTable(_)
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
-        | Statement::AlterTable(_) => {}
+        | Statement::AlterTable(_)
+        | Statement::Session(_) => {}
     }
 }
 
@@ -266,11 +269,14 @@ fn walk_mut(statement: &mut Statement, visit: &mut impl FnMut(&mut Expr)) {
             }
         }
         Statement::Explain(inner) => walk_mut(inner, visit),
+        // Neither DDL nor a session statement can carry a parameter: there is no expression in
+        // either that a `$1` could stand in.
         Statement::CreateTable(_)
         | Statement::DropTable(_)
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
-        | Statement::AlterTable(_) => {}
+        | Statement::AlterTable(_)
+        | Statement::Session(_) => {}
     }
 }
 
@@ -306,7 +312,9 @@ pub(super) fn table_names(statement: &Statement) -> Vec<&str> {
         | Statement::DropIndex(_)
         // DDL over a table, but nothing here needs its column types: a parameter cannot appear
         // in an `ALTER TABLE`, so there is nothing to infer against.
-        | Statement::AlterTable(_) => Vec::new(),
+        | Statement::AlterTable(_)
+        // A session statement is about no table at all.
+        | Statement::Session(_) => Vec::new(),
     }
 }
 
@@ -352,11 +360,14 @@ fn for_each_expr(statement: &Statement, visit: &mut impl FnMut(&Expr)) {
         }
         Statement::Delete(delete) => delete.filter.iter().for_each(&mut each),
         Statement::Explain(inner) => for_each_expr(inner, visit),
+        // Neither DDL nor a session statement can carry a parameter: there is no expression in
+        // either that a `$1` could stand in.
         Statement::CreateTable(_)
         | Statement::DropTable(_)
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
-        | Statement::AlterTable(_) => {}
+        | Statement::AlterTable(_)
+        | Statement::Session(_) => {}
     }
 }
 

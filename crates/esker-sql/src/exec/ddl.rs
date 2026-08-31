@@ -341,7 +341,27 @@ pub(super) fn alter_table(
         let AlterTableAction::AddColumn {
             column,
             if_not_exists,
-        } = action;
+        } = action
+        else {
+            // Retention is not part of the table definition and deliberately does **not** bump the
+            // schema version (`docs/adr/0021-time-machine.md` Decision 4). It changes nothing
+            // about how a row is written or read, and bumping would make every node in the cluster
+            // discard its table cache to learn a number none of them uses. The collector picks it
+            // up on its next pass, which is the only place it means anything.
+            let AlterTableAction::SetRetention { retention_ms } = action else {
+                unreachable!("every action is one of the two")
+            };
+            match retention_ms {
+                Some(retention_ms) => {
+                    catalog::set_table_retention(txn, executor.tenant, table.id, *retention_ms);
+                }
+                // `DEFAULT` deletes the override rather than storing a zero: a table with no
+                // override is not "retention zero", it is the cluster default, and the difference
+                // is an absent key against a key holding zero.
+                None => catalog::clear_table_retention(txn, executor.tenant, table.id),
+            }
+            continue;
+        };
         if updated.column(&column.name).is_some() {
             if *if_not_exists {
                 executor.notice(SqlError::DuplicateColumnSkipping {

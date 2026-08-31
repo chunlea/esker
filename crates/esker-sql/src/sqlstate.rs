@@ -75,6 +75,9 @@ pub const UNIQUE_VIOLATION: &str = "23505";
 pub const ACTIVE_SQL_TRANSACTION: &str = "25001";
 /// `COMMIT` or `ROLLBACK` with no transaction block open.
 pub const NO_ACTIVE_SQL_TRANSACTION: &str = "25P01";
+/// A write in a transaction that may not write — which here is every transaction reading the past
+/// (`docs/adr/0021-time-machine.md` Decision 1).
+pub const READ_ONLY_SQL_TRANSACTION: &str = "25006";
 /// Any statement after an error inside a transaction block, until `ROLLBACK`. Half of contract
 /// C2's state-machine promise lives on this code.
 pub const IN_FAILED_SQL_TRANSACTION: &str = "25P02";
@@ -224,6 +227,10 @@ mod tests {
         (
             "NO_ACTIVE_SQL_TRANSACTION",
             super::NO_ACTIVE_SQL_TRANSACTION,
+        ),
+        (
+            "READ_ONLY_SQL_TRANSACTION",
+            super::READ_ONLY_SQL_TRANSACTION,
         ),
         (
             "IN_FAILED_SQL_TRANSACTION",

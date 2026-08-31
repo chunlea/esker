@@ -45,6 +45,26 @@ pub use store::StoreBackend;
 pub trait Backend: fmt::Debug + Send + Sync {
     /// Starts a transaction at a fresh snapshot.
     fn begin(&self) -> Result<Box<dyn Txn>>;
+
+    /// Starts a **read-only** transaction at a snapshot the caller chose.
+    ///
+    /// The whole of ADR 0021's Decision 1: a historical read is a read timestamp and nothing else,
+    /// so this is `begin` with the number handed in rather than allocated. Locks, resolution,
+    /// read-your-writes and commit are all indifferent to where it came from.
+    ///
+    /// **Read-only is enforced by the transaction this returns**, not left to the caller.
+    /// Committing at `commit_ts > start_ts` against a snapshot that old is a lost update with
+    /// extra steps, and it is the one window snapshot isolation does not close: the conflicting
+    /// writer committed *after* the snapshot and *before* the write, so Percolator's conflict
+    /// check would not catch it.
+    fn begin_at(&self, start_ts: u64) -> Result<Box<dyn Txn>>;
+
+    /// The oracle's current timestamp.
+    ///
+    /// `CLAUDE.md` invariant 6: no node uses its wall clock for ordering, so "now" is a number from
+    /// the timestamp oracle like every other. This is what bounds a historical read from above —
+    /// a read at a timestamp that has not happened would see a prefix of it and call it complete.
+    fn now(&self) -> Result<u64>;
 }
 
 /// One transaction's view of storage.
@@ -63,6 +83,16 @@ pub trait Txn: fmt::Debug + Send {
     /// Buffers a delete, with the same rule.
     fn delete(&mut self, key: &[u8]);
 
+    /// Whether this transaction may write.
+    ///
+    /// False for one opened by [`Backend::begin_at`]. The executor asks *before* it plans, so that
+    /// a write at a past snapshot is `25006` naming the command rather than a write that is
+    /// buffered and then quietly dropped. [`Txn::put`] and [`Txn::delete`] cannot report anything —
+    /// they are buffered and return nothing — which is exactly why the check has to be here.
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
     /// Commits, yielding the commit timestamp, or `None` for a transaction that wrote nothing.
     fn commit(self: Box<Self>) -> Result<Option<u64>>;
 
@@ -78,14 +108,37 @@ enum Write {
 }
 
 /// Every committed version of every key, newest last, plus the clock that stamps them.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Versions {
     /// `key -> [(commit_ts, value)]`, ascending by timestamp. `None` is a tombstone.
     keys: BTreeMap<Vec<u8>, Vec<(u64, Option<Bytes>)>>,
     /// Stands in for the timestamp oracle. Monotone, and the only source of timestamps here, which
     /// is `CLAUDE.md` invariant 6 kept true even in a fake.
+    ///
+    /// **Shaped like a real one**: `ts = physical_ms << 18 | logical` (`esker_pd::tso`), starting
+    /// at a plausible instant rather than at zero, and advancing the *logical* half per commit.
+    /// The shape is not decoration — it is what a time machine is asked about. A counter starting
+    /// at zero puts every version inside the same millisecond of 1970, so an instant a user could
+    /// name would not distinguish two of them, and a test written against it would prove the
+    /// feature works on data no cluster produces. Tests that want two versions in different
+    /// milliseconds ask for that with [`MemoryBackend::advance_ms`].
     clock: u64,
 }
+
+impl Default for Versions {
+    fn default() -> Self {
+        Versions {
+            keys: BTreeMap::new(),
+            clock: esker_client::ts_at_ms(FAKE_START_MS),
+        }
+    }
+}
+
+/// Where a [`MemoryBackend`]'s clock starts: 2026-08-30 14:00:00 UTC, in Unix milliseconds.
+///
+/// Any plausible instant would do. What matters is that it is not zero, so that the physical half
+/// of every timestamp the fake hands out is a real date a test can write down.
+const FAKE_START_MS: u64 = 1_787_493_600_000;
 
 impl Versions {
     /// The value visible at `ts`: the newest version committed at or before it.
@@ -148,6 +201,20 @@ impl MemoryBackend {
         self
     }
 
+    /// Moves the clock's **physical** half on by `millis`, the way time passing does.
+    ///
+    /// A commit advances the logical half only, so without this every version a test writes lands
+    /// in one millisecond — which is what a busy cluster looks like, and which is why the default
+    /// is that way. A test about reading *as of an instant* needs its versions in different
+    /// milliseconds, because an instant a user can name has millisecond resolution
+    /// (`crate::time_machine`), and this is how it says so.
+    pub fn advance_ms(&self, millis: u64) {
+        let mut versions = self.lock();
+        versions.clock = versions
+            .clock
+            .saturating_add(millis << esker_client::TSO_LOGICAL_BITS);
+    }
+
     /// The value visible at the newest committed timestamp, for assertions in tests.
     #[must_use]
     pub fn peek(&self, key: &[u8]) -> Option<Bytes> {
@@ -173,7 +240,28 @@ impl Backend for MemoryBackend {
             start_ts,
             buffer: BTreeMap::new(),
             max_scan: self.max_scan,
+            read_only: false,
         }))
+    }
+
+    /// The fake is a real time machine, which is the point of it.
+    ///
+    /// Every version here is already filed under its `commit_ts` and `Versions::visible` already
+    /// answers "the newest at or before `ts`", so a historical read is the same call with a
+    /// different number — the same sentence that is true of the store below. That is what lets
+    /// the whole feature, and the whole `.slt` corpus, be exercised before the client half lands.
+    fn begin_at(&self, start_ts: u64) -> Result<Box<dyn Txn>> {
+        Ok(Box::new(MemoryTxn {
+            versions: Arc::clone(&self.versions),
+            start_ts,
+            buffer: BTreeMap::new(),
+            max_scan: self.max_scan,
+            read_only: true,
+        }))
+    }
+
+    fn now(&self) -> Result<u64> {
+        Ok(self.lock().clock)
     }
 }
 
@@ -197,6 +285,9 @@ struct MemoryTxn {
     buffer: BTreeMap<Vec<u8>, Write>,
     /// The store's scan ceiling; see [`MemoryBackend::with_scan_limit`].
     max_scan: u32,
+    /// Set by [`Backend::begin_at`]. A write here is dropped rather than buffered, and the
+    /// executor is what turns the attempt into `25006` before it gets this far.
+    read_only: bool,
 }
 
 impl MemoryTxn {
@@ -256,12 +347,22 @@ impl Txn for MemoryTxn {
     }
 
     fn put(&mut self, key: &[u8], value: &[u8]) {
+        if self.read_only {
+            return;
+        }
         self.buffer
             .insert(key.to_vec(), Write::Put(Bytes::copy_from_slice(value)));
     }
 
     fn delete(&mut self, key: &[u8]) {
+        if self.read_only {
+            return;
+        }
         self.buffer.insert(key.to_vec(), Write::Delete);
+    }
+
+    fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     fn commit(self: Box<Self>) -> Result<Option<u64>> {
@@ -333,11 +434,15 @@ mod tests {
     #[test]
     fn a_committed_value_is_visible_to_the_next_transaction_and_not_to_an_older_one() {
         let backend = MemoryBackend::new();
+        let before = backend.now().unwrap();
         let older = backend.begin().unwrap();
 
         let mut writer = backend.begin().unwrap();
         writer.put(b"k", b"v");
-        assert_eq!(writer.commit().unwrap(), Some(1));
+        // A commit takes the next timestamp, which is the one after the snapshot every open
+        // transaction holds. Written as a *relation* to `before` rather than as a literal,
+        // because the clock starts at a plausible instant rather than at zero.
+        assert_eq!(writer.commit().unwrap(), Some(before + 1));
 
         // The transaction that started first still sees its own snapshot.
         assert_eq!(older.get(b"k").unwrap(), None);

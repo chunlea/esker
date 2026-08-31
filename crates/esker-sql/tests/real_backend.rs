@@ -281,3 +281,62 @@ fn a_bound_parameter_round_trips_through_the_cluster() {
     };
     assert_eq!(rows, [[Some(b"ann".to_vec())]]);
 }
+
+/// The one stub in this crate, asserted where a real backend exists.
+///
+/// `TxnClient::begin_at` is another lane's and does not exist yet (`docs/plans/phase-6d.md` §3),
+/// so a historical read against a real cluster is `0A000` **naming what is missing**. This test is
+/// what keeps the refusal from quietly becoming a fallback: a `begin_at` that read the present
+/// would answer a user who asked for an hour ago with *now*, and nothing would tell them. When the
+/// constructor lands, this test is the one that has to change, which is the point of writing it.
+///
+/// A **token**, not an instant, and the reason is worth writing down: this cluster's oracle is a
+/// `CountingOracle`, whose timestamps are a counter rather than `physical_ms << 18`. The physical
+/// half of every timestamp here is therefore zero, every version sits inside the first millisecond
+/// of 1970, and no instant a user could name would distinguish two of them. A token carries the
+/// timestamp directly and needs no clock at all, which is what makes it the shape that works
+/// before PD's real TSO is wired in — `src/bin/esker-sql.rs` still builds a `CountingOracle`, and
+/// `esker_pd::tso` is the real one.
+#[test]
+fn a_historical_read_against_a_real_store_is_refused_by_name() {
+    let cluster = Cluster::start();
+    let mut session = cluster.session();
+
+    session
+        .run("CREATE TABLE t (id int8 PRIMARY KEY, note text)")
+        .unwrap();
+    session.run("INSERT INTO t VALUES (1, 'one')").unwrap();
+
+    // Inside a block the refusal arrives at the `SET` itself, because that is where the session
+    // tries to move: the node will not *enter* the past, rather than entering it and failing on
+    // the next query.
+    session.run("BEGIN").unwrap();
+    let error = session
+        .run("SET TRANSACTION SNAPSHOT 'esker-0000000000000001'")
+        .unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED);
+    assert_eq!(
+        error.to_string(),
+        "reading as of a past timestamp against a real store is not supported"
+    );
+    session.run("ROLLBACK").unwrap();
+
+    // Outside a block there is no transaction to reopen, so the `SET` is recorded and the refusal
+    // arrives at the first statement that would have read the past. Both moments are honest; what
+    // matters is that neither of them reads the present.
+    //
+    // The instant is the epoch because that is where a `CountingOracle`'s "now" is: with no
+    // wall-clock half, `1970-01-01` is the present here and anything later is the future.
+    session
+        .run("SET esker.read_as_of = '1970-01-01 00:00:00+00'")
+        .unwrap();
+    let error = session.run("SELECT note FROM t").unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED);
+
+    // And the present still reads, which is what makes the refusal a bound rather than an outage.
+    session.run("RESET esker.read_as_of").unwrap();
+    let Outcome::Rows { rows, .. } = session.run("SELECT note FROM t").unwrap() else {
+        panic!("not rows");
+    };
+    assert_eq!(rows, [[Some(b"one".to_vec())]]);
+}

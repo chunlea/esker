@@ -446,3 +446,24 @@ CREATE SERVER srv FOREIGN DATA WRAPPER fdw;
 CREATE FOREIGN TABLE ft (a int8) SERVER srv;
 IMPORT FOREIGN SCHEMA remote LIMIT TO (t) FROM SERVER srv INTO local;
 CREATE USER MAPPING FOR alice SERVER srv OPTIONS (user 'x');
+
+# The time machine's surface (docs/adr/0021-time-machine.md, docs/plans/phase-6d.md).
+#
+# Every statement here is one a real PostgreSQL 19 parses, which is the whole argument for the
+# shape the feature took: the three invented spellings a time machine invites -- CockroachDB's
+# `AS OF SYSTEM TIME`, `BEGIN AS OF SYSTEM TIME`, a bare `CHECKPOINT <name>` -- are all 42601 on
+# that server, so taking them would make this node accept syntax the oracle rejects. What is left
+# is PostgreSQL's own: a namespaced custom GUC, SET TRANSACTION SNAPSHOT, a storage parameter, and
+# function calls. None of them needed a line inside src/parse's grammar.
+@class time-machine
+SET esker.read_as_of = '-1h';
+SET esker.read_as_of TO '2026-08-30 14:00:00+00';
+SET LOCAL esker.read_as_of = '-30m';
+SET esker.read_as_of = DEFAULT;
+SHOW esker.read_as_of;
+RESET esker.read_as_of;
+ALTER TABLE t SET (retention = '7d');
+ALTER TABLE t SET (retention = 604800000);
+SELECT pg_export_snapshot();
+SELECT esker_checkpoint('nightly');
+SELECT * FROM esker_diff('t', '-1h', 'now');
