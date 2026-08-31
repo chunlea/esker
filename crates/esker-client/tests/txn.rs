@@ -22,7 +22,27 @@ use esker_client::wire::{
 };
 use esker_client::{CountingOracle, Error, TxnClient};
 
-const START_TS: u64 = 10;
+/// A timestamp shaped the way the oracle mints them: `ts = physical_ms << 18 | logical`
+/// (`docs/txn-spec.md` §5.5). A lease is judged in the physical half alone, so a fixture that
+/// counts by one describes a cluster where a millisecond never passes and no lock ever expires.
+const fn at_ms(physical_ms: u64) -> u64 {
+    physical_ms << esker_client::TSO_LOGICAL_BITS
+}
+
+/// The reader's own snapshot: a hundred seconds in, so every dead lease below has run out by
+/// the time this client looks at it.
+const START_TS: u64 = at_ms(100_000);
+
+/// A transaction that started one second in and never came back. Its three-second lease was
+/// over long before [`START_TS`].
+const DEAD_TS: u64 = at_ms(1_000);
+
+/// A second abandoned transaction, so a test can tell two holders apart.
+const OTHER_DEAD_TS: u64 = at_ms(1_100);
+
+/// A transaction that started just now: its lease is **live**, and a resolver that kills it
+/// aborts a transaction that is still working.
+const LIVE_TS: u64 = at_ms(99_500);
 
 fn key(bytes: &'static [u8]) -> Bytes {
     Bytes::from_static(bytes)
@@ -678,16 +698,68 @@ fn a_lock(on: &'static [u8], primary: &'static [u8], start_ts: u64) -> LockInfo 
     }
 }
 
-/// A `Locked` is not an error to report: the client resolves the lock and asks again. That is
-/// the reader's half of `docs/txn-spec.md` §5.5.
+/// The two calls that settle a lock's owner before its keys are resolved
+/// (`docs/txn-spec.md` §5.5): a read of the **primary**, which says whether the lease is still
+/// being held, and a `Rollback` of it, which is the verdict and the act in one.
+///
+/// `primary_status` is what the rollback answers: `Ok` for a transaction this client just
+/// killed, `Committed` for one that got there first.
+fn script_settling_the_primary(
+    transport: &FakeTransport,
+    primary: &'static [u8],
+    primary_status: TxnStatus,
+) {
+    transport
+        // The primary is no longer locked — the owner's lock is gone, or was never taken.
+        .script(
+            Rule::new(
+                Matcher::All(vec![
+                    Matcher::Method(Method::TxnGet),
+                    Matcher::Key(key(primary)),
+                ]),
+                Outcome::TxnReply(TxnKvResp::Get { value: None }),
+            )
+            .forever(),
+        )
+        .script(
+            Rule::new(
+                Matcher::Method(Method::TxnRollback),
+                Outcome::TxnReply(TxnKvResp::Rollback {
+                    status: primary_status,
+                }),
+            )
+            .forever(),
+        );
+}
+
+/// The `TxnKv` bodies of every call of one method, in the order they went out.
+fn calls_of(transport: &FakeTransport, method: Method) -> Vec<TxnKvReq> {
+    (0..transport.call_count())
+        .map(|index| nth_txn(transport, index))
+        .filter(|request| request.method() == method)
+        .collect()
+}
+
+/// A `Locked` is not an error to report: the client settles the lock's owner and asks again.
+/// That is the reader's half of `docs/txn-spec.md` §5.5.
+///
+/// Four calls, and the order of the middle two is the rule: the **primary is settled first**,
+/// and only then does its verdict travel to the stuck key. A `ResolveLock` is not a question —
+/// its `commit_ts` is an answer this client is responsible for having (see
+/// `docs/plans/phase-5.md` §10.6: a store cannot classify a transaction whose primary may live
+/// in another region).
 #[test]
 fn a_read_that_meets_a_lock_resolves_it_and_tries_again() {
     let transport = Arc::new(FakeTransport::new());
-    transport
-        .script(Rule::new(
+    transport.script(Rule::new(
+        Matcher::All(vec![
             Matcher::Method(Method::TxnGet),
-            Outcome::locked(&a_lock(b"k", b"primary", 5)),
-        ))
+            Matcher::Key(key(b"k")),
+        ]),
+        Outcome::locked(&a_lock(b"k", b"primary", DEAD_TS)),
+    ));
+    script_settling_the_primary(&transport, b"primary", TxnStatus::Ok);
+    transport
         .script(
             Rule::new(
                 Matcher::Method(Method::TxnResolveLock),
@@ -710,21 +782,176 @@ fn a_read_that_meets_a_lock_resolves_it_and_tries_again() {
     assert_eq!(txn.get(b"k").unwrap(), Some(key(b"v")));
     assert_eq!(
         transport.methods(),
-        vec![Method::TxnGet, Method::TxnResolveLock, Method::TxnGet]
+        vec![
+            Method::TxnGet,
+            Method::TxnGet,
+            Method::TxnRollback,
+            Method::TxnResolveLock,
+            Method::TxnGet
+        ],
+        "the read, the primary's state, the primary settled, the key resolved, the read again"
     );
-    // The resolution names the *stuck* transaction, not the reader's own.
+    // The primary is read at the *lock's* snapshot, which is the timestamp at which its own
+    // lock is in the way if it still holds one.
     match nth_txn(&transport, 1) {
+        TxnKvReq::Get { key: read, ts } => {
+            assert_eq!(read, key(b"primary"));
+            assert_eq!(ts, DEAD_TS, "the lock's snapshot, not the reader's");
+        }
+        other => panic!("{other:?}"),
+    }
+    // The verdict is reached by rolling the primary back: it either leaves a marker or comes
+    // back `Committed`, with no window in between for a commit to slip through.
+    match nth_txn(&transport, 2) {
+        TxnKvReq::Rollback { start_ts, keys } => {
+            assert_eq!(
+                start_ts, DEAD_TS,
+                "the lock's transaction, not the reader's"
+            );
+            assert_eq!(keys, vec![key(b"primary")], "the primary, and only it");
+        }
+        other => panic!("{other:?}"),
+    }
+    // And the resolution carries that verdict to the stuck key.
+    match nth_txn(&transport, 3) {
         TxnKvReq::ResolveLock {
             start_ts,
             commit_ts,
             keys,
         } => {
-            assert_eq!(start_ts, 5, "the lock's transaction, not the reader's");
-            assert_eq!(commit_ts, 0, "zero asks the store to decide by the primary");
+            assert_eq!(
+                start_ts, DEAD_TS,
+                "the lock's transaction, not the reader's"
+            );
+            assert_eq!(
+                commit_ts, 0,
+                "the primary was rolled back, so this rolls back"
+            );
             assert_eq!(keys, vec![key(b"k")]);
         }
         other => panic!("{other:?}"),
     }
+}
+
+/// The other verdict, and the one that costs data if it is got wrong: the owner **committed**
+/// between leaving its lock and being settled, so the stuck key must roll **forward** at the
+/// commit timestamp the primary reports.
+///
+/// A resolver that sent zero here would abandon one key of a committed transaction — no error,
+/// nothing to notice, and a row that was acknowledged as written simply absent.
+/// `tests/txn_crash_boundaries.rs` proves the same thing against real stores.
+#[test]
+fn a_lock_whose_primary_committed_rolls_forward() {
+    let transport = Arc::new(FakeTransport::new());
+    transport.script(Rule::new(
+        Matcher::All(vec![
+            Matcher::Method(Method::TxnGet),
+            Matcher::Key(key(b"k")),
+        ]),
+        Outcome::locked(&a_lock(b"k", b"primary", DEAD_TS)),
+    ));
+    script_settling_the_primary(
+        &transport,
+        b"primary",
+        TxnStatus::Committed {
+            commit_ts: at_ms(1_001),
+        },
+    );
+    transport
+        .script(
+            Rule::new(
+                Matcher::Method(Method::TxnResolveLock),
+                Outcome::TxnReply(TxnKvResp::ResolveLock { resolved: 1 }),
+            )
+            .forever(),
+        )
+        .script(
+            Rule::new(
+                Matcher::Method(Method::TxnGet),
+                Outcome::TxnReply(TxnKvResp::Get {
+                    value: Some(key(b"v")),
+                }),
+            )
+            .forever(),
+        );
+    let client = client(&transport);
+    let txn = client.begin().unwrap();
+    assert_eq!(txn.get(b"k").unwrap(), Some(key(b"v")));
+
+    let resolves = calls_of(&transport, Method::TxnResolveLock);
+    match &resolves[..] {
+        [
+            TxnKvReq::ResolveLock {
+                start_ts,
+                commit_ts,
+                keys,
+            },
+        ] => {
+            assert_eq!(*start_ts, DEAD_TS);
+            assert_eq!(
+                *commit_ts,
+                at_ms(1_001),
+                "the transaction committed, so its keys roll forward at its commit timestamp"
+            );
+            assert_eq!(keys, &vec![key(b"k")]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A lock **inside** its lease belongs to a transaction that is still working, and a reader
+/// that settles it anyway aborts it.
+///
+/// So the reader waits instead: no `Rollback`, no `ResolveLock`, a backoff between looks, and
+/// eventually the bounded refusal. The judgement is made against a timestamp from the *oracle*
+/// (`CLAUDE.md` invariant 6), never a wall clock — which is why a fixture whose timestamps have
+/// no physical half would make every lock in this file look immortal.
+#[test]
+fn a_lock_inside_its_lease_is_waited_for_rather_than_settled() {
+    let transport = Arc::new(FakeTransport::new());
+    let clock = Arc::new(FakeClock::new());
+    transport.script(
+        Rule::new(
+            Matcher::Method(Method::TxnGet),
+            Outcome::locked(&a_lock(b"k", b"primary", LIVE_TS)),
+        )
+        .forever(),
+    );
+    let router = Router::with_options(
+        Arc::clone(&transport) as _,
+        one_region() as Arc<dyn esker_client::RegionResolver>,
+        ClientOptions {
+            jitter_seed: Some(7),
+            ..ClientOptions::default()
+        },
+    )
+    .with_clock(Arc::clone(&clock) as Arc<dyn esker_client::clock::Clock>);
+    let client = TxnClient::on_router(
+        Arc::new(router),
+        Arc::new(CountingOracle::starting_at(START_TS)),
+    )
+    .with_max_lock_resolutions(3);
+
+    let txn = client.begin().unwrap();
+    match txn.get(b"k").unwrap_err() {
+        Error::LockNotCleared { start_ts } => assert_eq!(start_ts, LIVE_TS),
+        other => panic!("expected LockNotCleared, got {other:?}"),
+    }
+
+    assert!(
+        !transport.methods().contains(&Method::TxnRollback),
+        "a live transaction's primary must not be rolled back: {:?}",
+        transport.methods()
+    );
+    assert!(
+        !transport.methods().contains(&Method::TxnResolveLock),
+        "nothing to resolve while the owner is inside its lease"
+    );
+    assert_eq!(
+        clock.sleeps_ms(),
+        vec![10, 20, 40],
+        "one backoff per look, growing, so a busy key is not spun on"
+    );
 }
 
 /// The reason a `Prewrite` answers per key: a batch that collides with **several** locks
@@ -745,9 +972,9 @@ fn a_prewrite_that_meets_several_locks_clears_them_in_one_round() {
             Matcher::Method(Method::TxnPrewrite),
             Outcome::TxnReply(TxnKvResp::Prewrite {
                 keys: vec![
-                    TxnStatus::Locked(a_lock(b"b", b"other-1", 5)),
+                    TxnStatus::Locked(a_lock(b"b", b"other-1", DEAD_TS)),
                     TxnStatus::Ok,
-                    TxnStatus::Locked(a_lock(b"d", b"other-2", 6)),
+                    TxnStatus::Locked(a_lock(b"d", b"other-2", OTHER_DEAD_TS)),
                 ],
             }),
         ))
@@ -768,6 +995,9 @@ fn a_prewrite_that_meets_several_locks_clears_them_in_one_round() {
             )
             .forever(),
         );
+    // Both holders are settled the same way, and both are dead.
+    script_settling_the_primary(&transport, b"other-1", TxnStatus::Ok);
+    script_settling_the_primary(&transport, b"other-2", TxnStatus::Ok);
     let client = client(&transport);
     let mut txn = client.begin().unwrap();
     for k in [b"a".as_slice(), b"b", b"c", b"d"] {
@@ -792,7 +1022,7 @@ fn a_prewrite_that_meets_several_locks_clears_them_in_one_round() {
             other => panic!("{other:?}"),
         })
         .collect();
-    assert_eq!(by_txn, vec![5, 6]);
+    assert_eq!(by_txn, vec![DEAD_TS, OTHER_DEAD_TS]);
 
     // One resolution round: the secondaries were prewritten, resolved, prewritten again — and
     // not once per lock.
@@ -821,8 +1051,8 @@ fn locks_held_by_one_transaction_are_resolved_in_one_call() {
             Matcher::Method(Method::TxnPrewrite),
             Outcome::TxnReply(TxnKvResp::Prewrite {
                 keys: vec![
-                    TxnStatus::Locked(a_lock(b"b", b"other", 5)),
-                    TxnStatus::Locked(a_lock(b"c", b"other", 5)),
+                    TxnStatus::Locked(a_lock(b"b", b"other", DEAD_TS)),
+                    TxnStatus::Locked(a_lock(b"c", b"other", DEAD_TS)),
                 ],
             }),
         ))
@@ -843,6 +1073,7 @@ fn locks_held_by_one_transaction_are_resolved_in_one_call() {
             )
             .forever(),
         );
+    script_settling_the_primary(&transport, b"other", TxnStatus::Ok);
     let client = client(&transport);
     let mut txn = client.begin().unwrap();
     for k in [b"a".as_slice(), b"b", b"c"] {
@@ -857,7 +1088,7 @@ fn locks_held_by_one_transaction_are_resolved_in_one_call() {
     assert_eq!(resolves.len(), 1, "one holder, one call");
     match &resolves[0] {
         TxnKvReq::ResolveLock { start_ts, keys, .. } => {
-            assert_eq!(*start_ts, 5);
+            assert_eq!(*start_ts, DEAD_TS);
             assert_eq!(keys, &vec![key(b"b"), key(b"c")]);
         }
         other => panic!("{other:?}"),
@@ -880,7 +1111,7 @@ fn a_conflict_beside_a_lock_ends_it_without_resolving() {
                 Matcher::Method(Method::TxnPrewrite),
                 Outcome::TxnReply(TxnKvResp::Prewrite {
                     keys: vec![
-                        TxnStatus::Locked(a_lock(b"b", b"other", 5)),
+                        TxnStatus::Locked(a_lock(b"b", b"other", DEAD_TS)),
                         TxnStatus::Conflict { commit_ts: 42 },
                     ],
                 }),
@@ -925,13 +1156,14 @@ fn a_prewrite_answered_with_the_wrong_number_of_statuses_is_refused() {
 #[test]
 fn a_prewrite_that_meets_a_lock_resolves_it_and_tries_again() {
     let transport = Arc::new(FakeTransport::new());
+    transport.script(Rule::new(
+        Matcher::Method(Method::TxnPrewrite),
+        Outcome::TxnReply(TxnKvResp::Prewrite {
+            keys: vec![TxnStatus::Locked(a_lock(b"k", b"other", DEAD_TS))],
+        }),
+    ));
+    script_settling_the_primary(&transport, b"other", TxnStatus::Ok);
     transport
-        .script(Rule::new(
-            Matcher::Method(Method::TxnPrewrite),
-            Outcome::TxnReply(TxnKvResp::Prewrite {
-                keys: vec![TxnStatus::Locked(a_lock(b"k", b"other", 5))],
-            }),
-        ))
         .script(
             Rule::new(
                 Matcher::Method(Method::TxnResolveLock),
@@ -957,58 +1189,71 @@ fn a_prewrite_that_meets_a_lock_resolves_it_and_tries_again() {
         transport.methods(),
         vec![
             Method::TxnPrewrite,
+            Method::TxnGet,
+            Method::TxnRollback,
             Method::TxnResolveLock,
             Method::TxnPrewrite,
             Method::TxnCommit
-        ]
+        ],
+        "a writer settles the lock's owner exactly the way a reader does"
     );
 }
 
-/// A lock whose owner keeps heartbeating never clears, and a client that waited for ever would
-/// be indistinguishable from one that hung. The budget is separate from the router's, because
-/// each resolution attempt makes progress and a routing retry does not.
+/// A lock that is settled and comes straight back — a competitor that keeps re-taking it —
+/// never clears, and a client that waited for ever would be indistinguishable from one that
+/// hung. The budget is separate from the router's, because each resolution attempt makes
+/// progress and a routing retry does not.
 #[test]
 fn a_lock_that_never_clears_is_bounded() {
     let transport = Arc::new(FakeTransport::new());
-    transport
-        .script(
-            Rule::new(
+    transport.script(
+        Rule::new(
+            Matcher::All(vec![
                 Matcher::Method(Method::TxnGet),
-                Outcome::locked(&a_lock(b"k", b"primary", 5)),
-            )
-            .forever(),
+                Matcher::Key(key(b"k")),
+            ]),
+            Outcome::locked(&a_lock(b"k", b"primary", DEAD_TS)),
         )
-        .script(
-            Rule::new(
-                Matcher::Method(Method::TxnResolveLock),
-                Outcome::TxnReply(TxnKvResp::ResolveLock { resolved: 0 }),
-            )
-            .forever(),
-        );
+        .forever(),
+    );
+    script_settling_the_primary(&transport, b"primary", TxnStatus::Ok);
+    transport.script(
+        Rule::new(
+            Matcher::Method(Method::TxnResolveLock),
+            Outcome::TxnReply(TxnKvResp::ResolveLock { resolved: 0 }),
+        )
+        .forever(),
+    );
     let client = client(&transport).with_max_lock_resolutions(3);
     let txn = client.begin().unwrap();
 
     match txn.get(b"k").unwrap_err() {
-        Error::LockNotCleared { start_ts } => assert_eq!(start_ts, 5),
+        Error::LockNotCleared { start_ts } => assert_eq!(start_ts, DEAD_TS),
         other => panic!("expected LockNotCleared, got {other:?}"),
     }
-    // Four reads and three resolutions: the budget counts resolutions, and the last read is
-    // what discovers the lock is still there.
+    // Four reads of `k` and three resolutions: the budget counts resolutions, and the last
+    // read is what discovers the lock is still there. The reads of the *primary* are the
+    // settling half and there is one per resolution, not one per look.
+    assert_eq!(calls_of(&transport, Method::TxnResolveLock).len(), 3);
+    let reads: Vec<Bytes> = calls_of(&transport, Method::TxnGet)
+        .into_iter()
+        .map(|request| match request {
+            TxnKvReq::Get { key, .. } => key,
+            other => panic!("{other:?}"),
+        })
+        .collect();
     assert_eq!(
-        transport
-            .methods()
-            .iter()
-            .filter(|m| **m == Method::TxnResolveLock)
-            .count(),
-        3
+        reads.iter().filter(|read| **read == key(b"k")).count(),
+        4,
+        "one look before each resolution, and one after the last"
     );
     assert_eq!(
-        transport
-            .methods()
+        reads
             .iter()
-            .filter(|m| **m == Method::TxnGet)
+            .filter(|read| **read == key(b"primary"))
             .count(),
-        4
+        3,
+        "the primary's state is read once per resolution"
     );
 }
 

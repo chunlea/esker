@@ -260,6 +260,28 @@ owning client is alive.
 Rolling the primary back before its secondaries is the mirror of committing it first, and for the
 same reason: the primary is the fact, and it has to be settled before anything reads it as settled.
 
+**Who does which half.** The lease judgement is the *client's* and the write is the *store's*, and
+the split is forced: a store decides at apply, where it may not read a clock
+(`docs/plans/phase-5.md` §10.2), and it may not classify the transaction either, because the
+primary can live in another region on another store (§10.6). So a resolver — any client that met
+the lock — does this, in `esker-client`'s `Transaction::resolve`:
+
+1. **Judge the lease** from the `LockInfo` it holds and a fresh timestamp from the oracle. Live:
+   back off and look again; nothing is written. This is the row above that says *wait*.
+2. If the lock in hand is a secondary's, **read the primary** at the lock's `start_ts`. A
+   `Heartbeat` extends the primary's lease alone, so only the primary's TTL decides. Still inside
+   its lease: wait.
+3. **`Rollback` the primary.** This is the verdict *and* the act in one apply: it leaves a rollback
+   marker — the transaction is dead for ever, and §5.4's marker is what makes its late `Prewrite`
+   fail — or it answers `Committed { commit_ts }`, because the commit got there first. There is no
+   window between looking and deciding.
+4. **`ResolveLock`** the stuck keys with that verdict: the commit timestamp to roll forward, zero to
+   roll back.
+
+`ResolveLock`'s `commit_ts` is therefore an **answer, not a question**. A resolver that sent zero
+without step 3 would tell a store to abandon a transaction that may have committed — one key of it
+missing, no error, and nothing to notice.
+
 ## 6. What snapshot isolation gives, and what it does not
 
 **Guaranteed.**

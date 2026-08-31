@@ -40,6 +40,12 @@ esker-store.workspace = true
 esker-sim.workspace = true
 # `Role`, to ask a store whether it is the one leading right now. Dev-only.
 esker-raft.workspace = true
+# The bank test's oracle *is* PD's (`esker_pd::tso::Oracle`), driven in-process rather than
+# over a socket. A second implementation of the timestamp layout would be a second thing to
+# get wrong, and a lock's lease is judged in the physical half of what it hands out
+# (`docs/txn-spec.md` §5.5). `esker-txn` takes the same dev-dependency for the same reason.
+# Dev-only: nothing the client ships links the placement driver.
+esker-pd.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "time"] }

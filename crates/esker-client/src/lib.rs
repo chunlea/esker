@@ -47,4 +47,7 @@ pub use retry::{BACKOFF_BASE_MS, BACKOFF_MAX_MS, MAX_RETRIES, RetryPolicy, backo
 pub use router::Router;
 pub use tcp::TcpStores;
 pub use transport::StoreTransport;
-pub use txn::{CountingOracle, TimestampOracle, Transaction, TxnClient};
+pub use txn::{
+    CountingOracle, LOCK_TTL_MS, TSO_LOGICAL_BITS, TimestampOracle, Transaction, TxnClient,
+    is_expired, physical_ms,
+};

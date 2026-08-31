@@ -58,11 +58,13 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 
 use crate::error::{Error, Result};
 use crate::region_cache::RegionResolver;
+use crate::retry::backoff_ms;
 use crate::router::{ClientOptions, Router, fan_out};
 use crate::transport::StoreTransport;
 use crate::wire::{
@@ -72,6 +74,36 @@ use crate::wire::{
 
 /// Default time-to-live of a lock, in milliseconds (`docs/DESIGN.md` §14).
 pub const LOCK_TTL_MS: u64 = 3_000;
+
+/// Bits of the logical counter in a timestamp: `ts = physical_ms << 18 | logical`.
+///
+/// A copy of `esker_pd::TSO_LOGICAL_BITS`, for the same reason `esker_txn::TSO_LOGICAL_BITS`
+/// is one: a client sits above the placement driver in `CLAUDE.md`'s layer table and does not
+/// link it, but it has to read a lock's age out of a timestamp to know whether the lease has
+/// run out. A copy that drifts would put every lock TTL out by a factor of 2^18, so
+/// `tests/txn_ttl.rs` checks this one against its source.
+pub const TSO_LOGICAL_BITS: u32 = 18;
+
+/// The physical millisecond a timestamp was minted in.
+#[must_use]
+pub fn physical_ms(ts: u64) -> u64 {
+    ts >> TSO_LOGICAL_BITS
+}
+
+/// Whether a lock minted at `start_ts` with a `ttl_ms` lease is dead as of `now_ts`.
+///
+/// Both arguments are **timestamps from the oracle**, never wall-clock readings
+/// (`CLAUDE.md` invariant 6): no node decides another node's transaction is dead by looking at
+/// its own clock. The comparison is on the physical halves alone, so every logical counter
+/// inside the last millisecond of the lease is still live.
+///
+/// The judgement is deliberately **conservative**. `now_ts` comes from this client, which may
+/// be behind, so this can be late in declaring a lock dead and never early. Late costs
+/// latency; early aborts a transaction that is alive (`docs/plans/phase-5.md` §10.2).
+#[must_use]
+pub fn is_expired(start_ts: u64, ttl_ms: u64, now_ts: u64) -> bool {
+    physical_ms(now_ts) > physical_ms(start_ts).saturating_add(ttl_ms)
+}
 
 /// Most regions one scan walks before it answers with what it has.
 ///
@@ -526,7 +558,7 @@ impl Transaction {
                     start_ts: locks[0].start_ts,
                 });
             }
-            self.resolve_all(&locks)?;
+            self.resolve_all(&locks, round)?;
         }
         // The loop above returns on every path; `0..=n` is never empty.
         Err(Error::Internal(
@@ -554,19 +586,21 @@ impl Transaction {
     /// Grouped by the transaction that holds them rather than by key: one `ResolveLock` names
     /// a `start_ts` and the keys of *that* transaction, and the common case under contention is
     /// one competitor holding several of the keys we want — which is then one call, not one per
-    /// key.
-    fn resolve_all(&self, locks: &[LockInfo]) -> Result<()> {
-        let mut by_txn: BTreeMap<u64, Vec<Bytes>> = BTreeMap::new();
+    /// key. Every lock of one transaction names the same primary and the same `start_ts`, so
+    /// one of them stands for the group when its owner has to be classified.
+    fn resolve_all(&self, locks: &[LockInfo], attempt: u32) -> Result<()> {
+        let mut by_txn: BTreeMap<u64, (LockInfo, Vec<Bytes>)> = BTreeMap::new();
         for lock in locks {
             by_txn
                 .entry(lock.start_ts)
-                .or_default()
+                .or_insert_with(|| (lock.clone(), Vec::new()))
+                .1
                 .push(lock.key.clone());
         }
-        let groups: Vec<(u64, Vec<Bytes>)> = by_txn.into_iter().collect();
+        let groups: Vec<(LockInfo, Vec<Bytes>)> = by_txn.into_values().collect();
         for outcome in fan_out(groups.len(), |index| {
-            let (start_ts, keys) = &groups[index];
-            self.resolve(*start_ts, keys.clone())
+            let (lock, keys) = &groups[index];
+            self.resolve(lock, keys.clone(), attempt)
         }) {
             outcome?;
         }
@@ -712,7 +746,7 @@ impl Transaction {
                     start_ts: lock.start_ts,
                 });
             }
-            self.resolve(lock.start_ts, vec![lock.key.clone()])?;
+            self.resolve(&lock, vec![lock.key.clone()], attempt)?;
         }
         // The loop above returns on every path; `0..=n` is never empty.
         Err(Error::Internal(
@@ -723,26 +757,139 @@ impl Transaction {
     /// Finishes someone else's transaction, the way its primary says
     /// (`docs/txn-spec.md` §5.5).
     ///
-    /// The store reads the primary's state and decides; this side only has to ask, and to back
-    /// off when the answer is "its owner is still alive". The wait is a `Locked` on the
-    /// *primary*, which is the store's way of saying the lease has not run out — so the
-    /// backoff is the router's, and no wall clock is consulted here either.
-    fn resolve(&self, start_ts: u64, keys: Vec<Bytes>) -> Result<()> {
-        // Reading the primary at the lock's own `start_ts` is what classifies it: a `write`
-        // record there means the transaction committed, a rollback marker means it did not,
-        // and a lock still in the way means its owner is inside its lease.
+    /// **The verdict is this client's**, and it has to be. A store cannot classify a
+    /// transaction by reading its primary, because the primary may live in another region on
+    /// another store — that read would answer "missing" for a transaction perfectly alive
+    /// elsewhere and roll back a committed one (`docs/plans/phase-5.md` §10.6). So
+    /// `ResolveLock`'s `commit_ts` is not a question, it is an answer: above zero, commit these
+    /// keys there; zero, roll them back. Sending zero without having settled the primary first
+    /// tells the store to abandon a transaction that may have committed.
+    ///
+    /// The order is the mirror of the commit's, and for the same reason: **the primary is
+    /// settled first**, and everything else follows the fact it leaves behind.
+    fn resolve(&self, lock: &LockInfo, keys: Vec<Bytes>, attempt: u32) -> Result<()> {
+        let Some(verdict) = self.classify(lock)? else {
+            // Its owner is inside its lease. Waiting is the whole answer: the caller retries,
+            // and by then the owner has committed, or its lease has run out and this returns a
+            // verdict instead. Killing it here would abort a live transaction.
+            self.router
+                .clock()
+                .sleep(Duration::from_millis(backoff_ms(attempt)));
+            return Ok(());
+        };
+        // The primary is already settled — `classify` settled it — so only the rest is left.
+        let rest: Vec<Bytes> = keys
+            .into_iter()
+            .filter(|key| *key != lock.primary)
+            .collect();
+        if rest.is_empty() {
+            return Ok(());
+        }
         let request = TxnKvReq::ResolveLock {
-            start_ts,
-            // Zero is "roll back"; the store replaces it with the primary's commit timestamp
-            // when the primary turns out to be committed. The client does not read the primary
-            // itself, because a decision made from two round trips could be made from a
-            // snapshot that moved between them.
-            commit_ts: 0,
-            keys,
+            start_ts: lock.start_ts,
+            commit_ts: verdict.commit_ts(),
+            keys: rest,
         };
         match self.call(&request)? {
             TxnKvResp::ResolveLock { .. } => Ok(()),
             other => Err(unexpected(Method::TxnResolveLock, &other)),
+        }
+    }
+
+    /// What the transaction holding `lock` did, settling it if its lease has run out.
+    ///
+    /// `None` is "its owner is still alive" — the one answer that is not a verdict.
+    fn classify(&self, lock: &LockInfo) -> Result<Option<Verdict>> {
+        // From the oracle, not from a clock (`CLAUDE.md` invariant 6). A fresh timestamp
+        // rather than this transaction's own `start_ts`: both are conservative, but a reader
+        // that began long ago would judge every lock alive for ever and never make progress.
+        let now = self.oracle.timestamp()?;
+        if !is_expired(lock.start_ts, lock.ttl_ms, now) {
+            return Ok(None);
+        }
+        // The lock in hand may be a *secondary's*, and a `Heartbeat` extends the primary's
+        // lease alone — so a secondary's TTL can say "dead" about a transaction whose primary
+        // is still being kept alive. The primary's lease is the one that decides
+        // (`docs/txn-spec.md` §5.5), and this is the round trip that asks for it. It is spent
+        // only on the path that is about to declare somebody dead.
+        if let Some(primary) = self.lock_on_primary(lock)?
+            && !is_expired(primary.start_ts, primary.ttl_ms, now)
+        {
+            return Ok(None);
+        }
+        self.settle_primary(lock).map(Some)
+    }
+
+    /// The lock the transaction still holds on its own primary, if it holds one.
+    ///
+    /// A `Get` of the primary at the lock's own `start_ts` answers `Locked` exactly while the
+    /// owner's lock is in the way. Someone *else's* lock there means ours is long gone, which
+    /// reads as settled rather than as alive — the same reading `percolator::primary_state`
+    /// makes of it.
+    fn lock_on_primary(&self, lock: &LockInfo) -> Result<Option<LockInfo>> {
+        let request = TxnKvReq::Get {
+            key: lock.primary.clone(),
+            ts: lock.start_ts,
+        };
+        match self.call(&request) {
+            Ok(_) => Ok(None),
+            Err(error) => match lock_in(&error) {
+                Some(found) => Ok(found?)
+                    .map(|found: LockInfo| (found.start_ts == lock.start_ts).then_some(found)),
+                None => Err(error),
+            },
+        }
+    }
+
+    /// Settles the primary, and answers with what the transaction turned out to have done.
+    ///
+    /// A `Rollback` of it is the verdict *and* the act, in one apply: it either leaves a
+    /// rollback marker — so the transaction is dead for ever, and a late `Prewrite` of it will
+    /// fail (`docs/txn-spec.md` §5.4) — or it answers `Committed`, because the commit got there
+    /// first. There is no window between looking and deciding, which is what would let a
+    /// resolver undo a commit.
+    fn settle_primary(&self, lock: &LockInfo) -> Result<Verdict> {
+        let request = TxnKvReq::Rollback {
+            start_ts: lock.start_ts,
+            keys: vec![lock.primary.clone()],
+        };
+        match self.call(&request)? {
+            TxnKvResp::Rollback { status } => match status {
+                // Ours or someone else's, the marker is there and the answer is the same.
+                TxnStatus::Ok | TxnStatus::RolledBack => Ok(Verdict::Dead),
+                TxnStatus::Committed { commit_ts } => Ok(Verdict::Committed { commit_ts }),
+                // Nothing else can come back from a rollback, and guessing at one would mean
+                // guessing at a transaction's fate. `LockNotFound` here means the store could
+                // not account for the primary at all, which is not a licence to abandon it.
+                other => Err(Error::Store(ProtoError::invalid(format!(
+                    "settling the primary of the transaction at {} answered {other:?}",
+                    lock.start_ts
+                )))),
+            },
+            other => Err(unexpected(Method::TxnRollback, &other)),
+        }
+    }
+}
+
+/// What the transaction that owns a lock turned out to have done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// It committed, at this timestamp: every key of it rolls **forward**.
+    Committed {
+        /// Where its `write` records go.
+        commit_ts: u64,
+    },
+    /// It is dead — settled by us, or by whoever got there first.
+    Dead,
+}
+
+impl Verdict {
+    /// The `commit_ts` a `ResolveLock` carries. Zero is "roll back", which is unambiguous
+    /// because no transaction commits at timestamp zero.
+    fn commit_ts(self) -> u64 {
+        match self {
+            Self::Committed { commit_ts } => commit_ts,
+            Self::Dead => 0,
         }
     }
 }
