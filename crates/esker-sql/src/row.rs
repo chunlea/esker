@@ -18,10 +18,27 @@
 //! row key    't' ++ tenant:u64 ++ table_id:u64 ++ 'r' ++ memcomparable(primary key columns)
 //! index key  't' ++ tenant:u64 ++ table_id:u64 ++ 'i' ++ index_id:u64
 //!                ++ (null_marker ++ memcomparable(column))*  [++ memcomparable(primary key)]
-//! row value  version:u8=1 ++ null_bitmap:ceil(n/8) ++ non-NULL columns in column order
+//! row value  version:u8=2 ++ columns:varint ++ null_bitmap:ceil(columns/8)
+//!                ++ non-NULL columns in column order
 //! ```
 //!
-//! # Three decisions worth their own paragraph
+//! # Four decisions worth their own paragraph
+//!
+//! **The row says how many columns it holds, and that is what makes `ALTER TABLE ADD COLUMN`
+//! free.** A row written before the column existed is not rewritten; it is read back with the
+//! trailing columns padded to NULL, which is what PostgreSQL shows for them anyway. The count has
+//! to be *in the row* for that to be sound: without it the bitmap's length is taken from the
+//! reader's column list, so a two-column row read as three would take the third bitmap bit
+//! (unset, meaning "not NULL") and run off the end of the value — and once the column count
+//! crosses a multiple of eight the bitmap grows a byte and the reader would take the first
+//! column's bytes as bitmap, which is a *wrong answer* rather than an error. A count in the row
+//! is one varint and it closes both. Reading a row that claims *more* columns than the reader
+//! has is corruption, not padding: the catalog is read at the same snapshot as the row, so a row
+//! from a newer schema cannot be visible to a transaction that cannot see the schema.
+//! `ADR 0019` records the change and what it does not solve — a `DROP COLUMN` needs a row that
+//! carries column *identity*, not a count.
+//!
+//! # Three more decisions worth their own paragraph
 //!
 //! **The trailing primary key on an index entry is what makes it unique, so a unique index leaves
 //! it off** — its absence is what turns a duplicate into a collision on one key, which is exactly
@@ -50,7 +67,11 @@ use crate::value::{ColumnType, Datum, sort_bits_of_f64};
 
 /// The version byte a row value starts with. An older node reading a newer row must fail rather
 /// than misread it (`CLAUDE.md` invariant 2).
-pub const ROW_FORMAT_VERSION: u8 = 1;
+///
+/// Version 2 added the column count (ADR 0019). Version 1 is not read: it was never written
+/// anywhere but a test, and a compatibility path for data that does not exist is one nothing can
+/// check.
+pub const ROW_FORMAT_VERSION: u8 = 2;
 
 /// Ahead of every index column: the value is present.
 const KEY_PRESENT: u8 = 0x00;
@@ -60,8 +81,10 @@ const KEY_NULL: u8 = 0x01;
 
 /// Encodes one row's columns as the value half of its key/value pair.
 ///
-/// The bitmap comes before the values so that a projection can skip a NULL column without decoding
-/// anything, and a row of all NULLs is a version byte and a run of set bits.
+/// The count comes first so that a reader with *more* columns than the writer had — every reader
+/// of a row written before an `ALTER TABLE ADD COLUMN` — knows where the bitmap ends. The bitmap
+/// comes before the values so that a projection can skip a NULL column without decoding anything,
+/// and a row of all NULLs is a header and a run of set bits.
 pub fn encode_row(types: &[ColumnType], values: &[Datum]) -> Result<Vec<u8>> {
     if types.len() != values.len() {
         return Err(SqlError::Internal(format!(
@@ -72,13 +95,15 @@ pub fn encode_row(types: &[ColumnType], values: &[Datum]) -> Result<Vec<u8>> {
     }
 
     let bitmap_len = types.len().div_ceil(8);
-    let mut out = Vec::with_capacity(1 + bitmap_len + 8 * types.len());
+    let mut out = Vec::with_capacity(2 + bitmap_len + 8 * types.len());
     out.push(ROW_FORMAT_VERSION);
-    out.resize(1 + bitmap_len, 0);
+    varint::put_u64(types.len() as u64, &mut out);
+    let bitmap_at = out.len();
+    out.resize(bitmap_at + bitmap_len, 0);
 
     for (index, (ty, value)) in types.iter().zip(values).enumerate() {
         if matches!(value, Datum::Null) {
-            out[1 + index / 8] |= 1 << (index % 8);
+            out[bitmap_at + index / 8] |= 1 << (index % 8);
             continue;
         }
         if !value.fits(*ty) {
@@ -110,11 +135,16 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
     }
 }
 
-/// Reads a row value back, given the columns it was written with.
+/// Reads a row value back, given the columns the table has **now**.
 ///
 /// The encoding carries no type tags, so the schema is what makes it readable — the same rule as
 /// `esker_keys::codec::decode_tuple`. Every failure is a typed error: a truncated or corrupt row
 /// is data, and data never panics this crate (`CLAUDE.md` invariant 9).
+///
+/// A row written with *fewer* columns than `types` — every row written before an `ALTER TABLE ADD
+/// COLUMN` — is padded with NULL, which is what PostgreSQL shows for those columns and is why the
+/// `ALTER` rewrites nothing. A row that claims *more* is corruption: rows and the catalog are read
+/// at one snapshot, so a row from a schema the reader cannot see cannot be visible to it either.
 pub fn decode_row(types: &[ColumnType], bytes: &[u8]) -> Result<Vec<Datum>> {
     let (&version, rest) = bytes.split_first().ok_or_else(|| corrupt("row is empty"))?;
     if version != ROW_FORMAT_VERSION {
@@ -123,13 +153,25 @@ pub fn decode_row(types: &[ColumnType], bytes: &[u8]) -> Result<Vec<Datum>> {
         )));
     }
 
-    let bitmap_len = types.len().div_ceil(8);
+    let (written, consumed) =
+        varint::get_u64(rest).map_err(|error| corrupt(format!("row column count: {error}")))?;
+    let written = usize::try_from(written)
+        .map_err(|_| corrupt("a row of more columns than this machine can count"))?;
+    if written > types.len() {
+        return Err(corrupt(format!(
+            "a row of {written} columns in a table of {}",
+            types.len()
+        )));
+    }
+    let rest = &rest[consumed..];
+
+    let bitmap_len = written.div_ceil(8);
     let (bitmap, mut rest) = rest
         .split_at_checked(bitmap_len)
         .ok_or_else(|| corrupt("row ends inside its NULL bitmap"))?;
 
     let mut values = Vec::with_capacity(types.len());
-    for (index, ty) in types.iter().enumerate() {
+    for (index, ty) in types.iter().take(written).enumerate() {
         if bitmap[index / 8] & (1 << (index % 8)) != 0 {
             values.push(Datum::Null);
             continue;
@@ -144,6 +186,9 @@ pub fn decode_row(types: &[ColumnType], bytes: &[u8]) -> Result<Vec<Datum>> {
             rest.len()
         )));
     }
+    // Columns added after this row was written. The `ALTER` that added them refuses `NOT NULL`,
+    // so NULL is a value they are allowed to hold.
+    values.resize(types.len(), Datum::Null);
     Ok(values)
 }
 
@@ -390,9 +435,11 @@ mod tests {
     }
 
     /// The golden. These bytes are the format, and changing any of them is a format change with
-    /// everything that implies (`CLAUDE.md`, "ask before doing").
+    /// everything that implies (`CLAUDE.md`, "ask before doing"). Version 2 added the column
+    /// count after the version byte, so that a row survives an `ALTER TABLE ADD COLUMN`
+    /// (ADR 0019).
     #[test]
-    fn a_row_value_is_a_version_a_bitmap_and_the_columns() {
+    fn a_row_value_is_a_version_a_count_a_bitmap_and_the_columns() {
         let types = [
             ColumnType::Int8,
             ColumnType::Text,
@@ -412,7 +459,8 @@ mod tests {
         assert_eq!(
             hex(&encode_row(&types, &values).unwrap()),
             concat!(
-                "01",               // format version
+                "02",               // format version
+                "06",               // varint 6: the columns this row was written with
                 "00",               // NULL bitmap: six columns, none NULL
                 "0100000000000000", // 1 as little-endian i64
                 "026869",           // varint 2, "hi"
@@ -440,7 +488,8 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "01",               // version
+                "02",               // version
+                "09",               // varint 9 columns -- and so a two-byte bitmap
                 "fe",               // columns 1..=7 are NULL, column 0 is not
                 "00",               // column 8 is not NULL
                 "0700000000000000", // column 0
@@ -448,6 +497,67 @@ mod tests {
             )
         );
         assert_eq!(decode_row(&types, &encoded).unwrap(), values);
+    }
+
+    /// The point of the column count: a row written before `ALTER TABLE ADD COLUMN` reads back
+    /// with the new columns NULL, and nothing rewrote it.
+    #[test]
+    fn a_row_written_before_a_column_existed_reads_back_padded_with_nulls() {
+        let before = [ColumnType::Int8, ColumnType::Text];
+        let row = encode_row(&before, &[Datum::Int8(1), Datum::Text("one".into())]).unwrap();
+
+        let after = [ColumnType::Int8, ColumnType::Text, ColumnType::Bool];
+        assert_eq!(
+            decode_row(&after, &row).unwrap(),
+            [Datum::Int8(1), Datum::Text("one".into()), Datum::Null]
+        );
+
+        // And again, because two successive ALTERs are what a table actually gets.
+        let after = [
+            ColumnType::Int8,
+            ColumnType::Text,
+            ColumnType::Bool,
+            ColumnType::Double,
+        ];
+        assert_eq!(
+            decode_row(&after, &row).unwrap(),
+            [
+                Datum::Int8(1),
+                Datum::Text("one".into()),
+                Datum::Null,
+                Datum::Null,
+            ]
+        );
+    }
+
+    /// The case a lenient decoder gets *wrong* rather than merely wrong-length: at nine columns
+    /// the bitmap grows a second byte, so a reader that sized the bitmap from its own column list
+    /// would read the first column's leading byte as bitmap and answer with plausible nonsense.
+    /// The count in the row is what stops it.
+    #[test]
+    fn adding_a_ninth_column_does_not_reinterpret_the_bitmap() {
+        let eight = [ColumnType::Int8; 8];
+        let values: Vec<Datum> = (0..8).map(Datum::Int8).collect();
+        let row = encode_row(&eight, &values).unwrap();
+        assert_eq!(row[1], 8, "the count, before a one-byte bitmap");
+
+        let nine = [ColumnType::Int8; 9];
+        let mut expected = values;
+        expected.push(Datum::Null);
+        assert_eq!(decode_row(&nine, &row).unwrap(), expected);
+    }
+
+    /// The other direction is corruption, not padding. A row and the catalog are read at one
+    /// snapshot, so a transaction that cannot see the `ALTER` cannot see a row that used it.
+    #[test]
+    fn a_row_of_more_columns_than_the_table_has_is_corruption() {
+        let row = encode_row(
+            &[ColumnType::Int8, ColumnType::Int8],
+            &[Datum::Int8(1), Datum::Int8(2)],
+        )
+        .unwrap();
+        let error = decode_row(&[ColumnType::Int8], &row).unwrap_err();
+        assert_eq!(error.sqlstate(), sqlstate::DATA_CORRUPTED);
     }
 
     /// An empty string is not a NULL, and the encoding must not let them become each other.
@@ -718,6 +828,33 @@ mod tests {
     proptest::proptest! {
         /// Round trip: whatever goes into a row comes back out of it, for any mixture of types
         /// and any placement of NULLs.
+        #[test]
+        /// Every row survives every number of columns appended after it was written, which is
+        /// the property `ALTER TABLE ADD COLUMN` rests on. The appended types are arbitrary:
+        /// nothing of them is read, because the padding is NULL whatever they are.
+        #[test]
+        fn a_row_survives_any_number_of_columns_appended_after_it(
+            (types, rows) in schema_and_rows(0..12, 1),
+            added in proptest::collection::vec(
+                proptest::sample::select(&[
+                    ColumnType::Int8,
+                    ColumnType::Text,
+                    ColumnType::Bool,
+                    ColumnType::Bytea,
+                    ColumnType::TimestampTz,
+                    ColumnType::Double,
+                ][..]),
+                0..6,
+            ),
+        ) {
+            let row = encode_row(&types, &rows[0]).unwrap();
+            let mut widened = types.clone();
+            widened.extend_from_slice(&added);
+            let mut expected = rows[0].clone();
+            expected.resize(widened.len(), Datum::Null);
+            proptest::prop_assert_eq!(decode_row(&widened, &row).unwrap(), expected);
+        }
+
         #[test]
         fn any_row_survives_encode_and_decode((types, rows) in schema_and_rows(0..12, 1)) {
             let values = &rows[0];

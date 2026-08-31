@@ -228,8 +228,11 @@ socket edge (`CLAUDE.md`). The session runs the executor on a blocking task.
 Both get a version byte first and a golden test, and an unknown version is a typed error, never a
 panic (`CLAUDE.md` invariants 2 and 9).
 
-- **Row value** — `version:u8=1 ++ null_bitmap:ceil(n/8) ++ non-null column values in column
-  order`. Per type: `INT8` 8-byte LE two's complement; `BOOL` one byte 0/1; `DOUBLE` 8-byte LE
+- **Row value** — `version:u8=2 ++ columns:varint ++ null_bitmap:ceil(columns/8) ++ non-null
+  column values in column order`. The count is what makes `ALTER TABLE ADD COLUMN` rewrite nothing:
+  a row narrower than the table reads back padded with NULL, and one wider is corruption
+  ([ADR 0019](../adr/0019-a-row-says-how-many-columns-it-has.md), which also records why version 1
+  — no count — is refused rather than kept readable). Per type: `INT8` 8-byte LE two's complement; `BOOL` one byte 0/1; `DOUBLE` 8-byte LE
   IEEE-754; `TIMESTAMPTZ` `i64` LE microseconds since 2000-01-01 UTC (PG's own epoch, so a value
   round-trips through PG's binary format unchanged); `TEXT` and `BYTEA` varint length ++ bytes.
   The bitmap is first so a projection can skip a NULL column without decoding it.

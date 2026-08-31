@@ -97,6 +97,8 @@ pub(super) fn create_table(
             .primary_key_name
             .clone()
             .unwrap_or_else(|| plan::primary_key_name(&create.name)),
+        // A table starts at schema version 1; `ALTER TABLE ADD COLUMN` moves it.
+        schema_version: 1,
     };
     catalog::create_table(txn, executor.tenant, &table)?;
     Ok(Outcome::done("CREATE TABLE"))

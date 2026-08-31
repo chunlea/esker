@@ -96,6 +96,15 @@ pub struct TableDef {
     /// The primary key constraint's name, which is a relation name like any other even though it
     /// has no index behind it. It is what a `23505` on the key quotes back.
     pub primary_key_name: String,
+    /// How many times this table's *shape* has changed. `1` for a table as `CREATE TABLE` left
+    /// it; each `ALTER TABLE ADD COLUMN` adds one.
+    ///
+    /// Nothing needs it to read a row — a row carries its own column count (`crate::row`) — so it
+    /// is not load-bearing yet. It is here because a schema change is the table's own event and
+    /// the cluster-wide `catalog_version` cannot say which table moved, which is what the staged
+    /// online-DDL design in `docs/adr/0020-online-schema-change.md` needs to attach per-column
+    /// states to.
+    pub schema_version: u64,
 }
 
 impl TableDef {
@@ -494,6 +503,7 @@ mod tests {
                 columns: vec![1],
             }],
             primary_key_name: "accounts_pkey".into(),
+            schema_version: 1,
         }
     }
 
@@ -511,13 +521,14 @@ mod tests {
         assert_eq!(
             hex,
             concat!(
-                "01",                 // catalog format version
+                "02",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
                 // relation name like any other and has to be reserved, even though there is no
                 // index behind it: the row key *is* the primary key.
                 "0d6163636f756e74735f706b6579",
+                "01", // schema version 1: CREATE TABLE has run and no ALTER has
                 "02", // two columns
                 "026964",
                 "01",

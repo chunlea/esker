@@ -25,7 +25,11 @@ use crate::error::{Result, SqlError};
 use crate::value::ColumnType;
 
 /// The version byte on every catalog record.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 1;
+///
+/// Version 2 added a table's schema version (ADR 0019). Version 1 is not read: nothing has ever
+/// persisted a catalog outside a test, and a compatibility path for data that does not exist is
+/// one nothing can check.
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 2;
 
 /// What every catalog key begins with, after the `'m'` namespace byte.
 const SQL: &[u8] = b"sql";
@@ -131,6 +135,8 @@ pub(super) fn encode_table(table: &TableDef) -> Vec<u8> {
 
     put_str(&table.primary_key_name, &mut out);
 
+    varint::put_u64(table.schema_version, &mut out);
+
     varint::put_u64(table.columns.len() as u64, &mut out);
     for column in &table.columns {
         put_str(&column.name, &mut out);
@@ -162,6 +168,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
     let id = reader.u64_le()?;
     let name = reader.string()?;
     let primary_key_name = reader.string()?;
+    let schema_version = reader.varint()?;
 
     let mut columns = Vec::with_capacity(reader.count()?);
     for _ in 0..columns.capacity() {
@@ -202,6 +209,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
         primary_key,
         indexes,
         primary_key_name,
+        schema_version,
     })
 }
 
