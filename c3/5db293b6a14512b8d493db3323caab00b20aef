@@ -1,0 +1,38 @@
+crates/esker-sql/src/backend.rs
+  h_44076b318daf9c 272-275
+crates/esker-sql/src/error.rs
+  h_44076b318daf9c 135-145,171-181,232-274,363,371-373,378-381,385-387,399-402,436-452,470-472,542-546
+crates/esker-sql/src/exec/dml.rs
+  h_44076b318daf9c 1-185
+crates/esker-sql/src/exec/mod.rs
+  h_44076b318daf9c 28,44,47-51,65,74-75,77,108,137-142,177,179-195,206-211,232,237,241-246,250
+crates/esker-sql/src/parse.rs
+  h_44076b318daf9c 27-29,825,1022-1146
+crates/esker-sql/src/pgwire/mod.rs
+  h_44076b318daf9c 45-47
+crates/esker-sql/src/pgwire/session.rs
+  h_44076b318daf9c 898-901
+crates/esker-sql/src/plan/dml.rs
+  h_44076b318daf9c 1-16
+crates/esker-sql/src/plan/expr.rs
+  h_44076b318daf9c 1-140
+crates/esker-sql/src/plan/mod.rs
+  h_44076b318daf9c 22-23,29-30,37-41,51-52,71-72
+crates/esker-sql/src/sqlstate.rs
+  h_44076b318daf9c 136-137,232
+crates/esker-sql/tests/insert.rs
+  h_44076b318daf9c 1-484
+docs/plans/phase-6a.md
+  h_44076b318daf9c 475,477-478,690-736
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "c35db293b6a14512b8d493db3323caab00b20aef",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
