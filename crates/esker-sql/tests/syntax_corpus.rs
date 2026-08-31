@@ -14,7 +14,7 @@
 //! # The invariant this file exists to hold
 //!
 //! **No statement PostgreSQL 19 accepts is ever answered with a syntax error.** Not "few", not
-//! "only obscure ones" — none, across all 413. There are exactly two acceptable answers:
+//! "only obscure ones" — none, across all 416. There are exactly two acceptable answers:
 //!
 //! * the statement parses; or
 //! * it comes back `0A000 feature_not_supported` **naming the construct**, which is what

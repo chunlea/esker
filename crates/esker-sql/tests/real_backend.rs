@@ -348,3 +348,66 @@ fn a_historical_read_against_real_stores_sees_the_old_row() {
         "and the present is where the block left it"
     );
 }
+
+/// The time machine's two verbs against three real stores: a checkpoint, and a diff across it.
+///
+/// The fake proves the merge; this proves the wiring, which is the question a fake cannot answer —
+/// two read-only transactions at two timestamps, each scanning a range that spans the stores that
+/// hold it, through Percolator.
+#[test]
+fn a_diff_across_a_checkpoint_runs_against_real_stores() {
+    let cluster = Cluster::start();
+    let mut session = cluster.session();
+
+    session
+        .run("CREATE TABLE d (id int8 PRIMARY KEY, note text)")
+        .unwrap();
+    session
+        .run("INSERT INTO d VALUES (1, 'same'), (2, 'old'), (3, 'gone')")
+        .unwrap();
+    session.run("SELECT esker_checkpoint('d0')").unwrap();
+
+    session
+        .run("UPDATE d SET note = 'new' WHERE id = 2")
+        .unwrap();
+    session.run("DELETE FROM d WHERE id = 3").unwrap();
+    session.run("INSERT INTO d VALUES (4, 'fresh')").unwrap();
+
+    let mut rows = session.rows("SELECT * FROM esker_diff('d', 'd0')");
+    rows.sort();
+    assert_eq!(
+        rows,
+        [
+            vec![
+                Some("delete".to_owned()),
+                Some("(3)".to_owned()),
+                Some("(3, gone)".to_owned()),
+                None,
+            ],
+            vec![
+                Some("insert".to_owned()),
+                Some("(4)".to_owned()),
+                None,
+                Some("(4, fresh)".to_owned()),
+            ],
+            vec![
+                Some("update".to_owned()),
+                Some("(2)".to_owned()),
+                Some("(2, old)".to_owned()),
+                Some("(2, new)".to_owned()),
+            ],
+        ],
+        "key 1 was never touched and is not a row"
+    );
+
+    // A checkpoint taken on one session is a name any session on the cluster can use.
+    let mut other = cluster.session();
+    other.run("BEGIN").unwrap();
+    other.run("SET TRANSACTION SNAPSHOT 'd0'").unwrap();
+    assert_eq!(
+        other.rows("SELECT note FROM d WHERE id = 3"),
+        [[Some("gone".to_owned())]],
+        "the row this session deleted, out of three real stores"
+    );
+    other.run("ROLLBACK").unwrap();
+}

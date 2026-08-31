@@ -194,6 +194,62 @@ SET TRANSACTION SNAPSHOT 'before'
 statement ok
 ROLLBACK
 
+# --- esker_diff
+# Two scans and a merge (ADR 0021 Decision 3): a key on the right only is an insert, on the left
+# only a delete, on both with different bytes an update, and identical bytes are not a row.
+#
+# **Not a changelog.** It compares two states: a key written and then written back is invisible
+# here, and five updates look like one. Saying so matters because "diff" invites the other
+# reading; the real changelog is the Raft log, and reading it is a different feature.
+statement ok
+CREATE TABLE d (id int8 PRIMARY KEY, note text)
+
+statement ok
+INSERT INTO d VALUES (1, 'same'), (2, 'old'), (3, 'gone')
+
+statement ok
+SELECT esker_checkpoint('d0')
+
+statement ok
+UPDATE d SET note = 'new' WHERE id = 2
+
+statement ok
+DELETE FROM d WHERE id = 3
+
+statement ok
+INSERT INTO d VALUES (4, 'fresh')
+
+# Key 1 was never touched, so it is not a row here. The two-argument form compares against now.
+query TTTT rowsort
+SELECT * FROM esker_diff('d', 'd0')
+----
+delete	(3)	(3, gone)	NULL
+insert	(4)	NULL	(4, fresh)
+update	(2)	(2, old)	(2, new)
+
+# Written and written back: three versions of key 1 exist and the diff sees none of them.
+statement ok
+SELECT esker_checkpoint('d1')
+
+statement ok
+UPDATE d SET note = 'other' WHERE id = 1
+
+statement ok
+UPDATE d SET note = 'same' WHERE id = 1
+
+query TTTT rowsort
+SELECT * FROM esker_diff('d', 'd1')
+----
+
+# A snapshot that is not there is 42704, like any other read at a name that does not exist.
+statement error (42704)
+SELECT * FROM esker_diff('d', 'no-such-checkpoint')
+
+# EXCEPT stays 0A000: implementing general set operations to reach a two-table diff would be a
+# larger feature refused in a smaller disguise.
+statement error (0A000)
+SELECT id FROM d EXCEPT SELECT id FROM d
+
 # --- ALTER TABLE ... SET (retention)
 # The travel window is retention, and there is no second mechanism: how far back you can read is
 # how far back the collector has not yet swept, and those must be one number or the feature is a

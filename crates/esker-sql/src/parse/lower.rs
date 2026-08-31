@@ -135,6 +135,40 @@ fn lower_verb(query: &Query) -> Result<Option<plan::TimeMachineVerb>> {
         } = &table.relation
     {
         let called = name.to_string().to_ascii_lowercase();
+        if called == "esker_diff" {
+            refuse_if(!table.joins.is_empty(), "a JOIN on esker_diff()")?;
+            refuse_if(select.selection.is_some(), "a WHERE on esker_diff()")?;
+            refuse_if(
+                !matches!(select.projection.as_slice(), [SelectItem::Wildcard(_)]),
+                "a target list on esker_diff() other than *",
+            )?;
+            let TableFactor::Table {
+                args: Some(args), ..
+            } = &table.relation
+            else {
+                unreachable!("matched with args above")
+            };
+            let arguments = table_function_arguments(args).ok_or_else(|| {
+                SqlError::unsupported("esker_diff() with arguments that are not string literals")
+            })?;
+            return Ok(Some(match arguments.as_slice() {
+                [table, from] => plan::TimeMachineVerb::Diff {
+                    table: fold_identifier(table, true).0,
+                    from: from.clone(),
+                    to: None,
+                },
+                [table, from, to] => plan::TimeMachineVerb::Diff {
+                    table: fold_identifier(table, true).0,
+                    from: from.clone(),
+                    to: Some(to.clone()),
+                },
+                _ => {
+                    return Err(SqlError::unsupported(
+                        "esker_diff() with a number of arguments other than two or three",
+                    ));
+                }
+            }));
+        }
         if called == "esker_checkpoints" {
             // Nothing else may be attached: this returns what it returns, and a `WHERE` silently
             // ignored would answer a different question than the one asked.
@@ -177,6 +211,28 @@ fn lower_verb(query: &Query) -> Result<Option<plan::TimeMachineVerb>> {
         }
         _ => None,
     })
+}
+
+/// A table function's arguments as strings, or `None` when any is not a plain string literal.
+///
+/// Same rule as [`verb_arguments`] and a different AST shape: a table function's arguments hang
+/// off the `FROM` item rather than off a projected expression.
+fn table_function_arguments(args: &sqlparser::ast::TableFunctionArgs) -> Option<Vec<String>> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr};
+
+    if args.settings.is_some() {
+        return None;
+    }
+    args.args
+        .iter()
+        .map(|argument| match argument {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(value))) => match &value.value {
+                Value::SingleQuotedString(text) => Some(text.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
 }
 
 /// A verb's arguments as strings, or `None` when any of them is not a plain string literal.

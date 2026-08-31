@@ -36,7 +36,7 @@ use crate::pgwire::message::FieldDescription;
 use crate::pgwire::session::Outcome;
 use crate::plan::TimeMachineVerb;
 use crate::time_machine::{check_name, render, token};
-use crate::value::ColumnType;
+use crate::value::{ColumnType, Datum};
 
 /// Runs one verb.
 pub(super) fn run(
@@ -48,6 +48,7 @@ pub(super) fn run(
         TimeMachineVerb::ExportSnapshot { name } => export(executor, txn, name.as_deref()),
         TimeMachineVerb::DropCheckpoint { name } => drop_one(executor, name),
         TimeMachineVerb::ListCheckpoints => list(executor, txn),
+        TimeMachineVerb::Diff { table, from, to } => diff(executor, table, from, to.as_deref()),
     }
 }
 
@@ -145,4 +146,211 @@ fn one_text(column: &str, value: String) -> Outcome {
         rows: vec![vec![Some(value.into_bytes())]],
         tag: "SELECT 1".to_owned(),
     }
+}
+
+/// `esker_diff('<table>', '<from>'[, '<to>'])` — two scans and a merge.
+///
+/// ADR 0021 Decision 3, implemented as it is described there: open two read-only transactions,
+/// scan the same row range in both, and walk the two sorted streams together. A key on the right
+/// only is an `insert`, on the left only a `delete`, on both with different bytes an `update`, and
+/// identical bytes are not a row at all. `O(rows)` with no buffering beyond one row per side,
+/// because the key space is ordered and both sides come back in that order.
+///
+/// **Each side is rendered with its own snapshot's schema.** The two transactions each read the
+/// catalog at their own timestamp, so a diff spanning an `ALTER TABLE ... ADD COLUMN` shows the
+/// old row with the old columns and the new one with the new — which is what happened. Resolving
+/// one schema and using it for both would print a row that never existed.
+///
+/// It is **not a changelog**, and the type's doc comment says so where a reader meets it first: a
+/// key written and written back is invisible here, and five updates look like one.
+fn diff(executor: &mut Executor, table: &str, from: &str, to: Option<&str>) -> Result<Outcome> {
+    let left = executor.snapshot_named(from)?;
+    let left_txn = executor.read_at(left)?;
+    // `None` is the present, and the present is a fresh ordinary transaction rather than a
+    // historical one: there is no timestamp to name for "now" that is not already stale.
+    let right_txn = match to {
+        Some(name) => {
+            let right = executor.snapshot_named(name)?;
+            executor.read_at(right)?
+        }
+        None => executor.plain_read()?,
+    };
+
+    let mut rows = Vec::new();
+    let mut left_side = Side::open(&*left_txn, executor.tenant, table)?;
+    let mut right_side = Side::open(&*right_txn, executor.tenant, table)?;
+    let (mut left_row, mut right_row) = (left_side.next()?, right_side.next()?);
+    loop {
+        match (&left_row, &right_row) {
+            (None, None) => break,
+            (Some(old), None) => {
+                rows.push(deleted(&left_side, &old.1));
+                left_row = left_side.next()?;
+            }
+            (None, Some(new)) => {
+                rows.push(inserted(&right_side, &new.1));
+                right_row = right_side.next()?;
+            }
+            (Some(old), Some(new)) => match old.0.cmp(&new.0) {
+                std::cmp::Ordering::Less => {
+                    rows.push(deleted(&left_side, &old.1));
+                    left_row = left_side.next()?;
+                }
+                std::cmp::Ordering::Greater => {
+                    rows.push(inserted(&right_side, &new.1));
+                    right_row = right_side.next()?;
+                }
+                std::cmp::Ordering::Equal => {
+                    // Identical bytes are not a row. The two sides are the *same encoding* of the
+                    // same values, so comparing bytes is comparing values — and it is what makes
+                    // an unchanged key cost nothing but the comparison. It stays right across a
+                    // schema change for a reason worth knowing: `ADD COLUMN` rewrites no row
+                    // (ADR 0019), so a row nobody touched has the *same bytes* on both sides and
+                    // is not a change — even though it now decodes to one more column. The column
+                    // is new; the row is not.
+                    if old.1 != new.1 {
+                        rows.push(updated(&left_side, &old.1, &right_side, &new.1));
+                    }
+                    left_row = left_side.next()?;
+                    right_row = right_side.next()?;
+                }
+            },
+        }
+    }
+
+    let tag = format!("SELECT {}", rows.len());
+    Ok(Outcome::Rows {
+        fields: ["change", "key", "before", "after"]
+            .into_iter()
+            .map(|name| FieldDescription::computed(name, ColumnType::Text))
+            .collect(),
+        rows,
+        tag,
+    })
+}
+
+/// One side of a diff: a table as one snapshot sees it, and a cursor over its rows.
+struct Side<'a> {
+    txn: &'a dyn Txn,
+    table: std::sync::Arc<catalog::TableDef>,
+    types: Vec<ColumnType>,
+    next: Vec<u8>,
+    end: Vec<u8>,
+    batch: std::vec::IntoIter<(bytes::Bytes, bytes::Bytes)>,
+}
+
+impl<'a> Side<'a> {
+    fn open(txn: &'a dyn Txn, tenant: u64, name: &str) -> Result<Self> {
+        // The catalog is read through *this* transaction, so each side sees the schema its own
+        // snapshot had. A table that did not exist yet is `42P01` from the side that cannot see
+        // it, which is the honest answer: a diff of a table against a moment before it existed is
+        // not an empty diff, it is a question about a table that was not there.
+        let table = catalog::Catalog::new()
+            .view_uncached(txn, tenant)?
+            .require_table(name)?;
+        let (next, end) = crate::row::table_row_range(tenant, table.id);
+        Ok(Side {
+            txn,
+            types: table.column_types(),
+            table,
+            next,
+            end,
+            batch: Vec::new().into_iter(),
+        })
+    }
+
+    /// The next `(key, value)`, a page at a time, stopping on an **empty** read.
+    fn next(&mut self) -> Result<Option<(Vec<u8>, bytes::Bytes)>> {
+        loop {
+            if let Some((key, value)) = self.batch.next() {
+                self.next = crate::exec::query::successor(&key);
+                return Ok(Some((key.to_vec(), value)));
+            }
+            let read = self
+                .txn
+                .scan(&self.next, &self.end, crate::exec::SCAN_CHUNK)?;
+            if read.is_empty() {
+                return Ok(None);
+            }
+            self.batch = read.into_iter();
+        }
+    }
+
+    /// A row's values, decoded with **this** side's schema.
+    ///
+    /// `Err` is not propagated: bytes a side cannot read are reported as a value rather than
+    /// aborting the diff, because a row that will not decode is a fact about the data and hiding
+    /// it would make the diff look complete.
+    fn values(&self, value: &[u8]) -> std::result::Result<Vec<Datum>, String> {
+        crate::row::decode_row(&self.types, value).map_err(|error| error.to_string())
+    }
+
+    /// A row rendered the way PostgreSQL renders a composite: `(1, ann, t)`, `null` for a NULL.
+    fn render_row(&self, value: &[u8]) -> String {
+        match self.values(value) {
+            Ok(row) => render_tuple(row.iter()),
+            Err(error) => format!("(unreadable: {error})"),
+        }
+    }
+
+    /// The primary key, rendered the way a `23505`'s `DETAIL` renders one.
+    ///
+    /// Taken from the **row**, not from the key bytes, and that is deliberate: the key columns are
+    /// columns of the row, so reading them out of the decoded row costs nothing and couples this
+    /// to no key format. The first version parsed the key and got it wrong — a row key encodes its
+    /// primary key without the per-column markers an *index* key carries, so the index decoder
+    /// this reached for fell through to hex on every row.
+    fn render_key(&self, value: &[u8]) -> String {
+        match self.values(value) {
+            Ok(row) => render_tuple(self.table.primary_key.iter().filter_map(|&at| row.get(at))),
+            // No key to show, and the row is already reported as unreadable beside it.
+            Err(_) => "(unreadable)".to_owned(),
+        }
+    }
+}
+
+/// `(1, ann, t)` — the shape PostgreSQL prints a composite in, and the one a `23505`'s `DETAIL`
+/// uses. No quoting, exactly as PostgreSQL does it.
+fn render_tuple<'a>(values: impl Iterator<Item = &'a Datum>) -> String {
+    let rendered = values
+        .map(|datum| datum.to_text().unwrap_or_else(|| "null".to_owned()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("({rendered})")
+}
+
+/// The three rows a diff can produce, one constructor each.
+///
+/// Three rather than one function taking two `Option`s, so that "a change has at least one side"
+/// is a fact about the signature rather than an `expect` at run time (`CLAUDE.md` invariant 9).
+/// Each knows which side holds the row, and therefore which schema renders it and which row the
+/// key comes out of.
+fn deleted(left: &Side<'_>, value: &[u8]) -> Vec<Option<Vec<u8>>> {
+    vec![
+        Some(b"delete".to_vec()),
+        Some(left.render_key(value).into_bytes()),
+        Some(left.render_row(value).into_bytes()),
+        None,
+    ]
+}
+
+fn inserted(right: &Side<'_>, value: &[u8]) -> Vec<Option<Vec<u8>>> {
+    vec![
+        Some(b"insert".to_vec()),
+        Some(right.render_key(value).into_bytes()),
+        None,
+        Some(right.render_row(value).into_bytes()),
+    ]
+}
+
+fn updated(left: &Side<'_>, old: &[u8], right: &Side<'_>, new: &[u8]) -> Vec<Option<Vec<u8>>> {
+    vec![
+        Some(b"update".to_vec()),
+        // Keyed from the newer side: the key is the same either way — the row key *is* the primary
+        // key, so an update cannot move it — and taking the newer one keeps the rule "the key is
+        // rendered with the schema of the row beside it" true in all three cases.
+        Some(right.render_key(new).into_bytes()),
+        Some(left.render_row(old).into_bytes()),
+        Some(right.render_row(new).into_bytes()),
+    ]
 }

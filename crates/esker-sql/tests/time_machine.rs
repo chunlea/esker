@@ -819,3 +819,185 @@ fn a_verb_inside_an_expression_is_refused_rather_than_half_run() {
         "nothing was written"
     );
 }
+
+// --- DIFF -------------------------------------------------------------------------------------
+
+/// The four things a diff can say, and the fourth is that it says nothing: two scans, one merge,
+/// and an unchanged key costs a comparison and produces no row.
+#[test]
+fn a_diff_reports_an_insert_an_update_a_delete_and_nothing_for_an_unchanged_key() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY, note text)")
+        .unwrap();
+    node.run("INSERT INTO t VALUES (1, 'same'), (2, 'old'), (3, 'gone')")
+        .unwrap();
+    node.run("SELECT esker_checkpoint('before')").unwrap();
+
+    node.run("UPDATE t SET note = 'new' WHERE id = 2").unwrap();
+    node.run("DELETE FROM t WHERE id = 3").unwrap();
+    node.run("INSERT INTO t VALUES (4, 'fresh')").unwrap();
+
+    let rows = node.rows("SELECT * FROM esker_diff('t', 'before')");
+    assert_eq!(
+        rows,
+        [
+            vec![
+                Some("update".to_owned()),
+                Some("(2)".to_owned()),
+                Some("(2, old)".to_owned()),
+                Some("(2, new)".to_owned()),
+            ],
+            vec![
+                Some("delete".to_owned()),
+                Some("(3)".to_owned()),
+                Some("(3, gone)".to_owned()),
+                None,
+            ],
+            vec![
+                Some("insert".to_owned()),
+                Some("(4)".to_owned()),
+                None,
+                Some("(4, fresh)".to_owned()),
+            ],
+        ],
+        "row 1 was never touched and is not a row here"
+    );
+}
+
+/// Two named snapshots, rather than one against the present. The three-argument form.
+#[test]
+fn a_diff_between_two_checkpoints_ignores_what_happened_after_the_second() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY, note text)")
+        .unwrap();
+    node.run("INSERT INTO t VALUES (1, 'one')").unwrap();
+    node.run("SELECT esker_checkpoint('a')").unwrap();
+    node.run("INSERT INTO t VALUES (2, 'two')").unwrap();
+    node.run("SELECT esker_checkpoint('b')").unwrap();
+    node.run("INSERT INTO t VALUES (3, 'three')").unwrap();
+
+    let rows = node.rows("SELECT * FROM esker_diff('t', 'a', 'b')");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0][0], Some("insert".to_owned()));
+    assert_eq!(rows[0][1], Some("(2)".to_owned()));
+
+    // And the same pair the other way round is the same change, read as its undo.
+    let back = node.rows("SELECT * FROM esker_diff('t', 'b', 'a')");
+    assert_eq!(back.len(), 1, "{back:?}");
+    assert_eq!(back[0][0], Some("delete".to_owned()));
+}
+
+/// **It is not a changelog**, and this is the test that says so: a key written and written back
+/// is invisible, and five updates look like one. Saying it in a doc comment is not enough — the
+/// other reading is the one "diff" invites.
+#[test]
+fn a_diff_compares_two_states_and_is_not_a_changelog() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY, note text)")
+        .unwrap();
+    node.run("INSERT INTO t VALUES (1, 'a'), (2, 'x')").unwrap();
+    node.run("SELECT esker_checkpoint('before')").unwrap();
+
+    // Written and written back: three versions of key 1 exist, and the diff sees none of them.
+    node.run("UPDATE t SET note = 'b' WHERE id = 1").unwrap();
+    node.run("UPDATE t SET note = 'a' WHERE id = 1").unwrap();
+    // Five updates to key 2, which the diff reports as one.
+    for note in ["p", "q", "r", "s", "z"] {
+        node.run(&format!("UPDATE t SET note = '{note}' WHERE id = 2"))
+            .unwrap();
+    }
+
+    let rows = node.rows("SELECT * FROM esker_diff('t', 'before')");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0][1], Some("(2)".to_owned()));
+    assert_eq!(rows[0][2], Some("(2, x)".to_owned()));
+    assert_eq!(rows[0][3], Some("(2, z)".to_owned()), "the last, not each");
+}
+
+/// Each side is rendered with **its own snapshot's schema**, which falls out of giving each side
+/// its own transaction. Using one schema for both would print a row that never existed.
+#[test]
+fn a_diff_across_an_add_column_renders_each_side_with_its_own_schema() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY, note text)")
+        .unwrap();
+    node.run("INSERT INTO t VALUES (1, 'one')").unwrap();
+    node.run("SELECT esker_checkpoint('before')").unwrap();
+
+    node.run("ALTER TABLE t ADD COLUMN extra text").unwrap();
+    node.run("UPDATE t SET extra = 'added' WHERE id = 1")
+        .unwrap();
+
+    let rows = node.rows("SELECT * FROM esker_diff('t', 'before')");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0][2], Some("(1, one)".to_owned()), "two columns then");
+    assert_eq!(
+        rows[0][3],
+        Some("(1, one, added)".to_owned()),
+        "three columns now"
+    );
+}
+
+/// A diff is two reads, so a snapshot outside the window is refused the way any read is, and a
+/// name that is not there is `42704`.
+#[test]
+fn a_diff_refuses_a_snapshot_it_could_not_read_at() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY)").unwrap();
+    assert_eq!(
+        node.fails("SELECT * FROM esker_diff('t', 'nope')")
+            .sqlstate(),
+        sqlstate::UNDEFINED_OBJECT
+    );
+    assert_eq!(
+        node.fails("SELECT * FROM esker_diff('t', '')").sqlstate(),
+        sqlstate::INVALID_PARAMETER_VALUE
+    );
+}
+
+/// A table that did not exist at the older snapshot is `42P01` from the side that cannot see it —
+/// which is the honest answer. A diff against a moment before the table existed is not an empty
+/// diff, it is a question about a table that was not there.
+#[test]
+fn a_diff_of_a_table_that_did_not_exist_yet_is_42p01() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE anchor (id int8 PRIMARY KEY)")
+        .unwrap();
+    node.run("SELECT esker_checkpoint('before')").unwrap();
+    node.run("CREATE TABLE later (id int8 PRIMARY KEY)")
+        .unwrap();
+
+    let error = node.fails("SELECT * FROM esker_diff('later', 'before')");
+    assert_eq!(error.sqlstate(), sqlstate::UNDEFINED_TABLE);
+}
+
+/// `EXCEPT` stays `0A000`. Implementing general set operations to reach a two-table diff would be
+/// a larger feature refused in a smaller disguise, and the diff that exists is the one ADR 0021
+/// describes: two scans over one table's row range, and a merge.
+#[test]
+fn except_is_still_refused_by_name() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY)").unwrap();
+    let error = node.fails("SELECT id FROM t EXCEPT SELECT id FROM t");
+    assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED);
+    assert_eq!(error.to_string(), "EXCEPT is not supported");
+}
+
+/// `ADD COLUMN` rewrites no row (ADR 0019), so a row nobody touched has the **same bytes** on both
+/// sides and is not a change — even though it decodes to one more column. That is the right
+/// answer and it is not the obvious one: the column is new, the row is not.
+#[test]
+fn add_column_alone_is_not_a_change_because_it_rewrites_no_row() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY, note text)")
+        .unwrap();
+    node.run("INSERT INTO t VALUES (1, 'one')").unwrap();
+    node.run("SELECT esker_checkpoint('before')").unwrap();
+    node.run("ALTER TABLE t ADD COLUMN extra text").unwrap();
+
+    assert!(
+        node.rows("SELECT * FROM esker_diff('t', 'before')")
+            .is_empty(),
+        "no row was rewritten, so no row changed"
+    );
+}

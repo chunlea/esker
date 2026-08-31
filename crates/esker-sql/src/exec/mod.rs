@@ -28,7 +28,7 @@ mod bind;
 mod cursor;
 mod ddl;
 mod dml;
-mod query;
+pub(crate) mod query;
 mod verbs;
 
 use std::sync::Arc;
@@ -347,6 +347,33 @@ impl Executor {
         }
         txn.commit()?;
         Ok(())
+    }
+
+    /// A snapshot id — a token or a checkpoint name — as the timestamp it means.
+    ///
+    /// The **same namespace** `SET TRANSACTION SNAPSHOT` reads, so anything a session can read at
+    /// is something a diff can compare against. Sharing it is the point: two grammars for one idea
+    /// would mean a checkpoint you could read at and not diff.
+    pub(crate) fn snapshot_named(&self, id: &str) -> Result<u64> {
+        match time_machine::parse_snapshot_id(id)? {
+            time_machine::SnapshotId::Timestamp(start_ts) => Ok(start_ts),
+            time_machine::SnapshotId::Checkpoint(name) => self.checkpoint_at(&name),
+        }
+    }
+
+    /// A read-only transaction at a timestamp, with the window checked as any other read is.
+    ///
+    /// Not routed through [`Executor::open_txn`], which answers with the *session's* snapshot: a
+    /// diff names its own two, and neither of them is the one the session is sitting at.
+    pub(crate) fn read_at(&self, start_ts: u64) -> Result<Box<dyn Txn>> {
+        let now = self.backend.now()?;
+        time_machine::Window::new(now, self.cluster_retention()?).admits(start_ts)?;
+        self.backend.begin_at(start_ts)
+    }
+
+    /// An ordinary transaction at the present, for the side of a diff that is "now".
+    pub(crate) fn plain_read(&self) -> Result<Box<dyn Txn>> {
+        self.backend.begin()
     }
 
     /// The timestamp a checkpoint names, or `42704`.

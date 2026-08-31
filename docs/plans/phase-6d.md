@@ -234,7 +234,10 @@ Written before the code, and each is one of the kinds `DESIGN.md` §11 requires 
   stub is gone: the historical read now runs against three real stores. The invented spellings gain
   a `HINT` naming what to write instead. `tests/slt/time_machine.slt` joins the corpus, so the
   surface runs under both `.slt` runners and against real stores.
-- [ ] 3 — `DIFF`
+- [x] 3 — **`DIFF`.** `SELECT * FROM esker_diff('<table>', '<from>'[, '<to>'])`, as ADR 0021
+  describes it: two read-only transactions, one scan each over the same row range, and a merge that
+  buffers one row per side. Four text columns, each side rendered with its own snapshot's schema.
+  `EXCEPT` stays `0A000`. Runs against three real stores.
 - [ ] 4 — the tests, and where PostgreSQL parity ends
 
 ## 9. What changed from this plan
@@ -290,6 +293,22 @@ half — so `SET esker.read_as_of = '-1h'` is `22023` there and `ok` here, and o
 both. Every past read in that file is reached through a checkpoint, which needs no clock; the
 instant and interval forms are asserted in `tests/time_machine.rs` over a fake whose clock is
 shaped like a real TSO.
+
+**The diff's snapshot arguments are a snapshot id, and "now" is an arity rather than a value.**
+`esker_diff('t', 'before')` compares against the present and `esker_diff('t', 'a', 'b')` compares
+two named ones. A magic `'now'` would have been a trap: a checkpoint may legitimately be called
+`now`, and a string that sometimes means a name and sometimes means the clock is the kind of
+surface that is wrong once and silently.
+
+**The key is rendered from the row, not from the key bytes.** The first version parsed the row key
+with `decode_key_columns`, which is the *index*-key decoder — an index key carries a per-column
+NULL marker and a row key does not, so every key fell through to hex. Reading the key columns out
+of the already-decoded row costs nothing and couples the diff to no key format.
+
+**`ADD COLUMN` alone is not a change**, which is worth a test because it is not the obvious answer.
+ADR 0019 makes it rewrite no row, so a row nobody touched has the same bytes on both sides even
+though it now decodes to one more column. A comment claiming the opposite was written and then
+corrected by the test.
 
 **Two test harnesses sent `BEGIN` through `execute`**, where it is `0A000 BEGIN is not supported`:
 transaction control belongs to `pgwire::session` and reaches the executor as a call. Neither

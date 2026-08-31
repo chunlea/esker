@@ -36,6 +36,23 @@ pub enum TimeMachineVerb {
     },
     /// `SELECT * FROM esker_checkpoints()`. A name you cannot list is a name you cannot use.
     ListCheckpoints,
+    /// `SELECT * FROM esker_diff('<table>', '<from>'[, '<to>'])`.
+    ///
+    /// Two scans and a merge, and **not a changelog** — saying so matters, because "diff" invites
+    /// the other reading. It compares two *states*: a key written and then written back is
+    /// invisible to it, and five updates look like one. A real changelog is the Raft log, and
+    /// reading it is a different feature.
+    Diff {
+        /// The table, folded like any other relation name.
+        table: String,
+        /// The older snapshot, as a token or a checkpoint name.
+        from: String,
+        /// The newer snapshot, or `None` for the present — which is the common case and the
+        /// reason this is an arity rather than a magic value: a checkpoint may legitimately be
+        /// called `now`, and a string that sometimes means a name and sometimes means the clock
+        /// would be a trap.
+        to: Option<String>,
+    },
 }
 
 impl TimeMachineVerb {
