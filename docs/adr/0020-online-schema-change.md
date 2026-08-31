@@ -185,8 +185,30 @@ is how that TODO closes.
   state, a step it may take when a precondition holds, and a report. The schema **lease** is also
   PD's to publish, for the same reason the safepoint is: it is a cluster-wide number with one
   writer.
+
+  > **Amended (phase 6e): PD publishes the interval and does not drive the steps.** The arithmetic
+  > is PD's — a cluster-wide bound needs one writer — but driving is not. A step is a *catalog
+  > transaction*; the catalog is `esker-sql`'s; and PD is byte-opaque by `CLAUDE.md` invariant 7,
+  > so it cannot read a table definition, let alone write one. Giving PD the drive would mean
+  > giving PD key semantics, which is the one thing invariant 7 exists to prevent.
+  >
+  > So the job record lives in the catalog where every node can see it, and a node takes the steps
+  > using PD's published interval as the wait. `esker_schema_step('<index>')` is the step with the
+  > wait taken out, which is also what makes the state machine testable without a timer.
+  >
+  > **A consequence, stated rather than discovered: an orphaned job stalls.** If the node that
+  > started a `CREATE INDEX CONCURRENTLY` dies, nothing re-drives the job on its own — it sits at
+  > whatever state it reached until *any* node or an operator calls `esker_schema_step`. **Nothing
+  > is lost and nothing is unsafe**: the job record and its cursor are durable, the index is not
+  > readable until it is `public`, and every node maintains it at whatever state it is stuck in, so
+  > a stalled job is a slow schema change and never a wrong answer. Automatic re-drive — a node
+  > that notices an idle job and picks it up, or PD asking one to — is future work, and it is
+  > liveness rather than safety. `docs/plans/phase-6e.md` §10.
 * **`esker-proto`** — the messages PD needs to hand a schema-change job out and collect its
-  progress, and the lease in whatever PD already sends nodes periodically.
+  progress, and the lease. **Amended (phase 6e):** the lease is a method of its own,
+  `Pd::SchemaLease` (0x0307), rather than a field on a message PD already sends — PD sends a SQL
+  node nothing, and adding a field to `PdResp::Tso` would have changed a wire format with a golden
+  test. [ADR 0028](0028-the-schema-lease.md) has the argument.
 * **`esker-client`** — nothing. The backfill is `TxnClient` used the way everything else uses it.
 * **`esker-store`, `esker-txn`, `esker-engine`** — nothing. Every layer below the catalog is
   byte-opaque (`CLAUDE.md` invariant 7) and a schema change is keys and values like any other.

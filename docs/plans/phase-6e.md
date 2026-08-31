@@ -310,6 +310,14 @@ interval after every step is **656 seconds**, and waiting only after the three t
 a step behind while they run. `esker_schema_step`'s answer says which kind of step it took, so a
 driver can tell.
 
+**An orphaned job stalls, and that is a liveness gap rather than a safety one.** If the node that
+started a `CREATE INDEX CONCURRENTLY` dies, nothing re-drives the job by itself: it sits at whatever
+state it reached until any node or an operator calls `esker_schema_step('<index>')`. Nothing is lost
+— the job record and its cursor are durable, and a different session finishing a half-done job is
+one of the tests. Nothing is unsafe either: the index is not readable until `public`, and every node
+maintains it at whatever state it is stuck in, so a stalled job is a slow schema change and never a
+wrong answer. Automatic re-drive is future work.
+
 **PD publishes the interval; a SQL node drives the steps.** ADR 0020 puts the step clock in PD, and
 the arithmetic *is* PD's — a cluster-wide bound needs one writer. Driving is not: a step is a catalog
 transaction, the catalog is `esker-sql`'s, and PD is byte-opaque by `CLAUDE.md` invariant 7 and
