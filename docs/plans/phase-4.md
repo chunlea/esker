@@ -1266,3 +1266,42 @@ sampling rounds would buy nothing.
 take the stalled state observed in a trace, build it directly, and assert the peer recovers. Every
 defect this family has given up has been found by a trace and pinned by a unit test; none of them
 was found by counting runs.
+
+## 20. The residual, constructed from a trace: a peer born not knowing its own learners
+
+Doctrine applied. The trace of a stalled region said, in two lines:
+
+    a region split region_id=18 child_id=23 index=57
+    not promoting: the leader has no progress for this peer region_id=18 learner=21
+
+The region **record** listed peer 21 as a learner; the Raft **core** had never heard of it. There is
+one place that gap can open, and it is four lines of `start_peer`:
+
+    let voters = region.peers.iter().filter(|p| p.role == Voter).map(...).collect();
+    RaftLogStorage::open(db, region.id, ConfState::from_voters(voters.clone()))
+
+Every learner in the record was dropped on the floor. The leader then had no `Progress` for a peer
+its own region record listed, so it sent it nothing, so the peer sat at `applied = 0` — and
+`promote_caught_up_learners` skipped it every round with "no progress for this peer", for the life
+of the cluster. That is the acceptance stall, exactly.
+
+It bites wherever a peer is started from a record that *already* lists learners and whose log has no
+configuration of its own to override the one passed in — which is a **split child** above all, since
+its log begins at index 0 and it inherits its parent's whole peer list. A region whose log already
+carries a configuration takes it from there, correctly, which is why this survived every earlier
+test: they all started from a bootstrap or a conf change, never from a record.
+
+`a_peer_started_from_a_record_with_a_learner_knows_about_it` builds that state directly — no
+cluster, no timing — and is mutation-checked.
+
+### 20.1 The result
+
+`tests/promotion.rs`: **20 of 20 runs green**, from 13 of 20 before this. It is un-`#[ignore]`d.
+
+Six defects separated the acceptance stall from a green run, and the tally is the doctrine's own
+evidence: **statistics found none of them; traces found all six.** The pass-rate instrument could
+not even resolve the epoch defect at n=20 per variant (p=0.137), and the same variant measured
+17/20, 8/14, 5/5 and 13/20 across one day. What every one of them had in common is worth naming:
+each turned a *transient* condition — a lost message, a moment not leading, a configuration
+mid-flight, a record read at the wrong instant — into a *permanent* one, because nothing in the path
+could ever revisit the decision.

@@ -2025,6 +2025,18 @@ fn start_peer(
         .filter(|peer| peer.role == PeerRole::Voter)
         .map(|peer| peer.peer_id)
         .collect();
+    // **The learners come too.** Dropping them was the last of phase-4 acceptance's stalls: a peer
+    // started from a record that already lists learners — a split child inheriting its parent's,
+    // a store reopening, a region adopted from a snapshot — built a core configuration of voters
+    // only. The region record then said "peer 21 is a learner" while the Raft core had never heard
+    // of peer 21, so the leader had no `Progress` for it, sent it nothing, and never promoted it:
+    // a learner at `applied = 0` for the life of the cluster (`docs/plans/phase-4.md` §20).
+    let learners: Vec<u64> = region
+        .peers
+        .iter()
+        .filter(|peer| peer.role == PeerRole::Learner)
+        .map(|peer| peer.peer_id)
+        .collect();
     let peer_id = region
         .peers
         .iter()
@@ -2039,13 +2051,17 @@ fn start_peer(
     let storage = RaftLogStorage::open(
         Arc::clone(db),
         region.id,
-        esker_raft::ConfState::from_voters(voters.clone()),
+        esker_raft::ConfState {
+            voters: voters.clone(),
+            learners: learners.clone(),
+        },
     )?;
     RaftPeer::start(
         PeerOptions {
             region: region.clone(),
             peer_id,
             voters,
+            learners,
             seed: raft.seed,
             compaction: raft.compaction,
         },

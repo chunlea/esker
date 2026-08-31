@@ -88,6 +88,7 @@ fn start(db: &Arc<Db>) -> Arc<RaftPeer> {
             region: whole_key_space(),
             peer_id: 1,
             voters: vec![1],
+            learners: Vec::new(),
             seed: 3,
             compaction: LogCompaction::new(),
         },

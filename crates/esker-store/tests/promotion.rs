@@ -174,43 +174,38 @@ fn pd_regions(pd: &Arc<Pd>) -> Vec<Region> {
 /// The bound is what the finding is about. A learner appearing proves only that `AddPeer`'s first
 /// step works, which was never in doubt; what stalled acceptance is that the second step never
 /// came, and a test that waits without a deadline would have reported that as success.
-/// # Why this is `#[ignore]`d
+/// # What it took to make this pass
 ///
-/// It **fails**, and it is meant to be here failing: it is a faithful reduction of the phase-4
-/// acceptance stall, and a repro belongs in the tree rather than in a scratchpad that dies with the
-/// session. Run it with `cargo test -p esker-store --test promotion -- --ignored`.
+/// It failed for the whole of the investigation and was kept in the tree failing, `#[ignore]`d, as
+/// the reduction of the acceptance stall. **20 of 20 runs green** now. Six defects stood between
+/// those two states, and every one of them was found by reading a trace and pinned by a unit test —
+/// none was found by counting runs:
 ///
-/// What it caught, and what is fixed:
+/// 1. **the promotion was never asked for.** PD stops re-sending an `AddPeer` once it can see the
+///    learner, while the store waited to be asked again. The leader promotes on its own now, on the
+///    learner's `matched`, because a region heartbeat comes only from a leader and PD can therefore
+///    never see a learner's progress at all;
+/// 2. **a follower below the compaction boundary cannot be heartbeated**, so `send_heartbeat` fell
+///    through to a paused `send_append` and one lost probe stranded it for the term;
+/// 3. **an `InstallSnapshot` was stepped into the core** for a region the store already hosted,
+///    which restored from the metadata alone while no data was written;
+/// 4. **an append below the follower's commit index was rejected** rather than answered, and since
+///    `maybe_decr_to` never raises `next`, the leader probed an index the follower would refuse for
+///    ever — 526 back-offs in one run against a follower answering every one;
+/// 5. **the compaction hold was fail-open**: `RawNode::progress` is empty on a non-leader, so a
+///    peer that was not leading that instant held nothing and compacted by the tail rule;
+/// 6. **a peer started from a region record dropped that record's learners** on the floor, so the
+///    core had no `Progress` for a peer its own region record listed — the leader sent it nothing
+///    and it sat at `applied = 0` for the life of the cluster.
 ///
-/// * the promotion never happened at all, because PD stops re-sending an `AddPeer` once it can see
-///   the learner while the store was waiting to be asked again. The leader promotes on its own
-///   now, on the learner's `matched`. **0 of 63 learners promoted before, 62 of 63 after.**
-/// * a follower below the compaction boundary cannot be heartbeated, so `send_heartbeat` fell
-///   through to a paused `send_append` and one lost probe stranded it. Fixed in `esker-raft`.
-/// * an `InstallSnapshot` reaching a region this store already hosts was **stepped into the core**,
-///   which restored from the metadata alone while the store wrote no data; the `Ready` carrying it
-///   hit a phase-3 stub that logged and dropped it. That is the `a Raft snapshot arrived;
-///   streaming is phase 4` line seen on a stalled region. The announcement is never stepped now.
+/// The shape they shared is worth naming: each turned a *transient* condition — a lost message, a
+/// moment not leading, a configuration mid-flight — into a *permanent* one, because nothing in the
+/// path could ever revisit the decision.
 ///
-/// What still fails, with the evidence gathered so far. Counting messages in both directions for a
-/// stalled region gives 333 dispatched leader→learner, 238 stepped by the learner, and 238 back —
-/// so the learner is **alive, replicating and answering**, and its own store reports it applying.
-/// The leader's `matched` for it stays 0 regardless. The loop is: the learner adopts a snapshot at
-/// some index, the leader writes on and compacts past it, every probe is then rejected, the
-/// re-offered snapshot is declined because catching up a peer that already holds data is a
-/// documented v1 limitation (`docs/plans/phase-4.md` §13.2), and that repeats for ever.
-///
-/// Two things ruled out rather than assumed. `recent_active = false` is **not** evidence the leader
-/// never heard from the peer: check-quorum clears it every election timeout, which at this test's
-/// 5 ms tick is about ten times a second. And the stale-epoch drops that correlate exactly with the
-/// stalled regions — 14 regions, identical sets — are a symptom, not the cause: checking `version`
-/// alone was tried and did not fix the stall, so that change was **reverted** rather than shipped.
-///
-/// Holding the leader's log for a peer still catching up is implemented and unit-tested
-/// (`a_compaction_keeps_what_a_lagging_peer_still_needs`), and did **not** clear this test either —
-/// recorded as tested behaviour that is right on its own merits, not as the fix.
-#[ignore = "reproduces the phase-4 acceptance promotion stall; see the doc comment for what is \
-            fixed and what remains"]
+/// Two things this test learned about itself, both of which had it measuring the bug rather than
+/// the fix. It wrote only to store 1, which worked precisely while every leader stayed there; and
+/// it ran two stores at `target_replicas` two, where the quorum is two and one slightly slow
+/// replica stops the region committing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_learner_on_a_fresh_store_becomes_a_voter_under_load() {
     let _ = tracing_subscriber::fmt()

@@ -239,6 +239,13 @@ pub struct PeerOptions {
     pub peer_id: NodeId,
     /// The group's voters, used only when the log has no configuration of its own.
     pub voters: Vec<NodeId>,
+    /// The group's learners, under the same rule.
+    ///
+    /// **Separate from `voters` and never folded into them.** A learner replicates without voting,
+    /// so a group that started it as a voter would count it toward quorum; a group that dropped it
+    /// entirely would never send to it at all, which is the failure this field exists to stop
+    /// (`docs/plans/phase-4.md` §20).
+    pub learners: Vec<NodeId>,
     /// Seed for the election-timeout RNG. The peer id selects the stream, so a whole cluster may
     /// share one seed and still not campaign in lockstep
     /// (`docs/adr/0008-raft-determinism-and-the-driver-contract.md`).
@@ -1022,6 +1029,7 @@ impl RaftPeer {
     ) -> Result<Arc<Self>> {
         let region_id = options.region.id;
         let mut config = RaftConfig::new(options.peer_id, options.voters, options.seed);
+        config.learners = options.learners;
         config.applied = storage.applied_index();
         let applied_index = storage.applied_index();
 
@@ -1362,6 +1370,7 @@ mod tests {
                 region: Region::bootstrap(REGION, 1, peer_id),
                 peer_id,
                 voters,
+                learners: Vec::new(),
                 seed: 7,
                 compaction: LogCompaction::new(),
             },
@@ -1803,6 +1812,7 @@ mod tests {
                 region: Region::bootstrap(REGION, 1, 1),
                 peer_id: 1,
                 voters: vec![1],
+                learners: Vec::new(),
                 seed: 7,
                 compaction: LogCompaction {
                     threshold: 8,
@@ -1888,6 +1898,7 @@ mod tests {
                         region: Region::bootstrap(region_id, 1, region_id),
                         peer_id: region_id,
                         voters: vec![region_id],
+                        learners: Vec::new(),
                         seed: 7,
                         compaction: LogCompaction::new(),
                     },
@@ -1953,6 +1964,7 @@ mod tests {
                         region: Region::bootstrap(region_id, 1, region_id),
                         peer_id: region_id,
                         voters: vec![region_id],
+                        learners: Vec::new(),
                         seed: 7,
                         compaction: LogCompaction::new(),
                     },

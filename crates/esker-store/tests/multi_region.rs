@@ -627,3 +627,90 @@ async fn a_raft_message_from_a_peer_a_conf_change_behind_is_still_delivered() {
     );
     store.stop();
 }
+
+/// A peer started from a region record that lists a **learner** knows about that learner.
+///
+/// This is the last of phase-4 acceptance's stalls, and it is a one-line omission with an
+/// unbounded consequence. `start_peer` built the core's configuration from the region's peers
+/// filtered to `Voter`, so every learner in the record was dropped on the floor. The record then
+/// said "peer N is a learner of this region" while the Raft core had never heard of peer N — so the
+/// leader had no `Progress` for it, never sent it anything, and `promote_caught_up_learners` saw
+/// "no progress for this peer" and skipped it every round. A learner at `applied = 0` for the life
+/// of the cluster, which is exactly the shape the acceptance run reported.
+///
+/// The region here has **no Raft log of its own**, which is what makes the passed configuration the
+/// one that counts — the same position a **split child** is in, since its log begins at index 0.
+/// That is the path that lost learners in the acceptance run: a child inherits its parent's peer
+/// list, learners included, and was then born not knowing about them. A region whose log already
+/// has a configuration takes it from the log instead, correctly, and needs no help from here.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_started_from_a_record_with_a_learner_knows_about_it() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Region 2 as a split would leave it: a voter on this store and a learner on another, and not
+    // one log entry yet.
+    let child = Region {
+        id: 2,
+        start_key: Bytes::from_static(b"m"),
+        end_key: Bytes::new(),
+        peers: vec![
+            Peer::voter(1, 2),
+            Peer {
+                store_id: 2,
+                peer_id: 77,
+                role: esker_proto::PeerRole::Learner,
+            },
+        ],
+        epoch: Epoch::new(2, 2),
+    };
+
+    // Replicated, because an unreplicated store starts no peer at all and there would be no core
+    // to ask.
+    let address: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let replicated = || {
+        let mut raft = esker_store::server::RaftOptions::new(
+            vec![
+                esker_store::PeerAddress::new(1, 1, address),
+                esker_store::PeerAddress::new(2, 2, address),
+            ],
+            11,
+        );
+        raft.bootstrap_voters = Some(vec![1]);
+        StoreOptions {
+            raft: Some(raft),
+            ..StoreOptions::new()
+        }
+    };
+
+    let store = Store::open(dir.path(), replicated()).unwrap();
+    seed(
+        &store,
+        &[region(1, b"", b"m", 1, Epoch::new(1, 2)), child.clone()],
+    );
+    store.stop();
+    drop(store);
+    let store = Store::open(dir.path(), replicated()).unwrap();
+
+    let peer = store.peer_of(child.id).expect("the child is replicated");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !peer.is_leader() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the lone voter never took office"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let progress = peer.progress().await.unwrap();
+    let learner = progress.iter().find(|entry| entry.id == 77);
+    assert!(
+        learner.is_some(),
+        "the core does not know about a learner its own region record lists, so nothing will ever \
+         be sent to it and it can never be promoted: {progress:#?}"
+    );
+    assert!(
+        learner.unwrap().is_learner,
+        "it has to be a learner and not a voter, or it counts toward quorum before it has any data"
+    );
+    store.stop();
+}
