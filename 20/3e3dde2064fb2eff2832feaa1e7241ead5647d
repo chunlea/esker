@@ -1,0 +1,33 @@
+crates/esker-sql/Cargo.toml
+  s_4dac2a9786305f::t_f4063d797820c8 18-20
+crates/esker-sql/src/bin/esker-sql.rs
+  s_4dac2a9786305f::t_6332077689f963 4-8,17,51-54,60-68,70,75-106
+crates/esker-sql/src/pgwire/server.rs
+  s_4dac2a9786305f::t_39029b7fa0d4d9 107-122,132,144,148-152,170-186
+crates/esker-sql/tests/cluster/mod.rs
+  s_4dac2a9786305f::t_2564cd94878610 61-64,67,79-87,105,112-115,117-123,128-137,165
+crates/esker-sql/tests/psql_smoke.rs
+  s_4dac2a9786305f::t_608e8cb2d72ded 15-16,344-367,369-385,396,451-455,459-466,470,514-517,519
+crates/esker-sql/tests/real_corpus.rs
+  s_4dac2a9786305f::t_299e63d47d4478 1-33
+crates/esker-sql/tests/slt_harness/mod.rs
+  s_4dac2a9786305f::t_5497043e6faf9c 128-136
+docs/plans/phase-6a.md
+  s_4dac2a9786305f::t_fb4d6e30662605 520-524,559-565,571-575,632-637
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "203e3dde2064fb2eff2832feaa1e7241ead5647d",
+  "prompts": {},
+  "sessions": {
+    "s_4dac2a9786305f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c856055d-e868-42d6-b63f-7ca0cbb2c857",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
