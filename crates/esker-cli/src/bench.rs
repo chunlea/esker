@@ -55,6 +55,14 @@ pub(crate) enum Workload {
     Tso,
     /// Take cluster-unique ids from the placement driver's allocator.
     AllocId,
+    /// One **transaction** per operation, writing `--batch-size` keys
+    /// ([`crate::bench_txn`]).
+    ///
+    /// The comparison that matters is against `fillrandom --remote` on the same store: the gap
+    /// is what two-phase commit and MVCC cost, and `docs/bench/phase-5.md` explains it.
+    TxnPut,
+    /// A snapshot and one transactional read per operation, against `readrandom --remote`.
+    TxnGet,
 }
 
 impl Workload {
@@ -69,6 +77,8 @@ impl Workload {
             "readseq" => Some(Self::ReadSeq),
             "tso" => Some(Self::Tso),
             "allocid" => Some(Self::AllocId),
+            "txnput" => Some(Self::TxnPut),
+            "txnget" => Some(Self::TxnGet),
             _ => None,
         }
     }
@@ -83,7 +93,18 @@ impl Workload {
             Self::ReadSeq => "readseq",
             Self::Tso => "tso",
             Self::AllocId => "allocid",
+            Self::TxnPut => "txnput",
+            Self::TxnGet => "txnget",
         }
+    }
+
+    /// Whether this workload speaks `TxnKv` rather than `RawKv`.
+    ///
+    /// Only over the network: a transaction is a conversation with a *store* — locks, records
+    /// and a commit point that apply decides — and there is no in-process shortcut to it the
+    /// way there is for an engine workload.
+    pub(crate) fn is_transactional(self) -> bool {
+        matches!(self, Self::TxnPut | Self::TxnGet)
     }
 
     /// Whether this workload measures the placement driver rather than the engine.
@@ -98,7 +119,7 @@ impl Workload {
     pub(crate) fn needs_a_populated_database(self) -> bool {
         matches!(
             self,
-            Self::Overwrite | Self::ReadRandom | Self::ReadMissing | Self::ReadSeq
+            Self::Overwrite | Self::ReadRandom | Self::ReadMissing | Self::ReadSeq | Self::TxnGet
         )
     }
 }
@@ -218,17 +239,27 @@ pub(crate) fn value_of(size: u32, seed: u64) -> Vec<u8> {
 /// its own database; the engine options here are that server's business and are ignored.
 pub(crate) fn run(options: &Run) -> Result<Report, String> {
     if let Some(addr) = &options.remote {
-        // `--remote` drives `RawKv` against a store, and a placement driver is not one.
-        // Refused rather than ignored: a flag that quietly measures something else is worse
-        // than one that does not work.
+        // `--remote` drives a store, and a placement driver is not one. Refused rather than
+        // ignored: a flag that quietly measures something else is worse than one that does not
+        // work.
         if options.workload.is_placement_driver() {
             return Err(format!(
-                "`--remote {addr}` drives RawKv against a store; the `{}` workload measures a \
-                 placement driver in this process",
+                "`--remote {addr}` drives a store; the `{}` workload measures a placement \
+                 driver in this process",
                 options.workload.name()
             ));
         }
+        if options.workload.is_transactional() {
+            return crate::bench_txn::run(options, addr);
+        }
         return crate::bench_remote::run(options, addr);
+    }
+    // A transaction has no in-process form: its decisions happen at apply, inside a store.
+    if options.workload.is_transactional() {
+        return Err(format!(
+            "the `{}` workload needs a store to talk to; give it `--remote HOST:PORT`",
+            options.workload.name()
+        ));
     }
     let (dir, temporary) = match &options.dir {
         Some(dir) => (dir.clone(), false),

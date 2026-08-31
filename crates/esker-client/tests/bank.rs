@@ -171,11 +171,29 @@ impl Plan {
         }
     }
 
-    /// One of a thousand seeds: the same shape, in a fraction of the time.
+    /// One of a thousand seeds.
+    ///
+    /// Two shapes, chosen by the seed itself so a failure is reproducible from its number
+    /// alone. Most seeds run **unreplicated and unkilled**: no Raft, two stores, and every
+    /// second of the run spent on what a thousand seeds are for — a thousand different
+    /// interleavings of contention, crashed clients and lock resolution. Every fourth seed
+    /// runs the replicated topology with a leader kill, which is three times the wall clock
+    /// for a fraction of the transfers, so the sweep covers the fault dimension without
+    /// spending most of its hours on cluster startup.
+    ///
+    /// The sixty-second run is where the fault plan is exercised properly.
     fn one_seed(seed: u64) -> Self {
+        if seed % 4 == 0 {
+            return Self {
+                duration: Duration::from_millis(1_500),
+                kills: 1,
+                ..Self::fast(seed)
+            };
+        }
         Self {
             duration: Duration::from_millis(1_200),
-            kills: 1,
+            kills: 0,
+            topology: Topology::unreplicated(seed),
             ..Self::fast(seed)
         }
     }
@@ -823,14 +841,20 @@ fn sixty_seconds_of_transfers_under_faults() {
 
 /// The acceptance run's other half: a thousand seeds, each a whole cluster of its own.
 ///
-/// Every failure names its seed, in the message and in the line printed before the run starts,
-/// so a failing seed can be re-run alone with `ESKER_BANK_SEED`.
+/// About 3.4 seconds a seed in release on the machine in `docs/bench/phase-5.md`, so roughly an
+/// hour for the thousand. `ESKER_BANK_SEEDS` shortens it and `ESKER_BANK_SEED` moves the start,
+/// which is how a failing seed is re-run alone:
 ///
 /// ```text
 /// cargo test -p esker-client --release --test bank -- --ignored --nocapture thousand
+/// ESKER_BANK_SEED=417 ESKER_BANK_SEEDS=1 cargo test -p esker-client --release \
+///     --test bank -- --ignored --nocapture thousand
 /// ```
+///
+/// Every failure names its seed, in the assertion message and in the line printed before the
+/// run starts, so a failure in a captured log is enough to reproduce it.
 #[test]
-#[ignore = "a thousand clusters; tens of minutes"]
+#[ignore = "a thousand clusters; about an hour"]
 fn a_thousand_seeds() {
     let seeds: u64 = std::env::var("ESKER_BANK_SEEDS")
         .ok()

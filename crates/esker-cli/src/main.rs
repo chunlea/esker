@@ -10,6 +10,7 @@ mod args;
 mod bench;
 mod bench_pd;
 mod bench_remote;
+mod bench_txn;
 mod bytes;
 mod cluster;
 mod manifest_dump;
