@@ -42,6 +42,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod apply;
+pub mod columnar;
 pub mod driver;
 pub mod error;
 /// Bits of the logical counter in a timestamp, re-exported so a caller working in

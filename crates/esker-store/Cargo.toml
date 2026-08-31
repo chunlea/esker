@@ -14,6 +14,9 @@ esker-engine.workspace = true
 # The `'r'` namespace every RawKV key is stored under. A client never sends the prefix, so
 # this is the only place it is applied (docs/DESIGN.md §3, CLAUDE.md invariant 7).
 esker-keys.workspace = true
+# The columnar apply target (ADR 0022 Decision 1). The first edge into this crate; it shares
+# nothing with the row engine but the `FileSystem` trait and `esker-base`.
+esker-columnar.workspace = true
 # The wire: messages, the typed error, and the Service the server calls.
 esker-proto.workspace = true
 # Percolator's decisions, records and keys. The store owns none of them: it decodes a request,

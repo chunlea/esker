@@ -1785,6 +1785,33 @@ impl Store {
         .await
     }
 
+    /// Serves a plan fragment against this store's columnar copy of a region.
+    ///
+    /// **The epoch is checked exactly as a row read's is** (invariant 5), from the
+    /// [`RequestHeader`] that every request already carries — the fragment body deliberately has
+    /// no epoch of its own, because two epochs on one wire is two sources of truth.
+    ///
+    /// Every negative answer here is a [`FragmentResp::Refused`] and never a `ProtoError`. A
+    /// refusal is a *normal* response meaning "fall back to a row scan"; an error frame would
+    /// make a stale route or a rolling upgrade look like a fault.
+    async fn serve_fragment(
+        self: &Arc<Self>,
+        header: RequestHeader,
+        _request: esker_proto::fragment::FragmentReq,
+    ) -> std::result::Result<esker_proto::fragment::FragmentResp, ProtoError> {
+        // Routing first, so a fragment addressed to a region this store does not own is answered
+        // the same way a row read would be — the epoch check is not optional here.
+        let _state = self.regions.route(&header, None)?;
+        Ok(esker_proto::fragment::FragmentResp::Refused {
+            reason: esker_proto::fragment::RefusalReason::NotColumnar,
+            detail: format!(
+                "store {} holds region {} as rows, not columns",
+                self.store_id(),
+                header.region_id
+            ),
+        })
+    }
+
     /// The `raft` column family's id, or the failure that says the store was opened wrong.
     fn raft_cf(&self) -> std::result::Result<u32, ProtoError> {
         self.db.cf_id(cf::RAFT).ok_or_else(|| {
@@ -2404,6 +2431,20 @@ impl Service for StoreService {
                         .serve_admin(request)
                         .await
                         .map(|response| Reply::Unary(Response::Admin(response)));
+                }
+                // A fragment for a region this store holds no columnar copy of. **A refusal, not
+                // an error**: `NotColumnar` is a normal answer meaning "the caller's routing is
+                // stale, or placement moved — fall back to a row scan", and the planner's
+                // fallback is not an error path (ADR 0022 Decision 4, `esker_proto::fragment`).
+                // Making it an error frame would make every rolling upgrade look like a fault.
+                //
+                // Until the apply target is placed on regions (phase 8 unit 3), this is the only
+                // answer this store has, and it is the correct one rather than a placeholder.
+                Request::Fragment { header, request } => {
+                    return store
+                        .serve_fragment(header, request)
+                        .await
+                        .map(|response| Reply::Unary(Response::Fragment(response)));
                 }
                 // A store is not a placement driver. Answering anything but a refusal — even a
                 // helpful-looking one — would let a misconfigured client believe it had reached
