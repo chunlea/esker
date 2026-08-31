@@ -164,6 +164,18 @@ pub enum Error {
         key: Bytes,
     },
 
+    /// A named snapshot was read back and is not there
+    /// ([ADR 0021](../../docs/adr/0021-time-machine.md) decision 3).
+    ///
+    /// PostgreSQL's `42704 snapshot "..." does not exist`, and it means what it says: the name
+    /// was never exported, or whatever holds the names has lost it. A checkpoint is a claim,
+    /// and this is the claim failing before anything is read at it.
+    #[error("no snapshot is named {name:?}")]
+    NoSuchSnapshot {
+        /// The name that was looked up.
+        name: Bytes,
+    },
+
     /// A bug in this crate rather than a failure of the cluster.
     #[error("internal error: {0}")]
     Internal(String),
@@ -201,7 +213,8 @@ impl Error {
             | Self::LockNotCleared { .. }
             | Self::SnapshotTooOld { .. }
             | Self::SnapshotInTheFuture { .. }
-            | Self::ReadOnlyTransaction { .. } => true,
+            | Self::ReadOnlyTransaction { .. }
+            | Self::NoSuchSnapshot { .. } => true,
             // An answer came back, so the store acted; what it did is anybody's guess. A
             // transaction settled by someone else is the sharpest case of that — something
             // *was* written, by them — and an internal bug here proves nothing about the

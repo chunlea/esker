@@ -269,6 +269,131 @@ fn asking_for_the_safepoint_does_not_move_it() {
     cluster.shutdown();
 }
 
+// -- checkpoints ---------------------------------------------------------------------------
+
+/// A checkpoint names the present and a later transaction reads it back — and what makes it a
+/// checkpoint rather than a handle is that it outlives the session that took it, which is the
+/// one place this diverges from `pg_export_snapshot()` (ADR 0021 decision 3).
+#[test]
+fn a_named_snapshot_is_read_back_at_the_moment_it_named() {
+    let cluster = cluster(0x71_0009);
+    let client = cluster.client_within(9, Duration::from_secs(20)).unwrap();
+
+    write_one(&client, b"a-row", b"at the checkpoint");
+    let exported = client.export_snapshot(b"named/before-the-change").unwrap();
+    write_one(&client, b"a-row", b"after the change");
+
+    assert_eq!(
+        client.snapshot_at(b"named/before-the-change").unwrap(),
+        exported,
+        "the name resolves to the timestamp it was exported at"
+    );
+    let then = client
+        .begin_at_snapshot(b"named/before-the-change")
+        .unwrap();
+    assert_eq!(
+        then.get(b"a-row").unwrap(),
+        Some(Bytes::from_static(b"at the checkpoint")),
+        "reading at a checkpoint is reading at its timestamp, and nothing more"
+    );
+    assert!(then.is_read_only(), "a checkpoint is a past instant");
+
+    // A *different* client, of the kind that did not take it: the record is in the database,
+    // not in the exporting session.
+    let stranger = cluster.client_within(99, Duration::from_secs(20)).unwrap();
+    assert_eq!(
+        stranger
+            .begin_at_snapshot(b"named/before-the-change")
+            .unwrap()
+            .get(b"a-row")
+            .unwrap(),
+        Some(Bytes::from_static(b"at the checkpoint"))
+    );
+
+    cluster.shutdown();
+}
+
+/// A name that was never exported is a refusal, not an empty answer: PostgreSQL's
+/// `42704 snapshot "..." does not exist`.
+#[test]
+fn a_snapshot_that_was_never_exported_is_refused() {
+    let cluster = cluster(0x71_000a);
+    let client = cluster.client_within(10, Duration::from_secs(20)).unwrap();
+
+    match client.begin_at_snapshot(b"named/never-taken") {
+        Err(Error::NoSuchSnapshot { name }) => {
+            assert_eq!(name, Bytes::from_static(b"named/never-taken"));
+        }
+        other => panic!("an unknown name must be refused: {other:?}"),
+    }
+
+    cluster.shutdown();
+}
+
+/// A checkpoint is a claim, and this is the claim failing: named, then collected past.
+///
+/// It is the composition that matters — the name still resolves, and the *read* is what
+/// refuses, with the window in it. A checkpoint that promised its data would be a promise the
+/// storage layer never made.
+#[test]
+fn a_checkpoint_older_than_the_window_names_history_that_is_gone() {
+    let cluster = cluster(0x71_000b);
+    let client = cluster.client_within(11, Duration::from_secs(20)).unwrap();
+
+    write_one(&client, b"a-row", b"ancient");
+    let named = client.export_snapshot(b"named/too-old").unwrap();
+    let recent = write_one(&client, b"a-row", b"recent");
+
+    let router = cluster.router(61).expect("a router");
+    let _ = router
+        .call(&Body::Txn(TxnKvReq::GcSafepoint { safepoint: recent }))
+        .unwrap();
+
+    assert_eq!(
+        client.snapshot_at(b"named/too-old").unwrap(),
+        named,
+        "the name still resolves — it is the read that cannot be answered"
+    );
+    match client.begin_at_snapshot(b"named/too-old") {
+        Err(Error::SnapshotTooOld { requested, floor }) => {
+            assert_eq!(requested, named);
+            assert_eq!(floor, recent);
+        }
+        other => panic!("a checkpoint past the window must refuse: {other:?}"),
+    }
+
+    cluster.shutdown();
+}
+
+/// A value that is not one of these records is a typed refusal rather than a number read out
+/// of whatever bytes were there (`CLAUDE.md` invariant 2).
+#[test]
+fn a_name_holding_something_else_is_not_read_as_a_timestamp() {
+    let cluster = cluster(0x71_000c);
+    let client = cluster.client_within(12, Duration::from_secs(20)).unwrap();
+
+    // An ordinary value at the name, as an application that reused the key would leave.
+    write_one(&client, b"named/not-a-snapshot", b"just a value");
+    assert!(
+        matches!(
+            client.snapshot_at(b"named/not-a-snapshot"),
+            Err(Error::Store(esker_client::wire::ProtoError::Corrupt { .. }))
+        ),
+        "a nine-byte record is the whole format; anything else is not one"
+    );
+
+    // And a record of a version this build does not read.
+    let mut txn = client.begin().unwrap();
+    txn.put(b"named/from-the-future", &[9u8, 0, 0, 0, 0, 0, 0, 0, 0]);
+    txn.commit().unwrap();
+    assert!(matches!(
+        client.snapshot_at(b"named/from-the-future"),
+        Err(Error::Store(esker_client::wire::ProtoError::Corrupt { .. }))
+    ));
+
+    cluster.shutdown();
+}
+
 /// `ts_ago` is measured from a timestamp the **oracle** handed out, never from this machine's
 /// clock (`CLAUDE.md` invariant 6), and it saturates rather than wrapping.
 #[test]

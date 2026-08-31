@@ -333,6 +333,52 @@ impl TxnClient {
         }
     }
 
+    /// Names the present, so a later transaction can read it back — `pg_export_snapshot()`
+    /// ([ADR 0021](../../docs/adr/0021-time-machine.md) decision 3).
+    ///
+    /// **It is free, and that is the design.** A checkpoint is a *number*: this takes a
+    /// timestamp and writes one nine-byte record. No snapshot, no copy, no flush — the data it
+    /// refers to is kept by retention whether anybody named it or not. The catch is exactly
+    /// that: a checkpoint older than the retention window names history that is gone, so the
+    /// record is a **claim to check** rather than a guarantee, and [`TxnClient::begin_at`] is
+    /// where it gets checked. Pinning a checkpoint's timestamp by holding the safepoint back is
+    /// the placement driver's half and is not built.
+    ///
+    /// **Not spelled `CHECKPOINT`.** PostgreSQL owns that keyword for forcing a WAL checkpoint
+    /// and this node already answers `0A000` for it; taking the word would be inventing
+    /// semantics for one that has some. The spelling is the one PostgreSQL already pairs with
+    /// `SET TRANSACTION SNAPSHOT`.
+    ///
+    /// `name` is a **key**, in whatever space the caller keeps its names in: this crate is
+    /// byte-opaque (`CLAUDE.md` invariant 7), so where the name → timestamp map lives is the
+    /// decision of the layer above, which for SQL is the catalog (ADR 0021 decision 4).
+    pub fn export_snapshot(&self, name: &[u8]) -> Result<u64> {
+        let at = self.oracle.timestamp()?;
+        let mut txn = self.begin()?;
+        txn.put(name, &encode_snapshot(at));
+        txn.commit()?;
+        Ok(at)
+    }
+
+    /// The timestamp a name was exported at, or [`Error::NoSuchSnapshot`].
+    ///
+    /// Read at the present, because a name is looked up now however far back it points.
+    pub fn snapshot_at(&self, name: &[u8]) -> Result<u64> {
+        let found = self.begin()?.get(name)?;
+        let Some(record) = found else {
+            return Err(Error::NoSuchSnapshot {
+                name: Bytes::copy_from_slice(name),
+            });
+        };
+        decode_snapshot(name, &record)
+    }
+
+    /// A read-only transaction as of an exported snapshot: [`TxnClient::begin_at`] with the
+    /// timestamp looked up instead of computed, which is all "reading at a checkpoint" is.
+    pub fn begin_at_snapshot(&self, name: &[u8]) -> Result<Transaction> {
+        self.begin_at(self.snapshot_at(name)?)
+    }
+
     /// One `TxnKv` call that belongs to the client rather than to a transaction.
     fn call(&self, request: &TxnKvReq) -> Result<TxnKvResp> {
         match self.router.call(&Body::Txn(request.clone()))? {
@@ -1081,6 +1127,48 @@ impl Verdict {
     }
 }
 
+/// Version byte of an exported-snapshot record. An unknown one is a typed error and never a
+/// guess (`CLAUDE.md` invariant 2).
+const SNAPSHOT_RECORD_VERSION: u8 = 1;
+
+/// `version:u8 ++ start_ts:u64` little-endian — nine bytes.
+///
+/// Deliberately the same shape as the retention records of
+/// [ADR 0021](../../docs/adr/0021-time-machine.md) decision 4: a version byte and a `u64`, so
+/// the two records of one feature read alike and neither needs its own explanation.
+fn encode_snapshot(at: u64) -> [u8; 9] {
+    let mut out = [0u8; 9];
+    out[0] = SNAPSHOT_RECORD_VERSION;
+    out[1..].copy_from_slice(&at.to_le_bytes());
+    out
+}
+
+fn decode_snapshot(name: &[u8], record: &[u8]) -> Result<u64> {
+    // Length first: a nine-byte record is the whole format, so anything else is a value that
+    // is not one of these rather than a version to interpret.
+    let Ok(bytes) = <[u8; 9]>::try_from(record) else {
+        return Err(Error::Store(ProtoError::corrupt(
+            "snapshot record",
+            format!(
+                "the snapshot named {name:?} is {} bytes, not 9",
+                record.len()
+            ),
+        )));
+    };
+    if bytes[0] != SNAPSHOT_RECORD_VERSION {
+        return Err(Error::Store(ProtoError::corrupt(
+            "snapshot record",
+            format!(
+                "the snapshot named {name:?} is version {}, and this build reads {SNAPSHOT_RECORD_VERSION}",
+                bytes[0]
+            ),
+        )));
+    }
+    let mut ts = [0u8; 8];
+    ts.copy_from_slice(&bytes[1..]);
+    Ok(u64::from_le_bytes(ts))
+}
+
 /// The lock inside a `Locked` refusal, if that is what this error is.
 ///
 /// A `Locked` whose payload will not decode is an error and not an absence: treating it as
@@ -1148,7 +1236,9 @@ impl TimestampOracle for CountingOracle {
 
 #[cfg(test)]
 mod tests {
-    use super::{CountingOracle, TimestampOracle};
+    use super::{
+        CountingOracle, SNAPSHOT_RECORD_VERSION, TimestampOracle, decode_snapshot, encode_snapshot,
+    };
 
     /// Timestamps must not repeat: two transactions sharing a `start_ts` would share an
     /// identity, and a resolver could not tell whose lock it had found.
@@ -1172,5 +1262,51 @@ mod tests {
         let oracle = CountingOracle::starting_at(1);
         assert_eq!(oracle.tso(0).unwrap(), 1);
         assert_eq!(oracle.tso(0).unwrap(), 2);
+    }
+
+    /// **Frozen bytes.** An exported snapshot is a record other builds will read, so its nine
+    /// bytes are pinned here rather than checked against the encoder that produced them — a
+    /// round trip passes just as happily when both halves drift together.
+    #[test]
+    fn a_snapshot_record_is_nine_frozen_bytes() {
+        assert_eq!(
+            encode_snapshot(0x0102_0304_0506_0708),
+            [1, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01],
+            "version 1, then the timestamp little-endian"
+        );
+        assert_eq!(
+            encode_snapshot(0),
+            [SNAPSHOT_RECORD_VERSION, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    /// And the decoder reads that pin, so the pair cannot drift together.
+    #[test]
+    fn a_frozen_record_decodes_to_the_timestamp_it_names() {
+        let frozen = [1u8, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01];
+        assert_eq!(
+            decode_snapshot(b"n", &frozen).unwrap(),
+            0x0102_0304_0506_0708
+        );
+    }
+
+    /// Every truncation, one byte too many, and a version this build does not know: all
+    /// refused, none guessed at.
+    #[test]
+    fn a_record_that_is_not_one_is_refused_rather_than_read() {
+        let good = encode_snapshot(42);
+        for length in 0..good.len() {
+            assert!(
+                decode_snapshot(b"n", &good[..length]).is_err(),
+                "a {length}-byte value is not a snapshot record"
+            );
+        }
+        let mut too_long = good.to_vec();
+        too_long.push(0);
+        assert!(decode_snapshot(b"n", &too_long).is_err());
+
+        let mut wrong_version = good;
+        wrong_version[0] = SNAPSHOT_RECORD_VERSION + 1;
+        assert!(decode_snapshot(b"n", &wrong_version).is_err());
     }
 }
