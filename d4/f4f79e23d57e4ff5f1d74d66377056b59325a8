@@ -1,0 +1,21 @@
+docs/adr/0020-online-schema-change.md
+  s_543d4c9b3ee38c::t_627e0b2c53d679 1-174
+docs/plans/phase-6a.md
+  s_543d4c9b3ee38c::t_e0f5c165e3c28e 1093-1103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "d4f4f79e23d57e4ff5f1d74d66377056b59325a8",
+  "prompts": {},
+  "sessions": {
+    "s_543d4c9b3ee38c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "befd6192-73a4-4b10-9f4b-cd092c10ce31",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
