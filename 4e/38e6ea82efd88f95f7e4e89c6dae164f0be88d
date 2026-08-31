@@ -1,0 +1,21 @@
+docs/bench/phase-4-coverage.md
+  s_7b671d2e699216::t_9e54e7b778e58d 1-69
+docs/bench/phase-4.md
+  s_7b671d2e699216::t_93ed5843cb2aac 1-209
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "4e38e6ea82efd88f95f7e4e89c6dae164f0be88d",
+  "prompts": {},
+  "sessions": {
+    "s_7b671d2e699216": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "efbb1686-4851-4ab6-9a2b-0781e263df25",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
