@@ -46,6 +46,9 @@ esker-store.workspace = true
 # `esker-sim` because DESIGN.md §11 puts it there for exactly this. Both dev-only.
 esker-client.workspace = true
 esker-sim.workspace = true
+# `tests/tier_acceptance.rs` reads a store's engine directly to prove what *that node* holds,
+# which means encoding a RawKv key the way the store does. Dev-only.
+esker-keys.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "time"] }
 
 [lints]

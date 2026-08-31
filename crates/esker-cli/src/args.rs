@@ -157,6 +157,9 @@ Commands:
   raw <verb> ...        Read or write keys over the network
   server                Open a store and serve the RawKV API
   cluster start|stop    Start or stop a local cluster replicating one region
+                        (--nodes, --data-dir, --base-port, --seed, --sst-store,
+                        --write-buffer-size; each node gets its own prefix under
+                        the one given)
   pd serve|inspect      Run the placement driver, or print what it has stored
   region <verb> ...     Look at, split, or hand over a region
 
@@ -204,6 +207,13 @@ Server options:
       --store-id N      This store's id, reported in the handshake (default 1)
       --peer-id N       This store's Raft peer id (default: the store id)
       --peer ID@ADDR    A peer of the region, repeatable, this store's included
+      --write-buffer-size N
+                        Memtable bytes before a flush (default 64 MiB)
+      --sst-store URL   Tier this store's SSTs into s3://bucket/prefix, keeping the
+                        WAL and the Raft log local. The endpoint and credentials
+                        come from ESKER_S3_ENDPOINT, ESKER_S3_KEY, ESKER_S3_SECRET
+                        and ESKER_S3_REGION, never from a flag. One prefix per
+                        store: two sharing one overwrite each other's SSTs
       --pd HOST:PORT    The placement driver to register with and report to. With
                         one, PD decides which store creates region 1 and this store
                         reports its regions on the schedule of DESIGN.md §14.
@@ -696,6 +706,18 @@ fn parse_server(arguments: &[String]) -> Result<Command, ParseError> {
             "--listen" => {
                 options.listen = take_value(arguments, &mut index, inline, "--listen")?;
             }
+            "--sst-store" => {
+                options.sst_store = Some(take_value(arguments, &mut index, inline, "--sst-store")?);
+            }
+            "--write-buffer-size" => {
+                let raw = take_value(arguments, &mut index, inline, "--write-buffer-size")?;
+                options.write_buffer_size = Some(raw.parse().ok().filter(|size| *size > 0).ok_or(
+                    ParseError::InvalidValue {
+                        flag: "--write-buffer-size",
+                        value: raw.clone(),
+                    },
+                )?);
+            }
             "--store-id" => {
                 let raw = take_value(arguments, &mut index, inline, "--store-id")?;
                 options.store_id =
@@ -780,6 +802,8 @@ fn parse_cluster(arguments: &[String]) -> Result<Command, ParseError> {
     let mut data_dir = PathBuf::from("esker-cluster");
     let mut base_port = crate::cluster::DEFAULT_BASE_PORT;
     let mut seed = 0_u64;
+    let mut sst_store: Option<String> = None;
+    let mut write_buffer_size: Option<usize> = None;
     let mut index = 0;
 
     while index < rest.len() {
@@ -819,6 +843,18 @@ fn parse_cluster(arguments: &[String]) -> Result<Command, ParseError> {
                     value: raw.clone(),
                 })?;
             }
+            "--sst-store" => {
+                sst_store = Some(take_value(rest, &mut index, inline, "--sst-store")?);
+            }
+            "--write-buffer-size" => {
+                let raw = take_value(rest, &mut index, inline, "--write-buffer-size")?;
+                write_buffer_size = Some(raw.parse().ok().filter(|size| *size > 0).ok_or(
+                    ParseError::InvalidValue {
+                        flag: "--write-buffer-size",
+                        value: raw.clone(),
+                    },
+                )?);
+            }
             other if other.starts_with('-') => {
                 return Err(ParseError::UnknownFlag(other.to_owned()));
             }
@@ -832,6 +868,8 @@ fn parse_cluster(arguments: &[String]) -> Result<Command, ParseError> {
             data_dir,
             base_port,
             seed,
+            sst_store,
+            write_buffer_size,
         })),
         "stop" => Ok(Command::Cluster(ClusterOptions::Stop { data_dir })),
         other => Err(ParseError::UnknownCommand(format!("cluster {other}"))),
@@ -1110,6 +1148,7 @@ mod tests {
             panic!("expected a bench command");
         };
         assert_eq!(options.sst_store.as_deref(), Some("s3://esker/tier"));
+
         assert_eq!(options.sst_cache_bytes, Some(0));
 
         let Command::Bench(options) = parse_ok(&["bench", "--sst-cache-bytes=1048576"]) else {
@@ -1133,6 +1172,48 @@ mod tests {
         );
         assert_eq!(
             parse(["bench", "--sst-store"]),
+            Err(ParseError::MissingValue("--sst-store"))
+        );
+    }
+
+    /// `--sst-store` on a server, and on a cluster where every node must get a *different*
+    /// prefix — two databases sharing one silently overwrite each other's `000007.sst`.
+    #[test]
+    fn the_server_and_the_cluster_both_take_a_store_url() {
+        let Command::Server(options) = parse_ok(&["server", "--sst-store", "s3://esker/tier"])
+        else {
+            panic!("expected a server command");
+        };
+        assert_eq!(options.sst_store.as_deref(), Some("s3://esker/tier"));
+
+        let Command::Server(options) = parse_ok(&["server", "--write-buffer-size", "262144"])
+        else {
+            panic!("expected a server command");
+        };
+        assert_eq!(options.write_buffer_size, Some(256 * 1024));
+        assert_eq!(
+            parse(["server", "--write-buffer-size", "0"]),
+            Err(ParseError::InvalidValue {
+                flag: "--write-buffer-size",
+                value: "0".to_owned()
+            }),
+            "a zero-byte memtable would flush forever"
+        );
+
+        let Command::Server(options) = parse_ok(&["server"]) else {
+            panic!("expected a server command");
+        };
+        assert_eq!(options.sst_store, None, "absent means local SSTs");
+
+        let Command::Cluster(ClusterOptions::Start { sst_store, .. }) =
+            parse_ok(&["cluster", "start", "--sst-store=s3://esker/c1"])
+        else {
+            panic!("expected a cluster start");
+        };
+        assert_eq!(sst_store.as_deref(), Some("s3://esker/c1"));
+
+        assert_eq!(
+            parse(["server", "--sst-store"]),
             Err(ParseError::MissingValue("--sst-store"))
         );
     }
@@ -1400,6 +1481,8 @@ mod tests {
             data_dir,
             base_port,
             seed,
+            sst_store,
+            write_buffer_size,
         }) = parse_ok(&[
             "cluster",
             "start",
@@ -1416,6 +1499,11 @@ mod tests {
         };
         assert_eq!((nodes, base_port, seed), (5, 30_000, 9));
         assert_eq!(data_dir, PathBuf::from("/tmp/c"));
+        assert_eq!(sst_store, None, "a cluster tiers nothing unless asked");
+        assert_eq!(
+            write_buffer_size, None,
+            "and keeps the engine's memtable size"
+        );
 
         let Command::Cluster(ClusterOptions::Stop { data_dir }) =
             parse_ok(&["cluster", "stop", "--data-dir", "/tmp/c"])

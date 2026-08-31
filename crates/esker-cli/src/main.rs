@@ -19,6 +19,7 @@ mod raw;
 mod region;
 mod server;
 mod sst_dump;
+mod sst_store;
 #[cfg(test)]
 mod testserver;
 mod wal_dump;

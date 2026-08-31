@@ -324,6 +324,7 @@ dependencies = [
  "esker-base",
  "esker-client",
  "esker-engine",
+ "esker-keys",
  "esker-pd",
  "esker-proto",
  "esker-s3",

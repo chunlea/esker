@@ -42,6 +42,20 @@ pub(crate) struct ServerOptions {
     /// Seed for the election-timeout RNG. A whole cluster shares one: the peer id selects the
     /// stream (`docs/adr/0008-raft-determinism-and-the-driver-contract.md`).
     pub(crate) seed: u64,
+    /// The memtable size, in bytes, or `None` for the engine's 64 MiB default.
+    ///
+    /// Exposed because a small deployment wants a smaller one, and because an acceptance test
+    /// that has to produce an SST otherwise has to push 64 MiB through Raft to get one
+    /// (`docs/bench/phase-4.md` made the same complaint about the knobs this command does not
+    /// have).
+    pub(crate) write_buffer_size: Option<usize>,
+    /// Tier the SSTs into `s3://bucket/prefix` instead of leaving them on local disk.
+    ///
+    /// One prefix per store: two databases sharing one would overwrite each other's
+    /// `000007.sst`, because a file number restarts at one in every database
+    /// (`crate::sst_store`). `esker cluster start` derives a per-node prefix for exactly that
+    /// reason; an operator running `esker server` by hand owns it.
+    pub(crate) sst_store: Option<String>,
     /// The placement driver to register with and report to. `None` is a store that bootstraps
     /// its own region and reports to nobody — phase 2's single node and phase 3e's static
     /// cluster, both of which this command still starts.
@@ -57,6 +71,8 @@ impl Default for ServerOptions {
             peer_id: 1,
             peers: Vec::new(),
             seed: 0,
+            write_buffer_size: None,
+            sst_store: None,
             pd: None,
         }
     }
@@ -104,11 +120,27 @@ pub(crate) fn run(options: &ServerOptions) -> Result<(), String> {
         }
     };
 
+    // Built before the store, and a failure here is a startup failure: a `--sst-store` that
+    // cannot be reached is a misconfiguration, and a store that started anyway would write
+    // SSTs nobody asked it to keep locally and report success.
+    let fs =
+        crate::sst_store::filesystem(options.sst_store.as_deref(), &options.data_dir, None, true)?;
+
+    let mut engine = StoreOptions::new().engine;
+    if let Some(size) = options.write_buffer_size {
+        engine.cf_options.write_buffer_size = size;
+        for override_options in engine.cf_overrides.values_mut() {
+            override_options.write_buffer_size = size;
+        }
+    }
+
     let store = Store::open(
         &options.data_dir,
         StoreOptions {
             store_id: options.store_id,
             peer_id: options.peer_id,
+            engine,
+            fs,
             raft,
             pd,
             // What PD records as this store's address is the address it was told to listen on,

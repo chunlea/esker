@@ -26,8 +26,6 @@ use std::time::{Duration, Instant};
 
 use esker_base::rng::Pcg32;
 use esker_engine::batch::WriteBatch;
-use esker_engine::fs::tier::{TierOptions, TieredFileSystem};
-use esker_engine::fs::{FileSystem, LocalFileSystem};
 use esker_engine::options::{CfOptions, Options, ReadOptions, WalSyncMode, WriteOptions};
 use esker_engine::{Db, cf};
 
@@ -312,50 +310,6 @@ pub(crate) fn run(options: &Run) -> Result<Report, String> {
     result
 }
 
-/// Builds the filesystem the database will run on: the local one, or a tiered one when
-/// `--sst-store` was given.
-///
-/// The tier runs with `background: false` for the whole bench. That is not how a store runs —
-/// [ADR 0024](../../../docs/adr/0024-tiering-failure-semantics.md) puts the uploader on its own
-/// thread precisely so a flush never waits — but a benchmark wants a *steady state*, and an
-/// uploader fetching files back while the measured phase reads them would be measuring the
-/// interference. Uploads are driven explicitly between the populate and the measurement
-/// instead, and nothing moves after that.
-fn build_filesystem(options: &Run, dir: &Path) -> Result<Arc<dyn FileSystem>, String> {
-    let local = Arc::new(LocalFileSystem::new());
-    let Some(store_url) = &options.sst_store else {
-        return Ok(local);
-    };
-
-    let endpoint_url =
-        std::env::var("ESKER_S3_ENDPOINT").unwrap_or_else(|_| "http://localhost:19000".to_string());
-    let endpoint = esker_s3::Endpoint::parse(&endpoint_url).map_err(|err| err.to_string())?;
-    let credentials = esker_s3::Credentials::new(
-        std::env::var("ESKER_S3_KEY").unwrap_or_else(|_| "eskertest".to_string()),
-        std::env::var("ESKER_S3_SECRET").unwrap_or_else(|_| "eskertest123".to_string()),
-    );
-    let region = std::env::var("ESKER_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
-
-    let config = esker_s3::Config::from_store_url(store_url, endpoint, region, credentials)
-        .map_err(|err| err.to_string())?;
-    let key_prefix = config.prefix.clone();
-    let client = Arc::new(esker_s3::S3Client::new(config));
-
-    TieredFileSystem::new(
-        local,
-        client,
-        dir,
-        TierOptions {
-            key_prefix,
-            local_budget: options.sst_cache_bytes,
-            background: false,
-            ..TierOptions::default()
-        },
-    )
-    .map(|tier| tier as Arc<dyn FileSystem>)
-    .map_err(|err| format!("opening the SST tier at {store_url}: {err}"))
-}
-
 /// Uploads everything the populate phase wrote, then lets the governor settle.
 ///
 /// Loops until a pass moves nothing: one pass handles `batch` files, and a populate can leave
@@ -380,7 +334,15 @@ fn drain_the_tier(db: &Db) -> Result<(), String> {
 
 fn run_in(options: &Run, dir: &Path) -> Result<Report, String> {
     std::fs::create_dir_all(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
-    let fs = build_filesystem(options, dir)?;
+    // `background: false`: a benchmark wants a steady state, not a measurement of the
+    // uploader fetching files back while the measured phase reads them. Uploads are driven
+    // explicitly by `drain_the_tier` below, before the clock starts.
+    let fs = crate::sst_store::filesystem(
+        options.sst_store.as_deref(),
+        dir,
+        options.sst_cache_bytes,
+        false,
+    )?;
     let db = Db::open_with(
         dir,
         Options {

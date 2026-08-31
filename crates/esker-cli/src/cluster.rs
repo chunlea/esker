@@ -40,6 +40,14 @@ pub(crate) enum ClusterOptions {
         base_port: u16,
         /// Seed for the election-timeout RNG, shared by every node.
         seed: u64,
+        /// Tier every node's SSTs into `s3://bucket/prefix`.
+        ///
+        /// Each node gets `prefix/node-N`, derived rather than configured: a cluster is
+        /// several databases, and two sharing a prefix would overwrite each other's
+        /// `000007.sst` (`crate::sst_store`).
+        sst_store: Option<String>,
+        /// Memtable bytes before a flush, for every node. `None` is the engine's default.
+        write_buffer_size: Option<usize>,
     },
     /// Stop a cluster `start` launched.
     Stop {
@@ -64,7 +72,16 @@ pub(crate) fn run(options: &ClusterOptions) -> Result<(), String> {
             data_dir,
             base_port,
             seed,
-        } => start(*nodes, data_dir, *base_port, *seed),
+            sst_store,
+            write_buffer_size,
+        } => start(
+            *nodes,
+            data_dir,
+            *base_port,
+            *seed,
+            sst_store.as_deref(),
+            *write_buffer_size,
+        ),
         ClusterOptions::Stop { data_dir } => stop(data_dir),
     }
 }
@@ -79,7 +96,14 @@ fn dir_of(data_dir: &Path, id: u64) -> PathBuf {
     data_dir.join(format!("node-{id}"))
 }
 
-fn start(nodes: u64, data_dir: &Path, base_port: u16, seed: u64) -> Result<(), String> {
+fn start(
+    nodes: u64,
+    data_dir: &Path,
+    base_port: u16,
+    seed: u64,
+    sst_store: Option<&str>,
+    write_buffer_size: Option<usize>,
+) -> Result<(), String> {
     if nodes == 0 {
         return Err("`--nodes` must be at least 1".to_owned());
     }
@@ -121,6 +145,14 @@ fn start(nodes: u64, data_dir: &Path, base_port: u16, seed: u64) -> Result<(), S
             .arg(id.to_string())
             .arg("--seed")
             .arg(seed.to_string());
+        if let Some(store_url) = sst_store {
+            process
+                .arg("--sst-store")
+                .arg(crate::sst_store::for_node(store_url, id));
+        }
+        if let Some(size) = write_buffer_size {
+            process.arg("--write-buffer-size").arg(size.to_string());
+        }
         for peer in &peers {
             process.arg("--peer").arg(peer);
         }
