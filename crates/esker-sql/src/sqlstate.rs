@@ -113,6 +113,12 @@ pub const INVALID_CATALOG_NAME: &str = "3D000";
 /// this is the code PostgreSQL uses for the same situation under serializable isolation — a
 /// client is expected to see it and retry.
 pub const SERIALIZATION_FAILURE: &str = "40001";
+/// A request went out and no usable answer came back, so whether it was applied is unknown. The
+/// one condition a distributed store has that a single-process one does not, and PostgreSQL has a
+/// code for it because two-phase commit has the same problem.
+pub const STATEMENT_COMPLETION_UNKNOWN: &str = "40003";
+/// The store could not be reached, or would not answer in time.
+pub const CONNECTION_FAILURE: &str = "08006";
 
 // --- Class 42 — Syntax Error or Access Rule Violation ---
 
@@ -208,6 +214,11 @@ mod tests {
         ),
         ("NOT_NULL_VIOLATION", super::NOT_NULL_VIOLATION),
         ("SERIALIZATION_FAILURE", super::SERIALIZATION_FAILURE),
+        (
+            "STATEMENT_COMPLETION_UNKNOWN",
+            super::STATEMENT_COMPLETION_UNKNOWN,
+        ),
+        ("CONNECTION_FAILURE", super::CONNECTION_FAILURE),
         ("UNIQUE_VIOLATION", super::UNIQUE_VIOLATION),
         ("ACTIVE_SQL_TRANSACTION", super::ACTIVE_SQL_TRANSACTION),
         (

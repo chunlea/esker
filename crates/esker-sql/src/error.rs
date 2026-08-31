@@ -352,8 +352,29 @@ pub enum SqlError {
     /// Two transactions wrote the same key and this one lost the race. The client is expected to
     /// retry; the executor turns this into a `23505` when the key it lost was a unique index entry,
     /// because from the user's point of view that is a duplicate and not a race.
-    #[error("could not serialize access due to concurrent update: {0}")]
-    SerializationFailure(String),
+    #[error("could not serialize access due to concurrent update: {message}")]
+    SerializationFailure {
+        /// What the store said.
+        message: String,
+        /// **Which key lost**, when the store answered per key — which `Prewrite` does
+        /// (`docs/txn-spec.md` §6.1). `None` means the refusing method does not answer per key,
+        /// not that no key lost.
+        ///
+        /// The executor needs it to tell two events apart that are one event to the layer below:
+        /// a lost race on an ordinary row is this error, and a lost race on a *unique index
+        /// entry* is the `23505` the user actually caused.
+        key: Option<Vec<u8>>,
+    },
+
+    /// A request went out and no usable answer came back. Whether it was applied is genuinely
+    /// unknown, and saying so is the only honest answer — reporting success would be a lie and
+    /// reporting failure would be a different one.
+    #[error("the transaction's outcome is unknown: {0}")]
+    OutcomeUnknown(String),
+
+    /// The store could not be reached, or would not answer in time.
+    #[error("could not reach the store: {0}")]
+    StoreUnavailable(String),
 
     /// `CREATE ... IF NOT EXISTS` for something that is already there. A notice: the statement
     /// succeeded and did nothing.
@@ -482,7 +503,9 @@ impl SqlError {
             SqlError::UndefinedOperator { .. } => sqlstate::UNDEFINED_FUNCTION,
             SqlError::NegativeLimit("LIMIT") => sqlstate::INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
             SqlError::NegativeLimit(_) => sqlstate::INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
-            SqlError::SerializationFailure(_) => sqlstate::SERIALIZATION_FAILURE,
+            SqlError::SerializationFailure { .. } => sqlstate::SERIALIZATION_FAILURE,
+            SqlError::OutcomeUnknown(_) => sqlstate::STATEMENT_COMPLETION_UNKNOWN,
+            SqlError::StoreUnavailable(_) => sqlstate::CONNECTION_FAILURE,
             SqlError::DoesNotExistSkipping { .. } => sqlstate::SUCCESSFUL_COMPLETION,
             SqlError::IdentifierTruncated { .. } => sqlstate::NAME_TOO_LONG,
             SqlError::InFailedTransaction => sqlstate::IN_FAILED_SQL_TRANSACTION,

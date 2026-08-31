@@ -202,11 +202,34 @@ impl Executor {
     }
 
     /// Turns a `40001` from `commit` into the `23505` it is, when the key that lost was a unique
-    /// index entry. See the module docs for why this needs a second look at the store.
+    /// index entry.
+    ///
+    /// The store now **names the key that lost** (`docs/txn-spec.md` §6.1), so the common case is
+    /// a lookup in what this transaction wrote and costs nothing. The second look is what is left
+    /// of the original design, for a refusal that named no key: `Commit` and `Rollback` do not
+    /// answer per key, and this layer will not invent one.
     fn explain_conflict(&self, error: SqlError, written: &Written) -> SqlError {
-        if !matches!(error, SqlError::SerializationFailure(_)) || written.unique_keys.is_empty() {
+        let SqlError::SerializationFailure { key, .. } = &error else {
+            return error;
+        };
+        if written.unique_keys.is_empty() {
             return error;
         }
+
+        if let Some(lost) = key {
+            return match written.unique_keys.iter().find(|it| &it.key == lost) {
+                Some(unique) => SqlError::UniqueViolation {
+                    constraint: unique.constraint.clone(),
+                    key: Some(unique.detail.clone()),
+                },
+                // A key this transaction wrote that is not one of its unique index entries: an
+                // ordinary row-level race, and still retryable.
+                None => error,
+            };
+        }
+
+        // No key named. Open a transaction and look: the entries that are now present are the
+        // ones this transaction collided with, and the first of those names the constraint.
         let Ok(txn) = self.backend.begin() else {
             return error;
         };
@@ -218,7 +241,6 @@ impl Executor {
                 };
             }
         }
-        // Nobody took any of them: an ordinary row-level race, and still retryable.
         error
     }
 
