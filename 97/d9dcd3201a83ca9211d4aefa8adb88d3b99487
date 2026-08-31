@@ -1,0 +1,19 @@
+crates/esker-client/tests/bank.rs
+  s_cf8601956e2620::t_53d7de129ea1fd 235-240,242,244,598-602,644-653,670-675,679
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "97d9dcd3201a83ca9211d4aefa8adb88d3b99487",
+  "prompts": {},
+  "sessions": {
+    "s_cf8601956e2620": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "732aecbc-5268-4943-836e-a49ba67b2585",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
