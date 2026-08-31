@@ -1,0 +1,360 @@
+//! What a `$1` is, and what to read its bytes as.
+//!
+//! A `Bind` carries values and format codes and no types at all. The type is inferred from *where*
+//! the parameter appears — the column it is being inserted into, the column it is compared
+//! against, the column it is assigned to — which is why this lives beside the executor, where the
+//! catalog is in reach, and not in the protocol layer.
+//!
+//! # The fallback is `text`, and that was measured
+//!
+//! A parameter no context types is `text`. `PREPARE p AS SELECT $1` on a real PostgreSQL 19
+//! reports `{text}`, not an error and not "unknown" — so a client that binds anything to a bare
+//! `SELECT $1` gets a string back, and so does one talking to this node.
+//!
+//! A type the client *declared* in `Parse` wins over any inference. It said what it is sending; the
+//! server's job is to read it that way, not to argue.
+
+use crate::catalog::TableDef;
+use crate::error::{Result, SqlError};
+use crate::pgwire::session::Params;
+use crate::plan::{BinaryOp, Expr, Literal, Statement};
+use crate::value::{ColumnType, Datum};
+
+/// Every parameter's type, indexed from zero for `$1`.
+pub(super) fn infer(
+    statement: &Statement,
+    table: Option<&TableDef>,
+    declared: &[u32],
+) -> Vec<ColumnType> {
+    // Sized by the highest `$n` the statement mentions anywhere, not only where a type comes from:
+    // `SELECT $1` names a parameter that nothing types, and it still has to be reported.
+    let mut count = declared.len();
+    for_each_expr(statement, &mut |expr| {
+        if let Expr::Parameter(number) = expr {
+            count = count.max(*number as usize);
+        }
+    });
+
+    let mut found: Vec<Option<ColumnType>> = vec![None; count];
+    walk(statement, table, &mut |number, ty| {
+        let at = (number as usize).saturating_sub(1);
+        if found.len() <= at {
+            found.resize(at + 1, None);
+        }
+        found[at].get_or_insert(ty);
+    });
+
+    found
+        .into_iter()
+        .enumerate()
+        .map(|(at, inferred)| {
+            // What the client declared wins: it is the one that knows what bytes it is sending.
+            match declared.get(at).copied().unwrap_or(0) {
+                0 => inferred.unwrap_or(ColumnType::Text),
+                oid => from_oid(oid).unwrap_or_else(|| inferred.unwrap_or(ColumnType::Text)),
+            }
+        })
+        .collect()
+}
+
+/// Replaces every `$n` with the value bound to it, already read as the type inferred for it.
+///
+/// After this the statement holds no parameters at all, so everything downstream — the planner,
+/// the filter, the row builder — sees the same shapes it would have seen from a literal.
+pub(super) fn substitute(
+    statement: &mut Statement,
+    params: &Params<'_>,
+    types: &[ColumnType],
+) -> Result<()> {
+    let mut failure = None;
+    walk_mut(statement, &mut |expr| {
+        let Expr::Parameter(number) = expr else {
+            return;
+        };
+        let number = *number;
+        let at = (number as usize).saturating_sub(1);
+        let Some(slot) = params.values.get(at) else {
+            // Nothing was bound. In the simple query protocol nothing ever is, and PostgreSQL says
+            // exactly this.
+            failure.get_or_insert(SqlError::UndefinedParameter(number));
+            return;
+        };
+        let ty = types.get(at).copied().unwrap_or(ColumnType::Text);
+        let value = match slot {
+            None => Ok(Datum::Null),
+            Some(bytes) => match params.format(at) {
+                0 => std::str::from_utf8(bytes)
+                    .map_err(|_| SqlError::InvalidByteSequence(bytes.first().copied().unwrap_or(0)))
+                    .and_then(|text| Datum::from_text(ty, text)),
+                1 => Datum::from_binary(ty, bytes),
+                other => Err(SqlError::ProtocolViolation(format!(
+                    "parameter format {other} is neither text nor binary"
+                ))),
+            },
+        };
+        match value {
+            Ok(value) => *expr = Expr::Literal(Literal::Typed(Box::new(value))),
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
+        }
+    });
+    failure.map_or(Ok(()), Err)
+}
+
+/// The type a client's declared OID names, or `None` for one this crate does not have.
+fn from_oid(oid: u32) -> Option<ColumnType> {
+    ColumnType::ALL.into_iter().find(|ty| ty.oid() == oid)
+}
+
+/// Visits every parameter with the type its context gives it.
+fn walk(statement: &Statement, table: Option<&TableDef>, seen: &mut impl FnMut(u32, ColumnType)) {
+    match statement {
+        Statement::Insert(insert) => {
+            let Some(table) = table else { return };
+            let targets: Vec<usize> = match &insert.columns {
+                Some(names) => names.iter().filter_map(|name| table.column(name)).collect(),
+                None => (0..table.columns.len()).collect(),
+            };
+            for row in &insert.rows {
+                for (target, expr) in targets.iter().zip(row) {
+                    if let Expr::Parameter(number) = expr {
+                        seen(*number, table.columns[*target].ty);
+                    }
+                }
+            }
+        }
+        Statement::Select(select) => {
+            if let Some(filter) = &select.filter {
+                walk_predicate(filter, table, seen);
+            }
+            // `LIMIT $1` is a count, whatever else is going on.
+            for clause in [select.limit.as_ref(), select.offset.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if let Expr::Parameter(number) = clause {
+                    seen(*number, ColumnType::Int8);
+                }
+            }
+        }
+        Statement::Update(update) => {
+            if let Some(table) = table {
+                for (name, value) in &update.assignments {
+                    if let (Some(at), Expr::Parameter(number)) = (table.column(name), value) {
+                        seen(*number, table.columns[at].ty);
+                    }
+                }
+            }
+            if let Some(filter) = &update.filter {
+                walk_predicate(filter, table, seen);
+            }
+        }
+        Statement::Delete(delete) => {
+            if let Some(filter) = &delete.filter {
+                walk_predicate(filter, table, seen);
+            }
+        }
+        Statement::Explain(inner) => walk(inner, table, seen),
+        Statement::CreateTable(_)
+        | Statement::DropTable(_)
+        | Statement::CreateIndex(_)
+        | Statement::DropIndex(_) => {}
+    }
+}
+
+/// A parameter compared against a column takes that column's type. That is the whole of the
+/// inference in a `WHERE`, and it is what `WHERE id = $1` needs.
+fn walk_predicate(expr: &Expr, table: Option<&TableDef>, seen: &mut impl FnMut(u32, ColumnType)) {
+    match expr {
+        Expr::Binary { op, left, right }
+            if op.is_comparison() || *op == BinaryOp::And || *op == BinaryOp::Or =>
+        {
+            if op.is_comparison()
+                && let Some(table) = table
+            {
+                let pair = match (left.as_ref(), right.as_ref()) {
+                    (Expr::Column(name), Expr::Parameter(number))
+                    | (Expr::Parameter(number), Expr::Column(name)) => Some((name, *number)),
+                    _ => None,
+                };
+                if let Some((name, number)) = pair
+                    && let Some(at) = table.column(name)
+                {
+                    seen(number, table.columns[at].ty);
+                }
+            }
+            walk_predicate(left, table, seen);
+            walk_predicate(right, table, seen);
+        }
+        Expr::Binary { left, right, .. } => {
+            walk_predicate(left, table, seen);
+            walk_predicate(right, table, seen);
+        }
+        Expr::Not(operand) | Expr::IsNull { operand, .. } => walk_predicate(operand, table, seen),
+        _ => {}
+    }
+}
+
+/// Visits every expression in a statement, for substitution.
+fn walk_mut(statement: &mut Statement, visit: &mut impl FnMut(&mut Expr)) {
+    match statement {
+        Statement::Insert(insert) => {
+            for row in &mut insert.rows {
+                for expr in row {
+                    walk_expr_mut(expr, visit);
+                }
+            }
+        }
+        Statement::Select(select) => {
+            for item in &mut select.projection {
+                if let crate::plan::SelectItem::Expr { expr, .. } = item {
+                    walk_expr_mut(expr, visit);
+                }
+            }
+            for expr in select
+                .filter
+                .iter_mut()
+                .chain(select.limit.iter_mut())
+                .chain(select.offset.iter_mut())
+            {
+                walk_expr_mut(expr, visit);
+            }
+            for item in &mut select.order_by {
+                walk_expr_mut(&mut item.expr, visit);
+            }
+        }
+        Statement::Update(update) => {
+            for (_, value) in &mut update.assignments {
+                walk_expr_mut(value, visit);
+            }
+            if let Some(filter) = &mut update.filter {
+                walk_expr_mut(filter, visit);
+            }
+        }
+        Statement::Delete(delete) => {
+            if let Some(filter) = &mut delete.filter {
+                walk_expr_mut(filter, visit);
+            }
+        }
+        Statement::Explain(inner) => walk_mut(inner, visit),
+        Statement::CreateTable(_)
+        | Statement::DropTable(_)
+        | Statement::CreateIndex(_)
+        | Statement::DropIndex(_) => {}
+    }
+}
+
+fn walk_expr_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr)) {
+    visit(expr);
+    match expr {
+        Expr::Binary { left, right, .. } => {
+            walk_expr_mut(left, visit);
+            walk_expr_mut(right, visit);
+        }
+        Expr::Not(operand) | Expr::IsNull { operand, .. } => walk_expr_mut(operand, visit),
+        _ => {}
+    }
+}
+
+/// The table a statement is about, by name, so the inference has column types to work from.
+pub(super) fn table_name(statement: &Statement) -> Option<&str> {
+    match statement {
+        Statement::Insert(insert) => Some(&insert.table),
+        Statement::Select(select) => select.from.as_deref(),
+        Statement::Update(update) => Some(&update.table),
+        Statement::Delete(delete) => Some(&delete.table),
+        Statement::Explain(inner) => table_name(inner),
+        Statement::CreateTable(_)
+        | Statement::DropTable(_)
+        | Statement::CreateIndex(_)
+        | Statement::DropIndex(_) => None,
+    }
+}
+
+/// Whether a statement mentions a parameter at all, so the common case costs no walk of its own.
+pub(super) fn has_parameters(statement: &Statement) -> bool {
+    let mut found = false;
+    for_each_expr(statement, &mut |expr| {
+        found = found || matches!(expr, Expr::Parameter(_));
+    });
+    found
+}
+
+/// Every expression in a statement, read-only.
+fn for_each_expr(statement: &Statement, visit: &mut impl FnMut(&Expr)) {
+    let mut each = |expr: &Expr| descend(expr, visit);
+    match statement {
+        Statement::Insert(insert) => {
+            for row in &insert.rows {
+                row.iter().for_each(&mut each);
+            }
+        }
+        Statement::Select(select) => {
+            for item in &select.projection {
+                if let crate::plan::SelectItem::Expr { expr, .. } = item {
+                    each(expr);
+                }
+            }
+            select
+                .filter
+                .iter()
+                .chain(select.limit.iter())
+                .chain(select.offset.iter())
+                .for_each(&mut each);
+            for item in &select.order_by {
+                each(&item.expr);
+            }
+        }
+        Statement::Update(update) => {
+            for (_, value) in &update.assignments {
+                each(value);
+            }
+            update.filter.iter().for_each(&mut each);
+        }
+        Statement::Delete(delete) => delete.filter.iter().for_each(&mut each),
+        Statement::Explain(inner) => for_each_expr(inner, visit),
+        Statement::CreateTable(_)
+        | Statement::DropTable(_)
+        | Statement::CreateIndex(_)
+        | Statement::DropIndex(_) => {}
+    }
+}
+
+fn descend(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
+    visit(expr);
+    match expr {
+        Expr::Binary { left, right, .. } => {
+            descend(left, visit);
+            descend(right, visit);
+        }
+        Expr::Not(operand) | Expr::IsNull { operand, .. } => descend(operand, visit),
+        _ => {}
+    }
+}
+
+/// Replaces every parameter with a *typed placeholder*, for `Describe`.
+///
+/// Describing a statement needs to know the shape of its output, and a `SELECT $1` cannot be
+/// planned while `$1` has no type. Nothing is run, so the value does not matter — only that it has
+/// the type the inference gave the parameter.
+pub(super) fn substitute_placeholders(statement: &mut Statement, types: &[ColumnType]) {
+    walk_mut(statement, &mut |expr| {
+        if let Expr::Parameter(number) = expr {
+            let at = (*number as usize).saturating_sub(1);
+            let ty = types.get(at).copied().unwrap_or(ColumnType::Text);
+            *expr = Expr::Literal(Literal::Typed(Box::new(placeholder(ty))));
+        }
+    });
+}
+
+fn placeholder(ty: ColumnType) -> Datum {
+    match ty {
+        ColumnType::Int8 => Datum::Int8(0),
+        ColumnType::Text => Datum::Text(String::new()),
+        ColumnType::Bool => Datum::Bool(false),
+        ColumnType::Bytea => Datum::Bytea(Vec::new()),
+        ColumnType::TimestampTz => Datum::TimestampTz(0),
+        ColumnType::Double => Datum::Double(0.0),
+    }
+}

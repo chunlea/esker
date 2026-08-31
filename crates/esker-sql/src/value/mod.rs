@@ -236,6 +236,68 @@ impl Datum {
         })
     }
 
+    /// The bytes PostgreSQL puts in a **binary**-format field, or `None` for NULL.
+    ///
+    /// Big-endian throughout, which is the one place this project is: everything it writes for
+    /// itself is little-endian and everything on this wire is not. The formats were captured with
+    /// `COPY ... TO STDOUT (FORMAT binary)`, which uses the same `typsend` functions the protocol
+    /// does, and one of them settled a bet made back in unit 3 — a `timestamptz` really is
+    /// microseconds from 2000-01-01 with `i64::MAX` for `infinity`, so a value goes onto the wire
+    /// exactly as it is stored, with no arithmetic at all.
+    #[must_use]
+    pub fn to_binary(&self) -> Option<Vec<u8>> {
+        Some(match self {
+            Datum::Null => return None,
+            Datum::Int8(v) | Datum::TimestampTz(v) => v.to_be_bytes().to_vec(),
+            Datum::Bool(v) => vec![u8::from(*v)],
+            Datum::Double(v) => v.to_be_bytes().to_vec(),
+            Datum::Text(v) => v.as_bytes().to_vec(),
+            Datum::Bytea(v) => v.clone(),
+        })
+    }
+
+    /// Reads a value out of a binary-format parameter.
+    ///
+    /// A wrong length is an error, never a partial read: a client that sends four bytes for an
+    /// `int8` has a bug, and guessing at what it meant would turn that bug into a wrong number.
+    pub fn from_binary(ty: ColumnType, bytes: &[u8]) -> Result<Datum> {
+        let fixed = |width: usize| {
+            (bytes.len() == width).then_some(bytes).ok_or_else(|| {
+                SqlError::ProtocolViolation(format!(
+                    "a binary {} is {width} bytes, not {}",
+                    ty.name(),
+                    bytes.len()
+                ))
+            })
+        };
+        Ok(match ty {
+            ColumnType::Int8 | ColumnType::TimestampTz | ColumnType::Double => {
+                let head: [u8; 8] = fixed(8)?.try_into().unwrap_or([0; 8]);
+                match ty {
+                    ColumnType::Int8 => Datum::Int8(i64::from_be_bytes(head)),
+                    ColumnType::TimestampTz => Datum::TimestampTz(i64::from_be_bytes(head)),
+                    _ => Datum::Double(f64::from_be_bytes(head)),
+                }
+            }
+            ColumnType::Bool => match fixed(1)?[0] {
+                0 => Datum::Bool(false),
+                1 => Datum::Bool(true),
+                other => {
+                    return Err(SqlError::ProtocolViolation(format!(
+                        "a binary boolean is 0 or 1, not {other}"
+                    )));
+                }
+            },
+            ColumnType::Text => {
+                Datum::Text(String::from_utf8(bytes.to_vec()).map_err(|error| {
+                    let at = error.utf8_error().valid_up_to();
+                    SqlError::InvalidByteSequence(error.as_bytes().get(at).copied().unwrap_or(0))
+                })?)
+            }
+            ColumnType::Bytea => Datum::Bytea(bytes.to_vec()),
+        })
+    }
+
     /// The order PostgreSQL sorts these values in, which is not the order their bits are in.
     ///
     /// Three of its rules are its own and were confirmed against the server: `-0.0` and `0.0`
@@ -560,5 +622,80 @@ mod tests {
         let error = Datum::from_text(ColumnType::TimestampTz, "294277-01-01 00:00:00+00")
             .expect_err("past the end");
         assert_eq!(error.sqlstate(), sqlstate::DATETIME_FIELD_OVERFLOW);
+    }
+}
+
+#[cfg(test)]
+mod binary_tests {
+    use super::{ColumnType, Datum, MIN_MICROS, NEG_INFINITY, POS_INFINITY};
+
+    /// The bytes a real PostgreSQL 19 wrote for these values, taken from
+    /// `COPY ... TO STDOUT (FORMAT binary)` — the same `typsend` functions the protocol uses.
+    #[test]
+    fn the_binary_formats_are_the_ones_postgresql_sends() {
+        let cases: &[(Datum, &[u8])] = &[
+            (Datum::Int8(1), &[0, 0, 0, 0, 0, 0, 0, 1]),
+            (Datum::Int8(-1), &[0xff; 8]),
+            (Datum::Bool(true), &[1]),
+            (Datum::Bool(false), &[0]),
+            (Datum::Text("ab".into()), b"ab"),
+            (Datum::Bytea(vec![0xde, 0xad]), &[0xde, 0xad]),
+            (Datum::TimestampTz(0), &[0; 8]),
+            (
+                Datum::TimestampTz(762_525_296_100_000),
+                &[0x00, 0x02, 0xb5, 0x83, 0x41, 0x68, 0x02, 0xa0],
+            ),
+            (
+                Datum::Double(1.5),
+                &[0x3f, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            ),
+            (
+                Datum::TimestampTz(POS_INFINITY),
+                &[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            ),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(
+                value.to_binary().as_deref(),
+                Some(*expected),
+                "{value:?} does not match what PostgreSQL sent"
+            );
+        }
+    }
+
+    /// Every value survives the binary round trip, sentinels included — which is the point of
+    /// storing PostgreSQL's own representation rather than a translated one.
+    #[test]
+    fn binary_round_trips_for_every_type() {
+        let cases = [
+            (ColumnType::Int8, Datum::Int8(i64::MIN)),
+            (ColumnType::Text, Datum::Text("héllo 🌊".into())),
+            (ColumnType::Bool, Datum::Bool(true)),
+            (ColumnType::Bytea, Datum::Bytea(vec![0, 0xff, 0x7f])),
+            (ColumnType::TimestampTz, Datum::TimestampTz(MIN_MICROS)),
+            (ColumnType::TimestampTz, Datum::TimestampTz(NEG_INFINITY)),
+            (ColumnType::Double, Datum::Double(f64::NAN)),
+            (ColumnType::Double, Datum::Double(-0.0)),
+        ];
+        for (ty, value) in cases {
+            let bytes = value.to_binary().expect("not NULL");
+            assert_eq!(Datum::from_binary(ty, &bytes).unwrap(), value, "{ty:?}");
+        }
+        assert_eq!(
+            Datum::Null.to_binary(),
+            None,
+            "NULL is a -1 length, not bytes"
+        );
+    }
+
+    /// A wrong length is a protocol violation, not a partial read: guessing would turn a client's
+    /// bug into a wrong number.
+    #[test]
+    fn a_binary_value_of_the_wrong_length_is_refused() {
+        assert!(Datum::from_binary(ColumnType::Int8, &[0; 4]).is_err());
+        assert!(Datum::from_binary(ColumnType::Bool, &[2]).is_err());
+        assert!(Datum::from_binary(ColumnType::Double, &[]).is_err());
+        // A variable-length type takes whatever it is given.
+        assert!(Datum::from_binary(ColumnType::Bytea, &[]).is_ok());
     }
 }

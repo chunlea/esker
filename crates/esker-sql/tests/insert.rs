@@ -18,7 +18,7 @@ use esker_sql::backend::{Backend, MemoryBackend};
 use esker_sql::catalog::Catalog;
 use esker_sql::exec::Executor;
 use esker_sql::parse::parse_statements;
-use esker_sql::pgwire::session::{Execute, Outcome};
+use esker_sql::pgwire::session::{Execute, Outcome, Params};
 use esker_sql::row;
 use esker_sql::sqlstate;
 use esker_sql::value::{ColumnType, Datum};
@@ -49,7 +49,7 @@ impl Node {
 fn run(executor: &mut Executor, sql: &str) -> esker_sql::Result<Outcome> {
     let mut last = Outcome::done("");
     for parsed in parse_statements(sql)? {
-        last = executor.execute(&parsed)?;
+        last = executor.execute(&parsed, &Params::NONE)?;
     }
     Ok(last)
 }

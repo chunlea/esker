@@ -427,6 +427,7 @@ impl Execute for NotYetExecuting {
     fn execute(
         &mut self,
         parsed: &crate::parse::Parsed,
+        _params: &crate::pgwire::session::Params<'_>,
     ) -> Result<crate::pgwire::session::Outcome> {
         Err(SqlError::unsupported(format!(
             "{} (the executor lands in unit 6 of docs/plans/phase-6a.md)",

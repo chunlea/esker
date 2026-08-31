@@ -58,6 +58,54 @@ impl Outcome {
     }
 }
 
+/// The parameters a `Bind` carried, and everything needed to read them.
+///
+/// Values arrive as bytes with a format code each, and the *type* to read them as is not in the
+/// message at all — it is inferred from where the parameter appears in the statement, which is why
+/// this is handed to the executor rather than decoded here.
+#[derive(Debug, Clone, Copy)]
+pub struct Params<'a> {
+    /// One per parameter; `None` is SQL NULL, which the wire spells as a length of -1.
+    pub values: &'a [Option<Vec<u8>>],
+    /// Format codes: one per value, or exactly one meaning "all of them", or none meaning all
+    /// text. That three-way rule is the protocol's, and getting it wrong reads a binary value as
+    /// text or the reverse.
+    pub formats: &'a [i16],
+    /// Type OIDs the client declared in `Parse`. May be shorter than `values`, and a zero means
+    /// "you decide".
+    pub declared: &'a [u32],
+}
+
+impl Params<'_> {
+    /// No parameters at all — what the simple query protocol always has.
+    pub const NONE: Params<'static> = Params {
+        values: &[],
+        formats: &[],
+        declared: &[],
+    };
+
+    /// The format code for one parameter, with the protocol's three-way rule applied.
+    #[must_use]
+    pub fn format(&self, index: usize) -> i16 {
+        match self.formats {
+            [] => 0,
+            [only] => *only,
+            many => many.get(index).copied().unwrap_or(0),
+        }
+    }
+}
+
+/// What `Describe` on a prepared statement answers: the parameters it takes and the rows it
+/// returns.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Described {
+    /// One type OID per parameter, inferred where the client declared nothing.
+    pub parameters: Vec<u32>,
+    /// The row shape, or `None` for a statement that returns none — which the protocol spells
+    /// `NoData`.
+    pub fields: Option<Vec<FieldDescription>>,
+}
+
 /// The seam between the protocol and the thing that runs statements.
 ///
 /// The executor (unit 6 of `docs/plans/phase-6a.md`) implements this; the tests here use a fake.
@@ -67,15 +115,15 @@ impl Outcome {
 /// conflict, and the session must end the transaction anyway.
 pub trait Execute {
     /// Runs one statement that is not transaction control.
-    fn execute(&mut self, parsed: &Parsed) -> Result<Outcome>;
+    fn execute(&mut self, parsed: &Parsed, params: &Params<'_>) -> Result<Outcome>;
 
-    /// The columns a statement would return, without running it — what `Describe` needs.
+    /// What a statement takes and what it returns, without running it — what `Describe` needs.
     ///
-    /// `None` means the statement returns no rows, which the protocol spells `NoData`. The default
-    /// says that for everything, which is right until the planner can answer properly.
-    fn describe(&mut self, parsed: &Parsed) -> Result<Option<Vec<FieldDescription>>> {
-        let _ = parsed;
-        Ok(None)
+    /// The default answers "no parameters, no rows", which is right for an executor that runs
+    /// nothing.
+    fn describe(&mut self, parsed: &Parsed, declared: &[u32]) -> Result<Described> {
+        let _ = (parsed, declared);
+        Ok(Described::default())
     }
 
     /// Notices the statement that just ran produced, which the session sends before its
@@ -123,8 +171,10 @@ struct Portal {
     statement: String,
     /// Kept so a second `Execute` after a `PortalSuspended` can resume, and so `Describe` can
     /// answer without the statement being re-bound.
-    #[allow(dead_code)]
     params: Vec<Option<Vec<u8>>>,
+    /// Format codes as `Bind` sent them, with the protocol's "one for all" rule left intact —
+    /// [`Params::format`] applies it.
+    formats: Vec<i16>,
     /// Rows already returned by earlier `Execute`s against this portal.
     delivered: usize,
 }
@@ -196,7 +246,9 @@ impl Session {
             StatementClass::Begin => self.begin(executor, out),
             StatementClass::Commit => self.commit(executor, out),
             StatementClass::Rollback => self.rollback(executor, out),
-            _ => executor.execute(parsed),
+            // A simple query carries no parameters: the protocol has no way to send one, which
+            // is why `$1` in a `Query` is `42P02`.
+            _ => executor.execute(parsed, &Params::NONE),
         };
 
         // Notices come before whatever the statement produced, error or not: a `CREATE TABLE IF
@@ -299,8 +351,9 @@ impl Session {
                 portal,
                 statement,
                 params,
+                param_formats,
                 ..
-            } => self.bind(portal, statement, params, out),
+            } => self.bind(portal, statement, params, param_formats, out),
             Frontend::Describe { target, name } => self.describe(*target, name, executor, out),
             Frontend::Execute { portal, max_rows } => {
                 self.execute(portal, *max_rows, executor, out);
@@ -360,6 +413,7 @@ impl Session {
         portal: &str,
         statement: &str,
         params: &[Option<Vec<u8>>],
+        formats: &[i16],
         out: &mut Vec<u8>,
     ) {
         if !self.statements.contains_key(statement) {
@@ -373,6 +427,7 @@ impl Session {
             Portal {
                 statement: statement.to_owned(),
                 params: params.to_vec(),
+                formats: formats.to_vec(),
                 delivered: 0,
             },
         );
@@ -396,21 +451,20 @@ impl Session {
             Ok(prepared) => prepared.clone(),
             Err(error) => return self.extended_failure(&error, out),
         };
-        if target == Target::Statement {
-            // TODO(unit-6): these are the types the client declared, not types we inferred. Real
-            // inference needs the planner to type the expressions a parameter appears in; until
-            // then a client that declares nothing is told nothing, which is honest but is not yet
-            // what PostgreSQL answers.
-            Backend::ParameterDescription(&prepared.param_types).encode(out);
-        }
-        let fields = match prepared.parsed.as_ref() {
-            None => None,
-            Some(parsed) => match executor.describe(parsed) {
-                Ok(fields) => fields,
+        let described = match prepared.parsed.as_ref() {
+            None => Described::default(),
+            Some(parsed) => match executor.describe(parsed, &prepared.param_types) {
+                Ok(described) => described,
                 Err(error) => return self.extended_failure(&error, out),
             },
         };
-        match fields {
+        if target == Target::Statement {
+            // Inferred, not merely echoed back: a client that declares nothing is told what the
+            // statement actually needs, which is what PostgreSQL answers and what a driver builds
+            // its encoder from.
+            Backend::ParameterDescription(&described.parameters).encode(out);
+        }
+        match described.fields {
             Some(fields) => Backend::RowDescription(&fields).encode(out),
             None => Backend::NoData.encode(out),
         }
@@ -444,7 +498,14 @@ impl Session {
             StatementClass::Begin => self.begin(executor, out),
             StatementClass::Commit => self.commit(executor, out),
             StatementClass::Rollback => self.rollback(executor, out),
-            _ => executor.execute(&parsed),
+            _ => executor.execute(
+                &parsed,
+                &Params {
+                    values: &open.params,
+                    formats: &open.formats,
+                    declared: &prepared.param_types,
+                },
+            ),
         };
         // Same rule as the simple query path: what the statement remarked on goes out before what
         // it produced.
@@ -555,7 +616,7 @@ fn ends_a_transaction(class: &StatementClass) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Execute, Outcome, Session};
+    use super::{Described, Execute, Outcome, Params, Session};
     use crate::error::{Result, SqlError};
     use crate::parse::Parsed;
     use crate::pgwire::message::{FieldDescription, Frontend, Target, TransactionStatus};
@@ -593,17 +654,24 @@ mod tests {
     }
 
     impl Execute for Fake {
-        fn describe(&mut self, parsed: &Parsed) -> Result<Option<Vec<FieldDescription>>> {
+        fn describe(&mut self, parsed: &Parsed, declared: &[u32]) -> Result<Described> {
             self.calls.push(format!("describe {}", parsed.rendered()));
-            Ok(if self.rows == 0 {
-                None
-            } else {
-                Some(Fake::fields())
+            Ok(Described {
+                parameters: declared.to_vec(),
+                fields: (self.rows != 0).then(Fake::fields),
             })
         }
 
-        fn execute(&mut self, parsed: &Parsed) -> Result<Outcome> {
-            self.calls.push(format!("execute {}", parsed.rendered()));
+        fn execute(&mut self, parsed: &Parsed, params: &Params<'_>) -> Result<Outcome> {
+            self.calls.push(format!(
+                "execute {}{}",
+                parsed.rendered(),
+                if params.values.is_empty() {
+                    String::new()
+                } else {
+                    format!(" with {} parameters", params.values.len())
+                }
+            ));
             if let Some(error) = self.fail.take() {
                 return Err(error);
             }

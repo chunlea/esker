@@ -24,6 +24,7 @@
 //! the first of those names the constraint. A key that is absent means nobody took it and the
 //! conflict really was an ordinary row-level race, which stays `40001` and stays retryable.
 
+mod bind;
 mod ddl;
 mod dml;
 mod query;
@@ -35,8 +36,9 @@ use crate::catalog::Catalog;
 use crate::error::{Result, SqlError};
 use crate::parse::Parsed;
 use crate::pgwire::message::FieldDescription;
-use crate::pgwire::session::{Execute, Outcome};
+use crate::pgwire::session::{Described, Execute, Outcome, Params};
 use crate::plan::Statement;
+use crate::value::ColumnType;
 
 /// Runs statements for one connection.
 #[derive(Debug)]
@@ -71,10 +73,12 @@ impl Executor {
 
     /// Runs `statement` in the open transaction, or in one of its own that is committed on success
     /// and rolled back on failure.
-    fn in_a_transaction(&mut self, statement: &Statement) -> Result<Outcome> {
+    fn in_a_transaction(&mut self, statement: Statement, params: &Params<'_>) -> Result<Outcome> {
         if let Some(mut txn) = self.open.take() {
             let mut written = std::mem::take(&mut self.written);
-            let outcome = self.run_recording(&mut *txn, statement, &mut written);
+            let outcome = self
+                .bound(&*txn, statement, params)
+                .and_then(|statement| self.run_recording(&mut *txn, &statement, &mut written));
             self.open = Some(txn);
             self.written = written;
             return outcome;
@@ -82,7 +86,14 @@ impl Executor {
 
         let mut txn = self.backend.begin()?;
         let mut written = Written::default();
-        match self.run_recording(&mut *txn, statement, &mut written) {
+        let bound = match self.bound(&*txn, statement, params) {
+            Ok(bound) => bound,
+            Err(error) => {
+                let _ = txn.rollback();
+                return Err(error);
+            }
+        };
+        match self.run_recording(&mut *txn, &bound, &mut written) {
             Ok(outcome) => match txn.commit() {
                 Ok(_) => Ok(outcome),
                 Err(error) => Err(self.explain_conflict(error, &written)),
@@ -160,10 +171,7 @@ impl Executor {
 
     fn explain_rows(lines: Vec<String>) -> Outcome {
         Outcome::Rows {
-            fields: vec![FieldDescription::computed(
-                "QUERY PLAN",
-                crate::value::ColumnType::Text,
-            )],
+            fields: vec![FieldDescription::computed("QUERY PLAN", ColumnType::Text)],
             rows: lines
                 .into_iter()
                 .map(|line| vec![Some(line.into_bytes())])
@@ -196,6 +204,37 @@ impl Executor {
     /// Adds a notice for the session to send before this statement's `CommandComplete`.
     fn notice(&mut self, notice: SqlError) {
         self.notices.push(notice);
+    }
+
+    /// Reads every `$n` in a statement as the type its context gives it, leaving a statement with
+    /// no parameters left in it.
+    fn bound(
+        &self,
+        txn: &dyn Txn,
+        mut statement: Statement,
+        params: &Params<'_>,
+    ) -> Result<Statement> {
+        if params.values.is_empty() && !bind::has_parameters(&statement) {
+            return Ok(statement);
+        }
+        let table = self.table_for(txn, &statement)?;
+        let types = bind::infer(&statement, table.as_deref(), params.declared);
+        bind::substitute(&mut statement, params, &types)?;
+        Ok(statement)
+    }
+
+    /// The table a statement is about, when it is about one that exists.
+    fn table_for(
+        &self,
+        txn: &dyn Txn,
+        statement: &Statement,
+    ) -> Result<Option<Arc<crate::catalog::TableDef>>> {
+        match bind::table_name(statement) {
+            // A name that is not there is not this function's error to raise: the statement will
+            // reach it and report it with the message that statement uses.
+            Some(name) => Ok(self.catalog_view(txn)?.table(name)?),
+            None => Ok(None),
+        }
     }
 
     /// This transaction's view of the catalog, pinned to one version.
@@ -268,9 +307,41 @@ fn explain_lines(statement: &Statement) -> Vec<String> {
 }
 
 impl Execute for Executor {
-    fn execute(&mut self, parsed: &Parsed) -> Result<Outcome> {
+    fn execute(&mut self, parsed: &Parsed, params: &Params<'_>) -> Result<Outcome> {
         let statement = parsed.lower()?;
-        self.in_a_transaction(&statement)
+        self.in_a_transaction(statement, params)
+    }
+
+    fn describe(&mut self, parsed: &Parsed, declared: &[u32]) -> Result<Described> {
+        let statement = parsed.lower()?;
+        // Describing takes a transaction of its own, because typing the parameters needs the
+        // catalog and the catalog is data like any other. It writes nothing, so it costs a
+        // snapshot and no conflict.
+        let txn = self.backend.begin()?;
+        let table = self.table_for(&*txn, &statement)?;
+        let types = bind::infer(&statement, table.as_deref(), declared);
+        let parameters = types.iter().copied().map(ColumnType::oid).collect();
+
+        // Planning needs every expression to have a type, and a `$1` has none until now. Nothing
+        // is run, so a placeholder of the right type is all the planner needs to answer the shape.
+        let mut statement = statement;
+        bind::substitute_placeholders(&mut statement, &types);
+        let fields = match &statement {
+            Statement::Select(select) => Some(
+                query::plan(select, self.tenant, table.as_deref())?
+                    .columns
+                    .into_iter()
+                    .map(|(name, ty)| FieldDescription::computed(name, ty))
+                    .collect(),
+            ),
+            Statement::Explain(_) => Some(vec![FieldDescription::computed(
+                "QUERY PLAN",
+                ColumnType::Text,
+            )]),
+            _ => None,
+        };
+        let _ = txn.rollback();
+        Ok(Described { parameters, fields })
     }
 
     fn take_notices(&mut self) -> Vec<SqlError> {

@@ -472,11 +472,12 @@ its own gap register, and it would be longer.
 - [x] 4 — catalog: the `'m'`-space records with a golden, the per-transaction version check,
   and a cache that cannot serve a definition from a snapshot's future
 - [x] 5 — backend trait and fake (the executor's half of the unique-index composition is unit 6)
-- [ ] 6 — planner and executor: **6a–6d done** — the lowering out of the parser's AST, the DDL
+- [x] 6 — planner and executor — the lowering out of the parser's AST, the DDL
   executor over the catalog, `Execute` implemented and a real `psql` driving `CREATE`/`DROP`
-  against it (6a); `INSERT` with its indexes and both halves of the unique-index ruling (6b);
-  the planner, the pull-based executor and `EXPLAIN` (6c); `UPDATE` and
-  `DELETE` with their index maintenance (6d); bound parameters remain
+  against it (6a); `INSERT` with its indexes and both halves of the unique-index ruling (6b); the
+  planner, the pull-based executor and `EXPLAIN` (6c); `UPDATE` and `DELETE` with their index
+  maintenance (6d); bound parameters in both wire formats and inferred `ParameterDescription` (6e).
+  All three obligations from §10a are discharged.
 - [ ] 7 — `.slt` harness
 
 ## 10a. Handoff — where a fresh lane picks up
@@ -803,6 +804,28 @@ Two things in the implementation are there for a reason worth recording:
 Assignment targets are resolved before the first row is read, so `SET nope = 1` fails without
 having rewritten anything. The same script against a real PostgreSQL 19 differs only in the
 `LINE/^` caret.
+
+**Unit 6e.** Bound parameters, which closes the third obligation from §10a: `ParameterDescription`
+now reports what a statement *needs* rather than echoing back what the client declared, which told
+a client that declared nothing exactly nothing.
+
+A `Bind` carries values and format codes and no types at all, so the type comes from where the
+parameter appears — the column it is inserted into, the column it is compared against, the column
+it is assigned to. A type the client did declare wins, because it is the one that knows what bytes
+it is sending. Two things were measured rather than assumed:
+
+- **The fallback is `text`.** `PREPARE p AS SELECT $1` on a real PostgreSQL 19 reports `{text}`,
+  not an error and not "unknown".
+- **The binary formats**, captured with `COPY ... TO STDOUT (FORMAT binary)`, which goes through
+  the same `typsend` functions the protocol does. All six are big-endian — the one place in this
+  project that is — and one of them settled a bet from unit 3: a `timestamptz` on the wire really
+  is microseconds from 2000-01-01 with `i64::MAX` for `infinity`, so a value goes out exactly as it
+  is stored, with no arithmetic at all.
+
+A real `psql` 18.6 now drives the extended protocol against this node with `\bind`, and the same
+script against PostgreSQL 19 returns the same rows and the same errors. The only field still
+missing is the `CONTEXT: unnamed portal parameter $1 = ...` a real server adds to a parameter's
+own error — noted with the `LINE/^` caret as the remaining message-field gap.
 
 **Unit 2a.** The goldens are recorded, not written. A proxy between `psql` 18.6 and the
 PostgreSQL 19beta1 container logged both directions of five real sessions, and
