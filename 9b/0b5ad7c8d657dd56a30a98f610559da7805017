@@ -1,0 +1,14 @@
+docs/plans/phase-5.md
+  h_44076b318daf9c 327-386
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "9b0b5ad7c8d657dd56a30a98f610559da7805017",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
