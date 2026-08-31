@@ -1,0 +1,33 @@
+crates/esker-raft/src/replication.rs
+  s_dc640bf0df4adb::t_170e1ab0a25e30 197-220
+crates/esker-raft/src/snapshot.rs
+  s_dc640bf0df4adb::t_6b822478556a67 440-451,453,473-487
+crates/esker-store/src/server.rs
+  s_dc640bf0df4adb::t_65c4f48f2d250a 626-646,1467-1474,1558-1570,1643-1646,1650-1651
+crates/esker-store/src/snapshot.rs
+  s_dc640bf0df4adb::t_e09a731431fa78 248,250-314,321-325,329-330,332,450-451,453-454,664-669,671,673-674,676-694,696-718
+crates/esker-store/tests/promotion.rs
+  s_dc640bf0df4adb::t_65a6a9a6cb9039 125-127,344-347
+crates/esker-store/tests/snapshot.rs
+  s_dc640bf0df4adb::t_01aa60cc2fa7e0 488,519,526-528,530-536
+docs/plans/phase-4.md
+  s_dc640bf0df4adb::t_508d9e288b474e 1115-1177
+docs/raft-spec.md
+  s_dc640bf0df4adb::t_e0ea084ac5d268 114
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "0af7f3be573543e4310b35d9ae8eda29d9c56a64",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "claude-fable-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
