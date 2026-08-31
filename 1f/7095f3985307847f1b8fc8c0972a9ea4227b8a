@@ -1,0 +1,61 @@
+crates/esker-sql/src/backend/mod.rs
+  s_3138696d8fbc01::t_09069a0ec21179 48-67,86-95,111,117-124,128-142,204-217,243,246-265,288-290,350-352,358-360,364-367,437,442-445
+crates/esker-sql/src/backend/store.rs
+  s_3138696d8fbc01::t_3ea0f45e197699 26,35,41-44,46-47,57-80
+crates/esker-sql/src/bin/esker-sql.rs
+  s_3138696d8fbc01::t_a81cec0ea7151e 67-70,83-91,113-117
+crates/esker-sql/src/error.rs
+  s_3138696d8fbc01::t_17d7f104ada4d2 420-491,528-530,586-598,621-623
+crates/esker-sql/src/exec/bind.rs
+  s_3138696d8fbc01::t_63868b209aaba8 165-166,171-172,272-273,278-279,315-317,363-364,369-370
+crates/esker-sql/src/exec/ddl.rs
+  s_3138696d8fbc01::t_6b466b7a3d2194 344-364
+crates/esker-sql/src/exec/mod.rs
+  s_3138696d8fbc01::t_03a69cb625af3f 42,67-90,106-107,111-126,140,172-179,194-353,643-645,652-657,665-667,706-707,716,731
+crates/esker-sql/src/lib.rs
+  s_3138696d8fbc01::t_73d614a0234b97 55
+crates/esker-sql/src/parse/lower.rs
+  s_3138696d8fbc01::t_70b7275203f19f 31,103-105,110-315,439-442
+crates/esker-sql/src/plan/ddl.rs
+  s_3138696d8fbc01::t_45f025d129a261 184-196
+crates/esker-sql/src/plan/mod.rs
+  s_3138696d8fbc01::t_c651dbf6277c8d 25,34,68-70,91-112,132
+crates/esker-sql/src/plan/session.rs
+  s_3138696d8fbc01::t_a6e8f88e030149 1-48
+crates/esker-sql/src/sqlstate.rs
+  s_3138696d8fbc01::t_c2f04975337a2b 78-80,231-234
+crates/esker-sql/src/time_machine.rs
+  s_3138696d8fbc01::t_041e95d9a8f4fc 1-454
+crates/esker-sql/tests/cluster/mod.rs
+  s_3138696d8fbc01::t_eedcbab275fee1 44,49,154-156,160,184-188,192-206
+crates/esker-sql/tests/corpus/pg19.sql
+  s_3138696d8fbc01::t_aec9268905d6d0 449-469
+crates/esker-sql/tests/lowering.rs
+  s_3138696d8fbc01::t_f42e9295a444ac 304-307,316-319
+crates/esker-sql/tests/real_backend.rs
+  s_3138696d8fbc01::t_e55a121aa942e5 284-342
+crates/esker-sql/tests/syntax_corpus.rs
+  s_3138696d8fbc01::t_b442f813f642b9 17
+crates/esker-sql/tests/time_machine.rs
+  s_3138696d8fbc01::t_5fe3af2dbc4526 1-577
+docs/adr/0021-time-machine.md
+  s_3138696d8fbc01::t_b2863a65b0725a 3-7,88-93,277-292
+docs/plans/phase-6d.md
+  s_3138696d8fbc01::t_f3fccf5ecdaf55 225-232,236-271
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "1f7095f3985307847f1b8fc8c0972a9ea4227b8a",
+  "prompts": {},
+  "sessions": {
+    "s_3138696d8fbc01": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "de1cd601-bbfb-4a44-a756-dae1c4fcb152",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
