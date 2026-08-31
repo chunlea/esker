@@ -310,30 +310,39 @@ impl Pd {
         Ok(operator)
     }
 
-    /// Drops the corrections whose stores have caught up, and the ones too old to mean anything.
+    /// Drops the corrections the reports have absorbed, and the ones too old to mean anything.
     ///
-    /// "Caught up" is per store and on PD's clock: a delta is held until **every** store it
-    /// names has sent a report stamped after the operator retired, because a delta corrects both
-    /// ends of a move and half a correction is worse than none. A store PD has no record of is
-    /// treated as caught up — there is nothing to correct.
+    /// "Absorbed" is one instant for the whole list rather than a question asked per store: the
+    /// **oldest report among the live stores**. Every store has reported since then, so every
+    /// correction older than it is already in the numbers.
+    ///
+    /// A report stamped *at* the retirement instant counts, and the causal chain is why: the
+    /// store applied the change before its leader sent the region heartbeat, and PD stamped the
+    /// retirement when that heartbeat arrived. A store report stamped no earlier than that was
+    /// computed no earlier than the change, so it contains it. Holding it one interval longer
+    /// looks safer and is not — it double-counts a move the numbers already show, and a
+    /// balancer reading counts that drift further from the truth with every operator does not
+    /// settle. `tests/balance.rs` fails on exactly that if this becomes `>=`. Deciding it per store would be
+    /// exact — a delta naming only store 3 could go as soon as store 3 reported — and this runs
+    /// on every region heartbeat, so exact costs a scan of the store table per entry per beat.
+    /// The whole imprecision is that a correction may outlive its usefulness by up to one store
+    /// heartbeat, which is the same interval the correction exists to cover in the first place.
+    ///
+    /// **Live** stores only. A store that is down has a frozen stamp, so including it would pin
+    /// every correction in the list until the age rule below swept it — one dead store
+    /// suppressing balance across the cluster — and its counts mean nothing anyway.
     fn retire_settled(&self, state: &mut State, stores: &[StoreRecord], now_ms: u64) {
-        let reported_since = |store_id: Option<u64>, retired_ms: u64| {
-            let Some(store_id) = store_id else {
-                return true;
-            };
-            stores
-                .iter()
-                .find(|store| store.store_id == store_id)
-                .is_none_or(|store| store.last_heartbeat_ms >= retired_ms)
-        };
+        let absorbed = stores
+            .iter()
+            .filter(|store| !schedule::is_down(store, now_ms, self.max_store_down_time_ms))
+            .map(|store| store.last_heartbeat_ms)
+            .min()
+            // No live store is nothing to correct against; the age rule alone applies.
+            .unwrap_or(0);
         let too_old = now_ms.saturating_sub(self.max_store_down_time_ms);
-        state.settling.retain(|(load, retired_ms)| {
-            *retired_ms > too_old
-                && !(reported_since(load.region_to, *retired_ms)
-                    && reported_since(load.region_from, *retired_ms)
-                    && reported_since(load.leader_to, *retired_ms)
-                    && reported_since(load.leader_from, *retired_ms))
-        });
+        state
+            .settling
+            .retain(|(_, retired_ms)| *retired_ms > absorbed && *retired_ms > too_old);
     }
 
     /// One cluster-unique peer id, persisted before it is handed out ([`crate::alloc`]).
@@ -875,6 +884,74 @@ mod tests {
                 epoch: Epoch::new(7, 4),
                 peer_id: 15,
             }),
+        );
+    }
+
+    /// The correction a retired operator leaves behind goes when the reports have absorbed it —
+    /// and a **dead** store does not get to hold it there.
+    ///
+    /// A down store's last-heartbeat stamp is frozen, so asking "has every store reported since?"
+    /// would answer no for ever: one dead store would pin every correction in the cluster until
+    /// the age rule swept it, and balance would be reading counts that drift further from the
+    /// truth with every operator. Which is the exact shape of the bug the list exists to fix,
+    /// inverted.
+    #[test]
+    fn a_retired_operators_correction_goes_when_the_live_stores_have_reported() {
+        let (_dir, clock, pd) = open();
+        cluster_of_four(&pd);
+        clock.advance(MAX_STORE_DOWN_TIME_MS + 1);
+        for store_id in [1, 2, 4] {
+            alive(&pd, store_id, 0);
+        }
+        // The reports are in; what follows arrives after them, as it does in a cluster where a
+        // store's summary and a region's leader are different messages from different nodes.
+        clock.advance(1);
+
+        // A repair, and then the heartbeat that shows it done.
+        let Some(Operator::AddPeer { peer_id, .. }) = pd
+            .region_heartbeat(&beat(three_replicas(), 10, 4))
+            .unwrap()
+            .operator
+        else {
+            panic!("expected an AddPeer");
+        };
+        let done = whole_space(
+            vec![
+                Peer::voter(1, 10),
+                Peer::voter(2, 20),
+                Peer::voter(3, 30),
+                Peer::voter(4, peer_id),
+            ],
+            Epoch::new(2, 1),
+        );
+        pd.region_heartbeat(&beat(done, 10, 4)).unwrap();
+        assert_eq!(
+            pd.lock().unwrap().settling.len(),
+            1,
+            "the operator retired and left nothing behind"
+        );
+
+        // Store 3 is down and stays down. It must not keep the correction alive.
+        //
+        // The beat that prunes is another region's, which is how a real cluster does it: the
+        // list is swept by any heartbeat that reaches the rules, and region 1's next one will
+        // not — it has the `RemovePeer` for the dead peer in flight, and an operator being
+        // waited on is answered before the rules are consulted at all.
+        clock.advance(1);
+        for store_id in [1, 2, 4] {
+            alive(&pd, store_id, 0);
+        }
+        let elsewhere = Region {
+            id: 2,
+            start_key: bytes::Bytes::new(),
+            end_key: bytes::Bytes::new(),
+            peers: vec![Peer::voter(1, 50), Peer::voter(2, 51), Peer::voter(4, 52)],
+            epoch: Epoch::new(1, 1),
+        };
+        pd.region_heartbeat(&beat(elsewhere, 50, 4)).unwrap();
+        assert!(
+            pd.lock().unwrap().settling.is_empty(),
+            "a down store pinned the correction the live stores had already absorbed"
         );
     }
 
