@@ -1,0 +1,19 @@
+docs/bench/phase-4.md
+  s_dc640bf0df4adb::t_4ffa5ed4de1562 291-356
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "5af48606c02e76ccd56cf1e8acd5bea6dd2696b2",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "claude-fable-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
