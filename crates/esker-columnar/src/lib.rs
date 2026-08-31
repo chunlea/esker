@@ -1,0 +1,101 @@
+//! `esker-columnar` — the columnar file format.
+//!
+//! [ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) argues for a second copy of a
+//! table laid out by column, and ranks the cost of building one. The file format is first on that
+//! list and this crate is it: *"a file format with a footer, a version and golden tests; a set of
+//! per-type encodings each with a round-trip proptest; a stripe/row-group layout with statistics
+//! for predicate pruning; ... a crash test ...; and a fuzz test proving that no arbitrary byte
+//! sequence panics a decoder."*
+//!
+//! It is a **file format and nothing else**. No Raft, no learner, no fragment protocol, no
+//! planner, no SQL — those are ADR 0022's milestones 2 through 5 and
+//! `docs/plans/phase-7-columnar.md` names every one of them under what this phase does not do.
+//! Both ways of delivering a columnar copy — a Raft learner applying the log, or phase 6b
+//! rewriting a cold SST on its way to object storage — need these bytes and nothing about
+//! either is decided here.
+//!
+//! # The shape
+//!
+//! ```text
+//! file   := stripe* ++ footer ++ trailer
+//! stripe := chunk*                        one chunk per column, in schema order
+//! chunk  := payload ++ codec:u8 ++ crc32c:u32
+//! ```
+//!
+//! A **stripe** is a row group: a bounded run of rows, stored one column at a time. It is the
+//! unit of pruning (a stripe is skipped or read) and the unit of decoding (a chunk is decoded
+//! whole). A **chunk** is one column of one stripe: an encoding tag, the rows it covers, where
+//! its NULLs are, and its values densely packed — then LZ4 over the lot, if that pays.
+//!
+//! The [`footer`] carries the schema, every chunk's position, and every chunk's
+//! [statistics](stats), so that deciding what to read costs no I/O beyond opening the file. The
+//! **trailer** is 32 fixed bytes at the very end, and its magic is what makes a file a file:
+//! everything a crash left half-written lacks it, and is reported as [`Error::Unsealed`] rather
+//! than as damage.
+//!
+//! # Invariants this crate holds
+//!
+//! * **Every region is checksummed** (invariant 2). Each chunk carries a CRC32C over its payload
+//!   and codec byte together; the footer's CRC is in the trailer; the trailer checksums itself.
+//! * **Immutable files, atomic pointers** (invariant 3). A file is written to a temporary name,
+//!   synced, then renamed into place; nothing is ever modified after the trailer lands.
+//! * **Nothing panics on on-disk data** (invariant 9). Every decode path reads through
+//!   one bounds-checked cursor, which refuses counts larger than the bytes behind
+//!   them. `tests/fuzz_decode.rs` is what proves it, and `tests/crash.rs` proves that no
+//!   truncation of a file is ever read back as complete.
+//! * **The type set is the row side's** — the six `esker_sql::value::ColumnType` variants, with
+//!   the row side's own tag bytes. A columnar copy of a row holds no more than the row could.
+
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+pub mod encode;
+pub mod error;
+pub mod footer;
+pub mod frame;
+pub mod stats;
+pub mod value;
+
+pub(crate) mod cursor;
+
+pub use error::{Error, Result};
+pub use footer::{ChunkMeta, Footer, StripeMeta, Trailer};
+pub use frame::Compression;
+pub use stats::{Bound, ColumnStats};
+pub use value::{ColumnDef, ColumnType, Schema, Value, ValueRef};
+
+/// Byte layouts that are frozen. Changing any of these is a format change: it needs an ADR, a
+/// format-version bump and a migration story (ADR 0002).
+pub mod format {
+    /// Trailing magic of a columnar file: the ASCII bytes `ESKERCOL`.
+    pub const COLUMNAR_MAGIC: [u8; 8] = *b"ESKERCOL";
+
+    /// Fixed trailer size: footer handle, two checksums, version, magic.
+    pub const COLUMNAR_TRAILER_SIZE: usize = 32;
+
+    /// Version of the layout this build reads and writes.
+    pub const COLUMNAR_FORMAT_VERSION: u32 = 1;
+
+    /// Every chunk ends with `codec:u8 ++ crc32c:u32`.
+    pub const CHUNK_TRAILER_SIZE: usize = 5;
+
+    /// Longest min/max bound stored in a chunk's statistics.
+    ///
+    /// A bound is there to prune with, not to reproduce a value, so one enormous string must not
+    /// be able to inflate the footer every reader loads. Longer values are truncated to a bound
+    /// that still holds — see [`crate::stats`].
+    pub const MAX_BOUND_LEN: usize = 64;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format::{COLUMNAR_FORMAT_VERSION, COLUMNAR_MAGIC, COLUMNAR_TRAILER_SIZE};
+
+    /// The magic is written into every file, so its bytes are part of the format.
+    #[test]
+    fn the_format_constants_are_frozen() {
+        assert_eq!(&COLUMNAR_MAGIC, b"ESKERCOL");
+        assert_eq!(COLUMNAR_TRAILER_SIZE, 32);
+        assert_eq!(COLUMNAR_FORMAT_VERSION, 1);
+        assert!(COLUMNAR_MAGIC.len() < COLUMNAR_TRAILER_SIZE);
+    }
+}

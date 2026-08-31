@@ -354,6 +354,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "esker-columnar"
+version = "0.1.0"
+dependencies = [
+ "esker-base",
+ "esker-engine",
+ "lz4_flex",
+ "proptest",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "esker-engine"
 version = "0.1.0"
 dependencies = [

@@ -39,6 +39,7 @@ tempfile = { version = "3", default-features = false }
 # --- workspace-internal ---
 esker-base = { path = "crates/esker-base", version = "0.1.0" }
 esker-client = { path = "crates/esker-client", version = "0.1.0" }
+esker-columnar = { path = "crates/esker-columnar", version = "0.1.0" }
 esker-engine = { path = "crates/esker-engine", version = "0.1.0" }
 esker-keys = { path = "crates/esker-keys", version = "0.1.0" }
 esker-pd = { path = "crates/esker-pd", version = "0.1.0" }

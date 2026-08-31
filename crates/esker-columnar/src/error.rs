@@ -1,0 +1,81 @@
+//! The crate's error type.
+//!
+//! One enum, as `CLAUDE.md` requires, and three of its variants carry the weight:
+//!
+//! * [`Error::Corruption`] is how invariant 2 is honoured. A bad checksum, a wrong magic, an
+//!   impossible length, a chunk that disagrees with the footer that named it — every one of them
+//!   is a value, never a panic and never a silent skip.
+//! * [`Error::Unsealed`] is **not** corruption, and keeping them apart is the point of having
+//!   both. A columnar file is finished by its trailer: stripes, then the footer, then the
+//!   trailer, then a sync and a rename. Every prefix of that is a file a crash left behind, and
+//!   the right response is to delete it. A *sealed* file whose bytes have since rotted is an
+//!   alarm. One error type for both would make every crash look like disk failure, or — far
+//!   worse — make disk failure look survivable.
+//! * [`Error::Io`] always names the path, because a bare "No such file or directory" is not
+//!   actionable in a crash report and the caller always knew what it asked for.
+
+use std::io;
+use std::path::PathBuf;
+
+/// The result of every fallible operation in this crate.
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// Everything that can go wrong reading or writing a columnar file.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// The filesystem refused an operation.
+    #[error("io error on {path}: {source}")]
+    Io {
+        /// The file or directory the operation named.
+        path: PathBuf,
+        /// What the filesystem said.
+        #[source]
+        source: io::Error,
+    },
+
+    /// On-disk bytes did not mean what the format says they must (invariant 2).
+    #[error("corruption in {context}: {detail}")]
+    Corruption {
+        /// Where it was found — a file name, or a component such as `stripe index`.
+        context: String,
+        /// What was wrong, specifically enough to debug from one log line.
+        detail: String,
+    },
+
+    /// The file has no valid trailer, so it was never finished.
+    ///
+    /// The expected shape of a crash mid-write, and the reason it is not [`Error::Corruption`]:
+    /// see the module docs.
+    #[error("{path} has no valid columnar trailer: the file was never finished")]
+    Unsealed {
+        /// The file that has no trailer.
+        path: PathBuf,
+    },
+
+    /// The caller asked for something this format cannot express: a row of the wrong width, a
+    /// value of the wrong type, a column or stripe that does not exist.
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+}
+
+impl Error {
+    /// A corruption error, with the region that held the bytes and what was wrong with them.
+    pub fn corruption(context: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::Corruption {
+            context: context.into(),
+            detail: detail.into(),
+        }
+    }
+
+    /// Whether this is on-disk bytes failing to mean what they must.
+    #[must_use]
+    pub fn is_corruption(&self) -> bool {
+        matches!(self, Self::Corruption { .. })
+    }
+
+    /// Whether this is a file a crash left half-written, which is discardable rather than alarming.
+    #[must_use]
+    pub fn is_unsealed(&self) -> bool {
+        matches!(self, Self::Unsealed { .. })
+    }
+}

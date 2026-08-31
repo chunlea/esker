@@ -1,0 +1,29 @@
+[package]
+name = "esker-columnar"
+description = "Esker columnar file format: stripes, per-column chunks, encodings and statistics."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+# CRC32C, varints and the seeded RNG. Every byte layout here is checksummed with the first and
+# framed with the second (CLAUDE.md invariant 2, ADR 0004).
+esker-base.workspace = true
+# The `FileSystem` seam, and nothing else. ADR 0022 sanctions exactly this dependency: "its file
+# format, compaction and read path share nothing but the `FileSystem` trait and the primitives in
+# `esker-base`". A columnar file therefore lives wherever an SST can, object storage included.
+esker-engine.workspace = true
+# The only compression codec, pure Rust (CLAUDE.md, dependency policy).
+lz4_flex.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
