@@ -232,10 +232,16 @@ impl Plan {
     /// The sixty-second run is where the fault plan is exercised properly.
     fn one_seed(seed: u64) -> Self {
         if seed % 4 == 0 {
+            // Three seconds, not the 1.5 this was. A killed seed spends its first quarter
+            // waiting for the audit's own lag to elapse and the rest sharing the run with a
+            // leader kill, so 1.5 s left room for one or two audit attempts — measured, one
+            // seed in twelve still reached `audits > 0` with a single attempt and failed with
+            // nothing wrong. A coverage assertion that is a coin flip either cries wolf or gets
+            // loosened until it is blind; the third answer is to give it room.
             return Self {
-                duration: Duration::from_millis(1_500),
+                duration: Duration::from_secs(3),
                 kills: 1,
-                audit_lag: audit_lag_for(Duration::from_millis(1_500)),
+                audit_lag: audit_lag_for(Duration::from_secs(3)),
                 ..Self::fast(seed)
             };
         }
@@ -589,6 +595,11 @@ fn bank(plan: &Plan) {
         "{label}: the cluster never elected a leader to begin with"
     );
     open_accounts(&cluster);
+    // When the accounts became readable. The auditor reads `lag` into the past, so every attempt
+    // before `opened_at + lag` is looking at a moment the accounts did not exist in — a complete
+    // and perfectly true audit of nothing, which is counted as short and proves nothing. The
+    // harness knows this instant, so it waits for it rather than spending attempts discovering it.
+    let opened_at = Instant::now();
 
     let ledger = Arc::new(Ledger::default());
     let stop = Arc::new(AtomicBool::new(false));
@@ -630,6 +641,16 @@ fn bank(plan: &Plan) {
         );
         let lag = audit_lag(plan);
         std::thread::spawn(move || {
+            // See `opened_at`: the first attempt that could possibly see every account is one
+            // lag after they were opened. On a short seed run that is a quarter of the whole
+            // run, and spending it on attempts that cannot succeed is what left the killed
+            // seeds completing one audit out of six — one jitter away from none, and from an
+            // `audits > 0` assertion that fails without anything being wrong.
+            let earliest = opened_at + lag;
+            let now = Instant::now();
+            if now < earliest {
+                std::thread::sleep(earliest - now);
+            }
             // A wider lock budget than a transfer's: an audit reads every account at one
             // snapshot, so it meets whatever any writer is holding at that instant and has to
             // wait each of them out. A transfer that gave up would simply try again; an audit
@@ -646,10 +667,16 @@ fn bank(plan: &Plan) {
             // ever after: `TcpStores` opens its book once. Rebuilding after a run of failures
             // is what a real client does, and without it an auditor stops auditing at the first
             // kill while still looking busy.
+            // Rebuilt after **one** unreadable attempt, not five. A client whose store was
+            // killed fails instantly and for ever, so the four extra attempts confirm nothing
+            // and cost the run its whole audit window: seeds 20 and 32 spent every attempt they
+            // had on a connection that could never answer, reported `0 of 2 audits complete`,
+            // and failed the coverage assertion with the cluster perfectly healthy. A rebuild
+            // costs one `client_within`, which is far less than a wasted attempt.
             let mut consecutive = 0u32;
             while !stop.load(Ordering::Relaxed) {
                 attempts.fetch_add(1, Ordering::Relaxed);
-                if consecutive >= 5 {
+                if consecutive >= 1 {
                     consecutive = 0;
                     if let Some(fresh) = auditing(&cluster) {
                         client = fresh;
