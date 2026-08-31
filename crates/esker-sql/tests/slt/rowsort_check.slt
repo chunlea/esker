@@ -1,0 +1,56 @@
+# A file whose only job is to prove `rowsort` means the same thing to both runners.
+#
+# It is the one directive where the two harnesses could silently disagree: ours sorts rows to
+# compare them and so does the crate's, and if they sorted differently every `rowsort` result in the
+# corpus would be checked against the wrong thing by one of them.
+
+statement ok
+CREATE TABLE r (id int8 PRIMARY KEY, t text, n int8)
+
+# tag: INSERT 0 5
+statement ok
+INSERT INTO r VALUES (1, 'b', 2), (2, 'a', 1), (3, 'c', 2), (4, 'a', 3), (5, NULL, 1)
+
+# Without a sort mode the order is the one the statement asked for.
+query I
+SELECT id FROM r ORDER BY id DESC
+----
+5
+4
+3
+2
+1
+
+# With one, the rows are compared as a set -- and the file lists them in the sorted order both
+# runners produce, which is lexicographic over the columns as strings.
+query I rowsort
+SELECT id FROM r ORDER BY id DESC
+----
+1
+2
+3
+4
+5
+
+# Sorting is over the whole row, column by column, not over the rendered line: the first column
+# decides, and the second only breaks its ties.
+query TI rowsort
+SELECT t, n FROM r
+----
+NULL	1
+a	1
+a	3
+b	2
+c	2
+
+# A NULL renders as the four characters `NULL`, which is why it sorts where an `N` would rather
+# than where a NULL would. That is a property of the *file format*, not of the server, and it is
+# worth pinning: a reader who expects SQL's NULL ordering here would be wrong.
+query T rowsort
+SELECT t FROM r
+----
+NULL
+a
+a
+b
+c

@@ -102,18 +102,10 @@ impl sqllogictest::DB for Node {
                     .iter()
                     .map(|field| Letter(harness::type_letter(field.type_oid)))
                     .collect(),
-                // The crate compares rows as `Vec<Vec<String>>`, so a NULL has to be rendered the
-                // same way our own harness renders it or the two would disagree about the corpus
-                // rather than about the server.
-                rows: rows
-                    .iter()
-                    .map(|row| {
-                        harness::render(row)
-                            .split('\t')
-                            .map(str::to_owned)
-                            .collect()
-                    })
-                    .collect(),
+                // Both runners render a row through the same function, so a NULL and an empty
+                // string mean the same thing to both and a disagreement can only be about the
+                // server.
+                rows: rows.iter().map(|row| harness::render_row(row)).collect(),
             },
             Outcome::Done { tag } => DBOutput::StatementComplete(rows_touched(&tag)),
         })

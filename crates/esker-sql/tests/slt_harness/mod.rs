@@ -48,6 +48,14 @@
 //! checked against the types the *server reported*, so a query that silently changed shape fails
 //! here rather than in whatever reads it next.
 //!
+//! `query <types> rowsort` sorts the rows before comparing, which is the format's way of saying
+//! **the order is not part of the answer**. A `SELECT` with no `ORDER BY`, or one whose `ORDER BY`
+//! leaves ties, has no order to promise — PostgreSQL does not guarantee one and neither does this
+//! node. Writing such a result down as though it did would pin an accident, and the first change to
+//! the scan or the sort would break a test that was never testing anything. The rows are sorted the
+//! way the crate sorts them, column vector by column vector, so both runners agree on what
+//! `rowsort` means.
+//!
 //! # The corpus was replayed against a real server
 //!
 //! Every directive in these files was put to a running PostgreSQL 19beta1 and compared with what it
@@ -86,6 +94,10 @@ pub(crate) const FILES: &[(&str, &str)] = &[
     ("index.slt", include_str!("../slt/index.slt")),
     ("insert.slt", include_str!("../slt/insert.slt")),
     ("nulls.slt", include_str!("../slt/nulls.slt")),
+    (
+        "rowsort_check.slt",
+        include_str!("../slt/rowsort_check.slt"),
+    ),
     ("select.slt", include_str!("../slt/select.slt")),
     (
         "update_delete.slt",
@@ -132,7 +144,11 @@ pub(crate) fn run_file(name: &str, body: &str) -> usize {
                 };
                 assert_eq!(error.sqlstate(), sqlstate, "{at}: {sql} -> `{error}`");
             }
-            Kind::Query { types, expected } => {
+            Kind::Query {
+                types,
+                sorted,
+                expected,
+            } => {
                 let outcome = run(&mut executor, sql)
                     .unwrap_or_else(|error| panic!("{at}: {sql} -> {error}"));
                 let Outcome::Rows { fields, rows, .. } = outcome else {
@@ -153,7 +169,14 @@ pub(crate) fn run_file(name: &str, body: &str) -> usize {
                         field.name
                     );
                 }
-                let actual: Vec<String> = rows.iter().map(|row| render(row)).collect();
+                // Sorted as column vectors, not as rendered lines, because that is what the
+                // `sqllogictest` crate does and the two runners must mean the same thing by it.
+                let mut columns: Vec<Vec<String>> =
+                    rows.iter().map(|row| render_row(row)).collect();
+                if sorted {
+                    columns.sort_unstable();
+                }
+                let actual: Vec<String> = columns.iter().map(|row| row.join("\t")).collect();
                 assert_eq!(actual, expected, "{at}: {sql}");
             }
         }
@@ -191,8 +214,8 @@ fn rows_touched(outcome: &Outcome) -> Option<usize> {
         .and_then(|count| count.parse().ok())
 }
 
-/// One row, tab-separated, `NULL` for a NULL.
-pub(crate) fn render(row: &[Option<Vec<u8>>]) -> String {
+/// One row as its columns, `NULL` for a NULL.
+pub(crate) fn render_row(row: &[Option<Vec<u8>>]) -> Vec<String> {
     row.iter()
         .map(|value| {
             value.as_ref().map_or_else(
@@ -200,8 +223,7 @@ pub(crate) fn render(row: &[Option<Vec<u8>>]) -> String {
                 |bytes| String::from_utf8_lossy(bytes).into_owned(),
             )
         })
-        .collect::<Vec<_>>()
-        .join("\t")
+        .collect()
 }
 
 /// The letter a `query` line uses for a type OID.
@@ -235,6 +257,8 @@ enum Kind {
     },
     Query {
         types: String,
+        /// `rowsort`: the order is not part of the answer, so compare the rows as a set.
+        sorted: bool,
         expected: Vec<String>,
     },
 }
@@ -311,7 +335,20 @@ fn parse_file(name: &str, body: &str) -> Vec<Directive> {
             Kind::Error {
                 sqlstate: sqlstate.to_owned(),
             }
-        } else if let Some(types) = header.strip_prefix("query ") {
+        } else if let Some(rest) = header.strip_prefix("query ") {
+            // `query I rowsort`: the types, then the sort mode the format defines.
+            let (types, sorted) = match rest.trim().split_once(char::is_whitespace) {
+                Some((types, mode)) => {
+                    assert_eq!(
+                        mode.trim(),
+                        "rowsort",
+                        "{name}:{start}: `{}` is not a sort mode this corpus uses",
+                        mode.trim()
+                    );
+                    (types, true)
+                }
+                None => (rest.trim(), false),
+            };
             assert_eq!(
                 lines.get(at).map(|line| line.trim()),
                 Some("----"),
@@ -324,7 +361,8 @@ fn parse_file(name: &str, body: &str) -> Vec<Directive> {
                 at += 1;
             }
             Kind::Query {
-                types: types.trim().to_owned(),
+                types: types.to_owned(),
+                sorted,
                 expected,
             }
         } else {
