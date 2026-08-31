@@ -802,3 +802,101 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
 Joint consensus vs single-server changes only · separate Raft log store · async commit / 1PC ·
 leader leases vs ReadIndex only · PD HA timing · secondary-index encoding for
 composite keys · how much Postgres surface for the first SQL milestone.
+
+## 16. Columnar (`esker-columnar`)
+
+A second copy of a table laid out by column, for the queries a row layout answers badly:
+`SELECT count(*), sum(amount) FROM ledger WHERE day > ...` reads every byte of every column to use
+two of them. [ADR 0022](adr/0022-columnar-learner-replica.md) decides *that* Esker gets one, where
+it comes from and what it costs; [ADR 0027](adr/0027-columnar-file-format.md) decides what the
+bytes look like. This section is the shape, not the argument.
+
+The crate shares nothing with `esker-engine` but the `FileSystem` trait (§4) and the primitives in
+`esker-base`, which is what lets a columnar file live wherever an SST can, object storage included.
+
+### 16.1 The file
+
+```
+file   := stripe* ++ footer ++ trailer
+stripe := chunk*                          one chunk per column, in schema order
+chunk  := payload ++ codec:u8 ++ crc32c(offset ++ payload ++ codec)
+payload := encoding:u8 ++ rows:varint ++ null_count:varint ++ [null mask] ++ values
+```
+
+A **stripe** is a row group: the unit of pruning and of decoding. A **chunk** is one column of one
+stripe. Values are stored densely for the rows that are not NULL, so a NULL costs one bit in the
+mask and no slot among the values; the mask sits *above* the value encoding, so no encoding has to
+steal a value from its own domain — and this domain contains `i64::MIN` and the empty string.
+
+Encodings, chosen by encoding both ways and keeping the smaller rather than by a tuned threshold:
+frame-of-reference or delta for `int8` and `timestamptz`, dictionary or bit-packed lengths plus
+bytes for `text` and `bytea`, bit-packed or run-length for `bool` and the null mask, plain for
+`double`. Then LZ4 over the payload when it saves more than an eighth — the engine's rule (§4.5).
+The type set is the six `esker_sql::value::ColumnType` carries, with the row side's own tag bytes.
+
+The **trailer** is 32 fixed bytes at the very end: the footer's offset, length and CRC, a CRC over
+itself, a format version, and the magic `ESKERCOL`. It is written last, so **its magic is the
+commit point**: everything a crash left half-written lacks it and is reported as *unsealed* rather
+than as corruption, which is a different operational answer — an unsealed file is deleted, a
+corrupt one is an alarm. The file is written to a temporary and renamed into place (invariant 3).
+
+A chunk's checksum covers its **offset**. A checksum proves a block is intact, not that it is the
+block that was asked for: a chunk copied over another one carries its own valid checksum and
+answers with another stripe's rows. That is what a misdirected write looks like, and the milestone-2
+fuzz produced one before the offset was folded in (ADR 0027, format version 2).
+
+The **footer** carries the schema, every chunk's position, and per-chunk statistics — min, max and
+null count — so that deciding what to read costs no I/O beyond opening the file. Bounds are
+computed in **`pg_cmp` order**, this system's ordering rather than IEEE's, which is why `NaN` is
+the maximum of a chunk that holds one: `WHERE x > 5` matches a `NaN` row, and a bound that
+excluded it would prune away a stripe the query wants.
+
+### 16.2 The fragment
+
+Push-down rides the axis `TxnKvReq::Scan` already establishes (§9): a request that carries *work*
+rather than a range, and returns what the work produced rather than what it read.
+
+```
+fragment := version:u8 ++ body ++ crc32c:u32
+body     := table ++ key range ++ projection ++ [filter] ++ output
+output   := rows(limit) | aggregates(group_by, count/count(col)/sum/min/max)
+```
+
+The projection is the only place a table column index appears; the filter, the grouping and the
+aggregates all name **projection slots**. So an expression cannot reach a column the fragment did
+not ask for, and "decode only what was projected" is a property of the format rather than a
+discipline the evaluator keeps. A fragment whose only aggregate is `count(*)` decodes no chunk at
+all.
+
+**A fragment this build cannot evaluate is refused, and none of it is done.** An unknown version,
+expression node, comparison operator, aggregate kind or type tag; a slot outside the projection; a
+`sum` over a type with no addition; a key range, which a columnar file cannot restrict to because
+it records none. Honouring the half it understood would silently drop a filter, which returns
+extra rows rather than an error — the defect class `esker_sql::plan`'s "reject, do not ignore"
+rule exists to make impossible. Refusal and corruption are decided in that order and are different
+answers: the checksum runs first, so intact bytes carrying an unknown tag are a build that does
+not implement them, not a damaged message, and the caller falls back to a row scan.
+
+Aggregate semantics are PostgreSQL's, defined here because the row executor has none yet:
+`count(*)` counts rows and `count(col)` skips NULLs, `sum`/`min`/`max` over nothing are NULL and
+not zero, extremes order by `pg_cmp`, NULL forms one `GROUP BY` group of its own. One declared
+divergence: `sum(bigint)` returns `numeric` on a real server and cannot overflow, and phase 6a has
+no `numeric`, so an `int8` sum that does not fit is a typed error rather than a wrapped number.
+
+A fragment's aggregates are folded into **one accumulator per group across the whole file**, in row
+order, so its answer does not depend on where stripe boundaries fell — floating-point addition is
+not associative. Combining partials *between* files does change the answer, which is the two-level
+aggregate's problem and not this one's.
+
+### 16.3 What holds it up
+
+The defence ADR 0022 asks for by name — a differential test — is a second interpreter that answers
+the same fragment over the rows the file was *written from*, never opening the file, sharing only
+`pg_cmp` because that is the specification. Every generated fragment is answered by both, and by
+the evaluator again with pruning switched off, and compared as a `Result` so that an error is an
+answer too. Pruning may only ever remove work.
+
+Not built here: the learner feed and the tiering rewrite (ADR 0022 milestone 3), planner routing
+and `EXPLAIN` (milestone 4), MPP exchange (milestone 5), compaction, and any wire service — the
+fragment's bytes are defined in `esker-columnar` and `esker-proto` carries them when there is
+something to carry them between.
