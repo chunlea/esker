@@ -366,20 +366,16 @@ async fn psql_runs_real_sql_against_a_real_cluster() {
     drop(cluster);
 }
 
-/// The one thing standing between this node and a real cluster over a real client, and it is not
-/// in this crate.
+/// The error that used to stop this test, kept as a guard rather than deleted.
 ///
-/// `BlockingTransport::call` refuses to run when `tokio::runtime::Handle::try_current()` succeeds
-/// (`crates/esker-proto/src/transport/client.rs`). That guard is right about the hazard it names —
-/// blocking a runtime *worker* thread deadlocks it — and too broad by one case: `spawn_blocking`
-/// **propagates the runtime handle** into the blocking pool, which is precisely where a
-/// synchronous client is supposed to run. Measured rather than argued: a `Runtime::block_on` on
-/// another runtime inside a `spawn_blocking` task completes normally and does not panic, so the
-/// thing the guard is protecting against is not what it is catching.
+/// `BlockingTransport::call` guarded on `Handle::try_current().is_ok()`, and `tokio` sets its
+/// handle on a blocking-pool thread as well as on a worker — so it refused the one thread a
+/// synchronous client belongs on, and this node hit it on every statement. Fixed in `esker-proto`
+/// (the guard asks `tokio` now instead of guessing), and pinned there by a test on each side.
 ///
-/// So this test skips on that one error and on nothing else, which makes it **self-cancelling**:
-/// the day the guard learns to tell a blocking thread from a worker, this starts running by
-/// itself. Every other failure is a failure.
+/// The check stays because the failure it names is silent from here: a regression would make
+/// every statement fail identically, and a message saying which layer refused is worth more than
+/// an assertion about missing rows.
 const BLOCKING_GUARD: &str = "BlockingTransport::call was used inside an async runtime";
 
 async fn psql_smoke(sessions: Arc<RealSessions>) {
@@ -456,13 +452,11 @@ fn check_smoke_output(output: &std::process::Output) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    if stderr.contains(BLOCKING_GUARD) {
-        eprintln!(
-            "skipping: esker-proto's BlockingTransport refuses a call from tokio's blocking pool, \
-             where a synchronous client belongs. See BLOCKING_GUARD in this file."
-        );
-        return;
-    }
+    assert!(
+        !stderr.contains(BLOCKING_GUARD),
+        "esker-proto's BlockingTransport is refusing calls from tokio's blocking pool again, \
+         which is where a synchronous client belongs. See BLOCKING_GUARD in this file.\n{stderr}"
+    );
 
     // The rows, in the order the ORDER BY asked for.
     assert!(

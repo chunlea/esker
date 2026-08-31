@@ -522,13 +522,21 @@ its own gap register, and it would be longer.
   corpus replayed against three real stores, and seven end-to-end tests through Percolator. The
   session runs the executor on a blocking task, which the plan always said and nothing had needed
   until the store stopped being in this process
+- [x] 12 — **a real `psql` against a real cluster**: the acceptance target. The same script as the
+  fake-backed smoke, driven by a client nobody here wrote, over a socket, against a node holding no
+  data at all. It needed one fix outside this crate — `esker-proto`'s blocking transport refused
+  the one thread a synchronous client belongs on (`spawn_blocking`), because `tokio` sets its
+  handle there too
 
 ## 10a. Handoff — where a fresh lane picks up
 
 Every unit is complete. 231 tests, `cargo fmt --check`, `clippy -D warnings`, `cargo deny` and the
 dependency budget all green; no dependency was added.
 
-**A real `psql` 18.6 runs SQL against this node.** `tests/psql_smoke.rs` drives a whole session over
+**A real `psql` 18.6 runs SQL against this node, and against a real three-store cluster.**
+`tests/psql_smoke.rs` drives the same session twice — once over the in-process fake and once over
+`StoreBackend`, where every statement is a Percolator transaction spanning two regions on two
+separate databases. It drives a whole session over
 a socket — `CREATE TABLE`, `INSERT`, `SELECT ... ORDER BY`, an `UPDATE`, a `23505` naming its
 constraint, a bound parameter through the extended protocol with `\bind`, and a `BEGIN`/`ROLLBACK`
 that leaves the rows it deleted — against the executor and the store. It skips when `psql` is
