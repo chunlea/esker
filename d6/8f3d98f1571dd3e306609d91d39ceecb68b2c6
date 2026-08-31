@@ -1,0 +1,23 @@
+docs/adr/0024-tiering-failure-semantics.md
+  s_3138696d8fbc01::t_5657cffaf772d7 1-162
+docs/adr/0025-s3-transport-and-tls.md
+  s_3138696d8fbc01::t_a8727110e6e05a 1-121
+docs/plans/phase-6b.md
+  s_3138696d8fbc01::t_4b4c780a285399 1-216
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "d68f3d98f1571dd3e306609d91d39ceecb68b2c6",
+  "prompts": {},
+  "sessions": {
+    "s_3138696d8fbc01": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "de1cd601-bbfb-4a44-a756-dae1c4fcb152",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
