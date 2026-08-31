@@ -354,6 +354,67 @@ replica-growth machinery, exercised by 12 regions growing from 1 to 3 replicas a
 a literal repeat of those two scripts, and is reported as exactly that — strong, relevant,
 corroborating, not a substitute for re-running the two scenarios by name.
 
+## Run 4 — 2026-08-31, the two named scenarios, literally, at final HEAD
+
+commit `527bec1`. Both scenarios re-run against `8726a1a..f028d2e`, with `max_store_down_time`
+corrected to 30,000 ms (the documented default) per the standing ruling — no more manufactured
+repair/balance interference from an aggressive down-threshold.
+
+### Balance: grow 1 store to 5 — clean pass
+
+8,000 keys on 1 store (16 regions, 256 KiB split threshold), then stores 2–5 started together.
+
+**Converged in 14 seconds** from the four stores joining to a region-count gap ≤1 across all five
+— against Run 1's and Run 2's setups, which never converged inside a 240s window. Leader spread at
+the end: 5/3/3/3/2 across the five stores. **7,947/7,947 acknowledged writes verified readable,
+zero mismatches.** This is the fix (ADR 0023) working exactly as its own text predicts: the
+load-accounting race that caused thrashing is gone, and what took minutes-and-never before now
+takes fourteen seconds.
+
+### Repair: kill store 3, add store 4 — **one region did not recover, and cannot on its own**
+
+12,000 keys on 3 stores (1 MiB split threshold, 8 regions), a 90 s wait for initial 3× replication,
+`SIGKILL` on store 3, store 4 started immediately, a 270 s poll for full repair.
+
+**Six of eight regions showed real repair progress** (store 3's peer removed, store 4 added — three
+of those six reached a clean 3-voter state with no dead store within the window; three were still
+mid-transition, dead peer not yet removed, new peer still a learner, when polling stopped).
+**One region did not move at all: region 27, `[key…4385, key…5830)`.**
+
+```
+before the kill:  region 27  epoch=(3,4)  peers=*28@store1V  29@store3V          <- 2 peers, not 3
+after 270s:       region 27  epoch=(3,4)  peers=*28@store1V  29@store3V          <- byte-identical
+```
+
+**Region 27 already had only two voters before anything was killed** — one of the eight regions
+that had not finished growing to `target_replicas=3` by the time the pre-kill wait gave up (a
+milder version of the promotion-latency finding this lane has made throughout, and separate from
+the ADR 0023 defect the balance result above confirms fixed). Store 3 was one of those two. Once it
+died, the surviving voter (store 1, peer 28) is **one voter out of a two-voter membership** — a
+majority of two is two, so it can neither elect a new term nor commit anything, including the very
+`AddPeer` that a repair would need to propose *through this region's own Raft group* to fix it. The
+epoch never moving is the proof: nothing was ever agreed on, because nothing more this group's
+membership can be, without the second vote, agrees on anything at all.
+
+**Consequence: `verify` failed for the first time in this lane's entire testing.**
+`10,540/11,950` readable — **1,410 keys, every one of them inside region 27's range, unreachable**:
+
+```
+p4loadgen verify: 10,540/11,950 readable (1,410 missing/mismatched)
+  key 4995: error gave up after 9 attempts: peer is not the leader of region 27
+  ... (1,409 more, all region 27)
+```
+
+**Not confirmed as data loss** — nothing here proves the keys' bytes are gone from store 1's disk,
+only that the region's Raft group cannot currently be read from or written to, and this lane has no
+tool to inspect store 1's raw engine state directly to settle it either way (the same gap Run 1's
+chaos section named: no `sst-dump`-equivalent for the `'m'`/`raft` CF). What *is* established,
+plainly, is that a live cluster serving this region right now answers neither reads nor writes for
+those 1,410 keys, and that self-healing cannot reach them: repair is proposed through the region it
+repairs, and a region already down to a bare, even, two-vote membership that loses one voter has
+nothing left to propose through. Every other acknowledged write in this run and every other run in
+this file — every one, in every configuration, across four runs — remained readable throughout.
+
 ## Methodology note: what the scratchpad tooling is, and isn't
 
 None of the four items above could be produced with the checked-in `esker-cli`: `bench`/`raw` only
