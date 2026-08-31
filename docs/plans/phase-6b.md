@@ -214,3 +214,63 @@ Touch `esker-raft`, `esker-store`, `esker-txn`, `esker-sql` or `esker-client`. A
 dependency. Implement TLS. Tier the WAL. Change the SST format itself — the bytes of an SST
 are the same whether it lives on disk or in a bucket, which is the property that makes all of
 this cheap.
+
+---
+
+## What was built, and where it differs from the plan above
+
+Written after the fact, per `CLAUDE.md`'s definition of done. The plan above is left as it was
+written; this section is the diff.
+
+### Delivered
+
+| Unit | State |
+|---|---|
+| 1. Plan, ADR 0024 (failure semantics), ADR 0025 (transport and TLS) | done — `d68f3d9` |
+| 2. SHA-256 + HMAC in `esker-base`, against FIPS 180-4 and RFC 4231 | done — `527bec1` |
+| 3. SigV4 + HTTP/1.1 + the four S3 calls, in `esker-s3` | done — `a12166d` |
+| 4. `FileLocation`, the manifest record, and `fs::tier::TieredFileSystem` | done — `720abf0` |
+| 5. `MinIO` integration: `esker-s3`'s four calls, and the engine's tier end to end | done — `a12166d`, `720abf0` |
+| 6. `bench --sst-store`, and `docs/bench/phase-6b.md` | done — `00b737f` |
+| Region hibernation (§6b item 2) | **not done.** It was "ADR and design only, unless time allows"; it did not. Nothing depends on it |
+| `esker server --sst-store` | **blocked, not done.** See below |
+
+### Departures from the plan
+
+- **Blocking `std::net`, not tokio.** The lane brief said tokio TCP. `CLAUDE.md` puts async at
+  the network edge and keeps the engine synchronous and `std`-only, and the uploader runs on
+  the engine's side of that line. `esker_s3::Transport` is a trait with a blocking
+  implementation, which is what `DESIGN.md` §13 asked for and costs zero dependencies. ADR 0025
+  decision 2 records the reasoning; flagged in the lane report rather than done quietly.
+- **The backoff is one attempt per maintenance pass**, not exponential with jitter. ADR 0024's
+  first draft promised the latter; the implementation makes a pass take *distinct* files, once
+  each, which bounds the retry rate by the uploader's cadence without a clock the simulator
+  would have to fake. The ADR was corrected to describe the code (`720abf0`).
+- **A `200` answer to a ranged `GET` is sliced locally** rather than re-fetched. It *is* the
+  full-GET fallback, already paid for. ADR 0024 decision 6 was corrected to match.
+- **No prefix-collision marker.** The plan listed a `TIER-ID` marker object guarding against two
+  databases sharing one prefix, sequenced last so it could be dropped. It was dropped. Two
+  databases sharing an `--sst-store` prefix will overwrite each other's `000007.sst` **silently**
+  — the sharpest edge this lane is leaving behind, and the first thing to build in 6c.
+
+### Debt, in the order it should be paid
+
+1. **Connection reuse in `esker_s3::transport`.** One TCP connection per request costs ~692 µs
+   per cold read on loopback and dominates the cold-cache p99 (`docs/bench/phase-6b.md` §3).
+   Local to one implementor of one trait.
+2. **The prefix-collision marker**, above.
+3. **TLS** — ADR 0025 §"what has to be true before TLS lands" is the checklist.
+4. **An offline object reconciler** in `esker-cli`: a `DeleteObject` that fails leaks the
+   object, deliberately, because a leaked object costs storage and a wrongly deleted one costs
+   data. List-and-compare is cheap and belongs in a tool, not on the write path.
+5. **A tiered-read block size.** 4 KiB is tuned for a local SSD; a tiered SST pays a round trip
+   per block. Measure before adding the knob.
+
+### What `esker-store` needs, which this lane did not have
+
+`esker-store` is frozen for this lane, so `esker server --sst-store` is not wired. It needs one
+change, and only one: `StoreOptions` gains an `fs: Arc<dyn FileSystem>` (defaulting to
+`LocalFileSystem::new()`), and `open_engine` passes it to `Db::open_with` instead of
+constructing a `LocalFileSystem` itself (`crates/esker-store/src/server.rs:288`). Everything on
+this side of that line is built and tested: `esker-cli bench --sst-store` does exactly this
+wiring and is the worked example.
