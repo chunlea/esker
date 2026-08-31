@@ -151,6 +151,11 @@ same walk for the same reason.
 that is the whole reason `enc_ts` is complemented. **The boundary is inclusive**: a version committed
 at exactly `ts` is visible at `ts`, because `!commit_ts == !ts` makes the seek land on it.
 
+A **`Scan` reaches one region**, and a store answers only for the keys it owns — so a client whose
+range spans a region boundary must walk them, asking each in turn from where the last one ended.
+One request would come back holding the first region's keys and nothing else, with no error and
+nothing to notice, which is the shape of wrong answer this specification exists to rule out.
+
 ### 5.1 Read at `ts`
 
 1. `get_lock(k)`. A lock with `start_ts ≤ ts` blocks the read: it may commit at a `commit_ts ≤ ts`

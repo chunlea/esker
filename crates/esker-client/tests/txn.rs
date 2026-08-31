@@ -173,6 +173,111 @@ fn a_transaction_reads_its_own_writes_without_a_round_trip() {
     }
 }
 
+/// A scan whose range spans a **split boundary** reads both regions.
+///
+/// One request reaches one region and a store answers only for the keys it owns, so the
+/// single-request version of this came back holding the first region's keys and nothing else —
+/// no error, nothing to notice. The walk asks each region in turn, learning where the last one
+/// ended from the cache it already keeps.
+#[test]
+fn a_scan_across_a_split_boundary_reads_both_regions() {
+    let transport = Arc::new(FakeTransport::new());
+    // Region 1 owns `..m` and region 2 owns `m..`, each answering only for its own keys —
+    // which is what a real store does, and what the old scan silently believed was everything.
+    transport
+        .script(
+            Rule::new(
+                Matcher::All(vec![Matcher::Method(Method::TxnScan), Matcher::Store(1)]),
+                Outcome::TxnReply(TxnKvResp::Scan {
+                    pairs: vec![(key(b"a"), key(b"1")), (key(b"b"), key(b"2"))],
+                }),
+            )
+            .forever(),
+        )
+        .script(
+            Rule::new(
+                Matcher::All(vec![Matcher::Method(Method::TxnScan), Matcher::Store(2)]),
+                Outcome::TxnReply(TxnKvResp::Scan {
+                    pairs: vec![(key(b"n"), key(b"3")), (key(b"o"), key(b"4"))],
+                }),
+            )
+            .forever(),
+        );
+    let resolver = two_regions();
+    let client = client_on(
+        &transport,
+        resolver as Arc<dyn esker_client::RegionResolver>,
+    );
+    let txn = client.begin().unwrap();
+
+    let pairs = txn.scan(b"a", b"", 100).unwrap();
+    assert_eq!(
+        pairs,
+        vec![
+            (key(b"a"), key(b"1")),
+            (key(b"b"), key(b"2")),
+            (key(b"n"), key(b"3")),
+            (key(b"o"), key(b"4")),
+        ],
+        "both regions, in key order"
+    );
+    assert_eq!(transport.stores(), vec![1, 2], "one request per region");
+
+    // The second request starts where the first region ended, not where the caller asked.
+    match nth_txn(&transport, 1) {
+        TxnKvReq::Scan { start, .. } => assert_eq!(start, key(b"m")),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The walk stops at the range the caller asked for, rather than running on into regions
+/// beyond it.
+#[test]
+fn a_scan_stops_at_the_end_of_its_range() {
+    let transport = Arc::new(FakeTransport::new());
+    transport.unmatched(Outcome::TxnReply(TxnKvResp::Scan {
+        pairs: vec![(key(b"a"), key(b"1"))],
+    }));
+    let resolver = two_regions();
+    let client = client_on(
+        &transport,
+        resolver as Arc<dyn esker_client::RegionResolver>,
+    );
+    let txn = client.begin().unwrap();
+
+    // `..c` is wholly inside the first region, so the second is never asked.
+    let pairs = txn.scan(b"a", b"c", 100).unwrap();
+    assert_eq!(pairs, vec![(key(b"a"), key(b"1"))]);
+    assert_eq!(
+        transport.stores(),
+        vec![1],
+        "the far region is not in the range"
+    );
+}
+
+/// And it stops once the limit is full, however many regions are left.
+#[test]
+fn a_scan_stops_when_the_limit_is_full() {
+    let transport = Arc::new(FakeTransport::new());
+    transport.unmatched(Outcome::TxnReply(TxnKvResp::Scan {
+        pairs: vec![(key(b"a"), key(b"1")), (key(b"b"), key(b"2"))],
+    }));
+    let resolver = two_regions();
+    let client = client_on(
+        &transport,
+        resolver as Arc<dyn esker_client::RegionResolver>,
+    );
+    let txn = client.begin().unwrap();
+
+    let pairs = txn.scan(b"a", b"", 2).unwrap();
+    assert_eq!(pairs.len(), 2);
+    assert_eq!(
+        transport.stores(),
+        vec![1],
+        "the limit was full, so the second region was never asked"
+    );
+}
+
 /// The same rule applied to a range: a buffered put appears, a buffered delete removes a row
 /// the store returned, and the result stays in key order.
 #[test]

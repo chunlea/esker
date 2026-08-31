@@ -73,6 +73,13 @@ use crate::wire::{
 /// Default time-to-live of a lock, in milliseconds (`docs/DESIGN.md` §14).
 pub const LOCK_TTL_MS: u64 = 3_000;
 
+/// Most regions one scan walks before it answers with what it has.
+///
+/// A bound rather than a limit on correctness: a scan that has crossed this many regions has
+/// read a great deal, and a caller wanting more asks again from where it stopped. Without one, a
+/// region cache that kept naming regions would make a scan of a small range unbounded work.
+pub const MAX_SCAN_REGIONS: usize = 64;
+
 /// How many times a reader will resolve a lock and try again before giving up.
 ///
 /// Separate from the router's retry budget, which counts *routing* failures. A lock is not a
@@ -113,6 +120,7 @@ pub struct TxnClient {
     oracle: Arc<dyn TimestampOracle>,
     lock_ttl_ms: u64,
     max_lock_resolutions: u32,
+    max_scan_regions: usize,
 }
 
 impl TxnClient {
@@ -139,6 +147,7 @@ impl TxnClient {
             oracle,
             lock_ttl_ms: LOCK_TTL_MS,
             max_lock_resolutions: MAX_LOCK_RESOLUTIONS,
+            max_scan_regions: MAX_SCAN_REGIONS,
         }
     }
 
@@ -154,6 +163,7 @@ impl TxnClient {
             oracle,
             lock_ttl_ms: LOCK_TTL_MS,
             max_lock_resolutions: MAX_LOCK_RESOLUTIONS,
+            max_scan_regions: MAX_SCAN_REGIONS,
         }
     }
 
@@ -168,6 +178,13 @@ impl TxnClient {
     #[must_use]
     pub fn with_max_lock_resolutions(mut self, attempts: u32) -> Self {
         self.max_lock_resolutions = attempts;
+        self
+    }
+
+    /// Sets how many regions one scan will walk.
+    #[must_use]
+    pub fn with_max_scan_regions(mut self, regions: usize) -> Self {
+        self.max_scan_regions = regions;
         self
     }
 
@@ -190,6 +207,7 @@ impl TxnClient {
             start_ts,
             lock_ttl_ms: self.lock_ttl_ms,
             max_lock_resolutions: self.max_lock_resolutions,
+            max_scan_regions: self.max_scan_regions,
             buffer: BTreeMap::new(),
             state: State::Open,
         })
@@ -225,6 +243,8 @@ pub struct Transaction {
     start_ts: u64,
     lock_ttl_ms: u64,
     max_lock_resolutions: u32,
+    /// Most regions one scan will walk before it stops and answers with what it has.
+    max_scan_regions: usize,
     /// The write set, in key order. A `BTreeMap` rather than a list because a transaction that
     /// writes a key twice must send one mutation, not two — and because the *first* key in
     /// order is a stable choice of primary, which makes a retried commit pick the same one.
@@ -300,23 +320,49 @@ impl Transaction {
     /// The merge is the read-your-writes rule applied to a range: a buffered `Put` in the
     /// range appears even though no store has it, a buffered `Delete` hides a committed value,
     /// and the result is in key order either way. The `limit` is applied **after** the merge,
-    /// so a scan cannot return fewer rows than it would have because the buffer displaced
-    /// some.
+    /// so a scan cannot return fewer rows than it would have because the buffer displaced some.
+    ///
+    /// # A range is not a region
+    ///
+    /// One request reaches **one** region, and a store answers only for the keys it owns — so a
+    /// scan whose range spans a split boundary would come back holding the first region's keys
+    /// and nothing else, with no error and nothing to notice. That is the failure this walks
+    /// region by region to avoid: it asks, learns from the region cache where that region ended,
+    /// and asks again from there until the range is exhausted or the limit is full.
+    ///
+    /// The cache is a *hint* here as everywhere else (`docs/DESIGN.md` §10). If it does not know
+    /// where a region ended, the walk stops rather than guessing — a short answer, which is what
+    /// a caller gets from any bounded scan, rather than a wrong one.
     pub fn scan(&self, start: &[u8], end: &[u8], limit: u32) -> Result<Vec<(Bytes, Bytes)>> {
         let limit = self.router.bounded_limit(limit, DEFAULT_SCAN_LIMIT);
-        let request = TxnKvReq::Scan {
-            start: Bytes::copy_from_slice(start),
-            end: Bytes::copy_from_slice(end),
-            limit,
-            ts: self.start_ts,
-            reverse: false,
-        };
-        let pairs = match self.call_resolving(&request)? {
-            TxnKvResp::Scan { pairs } => pairs,
-            other => return Err(unexpected(Method::TxnScan, &other)),
-        };
+        let mut merged: BTreeMap<Bytes, Bytes> = BTreeMap::new();
+        let mut cursor = Bytes::copy_from_slice(start);
 
-        let mut merged: BTreeMap<Bytes, Bytes> = pairs.into_iter().collect();
+        for _ in 0..self.max_scan_regions {
+            let page = self.scan_page(&cursor, end, limit)?;
+            merged.extend(page);
+            if merged.len() >= limit as usize {
+                break;
+            }
+            // Where this region ended is where the next one starts. An empty `end_key` is the
+            // end of the key space, so a region carrying one is the last there is.
+            let Some(next) = self
+                .router
+                .cached_route(&cursor)
+                .map(|route| route.region.end_key)
+                .filter(|next| !next.is_empty())
+            else {
+                break;
+            };
+            // Past the range the caller asked for, or not moving. The second is the guard that
+            // matters: a cache entry naming a region that ends at or before the cursor would
+            // otherwise ask the same region for ever.
+            if (!end.is_empty() && next.as_ref() >= end) || next <= cursor {
+                break;
+            }
+            cursor = next;
+        }
+
         for (key, write) in self.in_range(start, end) {
             match write {
                 Write::Put(value) => merged.insert(key.clone(), value.clone()),
@@ -324,6 +370,21 @@ impl Transaction {
             };
         }
         Ok(merged.into_iter().take(limit as usize).collect())
+    }
+
+    /// One region's worth of a scan.
+    fn scan_page(&self, start: &Bytes, end: &[u8], limit: u32) -> Result<Vec<(Bytes, Bytes)>> {
+        let request = TxnKvReq::Scan {
+            start: start.clone(),
+            end: Bytes::copy_from_slice(end),
+            limit,
+            ts: self.start_ts,
+            reverse: false,
+        };
+        match self.call_resolving(&request)? {
+            TxnKvResp::Scan { pairs } => Ok(pairs),
+            other => Err(unexpected(Method::TxnScan, &other)),
+        }
     }
 
     /// The buffered writes inside `[start, end)`; an empty `end` means the end of the key
