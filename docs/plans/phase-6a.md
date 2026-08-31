@@ -1101,3 +1101,4 @@ reason they are here rather than in a notebook.
 | # | Milestone | ADR | What has to exist first | Size, honestly |
 |---|---|---|---|---|
 | M1 | **Distributed online schema change** — `CREATE INDEX` without blocking, and the door to `DROP COLUMN` and type changes | [0020](../adr/0020-online-schema-change.md) | a schema lease published by PD; per-column and per-index states in the catalog | a phase. The state machine is small; the lease is the hard part, because it must stop a node that believes it is healthy |
+| M2 | **The time machine** — historical reads, checkpoints, `DIFF`, `FLASHBACK` as compensating writes | [0021](../adr/0021-time-machine.md) | `TxnClient::begin_at`; the collector honouring the per-table retention records, which **exist now** | a unit each, on machinery that is already built. The storage layer is a time machine already; this is a surface and a bound |

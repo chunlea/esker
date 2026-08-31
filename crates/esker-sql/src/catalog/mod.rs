@@ -51,6 +51,20 @@ use crate::value::ColumnType;
 /// (`CLAUDE.md` invariant 2).
 pub const CATALOG_FORMAT_VERSION: u8 = record::CATALOG_FORMAT_VERSION;
 
+/// How long old MVCC versions are kept when nothing says otherwise: **one hour**.
+///
+/// This number is two things at once and they pull in opposite directions
+/// ([ADR 0021](../../../docs/adr/0021-time-machine.md)). It is the depth of the *time machine* — a
+/// read `AS OF` an instant older than this has nothing left to read — and it is the depth of every
+/// version chain the storage engine has to walk past to answer an ordinary read. An hour is chosen
+/// to be long enough that "what did this look like before the last run" is answerable out of the
+/// box and short enough that a hot-rewritten key does not accumulate a chain nobody wanted.
+pub const DEFAULT_RETENTION_MS: u64 = 60 * 60 * 1000;
+
+/// A retention that never collects. Reserved rather than derived, because every other value is
+/// subtracted from a timestamp and this one cannot be.
+pub const RETENTION_FOREVER: u64 = u64::MAX;
+
 /// The longest identifier PostgreSQL keeps. Longer ones are truncated with a `42622` notice, not
 /// refused — measured against the server, which truncated a 70-character name to 63.
 pub const MAX_IDENTIFIER_BYTES: usize = 63;
@@ -401,6 +415,9 @@ pub fn replace_table(
 /// the caller's to delete; this is the catalog only.
 pub fn drop_table(txn: &mut dyn Txn, tenant: u64, table: &TableDef) -> Result<()> {
     txn.delete(&record::table_key(tenant, table.id));
+    // A relation id is never reused, so an orphan override could not be mistaken for another
+    // table's -- but it would sit in the collector's scan of every override for ever.
+    clear_table_retention(txn, tenant, table.id);
     txn.delete(&record::name_key(tenant, &table.name));
     txn.delete(&record::name_key(tenant, &table.primary_key_name));
     for index in &table.indexes {
@@ -433,6 +450,49 @@ fn write_table(txn: &mut dyn Txn, tenant: u64, table: &TableDef) {
                 index_id: index.id,
             }),
         );
+    }
+}
+
+/// Sets the retention override for one table, in milliseconds.
+///
+/// It does **not** bump the catalog version, and that is deliberate. Retention changes nothing
+/// about how a row is written or read — it is a housekeeping bound the collector reads directly
+/// from the store — so bumping the version would make every node in the cluster throw away its
+/// table cache to learn a number none of them uses. The collector picks the change up on its next
+/// pass, which is the only place it matters.
+pub fn set_table_retention(txn: &mut dyn Txn, tenant: u64, table_id: u64, retention_ms: u64) {
+    txn.put(
+        &record::retention_key(tenant, table_id),
+        &record::encode_retention(retention_ms),
+    );
+}
+
+/// Removes a table's override, putting it back on the cluster default.
+pub fn clear_table_retention(txn: &mut dyn Txn, tenant: u64, table_id: u64) {
+    txn.delete(&record::retention_key(tenant, table_id));
+}
+
+/// One table's override, or `None` when it takes the cluster default.
+pub fn table_retention(txn: &dyn Txn, tenant: u64, table_id: u64) -> Result<Option<u64>> {
+    match txn.get(&record::retention_key(tenant, table_id))? {
+        Some(bytes) => Ok(Some(record::decode_retention(&bytes)?)),
+        None => Ok(None),
+    }
+}
+
+/// Sets the cluster's default retention, in milliseconds.
+pub fn set_default_retention(txn: &mut dyn Txn, retention_ms: u64) {
+    txn.put(
+        &record::default_retention_key(),
+        &record::encode_retention(retention_ms),
+    );
+}
+
+/// The cluster's default retention, or [`DEFAULT_RETENTION_MS`] when nobody has set one.
+pub fn default_retention(txn: &dyn Txn) -> Result<u64> {
+    match txn.get(&record::default_retention_key())? {
+        Some(bytes) => record::decode_retention(&bytes),
+        None => Ok(DEFAULT_RETENTION_MS),
     }
 }
 
@@ -472,12 +532,22 @@ pub fn bump_version(txn: &mut dyn Txn) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Catalog, ColumnDef, IndexDef, MAX_IDENTIFIER_BYTES, Relation, TableDef, allocate_id,
-        create_table, drop_table, fold_identifier, record, replace_table,
+        Catalog, ColumnDef, DEFAULT_RETENTION_MS, IndexDef, MAX_IDENTIFIER_BYTES,
+        RETENTION_FOREVER, Relation, TableDef, allocate_id, clear_table_retention, create_table,
+        default_retention, drop_table, fold_identifier, record, replace_table,
+        set_default_retention, set_table_retention, table_retention,
     };
     use crate::backend::{Backend, MemoryBackend};
     use crate::sqlstate;
     use crate::value::ColumnType;
+
+    fn hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        bytes.iter().fold(String::new(), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+    }
 
     fn accounts(id: u64) -> TableDef {
         TableDef {
@@ -511,15 +581,8 @@ mod tests {
     #[test]
     fn a_table_record_is_a_version_and_then_the_definition() {
         let encoded = record::encode_table(&accounts(7));
-        let hex: String = {
-            use std::fmt::Write as _;
-            encoded.iter().fold(String::new(), |mut out, byte| {
-                let _ = write!(out, "{byte:02x}");
-                out
-            })
-        };
         assert_eq!(
-            hex,
+            hex(&encoded),
             concat!(
                 "02",                 // catalog format version
                 "0700000000000000",   // table id 7
@@ -882,6 +945,99 @@ mod tests {
         assert!(
             view.table("accounts").unwrap().is_none(),
             "a table nobody committed came back from the cache"
+        );
+    }
+
+    /// The golden for a retention record. The garbage collector reads these bytes from a crate
+    /// that does not link this one (ADR 0021), so the layout is a contract between two layers and
+    /// not an implementation detail of either.
+    #[test]
+    fn a_retention_record_is_a_version_and_a_u64_of_milliseconds() {
+        let encoded = record::encode_retention(600_000);
+        assert_eq!(
+            hex(&encoded),
+            concat!(
+                "02",               // catalog format version
+                "c027090000000000", // 600000 ms -- ten minutes, little-endian
+            )
+        );
+        assert_eq!(record::decode_retention(&encoded).unwrap(), 600_000);
+
+        // The key layout is the other half of the contract: one scan of the kind byte visits every
+        // override, and the cluster default is not in it.
+        let key = record::retention_key(1, 7);
+        let default = record::default_retention_key();
+        assert_eq!(
+            hex(&key),
+            concat!(
+                "6d",               // 'm', the meta space
+                "73716c",           // "sql"
+                "72",               // 'r', a retention override
+                "0000000000000001", // tenant 1, memcomparable
+                "0000000000000007", // table 7
+            )
+        );
+        assert_eq!(hex(&default), concat!("6d", "73716c", "64"));
+        assert!(
+            !default.starts_with(&key[..key.len() - 16]),
+            "the default must not fall inside a scan of the overrides"
+        );
+
+        // Forever is a reserved value, not a very large duration: a reader subtracts every other
+        // one from a timestamp and cannot subtract this.
+        assert_eq!(
+            record::decode_retention(&record::encode_retention(RETENTION_FOREVER)).unwrap(),
+            u64::MAX
+        );
+
+        // And it fails closed like every other record.
+        let mut damaged = encoded.clone();
+        damaged[0] = record::CATALOG_FORMAT_VERSION + 1;
+        assert!(record::decode_retention(&damaged).is_err());
+        for cut in 0..encoded.len() {
+            assert!(
+                record::decode_retention(&encoded[..cut]).is_err(),
+                "{cut} bytes decoded as a retention"
+            );
+        }
+        assert!(
+            record::decode_retention(&[&encoded[..], &[0]].concat()).is_err(),
+            "a trailing byte is not ignored"
+        );
+    }
+
+    /// Retention is per table with a cluster fallback, and it survives the table being dropped
+    /// only in the sense that it does not: an override goes when its table does.
+    #[test]
+    fn retention_falls_back_to_the_cluster_default_and_dies_with_its_table() {
+        let backend = MemoryBackend::new();
+        let mut txn = backend.begin().unwrap();
+
+        assert_eq!(default_retention(&*txn).unwrap(), DEFAULT_RETENTION_MS);
+        assert_eq!(table_retention(&*txn, 1, 7).unwrap(), None);
+
+        set_default_retention(&mut *txn, 5_000);
+        set_table_retention(&mut *txn, 1, 7, 600_000);
+        assert_eq!(default_retention(&*txn).unwrap(), 5_000);
+        assert_eq!(table_retention(&*txn, 1, 7).unwrap(), Some(600_000));
+        assert_eq!(table_retention(&*txn, 1, 8).unwrap(), None, "another table");
+        assert_eq!(
+            table_retention(&*txn, 2, 7).unwrap(),
+            None,
+            "another tenant"
+        );
+
+        clear_table_retention(&mut *txn, 1, 7);
+        assert_eq!(table_retention(&*txn, 1, 7).unwrap(), None);
+
+        let table = accounts(7);
+        create_table(&mut *txn, 1, &table).unwrap();
+        set_table_retention(&mut *txn, 1, 7, RETENTION_FOREVER);
+        drop_table(&mut *txn, 1, &table).unwrap();
+        assert_eq!(
+            table_retention(&*txn, 1, 7).unwrap(),
+            None,
+            "an override must not outlive its table in the collector's scan"
         );
     }
 

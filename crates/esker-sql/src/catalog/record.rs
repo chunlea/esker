@@ -5,7 +5,16 @@
 //! 'm' ++ "sql" ++ 's' ++ tenant:u64            the next relation id, one counter per tenant
 //! 'm' ++ "sql" ++ 't' ++ tenant:u64 ++ id:u64  a table, with its indexes inside it
 //! 'm' ++ "sql" ++ 'n' ++ tenant:u64 ++ name    a name, and what relation it is
+//! 'm' ++ "sql" ++ 'd'                          the cluster's default MVCC retention
+//! 'm' ++ "sql" ++ 'r' ++ tenant:u64 ++ id:u64  one table's retention override
 //! ```
+//!
+//! The two retention records are read by the **garbage collector**, which lives below this crate
+//! and does not link it ([ADR 0021](../../../../docs/adr/0021-time-machine.md)). That is why they
+//! are records of their own rather than fields of the table record: the GC filter must read them
+//! without decoding a table definition, whose format it has no business knowing, and a prefix scan
+//! of `'m' ++ "sql" ++ 'r'` returns every override and nothing else. The cluster default is under
+//! its own kind byte for the same reason — under `'r'` it would be inside that scan.
 //!
 //! Ids in keys are memcomparable (`esker_keys::codec`), so a scan of one tenant's tables visits
 //! them in id order. Record *bodies* are hand-written little-endian, like every other value this
@@ -40,6 +49,8 @@ const KIND_TABLE: u8 = b't';
 const KIND_NAME: u8 = b'n';
 const KIND_INDEX: u8 = b'i';
 const KIND_PRIMARY_KEY: u8 = b'p';
+const KIND_RETENTION_DEFAULT: u8 = b'd';
+const KIND_RETENTION: u8 = b'r';
 
 /// Tags for [`ColumnType`] as stored. Ours rather than PostgreSQL's OIDs, because these are a
 /// format we own and must never move; the OIDs stay on the wire where they belong.
@@ -105,6 +116,46 @@ pub(super) fn name_key(tenant: u64, name: &str) -> Vec<u8> {
     codec::encode_u64(tenant, &mut suffix);
     suffix.extend_from_slice(name.as_bytes());
     prefix::meta_key(&suffix)
+}
+
+/// `'m' ++ "sql" ++ 'd'`. One number for the cluster, absent until somebody sets it.
+#[must_use]
+pub(super) fn default_retention_key() -> Vec<u8> {
+    prefix::meta_key(&[SQL, &[KIND_RETENTION_DEFAULT]].concat())
+}
+
+/// `'m' ++ "sql" ++ 'r' ++ tenant ++ table_id`. Absent for a table that takes the default.
+///
+/// Ids are memcomparable, so one scan of `'m' ++ "sql" ++ 'r'` visits every override in id order,
+/// which is what the collector wants: it reads the whole map once per compaction rather than
+/// asking per key.
+#[must_use]
+pub(super) fn retention_key(tenant: u64, table_id: u64) -> Vec<u8> {
+    let mut suffix = [SQL, &[KIND_RETENTION]].concat();
+    codec::encode_u64(tenant, &mut suffix);
+    codec::encode_u64(table_id, &mut suffix);
+    prefix::meta_key(&suffix)
+}
+
+/// A retention, in milliseconds, behind the same version byte as every other record.
+///
+/// Milliseconds because that is the unit of a timestamp's physical half (`esker_pd::tso`), so
+/// turning a retention into a timestamp distance is a shift and not a conversion anybody can get
+/// wrong. [`super::RETENTION_FOREVER`] is `u64::MAX` and means *never collect*, which a reader has
+/// to test for rather than subtract.
+#[must_use]
+pub(super) fn encode_retention(retention_ms: u64) -> Vec<u8> {
+    let mut out = vec![CATALOG_FORMAT_VERSION];
+    out.extend_from_slice(&retention_ms.to_le_bytes());
+    out
+}
+
+/// Reads a retention back.
+pub(super) fn decode_retention(bytes: &[u8]) -> Result<u64> {
+    let mut reader = Reader::new(bytes)?;
+    let retention = reader.u64_le()?;
+    reader.finish()?;
+    Ok(retention)
 }
 
 /// A monotone counter as stored: little-endian, like every other record body here.
