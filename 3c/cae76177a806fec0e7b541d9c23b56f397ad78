@@ -1,0 +1,29 @@
+crates/esker-store/src/peer.rs
+  s_dc640bf0df4adb::t_0dbe04c57465a3 242-248,1032,1373,1815,1901,1967
+crates/esker-store/src/server.rs
+  s_dc640bf0df4adb::t_e1f304ac35340a 2028-2039,2054-2057,2064
+crates/esker-store/tests/multi_region.rs
+  s_dc640bf0df4adb::t_c6d6ee09c408cc 630-716
+crates/esker-store/tests/promotion.rs
+  s_dc640bf0df4adb::t_07292870912eef 177,179-182,184-199,201-203,205-208
+crates/esker-store/tests/restart.rs
+  s_dc640bf0df4adb::t_0c8cb3e61aa085 91
+docs/plans/phase-4.md
+  s_dc640bf0df4adb::t_87e21855f1002b 1269-1307
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "3ccae76177a806fec0e7b541d9c23b56f397ad78",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
