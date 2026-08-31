@@ -558,12 +558,13 @@ thirty of them and `tests/lowering.rs` holds twenty-nine more at the clause leve
 - The `TODO(post-v1)`s named above, and the one in §5 about the round trip a unique index costs per
   row.
 
-### Two seam mismatches, found by reading the client before the signal — both closed
+### Three seam mismatches, found by reading the client before the signal
 
-`crates/esker-client/src/txn.rs` was read against `backend::Txn` ahead of the wiring unit. Every
-signature lines up — `get` and `scan` take `&self`, `put` and `delete` return nothing, `commit`
+`crates/esker-client/src/txn.rs` was read against `backend::Txn` ahead of the wiring unit, and
+again after the store half opened. Every signature lines up — `get` and `scan` take `&self`, `put` and `delete` return nothing, `commit`
 yields `Option<u64>`, `rollback` takes `self` — which is what shaping the trait against the real
-one bought. Two things did not, and neither would have failed to compile.
+one bought. Three things did not, and none of them would have failed to compile. Two are closed;
+the third is open and is the client lane's.
 
 **1. `scan(.., 0)` meant "everything" here and "a page" there. Fixed.** [`backend::Txn::scan`]'s
 contract is that a `limit` of 0 is no limit; `Transaction::scan` runs it through
@@ -613,6 +614,27 @@ That is better than a bare error code, and it makes the wiring unit *smaller* ra
   arrived, so it opens a fresh transaction and probes every unique key it wrote. The key is now in
   the error. Keep the probe only for `key: None`, and take the round trip out of the path a
   duplicate insert takes.
+
+**3. A scan stops at a region boundary, and nothing says so. Not this lane's, and not yet fixed.**
+Found while re-reading the store half after it opened. `esker_client::Transaction::scan` sends one
+`TxnKvReq::Scan` and merges its buffer into the answer; the region it goes to is the one holding
+**`start`** (`wire.rs`'s routing key, which already carries a `TODO(phase-4)` about reverse scans
+and more than one region). The store answers out of its own engine
+(`esker-store/src/txnkv.rs::user_keys_in`), so a range spanning two regions comes back holding only
+the first one's keys.
+
+That defeats **any** paging rule this crate can implement on its own, including the one it now has.
+`for_each_page` resumes from `successor(last)` and stops on an empty read; once the first region's
+keys are exhausted, `successor(last)` still routes to that same region, which answers empty, and
+the walk stops with later regions unread. So the fix above is correct for one region and correct
+for the fake, and a table that has *split* would silently truncate again — a `DROP TABLE` leaving
+rows, and an index built over the first region only.
+
+The fix belongs in `esker-client`: `Transaction::scan` iterating regions in order, the way a
+region-aware client is expected to. `esker-sql` must not learn where boundaries are — that is the
+routing layer's knowledge and this crate is above it. Flagged before the wiring signal rather than
+after, because the wiring unit will otherwise appear to work: nothing truncates until a table grows
+past one region.
 
 One correction to the first version of this note, since it was read as a claim about the client's
 internals: it said a duplicate would surface as "an internal-sounding failure", meaning how the
