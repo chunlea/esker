@@ -25,7 +25,8 @@ use std::sync::{Arc, RwLock};
 use bytes::Bytes;
 use esker_engine::compaction::CompactionFilter;
 use esker_engine::{
-    Db, LocalFileSystem, Options, ReadOptions, WalSyncMode, WriteBatch, WriteOptions, cf,
+    Db, FileSystem, LocalFileSystem, Options, ReadOptions, WalSyncMode, WriteBatch, WriteOptions,
+    cf,
 };
 use esker_proto::{
     BoxFuture, Peer, PeerRole, ProtoError, RaftBatch, RawKvReq, RawKvResp, Region, Reply, Request,
@@ -66,6 +67,13 @@ pub struct StoreOptions {
     pub limits: Limits,
     /// How the engine underneath is opened.
     pub engine: Options,
+    /// The filesystem the engine reads and writes SSTs through.
+    ///
+    /// [`LocalFileSystem`] by default, which is the ordinary store. The parameter exists so a
+    /// caller can hand the engine a **tiered** filesystem — the database directory as a cache
+    /// in front of object storage (`docs/DESIGN.md` §13) — without this crate knowing anything
+    /// about what is behind it, and so a test can inject faults the way `esker-engine`'s own do.
+    pub fs: Arc<dyn FileSystem>,
     /// Replication, when this store is one of several. `None` is a single-node store that writes
     /// straight to the engine — which is what phase 2 built and what the CLI's `server` command
     /// still starts.
@@ -184,6 +192,7 @@ impl StoreOptions {
                 wal_sync_mode: WalSyncMode::Never,
                 ..Options::default()
             },
+            fs: Arc::new(LocalFileSystem::new()),
         }
     }
 }
@@ -274,6 +283,7 @@ fn load_retention(db: &Db, collector: &MvccCollector) {
 fn open_engine(
     path: impl AsRef<Path>,
     mut engine: Options,
+    fs: Arc<dyn FileSystem>,
     collector: &Arc<MvccCollector>,
 ) -> Result<Db> {
     // Only on `write`. The collector reads a `WriteRecord` out of every value it is offered, and
@@ -285,7 +295,7 @@ fn open_engine(
         .cf_overrides
         .insert(cf::WRITE.to_string(), write_options);
 
-    let db = Db::open_with(path, engine, Arc::new(LocalFileSystem::new()), &cf::BUILTIN)?;
+    let db = Db::open_with(path, engine, fs, &cf::BUILTIN)?;
     for name in cf::BUILTIN {
         if db.cf_id(name).is_none() {
             return Err(StoreError::Bootstrap(format!(
@@ -319,6 +329,7 @@ impl Store {
             region_id,
             limits,
             engine,
+            fs,
             raft,
             pd,
             address,
@@ -334,7 +345,7 @@ impl Store {
             RetentionPolicy::uniform(DEFAULT_RETENTION_MS),
             0,
         ));
-        let db = Arc::new(open_engine(path, engine, &collector)?);
+        let db = Arc::new(open_engine(path, engine, fs, &collector)?);
         load_retention(&db, &collector);
 
         // What this store hosts is what its own `'m'` records say — never what its configuration

@@ -356,7 +356,7 @@ pub fn stage_pairs(db: &Db, pairs: &[(Bytes, Bytes)]) -> Result<(), ProtoError> 
 ///
 /// The recovery half of the announcement record. A receive that stopped part-way left keys no
 /// region covers; they are harmless where they are, but they would make the **retry** refuse to
-/// start ([`may_receive`]), so the restart clears them and the range is clean again.
+/// start ([`clear_range`]), so the restart clears them and the range is clean again.
 ///
 /// Point deletes, because the engine has no range tombstones in v1 (ADR 0006). The cost is
 /// proportional to what was received before the crash, which is the honest price of not being able
