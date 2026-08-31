@@ -90,6 +90,22 @@ pub fn physical_ms(ts: u64) -> u64 {
     ts >> TSO_LOGICAL_BITS
 }
 
+/// The first timestamp of the millisecond `physical_ms`, with the logical counter at zero.
+///
+/// The inverse of [`physical_ms`], and the whole of "wall clock in, timestamp out"
+/// ([ADR 0021](../../docs/adr/0021-time-machine.md) decision 1): a timestamp's high 46 bits
+/// *are* milliseconds since the Unix epoch, so this is a shift and never a lookup.
+///
+/// The rounding is deliberate and worth stating, because both readings are defensible until you
+/// pick one. A read at this timestamp sees every transaction that committed strictly **before**
+/// that millisecond and none that committed within it — so "as of 14:00:00.000" does not
+/// include a transaction committing *at* 14:00:00.000, exactly as it does not include one that
+/// is one instant from committing.
+#[must_use]
+pub fn ts_at_ms(physical_ms: u64) -> u64 {
+    physical_ms << TSO_LOGICAL_BITS
+}
+
 /// Whether a lock minted at `start_ts` with a `ttl_ms` lease is dead as of `now_ts`.
 ///
 /// Both arguments are **timestamps from the oracle**, never wall-clock readings
@@ -232,8 +248,104 @@ impl TxnClient {
     /// stamped with, what its `default` values are filed under, and what a resolver looks its
     /// fate up by. It comes from the oracle and from nowhere else (`CLAUDE.md` invariant 6).
     pub fn begin(&self) -> Result<Transaction> {
-        let start_ts = self.oracle.timestamp()?;
-        Ok(Transaction {
+        Ok(self.open(self.oracle.timestamp()?, false))
+    }
+
+    /// A **read-only** transaction at a timestamp of the caller's choosing: the time machine
+    /// ([ADR 0021](../../docs/adr/0021-time-machine.md) decision 1).
+    ///
+    /// `begin()` is the special case of this with the timestamp taken from the oracle, and that
+    /// is the whole of the feature on this side: a transaction's `start_ts` is its snapshot, so
+    /// reading the past is only a matter of choosing a different number. Locks, resolution,
+    /// read-your-writes and the region walk are all indifferent to where it came from.
+    ///
+    /// Three rules stand between the caller and a wrong answer, and each is a **refusal**
+    /// rather than a clamp — a clamp would answer a question nobody asked:
+    ///
+    /// * **Read-only.** A write is refused, at commit, with [`Error::ReadOnlyTransaction`].
+    /// * **Not below the safepoint.** [`Error::SnapshotTooOld`], carrying the floor, because
+    ///   below it the answer would be a state that never existed.
+    /// * **Not in the future.** [`Error::SnapshotInTheFuture`].
+    ///
+    /// The floor costs one round trip, and it is spent here rather than per read: see
+    /// [`TxnClient::safepoint`] for what that number is and what it is not.
+    pub fn begin_at(&self, start_ts: u64) -> Result<Transaction> {
+        let now = self.oracle.timestamp()?;
+        if start_ts > now {
+            return Err(Error::SnapshotInTheFuture {
+                requested: start_ts,
+                now,
+            });
+        }
+        let floor = self.safepoint()?;
+        // At the floor exactly is still answerable: the collector keeps the newest version at
+        // or below the safepoint, because that is what a read *at* the safepoint returns
+        // (`docs/txn-spec.md` §7). Below it, versions are missing.
+        if start_ts < floor {
+            return Err(Error::SnapshotTooOld {
+                requested: start_ts,
+                floor,
+            });
+        }
+        Ok(self.open(start_ts, true))
+    }
+
+    /// A read-only transaction as of `how_long` ago.
+    ///
+    /// The sugar the common case wants, and the one that keeps `CLAUDE.md` invariant 6: "ago"
+    /// is measured from a **timestamp the oracle just handed out**, not from this machine's
+    /// wall clock. A client that subtracted from its own clock would be ordering itself against
+    /// the cluster by a number the cluster never agreed to.
+    pub fn begin_ago(&self, how_long: Duration) -> Result<Transaction> {
+        self.begin_at(self.ts_ago(how_long)?)
+    }
+
+    /// The timestamp `how_long` before now, taken from the oracle and shifted back.
+    ///
+    /// Saturating: a duration longer than the oracle's clock has been running answers the
+    /// bottom of the timestamp space, which [`TxnClient::begin_at`] then refuses as too old —
+    /// a refusal naming the window, rather than an overflow.
+    pub fn ts_ago(&self, how_long: Duration) -> Result<u64> {
+        let now = self.oracle.timestamp()?;
+        let ago_ms = u64::try_from(how_long.as_millis()).unwrap_or(u64::MAX);
+        Ok(ts_at_ms(physical_ms(now).saturating_sub(ago_ms)))
+    }
+
+    /// The garbage-collection safepoint now in force: the oldest timestamp a read can be
+    /// answered at.
+    ///
+    /// Asked with a `GcSafepoint` of **zero**, which is a query and not a write: a store's
+    /// safepoint only ever rises (`crates/esker-store/src/gc.rs`, `fetch_max`), so publishing
+    /// zero cannot lower one, and the response is defined as the safepoint now in force. That
+    /// is why this needs no verb of its own.
+    ///
+    /// **What the number is not.** It is one store's, reached by routing an empty key, where
+    /// the placement driver publishes to all of them; a store that has not yet received the
+    /// latest safepoint reports a lower one. So a refusal built on it is authoritative — that
+    /// history is gone everywhere, since the floor only rises — while an acceptance is a
+    /// best-effort: another store may have collected further. The exact per-table floor is
+    /// `esker-sql`'s to apply (ADR 0021 decision 2), because it needs the retention records and
+    /// the table a key belongs to, and this crate is byte-opaque by `CLAUDE.md` invariant 7.
+    pub fn safepoint(&self) -> Result<u64> {
+        match self.call(&TxnKvReq::GcSafepoint { safepoint: 0 })? {
+            TxnKvResp::GcSafepoint { safepoint } => Ok(safepoint),
+            other => Err(unexpected(Method::TxnGcSafepoint, &other)),
+        }
+    }
+
+    /// One `TxnKv` call that belongs to the client rather than to a transaction.
+    fn call(&self, request: &TxnKvReq) -> Result<TxnKvResp> {
+        match self.router.call(&Body::Txn(request.clone()))? {
+            Response::TxnKv(response) => Ok(response),
+            other => Err(Error::UnexpectedResponse {
+                expected: request.method(),
+                actual: other.method(),
+            }),
+        }
+    }
+
+    fn open(&self, start_ts: u64, read_only: bool) -> Transaction {
+        Transaction {
             router: Arc::clone(&self.router),
             oracle: Arc::clone(&self.oracle),
             start_ts,
@@ -241,8 +353,10 @@ impl TxnClient {
             max_lock_resolutions: self.max_lock_resolutions,
             max_scan_regions: self.max_scan_regions,
             buffer: BTreeMap::new(),
+            read_only,
+            refused_write: None,
             state: State::Open,
-        })
+        }
     }
 }
 
@@ -281,6 +395,15 @@ pub struct Transaction {
     /// writes a key twice must send one mutation, not two — and because the *first* key in
     /// order is a stable choice of primary, which makes a retried commit pick the same one.
     buffer: BTreeMap<Bytes, Write>,
+    /// Whether this transaction reads a past snapshot and so may not write
+    /// ([ADR 0021](../../docs/adr/0021-time-machine.md) decision 1).
+    read_only: bool,
+    /// The first key a write was attempted on, when this transaction is read-only.
+    ///
+    /// The write is **not** buffered — a historical read that answered a caller with its own
+    /// phantom write would be lying about the past, which is the one thing this transaction
+    /// exists to tell the truth about — and `commit` refuses, naming this key.
+    refused_write: Option<Bytes>,
     state: State,
 }
 
@@ -314,6 +437,9 @@ impl Transaction {
 
     /// Buffers a write. No I/O: the whole set goes out at `commit()`.
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
+        if self.refuse_write(key) {
+            return;
+        }
         self.buffer.insert(
             Bytes::copy_from_slice(key),
             Write::Put(Bytes::copy_from_slice(value)),
@@ -322,8 +448,35 @@ impl Transaction {
 
     /// Buffers a delete. No I/O.
     pub fn delete(&mut self, key: &[u8]) {
+        if self.refuse_write(key) {
+            return;
+        }
         self.buffer
             .insert(Bytes::copy_from_slice(key), Write::Delete);
+    }
+
+    /// Whether this transaction may not write, remembering the first key that tried.
+    ///
+    /// The write is dropped rather than buffered, and the refusal comes at `commit`. Two
+    /// alternatives were available and are worse: making `put` return a `Result` puts an error
+    /// path on every ordinary transaction's hot loop to serve what is a programming error, and
+    /// buffering the write would make [`Transaction::get`] answer with a value that never
+    /// existed at this snapshot — a historical read lying about history, which is the one thing
+    /// it is for. Nothing is silent: the transaction cannot commit, and the error names the key.
+    fn refuse_write(&mut self, key: &[u8]) -> bool {
+        if !self.read_only {
+            return false;
+        }
+        if self.refused_write.is_none() {
+            self.refused_write = Some(Bytes::copy_from_slice(key));
+        }
+        true
+    }
+
+    /// Whether this transaction reads a past snapshot, and so cannot write.
+    #[must_use]
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Reads one key at this transaction's snapshot, its own buffered writes first.
@@ -437,6 +590,12 @@ impl Transaction {
     /// The order is the one in this module's header, and steps 2 and 5 are enforced by
     /// `esker-txn`'s types rather than by this function being read carefully.
     pub fn commit(mut self) -> Result<Option<u64>> {
+        if let Some(key) = self.refused_write.clone() {
+            return Err(Error::ReadOnlyTransaction {
+                start_ts: self.start_ts,
+                key,
+            });
+        }
         self.finish()?;
         let Some(primary) = self.primary().cloned() else {
             return Ok(None);

@@ -121,6 +121,49 @@ pub enum Error {
         start_ts: u64,
     },
 
+    /// A historical read named a timestamp the collector has already passed
+    /// ([ADR 0021](../../docs/adr/0021-time-machine.md) decision 1).
+    ///
+    /// A refusal rather than a clamp, and rather than an approximate answer: below the
+    /// safepoint some versions are gone and some are not, so the database *can* answer and the
+    /// answer is a state that never existed (`docs/txn-spec.md` §7). The error carries the
+    /// floor because the useful reply to "show me 14:00" is how far back the caller may
+    /// actually ask.
+    #[error("a read at {requested} is below the safepoint {floor}; history that old is collected")]
+    SnapshotTooOld {
+        /// The timestamp the caller asked to read at.
+        requested: u64,
+        /// The oldest timestamp that can still be answered — the safepoint now in force.
+        floor: u64,
+    },
+
+    /// A read named a timestamp that has not happened yet (ADR 0021 decision 1).
+    ///
+    /// A read there would see a prefix of that instant and call it complete: transactions that
+    /// will commit below it have not committed yet.
+    #[error("a read at {requested} is above the oracle's high-water mark {now}")]
+    SnapshotInTheFuture {
+        /// The timestamp the caller asked to read at.
+        requested: u64,
+        /// The newest timestamp the oracle has handed out.
+        now: u64,
+    },
+
+    /// A write was attempted on a transaction opened at a past timestamp.
+    ///
+    /// Read-only is not a policy here, it is the only safe reading: committing at a fresh
+    /// `commit_ts` against an old snapshot is a lost update that Percolator's conflict check
+    /// **cannot** catch, because the conflicting writer committed after the snapshot and before
+    /// the write — the one window snapshot isolation does not close (ADR 0021 decision 1).
+    /// PostgreSQL spells the same refusal `25006 read_only_sql_transaction`.
+    #[error("the transaction at {start_ts} reads the past and cannot write (key {key:?})")]
+    ReadOnlyTransaction {
+        /// The historical snapshot it was opened at.
+        start_ts: u64,
+        /// The first key a write was attempted on.
+        key: Bytes,
+    },
+
     /// A bug in this crate rather than a failure of the cluster.
     #[error("internal error: {0}")]
     Internal(String),
@@ -150,10 +193,15 @@ impl Error {
             // A request that was never routed or never built changed nothing. So did a
             // transaction that lost a write-write race and one whose lock never cleared: both
             // are the store *saying* it refused, which means its answer arrived.
+            // The three time-machine refusals are decided *before* anything is sent, from a
+            // timestamp and a safepoint, so there is nothing they could have changed.
             Self::NoRegion { .. }
             | Self::RequestTooLarge { .. }
             | Self::TxnConflict { .. }
-            | Self::LockNotCleared { .. } => true,
+            | Self::LockNotCleared { .. }
+            | Self::SnapshotTooOld { .. }
+            | Self::SnapshotInTheFuture { .. }
+            | Self::ReadOnlyTransaction { .. } => true,
             // An answer came back, so the store acted; what it did is anybody's guess. A
             // transaction settled by someone else is the sharpest case of that — something
             // *was* written, by them — and an internal bug here proves nothing about the
