@@ -1,0 +1,32 @@
+crates/esker-store/src/gc.rs
+  s_dc640bf0df4adb::t_03cfbb89078260 48,54,69,72,114,157,168,195,233,259,261,266-401
+  s_dc640bf0df4adb::t_e0951d67f2fb19 45-47
+  s_dc640bf0df4adb::t_59e9cc9fc49b48 49-53
+  s_dc640bf0df4adb::t_900255ff82ca1a 55-57,66-68
+  s_dc640bf0df4adb::t_875723c3579120 70-71
+  s_dc640bf0df4adb::t_dfef6d8951adb7 73-75,111-113
+  s_dc640bf0df4adb::t_33d17cb6fb5c7c 115-117,154-156
+  s_dc640bf0df4adb::t_f29c4e0184f5c9 158-160,165-167
+  s_dc640bf0df4adb::t_35f7d90817d6c8 169-171,192-194
+  s_dc640bf0df4adb::t_bc3f5535bc2c0e 196-198,230-232
+  s_dc640bf0df4adb::t_da12d73446a754 234-236,256-258
+  s_dc640bf0df4adb::t_112cefdd579743 260
+  s_dc640bf0df4adb::t_b7e1e3ef3e387b 262-265
+  s_dc640bf0df4adb::t_9681564fda4baf 402-404
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2fe7f16479999434bb4e59938d5a6042dbb12624",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "claude-fable-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
