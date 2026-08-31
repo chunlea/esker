@@ -836,14 +836,15 @@ impl Transaction {
             key: lock.primary.clone(),
             ts: lock.start_ts,
         };
-        match self.call(&request) {
-            Ok(_) => Ok(None),
-            Err(error) => match lock_in(&error) {
-                Some(found) => Ok(found?)
-                    .map(|found: LockInfo| (found.start_ts == lock.start_ts).then_some(found)),
-                None => Err(error),
-            },
-        }
+        let Err(error) = self.call(&request) else {
+            // It answered, so nothing is in the way: the owner's lock is gone.
+            return Ok(None);
+        };
+        let Some(found) = lock_in(&error) else {
+            return Err(error);
+        };
+        let found = found?;
+        Ok((found.start_ts == lock.start_ts).then_some(found))
     }
 
     /// Settles the primary, and answers with what the transaction turned out to have done.
