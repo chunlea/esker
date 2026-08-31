@@ -1,0 +1,23 @@
+crates/esker-store/tests/balance.rs
+  s_b3f6a712d611c9::t_1eeef3257ae646 68-77
+crates/esker-store/tests/snapshot.rs
+  s_b3f6a712d611c9::t_7e30159bb745b4 44-53,59-68,137-149,151-171,301
+docs/plans/debt-c1.md
+  s_b3f6a712d611c9::t_cfb1d3e397668b 108-174
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "8ba2b49dd6643a8be95d9dc03bfc7dad95e648eb",
+  "prompts": {},
+  "sessions": {
+    "s_b3f6a712d611c9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "78adef9a-88ef-4c89-a340-f825de3d2ab7",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
