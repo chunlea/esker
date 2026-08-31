@@ -1,0 +1,23 @@
+crates/esker-client/src/error.rs
+  s_a54678688ddc33::t_6d5a8a2b167029 167-178,216-217
+crates/esker-client/src/txn.rs
+  s_a54678688ddc33::t_93ad00a7a9def5 336-381,1130-1171,1239-1241,1266-1311
+crates/esker-client/tests/time_machine.rs
+  s_a54678688ddc33::t_297cfda1f9755a 269-393
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "3a722b37e09e9958b5ec68147b0109812b637212",
+  "prompts": {},
+  "sessions": {
+    "s_a54678688ddc33": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5f80ef1c-2a51-422f-beb6-dba4320b1635",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
