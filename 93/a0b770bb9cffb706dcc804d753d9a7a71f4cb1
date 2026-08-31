@@ -1,0 +1,19 @@
+crates/esker-pd/src/pd/repair.rs
+  s_3138696d8fbc01::t_892b9347345fad 313,315-333,335-341,343-345,890-957
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "93a0b770bb9cffb706dcc804d753d9a7a71f4cb1",
+  "prompts": {},
+  "sessions": {
+    "s_3138696d8fbc01": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "de1cd601-bbfb-4a44-a756-dae1c4fcb152",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
