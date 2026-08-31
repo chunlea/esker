@@ -1,0 +1,21 @@
+crates/esker-proto/src/transport/client.rs
+  s_4dac2a9786305f::t_2e9b6bc1334979 463-475,502-522,527-541
+crates/esker-proto/tests/loopback.rs
+  s_4dac2a9786305f::t_75e6fddd181447 647-682,693,696,698-701
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "1cf3bf981b8bc0c90895338a432a6d8502655c43",
+  "prompts": {},
+  "sessions": {
+    "s_4dac2a9786305f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c856055d-e868-42d6-b63f-7ca0cbb2c857",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
