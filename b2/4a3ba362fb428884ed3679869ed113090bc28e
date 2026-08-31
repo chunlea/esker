@@ -1,0 +1,19 @@
+docs/plans/phase-6d.md
+  s_88c85077107b97::t_4c72c35e113e23 1-229
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "b24a3ba362fb428884ed3679869ed113090bc28e",
+  "prompts": {},
+  "sessions": {
+    "s_88c85077107b97": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e65761d1-f1de-4347-93cc-b0b75ed50b76",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
