@@ -1,0 +1,41 @@
+crates/esker-cli/src/args.rs
+  s_81a3dd1e652b18::t_dd1cacb5dfc3e7 216-220,716-717,1194-1208
+crates/esker-cli/src/bench.rs
+  s_81a3dd1e652b18::t_cccdfb64dd3263 340-341,347
+crates/esker-cli/src/server.rs
+  s_81a3dd1e652b18::t_671e331497a69f 59-66,84,135-148
+crates/esker-cli/src/sst_store.rs
+  s_81a3dd1e652b18::t_72dac760accbe1 23-30,36-52,83,103-104,107-113,122-123,134,148,164-165,167-168
+crates/esker-engine/src/fs/claim.rs
+  s_81a3dd1e652b18::t_3bfc246a32fdd6 1-435
+crates/esker-engine/src/fs/mod.rs
+  s_81a3dd1e652b18::t_784353f60c70c2 34
+crates/esker-engine/src/fs/tier.rs
+  s_81a3dd1e652b18::t_c6d0a56cbedf5e 54,97-112,125-126,254-257,262-369
+crates/esker-engine/tests/tier_claim.rs
+  s_81a3dd1e652b18::t_c904e189af6a4a 1-266
+crates/esker-engine/tests/tier_minio.rs
+  s_81a3dd1e652b18::t_724e2d20beb2d2 38,81-127,353-384
+docs/DESIGN.md
+  s_81a3dd1e652b18::t_60326734ef1110 743-749
+docs/adr/0029-the-sst-store-claim.md
+  s_81a3dd1e652b18::t_1d569408a044fa 1-97
+docs/plans/phase-6b.md
+  s_81a3dd1e652b18::t_60eabf20f929f5 253-258,265
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "25b8837af4bf480a3e9f5245927a91b6cc38259b",
+  "prompts": {},
+  "sessions": {
+    "s_81a3dd1e652b18": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a496fe55-1dd5-47a0-acee-877c11a897d0",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
