@@ -20,9 +20,16 @@ pub enum Error {
     #[error(transparent)]
     Store(#[from] ProtoError),
 
-    /// The store kept answering with a redirectable error until the retry budget ran out.
-    /// Every retried error is a refusal, so nothing was written; the cluster is unhealthy or
-    /// the caller's budget is too small for how long it takes to elect a leader.
+    /// The call kept failing in a way worth trying again until the retry budget ran out. The
+    /// cluster is unhealthy, or the caller's budget is too small for how long it takes to
+    /// elect a leader.
+    ///
+    /// Nothing was written either way, but for two different reasons: a redirectable error is
+    /// a refusal, and the only other thing that is retried is a **read** whose answer was lost
+    /// ([`crate::retry::may_ask_again`]). `source` still decides
+    /// [`Error::changed_nothing`], which is the conservative answer rather than the exact one
+    /// — a read that exhausts on lost answers changed nothing, and this reports that it may
+    /// have. Callers that need the exact answer have the method and this type does not.
     #[error("gave up after {attempts} attempts: {source}")]
     RetriesExhausted {
         /// Calls made, the first attempt included.

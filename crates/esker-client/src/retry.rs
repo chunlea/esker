@@ -15,6 +15,19 @@
 //! them for the same reason `EpochNotMatch` does: it says the client's routing is stale and
 //! nothing else, and its repair is a cache refresh.
 //!
+//! # The other half of the rule: a lost answer to a question
+//!
+//! [`is_retryable`](ProtoError::is_retryable) is a property of the error alone, and it has to
+//! be — see [`classify`]. But the rule it comes from is about *writes*: a write may be re-sent
+//! only when the previous attempt provably did not commit. The mirror of that rule needs the
+//! method, and [`may_ask_again`] is where it lives: **a read may always be re-sent**, because
+//! asking again cannot change what the first attempt did.
+//!
+//! Without it, a read whose answer was lost — the peer stopped mid-call, the connection went —
+//! fails the caller outright, even though the region has two other replicas that could answer
+//! and the request could not have changed anything. That is a refusal manufactured out of a
+//! dropped packet.
+//!
 //! # The rule the retry set is derived from
 //!
 //! > A write may be re-sent only when the previous attempt provably did not commit.
@@ -39,7 +52,7 @@ use std::time::Duration;
 
 use esker_base::rng::Pcg32;
 
-use crate::wire::{ProtoError, Region, RequestOutcome};
+use crate::wire::{Method, ProtoError, Region, RequestOutcome};
 
 /// How many times a redirectable error is retried before it is returned to the caller.
 ///
@@ -223,6 +236,30 @@ pub fn classify(error: &ProtoError) -> Verdict {
         // lie.
         _ => Verdict::Surface,
     }
+}
+
+/// Whether an error [`classify`] said to surface is merely a **lost answer** that this method
+/// may ask for again.
+///
+/// This is the one rule that needs the method, and it is the mirror of the one the retryable
+/// set is derived from. A write may be re-sent only when the previous attempt provably did not
+/// commit, so an [`RequestOutcome::Unknown`] answer to a write is never re-sent: it becomes
+/// [`crate::Error::AmbiguousResult`] and the caller decides. A **read** is the opposite case
+/// and the reasoning is the whole of it: whatever the first attempt did or did not do, asking
+/// again does not change it, and the answer is the same answer. So it is asked again, of
+/// whichever peer the repaired route leads to.
+///
+/// The repair is [`Redirect::Leader`] with no hint. The peer that lost the answer is the peer
+/// that stopped, and forgetting the leader is what sends the next attempt somewhere else; an
+/// unknown leader still routes, because asking a follower is how the next hint is obtained.
+///
+/// It matters exactly when the cluster is losing nodes, which is when a client most needs its
+/// reads to work: `esker-store` answers a proposal stranded by a stopping peer with
+/// [`ProtoError::Closed`], and every read in flight to that peer gets the same treatment. One
+/// of those two is genuinely ambiguous and one is not, and this is what tells them apart.
+#[must_use]
+pub fn may_ask_again(method: Method, error: &ProtoError) -> bool {
+    !method.is_mutation() && error.outcome() == RequestOutcome::Unknown
 }
 
 #[cfg(test)]

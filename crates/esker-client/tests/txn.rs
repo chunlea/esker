@@ -1384,8 +1384,12 @@ fn an_unanswered_prewrite_is_ambiguous_and_resolvable() {
     );
 }
 
-/// A read that goes unanswered is *not* ambiguous: re-reading is always safe, so it comes back
-/// as a plain store error and the caller may simply ask again.
+/// A read that goes unanswered is *not* ambiguous: re-reading is always safe, whatever became
+/// of the first attempt.
+///
+/// So the client asks again itself rather than handing the caller a failure it would only have
+/// retried — `retry::may_ask_again`. What the caller finally sees is the budget running out,
+/// carrying the error that spent it, and never [`Error::AmbiguousResult`].
 #[test]
 fn an_unanswered_read_is_not_ambiguous() {
     let transport = Arc::new(FakeTransport::new());
@@ -1394,10 +1398,14 @@ fn an_unanswered_read_is_not_ambiguous() {
     }));
     let client = client(&transport);
     let txn = client.begin().unwrap();
-    assert!(matches!(
-        txn.get(b"k").unwrap_err(),
-        Error::Store(ProtoError::Timeout { .. })
-    ));
+    let error = txn.get(b"k").unwrap_err();
+    match &error {
+        Error::RetriesExhausted { source, .. } => {
+            assert!(matches!(**source, ProtoError::Timeout { .. }), "{source:?}");
+        }
+        other => panic!("expected the budget to run out, got {other:?}"),
+    }
+    assert!(transport.call_count() > 1, "the read was never asked again");
 }
 
 /// One region cache, one set of rules: a `RawClient` and a `TxnClient` sharing a router share

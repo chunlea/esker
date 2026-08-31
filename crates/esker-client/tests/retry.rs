@@ -16,7 +16,9 @@ use esker_client::clock::FakeClock;
 use esker_client::region_cache::{RegionResolver, Route, StaticRegion};
 use esker_client::retry::RetryPolicy;
 use esker_client::testing::{Call, FakeTransport, Matcher, Outcome, Rule};
-use esker_client::wire::{Epoch, Method, Peer, ProtoError, RawKvReq, RawKvResp, Region};
+use esker_client::wire::{
+    Epoch, Method, Peer, ProtoError, RawKvReq, RawKvResp, Region, RequestOutcome,
+};
 use esker_client::{ClientOptions, Error, RawClient};
 
 /// Store `n` hosts peer `n * 10`, so an assertion can tell the two apart at a glance.
@@ -340,16 +342,26 @@ fn a_key_outside_the_region_surfaces_and_still_clears_the_cache() {
 // What is never retried
 // ---------------------------------------------------------------------------------------
 
+/// Every error here is a **refusal**: the store answered, and its answer was no. There is
+/// nothing to ask again for, whatever the method was.
+///
+/// An error whose outcome is `Unknown` is a different thing and is not in this list — no answer
+/// came back at all, which for a read is worth asking again and for a write is not. The two
+/// tests below that rule are what cover those.
 #[test]
 fn a_non_retryable_error_surfaces_on_the_first_attempt() {
     for error in [
         ProtoError::invalid("empty key"),
-        ProtoError::corrupt("response", "bad crc"),
         ProtoError::Locked {
             lock_info: Bytes::from_static(b"lock"),
         },
         ProtoError::not_sent("connection refused"),
     ] {
+        assert_eq!(
+            error.outcome(),
+            RequestOutcome::NotApplied,
+            "{error:?} is not a refusal"
+        );
         let harness = harness();
         harness
             .transport
@@ -392,10 +404,47 @@ fn an_unanswered_write_is_ambiguous_and_is_never_re_sent() {
     assert_eq!(harness.transport.call_count(), 1, "the write was re-sent");
 }
 
-/// The other half of the same rule: re-reading is always safe, so an unanswered *read* has
-/// nothing ambiguous about it and is reported plainly.
+/// The other half of the same rule, and the reason it is a rule about the *method*: asking a
+/// read again cannot change what the first attempt did, so a read whose answer was lost is
+/// simply asked again — of a different peer, because the one that lost it is the one that
+/// stopped.
+///
+/// This is what stops a dropped packet from being manufactured into a refusal. A cluster
+/// losing a node is exactly when a client most needs its reads to work, and the region has two
+/// other replicas that could have answered.
 #[test]
-fn an_unanswered_read_is_not_reported_as_ambiguous() {
+fn a_read_whose_answer_was_lost_is_asked_again() {
+    let harness = harness();
+    harness.transport.script_all([
+        Rule::new(
+            Matcher::Any,
+            Outcome::Fail(ProtoError::Closed {
+                detail: "the Raft peer stopped".to_owned(),
+            }),
+        )
+        .times(1),
+        always(Outcome::Reply(RawKvResp::Get {
+            value: Some(Bytes::from_static(b"v")),
+        })),
+    ]);
+
+    let found = harness.client.get(b"k").expect("the second peer answered");
+    assert_eq!(found.as_deref(), Some(&b"v"[..]));
+    assert_eq!(
+        harness.transport.call_count(),
+        2,
+        "the read was not re-asked"
+    );
+}
+
+/// And it is bounded by the same budget as any other retry, and still surfaces the error that
+/// caused it rather than inventing one.
+///
+/// It is **not** `AmbiguousResult`: nothing about a read is ambiguous, whatever happened to the
+/// answer. That distinction is what `prompts/05-txn.md` is built on, and losing it here would
+/// lose it everywhere.
+#[test]
+fn a_read_that_never_gets_an_answer_exhausts_the_budget_and_says_why() {
     let harness = harness();
     harness
         .transport
@@ -403,10 +452,20 @@ fn an_unanswered_read_is_not_reported_as_ambiguous() {
             detail: "connection reset".to_owned(),
         })));
 
-    let error = harness.client.get(b"k").expect_err("no answer came back");
+    let error = harness
+        .client
+        .get(b"k")
+        .expect_err("no answer ever came back");
+    match &error {
+        Error::RetriesExhausted { attempts, source } => {
+            assert_eq!(*attempts, RetryPolicy::default().max_retries + 1);
+            assert!(matches!(**source, ProtoError::Closed { .. }), "{source:?}");
+        }
+        other => panic!("expected the budget to run out, got {other:?}"),
+    }
     assert!(
-        matches!(error, Error::Store(ProtoError::Closed { .. })),
-        "{error:?}"
+        !matches!(error, Error::AmbiguousResult { .. }),
+        "a read was called ambiguous"
     );
 }
 

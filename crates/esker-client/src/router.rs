@@ -41,7 +41,9 @@ use crate::clock::{Clock, SystemClock};
 use crate::error::{Error, Result};
 use crate::gate::Gate;
 use crate::region_cache::{RegionCache, RegionResolver, Route};
-use crate::retry::{CALL_TIMEOUT_MS, Jitter, Redirect, RetryPolicy, Verdict, classify};
+use crate::retry::{
+    CALL_TIMEOUT_MS, Jitter, Redirect, RetryPolicy, Verdict, classify, may_ask_again,
+};
 use crate::transport::StoreTransport;
 use crate::wire::{Body, Method, ProtoError, RequestHeader, RequestOutcome, Response};
 
@@ -238,31 +240,37 @@ impl Router {
                 }
             };
 
-            match classify(&error) {
-                Verdict::Surface => {
-                    self.on_terminal(&error, region_id, body.routing_key());
-                    return Err(terminal(error, method));
+            let repair = match classify(&error) {
+                Verdict::Retry(redirect) => Some(redirect),
+                // The one rule `classify` cannot state, because it needs the method: an answer
+                // that never came back may be asked for again when asking cannot change what
+                // the first attempt did. See `retry::may_ask_again` — a read, never a write.
+                Verdict::Surface if may_ask_again(method, &error) => {
+                    Some(Redirect::Leader { hint: None })
                 }
-                Verdict::Retry(redirect) => {
-                    self.repair(&redirect, region_id);
-                    if attempts > self.options.retry.max_retries {
-                        return Err(Error::RetriesExhausted {
-                            attempts,
-                            source: Box::new(error),
-                        });
-                    }
-                    let delay = self.jitter.apply(self.options.retry.backoff(attempts - 1));
-                    // Sleeping past the deadline only delays the same answer, so stop now and
-                    // say which failure the caller was waiting on.
-                    if self.clock.now() + delay >= deadline {
-                        return Err(Error::DeadlineExceeded {
-                            attempts,
-                            source: Some(Box::new(error)),
-                        });
-                    }
-                    self.clock.sleep(delay);
-                }
+                Verdict::Surface => None,
+            };
+            let Some(redirect) = repair else {
+                self.on_terminal(&error, region_id, body.routing_key());
+                return Err(terminal(error, method));
+            };
+            self.repair(&redirect, region_id);
+            if attempts > self.options.retry.max_retries {
+                return Err(Error::RetriesExhausted {
+                    attempts,
+                    source: Box::new(error),
+                });
             }
+            let delay = self.jitter.apply(self.options.retry.backoff(attempts - 1));
+            // Sleeping past the deadline only delays the same answer, so stop now and say
+            // which failure the caller was waiting on.
+            if self.clock.now() + delay >= deadline {
+                return Err(Error::DeadlineExceeded {
+                    attempts,
+                    source: Some(Box::new(error)),
+                });
+            }
+            self.clock.sleep(delay);
         }
     }
 
