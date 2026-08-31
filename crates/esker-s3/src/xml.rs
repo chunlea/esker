@@ -76,7 +76,7 @@ fn numeric_references(text: &str) -> String {
         match decoded {
             Some(ch) => out.push(ch),
             // Malformed or unrepresentable: keep the source text, do not guess.
-            None => out.push_str(&rest[at..at + 2 + end + 1]),
+            None => out.push_str(&rest[at..=at + 2 + end]),
         }
         rest = &after[end + 1..];
     }

@@ -19,7 +19,7 @@
 //! cargo test -p esker-s3 --test minio -- --ignored --test-threads=1
 //! ```
 //!
-//! Port 19000 rather than 9000 so it cannot collide with a MinIO somebody is already running.
+//! Port 19000 rather than 9000 so it cannot collide with a `MinIO` somebody is already running.
 //! `ESKER_S3_ENDPOINT`, `ESKER_S3_BUCKET`, `ESKER_S3_KEY` and `ESKER_S3_SECRET` override the
 //! defaults, so the same tests run against any S3-compatible endpoint reachable over HTTP.
 //!
@@ -58,7 +58,7 @@ fn client(prefix: &str) -> S3Client {
 /// Bytes that compress badly and differ at every offset, so a ranged read that returns the
 /// wrong window is caught by value and not only by length.
 fn payload(len: usize) -> Vec<u8> {
-    let mut rng = esker_base::rng::Pcg32::new(0x5153_5f74_6965_72, 1);
+    let mut rng = esker_base::rng::Pcg32::new(0x0051_535f_7469_6572, 1);
     let mut bytes = vec![0u8; len];
     rng.fill_bytes(&mut bytes);
     bytes
@@ -162,7 +162,7 @@ fn awkward_keys_survive_the_round_trip() {
 }
 
 /// A listing longer than one page. `ListObjectsV2` caps a page at 1,000 keys, so this uses the
-/// `max-keys` MinIO honours by uploading enough objects to force a continuation — the loop that
+/// `max-keys` `MinIO` honours by uploading enough objects to force a continuation — the loop that
 /// follows the token is otherwise never executed by any test.
 #[test]
 #[ignore = "needs a MinIO container and uploads 1,050 objects; see the module docs"]
