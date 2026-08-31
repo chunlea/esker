@@ -1090,3 +1090,14 @@ other 72 are registered in §9, and the thirteen of them that sit on the query p
 concrete piece of work this plan has, because each is a statement a user could write today and get a
 syntax error for where the contract promises `0A000`. (Both numbers moved later, when the `ALTER
 TABLE` sweep took the corpus to 402.)
+
+## 12. Milestones decided here and built later
+
+Designs that are settled, written down as ADRs, and deliberately not implemented in this phase.
+Each is a phase of its own; what they have in common is that all three are cheap to *design* now
+and expensive to retrofit if the formats they need are chosen without them in mind — which is the
+reason they are here rather than in a notebook.
+
+| # | Milestone | ADR | What has to exist first | Size, honestly |
+|---|---|---|---|---|
+| M1 | **Distributed online schema change** — `CREATE INDEX` without blocking, and the door to `DROP COLUMN` and type changes | [0020](../adr/0020-online-schema-change.md) | a schema lease published by PD; per-column and per-index states in the catalog | a phase. The state machine is small; the lease is the hard part, because it must stop a node that believes it is healthy |

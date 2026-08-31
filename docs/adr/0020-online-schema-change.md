@@ -1,0 +1,174 @@
+# 0020 — Distributed online schema change
+
+Status: **design only, accepted as the plan of record.** No code. It names the states, the rule
+that makes them safe, and what each crate has to grow; the milestone is in
+`docs/plans/phase-6a.md` §12. See [ADR 0019](0019-a-row-says-how-many-columns-it-has.md) (the row
+format this rests on), `crates/esker-sql/src/catalog/`, `docs/txn-spec.md` §5 and §7.
+
+## Context
+
+`ALTER TABLE ADD COLUMN` of a nullable column landed as one catalog write with no row rewritten
+and no staging at all. That is not a general result and must not be read as one, so this ADR starts
+by saying exactly why that one change was allowed to be instantaneous — because the same argument
+is what shows that nothing else is.
+
+Every node caches table definitions and reads the catalog through a transaction, so a definition
+belongs to a snapshot. But **snapshot isolation does not order a schema change against a
+concurrent writer.** The dangerous shape is this, and it is the shape every rule below exists to
+close:
+
+```text
+T1  begin at ts=100, reads the catalog: table t has one index
+DDL commits at ts=110: t now has two
+T1  inserts a row at ts=120, writing one index entry, because that is what its schema says
+```
+
+`T1` never *wrote* the catalog, it only read it, and Percolator detects write-write conflicts
+(`docs/txn-spec.md` §5) — so nothing conflicts and both transactions commit. The second index is
+now missing an entry for a row that exists. Making writers write the catalog version key would
+close it and would also serialise the entire cluster behind one key, which is not a trade anybody
+should take.
+
+### Why nullable `ADD COLUMN` escapes it
+
+Run the same interleaving with a column instead of an index. `T1` writes a two-column row after
+the table became three columns. A later reader with the three-column schema decodes it and pads the
+third to NULL (ADR 0019), which is the same answer it would have given if `T1` had known about the
+column and left it NULL. And the reverse cannot happen: a reader whose catalog view predates the
+`ALTER` has a snapshot below the DDL's commit ts, so it cannot see any row written by a transaction
+that started above it.
+
+So a nullable `ADD COLUMN` is safe in one step for a reason that is a property of the *format*, not
+of the protocol: **both schemas read every row the other writes, identically.** That is the
+condition, and it is worth stating as one because it is the exception. `ADD INDEX`, `DROP COLUMN`,
+`ADD COLUMN` with a `DEFAULT` that must be materialised, a type change and `DROP INDEX` all fail
+it, each in its own direction, and each therefore needs the protocol below.
+
+## Decision: F1's four states, with our catalog as the schema store
+
+Every index and every column carries a **state** alongside its definition, and a schema change
+moves it one state at a time. The states, for something being *added* (a removal runs them
+backwards):
+
+| State | Reads | Inserts / updates | Deletes |
+|---|---|---|---|
+| **absent** | no | no | no |
+| **delete-only** | no | no | **yes** — removes the entry if one is there |
+| **write-only** | no | **yes** | yes |
+| **public** | **yes** | yes | yes |
+
+Between write-only and public there is a **backfill**: entries for the rows that predate
+write-only.
+
+### What each intermediate state prevents, concretely
+
+The states are not ceremony. Each one exists because the pair of states on either side of it is
+safe together and the pair you would get by skipping it is not. Take `CREATE INDEX i ON t (a)` with
+two nodes, A ahead and B behind.
+
+**Skip delete-only** (absent → write-only). A is write-only and inserts row `r`, writing index
+entry `e`. B is still absent and deletes `r`; knowing nothing of `i`, it leaves `e`. Now `e` points
+at a row that is not there, and the moment the index goes public a scan through it returns a row
+the table does not contain — a phantom, produced by a query the user would call correct.
+Delete-only exists so that *every* node removes entries before *any* node creates them.
+
+**Skip write-only** (delete-only → public). B, in delete-only, inserts a row and writes no entry.
+A, public, answers `SELECT ... WHERE a = ...` from the index and does not find it. The row exists
+and the query says it does not. Write-only exists so that *every* node maintains the index before
+*any* node trusts it.
+
+**Skip the backfill** (write-only → public with the old rows unindexed). Every row written before
+write-only is invisible to an index scan, which is the same wrong answer as above with a wider
+blast radius. The backfill exists so that the index is *complete* before it is *trusted*.
+
+These are the same three anomalies for a column being dropped, read backwards: a column that goes
+public → absent in one step is read by a node that still thinks it is there, out of rows a node
+that thinks it is gone has already rewritten without it.
+
+## The rule that makes one state at a time enough
+
+**At most two adjacent states may be in use in the cluster at any instant.** That is F1's
+two-version invariant, and everything below is how we get it out of machinery that already exists.
+
+**A cached schema has a lease.** A node may answer from a cached definition only while its lease is
+unexpired; past that it must re-read the catalog version before it serves anything. Today's cache
+(`crate::catalog`) already discards on a version change and re-reads per transaction — what it does
+not have is a *deadline* by which a node is guaranteed to have noticed. The lease is that deadline,
+and it is the one new safety property this needs.
+
+**A schema-change step waits longer than a lease plus the longest transaction.** Then no
+transaction can still be running under a state two steps behind. Both bounds are already published
+by PD and already enforced:
+
+* a **writing** transaction's lifetime is bounded by its lock TTL — past it a resolver rolls the
+  transaction back (`docs/txn-spec.md` §5.2), so its writes cannot land;
+* a **read-only** transaction's lifetime is bounded by the **GC safepoint**: a read at a ts below
+  the safepoint is refused (§7). The safepoint distance is the retention window of
+  [ADR 0021](0021-time-machine.md), which makes the travel window and the maximum stale-schema
+  window the same number — worth knowing before either is tuned.
+
+So a step interval of `lease + max(lock TTL, safepoint distance)` is sufficient, and PD is where
+that arithmetic belongs because PD already owns both inputs.
+
+**A schema-change step is itself an ordinary transaction**, so two concurrent schema changes on one
+table conflict on the catalog version key and one retries — which is the serialisation the catalog
+already has (`crate::catalog::bump_version`) and the reason it is not a bottleneck worth removing.
+
+**A stale reader is safe without a lease, and a stale writer is not.** This is worth separating,
+because it is what tells us the lease is about *writes*. A transaction's catalog read is at its own
+snapshot, so a reader always sees a schema consistent with the rows it can see. It is the writer
+that can act on a schema older than the one the cluster has moved to, and the states are what make
+that harmless for one step's worth of staleness.
+
+## The backfill is ordinary transactions
+
+Nothing new. The backfill scans the table's row range and writes index entries with the same
+`scan`/`put`/`commit` the executor already uses (`crate::backend`), in **many small transactions
+rather than one**: a single transaction over a large table would hold locks for its whole duration,
+conflict with everything, and exceed the lock TTL that the step interval above depends on.
+
+So it is a resumable job: a batch is `[cursor, cursor + n)` of the row range, one transaction per
+batch, and the cursor is durable so a node that dies resumes rather than restarts. Two properties
+make it safe to run concurrently with live traffic, and both are already true:
+
+* it runs while every node is at **write-only**, so a row written or deleted during the backfill is
+  maintained by its own writer. The backfill and the writer may both write the same entry;
+  identical values, and a lost race is an ordinary conflict-and-retry.
+* a `UNIQUE` index whose backfill meets a duplicate fails the whole change with `23505`, exactly as
+  `CREATE INDEX` does today over rows that already violate it — which is the one place a schema
+  change can fail on *data* rather than on a conflict, and the user has to be told which row.
+
+`CREATE INDEX` today does this in one transaction inside the statement (`exec::ddl::backfill`) and
+is honest about it: it is `TODO(post-v1)` for a table large enough to matter. The staged protocol
+is how that TODO closes.
+
+## What each crate has to grow
+
+* **`esker-sql`** — the bulk of it. A `state` on every `IndexDef` and `ColumnDef` plus the schema
+  version it entered (the `TableDef::schema_version` field ADR 0019 added is what these hang from);
+  the planner refusing to choose a non-public index; the DML maintaining write-only and delete-only
+  indexes on insert, update and delete; the job that drives the states and the backfill; and
+  `CREATE INDEX` becoming a job rather than a statement that finishes.
+* **`esker-pd`** — the step clock. It already publishes the GC safepoint and already schedules
+  operators (`crates/esker-pd/src/schedule.rs`), and a schema-change job is the same shape: durable
+  state, a step it may take when a precondition holds, and a report. The schema **lease** is also
+  PD's to publish, for the same reason the safepoint is: it is a cluster-wide number with one
+  writer.
+* **`esker-proto`** — the messages PD needs to hand a schema-change job out and collect its
+  progress, and the lease in whatever PD already sends nodes periodically.
+* **`esker-client`** — nothing. The backfill is `TxnClient` used the way everything else uses it.
+* **`esker-store`, `esker-txn`, `esker-engine`** — nothing. Every layer below the catalog is
+  byte-opaque (`CLAUDE.md` invariant 7) and a schema change is keys and values like any other.
+
+The honest size: this is a phase of its own, not a unit. The part that is genuinely hard is not the
+state machine — it is four states and a table — but the lease, because a lease is a liveness
+mechanism with a safety consequence, and the failure it has to survive is a node that stops hearing
+from PD and keeps serving writes. That node has to *stop*, and stopping a node that believes it is
+healthy is the thing distributed systems are worst at.
+
+## What is deliberately not decided here
+
+The **DDL surface**. `DROP COLUMN`, `ALTER COLUMN TYPE` and `CREATE INDEX CONCURRENTLY` stay
+`0A000` naming themselves until this exists, and which of them lands first is a scheduling
+question, not an architectural one. `DROP COLUMN` additionally needs a row format that carries
+column *identity* rather than a count, which ADR 0019 names as a future version 3.
