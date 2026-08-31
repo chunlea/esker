@@ -1,0 +1,220 @@
+# Where NULL sits, on every type, in both directions, with the default and with both overrides.
+#
+# `nulls.slt` is about what a NULL does to a *predicate*; this is about what it does to a *sort*.
+# The two are separate rules and only one of them is three-valued: in a `WHERE`, NULL is neither
+# true nor false and the row is dropped; in an `ORDER BY`, NULL is the largest value there is and
+# the row is kept. Nothing about the first tells you the second.
+#
+# Every ordering here was read off a real PostgreSQL 19 with `ORDER BY ... COLLATE "C"` for text --
+# see select.slt for why the collation is the one divergence.
+
+statement ok
+CREATE TABLE o (id int8 PRIMARY KEY, t text, n int8, d double precision, b bool, y bytea, ts timestamptz)
+
+# tag: INSERT 0 5
+statement ok
+INSERT INTO o VALUES
+  (1, '',   1,    1.0,  true,  '\x',    '2024-01-01 00:00:00+00'),
+  (2, 'a',  NULL, NULL, NULL,  NULL,    NULL),
+  (3, NULL, 2,    2.0,  false, '\x00',  '2024-01-02 00:00:00+00'),
+  (4, ' ',  NULL, NULL, true,  '\xff',  NULL),
+  (5, 'A',  3,    -0.0, NULL,  NULL,    'infinity')
+
+# --- the default: NULLS LAST ascending, NULLS FIRST descending -------------------------------
+#
+# That is one rule, not two. NULL is the largest value, and `DESC` reverses the order it sits in
+# exactly as it reverses everything else.
+
+query I
+SELECT n FROM o ORDER BY n, id
+----
+1
+2
+3
+NULL
+NULL
+
+query I
+SELECT n FROM o ORDER BY n DESC, id
+----
+NULL
+NULL
+3
+2
+1
+
+# --- and both overrides, in both directions --------------------------------------------------
+
+query I
+SELECT n FROM o ORDER BY n NULLS FIRST, id
+----
+NULL
+NULL
+1
+2
+3
+
+query I
+SELECT n FROM o ORDER BY n DESC NULLS LAST, id
+----
+3
+2
+1
+NULL
+NULL
+
+query I
+SELECT n FROM o ORDER BY n ASC NULLS LAST, id
+----
+1
+2
+3
+NULL
+NULL
+
+query I
+SELECT n FROM o ORDER BY n DESC NULLS FIRST, id
+----
+NULL
+NULL
+3
+2
+1
+
+# --- every type puts its NULLs in the same place ----------------------------------------------
+#
+# The rule is about NULL, not about the type, and a type whose values sort by different bytes must
+# not put its NULLs anywhere else.
+
+# DIVERGES from PostgreSQL in the `A`/`a` pair only, and for the reason select.slt already gives:
+# this is byte order, which is PostgreSQL's `COLLATE "C"`, and the server this was checked against
+# has an en_US.utf8 database and returns `a` before `A`. Every other row here agrees, NULL's
+# position included.
+#
+# The possibly-empty column goes first, and never last. A single-column row holding `''` renders
+# as a blank line, and a blank line is what ends an expected block -- so a `----` block cannot
+# express one at the end of a row. That is the third limitation of this file format the corpus has
+# run into, after the whitespace join and NULL sorting as the letters `NULL`; all three are the
+# format's and none of them is the server's.
+query TI
+SELECT t, id FROM o ORDER BY t, id
+----
+	1
+ 	4
+A	5
+a	2
+NULL	3
+
+query R
+SELECT d FROM o ORDER BY d, id
+----
+0
+1
+2
+NULL
+NULL
+
+query B
+SELECT b FROM o ORDER BY b, id
+----
+f
+t
+t
+NULL
+NULL
+
+query X
+SELECT y FROM o ORDER BY y, id
+----
+\x
+\x00
+\xff
+NULL
+NULL
+
+query D
+SELECT ts FROM o ORDER BY ts, id
+----
+2024-01-01 00:00:00+00
+2024-01-02 00:00:00+00
+infinity
+NULL
+NULL
+
+# `infinity` is a value, not a missing one: it sorts above every finite instant and still below
+# NULL. A type that confused the two would put them adjacent.
+query D
+SELECT ts FROM o ORDER BY ts DESC, id
+----
+NULL
+NULL
+infinity
+2024-01-02 00:00:00+00
+2024-01-01 00:00:00+00
+
+# --- more than one key -------------------------------------------------------------------------
+#
+# The second key decides only where the first ties, and a NULL in the first key ties with another
+# NULL like any other equal pair.
+
+query I
+SELECT id FROM o ORDER BY n NULLS FIRST, id
+----
+2
+4
+1
+3
+5
+
+query I
+SELECT id FROM o ORDER BY n NULLS FIRST, id DESC
+----
+4
+2
+1
+3
+5
+
+# A NULL first key and a NULL second key: both tie, and the third key is what is left.
+query I
+SELECT id FROM o ORDER BY n NULLS FIRST, d NULLS FIRST, id
+----
+2
+4
+1
+3
+5
+
+# --- ties promise nothing ----------------------------------------------------------------------
+#
+# `ORDER BY n` leaves rows 2 and 4 tied, and neither PostgreSQL nor this node says which comes
+# first. `rowsort` is how the corpus says so; adding `, id` is how a query says so.
+
+query I rowsort
+SELECT id FROM o ORDER BY n
+----
+1
+2
+3
+4
+5
+
+query I
+SELECT id FROM o ORDER BY n, id
+----
+1
+3
+5
+2
+4
+
+# A `SELECT` with no `ORDER BY` at all promises even less -- not even that the storage order will
+# stay what it is today.
+query I rowsort
+SELECT id FROM o
+----
+1
+2
+3
+4
+5

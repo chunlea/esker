@@ -94,6 +94,7 @@ pub(crate) const FILES: &[(&str, &str)] = &[
     ("index.slt", include_str!("../slt/index.slt")),
     ("insert.slt", include_str!("../slt/insert.slt")),
     ("nulls.slt", include_str!("../slt/nulls.slt")),
+    ("ordering.slt", include_str!("../slt/ordering.slt")),
     (
         "rowsort_check.slt",
         include_str!("../slt/rowsort_check.slt"),
