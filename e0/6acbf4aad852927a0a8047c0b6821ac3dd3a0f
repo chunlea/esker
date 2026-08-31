@@ -1,0 +1,22 @@
+crates/esker-store/src/peer.rs
+  s_dc640bf0df4adb::t_2f8e297a9ea4f5 840-863,865,867,869
+  s_dc640bf0df4adb::t_ecc37014ff1072 2138-2141,2153-2243
+crates/esker-store/src/driver.rs
+  s_dc640bf0df4adb::t_b875bde7eb0ac7 224,234,256,266
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "e06acbf4aad852927a0a8047c0b6821ac3dd3a0f",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "claude-fable-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
