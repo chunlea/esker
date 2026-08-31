@@ -129,6 +129,31 @@ its own kind byte, readable by a layer that does not link `esker-sql`.
 'm' ++ "sql" ++ 'c' ++ tenant:u64 ++ id:u64   one table's columnar replication setting
 ```
 
+> **Amended (phase 8): the kind byte is `'l'`, not `'c'`.** By the time this was built `'c'` was
+> the *checkpoint's* — phase 6d took it, after this ADR was written and without knowing this
+> sketch existed. Two kinds sharing a byte is not a cosmetic clash: the layout's whole point is
+> that "one scan of the kind byte visits every setting", and a scan of `'c'` would have returned
+> checkpoints interleaved with columnar settings, to a placement driver that cannot tell them
+> apart because it does not link `esker-sql`.
+>
+> `'l'` is for the **learner** Decision 1 calls a columnar replica. `crates/esker-sql/src/catalog`
+> pins the layout with a golden that also asserts a checkpoint key falls *outside* a scan of the
+> columnar range — the collision itself is tested, rather than being avoided and then trusted.
+
+> **Amended (phase 8): PostgreSQL refuses this DDL, and no spelling of it would not be refused.**
+> The paragraph below says `ALTER TABLE ... SET (columnar_replicas = 1)` is "the storage-parameter
+> spelling PostgreSQL already parses". Measured against 19beta1 rather than assumed, it is not:
+> an unqualified custom parameter is `22023 unrecognized parameter "columnar_replicas"`, and an
+> arbitrary namespace is `22023 unrecognized parameter namespace "esker"` — only `toast` is known.
+> So there is no compatible spelling to choose, and accepting this one is a **deliberate
+> divergence** rather than a compatibility win. It is in the register at
+> `docs/plans/phase-6a.md` §10a with the others, and the capture is
+> `crates/esker-sql/tests/corpus/pg19_storage_parameters.txt`.
+>
+> The capture also found the asymmetry that reading would have missed: `RESET` of a parameter that
+> has never existed anywhere is **accepted**, while `SET` of the same name errors. `RESET` does not
+> validate names at all.
+
 Value: a version byte and the number of columnar learners wanted (`0` meaning none, which is also
 what an absent record means). Setting it does not bump the catalog version — it changes nothing
 about how a row is written or read — for the same reason retention does not. The DDL surface is

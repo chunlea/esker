@@ -1,0 +1,29 @@
+# What a real PostgreSQL 19beta1 does with a storage parameter -- the surface
+# `ALTER TABLE ... SET (columnar_replicas = N)` lands on (ADR 0022 Decision 5).
+#
+# Nothing here was written from the documentation. Every line was put to a running PostgreSQL
+# 19beta1 in the `esker-pg19` container with `\set VERBOSITY verbose`, and what is recorded is
+# either that it was accepted or the SQLSTATE and message it refused with.
+#
+#   statement <tab> ok                 PostgreSQL accepted it
+#   statement <tab> !SQLSTATE msg      PostgreSQL refused it
+#
+# THE ONE THAT READING WOULD HAVE GOT WRONG is the third: `RESET` of a parameter that has never
+# existed anywhere is **accepted**, while `SET` of the same name is an error. The asymmetry is not
+# symmetry with a hole in it -- `RESET` does not validate names at all.
+#
+# The consequence for us, and the reason this file exists: there is **no spelling of a custom
+# storage parameter that PostgreSQL 19 accepts.** An unqualified name is "unrecognized parameter",
+# and an arbitrary namespace is "unrecognized parameter namespace" -- only `toast` is known. So
+# `columnar_replicas` cannot be made compatible by choosing a better name, and this node accepting
+# it is a deliberate divergence rather than an oversight. Recorded in `docs/plans/phase-6a.md`
+# §10a with the others.
+
+ALTER TABLE t SET (columnar_replicas = 1)	!22023 unrecognized parameter "columnar_replicas"
+CREATE TABLE t (id int8) WITH (columnar_replicas = 1)	!22023 unrecognized parameter "columnar_replicas"
+ALTER TABLE t RESET (columnar_replicas)	ok
+ALTER TABLE t RESET (no_such_thing_at_all)	ok
+ALTER TABLE t SET (esker.columnar_replicas = 1)	!22023 unrecognized parameter namespace "esker"
+ALTER TABLE t SET (toast.columnar_replicas = 1)	ok
+ALTER TABLE t SET (autovacuum_enabled = false)	ok
+ALTER TABLE t SET (autovacuum_enabled = 'banana')	!22023 invalid value for boolean option "autovacuum_enabled": banana

@@ -422,8 +422,26 @@ pub(super) fn alter_table(
             // about how a row is written or read, and bumping would make every node in the cluster
             // discard its table cache to learn a number none of them uses. The collector picks it
             // up on its next pass, which is the only place it means anything.
+            // The columnar setting is not part of the table definition either, and for the same
+            // reason: it says how many *copies* the cluster keeps, not how a row is written or
+            // read. The placement driver acts on it; no reader of rows does, so no node's cached
+            // `TableDef` is stale because of it.
+            if let AlterTableAction::SetColumnarReplicas { replicas } = action {
+                match replicas {
+                    Some(replicas) => catalog::set_table_columnar_replicas(
+                        txn,
+                        executor.tenant,
+                        table.id,
+                        *replicas,
+                    ),
+                    None => {
+                        catalog::clear_table_columnar_replicas(txn, executor.tenant, table.id);
+                    }
+                }
+                continue;
+            }
             let AlterTableAction::SetRetention { retention_ms } = action else {
-                unreachable!("every action is one of the two")
+                unreachable!("every action is one of the three")
             };
             match retention_ms {
                 Some(retention_ms) => {

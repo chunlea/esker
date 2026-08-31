@@ -29,8 +29,8 @@ use crate::error::{Result, SqlError};
 use crate::parse::{Parsed, feature_name};
 use crate::plan;
 use crate::time_machine;
+use crate::value::PgDatum;
 use crate::value::{ColumnType, Datum};
-use crate::value::{PgDatum};
 
 impl Parsed {
     /// Lowers this statement into the plan types the executor runs, or names the construct that
@@ -189,6 +189,21 @@ fn lower_verb(query: &Query) -> Result<Option<plan::TimeMachineVerb>> {
                 "a target list on esker_schema_jobs() other than *",
             )?;
             return Ok(Some(plan::TimeMachineVerb::ListSchemaJobs));
+        }
+        if called == "esker_columnar_replicas" {
+            refuse_if(
+                !table.joins.is_empty(),
+                "a JOIN on esker_columnar_replicas()",
+            )?;
+            refuse_if(
+                select.selection.is_some(),
+                "a WHERE on esker_columnar_replicas()",
+            )?;
+            refuse_if(
+                !matches!(select.projection.as_slice(), [SelectItem::Wildcard(_)]),
+                "a target list on esker_columnar_replicas() other than *",
+            )?;
+            return Ok(Some(plan::TimeMachineVerb::ListColumnarReplicas));
         }
         if called == "esker_checkpoints" {
             // Nothing else may be attached: this returns what it returns, and a `WHERE` silently
@@ -466,6 +481,11 @@ fn lower_storage_parameters(
             "ALTER TABLE ... SET with more than one storage parameter",
         ));
     };
+    if key.value.eq_ignore_ascii_case("columnar_replicas") {
+        return Ok(plan::AlterTableAction::SetColumnarReplicas {
+            replicas: Some(lower_columnar_replicas(value)?),
+        });
+    }
     if !key.value.eq_ignore_ascii_case("retention") {
         return Err(SqlError::unsupported(format!(
             "the storage parameter {}",
@@ -534,6 +554,28 @@ fn default_not_constant(expr: &Expr) -> SqlError {
 
 fn default_not_constant_text(rendered: &str) -> SqlError {
     SqlError::unsupported(format!("DEFAULT {rendered}, which is not a constant"))
+}
+
+/// A columnar-replica count: a plain non-negative integer, and nothing else.
+///
+/// No interval grammar, no `'forever'`, no `DEFAULT` — it is a replica count, so the only thing
+/// it can be is a number. A `u8` because a table wanting more than 255 columnar copies is a
+/// configuration mistake rather than a number worth carrying, and refusing it by name is more
+/// use than storing it.
+fn lower_columnar_replicas(value: &Expr) -> Result<u8> {
+    let text = match value {
+        Expr::Value(value) => match &value.value {
+            Value::Number(digits, _) => digits.clone(),
+            Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => text.clone(),
+            other => other.to_string(),
+        },
+        other => other.to_string(),
+    };
+    text.parse::<u8>()
+        .map_err(|_| SqlError::InvalidParameterValue {
+            name: "columnar_replicas",
+            value: text.clone(),
+        })
 }
 
 /// A retention value: an interval, `'forever'`, or `DEFAULT`.

@@ -56,6 +56,13 @@ pub enum TimeMachineVerb {
     /// The `psql`-visible progress ADR 0020 asks for: a human watching a `CREATE INDEX
     /// CONCURRENTLY` sees the state advance, which is the only way to tell "slow" from "stuck".
     ListSchemaJobs,
+    /// `SELECT * FROM esker_columnar_replicas()` — which tables want a columnar copy, and how
+    /// many ([ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) Decision 5).
+    ///
+    /// A setting nobody can read back is a setting nobody can check, and this one is acted on by
+    /// a different process entirely — so seeing what the catalog says is the only way to tell
+    /// "PD has not got to it yet" from "the ALTER never landed".
+    ListColumnarReplicas,
     /// `SELECT esker_schema_step('<index>')` — take the next step of one job, and say what it did.
     ///
     /// **The step clock made explicit.** PD publishes the interval a step must wait

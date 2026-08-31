@@ -385,6 +385,27 @@ to fail regardless, never a wrong answer. Closing it properly needs PostgreSQL's
 the thing ADR 0014 declined to reimplement. Recorded as a known divergence; revisit only if a real
 client is confused by it.
 
+#### A deliberate one, added in phase 8: `columnar_replicas`
+
+`ALTER TABLE t SET (columnar_replicas = <n>)` is accepted here and refused by PostgreSQL 19 —
+`22023 unrecognized parameter "columnar_replicas"`. Unlike the two above, this one is *chosen*
+rather than inherited from `sqlparser`, so it is worth being explicit about what was checked
+before choosing it.
+
+There is no spelling that would not diverge. A custom storage parameter has to be either
+unqualified, which is `unrecognized parameter`, or namespaced, which is `unrecognized parameter
+namespace "esker"` — only `toast` is a namespace PostgreSQL knows. Both measured, both in
+`crates/esker-sql/tests/corpus/pg19_storage_parameters.txt`. So the choice was never "compatible
+or divergent", it was "which divergent spelling", and the storage-parameter shape is the one a
+PostgreSQL user already knows how to type and the one ADR 0022 Decision 5 asked for.
+
+The capture also recorded the asymmetry that reading the documentation would have missed:
+`RESET` of a parameter that has never existed anywhere is **accepted**, while `SET` of the same
+name errors. `RESET` does not validate names at all. So a client that sends
+`ALTER TABLE t RESET (columnar_replicas)` gets success from both servers, which is the one half of
+this surface where the two agree — for different reasons, and worth knowing before somebody reads
+the agreement as compatibility.
+
 ### Keeping the oracle, for acceptance
 
 The oracle is not a one-off. It is how this plan's remaining units get their evidence, and it is

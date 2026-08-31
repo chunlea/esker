@@ -812,6 +812,53 @@ pub fn drop_flashback(txn: &mut dyn Txn, tenant: u64, table_id: u64) {
     txn.delete(&record::flashback_key(tenant, table_id));
 }
 
+/// How many columnar replicas a table wants, or `None` when nothing has been said about it.
+///
+/// [ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) Decision 5. `None` and
+/// `Some(0)` mean the same thing to a reader — no columnar copy — and are kept apart only so that
+/// a table somebody explicitly turned off is distinguishable from one nobody ever turned on.
+pub fn table_columnar_replicas(txn: &dyn Txn, tenant: u64, table_id: u64) -> Result<Option<u8>> {
+    match txn.get(&record::columnar_key(tenant, table_id))? {
+        Some(bytes) => Ok(Some(record::decode_columnar(&bytes)?)),
+        None => Ok(None),
+    }
+}
+
+/// Sets how many columnar replicas a table wants.
+///
+/// **This does not bump the catalog version**, for the same reason a retention override does not:
+/// it changes nothing about how a row is written or read, so no node caching a `TableDef` is
+/// stale because of it, and ADR 0020's two-version invariant has nothing to say about it. What
+/// acts on it is the placement driver, which is not a reader of rows.
+pub fn set_table_columnar_replicas(txn: &mut dyn Txn, tenant: u64, table_id: u64, replicas: u8) {
+    txn.put(
+        &record::columnar_key(tenant, table_id),
+        &record::encode_columnar(replicas),
+    );
+}
+
+/// Forgets the setting entirely, which reads back the same as zero.
+pub fn clear_table_columnar_replicas(txn: &mut dyn Txn, tenant: u64, table_id: u64) {
+    txn.delete(&record::columnar_key(tenant, table_id));
+}
+
+/// The `[start, end)` key range holding one tenant's columnar settings, in table-id order.
+///
+/// One scan of it is the whole map, which is what a placement driver wants: it reads every
+/// table's wish once rather than asking per table.
+#[must_use]
+pub fn columnar_range(tenant: u64) -> (Vec<u8>, Vec<u8>) {
+    record::columnar_range(tenant)
+}
+
+/// One listed setting, out of its key and its value.
+pub fn decode_columnar(tenant: u64, key: &[u8], value: &[u8]) -> Result<(u64, u8)> {
+    Ok((
+        record::columnar_table_id(tenant, key)?,
+        record::decode_columnar(value)?,
+    ))
+}
+
 /// Sets the retention override for one table, in milliseconds.
 ///
 /// It does **not** bump the catalog version, and that is deliberate. Retention changes nothing
@@ -1443,6 +1490,63 @@ mod tests {
         assert!(
             view.table("accounts").unwrap().is_none(),
             "a table nobody committed came back from the cache"
+        );
+    }
+
+    /// The golden for a columnar-replica record, and for the kind byte that is **not** the one
+    /// ADR 0022 sketched.
+    ///
+    /// The placement driver reads these bytes from a crate that does not link this one, exactly
+    /// as the collector reads a retention override, so the layout is a contract between two
+    /// layers rather than an implementation detail of either.
+    ///
+    /// ADR 0022 Decision 5 wrote the key as `'m' ++ "sql" ++ 'c'`. By the time it was built `'c'`
+    /// was the checkpoint's — phase 6d took it first — and two kinds sharing a byte is one scan
+    /// returning the other's records. This pins `'l'`, and it pins that the two ranges do not
+    /// overlap, because that is the failure the collision would have caused.
+    #[test]
+    fn a_columnar_record_is_a_version_and_a_count_under_its_own_kind_byte() {
+        let encoded = record::encode_columnar(2);
+        assert_eq!(
+            hex(&encoded),
+            concat!(
+                "03", // catalog format version
+                "02", // two columnar replicas
+            )
+        );
+        assert_eq!(record::decode_columnar(&encoded).unwrap(), 2);
+
+        let key = record::columnar_key(1, 7);
+        assert_eq!(
+            hex(&key),
+            concat!(
+                "6d",               // 'm', the meta space
+                "73716c",           // "sql"
+                "6c",               // 'l', the learner ADR 0022 Decision 1 calls a columnar copy
+                "0000000000000001", // tenant 1, memcomparable
+                "0000000000000007", // table 7
+            )
+        );
+        assert_eq!(record::columnar_table_id(1, &key).unwrap(), 7);
+
+        // The collision that was avoided, asserted rather than remembered: a checkpoint key must
+        // not fall inside a scan of the columnar settings, and vice versa.
+        let (start, end) = record::columnar_range(1);
+        let checkpoint = record::checkpoint_key(1, "nightly");
+        assert!(
+            key >= start && key < end,
+            "the record is outside its own range"
+        );
+        assert!(
+            checkpoint < start || checkpoint >= end,
+            "a checkpoint falls inside the columnar scan -- the kind bytes collide"
+        );
+
+        // Zero is stored rather than meaning absent, so the two are distinguishable in history
+        // even though they read the same.
+        assert_eq!(
+            record::decode_columnar(&record::encode_columnar(0)).unwrap(),
+            0
         );
     }
 

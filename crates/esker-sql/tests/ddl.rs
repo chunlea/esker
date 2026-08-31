@@ -22,7 +22,7 @@ use esker_sql::parse::parse_statements;
 use esker_sql::pgwire::session::{Execute, Outcome, Params};
 use esker_sql::sqlstate;
 use esker_sql::value::ColumnType;
-use esker_sql::value::{PgType};
+use esker_sql::value::PgType;
 
 struct Node {
     backend: Arc<MemoryBackend>,
@@ -68,6 +68,20 @@ impl Node {
             last = self.executor.execute(&parsed, &Params::NONE)?;
         }
         Ok(last)
+    }
+
+    fn rows(&mut self, sql: &str) -> Vec<Vec<Option<String>>> {
+        match self.run(sql).unwrap() {
+            Outcome::Rows { rows, .. } => rows
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|value| value.map(|bytes| String::from_utf8(bytes).unwrap()))
+                        .collect()
+                })
+                .collect(),
+            other @ Outcome::Done { .. } => panic!("expected rows, got {other:?}"),
+        }
     }
 
     fn notices(&mut self) -> Vec<String> {
@@ -928,4 +942,81 @@ fn an_index_on_a_keyless_table_keeps_identical_values_apart() {
         panic!("not rows");
     };
     assert_eq!(rows.len(), 2);
+}
+
+// --- The columnar-replica flag (ADR 0022 Decision 5) -------------------------------------------
+
+/// The setting round-trips through the catalog and reads back on the listing surface.
+///
+/// Two properties in one test because they are one claim: a setting nobody can read back is a
+/// setting nobody can check, and this one is acted on by a *different process*, so the catalog
+/// readout is the only way to tell "PD has not got to it yet" from "the ALTER never landed".
+#[test]
+fn a_columnar_replica_count_is_set_and_read_back() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY, a int8)")
+        .unwrap();
+    node.run("CREATE TABLE u (id int8 PRIMARY KEY)").unwrap();
+
+    assert!(
+        node.rows("SELECT * FROM esker_columnar_replicas()")
+            .is_empty(),
+        "a table nobody has asked about should not be listed"
+    );
+
+    node.run("ALTER TABLE t SET (columnar_replicas = 2)")
+        .unwrap();
+    assert_eq!(
+        node.rows("SELECT * FROM esker_columnar_replicas()"),
+        [[Some("t".to_owned()), Some("2".to_owned())]]
+    );
+
+    // Zero is a legal setting and is *stored*, not deleted: "somebody turned it off" and "nobody
+    // ever turned it on" read the same to a placement driver and are different histories.
+    node.run("ALTER TABLE t SET (columnar_replicas = 0)")
+        .unwrap();
+    assert_eq!(
+        node.rows("SELECT * FROM esker_columnar_replicas()"),
+        [[Some("t".to_owned()), Some("0".to_owned())]]
+    );
+
+    node.run("ALTER TABLE u SET (columnar_replicas = 1)")
+        .unwrap();
+    let listed = node.rows("SELECT * FROM esker_columnar_replicas()");
+    assert_eq!(listed.len(), 2, "{listed:?}");
+}
+
+/// Setting it does **not** bump the schema version, which is the half that would be expensive to
+/// get wrong.
+///
+/// It changes nothing about how a row is written or read, so a node caching a `TableDef` is not
+/// stale because of it. Bumping would make every node in the cluster discard its table cache to
+/// learn a number none of them uses — and ADR 0020's two-version invariant is stated over that
+/// same number, so a spurious bump is not free there either.
+#[test]
+fn the_columnar_flag_does_not_bump_the_schema_version() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY)").unwrap();
+    let before = node.table("t").unwrap().schema_version;
+    node.run("ALTER TABLE t SET (columnar_replicas = 3)")
+        .unwrap();
+    assert_eq!(node.table("t").unwrap().schema_version, before);
+}
+
+/// A value that is not a replica count is refused **by name**, and the name is the parameter's.
+#[test]
+fn a_columnar_replica_count_that_is_not_a_number_is_refused() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY)").unwrap();
+    for bad in ["'banana'", "-1", "300", "'7d'"] {
+        let error = node
+            .run(&format!("ALTER TABLE t SET (columnar_replicas = {bad})"))
+            .unwrap_err();
+        assert_eq!(
+            error.sqlstate(),
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "{bad} gave {error}"
+        );
+        assert!(error.to_string().contains("columnar_replicas"), "{error}");
+    }
 }

@@ -37,8 +37,8 @@ use crate::pgwire::message::FieldDescription;
 use crate::pgwire::session::Outcome;
 use crate::plan::TimeMachineVerb;
 use crate::time_machine::{check_name, render, token};
-use crate::value::{ColumnType, Datum};
 use crate::value::PgDatum;
+use crate::value::{ColumnType, Datum};
 
 /// Runs one verb.
 pub(super) fn run(
@@ -53,6 +53,7 @@ pub(super) fn run(
         TimeMachineVerb::Diff { table, from, to } => diff(executor, table, from, to.as_deref()),
         TimeMachineVerb::Flashback { table, to } => run_flashback(executor, txn, table, to),
         TimeMachineVerb::ListSchemaJobs => list_jobs(executor, txn),
+        TimeMachineVerb::ListColumnarReplicas => list_columnar_replicas(executor, txn),
         TimeMachineVerb::SchemaStep { index } => schema_step(executor, txn, index),
     }
 }
@@ -199,6 +200,41 @@ fn run_flashback(
             return Ok(one_text("esker_flashback", changed.to_string()));
         }
     }
+}
+
+/// `SELECT * FROM esker_columnar_replicas()` — which tables want a columnar copy, and how many.
+///
+/// Two columns, because the question has two halves and an operator asking it is usually asking
+/// the second: the table, and the number the catalog holds. What the *cluster* has actually
+/// placed is PD's to report and deliberately not here — a catalog readout that guessed at
+/// placement would be a second source of truth about where a replica is.
+fn list_columnar_replicas(executor: &Executor, txn: &mut dyn Txn) -> Result<Outcome> {
+    let tenant = executor.tenant;
+    let (start, end) = catalog::columnar_range(tenant);
+    let mut settings = Vec::new();
+    for_each_page(txn, &start, &end, |_, page| {
+        for (key, value) in page {
+            settings.push(catalog::decode_columnar(tenant, key, value)?);
+        }
+        Ok(())
+    })?;
+    let mut rows = Vec::with_capacity(settings.len());
+    for (table_id, replicas) in settings {
+        let table = executor.table_by_id(txn, table_id)?;
+        rows.push(vec![
+            Some(table.name.clone().into_bytes()),
+            Some(replicas.to_string().into_bytes()),
+        ]);
+    }
+    let tag = format!("SELECT {}", rows.len());
+    Ok(Outcome::Rows {
+        fields: ["table", "columnar_replicas"]
+            .into_iter()
+            .map(|name| FieldDescription::computed(name, ColumnType::Text))
+            .collect(),
+        rows,
+        tag,
+    })
 }
 
 /// `SELECT * FROM esker_schema_jobs()` — every schema change in flight, and where each one is.

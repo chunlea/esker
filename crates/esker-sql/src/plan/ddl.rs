@@ -215,4 +215,20 @@ pub enum AlterTableAction {
         /// key holding zero are different things to the collector.
         retention_ms: Option<u64>,
     },
+    /// `SET (columnar_replicas = <n>)` — how many columnar copies of this table the cluster
+    /// should keep ([ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) Decision 5).
+    ///
+    /// The same storage-parameter shape as `retention` above and, like it, **not part of the
+    /// table definition**: it changes nothing about how a row is written or read, so it does not
+    /// bump the schema version. What acts on it is the placement driver.
+    ///
+    /// PostgreSQL refuses this spelling — measured, not assumed: `unrecognized parameter
+    /// "columnar_replicas"`, SQLSTATE 22023, and there is **no** custom spelling it accepts, since
+    /// an arbitrary namespace is refused too (`tests/corpus/pg19_storage_parameters.txt`). So this
+    /// is a deliberate divergence rather than a gap, and it is in the register with the others.
+    SetColumnarReplicas {
+        /// How many, or `None` for `RESET`, which forgets the setting. Zero is legal and means
+        /// the same as forgetting it to every reader.
+        replicas: Option<u8>,
+    },
 }

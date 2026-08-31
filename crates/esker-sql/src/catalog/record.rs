@@ -72,6 +72,14 @@ const KIND_ROW_ID: u8 = b'a';
 const KIND_CHECKPOINT: u8 = b'c';
 const KIND_JOB: u8 = b'j';
 const KIND_FLASHBACK: u8 = b'f';
+/// A table's columnar-replica count ([ADR 0022](../../../../docs/adr/0022-columnar-learner-replica.md)
+/// Decision 5).
+///
+/// **`'l'`, not the `'c'` the ADR sketched.** ADR 0022 wrote the key as `'m' ++ "sql" ++ 'c'`,
+/// and by the time it was built `'c'` was the checkpoint's — phase 6d took it first, and two
+/// kinds sharing a byte is one scan returning the other's records. `'l'` is for the **learner**
+/// the ADR's own Decision 1 calls a columnar replica, which is the next most honest letter.
+const KIND_COLUMNAR: u8 = b'l';
 
 /// Tags for [`ColumnType`] as stored. Ours rather than PostgreSQL's OIDs, because these are a
 /// format we own and must never move; the OIDs stay on the wire where they belong.
@@ -209,6 +217,65 @@ pub(super) fn decode_retention(bytes: &[u8]) -> Result<u64> {
     let retention = reader.u64_le()?;
     reader.finish()?;
     Ok(retention)
+}
+
+/// `'m' ++ "sql" ++ 'l' ++ tenant ++ table_id`. Absent for a table with no columnar copy, which
+/// is the same as a count of zero.
+///
+/// Laid out like the retention override above and for the same reason: ids are memcomparable, so
+/// one scan of `'m' ++ "sql" ++ 'l'` visits every table that wants one, in id order, which is
+/// what a placement driver reading the map wants.
+#[must_use]
+pub(super) fn columnar_key(tenant: u64, table_id: u64) -> Vec<u8> {
+    let mut suffix = [SQL, &[KIND_COLUMNAR]].concat();
+    codec::encode_u64(tenant, &mut suffix);
+    codec::encode_u64(table_id, &mut suffix);
+    prefix::meta_key(&suffix)
+}
+
+/// The `[start, end)` range holding one tenant's columnar settings, in table-id order.
+#[must_use]
+pub(super) fn columnar_range(tenant: u64) -> (Vec<u8>, Vec<u8>) {
+    let mut suffix = [SQL, &[KIND_COLUMNAR]].concat();
+    codec::encode_u64(tenant, &mut suffix);
+    let start = prefix::meta_key(&suffix);
+    let mut end = start.clone();
+    end.push(0xFF);
+    (start, end)
+}
+
+/// The table id out of a columnar key.
+pub(super) fn columnar_table_id(tenant: u64, key: &[u8]) -> Result<u64> {
+    let prefix = columnar_key(tenant, 0);
+    let at = prefix.len() - 8;
+    let tail = key
+        .get(at..)
+        .ok_or_else(|| corrupt("a columnar key with no table id"))?;
+    let (id, rest) = codec::decode_u64(tail).map_err(|error| corrupt(error.to_string()))?;
+    if !rest.is_empty() {
+        return Err(corrupt("bytes after a columnar key's table id"));
+    }
+    Ok(id)
+}
+
+/// How many columnar replicas a table wants, behind the same version byte as every other record.
+///
+/// A `u8` because the count is a replica count and a table wanting more than 255 columnar copies
+/// is a configuration error rather than a number to carry. Zero is legal and means the same as an
+/// absent record; `ALTER TABLE ... SET (columnar_replicas = 0)` writes it rather than deleting,
+/// so that "somebody turned it off" and "nobody ever turned it on" are the same *answer* without
+/// being the same *history*.
+#[must_use]
+pub(super) fn encode_columnar(replicas: u8) -> Vec<u8> {
+    vec![CATALOG_FORMAT_VERSION, replicas]
+}
+
+/// Reads a columnar-replica count back.
+pub(super) fn decode_columnar(bytes: &[u8]) -> Result<u8> {
+    let mut reader = Reader::new(bytes)?;
+    let replicas = reader.u8()?;
+    reader.finish()?;
+    Ok(replicas)
 }
 
 /// `'m' ++ "sql" ++ 'c' ++ tenant ++ name`. A checkpoint, absent until somebody names one.
@@ -656,6 +723,15 @@ impl<'a> Reader<'a> {
             1 => Ok(true),
             other => Err(corrupt(format!("flag byte {other} is neither 0 nor 1"))),
         }
+    }
+
+    fn u8(&mut self) -> Result<u8> {
+        let (head, rest) = self
+            .bytes
+            .split_first()
+            .ok_or_else(|| corrupt("a catalog record ends inside a byte"))?;
+        self.bytes = rest;
+        Ok(*head)
     }
 
     fn u64_le(&mut self) -> Result<u64> {
