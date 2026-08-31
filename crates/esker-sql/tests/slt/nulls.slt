@@ -1,0 +1,122 @@
+# Three-valued logic, on its own, because it is the thing most likely to be subtly wrong and the
+# thing a wrong answer is hardest to notice in.
+#
+# Every row here was checked against a real PostgreSQL 19.
+
+statement ok
+CREATE TABLE n (id int8 PRIMARY KEY, a int8, b int8, t text, f bool)
+
+# tag: INSERT 0 5
+statement ok
+INSERT INTO n VALUES (1, 1, 1, 'x', true), (2, 1, NULL, NULL, false),
+                     (3, NULL, 1, 'x', NULL), (4, NULL, NULL, NULL, NULL), (5, 2, 2, 'y', true)
+
+# A comparison with a NULL operand is unknown, and unknown does not keep a row.
+query I
+SELECT id FROM n WHERE a = b ORDER BY id
+----
+1
+5
+
+query I
+SELECT id FROM n WHERE a <> b ORDER BY id
+----
+
+query I
+SELECT id FROM n WHERE a < b OR a > b ORDER BY id
+----
+
+# IS NULL is the only thing that can see one.
+query I
+SELECT id FROM n WHERE a IS NULL ORDER BY id
+----
+3
+4
+
+query I
+SELECT id FROM n WHERE a IS NOT NULL AND b IS NULL ORDER BY id
+----
+2
+
+# NOT of unknown is unknown, so it drops the row rather than keeping it.
+query I
+SELECT id FROM n WHERE NOT (a = 1) ORDER BY id
+----
+5
+
+query I
+SELECT id FROM n WHERE NOT (a IS NULL) ORDER BY id
+----
+1
+2
+5
+
+# AND: a definite false settles it whatever the other side is.
+query I
+SELECT id FROM n WHERE a = 1 AND id = 99
+----
+
+query I
+SELECT id FROM n WHERE a = 99 AND b = 1 ORDER BY id
+----
+
+# OR: a definite true settles it.
+query I
+SELECT id FROM n WHERE a = 99 OR id = 3
+----
+3
+
+query I
+SELECT id FROM n WHERE a = 1 OR b = 1 ORDER BY id
+----
+1
+2
+3
+
+# A boolean column is a predicate on its own, and NULL in it is unknown like any other.
+query I
+SELECT id FROM n WHERE f ORDER BY id
+----
+1
+5
+
+query I
+SELECT id FROM n WHERE NOT f ORDER BY id
+----
+2
+
+# Nesting: unknown propagates outwards through every connective.
+query I
+SELECT id FROM n WHERE (a = 1 AND b = 1) OR (t IS NULL AND f IS NULL) ORDER BY id
+----
+1
+4
+
+# NULL sorts last ascending and first descending, on every type.
+query T
+SELECT t FROM n ORDER BY t, id
+----
+x
+x
+y
+NULL
+NULL
+
+query T
+SELECT t FROM n ORDER BY t DESC, id
+----
+NULL
+NULL
+y
+x
+x
+
+# Two keys: the second only decides where the first ties, NULLs included.
+query I
+SELECT id FROM n ORDER BY a NULLS FIRST, b NULLS FIRST
+----
+4
+3
+2
+1
+5

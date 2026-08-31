@@ -1,0 +1,173 @@
+# The planner's three rules, and the property that matters more than any of them: whichever path is
+# chosen, the answer is the same.
+#
+# A pushdown that is subtly too tight returns fewer rows and nothing reports it, so every predicate
+# here is checked for the rows it returns as well as for the plan it produces.
+#
+# DIVERGES from PostgreSQL, deliberately, in the `EXPLAIN` blocks only. PostgreSQL's plan output
+# carries cost estimates and its own node names; there is no cost model here, so there are none.
+# What ours prints is the access path and the condition, which is the part a user changes their
+# schema over. Every `query I` in this file is checked against a real PostgreSQL 19 and agrees.
+
+statement ok
+CREATE TABLE p (id int8 PRIMARY KEY, e text, n int8)
+
+# tag: INSERT 0 5
+statement ok
+INSERT INTO p VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30), (4, 'd', 40), (5, NULL, 50)
+
+statement ok
+CREATE UNIQUE INDEX p_e_key ON p (e)
+
+statement ok
+CREATE INDEX p_n_idx ON p (n)
+
+# Rule 1: the whole primary key, pinned.
+query T
+EXPLAIN SELECT * FROM p WHERE id = 3
+----
+Project (3 columns)
+  Filter
+    Condition: (id = 3)
+    Point Get on p
+
+query IT
+SELECT id, e FROM p WHERE id = 3
+----
+3	c
+
+# Rule 3: a unique index's whole key, pinned.
+query T
+EXPLAIN SELECT id FROM p WHERE e = 'c'
+----
+Project (1 columns)
+  Filter
+    Condition: (e = 'c')
+    Index Lookup on p
+      Index: p_e_key
+
+query I
+SELECT id FROM p WHERE e = 'c'
+----
+3
+
+# A non-unique index is not a lookup: two rows can share a value, so it is still a scan.
+query T
+EXPLAIN SELECT id FROM p WHERE n = 30
+----
+Project (1 columns)
+  Filter
+    Condition: (n = 30)
+    Seq Scan on p
+
+query I
+SELECT id FROM p WHERE n = 30
+----
+3
+
+# Rule 2: a bound on the primary key narrows the range instead of filtering the whole table. The
+# filter still runs: a range is not an equality, and the first key in it may not satisfy the bound.
+query T
+EXPLAIN SELECT id FROM p WHERE id > 3 ORDER BY n DESC LIMIT 2
+----
+Limit 2 Offset 0
+  Project (1 columns)
+    Sort
+      Keys: n DESC
+      Filter
+        Condition: (id > 3)
+        Seq Scan on p
+          Range: narrowed by the primary key
+
+query I
+SELECT id FROM p WHERE id > 3 ORDER BY id
+----
+4
+5
+
+query I
+SELECT id FROM p WHERE id >= 3 ORDER BY id
+----
+3
+4
+5
+
+query I
+SELECT id FROM p WHERE id < 3 ORDER BY id
+----
+1
+2
+
+query I
+SELECT id FROM p WHERE id <= 3 ORDER BY id
+----
+1
+2
+3
+
+query I
+SELECT id FROM p WHERE id > 1 AND id < 4 ORDER BY id
+----
+2
+3
+
+query I
+SELECT id FROM p WHERE 3 < id ORDER BY id
+----
+4
+5
+
+query I
+SELECT id FROM p WHERE id > 99
+----
+
+query I
+SELECT id FROM p WHERE id > 0 ORDER BY id
+----
+1
+2
+3
+4
+5
+
+# A constant under an OR is not required by the query, so it must not become an access path: the
+# rows the other branch matches are not in that key's range.
+query T
+EXPLAIN SELECT id FROM p WHERE id = 1 OR n = 30
+----
+Project (1 columns)
+  Filter
+    Condition: ((id = 1) OR (n = 30))
+    Seq Scan on p
+
+query I
+SELECT id FROM p WHERE id = 1 OR n = 30 ORDER BY id
+----
+1
+3
+
+query I
+SELECT id FROM p WHERE e = 'a' OR e = 'b' ORDER BY id
+----
+1
+2
+
+# A pinned key that matches nothing is still a point read, and still answers nothing.
+query I
+SELECT id FROM p WHERE id = 99
+----
+
+query I
+SELECT id FROM p WHERE e = 'nope'
+----
+
+# A NULL never pins anything: `= NULL` is unknown, so this is a scan that returns no rows.
+query I
+SELECT id FROM p WHERE e = NULL
+----
+
+# And the row whose indexed column is NULL is still there to be found another way.
+query I
+SELECT id FROM p WHERE e IS NULL
+----
+5

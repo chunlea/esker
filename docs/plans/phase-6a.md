@@ -478,8 +478,9 @@ its own gap register, and it would be longer.
   planner, the pull-based executor and `EXPLAIN` (6c); `UPDATE` and `DELETE` with their index
   maintenance (6d); bound parameters in both wire formats and inferred `ParameterDescription` (6e).
   All three obligations from §10a are discharged.
-- [x] 7 — the `.slt` harness: eight files, one per statement class, replayed against the real
-  server to check that they record PostgreSQL's answers and not ours
+- [x] 7 — the `.slt` harness: ten files, 228 directives, run by **two** runners (ours and the
+  `sqllogictest` crate) and replayed against the real server to check that they record
+  PostgreSQL's answers and not ours
 
 ## 10a. Handoff — where a fresh lane picks up
 
@@ -878,6 +879,50 @@ carry a `DIVERGES` comment with the reason beside them: a table with no primary 
 literal in an integer column, and `text` ordering by bytes. All three are the divergences already
 argued for in §6 and §11; what is new is that they are now the *complete* list, measured rather
 than believed.
+
+**Unit 7, second pass — the `sqllogictest` crate, and what it caught.**
+
+`CLAUDE.md`'s dev allowlist reserves `sqllogictest` for phase 6; it is now a dev-dependency and
+`tests/sqllogictest.rs` hands it the same `tests/slt/*.slt` our own runner reads. The point is the
+one the `psql` smoke test makes: **the other end was written by someone else.** A harness and its
+files are written together, and a harness that quietly means something slightly different by
+`statement error` will agree with its own files forever.
+
+Making that possible meant giving up a dialect. The corpus was ours — `statement ok INSERT 0 2`,
+`statement error 23505: message` — and is now the crate's exactly: `statement ok`, `statement count
+N`, `statement error (23505)`, which the crate resolves through a `error_sql_state` hook on the
+driver. One thing the format has no word for rides in a comment: `# tag:` names the command tag a
+statement must report, because `INSERT 0 3` and `UPDATE 3` are different answers to a client and
+`statement count 3` is the only word the format has for both. The crate's parser skips it.
+
+It disagreed on the first run, and about the *format* rather than the server, which is the more
+useful kind of disagreement to find. The crate's default validator normalises a result by splitting
+on whitespace and rejoining with single spaces, and that **cannot represent an empty string**: a row
+of `9223372036854775807`, `''`, `f` collapses to two visible columns and a run of spaces, and no
+expected line can be written that means "the second column is empty". `types.slt` stores an empty
+`text` on purpose, because an empty string that is not a NULL is precisely what the row encoding is
+built around. The runner is given a tab-joining validator — the crate's own extension point — and
+the limitation is recorded as the dialect's rather than worked around by deleting the values that
+expose it.
+
+A second test keeps the two honest about each other: both runners must count the same number of
+records in every file, so one of them cannot start skipping what the other checks.
+
+**Coverage.** Two files added, 228 directives across ten. `nulls.slt` is three-valued logic on its
+own — the thing most likely to be subtly wrong and hardest to notice a wrong answer in — and
+`access_paths.slt` is the planner's three rules, each checked for the *rows* it returns as well as
+the plan it produces, because a pushdown that is subtly too tight returns fewer rows and nothing
+reports it. Both were replayed against a real PostgreSQL 19 and agree with it completely.
+
+Writing `access_paths.slt` also found a real defect in a user-facing surface: `EXPLAIN` was printing
+`Condition: (column 0 = Integer(3))` — a position instead of the name the user typed, and a Rust
+`Debug` rendering of the literal. It now prints `Condition: (id = 3)`, with strings quoted, because
+`WHERE e = c` and `WHERE e = 'c'` mean different things and a plan that cannot tell them apart is a
+plan that cannot be checked against the query.
+
+The whole-corpus replay now accounts for every disagreement exactly: **30** in `unsupported.slt`
+(contract C2 by design), **5** `EXPLAIN` blocks (no cost model here, marked `DIVERGES` in the file),
+and **3** marked divergences. Nothing else.
 
 **Unit 2a.** The goldens are recorded, not written. A proxy between `psql` 18.6 and the
 PostgreSQL 19beta1 container logged both directions of five real sessions, and

@@ -4,7 +4,8 @@
 statement ok
 CREATE TABLE s (id int8 PRIMARY KEY, n int8, t text)
 
-statement ok INSERT 0 4
+# tag: INSERT 0 4
+statement ok
 INSERT INTO s VALUES (1, 10, 'a'), (2, NULL, 'B'), (3, 30, NULL), (4, 20, 'b')
 
 query IIT
@@ -120,10 +121,10 @@ SELECT id FROM s ORDER BY id LIMIT NULL
 3
 4
 
-statement error 2201W: LIMIT must not be negative
+statement error (2201W)
 SELECT id FROM s LIMIT -1
 
-statement error 2201X: OFFSET must not be negative
+statement error (2201X)
 SELECT id FROM s OFFSET -1
 
 # A quoted literal takes the column's type; a typed one that has no operator does not.
@@ -132,13 +133,13 @@ SELECT id FROM s WHERE n = '10'
 ----
 1
 
-statement error 42883: operator does not exist: text = integer
+statement error (42883)
 SELECT t FROM s WHERE t = 1
 
-statement error 42P01: relation "nope" does not exist
+statement error (42P01)
 SELECT * FROM nope
 
-statement error 42703
+statement error (42703)
 SELECT nope FROM s
 
 # ORDER BY can name a column the target list does not return.

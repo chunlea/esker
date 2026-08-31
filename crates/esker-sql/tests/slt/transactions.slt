@@ -4,7 +4,8 @@
 statement ok
 CREATE TABLE t (id int8 PRIMARY KEY, n int8)
 
-statement ok BEGIN
+# tag: BEGIN
+statement ok
 BEGIN
 
 statement ok
@@ -16,14 +17,16 @@ SELECT n FROM t WHERE id = 1
 ----
 10
 
-statement ok ROLLBACK
+# tag: ROLLBACK
+statement ok
 ROLLBACK
 
 query I
 SELECT n FROM t WHERE id = 1
 ----
 
-statement ok BEGIN
+# tag: BEGIN
+statement ok
 BEGIN
 
 statement ok
@@ -32,7 +35,8 @@ INSERT INTO t VALUES (1, 10)
 statement ok
 UPDATE t SET n = 11 WHERE id = 1
 
-statement ok COMMIT
+# tag: COMMIT
+statement ok
 COMMIT
 
 query I
@@ -50,7 +54,7 @@ CREATE TABLE gone (id int8 PRIMARY KEY)
 statement ok
 ROLLBACK
 
-statement error 42P01
+statement error (42P01)
 SELECT * FROM gone
 
 # Several statements in one block, committed together.
@@ -76,7 +80,7 @@ SELECT id FROM together
 
 # A statement outside a block is its own transaction, so a failure leaves nothing -- not even the
 # rows before the one that failed.
-statement error 23505
+statement error (23505)
 INSERT INTO t (id, n) VALUES (2, 1), (1, 1)
 
 query I

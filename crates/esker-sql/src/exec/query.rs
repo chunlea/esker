@@ -37,6 +37,9 @@ pub(super) struct Planned {
     pub(super) columns: Vec<(String, ColumnType)>,
     /// The table's name, for `EXPLAIN`.
     pub(super) table: String,
+    /// The table's column names, so `EXPLAIN` can print the names a user typed rather than the
+    /// positions the executor resolved them to.
+    pub(super) column_names: Vec<String>,
 }
 
 /// The access path and filter for every row of `table` a predicate matches — the half of a plan
@@ -122,6 +125,13 @@ pub(super) fn plan(select: &Select, tenant: u64, table: Option<&TableDef>) -> Re
         node,
         columns,
         table: table.map_or_else(|| "-".to_owned(), |table| table.name.clone()),
+        column_names: table.map_or_else(Vec::new, |table| {
+            table
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect()
+        }),
     })
 }
 

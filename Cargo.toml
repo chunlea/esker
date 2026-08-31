@@ -19,7 +19,7 @@ crossbeam-skiplist = { version = "0.1", default-features = false, features = ["s
 lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 # The one large dependency exception CLAUDE.md anticipated (docs/adr/0014-sqlparser.md).
 # `default-features = false` is load-bearing: the default `recursive-protection` feature pulls
-# `psm`, which compiles assembly through `cc`, and both are banned. esker-sql/src/parse.rs owns
+# `psm`, which compiles assembly through `cc`, and both are banned. esker-sql/src/parse/ owns
 # the stack-depth guard that feature would otherwise have provided.
 sqlparser = { version = "0.62.0", default-features = false, features = ["std"] }
 thiserror = { version = "2", default-features = false, features = ["std"] }
@@ -29,6 +29,11 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["s
 # --- dev-only allowlist ---
 criterion = { version = "0.5", default-features = false }
 proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }
+# The sqllogictest runner CLAUDE.md's dev allowlist names for phase 6. Dev-only, so the pure-Rust
+# rule does not reach it (deny.toml `exclude-dev`) and it costs nothing against the runtime budget.
+# It runs the same `tests/slt/*.slt` files esker-sql's own harness does; see that crate's
+# `tests/sqllogictest.rs` for why both exist.
+sqllogictest = { version = "0.29", default-features = false }
 stateright = { version = "0.30", default-features = false }
 tempfile = { version = "3", default-features = false }
 # --- workspace-internal ---

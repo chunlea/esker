@@ -163,7 +163,7 @@ impl Executor {
         let lines = match statement {
             Statement::Select(select) => {
                 let planned = self.plan_select(txn, select)?;
-                planned.node.explain(&planned.table)
+                planned.node.explain(&planned.table, &planned.column_names)
             }
             other => explain_lines(other),
         };
