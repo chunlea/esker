@@ -1,0 +1,23 @@
+crates/esker-columnar/tests/compression.rs
+  s_a54678688ddc33::t_6325ce27109bec 1-141
+crates/esker-columnar/tests/corpus.rs
+  s_a54678688ddc33::t_0e1aeb1b67d5bb 1-88
+crates/esker-columnar/tests/golden.rs
+  s_a54678688ddc33::t_b67af8b153efc7 1-207
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "7dc75bba727c09deb4865200981a68e238cd9f5b",
+  "prompts": {},
+  "sessions": {
+    "s_a54678688ddc33": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5f80ef1c-2a51-422f-beb6-dba4320b1635",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
