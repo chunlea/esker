@@ -1,0 +1,19 @@
+crates/esker-engine/src/fs/claim.rs
+  s_b3f6a712d611c9::t_3d6706d7122076 209-217,321-327
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a1b082a9c9e9ac996ab11712f5d87522c55c5173",
+  "prompts": {},
+  "sessions": {
+    "s_b3f6a712d611c9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "78adef9a-88ef-4c89-a340-f825de3d2ab7",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
