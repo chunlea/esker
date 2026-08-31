@@ -24,11 +24,11 @@
 //! C1 broken (`docs/plans/phase-6a.md` §1). The guard may only ever err towards accepting.
 
 use sqlparser::ast::{
-    BinaryOperator, ColumnOption, CreateTableOptions, DataType, DollarQuotedString,
-    ExactNumberInfo, Expr, GroupByExpr, Ident, IndexColumn, IndexType, LimitClause,
-    NullsDistinctOption, ObjectName, ObjectType, OffsetRows, OrderByKind, Query, SelectItem,
-    SetExpr, Statement, TableConstraint, TableFactor, TableObject, TimezoneInfo, UnaryOperator,
-    Value,
+    AssignmentTarget, BinaryOperator, ColumnOption, CreateTableOptions, DataType,
+    DollarQuotedString, ExactNumberInfo, Expr, FromTable, GroupByExpr, Ident, IndexColumn,
+    IndexType, LimitClause, NullsDistinctOption, ObjectName, ObjectType, OffsetRows, OrderByKind,
+    Query, SelectItem, SetExpr, Statement, TableConstraint, TableFactor, TableObject, TimezoneInfo,
+    UnaryOperator, Value,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::{Parser, ParserError};
@@ -825,6 +825,8 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
             Ok(plan::Statement::CreateTable(lower_create_table(create)?))
         }
         Statement::Query(query) => Ok(plan::Statement::Select(lower_query(query)?)),
+        Statement::Update(update) => Ok(plan::Statement::Update(lower_update(update)?)),
+        Statement::Delete(delete) => Ok(plan::Statement::Delete(lower_delete(delete)?)),
         Statement::Insert(insert) => Ok(plan::Statement::Insert(lower_insert(insert)?)),
         Statement::CreateIndex(create) => {
             Ok(plan::Statement::CreateIndex(lower_create_index(create)?))
@@ -1348,6 +1350,60 @@ fn table_factor(factor: &TableFactor) -> Result<String> {
         }
         other => Err(SqlError::unsupported(format!("the FROM item {other}"))),
     }
+}
+
+fn lower_update(update: &sqlparser::ast::Update) -> Result<plan::Update> {
+    refuse_if(update.from.is_some(), "UPDATE ... FROM")?;
+    refuse_if(update.returning.is_some(), "UPDATE ... RETURNING")?;
+    refuse_if(update.output.is_some(), "UPDATE ... OUTPUT")?;
+    refuse_if(update.or.is_some(), "UPDATE OR")?;
+    refuse_if(!update.order_by.is_empty(), "UPDATE ... ORDER BY")?;
+    refuse_if(update.limit.is_some(), "UPDATE ... LIMIT")?;
+    refuse_if(!update.optimizer_hints.is_empty(), "an optimizer hint")?;
+    refuse_if(!update.table.joins.is_empty(), "a JOIN in UPDATE")?;
+
+    let assignments = update
+        .assignments
+        .iter()
+        .map(|assignment| {
+            let name = match &assignment.target {
+                AssignmentTarget::ColumnName(name) => object_name(name)?,
+                other @ AssignmentTarget::Tuple(_) => {
+                    return Err(SqlError::unsupported(format!(
+                        "the assignment target {other}"
+                    )));
+                }
+            };
+            Ok((name, lower_expr(&assignment.value)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(plan::Update {
+        table: table_factor(&update.table.relation)?,
+        assignments,
+        filter: update.selection.as_ref().map(lower_expr).transpose()?,
+    })
+}
+
+fn lower_delete(delete: &sqlparser::ast::Delete) -> Result<plan::Delete> {
+    refuse_if(!delete.tables.is_empty(), "a multi-table DELETE")?;
+    refuse_if(delete.using.is_some(), "DELETE ... USING")?;
+    refuse_if(delete.returning.is_some(), "DELETE ... RETURNING")?;
+    refuse_if(!delete.order_by.is_empty(), "DELETE ... ORDER BY")?;
+    refuse_if(delete.limit.is_some(), "DELETE ... LIMIT")?;
+    refuse_if(delete.output.is_some(), "DELETE ... OUTPUT")?;
+    refuse_if(!delete.optimizer_hints.is_empty(), "an optimizer hint")?;
+
+    let (FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables)) = &delete.from;
+    let [table] = tables.as_slice() else {
+        return Err(SqlError::unsupported("a multi-table DELETE"));
+    };
+    refuse_if(!table.joins.is_empty(), "a JOIN in DELETE")?;
+
+    Ok(plan::Delete {
+        table: table_factor(&table.relation)?,
+        filter: delete.selection.as_ref().map(lower_expr).transpose()?,
+    })
 }
 
 /// The six types, under every spelling PostgreSQL accepts for them.

@@ -27,7 +27,7 @@ pub use ddl::{
     Column, CreateIndex, CreateTable, DropIndex, DropTable, UniqueConstraint, index_name,
     primary_key_name, unique_constraint_name,
 };
-pub use dml::Insert;
+pub use dml::{Delete, Insert, Update};
 pub use expr::{BinaryOp, Expr, Literal};
 pub use query::{Node, OrderItem, Select, SelectItem, SortKey};
 
@@ -54,6 +54,10 @@ pub enum Statement {
     Insert(Insert),
     /// `SELECT`.
     Select(Select),
+    /// `UPDATE`.
+    Update(Update),
+    /// `DELETE`.
+    Delete(Delete),
     /// `EXPLAIN`, and the statement it is about. The inner statement is planned and described,
     /// never run.
     Explain(Box<Statement>),
@@ -75,6 +79,8 @@ impl Statement {
             // Neither of these uses this: their tags carry a count, which only the executor knows.
             Statement::Insert(_) => "INSERT",
             Statement::Select(_) => "SELECT",
+            Statement::Update(_) => "UPDATE",
+            Statement::Delete(_) => "DELETE",
             Statement::Explain(_) => "EXPLAIN",
         }
     }

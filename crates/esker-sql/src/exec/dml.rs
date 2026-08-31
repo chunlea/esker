@@ -25,9 +25,10 @@
 use crate::backend::Txn;
 use crate::catalog::TableDef;
 use crate::error::{Result, SqlError};
+use crate::exec::query;
 use crate::exec::{Executor, Unique, Written};
 use crate::pgwire::session::Outcome;
-use crate::plan::Insert;
+use crate::plan::{Delete, Insert, Update};
 use crate::row;
 use crate::value::Datum;
 
@@ -55,16 +56,7 @@ pub(super) fn insert(
             row[*target] = expr.evaluate(column.ty, &column.name)?;
         }
 
-        for (ordinal, column) in table.columns.iter().enumerate() {
-            if column.not_null && matches!(row[ordinal], Datum::Null) {
-                return Err(SqlError::NotNullViolationInRelation {
-                    column: column.name.clone(),
-                    relation: table.name.clone(),
-                    row: Some(render_values(&row)),
-                });
-            }
-        }
-
+        check_not_null(&table, &row)?;
         write_row(executor, txn, &table, &row, written)?;
     }
 
@@ -182,4 +174,147 @@ fn render_values(values: &[Datum]) -> String {
         .map(|value| value.to_text().unwrap_or_else(|| "null".to_owned()))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// `UPDATE`: read the rows that match, rewrite them, and keep every index in step.
+///
+/// # Why the rows are read before any of them is written
+///
+/// The scan and the writes go through the same transaction, and the buffer is merged into a scan
+/// (`crate::backend`), so a row whose primary key this statement *moves* could be met again
+/// further along the scan and updated twice. That is the Halloween problem, and materialising the
+/// matching rows first is the cheap way out of it: what the statement writes can no longer change
+/// what it is about to read.
+pub(super) fn update(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    update: &Update,
+    written: &mut Written,
+) -> Result<Outcome> {
+    let table = executor.require_table(txn, &update.table)?;
+
+    // Resolve the target of every assignment first, so `SET nope = 1` fails before anything is
+    // read rather than after some rows have been rewritten.
+    let assignments = update
+        .assignments
+        .iter()
+        .map(|(name, value)| {
+            let ordinal =
+                table
+                    .column(name)
+                    .ok_or_else(|| SqlError::UndefinedColumnInRelation {
+                        column: name.clone(),
+                        relation: table.name.clone(),
+                    })?;
+            Ok((ordinal, value.clone()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let rows = collect(executor, txn, update.filter.as_ref(), &table)?;
+    let mut count = 0;
+    for old in rows {
+        let mut new = old.clone();
+        for (ordinal, value) in &assignments {
+            let column = &table.columns[*ordinal];
+            // Evaluated against the row as it was, so `SET a = b, b = a` swaps them.
+            let evaluated = match value {
+                crate::plan::Expr::Literal(literal) => literal.assign(column.ty, &column.name)?,
+                other => {
+                    let resolved = query::resolve_against(other, &table)?;
+                    query::evaluate(&resolved, &old)?
+                }
+            };
+            if !evaluated.fits(column.ty) {
+                return Err(SqlError::DatatypeMismatchInColumn {
+                    column: column.name.clone(),
+                    column_type: column.ty.name(),
+                    expression_type: "the expression's",
+                });
+            }
+            new[*ordinal] = evaluated;
+        }
+        check_not_null(&table, &new)?;
+        remove_row(executor, txn, &table, &old)?;
+        write_row(executor, txn, &table, &new, written)?;
+        count += 1;
+    }
+    Ok(Outcome::done(format!("UPDATE {count}")))
+}
+
+/// `DELETE`: the row and every index entry that points at it.
+pub(super) fn delete(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    delete: &Delete,
+) -> Result<Outcome> {
+    let table = executor.require_table(txn, &delete.table)?;
+    let rows = collect(executor, txn, delete.filter.as_ref(), &table)?;
+    let count = rows.len();
+    for row in rows {
+        remove_row(executor, txn, &table, &row)?;
+    }
+    Ok(Outcome::done(format!("DELETE {count}")))
+}
+
+/// Every row a predicate matches, read before anything is written. See [`update`] for why.
+fn collect(
+    executor: &Executor,
+    txn: &dyn Txn,
+    filter: Option<&crate::plan::Expr>,
+    table: &TableDef,
+) -> Result<Vec<Vec<Datum>>> {
+    let node = query::matching_rows(filter, executor.tenant, table)?;
+    let mut cursor = query::Cursor::open(txn, executor.tenant, &node)?;
+    let mut rows = Vec::new();
+    while let Some(row) = cursor.next()? {
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+fn check_not_null(table: &TableDef, row: &[Datum]) -> Result<()> {
+    for (ordinal, column) in table.columns.iter().enumerate() {
+        if column.not_null && matches!(row[ordinal], Datum::Null) {
+            return Err(SqlError::NotNullViolationInRelation {
+                column: column.name.clone(),
+                relation: table.name.clone(),
+                row: Some(render_values(row)),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Deletes a row and every index entry built from it.
+fn remove_row(
+    executor: &Executor,
+    txn: &mut dyn Txn,
+    table: &TableDef,
+    row: &[Datum],
+) -> Result<()> {
+    let tenant = executor.tenant;
+    let primary_key: Vec<Datum> = table
+        .primary_key
+        .iter()
+        .map(|&ordinal| row[ordinal].clone())
+        .collect();
+
+    for index in &table.indexes {
+        let columns: Vec<Datum> = index
+            .columns
+            .iter()
+            .map(|&ordinal| row[ordinal].clone())
+            .collect();
+        let by_value = index.unique && row::unique_index_key_is_unique_by_value(&columns);
+        let suffix = if by_value {
+            None
+        } else {
+            Some(primary_key.as_slice())
+        };
+        txn.delete(&row::index_key(
+            tenant, table.id, index.id, &columns, suffix,
+        )?);
+    }
+    txn.delete(&row::row_key(tenant, table.id, &primary_key)?);
+    Ok(())
 }

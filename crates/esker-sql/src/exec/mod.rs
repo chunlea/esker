@@ -109,6 +109,8 @@ impl Executor {
             Statement::DropIndex(drop) => ddl::drop_index(self, txn, drop),
             Statement::Insert(insert) => dml::insert(self, txn, insert, written),
             Statement::Select(select) => self.select(txn, select),
+            Statement::Update(update) => dml::update(self, txn, update, written),
+            Statement::Delete(delete) => dml::delete(self, txn, delete),
             Statement::Explain(inner) => self.explain(txn, inner),
         }
     }
@@ -251,6 +253,8 @@ fn explain_lines(statement: &Statement) -> Vec<String> {
         // A `SELECT`'s plan is the interesting one, and it needs the catalog to be built, so
         // `EXPLAIN SELECT` is handled where the catalog is in reach rather than here.
         Statement::Select(_) => vec!["Select".to_owned()],
+        Statement::Update(update) => vec![format!("Update on {}", update.table)],
+        Statement::Delete(delete) => vec![format!("Delete on {}", delete.table)],
         Statement::Insert(insert) => vec![format!(
             "Insert on {} ({} row{})",
             insert.table,

@@ -44,13 +44,32 @@ pub(super) struct Planned {
     pub(super) table: String,
 }
 
+/// The access path and filter for every row of `table` a predicate matches — the half of a plan
+/// that `UPDATE` and `DELETE` share with `SELECT`.
+///
+/// It yields whole rows, because a statement that rewrites a row needs all of it: the columns it
+/// is not changing still have to be written back, and the index entries it is replacing were built
+/// from the old ones.
+pub(super) fn matching_rows(filter: Option<&Expr>, tenant: u64, table: &TableDef) -> Result<Node> {
+    let mut node = access_path(filter, tenant, table)?;
+    if let Some(filter) = filter {
+        let predicate = resolve(filter, Some(table))?;
+        check_predicate(&predicate)?;
+        node = Node::Filter {
+            input: Box::new(node),
+            predicate,
+        };
+    }
+    Ok(node)
+}
+
 /// Turns a lowered `SELECT` into a plan against a table.
 ///
 /// `table` is `None` for `SELECT 1`, which has no table and one row.
 pub(super) fn plan(select: &Select, tenant: u64, table: Option<&TableDef>) -> Result<Planned> {
     let mut node = match table {
         None => Node::OneRow,
-        Some(table) => access_path(select, tenant, table)?,
+        Some(table) => access_path(select.filter.as_ref(), tenant, table)?,
     };
 
     if let Some(filter) = &select.filter {
@@ -113,9 +132,9 @@ pub(super) fn plan(select: &Select, tenant: u64, table: Option<&TableDef>) -> Re
 
 /// Rule 1, 2 and 3 from `plan::query`: pin the whole primary key, bound its first column, or pin a
 /// unique index's whole key. Otherwise a scan.
-fn access_path(select: &Select, tenant: u64, table: &TableDef) -> Result<Node> {
+fn access_path(filter: Option<&Expr>, tenant: u64, table: &TableDef) -> Result<Node> {
     let columns = table.column_types();
-    let Some(filter) = &select.filter else {
+    let Some(filter) = filter else {
         return Ok(seq_scan(tenant, table, &columns, false));
     };
     let equalities = equality_constants(filter, table)?;
@@ -327,6 +346,11 @@ fn pinned(ordinals: &[usize], equalities: &[(usize, Datum)]) -> Option<Vec<Datum
                 .map(|(_, value)| value.clone())
         })
         .collect()
+}
+
+/// Resolves a column reference against one table — what `UPDATE`'s `SET` expressions need.
+pub(super) fn resolve_against(expr: &Expr, table: &TableDef) -> Result<Expr> {
+    resolve(expr, Some(table))
 }
 
 /// `ORDER BY x` where `x` is an output alias means the expression that alias names.

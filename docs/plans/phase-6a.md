@@ -472,11 +472,11 @@ its own gap register, and it would be longer.
 - [x] 4 — catalog: the `'m'`-space records with a golden, the per-transaction version check,
   and a cache that cannot serve a definition from a snapshot's future
 - [x] 5 — backend trait and fake (the executor's half of the unique-index composition is unit 6)
-- [ ] 6 — planner and executor: **6a, 6b and 6c done** — the lowering out of the parser's AST, the DDL
+- [ ] 6 — planner and executor: **6a–6d done** — the lowering out of the parser's AST, the DDL
   executor over the catalog, `Execute` implemented and a real `psql` driving `CREATE`/`DROP`
   against it (6a); `INSERT` with its indexes and both halves of the unique-index ruling (6b);
-  the planner, the pull-based executor and `EXPLAIN` (6c); `UPDATE`, `DELETE` and bound parameters
-  remain
+  the planner, the pull-based executor and `EXPLAIN` (6c); `UPDATE` and
+  `DELETE` with their index maintenance (6d); bound parameters remain
 - [ ] 7 — `.slt` harness
 
 ## 10a. Handoff — where a fresh lane picks up
@@ -784,6 +784,25 @@ Three more parity details came off the server:
 `EXPLAIN` output is deliberately not PostgreSQL-shaped: there is no cost model here, so there are
 no costs. What it does print is the access path and the filter, which is the part a user changes
 their schema over.
+
+**Unit 6d.** `UPDATE` and `DELETE`. Both reuse the planner — a pinned key is a point read here too
+— and the hard part of neither is the row. It is everything that points at it: an index entry left
+behind after the value moved is not a slow query, it is a wrong answer, because the planner will
+follow it and return a row that no longer has that value.
+
+Two things in the implementation are there for a reason worth recording:
+
+- **The matching rows are read before any of them is written.** The scan and the writes share a
+  transaction, and the buffer is merged into a scan, so a row whose primary key an `UPDATE` *moves*
+  could be met again further along and moved a second time. That is the Halloween problem, and
+  materialising first is the cheap way out.
+  `an_update_that_moves_rows_forward_touches_each_one_once` is the test.
+- **`SET` expressions are evaluated against the row as it was**, so `SET a = b, b = a` swaps them
+  rather than assigning `a` twice, and `SET e = e` on a unique column is not a duplicate of itself.
+
+Assignment targets are resolved before the first row is read, so `SET nope = 1` fails without
+having rewritten anything. The same script against a real PostgreSQL 19 differs only in the
+`LINE/^` caret.
 
 **Unit 2a.** The goldens are recorded, not written. A proxy between `psql` 18.6 and the
 PostgreSQL 19beta1 container logged both directions of five real sessions, and
