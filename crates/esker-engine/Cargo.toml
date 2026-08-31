@@ -10,6 +10,10 @@ publish.workspace = true
 
 [dependencies]
 esker-base.workspace = true
+# The object-storage client behind `fs::tier` (ADR 0024, ADR 0025). A leaf crate like
+# esker-base: no external dependency of its own, so this costs nothing against the budget in
+# deny.toml, and it keeps the engine free of tokio -- `esker_s3::Transport` blocks.
+esker-s3.workspace = true
 # `Bytes` at API boundaries only; `&[u8]` internally (CLAUDE.md, "Toolchain and conventions").
 bytes.workspace = true
 # The memtable, and the one piece of concurrent unsafe code we buy rather than write.

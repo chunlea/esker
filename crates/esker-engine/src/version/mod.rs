@@ -29,7 +29,7 @@ use std::sync::Arc;
 use crate::dbformat::{Comparator, extract_user_key};
 
 pub use builder::Builder;
-pub use edit::{FileMeta, VersionEdit};
+pub use edit::{FileLocation, FileMeta, VersionEdit};
 pub use set::VersionSet;
 
 /// The files of one column family, level by level.
@@ -147,6 +147,21 @@ impl Version {
         self.cf(cf).map_or(&[], |cf| cf.files(level))
     }
 
+    /// Which column family and level hold `number`, if any version of this does.
+    ///
+    /// Linear in the file count, which is fine for its one caller: a batch of upload
+    /// promotions, a handful at a time, on a background thread.
+    pub fn locate(&self, number: u64) -> Option<(u32, u32)> {
+        for (cf, families) in &self.cfs {
+            for (level, files) in families.levels.iter().enumerate() {
+                if files.iter().any(|file| file.number == number) {
+                    return Some((*cf, u32::try_from(level).ok()?));
+                }
+            }
+        }
+        None
+    }
+
     /// Every file number any column family references.
     ///
     /// This is what makes deletion safe: a file may be removed from disk only when it appears
@@ -184,6 +199,7 @@ impl Version {
 #[cfg(test)]
 mod tests {
     use super::{CfVersion, FileMeta, Version};
+    use crate::version::FileLocation;
     use std::sync::Arc;
 
     fn file(number: u64) -> Arc<FileMeta> {
@@ -194,6 +210,7 @@ mod tests {
             largest: vec![9u8; 9],
             smallest_seqno: number,
             largest_seqno: number,
+            location: FileLocation::Local,
         })
     }
 

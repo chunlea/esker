@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use esker_engine::dbformat::{EntryKind, internal_key};
-use esker_engine::version::{FileMeta, VersionEdit};
+use esker_engine::version::{FileLocation, FileMeta, VersionEdit};
 use proptest::prelude::*;
 
 fn hex(bytes: &[u8]) -> String {
@@ -46,6 +46,7 @@ fn golden_version_edit() {
             largest: internal_key(b"pear", 20, EntryKind::Put),
             smallest_seqno: 10,
             largest_seqno: 20,
+            location: FileLocation::Local,
         },
     );
 
@@ -78,6 +79,7 @@ fn file_meta() -> impl Strategy<Value = FileMeta> {
             largest,
             smallest_seqno: a.min(b),
             largest_seqno: a.max(b),
+            location: FileLocation::Local,
         })
 }
 
@@ -291,6 +293,7 @@ fn add_file(set: &mut VersionSet, smallest: &[u8], largest: &[u8]) -> u64 {
             largest: internal_key(largest, number, EntryKind::Put),
             smallest_seqno: number,
             largest_seqno: number,
+            location: FileLocation::Local,
         },
     );
     set.log_and_apply(&mut edit).unwrap();
@@ -387,6 +390,7 @@ fn a_crash_anywhere_in_the_current_swap_leaves_a_readable_database() {
                 largest: internal_key(b"z", number, EntryKind::Put),
                 smallest_seqno: number,
                 largest_seqno: number,
+                location: FileLocation::Local,
             },
         );
         let outcome = set.log_and_apply(&mut edit);
@@ -551,6 +555,7 @@ fn obsolete_files_respect_pinned_versions() {
             largest: internal_key(b"z", merged, EntryKind::Put),
             smallest_seqno: 1,
             largest_seqno: merged,
+            location: FileLocation::Local,
         },
     );
     set.log_and_apply(&mut edit).unwrap();

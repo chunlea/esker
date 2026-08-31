@@ -403,11 +403,7 @@ impl VersionSet {
     /// Obsolete are: SSTs no live version references, log segments below the log number, every
     /// manifest but the live one, and any leftover temporary file.
     pub fn obsolete_files(&mut self) -> Result<Vec<PathBuf>> {
-        self.live.retain(|version| Arc::strong_count(version) > 1);
-        let mut live_files: BTreeSet<u64> = self.current.live_files();
-        for version in &self.live {
-            live_files.extend(version.live_files());
-        }
+        let live_files = self.live_file_numbers();
 
         let mut obsolete = Vec::new();
         for path in self.fs.list(&self.dir).at(&self.dir)? {
@@ -425,6 +421,21 @@ impl VersionSet {
             }
         }
         Ok(obsolete)
+    }
+
+    /// Every file number any pinned version still needs.
+    ///
+    /// The same set [`obsolete_files`](Self::obsolete_files) computes, exposed because object
+    /// deletion cannot be driven from a directory listing: a file the tier has evicted is
+    /// absent from the listing, so its object would never be reclaimed
+    /// ([ADR 0024](../../../docs/adr/0024-tiering-failure-semantics.md) decision 5).
+    pub fn live_file_numbers(&mut self) -> BTreeSet<u64> {
+        self.live.retain(|version| Arc::strong_count(version) > 1);
+        let mut live_files: BTreeSet<u64> = self.current.live_files();
+        for version in &self.live {
+            live_files.extend(version.live_files());
+        }
+        live_files
     }
 
     /// Deletes what [`obsolete_files`](Self::obsolete_files) found, returning what went.

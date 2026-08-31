@@ -31,6 +31,9 @@
 //! shape, so a Windows port is a design change, not a `cfg` — and `deny.toml` builds exactly
 //! two targets, both of them unix.
 
+pub mod tier;
+
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -91,6 +94,64 @@ pub trait FileSystem: Send + Sync + fmt::Debug {
     /// This is what makes `checkpoint` cheap: SSTs are immutable, so a checkpoint links them
     /// instead of copying them (`docs/DESIGN.md` §4.1).
     fn hard_link(&self, from: &Path, to: &Path) -> io::Result<()>;
+
+    /// The object-storage tier behind this filesystem, if it has one.
+    ///
+    /// `None` for every implementation that is only a filesystem, which is the default and
+    /// therefore the answer for [`LocalFileSystem`], the simulator's memory filesystem and the
+    /// fault injector. [`tier::TieredFileSystem`] returns itself.
+    ///
+    /// The engine calls this at the three moments a tier needs to hear about: an SST has been
+    /// written and is durable, an edit is about to be written and may carry promotions, and the
+    /// obsolete-file sweep has computed which files are still live. Everything else — when to
+    /// upload, what to evict, when to fetch — is the tier's own business.
+    fn tier(&self) -> Option<&dyn SstTier> {
+        None
+    }
+}
+
+/// The object-storage tier's side of the seam.
+///
+/// Kept deliberately narrow. The engine knows four facts a tier cannot work out for itself —
+/// a new SST exists, an edit is being written, which files are live, and that some time has
+/// passed — and the tier knows everything else.
+pub trait SstTier: Send + Sync + fmt::Debug {
+    /// A new SST is complete and durable on local disk, and may be uploaded.
+    ///
+    /// Called **after** the manifest edit that names it, never before: an upload is not on the
+    /// write path ([ADR 0024](../../../docs/adr/0024-tiering-failure-semantics.md) decision 1).
+    fn note_durable_sst(&self, number: u64);
+
+    /// File numbers whose upload has completed since the last call, taken from the tier.
+    ///
+    /// The engine folds these into whatever edit it is about to write, as promotions. Draining
+    /// is destructive: a number reported once is not reported again, and a crash before the
+    /// edit lands simply means the file stays recorded `Local` — which is safe, because the
+    /// read path does not consult the field (ADR 0024 decision 4).
+    fn drain_promotions(&self) -> Vec<u64>;
+
+    /// Deletes the objects of files no live version names.
+    ///
+    /// `live` is the union of every pinned version's file set and `pending` is the register of
+    /// outputs being written. An object is deleted only when its number is in neither — the
+    /// phase-1 rule, extended by one set, because an evicted file is absent from the directory
+    /// listing the local sweep uses and its object would otherwise never be reclaimed.
+    fn retain(&self, live: &BTreeSet<u64>, pending: &BTreeSet<u64>) -> io::Result<()>;
+
+    /// Does one bounded pass of whatever is outstanding: uploads, fetches, eviction.
+    ///
+    /// Returns how many uploads succeeded. Called by the tier's own thread when it has one, and
+    /// directly by tests when it does not.
+    fn maintain(&self) -> usize;
+
+    /// Whether the engine should run [`maintain`](Self::maintain) on a thread of its own.
+    ///
+    /// `false` makes the tier entirely caller-driven, which is what the tests want: a
+    /// background thread makes "has it uploaded yet" a question only a sleep can answer.
+    fn wants_background_thread(&self) -> bool;
+
+    /// What has happened so far, for the bench and for `tracing`.
+    fn stats(&self) -> tier::TierStats;
 }
 
 /// An append-only file. The WAL, the manifest and every SST are written through one.

@@ -36,7 +36,7 @@ use crate::filename::{self, FileKind};
 use crate::iterator::Cursor;
 use crate::range_del::RangeTombstones;
 use crate::sst::{TableBuilder, TableOptions};
-use crate::version::{CfVersion, FileMeta, Version, VersionEdit};
+use crate::version::{CfVersion, FileLocation, FileMeta, Version, VersionEdit};
 
 use super::iter::table_cursor;
 use super::merge::MergeCursor;
@@ -309,6 +309,13 @@ impl DbInner {
         // Either a version names them now, or nothing ever will: both mean they have stopped
         // being files "being written", and in the second case the sweep is what reclaims them.
         self.forget_pending(&outputs)?;
+        if applied {
+            // After the edit. A compaction that was dropped produced files no version names,
+            // and uploading those would be uploading garbage for the sweep to delete.
+            for file in &outputs {
+                self.note_durable_sst(file.number);
+            }
+        }
         self.purge_and_evict()?;
         if !applied {
             tracing::debug!(
@@ -482,13 +489,18 @@ impl DbInner {
         // its output looks like garbage twice over and the sweep deletes a file the *current*
         // version references. Installing an edit takes the version lock, so holding it across
         // both samples is what makes them one instant.
-        let (obsolete, pending) = {
+        let (obsolete, live, pending) = {
             let mut versions = lock(&self.versions)?;
             let obsolete = versions.obsolete_files()?;
+            // Taken under the same lock as the listing, because object deletion needs the same
+            // instant. It cannot be derived from the listing: a file the tier evicted is not
+            // in the directory at all, so its object would never be reclaimed
+            // (ADR 0024 decision 5).
+            let live = versions.live_file_numbers();
             #[cfg(any(test, feature = "testing"))]
             self.pause_at(crate::testing::PausePoint::SweptDirectoryBeforePending);
             let pending: BTreeSet<u64> = lock(&self.pending_outputs)?.clone();
-            (obsolete, pending)
+            (obsolete, live, pending)
         };
         for path in obsolete {
             if let Some(FileKind::Sst(number)) = filename::classify_path(&path) {
@@ -504,6 +516,13 @@ impl DbInner {
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => return Err(Error::io(&path, err)),
             }
+        }
+        if let Some(tier) = self.fs.tier()
+            && let Err(err) = tier.retain(&live, &pending)
+        {
+            // An object we failed to delete is leaked, not lost. Failing the sweep over it
+            // would turn a storage cost into an availability one.
+            tracing::warn!(error = %err, "reclaiming obsolete objects failed");
         }
         Ok(())
     }
@@ -669,6 +688,7 @@ impl CompactionOutput for TableWriter<'_> {
             largest: std::mem::take(&mut self.largest),
             smallest_seqno: self.smallest_seqno,
             largest_seqno: self.largest_seqno,
+            location: FileLocation::Local,
         });
         Ok(true)
     }

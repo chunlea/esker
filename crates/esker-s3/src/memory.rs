@@ -1,4 +1,4 @@
-//! An [`ObjectStore`](crate::ObjectStore) in a `BTreeMap`, for tests that are not about S3.
+//! An [`ObjectStore`] in a `BTreeMap`, for tests that are not about S3.
 //!
 //! The tiered filesystem has a lot of behaviour that has nothing to do with HTTP: what gets
 //! uploaded and when, what the governor evicts, which objects the sweep may delete. Testing
@@ -6,7 +6,7 @@
 //! which is how a test suite ends up with the interesting cases behind `#[ignore]`.
 //!
 //! So the engine's tests run against this, and the S3 client's own tests run against `MinIO`. The
-//! seam between them is [`ObjectStore`](crate::ObjectStore), which is why it is deliberately
+//! seam between them is [`ObjectStore`], which is why it is deliberately
 //! smaller than S3.
 //!
 //! It also fails on demand: [`MemoryStore::fail_next_puts`] and friends are how the

@@ -63,10 +63,18 @@ stays local and its number goes back on the retry queue. Specifically it does **
 The file is `Local` in the manifest, complete on disk, and readable. Every read of it is a local
 read. The only thing that has not happened is the part that would have let us delete it.
 
-Retries are exponential with a cap and a jitter drawn from `esker_base::rng::Pcg32` (the
-project's only randomness — `CLAUDE.md`). A file whose upload has failed *n* times is not
-special-cased: it is retried like any other, forever, because the alternative is a file that is
-permanently unevictable and silently so.
+**The backoff is one attempt per maintenance pass.** A file that fails goes to the back of the
+upload queue, and a pass takes at most `batch` *distinct* files, so a bucket that is refusing
+everything is retried at the uploader's own cadence — a new SST, or its five-second idle tick —
+rather than spun on. This is deliberately not an exponential backoff with a jitter: that would
+need a clock inside the engine for the simulator to fake, and the pass cadence already bounds
+the retry rate by the flush rate, which is the thing that actually matters. If a measurement
+ever shows an idle database retrying a dead endpoint too eagerly, lengthening the idle tick is
+the knob, and it is one knob rather than three.
+
+A file whose upload has failed *n* times is not otherwise special-cased: it is retried forever,
+because the alternative is a file that is permanently unevictable and silently so. The failure
+count is kept for the log line and for nothing else.
 
 ## Decision 3: local disk full is backpressure, and the tier is not a relief valve
 
@@ -141,11 +149,13 @@ Every ranged read checks:
   in which case it equals what remained;
 - the `ETag` matches the one recorded when the object was uploaded, when we have it.
 
-A mismatch is retried once as a **full** GET, on the theory that the range machinery is what is
-broken. A second mismatch is corruption, reported as `Error::Corruption` like every other
-checksum failure — never a panic, never silently accepted (`CLAUDE.md` invariants 2 and 9). The
-SST's own block CRCs are still checked underneath all of this; this check exists to turn a
-confusing wrong-bytes failure into a clear one.
+A gateway that answers `200` with the whole object has already *given* us the full-GET fallback,
+so the client slices the window out of what arrived rather than asking a second time. Every
+other mismatch — a `206` from the wrong offset, a short body that is not at the end of the
+object, an `ETag` that is not the one recorded at upload — is an error, retried by the layer
+above like any other failed read, and never quietly accepted (`CLAUDE.md` invariants 2 and 9).
+The SST's own block CRCs are still checked underneath all of this; this check exists so that
+"the object was replaced" reads as itself instead of as a checksum failure three layers up.
 
 ## Consequences
 

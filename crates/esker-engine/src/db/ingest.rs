@@ -30,7 +30,7 @@ use crate::dbformat::extract_user_key;
 use crate::error::{Error, IoResultExt, Result};
 use crate::filename;
 use crate::sst::TableReader;
-use crate::version::{FileMeta, VersionEdit};
+use crate::version::{FileLocation, FileMeta, VersionEdit};
 
 use super::{ColumnFamily, Db, DbInner, lock, read_lock};
 
@@ -117,6 +117,7 @@ impl DbInner {
             largest: properties.largest_key.clone(),
             smallest_seqno: properties.smallest_seqno,
             largest_seqno: properties.largest_seqno,
+            location: FileLocation::Local,
         })
     }
 

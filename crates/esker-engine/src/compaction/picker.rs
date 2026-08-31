@@ -391,6 +391,7 @@ mod tests {
     use crate::dbformat::{BytewiseComparator, EntryKind, InternalKeyComparator, internal_key};
     use crate::options::CfOptions;
     use crate::range_del::RangeTombstones;
+    use crate::version::FileLocation;
     use crate::version::{Builder, CfVersion, FileMeta, Version, VersionEdit};
     use std::sync::Arc;
 
@@ -421,6 +422,7 @@ mod tests {
             largest: internal_key(largest.as_bytes(), number, EntryKind::Put),
             smallest_seqno: number,
             largest_seqno: number,
+            location: FileLocation::Local,
         }
     }
 

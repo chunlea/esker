@@ -36,7 +36,7 @@ use crate::filename;
 use crate::memtable::MemTable;
 use crate::range_del::RangeTombstones;
 use crate::sst::{TableBuilder, TableOptions};
-use crate::version::{FileMeta, VersionEdit};
+use crate::version::{FileLocation, FileMeta, VersionEdit};
 use crate::wal::LogWriter;
 
 use super::{ColumnFamily, Db, DbInner, MemState, lock, read_lock, write_lock};
@@ -304,6 +304,7 @@ impl DbInner {
         self.pause_at(crate::testing::PausePoint::FlushedTableBeforeEdit);
 
         let mut edit = VersionEdit::new();
+        let meta_written = meta.is_some();
         if let Some(meta) = meta {
             tracing::debug!(
                 cf = cf.id(),
@@ -314,6 +315,15 @@ impl DbInner {
             edit.add_file(cf.id(), 0, meta);
         }
         self.log_and_apply(&mut edit)?;
+
+        // After the edit and never before it — local durability is what an acknowledgement
+        // means, and an upload is not part of it (ADR 0024 decision 1) — but before the
+        // immutable memtable is dropped, because that drop is what `wait_for_flush` returns
+        // on. A caller that has been told its flush finished must find the file already known
+        // to the tier, or "flush then upload" is a race it cannot win.
+        if meta_written {
+            self.note_durable_sst(number);
+        }
 
         // Only now: until the edit is durable, this memtable is the only copy of that data.
         {
@@ -358,6 +368,7 @@ impl DbInner {
             largest,
             smallest_seqno,
             largest_seqno,
+            location: FileLocation::Local,
         }))
     }
 
@@ -439,6 +450,7 @@ impl DbInner {
             largest,
             smallest_seqno,
             largest_seqno,
+            location: FileLocation::Local,
         }))
     }
 

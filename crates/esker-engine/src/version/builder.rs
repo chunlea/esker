@@ -17,7 +17,7 @@ use std::sync::Arc;
 use crate::dbformat::{Comparator, InternalKeyComparator};
 use crate::error::{Error, Result};
 
-use super::{CfVersion, FileMeta, Version, VersionEdit};
+use super::{CfVersion, FileLocation, FileMeta, Version, VersionEdit};
 
 /// Accumulates edits and produces the version they describe.
 #[derive(Debug)]
@@ -26,6 +26,8 @@ pub struct Builder {
     num_levels: usize,
     deleted: BTreeMap<(u32, usize), BTreeSet<u64>>,
     added: BTreeMap<(u32, usize), Vec<Arc<FileMeta>>>,
+    /// Locations an edit moved, applied in `build` once the level's file list is assembled.
+    relocated: BTreeMap<(u32, usize), BTreeMap<u64, FileLocation>>,
     cf_added: BTreeSet<u32>,
     cf_dropped: BTreeSet<u32>,
 }
@@ -38,6 +40,7 @@ impl Builder {
             num_levels,
             deleted: BTreeMap::new(),
             added: BTreeMap::new(),
+            relocated: BTreeMap::new(),
             cf_added: BTreeSet::new(),
             cf_dropped: BTreeSet::new(),
         }
@@ -76,6 +79,13 @@ impl Builder {
                 .or_default()
                 .push(Arc::new(meta.clone()));
         }
+        for (cf, level, number, location) in &edit.file_locations {
+            let level = self.level(*level)?;
+            self.relocated
+                .entry((*cf, level))
+                .or_default()
+                .insert(*number, *location);
+        }
         Ok(())
     }
 
@@ -100,6 +110,7 @@ impl Builder {
             .deleted
             .keys()
             .chain(self.added.keys())
+            .chain(self.relocated.keys())
             .copied()
             .collect();
         for (cf, level) in touched {
@@ -140,6 +151,23 @@ impl Builder {
                         deleted.len() - accounted
                     ),
                 ));
+            }
+
+            // A location change is not a file change: it rewrites one field of a meta the
+            // level already holds. A promotion naming a file that is not here is *ignored*
+            // rather than rejected — the upload that wrote it raced a compaction that removed
+            // the file, and refusing to open a database over a stale hint would be absurd
+            // (ADR 0024 decision 4: the location is a record, never a decision).
+            if let Some(moved) = self.relocated.remove(&(cf, level)) {
+                for file in &mut files {
+                    if let Some(location) = moved.get(&file.number)
+                        && file.location != *location
+                    {
+                        let mut updated = FileMeta::clone(file);
+                        updated.location = *location;
+                        *file = Arc::new(updated);
+                    }
+                }
             }
 
             sort_level(&mut files, level, comparator);
@@ -208,6 +236,7 @@ fn check_disjoint(
 mod tests {
     use super::Builder;
     use crate::dbformat::{BytewiseComparator, EntryKind, InternalKeyComparator, internal_key};
+    use crate::version::FileLocation;
     use crate::version::{FileMeta, Version, VersionEdit};
     use std::sync::Arc;
 
@@ -225,6 +254,7 @@ mod tests {
             largest: internal_key(largest, number, EntryKind::Put),
             smallest_seqno: number,
             largest_seqno: number,
+            location: FileLocation::Local,
         }
     }
 

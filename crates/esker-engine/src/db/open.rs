@@ -26,7 +26,7 @@ use crate::batch::WriteBatch;
 use crate::dbformat::{InternalKeyComparator, SeqNo};
 use crate::error::{Error, IoResultExt, Result};
 use crate::filename::{self, FileKind};
-use crate::fs::{FileSystem, LocalFileSystem};
+use crate::fs::{FileSystem, LocalFileSystem, SstTier};
 use crate::options::Options;
 use crate::version::{VersionEdit, VersionSet};
 use crate::wal::{LogReader, LogWriter, ReadOutcome};
@@ -152,6 +152,8 @@ impl Db {
             bloom_skips: AtomicU64::new(0),
             bloom_probes: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
+            tier: Mutex::new(crate::db::TierSignal::default()),
+            tier_wanted: Condvar::new(),
             stalls: AtomicU64::new(0),
             slowdowns: AtomicU64::new(0),
             next_seqno: AtomicU64::new(last_seqno + 1),
@@ -159,12 +161,13 @@ impl Db {
             snapshots: SnapshotList::new(),
         });
 
-        let (flusher, compactors) = spawn_background(&inner, &dir_for_error)?;
+        let (flusher, compactors, uploader) = spawn_background(&inner, &dir_for_error)?;
 
         let db = Self {
             inner,
             flusher: Some(flusher),
             compactors,
+            uploader,
         };
         db.purge_obsolete_files()?;
         Ok(db)
@@ -184,10 +187,10 @@ impl Db {
 /// mid-wait. The pool is bounded rather than one thread per compaction: compaction is
 /// throughput work, and an unbounded pool starves the foreground of the disk
 /// (`docs/DESIGN.md` §4.7).
-fn spawn_background(
-    inner: &Arc<DbInner>,
-    dir: &Path,
-) -> Result<(JoinHandle<()>, Vec<JoinHandle<()>>)> {
+/// The flusher, the compaction pool, and the uploader when there is a tier to upload to.
+type Background = (JoinHandle<()>, Vec<JoinHandle<()>>, Option<JoinHandle<()>>);
+
+fn spawn_background(inner: &Arc<DbInner>, dir: &Path) -> Result<Background> {
     let weak = Arc::downgrade(inner);
     let flusher = std::thread::Builder::new()
         .name("esker-flush".to_string())
@@ -212,7 +215,29 @@ fn spawn_background(
                 .map_err(|err| Error::io(dir, err))?,
         );
     }
-    Ok((flusher, compactors))
+    // Only when there is something to upload to. A database on a plain filesystem does not
+    // carry a thread whose whole job would be to find nothing to do.
+    let uploader = if inner
+        .fs
+        .tier()
+        .is_some_and(SstTier::wants_background_thread)
+    {
+        let weak = Arc::downgrade(inner);
+        Some(
+            std::thread::Builder::new()
+                .name("esker-tier".to_string())
+                .spawn(move || {
+                    if let Some(inner) = weak.upgrade() {
+                        inner.tier_loop();
+                    }
+                })
+                .map_err(|err| Error::io(dir, err))?,
+        )
+    } else {
+        None
+    };
+
+    Ok((flusher, compactors, uploader))
 }
 
 /// Creates or recovers the version set, and makes sure every column family the caller named

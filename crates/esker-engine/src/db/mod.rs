@@ -37,6 +37,7 @@ pub mod open;
 pub mod read;
 pub mod snapshot;
 pub mod table_cache;
+pub mod tier;
 pub mod write;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -71,6 +72,8 @@ pub struct Db {
     flusher: Option<JoinHandle<()>>,
     /// The bounded compaction pool (`docs/DESIGN.md` §14: two threads).
     compactors: Vec<JoinHandle<()>>,
+    /// The uploader, present only when the filesystem has an object tier.
+    uploader: Option<JoinHandle<()>>,
 }
 
 impl Drop for Db {
@@ -86,11 +89,18 @@ impl Drop for Db {
         if let Ok(_state) = self.inner.compact.lock() {
             self.inner.shutdown.store(true, Ordering::Release);
         }
+        if let Ok(_state) = self.inner.tier.lock() {
+            self.inner.shutdown.store(true, Ordering::Release);
+        }
         self.inner.shutdown.store(true, Ordering::Release);
         self.inner.flush_wanted.notify_all();
         self.inner.flush_done.notify_all();
         self.inner.compact_wanted.notify_all();
         self.inner.compaction_done.notify_all();
+        self.inner.tier_wanted.notify_all();
+        if let Some(handle) = self.uploader.take() {
+            let _unused = handle.join();
+        }
         for handle in self.compactors.drain(..) {
             let _unused = handle.join();
         }
@@ -141,6 +151,14 @@ pub(crate) struct DbInner {
     pub(crate) bloom_skips: AtomicU64,
     pub(crate) bloom_probes: AtomicU64,
     pub(crate) shutdown: AtomicBool,
+    /// Whether the uploader has work waiting, and the condvar it sleeps on.
+    ///
+    /// A pair of its own rather than a share of the compaction signal: an upload must not wake
+    /// a compactor and a compaction must not wake the uploader, or one starves the other's
+    /// wake-ups on a busy database.
+    pub(crate) tier: Mutex<TierSignal>,
+    /// Notified when [`DbInner::signal_tier`] has set `tier.wanted`.
+    pub(crate) tier_wanted: Condvar,
     /// Times a writer was stopped outright, and times it was merely slowed. Both are
     /// properties, because a database that mysteriously goes slow is one nobody can operate.
     pub(crate) stalls: AtomicU64,
@@ -159,6 +177,18 @@ pub(crate) struct CompactState {
     pub(crate) wanted: bool,
     /// The first background failure.
     pub(crate) error: Option<String>,
+}
+
+/// Whether the uploader has something to do.
+///
+/// No `error` field, unlike its neighbours: an upload that fails is not an error anybody is
+/// waiting on. The file stays local and readable and the tier retries
+/// ([ADR 0024](../../../docs/adr/0024-tiering-failure-semantics.md) decision 2), so there is
+/// nothing to report to a foreground caller and nothing to hold onto.
+#[derive(Debug, Default)]
+pub(crate) struct TierSignal {
+    /// Set when an SST has become durable, or when a retry is due.
+    pub(crate) wanted: bool,
 }
 
 /// What the background flush thread is doing, and what went wrong if anything did.
