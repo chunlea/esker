@@ -1,0 +1,67 @@
+# INSERT: the row, the count in the tag, and the two ways a duplicate arrives.
+
+statement ok
+CREATE TABLE t (id int8 PRIMARY KEY, e text UNIQUE, n int8 NOT NULL, note text)
+
+statement ok INSERT 0 1
+INSERT INTO t VALUES (1, 'a', 10, 'first')
+
+statement ok INSERT 0 3
+INSERT INTO t VALUES (2, 'b', 20, NULL), (3, 'c', 30, NULL), (4, NULL, 40, NULL)
+
+# Columns the statement did not name are NULL, and so are the ones past a short VALUES tuple.
+statement ok
+INSERT INTO t (id, n) VALUES (5, 50)
+
+query ITIT
+SELECT id, e, n, note FROM t WHERE id = 5
+----
+5	NULL	50	NULL
+
+# A NULL is not an empty string.
+statement ok
+INSERT INTO t (id, n, note) VALUES (6, 60, '')
+
+query IT
+SELECT id, note FROM t WHERE note IS NULL ORDER BY id
+----
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+
+statement error 23505: duplicate key value violates unique constraint "t_pkey"
+INSERT INTO t VALUES (1, 'zz', 1, NULL)
+
+statement error 23505: duplicate key value violates unique constraint "t_e_key"
+INSERT INTO t VALUES (99, 'a', 1, NULL)
+
+# PostgreSQL admits any number of NULLs in a UNIQUE column, so these do not collide.
+statement ok INSERT 0 2
+INSERT INTO t (id, e, n) VALUES (7, NULL, 70), (8, NULL, 80)
+
+statement error 23502: null value in column "n" of relation "t" violates not-null constraint
+INSERT INTO t (id) VALUES (9)
+
+statement error 23502
+INSERT INTO t (e, n) VALUES ('zz', 1)
+
+statement error 42703: column "nope" of relation "t" does not exist
+INSERT INTO t (nope) VALUES (1)
+
+statement error 42601: INSERT has more expressions than target columns
+INSERT INTO t VALUES (10, 'x', 1, NULL, 'extra')
+
+statement error 22003: bigint out of range
+INSERT INTO t (id, n) VALUES (9223372036854775808, 1)
+
+statement error 42P02: there is no parameter $1
+INSERT INTO t (id, n) VALUES ($1, 1)
+
+# A failed row takes the rows before it with it: one statement is one transaction.
+statement error 23502
+INSERT INTO t (id, n) VALUES (20, 1), (21, NULL)
+
+query I
+SELECT id FROM t WHERE id = 20
+----

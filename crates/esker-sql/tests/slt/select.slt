@@ -1,0 +1,159 @@
+# SELECT: projection, WHERE, ORDER BY, LIMIT, OFFSET -- and the three-valued logic that runs
+# through all of them.
+
+statement ok
+CREATE TABLE s (id int8 PRIMARY KEY, n int8, t text)
+
+statement ok INSERT 0 4
+INSERT INTO s VALUES (1, 10, 'a'), (2, NULL, 'B'), (3, 30, NULL), (4, 20, 'b')
+
+query IIT
+SELECT * FROM s WHERE id = 1
+----
+1	10	a
+
+query I
+SELECT 1
+----
+1
+
+query ITB
+SELECT 1, 'x', true
+----
+1	x	t
+
+# NULL is never equal to anything, including itself -- which is why IS NULL exists.
+query I
+SELECT id FROM s WHERE n = NULL
+----
+
+query I
+SELECT id FROM s WHERE n <> NULL
+----
+
+query I
+SELECT id FROM s WHERE NOT (n = 10) ORDER BY id
+----
+3
+4
+
+query I
+SELECT id FROM s WHERE n IS NULL
+----
+2
+
+query I
+SELECT id FROM s WHERE n IS NOT NULL ORDER BY id
+----
+1
+3
+4
+
+# A definite false settles an AND; a definite true settles an OR.
+query I
+SELECT id FROM s WHERE n = 10 OR t IS NULL ORDER BY id
+----
+1
+3
+
+query I
+SELECT id FROM s WHERE n = 10 AND t IS NULL
+----
+
+query I
+SELECT id FROM s WHERE n = 99 OR id = 2
+----
+2
+
+# NULLS LAST ascending, NULLS FIRST descending, and an explicit clause overrides.
+query I
+SELECT n FROM s ORDER BY n
+----
+10
+20
+30
+NULL
+
+query I
+SELECT n FROM s ORDER BY n DESC
+----
+NULL
+30
+20
+10
+
+query I
+SELECT id FROM s ORDER BY n NULLS FIRST, id
+----
+2
+1
+4
+3
+
+# DIVERGES from PostgreSQL, deliberately. This is byte order, which is what PostgreSQL gives under
+# `COLLATE "C"`; the server this corpus was checked against has an en_US.utf8 database and returns
+# `a, b, B`. A locale-aware collation means ICU or a platform C library and this project compiles
+# neither -- see `crate::row` for the whole argument.
+query T
+SELECT t FROM s WHERE t IS NOT NULL ORDER BY t
+----
+B
+a
+b
+
+query I
+SELECT id FROM s ORDER BY id LIMIT 2 OFFSET 1
+----
+2
+3
+
+query I
+SELECT id FROM s ORDER BY id LIMIT 0
+----
+
+# LIMIT NULL is no limit.
+query I
+SELECT id FROM s ORDER BY id LIMIT NULL
+----
+1
+2
+3
+4
+
+statement error 2201W: LIMIT must not be negative
+SELECT id FROM s LIMIT -1
+
+statement error 2201X: OFFSET must not be negative
+SELECT id FROM s OFFSET -1
+
+# A quoted literal takes the column's type; a typed one that has no operator does not.
+query I
+SELECT id FROM s WHERE n = '10'
+----
+1
+
+statement error 42883: operator does not exist: text = integer
+SELECT t FROM s WHERE t = 1
+
+statement error 42P01: relation "nope" does not exist
+SELECT * FROM nope
+
+statement error 42703
+SELECT nope FROM s
+
+# ORDER BY can name a column the target list does not return.
+query T
+SELECT t FROM s WHERE t IS NOT NULL ORDER BY id
+----
+a
+B
+b
+
+# And an output alias.
+query I
+SELECT n AS m FROM s ORDER BY m NULLS FIRST
+----
+NULL
+10
+20
+30

@@ -1,0 +1,103 @@
+# Contract C2: a statement PostgreSQL accepts and this node does not run comes back `0A000` naming
+# the construct. Never a syntax error, never a wrong answer, never a silent no-op.
+#
+# This file is the deliverable §3 calls "out, as executed features -- and therefore in as C2
+# responses". Every line here parses.
+
+statement ok
+CREATE TABLE t (id int8 PRIMARY KEY, a int8, b text)
+
+statement error 0A000: JOIN
+SELECT * FROM t JOIN t u ON true
+
+statement error 0A000: UNION
+SELECT * FROM t UNION SELECT * FROM t
+
+statement error 0A000: GROUP BY
+SELECT a FROM t GROUP BY a
+
+# `GROUP BY` is checked first, so that is what it names -- either way the answer is 0A000 naming
+# a construct the statement really does contain.
+statement error 0A000: GROUP BY
+SELECT a FROM t GROUP BY a HAVING a > 1
+
+statement error 0A000: SELECT DISTINCT
+SELECT DISTINCT a FROM t
+
+statement error 0A000: WITH
+WITH x AS (SELECT 1) SELECT * FROM x
+
+statement error 0A000: count
+SELECT count(*) FROM t
+
+statement error 0A000: the operator +
+SELECT a + 1 FROM t
+
+statement error 0A000: a table alias
+SELECT x.a FROM t x
+
+statement error 0A000: INSERT ... RETURNING
+INSERT INTO t VALUES (1, 2, 'x') RETURNING id
+
+statement error 0A000: INSERT ... ON CONFLICT
+INSERT INTO t VALUES (1, 2, 'x') ON CONFLICT DO NOTHING
+
+statement error 0A000: INSERT ... SELECT
+INSERT INTO t SELECT * FROM t
+
+statement error 0A000: UPDATE ... RETURNING
+UPDATE t SET a = 1 RETURNING id
+
+statement error 0A000: DELETE ... RETURNING
+DELETE FROM t RETURNING id
+
+statement error 0A000: CREATE TEMPORARY TABLE
+CREATE TEMPORARY TABLE tmp (id int8 PRIMARY KEY)
+
+statement error 0A000: CREATE TABLE ... AS
+CREATE TABLE copy AS SELECT * FROM t
+
+statement error 0A000: DEFAULT
+CREATE TABLE d (id int8 PRIMARY KEY, a int8 DEFAULT 1)
+
+statement error 0A000: FOREIGN KEY
+CREATE TABLE f (id int8 PRIMARY KEY, a int8, FOREIGN KEY (a) REFERENCES t (id))
+
+statement error 0A000: CHECK
+CREATE TABLE c (id int8 PRIMARY KEY, a int8, CHECK (a > 0))
+
+statement error 0A000: the type
+CREATE TABLE ty (id int8 PRIMARY KEY, a int4)
+
+statement error 0A000: the qualified name
+CREATE TABLE public.q (id int8 PRIMARY KEY)
+
+statement error 0A000: a partial index
+CREATE INDEX ON t (a) WHERE a > 0
+
+statement error 0A000: CREATE INDEX CONCURRENTLY
+CREATE INDEX CONCURRENTLY ci ON t (a)
+
+statement error 0A000: ALTER TABLE
+ALTER TABLE t ADD COLUMN c int8
+
+statement error 0A000: CREATE VIEW
+CREATE VIEW v AS SELECT * FROM t
+
+statement error 0A000: PREPARE
+PREPARE p AS SELECT 1
+
+statement error 0A000: SAVEPOINT
+SAVEPOINT s
+
+statement error 0A000: COPY
+COPY t FROM STDIN
+
+statement error 0A000: GRANT
+GRANT SELECT ON t TO alice
+
+# And the statement after any of them still runs: a refusal is not a poisoned session.
+query I
+SELECT 1
+----
+1

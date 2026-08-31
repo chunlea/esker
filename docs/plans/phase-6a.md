@@ -478,7 +478,8 @@ its own gap register, and it would be longer.
   planner, the pull-based executor and `EXPLAIN` (6c); `UPDATE` and `DELETE` with their index
   maintenance (6d); bound parameters in both wire formats and inferred `ParameterDescription` (6e).
   All three obligations from §10a are discharged.
-- [ ] 7 — `.slt` harness
+- [x] 7 — the `.slt` harness: eight files, one per statement class, replayed against the real
+  server to check that they record PostgreSQL's answers and not ours
 
 ## 10a. Handoff — where a fresh lane picks up
 
@@ -826,6 +827,34 @@ A real `psql` 18.6 now drives the extended protocol against this node with `\bin
 script against PostgreSQL 19 returns the same rows and the same errors. The only field still
 missing is the `CONTEXT: unnamed portal parameter $1 = ...` a real server adds to a parameter's
 own error — noted with the `LINE/^` caret as the remaining message-field gap.
+
+**Unit 7.** The `.slt` harness, and one decision about it that turned out to matter more than the
+harness itself.
+
+Eight files, one per statement class, in `tests/slt/`. The format is the familiar one — `statement
+ok`, `statement error <SQLSTATE>`, `query <types>` and its rows — with two additions that earn
+their place: `statement ok` may name the command tag it expects, and `query` checks the letters
+against the *types the server reported*, so a query that silently changed shape fails here rather
+than wherever reads it next. Rows are tab-separated rather than the `sqllogictest` crate's
+whitespace, which cannot express a value with a space in it; `types.slt` has one.
+
+**The corpus was then replayed against a real PostgreSQL 19beta1** — every directive, compared with
+what that server answered. A corpus that only records our own behaviour proves nothing, and this is
+the same capture-first method the rest of the phase used, turned on the tests. Two rounds of it
+found nothing in the executor and three defects in the *verification*, which is worth recording
+because each would have made the check look like it passed while checking almost nothing: psql
+prints NULL as an empty string, so every NULL looked like a mismatch; running each statement in its
+own psql invocation ends the transaction between them, which is exactly what `transactions.slt`
+needs not to happen; and replaying a file's statements against a database the last replay already
+mutated applies every `UPDATE` twice — and a swap applied twice is a swap that never happened.
+
+The result: **every directive agrees**, with two kinds of exception, both marked in the files.
+`unsupported.slt` in its entirety is contract C2 — thirty statements PostgreSQL runs and this node
+answers `0A000` for, which is the deliverable §3 describes rather than an omission. And three lines
+carry a `DIVERGES` comment with the reason beside them: a table with no primary key, a decimal
+literal in an integer column, and `text` ordering by bytes. All three are the divergences already
+argued for in §6 and §11; what is new is that they are now the *complete* list, measured rather
+than believed.
 
 **Unit 2a.** The goldens are recorded, not written. A proxy between `psql` 18.6 and the
 PostgreSQL 19beta1 container logged both directions of five real sessions, and

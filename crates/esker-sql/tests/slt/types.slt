@@ -1,0 +1,88 @@
+# The six types, through a whole round trip: literal in, storage, text out.
+#
+# The value corpus (tests/corpus/pg19_values.txt) checks the formats against a real server; this
+# checks that a value survives the executor as well as the codec.
+
+statement ok
+CREATE TABLE v (id int8 PRIMARY KEY, i int8, t text, b bool, y bytea, ts timestamptz, d double precision)
+
+statement ok INSERT 0 1
+INSERT INTO v VALUES (1, 42, 'hello', true, '\xdeadbeef', '2024-02-29 12:34:56.1+00', 1.5)
+
+query ITBXDR
+SELECT i, t, b, y, ts, d FROM v WHERE id = 1
+----
+42	hello	t	\xdeadbeef	2024-02-29 12:34:56.1+00	1.5
+
+# The ends of each range, and the values with a special text form.
+statement ok
+INSERT INTO v VALUES (2, 9223372036854775807, '', false, '\x', 'infinity', 'Infinity')
+
+statement ok
+INSERT INTO v VALUES (3, -9223372036854775808, ' padded ', NULL, '\x00', '-infinity', 'NaN')
+
+query ITBXDR
+SELECT i, t, b, y, ts, d FROM v WHERE id = 2
+----
+9223372036854775807		f	\x	infinity	Infinity
+
+query ITBXDR
+SELECT i, t, b, y, ts, d FROM v WHERE id = 3
+----
+-9223372036854775808	 padded 	NULL	\x00	-infinity	NaN
+
+# The float notation boundary, measured on a real server: plain inside 10^-4 .. 10^14.
+statement ok INSERT 0 4
+INSERT INTO v (id, d) VALUES (10, 1e14), (11, 1e15), (12, 0.0001), (13, 0.00001)
+
+query R
+SELECT d FROM v WHERE id >= 10 AND id <= 13 ORDER BY id
+----
+100000000000000
+1e+15
+0.0001
+1e-05
+
+# numeric has no signed zero; float8's input function keeps one.
+statement ok
+INSERT INTO v (id, d) VALUES (20, -0.0), (21, '-0')
+
+query R
+SELECT d FROM v WHERE id >= 20 AND id <= 21 ORDER BY id
+----
+0
+-0
+
+# Assignment casts: what a literal becomes in a column of another type.
+statement ok
+CREATE TABLE casts (id int8 PRIMARY KEY, s text, d double precision)
+
+statement ok INSERT 0 4
+INSERT INTO casts VALUES (1, 42, 1), (2, true, 2.5), (3, 1.5, '3.5'), (4, '5', 4)
+
+query IT
+SELECT id, s FROM casts ORDER BY id
+----
+1	42
+2	true
+3	1.5
+4	5
+
+statement error 42804: column "ts" is of type timestamp with time zone but expression is of type integer
+INSERT INTO v (id, ts) VALUES (30, 1)
+
+# DIVERGES from PostgreSQL, deliberately. It rounds this to 3; `numeric` rounds half away from
+# zero where a `float8` rounds half to even, and there is no `numeric` here to be sure with. A
+# silently wrong number is worse than a named gap.
+statement error 0A000: numeric literal
+INSERT INTO v (id, i) VALUES (31, 2.5)
+
+statement error 22007
+INSERT INTO v (id, ts) VALUES (32, 'not a date')
+
+statement error 22023: invalid hexadecimal digit
+INSERT INTO v (id, y) VALUES (33, '\xzz')
+
+# A timestamp past the end of the range is refused, not wrapped.
+statement error 22008
+INSERT INTO v (id, ts) VALUES (34, '294277-01-01 00:00:00+00')

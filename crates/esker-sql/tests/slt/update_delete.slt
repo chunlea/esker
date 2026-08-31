@@ -1,0 +1,105 @@
+# UPDATE and DELETE, and the index entries that have to move with them.
+
+statement ok
+CREATE TABLE u (id int8 PRIMARY KEY, e text UNIQUE, n int8 NOT NULL)
+
+statement ok INSERT 0 3
+INSERT INTO u VALUES (1, 'a', 10), (2, 'b', 20), (3, NULL, 30)
+
+statement ok UPDATE 1
+UPDATE u SET n = 99 WHERE id = 1
+
+query I
+SELECT n FROM u WHERE id = 1
+----
+99
+
+statement ok UPDATE 3
+UPDATE u SET n = 0
+
+statement ok UPDATE 0
+UPDATE u SET n = 1 WHERE id = 999
+
+# A SET expression sees the row as it was, so this swaps rather than assigning twice.
+statement ok
+CREATE TABLE swap (id int8 PRIMARY KEY, a int8, b int8)
+
+statement ok
+INSERT INTO swap VALUES (1, 10, 20)
+
+statement ok UPDATE 1
+UPDATE swap SET a = b, b = a WHERE id = 1
+
+query II
+SELECT a, b FROM swap
+----
+20	10
+
+# The index moves with the value: the old entry must not answer for it.
+statement ok
+UPDATE u SET e = 'z' WHERE id = 1
+
+query I
+SELECT id FROM u WHERE e = 'z'
+----
+1
+
+query I
+SELECT id FROM u WHERE e = 'a'
+----
+
+# And the freed value can be taken.
+statement ok
+UPDATE u SET e = 'a' WHERE id = 2
+
+query I
+SELECT id FROM u WHERE e = 'a'
+----
+2
+
+statement error 23505
+UPDATE u SET id = 3 WHERE id = 1
+
+statement error 23505
+UPDATE u SET e = 'a' WHERE id = 3
+
+statement error 23502
+UPDATE u SET n = NULL WHERE id = 1
+
+statement error 42703: column "nope" of relation "u" does not exist
+UPDATE u SET nope = 1
+
+statement error 22P02: invalid input syntax for type bigint: "x"
+UPDATE u SET n = 'x' WHERE id = 1
+
+# Setting a unique column to what it already is is not a duplicate of itself.
+statement ok UPDATE 1
+UPDATE u SET e = 'a', n = 5 WHERE id = 2
+
+# Moving a row's key moves the row.
+statement ok UPDATE 1
+UPDATE u SET id = 10 WHERE id = 1
+
+query I
+SELECT id FROM u ORDER BY id
+----
+2
+3
+10
+
+statement ok DELETE 0
+DELETE FROM u WHERE id = 999
+
+statement ok DELETE 1
+DELETE FROM u WHERE id = 2
+
+# The index entry went with the row, so the value is free.
+statement ok
+INSERT INTO u VALUES (99, 'a', 1)
+
+statement ok DELETE 3
+DELETE FROM u
+
+query I
+SELECT id FROM u
+----

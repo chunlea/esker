@@ -1,0 +1,62 @@
+# CREATE INDEX and DROP INDEX, including the part that is easy to get wrong: an index over a table
+# that already has rows has to be built, not just declared.
+
+statement ok
+CREATE TABLE t (id int8 PRIMARY KEY, a text, b int8)
+
+statement ok INSERT 0 3
+INSERT INTO t VALUES (1, 'x', 10), (2, 'y', 20), (3, 'z', 30)
+
+# Built over rows that already exist, so the lookup finds them.
+statement ok CREATE INDEX
+CREATE UNIQUE INDEX t_a_key ON t (a)
+
+query I
+SELECT id FROM t WHERE a = 'y'
+----
+2
+
+# A derived name is disambiguated; a name the user chose is not.
+statement ok
+CREATE INDEX ON t (b)
+
+statement ok
+CREATE INDEX ON t (b)
+
+statement ok
+CREATE INDEX mine ON t (b)
+
+statement error 42P07
+CREATE INDEX mine ON t (b)
+
+statement ok CREATE INDEX
+CREATE INDEX IF NOT EXISTS mine ON t (b)
+
+statement ok DROP INDEX
+DROP INDEX t_b_idx1
+
+statement error 42704: index "t_b_idx1" does not exist
+DROP INDEX t_b_idx1
+
+statement ok
+DROP INDEX IF EXISTS t_b_idx1
+
+statement error 42809: "t" is not an index
+DROP INDEX t
+
+# The primary key's index cannot be dropped: the constraint needs it.
+statement error 2BP01
+DROP INDEX t_pkey
+
+# A unique index built over rows that already break it fails, with the same code an INSERT gets.
+statement ok
+CREATE TABLE dupes (id int8 PRIMARY KEY, v text)
+
+statement ok INSERT 0 2
+INSERT INTO dupes VALUES (1, 'same'), (2, 'same')
+
+statement error 23505
+CREATE UNIQUE INDEX dupes_v_key ON dupes (v)
+
+statement ok
+CREATE INDEX dupes_v_idx ON dupes (v)

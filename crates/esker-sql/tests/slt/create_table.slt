@@ -1,0 +1,67 @@
+# CREATE TABLE and DROP TABLE.
+#
+# Every answer here was checked against a real PostgreSQL 19: paste any of these into psql and it
+# says the same thing.
+
+statement ok CREATE TABLE
+CREATE TABLE accounts (id int8 PRIMARY KEY, email text NOT NULL UNIQUE, note text)
+
+statement error 42P07: relation "accounts" already exists
+CREATE TABLE accounts (id int8 PRIMARY KEY)
+
+statement ok CREATE TABLE
+CREATE TABLE IF NOT EXISTS accounts (id int8 PRIMARY KEY)
+
+# A name folds unless it was quoted.
+statement ok
+CREATE TABLE Mixed (Id int8 PRIMARY KEY)
+
+statement error 42P07
+CREATE TABLE mixed (id int8 PRIMARY KEY)
+
+statement ok
+CREATE TABLE "Quoted" (id int8 PRIMARY KEY)
+
+statement ok
+CREATE TABLE quoted (id int8 PRIMARY KEY)
+
+# Every spelling of the six types.
+statement ok
+CREATE TABLE types (a bigint PRIMARY KEY, b int8, c text, d bool, e boolean, f bytea,
+                    g float8, h double precision, i timestamptz, j timestamp with time zone)
+
+# A composite key keeps its own order, which is not the column order.
+statement ok
+CREATE TABLE composite (a int8, b text, PRIMARY KEY (b, a))
+
+statement error 42701: column "a" specified more than once
+CREATE TABLE dup (a int8 PRIMARY KEY, a text)
+
+statement error 42703: column "b" named in key does not exist
+CREATE TABLE badkey (a int8, PRIMARY KEY (b))
+
+# DIVERGES from PostgreSQL, deliberately. The row key *is* the primary key, so a table without one
+# has nowhere to live; PostgreSQL allows it and gives its rows a hidden identity. Contract C2 says
+# what to do about a statement PostgreSQL accepts and we cannot run: name it.
+statement error 0A000: PRIMARY KEY
+CREATE TABLE nokey (a int8)
+
+statement error 42P01: table "nope" does not exist
+DROP TABLE nope
+
+statement ok DROP TABLE
+DROP TABLE IF EXISTS nope
+
+# The name a primary key constraint holds is taken, even though there is no index behind it.
+statement error 42P07
+CREATE INDEX accounts_pkey ON accounts (note)
+
+statement error 42809: "accounts_email_key" is not a table
+DROP TABLE accounts_email_key
+
+statement ok DROP TABLE
+DROP TABLE accounts
+
+# Dropping the table freed every name it held.
+statement ok
+CREATE TABLE accounts_email_key (id int8 PRIMARY KEY)
