@@ -38,79 +38,60 @@ esker-columnar ->  esker-engine          (standalone; nothing depends on it yet)
 
 This lane adds the first edge into the columnar crate: `esker-store -> esker-columnar`.
 
-## OPEN — two questions this plan does not answer, and will not guess
+## The two seams, as ruled
 
-Both are recorded here rather than decided, because getting either wrong is a rewrite of unit 1.
+Both were escalated rather than guessed, because getting either wrong is a rewrite of unit 1. Both
+are now decided and recorded here with the reasoning that decided them.
 
-### OPEN-1: who decodes a row into typed columns — ESCALATED, and not blocking
+### RULED-1: the row value codec moves down to `esker-keys`
 
 The apply target must turn a committed row into `esker_columnar::Value`s. `esker-keys` gives the
-store `split_table` and `split_ts` honestly — tenant, table, and the MVCC suffix. It does **not**
-give the row *value*: that is `esker_sql::row::decode_row`, and `esker-sql` depends on
-`esker-store`, so the store calling it inverts the layering.
+store `split_table` and `split_ts` honestly; the row *value* was `esker_sql::row::decode_row`, and
+`esker-sql` depends on `esker-store`, so the store calling it inverted the layering.
 
-wy-c2 decomposed this better than the first draft of this plan did. The decoder needs two things
-and they have **different answers**:
+wy-c2 cut the question better than this plan's first draft did: the decoder needs **types**, which
+can travel as *data*, and a **codec**, which is *code* and cannot. So the question was never which
+port shape to use — it was where the codec lives.
 
-* **the types, in order** — those can travel as **data**. The SQL node already has to publish a
-  per-table record for Decision 5's flag, on ADR 0021's precedent: a record under its own kind
-  byte, readable by a layer that does not link `esker-sql`. A schema record beside it is the same
-  move.
-* **the codec** — how to walk a row's bytes given those types. That is **code**, and cannot travel
-  as data. Something below `esker-sql` has to own it.
+**Ruled: it moves down to `esker-keys`**, which is the byte-meaning crate; the value format is the
+other half of its one job. wy-c2 executes the move — a pure move plus re-export, goldens
+byte-identical, with an ADR and the `CLAUDE.md` crate-table line. Two facts that made the
+alternative unbuildable, both verified from the manifests: **no crate in this tree links
+`esker-sql`** and it has no binary, so "inject from the composition root" had no *above*; and
+placement will not carry schema, correctly, because PD carries *where* a replica lives and not
+*what* a table looks like (the line phase 6e drew on invariant 7).
 
-So the real question is not which port shape to use; it is **whether the row value codec moves
-down out of `esker-sql`**. That is an architecture decision crossing both lanes, it needs an ADR,
-and it is on the coordinator's desk rather than settled between two lanes mid-flight.
-
-Two facts that bear on it, both verified from the manifests rather than assumed:
-
-* **`esker-cli` does not link `esker-sql`.** In fact *no crate in this tree does*, and `esker-sql`
-  has no binary — it is a leaf library nothing consumes yet. So "the composition root injects an
-  implementation from above" has no *above*: there is no process today holding both a `Store` and
-  the SQL layer. Injection is not wrong in shape, it is unbuildable without giving every storage
-  node the whole SQL layer as a dependency.
-* **Placement will not carry schema**, and should not. PD carries *where* a replica lives, not
-  *what* a table looks like; a placement operator naming a schema would make PD a carrier of SQL
-  semantics, which is the line phase 6e drew when it moved the schema-step drive away from PD on
-  invariant 7. §wire's plumbing carries table ids and replica counts — numbers.
-
-**Why this does not block unit 1.** The port has the *same shape* whichever way the decision goes:
+**This lane keeps building against the port** and swaps the constructor when the move lands:
 
 ```rust
 trait RowDecoder { fn decode(&self, key: &[u8], value: &[u8]) -> Result<Vec<Value>>; }
 ```
 
-Only *who constructs it* changes. Unit 1 takes one by injection and its tests use a hand-written
-fake, so the apply target, the run lifecycle and the differential harness are all writable now.
-This lane is blocked on the **constructor**, not on the trait — so it builds against the trait and
-the constructor question stays open in this file until it is ruled on.
+Unit 1 takes one by injection; its tests use a hand-written fake. Nothing written against the trait
+changes when the real implementor arrives.
 
-### OPEN-2: where MVCC visibility is applied
+### RULED-2: a version-aware scan mode, and this lane now owns all of `esker-columnar`
 
 Decision 4 evaluates visibility **at read time**, so runs hold every version as committed. Applying
-it means "the newest version of each key with `commit_ts <= ts`, unless that version is a delete".
+it means "the newest version of each key with `commit_ts <= ts`, unless that version is a delete" —
+and M2's evaluator could not express it. `commit_ts <= ts` *is* a filter `Expr`; **newest-per-key is
+an argmax**, and no `Expr` does that.
 
-M2's evaluator cannot express that. `ScanOptions` carries one switch (`prune`); `evaluate_with`
-takes a `Fragment` and evaluates every row in the file. `commit_ts <= ts` *is* expressible as a
-filter `Expr` — but **"newest per key" is an argmax**, and no `Expr` in `fragment` does that.
+**Ruled**, and the lane expands to all of `esker-columnar` (its author retired; no other writer):
 
-| | |
-|---|---|
-| **(i)** express it in the fragment filter | impossible: argmax is not an `Expr` |
-| **(ii)** resolve versions at compaction, keep one per key | breaks reading at an older `ts`, which Decision 4 requires |
-| **(iii)** resolve in the store: read candidate rows out, fold there | the store re-implements aggregation, and materialises what pruning exists to avoid |
-| **(iv)** a version-aware scan mode in `esker-columnar` | where the layout knowledge lives; one forward pass if the run is sorted for it |
-
-**Proposed: (iv)**, with the ingestion side paying for it: if each run is sorted by
-`(pk, commit_ts DESC)`, then the newest visible version of a key is the *first* row for that key
-with `commit_ts <= ts`, and the scan is a single forward pass with no hashing and no buffering.
-The sort is a compaction decision, which is squarely this lane; the scan mode is a small addition
-to M2's evaluator, which the brief scopes *away* from this lane ("ingestion+compaction side").
-
-**This needs a scope ruling before unit 3.** Either the evaluator addition is in this lane, or it
-belongs to whoever owns M2's scan. It is a handful of lines against `evaluate_with`, but it is not
-mine to assume.
+* **Runs are sorted `(pk, commit_ts DESC)`.** That is an ingestion and compaction decision, and it
+  is what makes the read cheap: the newest visible version of a key is the *first* row for that key
+  with `commit_ts <= ts`, so the scan is a single forward pass — no hashing, no buffering, no
+  second sort.
+* **The evaluator gains a parameter.** The visibility `ts` arrives from the **wire envelope**
+  (§wire's field, Decision 4), and the **fragment payload does not change**. A fragment stays a
+  description of *what to compute*; the timestamp is a property of *when to read*, and keeping them
+  apart is what stops a fragment from being a different query at a different `ts`.
+* **The differential's reference computes visibility by the same rule — and must implement it
+  independently.** That distinction is the whole value of the harness: same *rule*, second
+  *implementation*. A reference that called the same visibility code would make the comparison a
+  tautology, which is the trap phase 7 named when it said the load-bearing unit is not the
+  evaluator but the differential.
 
 ## The apply target (unit 1)
 
