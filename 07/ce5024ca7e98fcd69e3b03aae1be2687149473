@@ -1,0 +1,16 @@
+crates/esker-client/src/txn.rs
+  h_44076b318daf9c 9,26-31
+crates/esker-txn/src/key.rs
+  h_44076b318daf9c 72,101
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "07ce5024ca7e98fcd69e3b03aae1be2687149473",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
