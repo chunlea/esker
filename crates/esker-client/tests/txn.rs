@@ -391,13 +391,103 @@ fn a_prewrite_conflict_ends_the_transaction() {
         Error::TxnConflict {
             start_ts,
             commit_ts,
+            key: lost,
         } => {
             assert_eq!(start_ts, START_TS);
             assert_eq!(commit_ts, 42);
+            assert_eq!(
+                lost,
+                Some(key(b"k")),
+                "the caller has to know which key lost, or it cannot tell a duplicate key \
+                 from a serialization failure"
+            );
         }
         other => panic!("expected a conflict, got {other:?}"),
     }
     assert_eq!(transport.call_count(), 1, "it stopped at the primary");
+}
+
+/// Which key lost, in a batch where only one did.
+///
+/// This is what a layer above needs to tell a duplicate key from a serialization failure: a
+/// lost race on an ordinary row is one thing and a lost race on a unique index entry is
+/// another, and only the key tells them apart (`docs/txn-spec.md` §6.1). The status list is
+/// positionally aligned with the mutations, so the client already knows — it just has to not
+/// throw it away.
+#[test]
+fn a_conflict_names_the_key_that_lost() {
+    let transport = Arc::new(FakeTransport::new());
+    transport
+        // The primary succeeds; the second of the three secondaries is the one that lost.
+        .script(Rule::new(
+            Matcher::Method(Method::TxnPrewrite),
+            Outcome::PrewriteOk,
+        ))
+        .script(
+            Rule::new(
+                Matcher::Method(Method::TxnPrewrite),
+                Outcome::TxnReply(TxnKvResp::Prewrite {
+                    keys: vec![
+                        TxnStatus::Ok,
+                        TxnStatus::Conflict { commit_ts: 42 },
+                        TxnStatus::Ok,
+                    ],
+                }),
+            )
+            .forever(),
+        );
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+    for k in [
+        b"index/email/a".as_slice(),
+        b"index/email/b",
+        b"index/email/c",
+        b"index/email/d",
+    ] {
+        txn.put(k, b"row");
+    }
+
+    match txn.commit().unwrap_err() {
+        Error::TxnConflict {
+            commit_ts,
+            key: lost,
+            ..
+        } => {
+            assert_eq!(commit_ts, 42);
+            assert_eq!(
+                lost,
+                Some(key(b"index/email/c")),
+                "the second secondary, which is the third key overall"
+            );
+        }
+        other => panic!("expected a conflict, got {other:?}"),
+    }
+}
+
+/// A `Commit` answers for the batch rather than per key, so it names no key — and this layer
+/// does not invent one. A caller reading `None` as "some key lost" would be reading a guess.
+#[test]
+fn a_conflict_with_no_per_key_answer_names_no_key() {
+    let transport = Arc::new(FakeTransport::new());
+    transport
+        .script(Rule::new(Matcher::Method(Method::TxnPrewrite), Outcome::PrewriteOk).forever())
+        .script(
+            Rule::new(
+                Matcher::Method(Method::TxnCommit),
+                Outcome::TxnReply(TxnKvResp::Commit {
+                    status: TxnStatus::Conflict { commit_ts: 42 },
+                }),
+            )
+            .forever(),
+        );
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+    txn.put(b"k", b"v");
+
+    match txn.commit().unwrap_err() {
+        Error::TxnConflict { key: lost, .. } => assert_eq!(lost, None),
+        other => panic!("expected a conflict, got {other:?}"),
+    }
 }
 
 /// A conflict says nothing was written, and the caller may act on that without reading
@@ -407,6 +497,7 @@ fn a_conflict_changed_nothing() {
     let error = Error::TxnConflict {
         start_ts: 1,
         commit_ts: 2,
+        key: None,
     };
     assert!(error.changed_nothing());
     // A transaction settled by someone else is the opposite: something was written, by them.

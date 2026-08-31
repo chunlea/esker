@@ -320,6 +320,14 @@ orderings it can take are worth spelling out, because only one of them is the ob
 Either way the refusal is a write-write conflict on `k` and the loser must start again at a fresh
 `start_ts` — at which point its read of `k` finds the winner's row, and the constraint holds.
 
+**Which key lost is part of the answer.** A `Prewrite` reports per key
+([ADR 0016](adr/0016-txnkv-on-the-wire.md) decision 1), so the refusal names the key rather than only
+the transaction — and it has to, because a lost race on an ordinary row and a lost race on a unique
+index entry are the same event to this layer and different events to the one above it.
+`esker_client::Error::TxnConflict` carries `key: Option<Bytes>`; `None` means the method that refused
+does not answer per key (`Commit`, `Rollback`) and no key was named, which is not the same as no key
+having lost.
+
 `esker-sql` builds unique-index enforcement on exactly this: the index entry is the key, a snapshot
 read proves it absent, and an ordinary `Put` claims it. No `SELECT … FOR UPDATE` and no `Lock`-kind
 record is needed, because the conflict is on a key the transaction **writes**, which is the half of

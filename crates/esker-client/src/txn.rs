@@ -443,8 +443,14 @@ impl Transaction {
 
             // A terminal status ends the transaction, and it ends it now: resolving locks on
             // the other keys would be work for a transaction that is already dead.
-            if let Some(fatal) = statuses.iter().find(|status| status.is_fatal()) {
-                return self.check(fatal.clone());
+            //
+            // By *position*, not by search: the status list is aligned with the mutations, so
+            // the index is which key lost. A caller above needs that — a lost race on a unique
+            // index entry is a duplicate key rather than a serialization failure, and only the
+            // key tells the two apart (`docs/txn-spec.md` §6.1).
+            if let Some(at) = statuses.iter().position(TxnStatus::is_fatal) {
+                let lost = keys.get(at);
+                return self.check(statuses[at].clone(), lost);
             }
             let locks: Vec<LockInfo> = statuses
                 .iter()
@@ -513,7 +519,9 @@ impl Transaction {
             keys: keys.to_vec(),
         };
         match self.call(&request)? {
-            TxnKvResp::Commit { status } => self.check(status),
+            // No key: a `Commit` answers for the batch, not per key, so naming one would be a
+            // guess dressed as a fact.
+            TxnKvResp::Commit { status } => self.check(status, None),
             other => Err(unexpected(Method::TxnCommit, &other)),
         }
     }
@@ -524,7 +532,7 @@ impl Transaction {
             keys: keys.to_vec(),
         };
         match self.call(&request)? {
-            TxnKvResp::Rollback { status } => self.check(status),
+            TxnKvResp::Rollback { status } => self.check(status, None),
             other => Err(unexpected(Method::TxnRollback, &other)),
         }
     }
@@ -575,12 +583,17 @@ impl Transaction {
     }
 
     /// A status that is not `Ok` is the transaction's fate, not a failure of the call.
-    fn check(&self, status: TxnStatus) -> Result<()> {
+    ///
+    /// `key` is the one the status is about, where the method answered per key. `None` where it
+    /// did not — and it stays `None` rather than becoming the batch's first key, because a
+    /// caller that reads it as "this key lost" would be reading a guess.
+    fn check(&self, status: TxnStatus, key: Option<&Bytes>) -> Result<()> {
         match status {
             TxnStatus::Ok => Ok(()),
             TxnStatus::Conflict { commit_ts } => Err(Error::TxnConflict {
                 start_ts: self.start_ts,
                 commit_ts,
+                key: key.cloned(),
             }),
             TxnStatus::RolledBack => Err(Error::TxnSettled {
                 start_ts: self.start_ts,

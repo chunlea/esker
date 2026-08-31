@@ -92,6 +92,15 @@ pub enum Error {
         start_ts: u64,
         /// The winner's commit timestamp.
         commit_ts: u64,
+        /// **Which key lost**, when the store said per key — which `Prewrite` does
+        /// ([ADR 0016](../../docs/adr/0016-txnkv-on-the-wire.md) decision 1).
+        ///
+        /// A caller above this one may need to know: a lost race on an ordinary row is a
+        /// serialization failure and a lost race on a *unique index entry* is a duplicate key,
+        /// and only the key tells them apart (`docs/txn-spec.md` §6.1). `None` means the
+        /// method that refused does not answer per key, so the store named no key and this
+        /// layer will not invent one.
+        key: Option<Bytes>,
     },
 
     /// A transaction was settled by someone else — rolled back because its lock expired, or
