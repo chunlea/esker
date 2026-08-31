@@ -250,6 +250,41 @@ SELECT * FROM esker_diff('d', 'no-such-checkpoint')
 statement error (0A000)
 SELECT id FROM d EXCEPT SELECT id FROM d
 
+# --- esker_flashback
+# ADR 0021 Decision 3's fourth verb, and the one whose *design* is the point. A flashback writes the
+# difference **forwards**, at a fresh commit_ts, and touches no version that already exists -- so
+# the state it undid is still readable and the undo is itself undoable. One that mutated history
+# would be the single operation here that destroys evidence, and it would do it exactly when
+# somebody is working out what happened.
+
+statement ok
+SELECT esker_checkpoint('d2')
+
+statement ok
+DELETE FROM d WHERE id = 2
+
+statement ok
+INSERT INTO d VALUES (9, 'ninth')
+
+# Two rows moved: one deleted comes back, one inserted goes away. Rows nobody touched are not
+# written at all, which is what makes a flashback O(rows changed).
+query T
+SELECT esker_flashback('d', 'd2')
+----
+2
+
+query IT rowsort
+SELECT id, note FROM d
+----
+1	same
+2	new
+4	fresh
+
+# Oracle's spelling is 42601 on a real PostgreSQL as well as here, so the code is parity and only
+# the HINT naming the verb that works is new.
+statement error (42601)
+FLASHBACK TABLE d TO TIMESTAMP '2026-08-30 14:00:00+00'
+
 # --- ALTER TABLE ... SET (retention)
 # The travel window is retention, and there is no second mechanism: how far back you can read is
 # how far back the collector has not yet swept, and those must be one number or the feature is a

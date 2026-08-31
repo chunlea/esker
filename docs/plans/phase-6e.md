@@ -1,7 +1,7 @@
 # Phase 6e plan — online schema change
 
-Status: **units 0-6 complete**, unit 7 (`FLASHBACK`) not reached — written before
-implementation; §9 records progress and §10 what changed.
+Status: **complete**, units 0–7 — written before implementation; §9 records progress and §10
+what changed.
 Design: [ADR 0020](../adr/0020-online-schema-change.md), resting on
 [ADR 0019](../adr/0019-a-row-says-how-many-columns-it-has.md) (the row format) and
 [ADR 0021](../adr/0021-time-machine.md) (retention, which turns out to be the same number as the
@@ -309,6 +309,25 @@ interval after every step is **656 seconds**, and waiting only after the three t
 **24 seconds**. Same safety: every batch runs at write-only, so no state moves and no node can fall
 a step behind while they run. `esker_schema_step`'s answer says which kind of step it took, so a
 driver can tell.
+
+**`FLASHBACK` is `esker_diff` applied backwards, and reusing the merge is the point.** A flashback
+that disagreed with the diff about what changed would be a flashback whose preview was a lie. Its
+own module rather than a mode of the diff, because one writes and the other does not, but the walk
+is the same walk.
+
+**A flashback batch reads both sides to the *smaller* of the two pages' last keys.** A key past the
+end of one page might exist on the other, and calling it an insert or a delete would be deciding a
+comparison from half the evidence. Both sides resume from the same boundary next time.
+
+**Its record stores the target, not just the cursor** — a resume that picked up a cursor without
+checking what it was a cursor *for* would finish somebody else's flashback with its own target and
+leave the table in a state it was never in. Calling `esker_flashback` with a different snapshot
+while one is in flight is refused by name.
+
+**Unlike the schema job, a flashback runs its own batches to completion** rather than needing a
+driver. It is a data operation the user is waiting on rather than a schema change the cluster has to
+agree about, so there is no interval to wait between batches — but the cursor is still durable, so a
+node that dies mid-flashback leaves one and the next call resumes.
 
 **An orphaned job stalls, and that is a liveness gap rather than a safety one.** If the node that
 started a `CREATE INDEX CONCURRENTLY` dies, nothing re-drives the job by itself: it sits at whatever

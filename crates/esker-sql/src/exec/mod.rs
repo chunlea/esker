@@ -28,6 +28,7 @@ mod bind;
 mod cursor;
 mod ddl;
 mod dml;
+mod flashback;
 mod job;
 
 pub use job::BATCH_ROWS;

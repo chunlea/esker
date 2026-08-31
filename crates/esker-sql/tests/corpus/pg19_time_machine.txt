@@ -42,3 +42,5 @@ SELECT * FROM ro_probe AS OF CHECKPOINT 'nightly'	!42601 syntax error at or near
 ALTER TABLE ro_probe SET (retention = '7d')	!22023 unrecognized parameter "retention"
 SELECT esker_checkpoint('nightly')	!42883 function esker_checkpoint(unknown) does not exist
 SELECT * FROM esker_diff('ro_probe', 'a')	!42883 function esker_diff(unknown, unknown) does not exist
+SELECT esker_flashback('ro_probe', 'a')	!42883 function esker_flashback(unknown, unknown) does not exist
+FLASHBACK TABLE ro_probe TO TIMESTAMP '2026-08-30 14:00:00+00'	!42601 syntax error at or near "FLASHBACK"

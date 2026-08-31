@@ -659,6 +659,12 @@ fn recognize_redirect(words: &[&str]) -> Option<&'static str> {
              block. See docs/adr/0021-time-machine.md.",
         ),
         (
+            &["FLASHBACK", "TABLE"],
+            "Esker puts a table back with SELECT esker_flashback('<table>', '<snapshot>'), \
+             which writes the difference forwards rather than unwriting history. See \
+             docs/adr/0021-time-machine.md.",
+        ),
+        (
             &["FOR", "SYSTEM_TIME", "AS", "OF"],
             "Esker reads the past with SET esker.read_as_of = '<timestamp>' or an interval \
              such as '-1h'. See docs/adr/0021-time-machine.md.",

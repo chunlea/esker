@@ -199,6 +199,14 @@ fn lower_verb(query: &Query) -> Result<Option<plan::TimeMachineVerb>> {
     let [SelectItem::UnnamedExpr(Expr::Function(function))] = select.projection.as_slice() else {
         return Ok(None);
     };
+    scalar_verb(function)
+}
+
+/// The scalar half of [`lower_verb`]: `SELECT <verb>(...)` with no `FROM` at all.
+///
+/// Its own function because the two halves are two shapes — a call in the `FROM` clause and a call
+/// in the target list — and together they were more than one screen.
+fn scalar_verb(function: &sqlparser::ast::Function) -> Result<Option<plan::TimeMachineVerb>> {
     let called = function.name.to_string().to_ascii_lowercase();
     let arguments = verb_arguments(function);
     Ok(match (called.as_str(), arguments.as_deref()) {
@@ -211,6 +219,10 @@ fn lower_verb(query: &Query) -> Result<Option<plan::TimeMachineVerb>> {
         ("esker_drop_checkpoint", Some([name])) => {
             Some(plan::TimeMachineVerb::DropCheckpoint { name: name.clone() })
         }
+        ("esker_flashback", Some([table, to])) => Some(plan::TimeMachineVerb::Flashback {
+            table: fold_identifier(table, true).0,
+            to: to.clone(),
+        }),
         ("esker_schema_step", Some([index])) => Some(plan::TimeMachineVerb::SchemaStep {
             // An index *name*, folded the way every relation name is — unlike a checkpoint's,
             // which is a string literal PostgreSQL would not fold.

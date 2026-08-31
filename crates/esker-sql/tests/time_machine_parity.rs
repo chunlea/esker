@@ -83,6 +83,12 @@ const DIVERGENCES: &[(&str, &str)] = &[
         "SELECT * FROM esker_diff('ro_probe', 'a')",
         "The same. Here it is a diff; there it is a function that does not exist.",
     ),
+    (
+        "SELECT esker_flashback('ro_probe', 'a')",
+        "The same again, and the reason `FLASHBACK TABLE` is not the spelling: Oracle's word is \
+         `42601` on PostgreSQL, so taking it would make this node accept syntax the oracle \
+         rejects. It gets a `HINT` naming this verb instead (ADR 0021 Decision 3).",
+    ),
 ];
 
 #[test]

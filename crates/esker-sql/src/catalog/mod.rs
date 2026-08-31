@@ -764,6 +764,46 @@ pub fn decode_job(tenant: u64, key: &[u8], value: &[u8]) -> Result<JobRecord> {
     })
 }
 
+/// A flashback in progress: where it is putting the table back to, and how far it has got.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlashbackRecord {
+    /// The table being put back.
+    pub table_id: u64,
+    /// The snapshot it is being put back to.
+    pub target_ts: u64,
+    /// The row key the next batch starts at. Empty means "from the beginning".
+    pub cursor: Vec<u8>,
+    /// How many rows have been changed so far, for the answer the statement gives.
+    pub changed: u64,
+}
+
+/// Records a flashback, or moves its cursor on.
+pub fn put_flashback(txn: &mut dyn Txn, tenant: u64, record: &FlashbackRecord) {
+    txn.put(
+        &record::flashback_key(tenant, record.table_id),
+        &record::encode_flashback(record.target_ts, &record.cursor, record.changed),
+    );
+}
+
+/// The flashback in progress on one table, or `None`.
+pub fn flashback(txn: &dyn Txn, tenant: u64, table_id: u64) -> Result<Option<FlashbackRecord>> {
+    let Some(bytes) = txn.get(&record::flashback_key(tenant, table_id))? else {
+        return Ok(None);
+    };
+    let (target_ts, cursor, changed) = record::decode_flashback(&bytes)?;
+    Ok(Some(FlashbackRecord {
+        table_id,
+        target_ts,
+        cursor,
+        changed,
+    }))
+}
+
+/// Forgets a flashback, when it has finished.
+pub fn drop_flashback(txn: &mut dyn Txn, tenant: u64, table_id: u64) {
+    txn.delete(&record::flashback_key(tenant, table_id));
+}
+
 /// Sets the retention override for one table, in milliseconds.
 ///
 /// It does **not** bump the catalog version, and that is deliberate. Retention changes nothing

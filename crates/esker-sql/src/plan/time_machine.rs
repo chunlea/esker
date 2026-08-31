@@ -36,6 +36,21 @@ pub enum TimeMachineVerb {
     },
     /// `SELECT * FROM esker_checkpoints()`. A name you cannot list is a name you cannot use.
     ListCheckpoints,
+    /// `SELECT esker_flashback('<table>', '<snapshot>')` — put a table back, by writing forwards.
+    ///
+    /// ADR 0021 Decision 3's fourth verb. **Compensating writes, never a rewrite of history**: the
+    /// difference between now and the target is written as an ordinary transaction at a fresh
+    /// `commit_ts`, so every version that existed before is still there and still readable `AS OF`
+    /// an instant before the correction. An undo is itself undoable, and the audit trail survives
+    /// the fix — which is the whole argument, because the alternative destroys evidence exactly
+    /// when somebody is trying to work out what happened.
+    Flashback {
+        /// The table to put back, folded.
+        table: String,
+        /// The snapshot to put it back to, as a token or a checkpoint name — the same namespace
+        /// `SET TRANSACTION SNAPSHOT` and `esker_diff` read.
+        to: String,
+    },
     /// `SELECT * FROM esker_schema_jobs()` — what schema changes are in flight, and where each is.
     ///
     /// The `psql`-visible progress ADR 0020 asks for: a human watching a `CREATE INDEX

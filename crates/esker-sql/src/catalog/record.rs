@@ -10,6 +10,7 @@
 //! 'm' ++ "sql" ++ 'a' ++ tenant:u64 ++ id:u64  one table's next internal row id
 //! 'm' ++ "sql" ++ 'c' ++ tenant:u64 ++ name    a checkpoint: a name and the timestamp it means
 //! 'm' ++ "sql" ++ 'j' ++ tenant:u64 ++ id:u64  a schema-change job, and how far its backfill got
+//! 'm' ++ "sql" ++ 'f' ++ tenant:u64 ++ id:u64  a flashback in progress, and how far it got
 //! ```
 //!
 //! The two retention records are read by the **garbage collector**, which lives below this crate
@@ -70,6 +71,7 @@ const KIND_RETENTION: u8 = b'r';
 const KIND_ROW_ID: u8 = b'a';
 const KIND_CHECKPOINT: u8 = b'c';
 const KIND_JOB: u8 = b'j';
+const KIND_FLASHBACK: u8 = b'f';
 
 /// Tags for [`ColumnType`] as stored. Ours rather than PostgreSQL's OIDs, because these are a
 /// format we own and must never move; the OIDs stay on the wire where they belong.
@@ -310,6 +312,51 @@ pub(super) fn job_index_id(tenant: u64, key: &[u8]) -> Result<u64> {
     codec::decode_u64(rest)
         .map(|(id, _)| id)
         .map_err(|error| corrupt(format!("a job key with no index id: {error}")))
+}
+
+/// `'m' ++ "sql" ++ 'f' ++ tenant ++ table_id`. A flashback in progress.
+///
+/// Keyed by the **table**, because a flashback is about one table and two of them on one table
+/// would be two people undoing each other. Its own kind rather than a field on the job record: a
+/// schema-change job is about an index and a flashback is about rows, and one record holding
+/// either would be a record whose meaning depends on which fields are set.
+#[must_use]
+pub(super) fn flashback_key(tenant: u64, table_id: u64) -> Vec<u8> {
+    let mut suffix = [SQL, &[KIND_FLASHBACK]].concat();
+    codec::encode_u64(tenant, &mut suffix);
+    codec::encode_u64(table_id, &mut suffix);
+    prefix::meta_key(&suffix)
+}
+
+/// A flashback: the instant it is putting the table back to, and how far it has got.
+///
+/// The **target** is stored, not just the cursor, and that is the point of storing anything: a
+/// resume that picked up a cursor without checking what it was a cursor *for* would finish
+/// somebody else's flashback with its own target, leaving a table that was never in either state.
+#[must_use]
+pub(super) fn encode_flashback(target_ts: u64, cursor: &[u8], changed: u64) -> Vec<u8> {
+    let mut out = vec![CATALOG_FORMAT_VERSION];
+    out.extend_from_slice(&target_ts.to_le_bytes());
+    varint::put_u64(changed, &mut out);
+    varint::put_u64(cursor.len() as u64, &mut out);
+    out.extend_from_slice(cursor);
+    out
+}
+
+/// Reads a flashback back: `(target_ts, cursor, changed)`.
+pub(super) fn decode_flashback(bytes: &[u8]) -> Result<(u64, Vec<u8>, u64)> {
+    let mut reader = Reader::new(bytes)?;
+    let target_ts = reader.u64_le()?;
+    let changed = reader.varint()?;
+    let len = reader.count()?;
+    let (cursor, rest) = reader
+        .bytes
+        .split_at_checked(len)
+        .ok_or_else(|| corrupt(format!("a flashback cursor of {len} bytes is truncated")))?;
+    let cursor = cursor.to_vec();
+    reader.bytes = rest;
+    reader.finish()?;
+    Ok((target_ts, cursor, changed))
 }
 
 /// A checkpoint's timestamp, behind the same version byte as every other record.

@@ -1001,3 +1001,190 @@ fn add_column_alone_is_not_a_change_because_it_rewrites_no_row() {
         "no row was rewritten, so no row changed"
     );
 }
+
+// --- FLASHBACK ---------------------------------------------------------------------------------
+//
+// ADR 0021 Decision 3's fourth verb, and the one whose *design* is the point rather than its
+// mechanism. A flashback writes the difference **forwards**, at a fresh commit_ts, and touches no
+// version that already exists — so the state it undid is still there, still readable, and the undo
+// is itself undoable. A flashback that mutated history would be the one operation in this system
+// that destroys evidence, and it would destroy it exactly when somebody is working out what
+// happened.
+
+/// The three shapes of change, put back: a row deleted comes back, a row inserted goes away, and a
+/// row updated returns to what it was. Rows nobody touched are not written at all.
+#[test]
+fn a_flashback_restores_deletes_removes_inserts_and_reverts_updates() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY, note text)")
+        .unwrap();
+    node.run("INSERT INTO t VALUES (1, 'same'), (2, 'old'), (3, 'gone')")
+        .unwrap();
+    node.run("SELECT esker_checkpoint('before')").unwrap();
+
+    node.run("UPDATE t SET note = 'new' WHERE id = 2").unwrap();
+    node.run("DELETE FROM t WHERE id = 3").unwrap();
+    node.run("INSERT INTO t VALUES (4, 'fresh')").unwrap();
+
+    assert_eq!(
+        node.rows("SELECT esker_flashback('t', 'before')"),
+        [[Some("3".to_owned())]],
+        "three rows moved, and row 1 was not one of them"
+    );
+    assert_eq!(
+        node.rows("SELECT id, note FROM t ORDER BY id"),
+        [
+            [Some("1".to_owned()), Some("same".to_owned())],
+            [Some("2".to_owned()), Some("old".to_owned())],
+            [Some("3".to_owned()), Some("gone".to_owned())],
+        ]
+    );
+}
+
+/// **The undo is undoable**, which is the whole argument for compensating writes. The state before
+/// the flashback is still readable `AS OF` an instant before it, and flashing back to *that* puts
+/// it right back — no version was ever destroyed.
+#[test]
+fn a_flashback_is_itself_undoable_because_it_wrote_nothing_away() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY, note text)")
+        .unwrap();
+    node.run("INSERT INTO t VALUES (1, 'original')").unwrap();
+    node.run("SELECT esker_checkpoint('before')").unwrap();
+
+    node.run("UPDATE t SET note = 'wrong' WHERE id = 1")
+        .unwrap();
+    // The mistake, named — the state a flashback is about to walk away from.
+    node.run("SELECT esker_checkpoint('mistake')").unwrap();
+
+    node.run("SELECT esker_flashback('t', 'before')").unwrap();
+    assert_eq!(
+        node.rows("SELECT note FROM t"),
+        [[Some("original".to_owned())]]
+    );
+
+    // The state it undid is still there, which is what "writes forwards" buys.
+    node.run("BEGIN").unwrap();
+    node.run("SET TRANSACTION SNAPSHOT 'mistake'").unwrap();
+    assert_eq!(
+        node.rows("SELECT note FROM t"),
+        [[Some("wrong".to_owned())]]
+    );
+    node.run("ROLLBACK").unwrap();
+
+    // And so the flashback can be flashed back.
+    node.run("SELECT esker_flashback('t', 'mistake')").unwrap();
+    assert_eq!(
+        node.rows("SELECT note FROM t"),
+        [[Some("wrong".to_owned())]]
+    );
+}
+
+/// Indexes are maintained by the path an `UPDATE` uses, not by a shortcut — so an index is correct
+/// after a flashback, and a flashback that would violate a `UNIQUE` fails like any other write.
+#[test]
+fn a_flashback_maintains_every_index_through_the_ordinary_write_path() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY, k int8 UNIQUE)")
+        .unwrap();
+    node.run("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
+    node.run("SELECT esker_checkpoint('before')").unwrap();
+
+    node.run("UPDATE t SET k = 30 WHERE id = 1").unwrap();
+    node.run("DELETE FROM t WHERE id = 2").unwrap();
+    assert_eq!(
+        node.rows("SELECT id FROM t WHERE k = 10"),
+        Vec::<Vec<Option<String>>>::new()
+    );
+
+    node.run("SELECT esker_flashback('t', 'before')").unwrap();
+
+    // Every lookup goes through the unique index, and every one of them is right.
+    assert_eq!(
+        node.rows("SELECT id FROM t WHERE k = 10"),
+        [[Some("1".to_owned())]]
+    );
+    assert_eq!(
+        node.rows("SELECT id FROM t WHERE k = 20"),
+        [[Some("2".to_owned())]],
+        "the deleted row's index entry came back with it"
+    );
+    assert!(
+        node.rows("SELECT id FROM t WHERE k = 30").is_empty(),
+        "and the entry it moved away from is gone"
+    );
+}
+
+/// A table larger than one batch is completely put back, and the cursor is what makes that true —
+/// the same requirement, and the same shape, as the index backfill's.
+#[test]
+fn a_flashback_larger_than_one_batch_finishes() {
+    let rows = 300;
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY, n int8)")
+        .unwrap();
+    let values: Vec<String> = (1..=rows).map(|id| format!("({id}, {id})")).collect();
+    node.run(&format!("INSERT INTO t VALUES {}", values.join(", ")))
+        .unwrap();
+    node.run("SELECT esker_checkpoint('before')").unwrap();
+
+    node.run("DELETE FROM t").unwrap();
+    assert!(node.rows("SELECT id FROM t").is_empty());
+
+    assert_eq!(
+        node.rows("SELECT esker_flashback('t', 'before')"),
+        [[Some(rows.to_string())]]
+    );
+    assert_eq!(node.rows("SELECT id FROM t").len(), rows);
+}
+
+/// A snapshot that is not there is `42704`, like every other read at a name that does not exist —
+/// the same namespace `SET TRANSACTION SNAPSHOT` and `esker_diff` read, so anything you can look at
+/// you can go back to.
+#[test]
+fn a_flashback_to_a_snapshot_that_is_not_there_is_42704() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY)").unwrap();
+    assert_eq!(
+        node.fails("SELECT esker_flashback('t', 'nope')").sqlstate(),
+        sqlstate::UNDEFINED_OBJECT
+    );
+    assert_eq!(
+        node.fails("SELECT esker_flashback('nosuch', 'nope')")
+            .sqlstate(),
+        sqlstate::UNDEFINED_OBJECT
+    );
+}
+
+/// A flashback is a write, so at a past snapshot it is `25006` like any other. Writing the present
+/// from a transaction that may not write is exactly what the rule forbids.
+#[test]
+fn a_flashback_is_refused_while_reading_the_past() {
+    let mut node = Node::new();
+    let before = a_row_with_a_past(&mut node);
+    node.run(&format!(
+        "SET esker.read_as_of = '{}'",
+        esker_sql::time_machine::render(before)
+    ))
+    .unwrap();
+    let error = node.fails(&format!("SELECT esker_flashback('t', '{}')", token(before)));
+    assert_eq!(error.sqlstate(), sqlstate::READ_ONLY_SQL_TRANSACTION);
+    assert_eq!(
+        error.to_string(),
+        "cannot execute esker_flashback in a read-only transaction"
+    );
+}
+
+/// `FLASHBACK TABLE` is Oracle's spelling and neither `sqlparser` nor PostgreSQL 19 reads it, so it
+/// is `42601` on both — and carries a `HINT` naming the verb that works, like the other three
+/// spellings this node redirects rather than invents.
+#[test]
+fn the_flashback_table_spelling_gets_a_redirect() {
+    let error =
+        parse_statements("FLASHBACK TABLE t TO TIMESTAMP '2026-08-30 14:00:00+00'").unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::SYNTAX_ERROR);
+    assert!(
+        error.hint().unwrap().contains("esker_flashback"),
+        "{error:?}"
+    );
+}

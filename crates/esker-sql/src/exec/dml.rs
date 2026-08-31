@@ -100,7 +100,7 @@ fn target_columns(table: &TableDef, insert: &Insert) -> Result<Vec<usize>> {
 }
 
 /// Writes one row and its index entries, checking every uniqueness constraint on the way.
-fn write_row(
+pub(super) fn write_row(
     executor: &Executor,
     txn: &mut dyn Txn,
     table: &TableDef,
@@ -323,7 +323,7 @@ fn check_not_null(table: &TableDef, row: &[Datum]) -> Result<()> {
 }
 
 /// Deletes a row and every index entry built from it.
-fn remove_row(
+pub(super) fn remove_row(
     executor: &Executor,
     txn: &mut dyn Txn,
     table: &TableDef,

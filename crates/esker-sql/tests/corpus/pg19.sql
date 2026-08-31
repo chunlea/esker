@@ -481,6 +481,7 @@ ALTER TABLE t SET (retention = 604800000);
 SELECT pg_export_snapshot();
 SELECT esker_checkpoint('nightly');
 SELECT * FROM esker_diff('t', 'nightly');
+SELECT esker_flashback('t', 'nightly');
 SELECT * FROM esker_diff('t', 'nightly', 'monthly');
 SELECT esker_drop_checkpoint('nightly');
 SELECT * FROM esker_checkpoints();

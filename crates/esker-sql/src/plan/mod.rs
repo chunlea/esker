@@ -120,6 +120,10 @@ impl Statement {
             // one of their own (`crate::exec::verbs`) — but a schema step is a real DDL move and
             // has no business happening under a read of the past.
             Statement::TimeMachine(TimeMachineVerb::SchemaStep { .. }) => Some("esker_schema_step"),
+            // A flashback is a write in the plainest sense — it is the *point* of it — so at a past
+            // snapshot it is refused like any other. Flashing back while reading the past would be
+            // writing the present from a transaction that may not write.
+            Statement::TimeMachine(TimeMachineVerb::Flashback { .. }) => Some("esker_flashback"),
             Statement::TimeMachine(_)
             | Statement::Select(_)
             | Statement::Explain(_)

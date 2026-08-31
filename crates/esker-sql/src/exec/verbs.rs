@@ -32,7 +32,7 @@ use crate::backend::Txn;
 use crate::catalog;
 use crate::error::Result;
 use crate::error::SqlError;
-use crate::exec::{Executor, for_each_page, job};
+use crate::exec::{Executor, flashback, for_each_page, job};
 use crate::pgwire::message::FieldDescription;
 use crate::pgwire::session::Outcome;
 use crate::plan::TimeMachineVerb;
@@ -50,6 +50,7 @@ pub(super) fn run(
         TimeMachineVerb::DropCheckpoint { name } => drop_one(executor, name),
         TimeMachineVerb::ListCheckpoints => list(executor, txn),
         TimeMachineVerb::Diff { table, from, to } => diff(executor, table, from, to.as_deref()),
+        TimeMachineVerb::Flashback { table, to } => run_flashback(executor, txn, table, to),
         TimeMachineVerb::ListSchemaJobs => list_jobs(executor, txn),
         TimeMachineVerb::SchemaStep { index } => schema_step(executor, txn, index),
     }
@@ -140,6 +141,63 @@ fn list(executor: &mut Executor, txn: &mut dyn Txn) -> Result<Outcome> {
         rows,
         tag,
     })
+}
+
+/// `SELECT esker_flashback('<table>', '<snapshot>')` — put a table back, and say how many rows
+/// moved.
+///
+/// **Compensating writes** (ADR 0021 Decision 3): the difference between now and the target,
+/// written forwards at a fresh `commit_ts`. Nothing that already exists is touched, so every state
+/// the table was in is still readable `AS OF` an instant before this — an undo is undoable, and
+/// the audit trail survives the correction.
+///
+/// Runs its batches here rather than returning a handle, because a flashback is a data operation
+/// the user is waiting on rather than a schema change the cluster has to agree about. The **cursor
+/// is still durable**: a node that dies mid-flashback leaves one, and calling the verb again
+/// resumes from it instead of starting over — which on a table big enough to need batching is the
+/// difference between finishing and not.
+fn run_flashback(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    table: &str,
+    to: &str,
+) -> Result<Outcome> {
+    let tenant = executor.tenant;
+    let target = executor.snapshot_named(to)?;
+    let def = executor.require_table(txn, table)?;
+
+    // An existing record wins, and its **target** wins with it: resuming somebody else's flashback
+    // with a different target would leave the table in a state it was never in.
+    let existing = catalog::flashback(txn, tenant, def.id)?;
+    if let Some(record) = &existing
+        && record.target_ts != target
+    {
+        return Err(SqlError::FeatureNotSupported(format!(
+            "a flashback of \"{table}\" to another snapshot is already in progress; \
+             finish it by calling esker_flashback with that snapshot"
+        )));
+    }
+    if existing.is_none() {
+        let mut own = executor.plain_read()?;
+        catalog::put_flashback(
+            &mut *own,
+            tenant,
+            &catalog::FlashbackRecord {
+                table_id: def.id,
+                target_ts: target,
+                cursor: Vec::new(),
+                changed: 0,
+            },
+        );
+        own.commit()?;
+    }
+
+    // Batch until it finishes. Each is its own transaction, so a crash anywhere leaves a cursor.
+    loop {
+        if let Some(changed) = flashback::batch(executor, def.id)? {
+            return Ok(one_text("esker_flashback", changed.to_string()));
+        }
+    }
 }
 
 /// `SELECT * FROM esker_schema_jobs()` — every schema change in flight, and where each one is.
