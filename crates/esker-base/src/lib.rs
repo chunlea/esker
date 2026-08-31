@@ -12,8 +12,8 @@
 //! * Nothing here allocates on a decode path unless the caller asked for an owned value,
 //!   and nothing here panics on adversarial input — malformed bytes come back as an error
 //!   (`CLAUDE.md` invariant 9).
-//! * [`crc32c`] and [`rng`] match published reference vectors, not just themselves. A
-//!   self-consistent property test will happily bless a wrong algorithm.
+//! * [`crc32c`], [`rng`], [`sha256`] and [`hmac`] match published reference vectors, not just
+//!   themselves. A self-consistent property test will happily bless a wrong algorithm.
 //! * [`rng::Pcg32`] is the only source of randomness in the project. No component may reach
 //!   for OS entropy or a thread-local generator: determinism is what makes the simulator and
 //!   the model checker useful (`docs/DESIGN.md` §5, §11).
@@ -24,5 +24,7 @@
 
 pub mod crc32c;
 pub mod hash;
+pub mod hmac;
 pub mod rng;
+pub mod sha256;
 pub mod varint;
