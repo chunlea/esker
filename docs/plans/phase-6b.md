@@ -232,8 +232,8 @@ written; this section is the diff.
 | 4. `FileLocation`, the manifest record, and `fs::tier::TieredFileSystem` | done — `720abf0` |
 | 5. `MinIO` integration: `esker-s3`'s four calls, and the engine's tier end to end | done — `a12166d`, `720abf0` |
 | 6. `bench --sst-store`, and `docs/bench/phase-6b.md` | done — `00b737f` |
+| 6. `esker server --sst-store` and the store-level acceptance | done — `843c8bf`, after `StoreOptions::fs` landed in `9dd71b1` |
 | Region hibernation (§6b item 2) | **not done.** It was "ADR and design only, unless time allows"; it did not. Nothing depends on it |
-| `esker server --sst-store` | **blocked, not done.** See below |
 
 ### Departures from the plan
 
@@ -265,12 +265,33 @@ written; this section is the diff.
    data. List-and-compare is cheap and belongs in a tool, not on the write path.
 5. **A tiered-read block size.** 4 KiB is tuned for a local SSD; a tiered SST pays a round trip
    per block. Measure before adding the knob.
+6. **The rest of the engine's knobs on `esker server`.** `--write-buffer-size` landed here
+   because the acceptance needed it; `docs/bench/phase-4.md` wanted `region_split_size` and the
+   heartbeat intervals for the same reason and had to wrap the binary instead.
 
-### What `esker-store` needs, which this lane did not have
+### The acceptance, and the bug it found
 
-`esker-store` is frozen for this lane, so `esker server --sst-store` is not wired. It needs one
-change, and only one: `StoreOptions` gains an `fs: Arc<dyn FileSystem>` (defaulting to
-`LocalFileSystem::new()`), and `open_engine` passes it to `Db::open_with` instead of
-constructing a `LocalFileSystem` itself (`crates/esker-store/src/server.rs:288`). Everything on
-this side of that line is built and tested: `esker-cli bench --sst-store` does exactly this
-wiring and is the worked example.
+`crates/esker-cli/tests/tier_acceptance.rs` runs the scenario the phase asks for against three
+store processes and a real `MinIO`: node 3 uploads its SSTs, is killed, misses a phase of
+writes, loses all six SSTs, and comes back holding all 2,400 keys. All six deleted files
+reappear under the same numbers, which is what distinguishes recovery from object storage from
+recovery by Raft snapshot. `docs/bench/phase-6b.md` §5 has the numbers.
+
+**The first version of it proved nothing, and that is the most useful thing this lane found.**
+Deleting the SSTs lost zero keys with or without a tier, because an idle column family was
+pinning the write-ahead log: `oldest_log` answered a stale `active_log` for a family with an
+empty memtable, so `esker-store`'s idle `lock` and `write` families held every segment the
+database had ever written — 41 surviving 40 flushes. Every write was still in the log, recovery
+replayed the whole history, and the SSTs were decoration. Fixed in `b790f50`; with the fix the
+untiered control loses 1,617 of 2,000 reads, which is what makes the tiered run mean something.
+
+A test that cannot tell a working tier from a broken one is a test that will pass on the day the
+tier breaks. This one now fails without either half.
+
+### Two harness lessons, for whoever writes the next multi-process test
+
+- **Stop the supervisor with `SIGINT`, not `SIGKILL`.** `cluster start` stops its children on
+  ctrl-C; killing it outright orphans three stores that then sit on their ports until the *next*
+  test fails to start a cluster, for reasons that have nothing to do with it.
+- **Keep the supervisor's output.** "The cluster did not start" is not a diagnosis, and the log
+  is the only thing that says why.

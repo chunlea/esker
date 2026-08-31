@@ -118,3 +118,71 @@ Two smaller ones, in order of expected value:
 - **The mixed hit rate.** See §1: at open granularity there is nothing between 0% and 100% for
   a four-file database. A run with enough files and enough locality to produce a middling hit
   rate would be a better bench, and is worth building when there is a workload that justifies it.
+
+---
+
+## 5. The acceptance: a store loses its SSTs and rebuilds
+
+`prompts/06-sql-serverless.md` §6b, Acceptance: *a store can be started with
+`--sst-store s3://bucket/prefix` against `MinIO`, lose its local disk, and rebuild from object
+storage plus its Raft peers with no data loss.*
+
+Run by `crates/esker-cli/tests/tier_acceptance.rs`, against three real store **processes** and
+the same container as above. Scheduled after `StoreOptions::fs` landed (`9dd71b1`).
+
+### The scenario, and why it is shaped this way
+
+```text
+  phase A   3 nodes up     2,000 keys, flushed to SSTs, uploaded   -> only S3 can return these
+  node 3 SIGKILLed
+  phase B   2 nodes up     400 keys committed by the quorum        -> only the peers can return these
+  node 3's *.sst deleted   (manifest, WAL and Raft log all kept)
+  node 3 restarted
+```
+
+The two halves are separately necessary on purpose. Phase A cannot come back from the peers'
+Raft log alone once it is behind node 3's applied index, and phase B cannot come back from
+object storage because node 3 was not there to write it. A run that passed with only one of the
+two mechanisms working would not be an acceptance of anything.
+
+### Result
+
+| | |
+|---|---|
+| SSTs node 3 uploaded | 6 |
+| SSTs deleted while it was down | 6 — `000006`, `000012`, `000015`, `000017`, `000019`, `000021` |
+| SSTs on its disk after the restart | 8 |
+| **of the deleted six, how many came back** | **6 of 6, under the same numbers** |
+| keys readable from node 3's own engine | 2,400 of 2,400 (2,000 phase A + 400 phase B) |
+| **untiered control**: same deletion, no tier | **1,617 of 2,000 reads fail** |
+
+**The file names are the evidence.** A Raft snapshot would have re-ingested the range under
+*new* file numbers, so the reappearance of these exact six is what says object storage did the
+work rather than the peers quietly doing all of it. The untiered control is what says the files
+were load-bearing at all.
+
+The final check opens node 3's database **directly** rather than reading through the cluster.
+Reading through the cluster proves only that *some* node has the data — a leader that never
+lost anything answers every query. Opening node 3's engine on the same tiered filesystem it ran
+with is the only check that says what *that node* holds.
+
+### What the first attempt proved instead, and the bug behind it
+
+The first run of this test passed its key checks and meant nothing: deleting node 3's six SSTs
+lost **zero** keys, with or without a tier. The reason was not tiering at all.
+
+`roll_log_and_switch` updates a family's `active_log` only when it switches that family, so a
+family that goes idle keeps a stale one — and `oldest_log` answered it unconditionally, pinning
+the log number for ever. `esker-store` opens four families and a RawKV workload writes to two;
+`lock` and `write` sat empty and held every segment the database had ever written. Measured:
+**41 WAL segments survived 40 flushes**, one per flush.
+
+So every write ever made was still in the log, recovery replayed the entire history, and the
+SSTs were decoration. Two ordinary consequences — a data directory that grows without bound and
+a recovery that gets slower for ever — and one that hid them: an acceptance test that could not
+fail. Fixed in `b790f50`, failure-verified by reverting it (41 segments, then ≤ 3), and the
+control above is the number that says the fix is what made this test mean something.
+
+It is worth saying plainly that the tiering work did not find this bug — **the attempt to prove
+tiering worked** did. A test that cannot distinguish a working tier from a broken one is a test
+that will pass on the day the tier breaks.

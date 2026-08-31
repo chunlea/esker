@@ -221,6 +221,15 @@ a snapshot older than the delete still has to see what it deleted.
 Shared WAL and seqno space; separate memtables, levels, options (prefix extractor, block size,
 compression, filter). `WriteBatch` across CFs is atomic.
 
+**One shared WAL means one shared retirement rule**, and it is sharper than it looks: a segment
+may be deleted only when *no* family still needs it, so the slowest family sets the pace for
+every other. A family with unflushed data in segment *N* keeps *N* and everything after it. A
+family that is **empty** keeps nothing — it has no unflushed data, and a write arriving later
+lands in whatever segment is current then. Getting that second clause wrong is how an idle
+family pins the log for ever: `esker-store` opens four families and a RawKV workload writes to
+two, so `lock` and `write` would otherwise hold every segment the database ever wrote. See
+`db/flush.rs`'s `oldest_log`, which carries the reasoning and the measurement.
+
 The engine creates no column family of its own: `Db::open` opens the ones the caller names,
 creating any that are missing, and also opens any the database already holds — hiding data a
 database contains is worse than opening more than was asked for. `create_cf` and `drop_cf` work
