@@ -26,8 +26,8 @@ use crate::catalog::{ColumnDef, TableDef};
 use crate::error::{Result, SqlError};
 use crate::plan::{BinaryOp, Expr, Node, Select, SelectItem, SortKey};
 use crate::row::{self, RowSchema};
+use crate::value::PgType;
 use crate::value::{ColumnType, Datum};
-use crate::value::{PgType};
 
 /// The tables a column reference in one query may name, in the order their columns appear in a
 /// row.
