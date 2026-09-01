@@ -1,0 +1,34 @@
+docs/plans/phase-9-rails.md
+  s_e2fd0c54b9d574::t_3f98ad70c71e7f 3,469-477,952
+  s_0100922e76a475::t_e28d26e6575359 108-113
+  s_0100922e76a475::t_15532bdd3e558b 114-116
+  s_e2fd0c54b9d574::t_b76e29e57c7ee1 117-122
+docs/adr/0033-tier-1-of-the-type-surface.md
+  s_e2fd0c54b9d574::t_5ca474316b139c 1,41,45-46,67-97,143-148,155-157,163-187
+  s_e2fd0c54b9d574::t_19941e5e1e2bac 188-190
+  s_e2fd0c54b9d574::t_ec3e884a9e13c8 191-193
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "43344039824d2b3ebd650a9e0f2ac3052b4fba7e",
+  "prompts": {},
+  "sessions": {
+    "s_0100922e76a475": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9838aaeb-6dbb-4538-8e1f-1c9ba03c938b",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    },
+    "s_e2fd0c54b9d574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "671f3143-5435-4676-97d9-490a56835160",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
