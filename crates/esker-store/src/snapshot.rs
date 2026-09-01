@@ -516,10 +516,18 @@ fn expect_kind(input: &mut Decoder<'_>, kind: u8) -> Result<(), ProtoError> {
         .get_u8("snapshot.version")
         .map_err(|error| ProtoError::corrupt("snapshot chunk", error.to_string()))?;
     if version != SNAPSHOT_FORMAT_VERSION {
-        return Err(ProtoError::corrupt(
-            "snapshot chunk",
-            format!("format version {version}, expected {SNAPSHOT_FORMAT_VERSION}"),
-        ));
+        // **A version disagreement, not corruption.** A v1 sender is a store of an older build
+        // saying something well-formed that this build must not act on, and the two are worth
+        // telling apart: corruption is a reason to retry the transfer, a version mismatch is a
+        // reason to stop. Same rule and same error as the transport handshake
+        // (`esker_proto::transport`): no downgrade, because a protocol that quietly agrees to a
+        // lower version is one whose behaviour nobody can state. Refused on the **first byte**,
+        // before the kind or any body is read, so a v1 chunk can never be mis-parsed as a v2 one
+        // — which for the pairs chunk would read v1's CRC as v2's column family.
+        return Err(ProtoError::WireVersion {
+            expected: u32::from(SNAPSHOT_FORMAT_VERSION),
+            actual: u32::from(version),
+        });
     }
     let found = input
         .get_u8("snapshot.kind")
@@ -574,7 +582,7 @@ mod tests {
     };
     use bytes::Bytes;
     use esker_engine::{Db, LocalFileSystem, Options, WriteBatch, WriteOptions, cf};
-    use esker_proto::{Epoch, Peer, Region};
+    use esker_proto::{Epoch, Peer, ProtoError, Region};
     use esker_raft::{ConfState, SnapshotMeta};
     use std::sync::Arc;
 
@@ -744,6 +752,103 @@ mod tests {
             assert!(
                 decode_pairs(&damaged).is_err(),
                 "a flip at byte {at} was accepted"
+            );
+        }
+    }
+
+    /// **The goldens.** These bytes are the format: a change to them is a format change and needs
+    /// a version bump and an ADR, not a rewritten expectation.
+    ///
+    /// Both chunk kinds, because the version byte leads both and a bump that moved one and not
+    /// the other would be two formats sharing a number.
+    #[test]
+    fn the_chunk_bytes_are_the_format() {
+        let header = SnapshotHeader {
+            region: Region {
+                id: 3,
+                start_key: Bytes::from_static(b"d"),
+                end_key: Bytes::from_static(b"m"),
+                peers: vec![Peer::voter(1, 10)],
+                epoch: Epoch::new(2, 5),
+            },
+            meta: SnapshotMeta {
+                index: 42,
+                term: 7,
+                conf: ConfState {
+                    voters: vec![10],
+                    learners: vec![30],
+                },
+            },
+        };
+        assert_eq!(
+            header.encode().to_vec(),
+            vec![
+                2, // format version
+                1, // chunk kind: header
+                3, // region id
+                1, b'd', // start key
+                1, b'm', // end key
+                2,    // epoch conf_ver
+                5,    // epoch version
+                1,    // one peer
+                1, 10, 1,  // store 1, peer 10, role Voter
+                42, // snapshot index
+                7,  // term
+                1, 10, // voters
+                1, 30, // learners
+            ],
+            "the header chunk is a wire format"
+        );
+
+        assert_eq!(
+            encode_pairs(
+                super::SNAPSHOT_CFS[2].0,
+                &[(Bytes::from_static(b"xk"), Bytes::from_static(b"v"))]
+            )
+            .to_vec(),
+            vec![
+                2, // format version
+                2, // chunk kind: pairs
+                3, // column family: write
+                149, 255, 94, 27, // crc32c of the body
+                6,  // body length
+                1,  // one pair
+                2, b'x', b'k', // key
+                1, b'v', // value
+            ],
+            "the pairs chunk is a wire format"
+        );
+    }
+
+    /// A version 1 stream is refused with a **typed version error** on its first byte, whichever
+    /// chunk it is.
+    ///
+    /// The rolling-upgrade shape: an older store answering a newer one's ask. Refusing before the
+    /// kind byte is what stops a v1 pairs chunk being read as a v2 one — v1's CRC would land
+    /// where v2 reads the column family, so the first bytes of a checksum would decide which
+    /// column family a region's data went into. `WireVersion` and not `Corrupt` because the
+    /// sender is not damaged, it is old, and only one of those is worth retrying.
+    #[test]
+    fn a_version_one_chunk_is_refused_by_version() {
+        // v1's own bytes: version 1, kind, then the body it had.
+        let v1_header = [1u8, 1, 3, 1, b'd', 1, b'm', 0, 2, 5, 42, 7, 1, 10, 1, 30];
+        let v1_pairs = [1u8, 2, 0x00, 0x00, 0x00, 0x00, 1, 0];
+
+        for (bytes, what) in [(&v1_header[..], "header"), (&v1_pairs[..], "pairs")] {
+            let error = if what == "header" {
+                SnapshotHeader::decode(bytes).unwrap_err()
+            } else {
+                decode_pairs(bytes).unwrap_err()
+            };
+            assert!(
+                matches!(
+                    error,
+                    ProtoError::WireVersion {
+                        expected: 2,
+                        actual: 1
+                    }
+                ),
+                "a v1 {what} chunk was answered with {error:?} rather than a version mismatch"
             );
         }
     }

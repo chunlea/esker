@@ -662,6 +662,137 @@ async fn a_region_arrives_with_its_transactional_records() {
     second.stop().await;
 }
 
+/// **The user-facing shape.** A voter caught up by snapshot, given the office, answers a read of
+/// a row committed before it joined.
+///
+/// The other two tests in this pair look at a learner's column families, which is where the
+/// defect was found; this one asks the question a client asks, through the front door, of the
+/// store a client would be routed to. On the version-1 stream it answered `None` — a committed
+/// row read as absent, by a leader, with no error anywhere. That is a lost acknowledged write as
+/// far as anybody outside the store can tell, and it needed no columnar anything: a peer added
+/// after the log was compacted, promoted, and elected is a sequence phases 4 and 5 already had.
+///
+/// # Could the acceptance suites have caught it
+///
+/// No, and the reason is a gap between two files rather than a weak assertion in either.
+/// `tests/snapshot.rs` is the only place that installs a snapshot on a peer and reads it back,
+/// and every write in it was `RawKV` — the one namespace version 1 shipped. `tests/txnkv.rs` and
+/// `esker-txn`'s matrix are the only places that write Percolator records, and both run against a
+/// single store that never transfers a region. `tests/promotion.rs` drives learners to voters
+/// under load, which is this test's first half, but its load generator writes `RawKV` too and it
+/// asserts about roles rather than about values. So the two halves — a transfer, and a
+/// transactional value read afterwards — had never met.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_voter_caught_up_by_snapshot_can_lead_and_answer_an_old_row() {
+    trace();
+    let pd = Arc::new(FakePd::new());
+    let first_address = reserve();
+    let second_address = reserve();
+    let peers = vec![
+        PeerAddress::new(1, 1, first_address),
+        PeerAddress::new(2, 2, second_address),
+    ];
+    // Compacted hard, so the log cannot catch the second store up and a snapshot is the only way
+    // it ever holds the region — the case a store that joins a running cluster is in.
+    let compaction = LogCompaction {
+        threshold: 8,
+        keep: 2,
+        ..LogCompaction::new()
+    };
+
+    let first = open(
+        first_address,
+        1,
+        &pd,
+        raft_options(peers.clone(), compaction, Some(vec![1])),
+        1,
+    )
+    .await;
+    wait_for("a leader", || {
+        first.store.peer_of(1).is_some_and(|peer| peer.is_leader())
+    })
+    .await;
+
+    // The old row: committed before the second store exists, and never written again.
+    let region = first.store.regions().regions()[0].clone();
+    commit_one(&first.store, &region, key(0), b"committed", 10, 11).await;
+
+    let second = open(
+        second_address,
+        2,
+        &pd,
+        raft_options(peers.clone(), compaction, Some(vec![2])),
+        2,
+    )
+    .await;
+    let epoch = first.store.regions().regions()[0].epoch;
+    pd.issue(Operator::AddPeer {
+        region_id: 1,
+        epoch,
+        store_id: 2,
+        peer_id: 2,
+    });
+
+    // Keep writing, so the leader's log compacts past the new peer and the snapshot is what
+    // catches it up rather than the entries.
+    for n in 1..80 {
+        let region = first.store.regions().regions()[0].clone();
+        put(&first.store, &region, key(n), b"value").await;
+    }
+    wait_for("the second store to hold the region", || {
+        second.store.regions().get(1).is_some()
+    })
+    .await;
+    wait_for("the second store's peer to be a voter", || {
+        first.store.regions().regions()[0]
+            .peers
+            .iter()
+            .any(|peer| peer.peer_id == 2 && peer.role == PeerRole::Voter)
+    })
+    .await;
+
+    // The office moves. A transfer only completes if the target is caught up, so reaching this
+    // point at all is the cluster's own statement that the second store has the region.
+    let epoch = first.store.regions().regions()[0].epoch;
+    pd.issue(Operator::TransferLeader {
+        region_id: 1,
+        epoch,
+        to_peer_id: 2,
+    });
+    wait_for("the second store to lead", || {
+        second.store.peer_of(1).is_some_and(|peer| peer.is_leader())
+    })
+    .await;
+
+    // And the read a client makes, of a row committed long before this store existed, served by
+    // the replicated path on the store that now leads.
+    let region = second.store.regions().get(1).unwrap().region().clone();
+    let header = RequestHeader::new(region.id, region.epoch, 0);
+    let answer = within(
+        "the new leader to answer a read",
+        second.store.serve_txn(
+            header,
+            TxnKvReq::Get {
+                key: key(0),
+                ts: 100,
+            },
+        ),
+    )
+    .await
+    .expect("the new leader refused a read of its own region");
+    assert_eq!(
+        answer,
+        TxnKvResp::Get {
+            value: Some(Bytes::from_static(b"committed"))
+        },
+        "a row committed before this peer joined reads as absent from the leader: an \
+         acknowledged write lost by a transfer that carried one column family"
+    );
+
+    first.stop().await;
+    second.stop().await;
+}
+
 /// **The blocker, as PD creates it.** A columnar learner placed by an operator reaches the
 /// leader's applied index holding the leader's data.
 ///

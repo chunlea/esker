@@ -58,17 +58,73 @@ family: `lock` and `write` hold only `'x'` keys today and the `'r'` walk over th
 that finds nothing, which is a cheaper guarantee than a table of which family may hold which
 namespace, and one that cannot go stale.
 
-**4. No compatibility with version 1.** A stream lives for the length of one transfer between two
-stores of one cluster, so there is no persisted v1 stream to read. Refusing a v1 chunk is also the
-right answer on its own terms: adopting one would produce exactly the silently incomplete region
-this version exists to stop.
+**4. No compatibility with version 1, and the refusal is typed.** A stream lives for the length of
+one transfer between two stores of one cluster, so there is no persisted v1 stream to read.
+Refusing a v1 chunk is also the right answer on its own terms: adopting one would produce exactly
+the silently incomplete region this version exists to stop.
+
+A v1 chunk is refused on its **first byte**, with `ProtoError::WireVersion { expected: 2, actual:
+1 }` — the same error and the same no-downgrade rule as the transport handshake
+(`esker_proto::transport`), and deliberately not `Corrupt`: an older store is not damaged, and
+only one of those two is worth retrying. First byte matters as much as the type. A v1 pairs chunk
+is `1 ++ 2 ++ crc32:u32 ++ ..` and a v2 one is `2 ++ 2 ++ cf:u8 ++ crc32:u32 ++ ..`, so a decoder
+that checked the kind before the version would read the first byte of v1's checksum as v2's
+column family — a coin flip deciding which family a region's data landed in.
+`a_version_one_chunk_is_refused_by_version` pins both halves for both chunk kinds, and
+`the_chunk_bytes_are_the_format` is the golden: the header and the pairs chunk byte for byte, so
+a change to either is a deliberate format change rather than a re-run expectation.
+
+## What a user would have seen, and why no suite saw it
+
+The columnar learner is where this was found, but it is not the worst case and not the oldest. The
+user-facing shape needs no columnar anything:
+
+> A store joins a running cluster. It is added as a learner, the leader's log has already been
+> compacted past it, so a snapshot is what catches it up. It is promoted to voter, it is elected,
+> and it answers a client's read of a row committed before it joined — with **nothing**. No error,
+> no refusal, no epoch complaint: a committed row read as absent, by a leader.
+
+That is `tests/snapshot.rs::a_voter_caught_up_by_snapshot_can_lead_and_answer_an_old_row`, and on
+the version-1 stream it fails as `Get { value: None }` where the row is. A peer added after a
+compaction, promoted, and elected is a sequence phases 4 and 5 already had; only the read at the
+end is new.
+
+**Could the acceptance suites have triggered it? No — and the reason is a gap between files, not a
+weak assertion in one.** The two halves never met:
+
+* `crates/esker-store/tests/snapshot.rs` is the only place that installs a snapshot on a peer and
+  reads it back afterwards, and before this change it contained **zero** transactional writes
+  (`git show 15e2604:crates/esker-store/tests/snapshot.rs | grep -c TxnKvReq` → 0). It wrote
+  `RawKV`, which is the one namespace version 1 shipped.
+* `crates/esker-store/tests/promotion.rs` drives learners to voters under load — this test's first
+  half — but its writer is `RawKv::put` and its assertions are about roles, not values.
+* `esker-client`'s transactional suites (`bank`, `anomalies`, `txn_linearizability`,
+  `txn_crash_boundaries`, `time_machine`, `txn`, `refusals`) never move a region: no `Operator::`
+  and no `AddPeer` appears in any of them, so no snapshot is ever installed under them.
+* `crates/esker-store/tests/txnkv.rs` and `esker-txn`'s matrix write Percolator records against a
+  single store that never transfers a region.
+* `esker-sim`'s `raft_snapshot.rs` is the pure-Raft simulator and does not reference `esker_store`
+  at all; `esker-cli`'s `tier_acceptance.rs` has neither transactional writes nor peer moves.
+
+The one place both halves were present is `esker-sql/tests/joint_gate.rs`'s differential — SQL
+writes are transactional and PD places a learner that is caught up by snapshot — and that test was
+`#[ignore]`d as unrunnable, because the fragment service it reads through did not exist yet
+(`docs/plans/phase-8-learner.md` §wiring). So the suite that would have caught this is the suite
+that was waiting on the feature that found it.
+
+Two things follow. Any store added to a **running** cluster with data has been receiving an
+incomplete region since phase 4c, which the recorded transcript in
+`docs/bench/columnar-learner.md` shows happening. And the crossing that was missing —
+*transactional data, a transfer, then a read on the receiving store* — is now a test rather than
+an observation.
 
 ## Consequences
 
 * A snapshot now moves the bytes it says it moves. `tests/snapshot.rs`'s
-  `a_region_arrives_with_its_transactional_records` and
-  `a_placed_columnar_learner_holds_what_the_leader_holds` are the regressions, both red before
-  this change in under a second.
+  `a_region_arrives_with_its_transactional_records`,
+  `a_placed_columnar_learner_holds_what_the_leader_holds` and
+  `a_voter_caught_up_by_snapshot_can_lead_and_answer_an_old_row` are the regressions, all three
+  red before this change in under three seconds.
 * Transfers are bigger, by exactly what was being lost. A region of SQL data was previously
   shipping almost nothing.
 * `clear_range` writes a range tombstone per family per namespace and discharges each, so
