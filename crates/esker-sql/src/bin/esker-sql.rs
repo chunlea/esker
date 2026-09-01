@@ -18,6 +18,7 @@ use esker_sql::backend::{Backend, MemoryBackend, StoreBackend};
 use esker_sql::catalog::Catalog;
 use esker_sql::exec::Executor;
 use esker_sql::exec::redrive::ReDriver;
+use esker_sql::pd::{LeaseRefresher, PdConn, PdLease};
 use esker_sql::pgwire::server::{Auth, Config, Executors, serve};
 use esker_sql::pgwire::session::Execute;
 
@@ -49,16 +50,32 @@ async fn main() -> std::io::Result<()> {
         )
         .init();
 
-    // `esker-sql [listen] [store...]`. With no stores the node runs on the in-process fake.
-    let mut args = std::env::args().skip(1);
-    let address = args.next().unwrap_or_else(|| "127.0.0.1:5432".to_owned());
-    let stores: Vec<String> = args.collect();
+    // `esker-sql [--pd HOST:PORT] [listen] [store...]`. With no stores the node runs on the
+    // in-process fake.
+    let Args {
+        address,
+        stores,
+        pd,
+    } = Args::parse(std::env::args().skip(1))?;
     let config = Config {
         address,
         auth: Auth::Trust,
         ..Config::default()
     };
+    // The lease this node holds, or nothing at all. **Absent `--pd` changes nothing**: no lease
+    // source, so `Backend::schema_lease_remaining` answers "unbounded" and every write is
+    // unrestricted, exactly as it was before this flag existed.
+    let lease = pd.as_ref().map(|_| Arc::new(PdLease::new()));
     let backend: Arc<dyn Backend> = if stores.is_empty() {
+        if pd.is_some() {
+            // The fake keeps nothing and is in this process; a lease from a real placement driver
+            // over it would be a safety property with nothing behind it, and a columnar report
+            // would name ranges no store holds. Refused rather than half-wired.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--pd needs a cluster: give this node the store addresses to connect to",
+            ));
+        }
         tracing::warn!(
             "no store addresses given: running on the in-process fake, which keeps nothing"
         );
@@ -67,10 +84,26 @@ async fn main() -> std::io::Result<()> {
         tracing::info!(stores = ?stores, "connecting to the cluster");
         {
             let (client, oracle) = connect(&stores)?;
-            Arc::new(StoreBackend::new(Arc::new(client), oracle))
+            let backend = StoreBackend::new(Arc::new(client), oracle);
+            match &lease {
+                Some(lease) => Arc::new(backend.with_schema_lease(Arc::clone(lease) as Arc<_>)),
+                None => Arc::new(backend),
+            }
         }
     };
     let catalog = Arc::new(Catalog::new());
+
+    // The one cable. With it, two things that ship inert come alive: the lease arms fail-closed,
+    // and the re-driver below is given PD's interval (`docs/plans/phase-8-learner.md` §wiring).
+    // `zip` because the two are built together: a lease with no address to renew it at, or an
+    // address with no lease to fill in, would both be this function having gone wrong.
+    if let Some((address, lease)) = pd.zip(lease) {
+        attach_pd(address, lease).await?;
+    } else {
+        tracing::info!(
+            "no placement driver given: writes are unrestricted and no schema lease is held"
+        );
+    }
 
     // Every node runs a re-driver, so a schema change whose node died is finished by whichever
     // node notices rather than by a human calling `esker_schema_step` (ADR 0020 as amended,
@@ -78,10 +111,10 @@ async fn main() -> std::io::Result<()> {
     // interval between passes and would hold a runtime worker for the whole of one.
     //
     // It does nothing until this node holds a schema lease, because the lease is what carries
-    // PD's step interval and a node that cannot be told the wait must not invent one. Nothing
-    // attaches a lease yet — see `connect`'s `TODO(phase-6a)`, which is the same reason — so on
-    // this binary today it starts, finds no interval, and waits. That is the honest state: the
-    // mechanism is wired and inert, rather than absent and forgotten.
+    // PD's step interval and a node that cannot be told the wait must not invent one. With `--pd`
+    // it has one by the time this runs, so the interval below is PD's; without one it starts,
+    // finds no interval, and waits — which is a node with no placement driver and no staged
+    // schema change to be behind on, not a node that has lost anything.
     let redriver = ReDriver::new(Arc::clone(&backend), Arc::clone(&catalog), TENANT);
     if let Some(interval) = redriver.interval() {
         tracing::info!(
@@ -101,6 +134,95 @@ async fn main() -> std::io::Result<()> {
 
     let sessions = Sessions { backend, catalog };
     serve(config, Arc::new(sessions)).await
+}
+
+/// What this node was told on its command line.
+///
+/// Hand-parsed, like every other argument list in this project. The positional form is unchanged —
+/// `esker-sql [listen] [store...]` — and `--pd` may appear anywhere among them.
+#[derive(Debug)]
+struct Args {
+    /// Where to listen for clients.
+    address: String,
+    /// The stores to connect to; empty runs the in-process fake.
+    stores: Vec<String>,
+    /// The placement driver, or `None`.
+    ///
+    /// **No default and no discovery.** A node started without `--pd` behaves exactly as it did
+    /// before the flag existed, which is what makes the flag additive rather than a change of
+    /// behaviour with an opt-out.
+    pd: Option<std::net::SocketAddr>,
+}
+
+impl Args {
+    fn parse(arguments: impl Iterator<Item = String>) -> std::io::Result<Self> {
+        let invalid =
+            |message: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, message);
+        let mut positional = Vec::new();
+        let mut pd = None;
+        let mut arguments = arguments.peekable();
+        while let Some(argument) = arguments.next() {
+            let raw = if let Some(value) = argument.strip_prefix("--pd=") {
+                value.to_owned()
+            } else if argument == "--pd" {
+                arguments
+                    .next()
+                    .ok_or_else(|| invalid("--pd needs an address".to_owned()))?
+            } else {
+                positional.push(argument);
+                continue;
+            };
+            pd = Some(raw.parse().map_err(|error| {
+                invalid(format!("{raw} is not a placement-driver address: {error}"))
+            })?);
+        }
+        let mut positional = positional.into_iter();
+        Ok(Self {
+            address: positional
+                .next()
+                .unwrap_or_else(|| "127.0.0.1:5432".to_owned()),
+            stores: positional.collect(),
+            pd,
+        })
+    }
+}
+
+/// Fetches the first lease and starts the refresher thread.
+///
+/// **The lease is fetched before this node serves anything.** A node that cannot reach PD at
+/// startup does not come up holding a lease it never had; it fails, the way a store that cannot
+/// reach PD fails to open (`esker_store::RemotePd`).
+async fn attach_pd(address: std::net::SocketAddr, lease: Arc<PdLease>) -> std::io::Result<()> {
+    let conn = Arc::new(PdConn::new(address));
+    let refresher = LeaseRefresher::new(conn, lease);
+    // Onto a blocking thread and back, because this function is inside `#[tokio::main]`'s
+    // `block_on`: a synchronous client refuses a thread that is *driving* a runtime, and
+    // `spawn_blocking` is the seam for exactly that — the same one every statement takes
+    // (`crate::pgwire::server`).
+    let (refresher, held) = tokio::task::spawn_blocking(move || {
+        let held = refresher.refresh();
+        (refresher, held)
+    })
+    .await
+    .map_err(std::io::Error::other)?;
+    let held = held.map_err(|error| {
+        std::io::Error::other(format!(
+            "fetching the schema lease from the placement driver at {address}: {error}"
+        ))
+    })?;
+    tracing::info!(
+        pd = %address,
+        lease_ms = held.lease_ms,
+        step_ms = held.step.step_ms,
+        removal_extra_ms = held.step.removal_extra_ms,
+        "holding a schema lease"
+    );
+    // A thread rather than a task, and for the reason the re-driver beside it gives: a refresh
+    // sleeps a period between passes and would hold a runtime worker for the whole of one.
+    std::thread::Builder::new()
+        .name("schema-lease".to_owned())
+        .spawn(move || refresher.run())?;
+    Ok(())
 }
 
 /// Builds a client over the given stores, with routing that asks them where the regions are.

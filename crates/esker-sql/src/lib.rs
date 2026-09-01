@@ -48,6 +48,7 @@ pub mod catalog;
 pub mod error;
 pub mod exec;
 pub mod parse;
+pub mod pd;
 pub mod pgwire;
 pub mod plan;
 pub mod row;

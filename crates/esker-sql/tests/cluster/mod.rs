@@ -43,7 +43,7 @@ use esker_client::region_cache::{RegionResolver, RegionTable, Route};
 use esker_client::router::{ClientOptions, Router};
 use esker_client::{CountingOracle, TcpStores, TimestampOracle, TxnClient};
 use esker_proto::{Epoch, Peer, Region, ServerHandle, TransportConfig};
-use esker_sql::backend::{Backend, StoreBackend};
+use esker_sql::backend::{Backend, SchemaLease, StoreBackend};
 use esker_sql::catalog::Catalog;
 use esker_sql::exec::Executor;
 use esker_sql::parse::StatementClass;
@@ -57,6 +57,14 @@ pub const TENANT: u64 = 1;
 pub struct Cluster {
     pub backend: Arc<dyn Backend>,
     pub catalog: Arc<Catalog>,
+    /// The client the default backend is built over, so a test can build a second backend of its
+    /// own — one holding a schema lease, say — against the same three stores.
+    pub client: Arc<TxnClient>,
+    /// The oracle that client allocates from. Shared, because two backends over one cluster that
+    /// numbered their transactions independently would not be one cluster.
+    pub oracle: Arc<dyn TimestampOracle>,
+    /// Where the three stores listen, so a test can build a second client of its own.
+    pub addresses: Vec<std::net::SocketAddr>,
     _handles: Vec<ServerHandle>,
     _dirs: Vec<tempfile::TempDir>,
     /// The runtime the stores were started on, when this cluster owns one. `None` when the caller
@@ -153,12 +161,16 @@ impl Cluster {
         );
         // Starting well above zero so that a timestamp is never mistaken for an absent one.
         let oracle: Arc<dyn TimestampOracle> = Arc::new(CountingOracle::starting_at(1_000));
-        let client = TxnClient::on_router(Arc::new(router), Arc::clone(&oracle));
+        let client = Arc::new(TxnClient::on_router(Arc::new(router), Arc::clone(&oracle)));
 
-        let (handles, dirs) = started.into_iter().unzip();
+        let (handles, dirs): (Vec<_>, Vec<_>) = started.into_iter().unzip();
+        let addresses = handles.iter().map(ServerHandle::local_addr).collect();
         Cluster {
-            backend: Arc::new(StoreBackend::new(Arc::new(client), oracle)),
+            backend: Arc::new(StoreBackend::new(Arc::clone(&client), Arc::clone(&oracle))),
             catalog: Arc::new(Catalog::new()),
+            client,
+            oracle,
+            addresses,
             _handles: handles,
             _dirs: dirs,
             runtime: None,
@@ -171,6 +183,54 @@ impl Cluster {
         Session {
             executor: Executor::new(Arc::clone(&self.backend), Arc::clone(&self.catalog), TENANT),
         }
+    }
+
+    /// A second backend over the same three stores, holding `lease`.
+    ///
+    /// What the real binary builds when it is given `--pd`: the same client and the same oracle,
+    /// with a lease source attached — so a test can take the lease away from a node without
+    /// taking the cluster away from it.
+    pub fn backend_holding(&self, lease: Arc<dyn SchemaLease>) -> Arc<dyn Backend> {
+        self.backend_for(Arc::clone(&self.client), lease)
+    }
+
+    /// The same, over a client the caller built.
+    pub fn backend_for(
+        &self,
+        client: Arc<TxnClient>,
+        lease: Arc<dyn SchemaLease>,
+    ) -> Arc<dyn Backend> {
+        Arc::new(StoreBackend::new(client, Arc::clone(&self.oracle)).with_schema_lease(lease))
+    }
+
+    /// A second client over the same three stores: what a **second SQL node** holds.
+    ///
+    /// Its own connections and its own region cache, which is what makes it another node — over
+    /// the same oracle, which is what two nodes against one TSO have. Two independent counters
+    /// would hand the same timestamp to two different transactions, which is not a second node
+    /// but a broken cluster (`CLAUDE.md` invariant 6).
+    ///
+    /// Blocks, so it belongs off the reactor like every other synchronous client here.
+    pub fn another_client(&self) -> Arc<TxnClient> {
+        let stores = TcpStores::connect_all(&self.addresses, TransportConfig::new())
+            .expect("a second client connects to all three");
+        let resolver: Arc<dyn RegionResolver> = Arc::new(RegionTable::from_routes([
+            route(1, b"", b"m"),
+            route(2, b"m", b"t"),
+            route(3, b"t", b""),
+        ]));
+        let router = Router::with_options(
+            Arc::new(stores),
+            resolver,
+            ClientOptions {
+                jitter_seed: Some(11),
+                ..ClientOptions::default()
+            },
+        );
+        Arc::new(TxnClient::on_router(
+            Arc::new(router),
+            Arc::clone(&self.oracle),
+        ))
     }
 }
 
