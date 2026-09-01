@@ -1,0 +1,19 @@
+docs/bench/columnar-learner.md
+  s_b3f6a712d611c9::t_6bf10b90e4a1b8 1-91
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "401f525ed46dc5d05fa80e8895bd4aefe87ccfa9",
+  "prompts": {},
+  "sessions": {
+    "s_b3f6a712d611c9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "78adef9a-88ef-4c89-a340-f825de3d2ab7",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
