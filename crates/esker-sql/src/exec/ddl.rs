@@ -428,12 +428,14 @@ pub(super) fn alter_table(
             // `TableDef` is stale because of it.
             if let AlterTableAction::SetColumnarReplicas { replicas } = action {
                 match replicas {
+                    // The row schema is published in the same write, because a store that holds
+                    // a learner needs it to decode a row and cannot ask this crate for it.
                     Some(replicas) => catalog::set_table_columnar_replicas(
                         txn,
                         executor.tenant,
-                        table.id,
+                        &updated,
                         *replicas,
-                    ),
+                    )?,
                     None => {
                         catalog::clear_table_columnar_replicas(txn, executor.tenant, table.id);
                     }
@@ -493,6 +495,13 @@ pub(super) fn alter_table(
     // visible together.
     updated.schema_version += 1;
     catalog::replace_table(txn, executor.tenant, &table, &updated)?;
+    // And the published schema, if this table has one, in the SAME transaction. That is the
+    // ordering guarantee a columnar learner gets: a row written after this `ALTER` cannot reach a
+    // store before the schema that decodes it, because the two commit together. A learner given
+    // a stale schema does not read the row wrongly — `decode_row` refuses a row wider than its
+    // schema — but it stops applying, and by ADR 0022's constraint it may not fetch, so it would
+    // sit behind until somebody noticed. A no-op for a table nobody wants a columnar copy of.
+    catalog::refresh_published_schema(txn, executor.tenant, &updated)?;
     done
 }
 

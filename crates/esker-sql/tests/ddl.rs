@@ -84,6 +84,12 @@ impl Node {
         }
     }
 
+    fn published_schema(&self, name: &str) -> Option<esker_sql::catalog::PublishedSchema> {
+        let table = self.table(name)?;
+        let txn = self.backend.begin().unwrap();
+        esker_sql::catalog::table_published_schema(&*txn, 1, table.id).unwrap()
+    }
+
     fn notices(&mut self) -> Vec<String> {
         self.executor
             .take_notices()
@@ -1019,4 +1025,53 @@ fn a_columnar_replica_count_that_is_not_a_number_is_refused() {
         );
         assert!(error.to_string().contains("columnar_replicas"), "{error}");
     }
+}
+
+/// The published schema is written with the flag, and **refreshed by the `ALTER` that changes
+/// it, in that `ALTER`'s own transaction**.
+///
+/// That is the whole ordering guarantee a columnar learner gets. A row written after an
+/// `ADD COLUMN` cannot reach a store before the schema that decodes it, because the two commit
+/// together. Publishing separately would leave a window in which the learner meets a row wider
+/// than its schema — which `decode_row` refuses rather than misreads, so it is loud, but it is
+/// loud on the apply path, where by ADR 0022's constraint the learner may not fetch. It would
+/// simply stop applying until somebody noticed.
+#[test]
+fn the_published_schema_is_refreshed_by_the_alter_that_changes_it() {
+    let mut node = Node::new();
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY, a int8)")
+        .unwrap();
+
+    // Nothing published for a table nobody wants a columnar copy of.
+    assert!(node.published_schema("t").is_none());
+
+    node.run("ALTER TABLE t SET (columnar_replicas = 1)")
+        .unwrap();
+    let published = node.published_schema("t").expect("published with the flag");
+    let (version, columns) = (published.schema_version, &published.columns);
+    assert_eq!(columns.len(), 2);
+    assert_eq!(version, node.table("t").unwrap().schema_version);
+
+    // The ALTER that widens the table republishes it, and the missing value travels.
+    node.run("ALTER TABLE t ADD COLUMN tier int8 NOT NULL DEFAULT 42")
+        .unwrap();
+    let published = node.published_schema("t").expect("still published");
+    let (version, columns) = (published.schema_version, &published.columns);
+    assert_eq!(columns.len(), 3, "the new column was not published");
+    assert_eq!(
+        version,
+        node.table("t").unwrap().schema_version,
+        "the published schema is as of a different version than the table"
+    );
+    assert_eq!(
+        columns[2].1,
+        Some(esker_sql::value::Datum::Int8(42)),
+        "the missing value did not travel; rows predating the column would read NULL"
+    );
+
+    // A table without the flag is not published by an ALTER either -- the refresh is a no-op
+    // rather than an unconditional write.
+    node.run("CREATE TABLE u (id int8 PRIMARY KEY)").unwrap();
+    node.run("ALTER TABLE u ADD COLUMN b int8").unwrap();
+    assert!(node.published_schema("u").is_none());
 }

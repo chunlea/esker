@@ -258,24 +258,80 @@ pub(super) fn columnar_table_id(tenant: u64, key: &[u8]) -> Result<u64> {
     Ok(id)
 }
 
-/// How many columnar replicas a table wants, behind the same version byte as every other record.
+/// What a table wants of the storage layer: how many columnar copies, and how to decode its rows.
 ///
-/// A `u8` because the count is a replica count and a table wanting more than 255 columnar copies
-/// is a configuration error rather than a number to carry. Zero is legal and means the same as an
-/// absent record; `ALTER TABLE ... SET (columnar_replicas = 0)` writes it rather than deleting,
-/// so that "somebody turned it off" and "nobody ever turned it on" are the same *answer* without
-/// being the same *history*.
-#[must_use]
-pub(super) fn encode_columnar(replicas: u8) -> Vec<u8> {
-    vec![CATALOG_FORMAT_VERSION, replicas]
+/// ```text
+/// version:u8 ++ replicas:u8 ++ schema_version:varint ++ ncols:varint
+///             ++ (type:u8 ++ missing:value) * ncols
+/// ```
+///
+/// **Two readers, one record, and the count is a fixed-offset prefix.** The placement driver
+/// reads byte 1 and stops: it wants a number and cannot read a table definition anyway
+/// (`CLAUDE.md` invariant 7). A store holding a columnar learner reads on into the tail, because
+/// it has to turn a committed row into typed columns and `esker_keys::row::decode_row` needs a
+/// `RowSchema` to do it. Neither links `esker-sql`.
+///
+/// **The schema is here rather than under a kind byte of its own** so that it is written in the
+/// same transaction as the setting that causes a learner to exist, and refreshed in the same
+/// transaction as the `ALTER` that changes it. A schema published separately would be a second
+/// record to keep in step, and the window between the two writes is exactly the window in which a
+/// learner decodes rows against the wrong schema.
+///
+/// **`missing` travels with the types and is not optional.** `decode_row` pads a row written
+/// before a column existed with that column's missing value — PostgreSQL 11's `attmissingval` —
+/// and a decoder given only types would build `RowSchema::nullable` and read NULL where the row
+/// store reads the default. Silently, and only for rows older than the `ALTER`, which is the
+/// hardest case to notice.
+///
+/// A `u8` count because a table wanting more than 255 columnar copies is a configuration error
+/// rather than a number to carry. Zero is legal and means the same as an absent record;
+/// `SET (columnar_replicas = 0)` writes it rather than deleting, so that "somebody turned it off"
+/// and "nobody ever turned it on" are the same *answer* without being the same *history*.
+pub(super) fn encode_columnar(replicas: u8, table: Option<&TableDef>) -> Result<Vec<u8>> {
+    let mut out = vec![CATALOG_FORMAT_VERSION, replicas];
+    let Some(table) = table else {
+        varint::put_u64(0, &mut out);
+        varint::put_u64(0, &mut out);
+        return Ok(out);
+    };
+    varint::put_u64(table.schema_version, &mut out);
+    varint::put_u64(table.columns.len() as u64, &mut out);
+    for column in &table.columns {
+        out.push(tag_of(column.ty));
+        put_value(column.missing.as_ref(), column.ty, &mut out)?;
+    }
+    Ok(out)
 }
 
-/// Reads a columnar-replica count back.
-pub(super) fn decode_columnar(bytes: &[u8]) -> Result<u8> {
+/// The count alone, which is all a placement driver wants.
+///
+/// A separate function rather than the first field of the full decode, because PD must be able to
+/// read it **without** parsing a schema it has no business understanding — and because a schema
+/// this build cannot parse must not stop PD from reading a number it can.
+pub(super) fn decode_columnar_replicas(bytes: &[u8]) -> Result<u8> {
+    let mut reader = Reader::new(bytes)?;
+    reader.u8()
+}
+
+/// The whole record: the count, the schema version, and the row schema.
+pub(super) fn decode_columnar(bytes: &[u8]) -> Result<(u8, super::PublishedSchema)> {
     let mut reader = Reader::new(bytes)?;
     let replicas = reader.u8()?;
+    let schema_version = reader.varint()?;
+    let count = reader.count()?;
+    let mut columns = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        let ty = type_of(reader.u8()?)?;
+        columns.push((ty, reader.value(ty)?));
+    }
     reader.finish()?;
-    Ok(replicas)
+    Ok((
+        replicas,
+        super::PublishedSchema {
+            schema_version,
+            columns,
+        },
+    ))
 }
 
 /// `'m' ++ "sql" ++ 'c' ++ tenant ++ name`. A checkpoint, absent until somebody names one.

@@ -819,8 +819,66 @@ pub fn drop_flashback(txn: &mut dyn Txn, tenant: u64, table_id: u64) {
 /// a table somebody explicitly turned off is distinguishable from one nobody ever turned on.
 pub fn table_columnar_replicas(txn: &dyn Txn, tenant: u64, table_id: u64) -> Result<Option<u8>> {
     match txn.get(&record::columnar_key(tenant, table_id))? {
-        Some(bytes) => Ok(Some(record::decode_columnar(&bytes)?)),
+        Some(bytes) => Ok(Some(record::decode_columnar_replicas(&bytes)?)),
         None => Ok(None),
+    }
+}
+
+/// The published row schema for a table that wants a columnar copy.
+///
+/// What a store below this crate needs to turn a committed row into typed columns: the schema
+/// version it is as of, and a `(type, missing)` pair per column — the two halves
+/// `esker_keys::row::RowSchema` is built from.
+///
+/// **Types alone would be silently wrong.** `decode_row` pads a row written before a column
+/// existed with that column's missing value; a decoder given only types builds
+/// `RowSchema::nullable` and reads NULL where the row store reads the default, for exactly the
+/// rows that predate the `ALTER`.
+pub fn table_published_schema(
+    txn: &dyn Txn,
+    tenant: u64,
+    table_id: u64,
+) -> Result<Option<PublishedSchema>> {
+    match txn.get(&record::columnar_key(tenant, table_id))? {
+        Some(bytes) => Ok(Some(record::decode_columnar(&bytes)?.1)),
+        None => Ok(None),
+    }
+}
+
+/// How a table's rows decode, published for a layer that cannot ask this crate.
+///
+/// [ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) Decision 5, and the shape a
+/// columnar learner's apply target needs: it holds a committed row's bytes and has to turn them
+/// into typed columns without linking `esker-sql`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PublishedSchema {
+    /// The `TableDef::schema_version` this was published at.
+    ///
+    /// Monotonic, one more per `ADD COLUMN`. A reader holding two keeps the higher and never
+    /// installs an older over a newer — the only comparison it needs, since a schema is published
+    /// in the same transaction as the `ALTER` that made it true.
+    pub schema_version: u64,
+    /// A type and a missing value per column, in encoding order.
+    pub columns: Vec<(ColumnType, Option<Datum>)>,
+}
+
+impl PublishedSchema {
+    /// The [`crate::row::RowSchema`] to decode this table's rows with.
+    ///
+    /// **Use this rather than assembling one.** `RowSchema::nullable(types)` is the natural thing
+    /// to reach for when all you seem to have is types, and it is wrong here: it pads every
+    /// absent column with NULL, where a row written before an `ADD COLUMN ... DEFAULT <constant>`
+    /// must pad with that constant. The mistake is silent and shows up only on rows older than
+    /// the `ALTER`. Handing back a built `RowSchema` is what makes it unrepresentable.
+    #[must_use]
+    pub fn row_schema(&self) -> crate::row::RowSchema {
+        let types = self.columns.iter().map(|(ty, _)| *ty).collect();
+        let missing = self
+            .columns
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect();
+        crate::row::RowSchema::new(types, missing)
     }
 }
 
@@ -830,11 +888,36 @@ pub fn table_columnar_replicas(txn: &dyn Txn, tenant: u64, table_id: u64) -> Res
 /// it changes nothing about how a row is written or read, so no node caching a `TableDef` is
 /// stale because of it, and ADR 0020's two-version invariant has nothing to say about it. What
 /// acts on it is the placement driver, which is not a reader of rows.
-pub fn set_table_columnar_replicas(txn: &mut dyn Txn, tenant: u64, table_id: u64, replicas: u8) {
+pub fn set_table_columnar_replicas(
+    txn: &mut dyn Txn,
+    tenant: u64,
+    table: &TableDef,
+    replicas: u8,
+) -> Result<()> {
     txn.put(
-        &record::columnar_key(tenant, table_id),
-        &record::encode_columnar(replicas),
+        &record::columnar_key(tenant, table.id),
+        &record::encode_columnar(replicas, Some(table))?,
     );
+    Ok(())
+}
+
+/// Rewrites the published schema of a table that has one, leaving its replica count alone.
+///
+/// Called by every `ALTER` that changes what a row decodes to, **in that `ALTER`'s own
+/// transaction**. That is the whole ordering guarantee a learner gets: the schema it needs to
+/// read rows written after the `ALTER` is committed by the same transaction that made those rows
+/// possible, so it can never be published later than the first row that needs it.
+///
+/// A no-op for a table nobody has asked for a columnar copy of, which is why every DDL path can
+/// call it unconditionally.
+pub fn refresh_published_schema(txn: &mut dyn Txn, tenant: u64, table: &TableDef) -> Result<()> {
+    let key = record::columnar_key(tenant, table.id);
+    let Some(bytes) = txn.get(&key)? else {
+        return Ok(());
+    };
+    let replicas = record::decode_columnar_replicas(&bytes)?;
+    txn.put(&key, &record::encode_columnar(replicas, Some(table))?);
+    Ok(())
 }
 
 /// Forgets the setting entirely, which reads back the same as zero.
@@ -855,7 +938,7 @@ pub fn columnar_range(tenant: u64) -> (Vec<u8>, Vec<u8>) {
 pub fn decode_columnar(tenant: u64, key: &[u8], value: &[u8]) -> Result<(u64, u8)> {
     Ok((
         record::columnar_table_id(tenant, key)?,
-        record::decode_columnar(value)?,
+        record::decode_columnar_replicas(value)?,
     ))
 }
 
@@ -1022,6 +1105,8 @@ mod tests {
             .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
             .collect()
     }
+
+    use crate::value::Datum;
 
     fn hex(bytes: &[u8]) -> String {
         use std::fmt::Write as _;
@@ -1493,28 +1578,65 @@ mod tests {
         );
     }
 
-    /// The golden for a columnar-replica record, and for the kind byte that is **not** the one
-    /// ADR 0022 sketched.
+    /// The golden for a columnar record: the count PD reads, and the row schema a store reads
+    /// past it.
     ///
-    /// The placement driver reads these bytes from a crate that does not link this one, exactly
-    /// as the collector reads a retention override, so the layout is a contract between two
-    /// layers rather than an implementation detail of either.
+    /// Both audiences are below this crate and neither links it, so the layout is a contract
+    /// between three layers rather than an implementation detail of one. **The count is at a
+    /// fixed offset on purpose** — a placement driver reads byte 1 and stops, because it wants a
+    /// number and cannot read a table definition anyway (`CLAUDE.md` invariant 7).
     ///
-    /// ADR 0022 Decision 5 wrote the key as `'m' ++ "sql" ++ 'c'`. By the time it was built `'c'`
-    /// was the checkpoint's — phase 6d took it first — and two kinds sharing a byte is one scan
-    /// returning the other's records. This pins `'l'`, and it pins that the two ranges do not
-    /// overlap, because that is the failure the collision would have caused.
+    /// It also pins the kind byte that is **not** the one ADR 0022 sketched. The ADR wrote
+    /// `'m' ++ "sql" ++ 'c'`; by the time this was built `'c'` was the checkpoint's, and two
+    /// kinds sharing a byte is one scan returning the other's records. The collision is asserted
+    /// here rather than avoided and then trusted.
     #[test]
-    fn a_columnar_record_is_a_version_and_a_count_under_its_own_kind_byte() {
-        let encoded = record::encode_columnar(2);
+    fn a_columnar_record_carries_the_count_and_the_row_schema() {
+        let table = accounts(7);
+        let encoded = record::encode_columnar(2, Some(&table)).unwrap();
         assert_eq!(
             hex(&encoded),
             concat!(
                 "03", // catalog format version
-                "02", // two columnar replicas
+                "02", // two columnar replicas -- byte 1, where PD stops
+                "01", // schema_version 1
+                "02", // two columns
+                "01", "00", // int8, no missing value
+                "02", "00", // text, no missing value
             )
         );
-        assert_eq!(record::decode_columnar(&encoded).unwrap(), 2);
+
+        // PD's read: two bytes and no schema parsing at all.
+        assert_eq!(record::decode_columnar_replicas(&encoded).unwrap(), 2);
+
+        // A store's read: the pair `esker_keys::row::RowSchema` is built from.
+        let (replicas, published) = record::decode_columnar(&encoded).unwrap();
+        assert_eq!((replicas, published.schema_version), (2, 1));
+        assert_eq!(
+            published.columns,
+            vec![(ColumnType::Int8, None), (ColumnType::Text, None)]
+        );
+
+        // A missing value travels with its column, because a decoder given only types pads NULL
+        // where the row store pads the default -- silently, and only for rows older than the
+        // `ALTER` that added the column.
+        let mut widened = accounts(7);
+        widened.columns.push(ColumnDef {
+            name: "tier".into(),
+            ty: ColumnType::Int8,
+            not_null: true,
+            default: Some(Datum::Int8(42)),
+            missing: Some(Datum::Int8(42)),
+        });
+        let (_, published) =
+            record::decode_columnar(&record::encode_columnar(1, Some(&widened)).unwrap()).unwrap();
+        assert_eq!(
+            published.columns[2],
+            (ColumnType::Int8, Some(Datum::Int8(42)))
+        );
+        // And the built `RowSchema` carries it, which is the property the pair exists for: a
+        // decoder that assembled one from types alone would pad NULL here.
+        assert_eq!(published.row_schema().types().len(), 3);
 
         let key = record::columnar_key(1, 7);
         assert_eq!(
@@ -1529,8 +1651,7 @@ mod tests {
         );
         assert_eq!(record::columnar_table_id(1, &key).unwrap(), 7);
 
-        // The collision that was avoided, asserted rather than remembered: a checkpoint key must
-        // not fall inside a scan of the columnar settings, and vice versa.
+        // The collision that was avoided, asserted rather than remembered.
         let (start, end) = record::columnar_range(1);
         let checkpoint = record::checkpoint_key(1, "nightly");
         assert!(
@@ -1540,13 +1661,6 @@ mod tests {
         assert!(
             checkpoint < start || checkpoint >= end,
             "a checkpoint falls inside the columnar scan -- the kind bytes collide"
-        );
-
-        // Zero is stored rather than meaning absent, so the two are distinguishable in history
-        // even though they read the same.
-        assert_eq!(
-            record::decode_columnar(&record::encode_columnar(0)).unwrap(),
-            0
         );
     }
 

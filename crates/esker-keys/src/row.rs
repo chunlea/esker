@@ -412,8 +412,26 @@ fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
     }
 }
 
-/// Reads index-key columns back, which is what a secondary index lookup does to recover the
+/// Reads **index**-key columns back, which is what a secondary index lookup does to recover the
 /// primary key it is pointing at.
+///
+/// # This does not read a row key
+///
+/// Index-key columns carry a NULL marker in front of each field — that is what lets a NULL sort
+/// last and not collide with an empty string — and [`row_key`] writes no markers, because a
+/// primary key column is `NOT NULL` by definition and a marker on every one of them would be a
+/// byte per column for a case that cannot arise.
+///
+/// So this refuses a row key, and refuses it *confusingly*: the first byte it meets is the first
+/// byte of a value, and it is reported as an index marker that is not one of ours. It is not a
+/// decoder that happens to be strict about row keys; there is no public decoder for a row key at
+/// all. A caller that wants a row's primary key back has three honest options — read the row and
+/// take the key columns from it, carry the primary key alongside the key it built, or treat the
+/// key bytes as an opaque identity, which is what a columnar learner does.
+///
+/// Named here because it has already cost one lane an afternoon of reading an index-marker error
+/// against a row key. Adding the decoder is a small piece of work nobody has yet needed enough to
+/// do; being told why it is absent is what this comment is for.
 pub fn decode_key_columns(types: &[ColumnType], mut bytes: &[u8]) -> Result<(Vec<Datum>, usize)> {
     let total = bytes.len();
     let mut values = Vec::with_capacity(types.len());
