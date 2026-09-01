@@ -17,7 +17,16 @@
 //! assertion: resolving MVCC visibility across several runs materialises rows where a single run
 //! borrows them, and the size of that is not something to guess at.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+// A benchmark counts rows and divides by seconds. Every cast below is a row count or an id, all
+// far inside every type involved, and writing `try_from` around each would say nothing a reader
+// needs. Allowed here and deliberately not in the crate that ships.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
 
 use std::sync::Arc;
 use std::time::Instant;

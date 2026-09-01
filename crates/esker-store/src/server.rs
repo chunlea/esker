@@ -546,91 +546,14 @@ impl Store {
             return;
         }
 
-        let (kind, node, store_id, role) = match operator {
-            // **Learner first, and the store finishes the job.** An `AddPeer` for a peer this
-            // region has never heard of adds a *learner*: it receives the log and the snapshot
-            // without voting, so it never makes a quorum harder to reach while it is catching up.
-            // The promotion that follows is the leader's, on
-            // [`Store::promote_caught_up_learners`], because "has this learner caught up" is a
-            // statement about its match index and the leader is the only party that can see one.
-            //
-            // 4c put the promotion here instead, as "the same operator for a peer that is already
-            // a learner", and that is what phase-4 acceptance stalled on: PD stops re-sending an
-            // operator once it can see the learner, so the second step was never asked for. The
-            // reasoning that made it look sound is corrected at the promotion itself.
-            //
-            // Arriving here for a peer that is already a learner is therefore a *repeat* rather
-            // than a second step — PD re-deriving after a timeout — and is answered by the same
-            // promotion criterion, which is to say by leaving it to the round that checks it.
-            Operator::AddPeer {
-                store_id, peer_id, ..
-            } => match state
-                .region()
-                .peers
-                .iter()
-                .find(|peer| peer.peer_id == *peer_id)
-            {
-                None => (
-                    esker_raft::ConfChangeKind::AddLearner,
-                    *peer_id,
-                    *store_id,
-                    PeerRole::Learner,
-                ),
-                // Already here. A learner is on its way to being a voter under its own criterion,
-                // and a voter is what was asked for: either way there is nothing to propose.
-                Some(_) => return,
-            },
-            // **A columnar replica: a learner that is never promoted** (ADR 0022 Decision 1).
-            //
-            // The same `ConfChangeKind::AddLearner` a row replica gets — `esker-raft` has one
-            // notion of learner and the ADR leaves it that way — with the *role* carried in the
-            // conf change's **context**, which raft replicates and never interprets. That is what
-            // makes the distinction land on every peer including the leader, which matters
-            // because promotion is a decision the leader takes from the region record.
-            //
-            // `AddPeer` cannot serve here: it completes when the peer becomes a **voter**, and a
-            // columnar replica never does, so it would be a repair that never finishes.
-            Operator::AddLearner {
-                store_id, peer_id, ..
-            } => match state
-                .region()
-                .peers
-                .iter()
-                .find(|peer| peer.peer_id == *peer_id)
-            {
-                None => (
-                    esker_raft::ConfChangeKind::AddLearner,
-                    *peer_id,
-                    *store_id,
-                    PeerRole::ColumnarLearner,
-                ),
-                // Already here, in whatever role it was added as. Nothing to propose, and
-                // certainly not a change of role: that would be a promotion or a demotion and
-                // neither is what this operator asks for.
-                Some(_) => return,
-            },
-            Operator::RemovePeer { peer_id, .. } => {
-                let Some(existing) = state
-                    .region()
-                    .peers
-                    .iter()
-                    .find(|peer| peer.peer_id == *peer_id)
-                else {
-                    return;
-                };
-                (
-                    esker_raft::ConfChangeKind::Remove,
-                    *peer_id,
-                    existing.store_id,
-                    existing.role,
-                )
-            }
-            // Leadership moves by the core's own `TimeoutNow` path rather than by a conf change,
-            // so it takes a different route out of here entirely.
-            Operator::TransferLeader { to_peer_id, .. } => {
-                self.transfer_leadership(&state, &peer, *to_peer_id).await;
-                return;
-            }
+        // Leadership moves by the core's own `TimeoutNow` path rather than by a conf change, so
+        // it leaves before the membership vocabulary below.
+        if let Operator::TransferLeader { to_peer_id, .. } = operator {
+            self.transfer_leadership(&state, &peer, *to_peer_id).await;
+            return;
+        }
+        let Some((kind, node, store_id, role)) = conf_change_for(operator, &state) else {
+            return;
         };
 
         // Bounded, because a proposal is answered when it *applies* and a membership change that
@@ -2284,6 +2207,98 @@ fn bootstrap(db: &Arc<Db>, options: &BootstrapOptions<'_>) -> Result<Option<Regi
         "bootstrapped a region covering the whole key space"
     );
     Ok(Some(region))
+}
+
+/// The membership change an operator asks for, or `None` when there is nothing to propose.
+///
+/// Split out of [`Store::apply_operator`] because it is the whole of the operator *vocabulary* —
+/// what each one means as a change of membership — and that reads better as one thing than as a
+/// preamble to the proposal carrying it. `TransferLeader` is deliberately not here: it moves
+/// leadership by the core's own `TimeoutNow` path rather than by a conf change, so it leaves
+/// `apply_operator` before this is reached.
+fn conf_change_for(
+    operator: &esker_proto::Operator,
+    state: &RegionState,
+) -> Option<(esker_raft::ConfChangeKind, u64, u64, PeerRole)> {
+    Some(match operator {
+        // **Learner first, and the store finishes the job.** An `AddPeer` for a peer this
+        // region has never heard of adds a *learner*: it receives the log and the snapshot
+        // without voting, so it never makes a quorum harder to reach while it is catching up.
+        // The promotion that follows is the leader's, on
+        // [`Store::promote_caught_up_learners`], because "has this learner caught up" is a
+        // statement about its match index and the leader is the only party that can see one.
+        //
+        // 4c put the promotion here instead, as "the same operator for a peer that is already
+        // a learner", and that is what phase-4 acceptance stalled on: PD stops re-sending an
+        // operator once it can see the learner, so the second step was never asked for. The
+        // reasoning that made it look sound is corrected at the promotion itself.
+        //
+        // Arriving here for a peer that is already a learner is therefore a *repeat* rather
+        // than a second step — PD re-deriving after a timeout — and is answered by the same
+        // promotion criterion, which is to say by leaving it to the round that checks it.
+        esker_proto::Operator::AddPeer {
+            store_id, peer_id, ..
+        } => match state
+            .region()
+            .peers
+            .iter()
+            .find(|peer| peer.peer_id == *peer_id)
+        {
+            None => (
+                esker_raft::ConfChangeKind::AddLearner,
+                *peer_id,
+                *store_id,
+                PeerRole::Learner,
+            ),
+            // Already here. A learner is on its way to being a voter under its own criterion,
+            // and a voter is what was asked for: either way there is nothing to propose.
+            Some(_) => return None,
+        },
+        // **A columnar replica: a learner that is never promoted** (ADR 0022 Decision 1).
+        //
+        // The same `ConfChangeKind::AddLearner` a row replica gets — `esker-raft` has one
+        // notion of learner and the ADR leaves it that way — with the *role* carried in the
+        // conf change's **context**, which raft replicates and never interprets. That is what
+        // makes the distinction land on every peer including the leader, which matters
+        // because promotion is a decision the leader takes from the region record.
+        //
+        // `AddPeer` cannot serve here: it completes when the peer becomes a **voter**, and a
+        // columnar replica never does, so it would be a repair that never finishes.
+        esker_proto::Operator::AddLearner {
+            store_id, peer_id, ..
+        } => match state
+            .region()
+            .peers
+            .iter()
+            .find(|peer| peer.peer_id == *peer_id)
+        {
+            None => (
+                esker_raft::ConfChangeKind::AddLearner,
+                *peer_id,
+                *store_id,
+                PeerRole::ColumnarLearner,
+            ),
+            // Already here, in whatever role it was added as. Nothing to propose, and
+            // certainly not a change of role: that would be a promotion or a demotion and
+            // neither is what this operator asks for.
+            Some(_) => return None,
+        },
+        esker_proto::Operator::RemovePeer { peer_id, .. } => {
+            let existing = state
+                .region()
+                .peers
+                .iter()
+                .find(|peer| peer.peer_id == *peer_id)?;
+            (
+                esker_raft::ConfChangeKind::Remove,
+                *peer_id,
+                existing.store_id,
+                existing.role,
+            )
+        }
+        // Handled by the caller, which is the only place that can await the transfer.
+        esker_proto::Operator::TransferLeader { .. } => return None,
+    })
 }
 
 /// Region 1 as a store with no placement driver makes it: `["", "")`, at the initial epoch.

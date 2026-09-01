@@ -58,6 +58,11 @@ impl StandIn {
                     region: first.then(|| Region::bootstrap(1, store.store_id, 1)),
                 }
             }
+            // A SQL node telling PD which tables want columnar replicas. **A store never sends
+            // one** — it is reported from above, because PD carries where a replica lives and not
+            // what a table looks like — so this stand-in records nothing and answers the empty
+            // acknowledgement, which is what a store's PD client would see if it ever asked.
+            PdReq::ReportColumnar { .. } => PdResp::ReportColumnar,
             PdReq::StoreHeartbeat { store_id, .. } => {
                 state.store_beats.push(store_id);
                 PdResp::StoreHeartbeat

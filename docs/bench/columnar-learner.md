@@ -43,9 +43,23 @@ which is the right question for a Raft apply loop, and **not** a claim about eit
 throughput. Dividing one by the other produces a four-figure ratio that means nothing about
 columnar storage and everything about a write path being used a row at a time.
 
-This lane consumes `esker-engine`'s write path rather than owning it, so the observation is
-recorded here rather than acted on. It is the largest single number in this file and the least
-informative.
+### And the sharper reading, which is not "ingestion is slow"
+
+**The run had `WalSyncMode::Never`.** If durability waiting is switched off and `commit_group`
+still holds 2075 of 2114 stacks at 4.8 ms a put — one writer, nothing to contend with — then
+whatever it is waiting on, **it is not an `fsync`**. So the finding is not "fsync-per-write is
+expensive". It is either that *a mode whose whole purpose is to remove the durability wait is not
+removing it*, or that the cost is somewhere else entirely and the mode's name is a red herring for
+whoever picks this up. Those are distinguishable, and the sample counts above are what
+distinguishes them.
+
+That is a correctness-of-configuration question about `esker-engine` and a more interesting one
+than a slow path. Neither this lane nor `esker-sql`'s owns that crate, so it is recorded as a lead
+rather than acted on — and recorded as a lead deliberately, because "ingestion is slow" is a shrug
+and "`WalSyncMode::Never` may not be disabling what it names" is something somebody can pick up.
+
+(Framing owed to lane wy-c2, who pointed out that the disabled-sync detail makes the number mean
+something quite different from what this document first said about it.)
 
 ## The scan number, with the half that cuts the other way
 
