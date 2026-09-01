@@ -125,6 +125,17 @@ pub enum StatementClass {
     Commit,
     /// `ROLLBACK`.
     Rollback,
+    /// `SAVEPOINT <name>`, carrying the name.
+    Savepoint(String),
+    /// `ROLLBACK TO [SAVEPOINT] <name>`, carrying the name.
+    ///
+    /// **A separate class from [`StatementClass::Rollback`], and the reason is a wrong answer.**
+    /// `sqlparser` puts the two in one variant with an `Option<Ident>`, so classifying on the
+    /// variant alone made `ROLLBACK TO s` end the whole block — a statement PostgreSQL accepts,
+    /// answered with a `ROLLBACK` tag, and the user's other work gone with no error to say so.
+    RollbackTo(String),
+    /// `RELEASE [SAVEPOINT] <name>`, carrying the name.
+    Release(String),
     /// `EXPLAIN`.
     Explain,
     /// Parsed, not executed. The string is the feature name for the `0A000` message, phrased the
@@ -367,7 +378,21 @@ pub fn classify(statement: &Statement) -> StatementClass {
         } => StatementClass::DropIndex,
         Statement::StartTransaction { .. } => StatementClass::Begin,
         Statement::Commit { .. } => StatementClass::Commit,
+        // The `savepoint` field is what tells the two apart, and reading only the variant is how
+        // `ROLLBACK TO s` used to end the whole transaction.
+        Statement::Rollback {
+            savepoint: Some(name),
+            ..
+        } => StatementClass::RollbackTo(
+            crate::catalog::fold_identifier(&name.value, name.quote_style.is_some()).0,
+        ),
         Statement::Rollback { .. } => StatementClass::Rollback,
+        Statement::Savepoint { name } => StatementClass::Savepoint(
+            crate::catalog::fold_identifier(&name.value, name.quote_style.is_some()).0,
+        ),
+        Statement::ReleaseSavepoint { name } => StatementClass::Release(
+            crate::catalog::fold_identifier(&name.value, name.quote_style.is_some()).0,
+        ),
         Statement::Explain { .. } | Statement::ExplainTable { .. } => StatementClass::Explain,
         other => StatementClass::Other(feature_name(other)),
     }
@@ -1350,7 +1375,6 @@ mod tests {
             ("DROP VIEW v", "DROP VIEW"),
             ("GRANT SELECT ON t TO alice", "GRANT SELECT"),
             ("ALTER TABLE t ADD COLUMN b INT8", "ALTER TABLE"),
-            ("SAVEPOINT s", "SAVEPOINT"),
         ];
         for (sql, feature) in cases {
             let statements = parse(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));

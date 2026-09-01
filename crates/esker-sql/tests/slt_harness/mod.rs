@@ -219,6 +219,18 @@ pub(crate) fn run(executor: &mut Executor, sql: &str) -> esker_sql::Result<Outco
                 .map(|()| Outcome::done("BEGIN"))?,
             StatementClass::Commit => executor.commit().map(|()| Outcome::done("COMMIT"))?,
             StatementClass::Rollback => executor.rollback().map(|()| Outcome::done("ROLLBACK"))?,
+            // The three that mark and unwind part of a block. The aborted-block rule is *not*
+            // mirrored here — `tests/savepoint.rs` is where that is tested, against the session
+            // that owns it — so a `.slt` file uses these for the undo and not for the recovery.
+            StatementClass::Savepoint(name) => executor
+                .savepoint(name)
+                .map(|()| Outcome::done("SAVEPOINT"))?,
+            StatementClass::RollbackTo(name) => executor
+                .rollback_to(name)
+                .map(|()| Outcome::done("ROLLBACK"))?,
+            StatementClass::Release(name) => {
+                executor.release(name).map(|()| Outcome::done("RELEASE"))?
+            }
             _ => executor.execute(&parsed, &Params::NONE)?,
         };
     }

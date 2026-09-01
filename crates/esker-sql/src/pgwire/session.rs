@@ -138,6 +138,28 @@ pub trait Execute {
     }
 
     /// Opens a transaction.
+    /// Marks a point in the open block that `rollback_to` can return to.
+    ///
+    /// Names **stack**: two savepoints of one name are two marks, and `rollback_to` and `release`
+    /// each find the most recent. A map from name to mark gets that wrong in a way no
+    /// single-savepoint test can see (measured; `tests/corpus/pg19_savepoint.txt`).
+    fn savepoint(&mut self, name: &str) -> Result<()> {
+        let _ = name;
+        Ok(())
+    }
+
+    /// Undoes every write made since the most recent mark of that name, and leaves the mark.
+    fn rollback_to(&mut self, name: &str) -> Result<()> {
+        let _ = name;
+        Ok(())
+    }
+
+    /// Drops the most recent mark of that name and every mark above it, keeping their writes.
+    fn release(&mut self, name: &str) -> Result<()> {
+        let _ = name;
+        Ok(())
+    }
+
     /// Opens an explicit transaction block. `read_only` is `BEGIN READ ONLY`, which refuses every
     /// write in the block with `25006` exactly as PostgreSQL does.
     fn begin(&mut self, read_only: bool) -> Result<()> {
@@ -240,7 +262,7 @@ impl Session {
         let class = parsed.class();
 
         // A failed transaction refuses everything until it is ended, and says why every time.
-        if self.status == TransactionStatus::Failed && !ends_a_transaction(class) {
+        if self.status == TransactionStatus::Failed && !allowed_in_a_failed_transaction(class) {
             self.fail(&SqlError::InFailedTransaction, out);
             return false;
         }
@@ -249,6 +271,9 @@ impl Session {
             StatementClass::Begin => self.begin(parsed, executor, out),
             StatementClass::Commit => self.commit(executor, out),
             StatementClass::Rollback => self.rollback(executor, out),
+            StatementClass::Savepoint(name) => self.savepoint(name, executor),
+            StatementClass::RollbackTo(name) => self.rollback_to(name, executor),
+            StatementClass::Release(name) => self.release(name, executor),
             // A simple query carries no parameters: the protocol has no way to send one, which
             // is why `$1` in a `Query` is `42P02`.
             _ => executor.execute(parsed, &Params::NONE),
@@ -333,6 +358,43 @@ impl Session {
         let result = executor.rollback();
         self.status = TransactionStatus::Idle;
         result.map(|()| Outcome::done("ROLLBACK"))
+    }
+
+    /// `SAVEPOINT <name>`: a mark in the open block, and `25P01` outside one.
+    ///
+    /// PostgreSQL names **its own verb** in that message rather than what the user typed, so all
+    /// three of these say `SAVEPOINT`, `ROLLBACK TO SAVEPOINT` and `RELEASE SAVEPOINT` whichever
+    /// spelling arrived. Measured.
+    fn savepoint(&mut self, name: &str, executor: &mut dyn Execute) -> Result<Outcome> {
+        if self.status != TransactionStatus::InTransaction {
+            return Err(SqlError::OutsideTransactionBlock("SAVEPOINT"));
+        }
+        executor
+            .savepoint(name)
+            .map(|()| Outcome::done("SAVEPOINT"))
+    }
+
+    /// `ROLLBACK TO [SAVEPOINT] <name>`: undoes back to the mark and **leaves it there**, so the
+    /// same savepoint can be rolled back to again.
+    ///
+    /// It is the one statement that recovers an aborted block, so a success here moves the status
+    /// back to `InTransaction`. A failure does not: `3B001` for a savepoint that is not there
+    /// aborts the block like any other error, which is one of the ways *into* `25P02`.
+    fn rollback_to(&mut self, name: &str, executor: &mut dyn Execute) -> Result<Outcome> {
+        if self.status == TransactionStatus::Idle {
+            return Err(SqlError::OutsideTransactionBlock("ROLLBACK TO SAVEPOINT"));
+        }
+        executor.rollback_to(name)?;
+        self.status = TransactionStatus::InTransaction;
+        Ok(Outcome::done("ROLLBACK"))
+    }
+
+    /// `RELEASE [SAVEPOINT] <name>`: drops the mark and everything above it, and touches no data.
+    fn release(&mut self, name: &str, executor: &mut dyn Execute) -> Result<Outcome> {
+        if self.status != TransactionStatus::InTransaction {
+            return Err(SqlError::OutsideTransactionBlock("RELEASE SAVEPOINT"));
+        }
+        executor.release(name).map(|()| Outcome::done("RELEASE"))
     }
 
     /// Handles one frontend message, appending whatever it should answer with.
@@ -499,7 +561,9 @@ impl Session {
             return;
         };
 
-        if self.status == TransactionStatus::Failed && !ends_a_transaction(parsed.class()) {
+        if self.status == TransactionStatus::Failed
+            && !allowed_in_a_failed_transaction(parsed.class())
+        {
             return self.extended_failure(&SqlError::InFailedTransaction, out);
         }
 
@@ -507,6 +571,9 @@ impl Session {
             StatementClass::Begin => self.begin(&parsed, executor, out),
             StatementClass::Commit => self.commit(executor, out),
             StatementClass::Rollback => self.rollback(executor, out),
+            StatementClass::Savepoint(name) => self.savepoint(name, executor),
+            StatementClass::RollbackTo(name) => self.rollback_to(name, executor),
+            StatementClass::Release(name) => self.release(name, executor),
             _ => executor.execute(
                 &parsed,
                 &Params {
@@ -618,9 +685,20 @@ fn warn(error: &SqlError, out: &mut Vec<u8>) {
     error_message(error, &fields).encode(out);
 }
 
-/// Whether this statement is one of the two a failed transaction still accepts.
+/// Whether this statement is one of the two that **end** a failed transaction.
 fn ends_a_transaction(class: &StatementClass) -> bool {
     matches!(class, StatementClass::Commit | StatementClass::Rollback)
+}
+
+/// Whether a failed transaction still accepts this statement.
+///
+/// Three, not two, and the third is the whole reason savepoints are worth having: **`ROLLBACK TO`
+/// recovers an aborted block.** After an error every statement is `25P02` until the transaction
+/// ends — except that one, which un-aborts it and lets the block go on and commit. Measured, and
+/// it is what lets `ActiveRecord` run a test per transaction: a failing assertion does not poison
+/// the rest of the block.
+fn allowed_in_a_failed_transaction(class: &StatementClass) -> bool {
+    ends_a_transaction(class) || matches!(class, StatementClass::RollbackTo(_))
 }
 
 #[cfg(test)]

@@ -2,8 +2,13 @@
 # `docs/plans/phase-9-rails.md`, and what ActiveRecord wraps every one of its own tests in.
 #
 # Captured in **one session** with `scratchpad/sesscap.py`, in this order, and replayed the same
-# way: a savepoint is entirely about what a previous statement left behind, so a corpus taken a
-# connection per statement would have recorded nothing at all.
+# way against one node: a savepoint is entirely about what a previous statement left behind, so a
+# corpus taken a connection per statement would have recorded nothing at all -- and one taken in
+# two sessions against two table states records answers that contradict each other, which is what
+# the first draft of this file did.
+#
+# It builds its own table, for the same reason. A fixture outside the file is a second thing that
+# has to agree with it.
 #
 #   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
 #   statement <tab> <tab> -               a command with no result set, only a tag
@@ -25,21 +30,23 @@
 #   * outside a transaction block all three are `25P01`, and each names **its own verb** --
 #     `SAVEPOINT`, `RELEASE SAVEPOINT`, `ROLLBACK TO SAVEPOINT` -- not the one the user typed.
 #
+CREATE TABLE sp (id int8 PRIMARY KEY, n text)		-
+
 # --- the three verbs, outside a block and inside one
 SAVEPOINT outside_a_block	!25P01 SAVEPOINT can only be used in transaction blocks
 RELEASE outside_a_block	!25P01 RELEASE SAVEPOINT can only be used in transaction blocks
 ROLLBACK TO outside_a_block	!25P01 ROLLBACK TO SAVEPOINT can only be used in transaction blocks
 BEGIN		-
-INSERT INTO sp VALUES (1, 'a')	!23505 duplicate key value violates unique constraint "sp_pkey" DETAIL: Key (id)=(1) already exists.
-SAVEPOINT s1	!25P02 current transaction is aborted, commands ignored until end of transaction block
-INSERT INTO sp VALUES (2, 'b')	!25P02 current transaction is aborted, commands ignored until end of transaction block
-SELECT id, n FROM sp ORDER BY id	!25P02 current transaction is aborted, commands ignored until end of transaction block
-ROLLBACK TO s1	!3B001 savepoint "s1" does not exist
-SELECT id, n FROM sp ORDER BY id	!25P02 current transaction is aborted, commands ignored until end of transaction block
-INSERT INTO sp VALUES (3, 'c')	!25P02 current transaction is aborted, commands ignored until end of transaction block
-ROLLBACK TO SAVEPOINT s1	!3B001 savepoint "s1" does not exist
-SELECT id, n FROM sp ORDER BY id	!25P02 current transaction is aborted, commands ignored until end of transaction block
-RELEASE s1	!25P02 current transaction is aborted, commands ignored until end of transaction block
+INSERT INTO sp VALUES (1, 'a')		-
+SAVEPOINT s1		-
+INSERT INTO sp VALUES (2, 'b')		-
+SELECT id, n FROM sp ORDER BY id	bigint,text	1|a ; 2|b
+ROLLBACK TO s1		-
+SELECT id, n FROM sp ORDER BY id	bigint,text	1|a
+INSERT INTO sp VALUES (3, 'c')		-
+ROLLBACK TO SAVEPOINT s1		-
+SELECT id, n FROM sp ORDER BY id	bigint,text	1|a
+RELEASE s1		-
 ROLLBACK TO s1	!3B001 savepoint "s1" does not exist
 SAVEPOINT s2	!25P02 current transaction is aborted, commands ignored until end of transaction block
 INSERT INTO sp VALUES (4, 'd')	!25P02 current transaction is aborted, commands ignored until end of transaction block
@@ -49,9 +56,10 @@ RELEASE SAVEPOINT s2	!25P02 current transaction is aborted, commands ignored unt
 SELECT id, n FROM sp ORDER BY id	!25P02 current transaction is aborted, commands ignored until end of transaction block
 ROLLBACK TO s3	!3B001 savepoint "s3" does not exist
 COMMIT		-
-SELECT id, n FROM sp ORDER BY id	bigint,text	1|kept ; 2|after recovery
+SELECT id, n FROM sp ORDER BY id	bigint,text	-
 
 # --- the recovery Rails depends on, and the stack that names make
+DELETE FROM sp		-
 BEGIN		-
 INSERT INTO sp VALUES (1, 'kept')		-
 SAVEPOINT s		-

@@ -122,9 +122,6 @@ statement error (0A000)
 PREPARE p AS SELECT 1
 
 statement error (0A000)
-SAVEPOINT s
-
-statement error (0A000)
 COPY t FROM STDIN
 
 statement error (0A000)

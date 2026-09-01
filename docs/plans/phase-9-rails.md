@@ -1,6 +1,6 @@
 # Phase 9 plan — a PostgreSQL that Rails can talk to, scored by Rails' own tests
 
-Status: **units 0 and 1 landed.** §8 records progress per unit, §6 the divergences and §7 what unit 1 changed.
+Status: **units 0, 1 and 2 landed; unit 3 in progress.** §9 records progress per unit, §6 the divergences, §7 what unit 1 changed and §8 what is watched.
 
 Design: [ADR 0031](../adr/0031-rails-compatibility-is-measured.md). Constitution: `CLAUDE.md`.
 The compatibility contract this inherits whole: `docs/plans/phase-6a.md` §1 — **C1** every valid
@@ -227,6 +227,19 @@ Two things it must get right that the capture names: the aborted-block flag is *
 and `ROLLBACK TO` clears it, and the undo log has to be bounded the way the sort and the group
 table are — a `53400` naming it beats an allocation on a client's behalf.
 
+#### What building it turned up
+
+**`ROLLBACK TO s` ended the whole block.** `sqlparser` puts `ROLLBACK` and `ROLLBACK TO` in one
+variant with an `Option<Ident>`, and the classifier read the variant: so a statement PostgreSQL
+accepts was answered with a `ROLLBACK` tag and the user's other work went with it, no error to say
+so. It is now its own [`StatementClass`], and `tests/savepoint.rs` holds the regression — where the
+assertion is the **keeping**, because a plain `ROLLBACK` would have discarded the earlier row too.
+
+The corpus itself had to be re-taken. The first draft was two captures against two table states,
+so its two halves contradicted each other and the replay failed on a line where *both* servers were
+right about what they had been asked. It is now one session, and it **builds its own table**: a
+fixture outside the file is a second thing that has to agree with it.
+
 ### Unit 4 — `INNER` and `LEFT JOIN`, `ON` and `USING`
 
 One inner join and one cross join exist today (`plan::Join`, `Node::NestedLoop`, `Probe`). This
@@ -337,14 +350,23 @@ wrong**, and both were found by writing the statement down rather than by a fail
   expression that is written against a node's *output* rather than its input — an `Aggregate`'s
   `HAVING` — says so where it is rendered.
 
-## 8. Progress
+## 8. The watched list
+
+Failures seen once, not chased, and instrumented so that a recurrence leaves an artifact rather
+than a line in a scrollback. A third sighting of any of them makes it a chase.
+
+| Seen | What | State |
+|---|---|---|
+| 2026-09-01, once | `joint_gate::a_lock_the_ttl_kills_resolves_the_same_way_on_both_engines` failed a `TxnKv` call to the region's leader under a fully parallel `cargo test`. Passes 5/5 standalone — 3× alone and 2× as a whole target. A 30-second RPC deadline missed under load, on the clock surface `1f22077` hardened, and nothing in this lane touches a lock or a TTL. | **watched.** The bare `expect` on that call is now a dump: `target/joint-gate-transport-<ts>.txt`, naming who led the region, every store's address, leadership and applied index, and the deadline. |
+
+## 9. Progress
 
 | Unit | State | Commit |
 |---|---|---|
 | 0 — ADR, plan, aggregate capture | **done** | `de3c465`, `32fb58f` |
 | 1 — aggregates | **done** | `1d78a96` |
 | 2 — sequences and `RETURNING` | **done** | `e1b1bd2`, `7a7d4f3`, `bf28e0d` |
-| 3 — savepoints | **captured** (`tests/corpus/pg19_savepoint.txt`), design in §2; not built | |
+| 3 — savepoints | **done** | `779ae2e` (capture), this commit |
 | 3 — savepoints | not started | |
 | 4 — joins | not started | |
 | 5 — `pg_catalog` | not started | |

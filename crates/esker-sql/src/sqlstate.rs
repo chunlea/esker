@@ -150,6 +150,9 @@ pub const WRONG_OBJECT_TYPE: &str = "42809";
 pub const DATATYPE_MISMATCH: &str = "42804";
 /// No such function.
 pub const UNDEFINED_FUNCTION: &str = "42883";
+/// `ROLLBACK TO` or `RELEASE` naming a savepoint that is not there. Its own class, 3B, which has
+/// this one condition in it.
+pub const NO_SUCH_SAVEPOINT: &str = "3B001";
 /// `currval` before this session has called `nextval`. PostgreSQL's class 55, and a statement
 /// about the *session* rather than about the sequence — which does have a value.
 pub const OBJECT_NOT_IN_PREREQUISITE_STATE: &str = "55000";
@@ -276,6 +279,7 @@ mod tests {
         ("DATATYPE_MISMATCH", super::DATATYPE_MISMATCH),
         ("UNDEFINED_FUNCTION", super::UNDEFINED_FUNCTION),
         ("GENERATED_ALWAYS", super::GENERATED_ALWAYS),
+        ("NO_SUCH_SAVEPOINT", super::NO_SUCH_SAVEPOINT),
         (
             "OBJECT_NOT_IN_PREREQUISITE_STATE",
             super::OBJECT_NOT_IN_PREREQUISITE_STATE,

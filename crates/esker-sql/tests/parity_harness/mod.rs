@@ -36,7 +36,7 @@ use std::sync::Arc;
 use esker_sql::backend::{Backend, MemoryBackend};
 use esker_sql::catalog::Catalog;
 use esker_sql::exec::Executor;
-use esker_sql::parse::parse_statements;
+use esker_sql::parse::{StatementClass, parse_statements};
 use esker_sql::pgwire::session::{Execute, Outcome, Params};
 use esker_sql::value::PgType;
 
@@ -78,6 +78,14 @@ impl std::fmt::Display for Answer {
     }
 }
 
+/// The three statements a failed block still accepts, mirroring `crate::pgwire::session`.
+fn allowed_in_a_failed_block(class: &StatementClass) -> bool {
+    matches!(
+        class,
+        StatementClass::Commit | StatementClass::Rollback | StatementClass::RollbackTo(_)
+    )
+}
+
 /// What a corpus is allowed to disagree about, and why.
 #[derive(Default)]
 pub(crate) struct Divergences {
@@ -92,6 +100,10 @@ pub(crate) struct Node {
     /// Public to the tests that need the extended protocol rather than the simple one — a
     /// `Describe` has no place in a corpus, because `psql` never sends one.
     pub(crate) executor: Executor,
+    /// Whether an explicit block is open, and whether it has failed. The session's state, mirrored
+    /// (see [`Node::run`]).
+    in_block: bool,
+    failed: bool,
 }
 
 impl Node {
@@ -99,6 +111,8 @@ impl Node {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let mut node = Node {
             executor: Executor::new(backend, Arc::new(Catalog::new()), 1),
+            in_block: false,
+            failed: false,
         };
         for statement in fixture {
             node.run(statement)
@@ -107,10 +121,90 @@ impl Node {
         node
     }
 
+    /// One statement, through the same dispatch a client's would take.
+    ///
+    /// Transaction control does not go through `execute` — the session handles it, because it is
+    /// what moves the status a client sees — so this mirrors `crate::pgwire::session`'s dispatch,
+    /// the way `tests/slt_harness` already does. It mirrors the **aborted-block rule** too, which
+    /// is the one thing here that is a rule rather than a call: after an error every statement is
+    /// `25P02` until the block ends, except the three that are allowed through.
+    ///
+    /// That the real session agrees is not assumed: `tests/savepoint.rs` drives `Session` itself
+    /// and reads the status out of its `ReadyForQuery`.
     pub(crate) fn run(&mut self, sql: &str) -> esker_sql::Result<Outcome> {
         let mut last = Outcome::done("");
         for parsed in parse_statements(sql)? {
-            last = self.executor.execute(&parsed, &Params::NONE)?;
+            let class = parsed.class().clone();
+            if self.failed && !allowed_in_a_failed_block(&class) {
+                return Err(esker_sql::SqlError::InFailedTransaction);
+            }
+            let outcome = match &class {
+                StatementClass::Begin => {
+                    self.in_block = true;
+                    self.executor.begin(false).map(|()| Outcome::done("BEGIN"))
+                }
+                // A `COMMIT` on a **failed** block rolls it back and says so, which is
+                // PostgreSQL's own answer and the reason the tag is `ROLLBACK`.
+                StatementClass::Commit if self.failed => {
+                    self.in_block = false;
+                    self.failed = false;
+                    self.executor.rollback().map(|()| Outcome::done("ROLLBACK"))
+                }
+                StatementClass::Commit => {
+                    self.in_block = false;
+                    self.executor.commit().map(|()| Outcome::done("COMMIT"))
+                }
+                StatementClass::Rollback => {
+                    self.in_block = false;
+                    self.failed = false;
+                    self.executor.rollback().map(|()| Outcome::done("ROLLBACK"))
+                }
+                StatementClass::Savepoint(name) => {
+                    if self.in_block {
+                        self.executor
+                            .savepoint(name)
+                            .map(|()| Outcome::done("SAVEPOINT"))
+                    } else {
+                        Err(esker_sql::SqlError::OutsideTransactionBlock("SAVEPOINT"))
+                    }
+                }
+                StatementClass::RollbackTo(name) => {
+                    if self.in_block {
+                        // The one statement that recovers an aborted block.
+                        self.executor
+                            .rollback_to(name)
+                            .inspect(|()| {
+                                self.failed = false;
+                            })
+                            .map(|()| Outcome::done("ROLLBACK"))
+                    } else {
+                        Err(esker_sql::SqlError::OutsideTransactionBlock(
+                            "ROLLBACK TO SAVEPOINT",
+                        ))
+                    }
+                }
+                StatementClass::Release(name) => {
+                    if self.in_block {
+                        self.executor
+                            .release(name)
+                            .map(|()| Outcome::done("RELEASE"))
+                    } else {
+                        Err(esker_sql::SqlError::OutsideTransactionBlock(
+                            "RELEASE SAVEPOINT",
+                        ))
+                    }
+                }
+                _ => self.executor.execute(&parsed, &Params::NONE),
+            };
+            match outcome {
+                Ok(outcome) => last = outcome,
+                Err(error) => {
+                    if self.in_block && error.aborts_transaction() {
+                        self.failed = true;
+                    }
+                    return Err(error);
+                }
+            }
         }
         Ok(last)
     }

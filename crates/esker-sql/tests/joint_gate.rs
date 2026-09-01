@@ -517,14 +517,65 @@ impl Gate {
             .expect("the leader hosts the region")
             .region()
             .epoch;
-        let transport = BlockingTransport::connect(leader.address).unwrap();
+        // A transport failure here is **not** a bare `expect`, for the reason `compare` gives:
+        // this call is what a lock-expiry test hangs off, it has been seen to lose its deadline
+        // once under a fully parallel `cargo test`, and a rare failure whose evidence went to a
+        // terminal that was grepped is worth almost nothing. So it writes the cluster down first
+        // (`docs/plans/phase-9-rails.md` §8, the watched list).
+        let transport = BlockingTransport::connect(leader.address)
+            .unwrap_or_else(|error| self.transport_dump(region_id, "connect", &format!("{error}")));
         let answer = transport
             .call(
                 Request::txn_kv(RequestHeader::new(region_id, epoch, 0), request),
                 Instant::now() + Duration::from_secs(30),
             )
-            .expect("the leader answered");
+            .unwrap_or_else(|error| self.transport_dump(region_id, "call", &format!("{error}")));
         answer.into_txn_kv().expect("a TxnKv answer")
+    }
+
+    /// Writes the cluster down and fails, for a `TxnKv` call that never answered.
+    ///
+    /// The same discipline as [`compare`] and for the same reason — an artifact rather than a line
+    /// in a scrollback — but a different question, so a different dump: what failed here is the
+    /// *wire*, so what has to be on file is who led the region, what every store thought it was
+    /// doing, and how long the deadline was.
+    fn transport_dump(&self, region_id: u64, what: &str, error: &str) -> ! {
+        let mut dump = String::new();
+        let _ = writeln!(
+            dump,
+            "a TxnKv {what} to the leader of region {region_id} failed"
+        );
+        let _ = writeln!(dump, "error            {error}");
+        let _ = writeln!(dump, "deadline         30s");
+        dump.push_str("\n-- every store ---------------------------------------------------\n");
+        for node in &self.nodes {
+            let peer = node.store.peer_of(region_id);
+            let _ = writeln!(
+                dump,
+                "store {}  address={}  leader={:?}  applied={:?}",
+                node.store.store_id(),
+                node.address,
+                peer.as_ref().map(|peer| peer.is_leader()),
+                peer.as_ref().map(|peer| peer.applied_index()),
+            );
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis());
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("joint-gate-transport-{stamp}.txt"));
+        let written = std::fs::write(&path, &dump);
+        panic!(
+            "a TxnKv {what} to the leader of region {region_id} failed: {error}; dump {} at {}\n\
+             {dump}",
+            if written.is_ok() {
+                "written"
+            } else {
+                "NOT written"
+            },
+            path.display(),
+        )
     }
 
     /// The store ids holding a columnar learner of any region, as **PD** records them.

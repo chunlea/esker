@@ -390,6 +390,19 @@ pub enum SqlError {
     #[error("syntax error at or near \"{0}\"")]
     SyntaxAtOrNear(&'static str),
 
+    /// `SAVEPOINT`, `ROLLBACK TO SAVEPOINT` or `RELEASE SAVEPOINT` with no block open.
+    ///
+    /// The verb is **PostgreSQL's own**, not the user's: `RELEASE s` outside a block says
+    /// `RELEASE SAVEPOINT can only be used in transaction blocks`, naming the full form whichever
+    /// spelling arrived. Measured, all three.
+    #[error("{0} can only be used in transaction blocks")]
+    OutsideTransactionBlock(&'static str),
+
+    /// `ROLLBACK TO` or `RELEASE` naming a savepoint that is not on the stack — because it never
+    /// was, or because it has been released.
+    #[error("savepoint \"{0}\" does not exist")]
+    NoSuchSavepoint(String),
+
     /// `currval` or `lastval` before this session has taken a value.
     ///
     /// Session state, and PostgreSQL says so in the message: the sequence may well have a value,
@@ -734,6 +747,7 @@ impl SqlError {
             SqlError::ParameterlessAggregate => sqlstate::WRONG_OBJECT_TYPE,
             SqlError::GeneratedAlways { .. } => sqlstate::GENERATED_ALWAYS,
             SqlError::SequenceNotYetDefined(_) => sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+            SqlError::NoSuchSavepoint(_) => sqlstate::NO_SUCH_SAVEPOINT,
             SqlError::GroupingError(_) | SqlError::AggregateNotAllowed(_) => {
                 sqlstate::GROUPING_ERROR
             }
@@ -749,9 +763,9 @@ impl SqlError {
             SqlError::ActiveTransaction
             | SqlError::SnapshotAfterQuery
             | SqlError::ConcurrentlyInTransactionBlock(_) => sqlstate::ACTIVE_SQL_TRANSACTION,
-            SqlError::NoActiveTransaction | SqlError::SetTransactionOutsideBlock => {
-                sqlstate::NO_ACTIVE_SQL_TRANSACTION
-            }
+            SqlError::NoActiveTransaction
+            | SqlError::SetTransactionOutsideBlock
+            | SqlError::OutsideTransactionBlock(_) => sqlstate::NO_ACTIVE_SQL_TRANSACTION,
             SqlError::InvalidSnapshotIdentifier(_)
             | SqlError::InvalidParameterValue { .. }
             | SqlError::ParameterOutOfRange { .. } => sqlstate::INVALID_PARAMETER_VALUE,

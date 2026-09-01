@@ -35,6 +35,7 @@ mod job;
 pub use job::BATCH_ROWS;
 pub(crate) mod query;
 pub mod redrive;
+mod savepoint;
 mod verbs;
 
 use std::sync::Arc;
@@ -80,6 +81,10 @@ pub struct Executor {
     /// The sequence this session last took a value from, which is the whole of what `lastval()`
     /// is. `None` until there has been one, and `55000` is what that answers with.
     last_sequence: Option<u64>,
+    /// The open block's savepoints and the pre-images they can undo to
+    /// (`crate::exec::savepoint`). Empty outside a block, and empty inside one until the first
+    /// `SAVEPOINT` — which is what keeps an ordinary transaction paying nothing for this.
+    savepoints: savepoint::Savepoints,
     /// Whether the open transaction has run DDL. From then on its catalog lookups read through
     /// rather than from the shared cache: they answer with its own uncommitted definitions, which
     /// must not reach the other sessions on this node (`crate::catalog`).
@@ -137,6 +142,7 @@ impl Executor {
             row_ids: std::collections::BTreeMap::new(),
             sequences: std::collections::BTreeMap::new(),
             last_sequence: None,
+            savepoints: savepoint::Savepoints::default(),
             catalog_written: false,
             read_as_of: None,
             open_used: false,
@@ -216,11 +222,24 @@ impl Executor {
     fn in_a_transaction(&mut self, statement: Statement, params: &Params<'_>) -> Result<Outcome> {
         if let Some(mut txn) = self.open.take() {
             let mut written = std::mem::take(&mut self.written);
-            let outcome = self
-                .bound(&*txn, statement, params)
-                .and_then(|statement| self.run_recording(&mut *txn, &statement, &mut written));
+            let mut savepoints = std::mem::take(&mut self.savepoints);
+            // With a savepoint open the statement writes through a `Recording`, which takes each
+            // key's pre-image on the way past. That is what makes "every write is undoable" a fact
+            // about the type the executor was handed rather than a rule every call site follows.
+            let outcome = self.bound(&*txn, statement, params).and_then(|statement| {
+                if savepoints.recording() {
+                    let mut recording = savepoint::Recording::new(&mut *txn, &mut savepoints);
+                    let outcome = self.run_recording(&mut recording, &statement, &mut written);
+                    // A pre-image that could not be read is reported here, at the first place that
+                    // can say anything: `put` and `delete` return nothing by contract.
+                    recording.finish().and(outcome)
+                } else {
+                    self.run_recording(&mut *txn, &statement, &mut written)
+                }
+            });
             self.open = Some(txn);
             self.written = written;
+            self.savepoints = savepoints;
             return outcome;
         }
 
@@ -1121,6 +1140,7 @@ impl Execute for Executor {
     fn begin(&mut self, read_only: bool) -> Result<()> {
         // A second `BEGIN` never reaches here: the session answers it with PostgreSQL's warning
         // and leaves the block alone.
+        self.savepoints.clear();
         self.block_read_only = read_only;
         self.open = Some(self.open_txn()?);
         self.open_used = false;
@@ -1129,7 +1149,30 @@ impl Execute for Executor {
         Ok(())
     }
 
+    fn savepoint(&mut self, name: &str) -> Result<()> {
+        self.savepoints.savepoint(name);
+        Ok(())
+    }
+
+    /// The undo runs against the **open transaction**, which is the only place the writes it is
+    /// compensating for exist. A `ROLLBACK TO` with no block open never reaches here — the session
+    /// answers `25P01` first — so a missing transaction is a bug rather than a user's mistake.
+    fn rollback_to(&mut self, name: &str) -> Result<()> {
+        let mut txn = self
+            .open
+            .take()
+            .ok_or_else(|| SqlError::Internal("a ROLLBACK TO with no open block".to_owned()))?;
+        let result = self.savepoints.rollback_to(name, &mut *txn);
+        self.open = Some(txn);
+        result
+    }
+
+    fn release(&mut self, name: &str) -> Result<()> {
+        self.savepoints.release(name)
+    }
+
     fn commit(&mut self) -> Result<()> {
+        self.savepoints.clear();
         let written = std::mem::take(&mut self.written);
         self.catalog_written = false;
         self.end_of_block();
@@ -1151,6 +1194,7 @@ impl Execute for Executor {
     }
 
     fn rollback(&mut self) -> Result<()> {
+        self.savepoints.clear();
         self.written = Written::default();
         self.catalog_written = false;
         self.columnar_changed = false;
