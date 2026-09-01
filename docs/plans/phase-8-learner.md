@@ -907,8 +907,34 @@ a lock **can** now be judged dead, so a transaction slow between prewrite and co
 locks resolved underneath it, which the counting oracle made impossible. The second is the one to
 look at first, because it is new.
 
-What to do with a recurrence rather than what to conclude from a silence: run the file with
-`--nocapture` and keep the whole failure, because `assert_eq!` prints both vectors and the
-difference names the mechanism — a row missing entirely is a catch-up or a seal, a row with the
-wrong `region` value is the widening, and a row visible on one side only is MVCC resolution. It is
-worth a deliberate soak before wave B builds on the fragment path.
+### What was done about it, since a pass rate is not evidence
+
+**1. The evidence cannot be lost again.** A `columns != rows` disagreement writes
+`target/joint-gate-disagreement-<ts>.txt` before it panics and names the file in the panic: both
+sides, the rows only one side has, the instant, the fragment's shape, and per store whether it
+leads, what it has applied, whether it is the columnar learner, and for each row of the workload
+how many `write` records it holds and what a direct read answers. Those last two are the diagnosis
+— a version the learner does not *have* is a catch-up or a tee, one it has and does not show is
+MVCC, one with a lock over it is the resolution path.
+
+**2. The named candidate is constructed and ruled out.**
+`a_lock_the_ttl_kills_resolves_the_same_way_on_both_engines` drives the interleaving rather than
+waiting for it: a transaction prewrites two rows and commits only its primary, the wall clock
+passes the lock's TTL, the row scan resolves the standing lock against a committed primary and
+**rolls it forward**, and the columnar copy is asked about the same instant. That `write` record is
+created by `ResolveLock` and not by `Commit`, so a tee watching commits alone would hold every
+version except those a resolver produced — for ever, and only for transactions whose client died
+at exactly the wrong moment. `peer::commits_of` covers it and the test says so from outside.
+
+It is not a vacuous pass: with that arm of `commits_of` removed, the test fails and the dump reads
+*only the row scan has* `[Int8(5), Text("barbara")]` while every store, learner included, shows
+`id 5: 1 write records` — the version in the region and not in the copy, which is the sentence the
+dump exists to be able to write.
+
+**3. The soak.** 200 runs of the differential on the physical oracle with the dump armed: **200
+passed, 0 failed, no artifact written.**
+
+So the candidate the oracle change introduced is not the cause, and what was seen once is still
+unexplained. What it is not, now, is unrecorded and undiagnosable: the next occurrence leaves a
+file. A row missing entirely is a catch-up or a seal, a row with the wrong `region` value is the
+widening, and a row visible on one side only is MVCC resolution.
