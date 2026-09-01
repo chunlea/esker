@@ -1,0 +1,14 @@
+crates/esker-sql/tests/redrive_live.rs
+  h_44076b318daf9c 1-173
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "7cb0a8ab5811a6f5a98e9aaaedb9cead25c892fa",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
