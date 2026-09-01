@@ -84,13 +84,18 @@ async fn main() -> std::io::Result<()> {
         Arc::new(MemoryBackend::new())
     } else {
         tracing::info!(stores = ?stores, "connecting to the cluster");
-        {
-            let (client, oracle) = connect(&stores)?;
-            let backend = StoreBackend::new(Arc::new(client), oracle);
-            match &lease {
-                Some(lease) => Arc::new(backend.with_schema_lease(Arc::clone(lease) as Arc<_>)),
-                None => Arc::new(backend),
-            }
+        // Onto a blocking thread, because connecting is a **synchronous** client building its own
+        // runtime and this function is inside `#[tokio::main]`'s. Doing it here panicked with
+        // "Cannot start a runtime from within a runtime" — on the first line of every node
+        // started against real stores, which is the one path no test took until this phase
+        // started one from a shell.
+        let (client, oracle) = tokio::task::spawn_blocking(move || connect(&stores))
+            .await
+            .map_err(std::io::Error::other)??;
+        let backend = StoreBackend::new(Arc::new(client), oracle);
+        match &lease {
+            Some(lease) => Arc::new(backend.with_schema_lease(Arc::clone(lease) as Arc<_>)),
+            None => Arc::new(backend),
         }
     };
     let catalog = Arc::new(Catalog::new());
