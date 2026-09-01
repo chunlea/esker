@@ -125,6 +125,49 @@ async fn open_store(
     }
 }
 
+/// The SQL node over this cluster, as the binary builds one: a client, a lease fetched before it
+/// serves, a refresher thread, and the connection the executor reports through.
+///
+/// Routed from what PD actually says rather than from an assumption — PD allocates the region's
+/// id, and a later conf change moves its epoch, which the client learns from the store's own
+/// refusal, so this only has to be right at the start.
+fn sql_node(
+    addresses: &[std::net::SocketAddr],
+    region: &esker_proto::Region,
+    pd_address: std::net::SocketAddr,
+) -> (Arc<dyn Backend>, Arc<PdConn>) {
+    let stores = TcpStores::connect_all(addresses, TransportConfig::new()).unwrap();
+    let resolver: Arc<dyn RegionResolver> = Arc::new(RegionTable::from_routes([Route {
+        region: region.clone(),
+        leader: None,
+    }]));
+    let router = Router::with_options(
+        Arc::new(stores),
+        resolver,
+        ClientOptions {
+            jitter_seed: Some(13),
+            ..ClientOptions::default()
+        },
+    );
+    let oracle: Arc<dyn TimestampOracle> = Arc::new(CountingOracle::starting_at(1_000));
+    let client = Arc::new(TxnClient::on_router(Arc::new(router), Arc::clone(&oracle)));
+
+    let lease = Arc::new(PdLease::new());
+    let backend: Arc<dyn Backend> = Arc::new(
+        esker_sql::backend::StoreBackend::new(client, oracle)
+            .with_schema_lease(Arc::clone(&lease) as Arc<dyn SchemaLeaseSource>),
+    );
+    let conn = Arc::new(PdConn::new(pd_address));
+    let refresher = LeaseRefresher::new(Arc::clone(&conn), lease)
+        .asserting_columnar_for(Arc::clone(&backend), TENANT);
+    refresher.refresh().expect("the node fetches its lease");
+    std::thread::Builder::new()
+        .name("schema-lease".to_owned())
+        .spawn(move || refresher.run())
+        .unwrap();
+    (backend, conn)
+}
+
 /// The whole cluster: a placement driver, four stores, and one SQL node over them.
 struct Gate {
     pd: Arc<Pd>,
@@ -139,6 +182,15 @@ struct Gate {
 
 impl Gate {
     async fn start() -> Self {
+        Self::start_with(false).await
+    }
+
+    /// The same cluster, with PD's balancer running.
+    async fn start_balancing() -> Self {
+        Self::start_with(true).await
+    }
+
+    async fn start_with(balance: bool) -> Self {
         let pd_address = reserve();
         let addresses: Vec<std::net::SocketAddr> = (0..STORES).map(|_| reserve()).collect();
         let peers: Vec<PeerAddress> = addresses
@@ -157,10 +209,12 @@ impl Gate {
                 target_replicas: VOTERS,
                 operator_timeout_ms: 5_000,
                 max_store_down_time_ms: 5_000,
-                // **Off**, as PD's own columnar tests have it. This gate is about a placement a
-                // DDL statement caused; balance moving a voter onto the spare store would decide
-                // where the learner can go for reasons that have nothing to do with the ALTER.
-                balance: false,
+                // **Off by default here**, as PD's own columnar tests have it: this gate is about
+                // a placement a DDL statement caused, and balance moving a voter onto the spare
+                // store would decide where the learner can go for reasons that have nothing to do
+                // with the `ALTER`. What that hides is not nothing —
+                // [`a_columnar_learner_does_not_cost_the_region_a_voter`] is the case it hides.
+                balance,
                 ..PdOptions::new()
             },
         )
@@ -204,47 +258,15 @@ impl Gate {
         })
         .await;
 
-        // The SQL node's client, routed from what PD actually says rather than from an assumption:
-        // PD allocates the region's id, and a later conf change moves its epoch — which the client
-        // learns from the store's own refusal, so this only has to be right at the start.
+        // PD allocates the region's id, so the client is told what PD actually says rather than
+        // what a fresh cluster usually comes out as.
         let route = pd
             .get_region(b"")
             .unwrap()
             .expect("a region covers the key space");
         let region_id = route.region.id;
-        let oracle: Arc<dyn TimestampOracle> = Arc::new(CountingOracle::starting_at(1_000));
-        let (backend, conn) = tokio::task::block_in_place(|| {
-            let stores = TcpStores::connect_all(&addresses, TransportConfig::new()).unwrap();
-            let resolver: Arc<dyn RegionResolver> = Arc::new(RegionTable::from_routes([Route {
-                region: route.region.clone(),
-                leader: None,
-            }]));
-            let router = Router::with_options(
-                Arc::new(stores),
-                resolver,
-                ClientOptions {
-                    jitter_seed: Some(13),
-                    ..ClientOptions::default()
-                },
-            );
-            let client = Arc::new(TxnClient::on_router(Arc::new(router), Arc::clone(&oracle)));
-
-            // The node, as the binary builds it: a lease fetched before it serves, a refresher
-            // thread, and the connection the executor reports through.
-            let lease = Arc::new(PdLease::new());
-            let backend = esker_sql::backend::StoreBackend::new(client, oracle)
-                .with_schema_lease(Arc::clone(&lease) as Arc<dyn SchemaLeaseSource>);
-            let backend: Arc<dyn Backend> = Arc::new(backend);
-            let conn = Arc::new(PdConn::new(pd_address));
-            let refresher = LeaseRefresher::new(Arc::clone(&conn), lease)
-                .asserting_columnar_for(Arc::clone(&backend), TENANT);
-            refresher.refresh().expect("the node fetches its lease");
-            std::thread::Builder::new()
-                .name("schema-lease".to_owned())
-                .spawn(move || refresher.run())
-                .unwrap();
-            (backend, conn)
-        });
+        let (backend, conn) =
+            tokio::task::block_in_place(|| sql_node(&addresses, &route.region, pd_address));
 
         Gate {
             pd,
@@ -572,6 +594,80 @@ async fn a_learner_that_dies_comes_back_to_the_same_job() {
         },
     )
     .await;
+
+    gate.stop().await;
+}
+
+/// A columnar learner must not cost the region a voter — and today it does.
+///
+/// **This test is `ignore`d because it fails, and it fails on a defect in `esker-pd` that this
+/// lane is not allowed to fix.** It is here rather than in a report because a red test is the
+/// fastest thing to hand across a lane boundary: un-`ignore` it, and it either passes or it says
+/// exactly what is still wrong.
+///
+/// `balance::region_balance` asks `region.peers.len() > cluster.target_replicas`, over **every**
+/// peer. A healthy three-voter region that gains a columnar learner is four peers against a
+/// target of three, so balance sheds "the replica on the busiest store" — a voter — and repair
+/// then has to put one back. That is the third instance of the family `wy-c2` named at the end of
+/// wave A: *"a count taken over `peers` rather than over voters"*, after `urgency_for` and
+/// `repair_for`, both of which were fixed and both of which read healthy on a cluster that was
+/// not.
+///
+/// Seen first on a real cluster, not here (`docs/bench/columnar-learner.md`). PD's own history,
+/// out of `esker pd inspect` after the run:
+///
+/// ```text
+///   1788233921876 ms  region 1  AddLearner  issued     store 4  peer 5
+///   1788233921975 ms  region 1  AddLearner  done       store 4  peer 5
+///   1788233921975 ms  region 1  RemovePeer  issued     store 0  peer 3
+///   1788233922074 ms  region 1  RemovePeer  done       store 0  peer 3
+///   1788233922074 ms  region 1  AddPeer     issued     store 1  peer 6
+///   1788234222175 ms  region 1  AddPeer     timed out  store 1  peer 6
+/// ```
+///
+/// The voter went in the same millisecond the columnar learner landed, and no store was down —
+/// all four were heart-beating throughout, so `repair_for`, which only removes a *dead* peer, is
+/// not what did it. The cost is not cosmetic: the region sat at **two** voters for the five
+/// minutes the replacement's `AddPeer` took to time out, one failure from losing quorum, and
+/// every other operator for that region — including the removal the next `ALTER` asked for —
+/// waited behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "fails on a defect in esker-pd's balance rule: see this test's doc comment"]
+async fn a_columnar_learner_does_not_cost_the_region_a_voter() {
+    let gate = Gate::start_balancing().await;
+    tokio::task::block_in_place(|| {
+        let mut session = gate.session();
+        session
+            .run("CREATE TABLE t (id int8 PRIMARY KEY, name text)")
+            .unwrap();
+        session.run("INSERT INTO t VALUES (1, 'ada')").unwrap();
+        session
+            .run("ALTER TABLE t SET (columnar_replicas = 1)")
+            .unwrap();
+    });
+    wait_for("PD to place a columnar learner", 60, || {
+        gate.columnar_learners().len() == 1
+    })
+    .await;
+
+    // Long enough for the next few heartbeats to have been answered: the removal that this test
+    // is about arrived in the millisecond after the learner landed.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let voters: Vec<u64> = gate
+        .pd
+        .regions()
+        .unwrap()
+        .iter()
+        .flat_map(|record| record.region.peers.clone())
+        .filter(|peer| peer.role == PeerRole::Voter)
+        .map(|peer| peer.peer_id)
+        .collect();
+    assert_eq!(
+        voters.len(),
+        VOTERS,
+        "the region lost a voter when it gained a columnar learner: {:?}",
+        gate.pd.regions().unwrap(),
+    );
 
     gate.stop().await;
 }

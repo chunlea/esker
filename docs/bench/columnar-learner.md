@@ -103,3 +103,147 @@ trouble; a region that never compacts at all still pays only about half.
   merged row is possible and is a larger change than this milestone earned.
 * **20,000 rows** is small, chosen so the row side finishes. The columnar figures are stable across
   sizes; the row side is linear in the same coordination cost throughout.
+
+---
+
+# The story end to end, on a real cluster — 2026-08-31
+
+Not a benchmark. This is the transcript the phase-8 wiring lane's gate is written against
+(`docs/plans/phase-8-learner.md` §wiring): a placement driver, four stores and a SQL node, all as
+separate processes, with `ALTER TABLE ... SET (columnar_replicas = N)` as the only thing anybody
+asks for. It is recorded because the numbers above say what a columnar replica costs and this says
+what it takes to get one.
+
+## Two commands and a psql session
+
+```text
+$ esker cluster start --nodes 4 --data-dir /tmp/smoke/cluster --base-port 21160 --pd
+esker cluster: 4 nodes started
+  placement driver on 127.0.0.1:21164 (pid 11471)
+  node 1 on 127.0.0.1:21160 (pid 11472)
+  node 2 on 127.0.0.1:21161 (pid 11473)
+  node 3 on 127.0.0.1:21162 (pid 11474)
+  node 4 on 127.0.0.1:21163 (pid 11475)
+esker cluster: a SQL node over this cluster is
+  esker-sql 127.0.0.1:5432 127.0.0.1:21160 127.0.0.1:21161 127.0.0.1:21162 127.0.0.1:21163 --pd 127.0.0.1:21164
+```
+
+**Four nodes, not three.** A columnar learner is placed on the healthiest store *without a peer*,
+so a three-store cluster with a three-voter region has nowhere to put one.
+
+```text
+$ esker-sql 127.0.0.1:5442 127.0.0.1:21160 ... 127.0.0.1:21163 --pd 127.0.0.1:21164
+INFO esker_sql: connecting to the cluster stores=[...]
+INFO esker_sql: holding a schema lease pd=127.0.0.1:21164 lease_ms=5000 step_ms=8000 removal_extra_ms=3600000
+INFO esker_sql: re-driving orphaned schema-change jobs step_ms=8000 removal_extra_ms=3600000
+INFO esker_sql::pgwire::server: esker-sql is listening address=127.0.0.1:5442
+```
+
+Those two middle lines are the whole of this lane. Before it, the second said *"no schema step
+interval published to this node"* and the first did not exist: the lease was never fetched, so
+fail-closed never armed, and the re-driver ticked against nothing.
+
+```text
+$ psql postgresql://esker@127.0.0.1:5442/esker?sslmode=disable
+CREATE TABLE readings (id int8 PRIMARY KEY, sensor text NOT NULL, value int8);
+INSERT INTO readings VALUES (1, 'north', 10), (2, 'south', 20), (3, 'east', 30);
+SELECT * FROM readings ORDER BY id;
+ id | sensor | value
+----+--------+-------
+  1 | north  |    10
+  2 | south  |    20
+  3 | east   |    30
+(3 rows)
+
+ALTER TABLE readings SET (columnar_replicas = 1);
+SELECT * FROM esker_columnar_replicas();
+  table   | columnar_replicas
+----------+-------------------
+ readings | 1
+(1 row)
+```
+
+## What the cluster did about it, without being asked again
+
+```text
+$ esker region ls --pd 127.0.0.1:21164          # before
+  region       epoch  peers
+       1     5,1      *2@127.0.0.1:21161 3@127.0.0.1:21160 4@127.0.0.1:21162
+
+$ esker region ls --pd 127.0.0.1:21164          # after
+  region       epoch  peers
+       1     8,1      *2@127.0.0.1:21161 4@127.0.0.1:21162 5C@127.0.0.1:21163 6L@127.0.0.1:21160
+
+1 regions; * is the leader, L a learner, C a columnar learner
+```
+
+`5C` on `127.0.0.1:21163` is the columnar replica, on the store that had no peer — placed because
+a `psql` statement said so and for no other reason. Setting the flag back to `0` takes it away
+again, because a report is a full assertion and a table set to zero is simply absent from the next
+one:
+
+```text
+ALTER TABLE readings SET (columnar_replicas = 0);
+
+$ esker region ls --pd 127.0.0.1:21164
+       1     9,1      *2@127.0.0.1:21161 4@127.0.0.1:21162 6L@127.0.0.1:21160
+```
+
+## How long it takes, and why
+
+Two minutes to place, five to retire — and none of it is the SQL node, which reports in the same
+millisecond the `ALTER` commits. PD can only reach a store by **answering its region heartbeat**,
+and a real store sends one every 60 s (`esker_store::REGION_HEARTBEAT_MS`, `docs/DESIGN.md` §14).
+Every operator therefore costs a heartbeat, and the removal below cost five minutes because it
+queued behind an operator that had to time out first. The in-process gate does the same sequence in
+under four seconds with `region_heartbeat` at 20 ms, which is the same code and a different clock.
+
+## The defect this transcript found
+
+`esker pd inspect` after the run, with the history PD keeps of its own operators:
+
+```text
+regions (1)
+     1  [, +inf)  epoch (9, 1)  leader 2  term 1  applied 23
+        peer 2 on store 2 (Voter)
+        peer 4 on store 3 (Voter)
+        peer 6 on store 1 (Learner)
+
+operator history (12)
+   1788233801172 ms  region 1  AddPeer     issued     store 1  peer 3
+   1788233801375 ms  region 1  AddPeer     done       store 1  peer 3
+   1788233801375 ms  region 1  AddPeer     issued     store 3  peer 4
+   1788233801874 ms  region 1  AddPeer     done       store 3  peer 4
+   1788233921876 ms  region 1  AddLearner  issued     store 4  peer 5
+   1788233921975 ms  region 1  AddLearner  done       store 4  peer 5
+   1788233921975 ms  region 1  RemovePeer  issued     store 0  peer 3
+   1788233922074 ms  region 1  RemovePeer  done       store 0  peer 3
+   1788233922074 ms  region 1  AddPeer     issued     store 1  peer 6
+   1788234222175 ms  region 1  AddPeer     timed out  store 1  peer 6
+   1788234222175 ms  region 1  RemovePeer  issued     store 0  peer 5
+   1788234222276 ms  region 1  RemovePeer  done       store 0  peer 5
+```
+
+**A voter went in the same millisecond the columnar learner landed.** No store was down — all four
+were heart-beating throughout, and `schedule::repair_for` only removes a *dead* peer. What did it is
+`balance::region_balance`, which asks `region.peers.len() > cluster.target_replicas` over **every**
+peer: a healthy three-voter region that gains a columnar learner is four peers against a target of
+three, so balance sheds "the replica on the busiest store" and repair has to put one back.
+
+That is the third instance of the family wave A named — *a count taken over `peers` rather than
+over voters* — after `schedule::urgency_for` and `schedule::repair_for`, both of which were fixed
+and both of which read healthy on a cluster that was not. The cost here is not cosmetic: the region
+sat at **two** voters for the five minutes the replacement's `AddPeer` took to time out, one
+failure from losing quorum, and every other operator for that region — including the removal the
+next `ALTER` asked for — waited behind it.
+
+Reproduced in under three seconds, in process, as
+`esker-sql/tests/joint_gate.rs::a_columnar_learner_does_not_cost_the_region_a_voter` — `#[ignore]`d
+because it fails, and left red on purpose for whoever owns `esker-pd`:
+
+```text
+cargo test -p esker-sql --test joint_gate -- --ignored --test-threads=1
+```
+
+It is why PD's own columnar tests run with `balance: false`, and why the gate beside it does too:
+the harness that would have caught this had the switch turned off.

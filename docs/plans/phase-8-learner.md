@@ -606,3 +606,91 @@ process boundary rather than the rule alone.
 
 Not fixed here: this lane reached the end of its context, and a hurried change to the retry path is
 how a good fix becomes a bad one.
+
+---
+
+# §wiring — what was built (lane a5-wiring)
+
+The cable is in and the circuit closes: on a real cluster, `ALTER TABLE t SET
+(columnar_replicas = 1)` typed into `psql` now causes a columnar replica to be placed, and setting
+it to `0` takes it away. `docs/bench/columnar-learner.md` carries the transcript.
+
+## The five units, and what each one turned out to be
+
+1. **The cable.** `esker-sql --pd HOST:PORT`: a `PdConn` speaking the two methods only a SQL node
+   sends, a lease fetched before the node serves, and a refresher thread. Absent `--pd` changes
+   nothing — no lease source, unrestricted writes, no interval — which is what every existing test
+   in the crate keeps checking by carrying on unmodified. The lapse test stops the placement driver
+   and watches writes turn into `25006` while the same session keeps reading.
+2. **The re-driver, live.** Two SQL nodes over three stores; one abandons a `CREATE INDEX
+   CONCURRENTLY` after one step and the other's `run()` loop finishes it on PD's cadence. The
+   refresher is load-bearing there rather than incidental: the test runs for several lease terms
+   and `ReDriver::pass` fail-closes on a lapsed lease, so a hang would mean a renewal stopped.
+3. **The report.** After the `ALTER` commits and on every lease refresh, as a full assertion built
+   from a scan of `catalog::columnar_range`. A rolled-back `ALTER` reports nothing; a block's
+   commit reports at the commit; a table set to `0` is absent rather than zero.
+4. **The gate.** A real `esker-pd`, four real stores, the real node wiring. Placement, retirement,
+   and a learner killed and reopened that comes back to the same job.
+5. **The smoke.** `esker cluster start --pd` now starts a placement driver and prints the
+   `esker-sql` line that goes over it; `esker region ls` prints `C` for a columnar learner.
+
+## Two defects found by running it, one fixed here and one not
+
+**Fixed (this lane's own layer).** `esker-sql <listen> <store>...` panicked with *"Cannot start a
+runtime from within a runtime"* on its first line, before it listened for anything: `connect`
+builds a synchronous client, which owns a runtime, and it was called straight from
+`#[tokio::main]`'s. It had been true since the binary learned to take store addresses; every test
+built its client on a blocking thread, so the panicking path was the binary's own startup and
+nothing walked it until a shell did.
+
+**Not fixed, and not this lane's to fix.** `balance::region_balance` counts
+`region.peers.len() > cluster.target_replicas` over **every** peer, so a healthy three-voter region
+that gains a columnar learner is four against three and balance sheds a **voter**. PD's own
+operator history, from `esker pd inspect` after the run:
+
+```text
+   1788233921975 ms  region 1  AddLearner  done       store 4  peer 5
+   1788233921975 ms  region 1  RemovePeer  issued     store 0  peer 3
+   1788233922074 ms  region 1  AddPeer     issued     store 1  peer 6
+   1788234222175 ms  region 1  AddPeer     timed out  store 1  peer 6
+```
+
+Same millisecond, no store down. The region sat at two voters for the five minutes the replacement
+took to time out, and every operator behind it — including the next `ALTER`'s removal — waited.
+This is the **third** instance of the family §wire named at the end of wave A, after `urgency_for`
+and `repair_for`: *a count taken over `peers` rather than over voters*, reading healthy on a
+cluster that is not. Handed over as a red test rather than a paragraph:
+`esker-sql/tests/joint_gate.rs::a_columnar_learner_does_not_cost_the_region_a_voter`, `#[ignore]`d,
+three seconds to reproduce.
+
+## What the gate does NOT prove, and the evidence
+
+The brief's gate ends with the differential — a fragment evaluated against the learner against a
+row scan at one `ts`. **It cannot run, and the reason is not in this lane.** `esker-store` has no
+columnar apply target on a live region:
+
+* `Store::serve_fragment` returns `Refused { NotColumnar }` unconditionally, and says of itself
+  that *"until the apply target is placed on regions (phase 8 unit 3), this is the only answer this
+  store has"*;
+* `ColumnarApply::open` is called from no path in `esker-store/src` — only from that module's own
+  tests, `tests/columnar_differential.rs` and `tests/bench_columnar.rs`.
+
+So a columnar learner today is a learner whose *region record* says it is columnar, applying rows
+like every other learner. §store units 1 and 2 built the apply target and the runs; unit 3 — the
+fragment service on a live region — is what stands between here and the differential.
+`joint_gate.rs::the_fragment_service_still_refuses` pins that as a fact rather than a claim, and is
+the test to replace with the differential when unit 3 lands.
+
+The brief's premise that "the store's apply target [and] the fragment service ... ALL exist and are
+green" is true of the modules and not of the paths: both exist, neither is reachable from a running
+store. Worth saying plainly, because a wave that reported the gate green on the placement half
+would have left the next lane to discover the other half was never wired.
+
+## Not done, deliberately
+
+* **No literal `SIGKILL`** in the gate: a store there is an object in the test's process, so the
+  crash is an abrupt stop and a reopen. The between-process question belongs to `esker-cli`'s
+  chaos battery, which owns it for every store in the cluster.
+* **No routing table from PD.** `connect`'s `TODO(phase-6a)` stands: this lane added a PD
+  connection for the lease and the report, not a region resolver. The static route is corrected by
+  the store's own `EpochNotMatch`, which is how a conf change reaches the client today.
