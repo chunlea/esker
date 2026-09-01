@@ -35,6 +35,15 @@ history stays readable. Each entry records:
 A number without its machine and its workload is not a measurement, and two numbers from
 different machines are not a comparison.
 
+## Not a benchmark: the compatibility scoreboards
+
+[`rails-scoreboard.md`](rails-scoreboard.md) records how far a real `ActiveRecord` gets against
+this node — a pass rate over somebody else's test suite rather than a throughput number, and the
+oracle phase 9 is measured by ([ADR 0031](../adr/0031-rails-compatibility-is-measured.md)). It
+lives here because the same rules apply to it: the commit it was taken at, the commands that
+reproduce it, and **the bad number recorded rather than the flattering one**. It is a gate for
+nothing; it is a fact somebody has to explain.
+
 ## Rules
 
 * **Do not tune before correctness is proven.** A fast engine that loses an acknowledged write
