@@ -27,11 +27,78 @@ use crate::catalog::TableDef;
 use crate::error::{Result, SqlError};
 use crate::exec::{Executor, Unique, Written};
 use crate::exec::{cursor, query};
+use crate::pgwire::message::FieldDescription;
 use crate::pgwire::session::Outcome;
-use crate::plan::{Delete, Insert, Update};
+use crate::plan::{Delete, Insert, Returning, Update};
 use crate::row;
+use crate::value::ColumnType;
 use crate::value::Datum;
 use crate::value::{PgDatum, PgType};
+
+/// The rows a statement's `RETURNING` will answer with, gathered as the statement writes them.
+///
+/// `None` from [`Returned::open`] is the ordinary case — no `RETURNING` — and then nothing here
+/// runs and the statement answers with its tag alone.
+///
+/// **The rows are gathered as they are written, not read back afterwards.** Reading them back
+/// would be a second pass over keys the transaction has already touched, and for a `DELETE` there
+/// would be nothing left to read; more importantly it would answer with what a *later* statement
+/// could see rather than with what this one did, which is not what `RETURNING` means.
+struct Returned {
+    columns: Vec<(String, ColumnType)>,
+    exprs: Vec<crate::plan::Expr>,
+    rows: Vec<Vec<Option<Vec<u8>>>>,
+}
+
+impl Returned {
+    /// Resolves the target list against the table, or `None` when the statement has no
+    /// `RETURNING`. Resolution happens **before** the first row is written, so `RETURNING nope`
+    /// is `42703` with nothing written rather than after half the statement has run.
+    fn open(returning: Option<&Returning>, table: &TableDef) -> Result<Option<Self>> {
+        let Some(items) = returning else {
+            return Ok(None);
+        };
+        let (columns, exprs) = query::returning_columns(items, table)?;
+        Ok(Some(Returned {
+            columns,
+            exprs,
+            rows: Vec::new(),
+        }))
+    }
+
+    /// One row, as the statement leaves it.
+    fn push(&mut self, row: &[Datum]) -> Result<()> {
+        let values = self
+            .exprs
+            .iter()
+            .map(|expr| {
+                cursor::evaluate(expr, row).map(|value| value.to_text().map(String::into_bytes))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.rows.push(values);
+        Ok(())
+    }
+}
+
+/// The statement's answer: its rows and its tag, or its tag alone.
+///
+/// The tag is **the same either way**. `INSERT 0 2` is what a real server sends whether or not the
+/// statement had a `RETURNING`, because the tag counts rows written and the result set is a second
+/// thing the statement produced rather than a different thing it did.
+fn finish(returned: Option<Returned>, tag: String) -> Outcome {
+    match returned {
+        None => Outcome::done(tag),
+        Some(returned) => Outcome::Rows {
+            fields: returned
+                .columns
+                .iter()
+                .map(|(name, ty)| FieldDescription::computed(name.clone(), *ty))
+                .collect(),
+            rows: returned.rows,
+            tag,
+        },
+    }
+}
 
 pub(super) fn insert(
     executor: &mut Executor,
@@ -41,6 +108,7 @@ pub(super) fn insert(
 ) -> Result<Outcome> {
     let table = executor.require_table(txn, &insert.table)?;
     let targets = target_columns(&table, insert)?;
+    let mut returned = Returned::open(insert.returning.as_ref(), &table)?;
 
     for values in &insert.rows {
         if values.len() > targets.len() {
@@ -73,11 +141,16 @@ pub(super) fn insert(
 
         check_not_null(&table, &row)?;
         write_row(executor, txn, &table, &row, written)?;
+        // The row **as stored**, so a column filled from its `DEFAULT` comes back with that value
+        // rather than with the NULL the user did not write.
+        if let Some(returned) = &mut returned {
+            returned.push(&row)?;
+        }
     }
 
     // The leading zero is the OID of the inserted row, which PostgreSQL stopped assigning in 8.1
     // and still reports as 0. A client that parses the tag expects three fields.
-    Ok(Outcome::done(format!("INSERT 0 {}", insert.rows.len())))
+    Ok(finish(returned, format!("INSERT 0 {}", insert.rows.len())))
 }
 
 /// Which column each value in a `VALUES` tuple is for.
@@ -230,6 +303,7 @@ pub(super) fn update(
     written: &mut Written,
 ) -> Result<Outcome> {
     let table = executor.require_table(txn, &update.table)?;
+    let mut returned = Returned::open(update.returning.as_ref(), &table)?;
 
     // Resolve the target of every assignment first, so `SET nope = 1` fails before anything is
     // read rather than after some rows have been rewritten.
@@ -274,9 +348,14 @@ pub(super) fn update(
         check_not_null(&table, &new)?;
         remove_row(executor, txn, &table, &old)?;
         write_row(executor, txn, &table, &new, written)?;
+        // The row **after** the assignments: `UPDATE t SET n = n + 1 RETURNING n` answers with
+        // the new value, which is the whole reason a client writes it.
+        if let Some(returned) = &mut returned {
+            returned.push(&new)?;
+        }
         count += 1;
     }
-    Ok(Outcome::done(format!("UPDATE {count}")))
+    Ok(finish(returned, format!("UPDATE {count}")))
 }
 
 /// `DELETE`: the row and every index entry that points at it.
@@ -286,12 +365,17 @@ pub(super) fn delete(
     delete: &Delete,
 ) -> Result<Outcome> {
     let table = executor.require_table(txn, &delete.table)?;
+    let mut returned = Returned::open(delete.returning.as_ref(), &table)?;
     let rows = collect(executor, txn, delete.filter.as_ref(), &table)?;
     let count = rows.len();
     for row in rows {
+        // The row as it was, gathered before it goes: after `remove_row` there is nothing to read.
+        if let Some(returned) = &mut returned {
+            returned.push(&row)?;
+        }
         remove_row(executor, txn, &table, &row)?;
     }
-    Ok(Outcome::done(format!("DELETE {count}")))
+    Ok(finish(returned, format!("DELETE {count}")))
 }
 
 /// Every row a predicate matches, read before anything is written. See [`update`] for why.

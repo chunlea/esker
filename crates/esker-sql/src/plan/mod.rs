@@ -29,7 +29,7 @@ pub use ddl::{
     AlterTable, AlterTableAction, Column, CreateIndex, CreateTable, DropIndex, DropTable,
     UniqueConstraint, index_name, primary_key_name, unique_constraint_name,
 };
-pub use dml::{Delete, Insert, Update};
+pub use dml::{Delete, Insert, Returning, Update};
 pub use expr::{AggregateCall, AggregateFunc, BinaryOp, Expr, Literal};
 pub use query::{AggregateSpec, Join, Node, OrderItem, Probe, Select, SelectItem, SortKey};
 pub use session::SessionStatement;

@@ -1,0 +1,44 @@
+# What a real PostgreSQL 19beta1 does with `RETURNING` -- unit 2 of `docs/plans/phase-9-rails.md`,
+# and the half of it Rails cannot work without: `Model.create!` reads the id back through this.
+#
+# Nothing here was written from the documentation. Every line was put to the running `esker-pg19`
+# container on 2026-09-01 over the fixture below, in order, and what is recorded is what came back.
+# The statements are **stateful** -- an `INSERT` here is a row the next line can see -- so the test
+# replays them in file order and does not reorder or skip.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow the message
+#
+# ` ; ` separates rows, `|` separates columns, `\N` is SQL NULL, and a lone `-` is no rows at all.
+#
+# THE TWO A READER WOULD HAVE GOT WRONG:
+#
+#   * `RETURNING` sees the row **as the statement leaves it**, not as the user wrote it: an
+#     `INSERT` that names two of four columns still returns the other two at their `DEFAULT`
+#     (`d` below, not NULL), and an `UPDATE` returns the value it just assigned.
+#   * a statement that matched nothing returns **no rows**, and still reports its ordinary tag.
+#     `UPDATE ... WHERE id = 999 RETURNING id` is `UPDATE 0` with an empty result set, not an error
+#     and not one row of NULL.
+#
+# The fixture, replayed by `tests/returning.rs` before the first statement:
+#
+#   CREATE TABLE r (id int8 PRIMARY KEY, n int8, t text DEFAULT 'd', b bool);
+#   INSERT INTO r VALUES (1,10,'a',true),(2,20,'b',false),(3,NULL,NULL,NULL);
+#
+# --- RETURNING: the four shapes of a target list, over the rows a statement wrote
+INSERT INTO r (id, n) VALUES (10, 1) RETURNING id	bigint	10
+INSERT INTO r (id, n) VALUES (11, 2) RETURNING *	bigint,bigint,text,boolean	11|2|d|\N
+INSERT INTO r (id, n) VALUES (12, 3) RETURNING id, t	bigint,text	12|d
+INSERT INTO r (id, n) VALUES (13, 4) RETURNING id AS new_id	bigint	13
+INSERT INTO r (id, n) VALUES (14, 5) RETURNING r.*	bigint,bigint,text,boolean	14|5|d|\N
+INSERT INTO r (id, n) VALUES (15, 6), (16, 7) RETURNING id	bigint	15 ; 16
+INSERT INTO r (id, n) VALUES (17, 8) RETURNING n IS NULL	boolean	f
+INSERT INTO r (id, n) VALUES (18, 9) RETURNING nope	!42703 column "nope" does not exist
+INSERT INTO r (id, n) VALUES (19, 9) RETURNING count(*)	!42803 aggregate functions are not allowed in RETURNING
+UPDATE r SET n = 99 WHERE id = 1 RETURNING id, n	bigint,bigint	1|99
+UPDATE r SET n = 98 WHERE id = 1 RETURNING *	bigint,bigint,text,boolean	1|98|a|t
+UPDATE r SET n = 97 WHERE id = 999 RETURNING id	bigint	-
+UPDATE r SET t = 'z' WHERE id = 2 RETURNING t	text	z
+DELETE FROM r WHERE id = 10 RETURNING id, n	bigint,bigint	10|1
+DELETE FROM r WHERE id = 999 RETURNING id	bigint	-
+DELETE FROM r WHERE id = 11 RETURNING *	bigint,bigint,text,boolean	11|2|d|\N

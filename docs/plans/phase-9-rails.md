@@ -113,7 +113,26 @@ PostgreSQL's own sequences are **not** gap-free either (a rolled-back transactio
 value), which is the licence to cache a block per session. Captured before it is decided.
 
 `INSERT`/`UPDATE`/`DELETE ... RETURNING` is the other half, and it is the half Rails cannot work
-without: `Model.create!` reads the id back through it.
+without: `Model.create!` reads the id back through it. **Landed first**, because it is independent
+of the sequence and it is what every other unit's tests will want to write.
+
+`RETURNING` reuses the `SELECT` target list whole — one `lower_projection`, one `Scope`, one set of
+name-and-type rules — so `RETURNING *` returns what `SELECT *` returns, in the same order, under
+the same names, and there is no second place for the two to drift. Which row it sees is the whole
+of the semantics and all three were measured: an `INSERT` answers with the row **as stored**, so a
+column filled from its `DEFAULT` comes back with that value; an `UPDATE` with the row **after** the
+assignments; a `DELETE` with the row as it was, gathered before it goes because afterwards there is
+nothing to read.
+
+Two things the corpus could not hold, so they are tests of their own. The **command tag** is
+unchanged by a `RETURNING` — `psql` prints a result set where it would have printed the tag, so the
+container could not be asked, and the assertion is against the tags this crate already pins for the
+same statement without one. And a prepared `RETURNING` **describes its columns**: answering "no
+columns" and then sending some is the one thing a `Describe` exists to prevent.
+
+*Owed to unit 3:* `tests/aggregate_parity.rs` and `tests/returning.rs` now hold the same replay
+loop twice. The third corpus is the one that should extract it into a shared harness rather than
+copy it again.
 
 ### Unit 3 — `SAVEPOINT`, `ROLLBACK TO`, `RELEASE`
 
@@ -240,8 +259,8 @@ wrong**, and both were found by writing the statement down rather than by a fail
 | Unit | State | Commit |
 |---|---|---|
 | 0 — ADR, plan, aggregate capture | **done** | `de3c465`, `32fb58f` |
-| 1 — aggregates | **done** | this commit |
-| 2 — sequences and `RETURNING` | not started | |
+| 1 — aggregates | **done** | `1d78a96` |
+| 2 — sequences and `RETURNING` | **`RETURNING` done**, sequences not started | this commit |
 | 3 — savepoints | not started | |
 | 4 — joins | not started | |
 | 5 — `pg_catalog` | not started | |

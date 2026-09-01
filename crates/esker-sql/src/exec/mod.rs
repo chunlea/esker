@@ -801,6 +801,25 @@ fn explain_lines(statement: &Statement) -> Vec<String> {
         Statement::TimeMachine(_) => vec!["Time Machine".to_owned()],
     }
 }
+/// The columns a write statement's `RETURNING` will describe, or `None` when it has none.
+///
+/// `tables` is what `describe` already resolved, so this neither opens a transaction nor reads the
+/// catalog again; a statement whose table is gone has already failed by the time it gets here.
+fn returning_fields(
+    returning: Option<&crate::plan::Returning>,
+    tables: &[Arc<crate::catalog::TableDef>],
+) -> Result<Option<Vec<FieldDescription>>> {
+    let (Some(items), Some(table)) = (returning, tables.first()) else {
+        return Ok(None);
+    };
+    let (columns, _) = query::returning_columns(items, table)?;
+    Ok(Some(
+        columns
+            .into_iter()
+            .map(|(name, ty)| FieldDescription::computed(name, ty))
+            .collect(),
+    ))
+}
 
 impl Execute for Executor {
     fn execute(&mut self, parsed: &Parsed, params: &Params<'_>) -> Result<Outcome> {
@@ -858,6 +877,13 @@ impl Execute for Executor {
                 "QUERY PLAN",
                 ColumnType::Text,
             )]),
+            // A `RETURNING` makes a write statement row-returning, and a client that prepares one
+            // asks for its shape before it binds. Answering `None` here would tell the client
+            // there are no columns and then send it some, which is the one thing a `Describe` is
+            // for.
+            Statement::Insert(insert) => returning_fields(insert.returning.as_ref(), &tables)?,
+            Statement::Update(update) => returning_fields(update.returning.as_ref(), &tables)?,
+            Statement::Delete(delete) => returning_fields(delete.returning.as_ref(), &tables)?,
             _ => None,
         };
         let _ = txn.rollback();

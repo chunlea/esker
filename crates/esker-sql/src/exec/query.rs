@@ -420,6 +420,43 @@ fn order_keys(
     Ok(keys)
 }
 
+/// A resolved target list: one name and type per output column, and the expression that fills it.
+pub(super) type TargetList = (Vec<(String, ColumnType)>, Vec<Expr>);
+
+/// `RETURNING`, resolved against one table: the output columns and the expression per column.
+///
+/// The same [`Scope`], the same `resolve` and the same name-and-type rules a `SELECT`'s target
+/// list gets, which is what makes `RETURNING *` and `SELECT *` return the same columns in the same
+/// order under the same names. An aggregate is refused here rather than resolved: there is no
+/// group in a statement that writes rows, and PostgreSQL says so.
+pub(super) fn returning_columns(items: &[SelectItem], table: &TableDef) -> Result<TargetList> {
+    let scope = Scope::single(table);
+    let select = Select {
+        from: Some(table.name.clone()),
+        join: None,
+        projection: items.to_vec(),
+        filter: None,
+        distinct: false,
+        group_by: Vec::new(),
+        having: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+    };
+    for item in items {
+        if let SelectItem::Expr { expr, .. } = item
+            && aggregate::contains_aggregate(expr)
+        {
+            return Err(SqlError::AggregateNotAllowed(
+                "aggregate functions are not allowed in RETURNING",
+            ));
+        }
+    }
+    let columns = output_columns(&select, &scope, None)?;
+    let exprs = projection_exprs(&select, &scope, None)?;
+    Ok((columns, exprs))
+}
+
 /// Whether every column reference in an expression belongs to `table`.
 fn mentions_only(expr: &Expr, table: &TableDef) -> bool {
     let mut only = true;

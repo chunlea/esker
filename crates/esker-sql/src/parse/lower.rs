@@ -890,7 +890,11 @@ fn lower_insert(insert: &sqlparser::ast::Insert) -> Result<plan::Insert> {
     refuse_if(insert.overwrite, "INSERT OVERWRITE")?;
     refuse_if(insert.replace_into, "REPLACE INTO")?;
     refuse_if(insert.on.is_some(), "INSERT ... ON CONFLICT")?;
-    refuse_if(insert.returning.is_some(), "INSERT ... RETURNING")?;
+    let returning = insert
+        .returning
+        .as_deref()
+        .map(lower_projection)
+        .transpose()?;
     refuse_if(insert.table_alias.is_some(), "INSERT ... AS")?;
     refuse_if(insert.partitioned.is_some(), "INSERT ... PARTITION")?;
     refuse_if(!insert.after_columns.is_empty(), "INSERT ... AFTER")?;
@@ -947,6 +951,7 @@ fn lower_insert(insert: &sqlparser::ast::Insert) -> Result<plan::Insert> {
         table,
         columns,
         rows,
+        returning,
     })
 }
 
@@ -1150,6 +1155,53 @@ fn lower_value(value: &Value, negated: bool) -> Result<plan::Expr> {
     Ok(plan::Expr::Literal(literal))
 }
 
+/// A target list, lowered — the one a `SELECT` projects and the one a `RETURNING` returns.
+///
+/// One function because they are one grammar: `*`, `t.*`, an expression, an expression with an
+/// alias, and the five `SELECT * EXCLUDE`-style modifiers that are each `0A000` naming themselves.
+/// Two copies of this is two places for `RETURNING *` to stop meaning what `SELECT *` means.
+fn lower_projection(items: &[SelectItem]) -> Result<Vec<plan::SelectItem>> {
+    items
+        .iter()
+        .map(|item| match item {
+            SelectItem::UnnamedExpr(expr) => Ok(plan::SelectItem::Expr {
+                expr: lower_expr(expr)?,
+                alias: None,
+            }),
+            SelectItem::ExprWithAlias { expr, alias } => Ok(plan::SelectItem::Expr {
+                expr: lower_expr(expr)?,
+                alias: Some(ident(alias)),
+            }),
+            SelectItem::Wildcard(options) => {
+                refuse_if(options.opt_exclude.is_some(), "SELECT * EXCLUDE")?;
+                refuse_if(options.opt_except.is_some(), "SELECT * EXCEPT")?;
+                refuse_if(options.opt_replace.is_some(), "SELECT * REPLACE")?;
+                refuse_if(options.opt_rename.is_some(), "SELECT * RENAME")?;
+                Ok(plan::SelectItem::Wildcard)
+            }
+            SelectItem::QualifiedWildcard(kind, options) => {
+                refuse_if(options.opt_ilike.is_some(), "SELECT * ILIKE")?;
+                refuse_if(options.opt_exclude.is_some(), "SELECT * EXCLUDE")?;
+                refuse_if(options.opt_except.is_some(), "SELECT * EXCEPT")?;
+                refuse_if(options.opt_replace.is_some(), "SELECT * REPLACE")?;
+                refuse_if(options.opt_rename.is_some(), "SELECT * RENAME")?;
+                match kind {
+                    SelectItemQualifiedWildcardKind::ObjectName(name) => {
+                        Ok(plan::SelectItem::QualifiedWildcard(object_name(name)?))
+                    }
+                    // `STRUCT('x').*` and friends: an expression, not a table.
+                    SelectItemQualifiedWildcardKind::Expr(_) => {
+                        Err(SqlError::unsupported("a SELECT * over an expression"))
+                    }
+                }
+            }
+            SelectItem::ExprWithAliases { .. } => {
+                Err(SqlError::unsupported("a multi-column alias"))
+            }
+        })
+        .collect()
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "most of it is the refusal list, which is the point: one line per clause not honoured"
@@ -1247,46 +1299,7 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
         _ => return Err(SqlError::unsupported("a comma-separated FROM list")),
     };
 
-    let projection = select
-        .projection
-        .iter()
-        .map(|item| match item {
-            SelectItem::UnnamedExpr(expr) => Ok(plan::SelectItem::Expr {
-                expr: lower_expr(expr)?,
-                alias: None,
-            }),
-            SelectItem::ExprWithAlias { expr, alias } => Ok(plan::SelectItem::Expr {
-                expr: lower_expr(expr)?,
-                alias: Some(ident(alias)),
-            }),
-            SelectItem::Wildcard(options) => {
-                refuse_if(options.opt_exclude.is_some(), "SELECT * EXCLUDE")?;
-                refuse_if(options.opt_except.is_some(), "SELECT * EXCEPT")?;
-                refuse_if(options.opt_replace.is_some(), "SELECT * REPLACE")?;
-                refuse_if(options.opt_rename.is_some(), "SELECT * RENAME")?;
-                Ok(plan::SelectItem::Wildcard)
-            }
-            SelectItem::QualifiedWildcard(kind, options) => {
-                refuse_if(options.opt_ilike.is_some(), "SELECT * ILIKE")?;
-                refuse_if(options.opt_exclude.is_some(), "SELECT * EXCLUDE")?;
-                refuse_if(options.opt_except.is_some(), "SELECT * EXCEPT")?;
-                refuse_if(options.opt_replace.is_some(), "SELECT * REPLACE")?;
-                refuse_if(options.opt_rename.is_some(), "SELECT * RENAME")?;
-                match kind {
-                    SelectItemQualifiedWildcardKind::ObjectName(name) => {
-                        Ok(plan::SelectItem::QualifiedWildcard(object_name(name)?))
-                    }
-                    // `STRUCT('x').*` and friends: an expression, not a table.
-                    SelectItemQualifiedWildcardKind::Expr(_) => {
-                        Err(SqlError::unsupported("a SELECT * over an expression"))
-                    }
-                }
-            }
-            SelectItem::ExprWithAliases { .. } => {
-                Err(SqlError::unsupported("a multi-column alias"))
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let projection = lower_projection(&select.projection)?;
 
     let filter = select.selection.as_ref().map(lower_expr).transpose()?;
 
@@ -1412,7 +1425,11 @@ fn table_factor(factor: &TableFactor) -> Result<String> {
 
 fn lower_update(update: &sqlparser::ast::Update) -> Result<plan::Update> {
     refuse_if(update.from.is_some(), "UPDATE ... FROM")?;
-    refuse_if(update.returning.is_some(), "UPDATE ... RETURNING")?;
+    let returning = update
+        .returning
+        .as_deref()
+        .map(lower_projection)
+        .transpose()?;
     refuse_if(update.output.is_some(), "UPDATE ... OUTPUT")?;
     refuse_if(update.or.is_some(), "UPDATE OR")?;
     refuse_if(!update.order_by.is_empty(), "UPDATE ... ORDER BY")?;
@@ -1440,13 +1457,18 @@ fn lower_update(update: &sqlparser::ast::Update) -> Result<plan::Update> {
         table: table_factor(&update.table.relation)?,
         assignments,
         filter: update.selection.as_ref().map(lower_expr).transpose()?,
+        returning,
     })
 }
 
 fn lower_delete(delete: &sqlparser::ast::Delete) -> Result<plan::Delete> {
     refuse_if(!delete.tables.is_empty(), "a multi-table DELETE")?;
     refuse_if(delete.using.is_some(), "DELETE ... USING")?;
-    refuse_if(delete.returning.is_some(), "DELETE ... RETURNING")?;
+    let returning = delete
+        .returning
+        .as_deref()
+        .map(lower_projection)
+        .transpose()?;
     refuse_if(!delete.order_by.is_empty(), "DELETE ... ORDER BY")?;
     refuse_if(delete.limit.is_some(), "DELETE ... LIMIT")?;
     refuse_if(delete.output.is_some(), "DELETE ... OUTPUT")?;
@@ -1461,6 +1483,7 @@ fn lower_delete(delete: &sqlparser::ast::Delete) -> Result<plan::Delete> {
     Ok(plan::Delete {
         table: table_factor(&table.relation)?,
         filter: delete.selection.as_ref().map(lower_expr).transpose()?,
+        returning,
     })
 }
 
