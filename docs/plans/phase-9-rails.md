@@ -12,6 +12,32 @@ what we execute matches PostgreSQL 19 exactly. The divergence table this phase a
 Lane: `crates/esker-sql/src/**` and `crates/esker-sql/tests/**` except `tests/joint_gate.rs` and
 `tests/pd_wiring.rs`, which belong to another lane and are not touched here.
 
+## 0. The repository boundary, which is a rule and not a preference
+
+**This repository is 100% Rust plus documentation. No Ruby and no Rails code enters it — not a
+`Gemfile`, not a `config.yml`, not a runner script.** `CLAUDE.md`'s dependency policy is a statement
+about what this project *is*, and a Ruby harness checked in beside the Rust would make "pure Rust,
+as few crates as possible" a claim with an asterisk on it.
+
+The harness therefore lives outside the tree, at
+`/Users/chunlea/workspace/lab/esker-rails-harness/`: the `rails/rails` checkout, the `config.yml`
+that points ActiveRecord at this node, the runner, and the exclusion-list runner. It is never
+committed here.
+
+What crosses the boundary back into the repository is exactly three kinds of thing, and each of
+them is a plain artefact a Rust test or a reader can use:
+
+1. **The SQL ActiveRecord issues, captured as a plain-text fixture** under
+   `crates/esker-sql/tests/corpus/`, in the same convention `docs/plans/phase-6d.md` established —
+   statement, then what a real PostgreSQL 19 answered. A Rust test replays it. This is how AR's
+   boot queries become a specification without a line of Ruby.
+2. **The scoreboard results**, as a markdown table in `docs/bench/rails-scoreboard.md`, together
+   with the exact commands that reproduce the run against the out-of-tree harness.
+3. **Rust features**, which is everything in `crates/esker-sql/`.
+
+A number nobody can reproduce is not a measurement, so the reproduce-it commands are part of the
+scoreboard rather than a `README` in someone's home directory.
+
 ## 1. What "Rails can talk to it" is measured by
 
 Not by a claim. By `activerecord/test` with `ARCONN=postgresql` pointed at this node, producing a
@@ -118,10 +144,12 @@ specification. Anything outside that set is out of scope for this unit.
 
 ### Unit 6 — the scoreboard
 
-A harness that points `activerecord/test`'s `config.yml` at this node, runs the suite, and writes
-`docs/bench/rails-scoreboard.md`: the Rails commit, the raw pass rate, the pass rate with conflict
-retry, and one line per excluded test with its reason. The first run's number is the baseline
-whatever it is.
+The harness — `config.yml` pointed at this node, the runner, the exclusion-list runner — is built
+**in `/Users/chunlea/workspace/lab/esker-rails-harness/`** and stays there (§0). What lands in this
+repository is `docs/bench/rails-scoreboard.md`: the Rails commit and the Esker commit, the raw pass
+rate, the pass rate with conflict retry, one line per excluded test with its reason and the unit
+that closes it, and the exact commands that reproduce the run. The first run's number is the
+baseline whatever it is.
 
 ## 3. The test ladder
 
@@ -134,7 +162,9 @@ about it in Rust:
 3. **A scaffolded CRUD app** — create, read, update, destroy, through the real adapter.
 4. **The full ActiveRecord suite**, with the exclusion list.
 
-Rungs 1–3 are scripts under `tools/rails/`, runnable by hand and by the harness. Rung 4 is unit 6.
+Rungs 1–3 are Ruby, so all four live in the out-of-tree harness (§0). What each rung contributes to
+*this* repository is the SQL it made this node answer, captured as a corpus fixture — a rung is not
+finished when it runs, it is finished when its statements are a Rust test.
 
 Inside the crate the existing shapes carry the weight, and each unit adds to all four:
 `tests/slt/*.slt` for the surface, `tests/lowering.rs` for the C2 refusals, a `*_parity.rs`

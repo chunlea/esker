@@ -132,6 +132,11 @@ query to either replica — treats it as a decision rather than discovers it as 
 
 - Compatibility becomes falsifiable. Anyone can run the harness and get the same number, and a
   regression shows up as a number going down rather than as an application failing in production.
+- **The harness is Ruby, so it lives outside this repository** and the scoreboard carries the
+  commands that reproduce it (`docs/plans/phase-9-rails.md` §0). This project is 100% Rust plus
+  documentation; a `Gemfile` checked in beside it would put an asterisk on that sentence. What
+  crosses back in is the SQL ActiveRecord issues — captured as a plain-text corpus a Rust test
+  replays, the convention `docs/plans/phase-6d.md` established — and the results.
 - The exclusion list becomes the roadmap. The units after aggregates — sequences and `RETURNING`,
   savepoints, joins, `pg_catalog` — are ordered by what the suite cannot get past, not by what
   looked next.
