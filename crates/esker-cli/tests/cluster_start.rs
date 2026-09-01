@@ -27,6 +27,18 @@ use tempfile::TempDir;
 /// columnar learner goes on the healthiest store *without* a peer, so three voters need a fourth.
 const NODES: u64 = 4;
 
+/// Held for the length of each test in this file, so the two never overlap.
+///
+/// **They cannot share a port space and one of them squats a port on purpose.** `free_port_run`
+/// binds a run, releases it and returns the base, which is the usual trick and is a race between
+/// the release and the cluster's own bind — harmless against other test binaries, which scan other
+/// bands, and not harmless against the test next door. Run in parallel under a loaded box they
+/// picked the same base, [`a_driver_that_cannot_listen_is_a_failure_and_not_a_cluster`]'s squatter
+/// took the *other* test's driver port, and the four-node start failed with a placement driver
+/// that could never listen: `stores (0)`, `(not bootstrapped)`. Which is, to be fair, the failure
+/// this file is about — arriving from the wrong direction.
+static PORTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A run of `NODES + 1` free ports: the stores' own, and the driver's one above them.
 fn free_port_run() -> u16 {
     let span = usize::try_from(NODES).unwrap() + 1;
@@ -79,6 +91,9 @@ fn inspect(pd_dir: &Path) -> String {
 /// timing from the question entirely, and the unit tests on `wait_until_listening`.
 #[test]
 fn a_four_node_cluster_with_a_driver_registers_four_stores() {
+    let _ports = PORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let data_dir = TempDir::new().unwrap();
     let base_port = free_port_run();
 
@@ -129,6 +144,9 @@ fn a_four_node_cluster_with_a_driver_registers_four_stores() {
 /// written from, only with the driver arriving a moment late rather than never.
 #[test]
 fn a_driver_that_cannot_listen_is_a_failure_and_not_a_cluster() {
+    let _ports = PORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let data_dir = TempDir::new().unwrap();
     let base_port = free_port_run();
     let pd_port = base_port + u16::try_from(NODES).unwrap();
