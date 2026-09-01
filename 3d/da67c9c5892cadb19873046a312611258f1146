@@ -1,0 +1,21 @@
+docs/bench/README.md
+  s_da0bde754320e7::t_045f0382472b41 38-46
+docs/bench/rails-scoreboard.md
+  s_da0bde754320e7::t_ffbf1f28c42461 1-191
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "3dda67c9c5892cadb19873046a312611258f1146",
+  "prompts": {},
+  "sessions": {
+    "s_da0bde754320e7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7c97e357-5610-4f5f-b753-96f19451b2aa",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
