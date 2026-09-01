@@ -1,0 +1,20 @@
+crates/esker-cli/src/cluster.rs
+  s_dc640bf0df4adb::t_3946e3898a408b 118,121,236,273-277,279-280,296-302
+  s_dc640bf0df4adb::t_b840d070ce51b3 3-7,53-59,86,94,110-117,119-120,122-164,172,199-209,234-235,262
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "40d035ee7c1ab3ff1d9b5dc23aca880cd658437f",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "claude-fable-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
