@@ -1,0 +1,31 @@
+crates/esker-sql/tests/joint_gate.rs
+  s_dc640bf0df4adb::t_de65ad86050ff2 177-189,331,350,352-360,373,381,384-387,389-397,597-611,635-648,675,677,679,685,689-696
+crates/esker-store/src/columnar/decode.rs
+  s_dc640bf0df4adb::t_00e73a86081ea1 61-64,108-111,141-144
+crates/esker-store/src/columnar/mod.rs
+  s_dc640bf0df4adb::t_aa3f8f69d1a308 95-104,240-256,492-496,579-581
+crates/esker-store/src/columnar/region.rs
+  s_dc640bf0df4adb::t_8226e64ec5f0b7 88-90,92-93,216
+crates/esker-store/src/server.rs
+  s_dc640bf0df4adb::t_21e0a970c1fd1f 2625-2640
+crates/esker-store/tests/bench_columnar.rs
+  s_dc640bf0df4adb::t_396b0eae063e93 81-85
+crates/esker-store/tests/columnar_differential.rs
+  s_dc640bf0df4adb::t_a75d47a6d62bf3 74-78,434-442,534-539,542-546,554-555
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "bfab24f03b241d5a1fba900b007121edfd691378",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
