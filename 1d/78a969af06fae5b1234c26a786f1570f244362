@@ -1,0 +1,55 @@
+crates/esker-sql/src/error.rs
+  s_0100922e76a475::t_a5d59550d99b37 356-425,636-638,668-669,685-692,762-767,812-814
+crates/esker-sql/src/exec/aggregate.rs
+  s_0100922e76a475::t_c472e83b29f985 1-579
+crates/esker-sql/src/exec/cursor.rs
+  s_0100922e76a475::t_3d40a59b316857 18,22,24,79-93,189-197,379-422,449-516,639-646
+crates/esker-sql/src/exec/mod.rs
+  s_0100922e76a475::t_a4ed846a1f0434 27
+crates/esker-sql/src/exec/query.rs
+  s_0100922e76a475::t_a5ee0ed4ca2bf3 27,76-91,197-199,270,279-295,300-306,309,318-329,352-422,754,795,894-902,912-918,934-938,961-971,974,985-989,1001-1018,1027,1042-1049
+crates/esker-sql/src/parse/lower.rs
+  s_0100922e76a475::t_bd28296f86883d 20,58,1025,1030-1116,1175-1183,1188-1219,1223,1342-1344
+crates/esker-sql/src/plan/expr.rs
+  s_0100922e76a475::t_cd4d15ac55ae3f 84-168,366
+crates/esker-sql/src/plan/mod.rs
+  s_0100922e76a475::t_7b475f21791ae0 33-34,62-66
+crates/esker-sql/src/plan/query.rs
+  s_0100922e76a475::t_1e5b787158d2b4 22,25,52-62,228-275,303-349,352-378,394,409,437,456-478,480-488,490-504,506-511,544-550,554-566
+crates/esker-sql/src/sqlstate.rs
+  s_0100922e76a475::t_781a50fb5bcf3a 153-159,272-273
+crates/esker-sql/tests/aggregate_parity.rs
+  s_0100922e76a475::t_ba6baeeafcf79d 1-381
+crates/esker-sql/tests/corpus/pg19_aggregate.txt
+  s_0100922e76a475::t_6babe4f7523d83 19,30-34,187-226
+crates/esker-sql/tests/lowering.rs
+  s_0100922e76a475::t_853d2a3234bdcb 93-110
+crates/esker-sql/tests/select.rs
+  s_0100922e76a475::t_cd2c1a99c1306d 407-413
+crates/esker-sql/tests/slt/aggregate.slt
+  s_0100922e76a475::t_11755c1c82136a 1-250
+crates/esker-sql/tests/slt/unsupported.slt
+  s_0100922e76a475::t_4e995f886b4b9f 16-17,19,22,25,31-37
+crates/esker-sql/tests/slt_harness/mod.rs
+  s_0100922e76a475::t_0b760d0b035118 95
+docs/adr/0031-rails-compatibility-is-measured.md
+  s_0100922e76a475::t_6add4c33dceb30 52-54,80
+docs/plans/phase-9-rails.md
+  s_0100922e76a475::t_ec8b086f5a5d40 3,8-10,71-72,74-77,206-238,242-243
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "1d78a969af06fae5b1234c26a786f1570f244362",
+  "prompts": {},
+  "sessions": {
+    "s_0100922e76a475": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9838aaeb-6dbb-4538-8e1f-1c9ba03c938b",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
