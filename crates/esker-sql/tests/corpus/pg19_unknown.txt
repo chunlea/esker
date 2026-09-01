@@ -1,0 +1,197 @@
+# What a real PostgreSQL 19beta1 does with an **untyped literal** -- the quoted string it calls
+# `unknown` -- in a comparison. This is the specification for the wrong answer
+# `docs/plans/phase-9-rails.md` §6 recorded and `tests/in_list.rs` inherited: `SELECT 1 = '1'`
+# answered `f` here where a real server says `t`.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way against one node.
+# It builds its own table.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THE RULE, which is three cases and not one:
+#
+#   1. **One side unknown, the other typed** -- the unknown is *read as that type*, by that type's
+#      own input function. `1 = '1'` is `t`; `1 = '01'`, `1 = ' 1'` and `1 = '+1'` are all `t`,
+#      because that is what `int4in` accepts. A string that will not read is the input function's
+#      own error, not a comparison that answers false: `1 = 'x'` is `22P02`, `1 = '1.5'` is
+#      `22P02`, and a timestamp raises `22007` rather than `22P02`.
+#   2. **Both sides unknown** -- both become `text`, and this is the case that tells the rules
+#      apart. `'1' = '01'` is **`f`** where `1 = '01'` is `t`: with nothing to type them against
+#      there is no integer anywhere in the expression, and `'1'` and `'01'` are two different
+#      strings.
+#   3. **An explicit type is not unknown any more.** `1 = '1'::text` is `42883 operator does not
+#      exist: integer = text` -- the cast makes the right side `text` before resolution runs, and
+#      there is no `integer = text` to call. The same statement without the cast is `t`.
+#
+# AND THE TRAP, which is `IN`:
+#
+#   an `IN` list is typed as a **whole**, not pairwise against the operand. `'01' IN ('1', 1)` is
+#   **`t`** -- the `1` gives every unknown in the expression the type `integer`, including the
+#   operand, so it is `1 IN (1, 1)`. `'01' IN ('1')` with the `1` removed is `f`, because then
+#   nothing is typed and it is two strings. An implementation that reconciled each item against
+#   the operand left to right would answer `f` for the first, and it would be a wrong answer
+#   rather than a refusal. The coercion also happens at **plan time**: `1 IN (NULL, 'x')` is
+#   `22P02` and not NULL, though the NULL alone could have decided it.
+#
+# TWO THINGS THIS NODE CANNOT REPRODUCE, both measured here and declared in
+# `tests/unknown_literal.rs`:
+#
+#   * `pg_typeof(1)` is **`integer`**, not `bigint` -- a bare integer constant is `int4`, so
+#     `1 = '2147483648'` is `22003 value "2147483648" is out of range for type integer`. This
+#     node's bare constant is `int8` and answers `f`. It closes when `int4` exists.
+#   * `pg_typeof(1.5)` is **`numeric`**. This node has no `numeric` and a decimal literal is a
+#     `double precision` everywhere, `SELECT 1.5` included -- so `0.1 = '0.1000000000000000000001'`
+#     is `f` on a real server and `t` here. ADR 0031's numeric backlog.
+CREATE TABLE unk (id int8 PRIMARY KEY, n text, d float8, b bool)		-
+INSERT INTO unk VALUES (1, 'one', 1.5, true)		-
+
+# --- case 1: one side unknown, the other a typed constant
+SELECT 1 = '1'	boolean	t
+SELECT '1' = 1	boolean	t
+SELECT 1 = '01'	boolean	t
+SELECT 1 = ' 1'	boolean	t
+SELECT 1 = '1 '	boolean	t
+SELECT 1 = '+1'	boolean	t
+SELECT '  1  ' = 1	boolean	t
+SELECT 1 = '2'	boolean	f
+SELECT 1 <> '2'	boolean	t
+SELECT 1 < '2'	boolean	t
+SELECT 2 > '1'	boolean	t
+SELECT 1 <= '1'	boolean	t
+SELECT 1 >= '1'	boolean	t
+SELECT '1' < 2	boolean	t
+SELECT '2' > 1	boolean	t
+
+# --- and what a literal that will not read as the other side's type answers: the input
+# --- function's own error, never a `false`
+SELECT 1 = 'x'	!22P02 invalid input syntax for type integer: "x"
+SELECT 1 = ''	!22P02 invalid input syntax for type integer: ""
+SELECT 'x' = 1	!22P02 invalid input syntax for type integer: "x"
+SELECT 1 = '1.5'	!22P02 invalid input syntax for type integer: "1.5"
+SELECT 1 = ' '	!22P02 invalid input syntax for type integer: " "
+SELECT 1 = '1e0'	!22P02 invalid input syntax for type integer: "1e0"
+
+# --- booleans take the same road, and `boolin` is wider than `t`/`f`
+SELECT true = 't'	boolean	t
+SELECT true = 'true'	boolean	t
+SELECT true = 'TRUE'	boolean	t
+SELECT true = 'yes'	boolean	t
+SELECT true = 'Y'	boolean	t
+SELECT true = 'on'	boolean	t
+SELECT true = '1'	boolean	t
+SELECT true = '0'	boolean	f
+SELECT true = ' t '	boolean	t
+SELECT false = 'f'	boolean	t
+SELECT 'f' = false	boolean	t
+SELECT true = 'maybe'	!22P02 invalid input syntax for type boolean: "maybe"
+SELECT true = ''	!22P02 invalid input syntax for type boolean: ""
+
+# --- a decimal constant types the unknown too. On a real server that type is `numeric`; here it
+# --- is `double precision`, and the two agree on every input either can print
+SELECT 1.5 = '1.5'	boolean	t
+SELECT '1.5' = 1.5	boolean	t
+SELECT 1.5 = '1.50'	boolean	t
+SELECT 1.5 = '1.5000'	boolean	t
+SELECT 1.5 = '1.5e0'	boolean	t
+SELECT 1.5 = ' 1.5 '	boolean	t
+SELECT 1.0 = '1'	boolean	t
+SELECT 1.5 = 'x'	!22P02 invalid input syntax for type numeric: "x"
+
+# --- case 2: BOTH sides unknown, so both are `text`. The case that tells the rules apart
+SELECT '1' = '1'	boolean	t
+SELECT '1' = '01'	boolean	f
+SELECT '1' = ' 1'	boolean	f
+SELECT 'a' < 'b'	boolean	t
+SELECT 'B' < 'a'	boolean	f
+SELECT '10' < '9'	boolean	t
+SELECT 'b' > 'a'	boolean	t
+SELECT '' = ''	boolean	t
+
+# --- NULL is NULL whatever gave the other side its type
+SELECT 1 = NULL	boolean	\N
+SELECT NULL = '1'	boolean	\N
+SELECT NULL = NULL	boolean	\N
+SELECT 1 = '1' AND NULL	boolean	\N
+
+# --- it composes, and it is an expression and not only a predicate
+SELECT 1 = '1' OR 1 = '2'	boolean	t
+SELECT 1.5 = '1.5' AND 2.5 = '2.5'	boolean	t
+SELECT NOT (1 = '1')	boolean	f
+SELECT (1 = '1') = true	boolean	t
+SELECT 1 = '1', '1' = 1, '1' = '01'	boolean,boolean,boolean	t|t|f
+
+# --- case 3: an explicit type is not unknown, and there is no `integer = text` to call
+SELECT 1 = '1'::text	!42883 operator does not exist: integer = text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT '1'::text = 1	!42883 operator does not exist: text = integer DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 1::int8 = '1'	boolean	t
+SELECT '1'::text = '01'	boolean	f
+
+# --- the four other types this node has, each read by its own input function
+SELECT '2020-01-01 00:00:00+00'::timestamptz = '2020-01-01 00:00:00+00'	boolean	t
+SELECT '2020-01-01 00:00:00+00'::timestamptz = '2020-01-01 01:00:00+01'	boolean	t
+SELECT '2020-01-01 00:00:00+00'::timestamptz = 'not a date'	!22007 invalid input syntax for type timestamp with time zone: "not a date"
+SELECT '\x0102'::bytea = '\x0102'	boolean	t
+SELECT '\x0102'::bytea = 'zz'	boolean	f
+SELECT 1.5::float8 = '1.5'	boolean	t
+SELECT 1.5::float8 = 'NaN'	boolean	f
+SELECT 1.5::float8 = 'x'	!22P02 invalid input syntax for type double precision: "x"
+SELECT 'a'::text = 'a'	boolean	t
+
+# --- the int4 a bare constant actually is, and the numeric a decimal one is
+SELECT 1 = '2147483648'	!22003 value "2147483648" is out of range for type integer
+SELECT 1 = '9223372036854775808'	!22003 value "9223372036854775808" is out of range for type integer
+SELECT 3000000000 = '3000000000'	boolean	t
+SELECT 9007199254740993 = '9007199254740993'	boolean	t
+SELECT 1::bigint = '9223372036854775807'	boolean	f
+SELECT 0.1 = '0.1000000000000000000001'	boolean	f
+SELECT 9007199254740993 = 9007199254740992.0	boolean	f
+SELECT 1 = 1.0	boolean	t
+SELECT 1 = 1.5	boolean	f
+
+# --- the trap: an `IN` list is typed as a WHOLE, and the operand is typed by it
+SELECT 1 IN ('1')	boolean	t
+SELECT 1 IN ('1', '2')	boolean	t
+SELECT 1 IN (1, '1')	boolean	t
+SELECT '1' IN (1)	boolean	t
+SELECT '1' IN ('1')	boolean	t
+SELECT '1' IN ('01')	boolean	f
+SELECT '01' IN ('1')	boolean	f
+SELECT '01' IN ('1', 1)	boolean	t
+SELECT '1' IN (1, '01')	boolean	t
+SELECT ' 1' IN (1)	boolean	t
+SELECT ' 1' IN ('1')	boolean	f
+SELECT 1 NOT IN ('1')	boolean	f
+SELECT '01' NOT IN ('1', 1)	boolean	f
+SELECT 1 IN ('x')	!22P02 invalid input syntax for type integer: "x"
+SELECT 'a' IN ('a', 1)	!22P02 invalid input syntax for type integer: "a"
+SELECT 1 IN ('1', 2.0)	boolean	t
+SELECT '2147483648' IN (3000000000)	boolean	f
+
+# --- and a NULL in the list does not stop the coercion, which runs at plan time
+SELECT 1 IN ('1', NULL)	boolean	t
+SELECT 1 IN (NULL, '1')	boolean	t
+SELECT 1 IN ('2', NULL)	boolean	\N
+SELECT '1' IN (NULL)	boolean	\N
+SELECT 1 IN (NULL, 'x')	!22P02 invalid input syntax for type integer: "x"
+
+# --- the same question of a column, which is the half that already worked
+SELECT id FROM unk WHERE id = '1'	bigint	1
+SELECT id FROM unk WHERE '1' = id	bigint	1
+SELECT id FROM unk WHERE id = '01'	bigint	1
+SELECT id FROM unk WHERE n = 'one'	bigint	1
+SELECT id FROM unk WHERE id IN ('1')	bigint	1
+SELECT id FROM unk WHERE b = 't'	bigint	1
+SELECT id FROM unk WHERE d = '1.5'	bigint	1
+SELECT id FROM unk WHERE id > '0'	bigint	1
+SELECT id FROM unk WHERE n < 'p'	bigint	1
+SELECT id FROM unk WHERE id = '1' AND n = 'one'	bigint	1
+SELECT id, id = '1' FROM unk	bigint,boolean	1|t
+SELECT id FROM unk WHERE n = 1	!42883 operator does not exist: text = integer DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT id FROM unk WHERE id = 'x'	!22P02 invalid input syntax for type bigint: "x"
+SELECT id FROM unk WHERE id IN ('1', 'x')	!22P02 invalid input syntax for type bigint: "x"
+SELECT id FROM unk WHERE n IN ('one', 1)	!42883 operator does not exist: text = integer DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT id FROM unk WHERE id = 1.5	bigint	-
+SELECT id FROM unk WHERE id = 1.0	bigint	1
+SELECT id FROM unk WHERE d = 1	bigint	-

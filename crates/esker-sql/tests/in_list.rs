@@ -29,7 +29,13 @@ const FIXTURE: &[&str] = &[
 ];
 
 /// What this node answers differently, and why. **Not one of them is about `IN`** — the corpus
-/// surfaced five gaps that were already there, which is what a capture is for.
+/// surfaced gaps that were already there, which is what a capture is for.
+///
+/// It is one shorter than the `IN` unit left it. `SELECT 1 IN ('1')` was the worst entry on the
+/// list — a *wrong answer* rather than a refusal, inherited from `=` through the `reconcile` the
+/// two share — and it is now fixed: `tests/unknown_literal.rs` and `tests/corpus/pg19_unknown.txt`.
+/// The two that remain from that family are no longer about typing an untyped literal at all, and
+/// each says below what it is instead.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
     answers: &[
@@ -40,22 +46,19 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              `tests/in_list.rs` pins those.",
         ),
         (
-            "SELECT 1 IN ('1')",
-            "**a wrong answer, and older than `IN`**: two literals with no column to type them \
-             against are compared untyped, so `SELECT 1 = '1'` is `f` here where a real server \
-             says `t`. `IN` inherits it exactly — the list is typed by `reconcile`, the same \
-             function `=` uses — so this is one bug and not two. Recorded in \
-             `docs/plans/phase-9-rails.md` §6.",
-        ),
-        (
             "SELECT 1 IN (1.0)",
-            "the same untyped-literal comparison, with a numeric literal on the right.",
+            "**not the untyped-literal bug any more** — that one is fixed and its entry is gone, \
+             which is why this list is shorter than the six the `IN` unit declared. Neither side \
+             here is `unknown`: it is an `integer` against a `numeric`, which a real server \
+             promotes and this node does not. `tests/unknown_literal.rs` declares it with the \
+             counterexample that says why promoting to `double` is not the fix.",
         ),
         (
             "SELECT 'a' IN (1)",
-            "the same, in the direction where PostgreSQL raises `22P02` rather than answering: \
-             it casts `'a'` to integer and fails. Against a *column* this node answers the same \
-             `22P02`, which the lines above it in the corpus show.",
+            "the `int4` divergence, not the untyped-literal one: the rule is working and `'a'` \
+             *is* being read as an integer because of the `1`, so both servers raise `22P02`. \
+             A bare constant is `integer` on a real server and `int8` here, so the message names \
+             `bigint`. `tests/unknown_literal.rs` has the eleven statements this costs.",
         ),
         (
             "SELECT id FROM inl WHERE k IN (id + 6) ORDER BY id",

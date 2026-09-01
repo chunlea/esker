@@ -25,7 +25,7 @@
 use crate::catalog::{ColumnDef, TableDef};
 use crate::error::{Result, SqlError};
 use crate::exec::aggregate;
-use crate::plan::{BinaryOp, Expr, Node, Select, SelectItem, SortKey};
+use crate::plan::{BinaryOp, Expr, Literal, Node, Select, SelectItem, SortKey};
 use crate::row::{self, RowSchema};
 use crate::value::PgType;
 use crate::value::{ColumnType, Datum};
@@ -453,7 +453,7 @@ fn order_keys(
         // A position is resolved against the **output list**, which is already expanded and
         // already in whichever row space the sort will run over -- so `SELECT * FROM t ORDER BY 1`
         // works, where resolving it against the unexpanded target list could not have.
-        let resolved = if let Expr::Literal(crate::plan::Literal::Integer(position)) = &item.expr {
+        let resolved = if let Expr::Literal(Literal::Integer(position)) = &item.expr {
             let at = usize::try_from(*position)
                 .ok()
                 .filter(|at| (1..=outputs.len()).contains(at))
@@ -1069,15 +1069,31 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             list,
             negated,
         } => {
-            // `x IN (a, b)` is a set of `=`, so every item is typed against the operand by exactly
-            // the rule `x = a` uses — and the operand can be typed *by* an item in return, which
-            // is what makes `SELECT 1 IN ('1')` true rather than false. Without this the list
-            // would be compared untyped and a `text` item against an `int8` column would simply
-            // not match: a wrong answer where a real server raises `42883`.
+            // `x IN (a, b)` is a set of `=`, so every item is typed the way `x = a` types it — but
+            // the list is typed as a **whole** and not pairwise, which is a rule of its own.
+            // PostgreSQL's `select_common_type` runs over the operand and every item at once, so
+            // one typed item gives *every* `unknown` in the expression its type, the operand
+            // included: `'01' IN ('1', 1)` is true, because the `1` makes it `1 IN (1, 1)`. A
+            // left-to-right pairwise reconcile answers `f` for that, which is a wrong answer and
+            // not a refusal. Measured, `tests/corpus/pg19_unknown.txt`.
             let mut operand = resolve(operand, scope)?;
-            let mut resolved = Vec::with_capacity(list.len());
+            let mut items = Vec::with_capacity(list.len());
             for item in list {
-                let item = resolve(item, scope)?;
+                items.push(resolve(item, scope)?);
+            }
+            // The coercion happens here, at plan time, and not when a row is scanned: PostgreSQL
+            // answers `1 IN (NULL, 'x')` with `22P02` even though the NULL alone could have
+            // decided it.
+            if let Some(ty) = common_type(&operand, &items) {
+                give_type(&mut operand, ty)?;
+                for item in &mut items {
+                    give_type(item, ty)?;
+                }
+            }
+            // Then the ordinary pairwise rule, which is what still raises `42883` when two items
+            // have types no `=` covers — `n IN ('one', 1)` over a `text` column.
+            let mut resolved = Vec::with_capacity(items.len());
+            for item in items {
                 let (left, right) = reconcile(BinaryOp::Eq, operand, item)?;
                 operand = left;
                 resolved.push(right);
@@ -1096,8 +1112,21 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
     })
 }
 
-/// Gives a literal the type of the column it is being compared against, or says the comparison is
+/// Gives a literal the type of whatever it is being compared against, or says the comparison is
 /// between types no operator covers.
+///
+/// "Whatever" is the part that was a bug: a quoted string is PostgreSQL's `unknown` and takes its
+/// type from the *other operand*, which is a **column or a literal** and not only a column.
+/// `SELECT 1 = '1'` is `t` on a real server and was `f` here, because with no column in the
+/// expression nothing typed the `'1'` and an `int8` was compared against a `text`. Three cases,
+/// measured in `tests/corpus/pg19_unknown.txt`:
+///
+/// 1. one side `unknown`, the other typed — the `unknown` is read by that type's input function,
+///    and a string that will not read is that function's own error (`22P02`) rather than a `false`;
+/// 2. **both** sides `unknown` — both are `text`, which is why `'1' = '01'` is `f` where
+///    `1 = '01'` is `t`. Nothing is changed here and the evaluator's `Literal::String` is already
+///    a `Datum::Text`;
+/// 3. neither side `unknown` — nothing to resolve, and a pair no operator covers is `42883`.
 fn reconcile(op: BinaryOp, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
     Ok(match (&left, &right) {
         (Expr::Ordinal { ty, .. }, Expr::Literal(literal)) => (
@@ -1108,8 +1137,78 @@ fn reconcile(op: BinaryOp, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
             Expr::Literal(retype(*ty, literal, op, true)?),
             right.clone(),
         ),
+        // An `unknown` beside a literal that has a type. `Literal::String` is the only `unknown`
+        // there is: a NULL has no type either, and needs none — a comparison with one is NULL
+        // whatever type the other side turns out to be.
+        (Expr::Literal(Literal::String(_)), Expr::Literal(other)) => match literal_type(other) {
+            Some(ty) => (
+                Expr::Literal(retype(ty, unknown_of(&left), op, true)?),
+                right.clone(),
+            ),
+            None => (left, right),
+        },
+        (Expr::Literal(other), Expr::Literal(Literal::String(_))) => match literal_type(other) {
+            Some(ty) => (
+                left.clone(),
+                Expr::Literal(retype(ty, unknown_of(&right), op, false)?),
+            ),
+            None => (left, right),
+        },
         _ => (left, right),
     })
+}
+
+/// The type a literal already carries, or `None` for the two that carry none.
+///
+/// `unknown` (a quoted string) is the one that takes a type from its neighbour; NULL has no type
+/// and needs none. The other four are what PostgreSQL calls them, with the two divergences this
+/// node declares: a bare integer constant is `int4` on a real server and `int8` here, and a
+/// decimal constant is `numeric` there and `double precision` here — the same choice
+/// `Literal::Decimal` already makes everywhere else in this crate, `SELECT 1.5` included.
+fn literal_type(literal: &Literal) -> Option<ColumnType> {
+    match literal {
+        Literal::Null | Literal::String(_) => None,
+        Literal::Integer(_) => Some(ColumnType::Int8),
+        Literal::Decimal(_) => Some(ColumnType::Double),
+        Literal::Bool(_) => Some(ColumnType::Bool),
+        Literal::Typed(value) => value.column_type(),
+    }
+}
+
+/// The literal inside an `Expr::Literal`, for the two `reconcile` arms that have already matched
+/// on it. A non-literal here is a pattern that cannot be reached.
+fn unknown_of(expr: &Expr) -> &Literal {
+    match expr {
+        Expr::Literal(literal) => literal,
+        // Unreachable: every caller has matched `Expr::Literal` in the same pattern.
+        _ => &Literal::Null,
+    }
+}
+
+/// The type an `IN` list resolves to as a whole — PostgreSQL's `select_common_type`, narrowed to
+/// what this node's expressions can be.
+///
+/// The **first** operand with a type wins, operand or item, and every `unknown` in the expression
+/// takes it. Where two typed operands disagree nothing is decided here: the pairwise `reconcile`
+/// that follows is what raises `42883`, and it names the two types.
+fn common_type(operand: &Expr, items: &[Expr]) -> Option<ColumnType> {
+    std::iter::once(operand)
+        .chain(items)
+        .find_map(|expr| match expr {
+            Expr::Ordinal { ty, .. } => Some(*ty),
+            Expr::Literal(literal) => literal_type(literal),
+            _ => None,
+        })
+}
+
+/// Reads an `unknown` as `ty`, in place. Anything else is left exactly as it is — a literal that
+/// already has a type keeps it, and it is `reconcile` that decides whether the pair has an
+/// operator.
+fn give_type(expr: &mut Expr, ty: ColumnType) -> Result<()> {
+    if let Expr::Literal(literal @ Literal::String(_)) = expr {
+        *literal = retype(ty, &literal.clone(), BinaryOp::Eq, false)?;
+    }
+    Ok(())
 }
 
 /// One literal, resolved against a column's type. A literal that will not assign is
@@ -1117,11 +1216,10 @@ fn reconcile(op: BinaryOp, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
 /// from its point of view there is simply no `text = integer` to call.
 fn retype(
     ty: ColumnType,
-    literal: &crate::plan::Literal,
+    literal: &Literal,
     op: BinaryOp,
     literal_on_the_left: bool,
-) -> Result<crate::plan::Literal> {
-    use crate::plan::Literal;
+) -> Result<Literal> {
     if matches!(literal, Literal::Null) {
         return Ok(Literal::Null);
     }
@@ -1146,7 +1244,7 @@ fn retype(
 
 fn undefined_operator(
     ty: ColumnType,
-    literal: &crate::plan::Literal,
+    literal: &Literal,
     op: BinaryOp,
     literal_on_the_left: bool,
 ) -> SqlError {
@@ -1178,7 +1276,7 @@ fn check_predicate(expr: &Expr, clause: &'static str, scope: &Scope<'_>) -> Resu
         | Expr::Not(_)
         | Expr::IsNull { .. }
         | Expr::InList { .. }
-        | Expr::Literal(crate::plan::Literal::Bool(_) | crate::plan::Literal::Null)
+        | Expr::Literal(Literal::Bool(_) | Literal::Null)
         | Expr::Ordinal {
             ty: ColumnType::Bool,
             ..
@@ -1299,7 +1397,6 @@ fn projection_exprs(
 /// What type an output column has. A literal with no column to take a type from falls back the way
 /// PostgreSQL does: a quoted string is `text`, an integer is `bigint`.
 pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
-    use crate::plan::Literal;
     Ok(match expr {
         Expr::Column { table, name } => scope.resolve_column(table.as_deref(), name)?.1,
         Expr::Ordinal { ty, .. } => *ty,

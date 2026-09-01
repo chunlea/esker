@@ -32,6 +32,7 @@
 mod cluster;
 
 use std::fmt::Write as _;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,6 +40,7 @@ use esker_client::region_cache::{RegionResolver, RegionTable, Route};
 use esker_client::router::{ClientOptions, Router};
 use esker_client::{TcpStores, TimestampOracle, TxnClient};
 use esker_pd::{Pd, PdOptions, PdService};
+use esker_proto::ProtoError;
 use esker_proto::fragment::result::{Body, Value as WireValue};
 use esker_proto::fragment::{FragmentReq, FragmentResp, RefusalReason};
 use esker_proto::txn::TxnStatus;
@@ -68,11 +70,11 @@ const STORES: u64 = 4;
 struct Node {
     store: Arc<Store>,
     handle: ServerHandle,
-    address: std::net::SocketAddr,
+    address: SocketAddr,
     dir: tempfile::TempDir,
 }
 
-fn reserve() -> std::net::SocketAddr {
+fn reserve() -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap()
 }
@@ -87,9 +89,9 @@ async fn wait_for<F: FnMut() -> bool>(what: &str, seconds: u64, mut ready: F) {
 
 async fn open_store(
     dir: tempfile::TempDir,
-    address: std::net::SocketAddr,
+    address: SocketAddr,
     store_id: u64,
-    pd_address: std::net::SocketAddr,
+    pd_address: SocketAddr,
     peers: &[PeerAddress],
 ) -> Node {
     let mut raft = RaftOptions::new(peers.to_vec(), 20_260_831);
@@ -141,9 +143,9 @@ async fn open_store(
 /// id, and a later conf change moves its epoch, which the client learns from the store's own
 /// refusal, so this only has to be right at the start.
 fn sql_node(
-    addresses: &[std::net::SocketAddr],
+    addresses: &[SocketAddr],
     region: &esker_proto::Region,
-    pd_address: std::net::SocketAddr,
+    pd_address: SocketAddr,
     oracle: Arc<dyn TimestampOracle>,
 ) -> (Arc<dyn Backend>, Arc<PdConn>) {
     let stores = TcpStores::connect_all(addresses, TransportConfig::new()).unwrap();
@@ -220,7 +222,7 @@ impl WallClockOracle {
 }
 
 impl TimestampOracle for WallClockOracle {
-    fn tso(&self, count: u32) -> Result<u64, esker_proto::ProtoError> {
+    fn tso(&self, count: u32) -> Result<u64, ProtoError> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| {
@@ -243,7 +245,7 @@ struct Gate {
     pd: Arc<Pd>,
     /// The SQL node's oracle, so a test can name the instant it reads at.
     oracle: Arc<dyn TimestampOracle>,
-    pd_address: std::net::SocketAddr,
+    pd_address: SocketAddr,
     pd_handle: Option<ServerHandle>,
     nodes: Vec<Node>,
     backend: Arc<dyn Backend>,
@@ -264,7 +266,7 @@ impl Gate {
 
     async fn start_with(balance: bool) -> Self {
         let pd_address = reserve();
-        let addresses: Vec<std::net::SocketAddr> = (0..STORES).map(|_| reserve()).collect();
+        let addresses: Vec<SocketAddr> = (0..STORES).map(|_| reserve()).collect();
         let peers: Vec<PeerAddress> = addresses
             .iter()
             .enumerate()
@@ -475,37 +477,23 @@ impl Gate {
             esker_columnar::TableRef { tenant, table_id },
             projection,
         );
-        // Dumped rather than unwrapped, for the reason the `TxnKv` call is: this is the second of
-        // the two transport calls in this file and both have now missed their deadline once under
-        // a fully parallel `cargo test` (`docs/plans/phase-9-rails.md` §8).
-        let transport = BlockingTransport::connect(node.address).unwrap_or_else(|error| {
-            transport_dump(
-                std::slice::from_ref(node),
-                region_id,
-                "connect",
-                &format!("{error}"),
-            )
-        });
-        let answer = transport
-            .call(
-                Request::Fragment {
-                    header: RequestHeader::new(region_id, region.region().epoch, 0),
-                    request: FragmentReq {
-                        fragment: esker_columnar::fragment::encode(&fragment).into(),
-                        ts,
-                        min_apply_index,
-                    },
-                },
-                Instant::now() + Duration::from_secs(30),
-            )
-            .unwrap_or_else(|error| {
-                transport_dump(
-                    std::slice::from_ref(node),
-                    region_id,
-                    "fragment call",
-                    &format!("{error}"),
-                )
-            });
+        // Retried on a leadership change and dumped on anything else — see
+        // [`is_a_leadership_change`]. This is the call the third sighting of the watched flake
+        // landed on, and the dump is what said it was an election gap rather than the deadline.
+        let request = Request::Fragment {
+            header: RequestHeader::new(region_id, region.region().epoch, 0),
+            request: FragmentReq {
+                fragment: esker_columnar::fragment::encode(&fragment).into(),
+                ts,
+                min_apply_index,
+            },
+        };
+        let answer = call_through_an_election(
+            std::slice::from_ref(node),
+            region_id,
+            "fragment call",
+            |_| Some((node.address, request.clone())),
+        );
         match answer {
             Response::Fragment(response) => response,
             other => panic!("a fragment request answered {other:?}"),
@@ -517,42 +505,31 @@ impl Gate {
     /// The wire and not the client, because what this drives is a half-finished transaction — a
     /// prewrite whose commit never comes for one of its keys — and the client's whole job is to
     /// not leave one of those behind.
-    fn txn(&self, region_id: u64, request: TxnKvReq) -> TxnKvResp {
-        let leader = self
-            .nodes
-            .iter()
-            .find(|node| {
+    fn txn(&self, region_id: u64, request: &TxnKvReq) -> TxnKvResp {
+        // A transport failure here is **not** a bare `expect`, and it is not a bare dump either:
+        // this call is what a lock-expiry test hangs off, and it has been seen to fail twice for
+        // two different reasons under a fully parallel `cargo test`
+        // (`docs/plans/phase-9-rails.md` §8). The leader is looked up **per attempt**, because
+        // the thing being retried is precisely that it changed.
+        let answer = call_through_an_election(&self.nodes, region_id, "call", |nodes| {
+            let leader = nodes.iter().find(|node| {
                 node.store
                     .peer_of(region_id)
                     .is_some_and(|peer| peer.is_leader())
-            })
-            .expect("some store leads the region");
-        let epoch = leader
-            .store
-            .regions()
-            .get(region_id)
-            .expect("the leader hosts the region")
-            .region()
-            .epoch;
-        // A transport failure here is **not** a bare `expect`, for the reason `compare` gives:
-        // this call is what a lock-expiry test hangs off, it has been seen to lose its deadline
-        // once under a fully parallel `cargo test`, and a rare failure whose evidence went to a
-        // terminal that was grepped is worth almost nothing. So it writes the cluster down first
-        // (`docs/plans/phase-9-rails.md` §8, the watched list).
-        let transport = BlockingTransport::connect(leader.address)
-            .unwrap_or_else(|error| self.transport_dump(region_id, "connect", &format!("{error}")));
-        let answer = transport
-            .call(
-                Request::txn_kv(RequestHeader::new(region_id, epoch, 0), request),
-                Instant::now() + Duration::from_secs(30),
-            )
-            .unwrap_or_else(|error| self.transport_dump(region_id, "call", &format!("{error}")));
+            })?;
+            let epoch = leader
+                .store
+                .regions()
+                .get(region_id)
+                .expect("the leader hosts the region")
+                .region()
+                .epoch;
+            Some((
+                leader.address,
+                Request::txn_kv(RequestHeader::new(region_id, epoch, 0), request.clone()),
+            ))
+        });
         answer.into_txn_kv().expect("a TxnKv answer")
-    }
-
-    /// Writes the cluster down and fails, for a call that never answered.
-    fn transport_dump(&self, region_id: u64, what: &str, error: &str) -> ! {
-        transport_dump(&self.nodes, region_id, what, error)
     }
 
     /// The store ids holding a columnar learner of any region, as **PD** records them.
@@ -702,6 +679,81 @@ async fn an_alter_places_a_columnar_replica_and_clearing_it_takes_it_back() {
 ///
 /// A free function over whatever nodes the caller can see, because the two calls that need it are
 /// not both methods on the gate: the fragment one is an associated function holding a single node.
+/// The retry a real client already has, at the two transport calls in this file that did not.
+///
+/// The watched flake (`docs/plans/phase-9-rails.md` §8) was chased at its third sighting and the
+/// dump said what it is: **not** the 30-second deadline, but the gap between a leader stepping
+/// down on a saturated machine and the next election — no store leading, and all four peers
+/// agreed at the same applied index, with the 30 seconds untouched. `esker-client` treats that as
+/// a redirect and tries again (`crates/esker-client/src/retry.rs`); these two calls went to the
+/// wire directly and did not.
+///
+/// **Only a leadership change is retried.** Anything else still writes the cluster down and
+/// fails, which is what the dump was added for and what would be lost by wrapping the call in a
+/// blanket retry. Both tests assert what the two engines *answer*, not that the first attempt
+/// lands on a leader that is still leading when it commits — so this is the assertion being
+/// written correctly rather than a workaround for it.
+///
+/// The address and the request are built per attempt, by the caller, because on the `TxnKv` side
+/// the thing being retried is precisely that the leader moved: a closure that returns `None` is
+/// saying *nothing leads the region at this instant*, which is the gap itself and not a failure.
+fn call_through_an_election(
+    nodes: &[Node],
+    region_id: u64,
+    what: &str,
+    mut address_and_request: impl FnMut(&[Node]) -> Option<(SocketAddr, Request)>,
+) -> Response {
+    // Eight attempts a quarter-second apart. An election on an idle cluster takes one heartbeat;
+    // two seconds is a saturated machine's worth of them, and still well inside the deadline a
+    // single call already gets.
+    const ATTEMPTS: usize = 8;
+    const PAUSE: Duration = Duration::from_millis(250);
+
+    let mut last = "no store led the region on any attempt".to_owned();
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(PAUSE);
+        }
+        let Some((address, request)) = address_and_request(nodes) else {
+            continue;
+        };
+        let outcome = BlockingTransport::connect(address).and_then(|transport| {
+            transport.call(request, Instant::now() + Duration::from_secs(30))
+        });
+        match outcome {
+            Ok(answer) => return answer,
+            Err(error) if is_a_leadership_change(&error) => last = format!("{error}"),
+            Err(error) => transport_dump(nodes, region_id, what, &format!("{error}")),
+        }
+    }
+    transport_dump(
+        nodes,
+        region_id,
+        what,
+        &format!("{ATTEMPTS} attempts each lost the leader; the last said: {last}"),
+    )
+}
+
+/// Whether an error is the region changing leader while the call was in flight.
+///
+/// **Two shapes from one event**, and `esker_store::peer`'s `stopped_leading` sends both: an
+/// orphaned *read* is answered `NotLeader`, and a *proposal* already in the peer's log is answered
+/// `Closed` with a detail saying it may still commit. The dump caught the second; matching only
+/// that one would leave the other half of the same instant unretried.
+///
+/// `Closed` is matched on its detail because that is the only structure it has — it is the
+/// protocol's general "the connection went away", and a store that was killed must still dump
+/// rather than be retried. The text is `esker-store`'s, one crate away and out of this lane; if it
+/// ever changes, this stops retrying and the flake comes back as a dump, which is the safe
+/// direction for it to fail in.
+fn is_a_leadership_change(error: &ProtoError) -> bool {
+    match error {
+        ProtoError::NotLeader { .. } => true,
+        ProtoError::Closed { detail } => detail.contains("stopped leading"),
+        _ => false,
+    }
+}
+
 fn transport_dump(nodes: &[Node], region_id: u64, what: &str, error: &str) -> ! {
     let mut dump = String::new();
     let _ = writeln!(dump, "a {what} to the leader of region {region_id} failed");
@@ -903,7 +955,7 @@ fn strand_a_secondary_lock(
     let start_ts = gate.oracle.timestamp().unwrap();
     let answer = gate.txn(
         region_id,
-        TxnKvReq::Prewrite {
+        &TxnKvReq::Prewrite {
             start_ts,
             primary: primary.clone(),
             ttl_ms,
@@ -928,7 +980,7 @@ fn strand_a_secondary_lock(
     let commit_ts = gate.oracle.timestamp().unwrap();
     let answer = gate.txn(
         region_id,
-        TxnKvReq::Commit {
+        &TxnKvReq::Commit {
             start_ts,
             commit_ts,
             keys: vec![primary.clone()],

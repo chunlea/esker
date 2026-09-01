@@ -431,8 +431,10 @@ were already there, which is what a capture is for. Five are named refusals (`IS
 operator `+`). The sixth is not: **`SELECT 1 = '1'` is `f` here where a real server says `t`.**
 Two literals with no column to type them against are compared untyped, which is a *wrong answer*
 rather than a refusal — the class this project treats as worst. It is `=`'s bug and older than
-this unit; `IN` inherits it exactly because it shares `reconcile`. Recorded in §6 and in
-`tests/in_list.rs`'s `DIVERGENCES`, and it wants a unit of its own.
+this unit; `IN` inherits it exactly because it shares `reconcile`.
+
+**Fixed in unit 6** (§Unit 6, "the two inherited fixes"), which is why `tests/in_list.rs` now
+declares five and not six.
 
 #### The type surface is BLOCKED, and not on this lane
 
@@ -732,7 +734,9 @@ close, and a divergence recorded in the wrong file is better than one recorded n
 | `SET <parameter>` for a parameter this node does not have is `0A000` naming it, where PostgreSQL answers `42704` | PostgreSQL knows that an un-namespaced name it does not have cannot be a custom GUC. Telling `work_mem` — a real parameter this node does not implement — from a name nobody has would mean carrying PostgreSQL's whole GUC table, so a `SET` this node does not run names itself under contract C2 rather than claim the parameter is absent. `SHOW` and `RESET` make the opposite trade and answer `42704` for both; that asymmetry is older than this unit and is worth closing in one direction when there is a reason to pick one. | `tests/session_parameters.rs`'s `DIVERGENCES` |
 | A `SET` that changes a `GUC_REPORT` parameter sends no `ParameterStatus` | PostgreSQL tells a client when `standard_conforming_strings`, `TimeZone` or `IntervalStyle` changes, so a driver can track it. Of the values this node accepts, only `IntervalStyle` ever *changes* from what the startup packet announced — and it governs how an `interval` prints, of which this node has none. The other two are honoured only at the value they were announced with. Recorded rather than built: the report would have to leave the executor through `Outcome`, and nothing measurable is wrong today. | this table, `src/parameter.rs` |
 | A column alias list (`FROM t AS x (c, d)`), and an alias on `UPDATE` / `DELETE`, are `0A000` naming themselves | A real server takes all three. The column list renames the table's columns, so ignoring it would answer a query about `c` with a column called `id` — a wrong answer rather than a gap. `UPDATE`/`DELETE` resolve against one table and have no second name to tell apart, so the alias buys nothing there; the `SELECT` side is what the 19 catalog statements need. | `tests/alias.rs`'s `DIVERGENCES` |
-| **`SELECT 1 = '1'` is `f`, where PostgreSQL answers `t`** | Two literals with no column to type either against are compared untyped, so an `int8` never equals a `text`. It is a **wrong answer and not a refusal**, which is the one outcome this crate is built to avoid, and it is *older than the unit that found it*: `IN` shares `reconcile` with `=` and inherits it exactly. Against a column both are right — `id = '1'` and `id IN ('1')` match — because there the column gives the literal a type. It wants a unit of its own: the fix is a type for an untyped literal in a comparison that has no column in it, which is PostgreSQL's `unknown` resolution and is a rule, not a patch. | [`tests/in_list.rs`]'s `DIVERGENCES`, `tests/corpus/pg19_in.txt` |
+| ~~`SELECT 1 = '1'` is `f`~~ — **fixed**, and it was a rule rather than a patch | Two literals with no column to type either against were compared untyped, so an `int8` never equalled a `text`. A **wrong answer and not a refusal**, and older than the unit that found it: `IN` shares `reconcile` with `=` and inherited it exactly. The fix is PostgreSQL's `unknown` resolution, captured in full first: an `unknown` beside a *typed operand of any kind* takes that type, two `unknown`s are both `text` (which is why `'1' = '01'` stays `f`), and an `IN` list is typed **as a whole** so `'01' IN ('1', 1)` is `t`. **78 of 123 captured statements disagreed before it and 31 after**, and every one of those 31 is one of four gaps that were already there — `int4` (11), `numeric` (5), a cast (14), the `C` collation (1). | `tests/unknown_literal.rs`, `tests/corpus/pg19_unknown.txt` (123 statements) |
+| A bare integer constant is `int8`, where PostgreSQL's is `int4` | `pg_typeof(1)` is `integer` on a real server, so `1 = '2147483648'` is `22003 value "2147483648" is out of range for type integer` and here the string reads and the comparison answers `f`. Every input error under the same rule names `bigint` where PostgreSQL names `integer`. Eleven statements, all of them the same one fact, and it closes when `int4` exists — the type-surface unit this plan blocks on `esker-keys`. | `tests/unknown_literal.rs`'s `DIVERGENCES` |
+| A decimal constant is `double precision`, where PostgreSQL's is `numeric` | The same choice `Literal::Decimal` already makes everywhere in this crate, `SELECT 1.5` included, so it is not new — the corpus is the first thing to put a number on it. `double` reproduces `numeric` for every value it can hold and stops at about 17 digits: `0.1 = '0.1000000000000000000001'` is `f` on a real server and `t` here. Its neighbour, `1 = 1.0`, is `t` there and `f` here for the opposite reason — no promotion between `int8` and `float8` — and promoting to `double` would fix that line and break `9007199254740993 = 9007199254740992.0`, which this node currently gets right. Recorded with its counterexample rather than fixed; ADR 0031's numeric backlog. | `tests/unknown_literal.rs`'s `DIVERGENCES` |
 | `EXPLAIN` prints `Aggregate` / `Group Aggregate` / `Unique` and no costs | The same divergence the access-path plans already carry: PostgreSQL chooses between `HashAggregate` and `GroupAggregate` and prints an estimate; there is one strategy here and no cost model, so the name says what it is rather than implying a choice that was not made. | `tests/slt/aggregate.slt`, `tests/slt/access_paths.slt` |
 
 ## 7. What unit 1 changed, and the two bugs it turned up
@@ -760,7 +764,7 @@ line in a scrollback. A third sighting makes it a chase.
 | Seen | What | State |
 |---|---|---|
 | 2026-09-01, **twice** | `joint_gate`'s two transport calls have each missed their 30-second deadline once under a fully parallel `cargo test`: first `a_lock_the_ttl_kills_resolves_the_same_way_on_both_engines` on the `TxnKv` call, then `the_learner_answers_fragments_that_agree_with_a_row_scan` on the fragment call — `Timeout { no answer from 127.0.0.1:60224 in 30s }`. Both pass standalone. **Two different tests, one failure mode**, which narrows it: this is not the lock-expiry clock `1f22077` hardened, it is a 30-second RPC deadline against however many test binaries this machine is running at once. | **chased — see below.** Both calls dump instead of unwrapping: `target/joint-gate-transport-<ts>.txt`, naming who led the region, every store's address, leadership and applied index, and the deadline. |
-| 2026-09-01, **third** | The same test and the same call, and the dump says it is **not the deadline**: `connection closed: region 1 stopped leading with this proposal in its log`, with **no store leading** and all four agreed at `applied=16`. An election gap under a saturated machine, not an expired timeout. | **chased, and handed over.** The finding and the one-line fix are below; the file is another lane's. |
+| 2026-09-01, **third** | The same test and the same call, and the dump says it is **not the deadline**: `connection closed: region 1 stopped leading with this proposal in its log`, with **no store leading** and all four agreed at `applied=16`. An election gap under a saturated machine, not an expired timeout. | **closed in unit 6.** The retry is in, at both call sites, on the leadership error only — see below. |
 
 ### The chase, run — and it is not the deadline
 
@@ -799,9 +803,37 @@ is not a workaround, it is the assertion being written correctly.
 Standalone it passes in 5.65s, and this phase's changes are in the expression layer with nothing
 between them and Raft leadership.
 
-**Handed over rather than fixed**: `tests/joint_gate.rs` is another lane's file (§ "Lane", above),
-and the change is theirs to make — one retry, on the leadership error only, at each of the two
-transport call sites that already dump.
+**Handed over rather than fixed**: `tests/joint_gate.rs` was another lane's file (§ "Lane",
+above), and the change was theirs to make — one retry, on the leadership error only, at each of the
+two transport call sites that already dump.
+
+### Closed, in unit 6
+
+That lane retired and the file came here, and the retry is in: `call_through_an_election` at both
+call sites. **Only a leadership change is retried** — anything else still writes the cluster down
+and fails, which is what the dump was added for and what a blanket retry would have thrown away.
+
+Two things the fix had to know that the diagnosis did not say:
+
+* **the event has two error shapes, not one.** `esker_store::peer`'s `stopped_leading` answers an
+  orphaned *read* with `NotLeader` and a *proposal already in the log* with `Closed { detail }`.
+  The dump caught the second; matching only it would leave the other half of the same instant
+  unretried. `ProtoError::is_retryable` covers the first and deliberately not the second — a
+  closed connection with an unknown outcome is not safe for a caller to repeat in general — so the
+  predicate is local to the test and says why.
+* **the leader has to be looked up per attempt.** The `TxnKv` call site resolved the leader once
+  and then retried against it, which retries the store that just stepped down. The address and the
+  request are now built by a closure the retry calls each time, and a closure that returns `None`
+  means *nothing leads the region at this instant* — the gap itself, and a wait rather than a
+  failure.
+
+A fourth sighting was caught in the same session, on a fully parallel `cargo test` right after
+another had finished, and it was **two failures rather than one**: the fragment call, and — in a
+different test — `Backend::begin` answering `StoreUnavailable("gave up after 9 attempts: region
+epoch does not match")`. The second is not this fix's: it is the *client's* own retry, which
+already retries nine times, exhausting them against an epoch that keeps moving. Same cause
+(saturation), third mechanism, and it is recorded here rather than claimed to be fixed. Three
+consecutive standalone runs are clean.
 
 ## 9. Progress
 
@@ -813,4 +845,5 @@ transport call sites that already dump.
 | 3 — savepoints | **done** | `779ae2e` (capture), `a74b724` |
 | 4 — joins | **`LEFT`, `ON`, `USING` done**; a second join is not | `56d23e2` |
 | 5 — `pg_catalog` | **in progress, in the measured order.** Captured and re-ordered (`b8d90e7`); the **table alias**, the **six `SET`s + two `SHOW`s** and **`IN (list)`** built, taking `ActiveRecord`'s 36 from 3 served to **11** and moving five statements onto the catalog; the type surface **blocked on `esker-keys`** and reported; the translation approach **decided** (views over records). What is left is the catalog's content, starting at `pg_type`. | `b8d90e7`, `b0eca1c`, this commit |
-| 6 — the scoreboard | **first run done**: the harness runs the ladder and all 426 suite files, `docs/bench/rails-scoreboard.md` carries both. 59 files reach a test, 367 die at `establish_connection`; rung 1 passes. Its finding — `IN (list)`, the first query `ActiveRecord` sends — was built in the same round, and rung 2 now stops on the catalog | this commit |
+| 6 — the scoreboard | **first run done**: the harness runs the ladder and all 426 suite files, `docs/bench/rails-scoreboard.md` carries both. 59 files reach a test, 367 die at `establish_connection`; rung 1 passes. Its finding — `IN (list)`, the first query `ActiveRecord` sends — was built in the same round, and rung 2 now stops on the catalog | `6971a30` |
+| 6 — the two inherited fixes | **done**: PostgreSQL's `unknown` resolution (`SELECT 1 = '1'` was `f`), captured in 123 statements and fixed as the rule it is — 78 disagreements became 31, all four remaining classes declared; and the watched transport flake, retried at both `joint_gate` call sites on a leadership change only. §6 and §8 | this commit |
