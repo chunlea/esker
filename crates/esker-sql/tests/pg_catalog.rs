@@ -251,6 +251,39 @@ fn a_catalog_relation_is_read_only() {
     assert_eq!(error.sqlstate(), sqlstate::DUPLICATE_TABLE);
 }
 
+/// `SELECT *` expands to the view's columns, and hides none of them.
+///
+/// **This is not in the corpus, and it is the bug the corpus could not have caught.** A real
+/// server's `pg_type` has some thirty columns and 669 rows, so `SELECT *` is not a line two
+/// servers can agree on — and the first version of this unit answered it one column short. A
+/// `TableDef` with no primary key means a *keyless table*, whose column 0 is an internal row id
+/// that `SELECT *` hides; a computed relation has no key **and** no row id, because nothing stores
+/// its rows. `pg_type.oid` is column 0, so the framework's own first question came back without
+/// the answer in it.
+#[test]
+fn a_star_expands_to_every_column_of_the_view() {
+    let mut node = parity::Node::new(&[]);
+
+    assert_eq!(
+        node.rows("SELECT * FROM pg_type WHERE typname = 'int8'"),
+        vec![vec!["20", "int8", "0", ",", "int8in", "b", "0"]]
+    );
+    assert_eq!(
+        node.rows("SELECT t.* FROM pg_type AS t WHERE t.oid = 20"),
+        vec![vec!["20", "int8", "0", ",", "int8in", "b", "0"]]
+    );
+    assert_eq!(node.rows("SELECT * FROM pg_type").len(), 6);
+
+    // `pg_range` is empty, so its columns can only be read off the description.
+    match node.answer("SELECT * FROM pg_range") {
+        parity::Answer::Rows { types, rows } => {
+            assert!(rows.is_empty(), "pg_range has no rows here");
+            assert_eq!(types.len(), 2, "rngtypid and rngsubtype, and no `oid`");
+        }
+        other => panic!("SELECT * FROM pg_range answered {other}"),
+    }
+}
+
 /// `EXPLAIN` over a computed relation says what it is: one access path, and no cost.
 #[test]
 fn explain_names_the_catalog_scan() {

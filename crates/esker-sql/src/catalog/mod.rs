@@ -310,6 +310,15 @@ impl TableDef {
     /// the user's columns and cannot move it.
     #[must_use]
     pub fn row_id(&self) -> Option<usize> {
+        // A `pg_catalog` view has no key **and no row id**: nothing stores its rows, so there is
+        // no identity to hide in column 0. Without this it reads as a keyless table and
+        // [`TableDef::user_columns`] hides its first column — which is `pg_type.oid`, so
+        // `SELECT * FROM pg_type` came back one column short. A wrong answer rather than a gap,
+        // and found by asking the running node a question the corpus could not: a real server's
+        // `pg_type` has some thirty columns, so `SELECT *` is not a line two servers can agree on.
+        if pg_catalog::view_of(self).is_some() {
+            return None;
+        }
         self.primary_key_name.is_empty().then_some(0)
     }
 
