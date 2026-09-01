@@ -349,6 +349,79 @@ several. What stands between here and a booting ActiveRecord, in the order the b
 
 Each of those is a unit. The count in `activerecord_surface.rs` is what says whether one worked.
 
+#### Handover — every one of the 36, by number
+
+Numbering is the order in `tests/corpus/activerecord_8_1_statements.txt`, which is the order
+ActiveRecord issued them. Reproduce this table by replaying the corpus and printing each answer;
+`activerecord_surface.rs` already does the replay.
+
+**Served today — 3.** `10` `DROP TABLE IF EXISTS`, `18` `BEGIN`, `19` `COMMIT`.
+
+**Remaining — 33, grouped by what unblocks them.** The groups are disjoint and each names the
+*first* thing in the way; a statement may need more than one, and the second only matters once the
+first is gone.
+
+| What unblocks them | Statements | Count |
+|---|---|---|
+| **a table alias** (`FROM pg_type AS t`, `pg_class c`) | 4, 7, 8, 9, 15, 16, 17, 21, 23, 26, 28, 29, 30, 31, 32, 33, 34, 35, 36 | **19** |
+| **`SET` of a session parameter it does not know** | 1, 2, 3, 5, 25, 27 | 6 |
+| **the type surface** (`character varying`, `integer`, `timestamp(6)`) | 13 — and with it **14** and **20**, which fail only because 13 did | 3 |
+| **`SHOW` of a parameter it does not know** | 6, 11 | 2 |
+| **a cast** (`::regtype::oid`) | 12 | 1 |
+| **a bare `current_schema`** (a function spelled as a keyword — `42703 column … does not exist` today) | 24 | 1 |
+| **`current_schemas(false)`** called on its own | 22 | 1 |
+
+Two things that table makes obvious and the earlier blocker count did not:
+
+* **The cheapest six are the `SET`s.** Every one is a parameter a real server accepts and ignores
+  or honours quietly, and this node answers `0A000` naming it. Accepting the ones PostgreSQL
+  accepts — measuring each first, because `SET intervalstyle = iso_8601` changing nothing here is
+  a claim, not an assumption — turns 6 into runs for very little. It is the highest ratio on the
+  board and it is **not** in the re-ordered list above, which was written from the blocker counts
+  before this table existed.
+* **The type surface is worth 3, not 1.** 14 and 20 fail with `42P01` only because the `CREATE
+  TABLE` before them did; they are not independently blocked.
+
+#### The translation approach, and why it is not chosen yet
+
+Nothing of `pg_catalog` is built, and the shape it should take is **deliberately undecided** until
+the query surface above exists — a decision made now would be made without knowing what the
+queries can ask. The two candidates, with what the capture says about each:
+
+1. **Catalog tables as real tables** in a reserved part of the `'m'` space, written by DDL and read
+   by the ordinary planner. Everything above works on them for free — aliases, joins, `ORDER BY` —
+   and their *content* is duplicated state that every `CREATE TABLE` has to keep in step, which is
+   the class of bug this project has spent two phases avoiding.
+2. **Catalog tables as views over the existing records**, materialised per query from the `'m'`
+   space. No duplicated state and no way to drift, and it needs the planner to accept a relation
+   that is computed rather than scanned — a `Node` variant, not a storage change.
+
+The capture favours **(2)**: 19 of the 33 remaining statements only need the catalog to *be a
+relation the planner can alias and join*, and none of them needs it to be writable. `pg_catalog`
+write paths stay out of scope (§5).
+
+#### The state of every file
+
+No file is half-built. What exists:
+
+* `tests/corpus/activerecord_8_1_statements.txt` — the 36 statements, complete, in issue order.
+* `tests/activerecord_surface.rs` — the C1/C2 gate and the exact count. Complete.
+* In the **out-of-repo** harness (`/Users/chunlea/workspace/lab/esker-rails-harness/`):
+  `Gemfile` + `.bundle/config` (rails 8.1.3.1, pg 1.6.3, confined to `vendor/bundle`), `boot.rb`
+  (connect → migrate → CRUD → schema dump), `capture-ar-boot.sh`, `extract.py`, `README.md`. All
+  working; `bundle install` has run. **One trap worth inheriting**: `extract.py` must skip its own
+  marker statements, or the window split leaves a truncated `SELECT '` in the corpus — a statement
+  no server ever saw. The surface gate caught that on its first run, which is what a gate is for.
+
+#### Unit 6's runner: not started
+
+Nothing of the scoreboard exists. The harness has the *capture* half (`boot.rb` drives one
+connection); it has no `rails/rails` checkout, no `config.yml` pointing ActiveRecord at an Esker
+node, no runner and no exclusion-list runner. The count in `activerecord_surface.rs` is a
+**proxy** for the scoreboard and not the scoreboard: it measures whether statements are answered,
+where the real one measures whether tests pass. It exists because 3-of-36 is a number that can be
+had today, and unit 6's cannot.
+
 ### Unit 6 — the scoreboard
 
 The harness — `config.yml` pointed at this node, the runner, the exclusion-list runner — is built
@@ -458,7 +531,8 @@ line in a scrollback. A third sighting makes it a chase.
 | 2 — sequences and `RETURNING` | **done** | `e1b1bd2`, `7a7d4f3`, `bf28e0d` |
 | 3 — savepoints | **done** | `779ae2e` (capture), `a74b724` |
 | 4 — joins | **`LEFT`, `ON`, `USING` done**; a second join is not | `56d23e2` |
-| 5 — `pg_catalog` | **captured, and re-ordered by what it found**: 3 of ActiveRecord's 36 statements run, and the catalog is the *last* blocker rather than the first | this commit |
+| 5 — `pg_catalog` | **captured, and re-ordered by what it found**: 3 of ActiveRecord's 36 statements run, and the catalog is the *last* blocker rather than the first. §2 carries the per-statement handover | `b8d90e7`, this commit |
+| 6 — the scoreboard | not started; §2 unit 5 says what of it exists (the capture half) and what does not (everything else) | |
 | 3 — savepoints | not started | |
 | 4 — joins | not started | |
 | 5 — `pg_catalog` | not started | |
