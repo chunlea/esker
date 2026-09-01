@@ -412,6 +412,39 @@ fn physical_ranges(region: &Region) -> [(Vec<u8>, Vec<u8>); PHYSICAL_NAMESPACES.
     [(raw_low, raw_high), (txn_low, txn_high)]
 }
 
+/// How many keys each shipped column family holds inside `region`'s range.
+///
+/// [`clear_range`]'s own emptiness check is the one-bit version of this, and one bit is not enough
+/// to check a *reclamation* with: "two of three column families" is what the version-1 snapshot
+/// stream turned out to be ([ADR 0032](../../../docs/adr/0032-a-snapshot-carries-every-column-family.md)),
+/// and a probe that answers "not empty" without saying which family would have read the same
+/// either way. So this names the family, and the caller asserts about all three at once.
+///
+/// Public because the only useful check of a range that is supposed to be gone is made from
+/// outside the code that removed it.
+pub fn key_counts(
+    db: &Db,
+    region: &Region,
+) -> Result<[(&'static str, usize); SNAPSHOT_CFS.len()], ProtoError> {
+    let mut counts = [("", 0_usize); SNAPSHOT_CFS.len()];
+    for (at, (_, name)) in SNAPSHOT_CFS.into_iter().enumerate() {
+        let mut held = 0;
+        for (low, high) in physical_ranges(region) {
+            let mut iter = db
+                .iter(name, &ReadOptions::default())
+                .map_err(|error| engine_to_proto(&error))?;
+            iter.seek(&low);
+            while iter.valid() && iter.key() < high.as_slice() {
+                held += 1;
+                iter.next();
+            }
+            iter.status().map_err(|error| engine_to_proto(&error))?;
+        }
+        counts[at] = (name, held);
+    }
+    Ok(counts)
+}
+
 /// The first key of `region`'s range that any shipped column family holds, if there is one.
 ///
 /// Every family, because the question this answers is "is this range empty" and a range that is

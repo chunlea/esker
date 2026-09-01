@@ -52,6 +52,13 @@ use crate::split::{self, SplitOptions};
 use crate::transport::{PeerAddress, StoreAddress, StoreTransport};
 use crate::{OPERATOR_TIMEOUT, SNAPSHOT_STREAM_DEPTH, TRANSFER_LAG_ALLOWANCE};
 
+/// How many consecutive leaderless heartbeat rounds make a region worth asking PD about.
+///
+/// A throttle rather than a bound; see [`Store::sweep_orphaned_regions`] for why the safety is
+/// elsewhere. At the default `heartbeat_tick` of one raft tick this is five seconds, which is
+/// several election timeouts and still healing in the same breath as a rebalance.
+const ORPHAN_PROBE_ROUNDS: u32 = 50;
+
 /// How a store is opened.
 #[derive(Debug, Clone)]
 pub struct StoreOptions {
@@ -698,17 +705,54 @@ impl Store {
         }
     }
 
-    /// Stops serving a region this store has been removed from, and forgets its Raft state.
+    /// Stops serving a region this store has been removed from, forgets its Raft state, and
+    /// **reclaims its range**.
     ///
-    /// Spawned rather than done here, because this runs on the removed peer's **own driver
+    /// Spawned rather than done here, because one caller is the removed peer's **own driver
     /// thread**: stopping it from inside is a join on itself.
     ///
-    /// The region's **data is left in place**. Removing it would mean point deletes over the whole
-    /// range — the engine has no range tombstones in v1 (ADR 0006) — and the tombstones that
-    /// leaves are keys in the range, which is the state that stops the range ever receiving a
-    /// snapshot again (`docs/plans/phase-4.md` §13.4). So the keys stay, no region covers them, and
-    /// nothing serves them. `TODO(post-v1)`: reclaim them when the engine can drop a range.
-    fn retire_region(self: &Arc<Self>, region_id: u64) {
+    /// # Why the data goes now, when it used to stay
+    ///
+    /// It used to stay, and this comment used to say why: removing it would mean point deletes
+    /// over the whole range, because "the engine has no range tombstones in v1 (ADR 0006)", and
+    /// the tombstones those leave are keys in the range — the state that stops the range ever
+    /// receiving a snapshot again. Every clause of that was true when it was written and the first
+    /// one stopped being true in phase 5: range tombstones are
+    /// [ADR 0017](../../../docs/adr/0017-range-tombstones.md), and
+    /// [`snapshot::clear_range`](crate::snapshot::clear_range) is this exact operation — delete,
+    /// flush, discharge, and *verify* — written for the peer that has to be caught up by a
+    /// snapshot. So the reason to keep the keys expired two phases ago and nobody came back to it;
+    /// the consequence was unbounded disk growth on any cluster that rebalances, since every
+    /// rebalance is a `RemovePeer`.
+    ///
+    /// # The order, and what a crash between the steps leaves
+    ///
+    /// The Raft state and the region record go **first**, synced, and the range is emptied after.
+    /// A crash in between leaves keys under no record, which is precisely the state this store was
+    /// in permanently until now — recoverable, and never served, because there is no region record
+    /// to serve them from. Doing it the other way round would leave a *record* pointing at a
+    /// half-emptied range, and a peer that restarted into serving a partial region is the one
+    /// outcome that must never happen (`docs/plans/phase-4.md` §13.1).
+    ///
+    /// # The two gates, which are the difference between reclamation and data loss
+    ///
+    /// Deleting a range this store still owns loses acknowledged writes, so the clear runs only
+    /// when both are true:
+    ///
+    /// 1. **the membership no longer names a peer on this store.** Which record answers that
+    ///    depends on who is retiring, and getting it from the map is wrong for one of the two
+    ///    callers: a peer that applied its own removal holds the post-change record, but a store
+    ///    the sweep found holds the record from *before* the change — it never applied one — so
+    ///    its own copy still names it and always will. `membership` is the newer record when the
+    ///    caller has one, and the map's when it does not; and
+    /// 2. **no region this store still hosts overlaps the range.** This is the one that catches a
+    ///    *stale* record: a parent whose split narrowed it, retired against the range it had
+    ///    before, would delete the child's keys. The map is the authority on what is served here,
+    ///    and it is consulted after the removal so the answer cannot include the region going away.
+    ///
+    /// Either gate failing is logged and skips the clear. The keys then stay where they were,
+    /// which is the old behaviour and costs disk rather than data.
+    fn retire_region(self: &Arc<Self>, region_id: u64, membership: Option<Region>) {
         let Some(runtime) = self.runtime.clone() else {
             return;
         };
@@ -728,15 +772,83 @@ impl Store {
                 Ok(Ok(entries)) => tracing::info!(
                     region_id,
                     entries,
-                    "this store was removed from a region; its raft state is gone and its data \
-                     is left where no region covers it"
+                    "this store was removed from a region; its raft state is gone"
                 ),
                 Ok(Err(error)) => {
                     tracing::warn!(region_id, %error, "could not clear a retired region's log");
+                    // The record may still be on disk, so the range may still be served after a
+                    // restart. Emptying it now would be emptying a range this store can still
+                    // come back into.
+                    return;
                 }
-                Err(error) => tracing::warn!(region_id, %error, "the retirement task failed"),
+                Err(error) => {
+                    tracing::warn!(region_id, %error, "the retirement task failed");
+                    return;
+                }
             }
+            // The **range** is always this store's own record: it is what this store actually
+            // wrote keys into, and a newer record from elsewhere may describe a narrower one.
+            // The **membership** is the newest available. Gate 2 below is what keeps the pair
+            // honest when the two records disagree about the range as well.
+            store
+                .reclaim_retired_range(
+                    state.region(),
+                    membership.as_ref().unwrap_or(state.region()),
+                )
+                .await;
         });
+    }
+
+    /// Empties a retired region's range, once it is provably nobody's here.
+    ///
+    /// Split out of [`retire_region`](Self::retire_region) because it is the part that deletes
+    /// data, and the two gates in front of it are the whole reason it is safe to. See that
+    /// method's documentation for what they are and what happens when one does not hold.
+    async fn reclaim_retired_range(self: &Arc<Self>, region: &Region, membership: &Region) {
+        if let Some(mine) = membership
+            .peers
+            .iter()
+            .find(|peer| peer.store_id == self.store_id)
+        {
+            tracing::warn!(
+                region_id = region.id,
+                peer_id = mine.peer_id,
+                "a region was retired while its record still names a peer on this store; its \
+                 range is left alone"
+            );
+            return;
+        }
+        let overlapping = self.regions.overlapping(&region.start_key, &region.end_key);
+        if !overlapping.is_empty() {
+            tracing::warn!(
+                region_id = region.id,
+                overlaps = ?overlapping.iter().map(|other| other.id).collect::<Vec<_>>(),
+                "a retired region's range is still covered by a region this store hosts, so it \
+                 is left alone rather than emptied under its owner"
+            );
+            return;
+        }
+
+        let db = Arc::clone(&self.db);
+        let region = region.clone();
+        let region_id = region.id;
+        // On a blocking thread: `clear_range` is a delete, a flush and a compaction of the range.
+        match tokio::task::spawn_blocking(move || snapshot::clear_range(&db, &region)).await {
+            Ok(Ok(())) => tracing::info!(
+                region_id,
+                "a retired region's range was reclaimed in every column family"
+            ),
+            // Loud and harmless: the range keeps its keys, which is where it was before. The one
+            // way this fails is a tombstone that could not be discharged because something is
+            // holding an engine snapshot open, and the next retirement of this range will clear
+            // it (`crate::snapshot::clear_range`).
+            Ok(Err(error)) => {
+                tracing::warn!(region_id, %error, "a retired region's range was not reclaimed");
+            }
+            Err(error) => {
+                tracing::warn!(region_id, %error, "the reclamation task failed");
+            }
+        }
     }
 
     /// Brings a split into effect: narrows the parent and starts the child.
@@ -808,6 +920,11 @@ impl Store {
             );
             let mut interval = tokio::time::interval(tick);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // How many consecutive rounds each region has had no leader, which is the only state
+            // `sweep_orphaned_regions` keeps. It lives here rather than on the store because this
+            // task is its only reader and its only writer.
+            let mut leaderless: std::collections::BTreeMap<u64, u32> =
+                std::collections::BTreeMap::new();
             loop {
                 interval.tick().await;
                 // A weak reference, so a dropped store ends this task rather than keeping
@@ -836,10 +953,112 @@ impl Store {
                 // On the same schedule, because it is the second half of the same job: an
                 // `AddPeer` is not finished until the replica votes.
                 store.promote_caught_up_learners().await;
+                // And the same for the other operator: a `RemovePeer` is not finished until the
+                // store it removed has heard about it. See `sweep_orphaned_regions`.
+                store.sweep_orphaned_regions(&mut leaderless).await;
                 drop(store);
             }
         });
         self.remember(task);
+    }
+
+    /// Retires every region this store hosts that the cluster has removed it from.
+    ///
+    /// # The gap this closes: nobody tells a removed peer
+    ///
+    /// `retire_region` is reached from one place — a peer applying the conf change that removed
+    /// it — and a removed peer does not apply that entry, because it never receives it. A
+    /// configuration change takes effect **when it is appended** (§4.1, and `esker-raft`'s
+    /// `conf::tests::a_leader_removed_by_a_committed_change_steps_down` asserts exactly that), so
+    /// the instant the leader appends `Remove(n)` its own `Progress` no longer has an entry for
+    /// `n`, and the entry that says `n` is gone is the first one `n` is not sent. The commit needs
+    /// a quorum of the *new* configuration, which `n` is not in, so it commits without `n` ever
+    /// hearing of it. Nothing after that is addressed to `n` either.
+    ///
+    /// So without this sweep a removed store keeps a peer, a region record and every key of the
+    /// range for the life of the process. It is not only a disk leak: that peer has no leader, so
+    /// it campaigns for ever against a group that has replaced it. A restart does not heal it —
+    /// `docs/plans/phase-4.md` §6 race 3 tombstones a record whose peer list does not name this
+    /// store, and this record still names it, because it is the record from before the change.
+    ///
+    /// # Why the placement driver is asked, and why its answer is safe to delete data on
+    ///
+    /// PD holds the routing table (`docs/DESIGN.md` §7) and learns a region's membership from its
+    /// **leader's** region heartbeats. So an answer that names a newer `conf_ver` than this store
+    /// holds is an applied membership from a peer that is in the group this store thinks it is in.
+    /// Three conditions together, and all three are needed:
+    ///
+    /// * the answer is about the **same region** — a different id means the range moved under a
+    ///   split or a merge, which is a different question and not this one's to act on;
+    /// * its `conf_ver` is **strictly greater** than the one here, so it describes a change this
+    ///   store has not applied rather than the state it already knows; and
+    /// * it names **no peer on this store**.
+    ///
+    /// Every other answer, and every failure to get one, leaves the region alone. That is the
+    /// fail-closed direction: a store that keeps a region it has been removed from wastes disk
+    /// and campaigns, and a store that drops one it still holds loses acknowledged writes.
+    ///
+    /// # The trigger is a throttle, not a safety bound
+    ///
+    /// Only a region whose peer has had **no leader** for [`ORPHAN_PROBE_ROUNDS`] consecutive
+    /// rounds is asked about, and the counter resets when it is. Being leaderless is what a
+    /// removed peer is permanently and what an ordinary election is for a moment, so the count
+    /// keeps the question rare rather than making it correct — a probe during a real election is
+    /// answered "you are still a member" and costs one round trip. Safety is entirely in the
+    /// three conditions above.
+    async fn sweep_orphaned_regions(
+        self: &Arc<Self>,
+        leaderless: &mut std::collections::BTreeMap<u64, u32>,
+    ) {
+        let Some(pd) = self.pd.clone() else {
+            return;
+        };
+        let hosted = self.regions.regions();
+        leaderless.retain(|region_id, _| hosted.iter().any(|region| region.id == *region_id));
+
+        for region in hosted {
+            let Some(peer) = self.peer_of(region.id) else {
+                continue;
+            };
+            if peer.leader().is_some() {
+                leaderless.remove(&region.id);
+                continue;
+            }
+            let rounds = leaderless.entry(region.id).or_default();
+            *rounds += 1;
+            if *rounds < ORPHAN_PROBE_ROUNDS {
+                continue;
+            }
+            *rounds = 0;
+
+            let pd = Arc::clone(&pd);
+            let start_key = region.start_key.clone();
+            let Ok(Ok(Some(route))) =
+                tokio::task::spawn_blocking(move || pd.get_region(&start_key)).await
+            else {
+                // Unreachable, or PD has never heard of the range. Neither is evidence of a
+                // removal, and this runs again next round.
+                continue;
+            };
+            if route.region.id != region.id
+                || route.region.epoch.conf_ver <= region.epoch.conf_ver
+                || route
+                    .region
+                    .peers
+                    .iter()
+                    .any(|peer| peer.store_id == self.store_id)
+            {
+                continue;
+            }
+            tracing::info!(
+                region_id = region.id,
+                ours = ?region.epoch,
+                theirs = ?route.region.epoch,
+                "the placement driver holds a newer membership for a region this store hosts, \
+                 and it does not name this store; retiring it"
+            );
+            self.retire_region(region.id, Some(route.region));
+        }
     }
 
     /// Promotes every learner that has caught up, in the regions this store leads.
@@ -2693,7 +2912,9 @@ impl RegionHost for StoreHost {
         };
         store.regions.replace(region.clone())?;
         if removed_self {
-            store.retire_region(region.id);
+            // No newer record to pass: this peer applied the change itself, so the record the map
+            // now holds is the post-change one.
+            store.retire_region(region.id, None);
         }
         Ok(())
     }
