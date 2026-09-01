@@ -1,0 +1,27 @@
+crates/esker-sql/tests/activerecord_surface.rs
+  s_0100922e76a475::t_31686c1ddde2a5 1-106
+crates/esker-sql/tests/corpus/activerecord_8_1_statements.txt
+  s_0100922e76a475::t_415f3383dae239 1-56
+crates/esker-sql/tests/joint_gate.rs
+  s_0100922e76a475::t_902ec4657f794e 478-488,501-508,553,555,696-739
+crates/esker-sql/tests/parity_harness/mod.rs
+  s_0100922e76a475::t_d69de9d48b1eee 344,355
+docs/plans/phase-9-rails.md
+  s_0100922e76a475::t_35e75a18a5e398 3,283-284,286-350,445-446,450,460-461
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "b8d90e743fe84af5921fc2d062054e1056a9cb96",
+  "prompts": {},
+  "sessions": {
+    "s_0100922e76a475": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9838aaeb-6dbb-4538-8e1f-1c9ba03c938b",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
