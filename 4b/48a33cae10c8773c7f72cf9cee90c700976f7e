@@ -1,0 +1,19 @@
+crates/esker-cli/tests/cluster_start.rs
+  s_094241f844188c::t_b311f3c658249d 30-41,94-96,147-149
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "4b48a33cae10c8773c7f72cf9cee90c700976f7e",
+  "prompts": {},
+  "sessions": {
+    "s_094241f844188c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "54200bf0-3107-4c35-8bbd-bea1cd1c7064",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
