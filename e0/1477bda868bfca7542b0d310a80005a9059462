@@ -1,0 +1,32 @@
+Cargo.lock
+  h_44076b318daf9c 462
+crates/esker-sql/Cargo.toml
+  h_44076b318daf9c 43-47
+crates/esker-sql/tests/joint_gate.rs
+  h_44076b318daf9c 41-47,144,180-181,276-279,283,301-420,558,560-564,566-570,572-573,575,581-583,587-594,596,601-612,615-664,666,669-670,672-682,684-690,692-718
+crates/esker-store/src/columnar/mod.rs
+  h_44076b318daf9c 38,40
+crates/esker-store/src/columnar/region.rs
+  h_44076b318daf9c 1-474
+crates/esker-store/src/columnar/wire.rs
+  h_44076b318daf9c 1-139
+crates/esker-store/src/peer.rs
+  h_44076b318daf9c 274-280,393-394,666-669,690-709,741-755,783-822,1230-1263,1317,1661,2113,2196,2263
+crates/esker-store/src/server.rs
+  h_44076b318daf9c 37-38,259-295,387-388,392-393,452-454,509,766,1796-1805,1808,1810-1811,1814-1939,2494-2499,2508,2559,2568-2646,2745-2750,2754
+crates/esker-store/tests/columnar_region.rs
+  h_44076b318daf9c 1-279
+crates/esker-store/tests/restart.rs
+  h_44076b318daf9c 94
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "e01477bda868bfca7542b0d310a80005a9059462",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
