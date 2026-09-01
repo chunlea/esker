@@ -1,0 +1,22 @@
+crates/esker-sql/src/bin/esker-sql.rs
+  h_44076b318daf9c 21,32-33,38-42,98-105,108-109,111-112,141-145,200,205-213,215-216,244
+crates/esker-sql/src/exec/ddl.rs
+  h_44076b318daf9c 443-447
+crates/esker-sql/src/exec/mod.rs
+  h_44076b318daf9c 54-59,93-100,135-185,230-234,245-247,886,890-895,905
+crates/esker-sql/src/pd.rs
+  h_44076b318daf9c 18,32-33,40,44-45,286-343,348-349,353,356-360,363-381,385,389-418
+crates/esker-sql/tests/pd_wiring.rs
+  h_44076b318daf9c 25,28-29,37,47-49,53-60,69-70,163-293
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "c11c660731c7a2b329a145d48b32d5e818544305",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
