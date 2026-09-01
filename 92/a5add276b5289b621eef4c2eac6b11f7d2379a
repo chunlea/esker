@@ -1,0 +1,27 @@
+crates/esker-store/src/server.rs
+  s_e2fd0c54b9d574::t_52725f443c5a4d 55-61,708-709,711,714-755,775,779-786,789-798,802-853,923-927,956-958,965-1063,2915-2917
+crates/esker-store/src/snapshot.rs
+  s_e2fd0c54b9d574::t_7b01257ee4ddf0 415-447
+crates/esker-store/tests/retire.rs
+  s_e2fd0c54b9d574::t_f71d4d018c004e 1-414
+docs/adr/0034-a-removed-peer-is-swept-and-its-range-reclaimed.md
+  s_e2fd0c54b9d574::t_c868a913490120 1-131
+docs/plans/debt-c3.md
+  s_e2fd0c54b9d574::t_59d8bdd66d146c 1-108
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "92a5add276b5289b621eef4c2eac6b11f7d2379a",
+  "prompts": {},
+  "sessions": {
+    "s_e2fd0c54b9d574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "671f3143-5435-4676-97d9-490a56835160",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
