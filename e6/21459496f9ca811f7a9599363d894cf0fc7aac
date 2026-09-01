@@ -1,0 +1,23 @@
+crates/esker-store/src/snapshot.rs
+  s_094241f844188c::t_863e8ca1bae59f 519-530,585,759-855
+crates/esker-store/tests/snapshot.rs
+  s_094241f844188c::t_1b3b64ab051435 665-795
+docs/adr/0032-a-snapshot-carries-every-column-family.md
+  s_094241f844188c::t_0743b4585db493 61-119,124-127
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "e621459496f9ca811f7a9599363d894cf0fc7aac",
+  "prompts": {},
+  "sessions": {
+    "s_094241f844188c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "54200bf0-3107-4c35-8bbd-bea1cd1c7064",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
