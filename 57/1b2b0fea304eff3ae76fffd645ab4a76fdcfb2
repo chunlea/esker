@@ -1,0 +1,19 @@
+crates/esker-pd/src/balance.rs
+  s_0100922e76a475::t_05d5b6823bac03 162-182,186,236,241-248
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "571b2b0fea304eff3ae76fffd645ab4a76fdcfb2",
+  "prompts": {},
+  "sessions": {
+    "s_0100922e76a475": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9838aaeb-6dbb-4538-8e1f-1c9ba03c938b",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
