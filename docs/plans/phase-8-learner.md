@@ -422,3 +422,64 @@ The learner's decoder is therefore `cl-c1`'s seam and not a field of mine. The t
 travel as data; the *codec* that walks a row's bytes cannot, and something below `esker-sql` has to
 own it. That is an ADR-level question crossing both halves — recorded here as **OPEN**, and put to
 the coordinator rather than settled between two lanes mid-flight.
+
+---
+
+# §wire — handover state (lane wy-c2, end of wave A)
+
+## THE ONE GAP: nothing calls `Pd::ReportColumnar` yet
+
+The wire method, PD's durable record and the scheduling are all in and tested. **The caller is
+not.** `esker-sql`'s `ALTER TABLE ... SET (columnar_replicas = N)` writes the catalog record and
+does *not* report to PD, and the lease refresh does not re-assert. So today the flag is durable and
+readable and PD never hears about it, which means no columnar learner is ever placed on a real
+cluster.
+
+What a fresh lane needs to add, both in `esker-sql`:
+
+1. After the `ALTER` commits, scan `catalog::columnar_range(tenant)`, build one
+   `esker_proto::pd::ColumnarWish` per table from `esker_keys::row::table_row_range(tenant, id)`
+   and the replica count, and send `PdReq::ReportColumnar { wishes }`. It is a **full assertion**,
+   so the scan is the message — do not send a delta.
+2. Re-send the same on every schema-lease refresh, which is the anti-entropy sweep the design
+   assumes. A report lost to a PD restart is repaired by the next one and there is no
+   acknowledgement protocol precisely because of this.
+
+The SQL node has no `PdClient` today — `esker-sql`'s binary takes store addresses, not PD's
+(`connect`'s `TODO(phase-6a)`), which is the same reason the schema lease is unattached and the
+re-driver ships inert. So this is one piece of work with the lease's, not two.
+
+## What is done, with the numbers
+
+* `Pd::ReportColumnar` (0x0308), goldens for request and response; `ColumnarWish` carries
+  `(start_key, end_key, replicas)`.
+* PD's `ColumnarRecord`, persisted under `'m' 'l'`, golden-pinned, loaded at open.
+  `wanted_for(start, end)` takes the **maximum** over overlapping wishes.
+* Scheduling in `pd::repair::plan`, between repair and balance; `schedule::columnar_for`.
+* `Operator::AddLearner` (kind 4) + `EventKind::AddLearner`; `PeerRole::ColumnarLearner = 3`.
+* Six tests in `crates/esker-pd/tests/columnar.rs`. Balance is **off** in that harness on purpose.
+
+## Two masking bugs found, both the same shape
+
+Both counted non-voters towards a voter target, and both read *healthy* on a cluster that was not.
+Worth stating together because a third of the same family is plausible wherever a count is taken
+over `peers` rather than over voters:
+
+* `schedule::urgency_for` counted all live peers against `target_replicas`.
+* `schedule::repair_for` counted a columnar learner as "a replacement already on its way", which it
+  never is — it is never promoted.
+
+## Leads left for somebody else, with evidence
+
+* **`WalSyncMode::Never` may not be disabling what it names.** `docs/bench/columnar-learner.md`:
+  2075 of 2114 sampled stacks in `DbInner::commit_group`, ~4.8 ms per single-row put, one writer,
+  no contention — with sync **disabled**. So whatever it waits on is not an fsync. Recorded as a
+  lead rather than a shrug; neither this lane nor `cl-c1` owns `esker-engine`.
+* **Row format v3 (column identity) is what `DROP COLUMN` needs** — ADR 0019 Decision 3. When it
+  lands, v2 rows still exist in a table that then takes a drop, and those are exactly the rows
+  Decision 3 says cannot be read: v3 either rewrites surviving v2 rows or refuses a drop on a table
+  that still has them. The columnar copy inherits whichever it is.
+* **`esker_columnar::Value` and `esker_keys::value::Datum` are now the same six shapes with the
+  same tag bytes**, defined twice. ADR 0030 makes converging them possible and deliberately does
+  not do it.
+
