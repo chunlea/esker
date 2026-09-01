@@ -885,3 +885,30 @@ that is right, and a caller that never uses it. The test now takes its widening 
 * **The `receive_raft` ask still races the conf change.** It costs a retry and heals, and it is now
   the only part of the original blocker that is left. Worth fixing when someone is in `server.rs`
   with a reason: the sender could check the *core's* membership rather than the applied record.
+
+## One observation this lane could not reproduce, recorded rather than dropped
+
+The differential's own assertion failed **once**:
+
+```text
+thread 'the_learner_answers_fragments_that_agree_with_a_row_scan' panicked at
+crates/esker-sql/tests/joint_gate.rs:729:5
+```
+
+Line 729 is `assert_eq!(columns, rows, "the columnar copy and the row store disagree at ts {ts}")`
+— the two engines, not the reference. It happened on the first run after the gate's oracle changed
+from `CountingOracle` to a physical-millisecond one, and **fourteen runs since have been clean**:
+eight of that test alone and six of the whole file in parallel. The assertion's output was lost to
+a `grep` in the command that ran it, so what differed is not known.
+
+Two candidates, and no evidence separating them. Either it is a pre-existing race the counting
+oracle's small timestamps happened to hide, or the physical oracle introduced it — a real TTL means
+a lock **can** now be judged dead, so a transaction slow between prewrite and commit can have its
+locks resolved underneath it, which the counting oracle made impossible. The second is the one to
+look at first, because it is new.
+
+What to do with a recurrence rather than what to conclude from a silence: run the file with
+`--nocapture` and keep the whole failure, because `assert_eq!` prints both vectors and the
+difference names the mechanism — a row missing entirely is a catch-up or a seal, a row with the
+wrong `region` value is the widening, and a row visible on one side only is MVCC resolution. It is
+worth a deliberate soak before wave B builds on the fragment path.
