@@ -1,0 +1,16 @@
+crates/esker-sql/Cargo.toml
+  h_44076b318daf9c 35-42
+crates/esker-sql/tests/joint_gate.rs
+  h_44076b318daf9c 1-577
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "ea9d38adaab30cbc97a2b5ca27b9c634e37cd00d",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
