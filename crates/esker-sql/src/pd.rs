@@ -15,8 +15,7 @@
 //! * the **re-driver's interval**, which is the same PD answer's second number
 //!   ([`crate::exec::redrive`]);
 //! * **`ReportColumnar`** (ADR 0022 Decision 5), so that `ALTER TABLE ... SET (columnar_replicas
-//!   = N)` becomes placement rather than a durable record nobody reads. The method is here; its
-//!   callers are the next unit's.
+//!   = N)` becomes placement rather than a durable record nobody reads.
 //!
 //! # Blocking, on purpose
 //!
@@ -30,18 +29,20 @@
 //!
 //! A failed call drops the connection; the next one builds a new connection. There is no backoff
 //! loop because the caller's own cadence *is* the backoff, and no acknowledgement protocol for a
-//! report because a report is a **full assertion**: whatever is lost is repaired by the next one,
-//! which re-sends the whole set (ADR 0022 Decision 5).
+//! report because [`columnar_wishes`] is a **full assertion**: whatever is lost is repaired by the
+//! next refresh, which re-sends the whole set (ADR 0022 Decision 5).
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use esker_proto::pd::ColumnarWish;
 use esker_proto::{BlockingTransport, PdReq, PdResp, ProtoError, TransportConfig};
 
-use crate::backend::{SchemaLease, StepInterval};
+use crate::backend::{Backend, SchemaLease, StepInterval};
+use crate::exec::for_each_page;
 
 /// A connection to the placement driver, held by one SQL node.
 ///
@@ -282,25 +283,137 @@ impl SchemaLease for PdLease {
     }
 }
 
-/// The thread that renews this node's lease.
+/// Where this node's columnar wishes go.
+///
+/// A trait so that the executor holds a *sink* rather than a socket: the report is a full
+/// assertion sent after a commit, and what it is sent over is not the executor's business.
+/// [`PdConn`] is the implementation the binary attaches.
+pub trait ColumnarReport: std::fmt::Debug + Send + Sync {
+    /// Asserts the whole set of ranges that want columnar replicas.
+    fn report(&self, wishes: Vec<ColumnarWish>) -> Result<(), ProtoError>;
+}
+
+impl ColumnarReport for PdConn {
+    fn report(&self, wishes: Vec<ColumnarWish>) -> Result<(), ProtoError> {
+        self.report_columnar(wishes)
+    }
+}
+
+/// Every range that wants columnar replicas, read from the catalog.
+///
+/// **The scan is the message.** A report is a full assertion, so this is what is sent — never a
+/// delta of what one `ALTER` changed. A table set to `0` is *absent* rather than present with a
+/// zero, which is how a cleared flag travels and why removal needs no message of its own.
+///
+/// Ranges rather than table ids, because a range is PD's own vocabulary: it acts on this without
+/// learning that a table exists (`CLAUDE.md` invariant 7), and a table that later splits into four
+/// regions is still one range that every overlapping region inherits.
+pub fn columnar_wishes(
+    backend: &dyn Backend,
+    tenant: u64,
+) -> crate::error::Result<Vec<ColumnarWish>> {
+    let mut txn = backend.begin()?;
+    let (start, end) = crate::catalog::columnar_range(tenant);
+    let mut wishes = Vec::new();
+    let walked = for_each_page(&mut *txn, &start, &end, |_, page| {
+        for (key, value) in page {
+            let (table_id, replicas) = crate::catalog::decode_columnar(tenant, key, value)?;
+            if replicas == 0 {
+                continue;
+            }
+            let (start_key, end_key) = esker_keys::row::table_row_range(tenant, table_id);
+            wishes.push(ColumnarWish {
+                start_key: Bytes::from(start_key),
+                end_key: Bytes::from(end_key),
+                replicas,
+            });
+        }
+        Ok(())
+    });
+    // A read, so there is nothing to commit and nothing to lose by rolling back.
+    let _ = txn.rollback();
+    walked?;
+    Ok(wishes)
+}
+
+/// The thread that renews this node's lease, and re-asserts its columnar wishes.
+///
+/// One thread doing both, because they are one PD answer's worth of work: the lease is what says
+/// when to come back, and the re-assertion is the anti-entropy sweep that ADR 0022 Decision 5
+/// relies on instead of an acknowledgement protocol.
 #[derive(Debug)]
 pub struct LeaseRefresher {
     conn: Arc<PdConn>,
     lease: Arc<PdLease>,
+    /// What to read the wishes from, or `None` for a refresher that only renews.
+    wishes: Option<(Arc<dyn Backend>, u64)>,
 }
 
 impl LeaseRefresher {
-    /// A refresher for `lease`.
+    /// A refresher for `lease`, which renews and nothing else.
     #[must_use]
     pub fn new(conn: Arc<PdConn>, lease: Arc<PdLease>) -> Self {
-        Self { conn, lease }
+        Self {
+            conn,
+            lease,
+            wishes: None,
+        }
     }
 
-    /// One round: renew the lease.
+    /// The same refresher, re-asserting `tenant`'s columnar wishes on every round.
+    ///
+    /// The binary always attaches this; a test that is only about the lease does not have to.
+    #[must_use]
+    pub fn asserting_columnar_for(mut self, backend: Arc<dyn Backend>, tenant: u64) -> Self {
+        self.wishes = Some((backend, tenant));
+        self
+    }
+
+    /// One round: renew the lease, then re-assert the wishes.
+    ///
+    /// The lease first, because it is the half that must not be late — a report that misses a
+    /// round is repaired by the next one, and a lease that misses enough of them stops this node
+    /// writing.
+    ///
+    /// # Errors
+    ///
+    /// The renewal's failure. A **report** that fails is logged and not returned: the lease is
+    /// still good, so this node keeps writing, and PD hears the same content on the next round.
     pub fn refresh(&self) -> Result<Lease, ProtoError> {
         let lease = self.conn.schema_lease()?;
         self.lease.record(lease);
+        self.assert_wishes();
         Ok(lease)
+    }
+
+    /// Sends the whole set, or logs why it could not read it.
+    ///
+    /// **A failed read sends nothing**, which is the one thing that must not go wrong here: an
+    /// empty report is a valid assertion meaning "no table wants a columnar copy", so a node that
+    /// reported `[]` because its own store was unreachable would retire every learner in the
+    /// cluster.
+    fn assert_wishes(&self) {
+        let Some((backend, tenant)) = &self.wishes else {
+            return;
+        };
+        match columnar_wishes(&**backend, *tenant) {
+            Ok(wishes) => {
+                let ranges = wishes.len();
+                if let Err(error) = self.conn.report_columnar(wishes) {
+                    tracing::warn!(
+                        %error,
+                        "could not report columnar placement; the next refresh re-asserts it"
+                    );
+                } else {
+                    tracing::debug!(ranges, "asserted columnar placement");
+                }
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                "could not read this tenant's columnar settings; reporting nothing rather than \
+                 asserting an empty set"
+            ),
+        }
     }
 
     /// Renews for as long as this node runs.

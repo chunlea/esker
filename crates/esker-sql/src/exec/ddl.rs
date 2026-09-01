@@ -440,6 +440,11 @@ pub(super) fn alter_table(
                         catalog::clear_table_columnar_replicas(txn, executor.tenant, table.id);
                     }
                 }
+                // PD acts on this and **cannot read it**: the setting is in the cluster's own key
+                // space and PD links neither this crate nor a client (ADR 0022 Decision 5). So the
+                // node that ran the `ALTER` tells it — after the commit, from the executor, as a
+                // full assertion of every wish rather than this one's delta.
+                executor.columnar_changed();
                 continue;
             }
             let AlterTableAction::SetRetention { retention_ms } = action else {

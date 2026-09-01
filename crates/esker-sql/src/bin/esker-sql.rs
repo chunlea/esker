@@ -18,7 +18,7 @@ use esker_sql::backend::{Backend, MemoryBackend, StoreBackend};
 use esker_sql::catalog::Catalog;
 use esker_sql::exec::Executor;
 use esker_sql::exec::redrive::ReDriver;
-use esker_sql::pd::{LeaseRefresher, PdConn, PdLease};
+use esker_sql::pd::{ColumnarReport, LeaseRefresher, PdConn, PdLease};
 use esker_sql::pgwire::server::{Auth, Config, Executors, serve};
 use esker_sql::pgwire::session::Execute;
 
@@ -29,15 +29,17 @@ const TENANT: u64 = 1;
 struct Sessions {
     backend: Arc<dyn Backend>,
     catalog: Arc<Catalog>,
+    /// Where an `ALTER ... SET (columnar_replicas = N)` reports to, on a node that has a PD.
+    columnar: Option<Arc<dyn ColumnarReport>>,
 }
 
 impl Executors for Sessions {
     fn for_session(&self) -> Box<dyn Execute + Send> {
-        Box::new(Executor::new(
-            Arc::clone(&self.backend),
-            Arc::clone(&self.catalog),
-            TENANT,
-        ))
+        let executor = Executor::new(Arc::clone(&self.backend), Arc::clone(&self.catalog), TENANT);
+        Box::new(match &self.columnar {
+            Some(report) => executor.reporting_columnar_to(Arc::clone(report)),
+            None => executor,
+        })
     }
 }
 
@@ -93,17 +95,21 @@ async fn main() -> std::io::Result<()> {
     };
     let catalog = Arc::new(Catalog::new());
 
-    // The one cable. With it, two things that ship inert come alive: the lease arms fail-closed,
-    // and the re-driver below is given PD's interval (`docs/plans/phase-8-learner.md` §wiring).
-    // `zip` because the two are built together: a lease with no address to renew it at, or an
-    // address with no lease to fill in, would both be this function having gone wrong.
-    if let Some((address, lease)) = pd.zip(lease) {
-        attach_pd(address, lease).await?;
+    // The one cable. With it, three things that ship inert come alive: the lease arms fail-closed,
+    // the re-driver below is given PD's interval, and `ALTER ... SET (columnar_replicas = N)`
+    // becomes placement rather than a durable record nobody reads
+    // (`docs/plans/phase-8-learner.md` §wiring). `zip` because the two are built together: a lease
+    // with no address to renew it at, or an address with no lease to fill in, would both be this
+    // function having gone wrong.
+    let columnar: Option<Arc<dyn ColumnarReport>> = if let Some((address, lease)) = pd.zip(lease) {
+        Some(attach_pd(address, lease, &backend).await?)
     } else {
         tracing::info!(
-            "no placement driver given: writes are unrestricted and no schema lease is held"
+            "no placement driver given: writes are unrestricted, no schema lease is held, and \
+             columnar placement is not reported"
         );
-    }
+        None
+    };
 
     // Every node runs a re-driver, so a schema change whose node died is finished by whichever
     // node notices rather than by a human calling `esker_schema_step` (ADR 0020 as amended,
@@ -132,7 +138,11 @@ async fn main() -> std::io::Result<()> {
         .name("schema-redriver".to_owned())
         .spawn(move || redriver.run())?;
 
-    let sessions = Sessions { backend, catalog };
+    let sessions = Sessions {
+        backend,
+        catalog,
+        columnar,
+    };
     serve(config, Arc::new(sessions)).await
 }
 
@@ -187,14 +197,23 @@ impl Args {
     }
 }
 
-/// Fetches the first lease and starts the refresher thread.
+/// Fetches the first lease, starts the refresher thread, and hands back the report sink.
 ///
 /// **The lease is fetched before this node serves anything.** A node that cannot reach PD at
 /// startup does not come up holding a lease it never had; it fails, the way a store that cannot
 /// reach PD fails to open (`esker_store::RemotePd`).
-async fn attach_pd(address: std::net::SocketAddr, lease: Arc<PdLease>) -> std::io::Result<()> {
+///
+/// That first round also sends the first columnar report, which is what repairs a placement
+/// driver that restarted while this node was up: the assertion is the whole set, so a node
+/// starting is a node saying everything it knows.
+async fn attach_pd(
+    address: std::net::SocketAddr,
+    lease: Arc<PdLease>,
+    backend: &Arc<dyn Backend>,
+) -> std::io::Result<Arc<dyn ColumnarReport>> {
     let conn = Arc::new(PdConn::new(address));
-    let refresher = LeaseRefresher::new(conn, lease);
+    let refresher = LeaseRefresher::new(Arc::clone(&conn), lease)
+        .asserting_columnar_for(Arc::clone(backend), TENANT);
     // Onto a blocking thread and back, because this function is inside `#[tokio::main]`'s
     // `block_on`: a synchronous client refuses a thread that is *driving* a runtime, and
     // `spawn_blocking` is the seam for exactly that — the same one every statement takes
@@ -222,7 +241,7 @@ async fn attach_pd(address: std::net::SocketAddr, lease: Arc<PdLease>) -> std::i
     std::thread::Builder::new()
         .name("schema-lease".to_owned())
         .spawn(move || refresher.run())?;
-    Ok(())
+    Ok(conn)
 }
 
 /// Builds a client over the given stores, with routing that asks them where the regions are.

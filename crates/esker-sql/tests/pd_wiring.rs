@@ -22,9 +22,11 @@ mod standin_pd;
 use std::sync::Arc;
 use std::time::Duration;
 
+use esker_proto::pd::ColumnarWish;
 use esker_sql::backend::{Backend, SchemaLease as SchemaLeaseSource, StepInterval};
 use esker_sql::exec::Executor;
-use esker_sql::pd::{LeaseRefresher, PdConn, PdLease};
+use esker_sql::pd::{ColumnarReport, LeaseRefresher, PdConn, PdLease};
+use esker_sql::pgwire::session::Execute;
 
 use cluster::{Session, TENANT};
 use standin_pd::{REMOVAL_EXTRA_MS, STEP_MS};
@@ -32,6 +34,7 @@ use standin_pd::{REMOVAL_EXTRA_MS, STEP_MS};
 /// The whole node, as the binary builds it: a lease, a backend holding it, and a refresher.
 struct Node {
     backend: Arc<dyn Backend>,
+    conn: Arc<PdConn>,
     lease: Arc<PdLease>,
 }
 
@@ -41,11 +44,20 @@ impl Node {
     fn start(cluster: &cluster::Cluster, address: std::net::SocketAddr) -> (Self, LeaseRefresher) {
         let lease = Arc::new(PdLease::new());
         let backend = cluster.backend_holding(Arc::clone(&lease) as Arc<dyn SchemaLeaseSource>);
-        let refresher = LeaseRefresher::new(Arc::new(PdConn::new(address)), Arc::clone(&lease));
+        let conn = Arc::new(PdConn::new(address));
+        let refresher = LeaseRefresher::new(Arc::clone(&conn), Arc::clone(&lease))
+            .asserting_columnar_for(Arc::clone(&backend), TENANT);
         refresher
             .refresh()
             .expect("a node fetches its lease before it serves");
-        (Node { backend, lease }, refresher)
+        (
+            Node {
+                backend,
+                conn,
+                lease,
+            },
+            refresher,
+        )
     }
 
     fn session(&self, cluster: &cluster::Cluster) -> Session {
@@ -54,7 +66,8 @@ impl Node {
                 Arc::clone(&self.backend),
                 Arc::clone(&cluster.catalog),
                 TENANT,
-            ),
+            )
+            .reporting_columnar_to(Arc::clone(&self.conn) as Arc<dyn ColumnarReport>),
         }
     }
 }
@@ -146,4 +159,135 @@ async fn a_lapsed_lease_refuses_writes_and_still_serves_reads() {
     });
 
     drop(cluster);
+}
+
+/// `ALTER TABLE ... SET (columnar_replicas = N)` reaches PD, and what reaches it is the whole set.
+///
+/// ADR 0022 Decision 5: PD acts on the flag and cannot read it, so the node that ran the `ALTER`
+/// reports — as **key ranges**, which is PD's own vocabulary, and as a full assertion rather than
+/// a delta, which is what makes a lost report cost nothing and a cleared flag need no message of
+/// its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_alter_reports_every_range_that_wants_columnar_replicas() {
+    let (pd, pd_handle, address) = standin_pd::serve().await;
+    let cluster = cluster::Cluster::start_on_this_runtime().await;
+    let (node, refresher) = tokio::task::block_in_place(|| Node::start(&cluster, address));
+
+    // The startup report: this node asserted an empty set, because nothing wants a copy yet.
+    assert_eq!(
+        pd.reports(),
+        vec![Vec::new()],
+        "a node asserts on startup, which is what repairs a PD that restarted",
+    );
+
+    let (_first, second) = tokio::task::block_in_place(|| {
+        let mut session = node.session(&cluster);
+        session
+            .run("CREATE TABLE t (id int8 PRIMARY KEY, name text)")
+            .unwrap();
+        session
+            .run("CREATE TABLE u (id int8 PRIMARY KEY, name text)")
+            .unwrap();
+        assert_eq!(
+            pd.reports().len(),
+            1,
+            "a CREATE TABLE says nothing about columnar placement",
+        );
+
+        session
+            .run("ALTER TABLE t SET (columnar_replicas = 2)")
+            .unwrap();
+        let first = table_range(&node, &cluster, "t");
+        assert_eq!(
+            pd.last_report().unwrap(),
+            vec![wish(&first, 2)],
+            "the ALTER reported the table's row range and its count",
+        );
+
+        // A second table, and the report carries **both**: the scan is the message.
+        session
+            .run("ALTER TABLE u SET (columnar_replicas = 1)")
+            .unwrap();
+        let second = table_range(&node, &cluster, "u");
+        assert_eq!(
+            pd.last_report().unwrap(),
+            vec![wish(&first, 2), wish(&second, 1)],
+            "a report is the whole catalog, never the delta of one ALTER",
+        );
+        (first, second)
+    });
+
+    tokio::task::block_in_place(|| {
+        let mut session = node.session(&cluster);
+        // Zero is removal, and it arrives as an absence rather than as a zero.
+        session
+            .run("ALTER TABLE t SET (columnar_replicas = 0)")
+            .unwrap();
+        assert_eq!(
+            pd.last_report().unwrap(),
+            vec![wish(&second, 1)],
+            "a table set to zero is absent from the assertion, which is how removal travels",
+        );
+        assert!(
+            pd.last_report()
+                .unwrap()
+                .iter()
+                .all(|wish| wish.replicas != 0),
+            "a wish never carries a zero",
+        );
+
+        // A rolled-back ALTER reports nothing: what is asserted is what the cluster can read.
+        session.executor.begin(false).unwrap();
+        session
+            .run("ALTER TABLE u SET (columnar_replicas = 3)")
+            .unwrap();
+        session.executor.rollback().unwrap();
+        assert_eq!(
+            pd.last_report().unwrap(),
+            vec![wish(&second, 1)],
+            "an ALTER that was rolled back was never true, so it is never reported",
+        );
+
+        // And the same one inside a block that commits does report, at the commit.
+        session.executor.begin(false).unwrap();
+        session
+            .run("ALTER TABLE u SET (columnar_replicas = 3)")
+            .unwrap();
+        let before = pd.reports().len();
+        session.executor.commit().unwrap();
+        assert_eq!(pd.reports().len(), before + 1, "the block's commit reports");
+        assert_eq!(pd.last_report().unwrap(), vec![wish(&second, 3)]);
+    });
+
+    // The anti-entropy sweep: a refresh re-asserts the same content, which is why there is no
+    // acknowledgement protocol and no retry queue.
+    let before = pd.reports().len();
+    tokio::task::block_in_place(|| refresher.refresh().unwrap());
+    assert_eq!(pd.reports().len(), before + 1);
+    assert_eq!(
+        pd.last_report().unwrap(),
+        vec![wish(&second, 3)],
+        "every refresh re-asserts the whole set",
+    );
+
+    pd_handle.shutdown().await.unwrap();
+    drop(cluster);
+}
+
+/// The row range of a table, which is what a wish names.
+fn table_range(node: &Node, cluster: &cluster::Cluster, name: &str) -> (Vec<u8>, Vec<u8>) {
+    let txn = node.backend.begin().unwrap();
+    let view = cluster.catalog.view(&*txn, TENANT).unwrap();
+    let table = view.table(name).unwrap().unwrap();
+    let range = esker_keys::row::table_row_range(TENANT, table.id);
+    let _ = txn.rollback();
+    range
+}
+
+fn wish(range: &(Vec<u8>, Vec<u8>), replicas: u8) -> ColumnarWish {
+    ColumnarWish {
+        start_key: bytes::Bytes::from(range.0.clone()),
+        end_key: bytes::Bytes::from(range.1.clone()),
+        replicas,
+    }
 }

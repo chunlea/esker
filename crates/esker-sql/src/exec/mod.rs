@@ -51,6 +51,12 @@ use crate::value::{PgDatum, PgType};
 
 /// Runs statements for one connection.
 #[derive(Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each is an independent fact about the open transaction — has it written the \
+              catalog, has it run a statement, was it opened read-only, did it change a columnar \
+              setting — and a flags struct or a bitfield would hide what each one means"
+)]
 pub struct Executor {
     backend: Arc<dyn Backend>,
     catalog: Arc<Catalog>,
@@ -84,6 +90,14 @@ pub struct Executor {
     /// Separate from the transaction's own read-only-ness, which comes from reading the past: a
     /// block may be read-only because the user asked, because the snapshot is historical, or both.
     block_read_only: bool,
+    /// Where columnar placement is reported, on a node that has a placement driver.
+    columnar: Option<Arc<dyn crate::pd::ColumnarReport>>,
+    /// Whether the open transaction has changed a table's columnar setting.
+    ///
+    /// Set by the `ALTER` and acted on **after the commit**, because what is reported is what the
+    /// cluster can now read: a report sent from inside the transaction would name a wish that a
+    /// rollback could take back, and PD has no way to hear that it was taken back.
+    columnar_changed: bool,
 }
 
 /// What a session was told to read at, and what it was told in.
@@ -118,6 +132,57 @@ impl Executor {
             read_as_of: None,
             open_used: false,
             block_read_only: false,
+            columnar: None,
+            columnar_changed: false,
+        }
+    }
+
+    /// The same executor, reporting columnar placement to `report` after an `ALTER` commits.
+    ///
+    /// Without one an `ALTER ... SET (columnar_replicas = N)` still writes its durable catalog
+    /// record and simply tells nobody — which is a node with no placement driver, and is what
+    /// every test cluster in this crate is.
+    #[must_use]
+    pub fn reporting_columnar_to(mut self, report: Arc<dyn crate::pd::ColumnarReport>) -> Self {
+        self.columnar = Some(report);
+        self
+    }
+
+    /// Marks the open transaction as having changed a table's columnar setting.
+    pub(crate) fn columnar_changed(&mut self) {
+        self.columnar_changed = true;
+    }
+
+    /// Asserts this tenant's columnar wishes to PD, if the transaction that just committed
+    /// changed one.
+    ///
+    /// **The scan is the message** (ADR 0022 Decision 5): what is sent is the whole set read back
+    /// out of the catalog, never a delta of what this statement did, so a report is complete by
+    /// construction and a lost one costs nothing. Which is also why a failure here is a log line
+    /// and not the statement's error: the `ALTER` is committed and durable, and the lease
+    /// refresher re-asserts the same content on its next pass.
+    fn report_columnar(&mut self) {
+        if !std::mem::take(&mut self.columnar_changed) {
+            return;
+        }
+        let Some(report) = self.columnar.as_ref() else {
+            return;
+        };
+        match crate::pd::columnar_wishes(&*self.backend, self.tenant) {
+            Ok(wishes) => {
+                if let Err(error) = report.report(wishes) {
+                    tracing::warn!(
+                        %error,
+                        "could not report columnar placement to the placement driver; the next \
+                         lease refresh re-asserts it"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                "could not read this tenant's columnar settings after the ALTER committed; the \
+                 next lease refresh re-asserts them"
+            ),
         }
     }
 
@@ -162,7 +227,11 @@ impl Executor {
         };
         let outcome = match self.run_recording(&mut *txn, &bound, &mut written) {
             Ok(outcome) => match txn.commit() {
-                Ok(_) => Ok(outcome),
+                Ok(_) => {
+                    // After the commit, and only after it.
+                    self.report_columnar();
+                    Ok(outcome)
+                }
                 Err(error) => Err(self.explain_conflict(error, &written)),
             },
             Err(error) => {
@@ -173,6 +242,9 @@ impl Executor {
             }
         };
         self.catalog_written = false;
+        // A statement that did not commit changed nothing PD could act on, whether it was rolled
+        // back or refused.
+        self.columnar_changed = false;
         outcome
     }
 
@@ -811,10 +883,16 @@ impl Execute for Executor {
         self.catalog_written = false;
         self.end_of_block();
         let Some(txn) = self.open.take() else {
+            self.columnar_changed = false;
             return Ok(());
         };
         match txn.commit() {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                // The block's commit is where an `ALTER` inside one becomes visible, so it is
+                // where the report belongs.
+                self.report_columnar();
+                Ok(())
+            }
             // The same translation the autocommit path does. A block's commit is where a client
             // that wrote several rows finds out it lost, and it deserves the same answer.
             Err(error) => Err(self.explain_conflict(error, &written)),
@@ -824,6 +902,7 @@ impl Execute for Executor {
     fn rollback(&mut self) -> Result<()> {
         self.written = Written::default();
         self.catalog_written = false;
+        self.columnar_changed = false;
         self.end_of_block();
         let Some(txn) = self.open.take() else {
             return Ok(());
