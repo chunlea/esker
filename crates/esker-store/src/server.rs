@@ -2622,7 +2622,22 @@ fn evaluate(
         fragment,
         &ScanOptions {
             prune: true,
-            widening: None,
+            // **Every run read as the table is now**, which is what an `ADD COLUMN` needs and
+            // what this passed as `None` until the joint gate's widened corpus asked for it.
+            // Without it the target schema is `readers[0]`'s — the *oldest* run's — and the two
+            // ways that is wrong are the two halves of the same defect: a newer, wider run is
+            // refused outright ("written under a newer schema"), and if the widest run happened
+            // to sort first, the older ones would be padded with `NULL` where the row store pads
+            // with the column's `DEFAULT`. The first is loud; the second is the silent
+            // disagreement ADR 0022 calls the worst failure this feature can have.
+            //
+            // `esker-store`'s own `columnar_differential.rs` proved the mechanism by building
+            // this `Widening` **by hand in the test**, which is precisely how a module can be
+            // right while the path that uses it is not.
+            widening: Some(esker_columnar::Widening {
+                schema: runs.schema.clone(),
+                missing: runs.missing.clone(),
+            }),
             // MVCC at **read** time (ADR 0022 Decision 4): the runs hold every version as
             // committed, and which of them a caller may see is a property of when it is reading.
             visibility: Some(Visibility {

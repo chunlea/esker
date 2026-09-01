@@ -78,6 +78,11 @@ impl RowDecoder for Decoder {
         &self.schema
     }
 
+    /// A fixed two-column table: no column postdates a row, so nothing is padded.
+    fn missing(&self) -> Vec<Value> {
+        vec![Value::Null; self.schema.len()]
+    }
+
     fn decode(&self, key: &[u8], value: Option<&[u8]>) -> Result<Vec<Value>> {
         let mut id = [0u8; 8];
         id.copy_from_slice(&key[..8]);

@@ -174,6 +174,19 @@ fn sql_node(
     (backend, conn)
 }
 
+/// One decoded cell, on either side of the differential.
+///
+/// A shared shape rather than one per side: the comparison is only worth making if the two sides
+/// cannot disagree about how to *say* a value, only about what it is. A wire `Value` and a
+/// `Datum` are different types with the same three cases here, and flattening both into this is
+/// the only place the two vocabularies meet.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Cell {
+    Int8(i64),
+    Text(String),
+    Null,
+}
+
 /// The whole cluster: a placement driver, four stores, and one SQL node over them.
 struct Gate {
     pd: Arc<Pd>,
@@ -315,7 +328,7 @@ impl Gate {
         ts: u64,
         min_apply_index: u64,
         projection: Vec<u32>,
-    ) -> Vec<(i64, Option<String>)> {
+    ) -> Vec<Vec<Cell>> {
         let learner = self.learner_node();
         let region_id = learner.store.regions().find(b"t").unwrap().id();
         let answer = Self::ask(
@@ -334,12 +347,17 @@ impl Gate {
         else {
             panic!("a scan fragment came back as groups");
         };
-        let mut out: Vec<(i64, Option<String>)> = rows
+        let mut out: Vec<Vec<Cell>> = rows
             .iter()
-            .map(|row| match (&row[0], &row[1]) {
-                (WireValue::Int8(id), WireValue::Text(name)) => (*id, Some(name.clone())),
-                (WireValue::Int8(id), WireValue::Null) => (*id, None),
-                other => panic!("unexpected row {other:?}"),
+            .map(|row| {
+                row.iter()
+                    .map(|value| match value {
+                        WireValue::Int8(n) => Cell::Int8(*n),
+                        WireValue::Text(text) => Cell::Text(text.clone()),
+                        WireValue::Null => Cell::Null,
+                        other => panic!("unexpected column {other:?}"),
+                    })
+                    .collect()
             })
             .collect();
         out.sort();
@@ -352,7 +370,7 @@ impl Gate {
     /// resolves MVCC in Percolator's `write` records, and decodes with the row codec — sharing the
     /// *rule* with the columnar path and none of its code, which is what makes the comparison
     /// worth making (`docs/plans/phase-8-learner.md`, RULED-2).
-    fn row_scan(&self, ts: u64, table_id: u64) -> Vec<(i64, Option<String>)> {
+    fn row_scan(&self, ts: u64, table_id: u64, projection: &[u32]) -> Vec<Vec<Cell>> {
         let txn = self.backend.begin_at(ts).unwrap();
         let (start, end) = esker_keys::row::table_row_range(TENANT, table_id);
         let pairs = txn.scan(&start, &end, 1024).unwrap();
@@ -360,15 +378,23 @@ impl Gate {
             let view = self.catalog.view(&*txn, TENANT).unwrap();
             view.table("t").unwrap().unwrap().row_schema()
         };
-        let mut out: Vec<(i64, Option<String>)> = pairs
+        let mut out: Vec<Vec<Cell>> = pairs
             .iter()
             .map(|(_, value)| {
+                // The **row codec's** padding, which is the half of this differential that knows
+                // what a column added after a row was written should read as: `decode_row` fills
+                // a short row from the schema's missing values, so a row stored two columns wide
+                // comes back three wide with the `DEFAULT` in it.
                 let row = esker_sql::row::decode_row(&schema, value).unwrap();
-                match (&row[0], &row[1]) {
-                    (Datum::Int8(id), Datum::Text(name)) => (*id, Some(name.clone())),
-                    (Datum::Int8(id), Datum::Null) => (*id, None),
-                    other => panic!("unexpected row {other:?}"),
-                }
+                projection
+                    .iter()
+                    .map(|at| match &row[*at as usize] {
+                        Datum::Int8(n) => Cell::Int8(*n),
+                        Datum::Text(text) => Cell::Text(text.clone()),
+                        Datum::Null => Cell::Null,
+                        other => panic!("unexpected column {other:?}"),
+                    })
+                    .collect()
             })
             .collect();
         let _ = txn.rollback();
@@ -568,8 +594,22 @@ async fn an_alter_places_a_columnar_replica_and_clearing_it_takes_it_back() {
 /// a learner, and the reference reads the same instant through Percolator's `write` records on a
 /// voter and decodes with the row codec. The workload has an update and a delete in it precisely
 /// so that "every version" and "the visible version" are different answers.
+///
+/// # The corpus, and the one case that hides
+///
+/// An update and a delete separate "every version" from "the visible version", and that is not
+/// the hardest thing here. The case `docs/plans/phase-8-learner.md` §store names is
+/// **`ADD COLUMN` with a non-`NULL` default over rows written before it**: the rows on disk are
+/// two columns wide and the table is three, so the answer for the third column of an old row is
+/// the column's *missing value* — `attmissingval`, PostgreSQL 11's trick, which is why the
+/// `ALTER` is instant on both sides. The row codec pads from the schema; the columnar decoder has
+/// to be built from `Published`'s `(type, missing)` pairs and not from the types alone, or it
+/// pads with `NULL` and the two engines disagree about a row nobody has touched since.
+///
+/// So the workload ends with an `ADD COLUMN ... NOT NULL DEFAULT`, one row inserted after it at
+/// the new width, and one older row rewritten — three widths of row alive at the timestamp this
+/// reads at.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "a placed columnar learner never receives the region's existing data: see the doc above"]
 async fn the_learner_answers_fragments_that_agree_with_a_row_scan() {
     let gate = Gate::start().await;
 
@@ -591,6 +631,20 @@ async fn the_learner_answers_fragments_that_agree_with_a_row_scan() {
         session.run("DELETE FROM t WHERE id = 3").unwrap();
         session
             .run("INSERT INTO t VALUES (5, 'grace hopper')")
+            .unwrap();
+        // The column that was not there when rows 1, 2, 4 and 5 were written. Nothing is
+        // rewritten by it — that is the feature — so what those rows read for it comes from the
+        // catalog rather than from their bytes.
+        session
+            .run("ALTER TABLE t ADD COLUMN region text NOT NULL DEFAULT 'unknown'")
+            .unwrap();
+        // One row born at the new width, and one older row rewritten to it, so the copy holds all
+        // three shapes at once.
+        session
+            .run("INSERT INTO t VALUES (6, 'katherine', 'west')")
+            .unwrap();
+        session
+            .run("UPDATE t SET region = 'east' WHERE id = 2")
             .unwrap();
     });
 
@@ -618,22 +672,28 @@ async fn the_learner_answers_fragments_that_agree_with_a_row_scan() {
         .max()
         .expect("some store leads the region");
 
+    let projection = vec![0, 1, 2];
     let columns = tokio::task::block_in_place(|| {
-        gate.fragment(TENANT, table_id, ts, min_apply_index, vec![0, 1])
+        gate.fragment(TENANT, table_id, ts, min_apply_index, projection.clone())
     });
-    let rows = tokio::task::block_in_place(|| gate.row_scan(ts, table_id));
+    let rows = tokio::task::block_in_place(|| gate.row_scan(ts, table_id, &projection));
 
     assert_eq!(
         columns, rows,
         "the columnar copy and the row store disagree at ts {ts}",
     );
+    let text = |value: &str| Cell::Text(value.to_owned());
     assert_eq!(
         rows,
         vec![
-            (1, Some("ada lovelace".to_owned())),
-            (2, Some("grace".to_owned())),
-            (4, Some("barbara".to_owned())),
-            (5, Some("grace hopper".to_owned())),
+            // Written before `ADD COLUMN`, never touched since: the default, not NULL.
+            vec![Cell::Int8(1), text("ada lovelace"), text("unknown")],
+            // Rewritten after it.
+            vec![Cell::Int8(2), text("grace"), text("east")],
+            vec![Cell::Int8(4), text("barbara"), text("unknown")],
+            vec![Cell::Int8(5), text("grace hopper"), text("unknown")],
+            // Born at the new width.
+            vec![Cell::Int8(6), text("katherine"), text("west")],
         ],
         "the reference itself is wrong, so the agreement above means nothing",
     );

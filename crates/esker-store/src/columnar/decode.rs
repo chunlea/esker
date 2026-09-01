@@ -58,6 +58,10 @@ pub struct TableDecoder {
     columns: Schema,
     /// The row codec's view of the same columns, `missing` values included.
     row: RowSchema,
+    /// The same `missing` values in the columnar vocabulary, for a read that has to widen an
+    /// older run to this schema. Kept beside `row` rather than derived from it because
+    /// `RowSchema` does not hand its own back and `esker-keys` is not this crate's to change.
+    missing: Vec<Value>,
     /// Which schema version this was built from, so a stale push is refused over a fresh one.
     schema_version: u64,
 }
@@ -101,6 +105,10 @@ impl TableDecoder {
         Ok(Self {
             columns,
             row: RowSchema::new(types.to_vec(), missing.to_vec()),
+            missing: missing
+                .iter()
+                .map(|datum| datum.as_ref().map_or(Value::Null, value_of))
+                .collect(),
             schema_version,
         })
     }
@@ -128,6 +136,10 @@ impl TableDecoder {
 impl RowDecoder for TableDecoder {
     fn schema(&self) -> &Schema {
         &self.columns
+    }
+
+    fn missing(&self) -> Vec<Value> {
+        self.missing.clone()
     }
 
     /// Decodes the row's data columns. The key is not read here at all: the row value carries

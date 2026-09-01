@@ -92,6 +92,16 @@ pub trait RowDecoder: Send + Sync + fmt::Debug {
     /// `value` is `None` for a delete, whose columns all come back NULL. A tombstone's *identity*
     /// does not come from here: see [`KEY_COLUMN`].
     fn decode(&self, key: &[u8], value: Option<&[u8]>) -> Result<Vec<Value>>;
+
+    /// What a run written **before** a column existed reads for it, one per column of
+    /// [`RowDecoder::schema`].
+    ///
+    /// PostgreSQL 11's `attmissingval`, the same values [`esker_keys::row::decode_row`] pads a
+    /// short row with. Required rather than defaulted for the reason `super::decode`'s header
+    /// gives about the decoder itself: a default of "all NULL" is the wrong answer that nothing
+    /// would catch, and it would be wrong *only for the old rows* of a table that took an
+    /// `ADD COLUMN ... DEFAULT`.
+    fn missing(&self) -> Vec<Value>;
 }
 
 /// How the apply target seals runs.
@@ -225,6 +235,23 @@ impl ColumnarApply {
     #[must_use]
     pub fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    /// What a run written before a column existed reads for it, one per column of
+    /// [`ColumnarApply::schema`].
+    ///
+    /// The decoder's `missing` values with three `NULL`s after them, for `__key`, `__commit_ts`
+    /// and `__deleted`: every run has all three whatever schema it was written under, so their
+    /// entries are never reached — they are there so the vector lines up with the run schema,
+    /// which is what [`esker_columnar::Widening`] indexes by.
+    ///
+    /// A read that does not pass this pads an older run with `NULL`, which is the wrong answer for
+    /// exactly the rows a user is least likely to check (`super::decode`'s module header).
+    #[must_use]
+    pub fn missing(&self) -> Vec<Value> {
+        let mut missing = self.decoder.missing();
+        missing.resize(self.schema.len(), Value::Null);
+        missing
     }
 
     /// Rows buffered and not yet sealed.
@@ -462,6 +489,11 @@ mod tests {
             &self.schema
         }
 
+        /// No column of this table was added after any row, so nothing is ever padded.
+        fn missing(&self) -> Vec<Value> {
+            vec![Value::Null; self.schema.len()]
+        }
+
         fn decode(&self, key: &[u8], value: Option<&[u8]>) -> Result<Vec<Value>> {
             let id = i64::from_be_bytes(
                 key.try_into()
@@ -543,6 +575,9 @@ mod tests {
         impl RowDecoder for Colliding {
             fn schema(&self) -> &Schema {
                 &self.0
+            }
+            fn missing(&self) -> Vec<Value> {
+                unreachable!()
             }
             fn decode(&self, _: &[u8], _: Option<&[u8]>) -> Result<Vec<Value>> {
                 unreachable!()

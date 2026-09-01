@@ -85,7 +85,12 @@ struct Tables {
 #[derive(Debug, Clone)]
 pub struct TableRuns {
     /// The run schema: the table's columns, then `__key`, `__commit_ts`, `__deleted`.
+    ///
+    /// **The current one**, which the oldest run need not have been written under. Every run is
+    /// read as having these columns, which is what lets an `ADD COLUMN` land mid-workload.
     pub schema: Schema,
+    /// One per column of `schema`: what a run written before that column existed reads for it.
+    pub missing: Vec<esker_columnar::Value>,
     /// The live runs, oldest first. Immutable files: safe to read with the lock released.
     pub paths: Vec<PathBuf>,
     /// `(key, commit_ts, deleted)` slots, for the visibility the read applies.
@@ -208,6 +213,7 @@ impl ColumnarSlot {
         let runs = apply.runs();
         Ok(Some(TableRuns {
             schema: apply.schema().clone(),
+            missing: apply.missing(),
             paths: runs
                 .live()
                 .iter()

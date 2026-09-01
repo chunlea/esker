@@ -71,6 +71,11 @@ impl RowDecoder for Decoder {
         &self.schema
     }
 
+    /// A fixed two-column table: no column postdates a row, so nothing is padded.
+    fn missing(&self) -> Vec<Value> {
+        vec![Value::Null; self.schema.len()]
+    }
+
     fn decode(&self, key: &[u8], value: Option<&[u8]>) -> Result<Vec<Value>> {
         let mut id = [0u8; 8];
         id.copy_from_slice(&key[..8]);
@@ -426,6 +431,15 @@ impl RowDecoder for WideningDecoder {
         &self.schema
     }
 
+    /// `c`'s `DEFAULT 42`, which is what a row written at version 1 must read for it.
+    fn missing(&self) -> Vec<Value> {
+        let mut missing = vec![Value::Null, Value::Null];
+        if self.schema.len() > 2 {
+            missing.push(Value::Int8(42));
+        }
+        missing
+    }
+
     fn decode(&self, _key: &[u8], value: Option<&[u8]>) -> Result<Vec<Value>> {
         let Some(bytes) = value else {
             return Ok(vec![Value::Null; self.schema.len()]);
@@ -517,9 +531,19 @@ fn a_column_added_mid_workload_reads_its_default_for_the_rows_that_predate_it() 
     );
     // The schema every run is read as having, and what the older, narrower one pads with. `42`
     // for `c` is the column's `missing` value — the whole point of the test.
+    //
+    // **Taken from the apply target, not written out here.** It was a literal until the joint
+    // gate found that the production read path passed `widening: None` and so never used any of
+    // this: a test that builds the right answer by hand proves the mechanism and says nothing
+    // about the caller. `ColumnarApply::missing` is what `Store::serve_fragment` passes, so this
+    // now exercises the same value the cluster does.
     let widening = esker_columnar::Widening {
         schema: apply.schema().clone(),
-        missing: vec![
+        missing: apply.missing(),
+    };
+    assert_eq!(
+        widening.missing,
+        vec![
             Value::Null,
             Value::Null,
             Value::Int8(42),
@@ -527,7 +551,8 @@ fn a_column_added_mid_workload_reads_its_default_for_the_rows_that_predate_it() 
             Value::Null,
             Value::Null,
         ],
-    };
+        "the apply target's missing values are not the catalog's",
+    );
     let result = evaluate_merged(
         &readers,
         &fragment,
