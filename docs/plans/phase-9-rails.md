@@ -1,6 +1,6 @@
 # Phase 9 plan — a PostgreSQL that Rails can talk to, scored by Rails' own tests
 
-Status: **units 0–4 landed** (unit 4 bar a second join); **unit 5 captured and re-ordered** — §2 says what the measurement changed. §9 records progress per unit, §6 the divergences, §7 what unit 1 changed and §8 what is watched.
+Status: **units 0–4 landed** (unit 4 bar a second join); **unit 5 in progress in the measured order** — the table alias, the eight session statements and `IN (list)` are built, and `ActiveRecord`'s 36 went 3 → **11**; the type surface is blocked on `esker-keys` and said so. **Unit 6's first scoreboard is in** ([`docs/bench/rails-scoreboard.md`](../bench/rails-scoreboard.md)): rung 1 of the ladder passes and rung 2 now stops on `relation "pg_type" does not exist` — the catalog, which is where the next unit is. §2 says what the measurement changed, §9 records progress per unit, §6 the divergences, §7 what unit 1 changed and §8 what is watched.
 
 Design: [ADR 0031](../adr/0031-rails-compatibility-is-measured.md). Constitution: `CLAUDE.md`.
 The compatibility contract this inherits whole: `docs/plans/phase-6a.md` §1 — **C1** every valid
@@ -349,44 +349,161 @@ several. What stands between here and a booting ActiveRecord, in the order the b
 
 Each of those is a unit. The count in `activerecord_surface.rs` is what says whether one worked.
 
+#### What landed against that order: the alias, and the six SETs
+
+Both of the first two rungs are built, and the pair is worth reading together because they moved
+the same counter by very different amounts. **3 of 36 became 11 of 36.**
+
+**The table alias is +0, and that is the finding.** Nineteen statements open `FROM pg_type AS t`;
+every one of them now gets past the alias and stops on the *next* thing — a `pg_class` to alias.
+A gate is not a feature until what is behind it exists, and the counter saying so is exactly what
+it is for. What the alias *is*, measured (`tests/corpus/pg19_alias.txt`, 42 statements):
+
+* **an alias replaces the name.** `al.id` after `FROM al AS t` is `42P01` — and a **different
+  sentence** from a qualifier the query never had: `invalid reference to FROM-clause entry`
+  against `missing FROM-clause entry`, plus a `HINT` naming the alias. A scope that kept matching
+  `TableDef::name` would answer both, which is a query a real server refuses.
+* **two FROM entries may not share a name**: `42712`, and this one was a **silent wrong answer
+  before the unit**. `SELECT al.id FROM al JOIN al ON true` ran, resolved to the outer side, and
+  returned one table's column twice. The check is over the name each entry is *referred as*, so
+  `FROM al AS t JOIN ar AS al` stays legal — the alias freed the name.
+* the alias is the name **every message uses**: `42803` says `column "t.n"`. It also had to reach
+  `USING`, which builds its equality qualified — the corpus caught that on its first run.
+* a **column alias list** (`AS t (c, d)`) is a second feature and is `0A000` naming itself; so is
+  an alias on `UPDATE` and `DELETE`, which a real server takes. Three divergences, each counted.
+
+**The six `SET`s are +8** — the eight statements, including the two `SHOW`s. The handover called
+them the highest ratio on the board and they were, but "a real server accepts them and ignores
+them" turned out to be wrong for three of the eight, which is the whole argument for capturing
+first (`tests/corpus/pg19_set.txt`, 68 statements):
+
+* **`SET standard_conforming_strings = off` is `0A000` on a real server too**, with a message of
+  its own. Accepting it and doing nothing would have been the one answer that is wrong in the
+  direction ADR 0031 cares most about.
+* **`client_min_messages` is not inert here.** This node raises real notices — `DROP TABLE IF
+  EXISTS` for a table that is not there is one, and it is the first thing `ActiveRecord`'s
+  migration does — so the parameter is *honoured*, filtered in `Executor::take_notices`. That is
+  precisely why the framework sends it.
+* **`max_identifier_length` is read-only**: `55P02`, a different answer from `42704`, and 63 —
+  the same number `IdentifierTruncated` is about.
+* **a `SET` is transactional.** `ROLLBACK` puts the old value back, `COMMIT` keeps the new one,
+  and `ROLLBACK TO` undoes a `SET` made inside the savepoint exactly as it undoes a write. A
+  session parameter is *block* state, not connection state; storing it beside the socket would
+  keep a value the user's transaction threw away. The savepoint marks carry a copy, which is what
+  `crates/esker-sql/src/exec/savepoint.rs` grew for it.
+
+`crates/esker-sql/src/parameter.rs` holds one row per parameter with **what this node means**, and
+that column is the point: `TimeZone` is honoured only where it means UTC, because `timestamptz`
+prints in UTC and nowhere else; `search_path` only where it means `public`, because a schema
+qualifier is `0A000` here. A real server takes `America/New_York` and `nosuchschema` for both;
+this one refuses them by name rather than honour a setting in `SHOW` and nowhere else.
+
+Two divergences the pair leaves, both recorded in §6.
+
+#### Unit 5's `IN`, which the scoreboard asked for and which moved the ladder
+
+Built **after** the first scoreboard and because of it: the run said `ActiveRecord` could not open
+a connection, and named the reason as one expression. `tests/corpus/pg19_in.txt` is 34 statements,
+and the trap is the one an implementation gets wrong by reading rather than measuring:
+
+* **a NULL in the list does not mean false.** The rule is three-valued and asymmetric — an equal
+  item wins outright (`1 IN (1, NULL)` is **true**), and with no match a NULL anywhere makes the
+  answer unknown (`1 IN (2, NULL)` is **NULL**). The consequence is what bites: `1 NOT IN (2,
+  NULL)` is NULL, so **a `NOT IN` over a list containing a NULL matches nothing at all**. "Not
+  equal to any of them" returns the row, with nothing to say so.
+* **and a NULL item does not stop the scan.** `1 IN (NULL, 1)` is **true**. This crate answered
+  `NULL` for it until the corpus was extended with a NULL *before* the match — the first draft had
+  the whole rule right and the loop wrong, in the shape that drops a row rather than raising. The
+  first draft's corpus put the NULL last in every case it covered, which is exactly the sort of
+  hole a capture written from the rule rather than from the cases leaves.
+* It is a **node, not a rewrite** to `x = a OR x = b`, so the left-hand side is evaluated once —
+  which also keeps a `nextval` on the left from running per item.
+* The list is typed by **`reconcile`**, the same function `=` uses, so `id IN ('1')` matches and
+  `n IN (1)` is the same `42883` a bare `=` gives. There is no rule of its own to get wrong.
+
+**What it moved**, measured both sides: rung 2 of the ladder stopped on `IN` and now stops on
+`relation "pg_type" does not exist` — the catalog, which is the destination rather than another
+thing in front of it. Statements served stayed at **11**, and that is the honest result: 4, 7, 8
+and 9 got one step further rather than through.
+
+**Six divergences declared, and not one of them is about `IN`** — the corpus surfaced gaps that
+were already there, which is what a capture is for. Five are named refusals (`IS TRUE`, the
+operator `+`). The sixth is not: **`SELECT 1 = '1'` is `f` here where a real server says `t`.**
+Two literals with no column to type them against are compared untyped, which is a *wrong answer*
+rather than a refusal — the class this project treats as worst. It is `=`'s bug and older than
+this unit; `IN` inherits it exactly because it shares `reconcile`. Recorded in §6 and in
+`tests/in_list.rs`'s `DIVERGENCES`, and it wants a unit of its own.
+
+#### The type surface is BLOCKED, and not on this lane
+
+The third rung — `character varying`, `integer`, `timestamp(6)`, worth 3 statements through the
+13→14,20 cascade — **cannot be built in `crates/esker-sql/`**. `ColumnType` is
+`esker_keys::value::ColumnType` (`crates/esker-keys/src/value.rs:60`), a six-variant enum with a
+`ColumnType::ALL` and the row-value codec beside it; `esker-columnar` carries a second copy
+(`crates/esker-columnar/src/value.rs:46`). Adding a stored type is a change to both, plus ADR 0030.
+
+There is no honest way round it, and each near-miss fails for its own reason:
+
+* **`integer`** is `int4`, and mapping it to `int8` would accept every value between 2^31 and 2^63
+  that a real server answers `22003` for — which is the argument phase 9 unit 2 already made for
+  refusing `serial`, in this file.
+* **`timestamp(6)`** is `timestamp` *without* time zone (OID 1114) and this node has only
+  `timestamptz` (1184). Different type at the client, different semantics.
+* **`character varying`** with no length is the closest: it behaves exactly like `text`. What
+  differs is the OID (1043 against 25) and what `format_type` answers — so it needs either a new
+  `ColumnType` or a *declared* type on the catalog's `ColumnDef`, and that record has a format
+  version and a golden. Both are "ask before doing".
+
+So the ladder's rung 2 — connect and run one migration — stays blocked, and the block is a
+cross-crate one. Reported rather than worked around.
+
 #### Handover — every one of the 36, by number
 
 Numbering is the order in `tests/corpus/activerecord_8_1_statements.txt`, which is the order
 ActiveRecord issued them. Reproduce this table by replaying the corpus and printing each answer;
 `activerecord_surface.rs` already does the replay.
 
-**Served today — 3.** `10` `DROP TABLE IF EXISTS`, `18` `BEGIN`, `19` `COMMIT`.
+**Served today — 11.** `1`, `2`, `3`, `5`, `25`, `27` the six `SET`s; `6`, `11` the two `SHOW`s;
+`10` `DROP TABLE IF EXISTS`; `18` `BEGIN`; `19` `COMMIT`.
 
-**Remaining — 33, grouped by what unblocks them.** The groups are disjoint and each names the
+**Remaining — 25, grouped by what unblocks them.** The groups are disjoint and each names the
 *first* thing in the way; a statement may need more than one, and the second only matters once the
-first is gone.
+first is gone. The alias is gone from this table because it is built — which moved nineteen
+statements onto their second blocker without moving one onto the served list.
 
-| What unblocks them | Statements | Count |
-|---|---|---|
-| **a table alias** (`FROM pg_type AS t`, `pg_class c`) | 4, 7, 8, 9, 15, 16, 17, 21, 23, 26, 28, 29, 30, 31, 32, 33, 34, 35, 36 | **19** |
-| **`SET` of a session parameter it does not know** | 1, 2, 3, 5, 25, 27 | 6 |
-| **the type surface** (`character varying`, `integer`, `timestamp(6)`) | 13 — and with it **14** and **20**, which fail only because 13 did | 3 |
-| **`SHOW` of a parameter it does not know** | 6, 11 | 2 |
-| **a cast** (`::regtype::oid`) | 12 | 1 |
-| **a bare `current_schema`** (a function spelled as a keyword — `42703 column … does not exist` today) | 24 | 1 |
-| **`current_schemas(false)`** called on its own | 22 | 1 |
+This table is **measured, not derived**: every one of the 36 was put to a running node and its
+answer recorded (`docs/bench/rails-scoreboard.md` carries the full list). That matters, because the
+derivation was wrong — reclassifying the nineteen as "waiting for a `pg_catalog` relation" is what
+a reader would conclude from the blocker counts, and only **one** statement actually gets far
+enough to say so.
 
-Two things that table makes obvious and the earlier blocker count did not:
+| What each stops on **today** | Statements | Before `IN` | After |
+|---|---|---|---|
+| **more than one `JOIN`** — unit 4's deliberate omission, now with its real number | 15, 26, 32, 33, 34, 35, 36 | 7 | **7** |
+| **the catalog itself** — `relation "pg_type" does not exist` | 4, 7, 8, 9, 23 | 1 | **5** |
+| **`= ANY(…)`** — an array, and the `current_schemas` that fills it | 16, 17, 21, 28 | 4 | 4 |
+| **a qualified name** (`pg_catalog.pg_class`) | 29, 30, 31 | 3 | 3 |
+| **the type surface** — **blocked on `esker-keys`**, see above | 13, and **14**, **20** which fail only because 13 did | 3 | 3 |
+| **a cast** (`'integer'::regtype::oid`) | 12 | 1 | 1 |
+| **`current_schemas(false)`** on its own | 22 | 1 | 1 |
+| **a bare `current_schema`** (a function spelled as a keyword) | 24 | 1 | 1 |
+| **`IN (list)`** | 4, 7, 8, 9 | **4** | 0 |
 
-* **The cheapest six are the `SET`s.** Every one is a parameter a real server accepts and ignores
-  or honours quietly, and this node answers `0A000` naming it. Accepting the ones PostgreSQL
-  accepts — measuring each first, because `SET intervalstyle = iso_8601` changing nothing here is
-  a claim, not an assumption — turns 6 into runs for very little. It is the highest ratio on the
-  board and it is **not** in the re-ordered list above, which was written from the blocker counts
-  before this table existed.
-* **The type surface is worth 3, not 1.** 14 and 20 fail with `42P01` only because the `CREATE
-  TABLE` before them did; they are not independently blocked.
+**Before `IN`, exactly one statement of thirty-six reached the catalog.** That is the number that
+overturns the reclassification: nineteen statements *read* `pg_catalog`, so it is tempting to call
+the catalog the next unit — but the refusals come from lowering, which runs before the catalog is
+consulted, and every statement stopped in the query surface would have been stopped there whatever
+the catalog held. Building it first would have left 35 of the 36 exactly where they were.
 
-#### The translation approach, and why it is not chosen yet
+**`IN` moved five statements onto the catalog and rung 2 with them** (§Unit 5's `IN`, below). That
+is the point of the counter: it does not measure features, it measures *what is now in the way*.
 
-Nothing of `pg_catalog` is built, and the shape it should take is **deliberately undecided** until
-the query surface above exists — a decision made now would be made without knowing what the
-queries can ask. The two candidates, with what the capture says about each:
+#### The translation approach, decided: views over the records
+
+The predecessor left this open until the query surface existed. It exists — a catalog relation can
+now be aliased, and the corpus proves the alias reaches `WHERE`, `ORDER BY`, `GROUP BY`, `USING`
+and both join kinds — so the decision is made here, and the capture is what makes it. The two
+candidates were:
 
 1. **Catalog tables as real tables** in a reserved part of the `'m'` space, written by DDL and read
    by the ordinary planner. Everything above works on them for free — aliases, joins, `ORDER BY` —
@@ -396,16 +513,74 @@ queries can ask. The two candidates, with what the capture says about each:
    space. No duplicated state and no way to drift, and it needs the planner to accept a relation
    that is computed rather than scanned — a `Node` variant, not a storage change.
 
-The capture favours **(2)**: 19 of the 33 remaining statements only need the catalog to *be a
-relation the planner can alias and join*, and none of them needs it to be writable. `pg_catalog`
-write paths stay out of scope (§5).
+**Decision: (2), views over the existing records.** The evidence, from the capture rather than from
+taste:
+
+* **Nothing writes.** All 19 catalog statements are `SELECT`s. A form that cannot be written to
+  costs nothing that any of them wanted, and §5 already puts `pg_catalog` write paths out of scope.
+* **Everything reads through the ordinary query surface.** `FROM pg_type AS t`, `LEFT JOIN
+  pg_range`, `WHERE … IN (…)`, `ORDER BY`, `GROUP BY` — the alias unit just built the last piece
+  each of those needed. A computed relation that yields rows is enough for all of it; the planner
+  needs one `Node` variant, not a storage change.
+* **(1) is the bug class this project has spent two phases avoiding.** Catalog tables as real
+  tables means every `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE`, `CREATE INDEX` and sequence
+  allocation has a second write it must keep in step, transactionally, forever — and a `pg_class`
+  that disagreed with the `'m'` space would be wrong in a way only a client notices.
+* And the shape (2) needs already has a precedent to copy: the `'m'` key space is read by prefix
+  scan today, which is exactly what a `pg_class` row set is.
+
+The cost is that a computed relation has no index and no statistics, so every catalog query is a
+scan of the tenant's tables. For a schema dump that is the right trade and for `ActiveRecord`'s
+boot it is 19 statements over a handful of rows; if it ever is not, materialising is a change
+behind the same `Node`.
+
+#### Handover — what unit 5 still owes, and what it does not
+
+**Not done: the catalog's content**, which is the whole of what is left of this unit. The *shape*
+is decided (views over records, above) and the *first slice* is named by the scoreboard:
+**`pg_type` and `pg_range`**, which four statements need and which rung 2 now stops on. Everything
+before it in the measured order is either built or blocked:
+
+| The measured order | State |
+|---|---|
+| table aliases | **built** — `tests/alias.rs`, 42 statements |
+| the six `SET`s and two `SHOW`s | **built** — `tests/session_parameters.rs`, 68 statements |
+| the type surface | **BLOCKED on `esker-keys`**, reported above; not this lane's to build |
+| *(inserted by the scoreboard)* `IN (list)` | **built** — `tests/in_list.rs`, 40 statements |
+| the catalog's content | **not started**; `pg_type` + `pg_range` first |
+
+Two questions the next lane has to answer before writing a row of `pg_type`, and neither is
+obvious:
+
+1. **Whose types does `pg_type` list?** PostgreSQL's `pg_type` holds every type the server has.
+   This node has six. Listing PostgreSQL's standard OIDs (`int4` is 23, `numeric` is 1700) would
+   tell a client this node has types it answers `0A000` for; listing only six would give
+   `ActiveRecord` a type map with holes in it, and its adapter reads that map to decode **every**
+   column it ever receives. The answer wants a capture of what the adapter does with a short map
+   before it is chosen, not an argument.
+2. **Where does a computed relation sit in the planner?** `Node::SeqScan` reads a key range. A
+   catalog view yields rows from nowhere, so it is a `Node` variant of its own — and everything
+   above it (alias, filter, sort, aggregate, join) already works on rows, which is what the last
+   three units were for.
+
+**Not owed by this unit**: `= ANY(…)` (an array, so `esker-keys`), a second `JOIN`, a qualified
+name, and the cast. Each is named in the scoreboard with its count, and each is its own unit.
 
 #### The state of every file
 
 No file is half-built. What exists:
 
 * `tests/corpus/activerecord_8_1_statements.txt` — the 36 statements, complete, in issue order.
-* `tests/activerecord_surface.rs` — the C1/C2 gate and the exact count. Complete.
+* `tests/activerecord_surface.rs` — the C1/C2 gate and the exact count, now **11**.
+* `tests/corpus/pg19_alias.txt` + `tests/alias.rs` — 42 statements, three declared divergences.
+* `tests/corpus/pg19_set.txt` + `tests/session_parameters.rs` — 68 statements, one declared
+  divergence, plus the notice-suppression test a corpus cannot hold.
+* `src/parameter.rs` — the six parameters and, per parameter, what this node means by a value.
+* `tests/corpus/pg19_in.txt` + `tests/in_list.rs` — 40 statements, six declared divergences, none
+  of them about `IN`.
+* `docs/bench/rails-scoreboard.md` — unit 6's first run, and the per-statement table §2 quotes.
+* In the **out-of-repo** harness: `config.yml`, `ladder.rb`, `run-scoreboard.sh`,
+  `exclusions.txt` (empty, and the file says why), and a `rails/rails` checkout at `v8.1.3.1`.
 * In the **out-of-repo** harness (`/Users/chunlea/workspace/lab/esker-rails-harness/`):
   `Gemfile` + `.bundle/config` (rails 8.1.3.1, pg 1.6.3, confined to `vendor/bundle`), `boot.rb`
   (connect → migrate → CRUD → schema dump), `capture-ar-boot.sh`, `extract.py`, `README.md`. All
@@ -413,23 +588,83 @@ No file is half-built. What exists:
   marker statements, or the window split leaves a truncated `SELECT '` in the corpus — a statement
   no server ever saw. The surface gate caught that on its first run, which is what a gate is for.
 
-#### Unit 6's runner: not started
+#### Unit 6's runner: built, and what it is not
 
-Nothing of the scoreboard exists. The harness has the *capture* half (`boot.rb` drives one
-connection); it has no `rails/rails` checkout, no `config.yml` pointing ActiveRecord at an Esker
-node, no runner and no exclusion-list runner. The count in `activerecord_surface.rs` is a
-**proxy** for the scoreboard and not the scoreboard: it measures whether statements are answered,
-where the real one measures whether tests pass. It exists because 3-of-36 is a number that can be
-had today, and unit 6's cannot.
+It exists now — `rails/rails` at `v8.1.3.1`, `config.yml`, `ladder.rb`, `run-scoreboard.sh` and
+`exclusions.txt`, all out of tree (§0). What has not changed is the relationship between the two
+numbers: `activerecord_surface.rs`'s count measures whether **statements are answered**, and the
+scoreboard measures whether **tests pass**. They moved apart this round and that is the useful
+part — `IN` moved the scoreboard's ladder and left the count at 11. Neither is a substitute for
+the other, and the per-statement table in the scoreboard is the third thing, which measures what
+is *in the way*.
 
-### Unit 6 — the scoreboard
+### Unit 6 — the scoreboard ✅ (first run)
 
-The harness — `config.yml` pointed at this node, the runner, the exclusion-list runner — is built
-**in `/Users/chunlea/workspace/lab/esker-rails-harness/`** and stays there (§0). What lands in this
-repository is `docs/bench/rails-scoreboard.md`: the Rails commit and the Esker commit, the raw pass
-rate, the pass rate with conflict retry, one line per excluded test with its reason and the unit
-that closes it, and the exact commands that reproduce the run. The first run's number is the
-baseline whatever it is.
+The harness — `config.yml` pointed at this node, the ladder runner, the suite runner and the
+exclusion list — is built **in `/Users/chunlea/workspace/lab/esker-rails-harness/`** and stays
+there (§0). What lands here is [`docs/bench/rails-scoreboard.md`](../bench/rails-scoreboard.md):
+both commits, the ladder, the suite's numbers, the exclusion list, and the commands that reproduce
+every one of them.
+
+**The baseline, and it is the number it is.** Of 426 files, **59 reach a first test and 367 never
+load** — every one of them at `establish_connection`. 772 tests ran and 525 passed, and the
+scoreboard says plainly why that 68% is not a score: **all 59 files that ran are `test/cases/arel/`,
+and that is every Arel file in the suite.** Not one test outside Arel ran. Arel is `ActiveRecord`'s
+SQL-string builder — it composes an AST and prints it — so those are precisely the tests that
+survive a node nothing can connect to. The number that describes this server is the 367.
+
+The reason is one sentence rather than four hundred: `ActiveRecord` cannot
+`establish_connection`. `AbstractAdapter`'s type map is built from the first query it ever sends —
+
+```sql
+SELECT t.oid, t.typname FROM pg_type as t WHERE t.typname IN ('int2', 'int4', …)
+```
+
+— and this node answered `0A000` for **`IN (list)`**, before the missing `pg_type` was ever
+reached. `IN` was built in the same round because of this; rung 2 now stops on `relation "pg_type"
+does not exist`, which is the destination rather than another thing in front of it.
+
+**Rung 1 passes**, which is what makes the number readable rather than opaque: `libpq` negotiates
+the protocol, authenticates, and runs `SELECT 1` against a server written from scratch in this
+repository. The gap between rung 1 and rung 2 was one expression wide.
+
+**The conflict-retry number is not zero, it is undefined** — a `40001` cannot happen in a session
+that never opens a transaction. It gets a number the first time the suite reaches a test that
+touches this server, and saying so beats writing 0% for something that was not measured.
+
+**The exclusion list is empty**, deliberately. ADR 0031's three rules admit a declared divergence,
+a named missing feature, or a test about PostgreSQL's own internals; nothing has been *shown* to be
+any of the three, because nothing that matters has run. A list written before the failures are
+known is a list of guesses.
+
+#### What the scoreboard says the next unit is
+
+The suite's zero has no resolution, so the scoreboard carries the measurement that does: **every
+one of the 36 boot statements, put to a running node, with what stops it**. That table is what
+§2's handover now quotes, and it overturned the reclassification this file had made an hour
+earlier — one statement of thirty-six reaches the catalog.
+
+The first ranking this produced put **`IN (list)`** at the top — 4 statements, no new type, no new
+node, no new access path, and the only item that moved rung 2. It was built in the same round
+(§Unit 5's `IN`), and the ranking below is what the re-measurement says now:
+
+1. **`pg_type` and `pg_range` — 4 statements (4, 7, 8, 9), and the first thing `ActiveRecord`
+   asks for.** It is what rung 2 stops on now, and it is the smallest useful slice of the catalog:
+   two relations of fixed content, read-only, with no per-tenant state at all. **It is the only
+   item that can move the ladder**, which is what turns the suite's zero into a number.
+2. **a second `JOIN` — 7 statements**, the largest group and the one unit 4 named and left. A real
+   unit: a nested `NestedLoop`, a three-table scope, and a probe boundary that is no longer "the
+   last table".
+3. **a qualified name (`pg_catalog.pg_class`) — 3 statements**, and needed by the catalog anyway,
+   since that is how half of them spell it.
+4. **`= ANY(…)` — 4 statements**, which needs an **array**: a stored type, so `esker-keys`, so the
+   same block the type surface hit.
+5. **the rest of the catalog** — `pg_class`, `pg_attribute`, `pg_namespace`, `pg_index` — which is
+   what the remaining fourteen need once the four above are done.
+
+And one that is not on the list because it is not about `ActiveRecord`: **`SELECT 1 = '1'` is `f`
+here.** The `IN` corpus found it, it is a wrong answer rather than a refusal, and it is worth a
+unit ahead of anything on this list on those grounds alone (§6).
 
 ## 3. The test ladder
 
@@ -494,6 +729,10 @@ close, and a divergence recorded in the wrong file is better than one recorded n
 | `avg` over an `int8` column is `0A000` | The other half of the same rule. PostgreSQL's `avg(bigint)` is `numeric` with sixteen fractional digits — `8.3333333333333333` — and the nearest `float8` is `8.333333333333334`: a different value in the last digit and a different type at the client, where `pg` maps `numeric` to `BigDecimal` and `float8` to `Float`. `avg(float8)` **is** implemented and is exact. First entry on the numeric backlog. | ADR 0031, `tests/slt/aggregate.slt` |
 | Groups come back in `pg_cmp` order of their key | PostgreSQL promises **no order at all** without an `ORDER BY`, and returns its hash order — measured, it put the NULL group first. Ours is deterministic, which is a superset of what PostgreSQL guarantees, is what a byte-comparing harness needs, and — because `pg_cmp` puts NULL last — is the order `ORDER BY <key>` would have given anyway. The same choice `esker-columnar`'s evaluator made. | `crate::exec::aggregate`, `tests/aggregate_parity.rs`'s `DIVERGENCES` |
 | A non-integer constant in `GROUP BY` groups rather than failing | PostgreSQL answers `42601 non-integer constant in GROUP BY`; here `GROUP BY 'x'` is an ordinary one-group key. Refusing it would mean a rule about literals that nothing else in this crate has, for a statement nobody writes on purpose. Divergence in the permissive direction, and recorded rather than fixed. | `tests/aggregate_parity.rs`'s `DIVERGENCES` |
+| `SET <parameter>` for a parameter this node does not have is `0A000` naming it, where PostgreSQL answers `42704` | PostgreSQL knows that an un-namespaced name it does not have cannot be a custom GUC. Telling `work_mem` — a real parameter this node does not implement — from a name nobody has would mean carrying PostgreSQL's whole GUC table, so a `SET` this node does not run names itself under contract C2 rather than claim the parameter is absent. `SHOW` and `RESET` make the opposite trade and answer `42704` for both; that asymmetry is older than this unit and is worth closing in one direction when there is a reason to pick one. | `tests/session_parameters.rs`'s `DIVERGENCES` |
+| A `SET` that changes a `GUC_REPORT` parameter sends no `ParameterStatus` | PostgreSQL tells a client when `standard_conforming_strings`, `TimeZone` or `IntervalStyle` changes, so a driver can track it. Of the values this node accepts, only `IntervalStyle` ever *changes* from what the startup packet announced — and it governs how an `interval` prints, of which this node has none. The other two are honoured only at the value they were announced with. Recorded rather than built: the report would have to leave the executor through `Outcome`, and nothing measurable is wrong today. | this table, `src/parameter.rs` |
+| A column alias list (`FROM t AS x (c, d)`), and an alias on `UPDATE` / `DELETE`, are `0A000` naming themselves | A real server takes all three. The column list renames the table's columns, so ignoring it would answer a query about `c` with a column called `id` — a wrong answer rather than a gap. `UPDATE`/`DELETE` resolve against one table and have no second name to tell apart, so the alias buys nothing there; the `SELECT` side is what the 19 catalog statements need. | `tests/alias.rs`'s `DIVERGENCES` |
+| **`SELECT 1 = '1'` is `f`, where PostgreSQL answers `t`** | Two literals with no column to type either against are compared untyped, so an `int8` never equals a `text`. It is a **wrong answer and not a refusal**, which is the one outcome this crate is built to avoid, and it is *older than the unit that found it*: `IN` shares `reconcile` with `=` and inherits it exactly. Against a column both are right — `id = '1'` and `id IN ('1')` match — because there the column gives the literal a type. It wants a unit of its own: the fix is a type for an untyped literal in a comparison that has no column in it, which is PostgreSQL's `unknown` resolution and is a rule, not a patch. | [`tests/in_list.rs`]'s `DIVERGENCES`, `tests/corpus/pg19_in.txt` |
 | `EXPLAIN` prints `Aggregate` / `Group Aggregate` / `Unique` and no costs | The same divergence the access-path plans already carry: PostgreSQL chooses between `HashAggregate` and `GroupAggregate` and prints an estimate; there is one strategy here and no cost model, so the name says what it is rather than implying a choice that was not made. | `tests/slt/aggregate.slt`, `tests/slt/access_paths.slt` |
 
 ## 7. What unit 1 changed, and the two bugs it turned up
@@ -520,7 +759,49 @@ line in a scrollback. A third sighting makes it a chase.
 
 | Seen | What | State |
 |---|---|---|
-| 2026-09-01, **twice** | `joint_gate`'s two transport calls have each missed their 30-second deadline once under a fully parallel `cargo test`: first `a_lock_the_ttl_kills_resolves_the_same_way_on_both_engines` on the `TxnKv` call, then `the_learner_answers_fragments_that_agree_with_a_row_scan` on the fragment call — `Timeout { no answer from 127.0.0.1:60224 in 30s }`. Both pass standalone. **Two different tests, one failure mode**, which narrows it: this is not the lock-expiry clock `1f22077` hardened, it is a 30-second RPC deadline against however many test binaries this machine is running at once. | **watched, one sighting from a chase.** Both calls now dump instead of unwrapping: `target/joint-gate-transport-<ts>.txt`, naming who led the region, every store's address, leadership and applied index, and the deadline. |
+| 2026-09-01, **twice** | `joint_gate`'s two transport calls have each missed their 30-second deadline once under a fully parallel `cargo test`: first `a_lock_the_ttl_kills_resolves_the_same_way_on_both_engines` on the `TxnKv` call, then `the_learner_answers_fragments_that_agree_with_a_row_scan` on the fragment call — `Timeout { no answer from 127.0.0.1:60224 in 30s }`. Both pass standalone. **Two different tests, one failure mode**, which narrows it: this is not the lock-expiry clock `1f22077` hardened, it is a 30-second RPC deadline against however many test binaries this machine is running at once. | **chased — see below.** Both calls dump instead of unwrapping: `target/joint-gate-transport-<ts>.txt`, naming who led the region, every store's address, leadership and applied index, and the deadline. |
+| 2026-09-01, **third** | The same test and the same call, and the dump says it is **not the deadline**: `connection closed: region 1 stopped leading with this proposal in its log`, with **no store leading** and all four agreed at `applied=16`. An election gap under a saturated machine, not an expired timeout. | **chased, and handed over.** The finding and the one-line fix are below; the file is another lane's. |
+
+### The chase, run — and it is not the deadline
+
+The third sighting came under a fully parallel `cargo test` on 2026-09-01 and it is a **different
+failure mode from the first two**, which is what the dump was put there to find out:
+
+```
+a call to the leader of region 1 failed
+error            connection closed: region 1 stopped leading with this proposal in its log; it may still commit
+deadline         30s
+
+-- every store this caller can see --------------------------------
+store 1  address=127.0.0.1:55664  leader=Some(false)  applied=Some(16)
+store 2  address=127.0.0.1:55671  leader=Some(false)  applied=Some(16)
+store 3  address=127.0.0.1:55678  leader=Some(false)  applied=Some(16)
+store 4  address=127.0.0.1:55681  leader=Some(false)  applied=Some(16)
+```
+
+**No store is the leader, and all four agree at `applied=16`.** That is the gap between a
+step-down and the next election, not an expired deadline — the 30 seconds never ran out. So the
+watched entry's working theory ("a 30-second RPC deadline against however many test binaries this
+machine is running at once") is *half* the story: the load is the same cause, and it produces two
+different mechanisms.
+
+* **The deadline** (sightings 1 and 2): the call waits and the answer never comes.
+* **The election gap** (sighting 3): the leader misses its heartbeat tick because the machine is
+  saturated, a follower campaigns, and the in-flight proposal's leader steps down under it. The
+  caller is told so immediately, which is why the deadline is untouched.
+
+The two want different fixes, and the second one's is the smaller and the more correct: **the
+caller should retry on a leadership change**, which is what a real client does — `esker-client`
+treats `NotLeader` as a redirect and tries again. The test asserts *what the two engines answer*,
+not that the first RPC attempt lands on a leader that is still leading when it commits, so a retry
+is not a workaround, it is the assertion being written correctly.
+
+Standalone it passes in 5.65s, and this phase's changes are in the expression layer with nothing
+between them and Raft leadership.
+
+**Handed over rather than fixed**: `tests/joint_gate.rs` is another lane's file (§ "Lane", above),
+and the change is theirs to make — one retry, on the leadership error only, at each of the two
+transport call sites that already dump.
 
 ## 9. Progress
 
@@ -531,9 +812,5 @@ line in a scrollback. A third sighting makes it a chase.
 | 2 — sequences and `RETURNING` | **done** | `e1b1bd2`, `7a7d4f3`, `bf28e0d` |
 | 3 — savepoints | **done** | `779ae2e` (capture), `a74b724` |
 | 4 — joins | **`LEFT`, `ON`, `USING` done**; a second join is not | `56d23e2` |
-| 5 — `pg_catalog` | **captured, and re-ordered by what it found**: 3 of ActiveRecord's 36 statements run, and the catalog is the *last* blocker rather than the first. §2 carries the per-statement handover | `b8d90e7`, this commit |
-| 6 — the scoreboard | not started; §2 unit 5 says what of it exists (the capture half) and what does not (everything else) | |
-| 3 — savepoints | not started | |
-| 4 — joins | not started | |
-| 5 — `pg_catalog` | not started | |
-| 6 — the scoreboard | not started | |
+| 5 — `pg_catalog` | **in progress, in the measured order.** Captured and re-ordered (`b8d90e7`); the **table alias**, the **six `SET`s + two `SHOW`s** and **`IN (list)`** built, taking `ActiveRecord`'s 36 from 3 served to **11** and moving five statements onto the catalog; the type surface **blocked on `esker-keys`** and reported; the translation approach **decided** (views over records). What is left is the catalog's content, starting at `pg_type`. | `b8d90e7`, `b0eca1c`, this commit |
+| 6 — the scoreboard | **first run done**: the harness runs the ladder and all 426 suite files, `docs/bench/rails-scoreboard.md` carries both. 59 files reach a test, 367 die at `establish_connection`; rung 1 passes. Its finding — `IN (list)`, the first query `ActiveRecord` sends — was built in the same round, and rung 2 now stops on the catalog | this commit |

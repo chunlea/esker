@@ -307,6 +307,7 @@ impl Aggregation {
             Expr::Binary { .. }
             | Expr::Not(_)
             | Expr::IsNull { .. }
+            | Expr::InList { .. }
             | Expr::Literal(Literal::Bool(_) | Literal::Null) => return Ok(()),
             Expr::Ordinal { ty, .. } => *ty,
             Expr::Aggregate(call) => self
@@ -384,6 +385,18 @@ impl Aggregation {
                 right: Box::new(self.rewrite(right, scope)?),
             },
             Expr::Not(operand) => Expr::Not(Box::new(self.rewrite(operand, scope)?)),
+            Expr::InList {
+                operand,
+                list,
+                negated,
+            } => Expr::InList {
+                operand: Box::new(self.rewrite(operand, scope)?),
+                list: list
+                    .iter()
+                    .map(|item| self.rewrite(item, scope))
+                    .collect::<Result<Vec<_>>>()?,
+                negated: *negated,
+            },
             Expr::IsNull { operand, negated } => Expr::IsNull {
                 operand: Box::new(self.rewrite(operand, scope)?),
                 negated: *negated,
@@ -437,6 +450,12 @@ fn walk<'a>(expr: &'a Expr, found: &mut Vec<&'a AggregateCall>) {
             walk(right, found);
         }
         Expr::Not(operand) | Expr::IsNull { operand, .. } => walk(operand, found),
+        Expr::InList { operand, list, .. } => {
+            walk(operand, found);
+            for item in list {
+                walk(item, found);
+            }
+        }
         _ => {}
     }
 }

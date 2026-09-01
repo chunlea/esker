@@ -1,0 +1,84 @@
+# What a real PostgreSQL 19beta1 does with `IN (list)` -- phase 9's answer to what the first Rails
+# scoreboard found (`docs/bench/rails-scoreboard.md`). `ActiveRecord` cannot open a connection
+# without it: `AbstractAdapter` builds its type map from
+# `SELECT t.oid, t.typname FROM pg_type as t WHERE t.typname IN ('int2', …)`, and that is the
+# first statement it ever sends.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way against one node.
+# It builds its own table.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THE TRAP, and the reason this file exists:
+#
+#   * **a NULL in the list does not mean false.** The rule is three-valued and asymmetric: an
+#     equal item wins outright (`1 IN (1, NULL)` is **true**), and with no match a NULL anywhere
+#     makes the answer unknown (`1 IN (2, NULL)` is **NULL**). The consequence is the one that
+#     bites: `1 NOT IN (2, NULL)` is NULL, so a `NOT IN` over a list containing a NULL matches
+#     **nothing at all** -- and an implementation that read "not equal to any of them" would
+#     return the row.
+#   * and a NULL item **does not stop the scan**: `1 IN (NULL, 1)` is **true**. An implementation
+#     that gave up at the first NULL would answer NULL and drop a row the user asked for -- which
+#     is the bug this crate had until the line below was captured.
+#
+# TWO MORE:
+#
+#   * it is an **expression**, not only a predicate: `SELECT id IN (1, 2)` is a `boolean` column,
+#     and it composes with `AND` and with `IS TRUE`.
+#   * the list is compared under the **ordinary comparison rules**, so `1 IN ('1')` is true and
+#     `n IN (1)` over a `text` column is `42883` -- the same operator resolution a bare `=` gets,
+#     not a rule of its own.
+CREATE TABLE inl (id int8 PRIMARY KEY, n text, k int8)		-
+INSERT INTO inl VALUES (1, 'one', 7), (2, 'two', NULL), (3, NULL, 9)		-
+
+# --- the ordinary shape, and what it is sugar for
+SELECT id FROM inl WHERE id IN (1, 3) ORDER BY id	bigint	1 ; 3
+SELECT id FROM inl WHERE id = 1 OR id = 3 ORDER BY id	bigint	1 ; 3
+SELECT id FROM inl WHERE n IN ('one', 'two') ORDER BY id	bigint	1 ; 2
+SELECT id FROM inl WHERE id NOT IN (1) ORDER BY id	bigint	2 ; 3
+SELECT id FROM inl WHERE id IN (1) ORDER BY id	bigint	1
+SELECT id FROM inl WHERE id IN (99) ORDER BY id	bigint	-
+SELECT count(*) FROM inl WHERE id IN (1, 2, 3)	bigint	3
+
+# --- THE TRAP: a NULL in the list, and a NULL on the left
+SELECT 1 IN (2, NULL)	boolean	\N
+SELECT 1 IN (1, NULL)	boolean	t
+SELECT 1 NOT IN (2, NULL)	boolean	\N
+SELECT 1 NOT IN (1, NULL)	boolean	f
+SELECT NULL IN (1)	boolean	\N
+SELECT NULL NOT IN (1)	boolean	\N
+SELECT NULL IN (NULL)	boolean	\N
+SELECT id FROM inl WHERE k IN (7, 9) ORDER BY id	bigint	1 ; 3
+SELECT id FROM inl WHERE k NOT IN (7) ORDER BY id	bigint	3
+SELECT id FROM inl WHERE n IN ('one') ORDER BY id	bigint	1
+SELECT id FROM inl WHERE n NOT IN ('one') ORDER BY id	bigint	2
+
+# --- it is an expression, not only a predicate
+SELECT id, id IN (1, 2) FROM inl ORDER BY id	bigint,boolean	1|t ; 2|t ; 3|f
+SELECT id, id NOT IN (1, 2) FROM inl ORDER BY id	bigint,boolean	1|f ; 2|f ; 3|t
+SELECT id FROM inl WHERE (id IN (1, 2)) IS TRUE ORDER BY id	bigint	1 ; 2
+SELECT id IN (1, 2) AND true FROM inl ORDER BY id	boolean	t ; t ; f
+
+# --- the types, which are the ordinary comparison rules
+SELECT 1 IN ('1')	boolean	t
+SELECT 1 IN (1.0)	boolean	t
+SELECT 'a' IN (1)	!22P02 invalid input syntax for type integer: "a"
+SELECT true IN (true, false)	boolean	t
+SELECT id FROM inl WHERE id IN ('1') ORDER BY id	bigint	1
+SELECT id FROM inl WHERE n IN (1)	!42883 operator does not exist: text = integer DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT id FROM inl WHERE id IN (1, 'two')	!22P02 invalid input syntax for type bigint: "two"
+
+# --- an expression on either side, and a duplicate
+SELECT id FROM inl WHERE id IN (1, 1, 1) ORDER BY id	bigint	1
+SELECT id FROM inl WHERE k IN (id + 6) ORDER BY id	bigint	1 ; 3
+SELECT id FROM inl WHERE id + 0 IN (1, 2) ORDER BY id	bigint	1 ; 2
+
+# --- and a NULL BEFORE the match, which does not stop the scan
+SELECT 1 IN (NULL, 1)	boolean	t
+SELECT 1 NOT IN (NULL, 1)	boolean	f
+SELECT 1 IN (NULL, 2)	boolean	\N
+SELECT 1 IN (2, NULL, 1)	boolean	t
+SELECT id FROM inl WHERE id IN (NULL, 2, 3) ORDER BY id	bigint	2 ; 3
+SELECT id FROM inl WHERE id NOT IN (NULL, 2) ORDER BY id	bigint	-

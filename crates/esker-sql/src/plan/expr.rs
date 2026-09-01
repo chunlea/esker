@@ -73,6 +73,26 @@ pub enum Expr {
     },
     /// `NOT x`.
     Not(Box<Expr>),
+    /// `x IN (a, b, …)`, or `NOT IN` when negated.
+    ///
+    /// Carried as itself rather than lowered to `x = a OR x = b`, for one reason that is not
+    /// taste: the left-hand side would be **evaluated once per item**. `k IN (id + 6, id + 7)` is
+    /// cheap written this way and quadratic written the other way for a wide left side, and a
+    /// rewrite that duplicated a `nextval` would be worse than slow.
+    ///
+    /// The three-valued rule is the trap the corpus exists for and it is **not** "NULL means
+    /// false": a match wins over a NULL, and a NULL wins over no match. `1 IN (1, NULL)` is true,
+    /// `1 IN (2, NULL)` is NULL, and `1 NOT IN (2, NULL)` is NULL — so a `NOT IN` over a list
+    /// containing NULL matches nothing at all. Measured, `tests/corpus/pg19_in.txt`.
+    InList {
+        /// The left-hand side, evaluated once.
+        operand: Box<Expr>,
+        /// The list, in the order written. PostgreSQL's grammar has no empty one.
+        list: Vec<Expr>,
+        /// `NOT IN`, which is `NOT (x IN …)` and not "none of them are equal" — the difference is
+        /// entirely in what NULL does.
+        negated: bool,
+    },
     /// `x IS NULL`, or `IS NOT NULL` when negated. Never NULL itself — that is the whole point of
     /// the operator, and the reason `x = NULL` is not a way to write it.
     IsNull {
@@ -444,6 +464,8 @@ fn describe(expr: &Expr) -> &'static str {
         Expr::Binary { .. } => "an operator",
         Expr::Not(_) => "NOT",
         Expr::IsNull { .. } => "IS NULL",
+        Expr::InList { negated: false, .. } => "IN",
+        Expr::InList { negated: true, .. } => "NOT IN",
         Expr::Aggregate(_) => "an aggregate function",
         Expr::Default => "DEFAULT",
         Expr::Sequence(_) => "a sequence function",

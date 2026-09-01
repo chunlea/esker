@@ -55,6 +55,12 @@ const FIXTURE: &[&str] =
 ///   them now fails on its *second* blocker instead of its first: a catalog relation to alias.
 ///   A gate is not a feature until what is behind it exists.
 ///
+/// **`IN (list)` is also +0**, and that is worth a line rather than silence: it was the first
+/// scoreboard's top recommendation and it moved four statements (4, 7, 8, 9) off the query surface
+/// and onto `relation "pg_type" does not exist` — the catalog, which is the destination. This
+/// counter measures what is *answered*, and `docs/bench/rails-scoreboard.md`'s per-statement table
+/// measures what is in the way; the second is what says where a unit went.
+///
 /// It was guessed at ten before the first run, which is the reason for measuring: the guess was
 /// wrong by more than a factor of three in the flattering direction.
 const RUNS: usize = 11;

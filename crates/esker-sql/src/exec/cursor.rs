@@ -720,6 +720,12 @@ pub(super) fn evaluate(expr: &Expr, row: &[Datum]) -> Result<Datum> {
             }
         },
 
+        Expr::InList {
+            operand,
+            list,
+            negated,
+        } => in_list(operand, list, *negated, row)?,
+
         Expr::Binary { op, left, right } => {
             let (left, right) = (evaluate(left, row)?, evaluate(right, row)?);
             match op {
@@ -754,6 +760,48 @@ pub(super) fn evaluate(expr: &Expr, row: &[Datum]) -> Result<Datum> {
                 }
             }
         }
+    })
+}
+
+/// `x IN (a, b, …)` — three-valued, and the rule is **not** "a NULL means false":
+///
+/// * an equal item wins outright, whatever else is in the list — `1 IN (1, NULL)` is true;
+/// * with no match, a NULL anywhere (in the list or on the left) makes the answer unknown —
+///   `1 IN (2, NULL)` is NULL, so `1 NOT IN (2, NULL)` is NULL too and a `NOT IN` over a list
+///   containing NULL matches **nothing at all**;
+/// * only a list of definite non-matches is false.
+///
+/// A NULL item does **not** stop the scan: `1 IN (NULL, 1)` is true. Giving up at the first NULL
+/// answers NULL and drops a row the user asked for, which is what this crate did until the corpus
+/// was extended with a NULL before the match.
+///
+/// Measured on 19beta1, `tests/corpus/pg19_in.txt`. A scan rather than a rewrite to `= a OR = b`,
+/// so the left-hand side is evaluated once — which also keeps a `nextval` on the left from
+/// running per item.
+fn in_list(operand: &Expr, list: &[Expr], negated: bool, row: &[Datum]) -> Result<Datum> {
+    let operand = evaluate(operand, row)?;
+    // A NULL on the left can neither match nor definitely fail to, so nothing in the list can
+    // change the answer.
+    if matches!(operand, Datum::Null) {
+        return Ok(Datum::Null);
+    }
+    let mut unknown = false;
+    let mut matched = false;
+    for item in list {
+        let item = evaluate(item, row)?;
+        if matches!(item, Datum::Null) {
+            unknown = true;
+            continue;
+        }
+        if operand.pg_cmp(&item).is_eq() {
+            matched = true;
+            break;
+        }
+    }
+    Ok(match (matched, unknown) {
+        (true, _) => Datum::Bool(!negated),
+        (false, true) => Datum::Null,
+        (false, false) => Datum::Bool(negated),
     })
 }
 

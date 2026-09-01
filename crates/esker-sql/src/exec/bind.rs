@@ -225,6 +225,12 @@ fn walk_predicate(
             walk_predicate(right, tables, seen);
         }
         Expr::Not(operand) | Expr::IsNull { operand, .. } => walk_predicate(operand, tables, seen),
+        Expr::InList { operand, list, .. } => {
+            walk_predicate(operand, tables, seen);
+            for item in list {
+                walk_predicate(item, tables, seen);
+            }
+        }
         _ => {}
     }
 }
@@ -291,6 +297,12 @@ fn walk_expr_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr)) {
             walk_expr_mut(right, visit);
         }
         Expr::Not(operand) | Expr::IsNull { operand, .. } => walk_expr_mut(operand, visit),
+        Expr::InList { operand, list, .. } => {
+            walk_expr_mut(operand, visit);
+            for item in list {
+                walk_expr_mut(item, visit);
+            }
+        }
         _ => {}
     }
 }
@@ -386,6 +398,12 @@ fn descend(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
             descend(right, visit);
         }
         Expr::Not(operand) | Expr::IsNull { operand, .. } => descend(operand, visit),
+        Expr::InList { operand, list, .. } => {
+            descend(operand, visit);
+            for item in list {
+                descend(item, visit);
+            }
+        }
         _ => {}
     }
 }

@@ -158,3 +158,52 @@ NULL
 10
 20
 30
+
+# --- IN (list), and the three-valued rule that is the whole of it (phase 9 unit 5,
+# tests/in_list.rs). The trap is `NOT IN` over a list holding a NULL: it matches **nothing**,
+# because "unknown" is not "true".
+query I
+SELECT id FROM s WHERE id IN (1, 3) ORDER BY id
+----
+1
+3
+
+query I
+SELECT id FROM s WHERE id NOT IN (1, 3) ORDER BY id
+----
+2
+4
+
+query I
+SELECT id FROM s WHERE n IN (10, 30) ORDER BY id
+----
+1
+3
+
+# Row 2's `n` is NULL, so `n NOT IN (10)` is unknown for it and the row goes -- which is the
+# difference between this and "not equal to any of them".
+query I
+SELECT id FROM s WHERE n NOT IN (10) ORDER BY id
+----
+3
+4
+
+# It is an expression, not only a predicate.
+query IB
+SELECT id, id IN (1, 2) FROM s ORDER BY id
+----
+1	t
+2	t
+3	f
+4	f
+
+# And a NULL in the list makes a non-match unknown rather than false.
+query B
+SELECT 1 IN (2, NULL)
+----
+NULL
+
+query B
+SELECT 1 IN (1, NULL)
+----
+t

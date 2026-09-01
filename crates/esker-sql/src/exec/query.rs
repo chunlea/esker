@@ -631,6 +631,12 @@ fn for_each_column(expr: &Expr, visit: &mut impl FnMut(Option<&str>, &str)) {
             for_each_column(right, visit);
         }
         Expr::Not(operand) | Expr::IsNull { operand, .. } => for_each_column(operand, visit),
+        Expr::InList { operand, list, .. } => {
+            for_each_column(operand, visit);
+            for item in list {
+                for_each_column(item, visit);
+            }
+        }
         _ => {}
     }
 }
@@ -1058,6 +1064,30 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             }
         }
         Expr::Not(operand) => Expr::Not(Box::new(resolve(operand, scope)?)),
+        Expr::InList {
+            operand,
+            list,
+            negated,
+        } => {
+            // `x IN (a, b)` is a set of `=`, so every item is typed against the operand by exactly
+            // the rule `x = a` uses — and the operand can be typed *by* an item in return, which
+            // is what makes `SELECT 1 IN ('1')` true rather than false. Without this the list
+            // would be compared untyped and a `text` item against an `int8` column would simply
+            // not match: a wrong answer where a real server raises `42883`.
+            let mut operand = resolve(operand, scope)?;
+            let mut resolved = Vec::with_capacity(list.len());
+            for item in list {
+                let item = resolve(item, scope)?;
+                let (left, right) = reconcile(BinaryOp::Eq, operand, item)?;
+                operand = left;
+                resolved.push(right);
+            }
+            Expr::InList {
+                operand: Box::new(operand),
+                list: resolved,
+                negated: *negated,
+            }
+        }
         Expr::IsNull { operand, negated } => Expr::IsNull {
             operand: Box::new(resolve(operand, scope)?),
             negated: *negated,
@@ -1147,6 +1177,7 @@ fn check_predicate(expr: &Expr, clause: &'static str, scope: &Scope<'_>) -> Resu
         Expr::Binary { .. }
         | Expr::Not(_)
         | Expr::IsNull { .. }
+        | Expr::InList { .. }
         | Expr::Literal(crate::plan::Literal::Bool(_) | crate::plan::Literal::Null)
         | Expr::Ordinal {
             ty: ColumnType::Bool,
@@ -1281,7 +1312,8 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         Expr::Literal(Literal::Bool(_))
         | Expr::Binary { .. }
         | Expr::Not(_)
-        | Expr::IsNull { .. } => ColumnType::Bool,
+        | Expr::IsNull { .. }
+        | Expr::InList { .. } => ColumnType::Bool,
         Expr::Parameter(number) => return Err(SqlError::UndefinedParameter(*number)),
         // An aggregate's type is the aggregation's business, and by the time a plan is typed
         // every one of them has been rewritten into an `Ordinal` carrying the answer. One here

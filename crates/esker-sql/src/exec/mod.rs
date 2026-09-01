@@ -1101,6 +1101,9 @@ fn has_sequence_call(expr: &crate::plan::Expr) -> bool {
         Expr::Sequence(_) => true,
         Expr::Binary { left, right, .. } => has_sequence_call(left) || has_sequence_call(right),
         Expr::Not(operand) | Expr::IsNull { operand, .. } => has_sequence_call(operand),
+        Expr::InList { operand, list, .. } => {
+            has_sequence_call(operand) || list.iter().any(has_sequence_call)
+        }
         _ => false,
     }
 }

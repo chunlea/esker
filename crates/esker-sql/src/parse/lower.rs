@@ -1149,6 +1149,15 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                 right: Box::new(lower_expr(right)?),
             })
         }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Ok(plan::Expr::InList {
+            operand: Box::new(lower_expr(expr)?),
+            list: list.iter().map(lower_expr).collect::<Result<Vec<_>>>()?,
+            negated: *negated,
+        }),
         Expr::Function(function) => lower_function(function),
         other => Err(SqlError::unsupported(format!("the expression {other}"))),
     }

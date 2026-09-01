@@ -595,6 +595,19 @@ fn render(expr: &Expr, columns: &[String]) -> String {
             render(right, columns)
         ),
         Expr::Not(operand) => format!("NOT {}", render(operand, columns)),
+        Expr::InList {
+            operand,
+            list,
+            negated,
+        } => format!(
+            "{} {}IN ({})",
+            render(operand, columns),
+            if *negated { "NOT " } else { "" },
+            list.iter()
+                .map(|item| render(item, columns))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Expr::IsNull { operand, negated } => format!(
             "{} IS {}NULL",
             render(operand, columns),
