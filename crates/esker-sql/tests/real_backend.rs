@@ -16,7 +16,7 @@ mod cluster;
 use cluster::Cluster;
 use esker_sql::pgwire::session::{Execute, Outcome, Params};
 use esker_sql::sqlstate;
-use esker_sql::value::{PgType};
+use esker_sql::value::PgType;
 
 /// The first end-to-end transaction: DDL and DML through Percolator, with the catalog in one
 /// region and the rows in another.

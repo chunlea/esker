@@ -22,7 +22,7 @@
 use crate::plan::{Expr, Literal};
 use crate::row::RowSchema;
 use crate::value::Datum;
-use crate::value::{PgDatum};
+use crate::value::PgDatum;
 
 /// One `JOIN`, as written.
 ///

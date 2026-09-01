@@ -13,8 +13,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use esker_sql::row::index_key;
+use esker_sql::value::PgDatum;
 use esker_sql::value::{ColumnType, Datum};
-use esker_sql::value::{PgDatum};
 
 #[test]
 fn encoded_keys_sort_the_way_postgresql_sorts_the_values() {

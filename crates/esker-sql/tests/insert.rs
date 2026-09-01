@@ -21,8 +21,8 @@ use esker_sql::parse::parse_statements;
 use esker_sql::pgwire::session::{Execute, Outcome, Params};
 use esker_sql::row;
 use esker_sql::sqlstate;
+use esker_sql::value::PgDatum;
 use esker_sql::value::{ColumnType, Datum};
-use esker_sql::value::{PgDatum};
 
 /// A node, and as many sessions against it as a test needs.
 struct Node {

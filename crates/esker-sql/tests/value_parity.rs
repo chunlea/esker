@@ -19,8 +19,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use esker_sql::value::PgDatum;
 use esker_sql::value::{ColumnType, Datum};
-use esker_sql::value::{PgDatum};
 
 /// Inputs a real PostgreSQL reads and this crate deliberately does not, each answered with
 /// `0A000 feature_not_supported` naming the construct.
