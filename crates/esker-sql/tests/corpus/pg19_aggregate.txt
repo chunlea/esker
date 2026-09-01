@@ -1,0 +1,181 @@
+# What a real PostgreSQL 19beta1 does with an aggregate -- the specification unit 1 of
+# `docs/plans/phase-9-rails.md` was written from, and the evidence ADR 0031 argues over.
+#
+# Nothing here was written from the documentation or from memory. Every line was put to the
+# running `esker-pg19` container on 2026-08-31 over the fixture below, with `\set VERBOSITY
+# verbose` for the refusals, and what is recorded is what came back.
+#
+#   query <tab> types <tab> rows        the result, and the types `\gdesc` declared for it
+#   query <tab> !SQLSTATE message       PostgreSQL refused it; DETAIL and HINT follow the message
+#
+# In the `rows` column ` ; ` separates rows, `|` separates columns, `\N` is SQL NULL, and a lone
+# `-` is **no rows at all** -- which is a different answer from one row of NULL and the whole of
+# what the empty-input rules are about.
+#
+# The `types` column is what a client's `RowDescription` says, so it is where the one divergence
+# this node cannot close shows up: PostgreSQL types `sum(bigint)` and `avg(bigint)` as `numeric`
+# and there is no `numeric` in this crate (ADR 0031).
+#
+# THE FOUR A READER WOULD HAVE GOT WRONG, and the reason this file exists rather than a paragraph:
+#
+#   * `min(boolean)` and `max(boolean)` DO NOT EXIST. They are `42883`, not an ordering of `f` and
+#     `t` -- so refusing them is parity and implementing them would be the divergence.
+#   * an ungrouped aggregate with a `HAVING` that is false returns NO ROWS, where the same query
+#     without the `HAVING` returns one row of zero. `HAVING` filters the one implicit group.
+#   * `GROUP BY` may name an output alias (`GROUP BY gg`) and `HAVING` may NOT (`HAVING c > 0` is
+#     `42703 column "c" does not exist`). The two clauses do not share a name scope.
+#   * `sum(bigint)` over two `9223372036854775807`s is `18446744073709551614`. PostgreSQL's sum is
+#     `numeric` and cannot overflow; ours is `int8` and errors instead, which is ADR 0031's
+#     declared divergence and the row this file exists to keep honest.
+#
+# The fixture, replayed by `tests/aggregate_parity.rs` before the first query:
+#
+#   CREATE TABLE agg (id int8 PRIMARY KEY, g text, n int8, f float8, b bool, ts timestamptz, y bytea);
+#   INSERT INTO agg VALUES
+#     (1, 'a',  10,   1.5,   true,  '2024-01-01 00:00:00+00', '\x01'),
+#     (2, 'a',  20,   2.5,   false, '2024-06-01 12:00:00+00', '\x02'),
+#     (3, 'b',  NULL, NULL,  NULL,  NULL,                     NULL),
+#     (4, 'b',  -5,   0.5,   true,  '2023-01-01 00:00:00+00', '\xff'),
+#     (5, NULL, 7,    'NaN', false, '2025-01-01 00:00:00+00', '\x00');
+#   CREATE TABLE wide (id int8 PRIMARY KEY, n int8, g text);          -- stays empty
+#   CREATE TABLE big (id int8 PRIMARY KEY, n int8);
+#   INSERT INTO big VALUES (1, 9223372036854775807), (2, 9223372036854775807);
+#
+# --- count: every row, and the NULL rule
+SELECT count(*) FROM agg	bigint	5
+SELECT count(n) FROM agg	bigint	4
+SELECT count(g) FROM agg	bigint	4
+SELECT count(*), count(n), count(g) FROM agg	bigint,bigint,bigint	5|4|4
+SELECT count(1) FROM agg	bigint	5
+SELECT count(id) FROM agg	bigint	5
+SELECT COUNT(*) FROM agg	bigint	5
+SELECT count() FROM agg	!42809 count(*) must be used to call a parameterless aggregate function
+SELECT count(*, 1) FROM agg	!42601 syntax error at or near ","
+SELECT COUNT(*) AS "count_all" FROM "agg"	bigint	5
+SELECT COUNT(DISTINCT "agg"."id") FROM "agg"	bigint	5
+
+# --- the empty-input rules: an ungrouped aggregate over no rows is one row, not none
+SELECT count(*) FROM wide	bigint	0
+SELECT count(n) FROM wide	bigint	0
+SELECT count(*) FROM agg WHERE n > 1000	bigint	0
+SELECT sum(n) FROM wide	numeric	\N
+SELECT sum(n) FROM agg WHERE n > 1000	numeric	\N
+SELECT min(n), max(n) FROM wide	bigint,bigint	\N|\N
+SELECT max(n) FROM agg WHERE false	bigint	\N
+SELECT avg(n) FROM wide	numeric	\N
+SELECT avg(f) FROM agg WHERE false	double precision	\N
+SELECT sum(f) FROM agg WHERE false	double precision	\N
+SELECT min(g) FROM agg WHERE g IS NULL	text	\N
+SELECT g, count(*) FROM wide GROUP BY g	text,bigint	-
+
+# --- sum: the type, and the overflow PostgreSQL cannot have
+SELECT sum(n) FROM agg	numeric	32
+SELECT sum(f) FROM agg	double precision	NaN
+SELECT sum(n) FROM big	numeric	18446744073709551614
+SELECT sum(DISTINCT n) FROM agg	numeric	32
+SELECT sum(g) FROM agg	!42883 function sum(text) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT sum(b) FROM agg	!42883 function sum(boolean) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT sum(ts) FROM agg	!42883 function sum(timestamp with time zone) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+
+# --- min and max: the six types, and the two that have no aggregate at all
+SELECT min(n), max(n) FROM agg	bigint,bigint	-5|20
+SELECT min(g), max(g) FROM agg	text,text	a|b
+SELECT min(f), max(f) FROM agg	double precision,double precision	0.5|NaN
+SELECT min(f), max(f) FROM agg WHERE id = 5	double precision,double precision	NaN|NaN
+SELECT min(ts), max(ts) FROM agg	timestamp with time zone,timestamp with time zone	2023-01-01 00:00:00+00|2025-01-01 00:00:00+00
+SELECT min(y), max(y) FROM agg	bytea,bytea	\x00|\xff
+SELECT min(b), max(b) FROM agg	!42883 function min(boolean) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT min(id), max(id), count(*) FROM agg	bigint,bigint,bigint	1|5|5
+SELECT MAX("agg"."id") AS max_id FROM "agg"	bigint	5
+
+# --- avg: sixteen fractional digits, which is where numeric stops being optional
+SELECT avg(n) FROM agg	numeric	8.0000000000000000
+SELECT avg(f) FROM agg	double precision	NaN
+SELECT avg(n) FROM agg WHERE id = 1	numeric	10.0000000000000000
+SELECT avg(n) FROM agg WHERE id IN (1, 4)	numeric	2.5000000000000000
+SELECT avg(n) FROM agg WHERE id IN (1, 2)	numeric	15.0000000000000000
+SELECT avg(n) FROM agg WHERE id IN (1, 2, 4)	numeric	8.3333333333333333
+SELECT avg(id) FROM agg	numeric	3.0000000000000000
+SELECT avg(n)::text FROM agg	text	8.0000000000000000
+SELECT avg(g) FROM agg	!42883 function avg(text) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT avg(b) FROM agg	!42883 function avg(boolean) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT pg_typeof(count(*)), pg_typeof(sum(n)), pg_typeof(avg(n)), pg_typeof(sum(f)), pg_typeof(avg(f)) FROM agg	regtype,regtype,regtype,regtype,regtype	bigint|numeric|numeric|double precision|double precision
+
+# --- GROUP BY: NULL is one group of its own, and the group order is not promised
+SELECT g, count(*) FROM agg GROUP BY g ORDER BY g	text,bigint	a|2 ; b|2 ; \N|1
+SELECT g, count(*) FROM agg GROUP BY g ORDER BY g NULLS FIRST	text,bigint	\N|1 ; a|2 ; b|2
+SELECT g, count(*) FROM agg GROUP BY g	text,bigint	\N|1 ; a|2 ; b|2
+SELECT g, count(n), sum(n), min(n), max(n) FROM agg GROUP BY g ORDER BY g	text,bigint,numeric,bigint,bigint	a|2|30|10|20 ; b|1|-5|-5|-5 ; \N|1|7|7|7
+SELECT avg(n), sum(n), count(n), min(n), max(n) FROM agg GROUP BY g ORDER BY g	numeric,numeric,bigint,bigint,bigint	15.0000000000000000|30|2|10|20 ; -5.0000000000000000|-5|1|-5|-5 ; 7.0000000000000000|7|1|7|7
+SELECT g, sum(n) FROM agg GROUP BY g ORDER BY g	text,numeric	a|30 ; b|-5 ; \N|7
+SELECT count(*), g FROM agg GROUP BY g ORDER BY g	bigint,text	2|a ; 2|b ; 1|\N
+SELECT g, count(*) FROM agg WHERE n IS NOT NULL GROUP BY g ORDER BY g	text,bigint	a|2 ; b|1 ; \N|1
+SELECT count(*) FROM agg WHERE g = 'a' GROUP BY g	bigint	2
+SELECT g, count(*) FROM agg GROUP BY 1 ORDER BY 1	text,bigint	a|2 ; b|2 ; \N|1
+SELECT g, count(*) FROM agg GROUP BY g, g ORDER BY g	text,bigint	a|2 ; b|2 ; \N|1
+SELECT g AS gg, count(*) FROM agg GROUP BY gg ORDER BY gg	text,bigint	a|2 ; b|2 ; \N|1
+SELECT g, n, count(*) FROM agg GROUP BY g, n ORDER BY g, n	text,bigint,bigint	a|10|1 ; a|20|1 ; b|-5|1 ; b|\N|1 ; \N|7|1
+SELECT count(*) FROM agg GROUP BY id ORDER BY id	bigint	1 ; 1 ; 1 ; 1 ; 1
+SELECT count(*) FROM agg GROUP BY n IS NULL ORDER BY 1	bigint	1 ; 4
+SELECT n FROM agg GROUP BY n ORDER BY n	bigint	-5 ; 7 ; 10 ; 20 ; \N
+SELECT n FROM agg GROUP BY n ORDER BY n NULLS FIRST	bigint	\N ; -5 ; 7 ; 10 ; 20
+SELECT max(g) FROM agg GROUP BY b ORDER BY b	text	a ; b ; b
+SELECT count(*) FROM agg GROUP BY ts ORDER BY ts	bigint	1 ; 1 ; 1 ; 1 ; 1
+SELECT count(*) FROM agg GROUP BY y ORDER BY y	bigint	1 ; 1 ; 1 ; 1 ; 1
+SELECT count(*) FROM agg GROUP BY f ORDER BY f	bigint	1 ; 1 ; 1 ; 1 ; 1
+SELECT g, count(*) FROM agg GROUP BY g ORDER BY g LIMIT 1	text,bigint	a|2
+SELECT g, count(*) FROM agg GROUP BY g ORDER BY g OFFSET 1	text,bigint	b|2 ; \N|1
+SELECT count(*) FROM agg GROUP BY g LIMIT 1	bigint	1
+
+# --- what must appear in the GROUP BY, and where an aggregate may not appear
+SELECT g, n FROM agg GROUP BY g	!42803 column "agg.n" must appear in the GROUP BY clause or be used in an aggregate function
+SELECT n FROM agg GROUP BY g	!42803 column "agg.n" must appear in the GROUP BY clause or be used in an aggregate function
+SELECT count(*) FROM agg ORDER BY g	!42803 column "agg.g" must appear in the GROUP BY clause or be used in an aggregate function
+SELECT count(*) FROM agg WHERE count(*) > 1	!42803 aggregate functions are not allowed in WHERE
+SELECT count(count(*)) FROM agg	!42803 aggregate function calls cannot be nested
+
+# --- HAVING, including the one over no GROUP BY at all
+SELECT g, count(*) FROM agg GROUP BY g HAVING count(*) > 1 ORDER BY g	text,bigint	a|2 ; b|2
+SELECT g FROM agg GROUP BY g HAVING sum(n) > 5 ORDER BY g	text	a ; \N
+SELECT g FROM agg GROUP BY g HAVING g > 'a' ORDER BY g	text	b
+SELECT g FROM agg GROUP BY g HAVING count(n) = 0 ORDER BY g	text	-
+SELECT count(*) FROM agg HAVING count(*) > 0	bigint	5
+SELECT count(*) FROM agg HAVING count(*) > 99	bigint	-
+SELECT count(*) FROM agg HAVING true	bigint	5
+SELECT count(*) FROM agg WHERE true HAVING count(*) = 5	bigint	5
+SELECT sum(n) FROM agg HAVING sum(n) IS NOT NULL	numeric	32
+SELECT count(*) AS c FROM agg HAVING c > 0	!42703 column "c" does not exist
+SELECT count(*) FROM agg WHERE id > 0 GROUP BY g HAVING count(*) = 2 ORDER BY 1	bigint	2 ; 2
+
+# --- ORDER BY over an aggregate, an alias, and a group key
+SELECT g, count(*) AS c FROM agg GROUP BY g ORDER BY c DESC, g	text,bigint	a|2 ; b|2 ; \N|1
+SELECT g, count(*) FROM agg GROUP BY g ORDER BY count(*) DESC, g	text,bigint	a|2 ; b|2 ; \N|1
+SELECT count(*) AS c FROM agg ORDER BY c	bigint	5
+SELECT count(*) FROM agg GROUP BY g HAVING count(*) > 0 ORDER BY count(*)	bigint	1 ; 2 ; 2
+SELECT sum(n) FROM agg GROUP BY g ORDER BY sum(n) NULLS LAST	numeric	-5 ; 7 ; 30
+
+# --- DISTINCT, in both places it can be written
+SELECT count(DISTINCT g) FROM agg	bigint	2
+SELECT count(DISTINCT n) FROM agg	bigint	4
+SELECT DISTINCT g FROM agg ORDER BY g	text	a ; b ; \N
+SELECT DISTINCT n FROM agg ORDER BY n	bigint	-5 ; 7 ; 10 ; 20 ; \N
+SELECT DISTINCT g, b FROM agg ORDER BY g, b	text,boolean	a|f ; a|t ; b|t ; b|\N ; \N|f
+SELECT DISTINCT count(*) FROM agg	bigint	5
+SELECT DISTINCT ON (g) g, n FROM agg ORDER BY g, n	text,bigint	a|10 ; b|-5 ; \N|7
+
+# --- over a join, and over no table
+SELECT count(*) FROM agg a JOIN agg b ON a.id = b.id	bigint	5
+SELECT sum(a.n) FROM agg a JOIN agg b ON a.id = b.id	numeric	32
+SELECT count(*) FROM agg, wide	bigint	0
+SELECT count(*) FROM (SELECT 1) s	bigint	1
+SELECT count(*) FROM agg LIMIT 0	bigint	-
+
+# --- the surface next to this one, captured so the refusals can name it rather than guess
+SELECT count(*) FROM agg GROUP BY ()	bigint	5
+SELECT g, count(*) FROM agg GROUP BY GROUPING SETS ((g), ())	text,bigint	\N|5 ; \N|1 ; a|2 ; b|2
+SELECT count(*) FILTER (WHERE n > 0) FROM agg	bigint	3
+SELECT bool_and(b), bool_or(b) FROM agg	boolean,boolean	f|t
+SELECT string_agg(g, ',') FROM agg	text	a,a,b,b
+SELECT array_agg(n) FROM agg	bigint[]	{10,20,NULL,-5,7}
+SELECT count(*) + 1 FROM agg	bigint	6
+SELECT sum(n) + 0 FROM agg	numeric	32
