@@ -1,0 +1,25 @@
+crates/esker-store/src/server.rs
+  s_b3f6a712d611c9::t_64d399d5e392d1 549-556,2212-2303
+crates/esker-store/tests/bench_columnar.rs
+  s_b3f6a712d611c9::t_8eb461fc0ebc94 20-29
+crates/esker-store/tests/pd_client.rs
+  s_b3f6a712d611c9::t_2692188f8cae0e 61-65
+docs/bench/columnar-learner.md
+  s_b3f6a712d611c9::t_0bd3050e5c6af7 46-62
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "56afa3efb2cb17639b41ea91b8a71a99f9b91591",
+  "prompts": {},
+  "sessions": {
+    "s_b3f6a712d611c9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "78adef9a-88ef-4c89-a340-f825de3d2ab7",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
