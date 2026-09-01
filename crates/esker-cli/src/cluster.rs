@@ -330,13 +330,9 @@ fn start(
         data_dir.display()
     );
 
-    // Supervise: wait for ctrl-C or for a child to die, then stop the rest politely. A cluster
-    // that lost a child is stopped exactly as an interrupted one is and **exits non-zero**, so a
-    // script that started one is told, rather than reading a clean exit as a clean run.
-    let lost = wait_for_interrupt(&mut children);
-    if let Some(gone) = &lost {
-        eprintln!("esker cluster: {gone}");
-    }
+    // Supervise until ctrl-C, naming any child that dies on the way but leaving the rest running:
+    // killing one node while the others carry on is what this command is for.
+    wait_for_interrupt(&mut children);
     println!("esker cluster: stopping");
     for (id, child) in &mut children {
         signal(child.id(), "TERM");
@@ -347,10 +343,7 @@ fn start(
         }
     }
     let _ = std::fs::remove_file(data_dir.join(STATE_FILE));
-    match lost {
-        Some(gone) => Err(gone),
-        None => Ok(()),
-    }
+    Ok(())
 }
 
 fn stop(data_dir: &Path) -> Result<(), String> {
@@ -447,19 +440,33 @@ fn what(id: u64) -> String {
     }
 }
 
-/// Blocks until ctrl-C or until a child exits, and says which happened.
+/// Blocks until ctrl-C, naming any child that exits along the way.
 ///
 /// A child that dies while the cluster is up used to be invisible: this process blocked on a
 /// signal and nothing looked at them again until the whole thing was stopped, so a cluster could
-/// spend an afternoon as three nodes of four with no line saying so anywhere.
-fn wait_for_interrupt(children: &mut [(u64, Child)]) -> Option<String> {
+/// spend an afternoon as three nodes of four with no line saying so anywhere. It says so now.
+///
+/// **And it says so and keeps going**, which is not a detail. A node of this cluster being killed
+/// — `SIGKILL`, not a shutdown — while the others carry on is the entire reason the command runs
+/// child processes at all (this module's header), and it is what `esker-cli`'s chaos battery does
+/// fifty times in a row. A supervisor that stopped the cluster at the first death would make that
+/// battery test its own teardown; it did, for one commit, and the acceptance run hung on stores
+/// that had been taken away from it.
+///
+/// The startup check is the one that fails the command, and it is a different question:
+/// [`first_child_that_died`] runs before anything is announced, where a dead child means the
+/// cluster never formed rather than that somebody is testing it.
+fn wait_for_interrupt(children: &mut [(u64, Child)]) {
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     else {
         eprintln!("esker cluster: cannot listen for ctrl-c; stopping immediately");
-        return None;
+        return;
     };
+    // One line per child and never more: a reaped child answers `try_wait` with its status for
+    // ever, and a supervisor that said so every tick would bury the log it exists to write.
+    let mut reported: Vec<u64> = Vec::new();
     runtime.block_on(async {
         let interrupt = tokio::signal::ctrl_c();
         tokio::pin!(interrupt);
@@ -469,18 +476,22 @@ fn wait_for_interrupt(children: &mut [(u64, Child)]) -> Option<String> {
                     if let Err(error) = signalled {
                         eprintln!("esker cluster: cannot listen for ctrl-c ({error}); stopping");
                     }
-                    return None;
+                    return;
                 }
                 () = tokio::time::sleep(SUPERVISE_TICK) => {
                     for (id, child) in children.iter_mut() {
+                        if reported.contains(id) {
+                            continue;
+                        }
                         if let Ok(Some(status)) = child.try_wait() {
-                            return Some(format!("{} exited with {status}", what(*id)));
+                            reported.push(*id);
+                            eprintln!("esker cluster: {} exited with {status}", what(*id));
                         }
                     }
                 }
             }
         }
-    })
+    });
 }
 
 /// `id address pid`, one node per line.
