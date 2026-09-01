@@ -1,0 +1,49 @@
+crates/esker-sql/src/catalog/mod.rs
+  s_e2fd0c54b9d574::t_e40fa061bd855e 41,625-632
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_e2fd0c54b9d574::t_03ee9a1e06115b 1-252
+crates/esker-sql/src/error.rs
+  s_e2fd0c54b9d574::t_2b223add4e2427 105-114,782
+crates/esker-sql/src/exec/cursor.rs
+  s_e2fd0c54b9d574::t_25e7761d64fc46 51-52,118-164,170-172,192,198-205,266-267
+crates/esker-sql/src/exec/ddl.rs
+  s_e2fd0c54b9d574::t_38fe658fa05b5a 195-196,258,439,576-584
+crates/esker-sql/src/exec/dml.rs
+  s_e2fd0c54b9d574::t_e6b3dea0e626cc 109,338,407
+crates/esker-sql/src/exec/query.rs
+  s_e2fd0c54b9d574::t_20f91cc19fb710 25,664-667,669,686,783-789
+crates/esker-sql/src/plan/mod.rs
+  s_e2fd0c54b9d574::t_9b05eac970275a 29
+crates/esker-sql/src/plan/query.rs
+  s_e2fd0c54b9d574::t_e07d8c26261f80 22,190-202,279,281-283,456-461
+crates/esker-sql/src/sqlstate.rs
+  s_e2fd0c54b9d574::t_d2f75f54163f82 131-135
+crates/esker-sql/tests/activerecord_surface.rs
+  s_e2fd0c54b9d574::t_1e55ef5e50c2f4 66-73
+crates/esker-sql/tests/corpus/pg19_pg_catalog.txt
+  s_e2fd0c54b9d574::t_ac96a69a1e4c3c 1-112
+crates/esker-sql/tests/pg_catalog.rs
+  s_e2fd0c54b9d574::t_96b58fdaf958f7 1-272
+docs/adr/0033-the-three-types-a-rails-migration-emits.md
+  s_e2fd0c54b9d574::t_5ca474316b139c 1-128
+docs/bench/rails-scoreboard.md
+  s_e2fd0c54b9d574::t_0801e48afad7f6 16-28,31,35,41-47,53,56,60-64,66-99,105-153,162-163,165-166,168-170,172,180-181,183-185,187-191,217-225,236-238
+docs/plans/phase-9-rails.md
+  s_e2fd0c54b9d574::t_3f98ad70c71e7f 3,462-474,565,684-754,792-799,927-971,983-985
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "c88a9329aa0d12526d474684fdd252abc3b3eac4",
+  "prompts": {},
+  "sessions": {
+    "s_e2fd0c54b9d574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "671f3143-5435-4676-97d9-490a56835160",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
