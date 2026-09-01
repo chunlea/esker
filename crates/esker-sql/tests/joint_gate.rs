@@ -31,6 +31,7 @@
 
 mod cluster;
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -40,10 +41,12 @@ use esker_client::{TcpStores, TimestampOracle, TxnClient};
 use esker_pd::{Pd, PdOptions, PdService};
 use esker_proto::fragment::result::{Body, Value as WireValue};
 use esker_proto::fragment::{FragmentReq, FragmentResp, RefusalReason};
+use esker_proto::txn::TxnStatus;
 use esker_proto::{
     BlockingTransport, PeerRole, Request, RequestHeader, Response, Server, ServerHandle, Service,
     TransportConfig,
 };
+use esker_proto::{TxnKvReq, TxnKvResp, TxnMutation};
 use esker_sql::Datum;
 use esker_sql::backend::{Backend, SchemaLease as SchemaLeaseSource};
 use esker_sql::catalog::Catalog;
@@ -492,6 +495,38 @@ impl Gate {
         }
     }
 
+    /// One `TxnKv` request, over a real socket, to whichever store **leads** the region.
+    ///
+    /// The wire and not the client, because what this drives is a half-finished transaction — a
+    /// prewrite whose commit never comes for one of its keys — and the client's whole job is to
+    /// not leave one of those behind.
+    fn txn(&self, region_id: u64, request: TxnKvReq) -> TxnKvResp {
+        let leader = self
+            .nodes
+            .iter()
+            .find(|node| {
+                node.store
+                    .peer_of(region_id)
+                    .is_some_and(|peer| peer.is_leader())
+            })
+            .expect("some store leads the region");
+        let epoch = leader
+            .store
+            .regions()
+            .get(region_id)
+            .expect("the leader hosts the region")
+            .region()
+            .epoch;
+        let transport = BlockingTransport::connect(leader.address).unwrap();
+        let answer = transport
+            .call(
+                Request::txn_kv(RequestHeader::new(region_id, epoch, 0), request),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .expect("the leader answered");
+        answer.into_txn_kv().expect("a TxnKv answer")
+    }
+
     /// The store ids holding a columnar learner of any region, as **PD** records them.
     fn columnar_learners(&self) -> Vec<u64> {
         let mut found: Vec<u64> = self
@@ -630,6 +665,320 @@ async fn an_alter_places_a_columnar_replica_and_clearing_it_takes_it_back() {
     gate.stop().await;
 }
 
+/// Compares the two engines and, on a disagreement, **writes everything down before failing**.
+///
+/// A silent disagreement between the row store and the columnar copy is what ADR 0022 calls the
+/// worst failure this feature can have. When one appears it is very likely to be rare, and a rare
+/// failure whose evidence went to a terminal that was grepped is worth almost nothing — that has
+/// happened once already on this test (`docs/plans/phase-8-learner.md` §close). So the dump goes
+/// to a **file**: `target/joint-gate-disagreement-<ts>.txt`, named in the panic, holding both
+/// sides, the instant, the fragment's shape, what each store holds for the table, and the lock
+/// column family — because the difference between "a version is missing" and "a version is
+/// hidden" is the difference between a catch-up bug and an MVCC one.
+fn compare(gate: &Gate, what: &Comparison) {
+    if what.columns == what.rows {
+        return;
+    }
+    let mut dump = String::new();
+    dump.push_str("the columnar copy and the row store disagree\n\n");
+    let _ = writeln!(dump, "ts               {}", what.ts);
+    let _ = writeln!(dump, "min_apply_index  {}", what.min_apply_index);
+    let _ = writeln!(dump, "table_id         {}", what.table_id);
+    let _ = writeln!(dump, "projection       {:?}", what.projection);
+    let _ = writeln!(dump, "region           {}", what.region_id);
+    dump.push_str("\n-- the fragment answered ------------------------------------------\n");
+    for row in &what.columns {
+        let _ = writeln!(dump, "{row:?}");
+    }
+    dump.push_str("\n-- the row scan answered ------------------------------------------\n");
+    for row in &what.rows {
+        let _ = writeln!(dump, "{row:?}");
+    }
+    dump.push_str("\n-- only the fragment has ------------------------------------------\n");
+    for row in what.columns.iter().filter(|row| !what.rows.contains(row)) {
+        let _ = writeln!(dump, "{row:?}");
+    }
+    dump.push_str("\n-- only the row scan has -----------------------------------------\n");
+    for row in what.rows.iter().filter(|row| !what.columns.contains(row)) {
+        let _ = writeln!(dump, "{row:?}");
+    }
+    dump.push_str("\n-- every store ---------------------------------------------------\n");
+    for node in &gate.nodes {
+        let store = &node.store;
+        let peer = store.peer_of(what.region_id);
+        let _ = writeln!(
+            dump,
+            "store {}  leader={:?}  applied={:?}  columnar={}",
+            store.store_id(),
+            peer.as_ref().map(|peer| peer.is_leader()),
+            peer.as_ref().map(|peer| peer.applied_index()),
+            store
+                .regions()
+                .get(what.region_id)
+                .is_some_and(|state| state.region().peers.iter().any(|peer| {
+                    peer.store_id == store.store_id() && peer.role == PeerRole::ColumnarLearner
+                })),
+        );
+        let _ = writeln!(dump, "  what it holds for this table:");
+        for line in table_state(store, what.region_id, what.table_id, &what.ids) {
+            let _ = writeln!(dump, "    {line}");
+        }
+    }
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target")
+        .join(format!("joint-gate-disagreement-{}.txt", what.ts));
+    let written = std::fs::write(&path, &dump);
+    panic!(
+        "the columnar copy and the row store disagree at ts {}; dump {} at {}\n{dump}",
+        what.ts,
+        if written.is_ok() {
+            "written"
+        } else {
+            "NOT written"
+        },
+        path.display(),
+    );
+}
+
+/// Everything one comparison is made of, so the dump can say all of it.
+struct Comparison {
+    ts: u64,
+    min_apply_index: u64,
+    table_id: u64,
+    region_id: u64,
+    projection: Vec<u32>,
+    columns: Vec<Vec<Cell>>,
+    rows: Vec<Vec<Cell>>,
+    /// The primary keys the workload touched, so the dump can ask every store about each one.
+    ids: Vec<i64>,
+}
+
+/// What each store holds for the table's rows, read from that store and no other.
+///
+/// Two facts per row and they answer different questions: the number of `write` records says
+/// whether the version **is there**, and a direct read at "whatever is committed" says whether it
+/// is **visible** and whether a lock is standing over it. A version missing on the learner is a
+/// catch-up or a tee; a version present and not visible is MVCC; a lock is the resolution path.
+///
+/// Read through the store's own direct path rather than the engine's column families, because
+/// this test crate does not link `esker-engine` and a dump is not worth a dependency.
+fn table_state(store: &Arc<Store>, region_id: u64, table_id: u64, ids: &[i64]) -> Vec<String> {
+    let Some(state) = store.regions().get(region_id) else {
+        return vec!["does not host the region".to_owned()];
+    };
+    ids.iter()
+        .map(|id| {
+            let key = bytes::Bytes::from(
+                esker_keys::row::row_key(TENANT, table_id, &[Datum::Int8(*id)]).expect("a row key"),
+            );
+            let versions = store
+                .write_records(&key)
+                .map_or_else(|error| format!("unreadable: {error}"), |n| n.to_string());
+            let visible = match store.handle_txn(
+                &state,
+                TxnKvReq::Get {
+                    key: key.clone(),
+                    ts: u64::MAX,
+                },
+            ) {
+                Ok(TxnKvResp::Get { value: Some(value) }) => {
+                    format!("{} bytes", value.len())
+                }
+                Ok(TxnKvResp::Get { value: None }) => "absent".to_owned(),
+                Ok(other) => format!("{other:?}"),
+                Err(error) => format!("refused: {error}"),
+            };
+            format!("id {id}: {versions} write records, reads as {visible}")
+        })
+        .collect()
+}
+
+/// One of `t`'s row keys, as the SQL layer writes them.
+fn row_key(table_id: u64, id: i64) -> bytes::Bytes {
+    bytes::Bytes::from(
+        esker_keys::row::row_key(TENANT, table_id, &[Datum::Int8(id)]).expect("a row key"),
+    )
+}
+
+/// One of `t`'s row values, `(id int8, name text)`, as the SQL layer encodes them.
+fn row_value(id: i64, name: &str) -> bytes::Bytes {
+    bytes::Bytes::from(
+        esker_keys::row::encode_row(
+            &[
+                esker_keys::value::ColumnType::Int8,
+                esker_keys::value::ColumnType::Text,
+            ],
+            &[Datum::Int8(id), Datum::Text(name.to_owned())],
+        )
+        .expect("a row value"),
+    )
+}
+
+/// Leaves `secondary` locked by a transaction whose primary **committed**: prewrite both, commit
+/// the primary alone.
+///
+/// The state a client that died between its two steps leaves behind, and the only one in which a
+/// resolver has to roll a lock *forward*. Driven over the wire because the client exists to not
+/// produce it.
+fn strand_a_secondary_lock(
+    gate: &Gate,
+    region_id: u64,
+    primary: &bytes::Bytes,
+    secondary: &bytes::Bytes,
+    ttl_ms: u64,
+) {
+    let start_ts = gate.oracle.timestamp().unwrap();
+    let answer = gate.txn(
+        region_id,
+        TxnKvReq::Prewrite {
+            start_ts,
+            primary: primary.clone(),
+            ttl_ms,
+            mutations: vec![
+                TxnMutation::Put {
+                    key: primary.clone(),
+                    value: row_value(4, "katherine"),
+                },
+                TxnMutation::Put {
+                    key: secondary.clone(),
+                    value: row_value(5, "barbara"),
+                },
+            ],
+        },
+    );
+    assert_eq!(
+        answer,
+        TxnKvResp::prewrite_ok(2),
+        "the prewrite this test is built on was refused",
+    );
+
+    let commit_ts = gate.oracle.timestamp().unwrap();
+    let answer = gate.txn(
+        region_id,
+        TxnKvReq::Commit {
+            start_ts,
+            commit_ts,
+            keys: vec![primary.clone()],
+        },
+    );
+    assert_eq!(
+        answer,
+        TxnKvResp::Commit {
+            status: TxnStatus::Ok
+        },
+        "the primary did not commit, so there is no roll-forward to test",
+    );
+}
+
+/// **The interleaving the physical oracle made possible**: a lock the TTL kills, resolved by the
+/// row read, and the columnar copy asked about the same instant afterwards.
+///
+/// Constructed rather than waited for. `docs/plans/phase-8-learner.md` §close records the
+/// differential disagreeing once, at the moment this gate's oracle stopped being a counter, and
+/// names the candidate the change introduced: with physical timestamps a lock **can** now be
+/// judged dead, and a reader that finds one resolves it — rolling it forward if its primary
+/// committed, back if not — which under a counter could never happen at all.
+///
+/// The interleaving in full, driven over the wire so that no layer smooths it over:
+///
+/// 1. a transaction prewrites two of the table's rows and commits **only its primary**, which is
+///    the state a client that died between the two steps leaves behind;
+/// 2. the secondary's lock is therefore standing, over a transaction that *did* commit;
+/// 3. time passes — real time, which is what the TTL is measured in — until any reader will judge
+///    that lock dead;
+/// 4. the row scan resolves it, which for a committed primary means **rolling it forward**: a
+///    `write` record appears for a key that had none, written by a reader rather than by a writer;
+/// 5. the columnar copy is asked about the same instant, after catching up to the leader.
+///
+/// Step 4 is the one that could go wrong silently. That record is created by `ResolveLock`, not by
+/// `Commit`, and a tee that only watched commits would never see it — the learner would hold every
+/// version except the ones a resolver produced, for ever, and only for transactions whose client
+/// died at exactly the wrong moment. `esker_store::peer`'s `commits_of` covers it, and this is
+/// what says so from outside.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lock_the_ttl_kills_resolves_the_same_way_on_both_engines() {
+    let gate = Gate::start().await;
+    tokio::task::block_in_place(|| {
+        let mut session = gate.session();
+        settle(
+            &mut session,
+            "CREATE TABLE t (id int8 PRIMARY KEY, name text)",
+        );
+        settle(
+            &mut session,
+            "INSERT INTO t VALUES (1, 'ada'), (2, 'grace'), (3, 'edsger')",
+        );
+        settle(&mut session, "ALTER TABLE t SET (columnar_replicas = 1)");
+    });
+    wait_for("PD to place a columnar learner", 60, || {
+        gate.columnar_learners().len() == 1
+    })
+    .await;
+    wait_for("the store to build the learner", 60, || {
+        gate.learner_node().store.regions().find(b"t").is_some()
+    })
+    .await;
+
+    let table_id = tokio::task::block_in_place(|| gate.table_id("t"));
+    let region_id = gate.learner_node().store.regions().find(b"t").unwrap().id();
+    let primary = row_key(table_id, 4);
+    let secondary = row_key(table_id, 5);
+
+    // 1 and 2. A short TTL because the wait below is real seconds and this test has no reason to
+    // spend three of them.
+    let ttl_ms = 300;
+    tokio::task::block_in_place(|| {
+        strand_a_secondary_lock(&gate, region_id, &primary, &secondary, ttl_ms);
+    });
+
+    // 3. Past the TTL, in the only units a TTL has. `is_expired` compares the *physical* halves of
+    // two oracle timestamps, so this is the wait that a counting oracle could not express — which
+    // is the whole reason this test exists.
+    tokio::time::sleep(Duration::from_millis(ttl_ms * 4)).await;
+
+    // 4. The row scan, at an instant after the commit. It meets the standing lock, resolves it
+    // against a primary that committed, and rolls it forward.
+    let ts = gate.oracle.timestamp().unwrap();
+    let projection = vec![0, 1];
+    let rows = tokio::task::block_in_place(|| gate.row_scan(ts, table_id, &projection));
+    assert!(
+        rows.contains(&vec![Cell::Int8(5), Cell::Text("barbara".to_owned())]),
+        "the row store did not roll the secondary forward, so the case this test is about did \
+         not happen: {rows:?}",
+    );
+
+    // 5. And the columnar copy, once it has applied at least as much as the leader — which now
+    // includes whatever the resolution proposed.
+    let min_apply_index = gate
+        .nodes
+        .iter()
+        .filter_map(|node| node.store.peer_of(region_id))
+        .filter(|peer| peer.is_leader())
+        .map(|peer| peer.applied_index())
+        .max()
+        .expect("some store leads the region");
+    let columns = tokio::task::block_in_place(|| {
+        gate.fragment(TENANT, table_id, ts, min_apply_index, projection.clone())
+    });
+
+    compare(
+        &gate,
+        &Comparison {
+            ts,
+            min_apply_index,
+            table_id,
+            region_id,
+            projection,
+            columns,
+            rows,
+            ids: vec![1, 2, 3, 4, 5],
+        },
+    );
+
+    gate.stop().await;
+}
+
 /// **The differential, on a live cluster.** Fragments and rows agree at one timestamp.
 ///
 /// ADR 0022 names the two engines disagreeing as the worst failure this feature can have,
@@ -726,9 +1075,18 @@ async fn the_learner_answers_fragments_that_agree_with_a_row_scan() {
     });
     let rows = tokio::task::block_in_place(|| gate.row_scan(ts, table_id, &projection));
 
-    assert_eq!(
-        columns, rows,
-        "the columnar copy and the row store disagree at ts {ts}",
+    compare(
+        &gate,
+        &Comparison {
+            ts,
+            min_apply_index,
+            table_id,
+            region_id,
+            projection,
+            columns,
+            rows: rows.clone(),
+            ids: vec![1, 2, 3, 4, 5, 6],
+        },
     );
     let text = |value: &str| Cell::Text(value.to_owned());
     assert_eq!(
