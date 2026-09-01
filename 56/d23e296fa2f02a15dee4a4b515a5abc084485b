@@ -1,0 +1,39 @@
+crates/esker-sql/src/error.rs
+  s_dc640bf0df4adb::t_d5ccd98e597633 393-413,722-724,733
+crates/esker-sql/src/exec/cursor.rs
+  s_dc640bf0df4adb::t_33b914ef1c74d4 98,105-110,138,176,182,268,274,282,306-307,309-311,321,323-325,329-335,337-339,354,482-494
+crates/esker-sql/src/exec/query.rs
+  s_dc640bf0df4adb::t_bf65ed27e42bdb 48-58,67,76,82,86,135-155,186-199,261-266,268-269,271-276,300,340,405,423-435,509-547,584-585,589,594-599,604,613-651
+crates/esker-sql/src/parse/lower.rs
+  s_dc640bf0df4adb::t_feabd5d6d2d5fb 1539,1541-1545,1562-1571,1574-1580,1582-1589,1591
+crates/esker-sql/src/plan/mod.rs
+  s_dc640bf0df4adb::t_c0fdd294fcfd92 35-37
+crates/esker-sql/src/plan/query.rs
+  s_dc640bf0df4adb::t_8adaf9609fb4ce 27-39,42-43,48-50,52-57,222-224,226-232
+crates/esker-sql/tests/corpus/pg19_join.txt
+  s_dc640bf0df4adb::t_e293a9f3571f68 1-76
+crates/esker-sql/tests/join.rs
+  s_dc640bf0df4adb::t_b137a54dd840bf 1-202
+crates/esker-sql/tests/select.rs
+  s_dc640bf0df4adb::t_767acf0bd86224 415-418,421-424
+crates/esker-sql/tests/slt/join.slt
+  s_dc640bf0df4adb::t_468bf0859b4dff 134-144,146-148
+docs/plans/phase-9-rails.md
+  s_dc640bf0df4adb::t_8d8a5bc989c96b 3,243-279,399-400
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "56d23e296fa2f02a15dee4a4b515a5abc084485b",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
