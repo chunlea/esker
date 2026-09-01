@@ -178,13 +178,54 @@ any, and `CACHE n` is a sequence option PostgreSQL has with exactly this behavio
 
 ### Unit 3 — `SAVEPOINT`, `ROLLBACK TO`, `RELEASE`
 
-Rails wraps each test in a transaction and rolls it back, and nests with savepoints. Percolator has
-no nested transaction, so this is an **undo log over the write buffer**: a savepoint is a mark, a
-`ROLLBACK TO` truncates the buffer to it, a `RELEASE` drops the mark. Designed honestly against the
-buffer rather than approximated — the failure mode to avoid is a `ROLLBACK TO` that leaves a write
-behind, which is a wrong answer with no error. PostgreSQL's semantics for a savepoint that does not
-exist (`3B001`), and for the state of a transaction after an error inside a savepoint, are captured
-before any of it is written.
+Rails wraps each test in a transaction and rolls it back, and nests with savepoints. **Captured
+first**, in one session, as `tests/corpus/pg19_savepoint.txt`: 48 statements, and five facts the
+file exists for.
+
+**The one that decides the shape.** `ROLLBACK TO SAVEPOINT` **un-aborts the block**. After an error
+every statement is `25P02` until the end of the transaction — except that one, which recovers it
+and lets the block go on and commit. Measured: a `23505`, then a `SELECT` that is `25P02`, then
+`ROLLBACK TO s`, then an `INSERT` that works and a `COMMIT` that keeps both the pre-savepoint row
+and the post-recovery one. That single fact is the whole of why Rails can run a test per
+transaction — a failing assertion does not poison the rest of the block — and any design that
+cannot recover an aborted block has not implemented savepoints at all.
+
+Four more, each of which a plausible implementation gets wrong:
+
+* a `ROLLBACK TO` **keeps** the savepoint, so the same one can be rolled back to twice;
+* a `RELEASE` does not, and rolling back to a released savepoint is `3B001` — which itself aborts
+  the block, so it is one of the ways *into* `25P02`;
+* **names stack.** Two `SAVEPOINT dup` are two marks: `ROLLBACK TO dup` finds the most recent,
+  `RELEASE dup` releases the most recent, and after that `ROLLBACK TO dup` finds the older one. A
+  map from name to mark gets this wrong in a way no single-savepoint test can see;
+* outside a block all three are `25P01` naming **their own verb** — `SAVEPOINT`,
+  `RELEASE SAVEPOINT`, `ROLLBACK TO SAVEPOINT` — not the one the user typed.
+
+#### The undo log, designed against the buffer rather than against the idea
+
+Percolator has no nested transaction and `esker-client`'s `Transaction` does not expose its write
+buffer — and `esker-client` is another lane's. So the honest design is not "truncate the buffer",
+which this crate cannot do, but **a compensating undo log this crate keeps itself**:
+
+* a **savepoint** pushes `(name, undo.len())` onto a stack;
+* every `put` and `delete` made while the stack is non-empty first reads the key's **pre-image**
+  through the same transaction — `txn.get(&key)` — and appends `(key, before)` to the undo log.
+  The pre-image is what *this transaction* sees, which is exactly what restoring it has to put
+  back;
+* a **`ROLLBACK TO`** finds the topmost mark of that name, replays the undo log backwards to it
+  (`put` the old value, or `delete` where there was none), truncates the log and the stack **above**
+  the mark, and leaves the mark itself;
+* a **`RELEASE`** pops the mark and everything above it and touches no data.
+
+The cost is one read per write while a savepoint is open, and an undo log the size of what the
+block wrote. Both are paid only inside a savepoint, which is the shape Rails uses and not the shape
+a bulk load does. It needs **nothing from `esker-client`**, which is what makes it buildable in this
+lane, and it is exact rather than approximate: the failure mode to avoid is a `ROLLBACK TO` that
+leaves a write behind, and replaying pre-images cannot leave one.
+
+Two things it must get right that the capture names: the aborted-block flag is **session state**
+and `ROLLBACK TO` clears it, and the undo log has to be bounded the way the sort and the group
+table are — a `53400` naming it beats an allocation on a client's behalf.
 
 ### Unit 4 — `INNER` and `LEFT JOIN`, `ON` and `USING`
 
@@ -302,8 +343,8 @@ wrong**, and both were found by writing the statement down rather than by a fail
 |---|---|---|
 | 0 — ADR, plan, aggregate capture | **done** | `de3c465`, `32fb58f` |
 | 1 — aggregates | **done** | `1d78a96` |
-| 2 — sequences and `RETURNING` | **done** | `e1b1bd2`, `7a7d4f3`, this commit |
-| 3 — savepoints | in progress | |
+| 2 — sequences and `RETURNING` | **done** | `e1b1bd2`, `7a7d4f3`, `bf28e0d` |
+| 3 — savepoints | **captured** (`tests/corpus/pg19_savepoint.txt`), design in §2; not built | |
 | 3 — savepoints | not started | |
 | 4 — joins | not started | |
 | 5 — `pg_catalog` | not started | |

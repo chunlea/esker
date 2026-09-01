@@ -1,0 +1,78 @@
+# What a real PostgreSQL 19beta1 does with `SAVEPOINT`, `ROLLBACK TO` and `RELEASE` -- unit 3 of
+# `docs/plans/phase-9-rails.md`, and what ActiveRecord wraps every one of its own tests in.
+#
+# Captured in **one session** with `scratchpad/sesscap.py`, in this order, and replayed the same
+# way: a savepoint is entirely about what a previous statement left behind, so a corpus taken a
+# connection per statement would have recorded nothing at all.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THE FIVE THIS FILE EXISTS FOR:
+#
+#   * **`ROLLBACK TO SAVEPOINT` un-aborts the block.** After an error every statement is `25P02`
+#     until the end of the transaction -- except this one, which recovers it and lets the block go
+#     on and commit. That single fact is the whole of why Rails can run a test per transaction:
+#     a failing assertion does not poison the rest.
+#   * a `ROLLBACK TO` **keeps the savepoint**, so the same one can be rolled back to twice.
+#   * a `RELEASE` does not, and rolling back to a released savepoint is `3B001` -- which itself
+#     aborts the block, so it is one of the ways to get into `25P02`.
+#   * **savepoint names stack.** Two `SAVEPOINT dup` are two marks; `ROLLBACK TO dup` finds the
+#     most recent and `RELEASE dup` releases the most recent, after which `ROLLBACK TO dup` finds
+#     the older one. A map from name to mark would have got this wrong in a way no single-savepoint
+#     test could see.
+#   * outside a transaction block all three are `25P01`, and each names **its own verb** --
+#     `SAVEPOINT`, `RELEASE SAVEPOINT`, `ROLLBACK TO SAVEPOINT` -- not the one the user typed.
+#
+# --- the three verbs, outside a block and inside one
+SAVEPOINT outside_a_block	!25P01 SAVEPOINT can only be used in transaction blocks
+RELEASE outside_a_block	!25P01 RELEASE SAVEPOINT can only be used in transaction blocks
+ROLLBACK TO outside_a_block	!25P01 ROLLBACK TO SAVEPOINT can only be used in transaction blocks
+BEGIN		-
+INSERT INTO sp VALUES (1, 'a')	!23505 duplicate key value violates unique constraint "sp_pkey" DETAIL: Key (id)=(1) already exists.
+SAVEPOINT s1	!25P02 current transaction is aborted, commands ignored until end of transaction block
+INSERT INTO sp VALUES (2, 'b')	!25P02 current transaction is aborted, commands ignored until end of transaction block
+SELECT id, n FROM sp ORDER BY id	!25P02 current transaction is aborted, commands ignored until end of transaction block
+ROLLBACK TO s1	!3B001 savepoint "s1" does not exist
+SELECT id, n FROM sp ORDER BY id	!25P02 current transaction is aborted, commands ignored until end of transaction block
+INSERT INTO sp VALUES (3, 'c')	!25P02 current transaction is aborted, commands ignored until end of transaction block
+ROLLBACK TO SAVEPOINT s1	!3B001 savepoint "s1" does not exist
+SELECT id, n FROM sp ORDER BY id	!25P02 current transaction is aborted, commands ignored until end of transaction block
+RELEASE s1	!25P02 current transaction is aborted, commands ignored until end of transaction block
+ROLLBACK TO s1	!3B001 savepoint "s1" does not exist
+SAVEPOINT s2	!25P02 current transaction is aborted, commands ignored until end of transaction block
+INSERT INTO sp VALUES (4, 'd')	!25P02 current transaction is aborted, commands ignored until end of transaction block
+SAVEPOINT s3	!25P02 current transaction is aborted, commands ignored until end of transaction block
+INSERT INTO sp VALUES (5, 'e')	!25P02 current transaction is aborted, commands ignored until end of transaction block
+RELEASE SAVEPOINT s2	!25P02 current transaction is aborted, commands ignored until end of transaction block
+SELECT id, n FROM sp ORDER BY id	!25P02 current transaction is aborted, commands ignored until end of transaction block
+ROLLBACK TO s3	!3B001 savepoint "s3" does not exist
+COMMIT		-
+SELECT id, n FROM sp ORDER BY id	bigint,text	1|kept ; 2|after recovery
+
+# --- the recovery Rails depends on, and the stack that names make
+BEGIN		-
+INSERT INTO sp VALUES (1, 'kept')		-
+SAVEPOINT s		-
+INSERT INTO sp VALUES (1, 'duplicate')	!23505 duplicate key value violates unique constraint "sp_pkey" DETAIL: Key (id)=(1) already exists.
+SELECT id, n FROM sp ORDER BY id	!25P02 current transaction is aborted, commands ignored until end of transaction block
+ROLLBACK TO s		-
+SELECT id, n FROM sp ORDER BY id	bigint,text	1|kept
+INSERT INTO sp VALUES (2, 'after recovery')		-
+COMMIT		-
+SELECT id, n FROM sp ORDER BY id	bigint,text	1|kept ; 2|after recovery
+BEGIN		-
+SAVEPOINT dup		-
+INSERT INTO sp VALUES (3, 'first dup')		-
+SAVEPOINT dup		-
+INSERT INTO sp VALUES (4, 'second dup')		-
+ROLLBACK TO dup		-
+SELECT id, n FROM sp ORDER BY id	bigint,text	1|kept ; 2|after recovery ; 3|first dup
+ROLLBACK TO dup		-
+SELECT id, n FROM sp ORDER BY id	bigint,text	1|kept ; 2|after recovery ; 3|first dup
+RELEASE dup		-
+ROLLBACK TO dup		-
+SELECT id, n FROM sp ORDER BY id	bigint,text	1|kept ; 2|after recovery
+COMMIT		-
+SELECT id, n FROM sp ORDER BY id	bigint,text	1|kept ; 2|after recovery
