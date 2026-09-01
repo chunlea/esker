@@ -1,0 +1,14 @@
+crates/esker-sql/src/bin/esker-sql.rs
+  h_44076b318daf9c 87-98
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "772c472683e0e6167cb57145687a43e320396a24",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
