@@ -541,6 +541,12 @@ fn render(expr: &Expr, columns: &[String]) -> String {
             render(operand, columns),
             if *negated { "NOT " } else { "" }
         ),
+        Expr::Default => "DEFAULT".to_owned(),
+        Expr::Sequence(call) => match (&call.name, call.value) {
+            (Some(name), Some(value)) => format!("{}('{name}', {value})", call.func.name()),
+            (Some(name), None) => format!("{}('{name}')", call.func.name()),
+            _ => format!("{}()", call.func.name()),
+        },
         Expr::Aggregate(call) => format!(
             "{}({}{})",
             call.func.name(),

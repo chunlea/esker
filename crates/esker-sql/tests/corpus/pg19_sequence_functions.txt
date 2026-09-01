@@ -1,0 +1,49 @@
+# What a real PostgreSQL 19beta1 does with the four sequence functions and with `DEFAULT` written
+# where a value goes -- the rest of unit 2 of `docs/plans/phase-9-rails.md`.
+#
+# Captured in **one session**, with `scratchpad/sesscap.py`, because `currval` and `lastval` are
+# session state: a runner that opened a connection per statement would have recorded "not yet
+# defined in this session" for every one of them, which is true and is not what a client sees.
+# `tests/sequence_functions.rs` replays it against one node for the same reason.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THE FOUR A READER WOULD HAVE GOT WRONG:
+#
+#   * the argument is a **name, not a string**. `nextval('W1_ID_SEQ')` finds `w1_id_seq` because
+#     unquoted text inside the quotes folds exactly as an identifier does, and `public.` in front
+#     of it is a schema qualifier rather than part of the name.
+#   * `setval` sets `currval` too: after `setval(s, 10)` this session's `currval` is 10, even
+#     though it never called `nextval`.
+#   * `setval(s, n)` and `setval(s, n, false)` differ by **where the next value comes from**, not
+#     by what they return: both answer `n`, and the next `nextval` answers `n+1` or `n`.
+#   * `DEFAULT` in a `VALUES` list is not a value, it is the column keeping its own default -- so
+#     the `bigserial` still takes a number from the sequence and a column with no default gets
+#     NULL. It is also **not** an explicit value, so a `GENERATED ALWAYS` column accepts it where
+#     it would refuse a number.
+#
+CREATE TABLE w1 (id bigserial PRIMARY KEY, n text DEFAULT 'dd', m int8)		-
+SELECT nextval('w1_id_seq')	bigint	1
+SELECT currval('w1_id_seq')	bigint	1
+SELECT lastval()	bigint	1
+SELECT setval('w1_id_seq', 10)	bigint	10
+SELECT currval('w1_id_seq')	bigint	10
+SELECT nextval('w1_id_seq')	bigint	11
+SELECT setval('w1_id_seq', 20, false)	bigint	20
+SELECT nextval('w1_id_seq')	bigint	20
+SELECT setval('w1_id_seq', 30, true)	bigint	30
+SELECT nextval('w1_id_seq')	bigint	31
+SELECT nextval('W1_ID_SEQ')	bigint	32
+SELECT nextval('public.w1_id_seq')	bigint	33
+SELECT currval('nosuch_seq')	!42P01 relation "nosuch_seq" does not exist
+SELECT nextval('nosuch_seq')	!42P01 relation "nosuch_seq" does not exist
+SELECT nextval('w1')	!42809 "w1" is not a sequence
+SELECT setval('w1_id_seq', 0)	!22003 setval: value 0 is out of bounds for sequence "w1_id_seq" (1..9223372036854775807)
+INSERT INTO w1 (id, n, m) VALUES (DEFAULT, DEFAULT, 1) RETURNING id, n, m	bigint,text,bigint	34|dd|1
+INSERT INTO w1 VALUES (DEFAULT, DEFAULT, 2) RETURNING id, n, m	bigint,text,bigint	35|dd|2
+INSERT INTO w1 (n) VALUES (DEFAULT) RETURNING id, n	bigint,text	36|dd
+INSERT INTO w1 (m) VALUES (DEFAULT) RETURNING id, m	bigint,bigint	37|\N
+UPDATE w1 SET n = DEFAULT WHERE m = 1 RETURNING n	text	dd
+SELECT currval('w1_id_seq')	bigint	37

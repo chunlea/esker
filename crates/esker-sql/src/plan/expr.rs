@@ -81,6 +81,22 @@ pub enum Expr {
         /// `IS NOT NULL`.
         negated: bool,
     },
+    /// `DEFAULT`, written where a value goes: `INSERT INTO t VALUES (DEFAULT, 1)` and
+    /// `UPDATE t SET a = DEFAULT`.
+    ///
+    /// Not a value and not a literal — it is a *reference to the column's own default*, which is
+    /// a constant for most columns and a `nextval` for a `bigserial` one. It therefore cannot be
+    /// evaluated without knowing which column it is being written into, and the two statements
+    /// that can say resolve it; anywhere else it is `0A000` naming itself, which is what a real
+    /// server does too (`DEFAULT` in a `WHERE` is a syntax error there).
+    Default,
+    /// A sequence function — `nextval('s')`, `currval('s')`, `setval('s', 10)`, `lastval()`.
+    ///
+    /// **Never evaluated by the row evaluator**, and for a stronger reason than an aggregate: it
+    /// has *side effects*. `nextval` is not a function of the row, it is a write, and it happens
+    /// once per statement in the order the statement names it. The executor evaluates these before
+    /// it plans and substitutes the values it got; one reaching a row evaluator is a planner bug.
+    Sequence(Box<SequenceCall>),
     /// An aggregate call — `count(*)`, `sum(a)`, `min(DISTINCT b)`.
     ///
     /// **Never evaluated.** It is a value *of a group*, not of a row, so the executor's
@@ -88,6 +104,71 @@ pub enum Expr {
     /// with an [`Expr::Ordinal`] into the aggregated row before the tree is built. One reaching a
     /// row evaluator is a planner bug and says so rather than returning a number.
     Aggregate(Box<AggregateCall>),
+}
+
+/// The four functions a sequence answers to.
+///
+/// PostgreSQL has one more, `nextval`'s sibling `setval` in its two-argument and three-argument
+/// forms, which are one function here because they differ only in a boolean. Everything else in
+/// `pg_sequence`'s surface — `ALTER SEQUENCE`, `CREATE SEQUENCE`, reading a sequence as a relation
+/// — is `0A000` naming itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceFunc {
+    /// `nextval(regclass)`: the next value, and a write.
+    NextVal,
+    /// `currval(regclass)`: the last value **this session** got from that sequence.
+    CurrVal,
+    /// `setval(regclass, bigint [, boolean])`: where the sequence resumes from.
+    SetVal,
+    /// `lastval()`: the last value this session got from *any* sequence.
+    LastVal,
+}
+
+impl SequenceFunc {
+    /// The four names, matched case-insensitively as PostgreSQL matches them.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "nextval" => Some(SequenceFunc::NextVal),
+            "currval" => Some(SequenceFunc::CurrVal),
+            "setval" => Some(SequenceFunc::SetVal),
+            "lastval" => Some(SequenceFunc::LastVal),
+            _ => None,
+        }
+    }
+
+    /// What it is called — and, because PostgreSQL names an output column after the function that
+    /// filled it, what `SELECT nextval('s')` calls its one column.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            SequenceFunc::NextVal => "nextval",
+            SequenceFunc::CurrVal => "currval",
+            SequenceFunc::SetVal => "setval",
+            SequenceFunc::LastVal => "lastval",
+        }
+    }
+}
+
+/// One sequence-function call, as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequenceCall {
+    /// Which one.
+    pub func: SequenceFunc,
+    /// The sequence's name, **folded the way an identifier is folded**, or `None` for `lastval()`.
+    ///
+    /// The argument is a string and PostgreSQL reads it as a *name*: measured,
+    /// `nextval('Q1_ID_SEQ')` finds `q1_id_seq` and `nextval('"q1_id_seq"')` finds it too. So the
+    /// quoting rules that apply to an identifier apply inside the quotes, which is not a thing a
+    /// reader would guess about a `text` argument.
+    pub name: Option<String>,
+    /// `setval`'s value.
+    pub value: Option<i64>,
+    /// `setval`'s third argument, `is_called`, which defaults to true.
+    ///
+    /// True means the value has been handed out and the next `nextval` answers one *past* it;
+    /// false means it has not and the next `nextval` answers it. Measured both ways.
+    pub is_called: bool,
 }
 
 /// The five aggregates this node computes.
@@ -364,5 +445,7 @@ fn describe(expr: &Expr) -> &'static str {
         Expr::Not(_) => "NOT",
         Expr::IsNull { .. } => "IS NULL",
         Expr::Aggregate(_) => "an aggregate function",
+        Expr::Default => "DEFAULT",
+        Expr::Sequence(_) => "a sequence function",
     }
 }

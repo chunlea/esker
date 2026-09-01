@@ -31,7 +31,7 @@ pub use ddl::{
     UniqueConstraint, index_name, primary_key_name, sequence_name, unique_constraint_name,
 };
 pub use dml::{Delete, Insert, Returning, Update};
-pub use expr::{AggregateCall, AggregateFunc, BinaryOp, Expr, Literal};
+pub use expr::{AggregateCall, AggregateFunc, BinaryOp, Expr, Literal, SequenceCall, SequenceFunc};
 pub use query::{AggregateSpec, Join, Node, OrderItem, Probe, Select, SelectItem, SortKey};
 pub use session::SessionStatement;
 pub use time_machine::TimeMachineVerb;

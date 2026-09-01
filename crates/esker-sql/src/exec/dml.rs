@@ -131,6 +131,13 @@ pub(super) fn insert(
             .collect();
         for (target, expr) in targets.iter().zip(values) {
             let column = &table.columns[*target];
+            // `DEFAULT` written for a column is the column keeping its own default, which is what
+            // the row already holds — including, below, its sequence. It is *not* an explicit
+            // value, so a `GENERATED ALWAYS` column takes it: measured, `VALUES (DEFAULT, …)` into
+            // one is accepted where `VALUES (7, …)` is `428C9`.
+            if matches!(expr, crate::plan::Expr::Default) {
+                continue;
+            }
             // `GENERATED ALWAYS` refuses a value the user wrote, and names the clause that
             // overrides it — the whole of the difference between the three identity kinds
             // (`crate::catalog::Identity`), measured on all three.
@@ -143,14 +150,16 @@ pub(super) fn insert(
             }
             row[*target] = expr.evaluate(column.ty, &column.name)?;
         }
-        // A sequence fills its column when the statement did not. It runs **after** the values,
-        // so a `bigserial` the user did write keeps their number and does not consume one — which
-        // is what a real server does, and the reason the next insert can collide with it.
+        // A sequence fills its column when the statement did not name it, or named it and wrote
+        // `DEFAULT`. It runs **after** the values, so a `bigserial` the user did write keeps their
+        // number and does not consume one — which is what a real server does, and the reason the
+        // next insert can collide with it.
         for sequence in &table.sequences {
             if targets
                 .iter()
                 .take(values.len())
-                .any(|at| *at == sequence.column)
+                .position(|at| *at == sequence.column)
+                .is_some_and(|at| !matches!(values[at], crate::plan::Expr::Default))
             {
                 continue;
             }
@@ -353,6 +362,12 @@ pub(super) fn update(
             let column = &table.columns[*ordinal];
             // Evaluated against the row as it was, so `SET a = b, b = a` swaps them.
             let evaluated = match value {
+                // `SET a = DEFAULT` is the column's own default, which for a sequence column is
+                // the next value and for every other one is the constant the catalog holds.
+                crate::plan::Expr::Default => match table.sequence_for(*ordinal) {
+                    Some(sequence) => Datum::Int8(executor.next_sequence_value(sequence.id)?),
+                    None => column.default.clone().unwrap_or(Datum::Null),
+                },
                 crate::plan::Expr::Literal(literal) => literal.assign(column.ty, &column.name)?,
                 other => {
                     let resolved = query::resolve_against(other, &table)?;

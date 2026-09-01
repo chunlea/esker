@@ -661,9 +661,22 @@ impl View<'_> {
     }
 
     /// A table by name, or `42P01` — the shape almost every statement wants.
+    ///
+    /// A **sequence's** name is the one case that is not `42P01`, because the relation is there:
+    /// PostgreSQL reads a sequence as a three-column relation (`last_value`, `log_cnt`,
+    /// `is_called`) and this node does not, so it is `0A000` naming the construct. Answering
+    /// "does not exist" for something that does is the wrong-answer shape contract C2 exists to
+    /// prevent — it sends a user looking for a missing table.
     pub fn require_table(&self, name: &str) -> Result<Arc<TableDef>> {
-        self.table(name)?
-            .ok_or_else(|| SqlError::UndefinedTable(name.to_owned()))
+        if let Some(table) = self.table(name)? {
+            return Ok(table);
+        }
+        if matches!(self.relation(name)?, Some(Relation::Sequence { .. })) {
+            return Err(SqlError::unsupported(format!(
+                "reading a sequence as a relation, which is what \"{name}\" is"
+            )));
+        }
+        Err(SqlError::UndefinedTable(name.to_owned()))
     }
 }
 

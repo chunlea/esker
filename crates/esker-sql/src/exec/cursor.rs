@@ -644,6 +644,19 @@ pub(super) fn evaluate(expr: &Expr, row: &[Datum]) -> Result<Datum> {
                 "an aggregate reached the row evaluator".to_owned(),
             ));
         }
+        // Both are resolved before a plan is built -- a `DEFAULT` by the statement that knows
+        // which column it is for, a sequence call by the executor, which runs it once rather than
+        // once per row. Either one here is a planner bug.
+        Expr::Default => {
+            return Err(SqlError::Internal(
+                "a DEFAULT reached the row evaluator".to_owned(),
+            ));
+        }
+        Expr::Sequence(_) => {
+            return Err(SqlError::Internal(
+                "a sequence function reached the row evaluator".to_owned(),
+            ));
+        }
 
         Expr::IsNull { operand, negated } => {
             let value = evaluate(operand, row)?;

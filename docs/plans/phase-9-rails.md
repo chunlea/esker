@@ -115,10 +115,29 @@ same sentence as the type it stands for. It costs nothing that matters here: Rai
 column and never for `serial`. `GENERATED ... AS IDENTITY` parses already (phase-6a §9 G07 is the
 `CREATE SEQUENCE` *options*, not the column form).
 
-`nextval` and `currval` are the two verbs. The hard part is not the counter, it is that a counter
-under Percolator either serialises every insert through one key or stops being gap-free —
-PostgreSQL's own sequences are **not** gap-free either (a rolled-back transaction consumes its
-value), which is the licence to cache a block per session. Captured before it is decided.
+`nextval`, `currval`, `setval` and `lastval` are the four verbs, and they run in a `SELECT` with
+no `FROM` — which is where every client writes one. Over a table a sequence function is a side
+effect **per row** on a real server (measured: `SELECT nextval('s') FROM t` over four rows answers
+1, 2, 3, 4), so that shape is `0A000` naming the function rather than quietly running once and
+handing a client one number where it expected four.
+
+The argument is a **name, not a string**: `nextval('W1_ID_SEQ')` finds `w1_id_seq` because the text
+inside the quotes folds exactly as an identifier does, and a `public.` qualifier is a schema
+reference rather than part of the name — `pg_get_serial_sequence` answers `public.t_id_seq` and
+clients pass that straight back.
+
+The hard part was never the counter, it is that a counter under Percolator either serialises every
+insert through one key or stops being gap-free — PostgreSQL's own sequences are **not** gap-free
+either (a rolled-back transaction consumes its value), which is the licence to cache a block per
+session. `setval` therefore has to **discard the session's block**, or the next `nextval` would
+keep handing out numbers reserved before it and the statement would have done nothing visible.
+That is the one place the batch could have been silently wrong, and it is a test of its own —
+the bug would show up as the *second* value after a `setval`, not the first.
+
+`DEFAULT` written where a value goes is not a value: it is the column keeping its own default, so
+a `bigserial` still takes a number and a column with no default gets NULL. It is also **not** an
+explicit value, so a `GENERATED ALWAYS` column accepts it where it refuses a number — the one
+place the two clauses have to be told apart, and measured on both.
 
 `INSERT`/`UPDATE`/`DELETE ... RETURNING` is the other half, and it is the half Rails cannot work
 without: `Model.create!` reads the id back through it. **Landed first**, because it is independent
@@ -283,7 +302,8 @@ wrong**, and both were found by writing the statement down rather than by a fail
 |---|---|---|
 | 0 — ADR, plan, aggregate capture | **done** | `de3c465`, `32fb58f` |
 | 1 — aggregates | **done** | `1d78a96` |
-| 2 — sequences and `RETURNING` | **`RETURNING` done** (`e1b1bd2`); `bigserial`, identity and the sequence under them done (this commit); `nextval`/`currval`/`lastval`/`setval` as callable functions, and `VALUES (DEFAULT, …)`, are what is left | |
+| 2 — sequences and `RETURNING` | **done** | `e1b1bd2`, `7a7d4f3`, this commit |
+| 3 — savepoints | in progress | |
 | 3 — savepoints | not started | |
 | 4 — joins | not started | |
 | 5 — `pg_catalog` | not started | |

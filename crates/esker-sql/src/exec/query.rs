@@ -1066,7 +1066,8 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
     Ok(match expr {
         Expr::Column { table, name } => scope.resolve_column(table.as_deref(), name)?.1,
         Expr::Ordinal { ty, .. } => *ty,
-        Expr::Literal(Literal::Integer(_)) => ColumnType::Int8,
+        // A sequence function answers `bigint` on a real server, all four of them.
+        Expr::Literal(Literal::Integer(_)) | Expr::Sequence(_) => ColumnType::Int8,
         Expr::Literal(Literal::Decimal(_)) => ColumnType::Double,
 
         Expr::Literal(Literal::String(_) | Literal::Null) => ColumnType::Text,
@@ -1082,6 +1083,14 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         Expr::Aggregate(_) => {
             return Err(SqlError::Internal(
                 "an aggregate reached expr_type without being rewritten".to_owned(),
+            ));
+        }
+        // `DEFAULT` has the type of the column it is written into, and reaching here means it was
+        // written somewhere with no column to take one from -- which PostgreSQL answers as a
+        // syntax error and this node answers by name.
+        Expr::Default => {
+            return Err(SqlError::unsupported(
+                "DEFAULT outside an INSERT value or an UPDATE assignment",
             ));
         }
     })

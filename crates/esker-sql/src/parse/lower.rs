@@ -1002,6 +1002,13 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             expr,
         } => lower_expr(expr),
         Expr::Nested(inner) => lower_expr(inner),
+        // `DEFAULT` is a keyword `sqlparser` hands back as a bare identifier. Quoted, it is a
+        // column called `DEFAULT` and stays one; unquoted, it is the clause.
+        Expr::Identifier(name)
+            if name.quote_style.is_none() && name.value.eq_ignore_ascii_case("default") =>
+        {
+            Ok(plan::Expr::Default)
+        }
         Expr::Identifier(name) => Ok(plan::Expr::Column {
             table: None,
             name: ident(name),
@@ -1072,6 +1079,9 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
     };
 
     let name = function.name.to_string();
+    if let Some(func) = plan::SequenceFunc::from_name(&name) {
+        return lower_sequence_function(func, function);
+    }
     let Some(func) = plan::AggregateFunc::from_name(&name) else {
         return Err(SqlError::unsupported(format!("the function {name}")));
     };
@@ -1145,6 +1155,139 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
         star,
         distinct,
     })))
+}
+
+/// `nextval('s')`, `currval('s')`, `setval('s', 10 [, false])`, `lastval()`.
+///
+/// The argument is a **name**, not a string, and that is the thing a reader would get wrong. Its
+/// text goes through the same folding an unquoted identifier does — measured, `nextval('Q1_ID_SEQ')`
+/// finds `q1_id_seq` and `nextval('"q1_id_seq"')` finds it too — so a sequence created for a column
+/// named `Id` is reachable under either spelling, exactly as the column is.
+fn lower_sequence_function(
+    func: plan::SequenceFunc,
+    function: &sqlparser::ast::Function,
+) -> Result<plan::Expr> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments};
+
+    refuse_if(function.over.is_some(), "a window function")?;
+    refuse_if(function.filter.is_some(), "an aggregate FILTER clause")?;
+
+    let FunctionArguments::List(FunctionArgumentList { args, .. }) = &function.args else {
+        return Err(SqlError::unsupported(format!(
+            "the function {} with no argument list",
+            func.name()
+        )));
+    };
+    let plain: Vec<&Expr> = args
+        .iter()
+        .filter_map(|arg| match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Some(expr),
+            _ => None,
+        })
+        .collect();
+    if plain.len() != args.len() {
+        return Err(SqlError::unsupported(format!(
+            "a named argument to {}",
+            func.name()
+        )));
+    }
+
+    let named = |expr: &Expr| -> Result<String> {
+        match expr {
+            Expr::Value(value) => match &value.value {
+                Value::SingleQuotedString(text)
+                | Value::DollarQuotedString(DollarQuotedString { value: text, .. }) => {
+                    Ok(sequence_reference(text))
+                }
+                other => Err(SqlError::unsupported(format!(
+                    "the sequence name {other}, which is not a string literal"
+                ))),
+            },
+            other => Err(SqlError::unsupported(format!(
+                "the sequence name {other}, which is not a string literal"
+            ))),
+        }
+    };
+
+    let call = match (func, plain.as_slice()) {
+        (plan::SequenceFunc::LastVal, []) => plan::SequenceCall {
+            func,
+            name: None,
+            value: None,
+            is_called: true,
+        },
+        (plan::SequenceFunc::NextVal | plan::SequenceFunc::CurrVal, [name]) => plan::SequenceCall {
+            func,
+            name: Some(named(name)?),
+            value: None,
+            is_called: true,
+        },
+        (plan::SequenceFunc::SetVal, [name, value] | [name, value, _]) => {
+            let is_called = match plain.as_slice() {
+                [_, _, flag] => match flag {
+                    Expr::Value(value) => match &value.value {
+                        Value::Boolean(flag) => *flag,
+                        other => {
+                            return Err(SqlError::unsupported(format!(
+                                "setval's is_called argument {other}, which is not a boolean \
+                                 literal"
+                            )));
+                        }
+                    },
+                    other => {
+                        return Err(SqlError::unsupported(format!(
+                            "setval's is_called argument {other}, which is not a boolean literal"
+                        )));
+                    }
+                },
+                // Two arguments: `is_called` defaults to true, so the next `nextval` answers one
+                // past the value rather than the value itself.
+                _ => true,
+            };
+            let value = match lower_expr(value)? {
+                plan::Expr::Literal(plan::Literal::Integer(value)) => value,
+                other => {
+                    return Err(SqlError::unsupported(format!(
+                        "setval's value {other:?}, which is not an integer literal"
+                    )));
+                }
+            };
+            plan::SequenceCall {
+                func,
+                name: Some(named(name)?),
+                value: Some(value),
+                is_called,
+            }
+        }
+        // Every other arity. PostgreSQL answers `42883` naming the argument types; this crate has
+        // no overload table to name them from, so it names the call instead.
+        (_, other) => {
+            return Err(SqlError::unsupported(format!(
+                "{} with {} arguments",
+                func.name(),
+                other.len()
+            )));
+        }
+    };
+    Ok(plan::Expr::Sequence(Box::new(call)))
+}
+
+/// A sequence's name, as it is written inside `nextval`'s string argument.
+///
+/// Read as an identifier, because that is what it is: unquoted text folds to lower case and text
+/// inside double quotes does not. A schema qualifier is dropped rather than refused —
+/// `pg_get_serial_sequence` answers `public.t_id_seq` and clients pass that straight back, so
+/// refusing it would break the round trip a real server supports; there is one schema here, so
+/// `public.` names it.
+fn sequence_reference(text: &str) -> String {
+    let bare = text.strip_prefix("public.").unwrap_or(text);
+    match bare
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        Some(quoted) => fold_identifier(quoted, true).0,
+        None => fold_identifier(bare, false).0,
+    }
 }
 
 fn lower_value(value: &Value, negated: bool) -> Result<plan::Expr> {

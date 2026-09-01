@@ -47,7 +47,7 @@ use crate::pgwire::message::FieldDescription;
 use crate::pgwire::session::{Described, Execute, Outcome, Params};
 use crate::plan::Statement;
 use crate::time_machine;
-use crate::value::ColumnType;
+use crate::value::{ColumnType, Datum};
 use crate::value::{PgDatum, PgType};
 
 /// Runs statements for one connection.
@@ -77,6 +77,9 @@ pub struct Executor {
     /// One session's reserved block per sequence: the next value it will hand out and the first
     /// value past its block. See [`Executor::next_sequence_value`].
     sequences: std::collections::BTreeMap<u64, (i64, i64)>,
+    /// The sequence this session last took a value from, which is the whole of what `lastval()`
+    /// is. `None` until there has been one, and `55000` is what that answers with.
+    last_sequence: Option<u64>,
     /// Whether the open transaction has run DDL. From then on its catalog lookups read through
     /// rather than from the shared cache: they answer with its own uncommitted definitions, which
     /// must not reach the other sessions on this node (`crate::catalog`).
@@ -133,6 +136,7 @@ impl Executor {
             notices: Vec::new(),
             row_ids: std::collections::BTreeMap::new(),
             sequences: std::collections::BTreeMap::new(),
+            last_sequence: None,
             catalog_written: false,
             read_as_of: None,
             open_used: false,
@@ -514,6 +518,12 @@ impl Executor {
 
     /// `SELECT`: plan it, then pull every row through.
     fn select(&mut self, txn: &mut dyn Txn, select: &crate::plan::Select) -> Result<Outcome> {
+        // A sequence function is a **write**, not a value of a row, so it runs here — once, in the
+        // order the target list names it — and what the planner sees is the number it produced.
+        // Running it inside the plan would run it once per row, which is what PostgreSQL does over
+        // a `FROM` and is why that shape is refused rather than approximated.
+        let resolved = self.resolve_sequence_calls(&*txn, select)?;
+        let select = resolved.as_ref();
         let planned = self.plan_select(txn, select)?;
         let mut cursor = cursor::Cursor::open(txn, self.tenant, &planned.node)?;
         let mut rows = Vec::new();
@@ -531,6 +541,145 @@ impl Executor {
             .collect();
         let tag = format!("SELECT {}", rows.len());
         Ok(Outcome::Rows { fields, rows, tag })
+    }
+
+    /// Runs every sequence function in a target list and puts its value back in its place.
+    ///
+    /// `Cow`-shaped by hand: a statement with none — every statement but a handful — is handed
+    /// back untouched and nothing is cloned.
+    ///
+    /// **Only with no `FROM`.** `SELECT nextval('s')` is what every client writes and is one call;
+    /// `SELECT nextval('s') FROM t` is one call *per row* on a real server, which is a side effect
+    /// inside the row loop and a different feature. It is `0A000` naming the function rather than
+    /// quietly running once, because a client that got one number where it expected four would
+    /// have no way to tell.
+    fn resolve_sequence_calls<'s>(
+        &mut self,
+        txn: &dyn Txn,
+        select: &'s crate::plan::Select,
+    ) -> Result<SelectRef<'s>> {
+        use crate::plan::{Expr, Literal, SelectItem};
+        if !select
+            .projection
+            .iter()
+            .any(|item| matches!(item, SelectItem::Expr { expr, .. } if has_sequence_call(expr)))
+        {
+            // Nothing to do, and nothing anywhere else either: a call outside the target list is
+            // refused by the planner, which is where every other expression is checked.
+            return Ok(SelectRef::Borrowed(select));
+        }
+        if select.from.is_some() {
+            return Err(SqlError::unsupported(
+                "a sequence function in a SELECT with a FROM clause",
+            ));
+        }
+        let mut resolved = select.clone();
+        for item in &mut resolved.projection {
+            let SelectItem::Expr { expr, alias } = item else {
+                continue;
+            };
+            let Expr::Sequence(call) = expr else {
+                // A call *inside* a larger expression -- `nextval('s') + 1` -- needs arithmetic
+                // this crate does not have, so it is refused where the operator already is.
+                continue;
+            };
+            let value = self.run_sequence_call(txn, call)?;
+            // PostgreSQL names the column after the function, so the alias the user did not write
+            // is the one the function gives it.
+            let name = alias.clone().unwrap_or_else(|| call.func.name().to_owned());
+            *item = SelectItem::Expr {
+                expr: Expr::Literal(Literal::Typed(Box::new(Datum::Int8(value)))),
+                alias: Some(name),
+            };
+        }
+        Ok(SelectRef::Owned(Box::new(resolved)))
+    }
+
+    /// One sequence function, and the write it is.
+    fn run_sequence_call(
+        &mut self,
+        txn: &dyn Txn,
+        call: &crate::plan::SequenceCall,
+    ) -> Result<i64> {
+        use crate::plan::SequenceFunc;
+        // `lastval()` names no sequence: it is the last value *this session* got from any of them,
+        // and it is `55000` before there has been one.
+        let SequenceFunc::LastVal = call.func else {
+            let name = call.name.as_deref().unwrap_or_default();
+            let sequence = self.require_sequence(txn, name)?;
+            return match call.func {
+                SequenceFunc::NextVal => self.next_sequence_value(sequence.id),
+                SequenceFunc::CurrVal => self
+                    .sequences
+                    .get(&sequence.id)
+                    .map(|(next, _)| next - 1)
+                    .ok_or_else(|| SqlError::SequenceNotYetDefined(Some(name.to_owned()))),
+                SequenceFunc::SetVal => self.set_sequence(sequence.id, call),
+                SequenceFunc::LastVal => unreachable!("handled above"),
+            };
+        };
+        let id = self
+            .last_sequence
+            .ok_or(SqlError::SequenceNotYetDefined(None))?;
+        self.sequences
+            .get(&id)
+            .map(|(next, _)| next - 1)
+            .ok_or(SqlError::SequenceNotYetDefined(None))
+    }
+
+    /// A sequence by name, or the two refusals a real server gives: `42P01` for a name that is
+    /// nothing and `42809` for one that is something else.
+    fn require_sequence(&self, txn: &dyn Txn, name: &str) -> Result<crate::catalog::SequenceDef> {
+        let view = self.catalog_view(txn)?;
+        match view.relation(name)? {
+            Some(crate::catalog::Relation::Sequence { table_id, column }) => {
+                let table = view
+                    .table_by_id(table_id)?
+                    .ok_or_else(|| SqlError::UndefinedTable(name.to_owned()))?;
+                table
+                    .sequence_for(column)
+                    .cloned()
+                    .ok_or_else(|| SqlError::UndefinedTable(name.to_owned()))
+            }
+            // No `HINT`: PostgreSQL sends one only for the `DROP` statements, where there is
+            // another verb to point at. `nextval` over a table has nothing to suggest.
+            Some(_) => Err(SqlError::WrongObjectType {
+                name: name.to_owned(),
+                expected: "a sequence",
+                found: "",
+            }),
+            None => Err(SqlError::UndefinedTable(name.to_owned())),
+        }
+    }
+
+    /// `setval`: where the sequence resumes from, and what this session's `currval` now answers.
+    ///
+    /// It **discards this session's cached block**, which is not an optimisation detail: without
+    /// it the next `nextval` would keep handing out the numbers reserved before the `setval` and
+    /// the statement would have done nothing visible. Other sessions' blocks are not discarded and
+    /// cannot be — PostgreSQL's `CACHE n` has the same hole and documents it.
+    fn set_sequence(&mut self, sequence_id: u64, call: &crate::plan::SequenceCall) -> Result<i64> {
+        let value = call.value.unwrap_or_default();
+        if value < 1 {
+            return Err(SqlError::SetvalOutOfBounds {
+                sequence: call.name.clone().unwrap_or_default(),
+                value,
+            });
+        }
+        // `is_called` true means the value has been handed out, so the next one is past it.
+        let next = if call.is_called { value + 1 } else { value };
+        let mut txn = self.backend.begin()?;
+        crate::catalog::set_sequence_value(
+            &mut *txn,
+            self.tenant,
+            sequence_id,
+            u64::try_from(next).unwrap_or(u64::MAX),
+        );
+        txn.commit()?;
+        // `currval` answers the value that was set, whether or not it was called -- measured.
+        self.sequences.insert(sequence_id, (value + 1, value + 1));
+        self.last_sequence = Some(sequence_id);
+        Ok(value)
     }
 
     /// Resolves the tables a `SELECT` names and plans against them.
@@ -666,6 +815,7 @@ impl Executor {
         {
             let value = *next;
             *next += 1;
+            self.last_sequence = Some(sequence_id);
             return Ok(value);
         }
 
@@ -686,6 +836,7 @@ impl Executor {
         let batch = i64::try_from(crate::catalog::SEQUENCE_BATCH).unwrap_or(i64::MAX);
         self.sequences
             .insert(sequence_id, (first + 1, first.saturating_add(batch)));
+        self.last_sequence = Some(sequence_id);
         Ok(first)
     }
 
@@ -813,6 +964,35 @@ pub(crate) struct Unique {
     pub(crate) constraint: String,
     /// `Key (id)=(1)`, for the `DETAIL` field.
     pub(crate) detail: String,
+}
+
+/// A `SELECT` that either was left alone or had its sequence calls run.
+///
+/// `std::borrow::Cow` would need `Select: ToOwned`, which it has by `Clone` but which reads worse
+/// here than saying the two cases out loud.
+enum SelectRef<'a> {
+    Borrowed(&'a crate::plan::Select),
+    Owned(Box<crate::plan::Select>),
+}
+
+impl SelectRef<'_> {
+    fn as_ref(&self) -> &crate::plan::Select {
+        match self {
+            SelectRef::Borrowed(select) => select,
+            SelectRef::Owned(select) => select,
+        }
+    }
+}
+
+/// Whether an expression contains a sequence function anywhere in it.
+fn has_sequence_call(expr: &crate::plan::Expr) -> bool {
+    use crate::plan::Expr;
+    match expr {
+        Expr::Sequence(_) => true,
+        Expr::Binary { left, right, .. } => has_sequence_call(left) || has_sequence_call(right),
+        Expr::Not(operand) | Expr::IsNull { operand, .. } => has_sequence_call(operand),
+        _ => false,
+    }
 }
 
 /// The `EXPLAIN` output for a statement. One line per plan node, indented by depth, which is the

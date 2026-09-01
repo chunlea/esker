@@ -95,6 +95,30 @@ fn dropping_a_table_frees_its_sequences_name() {
         .expect("the sequence's name went with the table");
 }
 
+/// A sequence's name resolves, so reading one as a relation is **not** `42P01`.
+///
+/// PostgreSQL reads a sequence as a three-column relation (`last_value`, `log_cnt`, `is_called`)
+/// and this node does not, so it is `0A000` naming the construct. Answering "does not exist" for
+/// something that does is the wrong-answer shape contract C2 exists to prevent: it sends a user
+/// looking for a missing table.
+#[test]
+fn reading_a_sequence_as_a_relation_is_named_rather_than_missing() {
+    let mut node = parity::Node::new(&["CREATE TABLE rel (id bigserial PRIMARY KEY)"]);
+    let error = node.run("SELECT * FROM rel_id_seq").unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED, "{error}");
+    assert!(
+        error.to_string().contains("rel_id_seq"),
+        "`{error}` does not name what was read"
+    );
+    // And a name that really is nothing is still `42P01`.
+    assert_eq!(
+        node.run("SELECT * FROM nothing_at_all")
+            .unwrap_err()
+            .sqlstate(),
+        sqlstate::UNDEFINED_TABLE
+    );
+}
+
 /// A failed `INSERT` still consumed its value, here as on a real server.
 ///
 /// That is not a side-effect of how this is built, it is what `nextval` **is**: it runs outside

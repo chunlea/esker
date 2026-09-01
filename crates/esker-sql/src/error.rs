@@ -390,6 +390,29 @@ pub enum SqlError {
     #[error("syntax error at or near \"{0}\"")]
     SyntaxAtOrNear(&'static str),
 
+    /// `currval` or `lastval` before this session has taken a value.
+    ///
+    /// Session state, and PostgreSQL says so in the message: the sequence may well have a value,
+    /// just not one *this* connection asked for. `None` is `lastval()`, which names no sequence
+    /// because it is about the session and not about one of them.
+    #[error("{}", match .0 {
+        Some(name) => format!("currval of sequence \"{name}\" is not yet defined in this session"),
+        None => "lastval is not yet defined in this session".to_owned(),
+    })]
+    SequenceNotYetDefined(Option<String>),
+
+    /// `setval` below a sequence's minimum. PostgreSQL prints the whole permitted range.
+    #[error(
+        "setval: value {value} is out of bounds for sequence \"{sequence}\" \
+         (1..9223372036854775807)"
+    )]
+    SetvalOutOfBounds {
+        /// The sequence, which PostgreSQL names.
+        sequence: String,
+        /// What was asked for.
+        value: i64,
+    },
+
     /// A value written into a `GENERATED ALWAYS AS IDENTITY` column.
     ///
     /// PostgreSQL's own sentence, its `DETAIL` and its `HINT`, all three measured: the hint names
@@ -688,7 +711,8 @@ impl SqlError {
             SqlError::IntegerOutOfRange { .. }
             | SqlError::FloatOutOfRange { .. }
             | SqlError::IntegerLiteralOutOfRange
-            | SqlError::BigintOutOfRange => sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
+            | SqlError::BigintOutOfRange
+            | SqlError::SetvalOutOfBounds { .. } => sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
             SqlError::InvalidDatetimeFormat { .. } => sqlstate::INVALID_DATETIME_FORMAT,
             SqlError::DatetimeFieldOutOfRange(_) | SqlError::TimestampOutOfRange(_) => {
                 sqlstate::DATETIME_FIELD_OVERFLOW
@@ -709,6 +733,7 @@ impl SqlError {
             | SqlError::UndefinedAggregateArity { .. } => sqlstate::UNDEFINED_FUNCTION,
             SqlError::ParameterlessAggregate => sqlstate::WRONG_OBJECT_TYPE,
             SqlError::GeneratedAlways { .. } => sqlstate::GENERATED_ALWAYS,
+            SqlError::SequenceNotYetDefined(_) => sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
             SqlError::GroupingError(_) | SqlError::AggregateNotAllowed(_) => {
                 sqlstate::GROUPING_ERROR
             }

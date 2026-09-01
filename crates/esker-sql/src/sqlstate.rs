@@ -150,6 +150,9 @@ pub const WRONG_OBJECT_TYPE: &str = "42809";
 pub const DATATYPE_MISMATCH: &str = "42804";
 /// No such function.
 pub const UNDEFINED_FUNCTION: &str = "42883";
+/// `currval` before this session has called `nextval`. PostgreSQL's class 55, and a statement
+/// about the *session* rather than about the sequence — which does have a value.
+pub const OBJECT_NOT_IN_PREREQUISITE_STATE: &str = "55000";
 /// A value written into a `GENERATED ALWAYS AS IDENTITY` column. PostgreSQL's own class 428,
 /// which has exactly this one condition in it.
 pub const GENERATED_ALWAYS: &str = "428C9";
@@ -273,6 +276,10 @@ mod tests {
         ("DATATYPE_MISMATCH", super::DATATYPE_MISMATCH),
         ("UNDEFINED_FUNCTION", super::UNDEFINED_FUNCTION),
         ("GENERATED_ALWAYS", super::GENERATED_ALWAYS),
+        (
+            "OBJECT_NOT_IN_PREREQUISITE_STATE",
+            super::OBJECT_NOT_IN_PREREQUISITE_STATE,
+        ),
         ("GROUPING_ERROR", super::GROUPING_ERROR),
         ("INVALID_COLUMN_REFERENCE", super::INVALID_COLUMN_REFERENCE),
         ("INVALID_TABLE_DEFINITION", super::INVALID_TABLE_DEFINITION),
