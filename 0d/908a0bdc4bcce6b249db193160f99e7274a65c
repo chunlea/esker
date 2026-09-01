@@ -1,0 +1,14 @@
+docs/plans/phase-8-learner.md
+  h_44076b318daf9c 697-722
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "0d908a0bdc4bcce6b249db193160f99e7274a65c",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
