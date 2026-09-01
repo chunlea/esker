@@ -1,0 +1,21 @@
+docs/bench/columnar-learner.md
+  s_094241f844188c::t_952835b375f0b5 241-254,257-274,277-371
+docs/plans/phase-8-learner.md
+  s_094241f844188c::t_d6182e081117f1 803-887
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "e36eccafc518c5de37d713d39c4b95c888872cde",
+  "prompts": {},
+  "sessions": {
+    "s_094241f844188c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "54200bf0-3107-4c35-8bbd-bea1cd1c7064",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
