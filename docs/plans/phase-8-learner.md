@@ -720,3 +720,83 @@ taken while it is wedged — rather than changing the retry path against a green
 
 `fifty_sigkills_of_the_leader_process`, the long form of the same battery, is `#[ignore]`d and was
 not run.
+
+---
+
+# §store unit 3b — done, and where a resuming lane starts
+
+The apply target is on live regions and the fragment service answers from it
+(`crates/esker-store/src/columnar/region.rs`, `Store::serve_fragment`). What that commit does and
+what it deliberately does not is in its message and in the module header; the short version is
+that a columnar learner now **tees** its committed row versions into a per-table columnar copy,
+rebuilds that copy from the region's own `write` records whenever it opens one, and serves
+fragments over every live run at `ts` after satisfying `min_apply_index` with a learner
+`ReadIndex` round.
+
+Proven in `crates/esker-store/tests/columnar_region.rs`: built from history, extended by the
+apply, read at three timestamps, refused for a table with no record, rebuilt on reopen.
+
+## THE BLOCKER a resuming lane meets first
+
+**A columnar learner PD places never receives the region's existing data.** Not a wiring fault and
+not this lane's: it is the learner-creation path. From the store's own log on a four-node cluster,
+with the SQL node driving:
+
+```text
+INFO a region arrived by snapshot region_id=1 index=0
+WARN a snapshot did not arrive; the leader will offer it again region_id=1 index=0
+     error=invalid request: peer 5 is not a member of region 1 and may not have a copy of it
+```
+
+Measured on the learner at the moment a fragment asked, and fifteen seconds later: **published
+apply index 22, two versions in its `write` column family**, where the leader had ten. The ask in
+`Store::receive_raft`'s unknown-region path races the conf change that placed the peer — the sender
+checks the asking peer against a membership it has not applied — and the retry lands a region
+record at index 0, which carries no data. A **row** learner survives this because the log catches
+it up and promotion then waits on it; a columnar learner is never promoted, so nothing ever notices
+it is empty.
+
+So `the_learner_answers_fragments_that_agree_with_a_row_scan` in
+`crates/esker-sql/tests/joint_gate.rs` is written, correct, and `#[ignore]`d. It is the first thing
+to un-ignore, and it will pass when a placed learner receives what the region already holds.
+
+## Item 2 — `esker-pd`'s peer counting, and its regression test
+
+`crates/esker-pd/src/balance.rs`, in `region_balance`:
+
+```rust
+if region.region.peers.len() > cluster.target_replicas && !mid_repair {
+```
+
+`peers.len()` counts **every** peer, so a healthy three-voter region that gains a columnar learner
+is four against a target of three and balance sheds a *voter*. Count voters for a shed decision —
+`peers.iter().filter(|p| p.role == PeerRole::Voter).count()` — and pick the heaviest from the
+voters too, since a columnar learner is not a replica this rule may give back (removing one is
+`schedule::columnar_for`'s decision and nobody else's).
+
+The regression is already written: un-`ignore`
+`joint_gate.rs::a_columnar_learner_does_not_cost_the_region_a_voter`. It asserts what should be
+true — the region keeps `VOTERS` voters after the `ALTER` — and it fails today in under three
+seconds with `balance: true`. Evidence, including PD's own operator history, is in the section
+above and in `docs/bench/columnar-learner.md`.
+
+Watch for a fourth instance of the same family while in there: any count over `region.peers` that
+means *voters*.
+
+## Item 3 — the real differential joint gate
+
+Nothing to write: the test exists, and its reference is a second implementation rather than a
+second call (a row scan at the same `ts` through Percolator's records, decoded with the row codec).
+It needs the blocker above fixed, and then:
+
+1. un-`ignore` it and run `cargo test -p esker-sql --test joint_gate -- --ignored`;
+2. replace `docs/bench/columnar-learner.md`'s "the story end to end" section's last paragraph — the
+   one that says the fragment service refuses — with what a fragment now answers;
+3. widen the corpus before calling it done. One update and one delete is enough to tell "every
+   version" from "the visible version" and is **not** enough for the case §store names as the one
+   that hides: an `ADD COLUMN` with a non-`NULL` default and rows written before it, which reads
+   the default row-side and NULL columnar-side if the decoder is built from types alone. The
+   schema push that would make that case reachable on a live region does not exist yet either
+   (`region.rs` reads the published record from the catalog the region carries), so a table whose
+   rows live in a region that does not cover `'m'` still has no copy at all — the third thing this
+   milestone owes.
