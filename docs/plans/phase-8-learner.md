@@ -577,3 +577,32 @@ No routing table from PD (`connect`'s `TODO(phase-6a)` stands — this lane adds
 the lease and the report, not a region resolver). No changes to `esker-store`, `esker-columnar`,
 `esker-pd`, `esker-proto`: all of it exists, is tested, and is forbidden to this lane. A defect
 found there is reported with evidence, not fixed.
+
+## The joint gate did NOT pass, and the blocker is probably this lane's
+
+`esker-cli::cluster_chaos::a_sigkilled_leader_process_never_costs_an_acknowledged_write` ran for
+**over an hour** and did not finish. Sampled before anything was killed (`sample` on the live pid):
+the test thread is `cluster_chaos::battery` → `drive` → `esker_client::raw` → `router` →
+`tcp`/`clock`, with backoff sleeps and parks. That is the client **retry** path.
+
+The most likely cause is `aaffec7` — wave C's `retry::may_ask_again`, which re-asks a read whose
+answer was lost instead of surfacing it. Before that change a lost read answer returned at once;
+after it, the call can spend `max_retries` with backoff, bounded only by the 10 s call deadline. A
+loop making many such calls while a leader is dead turns a fast failure into ten seconds, over and
+over.
+
+**The retry rule itself is defensible and this note is not a request to revert it.** A read may
+always be re-asked, and refusing to was manufacturing refusals out of dropped packets — that is
+what `retry.rs`'s own module doc had named and left. What is probably wrong is that
+`cluster_chaos`'s loop was written against a client that failed fast, so the change turned a
+bounded wait into a much longer one. The fix is more likely in that test's loop or its deadline
+than in `may_ask_again`.
+
+That is a hypothesis from **one sample**, and it should be confirmed before anything is changed.
+The cheap confirmation: run that test with `aaffec7`'s `may_ask_again` branch disabled and see
+whether it completes. `crates/esker-client/tests/chaos_linearizability.rs` is the in-process twin
+of it and completes in ~5 s, which is itself evidence — whatever this is, it involves the real
+process boundary rather than the rule alone.
+
+Not fixed here: this lane reached the end of its context, and a hurried change to the retry path is
+how a good fix becomes a bad one.
