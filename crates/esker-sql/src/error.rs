@@ -390,6 +390,27 @@ pub enum SqlError {
     #[error("syntax error at or near \"{0}\"")]
     SyntaxAtOrNear(&'static str),
 
+    /// `ORDER BY <name>` where more than one **output** column is called that.
+    ///
+    /// A different sentence from [`SqlError::AmbiguousColumn`] and about a different thing: the
+    /// columns in question are the ones the target list produced, not the ones the tables have.
+    /// `SELECT l.id, r.id, id FROM l JOIN r USING (id) ORDER BY id` is this — the `id` in the
+    /// target list is unambiguous, and the three columns it comes back with are not. Measured.
+    #[error("ORDER BY \"{0}\" is ambiguous")]
+    AmbiguousOrderBy(String),
+
+    /// `USING (c)` where one of the two tables has no column `c`.
+    ///
+    /// PostgreSQL names **which side** is missing it, and that is the useful half: a typo and a
+    /// join between the wrong two tables look identical without it.
+    #[error("column \"{column}\" specified in USING clause does not exist in {side} table")]
+    UsingColumnMissing {
+        /// The column named in the clause.
+        column: String,
+        /// `left` or `right`.
+        side: &'static str,
+    },
+
     /// `SAVEPOINT`, `ROLLBACK TO SAVEPOINT` or `RELEASE SAVEPOINT` with no block open.
     ///
     /// The verb is **PostgreSQL's own**, not the user's: `RELEASE s` outside a block says
@@ -698,7 +719,9 @@ impl SqlError {
             SqlError::UndefinedTable(_)
             | SqlError::UndefinedTableForDrop(_)
             | SqlError::MissingFromEntry(_) => sqlstate::UNDEFINED_TABLE,
-            SqlError::AmbiguousColumn(_) => sqlstate::AMBIGUOUS_COLUMN,
+            SqlError::AmbiguousColumn(_) | SqlError::AmbiguousOrderBy(_) => {
+                sqlstate::AMBIGUOUS_COLUMN
+            }
             SqlError::UndefinedIndex(_) => sqlstate::UNDEFINED_OBJECT,
             SqlError::DependentObjectsStillExist { .. } => sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
             SqlError::WrongObjectType { .. } | SqlError::AlterActionOnWrongObject { .. } => {
@@ -707,6 +730,7 @@ impl SqlError {
             SqlError::UndefinedColumn(_)
             | SqlError::UndefinedColumnInKey(_)
             | SqlError::UndefinedQualifiedColumn { .. }
+            | SqlError::UsingColumnMissing { .. }
             | SqlError::UndefinedColumnInRelation { .. } => sqlstate::UNDEFINED_COLUMN,
             SqlError::DuplicateTable(_) | SqlError::AlreadyExistsSkipping(_) => {
                 sqlstate::DUPLICATE_TABLE

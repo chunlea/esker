@@ -1536,16 +1536,18 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
 fn lower_join(join: &sqlparser::ast::Join) -> Result<plan::Join> {
     let table = table_factor(&join.relation)?;
     refuse_if(join.global, "a GLOBAL JOIN")?;
-    let on = match &join.join_operator {
+    let (kind, constraint) = match &join.join_operator {
         JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => {
-            join_constraint(constraint)?
+            (plan::JoinKind::Inner, Some(constraint))
         }
-        JoinOperator::CrossJoin(constraint) => join_constraint(constraint)?,
+        JoinOperator::CrossJoin(constraint) => (plan::JoinKind::Inner, Some(constraint)),
+        JoinOperator::Left(constraint) | JoinOperator::LeftOuter(constraint) => {
+            (plan::JoinKind::Left, Some(constraint))
+        }
         // Each of these keeps rows an inner join drops, so running one as an inner join would
         // silently return fewer rows than the user asked for -- the worst thing a join can do.
         other => {
             return Err(SqlError::unsupported(match other {
-                JoinOperator::Left(_) | JoinOperator::LeftOuter(_) => "a LEFT JOIN",
                 JoinOperator::Right(_) | JoinOperator::RightOuter(_) => "a RIGHT JOIN",
                 JoinOperator::FullOuter(_) => "a FULL JOIN",
                 JoinOperator::LeftSemi(_) | JoinOperator::Semi(_) => "a SEMI JOIN",
@@ -1557,18 +1559,36 @@ fn lower_join(join: &sqlparser::ast::Join) -> Result<plan::Join> {
             }));
         }
     };
-    Ok(plan::Join { table, on })
+    let (on, using) = match constraint {
+        Some(constraint) => join_constraint(constraint)?,
+        None => (None, Vec::new()),
+    };
+    Ok(plan::Join {
+        table,
+        kind,
+        on,
+        using,
+    })
 }
 
-fn join_constraint(constraint: &JoinConstraint) -> Result<Option<plan::Expr>> {
+/// A join's condition: an `ON` expression, the columns of a `USING`, or neither for a cross join.
+///
+/// `USING (a)` is carried as *columns* and not lowered here into `ON l.a = r.a`, because it does a
+/// second thing an equality cannot: it **merges** the two columns, so `SELECT *` returns one `a`
+/// and at the front. The planner builds the equality from the columns and the scope carries the
+/// merge, which keeps both halves of the clause in one place.
+fn join_constraint(constraint: &JoinConstraint) -> Result<(Option<plan::Expr>, Vec<String>)> {
     match constraint {
-        JoinConstraint::On(expr) => Ok(Some(lower_expr(expr)?)),
-        // `USING (a)` also *merges* the two columns into one in the output, which is a projection
-        // rule and not only a condition; running it as `ON a.x = b.x` would give the wrong number
-        // of columns for `SELECT *`.
-        JoinConstraint::Using(_) => Err(SqlError::unsupported("a JOIN ... USING clause")),
+        JoinConstraint::On(expr) => Ok((Some(lower_expr(expr)?), Vec::new())),
+        JoinConstraint::Using(columns) => {
+            let columns = columns
+                .iter()
+                .map(object_name)
+                .collect::<Result<Vec<_>>>()?;
+            Ok((None, columns))
+        }
         JoinConstraint::Natural => Err(SqlError::unsupported("a NATURAL JOIN")),
-        JoinConstraint::None => Ok(None),
+        JoinConstraint::None => Ok((None, Vec::new())),
     }
 }
 

@@ -45,6 +45,17 @@ pub(super) struct Scope<'a> {
     /// because the columns a user gets back must not depend on which side the planner chose to
     /// drive the loop from.
     written: Vec<usize>,
+    /// `USING (a, b, …)`: the columns the two sides share as one.
+    ///
+    /// Two things follow from a column being merged, and both were measured. `SELECT *` returns it
+    /// **once and first**, ahead of either table's other columns; and a bare reference to it is no
+    /// longer ambiguous, where the same query written with `ON l.a = r.a` answers `42702`.
+    ///
+    /// The merged value is the **left** side's, with no `COALESCE` needed and none available: for
+    /// an inner join the two are equal by the condition, and for a left join the right one is
+    /// either equal or NULL. There is no third case here, because there is no `RIGHT` or `FULL`
+    /// join in this crate to make one.
+    using: Vec<String>,
 }
 
 impl<'a> Scope<'a> {
@@ -53,6 +64,7 @@ impl<'a> Scope<'a> {
         Scope {
             tables: Vec::new(),
             written: Vec::new(),
+            using: Vec::new(),
         }
     }
 
@@ -61,15 +73,17 @@ impl<'a> Scope<'a> {
         Scope {
             tables: vec![table],
             written: vec![0],
+            using: Vec::new(),
         }
     }
 
     /// Two tables: the first is the one the loop is driven from, and `swapped` says whether that
     /// is the one the user wrote second.
-    fn joined(outer: &'a TableDef, inner: &'a TableDef, swapped: bool) -> Self {
+    fn joined(outer: &'a TableDef, inner: &'a TableDef, swapped: bool, using: &[String]) -> Self {
         Scope {
             tables: vec![outer, inner],
             written: if swapped { vec![1, 0] } else { vec![0, 1] },
+            using: using.to_vec(),
         }
     }
 
@@ -118,16 +132,27 @@ impl<'a> Scope<'a> {
                 .collect();
             return Ok(columns.into_iter());
         }
-        let columns: Vec<_> = self
-            .written
-            .iter()
-            .flat_map(|&index| {
-                let offset = self.offset(index);
-                self.tables[index]
-                    .user_columns()
-                    .map(move |(at, column)| (offset + at, column))
-            })
-            .collect();
+        // A merged column comes **first and once**: `SELECT * FROM l JOIN r USING (id)` is
+        // `id, <l's others>, <r's others>`, measured. So the merged ones are emitted from the
+        // left-hand table in the order the clause named them, and then every column of every table
+        // that is not one of them.
+        let mut columns = Vec::new();
+        let written = self.written.first().copied().unwrap_or(0);
+        for merged in &self.using {
+            let at = self.tables[written]
+                .column(merged)
+                .ok_or_else(|| undefined_column(merged))?;
+            columns.push((self.offset(written) + at, &self.tables[written].columns[at]));
+        }
+        for &index in &self.written {
+            let offset = self.offset(index);
+            for (at, column) in self.tables[index].user_columns() {
+                if self.using.contains(&column.name) {
+                    continue;
+                }
+                columns.push((offset + at, column));
+            }
+        }
         Ok(columns.into_iter())
     }
 
@@ -156,6 +181,20 @@ impl<'a> Scope<'a> {
                 }
             })?;
             return Ok((self.offset(index) + at, self.tables[index].columns[at].ty));
+        }
+
+        // A `USING` column is **one** column, so a bare reference to it is not ambiguous — where
+        // the same query written `ON l.id = r.id` answers `42702`. Its value is the left-hand
+        // side's: equal to the right's for an inner join, and either equal or NULL for a left one,
+        // so there is no third case and no `COALESCE` to need.
+        if self.using.iter().any(|merged| merged == name) {
+            let written = self.written.first().copied().unwrap_or(0);
+            if let Some(at) = self.tables[written].column(name) {
+                return Ok((
+                    self.offset(written) + at,
+                    self.tables[written].columns[at].ty,
+                ));
+            }
         }
 
         let mut found = None;
@@ -219,26 +258,22 @@ pub(super) fn plan(
     // JOIN o ON c.id = o.cid` reads the whole of `o` for every row of `c`, while the same query
     // written the other way round costs one key read per row. A user should not have to know
     // which order to type.
-    let (scope, swapped) = match (table, inner) {
-        (None, _) => (Scope::empty(), false),
-        (Some(table), None) => (Scope::single(table), false),
-        (Some(left), Some(right)) => {
-            let on = select.join.as_ref().and_then(|join| join.on.as_ref());
-            // As written first: a probe on the right-hand table keeps the order the user chose,
-            // which keeps `EXPLAIN` easiest to read when both would work.
-            if on.is_some_and(|on| {
-                probe_for(on, &Scope::joined(left, right, false), right).is_some()
-            }) {
-                (Scope::joined(left, right, false), false)
-            } else if on
-                .is_some_and(|on| probe_for(on, &Scope::joined(right, left, true), left).is_some())
-            {
-                (Scope::joined(right, left, true), true)
-            } else {
-                (Scope::joined(left, right, false), false)
-            }
+    // `USING (a, b)` is the equality `l.a = r.a AND l.b = r.b` **plus** a merge, so the condition
+    // is built here and the merge is carried by the scope.
+    let using: &[String] = select.join.as_ref().map_or(&[], |join| &join.using);
+    let condition = match (&select.join, table, inner) {
+        (Some(join), Some(left), Some(right)) if !join.using.is_empty() => {
+            Some(using_condition(&join.using, left, right)?)
         }
+        (Some(join), ..) => join.on.clone(),
+        _ => None,
     };
+    let left_join = select
+        .join
+        .as_ref()
+        .is_some_and(|join| join.kind == crate::plan::JoinKind::Left);
+
+    let (scope, swapped) = drive_from(table, inner, condition.as_ref(), left_join, using);
     let (outer_table, inner_table) = match (table, inner, swapped) {
         (Some(left), Some(right), false) => (Some(left), Some(right)),
         (Some(left), Some(right), true) => (Some(right), Some(left)),
@@ -262,7 +297,7 @@ pub(super) fn plan(
 
     if let Some(join) = &select.join {
         let inner = inner_table.ok_or_else(|| SqlError::UndefinedTable(join.table.clone()))?;
-        node = join_node(node, join, &scope, inner)?;
+        node = join_node(node, condition.as_ref(), left_join, &scope, inner)?;
     }
 
     if let Some(filter) = &select.filter {
@@ -302,7 +337,7 @@ pub(super) fn plan(
     // rather than working around it: deduplication happens over the target list, so a sort key
     // the target list does not contain has no defined position to sort at. Its keys are resolved
     // against the *output* columns and a key that is not one of them is `42P10`.
-    let sort_keys = order_keys(select, &scope, aggregation.as_ref(), &exprs)?;
+    let sort_keys = order_keys(select, &scope, aggregation.as_ref(), &exprs, &columns)?;
     if !select.distinct && !sort_keys.is_empty() {
         node = Node::Sort {
             input: Box::new(node),
@@ -367,6 +402,7 @@ fn order_keys(
     scope: &Scope<'_>,
     aggregation: Option<&aggregate::Aggregation>,
     outputs: &[Expr],
+    columns: &[(String, ColumnType)],
 ) -> Result<Vec<SortKey>> {
     let mut keys = Vec::new();
     for item in &select.order_by {
@@ -384,6 +420,19 @@ fn order_keys(
                 })?;
             outputs[at - 1].clone()
         } else {
+            // A bare name that **more than one output column** is called is `42702`, and it is a
+            // different ambiguity from a column reference's: the target list is what is ambiguous,
+            // not the tables. `SELECT l.id, r.id, id FROM l JOIN r USING (id) ORDER BY id` is the
+            // shape — the `id` in the list resolves fine and the three columns it produces do not.
+            //
+            // The narrow half of PostgreSQL's rule: it also *prefers* an output column to an input
+            // one, which this does not do. Every case the corpus holds is covered by the
+            // ambiguity alone, and a preference nothing has measured would be invented.
+            if let Expr::Column { table: None, name } = &item.expr
+                && columns.iter().filter(|(output, _)| output == name).count() > 1
+            {
+                return Err(SqlError::AmbiguousOrderBy(name.clone()));
+            }
             let resolved = resolve(&dealias(&item.expr, select), scope)?;
             aggregate::check_not_nested(&resolved)?;
             match aggregation {
@@ -457,6 +506,45 @@ pub(super) fn returning_columns(items: &[SelectItem], table: &TableDef) -> Resul
     Ok((columns, exprs))
 }
 
+/// Which side of a join drives the loop, and the scope that follows from it.
+///
+/// **A left join may not swap.** An inner join is commutative, so this is free to choose — and it
+/// has to choose, because the probe only works on the *inner* side: without it, `FROM c JOIN o ON
+/// c.id = o.cid` reads the whole of `o` for every row of `c` while the same query written the
+/// other way round costs one key read per row, and a user should not have to know which order to
+/// type. A left join is not commutative: which side keeps its unmatched rows is the whole of what
+/// it means, so driving the right side and NULL-extending would answer a `RIGHT JOIN` — the same
+/// rows, in the wrong places, with nothing to say so.
+fn drive_from<'a>(
+    table: Option<&'a TableDef>,
+    inner: Option<&'a TableDef>,
+    on: Option<&Expr>,
+    left_join: bool,
+    using: &[String],
+) -> (Scope<'a>, bool) {
+    let (Some(left), Some(right)) = (table, inner) else {
+        return match table {
+            None => (Scope::empty(), false),
+            Some(table) => (Scope::single(table), false),
+        };
+    };
+    if left_join {
+        return (Scope::joined(left, right, false, using), false);
+    }
+    // As written first: a probe on the right-hand table keeps the order the user chose, which
+    // keeps `EXPLAIN` easiest to read when both would work.
+    if on
+        .is_some_and(|on| probe_for(on, &Scope::joined(left, right, false, using), right).is_some())
+    {
+        return (Scope::joined(left, right, false, using), false);
+    }
+    if on.is_some_and(|on| probe_for(on, &Scope::joined(right, left, true, using), left).is_some())
+    {
+        return (Scope::joined(right, left, true, using), true);
+    }
+    (Scope::joined(left, right, false, using), false)
+}
+
 /// Whether every column reference in an expression belongs to `table`.
 fn mentions_only(expr: &Expr, table: &TableDef) -> bool {
     let mut only = true;
@@ -493,29 +581,72 @@ fn for_each_column(expr: &Expr, visit: &mut impl FnMut(Option<&str>, &str)) {
 /// the difference a user changes their schema over.
 fn join_node(
     outer: Node,
-    join: &crate::plan::Join,
+    on: Option<&Expr>,
+    left_join: bool,
     scope: &Scope<'_>,
     inner: &TableDef,
 ) -> Result<Node> {
-    let probe = join
-        .on
-        .as_ref()
+    let probe = on
         .and_then(|on| probe_for(on, scope, inner))
         .unwrap_or(crate::plan::Probe::Materialize);
     // A probe answers the equality exactly, so the condition it came from is not re-checked. A
     // materialised inner side has nothing to answer it, so the whole condition is the filter.
-    let residual = match (&probe, &join.on) {
-        (crate::plan::Probe::Materialize, Some(on)) => Some(resolve(on, scope)?),
+    let residual = match (&probe, on) {
+        (crate::plan::Probe::Materialize, Some(on)) => {
+            let resolved = resolve(on, scope)?;
+            check_predicate(&resolved, "JOIN/ON", scope)?;
+            Some(resolved)
+        }
         _ => None,
     };
     Ok(Node::NestedLoop {
         outer: Box::new(outer),
+        left_join,
         inner_table_id: inner.id,
         inner_table: inner.name.clone(),
         inner_columns: inner.row_schema(),
         probe,
         residual,
     })
+}
+
+/// `USING (a, b)` as the condition it also is: `l.a = r.a AND l.b = r.b`, qualified by table so
+/// that it resolves the same way an `ON` written by hand would.
+///
+/// A column one side lacks is `42703` naming **which** side, which is what a real server says and
+/// is the difference between a typo and a join between the wrong two tables.
+fn using_condition(columns: &[String], left: &TableDef, right: &TableDef) -> Result<Expr> {
+    let mut condition: Option<Expr> = None;
+    for column in columns {
+        for (table, side) in [(left, "left"), (right, "right")] {
+            if table.column(column).is_none() {
+                return Err(SqlError::UsingColumnMissing {
+                    column: column.clone(),
+                    side,
+                });
+            }
+        }
+        let equality = Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Column {
+                table: Some(left.name.clone()),
+                name: column.clone(),
+            }),
+            right: Box::new(Expr::Column {
+                table: Some(right.name.clone()),
+                name: column.clone(),
+            }),
+        };
+        condition = Some(match condition {
+            None => equality,
+            Some(built) => Expr::Binary {
+                op: BinaryOp::And,
+                left: Box::new(built),
+                right: Box::new(equality),
+            },
+        });
+    }
+    condition.ok_or_else(|| SqlError::Internal("an empty USING clause".to_owned()))
 }
 
 /// The probe an `ON` condition allows, or `None` for one that needs the inner table read whole.

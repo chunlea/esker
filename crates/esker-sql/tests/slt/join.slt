@@ -131,11 +131,21 @@ SELECT wrong.id FROM o JOIN c ON o.cid = c.id
 statement error (42703)
 SELECT o.nosuch FROM o JOIN c ON o.cid = c.id
 
-# The joins that keep rows an inner join drops are refused by name, never approximated: running a
-# LEFT JOIN as an inner one would silently return fewer rows than the user asked for.
-statement error (0A000)
-SELECT o.id FROM o LEFT JOIN c ON o.cid = c.id
+# A LEFT JOIN keeps the two orders an inner join drops and NULL-extends them: 13 points at a
+# customer who is not there, and 14 points at nobody at all. Both come back, and `NULL = 9` and
+# `NULL = NULL` are unknown for the same reason. Replayed against a real PostgreSQL 19beta1.
+query IT
+SELECT o.id, c.name FROM o LEFT JOIN c ON o.cid = c.id ORDER BY o.id
+----
+10	ann
+11	ann
+12	bob
+13	NULL
+14	NULL
 
+# The joins that keep rows the *left* side does not have are still refused by name, never
+# approximated: running a RIGHT JOIN as a LEFT one would answer with the same rows in the wrong
+# places, which is worse than refusing.
 statement error (0A000)
 SELECT o.id FROM o RIGHT JOIN c ON o.cid = c.id
 
@@ -144,9 +154,6 @@ SELECT o.id FROM o FULL JOIN c ON o.cid = c.id
 
 statement error (0A000)
 SELECT o.id FROM o NATURAL JOIN c
-
-statement error (0A000)
-SELECT o.id FROM o JOIN c USING (id)
 
 # Two joins in one statement is the next unit's work, and says so.
 statement error (0A000)

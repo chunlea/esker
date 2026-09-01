@@ -1,0 +1,76 @@
+# What a real PostgreSQL 19beta1 does with `INNER` and `LEFT JOIN`, `ON` and `USING` -- unit 4 of
+# `docs/plans/phase-9-rails.md`. `has_many`, `includes` and `joins` are the whole of what an
+# ActiveRecord association compiles to.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way against one node.
+# It builds its own tables.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THE TRAP, and the reason this file exists:
+#
+#   * **the same predicate means different things in `ON` and in `WHERE`.**
+#     `LEFT JOIN r ON l.id = r.id AND r.flag` keeps every left row -- the ones that fail the
+#     condition come back NULL-extended -- and `LEFT JOIN r ON l.id = r.id WHERE r.flag` removes
+#     them. Measured side by side below: three rows against one. An implementation that folded the
+#     `ON` into the `WHERE`, or applied the left-join extension after the filter, would answer the
+#     second for both and lose rows with no error.
+#
+# THREE MORE:
+#
+#   * `USING (id)` **merges**: `SELECT *` returns one `id`, **first**, ahead of either table's own
+#     columns, and a bare `id` is no longer ambiguous where `ON l.id = r.id` makes it `42702`.
+#   * the merged column's value is the **left** side's -- for a left join the right one is either
+#     equal or NULL, so `SELECT id FROM l LEFT JOIN r USING (id)` answers 1, 2, 3 and not 1, 3.
+#   * a `USING` column one side lacks names **which** side, which is the difference between a typo
+#     and a join between the wrong two tables.
+#
+CREATE TABLE l (id int8 PRIMARY KEY, n text, k int8)		-
+CREATE TABLE r (id int8 PRIMARY KEY, m text, flag bool)		-
+INSERT INTO l VALUES (1, 'one', 1), (2, 'two', 9), (3, 'three', NULL)		-
+INSERT INTO r VALUES (1, 'uno', true), (3, 'tres', false), (4, 'cuatro', true)		-
+
+# --- INNER, and what SELECT * gives it
+SELECT * FROM l JOIN r ON l.id = r.id ORDER BY l.id	bigint,text,bigint,bigint,text,boolean	1|one|1|1|uno|t ; 3|three|\N|3|tres|f
+SELECT l.id, r.id, n, m FROM l JOIN r ON l.id = r.id ORDER BY l.id	bigint,bigint,text,text	1|1|one|uno ; 3|3|three|tres
+SELECT count(*) FROM l JOIN r ON l.id = r.id	bigint	2
+
+# --- LEFT: the rows an inner join drops, and which columns are NULL in them
+SELECT * FROM l LEFT JOIN r ON l.id = r.id ORDER BY l.id	bigint,text,bigint,bigint,text,boolean	1|one|1|1|uno|t ; 2|two|9|\N|\N|\N ; 3|three|\N|3|tres|f
+SELECT l.id, r.id, m FROM l LEFT JOIN r ON l.id = r.id ORDER BY l.id	bigint,bigint,text	1|1|uno ; 2|\N|\N ; 3|3|tres
+SELECT count(*) FROM l LEFT JOIN r ON l.id = r.id	bigint	3
+SELECT l.id FROM l LEFT JOIN r ON l.id = r.id WHERE r.id IS NULL ORDER BY l.id	bigint	2
+
+# --- THE TRAP: the same predicate in ON and in WHERE
+SELECT l.id, r.id, r.m FROM l LEFT JOIN r ON l.id = r.id AND r.flag ORDER BY l.id	bigint,bigint,text	1|1|uno ; 2|\N|\N ; 3|\N|\N
+SELECT l.id, r.id, r.m FROM l LEFT JOIN r ON l.id = r.id WHERE r.flag ORDER BY l.id	bigint,bigint,text	1|1|uno
+SELECT l.id, r.id FROM l LEFT JOIN r ON l.id = r.id AND r.m = 'nope' ORDER BY l.id	bigint,bigint	1|\N ; 2|\N ; 3|\N
+SELECT l.id, r.id FROM l LEFT JOIN r ON l.id = r.id WHERE r.m = 'nope' ORDER BY l.id	bigint,bigint	-
+SELECT l.id, r.id FROM l LEFT JOIN r ON false ORDER BY l.id	bigint,bigint	1|\N ; 2|\N ; 3|\N
+SELECT l.id, r.id FROM l LEFT JOIN r ON true ORDER BY l.id, r.id	bigint,bigint	1|1 ; 1|3 ; 1|4 ; 2|1 ; 2|3 ; 2|4 ; 3|1 ; 3|3 ; 3|4
+
+# --- a NULL join key never matches, on either side
+SELECT l.id, r.id FROM l LEFT JOIN r ON l.k = r.id ORDER BY l.id	bigint,bigint	1|1 ; 2|\N ; 3|\N
+SELECT l.id, r.id FROM l JOIN r ON l.k = r.id ORDER BY l.id	bigint,bigint	1|1
+
+# --- USING: the merged column, where it sits, and what it is called
+SELECT * FROM l JOIN r USING (id) ORDER BY id	bigint,text,bigint,text,boolean	1|one|1|uno|t ; 3|three|\N|tres|f
+SELECT * FROM l LEFT JOIN r USING (id) ORDER BY id	bigint,text,bigint,text,boolean	1|one|1|uno|t ; 2|two|9|\N|\N ; 3|three|\N|tres|f
+SELECT id, n, m FROM l JOIN r USING (id) ORDER BY id	bigint,text,text	1|one|uno ; 3|three|tres
+SELECT id FROM l JOIN r USING (id) ORDER BY id	bigint	1 ; 3
+SELECT l.id, r.id, id FROM l JOIN r USING (id) ORDER BY id	!42702 ORDER BY "id" is ambiguous
+SELECT id FROM l LEFT JOIN r USING (id) ORDER BY id	bigint	1 ; 2 ; 3
+SELECT l.id, r.id, id FROM l LEFT JOIN r USING (id) ORDER BY id	!42702 ORDER BY "id" is ambiguous
+SELECT l.* FROM l JOIN r USING (id) ORDER BY id	bigint,text,bigint	1|one|1 ; 3|three|\N
+SELECT r.* FROM l LEFT JOIN r USING (id) ORDER BY 1	bigint,text,boolean	1|uno|t ; 3|tres|f ; \N|\N|\N
+SELECT id FROM l JOIN r ON l.id = r.id ORDER BY id	!42702 column reference "id" is ambiguous
+SELECT id FROM l JOIN r USING (nope)	!42703 column "nope" specified in USING clause does not exist in left table
+SELECT id FROM l JOIN r USING (m)	!42703 column "m" specified in USING clause does not exist in left table
+SELECT id FROM l JOIN r USING (id, n)	!42703 column "n" specified in USING clause does not exist in right table
+
+# --- what the ON clause will and will not take
+SELECT l.id FROM l JOIN r ON l.id	!42804 argument of JOIN/ON must be type boolean, not type bigint
+SELECT l.id FROM l JOIN r ON l.id = r.nope	!42703 column r.nope does not exist
+SELECT count(*) FROM l CROSS JOIN r	bigint	9

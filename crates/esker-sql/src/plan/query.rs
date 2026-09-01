@@ -24,17 +24,37 @@ use crate::row::RowSchema;
 use crate::value::PgDatum;
 use crate::value::{ColumnType, Datum};
 
+/// Which rows a join keeps when nothing on the right matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    /// `JOIN` / `INNER JOIN`: the pair, or nothing.
+    Inner,
+    /// `LEFT [OUTER] JOIN`: the pair, or the left row with **every** right column NULL.
+    ///
+    /// The one that must not drop rows, and the reason the `ON` and the `WHERE` cannot be merged:
+    /// `ON l.id = r.id AND r.flag` keeps a left row with NULLs where `WHERE r.flag` removes it
+    /// entirely. Measured, both (`tests/corpus/pg19_join.txt`).
+    Left,
+}
+
 /// One `JOIN`, as written.
 ///
-/// Exactly one, and inner only. A second join, an outer join and a `USING` clause are each refused
-/// by name (contract C2) rather than approximated: an outer join that silently behaved like an
-/// inner one would drop rows, which is the worst thing a join can do.
+/// Exactly one. A second join is refused by name (contract C2) rather than approximated; the two
+/// **kinds** and both constraint spellings are executed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Join {
     /// The right-hand table.
     pub table: String,
-    /// `ON`, or `None` for `CROSS JOIN` — every pair of rows.
+    /// Whether an unmatched left row survives.
+    pub kind: JoinKind,
+    /// `ON`, or `None` for a `CROSS JOIN` and for `USING`, which becomes one.
     pub on: Option<Expr>,
+    /// `USING (a, b, …)`, the columns as written.
+    ///
+    /// Kept alongside the `ON` it lowers to rather than only as that `ON`, because `USING` does a
+    /// second thing an equality cannot: it **merges** the named columns, so `SELECT *` returns each
+    /// one once and at the front, and a bare reference to one is no longer ambiguous.
+    pub using: Vec<String>,
 }
 
 /// `SELECT`, as written.
@@ -199,8 +219,17 @@ pub enum Node {
     /// A nested-loop join: for every row of `outer`, the rows of the inner table that match.
     ///
     /// The output row is the outer row's columns followed by the inner row's, which is the order
-    /// `FROM a JOIN b` gives them and therefore the order `SELECT *` returns.
+    /// `FROM a JOIN b` gives them and therefore the order `SELECT *` returns. A `USING` clause
+    /// changes what the *projection* does with that row and not the row itself, so the merged
+    /// column lives in the executor's scope rather than here.
     NestedLoop {
+        /// Whether an outer row with no match survives, with every inner column NULL.
+        ///
+        /// **Applied after the `ON`, never after the `WHERE`.** That ordering is the whole of the
+        /// difference the capture exists to pin: a condition in the `ON` decides whether a *pair*
+        /// is kept, and an outer row that kept none is NULL-extended; a condition in the `WHERE`
+        /// runs over the already-extended row and can remove it.
+        left_join: bool,
         /// The left side, pulled once.
         outer: Box<Node>,
         /// The inner table.

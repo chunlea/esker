@@ -1,6 +1,6 @@
 # Phase 9 plan — a PostgreSQL that Rails can talk to, scored by Rails' own tests
 
-Status: **units 0, 1 and 2 landed; unit 3 in progress.** §9 records progress per unit, §6 the divergences, §7 what unit 1 changed and §8 what is watched.
+Status: **units 0–3 landed; unit 4 all but a second join.** §9 records progress per unit, §6 the divergences, §7 what unit 1 changed and §8 what is watched.
 
 Design: [ADR 0031](../adr/0031-rails-compatibility-is-measured.md). Constitution: `CLAUDE.md`.
 The compatibility contract this inherits whole: `docs/plans/phase-6a.md` §1 — **C1** every valid
@@ -240,13 +240,43 @@ so its two halves contradicted each other and the replay failed on a line where 
 right about what they had been asked. It is now one session, and it **builds its own table**: a
 fixture outside the file is a second thing that has to agree with it.
 
-### Unit 4 — `INNER` and `LEFT JOIN`, `ON` and `USING`
+### Unit 4 — `INNER` and `LEFT JOIN`, `ON` and `USING` ✅
 
-One inner join and one cross join exist today (`plan::Join`, `Node::NestedLoop`, `Probe`). This
-unit adds `LEFT` — which is the one that must not drop rows — a second join, and `USING`. Nested
-loop only; correctness over speed, and a bench afterwards rather than a plan built for one. The
-row-count explosion gets the guard `Sort` already has: a bound, and `53400` naming it, rather than
-an allocation on a client's behalf.
+Nested loop only; correctness over speed, and a bench afterwards rather than a plan built for one.
+The materialised inner side is bounded the way `Sort` is and answers `53400` naming it, which is
+where the memory of a join actually is — the output streams.
+
+**The trap the capture exists for**: the same predicate means different things in an `ON` and in a
+`WHERE`. `LEFT JOIN r ON l.id = r.id AND r.flag` keeps every left row, NULL-extending the ones that
+fail the condition; `... ON l.id = r.id WHERE r.flag` removes them. Three rows against one,
+measured side by side. It falls out of *where* the extension happens: after the `ON` has been
+applied to every pair, and before any `WHERE` above the node runs. An implementation that folded
+the two together would answer the second for both and lose rows with no error.
+
+**A left join may not swap which side drives the loop.** An inner join is commutative and the
+planner is free to pick the side it can probe; a left join is not, because which side keeps its
+unmatched rows is the whole of what it means. Driving the right side and NULL-extending answers a
+`RIGHT JOIN` — the same rows, in the wrong places, with nothing to say so — so the swap is disabled
+for it, and `tests/join.rs` pins that through `EXPLAIN` on a query where the other order *would*
+have probed.
+
+**`USING` is two things**, and carrying it only as the equality it implies would have got the
+second wrong: it is `l.a = r.a` **and** a merge. `SELECT *` returns the column once and first,
+ahead of either table's own; a bare reference to it is unambiguous where `ON l.a = r.a` makes it
+`42702`. Its value is the **left** side's, with no `COALESCE` needed and none available — for an
+inner join the two are equal by the condition and for a left join the right is either equal or
+NULL, and there is no `RIGHT` or `FULL` join here to make a third case.
+
+Two smaller things the capture decided. A `USING` column one side lacks names **which** side,
+because a typo and a join between the wrong two tables look identical without it. And `ORDER BY id`
+where more than one *output* column is called `id` is `42702 ORDER BY "id" is ambiguous` — a
+different ambiguity from a column reference's, and the narrow half of PostgreSQL's rule: it also
+prefers an output column to an input one, which is not implemented because nothing measured needs
+it and an unmeasured preference would be invented.
+
+**Not done: a second join.** `Select::join` is one `Option`, and a third table means a nested
+`NestedLoop`, a three-table scope, and a probe boundary that is no longer "the last table". It is
+its own unit's worth and is refused by name (`more than one JOIN`) until it is.
 
 ### Unit 5 — `pg_catalog` and `information_schema`, read-only
 
@@ -366,7 +396,8 @@ than a line in a scrollback. A third sighting of any of them makes it a chase.
 | 0 — ADR, plan, aggregate capture | **done** | `de3c465`, `32fb58f` |
 | 1 — aggregates | **done** | `1d78a96` |
 | 2 — sequences and `RETURNING` | **done** | `e1b1bd2`, `7a7d4f3`, `bf28e0d` |
-| 3 — savepoints | **done** | `779ae2e` (capture), this commit |
+| 3 — savepoints | **done** | `779ae2e` (capture), `a74b724` |
+| 4 — joins | **`LEFT`, `ON`, `USING` done**; a second join is not | this commit |
 | 3 — savepoints | not started | |
 | 4 — joins | not started | |
 | 5 — `pg_catalog` | not started | |

@@ -95,12 +95,19 @@ enum Kind<'a> {
     /// row (at most one row back) or the whole inner table, read once and paired with each.
     NestedLoop {
         outer: Box<Cursor<'a>>,
+        left_join: bool,
         inner_table_id: u64,
         inner_columns: RowSchema,
         probe: Probe,
         residual: Option<Expr>,
         /// The outer row being matched, and how far through the materialised inner side it is.
         current: Option<(Vec<Datum>, usize)>,
+        /// Whether the outer row in `current` has produced a pair yet.
+        ///
+        /// A left join's whole question, and it cannot be answered until the inner side is
+        /// exhausted: an outer row that matched nothing is emitted with every inner column NULL,
+        /// and one that matched is not emitted again.
+        matched: bool,
         /// The inner table, read once, for [`Probe::Materialize`] only.
         materialized: Vec<Vec<Datum>>,
     },
@@ -128,6 +135,7 @@ impl<'a> Cursor<'a> {
             },
             Node::NestedLoop {
                 outer,
+                left_join,
                 inner_table_id,
                 inner_columns,
                 probe,
@@ -165,11 +173,13 @@ impl<'a> Cursor<'a> {
                 };
                 Kind::NestedLoop {
                     outer: Box::new(Cursor::open(txn, tenant, outer)?),
+                    left_join: *left_join,
                     inner_table_id: *inner_table_id,
                     inner_columns: inner_columns.clone(),
                     probe: probe.clone(),
                     residual: residual.clone(),
                     current: None,
+                    matched: false,
                     materialized,
                 }
             }
@@ -255,11 +265,13 @@ impl<'a> Cursor<'a> {
 
             Kind::NestedLoop {
                 outer,
+                left_join,
                 inner_table_id,
                 inner_columns,
                 probe,
                 residual,
                 current,
+                matched,
                 materialized,
             } => loop {
                 let Some((row, position)) = current else {
@@ -267,6 +279,7 @@ impl<'a> Cursor<'a> {
                         return Ok(None);
                     };
                     *current = Some((next, 0));
+                    *matched = false;
                     continue;
                 };
 
@@ -290,7 +303,12 @@ impl<'a> Cursor<'a> {
                             Probe::Materialize => unreachable!("handled below"),
                         };
                         if matches!(row[at], Datum::Null) {
+                            // A NULL key matches nothing — but a left join still keeps the row.
+                            let unmatched = left_extend(*left_join, row, inner_columns.len());
                             *current = None;
+                            if unmatched.is_some() {
+                                return Ok(unmatched);
+                            }
                             continue;
                         }
                         let node = probe_node(probe, *inner_table_id, inner_columns, row);
@@ -300,11 +318,25 @@ impl<'a> Cursor<'a> {
                             *current = None;
                             return Ok(Some(joined));
                         }
+                        let unmatched = left_extend(*left_join, row, inner_columns.len());
                         *current = None;
+                        if unmatched.is_some() {
+                            return Ok(unmatched);
+                        }
                     }
                     Probe::Materialize => {
                         let Some(inner) = materialized.get(*position) else {
+                            // The inner side is exhausted. A left join whose outer row kept no
+                            // pair is emitted now, with every inner column NULL — and it is
+                            // decided **here**, after the `ON` has been applied to every pair and
+                            // before any `WHERE` above this node runs, which is the whole of what
+                            // separates the two clauses.
+                            let unmatched =
+                                left_extend(*left_join && !*matched, row, inner_columns.len());
                             *current = None;
+                            if unmatched.is_some() {
+                                return Ok(unmatched);
+                            }
                             continue;
                         };
                         *position += 1;
@@ -319,6 +351,7 @@ impl<'a> Cursor<'a> {
                             }
                         };
                         if keep {
+                            *matched = true;
                             return Ok(Some(joined));
                         }
                     }
@@ -444,6 +477,19 @@ impl<'a> Cursor<'a> {
             }
         }
     }
+}
+
+/// The row a left join emits for an outer row that matched nothing: the outer row, and one NULL
+/// per column of the inner table.
+///
+/// `None` for an inner join, which drops it — which is the one difference between the two, stated
+/// once so that neither probe path can implement it slightly differently.
+fn left_extend(left_join: bool, row: &[Datum], inner_width: usize) -> Option<Vec<Datum>> {
+    left_join.then(|| {
+        let mut extended = row.to_vec();
+        extended.extend(std::iter::repeat_n(Datum::Null, inner_width));
+        extended
+    })
 }
 
 /// Drains an input into groups and folds each one down to a row.

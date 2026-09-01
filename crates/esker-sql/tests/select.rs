@@ -412,11 +412,16 @@ fn an_expression_we_do_not_evaluate_is_refused_by_name() {
         ("SELECT DISTINCT ON (n) n FROM s1", "SELECT DISTINCT ON"),
         ("SELECT id FROM s1 GROUP BY ROLLUP (id)", "GROUP BY"),
         ("SELECT a.id FROM s1 a", "a table alias"),
-        // An inner join runs now; the ones that keep rows an inner join drops do not.
-        ("SELECT * FROM s1 LEFT JOIN s2 ON true", "LEFT JOIN"),
+        // `INNER` and `LEFT` run now, with `ON` and with `USING` (phase 9 unit 4). The ones that
+        // keep rows the *left* side does not have still do not: running a `RIGHT` as a `LEFT`
+        // would answer with the same rows in the wrong places.
+        ("SELECT * FROM s1 RIGHT JOIN s2 ON true", "RIGHT JOIN"),
         ("SELECT * FROM s1 FULL JOIN s2 ON true", "FULL JOIN"),
         ("SELECT * FROM s1 NATURAL JOIN s2", "NATURAL JOIN"),
-        ("SELECT * FROM s1 JOIN s2 USING (id)", "USING"),
+        (
+            "SELECT * FROM s1 JOIN s2 ON true JOIN s1 ON true",
+            "more than one JOIN",
+        ),
         ("SELECT * FROM s1 UNION SELECT * FROM s1", "UNION"),
     ] {
         let error = node.run(sql).unwrap_err();
