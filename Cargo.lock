@@ -460,6 +460,7 @@ dependencies = [
  "esker-base",
  "esker-client",
  "esker-keys",
+ "esker-pd",
  "esker-proto",
  "esker-store",
  "proptest",
