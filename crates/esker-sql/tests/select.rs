@@ -411,7 +411,9 @@ fn an_expression_we_do_not_evaluate_is_refused_by_name() {
         ("SELECT length(t) FROM s1", "length"),
         ("SELECT DISTINCT ON (n) n FROM s1", "SELECT DISTINCT ON"),
         ("SELECT id FROM s1 GROUP BY ROLLUP (id)", "GROUP BY"),
-        ("SELECT a.id FROM s1 a", "a table alias"),
+        // A table alias runs now (phase 9 unit 5, `tests/alias.rs`). What it does not carry is the
+        // **column** alias list, which renames the table's columns and cannot be ignored.
+        ("SELECT c FROM s1 AS a (c)", "a column alias list"),
         // `INNER` and `LEFT` run now, with `ON` and with `USING` (phase 9 unit 4). The ones that
         // keep rows the *left* side does not have still do not: running a `RIGHT` as a `LEFT`
         // would answer with the same rows in the wrong places.
@@ -452,7 +454,7 @@ fn a_comparison_between_types_with_no_operator_is_42883() {
         Some("No operator of that name accepts the given argument types.")
     );
     assert_eq!(
-        error.hint(),
+        error.hint().as_deref(),
         Some("You might need to add explicit type casts.")
     );
 

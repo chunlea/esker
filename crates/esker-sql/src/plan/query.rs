@@ -37,14 +37,44 @@ pub enum JoinKind {
     Left,
 }
 
+/// One entry in a `FROM` clause: a table, and the name the query refers to it by.
+///
+/// An **alias replaces the name**, which is the whole of what one is and the half a scope keyed by
+/// the table's own name gets wrong: after `FROM pg_type AS t`, `t.oid` resolves and `pg_type.oid`
+/// is `42P01` — measured, with a `HINT` naming the alias
+/// (`tests/corpus/pg19_alias.txt`). So [`TableRef::referred_as`] is the *only* name resolution may
+/// match, and the table's own name is kept for the catalog lookup and for `EXPLAIN`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableRef {
+    /// The relation, as the catalog knows it.
+    pub name: String,
+    /// `AS x`, or `x` — the name a qualifier must use once it is there.
+    pub alias: Option<String>,
+}
+
+impl TableRef {
+    /// A table under its own name.
+    #[must_use]
+    pub fn bare(name: String) -> Self {
+        TableRef { name, alias: None }
+    }
+
+    /// The name a qualifier in this query has to write: the alias if there is one, the table's own
+    /// name otherwise.
+    #[must_use]
+    pub fn referred_as(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.name)
+    }
+}
+
 /// One `JOIN`, as written.
 ///
 /// Exactly one. A second join is refused by name (contract C2) rather than approximated; the two
 /// **kinds** and both constraint spellings are executed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Join {
-    /// The right-hand table.
-    pub table: String,
+    /// The right-hand table, under the name the query refers to it by.
+    pub table: TableRef,
     /// Whether an unmatched left row survives.
     pub kind: JoinKind,
     /// `ON`, or `None` for a `CROSS JOIN` and for `USING`, which becomes one.
@@ -62,7 +92,7 @@ pub struct Join {
 pub struct Select {
     /// The table, or `None` for `SELECT 1` — a single row of no table at all, which drivers use to
     /// check a connection. With a [`Select::join`] it is the left-hand one.
-    pub from: Option<String>,
+    pub from: Option<TableRef>,
     /// The one join this crate runs, if the statement has one.
     pub join: Option<Join>,
     /// What to return.

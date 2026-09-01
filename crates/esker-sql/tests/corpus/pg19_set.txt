@@ -1,0 +1,125 @@
+# What a real PostgreSQL 19beta1 does with the six `SET`s and the two `SHOW`s `ActiveRecord` sends
+# at connect -- unit 5 of `docs/plans/phase-9-rails.md`.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way against one node.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# WHY THIS FILE EXISTS. Eight of the thirty-six statements are these, and every one was `0A000`
+# here. "A real server accepts them and ignores them" is a *claim*, and this is the measurement
+# that turns it into a specification -- which is why three of the eight are not ignored at all:
+#
+#   * **`standard_conforming_strings = off` is `0A000` on a real server too.** `on` is the only
+#     value PostgreSQL 19 takes, and it refuses the other with the same class this node uses for a
+#     feature it does not have. Accepting `off` and doing nothing would have been the one answer
+#     that is wrong in the dangerous direction.
+#   * **a bad value is `22023` with a HINT that lists the good ones**, and the parameter is named
+#     in PostgreSQL's *own* spelling: `"IntervalStyle"`, not the `intervalstyle` the user typed.
+#   * **`max_identifier_length` is read-only** -- `55P02`, not `42704`. A parameter that exists and
+#     cannot be set is a different answer from one that does not exist.
+#
+# THREE MORE, each of which a plausible implementation gets wrong:
+#
+#   * `TO DEFAULT` and `RESET` are the same operation, and both go back to the boot value rather
+#     than to the last value set.
+#   * a value is case-insensitive (`'WARNING'` reads back as `warning`) and the quotes are
+#     optional; `on` and `true` are one value.
+#   * `SHOW` of an unknown parameter is `42704`, not `0A000`: the statement is one the server runs
+#     and what is missing is the parameter.
+#   * **a `SET` is transactional.** `ROLLBACK` puts the old value back, `COMMIT` keeps the new one,
+#     and a `ROLLBACK TO` undoes a `SET` made inside the savepoint exactly as it undoes a write.
+#     A session parameter is block state, not connection state, and an implementation that stored
+#     it beside the socket would keep a value the user's transaction threw away.
+#
+# TWO LINES ARE LEFT OUT rather than pinned, and for one reason: their answer is a fact about the
+# server that answered rather than about SQL.
+#
+#   * `SHOW ALL` -- every parameter of that container. This node refuses it by name, and
+#     `tests/session_parameters.rs` holds that.
+#   * the **boot** `SHOW timezone`. The container answered `Etc/UTC` because its image sets `TZ`;
+#     a stock `initdb` picks the host's zone. This node boots `UTC`, which is the value it puts in
+#     its startup `ParameterStatus`. Both are UTC, and neither is PostgreSQL's answer -- there
+#     isn't one. Every `SHOW timezone` below that *follows a SET* is pinned, because that one is
+#     about SQL.
+# --- what a fresh session reports, before anything sets it
+SHOW search_path	text	"$user", public
+SHOW max_identifier_length	text	63
+SHOW client_min_messages	text	notice
+SHOW standard_conforming_strings	text	on
+SHOW intervalstyle	text	postgres
+
+# --- the six ActiveRecord sends, in the order it sends them, each read back
+SET client_min_messages TO 'warning'		-
+SHOW client_min_messages	text	warning
+SET standard_conforming_strings = on		-
+SHOW standard_conforming_strings	text	on
+SET intervalstyle = iso_8601		-
+SHOW intervalstyle	text	iso_8601
+SET SESSION timezone TO 'UTC'		-
+SHOW timezone	text	UTC
+SET search_path TO public		-
+SHOW search_path	text	public
+SET search_path TO "$user", public		-
+SHOW search_path	text	"$user", public
+
+# --- the spellings of a value, which are one value
+SET client_min_messages = warning		-
+SHOW client_min_messages	text	warning
+SET client_min_messages TO 'WARNING'		-
+SHOW client_min_messages	text	warning
+SET standard_conforming_strings = 'on'		-
+SET standard_conforming_strings = true		-
+SET IntervalStyle = postgres		-
+SHOW IntervalStyle	text	postgres
+SET intervalstyle TO 'iso_8601'		-
+SHOW intervalstyle	text	iso_8601
+SET TIME ZONE 'UTC'		-
+SHOW timezone	text	UTC
+
+# --- DEFAULT and RESET are the same operation
+SET client_min_messages TO DEFAULT		-
+SHOW client_min_messages	text	notice
+SET intervalstyle TO DEFAULT		-
+SHOW intervalstyle	text	postgres
+RESET client_min_messages		-
+SHOW client_min_messages	text	notice
+SET client_min_messages TO 'warning'		-
+RESET intervalstyle		-
+SHOW intervalstyle	text	postgres
+SET intervalstyle = iso_8601		-
+
+# --- and what a real server refuses, which is a condition and not a feature gap
+SET no_such_parameter = 1	!42704 unrecognized configuration parameter "no_such_parameter"
+SHOW no_such_parameter	!42704 unrecognized configuration parameter "no_such_parameter"
+RESET no_such_parameter	!42704 unrecognized configuration parameter "no_such_parameter"
+SET client_min_messages TO 'bogus'	!22023 invalid value for parameter "client_min_messages": "bogus" HINT: Available values: debug5, debug4, debug3, debug2, debug1, log, notice, warning, error.
+SET intervalstyle = bogus	!22023 invalid value for parameter "IntervalStyle": "bogus" HINT: Available values: postgres, postgres_verbose, sql_standard, iso_8601.
+SET standard_conforming_strings = off	!0A000 non-standard string literals are not supported
+SET max_identifier_length = 100	!55P02 parameter "max_identifier_length" cannot be changed
+
+# --- a SET is transactional, which is a thing a session parameter shares with a row
+SET client_min_messages TO 'warning'		-
+BEGIN		-
+SET client_min_messages TO 'error'		-
+SHOW client_min_messages	text	error
+ROLLBACK		-
+SHOW client_min_messages	text	warning
+BEGIN		-
+SET client_min_messages TO 'error'		-
+COMMIT		-
+SHOW client_min_messages	text	error
+BEGIN		-
+SET client_min_messages TO 'warning'		-
+SAVEPOINT s		-
+SET client_min_messages TO 'error'		-
+SHOW client_min_messages	text	error
+ROLLBACK TO s		-
+SHOW client_min_messages	text	warning
+RELEASE s		-
+SHOW client_min_messages	text	warning
+COMMIT		-
+SHOW client_min_messages	text	warning
+SET client_min_messages TO 'warning'		-
+SET intervalstyle = iso_8601		-

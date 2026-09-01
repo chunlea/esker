@@ -45,9 +45,19 @@ const FIXTURE: &[&str] =
 /// improvement, and the number is here to be argued with: it is the honest measure of how far a
 /// real `ActiveRecord` gets, and it should be uncomfortable until it is not.
 ///
-/// Three. It was guessed at ten before it was run, which is the reason for measuring: the guess
-/// was wrong by more than a factor of three in the flattering direction.
-const RUNS: usize = 3;
+/// Eleven, and what moved it says as much as the number. Unit 5 landed **two** features and only
+/// one of them shows here:
+///
+/// * the six `SET`s and two `SHOW`s (`tests/session_parameters.rs`) are +8, all of it. They were
+///   the cheapest ratio on the board and the handover said so.
+/// * a **table alias** (`tests/alias.rs`) is +0, and that is not a disappointment — it is the
+///   thing this counter is for. Nineteen statements open `FROM pg_type AS t`, and every one of
+///   them now fails on its *second* blocker instead of its first: a catalog relation to alias.
+///   A gate is not a feature until what is behind it exists.
+///
+/// It was guessed at ten before the first run, which is the reason for measuring: the guess was
+/// wrong by more than a factor of three in the flattering direction.
+const RUNS: usize = 11;
 
 #[test]
 fn every_statement_activerecord_sends_parses_and_is_answered_by_name() {

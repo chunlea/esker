@@ -7,7 +7,9 @@
 //! needs no grammar of its own and a real server accepts every statement a user writes here.
 //!
 //! A `SET` this node does not know stays `0A000 SET is not supported`, exactly as before. The set
-//! that is executed grows one name at a time; the set that is mishandled stays empty.
+//! that is executed grows one name at a time; the set that is mishandled stays empty — which is
+//! what [`crate::parameter`] is for: it holds, per parameter, the values this node *means* rather
+//! than the values it will swallow.
 
 /// One session statement, lowered.
 ///
@@ -31,6 +33,20 @@ pub enum SessionStatement {
     ShowReadAsOf,
     /// `SET TRANSACTION SNAPSHOT '<id>'`.
     SetSnapshot(String),
+    /// `SET <parameter> = <value>`, for one of the parameters in [`crate::parameter`].
+    ///
+    /// The name is carried as written and looked up when the statement *runs*, not when it is
+    /// lowered: a real server parses `SET client_min_messages TO 'bogus'` and fails it at execute
+    /// time, so a `Parse` that refused it would answer a message earlier than PostgreSQL does.
+    SetParameter {
+        /// What the user wrote. Folded and looked up by the executor.
+        name: String,
+        /// The text assigned, or `None` for `TO DEFAULT` — which is `RESET` by another name and
+        /// the same operation, measured.
+        value: Option<String>,
+    },
+    /// `SHOW <parameter>`, for one of the same.
+    ShowParameter(String),
 }
 
 impl SessionStatement {
@@ -41,8 +57,10 @@ impl SessionStatement {
     #[must_use]
     pub fn tag(&self) -> &'static str {
         match self {
-            SessionStatement::SetReadAsOf { .. } | SessionStatement::SetSnapshot(_) => "SET",
-            SessionStatement::ShowReadAsOf => "SHOW",
+            SessionStatement::SetReadAsOf { .. }
+            | SessionStatement::SetSnapshot(_)
+            | SessionStatement::SetParameter { .. } => "SET",
+            SessionStatement::ShowReadAsOf | SessionStatement::ShowParameter(_) => "SHOW",
         }
     }
 }

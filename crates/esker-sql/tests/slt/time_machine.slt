@@ -51,9 +51,11 @@ statement error (42704)
 SHOW esker.no_such_parameter
 
 # --- SET, another parameter
-# Contract C2's answer, naming the parameter rather than the statement.
+# Contract C2's answer, naming the parameter rather than the statement. `search_path` used to be
+# the example and is executed now (phase 9 unit 5, `tests/session_parameters.rs`); `work_mem` is
+# the shape the rule is about — a parameter a real server has and this node does not.
 statement error (0A000)
-SET search_path = 'public'
+SET work_mem = '4MB'
 
 # --- pg_export_snapshot
 # PostgreSQL's own verb. Free: it writes nothing at all, because the token carries the timestamp.

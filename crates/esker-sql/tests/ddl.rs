@@ -494,11 +494,14 @@ fn the_wrong_object_type_carries_postgresqls_own_hint() {
     node.run("CREATE TABLE t (a int8 PRIMARY KEY, b text UNIQUE)")
         .unwrap();
     assert_eq!(
-        node.run("DROP TABLE t_b_key").unwrap_err().hint(),
+        node.run("DROP TABLE t_b_key")
+            .unwrap_err()
+            .hint()
+            .as_deref(),
         Some("Use DROP INDEX to remove an index.")
     );
     assert_eq!(
-        node.run("DROP INDEX t").unwrap_err().hint(),
+        node.run("DROP INDEX t").unwrap_err().hint().as_deref(),
         Some("Use DROP TABLE to remove a table.")
     );
 }

@@ -349,6 +349,57 @@ fn lower_set(set: &sqlparser::ast::Set) -> Result<plan::Statement> {
                 },
             ))
         }
+        // A parameter this node reports. The name is looked up here only to route the statement;
+        // the **value** is checked when it runs, because that is when a real server checks it.
+        Set::SingleAssignment {
+            scope,
+            hivevar,
+            variable,
+            values,
+        } if guc_name(variable).is_some_and(|name| crate::parameter::lookup(&name).is_ok()) => {
+            refuse_if(*hivevar, "SET HIVEVAR")?;
+            let name = guc_name(variable).unwrap_or_default();
+            // `SET LOCAL` is undone when the transaction ends, whichever way it ends — which needs
+            // a per-block undo this node keeps only for `esker.read_as_of`. Refused by name rather
+            // than silently promoted to a session-wide `SET`, which would outlive the block.
+            refuse_if(
+                matches!(scope, Some(ContextModifier::Local)),
+                format!("SET LOCAL {name}"),
+            )?;
+            let [value] = values.as_slice() else {
+                // PostgreSQL takes a list for `search_path`, and one is what `ActiveRecord` sends:
+                // `SET search_path TO "$user", public`. It arrives as two values and is one path.
+                return Ok(plan::Statement::Session(
+                    plan::SessionStatement::SetParameter {
+                        value: Some(
+                            values
+                                .iter()
+                                .map(guc_list_item)
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        ),
+                        name,
+                    },
+                ));
+            };
+            Ok(plan::Statement::Session(
+                plan::SessionStatement::SetParameter {
+                    value: guc_value(value),
+                    name,
+                },
+            ))
+        }
+        // `SET TIME ZONE 'UTC'` is PostgreSQL's own spelling of `SET timezone TO 'UTC'` — the
+        // same parameter, and the parser gives it a variant of its own rather than a name.
+        Set::SetTimeZone { local, value } => {
+            refuse_if(*local, "SET LOCAL timezone")?;
+            Ok(plan::Statement::Session(
+                plan::SessionStatement::SetParameter {
+                    name: "timezone".to_owned(),
+                    value: guc_value(value),
+                },
+            ))
+        }
         Set::SetTransaction {
             modes,
             snapshot: Some(snapshot),
@@ -388,6 +439,11 @@ fn lower_show(variable: &[Ident]) -> Result<plan::Statement> {
     if name.is_empty() || name.eq_ignore_ascii_case("ALL") {
         return Err(SqlError::unsupported("SHOW ALL"));
     }
+    if crate::parameter::lookup(&name).is_ok() {
+        return Ok(plan::Statement::Session(
+            plan::SessionStatement::ShowParameter(name),
+        ));
+    }
     Err(SqlError::UnrecognizedParameter(name))
 }
 
@@ -404,6 +460,18 @@ fn lower_reset(reset: &sqlparser::ast::ResetStatement) -> Result<plan::Statement
                 plan::SessionStatement::SetReadAsOf {
                     value: None,
                     local: false,
+                },
+            ))
+        }
+        // `RESET x` and `SET x TO DEFAULT` are the same operation on a real server, and both go
+        // back to the **boot** value rather than to the last one set. Measured.
+        Reset::ConfigurationParameter(name)
+            if guc_name(name).is_some_and(|name| crate::parameter::lookup(&name).is_ok()) =>
+        {
+            Ok(plan::Statement::Session(
+                plan::SessionStatement::SetParameter {
+                    name: guc_name(name).unwrap_or_default(),
+                    value: None,
                 },
             ))
         }
@@ -443,6 +511,25 @@ fn guc_value(value: &Expr) -> Option<String> {
             other => Some(other.to_string()),
         },
         other => Some(other.to_string()),
+    }
+}
+
+/// One item of a `SET` that takes a list, as PostgreSQL renders it back.
+///
+/// `SET search_path TO "$user", public` is two items and one path, and `SHOW search_path` answers
+/// with the quotes still on the first — measured, so the quoting is kept rather than folded away.
+fn guc_list_item(value: &Expr) -> String {
+    match value {
+        Expr::Identifier(ident) => match ident.quote_style {
+            Some(quote) => format!("{quote}{}{quote}", ident.value),
+            None => ident.value.clone(),
+        },
+        Expr::Value(value) => match &value.value {
+            Value::DoubleQuotedString(text) => format!("\"{text}\""),
+            Value::SingleQuotedString(text) => text.clone(),
+            other => other.to_string(),
+        },
+        other => other.to_string(),
     }
 }
 
@@ -1455,7 +1542,7 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
     let (from, join) = match select.from.as_slice() {
         [] => (None, None),
         [table] => {
-            let left = table_factor(&table.relation)?;
+            let left = table_reference(&table.relation)?;
             let join = match table.joins.as_slice() {
                 [] => None,
                 [one] => Some(lower_join(one)?),
@@ -1534,7 +1621,7 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
 
 /// One `JOIN`, lowered. Every join this crate does not run is named rather than approximated.
 fn lower_join(join: &sqlparser::ast::Join) -> Result<plan::Join> {
-    let table = table_factor(&join.relation)?;
+    let table = table_reference(&join.relation)?;
     refuse_if(join.global, "a GLOBAL JOIN")?;
     let (kind, constraint) = match &join.join_operator {
         JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => {
@@ -1592,7 +1679,16 @@ fn join_constraint(constraint: &JoinConstraint) -> Result<(Option<plan::Expr>, V
     }
 }
 
-fn table_factor(factor: &TableFactor) -> Result<String> {
+/// One `FROM` entry, with the alias it carries.
+///
+/// The alias is folded as an identifier like every other name here, so `AS "T"` and `AS T` are two
+/// different names — measured: `SELECT T.id FROM alias_l AS "T"` is `42P01` on a real server.
+///
+/// A **column** alias list (`AS t (c, d)`) renames the columns as well, which is a second feature
+/// and not a spelling of this one: after it the table's own column names are gone (`t.id` becomes
+/// `42703`, measured). It is refused by name rather than silently ignored, because ignoring it
+/// would answer a query about `c` with a column called `id`.
+fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
     match factor {
         TableFactor::Table {
             name,
@@ -1603,15 +1699,33 @@ fn table_factor(factor: &TableFactor) -> Result<String> {
             partitions,
             ..
         } => {
-            refuse_if(alias.is_some(), "a table alias")?;
             refuse_if(args.is_some(), "a table function")?;
             refuse_if(!with_hints.is_empty(), "a table hint")?;
             refuse_if(version.is_some(), "a table version")?;
             refuse_if(!partitions.is_empty(), "a partition list")?;
-            object_name(name)
+            let alias = match alias {
+                None => None,
+                Some(alias) => {
+                    refuse_if(!alias.columns.is_empty(), "a column alias list")?;
+                    Some(ident(&alias.name))
+                }
+            };
+            Ok(plan::TableRef {
+                name: object_name(name)?,
+                alias,
+            })
         }
         other => Err(SqlError::unsupported(format!("the FROM item {other}"))),
     }
+}
+
+/// The same entry where an alias is not executed: `UPDATE` and `DELETE`, whose one table is
+/// resolved against itself and has no second name to tell apart. A real server takes one
+/// (measured), so this is a refusal by name and not a claim about the grammar.
+fn table_factor(factor: &TableFactor) -> Result<String> {
+    let table = table_reference(factor)?;
+    refuse_if(table.alias.is_some(), "a table alias")?;
+    Ok(table.name)
 }
 
 fn lower_update(update: &sqlparser::ast::Update) -> Result<plan::Update> {

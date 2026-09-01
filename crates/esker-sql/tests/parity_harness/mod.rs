@@ -209,6 +209,13 @@ impl Node {
         Ok(last)
     }
 
+    /// The notices the last statement produced, **after** `client_min_messages` has filtered
+    /// them — which is the only place a suppressed notice can be observed, because a corpus
+    /// records rows and a notice is not one.
+    pub(crate) fn executor_notices(&mut self) -> Vec<esker_sql::error::SqlError> {
+        self.executor.take_notices()
+    }
+
     /// The rows a query returns, or a panic naming the refusal — for the assertions a corpus
     /// cannot carry.
     pub(crate) fn rows(&mut self, sql: &str) -> Vec<Vec<String>> {

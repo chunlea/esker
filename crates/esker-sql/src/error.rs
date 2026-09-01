@@ -157,6 +157,30 @@ pub enum SqlError {
     #[error("missing FROM-clause entry for table \"{0}\"")]
     MissingFromEntry(String),
 
+    /// `SELECT t.a FROM t AS x` — a qualifier naming a table the query *does* have, under a name
+    /// the alias took away.
+    ///
+    /// A different sentence from [`SqlError::MissingFromEntry`] and the same `42P01`, because the
+    /// two are different mistakes: one is a table nobody put in the query, and this one is a table
+    /// that is there under another name. PostgreSQL says which name, in a `HINT`, and both halves
+    /// were measured (`tests/corpus/pg19_alias.txt`).
+    #[error("invalid reference to FROM-clause entry for table \"{table}\"")]
+    InvalidFromReference {
+        /// The name the user wrote, which is the table's own.
+        table: String,
+        /// The alias that replaced it.
+        alias: String,
+    },
+
+    /// `FROM t JOIN t` or `FROM a AS x JOIN b AS x` — two FROM entries a qualifier cannot tell
+    /// apart.
+    ///
+    /// Refused rather than resolved to the first, which is what a scope keyed by name does without
+    /// noticing: `t.id` would silently mean the outer one and a self-join would return the wrong
+    /// column with nothing to say so.
+    #[error("table name \"{0}\" specified more than once")]
+    DuplicateTableName(String),
+
     /// `ALTER TABLE ... ADD COLUMN` naming a column the table already has. The same `42701` as
     /// above and a different sentence: PostgreSQL names the relation here, because the column it
     /// is talking about is one that already exists rather than one the statement repeated.
@@ -627,6 +651,23 @@ pub enum SqlError {
         value: String,
     },
 
+    /// A `SET` whose value a boolean parameter cannot read. PostgreSQL gives this one a sentence
+    /// rather than a list of values, which is the difference a client sees between a boolean and
+    /// an enum. Measured, `tests/corpus/pg19_set.txt`.
+    #[error("parameter \"{0}\" requires a Boolean value")]
+    NonBooleanParameter(&'static str),
+
+    /// A `SET` of a parameter that exists and is fixed. `55P02`, and the reason it is not `42704`:
+    /// a parameter that cannot be changed is a different answer from one that is not there.
+    #[error("parameter \"{0}\" cannot be changed")]
+    CannotChangeParameter(&'static str),
+
+    /// `SET standard_conforming_strings = off`, which is **PostgreSQL's own refusal** — its
+    /// message and its `0A000`, not a gap of ours. This crate's string lexer is
+    /// standard-conforming and no setting makes it otherwise.
+    #[error("non-standard string literals are not supported")]
+    NonStandardStringLiterals,
+
     /// A `SET` whose value is well formed and outside what the parameter admits.
     ///
     /// PostgreSQL's own sentence for this, measured rather than recalled: `-5 ms is outside the
@@ -707,6 +748,9 @@ pub enum SqlError {
 impl SqlError {
     /// The five-character SQLSTATE a client will branch on.
     #[must_use]
+    // One arm per condition, and that is the point: a table of variants against the five-character
+    // codes clients branch on reads as a table and would read as nothing if it were split in three.
+    #[allow(clippy::too_many_lines)]
     pub fn sqlstate(&self) -> &'static str {
         match self {
             SqlError::FeatureNotSupported(_) | SqlError::SnapshotIsolationRequired => {
@@ -718,7 +762,9 @@ impl SqlError {
             SqlError::StatementTooComplex => sqlstate::STATEMENT_TOO_COMPLEX,
             SqlError::UndefinedTable(_)
             | SqlError::UndefinedTableForDrop(_)
-            | SqlError::MissingFromEntry(_) => sqlstate::UNDEFINED_TABLE,
+            | SqlError::MissingFromEntry(_)
+            | SqlError::InvalidFromReference { .. } => sqlstate::UNDEFINED_TABLE,
+            SqlError::DuplicateTableName(_) => sqlstate::DUPLICATE_ALIAS,
             SqlError::AmbiguousColumn(_) | SqlError::AmbiguousOrderBy(_) => {
                 sqlstate::AMBIGUOUS_COLUMN
             }
@@ -792,7 +838,10 @@ impl SqlError {
             | SqlError::OutsideTransactionBlock(_) => sqlstate::NO_ACTIVE_SQL_TRANSACTION,
             SqlError::InvalidSnapshotIdentifier(_)
             | SqlError::InvalidParameterValue { .. }
+            | SqlError::NonBooleanParameter(_)
             | SqlError::ParameterOutOfRange { .. } => sqlstate::INVALID_PARAMETER_VALUE,
+            SqlError::CannotChangeParameter(_) => sqlstate::CANT_CHANGE_RUNTIME_PARAM,
+            SqlError::NonStandardStringLiterals => sqlstate::FEATURE_NOT_SUPPORTED,
             SqlError::SnapshotDoesNotExist(_) | SqlError::UnrecognizedParameter(_) => {
                 sqlstate::UNDEFINED_OBJECT
             }
@@ -867,9 +916,9 @@ impl SqlError {
     /// do instead, and PostgreSQL answers it in the same message. Only the conditions where a real
     /// server was seen to send one have one here.
     #[must_use]
-    pub fn hint(&self) -> Option<&'static str> {
+    pub fn hint(&self) -> Option<String> {
         match self {
-            SqlError::Syntax { hint, .. } => *hint,
+            SqlError::Syntax { hint, .. } => hint.map(str::to_owned),
             // PostgreSQL owns `CHECKPOINT` for forcing a WAL checkpoint, so this node refuses it
             // by name (contract C2) and does not take the word for something else. A user who
             // wrote it was almost certainly reaching for a named checkpoint, which exists here.
@@ -878,34 +927,50 @@ impl SqlError {
             {
                 Some(
                     "Esker names a timestamp with SELECT esker_checkpoint('<name>'). \
-                     PostgreSQL's CHECKPOINT forces a WAL checkpoint and takes no name.",
+                     PostgreSQL's CHECKPOINT forces a WAL checkpoint and takes no name."
+                        .to_owned(),
                 )
             }
-            SqlError::GeneratedAlways { .. } => Some("Use OVERRIDING SYSTEM VALUE to override."),
+            SqlError::GeneratedAlways { .. } => Some("Use OVERRIDING SYSTEM VALUE to override.".to_owned()),
             SqlError::WrongObjectType {
                 found: "DROP INDEX",
                 ..
-            } => Some("Use DROP INDEX to remove an index."),
+            } => Some("Use DROP INDEX to remove an index.".to_owned()),
             SqlError::WrongObjectType {
                 found: "DROP TABLE",
                 ..
-            } => Some("Use DROP TABLE to remove a table."),
+            } => Some("Use DROP TABLE to remove a table.".to_owned()),
             SqlError::WrongObjectType {
                 found: "DROP SEQUENCE",
                 ..
-            } => Some("Use DROP SEQUENCE to remove a sequence."),
-            SqlError::DependentObjectsStillExist { .. } => Some("You can drop the table instead."),
+            } => Some("Use DROP SEQUENCE to remove a sequence.".to_owned()),
+            SqlError::DependentObjectsStillExist { .. } => Some("You can drop the table instead.".to_owned()),
             SqlError::SchemaLeaseExpired { .. } => Some(
-                "Reads are unaffected. Writes resume when this node can reach the placement driver.",
+                "Reads are unaffected. Writes resume when this node can reach the placement driver."
+                    .to_owned(),
             ),
             SqlError::DatatypeMismatchInColumn { .. } => {
-                Some("You will need to rewrite or cast the expression.")
+                Some("You will need to rewrite or cast the expression.".to_owned())
             }
             // The same hint a real server sends with the same `42883`, word for word, for an
             // operator and for an aggregate alike.
             SqlError::UndefinedOperator { .. } | SqlError::UndefinedAggregate { .. } => {
-                Some("You might need to add explicit type casts.")
+                Some("You might need to add explicit type casts.".to_owned())
             }
+            // PostgreSQL lists the values an enum parameter takes, and the list is the parameter's
+            // rather than the error's — looked up so the two can never say different things.
+            SqlError::InvalidParameterValue { name, .. } => match crate::parameter::lookup(name) {
+                Ok(crate::parameter::Parameter {
+                    values: crate::parameter::Values::Enum(allowed),
+                    ..
+                }) => Some(format!("Available values: {}.", allowed.join(", "))),
+                _ => None,
+            },
+            // PostgreSQL names the alias that took the name away, which is the whole of what a
+            // user needs: the table is there, under a name they did not write.
+            SqlError::InvalidFromReference { alias, .. } => Some(format!(
+                "Perhaps you meant to reference the table alias \"{alias}\"."
+            )),
             _ => None,
         }
     }

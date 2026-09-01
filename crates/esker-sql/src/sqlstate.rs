@@ -54,6 +54,9 @@ pub const CHARACTER_NOT_IN_REPERTOIRE: &str = "22021";
 /// What `bytea`'s hexadecimal input reports a bad digit or an odd count with. Surprising — the
 /// neighbouring failures in the same input function are `22P02` — and captured, not assumed.
 pub const INVALID_PARAMETER_VALUE: &str = "22023";
+/// A `SET` of a parameter that exists and is fixed — a different answer from one that does not
+/// exist, which is [`UNDEFINED_OBJECT`].
+pub const CANT_CHANGE_RUNTIME_PARAM: &str = "55P02";
 
 /// A negative `LIMIT`.
 pub const INVALID_ROW_COUNT_IN_LIMIT_CLAUSE: &str = "2201W";
@@ -134,6 +137,8 @@ pub const UNDEFINED_COLUMN: &str = "42703";
 pub const UNDEFINED_TABLE: &str = "42P01";
 /// A bare column name that more than one table in the query has.
 pub const AMBIGUOUS_COLUMN: &str = "42702";
+/// Two FROM entries under one name — `FROM t JOIN t`, or two aliases spelled the same.
+pub const DUPLICATE_ALIAS: &str = "42712";
 /// `CREATE TABLE` for a name that already exists.
 pub const DUPLICATE_TABLE: &str = "42P07";
 /// Two columns of one table share a name.
@@ -224,6 +229,10 @@ mod tests {
         ),
         ("INVALID_PARAMETER_VALUE", super::INVALID_PARAMETER_VALUE),
         (
+            "CANT_CHANGE_RUNTIME_PARAM",
+            super::CANT_CHANGE_RUNTIME_PARAM,
+        ),
+        (
             "INVALID_ROW_COUNT_IN_LIMIT_CLAUSE",
             super::INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
         ),
@@ -271,6 +280,7 @@ mod tests {
         ("UNDEFINED_COLUMN", super::UNDEFINED_COLUMN),
         ("UNDEFINED_TABLE", super::UNDEFINED_TABLE),
         ("AMBIGUOUS_COLUMN", super::AMBIGUOUS_COLUMN),
+        ("DUPLICATE_ALIAS", super::DUPLICATE_ALIAS),
         ("DUPLICATE_TABLE", super::DUPLICATE_TABLE),
         ("DUPLICATE_COLUMN", super::DUPLICATE_COLUMN),
         ("DUPLICATE_OBJECT", super::DUPLICATE_OBJECT),

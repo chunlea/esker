@@ -208,13 +208,18 @@ fn another_parameter_is_42704_and_not_a_feature_gap() {
 }
 
 /// A `SET` this node does not execute keeps contract C2's answer, and names the **parameter** —
-/// "SET is not supported" tells somebody who set `search_path` nothing about which line to remove.
+/// "SET is not supported" tells somebody who set `work_mem` nothing about which line to remove.
+///
+/// The example used to be `search_path`, which phase 9 unit 5 now executes
+/// (`tests/session_parameters.rs`). `work_mem` is the shape that is left and the one the rule is
+/// really about: a parameter a real server *has* and this node does not, which is `0A000` naming
+/// it rather than the `42704` that would claim it does not exist.
 #[test]
 fn another_set_is_0a000_naming_the_parameter() {
     let mut node = Node::new();
-    let error = node.fails("SET search_path = 'public'");
+    let error = node.fails("SET work_mem = '4MB'");
     assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED);
-    assert_eq!(error.to_string(), "SET search_path is not supported");
+    assert_eq!(error.to_string(), "SET work_mem is not supported");
 }
 
 /// The value grammar's failure is PostgreSQL's own condition for a `SET` it cannot read, with
@@ -768,7 +773,7 @@ fn an_invented_spelling_gets_postgresqls_code_and_a_redirect() {
         let error = parse_statements(sql).unwrap_err();
         assert_eq!(error.sqlstate(), sqlstate::SYNTAX_ERROR, "{sql}");
         assert_eq!(
-            error.hint(),
+            error.hint().as_deref(),
             Some(
                 "Esker reads the past with SET esker.read_as_of = '<timestamp>' or an interval \
                  such as '-1h'. See docs/adr/0021-time-machine.md."

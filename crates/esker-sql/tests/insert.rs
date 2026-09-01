@@ -213,7 +213,7 @@ fn a_value_that_cannot_be_assigned_is_42804_with_postgresqls_hint() {
         "column \"ts\" is of type timestamp with time zone but expression is of type integer"
     );
     assert_eq!(
-        error.hint(),
+        error.hint().as_deref(),
         Some("You will need to rewrite or cast the expression.")
     );
 }

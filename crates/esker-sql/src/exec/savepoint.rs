@@ -40,12 +40,21 @@ use crate::error::{Result, SqlError};
 /// a client's behalf. The same bound, for the same reason, as the sort's and the group table's.
 pub(super) const UNDO_LIMIT: usize = 1_000_000;
 
-/// One mark: a name, and how far the undo log had got when it was taken.
+/// One mark: a name, how far the undo log had got when it was taken, and the session parameters
+/// as they stood.
+///
+/// The parameters are here because a `SET` is transactional on a real server and a `ROLLBACK TO`
+/// undoes one — measured, `tests/corpus/pg19_set.txt`. They are a whole copy rather than a delta:
+/// there are six of them, a savepoint is rare, and a delta would be a second thing to get right.
 #[derive(Debug)]
 struct Mark {
     name: String,
     undo_at: usize,
+    parameters: Parameters,
 }
+
+/// The session's parameters, as [`crate::exec::Executor`] holds them.
+pub(super) type Parameters = std::collections::BTreeMap<&'static str, String>;
 
 /// What a block has to remember to undo part of itself.
 #[derive(Debug, Default)]
@@ -65,11 +74,12 @@ impl Savepoints {
         !self.marks.is_empty()
     }
 
-    /// `SAVEPOINT <name>`.
-    pub(super) fn savepoint(&mut self, name: &str) {
+    /// `SAVEPOINT <name>`, with the session parameters it can be rolled back to.
+    pub(super) fn savepoint(&mut self, name: &str, parameters: Parameters) {
         self.marks.push(Mark {
             name: name.to_owned(),
             undo_at: self.undo.len(),
+            parameters,
         });
     }
 
@@ -95,7 +105,9 @@ impl Savepoints {
     /// Marks above it go, because their writes have just been undone: PostgreSQL does the same,
     /// and a mark pointing into a log that has been truncated past it would be a mark that could
     /// never be reached.
-    pub(super) fn rollback_to(&mut self, name: &str, txn: &mut dyn Txn) -> Result<()> {
+    /// Answers with the session parameters as they stood at the mark, which the caller puts back:
+    /// a `SET` inside the savepoint is undone with the writes, exactly as a real server does it.
+    pub(super) fn rollback_to(&mut self, name: &str, txn: &mut dyn Txn) -> Result<Parameters> {
         let at = self.find(name)?;
         let undo_at = self.marks[at].undo_at;
         // Backwards, so that a key written more than once lands on the value it had at the mark
@@ -112,7 +124,7 @@ impl Savepoints {
             }
         }
         self.marks.truncate(at + 1);
-        Ok(())
+        Ok(self.marks[at].parameters.clone())
     }
 
     /// The block is over: every mark and every pre-image with it.

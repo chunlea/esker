@@ -1,0 +1,94 @@
+# What a real PostgreSQL 19beta1 does with a **table alias** -- unit 5 of
+# `docs/plans/phase-9-rails.md`. Nineteen of the thirty-six statements `ActiveRecord` sends open
+# `FROM pg_type AS t` or `FROM pg_class c`, including the very first one, so this is the gate every
+# catalog query is behind before its catalog matters at all.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way against one node.
+# It builds its own tables.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THE TRAP, and the reason this file exists:
+#
+#   * **an alias REPLACES the name.** After `FROM al AS t`, `t.id` resolves and `al.id` is
+#     `42P01` -- with a *different sentence* from a qualifier nothing in the query has: `invalid
+#     reference to FROM-clause entry` against `missing FROM-clause entry`, plus a `HINT` naming the
+#     alias. An implementation that kept matching the table's own name would answer both, which is
+#     a query a real server refuses, and would tell the 19 `ActiveRecord` statements nothing.
+#
+# THREE MORE:
+#
+#   * **two FROM entries may not share a name.** `FROM al JOIN al` is `42712`, and so is
+#     `FROM al AS x JOIN ar AS x`. A scope keyed by name resolves `al.id` to the first one and
+#     answers a self-join with one side's column twice, silently. The check is over the name each
+#     entry is *referred as*: `FROM al AS t JOIN ar AS al` is legal, because the alias freed `al`.
+#   * an alias **folds like any other identifier**, so `AS "T"` and `AS T` are two different names.
+#   * the alias is the name **every message uses**: `42803` says `column "t.n"`, not `column
+#     "al.n"` -- a message naming a table the user did not write is a message about someone else's
+#     query.
+#
+DROP TABLE IF EXISTS al		-
+DROP TABLE IF EXISTS ar		-
+CREATE TABLE al (id int8 PRIMARY KEY, n text, k int8)		-
+CREATE TABLE ar (id int8 PRIMARY KEY, m text)		-
+INSERT INTO al VALUES (1, 'one', 7), (2, 'two', NULL)		-
+INSERT INTO ar VALUES (1, 'uno'), (3, 'tres')		-
+
+# --- an alias REPLACES the name, which is the whole of what one is
+SELECT t.id, t.n FROM al AS t ORDER BY t.id	bigint,text	1|one ; 2|two
+SELECT t.id FROM al t ORDER BY t.id	bigint	1 ; 2
+SELECT al.id FROM al AS t ORDER BY 1	!42P01 invalid reference to FROM-clause entry for table "al" HINT: Perhaps you meant to reference the table alias "t".
+SELECT al.* FROM al AS t	!42P01 invalid reference to FROM-clause entry for table "al" HINT: Perhaps you meant to reference the table alias "t".
+SELECT id FROM al AS t ORDER BY id	bigint	1 ; 2
+SELECT t.* FROM al AS t ORDER BY t.id	bigint,text,bigint	1|one|7 ; 2|two|\N
+SELECT * FROM al AS t ORDER BY t.id	bigint,text,bigint	1|one|7 ; 2|two|\N
+SELECT t.id FROM al AS t WHERE t.k = 7	bigint	1
+SELECT t.nope FROM al AS t	!42703 column t.nope does not exist
+SELECT u.id FROM al AS t	!42P01 missing FROM-clause entry for table "u"
+
+# --- an alias folds like any other identifier
+SELECT "T".id FROM al AS "T" ORDER BY 1	bigint	1 ; 2
+SELECT T.id FROM al AS "T" ORDER BY 1	!42P01 missing FROM-clause entry for table "t"
+SELECT t.id FROM al AS "T" ORDER BY 1	!42P01 missing FROM-clause entry for table "t"
+
+# --- an alias may be spelled like another real table, and binds to what it renames
+SELECT ar.id, ar.n FROM al AS ar ORDER BY 1	bigint,text	1|one ; 2|two
+
+# --- two aliases, one join
+SELECT a.id, b.id FROM al a JOIN ar b ON a.id = b.id ORDER BY a.id	bigint,bigint	1|1
+SELECT a.id, b.id FROM al a LEFT JOIN ar b ON a.id = b.id ORDER BY a.id	bigint,bigint	1|1 ; 2|\N
+SELECT a.id, b.m FROM al AS a LEFT JOIN ar AS b ON a.id = b.id ORDER BY a.id	bigint,text	1|uno ; 2|\N
+SELECT id FROM al AS a JOIN ar AS b ON a.id = b.id	!42702 column reference "id" is ambiguous
+SELECT * FROM al AS a JOIN ar AS b USING (id) ORDER BY id	bigint,text,bigint,text	1|one|7|uno
+SELECT a.id FROM al AS a JOIN ar AS b USING (id) ORDER BY a.id	bigint	1
+SELECT al.id FROM al AS a JOIN ar ON a.id = ar.id	!42P01 invalid reference to FROM-clause entry for table "al" HINT: Perhaps you meant to reference the table alias "a".
+SELECT a.id, b.id FROM al AS a JOIN al AS b ON a.id = b.id ORDER BY a.id	bigint,bigint	1|1 ; 2|2
+
+# --- one name for two FROM entries
+SELECT al.id FROM al JOIN al ON true	!42712 table name "al" specified more than once
+SELECT a.id FROM al JOIN al AS al ON true	!42712 table name "al" specified more than once
+SELECT x.id FROM al AS x JOIN ar AS x ON x.id = x.id	!42712 table name "x" specified more than once
+SELECT t.id FROM al AS t JOIN ar AS al ON t.id = al.id ORDER BY t.id	bigint	1
+SELECT al.id FROM al AS t JOIN ar AS al ON t.id = al.id ORDER BY 1	bigint	1
+
+# --- the alias is the name every message uses
+SELECT t.n, count(*) FROM al AS t GROUP BY t.k ORDER BY 1	!42803 column "t.n" must appear in the GROUP BY clause or be used in an aggregate function
+SELECT t.id, count(*) FROM al AS t GROUP BY t.id ORDER BY t.id	bigint,bigint	1|1 ; 2|1
+SELECT t.id FROM al AS t ORDER BY t.k DESC	bigint	2 ; 1
+
+
+# --- the alias is the name every message uses
+SELECT t.n, count(*) FROM al AS t GROUP BY t.k ORDER BY 1	!42803 column "t.n" must appear in the GROUP BY clause or be used in an aggregate function
+SELECT t.id, count(*) FROM al AS t GROUP BY t.id ORDER BY t.id	bigint,bigint	1|1 ; 2|1
+SELECT t.id FROM al AS t ORDER BY t.k DESC	bigint	2 ; 1
+
+# --- a column alias list, which is a second feature and not a spelling of this one
+SELECT c FROM al AS t (c) ORDER BY c	bigint	1 ; 2
+SELECT c, d FROM al AS t (c, d) ORDER BY c	bigint,text	1|one ; 2|two
+SELECT t.id FROM al AS t (c)	!42703 column t.id does not exist
+
+# --- UPDATE and DELETE take one too
+UPDATE al AS t SET n = 'ONE' WHERE t.id = 1		-
+DELETE FROM al AS t WHERE t.id = 2		-

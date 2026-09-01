@@ -71,7 +71,20 @@ pub struct Executor {
     /// translation entirely for a client that used `BEGIN`.
     written: Written,
     /// Notices produced by the statement that just ran, waiting for the session to send them.
+    ///
+    /// What actually leaves is filtered by `client_min_messages`
+    /// ([`Executor::take_notices`]), which is the whole reason `ActiveRecord` sets it.
     notices: Vec<SqlError>,
+    /// Session parameters this session has set, by [`crate::parameter::Parameter::name`]. A
+    /// parameter absent here reads back its boot value, which is what makes `RESET` a removal
+    /// rather than a second assignment.
+    parameters: savepoint::Parameters,
+    /// The parameters as they stood when the open block began, or `None` outside one.
+    ///
+    /// A `SET` is transactional on a real server: `ROLLBACK` puts the old value back and `COMMIT`
+    /// keeps the new one (measured, `tests/corpus/pg19_set.txt`). A whole copy, for the reason the
+    /// savepoint marks hold one — there are six parameters and a block is not a hot path.
+    block_parameters: Option<savepoint::Parameters>,
     /// Row ids reserved for this session but not yet handed out: `table_id -> (next, end)`.
     /// See [`Executor::next_row_id`].
     row_ids: std::collections::BTreeMap<u64, (u64, u64)>,
@@ -139,6 +152,8 @@ impl Executor {
             open: None,
             written: Written::default(),
             notices: Vec::new(),
+            parameters: savepoint::Parameters::new(),
+            block_parameters: None,
             row_ids: std::collections::BTreeMap::new(),
             sequences: std::collections::BTreeMap::new(),
             last_sequence: None,
@@ -355,7 +370,82 @@ impl Executor {
                 self.set_snapshot(id)?;
                 Ok(Outcome::done("SET"))
             }
+            SessionStatement::SetParameter { name, value } => {
+                self.set_parameter(name, value.as_deref())?;
+                Ok(Outcome::done("SET"))
+            }
+            SessionStatement::ShowParameter(name) => {
+                let parameter = crate::parameter::lookup(name)?;
+                Ok(Outcome::Rows {
+                    // Named by PostgreSQL's **own** spelling and not the user's: `SHOW
+                    // intervalstyle` answers a column called `IntervalStyle`. Measured.
+                    fields: vec![FieldDescription::computed(
+                        parameter.reported,
+                        ColumnType::Text,
+                    )],
+                    rows: vec![vec![Some(self.parameter(parameter).into_bytes())]],
+                    tag: "SHOW".to_owned(),
+                })
+            }
         }
+    }
+
+    /// `SET <parameter> = <value>`, or `RESET` / `TO DEFAULT`, which are one operation.
+    ///
+    /// Three checks in PostgreSQL's own order, and the third is this crate's: the parameter must
+    /// exist (`42704`), the value must be one it takes (`22023`), and this node must **mean** it
+    /// (`crate::parameter::Parameter::honour`). The third is what keeps a `SET` from being
+    /// accepted and ignored, which is the failure mode a client cannot see.
+    fn set_parameter(&mut self, name: &str, value: Option<&str>) -> Result<()> {
+        let parameter = crate::parameter::lookup(name)?;
+        let Some(value) = value else {
+            if parameter.read_only {
+                return Err(SqlError::CannotChangeParameter(parameter.reported));
+            }
+            self.parameters.remove(parameter.name);
+            return Ok(());
+        };
+        let value = parameter.normalise(value)?;
+        parameter.honour(&value)?;
+        self.parameters.insert(parameter.name, value);
+        Ok(())
+    }
+
+    /// What this session reports for a parameter: what it set, or the boot value.
+    fn parameter(&self, parameter: &crate::parameter::Parameter) -> String {
+        self.parameters
+            .get(parameter.name)
+            .cloned()
+            .unwrap_or_else(|| parameter.boot.to_owned())
+    }
+
+    /// Whether `client_min_messages` lets a message of this severity out.
+    ///
+    /// PostgreSQL's ordering, and the two levels this node actually raises are `NOTICE` and
+    /// `WARNING`. `ActiveRecord` sets `warning` at connect precisely to silence the first — a
+    /// `DROP TABLE IF EXISTS` for a table that is not there says so, every time, and a framework
+    /// running a migration does not want to hear it.
+    fn reports(&self, severity: crate::error::Severity) -> bool {
+        use crate::error::Severity;
+
+        // Ordered as PostgreSQL orders them; a message is sent when its level is at least the
+        // threshold. Everything below `notice` is a level this node never raises.
+        const ORDER: &[&str] = &[
+            "debug5", "debug4", "debug3", "debug2", "debug1", "log", "notice", "warning", "error",
+        ];
+        let level = match severity {
+            Severity::Notice => "notice",
+            Severity::Warning => "warning",
+            // An error is not a notice: it goes out through `ErrorResponse`, which no threshold
+            // suppresses, and `client_min_messages` has never governed it.
+            Severity::Error | Severity::Fatal => return true,
+        };
+        let threshold = self
+            .parameters
+            .get("client_min_messages")
+            .map_or("notice", String::as_str);
+        let rank = |name: &str| ORDER.iter().position(|level| *level == name).unwrap_or(0);
+        rank(level) >= rank(threshold)
     }
 
     /// `SET esker.read_as_of = '...'`, resolved once and checked against the window.
@@ -529,6 +619,7 @@ impl Executor {
     /// transaction.
     fn end_of_block(&mut self) {
         self.open_used = false;
+        self.block_parameters = None;
         self.block_read_only = false;
         if self.read_as_of.as_ref().is_some_and(|as_of| as_of.local) {
             self.read_as_of = None;
@@ -704,11 +795,11 @@ impl Executor {
     /// Resolves the tables a `SELECT` names and plans against them.
     fn plan_select(&self, txn: &dyn Txn, select: &crate::plan::Select) -> Result<query::Planned> {
         let table = match &select.from {
-            Some(name) => Some(self.require_table(txn, name)?),
+            Some(table) => Some(self.require_table(txn, &table.name)?),
             None => None,
         };
         let inner = match &select.join {
-            Some(join) => Some(self.require_table(txn, &join.table)?),
+            Some(join) => Some(self.require_table(txn, &join.table.name)?),
             None => None,
         };
         query::plan(select, self.tenant, table.as_deref(), inner.as_deref())
@@ -1134,13 +1225,20 @@ impl Execute for Executor {
     }
 
     fn take_notices(&mut self) -> Vec<SqlError> {
+        // Filtered here rather than where each notice is raised, because this is the one place
+        // every notice this node produces passes through — and a suppressed one must still not be
+        // left in the queue for the next statement to emit.
         std::mem::take(&mut self.notices)
+            .into_iter()
+            .filter(|notice| self.reports(notice.severity()))
+            .collect()
     }
 
     fn begin(&mut self, read_only: bool) -> Result<()> {
         // A second `BEGIN` never reaches here: the session answers it with PostgreSQL's warning
         // and leaves the block alone.
         self.savepoints.clear();
+        self.block_parameters = Some(self.parameters.clone());
         self.block_read_only = read_only;
         self.open = Some(self.open_txn()?);
         self.open_used = false;
@@ -1150,7 +1248,7 @@ impl Execute for Executor {
     }
 
     fn savepoint(&mut self, name: &str) -> Result<()> {
-        self.savepoints.savepoint(name);
+        self.savepoints.savepoint(name, self.parameters.clone());
         Ok(())
     }
 
@@ -1164,7 +1262,11 @@ impl Execute for Executor {
             .ok_or_else(|| SqlError::Internal("a ROLLBACK TO with no open block".to_owned()))?;
         let result = self.savepoints.rollback_to(name, &mut *txn);
         self.open = Some(txn);
-        result
+        // The parameters go back with the writes: a `SET` inside the savepoint is undone too.
+        // Only on success — a `3B001` rolled nothing back and must change nothing.
+        let parameters = result?;
+        self.parameters = parameters;
+        Ok(())
     }
 
     fn release(&mut self, name: &str) -> Result<()> {
@@ -1194,6 +1296,11 @@ impl Execute for Executor {
     }
 
     fn rollback(&mut self) -> Result<()> {
+        // Before `end_of_block`, which drops the snapshot: a `SET` made inside the block goes back
+        // with everything else the block did.
+        if let Some(parameters) = self.block_parameters.take() {
+            self.parameters = parameters;
+        }
         self.savepoints.clear();
         self.written = Written::default();
         self.catalog_written = false;

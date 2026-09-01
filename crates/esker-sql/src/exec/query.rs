@@ -41,6 +41,13 @@ pub(super) struct Scope<'a> {
     /// In the order their columns appear in a row — which for a join is the order the executor
     /// reads them, outer first, and **not** necessarily the order the user wrote them in.
     tables: Vec<&'a TableDef>,
+    /// The name a qualifier must write for each of `tables`: its **alias** where it has one, and
+    /// the table's own name otherwise.
+    ///
+    /// Parallel to `tables` rather than read off them, because an alias *replaces* the name: after
+    /// `FROM pg_type AS t`, `t.oid` resolves and `pg_type.oid` is `42P01` naming the alias in a
+    /// `HINT`. Matching `TableDef::name` would answer both, which is a query a real server refuses.
+    names: Vec<String>,
     /// Indexes into `tables`, in the order the user wrote them. `SELECT *` expands in this order,
     /// because the columns a user gets back must not depend on which side the planner chose to
     /// drive the loop from.
@@ -63,15 +70,22 @@ impl<'a> Scope<'a> {
     fn empty() -> Self {
         Scope {
             tables: Vec::new(),
+            names: Vec::new(),
             written: Vec::new(),
             using: Vec::new(),
         }
     }
 
-    /// One table, which is every statement that is not a join.
+    /// One table under its own name, which is every statement that does not write an alias.
     pub(super) fn single(table: &'a TableDef) -> Self {
+        Scope::single_as(table, table.name.clone())
+    }
+
+    /// One table under the name the query refers to it by.
+    fn single_as(table: &'a TableDef, name: String) -> Self {
         Scope {
             tables: vec![table],
+            names: vec![name],
             written: vec![0],
             using: Vec::new(),
         }
@@ -79,9 +93,15 @@ impl<'a> Scope<'a> {
 
     /// Two tables: the first is the one the loop is driven from, and `swapped` says whether that
     /// is the one the user wrote second.
-    fn joined(outer: &'a TableDef, inner: &'a TableDef, swapped: bool, using: &[String]) -> Self {
+    fn joined(
+        outer: (&'a TableDef, &str),
+        inner: (&'a TableDef, &str),
+        swapped: bool,
+        using: &[String],
+    ) -> Self {
         Scope {
-            tables: vec![outer, inner],
+            tables: vec![outer.0, inner.0],
+            names: vec![outer.1.to_owned(), inner.1.to_owned()],
             written: if swapped { vec![1, 0] } else { vec![0, 1] },
             using: using.to_vec(),
         }
@@ -94,13 +114,35 @@ impl<'a> Scope<'a> {
     /// so beats a panic.
     pub(super) fn qualified_name(&self, at: usize) -> String {
         let mut start = 0;
-        for table in &self.tables {
+        for (index, table) in self.tables.iter().enumerate() {
             if at < start + table.columns.len() {
-                return format!("{}.{}", table.name, table.columns[at - start].name);
+                // The name the *query* used, which is the alias where there is one: a message
+                // naming a table the user did not write is a message about somebody else's query.
+                return format!("{}.{}", self.names[index], table.columns[at - start].name);
             }
             start += table.columns.len();
         }
         format!("<column {at}>")
+    }
+
+    /// The FROM entry a qualifier names.
+    ///
+    /// Two failures and they are different mistakes, which is why PostgreSQL gives them different
+    /// sentences (measured, `tests/corpus/pg19_alias.txt`): a name nothing in the query has is
+    /// `missing FROM-clause entry`, and the **table's own name where an alias replaced it** is
+    /// `invalid reference to FROM-clause entry`, with a `HINT` naming the alias. Answering the
+    /// first for both would tell a user their table is absent when it is right there.
+    fn entry(&self, qualifier: &str) -> Result<usize> {
+        if let Some(index) = self.names.iter().position(|name| name == qualifier) {
+            return Ok(index);
+        }
+        if let Some(index) = self.tables.iter().position(|table| table.name == qualifier) {
+            return Err(SqlError::InvalidFromReference {
+                table: qualifier.to_owned(),
+                alias: self.names[index].clone(),
+            });
+        }
+        Err(SqlError::MissingFromEntry(qualifier.to_owned()))
     }
 
     /// Where `table`'s columns start in a row.
@@ -120,11 +162,7 @@ impl<'a> Scope<'a> {
         qualifier: Option<&str>,
     ) -> Result<std::vec::IntoIter<(usize, &'a ColumnDef)>> {
         if let Some(qualifier) = qualifier {
-            let index = self
-                .tables
-                .iter()
-                .position(|table| table.name == qualifier)
-                .ok_or_else(|| SqlError::MissingFromEntry(qualifier.to_owned()))?;
+            let index = self.entry(qualifier)?;
             let offset = self.offset(index);
             let columns: Vec<_> = self.tables[index]
                 .user_columns()
@@ -166,11 +204,7 @@ impl<'a> Scope<'a> {
     /// column without saying so.
     fn resolve_column(&self, qualifier: Option<&str>, name: &str) -> Result<(usize, ColumnType)> {
         if let Some(qualifier) = qualifier {
-            let index = self
-                .tables
-                .iter()
-                .position(|table| table.name == qualifier)
-                .ok_or_else(|| SqlError::MissingFromEntry(qualifier.to_owned()))?;
+            let index = self.entry(qualifier)?;
             let at = self.tables[index].column(name).ok_or_else(|| {
                 if let Some(system) = SYSTEM_COLUMNS.iter().find(|system| **system == name) {
                     return SqlError::unsupported(format!("the system column {system}"));
@@ -260,8 +294,12 @@ pub(super) fn plan(
     // which order to type.
     // `USING (a, b)` is the equality `l.a = r.a AND l.b = r.b` **plus** a merge, so the condition
     // is built here and the merge is carried by the scope.
+    let names = from_names(select)?;
+    let named_table = table.map(|table| (table, names.0));
+    let named_inner = inner.map(|inner| (inner, names.1));
+
     let using: &[String] = select.join.as_ref().map_or(&[], |join| &join.using);
-    let condition = match (&select.join, table, inner) {
+    let condition = match (&select.join, named_table, named_inner) {
         (Some(join), Some(left), Some(right)) if !join.using.is_empty() => {
             Some(using_condition(&join.using, left, right)?)
         }
@@ -273,7 +311,13 @@ pub(super) fn plan(
         .as_ref()
         .is_some_and(|join| join.kind == crate::plan::JoinKind::Left);
 
-    let (scope, swapped) = drive_from(table, inner, condition.as_ref(), left_join, using);
+    let (scope, swapped) = drive_from(
+        named_table,
+        named_inner,
+        condition.as_ref(),
+        left_join,
+        using,
+    );
     let (outer_table, inner_table) = match (table, inner, swapped) {
         (Some(left), Some(right), false) => (Some(left), Some(right)),
         (Some(left), Some(right), true) => (Some(right), Some(left)),
@@ -296,7 +340,7 @@ pub(super) fn plan(
     };
 
     if let Some(join) = &select.join {
-        let inner = inner_table.ok_or_else(|| SqlError::UndefinedTable(join.table.clone()))?;
+        let inner = inner_table.ok_or_else(|| SqlError::UndefinedTable(join.table.name.clone()))?;
         node = join_node(node, condition.as_ref(), left_join, &scope, inner)?;
     }
 
@@ -481,7 +525,7 @@ pub(super) type TargetList = (Vec<(String, ColumnType)>, Vec<Expr>);
 pub(super) fn returning_columns(items: &[SelectItem], table: &TableDef) -> Result<TargetList> {
     let scope = Scope::single(table);
     let select = Select {
-        from: Some(table.name.clone()),
+        from: Some(crate::plan::TableRef::bare(table.name.clone())),
         join: None,
         projection: items.to_vec(),
         filter: None,
@@ -506,6 +550,29 @@ pub(super) fn returning_columns(items: &[SelectItem], table: &TableDef) -> Resul
     Ok((columns, exprs))
 }
 
+/// The names the query refers to its `FROM` entries by, outer as written first.
+///
+/// Not what the catalog calls them: an alias replaces the name, and this is what resolution
+/// matches. **Two entries under one name is `42712`** rather than a scope where the first quietly
+/// wins — `FROM t JOIN t ON true` would otherwise resolve every `t.c` to the outer side and answer
+/// a self-join with one table's columns twice, with nothing to say so. The check is over these
+/// names and not over the tables, which is why `FROM al AS t JOIN ar AS al` is legal: the alias
+/// freed the name (measured, `tests/corpus/pg19_alias.txt`).
+fn from_names(select: &Select) -> Result<(&str, &str)> {
+    let left = select
+        .from
+        .as_ref()
+        .map_or("", crate::plan::TableRef::referred_as);
+    let right = select
+        .join
+        .as_ref()
+        .map_or("", |join| join.table.referred_as());
+    if !right.is_empty() && left == right {
+        return Err(SqlError::DuplicateTableName(left.to_owned()));
+    }
+    Ok((left, right))
+}
+
 /// Which side of a join drives the loop, and the scope that follows from it.
 ///
 /// **A left join may not swap.** An inner join is commutative, so this is free to choose — and it
@@ -516,8 +583,8 @@ pub(super) fn returning_columns(items: &[SelectItem], table: &TableDef) -> Resul
 /// it means, so driving the right side and NULL-extending would answer a `RIGHT JOIN` — the same
 /// rows, in the wrong places, with nothing to say so.
 fn drive_from<'a>(
-    table: Option<&'a TableDef>,
-    inner: Option<&'a TableDef>,
+    table: Option<(&'a TableDef, &str)>,
+    inner: Option<(&'a TableDef, &str)>,
     on: Option<&Expr>,
     left_join: bool,
     using: &[String],
@@ -525,7 +592,7 @@ fn drive_from<'a>(
     let (Some(left), Some(right)) = (table, inner) else {
         return match table {
             None => (Scope::empty(), false),
-            Some(table) => (Scope::single(table), false),
+            Some((table, name)) => (Scope::single_as(table, name.to_owned()), false),
         };
     };
     if left_join {
@@ -533,12 +600,13 @@ fn drive_from<'a>(
     }
     // As written first: a probe on the right-hand table keeps the order the user chose, which
     // keeps `EXPLAIN` easiest to read when both would work.
-    if on
-        .is_some_and(|on| probe_for(on, &Scope::joined(left, right, false, using), right).is_some())
-    {
+    if on.is_some_and(|on| {
+        probe_for(on, &Scope::joined(left, right, false, using), right.0).is_some()
+    }) {
         return (Scope::joined(left, right, false, using), false);
     }
-    if on.is_some_and(|on| probe_for(on, &Scope::joined(right, left, true, using), left).is_some())
+    if on
+        .is_some_and(|on| probe_for(on, &Scope::joined(right, left, true, using), left.0).is_some())
     {
         return (Scope::joined(right, left, true, using), true);
     }
@@ -615,10 +683,14 @@ fn join_node(
 ///
 /// A column one side lacks is `42703` naming **which** side, which is what a real server says and
 /// is the difference between a typo and a join between the wrong two tables.
-fn using_condition(columns: &[String], left: &TableDef, right: &TableDef) -> Result<Expr> {
+fn using_condition(
+    columns: &[String],
+    left: (&TableDef, &str),
+    right: (&TableDef, &str),
+) -> Result<Expr> {
     let mut condition: Option<Expr> = None;
     for column in columns {
-        for (table, side) in [(left, "left"), (right, "right")] {
+        for ((table, _), side) in [(left, "left"), (right, "right")] {
             if table.column(column).is_none() {
                 return Err(SqlError::UsingColumnMissing {
                     column: column.clone(),
@@ -626,14 +698,17 @@ fn using_condition(columns: &[String], left: &TableDef, right: &TableDef) -> Res
                 });
             }
         }
+        // Qualified by the name the query refers to each side by, not by the table's own: the
+        // condition this builds is resolved against the same scope everything else is, where an
+        // alias has taken the table's name away.
         let equality = Expr::Binary {
             op: BinaryOp::Eq,
             left: Box::new(Expr::Column {
-                table: Some(left.name.clone()),
+                table: Some(left.1.to_owned()),
                 name: column.clone(),
             }),
             right: Box::new(Expr::Column {
-                table: Some(right.name.clone()),
+                table: Some(right.1.to_owned()),
                 name: column.clone(),
             }),
         };

@@ -53,6 +53,9 @@ const TYPE_DIVERGENCES: &[&str] = &[
     "SELECT g, count(n), sum(n), min(n), max(n) FROM agg GROUP BY g ORDER BY g",
     "SELECT g, sum(n) FROM agg GROUP BY g ORDER BY g",
     "SELECT sum(n) FROM agg HAVING sum(n) IS NOT NULL",
+    // A self-join under two aliases, which ran for the first time when unit 5 built them. Its
+    // rows agree; what differs is what `sum(int8)` is called, the same as every line above.
+    "SELECT sum(a.n) FROM agg a JOIN agg b ON a.id = b.id",
     "SELECT sum(n) FROM agg GROUP BY g ORDER BY sum(n) NULLS LAST",
     "SELECT sum(n) FROM big GROUP BY id ORDER BY id",
 ];
@@ -122,14 +125,6 @@ const DIVERGENCES: &[(&str, &str)] = &[
     (
         "SELECT count(*) FROM agg, wide",
         "a comma-separated FROM list",
-    ),
-    (
-        "SELECT count(*) FROM agg a JOIN agg b ON a.id = b.id",
-        "a table alias",
-    ),
-    (
-        "SELECT sum(a.n) FROM agg a JOIN agg b ON a.id = b.id",
-        "a table alias",
     ),
     ("SELECT count(*) FROM (SELECT 1) s", "a derived table"),
     (

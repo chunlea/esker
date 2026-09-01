@@ -47,6 +47,7 @@ pub mod backend;
 pub mod catalog;
 pub mod error;
 pub mod exec;
+pub mod parameter;
 pub mod parse;
 pub mod pd;
 pub mod pgwire;

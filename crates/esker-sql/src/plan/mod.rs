@@ -33,7 +33,7 @@ pub use ddl::{
 pub use dml::{Delete, Insert, Returning, Update};
 pub use expr::{AggregateCall, AggregateFunc, BinaryOp, Expr, Literal, SequenceCall, SequenceFunc};
 pub use query::{
-    AggregateSpec, Join, JoinKind, Node, OrderItem, Probe, Select, SelectItem, SortKey,
+    AggregateSpec, Join, JoinKind, Node, OrderItem, Probe, Select, SelectItem, SortKey, TableRef,
 };
 pub use session::SessionStatement;
 pub use time_machine::TimeMachineVerb;

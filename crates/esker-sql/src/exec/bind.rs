@@ -302,9 +302,9 @@ pub(super) fn table_names(statement: &Statement) -> Vec<&str> {
         // A join's two tables, outer first, which is the order their columns appear in a row.
         Statement::Select(select) => select
             .from
-            .as_deref()
-            .into_iter()
-            .chain(select.join.iter().map(|join| join.table.as_str()))
+            .iter()
+            .map(|table| table.name.as_str())
+            .chain(select.join.iter().map(|join| join.table.name.as_str()))
             .collect(),
         Statement::Update(update) => vec![update.table.as_str()],
         Statement::Delete(delete) => vec![delete.table.as_str()],

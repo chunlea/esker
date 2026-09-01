@@ -7,8 +7,11 @@
 statement ok
 CREATE TABLE t (id int8 PRIMARY KEY, a int8, b text)
 
+# A table alias runs now (phase 9 unit 5, tests/alias.rs). What it brought within reach and is
+# still not a feature names itself: a **column** alias list renames the table's columns, and
+# ignoring it would answer a query about `c` with a column called `id`.
 statement error (0A000)
-SELECT * FROM t JOIN t u ON true
+SELECT c FROM t AS x (c)
 
 statement error (0A000)
 SELECT * FROM t UNION SELECT * FROM t
@@ -38,9 +41,6 @@ SELECT avg(a) FROM t
 
 statement error (0A000)
 SELECT a + 1 FROM t
-
-statement error (0A000)
-SELECT x.a FROM t x
 
 
 statement error (0A000)
