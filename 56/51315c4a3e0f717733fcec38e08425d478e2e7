@@ -1,0 +1,45 @@
+crates/esker-keys/src/columnar.rs
+  s_81a3dd1e652b18::t_5be84d97a9f63d 1-269
+crates/esker-keys/src/lib.rs
+  s_81a3dd1e652b18::t_e1b43c913bb288 22
+crates/esker-pd/src/operator.rs
+  s_81a3dd1e652b18::t_28f85bcb9ff487 155-167
+crates/esker-pd/src/pd/repair.rs
+  s_81a3dd1e652b18::t_685ad021af1452 34-36
+crates/esker-pd/src/record.rs
+  s_81a3dd1e652b18::t_f229ad920ea091 348-354,385,397,762-765,770
+crates/esker-pd/src/schedule.rs
+  s_81a3dd1e652b18::t_379ead4a49d7f4 128-135
+crates/esker-pd/tests/balance.rs
+  s_81a3dd1e652b18::t_6f03fb8757a204 207-218
+crates/esker-proto/src/pd.rs
+  s_81a3dd1e652b18::t_b53ed0292d20e2 118-145,165,174,185,196,216-227,260-265
+crates/esker-proto/src/region.rs
+  s_81a3dd1e652b18::t_ccff2741bf9ff6 76-80,82-109,114,128,156-171
+crates/esker-proto/tests/golden/messages.hex
+  s_81a3dd1e652b18::t_feb5b116757f05 58-61
+crates/esker-proto/tests/messages.rs
+  s_81a3dd1e652b18::t_3b03eb3d90c368 540-543,582-618,756
+crates/esker-sql/src/catalog/mod.rs
+  s_81a3dd1e652b18::t_a046be08c34da8 850-854
+crates/esker-sql/src/catalog/record.rs
+  s_81a3dd1e652b18::t_3c5ebe212f22c5 214,216-226,228-229,231-239
+docs/adr/0030-the-row-codec-moves-down.md
+  s_81a3dd1e652b18::t_2b07cd5add3106 73-92
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "5651315c4a3e0f717733fcec38e08425d478e2e7",
+  "prompts": {},
+  "sessions": {
+    "s_81a3dd1e652b18": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a496fe55-1dd5-47a0-acee-877c11a897d0",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
