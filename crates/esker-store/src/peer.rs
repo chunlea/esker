@@ -764,7 +764,7 @@ impl PeerCore {
         outcome: &mut Option<(Region, bool)>,
         change: &esker_raft::ConfChange,
     ) -> std::result::Result<Applied, ProtoError> {
-        let store_id = crate::apply::decode_conf_change_context(&change.context)?;
+        let (store_id, _role) = crate::apply::decode_conf_change_context(&change.context)?;
         let moved = crate::apply::apply_conf_change(&self.region, change, store_id)?;
         if moved.peers == self.region.peers {
             tracing::debug!(
@@ -1031,7 +1031,8 @@ impl PeerCore {
             if change.kind == esker_raft::ConfChangeKind::Remove {
                 continue;
             }
-            if let Ok(store_id) = crate::apply::decode_conf_change_context(&change.context) {
+            if let Ok((store_id, _role)) = crate::apply::decode_conf_change_context(&change.context)
+            {
                 self.transport.learn(change.node, store_id);
             }
         }
@@ -1340,13 +1341,14 @@ impl RaftPeer {
         kind: esker_raft::ConfChangeKind,
         node: NodeId,
         store_id: u64,
+        role: esker_proto::PeerRole,
     ) -> std::result::Result<Applied, ProtoError> {
         let (notify, answer) = oneshot::channel();
         self.send(PeerMsg::ProposeConfChange {
             change: esker_raft::ConfChange {
                 kind,
                 node,
-                context: crate::apply::conf_change_context(store_id),
+                context: crate::apply::conf_change_context(store_id, role),
             },
             notify,
         })
@@ -1716,9 +1718,14 @@ mod tests {
         );
         elect_alone(&peer).await;
 
-        peer.propose_conf_change(esker_raft::ConfChangeKind::AddLearner, 4, 9)
-            .await
-            .expect("a conf change on the leader");
+        peer.propose_conf_change(
+            esker_raft::ConfChangeKind::AddLearner,
+            4,
+            9,
+            esker_proto::PeerRole::Learner,
+        )
+        .await
+        .expect("a conf change on the leader");
 
         assert_eq!(
             auditor.route_of(4),

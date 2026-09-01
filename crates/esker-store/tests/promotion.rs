@@ -367,6 +367,17 @@ async fn watch_until_every_learner_votes(
                             promoted.insert(id);
                         }
                     }
+                    // A columnar replica is a learner that is **never** promoted (ADR 0022
+                    // Decision 1), so it is not a promotion this test is waiting for — and if one
+                    // ever appeared here it would mean the placement under test had changed
+                    // shape, which is worth failing on rather than counting.
+                    PeerRole::ColumnarLearner => {
+                        panic!(
+                            "region {} peer {} is a columnar learner; this test places row \
+                             replicas and one arriving means something else placed it",
+                            region.id, peer.peer_id
+                        );
+                    }
                 }
             }
         }

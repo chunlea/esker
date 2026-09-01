@@ -386,15 +386,27 @@ pub fn check_scope(command: &Command, region: &Region) -> Result<(), ProtoError>
 /// right place: the core moves the *membership* and the store moves the *region*, from the same
 /// entry, without either knowing the other's business.
 #[must_use]
-pub fn conf_change_context(store_id: u64) -> Bytes {
+pub fn conf_change_context(store_id: u64, role: PeerRole) -> Bytes {
     let mut out = Encoder::new();
     out.put_u8(COMMAND_FORMAT_VERSION);
     out.put_varint(store_id);
+    out.put_u8(role.as_u8());
     Bytes::from(out.finish())
 }
 
-/// Reads the store id a conf change carries.
-pub fn decode_conf_change_context(context: &Bytes) -> Result<u64, ProtoError> {
+/// Reads the store id and intended role a conf change carries.
+///
+/// **A trailing role byte, and an absent one means [`PeerRole::Learner`].** The context is
+/// replicated — it sits in the Raft log — so entries written before this byte existed are still
+/// out there and still apply. Defaulting them to `Learner` is what they meant: the only conf
+/// change this store has ever proposed for a new peer is a learner-first `AddLearner`, and
+/// `ColumnarLearner` did not exist when they were written.
+///
+/// The byte is what lets a columnar replica be recorded as one. `esker-raft` carries the context
+/// and never interprets it, and it reaches **every** peer including the leader, so all of them
+/// apply the same role from the same bytes — which matters because promotion is a decision the
+/// leader takes from the record (ADR 0022 Decision 1).
+pub fn decode_conf_change_context(context: &Bytes) -> Result<(u64, PeerRole), ProtoError> {
     let mut input = Decoder::new(context);
     let version = input
         .get_u8("conf.version")
@@ -408,16 +420,14 @@ pub fn decode_conf_change_context(context: &Bytes) -> Result<u64, ProtoError> {
     let store_id = input
         .get_varint("conf.store_id")
         .map_err(|error| ProtoError::corrupt("conf change context", error.to_string()))?;
-    input
-        .finish()
-        .map_err(|error| ProtoError::corrupt("conf change context", error.to_string()))?;
-    if store_id == 0 {
-        return Err(ProtoError::corrupt(
-            "conf change context",
-            "store id zero is not a store",
-        ));
-    }
-    Ok(store_id)
+    // Absent on every entry written before the byte existed, and `Learner` is what those meant.
+    let role = match input.get_u8("conf.role") {
+        Ok(byte) => PeerRole::from_u8(byte).ok_or_else(|| {
+            ProtoError::corrupt("conf change context", format!("role byte {byte}"))
+        })?,
+        Err(_) => PeerRole::Learner,
+    };
+    Ok((store_id, role))
 }
 
 /// The region a conf change leaves behind: the same range, a moved peer list, a bumped `conf_ver`.
@@ -435,10 +445,14 @@ pub fn apply_conf_change(
     let mut peers = region.peers.clone();
     match change.kind {
         ConfChangeKind::AddVoter | ConfChangeKind::AddLearner => {
+            // A voter add is a voter; a learner add is whichever *kind* of learner the proposer
+            // meant, which only the context can say — `ConfChangeKind` has one `AddLearner` and
+            // ADR 0022 leaves raft untouched.
             let role = if matches!(change.kind, ConfChangeKind::AddVoter) {
                 PeerRole::Voter
             } else {
-                PeerRole::Learner
+                decode_conf_change_context(&change.context)
+                    .map_or(PeerRole::Learner, |(_, role)| role)
             };
             match peers.iter_mut().find(|peer| peer.peer_id == change.node) {
                 // Promotion: the peer is already there and only its role moves. This is the
@@ -693,6 +707,50 @@ pub fn response(request: &RawKvReq, applied: &Applied) -> RawKvResp {
         (RawKvReq::Get { .. }, _) => RawKvResp::Get { value: None },
         (RawKvReq::BatchGet { .. }, _) => RawKvResp::BatchGet { values: Vec::new() },
         (RawKvReq::Scan { .. }, _) => RawKvResp::Scan { pairs: Vec::new() },
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod conf_context_tests {
+    use bytes::Bytes;
+    use esker_proto::PeerRole;
+
+    use super::{conf_change_context, decode_conf_change_context};
+
+    #[test]
+    fn the_role_survives_the_round_trip() {
+        for role in PeerRole::ALL {
+            let context = conf_change_context(7, role);
+            assert_eq!(decode_conf_change_context(&context).unwrap(), (7, role));
+        }
+    }
+
+    /// **The context is replicated**, so entries written before the role byte existed are still in
+    /// logs and still apply. `Learner` is what they meant: the only conf change this store has
+    /// ever proposed for a *new* peer is a learner-first `AddLearner`, and `ColumnarLearner` did
+    /// not exist when they were written.
+    #[test]
+    fn a_context_from_before_the_role_byte_reads_as_a_plain_learner() {
+        // Exactly what `conf_change_context` used to write: version, then the store id.
+        let mut old = Vec::new();
+        old.push(super::COMMAND_FORMAT_VERSION);
+        let mut encoder = esker_proto::Encoder::new();
+        encoder.put_varint(9);
+        old.extend_from_slice(&encoder.finish());
+        assert_eq!(
+            decode_conf_change_context(&Bytes::from(old)).unwrap(),
+            (9, PeerRole::Learner)
+        );
+    }
+
+    /// A role byte this build does not know is refused rather than guessed at. Guessing would
+    /// pick `Learner`, and a columnar replica recorded as one is promoted and starts voting.
+    #[test]
+    fn an_unknown_role_byte_is_refused_rather_than_defaulted() {
+        let mut context = conf_change_context(1, PeerRole::Learner).to_vec();
+        *context.last_mut().unwrap() = 99;
+        assert!(decode_conf_change_context(&Bytes::from(context)).is_err());
     }
 }
 

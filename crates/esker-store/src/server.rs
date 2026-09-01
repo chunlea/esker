@@ -546,7 +546,7 @@ impl Store {
             return;
         }
 
-        let (kind, node, store_id) = match operator {
+        let (kind, node, store_id, role) = match operator {
             // **Learner first, and the store finishes the job.** An `AddPeer` for a peer this
             // region has never heard of adds a *learner*: it receives the log and the snapshot
             // without voting, so it never makes a quorum harder to reach while it is catching up.
@@ -570,9 +570,43 @@ impl Store {
                 .iter()
                 .find(|peer| peer.peer_id == *peer_id)
             {
-                None => (esker_raft::ConfChangeKind::AddLearner, *peer_id, *store_id),
+                None => (
+                    esker_raft::ConfChangeKind::AddLearner,
+                    *peer_id,
+                    *store_id,
+                    PeerRole::Learner,
+                ),
                 // Already here. A learner is on its way to being a voter under its own criterion,
                 // and a voter is what was asked for: either way there is nothing to propose.
+                Some(_) => return,
+            },
+            // **A columnar replica: a learner that is never promoted** (ADR 0022 Decision 1).
+            //
+            // The same `ConfChangeKind::AddLearner` a row replica gets — `esker-raft` has one
+            // notion of learner and the ADR leaves it that way — with the *role* carried in the
+            // conf change's **context**, which raft replicates and never interprets. That is what
+            // makes the distinction land on every peer including the leader, which matters
+            // because promotion is a decision the leader takes from the region record.
+            //
+            // `AddPeer` cannot serve here: it completes when the peer becomes a **voter**, and a
+            // columnar replica never does, so it would be a repair that never finishes.
+            Operator::AddLearner {
+                store_id, peer_id, ..
+            } => match state
+                .region()
+                .peers
+                .iter()
+                .find(|peer| peer.peer_id == *peer_id)
+            {
+                None => (
+                    esker_raft::ConfChangeKind::AddLearner,
+                    *peer_id,
+                    *store_id,
+                    PeerRole::ColumnarLearner,
+                ),
+                // Already here, in whatever role it was added as. Nothing to propose, and
+                // certainly not a change of role: that would be a promotion or a demotion and
+                // neither is what this operator asks for.
                 Some(_) => return,
             },
             Operator::RemovePeer { peer_id, .. } => {
@@ -588,6 +622,7 @@ impl Store {
                     esker_raft::ConfChangeKind::Remove,
                     *peer_id,
                     existing.store_id,
+                    existing.role,
                 )
             }
             // Leadership moves by the core's own `TimeoutNow` path rather than by a conf change,
@@ -602,7 +637,7 @@ impl Store {
         // cannot reach a quorum never does. Without this the heartbeat round that carried the
         // operator would stop, and with it the only channel the placement driver has to correct
         // its own mistake.
-        let proposal = peer.propose_conf_change(kind, node, store_id);
+        let proposal = peer.propose_conf_change(kind, node, store_id, role);
         match tokio::time::timeout(OPERATOR_TIMEOUT, proposal).await {
             Ok(Ok(_)) => tracing::info!(region_id, node, ?kind, "an operator applied"),
             Ok(Err(error)) => tracing::debug!(
@@ -648,9 +683,10 @@ impl Store {
             );
             return;
         };
-        if target.role == PeerRole::Learner {
-            // A learner cannot win an election, so the transfer would leave the region without a
-            // leader until the old one's timeout brought it back.
+        if matches!(target.role, PeerRole::Learner | PeerRole::ColumnarLearner) {
+            // Neither kind of learner can win an election, so the transfer would leave the region
+            // without a leader until the old one's timeout brought it back. A columnar learner is
+            // additionally one that must *never* lead: it holds columns, not rows.
             tracing::debug!(
                 region_id,
                 to_peer_id,
@@ -890,7 +926,17 @@ impl Store {
             let learners: Vec<u64> = region
                 .peers
                 .iter()
-                .filter(|peer| peer.role == PeerRole::Learner)
+                // **Exhaustive on purpose.** A role added later must not fall into either
+                // default: promoting it silently would make a replica vote that was never meant
+                // to, and skipping it silently would strand a replica that was. The compiler
+                // asks the question instead.
+                .filter(|peer| match peer.role {
+                    PeerRole::Learner => true,
+                    // Never promoted — that is the whole of ADR 0022 Decision 1. A promoted
+                    // columnar replica votes, counts toward a quorum, and is asked for row reads
+                    // it holds no rows for.
+                    PeerRole::ColumnarLearner | PeerRole::Voter => false,
+                })
                 .map(|peer| peer.peer_id)
                 .collect();
             if learners.is_empty() {
@@ -958,6 +1004,7 @@ impl Store {
                     esker_raft::ConfChangeKind::AddVoter,
                     learner,
                     store_id,
+                    PeerRole::Voter,
                 );
                 match tokio::time::timeout(OPERATOR_TIMEOUT, proposal).await {
                     Ok(Ok(_)) => {}
@@ -2298,7 +2345,11 @@ fn start_peer(
     let learners: Vec<u64> = region
         .peers
         .iter()
-        .filter(|peer| peer.role == PeerRole::Learner)
+        // **Both kinds.** `esker-raft` has one notion of learner and ADR 0022 leaves it that way:
+        // a columnar replica is a raft learner whose *apply* differs, so the core must know about
+        // it or the leader keeps no `Progress` for it, sends it nothing, and it sits at
+        // `applied = 0` for the life of the cluster — which is phase-4 §20's bug, exactly.
+        .filter(|peer| matches!(peer.role, PeerRole::Learner | PeerRole::ColumnarLearner))
         .map(|peer| peer.peer_id)
         .collect();
     let peer_id = region
