@@ -1,0 +1,19 @@
+crates/esker-sql/tests/joint_gate.rs
+  s_094241f844188c::t_3652eeb9df6b09 496-503,509,568-571,619-627,629-634,638-641,644-648,713-718,799-804,838-841,880-881,883-888,890-937,968-973
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "269c90a583e3e42febdedba6a0dd41732bf4fa54",
+  "prompts": {},
+  "sessions": {
+    "s_094241f844188c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "54200bf0-3107-4c35-8bbd-bea1cd1c7064",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
