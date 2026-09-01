@@ -32,6 +32,14 @@ tracing-subscriber.workspace = true
 # The end-to-end tests run the corpus against real stores over real sockets, which is the only
 # way to prove the wiring rather than the fake.
 esker-store.workspace = true
+# `tests/joint_gate.rs` drives a **real** placement driver, because what it is about is the seam
+# between three processes: a SQL node reports a columnar wish, PD schedules a learner for it, and
+# a store builds one. A stand-in for any of the three would be a test of the stand-in. Nothing
+# `esker-sql` ships links PD — they are peers that meet on the wire — so this is workspace-internal
+# and dev-only: it adds nothing to the runtime graph or to `deny.toml`'s budget, and `esker-pd`
+# does not depend on this crate, so there is no cycle. The same dependency `esker-store` and
+# `esker-client` take, for the same reason.
+esker-pd.workspace = true
 proptest.workspace = true
 sqllogictest.workspace = true
 tempfile.workspace = true
