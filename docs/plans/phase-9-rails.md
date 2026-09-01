@@ -1,6 +1,6 @@
 # Phase 9 plan — a PostgreSQL that Rails can talk to, scored by Rails' own tests
 
-Status: **units 0–4 landed** (unit 4 bar a second join); **unit 5 in progress in the measured order** — the table alias, the eight session statements and `IN (list)` are built, and `ActiveRecord`'s 36 went 3 → **11**; the type surface is blocked on `esker-keys` and said so. **Unit 6's first scoreboard is in** ([`docs/bench/rails-scoreboard.md`](../bench/rails-scoreboard.md)): rung 1 of the ladder passes and rung 2 now stops on `relation "pg_type" does not exist` — the catalog, which is where the next unit is. §2 says what the measurement changed, §9 records progress per unit, §6 the divergences, §7 what unit 1 changed and §8 what is watched.
+Status: **units 0–4 landed** (unit 4 bar a second join); **unit 5 in progress in the measured order** — the table alias, the eight session statements, `IN (list)` and now the catalog's first slice are built, and `ActiveRecord`'s 36 went 3 → 11 → **15**. **Unit 6's second scoreboard is in** ([`docs/bench/rails-scoreboard.md`](../bench/rails-scoreboard.md)): rung 1 passes, rung 2 has moved off the catalog and onto `'integer'::regtype::oid`, and the suite is unchanged — three numbers that moved by different amounts, which is what the file is shaped to show. **The next unit is the type surface**, which needs `esker-keys` and `esker-columnar` and now has an ADR: [ADR 0033](../adr/0033-the-three-types-a-rails-migration-emits.md). §2 says what the measurement changed, §9 records progress per unit, §6 the divergences, §7 what unit 1 changed and §8 what is watched (now empty).
 
 Design: [ADR 0031](../adr/0031-rails-compatibility-is-measured.md). Constitution: `CLAUDE.md`.
 The compatibility contract this inherits whole: `docs/plans/phase-6a.md` §1 — **C1** every valid
@@ -459,6 +459,19 @@ There is no honest way round it, and each near-miss fails for its own reason:
 So the ladder's rung 2 — connect and run one migration — stays blocked, and the block is a
 cross-crate one. Reported rather than worked around.
 
+**Unblocked in unit 6, as a decision rather than as code**: [ADR
+0033](../adr/0033-the-three-types-a-rails-migration-emits.md) settles all three — `ColumnType::Int4`,
+`ColumnType::Varchar` and `ColumnType::Timestamp`, with the typmod on the *column* where PostgreSQL
+keeps it, rather than an alias onto the types this node has. The finding that makes it one unit
+rather than a migration is that **it is not an on-disk format change**: the row codec carries no
+per-value type tag, so a `Varchar` writes exactly what a `Text` writes and every row written before
+the ADR decodes identically after it; `esker-columnar`'s type tag is append-only and the three take
+7, 8 and 9. The one version bump owed is the catalog's `ColumnDef`, which grows a typmod that reads
+`-1` — "no length given" — for every column written before it. The measured facts each type needs
+are in the ADR, including the two that reading would get wrong: an explicit cast to `varchar(3)`
+**truncates** where an `INSERT` **raises** `22001`, and `integer`'s `22003` does not quote the
+offending value where `bigint`'s does.
+
 #### Handover — every one of the 36, by number
 
 Numbering is the order in `tests/corpus/activerecord_8_1_statements.txt`, which is the order
@@ -549,7 +562,7 @@ before it in the measured order is either built or blocked:
 | the six `SET`s and two `SHOW`s | **built** — `tests/session_parameters.rs`, 68 statements |
 | the type surface | **BLOCKED on `esker-keys`**, reported above; not this lane's to build |
 | *(inserted by the scoreboard)* `IN (list)` | **built** — `tests/in_list.rs`, 40 statements |
-| the catalog's content | **not started**; `pg_type` + `pg_range` first |
+| the catalog's content | **started, and `pg_type` + `pg_range` are in** — unit 6, below |
 
 Two questions the next lane has to answer before writing a row of `pg_type`, and neither is
 obvious:
@@ -668,6 +681,77 @@ And one that is not on the list because it is not about `ActiveRecord`: **`SELEC
 here.** The `IN` corpus found it, it is a wrong answer rather than a refusal, and it is worth a
 unit ahead of anything on this list on those grounds alone (§6).
 
+#### Unit 6's catalog: `pg_type` and `pg_range`, computed rather than stored
+
+Built to the shape unit 5 decided — **views over the records** — and the shape is what made it
+small: `tests/corpus/pg19_pg_catalog.txt` is 46 statements and **41 of them agreed on the first
+run**, because a computed relation reaches the query surface the last three units built. An alias,
+a qualifier, `WHERE`, `IN`, `ORDER BY`, `DISTINCT`, `GROUP BY`, `count(*)` and both kinds of join
+all work over rows that came from nowhere. What the planner needed was one `Node` variant and one
+early return in `access_path`; the join needed one field, because a relation with no key range has
+nothing to probe with and is always the materialised side.
+
+**Whose types does `pg_type` list?** The predecessor left this open and asked for a capture rather
+than an argument, and the capture turned out to be of `ActiveRecord` rather than of PostgreSQL —
+its own source answers it:
+
+* `add_pg_decoders` builds its decoders with `filter_map`, so a name it gets no row for is a
+  decoder it does not make;
+* `TypeMapInitializer#run` partitions the rows it is handed and registers each partition, so an
+  empty partition registers nothing;
+* a column whose OID is in no map decodes as a string.
+
+**A short `pg_type` costs a client nothing it can see, and this node never sends an OID that is not
+in it** — the six types it has are the six it can put in a `RowDescription`. So `pg_type` lists the
+types *this* server has, with PostgreSQL's own OIDs, and `SELECT typname FROM pg_type WHERE typname
+= 'numeric'` is no rows here and one row there. Declared, and it closes one type at a time as types
+arrive. The rows are derived from `ColumnType::ALL` rather than written out, so a seventh type
+cannot be added to this node and left out of its own `pg_type`.
+
+Three things the capture settled that reading would have got wrong:
+
+* **`pg_range` has no `oid` column.** `SELECT oid FROM pg_range` is `42703` on a real server, and
+  that is exactly what makes `ActiveRecord`'s `LEFT JOIN pg_range AS r ON oid = rngtypid` legal
+  with an unqualified `oid`. A `pg_range` given one out of tidiness would have made the framework's
+  own statement `42702`.
+* **DDL on a system catalog is `42501`, not `0A000`** — `permission denied: "pg_type" is a system
+  catalog`, and `IF EXISTS` does not excuse it. §5 had guessed `0A000`; the measured answer is
+  better and is what this builds. **DML is not refused for a superuser**, which is not a
+  hypothesis: the capture ran `DELETE FROM pg_type WHERE oid = 20` without a transaction, `int8`
+  left the container's database, and every later statement answered `XX000 cache lookup failed for
+  type 20`. The database was rebuilt and the corpus re-verified against it; the three write probes
+  now sit inside rolled-back blocks. This node refuses every write alike, which is the answer a
+  real server gives everyone who is not a superuser.
+* **`DROP INDEX pg_type` is `42809 "pg_type" is not an index`**, not `42501`. It is asking about a
+  *kind* and not attempting a write, so the catalog relation has to be visible to that check rather
+  than refused in front of it — which is why the guard is in the write verbs and the *relation*
+  lookup answers a view like any other table.
+
+**What it moved, on all three numbers** (`docs/bench/rails-scoreboard.md` run 2):
+
+| | before | after |
+|---|---|---|
+| statements served, of 36 | 11 | **15** — 4, 7, 8 and 9, the whole of what the catalog blocked |
+| the ladder, rung 2 | `relation "pg_type" does not exist` | **`the expression 'integer'::regtype::oid is not supported`** |
+| the suite | 525 of 772 passing, 247 errors, 367 files never loaded | **771 of 772, 0 errors**, the same 367 — and none of that is this unit's doing |
+
+The suite not moving is the honest half. It is all-or-nothing at `establish_connection` and this
+round did not get past it — so a scoreboard carrying only the suite would have recorded a round
+that moved a rung and four statements as nothing at all. That is the argument for the three-number
+split, made by a measurement rather than in advance.
+
+**And the errors that did move were the harness's.** All 247 of run 1's were `NameError:
+uninitialized constant Arel::Nodes::ActiveModel` — `test/cases/arel/helper.rb` requires
+`active_support` and `arel` and not `active_model`, while `Arel::Nodes.build_quoted` names
+`ActiveModel::Attribute`. One `require` in the runner took one file from 97 errors to 0. Run 1 had
+called them "the Arel tests that *do* reach for an adapter", which was wrong, and it is the second
+number on this board that turned out to be about the measurement rather than about the server —
+the first was the 68% pass rate whose denominator excluded everything that tests this node. What
+remains is a single failure, `visit_BigDecimal` expecting `2.14` and getting `0.214e1`, which is
+Ruby 4.0.6's `BigDecimal#to_s` in a visitor that never opens a connection. It is **not excluded**:
+ADR 0031's three rules do not admit "a test about Ruby", and naming the cause while leaving the 1
+in the total is the honest treatment.
+
 ## 3. The test ladder
 
 Each rung is a thing that either works or does not, and none of them is reached by asserting
@@ -705,9 +789,14 @@ three real stores rather than the in-memory fake.
 
 ## 5. What this phase will NOT do
 
-* **No `pg_catalog` write path.** The catalog views are read-only translations. `INSERT INTO
-  pg_class` is `0A000`, as is `ALTER SYSTEM` and every other administrative surface phase-6a §9
-  already classifies as such.
+* **No `pg_catalog` write path.** The catalog views are read-only translations. **Corrected in
+  unit 6 by measurement**: the refusal is `42501 permission denied: "pg_type" is a system catalog`
+  and not the `0A000` this line first guessed — that is what a real server answers for `DROP
+  TABLE`, `ALTER TABLE` and `CREATE INDEX` on a catalog, and `IF EXISTS` does not excuse it. DML it
+  does *not* refuse for a superuser, which this node cannot follow and does not: a computed
+  relation has nothing to write to and there are no roles here, so every write gets the answer a
+  real server gives everyone who is not a superuser. `ALTER SYSTEM` and every other administrative
+  surface phase-6a §9 classifies as such stay `0A000`.
 * **No `plpgsql`, no `CREATE FUNCTION`, no triggers.** They parse (C1) and they are `0A000` (C2).
 * **No `numeric` type.** Refused by name and counted, per ADR 0031. It gets its own ADR and its own
   unit when the count justifies it.
@@ -835,6 +924,51 @@ already retries nine times, exhausting them against an epoch that keeps moving. 
 (saturation), third mechanism, and it is recorded here rather than claimed to be fixed. Three
 consecutive standalone runs are clean.
 
+## 8b. Handover — what unit 6 leaves, and what the ladder says to do next
+
+**The next unit is the type surface, and the evidence is the ladder rather than a count.** Two
+rankings of what is left disagree, and `docs/bench/rails-scoreboard.md` prints both on purpose:
+
+* by **statements unblocked**, a second `JOIN` is the biggest group at 7;
+* by **the ladder**, only the type surface can move rung 2, and nothing else is close — a second
+  join, `= ANY`, a qualified name and the rest of the catalog are all on paths a client reaches
+  *after* it has run a migration, and this one cannot run a migration.
+
+So: `integer`, `character varying`, `timestamp`, **and `'x'::regtype::oid` with them**, because
+neither half moves the ladder alone. `lookup_cast_type` asks the cast question and `pg_type`
+answers it, and today the cast is `0A000` and the answer would be "no such type" if it were not.
+[ADR 0033](../adr/0033-the-three-types-a-rails-migration-emits.md) is the plan, written before the
+code as the brief required, and it carries the measured facts — including the finding that this is
+**not** an on-disk format change, which is what makes it one unit.
+
+**What is built and where it is**, so nothing has to be rediscovered:
+
+| Thing | Where |
+|---|---|
+| the `unknown` resolution rule | `src/exec/query.rs`'s `reconcile`, `common_type`, `give_type`; `tests/unknown_literal.rs`, `tests/corpus/pg19_unknown.txt` (123 statements) |
+| `pg_type`, `pg_range`, and the write refusal | `src/catalog/pg_catalog.rs`; `tests/pg_catalog.rs`, `tests/corpus/pg19_pg_catalog.txt` (46) |
+| the computed-relation plan node | `plan::Node::CatalogView`, `NestedLoop::inner_view`; `exec::query::access_path` and `join_node`; `exec::cursor`'s `Kind::Rows` |
+| the transport retry | `tests/joint_gate.rs`'s `call_through_an_election` |
+| the second scoreboard | `docs/bench/rails-scoreboard.md`, run 2 |
+
+**Three things a successor should know before touching any of it:**
+
+1. **The catalog derives from `ColumnType::ALL`.** Adding a stored type adds a `pg_type` row for
+   free and will not compile until its `typname` and `typinput` are named — both are exhaustive
+   matches in `src/catalog/pg_catalog.rs`, and both were measured (`int4in` has no underscore,
+   `timestamp_in` does).
+2. **A capture that writes to `pg_catalog` breaks the oracle.** The `esker-pg19` container's
+   `esker` database had to be dropped and recreated after a probe deleted `int8` out of its
+   `pg_type` — autocommit, superuser, no error. Wrap write probes in `BEGIN`/`ROLLBACK`, and
+   re-verify any corpus captured in that session by replaying `cut -f1 corpus.txt` and diffing.
+3. **`activerecord_surface.rs` asserts its count exactly.** Moving it is the point of a unit; a
+   unit that moves it has to say which unit moved it, in the doc comment beside the number.
+
+**Nothing is half-built.** The two write paths a catalog relation could have been reached through
+— `existing_relation` for DDL and `require_table` for DML — both go through
+`pg_catalog::refuse_write`, and `tests/pg_catalog.rs` covers the two verbs where the answer is
+deliberately *not* `42501` (`DROP INDEX` is `42809`, `CREATE TABLE` is `42P07`).
+
 ## 9. Progress
 
 | Unit | State | Commit |
@@ -846,4 +980,6 @@ consecutive standalone runs are clean.
 | 4 — joins | **`LEFT`, `ON`, `USING` done**; a second join is not | `56d23e2` |
 | 5 — `pg_catalog` | **in progress, in the measured order.** Captured and re-ordered (`b8d90e7`); the **table alias**, the **six `SET`s + two `SHOW`s** and **`IN (list)`** built, taking `ActiveRecord`'s 36 from 3 served to **11** and moving five statements onto the catalog; the type surface **blocked on `esker-keys`** and reported; the translation approach **decided** (views over records). What is left is the catalog's content, starting at `pg_type`. | `b8d90e7`, `b0eca1c`, this commit |
 | 6 — the scoreboard | **first run done**: the harness runs the ladder and all 426 suite files, `docs/bench/rails-scoreboard.md` carries both. 59 files reach a test, 367 die at `establish_connection`; rung 1 passes. Its finding — `IN (list)`, the first query `ActiveRecord` sends — was built in the same round, and rung 2 now stops on the catalog | `6971a30` |
-| 6 — the two inherited fixes | **done**: PostgreSQL's `unknown` resolution (`SELECT 1 = '1'` was `f`), captured in 123 statements and fixed as the rule it is — 78 disagreements became 31, all four remaining classes declared; and the watched transport flake, retried at both `joint_gate` call sites on a leadership change only. §6 and §8 | this commit |
+| 6 — the two inherited fixes | **done**: PostgreSQL's `unknown` resolution (`SELECT 1 = '1'` was `f`), captured in 123 statements and fixed as the rule it is — 78 disagreements became 31, all four remaining classes declared; and the watched transport flake, retried at both `joint_gate` call sites on a leadership change only. §6 and §8 | `8b7d7c1` |
+| 6 — `pg_type` and `pg_range` | **done**: the catalog's first slice, computed rather than stored, 46 captured statements with 41 agreeing on the first run. `ActiveRecord`'s 36 went 11 → **15**, and the ladder's rung 2 moved off the catalog and onto `'integer'::regtype::oid`. The suite is unchanged and the scoreboard says why | this commit |
+| 6 — the second scoreboard | **published**: [`docs/bench/rails-scoreboard.md`](../bench/rails-scoreboard.md) run 2, with before/after on all three numbers, both rankings for the next unit, and the reproduce-it commands | this commit |

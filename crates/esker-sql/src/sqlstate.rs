@@ -128,6 +128,11 @@ pub const CONNECTION_FAILURE: &str = "08006";
 
 // --- Class 42 — Syntax Error or Access Rule Violation ---
 
+/// `42501` — the statement is refused because of what it is being done *to*: a write to a
+/// `pg_catalog` relation. Measured on 19beta1, where `DROP TABLE pg_type` answers
+/// `permission denied: "pg_type" is a system catalog`.
+pub const INSUFFICIENT_PRIVILEGE: &str = "42501";
+
 /// The statement is not valid SQL. Contract C1 says this must never be the answer to a statement
 /// PostgreSQL 19 would have accepted.
 pub const SYNTAX_ERROR: &str = "42601";

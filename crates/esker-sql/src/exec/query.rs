@@ -22,6 +22,7 @@
 //! query, and reading only its range would silently lose the rows the other branch matches — which
 //! is the kind of wrong answer nothing reports.
 
+use crate::catalog::pg_catalog;
 use crate::catalog::{ColumnDef, TableDef};
 use crate::error::{Result, SqlError};
 use crate::exec::aggregate;
@@ -660,7 +661,12 @@ fn join_node(
     scope: &Scope<'_>,
     inner: &TableDef,
 ) -> Result<Node> {
+    // A computed relation has no primary key and no index, so there is nothing to probe with and
+    // the inner side is read once into memory like any other unindexed join. Decided here rather
+    // than left to `probe_for`, so that a view can never be reached through a key.
+    let inner_view = pg_catalog::view_of(inner);
     let probe = on
+        .filter(|_| inner_view.is_none())
         .and_then(|on| probe_for(on, scope, inner))
         .unwrap_or(crate::plan::Probe::Materialize);
     // A probe answers the equality exactly, so the condition it came from is not re-checked. A
@@ -677,6 +683,7 @@ fn join_node(
         outer: Box::new(outer),
         left_join,
         inner_table_id: inner.id,
+        inner_view,
         inner_table: inner.name.clone(),
         inner_columns: inner.row_schema(),
         probe,
@@ -773,6 +780,13 @@ fn probe_for(on: &Expr, scope: &Scope<'_>, inner: &TableDef) -> Option<crate::pl
 /// unique index's whole key. Otherwise a scan.
 fn access_path(filter: Option<&Expr>, tenant: u64, table: &TableDef) -> Result<Node> {
     let columns = table.row_schema();
+    // A `pg_catalog` relation is computed, so it has no key range to narrow and no index to seek
+    // in: one access path, all of its rows, and the `WHERE` above it does the rest. Returned
+    // before any key is built, so the reserved id a view's `TableDef` carries never reaches a
+    // range (`crate::catalog::pg_catalog`).
+    if let Some(view) = pg_catalog::view_of(table) {
+        return Ok(Node::CatalogView { view, columns });
+    }
     let Some(filter) = filter else {
         return Ok(seq_scan(tenant, table, &columns, false));
     };

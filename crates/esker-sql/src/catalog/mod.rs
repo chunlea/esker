@@ -38,6 +38,7 @@
 //! puts nothing back. DDL is rare and this is the statement that just paid for a round trip
 //! anyway.
 
+pub mod pg_catalog;
 mod record;
 
 use std::collections::BTreeMap;
@@ -621,6 +622,14 @@ impl View<'_> {
     /// A table by name, or `None`. An index's name resolves to no table: `SELECT * FROM an_index`
     /// is `42P01` in PostgreSQL too.
     pub fn table(&self, name: &str) -> Result<Option<Arc<TableDef>>> {
+        // A `pg_catalog` relation is computed rather than stored, so it is answered before the
+        // `'m'` space is consulted and cannot be shadowed by a record. This node has no schemas,
+        // so `pg_type` is one name — where a real server would have resolved `pg_catalog.pg_type`
+        // ahead of `public.pg_type` and let both exist (`pg_catalog::refuse_write` is what stops
+        // the second from being created here, and `tests/pg_catalog.rs` declares the difference).
+        if let Some(view) = pg_catalog::view(name) {
+            return Ok(Some(view.table_def()));
+        }
         match self.relation(name)? {
             Some(Relation::Table { table_id }) => self.table_by_id(table_id),
             Some(

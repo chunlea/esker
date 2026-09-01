@@ -48,6 +48,8 @@ pub(super) struct Cursor<'a> {
 enum Kind<'a> {
     /// One row of nothing, then done.
     One(bool),
+    /// Rows that came from nowhere: a `pg_catalog` relation, computed rather than read.
+    Rows(std::vec::IntoIter<Vec<Datum>>),
     /// A key range, read a chunk at a time.
     Scan {
         columns: RowSchema,
@@ -113,11 +115,61 @@ enum Kind<'a> {
     },
 }
 
+/// The inner side of a nested loop, read once, or nothing when the probe reads it per outer row.
+///
+/// A materialised inner side is read here rather than re-scanned per outer row, and it is bounded
+/// by the same limit a sort is, for the same reason: an unbounded buffer on behalf of a client is
+/// a stall nobody asked for.
+///
+/// A **catalog view** is materialised too, and where its rows come from is the difference: there
+/// is no key range to scan, so they are computed. Always [`Probe::Materialize`] —
+/// `exec::query::join_node` will not build any other probe over a relation that has no key.
+fn inner_side(
+    txn: &dyn Txn,
+    tenant: u64,
+    inner_table_id: u64,
+    inner_view: Option<&crate::plan::CatalogView>,
+    inner_columns: &RowSchema,
+    probe: &Probe,
+) -> Result<Vec<Vec<Datum>>> {
+    if let Some(view) = inner_view {
+        return Ok(view.rows());
+    }
+    if !matches!(probe, Probe::Materialize) {
+        return Ok(Vec::new());
+    }
+    let (start, end) = row::table_row_range(tenant, inner_table_id);
+    let mut rows = Vec::new();
+    let mut scan = Cursor {
+        txn,
+        tenant,
+        kind: Kind::Scan {
+            columns: inner_columns.clone(),
+            next: start,
+            end,
+            batch: Vec::new().into_iter(),
+        },
+    };
+    while let Some(row) = scan.next()? {
+        if rows.len() == SORT_LIMIT {
+            return Err(SqlError::ConfigurationLimitExceeded(format!(
+                "a join whose inner side is more than {SORT_LIMIT} rows needs more memory than \
+                 this server will use for one query"
+            )));
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
 impl<'a> Cursor<'a> {
     /// Opens a cursor over a plan.
     pub(super) fn open(txn: &'a dyn Txn, tenant: u64, node: &Node) -> Result<Self> {
         let kind = match node {
             Node::OneRow => Kind::One(false),
+            // Computed here, once, rather than page by page: `pg_type` is six rows and `pg_range`
+            // is none. If a catalog view ever is not small, this is the line that changes.
+            Node::CatalogView { view, .. } => Kind::Rows(view.rows().into_iter()),
             Node::SeqScan {
                 columns,
                 start,
@@ -137,40 +189,20 @@ impl<'a> Cursor<'a> {
                 outer,
                 left_join,
                 inner_table_id,
+                inner_view,
                 inner_columns,
                 probe,
                 residual,
                 ..
             } => {
-                // A materialised inner side is read once, here, rather than re-scanned per outer
-                // row. It is bounded by the same limit a sort is, and for the same reason: an
-                // unbounded buffer on behalf of a client is a stall nobody asked for.
-                let materialized = if matches!(probe, Probe::Materialize) {
-                    let (start, end) = row::table_row_range(tenant, *inner_table_id);
-                    let mut rows = Vec::new();
-                    let mut scan = Cursor {
-                        txn,
-                        tenant,
-                        kind: Kind::Scan {
-                            columns: inner_columns.clone(),
-                            next: start,
-                            end,
-                            batch: Vec::new().into_iter(),
-                        },
-                    };
-                    while let Some(row) = scan.next()? {
-                        if rows.len() == SORT_LIMIT {
-                            return Err(SqlError::ConfigurationLimitExceeded(format!(
-                                "a join whose inner side is more than {SORT_LIMIT} rows needs \
-                                 more memory than this server will use for one query"
-                            )));
-                        }
-                        rows.push(row);
-                    }
-                    rows
-                } else {
-                    Vec::new()
-                };
+                let materialized = inner_side(
+                    txn,
+                    tenant,
+                    *inner_table_id,
+                    inner_view.as_ref(),
+                    inner_columns,
+                    probe,
+                )?;
                 Kind::NestedLoop {
                     outer: Box::new(Cursor::open(txn, tenant, outer)?),
                     left_join: *left_join,
@@ -230,6 +262,8 @@ impl<'a> Cursor<'a> {
             } else {
                 Some(Vec::new())
             }),
+
+            Kind::Rows(rows) => Ok(rows.next()),
 
             Kind::Scan {
                 columns,

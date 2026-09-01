@@ -102,6 +102,16 @@ pub enum SqlError {
     #[error("table \"{0}\" does not exist")]
     UndefinedTableForDrop(String),
 
+    /// A write to a `pg_catalog` relation, which is computed here and read-only everywhere.
+    ///
+    /// The sentence is a real server's, measured: `DROP TABLE pg_type`, `ALTER TABLE pg_type ADD
+    /// COLUMN` and `CREATE INDEX … ON pg_type` all answer it. A real server does **not** refuse
+    /// DML this way for a superuser — it lets one write `pg_type` and break the database — and
+    /// this node refuses every write alike, because it has no roles and a computed relation has
+    /// nothing to write to (`crate::catalog::pg_catalog`).
+    #[error("permission denied: \"{0}\" is a system catalog")]
+    SystemCatalog(&'static str),
+
     /// No such index.
     #[error("index \"{0}\" does not exist")]
     UndefinedIndex(String),
@@ -769,6 +779,7 @@ impl SqlError {
                 sqlstate::AMBIGUOUS_COLUMN
             }
             SqlError::UndefinedIndex(_) => sqlstate::UNDEFINED_OBJECT,
+            SqlError::SystemCatalog(_) => sqlstate::INSUFFICIENT_PRIVILEGE,
             SqlError::DependentObjectsStillExist { .. } => sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
             SqlError::WrongObjectType { .. } | SqlError::AlterActionOnWrongObject { .. } => {
                 sqlstate::WRONG_OBJECT_TYPE

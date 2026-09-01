@@ -106,6 +106,7 @@ pub(super) fn insert(
     insert: &Insert,
     written: &mut Written,
 ) -> Result<Outcome> {
+    crate::catalog::pg_catalog::refuse_write(&insert.table)?;
     let table = executor.require_table(txn, &insert.table)?;
     let targets = target_columns(&table, insert)?;
     let mut returned = Returned::open(insert.returning.as_ref(), &table)?;
@@ -334,6 +335,7 @@ pub(super) fn update(
     update: &Update,
     written: &mut Written,
 ) -> Result<Outcome> {
+    crate::catalog::pg_catalog::refuse_write(&update.table)?;
     let table = executor.require_table(txn, &update.table)?;
     let mut returned = Returned::open(update.returning.as_ref(), &table)?;
 
@@ -402,6 +404,7 @@ pub(super) fn delete(
     txn: &mut dyn Txn,
     delete: &Delete,
 ) -> Result<Outcome> {
+    crate::catalog::pg_catalog::refuse_write(&delete.table)?;
     let table = executor.require_table(txn, &delete.table)?;
     let mut returned = Returned::open(delete.returning.as_ref(), &table)?;
     let rows = collect(executor, txn, delete.filter.as_ref(), &table)?;

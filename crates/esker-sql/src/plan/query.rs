@@ -19,6 +19,7 @@
 //! slow. `EXPLAIN` prints which one was chosen, because a plan a user cannot see is a plan they
 //! cannot fix.
 
+use crate::catalog::pg_catalog::CatalogView;
 use crate::plan::{AggregateFunc, Expr, Literal};
 use crate::row::RowSchema;
 use crate::value::PgDatum;
@@ -186,6 +187,19 @@ pub struct OrderItem {
 pub enum Node {
     /// One row of no table, for `SELECT 1`.
     OneRow,
+    /// Every row of a `pg_catalog` relation, which is **computed rather than stored**.
+    ///
+    /// It has no key range, no index and no statistics, so there is one access path and it is all
+    /// of the rows. That is the cost of the shape `docs/plans/phase-9-rails.md` §Unit 5 chose —
+    /// views over the records rather than catalog tables kept in step by every DDL statement — and
+    /// for a schema dump over a handful of relations it is the right trade. Materialising is a
+    /// change behind this same variant if it ever is not.
+    CatalogView {
+        /// Which relation.
+        view: CatalogView,
+        /// How its rows are shaped, so everything above it reads a row like any other.
+        columns: RowSchema,
+    },
     /// Every row of a table, in primary key order, over a key range.
     SeqScan {
         /// The table.
@@ -262,8 +276,11 @@ pub enum Node {
         left_join: bool,
         /// The left side, pulled once.
         outer: Box<Node>,
-        /// The inner table.
+        /// The inner table, or a reserved id when the inner side is a catalog view.
         inner_table_id: u64,
+        /// Set when the inner side is a `pg_catalog` relation, which has no key range to scan.
+        /// Always paired with [`Probe::Materialize`]: a computed relation has no index to seek in.
+        inner_view: Option<CatalogView>,
         /// Its name, for `EXPLAIN`.
         inner_table: String,
         /// How the inner table's rows decode.
@@ -436,6 +453,12 @@ impl Node {
         let names = &self.input_names(columns)[..];
         match self {
             Node::OneRow => ("Result".to_owned(), None, None),
+            // No costs and no alternative: a computed relation has one access path. The name says
+            // what it is rather than implying a choice that was not made -- the same rule the
+            // aggregate and access-path plans already print by.
+            Node::CatalogView { view, .. } => {
+                (format!("Catalog Scan on {}", view.name()), None, None)
+            }
             Node::SeqScan { narrowed, .. } => (
                 format!("Seq Scan on {table}"),
                 None,

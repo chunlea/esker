@@ -192,6 +192,8 @@ pub(super) fn drop_table(
     drop: &DropTable,
 ) -> Result<Outcome> {
     for name in &drop.names {
+        // `42501`, and `IF EXISTS` does not excuse it — measured, both spellings.
+        catalog::pg_catalog::refuse_write(name)?;
         let table = match existing_relation(executor, txn, name)? {
             Some(catalog::Relation::Table { table_id }) => executor.table_by_id(txn, table_id)?,
             // A name that is there but is an index is *not* "does not exist": PostgreSQL says
@@ -253,6 +255,7 @@ pub(super) fn create_index(
     txn: &mut dyn Txn,
     create: &CreateIndex,
 ) -> Result<Outcome> {
+    catalog::pg_catalog::refuse_write(&create.table)?;
     let table = executor.require_table(txn, &create.table)?;
     // A name the user chose is theirs, and a collision with it is a `42P07`.
     let name = if let Some(given) = &create.name {
@@ -433,6 +436,7 @@ pub(super) fn alter_table(
     alter: &AlterTable,
 ) -> Result<Outcome> {
     let done = Ok(Outcome::done("ALTER TABLE"));
+    catalog::pg_catalog::refuse_write(&alter.name)?;
     let table = match existing_relation(executor, txn, &alter.name)? {
         Some(catalog::Relation::Table { table_id }) => executor.table_by_id(txn, table_id)?,
         // An index is a relation, so PostgreSQL does not say "is not a table" here -- it says the
@@ -569,6 +573,15 @@ fn existing_relation(
     txn: &dyn Txn,
     name: &str,
 ) -> Result<Option<catalog::Relation>> {
+    // A `pg_catalog` relation is a relation, and every verb that asks this question should see one
+    // — so a `DROP INDEX pg_type` is `42809 "pg_type" is not an index` and a `CREATE TABLE
+    // pg_type` is `42P07`, which is what a real server answers for the qualified spelling.
+    // Refusing here instead would answer `42501` for both, and only one of them is a write.
+    if let Some(view) = catalog::pg_catalog::view(name) {
+        return Ok(Some(catalog::Relation::Table {
+            table_id: view.table_def().id,
+        }));
+    }
     executor.catalog_view(txn)?.relation(name)
 }
 
