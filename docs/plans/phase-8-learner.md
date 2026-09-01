@@ -483,3 +483,97 @@ over `peers` rather than over voters:
   same tag bytes**, defined twice. ADR 0030 makes converging them possible and deliberately does
   not do it.
 
+---
+
+# §wiring — the SQL node's PD connection (lane a5-wiring)
+
+Three finished features are dormant in the real binary for one reason: **the SQL node has no PD
+connection.** The schema lease is never fetched, so fail-closed never arms; the re-driver reads its
+interval from the lease and so ticks against nothing; and `ALTER TABLE ... SET (columnar_replicas
+= N)` writes a catalog record PD never hears about, so no columnar learner is ever placed. Nothing
+below this line is a new feature. It is one cable and the proof that the circuit closes.
+
+## Where the PD client lives, and why not in `esker-client`
+
+`esker-store`'s `PdClient` trait carries the five **store** methods — bootstrap, alloc_id,
+get_region, and the two heartbeats — and neither `SchemaLease` nor `ReportColumnar`. That is
+correct and this lane does not touch it: those two are a *SQL node's* methods, and a store has no
+business holding a lease it does not use.
+
+So the SQL node needs a connection of its own, and it goes in **`esker-sql`**:
+
+* it speaks exactly two methods, both of which only a SQL node sends — putting them in
+  `esker-client` would make every raw-KV client carry a vocabulary it has no use for;
+* `esker-sql` already depends on `esker-proto`, so it costs no new edge;
+* `esker-client` stays untouched, which is the smaller blast radius on a shared tree.
+
+If a second consumer ever appears the type moves down; one consumer is not an abstraction.
+
+**`BlockingTransport`, not the async one.** The lease refresher is a thread, like the re-driver
+beside it, for the reason that file already gives: a refresh sleeps between passes and would hold
+a runtime worker for the whole of one. `BlockingTransport` is built for exactly that caller, and
+every call it makes carries a deadline — *"a blocking call with no deadline is a hang"*, which this
+codebase has already paid for once.
+
+## `--pd <addr>`, and absent means absent
+
+A new flag, and **nothing changes without it**. No default address, no discovery, no fallback. A
+node started without `--pd` behaves exactly as it does today: no lease, `schema_step_interval()`
+returns `None`, the re-driver logs that it has no interval and waits, and writes are unrestricted.
+Every existing test runs without PD and must keep passing untouched — that is the check that this
+flag is genuinely additive.
+
+With it, the node builds the PD connection, fetches a lease before serving, and starts a refresher
+thread.
+
+## Refresh cadence and failure semantics — read, not invented
+
+The numbers are PD's and the rules were argued in 6e/ADR 0028. This lane wires them; it does not
+re-derive them.
+
+* `PdResp::SchemaLease` carries `lease_ms`, `step_interval_ms` and `removal_extra_ms` **together**,
+  because PD computes the interval *from* the lease. A node holding one without the other holds
+  half an arithmetic, so the source answers `None` to both or neither.
+* **Refresh well inside the lease**, so that a single lost round trip does not expire it. The
+  cadence is a fraction of `lease_ms` and is derived from PD's number rather than configured — a
+  tunable here is a way to be wrong independently of the bound it exists to respect.
+* **Fail closed.** A source that cannot renew answers `None` to `remaining()`, and the backend
+  refuses **writes** with 6e's typed error. Reads are untouched: a reader's snapshot already agrees
+  with the rows it can see, so gating reads adds stalls and closes no hole (ADR 0020 as amended).
+  That asymmetry is the design's, not a convenience.
+* The `SchemaLease` trait stays the seam. It exists so *"the test that proves fail closed has to be
+  able to stop answering"* — so the real source implements it and the lapse test drives it by
+  stopping PD, not by swapping in a fake.
+
+## `ReportColumnar`: a full assertion, twice
+
+Per §wire's handover, and neither half is optional:
+
+1. **After the `ALTER` commits** (`exec/ddl.rs`), scan `catalog::columnar_range(tenant)`, build one
+   `ColumnarWish` per listed table from `esker_keys::row::table_row_range(tenant, id)` and its
+   count, and send them all. **The scan is the message** — it is a full assertion, never a delta,
+   so a report is complete by construction and a lost one costs nothing.
+2. **On every lease refresh**, re-send the same. That is the anti-entropy sweep the design assumes,
+   and it is why there is no acknowledgement protocol: a report lost to a PD restart is repaired by
+   the next refresh rather than by a retry queue that would need its own durability.
+
+Setting the flag to `0` clears the record, so the next assertion simply omits that table — removal
+falls out of the full-assertion shape rather than needing a message of its own.
+
+## The joint gate, which is the wave's definition of done
+
+A real cluster, not a harness: `esker cluster start`, a SQL node with `--pd`, `CREATE TABLE`, rows,
+`ALTER TABLE t SET (columnar_replicas = 1)`, then **wait for PD to schedule and the store to build
+the learner**. Then the differential — fragment against row scan at one `ts` — run against a
+learner that a DDL statement caused to exist. Then the flag to `0` and the learner retires; then
+`kill -9` mid-catch-up and it recovers.
+
+Everything it exercises is already tested in isolation. What it proves is that the pieces are
+*connected*, which is the one thing no unit test in this phase can say.
+
+## Not doing
+
+No routing table from PD (`connect`'s `TODO(phase-6a)` stands — this lane adds a PD connection for
+the lease and the report, not a region resolver). No changes to `esker-store`, `esker-columnar`,
+`esker-pd`, `esker-proto`: all of it exists, is tested, and is forbidden to this lane. A defect
+found there is reported with evidence, not fixed.
