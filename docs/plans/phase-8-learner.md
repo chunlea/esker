@@ -800,3 +800,88 @@ It needs the blocker above fixed, and then:
    (`region.rs` reads the published record from the catalog the region carries), so a table whose
    rows live in a region that does not cover `'m'` still has no copy at all — the third thing this
    milestone owes.
+
+---
+
+# §close — wave A closed (lane a6-close, 2026-09-01)
+
+The three things the section above left are done, and the joint gate runs with **nothing
+`#[ignore]`d**. What follows is what each one turned out to be, because in two of the three the
+diagnosis in that section was the symptom rather than the cause.
+
+## 1. The empty learner was a snapshot carrying one column family out of three
+
+The blocker above reads the trace as a race: the ask in `Store::receive_raft`'s unknown-region path
+against the conf change that placed the peer. That race is real and it is in the code's own words —
+`stage_conf_change` says `applied_conf` is "a different value from the core's membership in force,
+which moved when the entry was *appended*" — so a leader can and does refuse the first ask. It also
+heals on the next append, and it is not why the learner was empty.
+
+The cause is that `snapshot::read_pairs` walked `cf::DEFAULT` under the `'r'` namespace and nothing
+else, while a region's data lives in `default`, `lock` and `write`, and everything above RawKV is
+transactional and therefore under `'x'`. A snapshot carried a region's RawKV pairs and dropped
+every Percolator record in it. [ADR 0032](../adr/0032-a-snapshot-carries-every-column-family.md) is
+the decision; format version 2 names a column family per chunk and ships engine keys.
+
+**Reproduced from the recorded trace before anything was changed**, in 0.7 s and with no cluster,
+as `esker-store/tests/snapshot.rs::a_region_arrives_with_its_transactional_records` — and then, in
+the trace's own shape, `a_placed_columnar_learner_holds_what_the_leader_holds`, which failed with
+the learner at the leader's applied index holding only the versions committed *after* it was
+placed. That is the "two versions where the leader had ten" of the section above, exactly.
+
+The reason it was found here and not in phase 4 is worth keeping: a row learner is caught up by the
+log when the leader has not compacted, and when it is caught up by snapshot instead, promotion
+waits on `matched` — a number the transfer moves whether or not the bytes were complete. Nothing
+reads its `write` records until it leads. A columnar learner is never promoted and its whole job is
+to read those records. The user-facing shape needs no columnar anything, and now has its own test:
+`a_voter_caught_up_by_snapshot_can_lead_and_answer_an_old_row`, which on version 1 answers
+`Get { value: None }` for a committed row, from a leader. The ADR carries the greps showing why no
+acceptance suite could have caught it.
+
+## 2. Balance's third instance, and a fourth beside it
+
+`balance::region_balance` counts voters now. The shed decision was the third instance of the family
+after `urgency_for` and `repair_for`; `busiest`, in the same function's second half, was a fourth —
+that rule can only *move* a voter, so measuring the imbalance over a columnar learner it may not
+touch starts a move that does not relieve the store that triggered it. Confirmed both ways in a
+detached worktree at HEAD (red at 2 voters of 3, green at 3), and then on the real binaries: six
+operators, no `RemovePeer`, in `docs/bench/columnar-learner.md`.
+
+## 3. The differential passed, then the widened corpus broke it
+
+`the_learner_answers_fragments_that_agree_with_a_row_scan` passed as written once the snapshot fix
+landed. Widening the corpus to the case §store named — `ADD COLUMN region text NOT NULL DEFAULT
+'unknown'` over rows written before it — refused instead:
+
+```text
+Refused { reason: Unsupported,
+          detail: "a run of 6 columns cannot be read as 5: it was written under a newer schema" }
+```
+
+`Store::serve_fragment` passed `widening: None`, so `evaluate_merged` took its target schema from
+`readers[0]` — the *oldest* run. After an `ADD COLUMN` the runs are a mix of widths by design, and
+the two ways the oldest run is the wrong target are the two halves of one defect: a wider run is
+refused outright, and had the widest sorted first, the older ones would have been padded with NULL
+where the row store pads with the column's DEFAULT — the silent disagreement.
+
+The mechanism was already built **and already tested**: `columnar_differential.rs`'s widening test
+constructed the `Widening` by hand, `Value::Int8(42)` and all, and passed. That is the same shape
+as "`ColumnarApply::open` is called from no path in `esker-store/src`" one unit earlier — a module
+that is right, and a caller that never uses it. The test now takes its widening from
+`ColumnarApply::missing()`, which is what the store passes.
+
+## What wave A does not have, for whoever picks up B
+
+* **Nothing on a real cluster can ask a fragment.** No `esker` subcommand sends one and the planner
+  does not choose a columnar replica, so the differential's evidence is the in-process gate — real
+  PD, four real stores over real sockets, the real SQL node wiring, one process. That is the honest
+  boundary of what has been shown end to end.
+* **The schema push for a region that does not cover `'m'`** is still absent, as §store said:
+  `region.rs` reads the published record from the catalog the region carries, so a table whose rows
+  live elsewhere has no copy at all. The gate is single-region and does not reach it.
+* **`esker cluster start --nodes N --pd` starts its stores before the driver is listening** and
+  three of four die with "connection refused", silently, because the supervisor inherits their
+  stdio and then blocks. `esker-cli` is another lane's; the transcript is in the bench doc.
+* **The `receive_raft` ask still races the conf change.** It costs a retry and heals, and it is now
+  the only part of the original blocker that is left. Worth fixing when someone is in `server.rs`
+  with a reason: the sender could check the *core's* membership rather than the applied record.

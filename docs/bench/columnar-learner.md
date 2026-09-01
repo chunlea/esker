@@ -238,12 +238,134 @@ failure from losing quorum, and every other operator for that region — includi
 next `ALTER` asked for — waited behind it.
 
 Reproduced in under three seconds, in process, as
-`esker-sql/tests/joint_gate.rs::a_columnar_learner_does_not_cost_the_region_a_voter` — `#[ignore]`d
-because it fails, and left red on purpose for whoever owns `esker-pd`:
-
-```text
-cargo test -p esker-sql --test joint_gate -- --ignored --test-threads=1
-```
+`esker-sql/tests/joint_gate.rs::a_columnar_learner_does_not_cost_the_region_a_voter` — left red on
+purpose for whoever owns `esker-pd`, and **fixed in 571b2b0**: `balance::region_balance` counts
+voters now, on both the shed decision and the "is this region worth moving" one.
 
 It is why PD's own columnar tests run with `balance: false`, and why the gate beside it does too:
-the harness that would have caught this had the switch turned off.
+the harness that would have caught this had the switch turned off. Those switches stay — a balance
+move arriving in the same slot makes "PD asked for nothing" and "PD asked for something else"
+indistinguishable, which is the assertion half those tests rest on — and the case they hid has its
+own test beside them, with balance on.
+
+# The same run, after wave A closed — 2026-09-01
+
+Same commands, same four nodes, one region, one `ALTER`. What is different is everything the
+operator history does *not* say:
+
+```text
+$ esker region ls --pd 127.0.0.1:21264
+  region       epoch  peers
+       1     6,1      *2@127.0.0.1:21263 3@127.0.0.1:21260 4@127.0.0.1:21262 5C@127.0.0.1:21261
+
+$ esker pd inspect --data-dir .../pd
+     1  [, +inf)  epoch (6, 1)  leader 2  term 1  applied 16
+        peer 2 on store 4 (Voter)
+        peer 3 on store 1 (Voter)
+        peer 4 on store 3 (Voter)
+        peer 5 on store 2 (ColumnarLearner)
+
+operator history (6)
+   1788250747608 ms  region 1  AddPeer     issued     store 1  peer 3
+   1788250748010 ms  region 1  AddPeer     done       store 1  peer 3
+   1788250808010 ms  region 1  AddPeer     issued     store 3  peer 4
+   1788250808809 ms  region 1  AddPeer     done       store 3  peer 4
+   1788250868811 ms  region 1  AddLearner  issued     store 2  peer 5
+   1788250868911 ms  region 1  AddLearner  done       store 2  peer 5
+```
+
+**Six operators and not one `RemovePeer`.** Three voters and a columnar learner, which is what was
+asked for; the run above shed a voter in the millisecond after `AddLearner done` and spent five
+minutes replacing it. `PdOptions::balance` is on by default, so `esker pd serve` is balancing
+throughout — this is the rule running and declining to act, not the rule switched off.
+
+## What the learner received, which is the part that was empty
+
+The blocker `docs/plans/phase-8-learner.md` §store left — *a PD-placed columnar learner never
+receives the region's existing data* — is a snapshot that carried one column family out of three
+([ADR 0032](../adr/0032-a-snapshot-carries-every-column-family.md)). The learner's own write-ahead
+log is where that shows, because a store this size has flushed nothing yet:
+
+```text
+$ esker wal-dump .../node-2/000005.wal
+  1            52      611  seqno 2        9 entries
+         cf=2   Put  seqno 2   "xmsqll   ÿ…"                       (15 value bytes)
+         cf=2   Put  seqno 3   "xmsqln …reaÿdings …"                  (15 value bytes)
+         cf=2   Put  seqno 4   "xmsqln …reaÿdings_pkÿey …"         (15 value bytes)
+         cf=2   Put  seqno 5   "xmsqls …"                                   (13 value bytes)
+         cf=2   Put  seqno 6   "xmsqlt …"                                   (70 value bytes)
+         cf=2   Put  seqno 7   "xmsqlv …"                                   (13 value bytes)
+         cf=2   Put  seqno 8   "xt …r     ÿ …" (30 value bytes)
+         cf=2   Put  seqno 9   "xt …r     ÿ …" (30 value bytes)
+         cf=2   Put  seqno 10  "xt …r     ÿ …" (29 value bytes)
+  2           670       82  seqno 11       3 entries
+         cf=3   Put     seqno 11  "m       "          (19 value bytes)
+         cf=3   Put     seqno 12  "s       "          (13 value bytes)
+         cf=3   Delete  seqno 13  "p       "
+```
+
+`cf=2` is `write`; the keys are the `'x'` namespace. Six catalog records and the three rows
+`readings` holds, arriving in one batch — the snapshot — followed by the adopt: the region record,
+the raft state, and the deletion of the pending-snapshot marker, which are the last two of the
+four durable steps. **Under version 1 of the stream this file would have had nine fewer records
+and the learner would have adopted an empty region**, because the walk was `default` under `'r'`
+and this region has nothing in `'r'` at all.
+
+## What a fragment answers, and why that number is not here
+
+Nothing on a real cluster can ask one yet: no `esker` subcommand sends a `Fragment`, and the SQL
+planner does not choose a columnar replica — that is a later phase, and it is the honest gap in
+this transcript. The differential that closes wave A therefore runs in
+`esker-sql/tests/joint_gate.rs::the_learner_answers_fragments_that_agree_with_a_row_scan`, which is
+a real `esker-pd`, four real stores over real sockets and the real SQL node wiring in one process:
+
+```text
+running 5 tests
+test a_columnar_learner_does_not_cost_the_region_a_voter ... ok
+test a_fragment_is_refused_by_a_voter_and_by_a_learner_that_is_behind ... ok
+test a_learner_that_dies_comes_back_to_the_same_job ... ok
+test an_alter_places_a_columnar_replica_and_clearing_it_takes_it_back ... ok
+test the_learner_answers_fragments_that_agree_with_a_row_scan ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.35s
+```
+
+Nothing `#[ignore]`d, which is the sentence wave A was missing. The fragment resolves visibility in
+`esker-columnar`'s evaluator over the learner's runs; the reference reads the same instant through
+Percolator's `write` records on a voter and decodes with the row codec, and the two agree over a
+corpus with an update, a delete, and an `ADD COLUMN region text NOT NULL DEFAULT 'unknown'` with
+rows on both sides of it — the case that reads the default row-side and `NULL` columnar-side if
+anything in the path forgets the column's missing value. Something did: the fragment service passed
+no widening at all, so it read every run as the *oldest* one's schema and refused the wider ones
+outright (`bfab24f`).
+
+## One more thing the real binaries said
+
+`esker cluster start --nodes 4 --pd` started its placement driver and then spawned all four stores
+without waiting for it to bind. Three of them exited immediately:
+
+```text
+esker server: opening …/node-2: request not sent: connecting to 127.0.0.1:21264:
+              Connection refused (os error 61)
+esker pd: listening on 127.0.0.1:21264 — no cluster yet, waiting for a store to bootstrap one
+esker server: esker server: opening …/node-3: request not sent: connecting to 127.0.0.1:21264:
+              Connection refused (os error 61)opening …/node-1: … Connection refused (os error 61)
+esker server: store 4 listening on 127.0.0.1:21263
+```
+
+Three "connection refused" lines *above* the driver's own "listening", and the fourth node — the
+last one spawned — through. `cluster.rs`'s comment says it two lines above the loop: *"The driver
+first, because every store below is about to ask it whether to bootstrap. A store whose PD is not
+up yet fails to open"*. Starting the driver first is not the same as waiting for it.
+
+None of it is visible while it happens. The children inherit the supervisor's stdio and the
+supervisor then blocks in `wait_for_interrupt`, so the announcement ("4 nodes started", with four
+pids) is printed and the failures behind it are not flushed until the whole thing is stopped — and
+two of them interleave mid-line, as the third line above shows. What is left running is one store,
+which registers, bootstraps region 1 alone and heartbeats happily: a cluster that looks up and is a
+quarter of one. Started by hand with a second between the driver and the stores, the same binaries
+formed the cluster above in under a minute.
+
+Not fixed here: `esker-cli` is another lane's. Recorded because a smoke command that silently
+starts one node out of four is worse than one that fails, and because this is the second time the
+harness was the thing that was wrong.
