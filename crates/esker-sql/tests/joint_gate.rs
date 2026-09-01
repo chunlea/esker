@@ -493,20 +493,20 @@ async fn an_alter_places_a_columnar_replica_and_clearing_it_takes_it_back() {
 
     tokio::task::block_in_place(|| {
         let mut session = gate.session();
-        session
-            .run("CREATE TABLE t (id int8 PRIMARY KEY, name text)")
-            .unwrap();
-        session
-            .run("INSERT INTO t VALUES (1, 'ada'), (2, 'grace'), (3, 'edsger')")
-            .unwrap();
+        settle(
+            &mut session,
+            "CREATE TABLE t (id int8 PRIMARY KEY, name text)",
+        );
+        settle(
+            &mut session,
+            "INSERT INTO t VALUES (1, 'ada'), (2, 'grace'), (3, 'edsger')",
+        );
         assert!(
             gate.columnar_learners().is_empty(),
             "nothing has asked for a columnar copy yet",
         );
 
-        session
-            .run("ALTER TABLE t SET (columnar_replicas = 1)")
-            .unwrap();
+        settle(&mut session, "ALTER TABLE t SET (columnar_replicas = 1)");
     });
 
     // PD heard it, as a key range and not as a table id: a range is PD's own vocabulary, and it
@@ -565,9 +565,10 @@ async fn an_alter_places_a_columnar_replica_and_clearing_it_takes_it_back() {
     // The flag back to zero: the next assertion simply omits the table, and removal falls out of
     // the full-assertion shape rather than needing a message of its own.
     tokio::task::block_in_place(|| {
-        gate.session()
-            .run("ALTER TABLE t SET (columnar_replicas = 0)")
-            .unwrap();
+        settle(
+            &mut gate.session(),
+            "ALTER TABLE t SET (columnar_replicas = 0)",
+        );
     });
     assert!(
         gate.pd.columnar_wishes().is_empty(),
@@ -615,37 +616,36 @@ async fn the_learner_answers_fragments_that_agree_with_a_row_scan() {
 
     tokio::task::block_in_place(|| {
         let mut session = gate.session();
-        session
-            .run("CREATE TABLE t (id int8 PRIMARY KEY, name text)")
-            .unwrap();
-        session
-            .run("INSERT INTO t VALUES (1, 'ada'), (2, 'grace'), (3, 'edsger'), (4, 'barbara')")
-            .unwrap();
-        session
-            .run("ALTER TABLE t SET (columnar_replicas = 1)")
-            .unwrap();
+        settle(
+            &mut session,
+            "CREATE TABLE t (id int8 PRIMARY KEY, name text)",
+        );
+        settle(
+            &mut session,
+            "INSERT INTO t VALUES (1, 'ada'), (2, 'grace'), (3, 'edsger'), (4, 'barbara')",
+        );
+        settle(&mut session, "ALTER TABLE t SET (columnar_replicas = 1)");
         // After the flag, so the copy has history to convert *and* a stream to follow.
-        session
-            .run("UPDATE t SET name = 'ada lovelace' WHERE id = 1")
-            .unwrap();
-        session.run("DELETE FROM t WHERE id = 3").unwrap();
-        session
-            .run("INSERT INTO t VALUES (5, 'grace hopper')")
-            .unwrap();
+        settle(
+            &mut session,
+            "UPDATE t SET name = 'ada lovelace' WHERE id = 1",
+        );
+        settle(&mut session, "DELETE FROM t WHERE id = 3");
+        settle(&mut session, "INSERT INTO t VALUES (5, 'grace hopper')");
         // The column that was not there when rows 1, 2, 4 and 5 were written. Nothing is
         // rewritten by it — that is the feature — so what those rows read for it comes from the
         // catalog rather than from their bytes.
-        session
-            .run("ALTER TABLE t ADD COLUMN region text NOT NULL DEFAULT 'unknown'")
-            .unwrap();
+        settle(
+            &mut session,
+            "ALTER TABLE t ADD COLUMN region text NOT NULL DEFAULT 'unknown'",
+        );
         // One row born at the new width, and one older row rewritten to it, so the copy holds all
         // three shapes at once.
-        session
-            .run("INSERT INTO t VALUES (6, 'katherine', 'west')")
-            .unwrap();
-        session
-            .run("UPDATE t SET region = 'east' WHERE id = 2")
-            .unwrap();
+        settle(
+            &mut session,
+            "INSERT INTO t VALUES (6, 'katherine', 'west')",
+        );
+        settle(&mut session, "UPDATE t SET region = 'east' WHERE id = 2");
     });
 
     wait_for("PD to place a columnar learner", 60, || {
@@ -710,13 +710,12 @@ async fn a_fragment_is_refused_by_a_voter_and_by_a_learner_that_is_behind() {
     let gate = Gate::start().await;
     tokio::task::block_in_place(|| {
         let mut session = gate.session();
-        session
-            .run("CREATE TABLE t (id int8 PRIMARY KEY, name text)")
-            .unwrap();
-        session.run("INSERT INTO t VALUES (1, 'ada')").unwrap();
-        session
-            .run("ALTER TABLE t SET (columnar_replicas = 1)")
-            .unwrap();
+        settle(
+            &mut session,
+            "CREATE TABLE t (id int8 PRIMARY KEY, name text)",
+        );
+        settle(&mut session, "INSERT INTO t VALUES (1, 'ada')");
+        settle(&mut session, "ALTER TABLE t SET (columnar_replicas = 1)");
     });
     wait_for("PD to place a columnar learner", 60, || {
         gate.columnar_learners().len() == 1
@@ -797,13 +796,12 @@ async fn a_learner_that_dies_comes_back_to_the_same_job() {
     let mut gate = Gate::start().await;
     tokio::task::block_in_place(|| {
         let mut session = gate.session();
-        session
-            .run("CREATE TABLE t (id int8 PRIMARY KEY, name text)")
-            .unwrap();
-        session.run("INSERT INTO t VALUES (1, 'ada')").unwrap();
-        session
-            .run("ALTER TABLE t SET (columnar_replicas = 1)")
-            .unwrap();
+        settle(
+            &mut session,
+            "CREATE TABLE t (id int8 PRIMARY KEY, name text)",
+        );
+        settle(&mut session, "INSERT INTO t VALUES (1, 'ada')");
+        settle(&mut session, "ALTER TABLE t SET (columnar_replicas = 1)");
     });
     wait_for("PD to place a columnar learner", 60, || {
         gate.columnar_learners().len() == 1
@@ -837,9 +835,10 @@ async fn a_learner_that_dies_comes_back_to_the_same_job() {
     // The cluster carries on: a columnar learner is not a voter, so losing one costs the region
     // no quorum and the writes below are unaffected by its absence.
     tokio::task::block_in_place(|| {
-        gate.session()
-            .run("INSERT INTO t VALUES (2, 'grace'), (3, 'edsger')")
-            .unwrap();
+        settle(
+            &mut gate.session(),
+            "INSERT INTO t VALUES (2, 'grace'), (3, 'edsger')",
+        );
     });
 
     // And back, from its own directory, on its own address.
@@ -878,14 +877,64 @@ async fn a_learner_that_dies_comes_back_to_the_same_job() {
     gate.stop().await;
 }
 
-/// A columnar learner must not cost the region a voter — and today it does.
+/// Runs one of this file's statements, retrying an answer that says the outcome is genuinely
+/// unknown.
 ///
-/// **This test is `ignore`d because it fails, and it fails on a defect in `esker-pd` that this
-/// lane is not allowed to fix.** It is here rather than in a report because a red test is the
-/// fastest thing to hand across a lane boundary: un-`ignore` it, and it either passes or it says
-/// exactly what is still wrong.
+/// **Every write in this file goes through here**, because leadership moves under all five tests
+/// and for three different reasons: `Balance::TransferLeader` moves it by design in the balancing
+/// one, another kills a store outright, and a saturated box elects on its own. A write proposed
+/// into a log whose leader then steps down is answered `OutcomeUnknown` — the honest answer, and
+/// one the **client** may not turn into a retry on the caller's behalf, because a write that
+/// *may* have applied is not a write that may be repeated (`esker_store`'s pending-proposal rule).
 ///
-/// `balance::region_balance` asks `region.peers.len() > cluster.target_replicas`, over **every**
+/// A single writer of these particular statements may, which is the whole argument for this
+/// function and the reason it is not a general helper. Every statement here is idempotent under a
+/// second apply: `CREATE TABLE` answers `DuplicateTable`, a single-row `INSERT` answers
+/// `UniqueViolation`, `ADD COLUMN` answers `DuplicateColumn`, and the `UPDATE`s, the `DELETE` and
+/// the `ALTER ... SET` write the same value again. Each of those means the ambiguous attempt had
+/// in fact applied; anything else fails the test where it stands.
+///
+/// Found by `cargo test --workspace` rather than by a run of this file: alone it passes, and under
+/// the whole suite the box is saturated enough for a transfer and a statement to land together.
+/// Which is the shape worth remembering — a one-shot `unwrap` on a write makes "leadership does
+/// not move" a silent precondition, and the tests it is most false for are the ones about
+/// leadership moving.
+fn settle(session: &mut Session, sql: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match session.run(sql) {
+            Ok(_) => return,
+            Err(
+                esker_sql::SqlError::DuplicateTable(_)
+                | esker_sql::SqlError::DuplicateColumn(_)
+                | esker_sql::SqlError::DuplicateColumnInRelation { .. }
+                | esker_sql::SqlError::UniqueViolation { .. },
+            ) => return,
+            // A retry can collide with **its own** first attempt: an ambiguous write left a
+            // Percolator lock behind, and until the transaction that owns it resolves — by
+            // committing, or by its TTL expiring — a second attempt at the same rows cannot
+            // clear it and says so. Waiting is the answer, and it is the same answer a client
+            // gives a write conflict.
+            Err(
+                error @ (esker_sql::SqlError::OutcomeUnknown(_)
+                | esker_sql::SqlError::StoreUnavailable(_)
+                | esker_sql::SqlError::SerializationFailure { .. }),
+            ) => {
+                assert!(Instant::now() < deadline, "`{sql}` never settled: {error}");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => panic!("`{sql}`: {error}"),
+        }
+    }
+}
+
+/// A columnar learner must not cost the region a voter.
+///
+/// Handed across a lane boundary as a **red test** rather than a report — un-`ignore` it and it
+/// either passes or says exactly what is still wrong — and green since `571b2b0`. The only test
+/// here that runs with PD's balancer on, which is what it is for.
+///
+/// `balance::region_balance` asked `region.peers.len() > cluster.target_replicas`, over **every**
 /// peer. A healthy three-voter region that gains a columnar learner is four peers against a
 /// target of three, so balance sheds "the replica on the busiest store" — a voter — and repair
 /// then has to put one back. That is the third instance of the family `wy-c2` named at the end of
@@ -916,13 +965,12 @@ async fn a_columnar_learner_does_not_cost_the_region_a_voter() {
     let gate = Gate::start_balancing().await;
     tokio::task::block_in_place(|| {
         let mut session = gate.session();
-        session
-            .run("CREATE TABLE t (id int8 PRIMARY KEY, name text)")
-            .unwrap();
-        session.run("INSERT INTO t VALUES (1, 'ada')").unwrap();
-        session
-            .run("ALTER TABLE t SET (columnar_replicas = 1)")
-            .unwrap();
+        settle(
+            &mut session,
+            "CREATE TABLE t (id int8 PRIMARY KEY, name text)",
+        );
+        settle(&mut session, "INSERT INTO t VALUES (1, 'ada')");
+        settle(&mut session, "ALTER TABLE t SET (columnar_replicas = 1)");
     });
     wait_for("PD to place a columnar learner", 60, || {
         gate.columnar_learners().len() == 1
