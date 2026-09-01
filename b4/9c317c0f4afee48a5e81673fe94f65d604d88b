@@ -1,0 +1,33 @@
+crates/esker-columnar/src/lib.rs
+  s_dc640bf0df4adb::t_951046a7392996 72
+crates/esker-columnar/src/scan.rs
+  s_dc640bf0df4adb::t_8f98c03cb3f4bc 45,105,107-121,145,151-159,386-392,395
+crates/esker-columnar/src/scan/merged.rs
+  s_dc640bf0df4adb::t_83741fd718f153 12,17,23-28,31,37,44-63,68,74,82,93-94,98,101-113,123,126,138-147,156,183
+crates/esker-columnar/tests/differential.rs
+  s_dc640bf0df4adb::t_d5e3d6ba973385 332
+crates/esker-columnar/tests/scan.rs
+  s_dc640bf0df4adb::t_38aacb940e1e72 274
+crates/esker-columnar/tests/visibility.rs
+  s_dc640bf0df4adb::t_a7618b25a43b44 79
+crates/esker-store/src/columnar/mod.rs
+  s_dc640bf0df4adb::t_6c882311e8fe68 142-143,182-202,219,234-272
+crates/esker-store/tests/columnar_differential.rs
+  s_dc640bf0df4adb::t_29ce84f124e661 143,374,392-567
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "b49c317c0f4afee48a5e81673fe94f65d604d88b",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
