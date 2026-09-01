@@ -1,0 +1,29 @@
+crates/esker-columnar/tests/differential.proptest-regressions
+  s_b3f6a712d611c9::t_6748101c07252a 1-7
+crates/esker-store/src/apply.rs
+  s_b3f6a712d611c9::t_f2e68ab78c6ed5 389,393,397-409,423-430,448-450,454-455,714-757
+crates/esker-store/src/peer.rs
+  s_b3f6a712d611c9::t_c8bb79183e3c27 767,1034-1035,1344,1351,1721-1728
+crates/esker-store/src/server.rs
+  s_b3f6a712d611c9::t_a5d21c4174a2db 549,573-578,583-611,625,640,686-689,929-939,1007,2348-2352
+crates/esker-store/tests/bench_columnar.rs
+  s_b3f6a712d611c9::t_2d841b4d5c28f2 1-303
+crates/esker-store/tests/promotion.rs
+  s_b3f6a712d611c9::t_18ef912d719791 370-380
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "e74902234ce9e0cb50a148f0c9008e8c53a87450",
+  "prompts": {},
+  "sessions": {
+    "s_b3f6a712d611c9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "78adef9a-88ef-4c89-a340-f825de3d2ab7",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
