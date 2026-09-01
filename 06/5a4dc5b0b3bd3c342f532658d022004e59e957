@@ -1,0 +1,19 @@
+docs/plans/phase-8-learner.md
+  s_b3f6a712d611c9::t_bf38131066a9a6 486-579
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "065a4dc5b0b3bd3c342f532658d022004e59e957",
+  "prompts": {},
+  "sessions": {
+    "s_b3f6a712d611c9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "78adef9a-88ef-4c89-a340-f825de3d2ab7",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
