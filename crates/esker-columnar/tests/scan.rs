@@ -271,6 +271,7 @@ fn pruning_changes_nothing_but_the_work() {
             &fragment,
             &ScanOptions {
                 prune: false,
+                widening: None,
                 visibility: None,
             },
         )

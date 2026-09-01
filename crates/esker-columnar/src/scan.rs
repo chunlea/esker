@@ -42,7 +42,7 @@ use crate::fragment::expr::{CompareOp, Expr};
 use crate::fragment::{Fragment, Output};
 use crate::reader::Reader;
 use crate::stats::ColumnStats;
-use crate::value::{ColumnType, Value, ValueRef};
+use crate::value::{ColumnType, Schema, Value, ValueRef};
 
 pub use group::{GroupKey, Partial};
 
@@ -102,8 +102,23 @@ pub struct FragmentResult {
 /// No longer `Copy`: [`ScanOptions::visibility`] owns the key columns it names, and a scan's
 /// switches are set once per scan rather than in a loop, so cloning them costs nothing worth
 /// keeping a `Copy` bound for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ScanOptions {
+    /// Read older, narrower runs as if they had the columns a later `ADD COLUMN` gave the table.
+    ///
+    /// A run carries one schema in its footer, and a schema that widens mid-workload therefore
+    /// leaves runs of different widths behind it. Without this, slot 2 is `c` in a new run and
+    /// `__key` in an old one, and a merged read decodes one as the other.
+    ///
+    /// Columns are matched **by name**, because that is what survives an `ADD COLUMN` — it
+    /// appends, so positions of existing columns do not move, but relying on the position would
+    /// make this quietly wrong the day anything else changes. A column an older run does not have
+    /// reads its entry in [`Widening::missing`], which is PostgreSQL 11's `attmissingval` and the
+    /// same value [`esker_keys::row::decode_row`](https://docs.rs/) pads a narrower *row* with.
+    /// The rule is ADR 0019's, applied one level up: a narrower run against a wider schema pads,
+    /// a wider run against a narrower schema is corruption.
+    pub widening: Option<Widening>,
+
     /// Resolve MVCC versions while scanning, keeping the newest visible one per key.
     ///
     /// `None` scans every row in the file, which is what a run of one version per key wants and
@@ -127,9 +142,19 @@ impl Default for ScanOptions {
     fn default() -> Self {
         Self {
             prune: true,
+            widening: None,
             visibility: None,
         }
     }
+}
+
+/// The schema a merged read presents, and what an older run's absent columns read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Widening {
+    /// The columns every run is read as having, in the order a fragment's slots refer to them.
+    pub schema: Schema,
+    /// One per column of `schema`: what a run that predates that column reads instead.
+    pub missing: Vec<Value>,
 }
 
 /// Where matched rows go, and the only place a fragment's `output` is interpreted.
@@ -358,9 +383,16 @@ pub fn evaluate_merged(
     fragment: &Fragment,
     options: &ScanOptions,
 ) -> Result<FragmentResult> {
+    let uniform = match &options.widening {
+        // One schema for everybody: the fast path is safe.
+        None => true,
+        Some(widening) => readers
+            .iter()
+            .all(|reader| reader.schema() == &widening.schema),
+    };
     match readers {
         [] => Err(Error::InvalidArgument("a region with no runs".into())),
-        [only] => evaluate_with(only, fragment, options),
+        [only] if uniform => evaluate_with(only, fragment, options),
         _ => merged::evaluate(readers, fragment, options),
     }
 }

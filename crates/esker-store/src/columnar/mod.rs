@@ -139,6 +139,8 @@ pub struct ColumnarApply {
     ts_slot: usize,
     /// The table's own column count, which is what a decoder must return.
     data_columns: usize,
+    /// The schema version this target applies at; a push may only move it forward.
+    schema_version: u64,
     buffered: Vec<Row>,
     buffered_bytes: usize,
     /// The live runs, and the manifest that names them.
@@ -177,6 +179,27 @@ impl ColumnarApply {
             .map_err(|error| StoreError::Bootstrap(format!("{}: {error}", dir.display())))?;
         let runs = RunSet::open(Arc::clone(&fs), &dir)?;
 
+        let (schema, key_slot) = Self::run_schema(decoder.as_ref())?;
+        let ts_slot = key_slot + 1;
+
+        Ok(Self {
+            fs,
+            dir,
+            decoder,
+            options,
+            schema,
+            key_slot,
+            ts_slot,
+            data_columns: key_slot,
+            schema_version: 0,
+            buffered: Vec::new(),
+            buffered_bytes: 0,
+            runs,
+        })
+    }
+
+    /// The run schema for a decoder: its columns, then the three the target adds.
+    fn run_schema(decoder: &dyn RowDecoder) -> Result<(Schema, usize)> {
         let table = decoder.schema();
         for reserved in [KEY_COLUMN, COMMIT_TS_COLUMN, DELETED_COLUMN] {
             if table.columns().iter().any(|column| column.name == reserved) {
@@ -188,26 +211,12 @@ impl ColumnarApply {
         }
         let mut columns = table.columns().to_vec();
         let key_slot = columns.len();
-        let ts_slot = key_slot + 1;
         columns.push(ColumnDef::new(KEY_COLUMN, ColumnType::Bytea));
         columns.push(ColumnDef::new(COMMIT_TS_COLUMN, ColumnType::Int8));
         columns.push(ColumnDef::new(DELETED_COLUMN, ColumnType::Bool));
         let schema = Schema::new(columns)
             .map_err(|error| StoreError::Bootstrap(format!("the run schema: {error}")))?;
-
-        Ok(Self {
-            fs,
-            dir,
-            decoder,
-            options,
-            schema,
-            key_slot,
-            ts_slot,
-            data_columns: key_slot,
-            buffered: Vec::new(),
-            buffered_bytes: 0,
-            runs,
-        })
+        Ok((schema, key_slot))
     }
 
     /// The run schema, table columns first.
@@ -220,6 +229,45 @@ impl ColumnarApply {
     #[must_use]
     pub fn buffered(&self) -> usize {
         self.buffered.len()
+    }
+
+    /// Installs a newer schema, sealing what is buffered first.
+    ///
+    /// **Sealing first is the whole of it.** A run carries one schema in its footer, so a
+    /// memtable that spanned an `ADD COLUMN` would have to write rows of two widths into one
+    /// file — which the writer cannot do and should not learn to. Sealing at the boundary means
+    /// every run is internally consistent, and the widths differ *between* runs, which is a
+    /// reader's problem and a tractable one: a narrower run pads its absent columns exactly as
+    /// [`esker_keys::row::decode_row`] pads a narrower row, with the column's `missing` value.
+    ///
+    /// Refuses to go backwards. A push carrying an older `schema_version` than the one installed
+    /// is a delivery that overtook another, and installing it would decode later rows against an
+    /// earlier schema — the reverse of the case ADR 0019 calls corruption.
+    pub fn install_schema(&mut self, decoder: Arc<dyn RowDecoder>, version: u64) -> Result<()> {
+        if version < self.schema_version {
+            return Err(StoreError::Bootstrap(format!(
+                "a schema push at version {version} arrived after {}; refusing to go backwards",
+                self.schema_version
+            )));
+        }
+        if version == self.schema_version {
+            return Ok(());
+        }
+        self.seal()?;
+        let rebuilt = Self::run_schema(decoder.as_ref())?;
+        self.schema = rebuilt.0;
+        self.key_slot = rebuilt.1;
+        self.ts_slot = rebuilt.1 + 1;
+        self.data_columns = rebuilt.1;
+        self.decoder = decoder;
+        self.schema_version = version;
+        Ok(())
+    }
+
+    /// The schema version this target is applying at.
+    #[must_use]
+    pub fn schema_version(&self) -> u64 {
+        self.schema_version
     }
 
     /// Where `__key`, `__commit_ts` and `__deleted` landed, for a read that resolves versions.

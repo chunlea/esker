@@ -9,40 +9,69 @@
 //! the resolver in [`super::visible`] then works over the result unchanged.
 
 use crate::column::Column;
+use crate::error::Error;
 use crate::error::Result;
 use crate::fragment::Fragment;
 use crate::reader::Reader;
 use crate::scan::{ScanOptions, ScanStats, Sink, visible};
-use crate::value::{ColumnType, Value, ValueRef};
+use crate::value::{ColumnType, Schema, Value, ValueRef};
 
 /// One run's position in the merge, holding **one stripe** at a time.
 struct Cursor<'a> {
     reader: &'a Reader,
     types: Vec<ColumnType>,
+    /// For each **target** column, this run's column index, or `None` when the run predates it.
+    ///
+    /// Matched by name, so an `ADD COLUMN` that appends leaves every existing mapping alone and a
+    /// column an old run never had is filled from `missing` rather than read from whatever
+    /// happens to sit at that position — which, before this existed, was `__key`.
+    mapping: Vec<Option<usize>>,
     stripe: usize,
     stripes: usize,
+    /// Rows already widened into the target schema.
     rows: Vec<Vec<Value>>,
     at: usize,
 }
 
 impl<'a> Cursor<'a> {
-    fn open(reader: &'a Reader) -> Result<Self> {
+    fn open(reader: &'a Reader, target: &Schema, missing: &[Value]) -> Result<Self> {
         let types: Vec<ColumnType> = reader
             .schema()
             .columns()
             .iter()
             .map(|column| column.ty)
             .collect();
+        let mapping: Vec<Option<usize>> = target
+            .columns()
+            .iter()
+            .map(|wanted| {
+                reader
+                    .schema()
+                    .columns()
+                    .iter()
+                    .position(|have| have.name == wanted.name)
+            })
+            .collect();
+        // A run holding a column the target does not name is a run from a *newer* schema than the
+        // read was set up for. ADR 0019's rule: narrower pads, wider is corruption.
+        if reader.schema().len() > target.len() {
+            return Err(Error::InvalidArgument(format!(
+                "a run of {} columns cannot be read as {}: it was written under a newer schema",
+                reader.schema().len(),
+                target.len()
+            )));
+        }
         let stripes = reader.stripes().len();
         let mut cursor = Self {
             reader,
             types,
+            mapping,
             stripe: 0,
             stripes,
             rows: Vec::new(),
             at: 0,
         };
-        cursor.fill()?;
+        cursor.fill(missing)?;
         Ok(cursor)
     }
 
@@ -50,7 +79,7 @@ impl<'a> Cursor<'a> {
     ///
     /// Every column, not only the projected ones: the resolver reads the run's own key, timestamp
     /// and tombstone columns, and a fragment need not project a single one of them.
-    fn fill(&mut self) -> Result<()> {
+    fn fill(&mut self, missing: &[Value]) -> Result<()> {
         self.rows.clear();
         self.at = 0;
         while self.stripe < self.stripes {
@@ -61,14 +90,27 @@ impl<'a> Cursor<'a> {
             if rows == 0 {
                 continue;
             }
-            let mut decoded = vec![Vec::with_capacity(self.types.len()); rows];
+            // Read into this run's own shape first, then widen into the target's.
+            let mut native = vec![Vec::with_capacity(self.types.len()); rows];
             for (slot, column) in columns.iter().enumerate() {
                 let ty = self.types.get(slot).copied().unwrap_or(ColumnType::Int8);
                 for (row, value) in column.iter().enumerate() {
-                    decoded[row].push(value.to_value(ty)?);
+                    native[row].push(value.to_value(ty)?);
                 }
             }
-            self.rows = decoded;
+            self.rows = native
+                .into_iter()
+                .map(|row| {
+                    self.mapping
+                        .iter()
+                        .enumerate()
+                        .map(|(target, source)| match source {
+                            Some(index) => row.get(*index).cloned().unwrap_or(Value::Null),
+                            None => missing.get(target).cloned().unwrap_or(Value::Null),
+                        })
+                        .collect()
+                })
+                .collect();
             return Ok(());
         }
         Ok(())
@@ -78,10 +120,10 @@ impl<'a> Cursor<'a> {
         self.rows.get(self.at)
     }
 
-    fn advance(&mut self) -> Result<()> {
+    fn advance(&mut self, missing: &[Value]) -> Result<()> {
         self.at += 1;
         if self.at >= self.rows.len() {
-            self.fill()?;
+            self.fill(missing)?;
         }
         Ok(())
     }
@@ -93,7 +135,16 @@ pub(crate) fn evaluate(
     fragment: &Fragment,
     options: &ScanOptions,
 ) -> Result<crate::scan::FragmentResult> {
-    let slots = fragment.validate(readers[0].schema())?;
+    // The schema every run is read as having. Without a widening that is simply the first run's,
+    // which is what a region whose schema never changed has.
+    let owned = readers[0].schema().clone();
+    let (target, missing): (&Schema, &[Value]) = options
+        .widening
+        .as_ref()
+        .map_or((&owned, &[][..]), |widening| {
+            (&widening.schema, &widening.missing)
+        });
+    let slots = fragment.validate(target)?;
     let mut stats = ScanStats::default();
     let mut resolver = visible::Resolver::default();
     let mut sink = Sink::new(fragment, &slots);
@@ -102,7 +153,7 @@ pub(crate) fn evaluate(
     for reader in readers {
         stats.stripes_considered += reader.stripes().len() as u64;
         stats.stripes_read += reader.stripes().len() as u64;
-        cursors.push(Cursor::open(reader)?);
+        cursors.push(Cursor::open(reader, target, missing)?);
     }
 
     // Projection slots into file columns, so the sink sees the row the fragment asked for.
@@ -129,7 +180,7 @@ pub(crate) fn evaluate(
         }
         let Some(index) = best else { break };
         let row = cursors[index].peek().cloned().unwrap_or_default();
-        cursors[index].advance()?;
+        cursors[index].advance(missing)?;
         stats.rows_scanned += 1;
 
         if let Some(visibility) = &options.visibility {

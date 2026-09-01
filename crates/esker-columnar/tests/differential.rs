@@ -329,6 +329,7 @@ fn agree(
             fragment,
             &ScanOptions {
                 prune,
+                widening: None,
                 visibility: None,
             },
         )

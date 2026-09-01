@@ -76,6 +76,7 @@ fn visible_at(reader: &Reader, ts: i64, filter: Option<Expr>) -> Vec<(i64, Strin
         &fragment,
         &ScanOptions {
             prune: true,
+            widening: None,
             visibility: Some(visibility(ts)),
         },
     )

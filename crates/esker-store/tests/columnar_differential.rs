@@ -140,6 +140,7 @@ fn columnar(apply: &ColumnarApply, at: u64) -> BTreeMap<i64, String> {
         &fragment,
         &ScanOptions {
             prune: true,
+            widening: None,
             visibility: Some(Visibility {
                 key_columns: vec![2],
                 ts_column: 3,
@@ -370,6 +371,7 @@ fn count_at(apply: &ColumnarApply, at: u64) -> u64 {
         &fragment,
         &ScanOptions {
             prune: true,
+            widening: None,
             visibility: Some(Visibility {
                 key_columns: vec![2],
                 ts_column: 3,
@@ -385,5 +387,181 @@ fn count_at(apply: &ColumnarApply, at: u64) -> u64 {
             other => panic!("not a count: {other:?}"),
         },
         FragmentOutput::Rows(rows) => panic!("not groups: {rows:?}"),
+    }
+}
+
+/// A decoder of `id, name` plus `count` columns of `int8`, the last padding `missing`.
+#[derive(Debug)]
+struct WideningDecoder {
+    schema: Schema,
+    row: esker_keys::row::RowSchema,
+}
+
+impl WideningDecoder {
+    /// `version` 1 is `(id, name)`; version 2 adds `c int8 NOT NULL DEFAULT 42`.
+    fn at(version: u64) -> Arc<Self> {
+        let mut columns = vec![
+            ColumnDef::new("id", ColumnType::Int8),
+            ColumnDef::new("name", ColumnType::Text),
+        ];
+        let mut types = vec![
+            esker_keys::value::ColumnType::Int8,
+            esker_keys::value::ColumnType::Text,
+        ];
+        let mut missing: Vec<Option<esker_keys::value::Datum>> = vec![None, None];
+        if version >= 2 {
+            columns.push(ColumnDef::new("c", ColumnType::Int8));
+            types.push(esker_keys::value::ColumnType::Int8);
+            missing.push(Some(esker_keys::value::Datum::Int8(42)));
+        }
+        Arc::new(Self {
+            schema: Schema::new(columns).unwrap(),
+            row: esker_keys::row::RowSchema::new(types, missing),
+        })
+    }
+}
+
+impl RowDecoder for WideningDecoder {
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn decode(&self, _key: &[u8], value: Option<&[u8]>) -> Result<Vec<Value>> {
+        let Some(bytes) = value else {
+            return Ok(vec![Value::Null; self.schema.len()]);
+        };
+        let row = esker_keys::row::decode_row(&self.row, bytes)
+            .map_err(|error| esker_store::error::StoreError::Bootstrap(error.to_string()))?;
+        Ok(row
+            .iter()
+            .map(|datum| match datum {
+                esker_keys::value::Datum::Null => Value::Null,
+                esker_keys::value::Datum::Int8(int) => Value::Int8(*int),
+                esker_keys::value::Datum::Text(text) => Value::Text(text.clone()),
+                other => panic!("this table has no {other:?} columns"),
+            })
+            .collect())
+    }
+}
+
+/// Encodes a row of the given width, as the SQL layer would have written it at that version.
+fn row_at(version: u64, id: i64, name: &str) -> Vec<u8> {
+    let mut types = vec![
+        esker_keys::value::ColumnType::Int8,
+        esker_keys::value::ColumnType::Text,
+    ];
+    let mut values = vec![
+        esker_keys::value::Datum::Int8(id),
+        esker_keys::value::Datum::Text(name.to_string()),
+    ];
+    if version >= 2 {
+        types.push(esker_keys::value::ColumnType::Int8);
+        values.push(esker_keys::value::Datum::Int8(id * 100));
+    }
+    esker_keys::row::encode_row(&types, &values).unwrap()
+}
+
+/// **A schema widening in the middle of a workload, through the whole path.**
+///
+/// Rows written under version 1 are two columns wide; version 2 adds `c int8 NOT NULL DEFAULT 42`.
+/// A row predating the `ALTER` must read **42**, because that is what the row store reads for it
+/// (PostgreSQL 11's `attmissingval`, ADR 0019). The decoder's own regression proves it decodes;
+/// this proves it survives the *seal boundary*, the run-width difference and the merged read —
+/// which is where a columnar copy could still answer NULL while the decoder was perfectly correct.
+#[test]
+fn a_column_added_mid_workload_reads_its_default_for_the_rows_that_predate_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs: Arc<dyn FileSystem> = Arc::new(LocalFileSystem::new());
+    let mut apply = ColumnarApply::open(
+        Arc::clone(&fs),
+        dir.path(),
+        WideningDecoder::at(1),
+        ColumnarOptions::default(),
+    )
+    .unwrap();
+
+    // Version 1: two-column rows.
+    for id in 0..4i64 {
+        apply
+            .apply(&versioned_key(id, 10), Some(&row_at(1, id, "old")))
+            .unwrap();
+    }
+
+    // The ALTER lands: seal the v1 run, widen, keep applying.
+    apply.install_schema(WideningDecoder::at(2), 2).unwrap();
+    assert_eq!(apply.runs().live().len(), 1, "the widening did not seal");
+
+    for id in 4..8i64 {
+        apply
+            .apply(&versioned_key(id, 20), Some(&row_at(2, id, "new")))
+            .unwrap();
+    }
+    apply.seal().unwrap();
+    assert_eq!(apply.runs().live().len(), 2, "two widths, two runs");
+
+    // Read every row at a timestamp after both.
+    let fs = LocalFileSystem::new();
+    let runs = apply.runs();
+    let readers: Vec<Reader> = runs
+        .live()
+        .iter()
+        .map(|number| Reader::open(&fs, &runs.path_of(*number)).unwrap())
+        .collect();
+    let (key_slot, ts_slot, deleted_slot) = apply.visibility_slots();
+    let fragment = Fragment::scan(
+        TableRef {
+            tenant: 1,
+            table_id: 1,
+        },
+        vec![0, 2],
+    );
+    // The schema every run is read as having, and what the older, narrower one pads with. `42`
+    // for `c` is the column's `missing` value — the whole point of the test.
+    let widening = esker_columnar::Widening {
+        schema: apply.schema().clone(),
+        missing: vec![
+            Value::Null,
+            Value::Null,
+            Value::Int8(42),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ],
+    };
+    let result = evaluate_merged(
+        &readers,
+        &fragment,
+        &ScanOptions {
+            prune: true,
+            widening: Some(widening),
+            visibility: Some(Visibility {
+                key_columns: vec![key_slot],
+                ts_column: ts_slot,
+                deleted_column: deleted_slot,
+                ts: 30,
+            }),
+        },
+    )
+    .unwrap();
+    let FragmentOutput::Rows(rows) = result.output else {
+        panic!("not rows");
+    };
+
+    let mut seen: BTreeMap<i64, Value> = BTreeMap::new();
+    for row in rows {
+        let Value::Int8(id) = row[0] else {
+            panic!("not an id")
+        };
+        seen.insert(id, row[1].clone());
+    }
+    for id in 0..4i64 {
+        assert_eq!(
+            seen.get(&id),
+            Some(&Value::Int8(42)),
+            "row {id} predates the ALTER and must read the column's default"
+        );
+    }
+    for id in 4..8i64 {
+        assert_eq!(seen.get(&id), Some(&Value::Int8(id * 100)));
     }
 }
