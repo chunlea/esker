@@ -1205,13 +1205,19 @@ impl Store {
         let (chunks, mut chunk_rx) = tokio::sync::mpsc::channel::<Bytes>(1);
         let region = header.region.clone();
         let walk = tokio::task::spawn_blocking(move || {
-            snapshot::read_pairs(&db, &region, read, snapshot::CHUNK_TARGET_BYTES, |pairs| {
-                chunks
-                    .blocking_send(snapshot::encode_pairs(&pairs))
-                    .map_err(|_| ProtoError::Closed {
-                        detail: "the snapshot's reader has gone".to_owned(),
-                    })
-            })
+            snapshot::read_pairs(
+                &db,
+                &region,
+                read,
+                snapshot::CHUNK_TARGET_BYTES,
+                |cf_tag, pairs| {
+                    chunks
+                        .blocking_send(snapshot::encode_pairs(cf_tag, &pairs))
+                        .map_err(|_| ProtoError::Closed {
+                            detail: "the snapshot's reader has gone".to_owned(),
+                        })
+                },
+            )
         });
         let mut delivered = true;
         while let Some(chunk) = chunk_rx.recv().await {
@@ -1669,8 +1675,8 @@ impl Store {
             let chunk = chunk?;
             let db = Arc::clone(&self.db);
             blocking(move || {
-                let pairs = snapshot::decode_pairs(&chunk)?;
-                snapshot::stage_pairs(&db, &pairs)
+                let (cf_tag, pairs) = snapshot::decode_pairs(&chunk)?;
+                snapshot::stage_pairs(&db, cf_tag, &pairs)
             })
             .await?;
         }

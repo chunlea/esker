@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use esker_proto::{
     Epoch, Operator, PeerRole, RawKvReq, RawKvResp, Region, RequestHeader, Server, ServerHandle,
-    Service, TransportConfig,
+    Service, TransportConfig, TxnKvReq, TxnKvResp, TxnMutation,
 };
 use esker_store::pd::{FakePd, PdClient};
 use esker_store::server::RaftOptions;
@@ -168,6 +168,18 @@ fn key(n: u32) -> Bytes {
     Bytes::from(format!("k{n:05}"))
 }
 
+/// The `default` column family's tag in a snapshot chunk, which is where a `RawKV` pair goes.
+///
+/// The number rather than a name because the tag is the format's and the tests that use it are
+/// about the bytes: a snapshot's pairs chunk names its column family (`esker_store::snapshot`).
+const DEFAULT_CF: u8 = 1;
+
+/// The engine key a `RawKV` put of `user_key` writes: the `'r'` namespace, which a snapshot now
+/// carries as it finds it rather than stripping and re-adding.
+fn raw(user_key: &[u8]) -> Bytes {
+    Bytes::from(esker_keys::prefix::raw_key(user_key))
+}
+
 /// Writes one key, retrying while the answer is one the caller is told to retry.
 ///
 /// **Not `unwrap`.** A one-shot write makes "leadership does not move, and no epoch changes
@@ -210,6 +222,69 @@ async fn put(store: &Arc<Store>, region: &Region, key: Bytes, value: &[u8]) {
                     "writing {key:?} never succeeded; last answer {error}"
                 );
                 tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    }
+}
+
+/// Commits one key through Percolator on `store`, as a client would: prewrite, then commit.
+///
+/// The replicated path, so both entries go through the log and apply on every peer — which is
+/// what makes "the peer that joins later" a question about the transfer rather than about a
+/// write that never replicated. Retried on the same terms as [`put`], and for the same reason.
+async fn commit_one(
+    store: &Arc<Store>,
+    region: &Region,
+    key: Bytes,
+    value: &'static [u8],
+    start_ts: u64,
+    commit_ts: u64,
+) {
+    let requests = [
+        TxnKvReq::Prewrite {
+            start_ts,
+            primary: key.clone(),
+            ttl_ms: 3_000,
+            mutations: vec![TxnMutation::Put {
+                key: key.clone(),
+                value: Bytes::from_static(value),
+            }],
+        },
+        TxnKvReq::Commit {
+            start_ts,
+            commit_ts,
+            keys: vec![key.clone()],
+        },
+    ];
+    for request in requests {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let epoch = store
+                .regions()
+                .get(region.id)
+                .map_or(region.epoch, |state| state.region().epoch);
+            let header = RequestHeader::new(region.id, epoch, 0);
+            match within(
+                "a transactional write to be applied",
+                store.serve_txn(header, request.clone()),
+            )
+            .await
+            {
+                Ok(_) => break,
+                Err(error) => {
+                    // A prewrite and a commit are both idempotent for a single writer of one
+                    // fixed value, so an ambiguous answer may be repeated here — the same
+                    // argument `put` makes above, and no wider.
+                    if error.is_ambiguous() {
+                        continue;
+                    }
+                    assert!(error.is_retryable(), "committing {key:?}: {error}");
+                    assert!(
+                        Instant::now() < deadline,
+                        "committing {key:?} never succeeded; last answer {error}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
             }
         }
     }
@@ -445,6 +520,251 @@ async fn a_region_reaches_a_store_that_never_had_it() {
             "key {n} did not arrive"
         );
     }
+
+    first.stop().await;
+    second.stop().await;
+}
+
+/// A region that arrives by snapshot arrives with its **transactional** records, not only its
+/// raw pairs.
+///
+/// # The trace this was written from
+///
+/// A columnar learner placed by PD on a live four-store cluster published apply index 22 with
+/// **two** `write` records where its leader had ten (`docs/plans/phase-8-learner.md` §store,
+/// "THE BLOCKER"). Two, not zero, because two commits happened *after* the transfer and came
+/// down the log; everything committed before it was missing. That is the shape of a snapshot
+/// that carries one column family out of three, and it is what this reproduces in two seconds
+/// with no cluster: the region moves, the raw pair goes with it, and the Percolator records do
+/// not.
+///
+/// A **row** learner hides this. Its store is caught up by the log whenever the leader has not
+/// compacted, and when it is caught up by snapshot instead, promotion waits on `matched` — a
+/// number the transfer moves whether or not the bytes were complete. Nothing downstream reads
+/// its `write` records until it leads, by which time a later snapshot or a full log has usually
+/// covered the hole. A columnar learner is never promoted and its whole job is to read those
+/// records, so it is the first replica in this system for which an incomplete transfer is
+/// visible rather than merely true.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_region_arrives_with_its_transactional_records() {
+    trace();
+    let pd = Arc::new(FakePd::new());
+    let first_address = reserve();
+    let second_address = reserve();
+    let peers = vec![
+        PeerAddress::new(1, 1, first_address),
+        PeerAddress::new(2, 2, second_address),
+    ];
+
+    // **No aggressive compaction.** The leader's log is intact, so a snapshot here is not the
+    // repair of a peer that fell behind — it is the ordinary way a store that never had the
+    // region receives it, which is the path every placed replica takes.
+    let first = open(
+        first_address,
+        1,
+        &pd,
+        raft_options(peers.clone(), LogCompaction::new(), Some(vec![1])),
+        1,
+    )
+    .await;
+    wait_for("a leader", || {
+        first.store.peer_of(1).is_some_and(|peer| peer.is_leader())
+    })
+    .await;
+
+    // Four keys through Percolator and one through `RawKV`. Both halves before the peer exists,
+    // so both halves are the transfer's job — and a failure that reports one and not the other
+    // says which column family was dropped rather than that "data is missing".
+    let region = first.store.regions().regions()[0].clone();
+    for n in 0..4 {
+        commit_one(
+            &first.store,
+            &region,
+            key(n),
+            b"committed",
+            10 + u64::from(n) * 2,
+            11 + u64::from(n) * 2,
+        )
+        .await;
+    }
+    put(&first.store, &region, key(100), b"raw").await;
+
+    let second = open(
+        second_address,
+        2,
+        &pd,
+        raft_options(peers.clone(), LogCompaction::new(), Some(vec![2])),
+        2,
+    )
+    .await;
+    assert!(
+        second.store.regions().is_empty(),
+        "the second store bootstrapped a region of its own"
+    );
+
+    let epoch = first.store.regions().regions()[0].epoch;
+    pd.issue(Operator::AddPeer {
+        region_id: 1,
+        epoch,
+        store_id: 2,
+        peer_id: 2,
+    });
+    wait_for("the region to arrive on the second store", || {
+        second.store.regions().get(1).is_some()
+    })
+    .await;
+
+    // The raw half, which has always arrived.
+    let arrived = second.store.regions().get(1).unwrap().region().clone();
+    let header = RequestHeader::new(arrived.id, arrived.epoch, 0);
+    assert_eq!(
+        second
+            .store
+            .handle(header, RawKvReq::get(key(100)))
+            .unwrap(),
+        RawKvResp::Get {
+            value: Some(Bytes::from_static(b"raw"))
+        },
+        "the raw pair did not arrive, so this is not the failure this test is about"
+    );
+
+    // The transactional half. Counted first, because a count says how much was lost where a
+    // read says only that one key was.
+    let state = second.store.regions().get(1).unwrap();
+    let missing: Vec<u32> = (0..4)
+        .filter(|n| second.store.write_records(&key(*n)).unwrap() == 0)
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the region arrived without the `write` records of {missing:?}: a snapshot that ships \
+         one column family out of three"
+    );
+    for n in 0..4 {
+        assert_eq!(
+            second
+                .store
+                .handle_txn(
+                    &state,
+                    TxnKvReq::Get {
+                        key: key(n),
+                        ts: 100,
+                    },
+                )
+                .unwrap(),
+            TxnKvResp::Get {
+                value: Some(Bytes::from_static(b"committed"))
+            },
+            "key {n} committed before the transfer is not readable after it"
+        );
+    }
+
+    first.stop().await;
+    second.stop().await;
+}
+
+/// **The blocker, as PD creates it.** A columnar learner placed by an operator reaches the
+/// leader's applied index holding the leader's data.
+///
+/// The regression `docs/plans/phase-8-learner.md` §store asks for. It differs from the test
+/// above in the one way that matters for how the defect was found: nothing here is promoted and
+/// nothing here is read through the front door, so the *only* evidence that the transfer was
+/// complete is what the learner's own column families hold — which is exactly the position the
+/// fragment service is in when it is asked for a table.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_placed_columnar_learner_holds_what_the_leader_holds() {
+    trace();
+    let pd = Arc::new(FakePd::new());
+    let first_address = reserve();
+    let second_address = reserve();
+    let peers = vec![
+        PeerAddress::new(1, 1, first_address),
+        PeerAddress::new(2, 2, second_address),
+    ];
+
+    let first = open(
+        first_address,
+        1,
+        &pd,
+        raft_options(peers.clone(), LogCompaction::new(), Some(vec![1])),
+        1,
+    )
+    .await;
+    wait_for("a leader", || {
+        first.store.peer_of(1).is_some_and(|peer| peer.is_leader())
+    })
+    .await;
+
+    let region = first.store.regions().regions()[0].clone();
+    for n in 0..6 {
+        commit_one(
+            &first.store,
+            &region,
+            key(n),
+            b"committed",
+            10 + u64::from(n) * 2,
+            11 + u64::from(n) * 2,
+        )
+        .await;
+    }
+
+    let second = open(
+        second_address,
+        2,
+        &pd,
+        raft_options(peers.clone(), LogCompaction::new(), Some(vec![2])),
+        2,
+    )
+    .await;
+
+    let epoch = first.store.regions().regions()[0].epoch;
+    pd.issue(Operator::AddLearner {
+        region_id: 1,
+        epoch,
+        store_id: 2,
+        peer_id: 2,
+    });
+    wait_for("the columnar learner in the membership", || {
+        first.store.regions().regions()[0]
+            .peers
+            .iter()
+            .any(|peer| peer.role == PeerRole::ColumnarLearner)
+    })
+    .await;
+    wait_for("the region to arrive on the second store", || {
+        second.store.regions().get(1).is_some()
+    })
+    .await;
+
+    // One more commit after the placement, so "caught up" means the stream as well as the
+    // transfer — a learner that received nothing and then followed the log perfectly would pass
+    // an assertion about the tail alone, and that is the state the cluster was found in.
+    let region = first.store.regions().regions()[0].clone();
+    commit_one(&first.store, &region, key(6), b"committed", 30, 31).await;
+
+    let leader = first.store.peer_of(1).unwrap();
+    wait_for("the learner to reach the leader's applied index", || {
+        second
+            .store
+            .peer_of(1)
+            .is_some_and(|peer| peer.applied_index() >= leader.applied_index())
+    })
+    .await;
+
+    let short: Vec<(u32, u64, u64)> = (0..7)
+        .map(|n| {
+            (
+                n,
+                first.store.write_records(&key(n)).unwrap(),
+                second.store.write_records(&key(n)).unwrap(),
+            )
+        })
+        .filter(|(_, leader, learner)| leader != learner)
+        .collect();
+    assert!(
+        short.is_empty(),
+        "the columnar learner is at the leader's applied index without the leader's data; \
+         (key, leader versions, learner versions) = {short:?}"
+    );
 
     first.stop().await;
     second.stop().await;
@@ -706,16 +1026,18 @@ async fn an_interrupted_receive_is_cleared_by_the_restart() {
             .unwrap();
         esker_store::snapshot::stage_pairs(
             &db,
+            DEFAULT_CF,
             &[
-                (Bytes::from_static(b"e"), Bytes::from_static(b"half")),
-                (Bytes::from_static(b"f"), Bytes::from_static(b"half")),
+                (raw(b"e"), Bytes::from_static(b"half")),
+                (raw(b"f"), Bytes::from_static(b"half")),
             ],
         )
         .unwrap();
         // A key outside the region, which the cleanup must not touch.
         esker_store::snapshot::stage_pairs(
             &db,
-            &[(Bytes::from_static(b"z"), Bytes::from_static(b"other"))],
+            DEFAULT_CF,
+            &[(raw(b"z"), Bytes::from_static(b"other"))],
         )
         .unwrap();
         db.flush_all().unwrap();
@@ -807,15 +1129,17 @@ async fn what_is_streamed_is_the_region_and_nothing_else() {
         &narrow,
         store.db().snapshot(),
         esker_store::snapshot::CHUNK_TARGET_BYTES,
-        |pairs| {
-            seen.extend(pairs);
+        |cf_tag, pairs| {
+            if cf_tag == DEFAULT_CF {
+                seen.extend(pairs);
+            }
             Ok(())
         },
     )
     .unwrap();
     assert_eq!(
         seen.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>(),
-        (5..9).map(key).collect::<Vec<_>>()
+        (5..9).map(|n| raw(&key(n))).collect::<Vec<_>>()
     );
 
     // And a scan of the whole region still answers, so the pinned read did not disturb anything.

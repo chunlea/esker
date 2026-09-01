@@ -31,19 +31,38 @@
 //! `TODO(post-v1)`: with sequence-number rewriting and a range-clipped checkpoint, this becomes
 //! the link-only transfer §6 describes, and only this module changes.
 //!
-//! # Format (*fixed*, version 1)
+//! # Every column family a region owns, which version 1 did not do
 //!
-//! The stream is a run of chunks. The first is a header; every one after it is a batch of pairs.
+//! A region's data lives in **three** column families — `default`, `lock` and `write` — and
+//! version 1 of this format shipped one of them, over one of the two namespaces in it. So a
+//! snapshot carried `RawKV` pairs and dropped every Percolator record: every SQL row, every index
+//! entry, every catalog record and every live lock. Nothing noticed for a long time, because the
+//! only replica that reads those records without first being promoted is a columnar learner, and
+//! it was the last one built ([`crate::columnar::region`], `docs/plans/phase-8-learner.md`
+//! §store). See `tests/snapshot.rs::a_region_arrives_with_its_transactional_records` for the
+//! two-second reproduction and `docs/adr/0032-a-snapshot-carries-every-column-family.md` for the
+//! decision.
+//!
+//! # Format (*fixed*, version 2)
+//!
+//! The stream is a run of chunks. The first is a header; every one after it is a batch of pairs
+//! belonging to one column family.
 //!
 //! ```text
-//! header = 1:u8 ++ 1:u8(kind) ++ region ++ index ++ term ++ voters ++ learners
-//! pairs  = 1:u8 ++ 2:u8(kind) ++ crc32c:u32 ++ count ++ (key ++ value)*
+//! header = 2:u8 ++ 1:u8(kind) ++ region ++ index ++ term ++ voters ++ learners
+//! pairs  = 2:u8 ++ 2:u8(kind) ++ cf:u8 ++ crc32c:u32 ++ count ++ (key ++ value)*
 //! ```
 //!
-//! Everything unmarked is a varint; keys and values are length-prefixed. The keys are **user**
-//! keys — the `'r'` namespace is the store's and is added on the way in, exactly as it is for a
-//! request (`CLAUDE.md` invariant 7). Each batch carries its own CRC because a stream that
-//! delivered a corrupt chunk and then completed would otherwise look like a clean transfer.
+//! Everything unmarked is a varint; keys and values are length-prefixed. The keys are **engine**
+//! keys, namespace byte and timestamp suffix included, and are written into the named column
+//! family exactly as they arrive. Version 1 sent user keys and re-added the `'r'` namespace on
+//! the way in, which reads well while `'r'` is the only namespace there is; with `'x'` beside it
+//! the sender would have to strip a prefix the receiver then guesses back, and a guess is what
+//! this whole change is about not making. `CLAUDE.md` invariant 7 is untouched: nothing here
+//! reads a key, it copies bytes between two column families of the same name.
+//!
+//! Each batch carries its own CRC because a stream that delivered a corrupt chunk and then
+//! completed would otherwise look like a clean transfer.
 //!
 //! A failed chunk **restarts the whole snapshot**. There is no resume and no per-chunk
 //! retransmit: a snapshot is idempotent and cheap to redo relative to the bookkeeping resuming
@@ -58,11 +77,34 @@ use esker_raft::{ConfState, SnapshotMeta};
 use crate::error::engine_to_proto;
 
 /// Version byte on every chunk of a snapshot stream.
-const SNAPSHOT_FORMAT_VERSION: u8 = 1;
+///
+/// Two since a snapshot carries every column family. There is no compatibility with version 1 and
+/// none is owed: a stream lives for the length of one transfer between two stores of one cluster,
+/// and a chunk that names another version is refused as corrupt — which is the right answer for a
+/// v1 stream too, since adopting one would produce exactly the silently incomplete region this
+/// version exists to stop.
+const SNAPSHOT_FORMAT_VERSION: u8 = 2;
 
 /// Chunk kinds. Zero is reserved, as everywhere in this project's formats.
 const CHUNK_HEADER: u8 = 1;
 const CHUNK_PAIRS: u8 = 2;
+
+/// The column families a snapshot carries, and the byte that names each one in a pairs chunk.
+///
+/// `cf::RAFT` is deliberately absent and stays absent: it holds this store's log, hard state and
+/// region records, which are one peer's facts about a region rather than the region's contents.
+/// A receiver builds its own from the header (`Store::adopt_snapshot`).
+const SNAPSHOT_CFS: [(u8, &str); 3] = [(1, cf::DEFAULT), (2, cf::LOCK), (3, cf::WRITE)];
+
+/// The namespace bytes a store actually writes into those column families
+/// (`esker_keys::prefix`), which is what a region's user-key range has to be mapped through.
+///
+/// **Two, not four.** `'t'` and `'m'` are namespaces of the *user* key space — a SQL row's key is
+/// the user key a transaction writes, so it reaches the engine as `'x' ++ enc('t' ++ ..) ++ ts` —
+/// so they are shipped by walking `'x'` and are not ranges of their own. A third physical
+/// namespace would have to be added here — which does not compile until [`physical_ranges`]
+/// returns a range for it, and `a_range_is_walked_for_every_physical_namespace` says which.
+const PHYSICAL_NAMESPACES: [u8; 2] = [prefix::RAW, prefix::TXN];
 
 /// How many bytes of pairs one chunk carries before it is sent.
 ///
@@ -124,9 +166,9 @@ impl SnapshotHeader {
     }
 }
 
-/// One chunk of key-value pairs, checksummed.
+/// One chunk of one column family's key-value pairs, checksummed.
 #[must_use]
-pub fn encode_pairs(pairs: &[(Bytes, Bytes)]) -> Bytes {
+pub fn encode_pairs(cf_tag: u8, pairs: &[(Bytes, Bytes)]) -> Bytes {
     let mut body = Encoder::new();
     body.put_varint(pairs.len() as u64);
     for (key, value) in pairs {
@@ -138,6 +180,7 @@ pub fn encode_pairs(pairs: &[(Bytes, Bytes)]) -> Bytes {
     let mut out = Encoder::with_capacity(body.len() + 16);
     out.put_u8(SNAPSHOT_FORMAT_VERSION);
     out.put_u8(CHUNK_PAIRS);
+    out.put_u8(cf_tag);
     out.put_u32(crc32c::checksum(&body));
     // Length-prefixed rather than "the rest of the chunk", so a truncated frame is a decode error
     // rather than a body that happens to checksum against a shorter slice.
@@ -146,9 +189,22 @@ pub fn encode_pairs(pairs: &[(Bytes, Bytes)]) -> Bytes {
 }
 
 /// Reads a chunk written by [`encode_pairs`], checking its CRC before anything is believed.
-pub fn decode_pairs(bytes: &[u8]) -> Result<Vec<(Bytes, Bytes)>, ProtoError> {
+///
+/// Answers the column family the pairs belong in along with them: a chunk that named a family
+/// this build does not ship is refused rather than defaulted, because defaulting is how the bytes
+/// of one column family end up in another.
+pub fn decode_pairs(bytes: &[u8]) -> Result<(u8, Vec<(Bytes, Bytes)>), ProtoError> {
     let mut input = Decoder::new(bytes);
     expect_kind(&mut input, CHUNK_PAIRS)?;
+    let cf_tag = input
+        .get_u8("snapshot.cf")
+        .map_err(|error| ProtoError::corrupt("snapshot chunk", error.to_string()))?;
+    if cf_name(cf_tag).is_none() {
+        return Err(ProtoError::corrupt(
+            "snapshot chunk",
+            format!("column family {cf_tag}, which this build does not ship"),
+        ));
+    }
     let expected = input
         .get_u32("snapshot.crc")
         .map_err(|error| ProtoError::corrupt("snapshot chunk", error.to_string()))?;
@@ -179,15 +235,26 @@ pub fn decode_pairs(bytes: &[u8]) -> Result<Vec<(Bytes, Bytes)>, ProtoError> {
     input
         .finish()
         .map_err(|error| ProtoError::corrupt("snapshot chunk", error.to_string()))?;
-    Ok(pairs)
+    Ok((cf_tag, pairs))
 }
 
-/// Reads one region's pairs at a pinned snapshot, handing each batch to `emit`.
+/// The column family a chunk's tag names, if this build ships one under it.
+#[must_use]
+fn cf_name(tag: u8) -> Option<&'static str> {
+    SNAPSHOT_CFS
+        .iter()
+        .find(|(shipped, _)| *shipped == tag)
+        .map(|(_, name)| *name)
+}
+
+/// Reads one region's pairs at a pinned snapshot, handing each batch to `emit` with the column
+/// family it came from.
 ///
 /// The read is pinned by the engine snapshot the caller passes, which is what makes the stream a
 /// picture of one instant rather than of a moving target. That snapshot and the `meta.index` must
 /// be taken together, on the peer's own driver thread, or the metadata would name an index the
-/// data does not include.
+/// data does not include. **One snapshot across all three column families**, for the same reason:
+/// a lock read at a later instant than the write record it guards is a state no peer ever had.
 ///
 /// Synchronous, and expected to run on a blocking thread: it walks the region.
 pub fn read_pairs<E>(
@@ -198,14 +265,8 @@ pub fn read_pairs<E>(
     mut emit: E,
 ) -> Result<(), ProtoError>
 where
-    E: FnMut(Vec<(Bytes, Bytes)>) -> Result<(), ProtoError>,
+    E: FnMut(u8, Vec<(Bytes, Bytes)>) -> Result<(), ProtoError>,
 {
-    let low = prefix::raw_key(&region.start_key);
-    let high = if region.end_key.is_empty() {
-        vec![prefix::RAW + 1]
-    } else {
-        prefix::raw_key(&region.end_key)
-    };
     let options = ReadOptions {
         snapshot: Some(read),
         // A snapshot walks the whole region once and would evict everything a live workload has
@@ -213,35 +274,35 @@ where
         fill_cache: false,
         ..ReadOptions::default()
     };
-    let mut iter = db
-        .iter(cf::DEFAULT, &options)
-        .map_err(|error| engine_to_proto(&error))?;
-
-    let mut batch: Vec<(Bytes, Bytes)> = Vec::new();
-    let mut bytes = 0usize;
-    iter.seek(&low);
-    while iter.valid() && iter.key() < &high[..] {
-        let Some(user) = iter.key().strip_prefix(&[prefix::RAW]) else {
-            return Err(ProtoError::internal(format!(
-                "a snapshot read a key outside the 'r' namespace: {:?}",
-                iter.key()
-            )));
-        };
-        bytes += user.len() + iter.value().len();
-        batch.push((
-            Bytes::copy_from_slice(user),
-            Bytes::copy_from_slice(iter.value()),
-        ));
-        if bytes >= target_bytes {
-            emit(std::mem::take(&mut batch))?;
-            bytes = 0;
+    for (tag, name) in SNAPSHOT_CFS {
+        let mut batch: Vec<(Bytes, Bytes)> = Vec::new();
+        let mut bytes = 0usize;
+        // Both namespaces in every family. `lock` and `write` hold only `'x'` keys today and the
+        // `'r'` walk over them costs one seek that finds nothing — which is a cheaper guarantee
+        // than a table of which family may hold which namespace, and one that cannot go stale.
+        for (low, high) in physical_ranges(region) {
+            let mut iter = db
+                .iter(name, &options)
+                .map_err(|error| engine_to_proto(&error))?;
+            iter.seek(&low);
+            while iter.valid() && iter.key() < &high[..] {
+                bytes += iter.key().len() + iter.value().len();
+                batch.push((
+                    Bytes::copy_from_slice(iter.key()),
+                    Bytes::copy_from_slice(iter.value()),
+                ));
+                if bytes >= target_bytes {
+                    emit(tag, std::mem::take(&mut batch))?;
+                    bytes = 0;
+                }
+                iter.next();
+            }
+            iter.status().map_err(|error| engine_to_proto(&error))?;
         }
-        iter.next();
+        // The last batch goes even when it is empty: a region with no keys still has to produce a
+        // stream the receiver can complete, or an empty region could never be shipped at all.
+        emit(tag, batch)?;
     }
-    iter.status().map_err(|error| engine_to_proto(&error))?;
-    // The last batch goes even when it is empty: a region with no keys still has to produce a
-    // stream the receiver can complete, or an empty region could never be shipped at all.
-    emit(batch)?;
     Ok(())
 }
 
@@ -276,27 +337,36 @@ where
 /// exactly like correct data. Rather than weaken the check, this refuses and says so: catching the
 /// peer up is then still impossible, which is where it was before, and the failure is loud.
 pub fn clear_range(db: &Db, region: &Region) -> Result<(), ProtoError> {
-    let (low, high) = range_bounds(region);
-    let cf_id = db
-        .cf_id(cf::DEFAULT)
-        .ok_or_else(|| ProtoError::internal("the default column family is missing"))?;
-
-    if first_key_in(db, &low, &high)?.is_none() {
+    if first_key_in_region(db, region)?.is_none() {
         // Nothing to clear, which is the ordinary case: a replica placed on a store that never
         // held this range. No tombstone is written for it, so no discharge has to be waited for.
         return Ok(());
     }
 
+    // Every family and every namespace in one batch, so the range is emptied atomically rather
+    // than family by family with a crash window between them.
     let mut batch = WriteBatch::new();
-    batch.delete_range(cf_id, &low, &high);
+    for (_, name) in SNAPSHOT_CFS {
+        let cf_id = db.cf_id(name).ok_or_else(|| {
+            ProtoError::internal(format!(
+                "the store opened without its `{name}` column family"
+            ))
+        })?;
+        for (low, high) in physical_ranges(region) {
+            batch.delete_range(cf_id, &low, &high);
+        }
+    }
     db.write(batch, &WriteOptions { sync: true })
         .map_err(|error| engine_to_proto(&error))?;
-    db.flush(cf::DEFAULT)
-        .map_err(|error| engine_to_proto(&error))?;
-    db.compact_range(cf::DEFAULT, Some(&low), Some(&high))
-        .map_err(|error| engine_to_proto(&error))?;
+    for (_, name) in SNAPSHOT_CFS {
+        db.flush(name).map_err(|error| engine_to_proto(&error))?;
+        for (low, high) in physical_ranges(region) {
+            db.compact_range(name, Some(&low), Some(&high))
+                .map_err(|error| engine_to_proto(&error))?;
+        }
+    }
 
-    if let Some(survivor) = first_key_in(db, &low, &high)? {
+    if let Some(survivor) = first_key_in_region(db, region)? {
         return Err(ProtoError::Unsupported {
             detail: format!(
                 "region {}: clearing [{:?}, {:?}) left key {:?} behind, so the range cannot be \
@@ -310,21 +380,62 @@ pub fn clear_range(db: &Db, region: &Region) -> Result<(), ProtoError> {
     Ok(())
 }
 
-/// The `'r'`-namespaced bounds of a region's range, with the open end handled once.
-fn range_bounds(region: &Region) -> (Vec<u8>, Vec<u8>) {
-    let low = prefix::raw_key(&region.start_key);
-    let high = if region.end_key.is_empty() {
+/// Every engine range a region's user-key range maps to, one per physical namespace.
+///
+/// A region owns `[start_key, end_key)` of the **user** key space, and a store writes each user
+/// key into one of two shapes: `'r' ++ user_key` for `RawKV` and `'x' ++ enc(user_key) ++ !ts` for
+/// anything transactional. The `'x'` bound uses `esker_txn::key::prefix`, which is the same
+/// mapping `txnkv::scan` gives a client's range — memcomparable encoding is order-preserving and
+/// prefix-free, so a user key is inside the region exactly when its engine key is inside the
+/// bounds here, timestamp suffix and all.
+///
+/// An empty bound is the namespace's own edge rather than an encoding of the empty key: `'r'` is
+/// below every raw key and `'x' + 1` is above every transactional one, which needs no argument
+/// about what the codec does with nothing.
+fn physical_ranges(region: &Region) -> [(Vec<u8>, Vec<u8>); PHYSICAL_NAMESPACES.len()] {
+    let raw_low = prefix::raw_key(&region.start_key);
+    let raw_high = if region.end_key.is_empty() {
         vec![prefix::RAW + 1]
     } else {
         prefix::raw_key(&region.end_key)
     };
-    (low, high)
+    let txn_low = if region.start_key.is_empty() {
+        vec![prefix::TXN]
+    } else {
+        esker_txn::key::prefix(&region.start_key)
+    };
+    let txn_high = if region.end_key.is_empty() {
+        vec![prefix::TXN + 1]
+    } else {
+        esker_txn::key::prefix(&region.end_key)
+    };
+    [(raw_low, raw_high), (txn_low, txn_high)]
 }
 
-/// The first key in `[low, high)`, if the store holds one.
-fn first_key_in(db: &Db, low: &[u8], high: &[u8]) -> Result<Option<Vec<u8>>, ProtoError> {
+/// The first key of `region`'s range that any shipped column family holds, if there is one.
+///
+/// Every family, because the question this answers is "is this range empty" and a range that is
+/// empty in `default` and not in `write` is not empty.
+fn first_key_in_region(db: &Db, region: &Region) -> Result<Option<Vec<u8>>, ProtoError> {
+    for (_, name) in SNAPSHOT_CFS {
+        for (low, high) in physical_ranges(region) {
+            if let Some(found) = first_key_in(db, name, &low, &high)? {
+                return Ok(Some(found));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The first key in `[low, high)` of one column family, if the store holds one.
+fn first_key_in(
+    db: &Db,
+    name: &str,
+    low: &[u8],
+    high: &[u8],
+) -> Result<Option<Vec<u8>>, ProtoError> {
     let mut iter = db
-        .iter(cf::DEFAULT, &ReadOptions::default())
+        .iter(name, &ReadOptions::default())
         .map_err(|error| engine_to_proto(&error))?;
     iter.seek(low);
     let found = (iter.valid() && iter.key() < high).then(|| iter.key().to_vec());
@@ -332,20 +443,28 @@ fn first_key_in(db: &Db, low: &[u8], high: &[u8]) -> Result<Option<Vec<u8>>, Pro
     Ok(found)
 }
 
-/// Writes a batch of a snapshot's pairs into the data column family.
+/// Writes a batch of a snapshot's pairs into the column family its chunk named.
+///
+/// The keys go down as they arrive: they are engine keys, and the sender's engine and this one
+/// agree about what a key means or the transfer was never going to work.
 ///
 /// Not synced. Nothing reads these until the region is adopted, and the adoption *is* synced — so
 /// a crash before it leaves keys that no region covers and that the next attempt overwrites.
-pub fn stage_pairs(db: &Db, pairs: &[(Bytes, Bytes)]) -> Result<(), ProtoError> {
+pub fn stage_pairs(db: &Db, cf_tag: u8, pairs: &[(Bytes, Bytes)]) -> Result<(), ProtoError> {
     if pairs.is_empty() {
         return Ok(());
     }
-    let cf_id = db.cf_id(cf::DEFAULT).ok_or_else(|| {
-        ProtoError::internal("the store opened without its `default` column family")
+    let name = cf_name(cf_tag).ok_or_else(|| {
+        ProtoError::internal(format!("a snapshot chunk named column family {cf_tag}"))
+    })?;
+    let cf_id = db.cf_id(name).ok_or_else(|| {
+        ProtoError::internal(format!(
+            "the store opened without its `{name}` column family"
+        ))
     })?;
     let mut batch = WriteBatch::new();
     for (key, value) in pairs {
-        batch.put(cf_id, &prefix::raw_key(key), value);
+        batch.put(cf_id, key, value);
     }
     db.write(batch, &WriteOptions { sync: false })
         .map(|_| ())
@@ -362,27 +481,27 @@ pub fn stage_pairs(db: &Db, pairs: &[(Bytes, Bytes)]) -> Result<(), ProtoError> 
 /// proportional to what was received before the crash, which is the honest price of not being able
 /// to drop a range in one write.
 pub fn discard_range(db: &Db, region: &Region) -> Result<u64, ProtoError> {
-    let low = prefix::raw_key(&region.start_key);
-    let high = if region.end_key.is_empty() {
-        vec![prefix::RAW + 1]
-    } else {
-        prefix::raw_key(&region.end_key)
-    };
-    let cf_id = db.cf_id(cf::DEFAULT).ok_or_else(|| {
-        ProtoError::internal("the store opened without its `default` column family")
-    })?;
-    let mut iter = db
-        .iter(cf::DEFAULT, &ReadOptions::default())
-        .map_err(|error| engine_to_proto(&error))?;
     let mut batch = WriteBatch::new();
     let mut removed = 0u64;
-    iter.seek(&low);
-    while iter.valid() && iter.key() < &high[..] {
-        batch.delete(cf_id, iter.key());
-        removed += 1;
-        iter.next();
+    for (_, name) in SNAPSHOT_CFS {
+        let cf_id = db.cf_id(name).ok_or_else(|| {
+            ProtoError::internal(format!(
+                "the store opened without its `{name}` column family"
+            ))
+        })?;
+        for (low, high) in physical_ranges(region) {
+            let mut iter = db
+                .iter(name, &ReadOptions::default())
+                .map_err(|error| engine_to_proto(&error))?;
+            iter.seek(&low);
+            while iter.valid() && iter.key() < &high[..] {
+                batch.delete(cf_id, iter.key());
+                removed += 1;
+                iter.next();
+            }
+            iter.status().map_err(|error| engine_to_proto(&error))?;
+        }
     }
-    iter.status().map_err(|error| engine_to_proto(&error))?;
     if removed > 0 {
         // Synced: the announcement record is removed in a later write, and a crash between the
         // two must not leave the keys behind with nothing pointing at them.
@@ -450,11 +569,11 @@ mod tests {
     use esker_keys::prefix;
 
     use super::{
-        CHUNK_TARGET_BYTES, SnapshotHeader, clear_range, decode_pairs, encode_pairs, first_key_in,
-        read_pairs, stage_pairs,
+        CHUNK_TARGET_BYTES, SnapshotHeader, clear_range, decode_pairs, encode_pairs,
+        first_key_in_region, read_pairs, stage_pairs,
     };
     use bytes::Bytes;
-    use esker_engine::{Db, LocalFileSystem, Options, cf};
+    use esker_engine::{Db, LocalFileSystem, Options, WriteBatch, WriteOptions, cf};
     use esker_proto::{Epoch, Peer, Region};
     use esker_raft::{ConfState, SnapshotMeta};
     use std::sync::Arc;
@@ -540,6 +659,67 @@ mod tests {
         assert!(SnapshotHeader::decode(&empty.encode()).is_err());
     }
 
+    /// The tag every test below ships pairs under: the `default` column family, which is where
+    /// a `RawKV` pair lives.
+    const DEFAULT_CF: u8 = super::SNAPSHOT_CFS[0].0;
+
+    /// The engine pairs a `RawKV` put of each key leaves behind.
+    fn raw_pairs(keys: &[&str]) -> Vec<(Bytes, Bytes)> {
+        keys.iter()
+            .map(|key| {
+                (
+                    Bytes::from(prefix::raw_key(key.as_bytes())),
+                    Bytes::from(format!("v{key}")),
+                )
+            })
+            .collect()
+    }
+
+    /// Everything one committed transactional key leaves in the engine: the value in `default`,
+    /// the commit record in `write`, and — for a transaction still in flight — the lock.
+    ///
+    /// Written by hand rather than through `txnkv`, because what this file is about is which
+    /// bytes a transfer moves, and a hand-written record makes the expected set of them literal.
+    fn stage_transactional(db: &Db, user_key: &[u8], start_ts: u64, commit_ts: u64) {
+        let mut batch = WriteBatch::new();
+        batch.put(
+            db.cf_id(cf::DEFAULT).unwrap(),
+            &esker_txn::key::value(user_key, start_ts),
+            b"value",
+        );
+        batch.put(
+            db.cf_id(cf::WRITE).unwrap(),
+            &esker_txn::key::write(user_key, commit_ts),
+            b"commit",
+        );
+        batch.put(
+            db.cf_id(cf::LOCK).unwrap(),
+            &esker_txn::key::lock(user_key),
+            b"lock",
+        );
+        db.write(batch, &WriteOptions { sync: false }).unwrap();
+    }
+
+    /// Every batch a read produces, by the column family it names.
+    fn read_by_cf(db: &Db, region: &Region) -> std::collections::BTreeMap<u8, Vec<Bytes>> {
+        let mut seen: std::collections::BTreeMap<u8, Vec<Bytes>> =
+            std::collections::BTreeMap::new();
+        read_pairs(
+            db,
+            region,
+            db.snapshot(),
+            CHUNK_TARGET_BYTES,
+            |cf_tag, batch| {
+                seen.entry(cf_tag)
+                    .or_default()
+                    .extend(batch.into_iter().map(|(key, _)| key));
+                Ok(())
+            },
+        )
+        .unwrap();
+        seen
+    }
+
     /// A chunk carries its own checksum because a stream that delivered a corrupt chunk and then
     /// completed would otherwise look like a clean transfer. Corruption is an error value, never
     /// a silently accepted key (`CLAUDE.md` invariant 2).
@@ -549,13 +729,16 @@ mod tests {
             (Bytes::from_static(b"a"), Bytes::from_static(b"1")),
             (Bytes::from_static(b"b"), Bytes::from_static(b"")),
         ];
-        let encoded = encode_pairs(&pairs);
-        assert_eq!(decode_pairs(&encoded).unwrap(), pairs);
-        assert_eq!(decode_pairs(&encode_pairs(&[])).unwrap(), Vec::new());
+        let encoded = encode_pairs(DEFAULT_CF, &pairs);
+        assert_eq!(decode_pairs(&encoded).unwrap(), (DEFAULT_CF, pairs));
+        assert_eq!(
+            decode_pairs(&encode_pairs(DEFAULT_CF, &[])).unwrap(),
+            (DEFAULT_CF, Vec::new())
+        );
 
         // Every byte of the body, flipped, is caught. The header bytes ahead of the CRC are
-        // checked by their own version and kind.
-        for at in 6..encoded.len() {
+        // checked by their own version, kind and column family.
+        for at in 7..encoded.len() {
             let mut damaged = encoded.to_vec();
             damaged[at] ^= 0xff;
             assert!(
@@ -565,55 +748,67 @@ mod tests {
         }
     }
 
-    /// The stream is exactly the region's range, in key order, and the keys on the wire are the
-    /// user's — the `'r'` namespace is the store's business at both ends.
+    /// A chunk names the column family its pairs belong in, and one this build does not ship is
+    /// refused rather than defaulted into `default`.
     #[test]
-    fn a_read_covers_the_regions_range_and_nothing_else() {
-        let (_dir, db) = open();
-        let all: Vec<(Bytes, Bytes)> = ["a", "d", "e", "f", "m", "z"]
-            .iter()
-            .map(|key| (Bytes::from(key.to_string()), Bytes::from(format!("v{key}"))))
-            .collect();
-        stage_pairs(&db, &all).unwrap();
-
-        let mut seen: Vec<(Bytes, Bytes)> = Vec::new();
-        read_pairs(
-            &db,
-            &region(b"d", b"m"),
-            db.snapshot(),
-            CHUNK_TARGET_BYTES,
-            |batch| {
-                seen.extend(batch);
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            seen.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>(),
-            vec![
-                Bytes::from_static(b"d"),
-                Bytes::from_static(b"e"),
-                Bytes::from_static(b"f")
-            ],
-            "the read ran outside the region"
+    fn a_chunk_that_names_no_column_family_this_build_ships_is_refused() {
+        for (tag, _) in super::SNAPSHOT_CFS {
+            let encoded =
+                encode_pairs(tag, &[(Bytes::from_static(b"k"), Bytes::from_static(b"v"))]);
+            assert_eq!(decode_pairs(&encoded).unwrap().0, tag);
+        }
+        let mut unknown = encode_pairs(DEFAULT_CF, &[]).to_vec();
+        unknown[2] = 9;
+        assert!(
+            decode_pairs(&unknown).is_err(),
+            "a chunk for an unknown column family was accepted, which is how one family's bytes \
+             end up in another"
         );
-        assert_eq!(seen[0].1, Bytes::from_static(b"vd"));
+    }
+
+    /// The stream is exactly the region's range, in key order, over **every** column family a
+    /// region owns and both namespaces a store writes into them.
+    ///
+    /// The regression for `docs/plans/phase-8-learner.md` §store's blocker in its smallest form:
+    /// before this, the `lock` and `write` families and the whole `'x'` namespace of `default`
+    /// were simply not read, so a region arrived with its `RawKV` pairs and none of its
+    /// transactions.
+    #[test]
+    fn a_read_covers_the_regions_range_in_every_column_family() {
+        let (_dir, db) = open();
+        stage_pairs(&db, DEFAULT_CF, &raw_pairs(&["a", "d", "e", "f", "m", "z"])).unwrap();
+        // Inside the region, and one either side of it.
+        stage_transactional(&db, b"e", 10, 11);
+        stage_transactional(&db, b"a", 10, 11);
+        stage_transactional(&db, b"z", 10, 11);
+
+        let seen = read_by_cf(&db, &region(b"d", b"m"));
+        assert_eq!(
+            seen[&DEFAULT_CF],
+            vec![
+                Bytes::from(prefix::raw_key(b"d")),
+                Bytes::from(prefix::raw_key(b"e")),
+                Bytes::from(prefix::raw_key(b"f")),
+                Bytes::from(esker_txn::key::value(b"e", 10)),
+            ],
+            "the `default` read ran outside the region or missed a namespace"
+        );
+        assert_eq!(
+            seen[&super::SNAPSHOT_CFS[1].0],
+            vec![Bytes::from(esker_txn::key::lock(b"e"))],
+            "the lock of a key in the region did not travel with it"
+        );
+        assert_eq!(
+            seen[&super::SNAPSHOT_CFS[2].0],
+            vec![Bytes::from(esker_txn::key::write(b"e", 11))],
+            "the commit record of a key in the region did not travel with it"
+        );
 
         // An unbounded region takes everything from its start upwards, and an empty one still
         // produces a stream a receiver can complete.
-        let mut count = 0;
-        read_pairs(
-            &db,
-            &region(b"m", b""),
-            db.snapshot(),
-            CHUNK_TARGET_BYTES,
-            |batch| {
-                count += batch.len();
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(count, 2, "`m` and `z`");
+        let above = read_by_cf(&db, &region(b"m", b""));
+        assert_eq!(above[&DEFAULT_CF].len(), 3, "`m`, `z` and z's value");
+        assert_eq!(above[&super::SNAPSHOT_CFS[2].0].len(), 1, "z's commit");
 
         let mut chunks = 0;
         read_pairs(
@@ -621,13 +816,44 @@ mod tests {
             &region(b"n", b"o"),
             db.snapshot(),
             CHUNK_TARGET_BYTES,
-            |_| {
+            |_, _| {
                 chunks += 1;
                 Ok(())
             },
         )
         .unwrap();
-        assert_eq!(chunks, 1, "an empty region still produces one chunk");
+        assert_eq!(
+            chunks,
+            super::SNAPSHOT_CFS.len(),
+            "an empty region still produces one chunk per column family"
+        );
+    }
+
+    /// One range per physical namespace, each covering its own and starting at its own byte.
+    ///
+    /// The guard on the list above: a store that begins writing a third physical namespace has to
+    /// add it to `PHYSICAL_NAMESPACES`, which does not compile until `physical_ranges` returns a
+    /// range for it — and this says the ranges and the list are in the same order and about the
+    /// same bytes, rather than merely the same length.
+    #[test]
+    fn a_range_is_walked_for_every_physical_namespace() {
+        for (namespace, (low, high)) in super::PHYSICAL_NAMESPACES
+            .into_iter()
+            .zip(super::physical_ranges(&region(b"d", b"m")))
+        {
+            assert_eq!(low[0], namespace, "the low bound left its namespace");
+            assert_eq!(high[0], namespace, "the high bound left its namespace");
+            assert!(low < high);
+        }
+        // An open-ended region reaches the top of each namespace and no further, which is what
+        // stops a region that runs to the end of the key space sweeping the next namespace up.
+        for (namespace, (low, high)) in super::PHYSICAL_NAMESPACES
+            .into_iter()
+            .zip(super::physical_ranges(&region(b"", b"")))
+        {
+            assert_eq!(low, vec![namespace]);
+            assert_eq!(high, vec![namespace + 1]);
+        }
     }
 
     /// A target size closes chunks; it does not split a pair across two.
@@ -637,18 +863,26 @@ mod tests {
         let pairs: Vec<(Bytes, Bytes)> = (0..50)
             .map(|n| {
                 (
-                    Bytes::from(format!("k{n:04}")),
+                    Bytes::from(prefix::raw_key(format!("k{n:04}").as_bytes())),
                     Bytes::from(vec![b'v'; 100]),
                 )
             })
             .collect();
-        stage_pairs(&db, &pairs).unwrap();
+        stage_pairs(&db, DEFAULT_CF, &pairs).unwrap();
 
         let mut sizes = Vec::new();
-        read_pairs(&db, &region(b"", b""), db.snapshot(), 512, |batch| {
-            sizes.push(batch.len());
-            Ok(())
-        })
+        read_pairs(
+            &db,
+            &region(b"", b""),
+            db.snapshot(),
+            512,
+            |cf_tag, batch| {
+                if cf_tag == DEFAULT_CF {
+                    sizes.push(batch.len());
+                }
+                Ok(())
+            },
+        )
         .unwrap();
         assert!(
             sizes.len() > 5,
@@ -673,31 +907,23 @@ mod tests {
         // A clean range needs no clearing and says so by succeeding.
         clear_range(&db, &region(b"d", b"m")).unwrap();
 
-        stage_pairs(
-            &db,
-            &[
-                (Bytes::from_static(b"a"), Bytes::from_static(b"before")),
-                (Bytes::from_static(b"e"), Bytes::from_static(b"v")),
-                (Bytes::from_static(b"f"), Bytes::from_static(b"v")),
-                (Bytes::from_static(b"z"), Bytes::from_static(b"after")),
-            ],
-        )
-        .unwrap();
+        stage_pairs(&db, DEFAULT_CF, &raw_pairs(&["a", "e", "f", "z"])).unwrap();
+        // And a transaction on each of them, so the clearing has all three families to empty.
+        for key in [&b"a"[..], b"e", b"f", b"z"] {
+            stage_transactional(&db, key, 10, 11);
+        }
 
         clear_range(&db, &region(b"d", b"m")).unwrap();
 
-        let low = prefix::raw_key(b"d");
-        let high = prefix::raw_key(b"m");
         assert_eq!(
-            first_key_in(&db, &low, &high).unwrap(),
+            first_key_in_region(&db, &region(b"d", b"m")).unwrap(),
             None,
             "the range was not emptied, so refilling it would serve a mix of two states"
         );
-        // And only that range: the keys on either side of it are untouched.
+        // And only that range: the keys on either side of it are untouched, in every family.
         for (key, what) in [(&b"a"[..], "below"), (&b"z"[..], "above")] {
-            let full = prefix::raw_key(key);
             assert!(
-                first_key_in(&db, &full, &[prefix::RAW + 1])
+                first_key_in_region(&db, &region(key, &[key[0] + 1]))
                     .unwrap()
                     .is_some(),
                 "clearing a region's range took a key {what} it"
@@ -710,11 +936,10 @@ mod tests {
     #[test]
     fn clearing_a_range_twice_is_the_same_as_clearing_it_once() {
         let (_dir, db) = open();
-        stage_pairs(&db, &[(Bytes::from_static(b"e"), Bytes::from_static(b"v"))]).unwrap();
+        stage_pairs(&db, DEFAULT_CF, &raw_pairs(&["e"])).unwrap();
+        stage_transactional(&db, b"e", 10, 11);
         clear_range(&db, &region(b"d", b"m")).unwrap();
         clear_range(&db, &region(b"d", b"m")).unwrap();
-        let low = prefix::raw_key(b"d");
-        let high = prefix::raw_key(b"m");
-        assert_eq!(first_key_in(&db, &low, &high).unwrap(), None);
+        assert_eq!(first_key_in_region(&db, &region(b"d", b"m")).unwrap(), None);
     }
 }

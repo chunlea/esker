@@ -378,6 +378,12 @@ Regions cover the whole key space contiguously; the first region is `["", "")`.
     the task that walked the region — so every way out of that walk, the receiver hanging up
     included, produces an answer. Without it the leader waits on an acknowledgement the follower
     has no reason to send, and the replica is stranded for the rest of the term.
+  - **Every column family the region owns**, `default`, `lock` and `write`, each chunk naming
+    its own; `raft` is this store's log and metadata and is never shipped. The keys are engine
+    keys, namespace byte and timestamp suffix included, and a region's user-key range maps to one
+    engine range per physical namespace — `'r' ++ key` and `'x' ++ enc(key) ++ !ts`. Format
+    version 1 walked `default` under `'r'` alone and so dropped every transactional record a
+    region held, which is [ADR 0032](adr/0032-a-snapshot-carries-every-column-family.md).
   - **Key-value pairs, not SST files, in v1.** §6 originally described `engine.checkpoint(range)` →
     `ingest()`, and two things stop it: a checkpoint links *whole files* and a file straddles a
     region boundary, so the receiver would get its neighbour's keys; and `Db::ingest` refuses any
