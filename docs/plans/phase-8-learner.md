@@ -347,7 +347,70 @@ answer in row order across every stripe rather than per stripe and combined.
 of the *answer* and a build that ignored it would still be correct. Carried now rather than at
 milestone 4 because `EXPLAIN` is the named consumer and a field added later costs a version bump.
 
-## 4. What this lane will **not** carry
+## 4. Placement: PD is **told**, and the invariant-7 argument for why
+
+`brief-a2` offered two shapes and asked for the argument in writing: PD reads the catalog record
+byte-level, or the SQL node reports desired counts. The first is not buildable, and the reason is
+worth separating from the layering question it looks like.
+
+**PD has no access path.** `esker-pd` links `esker-engine` — its *own* database — plus
+`esker-proto` and `esker-base`. It does not link `esker-client`, and every method on its service is
+inbound: `Bootstrap`, `StoreHeartbeat`, `RegionHeartbeat`, `GetRegion`, `AllocId`, `Tso`,
+`SchemaLease`. Stores and SQL nodes call PD. **PD calls nobody.** The catalog record lives in the
+cluster's key space, which PD reaches only by being a client of the cluster it places — a
+dependency inversion, and a bootstrap problem besides, since PD has to work before any region is
+servable.
+
+Moving the record's codec to `esker_keys::columnar` (ADR 0030, applied twice) made those bytes
+*parseable* from PD. It did not make them *obtainable*. Those are different problems and only the
+first is closed by a crate move.
+
+**So the SQL node reports, and what it reports is a key range.** `Pd::ReportColumnar` carries
+`(start_key, end_key, replicas)`, and the choice of *range* over *table id* is where invariant 7 is
+kept:
+
+> Key semantics (tenant, table, MVCC suffix) live only in `esker-keys` and above.
+
+A range is not a key semantic — it is PD's own vocabulary, the thing a region *is*, and PD already
+reasons in nothing else. Told "the range `[a, b)` wants two columnar replicas", PD compares it
+against every region's `[start_key, end_key)` and never learns that a table exists. Told "table 7
+wants two", PD would have to know what a table is and where its rows live, which is exactly the
+line `docs/plans/phase-6e.md` §10 drew when it took the schema-step drive away from PD: *PD is
+byte-opaque and cannot read a table definition, let alone write one.*
+
+Ranges also happen to be split-safe, which a table id would not have been: a table that splits into
+four regions is still one range, and every overlapping region inherits the wish with nobody
+re-reporting.
+
+### The report is a full assertion
+
+Never a delta. Every SQL node reads the same catalog, so every report has the same content and the
+last writer is right whoever it was; a delta would need an ordering this service does not impose.
+It also turns the re-report on lease refresh into anti-entropy rather than duplication — a report
+lost to a restart is repaired by the next one, with no acknowledgement protocol.
+
+PD persists it, unlike the operators it has in flight, and the difference is where the fact lives.
+An operator can be recomputed from the next heartbeat because the cluster is the source of truth
+about its own membership. This cannot be: a restart that forgot it would retire every columnar
+replica in the cluster and wait for a SQL node to mention them again.
+
+### Scheduling sits between repair and balance
+
+After repair, because a region below its voter target is in trouble and a columnar copy is a
+convenience — the one operator slot a region gets belongs to the repair. Before balance, because a
+missing columnar copy means a query falling back to a row scan every time it runs, while an
+unbalanced cluster is merely uneven.
+
+### A note on a filter that was accidentally safe
+
+`esker-store`'s `promote_caught_up_learners` selects `role == PeerRole::Learner`, *positively*, so
+a third role is excluded from promotion by construction and the columnar variant needed no edit
+there. Written as `!= PeerRole::Voter` it would have promoted every columnar replica the moment the
+variant existed. `cl-c1` made it an exhaustive match rather than leave it resting on that, which is
+right: accidentally safe is not safe, and a fourth role would fall into whichever default was
+there.
+
+## 5. What this lane will **not** carry
 
 **A schema.** Placement carries where a replica lives, not what a table looks like. A placement
 operator naming a table's columns would make PD a carrier of SQL semantics, which is the exact line
