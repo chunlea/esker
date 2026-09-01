@@ -376,6 +376,10 @@ fn put_literal(value: &Value, out: &mut Vec<u8>) {
             out.push(value.column_type().map_or(TAG_NULL, ColumnType::tag));
             out.extend_from_slice(&v.to_le_bytes());
         }
+        Value::Int4(v) => {
+            out.push(ColumnType::Int4.tag());
+            out.extend_from_slice(&v.to_le_bytes());
+        }
         Value::Double(v) => {
             out.push(ColumnType::Double.tag());
             out.extend_from_slice(&v.to_le_bytes());
@@ -408,6 +412,7 @@ fn take_literal(cursor: &mut Cursor<'_>) -> Result<Value> {
     Ok(match ty {
         ColumnType::Int8 => Value::Int8(take_i64(cursor)?),
         ColumnType::TimestampTz => Value::TimestampTz(take_i64(cursor)?),
+        ColumnType::Int4 => Value::Int4(cursor.u32_le("literal int4")? as i32),
         ColumnType::Double => Value::Double(f64::from_bits(cursor.u64_le("literal double")?)),
         ColumnType::Bool => match cursor.u8("literal boolean")? {
             0 => Value::Bool(false),

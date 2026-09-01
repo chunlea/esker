@@ -93,6 +93,7 @@ fn type_of(value: &Value) -> Option<ValueType> {
     Some(match value {
         Value::Null => return None,
         Value::Int8(_) => ValueType::Int8,
+        Value::Int4(_) => ValueType::Int4,
         Value::Text(_) => ValueType::Text,
         Value::Bool(_) => ValueType::Bool,
         Value::Bytea(_) => ValueType::Bytea,
@@ -105,6 +106,7 @@ fn value_of(value: &Value) -> WireValue {
     match value {
         Value::Null => WireValue::Null,
         Value::Int8(int) => WireValue::Int8(*int),
+        Value::Int4(int) => WireValue::Int4(*int),
         Value::Text(text) => WireValue::Text(text.clone()),
         Value::Bool(flag) => WireValue::Bool(*flag),
         Value::Bytea(bytes) => WireValue::Bytea(bytes.clone()),

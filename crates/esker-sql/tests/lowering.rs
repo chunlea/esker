@@ -58,9 +58,10 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
             "CREATE TABLE t (a int8 GENERATED ALWAYS AS IDENTITY (START WITH 100))",
             "a sequence option on an identity column",
         ),
-        // `serial` is `int4` under another name and this crate has no `int4`; the refusal names
-        // what the user wrote (ADR 0031).
-        ("CREATE TABLE t (a serial)", "serial"),
+        // `serial` is `int4` under another name and **runs** since ADR 0033 gave this node an
+        // `int4`; `tests/ddl.rs` asserts what it builds. `smallserial` is `int2`, which is the
+        // next type in tier 1's order and is refused by name until it lands — the same shape
+        // `serial` was in, and for the same reason.
         ("CREATE TABLE t (a smallserial)", "smallserial"),
         (
             "ALTER TABLE t ADD COLUMN b bigserial",
@@ -77,8 +78,11 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
             "PARTITION BY",
         ),
         ("CREATE TABLE t (a int8) INHERITS (u)", "INHERITS"),
-        ("CREATE TABLE t (a int4)", "the type INT"),
+        // `int4` runs since ADR 0033. What is left of tier 1 is refused by name, in the order
+        // that ADR gives them, and each of these lines is deleted by the unit that lands its type.
         ("CREATE TABLE t (a varchar(10))", "the type VARCHAR"),
+        ("CREATE TABLE t (a int2)", "the type INT2"),
+        ("CREATE TABLE t (a real)", "the type REAL"),
         ("CREATE TABLE t (a numeric)", "the type NUMERIC"),
         ("CREATE TABLE t (a timestamp)", "the type TIMESTAMP"),
         ("CREATE TABLE t (a int8[])", "the type"),

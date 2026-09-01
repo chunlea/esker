@@ -165,6 +165,7 @@ impl RowDecoder for TableDecoder {
 fn columnar_type(ty: StoredType) -> esker_columnar::ColumnType {
     match ty {
         StoredType::Int8 => esker_columnar::ColumnType::Int8,
+        StoredType::Int4 => esker_columnar::ColumnType::Int4,
         StoredType::Text => esker_columnar::ColumnType::Text,
         StoredType::Bool => esker_columnar::ColumnType::Bool,
         StoredType::Bytea => esker_columnar::ColumnType::Bytea,
@@ -178,6 +179,7 @@ fn value_of(datum: &Datum) -> Value {
     match datum {
         Datum::Null => Value::Null,
         Datum::Int8(int) => Value::Int8(*int),
+        Datum::Int4(int) => Value::Int4(*int),
         Datum::Text(text) => Value::Text(text.clone()),
         Datum::Bool(flag) => Value::Bool(*flag),
         Datum::Bytea(bytes) => Value::Bytea(bytes.clone()),

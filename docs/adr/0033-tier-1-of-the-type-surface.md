@@ -138,6 +138,25 @@ Checked rather than assumed, and it is the reason this is one unit rather than a
 the brief that commissioned the unit, which grants `crates/esker-keys/**` and
 `crates/esker-columnar/**` *for exactly these types* and requires this ADR first.
 
+### What this section missed, found by building `int4`
+
+**A fourth format: the fragment result wire.** `esker_proto::fragment::result::ValueType` is a
+frozen tag byte of its own, mirroring `esker_columnar::Value` without linking it, and a new stored
+type leaves it incomplete — `esker-store`'s translation between the two is a *total* match on
+purpose, "so that a seventh type added to either side is a compile error here rather than a column
+that silently reads NULL", and that is exactly what happened. The alternatives were all worse than
+appending: widening an `int4` to the wire's `int8` would tell the receiver a type the column does
+not have and break the row/column differential that compares a fragment against a row scan, and
+there is no error channel on that path to refuse through.
+
+So the tag is appended the same way the columnar one is — `Int4` is 7, the six below it do not
+move, and a peer that has not learned it answers `unknown type tag` rather than reading four bytes
+as eight. **`crates/esker-proto/**` and `crates/esker-store/**` are outside the lane's grant**, and
+this is reported rather than assumed: the store's two arms are mechanical (`StoredType::Int4` →
+`ColumnType::Int4`, `Datum::Int4` → `Value::Int4`) and the proto change is one variant, one tag and
+one four-byte framing. Every tier-2 type will need the same fourth edit, and this section is here
+so the next one budgets for it.
+
 ## Consequences
 
 * `ColumnType::ALL` goes from six to twelve, and every `match` over it is a compile error until it

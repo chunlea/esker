@@ -112,7 +112,12 @@ impl ColumnData {
     #[must_use]
     pub fn empty(ty: ColumnType) -> Self {
         match ty {
-            ColumnType::Int8 | ColumnType::TimestampTz => ColumnData::Ints(Vec::new()),
+            // An `Int4` rides in the `Ints` run, widened. The *column* carries its type tag, so
+            // there is nothing ambiguous about it, and a second integer run would be a second
+            // encoding to keep in step for no gain — the values are the same values.
+            ColumnType::Int8 | ColumnType::TimestampTz | ColumnType::Int4 => {
+                ColumnData::Ints(Vec::new())
+            }
             ColumnType::Double => ColumnData::Doubles(Vec::new()),
             ColumnType::Bool => ColumnData::Bools(Vec::new()),
             ColumnType::Text | ColumnType::Bytea => ColumnData::Bytes {
@@ -146,7 +151,7 @@ impl ColumnData {
             (self, ty),
             (
                 ColumnData::Ints(_),
-                ColumnType::Int8 | ColumnType::TimestampTz
+                ColumnType::Int8 | ColumnType::TimestampTz | ColumnType::Int4
             ) | (ColumnData::Doubles(_), ColumnType::Double)
                 | (ColumnData::Bools(_), ColumnType::Bool)
                 | (
@@ -372,6 +377,7 @@ impl ColumnBuilder {
         match value {
             Value::Null => {}
             Value::Int8(v) | Value::TimestampTz(v) => self.ints.push(*v),
+            Value::Int4(v) => self.ints.push(i64::from(*v)),
             Value::Double(v) => self.doubles.push(*v),
             Value::Bool(v) => self.bools.push(*v),
             Value::Text(v) => self.push_bytes(v.as_bytes())?,
@@ -416,7 +422,7 @@ impl ColumnBuilder {
     pub fn finish(&mut self) -> Result<Column> {
         let nulls = NullMask::from_bools(&self.nulls);
         let data = match self.ty {
-            ColumnType::Int8 | ColumnType::TimestampTz => {
+            ColumnType::Int8 | ColumnType::TimestampTz | ColumnType::Int4 => {
                 ColumnData::Ints(std::mem::take(&mut self.ints))
             }
             ColumnType::Double => ColumnData::Doubles(std::mem::take(&mut self.doubles)),

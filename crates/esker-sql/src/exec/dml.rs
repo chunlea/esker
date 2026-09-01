@@ -100,6 +100,20 @@ fn finish(returned: Option<Returned>, tag: String) -> Outcome {
     }
 }
 
+/// A sequence's next value, as the column that takes it.
+///
+/// A sequence counts in `i64` whatever width it fills, so an `integer` identity column narrows
+/// here — and a sequence that has run past 2^31 answers the same `22003` a constant that far out
+/// would, which is what a real server does when a `serial` runs out rather than wrapping.
+fn sequence_datum(ty: ColumnType, value: i64) -> Result<Datum> {
+    Ok(match ty {
+        ColumnType::Int4 => Datum::Int4(
+            i32::try_from(value).map_err(|_| SqlError::IntegerLiteralOutOfRange(ty.name()))?,
+        ),
+        _ => Datum::Int8(value),
+    })
+}
+
 pub(super) fn insert(
     executor: &mut Executor,
     txn: &mut dyn Txn,
@@ -164,7 +178,14 @@ pub(super) fn insert(
             {
                 continue;
             }
-            row[sequence.column] = Datum::Int8(executor.next_sequence_value(sequence.id)?);
+            // Narrowed to the column's own width. A sequence counts in `i64` whatever it fills,
+            // so an `integer` identity column has to be told — and running past 2^31 is the same
+            // `22003` a constant that far out gets, which is what a real server answers when a
+            // `serial` runs out.
+            row[sequence.column] = sequence_datum(
+                table.columns[sequence.column].ty,
+                executor.next_sequence_value(sequence.id)?,
+            )?;
         }
         // A table with no declared key carries an internal row id the user cannot write, so the
         // executor fills it (`crate::catalog::TableDef::row_id`).
@@ -367,7 +388,10 @@ pub(super) fn update(
                 // `SET a = DEFAULT` is the column's own default, which for a sequence column is
                 // the next value and for every other one is the constant the catalog holds.
                 crate::plan::Expr::Default => match table.sequence_for(*ordinal) {
-                    Some(sequence) => Datum::Int8(executor.next_sequence_value(sequence.id)?),
+                    Some(sequence) => sequence_datum(
+                        table.columns[sequence.column].ty,
+                        executor.next_sequence_value(sequence.id)?,
+                    )?,
                     None => column.default.clone().unwrap_or(Datum::Null),
                 },
                 crate::plan::Expr::Literal(literal) => literal.assign(column.ty, &column.name)?,

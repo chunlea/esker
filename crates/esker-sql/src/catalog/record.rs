@@ -97,6 +97,9 @@ const TAG_BOOL: u8 = 3;
 const TAG_BYTEA: u8 = 4;
 const TAG_TIMESTAMPTZ: u8 = 5;
 const TAG_DOUBLE: u8 = 6;
+/// Appended by [ADR 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md), never
+/// renumbered: a record written before it has no tag above 6 and decodes unchanged.
+const TAG_INT4: u8 = 7;
 
 /// Tags for [`SchemaState`] as stored. Ours, and they must never move: an index read as the wrong
 /// state is an index a node writes when it should not, which is the whole failure ADR 0020 is about.
@@ -138,6 +141,7 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Bytea => TAG_BYTEA,
         ColumnType::TimestampTz => TAG_TIMESTAMPTZ,
         ColumnType::Double => TAG_DOUBLE,
+        ColumnType::Int4 => TAG_INT4,
     }
 }
 
@@ -149,6 +153,7 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_BYTEA => ColumnType::Bytea,
         TAG_TIMESTAMPTZ => ColumnType::TimestampTz,
         TAG_DOUBLE => ColumnType::Double,
+        TAG_INT4 => ColumnType::Int4,
         other => return Err(corrupt(format!("column type tag {other}"))),
     })
 }

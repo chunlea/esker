@@ -106,6 +106,9 @@ impl Bound {
         let fixed = || <[u8; 8]>::try_from(self.bytes.as_slice()).ok();
         Some(match ty {
             ColumnType::Int8 => Value::Int8(i64::from_le_bytes(fixed()?)),
+            ColumnType::Int4 => Value::Int4(i32::from_le_bytes(
+                <[u8; 4]>::try_from(self.bytes.as_slice()).ok()?,
+            )),
             ColumnType::TimestampTz => Value::TimestampTz(i64::from_le_bytes(fixed()?)),
             ColumnType::Double => Value::Double(f64::from_le_bytes(fixed()?)),
             ColumnType::Bool => Value::Bool(self.as_bool()?),
@@ -244,6 +247,8 @@ impl ColumnStats {
     pub fn fit(&self, ty: ColumnType) -> bool {
         let width = match ty {
             ColumnType::Int8 | ColumnType::TimestampTz | ColumnType::Double => Some(8),
+            // Its own width, which is what makes it a different type.
+            ColumnType::Int4 => Some(4),
             ColumnType::Bool => Some(1),
             ColumnType::Text | ColumnType::Bytea => None,
         };
@@ -688,6 +693,7 @@ mod tests {
     fn value_of(ty: ColumnType) -> impl Strategy<Value = Value> {
         let present = match ty {
             ColumnType::Int8 => any::<i64>().prop_map(Value::Int8).boxed(),
+            ColumnType::Int4 => any::<i32>().prop_map(Value::Int4).boxed(),
             ColumnType::TimestampTz => any::<i64>().prop_map(Value::TimestampTz).boxed(),
             ColumnType::Bool => any::<bool>().prop_map(Value::Bool).boxed(),
             ColumnType::Double => prop_oneof![
@@ -726,6 +732,15 @@ mod tests {
             let inside = match value {
                 Value::Int8(v) | Value::TimestampTz(v) => {
                     min.as_i64() <= Some(*v) && Some(*v) <= max.as_i64()
+                }
+                // A four-byte bound, read as its own width: `as_i64` wants eight and answers
+                // `None` for one, which would make this arm vacuously true.
+                Value::Int4(v) => {
+                    let read = |bound: &Bound| match bound.as_value(ColumnType::Int4) {
+                        Some(Value::Int4(value)) => Some(value),
+                        _ => None,
+                    };
+                    read(min) <= Some(*v) && Some(*v) <= read(max)
                 }
                 Value::Bool(v) => {
                     min.as_bool().is_some_and(|low| low <= *v)

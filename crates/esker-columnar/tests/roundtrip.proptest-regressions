@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 5a286ad35980d90b521bf0c7bb21716967678ffd067b1817a4b74cf54ad0c232 # shrinks to (schema, rows) = (Schema { columns: [ColumnDef { name: "c0", ty: Int4 }, ColumnDef { name: "c1", ty: Text }] }, [[Int4(-1779), Null]])
+cc 99e84a92932f2979b98705db30575a3c67833c123e2ec80ee1328c41cc45ca66 # shrinks to (schema, rows) = (Schema { columns: [ColumnDef { name: "c0", ty: Int4 }, ColumnDef { name: "c1", ty: TimestampTz }, ColumnDef { name: "c2", ty: Double }, ColumnDef { name: "c3", ty: Int8 }] }, [[Int4(0), TimestampTz(757382400005000), Double(NaN), Int8(-8196973576451524065)]]), stripe_rows = 35

@@ -91,12 +91,19 @@ pub enum ValueType {
     TimestampTz,
     /// A 64-bit float.
     Double,
+    /// A 32-bit signed integer.
+    ///
+    /// Appended by [ADR 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md), never
+    /// renumbered: a peer that has not learned it answers `unknown type tag` rather than reading
+    /// four bytes as eight, which is the direction this vocabulary is built to fail in.
+    Int4,
 }
 
 impl ValueType {
     /// Every type, so a test cannot silently skip one.
-    pub const ALL: [ValueType; 6] = [
+    pub const ALL: [ValueType; 7] = [
         ValueType::Int8,
+        ValueType::Int4,
         ValueType::Text,
         ValueType::Bool,
         ValueType::Bytea,
@@ -114,6 +121,7 @@ impl ValueType {
             ValueType::Bytea => 4,
             ValueType::TimestampTz => 5,
             ValueType::Double => 6,
+            ValueType::Int4 => 7,
         }
     }
 
@@ -126,6 +134,7 @@ impl ValueType {
             4 => ValueType::Bytea,
             5 => ValueType::TimestampTz,
             6 => ValueType::Double,
+            7 => ValueType::Int4,
             _ => return Err(DecodeError::invalid("result.type", "unknown type tag")),
         })
     }
@@ -152,6 +161,8 @@ pub enum Value {
     TimestampTz(i64),
     /// [`ValueType::Double`].
     Double(f64),
+    /// [`ValueType::Int4`].
+    Int4(i32),
 }
 
 impl Value {
@@ -166,6 +177,7 @@ impl Value {
             Value::Bytea(_) => ValueType::Bytea,
             Value::TimestampTz(_) => ValueType::TimestampTz,
             Value::Double(_) => ValueType::Double,
+            Value::Int4(_) => ValueType::Int4,
         })
     }
 
@@ -183,6 +195,12 @@ impl Value {
             Value::Double(v) => {
                 out.put_u8(ValueType::Double.tag());
                 out.put_u64(v.to_bits());
+            }
+            // Its own width on the wire, as it is on disk: four bytes, so a reader that knows the
+            // tag cannot mistake the framing.
+            Value::Int4(v) => {
+                out.put_u8(ValueType::Int4.tag());
+                out.put_u32(u32::from_le_bytes(v.to_le_bytes()));
             }
             Value::Bool(v) => {
                 out.put_u8(ValueType::Bool.tag());
@@ -214,6 +232,9 @@ impl Value {
             ValueType::Double => {
                 Value::Double(f64::from_bits(input.get_u64("result.value.double")?))
             }
+            ValueType::Int4 => Value::Int4(i32::from_le_bytes(
+                input.get_u32("result.value.int4")?.to_le_bytes(),
+            )),
             ValueType::Bool => Value::Bool(input.get_bool("result.value.bool")?),
             ValueType::Text => Value::Text(input.get_str("result.value.text")?.to_owned()),
             ValueType::Bytea => Value::Bytea(input.get_bytes("result.value.bytea")?.to_vec()),

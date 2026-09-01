@@ -362,8 +362,12 @@ impl Literal {
         match self {
             // `unknown` takes whatever type the other side has -- if it can be read as one.
             Literal::Null | Literal::String(_) => true,
-            Literal::Integer(_) => matches!(ty, ColumnType::Int8 | ColumnType::Double),
-            Literal::Decimal(_) => matches!(ty, ColumnType::Int8 | ColumnType::Double),
+            Literal::Integer(_) => {
+                matches!(ty, ColumnType::Int8 | ColumnType::Int4 | ColumnType::Double)
+            }
+            Literal::Decimal(_) => {
+                matches!(ty, ColumnType::Int8 | ColumnType::Int4 | ColumnType::Double)
+            }
             Literal::Bool(_) => matches!(ty, ColumnType::Bool),
             Literal::Typed(value) => value.fits(ty),
         }
@@ -390,6 +394,12 @@ impl Literal {
 
             Literal::Integer(value) => match ty {
                 ColumnType::Int8 => Ok(Datum::Int8(*value)),
+                // The range check is the type: a constant a real server refuses with `22003`
+                // must not be quietly accepted here, which is the whole argument ADR 0033 made
+                // for a distinct `int4` rather than an alias.
+                ColumnType::Int4 => i32::try_from(*value)
+                    .map(Datum::Int4)
+                    .map_err(|_| SqlError::IntegerLiteralOutOfRange(ColumnType::Int4.name())),
                 #[allow(
                     clippy::cast_precision_loss,
                     reason = "the widening is PostgreSQL's own assignment cast, and lossy the same way"
@@ -401,6 +411,10 @@ impl Literal {
             },
 
             Literal::Decimal(digits) => match ty {
+                // The same refusal `int8` gets, naming the column's own type.
+                ColumnType::Int4 => Err(SqlError::unsupported(format!(
+                    "assigning the numeric literal {digits} to the integer column \"{column}\""
+                ))),
                 // `numeric` has no signed zero, so `-0.0` in a `double precision` column is `0`
                 // and not `-0`. Measured: the literal goes through `numeric` on its way, and that
                 // is where the sign is lost.
@@ -431,6 +445,7 @@ impl Literal {
                     if *value { "true" } else { "false" }.to_owned(),
                 )),
                 ColumnType::Int8
+                | ColumnType::Int4
                 | ColumnType::Bytea
                 | ColumnType::TimestampTz
                 | ColumnType::Double => mismatch(),

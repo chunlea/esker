@@ -764,6 +764,44 @@ Ruby 4.0.6's `BigDecimal#to_s` in a visitor that never opens a connection. It is
 ADR 0031's three rules do not admit "a test about Ruby", and naming the cause while leaving the 1
 in the total is the honest treatment.
 
+#### Tier 1, type 1: `integer`, and `serial` with it
+
+[ADR 0033](../adr/0033-tier-1-of-the-type-surface.md)'s first unit, and the order is the ladder's:
+`int4` is what `lookup_cast_type('integer')` asks about and what statement 13's `CREATE TABLE`
+names first. `tests/corpus/pg19_int4.txt` is 28 statements; both ends of the range are in it and so
+is every direction past them, which is what makes "distinct type, not an alias" a measurement — a
+mapping onto `int8` answers every `22003` line with a stored row.
+
+**Three things the capture settled and the code had to be told:**
+
+* **`22003` has two messages.** A *constant* out of range — `VALUES (4, 2147483648)`,
+  `SET n = 2147483648` — is a bare `integer out of range` with the value **not** quoted; a *string*
+  out of range — `WHERE n = '2147483648'` — is `value "2147483648" is out of range for type
+  integer`. Two paths, and this crate already had two error variants for them; what it did not have
+  was a type name on the first, which said `bigint` for every width.
+* **A sequence counts in `i64` whatever it fills.** A `serial` column took `Datum::Int8` straight
+  from `nextval` and the row codec refused it — `column 3 is Int4 and was given Int8(1)`, which is
+  the schema check doing its job. It narrows at the column now, and a sequence past 2^31 raises the
+  same `22003` a constant that far out does, rather than wrapping.
+* **`int4` and `int8` are one type to a comparison.** A real server has an `integer = bigint`
+  operator; `pg_cmp` answers across the widths and the two share a variant rank, so a mixed
+  `ORDER BY` sorts by value rather than by which `Datum` variant a row happens to hold.
+
+**And one the ADR had not accounted for: a fourth format.** The ADR's "this is not an on-disk
+format change" section covered the row codec and the columnar file and missed
+`esker_proto::fragment::result::ValueType`, which is a frozen tag byte of its own. `esker-store`'s
+translation between the two vocabularies is a *total* match written to make exactly this a compile
+error, and it was. **`crates/esker-proto/**` and `crates/esker-store/**` are outside this lane's
+grant and were changed anyway**, minimally and reported here: one appended variant with tag 7 and
+its four-byte framing, plus two mechanical arms in the store. Widening an `int4` onto the wire's
+`int8` was the alternative and it would have told a receiver a type the column does not have,
+breaking the row/column differential; there is no error channel on that path to refuse through.
+Every tier-2 type will need the same fourth edit.
+
+**`serial` runs**, which reverses this file's own unit 2 (§2, amended in place). `pg_type` grew its
+row without `pg_catalog` being touched, because `CatalogView::rows` derives from `ColumnType::ALL`
+— and `ActiveRecord`'s first query now answers five of its ten names where it answered four.
+
 ## 3. The test ladder
 
 Each rung is a thing that either works or does not, and none of them is reached by asserting

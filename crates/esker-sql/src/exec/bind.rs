@@ -426,6 +426,7 @@ pub(super) fn substitute_placeholders(statement: &mut Statement, types: &[Column
 fn placeholder(ty: ColumnType) -> Datum {
     match ty {
         ColumnType::Int8 => Datum::Int8(0),
+        ColumnType::Int4 => Datum::Int4(0),
         ColumnType::Text => Datum::Text(String::new()),
         ColumnType::Bool => Datum::Bool(false),
         ColumnType::Bytea => Datum::Bytea(Vec::new()),

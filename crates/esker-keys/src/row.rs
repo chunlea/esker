@@ -120,6 +120,9 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
         // Nothing is written for a NULL; the bitmap is what records it.
         Datum::Null => {}
         Datum::Int8(v) | Datum::TimestampTz(v) => out.extend_from_slice(&v.to_le_bytes()),
+        // Four bytes, not eight. Nothing written before `int4` existed has a column of this type,
+        // so the narrower width costs no compatibility and is what `pg_type.typlen` says it is.
+        Datum::Int4(v) => out.extend_from_slice(&v.to_le_bytes()),
         Datum::Bool(v) => out.push(u8::from(*v)),
         Datum::Double(v) => out.extend_from_slice(&v.to_le_bytes()),
         Datum::Text(v) => {
@@ -269,6 +272,10 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
             };
             (value, rest)
         }
+        ColumnType::Int4 => {
+            let (head, rest) = bytes.split_first_chunk::<4>().ok_or_else(truncated)?;
+            (Datum::Int4(i32::from_le_bytes(*head)), rest)
+        }
         ColumnType::Bool => {
             let (&byte, rest) = bytes.split_first().ok_or_else(truncated)?;
             // Any other byte is a value we never wrote; refusing it keeps a corrupt row from
@@ -402,6 +409,11 @@ fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
     match value {
         Datum::Null => {}
         Datum::Int8(v) | Datum::TimestampTz(v) => codec::encode_i64(*v, out),
+        // Widened to the `i64` encoding rather than given one of its own: an index key has to sort
+        // by value and the memcomparable `i64` form already does, for every `i32` there is. A
+        // second encoding would be a second thing to get wrong for no gain — a key is not a row,
+        // and nothing reads its width back except the decoder beside it, which knows the type.
+        Datum::Int4(v) => codec::encode_i64(i64::from(*v), out),
         // One byte, already in order: false is 0 and true is 1.
         Datum::Bool(v) => out.push(u8::from(*v)),
         // Sign-magnitude does not sort as an integer does, and PostgreSQL has fewer floats than
@@ -461,6 +473,12 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         ColumnType::Int8 => {
             let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
             (Datum::Int8(value), rest)
+        }
+        ColumnType::Int4 => {
+            let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
+            let value = i32::try_from(value)
+                .map_err(|_| corrupt(format!("index key holds {value}, which is not an int4")))?;
+            (Datum::Int4(value), rest)
         }
         ColumnType::TimestampTz => {
             let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
@@ -901,6 +919,7 @@ mod tests {
         use proptest::prelude::*;
         let values: BoxedStrategy<Datum> = match ty {
             ColumnType::Int8 => any::<i64>().prop_map(Datum::Int8).boxed(),
+            ColumnType::Int4 => any::<i32>().prop_map(Datum::Int4).boxed(),
             ColumnType::Text => ".{0,32}".prop_map(Datum::Text).boxed(),
             ColumnType::Bool => any::<bool>().prop_map(Datum::Bool).boxed(),
             ColumnType::Bytea => proptest::collection::vec(any::<u8>(), 0..32)

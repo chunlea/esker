@@ -264,11 +264,13 @@ pub enum SqlError {
         value: String,
     },
 
-    /// An integer *literal* too large for `bigint`. PostgreSQL words this one in three words,
-    /// where the same overflow reached through the type's input function gets
-    /// [`SqlError::IntegerOutOfRange`]'s longer message. Two paths, two messages, both captured.
-    #[error("bigint out of range")]
-    IntegerLiteralOutOfRange,
+    /// An integer *literal* too large for the type it is going into. PostgreSQL words this one in
+    /// three words, where the same overflow reached through the type's input function gets
+    /// [`SqlError::IntegerOutOfRange`]'s longer message. Two paths, two messages, both captured —
+    /// `INSERT INTO t (n) VALUES (2147483648)` is `integer out of range` and
+    /// `WHERE n = '2147483648'` is `value "2147483648" is out of range for type integer`.
+    #[error("{0} out of range")]
+    IntegerLiteralOutOfRange(&'static str),
 
     /// More expressions in a `VALUES` tuple than there are columns to put them in. PostgreSQL
     /// calls this a *syntax* error, which it decides before looking at any of the values.
@@ -804,7 +806,7 @@ impl SqlError {
             }
             SqlError::IntegerOutOfRange { .. }
             | SqlError::FloatOutOfRange { .. }
-            | SqlError::IntegerLiteralOutOfRange
+            | SqlError::IntegerLiteralOutOfRange(_)
             | SqlError::BigintOutOfRange
             | SqlError::SetvalOutOfBounds { .. } => sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
             SqlError::InvalidDatetimeFormat { .. } => sqlstate::INVALID_DATETIME_FORMAT,

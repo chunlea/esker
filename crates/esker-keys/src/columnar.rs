@@ -60,6 +60,10 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Bytea => 4,
         ColumnType::TimestampTz => 5,
         ColumnType::Double => 6,
+        // Appended, never renumbered: an old file has no tag above 6 and reads unchanged, and a
+        // reader that meets one it does not know answers corruption rather than guessing
+        // ([ADR 0033](../../docs/adr/0033-tier-1-of-the-type-surface.md)).
+        ColumnType::Int4 => 7,
     }
 }
 
@@ -71,6 +75,7 @@ fn type_of(tag: u8) -> Result<ColumnType, RowError> {
         4 => ColumnType::Bytea,
         5 => ColumnType::TimestampTz,
         6 => ColumnType::Double,
+        7 => ColumnType::Int4,
         other => {
             return Err(RowError::Corrupt(format!(
                 "column type tag {other} is not one of ours"

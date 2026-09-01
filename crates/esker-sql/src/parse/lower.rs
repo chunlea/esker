@@ -1400,7 +1400,7 @@ fn lower_value(value: &Value, negated: bool) -> Result<plan::Expr> {
                 // too large is caught on a different path in PostgreSQL and says so differently.
                 plan::Literal::Integer(
                     text.parse()
-                        .map_err(|_| SqlError::IntegerLiteralOutOfRange)?,
+                        .map_err(|_| SqlError::IntegerLiteralOutOfRange("bigint"))?,
                 )
             }
         }
@@ -1801,17 +1801,22 @@ fn lower_delete(delete: &sqlparser::ast::Delete) -> Result<plan::Delete> {
     })
 }
 
-/// The six types, under every spelling PostgreSQL accepts for them — and the two serial spellings,
+/// Every stored type, under every spelling PostgreSQL accepts for it — and the serial spellings,
 /// which are not types at all.
 ///
-/// `bigserial` is `bigint` plus a sequence, so it lowers to [`ColumnType::Int8`] and the caller
-/// reads [`serial_identity`] to find out that a sequence goes with it. `serial` is `integer` plus a
-/// sequence, and this crate has no `integer`: it is refused by the same sentence `int4` gets, which
-/// is the point — accepting it as an `int8` would take every value between 2^31 and 2^63 that a
-/// real server answers `22003` for.
+/// A serial is its integer plus a sequence: `bigserial` lowers to [`ColumnType::Int8`] and
+/// `serial` to [`ColumnType::Int4`], with the caller reading [`serial_identity`] to find out that
+/// a sequence goes with it. `serial` was `0A000` until [ADR
+/// 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md), and only because `int4` was
+/// missing — accepting it as an `int8` would have taken every value between 2^31 and 2^63 that a
+/// real server answers `22003` for. With `int4` there is nothing left of that argument.
 fn lower_type(data_type: &DataType) -> Result<ColumnType> {
     Ok(match data_type {
         DataType::Int8(None) | DataType::BigInt(None) => ColumnType::Int8,
+        // `int`, `int4` and `integer` are one type under three spellings, and `sqlparser` gives
+        // each its own variant. A display width — `int(11)` — is MySQL's and is refused below
+        // with the type as the user wrote it.
+        DataType::Int4(None) | DataType::Int(None) | DataType::Integer(None) => ColumnType::Int4,
         DataType::Text => ColumnType::Text,
         DataType::Bool | DataType::Boolean => ColumnType::Bool,
         DataType::Bytea => ColumnType::Bytea,
@@ -1821,10 +1826,14 @@ fn lower_type(data_type: &DataType) -> Result<ColumnType> {
         DataType::Timestamp(None, TimezoneInfo::Tz | TimezoneInfo::WithTimeZone) => {
             ColumnType::TimestampTz
         }
-        // `bigserial` is `bigint` plus a sequence, and `sqlparser` 0.62 has no variant for it --
-        // it arrives as a custom type name. `serial` and `smallserial` arrive the same way and
-        // fall through to the refusal below, which names what the user wrote.
-        other if serial_identity(other).is_some() => ColumnType::Int8,
+        // `bigserial` and `serial` are `bigint`/`integer` plus a sequence, and `sqlparser` 0.62
+        // has no variant for either -- both arrive as a custom type name. `smallserial` arrives
+        // the same way and falls through to the refusal below until `int2` lands, which names
+        // what the user wrote.
+        other if serial_identity(other).is_some() => match serial_width(other) {
+            Some(ty) => ty,
+            None => return Err(SqlError::unsupported(format!("the type {other}"))),
+        },
         other => return Err(SqlError::unsupported(format!("the type {other}"))),
     })
 }
@@ -1863,11 +1872,30 @@ fn identity_kind(
 /// `smallserial` and `serial` are refused by [`lower_type`] before this is reached, so the only
 /// one that answers `Some` is `bigserial`.
 fn serial_identity(data_type: &DataType) -> Option<plan::Identity> {
+    serial_width(data_type).map(|_| plan::Identity::Default)
+}
+
+/// The integer a serial spelling stands for, or `None` if it is not one.
+///
+/// Measured rather than assumed: a real server reports a `serial` column as `integer`, `NOT NULL`,
+/// `DEFAULT nextval('t_a_seq'::regclass)` — a serial is not a type, it is three things this node
+/// already has. `smallserial` waits for `int2` and is refused by name until then, which is the
+/// same shape `serial` itself was in before this ADR.
+fn serial_width(data_type: &DataType) -> Option<ColumnType> {
     let DataType::Custom(name, modifiers) = data_type else {
         return None;
     };
-    (modifiers.is_empty() && name.to_string().eq_ignore_ascii_case("bigserial"))
-        .then_some(plan::Identity::Default)
+    if !modifiers.is_empty() {
+        return None;
+    }
+    let name = name.to_string();
+    if name.eq_ignore_ascii_case("bigserial") || name.eq_ignore_ascii_case("serial8") {
+        return Some(ColumnType::Int8);
+    }
+    if name.eq_ignore_ascii_case("serial") || name.eq_ignore_ascii_case("serial4") {
+        return Some(ColumnType::Int4);
+    }
+    None
 }
 
 /// An index's columns, which must be plain names: an expression index is a different feature.

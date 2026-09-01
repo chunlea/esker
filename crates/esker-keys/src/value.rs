@@ -60,6 +60,13 @@ pub fn f64_of_sort_bits(bits: u64) -> f64 {
 pub enum ColumnType {
     /// 64-bit integer. PostgreSQL calls it `bigint` in messages and `int8` in DDL.
     Int8,
+    /// 32-bit integer. PostgreSQL calls it `integer` in messages and `int4` in DDL.
+    ///
+    /// A **distinct type and not an alias for [`ColumnType::Int8`]** ([ADR
+    /// 0033](../../docs/adr/0033-tier-1-of-the-type-surface.md)): a client asking what a column is
+    /// gets `int4`'s OID, and a value between 2^31 and 2^63 is `22003` here as it is on a real
+    /// server rather than being quietly accepted.
+    Int4,
     /// Variable-length UTF-8 string.
     Text,
     /// Two-valued, with no third state but NULL.
@@ -74,8 +81,9 @@ pub enum ColumnType {
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 6] = [
+    pub const ALL: [ColumnType; 7] = [
         ColumnType::Int8,
+        ColumnType::Int4,
         ColumnType::Text,
         ColumnType::Bool,
         ColumnType::Bytea,
@@ -97,6 +105,9 @@ pub enum Datum {
     Null,
     /// [`ColumnType::Int8`].
     Int8(i64),
+    /// [`ColumnType::Int4`]. Four bytes on disk, and four bytes is the point: the width is what
+    /// makes it a different type from an `int8` that happens to hold a small number.
+    Int4(i32),
     /// [`ColumnType::Text`]. Always valid UTF-8: the server encoding is UTF8, and bytes that are
     /// not are refused on the way in the way PostgreSQL refuses them.
     Text(String),
@@ -119,6 +130,7 @@ impl PartialEq for Datum {
             (Datum::Int8(a), Datum::Int8(b)) | (Datum::TimestampTz(a), Datum::TimestampTz(b)) => {
                 a == b
             }
+            (Datum::Int4(a), Datum::Int4(b)) => a == b,
             (Datum::Text(a), Datum::Text(b)) => a == b,
             (Datum::Bool(a), Datum::Bool(b)) => a == b,
             (Datum::Bytea(a), Datum::Bytea(b)) => a == b,
@@ -139,6 +151,7 @@ impl Datum {
         Some(match self {
             Datum::Null => return None,
             Datum::Int8(_) => ColumnType::Int8,
+            Datum::Int4(_) => ColumnType::Int4,
             Datum::Text(_) => ColumnType::Text,
             Datum::Bool(_) => ColumnType::Bool,
             Datum::Bytea(_) => ColumnType::Bytea,

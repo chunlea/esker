@@ -69,6 +69,7 @@ impl PgType for ColumnType {
             ColumnType::Bool => 16,
             ColumnType::Bytea => 17,
             ColumnType::Int8 => 20,
+            ColumnType::Int4 => 23,
             ColumnType::Text => 25,
             ColumnType::Double => 701,
             ColumnType::TimestampTz => 1184,
@@ -78,6 +79,7 @@ impl PgType for ColumnType {
     fn name(self) -> &'static str {
         match self {
             ColumnType::Int8 => "bigint",
+            ColumnType::Int4 => "integer",
             ColumnType::Text => "text",
             ColumnType::Bool => "boolean",
             ColumnType::Bytea => "bytea",
@@ -89,6 +91,7 @@ impl PgType for ColumnType {
     fn type_len(self) -> i16 {
         match self {
             ColumnType::Bool => 1,
+            ColumnType::Int4 => 4,
             ColumnType::Int8 | ColumnType::TimestampTz | ColumnType::Double => 8,
             ColumnType::Text | ColumnType::Bytea => -1,
         }
@@ -150,6 +153,7 @@ impl PgDatum for Datum {
         Some(match self {
             Datum::Null => return None,
             Datum::Int8(v) => v.to_string(),
+            Datum::Int4(v) => v.to_string(),
             Datum::Text(v) => v.clone(),
             // One character. See the module note: the `::text` cast says `true`, the output
             // function says `t`, and the wire carries the output function.
@@ -171,6 +175,7 @@ impl PgDatum for Datum {
     fn from_text(ty: ColumnType, text: &str) -> Result<Datum> {
         Ok(match ty {
             ColumnType::Int8 => Datum::Int8(parse_int8(text)?),
+            ColumnType::Int4 => Datum::Int4(parse_int4(text)?),
             ColumnType::Text => Datum::Text(text.to_owned()),
             ColumnType::Bool => Datum::Bool(parse_bool(text)?),
             ColumnType::Bytea => Datum::Bytea(parse_bytea(text)?),
@@ -183,6 +188,7 @@ impl PgDatum for Datum {
         Some(match self {
             Datum::Null => return None,
             Datum::Int8(v) | Datum::TimestampTz(v) => v.to_be_bytes().to_vec(),
+            Datum::Int4(v) => v.to_be_bytes().to_vec(),
             Datum::Bool(v) => vec![u8::from(*v)],
             Datum::Double(v) => v.to_be_bytes().to_vec(),
             Datum::Text(v) => v.as_bytes().to_vec(),
@@ -208,6 +214,10 @@ impl PgDatum for Datum {
                     ColumnType::TimestampTz => Datum::TimestampTz(i64::from_be_bytes(head)),
                     _ => Datum::Double(f64::from_be_bytes(head)),
                 }
+            }
+            ColumnType::Int4 => {
+                let head: [u8; 4] = fixed(4)?.try_into().unwrap_or([0; 4]);
+                Datum::Int4(i32::from_be_bytes(head))
             }
             ColumnType::Bool => match fixed(1)?[0] {
                 0 => Datum::Bool(false),
@@ -237,6 +247,12 @@ impl PgDatum for Datum {
             (Datum::Int8(a), Datum::Int8(b)) | (Datum::TimestampTz(a), Datum::TimestampTz(b)) => {
                 a.cmp(b)
             }
+            // Across the two widths, because PostgreSQL has an `int4 = int8` operator and answers
+            // `1::integer = 1::bigint` with `t`. Widening is exact in this direction, so there is
+            // no rounding to argue about — an `i32` is an `i64`.
+            (Datum::Int4(a), Datum::Int4(b)) => a.cmp(b),
+            (Datum::Int4(a), Datum::Int8(b)) => i64::from(*a).cmp(b),
+            (Datum::Int8(a), Datum::Int4(b)) => a.cmp(&i64::from(*b)),
             // Byte order, not the database's collation: see `crate::row` for why that is a
             // decision and not an oversight.
             (Datum::Text(a), Datum::Text(b)) => a.as_bytes().cmp(b.as_bytes()),
@@ -256,7 +272,9 @@ impl PgDatum for Datum {
 fn variant_rank(value: &Datum) -> u8 {
     match value {
         Datum::Bool(_) => 0,
-        Datum::Int8(_) => 1,
+        // The two integer widths share a rank: they are one type to a comparison, and `pg_cmp`
+        // answers the pair above rather than falling through to here.
+        Datum::Int8(_) | Datum::Int4(_) => 1,
         Datum::Double(_) => 2,
         Datum::TimestampTz(_) => 3,
         Datum::Text(_) => 4,
@@ -266,6 +284,31 @@ fn variant_rank(value: &Datum) -> u8 {
 }
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
+
+/// PostgreSQL's `int4in`, which is `pg_strtoint32_safe` — the same lexer as the 64-bit one with a
+/// narrower accumulator, so `0x` literals and `_` separators are taken here too.
+///
+/// It is **not** `parse_int8` with a range check afterwards, and the difference is the message: a
+/// real server says `value "2147483648" is out of range for type integer`, naming `integer`, where
+/// running the wide parser first and narrowing would name `bigint` for a value that is a perfectly
+/// good `bigint`. Measured on 19beta1.
+fn parse_int4(text: &str) -> Result<i32> {
+    let wide = parse_int8(text).map_err(|error| match error {
+        SqlError::InvalidTextRepresentation { .. } => SqlError::InvalidTextRepresentation {
+            ty: ColumnType::Int4.name(),
+            value: text.to_owned(),
+        },
+        SqlError::IntegerOutOfRange { .. } => SqlError::IntegerOutOfRange {
+            ty: ColumnType::Int4.name(),
+            value: text.to_owned(),
+        },
+        other => other,
+    })?;
+    i32::try_from(wide).map_err(|_| SqlError::IntegerOutOfRange {
+        ty: ColumnType::Int4.name(),
+        value: text.to_owned(),
+    })
+}
 
 /// PostgreSQL's `pg_strtoint64_safe`, which is more than a decimal parser: it takes the
 /// non-decimal literals the lexer gained in PostgreSQL 16 and the digit separators with them.

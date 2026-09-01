@@ -143,6 +143,10 @@ fn activerecord_s_four_type_map_queries_answer() {
         vec![
             vec!["16", "bool"],
             vec!["20", "int8"],
+            // `int4` arrived with ADR 0033 and the catalog grew a row for it without being
+            // touched, because `CatalogView::rows` is derived from `ColumnType::ALL`. Five of
+            // this query's ten names are answered now where four were.
+            vec!["23", "int4"],
             vec!["701", "float8"],
             vec!["1184", "timestamptz"],
         ]
@@ -165,6 +169,7 @@ fn activerecord_s_four_type_map_queries_answer() {
             vec!["16", "bool", "0", ",", "boolin", "\\N", "b", "0"],
             vec!["17", "bytea", "0", ",", "byteain", "\\N", "b", "0"],
             vec!["20", "int8", "0", ",", "int8in", "\\N", "b", "0"],
+            vec!["23", "int4", "0", ",", "int4in", "\\N", "b", "0"],
             vec!["25", "text", "0", ",", "textin", "\\N", "b", "0"],
             vec!["701", "float8", "0", ",", "float8in", "\\N", "b", "0"],
             vec![
@@ -272,7 +277,11 @@ fn a_star_expands_to_every_column_of_the_view() {
         node.rows("SELECT t.* FROM pg_type AS t WHERE t.oid = 20"),
         vec![vec!["20", "int8", "0", ",", "int8in", "b", "0"]]
     );
-    assert_eq!(node.rows("SELECT * FROM pg_type").len(), 6);
+    assert_eq!(
+        node.rows("SELECT * FROM pg_type").len(),
+        esker_sql::value::ColumnType::ALL.len(),
+        "one row per type this server has, and the catalog cannot fall behind the enum"
+    );
 
     // `pg_range` is empty, so its columns can only be read off the description.
     match node.answer("SELECT * FROM pg_range") {

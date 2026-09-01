@@ -9,8 +9,9 @@
 //!
 //! # What is in it, and why it is short
 //!
-//! **`pg_type` lists the types this server has.** Six, with PostgreSQL's own OIDs for them,
-//! because those are the OIDs a `RowDescription` from this node carries. The alternative was to
+//! **`pg_type` lists the types this server has**, with PostgreSQL's own OIDs for them, because
+//! those are the OIDs a `RowDescription` from this node carries. It grows as the type surface does
+//! and cannot be forgotten: the rows are derived from `ColumnType::ALL`. The alternative was to
 //! list PostgreSQL's standard set — `int4` is 23, `numeric` is 1700 — and that would tell a client
 //! this server has types it answers `0A000` for.
 //!
@@ -122,8 +123,8 @@ impl CatalogView {
     #[must_use]
     pub fn rows(self) -> Vec<Vec<Datum>> {
         match self {
-            // Derived from `ColumnType::ALL` rather than written out, so a seventh type cannot be
-            // added to this node and left out of its own `pg_type`.
+            // Derived from `ColumnType::ALL` rather than written out, so a type cannot be added
+            // to this node and left out of its own `pg_type`.
             CatalogView::PgType => {
                 let mut rows: Vec<Vec<Datum>> = ColumnType::ALL
                     .iter()
@@ -226,6 +227,7 @@ pub fn refuse_write(name: &str) -> Result<()> {
 fn typname(ty: ColumnType) -> &'static str {
     match ty {
         ColumnType::Int8 => "int8",
+        ColumnType::Int4 => "int4",
         ColumnType::Text => "text",
         ColumnType::Bool => "bool",
         ColumnType::Bytea => "bytea",
@@ -243,6 +245,7 @@ fn typname(ty: ColumnType) -> &'static str {
 fn typinput(ty: ColumnType) -> &'static str {
     match ty {
         ColumnType::Int8 => "int8in",
+        ColumnType::Int4 => "int4in",
         ColumnType::Text => "textin",
         ColumnType::Bool => "boolin",
         ColumnType::Bytea => "byteain",

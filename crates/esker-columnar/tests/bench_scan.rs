@@ -61,6 +61,7 @@ fn encode_row(values: &[Value]) -> Vec<u8> {
         match value {
             Value::Null => out[bitmap_at + index / 8] |= 1 << (index % 8),
             Value::Int8(v) | Value::TimestampTz(v) => out.extend_from_slice(&v.to_le_bytes()),
+            Value::Int4(v) => out.extend_from_slice(&v.to_le_bytes()),
             Value::Double(v) => out.extend_from_slice(&v.to_le_bytes()),
             Value::Bool(v) => out.push(u8::from(*v)),
             Value::Text(v) => {
@@ -101,6 +102,12 @@ fn decode_row(types: &[ColumnType], bytes: &[u8]) -> Vec<Value> {
                 let value = Value::Int8(i64::from_le_bytes(fixed(at)));
                 at += 8;
                 value
+            }
+            ColumnType::Int4 => {
+                let mut four = [0u8; 4];
+                four.copy_from_slice(&bytes[at..at + 4]);
+                at += 4;
+                Value::Int4(i32::from_le_bytes(four))
             }
             ColumnType::TimestampTz => {
                 let value = Value::TimestampTz(i64::from_le_bytes(fixed(at)));

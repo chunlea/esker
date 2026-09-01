@@ -136,7 +136,7 @@ pub fn decode_column(
 
     let present = rows - null_count;
     let data = match ty {
-        ColumnType::Int8 | ColumnType::TimestampTz => {
+        ColumnType::Int8 | ColumnType::TimestampTz | ColumnType::Int4 => {
             ColumnData::Ints(integer::decode(encoding, &mut cursor, present)?)
         }
         ColumnType::Double => ColumnData::Doubles(double::decode(encoding, &mut cursor, present)?),
@@ -235,6 +235,7 @@ mod tests {
     fn value_of(ty: ColumnType) -> impl Strategy<Value = Value> {
         let present = match ty {
             ColumnType::Int8 => any::<i64>().prop_map(Value::Int8).boxed(),
+            ColumnType::Int4 => any::<i32>().prop_map(Value::Int4).boxed(),
             ColumnType::TimestampTz => (-1_000i64..1_000)
                 .prop_map(|d| Value::TimestampTz(757_382_400_000_000 + d * 1_000))
                 .boxed(),

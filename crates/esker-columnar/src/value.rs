@@ -41,11 +41,14 @@ pub fn pg_cmp_f64(left: f64, right: f64) -> Ordering {
     }
 }
 
-/// One of the six types a row carries (`esker_sql::value::ColumnType`).
+/// One of the types a row carries (`esker_sql::value::ColumnType`), mirrored here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ColumnType {
     /// 64-bit signed integer; PostgreSQL's `bigint`.
     Int8,
+    /// 32-bit signed integer; PostgreSQL's `integer`. A **distinct type** and not an `Int8` that
+    /// happens to be small ([ADR 0033](../../docs/adr/0033-tier-1-of-the-type-surface.md)).
+    Int4,
     /// Variable-length UTF-8 string.
     Text,
     /// Two-valued, with no third state but NULL.
@@ -60,8 +63,9 @@ pub enum ColumnType {
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 6] = [
+    pub const ALL: [ColumnType; 7] = [
         ColumnType::Int8,
+        ColumnType::Int4,
         ColumnType::Text,
         ColumnType::Bool,
         ColumnType::Bytea,
@@ -79,6 +83,8 @@ impl ColumnType {
             ColumnType::Bytea => 4,
             ColumnType::TimestampTz => 5,
             ColumnType::Double => 6,
+            // Appended, never renumbered: an old file has no tag above 6 and reads unchanged.
+            ColumnType::Int4 => 7,
         }
     }
 
@@ -91,6 +97,7 @@ impl ColumnType {
             4 => ColumnType::Bytea,
             5 => ColumnType::TimestampTz,
             6 => ColumnType::Double,
+            7 => ColumnType::Int4,
             other => {
                 return Err(Error::corruption(
                     "schema",
@@ -105,6 +112,7 @@ impl ColumnType {
     pub fn name(self) -> &'static str {
         match self {
             ColumnType::Int8 => "bigint",
+            ColumnType::Int4 => "integer",
             ColumnType::Text => "text",
             ColumnType::Bool => "boolean",
             ColumnType::Bytea => "bytea",
@@ -127,6 +135,8 @@ pub enum Value {
     Null,
     /// An [`ColumnType::Int8`].
     Int8(i64),
+    /// An [`ColumnType::Int4`].
+    Int4(i32),
     /// A [`ColumnType::Text`], already valid UTF-8 by construction.
     Text(String),
     /// A [`ColumnType::Bool`].
@@ -146,6 +156,7 @@ impl Value {
         match self {
             Value::Null => true,
             Value::Int8(_) => ty == ColumnType::Int8,
+            Value::Int4(_) => ty == ColumnType::Int4,
             Value::Text(_) => ty == ColumnType::Text,
             Value::Bool(_) => ty == ColumnType::Bool,
             Value::Bytea(_) => ty == ColumnType::Bytea,
@@ -166,6 +177,7 @@ impl Value {
         Some(match self {
             Value::Null => return None,
             Value::Int8(_) => ColumnType::Int8,
+            Value::Int4(_) => ColumnType::Int4,
             Value::Text(_) => ColumnType::Text,
             Value::Bool(_) => ColumnType::Bool,
             Value::Bytea(_) => ColumnType::Bytea,
@@ -180,6 +192,7 @@ impl Value {
         match self {
             Value::Null => ValueRef::Null,
             Value::Int8(v) | Value::TimestampTz(v) => ValueRef::Int(*v),
+            Value::Int4(v) => ValueRef::Int(i64::from(*v)),
             Value::Bool(v) => ValueRef::Bool(*v),
             Value::Double(v) => ValueRef::Double(*v),
             Value::Text(v) => ValueRef::Bytes(v.as_bytes()),
@@ -271,6 +284,13 @@ impl ValueRef<'_> {
             (ValueRef::Null, _) => Value::Null,
             (ValueRef::Int(v), ColumnType::Int8) => Value::Int8(v),
             (ValueRef::Int(v), ColumnType::TimestampTz) => Value::TimestampTz(v),
+            // Narrowed back from the widened run it rides in. A value outside `i32` cannot have
+            // been written by an `Int4` column, so it is corruption rather than a value to clamp.
+            (ValueRef::Int(v), ColumnType::Int4) => {
+                Value::Int4(i32::try_from(v).map_err(|_| {
+                    Error::corruption("column", format!("an integer column holds {v}"))
+                })?)
+            }
             (ValueRef::Bool(v), ColumnType::Bool) => Value::Bool(v),
             (ValueRef::Double(v), ColumnType::Double) => Value::Double(v),
             (ValueRef::Bytes(v), ColumnType::Bytea) => Value::Bytea(v.to_vec()),
@@ -412,12 +432,15 @@ mod tests {
         assert_eq!(ColumnType::Bytea.tag(), 4);
         assert_eq!(ColumnType::TimestampTz.tag(), 5);
         assert_eq!(ColumnType::Double.tag(), 6);
+        // Appended by ADR 0033, and the six above it did not move: an old file's tags still name
+        // the types they always named.
+        assert_eq!(ColumnType::Int4.tag(), 7);
 
         for ty in ColumnType::ALL {
             assert_eq!(ColumnType::from_tag(ty.tag()).unwrap(), ty);
         }
         assert!(ColumnType::from_tag(0).unwrap_err().is_corruption());
-        assert!(ColumnType::from_tag(7).unwrap_err().is_corruption());
+        assert!(ColumnType::from_tag(8).unwrap_err().is_corruption());
     }
 
     #[test]

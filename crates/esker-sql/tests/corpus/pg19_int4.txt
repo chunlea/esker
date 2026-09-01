@@ -1,0 +1,56 @@
+# `integer` / `int4`, as a real PostgreSQL 19beta1 answers it — tier 1's first type
+# ([ADR 0033](../../../../docs/adr/0033-tier-1-of-the-type-surface.md)).
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way against one node.
+# It builds its own table.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# WHAT MAKES IT A TYPE AND NOT AN ALIAS: the range. Both ends are here, and both directions past
+# them. A mapping onto `int8` would answer every one of the `22003` lines with a stored row.
+#
+# THE TRAP: **`22003` has two messages and they are not interchangeable.**
+#
+#   * a *constant* out of range — `VALUES (4, 2147483648)`, `SET n = 2147483648` — is a bare
+#     `integer out of range`, with the value **not** quoted;
+#   * a *string* out of range — `WHERE n = '2147483648'` — is `value "2147483648" is out of range
+#     for type integer`, with it quoted.
+#
+# One is the assignment noticing the constant will not fit and the other is `int4in` failing, and
+# an implementation that routed both through one of them would be right about the SQLSTATE and
+# wrong about the sentence. `'x'` distinguishes the same two paths under `22P02`, where the message
+# happens to agree.
+#
+# `serial` is here because it is not a type: column `s` is an `integer` that fills itself, and
+# `\gdesc` calls it `integer`. That is the whole of what ADR 0033 reverses.
+DROP TABLE IF EXISTS i4		-
+CREATE TABLE i4 (id integer PRIMARY KEY, n int, w int8, s serial)		-
+INSERT INTO i4 (id, n, w) VALUES (1, 10, 100)		-
+INSERT INTO i4 (id, n, w) VALUES (2, -2147483648, 200)		-
+INSERT INTO i4 (id, n, w) VALUES (3, 2147483647, 300)		-
+SELECT id, n, w, s FROM i4 ORDER BY id	integer,integer,bigint,integer	1|10|100|1 ; 2|-2147483648|200|2 ; 3|2147483647|300|3
+INSERT INTO i4 (id, n) VALUES (4, 2147483648)	!22003 integer out of range
+INSERT INTO i4 (id, n) VALUES (4, -2147483649)	!22003 integer out of range
+INSERT INTO i4 (id, n) VALUES (4, 'x')	!22P02 invalid input syntax for type integer: "x"
+INSERT INTO i4 (id, n) VALUES (4, '17')		-
+SELECT n FROM i4 WHERE id = 4	integer	17
+SELECT id FROM i4 WHERE n = 10	integer	1
+SELECT id FROM i4 WHERE n = '10'	integer	1
+SELECT id FROM i4 WHERE n = 10::int8	integer	1
+SELECT id FROM i4 WHERE n IN (10, 17) ORDER BY id	integer	1 ; 4
+SELECT id FROM i4 WHERE n > 0 ORDER BY id	integer	1 ; 3 ; 4
+SELECT id FROM i4 WHERE n = 'x'	!22P02 invalid input syntax for type integer: "x"
+SELECT id FROM i4 WHERE n = '2147483648'	!22003 value "2147483648" is out of range for type integer
+SELECT count(*), min(n), max(n) FROM i4	bigint,integer,integer	4|-2147483648|2147483647
+SELECT n FROM i4 ORDER BY n	integer	-2147483648 ; 10 ; 17 ; 2147483647
+SELECT id, n FROM i4 WHERE id = 1	integer,integer	1|10
+SELECT n = 10 FROM i4 WHERE id = 1	boolean	t
+SELECT n FROM i4 WHERE w = 100	integer	10
+SELECT id FROM i4 WHERE n IS NULL ORDER BY id	integer	-
+UPDATE i4 SET n = 5 WHERE id = 1		-
+SELECT n FROM i4 WHERE id = 1	integer	5
+UPDATE i4 SET n = 2147483648 WHERE id = 1	!22003 integer out of range
+DELETE FROM i4 WHERE id = 4		-
+SELECT count(*) FROM i4	bigint	3
