@@ -49,8 +49,9 @@ Three rules govern the exclusion list:
 2. **An entry that starts passing is deleted, and the deletion is a commit.** An exclusion list
    that only grows is a list nobody re-runs.
 3. **No entry may be added for a wrong answer.** A test excluded because this node returns
-   *different data* is a bug, not an exclusion, and it goes on the divergence table in
-   `docs/plans/phase-6a.md` §10a where a reader will find it — or it gets fixed.
+   *different data* is a bug, not an exclusion, and it goes on the divergence table
+   (`docs/plans/phase-9-rails.md` §6, which belongs beside `docs/plans/phase-6a.md` §10a) where a
+   reader will find it — or it gets fixed.
 
 ### The isolation level is the one caveat the number cannot absorb
 
@@ -76,7 +77,7 @@ differently
 Unit 1 is aggregates, and aggregates are where the six stored types (ADR 0030 — `int8`, `text`,
 `bool`, `bytea`, `timestamptz`, `float8`) meet a seventh that PostgreSQL has and this node does
 not. Every claim below was measured on the container and is recorded line by line in
-`crates/esker-sql/tests/corpus/pg19_aggregate.txt`.
+`crates/esker-sql/tests/corpus/pg19_aggregate.txt` — 145 probes.
 
 PostgreSQL types **`sum(bigint)` and `avg(bigint)` as `numeric`**. We cannot. The question is what
 to do about each, and the measurement gives two different answers, which is why they are decided

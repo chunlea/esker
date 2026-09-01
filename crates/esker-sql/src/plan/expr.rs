@@ -81,6 +81,91 @@ pub enum Expr {
         /// `IS NOT NULL`.
         negated: bool,
     },
+    /// An aggregate call — `count(*)`, `sum(a)`, `min(DISTINCT b)`.
+    ///
+    /// **Never evaluated.** It is a value *of a group*, not of a row, so the executor's
+    /// [`crate::exec`] row evaluator has no case for it: the planner replaces every one of these
+    /// with an [`Expr::Ordinal`] into the aggregated row before the tree is built. One reaching a
+    /// row evaluator is a planner bug and says so rather than returning a number.
+    Aggregate(Box<AggregateCall>),
+}
+
+/// The five aggregates this node computes.
+///
+/// PostgreSQL has dozens; these are the five `ActiveRecord`'s own calculations use — `count`, `sum`,
+/// `minimum`, `maximum`, `average` — and the four `esker-columnar`'s fragment evaluator already
+/// defines (`docs/plans/phase-7-columnar.md` M2), which is why the semantics below are a match
+/// rather than a second opinion. Everything else is `0A000` naming itself, contract C2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateFunc {
+    /// `count(*)` and `count(expr)`, which are different aggregates wearing one name.
+    Count,
+    /// `sum`, over `int8` and `float8`.
+    Sum,
+    /// `min`, in [`crate::value::PgDatum::pg_cmp`] order.
+    Min,
+    /// `max`, likewise.
+    Max,
+    /// `avg`, over `float8` only — `avg(int8)` is `numeric` on a real server and this node has no
+    /// `numeric` to be right with (`docs/adr/0031-rails-compatibility-is-measured.md`).
+    Avg,
+}
+
+impl AggregateFunc {
+    /// The five names, matched the way PostgreSQL matches them: case-insensitively, so `COUNT(*)`
+    /// and `Count(*)` are the same call. Measured — both forms execute on a real server.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "count" => Some(AggregateFunc::Count),
+            "sum" => Some(AggregateFunc::Sum),
+            "min" => Some(AggregateFunc::Min),
+            "max" => Some(AggregateFunc::Max),
+            "avg" => Some(AggregateFunc::Avg),
+            _ => None,
+        }
+    }
+
+    /// What it is called, in the lower case PostgreSQL's own messages use.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            AggregateFunc::Count => "count",
+            AggregateFunc::Sum => "sum",
+            AggregateFunc::Min => "min",
+            AggregateFunc::Max => "max",
+            AggregateFunc::Avg => "avg",
+        }
+    }
+}
+
+/// One aggregate call, as written.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggregateCall {
+    /// Which one.
+    pub func: AggregateFunc,
+    /// The arguments as written. Every one of the five takes exactly one; the rest are carried so
+    /// that the refusal can name their **types** the way a real server does — measured,
+    /// `count(n, g)` is `function count(bigint, text) does not exist`, and the types are not known
+    /// until the planner has resolved them.
+    pub args: Vec<Expr>,
+    /// `count(*)`: the argument list was a single `*`, so the call reads no value at all — which
+    /// is why it counts a row whose every column is NULL.
+    pub star: bool,
+    /// `DISTINCT` *inside* the parentheses: `count(DISTINCT a)`. Not the same clause as
+    /// `SELECT DISTINCT`, which is on [`crate::plan::Select`].
+    pub distinct: bool,
+}
+
+impl AggregateCall {
+    /// The single argument this call folds over, or `None` for `count(*)`.
+    ///
+    /// `None` for a call of the wrong arity too, which is why the planner checks the arity before
+    /// it asks.
+    #[must_use]
+    pub fn arg(&self) -> Option<&Expr> {
+        if self.star { None } else { self.args.first() }
+    }
 }
 
 /// The operators phase 6a evaluates.
@@ -278,5 +363,6 @@ fn describe(expr: &Expr) -> &'static str {
         Expr::Binary { .. } => "an operator",
         Expr::Not(_) => "NOT",
         Expr::IsNull { .. } => "IS NULL",
+        Expr::Aggregate(_) => "an aggregate function",
     }
 }

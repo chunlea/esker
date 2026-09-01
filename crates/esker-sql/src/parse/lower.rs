@@ -17,7 +17,7 @@
 
 use sqlparser::ast::{
     AlterTableOperation, AssignmentTarget, BinaryOperator, ColumnOption, CreateTableOptions,
-    DataType, DollarQuotedString, ExactNumberInfo, Expr, FromTable, GroupByExpr, Ident,
+    DataType, Distinct, DollarQuotedString, ExactNumberInfo, Expr, FromTable, GroupByExpr, Ident,
     IndexColumn, IndexType, JoinConstraint, JoinOperator, LimitClause, NullsDistinctOption,
     ObjectName, ObjectType, OffsetRows, OrderByKind, Query, SelectItem,
     SelectItemQualifiedWildcardKind, SetExpr, Statement, TableConstraint, TableFactor, TableObject,
@@ -55,7 +55,7 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
         // `SELECT` naming one is the verb rather than a column reference that does not resolve.
         Statement::Query(query) => match lower_verb(query)? {
             Some(verb) => Ok(plan::Statement::TimeMachine(verb)),
-            None => Ok(plan::Statement::Select(lower_query(query)?)),
+            None => Ok(plan::Statement::Select(Box::new(lower_query(query)?))),
         },
         Statement::Update(update) => Ok(plan::Statement::Update(lower_update(update)?)),
         Statement::Delete(delete) => Ok(plan::Statement::Delete(lower_delete(delete)?)),
@@ -1022,8 +1022,96 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                 right: Box::new(lower_expr(right)?),
             })
         }
+        Expr::Function(function) => lower_function(function),
         other => Err(SqlError::unsupported(format!("the expression {other}"))),
     }
+}
+
+/// A function call: one of the five aggregates, or `0A000` naming it.
+///
+/// Everything a real server would answer `42883` for is *also* refused here, so the distinction
+/// this function does not make -- a function PostgreSQL has and we do not, against one neither of
+/// us has -- is one no caller can act on anyway. What it must not do is execute a name it does not
+/// know, which is why the fall-through is a refusal rather than a lookup that returns NULL.
+fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
+    use sqlparser::ast::{
+        DuplicateTreatment, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments,
+    };
+
+    let name = function.name.to_string();
+    let Some(func) = plan::AggregateFunc::from_name(&name) else {
+        return Err(SqlError::unsupported(format!("the function {name}")));
+    };
+
+    // Each of these turns an aggregate into a different aggregate, so honouring the call and
+    // dropping the clause would answer a question the user did not ask.
+    refuse_if(function.over.is_some(), "a window function")?;
+    refuse_if(function.filter.is_some(), "an aggregate FILTER clause")?;
+    refuse_if(function.null_treatment.is_some(), "IGNORE/RESPECT NULLS")?;
+    refuse_if(!function.within_group.is_empty(), "WITHIN GROUP")?;
+
+    let FunctionArguments::List(FunctionArgumentList {
+        duplicate_treatment,
+        args,
+        clauses,
+    }) = &function.args
+    else {
+        // `count` with no parentheses at all cannot be an aggregate; PostgreSQL parses `count` as
+        // a column reference and answers `42703`, which is what a bare identifier already gets.
+        return Err(SqlError::unsupported(format!("the function {name}")));
+    };
+    if let Some(clause) = clauses.first() {
+        return Err(SqlError::unsupported(format!(
+            "an aggregate {clause} clause"
+        )));
+    }
+    let distinct = matches!(duplicate_treatment, Some(DuplicateTreatment::Distinct));
+
+    // A `*` mixed with anything else is not a call PostgreSQL's grammar has, and it says so with
+    // a syntax error rather than a missing function -- naming the comma when the `*` came first
+    // and the `*` when it did not. Both spellings were measured; `sqlparser` reads them both.
+    let star_at = args.iter().position(|arg| {
+        matches!(
+            arg,
+            FunctionArg::Unnamed(FunctionArgExpr::Wildcard | FunctionArgExpr::QualifiedWildcard(_))
+        )
+    });
+    if let Some(at) = star_at
+        && args.len() > 1
+    {
+        return Err(SqlError::SyntaxAtOrNear(if at == 0 { "," } else { "*" }));
+    }
+
+    let star = star_at.is_some();
+    if star && func != plan::AggregateFunc::Count {
+        // `sum(*)` and friends: PostgreSQL has no aggregate with a `*` form but `count`.
+        return Err(SqlError::unsupported(format!("{name}(*)")));
+    }
+    // `count()` is `42809` on a real server and says which spelling to use instead. Every other
+    // arity is `42883` naming the argument **types**, so it waits for the planner.
+    if args.is_empty() && func == plan::AggregateFunc::Count {
+        return Err(SqlError::ParameterlessAggregate);
+    }
+
+    let args = if star {
+        Vec::new()
+    } else {
+        args.iter()
+            .map(|arg| match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => lower_expr(expr),
+                other => Err(SqlError::unsupported(format!(
+                    "the aggregate argument {other}"
+                ))),
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    Ok(plan::Expr::Aggregate(Box::new(plan::AggregateCall {
+        func,
+        args,
+        star,
+        distinct,
+    })))
 }
 
 fn lower_value(value: &Value, negated: bool) -> Result<plan::Expr> {
@@ -1084,19 +1172,55 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
         }));
     };
 
-    refuse_if(select.distinct.is_some(), "SELECT DISTINCT")?;
+    // `DISTINCT` this node runs; `DISTINCT ON` is a different clause with a different answer --
+    // it keeps the first row per key rather than deduplicating the target list -- and is named
+    // rather than approximated by the one that is here.
+    let distinct = match &select.distinct {
+        // `SELECT ALL` is the default spelled out; PostgreSQL takes it and it changes nothing.
+        None | Some(Distinct::All) => false,
+        Some(Distinct::Distinct) => true,
+        Some(Distinct::On(_)) => return Err(SqlError::unsupported("SELECT DISTINCT ON")),
+    };
     refuse_if(select.top.is_some(), "SELECT TOP")?;
     refuse_if(select.into.is_some(), "SELECT INTO")?;
     refuse_if(!select.lateral_views.is_empty(), "a LATERAL VIEW")?;
     refuse_if(select.prewhere.is_some(), "PREWHERE")?;
-    refuse_if(
-        !matches!(select.group_by, GroupByExpr::Expressions(ref e, ref m) if e.is_empty() && m.is_empty()),
-        "GROUP BY",
-    )?;
+    // `GROUP BY` proper is executed; its four modifiers are not, and each is named. `GROUP BY
+    // ALL` is a different grammar again -- it is not PostgreSQL's, so it can only arrive from a
+    // dialect this crate does not offer.
+    let group_by = match &select.group_by {
+        GroupByExpr::Expressions(exprs, modifiers) => {
+            if let Some(modifier) = modifiers.first() {
+                return Err(SqlError::unsupported(format!("GROUP BY ... {modifier}")));
+            }
+            let mut keys = Vec::with_capacity(exprs.len());
+            for expr in exprs {
+                match expr {
+                    // `GROUP BY ()` is the **empty grouping set**: one group over everything,
+                    // which is the same answer as no `GROUP BY` at all -- measured, including
+                    // over an empty table, where it still returns one row of zero. Contributing
+                    // no key is exactly that, because the empty-input rule keys off whether any
+                    // key survives rather than off whether the clause was written.
+                    Expr::Tuple(items) if items.is_empty() => {}
+                    // `sqlparser` files these three as *expressions* rather than as modifiers, so
+                    // without this they would be refused as "the expression ROLLUP (a)" -- true,
+                    // and not the name a user would search the documentation for.
+                    Expr::Rollup(_) => return Err(SqlError::unsupported("GROUP BY ROLLUP")),
+                    Expr::Cube(_) => return Err(SqlError::unsupported("GROUP BY CUBE")),
+                    Expr::GroupingSets(_) => {
+                        return Err(SqlError::unsupported("GROUP BY GROUPING SETS"));
+                    }
+                    other => keys.push(lower_expr(other)?),
+                }
+            }
+            keys
+        }
+        GroupByExpr::All(_) => return Err(SqlError::unsupported("GROUP BY ALL")),
+    };
     refuse_if(!select.cluster_by.is_empty(), "CLUSTER BY")?;
     refuse_if(!select.distribute_by.is_empty(), "DISTRIBUTE BY")?;
     refuse_if(!select.sort_by.is_empty(), "SORT BY")?;
-    refuse_if(select.having.is_some(), "HAVING")?;
+    let having = select.having.as_ref().map(lower_expr).transpose()?;
     refuse_if(!select.named_window.is_empty(), "WINDOW")?;
     refuse_if(select.qualify.is_some(), "QUALIFY")?;
     refuse_if(!select.connect_by.is_empty(), "CONNECT BY")?;
@@ -1215,6 +1339,9 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
         join,
         projection,
         filter,
+        distinct,
+        group_by,
+        having,
         order_by,
         limit,
         offset,

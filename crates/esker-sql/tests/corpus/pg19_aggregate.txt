@@ -16,7 +16,7 @@
 # this node cannot close shows up: PostgreSQL types `sum(bigint)` and `avg(bigint)` as `numeric`
 # and there is no `numeric` in this crate (ADR 0031).
 #
-# THE FOUR A READER WOULD HAVE GOT WRONG, and the reason this file exists rather than a paragraph:
+# THE SIX A READER WOULD HAVE GOT WRONG, and the reason this file exists rather than a paragraph:
 #
 #   * `min(boolean)` and `max(boolean)` DO NOT EXIST. They are `42883`, not an ordering of `f` and
 #     `t` -- so refusing them is parity and implementing them would be the divergence.
@@ -27,6 +27,11 @@
 #   * `sum(bigint)` over two `9223372036854775807`s is `18446744073709551614`. PostgreSQL's sum is
 #     `numeric` and cannot overflow; ours is `int8` and errors instead, which is ADR 0031's
 #     declared divergence and the row this file exists to keep honest.
+#   * `GROUP BY ()` is the **grand total**, not a grouped query: over an empty table it still
+#     returns one row of zero, where `GROUP BY g` over the same table returns none.
+#   * the wrong *number* of arguments and the wrong *types* get different `DETAIL` sentences, and
+#     the number-of-arguments one names the types anyway: `count(n, g)` is
+#     `function count(bigint, text) does not exist`.
 #
 # The fixture, replayed by `tests/aggregate_parity.rs` before the first query:
 #
@@ -179,3 +184,43 @@ SELECT string_agg(g, ',') FROM agg	text	a,a,b,b
 SELECT array_agg(n) FROM agg	bigint[]	{10,20,NULL,-5,7}
 SELECT count(*) + 1 FROM agg	bigint	6
 SELECT sum(n) + 0 FROM agg	numeric	32
+
+# --- the arity and the shapes PostgreSQL's grammar rejects, which `sqlparser` reads
+SELECT sum() FROM agg	!42883 function sum() does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT min() FROM agg	!42883 function min() does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT count(n, g) FROM agg	!42883 function count(bigint, text) does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT min(n, g) FROM agg	!42883 function min(bigint, text) does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT count(1, *) FROM agg	!42601 syntax error at or near "*"
+SELECT sum(y) FROM agg	!42883 function sum(bytea) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT count(*) OVER () FROM agg	bigint	5 ; 5 ; 5 ; 5 ; 5
+SELECT sum(count(*)) FROM agg	!42803 aggregate function calls cannot be nested
+SELECT count(*) FROM agg HAVING count(count(*)) > 0	!42803 aggregate function calls cannot be nested
+
+# --- the empty grouping set, and the constant that is not a position
+SELECT count(*) FROM wide GROUP BY ()	bigint	0
+SELECT g, count(*) FROM agg GROUP BY (), g ORDER BY g	text,bigint	a|2 ; b|2 ; \N|1
+SELECT count(*) FROM wide GROUP BY 'x'	!42601 non-integer constant in GROUP BY
+SELECT g, count(*) FROM agg GROUP BY 5	!42P10 GROUP BY position 5 is not in select list
+SELECT g, count(*) FROM agg GROUP BY 0	!42P10 GROUP BY position 0 is not in select list
+SELECT g FROM agg GROUP BY g ORDER BY 2	!42P10 ORDER BY position 2 is not in select list
+SELECT n FROM agg ORDER BY 1 DESC	bigint	\N ; 20 ; 10 ; 7 ; -5
+SELECT g, n FROM agg ORDER BY 1, 2	text,bigint	a|10 ; a|20 ; b|-5 ; b|\N ; \N|7
+
+# --- SELECT DISTINCT and the sort keys it will not take
+SELECT DISTINCT g FROM agg ORDER BY n	!42P10 for SELECT DISTINCT, ORDER BY expressions must appear in select list
+SELECT DISTINCT g FROM agg ORDER BY g, n	!42P10 for SELECT DISTINCT, ORDER BY expressions must appear in select list
+
+# --- HAVING, and the column it may not reach for
+SELECT min(n) FROM agg GROUP BY g HAVING n > 0	!42803 column "agg.n" must appear in the GROUP BY clause or be used in an aggregate function
+SELECT count(*) FROM agg GROUP BY g ORDER BY n	!42803 column "agg.n" must appear in the GROUP BY clause or be used in an aggregate function
+SELECT count(*) FROM agg WHERE sum(n) > 1	!42803 aggregate functions are not allowed in WHERE
+SELECT g FROM agg GROUP BY g HAVING count(*) > 1 AND g IS NOT NULL ORDER BY g	text	a ; b
+SELECT count(*) FROM agg GROUP BY g, id ORDER BY id	bigint	1 ; 1 ; 1 ; 1 ; 1
+SELECT sum(n) FROM big GROUP BY id ORDER BY id	numeric	9223372036854775807 ; 9223372036854775807
+
+# --- the aggregate that may not be a grouping key, and the two clauses that reject it
+SELECT count(*), g FROM agg GROUP BY 1	!42803 aggregate functions are not allowed in GROUP BY
+SELECT g FROM agg GROUP BY count(*)	!42803 aggregate functions are not allowed in GROUP BY
+SELECT count(*) FROM agg HAVING count(*)	!42804 argument of HAVING must be type boolean, not type bigint
+SELECT count(*) FROM agg HAVING g	!42804 argument of HAVING must be type boolean, not type text
+SELECT count(*) FROM agg WHERE n	!42804 argument of WHERE must be type boolean, not type bigint

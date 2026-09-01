@@ -24,6 +24,7 @@
 //! the first of those names the constraint. A key that is absent means nobody took it and the
 //! conflict really was an ordinary row-level race, which stays `40001` and stays retryable.
 
+mod aggregate;
 mod bind;
 mod cursor;
 mod ddl;

@@ -404,9 +404,13 @@ fn an_expression_we_do_not_evaluate_is_refused_by_name() {
     for (sql, expected) in [
         ("SELECT id + 1 FROM s1", "+"),
         ("SELECT * FROM s1 WHERE id * 2 = 4", "*"),
-        ("SELECT count(*) FROM s1", "count"),
-        ("SELECT DISTINCT n FROM s1", "SELECT DISTINCT"),
-        ("SELECT id FROM s1 GROUP BY id", "GROUP BY"),
+        // The five aggregates, `GROUP BY`, `HAVING` and `DISTINCT` run now (phase 9 unit 1);
+        // what is next to them still does not, and each still names itself.
+        ("SELECT count(*) OVER () FROM s1", "a window function"),
+        ("SELECT count(*) FILTER (WHERE n > 0) FROM s1", "FILTER"),
+        ("SELECT length(t) FROM s1", "length"),
+        ("SELECT DISTINCT ON (n) n FROM s1", "SELECT DISTINCT ON"),
+        ("SELECT id FROM s1 GROUP BY ROLLUP (id)", "GROUP BY"),
         ("SELECT a.id FROM s1 a", "a table alias"),
         // An inner join runs now; the ones that keep rows an inner join drops do not.
         ("SELECT * FROM s1 LEFT JOIN s2 ON true", "LEFT JOIN"),

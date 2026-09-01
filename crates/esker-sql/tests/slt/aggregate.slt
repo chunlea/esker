@@ -1,0 +1,250 @@
+# Aggregates, GROUP BY, HAVING and DISTINCT, as a user meets them.
+#
+# The exhaustive comparison against a real PostgreSQL 19beta1 is tests/aggregate_parity.rs, which
+# replays 145 captured probes. This file is the readable half: the rules a person needs to know,
+# each written as the statement that shows it, so that a reader can see what the node does without
+# reading a corpus file. Every row below came off that same server.
+#
+# The four that are worth reading twice are the empty-input rules (two rules, not one), the NULL
+# group, min/max over bool (which PostgreSQL does not have), and sum over bigint (which PostgreSQL
+# has and answers as numeric — docs/adr/0031-rails-compatibility-is-measured.md).
+
+statement ok
+CREATE TABLE sales (id int8 PRIMARY KEY, region text, amount int8, rate float8, ok bool)
+
+# tag: INSERT 0 5
+statement ok
+INSERT INTO sales VALUES (1,'north',10,1.5,true),(2,'north',20,2.5,false),(3,'south',NULL,NULL,NULL),(4,'south',-5,0.5,true),(5,NULL,7,0.25,false)
+
+statement ok
+CREATE TABLE unsold (id int8 PRIMARY KEY, amount int8, region text)
+
+# count(*) counts every row, including the one whose columns are all NULL; count(col) does not.
+query III
+SELECT count(*), count(amount), count(region) FROM sales
+----
+5	4	4
+
+# A bare aggregate is named after the function, not `?column?`.
+query I
+SELECT count(*) AS total FROM sales
+----
+5
+
+# --- The empty-input rules, which are two rules and not one -------------------------------------
+
+# Ungrouped, over no rows: ONE row. count is zero and everything else is NULL — a sum of zero here
+# would be a wrong answer that looks like data.
+query III
+SELECT count(*), sum(amount), max(amount) FROM unsold
+----
+0	NULL	NULL
+
+# Grouped, over no rows: NO rows. There is no group to describe.
+query TI
+SELECT region, count(*) FROM unsold GROUP BY region
+----
+
+# A filter that matches nothing is the same as an empty table.
+query II
+SELECT count(*), sum(amount) FROM sales WHERE amount > 1000
+----
+0	NULL
+
+# --- What the plan looks like ---------------------------------------------------------------------
+#
+# DIVERGES from PostgreSQL in the EXPLAIN blocks only, the same way tests/slt/access_paths.slt
+# does: there is no cost model here, so there are no costs. PostgreSQL prints `HashAggregate` or
+# `GroupAggregate` depending on the strategy it chose; there is one strategy here, so the name says
+# what it is rather than implying a choice that was not made.
+#
+# The order is what a reader should take from it: the aggregation sits ABOVE the scan and BELOW the
+# sort, because `ORDER BY count(*)` orders groups and not rows.
+
+query T
+EXPLAIN SELECT count(*) FROM sales
+----
+Project (1 columns)
+  Aggregate
+    Aggregates: count(*)
+    Seq Scan on sales
+
+query T
+EXPLAIN SELECT region, count(*) FROM sales GROUP BY region HAVING count(*) > 1 ORDER BY region
+----
+Project (2 columns)
+  Sort
+    Keys: region
+    Group Aggregate
+      Group Key: region
+      Aggregates: count(*)
+      Filter: (count(*) > 1)
+      Seq Scan on sales
+
+query T
+EXPLAIN SELECT DISTINCT region FROM sales
+----
+Unique
+  Project (1 columns)
+    Seq Scan on sales
+
+# --- GROUP BY -----------------------------------------------------------------------------------
+
+# NULL is one group of its own, and it sorts last — the same place ORDER BY puts it.
+query TI
+SELECT region, count(*) FROM sales GROUP BY region ORDER BY region
+----
+north	2
+south	2
+NULL	1
+
+# Every aggregate at once, per group. `south` has one NULL amount: count(amount) is 1, not 2.
+query TIIII
+SELECT region, count(amount), sum(amount), min(amount), max(amount) FROM sales GROUP BY region ORDER BY region
+----
+north	2	30	10	20
+south	1	-5	-5	-5
+NULL	1	7	7	7
+
+# A position, and an output alias: PostgreSQL takes both in GROUP BY.
+query TI
+SELECT region AS r, count(*) FROM sales GROUP BY 1 ORDER BY 1
+----
+north	2
+south	2
+NULL	1
+
+# `GROUP BY ()` is the empty grouping set: one group over everything, the same as no GROUP BY.
+query I
+SELECT count(*) FROM sales GROUP BY ()
+----
+5
+
+# --- HAVING -------------------------------------------------------------------------------------
+
+query TI
+SELECT region, count(*) FROM sales GROUP BY region HAVING count(*) > 1 ORDER BY region
+----
+north	2
+south	2
+
+# HAVING with no GROUP BY filters the one implicit group, so a false one returns NO rows where the
+# same query without it returns one row of five.
+query I
+SELECT count(*) FROM sales HAVING count(*) > 99
+----
+
+query I
+SELECT count(*) FROM sales HAVING count(*) > 0
+----
+5
+
+# GROUP BY may name an output alias; HAVING may not. The two clauses do not share a name scope.
+statement error (42703)
+SELECT count(*) AS c FROM sales HAVING c > 0
+
+# --- ORDER BY over an aggregate -----------------------------------------------------------------
+
+query TI
+SELECT region, count(*) AS n FROM sales GROUP BY region ORDER BY n DESC, region
+----
+north	2
+south	2
+NULL	1
+
+query I
+SELECT sum(amount) FROM sales GROUP BY region ORDER BY sum(amount)
+----
+-5
+7
+30
+
+# --- DISTINCT, in both places it can be written -------------------------------------------------
+
+query I
+SELECT count(DISTINCT region) FROM sales
+----
+2
+
+query T
+SELECT DISTINCT region FROM sales ORDER BY region
+----
+north
+south
+NULL
+
+query TB
+SELECT DISTINCT region, ok FROM sales ORDER BY region, ok
+----
+north	f
+north	t
+south	t
+south	NULL
+NULL	f
+
+# Under SELECT DISTINCT a sort key must be one of the selected columns, because deduplication
+# happens over the target list and a key outside it has no position to sort at.
+statement error (42P10)
+SELECT DISTINCT region FROM sales ORDER BY amount
+
+# --- What may not appear where ------------------------------------------------------------------
+
+# A column that is neither grouped nor aggregated. The name comes back qualified.
+statement error (42803)
+SELECT region, amount FROM sales GROUP BY region
+
+# An ORDER BY over an ungrouped column, in a query that aggregates.
+statement error (42803)
+SELECT count(*) FROM sales ORDER BY region
+
+statement error (42803)
+SELECT count(*) FROM sales WHERE count(*) > 1
+
+statement error (42803)
+SELECT count(count(*)) FROM sales
+
+# --- Types: what has an aggregate and what does not ----------------------------------------------
+
+# float8 sums and averages exactly as PostgreSQL does.
+query RR
+SELECT sum(rate), avg(rate) FROM sales
+----
+4.75	1.1875
+
+# min and max over bool DO NOT EXIST on a real server, so refusing them is parity.
+statement error (42883)
+SELECT min(ok) FROM sales
+
+statement error (42883)
+SELECT sum(region) FROM sales
+
+# count(*) is the only parameterless aggregate call, and PostgreSQL says so with its own code.
+statement error (42809)
+SELECT count() FROM sales
+
+statement error (42883)
+SELECT count(region, amount) FROM sales
+
+# avg over a bigint column is `numeric` there and has no answer here: ADR 0031, and the first entry
+# on the numeric backlog.
+statement error (0A000)
+SELECT avg(amount) FROM sales
+
+# sum over a bigint column is an int8 here, so it can overflow where PostgreSQL's numeric cannot.
+# It answers rather than wrapping, which is the whole of what the divergence costs.
+statement ok
+CREATE TABLE huge (id int8 PRIMARY KEY, n int8)
+
+# tag: INSERT 0 2
+statement ok
+INSERT INTO huge VALUES (1, 9223372036854775807), (2, 9223372036854775807)
+
+statement error (22003)
+SELECT sum(n) FROM huge
+
+# One row each, so nothing overflows and the answers are PostgreSQL's exactly.
+query I
+SELECT sum(n) FROM huge GROUP BY id ORDER BY id
+----
+9223372036854775807
+9223372036854775807

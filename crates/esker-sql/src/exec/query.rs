@@ -24,6 +24,7 @@
 
 use crate::catalog::{ColumnDef, TableDef};
 use crate::error::{Result, SqlError};
+use crate::exec::aggregate;
 use crate::plan::{BinaryOp, Expr, Node, Select, SelectItem, SortKey};
 use crate::row::{self, RowSchema};
 use crate::value::PgType;
@@ -70,6 +71,22 @@ impl<'a> Scope<'a> {
             tables: vec![outer, inner],
             written: if swapped { vec![1, 0] } else { vec![0, 1] },
         }
+    }
+
+    /// The name a `42803` prints for a resolved position: `t.c`, qualified.
+    ///
+    /// PostgreSQL qualifies it even when the query has one table, and in a join it is the only
+    /// form that says which one. A position past the end can only be a bug, and a name that says
+    /// so beats a panic.
+    pub(super) fn qualified_name(&self, at: usize) -> String {
+        let mut start = 0;
+        for table in &self.tables {
+            if at < start + table.columns.len() {
+                return format!("{}.{}", table.name, table.columns[at - start].name);
+            }
+            start += table.columns.len();
+        }
+        format!("<column {at}>")
     }
 
     /// Where `table`'s columns start in a row.
@@ -177,8 +194,9 @@ pub(super) struct Planned {
 pub(super) fn matching_rows(filter: Option<&Expr>, tenant: u64, table: &TableDef) -> Result<Node> {
     let mut node = access_path(filter, tenant, table)?;
     if let Some(filter) = filter {
-        let predicate = resolve(filter, &Scope::single(table))?;
-        check_predicate(&predicate)?;
+        let scope = Scope::single(table);
+        let predicate = resolve(filter, &scope)?;
+        check_predicate(&predicate, "WHERE", &scope)?;
         node = Node::Filter {
             input: Box::new(node),
             predicate,
@@ -249,7 +267,7 @@ pub(super) fn plan(
 
     if let Some(filter) = &select.filter {
         let predicate = resolve(filter, &scope)?;
-        check_predicate(&predicate)?;
+        check_predicate(&predicate, "WHERE", &scope)?;
         // A predicate the access path already guarantees is not re-checked -- but one it only
         // *narrowed* still is, because a range is not an equality.
         node = Node::Filter {
@@ -258,37 +276,56 @@ pub(super) fn plan(
         };
     }
 
+    // Aggregation sits between the filter and the sort. Everything above it is written about a
+    // row that no table has -- the grouping keys followed by the aggregate values -- and
+    // `Aggregation::rewrite` is what moves an expression from one to the other.
+    let aggregation = aggregate::Aggregation::build(select, &scope)?;
+    if let Some(aggregation) = &aggregation {
+        node = Node::Aggregate {
+            input: Box::new(node),
+            keys: aggregation.keys.clone(),
+            aggregates: aggregation.specs.clone(),
+            having: aggregation.having.clone(),
+            grouped: aggregation.grouped,
+        };
+    }
+
+    let columns = output_columns(select, &scope, aggregation.as_ref())?;
+    let exprs = projection_exprs(select, &scope, aggregation.as_ref())?;
+
     // The sort goes *below* the projection, so it can order on a column the target list does not
     // return -- `SELECT n FROM s1 ORDER BY id` is ordinary SQL, and a sort above the projection
     // could not see `id` at all. An `ORDER BY` naming an output alias is substituted first, which
     // is the other half of what PostgreSQL allows.
-    if !select.order_by.is_empty() {
-        let keys = select
-            .order_by
-            .iter()
-            .map(|item| {
-                Ok(SortKey {
-                    expr: resolve(&dealias(&item.expr, select), &scope)?,
-                    descending: item.descending,
-                    // PostgreSQL's default is NULLS LAST ascending and NULLS FIRST descending,
-                    // which is one rule: NULL is the largest value, and `DESC` reverses the order
-                    // it sits in like everything else.
-                    nulls_first: item.nulls_first.unwrap_or(item.descending),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+    //
+    // `SELECT DISTINCT` is the one shape where that is not possible, and PostgreSQL says so
+    // rather than working around it: deduplication happens over the target list, so a sort key
+    // the target list does not contain has no defined position to sort at. Its keys are resolved
+    // against the *output* columns and a key that is not one of them is `42P10`.
+    let sort_keys = order_keys(select, &scope, aggregation.as_ref(), &exprs)?;
+    if !select.distinct && !sort_keys.is_empty() {
         node = Node::Sort {
             input: Box::new(node),
-            keys,
+            keys: sort_keys.clone(),
         };
     }
 
-    let columns = output_columns(select, &scope)?;
-    let exprs = projection_exprs(select, &scope)?;
     node = Node::Project {
         input: Box::new(node),
         exprs,
     };
+
+    if select.distinct {
+        node = Node::Distinct {
+            input: Box::new(node),
+        };
+        if !sort_keys.is_empty() {
+            node = Node::Sort {
+                input: Box::new(node),
+                keys: sort_keys,
+            };
+        }
+    }
 
     if select.limit.is_some() || select.offset.is_some() {
         node = Node::Limit {
@@ -310,6 +347,77 @@ pub(super) fn plan(
             .flat_map(|table| table.columns.iter().map(|column| column.name.clone()))
             .collect(),
     })
+}
+
+/// The `ORDER BY` keys, resolved into whichever row space the sort will run over.
+///
+/// Three substitutions happen before a key is resolved, and all three are PostgreSQL's:
+///
+/// * an **output alias** — `ORDER BY c` for `count(*) AS c` — is replaced by what it names;
+/// * an **integer literal** is a *position* in the target list, not a constant. Sorting by the
+///   constant `1` is a no-op that silently ignores `DESC`, which is the wrong-answer shape this
+///   whole crate is built to avoid;
+/// * an **aggregate** is rewritten to its position in the aggregated row, so `ORDER BY count(*)`
+///   orders the groups rather than failing to find a column.
+///
+/// Under `SELECT DISTINCT` the sort runs *above* the projection, so a key must be one of the
+/// output columns; anything else is `42P10` with PostgreSQL's own sentence.
+fn order_keys(
+    select: &Select,
+    scope: &Scope<'_>,
+    aggregation: Option<&aggregate::Aggregation>,
+    outputs: &[Expr],
+) -> Result<Vec<SortKey>> {
+    let mut keys = Vec::new();
+    for item in &select.order_by {
+        // A position is resolved against the **output list**, which is already expanded and
+        // already in whichever row space the sort will run over -- so `SELECT * FROM t ORDER BY 1`
+        // works, where resolving it against the unexpanded target list could not have.
+        let resolved = if let Expr::Literal(crate::plan::Literal::Integer(position)) = &item.expr {
+            let at = usize::try_from(*position)
+                .ok()
+                .filter(|at| (1..=outputs.len()).contains(at))
+                .ok_or_else(|| {
+                    SqlError::InvalidColumnReference(format!(
+                        "ORDER BY position {position} is not in select list"
+                    ))
+                })?;
+            outputs[at - 1].clone()
+        } else {
+            let resolved = resolve(&dealias(&item.expr, select), scope)?;
+            aggregate::check_not_nested(&resolved)?;
+            match aggregation {
+                None => resolved,
+                Some(aggregation) => aggregation.rewrite(&resolved, scope)?,
+            }
+        };
+        let expr = if select.distinct {
+            let at = outputs
+                .iter()
+                .position(|output| output == &resolved)
+                .ok_or_else(|| {
+                    SqlError::InvalidColumnReference(
+                        "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
+                            .to_owned(),
+                    )
+                })?;
+            Expr::Ordinal {
+                at,
+                ty: expr_type(&resolved, scope)?,
+            }
+        } else {
+            resolved
+        };
+        keys.push(SortKey {
+            expr,
+            descending: item.descending,
+            // PostgreSQL's default is NULLS LAST ascending and NULLS FIRST descending, which is
+            // one rule: NULL is the largest value, and `DESC` reverses the order it sits in like
+            // everything else.
+            nulls_first: item.nulls_first.unwrap_or(item.descending),
+        });
+    }
+    Ok(keys)
 }
 
 /// Whether every column reference in an expression belongs to `table`.
@@ -643,7 +751,7 @@ pub(super) fn resolve_against(expr: &Expr, table: &TableDef) -> Result<Expr> {
 }
 
 /// `ORDER BY x` where `x` is an output alias means the expression that alias names.
-fn dealias(expr: &Expr, select: &Select) -> Expr {
+pub(super) fn dealias(expr: &Expr, select: &Select) -> Expr {
     let Expr::Column { table: None, name } = expr else {
         return expr.clone();
     };
@@ -684,7 +792,7 @@ fn undefined_column(name: &str) -> SqlError {
 
 const SYSTEM_COLUMNS: [&str; 6] = ["ctid", "xmin", "xmax", "cmin", "cmax", "tableoid"];
 
-fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
+pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
     Ok(match expr {
         Expr::Column { table, name } => {
             let (at, ty) = scope.resolve_column(table.as_deref(), name)?;
@@ -783,7 +891,15 @@ fn undefined_operator(
 
 /// A `WHERE` clause has to be a boolean. PostgreSQL says so, and a `WHERE t` where `t` is text is
 /// a mistake worth catching before it silently keeps every row.
-fn check_predicate(expr: &Expr) -> Result<()> {
+fn check_predicate(expr: &Expr, clause: &'static str, scope: &Scope<'_>) -> Result<()> {
+    // An `UPDATE` or `DELETE` reaches here without going through `Aggregation::build`, and
+    // `WHERE count(*) > 1` is `42803` on all three statements. One check rather than three.
+    // A `HAVING` is the one clause where an aggregate belongs, so only `WHERE` refuses it.
+    if clause == "WHERE" && aggregate::contains_aggregate(expr) {
+        return Err(SqlError::AggregateNotAllowed(
+            "aggregate functions are not allowed in WHERE",
+        ));
+    }
     match expr {
         Expr::Binary { .. }
         | Expr::Not(_)
@@ -793,9 +909,13 @@ fn check_predicate(expr: &Expr) -> Result<()> {
             ty: ColumnType::Bool,
             ..
         } => Ok(()),
-        _ => Err(SqlError::DatatypeMismatch(
-            "argument of WHERE must be type boolean".to_owned(),
-        )),
+        // PostgreSQL names the type it got, and a user reading "must be type boolean" without it
+        // has to work out which of their columns was the problem. Measured, both clauses:
+        // `argument of WHERE must be type boolean, not type bigint`.
+        other => Err(SqlError::DatatypeMismatch(format!(
+            "argument of {clause} must be type boolean, not type {}",
+            expr_type(other, scope).map_or("unknown", ColumnType::name)
+        ))),
     }
 }
 
@@ -811,7 +931,11 @@ fn qualifier_of(item: &SelectItem) -> Option<&str> {
     }
 }
 
-fn output_columns(select: &Select, scope: &Scope<'_>) -> Result<Vec<(String, ColumnType)>> {
+fn output_columns(
+    select: &Select,
+    scope: &Scope<'_>,
+    aggregation: Option<&aggregate::Aggregation>,
+) -> Result<Vec<(String, ColumnType)>> {
     let mut columns = Vec::new();
     for item in &select.projection {
         match item {
@@ -834,9 +958,20 @@ fn output_columns(select: &Select, scope: &Scope<'_>) -> Result<Vec<(String, Col
                 );
             }
             SelectItem::Expr { expr, alias } => {
-                let ty = expr_type(expr, scope)?;
+                // With an aggregation the type comes from the rewritten expression, because an
+                // aggregate call has no type until the aggregation has resolved its argument.
+                let ty = match aggregation {
+                    None => expr_type(expr, scope)?,
+                    Some(aggregation) => {
+                        let rewritten = aggregation.rewrite(&resolve(expr, scope)?, scope)?;
+                        expr_type(&rewritten, scope)?
+                    }
+                };
+                // PostgreSQL names an aggregate's column after the function -- `count`, `sum` --
+                // and not `?column?`. Measured; ActiveRecord reads results by name.
                 let name = alias.clone().unwrap_or_else(|| match expr {
                     Expr::Column { name, .. } => name.clone(),
+                    Expr::Aggregate(call) => call.func.name().to_owned(),
                     _ => "?column?".to_owned(),
                 });
                 columns.push((name, ty));
@@ -847,7 +982,11 @@ fn output_columns(select: &Select, scope: &Scope<'_>) -> Result<Vec<(String, Col
 }
 
 /// One expression per output column, with `*` expanded.
-fn projection_exprs(select: &Select, scope: &Scope<'_>) -> Result<Vec<Expr>> {
+fn projection_exprs(
+    select: &Select,
+    scope: &Scope<'_>,
+    aggregation: Option<&aggregate::Aggregation>,
+) -> Result<Vec<Expr>> {
     let mut exprs = Vec::new();
     for item in &select.projection {
         match item {
@@ -859,13 +998,25 @@ fn projection_exprs(select: &Select, scope: &Scope<'_>) -> Result<Vec<Expr>> {
                         hint: None,
                     });
                 }
-                exprs.extend(
-                    scope
-                        .expand(qualifier_of(item))?
-                        .map(|(at, column)| Expr::Ordinal { at, ty: column.ty }),
-                );
+                // `SELECT *` under a `GROUP BY` is every column asked for outside an aggregate,
+                // so each one has to be a grouping key or it is `42803` -- which is what the
+                // rewrite says, one column at a time, naming the first that is not.
+                for (at, column) in scope.expand(qualifier_of(item))? {
+                    let expr = Expr::Ordinal { at, ty: column.ty };
+                    exprs.push(match aggregation {
+                        None => expr,
+                        Some(aggregation) => aggregation.rewrite(&expr, scope)?,
+                    });
+                }
             }
-            SelectItem::Expr { expr, .. } => exprs.push(resolve(expr, scope)?),
+            SelectItem::Expr { expr, .. } => {
+                let resolved = resolve(expr, scope)?;
+                aggregate::check_not_nested(&resolved)?;
+                exprs.push(match aggregation {
+                    None => resolved,
+                    Some(aggregation) => aggregation.rewrite(&resolved, scope)?,
+                });
+            }
         }
     }
     Ok(exprs)
@@ -873,7 +1024,7 @@ fn projection_exprs(select: &Select, scope: &Scope<'_>) -> Result<Vec<Expr>> {
 
 /// What type an output column has. A literal with no column to take a type from falls back the way
 /// PostgreSQL does: a quoted string is `text`, an integer is `bigint`.
-fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
+pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
     use crate::plan::Literal;
     Ok(match expr {
         Expr::Column { table, name } => scope.resolve_column(table.as_deref(), name)?.1,
@@ -888,6 +1039,14 @@ fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         | Expr::Not(_)
         | Expr::IsNull { .. } => ColumnType::Bool,
         Expr::Parameter(number) => return Err(SqlError::UndefinedParameter(*number)),
+        // An aggregate's type is the aggregation's business, and by the time a plan is typed
+        // every one of them has been rewritten into an `Ordinal` carrying the answer. One here
+        // means the rewrite was skipped.
+        Expr::Aggregate(_) => {
+            return Err(SqlError::Internal(
+                "an aggregate reached expr_type without being rewritten".to_owned(),
+            ));
+        }
     })
 }
 

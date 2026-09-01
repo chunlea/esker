@@ -15,11 +15,13 @@
 //! restarting after the last one is the same range read in bounded pieces.
 
 use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::backend::Txn;
 use crate::error::{Result, SqlError};
+use crate::exec::aggregate::{Accumulator, GROUP_LIMIT, GroupKey};
 use crate::exec::query::successor;
-use crate::plan::{BinaryOp, Expr, Node, Probe, SortKey};
+use crate::plan::{AggregateSpec, BinaryOp, Expr, Node, Probe, SortKey};
 use crate::row;
 use crate::row::RowSchema;
 use crate::value::{ColumnType, Datum};
@@ -73,6 +75,21 @@ enum Kind<'a> {
         input: Box<Cursor<'a>>,
         to_skip: usize,
         remaining: Option<usize>,
+    },
+    /// The other node that cannot stream: it drains its input on the first call, because the last
+    /// input row can change the first output row.
+    Aggregate {
+        input: Option<Box<Cursor<'a>>>,
+        /// The [`Node::Aggregate`] itself — keys, aggregates, `HAVING` and the empty-input rule —
+        /// kept whole rather than unpacked into four fields that would then have to be kept in
+        /// step with it.
+        spec: Node,
+        groups: std::vec::IntoIter<Vec<Datum>>,
+    },
+    /// `SELECT DISTINCT`: streams, keeping the first row of each distinct value.
+    Distinct {
+        input: Box<Cursor<'a>>,
+        seen: BTreeSet<GroupKey>,
     },
     /// A nested-loop join. The outer side streams; the inner side is either one probe per outer
     /// row (at most one row back) or the whole inner table, read once and paired with each.
@@ -168,6 +185,15 @@ impl<'a> Cursor<'a> {
                 input: Some(Box::new(Cursor::open(txn, tenant, input)?)),
                 keys: keys.clone(),
                 sorted: Vec::new().into_iter(),
+            },
+            Node::Aggregate { input, .. } => Kind::Aggregate {
+                input: Some(Box::new(Cursor::open(txn, tenant, input)?)),
+                spec: node.clone(),
+                groups: Vec::new().into_iter(),
+            },
+            Node::Distinct { input } => Kind::Distinct {
+                input: Box::new(Cursor::open(txn, tenant, input)?),
+                seen: BTreeSet::new(),
             },
             Node::Limit {
                 input,
@@ -350,6 +376,50 @@ impl<'a> Cursor<'a> {
                 Ok(sorted.next())
             }
 
+            Kind::Aggregate {
+                input,
+                spec,
+                groups,
+            } => {
+                if let Some(mut source) = input.take() {
+                    let Node::Aggregate {
+                        keys,
+                        aggregates,
+                        having,
+                        grouped,
+                        ..
+                    } = spec
+                    else {
+                        return Err(SqlError::Internal(
+                            "an aggregate cursor over a node that is not one".to_owned(),
+                        ));
+                    };
+                    *groups =
+                        fold(&mut source, keys, aggregates, having.as_ref(), *grouped)?.into_iter();
+                }
+                Ok(groups.next())
+            }
+
+            Kind::Distinct { input, seen } => {
+                while let Some(row) = input.next()? {
+                    // Streams, and still holds every distinct row it has seen -- so it is bounded
+                    // the way `Sort` and the group table are, and answers `53400` rather than
+                    // allocating without limit on a client's behalf.
+                    if seen.len() == GROUP_LIMIT {
+                        return Err(SqlError::ConfigurationLimitExceeded(format!(
+                            "a SELECT DISTINCT of more than {GROUP_LIMIT} distinct rows needs                              more memory than this node will use; add a WHERE or a LIMIT"
+                        )));
+                    }
+                    // First seen wins, so the output keeps the input's order rather than the set's
+                    // -- which for a `DISTINCT` with no `ORDER BY` is primary key order, and is
+                    // deterministic where a real server's is not.
+                    if seen.insert(GroupKey(row.clone())) {
+                        return Ok(Some(row));
+                    }
+                }
+                Ok(None)
+            }
+
             Kind::Limit {
                 input,
                 to_skip,
@@ -374,6 +444,74 @@ impl<'a> Cursor<'a> {
             }
         }
     }
+}
+
+/// Drains an input into groups and folds each one down to a row.
+///
+/// The output row is the grouping keys followed by the aggregate values, which is the row every
+/// expression above this node was rewritten against (`crate::exec::aggregate`).
+///
+/// **The empty-input rule is two rules.** With no input rows at all, an *ungrouped* aggregate
+/// still produces one row — `count` 0 and everything else NULL, because "how many rows are there"
+/// has an answer even when there are none — and a *grouped* one produces nothing, because there is
+/// no group to describe. Both were measured; getting the first wrong turns `SELECT count(*)` on an
+/// empty table into an empty result, which a client reads as a failed query.
+fn fold(
+    input: &mut Cursor<'_>,
+    keys: &[Expr],
+    aggregates: &[AggregateSpec],
+    having: Option<&Expr>,
+    grouped: bool,
+) -> Result<Vec<Vec<Datum>>> {
+    let mut groups: BTreeMap<GroupKey, Vec<Accumulator>> = BTreeMap::new();
+    while let Some(row) = input.next()? {
+        let key = GroupKey(
+            keys.iter()
+                .map(|key| evaluate(key, &row))
+                .collect::<Result<Vec<_>>>()?,
+        );
+        if !groups.contains_key(&key) && groups.len() == GROUP_LIMIT {
+            return Err(SqlError::ConfigurationLimitExceeded(format!(
+                "a GROUP BY of more than {GROUP_LIMIT} groups needs more memory than this node                  will use; group by fewer columns or add a WHERE"
+            )));
+        }
+        let accumulators = groups
+            .entry(key)
+            .or_insert_with(|| aggregates.iter().map(Accumulator::new).collect());
+        for (accumulator, spec) in accumulators.iter_mut().zip(aggregates) {
+            // `count(*)` reads no value at all, which is why it counts a row whose every column
+            // is NULL. Handing it a non-NULL placeholder keeps that in one place.
+            let value = match &spec.arg {
+                None => Datum::Bool(true),
+                Some(arg) => evaluate(arg, &row)?,
+            };
+            accumulator.push(&value)?;
+        }
+    }
+
+    if groups.is_empty() && !grouped {
+        groups.insert(
+            GroupKey(Vec::new()),
+            aggregates.iter().map(Accumulator::new).collect(),
+        );
+    }
+
+    let mut rows = Vec::with_capacity(groups.len());
+    for (key, accumulators) in groups {
+        let mut row = key.0;
+        row.extend(accumulators.iter().map(Accumulator::finish));
+        // `HAVING` filters groups, including the one implicit group of an ungrouped aggregate:
+        // `SELECT count(*) FROM t HAVING count(*) > 99` returns **no rows** where the same query
+        // without the clause returns one row of zero. Measured, and not a shape anybody guesses.
+        let keep = match having {
+            None => true,
+            Some(having) => matches!(evaluate(having, &row)?, Datum::Bool(true)),
+        };
+        if keep {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
 }
 
 /// A point read or an index lookup: at most one row, and the store asked at most twice.
@@ -498,6 +636,14 @@ pub(super) fn evaluate(expr: &Expr, row: &[Datum]) -> Result<Datum> {
             )));
         }
         Expr::Parameter(number) => return Err(SqlError::UndefinedParameter(*number)),
+        // A value of a group, not of a row. The planner replaces every one of these with an
+        // `Ordinal` into the aggregated row, so one arriving here is a planner bug and says so
+        // rather than returning a number nobody can check.
+        Expr::Aggregate(_) => {
+            return Err(SqlError::Internal(
+                "an aggregate reached the row evaluator".to_owned(),
+            ));
+        }
 
         Expr::IsNull { operand, negated } => {
             let value = evaluate(operand, row)?;

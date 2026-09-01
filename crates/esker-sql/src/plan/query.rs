@@ -19,10 +19,10 @@
 //! slow. `EXPLAIN` prints which one was chosen, because a plan a user cannot see is a plan they
 //! cannot fix.
 
-use crate::plan::{Expr, Literal};
+use crate::plan::{AggregateFunc, Expr, Literal};
 use crate::row::RowSchema;
-use crate::value::Datum;
 use crate::value::PgDatum;
+use crate::value::{ColumnType, Datum};
 
 /// One `JOIN`, as written.
 ///
@@ -49,6 +49,17 @@ pub struct Select {
     pub projection: Vec<SelectItem>,
     /// `WHERE`.
     pub filter: Option<Expr>,
+    /// `SELECT DISTINCT`. `DISTINCT ON` is a different clause and is `0A000` naming itself.
+    pub distinct: bool,
+    /// `GROUP BY`, in the order written. An integer literal here is a **position** in the target
+    /// list, which is PostgreSQL's rule and not a constant to group by.
+    pub group_by: Vec<Expr>,
+    /// `HAVING`.
+    ///
+    /// Its own field rather than a second `filter`, because it is evaluated over a *group* and not
+    /// over a row — and because the two clauses do not share a name scope: `GROUP BY` may name an
+    /// output alias and `HAVING` may not (measured; `tests/corpus/pg19_aggregate.txt`).
+    pub having: Option<Expr>,
     /// `ORDER BY`, in significance order.
     pub order_by: Vec<OrderItem>,
     /// `LIMIT`.
@@ -214,6 +225,54 @@ pub enum Node {
         /// How many to return, or `None` for all of them.
         limit: Option<usize>,
     },
+    /// `GROUP BY` and the aggregates over it: folds every group of input rows down to one row.
+    ///
+    /// The output row is **the grouping keys followed by the aggregate values**, in the order
+    /// [`Node::Aggregate::keys`] and [`Node::Aggregate::aggregates`] give them, which is the row
+    /// every expression above this node has been rewritten against.
+    ///
+    /// Like [`Node::Sort`] it cannot stream — the last input row can change the first output row —
+    /// so it is bounded and answers `53400` past the bound rather than allocating without limit.
+    Aggregate {
+        /// Where the rows come from.
+        input: Box<Node>,
+        /// The grouping keys, resolved against the *input* row. Empty for an ungrouped aggregate,
+        /// which is one group and not none.
+        keys: Vec<Expr>,
+        /// One per aggregate call, in the order the output row carries them.
+        aggregates: Vec<AggregateSpec>,
+        /// `HAVING`, resolved against the **output** row.
+        having: Option<Expr>,
+        /// Whether the statement wrote a `GROUP BY`.
+        ///
+        /// It decides the empty-input rule and nothing else, and the rule is two rules rather than
+        /// one: over no rows an **ungrouped** aggregate is one row (`count` 0, everything else
+        /// NULL) and a **grouped** one is no rows at all. Measured, both ways.
+        grouped: bool,
+    },
+    /// `SELECT DISTINCT`: the first row of each distinct value, in the order the input gave them.
+    ///
+    /// Distinctness is [`crate::value::PgDatum::pg_cmp`] equality, the same rule grouping uses, so
+    /// `-0.0` and `0.0` are one value and so are two `NaN`s — which is what a real server does and
+    /// what `Datum`'s own bitwise `PartialEq` deliberately does not.
+    Distinct {
+        /// Where the rows come from — always a [`Node::Project`], because `DISTINCT` is over the
+        /// target list and not over the table.
+        input: Box<Node>,
+    },
+}
+
+/// One aggregate, resolved: what to compute, over which value, at which type.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggregateSpec {
+    /// Which aggregate.
+    pub func: AggregateFunc,
+    /// The argument, resolved against the input row, or `None` for `count(*)`.
+    pub arg: Option<Expr>,
+    /// `DISTINCT` inside the parentheses.
+    pub distinct: bool,
+    /// The argument's type — what decides the accumulator. `None` for `count(*)`.
+    pub arg_type: Option<ColumnType>,
 }
 
 /// One resolved sort key.
@@ -241,9 +300,82 @@ impl Node {
         lines
     }
 
+    /// The names of the columns of the row **this node produces**, for a reader.
+    ///
+    /// Most nodes hand their input's row through unchanged, and two do not: a `Project` rebuilds
+    /// the row as its target list, and an `Aggregate` replaces it entirely with the grouping keys
+    /// followed by the aggregate values. Without this an `EXPLAIN` above an aggregate prints the
+    /// *table's* first column for position 0 — a name that is not merely unhelpful but wrong, and
+    /// wrong in the direction a reader would believe.
+    fn row_names(&self, columns: &[String]) -> Vec<String> {
+        match self {
+            Node::Aggregate {
+                input,
+                keys,
+                aggregates,
+                ..
+            } => {
+                let inner = input.row_names(columns);
+                keys.iter()
+                    .map(|key| render(key, &inner))
+                    .chain(aggregates.iter().map(|spec| render_aggregate(spec, &inner)))
+                    .collect()
+            }
+            Node::Project { input, exprs } => {
+                let inner = input.row_names(columns);
+                exprs.iter().map(|expr| render(expr, &inner)).collect()
+            }
+            Node::Filter { input, .. }
+            | Node::Sort { input, .. }
+            | Node::Limit { input, .. }
+            | Node::Distinct { input } => input.row_names(columns),
+            _ => columns.to_vec(),
+        }
+    }
+
+    /// The names of the row this node *reads*, which is what every expression on it is written
+    /// against — except an `Aggregate`'s `HAVING`, which is written against what it produces.
+    fn input_names(&self, columns: &[String]) -> Vec<String> {
+        match self {
+            Node::Filter { input, .. }
+            | Node::Project { input, .. }
+            | Node::Sort { input, .. }
+            | Node::Limit { input, .. }
+            | Node::Distinct { input }
+            | Node::Aggregate { input, .. } => input.row_names(columns),
+            _ => columns.to_vec(),
+        }
+    }
+
     fn explain_into(&self, table: &str, columns: &[String], depth: usize, lines: &mut Vec<String>) {
         let indent = "  ".repeat(depth);
-        let (line, child, extra) = match self {
+        let (line, child, extra) = self.describe(table, columns, &indent);
+        lines.push(format!("{indent}{line}"));
+        if let Some(extra) = extra {
+            // One `extra` may carry more than one line: a join prints its inner access path and
+            // its residual condition, and both belong to the node rather than to a child of it.
+            lines.extend(extra.split('\n').map(|line| format!("{indent}  {line}")));
+        }
+        if let Some(child) = child {
+            child.explain_into(table, columns, depth + 1, lines);
+        }
+    }
+
+    /// One node's own line, its child, and the extra lines that belong to it — split out of
+    /// [`Node::explain_into`] so that the walk and the per-node description are two readable
+    /// things rather than one long one.
+    fn describe(
+        &self,
+        table: &str,
+        columns: &[String],
+        indent: &str,
+    ) -> (String, Option<&Node>, Option<String>) {
+        // The names to render *this* node's expressions against. `columns` stays the table's own
+        // names all the way down, because every node works out its own row space from there --
+        // narrowing it for the child instead would hand a `Project`'s one output column to the
+        // three-column `Sort` beneath it.
+        let names = &self.input_names(columns)[..];
+        match self {
             Node::OneRow => ("Result".to_owned(), None, None),
             Node::SeqScan { narrowed, .. } => (
                 format!("Seq Scan on {table}"),
@@ -259,7 +391,7 @@ impl Node {
             Node::Filter { input, predicate } => (
                 "Filter".to_owned(),
                 Some(input),
-                Some(format!("Condition: {}", render(predicate, columns))),
+                Some(format!("Condition: {}", render(predicate, names))),
             ),
             Node::Project { input, exprs } => (
                 format!("Project ({} columns)", exprs.len()),
@@ -274,7 +406,7 @@ impl Node {
                     keys.iter()
                         .map(|key| format!(
                             "{}{}",
-                            render(&key.expr, columns),
+                            render(&key.expr, names),
                             if key.descending { " DESC" } else { "" }
                         ))
                         .collect::<Vec<_>>()
@@ -302,7 +434,7 @@ impl Node {
                     Some(condition) => {
                         format!(
                             "Inner: {access}\n{indent}  Join Filter: {}",
-                            render(condition, columns)
+                            render(condition, names)
                         )
                     }
                     None => format!("Inner: {access}"),
@@ -321,16 +453,62 @@ impl Node {
                 Some(input),
                 None,
             ),
+            Node::Aggregate { input, .. } => {
+                let (name, extra) = self.describe_aggregate(columns, names);
+                (name, Some(input), Some(extra))
+            }
+            Node::Distinct { input } => ("Unique".to_owned(), Some(input), None),
+        }
+    }
+
+    /// The aggregate's own two or three lines: the grouping keys, the calls, and the `HAVING`.
+    ///
+    /// PostgreSQL prints `HashAggregate` or `GroupAggregate` depending on the strategy it chose;
+    /// there is one strategy here, so the name says what it is rather than implying a choice that
+    /// was not made. An ungrouped aggregate prints as `Aggregate`, which is what a real server
+    /// calls the same node.
+    fn describe_aggregate(&self, columns: &[String], names: &[String]) -> (String, String) {
+        let Node::Aggregate {
+            keys,
+            aggregates,
+            having,
+            ..
+        } = self
+        else {
+            return ("Aggregate".to_owned(), String::new());
         };
-        lines.push(format!("{indent}{line}"));
-        if let Some(extra) = extra {
-            // One `extra` may carry more than one line: a join prints its inner access path and
-            // its residual condition, and both belong to the node rather than to a child of it.
-            lines.extend(extra.split('\n').map(|line| format!("{indent}  {line}")));
+        let mut extra = Vec::new();
+        if !keys.is_empty() {
+            extra.push(format!(
+                "Group Key: {}",
+                keys.iter()
+                    .map(|key| render(key, names))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
         }
-        if let Some(child) = child {
-            child.explain_into(table, columns, depth + 1, lines);
+        extra.push(format!(
+            "Aggregates: {}",
+            aggregates
+                .iter()
+                .map(|spec| render_aggregate(spec, names))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        if let Some(having) = having {
+            // Against the *output* row -- the grouping keys and the aggregates -- which is the one
+            // place in a plan where an expression is not written against what its node reads.
+            extra.push(format!(
+                "Filter: {}",
+                render(having, &self.row_names(columns))
+            ));
         }
+        let name = if keys.is_empty() {
+            "Aggregate"
+        } else {
+            "Group Aggregate"
+        };
+        (name.to_owned(), extra.join("\n"))
     }
 }
 
@@ -363,7 +541,27 @@ fn render(expr: &Expr, columns: &[String]) -> String {
             render(operand, columns),
             if *negated { "NOT " } else { "" }
         ),
+        Expr::Aggregate(call) => format!(
+            "{}({}{})",
+            call.func.name(),
+            if call.distinct { "DISTINCT " } else { "" },
+            call.arg()
+                .map_or_else(|| "*".to_owned(), |arg| render(arg, columns))
+        ),
     }
+}
+
+/// One aggregate, as `EXPLAIN` shows it: the call the user wrote, with its argument put back into
+/// the name they typed.
+fn render_aggregate(spec: &AggregateSpec, columns: &[String]) -> String {
+    format!(
+        "{}({}{})",
+        spec.func.name(),
+        if spec.distinct { "DISTINCT " } else { "" },
+        spec.arg
+            .as_ref()
+            .map_or_else(|| "*".to_owned(), |arg| render(arg, columns))
+    )
 }
 
 /// A literal as it would have been written. A string is quoted, because `WHERE e = c` and

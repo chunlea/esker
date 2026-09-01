@@ -150,6 +150,13 @@ pub const WRONG_OBJECT_TYPE: &str = "42809";
 pub const DATATYPE_MISMATCH: &str = "42804";
 /// No such function.
 pub const UNDEFINED_FUNCTION: &str = "42883";
+/// A column that is neither a grouping key nor inside an aggregate, and an aggregate written in a
+/// clause evaluated before the groups exist. One condition, because PostgreSQL gives them one
+/// code: `WHERE count(*) > 1` and `SELECT n FROM t GROUP BY g` are both `42803`.
+pub const GROUPING_ERROR: &str = "42803";
+/// `ORDER BY`, `GROUP BY` or `SELECT DISTINCT` naming something the target list does not have —
+/// a position out of range, or a `DISTINCT` sort key that is not selected.
+pub const INVALID_COLUMN_REFERENCE: &str = "42P10";
 /// A `$1` with nothing bound to it.
 pub const UNDEFINED_PARAMETER: &str = "42P02";
 /// A table definition that cannot be built — no primary key, in our case.
@@ -262,6 +269,8 @@ mod tests {
         ("WRONG_OBJECT_TYPE", super::WRONG_OBJECT_TYPE),
         ("DATATYPE_MISMATCH", super::DATATYPE_MISMATCH),
         ("UNDEFINED_FUNCTION", super::UNDEFINED_FUNCTION),
+        ("GROUPING_ERROR", super::GROUPING_ERROR),
+        ("INVALID_COLUMN_REFERENCE", super::INVALID_COLUMN_REFERENCE),
         ("INVALID_TABLE_DEFINITION", super::INVALID_TABLE_DEFINITION),
         ("NAME_TOO_LONG", super::NAME_TOO_LONG),
         ("UNDEFINED_PARAMETER", super::UNDEFINED_PARAMETER),

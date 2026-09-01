@@ -13,22 +13,28 @@ SELECT * FROM t JOIN t u ON true
 statement error (0A000)
 SELECT * FROM t UNION SELECT * FROM t
 
+# `GROUP BY`, `HAVING`, `DISTINCT` and the five aggregates run now (phase 9 unit 1,
+# tests/slt/aggregate.slt). What sits next to them still does not, and each still names itself.
 statement error (0A000)
-SELECT a FROM t GROUP BY a
-
-# `GROUP BY` is checked first, so that is what it names -- either way the answer is 0A000 naming
-# a construct the statement really does contain.
-statement error (0A000)
-SELECT a FROM t GROUP BY a HAVING a > 1
+SELECT a FROM t GROUP BY ROLLUP (a)
 
 statement error (0A000)
-SELECT DISTINCT a FROM t
+SELECT a FROM t GROUP BY GROUPING SETS ((a), ())
+
+statement error (0A000)
+SELECT DISTINCT ON (a) a FROM t
 
 statement error (0A000)
 WITH x AS (SELECT 1) SELECT * FROM x
 
 statement error (0A000)
-SELECT count(*) FROM t
+SELECT count(*) OVER () FROM t
+
+statement error (0A000)
+SELECT count(*) FILTER (WHERE a > 0) FROM t
+
+statement error (0A000)
+SELECT avg(a) FROM t
 
 statement error (0A000)
 SELECT a + 1 FROM t

@@ -1,13 +1,13 @@
 # Phase 9 plan — a PostgreSQL that Rails can talk to, scored by Rails' own tests
 
-Status: **unit 0 landed** (this file, [ADR 0031](../adr/0031-rails-compatibility-is-measured.md),
-`crates/esker-sql/tests/corpus/pg19_aggregate.txt`). §8 records progress per unit.
+Status: **units 0 and 1 landed.** §8 records progress per unit, §6 the divergences and §7 what unit 1 changed.
 
 Design: [ADR 0031](../adr/0031-rails-compatibility-is-measured.md). Constitution: `CLAUDE.md`.
 The compatibility contract this inherits whole: `docs/plans/phase-6a.md` §1 — **C1** every valid
 PG-19 statement parses, **C2** parsed-but-unimplemented is `0A000` naming the construct, **C3**
-what we execute matches PostgreSQL 19 exactly. The divergence table this phase adds rows to:
-`docs/plans/phase-6a.md` §10a.
+what we execute matches PostgreSQL 19 exactly. The divergences this phase adds are §6 of this
+file — they belong beside `docs/plans/phase-6a.md` §10a and are here because that file is another
+lane's while this phase runs.
 
 Lane: `crates/esker-sql/src/**` and `crates/esker-sql/tests/**` except `tests/joint_gate.rs` and
 `tests/pd_wiring.rs`, which belong to another lane and are not touched here.
@@ -68,11 +68,13 @@ reproduces PostgreSQL's text for every input that does not error, refuse it by n
 cannot.** That rule makes `sum(int8)` an `int8` and `avg(int8)` a `0A000`, and it was arrived at
 from `tests/corpus/pg19_aggregate.txt` rather than from taste.
 
-The capture is 115 probes against the `esker-pg19` container, and it is unit 1's specification.
-Four of its lines would have been got wrong by reading rather than measuring, and they are called
+The capture is 145 probes against the `esker-pg19` container, and it is unit 1's specification.
+Six of its lines would have been got wrong by reading rather than measuring, and they are called
 out at the top of the file: `min(boolean)` does not exist, a false `HAVING` over an ungrouped
-aggregate returns **no rows**, `GROUP BY` may name an output alias where `HAVING` may not, and
-`sum(bigint)` over two `int8` maxima is a number no `int8` holds.
+aggregate returns **no rows**, `GROUP BY` may name an output alias where `HAVING` may not,
+`sum(bigint)` over two `int8` maxima is a number no `int8` holds, `GROUP BY ()` is the grand total
+rather than a grouped query, and the wrong *number* of arguments names the argument **types**
+anyway.
 
 ### Unit 1 — aggregates: `count`, `sum`, `min`, `max`, `avg`, `GROUP BY`, `HAVING`, `DISTINCT`
 
@@ -201,12 +203,44 @@ three real stores rather than the in-memory fake.
 * **No adapter fork.** The conflict-retry pattern is used as CockroachDB's adapter uses it; writing
   and maintaining an `activerecord-esker-adapter` is not this phase.
 
-## 6. Progress
+## 6. The divergence table this phase adds
+
+`docs/plans/phase-6a.md` §10a holds the whole surface diffed against PostgreSQL 19, and every row
+below belongs beside those. They are **here** rather than there because `phase-6a.md` is another
+lane's file while this phase is running; folding them in is a one-commit merge when the lanes
+close, and a divergence recorded in the wrong file is better than one recorded nowhere.
+
+| Divergence | Why | Where it is written down |
+|---|---|---|
+| `sum(int8)` is an `int8`, and overflowing it is `22003` | PostgreSQL's `sum(bigint)` is `numeric` and cannot overflow. For every input that does not overflow the two print **the same characters**, so the divergence a client can see is the `RowDescription` OID (20, not 1700) and the error on the inputs PostgreSQL absorbs. ADR 0031's rule: implement it where our type reproduces PostgreSQL's text, refuse it where it cannot. | [ADR 0031](../adr/0031-rails-compatibility-is-measured.md), `tests/aggregate_parity.rs`'s `TYPE_DIVERGENCES` |
+| `avg` over an `int8` column is `0A000` | The other half of the same rule. PostgreSQL's `avg(bigint)` is `numeric` with sixteen fractional digits — `8.3333333333333333` — and the nearest `float8` is `8.333333333333334`: a different value in the last digit and a different type at the client, where `pg` maps `numeric` to `BigDecimal` and `float8` to `Float`. `avg(float8)` **is** implemented and is exact. First entry on the numeric backlog. | ADR 0031, `tests/slt/aggregate.slt` |
+| Groups come back in `pg_cmp` order of their key | PostgreSQL promises **no order at all** without an `ORDER BY`, and returns its hash order — measured, it put the NULL group first. Ours is deterministic, which is a superset of what PostgreSQL guarantees, is what a byte-comparing harness needs, and — because `pg_cmp` puts NULL last — is the order `ORDER BY <key>` would have given anyway. The same choice `esker-columnar`'s evaluator made. | `crate::exec::aggregate`, `tests/aggregate_parity.rs`'s `DIVERGENCES` |
+| A non-integer constant in `GROUP BY` groups rather than failing | PostgreSQL answers `42601 non-integer constant in GROUP BY`; here `GROUP BY 'x'` is an ordinary one-group key. Refusing it would mean a rule about literals that nothing else in this crate has, for a statement nobody writes on purpose. Divergence in the permissive direction, and recorded rather than fixed. | `tests/aggregate_parity.rs`'s `DIVERGENCES` |
+| `EXPLAIN` prints `Aggregate` / `Group Aggregate` / `Unique` and no costs | The same divergence the access-path plans already carry: PostgreSQL chooses between `HashAggregate` and `GroupAggregate` and prints an estimate; there is one strategy here and no cost model, so the name says what it is rather than implying a choice that was not made. | `tests/slt/aggregate.slt`, `tests/slt/access_paths.slt` |
+
+## 7. What unit 1 changed, and the two bugs it turned up
+
+The aggregate itself is one plan node and one executor kind. Two things it touched were **already
+wrong**, and both were found by writing the statement down rather than by a failure:
+
+* **`ORDER BY <integer>` sorted by the constant.** A position in the target list is PostgreSQL's
+  rule and this crate did not have it: `ORDER BY 1` lowered to the literal `1`, compared equal for
+  every row, and left the input order — which *looks* right whenever the input order happens to
+  agree, and silently ignores `DESC`. It is now a position, and out of range is `42P10` naming the
+  clause and the number, as measured.
+* **`EXPLAIN` printed the wrong column names above a node that reshapes the row.** Positions were
+  always rendered against the *table's* columns, so the first output column of an aggregate printed
+  as the table's first column — a name that is not merely unhelpful but wrong, and wrong in the
+  direction a reader would believe. Each node now works out the row space it reads, and the one
+  expression that is written against a node's *output* rather than its input — an `Aggregate`'s
+  `HAVING` — says so where it is rendered.
+
+## 8. Progress
 
 | Unit | State | Commit |
 |---|---|---|
-| 0 — ADR, plan, aggregate capture | **done** | this commit |
-| 1 — aggregates | in progress | |
+| 0 — ADR, plan, aggregate capture | **done** | `de3c465`, `32fb58f` |
+| 1 — aggregates | **done** | this commit |
 | 2 — sequences and `RETURNING` | not started | |
 | 3 — savepoints | not started | |
 | 4 — joins | not started | |

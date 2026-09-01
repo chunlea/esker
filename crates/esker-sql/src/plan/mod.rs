@@ -30,8 +30,8 @@ pub use ddl::{
     UniqueConstraint, index_name, primary_key_name, unique_constraint_name,
 };
 pub use dml::{Delete, Insert, Update};
-pub use expr::{BinaryOp, Expr, Literal};
-pub use query::{Join, Node, OrderItem, Probe, Select, SelectItem, SortKey};
+pub use expr::{AggregateCall, AggregateFunc, BinaryOp, Expr, Literal};
+pub use query::{AggregateSpec, Join, Node, OrderItem, Probe, Select, SelectItem, SortKey};
 pub use session::SessionStatement;
 pub use time_machine::TimeMachineVerb;
 
@@ -59,7 +59,11 @@ pub enum Statement {
     /// `INSERT`.
     Insert(Insert),
     /// `SELECT`.
-    Select(Select),
+    ///
+    /// Boxed, and it is the only statement that is: with `DISTINCT`, `GROUP BY` and `HAVING` on it
+    /// a `Select` is several times the size of every other variant, and an unboxed one would make
+    /// every `Statement` in the crate — including a `COMMIT` — that big.
+    Select(Box<Select>),
     /// `UPDATE`.
     Update(Update),
     /// `DELETE`.

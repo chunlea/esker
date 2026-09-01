@@ -90,6 +90,24 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
         ),
         ("EXPLAIN ANALYZE SELECT 1", "EXPLAIN ANALYZE"),
         ("EXPLAIN (FORMAT JSON) SELECT 1", "EXPLAIN"),
+        // Phase 9 unit 1 runs GROUP BY, HAVING, DISTINCT and the five aggregates. What sits next
+        // to each of them does not, and each still names the clause rather than the expression it
+        // happens to be spelled as -- `GROUP BY ROLLUP` and not "the expression ROLLUP (a)",
+        // because the first is what a user searches the documentation for.
+        ("SELECT a FROM t GROUP BY ROLLUP (a)", "GROUP BY ROLLUP"),
+        ("SELECT a FROM t GROUP BY CUBE (a)", "GROUP BY CUBE"),
+        (
+            "SELECT a FROM t GROUP BY GROUPING SETS ((a), ())",
+            "GROUP BY GROUPING SETS",
+        ),
+        ("SELECT DISTINCT ON (a) a FROM t", "SELECT DISTINCT ON"),
+        ("SELECT count(*) OVER () FROM t", "a window function"),
+        (
+            "SELECT count(*) FILTER (WHERE a > 0) FROM t",
+            "an aggregate FILTER clause",
+        ),
+        ("SELECT sum(*) FROM t", "sum(*)"),
+        ("SELECT lower(b) FROM t", "the function lower"),
     ];
 
     refuses_by_name(&cases);

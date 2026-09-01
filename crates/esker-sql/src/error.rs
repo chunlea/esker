@@ -353,6 +353,76 @@ pub enum SqlError {
         right: &'static str,
     },
 
+    /// An aggregate applied to a type it has no form for: `sum(text)`, `min(boolean)`.
+    ///
+    /// **Not a missing feature.** PostgreSQL 19 has no `sum(text)` and no `min(boolean)` either —
+    /// measured, `tests/corpus/pg19_aggregate.txt` — so this is contract C3 parity and refusing it
+    /// is being right rather than being incomplete. Implementing an ordering of `f` and `t` would
+    /// have been the divergence.
+    #[error("function {func}({argument}) does not exist")]
+    UndefinedAggregate {
+        /// The aggregate's name, lower case, as PostgreSQL writes it in the message.
+        func: &'static str,
+        /// The argument's type, in the name PostgreSQL talks about it by — `timestamp with time
+        /// zone`, not `timestamptz`.
+        argument: &'static str,
+    },
+
+    /// A call shape PostgreSQL's grammar rejects and `sqlparser` reads: `count(*, 1)`.
+    ///
+    /// A syntax error the *lowering* raises rather than the parser, which is unusual enough to
+    /// justify a variant of its own. It is not [`SqlError::Syntax`] because that one renders
+    /// `sqlparser`'s message behind a `syntax error:` prefix, and here the exact sentence a real
+    /// server sends is **known** — it was measured, both spellings: `count(*, 1)` names the comma
+    /// and `count(1, *)` names the star.
+    #[error("syntax error at or near \"{0}\"")]
+    SyntaxAtOrNear(&'static str),
+
+    /// `count()` — the one aggregate that takes no argument, called as though it took one.
+    /// PostgreSQL answers `42809` here rather than `42883`, and says which spelling works.
+    #[error("count(*) must be used to call a parameterless aggregate function")]
+    ParameterlessAggregate,
+
+    /// An aggregate called with a number of arguments it has no form for. A **different** `DETAIL`
+    /// from [`SqlError::UndefinedAggregate`]: PostgreSQL distinguishes the wrong *number* of
+    /// arguments from the wrong *types*, and both sentences were captured.
+    #[error("function {func}({arguments}) does not exist")]
+    UndefinedAggregateArity {
+        /// The aggregate's name.
+        func: &'static str,
+        /// The argument types written, comma-separated, as PostgreSQL prints them: measured,
+        /// `count(n, g)` comes back as `function count(bigint, text) does not exist`.
+        arguments: String,
+    },
+
+    /// `sum(int8)` overflowing.
+    ///
+    /// The same `22003` and the same three words as any other `int8` overflow — measured,
+    /// `9223372036854775807::int8 + 1` says exactly this — because a client cannot tell which
+    /// addition it was. What is worth knowing is that **PostgreSQL never raises it here**: its
+    /// `sum(bigint)` is `numeric` and cannot overflow, so this is the visible edge of ADR 0031's
+    /// declared divergence rather than a shared failure.
+    #[error("bigint out of range")]
+    BigintOutOfRange,
+
+    /// A column that is neither a grouping key nor inside an aggregate, in a query that groups.
+    ///
+    /// The name is **qualified** — `agg.n`, not `n` — because that is what a real server prints
+    /// and because in a join it is the only form that says which table.
+    #[error(
+        "column \"{0}\" must appear in the GROUP BY clause or be used in an aggregate function"
+    )]
+    GroupingError(String),
+
+    /// An aggregate written where a group does not exist yet: in `WHERE`, or inside another
+    /// aggregate. PostgreSQL words the two differently and both are captured.
+    #[error("{0}")]
+    AggregateNotAllowed(&'static str),
+
+    /// `ORDER BY`, `GROUP BY` or `SELECT DISTINCT` naming something the target list does not have.
+    #[error("{0}")]
+    InvalidColumnReference(String),
+
     /// An operator or function met types it is not defined for.
     #[error("{0}")]
     DatatypeMismatch(String),
@@ -563,7 +633,9 @@ impl SqlError {
             SqlError::FeatureNotSupported(_) | SqlError::SnapshotIsolationRequired => {
                 sqlstate::FEATURE_NOT_SUPPORTED
             }
-            SqlError::Syntax { .. } | SqlError::InsertTooManyExpressions => sqlstate::SYNTAX_ERROR,
+            SqlError::Syntax { .. }
+            | SqlError::InsertTooManyExpressions
+            | SqlError::SyntaxAtOrNear(_) => sqlstate::SYNTAX_ERROR,
             SqlError::StatementTooComplex => sqlstate::STATEMENT_TOO_COMPLEX,
             SqlError::UndefinedTable(_)
             | SqlError::UndefinedTableForDrop(_)
@@ -593,7 +665,8 @@ impl SqlError {
             }
             SqlError::IntegerOutOfRange { .. }
             | SqlError::FloatOutOfRange { .. }
-            | SqlError::IntegerLiteralOutOfRange => sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
+            | SqlError::IntegerLiteralOutOfRange
+            | SqlError::BigintOutOfRange => sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
             SqlError::InvalidDatetimeFormat { .. } => sqlstate::INVALID_DATETIME_FORMAT,
             SqlError::DatetimeFieldOutOfRange(_) | SqlError::TimestampOutOfRange(_) => {
                 sqlstate::DATETIME_FIELD_OVERFLOW
@@ -609,7 +682,14 @@ impl SqlError {
                 sqlstate::DATATYPE_MISMATCH
             }
             SqlError::UndefinedParameter(_) => sqlstate::UNDEFINED_PARAMETER,
-            SqlError::UndefinedOperator { .. } => sqlstate::UNDEFINED_FUNCTION,
+            SqlError::UndefinedOperator { .. }
+            | SqlError::UndefinedAggregate { .. }
+            | SqlError::UndefinedAggregateArity { .. } => sqlstate::UNDEFINED_FUNCTION,
+            SqlError::ParameterlessAggregate => sqlstate::WRONG_OBJECT_TYPE,
+            SqlError::GroupingError(_) | SqlError::AggregateNotAllowed(_) => {
+                sqlstate::GROUPING_ERROR
+            }
+            SqlError::InvalidColumnReference(_) => sqlstate::INVALID_COLUMN_REFERENCE,
             SqlError::NegativeLimit("LIMIT") => sqlstate::INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
             SqlError::NegativeLimit(_) => sqlstate::INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
             SqlError::SerializationFailure { .. } => sqlstate::SERIALIZATION_FAILURE,
@@ -679,6 +759,12 @@ impl SqlError {
             SqlError::UndefinedOperator { .. } => {
                 Some("No operator of that name accepts the given argument types.".to_owned())
             }
+            SqlError::UndefinedAggregate { .. } => {
+                Some("No function of that name accepts the given argument types.".to_owned())
+            }
+            SqlError::UndefinedAggregateArity { .. } => {
+                Some("No function of that name accepts the given number of arguments.".to_owned())
+            }
             // The only relations here that are not tables are indexes, so PostgreSQL's own
             // sentence is exact.
             SqlError::AlterActionOnWrongObject { .. } => {
@@ -723,7 +809,9 @@ impl SqlError {
             SqlError::DatatypeMismatchInColumn { .. } => {
                 Some("You will need to rewrite or cast the expression.")
             }
-            SqlError::UndefinedOperator { .. } => {
+            // The same hint a real server sends with the same `42883`, word for word, for an
+            // operator and for an aggregate alike.
+            SqlError::UndefinedOperator { .. } | SqlError::UndefinedAggregate { .. } => {
                 Some("You might need to add explicit type casts.")
             }
             _ => None,
