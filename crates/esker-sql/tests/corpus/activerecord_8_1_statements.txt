@@ -1,0 +1,56 @@
+# Every statement ActiveRecord 8.1.3.1 sent a real PostgreSQL 19beta1, in the order it sent them.
+#
+# Captured from the **server's** log (`log_statement = 'all'` plus `docker logs esker-pg19`), not
+# from Rails': what is recorded is what PostgreSQL received, and a client library's own logging is
+# a second thing that can be wrong. Taken by `capture-ar-boot.sh` in the out-of-repo harness
+# (`docs/plans/phase-9-rails.md` §0), which drives `establish_connection`, a migration, ordinary
+# CRUD, and a schema dump -- deliberately not a `rails new` app, because an app adds a framework's
+# worth of statements that have nothing to do with the adapter.
+#
+# **This is not a parity corpus.** The other files under `corpus/` record what PostgreSQL *answered*
+# and require this node to answer the same. These queries read PostgreSQL's own catalog, whose
+# contents this node does not and should not reproduce, so what is pinned here is the **statement
+# text**: the specification for what a Rails-compatible node has to be able to parse and run.
+#
+# `tests/activerecord_surface.rs` replays it and asserts contract C2 over the whole file -- every
+# statement either executes or is refused **by name**, never with a syntax error -- and counts how
+# many execute. That count is a progress number, and it is expected to be low.
+#
+# One statement per line, duplicates removed, whitespace collapsed, in first-issued order.
+#
+SET client_min_messages TO 'warning'
+SET standard_conforming_strings = on
+SET intervalstyle = iso_8601
+SELECT t.oid, t.typname FROM pg_type as t WHERE t.typname IN ('int2', 'int4', 'int8', 'oid', 'float4', 'float8', 'numeric', 'bool', 'timestamp', 'timestamptz')
+SET SESSION timezone TO 'UTC'
+SHOW search_path
+SELECT t.oid, t.typname, t.typelem, t.typdelim, t.typinput, r.rngsubtype, t.typtype, t.typbasetype FROM pg_type as t LEFT JOIN pg_range as r ON oid = rngtypid WHERE t.typname IN ('int2', 'int4', 'int8', 'oid', 'float4', 'float8', 'text', 'varchar', 'char', 'name', 'bpchar', 'bool', 'bit', 'varbit', 'date', 'money', 'bytea', 'point', 'hstore', 'json', 'jsonb', 'cidr', 'inet', 'uuid', 'xml', 'tsvector', 'macaddr', 'citext', 'ltree', 'line', 'lseg', 'box', 'path', 'polygon', 'circle', 'numeric', 'interval', 'time', 'timestamp', 'timestamptz')
+SELECT t.oid, t.typname, t.typelem, t.typdelim, t.typinput, r.rngsubtype, t.typtype, t.typbasetype FROM pg_type as t LEFT JOIN pg_range as r ON oid = rngtypid WHERE t.typtype IN ('r', 'e', 'd')
+SELECT t.oid, t.typname, t.typelem, t.typdelim, t.typinput, r.rngsubtype, t.typtype, t.typbasetype FROM pg_type as t LEFT JOIN pg_range as r ON oid = rngtypid WHERE t.typelem IN (16, 17, 18, 19, 20, 21, 23, 25, 26, 114, 142, 600, 601, 602, 603, 604, 628, 700, 701, 718, 790, 829, 869, 650, 1042, 1043, 1082, 1083, 1114, 1184, 1186, 1560, 1562, 1700, 2950, 3614, 3802, 13356, 13359, 13361, 13367, 13369, 3904, 3906, 3908, 3910, 3912, 3926)
+DROP TABLE IF EXISTS "harness_widgets"
+SHOW max_identifier_length
+SELECT 'integer'::regtype::oid
+CREATE TABLE "harness_widgets" ("id" bigserial primary key, "name" character varying NOT NULL, "count" integer DEFAULT 0, "live" boolean, "created_at" timestamp(6) NOT NULL, "updated_at" timestamp(6) NOT NULL)
+CREATE UNIQUE INDEX "index_harness_widgets_on_name" ON "harness_widgets" ("name")
+SELECT a.attname, format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid), a.attnotnull, a.atttypid, a.atttypmod, c.collname, col_description(a.attrelid, a.attnum) AS comment, attidentity AS identity, attgenerated as attgenerated FROM pg_attribute a LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum LEFT JOIN pg_type t ON a.atttypid = t.oid LEFT JOIN pg_collation c ON a.attcollation = c.oid AND a.attcollation <> t.typcollation WHERE a.attrelid = '"harness_widgets"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum
+SELECT c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ANY (current_schemas(false)) AND c.relkind IN ('r','v','m','p','f')
+SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indrelid = '"harness_widgets"'::regclass AND i.indisprimary ORDER BY array_position(i.indkey, a.attnum)
+BEGIN
+COMMIT
+SELECT COUNT(*) AS "count_all", "harness_widgets"."live" AS "harness_widgets_live" FROM "harness_widgets" GROUP BY "harness_widgets"."live"
+SELECT c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ANY (current_schemas(false)) AND c.relname = 'schema_migrations' AND c.relkind IN ('r','v','m','p','f')
+SELECT current_schemas(false)
+SELECT pg_extension.extname, n.nspname AS schema FROM pg_extension JOIN pg_namespace n ON pg_extension.extnamespace = n.oid
+SELECT current_schema
+SET search_path TO public
+SELECT type.typname AS name, type.OID AS oid, n.nspname AS schema, array_agg(enum.enumlabel ORDER BY enum.enumsortorder) AS value FROM pg_enum AS enum JOIN pg_type AS type ON (type.oid = enum.enumtypid) JOIN pg_namespace n ON type.typnamespace = n.oid WHERE n.nspname = ANY (current_schemas(false)) GROUP BY type.OID, n.nspname, type.typname;
+SET search_path TO "$user", public
+SELECT c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ANY (current_schemas(false)) AND c.relkind IN ('r','p')
+SELECT pg_catalog.obj_description(c.oid, 'pg_class') FROM pg_catalog.pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'Quoted' AND c.relkind IN ('r','p') AND n.nspname = ANY (current_schemas(false))
+SELECT parent.relname FROM pg_catalog.pg_inherits i JOIN pg_catalog.pg_class child ON i.inhrelid = child.oid JOIN pg_catalog.pg_class parent ON i.inhparent = parent.oid LEFT JOIN pg_namespace n ON n.oid = child.relnamespace WHERE child.relname = 'Quoted' AND child.relkind IN ('r','p') AND n.nspname = ANY (current_schemas(false))
+SELECT pg_catalog.pg_get_partkeydef(c.oid) FROM pg_catalog.pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'Quoted' AND c.relkind IN ('r','p') AND n.nspname = ANY (current_schemas(false))
+SELECT distinct i.relname, d.indisunique, d.indkey, pg_get_indexdef(d.indexrelid), pg_catalog.obj_description(i.oid, 'pg_class') AS comment, d.indisvalid, ARRAY( SELECT pg_get_indexdef(d.indexrelid, k + 1, true) FROM generate_subscripts(d.indkey, 1) AS k ORDER BY k ) AS columns FROM pg_class t INNER JOIN pg_index d ON t.oid = d.indrelid INNER JOIN pg_class i ON d.indexrelid = i.oid LEFT JOIN pg_namespace n ON n.oid = t.relnamespace WHERE i.relkind IN ('i', 'I') AND d.indisprimary = 'f' AND t.relname = 'Quoted' AND n.nspname = ANY (current_schemas(false)) ORDER BY i.relname
+SELECT conname, pg_get_constraintdef(c.oid, true) AS constraintdef, c.convalidated AS valid FROM pg_constraint c JOIN pg_class t ON c.conrelid = t.oid JOIN pg_namespace n ON n.oid = c.connamespace WHERE c.contype = 'c' AND t.relname = 'Quoted' AND n.nspname = ANY (current_schemas(false))
+SELECT conname, pg_get_constraintdef(c.oid) AS constraintdef, c.condeferrable, c.condeferred FROM pg_constraint c JOIN pg_class t ON c.conrelid = t.oid JOIN pg_namespace n ON n.oid = c.connamespace WHERE c.contype = 'x' AND t.relname = 'Quoted' AND n.nspname = ANY (current_schemas(false))
+SELECT c.conname, c.conrelid, c.condeferrable, c.condeferred, pg_get_constraintdef(c.oid) AS constraintdef, ( SELECT array_agg(a.attname ORDER BY idx) FROM ( SELECT idx, c.conkey[idx] AS conkey_elem FROM generate_subscripts(c.conkey, 1) AS idx ) indexed_conkeys JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = indexed_conkeys.conkey_elem ) AS conkey_names FROM pg_constraint c JOIN pg_class t ON c.conrelid = t.oid JOIN pg_namespace n ON n.oid = c.connamespace WHERE c.contype = 'u' AND t.relname = 'Quoted' AND n.nspname = ANY (current_schemas(false))
+SELECT t2.oid::regclass::text AS to_table, c.conname AS name, c.confupdtype AS on_update, c.confdeltype AS on_delete, c.convalidated AS valid, c.condeferrable AS deferrable, c.condeferred AS deferred, c.conrelid, c.confrelid, ( SELECT array_agg(a.attname ORDER BY idx) FROM ( SELECT idx, c.conkey[idx] AS conkey_elem FROM generate_subscripts(c.conkey, 1) AS idx ) indexed_conkeys JOIN pg_attribute a ON a.attrelid = t1.oid AND a.attnum = indexed_conkeys.conkey_elem ) AS conkey_names, ( SELECT array_agg(a.attname ORDER BY idx) FROM ( SELECT idx, c.confkey[idx] AS confkey_elem FROM generate_subscripts(c.confkey, 1) AS idx ) indexed_confkeys JOIN pg_attribute a ON a.attrelid = t2.oid AND a.attnum = indexed_confkeys.confkey_elem ) AS confkey_names FROM pg_constraint c JOIN pg_class t1 ON c.conrelid = t1.oid JOIN pg_class t2 ON c.confrelid = t2.oid JOIN pg_namespace n ON c.connamespace = n.oid WHERE c.contype = 'f' AND t1.relname = 'Quoted' AND n.nspname = ANY (current_schemas(false)) ORDER BY c.conname

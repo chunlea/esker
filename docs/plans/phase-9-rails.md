@@ -1,6 +1,6 @@
 # Phase 9 plan — a PostgreSQL that Rails can talk to, scored by Rails' own tests
 
-Status: **units 0–3 landed; unit 4 all but a second join.** §9 records progress per unit, §6 the divergences, §7 what unit 1 changed and §8 what is watched.
+Status: **units 0–4 landed** (unit 4 bar a second join); **unit 5 captured and re-ordered** — §2 says what the measurement changed. §9 records progress per unit, §6 the divergences, §7 what unit 1 changed and §8 what is watched.
 
 Design: [ADR 0031](../adr/0031-rails-compatibility-is-measured.md). Constitution: `CLAUDE.md`.
 The compatibility contract this inherits whole: `docs/plans/phase-6a.md` §1 — **C1** every valid
@@ -280,14 +280,74 @@ its own unit's worth and is refused by name (`more than one JOIN`) until it is.
 
 ### Unit 5 — `pg_catalog` and `information_schema`, read-only
 
-ActiveRecord boots by interrogating the catalog. This unit does not build a catalog *storage*
-surface — it **translates** ours: `pg_class`, `pg_attribute`, `pg_type`, `pg_index`, `pg_namespace`,
-`pg_constraint`, and `information_schema.tables` / `.columns`, each a read-only view over the `'m'`
-key space.
+**Captured, and the capture says this unit is not next.** That is the finding, and it is the point
+of having run the measurement before writing the code.
 
-The queries are not guessed. A real `rails new` is run against the PG19 container with statement
-logging on, and the statements AR 8.x actually issues at boot and at `db:schema:dump` are the
-specification. Anything outside that set is out of scope for this unit.
+`tests/corpus/activerecord_8_1_statements.txt` is the 36 distinct statements ActiveRecord 8.1.3.1
+sent a real PostgreSQL 19beta1 — read out of the **server's** log (`log_statement = 'all'` plus
+`docker logs`), so what is recorded is what PostgreSQL received rather than what a client library
+says it sent. `tests/activerecord_surface.rs` replays them and asserts the two contracts that apply
+whatever the answer — C1, every one parses; C2, every refusal names its construct — and counts how
+many run.
+
+**Three of thirty-six.** The number was guessed at ten before it was run, which is the whole
+argument for measuring: the guess was wrong by more than a factor of three, in the flattering
+direction.
+
+#### What actually blocks ActiveRecord, counted
+
+| Blocker | Statements needing it | Is it the catalog? |
+|---|---|---|
+| **a table alias** (`FROM pg_type AS t`, `pg_class c`) | **22** | no — the query surface |
+| a catalog function (`format_type`, `pg_get_expr`, `pg_get_indexdef`, `obj_description`, `current_schemas`, …) | 15 | half |
+| an **array** and `= ANY` (`array_agg`, `ARRAY(…)`, `generate_subscripts`, `array_position`) | 13 | no — a type |
+| **two or more joins** in one query | 9 | no — the query surface |
+| a **subquery** (scalar, correlated, `ARRAY(SELECT …)`, derived table) | 4 | no — the query surface |
+| a **cast** (`'…'::regclass`, `::regtype::oid`) | 4 | half |
+| `SHOW search_path`, `SHOW max_identifier_length` | 2 | no — session |
+| `character varying`, `integer`, `timestamp(6)` | 2 | no — the type surface |
+
+The catalog's *content* — translating our `'m'` key space into `pg_class` and friends — is the last
+thing on that list, not the first. A `pg_class` this node cannot alias, join twice, or take an
+`array_agg` over is a table no ActiveRecord query can read.
+
+#### The two that come before it, measured
+
+**The migration does not run.** `t.string`, `t.integer` and `t.timestamps` compile to
+`character varying`, `integer` and `timestamp(6)`, and this node has none of the three:
+
+```sql
+CREATE TABLE "harness_widgets" ("id" bigserial primary key,   -- runs (unit 2)
+  "name" character varying NOT NULL,                          -- 0A000 the type CHARACTER VARYING
+  "count" integer DEFAULT 0,                                  -- 0A000 the type INT
+  "live" boolean,                                             -- runs
+  "created_at" timestamp(6) NOT NULL, …)                      -- 0A000
+```
+
+So rung 2 of the ladder — establish a connection and run one migration — is blocked on the **type
+surface** and not on the catalog at all. `bigserial` and `boolean` were the two that worked, which
+is unit 2 and phase 6a paying off.
+
+**Every catalog query is blocked on a table alias** before anything else in it matters. `FROM
+pg_type AS t` is `0A000 a table alias is not supported` today; 22 of the 36 statements open that
+way, including the very first one ActiveRecord sends.
+
+#### What this re-orders
+
+The unit as written — "translate our catalog into views" — is a phase, and it is the *last* phase of
+several. What stands between here and a booting ActiveRecord, in the order the boot hits it:
+
+1. **table aliases**, and with them the qualified-name resolution they change;
+2. **`SHOW`** for the two GUCs a client reads at connect;
+3. the **type surface**: `integer`, `character varying`, `timestamp` — which also decides whether
+   `numeric` arrives at the same time (ADR 0031's backlog);
+4. **multi-table joins** — the thing unit 4 deliberately left, now with a number on it: 9
+   statements;
+5. **subqueries** and **arrays**;
+6. **casts** and the catalog **functions**;
+7. and only then the catalog's content.
+
+Each of those is a unit. The count in `activerecord_surface.rs` is what says whether one worked.
 
 ### Unit 6 — the scoreboard
 
@@ -382,12 +442,12 @@ wrong**, and both were found by writing the statement down rather than by a fail
 
 ## 8. The watched list
 
-Failures seen once, not chased, and instrumented so that a recurrence leaves an artifact rather
-than a line in a scrollback. A third sighting of any of them makes it a chase.
+Failures seen but not chased, instrumented so that a recurrence leaves an artifact rather than a
+line in a scrollback. A third sighting makes it a chase.
 
 | Seen | What | State |
 |---|---|---|
-| 2026-09-01, once | `joint_gate::a_lock_the_ttl_kills_resolves_the_same_way_on_both_engines` failed a `TxnKv` call to the region's leader under a fully parallel `cargo test`. Passes 5/5 standalone — 3× alone and 2× as a whole target. A 30-second RPC deadline missed under load, on the clock surface `1f22077` hardened, and nothing in this lane touches a lock or a TTL. | **watched.** The bare `expect` on that call is now a dump: `target/joint-gate-transport-<ts>.txt`, naming who led the region, every store's address, leadership and applied index, and the deadline. |
+| 2026-09-01, **twice** | `joint_gate`'s two transport calls have each missed their 30-second deadline once under a fully parallel `cargo test`: first `a_lock_the_ttl_kills_resolves_the_same_way_on_both_engines` on the `TxnKv` call, then `the_learner_answers_fragments_that_agree_with_a_row_scan` on the fragment call — `Timeout { no answer from 127.0.0.1:60224 in 30s }`. Both pass standalone. **Two different tests, one failure mode**, which narrows it: this is not the lock-expiry clock `1f22077` hardened, it is a 30-second RPC deadline against however many test binaries this machine is running at once. | **watched, one sighting from a chase.** Both calls now dump instead of unwrapping: `target/joint-gate-transport-<ts>.txt`, naming who led the region, every store's address, leadership and applied index, and the deadline. |
 
 ## 9. Progress
 
@@ -397,7 +457,8 @@ than a line in a scrollback. A third sighting of any of them makes it a chase.
 | 1 — aggregates | **done** | `1d78a96` |
 | 2 — sequences and `RETURNING` | **done** | `e1b1bd2`, `7a7d4f3`, `bf28e0d` |
 | 3 — savepoints | **done** | `779ae2e` (capture), `a74b724` |
-| 4 — joins | **`LEFT`, `ON`, `USING` done**; a second join is not | this commit |
+| 4 — joins | **`LEFT`, `ON`, `USING` done**; a second join is not | `56d23e2` |
+| 5 — `pg_catalog` | **captured, and re-ordered by what it found**: 3 of ActiveRecord's 36 statements run, and the catalog is the *last* blocker rather than the first | this commit |
 | 3 — savepoints | not started | |
 | 4 — joins | not started | |
 | 5 — `pg_catalog` | not started | |

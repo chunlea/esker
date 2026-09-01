@@ -341,7 +341,7 @@ fn parse(corpus: &str) -> Vec<(usize, String, Answer)> {
         .filter(|(_, line)| !line.trim_start().starts_with('#') && !line.trim().is_empty())
         .map(|(index, line)| {
             let mut fields = line.split('\t');
-            let statement = fields.next().expect("a statement").to_owned();
+            let statement = fields.next().unwrap_or_default().to_owned();
             let second = fields
                 .next()
                 .unwrap_or_else(|| panic!("line {}: no answer", index + 1));
@@ -352,7 +352,7 @@ fn parse(corpus: &str) -> Vec<(usize, String, Answer)> {
                 None if second.is_empty() => Answer::Done,
                 None => Answer::Rows {
                     types: second.split(',').map(str::to_owned).collect(),
-                    rows: match fields.next().expect("rows") {
+                    rows: match fields.next().unwrap_or("-") {
                         "-" => Vec::new(),
                         rows => rows
                             .split(" ; ")

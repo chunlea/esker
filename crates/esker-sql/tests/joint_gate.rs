@@ -475,7 +475,17 @@ impl Gate {
             esker_columnar::TableRef { tenant, table_id },
             projection,
         );
-        let transport = BlockingTransport::connect(node.address).unwrap();
+        // Dumped rather than unwrapped, for the reason the `TxnKv` call is: this is the second of
+        // the two transport calls in this file and both have now missed their deadline once under
+        // a fully parallel `cargo test` (`docs/plans/phase-9-rails.md` §8).
+        let transport = BlockingTransport::connect(node.address).unwrap_or_else(|error| {
+            transport_dump(
+                std::slice::from_ref(node),
+                region_id,
+                "connect",
+                &format!("{error}"),
+            )
+        });
         let answer = transport
             .call(
                 Request::Fragment {
@@ -488,7 +498,14 @@ impl Gate {
                 },
                 Instant::now() + Duration::from_secs(30),
             )
-            .unwrap();
+            .unwrap_or_else(|error| {
+                transport_dump(
+                    std::slice::from_ref(node),
+                    region_id,
+                    "fragment call",
+                    &format!("{error}"),
+                )
+            });
         match answer {
             Response::Fragment(response) => response,
             other => panic!("a fragment request answered {other:?}"),
@@ -533,49 +550,9 @@ impl Gate {
         answer.into_txn_kv().expect("a TxnKv answer")
     }
 
-    /// Writes the cluster down and fails, for a `TxnKv` call that never answered.
-    ///
-    /// The same discipline as [`compare`] and for the same reason — an artifact rather than a line
-    /// in a scrollback — but a different question, so a different dump: what failed here is the
-    /// *wire*, so what has to be on file is who led the region, what every store thought it was
-    /// doing, and how long the deadline was.
+    /// Writes the cluster down and fails, for a call that never answered.
     fn transport_dump(&self, region_id: u64, what: &str, error: &str) -> ! {
-        let mut dump = String::new();
-        let _ = writeln!(
-            dump,
-            "a TxnKv {what} to the leader of region {region_id} failed"
-        );
-        let _ = writeln!(dump, "error            {error}");
-        let _ = writeln!(dump, "deadline         30s");
-        dump.push_str("\n-- every store ---------------------------------------------------\n");
-        for node in &self.nodes {
-            let peer = node.store.peer_of(region_id);
-            let _ = writeln!(
-                dump,
-                "store {}  address={}  leader={:?}  applied={:?}",
-                node.store.store_id(),
-                node.address,
-                peer.as_ref().map(|peer| peer.is_leader()),
-                peer.as_ref().map(|peer| peer.applied_index()),
-            );
-        }
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |since| since.as_millis());
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target")
-            .join(format!("joint-gate-transport-{stamp}.txt"));
-        let written = std::fs::write(&path, &dump);
-        panic!(
-            "a TxnKv {what} to the leader of region {region_id} failed: {error}; dump {} at {}\n\
-             {dump}",
-            if written.is_ok() {
-                "written"
-            } else {
-                "NOT written"
-            },
-            path.display(),
-        )
+        transport_dump(&self.nodes, region_id, what, error)
     }
 
     /// The store ids holding a columnar learner of any region, as **PD** records them.
@@ -714,6 +691,50 @@ async fn an_alter_places_a_columnar_replica_and_clearing_it_takes_it_back() {
     .await;
 
     gate.stop().await;
+}
+
+/// Writes the cluster down and fails, for a transport call that never answered.
+///
+/// The same discipline as [`compare`] and for the same reason — an artifact rather than a line in a
+/// scrollback — but a different question, so a different dump: what failed here is the *wire*, so
+/// what has to be on file is who led the region, what every store thought it was doing, and how
+/// long the deadline was.
+///
+/// A free function over whatever nodes the caller can see, because the two calls that need it are
+/// not both methods on the gate: the fragment one is an associated function holding a single node.
+fn transport_dump(nodes: &[Node], region_id: u64, what: &str, error: &str) -> ! {
+    let mut dump = String::new();
+    let _ = writeln!(dump, "a {what} to the leader of region {region_id} failed");
+    let _ = writeln!(dump, "error            {error}");
+    let _ = writeln!(dump, "deadline         30s");
+    dump.push_str("\n-- every store this caller can see --------------------------------\n");
+    for node in nodes {
+        let peer = node.store.peer_of(region_id);
+        let _ = writeln!(
+            dump,
+            "store {}  address={}  leader={:?}  applied={:?}",
+            node.store.store_id(),
+            node.address,
+            peer.as_ref().map(|peer| peer.is_leader()),
+            peer.as_ref().map(|peer| peer.applied_index()),
+        );
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target")
+        .join(format!("joint-gate-transport-{stamp}.txt"));
+    let written = std::fs::write(&path, &dump);
+    panic!(
+        "a {what} to the leader of region {region_id} failed: {error}; dump {} at {}\n{dump}",
+        if written.is_ok() {
+            "written"
+        } else {
+            "NOT written"
+        },
+        path.display(),
+    )
 }
 
 /// Compares the two engines and, on a disagreement, **writes everything down before failing**.
