@@ -115,6 +115,34 @@ pub enum Operator {
         peer_id: u64,
     },
 
+    /// Add a replica of `region_id` on `store_id` that **stays** a learner.
+    ///
+    /// [ADR 0022](../../docs/adr/0022-columnar-learner-replica.md) Decision 1: a columnar replica
+    /// is a Raft learner whose apply writes columns instead of rows, and it is never promoted.
+    ///
+    /// **This is not a new membership concept.** The peer it asks for is an ordinary
+    /// [`PeerRole::Learner`](crate::PeerRole::Learner) — the same one [`Operator::AddPeer`]
+    /// creates on its way to a voter — and nothing in Raft, in the region record or in a quorum
+    /// calculation tells the two apart, because there is nothing to tell apart. What differs is
+    /// what **done** means, and that is why it cannot be `AddPeer` with a flag: `AddPeer`
+    /// completes when the peer becomes a voter, and this one completes when it exists at all. An
+    /// `AddPeer` that stopped at a learner is a repair still in progress; an `AddLearner` that
+    /// stopped at a learner is finished.
+    ///
+    /// A separate kind byte rather than a field on `AddPeer`, so no existing operator's bytes
+    /// move — the same additive shape [ADR 0028](../../docs/adr/0028-the-schema-lease.md) chose
+    /// for the schema lease, and for the same reason.
+    AddLearner {
+        /// The region to grow.
+        region_id: u64,
+        /// The epoch PD believes it is at.
+        epoch: Epoch,
+        /// Where the learner goes.
+        store_id: u64,
+        /// What to number it.
+        peer_id: u64,
+    },
+
     /// Move leadership of `region_id` to `to_peer_id`.
     ///
     /// **Reserved for 4d.** It is on the wire now so that the operator encoding does not change
@@ -134,6 +162,7 @@ mod operator_kind {
     pub(super) const ADD_PEER: u8 = 1;
     pub(super) const REMOVE_PEER: u8 = 2;
     pub(super) const TRANSFER_LEADER: u8 = 3;
+    pub(super) const ADD_LEARNER: u8 = 4;
 }
 
 impl Operator {
@@ -142,6 +171,7 @@ impl Operator {
     pub fn region_id(&self) -> u64 {
         match self {
             Self::AddPeer { region_id, .. }
+            | Self::AddLearner { region_id, .. }
             | Self::RemovePeer { region_id, .. }
             | Self::TransferLeader { region_id, .. } => *region_id,
         }
@@ -152,6 +182,7 @@ impl Operator {
     pub fn epoch(&self) -> Epoch {
         match self {
             Self::AddPeer { epoch, .. }
+            | Self::AddLearner { epoch, .. }
             | Self::RemovePeer { epoch, .. }
             | Self::TransferLeader { epoch, .. } => *epoch,
         }
@@ -162,6 +193,7 @@ impl Operator {
     pub fn name(&self) -> &'static str {
         match self {
             Self::AddPeer { .. } => "AddPeer",
+            Self::AddLearner { .. } => "AddLearner",
             Self::RemovePeer { .. } => "RemovePeer",
             Self::TransferLeader { .. } => "TransferLeader",
         }
@@ -176,6 +208,18 @@ impl Operator {
                 peer_id,
             } => {
                 out.put_u8(operator_kind::ADD_PEER);
+                out.put_varint(*region_id);
+                epoch.encode(out);
+                out.put_varint(*store_id);
+                out.put_varint(*peer_id);
+            }
+            Self::AddLearner {
+                region_id,
+                epoch,
+                store_id,
+                peer_id,
+            } => {
+                out.put_u8(operator_kind::ADD_LEARNER);
                 out.put_varint(*region_id);
                 epoch.encode(out);
                 out.put_varint(*store_id);
@@ -210,6 +254,12 @@ impl Operator {
         let epoch = Epoch::decode(input)?;
         Ok(match kind {
             operator_kind::ADD_PEER => Self::AddPeer {
+                region_id,
+                epoch,
+                store_id: input.get_varint("operator.store_id")?,
+                peer_id: input.get_varint("operator.peer_id")?,
+            },
+            operator_kind::ADD_LEARNER => Self::AddLearner {
                 region_id,
                 epoch,
                 store_id: input.get_varint("operator.store_id")?,

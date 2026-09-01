@@ -70,6 +70,26 @@ as an abstraction.
 `(table, pk, commit_ts, value_bytes)` and a fragment could not see typed columns, which defeats the
 purpose of a columnar copy.
 
+## Applied a second time: the columnar record
+
+The same argument, the same week, for a record whose *whole design point* is that two layers
+share it. `esker-sql` writes a per-table columnar record (ADR 0022 Decision 5); a store holding a
+columnar learner reads it to decode rows, and a placement driver reads its replica count. Neither
+links `esker-sql`, and the codec was written there — so the layout was shared and the function
+that parses it was not.
+
+The columnar record's key builders, its `Published` schema type and its codec now live in
+`esker_keys::columnar`, beside the row codec they are built on. `esker-sql` keeps the *writing* of
+it, because the `TableDef` it is written from is `esker-sql`'s, and re-exports `Published` rather
+than wrapping it so there is one definition of what the bytes mean. The goldens did not move a
+byte, which is the test of whether this was a move.
+
+**It is necessary and it is not sufficient for the placement driver, which is worth stating so
+nobody reads this as closing that.** `esker-pd` links its own engine, `esker-proto` and
+`esker-base`, and every PD method is *inbound* — stores and SQL nodes call PD; PD calls nobody.
+So PD can now parse a record it still has no way to obtain. The decoder's home was one problem
+and the access path is another, and only the first is closed here.
+
 ## Consequences
 
 * `esker-store` can decode a stored row without linking `esker-sql`, which is what unblocks ADR

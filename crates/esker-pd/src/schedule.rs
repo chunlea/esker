@@ -125,7 +125,14 @@ pub fn urgency_for(region: &RegionRecord, cluster: &Cluster<'_>) -> Option<Urgen
     if live_voters == quorum && live_voters < cluster.target_replicas {
         return Some(Urgency::QuorumRisk);
     }
-    if live().count() < cluster.target_replicas {
+    // **Voters, not peers.** `target_replicas` is a number of voters — it is what `quorum` is
+    // computed from — so counting learners towards it lets a learner stand in for a voter that
+    // is not there. That was harmless while every learner was a transient step of `AddPeer`; a
+    // columnar learner is permanent (ADR 0022 Decision 1), so a region of four voters and a
+    // columnar copy would have read as five replicas and reported healthy against a target of
+    // five. Under-replication masked by a replica that cannot vote is the failure this whole
+    // function exists to report.
+    if live().filter(|peer| peer.role == PeerRole::Voter).count() < cluster.target_replicas {
         return Some(Urgency::UnderTarget);
     }
     region

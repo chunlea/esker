@@ -345,6 +345,13 @@ pub enum EventKind {
     RemovePeer = 2,
     /// `TransferLeader`.
     TransferLeader = 3,
+    /// `AddLearner` — a columnar replica, which is never promoted
+    /// ([ADR 0022](../../docs/adr/0022-columnar-learner-replica.md) Decision 1).
+    ///
+    /// Its own kind in the history rather than an `AddPeer` that happened to stop, because the
+    /// history is what an operator reads to tell a repair that stalled from a placement that
+    /// finished — and those look identical if both are written down as "added a peer".
+    AddLearner = 4,
 }
 
 /// What became of it (*fixed*). Zero is reserved.
@@ -375,6 +382,7 @@ impl EventKind {
             1 => Some(Self::AddPeer),
             2 => Some(Self::RemovePeer),
             3 => Some(Self::TransferLeader),
+            4 => Some(Self::AddLearner),
             _ => None,
         }
     }
@@ -386,6 +394,7 @@ impl EventKind {
             Self::AddPeer => "AddPeer",
             Self::RemovePeer => "RemovePeer",
             Self::TransferLeader => "TransferLeader",
+            Self::AddLearner => "AddLearner",
         }
     }
 }
@@ -750,12 +759,15 @@ mod tests {
         // version ++ count ++ at_ms(6) ++ region_id(1) ++ kind ++ outcome
         let kind_at = good.len() - 4;
         assert_eq!(good[kind_at], super::EventKind::AddPeer.as_u8());
-        for byte in [0u8, 4, 200] {
+        // 4 is `AddLearner` now (ADR 0022), so the unknown values are 0, which is reserved, and
+        // two above the highest kind this version defines. A test that pins "unknown" to a
+        // number a later version claims stops testing anything the moment it is claimed.
+        for byte in [0u8, 5, 200] {
             let mut bytes = good.clone();
             bytes[kind_at] = byte;
             assert!(super::HistoryRecord::decode(&bytes).is_err(), "kind {byte}");
             let mut bytes = good.clone();
-            bytes[kind_at + 1] = byte.wrapping_add(u8::from(byte == 4));
+            bytes[kind_at + 1] = byte;
             if super::EventOutcome::from_u8(bytes[kind_at + 1]).is_none() {
                 assert!(super::HistoryRecord::decode(&bytes).is_err());
             }

@@ -72,14 +72,6 @@ const KIND_ROW_ID: u8 = b'a';
 const KIND_CHECKPOINT: u8 = b'c';
 const KIND_JOB: u8 = b'j';
 const KIND_FLASHBACK: u8 = b'f';
-/// A table's columnar-replica count ([ADR 0022](../../../../docs/adr/0022-columnar-learner-replica.md)
-/// Decision 5).
-///
-/// **`'l'`, not the `'c'` the ADR sketched.** ADR 0022 wrote the key as `'m' ++ "sql" ++ 'c'`,
-/// and by the time it was built `'c'` was the checkpoint's — phase 6d took it first, and two
-/// kinds sharing a byte is one scan returning the other's records. `'l'` is for the **learner**
-/// the ADR's own Decision 1 calls a columnar replica, which is the next most honest letter.
-const KIND_COLUMNAR: u8 = b'l';
 
 /// Tags for [`ColumnType`] as stored. Ours rather than PostgreSQL's OIDs, because these are a
 /// format we own and must never move; the OIDs stay on the wire where they belong.
@@ -219,119 +211,32 @@ pub(super) fn decode_retention(bytes: &[u8]) -> Result<u64> {
     Ok(retention)
 }
 
-/// `'m' ++ "sql" ++ 'l' ++ tenant ++ table_id`. Absent for a table with no columnar copy, which
-/// is the same as a count of zero.
+/// The columnar record's key, and the codec, live in [`esker_keys::columnar`].
 ///
-/// Laid out like the retention override above and for the same reason: ids are memcomparable, so
-/// one scan of `'m' ++ "sql" ++ 'l'` visits every table that wants one, in id order, which is
-/// what a placement driver reading the map wants.
-#[must_use]
-pub(super) fn columnar_key(tenant: u64, table_id: u64) -> Vec<u8> {
-    let mut suffix = [SQL, &[KIND_COLUMNAR]].concat();
-    codec::encode_u64(tenant, &mut suffix);
-    codec::encode_u64(table_id, &mut suffix);
-    prefix::meta_key(&suffix)
-}
+/// Moved there in [ADR 0030](../../../../docs/adr/0030-the-row-codec-moves-down.md)'s second
+/// application: a store holding a columnar learner has to read this record and cannot link this
+/// crate. What stays here is the *writing* of it, because the `TableDef` it is written from is
+/// this crate's, and the pinning test below that says the constants the two crates share have
+/// not drifted.
+pub(super) use esker_keys::columnar::{
+    decode as decode_columnar, key as columnar_key, range as columnar_range,
+    replicas as decode_columnar_replicas, table_id as columnar_table_id,
+};
 
-/// The `[start, end)` range holding one tenant's columnar settings, in table-id order.
-#[must_use]
-pub(super) fn columnar_range(tenant: u64) -> (Vec<u8>, Vec<u8>) {
-    let mut suffix = [SQL, &[KIND_COLUMNAR]].concat();
-    codec::encode_u64(tenant, &mut suffix);
-    let start = prefix::meta_key(&suffix);
-    let mut end = start.clone();
-    end.push(0xFF);
-    (start, end)
-}
-
-/// The table id out of a columnar key.
-pub(super) fn columnar_table_id(tenant: u64, key: &[u8]) -> Result<u64> {
-    let prefix = columnar_key(tenant, 0);
-    let at = prefix.len() - 8;
-    let tail = key
-        .get(at..)
-        .ok_or_else(|| corrupt("a columnar key with no table id"))?;
-    let (id, rest) = codec::decode_u64(tail).map_err(|error| corrupt(error.to_string()))?;
-    if !rest.is_empty() {
-        return Err(corrupt("bytes after a columnar key's table id"));
-    }
-    Ok(id)
-}
-
-/// What a table wants of the storage layer: how many columnar copies, and how to decode its rows.
+/// Writes a columnar record from a table definition.
 ///
-/// ```text
-/// version:u8 ++ replicas:u8 ++ schema_version:varint ++ ncols:varint
-///             ++ (type:u8 ++ missing:value) * ncols
-/// ```
-///
-/// **Two readers, one record, and the count is a fixed-offset prefix.** The placement driver
-/// reads byte 1 and stops: it wants a number and cannot read a table definition anyway
-/// (`CLAUDE.md` invariant 7). A store holding a columnar learner reads on into the tail, because
-/// it has to turn a committed row into typed columns and `esker_keys::row::decode_row` needs a
-/// `RowSchema` to do it. Neither links `esker-sql`.
-///
-/// **The schema is here rather than under a kind byte of its own** so that it is written in the
-/// same transaction as the setting that causes a learner to exist, and refreshed in the same
-/// transaction as the `ALTER` that changes it. A schema published separately would be a second
-/// record to keep in step, and the window between the two writes is exactly the window in which a
-/// learner decodes rows against the wrong schema.
-///
-/// **`missing` travels with the types and is not optional.** `decode_row` pads a row written
-/// before a column existed with that column's missing value — PostgreSQL 11's `attmissingval` —
-/// and a decoder given only types would build `RowSchema::nullable` and read NULL where the row
-/// store reads the default. Silently, and only for rows older than the `ALTER`, which is the
-/// hardest case to notice.
-///
-/// A `u8` count because a table wanting more than 255 columnar copies is a configuration error
-/// rather than a number to carry. Zero is legal and means the same as an absent record;
-/// `SET (columnar_replicas = 0)` writes it rather than deleting, so that "somebody turned it off"
-/// and "nobody ever turned it on" are the same *answer* without being the same *history*.
+/// The one direction that stays: the layout is `esker-keys`', and turning a `TableDef` into the
+/// `(type, missing)` pairs it holds is this crate's, because `TableDef` is.
 pub(super) fn encode_columnar(replicas: u8, table: Option<&TableDef>) -> Result<Vec<u8>> {
-    let mut out = vec![CATALOG_FORMAT_VERSION, replicas];
-    let Some(table) = table else {
-        varint::put_u64(0, &mut out);
-        varint::put_u64(0, &mut out);
-        return Ok(out);
-    };
-    varint::put_u64(table.schema_version, &mut out);
-    varint::put_u64(table.columns.len() as u64, &mut out);
-    for column in &table.columns {
-        out.push(tag_of(column.ty));
-        put_value(column.missing.as_ref(), column.ty, &mut out)?;
-    }
-    Ok(out)
-}
-
-/// The count alone, which is all a placement driver wants.
-///
-/// A separate function rather than the first field of the full decode, because PD must be able to
-/// read it **without** parsing a schema it has no business understanding — and because a schema
-/// this build cannot parse must not stop PD from reading a number it can.
-pub(super) fn decode_columnar_replicas(bytes: &[u8]) -> Result<u8> {
-    let mut reader = Reader::new(bytes)?;
-    reader.u8()
-}
-
-/// The whole record: the count, the schema version, and the row schema.
-pub(super) fn decode_columnar(bytes: &[u8]) -> Result<(u8, super::PublishedSchema)> {
-    let mut reader = Reader::new(bytes)?;
-    let replicas = reader.u8()?;
-    let schema_version = reader.varint()?;
-    let count = reader.count()?;
-    let mut columns = Vec::with_capacity(count.min(1024));
-    for _ in 0..count {
-        let ty = type_of(reader.u8()?)?;
-        columns.push((ty, reader.value(ty)?));
-    }
-    reader.finish()?;
-    Ok((
-        replicas,
-        super::PublishedSchema {
-            schema_version,
-            columns,
-        },
-    ))
+    let published = table.map(|table| esker_keys::columnar::Published {
+        schema_version: table.schema_version,
+        columns: table
+            .columns
+            .iter()
+            .map(|column| (column.ty, column.missing.clone()))
+            .collect(),
+    });
+    Ok(esker_keys::columnar::encode(replicas, published.as_ref())?)
 }
 
 /// `'m' ++ "sql" ++ 'c' ++ tenant ++ name`. A checkpoint, absent until somebody names one.
@@ -779,15 +684,6 @@ impl<'a> Reader<'a> {
             1 => Ok(true),
             other => Err(corrupt(format!("flag byte {other} is neither 0 nor 1"))),
         }
-    }
-
-    fn u8(&mut self) -> Result<u8> {
-        let (head, rest) = self
-            .bytes
-            .split_first()
-            .ok_or_else(|| corrupt("a catalog record ends inside a byte"))?;
-        self.bytes = rest;
-        Ok(*head)
     }
 
     fn u64_le(&mut self) -> Result<u64> {

@@ -31,6 +31,9 @@ fn event_of(operator: &Operator, outcome: EventOutcome, at_ms: u64) -> OperatorE
         // `RemovePeer` names a peer and not a store, because the store it is sent to needs only
         // the peer id. The history says nothing PD does not have on the wire.
         Operator::RemovePeer { peer_id, .. } => (EventKind::RemovePeer, 0, *peer_id),
+        Operator::AddLearner {
+            store_id, peer_id, ..
+        } => (EventKind::AddLearner, *store_id, *peer_id),
         Operator::TransferLeader { to_peer_id, .. } => (EventKind::TransferLeader, 0, *to_peer_id),
     };
     OperatorEvent {

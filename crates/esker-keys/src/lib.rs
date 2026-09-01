@@ -19,6 +19,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod codec;
+pub mod columnar;
 pub mod prefix;
 pub mod row;
 pub mod value;

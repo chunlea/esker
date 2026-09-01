@@ -204,6 +204,18 @@ impl Model {
                 shard.peers.push(Peer::voter(*store_id, *peer_id));
                 shard.epoch.conf_ver += 1;
             }
+            // A learner that stays one. The fake store does exactly what the operator says and
+            // never promotes it, which is the point of the operator being its own kind.
+            Operator::AddLearner {
+                region_id,
+                store_id,
+                peer_id,
+                ..
+            } => {
+                let shard = self.shards.get_mut(region_id).expect("a region PD named");
+                shard.peers.push(Peer::learner(*store_id, *peer_id));
+                shard.epoch.conf_ver += 1;
+            }
             Operator::RemovePeer {
                 region_id, peer_id, ..
             } => {

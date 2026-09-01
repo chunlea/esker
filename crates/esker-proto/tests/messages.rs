@@ -537,25 +537,11 @@ fn golden_txn_responses() -> Vec<(&'static str, Response)> {
     ]
 }
 
-fn golden_pd_responses() -> Vec<(&'static str, Response)> {
+/// The `RegionHeartbeat` answers, one per operator kind, in their own function: with them
+/// inline `golden_pd_responses` runs past the line budget, and a corpus function holding
+/// every message of every shape is one nobody reads.
+fn golden_operator_responses() -> Vec<(&'static str, Response)> {
     vec![
-        (
-            "pd-bootstrap",
-            Response::Pd(PdResp::Bootstrap {
-                cluster_id: PD_CLUSTER,
-                region: Some(pd_region()),
-            }),
-        ),
-        (
-            // The answer to every `Bootstrap` but the first in the life of a cluster: the
-            // cluster is there and this caller did not create it.
-            "pd-bootstrap-registered",
-            Response::Pd(PdResp::Bootstrap {
-                cluster_id: PD_CLUSTER,
-                region: None,
-            }),
-        ),
-        ("pd-store-heartbeat", Response::Pd(PdResp::StoreHeartbeat)),
         (
             "pd-region-heartbeat",
             Response::Pd(PdResp::RegionHeartbeat { operator: None }),
@@ -593,6 +579,43 @@ fn golden_pd_responses() -> Vec<(&'static str, Response)> {
                 }),
             }),
         ),
+        (
+            // A learner that is never promoted (ADR 0022 Decision 1). The same fields as
+            // `AddPeer` behind a different kind byte, because what differs is what *done* means
+            // and not what is asked of Raft -- so the bytes are deliberately near-identical and
+            // the golden is what stops the two being confused.
+            "pd-region-heartbeat-add-learner",
+            Response::Pd(PdResp::RegionHeartbeat {
+                operator: Some(Operator::AddLearner {
+                    region_id: 7,
+                    epoch: Epoch::new(2, 3),
+                    store_id: 5,
+                    peer_id: 42,
+                }),
+            }),
+        ),
+    ]
+}
+
+fn golden_pd_responses() -> Vec<(&'static str, Response)> {
+    vec![
+        (
+            "pd-bootstrap",
+            Response::Pd(PdResp::Bootstrap {
+                cluster_id: PD_CLUSTER,
+                region: Some(pd_region()),
+            }),
+        ),
+        (
+            // The answer to every `Bootstrap` but the first in the life of a cluster: the
+            // cluster is there and this caller did not create it.
+            "pd-bootstrap-registered",
+            Response::Pd(PdResp::Bootstrap {
+                cluster_id: PD_CLUSTER,
+                region: None,
+            }),
+        ),
+        ("pd-store-heartbeat", Response::Pd(PdResp::StoreHeartbeat)),
         (
             "pd-get-region",
             Response::Pd(PdResp::GetRegion {
@@ -730,6 +753,7 @@ fn golden_responses() -> Vec<(&'static str, Response)> {
     ];
     responses.extend(golden_pd_responses());
     responses.extend(golden_txn_responses());
+    responses.extend(golden_operator_responses());
     responses.extend(golden_fragment_responses());
     responses
 }

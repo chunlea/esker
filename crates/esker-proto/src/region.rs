@@ -73,12 +73,45 @@ pub enum PeerRole {
     Voter = 1,
     /// Receives the log but neither votes nor counts towards a quorum
     /// (`docs/DESIGN.md` §5).
+    ///
+    /// **On its way to being a voter.** This is the transient state of an `AddPeer`: the store
+    /// catches the replica up and the leader promotes it. A learner that must *never* be
+    /// promoted is [`PeerRole::ColumnarLearner`], and the two have to be different values for
+    /// exactly that reason.
     Learner = 2,
+    /// A columnar replica: receives the log, never votes, and is **never promoted**
+    /// ([ADR 0022](../../docs/adr/0022-columnar-learner-replica.md) Decision 1).
+    ///
+    /// # Why this is a role and not a flag somewhere else
+    ///
+    /// A store promotes learners that have caught up, and it decides that from the region
+    /// record. With two roles, a columnar replica is indistinguishable from one being caught up,
+    /// so the next promotion round makes it a voter — at which point it counts towards a quorum
+    /// and is asked to serve row reads it holds no rows for. The failure arrives minutes after a
+    /// placement that appeared to succeed, and reads as a placement bug rather than as this.
+    ///
+    /// It is **per peer** because one region can hold both at once: a replica being caught up on
+    /// its way to voting, and a columnar copy that never will. A marker on the region could not
+    /// tell them apart.
+    ///
+    /// It is in the **region record** because promotion is the *leader's* decision, taken
+    /// elsewhere. A store hosting a columnar replica knows perfectly well what it holds; the
+    /// leader is the one that needs telling.
+    ///
+    /// # Raft is untouched
+    ///
+    /// To Raft this is a learner and nothing else: the conf change stays
+    /// `ConfChangeKind::AddLearner`, quorums are unchanged, and `esker-raft` has no idea the
+    /// distinction exists. What carries it is the conf change's **context**, which
+    /// `esker-raft` documents as caller data it never interprets and which `esker-store` already
+    /// uses to carry a store id. Because the context is replicated in the log, every peer —
+    /// the leader included — applies the same role.
+    ColumnarLearner = 3,
 }
 
 impl PeerRole {
     /// Every role this version defines.
-    pub const ALL: [Self; 2] = [Self::Voter, Self::Learner];
+    pub const ALL: [Self; 3] = [Self::Voter, Self::Learner, Self::ColumnarLearner];
 
     /// The wire byte.
     #[must_use]
@@ -92,6 +125,7 @@ impl PeerRole {
         match byte {
             1 => Some(Self::Voter),
             2 => Some(Self::Learner),
+            3 => Some(Self::ColumnarLearner),
             _ => None,
         }
     }
@@ -116,6 +150,22 @@ impl Peer {
             store_id,
             peer_id,
             role: PeerRole::Voter,
+        }
+    }
+
+    /// A peer that receives the log but neither votes nor counts towards a quorum.
+    ///
+    /// Two things are learners and the wire does not tell them apart, on purpose: a replica
+    /// being caught up before it is promoted to a voter, and a columnar replica that is never
+    /// promoted at all ([ADR 0022](../../docs/adr/0022-columnar-learner-replica.md) Decision 1).
+    /// Raft treats them identically because there is nothing to treat differently; what differs
+    /// is only which operator asked for one, which is PD's business and not this type's.
+    #[must_use]
+    pub fn learner(store_id: u64, peer_id: u64) -> Self {
+        Self {
+            store_id,
+            peer_id,
+            role: PeerRole::Learner,
         }
     }
 

@@ -152,6 +152,19 @@ impl InFlight {
                     None => {}
                 }
             }
+            // Done when the peer EXISTS, whatever its role -- which is the whole difference
+            // from `AddPeer` above. A columnar learner is never promoted, so waiting for a voter
+            // would be waiting for something nobody is going to do.
+            Operator::AddLearner { peer_id, .. } => {
+                if record
+                    .region
+                    .peers
+                    .iter()
+                    .any(|peer| peer.peer_id == *peer_id)
+                {
+                    return Observed::Done;
+                }
+            }
             Operator::RemovePeer { peer_id, .. } => {
                 if !record
                     .region

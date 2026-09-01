@@ -55,6 +55,10 @@ response pd-store-heartbeat 0203
 response pd-region-heartbeat 030300
 response pd-region-heartbeat-add-peer 030301010702030429
 response pd-region-heartbeat-remove-peer 030301020702030b
+# A columnar learner: the same fields as add-peer behind kind 4, because what differs is
+# what *done* means rather than what is asked of Raft. Store 5, peer 42, so the golden
+# pins the two fields apart from add-peer's 4 and 41.
+response pd-region-heartbeat-add-learner 03030104070203052a
 response pd-region-heartbeat-transfer-leader 030301030702030a
 response pd-get-region 04030107016100020302010a01020b010a01010f3132372e302e302e313a3230313630
 response pd-get-region-none 0403000000

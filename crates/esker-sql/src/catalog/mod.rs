@@ -847,40 +847,11 @@ pub fn table_published_schema(
 
 /// How a table's rows decode, published for a layer that cannot ask this crate.
 ///
-/// [ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) Decision 5, and the shape a
-/// columnar learner's apply target needs: it holds a committed row's bytes and has to turn them
-/// into typed columns without linking `esker-sql`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PublishedSchema {
-    /// The `TableDef::schema_version` this was published at.
-    ///
-    /// Monotonic, one more per `ADD COLUMN`. A reader holding two keeps the higher and never
-    /// installs an older over a newer — the only comparison it needs, since a schema is published
-    /// in the same transaction as the `ALTER` that made it true.
-    pub schema_version: u64,
-    /// A type and a missing value per column, in encoding order.
-    pub columns: Vec<(ColumnType, Option<Datum>)>,
-}
-
-impl PublishedSchema {
-    /// The [`crate::row::RowSchema`] to decode this table's rows with.
-    ///
-    /// **Use this rather than assembling one.** `RowSchema::nullable(types)` is the natural thing
-    /// to reach for when all you seem to have is types, and it is wrong here: it pads every
-    /// absent column with NULL, where a row written before an `ADD COLUMN ... DEFAULT <constant>`
-    /// must pad with that constant. The mistake is silent and shows up only on rows older than
-    /// the `ALTER`. Handing back a built `RowSchema` is what makes it unrepresentable.
-    #[must_use]
-    pub fn row_schema(&self) -> crate::row::RowSchema {
-        let types = self.columns.iter().map(|(ty, _)| *ty).collect();
-        let missing = self
-            .columns
-            .iter()
-            .map(|(_, value)| value.clone())
-            .collect();
-        crate::row::RowSchema::new(types, missing)
-    }
-}
+/// The type and its codec are [`esker_keys::columnar::Published`]: a store holding a columnar
+/// learner reads this record and cannot link `esker-sql`
+/// ([ADR 0030](../../../docs/adr/0030-the-row-codec-moves-down.md)). Re-exported rather than
+/// wrapped, so there is one definition of what the bytes mean and not two.
+pub use esker_keys::columnar::Published as PublishedSchema;
 
 /// Sets how many columnar replicas a table wants.
 ///
