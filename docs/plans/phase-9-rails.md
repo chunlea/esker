@@ -103,9 +103,17 @@ where ADR 0031 records why not.
 ### Unit 2 — sequences, `serial`/`identity`, and `RETURNING`
 
 A sequence is a catalog record with its own kind byte and its own golden, next to the table and
-index records in the `'m'` key space (`crates/esker-sql/src/catalog/record.rs`). `serial` and
-`bigserial` are the column-level spellings that create one; `GENERATED ... AS IDENTITY` parses
-already (phase-6a §9 G07 is the `CREATE SEQUENCE` *options*, not the column form).
+index records in the `'m'` key space (`crates/esker-sql/src/catalog/record.rs`).
+
+**`serial` is `0A000` naming itself, and `bigserial` is the path.** `serial` *is* `int4` — it is
+shorthand for an `integer` column with a default — and this crate has no `int4`: `CREATE TABLE t
+(a int4)` is already `0A000 the type INT`, and answering `serial` with an `int8` would accept every
+value between 2^31 and 2^63 that a real server refuses with `22003`. That is ADR 0031's rule in the
+direction it cares most about — accepting what the oracle rejects — so `serial` is refused by the
+same sentence as the type it stands for. It costs nothing that matters here: Rails has defaulted to
+`bigint` primary keys since 5.1, so an ActiveRecord 8 schema asks for `bigserial` or an identity
+column and never for `serial`. `GENERATED ... AS IDENTITY` parses already (phase-6a §9 G07 is the
+`CREATE SEQUENCE` *options*, not the column form).
 
 `nextval` and `currval` are the two verbs. The hard part is not the counter, it is that a counter
 under Percolator either serialises every insert through one key or stops being gap-free —
@@ -130,9 +138,24 @@ container could not be asked, and the assertion is against the tags this crate a
 same statement without one. And a prepared `RETURNING` **describes its columns**: answering "no
 columns" and then sending some is the one thing a `Describe` exists to prevent.
 
-*Owed to unit 3:* `tests/aggregate_parity.rs` and `tests/returning.rs` now hold the same replay
-loop twice. The third corpus is the one that should extract it into a shared harness rather than
-copy it again.
+*Paid:* `tests/parity_harness/` is the shared replay, extracted at the third corpus as promised —
+`aggregate_parity.rs`, `returning.rs` and `sequence.rs` were three copies of one loop and are now
+one. It grew a `Done` answer so a corpus can hold DDL, which is what made a stateful sequence
+corpus possible at all.
+
+**Where the sequence lives, and why the table record did not change.** A sequence is keyed by the
+column it fills — `'m' ++ "sql" ++ 'q' ++ tenant ++ table ++ column` — so one table's sequences are
+a prefix scan, done where the table is loaded and cached with it. The table record has a format
+version and readers on both sides of it; a feature that can be added without touching it is a
+feature that cannot break one. Its **value** is a second record, for the reason the row-id counter
+already gives: the definition is written once and the counter on every allocation, so one record
+for both would rewrite a definition to hand out a number.
+
+`nextval` runs in a transaction of its own, which is the semantics rather than an implementation
+detail: a statement that fails or rolls back has still consumed its value. That is what licenses a
+sequence to leave gaps, and therefore what licenses `SEQUENCE_BATCH` to be larger than
+PostgreSQL's `CACHE 1` default — a divergence in the *size* of the gaps, not in whether there are
+any, and `CACHE n` is a sequence option PostgreSQL has with exactly this behaviour.
 
 ### Unit 3 — `SAVEPOINT`, `ROLLBACK TO`, `RELEASE`
 
@@ -260,7 +283,7 @@ wrong**, and both were found by writing the statement down rather than by a fail
 |---|---|---|
 | 0 — ADR, plan, aggregate capture | **done** | `de3c465`, `32fb58f` |
 | 1 — aggregates | **done** | `1d78a96` |
-| 2 — sequences and `RETURNING` | **`RETURNING` done**, sequences not started | this commit |
+| 2 — sequences and `RETURNING` | **`RETURNING` done** (`e1b1bd2`); `bigserial`, identity and the sequence under them done (this commit); `nextval`/`currval`/`lastval`/`setval` as callable functions, and `VALUES (DEFAULT, …)`, are what is left | |
 | 3 — savepoints | not started | |
 | 4 — joins | not started | |
 | 5 — `pg_catalog` | not started | |

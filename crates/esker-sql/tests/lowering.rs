@@ -47,9 +47,24 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
         ),
         ("CREATE TABLE t (a int8 REFERENCES u (b))", "REFERENCES"),
         ("CREATE TABLE t (a int8 CHECK (a > 0))", "CHECK"),
+        // The identity forms run now (phase 9 unit 2). The computed column that shares their
+        // grammar does not, and neither do the sequence options after one -- a `START WITH` this
+        // node ignored would hand out numbers nobody asked for.
         (
-            "CREATE TABLE t (a int8 GENERATED ALWAYS AS IDENTITY)",
-            "GENERATED",
+            "CREATE TABLE t (a int8, b int8 GENERATED ALWAYS AS (a * 2) STORED)",
+            "GENERATED ALWAYS AS (expression) STORED",
+        ),
+        (
+            "CREATE TABLE t (a int8 GENERATED ALWAYS AS IDENTITY (START WITH 100))",
+            "a sequence option on an identity column",
+        ),
+        // `serial` is `int4` under another name and this crate has no `int4`; the refusal names
+        // what the user wrote (ADR 0031).
+        ("CREATE TABLE t (a serial)", "serial"),
+        ("CREATE TABLE t (a smallserial)", "smallserial"),
+        (
+            "ALTER TABLE t ADD COLUMN b bigserial",
+            "ALTER TABLE ... ADD COLUMN ... bigserial",
         ),
         ("CREATE TABLE t (a text COLLATE \"C\")", "COLLATE"),
         (

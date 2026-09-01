@@ -131,7 +131,30 @@ pub(super) fn insert(
             .collect();
         for (target, expr) in targets.iter().zip(values) {
             let column = &table.columns[*target];
+            // `GENERATED ALWAYS` refuses a value the user wrote, and names the clause that
+            // overrides it — the whole of the difference between the three identity kinds
+            // (`crate::catalog::Identity`), measured on all three.
+            if let Some(sequence) = table.sequence_for(*target)
+                && sequence.identity.refuses_explicit()
+            {
+                return Err(SqlError::GeneratedAlways {
+                    column: column.name.clone(),
+                });
+            }
             row[*target] = expr.evaluate(column.ty, &column.name)?;
+        }
+        // A sequence fills its column when the statement did not. It runs **after** the values,
+        // so a `bigserial` the user did write keeps their number and does not consume one — which
+        // is what a real server does, and the reason the next insert can collide with it.
+        for sequence in &table.sequences {
+            if targets
+                .iter()
+                .take(values.len())
+                .any(|at| *at == sequence.column)
+            {
+                continue;
+            }
+            row[sequence.column] = Datum::Int8(executor.next_sequence_value(sequence.id)?);
         }
         // A table with no declared key carries an internal row id the user cannot write, so the
         // executor fills it (`crate::catalog::TableDef::row_id`).

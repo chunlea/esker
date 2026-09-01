@@ -25,9 +25,10 @@ mod query;
 mod session;
 mod time_machine;
 
+pub use crate::catalog::Identity;
 pub use ddl::{
     AlterTable, AlterTableAction, Column, CreateIndex, CreateTable, DropIndex, DropTable,
-    UniqueConstraint, index_name, primary_key_name, unique_constraint_name,
+    UniqueConstraint, index_name, primary_key_name, sequence_name, unique_constraint_name,
 };
 pub use dml::{Delete, Insert, Returning, Update};
 pub use expr::{AggregateCall, AggregateFunc, BinaryOp, Expr, Literal};

@@ -10,7 +10,7 @@
 //! what a `23505` message quotes back, and a client that matches on the constraint name would not
 //! recognise ours if we invented them.
 
-use crate::catalog::fold_identifier;
+use crate::catalog::{Identity, fold_identifier};
 use crate::value::{ColumnType, Datum};
 
 /// `CREATE TABLE`.
@@ -49,6 +49,13 @@ pub struct Column {
     /// expression such as `(1+1)` would need a folder this crate does not have. Both are `0A000`
     /// naming what they are, rather than a value that is wrong for every row but the first.
     pub default: Option<Datum>,
+    /// The sequence that fills this column — `bigserial` or `GENERATED ... AS IDENTITY` — and
+    /// which of the three it is.
+    ///
+    /// `serial` is **not** among them: it is `int4` under another name, this crate has no `int4`,
+    /// and answering it with an `int8` would accept every value between 2^31 and 2^63 that a real
+    /// server refuses with `22003` (ADR 0031, `docs/plans/phase-9-rails.md` §2 unit 2).
+    pub sequence: Option<Identity>,
 }
 
 /// A `UNIQUE` constraint, which becomes a unique index.
@@ -120,6 +127,13 @@ pub fn unique_constraint_name(table: &str, columns: &[String]) -> String {
     parts.extend(columns.iter().map(String::as_str));
     parts.push("key");
     derived(&parts)
+}
+
+/// `<table>_<column>_seq`, PostgreSQL's name for the sequence behind a `bigserial` or an identity
+/// column. Measured: `pg_get_serial_sequence('s1','id')` answers `public.s1_id_seq`.
+#[must_use]
+pub fn sequence_name(table: &str, column: &str) -> String {
+    derived(&[table, column, "seq"])
 }
 
 /// `<table>_<column>…_idx`, PostgreSQL's name for an unnamed index.

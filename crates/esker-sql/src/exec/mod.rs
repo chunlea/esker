@@ -74,6 +74,9 @@ pub struct Executor {
     /// Row ids reserved for this session but not yet handed out: `table_id -> (next, end)`.
     /// See [`Executor::next_row_id`].
     row_ids: std::collections::BTreeMap<u64, (u64, u64)>,
+    /// One session's reserved block per sequence: the next value it will hand out and the first
+    /// value past its block. See [`Executor::next_sequence_value`].
+    sequences: std::collections::BTreeMap<u64, (i64, i64)>,
     /// Whether the open transaction has run DDL. From then on its catalog lookups read through
     /// rather than from the shared cache: they answer with its own uncommitted definitions, which
     /// must not reach the other sessions on this node (`crate::catalog`).
@@ -129,6 +132,7 @@ impl Executor {
             written: Written::default(),
             notices: Vec::new(),
             row_ids: std::collections::BTreeMap::new(),
+            sequences: std::collections::BTreeMap::new(),
             catalog_written: false,
             read_as_of: None,
             open_used: false,
@@ -643,6 +647,46 @@ impl Executor {
         self.row_ids
             .insert(table_id, (first + 1, first + crate::catalog::ROW_ID_BATCH));
         Ok(i64::try_from(first).unwrap_or(i64::MAX))
+    }
+
+    /// The next value of one sequence.
+    ///
+    /// The same shape as [`Executor::next_row_id`] and the same trade, for a counter the *user*
+    /// can see: a batch is reserved in a transaction of its own and handed out from memory. That
+    /// separate transaction is what makes `nextval` **non-transactional**, which is not a
+    /// side-effect but the semantics — a rolled-back `INSERT` has still consumed its value, here
+    /// and on a real server, measured on both.
+    ///
+    /// The gaps it leaves are wider than PostgreSQL's default, and that is the declared
+    /// divergence on [`crate::catalog::SEQUENCE_BATCH`]: `CACHE n` is a sequence option PostgreSQL
+    /// has with exactly this behaviour, and neither server offers gap-freeness.
+    fn next_sequence_value(&mut self, sequence_id: u64) -> Result<i64> {
+        if let Some((next, end)) = self.sequences.get_mut(&sequence_id)
+            && *next < *end
+        {
+            let value = *next;
+            *next += 1;
+            return Ok(value);
+        }
+
+        let mut txn = self.backend.begin()?;
+        let first = match crate::catalog::allocate_sequence_values(
+            &mut *txn,
+            self.tenant,
+            sequence_id,
+            crate::catalog::SEQUENCE_BATCH,
+        ) {
+            Ok(first) => first,
+            Err(error) => {
+                let _ = txn.rollback();
+                return Err(error);
+            }
+        };
+        txn.commit()?;
+        let batch = i64::try_from(crate::catalog::SEQUENCE_BATCH).unwrap_or(i64::MAX);
+        self.sequences
+            .insert(sequence_id, (first + 1, first.saturating_add(batch)));
+        Ok(first)
     }
 
     /// Adds a notice for the session to send before this statement's `CommandComplete`.

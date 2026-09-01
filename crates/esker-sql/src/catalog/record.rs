@@ -11,7 +11,21 @@
 //! 'm' ++ "sql" ++ 'c' ++ tenant:u64 ++ name    a checkpoint: a name and the timestamp it means
 //! 'm' ++ "sql" ++ 'j' ++ tenant:u64 ++ id:u64  a schema-change job, and how far its backfill got
 //! 'm' ++ "sql" ++ 'f' ++ tenant:u64 ++ id:u64  a flashback in progress, and how far it got
+//! 'm' ++ "sql" ++ 'q' ++ tenant:u64 ++ table:u64 ++ column:u64   a sequence, by the column it fills
+//! 'm' ++ "sql" ++ 'e' ++ tenant:u64 ++ seq:u64  that sequence's next unhanded-out value
 //! ```
+//!
+//! **A sequence is keyed by the column it fills, not by its own id.** Every sequence this node has
+//! is owned by one column — `bigserial` and `GENERATED AS IDENTITY` are the only two spellings
+//! that make one, and a standalone `CREATE SEQUENCE` is `0A000` — so the owner is the natural key,
+//! and a prefix scan of one table's is what lets a `TableDef` carry its sequences without the
+//! *table record* growing a field. That matters more than it sounds: the table record has a format
+//! version and readers on both sides of it, and a feature that can be added without touching it is
+//! a feature that cannot break one.
+//!
+//! Its **value** is a separate record for the reason [`row_id_key`] gives: the definition is
+//! written once and the counter on every allocation, so putting them together would rewrite a
+//! definition to hand out a number.
 //!
 //! The two retention records are read by the **garbage collector**, which lives below this crate
 //! and does not link it ([ADR 0021](../../../../docs/adr/0021-time-machine.md)). That is why they
@@ -33,7 +47,7 @@
 use esker_base::varint;
 use esker_keys::{codec, prefix};
 
-use crate::catalog::{ColumnDef, IndexDef, Relation, SchemaState, TableDef};
+use crate::catalog::{ColumnDef, Identity, IndexDef, Relation, SchemaState, SequenceDef, TableDef};
 use crate::error::{Result, SqlError};
 use crate::value::{ColumnType, Datum};
 
@@ -72,6 +86,8 @@ const KIND_ROW_ID: u8 = b'a';
 const KIND_CHECKPOINT: u8 = b'c';
 const KIND_JOB: u8 = b'j';
 const KIND_FLASHBACK: u8 = b'f';
+const KIND_SEQUENCE: u8 = b'q';
+const KIND_SEQUENCE_VALUE: u8 = b'e';
 
 /// Tags for [`ColumnType`] as stored. Ours rather than PostgreSQL's OIDs, because these are a
 /// format we own and must never move; the OIDs stay on the wire where they belong.
@@ -437,6 +453,79 @@ pub(super) fn row_id_key(tenant: u64, table_id: u64) -> Vec<u8> {
     prefix::meta_key(&suffix)
 }
 
+/// `'m' ++ "sql" ++ 'q' ++ tenant ++ table_id ++ column`. One sequence, by the column it fills.
+///
+/// A prefix of `'m' ++ "sql" ++ 'q' ++ tenant ++ table_id` is exactly one table's sequences, in
+/// column order, which is how a `TableDef` gets them at load without the table record knowing.
+#[must_use]
+pub(super) fn sequence_key(tenant: u64, table_id: u64, column: usize) -> Vec<u8> {
+    let mut suffix = [SQL, &[KIND_SEQUENCE]].concat();
+    codec::encode_u64(tenant, &mut suffix);
+    codec::encode_u64(table_id, &mut suffix);
+    codec::encode_u64(column as u64, &mut suffix);
+    prefix::meta_key(&suffix)
+}
+
+/// The half-open range of one table's sequence records.
+#[must_use]
+pub(super) fn table_sequence_range(tenant: u64, table_id: u64) -> (Vec<u8>, Vec<u8>) {
+    let mut suffix = [SQL, &[KIND_SEQUENCE]].concat();
+    codec::encode_u64(tenant, &mut suffix);
+    codec::encode_u64(table_id, &mut suffix);
+    let start = prefix::meta_key(&suffix);
+    let mut end = start.clone();
+    end.push(0xff);
+    (start, end)
+}
+
+/// `'m' ++ "sql" ++ 'e' ++ tenant ++ sequence_id`. The next unhanded-out value.
+#[must_use]
+pub(super) fn sequence_value_key(tenant: u64, sequence_id: u64) -> Vec<u8> {
+    let mut suffix = [SQL, &[KIND_SEQUENCE_VALUE]].concat();
+    codec::encode_u64(tenant, &mut suffix);
+    codec::encode_u64(sequence_id, &mut suffix);
+    prefix::meta_key(&suffix)
+}
+
+/// One sequence: `version ++ id ++ name ++ identity`.
+///
+/// The column it fills is in the **key**, so it is not written twice; a record whose key and body
+/// disagreed would be a thing the format allowed and nothing checked.
+pub(super) fn encode_sequence(sequence: &SequenceDef) -> Vec<u8> {
+    let mut out = vec![CATALOG_FORMAT_VERSION];
+    out.extend_from_slice(&sequence.id.to_le_bytes());
+    put_str(&sequence.name, &mut out);
+    out.push(sequence.identity.as_u8());
+    out
+}
+
+/// Reads a sequence. `table_id` and `column` come from the key the caller read it under.
+pub(super) fn decode_sequence(bytes: &[u8], table_id: u64, column: usize) -> Result<SequenceDef> {
+    let mut reader = Reader::new(bytes)?;
+    let id = reader.u64_le()?;
+    let name = reader.string()?;
+    let identity = Identity::from_u8(reader.byte()?)?;
+    reader.finish()?;
+    Ok(SequenceDef {
+        id,
+        name,
+        table_id,
+        column,
+        identity,
+    })
+}
+
+/// The column ordinal a sequence key ends with.
+pub(super) fn sequence_column_of(tenant: u64, table_id: u64, key: &[u8]) -> Result<usize> {
+    let (start, _) = table_sequence_range(tenant, table_id);
+    let rest = key
+        .strip_prefix(start.as_slice())
+        .ok_or_else(|| corrupt("a sequence key outside the range it was read from"))?;
+    let (column, _) =
+        codec::decode_u64(rest).map_err(|_| corrupt("a sequence key with no column ordinal"))?;
+    usize::try_from(column).map_err(|_| corrupt("a sequence column ordinal that is not a usize"))
+}
+
 /// A monotone counter as stored: little-endian, like every other record body here.
 #[must_use]
 pub(super) fn encode_counter(value: u64) -> Vec<u8> {
@@ -566,6 +655,10 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
         indexes,
         primary_key_name,
         schema_version,
+        // Not in the record: a table's sequences are keyed by the columns they fill and are read
+        // where the table is loaded (`crate::catalog::View::table_by_id`). A `TableDef` decoded
+        // straight from bytes therefore has none, which is what this function is for.
+        sequences: Vec::new(),
     })
 }
 
@@ -586,6 +679,13 @@ pub(super) fn encode_relation(relation: &Relation) -> Vec<u8> {
             out.push(KIND_PRIMARY_KEY);
             out.extend_from_slice(&table_id.to_le_bytes());
         }
+        // A sequence's name resolves to the column it fills rather than to an id of its own,
+        // because that is the key its record lives under.
+        Relation::Sequence { table_id, column } => {
+            out.push(KIND_SEQUENCE);
+            out.extend_from_slice(&table_id.to_le_bytes());
+            out.extend_from_slice(&(*column as u64).to_le_bytes());
+        }
     }
     out
 }
@@ -603,6 +703,11 @@ pub(super) fn decode_relation(bytes: &[u8]) -> Result<Relation> {
         },
         KIND_PRIMARY_KEY => Relation::PrimaryKey {
             table_id: reader.u64_le()?,
+        },
+        KIND_SEQUENCE => Relation::Sequence {
+            table_id: reader.u64_le()?,
+            column: usize::try_from(reader.u64_le()?)
+                .map_err(|_| corrupt("a sequence column ordinal that is not a usize"))?,
         },
         other => return Err(corrupt(format!("relation kind byte {other}"))),
     };

@@ -142,8 +142,10 @@ pub(super) fn create_table(
         });
     }
 
+    let table_id = catalog::allocate_id(txn, executor.tenant)?;
+    let sequences = sequences_for(executor, txn, create, table_id)?;
     let table = TableDef {
-        id: catalog::allocate_id(txn, executor.tenant)?,
+        id: table_id,
         name: create.name.clone(),
         columns,
         primary_key,
@@ -151,9 +153,37 @@ pub(super) fn create_table(
         primary_key_name,
         // A table starts at schema version 1; `ALTER TABLE ADD COLUMN` moves it.
         schema_version: 1,
+        sequences,
     };
     catalog::create_table(txn, executor.tenant, &table)?;
+    for sequence in &table.sequences {
+        catalog::create_sequence(txn, executor.tenant, sequence)?;
+    }
     Ok(Outcome::done("CREATE TABLE"))
+}
+
+/// One sequence per `bigserial` or identity column, named the way a real server names it and
+/// taking that name in the same namespace tables and indexes share — `CREATE TABLE t_id_seq` after
+/// a `bigserial` is `42P07` on both servers.
+fn sequences_for(
+    executor: &Executor,
+    txn: &mut dyn Txn,
+    create: &CreateTable,
+    table_id: u64,
+) -> Result<Vec<catalog::SequenceDef>> {
+    let mut sequences = Vec::new();
+    for (ordinal, column) in create.columns.iter().enumerate() {
+        if let Some(identity) = column.sequence {
+            sequences.push(catalog::SequenceDef {
+                id: catalog::allocate_id(txn, executor.tenant)?,
+                name: plan::sequence_name(&create.name, &column.name),
+                table_id,
+                column: ordinal,
+                identity,
+            });
+        }
+    }
+    Ok(sequences)
 }
 
 pub(super) fn drop_table(
@@ -171,6 +201,14 @@ pub(super) fn drop_table(
                 return Err(SqlError::WrongObjectType {
                     name: name.clone(),
                     expected: "a table",
+                    found: "DROP INDEX",
+                });
+            }
+            Some(catalog::Relation::Sequence { .. }) => {
+                return Err(SqlError::WrongObjectType {
+                    name: name.clone(),
+                    expected: "a table",
+                    found: "DROP SEQUENCE",
                 });
             }
             None => {
@@ -314,6 +352,14 @@ pub(super) fn drop_index(
                 return Err(SqlError::WrongObjectType {
                     name: name.clone(),
                     expected: "an index",
+                    found: "DROP TABLE",
+                });
+            }
+            Some(catalog::Relation::Sequence { .. }) => {
+                return Err(SqlError::WrongObjectType {
+                    name: name.clone(),
+                    expected: "an index",
+                    found: "DROP SEQUENCE",
                 });
             }
             // The primary key has no index to drop, and PostgreSQL refuses to drop the one it does
@@ -395,6 +441,14 @@ pub(super) fn alter_table(
             return Err(SqlError::AlterActionOnWrongObject {
                 action: "ADD COLUMN",
                 name: alter.name.clone(),
+                kind: "indexes",
+            });
+        }
+        Some(catalog::Relation::Sequence { .. }) => {
+            return Err(SqlError::AlterActionOnWrongObject {
+                action: "ADD COLUMN",
+                name: alter.name.clone(),
+                kind: "sequences",
             });
         }
         None => {

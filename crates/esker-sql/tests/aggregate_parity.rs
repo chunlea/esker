@@ -19,15 +19,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::fmt::Write as _;
-use std::sync::Arc;
-
-use esker_sql::backend::{Backend, MemoryBackend};
-use esker_sql::catalog::Catalog;
-use esker_sql::exec::Executor;
-use esker_sql::parse::parse_statements;
-use esker_sql::pgwire::session::{Execute, Outcome, Params};
-use esker_sql::value::PgType;
+#[path = "parity_harness/mod.rs"]
+mod parity;
 
 /// The fixture the corpus was captured over, and the reason the whole file is one comparison
 /// rather than a hundred assertions: both servers see the same five rows.
@@ -179,203 +172,16 @@ const DIVERGENCES: &[(&str, &str)] = &[
 
 #[test]
 fn every_aggregate_answers_the_way_postgresql_19_does() {
-    let mut node = Node::new();
-    let mut checked = 0;
-    let mut mismatched = Vec::new();
-    let mut type_mismatched = Vec::new();
-    let mut agreed_after_all = Vec::new();
-
-    for (line_number, query, expected) in corpus() {
-        let listed = DIVERGENCES.iter().find(|(sql, _)| *sql == query);
-        let actual = node.answer(&query);
-
-        if listed.is_some() {
-            if actual == expected {
-                agreed_after_all.push(format!("line {line_number}: {query}"));
-            }
-            checked += 1;
-            continue;
-        }
-
-        match (&expected, &actual) {
-            (
-                Answer::Rows { types, rows },
-                Answer::Rows {
-                    types: ours,
-                    rows: theirs,
-                },
-            ) if rows == theirs && types != ours => {
-                if !TYPE_DIVERGENCES.contains(&query.as_str()) {
-                    type_mismatched.push(format!(
-                        "line {line_number}: {query}\n  PostgreSQL: {types:?}\n  Esker:      {ours:?}"
-                    ));
-                }
-            }
-            _ if actual == expected => {
-                if TYPE_DIVERGENCES.contains(&query.as_str()) {
-                    agreed_after_all.push(format!("line {line_number}: {query}"));
-                }
-            }
-            _ => mismatched.push(format!(
-                "line {line_number}: {query}\n  PostgreSQL: {expected}\n  Esker:      {actual}"
-            )),
-        }
-        checked += 1;
-    }
-
-    assert!(
-        mismatched.is_empty(),
-        "{} of {checked} probes disagree with PostgreSQL 19 and are not listed as \
-         divergences:\n\n{}",
-        mismatched.len(),
-        mismatched.join("\n\n")
-    );
-    assert!(
-        type_mismatched.is_empty(),
-        "{} probes have the right rows and an unlisted type divergence:\n\n{}",
-        type_mismatched.len(),
-        type_mismatched.join("\n\n")
-    );
-    assert!(
-        agreed_after_all.is_empty(),
-        "{} probes are listed as divergences and now agree with PostgreSQL -- delete the \
-         entries:\n\n{}",
-        agreed_after_all.len(),
-        agreed_after_all.join("\n")
+    let checked = parity::replay(
+        include_str!("corpus/pg19_aggregate.txt"),
+        FIXTURE,
+        &parity::Divergences {
+            types: TYPE_DIVERGENCES,
+            answers: DIVERGENCES,
+        },
     );
     assert!(
         checked > 140,
         "only {checked} probes ran; the corpus did not load"
     );
-}
-
-/// What one probe answered: rows with their declared types, or a refusal.
-#[derive(Debug, PartialEq, Eq)]
-enum Answer {
-    Rows {
-        types: Vec<String>,
-        rows: Vec<Vec<String>>,
-    },
-    Refused(String),
-}
-
-impl std::fmt::Display for Answer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Answer::Refused(message) => write!(f, "!{message}"),
-            Answer::Rows { types, rows } => write!(
-                f,
-                "{}\t{}",
-                types.join(","),
-                if rows.is_empty() {
-                    "-".to_owned()
-                } else {
-                    rows.iter()
-                        .map(|row| row.join("|"))
-                        .collect::<Vec<_>>()
-                        .join(" ; ")
-                }
-            ),
-        }
-    }
-}
-
-struct Node {
-    executor: Executor,
-}
-
-impl Node {
-    fn new() -> Self {
-        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let mut node = Node {
-            executor: Executor::new(backend, Arc::new(Catalog::new()), 1),
-        };
-        for statement in FIXTURE {
-            node.run(statement)
-                .unwrap_or_else(|error| panic!("the fixture did not load: {statement}\n{error}"));
-        }
-        node
-    }
-
-    fn run(&mut self, sql: &str) -> esker_sql::Result<Outcome> {
-        let mut last = Outcome::done("");
-        for parsed in parse_statements(sql)? {
-            last = self.executor.execute(&parsed, &Params::NONE)?;
-        }
-        Ok(last)
-    }
-
-    /// One probe, in the corpus's own shape.
-    fn answer(&mut self, sql: &str) -> Answer {
-        match self.run(sql) {
-            Err(error) => {
-                let mut message = format!("{} {error}", error.sqlstate());
-                if let Some(detail) = error.detail() {
-                    let _ = write!(message, " DETAIL: {detail}");
-                }
-                if let Some(hint) = error.hint() {
-                    let _ = write!(message, " HINT: {hint}");
-                }
-                Answer::Refused(message)
-            }
-            Ok(Outcome::Done { tag }) => Answer::Refused(format!("not a query: {tag}")),
-            Ok(Outcome::Rows { fields, rows, .. }) => Answer::Rows {
-                types: fields
-                    .iter()
-                    .map(|field| type_name(field.type_oid).to_owned())
-                    .collect(),
-                rows: rows
-                    .into_iter()
-                    .map(|row| {
-                        row.into_iter()
-                            .map(|value| {
-                                value.map_or_else(
-                                    || "\\N".to_owned(),
-                                    |bytes| String::from_utf8(bytes).unwrap(),
-                                )
-                            })
-                            .collect()
-                    })
-                    .collect(),
-            },
-        }
-    }
-}
-
-/// The name `\gdesc` prints for an OID, which is the name [`PgType`] already knows.
-fn type_name(oid: u32) -> &'static str {
-    esker_sql::value::ColumnType::ALL
-        .into_iter()
-        .find(|ty| ty.oid() == oid)
-        .map_or("?", PgType::name)
-}
-
-/// `query <tab> types <tab> rows`, or `query <tab> !SQLSTATE message`.
-fn corpus() -> Vec<(usize, String, Answer)> {
-    include_str!("corpus/pg19_aggregate.txt")
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim_start().starts_with('#') && !line.trim().is_empty())
-        .map(|(index, line)| {
-            let mut fields = line.split('\t');
-            let query = fields.next().expect("a query").to_owned();
-            let second = fields
-                .next()
-                .unwrap_or_else(|| panic!("line {}: no answer", index + 1));
-            let answer = match second.strip_prefix('!') {
-                Some(message) => Answer::Refused(message.to_owned()),
-                None => Answer::Rows {
-                    types: second.split(',').map(str::to_owned).collect(),
-                    rows: match fields.next().expect("rows") {
-                        "-" => Vec::new(),
-                        rows => rows
-                            .split(" ; ")
-                            .map(|row| row.split('|').map(str::to_owned).collect())
-                            .collect(),
-                    },
-                },
-            };
-            (index + 1, query, answer)
-        })
-        .collect()
 }

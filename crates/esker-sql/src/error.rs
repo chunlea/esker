@@ -114,6 +114,14 @@ pub enum SqlError {
         name: String,
         /// What the statement needed, with its article: `a table`, `an index`.
         expected: &'static str,
+        /// What it actually is, as the verb that removes it: `DROP TABLE`, `DROP INDEX`,
+        /// `DROP SEQUENCE`.
+        ///
+        /// The `HINT` needs it, and `expected` alone cannot supply it: with three kinds of
+        /// relation sharing one namespace, `DROP TABLE` over a name that is not a table has two
+        /// different right answers. Measured — a real server hints `Use DROP SEQUENCE to remove a
+        /// sequence.` for one and `Use DROP INDEX to remove an index.` for the other.
+        found: &'static str,
     },
 
     /// `DROP INDEX` naming the index a primary key constraint owns. PostgreSQL refuses it and
@@ -171,14 +179,18 @@ pub enum SqlError {
         relation: String,
     },
 
-    /// `ALTER TABLE` naming an index. PostgreSQL names the *action* rather than saying "is not a
-    /// table", because an index is a relation and the action is what cannot be performed on it.
+    /// `ALTER TABLE` naming an index or a sequence. PostgreSQL names the *action* rather than
+    /// saying "is not a table", because both are relations and the action is what cannot be
+    /// performed on them.
     #[error("ALTER action {action} cannot be performed on relation \"{name}\"")]
     AlterActionOnWrongObject {
         /// The action, as PostgreSQL spells it: `ADD COLUMN`.
         action: &'static str,
         /// The relation that was named.
         name: String,
+        /// What it is, plural, for the `DETAIL`: `indexes`, `sequences`. Measured — the two really
+        /// are different sentences off one condition.
+        kind: &'static str,
     },
 
     /// A duplicate reached a unique index.
@@ -377,6 +389,16 @@ pub enum SqlError {
     /// and `count(1, *)` names the star.
     #[error("syntax error at or near \"{0}\"")]
     SyntaxAtOrNear(&'static str),
+
+    /// A value written into a `GENERATED ALWAYS AS IDENTITY` column.
+    ///
+    /// PostgreSQL's own sentence, its `DETAIL` and its `HINT`, all three measured: the hint names
+    /// `OVERRIDING SYSTEM VALUE`, which is the clause that takes the value anyway.
+    #[error("cannot insert a non-DEFAULT value into column \"{column}\"")]
+    GeneratedAlways {
+        /// The column the value was written into.
+        column: String,
+    },
 
     /// `count()` — the one aggregate that takes no argument, called as though it took one.
     /// PostgreSQL answers `42809` here rather than `42883`, and says which spelling works.
@@ -686,6 +708,7 @@ impl SqlError {
             | SqlError::UndefinedAggregate { .. }
             | SqlError::UndefinedAggregateArity { .. } => sqlstate::UNDEFINED_FUNCTION,
             SqlError::ParameterlessAggregate => sqlstate::WRONG_OBJECT_TYPE,
+            SqlError::GeneratedAlways { .. } => sqlstate::GENERATED_ALWAYS,
             SqlError::GroupingError(_) | SqlError::AggregateNotAllowed(_) => {
                 sqlstate::GROUPING_ERROR
             }
@@ -765,10 +788,11 @@ impl SqlError {
             SqlError::UndefinedAggregateArity { .. } => {
                 Some("No function of that name accepts the given number of arguments.".to_owned())
             }
-            // The only relations here that are not tables are indexes, so PostgreSQL's own
-            // sentence is exact.
-            SqlError::AlterActionOnWrongObject { .. } => {
-                Some("This operation is not supported for indexes.".to_owned())
+            SqlError::GeneratedAlways { column } => Some(format!(
+                "Column \"{column}\" is an identity column defined as GENERATED ALWAYS."
+            )),
+            SqlError::AlterActionOnWrongObject { kind, .. } => {
+                Some(format!("This operation is not supported for {kind}."))
             }
             _ => None,
         }
@@ -794,14 +818,19 @@ impl SqlError {
                      PostgreSQL's CHECKPOINT forces a WAL checkpoint and takes no name.",
                 )
             }
+            SqlError::GeneratedAlways { .. } => Some("Use OVERRIDING SYSTEM VALUE to override."),
             SqlError::WrongObjectType {
-                expected: "a table",
+                found: "DROP INDEX",
                 ..
             } => Some("Use DROP INDEX to remove an index."),
             SqlError::WrongObjectType {
-                expected: "an index",
+                found: "DROP TABLE",
                 ..
             } => Some("Use DROP TABLE to remove a table."),
+            SqlError::WrongObjectType {
+                found: "DROP SEQUENCE",
+                ..
+            } => Some("Use DROP SEQUENCE to remove a sequence."),
             SqlError::DependentObjectsStillExist { .. } => Some("You can drop the table instead."),
             SqlError::SchemaLeaseExpired { .. } => Some(
                 "Reads are unaffected. Writes resume when this node can reach the placement driver.",

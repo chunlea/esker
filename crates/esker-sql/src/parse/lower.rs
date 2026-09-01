@@ -17,9 +17,9 @@
 
 use sqlparser::ast::{
     AlterTableOperation, AssignmentTarget, BinaryOperator, ColumnOption, CreateTableOptions,
-    DataType, Distinct, DollarQuotedString, ExactNumberInfo, Expr, FromTable, GroupByExpr, Ident,
-    IndexColumn, IndexType, JoinConstraint, JoinOperator, LimitClause, NullsDistinctOption,
-    ObjectName, ObjectType, OffsetRows, OrderByKind, Query, SelectItem,
+    DataType, Distinct, DollarQuotedString, ExactNumberInfo, Expr, FromTable, GeneratedAs,
+    GroupByExpr, Ident, IndexColumn, IndexType, JoinConstraint, JoinOperator, LimitClause,
+    NullsDistinctOption, ObjectName, ObjectType, OffsetRows, OrderByKind, Query, SelectItem,
     SelectItemQualifiedWildcardKind, SetExpr, Statement, TableConstraint, TableFactor, TableObject,
     TimezoneInfo, UnaryOperator, Value,
 };
@@ -664,6 +664,9 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
         let ty = lower_type(&column.data_type)?;
         let mut not_null = false;
         let mut default = None;
+        // `bigserial` is the type saying it; `GENERATED ... AS IDENTITY` is an option saying it.
+        // Both end here, because what they produce is the same record.
+        let mut sequence = serial_identity(&column.data_type);
         for option in &column.options {
             match &option.option {
                 ColumnOption::NotNull => not_null = true,
@@ -683,14 +686,31 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
                     primary_key.push(column_name.clone());
                     primary_key_name = primary_key_name.or_else(|| option.name.as_ref().map(ident));
                 }
+                ColumnOption::Generated {
+                    generated_as,
+                    sequence_options,
+                    generation_expr,
+                    ..
+                } => {
+                    sequence = Some(identity_kind(
+                        *generated_as,
+                        sequence_options.as_deref(),
+                        generation_expr.as_ref(),
+                    )?);
+                }
                 other => return Err(SqlError::unsupported(column_option_name(other))),
             }
+        }
+        // An identity column is `NOT NULL` whether or not it says so, here as there.
+        if sequence.is_some() {
+            not_null = true;
         }
         columns.push(plan::Column {
             name: column_name,
             ty,
             not_null,
             default,
+            sequence,
         });
     }
 
@@ -802,12 +822,20 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
                 "ALTER TABLE ... ADD COLUMN ... NOT NULL without a DEFAULT",
             ));
         }
+        // `ALTER TABLE ... ADD COLUMN id bigserial` would have to create a sequence *and* fill
+        // every row already stored from it, which is the table rewrite this `ALTER` is defined not
+        // to do. Refused by name rather than half-done.
+        refuse_if(
+            serial_identity(&column_def.data_type).is_some(),
+            "ALTER TABLE ... ADD COLUMN ... bigserial",
+        )?;
         actions.push(plan::AlterTableAction::AddColumn {
             column: plan::Column {
                 name: ident(&column_def.name),
                 ty,
                 not_null,
                 default,
+                sequence: None,
             },
             if_not_exists: *if_not_exists,
         });
@@ -1487,7 +1515,14 @@ fn lower_delete(delete: &sqlparser::ast::Delete) -> Result<plan::Delete> {
     })
 }
 
-/// The six types, under every spelling PostgreSQL accepts for them.
+/// The six types, under every spelling PostgreSQL accepts for them — and the two serial spellings,
+/// which are not types at all.
+///
+/// `bigserial` is `bigint` plus a sequence, so it lowers to [`ColumnType::Int8`] and the caller
+/// reads [`serial_identity`] to find out that a sequence goes with it. `serial` is `integer` plus a
+/// sequence, and this crate has no `integer`: it is refused by the same sentence `int4` gets, which
+/// is the point — accepting it as an `int8` would take every value between 2^31 and 2^63 that a
+/// real server answers `22003` for.
 fn lower_type(data_type: &DataType) -> Result<ColumnType> {
     Ok(match data_type {
         DataType::Int8(None) | DataType::BigInt(None) => ColumnType::Int8,
@@ -1500,8 +1535,53 @@ fn lower_type(data_type: &DataType) -> Result<ColumnType> {
         DataType::Timestamp(None, TimezoneInfo::Tz | TimezoneInfo::WithTimeZone) => {
             ColumnType::TimestampTz
         }
+        // `bigserial` is `bigint` plus a sequence, and `sqlparser` 0.62 has no variant for it --
+        // it arrives as a custom type name. `serial` and `smallserial` arrive the same way and
+        // fall through to the refusal below, which names what the user wrote.
+        other if serial_identity(other).is_some() => ColumnType::Int8,
         other => return Err(SqlError::unsupported(format!("the type {other}"))),
     })
+}
+
+/// `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY`, and the two things that share its variant.
+///
+/// Only one of them is a sequence. `GENERATED ALWAYS AS (<expr>) STORED` is a **computed column**,
+/// a different feature entirely, and is refused by name rather than read as an identity that would
+/// then hand out numbers where the user asked for an expression. The *sequence options* after an
+/// identity are gap G07 and are refused too, for the same reason: a `START WITH` this node ignored
+/// would hand out numbers nobody asked for.
+fn identity_kind(
+    generated_as: GeneratedAs,
+    sequence_options: Option<&[sqlparser::ast::SequenceOptions]>,
+    generation_expr: Option<&Expr>,
+) -> Result<plan::Identity> {
+    refuse_if(
+        generation_expr.is_some(),
+        "GENERATED ALWAYS AS (expression) STORED",
+    )?;
+    refuse_if(
+        sequence_options.is_some_and(|options| !options.is_empty()),
+        "a sequence option on an identity column",
+    )?;
+    match generated_as {
+        GeneratedAs::Always => Ok(plan::Identity::Always),
+        GeneratedAs::ByDefault => Ok(plan::Identity::ByDefault),
+        GeneratedAs::ExpStored => Err(SqlError::unsupported(
+            "GENERATED ALWAYS AS (expression) STORED",
+        )),
+    }
+}
+
+/// Whether a declared type is one of the serial spellings, and therefore brings a sequence.
+///
+/// `smallserial` and `serial` are refused by [`lower_type`] before this is reached, so the only
+/// one that answers `Some` is `bigserial`.
+fn serial_identity(data_type: &DataType) -> Option<plan::Identity> {
+    let DataType::Custom(name, modifiers) = data_type else {
+        return None;
+    };
+    (modifiers.is_empty() && name.to_string().eq_ignore_ascii_case("bigserial"))
+        .then_some(plan::Identity::Default)
 }
 
 /// An index's columns, which must be plain names: an expression index is a different feature.
