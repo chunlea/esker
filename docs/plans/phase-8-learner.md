@@ -694,3 +694,29 @@ would have left the next lane to discover the other half was never wired.
 * **No routing table from PD.** `connect`'s `TODO(phase-6a)` stands: this lane added a PD
   connection for the lease and the report, not a region resolver. The static route is corrected by
   the store's own `EpochNotMatch`, which is how a conf change reaches the client today.
+
+## The hour-long chaos test did not reproduce — twice, at this HEAD
+
+The section above this one records `cluster_chaos`'s sigkill test running for **over an hour**
+without finishing, with `retry::may_ask_again` named as the likely cause from one sample. It did
+not reproduce here, and the numbers are worth having beside the hypothesis rather than instead of
+it:
+
+```text
+cargo nextest run --workspace --all-features
+    Summary [141.869s] 2242 tests run: 2242 passed (17 slow), 34 skipped
+
+cargo nextest run -p esker-cli --test cluster_chaos
+    PASS [9.162s] a_sigkilled_leader_process_never_costs_an_acknowledged_write
+```
+
+Two clean runs at `1c66c08`, on a machine that was otherwise quiet. That does **not** refute the
+observation — a nine-second test and an hour-long one can be the same code under different load,
+and the original run was taken while several agents were compiling and running suites in this tree
+at once. What it does say is that the hang is **not deterministic at this HEAD**, so the cheap
+confirmation the note asks for (disable `may_ask_again` and see) would now be measuring a test that
+already passes. Whoever picks this up should reproduce the hang *first* — under load, with a sample
+taken while it is wedged — rather than changing the retry path against a green test.
+
+`fifty_sigkills_of_the_leader_process`, the long form of the same battery, is `#[ignore]`d and was
+not run.
