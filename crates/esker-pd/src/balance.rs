@@ -159,11 +159,31 @@ pub fn region_balance(region: &RegionRecord, cluster: &Cluster<'_>) -> Option<Ba
     // The second half first: a region over its replica target is one whose move has landed and
     // needs finishing. Doing this before considering a new move is what stops PD starting a
     // second move while the first is half done.
-    if region.region.peers.len() > cluster.target_replicas && !mid_repair {
+    //
+    // **Voters, not peers**, on both counts — the third instance of the family after
+    // `schedule::urgency_for` and `schedule::repair_for`, and the one a real cluster found.
+    // `target_replicas` is a number of voters, so a healthy three-voter region that gains a
+    // columnar learner counted four against three and balance shed a **voter**: PD's own
+    // operator history from `docs/bench/columnar-learner.md` shows the `AddLearner` and the
+    // `RemovePeer` in the same millisecond with no store down, and the region at two voters for
+    // the five minutes its replacement took to time out.
+    //
+    // A columnar learner is not a replica this rule may give back. Removing one is
+    // `schedule::columnar_for`'s decision, taken from what the SQL layer asked for, and nobody
+    // else's. Counting voters also stops the shed firing while an ordinary learner is still
+    // catching up, which would undo the very move that added it.
+    let voters = || {
+        region
+            .region
+            .peers
+            .iter()
+            .filter(|peer| peer.role == PeerRole::Voter)
+    };
+    if voters().count() > cluster.target_replicas && !mid_repair {
         // The replica that goes is the one on the busiest store — that is the whole point of
         // the move, so nothing may override it. Picking any other replica would undo the move
         // that was just made, and the two halves would chase each other for ever.
-        let heaviest = region.region.peers.iter().max_by_key(|peer| {
+        let heaviest = voters().max_by_key(|peer| {
             (
                 cluster.effective_regions(peer.store_id),
                 // Highest count wins; the *lowest* store id breaks the tie, so `max_by_key`
@@ -213,15 +233,19 @@ pub fn region_balance(region: &RegionRecord, cluster: &Cluster<'_>) -> Option<Ba
     // The first half: is one of this region's stores meaningfully busier than somewhere this
     // region could go?
     //
-    // Every peer counts here, the leader's included. Adding a replica elsewhere does not move
+    // Every voter counts here, the leader's included. Adding a replica elsewhere does not move
     // the office — only the `RemovePeer` above can do that, and it handles the case. Excluding
     // the leader here instead would mean a region with a *single* replica could never move at
     // all, because that replica is always the leader: a cluster of one store would never spread
     // onto a store that joined it.
-    let busiest = region
-        .region
-        .peers
-        .iter()
+    //
+    // **Voters again**, and for a reason the shed above does not have: this rule can only move a
+    // voter. Measuring the imbalance over a columnar learner it may not touch would start a move
+    // that does not relieve the store it was triggered by — add a voter on the quietest store,
+    // shed the heaviest *voter* somewhere else entirely, and leave the busy store exactly as
+    // busy, ready to trigger again. The fourth instance of the family, found by reading the
+    // second half of this function while fixing the first.
+    let busiest = voters()
         .filter(|peer| !cluster.is_store_down(peer.store_id))
         .max_by_key(|peer| {
             (

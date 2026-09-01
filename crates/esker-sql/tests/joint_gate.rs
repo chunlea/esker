@@ -852,7 +852,6 @@ async fn a_learner_that_dies_comes_back_to_the_same_job() {
 /// every other operator for that region — including the removal the next `ALTER` asked for —
 /// waited behind it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "fails on a defect in esker-pd's balance rule: see this test's doc comment"]
 async fn a_columnar_learner_does_not_cost_the_region_a_voter() {
     let gate = Gate::start_balancing().await;
     tokio::task::block_in_place(|| {
