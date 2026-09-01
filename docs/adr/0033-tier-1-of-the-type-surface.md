@@ -1,4 +1,4 @@
-# 0033 — the three types a Rails migration emits: `integer`, `character varying`, `timestamp`
+# 0033 — tier 1 of the type surface: the types that need no new storage
 
 Status: **accepted**
 Date: 2026-09-01
@@ -38,9 +38,11 @@ and is *not* the next unit, because nothing on that list is on the path a migrat
 that cannot run a migration never issues those seven statements in anger.
 `docs/bench/rails-scoreboard.md` prints both rankings for that reason.
 
-## What each of the three actually is, measured
+## What each of them actually is, measured
 
 Against `esker-pg19` (19beta1), not from memory:
+
+The three the ladder asks for first, side by side; the other four are in the decision's table.
 
 | | `integer` | `character varying` | `timestamp` |
 |---|---|---|---|
@@ -62,9 +64,37 @@ Against `esker-pg19` (19beta1), not from memory:
 
 ## Decision
 
-**Option 2.** Three new variants — `ColumnType::Int4`, `ColumnType::Varchar`,
-`ColumnType::Timestamp` — with the typmod as an `i32` on `ColumnDef`, which is where PostgreSQL
-keeps it too (`pg_attribute.atttypmod`).
+**Option 2.** New `ColumnType` variants, with the typmod as an `i32` on `ColumnDef`, which is where
+PostgreSQL keeps it too (`pg_attribute.atttypmod`).
+
+**Scope: tier 1 is every type that needs no new storage.** The standing order this ADR serves is
+that *this system supports the PostgreSQL types, it does not refuse them* — `0A000` naming a type
+is the state between units and never a destination. What decides the tiers is therefore not
+importance but **whether a type is a format addition**, and tier 1 is the set that is not:
+
+| Tier-1 type | OID | `typlen` | stored as | its own error |
+|---|---|---|---|---|
+| `integer` / `int4` | 23 | 4 | `Datum::Int4(i32)` | `22003 integer out of range` |
+| `smallint` / `int2` | 21 | 2 | `Datum::Int2(i16)` | `22003 smallint out of range` |
+| `real` / `float4` | 700 | 4 | `Datum::Float4(f32)` | `22003 "…" is out of range for type real` — and this one **quotes the value** where the integers do not |
+| `character varying(n)` | 1043 | -1 | `Datum::Text`, length-checked | `22001 value too long for type character varying(5)` |
+| `character(n)` / `bpchar` | 1042 | -1 | `Datum::Text`, blank-padded to `n` | truncates on an explicit cast, raises `22001` on assignment |
+| `timestamp(p)` without time zone | 1114 | 8 | `Datum::Timestamp(i64)` | `22008 timestamp out of range` |
+| `serial` / `smallserial` | — | — | `int4` / `int2` plus an identity | — |
+
+**`serial` is `integer` with an identity, and this ADR reverses the ruling that made it `0A000`.**
+Phase 9 unit 2 refused `serial` by name, and its argument was entirely about the missing type: a
+`serial` mapped onto `bigserial` would hand a client `int8` where a real server hands `int4`.
+Measured, `serial` is not a type at all — `information_schema` reports the column as `integer`,
+`NOT NULL`, with `DEFAULT nextval('t1_a_seq'::regclass)`, which is three things this node already
+has separately. The refusal existed only because `int4` did not; with `int4` it has no argument
+left, and keeping it would be refusing a type on the strength of a reason that has gone.
+
+**Two typmod encodings, and they are not the same.** `varchar(5)` and `character(3)` store
+`atttypmod` as the length **plus four** — measured: `9` and `7`, and `format_type('bpchar', 7)` is
+`character(3)`. `timestamp(6)` stores the precision **directly**: `6`. An implementation that
+assumed one rule would print `character(5)` for a `varchar(5)` or `timestamp(2)` for a
+`timestamp(6)`, so both are captured rather than derived.
 
 **Why not (1).** It is the argument phase 9 unit 2 already made for refusing `serial`, and the
 capture makes it concrete: an `integer` column mapped to `int8` accepts every value between 2^31
@@ -110,19 +140,54 @@ the brief that commissioned the unit, which grants `crates/esker-keys/**` and
 
 ## Consequences
 
-* `ColumnType::ALL` goes from six to nine, and every `match` over it is a compile error until it
-  handles the three. That is the point of it.
+* `ColumnType::ALL` goes from six to twelve, and every `match` over it is a compile error until it
+  handles the new ones. That is the point of it.
+* **The order is the ladder's, not the table's**: `int4` → `varchar(n)` → `timestamp(6)` →
+  `serial` → `int2`, `character(n)`, `float4`. Each is its own commit with its own capture, because
+  each can be measured on its own — the first three are what `ActiveRecord`'s own migration emits,
+  in the order it emits them.
 * `pg_type` grows three rows **without being touched**, because
   `crates/esker-sql/src/catalog/pg_catalog.rs` derives its rows from `ColumnType::ALL`. The
   `typname`/`typinput` tables beside it are exhaustive matches and will not compile until the three
   are named: `int4`/`int4in`, `varchar`/`varcharin`, `timestamp`/`timestamp_in`, all measured.
 * `'integer'::regtype::oid` becomes answerable, which is what rung 2 asks first. The cast is a
   second feature and is scoped with this one because neither moves the ladder alone.
+* **`serial` and `smallserial` stop being `0A000`.** Phase 9 unit 2's refusal is withdrawn here,
+  and the plan's §2 says so where it made the argument, so a reader of that unit is not left with a
+  rule this ADR has taken away.
 * **The row/column differential must stay green**: `esker-columnar`'s `Value` gains the same three
   and `tests/joint_gate.rs`'s fragment-against-row-scan comparison covers them.
 * Three divergences are expected and each needs its own line in the plan's §6 when it is measured:
   `22003` naming or not naming the value, the cast-truncates / insert-raises asymmetry, and
   `timestamp` under a `TimeZone` this node refuses anyway.
-* **Not in scope**: `numeric` (ADR 0031's backlog), arrays (`= ANY(…)`, four statements, the same
-  two crates and worth the same round), `char(n)`, `date`, `time`, and any integer width other than
-  4 and 8.
+## Roadmap: what tier 1 does *not* cover, and in what order it arrives
+
+Refuse-by-name is "not yet", and a reader should be able to see the order rather than infer that a
+missing type is a decision. Tier 1 is above; the two below are **format additions** and each is its
+own ADR — a key-codec encoding for the indexable ones, a columnar column encoding, goldens, old
+bytes still decoding, and the row/column differential green.
+
+**Tier 2 — new physical types.** `date`, `time`, `numeric(p, s)`, `uuid`, `json` / `jsonb`,
+`interval`, and **arrays** (`text[]` and `integer[]` columns *and* `= ANY($1)`, which
+`ActiveRecord` uses for every `IN` with binds — four of its 36 boot statements). Two of them carry
+the hard part: `numeric`'s text parity, because PostgreSQL prints the *declared* scale exactly and
+this is the type ADR 0031 has been refusing on those grounds since unit 0; and `jsonb`'s stored
+form, because it normalises key order and whitespace, so a capture decides what is stored rather
+than a preference.
+
+**Tier 3 — asked for explicitly, after arrays.** The range types
+(`int4range`, `int8range`, `numrange`, `tsrange`, `tstzrange`, `daterange`) — whose canonical form
+`[1,10)` is settled by capture and never guessed — then `enum` (`CREATE TYPE … AS ENUM`), `citext`,
+`hstore`, `tsvector`, `bit` / `varbit`, `inet` / `cidr`, `money`, `xml`, `ltree`, and the geometric
+types. Ranked by suite evidence once tiers 1 and 2 get `ActiveRecord` past `establish_connection`
+and its migrations, which is the point at which the scoreboard can rank them at all.
+
+Every type in every tier ships the same way: a PG19 capture corpus **first** under the C1/C2
+contract, a `pg_type` row derived from `ColumnType::ALL` so the catalog cannot lie about what the
+server has, text output byte-identical to the capture, and a regression per shape. ADR 0031's rule
+still governs *how* — a type ships only where its observable text matches the capture for every
+input that does not error, and is refused by name where it cannot.
+
+**Split across lanes**: tier 1 is this ADR's units. Tiers 2 and 3 belong to a dedicated types lane
+(`esker-keys`, `esker-columnar`, and the SQL type module), so that scoreboard iteration continues
+beside them rather than behind them.

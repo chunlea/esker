@@ -1,6 +1,6 @@
 # Phase 9 plan — a PostgreSQL that Rails can talk to, scored by Rails' own tests
 
-Status: **units 0–4 landed** (unit 4 bar a second join); **unit 5 in progress in the measured order** — the table alias, the eight session statements, `IN (list)` and now the catalog's first slice are built, and `ActiveRecord`'s 36 went 3 → 11 → **15**. **Unit 6's second scoreboard is in** ([`docs/bench/rails-scoreboard.md`](../bench/rails-scoreboard.md)): rung 1 passes, rung 2 has moved off the catalog and onto `'integer'::regtype::oid`, and the suite is unchanged — three numbers that moved by different amounts, which is what the file is shaped to show. **The next unit is the type surface**, which needs `esker-keys` and `esker-columnar` and now has an ADR: [ADR 0033](../adr/0033-the-three-types-a-rails-migration-emits.md). §2 says what the measurement changed, §9 records progress per unit, §6 the divergences, §7 what unit 1 changed and §8 what is watched (now empty).
+Status: **units 0–4 landed** (unit 4 bar a second join); **unit 5 in progress in the measured order** — the table alias, the eight session statements, `IN (list)` and now the catalog's first slice are built, and `ActiveRecord`'s 36 went 3 → 11 → **15**. **Unit 6's second scoreboard is in** ([`docs/bench/rails-scoreboard.md`](../bench/rails-scoreboard.md)): rung 1 passes, rung 2 has moved off the catalog and onto `'integer'::regtype::oid`, and the suite is unchanged — three numbers that moved by different amounts, which is what the file is shaped to show. **The next unit is the type surface**, which needs `esker-keys` and `esker-columnar` and now has an ADR: [ADR 0033](../adr/0033-tier-1-of-the-type-surface.md). §2 says what the measurement changed, §9 records progress per unit, §6 the divergences, §7 what unit 1 changed and §8 what is watched (now empty).
 
 Design: [ADR 0031](../adr/0031-rails-compatibility-is-measured.md). Constitution: `CLAUDE.md`.
 The compatibility contract this inherits whole: `docs/plans/phase-6a.md` §1 — **C1** every valid
@@ -105,15 +105,21 @@ where ADR 0031 records why not.
 A sequence is a catalog record with its own kind byte and its own golden, next to the table and
 index records in the `'m'` key space (`crates/esker-sql/src/catalog/record.rs`).
 
-**`serial` is `0A000` naming itself, and `bigserial` is the path.** `serial` *is* `int4` — it is
-shorthand for an `integer` column with a default — and this crate has no `int4`: `CREATE TABLE t
-(a int4)` is already `0A000 the type INT`, and answering `serial` with an `int8` would accept every
-value between 2^31 and 2^63 that a real server refuses with `22003`. That is ADR 0031's rule in the
-direction it cares most about — accepting what the oracle rejects — so `serial` is refused by the
-same sentence as the type it stands for. It costs nothing that matters here: Rails has defaulted to
-`bigint` primary keys since 5.1, so an ActiveRecord 8 schema asks for `bigserial` or an identity
-column and never for `serial`. `GENERATED ... AS IDENTITY` parses already (phase-6a §9 G07 is the
-`CREATE SEQUENCE` *options*, not the column form).
+**`serial` was `0A000` naming itself, and [ADR
+0033](../adr/0033-tier-1-of-the-type-surface.md) reverses that.** The argument this unit made was
+entirely about a missing type: `serial` *is* `int4` — shorthand for an `integer` column with a
+default — and this crate had no `int4`, so `CREATE TABLE t (a int4)` was already `0A000 the type
+INT`, and answering `serial` with an `int8` would have accepted every value between 2^31 and 2^63
+that a real server refuses with `22003`. ADR 0031's rule in the direction it cares most about:
+accepting what the oracle rejects.
+
+**With `int4` the argument has nothing left in it**, and a refusal that outlives its reason is a
+type refused for no reason. Measured, `serial` is not a type at all — `information_schema` reports
+the column as `integer`, `NOT NULL`, `DEFAULT nextval('t1_a_seq'::regclass)` — which is three
+things this node already has separately. `bigserial` stays the path an ActiveRecord 8 schema takes,
+because Rails has defaulted to `bigint` primary keys since 5.1; what changes is that a schema that
+asks for `serial` is answered rather than refused. `GENERATED ... AS IDENTITY` parses already
+(phase-6a §9 G07 is the `CREATE SEQUENCE` *options*, not the column form).
 
 `nextval`, `currval`, `setval` and `lastval` are the four verbs, and they run in a `SELECT` with
 no `FROM` — which is where every client writes one. Over a table a sequence function is a side
@@ -460,9 +466,15 @@ So the ladder's rung 2 — connect and run one migration — stays blocked, and 
 cross-crate one. Reported rather than worked around.
 
 **Unblocked in unit 6, as a decision rather than as code**: [ADR
-0033](../adr/0033-the-three-types-a-rails-migration-emits.md) settles all three — `ColumnType::Int4`,
-`ColumnType::Varchar` and `ColumnType::Timestamp`, with the typmod on the *column* where PostgreSQL
-keeps it, rather than an alias onto the types this node has. The finding that makes it one unit
+0033](../adr/0033-tier-1-of-the-type-surface.md) settles them, and a coordinator ruling widened it
+from three types to **tier 1 of the whole surface** — the standing order is that this system
+*supports* the PostgreSQL types rather than refusing them, and `0A000` naming a type is the state
+between units and never a destination. Tier 1 is every type that needs no new storage: `int4`,
+`int2`, `float4`, `varchar(n)`, `character(n)`, `timestamp(p)`, and **`serial`/`smallserial`**,
+which the ADR reverses unit 2's refusal of — measured, a `serial` is an `integer` column with a
+`nextval` default and `NOT NULL`, three things this node already has, and the refusal existed only
+because `int4` did not. Each type is a `ColumnType` variant with the typmod on the *column* where
+PostgreSQL keeps it, rather than an alias onto the types this node has. The finding that makes it one unit
 rather than a migration is that **it is not an on-disk format change**: the row codec carries no
 per-value type tag, so a `Varchar` writes exactly what a `Text` writes and every row written before
 the ADR decodes identically after it; `esker-columnar`'s type tag is append-only and the three take
@@ -937,7 +949,7 @@ rankings of what is left disagree, and `docs/bench/rails-scoreboard.md` prints b
 So: `integer`, `character varying`, `timestamp`, **and `'x'::regtype::oid` with them**, because
 neither half moves the ladder alone. `lookup_cast_type` asks the cast question and `pg_type`
 answers it, and today the cast is `0A000` and the answer would be "no such type" if it were not.
-[ADR 0033](../adr/0033-the-three-types-a-rails-migration-emits.md) is the plan, written before the
+[ADR 0033](../adr/0033-tier-1-of-the-type-surface.md) is the plan, written before the
 code as the brief required, and it carries the measured facts — including the finding that this is
 **not** an on-disk format change, which is what makes it one unit.
 
