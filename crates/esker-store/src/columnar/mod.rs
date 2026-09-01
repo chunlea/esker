@@ -35,7 +35,9 @@
 
 pub mod compact;
 pub mod decode;
+pub mod region;
 pub mod runs;
+pub mod wire;
 
 use std::fmt;
 use std::path::{Path, PathBuf};

@@ -34,6 +34,8 @@ use esker_proto::{
 };
 
 use crate::apply::Command;
+use crate::columnar::ColumnarOptions;
+use crate::columnar::region::ColumnarSlot;
 use crate::driver::DriverPool;
 use crate::error::{Result, StoreError};
 use crate::gc::{DEFAULT_RETENTION_MS, MvccCollector, RetentionPolicy};
@@ -254,6 +256,43 @@ pub struct Store {
     /// Regions a snapshot is being fetched for. A leader re-announces every heartbeat, and each
     /// announcement would otherwise start another transfer of the same megabytes.
     receiving: std::sync::Mutex<std::collections::BTreeSet<u64>>,
+    /// Where this store's data lives. Kept because a columnar copy is written **beside** the
+    /// engine rather than inside it: its runs are immutable files of their own format, swept by
+    /// their own manifest ([`crate::columnar::runs`]).
+    data_dir: std::path::PathBuf,
+    /// The filesystem the engine was opened on. A columnar run goes through the same one, so a
+    /// store tiering its SSTs tiers these too, and a test injecting faults injects them here.
+    fs: Arc<dyn FileSystem>,
+    /// One per region that has ever had a peer: the columnar copy a `ColumnarLearner` builds.
+    ///
+    /// Held by the store rather than by the region map because both sides of the seam need it —
+    /// the peer's driver appends to it, the fragment service reads it — and neither owns the
+    /// other.
+    columnar: std::sync::Mutex<std::collections::BTreeMap<u64, Arc<ColumnarSlot>>>,
+}
+
+/// Clears the keys an interrupted snapshot left behind, before anything looks at the key space.
+///
+/// A snapshot that was part-way in when the store stopped left keys no region covers. They go
+/// before the region map is built, so the retry finds the range it was promised and `may_receive`
+/// does not refuse it (`docs/plans/phase-4.md` §13.1).
+fn discard_interrupted_snapshots(db: &Arc<Db>) -> Result<()> {
+    for (region, index) in meta::load_pending_snapshots(db)? {
+        let removed = snapshot::discard_range(db, &region)?;
+        let mut batch = WriteBatch::new();
+        let cf_id = db
+            .cf_id(cf::RAFT)
+            .ok_or_else(|| StoreError::Bootstrap("the `raft` column family is missing".into()))?;
+        meta::stage_snapshot_done(&mut batch, cf_id, region.id);
+        db.write(batch, &WriteOptions { sync: true })?;
+        tracing::warn!(
+            region_id = region.id,
+            index,
+            removed,
+            "a snapshot was interrupted; its partial data was discarded"
+        );
+    }
+    Ok(())
 }
 
 /// Reads the retention policy out of the catalog and hands it to the collector.
@@ -345,31 +384,16 @@ impl Store {
             RetentionPolicy::uniform(DEFAULT_RETENTION_MS),
             0,
         ));
+        let data_dir = path.as_ref().to_path_buf();
+        let runs_fs = Arc::clone(&fs);
         let db = Arc::new(open_engine(path, engine, fs, &collector)?);
         load_retention(&db, &collector);
+
+        discard_interrupted_snapshots(&db)?;
 
         // What this store hosts is what its own `'m'` records say — never what its configuration
         // says on a later open, and never what the placement driver currently believes. A
         // database with none is a fresh one, and only then is `options` a bootstrap.
-        // A snapshot that was part-way in when this store stopped left keys no region covers.
-        // They are cleared before anything else looks at the key space, so the retry finds the
-        // range it was promised and `may_receive` does not refuse it
-        // (`docs/plans/phase-4.md` §13.1).
-        for (region, index) in meta::load_pending_snapshots(&db)? {
-            let removed = snapshot::discard_range(&db, &region)?;
-            let mut batch = WriteBatch::new();
-            let cf_id = db.cf_id(cf::RAFT).ok_or_else(|| {
-                StoreError::Bootstrap("the `raft` column family is missing".into())
-            })?;
-            meta::stage_snapshot_done(&mut batch, cf_id, region.id);
-            db.write(batch, &WriteOptions { sync: true })?;
-            tracing::warn!(
-                region_id = region.id,
-                index,
-                removed,
-                "a snapshot was interrupted; its partial data was discarded"
-            );
-        }
 
         let mut hosted = meta::load_regions(&db)?;
         if hosted.is_empty() {
@@ -425,6 +449,9 @@ impl Store {
             tickers: std::sync::Mutex::new(Vec::new()),
             background: std::sync::Mutex::new(Vec::new()),
             receiving: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            data_dir,
+            fs: runs_fs,
+            columnar: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         });
 
         // The peers are started only now, because each of them needs a handle back to the store:
@@ -479,6 +506,7 @@ impl Store {
                     Arc::clone(&view),
                     host,
                     Arc::clone(&self.drivers),
+                    Some(self.columnar_slot(region.id)),
                 )?;
                 self.spawn_ticker(&peer, raft.tick);
                 RegionState::replicated(RegionMeta::new(region), peer, view)
@@ -735,6 +763,7 @@ impl Store {
                     Arc::clone(&view),
                     host,
                     Arc::clone(&self.drivers),
+                    Some(self.columnar_slot(child.id)),
                 )?;
                 self.spawn_ticker(&peer, raft.tick);
                 RegionState::replicated(RegionMeta::new(child.clone()), peer, view)
@@ -1764,24 +1793,150 @@ impl Store {
     /// Every negative answer here is a [`FragmentResp::Refused`] and never a `ProtoError`. A
     /// refusal is a *normal* response meaning "fall back to a row scan"; an error frame would
     /// make a stale route or a rolling upgrade look like a fault.
-    /// Not `async` yet, and it will be: unit 3's `ReadIndex` round awaits the leader. Kept
-    /// synchronous until then rather than carrying an `async` with nothing to await in it.
-    fn serve_fragment(
+    ///
+    /// # The two halves of Decision 4, and why they are separate
+    ///
+    /// `min_apply_index` is a **catch-up** bound, satisfied before evaluation by a `ReadIndex`
+    /// round to the leader — a columnar learner may run one, and the leader answers any forwarder
+    /// (ADR 0022 Decision 4). `ts` is **visibility**, applied *during* evaluation. They fail
+    /// differently: one refuses with `TooFarBehind`, the other would silently answer from an older
+    /// state. A build that derived one from the other would answer from a state it had not
+    /// reached.
+    async fn serve_fragment(
         self: &Arc<Self>,
         header: RequestHeader,
-        _request: esker_proto::fragment::FragmentReq,
+        request: esker_proto::fragment::FragmentReq,
     ) -> std::result::Result<esker_proto::fragment::FragmentResp, ProtoError> {
+        use esker_proto::fragment::RefusalReason;
+
         // Routing first, so a fragment addressed to a region this store does not own is answered
         // the same way a row read would be — the epoch check is not optional here.
-        let _state = self.regions.route(&header, None)?;
-        Ok(esker_proto::fragment::FragmentResp::Refused {
-            reason: esker_proto::fragment::RefusalReason::NotColumnar,
-            detail: format!(
-                "store {} holds region {} as rows, not columns",
-                self.store_id(),
-                header.region_id
-            ),
-        })
+        let state = self.regions.route(&header, None)?;
+
+        let fragment = match esker_columnar::fragment::decode(&request.fragment) {
+            Ok(fragment) => fragment,
+            // A fragment this build cannot read is not this region's fault, and the planner's
+            // answer to it is the same as to any other refusal: read the rows.
+            Err(error) => {
+                return Ok(refused(
+                    RefusalReason::Unsupported,
+                    format!("this store cannot read the fragment: {error}"),
+                ));
+            }
+        };
+
+        // A voter holds rows and answers so. The role is the region record's, which is the same
+        // fact PD scheduled on and the same one the peer's apply reads (ADR 0022 Decision 1).
+        if !state
+            .region()
+            .peers
+            .iter()
+            .any(|peer| peer.store_id == self.store_id && peer.role == PeerRole::ColumnarLearner)
+        {
+            return Ok(refused(
+                RefusalReason::NotColumnar,
+                format!(
+                    "store {} holds region {} as rows, not columns",
+                    self.store_id(),
+                    header.region_id
+                ),
+            ));
+        }
+
+        // **The catch-up first, and this order is the point.** A learner placed a moment ago has
+        // the region and not yet its data; asked for a table then, it would answer "no columnar
+        // copy" — a refusal that says *look elsewhere* — when the truth is "not yet", which says
+        // *wait*. `min_apply_index` is what tells the two apart, so it is satisfied before
+        // anything is read (ADR 0022 Decision 4). Found by the differential, which asked a learner
+        // the instant PD placed it.
+        if request.min_apply_index > 0
+            && let Some(refusal) = self.catch_up(&state, request.min_apply_index).await
+        {
+            return Ok(refusal);
+        }
+
+        let slot = self.columnar_slot(header.region_id);
+        let runs = match slot.table(&self.db, fragment.table.tenant, fragment.table.table_id) {
+            Ok(Some(runs)) => runs,
+            Ok(None) => {
+                return Ok(refused(
+                    RefusalReason::NotColumnar,
+                    format!(
+                        "store {} holds region {} without a columnar copy of table {}",
+                        self.store_id(),
+                        header.region_id,
+                        fragment.table.table_id
+                    ),
+                ));
+            }
+            Err(error) => {
+                return Ok(refused(
+                    RefusalReason::NotColumnar,
+                    format!("this store's columnar copy is not readable: {error}"),
+                ));
+            }
+        };
+
+        match evaluate(slot.fs().as_ref(), &runs, &fragment, request.ts) {
+            Ok(answer) => Ok(answer),
+            Err(error) => Ok(refused(
+                RefusalReason::Unsupported,
+                format!("this store could not evaluate the fragment: {error}"),
+            )),
+        }
+    }
+
+    /// Waits for this peer to have applied `min_apply_index`, or says why it will not.
+    ///
+    /// `read_index_as_learner` rather than `read_index`, because the row path's version refuses on
+    /// a peer that does not lead — right for a row read, which only a leader serves, and wrong for
+    /// a learner serving a fragment (`crate::peer::RaftPeer::read_index_as_learner`).
+    async fn catch_up(
+        &self,
+        state: &Arc<RegionState>,
+        min_apply_index: u64,
+    ) -> Option<esker_proto::fragment::FragmentResp> {
+        use esker_proto::fragment::RefusalReason;
+
+        let peer = state.peer()?;
+        if peer.applied_index() >= min_apply_index {
+            return None;
+        }
+        match peer.read_index_as_learner().await {
+            // The round only tells this peer how far it must be; having *reached* it is what the
+            // call waits for, so an index still short of the bound is a peer that is behind.
+            Ok(_) if peer.applied_index() >= min_apply_index => None,
+            Ok(index) => Some(refused(
+                RefusalReason::TooFarBehind,
+                format!(
+                    "applied {} of the {min_apply_index} asked for, at read index {index}",
+                    peer.applied_index()
+                ),
+            )),
+            Err(error) => Some(refused(
+                RefusalReason::TooFarBehind,
+                format!("could not reach the leader to catch up: {error}"),
+            )),
+        }
+    }
+
+    /// This region's columnar copy, created on first ask.
+    ///
+    /// Every region gets one because a peer can be *told* it is a columnar learner long after it
+    /// starts — a conf change is how one is placed — and a slot that has never been opened costs a
+    /// map entry and touches no disk.
+    fn columnar_slot(&self, region_id: u64) -> Arc<ColumnarSlot> {
+        let mut slots = self
+            .columnar
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(slots.entry(region_id).or_insert_with(|| {
+            Arc::new(ColumnarSlot::new(
+                Arc::clone(&self.fs),
+                self.data_dir.join("columnar").join(region_id.to_string()),
+                ColumnarOptions::default(),
+            ))
+        }))
     }
 
     /// The `raft` column family's id, or the failure that says the store was opened wrong.
@@ -2336,6 +2491,12 @@ fn whole_key_space(options: &BootstrapOptions<'_>) -> Region {
 /// The voters come from the **region's own peer list**, not from the store's configuration. That
 /// is the difference a multi-region store makes: two regions on one store have different
 /// membership, and a store-wide voter list would give each of them the other's.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each is a distinct collaborator the peer needs — its log, its region, its \
+              transport, its host, its driver pool, its columnar copy — and a bag type would \
+              move the list rather than shorten it"
+)]
 fn start_peer(
     db: &Arc<Db>,
     region: &Region,
@@ -2344,6 +2505,7 @@ fn start_peer(
     transport: Arc<crate::transport::RegionTransport>,
     host: Arc<dyn RegionHost>,
     pool: Arc<DriverPool>,
+    columnar: Option<Arc<ColumnarSlot>>,
 ) -> Result<Arc<RaftPeer>> {
     let voters: Vec<u64> = region
         .peers
@@ -2394,12 +2556,92 @@ fn start_peer(
             learners,
             seed: raft.seed,
             compaction: raft.compaction,
+            columnar,
         },
         storage,
         transport as Arc<dyn crate::peer::RaftTransport>,
         host,
         pool,
     )
+}
+
+/// A refusal, which is a normal answer.
+fn refused(
+    reason: esker_proto::fragment::RefusalReason,
+    detail: String,
+) -> esker_proto::fragment::FragmentResp {
+    esker_proto::fragment::FragmentResp::Refused { reason, detail }
+}
+
+/// Evaluates one fragment over a table's runs, at one visibility timestamp.
+///
+/// **Every live run at once**, and that is the load-bearing part rather than an optimisation:
+/// resolving versions per run answers "the newest version of this key *in this run*", which is a
+/// different question — a run whose only word on a key is a tombstone resolves it to nothing, and
+/// an older run's live-looking row then survives a delete (`esker-store/tests/columnar_differential`
+/// was built for exactly that regression).
+fn evaluate(
+    fs: &dyn FileSystem,
+    runs: &crate::columnar::region::TableRuns,
+    fragment: &esker_columnar::Fragment,
+    ts: u64,
+) -> std::result::Result<esker_proto::fragment::FragmentResp, esker_columnar::Error> {
+    use esker_columnar::scan::visible::Visibility;
+    use esker_columnar::{Reader, ScanOptions};
+
+    // A table with a copy but no runs has committed nothing this fragment could return, and the
+    // evaluator refuses an empty reader list rather than inventing an empty answer.
+    if runs.paths.is_empty() {
+        return Ok(esker_proto::fragment::FragmentResp::Result {
+            result: esker_proto::fragment::result::encode(
+                &esker_proto::fragment::result::Body::Rows {
+                    types: Vec::new(),
+                    rows: Vec::new(),
+                },
+            )
+            .map_err(|error| esker_columnar::Error::InvalidArgument(error.to_string()))?
+            .into(),
+            stats: esker_proto::fragment::ScanStats::default(),
+        });
+    }
+
+    let readers: Vec<Reader> = runs
+        .paths
+        .iter()
+        .map(|path| Reader::open(fs, path))
+        .collect::<esker_columnar::Result<_>>()?;
+    let (key_column, ts_column, deleted_column) = runs.visibility;
+    let result = esker_columnar::evaluate_merged(
+        &readers,
+        fragment,
+        &ScanOptions {
+            prune: true,
+            widening: None,
+            // MVCC at **read** time (ADR 0022 Decision 4): the runs hold every version as
+            // committed, and which of them a caller may see is a property of when it is reading.
+            visibility: Some(Visibility {
+                key_columns: vec![key_column],
+                ts_column,
+                deleted_column,
+                ts: i64::try_from(ts).unwrap_or(i64::MAX),
+            }),
+        },
+    )?;
+
+    let body = crate::columnar::wire::body_of(&result.output)
+        .map_err(esker_columnar::Error::InvalidArgument)?;
+    let bytes = esker_proto::fragment::result::encode(&body)
+        .map_err(|error| esker_columnar::Error::InvalidArgument(error.to_string()))?;
+    Ok(esker_proto::fragment::FragmentResp::Result {
+        result: bytes.into(),
+        stats: esker_proto::fragment::ScanStats {
+            stripes_considered: result.stats.stripes_considered,
+            stripes_read: result.stats.stripes_read,
+            chunks_decoded: result.stats.chunks_decoded,
+            rows_scanned: result.stats.rows_scanned,
+            rows_matched: result.stats.rows_matched,
+        },
+    })
 }
 
 /// The store, behind the weak reference a peer's driver holds it by.
@@ -2500,17 +2742,16 @@ impl Service for StoreService {
                         .await
                         .map(|response| Reply::Unary(Response::Admin(response)));
                 }
-                // A fragment for a region this store holds no columnar copy of. **A refusal, not
-                // an error**: `NotColumnar` is a normal answer meaning "the caller's routing is
-                // stale, or placement moved — fall back to a row scan", and the planner's
-                // fallback is not an error path (ADR 0022 Decision 4, `esker_proto::fragment`).
-                // Making it an error frame would make every rolling upgrade look like a fault.
-                //
-                // Until the apply target is placed on regions (phase 8 unit 3), this is the only
-                // answer this store has, and it is the correct one rather than a placeholder.
+                // A fragment, answered from this store's columnar copy of the region — or
+                // **refused**, which is a normal answer and never an error frame: `NotColumnar`
+                // means "the caller's routing is stale, or placement moved — fall back to a row
+                // scan", and the planner's fallback is not an error path (ADR 0022 Decision 4,
+                // `esker_proto::fragment`). Making it an error would turn every rolling upgrade
+                // into a fault.
                 Request::Fragment { header, request } => {
                     return store
                         .serve_fragment(header, request)
+                        .await
                         .map(|response| Reply::Unary(Response::Fragment(response)));
                 }
                 // A store is not a placement driver. Answering anything but a refusal — even a

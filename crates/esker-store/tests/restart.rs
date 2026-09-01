@@ -91,6 +91,7 @@ fn start(db: &Arc<Db>) -> Arc<RaftPeer> {
             learners: Vec::new(),
             seed: 3,
             compaction: LogCompaction::new(),
+            columnar: None,
         },
         storage,
         Arc::new(DiscardTransport),

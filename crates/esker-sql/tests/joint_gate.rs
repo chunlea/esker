@@ -38,7 +38,13 @@ use esker_client::region_cache::{RegionResolver, RegionTable, Route};
 use esker_client::router::{ClientOptions, Router};
 use esker_client::{CountingOracle, TcpStores, TimestampOracle, TxnClient};
 use esker_pd::{Pd, PdOptions, PdService};
-use esker_proto::{PeerRole, Server, ServerHandle, Service, TransportConfig};
+use esker_proto::fragment::result::{Body, Value as WireValue};
+use esker_proto::fragment::{FragmentReq, FragmentResp, RefusalReason};
+use esker_proto::{
+    BlockingTransport, PeerRole, Request, RequestHeader, Response, Server, ServerHandle, Service,
+    TransportConfig,
+};
+use esker_sql::Datum;
 use esker_sql::backend::{Backend, SchemaLease as SchemaLeaseSource};
 use esker_sql::catalog::Catalog;
 use esker_sql::exec::Executor;
@@ -135,6 +141,7 @@ fn sql_node(
     addresses: &[std::net::SocketAddr],
     region: &esker_proto::Region,
     pd_address: std::net::SocketAddr,
+    oracle: Arc<dyn TimestampOracle>,
 ) -> (Arc<dyn Backend>, Arc<PdConn>) {
     let stores = TcpStores::connect_all(addresses, TransportConfig::new()).unwrap();
     let resolver: Arc<dyn RegionResolver> = Arc::new(RegionTable::from_routes([Route {
@@ -149,7 +156,6 @@ fn sql_node(
             ..ClientOptions::default()
         },
     );
-    let oracle: Arc<dyn TimestampOracle> = Arc::new(CountingOracle::starting_at(1_000));
     let client = Arc::new(TxnClient::on_router(Arc::new(router), Arc::clone(&oracle)));
 
     let lease = Arc::new(PdLease::new());
@@ -171,6 +177,8 @@ fn sql_node(
 /// The whole cluster: a placement driver, four stores, and one SQL node over them.
 struct Gate {
     pd: Arc<Pd>,
+    /// The SQL node's oracle, so a test can name the instant it reads at.
+    oracle: Arc<dyn TimestampOracle>,
     pd_address: std::net::SocketAddr,
     pd_handle: Option<ServerHandle>,
     nodes: Vec<Node>,
@@ -265,11 +273,14 @@ impl Gate {
             .unwrap()
             .expect("a region covers the key space");
         let region_id = route.region.id;
-        let (backend, conn) =
-            tokio::task::block_in_place(|| sql_node(&addresses, &route.region, pd_address));
+        let oracle: Arc<dyn TimestampOracle> = Arc::new(CountingOracle::starting_at(1_000));
+        let (backend, conn) = tokio::task::block_in_place(|| {
+            sql_node(&addresses, &route.region, pd_address, Arc::clone(&oracle))
+        });
 
         Gate {
             pd,
+            oracle,
             pd_address,
             pd_handle: Some(pd_handle),
             nodes,
@@ -284,6 +295,126 @@ impl Gate {
         Session {
             executor: Executor::new(Arc::clone(&self.backend), Arc::clone(&self.catalog), TENANT)
                 .reporting_columnar_to(Arc::clone(&self.conn) as Arc<dyn ColumnarReport>),
+        }
+    }
+
+    /// The id of a table this session created.
+    fn table_id(&self, name: &str) -> u64 {
+        let txn = self.backend.begin().unwrap();
+        let view = self.catalog.view(&*txn, TENANT).unwrap();
+        let id = view.table(name).unwrap().unwrap().id;
+        let _ = txn.rollback();
+        id
+    }
+
+    /// The rows a fragment against the learner answers with, as `(id, name)`.
+    fn fragment(
+        &self,
+        tenant: u64,
+        table_id: u64,
+        ts: u64,
+        min_apply_index: u64,
+        projection: Vec<u32>,
+    ) -> Vec<(i64, Option<String>)> {
+        let learner = self.learner_node();
+        let region_id = learner.store.regions().find(b"t").unwrap().id();
+        let answer = Self::ask(
+            learner,
+            region_id,
+            tenant,
+            table_id,
+            ts,
+            min_apply_index,
+            projection,
+        );
+        let FragmentResp::Result { result, .. } = answer else {
+            panic!("the learner refused the fragment: {answer:?}");
+        };
+        let Body::Rows { rows, .. } = esker_proto::fragment::result::decode(&result).unwrap()
+        else {
+            panic!("a scan fragment came back as groups");
+        };
+        let mut out: Vec<(i64, Option<String>)> = rows
+            .iter()
+            .map(|row| match (&row[0], &row[1]) {
+                (WireValue::Int8(id), WireValue::Text(name)) => (*id, Some(name.clone())),
+                (WireValue::Int8(id), WireValue::Null) => (*id, None),
+                other => panic!("unexpected row {other:?}"),
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The same rows, read the other way: through the row store, at the same instant.
+    ///
+    /// **A second implementation, not a second call.** It goes to the voters over the wire,
+    /// resolves MVCC in Percolator's `write` records, and decodes with the row codec — sharing the
+    /// *rule* with the columnar path and none of its code, which is what makes the comparison
+    /// worth making (`docs/plans/phase-8-learner.md`, RULED-2).
+    fn row_scan(&self, ts: u64, table_id: u64) -> Vec<(i64, Option<String>)> {
+        let txn = self.backend.begin_at(ts).unwrap();
+        let (start, end) = esker_keys::row::table_row_range(TENANT, table_id);
+        let pairs = txn.scan(&start, &end, 1024).unwrap();
+        let schema = {
+            let view = self.catalog.view(&*txn, TENANT).unwrap();
+            view.table("t").unwrap().unwrap().row_schema()
+        };
+        let mut out: Vec<(i64, Option<String>)> = pairs
+            .iter()
+            .map(|(_, value)| {
+                let row = esker_sql::row::decode_row(&schema, value).unwrap();
+                match (&row[0], &row[1]) {
+                    (Datum::Int8(id), Datum::Text(name)) => (*id, Some(name.clone())),
+                    (Datum::Int8(id), Datum::Null) => (*id, None),
+                    other => panic!("unexpected row {other:?}"),
+                }
+            })
+            .collect();
+        let _ = txn.rollback();
+        out.sort();
+        out
+    }
+
+    /// One fragment request, over a real socket, to one store.
+    ///
+    /// An associated function rather than a method: what it needs is a node and a region, and a
+    /// gate that lent it `self` would be lending nothing.
+    fn ask(
+        node: &Node,
+        region_id: u64,
+        tenant: u64,
+        table_id: u64,
+        ts: u64,
+        min_apply_index: u64,
+        projection: Vec<u32>,
+    ) -> FragmentResp {
+        let region = node
+            .store
+            .regions()
+            .find(b"t")
+            .expect("the store holds the region");
+        let fragment = esker_columnar::Fragment::scan(
+            esker_columnar::TableRef { tenant, table_id },
+            projection,
+        );
+        let transport = BlockingTransport::connect(node.address).unwrap();
+        let answer = transport
+            .call(
+                Request::Fragment {
+                    header: RequestHeader::new(region_id, region.region().epoch, 0),
+                    request: FragmentReq {
+                        fragment: esker_columnar::fragment::encode(&fragment).into(),
+                        ts,
+                        min_apply_index,
+                    },
+                },
+                Instant::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+        match answer {
+            Response::Fragment(response) => response,
+            other => panic!("a fragment request answered {other:?}"),
         }
     }
 
@@ -424,21 +555,98 @@ async fn an_alter_places_a_columnar_replica_and_clearing_it_takes_it_back() {
     gate.stop().await;
 }
 
-/// The half of the gate that cannot pass yet, pinned as a fact.
+/// **The differential, on a live cluster.** Fragments and rows agree at one timestamp.
 ///
-/// A learner placed by the test above is a learner the *record* says is columnar. Ask it for a
-/// fragment and it refuses with `NotColumnar`, because `esker-store` has no columnar apply target
-/// on a live region and `serve_fragment` is a documented placeholder. That refusal is the correct
-/// answer for what is built — a refusal means "fall back to a row scan" and is never an error —
-/// and it is also the evidence that the wave's differential is blocked on §store unit 3 rather
-/// than on this lane.
+/// ADR 0022 names the two engines disagreeing as the worst failure this feature can have,
+/// *"because it is silent"*. `esker-store`'s own differential defends the apply target against a
+/// reference written longhand; this defends the whole path — placement, the apply tee, the
+/// conversion, the fragment service, the wire — against **the row store**, which is the only
+/// reference a user can tell the difference from.
 ///
-/// **Delete this test when unit 3 lands**, and put the differential here.
+/// Two implementations of one rule, which is what makes it a differential rather than a
+/// tautology: the fragment resolves visibility in `esker-columnar`'s evaluator over sorted runs on
+/// a learner, and the reference reads the same instant through Percolator's `write` records on a
+/// voter and decodes with the row codec. The workload has an update and a delete in it precisely
+/// so that "every version" and "the visible version" are different answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_fragment_service_still_refuses() {
-    use esker_proto::fragment::{FragmentReq, FragmentResp, RefusalReason};
-    use esker_proto::{BlockingTransport, Request, RequestHeader, Response};
+#[ignore = "a placed columnar learner never receives the region's existing data: see the doc above"]
+async fn the_learner_answers_fragments_that_agree_with_a_row_scan() {
+    let gate = Gate::start().await;
 
+    tokio::task::block_in_place(|| {
+        let mut session = gate.session();
+        session
+            .run("CREATE TABLE t (id int8 PRIMARY KEY, name text)")
+            .unwrap();
+        session
+            .run("INSERT INTO t VALUES (1, 'ada'), (2, 'grace'), (3, 'edsger'), (4, 'barbara')")
+            .unwrap();
+        session
+            .run("ALTER TABLE t SET (columnar_replicas = 1)")
+            .unwrap();
+        // After the flag, so the copy has history to convert *and* a stream to follow.
+        session
+            .run("UPDATE t SET name = 'ada lovelace' WHERE id = 1")
+            .unwrap();
+        session.run("DELETE FROM t WHERE id = 3").unwrap();
+        session
+            .run("INSERT INTO t VALUES (5, 'grace hopper')")
+            .unwrap();
+    });
+
+    wait_for("PD to place a columnar learner", 60, || {
+        gate.columnar_learners().len() == 1
+    })
+    .await;
+    wait_for("the store to build the learner", 60, || {
+        gate.learner_node().store.regions().find(b"t").is_some()
+    })
+    .await;
+
+    let table_id = tokio::task::block_in_place(|| gate.table_id("t"));
+    // One instant, read two ways. Taken after the writes, so both sides see all of them.
+    let ts = gate.oracle.timestamp().unwrap();
+    // The leader's apply index, so the learner has to **catch up** before it may answer — the
+    // half of Decision 4 that a fragment at `min_apply_index = 0` would never exercise.
+    let region_id = gate.learner_node().store.regions().find(b"t").unwrap().id();
+    let min_apply_index = gate
+        .nodes
+        .iter()
+        .filter_map(|node| node.store.peer_of(region_id))
+        .filter(|peer| peer.is_leader())
+        .map(|peer| peer.applied_index())
+        .max()
+        .expect("some store leads the region");
+
+    let columns = tokio::task::block_in_place(|| {
+        gate.fragment(TENANT, table_id, ts, min_apply_index, vec![0, 1])
+    });
+    let rows = tokio::task::block_in_place(|| gate.row_scan(ts, table_id));
+
+    assert_eq!(
+        columns, rows,
+        "the columnar copy and the row store disagree at ts {ts}",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            (1, Some("ada lovelace".to_owned())),
+            (2, Some("grace".to_owned())),
+            (4, Some("barbara".to_owned())),
+            (5, Some("grace hopper".to_owned())),
+        ],
+        "the reference itself is wrong, so the agreement above means nothing",
+    );
+
+    gate.stop().await;
+}
+
+/// A fragment a replica cannot honour is **refused**, and refused for the right reason.
+///
+/// Both are normal answers meaning "fall back to a row scan" (ADR 0022 Decision 4), and telling
+/// them apart is what lets a planner know whether asking another replica would help.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fragment_is_refused_by_a_voter_and_by_a_learner_that_is_behind() {
     let gate = Gate::start().await;
     tokio::task::block_in_place(|| {
         let mut session = gate.session();
@@ -454,48 +662,60 @@ async fn the_fragment_service_still_refuses() {
         gate.columnar_learners().len() == 1
     })
     .await;
-    let placed = gate.columnar_learners()[0];
-    let learner = gate
-        .nodes
-        .iter()
-        .find(|node| node.store.store_id() == placed)
-        .unwrap();
     wait_for("the store to build the learner", 60, || {
-        learner.store.regions().find(b"t").is_some()
+        gate.learner_node().store.regions().find(b"t").is_some()
     })
     .await;
+    let table_id = tokio::task::block_in_place(|| gate.table_id("t"));
+    let region_id = gate.learner_node().store.regions().find(b"t").unwrap().id();
 
-    let region = learner.store.regions().find(b"t").unwrap();
-    let address = learner.address;
-    let answer = tokio::task::block_in_place(|| {
-        let transport = BlockingTransport::connect(address).unwrap();
-        transport
-            .call(
-                Request::Fragment {
-                    header: RequestHeader::new(region.id(), region.region().epoch, 0),
-                    request: FragmentReq {
-                        fragment: bytes::Bytes::new(),
-                        ts: 1,
-                        min_apply_index: 0,
-                    },
-                },
-                Instant::now() + Duration::from_secs(10),
-            )
-            .unwrap()
+    // A voter holds rows, and says so rather than answering from something it does not have.
+    let voter = gate
+        .nodes
+        .iter()
+        .find(|node| {
+            node.store.store_id() != gate.learner_node().store.store_id()
+                && node.store.regions().find(b"t").is_some()
+        })
+        .expect("three voters hold the region");
+    let refusal = tokio::task::block_in_place(|| {
+        Gate::ask(voter, region_id, TENANT, table_id, 1, 0, vec![0, 1])
     });
-    match answer {
-        Response::Fragment(FragmentResp::Refused { reason, detail }) => {
-            assert_eq!(
-                reason,
-                RefusalReason::NotColumnar,
-                "the store refused for a different reason: {detail}",
-            );
-        }
-        other => panic!(
-            "the fragment service answered {other:?}; if it evaluated the fragment then \
-             §store unit 3 has landed and this test should be replaced by the differential",
+    assert!(
+        matches!(
+            refusal,
+            FragmentResp::Refused {
+                reason: RefusalReason::NotColumnar,
+                ..
+            }
         ),
-    }
+        "a voter answered {refusal:?}",
+    );
+
+    // And a bound this replica cannot reach is `TooFarBehind` — a different replica may be closer,
+    // which is what the planner does with it.
+    let unreachable = u64::from(u32::MAX);
+    let behind = tokio::task::block_in_place(|| {
+        Gate::ask(
+            gate.learner_node(),
+            region_id,
+            TENANT,
+            table_id,
+            1,
+            unreachable,
+            vec![0, 1],
+        )
+    });
+    assert!(
+        matches!(
+            behind,
+            FragmentResp::Refused {
+                reason: RefusalReason::TooFarBehind,
+                ..
+            }
+        ),
+        "a learner asked for an index it cannot have answered {behind:?}",
+    );
 
     gate.stop().await;
 }

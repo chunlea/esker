@@ -271,6 +271,13 @@ pub struct PeerOptions {
     pub seed: u64,
     /// When the Raft log is compacted, and how much of it a compaction leaves.
     pub compaction: LogCompaction,
+    /// Where this region's columnar copy is built, when its peer is a columnar learner.
+    ///
+    /// `None` is a peer that can never be one — a store opened without a filesystem to build runs
+    /// on, and every test that does not care. The slot is opened lazily and only for a peer whose
+    /// **role in the region record** says to (ADR 0022 Decision 1), so passing one costs nothing
+    /// until that is true.
+    pub columnar: Option<Arc<crate::columnar::region::ColumnarSlot>>,
 }
 
 /// When a peer throws away the head of its Raft log.
@@ -383,6 +390,8 @@ pub struct PeerCore {
     published: Arc<Published>,
     /// How far the state machine has been driven. Reads wait for this, not for the commit index.
     applied_index: Index,
+    /// This region's columnar copy, for a peer the region record calls a columnar learner.
+    columnar: Option<Arc<crate::columnar::region::ColumnarSlot>>,
 }
 
 /// What the driver publishes for readers that must not wait on it.
@@ -654,6 +663,10 @@ impl PeerCore {
         let mut batch = WriteBatch::new();
         let mut split_halves = None;
         let mut conf_change = None;
+        // The keys this entry makes visible, and when — taken from the command and acted on only
+        // after the batch is durable, because a columnar copy may hold nothing this region has not
+        // committed.
+        let mut committed: Option<(u64, Vec<Bytes>)> = None;
 
         let outcome: std::result::Result<Applied, ProtoError> = match entry.kind {
             // A leader's no-op carries no payload; it exists so §5.4.2 lets the backlog commit.
@@ -674,22 +687,26 @@ impl PeerCore {
                         *new_region_id,
                         new_peer_ids,
                     ),
-                    _ => match crate::apply::check_scope(&command, &self.region) {
-                        // Refused, deterministically, on every peer alike. Nothing is staged.
-                        Err(refusal) => Err(refusal),
-                        Ok(()) => Ok(crate::apply::stage(
-                            self.node.storage().db(),
-                            &mut batch,
-                            &command,
-                            &self.region,
-                        )
-                        .map_err(|error| {
-                            StoreError::Bootstrap(format!(
-                                "could not apply entry {}: {error}",
-                                entry.index
-                            ))
-                        })?),
-                    },
+                    // Refused, deterministically, on every peer alike. Nothing is staged.
+                    _ => {
+                        if let Err(refusal) = crate::apply::check_scope(&command, &self.region) {
+                            Err(refusal)
+                        } else {
+                            committed = commits_of(&command);
+                            Ok(crate::apply::stage(
+                                self.node.storage().db(),
+                                &mut batch,
+                                &command,
+                                &self.region,
+                            )
+                            .map_err(|error| {
+                                StoreError::Bootstrap(format!(
+                                    "could not apply entry {}: {error}",
+                                    entry.index
+                                ))
+                            })?)
+                        }
+                    }
                 }
             }
             EntryKind::ConfChange => {
@@ -721,6 +738,21 @@ impl PeerCore {
             .write(batch, &WriteOptions { sync: false })?;
         self.applied_index = entry.index;
 
+        // The columnar copy, after the row state and never before it: what it ingests is read back
+        // out of the `write` column family this batch just landed, so the two engines cannot
+        // disagree about what was committed (`crate::columnar::region`).
+        if let Some((commit_ts, keys)) = committed
+            && let Some(refused) = self.tee_columnar(commit_ts, &keys, &outcome)
+        {
+            tracing::error!(
+                region_id = self.region_id,
+                index = entry.index,
+                error = %refused,
+                "this region's columnar copy could not take a commit; it is closed, so a fragment \
+                 refuses rather than answering from an incomplete copy"
+            );
+        }
+
         // Only now, with both records durable, does the split become visible to anything else.
         if let Some((parent, child)) = split_halves {
             self.region = parent.clone();
@@ -746,6 +778,46 @@ impl PeerCore {
 
         self.complete_proposal(entry, outcome);
         Ok(())
+    }
+
+    /// Feeds one entry's committed versions to this region's columnar copy.
+    ///
+    /// Answers with the failure rather than propagating it. A columnar copy is a **convenience**
+    /// and the row state is the region's truth, so a copy that cannot take a commit is closed —
+    /// the next commit rebuilds it from the region's own state — and the peer carries on. Stopping
+    /// the driver here would take a healthy replica out of its group over an optional index.
+    fn tee_columnar(
+        &self,
+        commit_ts: u64,
+        keys: &[Bytes],
+        outcome: &std::result::Result<Applied, ProtoError>,
+    ) -> Option<StoreError> {
+        let slot = self.columnar.as_ref()?;
+        if !self.is_columnar_learner() {
+            return None;
+        }
+        // An apply that refused the commit committed nothing.
+        if !matches!(outcome, Ok(Applied::Txn(response)) if committed_ok(response)) {
+            return None;
+        }
+        match slot.commit(self.node.storage().db(), commit_ts, keys) {
+            Ok(()) => None,
+            Err(error) => {
+                slot.close();
+                Some(error)
+            }
+        }
+    }
+
+    /// Whether the region record calls **this** peer a columnar learner.
+    ///
+    /// Read from the region rather than remembered from construction, because a peer is *told*
+    /// what it is after it starts: a learner placed by a conf change learns its role when that
+    /// change applies, into the same `self.region` this reads.
+    fn is_columnar_learner(&self) -> bool {
+        self.region.peers.iter().any(|peer| {
+            peer.peer_id == self.peer_id && peer.role == esker_proto::PeerRole::ColumnarLearner
+        })
     }
 
     /// Stages the store's half of a membership change: the region's new peer list and epoch.
@@ -1155,6 +1227,40 @@ fn propose_error(error: &esker_raft::RaftError, region_id: u64) -> ProtoError {
     }
 }
 
+/// The keys a command commits, and the timestamp it commits them at.
+///
+/// Only a `Commit` and a **rolled forward** `ResolveLock` make versions visible. A rollback and a
+/// prewrite make none: a prewrite's value is not visible until its commit, which is the fact that
+/// makes the columnar copy's input the `write` column family rather than the log's payload.
+fn commits_of(command: &Command) -> Option<(u64, Vec<Bytes>)> {
+    use crate::txn_command::TxnCommand;
+    match command {
+        Command::Txn(TxnCommand::Commit {
+            commit_ts, keys, ..
+        }) => Some((*commit_ts, keys.clone())),
+        // Zero is the caller's verdict for "roll it back", not a timestamp.
+        Command::Txn(TxnCommand::ResolveLock {
+            commit_ts, keys, ..
+        }) if *commit_ts != 0 => Some((*commit_ts, keys.clone())),
+        _ => None,
+    }
+}
+
+/// Whether a transactional apply's answer says the keys really committed.
+///
+/// A `ResolveLock` answers how many keys it resolved rather than a status, and a resolution
+/// carrying a commit timestamp rolls its keys **forward** — so the reading below is per key, from
+/// the `write` records the batch left, and not from this answer.
+fn committed_ok(response: &esker_proto::TxnKvResp) -> bool {
+    use esker_proto::{TxnKvResp, TxnStatus};
+    matches!(
+        response,
+        TxnKvResp::Commit {
+            status: TxnStatus::Ok
+        } | TxnKvResp::ResolveLock { .. }
+    )
+}
+
 /// The handle the request path holds: a way to reach the worker driving this region, and the few
 /// facts it needs often enough to be worth publishing without asking.
 #[derive(Debug)]
@@ -1208,6 +1314,7 @@ impl RaftPeer {
             leader: Arc::clone(&leader),
             published: Arc::clone(&published),
             applied_index,
+            columnar: options.columnar,
         };
 
         pool.register(region_id, Box::new(core))?;
@@ -1551,6 +1658,7 @@ mod tests {
                 learners: Vec::new(),
                 seed: 7,
                 compaction: LogCompaction::new(),
+                columnar: None,
             },
             storage,
             transport,
@@ -2002,6 +2110,7 @@ mod tests {
                     keep: 4,
                     ..LogCompaction::new()
                 },
+                columnar: None,
             },
             storage,
             Arc::new(DiscardTransport),
@@ -2084,6 +2193,7 @@ mod tests {
                         learners: Vec::new(),
                         seed: 7,
                         compaction: LogCompaction::new(),
+                        columnar: None,
                     },
                     storage,
                     Arc::new(DiscardTransport),
@@ -2150,6 +2260,7 @@ mod tests {
                         learners: Vec::new(),
                         seed: 7,
                         compaction: LogCompaction::new(),
+                        columnar: None,
                     },
                     storage,
                     Arc::new(DiscardTransport),

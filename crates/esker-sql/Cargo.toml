@@ -40,6 +40,11 @@ esker-store.workspace = true
 # does not depend on this crate, so there is no cycle. The same dependency `esker-store` and
 # `esker-client` take, for the same reason.
 esker-pd.workspace = true
+# The joint gate builds the fragment it sends and reads the answer back, so it needs the format
+# both sides speak. Dev-only, and `esker-sql` deliberately does not link it at runtime: the
+# planner's columnar half is a later milestone, and a leaf crate whose format versions could
+# reach the SQL layer is what `esker-proto`'s result format exists to prevent.
+esker-columnar.workspace = true
 proptest.workspace = true
 sqllogictest.workspace = true
 tempfile.workspace = true

@@ -459,6 +459,7 @@ dependencies = [
  "bytes",
  "esker-base",
  "esker-client",
+ "esker-columnar",
  "esker-keys",
  "esker-pd",
  "esker-proto",
