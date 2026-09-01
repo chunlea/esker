@@ -213,6 +213,27 @@ impl Pd {
             );
             return Some(Plan::Repair(repair));
         }
+        // Columnar placement, after the repair and before the balance, and the order is the
+        // argument. After repair, because a region below its voter target is in trouble and a
+        // columnar copy is a convenience — the one operator slot a region gets belongs to the
+        // repair. Before balance, because a missing columnar copy means a query falling back to a
+        // row scan every time it runs, while an unbalanced cluster is merely uneven.
+        //
+        // `wanted_for` is zero for every range nobody reported, so a cluster that has never been
+        // told about columnar replicas does one range comparison per heartbeat and stops.
+        let wanted = state
+            .columnar
+            .wanted_for(&record.region.start_key, &record.region.end_key);
+        if let Some(repair) = schedule::columnar_for(record, cluster, wanted) {
+            tracing::debug!(
+                region_id = record.region.id,
+                wanted,
+                repair = ?repair,
+                "region's columnar placement does not match what was asked for"
+            );
+            return Some(Plan::Repair(repair));
+        }
+
         if !self.balance {
             return None;
         }
@@ -275,6 +296,25 @@ impl Pd {
                 let peer_id = self.next_peer_id(state)?;
                 (
                     Operator::AddPeer {
+                        region_id,
+                        epoch,
+                        store_id,
+                        peer_id,
+                    },
+                    LoadDelta::add_peer(store_id),
+                )
+            }
+            // The same fresh-peer-id rule as `AddPeer` above, for the same reason, and a load
+            // delta that counts it as a replica: a columnar copy costs the store it lands on the
+            // same disk and the same apply work as any other replica, whatever it does with them.
+            Plan::Repair(Repair::AddColumnarLearner {
+                region_id,
+                epoch,
+                store_id,
+            }) => {
+                let peer_id = self.next_peer_id(state)?;
+                (
+                    Operator::AddLearner {
                         region_id,
                         epoch,
                         store_id,

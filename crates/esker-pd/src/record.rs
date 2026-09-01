@@ -18,6 +18,7 @@
 //! this crate exist precisely to catch the day they diverge.
 
 use bytes::Bytes;
+use esker_proto::pd::ColumnarWish;
 use esker_proto::{Decoder, Encoder, Epoch, Peer, PeerRole, Region};
 
 use crate::error::{PdError, Result};
@@ -207,6 +208,86 @@ impl AllocRecord {
         close(WHAT, input)?;
         Ok(record)
     }
+}
+
+/// Every key range that wants columnar replicas, as the SQL layer last reported it.
+///
+/// [ADR 0022](../../docs/adr/0022-columnar-learner-replica.md) Decision 5. PD cannot read the
+/// catalog setting this comes from — it links neither `esker-sql` nor a client, and every method
+/// on its service is inbound — so a SQL node reports it and re-reports on every lease refresh.
+///
+/// **The whole list in one record**, because a report is a full assertion: replacing the set as a
+/// unit is what makes a report that arrives during a crash either wholly applied or not applied,
+/// with no half-state for a scheduler to act on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ColumnarRecord {
+    /// The ranges, in the order they were reported.
+    pub wishes: Vec<ColumnarWish>,
+}
+
+impl ColumnarRecord {
+    /// How many columnar replicas a region covering `[start, end)` should have.
+    ///
+    /// The **maximum** over every overlapping wish, not the first match and not a sum. A region
+    /// can overlap two tables' ranges after a merge, and a region that serves a table wanting two
+    /// copies must have two whatever else it also serves; taking the first would depend on report
+    /// order, and summing would multiply a region's replicas by how many tables it happens to
+    /// hold.
+    #[must_use]
+    pub fn wanted_for(&self, start: &[u8], end: &[u8]) -> u8 {
+        self.wishes
+            .iter()
+            .filter(|wish| overlaps(start, end, &wish.start_key, &wish.end_key))
+            .map(|wish| wish.replicas)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The record's bytes.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Encoder::new();
+        start(&mut out);
+        out.put_varint(self.wishes.len() as u64);
+        for wish in &self.wishes {
+            out.put_bytes(&wish.start_key);
+            out.put_bytes(&wish.end_key);
+            out.put_u8(wish.replicas);
+        }
+        out.finish()
+    }
+
+    /// Reads the record back.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        const WHAT: &str = "columnar";
+        let mut input = open(WHAT, bytes)?;
+        let count = input.get_count("columnar.len").map_err(field(WHAT))?;
+        let mut wishes = Vec::with_capacity(count.min(1024));
+        for _ in 0..count {
+            wishes.push(ColumnarWish {
+                start_key: Bytes::copy_from_slice(
+                    input.get_bytes("columnar.start_key").map_err(field(WHAT))?,
+                ),
+                end_key: Bytes::copy_from_slice(
+                    input.get_bytes("columnar.end_key").map_err(field(WHAT))?,
+                ),
+                replicas: input.get_u8("columnar.replicas").map_err(field(WHAT))?,
+            });
+        }
+        close(WHAT, input)?;
+        Ok(Self { wishes })
+    }
+}
+
+/// Whether `[a_start, a_end)` and `[b_start, b_end)` share a key.
+///
+/// An empty end key is `+infinity`, the same convention a region's end key uses — so the two
+/// ranges here are compared by the rule the rest of PD already reads ranges by, rather than by a
+/// second one that could disagree at the end of the key space.
+fn overlaps(a_start: &[u8], a_end: &[u8], b_start: &[u8], b_end: &[u8]) -> bool {
+    let a_before_b = !a_end.is_empty() && a_end <= b_start;
+    let b_before_a = !b_end.is_empty() && b_end <= a_start;
+    !a_before_b && !b_before_a
 }
 
 impl TsoRecord {
@@ -577,11 +658,19 @@ fn decode_region(what: &'static str, input: &mut Decoder<'_>) -> Result<Region> 
 #[cfg(test)]
 mod tests {
     use super::{
-        AllocRecord, ClusterRecord, RECORD_VERSION, RegionRecord, StoreRecord, StoreStats,
-        TsoRecord, decode_range_entry, encode_range_entry,
+        AllocRecord, ClusterRecord, ColumnarRecord, ColumnarWish, RECORD_VERSION, RegionRecord,
+        StoreRecord, StoreStats, TsoRecord, decode_range_entry, encode_range_entry,
     };
     use bytes::Bytes;
     use esker_proto::{Epoch, Peer, PeerRole, Region};
+
+    fn hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        bytes.iter().fold(String::new(), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+    }
 
     fn region() -> Region {
         Region {
@@ -625,6 +714,64 @@ mod tests {
             applied_index: 4242,
             last_heartbeat_ms: 1_700_000_020_000,
         }
+    }
+
+    /// The columnar record's bytes, pinned.
+    ///
+    /// PD cannot re-derive this from anything — no heartbeat carries it and PD has no way to read
+    /// the catalog it comes from — so a change to the layout that a restart could not read would
+    /// silently retire every columnar replica in the cluster. That makes it worth a golden and
+    /// not just a round trip.
+    #[test]
+    fn a_columnar_record_is_a_version_and_a_list_of_ranges() {
+        let record = ColumnarRecord {
+            wishes: vec![
+                ColumnarWish {
+                    start_key: Bytes::from_static(b"t\x01"),
+                    end_key: Bytes::from_static(b"t\x02"),
+                    replicas: 1,
+                },
+                // Unbounded above, so the golden pins an empty end key as `+infinity` and not as
+                // an empty range.
+                ColumnarWish {
+                    start_key: Bytes::from_static(b"t\x09"),
+                    end_key: Bytes::new(),
+                    replicas: 2,
+                },
+            ],
+        };
+        let encoded = record.encode();
+        assert_eq!(
+            hex(&encoded),
+            concat!(
+                "01",     // record version
+                "02",     // two wishes
+                "027401", // "t\x01"
+                "027402", // "t\x02"
+                "01",     // one replica
+                "027409", // "t\x09"
+                "00",     // empty end key -- to the end of the key space
+                "02",     // two replicas
+            )
+        );
+        assert_eq!(ColumnarRecord::decode(&encoded).unwrap(), record);
+
+        // The range arithmetic the scheduler reads it by. An empty end key is `+infinity`, the
+        // same convention a region's end key uses, so the two are compared by one rule.
+        assert_eq!(record.wanted_for(b"t\x01", b"t\x02"), 1);
+        assert_eq!(
+            record.wanted_for(b"t\x00", b"t\x01"),
+            0,
+            "adjacent, not overlapping"
+        );
+        assert_eq!(record.wanted_for(b"t\x09", b""), 2);
+        assert_eq!(record.wanted_for(b"z", b""), 2, "inside the unbounded wish");
+        // A region overlapping both takes the MAXIMUM, not the first and not the sum: a region
+        // serving a table that wants two copies must have two whatever else it also serves.
+        assert_eq!(record.wanted_for(b"t\x01", b""), 2);
+        // And an empty record wants nothing, which is what every cluster that has never been told
+        // about columnar replicas looks like.
+        assert_eq!(ColumnarRecord::default().wanted_for(b"a", b"z"), 0);
     }
 
     #[test]

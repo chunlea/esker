@@ -36,6 +36,24 @@ use crate::messages::Method;
 use crate::region::{Epoch, Region};
 use crate::{ProtoError, Request, Response, Transport};
 
+/// One key range that wants columnar replicas, and how many.
+///
+/// The unit of [`PdReq::ReportColumnar`]. A **range** rather than a table, because a range is
+/// what PD already reasons in and a table id would make PD a reader of SQL semantics
+/// (`CLAUDE.md` invariant 7). It is also split-safe by construction: a table that splits into
+/// four regions is still one range, and every region overlapping it inherits the wish without
+/// anybody re-reporting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnarWish {
+    /// Inclusive start of the range.
+    pub start_key: Bytes,
+    /// Exclusive end, or empty for "to the end of the key space".
+    pub end_key: Bytes,
+    /// How many columnar replicas the range wants. Never zero: a range that wants none is absent
+    /// from the report, which is how a cleared flag travels.
+    pub replicas: u8,
+}
+
 /// A store, and where to reach it.
 ///
 /// The address is here because a client addresses a store by **id** and "resolving one to a
@@ -353,6 +371,30 @@ pub enum PdReq {
     /// region and therefore has nothing else to say to PD. It carries no arguments: the answer is
     /// a cluster-wide number with one writer, exactly like the GC safepoint.
     SchemaLease,
+
+    /// **The whole** set of key ranges that want columnar replicas, as one SQL node sees them.
+    ///
+    /// [ADR 0022](../../docs/adr/0022-columnar-learner-replica.md) Decision 5. PD acts on the
+    /// per-table columnar setting, and **cannot read it**: the setting lives in the catalog, in
+    /// the cluster's own key space, and PD links neither `esker-sql` nor a client — every method
+    /// on this service is inbound, so PD is told things and asks for nothing. So the SQL node
+    /// that ran the `ALTER` reports, and re-reports whenever it refreshes its lease.
+    ///
+    /// **Key ranges, not table ids**, and that is what keeps `CLAUDE.md` invariant 7 intact: a
+    /// range is PD's own vocabulary — it is what a region *is* — so PD acts on this without ever
+    /// learning that a table exists. A table id would have made PD a reader of SQL semantics,
+    /// which is the line phase 6e drew when it took the schema-step drive away from PD.
+    ///
+    /// **A full assertion, never a delta.** Every SQL node reads the same catalog, so every
+    /// report has the same content and the last writer is right whoever it was; a delta would
+    /// need an order this service does not impose. It also makes the re-report on lease refresh
+    /// an anti-entropy sweep rather than a duplicate: a report lost to a restart is repaired by
+    /// the next one, and PD needs no acknowledgement protocol to notice.
+    ReportColumnar {
+        /// Every range that wants columnar replicas, with how many. A range that wants none is
+        /// simply absent, which is how a cleared flag arrives.
+        wishes: Vec<ColumnarWish>,
+    },
 }
 
 impl PdReq {
@@ -367,6 +409,7 @@ impl PdReq {
             Self::AllocId { .. } => Method::PdAllocId,
             Self::Tso { .. } => Method::PdTso,
             Self::SchemaLease => Method::PdSchemaLease,
+            Self::ReportColumnar { .. } => Method::PdReportColumnar,
         }
     }
 
@@ -406,6 +449,14 @@ impl PdReq {
             Self::Tso { count } => out.put_varint(u64::from(*count)),
             // No fields, so nothing to write. The method is the whole request.
             Self::SchemaLease => {}
+            Self::ReportColumnar { wishes } => {
+                out.put_varint(wishes.len() as u64);
+                for wish in wishes {
+                    out.put_bytes(&wish.start_key);
+                    out.put_bytes(&wish.end_key);
+                    out.put_u8(wish.replicas);
+                }
+            }
         }
     }
 
@@ -439,6 +490,18 @@ impl PdReq {
                 count: input.get_varint_u32("tso.count")?,
             },
             Method::PdSchemaLease => Self::SchemaLease,
+            Method::PdReportColumnar => {
+                let count = input.get_count("columnar.wishes")?;
+                let mut wishes = Vec::with_capacity(count.min(1024));
+                for _ in 0..count {
+                    wishes.push(ColumnarWish {
+                        start_key: Bytes::copy_from_slice(input.get_bytes("columnar.start_key")?),
+                        end_key: Bytes::copy_from_slice(input.get_bytes("columnar.end_key")?),
+                        replicas: input.get_u8("columnar.replicas")?,
+                    });
+                }
+                Self::ReportColumnar { wishes }
+            }
             other => {
                 return Err(DecodeError::invalid(
                     "method",
@@ -505,6 +568,10 @@ pub enum PdResp {
         count: u32,
     },
 
+    /// The report was recorded. It carries nothing: a full assertion has no partial outcome, and
+    /// the next report repairs anything this one lost.
+    ReportColumnar,
+
     /// The schema lease, and the step interval derived from it.
     SchemaLease {
         /// How long a node may serve **writes** from a cached schema before asking again.
@@ -541,6 +608,7 @@ impl PdResp {
             Self::AllocId { .. } => Method::PdAllocId,
             Self::Tso { .. } => Method::PdTso,
             Self::SchemaLease { .. } => Method::PdSchemaLease,
+            Self::ReportColumnar => Method::PdReportColumnar,
         }
     }
 
@@ -550,7 +618,7 @@ impl PdResp {
                 out.put_varint(*cluster_id);
                 encode_opt_region(region.as_ref(), out);
             }
-            Self::StoreHeartbeat => {}
+            Self::StoreHeartbeat | Self::ReportColumnar => {}
             Self::RegionHeartbeat { operator } => match operator {
                 Some(operator) => {
                     out.put_bool(true);
@@ -597,6 +665,7 @@ impl PdResp {
                 region: decode_opt_region(input)?,
             },
             Method::PdStoreHeartbeat => Self::StoreHeartbeat,
+            Method::PdReportColumnar => Self::ReportColumnar,
             Method::PdRegionHeartbeat => Self::RegionHeartbeat {
                 operator: input
                     .get_bool("operator.present")?

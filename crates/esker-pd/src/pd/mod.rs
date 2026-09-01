@@ -39,6 +39,7 @@ use esker_engine::{
     Db, FileSystem, LocalFileSystem, Options, ReadOptions, WalSyncMode, WriteBatch, WriteOptions,
     cf,
 };
+use esker_proto::pd::ColumnarWish;
 use esker_proto::{Operator, Region, StoreInfo};
 
 use crate::alloc::{ALLOC_BATCH, Allocator};
@@ -47,7 +48,8 @@ use crate::error::{PdError, Result};
 use crate::keys;
 use crate::operator::InFlight;
 use crate::record::{
-    AllocRecord, ClusterRecord, HistoryRecord, OperatorEvent, RegionRecord, StoreRecord, TsoRecord,
+    AllocRecord, ClusterRecord, ColumnarRecord, HistoryRecord, OperatorEvent, RegionRecord,
+    StoreRecord, TsoRecord,
 };
 use crate::routing::{self, RegionBeat, StoreBeat, Upsert};
 use crate::schedule::{self, LoadDelta};
@@ -308,6 +310,16 @@ pub(crate) struct State {
     /// Held here as well as on disk so that appending is a push rather than a read-modify-write
     /// of the whole ring, and so that [`Pd::history`] answers without touching the engine.
     pub(crate) history: HistoryRecord,
+    /// Which key ranges want columnar replicas, as the SQL layer last reported
+    /// ([ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) Decision 5).
+    ///
+    /// **Persisted**, unlike the in-flight set above, and the difference is where the fact lives.
+    /// An operator can be recomputed from the next heartbeat because the cluster itself is the
+    /// source of truth about its own membership. This cannot: PD has no way to read the catalog
+    /// it comes from — it links neither `esker-sql` nor a client, and every method it serves is
+    /// inbound — so a restart that forgot it would retire every columnar replica in the cluster
+    /// and wait for a SQL node to mention them again.
+    pub(crate) columnar: ColumnarRecord,
     /// When each region becomes eligible for a *balance* move again, by region id.
     ///
     /// Memory, like the in-flight set: a restart forgets it, and the worst that costs is one
@@ -366,6 +378,13 @@ impl Pd {
             .map(|bytes| HistoryRecord::decode(&bytes))
             .transpose()?
             .unwrap_or_default();
+        // Loaded rather than defaulted-and-waited-for: PD cannot re-derive this from any
+        // heartbeat, so a restart that forgot it would retire every columnar replica in the
+        // cluster until a SQL node happened to report again.
+        let columnar = read(&db, &keys::columnar_key())?
+            .map(|bytes| ColumnarRecord::decode(&bytes))
+            .transpose()?
+            .unwrap_or_default();
         // `max(clock, mark)`, the restart rule, is inside `Oracle::load`.
         let oracle = Oracle::load(mark, options.clock.now_ms(), options.tso_save_interval_ms);
 
@@ -389,6 +408,7 @@ impl Pd {
                 cooling: BTreeMap::new(),
                 settling: Vec::new(),
                 history,
+                columnar,
             }),
         }))
     }
@@ -535,6 +555,30 @@ impl Pd {
     /// The oracle's high-water mark, for the inspector and the tests.
     pub fn tso_high_water_ms(&self) -> Result<u64> {
         Ok(self.lock()?.oracle.high_water_ms())
+    }
+
+    /// Records which key ranges want columnar replicas, replacing whatever was there.
+    ///
+    /// **A full assertion, not a delta**, which is what makes it safe for every SQL node to send
+    /// and safe to resend. Each reads the same catalog, so each reports the same content and the
+    /// last writer is right whoever it was; a delta would need an ordering this service does not
+    /// impose. Durable before it answers, for the reason above: PD cannot re-derive it.
+    pub fn report_columnar(&self, wishes: Vec<ColumnarWish>) -> Result<()> {
+        let mut state = self.lock()?;
+        let record = ColumnarRecord { wishes };
+        let mut batch = WriteBatch::new();
+        batch.put(self.cf, &keys::columnar_key(), &record.encode());
+        self.db.write(batch, &WriteOptions::synced())?;
+        state.columnar = record;
+        Ok(())
+    }
+
+    /// What the SQL layer last said about columnar placement.
+    #[must_use]
+    pub fn columnar_wishes(&self) -> Vec<ColumnarWish> {
+        self.lock()
+            .map(|state| state.columnar.wishes.clone())
+            .unwrap_or_default()
     }
 
     /// The schema lease and the step arithmetic derived from it

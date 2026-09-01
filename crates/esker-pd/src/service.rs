@@ -160,6 +160,10 @@ fn serve(pd: &Pd, cluster_id: u64, request: &PdReq) -> Result<PdResp, ProtoError
             start_ts: pd.tso(*count)?,
             count: *count,
         },
+        PdReq::ReportColumnar { wishes } => {
+            pd.report_columnar(wishes.clone())?;
+            PdResp::ReportColumnar
+        }
         PdReq::SchemaLease => {
             let lease = pd.schema_lease();
             PdResp::SchemaLease {

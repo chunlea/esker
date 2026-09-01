@@ -150,3 +150,10 @@ result rows 01000201020201070000000000000002026f6b01ffffffffffffffff0047b5dd8e
 # groups: key column (Text); aggregates count and sum(Int8); groups ("a", 3, 10) and
 # ("b", 0, NULL) -- a sum over no rows is NULL, which is the same 0x00 an absent value is.
 result groups 0101010202000001010202016103010a00000000000000020162000049b60f5b
+
+# A SQL node telling PD which key ranges want columnar replicas (ADR 0022 Decision 5). Two
+# wishes: a bounded range, and one whose empty end key means "to the end of the key space".
+# Ranges rather than table ids, so PD acts on it without learning that a table exists.
+request pd-report-columnar 0803cdd70202027401027402010274090002
+# A full assertion has no partial outcome, so the answer carries nothing.
+response pd-report-columnar 0803

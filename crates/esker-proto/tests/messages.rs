@@ -13,7 +13,7 @@ use esker_proto::fragment::{
     Value, ValueType,
 };
 use esker_proto::messages::{DEFAULT_SCAN_LIMIT, Hello, HelloAck, RawKvReq, RawKvResp};
-use esker_proto::pd::{Operator, PdReq, PdResp, StoreInfo};
+use esker_proto::pd::{ColumnarWish, Operator, PdReq, PdResp, StoreInfo};
 use esker_proto::txn::{LockInfo, TxnKvReq, TxnKvResp, TxnMutation, TxnStatus};
 use esker_proto::{
     Epoch, MAX_FRAME_SIZE, Method, Peer, PeerRole, ProtoError, RaftBatch, RaftMessage, Region,
@@ -81,8 +81,34 @@ const PD_CLUSTER: u64 = 0xABCD;
 
 /// The `Pd` goldens, in their own function: `docs/DESIGN.md` §9 gives the service six methods,
 /// and a corpus function holding every message of every service is one nobody reads.
+/// The columnar report's two wishes: one bounded range and one running to the end of the key
+/// space, so the golden pins the empty end key as `+infinity` and not as an empty range.
+fn columnar_wishes() -> Vec<ColumnarWish> {
+    vec![
+        ColumnarWish {
+            start_key: Bytes::from_static(b"t\x01"),
+            end_key: Bytes::from_static(b"t\x02"),
+            replicas: 1,
+        },
+        ColumnarWish {
+            start_key: Bytes::from_static(b"t\x09"),
+            end_key: Bytes::new(),
+            replicas: 2,
+        },
+    ]
+}
+
 fn golden_pd_requests() -> Vec<(&'static str, Request)> {
     vec![
+        (
+            "pd-report-columnar",
+            Request::Pd {
+                cluster_id: PD_CLUSTER,
+                request: PdReq::ReportColumnar {
+                    wishes: columnar_wishes(),
+                },
+            },
+        ),
         (
             "pd-bootstrap",
             Request::Pd {
@@ -646,6 +672,7 @@ fn golden_pd_responses() -> Vec<(&'static str, Response)> {
                 count: 16,
             }),
         ),
+        ("pd-report-columnar", Response::Pd(PdResp::ReportColumnar)),
         (
             "pd-schema-lease",
             Response::Pd(PdResp::SchemaLease {

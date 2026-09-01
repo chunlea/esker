@@ -75,6 +75,9 @@ pub enum Method {
     /// `Pd::SchemaLease` — how long a node may act on a cached schema before it must ask again
     /// ([ADR 0028](../../docs/adr/0028-the-schema-lease.md)).
     PdSchemaLease = 0x0307,
+    /// `Pd::ReportColumnar` — a SQL node telling PD which key ranges want columnar replicas
+    /// ([ADR 0022](../../docs/adr/0022-columnar-learner-replica.md), [`crate::pd`]).
+    PdReportColumnar = 0x0308,
 
     /// `RaftTransport::Batch` — a tick's worth of Raft messages between two stores
     /// (`docs/DESIGN.md` §6, [ADR 0009](../../docs/adr/0009-the-wire-carries-the-raft-message.md)).
@@ -143,7 +146,7 @@ pub const SERVICE_ADMIN: u8 = 0x05;
 
 impl Method {
     /// Every method this version defines.
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 31] = [
         Self::Hello,
         Self::RawGet,
         Self::RawBatchGet,
@@ -160,6 +163,7 @@ impl Method {
         Self::PdAllocId,
         Self::PdTso,
         Self::PdSchemaLease,
+        Self::PdReportColumnar,
         Self::RaftBatch,
         Self::RaftSnapshot,
         Self::TxnGet,
@@ -202,6 +206,7 @@ impl Method {
             0x0305 => Some(Self::PdAllocId),
             0x0306 => Some(Self::PdTso),
             0x0307 => Some(Self::PdSchemaLease),
+            0x0308 => Some(Self::PdReportColumnar),
             0x0601 => Some(Self::FragmentEvaluate),
             0x0401 => Some(Self::RaftBatch),
             0x0402 => Some(Self::RaftSnapshot),
@@ -255,6 +260,7 @@ impl Method {
             Self::PdGetRegion => "Pd::GetRegion",
             Self::PdAllocId => "Pd::AllocId",
             Self::PdTso => "Pd::Tso",
+            Self::PdReportColumnar => "Pd::ReportColumnar",
             Self::FragmentEvaluate => "Fragment::Evaluate",
             Self::PdSchemaLease => "Pd::SchemaLease",
             Self::AdminSplit => "Admin::Split",
@@ -1475,7 +1481,8 @@ mod tests {
                 | Method::PdGetRegion
                 | Method::PdAllocId
                 | Method::PdTso
-                | Method::PdSchemaLease => crate::messages::SERVICE_PD,
+                | Method::PdSchemaLease
+                | Method::PdReportColumnar => crate::messages::SERVICE_PD,
                 Method::TxnGet
                 | Method::TxnScan
                 | Method::TxnPrewrite

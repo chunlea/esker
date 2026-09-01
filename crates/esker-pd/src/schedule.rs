@@ -159,6 +159,23 @@ pub enum Repair {
         /// Where the new replica goes.
         store_id: u64,
     },
+    /// Put a columnar learner of `region_id` on `store_id`.
+    ///
+    /// Separate from [`Repair::AddPeer`] because it becomes a different operator with a different
+    /// completion: `AddPeer` is done when the peer votes, and this is done when it exists
+    /// ([ADR 0022](../../docs/adr/0022-columnar-learner-replica.md) Decision 1).
+    ///
+    /// **Only ever issued because the flag asked.** A region is never short of columnar replicas
+    /// by default: the wanted count comes from what a SQL node reported, and zero — which is what
+    /// an unreported range means — can never produce one of these.
+    AddColumnarLearner {
+        /// The region to grow.
+        region_id: u64,
+        /// The epoch PD believes it is at.
+        epoch: Epoch,
+        /// Where the columnar copy goes.
+        store_id: u64,
+    },
     /// Drop `peer_id`, whose store is down.
     RemovePeer {
         /// The region to shrink.
@@ -175,7 +192,9 @@ impl Repair {
     #[must_use]
     pub fn region_id(&self) -> u64 {
         match self {
-            Self::AddPeer { region_id, .. } | Self::RemovePeer { region_id, .. } => *region_id,
+            Self::AddPeer { region_id, .. }
+            | Self::AddColumnarLearner { region_id, .. }
+            | Self::RemovePeer { region_id, .. } => *region_id,
         }
     }
 }
@@ -382,7 +401,15 @@ pub fn repair_for(region: &RegionRecord, cluster: &Cluster<'_>) -> Option<Repair
             .iter()
             .filter(|peer| !cluster.is_store_down(peer.store_id))
     };
-    let live_replicas = live().count();
+    // A columnar learner is **not** a replacement on its way. The rule below counts replicas
+    // rather than voters on purpose — a learner catching up is a voter arriving, and asking for a
+    // second would grow the region once per operator timeout — but that reasoning is about a
+    // learner that gets *promoted*, and a columnar one never is (ADR 0022 Decision 1). Counting
+    // it here would suppress the voter add a region genuinely needs, which is the same masking
+    // `urgency_for` had and the reason "never confused with voter repair" is a requirement.
+    let live_replicas = live()
+        .filter(|peer| peer.role != PeerRole::ColumnarLearner)
+        .count();
     let live_voters = live().filter(|peer| peer.role == PeerRole::Voter).count();
     let epoch = region.region.epoch;
     let region_id = region.region.id;
@@ -420,6 +447,56 @@ pub fn repair_for(region: &RegionRecord, cluster: &Cluster<'_>) -> Option<Repair
         epoch,
         peer_id,
     })
+}
+
+/// What a region's columnar placement needs, given how many copies the SQL layer asked for.
+///
+/// Separate from [`repair_for`] and run after it, and both facts matter. Separate, because a
+/// columnar replica is counted, added and removed in its own currency — mixing them is how a
+/// region ends up with a columnar copy standing in for a voter. After, because a region below its
+/// voter target is in trouble and a columnar copy is a convenience: the one operator slot a
+/// region gets belongs to the repair.
+///
+/// `wanted` is zero for every range nobody reported, so a cluster where nothing asked for
+/// columnar replicas never reaches the body of this function with anything to do.
+#[must_use]
+pub fn columnar_for(region: &RegionRecord, cluster: &Cluster<'_>, wanted: u8) -> Option<Repair> {
+    let epoch = region.region.epoch;
+    let region_id = region.region.id;
+    let columnar = || {
+        region
+            .region
+            .peers
+            .iter()
+            .filter(|peer| peer.role == PeerRole::ColumnarLearner)
+    };
+    let wanted = usize::from(wanted);
+    let live = columnar()
+        .filter(|peer| !cluster.is_store_down(peer.store_id))
+        .count();
+
+    if live < wanted {
+        return healthiest_store_without_a_peer(region, cluster).map(|store_id| {
+            Repair::AddColumnarLearner {
+                region_id,
+                epoch,
+                store_id,
+            }
+        });
+    }
+    // Over the asked-for number, or asked for none at all: give one back. A dead one first,
+    // because removing a live copy while a dead one lingers leaves the region no better off; the
+    // lowest peer id after that, so two PDs — or one across a restart — choose the same peer.
+    if columnar().count() > wanted {
+        return columnar()
+            .min_by_key(|peer| (!cluster.is_store_down(peer.store_id), peer.peer_id))
+            .map(|peer| Repair::RemovePeer {
+                region_id,
+                epoch,
+                peer_id: peer.peer_id,
+            });
+    }
+    None
 }
 
 /// Every repair the cluster wants, most urgent first, skipping the regions in `busy`.

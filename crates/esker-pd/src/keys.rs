@@ -56,6 +56,12 @@ pub const REGION: u8 = b'r';
 pub const STORE: u8 = b's';
 /// Second byte of the oracle's high-water mark.
 pub const TSO: u8 = b't';
+/// Second byte of the columnar-placement record's key.
+///
+/// `'l'` for the **learner** [ADR 0022](../../docs/adr/0022-columnar-learner-replica.md)
+/// Decision 1 calls a columnar replica — deliberately the same letter `esker-sql` uses for the
+/// catalog record this is reported from, so the two read as one thing in two places.
+pub const COLUMNAR: u8 = b'l';
 
 /// Range-index tag for a region with a bounded end key.
 pub const TAG_BOUNDED: u8 = 1;
@@ -83,6 +89,15 @@ pub fn alloc_key() -> [u8; 2] {
 #[must_use]
 pub fn history_key() -> [u8; 2] {
     [PREFIX, HISTORY]
+}
+
+/// `'m' 'l'` — the whole columnar wish list, in one record.
+///
+/// One record rather than one per range, because a report is a **full assertion**: the set is
+/// replaced as a unit, so storing it as a unit means a report can never be half-applied.
+#[must_use]
+pub fn columnar_key() -> [u8; 2] {
+    [PREFIX, COLUMNAR]
 }
 
 /// `'m' 't'` — the oracle's high-water mark.
