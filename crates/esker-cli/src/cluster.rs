@@ -1,8 +1,10 @@
 //! `esker cluster start` / `esker cluster stop` — three stores on localhost, one region.
 //!
-//! This is a development and testing command, not an operator tool. There is no placement driver
-//! yet (phase 4), so the membership is fixed at start and every store is told the whole peer list
-//! on its command line.
+//! This is a development and testing command, not an operator tool. Without `--pd` the membership
+//! is fixed at start and every store is told the whole peer list on its command line; with it,
+//! this also starts a placement driver, points every store at it, and prints the address a SQL
+//! node should be given — which is what makes the phase-8 story runnable in one command
+//! (`docs/bench/columnar-learner.md`).
 //!
 //! # Why child processes
 //!
@@ -48,6 +50,13 @@ pub(crate) enum ClusterOptions {
         sst_store: Option<String>,
         /// Memtable bytes before a flush, for every node. `None` is the engine's default.
         write_buffer_size: Option<usize>,
+        /// Also start a placement driver, and point every node at it.
+        ///
+        /// A switch rather than an address: it listens on the port **above** the nodes', so it
+        /// cannot collide with one, and `start` prints where it is. A cluster this command starts
+        /// is one it also has to be able to stop, and an address it was handed might belong to
+        /// somebody else's driver.
+        pd: bool,
     },
     /// Stop a cluster `start` launched.
     Stop {
@@ -74,6 +83,7 @@ pub(crate) fn run(options: &ClusterOptions) -> Result<(), String> {
             seed,
             sst_store,
             write_buffer_size,
+            pd,
         } => start(
             *nodes,
             data_dir,
@@ -81,6 +91,7 @@ pub(crate) fn run(options: &ClusterOptions) -> Result<(), String> {
             *seed,
             sst_store.as_deref(),
             *write_buffer_size,
+            *pd,
         ),
         ClusterOptions::Stop { data_dir } => stop(data_dir),
     }
@@ -96,6 +107,61 @@ fn dir_of(data_dir: &Path, id: u64) -> PathBuf {
     data_dir.join(format!("node-{id}"))
 }
 
+/// What `start` prints once everything is up.
+///
+/// The SQL node's command line is printed rather than left to be worked out: it needs both the
+/// store addresses and the driver's, and the whole point of `--pd` is that this is the command
+/// that follows.
+fn announce(nodes: u64, base_port: u16, launched: &[Node], pd: Option<&str>) {
+    println!("esker cluster: {nodes} nodes started");
+    for node in launched {
+        match node.id {
+            0 => println!("  placement driver on {} (pid {})", node.address, node.pid),
+            id => println!("  node {id} on {} (pid {})", node.address, node.pid),
+        }
+    }
+    if let Some(address) = pd {
+        let stores: Vec<String> = (1..=nodes).map(|id| address_of(base_port, id)).collect();
+        println!(
+            "esker cluster: a SQL node over this cluster is\n  \
+             esker-sql 127.0.0.1:5432 {} --pd {address}",
+            stores.join(" ")
+        );
+    }
+}
+
+/// Starts the placement driver, and describes it the way the state file records a node.
+///
+/// Id **zero**, which is not a store id anywhere in this codebase and is therefore an honest way
+/// to say "this line is not a store" in a format that has one shape. `stop` kills it like any
+/// other line.
+fn start_pd(binary: &Path, data_dir: &Path, address: &str) -> Result<(Node, Child), String> {
+    let mut process = Process::new(binary);
+    process
+        .arg("pd")
+        .arg("serve")
+        .arg("--data-dir")
+        .arg(data_dir.join("pd"))
+        .arg("--listen")
+        .arg(address);
+    let child = process
+        .spawn()
+        .map_err(|error| format!("starting the placement driver: {error}"))?;
+    Ok((
+        Node {
+            id: 0,
+            address: address.to_owned(),
+            pid: child.id(),
+        },
+        child,
+    ))
+}
+
+/// Where the placement driver listens when `--pd` is given: one above the last node.
+fn pd_address_of(base_port: u16, nodes: u64) -> String {
+    format!("127.0.0.1:{}", u64::from(base_port) + nodes)
+}
+
 fn start(
     nodes: u64,
     data_dir: &Path,
@@ -103,6 +169,7 @@ fn start(
     seed: u64,
     sst_store: Option<&str>,
     write_buffer_size: Option<usize>,
+    with_pd: bool,
 ) -> Result<(), String> {
     if nodes == 0 {
         return Err("`--nodes` must be at least 1".to_owned());
@@ -129,6 +196,17 @@ fn start(
 
     let mut children: Vec<(u64, Child)> = Vec::new();
     let mut launched: Vec<Node> = Vec::new();
+
+    // The driver first, because every store below is about to ask it whether to bootstrap. A
+    // store whose PD is not up yet fails to open, which is the behaviour that makes a cluster's
+    // start order matter here and nowhere else.
+    let pd = with_pd.then(|| pd_address_of(base_port, nodes));
+    if let Some(address) = &pd {
+        let (node, child) = start_pd(&binary, data_dir, address)?;
+        launched.push(node);
+        children.push((0, child));
+    }
+
     for id in 1..=nodes {
         let dir = dir_of(data_dir, id);
         std::fs::create_dir_all(&dir)
@@ -152,6 +230,9 @@ fn start(
         }
         if let Some(size) = write_buffer_size {
             process.arg("--write-buffer-size").arg(size.to_string());
+        }
+        if let Some(address) = &pd {
+            process.arg("--pd").arg(address);
         }
         for peer in &peers {
             process.arg("--peer").arg(peer);
@@ -178,10 +259,7 @@ fn start(
     }
 
     write_state(data_dir, &launched)?;
-    println!("esker cluster: {nodes} nodes started");
-    for node in &launched {
-        println!("  node {} on {} (pid {})", node.id, node.address, node.pid);
-    }
+    announce(nodes, base_port, &launched, pd.as_deref());
     println!(
         "esker cluster: ctrl-C to stop, or `esker cluster stop --data-dir {}`",
         data_dir.display()
@@ -192,9 +270,14 @@ fn start(
     println!("esker cluster: stopping");
     for (id, child) in &mut children {
         signal(child.id(), "TERM");
+        let what = if *id == 0 {
+            "the placement driver".to_owned()
+        } else {
+            format!("node {id}")
+        };
         match child.wait() {
-            Ok(status) => println!("  node {id} exited with {status}"),
-            Err(error) => eprintln!("  node {id}: {error}"),
+            Ok(status) => println!("  {what} exited with {status}"),
+            Err(error) => eprintln!("  {what}: {error}"),
         }
     }
     let _ = std::fs::remove_file(data_dir.join(STATE_FILE));
@@ -210,10 +293,13 @@ fn stop(data_dir: &Path) -> Result<(), String> {
         ));
     }
     for node in &nodes {
-        println!(
-            "esker cluster: stopping node {} (pid {})",
-            node.id, node.pid
-        );
+        match node.id {
+            0 => println!(
+                "esker cluster: stopping the placement driver (pid {})",
+                node.pid
+            ),
+            id => println!("esker cluster: stopping node {id} (pid {})", node.pid),
+        }
         signal(node.pid, "TERM");
     }
     std::fs::remove_file(data_dir.join(STATE_FILE))

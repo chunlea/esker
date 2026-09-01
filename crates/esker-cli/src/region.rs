@@ -229,10 +229,15 @@ fn list(pd: &PdConn, hex: bool) -> Result<(), String> {
                 } else {
                     ""
                 };
-                let role = if peer.role == esker_proto::PeerRole::Learner {
-                    "L"
-                } else {
-                    ""
+                // `C` and `L` are different facts, not two spellings of one. A learner is on its
+                // way to being a voter; a **columnar** learner never is (ADR 0022 Decision 1), so
+                // an operator counting voters must not read one as the other — which is exactly
+                // the mistake that made two of PD's own schedulers report a healthy cluster that
+                // was not (`docs/plans/phase-8-learner.md` §wire).
+                let role = match peer.role {
+                    esker_proto::PeerRole::Learner => "L",
+                    esker_proto::PeerRole::ColumnarLearner => "C",
+                    esker_proto::PeerRole::Voter => "",
                 };
                 let address = stores
                     .iter()
@@ -255,7 +260,10 @@ fn list(pd: &PdConn, hex: bool) -> Result<(), String> {
             peers.join(" ")
         );
     }
-    println!("\n{} regions; * is the leader, L a learner", regions.len());
+    println!(
+        "\n{} regions; * is the leader, L a learner, C a columnar learner",
+        regions.len()
+    );
     Ok(())
 }
 

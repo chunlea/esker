@@ -159,7 +159,9 @@ Commands:
   cluster start|stop    Start or stop a local cluster replicating one region
                         (--nodes, --data-dir, --base-port, --seed, --sst-store,
                         --write-buffer-size; each node gets its own prefix under
-                        the one given)
+                        the one given). --pd also starts a placement driver on
+                        the port above the nodes and points every node at it,
+                        which is what a SQL node needs to be given with --pd
   pd serve|inspect      Run the placement driver, or print what it has stored
   region <verb> ...     Look at, split, or hand over a region
 
@@ -810,6 +812,7 @@ fn parse_cluster(arguments: &[String]) -> Result<Command, ParseError> {
     let mut seed = 0_u64;
     let mut sst_store: Option<String> = None;
     let mut write_buffer_size: Option<usize> = None;
+    let mut pd = false;
     let mut index = 0;
 
     while index < rest.len() {
@@ -861,6 +864,10 @@ fn parse_cluster(arguments: &[String]) -> Result<Command, ParseError> {
                     },
                 )?);
             }
+            // A switch, not an address: the port is derived from `--base-port` so that it
+            // cannot collide with the nodes', and it is printed. A cluster this command starts is
+            // one it also has to be able to stop.
+            "--pd" => pd = true,
             other if other.starts_with('-') => {
                 return Err(ParseError::UnknownFlag(other.to_owned()));
             }
@@ -876,6 +883,7 @@ fn parse_cluster(arguments: &[String]) -> Result<Command, ParseError> {
             seed,
             sst_store,
             write_buffer_size,
+            pd,
         })),
         "stop" => Ok(Command::Cluster(ClusterOptions::Stop { data_dir })),
         other => Err(ParseError::UnknownCommand(format!("cluster {other}"))),
@@ -1495,6 +1503,23 @@ mod tests {
         assert!(options.extra_addrs.is_empty());
     }
 
+    /// `--pd` is what turns a cluster of stores that bootstrap their own region into one with a
+    /// placement driver — and therefore into one a SQL node can hold a schema lease against.
+    #[test]
+    fn cluster_start_takes_a_placement_driver() {
+        let Command::Cluster(ClusterOptions::Start { pd, base_port, .. }) =
+            parse_ok(&["cluster", "start", "--pd"])
+        else {
+            panic!("expected a cluster start");
+        };
+        assert!(pd);
+        assert_eq!(
+            base_port,
+            crate::cluster::DEFAULT_BASE_PORT,
+            "the driver's own port is derived, so this one does not move",
+        );
+    }
+
     #[test]
     fn cluster_start_and_stop_parse() {
         let Command::Cluster(ClusterOptions::Start {
@@ -1504,6 +1529,7 @@ mod tests {
             seed,
             sst_store,
             write_buffer_size,
+            pd,
         }) = parse_ok(&[
             "cluster",
             "start",
@@ -1525,6 +1551,7 @@ mod tests {
             write_buffer_size, None,
             "and keeps the engine's memtable size"
         );
+        assert!(!pd, "a cluster starts no placement driver unless asked");
 
         let Command::Cluster(ClusterOptions::Stop { data_dir }) =
             parse_ok(&["cluster", "stop", "--data-dir", "/tmp/c"])
