@@ -1,0 +1,18 @@
+crates/esker-sql/tests/joint_gate.rs
+  h_44076b318daf9c 128-170,185-193,212-217,261-262,268-269,600-673
+docs/bench/columnar-learner.md
+  h_44076b318daf9c 106-249
+docs/plans/phase-8-learner.md
+  h_44076b318daf9c 609-696
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "1c66c08ab37f220a319808f25749a30bdfebae08",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
