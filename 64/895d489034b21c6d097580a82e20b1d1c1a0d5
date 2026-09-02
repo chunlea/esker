@@ -1,0 +1,31 @@
+crates/esker-sql/src/exec/subquery.rs
+  s_8213a31ba756d1::t_dbca3953201bbb 84,119,136,142-148
+crates/esker-sql/tests/activerecord_subquery.rs
+  s_8213a31ba756d1::t_c7819656863dd9 1-183
+crates/esker-sql/tests/activerecord_surface.rs
+  s_8213a31ba756d1::t_8761abbc0ee5c9 91-97
+crates/esker-sql/tests/corpus/pg19_subquery_activerecord.txt
+  s_8213a31ba756d1::t_0fe62f6866741c 1-38
+crates/esker-sql/tests/slt/subquery.slt
+  s_8213a31ba756d1::t_8e25a9b021b96a 1-134
+crates/esker-sql/tests/slt_harness/mod.rs
+  s_8213a31ba756d1::t_84a3514cb4508f 111
+docs/plans/phase-12-subquery.md
+  s_8213a31ba756d1::t_1dd6af998f5dfb 207,222-231
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "64895d489034b21c6d097580a82e20b1d1c1a0d5",
+  "prompts": {},
+  "sessions": {
+    "s_8213a31ba756d1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6f90895c-f344-4eae-bdcb-fc8ddda55532",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
