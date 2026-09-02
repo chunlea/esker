@@ -56,6 +56,21 @@ const MAX_ZONE_SECONDS: i64 = 16 * 3600;
 
 /// What PostgreSQL's `timestamptz_out` writes, for a server whose `TimeZone` is UTC.
 pub(super) fn to_text(micros: i64) -> String {
+    with_zone(micros, true)
+}
+
+/// What PostgreSQL's `timestamp_out` writes: the same instant with **no offset**.
+///
+/// That absence is the whole visible difference between the two types, and it is not cosmetic — a
+/// `timestamp` does no conversion at all, so the value that went in is the value that comes out
+/// whatever the session's `TimeZone` is, where a `timestamptz` is an instant rendered in a zone.
+/// This node only ever means UTC (`src/parameter.rs`), so the two agree here on every value and
+/// disagree on one string.
+pub(super) fn to_text_without_zone(micros: i64) -> String {
+    with_zone(micros, false)
+}
+
+fn with_zone(micros: i64, zone: bool) -> String {
     match micros {
         POS_INFINITY => return "infinity".to_owned(),
         NEG_INFINITY => return "-infinity".to_owned(),
@@ -84,9 +99,31 @@ pub(super) fn to_text(micros: i64) -> String {
         out.push('.');
         out.push_str(format!("{fraction:06}").trim_end_matches('0'));
     }
-    out.push_str("+00");
+    if zone {
+        out.push_str("+00");
+    }
     out.push_str(era);
     out
+}
+
+/// Reads the ISO subset for `timestamp` **without** time zone.
+///
+/// The same lexer, and the same instant for every input this node accepts — a zone displacement is
+/// what a `timestamp` has no room for, and this node's only zone is UTC, so the two functions
+/// differ in exactly one thing: **the name in the error**. Measured: a real server says
+/// `invalid input syntax for type timestamp: "not a date"`, naming the short form, where the
+/// zoned one names `timestamp with time zone`. Two messages about two types, and neither is the
+/// other's.
+pub(super) fn from_text_without_zone(text: &str) -> Result<i64> {
+    from_text(text).map_err(|error| match error {
+        SqlError::InvalidDatetimeFormat { value, .. } => SqlError::InvalidDatetimeFormat {
+            // `timestamp`, not `timestamp without time zone`: the input function's own name and
+            // not the type's long one.
+            ty: "timestamp",
+            value,
+        },
+        other => other,
+    })
 }
 
 /// Reads the ISO subset, or says which construct it did not read.
@@ -301,7 +338,25 @@ impl<'a> Scan<'a> {
         for index in 0..6 {
             micros = micros * 10 + i64::from(digits.get(index).map_or(0, |digit| digit - b'0'));
         }
-        if digits.get(6).is_some_and(|&digit| digit >= b'5') {
+        // The seventh digit and everything after it decide, and the rule is **not** "five rounds
+        // up": PostgreSQL reads the fraction as a double and applies `rint`, which rounds a tie to
+        // **even**. Measured on 19beta1, four halves rounded two different ways —
+        //
+        //     .1234565 -> .123456      .1234575 -> .123458
+        //     .1234555 -> .123456      .1234545 -> .123454
+        //
+        // — each landing on the even neighbour. And a tie is only a tie when nothing follows it:
+        // `.12345650001` is above the half and rounds up whatever the parity. `timestamptz` goes
+        // through this same function and had the same bug, which is why the fix is here rather
+        // than in the type that found it.
+        let rest = digits.get(6..).unwrap_or_default();
+        let round_up = match rest {
+            [] | [b'0'..=b'4', ..] => false,
+            // Exactly half: the digit is a 5 and nothing but zeros follows it.
+            [b'5', tail @ ..] if tail.iter().all(|&digit| digit == b'0') => micros % 2 == 1,
+            _ => true,
+        };
+        if round_up {
             micros += 1;
         }
         Ok(micros)

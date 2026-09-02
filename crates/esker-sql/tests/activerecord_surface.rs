@@ -64,13 +64,19 @@ const FIXTURE: &[&str] =
 /// It was guessed at ten before the first run, which is the reason for measuring: the guess was
 /// wrong by more than a factor of three in the flattering direction.
 ///
-/// **Fifteen now, and `pg_type` + `pg_range` are all four of the difference** — statements 4, 7, 8
-/// and 9, which are the first thing `ActiveRecord` asks a server and what rung 2 of the ladder
-/// stopped on. Unlike the alias and `IN`, this one is +4 rather than +0: the two units before it
-/// moved those four statements *onto* the catalog, and this is the catalog. That is what the three
-/// numbers together are for — this counter says what is answered, the scoreboard's per-statement
-/// table says what is in the way, and the ladder says whether a client can get through.
-const RUNS: usize = 15;
+/// **Fifteen after `pg_type` + `pg_range`** — statements 4, 7, 8 and 9, the first thing
+/// `ActiveRecord` asks a server and what rung 2 of the ladder stopped on. Unlike the alias and
+/// `IN`, that one was +4 rather than +0: the two units before it moved those four statements *onto*
+/// the catalog, and it was the catalog.
+///
+/// **Eighteen now, and the three are the type surface** — statement 13, the `CREATE TABLE` a
+/// migration emits, and 14 and 20 which failed only because 13 had. `character varying` and
+/// `timestamp` are what it names ([ADR
+/// 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md) tier 1, with the `integer` that
+/// landed before them). That is what the three numbers together are for — this counter says what
+/// is answered, the scoreboard's per-statement table says what is in the way, and the ladder says
+/// whether a client can get through.
+const RUNS: usize = 18;
 
 #[test]
 fn every_statement_activerecord_sends_parses_and_is_answered_by_name() {

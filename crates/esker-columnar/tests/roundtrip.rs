@@ -89,6 +89,9 @@ fn value_of(ty: ColumnType) -> impl Strategy<Value = Value> {
     let present = match ty {
         ColumnType::Int8 => any::<i64>().prop_map(Value::Int8).boxed(),
         ColumnType::Int4 => any::<i32>().prop_map(Value::Int4).boxed(),
+        ColumnType::Timestamp => (-5_000i64..5_000)
+            .prop_map(|d| Value::Timestamp(757_382_400_000_000 + d * 1_000))
+            .boxed(),
         ColumnType::TimestampTz => (-5_000i64..5_000)
             .prop_map(|d| Value::TimestampTz(757_382_400_000_000 + d * 1_000))
             .boxed(),
@@ -99,7 +102,7 @@ fn value_of(ty: ColumnType) -> impl Strategy<Value = Value> {
             any::<f64>().prop_map(Value::Double),
         ]
         .boxed(),
-        ColumnType::Text => (0usize..5)
+        ColumnType::Text | ColumnType::Varchar => (0usize..5)
             .prop_map(|pick| Value::Text(["", "a", "beta", "gamma", "\u{1f600}"][pick].to_owned()))
             .boxed(),
         ColumnType::Bytea => prop::collection::vec(any::<u8>(), 0..8)

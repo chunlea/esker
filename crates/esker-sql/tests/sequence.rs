@@ -20,14 +20,14 @@ mod parity;
 const FIXTURE: &[&str] = &[];
 
 const DIVERGENCES: &[(&str, &str)] = &[
-    (
-        "CREATE TABLE z4 (id serial PRIMARY KEY)",
-        "serial is int4 under another name and this crate has no int4; an int8 would accept every \
-         value between 2^31 and 2^63 that a real server answers 22003 for",
-    ),
+    // `serial` was here and is gone: ADR 0033 gave this node an `int4`, which was the whole of
+    // the argument for refusing it. The entry's removal is the record that the gap closed --
+    // the harness fails a divergence that has started agreeing, so this could not have been
+    // absorbed silently.
     (
         "CREATE TABLE z5 (id smallserial PRIMARY KEY)",
-        "smallserial is int2, and the same argument",
+        "smallserial is int2, which is the next type in tier 1's order (ADR 0033); the same \
+         argument that has just been withdrawn for serial, and withdrawn here when int2 lands",
     ),
     (
         concat!(
@@ -56,27 +56,37 @@ fn every_sequence_statement_answers_the_way_postgresql_19_does() {
     );
 }
 
-/// The two serial spellings this node will not take are refused by **name**, and by the same
-/// sentence the type they stand for already gets. A user who wrote `serial` and a user who wrote
-/// `int4` have made the same mistake and should be told the same thing.
+/// A serial spelling is its integer plus a sequence, and it is refused only while that integer is
+/// missing — by **name**, and by the same sentence the type itself gets.
+///
+/// [ADR 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md) withdrew the refusal of
+/// `serial` when `int4` arrived: that refusal had one argument — answering it with an `int8` would
+/// accept values a real server refuses — and `int4` emptied it. `smallserial` is `int2` and waits
+/// for the same reason, which is why this test still has something to assert. A user who wrote
+/// `smallserial` and a user who wrote `int2` have made the same mistake and are told the same
+/// thing.
 #[test]
-fn serial_is_refused_the_way_its_type_is() {
+fn a_serial_is_refused_only_while_its_integer_is_missing() {
     let mut node = parity::Node::new(&[]);
-    for sql in [
-        "CREATE TABLE s (id serial PRIMARY KEY)",
-        "CREATE TABLE s (id smallserial PRIMARY KEY)",
-    ] {
-        let error = node.run(sql).unwrap_err();
-        assert_eq!(
-            error.sqlstate(),
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "{sql} -> {error}"
-        );
-        assert!(
-            error.to_string().to_ascii_lowercase().contains("serial"),
-            "{sql} -> `{error}`, which does not name what was written"
-        );
-    }
+
+    // `serial` runs: an `integer` column that fills itself. `tests/int4.rs` asserts what it
+    // builds; here it is enough that it is no longer an error.
+    node.run("CREATE TABLE s4 (id serial PRIMARY KEY)").unwrap();
+    node.run("CREATE TABLE s8 (id bigserial PRIMARY KEY)")
+        .unwrap();
+
+    // `smallserial` is `int2`, which is the next type in tier 1's order.
+    let sql = "CREATE TABLE s2 (id smallserial PRIMARY KEY)";
+    let error = node.run(sql).unwrap_err();
+    assert_eq!(
+        error.sqlstate(),
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "{sql} -> {error}"
+    );
+    assert!(
+        error.to_string().to_ascii_lowercase().contains("serial"),
+        "{sql} -> `{error}`, which does not name what was written"
+    );
 }
 
 /// A sequence is dropped with the table that owns it, and its **name** goes with it — so the name

@@ -802,6 +802,76 @@ Every tier-2 type will need the same fourth edit.
 row without `pg_catalog` being touched, because `CatalogView::rows` derives from `ColumnType::ALL`
 — and `ActiveRecord`'s first query now answers five of its ten names where it answered four.
 
+#### Tier 1, type 2: `character varying`, with no length yet
+
+What `t.string` emits, and the second thing rung 2's migration names. `tests/corpus/pg19_varchar.txt`
+is 20 statements, and it is the strongest case in tier 1 for "not a format change": a `varchar`
+column's rows are **byte-identical** to a `text` column's, and `Datum` has no variant for it,
+because there would be nothing in one that a `Datum::Text` does not already hold. `text`, `varchar`
+and `bpchar` are one varlena told apart by OID — PostgreSQL's own model rather than a shortcut, and
+the reason `Datum::fits` now answers for a pair of types rather than one.
+
+What the capture settled:
+
+* **trailing spaces are significant**, unlike `character(n)`: `b = 'zz'` finds nothing where
+  `b = 'zz  '` finds the row. That is the whole difference from `bpchar` and the reason the two are
+  separate types rather than one with a flag.
+* **`min()` and `max()` decay to `text`.** There is one `min` for the string family and it is
+  `text`'s, so the declared type changes even though the value does not. Ours said
+  `character varying` and now says `text`.
+* `varchar = text` across two columns is `t`, and `varchar = 1` is
+  `42883 operator does not exist: character varying = integer`, which this node already answered
+  correctly because the rule is `comparable_with`'s and not the type's.
+
+**No length.** `varchar(n)` is a *typmod* — a column property, where PostgreSQL keeps it
+(`pg_attribute.atttypmod`) — and this node has nowhere to keep one yet, so it is `0A000` naming
+itself. Ignoring the length is the tempting shortcut and it is a **wrong answer**: a `varchar(5)`
+that stored six characters would answer a later `SELECT` with a row a real server never had, where
+that server raises `22001`. The typmod is one mechanism serving three types — `varchar(n)`,
+`character(n)` and `timestamp(p)` — so it is its own unit and they arrive together.
+
+**A capture trap, recorded because it cost a re-run**: `sesscap.py` skips blank lines, so a
+single-column row whose only value is the **empty string** vanishes from a capture. Every query in
+this corpus that can return one selects `id` beside it.
+
+#### Tier 1, type 3: `timestamp` without time zone, and the rounding bug it found
+
+The third thing rung 2's migration names: `t.timestamps` compiles to `timestamp(6)`.
+`tests/corpus/pg19_timestamp.txt` is 23 statements.
+
+**`timestamp` and `timestamp(6)` are the same type**, which is what lets this unit take the
+precision `ActiveRecord` writes without a typmod to keep it in: six is PostgreSQL's default *and*
+its maximum, so the two hold identical values — `a = b` is true for every row of the corpus — and
+print identically. `timestamp(0)` through `timestamp(5)` really do round, and they are `0A000`
+naming themselves until the typmod unit; accepting one and storing microseconds would answer a
+later `SELECT` with digits a real server discarded.
+
+What makes it a type rather than an alias for `timestamptz` is the **text**: no zone suffix, and no
+conversion — what goes in is what comes out, whatever the session's `TimeZone` is. Eight bytes
+either way, so nothing on disk changes.
+
+**And the corpus found a bug older than the type.** A seventh fractional digit rounds, and this
+crate rounded it **half up** where PostgreSQL rounds a tie to **even** — its parser reads the
+fraction as a double and applies `rint`. One example cannot tell the two rules apart; four can, and
+the capture has them:
+
+```
+.1234565 -> .123456      .1234575 -> .123458
+.1234555 -> .123456      .1234545 -> .123454
+```
+
+each landing on its *even* neighbour, in two different directions. A tie is only a tie when nothing
+follows it — `.12345650001` is above the half and rounds up whatever the parity. **`timestamptz`
+went through the same function and was wrong the same way**, so the fix is in the shared parser and
+`tests/timestamp.rs` pins both. It is a wrong answer rather than a gap, and it was found by writing
+the capture down rather than by a failure.
+
+Two messages about one type, also measured: the input error names **`timestamp`**
+(`invalid input syntax for type timestamp: "not a date"`) and the comparison error names the long
+form (`operator does not exist: timestamp without time zone = integer`). An implementation that
+routed both through `ColumnType::name()` would say the long form for the input error, which a real
+server never does.
+
 ## 3. The test ladder
 
 Each rung is a thing that either works or does not, and none of them is reached by asserting

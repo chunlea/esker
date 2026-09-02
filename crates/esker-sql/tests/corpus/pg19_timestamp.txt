@@ -1,0 +1,52 @@
+# `timestamp` without time zone, as a real PostgreSQL 19beta1 answers it — tier 1's third type
+# ([ADR 0033](../../../../docs/adr/0033-tier-1-of-the-type-surface.md)), and the third thing rung
+# 2's migration names: `t.timestamps` compiles to `timestamp(6)`.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way against one node.
+# It builds its own table.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# **`timestamp` AND `timestamp(6)` ARE THE SAME TYPE**, which is why this unit can take the
+# precision `ActiveRecord` writes without a typmod to keep it in. Six is PostgreSQL's default *and*
+# its maximum, so columns `a` and `b` below hold identical values — `a = b` is true for every row —
+# and print identically. What differs is one string: `\gdesc` says `timestamp(6) without time zone`
+# for the declared one and `timestamp without time zone` for the bare one. A `timestamp(0)` through
+# `timestamp(5)` really does round, and those are refused by name until the typmod unit.
+#
+# WHAT MAKES IT A TYPE AND NOT AN ALIAS FOR `timestamptz`: the text. It prints with **no zone
+# suffix** where a `timestamptz` prints `+00`, and it does no conversion — the value that goes in
+# is the value that comes out, whatever the session's `TimeZone` is.
+#
+# THREE THINGS TO READ CAREFULLY:
+#
+#   * the input error names **`timestamp`**, not `timestamp without time zone`:
+#     `22007 invalid input syntax for type timestamp: "not a date"`. The *comparison* error names
+#     the long form. Two messages about one type, and neither is the other's.
+#   * a seventh fractional digit **rounds**: `.1234565` is stored as `.123456`.
+#   * `infinity` and `-infinity` are values, and they print as those words.
+CREATE TABLE ts (id int8 PRIMARY KEY, a timestamp, b timestamp(6), c timestamptz)		-
+INSERT INTO ts VALUES (1, '2020-01-01 12:00:00', '2020-01-01 12:00:00', '2020-01-01 12:00:00+00')		-
+INSERT INTO ts VALUES (2, '2020-06-15 08:30:15.123456', '2020-06-15 08:30:15.123456', '2020-06-15 08:30:15.123456+00')		-
+INSERT INTO ts VALUES (3, '1999-12-31 23:59:59.999999', '1999-12-31 23:59:59.999999', '1999-12-31 23:59:59.999999+00')		-
+SELECT id, a, b, c FROM ts ORDER BY id	bigint,timestamp without time zone,timestamp(6) without time zone,timestamp with time zone	1|2020-01-01 12:00:00|2020-01-01 12:00:00|2020-01-01 12:00:00+00 ; 2|2020-06-15 08:30:15.123456|2020-06-15 08:30:15.123456|2020-06-15 08:30:15.123456+00 ; 3|1999-12-31 23:59:59.999999|1999-12-31 23:59:59.999999|1999-12-31 23:59:59.999999+00
+SELECT id FROM ts WHERE a = b ORDER BY id	bigint	1 ; 2 ; 3
+SELECT id FROM ts WHERE a = '2020-01-01 12:00:00'	bigint	1
+SELECT id FROM ts WHERE a > '2020-01-01' ORDER BY id	bigint	1 ; 2
+SELECT id, a FROM ts ORDER BY a	bigint,timestamp without time zone	3|1999-12-31 23:59:59.999999 ; 1|2020-01-01 12:00:00 ; 2|2020-06-15 08:30:15.123456
+SELECT count(*), min(a), max(a) FROM ts	bigint,timestamp without time zone,timestamp without time zone	3|1999-12-31 23:59:59.999999|2020-06-15 08:30:15.123456
+INSERT INTO ts VALUES (4, '2020-01-01 12:00:00.1234565', '2020-01-01', '2020-01-01')		-
+SELECT id, a, b FROM ts WHERE id = 4	bigint,timestamp without time zone,timestamp(6) without time zone	4|2020-01-01 12:00:00.123456|2020-01-01 00:00:00
+INSERT INTO ts VALUES (5, 'not a date', '2020-01-01', '2020-01-01')	!22007 invalid input syntax for type timestamp: "not a date"
+INSERT INTO ts VALUES (5, 'infinity', '-infinity', '2020-01-01')		-
+SELECT id, a, b FROM ts WHERE id = 5	bigint,timestamp without time zone,timestamp(6) without time zone	5|infinity|-infinity
+SELECT id FROM ts WHERE a IN ('2020-01-01 12:00:00') ORDER BY id	bigint	1
+INSERT INTO ts VALUES (6, NULL, NULL, NULL)		-
+SELECT id FROM ts WHERE a IS NULL	bigint	6
+SELECT id FROM ts WHERE a = 1	!42883 operator does not exist: timestamp without time zone = integer DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+UPDATE ts SET a = '2021-01-01' WHERE id = 1		-
+SELECT id, a FROM ts WHERE id = 1	bigint,timestamp without time zone	1|2021-01-01 00:00:00
+DELETE FROM ts WHERE id = 6		-
+SELECT count(*) FROM ts	bigint	5

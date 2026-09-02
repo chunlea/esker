@@ -65,7 +65,13 @@ fn encoded_keys_sort_the_way_postgresql_sorts_the_values() {
 fn column_type(name: &str) -> ColumnType {
     match name {
         "int8" => ColumnType::Int8,
+        "int4" => ColumnType::Int4,
         "text" => ColumnType::Text,
+        // Captured under `COLLATE "C"` for the same reason `text` is, and separately, because a
+        // type whose key order is unchecked is a type whose range scans are unchecked — which is
+        // what the exhaustiveness assertion at the end of the test is for.
+        "varchar" => ColumnType::Varchar,
+        "timestamp" => ColumnType::Timestamp,
         "bool" => ColumnType::Bool,
         "bytea" => ColumnType::Bytea,
         "timestamptz" => ColumnType::TimestampTz,

@@ -52,7 +52,9 @@ fn encode_row(values: &[Value]) -> Vec<u8> {
     for (index, value) in values.iter().enumerate() {
         match value {
             Value::Null => out[bitmap_at + index / 8] |= 1 << (index % 8),
-            Value::Int8(v) | Value::TimestampTz(v) => out.extend_from_slice(&v.to_le_bytes()),
+            Value::Int8(v) | Value::TimestampTz(v) | Value::Timestamp(v) => {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
             Value::Int4(v) => out.extend_from_slice(&v.to_le_bytes()),
             Value::Double(v) => out.extend_from_slice(&v.to_le_bytes()),
             Value::Bool(v) => out.push(u8::from(*v)),

@@ -78,13 +78,16 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
             "PARTITION BY",
         ),
         ("CREATE TABLE t (a int8) INHERITS (u)", "INHERITS"),
-        // `int4` runs since ADR 0033. What is left of tier 1 is refused by name, in the order
-        // that ADR gives them, and each of these lines is deleted by the unit that lands its type.
+        // `int4`, `character varying` and `timestamp` run since ADR 0033. What is left of tier 1
+        // is refused by name, in the order that ADR gives them, and each of these lines is
+        // deleted by the unit that lands its type. A **length or precision** is refused too: it
+        // is a typmod, which this node has nowhere to keep, and ignoring one would store a value
+        // a real server rejects with `22001`.
         ("CREATE TABLE t (a varchar(10))", "the type VARCHAR"),
+        ("CREATE TABLE t (a timestamp(3))", "the type TIMESTAMP"),
         ("CREATE TABLE t (a int2)", "the type INT2"),
         ("CREATE TABLE t (a real)", "the type REAL"),
         ("CREATE TABLE t (a numeric)", "the type NUMERIC"),
-        ("CREATE TABLE t (a timestamp)", "the type TIMESTAMP"),
         ("CREATE TABLE t (a int8[])", "the type"),
         ("CREATE TABLE s.t (a int8)", "the qualified name"),
         ("DROP TABLE t CASCADE", "DROP ... CASCADE"),

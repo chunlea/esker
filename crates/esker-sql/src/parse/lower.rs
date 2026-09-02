@@ -1818,6 +1818,12 @@ fn lower_type(data_type: &DataType) -> Result<ColumnType> {
         // with the type as the user wrote it.
         DataType::Int4(None) | DataType::Int(None) | DataType::Integer(None) => ColumnType::Int4,
         DataType::Text => ColumnType::Text,
+        // `character varying` and `varchar` with **no length**. A length is a typmod and this node
+        // has no column to keep one on yet, so `varchar(n)` is `0A000` naming itself until the
+        // typmod unit lands -- refusing the length rather than ignoring it, because a `varchar(5)`
+        // that took a six-character value would be a wrong answer where a real server raises
+        // `22001` (ADR 0033).
+        DataType::Varchar(None) | DataType::CharacterVarying(None) => ColumnType::Varchar,
         DataType::Bool | DataType::Boolean => ColumnType::Bool,
         DataType::Bytea => ColumnType::Bytea,
         DataType::Float8 | DataType::DoublePrecision | DataType::Double(ExactNumberInfo::None) => {
@@ -1825,6 +1831,14 @@ fn lower_type(data_type: &DataType) -> Result<ColumnType> {
         }
         DataType::Timestamp(None, TimezoneInfo::Tz | TimezoneInfo::WithTimeZone) => {
             ColumnType::TimestampTz
+        }
+        // `timestamp` and `timestamp(6)` are the **same type**: six is PostgreSQL's default and
+        // its maximum, so the two hold identical values and print identically, and the only thing
+        // that differs is the string `format_type` prints. `timestamp(0)` through `timestamp(5)`
+        // really do round, so they fall through to the refusal below until the typmod unit —
+        // accepting one and storing microseconds would be a wrong answer rather than a gap.
+        DataType::Timestamp(None | Some(6), TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
+            ColumnType::Timestamp
         }
         // `bigserial` and `serial` are `bigint`/`integer` plus a sequence, and `sqlparser` 0.62
         // has no variant for either -- both arrive as a custom type name. `smallserial` arrives

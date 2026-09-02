@@ -17,8 +17,11 @@
 
 
 int8	-9223372036854775808	-42	-1	0	1	42	9223372036854775807
+int4	-2147483648	-42	-1	0	1	42	2147483647
 bool	false	true
 float8	-Infinity	-1e+308	-1	0	-0	5e-324	1	1e+308	Infinity	NaN
 timestamptz	-infinity	4714-11-24 00:00:00+00 BC	1999-01-01 00:00:00+00	2000-01-01 00:00:00+00	294276-12-31 23:59:59+00	infinity
+timestamp	-infinity	4714-11-24 00:00:00 BC	1999-01-01 00:00:00	2000-01-01 00:00:00	294276-12-31 23:59:59	infinity
 text		A	B	_a	a	a b	ab	b	~	é	🌊
+varchar		A	B	_a	a	a b	ab	b	~	é	🌊
 bytea	\x	\x00	\x0000	\x01	\x7f	\x80	\xff	\xffff

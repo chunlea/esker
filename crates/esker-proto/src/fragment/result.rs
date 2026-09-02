@@ -91,6 +91,8 @@ pub enum ValueType {
     TimestampTz,
     /// A 64-bit float.
     Double,
+    /// Microseconds from 2000-01-01, with **no** zone: PostgreSQL's `timestamp`.
+    Timestamp,
     /// A 32-bit signed integer.
     ///
     /// Appended by [ADR 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md), never
@@ -101,9 +103,10 @@ pub enum ValueType {
 
 impl ValueType {
     /// Every type, so a test cannot silently skip one.
-    pub const ALL: [ValueType; 7] = [
+    pub const ALL: [ValueType; 8] = [
         ValueType::Int8,
         ValueType::Int4,
+        ValueType::Timestamp,
         ValueType::Text,
         ValueType::Bool,
         ValueType::Bytea,
@@ -122,6 +125,7 @@ impl ValueType {
             ValueType::TimestampTz => 5,
             ValueType::Double => 6,
             ValueType::Int4 => 7,
+            ValueType::Timestamp => 8,
         }
     }
 
@@ -135,6 +139,7 @@ impl ValueType {
             5 => ValueType::TimestampTz,
             6 => ValueType::Double,
             7 => ValueType::Int4,
+            8 => ValueType::Timestamp,
             _ => return Err(DecodeError::invalid("result.type", "unknown type tag")),
         })
     }
@@ -163,6 +168,8 @@ pub enum Value {
     Double(f64),
     /// [`ValueType::Int4`].
     Int4(i32),
+    /// [`ValueType::Timestamp`].
+    Timestamp(i64),
 }
 
 impl Value {
@@ -178,6 +185,7 @@ impl Value {
             Value::TimestampTz(_) => ValueType::TimestampTz,
             Value::Double(_) => ValueType::Double,
             Value::Int4(_) => ValueType::Int4,
+            Value::Timestamp(_) => ValueType::Timestamp,
         })
     }
 
@@ -190,6 +198,10 @@ impl Value {
             }
             Value::TimestampTz(v) => {
                 out.put_u8(ValueType::TimestampTz.tag());
+                out.put_u64(u64::from_le_bytes(v.to_le_bytes()));
+            }
+            Value::Timestamp(v) => {
+                out.put_u8(ValueType::Timestamp.tag());
                 out.put_u64(u64::from_le_bytes(v.to_le_bytes()));
             }
             Value::Double(v) => {
@@ -228,6 +240,9 @@ impl Value {
             )),
             ValueType::TimestampTz => Value::TimestampTz(i64::from_le_bytes(
                 input.get_u64("result.value.timestamptz")?.to_le_bytes(),
+            )),
+            ValueType::Timestamp => Value::Timestamp(i64::from_le_bytes(
+                input.get_u64("result.value.timestamp")?.to_le_bytes(),
             )),
             ValueType::Double => {
                 Value::Double(f64::from_bits(input.get_u64("result.value.double")?))

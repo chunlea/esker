@@ -175,6 +175,15 @@ timestamptz	2024-01-01T10:00:00Z	2024-01-01 10:00:00+00
 timestamptz	2024-01-01 10:00:00+05:30	2024-01-01 04:30:00+00
 timestamptz	2024-01-01 10:00:00-07	2024-01-01 17:00:00+00
 timestamptz	2024-01-01 10:00:00.1234567	2024-01-01 10:00:00.123457+00
+# A seventh digit that is exactly half rounds to the **even** neighbour, not up. Four lines
+# because one cannot tell the two rules apart: the first two are the same half rounded in
+# opposite directions, and the last is not a tie at all -- something follows the five, so it is
+# above the half whatever the parity. This crate rounded half up until ADR 0033's `timestamp`
+# unit, and `timestamptz` shares the parser, so it was wrong here first.
+timestamptz	2024-01-01 10:00:00.1234565	2024-01-01 10:00:00.123456+00
+timestamptz	2024-01-01 10:00:00.1234575	2024-01-01 10:00:00.123458+00
+timestamptz	2024-01-01 10:00:00.1234545	2024-01-01 10:00:00.123454+00
+timestamptz	2024-01-01 10:00:00.12345650001	2024-01-01 10:00:00.123457+00
 timestamptz	0001-01-01 00:00:00+00	0001-01-01 00:00:00+00
 timestamptz	0001-01-01 00:00:00 BC	0001-01-01 00:00:00+00 BC
 timestamptz	4713-01-01 00:00:00 BC	4713-01-01 00:00:00+00 BC

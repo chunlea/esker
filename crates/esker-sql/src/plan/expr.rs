@@ -406,8 +406,11 @@ impl Literal {
                 )]
                 ColumnType::Double => Ok(Datum::Double(*value as f64)),
                 // PostgreSQL's assignment cast to text is the value's own text.
-                ColumnType::Text => Ok(Datum::Text(value.to_string())),
-                ColumnType::Bool | ColumnType::Bytea | ColumnType::TimestampTz => mismatch(),
+                ColumnType::Text | ColumnType::Varchar => Ok(Datum::Text(value.to_string())),
+                ColumnType::Bool
+                | ColumnType::Bytea
+                | ColumnType::TimestampTz
+                | ColumnType::Timestamp => mismatch(),
             },
 
             Literal::Decimal(digits) => match ty {
@@ -427,11 +430,14 @@ impl Literal {
                     })
                 }
                 // The digits as written, which is what `numeric`'s own text is.
-                ColumnType::Text => Ok(Datum::Text(digits.clone())),
+                ColumnType::Text | ColumnType::Varchar => Ok(Datum::Text(digits.clone())),
                 ColumnType::Int8 => Err(SqlError::unsupported(format!(
                     "assigning the numeric literal {digits} to the bigint column \"{column}\""
                 ))),
-                ColumnType::Bool | ColumnType::Bytea | ColumnType::TimestampTz => mismatch(),
+                ColumnType::Bool
+                | ColumnType::Bytea
+                | ColumnType::TimestampTz
+                | ColumnType::Timestamp => mismatch(),
             },
 
             // Already resolved. It fits the column it was resolved against and nothing else.
@@ -441,13 +447,14 @@ impl Literal {
             Literal::Bool(value) => match ty {
                 ColumnType::Bool => Ok(Datum::Bool(*value)),
                 // `true`, not `t`: the cast, not the output function.
-                ColumnType::Text => Ok(Datum::Text(
+                ColumnType::Text | ColumnType::Varchar => Ok(Datum::Text(
                     if *value { "true" } else { "false" }.to_owned(),
                 )),
                 ColumnType::Int8
                 | ColumnType::Int4
                 | ColumnType::Bytea
                 | ColumnType::TimestampTz
+                | ColumnType::Timestamp
                 | ColumnType::Double => mismatch(),
             },
         }

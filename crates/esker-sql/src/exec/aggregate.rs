@@ -154,6 +154,10 @@ impl Aggregation {
             // for. Refusing it is being right rather than being incomplete.
             AggregateFunc::Min | AggregateFunc::Max => match arg {
                 ColumnType::Bool => undefined(),
+                // Measured: `min(varchar)` and `max(varchar)` come back as **`text`** on a real
+                // server. There is one `min` for the whole string family and it is `text`'s, so the
+                // declared type decays even though the value does not change.
+                ColumnType::Varchar => Ok(ColumnType::Text),
                 _ => Ok(arg),
             },
             AggregateFunc::Avg => match arg {

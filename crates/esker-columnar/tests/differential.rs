@@ -383,10 +383,13 @@ fn literal(rng: &mut Pcg32, ty: ColumnType) -> Value {
             let pool = [0i32, 1, -1, i32::MIN, i32::MAX, 42, -42, 7];
             Value::Int4(pool[rng.below(pool.len() as u32) as usize])
         }
+        ColumnType::Timestamp => {
+            Value::Timestamp(757_382_400_000_000 + i64::from(rng.below(10_000)))
+        }
         ColumnType::TimestampTz => {
             Value::TimestampTz(757_382_400_000_000 + i64::from(rng.below(10_000)))
         }
-        ColumnType::Text => {
+        ColumnType::Text | ColumnType::Varchar => {
             let pool = ["", "alpha", "beta", "\u{1f600}", "zzz"];
             Value::Text(pool[rng.below(pool.len() as u32) as usize].to_owned())
         }

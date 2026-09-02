@@ -372,7 +372,7 @@ fn take_expr(cursor: &mut Cursor<'_>, depth: usize) -> Result<Expr> {
 fn put_literal(value: &Value, out: &mut Vec<u8>) {
     match value {
         Value::Null => out.push(TAG_NULL),
-        Value::Int8(v) | Value::TimestampTz(v) => {
+        Value::Int8(v) | Value::TimestampTz(v) | Value::Timestamp(v) => {
             out.push(value.column_type().map_or(TAG_NULL, ColumnType::tag));
             out.extend_from_slice(&v.to_le_bytes());
         }
@@ -412,7 +412,10 @@ fn take_literal(cursor: &mut Cursor<'_>) -> Result<Value> {
     Ok(match ty {
         ColumnType::Int8 => Value::Int8(take_i64(cursor)?),
         ColumnType::TimestampTz => Value::TimestampTz(take_i64(cursor)?),
-        ColumnType::Int4 => Value::Int4(cursor.u32_le("literal int4")? as i32),
+        ColumnType::Timestamp => Value::Timestamp(take_i64(cursor)?),
+        ColumnType::Int4 => Value::Int4(i32::from_le_bytes(
+            cursor.u32_le("literal int4")?.to_le_bytes(),
+        )),
         ColumnType::Double => Value::Double(f64::from_bits(cursor.u64_le("literal double")?)),
         ColumnType::Bool => match cursor.u8("literal boolean")? {
             0 => Value::Bool(false),
@@ -424,7 +427,7 @@ fn take_literal(cursor: &mut Cursor<'_>) -> Result<Value> {
                 ));
             }
         },
-        ColumnType::Text => {
+        ColumnType::Text | ColumnType::Varchar => {
             let bytes = take_literal_bytes(cursor, "literal text")?;
             Value::Text(String::from_utf8(bytes).map_err(|error| {
                 Error::corruption("fragment", format!("literal text is not utf-8: {error}"))

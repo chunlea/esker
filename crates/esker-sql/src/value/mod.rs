@@ -71,7 +71,9 @@ impl PgType for ColumnType {
             ColumnType::Int8 => 20,
             ColumnType::Int4 => 23,
             ColumnType::Text => 25,
+            ColumnType::Varchar => 1043,
             ColumnType::Double => 701,
+            ColumnType::Timestamp => 1114,
             ColumnType::TimestampTz => 1184,
         }
     }
@@ -81,9 +83,11 @@ impl PgType for ColumnType {
             ColumnType::Int8 => "bigint",
             ColumnType::Int4 => "integer",
             ColumnType::Text => "text",
+            ColumnType::Varchar => "character varying",
             ColumnType::Bool => "boolean",
             ColumnType::Bytea => "bytea",
             ColumnType::TimestampTz => "timestamp with time zone",
+            ColumnType::Timestamp => "timestamp without time zone",
             ColumnType::Double => "double precision",
         }
     }
@@ -92,8 +96,11 @@ impl PgType for ColumnType {
         match self {
             ColumnType::Bool => 1,
             ColumnType::Int4 => 4,
-            ColumnType::Int8 | ColumnType::TimestampTz | ColumnType::Double => 8,
-            ColumnType::Text | ColumnType::Bytea => -1,
+            ColumnType::Int8
+            | ColumnType::TimestampTz
+            | ColumnType::Timestamp
+            | ColumnType::Double => 8,
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Bytea => -1,
         }
     }
 }
@@ -168,6 +175,8 @@ impl PgDatum for Datum {
                 out
             }
             Datum::TimestampTz(v) => timestamp::to_text(*v),
+            // No offset, which is the whole visible difference between the two types.
+            Datum::Timestamp(v) => timestamp::to_text_without_zone(*v),
             Datum::Double(v) => float::to_text(*v),
         })
     }
@@ -176,10 +185,11 @@ impl PgDatum for Datum {
         Ok(match ty {
             ColumnType::Int8 => Datum::Int8(parse_int8(text)?),
             ColumnType::Int4 => Datum::Int4(parse_int4(text)?),
-            ColumnType::Text => Datum::Text(text.to_owned()),
+            ColumnType::Text | ColumnType::Varchar => Datum::Text(text.to_owned()),
             ColumnType::Bool => Datum::Bool(parse_bool(text)?),
             ColumnType::Bytea => Datum::Bytea(parse_bytea(text)?),
             ColumnType::TimestampTz => Datum::TimestampTz(timestamp::from_text(text)?),
+            ColumnType::Timestamp => Datum::Timestamp(timestamp::from_text_without_zone(text)?),
             ColumnType::Double => Datum::Double(float::from_text(text)?),
         })
     }
@@ -187,7 +197,9 @@ impl PgDatum for Datum {
     fn to_binary(&self) -> Option<Vec<u8>> {
         Some(match self {
             Datum::Null => return None,
-            Datum::Int8(v) | Datum::TimestampTz(v) => v.to_be_bytes().to_vec(),
+            Datum::Int8(v) | Datum::TimestampTz(v) | Datum::Timestamp(v) => {
+                v.to_be_bytes().to_vec()
+            }
             Datum::Int4(v) => v.to_be_bytes().to_vec(),
             Datum::Bool(v) => vec![u8::from(*v)],
             Datum::Double(v) => v.to_be_bytes().to_vec(),
@@ -207,11 +219,15 @@ impl PgDatum for Datum {
             })
         };
         Ok(match ty {
-            ColumnType::Int8 | ColumnType::TimestampTz | ColumnType::Double => {
+            ColumnType::Int8
+            | ColumnType::TimestampTz
+            | ColumnType::Timestamp
+            | ColumnType::Double => {
                 let head: [u8; 8] = fixed(8)?.try_into().unwrap_or([0; 8]);
                 match ty {
                     ColumnType::Int8 => Datum::Int8(i64::from_be_bytes(head)),
                     ColumnType::TimestampTz => Datum::TimestampTz(i64::from_be_bytes(head)),
+                    ColumnType::Timestamp => Datum::Timestamp(i64::from_be_bytes(head)),
                     _ => Datum::Double(f64::from_be_bytes(head)),
                 }
             }
@@ -228,7 +244,7 @@ impl PgDatum for Datum {
                     )));
                 }
             },
-            ColumnType::Text => {
+            ColumnType::Text | ColumnType::Varchar => {
                 Datum::Text(String::from_utf8(bytes.to_vec()).map_err(|error| {
                     let at = error.utf8_error().valid_up_to();
                     SqlError::InvalidByteSequence(error.as_bytes().get(at).copied().unwrap_or(0))
@@ -244,9 +260,9 @@ impl PgDatum for Datum {
             // NULLS LAST, PostgreSQL's default for ascending order.
             (Datum::Null, _) => Ordering::Greater,
             (_, Datum::Null) => Ordering::Less,
-            (Datum::Int8(a), Datum::Int8(b)) | (Datum::TimestampTz(a), Datum::TimestampTz(b)) => {
-                a.cmp(b)
-            }
+            (Datum::Int8(a), Datum::Int8(b))
+            | (Datum::TimestampTz(a), Datum::TimestampTz(b))
+            | (Datum::Timestamp(a), Datum::Timestamp(b)) => a.cmp(b),
             // Across the two widths, because PostgreSQL has an `int4 = int8` operator and answers
             // `1::integer = 1::bigint` with `t`. Widening is exact in this direction, so there is
             // no rounding to argue about — an `i32` is an `i64`.
@@ -276,7 +292,7 @@ fn variant_rank(value: &Datum) -> u8 {
         // answers the pair above rather than falling through to here.
         Datum::Int8(_) | Datum::Int4(_) => 1,
         Datum::Double(_) => 2,
-        Datum::TimestampTz(_) => 3,
+        Datum::TimestampTz(_) | Datum::Timestamp(_) => 3,
         Datum::Text(_) => 4,
         Datum::Bytea(_) => 5,
         Datum::Null => 6,
@@ -478,13 +494,24 @@ mod tests {
         assert_eq!(ColumnType::Text.oid(), 25);
         assert_eq!(ColumnType::Double.oid(), 701);
         assert_eq!(ColumnType::TimestampTz.oid(), 1184);
+        // Tier 1 (ADR 0033), each measured off `pg_type` rather than remembered.
+        assert_eq!(ColumnType::Int4.oid(), 23);
+        assert_eq!(ColumnType::Varchar.oid(), 1043);
+        assert_eq!(ColumnType::Timestamp.oid(), 1114);
         for ty in ColumnType::ALL {
             assert_eq!(
                 ty.type_len() == -1,
-                matches!(ty, ColumnType::Text | ColumnType::Bytea),
+                matches!(
+                    ty,
+                    ColumnType::Text | ColumnType::Varchar | ColumnType::Bytea
+                ),
                 "{ty:?} reports the wrong width"
             );
         }
+        // And the fixed widths are the type's own, not "eight because it fits": a client sizes a
+        // binary column from this, so an `int4` claiming eight is a wrong parse of every value.
+        assert_eq!(ColumnType::Int4.type_len(), 4);
+        assert_eq!(ColumnType::Timestamp.type_len(), 8);
     }
 
     /// PostgreSQL complains about `bigint`, not about `int8`. The DDL spelling and the message

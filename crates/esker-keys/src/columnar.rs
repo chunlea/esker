@@ -64,6 +64,8 @@ fn tag_of(ty: ColumnType) -> u8 {
         // reader that meets one it does not know answers corruption rather than guessing
         // ([ADR 0033](../../docs/adr/0033-tier-1-of-the-type-surface.md)).
         ColumnType::Int4 => 7,
+        ColumnType::Varchar => 8,
+        ColumnType::Timestamp => 9,
     }
 }
 
@@ -76,6 +78,8 @@ fn type_of(tag: u8) -> Result<ColumnType, RowError> {
         5 => ColumnType::TimestampTz,
         6 => ColumnType::Double,
         7 => ColumnType::Int4,
+        8 => ColumnType::Varchar,
+        9 => ColumnType::Timestamp,
         other => {
             return Err(RowError::Corrupt(format!(
                 "column type tag {other} is not one of ours"

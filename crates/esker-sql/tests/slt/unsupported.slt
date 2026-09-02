@@ -66,8 +66,19 @@ CREATE TABLE f (id int8 PRIMARY KEY, a int8, FOREIGN KEY (a) REFERENCES t (id))
 statement error (0A000)
 CREATE TABLE c (id int8 PRIMARY KEY, a int8, CHECK (a > 0))
 
+# `int4`, `varchar` and `timestamp` run since ADR 0033; what is left of tier 1 is refused by
+# name, in the order that ADR gives them, and each line goes when its type lands.
 statement error (0A000)
-CREATE TABLE ty (id int8 PRIMARY KEY, a int4)
+CREATE TABLE ty (id int8 PRIMARY KEY, a int2)
+
+statement error (0A000)
+CREATE TABLE tv (id int8 PRIMARY KEY, a varchar(10))
+
+statement error (0A000)
+CREATE TABLE tr (id int8 PRIMARY KEY, a real)
+
+statement error (0A000)
+CREATE TABLE tp (id int8 PRIMARY KEY, a timestamp(3))
 
 statement error (0A000)
 CREATE TABLE public.q (id int8 PRIMARY KEY)

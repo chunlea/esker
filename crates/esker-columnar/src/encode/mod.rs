@@ -136,7 +136,7 @@ pub fn decode_column(
 
     let present = rows - null_count;
     let data = match ty {
-        ColumnType::Int8 | ColumnType::TimestampTz | ColumnType::Int4 => {
+        ColumnType::Int8 | ColumnType::TimestampTz | ColumnType::Timestamp | ColumnType::Int4 => {
             ColumnData::Ints(integer::decode(encoding, &mut cursor, present)?)
         }
         ColumnType::Double => ColumnData::Doubles(double::decode(encoding, &mut cursor, present)?),
@@ -149,7 +149,7 @@ pub fn decode_column(
                 "values",
             )?)
         }
-        ColumnType::Text | ColumnType::Bytea => {
+        ColumnType::Text | ColumnType::Varchar | ColumnType::Bytea => {
             let run = bytes::decode(encoding, &mut cursor, present)?;
             ColumnData::Bytes {
                 offsets: run.offsets,
@@ -160,7 +160,7 @@ pub fn decode_column(
     cursor.finish()?;
 
     let column = Column::new(ty, nulls, data)?;
-    if ty == ColumnType::Text {
+    if matches!(ty, ColumnType::Text | ColumnType::Varchar) {
         // Text is UTF-8 by definition, and a `String` built from unchecked bytes is how a corrupt
         // file becomes a wrong answer somewhere far away. Pay for the check once, here.
         for value in &column {
@@ -236,6 +236,9 @@ mod tests {
         let present = match ty {
             ColumnType::Int8 => any::<i64>().prop_map(Value::Int8).boxed(),
             ColumnType::Int4 => any::<i32>().prop_map(Value::Int4).boxed(),
+            ColumnType::Timestamp => (-1_000i64..1_000)
+                .prop_map(|d| Value::Timestamp(757_382_400_000_000 + d * 1_000))
+                .boxed(),
             ColumnType::TimestampTz => (-1_000i64..1_000)
                 .prop_map(|d| Value::TimestampTz(757_382_400_000_000 + d * 1_000))
                 .boxed(),
@@ -243,7 +246,7 @@ mod tests {
             ColumnType::Double => any::<u64>()
                 .prop_map(|bits| Value::Double(f64::from_bits(bits)))
                 .boxed(),
-            ColumnType::Text => (0usize..4)
+            ColumnType::Text | ColumnType::Varchar => (0usize..4)
                 .prop_map(|pick| Value::Text(["", "a", "beta", "\u{1f600}"][pick].to_owned()))
                 .boxed(),
             ColumnType::Bytea => prop::collection::vec(any::<u8>(), 0..6)

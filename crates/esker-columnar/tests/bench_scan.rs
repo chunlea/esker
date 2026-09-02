@@ -60,7 +60,9 @@ fn encode_row(values: &[Value]) -> Vec<u8> {
     for (index, value) in values.iter().enumerate() {
         match value {
             Value::Null => out[bitmap_at + index / 8] |= 1 << (index % 8),
-            Value::Int8(v) | Value::TimestampTz(v) => out.extend_from_slice(&v.to_le_bytes()),
+            Value::Int8(v) | Value::TimestampTz(v) | Value::Timestamp(v) => {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
             Value::Int4(v) => out.extend_from_slice(&v.to_le_bytes()),
             Value::Double(v) => out.extend_from_slice(&v.to_le_bytes()),
             Value::Bool(v) => out.push(u8::from(*v)),
@@ -109,6 +111,11 @@ fn decode_row(types: &[ColumnType], bytes: &[u8]) -> Vec<Value> {
                 at += 4;
                 Value::Int4(i32::from_le_bytes(four))
             }
+            ColumnType::Timestamp => {
+                let value = Value::Timestamp(i64::from_le_bytes(fixed(at)));
+                at += 8;
+                value
+            }
             ColumnType::TimestampTz => {
                 let value = Value::TimestampTz(i64::from_le_bytes(fixed(at)));
                 at += 8;
@@ -124,12 +131,12 @@ fn decode_row(types: &[ColumnType], bytes: &[u8]) -> Vec<Value> {
                 at += 1;
                 value
             }
-            ColumnType::Text | ColumnType::Bytea => {
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Bytea => {
                 let (len, used) = varint::get_u64(&bytes[at..]).unwrap();
                 at += used;
                 let raw = bytes[at..at + len as usize].to_vec();
                 at += len as usize;
-                if *ty == ColumnType::Text {
+                if matches!(ty, ColumnType::Text | ColumnType::Varchar) {
                     Value::Text(String::from_utf8(raw).unwrap())
                 } else {
                     Value::Bytea(raw)

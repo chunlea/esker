@@ -1,0 +1,54 @@
+# `character varying`, as a real PostgreSQL 19beta1 answers it — tier 1's second type
+# ([ADR 0033](../../../../docs/adr/0033-tier-1-of-the-type-surface.md)), and the one
+# `ActiveRecord`'s `t.string` emits.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way against one node.
+# It builds its own table.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# **NO LENGTH HERE.** `varchar(n)` is a *typmod*, which is a column property this node has nowhere
+# to keep yet, so it is `0A000` naming itself and gets its own corpus with the unit that adds it.
+# Bare `character varying` is what a `t.string` migration emits and what rung 2 of the ladder asks
+# for, and it is the whole of this file.
+#
+# WHAT MAKES IT A TYPE AND NOT AN ALIAS FOR `text`: nothing about the *values*. It is the same
+# varlena, it compares the same way, and `a = c` across a `varchar` and a `text` column is `t`.
+# What differs is what a client is told: OID 1043 against 25, and `character varying` where
+# `\gdesc` would say `text`. So this is not a format change even in principle — a `varchar`
+# column's rows are byte-identical to a `text` column's, and `Datum` has no variant for it.
+#
+# TWO THINGS TO READ CAREFULLY:
+#
+#   * **trailing spaces are significant**, unlike `character(n)`: `b = 'zz'` finds nothing where
+#     `b = 'zz  '` finds the row. That is the difference from `bpchar`, and it is why the two are
+#     separate types rather than one with a flag.
+#   * `min()` and `max()` come back as **`text`**, not `character varying`. The aggregate decays,
+#     which is a real server's answer and not a rounding of ours.
+#
+# A CAPTURE TRAP, recorded because it cost a re-run: `sesscap.py` skips blank lines, so a
+# single-column row whose only value is the **empty string** vanishes from the capture. Every query
+# here that can return one selects `id` beside it, which is why `ORDER BY a` is spelled
+# `SELECT id, a`.
+CREATE TABLE vc (id int8 PRIMARY KEY, a character varying, b varchar, c text)		-
+INSERT INTO vc VALUES (1, 'hello', 'abc', 'x')		-
+INSERT INTO vc VALUES (2, '', '', '')		-
+INSERT INTO vc VALUES (3, 'a much longer value', 'zz  ', 'y')		-
+SELECT id, a, b, c FROM vc ORDER BY id	bigint,character varying,character varying,text	1|hello|abc|x ; 2||| ; 3|a much longer value|zz  |y
+SELECT id FROM vc WHERE a = 'hello'	bigint	1
+SELECT id FROM vc WHERE a = c	bigint	2
+SELECT id FROM vc WHERE b = 'zz'	bigint	-
+SELECT id FROM vc WHERE b = 'zz  '	bigint	3
+SELECT id FROM vc WHERE a < 'b' ORDER BY id	bigint	2 ; 3
+SELECT id FROM vc WHERE a IN ('hello', '') ORDER BY id	bigint	1 ; 2
+SELECT id, a FROM vc ORDER BY a	bigint,character varying	2| ; 3|a much longer value ; 1|hello
+SELECT count(*), min(a), max(a) FROM vc	bigint,text,text	3||hello
+UPDATE vc SET a = 'changed' WHERE id = 1		-
+SELECT a FROM vc WHERE id = 1	character varying	changed
+INSERT INTO vc VALUES (4, NULL, NULL, NULL)		-
+SELECT id FROM vc WHERE a IS NULL	bigint	4
+SELECT id FROM vc WHERE a = 1	!42883 operator does not exist: character varying = integer DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+DELETE FROM vc WHERE id = 4		-
+SELECT count(*) FROM vc	bigint	3

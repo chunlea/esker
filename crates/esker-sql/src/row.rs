@@ -36,11 +36,13 @@ mod tests {
         use proptest::prelude::*;
         let values: BoxedStrategy<Datum> = match ty {
             ColumnType::Int8 => any::<i64>().prop_map(Datum::Int8).boxed(),
-            ColumnType::Text => ".{0,32}".prop_map(Datum::Text).boxed(),
+            ColumnType::Int4 => any::<i32>().prop_map(Datum::Int4).boxed(),
+            ColumnType::Text | ColumnType::Varchar => ".{0,32}".prop_map(Datum::Text).boxed(),
             ColumnType::Bool => any::<bool>().prop_map(Datum::Bool).boxed(),
             ColumnType::Bytea => proptest::collection::vec(any::<u8>(), 0..32)
                 .prop_map(Datum::Bytea)
                 .boxed(),
+            ColumnType::Timestamp => (MIN_MICROS..=MAX_MICROS).prop_map(Datum::Timestamp).boxed(),
             ColumnType::TimestampTz => prop_oneof![
                 9 => (MIN_MICROS..=MAX_MICROS).prop_map(Datum::TimestampTz),
                 1 => proptest::sample::select(vec![NEG_INFINITY, POS_INFINITY])

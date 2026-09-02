@@ -110,9 +110,12 @@ impl Bound {
                 <[u8; 4]>::try_from(self.bytes.as_slice()).ok()?,
             )),
             ColumnType::TimestampTz => Value::TimestampTz(i64::from_le_bytes(fixed()?)),
+            ColumnType::Timestamp => Value::Timestamp(i64::from_le_bytes(fixed()?)),
             ColumnType::Double => Value::Double(f64::from_le_bytes(fixed()?)),
             ColumnType::Bool => Value::Bool(self.as_bool()?),
-            ColumnType::Text | ColumnType::Bytea => Value::Bytea(self.bytes.clone()),
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Bytea => {
+                Value::Bytea(self.bytes.clone())
+            }
         })
     }
 
@@ -246,11 +249,14 @@ impl ColumnStats {
     #[must_use]
     pub fn fit(&self, ty: ColumnType) -> bool {
         let width = match ty {
-            ColumnType::Int8 | ColumnType::TimestampTz | ColumnType::Double => Some(8),
+            ColumnType::Int8
+            | ColumnType::TimestampTz
+            | ColumnType::Timestamp
+            | ColumnType::Double => Some(8),
             // Its own width, which is what makes it a different type.
             ColumnType::Int4 => Some(4),
             ColumnType::Bool => Some(1),
-            ColumnType::Text | ColumnType::Bytea => None,
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Bytea => None,
         };
         [self.min.as_ref(), self.max.as_ref()]
             .into_iter()
@@ -695,6 +701,7 @@ mod tests {
             ColumnType::Int8 => any::<i64>().prop_map(Value::Int8).boxed(),
             ColumnType::Int4 => any::<i32>().prop_map(Value::Int4).boxed(),
             ColumnType::TimestampTz => any::<i64>().prop_map(Value::TimestampTz).boxed(),
+            ColumnType::Timestamp => any::<i64>().prop_map(Value::Timestamp).boxed(),
             ColumnType::Bool => any::<bool>().prop_map(Value::Bool).boxed(),
             ColumnType::Double => prop_oneof![
                 Just(Value::Double(f64::NAN)),
@@ -702,7 +709,7 @@ mod tests {
                 any::<f64>().prop_map(Value::Double),
             ]
             .boxed(),
-            ColumnType::Text => prop::collection::vec(any::<char>(), 0..90)
+            ColumnType::Text | ColumnType::Varchar => prop::collection::vec(any::<char>(), 0..90)
                 .prop_map(|chars| Value::Text(chars.into_iter().collect()))
                 .boxed(),
             ColumnType::Bytea => prop::collection::vec(any::<u8>(), 0..90)
@@ -730,7 +737,7 @@ mod tests {
         };
         for value in present {
             let inside = match value {
-                Value::Int8(v) | Value::TimestampTz(v) => {
+                Value::Int8(v) | Value::TimestampTz(v) | Value::Timestamp(v) => {
                     min.as_i64() <= Some(*v) && Some(*v) <= max.as_i64()
                 }
                 // A four-byte bound, read as its own width: `as_i64` wants eight and answers

@@ -229,9 +229,11 @@ fn typname(ty: ColumnType) -> &'static str {
         ColumnType::Int8 => "int8",
         ColumnType::Int4 => "int4",
         ColumnType::Text => "text",
+        ColumnType::Varchar => "varchar",
         ColumnType::Bool => "bool",
         ColumnType::Bytea => "bytea",
         ColumnType::TimestampTz => "timestamptz",
+        ColumnType::Timestamp => "timestamp",
         ColumnType::Double => "float8",
     }
 }
@@ -247,9 +249,11 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::Int8 => "int8in",
         ColumnType::Int4 => "int4in",
         ColumnType::Text => "textin",
+        ColumnType::Varchar => "varcharin",
         ColumnType::Bool => "boolin",
         ColumnType::Bytea => "byteain",
         ColumnType::TimestampTz => "timestamptz_in",
+        ColumnType::Timestamp => "timestamp_in",
         ColumnType::Double => "float8in",
     }
 }

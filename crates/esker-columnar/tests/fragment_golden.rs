@@ -216,8 +216,12 @@ fn unknown_tags_refuse_the_whole_fragment() {
             Box::new(|body: &mut Vec<u8>| body[12] = 9),
         ),
         (
+            // Well past the vocabulary rather than one beyond it: this byte is a `ColumnType`
+            // tag, and the type surface is growing one tag at a time (ADR 0033), so `9` stopped
+            // being unknown the moment `timestamp` landed and quietly turned this case into a
+            // test that a *known* tag is accepted.
             "literal of type tag",
-            Box::new(|body: &mut Vec<u8>| body[16] = 9),
+            Box::new(|body: &mut Vec<u8>| body[16] = 200),
         ),
         ("output kind", Box::new(|body: &mut Vec<u8>| body[29] = 9)),
         (

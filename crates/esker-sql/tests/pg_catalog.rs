@@ -148,6 +148,8 @@ fn activerecord_s_four_type_map_queries_answer() {
             // this query's ten names are answered now where four were.
             vec!["23", "int4"],
             vec!["701", "float8"],
+            // `timestamp` is in ActiveRecord's list of ten and arrived with tier 1's third type.
+            vec!["1114", "timestamp"],
             vec!["1184", "timestamptz"],
         ]
     );
@@ -172,6 +174,17 @@ fn activerecord_s_four_type_map_queries_answer() {
             vec!["23", "int4", "0", ",", "int4in", "\\N", "b", "0"],
             vec!["25", "text", "0", ",", "textin", "\\N", "b", "0"],
             vec!["701", "float8", "0", ",", "float8in", "\\N", "b", "0"],
+            vec!["1043", "varchar", "0", ",", "varcharin", "\\N", "b", "0"],
+            vec![
+                "1114",
+                "timestamp",
+                "0",
+                ",",
+                "timestamp_in",
+                "\\N",
+                "b",
+                "0"
+            ],
             vec![
                 "1184",
                 "timestamptz",

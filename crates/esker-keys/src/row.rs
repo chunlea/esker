@@ -119,7 +119,9 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
     match value {
         // Nothing is written for a NULL; the bitmap is what records it.
         Datum::Null => {}
-        Datum::Int8(v) | Datum::TimestampTz(v) => out.extend_from_slice(&v.to_le_bytes()),
+        Datum::Int8(v) | Datum::TimestampTz(v) | Datum::Timestamp(v) => {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
         // Four bytes, not eight. Nothing written before `int4` existed has a column of this type,
         // so the narrower width costs no compatibility and is what `pg_type.typlen` says it is.
         Datum::Int4(v) => out.extend_from_slice(&v.to_le_bytes()),
@@ -263,11 +265,12 @@ impl RowSchema {
 fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
     let truncated = || corrupt(format!("a {ty:?} is truncated"));
     Ok(match ty {
-        ColumnType::Int8 | ColumnType::TimestampTz | ColumnType::Double => {
+        ColumnType::Int8 | ColumnType::TimestampTz | ColumnType::Timestamp | ColumnType::Double => {
             let (head, rest) = bytes.split_first_chunk::<8>().ok_or_else(truncated)?;
             let value = match ty {
                 ColumnType::Int8 => Datum::Int8(i64::from_le_bytes(*head)),
                 ColumnType::TimestampTz => Datum::TimestampTz(i64::from_le_bytes(*head)),
+                ColumnType::Timestamp => Datum::Timestamp(i64::from_le_bytes(*head)),
                 _ => Datum::Double(f64::from_le_bytes(*head)),
             };
             (value, rest)
@@ -285,7 +288,7 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
                 other => return Err(corrupt(format!("boolean byte {other} is neither 0 nor 1"))),
             }
         }
-        ColumnType::Text | ColumnType::Bytea => {
+        ColumnType::Text | ColumnType::Varchar | ColumnType::Bytea => {
             let (len, consumed) = varint::get_u64(bytes)
                 .map_err(|error| corrupt(format!("column length: {error}")))?;
             let len =
@@ -293,7 +296,7 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
             let (body, rest) = bytes[consumed..]
                 .split_at_checked(len)
                 .ok_or_else(|| corrupt(format!("a column of {len} bytes is truncated")))?;
-            let value = if ty == ColumnType::Text {
+            let value = if matches!(ty, ColumnType::Text | ColumnType::Varchar) {
                 Datum::Text(text_from_utf8(body)?)
             } else {
                 Datum::Bytea(body.to_vec())
@@ -408,7 +411,7 @@ pub fn unique_index_key_is_unique_by_value(columns: &[Datum]) -> bool {
 fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
     match value {
         Datum::Null => {}
-        Datum::Int8(v) | Datum::TimestampTz(v) => codec::encode_i64(*v, out),
+        Datum::Int8(v) | Datum::TimestampTz(v) | Datum::Timestamp(v) => codec::encode_i64(*v, out),
         // Widened to the `i64` encoding rather than given one of its own: an index key has to sort
         // by value and the memcomparable `i64` form already does, for every `i32` there is. A
         // second encoding would be a second thing to get wrong for no gain — a key is not a row,
@@ -484,6 +487,10 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
             let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
             (Datum::TimestampTz(value), rest)
         }
+        ColumnType::Timestamp => {
+            let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
+            (Datum::Timestamp(value), rest)
+        }
         ColumnType::Double => {
             let (bits, rest) = codec::decode_u64(bytes).map_err(decoded)?;
             (Datum::Double(crate::value::f64_of_sort_bits(bits)), rest)
@@ -497,7 +504,7 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
                 other => return Err(corrupt(format!("boolean byte {other} in an index key"))),
             }
         }
-        ColumnType::Text => {
+        ColumnType::Text | ColumnType::Varchar => {
             let (body, rest) = codec::decode_bytes(bytes).map_err(decoded)?;
             (Datum::Text(text_from_utf8(&body)?), rest)
         }
@@ -920,11 +927,12 @@ mod tests {
         let values: BoxedStrategy<Datum> = match ty {
             ColumnType::Int8 => any::<i64>().prop_map(Datum::Int8).boxed(),
             ColumnType::Int4 => any::<i32>().prop_map(Datum::Int4).boxed(),
-            ColumnType::Text => ".{0,32}".prop_map(Datum::Text).boxed(),
+            ColumnType::Text | ColumnType::Varchar => ".{0,32}".prop_map(Datum::Text).boxed(),
             ColumnType::Bool => any::<bool>().prop_map(Datum::Bool).boxed(),
             ColumnType::Bytea => proptest::collection::vec(any::<u8>(), 0..32)
                 .prop_map(Datum::Bytea)
                 .boxed(),
+            ColumnType::Timestamp => (MIN_MICROS..=MAX_MICROS).prop_map(Datum::Timestamp).boxed(),
             ColumnType::TimestampTz => prop_oneof![
                 9 => (MIN_MICROS..=MAX_MICROS).prop_map(Datum::TimestampTz),
                 1 => proptest::sample::select(vec![NEG_INFINITY, POS_INFINITY])

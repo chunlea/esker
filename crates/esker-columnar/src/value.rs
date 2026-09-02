@@ -51,25 +51,32 @@ pub enum ColumnType {
     Int4,
     /// Variable-length UTF-8 string.
     Text,
+    /// PostgreSQL's `character varying`: the same representation as [`ColumnType::Text`] and a
+    /// different type, which is PostgreSQL's own model.
+    Varchar,
     /// Two-valued, with no third state but NULL.
     Bool,
     /// Variable-length byte string.
     Bytea,
     /// An instant, microseconds from 2000-01-01 UTC. Stored exactly as an `Int8` is.
     TimestampTz,
+    /// PostgreSQL's `timestamp` without time zone: the same eight bytes and a different type.
+    Timestamp,
     /// IEEE-754 binary64.
     Double,
 }
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 7] = [
+    pub const ALL: [ColumnType; 9] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Text,
+        ColumnType::Varchar,
         ColumnType::Bool,
         ColumnType::Bytea,
         ColumnType::TimestampTz,
+        ColumnType::Timestamp,
         ColumnType::Double,
     ];
 
@@ -85,6 +92,8 @@ impl ColumnType {
             ColumnType::Double => 6,
             // Appended, never renumbered: an old file has no tag above 6 and reads unchanged.
             ColumnType::Int4 => 7,
+            ColumnType::Varchar => 8,
+            ColumnType::Timestamp => 9,
         }
     }
 
@@ -98,6 +107,8 @@ impl ColumnType {
             5 => ColumnType::TimestampTz,
             6 => ColumnType::Double,
             7 => ColumnType::Int4,
+            8 => ColumnType::Varchar,
+            9 => ColumnType::Timestamp,
             other => {
                 return Err(Error::corruption(
                     "schema",
@@ -113,10 +124,12 @@ impl ColumnType {
         match self {
             ColumnType::Int8 => "bigint",
             ColumnType::Int4 => "integer",
+            ColumnType::Varchar => "character varying",
             ColumnType::Text => "text",
             ColumnType::Bool => "boolean",
             ColumnType::Bytea => "bytea",
             ColumnType::TimestampTz => "timestamp with time zone",
+            ColumnType::Timestamp => "timestamp without time zone",
             ColumnType::Double => "double precision",
         }
     }
@@ -124,7 +137,10 @@ impl ColumnType {
     /// Whether values of this type are stored as a run of bytes rather than a fixed width.
     #[must_use]
     pub fn is_variable_length(self) -> bool {
-        matches!(self, ColumnType::Text | ColumnType::Bytea)
+        matches!(
+            self,
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Bytea
+        )
     }
 }
 
@@ -145,6 +161,8 @@ pub enum Value {
     Bytea(Vec<u8>),
     /// A [`ColumnType::TimestampTz`], microseconds from 2000-01-01 UTC.
     TimestampTz(i64),
+    /// A [`ColumnType::Timestamp`], microseconds from 2000-01-01.
+    Timestamp(i64),
     /// A [`ColumnType::Double`].
     Double(f64),
 }
@@ -157,10 +175,13 @@ impl Value {
             Value::Null => true,
             Value::Int8(_) => ty == ColumnType::Int8,
             Value::Int4(_) => ty == ColumnType::Int4,
-            Value::Text(_) => ty == ColumnType::Text,
+            // One representation, two types: there is no `Value::Varchar` because there would be
+            // nothing in it a `Text` does not hold.
+            Value::Text(_) => matches!(ty, ColumnType::Text | ColumnType::Varchar),
             Value::Bool(_) => ty == ColumnType::Bool,
             Value::Bytea(_) => ty == ColumnType::Bytea,
             Value::TimestampTz(_) => ty == ColumnType::TimestampTz,
+            Value::Timestamp(_) => ty == ColumnType::Timestamp,
             Value::Double(_) => ty == ColumnType::Double,
         }
     }
@@ -182,6 +203,7 @@ impl Value {
             Value::Bool(_) => ColumnType::Bool,
             Value::Bytea(_) => ColumnType::Bytea,
             Value::TimestampTz(_) => ColumnType::TimestampTz,
+            Value::Timestamp(_) => ColumnType::Timestamp,
             Value::Double(_) => ColumnType::Double,
         })
     }
@@ -191,7 +213,7 @@ impl Value {
     pub fn as_ref(&self) -> ValueRef<'_> {
         match self {
             Value::Null => ValueRef::Null,
-            Value::Int8(v) | Value::TimestampTz(v) => ValueRef::Int(*v),
+            Value::Int8(v) | Value::TimestampTz(v) | Value::Timestamp(v) => ValueRef::Int(*v),
             Value::Int4(v) => ValueRef::Int(i64::from(*v)),
             Value::Bool(v) => ValueRef::Bool(*v),
             Value::Double(v) => ValueRef::Double(*v),
@@ -284,6 +306,7 @@ impl ValueRef<'_> {
             (ValueRef::Null, _) => Value::Null,
             (ValueRef::Int(v), ColumnType::Int8) => Value::Int8(v),
             (ValueRef::Int(v), ColumnType::TimestampTz) => Value::TimestampTz(v),
+            (ValueRef::Int(v), ColumnType::Timestamp) => Value::Timestamp(v),
             // Narrowed back from the widened run it rides in. A value outside `i32` cannot have
             // been written by an `Int4` column, so it is corruption rather than a value to clamp.
             (ValueRef::Int(v), ColumnType::Int4) => {
@@ -294,7 +317,7 @@ impl ValueRef<'_> {
             (ValueRef::Bool(v), ColumnType::Bool) => Value::Bool(v),
             (ValueRef::Double(v), ColumnType::Double) => Value::Double(v),
             (ValueRef::Bytes(v), ColumnType::Bytea) => Value::Bytea(v.to_vec()),
-            (ValueRef::Bytes(v), ColumnType::Text) => Value::Text(
+            (ValueRef::Bytes(v), ColumnType::Text | ColumnType::Varchar) => Value::Text(
                 std::str::from_utf8(v)
                     .map_err(|error| Error::corruption("text column", error.to_string()))?
                     .to_owned(),
@@ -432,34 +455,59 @@ mod tests {
         assert_eq!(ColumnType::Bytea.tag(), 4);
         assert_eq!(ColumnType::TimestampTz.tag(), 5);
         assert_eq!(ColumnType::Double.tag(), 6);
-        // Appended by ADR 0033, and the six above it did not move: an old file's tags still name
-        // the types they always named.
+        // Appended by ADR 0033, and the six above them did not move: an old file's tags still
+        // name the types they always named, which is what makes a new type an addition rather
+        // than a format change.
         assert_eq!(ColumnType::Int4.tag(), 7);
+        assert_eq!(ColumnType::Varchar.tag(), 8);
+        assert_eq!(ColumnType::Timestamp.tag(), 9);
 
         for ty in ColumnType::ALL {
             assert_eq!(ColumnType::from_tag(ty.tag()).unwrap(), ty);
         }
         assert!(ColumnType::from_tag(0).unwrap_err().is_corruption());
-        assert!(ColumnType::from_tag(8).unwrap_err().is_corruption());
+        // One past the last: a reader that meets a tag a newer writer used answers corruption
+        // rather than guessing, which is the direction this vocabulary is built to fail in.
+        assert!(ColumnType::from_tag(10).unwrap_err().is_corruption());
     }
 
+    /// A value fits its own type and nothing else — **except** the one pair that is deliberately
+    /// two types over one representation.
+    ///
+    /// `text` and `character varying` are one varlena told apart by OID, which is PostgreSQL's own
+    /// model and the reason [`Value`] has no `Varchar` variant: there would be nothing in one that
+    /// a `Text` does not already hold ([ADR
+    /// 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md)). Every other value is still
+    /// exact, and the loop below asserts that rather than loosening for all of them.
     #[test]
-    fn a_value_fits_its_own_type_and_no_other() {
+    fn a_value_fits_its_own_type_and_only_what_shares_its_representation() {
         let values = [
-            (Value::Int8(1), ColumnType::Int8),
-            (Value::Text("a".into()), ColumnType::Text),
-            (Value::Bool(true), ColumnType::Bool),
-            (Value::Bytea(vec![1]), ColumnType::Bytea),
-            (Value::TimestampTz(1), ColumnType::TimestampTz),
-            (Value::Double(1.0), ColumnType::Double),
+            (Value::Int8(1), &[ColumnType::Int8][..]),
+            (Value::Int4(1), &[ColumnType::Int4][..]),
+            (
+                Value::Text("a".into()),
+                &[ColumnType::Text, ColumnType::Varchar][..],
+            ),
+            (Value::Bool(true), &[ColumnType::Bool][..]),
+            (Value::Bytea(vec![1]), &[ColumnType::Bytea][..]),
+            (Value::TimestampTz(1), &[ColumnType::TimestampTz][..]),
+            (Value::Timestamp(1), &[ColumnType::Timestamp][..]),
+            (Value::Double(1.0), &[ColumnType::Double][..]),
         ];
-        for (value, ty) in &values {
-            assert!(value.fits(*ty));
+        for (value, fits) in &values {
             for other in ColumnType::ALL {
-                assert_eq!(value.fits(other), other == *ty, "{value:?} vs {other:?}");
+                assert_eq!(
+                    value.fits(other),
+                    fits.contains(&other),
+                    "{value:?} vs {other:?}"
+                );
             }
-            assert!(Value::Null.fits(*ty), "NULL fits everything");
+            assert!(Value::Null.fits(fits[0]), "NULL fits everything");
         }
+        // `timestamp` and `timestamptz` share a *width* and not a representation: eight bytes
+        // either way, and a value knows which it is, because they print differently.
+        assert!(!Value::Timestamp(1).fits(ColumnType::TimestampTz));
+        assert!(!Value::TimestampTz(1).fits(ColumnType::Timestamp));
     }
 
     #[test]

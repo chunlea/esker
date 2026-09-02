@@ -98,6 +98,7 @@ fn type_of(value: &Value) -> Option<ValueType> {
         Value::Bool(_) => ValueType::Bool,
         Value::Bytea(_) => ValueType::Bytea,
         Value::TimestampTz(_) => ValueType::TimestampTz,
+        Value::Timestamp(_) => ValueType::Timestamp,
         Value::Double(_) => ValueType::Double,
     })
 }
@@ -111,6 +112,7 @@ fn value_of(value: &Value) -> WireValue {
         Value::Bool(flag) => WireValue::Bool(*flag),
         Value::Bytea(bytes) => WireValue::Bytea(bytes.clone()),
         Value::TimestampTz(ts) => WireValue::TimestampTz(*ts),
+        Value::Timestamp(ts) => WireValue::Timestamp(*ts),
         Value::Double(double) => WireValue::Double(*double),
     }
 }
