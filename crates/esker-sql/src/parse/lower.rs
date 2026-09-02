@@ -65,6 +65,23 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
             Ok(plan::Statement::CreateIndex(lower_create_index(create)?))
         }
         Statement::AlterTable(alter) => Ok(plan::Statement::AlterTable(lower_alter_table(alter)?)),
+        // `CREATE EXTENSION [IF NOT EXISTS] "name"`. The name keeps its case and its hyphens —
+        // `ActiveRecord` writes `"uuid-ossp"` — so it is **not** folded the way a relation name
+        // is: an extension is looked up by the string a control file is named with, not by a
+        // PostgreSQL identifier.
+        Statement::CreateExtension(create) => {
+            // `SCHEMA` and `VERSION` choose where it goes and which version to install; this node
+            // has one schema and offers one version per extension, so honouring the words while
+            // ignoring them would answer a question the user did not ask. `CASCADE` installs an
+            // extension's own dependencies, of which there are none here.
+            refuse_if(create.schema.is_some(), "CREATE EXTENSION ... SCHEMA")?;
+            refuse_if(create.version.is_some(), "CREATE EXTENSION ... VERSION")?;
+            refuse_if(create.cascade, "CREATE EXTENSION ... CASCADE")?;
+            Ok(plan::Statement::CreateExtension(plan::CreateExtension {
+                name: create.name.value.clone(),
+                if_not_exists: create.if_not_exists,
+            }))
+        }
         Statement::Drop {
             object_type,
             if_exists,

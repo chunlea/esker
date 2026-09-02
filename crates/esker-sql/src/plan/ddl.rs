@@ -86,6 +86,19 @@ pub struct UniqueConstraint {
     pub columns: Vec<String>,
 }
 
+/// `CREATE EXTENSION [IF NOT EXISTS] name`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateExtension {
+    /// The extension's name, as written — **case-sensitively**, because `ActiveRecord` quotes it
+    /// (`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`) and a hyphenated name has to survive.
+    pub name: String,
+    /// `IF NOT EXISTS`: an extension already installed is a notice rather than a `42710`.
+    ///
+    /// It covers **existence only**. An extension this build does not have is `0A000 … is not
+    /// available` with or without the clause — measured, both spellings.
+    pub if_not_exists: bool,
+}
+
 /// `DROP TABLE`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropTable {

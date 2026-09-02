@@ -18,13 +18,16 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT parent.relname FROM pg_catalog.pg_inherits i JOIN pg_catalog.pg_class child ON i.inhrelid = child.oid JOIN pg_catalog.pg_class parent ON i.inhparent = parent.oid LEFT JOIN pg_namespace n ON n.oid = child.relnamespace WHERE child.relname = 'ak' AND child.relkind IN ('r','p') AND n.nspname = ANY (current_schemas(false))",
         "SELECT extname FROM pg_extension WHERE extname = 'nope'",
     ],
-    // **Three, and all three are `plpgsql`.** Every PostgreSQL database has it installed, so a
-    // real server's `pg_extension` holds one row and this node's holds none. That is a declared
-    // divergence and not a gap: a row here would tell a client
-    // `CREATE FUNCTION … LANGUAGE plpgsql` will work, and this node has no procedural language and
-    // no `CREATE EXTENSION` — the same argument that keeps `pg_collation` and `pg_range` empty.
-    // `ActiveRecord` turns the answer into `enable_extension` lines in a schema dump, and none is
-    // the truth here.
+    // **Two, and `plpgsql` is no longer one of them.** This file used to declare `pg_extension`
+    // empty — a row would have claimed `CREATE FUNCTION … LANGUAGE plpgsql` works — and the
+    // `CREATE EXTENSION` unit made the claim true in the only sense that matters here: `plpgsql`
+    // is installed, both extension views say so, and `count(*)` agrees with a real server. That
+    // entry was deleted rather than kept, which is ADR 0031's rule 2.
+    //
+    // What is left are the two rows a real server's own `pg_extension` has because the *oracle*
+    // installed them for `postgresql_specific_schema.rb`, and this node has not: they are
+    // available here and not installed until a `CREATE EXTENSION` says so, which is the state a
+    // fresh database is in on both.
     //
     // `pg_inherits` agrees on every line, because nothing inherits on either side.
     answers: &[
@@ -36,10 +39,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT extname, extnamespace FROM pg_extension",
             "The same row, read directly.",
-        ),
-        (
-            "SELECT count(*) FROM pg_extension",
-            "1 against 0, which is the same fact counted.",
         ),
     ],
 };
@@ -57,18 +56,20 @@ fn every_extension_and_inherits_answer_is_postgresql_19_s() {
     );
 }
 
-/// A relation that is there and empty, not a relation that is missing.
+/// A relation that is **there**, not a relation that is missing.
 ///
 /// The difference is the whole unit: `42P01` makes `ActiveRecord` raise, and no rows makes it
 /// carry on with an empty list. Both views are read on every boot, and neither answer depends on
 /// anything this node has.
 #[test]
-fn both_views_resolve_and_hold_nothing() {
+fn both_views_resolve_and_answer() {
     let mut node = parity::Node::new(&[]);
     for view in ["pg_extension", "pg_inherits"] {
+        // `pg_inherits` holds nothing; `pg_extension` holds `plpgsql`, which every PostgreSQL
+        // database has installed before anything runs.
         assert_eq!(
             node.rows(&format!("SELECT count(*) FROM {view}")),
-            [["0"]],
+            [[if view == "pg_extension" { "1" } else { "0" }]],
             "for {view}"
         );
         // A stub that answered every column would hide the day one of them matters.

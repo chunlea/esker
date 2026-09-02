@@ -816,6 +816,23 @@ pub enum SqlError {
     #[error("value too long for type {0}")]
     StringDataRightTruncation(String),
 
+    /// `CREATE EXTENSION x` where `x` is already installed: `42710 duplicate_object`.
+    ///
+    /// `IF NOT EXISTS` turns this into a plain success — that is the **only** thing the clause
+    /// covers, and it does nothing for an extension the build does not have
+    /// ([`SqlError::ExtensionNotAvailable`]).
+    #[error("extension \"{0}\" already exists")]
+    DuplicateExtension(String),
+
+    /// `CREATE EXTENSION x` where this build has no `x`: `0A000`, with PostgreSQL's own HINT.
+    ///
+    /// Not `42704` and not a syntax error: a real server calls an extension it cannot find on
+    /// disk a *feature it does not have*, which is what it is here too. `IF NOT EXISTS` does
+    /// **not** cover it — measured, the message and the HINT are identical with and without the
+    /// clause — because the clause is about existence and this is about availability.
+    #[error("extension \"{0}\" is not available")]
+    ExtensionNotAvailable(String),
+
     /// A constraint name the relation already has: `42710`.
     #[error("constraint \"{constraint}\" for relation \"{relation}\" already exists")]
     DuplicateConstraint {
@@ -1074,6 +1091,7 @@ impl SqlError {
             SqlError::FeatureNotSupported(_)
             | SqlError::CannotConvert { .. }
             | SqlError::NonStandardStringLiterals
+            | SqlError::ExtensionNotAvailable(_)
             | SqlError::SnapshotIsolationRequired => sqlstate::FEATURE_NOT_SUPPORTED,
             SqlError::CardinalityViolation => sqlstate::CARDINALITY_VIOLATION,
             SqlError::SubqueryColumns(_)
@@ -1182,7 +1200,9 @@ impl SqlError {
             SqlError::DependentObjectsStillExist { .. } | SqlError::DependentTable { .. } => {
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST
             }
-            SqlError::DuplicateConstraint { .. } => sqlstate::DUPLICATE_OBJECT,
+            SqlError::DuplicateConstraint { .. } | SqlError::DuplicateExtension(_) => {
+                sqlstate::DUPLICATE_OBJECT
+            }
             SqlError::StringDataRightTruncation(_) => sqlstate::STRING_DATA_RIGHT_TRUNCATION,
             SqlError::UnsupportedUnicodeEscape => sqlstate::UNSUPPORTED_UNICODE_ESCAPE,
             // A declared length is `22023` too, which is not a family resemblance with the
@@ -1292,6 +1312,12 @@ impl SqlError {
                     .to_owned(),
             ),
             SqlError::Syntax { hint, .. } => hint.map(str::to_owned),
+            // PostgreSQL's own, verbatim: the extension is missing from the *system*, not from the
+            // statement, so the fix is outside SQL.
+            SqlError::ExtensionNotAvailable(_) => Some(
+                "The extension must first be installed on the system where PostgreSQL is running."
+                    .to_owned(),
+            ),
             // PostgreSQL owns `CHECKPOINT` for forcing a WAL checkpoint, so this node refuses it
             // by name (contract C2) and does not take the word for something else. A user who
             // wrote it was almost certainly reaching for a named checkpoint, which exists here.

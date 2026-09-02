@@ -1,0 +1,47 @@
+# `CREATE EXTENSION` — statement 703 of `postgresql_specific_schema.rb`, and rung 4's stopper.
+#
+# Captured in **one rolled-back session** against the `esker-pg19` container, with the error probes
+# in `SAVEPOINT`/`ROLLBACK TO` so one refusal does not abort the block, and a count outside the
+# transaction proving nothing survived. Installing an extension is a write, and an oracle a capture
+# changed is not an oracle. (The `SAVEPOINT` lines are not repeated here: each line of a corpus is
+# its own transaction, so a refusal poisons nothing.)
+#
+# The two names are the suite's own — `uuid-ossp` and `pgcrypto` — which are also **exactly** the
+# two this node's build offers. That allowlist is a decision, not a measurement: an extension is on
+# it when the schema needs it in order to load, and nothing else goes on it, because an entry tells
+# a client this server has something.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`IF NOT EXISTS` covers existence, not availability.** An unknown name is
+#     `0A000 extension "x" is not available` **with or without** the clause — measured, both
+#     spellings, the same message and the same HINT. The clause only turns the *already installed*
+#     case from `42710` into a success, and it emits a `NOTICE` when it does.
+#   * **The installed version is the extension's `default_version`**, not one the statement picks:
+#     `uuid-ossp` installs at `1.1` and `pgcrypto` at `1.4`. Afterwards `installed_version` equals
+#     `default_version`, and `pg_extension` and `pg_available_extensions` have to agree — they are
+#     one fact read two ways.
+#   * **A second `IF NOT EXISTS` does not upgrade anything.** Plain success, same version.
+#   * **`plpgsql` is already installed before anything runs**, on a real server and here, so
+#     `pg_extension` is never empty and the count after installing both is **3**.
+#   * **Installing an extension does not bring the functions it carries.** `uuid_generate_v4()` is
+#     still `42883` on this node — the statement's job is to let the schema load. That is a
+#     declared divergence and the last line of this file.
+SELECT extname, extversion FROM pg_extension ORDER BY extname	name,text	plpgsql|1.0
+SELECT count(*) FROM pg_extension WHERE extname IN ('uuid-ossp','pgcrypto')	bigint	0
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp"		-
+CREATE EXTENSION IF NOT EXISTS "pgcrypto"		-
+SELECT extname, extversion FROM pg_extension WHERE extname IN ('uuid-ossp','pgcrypto') ORDER BY extname	name,text	pgcrypto|1.4 ; uuid-ossp|1.1
+SELECT name, default_version, installed_version FROM pg_available_extensions WHERE name IN ('uuid-ossp','pgcrypto') ORDER BY name	name,text,text	pgcrypto|1.4|1.4 ; uuid-ossp|1.1|1.1
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp"		-
+SELECT count(*) FROM pg_extension	bigint	3
+CREATE EXTENSION "uuid-ossp"	!42710 extension "uuid-ossp" already exists
+CREATE EXTENSION IF NOT EXISTS "nosuchextension"	!0A000 extension "nosuchextension" is not available HINT: The extension must first be installed on the system where PostgreSQL is running.
+CREATE EXTENSION "nosuchextension"	!0A000 extension "nosuchextension" is not available HINT: The extension must first be installed on the system where PostgreSQL is running.
+CREATE EXTENSION IF NOT EXISTS "plpgsql"		-
+SELECT count(*) FROM pg_extension	bigint	3
+SELECT uuid_generate_v4() IS NOT NULL	boolean	t

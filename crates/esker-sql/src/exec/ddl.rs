@@ -296,6 +296,38 @@ fn unique_indexes(
     Ok(indexes)
 }
 
+/// `CREATE EXTENSION [IF NOT EXISTS] name`.
+///
+/// Three outcomes and the clause only changes one of them:
+///
+/// * the build **does not have** it — `0A000 extension "x" is not available`, with PostgreSQL's
+///   own HINT, **whether or not** `IF NOT EXISTS` was written. Measured, both spellings. The
+///   clause is about existence and this is about availability;
+/// * it is **already installed** — `42710` without the clause, a notice and a plain success with
+///   it, and either way the version does not change;
+/// * otherwise it is recorded at the version the build offers, which is the `default_version`
+///   `pg_available_extensions` was already reporting. The two views are one fact and this is where
+///   it is written.
+pub(super) fn create_extension(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    create: &plan::CreateExtension,
+) -> Result<Outcome> {
+    let done = Ok(Outcome::done("CREATE EXTENSION"));
+    let Some(version) = catalog::pg_catalog::available_extension(&create.name) else {
+        return Err(SqlError::ExtensionNotAvailable(create.name.clone()));
+    };
+    if catalog::pg_catalog::is_installed(txn, executor.tenant, &create.name)? {
+        if create.if_not_exists {
+            executor.notice(SqlError::AlreadyExistsSkipping(create.name.clone()));
+            return done;
+        }
+        return Err(SqlError::DuplicateExtension(create.name.clone()));
+    }
+    catalog::install_extension(txn, executor.tenant, &create.name, version);
+    done
+}
+
 /// `ALTER TABLE … ENABLE`/`DISABLE TRIGGER ALL`.
 ///
 /// One flag on the table, written the way every other constraint change is written — and it

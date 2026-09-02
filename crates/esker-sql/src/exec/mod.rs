@@ -351,6 +351,7 @@ impl Executor {
         self.catalog_written |= statement.writes_catalog();
         match statement {
             Statement::CreateTable(create) => ddl::create_table(self, txn, create),
+            Statement::CreateExtension(create) => ddl::create_extension(self, txn, create),
             Statement::DropTable(drop) => ddl::drop_table(self, txn, drop),
             Statement::CreateIndex(create) => ddl::create_index(self, txn, create),
             Statement::DropIndex(drop) => ddl::drop_index(self, txn, drop),
@@ -1276,6 +1277,9 @@ fn has_sequence_call(expr: &crate::plan::Expr) -> bool {
 fn explain_lines(statement: &Statement) -> Vec<String> {
     match statement {
         Statement::CreateTable(create) => vec![format!("Create Table on {}", create.name)],
+        Statement::CreateExtension(create) => {
+            vec![format!("Create Extension on {}", create.name)]
+        }
         Statement::DropTable(drop) => vec![format!("Drop Table on {}", drop.names.join(", "))],
         Statement::CreateIndex(create) => vec![format!("Create Index on {}", create.table)],
         Statement::DropIndex(drop) => vec![format!("Drop Index on {}", drop.names.join(", "))],

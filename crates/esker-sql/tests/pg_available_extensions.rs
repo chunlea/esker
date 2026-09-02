@@ -23,10 +23,31 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // differs while every value agrees.
         "SELECT name, default_version, installed_version FROM pg_available_extensions WHERE name \
          = 'plpgsql'",
-        "SELECT name, default_version, installed_version FROM pg_available_extensions WHERE name \
-         = 'hstore'",
     ],
     answers: &[
+        // **Three, and all three are `hstore`**, which this build no longer offers. The
+        // `CREATE EXTENSION` unit set the available list to exactly what
+        // `postgresql_specific_schema.rb` needs in order to load — `uuid-ossp` and `pgcrypto` —
+        // and took `hstore` off it: an entry there tells a client this server has something, and
+        // `hstore` brings a type this node does not have. A real server has it available and
+        // uninstalled, so these three answer where this node answers nothing.
+        //
+        // The shape they were here to prove — available-and-not-installed — is unchanged and is
+        // now carried by `pgcrypto`, in the test below.
+        (
+            "SELECT true FROM pg_available_extensions WHERE name = 'hstore'",
+            "`hstore` is available on a real server and is not on this build's allowlist.",
+        ),
+        (
+            "SELECT installed_version IS NOT NULL FROM pg_available_extensions WHERE name = \
+             'hstore'",
+            "The same, through `extension_enabled?`'s own expression: `f` there, no row here.",
+        ),
+        (
+            "SELECT name, default_version, installed_version FROM pg_available_extensions WHERE \
+             name = 'hstore'",
+            "The same again, read directly.",
+        ),
         (
             "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = \
              'pg_available_extensions' ORDER BY ordinal_position",
@@ -86,13 +107,19 @@ fn one_query_shape_carries_three_answers() {
         vec![vec!["t"]]
     );
     // Available and not installed: `f`, and a real `default_version` beside a NULL version.
+    //
+    // **`pgcrypto` rather than `hstore`.** The `CREATE EXTENSION` unit set this build's available
+    // list to exactly what `postgresql_specific_schema.rb` needs in order to load — `uuid-ossp`
+    // and `pgcrypto` — and took `hstore` off it, because an entry here tells a client this server
+    // has something and `hstore` brings a type this node does not have. The three-answer shape
+    // this test exists for is unchanged; only the name carrying the middle answer moved.
     assert_eq!(
-        node.rows("SELECT installed_version IS NOT NULL FROM pg_available_extensions WHERE name = 'hstore'"),
+        node.rows("SELECT installed_version IS NOT NULL FROM pg_available_extensions WHERE name = 'pgcrypto'"),
         vec![vec!["f"]]
     );
     assert_eq!(
-        node.rows("SELECT default_version, installed_version FROM pg_available_extensions WHERE name = 'hstore'"),
-        vec![vec!["1.8", "\\N"]]
+        node.rows("SELECT default_version, installed_version FROM pg_available_extensions WHERE name = 'pgcrypto'"),
+        vec![vec!["1.4", "\\N"]]
     );
     // Unknown: **no row at all** — not `f`, and not an error.
     assert!(
@@ -101,7 +128,7 @@ fn one_query_shape_carries_three_answers() {
     );
     // `extension_available?`'s own shape, which is `true` for both of the two and nothing else.
     assert_eq!(
-        node.rows("SELECT true FROM pg_available_extensions WHERE name = 'hstore'"),
+        node.rows("SELECT true FROM pg_available_extensions WHERE name = 'pgcrypto'"),
         vec![vec!["t"]]
     );
     assert!(

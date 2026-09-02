@@ -285,6 +285,9 @@ impl CatalogView {
             CatalogView::PgExtension => &[
                 ("extname", ColumnType::Text),
                 ("extnamespace", ColumnType::Int8),
+                // Added for `CREATE EXTENSION`, which is where a version comes from: the one the
+                // build offers as `default_version`, not one the statement chooses.
+                ("extversion", ColumnType::Text),
             ],
             CatalogView::PgInherits => &[
                 ("inhrelid", ColumnType::Int8),
@@ -355,6 +358,40 @@ impl CatalogView {
                 Datum::Int8(PUBLIC_NAMESPACE_OID),
                 Datum::Text(PUBLIC_SCHEMA.to_owned()),
             ]]),
+            // **One fact read two ways.** Which extensions are installed is stored, and both of
+            // these views report it — `pg_extension` as a row per installed extension and
+            // `pg_available_extensions` as a non-NULL `installed_version` beside every available
+            // one. They disagreed before `CREATE EXTENSION` existed, because one was a constant
+            // that said `plpgsql` was installed and the other held nothing at all.
+            CatalogView::PgExtension => Ok(installed(txn, tenant)?
+                .into_iter()
+                .map(|(name, version)| {
+                    vec![
+                        Datum::Text(name),
+                        Datum::Int8(PUBLIC_NAMESPACE_OID),
+                        Datum::Text(version),
+                    ]
+                })
+                .collect()),
+            CatalogView::PgAvailableExtensions => {
+                let installed = installed(txn, tenant)?;
+                Ok(AVAILABLE_EXTENSIONS
+                    .iter()
+                    .map(|(name, default_version)| {
+                        let version = installed
+                            .iter()
+                            .find(|(installed, _)| installed == name)
+                            .map(|(_, version)| Datum::Text(version.clone()));
+                        vec![
+                            Datum::Text((*name).to_owned()),
+                            Datum::Text((*default_version).to_owned()),
+                            version.unwrap_or(Datum::Null),
+                            Datum::Null,
+                            Datum::Null,
+                        ]
+                    })
+                    .collect())
+            }
             constant => Ok(constant.rows()),
         }
     }
@@ -394,34 +431,21 @@ impl CatalogView {
                 });
                 rows
             }
-            // **Two rows, and the pair is the point.** `plpgsql` is installed — its
-            // `installed_version` is set, so `extension_enabled?` is `t` — and `hstore` is
-            // available and not installed, so the same expression is `f` and `default_version` is
-            // still a real version. Any name that is not one of these two matches no row at all,
-            // which is `ActiveRecord`'s third case and the one a `WHERE` gives for free.
+            // **The available set is a property of the build**, and which of them is installed is
+            // state — so the rows are constants and their `installed_version` is not. `plpgsql`
+            // is installed from the start, as it is on every PostgreSQL database; `hstore` is
+            // available and not installed until a `CREATE EXTENSION` says otherwise. A name that
+            // is neither matches no row at all, which is `ActiveRecord`'s third case
+            // (`extension_available?` is `nil`) and the one a `WHERE` gives for free.
             //
-            // `location` and `comment` are NULL: a real server fills them from the filesystem it
-            // found the control file on, and there is no such file here. Neither is read by the
-            // two methods this view exists for.
-            CatalogView::PgAvailableExtensions => vec![
-                vec![
-                    Datum::Text("hstore".to_owned()),
-                    Datum::Text("1.8".to_owned()),
-                    Datum::Null,
-                    Datum::Null,
-                    Datum::Null,
-                ],
-                vec![
-                    Datum::Text("plpgsql".to_owned()),
-                    Datum::Text("1.0".to_owned()),
-                    Datum::Text("1.0".to_owned()),
-                    Datum::Null,
-                    Datum::Null,
-                ],
-            ],
+            // `location` and `comment` are NULL: a real server fills them from the control file it
+            // found on disk, and there is none here. Neither is read by the two methods this view
+            // exists for.
             // `PgRange` and `PgCollation` have none, and the catalog-backed views never reach
-            // here — `rows_of` answers for those before it delegates.
-            CatalogView::PgRange
+            // here — `rows_of` answers for those before it delegates, the two extension views
+            // included.
+            CatalogView::PgAvailableExtensions
+            | CatalogView::PgRange
             | CatalogView::PgCollation
             | CatalogView::PgExtension
             | CatalogView::PgInherits
@@ -525,6 +549,59 @@ pub fn refuse_write(name: &str) -> Result<()> {
 /// it. What has to be true is only that `relnamespace` equals `pg_namespace.oid`, which is the
 /// join `ActiveRecord` writes.
 const PUBLIC_NAMESPACE_OID: i64 = 11;
+
+/// The extensions this build offers, with the version each installs at.
+///
+/// A **property of the build, not of the tenant**: it says what a `CREATE EXTENSION` can succeed
+/// at, and every other name is `0A000 … is not available` with PostgreSQL's own HINT.
+///
+/// **Exactly the ones `postgresql_specific_schema.rb` needs in order to load**, and no more. The
+/// versions are the oracle's own (`pgcrypto` 1.4, `uuid-ossp` 1.1), and `plpgsql` is
+/// [`PRE_INSTALLED`] rather than merely available, which is what every PostgreSQL database
+/// reports for it.
+///
+/// **Installing one does not bring the functions it carries.** `uuid_generate_v4()` and
+/// `gen_random_uuid()` are still `42883` naming themselves — the statement's job is to let the
+/// schema load, and a function this node does not have is a gap of its own with its own capture.
+/// The list is deliberately short for the reason `pg_type` is: an entry here tells a client this
+/// server has something, so a type-bearing extension does not go on it until the type does.
+const AVAILABLE_EXTENSIONS: [(&str, &str); 3] = [
+    ("pgcrypto", "1.4"),
+    ("plpgsql", "1.0"),
+    ("uuid-ossp", "1.1"),
+];
+
+/// The extension every database has installed before anything runs.
+const PRE_INSTALLED: (&str, &str) = ("plpgsql", "1.0");
+
+/// Every installed extension, in name order: the one that is always there, then whatever a
+/// `CREATE EXTENSION` recorded.
+fn installed(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<(String, String)>> {
+    let mut rows = vec![(PRE_INSTALLED.0.to_owned(), PRE_INSTALLED.1.to_owned())];
+    for (name, version) in super::installed_extensions(txn, tenant)? {
+        if name != PRE_INSTALLED.0 {
+            rows.push((name, version));
+        }
+    }
+    rows.sort();
+    Ok(rows)
+}
+
+/// Whether this tenant has already installed an extension.
+pub fn is_installed(txn: &dyn crate::backend::Txn, tenant: u64, name: &str) -> Result<bool> {
+    Ok(installed(txn, tenant)?
+        .iter()
+        .any(|(installed, _)| installed == name))
+}
+
+/// Whether this build has an extension, and the version it would install at.
+#[must_use]
+pub fn available_extension(name: &str) -> Option<&'static str> {
+    AVAILABLE_EXTENSIONS
+        .iter()
+        .find(|(available, _)| *available == name)
+        .map(|(_, version)| *version)
+}
 
 /// The schema every relation is in.
 const PUBLIC_SCHEMA: &str = "public";

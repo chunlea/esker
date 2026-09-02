@@ -31,9 +31,9 @@ mod time_machine;
 pub use crate::catalog::Identity;
 pub use crate::catalog::pg_catalog::CatalogView;
 pub use ddl::{
-    AlterTable, AlterTableAction, Column, CreateIndex, CreateTable, DropIndex, DropTable,
-    ForeignKey, IndexKeyPart, KeyPartName, UniqueConstraint, foreign_key_name, index_name,
-    primary_key_name, sequence_name, unique_constraint_name,
+    AlterTable, AlterTableAction, Column, CreateExtension, CreateIndex, CreateTable, DropIndex,
+    DropTable, ForeignKey, IndexKeyPart, KeyPartName, UniqueConstraint, foreign_key_name,
+    index_name, primary_key_name, sequence_name, unique_constraint_name,
 };
 pub use dml::{Delete, Insert, Returning, Update};
 pub use expr::{
@@ -63,6 +63,10 @@ pub enum Statement {
     CreateTable(CreateTable),
     /// `DROP TABLE`.
     DropTable(DropTable),
+    /// `CREATE EXTENSION [IF NOT EXISTS] name` — a catalog write and nothing else here: it records
+    /// that the extension is installed, and what an extension *carries* is either already in this
+    /// build or is why the name is not available.
+    CreateExtension(CreateExtension),
     /// `CREATE INDEX`, and the `UNIQUE` variant.
     CreateIndex(CreateIndex),
     /// `DROP INDEX`.
@@ -145,6 +149,8 @@ impl Statement {
             Statement::Update(_) => Some("UPDATE"),
             Statement::Delete(_) => Some("DELETE"),
             Statement::CreateTable(_) => Some("CREATE TABLE"),
+            // A catalog write like the rest, so a read-only or time-travelling block refuses it.
+            Statement::CreateExtension(_) => Some("CREATE EXTENSION"),
             Statement::DropTable(_) => Some("DROP TABLE"),
             Statement::CreateIndex(_) => Some("CREATE INDEX"),
             Statement::DropIndex(_) => Some("DROP INDEX"),
@@ -178,6 +184,7 @@ impl Statement {
     pub fn tag(&self) -> &'static str {
         match self {
             Statement::CreateTable(_) => "CREATE TABLE",
+            Statement::CreateExtension(_) => "CREATE EXTENSION",
             Statement::DropTable(_) => "DROP TABLE",
             Statement::CreateIndex(_) => "CREATE INDEX",
             Statement::DropIndex(_) => "DROP INDEX",

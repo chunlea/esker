@@ -167,6 +167,7 @@ fn walk(
         // either that a `$1` could stand in.
         Statement::CreateTable(_)
         | Statement::DropTable(_)
+        | Statement::CreateExtension(_)
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
         | Statement::AlterTable(_)
@@ -281,6 +282,7 @@ pub(super) fn walk_mut(statement: &mut Statement, visit: &mut impl FnMut(&mut Ex
         // either that a `$1` could stand in.
         Statement::CreateTable(_)
         | Statement::DropTable(_)
+        | Statement::CreateExtension(_)
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
         | Statement::AlterTable(_)
@@ -363,6 +365,7 @@ pub(super) fn table_names(statement: &Statement) -> Vec<&str> {
         Statement::Explain(inner, _) => table_names(inner),
         Statement::CreateTable(_)
         | Statement::DropTable(_)
+        | Statement::CreateExtension(_)
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
         // DDL over a table, but nothing here needs its column types: a parameter cannot appear
@@ -422,6 +425,7 @@ fn for_each_expr(statement: &Statement, visit: &mut impl FnMut(&Expr)) {
         // either that a `$1` could stand in.
         Statement::CreateTable(_)
         | Statement::DropTable(_)
+        | Statement::CreateExtension(_)
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
         | Statement::AlterTable(_)

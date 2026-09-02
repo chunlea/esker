@@ -85,6 +85,11 @@ pub(crate) const CATALOG_FORMAT_VERSION: u8 = 12;
 /// backend since phase 6a unit 11 — so it is read rather than refused.
 const OLDEST_TABLE_VERSION: u8 = 2;
 
+/// The catalog version an **extension** record first existed at. Nothing older can hold one, and
+/// a reader newer than 12 must still accept the ones version 12 wrote — which is what this floor
+/// says and `CATALOG_FORMAT_VERSION` would not.
+const OLDEST_EXTENSION_VERSION: u8 = 12;
+
 /// What every catalog key begins with, after the `'m'` namespace byte.
 const SQL: &[u8] = b"sql";
 
@@ -104,6 +109,10 @@ const KIND_SEQUENCE: u8 = b'q';
 const KIND_SEQUENCE_VALUE: u8 = b'e';
 /// A `FOREIGN KEY`'s **back**-reference: parent id first, so "who references me" is a prefix scan.
 const KIND_FK_BACKREF: u8 = b'k';
+/// An **installed** extension, keyed by name. The available ones are a property of the build and
+/// are not stored; which of them a tenant has installed is state, and a real server's outlives the
+/// session that installed it.
+const KIND_EXTENSION: u8 = b'x';
 
 /// Tags for [`ColumnType`] as stored. Ours rather than PostgreSQL's OIDs, because these are a
 /// format we own and must never move; the OIDs stay on the wire where they belong.
@@ -359,6 +368,53 @@ pub(super) fn retention_key(tenant: u64, table_id: u64) -> Vec<u8> {
     codec::encode_u64(tenant, &mut suffix);
     codec::encode_u64(table_id, &mut suffix);
     prefix::meta_key(&suffix)
+}
+
+/// One installed extension: the tenant, then the name.
+///
+/// The name rather than an id, because that is what every statement and every view looks it up by
+/// — `CREATE EXTENSION "hstore"`, `WHERE extname = 'hstore'` — and an extension has no other
+/// identity a client can see.
+#[must_use]
+pub(super) fn extension_key(tenant: u64, name: &str) -> Vec<u8> {
+    let mut suffix = [SQL, &[KIND_EXTENSION]].concat();
+    codec::encode_u64(tenant, &mut suffix);
+    suffix.extend_from_slice(name.as_bytes());
+    prefix::meta_key(&suffix)
+}
+
+/// Every installed extension of one tenant: the range [`extension_key`] writes into.
+#[must_use]
+pub(super) fn extension_range(tenant: u64) -> (Vec<u8>, Vec<u8>) {
+    let start = extension_key(tenant, "");
+    let mut end = start.clone();
+    end.push(0xff);
+    (start, end)
+}
+
+/// The name out of a key [`extension_key`] wrote.
+pub(super) fn extension_name_of(tenant: u64, key: &[u8]) -> Result<String> {
+    let prefix = extension_key(tenant, "");
+    let name = key
+        .strip_prefix(prefix.as_slice())
+        .ok_or_else(|| corrupt("an extension key outside its own range"))?;
+    String::from_utf8(name.to_vec()).map_err(|_| corrupt("an extension name that is not UTF-8"))
+}
+
+/// An installed extension's version, behind the same version byte as every other record.
+#[must_use]
+pub(super) fn encode_extension(version: &str) -> Vec<u8> {
+    let mut out = vec![CATALOG_FORMAT_VERSION];
+    put_str(version, &mut out);
+    out
+}
+
+/// Reads one back.
+pub(super) fn decode_extension(bytes: &[u8]) -> Result<String> {
+    let mut reader = Reader::at_least(bytes, OLDEST_EXTENSION_VERSION)?;
+    let version = reader.string()?;
+    reader.finish()?;
+    Ok(version)
 }
 
 /// A retention, in milliseconds, behind the same version byte as every other record.

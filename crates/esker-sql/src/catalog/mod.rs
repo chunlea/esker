@@ -1158,6 +1158,34 @@ impl View<'_> {
 /// The key that records "`child` has a `FOREIGN KEY` into `parent`".
 ///
 /// Written when the constraint is made and removed when either table is dropped. See
+/// Records an extension as installed, at the version its build offers.
+///
+/// A catalog write like any other, so it commits and rolls back with the transaction that ran the
+/// `CREATE EXTENSION` — which is what a real server does, and what makes the statement safe inside
+/// the schema-load transaction `ActiveRecord` wraps everything in.
+pub fn install_extension(txn: &mut dyn Txn, tenant: u64, name: &str, version: &str) {
+    txn.put(
+        &record::extension_key(tenant, name),
+        &record::encode_extension(version),
+    );
+}
+
+/// Every extension this tenant has installed, by name, in name order.
+///
+/// One prefix scan. The **available** set is a property of the build and is not stored — which of
+/// them is installed is the only part that is state.
+pub fn installed_extensions(txn: &dyn Txn, tenant: u64) -> Result<Vec<(String, String)>> {
+    let (start, end) = record::extension_range(tenant);
+    let mut installed = Vec::new();
+    for (key, value) in txn.scan(&start, &end, 0)? {
+        installed.push((
+            record::extension_name_of(tenant, &key)?,
+            record::decode_extension(&value)?,
+        ));
+    }
+    Ok(installed)
+}
+
 /// `record::fk_backref_key`: the parent comes first so that "who references me" is a prefix scan
 /// rather than a scan of every table in the catalog.
 #[must_use]
@@ -1905,6 +1933,45 @@ mod tests {
                 .sqlstate(),
             sqlstate::DATA_CORRUPTED
         );
+    }
+
+    /// An installed extension: a version byte and its version string, and the **key** that says
+    /// which extension it is.
+    ///
+    /// The record has a floor of its own (`OLDEST_EXTENSION_VERSION`) rather than the current
+    /// catalog version, so a reader newer than 12 still accepts what 12 wrote — the same promise
+    /// every other record here makes, asserted rather than assumed.
+    #[test]
+    fn an_extension_record_is_a_version_and_the_version_it_installed_at() {
+        let encoded = record::encode_extension("1.1");
+        assert_eq!(
+            hex(&encoded),
+            concat!(
+                "0c",       // catalog format version
+                "03312e31", // varint 3, "1.1"
+            )
+        );
+        assert_eq!(record::decode_extension(&encoded).unwrap(), "1.1");
+
+        // The name is the key, not the value — an extension has no other identity a client sees.
+        let key = record::extension_key(1, "uuid-ossp");
+        let (start, end) = record::extension_range(1);
+        assert!(key >= start && key < end, "the key is inside the range");
+        assert_eq!(record::extension_name_of(1, &key).unwrap(), "uuid-ossp");
+        // Another tenant's is outside this one's range, which is what makes the scan per tenant.
+        assert!(record::extension_key(2, "uuid-ossp") >= end);
+    }
+
+    /// **A record written at version 12 still decodes when the catalog version moves on.**
+    ///
+    /// The bug this prevents is a one-word one: reading with `CATALOG_FORMAT_VERSION` as the floor
+    /// instead of the version the kind was introduced at, which refuses every record the previous
+    /// release wrote the day the version is bumped.
+    #[test]
+    fn an_extension_record_from_version_12_still_decodes() {
+        let mut written_at_12 = vec![12u8];
+        written_at_12.extend_from_slice(&[3, b'1', b'.', b'1']);
+        assert_eq!(record::decode_extension(&written_at_12).unwrap(), "1.1");
     }
 
     #[test]
