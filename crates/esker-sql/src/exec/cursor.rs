@@ -1213,7 +1213,7 @@ fn type_oid_argument(arg: Option<&Datum>) -> Result<Option<i64>> {
         Some(Datum::Int2(oid)) => Some(i64::from(*oid)),
         Some(Datum::Text(name)) => {
             use crate::value::PgType as _;
-            let ty = crate::value::type_by_name(name)
+            let ty = crate::value::type_by_name(name)?
                 .ok_or_else(|| SqlError::UndefinedType(name.trim().to_owned()))?;
             Some(i64::from(ty.oid()))
         }

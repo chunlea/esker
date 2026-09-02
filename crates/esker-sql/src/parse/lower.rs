@@ -1438,6 +1438,23 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
         Expr::BinaryOp { left, op, right } if is_comparison(op) && either_is_json(left, right) => {
             Err(refuse_json_comparison(op))
         }
+        // `date + time` and `time + date`, the one arithmetic in this type that answers a type
+        // this node has. Folded here, over **constants only**, which is the same boundary
+        // `lower_cast` draws: a per-row `+` needs a `BinaryOp::Plus` that produces a value rather
+        // than a boolean, and every one of the seventy matches on that enum assumes a comparison.
+        // The per-row form stays `0A000` naming the operator, and
+        // `tests/time.rs::a_column_plus_a_column_is_still_named` pins that it does — so this is a
+        // constant folded, not arithmetic landed.
+        Expr::BinaryOp {
+            op: BinaryOperator::Plus,
+            left,
+            right,
+        } if date_plus_time(left, right)?.is_some() => {
+            let micros = date_plus_time(left, right)?.unwrap_or_default();
+            Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                Datum::Timestamp(micros),
+            ))))
+        }
         Expr::BinaryOp { op, left, right } => {
             let op = match op {
                 BinaryOperator::Eq => plan::BinaryOp::Eq,
@@ -2381,7 +2398,7 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             },
         ) if cast_target(inner_type) == Some(CastTarget::RegType) => {
             let name = cast_operand(inner, data_type)?;
-            let ty = value::type_by_name(&name)
+            let ty = value::type_by_name(&name)?
                 .ok_or_else(|| SqlError::UndefinedType(name.trim().to_owned()))?;
             Ok(plan::Expr::Literal(plan::Literal::Integer(i64::from(
                 ty.oid(),
@@ -2415,7 +2432,7 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
         // `'integer'::regtype` on its own, which answers the name PostgreSQL prints it by.
         (CastTarget::RegType, _) => {
             let name = cast_operand(expr, data_type)?;
-            let ty = value::type_by_name(&name)
+            let ty = value::type_by_name(&name)?
                 .ok_or_else(|| SqlError::UndefinedType(name.trim().to_owned()))?;
             Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
                 Datum::Text(value::format_type(ty, NO_TYPMOD)),
@@ -2564,6 +2581,18 @@ fn refused_cast(expr: &Expr, data_type: &DataType) -> Result<Option<SqlError>> {
             }));
         }
     }
+    // **A `time` casts to a string and to nothing else.** Measured one target at a time against
+    // 19beta1: `text`, `varchar` and `character(n)` are the whole of it, and every other type
+    // this node has — both integers and floats, `numeric`, `bool`, `bytea`, `json`, `jsonb`,
+    // `date` and both timestamps — is `42846 cannot cast type time without time zone to …`.
+    // Without this the cast goes through the rendered text and blames the *value*, which is a
+    // `22P02` about digits for a pair that has no cast at all.
+    let stringy = |ty: ColumnType| {
+        matches!(
+            ty,
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar
+        )
+    };
     Ok(match (source, target) {
         (Some(ColumnType::Date), Some(to)) if numeric(to) => Some(SqlError::CannotCast {
             from: ColumnType::Date.name(),
@@ -2573,8 +2602,62 @@ fn refused_cast(expr: &Expr, data_type: &DataType) -> Result<Option<SqlError>> {
             from: from.name(),
             to: ColumnType::Date.name(),
         }),
+        (Some(ColumnType::Time), Some(to)) if !stringy(to) && to != ColumnType::Time => {
+            Some(SqlError::CannotCast {
+                from: ColumnType::Time.name(),
+                to: to.name(),
+            })
+        }
+        // The other direction is narrower: a `timestamp` **does** cast to a `time` — it is the
+        // clock of the instant — so only the types with no path at all are refused here.
+        (Some(from), Some(ColumnType::Time))
+            if !stringy(from)
+                && !matches!(from, ColumnType::Timestamp | ColumnType::TimestampTz)
+                && from != ColumnType::Time =>
+        {
+            Some(SqlError::CannotCast {
+                from: from.name(),
+                to: ColumnType::Time.name(),
+            })
+        }
         _ => None,
     })
+}
+
+/// `date + time` as an instant, when both sides are constants and one of each.
+///
+/// PostgreSQL's `+` over this pair is a `timestamp` — the day at that time of day — and it is
+/// commutative: `'12:34:56'::time + '2020-01-01'::date` and the reverse are the same value. Both
+/// spellings are in `tests/corpus/pg19_time.txt`.
+///
+/// `Ok(None)` means "not this pair", which is what lets the caller fall through to the ordinary
+/// operator lowering and refuse `+` by name.
+fn date_plus_time(left: &Expr, right: &Expr) -> Result<Option<i64>> {
+    let constant = |expr: &Expr| -> Result<Option<Datum>> {
+        let Some(ty) = source_type(expr)? else {
+            return Ok(None);
+        };
+        if !matches!(ty, ColumnType::Date | ColumnType::Time) {
+            return Ok(None);
+        }
+        match cast_literal_text(expr)? {
+            Some(text) => Datum::from_text(ty, &text).map(Some),
+            None => Ok(None),
+        }
+    };
+    let (Some(left), Some(right)) = (constant(left)?, constant(right)?) else {
+        return Ok(None);
+    };
+    // `date + date` and `time + time` are not this pair: the first has no `+` at all on a real
+    // server and the second is `42725 operator is not unique`.
+    let ((Datum::Date(day), Datum::Time(micros)) | (Datum::Time(micros), Datum::Date(day))) =
+        (left, right)
+    else {
+        return Ok(None);
+    };
+    // The day's midnight plus the time of day. `date::as_micros` is where the day count becomes
+    // an instant, including the two infinities, so this adds to the same epoch a `timestamp` has.
+    Ok(Some(value::date::as_micros(day).saturating_add(micros)))
 }
 
 /// The type a cast's operand already has, for the pairs [`refused_cast`] decides between.
@@ -3327,13 +3410,9 @@ fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
     }
 }
 
-/// PostgreSQL's ceiling on a declared string length, and its floor is one.
-///
-/// Measured on 19beta1, both ends: `varchar(10485761)` is `22023 length for type varchar cannot
-/// exceed 10485760` and `varchar(0)` is `22023 length for type varchar must be at least 1`. Zero
-/// is **not** legal, which is the one a reader would guess wrong — a `varchar(0)` holding only the
-/// empty string is a perfectly coherent type and PostgreSQL declines to have it.
-const MAX_STRING_LENGTH: u32 = 10_485_760;
+/// PostgreSQL's ceiling on a declared string length: [`value::MAX_TYPE_LENGTH`], which a
+/// `regtype` name is held to as well so that the two cannot disagree.
+use crate::value::MAX_TYPE_LENGTH as MAX_STRING_LENGTH;
 
 /// The declared length of a `varchar(n)` or `character(n)`, as a typmod.
 ///

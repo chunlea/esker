@@ -53,24 +53,24 @@ const TYPES: &[&str] = &[
     "SELECT '{\"a\":1}'::json::text, '{\"a\":1}'::text::json",
 ];
 
-/// One of `DIVERGENCES`' nine reasons.
+/// One of `DIVERGENCES`' eight reasons.
 const CATALOG: &str = "`typlen`, `typcategory` and `pg_typeof` are columns and a function this node's \
      `pg_type` does not have — it carries exactly what `ActiveRecord` reads \
      (`catalog/pg_catalog.rs`), and another name is `42703`, the same answer a real \
      server gives for a column that is not there. `format_type` is a function this node \
      does not have.";
-/// One of `DIVERGENCES`' nine reasons.
+/// One of `DIVERGENCES`' eight reasons.
 const ORDER: &str = "The same refusal for the same reason: a byte sort is not `jsonb`'s order, which puts \
      `null` below `1.00` where the bytes put it above.";
-/// One of `DIVERGENCES`' nine reasons.
+/// One of `DIVERGENCES`' eight reasons.
 const CONTAINMENT: &str = "Containment and the editing operators, likewise not built. `@>` is named in this \
      unit's scope and lands with the extraction operators; the rest are a later unit. \
      Each is `0A000` naming itself.";
-/// One of `DIVERGENCES`' nine reasons.
+/// One of `DIVERGENCES`' eight reasons.
 const MESSAGES: &str = "The refusal is the right one and its **text** differs: PostgreSQL adds a `DETAIL` \
      naming the position or the token, which this node does not carry for these two \
      SQLSTATEs. The SQLSTATE and the sentence agree; the detail line does not.";
-/// One of `DIVERGENCES`' nine reasons.
+/// One of `DIVERGENCES`' eight reasons.
 const COMPARISON: &str = "**Comparison over `json` or `jsonb` is refused rather than answered from the \
      bytes**, which is what ADR 0042 turns on: `'1.0'::jsonb = '1.00'::jsonb` is `t` on a \
      real server and byte equality says `f`, and `jsonb` sorts by *kind* before value. \
@@ -80,17 +80,17 @@ const COMPARISON: &str = "**Comparison over `json` or `jsonb` is refused rather 
      the `real` unit's lesson one layer up: a type may share another's representation \
      only if it shares its comparison. `json` has no comparison operators at all on a \
      real server, so refusing there is closer still than refusing `jsonb`.";
-/// One of `DIVERGENCES`' nine reasons.
+/// One of `DIVERGENCES`' eight reasons.
 const OPERATORS: &str = "The extraction operators are not built yet. This unit is the **format addition** — \
      the two types, their storage, and the canonical form `jsonb` prints — and `->`, \
      `->>`, `#>` and `#>>` are the next commit, with these lines as their specification. \
      `0A000` naming the operator is contract C2's answer for a construct that parses and \
      does not run.";
-/// One of `DIVERGENCES`' nine reasons.
+/// One of `DIVERGENCES`' eight reasons.
 const FUNCTIONS: &str = "A `json` function this node does not have, named under contract C2. None is in this \
      unit's scope; the corpus carries them so the unit that adds them starts from the \
      measurement.";
-/// One of `DIVERGENCES`' nine reasons.
+/// One of `DIVERGENCES`' eight reasons.
 const CASTS: &str = "**Both refuse a `jsonb` *object* cast to a scalar; the code and the \
      message differ.** PostgreSQL rejects it in the cast itself, `22023 cannot cast jsonb \
      object to type integer`, where this node renders the object to its text and hands that \
@@ -99,13 +99,6 @@ const CASTS: &str = "**Both refuse a `jsonb` *object* cast to a scalar; the code
      closing when the cast checks the `jsonb` *kind* before rendering. The scalar casts \
      this reason also covered now agree: `::text` landed with the json unit and `::numeric` \
      with this one.";
-/// One of `DIVERGENCES`' nine reasons.
-const REGTYPE: &str = "Both refuse, with different codes: PostgreSQL's *parser* answers `42601 syntax error \
-     at or near \"(\"` because `json` takes no typmod, and this node answers `42704 type \
-     \"json(10)\" does not exist` from the same fact one layer up. A refusal of the right \
-     shape with the wrong code, which closes when the regtype parser distinguishes the \
-     two conditions.";
-
 /// Every statement this node answers differently, each pointing at one reason above.
 const ANSWERS: &[(&str, &str)] = &[
     (
@@ -232,8 +225,6 @@ const ANSWERS: &[(&str, &str)] = &[
         FUNCTIONS,
     ),
     ("SELECT '{\"a\":1}'::jsonb::int", CASTS),
-    ("SELECT 'json(10)'::regtype::oid", REGTYPE),
-    ("SELECT 'jsonb(10)'::regtype::oid", REGTYPE),
     (
         "SELECT NULL::jsonb IS NULL, '{\"a\":1}'::jsonb = NULL",
         COMPARISON,

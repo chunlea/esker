@@ -212,63 +212,204 @@ pub fn format_type(ty: ColumnType, typmod: i32) -> String {
 
 /// The type a name means, under **every spelling PostgreSQL accepts for it**.
 ///
-/// What `'x'::regtype` resolves. Three rules, all measured against 19beta1 rather than assumed,
-/// and each one is a way a caller can spell a type that a naive `match` on `typname` would miss:
+/// What `'x'::regtype` resolves, and what `pg_typeof` would answer. Three rules, all measured
+/// against 19beta1 rather than assumed:
 ///
-/// * **Case does not matter.** `'INTEGER'::regtype::oid` is `23`.
-/// * **Surrounding space does not matter.** `' integer '::regtype::oid` is `23`.
-/// * **A typmod is parsed and discarded.** `'character varying(255)'::regtype::oid` is `1043` and
-///   `'timestamp(6) without time zone'::regtype::oid` is `1114` — the *type* is what a `regtype`
-///   names, and the length never was part of it.
+/// * **Case and surrounding space do not matter.** `'INTEGER'::regtype::oid` and
+///   `' integer '::regtype::oid` are both `23`.
+/// * **A typmod is parsed, *validated*, and then thrown away.** `'character varying(255)'` is
+///   `1043` and `'numeric(10,2)'` is `1700` — the *type* is what a `regtype` names — but
+///   `'numeric(1001,0)'` is `22023 NUMERIC precision 1001 must be between 1 and 1000` and
+///   `'character varying(0)'` is `22023 length for type varchar must be at least 1`. Discarding
+///   the number without reading it answered where a real server raises, which is the divergence
+///   class ADR 0031 counts worst.
+/// * **Every type answers to both of its names**, because PostgreSQL keeps two: the SQL name a
+///   column is declared and complained about with (`integer`, `character varying`) and the
+///   internal `pg_type.typname` (`int4`, `varchar`).
 ///
-/// Both spellings of every type answer, because PostgreSQL keeps two: the SQL name a column is
-/// declared and complained about with (`integer`, `character varying`) and the internal one
-/// `pg_type.typname` holds (`int4`, `varchar`). `'float'` is `float8`, which is the one alias that
-/// is not either of a type's two names.
-#[must_use]
-pub fn type_by_name(spelled: &str) -> Option<ColumnType> {
-    // `character varying(255)` -> `character varying`; `timestamp(6) without time zone` keeps its
-    // tail, because the words after the parentheses are part of the name.
-    let name = spelled.trim().to_ascii_lowercase();
-    let (name, had_typmod) = match (name.find('('), name.find(')')) {
-        (Some(open), Some(close)) if open < close => {
-            (format!("{}{}", &name[..open], &name[close + 1..]), true)
-        }
-        _ => (name, false),
+/// # This resolves from `ColumnType::ALL`, on purpose
+///
+/// It used to be a hand-written table of strings, and it drifted: `numeric` and `date` were in
+/// `pg_type` — which derives itself — and missing here, so `'decimal(3,2)'::regtype` was `42704`
+/// for a type the same node would happily create a column of. Every Rails suite file stopped on
+/// that line. Deriving the names from the same array `pg_type` uses means a new type is reachable
+/// here the moment it exists, and the only hand-written part left is `ALIASES` — the handful of
+/// spellings that are neither of a type's two names.
+pub fn type_by_name(spelled: &str) -> Result<Option<ColumnType>> {
+    let lowered = spelled.trim().to_ascii_lowercase();
+    if lowered.is_empty() {
+        return Err(SqlError::InvalidTypeName(String::new()));
+    }
+    let (bare, arguments) = match (lowered.find('('), lowered.rfind(')')) {
+        // `numeric(10,2)` -> `numeric` + `10,2`; `timestamp(6) without time zone` keeps its tail,
+        // because the words after the parentheses are part of the name.
+        (Some(open), Some(close)) if open < close => (
+            format!("{}{}", &lowered[..open], &lowered[close + 1..]),
+            Some(lowered[open + 1..close].to_owned()),
+        ),
+        _ => (lowered, None),
     };
-    let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
-    Some(match name.as_str() {
-        "bigint" | "int8" => ColumnType::Int8,
-        "integer" | "int4" | "int" => ColumnType::Int4,
-        "smallint" | "int2" => ColumnType::Int2,
-        "text" => ColumnType::Text,
-        "character varying" | "varchar" => ColumnType::Varchar,
-        "character" | "char" | "bpchar" => ColumnType::Bpchar,
-        "json" => ColumnType::Json,
-        "jsonb" => ColumnType::Jsonb,
-        "boolean" | "bool" => ColumnType::Bool,
-        "bytea" => ColumnType::Bytea,
-        "timestamp" | "timestamp without time zone" => ColumnType::Timestamp,
-        "timestamp with time zone" | "timestamptz" => ColumnType::TimestampTz,
-        "real" | "float4" => ColumnType::Real,
-        // `float` with no precision is `float8` on a real server, not `float4`.
-        "double precision" | "float8" | "float" => ColumnType::Double,
-        _ => return None,
-    })
-    // **A typmod is only legal on a type that takes one.** `'character varying(255)'::regtype` is
-    // `1043` and `'json(10)'::regtype` is `42601 syntax error at or near "("` — PostgreSQL's
-    // *parser* refuses the second, the way it refuses `integer(4)`. Discarding the number for
-    // every type would have answered `114` for a string a real server will not parse.
-    .filter(|ty| {
-        !had_typmod
-            || matches!(
-                ty,
-                ColumnType::Varchar
-                    | ColumnType::Bpchar
-                    | ColumnType::Timestamp
-                    | ColumnType::TimestampTz
-            )
-    })
+    let bare = bare.split_whitespace().collect::<Vec<_>>().join(" ");
+    let Some(ty) = resolve_type_name(&bare) else {
+        return Ok(None);
+    };
+    let Some(arguments) = arguments else {
+        return Ok(Some(ty));
+    };
+    // **A typmod is only legal on a type that takes one.** `'json(10)'::regtype` is `42601 syntax
+    // error at or near "("` on a real server — its *parser* refuses it, the way it refuses
+    // `integer(4)` — and this node answers `42704` for the whole spelling instead. Both refuse;
+    // the codes differ, which `tests/regtype.rs` declares.
+    if !takes_typmod(ty) {
+        // **Which `42601` you get is the grammar's choice, not the type's.** A spelling
+        // PostgreSQL has a keyword for is a syntax error at the parenthesis, because its parser
+        // never gets to a type; every other spelling parses as an identifier with a modifier and
+        // is rejected by name. Measured for all seventeen spellings this node has.
+        return Err(if TYPE_KEYWORDS.contains(&bare.as_str()) {
+            SqlError::TypeNameSyntax("(".to_owned())
+        } else {
+            SqlError::TypeModifierNotAllowed(bare)
+        });
+    }
+    validate_typmod(ty, &arguments)?;
+    Ok(Some(ty))
+}
+
+/// PostgreSQL's ceiling on a declared string length, and its floor is one.
+///
+/// Measured on 19beta1, both ends: `varchar(10485761)` is `22023 length for type varchar cannot
+/// exceed 10485760` and `varchar(0)` is `22023 length for type varchar must be at least 1`. Zero
+/// is **not** legal, which is the one a reader would guess wrong — a `varchar(0)` holding only the
+/// empty string is a perfectly coherent type and PostgreSQL declines to have it.
+///
+/// Here rather than in `parse::lower` because a `regtype` name and a column declaration have to
+/// agree about it: `'character varying(0)'::regtype` raises the same `22023` that
+/// `CREATE TABLE t (v varchar(0))` does.
+pub const MAX_TYPE_LENGTH: u32 = 10_485_760;
+
+/// The spellings PostgreSQL's grammar has a **keyword** for, among the types this node has.
+///
+/// Only reachable for a type that takes no typmod, and only to choose between its two `42601`s:
+/// `integer(4)` is `syntax error at or near "("` and `int4(4)` is `type modifier is not allowed
+/// for type "int4"`. Measured, one spelling at a time — it is not derivable from a type's two
+/// names, because `json` is a keyword and `text` and `date` are not while all three spell
+/// themselves identically in both.
+const TYPE_KEYWORDS: [&str; 7] = [
+    "boolean",
+    "integer",
+    "bigint",
+    "smallint",
+    "real",
+    "double precision",
+    "json",
+];
+
+/// The spellings that are neither a type's SQL name nor its `pg_type.typname`.
+///
+/// Everything else comes from `ColumnType::ALL`. Keep this list short: an entry here is a name
+/// that cannot be derived, and a type added to the array needs one only if PostgreSQL gives it a
+/// third spelling.
+const ALIASES: [(&str, ColumnType); 4] = [
+    ("int", ColumnType::Int4),
+    // `float` with no precision is `float8` on a real server, not `float4`.
+    ("float", ColumnType::Double),
+    // `decimal` is `numeric`'s standard name and PostgreSQL's own alias for it: all four
+    // spellings — `numeric`, `decimal`, and either with a typmod — resolve to 1700.
+    ("decimal", ColumnType::Numeric),
+    ("char", ColumnType::Bpchar),
+];
+
+/// A bare, normalised type name as one of this node's types.
+fn resolve_type_name(name: &str) -> Option<ColumnType> {
+    ColumnType::ALL
+        .into_iter()
+        .find(|ty| ty.name() == name || crate::catalog::pg_catalog::typname(*ty) == name)
+        .or_else(|| {
+            ALIASES
+                .iter()
+                .find(|(alias, _)| *alias == name)
+                .map(|(_, ty)| *ty)
+        })
+}
+
+/// Whether a type takes a typmod at all.
+///
+/// An exhaustive match rather than a `matches!` list, so that a type added to `ColumnType` has to
+/// answer this question instead of silently inheriting "no".
+fn takes_typmod(ty: ColumnType) -> bool {
+    match ty {
+        ColumnType::Varchar
+        | ColumnType::Bpchar
+        | ColumnType::Timestamp
+        | ColumnType::TimestampTz
+        | ColumnType::Time
+        | ColumnType::Numeric => true,
+        ColumnType::Int8
+        | ColumnType::Int4
+        | ColumnType::Int2
+        | ColumnType::Text
+        | ColumnType::Json
+        | ColumnType::Jsonb
+        | ColumnType::Bool
+        | ColumnType::Bytea
+        | ColumnType::Double
+        | ColumnType::Real
+        | ColumnType::Date => false,
+    }
+}
+
+/// The typmod arguments of a name, checked the way the declaration would check them.
+///
+/// The value is thrown away — a `regtype` is the type, not the type with its number — but the
+/// **error is not**, which is the whole point: `'numeric(1001,0)'::regtype` raises on a real
+/// server and answering `1700` would be an answer where PostgreSQL refuses.
+fn validate_typmod(ty: ColumnType, arguments: &str) -> Result<()> {
+    let parts: Vec<&str> = arguments.split(',').map(str::trim).collect();
+    let number = |text: &str| -> Result<i32> {
+        // PostgreSQL's *parser* stops at a sign inside a type name: `'timestamp(-1)'::regtype` is
+        // `42601 syntax error at or near "-"`, not a bounds error, because a typmod argument is
+        // grammatically an unsigned integer.
+        if text.starts_with('-') || text.starts_with('+') {
+            return Err(SqlError::TypeNameSyntax(text[..1].to_owned()));
+        }
+        text.parse::<i32>()
+            .map_err(|_| SqlError::TypeNameSyntax(text.to_owned()))
+    };
+    match ty {
+        // One length, and the message spells the type **short**: `length for type varchar`, not
+        // `character varying`. Measured, both types and both bounds.
+        ColumnType::Varchar | ColumnType::Bpchar => {
+            let spelled = if matches!(ty, ColumnType::Varchar) {
+                "varchar"
+            } else {
+                "char"
+            };
+            let length = number(parts.first().copied().unwrap_or_default())?;
+            if length < 1 {
+                return Err(SqlError::TypeLengthTooSmall(spelled));
+            }
+            if u32::try_from(length).is_ok_and(|length| length > MAX_TYPE_LENGTH) {
+                return Err(SqlError::TypeLengthTooLarge(spelled, MAX_TYPE_LENGTH));
+            }
+        }
+        // A precision past the maximum is **reduced, not refused** — `'timestamp(9)'::regtype` is
+        // 1114 and `'time(9)'::regtype` is 1083, each with a `WARNING` and no error. The number is
+        // discarded here in any case; only a negative one is a refusal, and it is the parser's.
+        ColumnType::Timestamp | ColumnType::TimestampTz | ColumnType::Time => {
+            number(parts.first().copied().unwrap_or_default())?;
+        }
+        ColumnType::Numeric => {
+            let precision = number(parts.first().copied().unwrap_or_default())?;
+            let scale = match parts.get(1) {
+                Some(text) => Some(number(text)?),
+                None => None,
+            };
+            numeric::declared_typmod(Some(precision), scale)?;
+        }
+        // `takes_typmod` returned false for these and the caller stopped before here.
+        _ => {}
+    }
+    Ok(())
 }
 
 /// What a stored type *means* to a PostgreSQL client.

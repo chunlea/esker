@@ -784,6 +784,29 @@ pub enum SqlError {
     #[error("type \"{0}\" does not exist")]
     UndefinedType(String),
 
+    /// `42601` from PostgreSQL's **type-name** parser, which is a different grammar from a
+    /// statement's: `'timestamp(-1)'::regtype` stops at the sign and `'integer(4)'::regtype` stops
+    /// at the parenthesis, because a typmod argument is an unsigned integer and `integer` takes no
+    /// typmod at all. Its own variant because [`SqlError::Syntax`] prefixes `syntax error: ` and
+    /// this message *is* `syntax error at or near "…"`.
+    #[error("syntax error at or near \"{0}\"")]
+    TypeNameSyntax(String),
+
+    /// A typmod on a type that takes none, where the name is **not** one of PostgreSQL's type
+    /// keywords: `42601 type modifier is not allowed for type "jsonb"`.
+    ///
+    /// The other half of [`SqlError::TypeNameSyntax`], and which one you get is decided by the
+    /// grammar rather than by the type: `json(10)` is a syntax error and `jsonb(10)` is this,
+    /// because `json` is a keyword in the type production and `jsonb` is an ordinary identifier.
+    /// Measured for every spelling this node has.
+    #[error("type modifier is not allowed for type \"{0}\"")]
+    TypeModifierNotAllowed(String),
+
+    /// A type name with nothing in it: `42601 invalid type name ""`. Not `42704` — PostgreSQL
+    /// refuses to look it up rather than failing to find it.
+    #[error("invalid type name \"{0}\"")]
+    InvalidTypeName(String),
+
     /// A value longer than its column's declared length: `22001`.
     ///
     /// The type is spelled as `format_type` writes it — `character varying(5)`, `character(3)` —
@@ -1055,6 +1078,11 @@ impl SqlError {
             SqlError::CardinalityViolation => sqlstate::CARDINALITY_VIOLATION,
             SqlError::SubqueryColumns(_)
             | SqlError::Syntax { .. }
+            // PostgreSQL's type-name grammar, refusing in the same class as its statement
+            // grammar: `'timestamp(-1)'::regtype` and `''::regtype` are both `42601`.
+            | SqlError::TypeNameSyntax(_)
+            | SqlError::TypeModifierNotAllowed(_)
+            | SqlError::InvalidTypeName(_)
             | SqlError::InsertTooManyExpressions
             | SqlError::SyntaxAtOrNear(_) => sqlstate::SYNTAX_ERROR,
             SqlError::StatementTooComplex => sqlstate::STATEMENT_TOO_COMPLEX,
