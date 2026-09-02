@@ -1,0 +1,21 @@
+crates/esker-cli/tests/cluster_start.rs
+  s_3ae23601ee3f84::t_cc2e3f7f20ea22 34-36,66-90,93,104-107
+docs/plans/phase-14-flakes.md
+  s_3ae23601ee3f84::t_91dc6e95cc58b1 370-446
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "e3ab045e08b0b4ef648a197c193aed43c20c9bc9",
+  "prompts": {},
+  "sessions": {
+    "s_3ae23601ee3f84": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "28a5221f-dddc-4b17-adc2-74658236cfd3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
