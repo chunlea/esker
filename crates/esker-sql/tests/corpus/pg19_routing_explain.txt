@@ -1,0 +1,68 @@
+# What a real PostgreSQL 19beta1 prints for the plans this milestone routes -- the other side of
+# the declared divergence [ADR 0031](../../../../docs/adr/0031-rails-compatibility-is-measured.md)
+# asks for, captured rather than described (`docs/plans/phase-10-routing.md` U3).
+#
+# PostgreSQL's plan text has **no equivalent** to naming an engine, because PostgreSQL has no
+# second engine to choose between. So this file is not a set of assertions about our output; it is
+# the measurement that makes "declared divergence" mean something. What it pins is the half that
+# *is* comparable: which statements both servers accept, and which they refuse.
+#
+#   script <tab> ok                the last statement succeeded
+#   script <tab> !SQLSTATE msg     PostgreSQL refused it
+#
+# WHAT PG19 PRINTS, verbatim, for the fixture
+# `CREATE TABLE t (id int8 PRIMARY KEY, name text, amount int8)` with two rows:
+#
+#   EXPLAIN SELECT count(*) FROM t
+#     Aggregate  (cost=23.38..23.39 rows=1 width=8)
+#       ->  Seq Scan on t  (cost=0.00..20.70 rows=1070 width=0)
+#
+#   EXPLAIN SELECT name, count(*) FROM t GROUP BY name
+#     HashAggregate  (cost=26.05..28.05 rows=200 width=40)
+#       Group Key: name
+#       ->  Seq Scan on t  (cost=0.00..20.70 rows=1070 width=32)
+#
+#   EXPLAIN SELECT count(*) FROM t WHERE amount > 5
+#     Aggregate  (cost=24.27..24.28 rows=1 width=8)
+#       ->  Seq Scan on t  (cost=0.00..23.38 rows=357 width=0)
+#             Filter: (amount > 5)
+#
+#   EXPLAIN ANALYZE SELECT count(*) FROM t
+#     Aggregate  (cost=23.38..23.39 rows=1 width=8) (actual time=0.008..0.008 rows=1.00 loops=1)
+#       Buffers: shared hit=1
+#       ->  Seq Scan on t  (cost=0.00..20.70 rows=1070 width=0) (actual ... rows=2.00 loops=1)
+#             Buffers: shared hit=1
+#     Planning Time: 0.029 ms
+#     Execution Time: 0.017 ms
+#
+# WHAT DIVERGES, and it is four things:
+#
+#   * **costs.** PostgreSQL prints `(cost=a..b rows=n width=w)` on every node. There is no cost
+#     model here and no statistics behind one, so there are no costs -- printing invented ones
+#     would be worse than printing none. `docs/plans/phase-6a.md` already records this for the
+#     plans that existed before this milestone; it is unchanged by it.
+#   * **`Aggregate` vs `HashAggregate`.** PostgreSQL names the strategy it chose; there is one
+#     strategy here, so the name says what it is rather than implying a choice that was not made.
+#     Also unchanged by this milestone.
+#   * **the engine line**, which is this milestone's. `Engine: columnar (2 of 6 columns projected)`
+#     has no PostgreSQL equivalent at all -- there is nothing for it to be a divergence *from*, and
+#     ADR 0022 Decision 2 requires it: "a routing decision nobody can see is one nobody can debug".
+#   * **`ANALYZE`'s numbers.** PostgreSQL reports `actual time`, `rows`, `loops`, `Buffers`,
+#     `Planning Time` and `Execution Time`. This node reports what a *fragment* cost -- stripes
+#     considered and read, chunks decoded, rows scanned and matched -- because that is the number
+#     the feature is about and the one the response has carried since phase 8. No timings: a wall
+#     clock in a plan is a number that changes every run, and nothing here is tuned against one
+#     yet (`docs/bench/`).
+#
+# The statements themselves are accepted by both servers, which is what these lines pin.
+
+EXPLAIN SELECT count(*) FROM t	ok
+EXPLAIN SELECT name, count(*) FROM t GROUP BY name	ok
+EXPLAIN SELECT count(*) FROM t WHERE amount > 5	ok
+EXPLAIN ANALYZE SELECT count(*) FROM t	ok
+EXPLAIN ANALYZE SELECT name, count(*) FROM t GROUP BY name	ok
+EXPLAIN ANALYZE INSERT INTO t VALUES (9, 'i', 90)	ok
+EXPLAIN ANALYZE UPDATE t SET amount = 1	ok
+EXPLAIN ANALYZE DELETE FROM t	ok
+EXPLAIN VERBOSE SELECT count(*) FROM t	ok
+EXPLAIN (FORMAT JSON) SELECT count(*) FROM t	ok

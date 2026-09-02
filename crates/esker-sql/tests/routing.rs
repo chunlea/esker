@@ -119,6 +119,80 @@ fn the_session_override_answers_the_way_postgresql_19_does() {
     );
 }
 
+/// Statements about a *plan* that a real PostgreSQL answers differently.
+///
+/// All four are `0A000` here and accepted there, which is contract C2's shape: a statement this
+/// node parses and cannot honour names the feature rather than being approximated. What
+/// diverges is never the *answer to a query* — only what a plan is allowed to say about itself.
+const EXPLAIN_DIVERGENCES: &[(&str, &str)] = &[
+    (
+        "EXPLAIN ANALYZE INSERT INTO t VALUES (9, 'i', 90)",
+        "`ANALYZE` runs the statement, which is exactly what it means on a real server — the row \
+         really is inserted there, inside the transaction the EXPLAIN runs in. This node executes \
+         `ANALYZE` for a `SELECT` only, and refuses it by name for anything that writes: the \
+         alternative is an `EXPLAIN` that writes, and a user who did not expect that has already \
+         written.",
+    ),
+    (
+        "EXPLAIN ANALYZE UPDATE t SET amount = 1",
+        "The same rule, and the same reason.",
+    ),
+    (
+        "EXPLAIN ANALYZE DELETE FROM t",
+        "The same rule, and the same reason.",
+    ),
+    (
+        "EXPLAIN VERBOSE SELECT count(*) FROM t",
+        "`VERBOSE` adds output column lists and schema qualification to every node. There is one \
+         schema here and the plan already names its columns, so honouring it would mean printing \
+         the same plan and calling it verbose. Refused by name, as it was before this milestone.",
+    ),
+    (
+        "EXPLAIN (FORMAT JSON) SELECT count(*) FROM t",
+        "A second rendering of a plan text that is already a declared divergence from \
+         PostgreSQL's. Producing JSON with our fields in it would look like PostgreSQL's schema \
+         and not be it, which is the wrong kind of nearly-compatible.",
+    ),
+];
+
+/// The plan surface, replayed: which `EXPLAIN` spellings both servers accept.
+///
+/// What each server *prints* is not compared and is not comparable — PostgreSQL has no second
+/// engine to name, so there is nothing for the engine line to diverge from. The corpus header
+/// carries PostgreSQL's output verbatim so the divergence table has both sides, which is what
+/// ADR 0031 asks for where there is no oracle.
+#[test]
+fn the_explain_surface_answers_the_way_postgresql_19_does() {
+    let mut diverged = Vec::new();
+    let mut checked = 0;
+    for (line_number, script, expected) in explain_corpus() {
+        let ours = answer_over_t(&script);
+        checked += 1;
+        let listed = EXPLAIN_DIVERGENCES.iter().find(|(sql, _)| script == *sql);
+        if ours == expected {
+            assert!(
+                listed.is_none(),
+                "line {line_number}: `{script}` is listed as a divergence and now agrees \
+                 ({ours}). Delete its row in EXPLAIN_DIVERGENCES."
+            );
+            continue;
+        }
+        match listed {
+            Some(_) => diverged.push(script),
+            None => panic!(
+                "line {line_number}: `{script}`\n  PostgreSQL 19: {expected}\n  here:          \
+                 {ours}"
+            ),
+        }
+    }
+    assert!(checked >= 10, "only {checked} statements ran");
+    assert_eq!(
+        diverged.len(),
+        EXPLAIN_DIVERGENCES.len(),
+        "every listed divergence must be exercised; these diverged: {diverged:?}"
+    );
+}
+
 /// The value is folded here and is not on a real server, which the corpus's `ok`/`!code` shape
 /// cannot see — so it is asserted directly rather than left to a format that would miss it.
 ///
@@ -212,9 +286,20 @@ fn a_refusal_falls_back_to_the_rows_in_the_same_snapshot() {
             vec![vec!["2"]],
             "{reason:?} changed the answer"
         );
-        // The *reason* is a run-time fact, so a plain `EXPLAIN` — which runs nothing — cannot
-        // carry it and does not pretend to. `EXPLAIN ANALYZE` is where it appears, and
-        // `the_analyze_of_a_fallback_names_the_refusal` is that assertion.
+        // A plain `EXPLAIN` runs nothing, so it reports what was *planned* — columnar — and does
+        // not pretend to know how the fragments went. `EXPLAIN ANALYZE` runs them, and that is
+        // where the refusal appears.
+        let planned = explain(&mut node, "SELECT count(*) FROM t");
+        assert!(
+            planned.contains("Engine: columnar"),
+            "{reason:?}: {planned}"
+        );
+
+        let ran = explain_analyze(&mut node, "SELECT count(*) FROM t");
+        assert!(ran.contains("Engine: rows"), "{reason:?}: {ran}");
+        assert!(ran.contains("columnar refused"), "{reason:?}: {ran}");
+        // The row plan it fell back to is printed beneath it, because that is the plan that ran.
+        assert!(ran.contains("Seq Scan on t"), "{reason:?}: {ran}");
     }
 }
 
@@ -230,6 +315,9 @@ fn the_row_override_asks_nobody() {
 
     assert_eq!(rows(&mut node, "SELECT count(*) FROM t"), vec![vec!["1"]]);
     assert_eq!(*asked.lock().unwrap(), 0, "a fragment went out anyway");
+    let plan = explain(&mut node, "SELECT count(*) FROM t");
+    assert!(plan.contains("Engine: rows"), "{plan}");
+    assert!(plan.contains("esker.engine = 'row'"), "{plan}");
 }
 
 /// A table nobody asked for a columnar copy of is never routed, whatever the session says.
@@ -248,6 +336,11 @@ fn a_table_with_no_columnar_copy_is_never_routed() {
 
     assert_eq!(rows(&mut node, "SELECT count(*) FROM t"), vec![vec!["1"]]);
     assert_eq!(*asked.lock().unwrap(), 0);
+    // **And the plan says nothing about an engine**, which is the right silence: a table with no
+    // columnar copy has one engine, so there was no decision to report. A line on every plan of
+    // every ordinary table is noise, and noise is what stops the line being read when it matters.
+    let plan = explain(&mut node, "SELECT count(*) FROM t");
+    assert!(!plan.contains("Engine:"), "{plan}");
 }
 
 /// A transaction that has written reads its own writes, which a learner has never seen.
@@ -301,6 +394,9 @@ fn a_distinct_aggregate_is_refused_by_name() {
         vec![vec!["1"]]
     );
     assert_eq!(*asked.lock().unwrap(), 0);
+    let plan = explain(&mut node, "SELECT count(DISTINCT name) FROM t");
+    assert!(plan.contains("Engine: rows"), "{plan}");
+    assert!(plan.contains("DISTINCT aggregate"), "{plan}");
 }
 
 /// A point read stays on rows even when the session asks for columns: a fragment cannot restrict
@@ -349,6 +445,49 @@ fn the_ratio_decides_between_two_queries_over_the_same_table() {
         vec![vec!["1", "a", "1"]]
     );
     assert_eq!(*asked.lock().unwrap(), before, "a wide query was routed");
+    let wide = explain(
+        &mut node,
+        "SELECT id, name, count(amount) FROM t GROUP BY id, name",
+    );
+    assert!(wide.contains("Engine: rows"), "{wide}");
+    assert!(wide.contains("3 of 3 columns projected"), "{wide}");
+}
+
+/// `EXPLAIN ANALYZE` carries what the scan cost, from the `ScanStats` the response has carried
+/// since phase 8 — which is why it was carried then rather than added now.
+#[test]
+fn analyze_reports_what_the_fragments_cost() {
+    let mut node = node_with(script(&[groups(&[(&[], &[Partial::Count(7)])])]));
+    ready(&mut node);
+
+    // Without `ANALYZE` nothing ran, so there is nothing to report and none is invented.
+    let planned = explain(&mut node, "SELECT count(*) FROM t");
+    assert!(
+        planned.contains("Columnar Aggregate on t  (1 fragments)"),
+        "{planned}"
+    );
+    assert!(!planned.contains("Stripes:"), "{planned}");
+
+    let ran = explain_analyze(&mut node, "SELECT count(*) FROM t");
+    assert!(ran.contains("Fragments: 1 asked, 1 answered"), "{ran}");
+    assert!(
+        ran.contains("Stripes: 2 of 4 read   Chunks: 1   Rows: 100 scanned, 10 matched"),
+        "{ran}"
+    );
+    assert!(ran.contains("Aggregates: count(*)"), "{ran}");
+}
+
+/// `ANALYZE` **runs** the statement, so it stays refused for anything that writes: an
+/// `EXPLAIN ANALYZE INSERT` that ran would be an insert.
+#[test]
+fn analyze_of_a_write_is_still_refused_by_name() {
+    let mut node = node();
+    run(&mut node, "CREATE TABLE t (id int8 PRIMARY KEY)").unwrap();
+    let error = run(&mut node, "EXPLAIN ANALYZE INSERT INTO t VALUES (1)").unwrap_err();
+    assert_eq!(error.sqlstate(), "0A000");
+    assert!(error.to_string().contains("ANALYZE"), "{error}");
+    // And nothing was inserted.
+    assert_eq!(rows(&mut node, "SELECT count(*) FROM t"), vec![vec!["0"]]);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -558,6 +697,15 @@ fn explain(node: &mut Executor, sql: &str) -> String {
         .join("\n")
 }
 
+/// The `EXPLAIN ANALYZE` of a query, as one string. Runs it.
+fn explain_analyze(node: &mut Executor, sql: &str) -> String {
+    rows(node, &format!("EXPLAIN ANALYZE {sql}"))
+        .into_iter()
+        .map(|row| row.join(""))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The one value a `SHOW` answers with.
 fn show(node: &mut Executor, sql: &str) -> String {
     rows(node, sql).pop().and_then(|mut row| row.pop()).unwrap()
@@ -579,9 +727,32 @@ fn answer(script: &str) -> String {
     }
 }
 
+/// The same, over the corpus fixture table.
+fn answer_over_t(script: &str) -> String {
+    let mut node = node();
+    run(
+        &mut node,
+        "CREATE TABLE t (id int8 PRIMARY KEY, name text, amount int8)",
+    )
+    .expect("the corpus fixture must exist");
+    match run(&mut node, script) {
+        Ok(()) => "ok".to_owned(),
+        Err(error) => format!("!{} {error}", error.sqlstate()),
+    }
+}
+
 /// `(line number, script, expected answer)` for every case in the corpus.
 fn corpus() -> Vec<(usize, String, String)> {
-    include_str!("corpus/pg19_routing_engine.txt")
+    cases(include_str!("corpus/pg19_routing_engine.txt"))
+}
+
+/// The same, for the plan-surface corpus.
+fn explain_corpus() -> Vec<(usize, String, String)> {
+    cases(include_str!("corpus/pg19_routing_explain.txt"))
+}
+
+fn cases(corpus: &str) -> Vec<(usize, String, String)> {
+    corpus
         .lines()
         .enumerate()
         .filter_map(|(at, line)| {

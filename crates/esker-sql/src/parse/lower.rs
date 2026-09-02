@@ -107,16 +107,22 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
             format,
             options,
         } => {
-            refuse_if(*analyze, "EXPLAIN ANALYZE")?;
             refuse_if(*verbose, "EXPLAIN VERBOSE")?;
             refuse_if(*query_plan, "EXPLAIN QUERY PLAN")?;
             refuse_if(*estimate, "EXPLAIN ESTIMATE")?;
             refuse_if(format.is_some(), "EXPLAIN (FORMAT ...)")?;
             refuse_if(options.is_some(), "EXPLAIN with options")?;
             let _ = describe_alias;
-            Ok(plan::Statement::Explain(Box::new(lower_statement(
-                statement,
-            )?)))
+            let inner = lower_statement(statement)?;
+            // **`ANALYZE` runs the statement**, which is what the word means on a real server. So
+            // it is executed for a `SELECT`, where the point of it is the `ScanStats` a columnar
+            // answer carries (ADR 0022 milestone 4), and stays `0A000` for everything else — an
+            // `EXPLAIN ANALYZE INSERT` that ran would be an insert.
+            refuse_if(
+                *analyze && !matches!(inner, plan::Statement::Select(_)),
+                "EXPLAIN ANALYZE of a statement that is not a SELECT",
+            )?;
+            Ok(plan::Statement::Explain(Box::new(inner), *analyze))
         }
         Statement::Set(set) => lower_set(set),
         Statement::ShowVariable { variable } => lower_show(variable),

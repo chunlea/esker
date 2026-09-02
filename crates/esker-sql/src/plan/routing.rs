@@ -150,6 +150,19 @@ pub enum Reason {
 }
 
 impl Reason {
+    /// Whether `EXPLAIN` prints an engine line for this reason at all.
+    ///
+    /// **Two reasons are silent, and both say the same thing: there was no choice.** A table
+    /// nobody asked for a columnar copy of has one engine, and a node with no way to ask a
+    /// fragment has one engine for every table — so a line about the engine on those plans is
+    /// noise on every query on every ordinary cluster, and noise is what stops a line being read
+    /// when it does matter. Every other reason describes a decision that was actually made, which
+    /// is the thing ADR 0022 Decision 2 asks to be visible.
+    #[must_use]
+    pub fn worth_printing(&self) -> bool {
+        !matches!(self, Reason::NotAsked | Reason::NoFragmentService)
+    }
+
     /// The sentence `EXPLAIN` puts in brackets after the engine.
     #[must_use]
     pub fn describe(&self) -> String {

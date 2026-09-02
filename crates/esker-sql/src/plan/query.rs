@@ -378,9 +378,14 @@ impl Node {
     /// changes their schema over — and it is written for a *user*, so `columns` is needed to turn
     /// the positions the executor works in back into the names they typed.
     #[must_use]
-    pub fn explain(&self, table: &str, columns: &[String]) -> Vec<String> {
+    pub fn explain(
+        &self,
+        table: &str,
+        columns: &[String],
+        engine: Option<&crate::plan::routing::Decision>,
+    ) -> Vec<String> {
         let mut lines = Vec::new();
-        self.explain_into(table, columns, 0, &mut lines);
+        self.explain_into(table, columns, engine, 0, &mut lines);
         lines
     }
 
@@ -434,9 +439,16 @@ impl Node {
         }
     }
 
-    fn explain_into(&self, table: &str, columns: &[String], depth: usize, lines: &mut Vec<String>) {
+    fn explain_into(
+        &self,
+        table: &str,
+        columns: &[String],
+        engine: Option<&crate::plan::routing::Decision>,
+        depth: usize,
+        lines: &mut Vec<String>,
+    ) {
         let indent = "  ".repeat(depth);
-        let (line, child, extra) = self.describe(table, columns, &indent);
+        let (line, child, extra) = self.describe(table, columns, engine, &indent);
         lines.push(format!("{indent}{line}"));
         if let Some(extra) = extra {
             // One `extra` may carry more than one line: a join prints its inner access path and
@@ -444,7 +456,15 @@ impl Node {
             lines.extend(extra.split('\n').map(|line| format!("{indent}  {line}")));
         }
         if let Some(child) = child {
-            child.explain_into(table, columns, depth + 1, lines);
+            // **A columnar node's subtree is not given the engine.** It prints its own engine line
+            // and the subtree beneath it is the *fallback*; handing the decision down would print
+            // it twice, once about the node and once about the scan it fell back to.
+            let below = if matches!(self, Node::Columnar(_)) {
+                None
+            } else {
+                engine
+            };
+            child.explain_into(table, columns, below, depth + 1, lines);
         }
     }
 
@@ -455,6 +475,7 @@ impl Node {
         &self,
         table: &str,
         columns: &[String],
+        engine: Option<&crate::plan::routing::Decision>,
         indent: &str,
     ) -> (String, Option<&Node>, Option<String>) {
         // The names to render *this* node's expressions against. `columns` stays the table's own
@@ -470,10 +491,15 @@ impl Node {
             Node::CatalogView { view, .. } => {
                 (format!("Catalog Scan on {}", view.name()), None, None)
             }
+            // **The engine goes on the scan**, which is the node the decision is about: ADR 0022
+            // Decision 2 asks `EXPLAIN` to name the engine it chose, and a plan that was
+            // *considered* for columns and left on rows has to say so as loudly as one that was
+            // not considered at all — the two look identical without it, and "it was fast
+            // yesterday" is what that costs.
             Node::SeqScan { narrowed, .. } => (
                 format!("Seq Scan on {table}"),
                 None,
-                narrowed.then(|| "Range: narrowed by the primary key".to_owned()),
+                Self::scan_extras(*narrowed, engine),
             ),
             Node::PointGet { .. } => (format!("Point Get on {table}"), None, None),
             Node::IndexLookup { index_name, .. } => (
@@ -558,6 +584,29 @@ impl Node {
                 (name, crate::exec::explain::child(columnar), Some(extra))
             }
         }
+    }
+
+    /// A sequential scan's extra lines: how the range was reached, and which engine will read it.
+    ///
+    /// The engine line is this milestone's and the range line is not, and they are together
+    /// because both are facts about *this scan* rather than about the tree. Joined with a
+    /// newline, which [`Node::explain_into`] splits and indents.
+    fn scan_extras(
+        narrowed: bool,
+        engine: Option<&crate::plan::routing::Decision>,
+    ) -> Option<String> {
+        let mut extra: Vec<String> = Vec::new();
+        if narrowed {
+            extra.push("Range: narrowed by the primary key".to_owned());
+        }
+        if let Some(decision) = engine.filter(|decision| decision.reason.worth_printing()) {
+            extra.push(format!(
+                "Engine: {}  ({})",
+                decision.engine.name(),
+                decision.reason.describe()
+            ));
+        }
+        (!extra.is_empty()).then(|| extra.join("\n"))
     }
 
     /// The aggregate's own two or three lines: the grouping keys, the calls, and the `HAVING`.

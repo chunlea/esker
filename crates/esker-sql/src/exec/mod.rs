@@ -356,7 +356,7 @@ impl Executor {
             Statement::Select(select) => self.select(txn, select),
             Statement::Update(update) => dml::update(self, txn, update, written),
             Statement::Delete(delete) => dml::delete(self, txn, delete),
-            Statement::Explain(inner) => self.explain(txn, inner),
+            Statement::Explain(inner, analyze) => self.explain(txn, inner, *analyze),
             Statement::TimeMachine(verb) => verbs::run(self, txn, verb),
             // Handled before a transaction is opened; `execute` never routes one here.
             Statement::Session(_) => Err(SqlError::Internal(
@@ -859,12 +859,27 @@ impl Executor {
     }
 
     /// `EXPLAIN`: the plan, as rows, and nothing run.
-    fn explain(&self, txn: &dyn Txn, statement: &Statement) -> Result<Outcome> {
+    fn explain(&self, txn: &dyn Txn, statement: &Statement, analyze: bool) -> Result<Outcome> {
         // A `SELECT`'s plan is the whole point of `EXPLAIN`, and building it needs the catalog.
         let lines = match statement {
             Statement::Select(select) => {
-                let planned = self.plan_select(txn, select)?;
-                planned.node.explain(&planned.table, &planned.column_names)
+                let mut planned = self.plan_select(txn, select)?;
+                if analyze {
+                    // **`ANALYZE` runs it**, which is what makes the numbers real. The fragments
+                    // go out and the plan is drained: what a routed query costs is a fact about a
+                    // run, and a plan that only described one would be reporting an estimate this
+                    // node does not have.
+                    if let Some(source) = self.fragments.clone() {
+                        fragment::resolve(&mut planned.node, &*source, txn.start_ts());
+                    }
+                    let mut cursor = cursor::Cursor::open(txn, self.tenant, &planned.node)?;
+                    while cursor.next()?.is_some() {}
+                }
+                planned.node.explain(
+                    &planned.table,
+                    &planned.column_names,
+                    planned.engine.as_ref(),
+                )
             }
             other => explain_lines(other),
         };
@@ -1183,7 +1198,7 @@ fn explain_lines(statement: &Statement) -> Vec<String> {
         )],
         // `EXPLAIN EXPLAIN ...` is not something PostgreSQL's grammar admits, so this is
         // unreachable through the parser and is written as a value rather than a panic anyway.
-        Statement::Explain(_) => vec!["Explain".to_owned()],
+        Statement::Explain(..) => vec!["Explain".to_owned()],
         // `EXPLAIN SET ...` is not PostgreSQL's grammar either, and a session statement has no
         // plan to print: it touches no table and reads no row.
         Statement::Session(session) => vec![session.tag().to_owned()],
@@ -1263,7 +1278,7 @@ impl Execute for Executor {
                 .map(|(name, ty)| FieldDescription::computed(name, ty))
                 .collect(),
             ),
-            Statement::Explain(_) => Some(vec![FieldDescription::computed(
+            Statement::Explain(..) => Some(vec![FieldDescription::computed(
                 "QUERY PLAN",
                 ColumnType::Text,
             )]),

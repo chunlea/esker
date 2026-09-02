@@ -110,7 +110,16 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
             "CREATE TABLE t (a int8, UNIQUE NULLS NOT DISTINCT (a))",
             "NULLS [NOT] DISTINCT",
         ),
-        ("EXPLAIN ANALYZE SELECT 1", "EXPLAIN ANALYZE"),
+        // `EXPLAIN ANALYZE SELECT` is **executed** since ADR 0022 milestone 4 — it is how the
+        // `ScanStats` a columnar answer carries reaches a user. What stays refused is the form
+        // that would *write*: `ANALYZE` runs the statement, and an `EXPLAIN` that inserts a row
+        // is a surprise a user cannot undo (`tests/routing.rs`,
+        // `analyze_of_a_write_is_still_refused_by_name`).
+        (
+            "EXPLAIN ANALYZE INSERT INTO t VALUES (1)",
+            "EXPLAIN ANALYZE",
+        ),
+        ("EXPLAIN ANALYZE DELETE FROM t", "EXPLAIN ANALYZE"),
         ("EXPLAIN (FORMAT JSON) SELECT 1", "EXPLAIN"),
         // Phase 9 unit 1 runs GROUP BY, HAVING, DISTINCT and the five aggregates. What sits next
         // to each of them does not, and each still names the clause rather than the expression it
@@ -315,7 +324,7 @@ fn drop_and_create_index_lower_to_their_lists() {
 /// clause it cannot honour is refused before anything is planned.
 #[test]
 fn explain_wraps_a_lowered_statement() {
-    let Statement::Explain(inner) = lower("EXPLAIN CREATE TABLE t (a int8)").unwrap() else {
+    let Statement::Explain(inner, false) = lower("EXPLAIN CREATE TABLE t (a int8)").unwrap() else {
         panic!("not an EXPLAIN")
     };
     assert!(matches!(*inner, Statement::CreateTable(_)));

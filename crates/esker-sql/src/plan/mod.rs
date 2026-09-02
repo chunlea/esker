@@ -74,9 +74,13 @@ pub enum Statement {
     Update(Update),
     /// `DELETE`.
     Delete(Delete),
-    /// `EXPLAIN`, and the statement it is about. The inner statement is planned and described,
-    /// never run.
-    Explain(Box<Statement>),
+    /// `EXPLAIN`, and the statement it is about.
+    ///
+    /// The flag is `ANALYZE`, which **runs** the statement — that is what the word means on a real
+    /// server, and it is why it stays refused for everything that writes. For a `SELECT` it is
+    /// what puts the `ScanStats` a columnar answer carries into the plan
+    /// (`docs/plans/phase-10-routing.md` U3).
+    Explain(Box<Statement>, bool),
     /// `SET`, `SHOW`, `RESET` — the statements that change the session rather than the store.
     /// Run outside any transaction, because one of them replaces the transaction itself.
     Session(SessionStatement),
@@ -153,7 +157,7 @@ impl Statement {
             Statement::TimeMachine(TimeMachineVerb::Flashback { .. }) => Some("esker_flashback"),
             Statement::TimeMachine(_)
             | Statement::Select(_)
-            | Statement::Explain(_)
+            | Statement::Explain(..)
             | Statement::Session(_) => None,
         }
     }
@@ -176,7 +180,7 @@ impl Statement {
             Statement::Select(_) => "SELECT",
             Statement::Update(_) => "UPDATE",
             Statement::Delete(_) => "DELETE",
-            Statement::Explain(_) => "EXPLAIN",
+            Statement::Explain(..) => "EXPLAIN",
             Statement::Session(session) => session.tag(),
             Statement::TimeMachine(verb) => verb.tag(),
         }

@@ -183,6 +183,15 @@ fn consider(
         )));
     }
 
+    // **Before any question about the plan's shape.** A table nobody asked for a columnar copy of
+    // has no second engine to choose between, and every reason after this one describes a *choice*
+    // — which `EXPLAIN` then prints. Deciding it here is what keeps an ordinary table's plan from
+    // growing a line about a feature it is not using.
+    let replicas = replicas(txn, tenant, table.id);
+    if replicas == 0 {
+        return Err(Decision::rows(Reason::NotAsked));
+    }
+
     let Some(aggregate) = find_aggregate(&planned.node) else {
         return Err(Decision::rows(Reason::NotExpressible("this plan's shape")));
     };
@@ -281,7 +290,7 @@ fn consider(
         stored: table.columns.len(),
         projected: columns.len(),
         bounded: false,
-        replicas: replicas(txn, tenant, table.id),
+        replicas,
     };
     let decision = routing::decide(shape, setting);
     if decision.engine == Engine::Row {
