@@ -1,0 +1,57 @@
+crates/esker-engine/src/db/mod.rs
+  s_e2fd0c54b9d574::t_1542aaaa10973b 77-78,109-111,117-126
+crates/esker-engine/src/db/open.rs
+  s_e2fd0c54b9d574::t_d63c6847ece086 164,171,191-198,247-266
+crates/esker-engine/src/db/write.rs
+  s_e2fd0c54b9d574::t_5caa3dda0b15e4 31,66,77-82,169-212
+crates/esker-engine/src/options.rs
+  s_e2fd0c54b9d574::t_79f7231f7e3d38 121-127,136-139,141-145,149-169,171-175,178-188,192-193,195-197,201,203-227,464-467
+crates/esker-engine/tests/wal_sync.rs
+  s_e2fd0c54b9d574::t_48c645046371ca 1-280
+crates/esker-store/src/apply.rs
+  s_e2fd0c54b9d574::t_db5c689bc3c964 797,1024,1210,1321
+crates/esker-store/src/meta.rs
+  s_e2fd0c54b9d574::t_0e01c9e9b75267 331,467,482,500
+crates/esker-store/src/peer.rs
+  s_e2fd0c54b9d574::t_7057272a724358 423,646,738
+crates/esker-store/src/raft_log.rs
+  s_e2fd0c54b9d574::t_eaca9cc4f5de1d 199,369,687,889,1016,1022,1068,1079
+crates/esker-store/src/server.rs
+  s_e2fd0c54b9d574::t_bcc0cde789d4c8 306,2138,2178,2755
+crates/esker-store/src/snapshot.rs
+  s_e2fd0c54b9d574::t_4c96b2e43a1da1 359,502,541,741
+crates/esker-store/src/split.rs
+  s_e2fd0c54b9d574::t_5670e776962302 235
+crates/esker-store/tests/columnar_region.rs
+  s_e2fd0c54b9d574::t_9ffb364df8d567 84,88
+crates/esker-store/tests/multi_region.rs
+  s_e2fd0c54b9d574::t_20cec87f7e1d9b 37
+crates/esker-store/tests/restart.rs
+  s_e2fd0c54b9d574::t_4b7a2d31d91eff 71
+crates/esker-store/tests/snapshot.rs
+  s_e2fd0c54b9d574::t_e34a6cd438c93f 1302
+crates/esker-store/tests/split.rs
+  s_e2fd0c54b9d574::t_303e30173bc3fc 526,559
+docs/adr/0036-a-write-may-have-no-opinion-about-durability.md
+  s_e2fd0c54b9d574::t_c3ae7e29a7ee69 1-112
+docs/bench/debt-c3.md
+  s_e2fd0c54b9d574::t_bbbab1006a8594 1-63
+docs/plans/debt-c3.md
+  s_e2fd0c54b9d574::t_41a0249cebd74f 276-351
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "dd182cbf6916e00f572490945c0593a8dd39f8a6",
+  "prompts": {},
+  "sessions": {
+    "s_e2fd0c54b9d574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "671f3143-5435-4676-97d9-490a56835160",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
