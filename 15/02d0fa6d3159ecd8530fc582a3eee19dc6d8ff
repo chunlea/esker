@@ -1,0 +1,25 @@
+crates/esker-store/src/server.rs
+  s_7a3132f4d02a00::t_d24766ef039877 55-66,1396-1426,1445,1449,1456-1467,1511-1561,2028-2046
+crates/esker-store/tests/snapshot.rs
+  s_7a3132f4d02a00::t_f66913dcbd7755 1056-1071,1082-1087,1145-1270
+docs/adr/0035-a-snapshot-ask-waits-for-the-record-that-names-its-peer.md
+  s_7a3132f4d02a00::t_566ccfa857312b 1-98
+docs/plans/debt-c3.md
+  s_7a3132f4d02a00::t_f2b0695c74ca10 139-212
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "1502d0fa6d3159ecd8530fc582a3eee19dc6d8ff",
+  "prompts": {},
+  "sessions": {
+    "s_7a3132f4d02a00": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "176f3779-1c8f-49ac-8e22-08bb3b8ac7c3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
