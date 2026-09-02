@@ -575,7 +575,10 @@ impl TableIter {
 
 /// [`Error`] is not `Clone` — an `io::Error` is not — so a stored status is rebuilt rather
 /// than cloned. Corruption keeps its shape because callers branch on it.
-fn clone_error(error: &Error) -> Error {
+///
+/// `pub(crate)` for [`crate::db::level_iter`], which holds a status for the same reason and would
+/// otherwise carry a second copy of this decision.
+pub(crate) fn clone_error(error: &Error) -> Error {
     match error {
         Error::Corruption { context, detail } => Error::corruption(context.clone(), detail.clone()),
         other => Error::InvalidArgument(other.to_string()),

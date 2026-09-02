@@ -10,7 +10,8 @@
 //! ```text
 //! esker [--version | -V] [--help | -h]
 //! esker bench [<workload>] [--num N] [--value-size N] [--batch-size N] [--threads N]
-//!             [--sync] [--dir PATH] [--duration-secs N] [--remote HOST:PORT] [--help]
+//!             [--sync] [--dir PATH] [--duration-secs N] [--remote HOST:PORT]
+//!             [--write-buffer-size N] [--target-file-size N] [--compact] [--help]
 //! esker sst-dump <path> [--verbose | -v] [--prefix-len N] [--help]
 //! esker wal-dump <path> [--verbose | -v] [--help]
 //! esker manifest-dump <dir> [--help]
@@ -189,7 +190,8 @@ Bench options:
                         fillrandom)
       --num N           Keys in the database, and operations measured (default 100000)
       --value-size N    Value size in bytes (default 100)
-      --batch-size N    Entries per write batch; for tso and allocid, values per
+      --batch-size N    Entries per write batch; entries read per scan for scanrange;
+                        for tso and allocid, values per
                         call to the placement driver (default 1)
       --threads N       Concurrent workers; readseq always uses one (default 1)
       --sync            Wait for each write to be durable (default off)
@@ -202,6 +204,15 @@ Bench options:
       --sst-cache-bytes N
                         Local SST bytes the tier may keep; 0 is a cold cache. Needs
                         --sst-store
+      --write-buffer-size N
+                        Memtable bytes before a flush (default 64 MiB). Small values
+                        make a fill produce many L0 files
+      --target-file-size N
+                        Bytes per compaction output file. This is what decides how
+                        many files a level below L0 holds
+      --compact         Compact the whole database before the measured phase, so the
+                        read workload runs against levels rather than against L0.
+                        Untimed, like the fill
       --adopt-sst-store Claim an --sst-store prefix that already holds objects but no
                         claim marker, instead of refusing. A benchmark's database is a
                         temporary directory, so its claim id is new every run and every
@@ -417,6 +428,20 @@ fn parse_bench(arguments: &[String]) -> Result<Command, ParseError> {
             options.adopt_sst_store = true;
             continue;
         }
+        if flag == "--compact" {
+            options.compact = true;
+            continue;
+        }
+        if flag == "--write-buffer-size" {
+            let raw = take_value(arguments, &mut index, inline, "--write-buffer-size")?;
+            options.write_buffer_size = Some(positive_bytes("--write-buffer-size", &raw)?);
+            continue;
+        }
+        if flag == "--target-file-size" {
+            let raw = take_value(arguments, &mut index, inline, "--target-file-size")?;
+            options.target_file_size = Some(positive_bytes("--target-file-size", &raw)?);
+            continue;
+        }
 
         if flag == "--sst-cache-bytes" {
             let raw = take_value(arguments, &mut index, inline, "--sst-cache-bytes")?;
@@ -491,6 +516,23 @@ fn take_value(
     };
     *index += 1;
     Ok(value.clone())
+}
+
+/// A byte count that must be greater than zero.
+///
+/// Zero is refused rather than clamped: a memtable or an output file of no bytes is not a shape
+/// the engine has, so a run asking for one has a typo in it and should be told.
+fn positive_bytes<T>(name: &'static str, raw: &str) -> Result<T, ParseError>
+where
+    T: std::str::FromStr + PartialOrd + Default,
+{
+    raw.parse::<T>()
+        .ok()
+        .filter(|bytes| *bytes > T::default())
+        .ok_or_else(|| ParseError::InvalidValue {
+            flag: name,
+            value: raw.to_owned(),
+        })
 }
 
 fn number(name: &'static str, raw: &str) -> Result<u32, ParseError> {
