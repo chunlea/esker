@@ -1,0 +1,29 @@
+Cargo.lock
+  s_e2fd0c54b9d574::t_a8facfe00f7811 490
+crates/esker-sim/src/mech/mod.rs
+  s_e2fd0c54b9d574::t_f92fc48e9d7673 46,51
+crates/esker-sim/src/mech/sweep.rs
+  s_e2fd0c54b9d574::t_75baf2a79e4716 1-341
+crates/esker-store/Cargo.toml
+  s_e2fd0c54b9d574::t_a159019473b1be 55-59
+crates/esker-store/tests/sim_sweep.rs
+  s_e2fd0c54b9d574::t_6089759a247562 1-530
+docs/plans/phase-11-engine.md
+  s_e2fd0c54b9d574::t_d78397b8b1e093 325-378
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "b37e264d6fb6c2b42ce044a7e3f6ec88c70223a6",
+  "prompts": {},
+  "sessions": {
+    "s_e2fd0c54b9d574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "671f3143-5435-4676-97d9-490a56835160",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
