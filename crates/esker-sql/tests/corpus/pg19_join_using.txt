@@ -1,0 +1,31 @@
+# `USING` in a chain, captured to record **why it is refused** rather than approximated
+#
+# Two things `USING` does that an `ON` equality does not, and both compound down a chain:
+#
+#   * it **merges** the column, so `SELECT *` over three tables joined `USING (id)` returns four
+#     columns and not six — the `id` appears once;
+#   * a later `ON` join bringing a third column of the same name makes a bare reference
+#     **`42702 column reference "id" is ambiguous`**, where without the `ON` join it resolves to
+#     the merged column.
+#
+# Approximating either would be a wrong answer rather than a gap, so a chain of more than one join
+# containing a `USING` is `0A000` naming itself. `ActiveRecord` sends **no** `USING` at all — zero
+# in 5396 captured statements — so this is a gap nothing is waiting on, and the file is here so
+# that whoever closes it starts from the measurement rather than from the guess.
+#
+DROP TABLE IF EXISTS ju3		-
+DROP TABLE IF EXISTS ju2		-
+DROP TABLE IF EXISTS ju1		-
+CREATE TABLE ju1 (id int8 PRIMARY KEY, a text)		-
+CREATE TABLE ju2 (id int8 PRIMARY KEY, b text)		-
+CREATE TABLE ju3 (id int8 PRIMARY KEY, c text)		-
+INSERT INTO ju1 VALUES (1, 'a1'), (2, 'a2'), (3, 'a3')		-
+INSERT INTO ju2 VALUES (1, 'b1'), (2, 'b2')		-
+INSERT INTO ju3 VALUES (1, 'c1')		-
+SELECT id, a, b, c FROM ju1 JOIN ju2 USING (id) JOIN ju3 USING (id) ORDER BY id	bigint,text,text,text	1|a1|b1|c1
+SELECT id, a, b, c FROM ju1 LEFT JOIN ju2 USING (id) LEFT JOIN ju3 USING (id) ORDER BY id	bigint,text,text,text	1|a1|b1|c1 ; 2|a2|b2|\N ; 3|a3|\N|\N
+SELECT * FROM ju1 JOIN ju2 USING (id) JOIN ju3 USING (id) ORDER BY id	bigint,text,text,text	1|a1|b1|c1
+SELECT * FROM ju1 LEFT JOIN ju2 USING (id) LEFT JOIN ju3 USING (id) ORDER BY id	bigint,text,text,text	1|a1|b1|c1 ; 2|a2|b2|\N ; 3|a3|\N|\N
+SELECT ju1.id, ju2.id FROM ju1 JOIN ju2 USING (id) ORDER BY ju1.id	bigint,bigint	1|1 ; 2|2
+SELECT id FROM ju1 JOIN ju2 USING (id) JOIN ju3 ON ju3.id = ju1.id ORDER BY id	!42702 column reference "id" is ambiguous
+SELECT count(*) FROM ju1 LEFT JOIN ju2 USING (id) LEFT JOIN ju3 USING (id)	bigint	3

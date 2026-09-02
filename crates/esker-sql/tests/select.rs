@@ -421,8 +421,8 @@ fn an_expression_we_do_not_evaluate_is_refused_by_name() {
         ("SELECT * FROM s1 FULL JOIN s2 ON true", "FULL JOIN"),
         ("SELECT * FROM s1 NATURAL JOIN s2", "NATURAL JOIN"),
         (
-            "SELECT * FROM s1 JOIN s2 ON true JOIN s1 ON true",
-            "more than one JOIN",
+            "SELECT id FROM s1 JOIN s1 AS b USING (id) JOIN s1 AS c USING (id)",
+            "USING in a chain of more than one JOIN",
         ),
         ("SELECT * FROM s1 UNION SELECT * FROM s1", "UNION"),
     ] {

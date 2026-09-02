@@ -1074,6 +1074,57 @@ is `22P02`, which this node answers too. So the pair is recognised together. It 
 around the missing type; it is the one place where composing the two steps would have to permit a
 cast PostgreSQL forbids.
 
+#### Rung 3: a chain of joins
+
+`ActiveRecord`'s `indexes()` sends **four tables and three joins** — `pg_class` twice under two
+aliases, all `ON`, mixing `INNER` and `LEFT` — and rung 3 stopped on it for four scoreboard runs
+with `0A000 more than one JOIN is not supported`.
+
+##### Left-deep in written order is the semantics, not a planner choice
+
+The four ways two joins combine return **1, 4, 1 and 2** rows over one fixture, and getting all
+four right is what separates a join planner from a fold:
+
+| First | Second | Rows |
+|---|---|---|
+| `JOIN` | `JOIN` | 1 |
+| `LEFT JOIN` | `LEFT JOIN` | 4 |
+| `LEFT JOIN` | `JOIN` | **1** |
+| `JOIN` | `LEFT JOIN` | 2 |
+
+The third is the one that decides it. `A LEFT JOIN B ON … JOIN C ON …` is `((A LJ B) JOIN C)`: the
+inner join runs against rows the left join has already NULL-extended and throws them back out. A
+chain planned as "each join against the original left table" keeps all four; a chain that reordered
+its steps keeps two. Any two of the four agreeing by accident is possible, all four is not.
+
+So `plan_chain` does **not** reorder, where the two-table path does and should — an inner join of
+two tables is commutative and the probe only works on the inner side, which is worth a swap. A
+chain is not free to: one `LEFT JOIN` anywhere in it fixes the order of every step after it. Rather
+than reorder the all-inner prefix and stop at the first outer join, it plans as written. A
+rule-based planner that is right everywhere beats one that is faster on shapes nobody sends.
+
+Each step's scope is the tables to its left plus the one being joined, which is what lets an `ON`
+reach back past the table joined in between — `ON n.oid = t.relnamespace`, as `indexes()` writes it.
+The same table twice under two aliases is two entries sharing one `TableDef`: a duplicate **name**
+is `42712` and a duplicate table is not.
+
+##### `USING` in a chain is refused, and only in a chain
+
+It does a second thing an equality cannot — it **merges** the named column — and the merge compounds:
+`SELECT *` over three tables joined `USING (id)` returns four columns, not six, and a later `ON` join
+bringing a third `id` makes a bare reference `42702 column reference "id" is ambiguous` where
+without it the same reference resolves. Both measured in `tests/corpus/pg19_join_using.txt`.
+Approximating either is a wrong answer rather than a gap, and **`ActiveRecord` sends no `USING` at
+all** — zero in 5396 captured statements — so nothing is waiting on it. One join with `USING` still
+runs; the corpus is there so whoever closes the gap starts from the measurement.
+
+##### A divergence that had started agreeing
+
+`CROSS JOIN` went into the divergence list on the assumption that it was refused like a
+comma-separated `FROM`. It has always run, and the harness failed the test until the entry came out
+— the second time this session that checking both directions has caught a note somebody wrote once
+and never re-measured.
+
 ## 3. The test ladder
 
 Each rung is a thing that either works or does not, and none of them is reached by asserting

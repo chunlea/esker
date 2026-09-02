@@ -108,6 +108,20 @@ impl<'a> Scope<'a> {
         }
     }
 
+    /// N tables, in the order the query wrote them — which for a chain of joins is also the
+    /// order the executor reads them, because a chain is planned left-deep with no swapping.
+    ///
+    /// `using` is empty by construction: `USING` in a chain is refused in the lowering, since the
+    /// merge it performs compounds in ways an equality cannot express (`plan::Select::joins`).
+    fn chain(entries: &[(&'a TableDef, String)]) -> Self {
+        Scope {
+            tables: entries.iter().map(|(table, _)| *table).collect(),
+            names: entries.iter().map(|(_, name)| name.clone()).collect(),
+            written: (0..entries.len()).collect(),
+            using: Vec::new(),
+        }
+    }
+
     /// The name a `42803` prints for a resolved position: `t.c`, qualified.
     ///
     /// PostgreSQL qualifies it even when the query has one table, and in a join it is the only
@@ -294,8 +308,18 @@ pub(super) fn plan(
     select: &Select,
     tenant: u64,
     table: Option<&TableDef>,
-    inner: Option<&TableDef>,
+    inners: &[&TableDef],
 ) -> Result<Planned> {
+    // A **chain** of joins takes the other path: left-deep, in the order written, with no choice
+    // of driving side. That is not a simplification of what one join does below — it is what the
+    // SQL means. `A LEFT JOIN B ON … JOIN C ON …` is `((A LJ B) JOIN C)`, and swapping any step
+    // would change which rows the NULL-extension survives; measured, and the whole reason the two
+    // paths are not merged. The single-join case keeps its choice because an inner join of two
+    // tables really is commutative and the probe only works on the inner side.
+    if inners.len() > 1 {
+        return plan_chain(select, tenant, table, inners);
+    }
+    let inner = inners.first().copied();
     // Which side drives the loop. An inner join is commutative, so this is free to choose — and
     // it has to choose, because the probe only works on the *inner* side: without this, `FROM c
     // JOIN o ON c.id = o.cid` reads the whole of `o` for every row of `c`, while the same query
@@ -307,18 +331,16 @@ pub(super) fn plan(
     let named_table = table.map(|table| (table, names.0));
     let named_inner = inner.map(|inner| (inner, names.1));
 
-    let using: &[String] = select.join.as_ref().map_or(&[], |join| &join.using);
-    let condition = match (&select.join, named_table, named_inner) {
+    let only_join = select.joins.first();
+    let using: &[String] = only_join.map_or(&[], |join| &join.using);
+    let condition = match (&only_join, named_table, named_inner) {
         (Some(join), Some(left), Some(right)) if !join.using.is_empty() => {
             Some(using_condition(&join.using, left, right)?)
         }
         (Some(join), ..) => join.on.clone(),
         _ => None,
     };
-    let left_join = select
-        .join
-        .as_ref()
-        .is_some_and(|join| join.kind == crate::plan::JoinKind::Left);
+    let left_join = only_join.is_some_and(|join| join.kind == crate::plan::JoinKind::Left);
 
     let (scope, swapped) = drive_from(
         named_table,
@@ -348,7 +370,7 @@ pub(super) fn plan(
         }
     };
 
-    if let Some(join) = &select.join {
+    if let Some(join) = only_join {
         let inner = inner_table.ok_or_else(|| SqlError::UndefinedTable(join.table.name.clone()))?;
         node = join_node(node, condition.as_ref(), left_join, &scope, inner)?;
     }
@@ -364,10 +386,26 @@ pub(super) fn plan(
         };
     }
 
+    finish_plan(select, node, &scope, outer_table)
+}
+
+/// Everything above the joins and the `WHERE`: aggregation, the target list, the sort, `DISTINCT`
+/// and `LIMIT`.
+///
+/// Shared by the one-join path and [`plan_chain`] rather than written twice. The two differ only
+/// in how they build the node underneath and which scope they build it against; from here up, a
+/// statement over four tables and a statement over one are planned by the same code, which is
+/// what keeps `GROUP BY` and `ORDER BY` from acquiring a second set of rules for chains.
+fn finish_plan(
+    select: &Select,
+    mut node: Node,
+    scope: &Scope<'_>,
+    outer_table: Option<&TableDef>,
+) -> Result<Planned> {
     // Aggregation sits between the filter and the sort. Everything above it is written about a
     // row that no table has -- the grouping keys followed by the aggregate values -- and
     // `Aggregation::rewrite` is what moves an expression from one to the other.
-    let aggregation = aggregate::Aggregation::build(select, &scope)?;
+    let aggregation = aggregate::Aggregation::build(select, scope)?;
     if let Some(aggregation) = &aggregation {
         node = Node::Aggregate {
             input: Box::new(node),
@@ -378,8 +416,8 @@ pub(super) fn plan(
         };
     }
 
-    let columns = output_columns(select, &scope, aggregation.as_ref())?;
-    let exprs = projection_exprs(select, &scope, aggregation.as_ref())?;
+    let columns = output_columns(select, scope, aggregation.as_ref())?;
+    let exprs = projection_exprs(select, scope, aggregation.as_ref())?;
 
     // The sort goes *below* the projection, so it can order on a column the target list does not
     // return -- `SELECT n FROM s1 ORDER BY id` is ordinary SQL, and a sort above the projection
@@ -390,7 +428,7 @@ pub(super) fn plan(
     // rather than working around it: deduplication happens over the target list, so a sort key
     // the target list does not contain has no defined position to sort at. Its keys are resolved
     // against the *output* columns and a key that is not one of them is `42P10`.
-    let sort_keys = order_keys(select, &scope, aggregation.as_ref(), &exprs, &columns)?;
+    let sort_keys = order_keys(select, scope, aggregation.as_ref(), &exprs, &columns)?;
     if !select.distinct && !sort_keys.is_empty() {
         node = Node::Sort {
             input: Box::new(node),
@@ -427,7 +465,7 @@ pub(super) fn plan(
         node,
         columns,
         table: outer_table.map_or_else(|| "-".to_owned(), |table| table.name.clone()),
-        column_names: scope_column_names(&scope),
+        column_names: scope_column_names(scope),
         engine: None,
     })
 }
@@ -541,7 +579,7 @@ pub(super) fn returning_columns(items: &[SelectItem], table: &TableDef) -> Resul
     let scope = Scope::single(table);
     let select = Select {
         from: Some(crate::plan::TableRef::bare(table.name.clone())),
-        join: None,
+        joins: Vec::new(),
         projection: items.to_vec(),
         filter: None,
         distinct: false,
@@ -573,14 +611,86 @@ pub(super) fn returning_columns(items: &[SelectItem], table: &TableDef) -> Resul
 /// a self-join with one table's columns twice, with nothing to say so. The check is over these
 /// names and not over the tables, which is why `FROM al AS t JOIN ar AS al` is legal: the alias
 /// freed the name (measured, `tests/corpus/pg19_alias.txt`).
+/// A chain of two or more joins: left-deep, in the order written.
+///
+/// Every step is a nested loop whose outer side is everything planned so far, so the scope grows
+/// one table at a time and each `ON` resolves against **every** table to its left — which is what
+/// lets `ON n.oid = t.relnamespace` reach back past the table joined in between, as
+/// `ActiveRecord`'s `indexes()` does.
+///
+/// # What this deliberately does not do
+///
+/// **It does not reorder.** A two-table inner join is commutative and [`plan`] exploits that; a
+/// chain is not free to, because a `LEFT JOIN` anywhere in it fixes the order of everything after
+/// it — `A LEFT JOIN B ON … JOIN C ON …` keeps only the rows the inner join matches, and swapping
+/// the last two steps would keep the NULL-extended ones. Rather than reorder the prefix that
+/// happens to be all-inner and stop at the first outer join, it plans as written: a rule-based
+/// planner that is right everywhere beats one that is faster on the shapes nobody sends.
+///
+/// The cost is that the inner side of each step is probed by key only when its `ON` allows it,
+/// exactly as for one join, and read whole otherwise. That is the same trade one join makes.
+fn plan_chain(
+    select: &Select,
+    tenant: u64,
+    table: Option<&TableDef>,
+    inners: &[&TableDef],
+) -> Result<Planned> {
+    let Some(outer) = table else {
+        return Err(SqlError::Internal(
+            "a chain of joins with no left-hand table".to_owned(),
+        ));
+    };
+    let outer_name = select
+        .from
+        .as_ref()
+        .map_or("", crate::plan::TableRef::referred_as)
+        .to_owned();
+
+    // Every table under the name the query refers to it by, left to right. The same table may
+    // appear twice under two aliases — `pg_class t … pg_class i` — so a duplicate *name* is the
+    // error and a duplicate table is not.
+    let mut entries: Vec<(&TableDef, String)> = vec![(outer, outer_name)];
+    for (join, inner) in select.joins.iter().zip(inners) {
+        entries.push((*inner, join.table.referred_as().to_owned()));
+    }
+    for (at, (_, name)) in entries.iter().enumerate() {
+        if entries[..at].iter().any(|(_, earlier)| earlier == name) {
+            return Err(SqlError::DuplicateTableName(name.clone()));
+        }
+    }
+
+    // The `WHERE` cannot narrow the outer access path here: with more than one table it may
+    // mention any of them, and a value from a table not yet read is not one a scan can seek on.
+    let mut node = access_path(None, tenant, outer)?;
+    // Grown one table at a time, so each step's `ON` sees exactly the tables to its left plus the
+    // one being joined — which is what makes a reference to a table two steps back resolve, and a
+    // reference to one further right an "undefined column" rather than a silent NULL.
+    for (at, (join, inner)) in select.joins.iter().zip(inners).enumerate() {
+        let scope = Scope::chain(&entries[..=at + 1]);
+        let left_join = join.kind == crate::plan::JoinKind::Left;
+        node = join_node(node, join.on.as_ref(), left_join, &scope, inner)?;
+    }
+
+    let scope = Scope::chain(&entries);
+    if let Some(filter) = &select.filter {
+        let predicate = resolve(filter, &scope)?;
+        check_predicate(&predicate, "WHERE", &scope)?;
+        node = Node::Filter {
+            input: Box::new(node),
+            predicate,
+        };
+    }
+    finish_plan(select, node, &scope, Some(outer))
+}
+
 fn from_names(select: &Select) -> Result<(&str, &str)> {
     let left = select
         .from
         .as_ref()
         .map_or("", crate::plan::TableRef::referred_as);
     let right = select
-        .join
-        .as_ref()
+        .joins
+        .first()
         .map_or("", |join| join.table.referred_as());
     if !right.is_empty() && left == right {
         return Err(SqlError::DuplicateTableName(left.to_owned()));

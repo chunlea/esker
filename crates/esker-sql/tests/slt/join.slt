@@ -156,5 +156,11 @@ statement error (0A000)
 SELECT o.id FROM o NATURAL JOIN c
 
 # Two joins in one statement is the next unit's work, and says so.
-statement error (0A000)
+# A chain of joins runs since the rung-3 unit, including the same table twice under two aliases —
+# which is the shape `ActiveRecord`'s `indexes()` sends. The `0A000` that stood here is gone.
+query I rowsort
 SELECT o.id FROM o JOIN c ON o.cid = c.id JOIN c AS d ON o.cid = d.id
+----
+10
+11
+12
