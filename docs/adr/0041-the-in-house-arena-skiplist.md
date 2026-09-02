@@ -1,8 +1,24 @@
 # 0041 — The in-house arena skiplist
 
-Status: **proposed, design only.** No code is written under this ADR without a coordinator's GO.
-It replaces the one bought piece of concurrent code named in `CLAUDE.md`'s dependency policy and in
-`docs/DESIGN.md` §4.4, and closes the `TODO(post-v1)` at `crates/esker-engine/src/memtable.rs:273`.
+Status: **proposed, and not being built.** Put to the maintainer at the close of phase 11 and
+declined, for three reasons worth keeping next to the design rather than in a plan file nobody
+reads twice:
+
+* **It is not a bottleneck.** Nothing has profiled the memtable cursor as the thing in the way.
+  The costs below are real and measured in complexity, not in a flame graph — `CLAUDE.md` says to
+  optimise after a profile, and this ADR is an argument from reading the code.
+* **The risk is silent.** The gain is a faster scan and three fewer crates; the exposure is
+  `unsafe` in the one place where getting it wrong produces a suite that passes on x86 for a year
+  and corrupts a memtable on ARM under load. That is a bad trade to take unprompted.
+* **The B wave comes first.** There is queued work with a caller waiting on it.
+
+The design stands as written and needs no revision to be picked up. What would change the answer
+is a profile that names `MemTableIter` — the shape to look for is a scan-heavy workload whose time
+sits in `re-find the key` rather than in I/O.
+
+It would replace the one bought piece of concurrent code named in `CLAUDE.md`'s dependency policy
+and in `docs/DESIGN.md` §4.4, and close the `TODO(post-v1)` at
+`crates/esker-engine/src/memtable.rs:273`. Both stay as they are.
 
 ## Context
 
@@ -199,7 +215,11 @@ memtables, that is a different ADR and it starts by changing group commit.
 
 ## Status of this ADR
 
-Design only. `docs/plans/phase-11-engine.md` §6 records that the lane stopped here deliberately;
-the decision to write the code belongs to the coordinator, and the thing to weigh is that the gain
-is a faster scan and three fewer crates, against `unsafe` in the one place where getting it wrong
-is silent.
+Design only, and staying that way for now — see the status line at the top for the three reasons.
+`docs/plans/phase-11-engine.md` §6 records that the lane stopped at the ADR deliberately and did
+not write a line of the code.
+
+Nothing here rots if it sits: the memtable's surface is unchanged, and the argument that makes the
+job small — writers serialised by group commit, an append-only structure, reclamation already
+owned by an `Arc` one level up — is a property of `db/write.rs` and `memtable.rs` as they stand.
+If either changes, this ADR is the thing to re-read first.

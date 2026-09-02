@@ -515,7 +515,9 @@ make the follow-up answerable.
 ### U5 — the skiplist ADR
 
 [ADR 0041](../adr/0041-the-in-house-arena-skiplist.md), **design only**, as the brief required. The
-lane stopped at the ADR and did not write the code.
+lane stopped at the ADR and did not write the code. Put to the maintainer at the close of the lane
+and **declined**: not a profiled bottleneck, a silent correctness risk, and the B wave has work
+with a caller waiting on it. The ADR carries all three reasons and what would change the answer.
 
 The argument the ADR makes that was not obvious going in: the memtable does not need a general
 lock-free ordered map. Writers are serialised by group commit, the structure is append-only for its
@@ -567,3 +569,78 @@ disagreement here was in the direction nobody checks for: the document was ahead
 §4.9 gains the two paragraphs the change makes true — why L0 is the exception, and why the
 tombstone walk is an L0 walk — and §14 gains a row for the open-reader bound, which had no default
 recorded anywhere.
+
+## 14. U6 and U7 — the two interim units
+
+### U6 — a tiered column family writes 16 KiB blocks
+
+U4 measured this and declined to act, because `CfOptions::block_size` is one knob for both storages
+and moving it would change every local database too. U6 takes the tiered half only: the local
+default stays at 4 KiB and is asserted to.
+
+**The design decision is the type, not the number.** A `usize` cannot say "no opinion", so
+resolving by overriding the value *when it equals the local default* would make a caller who
+deliberately asked for 4 KiB on tiered storage indistinguishable from one who asked for nothing.
+That is `dd182cb`'s bug in another field, and [`BlockSize::Storage`] versus `Fixed(n)` is the same
+missing state given a name before it can cost anything. Resolved in `table_options`, the one
+function that sees both the family's options and the filesystem; per database rather than per
+family, because tiering is a property of the filesystem.
+
+**Nothing needs migrating, and that is asserted rather than assumed.** A reader takes every block
+bound from the table's own index and never consults `block_size`, so an SST written at 4 KiB reads
+identically afterwards — checked by writing a database at 4 KiB, reopening it at 16 KiB, and
+reading every key back through a point lookup and a scan.
+
+`data_block_count` for the same 4,000 keys: **54 at 4 KiB, 14 at 16 KiB**. 3 of the 4 tests are red
+with the resolution patched back to 4 KiB; the fourth is the `Fixed` guard and passes either way.
+
+Two probes were wrong before one worked, and both are named in the test file:
+
+* **bytes on disk** — identical to the byte (39,823 both ways). An index entry and a per-block
+  trailer are a rounding error next to the keys, and LZ4 absorbs the rest.
+* **`TierStats::ranged_reads` over a scan** — 15 both ways, because with the local copies still
+  resident the scan was served locally: 57 cache hits against 3 misses. It never touched the tier.
+
+### U7 — what a crash costs under each `WalSyncMode`
+
+`tests/wal_sync.rs` counts syncs, which says whether the mode is read. `dd182cb`'s claim was about
+a **crash** — "a database configured for BOUNDED loss had unbounded loss" — and nothing checked it.
+`tests/wal_sync_crash.rs` is five tests on `MemFileSystem::lose_unsynced`, a power loss: the harsher
+of the two models `src/fs.rs` names, so every assertion holds a fortiori under a `kill -9`.
+
+Not a subprocess kill, deliberately: the claim is about an exact set of writes and a `SIGKILL` lands
+where the scheduler puts it. Under `Interval`, "the last interval's writes" would be whatever
+happened to be in flight on a box shared with three other agents. The bound is waited for by sync
+**count** rather than elapsed time, so a starved background thread makes the test slow instead of
+making it lie.
+
+Three of the five are red against the old rule (`sync || mode == PerWrite`, default `sync: true`):
+the `Interval` bound, the no-opinion loss on `Never`, and an explicit `Buffered` write on a
+`PerWrite` database. The two that stay green are guards and say so.
+
+**The red run corrected a comment I had written.** I recorded `an_explicit_buffered_write_is_still_
+buffered` as green before `dd182cb`, on the reading that an explicit `sync: false` always worked. It
+is red: the old line was an **OR**, so on a `PerWrite` database the mode added syncing back to a
+write that had declined it — `Buffered` was only honoured on the modes that were not going to sync
+anyway. The commit message says exactly that in one clause and I misread it. The test now prevents
+the misreading, and §12's list of tests that did not discriminate has a third entry in spirit: this
+one discriminated, and my *description* of it did not.
+
+Claim 3 uses `Durability::Policy` rather than `Buffered`, which is the whole red-first value of it.
+Before `dd182cb` a caller could already ask for a buffered write; what it could not do was leave the
+decision to the database. A test built from explicit `Buffered` writes passes against the bug.
+
+## 15. The lane's close
+
+Eleven commits, `875d9c4` through the close. The acceptance checklist:
+
+| | |
+|---|---|
+| `just check` | green in `target-c5` — see §16 |
+| `DESIGN.md` reflects what was built | §4.5 (tiered block size), §4.9 (per-level iterators, L0's exception, the reader cache), §7 (already corrected by `548dd62`), §14 (two new rows) |
+| the plan file records what changed and why | this file |
+| every performance claim has a number and a command | `docs/bench/phase-11-engine.md` |
+| every checker was shown red against the code it was written for | §10, §12, §14 |
+
+What this lane deliberately did not do is unchanged from §7, plus one addition: the in-house
+skiplist is designed and not built, by the maintainer's decision recorded in ADR 0041.
