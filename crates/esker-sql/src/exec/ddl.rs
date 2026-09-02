@@ -33,7 +33,7 @@
 //! without a key can now be created, written and read.
 
 use crate::backend::Txn;
-use crate::catalog::{self, ColumnDef, IndexDef, TableDef};
+use crate::catalog::{self, CheckDef, ColumnDef, IndexDef, TableDef};
 use crate::error::{Result, SqlError};
 use crate::exec::Executor;
 use crate::pgwire::session::Outcome;
@@ -56,29 +56,7 @@ pub(super) fn create_table(
         return Err(SqlError::DuplicateTable(create.name.clone()));
     }
 
-    let mut columns = Vec::with_capacity(create.columns.len());
-    for column in &create.columns {
-        if columns
-            .iter()
-            .any(|kept: &ColumnDef| kept.name == column.name)
-        {
-            return Err(SqlError::DuplicateColumn(column.name.clone()));
-        }
-        columns.push(ColumnDef {
-            name: column.name.clone(),
-            ty: column.ty,
-            typmod: column.typmod,
-            default_now: column.default_now,
-            // A primary key column is NOT NULL whether or not it said so, which is PostgreSQL's
-            // rule and also ours by necessity: a NULL cannot be part of a row key.
-            not_null: column.not_null || create.primary_key.contains(&column.name),
-            default: column.default.clone(),
-            // **No missing value at `CREATE TABLE`**, whatever the default is. Nothing predates a
-            // column the table was created with, so there is no narrower row for a pad to answer
-            // for — and writing one would be a claim about rows that cannot exist.
-            missing: None,
-        });
-    }
+    let columns = declared_columns(create)?;
 
     let key_position = |name: &String| {
         columns
@@ -155,11 +133,14 @@ pub(super) fn create_table(
         columns,
         primary_key,
         indexes,
+        checks: create.checks.clone(),
         primary_key_name,
         // A table starts at schema version 1; `ALTER TABLE ADD COLUMN` moves it.
         schema_version: 1,
         sequences,
     };
+
+    validate_checks(&table)?;
     catalog::create_table(txn, executor.tenant, &table)?;
     for sequence in &table.sequences {
         catalog::create_sequence(txn, executor.tenant, sequence)?;
@@ -170,6 +151,79 @@ pub(super) fn create_table(
 /// One sequence per `bigserial` or identity column, named the way a real server names it and
 /// taking that name in the same namespace tables and indexes share — `CREATE TABLE t_id_seq` after
 /// a `bigserial` is `42P07` on both servers.
+/// The table's columns, as the catalog holds them, refusing a name written twice.
+fn declared_columns(create: &CreateTable) -> Result<Vec<ColumnDef>> {
+    let mut columns = Vec::with_capacity(create.columns.len());
+    for column in &create.columns {
+        if columns
+            .iter()
+            .any(|kept: &ColumnDef| kept.name == column.name)
+        {
+            return Err(SqlError::DuplicateColumn(column.name.clone()));
+        }
+        columns.push(ColumnDef {
+            name: column.name.clone(),
+            ty: column.ty,
+            typmod: column.typmod,
+            default_now: column.default_now,
+            // A primary key column is NOT NULL whether or not it said so, which is PostgreSQL's
+            // rule and also ours by necessity: a NULL cannot be part of a row key.
+            not_null: column.not_null || create.primary_key.contains(&column.name),
+            default: column.default.clone(),
+            // **No missing value at `CREATE TABLE`**, whatever the default is. Nothing predates a
+            // column the table was created with, so there is no narrower row for a pad to answer
+            // for — and writing one would be a claim about rows that cannot exist.
+            missing: None,
+        });
+    }
+    Ok(columns)
+}
+
+/// A `CHECK` added after the fact.
+///
+/// It bumps the schema version like any other change to the table definition, because every
+/// node's cached `TableDef` has to learn it: a node still holding the old one would accept rows
+/// the constraint forbids.
+///
+/// **It is not validated against the rows already there.** PostgreSQL does validate. A backfill
+/// scan is the schema-change machinery of ADR 0020 and an `ADD CONSTRAINT` does not go through it
+/// yet, so this is a known gap rather than a decision — `tests/check_constraint.rs` pins what the
+/// node actually does and says why.
+fn add_check(
+    txn: &mut dyn Txn,
+    executor: &Executor,
+    table: &TableDef,
+    updated: &mut TableDef,
+    check: &CheckDef,
+) -> Result<()> {
+    if updated.checks.iter().any(|seen| seen.name == check.name) {
+        return Err(SqlError::DuplicateConstraint {
+            constraint: check.name.clone(),
+            relation: updated.name.clone(),
+        });
+    }
+    updated.checks.push(check.clone());
+    validate_checks(updated)?;
+    updated.schema_version += 1;
+    catalog::replace_table(txn, executor.tenant, table, updated)
+}
+
+/// Every `CHECK` on `table`, resolved against its own columns — **now**, not on the first row.
+///
+/// A predicate is stored as text and lowered when a row is written, so nothing else would notice
+/// that it names a column the table does not have until the first `INSERT`, and then as an
+/// internal error rather than the `42703` a real server gives at `CREATE TABLE`. Accepting one
+/// would create a table carrying a constraint that can never be evaluated. This is where the
+/// stored text stops being trusted.
+fn validate_checks(table: &TableDef) -> Result<()> {
+    for check in &table.checks {
+        let parsed = crate::parse::parse_predicate(&check.expr)?;
+        let scope = crate::exec::query::Scope::single(table);
+        crate::exec::query::resolve(&parsed, &scope)?;
+    }
+    Ok(())
+}
+
 fn sequences_for(
     executor: &Executor,
     txn: &mut dyn Txn,
@@ -475,6 +529,10 @@ pub(super) fn alter_table(
     let mut updated = (*table).clone();
     let mut changed = false;
     for action in &alter.actions {
+        if let AlterTableAction::AddCheck(check) = action {
+            add_check(txn, executor, &table, &mut updated, check)?;
+            continue;
+        }
         let AlterTableAction::AddColumn {
             column,
             if_not_exists,

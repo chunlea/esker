@@ -757,6 +757,7 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
     let mut primary_key = Vec::new();
     let mut primary_key_name = None;
     let mut unique = Vec::new();
+    let mut checks: Vec<crate::catalog::CheckDef> = Vec::new();
 
     for column in &create.columns {
         let column_name = ident(&column.name);
@@ -769,6 +770,25 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
         let mut sequence = serial_identity(&column.data_type);
         for option in &column.options {
             match &option.option {
+                // A column `CHECK`, named the way PostgreSQL names one when nothing else does:
+                // `<table>_<column>_check`. Measured — `q text CHECK (q <> '')` on table `ck` is
+                // `ck_q_check`.
+                // `constraint.expr`, not the constraint: a `CheckConstraint`'s own `Display`
+                // renders `CHECK (…)`, and storing that would make the stored text a call to a
+                // function named `CHECK` when it is read back.
+                ColumnOption::Check(constraint) => {
+                    refuse_if(
+                        constraint.enforced.is_some(),
+                        "CHECK ... ENFORCED, which is MySQL's",
+                    )?;
+                    checks.push(crate::catalog::CheckDef {
+                        name: constraint
+                            .name
+                            .as_ref()
+                            .map_or_else(|| format!("{name}_{column_name}_check"), ident),
+                        expr: constraint.expr.to_string(),
+                    });
+                }
                 ColumnOption::NotNull => not_null = true,
                 ColumnOption::Null => {}
                 // `DEFAULT CURRENT_TIMESTAMP` is an expression rather than a value, so it is
@@ -819,37 +839,18 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
         });
     }
 
-    for constraint in &create.constraints {
-        match constraint {
-            TableConstraint::PrimaryKey(key) => {
-                refuse_if(key.index_name.is_some(), "PRIMARY KEY USING INDEX")?;
-                primary_key.extend(index_columns(&key.columns)?);
-                primary_key_name = primary_key_name.or_else(|| key.name.as_ref().map(ident));
-            }
-            TableConstraint::Unique(key) => {
-                refuse_if(
-                    key.nulls_distinct != NullsDistinctOption::None,
-                    "UNIQUE NULLS [NOT] DISTINCT",
-                )?;
-                unique.push(plan::UniqueConstraint {
-                    name: key.name.as_ref().map(ident),
-                    columns: index_columns(&key.columns)?,
-                });
-            }
-            TableConstraint::ForeignKey(_) => {
-                return Err(SqlError::unsupported("FOREIGN KEY"));
-            }
-            TableConstraint::Check(_) => return Err(SqlError::unsupported("CHECK")),
-            other => {
-                return Err(SqlError::unsupported(format!(
-                    "the table constraint {other}"
-                )));
-            }
-        }
-    }
+    lower_table_constraints(
+        create,
+        &name,
+        &mut primary_key,
+        &mut primary_key_name,
+        &mut unique,
+        &mut checks,
+    )?;
 
     Ok(plan::CreateTable {
         name,
+        checks,
         if_not_exists: create.if_not_exists,
         columns,
         primary_key,
@@ -872,10 +873,34 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
     refuse_if(alter.on_cluster.is_some(), "ALTER TABLE ... ON CLUSTER")?;
     refuse_if(alter.table_type.is_some(), "ALTER of a table of that type")?;
 
+    // The table's own name, for deriving a constraint name PostgreSQL would derive.
+    let table_name = relation_name(&alter.name)?;
     let mut actions = Vec::with_capacity(alter.operations.len());
     for operation in &alter.operations {
         if let AlterTableOperation::SetOptionsParens { options } = operation {
             actions.push(lower_storage_parameters(options)?);
+            continue;
+        }
+        if let AlterTableOperation::AddConstraint { constraint, .. } = operation {
+            let TableConstraint::Check(check) = constraint else {
+                // A `FOREIGN KEY`, `UNIQUE` or `PRIMARY KEY` added after the fact. Named rather
+                // than recorded: see `plan::AlterTableAction::AddCheck`.
+                return Err(SqlError::unsupported(format!(
+                    "ALTER TABLE ... ADD CONSTRAINT ... {}",
+                    constraint_kind(constraint)
+                )));
+            };
+            refuse_if(
+                check.enforced.is_some(),
+                "CHECK ... ENFORCED, which is MySQL's",
+            )?;
+            actions.push(plan::AlterTableAction::AddCheck(crate::catalog::CheckDef {
+                name: check
+                    .name
+                    .as_ref()
+                    .map_or_else(|| format!("{table_name}_check"), ident),
+                expr: check.expr.to_string(),
+            }));
             continue;
         }
         let AlterTableOperation::AddColumn {
@@ -962,6 +987,76 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
 
 /// What to call an `ALTER TABLE` action the executor does not run.
 ///
+/// Every table-level constraint of a `CREATE TABLE`, into the four lists that hold one.
+///
+/// Split out of [`lower_create_table`] because that function had grown past what one screen
+/// holds, not because the constraints are separable — they all write into the same statement.
+fn lower_table_constraints(
+    create: &sqlparser::ast::CreateTable,
+    name: &str,
+    primary_key: &mut Vec<String>,
+    primary_key_name: &mut Option<String>,
+    unique: &mut Vec<plan::UniqueConstraint>,
+    checks: &mut Vec<crate::catalog::CheckDef>,
+) -> Result<()> {
+    for constraint in &create.constraints {
+        match constraint {
+            TableConstraint::PrimaryKey(key) => {
+                refuse_if(key.index_name.is_some(), "PRIMARY KEY USING INDEX")?;
+                primary_key.extend(index_columns(&key.columns)?);
+                *primary_key_name = primary_key_name
+                    .clone()
+                    .or_else(|| key.name.as_ref().map(ident));
+            }
+            TableConstraint::Unique(key) => {
+                refuse_if(
+                    key.nulls_distinct != NullsDistinctOption::None,
+                    "UNIQUE NULLS [NOT] DISTINCT",
+                )?;
+                unique.push(plan::UniqueConstraint {
+                    name: key.name.as_ref().map(ident),
+                    columns: index_columns(&key.columns)?,
+                });
+            }
+            TableConstraint::ForeignKey(_) => {
+                return Err(SqlError::unsupported("FOREIGN KEY"));
+            }
+            // A named table `CHECK`, or an unnamed one, which PostgreSQL names
+            // `<table>_check` — the same derivation a column constraint gets without the column.
+            TableConstraint::Check(check) => {
+                refuse_if(
+                    check.enforced.is_some(),
+                    "CHECK ... ENFORCED, which is MySQL's",
+                )?;
+                checks.push(crate::catalog::CheckDef {
+                    name: check
+                        .name
+                        .as_ref()
+                        .map_or_else(|| format!("{name}_check"), ident),
+                    expr: check.expr.to_string(),
+                });
+            }
+            other => {
+                return Err(SqlError::unsupported(format!(
+                    "the table constraint {other}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Which kind of constraint an `ADD CONSTRAINT` names, for the refusal that follows.
+fn constraint_kind(constraint: &TableConstraint) -> &'static str {
+    match constraint {
+        TableConstraint::ForeignKey(_) => "FOREIGN KEY",
+        TableConstraint::Unique(_) => "UNIQUE",
+        TableConstraint::PrimaryKey(_) => "PRIMARY KEY",
+        TableConstraint::Check(_) => "CHECK",
+        _ => "that constraint",
+    }
+}
+
 /// The three column actions are named the way PostgreSQL's own documentation names them, because
 /// they are the ones a user of this subset actually reaches. The rest fall back to the action's
 /// leading keywords, which is the same rule [`crate::parse::feature_name`] uses for a statement.

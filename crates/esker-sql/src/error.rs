@@ -713,6 +713,26 @@ pub enum SqlError {
     #[error("value too long for type {0}")]
     StringDataRightTruncation(String),
 
+    /// A constraint name the relation already has: `42710`.
+    #[error("constraint \"{constraint}\" for relation \"{relation}\" already exists")]
+    DuplicateConstraint {
+        /// The name that collided.
+        constraint: String,
+        /// The table it is on.
+        relation: String,
+    },
+
+    /// A row a `CHECK` refuses: `23514`.
+    #[error("new row for relation \"{relation}\" violates check constraint \"{constraint}\"")]
+    CheckViolation {
+        /// The constraint's name, given or derived.
+        constraint: String,
+        /// The table.
+        relation: String,
+        /// The row, for the `DETAIL` line PostgreSQL sends with it.
+        row: String,
+    },
+
     /// A `float(p)` whose precision is outside `1..=53`: `22023`.
     ///
     /// Its own message, not [`SqlError::TypeLengthTooSmall`]'s: PostgreSQL says "precision" and
@@ -950,6 +970,8 @@ impl SqlError {
             SqlError::NoActiveTransaction
             | SqlError::SetTransactionOutsideBlock
             | SqlError::OutsideTransactionBlock(_) => sqlstate::NO_ACTIVE_SQL_TRANSACTION,
+            SqlError::CheckViolation { .. } => sqlstate::CHECK_VIOLATION,
+            SqlError::DuplicateConstraint { .. } => sqlstate::DUPLICATE_OBJECT,
             SqlError::StringDataRightTruncation(_) => sqlstate::STRING_DATA_RIGHT_TRUNCATION,
             SqlError::UnsupportedUnicodeEscape => sqlstate::UNSUPPORTED_UNICODE_ESCAPE,
             // A declared length is `22023` too, which is not a family resemblance with the
@@ -1015,7 +1037,8 @@ impl SqlError {
             SqlError::UniqueViolation { key: Some(key), .. } => {
                 Some(format!("{key} already exists."))
             }
-            SqlError::NotNullViolationInRelation { row: Some(row), .. } => {
+            SqlError::NotNullViolationInRelation { row: Some(row), .. }
+            | SqlError::CheckViolation { row, .. } => {
                 Some(format!("Failing row contains ({row})."))
             }
             SqlError::UndefinedOperator { .. } => {

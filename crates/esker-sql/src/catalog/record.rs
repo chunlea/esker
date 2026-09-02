@@ -47,7 +47,9 @@
 use esker_base::varint;
 use esker_keys::{codec, prefix};
 
-use crate::catalog::{ColumnDef, Identity, IndexDef, Relation, SchemaState, SequenceDef, TableDef};
+use crate::catalog::{
+    CheckDef, ColumnDef, Identity, IndexDef, Relation, SchemaState, SequenceDef, TableDef,
+};
 use crate::error::{Result, SqlError};
 use crate::value::{ColumnType, Datum, NO_TYPMOD};
 
@@ -66,7 +68,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 5;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 6;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -660,6 +662,14 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
             varint::put_u64(ordinal as u64, &mut out);
         }
     }
+
+    // Version 6. At the very end, so a version 5 record's bytes are a prefix of a version 6 one's
+    // — the same shape every bump in this record has taken.
+    varint::put_u64(table.checks.len() as u64, &mut out);
+    for check in &table.checks {
+        put_str(&check.name, &mut out);
+        put_str(&check.expr, &mut out);
+    }
     Ok(out)
 }
 
@@ -733,7 +743,23 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
         });
     }
 
+    // A version 5 table has none, which is what every table written before version 6 had:
+    // `CHECK` was `0A000` until then. Read **before** `finish`, which consumes the reader and
+    // asserts the record is exhausted.
+    let checks = if reader.version >= 6 {
+        let mut checks = Vec::with_capacity(reader.count()?);
+        for _ in 0..checks.capacity() {
+            checks.push(CheckDef {
+                name: reader.string()?,
+                expr: reader.string()?,
+            });
+        }
+        checks
+    } else {
+        Vec::new()
+    };
     reader.finish()?;
+
     Ok(TableDef {
         id,
         name,
@@ -746,6 +772,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
         // where the table is loaded (`crate::catalog::View::table_by_id`). A `TableDef` decoded
         // straight from bytes therefore has none, which is what this function is for.
         sequences: Vec::new(),
+        checks,
     })
 }
 

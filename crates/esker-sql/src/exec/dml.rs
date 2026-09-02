@@ -241,6 +241,7 @@ pub(super) fn insert(
 
         fit_typmods(&table, &mut row)?;
         check_not_null(&table, &row)?;
+        check_constraints(&table, &row)?;
         write_row(executor, txn, &table, &row, written)?;
         // The row **as stored**, so a column filled from its `DEFAULT` comes back with that value
         // rather than with the NULL the user did not write.
@@ -461,6 +462,7 @@ pub(super) fn update(
         }
         fit_typmods(&table, &mut new)?;
         check_not_null(&table, &new)?;
+        check_constraints(&table, &new)?;
         remove_row(executor, txn, &table, &old)?;
         write_row(executor, txn, &table, &new, written)?;
         // The row **after** the assignments: `UPDATE t SET n = n + 1 RETURNING n` answers with
@@ -508,6 +510,40 @@ fn collect(
         rows.push(row);
     }
     Ok(rows)
+}
+
+/// Every `CHECK` on the table, against the row about to be written.
+///
+/// **A NULL passes.** A `CHECK` fails only when its predicate is *false*, and SQL's three-valued
+/// logic makes `NULL > 0` unknown rather than false — so a row with a NULL in the checked column
+/// is admitted. Measured: `INSERT INTO ck VALUES (4, NULL, 'x')` succeeds under `CHECK (p > 0)`.
+/// That is the rule most likely to be got wrong by evaluating the predicate as a boolean and
+/// treating "not true" as a violation.
+///
+/// The predicate is re-lowered from its stored text each time it is checked. It could be lowered
+/// once when the table is loaded; it is not, because the catalog caches a `TableDef` and a lowered
+/// expression would have to be invalidated with it. Re-lowering a short predicate per row is the
+/// cheaper mistake to make, and the only one that cannot go stale.
+fn check_constraints(table: &TableDef, row: &[Datum]) -> Result<()> {
+    for check in &table.checks {
+        let parsed = crate::parse::parse_predicate(&check.expr).map_err(|error| {
+            SqlError::Internal(format!(
+                "the stored CHECK {} of {} no longer parses: {error}",
+                check.name, table.name
+            ))
+        })?;
+        let scope = query::Scope::single(table);
+        let resolved = query::resolve(&parsed, &scope)?;
+        // Only `false` violates. NULL is unknown and passes, which is PostgreSQL's rule.
+        if matches!(cursor::evaluate(&resolved, row)?, Datum::Bool(false)) {
+            return Err(SqlError::CheckViolation {
+                constraint: check.name.clone(),
+                relation: table.name.clone(),
+                row: render_values(row),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn check_not_null(table: &TableDef, row: &[Datum]) -> Result<()> {

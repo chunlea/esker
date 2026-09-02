@@ -1,0 +1,42 @@
+# `CHECK` constraints — half of statement 52 of `schema.rb`
+#
+# The other half is `FOREIGN KEY`, which is a unit of its own because it has to *enforce*:
+# recording a constraint that does not constrain would let a schema load and then accept the rows
+# it forbids, which ADR 0031 calls a wrong answer rather than a gap. Until it lands, an FK is
+# `0A000` naming itself.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#
+# THE RULE MOST LIKELY TO BE GOT WRONG: **a NULL passes.** A `CHECK` fails only when its predicate
+# is *false*, and SQL's three-valued logic makes `NULL > 0` unknown rather than false — so
+# `INSERT INTO ck VALUES (4, NULL, 'x')` succeeds under `CHECK (p > 0)`. An implementation that
+# evaluated the predicate as a boolean and treated "not true" as a violation would reject it.
+#
+# AND THE NAME IS DERIVED WHEN NOTHING GIVES ONE: a column `CHECK` becomes
+# `<table>_<column>_check` — `q text CHECK (q <> '')` on table `ck` is `ck_q_check` — while a
+# table-level one with no name becomes `<table>_check`. A duplicate name is `42710`.
+#
+# This file builds and drops its own tables, so replaying it twice is the same as replaying it
+# once — verified by capturing it twice and diffing. The first attempt was **not** idempotent: it
+# dropped `ck` and not `ck2`/`ck3`, so the second run met a table that was already there.
+#
+DROP TABLE IF EXISTS ck3		-
+DROP TABLE IF EXISTS ck2		-
+DROP TABLE IF EXISTS ck		-
+CREATE TABLE ck (id int8 PRIMARY KEY, p int8, q text CHECK (q <> ''), CONSTRAINT ck_p CHECK (p > 0))		-
+INSERT INTO ck VALUES (1, 5, 'x')		-
+INSERT INTO ck VALUES (2, -1, 'x')	!23514 new row for relation "ck" violates check constraint "ck_p" DETAIL: Failing row contains (2, -1, x).
+INSERT INTO ck VALUES (3, 5, '')	!23514 new row for relation "ck" violates check constraint "ck_q_check" DETAIL: Failing row contains (3, 5, ).
+INSERT INTO ck VALUES (4, NULL, 'x')		-
+SELECT id, p, q FROM ck ORDER BY id	bigint,bigint,text	1|5|x ; 4|\N|x
+UPDATE ck SET p = -2 WHERE id = 1	!23514 new row for relation "ck" violates check constraint "ck_p" DETAIL: Failing row contains (1, -2, x).
+UPDATE ck SET p = 9 WHERE id = 1		-
+SELECT id, p FROM ck ORDER BY id	bigint,bigint	1|9 ; 4|\N
+ALTER TABLE ck ADD CONSTRAINT ck_q2 CHECK (q <> 'no')		-
+INSERT INTO ck VALUES (5, 1, 'no')	!23514 new row for relation "ck" violates check constraint "ck_q2" DETAIL: Failing row contains (5, 1, no).
+ALTER TABLE ck ADD CONSTRAINT ck_p CHECK (p > 100)	!42710 constraint "ck_p" for relation "ck" already exists
+CREATE TABLE ck2 (id int8 PRIMARY KEY, a int8 CHECK (a > b), b int8)		-
+CREATE TABLE ck3 (id int8 PRIMARY KEY, a int8 CHECK (nosuch > 0))	!42703 column "nosuch" does not exist
+SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'ck'::regclass AND contype = 'c' ORDER BY conname	name,"char",text	ck_p|c|CHECK ((p > 0)) ; ck_q2|c|CHECK ((q <> 'no'::text)) ; ck_q_check|c|CHECK ((q <> ''::text))
+SELECT conname FROM pg_constraint WHERE conrelid = 'ck'::regclass ORDER BY conname	name	ck_id_not_null ; ck_p ; ck_pkey ; ck_q2 ; ck_q_check

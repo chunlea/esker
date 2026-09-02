@@ -30,6 +30,9 @@ pub struct CreateTable {
     pub primary_key_name: Option<String>,
     /// Every `UNIQUE` constraint, from a column option or a table constraint.
     pub unique: Vec<UniqueConstraint>,
+    /// Every `CHECK`, named the way PostgreSQL names one: as written, or
+    /// `<table>_<column>_check` for a column constraint with no name of its own.
+    pub checks: Vec<crate::catalog::CheckDef>,
 }
 
 /// One declared column.
@@ -227,6 +230,12 @@ pub enum AlterTableAction {
         /// `IF NOT EXISTS`: a column that is already there is a notice rather than a `42701`.
         if_not_exists: bool,
     },
+    /// `ALTER TABLE … ADD CONSTRAINT … CHECK (…)`.
+    ///
+    /// Only a `CHECK`. A `FOREIGN KEY` is `0A000` naming itself until the unit that *enforces*
+    /// one lands: recording a constraint that does not constrain would let a schema load and then
+    /// accept the rows it forbids, which ADR 0031 calls a wrong answer rather than a gap.
+    AddCheck(crate::catalog::CheckDef),
     /// `SET (retention = '7d' | 'forever' | DEFAULT)` — how far back this table can be read.
     ///
     /// A storage parameter, which is PostgreSQL's own shape for a per-table knob and one this
