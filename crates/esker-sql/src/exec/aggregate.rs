@@ -44,7 +44,9 @@ use std::collections::BTreeSet;
 
 use crate::error::{Result, SqlError};
 use crate::exec::query::Scope;
-use crate::plan::{AggregateCall, AggregateFunc, AggregateSpec, Expr, Literal, Select, SelectItem};
+use crate::plan::{
+    AggregateCall, AggregateFunc, AggregateSpec, Expr, Literal, Select, SelectItem, SortKey,
+};
 use crate::value::{ColumnType, Datum};
 use crate::value::{PgDatum, PgType};
 
@@ -146,6 +148,10 @@ impl Aggregation {
         };
         match func {
             AggregateFunc::Count => Ok(ColumnType::Int8),
+            // An array of the argument's type on a real server — `bigint[]` over an `int8` — and
+            // `text` here, which is what an array is on this node (`crate::value::vector`). The
+            // declared type is the standing divergence; the value is byte-identical.
+            AggregateFunc::ArrayAgg => Ok(ColumnType::Text),
             AggregateFunc::Sum => match arg {
                 ColumnType::Int8 | ColumnType::Double => Ok(arg),
                 _ => undefined(),
@@ -242,20 +248,7 @@ impl Aggregation {
                         arguments: arguments.join(", "),
                     });
                 }
-                let arg = call
-                    .arg()
-                    .map(|arg| super::query::resolve(arg, scope))
-                    .transpose()?;
-                let arg_type = arg
-                    .as_ref()
-                    .map(|arg| super::query::expr_type(arg, scope))
-                    .transpose()?;
-                let spec = AggregateSpec {
-                    func: call.func,
-                    arg,
-                    distinct: call.distinct,
-                    arg_type,
-                };
+                let spec = resolve_aggregate(call, scope)?;
                 if specs.contains(&spec) {
                     continue;
                 }
@@ -370,6 +363,13 @@ impl Aggregation {
                     .position(|spec| {
                         spec.func == call.func
                             && spec.distinct == call.distinct
+                            // **The clause is part of the identity.** `array_agg(n ORDER BY n)`
+                            // and `array_agg(n ORDER BY n DESC)` in one statement are two
+                            // aggregates, not one written twice; matching without it collapsed
+                            // them onto the first one's accumulator and answered the same array
+                            // for both.
+                            && resolve_aggregate_order_by(call, scope)
+                                .is_ok_and(|ours| spec.order_by == ours)
                             && match (&spec.arg, call.arg()) {
                                 (None, None) => true,
                                 (Some(theirs), Some(ours)) => super::query::resolve(ours, scope)
@@ -510,6 +510,9 @@ pub(super) fn check_not_nested(expr: &Expr) -> Result<()> {
 #[derive(Debug)]
 pub(super) struct Accumulator {
     func: AggregateFunc,
+    /// The aggregate's own `ORDER BY`, kept because the sort happens at [`Accumulator::finish`] —
+    /// the order of a group is not known until the group is complete.
+    order_by: Vec<SortKey>,
     /// The values already folded in, for a `DISTINCT` call. One `BTreeSet` per aggregate rather
     /// than per group is not possible — distinctness is per group — so this lives here.
     seen: Option<BTreeSet<GroupKey>>,
@@ -528,6 +531,52 @@ enum State {
     Extreme(Option<Datum>),
     /// `avg(float8)`: the sum, and how many values went into it.
     AvgFloat { sum: f64, seen: i64 },
+    /// `array_agg`: every value, with the sort key it was collected under.
+    ///
+    /// The only state here that is **not** constant in the group's size, which is the price of an
+    /// aggregate that keeps its inputs rather than folding them. Bounded by the same
+    /// [`GROUP_LIMIT`] the group table and the `DISTINCT` set are, and for the same reason.
+    Gather(Vec<(Vec<Datum>, Datum)>),
+}
+
+/// One aggregate call, resolved into the spec the accumulator is built from.
+fn resolve_aggregate(call: &AggregateCall, scope: &Scope<'_>) -> Result<AggregateSpec> {
+    let arg = call
+        .arg()
+        .map(|arg| super::query::resolve(arg, scope))
+        .transpose()?;
+    let arg_type = arg
+        .as_ref()
+        .map(|arg| super::query::expr_type(arg, scope))
+        .transpose()?;
+    Ok(AggregateSpec {
+        func: call.func,
+        arg,
+        distinct: call.distinct,
+        arg_type,
+        order_by: resolve_aggregate_order_by(call, scope)?,
+    })
+}
+
+/// One aggregate's own `ORDER BY`, resolved against the **input** row.
+///
+/// Its keys are expressions of what is being aggregated, not of the grouped output — which is why
+/// they resolve in the same scope as the argument beside them and not in the one the projection
+/// sees. The default null placement follows the direction, exactly as the query's own `ORDER BY`
+/// resolves it.
+fn resolve_aggregate_order_by(call: &AggregateCall, scope: &Scope<'_>) -> Result<Vec<SortKey>> {
+    call.order_by
+        .iter()
+        .map(|item| {
+            Ok(SortKey {
+                expr: super::query::resolve(&item.expr, scope)?,
+                descending: item.descending,
+                nulls_first: item
+                    .nulls_first
+                    .unwrap_or(crate::catalog::KeyOrder::of(item.descending).nulls_first),
+            })
+        })
+        .collect()
 }
 
 impl Accumulator {
@@ -539,9 +588,11 @@ impl Accumulator {
             (AggregateFunc::Avg, _) => State::AvgFloat { sum: 0.0, seen: 0 },
             (AggregateFunc::Sum, _) => State::SumFloat(None),
             (AggregateFunc::Min | AggregateFunc::Max, _) => State::Extreme(None),
+            (AggregateFunc::ArrayAgg, _) => State::Gather(Vec::new()),
         };
         Accumulator {
             func: spec.func,
+            order_by: spec.order_by.clone(),
             seen: spec.distinct.then(BTreeSet::new),
             state,
         }
@@ -549,9 +600,13 @@ impl Accumulator {
 
     /// Folds one value in. `Datum::Null` is the argument's value, not its absence: `count(*)`
     /// passes a non-NULL placeholder, so a NULL here always means the column was NULL.
-    pub(super) fn push(&mut self, value: &Datum) -> Result<()> {
-        // Every aggregate but `count(*)` skips NULLs, and `count(*)` never sees one.
-        if matches!(value, Datum::Null) {
+    pub(super) fn push(&mut self, value: &Datum, sort_key: Vec<Datum>) -> Result<()> {
+        // Every aggregate but `count(*)` skips NULLs, and `count(*)` never sees one — **except
+        // `array_agg`, which collects them.** It is the one aggregate whose result has a place to
+        // put a NULL, so dropping them would silently shorten the array: measured,
+        // `array_agg(n ORDER BY n)` over a column with a NULL is `{10,20,30,NULL}` and not
+        // `{10,20,30}`.
+        if matches!(value, Datum::Null) && self.func != AggregateFunc::ArrayAgg {
             return Ok(());
         }
         // `DISTINCT` is one rule for all five rather than five implementations of it: a value
@@ -583,6 +638,16 @@ impl Accumulator {
             (State::AvgFloat { sum, seen }, Datum::Double(value)) => {
                 *sum += value;
                 *seen += 1;
+            }
+            // **Every value kept, with the key it sorts under** — the fold happens at `finish`,
+            // because the order is not known until the group is complete.
+            (State::Gather(values), value) => {
+                if values.len() == GROUP_LIMIT {
+                    return Err(SqlError::ConfigurationLimitExceeded(format!(
+                        "an array_agg over more than {GROUP_LIMIT} values needs more memory than                          this node will use; add a WHERE"
+                    )));
+                }
+                values.push((sort_key, value.clone()));
             }
             (State::Extreme(best), value) => {
                 let replace = match best {
@@ -627,6 +692,25 @@ impl Accumulator {
                 reason = "the count is the divisor PostgreSQL's own float8 average divides by"
             )]
             State::AvgFloat { sum, seen } => Datum::Double(sum / (*seen as f64)),
+            // **Over no rows this is NULL, not an empty array.** Measured, and it is the answer
+            // that surprises: `array_agg(id) FROM t WHERE false` is NULL where `count(id)` is 0.
+            // An empty array would make `array_length(…, 1)` answer NULL for a different reason
+            // and `IS NULL` answer false, so the two are not interchangeable.
+            State::Gather(values) if values.is_empty() => Datum::Null,
+            State::Gather(values) => {
+                let mut values = values.clone();
+                // Stable, so values with equal keys keep the order they arrived in — which is the
+                // input order, and is what a real server's sort does with them too.
+                values.sort_by(|(left, _), (right, _)| {
+                    super::cursor::compare_values(&self.order_by, left, right)
+                });
+                Datum::Text(crate::value::vector::Array::write(
+                    &values
+                        .into_iter()
+                        .map(|(_, value)| value.to_text())
+                        .collect::<Vec<_>>(),
+                ))
+            }
         }
     }
 }

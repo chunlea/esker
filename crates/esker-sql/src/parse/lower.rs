@@ -1720,11 +1720,7 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
         // a column reference and answers `42703`, which is what a bare identifier already gets.
         return Err(SqlError::unsupported(format!("the function {name}")));
     };
-    if let Some(clause) = clauses.first() {
-        return Err(SqlError::unsupported(format!(
-            "an aggregate {clause} clause"
-        )));
-    }
+    let order_by = lower_aggregate_clauses(clauses)?;
     let distinct = matches!(duplicate_treatment, Some(DuplicateTreatment::Distinct));
 
     // A `*` mixed with anything else is not a call PostgreSQL's grammar has, and it says so with
@@ -1773,7 +1769,37 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
         args,
         star,
         distinct,
+        order_by,
     })))
+}
+
+/// The clauses inside an aggregate's parentheses.
+///
+/// **`ORDER BY` is honoured and every other clause is named.** It orders the values within one
+/// group — `array_agg(x ORDER BY y DESC)` — and a real server takes it on every aggregate, so it
+/// is lowered for every aggregate rather than for the one that can show it. Accepting it and
+/// dropping it would put an `array_agg` in an order the caller did not ask for, which is a wrong
+/// answer and not a gap.
+fn lower_aggregate_clauses(
+    clauses: &[sqlparser::ast::FunctionArgumentClause],
+) -> Result<Vec<plan::OrderItem>> {
+    let mut order_by = Vec::new();
+    for clause in clauses {
+        let sqlparser::ast::FunctionArgumentClause::OrderBy(items) = clause else {
+            return Err(SqlError::unsupported(format!(
+                "an aggregate {clause} clause"
+            )));
+        };
+        for item in items {
+            refuse_if(item.with_fill.is_some(), "WITH FILL")?;
+            order_by.push(plan::OrderItem {
+                expr: lower_expr(&item.expr)?,
+                descending: item.options.asc == Some(false),
+                nulls_first: item.options.nulls_first,
+            });
+        }
+    }
+    Ok(order_by)
 }
 
 /// A `pg_catalog` function that prints a definition — `format_type(oid, typmod)`.

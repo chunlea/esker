@@ -568,6 +568,13 @@ pub enum AggregateFunc {
     /// `avg`, over `float8` only — `avg(int8)` is `numeric` on a real server and this node has no
     /// `numeric` to be right with (`docs/adr/0031-rails-compatibility-is-measured.md`).
     Avg,
+    /// `array_agg(expr [ORDER BY …])`: every value of the group, in one array.
+    ///
+    /// The one aggregate here that is **not** a fold — it keeps every value rather than combining
+    /// them, so it is the one whose memory is the group's size and the one that carries the
+    /// `ORDER BY` clause. Over **no rows it is NULL**, not an empty array, which is the answer
+    /// that surprises: `array_agg(id) FROM t WHERE false` is NULL and `count(id)` is 0.
+    ArrayAgg,
 }
 
 impl AggregateFunc {
@@ -581,6 +588,7 @@ impl AggregateFunc {
             "min" => Some(AggregateFunc::Min),
             "max" => Some(AggregateFunc::Max),
             "avg" => Some(AggregateFunc::Avg),
+            "array_agg" => Some(AggregateFunc::ArrayAgg),
             _ => None,
         }
     }
@@ -594,6 +602,7 @@ impl AggregateFunc {
             AggregateFunc::Min => "min",
             AggregateFunc::Max => "max",
             AggregateFunc::Avg => "avg",
+            AggregateFunc::ArrayAgg => "array_agg",
         }
     }
 }
@@ -614,6 +623,14 @@ pub struct AggregateCall {
     /// `DISTINCT` *inside* the parentheses: `count(DISTINCT a)`. Not the same clause as
     /// `SELECT DISTINCT`, which is on [`crate::plan::Select`].
     pub distinct: bool,
+    /// `ORDER BY` *inside* the parentheses: `array_agg(x ORDER BY y DESC)`. Not the query's
+    /// `ORDER BY` — it orders the values **within one group**, by expressions the aggregate does
+    /// not return.
+    ///
+    /// Carried for every aggregate rather than for `array_agg` alone, because a real server takes
+    /// the clause on all of them; on the four that fold, it changes nothing and is honoured by
+    /// costing a sort nobody can observe. Empty for every call that does not write it.
+    pub order_by: Vec<crate::plan::OrderItem>,
 }
 
 impl AggregateCall {

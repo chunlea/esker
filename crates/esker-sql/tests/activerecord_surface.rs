@@ -128,10 +128,14 @@ const FIXTURE: &[&str] =
 /// `pg_inherits` is empty on a real server too; the extension row a real server does have is a
 /// declared divergence (`tests/extension_inherits.rs`), not a missing feature.
 ///
-/// The two that still do not run are the rest of the array surface: line 52 (`indexes()`) wants
-/// `ARRAY(SELECT …)` and `generate_subscripts`, and lines 55 and 56 want `array_agg` and
-/// `c.conkey[idx]`. **The rows behind both are here and agree** (`tests/pg_catalog_*.rs`).
-const RUNS: usize = 30;
+/// **Thirty-one with boot statement 26**, the enum load — which wanted three things at once:
+/// `pg_enum`, `array_agg`, and an `ORDER BY` **inside** an aggregate's parentheses. All three
+/// landed together because the statement needs all three.
+///
+/// The one that still does not run is the other half of the array surface: line 52 (`indexes()`)
+/// wants `ARRAY(SELECT …)` over `generate_subscripts`, and `c.conkey[idx]` with it. **The rows
+/// behind it are here and agree** (`tests/pg_catalog_*.rs`).
+const RUNS: usize = 31;
 
 #[test]
 fn every_statement_activerecord_sends_parses_and_is_answered_by_name() {

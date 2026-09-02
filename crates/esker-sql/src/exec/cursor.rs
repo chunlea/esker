@@ -638,7 +638,14 @@ fn fold(
                 None => Datum::Bool(true),
                 Some(arg) => evaluate_in(arg, &row, env)?,
             };
-            accumulator.push(&value)?;
+            // The aggregate's **own** `ORDER BY`, evaluated against the same input row as its
+            // argument: `array_agg(x ORDER BY y)` sorts by a column it does not return, so the key
+            // has to travel with the value rather than be recovered from it.
+            let mut sort_key = Vec::with_capacity(spec.order_by.len());
+            for key in &spec.order_by {
+                sort_key.push(evaluate_in(&key.expr, &row, env)?);
+            }
+            accumulator.push(&value, sort_key)?;
         }
     }
 
@@ -748,10 +755,27 @@ fn compare_rows(
     right: &[Datum],
     env: Env<'_>,
 ) -> Result<Ordering> {
+    let mut a = Vec::with_capacity(keys.len());
+    let mut b = Vec::with_capacity(keys.len());
     for key in keys {
+        a.push(evaluate_in(&key.expr, left, env)?);
+        b.push(evaluate_in(&key.expr, right, env)?);
+    }
+    Ok(compare_values(keys, &a, &b))
+}
+
+/// The same ordering over key values that have **already been evaluated**.
+///
+/// Shared rather than copied, because `ORDER BY` inside an `array_agg` sorts by exactly the rule
+/// `ORDER BY` on the query does — including the half nobody remembers, that PostgreSQL's default
+/// null placement follows the direction. `array_agg(n ORDER BY n)` is `{10,20,30,NULL}` and
+/// `ORDER BY n DESC` is `{NULL,30,20,10}`; measured, and it falls out of this function rather than
+/// being asserted twice.
+pub(super) fn compare_values(keys: &[SortKey], left: &[Datum], right: &[Datum]) -> Ordering {
+    for (at, key) in keys.iter().enumerate() {
         let (a, b) = (
-            evaluate_in(&key.expr, left, env)?,
-            evaluate_in(&key.expr, right, env)?,
+            left.get(at).unwrap_or(&Datum::Null),
+            right.get(at).unwrap_or(&Datum::Null),
         );
         let ordering = match (matches!(a, Datum::Null), matches!(b, Datum::Null)) {
             (true, true) => Ordering::Equal,
@@ -761,7 +785,7 @@ fn compare_rows(
             (true, false) => nulls(key.nulls_first, Ordering::Less, Ordering::Greater),
             (false, true) => nulls(key.nulls_first, Ordering::Greater, Ordering::Less),
             (false, false) => {
-                let ordering = a.pg_cmp(&b);
+                let ordering = a.pg_cmp(b);
                 if key.descending {
                     ordering.reverse()
                 } else {
@@ -770,10 +794,10 @@ fn compare_rows(
             }
         };
         if !ordering.is_eq() {
-            return Ok(ordering);
+            return ordering;
         }
     }
-    Ok(Ordering::Equal)
+    Ordering::Equal
 }
 
 fn nulls(first: bool, when_first: Ordering, otherwise: Ordering) -> Ordering {

@@ -118,11 +118,14 @@ pub enum CatalogView {
     /// `PARTITION BY` here, so the emptiness is complete rather than provisional. Empty on a real
     /// server too until something partitions.
     PgInherits,
+    /// The values of every enum type, which is **none**: `CREATE TYPE … AS ENUM` is `0A000`, so
+    /// nothing can put a row here. Empty on a real server too until somebody makes an enum.
+    PgEnum,
 }
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 16] = [
+    pub const ALL: [CatalogView; 17] = [
         CatalogView::PgType,
         CatalogView::PgRange,
         CatalogView::PgClass,
@@ -134,6 +137,7 @@ impl CatalogView {
         CatalogView::PgCollation,
         CatalogView::PgExtension,
         CatalogView::PgInherits,
+        CatalogView::PgEnum,
         CatalogView::InformationSchemaTables,
         CatalogView::InformationSchemaColumns,
         CatalogView::InformationSchemaTableConstraints,
@@ -156,6 +160,7 @@ impl CatalogView {
             CatalogView::PgCollation => "pg_collation",
             CatalogView::PgExtension => "pg_extension",
             CatalogView::PgInherits => "pg_inherits",
+            CatalogView::PgEnum => "pg_enum",
             CatalogView::InformationSchemaTables => "information_schema.tables",
             CatalogView::InformationSchemaColumns => "information_schema.columns",
             CatalogView::InformationSchemaTableConstraints => {
@@ -184,6 +189,7 @@ impl CatalogView {
                 CatalogView::PgCollation => 8,
                 CatalogView::PgExtension => 14,
                 CatalogView::PgInherits => 15,
+                CatalogView::PgEnum => 16,
                 CatalogView::InformationSchemaTables => 9,
                 CatalogView::InformationSchemaColumns => 10,
                 CatalogView::InformationSchemaTableConstraints => 11,
@@ -219,6 +225,13 @@ impl CatalogView {
                 // `ActiveRecord`'s `columns()`, and only as `a.attcollation <> t.typcollation`
                 // — see `CatalogView::PgCollation`.
                 ("typcollation", ColumnType::Int8),
+                // **Last for the same reason**, and added for boot statement 26, which joins
+                // `pg_type` to `pg_namespace` on it to find a schema's enum types. Every type here
+                // reports the one namespace this node has, exactly as every relation's
+                // `relnamespace` does; on a real server they are in `pg_catalog`, which is a
+                // difference in the schema model and not in this column
+                // (`PUBLIC_NAMESPACE_OID`).
+                ("typnamespace", ColumnType::Int8),
             ],
             // No `oid`: see the module note. It is what keeps `ON oid = rngtypid` unambiguous.
             CatalogView::PgRange => &[
@@ -257,6 +270,14 @@ impl CatalogView {
             CatalogView::PgInherits => &[
                 ("inhrelid", ColumnType::Int8),
                 ("inhparent", ColumnType::Int8),
+            ],
+            // `enumsortorder` is a `real` on a real server, which is the one place this view's
+            // types are worth reading: the order is a float so a value can be inserted *between*
+            // two others without renumbering.
+            CatalogView::PgEnum => &[
+                ("enumtypid", ColumnType::Int8),
+                ("enumlabel", ColumnType::Text),
+                ("enumsortorder", ColumnType::Real),
             ],
             CatalogView::InformationSchemaTables => super::information_schema::TABLES_COLUMNS,
             CatalogView::InformationSchemaColumns => super::information_schema::COLUMNS_COLUMNS,
@@ -332,6 +353,9 @@ impl CatalogView {
                             // `a.attcollation <> t.typcollation` false for every column — the
                             // same answer a real server gives, by the same comparison.
                             Datum::Int8(0),
+                            // The one namespace this node has, the same one every relation
+                            // reports.
+                            Datum::Int8(PUBLIC_NAMESPACE_OID),
                         ]
                     })
                     .collect();
@@ -347,6 +371,7 @@ impl CatalogView {
             | CatalogView::PgCollation
             | CatalogView::PgExtension
             | CatalogView::PgInherits
+            | CatalogView::PgEnum
             | CatalogView::PgClass
             | CatalogView::PgNamespace
             | CatalogView::PgAttribute

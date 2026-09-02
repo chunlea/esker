@@ -430,10 +430,17 @@ pub struct AggregateSpec {
     pub distinct: bool,
     /// The argument's type — what decides the accumulator. `None` for `count(*)`.
     pub arg_type: Option<ColumnType>,
+    /// `ORDER BY` **inside the parentheses**: `array_agg(x ORDER BY y DESC)`.
+    ///
+    /// Not the query's `ORDER BY` and not `SortKey`'s usual home — this one sorts the values *of
+    /// one aggregate within one group*, by expressions the aggregate does not return. It is
+    /// resolved against the input row like the argument beside it, and it is empty for every call
+    /// that does not write the clause, which is all of them but `array_agg`'s.
+    pub order_by: Vec<SortKey>,
 }
 
 /// One resolved sort key.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SortKey {
     /// What to sort on.
     pub expr: Expr,

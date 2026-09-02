@@ -306,16 +306,18 @@ fn a_catalog_relation_is_read_only() {
 fn a_star_expands_to_every_column_of_the_view() {
     let mut node = parity::Node::new(&[]);
 
-    // The trailing `0` is `typcollation`, which phase 13 added **last** for exactly this reason:
-    // `SELECT *` expands in the declared order, so a column added anywhere else moves every one
-    // after it and every client reading by position reads the wrong value.
+    // The `0` before the last is `typcollation`, which phase 13 added **last** for exactly this
+    // reason: `SELECT *` expands in the declared order, so a column added anywhere else moves
+    // every one after it and every client reading by position reads the wrong value. The `11` now
+    // last is `typnamespace`, added the same way for boot statement 26 — this node has one
+    // namespace and every type reports it, as every relation's `relnamespace` does.
     assert_eq!(
         node.rows("SELECT * FROM pg_type WHERE typname = 'int8'"),
-        vec![vec!["20", "int8", "0", ",", "int8in", "b", "0", "0"]]
+        vec![vec!["20", "int8", "0", ",", "int8in", "b", "0", "0", "11"]]
     );
     assert_eq!(
         node.rows("SELECT t.* FROM pg_type AS t WHERE t.oid = 20"),
-        vec![vec!["20", "int8", "0", ",", "int8in", "b", "0", "0"]]
+        vec![vec!["20", "int8", "0", ",", "int8in", "b", "0", "0", "11"]]
     );
     assert_eq!(
         node.rows("SELECT * FROM pg_type").len(),

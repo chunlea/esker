@@ -1,0 +1,50 @@
+# `array_agg`, its `ORDER BY`, and `pg_enum` — boot statement 26.
+#
+#     SELECT type.typname, type.OID, n.nspname,
+#            array_agg(enum.enumlabel ORDER BY enum.enumsortorder) AS value
+#     FROM pg_enum AS enum JOIN pg_type AS type ON (type.oid = enum.enumtypid) …
+#
+# is how `ActiveRecord` loads the enum types a schema has. It wanted three things at once: the
+# relation `pg_enum`, the aggregate `array_agg`, and an `ORDER BY` **inside** an aggregate's
+# parentheses, which this node refused by name along with every other aggregate clause.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **Over no rows `array_agg` is NULL, not an empty array.** `array_agg(id) … WHERE id > 99` is
+#     NULL where `count(id)` is 0, and the two are not interchangeable: an empty array `IS NULL` is
+#     false. The line below asserts the NULL and the `IS NULL` beside it.
+#   * **NULLs are kept, not skipped.** Every other aggregate here drops them; this one collects
+#     them, so `array_agg(n ORDER BY n)` over a column with a NULL is `{10,20,30,NULL}` — and
+#     `ORDER BY n DESC` is `{NULL,30,20,10}`, because the default null placement follows the
+#     direction. One rule, two answers, and an implementation that dropped NULLs loses a row.
+#   * **The `ORDER BY` sorts by expressions the aggregate does not return.**
+#     `array_agg(id ORDER BY g, id DESC)` is `{2,1,4,3}`, which is neither input order nor `id`
+#     order — so the sort key has to travel with the value rather than be recovered from it.
+#   * **`pg_enum` is empty here and on this database**, and completely so here:
+#     `CREATE TYPE … AS ENUM` is `0A000`, so nothing can ever put a row in it.
+CREATE TABLE ag (id int8 PRIMARY KEY, g text, n int4)		-
+INSERT INTO ag VALUES (1, 'a', 10)		-
+INSERT INTO ag VALUES (2, 'a', 30)		-
+INSERT INTO ag VALUES (3, 'b', 20)		-
+INSERT INTO ag VALUES (4, 'b', NULL)		-
+SELECT array_agg(id) FROM ag	bigint[]	{1,2,3,4}
+SELECT array_agg(id ORDER BY id DESC) FROM ag	bigint[]	{4,3,2,1}
+SELECT array_agg(n ORDER BY n) FROM ag	integer[]	{10,20,30,NULL}
+SELECT array_agg(n ORDER BY n DESC) FROM ag	integer[]	{NULL,30,20,10}
+SELECT g, array_agg(id ORDER BY id) FROM ag GROUP BY g ORDER BY g	text,bigint[]	a|{1,2} ; b|{3,4}
+SELECT g, array_agg(n ORDER BY id) FROM ag GROUP BY g ORDER BY g	text,integer[]	a|{10,30} ; b|{20,NULL}
+SELECT array_agg(id) FROM ag WHERE id > 99	bigint[]	\N
+SELECT array_agg(id) IS NULL FROM ag WHERE id > 99	boolean	t
+SELECT array_agg(g) FROM ag	text[]	{a,a,b,b}
+SELECT array_agg(DISTINCT g) FROM ag	text[]	{a,b}
+SELECT array_agg(g ORDER BY g) FROM ag WHERE g = 'a'	text[]	{a,a}
+SELECT count(*), array_agg(id ORDER BY id) FROM ag	bigint,bigint[]	4|{1,2,3,4}
+SELECT array_agg(id ORDER BY g, id DESC) FROM ag	bigint[]	{2,1,4,3}
+SELECT enumlabel, enumtypid, enumsortorder FROM pg_enum	name,oid,real	-
+SELECT count(*) FROM pg_enum	bigint	0
+SELECT type.typname AS name, type.OID AS oid, n.nspname AS schema, array_agg(enum.enumlabel ORDER BY enum.enumsortorder) AS value FROM pg_enum AS enum JOIN pg_type AS type ON (type.oid = enum.enumtypid) JOIN pg_namespace n ON type.typnamespace = n.oid WHERE n.nspname = ANY (current_schemas(false)) GROUP BY type.OID, n.nspname, type.typname	name,oid,name,name[]	-
+DROP TABLE ag CASCADE		-
