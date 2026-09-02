@@ -1436,6 +1436,15 @@ const SYSTEM_COLUMNS: [&str; 6] = ["ctid", "xmin", "xmax", "cmin", "cmax", "tabl
 
 pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
     Ok(match expr {
+        // The strip is decided here, where the operand's type is still known.
+        Expr::ToText { operand, .. } => {
+            let operand = resolve(operand, scope)?;
+            let strip_blanks = matches!(expr_type(&operand, scope), Ok(ColumnType::Bpchar));
+            Expr::ToText {
+                operand: Box::new(operand),
+                strip_blanks,
+            }
+        }
         Expr::Column { table, name } => {
             let (level, at, column) = scope.lookup(table.as_deref(), name)?;
             if level == 0 {
@@ -1588,6 +1597,12 @@ fn subquery_operand(
 /// lifted to two columns. Coarse in the safe direction: it refuses only pairs that no cast in
 /// PostgreSQL relates either, so it cannot turn a comparison a real server runs into an error.
 fn same_family(left: ColumnType, right: ColumnType) -> bool {
+    // **`json` compares with nothing, including another `json`.** Measured:
+    // `'{"a":1}'::json = '{"a":1}'::json` is `42883 operator does not exist: json = json` -- the
+    // type has no equality operator at all, which is a property of it rather than a gap, and is
+    // why `json` cannot be a key, `DISTINCT`ed or grouped either. So this is checked before the
+    // families, because a family test says "the same type compares with itself" and here that is
+    // the case PostgreSQL refuses.
     fn family(ty: ColumnType) -> u8 {
         match ty {
             ColumnType::Int8
@@ -1608,12 +1623,6 @@ fn same_family(left: ColumnType, right: ColumnType) -> bool {
             ColumnType::Json => 6,
         }
     }
-    // **`json` compares with nothing, including another `json`.** Measured:
-    // `'{"a":1}'::json = '{"a":1}'::json` is `42883 operator does not exist: json = json` -- the
-    // type has no equality operator at all, which is a property of it rather than a gap, and is
-    // why `json` cannot be a key, `DISTINCT`ed or grouped either. So this is checked before the
-    // families, because a family test says "the same type compares with itself" and here that is
-    // the case PostgreSQL refuses.
     if matches!(left, ColumnType::Json) || matches!(right, ColumnType::Json) {
         return false;
     }
@@ -1988,7 +1997,8 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         Expr::CatalogFunc(call) => call.func.result_type(),
         Expr::Literal(Literal::Decimal(_)) => ColumnType::Double,
 
-        Expr::Literal(Literal::String(_) | Literal::Null) => ColumnType::Text,
+        // Whatever the operand is, a cast to `text` answers `text` — that is what it is for.
+        Expr::ToText { .. } | Expr::Literal(Literal::String(_) | Literal::Null) => ColumnType::Text,
         Expr::Literal(Literal::Typed(value)) => value.column_type().unwrap_or(ColumnType::Text),
         Expr::Literal(Literal::Bool(_))
         | Expr::Binary { .. }

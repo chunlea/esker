@@ -35,6 +35,8 @@ fn names(node: &mut parity::Node, sql: &str) -> Vec<String> {
         esker_sql::pgwire::session::Outcome::Rows { fields, .. } => {
             fields.into_iter().map(|field| field.name).collect()
         }
+        // Named rather than a wildcard: `Outcome` has two variants, so a `_` here would
+        // silently swallow a third if one is ever added.
         other @ esker_sql::pgwire::session::Outcome::Done { .. } => {
             panic!("{sql} returned no result set: {other:?}")
         }

@@ -486,7 +486,9 @@ fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
             substitute_in_expr(left, outer, depth);
             substitute_in_expr(right, outer, depth);
         }
-        Expr::Not(inner) => substitute_in_expr(inner, outer, depth),
+        Expr::Not(inner) | Expr::ToText { operand: inner, .. } => {
+            substitute_in_expr(inner, outer, depth);
+        }
         Expr::IsNull { operand, .. } => substitute_in_expr(operand, outer, depth),
         Expr::InList { operand, list, .. } => {
             substitute_in_expr(operand, outer, depth);
@@ -868,7 +870,7 @@ fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
             walk(left, visit);
             walk(right, visit);
         }
-        Expr::Not(inner) => walk(inner, visit),
+        Expr::Not(inner) | Expr::ToText { operand: inner, .. } => walk(inner, visit),
         Expr::IsNull { operand, .. } => walk(operand, visit),
         Expr::InList { operand, list, .. } => {
             walk(operand, visit);
@@ -913,7 +915,7 @@ fn walk_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr) -> Result<()>) ->
             walk_mut(left, visit)?;
             walk_mut(right, visit)?;
         }
-        Expr::Not(inner) => walk_mut(inner, visit)?,
+        Expr::Not(inner) | Expr::ToText { operand: inner, .. } => walk_mut(inner, visit)?,
         Expr::IsNull { operand, .. } => walk_mut(operand, visit)?,
         Expr::InList { operand, list, .. } => {
             walk_mut(operand, visit)?;

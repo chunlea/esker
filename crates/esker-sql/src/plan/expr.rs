@@ -172,6 +172,30 @@ pub enum Expr {
     /// with an [`Expr::Ordinal`] into the aggregated row before the tree is built. One reaching a
     /// row evaluator is a planner bug and says so rather than returning a number.
     Aggregate(Box<AggregateCall>),
+    /// `<expr>::text`, evaluated per row.
+    ///
+    /// The **output function** of whatever the operand turns out to be, which is what a cast to
+    /// `text` is on a real server — `42::text` is `42` and `1.0::float8::text` is `1`, because
+    /// each is what that type prints. Only `text` is a target here: every other cast in this crate
+    /// is folded at plan time over a literal, and a per-row cast is needed exactly where the
+    /// operand is a column.
+    ///
+    /// A `character(n)` is the one operand where the cast is not the identity on the stored text:
+    /// it **strips** the padding, so a `char(3)` holding `x` casts to `x` and prints as `x  `.
+    /// Measured, and the reason `tests/typmod.rs` could declare that pair as a divergence before
+    /// this existed.
+    ToText {
+        /// What to cast.
+        operand: Box<Expr>,
+        /// Whether to strip trailing blanks, which is true for exactly one operand type.
+        ///
+        /// A `character(n)` stores its value **padded** to `n`, and the cast to `text` strips that
+        /// padding back off: a `char(3)` holding `x` prints `x  ` and casts to `x`. Measured, and
+        /// the reason `tests/typmod.rs` could only declare that pair as a divergence until now.
+        /// Decided where the operand's type is known — at resolution — because a `Datum::Text`
+        /// does not know it came from a `bpchar`.
+        strip_blanks: bool,
+    },
 }
 
 /// One call to a `pg_catalog` function that prints a definition.
@@ -694,6 +718,7 @@ impl Expr {
 
 fn describe(expr: &Expr) -> &'static str {
     match expr {
+        Expr::ToText { .. } => "a cast to text",
         Expr::Literal(_) => "a literal",
         Expr::Parameter(_) => "a parameter",
         Expr::Column { .. } | Expr::Ordinal { .. } => "a column reference",
