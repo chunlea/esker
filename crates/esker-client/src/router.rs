@@ -45,7 +45,7 @@ use crate::retry::{
     CALL_TIMEOUT_MS, Jitter, Redirect, RetryPolicy, Verdict, classify, may_ask_again,
 };
 use crate::transport::StoreTransport;
-use crate::wire::{Body, Method, ProtoError, RequestHeader, RequestOutcome, Response};
+use crate::wire::{Body, Epoch, Method, ProtoError, RequestHeader, RequestOutcome, Response};
 
 /// Most calls in flight at once, per client.
 pub const MAX_IN_FLIGHT: usize = 256;
@@ -199,10 +199,18 @@ impl Router {
         };
 
         let mut attempts: u32 = 0;
+        // Attempts **in a row** that taught this client nothing, which is what the retry budget
+        // counts. See `learned_a_newer_epoch`: a refusal that hands back fresher routing than the
+        // one it refused is progress, and spending a budget on progress is how a client gives up
+        // on a call that was going to succeed.
+        let mut fruitless: u32 = 0;
         // The region the last attempt was addressed to, so a refusal repairs the entry that
         // produced it. Zero until one is routed: a resolver that failed named no region, and
         // there is nothing cached to invalidate.
         let mut region_id: u64 = 0;
+        // The epoch that attempt carried, so the repair that follows can be asked whether it
+        // moved. `None` until one is routed, for the same reason `region_id` is zero.
+        let mut sent_epoch: Option<Epoch> = None;
         loop {
             if self.clock.now() >= deadline {
                 return Err(Error::DeadlineExceeded {
@@ -234,6 +242,7 @@ impl Router {
                         }
                         Err(error) => {
                             region_id = route.region.id;
+                            sent_epoch = Some(route.region.epoch);
                             error
                         }
                     }
@@ -255,7 +264,16 @@ impl Router {
                 return Err(terminal(error, method));
             };
             self.repair(&redirect, region_id);
-            if attempts > self.options.retry.max_retries {
+            // **The budget counts failures, and a refusal that taught this client where the
+            // region went is not one.** Reset rather than decremented: a call that keeps being
+            // given fresher routing keeps its full budget for the moment it stops being given
+            // any, and the call deadline above is what bounds it either way.
+            if self.learned_a_newer_epoch(body.routing_key(), sent_epoch) {
+                fruitless = 0;
+            } else {
+                fruitless += 1;
+            }
+            if fruitless > self.options.retry.max_retries {
                 return Err(Error::RetriesExhausted {
                     attempts,
                     source: Box::new(error),
@@ -317,6 +335,38 @@ impl Router {
             Redirect::Refresh => self.cache.invalidate(region_id),
             Redirect::Busy => {}
         }
+    }
+
+    /// Whether the repair just made left this client holding a **newer** epoch for `key` than the
+    /// attempt that failed was addressed with.
+    ///
+    /// This is the difference between a client that is chasing a moving region and one that is
+    /// hammering a dead one, and until it existed the retry budget could not tell them apart. A
+    /// saturated cluster splits and rebalances, so a region's epoch really does move between one
+    /// attempt and the next; each refusal carries the regions that replaced the one asked about,
+    /// so each attempt leaves the cache **more correct than it found it** and the next one is
+    /// aimed better. Counting those against the same budget as a store that will not answer is how
+    /// `Backend::begin` came back as `gave up after 9 attempts: region epoch does not match` with
+    /// most of its ten-second deadline unspent — 2.27 s of it, in the repro this note comes from
+    /// (`docs/plans/debt-c3.md` §3).
+    ///
+    /// [`Epoch::is_stale_against`] is the comparison, and it is the same one the *store* uses to
+    /// decide the request was stale in the first place: the two counters move independently, so
+    /// "newer" is not one comparison. Asking it here rather than writing `>` is what keeps the
+    /// client's idea of progress and the store's idea of staleness from drifting apart.
+    ///
+    /// Only the epoch counts. A `NotLeader` hint moves no epoch and does not reset the budget,
+    /// which is the conservative half of this: chasing a leader around a region that is not
+    /// changing is exactly the loop the budget was put there to stop.
+    fn learned_a_newer_epoch(&self, key: &[u8], sent: Option<Epoch>) -> bool {
+        let Some(sent) = sent else {
+            // Nothing was sent, so nothing can have been learned: the resolver refused before an
+            // attempt was addressed at all.
+            return false;
+        };
+        self.cache
+            .lookup(key)
+            .is_some_and(|route| sent.is_stale_against(route.region.epoch))
     }
 
     /// Drops a cache entry that a terminal error proved wrong.

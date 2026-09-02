@@ -210,3 +210,66 @@ and every way of holding it open that this lane could construct also stops the c
 which is the thing being waited for. The end-to-end evidence for that path is
 `tests/promotion.rs` and `a_placed_columnar_learner_holds_what_the_leader_holds`, which are the
 tests that failed 3 of 3 under the naive fix and are green under this one.
+
+## 3. The client spends its retry budget on progress
+
+Inventory #6. `crates/esker-client/src/router.rs`, the budget check; the budget itself in
+`retry.rs` ("eight is nine calls in total").
+
+### What the repro showed, which is the whole argument
+
+`a_moving_epoch_burns_the_budget_with_most_of_the_deadline_unspent` scripts ten refusals, each
+teaching a strictly newer epoch than the last — a region that keeps moving, which is what a
+saturated box splitting and rebalancing actually produces. Against `FakeTransport` and `FakeClock`,
+so there is no wall clock and no socket in it. It reproduces the recorded failure exactly:
+
+```
+Err(RetriesExhausted { attempts: 9, source: EpochNotMatch { ... version: 10 } })
+gave up after spending 2.266s of a 10s deadline, with 9 calls made
+```
+
+**2.27 seconds of a ten-second deadline.** The client did not run out of time; it ran out of
+attempts, with 77% of its own budget for the call unspent, and handed the caller a failure for a
+call that had seconds left to succeed in. That is the evidence the brief asked for, and it settles
+the question it posed: the budget is not too small and the deadline is not too long — the two are
+counting different things and the wrong one is deciding.
+
+Every one of those nine refusals was **progress**. An `EpochNotMatch` carries the regions that
+replaced the one the client asked about, so each attempt leaves the cache more correct than it
+found it and the next is aimed better. Counting them against the same budget as a store that will
+not answer treats "you learned something, try again" as "this is not working".
+
+### The fix
+
+The budget counts **consecutive attempts that taught this client nothing**. After each repair the
+router asks `learned_a_newer_epoch`: does the cache now hold a newer epoch for this key than the
+attempt that just failed was addressed with? If so the budget resets; if not it is spent as before.
+
+Three things about it are deliberate:
+
+* **`Epoch::is_stale_against` is the comparison**, which is the same one the *store* uses to decide
+  the request was stale in the first place. The two counters move independently — a split bumps
+  `version`, a membership change bumps `conf_ver` — so "newer" is not one comparison, and asking
+  the shared predicate is what stops the client's idea of progress drifting from the store's idea
+  of staleness.
+* **Only the epoch counts.** A `NotLeader` hint moves no epoch and does not reset the budget:
+  chasing a leader around a region that is not changing is exactly the loop the budget exists to
+  stop. This is the conservative half, and it is why every existing budget test is untouched.
+* **Reset rather than decrement.** A call that keeps being given fresher routing keeps its whole
+  budget for the moment it stops being given any.
+
+The backoff schedule is unchanged and still counts total attempts, so a pathological store cannot
+be hammered: it is met with the same exponential curve to the same 2 s ceiling.
+
+### The other half, which would make the fix worse than the bug if it were missing
+
+"Progress does not spend the budget" is only safe while something else is counting.
+`an_epoch_that_never_settles_ends_at_the_deadline_and_says_so` scripts two hundred ever-newer
+epochs and asserts the call ends in `DeadlineExceeded` having spent at least half its timeout. The
+caller still gets an answer inside its call timeout, and the answer now says it ran out of *time* —
+which is true and actionable — rather than out of attempts, which was not.
+
+All 22 tests in `crates/esker-client/tests/retry.rs` pass, including the three that pin the budget
+for the cases that are not progress: `a_redirectable_error_is_retried_exactly_the_documented_number_of_times`,
+`a_read_that_never_gets_an_answer_exhausts_the_budget_and_says_why`, and
+`the_deadline_stops_a_retry_storm_before_the_budget_does`.

@@ -313,6 +313,98 @@ fn an_epoch_error_with_nothing_to_learn_falls_back_to_the_resolver() {
     assert_eq!(harness.client.cache().len(), 1, "the cache was refilled");
 }
 
+/// A region whose epoch keeps moving spends the attempt budget and leaves most of the call
+/// deadline unspent — the fourth sighting recorded in `docs/plans/phase-9-rails.md`.
+///
+/// **Every one of these refusals is progress.** An `EpochNotMatch` carries the regions that
+/// replaced the one the client asked about, so each attempt leaves the cache more correct than it
+/// found it. Counting them against the same budget as a store that will not answer treats "you
+/// learned something, try again" as "this is not working", and on a saturated box — where an epoch
+/// really does move that often, because splits and rebalances are happening — the caller is handed
+/// `gave up after 9 attempts: region epoch does not match` while a wait would have succeeded.
+#[test]
+fn a_moving_epoch_burns_the_budget_with_most_of_the_deadline_unspent() {
+    let harness = harness();
+    // Ten refusals, each teaching a different, newer epoch. More than the attempt budget of nine
+    // calls; far less than the ten-second deadline can pay for.
+    for version in 2..=11 {
+        harness.transport.script(Rule::new(
+            Matcher::Any,
+            Outcome::Fail(ProtoError::EpochNotMatch {
+                current_regions: vec![Region {
+                    id: 1,
+                    start_key: Bytes::new(),
+                    end_key: Bytes::new(),
+                    peers: three_peers(),
+                    epoch: Epoch::new(1, version),
+                }],
+            }),
+        ));
+    }
+    harness
+        .transport
+        .script(always(Outcome::Reply(RawKvResp::Get { value: None })));
+
+    let answer = harness.client.get(b"k");
+    let spent = harness.clock.elapsed();
+    let deadline = Duration::from_millis(esker_client::retry::CALL_TIMEOUT_MS);
+
+    // **The number in this message is the finding.** What made the caller's request fail was the
+    // attempt count, with most of its time budget unspent — so the client gave up on a call that
+    // had seconds left to succeed in.
+    assert_eq!(
+        answer,
+        Ok(None),
+        "gave up after spending {spent:?} of a {deadline:?} deadline, \
+         with {} calls made",
+        harness.transport.call_count(),
+    );
+    assert!(
+        spent < deadline,
+        "this call ran out of time rather than out of attempts, which is a different bug"
+    );
+}
+
+/// And a region whose epoch never stops moving is stopped by the **deadline**, not by running for
+/// ever.
+///
+/// The other half of the rule above, and the one that would make the fix worse than the bug if it
+/// were missing: "progress does not spend the budget" is only safe while something else is
+/// counting. A caller still gets an answer inside its call timeout, and the answer says it ran out
+/// of *time* — which is true, and is what a caller can act on — rather than out of attempts, which
+/// was not.
+#[test]
+fn an_epoch_that_never_settles_ends_at_the_deadline_and_says_so() {
+    let harness = harness();
+    // Far more refusals than any schedule can reach inside the deadline, each teaching a newer
+    // epoch than the last, so the loop is never once told the same thing twice.
+    for version in 2..=200 {
+        harness.transport.script(Rule::new(
+            Matcher::Any,
+            Outcome::Fail(ProtoError::EpochNotMatch {
+                current_regions: vec![Region {
+                    id: 1,
+                    start_key: Bytes::new(),
+                    end_key: Bytes::new(),
+                    peers: three_peers(),
+                    epoch: Epoch::new(1, version),
+                }],
+            }),
+        ));
+    }
+
+    let error = harness.client.get(b"k").expect_err("it cannot succeed");
+    assert!(
+        matches!(error, Error::DeadlineExceeded { .. }),
+        "a region that never settles should run out of time, not out of attempts: {error}"
+    );
+    assert!(
+        harness.clock.elapsed() >= Duration::from_millis(esker_client::retry::CALL_TIMEOUT_MS) / 2,
+        "it gave up after only {:?}",
+        harness.clock.elapsed()
+    );
+}
+
 /// `KeyNotInRegion` is not retryable — waiting cannot fix a routing mistake — but it does
 /// prove the cached region is wrong, and leaving it there would make the next call fail the
 /// same way.
