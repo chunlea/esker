@@ -42,6 +42,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::{Parser, ParserError};
 
 use crate::error::{Result, SqlError};
+use crate::plan;
 
 /// How deep a statement may nest before it is refused with SQLSTATE `54001`.
 ///
@@ -272,6 +273,26 @@ fn strip_drop_index_concurrently(sql: &str, scanned: &Scan<'_>) -> Option<String
     rewritten.push_str(sql.get(..at)?);
     rewritten.push_str(sql.get(at + "CONCURRENTLY".len()..)?);
     Some(rewritten)
+}
+
+/// One predicate, parsed and lowered — a stored `CHECK`, read back.
+///
+/// It goes through the real parser rather than a second one: the text came from a statement this
+/// parser accepted, so anything it will not read back is a bug here rather than in the catalog.
+/// Wrapped in a `SELECT` because that is the smallest statement with an expression in it.
+pub(crate) fn parse_predicate(expr: &str) -> Result<plan::Expr> {
+    let not_one = || SqlError::Internal("a stored CHECK is not one expression".to_owned());
+    let statements = parse_statements(&format!("SELECT {expr}"))?;
+    let [parsed] = statements.as_slice() else {
+        return Err(not_one());
+    };
+    let plan::Statement::Select(select) = parsed.lower()? else {
+        return Err(not_one());
+    };
+    match select.projection.as_slice() {
+        [plan::SelectItem::Expr { expr, .. }] => Ok(expr.clone()),
+        _ => Err(not_one()),
+    }
 }
 
 /// Parses one statement string into statements, guarding the stack first.

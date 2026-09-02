@@ -362,6 +362,7 @@ impl CatalogView {
                         primary_key_name: String::new(),
                         schema_version: 1,
                         sequences: Vec::new(),
+                        checks: Vec::new(),
                     })
                 })
                 .collect()

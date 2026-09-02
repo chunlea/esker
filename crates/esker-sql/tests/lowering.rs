@@ -46,7 +46,6 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
             "DEFAULT (1 + 1), which is not a constant",
         ),
         ("CREATE TABLE t (a int8 REFERENCES u (b))", "REFERENCES"),
-        ("CREATE TABLE t (a int8 CHECK (a > 0))", "CHECK"),
         // The identity forms run now (phase 9 unit 2). The computed column that shares their
         // grammar does not, and neither do the sequence options after one -- a `START WITH` this
         // node ignored would hand out numbers nobody asked for.
@@ -67,7 +66,11 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
             "CREATE TABLE t (a int8, FOREIGN KEY (a) REFERENCES u (b))",
             "FOREIGN KEY",
         ),
-        ("CREATE TABLE t (a int8, CHECK (a > 0))", "CHECK"),
+        // A `CHECK` runs since the constraint unit; a `FOREIGN KEY` still does not.
+        (
+            "ALTER TABLE t ADD CONSTRAINT f FOREIGN KEY (a) REFERENCES u (id)",
+            "FOREIGN KEY",
+        ),
         (
             "CREATE TABLE t (a int8) PARTITION BY RANGE (a)",
             "PARTITION BY",

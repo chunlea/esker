@@ -60,6 +60,35 @@ const NOT_NULL_OID_BASE: u64 = 0x2000_0000_0000_0000;
 /// How many bits the attnum occupies at the bottom of a `NOT NULL` constraint's oid.
 const NOT_NULL_COLUMN_BITS: u32 = 16;
 
+/// Where a `CHECK` constraint's synthetic oid starts.
+///
+/// Its own region, between the `NOT NULL` one and `PRIMARY_KEY_OID_BASE`, for the same reason
+/// those two have theirs: `pg_get_constraintdef(oid)` is given nothing but the number, so the
+/// number has to say which constraint it is. A `CHECK` is not a relation here — nothing can name
+/// it in a query — so it has no relation oid to borrow, and the table plus its position in the
+/// table's `checks` is what identifies it.
+const CHECK_OID_BASE: u64 = 0x3000_0000_0000_0000;
+
+/// Bits reserved for a check's position within its table, mirroring [`NOT_NULL_COLUMN_BITS`].
+const CHECK_INDEX_BITS: u32 = 16;
+
+/// The oid of the `at`-th `CHECK` on `table_id`.
+fn check_oid(table_id: u64, at: usize) -> i64 {
+    let at = u64::try_from(at).unwrap_or(0);
+    i64::try_from(CHECK_OID_BASE + (table_id << CHECK_INDEX_BITS) + at).unwrap_or(i64::MAX)
+}
+
+/// The table and position a `CHECK` oid names, or `None` for an oid outside that region.
+fn check_of(oid: i64) -> Option<(u64, usize)> {
+    let oid = u64::try_from(oid).ok()?;
+    let below = oid.checked_sub(CHECK_OID_BASE)?;
+    if below >= pg_relations::PRIMARY_KEY_OID_BASE - CHECK_OID_BASE {
+        return None;
+    }
+    let at = usize::try_from(below & ((1 << CHECK_INDEX_BITS) - 1)).ok()?;
+    Some((below >> CHECK_INDEX_BITS, at))
+}
+
 /// `confupdtype` and `confdeltype` for a constraint that is not a foreign key: a **space**.
 ///
 /// Measured — not the empty string, which is what `attidentity` uses for "none", and not NULL.
@@ -127,6 +156,18 @@ pub fn constraint_definition(relations: &Relations, oid: Option<i64>) -> Datum {
     {
         return Datum::Text(primary_key_definition(table));
     }
+    // A `CHECK`: the oid is the table and the check's position, read back the same way.
+    if let Some((table_id, at)) = check_of(oid)
+        && let Some(table) = relations
+            .rows()
+            .find(|row| row.kind == RelKind::Table && row.table_id == table_id)
+            .and_then(|row| relations.table(row))
+        && let Some(check) = table.checks.get(at)
+    {
+        // `CHECK ((p > 0))` — the doubled parentheses are PostgreSQL's, which wraps the whole
+        // predicate and then prints it parenthesised. Measured.
+        return Datum::Text(format!("CHECK (({}))", check.expr));
+    }
     // A `NOT NULL`: the oid is the table and the column, and this is where it is read back.
     let Some((table_id, attnum)) = not_null_of(oid) else {
         return Datum::Null;
@@ -180,6 +221,16 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             name: table.primary_key_name.clone(),
             contype: "p",
             conindid: oid,
+        });
+    }
+    // `CHECK`, contype `c`. It has no index behind it, so `conindid` is zero for the same reason
+    // a `NOT NULL`'s is: the column enforces it, not a relation.
+    for (at, check) in table.checks.iter().enumerate() {
+        out.push(Constraint {
+            oid: check_oid(table.id, at),
+            name: check.name.clone(),
+            contype: "c",
+            conindid: 0,
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));

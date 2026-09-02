@@ -327,6 +327,23 @@ pub struct TableDef {
     ///
     /// In column order, which is the order the scan returns them in.
     pub sequences: Vec<SequenceDef>,
+    /// `CHECK` constraints, in the order `pg_constraint` lists them — by name.
+    ///
+    /// Each holds its predicate as **text**, not as a parsed tree, and is re-lowered when the
+    /// table is loaded. That is two things at once and both are wanted: `pg_get_constraintdef`
+    /// needs the text anyway, and one string is an encoding this record already knows how to
+    /// write, where a serialised expression tree would be a second format to version.
+    pub checks: Vec<CheckDef>,
+}
+
+/// One `CHECK` constraint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckDef {
+    /// Its name — given, or derived as `<table>_<column>_check` the way PostgreSQL derives one.
+    pub name: String,
+    /// The predicate, as the user wrote it. Re-parsed on load and printed by
+    /// `pg_get_constraintdef`.
+    pub expr: String,
 }
 
 impl ColumnDef {
@@ -1436,6 +1453,7 @@ mod tests {
             primary_key_name: "accounts_pkey".into(),
             schema_version: 1,
             sequences: Vec::new(),
+            checks: Vec::new(),
         }
     }
 
@@ -1456,7 +1474,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "05",               // catalog format version
+                "06",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -1508,7 +1526,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "05",                 // catalog format version
+                "06",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -1541,6 +1559,7 @@ mod tests {
                 "01",                                     // entered at schema version 1
                 "01",
                 "01", // one column, column 1
+                "00", // version 6: no CHECK constraints
             )
         );
         assert_eq!(record::decode_table(&encoded).unwrap(), accounts(7));
@@ -1577,6 +1596,51 @@ mod tests {
             "01",
         ));
         assert_eq!(record::decode_table(&v2).unwrap(), accounts(7));
+    }
+
+    /// The **version 5** golden, kept for the same reason the four before it are.
+    ///
+    /// These are the bytes version 5 wrote — the record ends at the last index, with no count of
+    /// `CHECK` constraints after it — and a cluster that ran the `DEFAULT CURRENT_TIMESTAMP` unit
+    /// has them. The table reads back with no checks, which is what every table a version 5
+    /// catalog could hold had: `CHECK` was `0A000` until version 6.
+    #[test]
+    fn a_version_5_table_record_still_decodes() {
+        let v5 = decode_hex(concat!(
+            "05",                 // catalog format version 5
+            "0700000000000000",   // table id 7
+            "086163636f756e7473", // varint 8, "accounts"
+            "0d6163636f756e74735f706b6579",
+            "01", // schema version 1
+            "02", // two columns
+            "026964",
+            "01",
+            "01",       // "id", INT8, NOT NULL
+            "00",       // no DEFAULT
+            "00",       // and no missing value
+            "ffffffff", // no typmod
+            "00",       // and not an expression default
+            "05656d61696c",
+            "02",
+            "00",
+            "00",
+            "00",
+            "ffffffff",
+            "00",
+            "01",
+            "00",                                     // primary key: one column, column 0
+            "01",                                     // one index
+            "0800000000000000",                       // index id 8
+            "126163636f756e74735f656d61696c5f6b6579", // "accounts_email_key"
+            "01",                                     // unique
+            "03",                                     // state: public
+            "01",                                     // entered at schema version 1
+            "01",
+            "01", // one column, column 1 -- and nothing after it
+        ));
+        let table = record::decode_table(&v5).unwrap();
+        assert_eq!(table, accounts(7));
+        assert!(table.checks.is_empty());
     }
 
     /// The **version 4** golden, kept for the same reason the three before it are.
@@ -2171,7 +2235,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "05",               // catalog format version
+                "06",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

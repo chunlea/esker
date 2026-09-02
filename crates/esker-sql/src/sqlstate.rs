@@ -88,6 +88,8 @@ pub const INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE: &str = "2201X";
 pub const NOT_NULL_VIOLATION: &str = "23502";
 /// A duplicate reached a `PRIMARY KEY` or `UNIQUE` index.
 pub const UNIQUE_VIOLATION: &str = "23505";
+/// A row a `CHECK` constraint refuses.
+pub const CHECK_VIOLATION: &str = "23514";
 
 // --- Class 25 — Invalid Transaction State ---
 
