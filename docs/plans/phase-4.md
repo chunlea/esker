@@ -819,8 +819,10 @@ make it recover. Out of 4d's grant, which is read-only in the core.
 * Everything §13.8 lists that 4d did not touch: catching up an existing peer by snapshot,
   `RemovePeer` leaving the region's data, and replica repair end to end against the real scheduler
   rather than a fake driver.
-* **`region ls` walks the key space one `GetRegion` at a time.** Correct and O(regions) round trips;
-  a `ScanRegions` on the Pd service would make it one. Not this lane's to add.
+* ~~**`region ls` walks the key space one `GetRegion` at a time.**~~ Closed in debt wave C4:
+  `Pd::ScanRegions` (`0x030a`) pages the routing table in key order and `region ls` uses it —
+  measured at 61 `GetRegion` calls for 60 regions before, 2 after (one being the cluster-id
+  discovery), and 1 for every later listing on the same connection. `docs/plans/debt-c4.md` §6.
 
 
 ---
