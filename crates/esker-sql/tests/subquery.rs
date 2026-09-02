@@ -309,9 +309,17 @@ fn the_shapes_this_phase_does_not_run_name_themselves() {
             "WITH RECURSIVE t AS (SELECT 1 AS n) SELECT n FROM t",
             "WITH",
         ),
+        // The boundary with the type lane's arrays is decided by the **right-hand side** and not
+        // by the quantifier: `= ANY (array)` is `IN (list)` and runs, any other operator over an
+        // array is a quantifier this node does not have, and `ALL (array)` is named the same way.
+        // Every one of the six over a *subquery* runs, which is what this unit built.
         (
-            "SELECT id FROM sq_a WHERE id = ANY ('{1,2}')",
-            "ANY over an array",
+            "SELECT id FROM sq_a WHERE id > ANY ('{1,2}')",
+            "the quantifier > ANY",
+        ),
+        (
+            "SELECT id FROM sq_a WHERE id > ALL ('{1,2}')",
+            "ALL over an array",
         ),
         (
             "SELECT id FROM sq_a, LATERAL (SELECT 1) AS x",
@@ -329,6 +337,16 @@ fn the_shapes_this_phase_does_not_run_name_themselves() {
             "{statement} -> `{error}`, which does not name `{named}`"
         );
     }
+
+    // And the two either side of that boundary, which both run.
+    assert_eq!(
+        node.rows("SELECT id FROM sq_a WHERE id = ANY ('{1,2}') ORDER BY id"),
+        vec![vec!["1"], vec!["2"]]
+    );
+    assert_eq!(
+        node.rows("SELECT id FROM sq_a WHERE id > ANY (SELECT a_id FROM sq_b) ORDER BY id"),
+        vec![vec!["2"], vec!["3"]]
+    );
 }
 
 /// A subquery is never routed to the columnar engine, and the refusal is by construction.

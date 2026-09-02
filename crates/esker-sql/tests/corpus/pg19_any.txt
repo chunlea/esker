@@ -1,0 +1,35 @@
+# `= ANY(…)`, `current_schemas(bool)` and `current_schema()` — half of the rung-4 blocker
+#
+# `ActiveRecord` asks `WHERE n.nspname = ANY (current_schemas(false))` in every one of its
+# relation-listing statements, and rung 4 of the ladder stops on it.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it
+#
+# `x = ANY(<array>)` **is** `x IN (…)` — PostgreSQL defines the one as the other — and the last
+# three lines are why that is worth knowing rather than assuming. `= ANY` is three-valued:
+#
+#   NULL = ANY(ARRAY['a'])        NULL   — an unknown left operand is unknown against anything
+#   'a'  = ANY(ARRAY['a', NULL])  true   — a match wins; the NULL is never reached
+#   'z'  = ANY(ARRAY['a', NULL])  NULL   — no match *and* a NULL is unknown, not false
+#
+# and an **empty** array is plain `false`, not NULL. This node's `IN` was measured against all four
+# before the `ANY` arm was written, and answers identically — which is what makes lowering one to
+# the other free rather than a guess.
+#
+# `current_schemas(true)` includes `pg_catalog`, which is the implicitly-searched schema. Both
+# forms are constants here because this node has one schema and no `search_path`; what would make
+# them vary is schema support, which is a unit of its own.
+#
+SELECT current_schema()	name	public
+SELECT current_schemas(false)	name[]	{public}
+SELECT current_schemas(true)	name[]	{pg_catalog,public}
+SELECT 'public' = ANY(current_schemas(false))	boolean	t
+SELECT 'nope' = ANY(current_schemas(false))	boolean	f
+SELECT 'a' = ANY(ARRAY['a','b'])	boolean	t
+SELECT 'c' = ANY(ARRAY['a','b'])	boolean	f
+SELECT 'a' = ANY('{a,b}')	boolean	t
+SELECT 1 = ANY(ARRAY[1,2,3])	boolean	t
+SELECT 'x' = ANY(ARRAY[]::text[])	boolean	f
+SELECT NULL = ANY(ARRAY['a'])	boolean	\N
+SELECT 'a' = ANY(ARRAY['a', NULL])	boolean	t

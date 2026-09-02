@@ -1199,15 +1199,40 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                 Box::new(lower_query(subquery)?),
             ),
         ))),
-        // `ANY`/`SOME` and `ALL` are one shape with a flag, and `SOME` is not carried at all: it is
-        // a **spelling** of `ANY` rather than a second operator, and a real server answers the two
-        // identically (measured, `SELECT 1 = SOME (SELECT …)`).
+        // `<op> ANY (SELECT …)` -- a **subquery** on the right, which is this phase's and takes
+        // every one of the six operators. It is matched before the array arm below because the two
+        // share a grammar and nothing else: `= ANY (SELECT …)` is a nested loop over a plan and
+        // `= ANY ('{1,2}')` is a list of values, and only the right-hand side tells them apart.
+        // `SOME` is not carried at all: it is a **spelling** of `ANY` rather than a second
+        // operator, and a real server answers the two identically (measured,
+        // `SELECT 1 = SOME (SELECT …)`).
         Expr::AnyOp {
             left,
             compare_op,
             right,
             ..
-        } => lower_quantified(left, compare_op, right, false),
+        } if matches!(strip_nesting(right), Expr::Subquery(_)) => {
+            lower_quantified(left, compare_op, right, false)
+        }
+        // `x = ANY(<array>)` **is** `x IN (…)`: PostgreSQL defines the one as the other, and this
+        // node's `IN` already answers with the same three-valued logic — `'z' IN ('a', NULL)` is
+        // NULL, `'a' IN ('a', NULL)` is true, and an empty list is false, all measured on both
+        // sides before this arm was written. So there is nothing here to get wrong separately.
+        Expr::AnyOp {
+            left,
+            compare_op,
+            right,
+            ..
+        } if *compare_op == BinaryOperator::Eq => Ok(plan::Expr::InList {
+            operand: Box::new(lower_expr(left)?),
+            list: lower_array(right)?,
+            negated: false,
+        }),
+        // Any other operator against an array — `> ANY`, `<> ANY` — is a different quantifier and
+        // is named rather than approximated by the one this node has.
+        Expr::AnyOp { compare_op, .. } => Err(SqlError::unsupported(format!(
+            "the quantifier {compare_op} ANY"
+        ))),
         Expr::AllOp {
             left,
             compare_op,
@@ -1275,6 +1300,20 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
     };
 
     let name = function.name.to_string();
+    // `current_schema()` is the scalar half of `current_schemas()`: one name rather than a list,
+    // and `public` on this node because `public` is the only schema it has. Measured; the two are
+    // together here so a reader finds both at once.
+    if name.eq_ignore_ascii_case("current_schema") {
+        return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+            Datum::Text(PUBLIC_SCHEMA.to_owned()),
+        ))));
+    }
+    if let Some(schemas) = schema_function(function)? {
+        return Err(SqlError::unsupported(format!(
+            "current_schemas outside an ANY, which would need an array value where this node has              only array expressions ({} schemas)",
+            schemas.len()
+        )));
+    }
     if let Some(func) = plan::SequenceFunc::from_name(&name) {
         return lower_sequence_function(func, function);
     }
@@ -1485,6 +1524,122 @@ fn sequence_reference(text: &str) -> String {
         None => fold_identifier(bare, false).0,
     }
 }
+
+/// The elements of an array expression, for the right-hand side of `= ANY(…)`.
+///
+/// Three spellings, all of which `ActiveRecord` or its `pg` driver may send:
+///
+/// * `ARRAY['a', 'b']` — the constructor, which `sqlparser` gives as `Expr::Array`;
+/// * `'{a,b}'` — an array **literal** as text, which PostgreSQL's array input function reads;
+/// * `current_schemas(false)` — a function that returns one.
+///
+/// Everything stays at the level of an **expression**: this node has no array *value* and no array
+/// column, and nothing here creates one. `= ANY` is the only place an array appears, it becomes an
+/// `IN` list before the planner sees it, and a `Datum` is never an array. That is the split ADR
+/// 0033's roadmap describes — expression-level arrays now, stored arrays with the tier-2 unit that
+/// needs a column of them.
+fn lower_array(expr: &Expr) -> Result<Vec<plan::Expr>> {
+    match expr {
+        Expr::Array(array) => array.elem.iter().map(lower_expr).collect(),
+        Expr::Nested(inner) => lower_array(inner),
+        Expr::Function(function) => match schema_function(function)? {
+            Some(schemas) => Ok(schemas
+                .into_iter()
+                .map(|name| plan::Expr::Literal(plan::Literal::String(name)))
+                .collect()),
+            None => Err(SqlError::unsupported(format!(
+                "the function {} as an ANY operand",
+                function.name
+            ))),
+        },
+        // `'{a,b}'::text[]` and a bare `'{a,b}'`: the cast is a no-op here, because what the array
+        // holds is decided by what it is compared against, exactly as an `IN` list's elements are.
+        Expr::Cast { expr, .. } => lower_array(expr),
+        Expr::Value(value) => match &value.value {
+            Value::SingleQuotedString(text) => Ok(parse_array_literal(text)?
+                .into_iter()
+                .map(|item| plan::Expr::Literal(plan::Literal::String(item)))
+                .collect()),
+            _ => Err(SqlError::unsupported(format!("{expr} as an ANY operand"))),
+        },
+        other => Err(SqlError::unsupported(format!("{other} as an ANY operand"))),
+    }
+}
+
+/// `'{a,b,"c d"}'` as its elements.
+///
+/// PostgreSQL's array input syntax, narrowed to what an `= ANY` operand needs: braces, commas, and
+/// double quotes around an element containing a comma, a brace or a space. A NULL element is the
+/// unquoted word `NULL`, which this node does not produce and reads as the string — the one thing
+/// here that is a simplification, and it cannot be reached from anything `ActiveRecord` sends.
+fn parse_array_literal(text: &str) -> Result<Vec<String>> {
+    let inner = text
+        .trim()
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .ok_or_else(|| SqlError::InvalidTextRepresentation {
+            ty: "array",
+            value: text.to_owned(),
+        })?;
+    if inner.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut chars = inner.chars();
+    while let Some(character) = chars.next() {
+        match character {
+            '"' => quoted = !quoted,
+            '\\' => {
+                if let Some(escaped) = chars.next() {
+                    current.push(escaped);
+                }
+            }
+            ',' if !quoted => items.push(std::mem::take(&mut current)),
+            _ => current.push(character),
+        }
+    }
+    items.push(current);
+    Ok(items)
+}
+
+/// `current_schemas(bool)` as the schemas it returns, or `None` for a function that is not it.
+///
+/// Measured on 19beta1: `current_schemas(false)` is `{public}` and `current_schemas(true)` is
+/// `{pg_catalog,public}` — the `true` form includes the implicitly-searched catalog schema. This
+/// node has exactly one schema and no `search_path` to vary it, so both answers are constants;
+/// what would make them not constants is schema support, which is a unit of its own.
+fn schema_function(function: &sqlparser::ast::Function) -> Result<Option<Vec<String>>> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments};
+    if !function
+        .name
+        .to_string()
+        .eq_ignore_ascii_case("current_schemas")
+    {
+        return Ok(None);
+    }
+    let FunctionArguments::List(FunctionArgumentList { args, .. }) = &function.args else {
+        return Err(SqlError::unsupported("current_schemas with no argument"));
+    };
+    let include_implicit = match args.as_slice() {
+        [FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(value)))] => match &value.value {
+            Value::Boolean(flag) => *flag,
+            other => {
+                return Err(SqlError::unsupported(format!("current_schemas({other})")));
+            }
+        },
+        _ => return Err(SqlError::unsupported("current_schemas with that argument")),
+    };
+    Ok(Some(if include_implicit {
+        vec!["pg_catalog".to_owned(), PUBLIC_SCHEMA.to_owned()]
+    } else {
+        vec![PUBLIC_SCHEMA.to_owned()]
+    }))
+}
+
+/// The one schema this node has. `public`, which is what `current_schema()` answers.
+const PUBLIC_SCHEMA: &str = "public";
 
 /// `'<name>'::regtype`, `'<name>'::regtype::oid` and `'<digits>'::oid`.
 ///
