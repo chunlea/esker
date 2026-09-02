@@ -93,7 +93,7 @@ pub fn precision_of_typmod(typmod: i32) -> Option<u32> {
 ///   identically". That invariant is why `character(n)` waited for the typmod: without an `n`
 ///   there is nowhere to pad to.
 /// * **`timestamp(p)` rounds**, half away from zero, and carries — `.999999` at `timestamp(3)` is
-///   the next whole second. [`timestamp::round_to_precision`] holds the two surprises.
+///   the next whole second. `timestamp::round_to_precision` holds the two surprises.
 ///
 /// A NULL and a column with no typmod are returned untouched, which is every column this crate
 /// had before version 4 of the catalog record.
