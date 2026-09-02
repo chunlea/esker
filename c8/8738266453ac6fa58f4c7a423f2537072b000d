@@ -1,0 +1,37 @@
+.config/nextest.toml
+  s_5887b8dc15d0eb::t_c336f7fd6cbd33 1-37
+crates/esker-client/src/fragment.rs
+  s_5887b8dc15d0eb::t_b76b957fc27886 22,144,148-158
+crates/esker-client/src/router.rs
+  s_5887b8dc15d0eb::t_833c67f26c05e8 318-333
+crates/esker-client/tests/fragment.rs
+  s_5887b8dc15d0eb::t_7ad8c5eade956d 11,217-273
+crates/esker-sql/src/exec/fragment.rs
+  s_5887b8dc15d0eb::t_4a2c10d66fb73b 276-286,297,401,410,412,416-421,476-481,486,488-525,527,530-560
+crates/esker-sql/src/parameter.rs
+  s_5887b8dc15d0eb::t_7ecf10b329b115 69
+crates/esker-sql/src/pd.rs
+  s_5887b8dc15d0eb::t_f7935ac651374e 41,113-148,333-344
+crates/esker-sql/src/plan/routing.rs
+  s_5887b8dc15d0eb::t_68c325b9a0a6b2 7,147
+crates/esker-sql/tests/routing_differential.rs
+  s_5887b8dc15d0eb::t_cd885390b2249c 1-730
+docs/plans/phase-10-routing.md
+  s_5887b8dc15d0eb::t_9044d0d74ae865 73-78,308-323
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "c88738266453ac6fa58f4c7a423f2537072b000d",
+  "prompts": {},
+  "sessions": {
+    "s_5887b8dc15d0eb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a3f26108-d8c6-4ca4-8418-c2dce63dbbae",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
