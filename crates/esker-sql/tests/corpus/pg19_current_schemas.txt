@@ -1,0 +1,87 @@
+# VERIFIED BEFORE IMPORT: replayed twice against 19beta1 (self-idempotent) and diffed against
+# r1's committed file, byte-identical.
+#
+# **Imported because a paraphrase went round three times.** `current_schema()` was right and
+# `current_schema` — the bare, parenthesis-free spelling SQL allows for a niladic function — was
+# `42703`, and a triage saying "current_schema fails" and a test asserting `current_schema(false)`
+# is `42883` were both true at once. Replaying a capture statement by statement is what told the
+# two apart; asserting the shapes I happened to think of is what did not.
+#
+# `current_schemas`, `current_schema` and the session-info functions beside them, as a real
+# PostgreSQL 19beta1 answers them.
+#
+# NOT a type — the function **rung 4 now stops on**. At `51390c9` the `::regtype` cast landed and
+# rung 2 passed for the first time; rung 4's next answer is
+# `the expression n.nspname = ANY(current_schemas(false)) is not supported`, and boot statements
+# 16, 21, 22 and 28 are the same shape. It needs two things at once — `current_schemas`, whose
+# return type is an **array**, and `= ANY` over it — which is why it is captured beside
+# `pg19_array.txt` rather than after it.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way against one node.
+# It creates nothing; the two `SET search_path` probes are undone by the `RESET` below them.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **The return type is `name[]`, not `text[]`.** `pg_typeof(current_schemas(false))` is
+#     `name[]` (OID 1003) and `current_schema` is `name` (19). `name` is a 64-byte fixed type, not
+#     a varlena, so an implementation that answered `text[]` would report a different type OID to
+#     a client that asked — and `ActiveRecord` asks, through the very `lookup_cast_type` the cast
+#     unit just built.
+#   * **The boolean argument prepends the implicit schemas, it does not filter.**
+#     `current_schemas(false)` is `{public}` and `current_schemas(true)` is
+#     `{pg_catalog,public}` — `pg_catalog` arrives **first**, ahead of everything in
+#     `search_path`, because that is where it is implicitly searched.
+#   * **A schema in `search_path` that does not exist is silently dropped.**
+#     `SET search_path TO nosuchschema, public` then `current_schemas(false)` is `{public}` — no
+#     error, no empty slot. And `SHOW search_path` still reports the raw setting, so **`SHOW` and
+#     `current_schemas` disagree on purpose**: one is the text that was set, the other is the list
+#     that resolved. The default `"$user", public` shows the same thing — there is no schema
+#     named `esker`, so it contributes nothing.
+#   * **An explicit `pg_catalog` keeps its position.** `SET search_path TO public, pg_catalog`
+#     makes `current_schemas(false)` `{public,pg_catalog}` — in that order, not reordered to put
+#     the catalog first.
+#   * **It is strict, and it has exactly one arity.** `current_schemas(NULL)` is NULL rather than
+#     an error or an empty array; `current_schemas()` with no argument is
+#     `42883 function current_schemas() does not exist` with
+#     `DETAIL: No function of that name accepts the given number of arguments.` — the *number* of
+#     arguments, where a wrong *type* names the types instead.
+#   * **`current_schema` takes no argument at all**, in either spelling: bare `current_schema` and
+#     `current_schema()` both answer `public`, and `current_schema(false)` is `42883`. The bare
+#     spelling is the SQL-standard niladic form, and it is a *function* — a node that resolves it
+#     as a column reference answers `42703 column "current_schema" does not exist`, which is
+#     `triage/blockers-<hash>.md`'s only category-(a) row.
+#   * **A function call cannot be subscripted directly**: `current_schemas(false)[1]` is
+#     `42601 syntax error at or near "["`. It has to go through a cast, an alias or `unnest`.
+SELECT current_schemas(false)	name[]	{public}
+SELECT current_schemas(true)	name[]	{pg_catalog,public}
+SELECT current_schema	name	public
+SELECT current_schema()	name	public
+SELECT pg_typeof(current_schemas(false)), pg_typeof(current_schema)	regtype,regtype	name[]|name
+SELECT current_catalog, current_database()	name,name	esker|esker
+SELECT current_user, session_user, user	name,name,name	esker|esker|esker
+SELECT version() IS NOT NULL	boolean	t
+SELECT 'public' = ANY(current_schemas(false))	boolean	t
+SELECT 'pg_catalog' = ANY(current_schemas(false))	boolean	f
+SELECT 'pg_catalog' = ANY(current_schemas(true))	boolean	t
+SELECT array_length(current_schemas(false), 1), array_length(current_schemas(true), 1)	integer,integer	1|2
+SELECT n.nspname FROM pg_namespace n WHERE n.nspname = ANY(current_schemas(false))	name	public
+SELECT unnest(current_schemas(true))	name	pg_catalog ; public
+SELECT current_schemas(false)::text	text	{public}
+SELECT current_schemas(NULL)	name[]	\N
+SELECT current_schemas()	!42883 function current_schemas() does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT current_schemas(false, true)	!42883 function current_schemas(boolean, boolean) does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT current_schema(false)	!42883 function current_schema(boolean) does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT current_schemas(false)[1]	!42601 syntax error at or near "["
+SHOW search_path	text	"$user", public
+SET search_path TO public, pg_catalog		-
+SELECT current_schemas(false)	name[]	{public,pg_catalog}
+SET search_path TO nosuchschema, public		-
+SELECT current_schemas(false)	name[]	{public}
+SELECT current_schema	name	public
+RESET search_path		-
+SELECT current_schemas(false)	name[]	{public}
+SHOW search_path	text	"$user", public

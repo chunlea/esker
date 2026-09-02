@@ -95,7 +95,13 @@ const FIXTURE: &[&str] =
 /// a feature and moved no number is exactly what a counter asserted *exactly* is for — the
 /// shapes it did unblock are measured in `tests/activerecord_subquery.rs` instead, so the day the
 /// catalog functions land the subquery half is already known to work.
-const RUNS: usize = 22;
+///
+/// **Twenty-three**, and the twenty-third is the smallest change in this file's history:
+/// statement 24 is `SELECT current_schema`, the bare parenthesis-free spelling of a function
+/// whose parenthesised form had worked since the rung-4 unit. It took three rounds of
+/// contradictory reports to find, because "`current_schema` fails" and "`current_schema(false)`
+/// is `42883`" were true at the same time.
+const RUNS: usize = 23;
 
 #[test]
 fn every_statement_activerecord_sends_parses_and_is_answered_by_name() {
