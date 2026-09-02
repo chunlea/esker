@@ -40,11 +40,13 @@
 //! * **No wall clock, no sockets, no sleeping.** Time is a counter the model advances.
 //! * **Every failure is a seed.** A violation carries the seed and the round it happened in.
 
+pub mod ask;
 pub mod placement;
 pub mod reference;
 pub mod retry;
 pub mod sweep;
 
+pub use ask::{AskCase, Membership};
 pub use placement::{BalancePolicy, ClusterView, MidRepair, Move, PeerView, RegionView, StoreView};
 pub use reference::ReferenceBalance;
 pub use retry::{Answer, Budget, RetryClient, Script};
