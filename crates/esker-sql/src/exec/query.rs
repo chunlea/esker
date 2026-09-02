@@ -203,7 +203,12 @@ impl<'a> Scope<'a> {
     /// column reference "x" is ambiguous` — which is an error rather than a silent choice of the
     /// first one, because the user's intent is genuinely unknown and guessing it returns the wrong
     /// column without saying so.
-    fn resolve_column(&self, qualifier: Option<&str>, name: &str) -> Result<(usize, ColumnType)> {
+    /// Where a column is in the joined row, and **the column itself**.
+    ///
+    /// It returns the definition rather than just the type because a caller wants the typmod too,
+    /// and resolving twice — once for the type and once for the number beside it — is two lookups
+    /// that can disagree about which `id` an ambiguous name meant.
+    fn resolve_column(&self, qualifier: Option<&str>, name: &str) -> Result<(usize, &ColumnDef)> {
         if let Some(qualifier) = qualifier {
             let index = self.entry(qualifier)?;
             let at = self.tables[index].column(name).ok_or_else(|| {
@@ -215,7 +220,7 @@ impl<'a> Scope<'a> {
                     column: name.to_owned(),
                 }
             })?;
-            return Ok((self.offset(index) + at, self.tables[index].columns[at].ty));
+            return Ok((self.offset(index) + at, &self.tables[index].columns[at]));
         }
 
         // A `USING` column is **one** column, so a bare reference to it is not ambiguous — where
@@ -225,10 +230,7 @@ impl<'a> Scope<'a> {
         if self.using.iter().any(|merged| merged == name) {
             let written = self.written.first().copied().unwrap_or(0);
             if let Some(at) = self.tables[written].column(name) {
-                return Ok((
-                    self.offset(written) + at,
-                    self.tables[written].columns[at].ty,
-                ));
+                return Ok((self.offset(written) + at, &self.tables[written].columns[at]));
             }
         }
 
@@ -238,7 +240,7 @@ impl<'a> Scope<'a> {
                 if found.is_some() {
                     return Err(SqlError::AmbiguousColumn(name.to_owned()));
                 }
-                found = Some((self.offset(index) + at, table.columns[at].ty));
+                found = Some((self.offset(index) + at, &table.columns[at]));
             }
         }
         found.ok_or_else(|| undefined_column(name))
@@ -251,7 +253,9 @@ pub(super) struct Planned {
     /// The tree to pull rows through.
     pub(super) node: Node,
     /// One name and type per output column, for `RowDescription`.
-    pub(super) columns: Vec<(String, ColumnType)>,
+    /// One name, type and **typmod** per output column, for `RowDescription`. The typmod is
+    /// `NO_TYPMOD` for everything but a plain column reference, which is PostgreSQL's rule.
+    pub(super) columns: Vec<(String, ColumnType, i32)>,
     /// The table's name, for `EXPLAIN`.
     pub(super) table: String,
     /// The table's column names, so `EXPLAIN` can print the names a user typed rather than the
@@ -447,7 +451,7 @@ fn order_keys(
     scope: &Scope<'_>,
     aggregation: Option<&aggregate::Aggregation>,
     outputs: &[Expr],
-    columns: &[(String, ColumnType)],
+    columns: &[(String, ColumnType, i32)],
 ) -> Result<Vec<SortKey>> {
     let mut keys = Vec::new();
     for item in &select.order_by {
@@ -474,7 +478,7 @@ fn order_keys(
             // one, which this does not do. Every case the corpus holds is covered by the
             // ambiguity alone, and a preference nothing has measured would be invented.
             if let Expr::Column { table: None, name } = &item.expr
-                && columns.iter().filter(|(output, _)| output == name).count() > 1
+                && columns.iter().filter(|(output, ..)| output == name).count() > 1
             {
                 return Err(SqlError::AmbiguousOrderBy(name.clone()));
             }
@@ -498,6 +502,7 @@ fn order_keys(
             Expr::Ordinal {
                 at,
                 ty: expr_type(&resolved, scope)?,
+                typmod: typmod_of(&resolved, scope),
             }
         } else {
             resolved
@@ -515,7 +520,7 @@ fn order_keys(
 }
 
 /// A resolved target list: one name and type per output column, and the expression that fills it.
-pub(super) type TargetList = (Vec<(String, ColumnType)>, Vec<Expr>);
+pub(super) type TargetList = (Vec<(String, ColumnType, i32)>, Vec<Expr>);
 
 /// `RETURNING`, resolved against one table: the output columns and the expression per column.
 ///
@@ -1058,8 +1063,12 @@ const SYSTEM_COLUMNS: [&str; 6] = ["ctid", "xmin", "xmax", "cmin", "cmax", "tabl
 pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
     Ok(match expr {
         Expr::Column { table, name } => {
-            let (at, ty) = scope.resolve_column(table.as_deref(), name)?;
-            Expr::Ordinal { at, ty }
+            let (at, column) = scope.resolve_column(table.as_deref(), name)?;
+            Expr::Ordinal {
+                at,
+                ty: column.ty,
+                typmod: column.typmod,
+            }
         }
         Expr::Binary { op, left, right } => {
             let (left, right) = (resolve(left, scope)?, resolve(right, scope)?);
@@ -1143,12 +1152,12 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
 /// 3. neither side `unknown` — nothing to resolve, and a pair no operator covers is `42883`.
 fn reconcile(op: BinaryOp, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
     Ok(match (&left, &right) {
-        (Expr::Ordinal { ty, .. }, Expr::Literal(literal)) => (
+        (Expr::Ordinal { ty, typmod, .. }, Expr::Literal(literal)) => (
             left.clone(),
-            Expr::Literal(retype(*ty, literal, op, false)?),
+            Expr::Literal(blank_pad(retype(*ty, literal, op, false)?, *ty, *typmod)),
         ),
-        (Expr::Literal(literal), Expr::Ordinal { ty, .. }) => (
-            Expr::Literal(retype(*ty, literal, op, true)?),
+        (Expr::Literal(literal), Expr::Ordinal { ty, typmod, .. }) => (
+            Expr::Literal(blank_pad(retype(*ty, literal, op, true)?, *ty, *typmod)),
             right.clone(),
         ),
         // An `unknown` beside a literal that has a type. `Literal::String` is the only `unknown`
@@ -1228,6 +1237,46 @@ fn give_type(expr: &mut Expr, ty: ColumnType) -> Result<()> {
 /// One literal, resolved against a column's type. A literal that will not assign is
 /// `42883 operator does not exist`, which is what PostgreSQL answers rather than a type mismatch:
 /// from its point of view there is simply no `text = integer` to call.
+/// A literal being compared against a `character(n)`, in the form that column's values are stored.
+///
+/// PostgreSQL's `bpchar` comparison ignores trailing blanks on **both** sides. Here the stored
+/// side is already padded to exactly `n`, so the same answer falls out of a plain byte comparison
+/// once the literal is put in the same form: strip its trailing blanks and pad back to `n`. That
+/// is why `c = 'x'`, `c = 'x  '` and `c = 'x    '` all find a `char(3)` holding `x`.
+///
+/// A literal whose stripped length exceeds `n` is left alone. It cannot equal any stored value —
+/// every one of them is `n` characters — and that is a comparison that finds nothing rather than
+/// an error, which is what a real server does too: the `22001` is for *storing*, not for asking.
+///
+/// Doing this here rather than in the evaluator is what keeps an index seek working: the key
+/// built from a padded literal is the key the row wrote.
+fn blank_pad(literal: Literal, ty: ColumnType, typmod: i32) -> Literal {
+    if ty != ColumnType::Bpchar {
+        return literal;
+    }
+    let Some(length) = crate::value::length_of_typmod(typmod) else {
+        return literal;
+    };
+    // `retype` hands a text-shaped value back as `Literal::String`, not `Literal::Typed` — both
+    // spellings reach here and both are the same value.
+    let text = match &literal {
+        Literal::String(text) => text.as_str(),
+        Literal::Typed(datum) => match datum.as_ref() {
+            Datum::Text(text) => text.as_str(),
+            _ => return literal,
+        },
+        _ => return literal,
+    };
+    let trimmed = text.trim_end_matches(' ');
+    let Some(short_by) = (length as usize).checked_sub(trimmed.chars().count()) else {
+        return literal;
+    };
+    let mut padded = String::with_capacity(trimmed.len() + short_by);
+    padded.push_str(trimmed);
+    padded.extend(std::iter::repeat_n(' ', short_by));
+    Literal::String(padded)
+}
+
 fn retype(
     ty: ColumnType,
     literal: &Literal,
@@ -1321,7 +1370,7 @@ fn output_columns(
     select: &Select,
     scope: &Scope<'_>,
     aggregation: Option<&aggregate::Aggregation>,
-) -> Result<Vec<(String, ColumnType)>> {
+) -> Result<Vec<(String, ColumnType, i32)>> {
     let mut columns = Vec::new();
     for item in &select.projection {
         match item {
@@ -1340,7 +1389,7 @@ fn output_columns(
                 columns.extend(
                     scope
                         .expand(qualifier_of(item))?
-                        .map(|(_, column)| (column.name.clone(), column.ty)),
+                        .map(|(_, column)| (column.name.clone(), column.ty, column.typmod)),
                 );
             }
             SelectItem::Expr { expr, alias } => {
@@ -1360,7 +1409,14 @@ fn output_columns(
                     Expr::Aggregate(call) => call.func.name().to_owned(),
                     _ => "?column?".to_owned(),
                 });
-                columns.push((name, ty));
+                // A typmod travels only with a **plain column reference**, which is
+                // PostgreSQL's rule and the corpus's: `c || '|'` is `text` with none and
+                // `min(c)` is `bpchar` with none, where a bare `c` is `character(3)`.
+                let typmod = match expr {
+                    Expr::Column { .. } if aggregation.is_none() => typmod_of(expr, scope),
+                    _ => crate::value::NO_TYPMOD,
+                };
+                columns.push((name, ty, typmod));
             }
         }
     }
@@ -1388,7 +1444,11 @@ fn projection_exprs(
                 // so each one has to be a grouping key or it is `42803` -- which is what the
                 // rewrite says, one column at a time, naming the first that is not.
                 for (at, column) in scope.expand(qualifier_of(item))? {
-                    let expr = Expr::Ordinal { at, ty: column.ty };
+                    let expr = Expr::Ordinal {
+                        at,
+                        ty: column.ty,
+                        typmod: column.typmod,
+                    };
                     exprs.push(match aggregation {
                         None => expr,
                         Some(aggregation) => aggregation.rewrite(&expr, scope)?,
@@ -1410,9 +1470,24 @@ fn projection_exprs(
 
 /// What type an output column has. A literal with no column to take a type from falls back the way
 /// PostgreSQL does: a quoted string is `text`, an integer is `bigint`.
+/// The typmod a bare column reference carries, or `NO_TYPMOD` for anything else.
+///
+/// Only a plain column reference has one, which is PostgreSQL's rule rather than a simplification:
+/// `c || '|'` over a `character(3)` is `text` with no modifier and `min(c)` is `bpchar` with none,
+/// where a bare `c` is `character(3)`. An unresolvable column answers `NO_TYPMOD` rather than an
+/// error, because whatever is wrong with it is reported by `expr_type` beside this.
+pub(super) fn typmod_of(expr: &Expr, scope: &Scope<'_>) -> i32 {
+    match expr {
+        Expr::Column { table, name } => scope
+            .resolve_column(table.as_deref(), name)
+            .map_or(crate::value::NO_TYPMOD, |(_, column)| column.typmod),
+        _ => crate::value::NO_TYPMOD,
+    }
+}
+
 pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
     Ok(match expr {
-        Expr::Column { table, name } => scope.resolve_column(table.as_deref(), name)?.1,
+        Expr::Column { table, name } => scope.resolve_column(table.as_deref(), name)?.1.ty,
         Expr::Ordinal { ty, .. } => *ty,
         // A sequence function answers `bigint` on a real server, all four of them.
         Expr::Literal(Literal::Integer(_)) | Expr::Sequence(_) => ColumnType::Int8,

@@ -61,6 +61,13 @@ pub enum Expr {
         at: usize,
         /// The column's type, so a comparison against it can resolve a literal.
         ty: ColumnType,
+        /// The column's typmod, so a comparison against a `character(n)` can normalise one.
+        ///
+        /// A `bpchar`'s values are stored padded to `n`, so a literal has to be padded the same
+        /// way before a byte comparison means what PostgreSQL means. Carrying the number here is
+        /// what lets that happen once, where the literal is typed, rather than in the evaluator —
+        /// which sees two `Datum::Text`s and cannot tell a `character(3)` from a `text`.
+        typmod: i32,
     },
     /// A comparison or a logical connective.
     Binary {

@@ -647,7 +647,7 @@ impl Executor {
         let fields = planned
             .columns
             .iter()
-            .map(|(name, ty)| FieldDescription::computed(name.clone(), *ty))
+            .map(|(name, ty, typmod)| FieldDescription::of(name.clone(), *ty, *typmod))
             .collect();
         let tag = format!("SELECT {}", rows.len());
         Ok(Outcome::Rows { fields, rows, tag })
@@ -1153,7 +1153,7 @@ fn returning_fields(
     Ok(Some(
         columns
             .into_iter()
-            .map(|(name, ty)| FieldDescription::computed(name, ty))
+            .map(|(name, ty, typmod)| FieldDescription::of(name, ty, typmod))
             .collect(),
     ))
 }
@@ -1207,7 +1207,7 @@ impl Execute for Executor {
                 )?
                 .columns
                 .into_iter()
-                .map(|(name, ty)| FieldDescription::computed(name, ty))
+                .map(|(name, ty, typmod)| FieldDescription::of(name, ty, typmod))
                 .collect(),
             ),
             Statement::Explain(_) => Some(vec![FieldDescription::computed(

@@ -151,6 +151,11 @@ fn refuse_if_longer(text: &str, limit: u32, ty: ColumnType, typmod: i32) -> Resu
 #[must_use]
 pub fn format_type(ty: ColumnType, typmod: i32) -> String {
     match (ty, typmod) {
+        // **`bpchar` is the one type whose bare name is not its parameterised one.** Measured:
+        // `format_type(1042, -1)` is `bpchar` and `format_type(1042, 7)` is `character(3)`, where
+        // `varchar` is `character varying` either way. It is what `min(c)` reports, since an
+        // aggregate carries no typmod.
+        (ColumnType::Bpchar, NO_TYPMOD) => "bpchar".to_owned(),
         (_, NO_TYPMOD) => ty.name().to_owned(),
         (ColumnType::Varchar | ColumnType::Bpchar, _) => match length_of_typmod(typmod) {
             Some(length) => format!("{}({length})", ty.name()),

@@ -225,15 +225,29 @@ impl FieldDescription {
     /// reference". PostgreSQL fills them in for a column that came straight out of a table; ours
     /// are `u64` relation ids and would not fit the `u32` field, and a truncated one could name a
     /// different relation. Zero is the honest answer and the one the protocol provides for it.
+    ///
+    /// The type modifier is `-1`: a computed value has no declared length. That is PostgreSQL's
+    /// answer too — `c || '|'` over a `character(3)` is `text` with no modifier, and `min(c)` is
+    /// `bpchar` with none. Only a **plain column reference** carries one, which is
+    /// [`FieldDescription::of`].
     #[must_use]
     pub fn computed(name: impl Into<String>, ty: crate::value::ColumnType) -> Self {
+        Self::of(name, ty, crate::value::NO_TYPMOD)
+    }
+
+    /// A column of type `ty` carrying the declared length or precision its column was given.
+    ///
+    /// `typmod` is PostgreSQL's `atttypmod` and travels to the client unchanged, which is what
+    /// makes `\gdesc` say `character varying(5)` rather than `character varying`.
+    #[must_use]
+    pub fn of(name: impl Into<String>, ty: crate::value::ColumnType, typmod: i32) -> Self {
         FieldDescription {
             name: name.into(),
             table_oid: 0,
             column_id: 0,
             type_oid: ty.oid(),
             type_size: ty.type_len(),
-            type_modifier: -1,
+            type_modifier: typmod,
             format: 0,
         }
     }
