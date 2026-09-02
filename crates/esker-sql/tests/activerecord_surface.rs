@@ -88,6 +88,13 @@ const FIXTURE: &[&str] =
 /// that need `pg_class`, `pg_namespace` and `= ANY (current_schemas(false))` together. They are
 /// one shape asked three ways, which is why no single earlier unit could move any of them: a
 /// statement is served or it is not, and this one wanted three features before it was either.
+/// **Phase 12 moved it by nothing, and said so.** Subqueries, derived tables, CTEs and
+/// correlation all landed; three of the thirty-six carry a subquery and not one of them reaches
+/// it. Line 52 stops on `pg_get_indexdef`, lines 55 and 56 on `pg_get_constraintdef` and a
+/// `::text` cast, and all three want `array_agg` or `ARRAY(SELECT …)` besides. A phase that built
+/// a feature and moved no number is exactly what a counter asserted *exactly* is for — the
+/// shapes it did unblock are measured in `tests/activerecord_subquery.rs` instead, so the day the
+/// catalog functions land the subquery half is already known to work.
 const RUNS: usize = 22;
 
 #[test]

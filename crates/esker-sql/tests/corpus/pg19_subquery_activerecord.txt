@@ -1,0 +1,38 @@
+# The `ActiveRecord` shapes, with the pieces that are another lane's replaced -- phase 12 unit 5
+# (`docs/plans/phase-12-subquery.md`). Captured on the `esker-pg19` container inside one
+# `BEGIN ... ROLLBACK`, like every other corpus here.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# Three of ActiveRecord 8.1.3.1's thirty-six boot statements carry a subquery, and **not one of
+# them reaches it**: each stops on a catalog function first (`pg_get_indexdef`,
+# `pg_get_constraintdef`, a `::text` cast) and needs `array_agg` or `ARRAY(SELECT …)` besides. So
+# this file is their *shape* over three ordinary tables -- `array_agg` written as `max`,
+# `generate_subscripts` written as a table of positions -- and the structure is untouched:
+#
+#     ( SELECT array_agg(a.attname ORDER BY idx)
+#       FROM ( SELECT idx, c.conkey[idx] AS conkey_elem
+#              FROM generate_subscripts(c.conkey, 1) AS idx ) indexed_conkeys
+#       JOIN pg_attribute a ON a.attnum = indexed_conkeys.conkey_elem )
+#
+# is a **correlated scalar subquery whose own FROM is a derived table joined to a table**, and that
+# is what the first statement below is. When the array unit lands, the half measured here is
+# already known to work.
+CREATE TABLE ar_cons (id int8 PRIMARY KEY, name text, rel int8)		-
+INSERT INTO ar_cons VALUES (1, 'fk_a', 10), (2, 'fk_b', 11), (3, 'uq_c', 10)		-
+CREATE TABLE ar_keys (id int8 PRIMARY KEY, cid int8, pos int8)		-
+INSERT INTO ar_keys VALUES (100, 1, 1), (101, 1, 2), (102, 3, 1)		-
+CREATE TABLE ar_attrs (id int8 PRIMARY KEY, rel int8, pos int8, attname text)		-
+INSERT INTO ar_attrs VALUES (200, 10, 1, 'author_id'), (201, 10, 2, 'kind'), (202, 11, 1, 'title')		-
+
+# --- statement 55's shape, whole
+SELECT c.name, (SELECT max(a.attname) FROM (SELECT k.pos FROM ar_keys k WHERE k.cid = c.id) AS ks JOIN ar_attrs a ON a.pos = ks.pos) AS attname FROM ar_cons c ORDER BY c.name	text,text	fk_a|title ; fk_b|\N ; uq_c|title
+
+# --- and the pieces the three are built from
+SELECT c.name, (SELECT count(*) FROM ar_keys k WHERE k.cid = c.id) AS n FROM ar_cons c ORDER BY c.name	text,bigint	fk_a|2 ; fk_b|0 ; uq_c|1
+SELECT DISTINCT c.rel, (SELECT count(*) FROM ar_keys k WHERE k.cid = c.id) FROM ar_cons c ORDER BY 1, 2	bigint,bigint	10|1 ; 10|2 ; 11|0
+SELECT c.name FROM ar_cons c WHERE EXISTS (SELECT 1 FROM ar_keys k WHERE k.cid = c.id) ORDER BY c.name	text	fk_a ; uq_c
+SELECT count(*) FROM (SELECT DISTINCT rel FROM ar_cons) AS t	bigint	2
+WITH ks AS (SELECT cid, count(*) AS n FROM ar_keys GROUP BY cid) SELECT c.name, ks.n FROM ar_cons c JOIN ks ON ks.cid = c.id ORDER BY c.name	text,bigint	fk_a|2 ; uq_c|1

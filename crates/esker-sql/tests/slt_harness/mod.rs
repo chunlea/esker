@@ -108,6 +108,7 @@ pub(crate) const FILES: &[(&str, &str)] = &[
         include_str!("../slt/no_primary_key.slt"),
     ),
     ("nulls.slt", include_str!("../slt/nulls.slt")),
+    ("subquery.slt", include_str!("../slt/subquery.slt")),
     ("ordering.slt", include_str!("../slt/ordering.slt")),
     (
         "rowsort_check.slt",

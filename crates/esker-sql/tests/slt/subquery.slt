@@ -1,0 +1,134 @@
+# Subqueries and CTEs: a query where a value goes, and a query where a table goes.
+#
+# Phase 12 (`docs/plans/phase-12-subquery.md`). Four shapes, and one decision made twice about all
+# of them -- how many times the sub-plan runs. Nothing in it names the row outside, so it runs once
+# before the cursor opens; something does, and it runs per outer row.
+#
+# Every row below is what a real PostgreSQL 19beta1 answered for the same statement over the same
+# fixture. The corpora that measured them are `pg19_subquery_expr.txt`, `pg19_subquery_from.txt`,
+# `pg19_cte.txt` and `pg19_subquery_correlated.txt`; this file is the shapes a reader wants to see
+# together.
+
+statement ok
+CREATE TABLE sq (id int8 PRIMARY KEY, n text, k int8)
+
+statement ok
+CREATE TABLE sr (id int8 PRIMARY KEY, sq_id int8, v int8)
+
+# tag: INSERT 0 3
+statement ok
+INSERT INTO sq VALUES (1, 'one', 7), (2, 'two', NULL), (3, NULL, 9)
+
+# Row 12's `v` is NULL, which is what the `NOT IN` below turns on.
+# tag: INSERT 0 3
+statement ok
+INSERT INTO sr VALUES (10, 1, 100), (11, 1, 200), (12, 3, NULL)
+
+# --- IN over a subquery: the three-valued rule `in_list.slt`'s cousin pins for a list.
+
+query I
+SELECT id FROM sq WHERE id IN (SELECT sq_id FROM sr) ORDER BY id
+----
+1
+3
+
+query I
+SELECT id FROM sq WHERE id NOT IN (SELECT sq_id FROM sr) ORDER BY id
+----
+2
+
+# THE TRAP. `sr.v` has a NULL in it, so `NOT IN` over it matches nothing at all -- not "every row
+# whose id is not 100 or 200". A NULL is not a value that fails to match; it is a value nothing can
+# be said about, and `x NOT IN (…, NULL)` is therefore never true.
+query I
+SELECT id FROM sq WHERE id NOT IN (SELECT v FROM sr) ORDER BY id
+----
+
+# And the empty subquery is decided **before** the NULL: `NULL IN (no rows)` is false, where
+# `NULL IN (1)` is NULL.
+query B
+SELECT NULL IN (SELECT v FROM sr WHERE id > 99)
+----
+f
+
+query B
+SELECT 1 = ANY (SELECT sq_id FROM sr)
+----
+t
+
+query B
+SELECT 2 <> ALL (SELECT sq_id FROM sr)
+----
+t
+
+# --- a scalar subquery, and EXISTS
+
+query I
+SELECT (SELECT max(v) FROM sr)
+----
+200
+
+# Correlated: one run per outer row, and `count` over no matching rows is 0 rather than NULL --
+# the ungrouped empty-input rule, reached three times.
+query II
+SELECT id, (SELECT count(*) FROM sr WHERE sr.sq_id = sq.id) FROM sq ORDER BY id
+----
+1	2
+2	0
+3	1
+
+query IB
+SELECT id, EXISTS (SELECT 1 FROM sr WHERE sr.sq_id = sq.id) FROM sq ORDER BY id
+----
+1	t
+2	f
+3	t
+
+# A table correlated to itself under two aliases.
+query I
+SELECT id FROM sq x WHERE EXISTS (SELECT 1 FROM sq y WHERE y.id > x.id) ORDER BY id
+----
+1
+2
+
+# --- a derived table: a query where a table goes
+
+query IT
+SELECT * FROM (SELECT id, n FROM sq) AS t ORDER BY id
+----
+1	one
+2	two
+3	NULL
+
+# The alias list renames, and the column's own name is gone after it.
+query IT
+SELECT * FROM (SELECT id, n FROM sq) AS t (a, b) ORDER BY a
+----
+1	one
+2	two
+3	NULL
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT sq_id FROM sr) AS t
+----
+2
+
+query II
+SELECT t.id, r.v FROM (SELECT id FROM sq) AS t JOIN sr r ON r.sq_id = t.id ORDER BY t.id, r.v
+----
+1	100
+1	200
+3	NULL
+
+# --- a CTE, which is a derived table wearing a name
+
+query I
+WITH big AS (SELECT id FROM sq WHERE id > 1) SELECT * FROM big ORDER BY id
+----
+2
+3
+
+query I
+WITH a AS (SELECT id FROM sq), b AS (SELECT count(*) AS c FROM a) SELECT * FROM b
+----
+3

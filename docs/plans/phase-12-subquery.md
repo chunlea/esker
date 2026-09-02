@@ -204,7 +204,7 @@ itself, which is contract C2 and is checked by a test.
 | 2 — derived tables | ✅ | `468c1b6`; 65-statement capture, one new `Node` variant |
 | 3 — CTEs | ✅ | `ee2fcc3`; 51-statement capture, no executor at all |
 | 4 — correlated | ✅ | 34-statement capture; `Expr::Outer`, a scope chain, a nested loop |
-| 5 — the `ActiveRecord` shapes | | |
+| 5 — the `ActiveRecord` shapes | ✅ | 12-statement capture, an slt golden, **the counter moved by 0** |
 | 6 — ADR and DESIGN.md | | |
 
 ### What each unit changed about the plan above
@@ -219,6 +219,16 @@ itself, which is contract C2 and is checked by a test.
   relation id, or `SELECT *` came back one column short.
 * **Unit 3** needed no executor and one field: **an unreferenced CTE is still analysed**, which
   inlining alone never does.
+* **Unit 5** moved `activerecord_surface.rs`'s counter by **nothing**, and the number is asserted
+  exactly so that saying so is unavoidable. Three of the thirty-six boot statements carry a
+  subquery and none reaches it: each stops on a catalog function first (`pg_get_indexdef`,
+  `pg_get_constraintdef`, a `::text` cast) and needs `array_agg` or `ARRAY(SELECT …)` besides. What
+  it did instead is measure their *shape* — a correlated scalar subquery whose own `FROM` is a
+  derived table joined to a table — with the array pieces written as ones this node has, so the day
+  the catalog unit lands the subquery half is already known to work. It also found a real bug doing
+  it: a derived table inside a subquery was being planned with **no** enclosing scope, so it could
+  not name the outer query's columns. A `FROM` item may not see the ones *beside* it (that is
+  `LATERAL`) and may see the ones *outside* its statement, and those are two different things.
 * **Unit 4** made an outer reference carry **how far out** it reaches, because a three-level
   `EXISTS` chain can name two rows outside itself; and it made a statement with a correlated
   subquery in it refuse to swap its join, because a swap moves the columns an `Expr::Outer` is a

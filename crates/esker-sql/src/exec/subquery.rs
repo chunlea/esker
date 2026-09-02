@@ -81,7 +81,7 @@ pub(super) fn plan_subqueries(
         .flatten()
         .chain(select.joins.iter_mut().map(|join| &mut join.table))
     {
-        plan_derived(entry, tenant, txn, tables)?;
+        plan_derived(entry, tenant, txn, tables, outer)?;
     }
     let table = match &select.from {
         Some(from) => Some(relation_of(from, tables)?),
@@ -116,7 +116,7 @@ pub(super) fn plan_subqueries(
     // would never look at one. The plan each produces here is thrown away; what is kept is the
     // error it would have raised.
     for cte in &mut select.ctes {
-        plan_derived(cte, tenant, txn, tables)?;
+        plan_derived(cte, tenant, txn, tables, outer)?;
     }
     fold_counts(select, txn, tenant)
 }
@@ -133,13 +133,19 @@ fn plan_derived(
     tenant: u64,
     txn: &dyn Txn,
     tables: &dyn Tables,
+    outer: Option<&crate::exec::query::Scope<'_>>,
 ) -> Result<()> {
     let name = entry.referred_as().to_owned();
     let Some(derived) = entry.derived.as_mut() else {
         return Ok(());
     };
-    plan_subqueries(&mut derived.select, tenant, txn, tables, None)?;
-    let planned = plan_select_of(&derived.select, tenant, tables, None)?;
+    // `outer` is the scope **outside the statement this entry belongs to**, and never that
+    // statement's own: a derived table may name a column of an enclosing query -- measured, a
+    // correlated scalar subquery whose `FROM` is a derived table that names the outermost table --
+    // and may **not** name the `FROM` items beside it, which is what `LATERAL` is for and what
+    // `42P01 missing FROM-clause entry` says when it is missing.
+    plan_subqueries(&mut derived.select, tenant, txn, tables, outer)?;
+    let planned = plan_select_of(&derived.select, tenant, tables, outer)?;
 
     // A column alias list **may be shorter** than the target list — `AS t(a)` over two columns
     // renames the first and leaves the second alone, measured — and only a longer one is an error.
