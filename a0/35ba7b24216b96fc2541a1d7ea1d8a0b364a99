@@ -1,0 +1,37 @@
+crates/esker-proto/src/lib.rs
+  s_e2fd0c54b9d574::t_a1fc80c2152156 48
+crates/esker-proto/src/messages.rs
+  s_e2fd0c54b9d574::t_e366dc79bbe2de 120-124,144-151,162,194,225,280,343-348,905-910,1040,1052,1093,1110,1167-1168,1264,1309,1336-1338,1534
+crates/esker-proto/src/schema.rs
+  s_e2fd0c54b9d574::t_522093a5edeff4 1-186
+crates/esker-proto/tests/golden/messages.hex
+  s_e2fd0c54b9d574::t_e2fffa7cf8ffe1 160-162
+crates/esker-proto/tests/messages.rs
+  s_e2fd0c54b9d574::t_0ff202609ae54d 17,314,787,956-989
+crates/esker-store/src/columnar/region.rs
+  s_e2fd0c54b9d574::t_5e1cd39baaf536 82-94,240-289,321-327,419-434
+crates/esker-store/src/server.rs
+  s_e2fd0c54b9d574::t_ae8c022354ab4b 2203-2341,2396-2402,3318-3327
+crates/esker-store/tests/schema_fetch.rs
+  s_e2fd0c54b9d574::t_2b72d93a38efdd 1-323
+docs/adr/0037-a-columnar-learner-fetches-the-schema-it-cannot-read.md
+  s_e2fd0c54b9d574::t_5abd753da609d1 1-108
+docs/plans/debt-c3.md
+  s_e2fd0c54b9d574::t_05ed180997d152 484-557
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a035ba7b24216b96fc2541a1d7ea1d8a0b364a99",
+  "prompts": {},
+  "sessions": {
+    "s_e2fd0c54b9d574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "671f3143-5435-4676-97d9-490a56835160",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
