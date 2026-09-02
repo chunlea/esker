@@ -713,6 +713,18 @@ pub enum SqlError {
     #[error("value too long for type {0}")]
     StringDataRightTruncation(String),
 
+    /// A `float(p)` whose precision is outside `1..=53`: `22023`.
+    ///
+    /// Its own message, not [`SqlError::TypeLengthTooSmall`]'s: PostgreSQL says "precision" and
+    /// "bit"/"bits" here where it says "length" for a string, and both were measured — `float(0)`
+    /// is `must be at least 1 bit` and `float(54)` is `must be less than 54 bits`.
+    #[error("precision for type float must be at least 1 bit")]
+    FloatPrecisionTooSmall,
+
+    /// The other end of the same range.
+    #[error("precision for type float must be less than 54 bits")]
+    FloatPrecisionTooLarge,
+
     /// A declared length below PostgreSQL's floor of one: `22023`.
     ///
     /// Spelled `varchar` and `char`, which is the short form — the opposite of
@@ -945,6 +957,8 @@ impl SqlError {
             // Captured, both ends: `varchar(0)` and `varchar(10485761)`.
             SqlError::TypeLengthTooSmall(_)
             | SqlError::TypeLengthTooLarge(..)
+            | SqlError::FloatPrecisionTooSmall
+            | SqlError::FloatPrecisionTooLarge
             | SqlError::InvalidSnapshotIdentifier(_)
             | SqlError::InvalidParameterValue { .. }
             | SqlError::NonBooleanParameter(_)

@@ -2729,6 +2729,22 @@ fn lower_plain_type(data_type: &DataType) -> Result<ColumnType> {
         DataType::Float8 | DataType::DoublePrecision | DataType::Double(ExactNumberInfo::None) => {
             ColumnType::Double
         }
+        // **`FLOAT` is a spelling, not a type.** Bare it is `double precision`; with a precision
+        // in bits it is whichever IEEE width holds that many — `float(1)` through `float(24)` are
+        // `real` and `float(25)` through `float(53)` are `double precision`. Measured, including
+        // both ends of the range, which have their own message: `precision for type float must be
+        // at least 1 bit`, not the `length for type …` a string gets.
+        DataType::Float(precision) => match precision {
+            ExactNumberInfo::None => ColumnType::Double,
+            ExactNumberInfo::Precision(0) => return Err(SqlError::FloatPrecisionTooSmall),
+            ExactNumberInfo::Precision(bits) if *bits <= 24 => ColumnType::Real,
+            ExactNumberInfo::Precision(bits) if *bits <= 53 => ColumnType::Double,
+            ExactNumberInfo::Precision(_) => return Err(SqlError::FloatPrecisionTooLarge),
+            // `float(10, 2)` is a syntax a real server does not take for this type.
+            ExactNumberInfo::PrecisionAndScale(..) => {
+                return Err(SqlError::unsupported(format!("the type {data_type}")));
+            }
+        },
         DataType::Timestamp(None, TimezoneInfo::Tz | TimezoneInfo::WithTimeZone) => {
             ColumnType::TimestampTz
         }
