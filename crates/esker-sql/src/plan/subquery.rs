@@ -4,7 +4,7 @@
 //! `EXISTS`, `IN (SELECT …)`, and `ANY`/`ALL` with a subquery on the right — and they are one
 //! type with one field that decides everything: **how many times the sub-plan runs**. Nothing in
 //! it refers to the row outside it, so it runs once, before the cursor opens
-//! ([`crate::exec::subquery::resolve`]); something does, and it runs per outer row.
+//! (`crate::exec::subquery::resolve`); something does, and it runs per outer row.
 //!
 //! # `IN` is `= ANY`, and `NOT IN` is `<> ALL`
 //!
@@ -132,7 +132,7 @@ pub struct SubqueryExpr {
     /// The sub-select as written, which is what a nested subquery inside it is planned from.
     pub select: Box<Select>,
     /// The plan built from [`SubqueryExpr::select`], filled by
-    /// [`crate::exec::subquery::plan_subqueries`] before the outer plan is built — because the
+    /// `crate::exec::subquery::plan_subqueries` before the outer plan is built — because the
     /// outer statement cannot be *typed* until this one has been.
     pub plan: Option<Box<Node>>,
     /// The name and type of the subquery's single output column, filled at the same time.
@@ -144,7 +144,7 @@ pub struct SubqueryExpr {
     ///
     /// The one field that decides how many times this runs. `false` and it runs once, before the
     /// cursor opens; `true` and it runs per outer row, with the outer values substituted in first.
-    /// Filled by [`crate::exec::subquery::plan_subqueries`] from the plan it built — a fact about
+    /// Filled by `crate::exec::subquery::plan_subqueries` from the plan it built — a fact about
     /// the plan rather than a reading of the statement, so a reference that resolved to the inner
     /// scope after all does not count (`SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE
     /// b.a_id = id)` is **not** correlated: `id` is `b`'s).
@@ -152,7 +152,7 @@ pub struct SubqueryExpr {
     /// The subquery's answer: its single column, one entry per row — or, for an `EXISTS`, one
     /// entry per row of any value at all, because only the length is read.
     ///
-    /// Filled by [`crate::exec::subquery::resolve`] before the cursor opens when the subquery is
+    /// Filled by `crate::exec::subquery::resolve` before the cursor opens when the subquery is
     /// uncorrelated, and per outer row when it is not. `None` at the row evaluator is a bug in
     /// this crate and says so rather than answering "no rows" — which for a scalar subquery is a
     /// **NULL**, and a NULL looks like an answer.
@@ -200,7 +200,7 @@ impl SubqueryExpr {
     /// answer a question about it.
     ///
     /// `text` is the fallback for a scalar whose column has not been resolved yet, which is the
-    /// same thing [`crate::exec::query::expr_type`] does for an untyped literal — the caller that
+    /// same thing `crate::exec::query::expr_type` does for an untyped literal — the caller that
     /// cares has already failed with a better message.
     #[must_use]
     pub fn value_type(&self) -> ColumnType {
@@ -259,7 +259,7 @@ pub struct Derived {
     /// columns specified` for a CTE and `table "t" has …` for a `FROM (SELECT …)`. Same SQLSTATE,
     /// two sentences, measured — and a client that greps the text sees two.
     pub cte: bool,
-    /// The plan its rows come from, filled by [`crate::exec::subquery::plan_subqueries`].
+    /// The plan its rows come from, filled by `crate::exec::subquery::plan_subqueries`.
     pub plan: Option<Box<Node>>,
     /// The relation it looks like from above: one column per output column of the sub-select,
     /// under [`crate::catalog::DERIVED_TABLE_ID`]. Filled at the same time.

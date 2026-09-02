@@ -790,6 +790,16 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
   large dependency exception, `sqlparser`, PostgreSQL dialect, by ADR) → catalog in `'m'` key space →
   planner/executor over `esker-client` transactions, using the `'t'` key layout from §3. Postgres
   compatibility is a surface, not a storage format.
+  **A subquery is a plan node** ([ADR 0042](adr/0042-a-subquery-is-a-plan-node-run-once-or-per-row.md)):
+  one that names nothing outside itself runs **once**, before the cursor opens — the same pass shape
+  that fills a `Node::Columnar` from its fragments — and one that names an outer column runs **once per
+  outer row**, with the outer values substituted into a copy of the sub-plan first, so what a cursor
+  opens has no correlated reference left in it. `FROM (SELECT …) AS t` becomes a synthetic `TableDef`
+  under a reserved relation id, so name resolution, `SELECT *`, `EXPLAIN` and the join machinery are
+  unchanged by it; a non-recursive CTE is **inlined at each reference** and is therefore one of those,
+  which costs no executor at all and no observable difference — `MATERIALIZED` and `NOT MATERIALIZED`
+  return the same rows, measured. Every one of them is bounded where `Sort` is (`53400`), and none of
+  them routes to the columnar engine.
 - **Scale-to-zero:** because SQL nodes are stateless and SSTs can live in object storage, an idle tenant
   costs only its Raft metadata; PD may later hibernate cold regions (ADR).
 - **Multi-tenancy:** tenant id is the first field of every SQL key; RawKV/TxnKV users may adopt the same

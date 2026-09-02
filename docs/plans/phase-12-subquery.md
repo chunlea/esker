@@ -1,6 +1,6 @@
 # Phase 12 — subqueries and CTEs: a query whose FROM is a query
 
-Status: **units 0–4 landed**; unit 5 (the `ActiveRecord` shapes) and unit 6 (the ADR) remain. §6 records what each unit cost and what it changed about the plan.
+Status: **closed** — units 0–6 landed. The decisions are [ADR 0042](../adr/0042-a-subquery-is-a-plan-node-run-once-or-per-row.md); §6 records what each unit cost and what it changed about the plan.
 
 `docs/plans/phase-9-rails.md` §5 left one sentence that this phase exists to delete:
 
@@ -151,9 +151,12 @@ against a constant. That is a performance shortfall and it is named here rather 
 Every statement in the harness's triage that names a subquery or a CTE, run with its expected rows;
 the `tests/lowering.rs` gap entries that start working deleted, which is a commit; slt goldens.
 
-### Unit 6 — the ADR, and DESIGN.md
+### Unit 6 — the ADR, and DESIGN.md ✅
 
-The executor shape above, the inlining decision, and what is deferred.
+[ADR 0042](../adr/0042-a-subquery-is-a-plan-node-run-once-or-per-row.md): the executor shape, the
+synthetic relation a derived table is, the inlining decision and its cost, the level an outer
+reference carries, the five things the captures decided that reading would not have, and the list
+of what is deferred. DESIGN.md §13's `esker-sql` paragraph carries the two-sentence version.
 
 ## 4. What this phase will NOT do
 
@@ -205,7 +208,7 @@ itself, which is contract C2 and is checked by a test.
 | 3 — CTEs | ✅ | `ee2fcc3`; 51-statement capture, no executor at all |
 | 4 — correlated | ✅ | 34-statement capture; `Expr::Outer`, a scope chain, a nested loop |
 | 5 — the `ActiveRecord` shapes | ✅ | 12-statement capture, an slt golden, **the counter moved by 0** |
-| 6 — ADR and DESIGN.md | | |
+| 6 — ADR and DESIGN.md | ✅ | [ADR 0042](../adr/0042-a-subquery-is-a-plan-node-run-once-or-per-row.md), DESIGN.md §13 |
 
 ### What each unit changed about the plan above
 

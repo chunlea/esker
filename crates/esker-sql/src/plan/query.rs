@@ -387,7 +387,7 @@ pub enum Node {
     /// A **derived table**: its input's rows, under the name and column names the `FROM` entry
     /// gave them.
     ///
-    /// It computes nothing — [`crate::exec::cursor`] opens the input and hands its rows straight
+    /// It computes nothing — `crate::exec::cursor` opens the input and hands its rows straight
     /// through — and it exists for `EXPLAIN`, which is not a small reason. The plan text threads
     /// **one** table name and **one** list of column names down the whole tree, so without a node
     /// to switch them at, a scan of `dt_a` inside `FROM (SELECT … FROM dt_a) AS t` prints
