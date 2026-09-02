@@ -504,6 +504,7 @@ fn placeholder(ty: ColumnType) -> Datum {
     match ty {
         ColumnType::Int8 => Datum::Int8(0),
         ColumnType::Time => Datum::Time(0),
+        ColumnType::Uuid => Datum::Uuid([0; 16]),
         ColumnType::Int4 => Datum::Int4(0),
         ColumnType::Int2 => Datum::Int2(0),
         ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => Datum::Text(String::new()),

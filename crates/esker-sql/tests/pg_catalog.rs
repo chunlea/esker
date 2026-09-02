@@ -218,6 +218,9 @@ fn activerecord_s_four_type_map_queries_answer() {
             // `numeric` is in this list of forty too, and its `typinput` is PostgreSQL's own
             // `numeric_in` — derived from `ColumnType::ALL` like every row above it.
             vec!["1700", "numeric", "0", ",", "numeric_in", "\\N", "b", "0"],
+            // `uuid` is the tenth type in ADR 0033's tier 2 and the ninth of the twenty
+            // refusals in `postgresql_specific_schema.rb`.
+            vec!["2950", "uuid", "0", ",", "uuid_in", "\\N", "b", "0"],
             vec!["3802", "jsonb", "0", ",", "jsonb_in", "\\N", "b", "0"],
         ]
     );
@@ -306,18 +309,24 @@ fn a_catalog_relation_is_read_only() {
 fn a_star_expands_to_every_column_of_the_view() {
     let mut node = parity::Node::new(&[]);
 
-    // The `0` before the last is `typcollation`, which phase 13 added **last** for exactly this
+    // The `0` before `11` is `typcollation`, which phase 13 added **last** for exactly this
     // reason: `SELECT *` expands in the declared order, so a column added anywhere else moves
-    // every one after it and every client reading by position reads the wrong value. The `11` now
-    // last is `typnamespace`, added the same way for boot statement 26 — this node has one
-    // namespace and every type reports it, as every relation's `relnamespace` does.
+    // every one after it and every client reading by position reads the wrong value. `11` is
+    // `typnamespace`, added the same way for boot statement 26 — this node has one namespace and
+    // every type reports it, as every relation's `relnamespace` does. The `8` and `N` at the end
+    // are `typlen` and `typcategory`, appended last again for the uuid unit, which is the third
+    // capture to ask for them.
     assert_eq!(
         node.rows("SELECT * FROM pg_type WHERE typname = 'int8'"),
-        vec![vec!["20", "int8", "0", ",", "int8in", "b", "0", "0", "11"]]
+        vec![vec![
+            "20", "int8", "0", ",", "int8in", "b", "0", "0", "11", "8", "N"
+        ]]
     );
     assert_eq!(
         node.rows("SELECT t.* FROM pg_type AS t WHERE t.oid = 20"),
-        vec![vec!["20", "int8", "0", ",", "int8in", "b", "0", "0", "11"]]
+        vec![vec![
+            "20", "int8", "0", ",", "int8in", "b", "0", "0", "11", "8", "N"
+        ]]
     );
     assert_eq!(
         node.rows("SELECT * FROM pg_type").len(),

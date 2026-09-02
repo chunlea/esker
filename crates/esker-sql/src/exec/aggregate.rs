@@ -162,7 +162,14 @@ impl Aggregation {
                 // A third and fourth totally-ordered type with no aggregate over it, after
                 // `bool`: `min(jsonb)` is `42883 function min(jsonb) does not exist` on a real
                 // server even though `<` works and `ORDER BY` works. Refusing is being right.
-                ColumnType::Bool | ColumnType::Json | ColumnType::Jsonb => undefined(),
+                // And a **fifth**: `min(uuid)` is `42883` on a real server too, where `<`,
+                // `>`, `uuid_cmp` and `ORDER BY` all work. Checked against `pg_proc` in the
+                // capture rather than inferred — no `min` or `max` takes 2950. This is the
+                // finding ADR 0031 wrote down as a rule after `bool`: **the aggregate set is per
+                // type and cannot be derived from whether the type is ordered.**
+                ColumnType::Bool | ColumnType::Json | ColumnType::Jsonb | ColumnType::Uuid => {
+                    undefined()
+                }
                 // Measured: `min(varchar)` and `max(varchar)` come back as **`text`** on a real
                 // server, and `min(character(n))` comes back as **`bpchar`**. The string family
                 // does not decay uniformly — `bpchar` has a `min` of its own where `varchar`

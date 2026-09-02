@@ -1770,9 +1770,12 @@ fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // 19beta1 — measured, because putting it in family 4 by analogy would answer where a
             // real server raises, which is ADR 0031's worst class.
             ColumnType::Time => 6,
+            // Its own family too: `uuid = text` and `uuid = integer` are both `42883` on a real
+            // server, and its only comparisons are with another uuid.
+            ColumnType::Uuid => 7,
             // Unreachable: returned above, and kept as an arm rather than a `_` so that the next
-            // type added here is a compile error rather than a silent family 7.
-            ColumnType::Json => 7,
+            // type added here is a compile error rather than a silent family 8.
+            ColumnType::Json => 8,
         }
     }
     if matches!(left, ColumnType::Json) || matches!(right, ColumnType::Json) {

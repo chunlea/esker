@@ -73,6 +73,7 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Jsonb => 14,
         ColumnType::Date => 15,
         ColumnType::Time => 17,
+        ColumnType::Uuid => 18,
         ColumnType::Numeric => 16,
     }
 }
@@ -95,6 +96,7 @@ fn type_of(tag: u8) -> Result<ColumnType, RowError> {
         14 => ColumnType::Jsonb,
         15 => ColumnType::Date,
         17 => ColumnType::Time,
+        18 => ColumnType::Uuid,
         16 => ColumnType::Numeric,
         other => {
             return Err(RowError::Corrupt(format!(

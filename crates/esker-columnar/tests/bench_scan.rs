@@ -76,6 +76,9 @@ fn encode_row(values: &[Value]) -> Vec<u8> {
             // byte for byte; a guessed encoding here would measure the wrong thing silently.
             // Adding a numeric column means writing the kind-byte/zigzag-scale/digits pair.
             Value::Numeric(_) => unimplemented!("the bench corpus has no numeric column"),
+            // A uuid is sixteen fixed bytes with no length before them; the corpus has no
+            // uuid column, and a guessed encoding here would measure the wrong thing.
+            Value::Uuid(_) => unimplemented!("the corpus has no uuid column"),
             Value::Bytea(v) => {
                 varint::put_u64(v.len() as u64, &mut out);
                 out.extend_from_slice(v);
@@ -111,6 +114,7 @@ fn decode_row(types: &[ColumnType], bytes: &[u8]) -> Vec<Value> {
                 at += 8;
                 value
             }
+            ColumnType::Uuid => unimplemented!("the bench corpus has no uuid column"),
             ColumnType::Time => {
                 let value = Value::Time(i64::from_le_bytes(fixed(at)));
                 at += 8;

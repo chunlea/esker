@@ -127,6 +127,8 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
         // so the narrower width costs no compatibility and is what `pg_type.typlen` says it is.
         Datum::Int4(v) | Datum::Date(v) => out.extend_from_slice(&v.to_le_bytes()),
         Datum::Int2(v) => out.extend_from_slice(&v.to_le_bytes()),
+        // Sixteen bytes, fixed, so no length precedes them.
+        Datum::Uuid(v) => out.extend_from_slice(v),
         Datum::Bool(v) => out.push(u8::from(*v)),
         Datum::Double(v) => out.extend_from_slice(&v.to_le_bytes()),
         Datum::Real(v) => out.extend_from_slice(&v.to_le_bytes()),
@@ -302,6 +304,10 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
             let (head, rest) = bytes.split_first_chunk::<8>().ok_or_else(truncated)?;
             (Datum::Time(i64::from_le_bytes(*head)), rest)
         }
+        ColumnType::Uuid => {
+            let (head, rest) = bytes.split_first_chunk::<16>().ok_or_else(truncated)?;
+            (Datum::Uuid(*head), rest)
+        }
         ColumnType::Int2 => {
             let (head, rest) = bytes.split_first_chunk::<2>().ok_or_else(truncated)?;
             (Datum::Int2(i16::from_le_bytes(*head)), rest)
@@ -463,6 +469,9 @@ fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
         // second encoding would be a second thing to get wrong for no gain — a key is not a row,
         // and nothing reads its width back except the decoder beside it, which knows the type.
         Datum::Int4(v) | Datum::Date(v) => codec::encode_i64(i64::from(*v), out),
+        // **The bytes are the key.** A uuid's order is its bytes' order — `uuid_cmp` is a
+        // `memcmp` — and they are fixed width, so nothing has to be escaped or terminated.
+        Datum::Uuid(v) => out.extend_from_slice(v),
         Datum::Int2(v) => codec::encode_i64(i64::from(*v), out),
         // Four bytes, its own width, in the order `sort_bits_of_f32` puts floats.
         Datum::Real(v) => out.extend_from_slice(&crate::value::sort_bits_of_f32(*v).to_be_bytes()),
@@ -598,6 +607,12 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         ColumnType::Time => {
             let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
             (Datum::Time(value), rest)
+        }
+        ColumnType::Uuid => {
+            let (head, rest) = bytes
+                .split_first_chunk::<16>()
+                .ok_or_else(|| corrupt("an index key with a short uuid"))?;
+            (Datum::Uuid(*head), rest)
         }
         ColumnType::Int2 => {
             let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
@@ -1195,6 +1210,7 @@ mod tests {
             ColumnType::Date => any::<i32>().prop_map(Datum::Date).boxed(),
             // The whole closed range, both ends included, because `24:00:00` is a value.
             ColumnType::Time => (0i64..=86_400_000_000).prop_map(Datum::Time).boxed(),
+            ColumnType::Uuid => any::<[u8; 16]>().prop_map(Datum::Uuid).boxed(),
             // Weighted towards the shapes the encoding has cases for: the three specials, zero,
             // and a finite value at a scale on either side of nothing.
             ColumnType::Numeric => prop_oneof![

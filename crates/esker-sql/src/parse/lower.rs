@@ -2417,6 +2417,18 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
         // `2.5::int` is `3` and `0.5::int` is `1`. One rule for the cast, the assignment and the
         // `round` function, and it is not the parser's: reading `1.5` with `int4in` is
         // `22P02 invalid input syntax`, which is what this arm exists to not do.
+        // **`uuid::bytea` is the sixteen bytes, not the text's bytes.** Through the ordinary
+        // text path this became the hex of `a0eebc99-…`'s ASCII, which is a different value of a
+        // different length. The pair has a real conversion and it is the identity on the bytes.
+        if source_type(expr)? == Some(ColumnType::Uuid)
+            && lower_type(data_type).ok().map(|(ty, _)| ty) == Some(ColumnType::Bytea)
+            && let Some(text) = cast_literal_text(expr)?
+        {
+            let bytes = value::uuid::from_text(&text)?;
+            return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                Datum::Bytea(bytes.to_vec()),
+            ))));
+        }
         if source_type(expr)? == Some(ColumnType::Numeric)
             && let Some(to) = lower_type(data_type).ok().map(|(ty, _)| ty)
             && matches!(to, ColumnType::Int8 | ColumnType::Int4 | ColumnType::Int2)
@@ -2665,6 +2677,17 @@ fn refused_cast(expr: &Expr, data_type: &DataType) -> Result<Option<SqlError>> {
             from: from.name(),
             to: ColumnType::Date.name(),
         }),
+        // **A uuid casts to a string and to `bytea`, and to nothing else.** Measured: `::int` and
+        // `::json` are `42846 cannot cast type uuid to …`, where `::bytea` is the sixteen raw
+        // bytes. The value is bytes and never a number.
+        (Some(ColumnType::Uuid), Some(to))
+            if !stringy(to) && to != ColumnType::Bytea && to != ColumnType::Uuid =>
+        {
+            Some(SqlError::CannotCast {
+                from: ColumnType::Uuid.name(),
+                to: to.name(),
+            })
+        }
         (Some(ColumnType::Time), Some(to)) if !stringy(to) && to != ColumnType::Time => {
             Some(SqlError::CannotCast {
                 from: ColumnType::Time.name(),
@@ -3559,6 +3582,7 @@ fn lower_plain_type(data_type: &DataType) -> Result<ColumnType> {
         // server and `CREATE TABLE t (d date(3))` is a syntax error there, so the number has
         // nowhere to come from and nothing here produces one.
         DataType::Date => ColumnType::Date,
+        DataType::Uuid => ColumnType::Uuid,
         // `time` with no precision: six digits, the default and the maximum, as `timestamp` has
         // it. `time(p)` is the caller's, and carries a typmod.
         DataType::Time(None, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {

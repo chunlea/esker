@@ -85,6 +85,8 @@ pub enum ColumnType {
     /// PostgreSQL's `time` without time zone: microseconds since midnight, in a **closed** range
     /// that includes `24:00:00`.
     Time,
+    /// PostgreSQL's `uuid`: sixteen fixed bytes, ordered by those bytes.
+    Uuid,
     /// PostgreSQL's `numeric`: an arbitrary-precision decimal, carried as its **text**.
     ///
     /// Variable-length like a `Text`, and the text is lossless for this type — the scale is in
@@ -104,7 +106,7 @@ pub enum ColumnType {
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 17] = [
+    pub const ALL: [ColumnType; 18] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -121,6 +123,7 @@ impl ColumnType {
         ColumnType::Jsonb,
         ColumnType::Date,
         ColumnType::Time,
+        ColumnType::Uuid,
         ColumnType::Numeric,
     ];
 
@@ -145,6 +148,7 @@ impl ColumnType {
             ColumnType::Jsonb => 14,
             ColumnType::Date => 15,
             ColumnType::Time => 17,
+            ColumnType::Uuid => 18,
             ColumnType::Numeric => 16,
         }
     }
@@ -168,6 +172,7 @@ impl ColumnType {
             14 => ColumnType::Jsonb,
             15 => ColumnType::Date,
             17 => ColumnType::Time,
+            18 => ColumnType::Uuid,
             16 => ColumnType::Numeric,
             other => {
                 return Err(Error::corruption(
@@ -198,6 +203,7 @@ impl ColumnType {
             ColumnType::Jsonb => "jsonb",
             ColumnType::Date => "date",
             ColumnType::Time => "time without time zone",
+            ColumnType::Uuid => "uuid",
             ColumnType::Numeric => "numeric",
         }
     }
@@ -246,6 +252,8 @@ pub enum Value {
     Date(i32),
     /// A [`ColumnType::Time`], microseconds since midnight.
     Time(i64),
+    /// A [`ColumnType::Uuid`], as its sixteen bytes.
+    Uuid([u8; 16]),
     /// A [`ColumnType::Numeric`], as its text.
     Numeric(String),
 }
@@ -277,6 +285,7 @@ impl Value {
             Value::Real(_) => ty == ColumnType::Real,
             Value::Date(_) => ty == ColumnType::Date,
             Value::Time(_) => ty == ColumnType::Time,
+            Value::Uuid(_) => ty == ColumnType::Uuid,
             Value::Numeric(_) => ty == ColumnType::Numeric,
         }
     }
@@ -304,6 +313,7 @@ impl Value {
             Value::Real(_) => ColumnType::Real,
             Value::Date(_) => ColumnType::Date,
             Value::Time(_) => ColumnType::Time,
+            Value::Uuid(_) => ColumnType::Uuid,
             Value::Numeric(_) => ColumnType::Numeric,
         })
     }
@@ -323,6 +333,8 @@ impl Value {
             Value::Double(v) => ValueRef::Double(*v),
             Value::Real(v) => ValueRef::Real(*v),
             Value::Text(v) | Value::Numeric(v) => ValueRef::Bytes(v.as_bytes()),
+            // Sixteen bytes, carried as bytes: their order is the type's order.
+            Value::Uuid(v) => ValueRef::Bytes(&v[..]),
             Value::Bytea(v) => ValueRef::Bytes(v),
         }
     }
@@ -447,6 +459,12 @@ impl ValueRef<'_> {
                 std::str::from_utf8(v)
                     .map_err(|_| Error::corruption("column", "a numeric column holds non-UTF-8"))?
                     .to_owned(),
+            ),
+            // Sixteen bytes back into sixteen bytes. A run holding any other length for this
+            // type is corruption, not a value: every uuid is exactly this wide.
+            (ValueRef::Bytes(v), ColumnType::Uuid) => Value::Uuid(
+                <[u8; 16]>::try_from(v)
+                    .map_err(|_| Error::corruption("column", "a uuid that is not sixteen bytes"))?,
             ),
             (ValueRef::Bytes(v), ColumnType::Bytea) => Value::Bytea(v.to_vec()),
             (
@@ -605,6 +623,7 @@ mod tests {
         assert_eq!(ColumnType::Bpchar.tag(), 12);
         assert_eq!(ColumnType::Date.tag(), 15);
         assert_eq!(ColumnType::Time.tag(), 17);
+        assert_eq!(ColumnType::Uuid.tag(), 18);
 
         for ty in ColumnType::ALL {
             assert_eq!(ColumnType::from_tag(ty.tag()).unwrap(), ty);

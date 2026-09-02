@@ -95,6 +95,7 @@ fn column_type(name: &str) -> ColumnType {
         // The top of the range is in the fixture because it is a *value*: `24:00:00` sorts above
         // `23:59:59.999999` rather than being the bound a range scan stops at.
         "time" => ColumnType::Time,
+        "uuid" => ColumnType::Uuid,
         "bool" => ColumnType::Bool,
         "bytea" => ColumnType::Bytea,
         "timestamptz" => ColumnType::TimestampTz,

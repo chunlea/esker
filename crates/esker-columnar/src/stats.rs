@@ -129,6 +129,7 @@ impl Bound {
             | ColumnType::Json
             | ColumnType::Jsonb
             | ColumnType::Numeric
+            | ColumnType::Uuid
             | ColumnType::Bytea => Value::Bytea(self.bytes.clone()),
         })
     }
@@ -286,6 +287,7 @@ impl ColumnStats {
             // backwards as numbers. Nothing prunes yet; the first pruner that does must either
             // decode both bounds and compare with `numeric`'s own ordering or skip this type.
             | ColumnType::Numeric
+            | ColumnType::Uuid
             | ColumnType::Bytea => None,
         };
         [self.min.as_ref(), self.max.as_ref()]
@@ -812,6 +814,11 @@ mod tests {
             | ColumnType::Jsonb => prop::collection::vec(any::<char>(), 0..90)
                 .prop_map(|chars| Value::Text(chars.into_iter().collect()))
                 .boxed(),
+            ColumnType::Uuid => prop::collection::vec(any::<u8>(), 16..=16)
+                .prop_map(|bytes| {
+                    Value::Uuid(<[u8; 16]>::try_from(bytes.as_slice()).unwrap_or([0; 16]))
+                })
+                .boxed(),
             ColumnType::Bytea => prop::collection::vec(any::<u8>(), 0..90)
                 .prop_map(Value::Bytea)
                 .boxed(),
@@ -908,6 +915,9 @@ mod tests {
                 Value::Bytea(v) => {
                     min.bytes.as_slice() <= v.as_slice() && v.as_slice() <= max.bytes.as_slice()
                 }
+                // Sixteen bytes, bounded by bytes — and here the byte order **is** the type's
+                // order, unlike the `numeric` arm above.
+                Value::Uuid(v) => min.bytes.as_slice() <= &v[..] && &v[..] <= max.bytes.as_slice(),
                 Value::Null => true,
             };
             if !inside {
