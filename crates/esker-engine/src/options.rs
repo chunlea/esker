@@ -276,6 +276,13 @@ pub struct Options {
     pub group_commit_max_batches: usize,
     /// Shared by every column family that does not bring its own.
     pub block_cache: Option<Arc<dyn BlockCache>>,
+    /// How many SST readers are kept open at once, across every column family.
+    ///
+    /// An open reader is a file descriptor plus a resident index and filter, so this bounds two
+    /// different resources at once. It is a knob rather than a constant because the interesting
+    /// question about a cache is what it does when the **working set does not fit**, and that
+    /// question has no answer on a database with fewer files than the default of 256.
+    pub max_open_tables: usize,
     /// Threads in the compaction pool.
     pub compaction_threads: usize,
     /// Defaults for column families this call creates.
@@ -311,6 +318,7 @@ impl Default for Options {
             group_commit_max_bytes: defaults::GROUP_COMMIT_MAX_BYTES,
             group_commit_max_batches: defaults::GROUP_COMMIT_MAX_BATCHES,
             block_cache: None,
+            max_open_tables: defaults::MAX_OPEN_TABLES,
             compaction_threads: defaults::COMPACTION_THREADS,
             cf_options: CfOptions::default(),
             cf_overrides: std::collections::BTreeMap::new(),
@@ -454,6 +462,10 @@ pub mod defaults {
 
     /// Block cache shards. More shards, less contention, coarser eviction.
     pub const BLOCK_CACHE_SHARDS: usize = 8;
+
+    /// SST readers kept open at once. Small enough to bound file descriptors, large enough that
+    /// a hot working set is not reopened on every lookup.
+    pub const MAX_OPEN_TABLES: usize = 256;
 
     /// Threads in the compaction pool.
     pub const COMPACTION_THREADS: usize = 2;

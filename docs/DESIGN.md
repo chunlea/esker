@@ -248,6 +248,19 @@ Iterators: a merge iterator over memtables and per-level two-level iterators; sn
 seqno; `prefix_same_as_start` short-circuits when the prefix changes. Block cache: sharded LRU
 (8 shards, 256 MiB *default*), keyed by `(file_number, block_offset)`.
 
+**L0 is the exception to "per-level", and it has to be.** A level below L0 partitions the key
+space, so a scan of it is inside one file at a time and the level is one cursor that opens the file
+it has reached (`db/level_iter.rs`). L0's files overlap, so any of them can hold the next key and
+all of them are cursors at once. That is also why the range-tombstone set is collected by walking
+L0 alone: §4.7 discharges a tombstone rather than writing one below L0, so no deeper file can
+carry one.
+
+Open SST readers are a second cache in front of the block cache — a reader holds a file descriptor
+and a resident index and filter — bounded by `Options::max_open_tables` (256 *default*) and
+evicted **least-recently-used**. The rule matters more than it looks: file numbers rise
+monotonically, so evicting the lowest discards the file that has survived the most compactions,
+which is the deepest and most-read one in the tree.
+
 ## 5. Consensus (`esker-raft`)
 
 A faithful implementation of Raft (Ongaro's dissertation) as a pure state machine, modeled on
@@ -792,6 +805,7 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
 | L1 base / multiplier / levels | 64 MiB / 10 / 7 |
 | compaction output file size | 8 MiB |
 | block cache | 256 MiB, 8 shards |
+| open SST readers | 256, evicted least-recently-used |
 | SST tier local budget | 4 GiB (`TierOptions::local_budget`); `None` never evicts. Only *uploaded* files are ever candidates |
 | SST tier upload batch | 8 distinct files per maintenance pass — which is also the retry backoff (ADR 0024) |
 | SST tier idle tick | 5 s; the uploader also wakes whenever an SST becomes durable |

@@ -32,10 +32,6 @@ use crate::version::{VersionEdit, VersionSet};
 use crate::wal::{LogReader, LogWriter, ReadOutcome};
 
 use super::table_cache::TableCache;
-
-/// How many SSTs are kept open at once. Small enough to bound file descriptors, large enough
-/// that a hot working set is not reopened on every lookup.
-const MAX_OPEN_TABLES: usize = 256;
 use super::{ColumnFamily, CompactState, Db, DbInner, FlushState, SnapshotList, Wal, WriteQueue};
 
 /// Column families a new database is created with, unless the caller names others.
@@ -123,7 +119,7 @@ impl Db {
         let table_cache = Arc::new(TableCache::new(
             Arc::clone(&fs),
             dir.clone(),
-            MAX_OPEN_TABLES,
+            options.max_open_tables,
             options.block_cache.clone(),
         ));
         let inner = Arc::new(DbInner {
