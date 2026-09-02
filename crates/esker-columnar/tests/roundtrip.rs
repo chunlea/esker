@@ -89,6 +89,7 @@ fn value_of(ty: ColumnType) -> impl Strategy<Value = Value> {
     let present = match ty {
         ColumnType::Int8 => any::<i64>().prop_map(Value::Int8).boxed(),
         ColumnType::Int4 => any::<i32>().prop_map(Value::Int4).boxed(),
+        ColumnType::Int2 => any::<i16>().prop_map(Value::Int2).boxed(),
         ColumnType::Timestamp => (-5_000i64..5_000)
             .prop_map(|d| Value::Timestamp(757_382_400_000_000 + d * 1_000))
             .boxed(),

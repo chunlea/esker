@@ -60,7 +60,9 @@ pub enum Values {
     /// its own rather than a list — measured: `parameter "x" requires a Boolean value`.
     Boolean,
     /// Any text. PostgreSQL validates `search_path` not at all and `TimeZone` against a zone
-    /// database this node does not carry, so what narrows both here is [`honour`].
+    /// database this node does not carry, so what narrows both here is the `honour` column of the
+    /// parameter table below — plain words rather than a link, because that function is private
+    /// and rustdoc cannot resolve one to it under `-D warnings`.
     Free,
 }
 

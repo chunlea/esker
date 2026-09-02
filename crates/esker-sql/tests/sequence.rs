@@ -24,11 +24,8 @@ const DIVERGENCES: &[(&str, &str)] = &[
     // the argument for refusing it. The entry's removal is the record that the gap closed --
     // the harness fails a divergence that has started agreeing, so this could not have been
     // absorbed silently.
-    (
-        "CREATE TABLE z5 (id smallserial PRIMARY KEY)",
-        "smallserial is int2, which is the next type in tier 1's order (ADR 0033); the same \
-         argument that has just been withdrawn for serial, and withdrawn here when int2 lands",
-    ),
+    // `smallserial` was here too, and went with `int2`. Both serial entries are gone: a serial
+    // is not a type, and each was refused only while its integer was missing.
     (
         concat!(
             "SELECT column_name, is_nullable FROM information_schema.columns ",
@@ -69,24 +66,14 @@ fn every_sequence_statement_answers_the_way_postgresql_19_does() {
 fn a_serial_is_refused_only_while_its_integer_is_missing() {
     let mut node = parity::Node::new(&[]);
 
-    // `serial` runs: an `integer` column that fills itself. `tests/int4.rs` asserts what it
-    // builds; here it is enough that it is no longer an error.
+    // All three widths run now: a serial is its integer plus a sequence, and each was refused
+    // only while that integer was missing. `tests/int4.rs` and `tests/int2.rs` assert what they
+    // build; here it is enough that none of them is an error any more.
+    node.run("CREATE TABLE s2 (id smallserial PRIMARY KEY)")
+        .unwrap();
     node.run("CREATE TABLE s4 (id serial PRIMARY KEY)").unwrap();
     node.run("CREATE TABLE s8 (id bigserial PRIMARY KEY)")
         .unwrap();
-
-    // `smallserial` is `int2`, which is the next type in tier 1's order.
-    let sql = "CREATE TABLE s2 (id smallserial PRIMARY KEY)";
-    let error = node.run(sql).unwrap_err();
-    assert_eq!(
-        error.sqlstate(),
-        sqlstate::FEATURE_NOT_SUPPORTED,
-        "{sql} -> {error}"
-    );
-    assert!(
-        error.to_string().to_ascii_lowercase().contains("serial"),
-        "{sql} -> `{error}`, which does not name what was written"
-    );
 }
 
 /// A sequence is dropped with the table that owns it, and its **name** goes with it — so the name

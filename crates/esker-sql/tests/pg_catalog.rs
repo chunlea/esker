@@ -143,6 +143,8 @@ fn activerecord_s_four_type_map_queries_answer() {
         vec![
             vec!["16", "bool"],
             vec!["20", "int8"],
+            // `smallint` arrived with tier 1's fourth type, and is in ActiveRecord's list of ten.
+            vec!["21", "int2"],
             // `int4` arrived with ADR 0033 and the catalog grew a row for it without being
             // touched, because `CatalogView::rows` is derived from `ColumnType::ALL`. Five of
             // this query's ten names are answered now where four were.
@@ -171,6 +173,7 @@ fn activerecord_s_four_type_map_queries_answer() {
             vec!["16", "bool", "0", ",", "boolin", "\\N", "b", "0"],
             vec!["17", "bytea", "0", ",", "byteain", "\\N", "b", "0"],
             vec!["20", "int8", "0", ",", "int8in", "\\N", "b", "0"],
+            vec!["21", "int2", "0", ",", "int2in", "\\N", "b", "0"],
             vec!["23", "int4", "0", ",", "int4in", "\\N", "b", "0"],
             vec!["25", "text", "0", ",", "textin", "\\N", "b", "0"],
             vec!["701", "float8", "0", ",", "float8in", "\\N", "b", "0"],

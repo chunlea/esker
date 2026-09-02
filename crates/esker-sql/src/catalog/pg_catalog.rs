@@ -228,6 +228,7 @@ fn typname(ty: ColumnType) -> &'static str {
     match ty {
         ColumnType::Int8 => "int8",
         ColumnType::Int4 => "int4",
+        ColumnType::Int2 => "int2",
         ColumnType::Text => "text",
         ColumnType::Varchar => "varchar",
         ColumnType::Bool => "bool",
@@ -248,6 +249,7 @@ fn typinput(ty: ColumnType) -> &'static str {
     match ty {
         ColumnType::Int8 => "int8in",
         ColumnType::Int4 => "int4in",
+        ColumnType::Int2 => "int2in",
         ColumnType::Text => "textin",
         ColumnType::Varchar => "varcharin",
         ColumnType::Bool => "boolin",

@@ -49,6 +49,8 @@ pub enum ColumnType {
     /// 32-bit signed integer; PostgreSQL's `integer`. A **distinct type** and not an `Int8` that
     /// happens to be small ([ADR 0033](../../docs/adr/0033-tier-1-of-the-type-surface.md)).
     Int4,
+    /// 16-bit signed integer; PostgreSQL's `smallint`. Distinct for the same reason.
+    Int2,
     /// Variable-length UTF-8 string.
     Text,
     /// PostgreSQL's `character varying`: the same representation as [`ColumnType::Text`] and a
@@ -68,9 +70,10 @@ pub enum ColumnType {
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 9] = [
+    pub const ALL: [ColumnType; 10] = [
         ColumnType::Int8,
         ColumnType::Int4,
+        ColumnType::Int2,
         ColumnType::Text,
         ColumnType::Varchar,
         ColumnType::Bool,
@@ -94,6 +97,7 @@ impl ColumnType {
             ColumnType::Int4 => 7,
             ColumnType::Varchar => 8,
             ColumnType::Timestamp => 9,
+            ColumnType::Int2 => 10,
         }
     }
 
@@ -109,6 +113,7 @@ impl ColumnType {
             7 => ColumnType::Int4,
             8 => ColumnType::Varchar,
             9 => ColumnType::Timestamp,
+            10 => ColumnType::Int2,
             other => {
                 return Err(Error::corruption(
                     "schema",
@@ -124,6 +129,7 @@ impl ColumnType {
         match self {
             ColumnType::Int8 => "bigint",
             ColumnType::Int4 => "integer",
+            ColumnType::Int2 => "smallint",
             ColumnType::Varchar => "character varying",
             ColumnType::Text => "text",
             ColumnType::Bool => "boolean",
@@ -153,6 +159,8 @@ pub enum Value {
     Int8(i64),
     /// An [`ColumnType::Int4`].
     Int4(i32),
+    /// An [`ColumnType::Int2`].
+    Int2(i16),
     /// A [`ColumnType::Text`], already valid UTF-8 by construction.
     Text(String),
     /// A [`ColumnType::Bool`].
@@ -175,6 +183,7 @@ impl Value {
             Value::Null => true,
             Value::Int8(_) => ty == ColumnType::Int8,
             Value::Int4(_) => ty == ColumnType::Int4,
+            Value::Int2(_) => ty == ColumnType::Int2,
             // One representation, two types: there is no `Value::Varchar` because there would be
             // nothing in it a `Text` does not hold.
             Value::Text(_) => matches!(ty, ColumnType::Text | ColumnType::Varchar),
@@ -199,6 +208,7 @@ impl Value {
             Value::Null => return None,
             Value::Int8(_) => ColumnType::Int8,
             Value::Int4(_) => ColumnType::Int4,
+            Value::Int2(_) => ColumnType::Int2,
             Value::Text(_) => ColumnType::Text,
             Value::Bool(_) => ColumnType::Bool,
             Value::Bytea(_) => ColumnType::Bytea,
@@ -215,6 +225,7 @@ impl Value {
             Value::Null => ValueRef::Null,
             Value::Int8(v) | Value::TimestampTz(v) | Value::Timestamp(v) => ValueRef::Int(*v),
             Value::Int4(v) => ValueRef::Int(i64::from(*v)),
+            Value::Int2(v) => ValueRef::Int(i64::from(*v)),
             Value::Bool(v) => ValueRef::Bool(*v),
             Value::Double(v) => ValueRef::Double(*v),
             Value::Text(v) => ValueRef::Bytes(v.as_bytes()),
@@ -312,6 +323,11 @@ impl ValueRef<'_> {
             (ValueRef::Int(v), ColumnType::Int4) => {
                 Value::Int4(i32::try_from(v).map_err(|_| {
                     Error::corruption("column", format!("an integer column holds {v}"))
+                })?)
+            }
+            (ValueRef::Int(v), ColumnType::Int2) => {
+                Value::Int2(i16::try_from(v).map_err(|_| {
+                    Error::corruption("column", format!("a smallint column holds {v}"))
                 })?)
             }
             (ValueRef::Bool(v), ColumnType::Bool) => Value::Bool(v),
@@ -461,6 +477,7 @@ mod tests {
         assert_eq!(ColumnType::Int4.tag(), 7);
         assert_eq!(ColumnType::Varchar.tag(), 8);
         assert_eq!(ColumnType::Timestamp.tag(), 9);
+        assert_eq!(ColumnType::Int2.tag(), 10);
 
         for ty in ColumnType::ALL {
             assert_eq!(ColumnType::from_tag(ty.tag()).unwrap(), ty);
@@ -468,7 +485,7 @@ mod tests {
         assert!(ColumnType::from_tag(0).unwrap_err().is_corruption());
         // One past the last: a reader that meets a tag a newer writer used answers corruption
         // rather than guessing, which is the direction this vocabulary is built to fail in.
-        assert!(ColumnType::from_tag(10).unwrap_err().is_corruption());
+        assert!(ColumnType::from_tag(11).unwrap_err().is_corruption());
     }
 
     /// A value fits its own type and nothing else — **except** the one pair that is deliberately

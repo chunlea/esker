@@ -60,6 +60,9 @@ pub fn f64_of_sort_bits(bits: u64) -> f64 {
 pub enum ColumnType {
     /// 64-bit integer. PostgreSQL calls it `bigint` in messages and `int8` in DDL.
     Int8,
+    /// 16-bit integer. PostgreSQL calls it `smallint` in messages and `int2` in DDL. A distinct
+    /// type for the same reason `int4` is: two bytes, and `22003` past its own range.
+    Int2,
     /// 32-bit integer. PostgreSQL calls it `integer` in messages and `int4` in DDL.
     ///
     /// A **distinct type and not an alias for [`ColumnType::Int8`]** ([ADR
@@ -92,9 +95,10 @@ pub enum ColumnType {
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 9] = [
+    pub const ALL: [ColumnType; 10] = [
         ColumnType::Int8,
         ColumnType::Int4,
+        ColumnType::Int2,
         ColumnType::Text,
         ColumnType::Varchar,
         ColumnType::Bool,
@@ -121,6 +125,8 @@ pub enum Datum {
     /// [`ColumnType::Int4`]. Four bytes on disk, and four bytes is the point: the width is what
     /// makes it a different type from an `int8` that happens to hold a small number.
     Int4(i32),
+    /// [`ColumnType::Int2`]. Two bytes, for the same reason.
+    Int2(i16),
     /// [`ColumnType::Text`]. Always valid UTF-8: the server encoding is UTF8, and bytes that are
     /// not are refused on the way in the way PostgreSQL refuses them.
     Text(String),
@@ -148,6 +154,7 @@ impl PartialEq for Datum {
                 a == b
             }
             (Datum::Int4(a), Datum::Int4(b)) => a == b,
+            (Datum::Int2(a), Datum::Int2(b)) => a == b,
             (Datum::Timestamp(a), Datum::Timestamp(b)) => a == b,
             (Datum::Text(a), Datum::Text(b)) => a == b,
             (Datum::Bool(a), Datum::Bool(b)) => a == b,
@@ -170,6 +177,7 @@ impl Datum {
             Datum::Null => return None,
             Datum::Int8(_) => ColumnType::Int8,
             Datum::Int4(_) => ColumnType::Int4,
+            Datum::Int2(_) => ColumnType::Int2,
             Datum::Timestamp(_) => ColumnType::Timestamp,
             Datum::Text(_) => ColumnType::Text,
             Datum::Bool(_) => ColumnType::Bool,

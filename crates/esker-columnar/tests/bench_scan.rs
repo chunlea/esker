@@ -64,6 +64,7 @@ fn encode_row(values: &[Value]) -> Vec<u8> {
                 out.extend_from_slice(&v.to_le_bytes());
             }
             Value::Int4(v) => out.extend_from_slice(&v.to_le_bytes()),
+            Value::Int2(v) => out.extend_from_slice(&v.to_le_bytes()),
             Value::Double(v) => out.extend_from_slice(&v.to_le_bytes()),
             Value::Bool(v) => out.push(u8::from(*v)),
             Value::Text(v) => {
@@ -110,6 +111,12 @@ fn decode_row(types: &[ColumnType], bytes: &[u8]) -> Vec<Value> {
                 four.copy_from_slice(&bytes[at..at + 4]);
                 at += 4;
                 Value::Int4(i32::from_le_bytes(four))
+            }
+            ColumnType::Int2 => {
+                let mut two = [0u8; 2];
+                two.copy_from_slice(&bytes[at..at + 2]);
+                at += 2;
+                Value::Int2(i16::from_le_bytes(two))
             }
             ColumnType::Timestamp => {
                 let value = Value::Timestamp(i64::from_le_bytes(fixed(at)));

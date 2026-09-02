@@ -872,6 +872,29 @@ form (`operator does not exist: timestamp without time zone = integer`). An impl
 routed both through `ColumnType::name()` would say the long form for the input error, which a real
 server never does.
 
+#### Tier 1, type 4: `smallint`, and the last serial refusal
+
+`tests/corpus/pg19_int2.txt` is 26 statements and its shape is `int4`'s exactly, one width down —
+which is the argument for capturing it rather than deriving it. Both ends of the range, every
+direction past them, and the same two `22003` messages: a bare `smallint out of range` for a
+constant, `value "32768" is out of range for type smallint` for a string.
+
+**`smallserial` closes the last serial divergence.** `tests/sequence.rs` declares none now: both
+entries went, each removed by the arrival of its integer, and the test that asserted the two were
+refused asserts instead that all three widths run. A serial is not a type — it is an integer, a
+`NOT NULL` and a `nextval` default — so each refusal lasted exactly as long as its integer was
+missing.
+
+**The fragment wire needed a reader it did not have.** An `int2` literal is two bytes, and
+`esker_columnar::Cursor` had `u8`, `u32_le` and `u64_le` and no `u16_le`. Widening the literal to
+four bytes was the alternative and it is the same mistake the type exists to avoid: the frame would
+disagree with `put_literal` and with `pg_type.typlen`, and a width that lies is what makes an alias
+an alias. One reader added, symmetric with the two beside it.
+
+And the same narrowing bug as `int4`, one width down: `sequence_datum` gave a `smallserial` column
+`Datum::Int8` and the row codec refused it — `column 4 is Int2 and was given Int8(1)`, the schema
+check doing its job twice.
+
 ## 3. The test ladder
 
 Each rung is a thing that either works or does not, and none of them is reached by asserting
@@ -1043,6 +1066,28 @@ epoch does not match")`. The second is not this fix's: it is the *client's* own 
 already retries nine times, exhausting them against an epoch that keeps moving. Same cause
 (saturation), third mechanism, and it is recorded here rather than claimed to be fixed. Three
 consecutive standalone runs are clean.
+
+### Closed again, at the fourth sighting: the deadline
+
+The retry above covers the **election gap** and deliberately not the **deadline**, which is §8's
+first mechanism. The fourth sighting was a `just`-style per-crate gate run on 2026-09-01, and the
+dump named it exactly: `a_lock_the_ttl_kills_resolves_the_same_way_on_both_engines` died on its
+*fragment* call with `timed out: no answer from 127.0.0.1:61519 in 30s`, one store visible and not
+leading. Same saturation as before and worse — two lanes now build in one tree.
+
+**What the fix turns on is a distinction the first one did not need: retryability after a timeout
+is a property of the *request*, not of the error.** A timed-out call has an **unknown** outcome —
+the request may have applied and the answer been lost — so "retry a timeout" is safe for one of
+these two calls and unsafe for the other:
+
+* the **fragment** call is a scan at a fixed `ts`. Repeating it cannot change what the cluster
+  holds, so it retries its deadline: `Idempotent::Yes`.
+* the **`TxnKv`** call is a prewrite whose commit never comes, which is the whole subject of the
+  test around it. Repeating it would invent a second prewrite, so it still dumps:
+  `Idempotent::No`.
+
+Neither call answers for the other, and the enum is at the call sites rather than inside the helper
+so that a future third caller has to say which it is.
 
 ## 8b. Handover — what unit 6 leaves, and what the ladder says to do next
 

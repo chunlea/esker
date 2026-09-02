@@ -93,6 +93,8 @@ pub enum ValueType {
     Double,
     /// Microseconds from 2000-01-01, with **no** zone: PostgreSQL's `timestamp`.
     Timestamp,
+    /// A 16-bit signed integer.
+    Int2,
     /// A 32-bit signed integer.
     ///
     /// Appended by [ADR 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md), never
@@ -103,9 +105,10 @@ pub enum ValueType {
 
 impl ValueType {
     /// Every type, so a test cannot silently skip one.
-    pub const ALL: [ValueType; 8] = [
+    pub const ALL: [ValueType; 9] = [
         ValueType::Int8,
         ValueType::Int4,
+        ValueType::Int2,
         ValueType::Timestamp,
         ValueType::Text,
         ValueType::Bool,
@@ -126,6 +129,7 @@ impl ValueType {
             ValueType::Double => 6,
             ValueType::Int4 => 7,
             ValueType::Timestamp => 8,
+            ValueType::Int2 => 9,
         }
     }
 
@@ -140,6 +144,7 @@ impl ValueType {
             6 => ValueType::Double,
             7 => ValueType::Int4,
             8 => ValueType::Timestamp,
+            9 => ValueType::Int2,
             _ => return Err(DecodeError::invalid("result.type", "unknown type tag")),
         })
     }
@@ -168,6 +173,8 @@ pub enum Value {
     Double(f64),
     /// [`ValueType::Int4`].
     Int4(i32),
+    /// [`ValueType::Int2`].
+    Int2(i16),
     /// [`ValueType::Timestamp`].
     Timestamp(i64),
 }
@@ -185,6 +192,7 @@ impl Value {
             Value::TimestampTz(_) => ValueType::TimestampTz,
             Value::Double(_) => ValueType::Double,
             Value::Int4(_) => ValueType::Int4,
+            Value::Int2(_) => ValueType::Int2,
             Value::Timestamp(_) => ValueType::Timestamp,
         })
     }
@@ -213,6 +221,12 @@ impl Value {
             Value::Int4(v) => {
                 out.put_u8(ValueType::Int4.tag());
                 out.put_u32(u32::from_le_bytes(v.to_le_bytes()));
+            }
+            // Two bytes, its own width: the tag already says how to read them, and widening would
+            // make this frame disagree with `pg_type.typlen`.
+            Value::Int2(v) => {
+                out.put_u8(ValueType::Int2.tag());
+                out.put_u16(u16::from_le_bytes(v.to_le_bytes()));
             }
             Value::Bool(v) => {
                 out.put_u8(ValueType::Bool.tag());
@@ -249,6 +263,9 @@ impl Value {
             }
             ValueType::Int4 => Value::Int4(i32::from_le_bytes(
                 input.get_u32("result.value.int4")?.to_le_bytes(),
+            )),
+            ValueType::Int2 => Value::Int2(i16::from_le_bytes(
+                input.get_u16("result.value.int2")?.to_le_bytes(),
             )),
             ValueType::Bool => Value::Bool(input.get_bool("result.value.bool")?),
             ValueType::Text => Value::Text(input.get_str("result.value.text")?.to_owned()),

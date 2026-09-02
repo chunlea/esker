@@ -109,6 +109,9 @@ impl Bound {
             ColumnType::Int4 => Value::Int4(i32::from_le_bytes(
                 <[u8; 4]>::try_from(self.bytes.as_slice()).ok()?,
             )),
+            ColumnType::Int2 => Value::Int2(i16::from_le_bytes(
+                <[u8; 2]>::try_from(self.bytes.as_slice()).ok()?,
+            )),
             ColumnType::TimestampTz => Value::TimestampTz(i64::from_le_bytes(fixed()?)),
             ColumnType::Timestamp => Value::Timestamp(i64::from_le_bytes(fixed()?)),
             ColumnType::Double => Value::Double(f64::from_le_bytes(fixed()?)),
@@ -255,6 +258,7 @@ impl ColumnStats {
             | ColumnType::Double => Some(8),
             // Its own width, which is what makes it a different type.
             ColumnType::Int4 => Some(4),
+            ColumnType::Int2 => Some(2),
             ColumnType::Bool => Some(1),
             ColumnType::Text | ColumnType::Varchar | ColumnType::Bytea => None,
         };
@@ -700,6 +704,7 @@ mod tests {
         let present = match ty {
             ColumnType::Int8 => any::<i64>().prop_map(Value::Int8).boxed(),
             ColumnType::Int4 => any::<i32>().prop_map(Value::Int4).boxed(),
+            ColumnType::Int2 => any::<i16>().prop_map(Value::Int2).boxed(),
             ColumnType::TimestampTz => any::<i64>().prop_map(Value::TimestampTz).boxed(),
             ColumnType::Timestamp => any::<i64>().prop_map(Value::Timestamp).boxed(),
             ColumnType::Bool => any::<bool>().prop_map(Value::Bool).boxed(),
@@ -745,6 +750,13 @@ mod tests {
                 Value::Int4(v) => {
                     let read = |bound: &Bound| match bound.as_value(ColumnType::Int4) {
                         Some(Value::Int4(value)) => Some(value),
+                        _ => None,
+                    };
+                    read(min) <= Some(*v) && Some(*v) <= read(max)
+                }
+                Value::Int2(v) => {
+                    let read = |bound: &Bound| match bound.as_value(ColumnType::Int2) {
+                        Some(Value::Int2(value)) => Some(value),
                         _ => None,
                     };
                     read(min) <= Some(*v) && Some(*v) <= read(max)

@@ -104,6 +104,8 @@ const TAG_INT4: u8 = 7;
 const TAG_VARCHAR: u8 = 8;
 /// Appended by ADR 0033 with `timestamp`; a record written before it has no tag above 8.
 const TAG_TIMESTAMP: u8 = 9;
+/// Appended by ADR 0033 with `smallint`; a record written before it has no tag above 9.
+const TAG_INT2: u8 = 10;
 
 /// Tags for [`SchemaState`] as stored. Ours, and they must never move: an index read as the wrong
 /// state is an index a node writes when it should not, which is the whole failure ADR 0020 is about.
@@ -148,6 +150,7 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Int4 => TAG_INT4,
         ColumnType::Varchar => TAG_VARCHAR,
         ColumnType::Timestamp => TAG_TIMESTAMP,
+        ColumnType::Int2 => TAG_INT2,
     }
 }
 
@@ -162,6 +165,7 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_INT4 => ColumnType::Int4,
         TAG_VARCHAR => ColumnType::Varchar,
         TAG_TIMESTAMP => ColumnType::Timestamp,
+        TAG_INT2 => ColumnType::Int2,
         other => return Err(corrupt(format!("column type tag {other}"))),
     })
 }

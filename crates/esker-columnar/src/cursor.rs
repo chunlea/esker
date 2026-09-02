@@ -66,6 +66,13 @@ impl<'a> Cursor<'a> {
         Ok(self.bytes(1, field)?[0])
     }
 
+    /// A little-endian `u16`. An `int2` literal is two bytes on the wire, because two bytes is
+    /// what the type is — widening it would make the framing disagree with `put_literal`.
+    pub(crate) fn u16_le(&mut self, field: &str) -> Result<u16> {
+        let bytes = self.bytes(2, field)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
     /// A little-endian `u32`.
     pub(crate) fn u32_le(&mut self, field: &str) -> Result<u32> {
         let bytes = self.bytes(4, field)?;

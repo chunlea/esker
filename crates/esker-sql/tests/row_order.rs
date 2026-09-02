@@ -66,6 +66,7 @@ fn column_type(name: &str) -> ColumnType {
     match name {
         "int8" => ColumnType::Int8,
         "int4" => ColumnType::Int4,
+        "int2" => ColumnType::Int2,
         "text" => ColumnType::Text,
         // Captured under `COLLATE "C"` for the same reason `text` is, and separately, because a
         // type whose key order is unchecked is a type whose range scans are unchecked — which is

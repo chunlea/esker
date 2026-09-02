@@ -118,7 +118,8 @@ impl ColumnData {
             ColumnType::Int8
             | ColumnType::TimestampTz
             | ColumnType::Timestamp
-            | ColumnType::Int4 => ColumnData::Ints(Vec::new()),
+            | ColumnType::Int4
+            | ColumnType::Int2 => ColumnData::Ints(Vec::new()),
             ColumnType::Double => ColumnData::Doubles(Vec::new()),
             ColumnType::Bool => ColumnData::Bools(Vec::new()),
             ColumnType::Text | ColumnType::Varchar | ColumnType::Bytea => ColumnData::Bytes {
@@ -156,6 +157,7 @@ impl ColumnData {
                     | ColumnType::TimestampTz
                     | ColumnType::Timestamp
                     | ColumnType::Int4
+                    | ColumnType::Int2
             ) | (ColumnData::Doubles(_), ColumnType::Double)
                 | (ColumnData::Bools(_), ColumnType::Bool)
                 | (
@@ -382,6 +384,7 @@ impl ColumnBuilder {
             Value::Null => {}
             Value::Int8(v) | Value::TimestampTz(v) | Value::Timestamp(v) => self.ints.push(*v),
             Value::Int4(v) => self.ints.push(i64::from(*v)),
+            Value::Int2(v) => self.ints.push(i64::from(*v)),
             Value::Double(v) => self.doubles.push(*v),
             Value::Bool(v) => self.bools.push(*v),
             Value::Text(v) => self.push_bytes(v.as_bytes())?,
@@ -429,7 +432,8 @@ impl ColumnBuilder {
             ColumnType::Int8
             | ColumnType::TimestampTz
             | ColumnType::Timestamp
-            | ColumnType::Int4 => ColumnData::Ints(std::mem::take(&mut self.ints)),
+            | ColumnType::Int4
+            | ColumnType::Int2 => ColumnData::Ints(std::mem::take(&mut self.ints)),
             ColumnType::Double => ColumnData::Doubles(std::mem::take(&mut self.doubles)),
             ColumnType::Bool => ColumnData::Bools(std::mem::take(&mut self.bools)),
             ColumnType::Text | ColumnType::Varchar | ColumnType::Bytea => ColumnData::Bytes {
