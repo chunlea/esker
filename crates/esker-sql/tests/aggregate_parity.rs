@@ -126,7 +126,6 @@ const DIVERGENCES: &[(&str, &str)] = &[
         "SELECT count(*) FROM agg, wide",
         "a comma-separated FROM list",
     ),
-    ("SELECT count(*) FROM (SELECT 1) s", "a derived table"),
     (
         "SELECT g, count(*) FROM agg GROUP BY GROUPING SETS ((g), ())",
         "GROUP BY GROUPING SETS",

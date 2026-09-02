@@ -1082,6 +1082,10 @@ fn lower_insert(insert: &sqlparser::ast::Insert) -> Result<plan::Insert> {
 ///
 /// A negative number arrives as a unary minus over a positive literal, which is folded here so
 /// that `-1` is one literal rather than an operator this crate would otherwise have to run.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per expression shape; splitting it would hide the vocabulary rather than clarify it"
+)]
 fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
     match expr {
         Expr::Value(value) => lower_value(&value.value, false),
@@ -1938,6 +1942,40 @@ fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
             Ok(plan::TableRef {
                 name: object_name(name)?,
                 alias,
+                derived: None,
+            })
+        }
+        // `FROM (SELECT …) AS t` — a **derived table**. The alias is optional on PostgreSQL 19
+        // (measured; it was mandatory before 16), and without one there is simply no name to
+        // qualify the relation with, which an empty `TableRef::name` says exactly.
+        TableFactor::Derived {
+            lateral,
+            subquery,
+            alias,
+            sample,
+        } => {
+            // `LATERAL` is unit 4's correlation applied to a `FROM` item, and it is deliberately
+            // not folded into either (`docs/plans/phase-12-subquery.md` §4).
+            refuse_if(*lateral, "LATERAL")?;
+            refuse_if(sample.is_some(), "TABLESAMPLE")?;
+            let (name, columns) = match alias {
+                None => (String::new(), Vec::new()),
+                Some(alias) => (
+                    ident(&alias.name),
+                    alias
+                        .columns
+                        .iter()
+                        .map(|column| ident(&column.name))
+                        .collect(),
+                ),
+            };
+            Ok(plan::TableRef {
+                name,
+                alias: None,
+                derived: Some(Box::new(plan::Derived::new(
+                    Box::new(lower_query(subquery)?),
+                    columns,
+                ))),
             })
         }
         other => Err(SqlError::unsupported(format!("the FROM item {other}"))),

@@ -40,7 +40,7 @@ pub use query::{
 };
 pub use routing::{Columnar, Decision, Engine, Reason, Setting};
 pub use session::SessionStatement;
-pub use subquery::{SubqueryExpr, SubqueryKind};
+pub use subquery::{Derived, SubqueryExpr, SubqueryKind};
 pub use time_machine::TimeMachineVerb;
 
 /// One statement, lowered.

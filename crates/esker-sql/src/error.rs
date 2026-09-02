@@ -818,8 +818,8 @@ impl SqlError {
                 sqlstate::FEATURE_NOT_SUPPORTED
             }
             SqlError::CardinalityViolation => sqlstate::CARDINALITY_VIOLATION,
-            SqlError::SubqueryColumns(_) => sqlstate::SYNTAX_ERROR,
-            SqlError::Syntax { .. }
+            SqlError::SubqueryColumns(_)
+            | SqlError::Syntax { .. }
             | SqlError::InsertTooManyExpressions
             | SqlError::SyntaxAtOrNear(_) => sqlstate::SYNTAX_ERROR,
             SqlError::StatementTooComplex => sqlstate::STATEMENT_TOO_COMPLEX,

@@ -27,6 +27,9 @@
 //! short-circuited on a NULL operand (which is exactly what [`crate::plan::Expr::InList`]
 //! correctly does, because PostgreSQL's grammar has no empty list) answers NULL and drops a row.
 
+use std::sync::Arc;
+
+use crate::catalog::TableDef;
 use crate::plan::{BinaryOp, Expr, Node, Select};
 use crate::value::{ColumnType, Datum};
 
@@ -210,6 +213,61 @@ impl SubqueryExpr {
             SubqueryKind::Scalar => self.column.as_ref().map(|(name, _)| name.as_str()),
             SubqueryKind::Exists { negated: false } => Some("exists"),
             _ => None,
+        }
+    }
+}
+
+/// A **derived table**: `FROM (SELECT …) AS t`, and the alias list that renames its columns.
+///
+/// It is the same subquery the rest of this module is about, standing where a relation goes rather
+/// than where a value goes — so what it needs is not a value but a *shape*, and that is exactly
+/// what the two filled-in fields are. Once they are there, everything above knows it as a table:
+/// name resolution, the `SELECT *` expansion, `EXPLAIN`'s column names and the join machinery all
+/// work against `def` and never learn that nothing stores it.
+///
+/// # What the capture settled
+///
+/// `tests/corpus/pg19_subquery_from.txt`, and two of the three would have been guessed wrong:
+///
+/// * **the alias is optional on 19.** It was mandatory before PostgreSQL 16 and the documentation
+///   a reader is most likely to find still says so. Without one the relation simply has no name to
+///   qualify with, which is why an absent alias is an empty [`crate::plan::TableRef::name`] rather
+///   than a generated one — an invented name is a name a user could collide with.
+/// * **a column alias list may be SHORTER than the target list.** `AS t(a)` over two columns
+///   renames the first and leaves the second alone; only a *longer* one is an error, and it is
+///   `42P10 table "t" has 1 columns available but 2 columns specified`. Refusing a short one, which
+///   reads like the obvious symmetry, would refuse a statement a real server runs.
+/// * and a name the list replaced is **gone**: after `AS t(a, b)`, `t.id` is `42703`.
+#[derive(Debug, Clone)]
+pub struct Derived {
+    /// The sub-select as written.
+    pub select: Box<Select>,
+    /// `AS t(a, b)` — the column names, in order, or empty for a bare alias.
+    pub columns: Vec<String>,
+    /// The plan its rows come from, filled by [`crate::exec::subquery::plan_subqueries`].
+    pub plan: Option<Box<Node>>,
+    /// The relation it looks like from above: one column per output column of the sub-select,
+    /// under [`crate::catalog::DERIVED_TABLE_ID`]. Filled at the same time.
+    pub def: Option<Arc<TableDef>>,
+}
+
+/// Two derived tables are equal when they were **written** the same — the same reason
+/// [`SubqueryExpr`]'s equality is hand-written, and the same two fields left out.
+impl PartialEq for Derived {
+    fn eq(&self, other: &Self) -> bool {
+        self.select == other.select && self.columns == other.columns
+    }
+}
+
+impl Derived {
+    /// A derived table as the parser saw it, with nothing planned yet.
+    #[must_use]
+    pub fn new(select: Box<Select>, columns: Vec<String>) -> Self {
+        Derived {
+            select,
+            columns,
+            plan: None,
+            def: None,
         }
     }
 }

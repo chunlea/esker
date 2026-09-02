@@ -853,14 +853,18 @@ impl Executor {
         } else {
             select
         };
+        let catalogued = Catalogued { exec: self, txn };
         let table = match &select.from {
-            Some(table) => Some(self.require_table(txn, &table.name)?),
+            // A derived table stands for a relation nothing stores; `relation_of` hands back the
+            // synthetic one its sub-select's target list makes, which everything above reads like
+            // any other table.
+            Some(table) => Some(subquery::relation_of(table, &catalogued)?),
             None => None,
         };
         let inners = select
             .joins
             .iter()
-            .map(|join| self.require_table(txn, &join.table.name))
+            .map(|join| subquery::relation_of(&join.table, &catalogued))
             .collect::<Result<Vec<_>>>()?;
         let inner_refs: Vec<&crate::catalog::TableDef> =
             inners.iter().map(std::convert::AsRef::as_ref).collect();
@@ -869,8 +873,15 @@ impl Executor {
         // exists and is already correct, which is what lets a refusal be answered by putting the
         // original back (`crate::exec::fragment`). A join has no outer table to route and is left
         // alone by `consider` in any case.
+        // A derived table is never routed: nothing stores the relation, so there is no columnar
+        // copy of it, and its id is a reserved one no catalog record names.
+        let derived_from = select
+            .from
+            .as_ref()
+            .is_some_and(|from| from.derived.is_some());
         if let Some(table) = table.as_deref()
             && inners.is_empty()
+            && !derived_from
         {
             fragment::route(
                 txn,

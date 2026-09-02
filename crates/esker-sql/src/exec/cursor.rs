@@ -129,6 +129,7 @@ fn inner_side(
     tenant: u64,
     inner_table_id: u64,
     inner_view: Option<&crate::plan::CatalogView>,
+    inner_plan: Option<&Node>,
     inner_columns: &RowSchema,
     probe: &Probe,
 ) -> Result<Vec<Vec<Datum>>> {
@@ -140,14 +141,21 @@ fn inner_side(
     }
     let (start, end) = row::table_row_range(tenant, inner_table_id);
     let mut rows = Vec::new();
-    let mut scan = Cursor {
-        txn,
-        tenant,
-        kind: Kind::Scan {
-            columns: inner_columns.clone(),
-            next: start,
-            end,
-            batch: Vec::new().into_iter(),
+    // A **derived table**'s rows come from its own plan rather than from a key range, which is why
+    // the same `Cursor` is opened over one instead of over a `Scan`. Everything below it is
+    // unchanged — the bound and the `53400` past it — because what makes a materialised inner side
+    // expensive is the same either way: a whole relation held in memory for one query.
+    let mut scan = match inner_plan {
+        Some(plan) => Cursor::open(txn, tenant, plan)?,
+        None => Cursor {
+            txn,
+            tenant,
+            kind: Kind::Scan {
+                columns: inner_columns.clone(),
+                next: start,
+                end,
+                batch: Vec::new().into_iter(),
+            },
         },
     };
     while let Some(row) = scan.next()? {
@@ -190,6 +198,7 @@ impl<'a> Cursor<'a> {
                 left_join,
                 inner_table_id,
                 inner_view,
+                inner_plan,
                 inner_columns,
                 probe,
                 residual,
@@ -200,6 +209,7 @@ impl<'a> Cursor<'a> {
                     tenant,
                     *inner_table_id,
                     inner_view.as_ref(),
+                    inner_plan.as_deref(),
                     inner_columns,
                     probe,
                 )?;
@@ -233,6 +243,10 @@ impl<'a> Cursor<'a> {
                 spec: node.clone(),
                 groups: Vec::new().into_iter(),
             },
+            // It computes nothing: the sub-select's plan already produced the rows, and the name
+            // and column names this node carries are for `EXPLAIN`. Opening the input directly is
+            // what makes that true rather than merely intended.
+            Node::Derived { input, .. } => return Cursor::open(txn, tenant, input),
             Node::Distinct { input } => Kind::Distinct {
                 input: Box::new(Cursor::open(txn, tenant, input)?),
                 seen: BTreeSet::new(),

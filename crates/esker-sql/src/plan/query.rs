@@ -45,19 +45,41 @@ pub enum JoinKind {
 /// is `42P01` — measured, with a `HINT` naming the alias
 /// (`tests/corpus/pg19_alias.txt`). So [`TableRef::referred_as`] is the *only* name resolution may
 /// match, and the table's own name is kept for the catalog lookup and for `EXPLAIN`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Not `Eq`, since [`TableRef::derived`] carries a whole `SELECT` and an expression in one can hold
+/// a float literal — the same reason [`Select`] is not `Eq`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct TableRef {
     /// The relation, as the catalog knows it.
+    ///
+    /// **Empty for a derived table with no alias**, which PostgreSQL 19 allows (measured;
+    /// `tests/corpus/pg19_subquery_from.txt`). Empty is the honest name for a relation there is no
+    /// way to qualify: no identifier folds to it, so no qualifier can match, and generating one
+    /// would be inventing a name a user could collide with.
     pub name: String,
     /// `AS x`, or `x` — the name a qualifier must use once it is there.
     pub alias: Option<String>,
+    /// `FROM (SELECT …) AS t` — the sub-select this entry is, or `None` for a real relation.
+    pub derived: Option<Box<crate::plan::Derived>>,
 }
 
 impl TableRef {
     /// A table under its own name.
     #[must_use]
     pub fn bare(name: String) -> Self {
-        TableRef { name, alias: None }
+        TableRef {
+            name,
+            alias: None,
+            derived: None,
+        }
+    }
+
+    /// The plan a derived table's rows come from, or `None` for a real relation.
+    #[must_use]
+    pub fn derived_plan(&self) -> Option<&Node> {
+        self.derived
+            .as_ref()
+            .and_then(|derived| derived.plan.as_deref())
     }
 
     /// The name a qualifier in this query has to write: the alias if there is one, the table's own
@@ -290,6 +312,10 @@ pub enum Node {
         inner_table: String,
         /// How the inner table's rows decode.
         inner_columns: RowSchema,
+        /// Set when the inner side is a **derived table**, whose rows come from this plan rather
+        /// than from a key range. Always paired with [`Probe::Materialize`], for the same reason
+        /// [`Node::NestedLoop::inner_view`] is: a relation with no key has nothing to seek in.
+        inner_plan: Option<Box<Node>>,
         /// How one outer row produces inner rows.
         probe: Probe,
         /// What is left of `ON` after the probe, over the **combined** row. A probe answers an
@@ -339,6 +365,27 @@ pub enum Node {
     /// ([`crate::plan::routing`], ADR 0022 milestone 4). It carries the row plan it falls back to,
     /// so a refusal is answered by a field rather than by a branch somebody remembers.
     Columnar(Box<crate::plan::routing::Columnar>),
+    /// A **derived table**: its input's rows, under the name and column names the `FROM` entry
+    /// gave them.
+    ///
+    /// It computes nothing — [`crate::exec::cursor`] opens the input and hands its rows straight
+    /// through — and it exists for `EXPLAIN`, which is not a small reason. The plan text threads
+    /// **one** table name and **one** list of column names down the whole tree, so without a node
+    /// to switch them at, a scan of `dt_a` inside `FROM (SELECT … FROM dt_a) AS t` prints
+    /// `Seq Scan on t`: the wrong relation, named confidently. PostgreSQL calls this node
+    /// `Subquery Scan on t` and so does this one.
+    Derived {
+        /// The sub-select's plan.
+        input: Box<Node>,
+        /// The name the outer query refers to it by, or empty for a derived table with no alias —
+        /// which PostgreSQL 19 allows.
+        alias: String,
+        /// The relation the sub-select reads, and the column names its expressions were resolved
+        /// against — the pair `EXPLAIN` threads down, replaced here for the subtree.
+        input_table: String,
+        /// The sub-select's own column names, for the same reason.
+        input_columns: Vec<String>,
+    },
     /// `SELECT DISTINCT`: the first row of each distinct value, in the order the input gave them.
     ///
     /// Distinctness is [`crate::value::PgDatum::pg_cmp`] equality, the same rule grouping uses, so
@@ -453,6 +500,24 @@ impl Node {
         lines: &mut Vec<String>,
     ) {
         let indent = "  ".repeat(depth);
+        // A derived table is where the two names this walk threads down have to **change**: below
+        // it the relation is the sub-select's, not the outer query's, and so are the column names
+        // every expression is rendered against. The engine is not handed down either — the
+        // decision above is about a different scan, and a derived table is never routed.
+        if let Node::Derived {
+            input,
+            alias,
+            input_table,
+            input_columns,
+        } = self
+        {
+            lines.push(match alias.as_str() {
+                "" => format!("{indent}Subquery Scan"),
+                name => format!("{indent}Subquery Scan on {name}"),
+            });
+            input.explain_into(input_table, input_columns, None, depth + 1, lines);
+            return;
+        }
         let (line, child, extra) = self.describe(table, columns, engine, &indent);
         lines.push(format!("{indent}{line}"));
         if let Some(extra) = extra {
@@ -496,6 +561,10 @@ impl Node {
             Node::CatalogView { view, .. } => {
                 (format!("Catalog Scan on {}", view.name()), None, None)
             }
+            // Unreachable: `explain_into` prints this node itself, because it is the one place the
+            // table and column names change on the way down. Kept total rather than `unreachable!`
+            // so that a plan is never a panic.
+            Node::Derived { input, .. } => ("Subquery Scan".to_owned(), Some(input), None),
             // **The engine goes on the scan**, which is the node the decision is about: ADR 0022
             // Decision 2 asks `EXPLAIN` to name the engine it chose, and a plan that was
             // *considered* for columns and left on rows has to say so as loudly as one that was

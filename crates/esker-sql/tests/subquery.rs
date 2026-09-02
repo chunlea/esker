@@ -21,7 +21,7 @@ mod parity;
 ///
 /// Here rather than on the shared harness because it is two lines and the harness is another
 /// lane's file on `main`; a helper in one test file is one hunk fewer to resolve at merge time.
-fn error(node: &mut parity::Node, sql: &str) -> esker_sql::error::SqlError {
+fn refusal(node: &mut parity::Node, sql: &str) -> esker_sql::error::SqlError {
     node.run(sql)
         .err()
         .unwrap_or_else(|| panic!("{sql} did not refuse"))
@@ -193,7 +193,7 @@ fn a_scalar_subquery_answers_one_value_or_raises() {
     );
 
     // Two rows: `21000`, PostgreSQL's own sentence.
-    let error = error(&mut node, "SELECT (SELECT id FROM sq_a)");
+    let error = refusal(&mut node, "SELECT (SELECT id FROM sq_a)");
     assert_eq!(error.sqlstate(), sqlstate::CARDINALITY_VIOLATION);
     assert_eq!(
         error.to_string(),
@@ -217,7 +217,7 @@ fn a_scalar_subquery_answers_one_value_or_raises() {
 fn a_subquery_with_two_columns_is_refused_by_its_own_sentence() {
     let mut node = parity::Node::new(FIXTURE);
 
-    let scalar = error(&mut node, "SELECT (SELECT id, n FROM sq_a WHERE id = 1)");
+    let scalar = refusal(&mut node, "SELECT (SELECT id, n FROM sq_a WHERE id = 1)");
     assert_eq!(scalar.sqlstate(), sqlstate::SYNTAX_ERROR);
     assert!(
         scalar
@@ -230,7 +230,7 @@ fn a_subquery_with_two_columns_is_refused_by_its_own_sentence() {
         "SELECT id FROM sq_a WHERE id IN (SELECT id, a_id FROM sq_b)",
         "SELECT 1 = ANY (SELECT id, a_id FROM sq_b)",
     ] {
-        let error = error(&mut node, statement);
+        let error = refusal(&mut node, statement);
         assert_eq!(error.sqlstate(), sqlstate::SYNTAX_ERROR);
         assert!(
             error.to_string().contains("subquery has too many columns"),
@@ -318,7 +318,7 @@ fn the_shapes_this_phase_does_not_run_name_themselves() {
             "a comma-separated FROM list",
         ),
     ] {
-        let error = error(&mut node, statement);
+        let error = refusal(&mut node, statement);
         assert_eq!(
             error.sqlstate(),
             sqlstate::FEATURE_NOT_SUPPORTED,

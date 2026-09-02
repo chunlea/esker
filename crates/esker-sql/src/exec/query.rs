@@ -225,6 +225,9 @@ impl<'a> Scope<'a> {
     fn resolve_column(&self, qualifier: Option<&str>, name: &str) -> Result<(usize, &ColumnDef)> {
         if let Some(qualifier) = qualifier {
             let index = self.entry(qualifier)?;
+            if duplicated(self.tables[index], name) {
+                return Err(SqlError::AmbiguousColumn(name.to_owned()));
+            }
             let at = self.tables[index].column(name).ok_or_else(|| {
                 if let Some(system) = SYSTEM_COLUMNS.iter().find(|system| **system == name) {
                     return SqlError::unsupported(format!("the system column {system}"));
@@ -251,7 +254,11 @@ impl<'a> Scope<'a> {
         let mut found = None;
         for (index, table) in self.tables.iter().enumerate() {
             if let Some(at) = table.column(name) {
-                if found.is_some() {
+                // Twice in **one** relation is ambiguous too, and only a derived table can be:
+                // `SELECT a FROM (SELECT 1 AS a, 2 AS a) AS t` is `42702`, measured, while a real
+                // table cannot have two columns of one name. Answering the first would be a wrong
+                // column returned with nothing to say so.
+                if found.is_some() || duplicated(table, name) {
                     return Err(SqlError::AmbiguousColumn(name.to_owned()));
                 }
                 found = Some((self.offset(index) + at, &table.columns[at]));
@@ -342,10 +349,18 @@ pub(super) fn plan(
     };
     let left_join = only_join.is_some_and(|join| join.kind == crate::plan::JoinKind::Left);
 
+    // A **derived** side never drives the choice. `drive_from` swaps in order to reach a probe on
+    // the inner table's key, and a derived table has none -- so a swap could only move the plan
+    // that produces its rows to the side that is read once per outer row, for no gain.
+    let swappable = select
+        .from
+        .as_ref()
+        .is_none_or(|from| from.derived.is_none())
+        && only_join.is_none_or(|join| join.table.derived.is_none());
     let (scope, swapped) = drive_from(
         named_table,
         named_inner,
-        condition.as_ref(),
+        condition.as_ref().filter(|_| swappable),
         left_join,
         using,
     );
@@ -354,6 +369,15 @@ pub(super) fn plan(
         (Some(left), Some(right), true) => (Some(right), Some(left)),
         (table, _, _) => (table, None),
     };
+    // Which `FROM` entry each side came from, so a derived one is read from its own plan. Swapped
+    // with the tables, because `drive_from` may have chosen the right-hand side to drive from.
+    let left_entry = select.from.as_ref();
+    let right_entry = only_join.map(|join| &join.table);
+    let (outer_entry, inner_entry) = if swapped {
+        (right_entry, left_entry)
+    } else {
+        (left_entry, right_entry)
+    };
 
     let mut node = match outer_table {
         None => Node::OneRow,
@@ -361,18 +385,32 @@ pub(super) fn plan(
         // the outer table. A predicate mentioning the inner one cannot narrow the outer scan --
         // its value is not known until an outer row has been read -- and handing it to
         // `access_path`, which resolves against one table, would be an error rather than a plan.
+        // A derived table's "access path" is the sub-select's own plan. Nothing narrows it and
+        // nothing seeks in it -- the `WHERE` below becomes a `Filter` over these rows, which is
+        // what the same statement over an unindexed table already gets.
         Some(table) => {
-            let usable = select
-                .filter
-                .as_ref()
-                .filter(|filter| inner_table.is_none() || mentions_only(filter, table));
-            access_path(usable, tenant, table)?
+            if let Some(plan) = outer_entry.and_then(crate::plan::TableRef::derived_plan) {
+                plan.clone()
+            } else {
+                let usable = select
+                    .filter
+                    .as_ref()
+                    .filter(|filter| inner_table.is_none() || mentions_only(filter, table));
+                access_path(usable, tenant, table)?
+            }
         }
     };
 
     if let Some(join) = only_join {
         let inner = inner_table.ok_or_else(|| SqlError::UndefinedTable(join.table.name.clone()))?;
-        node = join_node(node, condition.as_ref(), left_join, &scope, inner)?;
+        node = join_node(
+            node,
+            condition.as_ref(),
+            left_join,
+            &scope,
+            inner,
+            inner_entry.and_then(crate::plan::TableRef::derived_plan),
+        )?;
     }
 
     if let Some(filter) = &select.filter {
@@ -654,21 +692,37 @@ fn plan_chain(
         entries.push((*inner, join.table.referred_as().to_owned()));
     }
     for (at, (_, name)) in entries.iter().enumerate() {
-        if entries[..at].iter().any(|(_, earlier)| earlier == name) {
+        // The empty name is a derived table with no alias, which PostgreSQL 19 allows and which
+        // nothing can refer to -- so two of them are two anonymous relations, not a duplicate.
+        if !name.is_empty() && entries[..at].iter().any(|(_, earlier)| earlier == name) {
             return Err(SqlError::DuplicateTableName(name.clone()));
         }
     }
 
     // The `WHERE` cannot narrow the outer access path here: with more than one table it may
     // mention any of them, and a value from a table not yet read is not one a scan can seek on.
-    let mut node = access_path(None, tenant, outer)?;
+    let mut node = match select
+        .from
+        .as_ref()
+        .and_then(crate::plan::TableRef::derived_plan)
+    {
+        Some(plan) => plan.clone(),
+        None => access_path(None, tenant, outer)?,
+    };
     // Grown one table at a time, so each step's `ON` sees exactly the tables to its left plus the
     // one being joined — which is what makes a reference to a table two steps back resolve, and a
     // reference to one further right an "undefined column" rather than a silent NULL.
     for (at, (join, inner)) in select.joins.iter().zip(inners).enumerate() {
         let scope = Scope::chain(&entries[..=at + 1]);
         let left_join = join.kind == crate::plan::JoinKind::Left;
-        node = join_node(node, join.on.as_ref(), left_join, &scope, inner)?;
+        node = join_node(
+            node,
+            join.on.as_ref(),
+            left_join,
+            &scope,
+            inner,
+            join.table.derived_plan(),
+        )?;
     }
 
     let scope = Scope::chain(&entries);
@@ -784,13 +838,15 @@ fn join_node(
     left_join: bool,
     scope: &Scope<'_>,
     inner: &TableDef,
+    inner_plan: Option<&Node>,
 ) -> Result<Node> {
     // A computed relation has no primary key and no index, so there is nothing to probe with and
     // the inner side is read once into memory like any other unindexed join. Decided here rather
-    // than left to `probe_for`, so that a view can never be reached through a key.
+    // than left to `probe_for`, so that a view can never be reached through a key. A **derived
+    // table** is the same case for the same reason: its rows come from a plan.
     let inner_view = pg_catalog::view_of(inner);
     let probe = on
-        .filter(|_| inner_view.is_none())
+        .filter(|_| inner_view.is_none() && inner_plan.is_none())
         .and_then(|on| probe_for(on, scope, inner))
         .unwrap_or(crate::plan::Probe::Materialize);
     // A probe answers the equality exactly, so the condition it came from is not re-checked. A
@@ -810,6 +866,7 @@ fn join_node(
         inner_view,
         inner_table: inner.name.clone(),
         inner_columns: inner.row_schema(),
+        inner_plan: inner_plan.map(|plan| Box::new(plan.clone())),
         probe,
         residual,
     })
@@ -1170,6 +1227,19 @@ pub(super) fn dealias(expr: &Expr, select: &Select) -> Expr {
 /// at the row key and a key that moved would mean rewriting every index on every update. They are
 /// not the same thing under different names, so `ctid` is refused rather than answered with
 /// something that would behave differently the first time somebody updated a row.
+/// Whether one relation has this column name more than once.
+///
+/// Only a **derived table** can: a `CREATE TABLE` with two columns of one name is `42701`, so for
+/// every real relation this is `false` and costs one pass over a short list.
+fn duplicated(table: &TableDef, name: &str) -> bool {
+    table
+        .columns
+        .iter()
+        .filter(|column| column.name == name)
+        .nth(1)
+        .is_some()
+}
+
 fn undefined_column(name: &str) -> SqlError {
     if let Some(system) = SYSTEM_COLUMNS.iter().find(|system| **system == name) {
         return SqlError::unsupported(format!("the system column {system}"));

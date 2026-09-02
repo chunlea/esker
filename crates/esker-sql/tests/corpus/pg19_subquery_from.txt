@@ -1,0 +1,109 @@
+# What a real PostgreSQL 19beta1 does with a **derived table** -- `FROM (SELECT …) AS t`, phase 12
+# unit 2 (`docs/plans/phase-12-subquery.md`). Captured before a line of the implementation, in ONE
+# session inside `BEGIN ... ROLLBACK` with `ON_ERROR_ROLLBACK on`, so the shared oracle is left
+# exactly as it was found.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THE THREE THAT WOULD HAVE BEEN GOT WRONG BY READING RATHER THAN MEASURING:
+#
+#   1. **the alias is OPTIONAL on 19.** It was mandatory before PostgreSQL 16 and most of the
+#      documentation a reader finds still says so. `SELECT * FROM (SELECT id FROM dt_a)` runs, and
+#      the relation simply has no name to qualify with.
+#   2. **a column alias list may be SHORTER than the target list.** `AS t (a)` over two columns
+#      renames the first and leaves the second under its own name -- so `SELECT a, n FROM … AS t(a)`
+#      is a legal statement returning both. Only a *longer* list is an error, and it is `42P10`
+#      with a sentence that counts both sides. Refusing a short one reads like the obvious symmetry
+#      and would refuse a statement a real server runs.
+#   3. **a `FROM` item cannot see the ones beside it.** `FROM (SELECT … WHERE id = a.id) AS t, dt_a a`
+#      is `42P01 missing FROM-clause entry for table "a"` even though `a` is right there -- that is
+#      what `LATERAL` is for, and the error says so by not existing.
+#
+# And two the capture pins because a plausible implementation gets them backwards: a name the alias
+# list replaced is **gone** (`t.id` is `42703` after `AS t (a, b)`), and duplicate output names
+# inside the derived table are legal until something references one, which is `42702`.
+CREATE TABLE dt_a (id int8 PRIMARY KEY, n text, k int8)		-
+INSERT INTO dt_a VALUES (1, 'one', 7), (2, 'two', NULL), (3, NULL, 9)		-
+CREATE TABLE dt_b (id int8 PRIMARY KEY, a_id int8, v int8)		-
+INSERT INTO dt_b VALUES (10, 1, 100), (11, 1, 200), (12, 3, NULL)		-
+
+# --- the ordinary shape, and the name it is known by
+SELECT * FROM (SELECT id, n FROM dt_a) AS t ORDER BY id	bigint,text	1|one ; 2|two ; 3|\N
+SELECT * FROM (SELECT id, n FROM dt_a) t ORDER BY id	bigint,text	1|one ; 2|two ; 3|\N
+SELECT id FROM (SELECT id, n FROM dt_a) AS t ORDER BY id	bigint	1 ; 2 ; 3
+SELECT t.id FROM (SELECT id, n FROM dt_a) AS t ORDER BY t.id	bigint	1 ; 2 ; 3
+SELECT t.* FROM (SELECT id, n FROM dt_a) AS t ORDER BY 1	bigint,text	1|one ; 2|two ; 3|\N
+SELECT x.id FROM (SELECT id FROM dt_a) AS x ORDER BY 1	bigint	1 ; 2 ; 3
+SELECT u.id FROM (SELECT id FROM dt_a) AS t	!42P01 missing FROM-clause entry for table "u"
+SELECT nope FROM (SELECT id FROM dt_a) AS t	!42703 column "nope" does not exist
+SELECT * FROM (SELECT id, n FROM dt_a) AS dt_a ORDER BY id	bigint,text	1|one ; 2|two ; 3|\N
+SELECT dt_a.id FROM (SELECT id, n FROM dt_a) AS dt_a ORDER BY 1	bigint	1 ; 2 ; 3
+SELECT * FROM (SELECT id FROM dt_a) AS T ORDER BY id	bigint	1 ; 2 ; 3
+SELECT * FROM (SELECT id FROM dt_a) AS "T" ORDER BY id	bigint	1 ; 2 ; 3
+SELECT T.id FROM (SELECT id FROM dt_a) AS "T" ORDER BY 1	!42P01 missing FROM-clause entry for table "t"
+
+# --- THE ALIAS IS OPTIONAL on 19, and then there is no name at all
+SELECT * FROM (SELECT id FROM dt_a)	bigint	1 ; 2 ; 3
+SELECT id FROM (SELECT id FROM dt_a) ORDER BY id	bigint	1 ; 2 ; 3
+SELECT * FROM (SELECT id FROM dt_a) WHERE id = 2	bigint	2
+
+# --- the column alias list: shorter is legal, longer is 42P10, and it REPLACES
+SELECT * FROM (SELECT id FROM dt_a) AS t (a) ORDER BY a	bigint	1 ; 2 ; 3
+SELECT * FROM (SELECT id, n FROM dt_a) AS t (a, b) ORDER BY a	bigint,text	1|one ; 2|two ; 3|\N
+SELECT a FROM (SELECT id, n FROM dt_a) AS t (a, b) ORDER BY a	bigint	1 ; 2 ; 3
+SELECT id FROM (SELECT id, n FROM dt_a) AS t (a, b) ORDER BY a	!42703 column "id" does not exist
+SELECT * FROM (SELECT id, n FROM dt_a) AS t (a) ORDER BY a	bigint,text	1|one ; 2|two ; 3|\N
+SELECT n FROM (SELECT id, n FROM dt_a) AS t (a) ORDER BY a	text	one ; two ; \N
+SELECT a, n FROM (SELECT id, n FROM dt_a) AS t (a) ORDER BY a	bigint,text	1|one ; 2|two ; 3|\N
+SELECT * FROM (SELECT id FROM dt_a) AS t (a, b) ORDER BY a	!42P10 table "t" has 1 columns available but 2 columns specified
+SELECT * FROM (SELECT id FROM dt_a) AS t (a, b)	!42P10 table "t" has 1 columns available but 2 columns specified
+SELECT * FROM (SELECT id FROM dt_a) AS t (a, b) WHERE a = 1	!42P10 table "t" has 1 columns available but 2 columns specified
+
+# --- what is inside it is a whole SELECT
+SELECT * FROM (SELECT id, n FROM dt_a ORDER BY id DESC) AS t	bigint,text	3|\N ; 2|two ; 1|one
+SELECT * FROM (SELECT id FROM dt_a) AS t WHERE id = 2	bigint	2
+SELECT * FROM (SELECT id, k FROM dt_a) AS t WHERE k IS NULL	bigint,bigint	2|\N
+SELECT * FROM (SELECT id FROM dt_a) AS t ORDER BY id DESC LIMIT 2	bigint	3 ; 2
+SELECT * FROM (SELECT id FROM dt_a LIMIT 1 OFFSET 1) AS t	bigint	2
+SELECT * FROM (SELECT DISTINCT a_id FROM dt_b) AS t ORDER BY a_id	bigint	1 ; 3
+SELECT * FROM (SELECT a_id, count(*) AS c FROM dt_b GROUP BY a_id) AS t ORDER BY a_id	bigint,bigint	1|2 ; 3|1
+SELECT * FROM (SELECT a_id, count(*) FROM dt_b GROUP BY a_id) AS t ORDER BY a_id	bigint,bigint	1|2 ; 3|1
+SELECT * FROM (SELECT id FROM dt_a WHERE id IN (SELECT a_id FROM dt_b)) AS t ORDER BY id	bigint	1 ; 3
+SELECT * FROM (SELECT id FROM dt_a WHERE id > (SELECT min(id) FROM dt_a)) AS t ORDER BY id	bigint	2 ; 3
+SELECT * FROM (SELECT (SELECT max(id) FROM dt_a)) AS t	bigint	3
+SELECT * FROM (SELECT id FROM (SELECT id FROM dt_a) AS inner_t) AS t ORDER BY id	bigint	1 ; 2 ; 3
+SELECT * FROM (SELECT a.id, b.v FROM dt_a a JOIN dt_b b ON b.a_id = a.id) AS t ORDER BY id, v	bigint,bigint	1|100 ; 1|200 ; 3|\N
+SELECT * FROM (SELECT id AS "Q" FROM dt_a) AS t ORDER BY 1	bigint	1 ; 2 ; 3
+SELECT "Q" FROM (SELECT id AS "Q" FROM dt_a) AS t ORDER BY 1	bigint	1 ; 2 ; 3
+SELECT * FROM (SELECT 1 AS a, 2 AS a) AS t	integer,integer	1|2
+SELECT a FROM (SELECT 1 AS a, 2 AS a) AS t	!42702 column reference "a" is ambiguous
+SELECT * FROM (SELECT 1) AS t	integer	1
+SELECT * FROM (SELECT 1 AS a) AS t	integer	1
+SELECT * FROM (SELECT id FROM dt_a WHERE id > 99) AS t	bigint	-
+SELECT * FROM (SELECT id FROM dt_a ORDER BY id) AS t ORDER BY t.id DESC	bigint	3 ; 2 ; 1
+SELECT id FROM (SELECT id, k FROM dt_a) AS t ORDER BY k	bigint	1 ; 3 ; 2
+
+# --- an aggregate OVER one, which is what `.from(subquery)` and `count` over `distinct` emit
+SELECT count(*) FROM (SELECT id FROM dt_a) AS t	bigint	3
+SELECT count(*) FROM (SELECT DISTINCT a_id FROM dt_b) AS t	bigint	2
+SELECT sum(x) FROM (SELECT k AS x FROM dt_a) AS t	numeric	16
+SELECT max(id), min(id) FROM (SELECT id FROM dt_a WHERE id > 1) AS t	bigint,bigint	3|2
+SELECT count(*) FROM (SELECT id FROM dt_a LIMIT 2) AS t	bigint	2
+SELECT count(*) FROM (SELECT id FROM dt_a WHERE id > 99) AS t	bigint	0
+SELECT count(*) FROM (SELECT id FROM dt_a) AS t WHERE t.id > 1	bigint	2
+SELECT count(*) FROM (SELECT id FROM dt_a) AS t GROUP BY id ORDER BY 1	bigint	1 ; 1 ; 1
+SELECT * FROM (SELECT count(*) AS c FROM dt_a) AS t	bigint	3
+SELECT c FROM (SELECT count(*) AS c FROM dt_a) AS t WHERE c > 2	bigint	3
+
+# --- joins against one, on either side
+SELECT t.id, b.v FROM (SELECT id FROM dt_a) AS t JOIN dt_b b ON b.a_id = t.id ORDER BY t.id, b.v	bigint,bigint	1|100 ; 1|200 ; 3|\N
+SELECT a.id, t.v FROM dt_a a JOIN (SELECT a_id, v FROM dt_b) AS t ON t.a_id = a.id ORDER BY a.id, t.v	bigint,bigint	1|100 ; 1|200 ; 3|\N
+SELECT a.id, t.v FROM dt_a a LEFT JOIN (SELECT a_id, v FROM dt_b) AS t ON t.a_id = a.id ORDER BY a.id, t.v	bigint,bigint	1|100 ; 1|200 ; 2|\N ; 3|\N
+SELECT * FROM (SELECT id FROM dt_a) AS t JOIN (SELECT a_id FROM dt_b) AS u ON u.a_id = t.id ORDER BY t.id	bigint,bigint	1|1 ; 1|1 ; 3|3
+SELECT t.id FROM dt_a JOIN (SELECT id FROM dt_a) AS t ON t.id = dt_a.id ORDER BY 1	bigint	1 ; 2 ; 3
+SELECT * FROM (SELECT id FROM dt_a) AS t JOIN dt_b AS t ON t.id = t.id	!42712 table name "t" specified more than once
+
+# --- a FROM item cannot see the ones beside it: that is what LATERAL is for
+SELECT * FROM (SELECT id FROM dt_a WHERE id = a.id) AS t, dt_a a	!42P01 missing FROM-clause entry for table "a"

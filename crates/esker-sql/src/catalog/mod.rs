@@ -257,6 +257,19 @@ pub const ROW_ID_BATCH: u64 = 256;
 /// every concurrent insert into a table contend on it.
 pub const SEQUENCE_BATCH: u64 = 32;
 
+/// The relation id every **derived table** wears: `FROM (SELECT …) AS t`.
+///
+/// A tenant's relation ids come from a sequence that starts at 1, so nothing a user creates
+/// reaches here, and it sits just below `pg_catalog`'s reserved block for the same reason that one
+/// exists: a [`TableDef`] has an id, and a relation nothing stores still needs one to be shaped
+/// like a table. **No key is ever built from it** — `crate::exec::query::plan` puts the
+/// sub-select's own plan where an access path would go, and `crate::exec::cursor` reads a derived
+/// join's inner side from that plan rather than from a range.
+///
+/// One id for all of them rather than one each: nothing compares two relation ids in a plan, and a
+/// counter would be a number in the output of `EXPLAIN` that changed with the statement around it.
+pub const DERIVED_TABLE_ID: u64 = u64::MAX - 1024;
+
 /// A table, its columns, its primary key and its indexes — everything needed to write a row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableDef {
@@ -359,6 +372,13 @@ impl TableDef {
         // and found by asking the running node a question the corpus could not: a real server's
         // `pg_type` has some thirty columns, so `SELECT *` is not a line two servers can agree on.
         if pg_catalog::view_of(self).is_some() {
+            return None;
+        }
+        // A **derived table** likewise: its rows come from a plan, not from a key, so there is no
+        // identity to hide in column 0 — and hiding one would drop the first column of every
+        // `SELECT * FROM (SELECT …) AS t`, which is the same wrong answer a catalog view gave
+        // before the line above it.
+        if self.id == DERIVED_TABLE_ID {
             return None;
         }
         self.primary_key_name.is_empty().then_some(0)

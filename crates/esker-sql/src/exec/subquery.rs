@@ -35,6 +35,14 @@ use crate::value::{Datum, PgDatum};
 /// with none — which is nearly all of them — is planned from the `Select` the caller already has,
 /// and nothing is cloned.
 pub(super) fn present(select: &Select) -> bool {
+    if select
+        .from
+        .iter()
+        .chain(select.joins.iter().map(|join| &join.table))
+        .any(|entry| entry.derived.is_some())
+    {
+        return true;
+    }
     let mut found = false;
     for_each_written_expr(select, &mut |expr| {
         found = found || contains_subquery(expr);
@@ -73,7 +81,137 @@ pub(super) fn plan_subqueries(
         }
     });
     outcome?;
+    // The `FROM` entries after the expressions, because a derived table's plan is what the
+    // statement's own scope is built from and a `LIMIT` may name neither.
+    for entry in std::iter::once(&mut select.from)
+        .flatten()
+        .chain(select.joins.iter_mut().map(|join| &mut join.table))
+    {
+        plan_derived(entry, tenant, txn, tables)?;
+    }
     fold_counts(select, txn, tenant)
+}
+
+/// One `FROM (SELECT …) AS t`: its plan, and the relation it looks like from above.
+///
+/// The relation is a **synthetic [`TableDef`]** — one column per output column of the sub-select,
+/// under [`crate::catalog::DERIVED_TABLE_ID`] — and building one is the whole trick this unit
+/// turns on. With it, `Scope` resolves a name, `SELECT *` expands, `EXPLAIN` prints the names the
+/// user typed and the join machinery probes or materialises, all without learning that nothing
+/// stores these rows. Without it every one of those would need a second code path.
+fn plan_derived(
+    entry: &mut crate::plan::TableRef,
+    tenant: u64,
+    txn: &dyn Txn,
+    tables: &dyn Tables,
+) -> Result<()> {
+    let name = entry.referred_as().to_owned();
+    let Some(derived) = entry.derived.as_mut() else {
+        return Ok(());
+    };
+    plan_subqueries(&mut derived.select, tenant, txn, tables)?;
+    let planned = plan_select_of(&derived.select, tenant, tables)?;
+
+    // A column alias list **may be shorter** than the target list — `AS t(a)` over two columns
+    // renames the first and leaves the second alone, measured — and only a longer one is an error.
+    // Refusing a short one reads like the obvious symmetry and would refuse a statement a real
+    // server runs.
+    if derived.columns.len() > planned.columns.len() {
+        return Err(SqlError::InvalidColumnReference(format!(
+            "table \"{name}\" has {} columns available but {} columns specified",
+            planned.columns.len(),
+            derived.columns.len()
+        )));
+    }
+    let columns: Vec<crate::catalog::ColumnDef> = planned
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(at, (column, ty, typmod))| crate::catalog::ColumnDef {
+            // The alias replaces the name outright: after `AS t(a, b)`, `t.id` is `42703`.
+            name: derived
+                .columns
+                .get(at)
+                .cloned()
+                .unwrap_or_else(|| column.clone()),
+            ty: *ty,
+            typmod: *typmod,
+            // Nothing is ever written into a derived table, so neither of these can be read: a
+            // `NOT NULL` is checked on insert and a default is applied on one.
+            not_null: false,
+            default: None,
+            // Every row this relation produces is exactly as wide as its target list, because the
+            // projection above the sub-plan built it — so no row is ever short and there is
+            // nothing to pad with.
+            missing: None,
+        })
+        .collect();
+    derived.def = Some(std::sync::Arc::new(crate::catalog::TableDef {
+        id: crate::catalog::DERIVED_TABLE_ID,
+        name,
+        columns,
+        primary_key: Vec::new(),
+        indexes: Vec::new(),
+        // Empty would mean "the user declared no primary key, so column 0 is an internal row id"
+        // — which is why `TableDef::row_id` names this id explicitly rather than reading this
+        // field. Left empty because it is the truth: there is no constraint here to name.
+        primary_key_name: String::new(),
+        schema_version: 1,
+        sequences: Vec::new(),
+    }));
+    // Wrapped rather than used bare, so `EXPLAIN` has a node to change the relation's name at:
+    // the plan text threads one table name down the whole tree, and without this a scan of `dt_a`
+    // inside `FROM (SELECT … FROM dt_a) AS t` prints `Seq Scan on t`.
+    derived.plan = Some(Box::new(Node::Derived {
+        input: Box::new(planned.node),
+        alias: derived
+            .def
+            .as_ref()
+            .map(|def| def.name.clone())
+            .unwrap_or_default(),
+        input_table: planned.table,
+        input_columns: planned.column_names,
+    }));
+    Ok(())
+}
+
+/// Plans one sub-`SELECT` against the tables it names. Shared by a subquery and a derived table.
+fn plan_select_of(
+    select: &Select,
+    tenant: u64,
+    tables: &dyn Tables,
+) -> Result<crate::exec::query::Planned> {
+    let table = match &select.from {
+        // A derived table inside a derived table: its own pass has already run, so the relation it
+        // looks like is there to be borrowed.
+        Some(from) => Some(relation_of(from, tables)?),
+        None => None,
+    };
+    let inners = select
+        .joins
+        .iter()
+        .map(|join| relation_of(&join.table, tables))
+        .collect::<Result<Vec<_>>>()?;
+    let inner_refs: Vec<&crate::catalog::TableDef> = inners.iter().map(AsRef::as_ref).collect();
+    // **Never routed.** `crate::exec::query::plan` leaves `Planned::engine` at `None` and only
+    // `crate::exec::fragment::route` fills it in; this is the call that does not make it, which is
+    // what ADR 0040 asks a plan carrying a subquery to be able to say
+    // (`docs/plans/phase-12-subquery.md` §4). A fragment's filter language has no subquery in it
+    // and its answer arrives whole in one message, so there is nothing here for a replica to do.
+    crate::exec::query::plan(select, tenant, table.as_deref(), &inner_refs)
+}
+
+/// The relation one `FROM` entry stands for: a real table, or a derived table's synthetic one.
+pub(super) fn relation_of(
+    entry: &crate::plan::TableRef,
+    tables: &dyn Tables,
+) -> Result<std::sync::Arc<crate::catalog::TableDef>> {
+    match entry.derived.as_ref() {
+        None => tables.get(&entry.name),
+        Some(derived) => derived.def.clone().ok_or_else(|| {
+            SqlError::Internal("a derived table reached the planner without a shape".to_owned())
+        }),
+    }
 }
 
 /// `LIMIT (SELECT …)` and `OFFSET (SELECT …)`, run here and replaced by the number they answered.
@@ -112,23 +250,7 @@ pub(super) trait Tables {
 fn plan_one(sub: &mut SubqueryExpr, tenant: u64, txn: &dyn Txn, tables: &dyn Tables) -> Result<()> {
     plan_subqueries(&mut sub.select, tenant, txn, tables)?;
 
-    let table = match &sub.select.from {
-        Some(from) => Some(tables.get(&from.name)?),
-        None => None,
-    };
-    let inners = sub
-        .select
-        .joins
-        .iter()
-        .map(|join| tables.get(&join.table.name))
-        .collect::<Result<Vec<_>>>()?;
-    let inner_refs: Vec<&crate::catalog::TableDef> = inners.iter().map(AsRef::as_ref).collect();
-    // **Never routed.** `crate::exec::query::plan` leaves `Planned::engine` at `None` and only
-    // `crate::exec::fragment::route` fills it in; this is the call that does not make it, which is
-    // what ADR 0040 asks a plan carrying a subquery to be able to say (§4 of the plan file). A
-    // fragment's filter language has no subquery in it and its answer arrives whole in one
-    // message, so there is nothing here for a columnar replica to do.
-    let planned = crate::exec::query::plan(&sub.select, tenant, table.as_deref(), &inner_refs)?;
+    let planned = plan_select_of(&sub.select, tenant, tables)?;
 
     // `EXISTS` reads rows and not values, so any number of columns is legal under it — measured,
     // `SELECT EXISTS (SELECT id, n FROM sq_a)` is `t`. Every other kind wants exactly one, and
@@ -419,7 +541,7 @@ fn for_each_node_expr_mut(node: &mut Node, visit: &mut impl FnMut(&mut Expr)) {
             }
             for_each_node_expr_mut(outer, visit);
         }
-        Node::Limit { input, .. } | Node::Distinct { input } => {
+        Node::Limit { input, .. } | Node::Distinct { input } | Node::Derived { input, .. } => {
             for_each_node_expr_mut(input, visit);
         }
         // A routed aggregate carries the row plan it falls back to, and that plan is the one that
