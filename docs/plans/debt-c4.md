@@ -316,3 +316,33 @@ Golden bytes for the request and the response, derived independently again. The 
 carries two regions that meet and one store shared by both, so it pins the contiguity the caller
 checks and the deduplication the shape exists for.
 
+## 7. `esker server` lacked `region_split_size` and the heartbeat intervals
+
+Inventory #16. `docs/plans/phase-6b.md` debt list, item 6; the complaint itself is in
+`docs/bench/phase-4.md`'s method table, which records that the phase-4 lane had to run a scratchpad
+wrapper — *"`esker-cli`'s own `server.rs`/`pd.rs` with those `StoreOptions`/`PdOptions` fields
+exposed as flags, otherwise identical"* — to get a meaningful region count without minutes of
+writing at the 96 MiB default.
+
+Four plain flags: `--region-split-size`, `--store-heartbeat-ms`, `--region-heartbeat-ms`,
+`--heartbeat-tick-ms`. Each refuses zero, because zero is a typo rather than "the default": a split
+size of zero asks a leader to split every region for ever, and a heartbeat interval of zero beats
+on every tick. Absent means the store's own default, so a flag's absence is not a different
+configuration from not having the flag.
+
+`--heartbeat-tick-ms` is in there because the other two are counted **in ticks**
+(`esker_store::Heartbeats`), so an interval below one tick is rounded up to one and shortening an
+interval without also shortening the tick does nothing. The help text says so, because a knob that
+silently does nothing is worse than a missing one.
+
+`store_options` is a function now rather than an expression inside `run`, and that is what the test
+holds on to: each of these parses fine and does nothing at all if it is dropped on the way through
+to `StoreOptions`, which is a failure no parse test can see. Two tests, one for the knobs reaching
+the store and one for the defaults standing without them, plus the parse test in both spellings
+(`--flag value` and `--flag=value` are two code paths) and a zero and a word refused for each.
+
+`docs/bench/phase-4.md`'s two wrapper notes are updated to say which half is closed. **The store
+half is; the PD half is not** — `pd serve` still exposes no `PdOptions` field, and that run set
+`max_store_down_time_ms` among others, so `pdwrap` is still needed and the note says so rather than
+claiming a fix that does not exist.
+

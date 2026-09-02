@@ -225,6 +225,21 @@ Server options:
       --peer ID@ADDR    A peer of the region, repeatable, this store's included
       --write-buffer-size N
                         Memtable bytes before a flush (default 64 MiB)
+      --region-split-size N
+                        Approximate region bytes past which a leader looks for a split
+                        key (default 96 MiB). A store with no --pd never splits,
+                        whatever this says: a split needs cluster-unique ids
+      --store-heartbeat-ms N
+                        How often this store reports itself to PD (default 10000)
+      --region-heartbeat-ms N
+                        How often each region's leader reports it absent a change
+                        (default 60000). Also the latency of an operator: PD answers
+                        a region heartbeat and has no other way to reach a store
+      --heartbeat-tick-ms N
+                        The resolution of the two intervals above, which are counted
+                        in these ticks (default 1000). An interval below one tick is
+                        rounded up to one, so shortening an interval without also
+                        shortening the tick does nothing
       --sst-store URL   Tier this store's SSTs into s3://bucket/prefix, keeping the
                         WAL and the Raft log local. The endpoint and credentials
                         come from ESKER_S3_ENDPOINT, ESKER_S3_KEY, ESKER_S3_SECRET
@@ -780,6 +795,52 @@ fn parse_pd(arguments: &[String]) -> Result<Command, ParseError> {
     }
 }
 
+/// Sets one of `esker server`'s numeric knobs, refusing zero.
+///
+/// Zero is a typo rather than "the default": a split size of zero would ask a leader to split every
+/// region for ever, and a heartbeat interval of zero would beat on every tick.
+fn set_server_knob(
+    options: &mut ServerOptions,
+    flag: &'static str,
+    raw: &str,
+) -> Result<(), ParseError> {
+    let value = Some(positive_u64(raw, flag)?);
+    match flag {
+        "--region-split-size" => options.region_split_size = value,
+        "--store-heartbeat-ms" => options.store_heartbeat_ms = value,
+        "--region-heartbeat-ms" => options.region_heartbeat_ms = value,
+        _ => options.heartbeat_tick_ms = value,
+    }
+    Ok(())
+}
+
+/// The `'static` name of one of `esker server`'s numeric knobs.
+///
+/// `ParseError::InvalidValue` carries a `&'static str`, and `flag` here is borrowed from the
+/// argument vector — so the arm that handles four flags at once has to map back to the literal.
+fn server_knob(flag: &str) -> &'static str {
+    match flag {
+        "--region-split-size" => "--region-split-size",
+        "--store-heartbeat-ms" => "--store-heartbeat-ms",
+        "--region-heartbeat-ms" => "--region-heartbeat-ms",
+        _ => "--heartbeat-tick-ms",
+    }
+}
+
+/// A `u64` flag value that must be above zero.
+fn positive_u64(raw: &str, flag: &'static str) -> Result<u64, ParseError> {
+    raw.parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or(ParseError::InvalidValue {
+            flag,
+            value: raw.to_owned(),
+        })
+}
+
+/// A flat dispatch over eighteen flags, which is the shape it should be: grouping them into
+/// helpers to satisfy a line count would put the flag and what it sets in two different places.
+#[allow(clippy::too_many_lines)]
 fn parse_server(arguments: &[String]) -> Result<Command, ParseError> {
     let mut options = ServerOptions::default();
     let mut index = 0;
@@ -820,6 +881,16 @@ fn parse_server(arguments: &[String]) -> Result<Command, ParseError> {
                         value: raw.clone(),
                     },
                 )?);
+            }
+            // The four `StoreOptions` knobs `docs/bench/phase-4.md` had to wrap this binary to
+            // reach. Each takes the same shape, so they take one arm.
+            "--region-split-size"
+            | "--store-heartbeat-ms"
+            | "--region-heartbeat-ms"
+            | "--heartbeat-tick-ms" => {
+                let named = server_knob(flag);
+                let raw = take_value(arguments, &mut index, inline, named)?;
+                set_server_knob(&mut options, named, &raw)?;
             }
             "--store-id" => {
                 let raw = take_value(arguments, &mut index, inline, "--store-id")?;
@@ -1328,6 +1399,55 @@ mod tests {
             panic!("expected a server command");
         };
         assert_eq!(options.sst_store, None, "absent means local SSTs");
+
+        // The four knobs `docs/bench/phase-4.md` had to wrap this binary to reach, in both
+        // spellings, because `--flag value` and `--flag=value` are two code paths.
+        let Command::Server(options) = parse_ok(&[
+            "server",
+            "--region-split-size",
+            "1048576",
+            "--store-heartbeat-ms=2000",
+            "--region-heartbeat-ms",
+            "1000",
+            "--heartbeat-tick-ms=100",
+        ]) else {
+            panic!("expected a server command");
+        };
+        assert_eq!(options.region_split_size, Some(1024 * 1024));
+        assert_eq!(options.store_heartbeat_ms, Some(2_000));
+        assert_eq!(options.region_heartbeat_ms, Some(1_000));
+        assert_eq!(options.heartbeat_tick_ms, Some(100));
+
+        // Absent is the store's default, not zero, and each of them refuses a zero: a split size
+        // of zero splits for ever and a heartbeat of zero beats on every tick.
+        let Command::Server(options) = parse_ok(&["server"]) else {
+            panic!("expected a server command");
+        };
+        assert_eq!(options.region_split_size, None);
+        assert_eq!(options.store_heartbeat_ms, None);
+        assert_eq!(options.region_heartbeat_ms, None);
+        assert_eq!(options.heartbeat_tick_ms, None);
+        for flag in [
+            "--region-split-size",
+            "--store-heartbeat-ms",
+            "--region-heartbeat-ms",
+            "--heartbeat-tick-ms",
+        ] {
+            assert!(
+                matches!(
+                    parse(["server", flag, "0"]),
+                    Err(ParseError::InvalidValue { .. })
+                ),
+                "{flag} accepted zero"
+            );
+            assert!(
+                matches!(
+                    parse(["server", flag, "not-a-number"]),
+                    Err(ParseError::InvalidValue { .. })
+                ),
+                "{flag} accepted a word"
+            );
+        }
 
         let Command::Cluster(ClusterOptions::Start { sst_store, .. }) =
             parse_ok(&["cluster", "start", "--sst-store=s3://esker/c1"])
