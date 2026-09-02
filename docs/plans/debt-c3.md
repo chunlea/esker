@@ -97,12 +97,42 @@ version, and one bit cannot tell a "two of three column families" miss from a cl
 the shape [ADR 0032](../adr/0032-a-snapshot-carries-every-column-family.md) found in the snapshot
 stream this week.
 
-### Left owed, deliberately
+## 1b. The columnar runs go with the region
 
-A retired region's **columnar runs** are not reclaimed. They are immutable files under
-`<data_dir>/columnar/<region_id>/` swept by their own manifest, and removing a tree of them needs a
-`FileSystem` capability the trait does not have — `delete` takes a file, and nothing answers "is
-this a directory". It is derived, rebuildable state and only exists on a store that held a columnar
-learner, so it is a smaller leak than the one this unit closes. Adding `remove_dir_all` to
-`FileSystem` touches four implementations and belongs with inventory #10, which is the other reason
-to open that trait.
+Unit 1 left this owed and written down, which under this wave's standing order is a bug rather than
+a deferral. A region's data is not only its keys: a columnar learner writes an immutable tree of run
+files under `<data_dir>/columnar/<region_id>/`, swept by a manifest of its own, **beside** the
+engine rather than inside it — so nothing the engine reclaims can reach it, and a retired region
+left one behind on every store that had ever held a columnar copy of it.
+
+It could not be built out of what `FileSystem` had. `delete` takes a file, `list` takes a directory,
+and nothing in the trait says which a path is, so a recursive removal written against it cannot
+take the first step. `FileSystem::remove_dir_all` is therefore new, with **no default**, which is
+what makes each of the five implementations state its own answer rather than inherit a wrong one:
+`LocalFileSystem`, `MemFileSystem`, `FaultFileSystem`, `TieredFileSystem`, and the `CrashFs` in
+`esker-engine`'s own version test.
+
+Three decisions in it are worth the words:
+
+* **idempotent**, because the caller may be running after a crash interrupted it, so "already gone"
+  is the ordinary case and not a failure;
+* **the directory goes too**, not just its contents, because "does this exist" is how a caller asks
+  whether the reclamation happened;
+* the in-memory implementation matches by **ancestry, not string prefix**, so `columnar/12` is not
+  swept up beside `columnar/1`. That is one `starts_with` away from a silent cross-region delete.
+
+The fault injector deliberately does not count or fault it, on the same terms as its `open`: this
+removes files of a region the cluster has already taken away, every caller logs a failure and
+carries on, so an injected fault would exercise a `warn!` rather than a recovery path.
+
+On the store side the slot in `Store::columnar` is dropped **before** the tree — it owns the
+`RunSet` that owns the manifest, and a fragment arriving mid-removal would otherwise reopen the
+table and write a manifest back into a directory being deleted — and the removal runs
+unconditionally after the range clear rather than chained onto its success: the copy is derived from
+the range and belongs to a region that is gone either way. The parent directory is `fsync`ed, since
+a removal is not durable until the directory that held the entry is.
+
+Asserted in the same test as the range, and in both directions:
+`a_removed_peer_reclaims_the_range_in_every_column_family` plants a copy for the region being shed
+**and one for a region that is not**, and the second is what says the removal is per region id
+rather than a sweep of `<data_dir>/columnar`.

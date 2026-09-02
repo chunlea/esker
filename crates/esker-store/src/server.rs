@@ -706,7 +706,7 @@ impl Store {
     }
 
     /// Stops serving a region this store has been removed from, forgets its Raft state, and
-    /// **reclaims its range**.
+    /// **reclaims its range and its columnar copy**.
     ///
     /// Spawned rather than done here, because one caller is the removed peer's **own driver
     /// thread**: stopping it from inside is a join on itself.
@@ -830,10 +830,10 @@ impl Store {
         }
 
         let db = Arc::clone(&self.db);
-        let region = region.clone();
+        let cleared = region.clone();
         let region_id = region.id;
         // On a blocking thread: `clear_range` is a delete, a flush and a compaction of the range.
-        match tokio::task::spawn_blocking(move || snapshot::clear_range(&db, &region)).await {
+        match tokio::task::spawn_blocking(move || snapshot::clear_range(&db, &cleared)).await {
             Ok(Ok(())) => tracing::info!(
                 region_id,
                 "a retired region's range was reclaimed in every column family"
@@ -847,6 +847,60 @@ impl Store {
             }
             Err(error) => {
                 tracing::warn!(region_id, %error, "the reclamation task failed");
+            }
+        }
+        // **Unconditionally after it**, and not chained onto its success. The columnar copy is
+        // derived from the range and belongs to a region that is gone either way; a range clear
+        // that failed is a reason to keep the *keys*, never a reason to keep a copy of them.
+        self.reclaim_columnar_copy(region_id).await;
+    }
+
+    /// Removes a retired region's columnar copy: the in-memory slot, then the tree of runs.
+    ///
+    /// The copy is a directory of immutable run files and a manifest of its own
+    /// (`crate::columnar::runs`), one per region id, written **beside** the engine rather than
+    /// inside it — so nothing the engine reclaims touches it and it has to be reclaimed here. Left
+    /// behind, it is the same unbounded growth as the range, on every store that ever held a
+    /// columnar learner.
+    ///
+    /// Per region id, which is what makes it safe without a second look at the region map: PD
+    /// never reuses an id, and a split child gets its own directory. Sweeping
+    /// `<data_dir>/columnar` would be a different and much worse operation.
+    ///
+    /// The slot goes first. It holds the `RunSet` that owns the manifest, and a fragment arriving
+    /// mid-removal would otherwise reopen the table and write a manifest back into a directory
+    /// being deleted.
+    async fn reclaim_columnar_copy(self: &Arc<Self>, region_id: u64) {
+        {
+            let mut slots = self
+                .columnar
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slots.remove(&region_id);
+        }
+        let fs = Arc::clone(&self.fs);
+        let root = self.data_dir.join("columnar");
+        let dir = root.join(region_id.to_string());
+        let removed = tokio::task::spawn_blocking(move || {
+            fs.remove_dir_all(&dir)?;
+            // The removal is not durable until the directory that held the entry is synced. A
+            // parent that has never existed is not an error: this store has never written a
+            // columnar run at all.
+            match fs.fsync_dir(&root) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            }
+        })
+        .await;
+        match removed {
+            Ok(Ok(())) => {
+                tracing::debug!(region_id, "a retired region's columnar copy was removed");
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(region_id, %error, "a retired region's columnar copy was not removed");
+            }
+            Err(error) => {
+                tracing::warn!(region_id, %error, "the columnar reclamation task failed");
             }
         }
     }

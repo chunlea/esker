@@ -675,6 +675,14 @@ impl FileSystem for TieredFileSystem {
         self.local.fsync_dir(dir)
     }
 
+    fn remove_dir_all(&self, dir: &Path) -> io::Result<()> {
+        // Local only, like `delete` above and for the same reason: what is in the bucket is
+        // decided by `retain`, which is the one place that knows whether a live version still
+        // needs it. Nothing under a region's own directory is ever uploaded — the tier holds
+        // SSTs — so there is nothing here for `retain` to hear about.
+        self.local.remove_dir_all(dir)
+    }
+
     fn size(&self, path: &Path) -> io::Result<u64> {
         match self.local.size(path) {
             Ok(size) => Ok(size),

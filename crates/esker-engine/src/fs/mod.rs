@@ -90,6 +90,22 @@ pub trait FileSystem: Send + Sync + fmt::Debug {
     /// Creates `dir` and any missing parents. Succeeds if it already exists.
     fn create_dir_all(&self, dir: &Path) -> io::Result<()>;
 
+    /// Removes `dir` and everything under it. Succeeds if it is already gone.
+    ///
+    /// The inverse of [`create_dir_all`](Self::create_dir_all), and the one operation that cannot
+    /// be built out of [`list`](Self::list) and [`delete`](Self::delete): `delete` takes a file,
+    /// `list` takes a directory, and nothing here says which a path is. It exists because a
+    /// *region's* files are a tree — the columnar copy of one lives under a directory of its own —
+    /// so reclaiming a region that has gone away needs a tree to go with it
+    /// ([ADR 0034](../../../../docs/adr/0034-a-removed-peer-is-swept-and-its-range-reclaimed.md)).
+    ///
+    /// **Idempotent, deliberately.** The one caller runs after a crash may have interrupted it, so
+    /// "already gone" is the ordinary case and not a failure. Every other error is returned.
+    ///
+    /// No implementation may treat this as "empty the directory": the directory goes too, because
+    /// "does this exist" is how a caller asks whether the reclamation happened.
+    fn remove_dir_all(&self, dir: &Path) -> io::Result<()>;
+
     /// Creates a hard link at `to` pointing at `from`.
     ///
     /// This is what makes `checkpoint` cheap: SSTs are immutable, so a checkpoint links them
@@ -240,6 +256,13 @@ impl FileSystem for LocalFileSystem {
 
     fn create_dir_all(&self, dir: &Path) -> io::Result<()> {
         fs::create_dir_all(dir)
+    }
+
+    fn remove_dir_all(&self, dir: &Path) -> io::Result<()> {
+        match fs::remove_dir_all(dir) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        }
     }
 
     fn hard_link(&self, from: &Path, to: &Path) -> io::Result<()> {

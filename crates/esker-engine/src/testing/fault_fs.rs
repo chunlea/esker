@@ -335,6 +335,14 @@ impl FileSystem for FaultFileSystem {
         self.shared.inner.create_dir_all(dir)
     }
 
+    fn remove_dir_all(&self, dir: &Path) -> io::Result<()> {
+        // **Not counted and not faulted**, on the same terms as `open`: this removes files that
+        // belong to a region the cluster has already taken away, so a failure here costs disk and
+        // never data. Every caller logs it and carries on, which means an injected failure would
+        // exercise a `warn!` rather than a recovery path.
+        self.shared.inner.remove_dir_all(dir)
+    }
+
     fn hard_link(&self, from: &Path, to: &Path) -> io::Result<()> {
         let operation = Operation::HardLink(from.to_path_buf(), to.to_path_buf());
         if let Decision::Inject(fault) = self.shared.begin(&operation) {

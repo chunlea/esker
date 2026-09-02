@@ -182,6 +182,20 @@ impl FileSystem for MemFileSystem {
         }
     }
 
+    fn remove_dir_all(&self, dir: &Path) -> io::Result<()> {
+        let mut inner = self.inner.lock().map_err(|_| poisoned())?;
+        // A path is "under `dir`" by ancestry rather than by string prefix, so a sibling whose
+        // name merely starts with this one's — `columnar/12` beside `columnar/1` — is not swept
+        // up with it.
+        inner
+            .files
+            .retain(|path, _| !path.ancestors().any(|ancestor| ancestor == dir));
+        inner
+            .dirs
+            .retain(|path| !path.ancestors().any(|ancestor| ancestor == dir));
+        Ok(())
+    }
+
     fn hard_link(&self, from: &Path, to: &Path) -> io::Result<()> {
         let mut inner = self.inner.lock().map_err(|_| poisoned())?;
         let shared = inner

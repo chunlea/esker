@@ -10,6 +10,11 @@
 //! disk space. A store must reclaim the range it no longer owns, **and** a store that still owns
 //! it must be untouched: a reclamation that ran on the wrong store, or against a stale record of
 //! a range that has since narrowed, deletes acknowledged writes (invariant 5).
+//!
+//! A region's data is not only its keys. The columnar copy is a tree of immutable run files
+//! written *beside* the engine, one directory per region id, so nothing the engine reclaims can
+//! reach it and it has to be reclaimed by name — which is why `FileSystem` grew a tree removal
+//! and why both halves of the rule are asserted about it too.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -31,7 +36,7 @@ use esker_store::{LogCompaction, PeerAddress, Store, StoreOptions, StoreService}
 struct Node {
     store: Arc<Store>,
     handle: ServerHandle,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
 }
 
 impl Node {
@@ -39,6 +44,25 @@ impl Node {
         self.store.stop();
         let _ = within("the server to shut down", self.handle.shutdown()).await;
     }
+
+    /// Where a region's columnar copy lives on this store: one directory per region id, written
+    /// **beside** the engine rather than inside it (`esker_store::columnar::runs`).
+    fn columnar_dir(&self, region_id: u64) -> std::path::PathBuf {
+        self.dir.path().join("columnar").join(region_id.to_string())
+    }
+}
+
+/// Puts a file where a region's columnar runs would be, so a reclamation has something to reclaim.
+///
+/// Written by hand rather than by driving a columnar learner, because what is under test is that
+/// the **directory** goes with the region: a manifest and a run file are what a real copy leaves,
+/// and this asserts about the tree rather than about their contents.
+fn plant_columnar_copy(node: &Node, region_id: u64) -> std::path::PathBuf {
+    let dir = node.columnar_dir(region_id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("RUNS"), b"a manifest").unwrap();
+    std::fs::write(dir.join("000001.run"), b"a run").unwrap();
+    dir
 }
 
 /// The deadline every store-reaching await gets, so a wedge becomes a failure rather than a hang.
@@ -118,11 +142,7 @@ async fn open(
     .await
     .unwrap();
     let handle = server.spawn().unwrap();
-    Node {
-        store,
-        handle,
-        _dir: dir,
-    }
+    Node { store, handle, dir }
 }
 
 async fn wait_for<F: FnMut() -> bool>(what: &str, mut ready: F) {
@@ -256,6 +276,27 @@ fn counts(store: &Arc<Store>, region: &Region) -> Vec<(&'static str, usize)> {
         .to_vec()
 }
 
+/// Four committed rows, one uncommitted prewrite and one `RawKV` put, so `default`, `write` and
+/// `lock` all hold keys in the region's range.
+///
+/// The prewrite is what makes the third family non-empty: a committed key leaves `write` and
+/// `default` and no lock, so a reclamation that missed `lock` entirely would pass a test built only
+/// from commits — which is the shape of the version-1 snapshot miss this file's header names.
+async fn seed_all_three_families(store: &Arc<Store>, region: &Region) {
+    for n in 0..4 {
+        commit_one(
+            store,
+            region,
+            key(n),
+            10 + u64::from(n) * 2,
+            11 + u64::from(n) * 2,
+        )
+        .await;
+    }
+    prewrite_only(store, region, key(50), 100).await;
+    put(store, region, key(200), b"raw").await;
+}
+
 /// Puts a voting replica of region 1 on `second`, and waits until every column family of it has
 /// landed there. Answers the region as the second store holds it.
 ///
@@ -332,18 +373,7 @@ async fn a_removed_peer_reclaims_the_range_in_every_column_family() {
     .await;
 
     let region = first.store.regions().regions()[0].clone();
-    for n in 0..4 {
-        commit_one(
-            &first.store,
-            &region,
-            key(n),
-            10 + u64::from(n) * 2,
-            11 + u64::from(n) * 2,
-        )
-        .await;
-    }
-    prewrite_only(&first.store, &region, key(50), 100).await;
-    put(&first.store, &region, key(200), b"raw").await;
+    seed_all_three_families(&first.store, &region).await;
 
     let second = open(
         second_address,
@@ -359,6 +389,11 @@ async fn a_removed_peer_reclaims_the_range_in_every_column_family() {
         before_on_leader.iter().all(|(_, held)| *held > 0),
         "the leader does not hold all three column families: {before_on_leader:?}"
     );
+
+    // A columnar copy of the region being shed, and one of a region that is not — the second is
+    // what says the removal is per region id rather than a sweep of `<data_dir>/columnar`.
+    let shed_copy = plant_columnar_copy(&second, 1);
+    let other_copy = plant_columnar_copy(&second, 7);
 
     pd.issue(Operator::RemovePeer {
         region_id: 1,
@@ -386,6 +421,18 @@ async fn a_removed_peer_reclaims_the_range_in_every_column_family() {
             (esker_engine::cf::WRITE, 0)
         ],
         "a store removed from a region kept keys of it"
+    );
+
+    // The columnar copy goes with the region, on the same terms and after the same gates: it is a
+    // tree of immutable run files under no manifest but its own, so nothing the engine reclaims
+    // would ever touch it.
+    wait_for("the shed region's columnar copy to be removed", || {
+        !shed_copy.exists()
+    })
+    .await;
+    assert!(
+        other_copy.exists(),
+        "reclaiming one region's columnar copy took another region's with it"
     );
 
     // And the store that still hosts it lost nothing. This is the half that would turn the fix

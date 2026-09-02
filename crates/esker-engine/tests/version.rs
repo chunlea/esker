@@ -218,6 +218,9 @@ impl FileSystem for CrashFs {
     fn create_dir_all(&self, dir: &Path) -> io::Result<()> {
         self.inner.create_dir_all(dir)
     }
+    fn remove_dir_all(&self, dir: &Path) -> io::Result<()> {
+        self.inner.remove_dir_all(dir)
+    }
     fn hard_link(&self, from: &Path, to: &Path) -> io::Result<()> {
         self.inner.hard_link(from, to)
     }

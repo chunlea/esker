@@ -1,7 +1,7 @@
 # 0034 — a removed peer is swept by the placement driver, and its range is reclaimed
 
-Status: accepted. Debt wave c3, unit 1, from `docs/plans/debt-c3.md` §1 — recorded as "a retired
-region's data is never reclaimed".
+Status: accepted. Debt wave c3, units 1 and 1b, from `docs/plans/debt-c3.md` §1 — recorded as "a
+retired region's data is never reclaimed".
 
 ## Context
 
@@ -108,12 +108,33 @@ peer — the state this ADR is fixing, reached only when something else is alrea
 A store with no placement driver never sweeps. It also never receives a `RemovePeer`, so there is
 nothing for it to sweep.
 
-**What this does not reclaim: a retired region's columnar runs.** They live beside the engine as
-immutable files under `<data_dir>/columnar/<region_id>/`, swept by their own manifest, and removing
-a tree of them needs a `FileSystem` capability the trait does not have (`delete` is a file, and
-nothing answers "is this a directory"). It is a smaller leak — derived, rebuildable state, only on
-a store that held a columnar learner — and it is recorded in `docs/plans/debt-c3.md` §1 rather than
-fixed here.
+**The columnar runs go too, and the trait grew a capability to make that possible.** They live
+beside the engine as immutable files under `<data_dir>/columnar/<region_id>/`, swept by their own
+manifest, so nothing the engine reclaims can reach them. Removing a tree of them could not be built
+out of `list` and `delete` — `delete` takes a file, `list` takes a directory, and nothing in
+`FileSystem` said which a path is — so `FileSystem::remove_dir_all` is new, with no default, which
+makes every implementation state its answer: the local one, the in-memory one, the fault injector,
+the tiered wrapper, and the crash filesystem in `esker-engine`'s version test.
+
+It is idempotent, because the caller may be running after a crash interrupted it, and it removes
+the directory rather than emptying it, because "does this exist" is how the caller asks whether the
+reclamation happened. The in-memory implementation matches by **ancestry** rather than by string
+prefix, so `columnar/12` is not swept up beside `columnar/1`.
+
+The slot in `Store::columnar` is dropped before the tree, because it owns the `RunSet` that owns
+the manifest and a fragment arriving mid-removal would otherwise reopen the table and write a
+manifest back into a directory being deleted. The removal runs unconditionally after the range
+clear rather than chained onto its success: the copy is derived from the range and belongs to a
+region that is gone either way, and a range clear that failed is a reason to keep the *keys*, never
+a reason to keep a copy of them. Per region id, which is what makes it safe without a second look
+at the region map — PD never reuses an id and a split child gets its own directory. The parent is
+`fsync`ed after, since a directory removal is not durable until the directory that held the entry
+is.
+
+The fault injector deliberately does **not** count or fault it, on the same terms as `open`: this
+removes files belonging to a region the cluster has already taken away, so every caller logs a
+failure and carries on, and an injected failure would exercise a `warn!` rather than a recovery
+path.
 
 ## Alternatives rejected
 
