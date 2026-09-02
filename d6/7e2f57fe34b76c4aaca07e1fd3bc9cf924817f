@@ -1,0 +1,19 @@
+docs/plans/phase-11-engine.md
+  s_f3955267395e69::t_7d0e5cb863fedd 647-702
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "d67e2f57fe34b76c4aaca07e1fd3bc9cf924817f",
+  "prompts": {},
+  "sessions": {
+    "s_f3955267395e69": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f99c5188-2954-40ae-b928-dc5eaa3b622d",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
