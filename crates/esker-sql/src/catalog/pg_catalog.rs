@@ -105,11 +105,24 @@ pub enum CatalogView {
     /// and that condition is **false for every column on a real server too**, so the answer is
     /// NULL on both.
     PgCollation,
+    /// The extensions installed here, which is **none** — where a real server always has at least
+    /// `plpgsql`.
+    ///
+    /// A declared divergence rather than a gap, and the same argument that keeps
+    /// [`CatalogView::PgCollation`] empty: a row here would tell a client
+    /// `CREATE FUNCTION … LANGUAGE plpgsql` will work, and there is no procedural language and no
+    /// `CREATE EXTENSION` on this node. `ActiveRecord` reads it to write `enable_extension` lines
+    /// into a schema dump, and none is the truth.
+    PgExtension,
+    /// Which relation inherits which, which is **nothing**: there is no `INHERITS` and no
+    /// `PARTITION BY` here, so the emptiness is complete rather than provisional. Empty on a real
+    /// server too until something partitions.
+    PgInherits,
 }
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 14] = [
+    pub const ALL: [CatalogView; 16] = [
         CatalogView::PgType,
         CatalogView::PgRange,
         CatalogView::PgClass,
@@ -119,6 +132,8 @@ impl CatalogView {
         CatalogView::PgIndex,
         CatalogView::PgConstraint,
         CatalogView::PgCollation,
+        CatalogView::PgExtension,
+        CatalogView::PgInherits,
         CatalogView::InformationSchemaTables,
         CatalogView::InformationSchemaColumns,
         CatalogView::InformationSchemaTableConstraints,
@@ -139,6 +154,8 @@ impl CatalogView {
             CatalogView::PgIndex => "pg_index",
             CatalogView::PgConstraint => "pg_constraint",
             CatalogView::PgCollation => "pg_collation",
+            CatalogView::PgExtension => "pg_extension",
+            CatalogView::PgInherits => "pg_inherits",
             CatalogView::InformationSchemaTables => "information_schema.tables",
             CatalogView::InformationSchemaColumns => "information_schema.columns",
             CatalogView::InformationSchemaTableConstraints => {
@@ -165,6 +182,8 @@ impl CatalogView {
                 CatalogView::PgIndex => 6,
                 CatalogView::PgConstraint => 7,
                 CatalogView::PgCollation => 8,
+                CatalogView::PgExtension => 14,
+                CatalogView::PgInherits => 15,
                 CatalogView::InformationSchemaTables => 9,
                 CatalogView::InformationSchemaColumns => 10,
                 CatalogView::InformationSchemaTableConstraints => 11,
@@ -227,6 +246,18 @@ impl CatalogView {
             CatalogView::PgCollation => {
                 &[("oid", ColumnType::Int8), ("collname", ColumnType::Text)]
             }
+            // Exactly the two `ActiveRecord` reads of each, which is this module's standing rule:
+            // a column it does not read is `42703`, the answer a real server gives for a name that
+            // is not a column at all, rather than a value nobody measured. `extname` is a `name`
+            // and the three oids are `oid` on a real server; all four are this node's own types.
+            CatalogView::PgExtension => &[
+                ("extname", ColumnType::Text),
+                ("extnamespace", ColumnType::Int8),
+            ],
+            CatalogView::PgInherits => &[
+                ("inhrelid", ColumnType::Int8),
+                ("inhparent", ColumnType::Int8),
+            ],
             CatalogView::InformationSchemaTables => super::information_schema::TABLES_COLUMNS,
             CatalogView::InformationSchemaColumns => super::information_schema::COLUMNS_COLUMNS,
             CatalogView::InformationSchemaTableConstraints => {
@@ -314,6 +345,8 @@ impl CatalogView {
             // here — `rows_of` answers for those before it delegates.
             CatalogView::PgRange
             | CatalogView::PgCollation
+            | CatalogView::PgExtension
+            | CatalogView::PgInherits
             | CatalogView::PgClass
             | CatalogView::PgNamespace
             | CatalogView::PgAttribute

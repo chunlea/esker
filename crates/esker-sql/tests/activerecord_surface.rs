@@ -123,10 +123,15 @@ const FIXTURE: &[&str] =
 /// its other spelling, written out where a list cannot go. The `ANY` form was never the problem
 /// and still expands where it is lowered.
 ///
+/// **Thirty with boot statements 23 and 30**, which wanted `pg_extension` and `pg_inherits` —
+/// two relations this node did not have at all, so both were `42P01`. Both are empty here and
+/// `pg_inherits` is empty on a real server too; the extension row a real server does have is a
+/// declared divergence (`tests/extension_inherits.rs`), not a missing feature.
+///
 /// The two that still do not run are the rest of the array surface: line 52 (`indexes()`) wants
 /// `ARRAY(SELECT …)` and `generate_subscripts`, and lines 55 and 56 want `array_agg` and
 /// `c.conkey[idx]`. **The rows behind both are here and agree** (`tests/pg_catalog_*.rs`).
-const RUNS: usize = 28;
+const RUNS: usize = 30;
 
 #[test]
 fn every_statement_activerecord_sends_parses_and_is_answered_by_name() {

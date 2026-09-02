@@ -1,0 +1,32 @@
+# `pg_extension` and `pg_inherits` — boot statements 23 and 30.
+#
+# Two relations `ActiveRecord` reads on every boot and this node did not have at all, so both were
+# `42P01 relation "…" does not exist`. Neither has anything to hold here: there is no procedural
+# language and no `CREATE EXTENSION`, and no inheritance and no `PARTITION BY`.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`pg_extension` is not empty on a real server.** Every PostgreSQL database has `plpgsql`
+#     installed, so boot statement 23 comes back with one row — `plpgsql` in `pg_catalog` — where
+#     this node answers none. That is a **declared divergence and not a gap**: an extension row
+#     here would tell a client `CREATE FUNCTION … LANGUAGE plpgsql` will work, which is the same
+#     argument that keeps `pg_collation` and `pg_range` empty. What `ActiveRecord` does with the
+#     answer is emit `enable_extension` lines into a schema dump, and none is the truth.
+#   * **`pg_inherits` is empty on both**, and for the same reason on both: nothing in this database
+#     inherits. It would have rows on a real server the moment a partitioned table existed, and
+#     `PARTITION BY` is `0A000` here, so the emptiness is complete rather than provisional.
+#   * **A column neither view has is `42703`, not `42P01`.** The relation resolves; the column does
+#     not. Both spellings are below, because a view added as a stub tends to answer everything.
+SELECT pg_extension.extname, n.nspname AS schema FROM pg_extension JOIN pg_namespace n ON pg_extension.extnamespace = n.oid	name,name	plpgsql|pg_catalog
+SELECT extname, extnamespace FROM pg_extension	name,oid	plpgsql|11
+SELECT count(*) FROM pg_extension	bigint	1
+SELECT inhrelid, inhparent FROM pg_inherits	oid,oid	-
+SELECT count(*) FROM pg_inherits	bigint	0
+SELECT parent.relname FROM pg_catalog.pg_inherits i JOIN pg_catalog.pg_class child ON i.inhrelid = child.oid JOIN pg_catalog.pg_class parent ON i.inhparent = parent.oid LEFT JOIN pg_namespace n ON n.oid = child.relnamespace WHERE child.relname = 'ak' AND child.relkind IN ('r','p') AND n.nspname = ANY (current_schemas(false))	name	-
+SELECT extname FROM pg_extension WHERE extname = 'nope'	name	-
+SELECT nosuchcol FROM pg_extension	!42703 column "nosuchcol" does not exist
+SELECT nosuchcol FROM pg_inherits	!42703 column "nosuchcol" does not exist
