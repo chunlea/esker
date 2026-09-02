@@ -48,9 +48,13 @@ impl Node {
     }
 }
 
-fn reserve() -> std::net::SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
+/// A port, **held** until the server that will serve on it adopts the socket.
+///
+/// Returning the address and dropping the listener leaves the port belonging to nobody until the
+/// rebind, and under a parallel suite run something else takes it — `Address already in use`.
+/// `Server::from_listener` takes the socket itself, so there is no window.
+fn reserve() -> std::net::TcpListener {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap()
 }
 
 /// A store hosting exactly `regions`, on a socket, with no Raft.
@@ -64,12 +68,17 @@ fn reserve() -> std::net::SocketAddr {
 /// consensus in it. The reopen is the load-bearing half: a record on disk is not a region the map
 /// serves until an open reads it, which the first version of this helper did not do and the epoch
 /// check caught immediately.
+#[allow(
+    clippy::unused_async,
+    reason = "the caller awaits it; adopting a listener is what stopped being async, not the helper"
+)]
 async fn open(
-    address: std::net::SocketAddr,
+    address_listener: std::net::TcpListener,
     store_id: u64,
     pd: &Arc<FakePd>,
     regions: &[Region],
 ) -> Node {
+    let address = address_listener.local_addr().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let options = || StoreOptions {
         store_id,
@@ -104,12 +113,11 @@ async fn open(
         regions.len(),
         "store {store_id} did not come back onto the records it was given"
     );
-    let server = Server::bind(
-        address,
+    let server = Server::from_listener(
+        address_listener,
         StoreService::new(Arc::clone(&store)) as Arc<dyn Service>,
         TransportConfig::new(),
     )
-    .await
     .unwrap();
     let handle = server.spawn().unwrap();
     Node {
@@ -274,11 +282,12 @@ async fn a_learner_without_the_catalog_fetches_the_schema_and_answers() {
         .try_init();
 
     let pd = Arc::new(FakePd::new());
-    let catalog_address = reserve();
-    let rows_address = reserve();
+    let catalog_address_listener = reserve();
+    let rows_address_listener = reserve();
+    let rows_address = rows_address_listener.local_addr().unwrap();
     // The two halves, one store each.
-    let catalog = open(catalog_address, 1, &pd, &[catalog_region()]).await;
-    let rows = open(rows_address, 2, &pd, &[rows_region()]).await;
+    let catalog = open(catalog_address_listener, 1, &pd, &[catalog_region()]).await;
+    let rows = open(rows_address_listener, 2, &pd, &[rows_region()]).await;
 
     // The catalog record, on the store that owns the catalog's range and nowhere else.
     commit(
@@ -396,10 +405,11 @@ async fn a_widened_table_is_answered_rather_than_frozen_at_the_first_version() {
         .try_init();
 
     let pd = Arc::new(FakePd::new());
-    let catalog_address = reserve();
-    let rows_address = reserve();
-    let catalog = open(catalog_address, 1, &pd, &[catalog_region()]).await;
-    let rows = open(rows_address, 2, &pd, &[rows_region()]).await;
+    let catalog_address_listener = reserve();
+    let rows_address_listener = reserve();
+    let rows_address = rows_address_listener.local_addr().unwrap();
+    let catalog = open(catalog_address_listener, 1, &pd, &[catalog_region()]).await;
+    let rows = open(rows_address_listener, 2, &pd, &[rows_region()]).await;
 
     commit(
         &catalog.store,

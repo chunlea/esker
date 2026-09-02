@@ -51,9 +51,13 @@ impl Node {
     }
 }
 
-fn reserve() -> std::net::SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
+/// A port, **held** until the server that will serve on it adopts the socket.
+///
+/// Returning the address and dropping the listener leaves the port belonging to nobody until the
+/// rebind, and under a parallel suite run something else takes it — `Address already in use`.
+/// `Server::from_listener` takes the socket itself, so there is no window.
+fn reserve() -> std::net::TcpListener {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap()
 }
 
 async fn wait_for<F: FnMut() -> bool>(what: &str, seconds: u64, mut ready: F) {
@@ -64,12 +68,17 @@ async fn wait_for<F: FnMut() -> bool>(what: &str, seconds: u64, mut ready: F) {
     }
 }
 
+#[allow(
+    clippy::unused_async,
+    reason = "the caller awaits it; adopting a listener is what stopped being async, not the helper"
+)]
 async fn open_store(
-    address: std::net::SocketAddr,
+    address_listener: std::net::TcpListener,
     store_id: u64,
     pd_address: std::net::SocketAddr,
     peers: &[PeerAddress],
 ) -> Node {
+    let address = address_listener.local_addr().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let mut raft = RaftOptions::new(peers.to_vec(), 20_260_830);
     raft.tick = Duration::from_millis(5);
@@ -101,12 +110,11 @@ async fn open_store(
     )
     .unwrap();
 
-    let server = Server::bind(
-        address,
+    let server = Server::from_listener(
+        address_listener,
         StoreService::new(Arc::clone(&store)) as Arc<dyn Service>,
         TransportConfig::new(),
     )
-    .await
     .unwrap();
     let handle = server.spawn().unwrap();
     Node {
@@ -222,8 +230,14 @@ async fn a_learner_on_a_fresh_store_becomes_a_voter_under_load() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
         .try_init();
-    let pd_address = reserve();
-    let addresses: Vec<std::net::SocketAddr> = (0..3).map(|_| reserve()).collect();
+    let pd_address_listener = reserve();
+    let pd_address = pd_address_listener.local_addr().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3).map(|_| reserve()).collect();
+    let addresses: Vec<std::net::SocketAddr> = listeners
+        .iter()
+        .map(|listener| listener.local_addr().unwrap())
+        .collect();
+    let mut listeners = listeners.into_iter();
     let peers: Vec<PeerAddress> = addresses
         .iter()
         .enumerate()
@@ -251,16 +265,15 @@ async fn a_learner_on_a_fresh_store_becomes_a_voter_under_load() {
         },
     )
     .unwrap();
-    let pd_server = Server::bind(
-        pd_address,
+    let pd_server = Server::from_listener(
+        pd_address_listener,
         PdService::new(Arc::clone(&pd)) as Arc<dyn Service>,
         TransportConfig::new(),
     )
-    .await
     .unwrap();
     let pd_handle = pd_server.spawn().unwrap();
 
-    let first = open_store(addresses[0], 1, pd_address, &peers).await;
+    let first = open_store(listeners.next().unwrap(), 1, pd_address, &peers).await;
     wait_for("a leader on the first store", 20, || {
         first
             .store
@@ -282,8 +295,8 @@ async fn a_learner_on_a_fresh_store_becomes_a_voter_under_load() {
     })
     .await;
 
-    let second = open_store(addresses[1], 2, pd_address, &peers).await;
-    let third = open_store(addresses[2], 3, pd_address, &peers).await;
+    let second = open_store(listeners.next().unwrap(), 2, pd_address, &peers).await;
+    let third = open_store(listeners.next().unwrap(), 3, pd_address, &peers).await;
 
     // Load keeps running while the cluster grows, which is the case the lag criterion has to work
     // under: a learner is never exactly level with a leader that is still taking writes.

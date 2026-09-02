@@ -102,18 +102,27 @@ async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
 
 /// Takes a free port and releases it, so two stores can be told each other's addresses before
 /// either is listening. A loopback port is not reused between this and the bind that follows.
-fn reserve() -> std::net::SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
+/// A port, **held** until the server that will serve on it adopts the socket.
+///
+/// Returning the address and dropping the listener leaves the port belonging to nobody until the
+/// rebind, and under a parallel suite run something else takes it — `Address already in use`.
+/// `Server::from_listener` takes the socket itself, so there is no window.
+fn reserve() -> std::net::TcpListener {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap()
 }
 
+#[allow(
+    clippy::unused_async,
+    reason = "the caller awaits it; adopting a listener is what stopped being async, not the helper"
+)]
 async fn open(
-    address: std::net::SocketAddr,
+    address_listener: std::net::TcpListener,
     store_id: u64,
     pd: &Arc<FakePd>,
     raft: RaftOptions,
     bootstrap_region: u64,
 ) -> Node {
+    let address = address_listener.local_addr().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(
         dir.path(),
@@ -141,12 +150,11 @@ async fn open(
     )
     .unwrap();
 
-    let server = Server::bind(
-        address,
+    let server = Server::from_listener(
+        address_listener,
         StoreService::new(Arc::clone(&store)) as Arc<dyn Service>,
         TransportConfig::new(),
     )
-    .await
     .unwrap();
     let handle = server.spawn().unwrap();
     Node {
@@ -306,9 +314,10 @@ fn put_command() -> esker_store::apply::Command {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_add_peer_operator_makes_a_learner() {
     let pd = Arc::new(FakePd::new());
-    let address = reserve();
+    let address_listener = reserve();
+    let address = address_listener.local_addr().unwrap();
     let node = open(
-        address,
+        address_listener,
         1,
         &pd,
         raft_options(
@@ -367,9 +376,10 @@ async fn an_add_peer_operator_makes_a_learner() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_operator_against_a_stale_epoch_is_dropped() {
     let pd = Arc::new(FakePd::new());
-    let address = reserve();
+    let address_listener = reserve();
+    let address = address_listener.local_addr().unwrap();
     let node = open(
-        address,
+        address_listener,
         1,
         &pd,
         raft_options(
@@ -427,8 +437,10 @@ async fn an_operator_against_a_stale_epoch_is_dropped() {
 async fn a_region_reaches_a_store_that_never_had_it() {
     trace();
     let pd = Arc::new(FakePd::new());
-    let first_address = reserve();
-    let second_address = reserve();
+    let first_address_listener = reserve();
+    let first_address = first_address_listener.local_addr().unwrap();
+    let second_address_listener = reserve();
+    let second_address = second_address_listener.local_addr().unwrap();
     let peers = vec![
         PeerAddress::new(1, 1, first_address),
         PeerAddress::new(2, 2, second_address),
@@ -442,7 +454,7 @@ async fn a_region_reaches_a_store_that_never_had_it() {
         ..LogCompaction::new()
     };
     let first = open(
-        first_address,
+        first_address_listener,
         1,
         &pd,
         // The address book has both stores — the leader must know how to reach a peer it is about
@@ -464,7 +476,7 @@ async fn a_region_reaches_a_store_that_never_had_it() {
 
     // The second store is told the cluster already exists, so it hosts nothing of its own.
     let second = open(
-        second_address,
+        second_address_listener,
         2,
         &pd,
         raft_options(peers.clone(), compaction, Some(vec![2])),
@@ -549,8 +561,10 @@ async fn a_region_reaches_a_store_that_never_had_it() {
 async fn a_region_arrives_with_its_transactional_records() {
     trace();
     let pd = Arc::new(FakePd::new());
-    let first_address = reserve();
-    let second_address = reserve();
+    let first_address_listener = reserve();
+    let first_address = first_address_listener.local_addr().unwrap();
+    let second_address_listener = reserve();
+    let second_address = second_address_listener.local_addr().unwrap();
     let peers = vec![
         PeerAddress::new(1, 1, first_address),
         PeerAddress::new(2, 2, second_address),
@@ -560,7 +574,7 @@ async fn a_region_arrives_with_its_transactional_records() {
     // repair of a peer that fell behind — it is the ordinary way a store that never had the
     // region receives it, which is the path every placed replica takes.
     let first = open(
-        first_address,
+        first_address_listener,
         1,
         &pd,
         raft_options(peers.clone(), LogCompaction::new(), Some(vec![1])),
@@ -590,7 +604,7 @@ async fn a_region_arrives_with_its_transactional_records() {
     put(&first.store, &region, key(100), b"raw").await;
 
     let second = open(
-        second_address,
+        second_address_listener,
         2,
         &pd,
         raft_options(peers.clone(), LogCompaction::new(), Some(vec![2])),
@@ -686,8 +700,10 @@ async fn a_region_arrives_with_its_transactional_records() {
 async fn a_voter_caught_up_by_snapshot_can_lead_and_answer_an_old_row() {
     trace();
     let pd = Arc::new(FakePd::new());
-    let first_address = reserve();
-    let second_address = reserve();
+    let first_address_listener = reserve();
+    let first_address = first_address_listener.local_addr().unwrap();
+    let second_address_listener = reserve();
+    let second_address = second_address_listener.local_addr().unwrap();
     let peers = vec![
         PeerAddress::new(1, 1, first_address),
         PeerAddress::new(2, 2, second_address),
@@ -701,7 +717,7 @@ async fn a_voter_caught_up_by_snapshot_can_lead_and_answer_an_old_row() {
     };
 
     let first = open(
-        first_address,
+        first_address_listener,
         1,
         &pd,
         raft_options(peers.clone(), compaction, Some(vec![1])),
@@ -718,7 +734,7 @@ async fn a_voter_caught_up_by_snapshot_can_lead_and_answer_an_old_row() {
     commit_one(&first.store, &region, key(0), b"committed", 10, 11).await;
 
     let second = open(
-        second_address,
+        second_address_listener,
         2,
         &pd,
         raft_options(peers.clone(), compaction, Some(vec![2])),
@@ -805,15 +821,17 @@ async fn a_voter_caught_up_by_snapshot_can_lead_and_answer_an_old_row() {
 async fn a_placed_columnar_learner_holds_what_the_leader_holds() {
     trace();
     let pd = Arc::new(FakePd::new());
-    let first_address = reserve();
-    let second_address = reserve();
+    let first_address_listener = reserve();
+    let first_address = first_address_listener.local_addr().unwrap();
+    let second_address_listener = reserve();
+    let second_address = second_address_listener.local_addr().unwrap();
     let peers = vec![
         PeerAddress::new(1, 1, first_address),
         PeerAddress::new(2, 2, second_address),
     ];
 
     let first = open(
-        first_address,
+        first_address_listener,
         1,
         &pd,
         raft_options(peers.clone(), LogCompaction::new(), Some(vec![1])),
@@ -839,7 +857,7 @@ async fn a_placed_columnar_learner_holds_what_the_leader_holds() {
     }
 
     let second = open(
-        second_address,
+        second_address_listener,
         2,
         &pd,
         raft_options(peers.clone(), LogCompaction::new(), Some(vec![2])),
@@ -974,8 +992,10 @@ async fn announce_until_retired(
 async fn a_snapshot_replacing_a_held_region_routes_through_a_retire() {
     trace();
     let pd = Arc::new(FakePd::new());
-    let first_address = reserve();
-    let second_address = reserve();
+    let first_address_listener = reserve();
+    let first_address = first_address_listener.local_addr().unwrap();
+    let second_address_listener = reserve();
+    let second_address = second_address_listener.local_addr().unwrap();
     let peers = vec![
         PeerAddress::new(1, 1, first_address),
         PeerAddress::new(2, 2, second_address),
@@ -986,7 +1006,7 @@ async fn a_snapshot_replacing_a_held_region_routes_through_a_retire() {
         ..LogCompaction::new()
     };
     let first = open(
-        first_address,
+        first_address_listener,
         1,
         &pd,
         raft_options(peers.clone(), compaction, Some(vec![1])),
@@ -1003,7 +1023,7 @@ async fn a_snapshot_replacing_a_held_region_routes_through_a_retire() {
     }
 
     let second = open(
-        second_address,
+        second_address_listener,
         2,
         &pd,
         raft_options(peers.clone(), compaction, Some(vec![2])),
@@ -1093,9 +1113,10 @@ async fn snapshot_refusal(
 #[tokio::test(flavor = "multi_thread")]
 async fn a_store_outside_the_region_is_refused_a_copy() {
     let pd = Arc::new(FakePd::new());
-    let address = reserve();
+    let address_listener = reserve();
+    let address = address_listener.local_addr().unwrap();
     let node = open(
-        address,
+        address_listener,
         1,
         &pd,
         raft_options(
@@ -1177,9 +1198,10 @@ async fn a_store_outside_the_region_is_refused_a_copy() {
 async fn a_peer_the_core_has_and_the_log_has_not_committed_is_waited_for_and_then_refused() {
     trace();
     let pd = Arc::new(FakePd::new());
-    let address = reserve();
+    let address_listener = reserve();
+    let address = address_listener.local_addr().unwrap();
     let node = open(
-        address,
+        address_listener,
         1,
         &pd,
         raft_options(

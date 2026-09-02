@@ -121,11 +121,27 @@ pub enum CatalogView {
     /// The values of every enum type, which is **none**: `CREATE TYPE … AS ENUM` is `0A000`, so
     /// nothing can put a row here. Empty on a real server too until somebody makes an enum.
     PgEnum,
+    /// What *could* be installed, which is not what is — and **not** [`CatalogView::PgExtension`].
+    ///
+    /// `pg_extension` lists what is installed; this lists the catalogue a server could install
+    /// from, which is a superset and is where the `installed_version IS NULL` case lives.
+    /// `ActiveRecord`'s `test/cases/helper.rb` reaches it around the schema load through two
+    /// one-line methods, and every suite file stopped on the `42P01` until it existed:
+    ///
+    /// * `extension_available?` — `SELECT true FROM pg_available_extensions WHERE name = $1`
+    /// * `extension_enabled?` — `SELECT installed_version IS NOT NULL FROM … WHERE name = $1`
+    ///
+    /// **One query shape, three answers**, and `ActiveRecord` tells all three apart because
+    /// `query_value` maps "no rows" to `nil`: an installed extension is `t`, an available but
+    /// uninstalled one is `f`, and an unknown name is **no row at all** — not `f`, not an error.
+    /// A view that returned a row per name, or none for an uninstalled one, would look right in
+    /// one case and answer the other two wrongly.
+    PgAvailableExtensions,
 }
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 17] = [
+    pub const ALL: [CatalogView; 18] = [
         CatalogView::PgType,
         CatalogView::PgRange,
         CatalogView::PgClass,
@@ -138,6 +154,7 @@ impl CatalogView {
         CatalogView::PgExtension,
         CatalogView::PgInherits,
         CatalogView::PgEnum,
+        CatalogView::PgAvailableExtensions,
         CatalogView::InformationSchemaTables,
         CatalogView::InformationSchemaColumns,
         CatalogView::InformationSchemaTableConstraints,
@@ -159,6 +176,7 @@ impl CatalogView {
             CatalogView::PgConstraint => "pg_constraint",
             CatalogView::PgCollation => "pg_collation",
             CatalogView::PgExtension => "pg_extension",
+            CatalogView::PgAvailableExtensions => "pg_available_extensions",
             CatalogView::PgInherits => "pg_inherits",
             CatalogView::PgEnum => "pg_enum",
             CatalogView::InformationSchemaTables => "information_schema.tables",
@@ -190,6 +208,7 @@ impl CatalogView {
                 CatalogView::PgExtension => 14,
                 CatalogView::PgInherits => 15,
                 CatalogView::PgEnum => 16,
+                CatalogView::PgAvailableExtensions => 17,
                 CatalogView::InformationSchemaTables => 9,
                 CatalogView::InformationSchemaColumns => 10,
                 CatalogView::InformationSchemaTableConstraints => 11,
@@ -270,6 +289,16 @@ impl CatalogView {
             CatalogView::PgInherits => &[
                 ("inhrelid", ColumnType::Int8),
                 ("inhparent", ColumnType::Int8),
+            ],
+            // The five a real server has, in its order. `name` is of type `name` there and the
+            // four others are `text`; this node has one string type and answers `text` for all
+            // five, which is the same trade every `pg_catalog` column makes.
+            CatalogView::PgAvailableExtensions => &[
+                ("name", ColumnType::Text),
+                ("default_version", ColumnType::Text),
+                ("installed_version", ColumnType::Text),
+                ("location", ColumnType::Text),
+                ("comment", ColumnType::Text),
             ],
             // `enumsortorder` is a `real` on a real server, which is the one place this view's
             // types are worth reading: the order is a float so a value can be inserted *between*
@@ -365,6 +394,31 @@ impl CatalogView {
                 });
                 rows
             }
+            // **Two rows, and the pair is the point.** `plpgsql` is installed — its
+            // `installed_version` is set, so `extension_enabled?` is `t` — and `hstore` is
+            // available and not installed, so the same expression is `f` and `default_version` is
+            // still a real version. Any name that is not one of these two matches no row at all,
+            // which is `ActiveRecord`'s third case and the one a `WHERE` gives for free.
+            //
+            // `location` and `comment` are NULL: a real server fills them from the filesystem it
+            // found the control file on, and there is no such file here. Neither is read by the
+            // two methods this view exists for.
+            CatalogView::PgAvailableExtensions => vec![
+                vec![
+                    Datum::Text("hstore".to_owned()),
+                    Datum::Text("1.8".to_owned()),
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Null,
+                ],
+                vec![
+                    Datum::Text("plpgsql".to_owned()),
+                    Datum::Text("1.0".to_owned()),
+                    Datum::Text("1.0".to_owned()),
+                    Datum::Null,
+                    Datum::Null,
+                ],
+            ],
             // `PgRange` and `PgCollation` have none, and the catalog-backed views never reach
             // here — `rows_of` answers for those before it delegates.
             CatalogView::PgRange
@@ -502,6 +556,28 @@ fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
     // By name, which is the order the scan already returns them in and the order a reader can
     // predict. PostgreSQL promises no order without an `ORDER BY`; a deterministic one is a
     // superset of that promise, as `pg_type`'s rows are.
+    // **The catalog describes itself.** A real server's `pg_class` has a row for every catalog
+    // relation, and `ActiveRecord` asks for one by name — `pg_available_extensions` — before it
+    // loads a single fixture. Derived from `CatalogView::ALL` rather than written out, so a view
+    // added to this node cannot be missing from the catalog that is supposed to list it.
+    //
+    // `relkind` is `v`: they are views on a real server, and the table lists a client asks for
+    // filter `relkind IN ('r', 'p')`, so these rows are invisible to them exactly as they should
+    // be. The name is the unqualified one, which is what `relname` holds — the schema is a
+    // separate column there and `information_schema.tables` is `tables` in `pg_class`.
+    let views = CatalogView::ALL.into_iter().map(|view| {
+        vec![
+            Datum::Int8(i64::try_from(view.id()).unwrap_or(i64::MAX)),
+            Datum::Text(
+                view.name()
+                    .rsplit_once('.')
+                    .map_or_else(|| view.name().to_owned(), |(_, name)| name.to_owned()),
+            ),
+            Datum::Int8(PUBLIC_NAMESPACE_OID),
+            Datum::Text("v".to_owned()),
+            Datum::Bool(false),
+        ]
+    });
     Ok(relations
         .rows()
         .map(|relation| {
@@ -521,6 +597,7 @@ fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
                 ),
             ]
         })
+        .chain(views)
         .collect())
 }
 

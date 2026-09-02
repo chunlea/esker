@@ -789,3 +789,49 @@ async fn a_wedged_handler_does_not_hold_shutdown_open() {
     );
     wedged.abort();
 }
+
+/// A reserved port is not reserved until something is **bound** to it.
+///
+/// The pattern every cluster test used — bind a socket, read the port, drop it, bind again later
+/// — leaves the port belonging to nobody in between. Under a parallel run something takes it and
+/// the second bind is `Address already in use`, which is how a family of tests failed under load
+/// while passing alone. This is that window, made deterministic, and then closed.
+#[tokio::test]
+async fn a_port_is_only_reserved_while_a_socket_holds_it() {
+    let config = TransportConfig::new();
+
+    // The old shape. Nothing is listening between the drop and the bind, and a squatter that
+    // takes the port in that gap makes the bind fail — a real failure, not a slow one.
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reserved.local_addr().unwrap();
+    drop(reserved);
+    let squatter = std::net::TcpListener::bind(address).unwrap();
+    let taken = Server::bind(address, Echo::new(41), config).await;
+    assert!(
+        taken.is_err(),
+        "the port was taken in the window and the bind should have failed"
+    );
+    drop(squatter);
+
+    // The new shape. The socket is held from the moment the port is allocated until the server
+    // serves on it, so there is no instant at which a squatter could get in — and the proof is
+    // that binding it again fails while the reservation is still in hand.
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = held.local_addr().unwrap();
+    assert!(
+        std::net::TcpListener::bind(address).is_err(),
+        "a held reservation must not be bindable by anyone else"
+    );
+    let server = Server::from_listener(held, Echo::new(41), config).unwrap();
+    assert_eq!(server.local_addr().unwrap(), address);
+
+    // And it really serves: the adopted socket is a working listener, not just a held port.
+    let handle = server.spawn().unwrap();
+    let transport = TcpTransport::connect_with(address, config).await.unwrap();
+    let response = transport.call(get("hello")).await.unwrap();
+    assert!(matches!(
+        response.into_raw_kv().unwrap(),
+        RawKvResp::Get { .. }
+    ));
+    handle.shutdown().await.unwrap();
+}

@@ -85,18 +85,27 @@ async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
         })
 }
 
-fn reserve() -> std::net::SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
+/// A port, **held** until the server that will serve on it adopts the socket.
+///
+/// Returning the address and dropping the listener leaves the port belonging to nobody until the
+/// rebind, and under a parallel suite run something else takes it — `Address already in use`.
+/// `Server::from_listener` takes the socket itself, so there is no window.
+fn reserve() -> std::net::TcpListener {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap()
 }
 
+#[allow(
+    clippy::unused_async,
+    reason = "the caller awaits it; adopting a listener is what stopped being async, not the helper"
+)]
 async fn open(
-    address: std::net::SocketAddr,
+    address_listener: std::net::TcpListener,
     store_id: u64,
     pd: &Arc<FakePd>,
     peers: &[PeerAddress],
     bootstrap_voters: Option<Vec<u64>>,
 ) -> Node {
+    let address = address_listener.local_addr().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let mut raft = RaftOptions::new(peers.to_vec(), 20_260_830);
     // **25 ms and not 5.** `esker-raft` counts ticks and never reads a clock, so the election
@@ -140,12 +149,11 @@ async fn open(
     )
     .unwrap();
 
-    let server = Server::bind(
-        address,
+    let server = Server::from_listener(
+        address_listener,
         StoreService::new(Arc::clone(&store)) as Arc<dyn Service>,
         esker_proto::TransportConfig::new(),
     )
-    .await
     .unwrap();
     let handle = server.spawn().unwrap();
     Node {
@@ -232,11 +240,17 @@ fn assert_contiguous(regions: &[Region]) {
 /// The 20 GB and five stores of `prompts/04` are an acceptance run. This is the same shape at a
 /// size CI can pay for: what a real bug breaks here is what it would break there.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one cluster, built and then checked from every angle the balance path has"
+)]
 async fn regions_reach_a_store_that_joins_and_none_is_left_without_a_leader() {
     trace();
     let pd = Arc::new(FakePd::new());
-    let first_address = reserve();
-    let second_address = reserve();
+    let first_address_listener = reserve();
+    let first_address = first_address_listener.local_addr().unwrap();
+    let second_address_listener = reserve();
+    let second_address = second_address_listener.local_addr().unwrap();
     let peers = vec![
         PeerAddress::new(1, 1, first_address),
         PeerAddress::new(2, 2, second_address),
@@ -244,7 +258,7 @@ async fn regions_reach_a_store_that_joins_and_none_is_left_without_a_leader() {
 
     // Store 1 bootstraps a region of one voter so it can commit alone; store 2 joins later, which
     // is what `AddPeer` is for.
-    let first = open(first_address, 1, &pd, &peers, Some(vec![1])).await;
+    let first = open(first_address_listener, 1, &pd, &peers, Some(vec![1])).await;
     wait_for("a leader on the first store", 10, || {
         first.store.peer_of(1).is_some_and(|peer| peer.is_leader())
     })
@@ -263,23 +277,41 @@ async fn regions_reach_a_store_that_joins_and_none_is_left_without_a_leader() {
     assert_contiguous(&grown);
 
     // A second store, told the cluster already exists, hosts nothing of its own.
-    let second = open(second_address, 2, &pd, &peers, Some(vec![2])).await;
+    let second = open(second_address_listener, 2, &pd, &peers, Some(vec![2])).await;
     assert!(second.store.regions().is_empty());
 
     // Ask for a replica of every region on the new store. A real placement driver issues these
-    // from what the heartbeats tell it; this issues the same operators against the same contract.
-    for region in &grown {
-        pd.issue(Operator::AddPeer {
-            region_id: region.id,
-            epoch: region.epoch,
-            store_id: 2,
-            peer_id: 1_000 + region.id,
-        });
-    }
+    // from what the heartbeats tell it, **every heartbeat, from the region as it is now** — it is
+    // level-triggered, not edge-triggered. So is this, and it has to be: an `AddPeer` carries the
+    // epoch it was issued against, the store rejects one whose epoch has moved, and a region that
+    // splits after the operator is issued never gains its learner. `grown` is a snapshot taken
+    // while splitting is still in flight — the wait above stops at *six* regions and the store
+    // keeps going — so under load one region's epoch really does move between the snapshot and
+    // the apply. Issuing once left that region stuck at 26 of 27 for the whole timeout.
+    let issue_missing = || {
+        let live = first.store.regions().regions();
+        for region in &live {
+            if region.peers.iter().any(|peer| peer.store_id == 2) {
+                continue;
+            }
+            pd.issue(Operator::AddPeer {
+                region_id: region.id,
+                epoch: region.epoch,
+                store_id: 2,
+                peer_id: 1_000 + region.id,
+            });
+        }
+        live.len()
+    };
+    let wanted = issue_missing().max(grown.len());
 
     // First the membership: every region should gain a learner on store 2. Checked separately
     // from the transfer so that a failure says which half of the path is broken.
     wait_for("every region to gain a learner", 60, || {
+        // Re-issued on every poll, against the epoch each region has now. A real placement driver
+        // does the same thing on its next heartbeat; issuing once and hoping is what made this
+        // test load-sensitive.
+        issue_missing();
         first
             .store
             .regions()
@@ -287,7 +319,7 @@ async fn regions_reach_a_store_that_joins_and_none_is_left_without_a_leader() {
             .iter()
             .filter(|region| region.peers.iter().any(|peer| peer.store_id == 2))
             .count()
-            >= grown.len()
+            >= wanted
     })
     .await;
 
@@ -361,9 +393,10 @@ async fn regions_reach_a_store_that_joins_and_none_is_left_without_a_leader() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dozen_regions_on_two_workers_all_make_progress() {
     let pd = Arc::new(FakePd::new());
-    let address = reserve();
+    let address_listener = reserve();
+    let address = address_listener.local_addr().unwrap();
     let peers = vec![PeerAddress::new(1, 1, address)];
-    let node = open(address, 1, &pd, &peers, Some(vec![1])).await;
+    let node = open(address_listener, 1, &pd, &peers, Some(vec![1])).await;
     wait_for("a leader", 10, || {
         node.store.peer_of(1).is_some_and(|peer| peer.is_leader())
     })

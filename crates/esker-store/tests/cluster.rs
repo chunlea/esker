@@ -34,31 +34,37 @@ struct Node {
     dir: TempDir,
 }
 
-/// Reserves `count` ports by binding and releasing them.
+/// Reserves `count` ports and **keeps holding them**.
 ///
 /// The stores have to know every peer's address *before* any server exists, so the addresses
-/// cannot come from the servers. Releasing a port and rebinding it races in principle; in practice
-/// the window is microseconds, and a peer that cannot be reached yet simply has its messages
-/// dropped and retried — which is the transport's normal behaviour, not a special case.
-fn reserve_ports(count: usize) -> Vec<SocketAddr> {
-    let listeners: Vec<std::net::TcpListener> = (0..count)
+/// cannot come from the servers. This used to bind a socket, read the port and release it, with a
+/// comment saying the window was microseconds — and under a parallel suite run something else
+/// took the port in that window and the rebind was `Address already in use`. The listeners are
+/// returned instead of their addresses and handed to `Server::from_listener`, so each port is
+/// held from the moment it is allocated until the server is serving on it.
+fn reserve_ports(count: usize) -> Vec<std::net::TcpListener> {
+    (0..count)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    listeners
-        .iter()
-        .map(|listener| listener.local_addr().unwrap())
         .collect()
 }
 
 /// Starts `count` stores replicating one region among themselves.
+#[allow(
+    clippy::unused_async,
+    reason = "the caller awaits it; adopting a listener is what stopped being async, not the helper"
+)]
 async fn start_cluster(count: usize) -> Vec<Node> {
-    let addrs = reserve_ports(count);
+    let listeners = reserve_ports(count);
+    let addrs: Vec<SocketAddr> = listeners
+        .iter()
+        .map(|listener| listener.local_addr().unwrap())
+        .collect();
     let peers: Vec<PeerAddress> = (0..count)
         .map(|at| PeerAddress::new(at as u64 + 1, at as u64 + 1, addrs[at]))
         .collect();
 
     let mut nodes = Vec::new();
-    for (at, addr) in addrs.iter().enumerate() {
+    for (at, listener) in listeners.into_iter().enumerate() {
         let id = at as u64 + 1;
         let dir = TempDir::new().unwrap();
         let mut raft = RaftOptions::new(peers.clone(), 20_260_830);
@@ -76,12 +82,11 @@ async fn start_cluster(count: usize) -> Vec<Node> {
             ..StoreOptions::new()
         };
         let store = Store::open(dir.path(), options).unwrap();
-        let server = Server::bind(
-            *addr,
+        let server = Server::from_listener(
+            listener,
             StoreService::new(Arc::clone(&store)),
             TransportConfig::new(),
         )
-        .await
         .unwrap();
         let handle = server.spawn().unwrap();
         nodes.push(Node { store, handle, dir });

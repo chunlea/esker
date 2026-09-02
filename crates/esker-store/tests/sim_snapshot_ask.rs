@@ -54,9 +54,13 @@ impl Node {
     }
 }
 
-fn reserve() -> std::net::SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
+/// A port, **held** until the server that will serve on it adopts the socket.
+///
+/// Returning the address and dropping the listener leaves the port belonging to nobody until the
+/// rebind, and under a parallel suite run something else takes it — `Address already in use`.
+/// `Server::from_listener` takes the socket itself, so there is no window.
+fn reserve() -> std::net::TcpListener {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap()
 }
 
 async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
@@ -74,7 +78,12 @@ async fn wait_for<F: FnMut() -> bool>(what: &str, mut ready: F) {
 }
 
 /// One store, alone in its cluster, leading region 1.
-async fn open(address: std::net::SocketAddr, pd: &Arc<FakePd>) -> Node {
+#[allow(
+    clippy::unused_async,
+    reason = "the caller awaits it; adopting a listener is what stopped being async, not the helper"
+)]
+async fn open(address_listener: std::net::TcpListener, pd: &Arc<FakePd>) -> Node {
+    let address = address_listener.local_addr().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let mut raft = RaftOptions::new(vec![PeerAddress::new(1, 1, address)], 20_261_102);
     raft.tick = Duration::from_millis(25);
@@ -99,12 +108,11 @@ async fn open(address: std::net::SocketAddr, pd: &Arc<FakePd>) -> Node {
         },
     )
     .unwrap();
-    let server = Server::bind(
-        address,
+    let server = Server::from_listener(
+        address_listener,
         StoreService::new(Arc::clone(&store)) as Arc<dyn Service>,
         TransportConfig::new(),
     )
-    .await
     .unwrap();
     let handle = server.spawn().unwrap();
     Node { store, handle, dir }
@@ -180,8 +188,9 @@ async fn observe(case: &AskCase) -> Option<Outcome> {
         return None;
     }
     let pd = Arc::new(FakePd::new());
-    let address = reserve();
-    let node = open(address, &pd).await;
+    let address_listener = reserve();
+    let address = address_listener.local_addr().unwrap();
+    let node = open(address_listener, &pd).await;
     wait_for("a leader", || {
         node.store.peer_of(1).is_some_and(|peer| peer.is_leader())
     })
