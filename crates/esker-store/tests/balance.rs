@@ -232,6 +232,10 @@ fn assert_contiguous(regions: &[Region]) {
 /// The 20 GB and five stores of `prompts/04` are an acceptance run. This is the same shape at a
 /// size CI can pay for: what a real bug breaks here is what it would break there.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one cluster, built and then checked from every angle the balance path has"
+)]
 async fn regions_reach_a_store_that_joins_and_none_is_left_without_a_leader() {
     trace();
     let pd = Arc::new(FakePd::new());
@@ -267,19 +271,37 @@ async fn regions_reach_a_store_that_joins_and_none_is_left_without_a_leader() {
     assert!(second.store.regions().is_empty());
 
     // Ask for a replica of every region on the new store. A real placement driver issues these
-    // from what the heartbeats tell it; this issues the same operators against the same contract.
-    for region in &grown {
-        pd.issue(Operator::AddPeer {
-            region_id: region.id,
-            epoch: region.epoch,
-            store_id: 2,
-            peer_id: 1_000 + region.id,
-        });
-    }
+    // from what the heartbeats tell it, **every heartbeat, from the region as it is now** — it is
+    // level-triggered, not edge-triggered. So is this, and it has to be: an `AddPeer` carries the
+    // epoch it was issued against, the store rejects one whose epoch has moved, and a region that
+    // splits after the operator is issued never gains its learner. `grown` is a snapshot taken
+    // while splitting is still in flight — the wait above stops at *six* regions and the store
+    // keeps going — so under load one region's epoch really does move between the snapshot and
+    // the apply. Issuing once left that region stuck at 26 of 27 for the whole timeout.
+    let issue_missing = || {
+        let live = first.store.regions().regions();
+        for region in &live {
+            if region.peers.iter().any(|peer| peer.store_id == 2) {
+                continue;
+            }
+            pd.issue(Operator::AddPeer {
+                region_id: region.id,
+                epoch: region.epoch,
+                store_id: 2,
+                peer_id: 1_000 + region.id,
+            });
+        }
+        live.len()
+    };
+    let wanted = issue_missing().max(grown.len());
 
     // First the membership: every region should gain a learner on store 2. Checked separately
     // from the transfer so that a failure says which half of the path is broken.
     wait_for("every region to gain a learner", 60, || {
+        // Re-issued on every poll, against the epoch each region has now. A real placement driver
+        // does the same thing on its next heartbeat; issuing once and hoping is what made this
+        // test load-sensitive.
+        issue_missing();
         first
             .store
             .regions()
@@ -287,7 +309,7 @@ async fn regions_reach_a_store_that_joins_and_none_is_left_without_a_leader() {
             .iter()
             .filter(|region| region.peers.iter().any(|peer| peer.store_id == 2))
             .count()
-            >= grown.len()
+            >= wanted
     })
     .await;
 
