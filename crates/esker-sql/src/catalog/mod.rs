@@ -41,6 +41,7 @@
 pub mod def_functions;
 pub mod pg_attribute;
 pub mod pg_catalog;
+pub mod pg_index;
 pub mod pg_relations;
 mod record;
 

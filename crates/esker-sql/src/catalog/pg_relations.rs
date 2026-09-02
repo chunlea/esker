@@ -284,6 +284,23 @@ pub fn primary_key_table(oid: i64) -> Option<u64> {
     oid.checked_sub(PRIMARY_KEY_OID_BASE)
 }
 
+/// The `attnum` a column has: its position among the columns a **user** can see, one-based.
+///
+/// Not its position in [`TableDef::columns`], and the difference is a whole column: a table with no
+/// declared primary key carries an internal row id in slot 0 that `user_columns` hides
+/// (`crate::catalog::INTERNAL_ROW_ID_NAME`). `pg_attribute` numbers from the visible list, so
+/// anything that reports an attnum — `pg_index.indkey`, `pg_constraint.conkey`,
+/// `information_schema.key_column_usage.ordinal_position` — has to number from the same one or the
+/// join `a.attnum = ANY(i.indkey)` matches the wrong column. Measured: `ib (a int4, b text)` has
+/// `indkey` `1` for an index on `a`, and this node stores `a` at slot 1.
+///
+/// One function, because two of them would be two chances to disagree.
+#[must_use]
+pub fn attnum_of(table: &TableDef, at: usize) -> i16 {
+    let hidden = usize::from(table.row_id().is_some());
+    i16::try_from(at.saturating_sub(hidden) + 1).unwrap_or(i16::MAX)
+}
+
 /// One sequence, by the column it fills, for the `nextval` a `pg_attrdef` row prints.
 #[must_use]
 pub fn sequence_for(table: &TableDef, column: usize) -> Option<&SequenceDef> {

@@ -204,6 +204,13 @@ pub enum CatalogFunc {
     /// a divergence visible in exactly one statement (`SELECT adbin`) and in none `ActiveRecord`
     /// writes, because the only way it reads that column is through this function.
     PgGetExpr,
+    /// `pg_get_indexdef(oid)`, `pg_get_indexdef(oid, column, pretty)`: an index's `CREATE INDEX`.
+    ///
+    /// Unlike `'x'::regclass` its argument is a **column** — `pg_get_indexdef(d.indexrelid)` over
+    /// every row of `pg_index` — so it really does answer differently per row and cannot be
+    /// resolved before the plan. The catalog it reads is snapshotted once per cursor rather than
+    /// once per row (`crate::exec::cursor::Env::relations`).
+    PgGetIndexdef,
     /// `'name'::regclass`: the oid of a relation, by name.
     ///
     /// Not a function a client can call by that name — it is the cast, lowered to one, because a
@@ -222,6 +229,7 @@ impl CatalogFunc {
         match () {
             () if name.eq_ignore_ascii_case("format_type") => Some(CatalogFunc::FormatType),
             () if name.eq_ignore_ascii_case("pg_get_expr") => Some(CatalogFunc::PgGetExpr),
+            () if name.eq_ignore_ascii_case("pg_get_indexdef") => Some(CatalogFunc::PgGetIndexdef),
             () => None,
         }
     }
@@ -232,6 +240,7 @@ impl CatalogFunc {
         match self {
             CatalogFunc::FormatType => "format_type",
             CatalogFunc::PgGetExpr => "pg_get_expr",
+            CatalogFunc::PgGetIndexdef => "pg_get_indexdef",
             CatalogFunc::RegClass => "regclass",
         }
     }
@@ -247,6 +256,7 @@ impl CatalogFunc {
         match self {
             CatalogFunc::FormatType => &[2],
             CatalogFunc::PgGetExpr => &[2, 3],
+            CatalogFunc::PgGetIndexdef => &[1, 3],
             CatalogFunc::RegClass => &[1],
         }
     }
@@ -255,7 +265,9 @@ impl CatalogFunc {
     #[must_use]
     pub fn result_type(self) -> ColumnType {
         match self {
-            CatalogFunc::FormatType | CatalogFunc::PgGetExpr => ColumnType::Text,
+            CatalogFunc::FormatType | CatalogFunc::PgGetExpr | CatalogFunc::PgGetIndexdef => {
+                ColumnType::Text
+            }
             // An `oid` on a real server, and a `bigint` here for the reason `pg_class.oid` is one.
             CatalogFunc::RegClass => ColumnType::Int8,
         }

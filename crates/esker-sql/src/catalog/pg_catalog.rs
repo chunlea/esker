@@ -75,6 +75,9 @@ pub enum CatalogView {
     PgAttribute,
     /// One row per column that has a **default**, and none for the rest.
     PgAttrdef,
+    /// Every index this tenant has, and every primary key — which has no index behind it here
+    /// and a row all the same ([`crate::catalog::pg_index`]).
+    PgIndex,
     /// The collations this server has, which is none.
     ///
     /// Empty for the reason [`CatalogView::PgRange`] is: a collation is a feature this node does
@@ -88,13 +91,14 @@ pub enum CatalogView {
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 7] = [
+    pub const ALL: [CatalogView; 8] = [
         CatalogView::PgType,
         CatalogView::PgRange,
         CatalogView::PgClass,
         CatalogView::PgNamespace,
         CatalogView::PgAttribute,
         CatalogView::PgAttrdef,
+        CatalogView::PgIndex,
         CatalogView::PgCollation,
     ];
 
@@ -108,6 +112,7 @@ impl CatalogView {
             CatalogView::PgNamespace => "pg_namespace",
             CatalogView::PgAttribute => "pg_attribute",
             CatalogView::PgAttrdef => "pg_attrdef",
+            CatalogView::PgIndex => "pg_index",
             CatalogView::PgCollation => "pg_collation",
         }
     }
@@ -123,7 +128,8 @@ impl CatalogView {
                 CatalogView::PgNamespace => 3,
                 CatalogView::PgAttribute => 4,
                 CatalogView::PgAttrdef => 5,
-                CatalogView::PgCollation => 6,
+                CatalogView::PgIndex => 6,
+                CatalogView::PgCollation => 7,
             }
     }
 
@@ -175,6 +181,7 @@ impl CatalogView {
             // declared-type divergences than `pg_class` has.
             CatalogView::PgAttribute => super::pg_attribute::ATTRIBUTE_COLUMNS,
             CatalogView::PgAttrdef => super::pg_attribute::ATTRDEF_COLUMNS,
+            CatalogView::PgIndex => super::pg_index::INDEX_COLUMNS,
             CatalogView::PgCollation => {
                 &[("oid", ColumnType::Int8), ("collname", ColumnType::Text)]
             }
@@ -198,6 +205,7 @@ impl CatalogView {
             CatalogView::PgClass => pg_class_rows(txn, tenant),
             CatalogView::PgAttribute => super::pg_attribute::rows(txn, tenant),
             CatalogView::PgAttrdef => super::pg_attribute::default_rows(txn, tenant),
+            CatalogView::PgIndex => super::pg_index::rows(txn, tenant),
             CatalogView::PgNamespace => Ok(vec![vec![
                 Datum::Int8(PUBLIC_NAMESPACE_OID),
                 Datum::Text(PUBLIC_SCHEMA.to_owned()),
@@ -245,7 +253,8 @@ impl CatalogView {
             | CatalogView::PgClass
             | CatalogView::PgNamespace
             | CatalogView::PgAttribute
-            | CatalogView::PgAttrdef => Vec::new(),
+            | CatalogView::PgAttrdef
+            | CatalogView::PgIndex => Vec::new(),
         }
     }
 

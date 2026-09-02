@@ -42,6 +42,15 @@ pub(super) const SORT_LIMIT: usize = 1_000_000;
 pub(super) struct Cursor<'a> {
     txn: &'a dyn Txn,
     tenant: u64,
+    /// The tenant's relations, read at most once and only if something asks.
+    ///
+    /// `pg_get_indexdef(d.indexrelid)` is a function of the **catalog**, and its argument is a
+    /// column, so unlike `'x'::regclass` it cannot be resolved before the plan is built — it
+    /// really does answer differently per row. Reading the catalog per row would make a schema
+    /// dump quadratic in the number of relations, so the snapshot is taken once, here, by whichever
+    /// cursor node first needs it. A cursor whose plan calls none of these functions never builds
+    /// one.
+    catalog: std::cell::OnceCell<crate::catalog::pg_relations::Relations>,
     kind: Kind<'a>,
 }
 
@@ -150,6 +159,7 @@ fn inner_side(
         None => Cursor {
             txn,
             tenant,
+            catalog: std::cell::OnceCell::new(),
             kind: Kind::Scan {
                 columns: inner_columns.clone(),
                 next: start,
@@ -285,7 +295,12 @@ impl<'a> Cursor<'a> {
                 remaining: *limit,
             },
         };
-        Ok(Cursor { txn, tenant, kind })
+        Ok(Cursor {
+            txn,
+            tenant,
+            catalog: std::cell::OnceCell::new(),
+            kind,
+        })
     }
 
     /// The next row, or `None` when there are no more.
@@ -300,6 +315,7 @@ impl<'a> Cursor<'a> {
         let env = Env {
             txn: Some(self.txn),
             tenant: self.tenant,
+            catalog: Some(&self.catalog),
         };
         match &mut self.kind {
             Kind::One(used) => Ok(if std::mem::replace(used, true) {
@@ -775,6 +791,9 @@ fn nulls(first: bool, when_first: Ordering, otherwise: Ordering) -> Ordering {
 pub(super) struct Env<'a> {
     txn: Option<&'a dyn Txn>,
     tenant: u64,
+    /// Where the cursor keeps its catalog snapshot, or `None` for an evaluator that has no cursor
+    /// behind it — `RETURNING` and `UPDATE ... SET`, neither of which can hold a catalog function.
+    catalog: Option<&'a std::cell::OnceCell<crate::catalog::pg_relations::Relations>>,
 }
 
 impl Env<'_> {
@@ -783,7 +802,27 @@ impl Env<'_> {
         Env {
             txn: None,
             tenant: 0,
+            catalog: None,
         }
+    }
+
+    /// The tenant's relations, read the first time one is asked for and shared after that.
+    fn relations(&self) -> Result<&crate::catalog::pg_relations::Relations> {
+        let (Some(cell), Some(txn)) = (self.catalog, self.txn) else {
+            return Err(SqlError::Internal(
+                "a catalog function reached an evaluator with no transaction to read in".to_owned(),
+            ));
+        };
+        if cell.get().is_none() {
+            // `OnceCell::get_or_init` cannot fail, and reading the catalog can, so the read
+            // happens outside it. A racing `set` is impossible — a cursor is not shared — and
+            // would be harmless anyway: both snapshots are of the same transaction.
+            let read = crate::catalog::pg_relations::Relations::read(txn, self.tenant)?;
+            let _ = cell.set(read);
+        }
+        cell.get().ok_or_else(|| {
+            SqlError::Internal("a catalog snapshot that was just read is gone".to_owned())
+        })
     }
 }
 
@@ -970,6 +1009,18 @@ fn catalog_function(
         // and NULL-propagating, so a `LEFT JOIN pg_attrdef` that matched nothing is NULL rather
         // than an error. The third argument is `pretty`, which changes nothing this node prints.
         CatalogFunc::PgGetExpr => args.first().cloned().unwrap_or(Datum::Null),
+        // The catalog it reads is snapshotted by the cursor, so a projection over every row of
+        // `pg_index` reads it once rather than once per index.
+        // **Strict in its second argument when there is one**, and that is not the same as
+        // having none: `pg_get_indexdef(oid)` is the whole definition and
+        // `pg_get_indexdef(oid, NULL, true)` is NULL. Measured, and the difference is invisible in
+        // an `Option` that flattens the two.
+        CatalogFunc::PgGetIndexdef if matches!(args.get(1), Some(Datum::Null)) => Datum::Null,
+        CatalogFunc::PgGetIndexdef => crate::catalog::pg_index::index_definition(
+            env.relations()?,
+            oid_argument(args.first())?,
+            column_argument(args.get(1))?,
+        ),
         // Resolved before the plan was built (`crate::exec::Executor::bound`). One here means the
         // resolution was skipped, and answering it from the row would be a catalog read per row.
         CatalogFunc::RegClass => {
@@ -1003,6 +1054,40 @@ fn type_oid_argument(arg: Option<&Datum>) -> Result<Option<i64>> {
         Some(other) => {
             return Err(SqlError::DatatypeMismatch(format!(
                 "format_type() takes an oid, not {other:?}"
+            )));
+        }
+    })
+}
+
+/// An `oid` argument, which is an integer of whatever width the column it came from has.
+fn oid_argument(arg: Option<&Datum>) -> Result<Option<i64>> {
+    Ok(match arg {
+        None | Some(Datum::Null) => None,
+        Some(Datum::Int8(oid)) => Some(*oid),
+        Some(Datum::Int4(oid)) => Some(i64::from(*oid)),
+        Some(Datum::Int2(oid)) => Some(i64::from(*oid)),
+        Some(other) => {
+            return Err(SqlError::DatatypeMismatch(format!(
+                "an oid is an integer, not {other:?}"
+            )));
+        }
+    })
+}
+
+/// `pg_get_indexdef`'s optional column number. `None` is the one-argument form, which is a
+/// different answer from column `0` — that one prints the definition unqualified.
+fn column_argument(arg: Option<&Datum>) -> Result<Option<i32>> {
+    Ok(match arg {
+        // A NULL is answered above, before this is called: the function is strict in this
+        // argument and `None` here means the one-argument form, which prints the whole
+        // definition. Flattening the two would print a definition where a real server says NULL.
+        None | Some(Datum::Null) => None,
+        Some(Datum::Int8(at)) => Some(i32::try_from(*at).unwrap_or(i32::MAX)),
+        Some(Datum::Int4(at)) => Some(*at),
+        Some(Datum::Int2(at)) => Some(i32::from(*at)),
+        Some(other) => {
+            return Err(SqlError::DatatypeMismatch(format!(
+                "a column number is an integer, not {other:?}"
             )));
         }
     })

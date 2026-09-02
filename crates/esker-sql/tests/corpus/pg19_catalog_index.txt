@@ -1,0 +1,75 @@
+# `pg_index` and `pg_get_indexdef`, as a real PostgreSQL 19beta1 answers them -- phase 13 unit 2.
+#
+# What `ActiveRecord`'s `indexes()` reads, joined to `pg_class` twice. Three oids in one statement
+# -- `t.oid`, `d.indrelid`, `d.indexrelid`, `i.oid` -- which is why every view in this phase takes
+# its oid from one place and none computes one.
+#
+# Captured in one session with `scratchpad/sesscap.py` inside one `BEGIN ... ROLLBACK`, and
+# replayed the same way against one node. The corpus builds its own tables.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **A primary key has a `pg_index` row**, `indisprimary` and `indisunique` both `t`, and its
+#     `indexrelid` is *not* its `indrelid`. Here the row key **is** the primary key and there is no
+#     separate index to describe -- and the row is still the right answer, for the reason
+#     `pg_class` reports the constraint as a relation: a client can name `ia_pkey`.
+#   * **`indkey` is an `int2vector` and prints space-separated**, `3 4` for a two-column index and
+#     `1 2` for a two-column primary key. `ActiveRecord` reads it as
+#     `row[2].split(" ").map(&:to_i)` -- a text operation on the rendered value -- so `text` here
+#     carries the same characters and means the same thing.
+#   * **`pg_get_indexdef` never raises.** An oid with no index behind it is **NULL**, including the
+#     oid of a *table* (`pg_get_indexdef('ia'::regclass)` is NULL, not an error), and so is a NULL
+#     argument. A node that raised would break `indexes()` on the first unusual row.
+#   * **It is strict in its *second* argument, which is not the same as having none.**
+#     `pg_get_indexdef(oid)` is the whole definition and `pg_get_indexdef(oid, NULL, true)` is
+#     **NULL**. An implementation that reads "no column" and "a NULL column" into one `Option`
+#     prints a definition where a real server says nothing.
+#   * **The three-argument form is three different answers.** `(oid, 0, true)` is the whole
+#     definition **without** the `public.` qualifier the one-argument form prints; `(oid, n, ...)`
+#     for `n >= 1` is the *column name alone*; and past the last column it is the **empty string**,
+#     not NULL and not an error. The `pretty` flag changes nothing for a plain column.
+#   * **A table with no primary key and no index has no rows here at all** -- `ib` before its index
+#     is created, and `count(*)` for a keyless table is 0.
+#
+# The three shapes below that are `ActiveRecord`'s own -- `indexes()`, `index_name_exists?` and
+# `primary_keys()` -- are the acceptance for this unit. `primary_keys()` needs `= ANY` over an
+# `int2vector`, which is the array lane's, and is here so the boundary is measured rather than
+# assumed.
+DROP TABLE IF EXISTS ia		-
+DROP TABLE IF EXISTS ib		-
+DROP TABLE IF EXISTS ic		-
+CREATE TABLE ia (id int8 PRIMARY KEY, x int4 NOT NULL, y text, z int8, w varchar(5))		-
+CREATE TABLE ib (a int4, b text)		-
+CREATE TABLE ic (k1 int8, k2 text, v int4, PRIMARY KEY (k1, k2))		-
+CREATE UNIQUE INDEX ia_x_idx ON ia (x)		-
+CREATE INDEX ia_yz_idx ON ia (y, z)		-
+CREATE INDEX ib_a_idx ON ib (a)		-
+SELECT i.relname, x.indisprimary, x.indisunique, x.indkey, x.indnatts, x.indisvalid, x.indpred IS NULL, x.indexprs IS NULL, x.indnullsnotdistinct FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'ia'::regclass ORDER BY i.relname	name,boolean,boolean,int2vector,smallint,boolean,boolean,boolean,boolean	ia_pkey|t|t|1|1|t|t|t|f ; ia_x_idx|f|t|2|1|t|t|t|f ; ia_yz_idx|f|f|3 4|2|t|t|t|f
+SELECT i.relname, x.indisprimary, x.indisunique, x.indkey FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'ic'::regclass ORDER BY i.relname	name,boolean,boolean,int2vector	ic_pkey|t|t|1 2
+SELECT i.relname, x.indisprimary, x.indisunique, x.indkey FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'ib'::regclass ORDER BY i.relname	name,boolean,boolean,int2vector	ib_a_idx|f|f|1
+SELECT count(*) FROM pg_index WHERE indrelid = 'ia'::regclass	bigint	3
+SELECT count(*) FROM pg_index WHERE indrelid = 'ib'::regclass	bigint	1
+SELECT x.indrelid = 'ia'::regclass, x.indexrelid = 'ia_pkey'::regclass FROM pg_index x WHERE x.indexrelid = 'ia_pkey'::regclass	boolean,boolean	t|t
+SELECT indkey FROM pg_index WHERE indexrelid = 'ia_yz_idx'::regclass	int2vector	3 4
+SELECT indkey FROM pg_index WHERE indexrelid = 'ic_pkey'::regclass	int2vector	1 2
+SELECT pg_get_indexdef('ia_pkey'::regclass)	text	CREATE UNIQUE INDEX ia_pkey ON public.ia USING btree (id)
+SELECT pg_get_indexdef('ia_x_idx'::regclass)	text	CREATE UNIQUE INDEX ia_x_idx ON public.ia USING btree (x)
+SELECT pg_get_indexdef('ia_yz_idx'::regclass)	text	CREATE INDEX ia_yz_idx ON public.ia USING btree (y, z)
+SELECT pg_get_indexdef('ic_pkey'::regclass)	text	CREATE UNIQUE INDEX ic_pkey ON public.ic USING btree (k1, k2)
+SELECT pg_get_indexdef('ia_yz_idx'::regclass, 1, true), pg_get_indexdef('ia_yz_idx'::regclass, 2, true)	text,text	y|z
+SELECT pg_get_indexdef('ia_yz_idx'::regclass, 0, true)	text	CREATE INDEX ia_yz_idx ON ia USING btree (y, z)
+SELECT pg_get_indexdef('ia_yz_idx'::regclass, 3, true), pg_get_indexdef('ia_yz_idx'::regclass, 1, true)	text,text	|y
+SELECT pg_get_indexdef('ia_yz_idx'::regclass, 1, false)	text	y
+SELECT pg_get_indexdef('ia_yz_idx'::regclass, NULL, true), pg_get_indexdef('ia_yz_idx'::regclass)	text,text	\N|CREATE INDEX ia_yz_idx ON public.ia USING btree (y, z)
+SELECT pg_get_indexdef(999999)	text	\N
+SELECT pg_get_indexdef(NULL)	text	\N
+SELECT pg_get_indexdef('ia'::regclass)	text	\N
+SELECT c.relname FROM pg_class t INNER JOIN pg_index d ON t.oid = d.indrelid INNER JOIN pg_class c ON d.indexrelid = c.oid WHERE c.relkind IN ('i','I') AND d.indisprimary = 'f' AND t.relname = 'ia' ORDER BY c.relname	name	ia_x_idx ; ia_yz_idx
+SELECT DISTINCT i.relname, d.indisunique, d.indkey, pg_get_indexdef(d.indexrelid), d.indisvalid FROM pg_class t INNER JOIN pg_index d ON t.oid = d.indrelid INNER JOIN pg_class i ON d.indexrelid = i.oid LEFT JOIN pg_namespace n ON n.oid = t.relnamespace WHERE i.relkind IN ('i','I') AND d.indisprimary = 'f' AND t.relname = 'ia' AND n.nspname = 'public' ORDER BY i.relname	name,boolean,int2vector,text,boolean	ia_x_idx|t|2|CREATE UNIQUE INDEX ia_x_idx ON public.ia USING btree (x)|t ; ia_yz_idx|f|3 4|CREATE INDEX ia_yz_idx ON public.ia USING btree (y, z)|t
+SELECT COUNT(*) FROM pg_class t INNER JOIN pg_index d ON t.oid = d.indrelid INNER JOIN pg_class i ON d.indexrelid = i.oid LEFT JOIN pg_namespace n ON n.oid = t.relnamespace WHERE i.relkind IN ('i','I') AND i.relname = 'ia_x_idx' AND t.relname = 'ia' AND n.nspname = 'public'	bigint	1
+SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indrelid = '"ic"'::regclass AND i.indisprimary	name	k1 ; k2
+SELECT pg_typeof(indkey), pg_typeof(indisunique), pg_typeof(indnatts) FROM pg_index WHERE indexrelid = 'ia_pkey'::regclass	regtype,regtype,regtype	int2vector|boolean|smallint
