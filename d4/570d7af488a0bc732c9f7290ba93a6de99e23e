@@ -1,0 +1,31 @@
+crates/esker-cli/src/bench.rs
+  s_e2fd0c54b9d574::t_5cd81284c41ab4 29-31,427
+crates/esker-engine/src/db/flush.rs
+  s_e2fd0c54b9d574::t_b2375bdbcd08df 461-466,470
+crates/esker-engine/src/db/mod.rs
+  s_e2fd0c54b9d574::t_4fad53ad01e958 501,552-556
+crates/esker-engine/src/options.rs
+  s_e2fd0c54b9d574::t_49d104a329f34c 331-372,382-383,415,472-493
+crates/esker-engine/tests/tiered_block_size.rs
+  s_e2fd0c54b9d574::t_6e67b3027786a5 1-268
+docs/DESIGN.md
+  s_e2fd0c54b9d574::t_b492a9c27dc28b 156-158,804
+docs/bench/phase-11-engine.md
+  s_e2fd0c54b9d574::t_ab63acafe3ebd0 188-207
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "d4570d7af488a0bc732c9f7290ba93a6de99e23e",
+  "prompts": {},
+  "sessions": {
+    "s_e2fd0c54b9d574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "671f3143-5435-4676-97d9-490a56835160",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
