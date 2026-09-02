@@ -1,0 +1,27 @@
+crates/esker-sql/src/exec/job.rs
+  s_e2fd0c54b9d574::t_7d979c0cc293cc 60-66,178-179,187-192
+crates/esker-sql/src/exec/verbs.rs
+  s_e2fd0c54b9d574::t_614cf3fd32f6ae 360-364,420-431
+crates/esker-sql/tests/redrive.rs
+  s_e2fd0c54b9d574::t_9f1b75a05a723a 23-24,26,30,53-55,60-66,74,77,180,200-421,701,731-743,764-792,795-801,820-986
+docs/adr/0020-online-schema-change.md
+  s_e2fd0c54b9d574::t_98301c0847c9ac 238-242
+docs/plans/phase-14-flakes.md
+  s_e2fd0c54b9d574::t_02d6c133808d27 133-235
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "c445a0491fb1082139d2bfd8cac60a84b00f472f",
+  "prompts": {},
+  "sessions": {
+    "s_e2fd0c54b9d574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "671f3143-5435-4676-97d9-490a56835160",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
