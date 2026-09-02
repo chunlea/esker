@@ -1,0 +1,19 @@
+docs/plans/debt-c3.md
+  s_7a3132f4d02a00::t_b8eabf5fd0fa8f 430-483
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "3b9df2e24be3dd59e6e7d41c2d8f4d90ec8235e0",
+  "prompts": {},
+  "sessions": {
+    "s_7a3132f4d02a00": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "176f3779-1c8f-49ac-8e22-08bb3b8ac7c3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
