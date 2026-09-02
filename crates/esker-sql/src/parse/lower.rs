@@ -3216,6 +3216,16 @@ fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
             ColumnType::Timestamp,
             value::typmod_of_precision(u32::try_from(*precision).unwrap_or(6)),
         )),
+        // **`time(7)` is `time(6)`, not an error.** A precision past the maximum is reduced to it
+        // — a `WARNING` on a real server and no complaint at all in the answer — where a
+        // `varchar` length past *its* bound is `22023`. The asymmetry is PostgreSQL's, measured:
+        // `'time(9)'::regtype` is 1083 and `'12:34:56'::time(7)` declares `time(6)`.
+        DataType::Time(Some(precision), TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
+            Ok((
+                ColumnType::Time,
+                value::typmod_of_precision(u32::try_from(*precision).unwrap_or(6).min(6)),
+            ))
+        }
         other => lower_plain_type(other).and_then(&plain),
     }
 }
@@ -3310,6 +3320,11 @@ fn lower_plain_type(data_type: &DataType) -> Result<ColumnType> {
         // server and `CREATE TABLE t (d date(3))` is a syntax error there, so the number has
         // nowhere to come from and nothing here produces one.
         DataType::Date => ColumnType::Date,
+        // `time` with no precision: six digits, the default and the maximum, as `timestamp` has
+        // it. `time(p)` is the caller's, and carries a typmod.
+        DataType::Time(None, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
+            ColumnType::Time
+        }
         // `bigserial` and `serial` are `bigint`/`integer` plus a sequence, and `sqlparser` 0.62
         // has no variant for either -- both arrive as a custom type name. `smallserial` arrives
         // the same way and falls through to the refusal below until `int2` lands, which names

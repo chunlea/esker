@@ -120,7 +120,7 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
     match value {
         // Nothing is written for a NULL; the bitmap is what records it.
         Datum::Null => {}
-        Datum::Int8(v) | Datum::TimestampTz(v) | Datum::Timestamp(v) => {
+        Datum::Int8(v) | Datum::TimestampTz(v) | Datum::Timestamp(v) | Datum::Time(v) => {
             out.extend_from_slice(&v.to_le_bytes());
         }
         // Four bytes, not eight. Nothing written before `int4` existed has a column of this type,
@@ -296,6 +296,12 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
             let (head, rest) = bytes.split_first_chunk::<4>().ok_or_else(truncated)?;
             (Datum::Date(i32::from_le_bytes(*head)), rest)
         }
+        // Eight little-endian bytes, the width `pg_type.typlen` gives it: a time of day is a
+        // microsecond count and one day does not fit in four bytes of them.
+        ColumnType::Time => {
+            let (head, rest) = bytes.split_first_chunk::<8>().ok_or_else(truncated)?;
+            (Datum::Time(i64::from_le_bytes(*head)), rest)
+        }
         ColumnType::Int2 => {
             let (head, rest) = bytes.split_first_chunk::<2>().ok_or_else(truncated)?;
             (Datum::Int2(i16::from_le_bytes(*head)), rest)
@@ -449,7 +455,9 @@ pub fn unique_index_key_is_unique_by_value(columns: &[Datum]) -> bool {
 fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
     match value {
         Datum::Null => {}
-        Datum::Int8(v) | Datum::TimestampTz(v) | Datum::Timestamp(v) => codec::encode_i64(*v, out),
+        Datum::Int8(v) | Datum::TimestampTz(v) | Datum::Timestamp(v) | Datum::Time(v) => {
+            codec::encode_i64(*v, out);
+        }
         // Widened to the `i64` encoding rather than given one of its own: an index key has to sort
         // by value and the memcomparable `i64` form already does, for every `i32` there is. A
         // second encoding would be a second thing to get wrong for no gain — a key is not a row,
@@ -584,6 +592,12 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
             let value = i32::try_from(value)
                 .map_err(|_| corrupt(format!("index key holds {value}, which is not a date")))?;
             (Datum::Date(value), rest)
+        }
+        // No narrowing on the way back: a time is already the width the key encoding uses, and
+        // its whole range — midnight through `24:00:00` inclusive — is ordinary `i64`.
+        ColumnType::Time => {
+            let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
+            (Datum::Time(value), rest)
         }
         ColumnType::Int2 => {
             let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
@@ -1179,6 +1193,8 @@ mod tests {
             ColumnType::Int8 => any::<i64>().prop_map(Datum::Int8).boxed(),
             ColumnType::Int4 => any::<i32>().prop_map(Datum::Int4).boxed(),
             ColumnType::Date => any::<i32>().prop_map(Datum::Date).boxed(),
+            // The whole closed range, both ends included, because `24:00:00` is a value.
+            ColumnType::Time => (0i64..=86_400_000_000).prop_map(Datum::Time).boxed(),
             // Weighted towards the shapes the encoding has cases for: the three specials, zero,
             // and a finite value at a scale on either side of nothing.
             ColumnType::Numeric => prop_oneof![

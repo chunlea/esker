@@ -76,6 +76,14 @@ pub fn encode_column(column: &Column) -> Result<(Encoding, Vec<u8>)> {
 ///
 /// `ty`, `rows` and `encoding` come from the footer, and every one of them is checked against
 /// what the chunk itself says before a value is decoded.
+///
+/// One dispatch over every column type, which is why it is long: the list grows by a line each
+/// time a type is added, and splitting it would put half the types in another function without
+/// making either half easier to read.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per column type, and they belong together"
+)]
 pub fn decode_column(
     ty: ColumnType,
     rows: u64,
@@ -143,7 +151,8 @@ pub fn decode_column(
         | ColumnType::Timestamp
         | ColumnType::Int4
         | ColumnType::Int2
-        | ColumnType::Date => ColumnData::Ints(integer::decode(encoding, &mut cursor, present)?),
+        | ColumnType::Date
+        | ColumnType::Time => ColumnData::Ints(integer::decode(encoding, &mut cursor, present)?),
         ColumnType::Double => ColumnData::Doubles(double::decode(encoding, &mut cursor, present)?),
         ColumnType::Real => ColumnData::Floats(float::decode(encoding, &mut cursor, present)?),
         ColumnType::Bool => {
@@ -257,6 +266,9 @@ mod tests {
             ColumnType::Int4 => any::<i32>().prop_map(Value::Int4).boxed(),
             ColumnType::Int2 => any::<i16>().prop_map(Value::Int2).boxed(),
             ColumnType::Date => any::<i32>().prop_map(Value::Date).boxed(),
+            // Both ends of the closed range, and midnight, which is where a run-length encoding
+            // of a mostly-empty time column lands.
+            ColumnType::Time => (0i64..=86_400_000_000).prop_map(Value::Time).boxed(),
             ColumnType::Real => any::<u32>()
                 .prop_map(|bits| Value::Real(f32::from_bits(bits)))
                 .boxed(),

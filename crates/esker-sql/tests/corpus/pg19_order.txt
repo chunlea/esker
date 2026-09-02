@@ -36,3 +36,4 @@ text		A	B	_a	a	a b	ab	b	~	é	🌊
 bpchar	   	  a	A  	B  	_a 	a  	a b	ab 	b  	~  	~~~
 varchar		A	B	_a	a	a b	ab	b	~	é	🌊
 bytea	\x	\x00	\x0000	\x01	\x7f	\x80	\xff	\xffff
+time	00:00:00	00:00:00.000001	12:34:56	12:34:56.123456	23:59:59.999999	24:00:00

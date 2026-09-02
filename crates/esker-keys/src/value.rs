@@ -165,11 +165,19 @@ pub enum ColumnType {
     /// down: a `date` has no time in it at all, prints without one, and its arithmetic answers
     /// different types from a timestamp's (`date - date` is an `integer`).
     Date,
+    /// PostgreSQL's `time` **without** time zone: a time of day, stored as microseconds since
+    /// midnight — eight bytes, PostgreSQL's own representation.
+    ///
+    /// **Its range is closed at both ends**: `00:00:00` through `24:00:00` inclusive, so a value
+    /// naming a twenty-fifth hour is storable and `86_400_000_000` is a legal number here. That is
+    /// PostgreSQL's rule, not a rounding artefact, and it is why nothing may assume a time is
+    /// strictly less than a day.
+    Time,
 }
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 16] = [
+    pub const ALL: [ColumnType; 17] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -186,6 +194,7 @@ impl ColumnType {
         ColumnType::Real,
         ColumnType::Date,
         ColumnType::Numeric,
+        ColumnType::Time,
     ];
 }
 
@@ -231,6 +240,9 @@ pub enum Datum {
     Date(i32),
     /// [`ColumnType::Numeric`]. Its scale is part of it (`crate::numeric`).
     Numeric(crate::numeric::Numeric),
+    /// [`ColumnType::Time`], in microseconds since midnight. `86_400_000_000` — `24:00:00` — is a
+    /// value and not an overflow.
+    Time(i64),
 }
 
 impl PartialEq for Datum {
@@ -246,7 +258,7 @@ impl PartialEq for Datum {
             // the number is compared.
             (Datum::Numeric(a), Datum::Numeric(b)) => a == b,
             (Datum::Int2(a), Datum::Int2(b)) => a == b,
-            (Datum::Timestamp(a), Datum::Timestamp(b)) => a == b,
+            (Datum::Timestamp(a), Datum::Timestamp(b)) | (Datum::Time(a), Datum::Time(b)) => a == b,
             (Datum::Text(a), Datum::Text(b)) => a == b,
             (Datum::Bool(a), Datum::Bool(b)) => a == b,
             (Datum::Bytea(a), Datum::Bytea(b)) => a == b,
@@ -270,6 +282,7 @@ impl Datum {
             Datum::Int8(_) => ColumnType::Int8,
             Datum::Int4(_) => ColumnType::Int4,
             Datum::Date(_) => ColumnType::Date,
+            Datum::Time(_) => ColumnType::Time,
             Datum::Numeric(_) => ColumnType::Numeric,
             Datum::Int2(_) => ColumnType::Int2,
             Datum::Real(_) => ColumnType::Real,

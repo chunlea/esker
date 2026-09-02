@@ -82,6 +82,9 @@ pub enum ColumnType {
     Real,
     /// PostgreSQL's `date`: a day, as a signed count from 2000-01-01 in four bytes.
     Date,
+    /// PostgreSQL's `time` without time zone: microseconds since midnight, in a **closed** range
+    /// that includes `24:00:00`.
+    Time,
     /// PostgreSQL's `numeric`: an arbitrary-precision decimal, carried as its **text**.
     ///
     /// Variable-length like a `Text`, and the text is lossless for this type — the scale is in
@@ -101,7 +104,7 @@ pub enum ColumnType {
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 16] = [
+    pub const ALL: [ColumnType; 17] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -117,6 +120,7 @@ impl ColumnType {
         ColumnType::Json,
         ColumnType::Jsonb,
         ColumnType::Date,
+        ColumnType::Time,
         ColumnType::Numeric,
     ];
 
@@ -140,6 +144,7 @@ impl ColumnType {
             ColumnType::Json => 13,
             ColumnType::Jsonb => 14,
             ColumnType::Date => 15,
+            ColumnType::Time => 17,
             ColumnType::Numeric => 16,
         }
     }
@@ -162,6 +167,7 @@ impl ColumnType {
             13 => ColumnType::Json,
             14 => ColumnType::Jsonb,
             15 => ColumnType::Date,
+            17 => ColumnType::Time,
             16 => ColumnType::Numeric,
             other => {
                 return Err(Error::corruption(
@@ -191,6 +197,7 @@ impl ColumnType {
             ColumnType::Json => "json",
             ColumnType::Jsonb => "jsonb",
             ColumnType::Date => "date",
+            ColumnType::Time => "time without time zone",
             ColumnType::Numeric => "numeric",
         }
     }
@@ -237,6 +244,8 @@ pub enum Value {
     Real(f32),
     /// A [`ColumnType::Date`], days from 2000-01-01.
     Date(i32),
+    /// A [`ColumnType::Time`], microseconds since midnight.
+    Time(i64),
     /// A [`ColumnType::Numeric`], as its text.
     Numeric(String),
 }
@@ -267,6 +276,7 @@ impl Value {
             Value::Double(_) => ty == ColumnType::Double,
             Value::Real(_) => ty == ColumnType::Real,
             Value::Date(_) => ty == ColumnType::Date,
+            Value::Time(_) => ty == ColumnType::Time,
             Value::Numeric(_) => ty == ColumnType::Numeric,
         }
     }
@@ -293,6 +303,7 @@ impl Value {
             Value::Double(_) => ColumnType::Double,
             Value::Real(_) => ColumnType::Real,
             Value::Date(_) => ColumnType::Date,
+            Value::Time(_) => ColumnType::Time,
             Value::Numeric(_) => ColumnType::Numeric,
         })
     }
@@ -302,7 +313,9 @@ impl Value {
     pub fn as_ref(&self) -> ValueRef<'_> {
         match self {
             Value::Null => ValueRef::Null,
-            Value::Int8(v) | Value::TimestampTz(v) | Value::Timestamp(v) => ValueRef::Int(*v),
+            Value::Int8(v) | Value::TimestampTz(v) | Value::Timestamp(v) | Value::Time(v) => {
+                ValueRef::Int(*v)
+            }
             // A day is an integer to the encoder, the way a timestamp is: the schema says which.
             Value::Int4(v) | Value::Date(v) => ValueRef::Int(i64::from(*v)),
             Value::Int2(v) => ValueRef::Int(i64::from(*v)),
@@ -405,6 +418,7 @@ impl ValueRef<'_> {
             (ValueRef::Int(v), ColumnType::Int8) => Value::Int8(v),
             (ValueRef::Int(v), ColumnType::TimestampTz) => Value::TimestampTz(v),
             (ValueRef::Int(v), ColumnType::Timestamp) => Value::Timestamp(v),
+            (ValueRef::Int(v), ColumnType::Time) => Value::Time(v),
             // Narrowed back from the widened run it rides in. A value outside `i32` cannot have
             // been written by an `Int4` column, so it is corruption rather than a value to clamp.
             (ValueRef::Int(v), ColumnType::Int4) => {
@@ -590,6 +604,7 @@ mod tests {
         assert_eq!(ColumnType::Real.tag(), 11);
         assert_eq!(ColumnType::Bpchar.tag(), 12);
         assert_eq!(ColumnType::Date.tag(), 15);
+        assert_eq!(ColumnType::Time.tag(), 17);
 
         for ty in ColumnType::ALL {
             assert_eq!(ColumnType::from_tag(ty.tag()).unwrap(), ty);

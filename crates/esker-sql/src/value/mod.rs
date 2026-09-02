@@ -33,6 +33,7 @@ pub mod date;
 pub(crate) mod float;
 pub(crate) mod json;
 pub mod numeric;
+pub mod time;
 mod timestamp;
 /// Arrays as the catalog holds them: text, read by the operators (`vector::Array`).
 pub mod vector;
@@ -146,6 +147,12 @@ pub fn fit_to_typmod(value: Datum, ty: ColumnType, typmod: i32) -> Result<Datum>
             Some(precision) => Datum::Timestamp(timestamp::round_to_precision(*micros, precision)),
             None => value,
         },
+        // The same rounding one type over, and it may carry past the end of the day — which is a
+        // value here, so there is nothing to clamp: `23:59:59.9999` at `time(3)` is `24:00:00`.
+        (Datum::Time(micros), ColumnType::Time) => match precision_of_typmod(typmod) {
+            Some(precision) => Datum::Time(time::round_to_precision(*micros, precision)),
+            None => value,
+        },
         (Datum::TimestampTz(micros), ColumnType::TimestampTz) => {
             match precision_of_typmod(typmod) {
                 Some(precision) => {
@@ -189,6 +196,12 @@ pub fn format_type(ty: ColumnType, typmod: i32) -> String {
         },
         (ColumnType::TimestampTz, _) => match precision_of_typmod(typmod) {
             Some(precision) => format!("timestamp({precision}) with time zone"),
+            None => ty.name().to_owned(),
+        },
+        // `time(3) without time zone`, the same shape one type over. Measured, including
+        // `format_type(1083, 0)`, which is `time(0) without time zone` and not the bare name.
+        (ColumnType::Time, _) => match precision_of_typmod(typmod) {
+            Some(precision) => format!("time({precision}) without time zone"),
             None => ty.name().to_owned(),
         },
         // `numeric(10,2)`, and `numeric(11,-2)` — the scale is signed and prints signed.
@@ -301,6 +314,7 @@ impl PgType for ColumnType {
             ColumnType::TimestampTz => 1184,
             ColumnType::Date => 1082,
             ColumnType::Numeric => 1700,
+            ColumnType::Time => 1083,
         }
     }
 
@@ -322,6 +336,7 @@ impl PgType for ColumnType {
             ColumnType::Real => "real",
             ColumnType::Date => "date",
             ColumnType::Numeric => "numeric",
+            ColumnType::Time => "time without time zone",
         }
     }
 
@@ -333,6 +348,7 @@ impl PgType for ColumnType {
             ColumnType::Int8
             | ColumnType::TimestampTz
             | ColumnType::Timestamp
+            | ColumnType::Time
             | ColumnType::Double => 8,
             ColumnType::Text
             | ColumnType::Varchar
@@ -427,6 +443,7 @@ impl PgDatum for Datum {
             Datum::Double(v) => float::to_text(*v),
             Datum::Real(v) => float::to_text_f32(*v),
             Datum::Date(v) => date::to_text(*v),
+            Datum::Time(v) => time::to_text(*v),
             Datum::Numeric(v) => numeric::to_text(v),
         })
     }
@@ -458,6 +475,7 @@ impl PgDatum for Datum {
             // session's clock enters. `crate::exec` resolves them where it has the transaction's
             // start timestamp, which is the only clock this crate is allowed to read (DESIGN §6).
             ColumnType::Date => Datum::Date(date::from_text(text, 0)?),
+            ColumnType::Time => Datum::Time(time::from_text(text)?),
             ColumnType::Numeric => Datum::Numeric(numeric::from_text(text)?),
         })
     }
@@ -469,7 +487,10 @@ impl PgDatum for Datum {
             // nothing here has ever sent or read that shape, so it is refused rather than
             // guessed. See the contract above for why the two share one answer.
             Datum::Null | Datum::Numeric(_) => return None,
-            Datum::Int8(v) | Datum::TimestampTz(v) | Datum::Timestamp(v) => {
+            // A `time` joins them: `time_send` is the microsecond count as eight big-endian
+            // bytes, measured with `COPY ... (FORMAT binary)` — `12:34:56` is `0x0a8bda1c00`
+            // (45_296_000_000) and `24:00:00` is `0x141dd76000`, the top of the closed range.
+            Datum::Int8(v) | Datum::TimestampTz(v) | Datum::Timestamp(v) | Datum::Time(v) => {
                 v.to_be_bytes().to_vec()
             }
             // Four big-endian bytes for both, which is what `int4send` and `date_send` write.
@@ -497,12 +518,14 @@ impl PgDatum for Datum {
             ColumnType::Int8
             | ColumnType::TimestampTz
             | ColumnType::Timestamp
+            | ColumnType::Time
             | ColumnType::Double => {
                 let head: [u8; 8] = fixed(8)?.try_into().unwrap_or([0; 8]);
                 match ty {
                     ColumnType::Int8 => Datum::Int8(i64::from_be_bytes(head)),
                     ColumnType::TimestampTz => Datum::TimestampTz(i64::from_be_bytes(head)),
                     ColumnType::Timestamp => Datum::Timestamp(i64::from_be_bytes(head)),
+                    ColumnType::Time => Datum::Time(i64::from_be_bytes(head)),
                     _ => Datum::Double(f64::from_be_bytes(head)),
                 }
             }
@@ -565,6 +588,9 @@ impl PgDatum for Datum {
             (_, Datum::Null) => Ordering::Less,
             (Datum::Int8(a), Datum::Int8(b))
             | (Datum::TimestampTz(a), Datum::TimestampTz(b))
+            // Plain integer order, and only against another `time`: this type compares with
+            // nothing else, so there is no promotion arm to write beside it.
+            | (Datum::Time(a), Datum::Time(b))
             | (Datum::Timestamp(a), Datum::Timestamp(b)) => a.cmp(b),
             // Across the two widths, because PostgreSQL has an `int4 = int8` operator and answers
             // `1::integer = 1::bigint` with `t`. Widening is exact in this direction, so there is
@@ -648,6 +674,10 @@ fn variant_rank(value: &Datum) -> u8 {
         Datum::Double(_) | Datum::Real(_) => 2,
         Datum::TimestampTz(_) | Datum::Timestamp(_) | Datum::Date(_) => 3,
         Datum::Numeric(_) => 7,
+        // Its own rank, because it is its own family: a `time` compares with a `time` and with
+        // nothing else, so this rank exists to give the cross-type order a total answer rather
+        // than to describe an operator a real server has.
+        Datum::Time(_) => 8,
         Datum::Text(_) => 4,
         Datum::Bytea(_) => 5,
         Datum::Null => 6,

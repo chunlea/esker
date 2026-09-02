@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8ae6228e8bbb70abe790320c328f028c6390743c005175672d30db89a17ac49d # shrinks to (_types, rows) = ([Time], [[Time(0)], [Time(1)]])
+cc b275ee780d1f46aa334844320223f4396f926d8f60d759d83c31711f58c1e886 # shrinks to (_types, rows) = ([Time], [[Time(0)], [Time(1)]])

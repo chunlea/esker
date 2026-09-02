@@ -192,6 +192,9 @@ fn activerecord_s_four_type_map_queries_answer() {
             // type — added to `ColumnType::ALL` and nowhere else, which is what "the catalog
             // derives itself" means: no row was written here by hand.
             vec!["1082", "date", "0", ",", "date_in", "\\N", "b", "0"],
+            // `time` is in this list of forty too, and its `typinput` is `time_in` — the
+            // capture's own spelling, underscore and all.
+            vec!["1083", "time", "0", ",", "time_in", "\\N", "b", "0"],
             vec![
                 "1114",
                 "timestamp",

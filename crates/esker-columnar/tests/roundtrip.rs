@@ -97,6 +97,8 @@ fn value_of(ty: ColumnType) -> impl Strategy<Value = Value> {
         ColumnType::Timestamp => (-5_000i64..5_000)
             .prop_map(|d| Value::Timestamp(757_382_400_000_000 + d * 1_000))
             .boxed(),
+        // Both ends of the closed range are in reach, because `24:00:00` is a value.
+        ColumnType::Time => (0i64..=86_400_000_000).prop_map(Value::Time).boxed(),
         ColumnType::TimestampTz => (-5_000i64..5_000)
             .prop_map(|d| Value::TimestampTz(757_382_400_000_000 + d * 1_000))
             .boxed(),
