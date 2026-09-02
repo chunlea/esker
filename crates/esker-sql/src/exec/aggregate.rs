@@ -153,7 +153,10 @@ impl Aggregation {
             // Every type has an ordering here, and `bool` is the one PostgreSQL has no aggregate
             // for. Refusing it is being right rather than being incomplete.
             AggregateFunc::Min | AggregateFunc::Max => match arg {
-                ColumnType::Bool => undefined(),
+                // A third and fourth totally-ordered type with no aggregate over it, after
+                // `bool`: `min(jsonb)` is `42883 function min(jsonb) does not exist` on a real
+                // server even though `<` works and `ORDER BY` works. Refusing is being right.
+                ColumnType::Bool | ColumnType::Json | ColumnType::Jsonb => undefined(),
                 // Measured: `min(varchar)` and `max(varchar)` come back as **`text`** on a real
                 // server, and `min(character(n))` comes back as **`bpchar`**. The string family
                 // does not decay uniformly — `bpchar` has a `min` of its own where `varchar`

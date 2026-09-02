@@ -84,11 +84,17 @@ pub enum ColumnType {
     /// again; what differs is that its values arrive **already padded** to the column's length, so
     /// byte comparison is the blank-insensitive comparison PostgreSQL specifies.
     Bpchar,
+    /// PostgreSQL's `json`: validated text, stored exactly as sent.
+    Json,
+    /// PostgreSQL's `jsonb`: the canonical text it prints as. Its equality is not its byte
+    /// equality, which is why it is not a key type (ADR 0042) — but it is an ordinary `Bytes` run
+    /// here, because a column is not a key.
+    Jsonb,
 }
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 12] = [
+    pub const ALL: [ColumnType; 14] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -101,6 +107,8 @@ impl ColumnType {
         ColumnType::Double,
         ColumnType::Real,
         ColumnType::Bpchar,
+        ColumnType::Json,
+        ColumnType::Jsonb,
     ];
 
     /// The tag byte this type is stored as. Frozen: see the module docs.
@@ -120,6 +128,8 @@ impl ColumnType {
             ColumnType::Int2 => 10,
             ColumnType::Real => 11,
             ColumnType::Bpchar => 12,
+            ColumnType::Json => 13,
+            ColumnType::Jsonb => 14,
         }
     }
 
@@ -138,6 +148,8 @@ impl ColumnType {
             10 => ColumnType::Int2,
             11 => ColumnType::Real,
             12 => ColumnType::Bpchar,
+            13 => ColumnType::Json,
+            14 => ColumnType::Jsonb,
             other => {
                 return Err(Error::corruption(
                     "schema",
@@ -163,6 +175,8 @@ impl ColumnType {
             ColumnType::Double => "double precision",
             ColumnType::Real => "real",
             ColumnType::Bpchar => "character",
+            ColumnType::Json => "json",
+            ColumnType::Jsonb => "jsonb",
         }
     }
 
@@ -171,7 +185,12 @@ impl ColumnType {
     pub fn is_variable_length(self) -> bool {
         matches!(
             self,
-            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Bytea
+            ColumnType::Text
+                | ColumnType::Varchar
+                | ColumnType::Bpchar
+                | ColumnType::Json
+                | ColumnType::Jsonb
+                | ColumnType::Bytea
         )
     }
 }
@@ -216,7 +235,11 @@ impl Value {
             // nothing in it a `Text` does not hold.
             Value::Text(_) => matches!(
                 ty,
-                ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar
+                ColumnType::Text
+                    | ColumnType::Varchar
+                    | ColumnType::Bpchar
+                    | ColumnType::Json
+                    | ColumnType::Jsonb
             ),
             Value::Bool(_) => ty == ColumnType::Bool,
             Value::Bytea(_) => ty == ColumnType::Bytea,
@@ -377,13 +400,18 @@ impl ValueRef<'_> {
             // for a `NaN` payload to be lost to.
             (ValueRef::Real(v), ColumnType::Real) => Value::Real(v),
             (ValueRef::Bytes(v), ColumnType::Bytea) => Value::Bytea(v.to_vec()),
-            (ValueRef::Bytes(v), ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar) => {
-                Value::Text(
-                    std::str::from_utf8(v)
-                        .map_err(|error| Error::corruption("text column", error.to_string()))?
-                        .to_owned(),
-                )
-            }
+            (
+                ValueRef::Bytes(v),
+                ColumnType::Text
+                | ColumnType::Varchar
+                | ColumnType::Bpchar
+                | ColumnType::Json
+                | ColumnType::Jsonb,
+            ) => Value::Text(
+                std::str::from_utf8(v)
+                    .map_err(|error| Error::corruption("text column", error.to_string()))?
+                    .to_owned(),
+            ),
             (other, ty) => {
                 return Err(Error::corruption(
                     "column",
@@ -561,7 +589,16 @@ mod tests {
                 // Three types, one representation — the string family PostgreSQL has, told apart
                 // by OID and not by bytes. A `bpchar`'s padding is applied before the value gets
                 // here, so what arrives is a `Text` like any other.
-                &[ColumnType::Text, ColumnType::Varchar, ColumnType::Bpchar][..],
+                // Five types, one representation. `json` and `jsonb` join the string family in
+                // *bytes* and not in comparison, which is what ADR 0042 is about — but `fits` is a
+                // question about bytes, so here they belong with the rest.
+                &[
+                    ColumnType::Text,
+                    ColumnType::Varchar,
+                    ColumnType::Bpchar,
+                    ColumnType::Json,
+                    ColumnType::Jsonb,
+                ][..],
             ),
             (Value::Bool(true), &[ColumnType::Bool][..]),
             (Value::Bytea(vec![1]), &[ColumnType::Bytea][..]),

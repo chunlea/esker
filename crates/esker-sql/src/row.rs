@@ -51,6 +51,21 @@ mod tests {
             ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => {
                 ".{0,32}".prop_map(Datum::Text).boxed()
             }
+            // Documents, because that is what these columns hold — the row codec is only ever
+            // handed a value the SQL layer has already validated or canonicalised.
+            ColumnType::Json | ColumnType::Jsonb => proptest::sample::select(vec![
+                "null",
+                "true",
+                "1",
+                "1.00",
+                "\"s\"",
+                "[]",
+                "[1, 2]",
+                "{}",
+                "{\"a\": 1}",
+            ])
+            .prop_map(|text| Datum::Text(text.to_owned()))
+            .boxed(),
             ColumnType::Bool => any::<bool>().prop_map(Datum::Bool).boxed(),
             ColumnType::Bytea => proptest::collection::vec(any::<u8>(), 0..32)
                 .prop_map(Datum::Bytea)

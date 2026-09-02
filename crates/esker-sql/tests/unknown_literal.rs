@@ -146,40 +146,24 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "the same `0A000`. A real server answers no rows, having compared 1 against 1.5 as \
              `numeric`.",
         ),
-        // --- a cast, which is `0A000` naming itself -------------------------------------------
+        // --- a cast of a *number*, which is still `0A000` --------------------------------------
+        //
+        // Seven entries stood here and have gone: a cast of a **string** literal runs since the
+        // json unit, which needed `'{"a":1}'::jsonb`, and the harness failed until they were
+        // deleted. What is left is the cast of a numeric literal, which nothing has needed yet.
         (
             "SELECT 1 = '1'::text",
-            "**a cast is `0A000` naming itself, and was before this unit.** These lines are the \
-             corpus's evidence for case 3 — that an explicit type is *not* `unknown`, so \
-             `1 = '1'::text` is `42883` where `1 = '1'` is `t`. This node cannot express the \
-             distinction and so cannot get it wrong: every quoted string here is `unknown`.",
+            "**a cast of a number is `0A000` naming itself.** These lines are the corpus's \
+             evidence for case 3 — that an explicit type is *not* `unknown`, so `1 = '1'::text` \
+             is `42883` where `1 = '1'` is `t`. This node cannot express the distinction on the \
+             numeric side and so cannot get it wrong there: the quoted string is `unknown`.",
         ),
         ("SELECT '1'::text = 1", "a cast, as above."),
         ("SELECT 1::int8 = '1'", "a cast, as above."),
-        ("SELECT '1'::text = '01'", "a cast, as above."),
         (
             "SELECT 1::bigint = '9223372036854775807'",
             "a cast, as above.",
         ),
-        (
-            "SELECT '2020-01-01 00:00:00+00'::timestamptz = '2020-01-01 00:00:00+00'",
-            "a cast, as above. These three lines are what says the rule reaches `timestamptz` — \
-             including that its input error is `22007` and not `22P02` — and this node has no \
-             way to write a `timestamptz` literal without one.",
-        ),
-        (
-            "SELECT '2020-01-01 00:00:00+00'::timestamptz = '2020-01-01 01:00:00+01'",
-            "a cast, as above.",
-        ),
-        (
-            "SELECT '2020-01-01 00:00:00+00'::timestamptz = 'not a date'",
-            "a cast, as above.",
-        ),
-        (
-            "SELECT '\\x0102'::bytea = '\\x0102'",
-            "a cast, as above; the `bytea` half of the same evidence.",
-        ),
-        ("SELECT '\\x0102'::bytea = 'zz'", "a cast, as above."),
         (
             "SELECT 1.5::float8 = '1.5'",
             "a cast, as above; the `float8` half.",
@@ -190,11 +174,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              reading a string successfully still answers `f`.",
         ),
         ("SELECT 1.5::float8 = 'x'", "a cast, as above."),
-        (
-            "SELECT 'a'::text = 'a'",
-            "a cast, as above; the `text` half, and the one that shows a cast on *one* side is \
-             enough to type the other.",
-        ),
         // --- the collation, already declared ---------------------------------------------------
         (
             "SELECT 'B' < 'a'",

@@ -69,6 +69,8 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Int2 => 10,
         ColumnType::Real => 11,
         ColumnType::Bpchar => 12,
+        ColumnType::Json => 13,
+        ColumnType::Jsonb => 14,
     }
 }
 
@@ -86,6 +88,8 @@ fn type_of(tag: u8) -> Result<ColumnType, RowError> {
         10 => ColumnType::Int2,
         11 => ColumnType::Real,
         12 => ColumnType::Bpchar,
+        13 => ColumnType::Json,
+        14 => ColumnType::Jsonb,
         other => {
             return Err(RowError::Corrupt(format!(
                 "column type tag {other} is not one of ours"

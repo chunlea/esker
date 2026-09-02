@@ -122,6 +122,18 @@ pub enum ColumnType {
     /// this type could not arrive before the typmod did — there is nowhere to pad to without an
     /// `n` ([ADR 0033](../../docs/adr/0033-tier-1-of-the-type-surface.md)).
     Bpchar,
+    /// PostgreSQL's `json`: a **validated string**, stored exactly as it was sent. Whitespace,
+    /// key order and duplicate keys all survive, because that is all `json` is
+    /// ([ADR 0042](../../docs/adr/0042-json-and-jsonb-are-two-types-and-one-of-them-is-not-a-key.md)).
+    Json,
+    /// PostgreSQL's `jsonb`: a value, stored as the **canonical text** it prints as — keys
+    /// reordered by length then bytes, duplicates dropped with the last winning, and a space after
+    /// every colon and comma.
+    ///
+    /// Its equality is **not** its byte equality: `1.0` and `1.00` print differently and compare
+    /// equal, because a jsonb number is a `numeric`. That is why a `jsonb` column cannot be a key
+    /// here, and it is the one thing ADR 0042 turns on.
+    Jsonb,
     /// Two-valued, with no third state but NULL.
     Bool,
     /// Variable-length byte string.
@@ -143,13 +155,15 @@ pub enum ColumnType {
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 12] = [
+    pub const ALL: [ColumnType; 14] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
         ColumnType::Text,
         ColumnType::Varchar,
         ColumnType::Bpchar,
+        ColumnType::Json,
+        ColumnType::Jsonb,
         ColumnType::Bool,
         ColumnType::Bytea,
         ColumnType::TimestampTz,
@@ -254,7 +268,11 @@ impl Datum {
             (None, _)
             | (
                 Some(ColumnType::Text),
-                ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar,
+                ColumnType::Text
+                | ColumnType::Varchar
+                | ColumnType::Bpchar
+                | ColumnType::Json
+                | ColumnType::Jsonb,
             ) => true,
             (Some(actual), wanted) => actual == wanted,
         }

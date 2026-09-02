@@ -55,6 +55,8 @@ pub const INVALID_TIME_ZONE_DISPLACEMENT_VALUE: &str = "22009";
 /// standard says should happen and not what PostgreSQL does — it raises rather than truncates,
 /// and an explicit `::varchar(5)` cast is the one place it really does truncate.
 pub const STRING_DATA_RIGHT_TRUNCATION: &str = "22001";
+/// A `jsonb` document containing a NUL escape, which its text form cannot hold.
+pub const UNSUPPORTED_UNICODE_ESCAPE: &str = "22P05";
 /// Bytes that are not valid in the server encoding.
 pub const CHARACTER_NOT_IN_REPERTOIRE: &str = "22021";
 /// What `bytea`'s hexadecimal input reports a bad digit or an odd count with. Surprising — the

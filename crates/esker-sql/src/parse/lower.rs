@@ -1137,6 +1137,10 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             op: UnaryOperator::Not,
             expr,
         } => Ok(plan::Expr::Not(Box::new(lower_expr(expr)?))),
+        // A comparison over `json` or `jsonb` is refused; [`refuse_json_comparison`] says why.
+        Expr::BinaryOp { left, op, right } if is_comparison(op) && either_is_json(left, right) => {
+            Err(refuse_json_comparison(op))
+        }
         Expr::BinaryOp { op, left, right } => {
             let op = match op {
                 BinaryOperator::Eq => plan::BinaryOp::Eq,
@@ -1170,10 +1174,6 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
         Expr::Cast {
             expr, data_type, ..
         } => lower_cast(expr, data_type),
-        // `x = ANY(<array>)` **is** `x IN (…)`: PostgreSQL defines the one as the other, and this
-        // node's `IN` already answers with the same three-valued logic — `'z' IN ('a', NULL)` is
-        // NULL, `'a' IN ('a', NULL)` is true, and an empty list is false, all measured on both
-        // sides before this arm was written. So there is nothing here to get wrong separately.
         Expr::AnyOp {
             left,
             compare_op,
@@ -1519,7 +1519,7 @@ fn parse_array_literal(text: &str) -> Result<Vec<Option<String>>> {
     let mut was_quoted = false;
     let mut quoted = false;
     let mut chars = inner.chars();
-    let mut finish = |current: &mut String, was_quoted: &mut bool, items: &mut Vec<_>| {
+    let finish = |current: &mut String, was_quoted: &mut bool, items: &mut Vec<_>| {
         let text = std::mem::take(current);
         items.push(
             if !*was_quoted && text.trim().eq_ignore_ascii_case("null") {
@@ -1623,10 +1623,8 @@ fn argument_type_name(arg: &sqlparser::ast::FunctionArg) -> String {
         Expr::Value(value) => match &value.value {
             Value::Boolean(_) => "boolean",
             Value::Number(..) => "integer",
-            // An unadorned string literal really is `unknown` to a real server's resolver, which
-            // is why `current_schema('x')` names `unknown` rather than `text`.
-            Value::SingleQuotedString(_) => "unknown",
-            Value::Null => "unknown",
+            // Everything else is `unknown`, which is what a real server's resolver calls an
+            // unadorned string literal: `current_schema('x')` names `unknown`, not `text`.
             _ => "unknown",
         }
         .to_owned(),
@@ -1656,8 +1654,27 @@ const PUBLIC_SCHEMA: &str = "public";
 /// So the pair is recognised together. That is not a shortcut around a missing type — it is the
 /// one place where composing the two steps would have to allow a cast PostgreSQL forbids.
 fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
-    let target = cast_target(data_type)
-        .ok_or_else(|| SqlError::unsupported(format!("a cast to {data_type}")))?;
+    // `NULL::anything` is NULL, whatever the type — the cast tells a client what the column's type
+    // is and changes nothing about the value.
+    if matches!(expr, Expr::Value(value) if matches!(value.value, Value::Null)) {
+        return Ok(plan::Expr::Literal(plan::Literal::Null));
+    }
+    let Some(target) = cast_target(data_type) else {
+        // A cast to a **stored type**, which is a different thing from `regtype` and `oid`: it
+        // reads the operand with that type's input function, exactly as assigning it to a column
+        // of that type would. Only a literal, and only a chain of them — `'{"a":1}'::json::jsonb`
+        // is two of these — because a cast of a *column* has to happen per row and this node has
+        // no expression-level cast to do it with.
+        return match cast_literal_text(expr)? {
+            Some(text) => {
+                let (ty, _) = lower_type(data_type)?;
+                Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                    Datum::from_text(ty, &text)?,
+                ))))
+            }
+            None => Err(SqlError::unsupported(format!("a cast to {data_type}"))),
+        };
+    };
     match (target, expr) {
         // `'integer'::regtype::oid` — the inner cast is matched here rather than lowered first.
         (
@@ -1669,7 +1686,7 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             },
         ) if cast_target(inner_type) == Some(CastTarget::RegType) => {
             let name = cast_operand(inner, data_type)?;
-            let ty = crate::value::type_by_name(&name)
+            let ty = value::type_by_name(&name)
                 .ok_or_else(|| SqlError::UndefinedType(name.trim().to_owned()))?;
             Ok(plan::Expr::Literal(plan::Literal::Integer(i64::from(
                 ty.oid(),
@@ -1678,10 +1695,10 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
         // `'integer'::regtype` on its own, which answers the name PostgreSQL prints it by.
         (CastTarget::RegType, _) => {
             let name = cast_operand(expr, data_type)?;
-            let ty = crate::value::type_by_name(&name)
+            let ty = value::type_by_name(&name)
                 .ok_or_else(|| SqlError::UndefinedType(name.trim().to_owned()))?;
             Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
-                Datum::Text(crate::value::format_type(ty, crate::value::NO_TYPMOD)),
+                Datum::Text(value::format_type(ty, NO_TYPMOD)),
             ))))
         }
         // `'23'::oid`. An `oid` reads digits and nothing else — a type *name* here is `22P02` on a
@@ -1699,6 +1716,80 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                 value,
             ))))
         }
+    }
+}
+
+/// `0A000` for a comparison over `json` or `jsonb`.
+///
+/// Refused **in the lowering**, where the operand still says which type it is. Once a cast has
+/// been lowered a `jsonb` is a `Datum::Text` and the type is gone: `Datum` has no json variant,
+/// because these two share `text`'s representation. That sharing is exactly what `varchar` and
+/// `bpchar` do and it is safe for them, because their comparison *is* text comparison. `jsonb`'s
+/// is not — `'1.0'::jsonb = '1.00'::jsonb` is `t` on a real server and byte comparison says `f`,
+/// and `ORDER BY` sorts by kind before value. Answering either from the bytes would be a wrong
+/// answer, so both are `0A000` until `jsonb` has a `Datum` of its own.
+///
+/// That is the `real` unit's lesson one layer up: **a type may share another's representation only
+/// if it shares its comparison.** `json` has no comparison operators at all on a real server, so
+/// refusing there is closer still. [ADR 0042](../../../docs/adr/0042-json-and-jsonb-are-two-types-and-one-of-them-is-not-a-key.md).
+fn refuse_json_comparison(op: &BinaryOperator) -> SqlError {
+    SqlError::unsupported(format!("the operator {op} over json or jsonb"))
+}
+
+/// Whether either operand of a comparison is written as a `json` or `jsonb` value.
+///
+/// Syntactic, and it has to be: after lowering, a `jsonb` is a `Datum::Text` like any other.
+fn either_is_json(left: &Expr, right: &Expr) -> bool {
+    is_json_expr(left) || is_json_expr(right)
+}
+
+fn is_json_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Nested(inner) => is_json_expr(inner),
+        Expr::Cast {
+            expr, data_type, ..
+        } => matches!(data_type, DataType::JSON | DataType::JSONB) || is_json_expr(expr),
+        _ => false,
+    }
+}
+
+/// Whether an operator compares, as against combines.
+fn is_comparison(op: &BinaryOperator) -> bool {
+    matches!(
+        op,
+        BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq
+    )
+}
+
+/// The text a literal — or a chain of casts over one — carries, for a cast to read.
+///
+/// **Each cast in a chain is applied in turn**, not skipped to the innermost literal, because the
+/// steps are not interchangeable: `'{"b":1,"a":2}'::jsonb::json` is `{"a": 2, "b": 1}` on a real
+/// server — the `jsonb` canonicalised it and the `json` stored *that* — while reading the original
+/// text as `json` directly would answer `{"b":1,"a":2}`. One reordering, two different answers.
+fn cast_literal_text(expr: &Expr) -> Result<Option<String>> {
+    match expr {
+        Expr::Nested(inner) => cast_literal_text(inner),
+        Expr::Value(value) => Ok(match &value.value {
+            Value::SingleQuotedString(text) => Some(text.clone()),
+            _ => None,
+        }),
+        // The inner cast, run: its *result* is what the outer one reads.
+        Expr::Cast { .. } => match lower_expr(expr)? {
+            plan::Expr::Literal(plan::Literal::Typed(value)) => Ok(match value.as_ref() {
+                Datum::Text(text) => Some(text.clone()),
+                other => other.to_text(),
+            }),
+            plan::Expr::Literal(plan::Literal::String(text)) => Ok(Some(text)),
+            plan::Expr::Literal(plan::Literal::Integer(value)) => Ok(Some(value.to_string())),
+            _ => Ok(None),
+        },
+        _ => Ok(None),
     }
 }
 
@@ -2266,6 +2357,10 @@ fn lower_plain_type(data_type: &DataType) -> Result<ColumnType> {
         DataType::Int2(None) | DataType::SmallInt(None) => ColumnType::Int2,
         DataType::Float4 | DataType::Real => ColumnType::Real,
         DataType::Text => ColumnType::Text,
+        // Neither takes a typmod, and the refusal is the *parser's*: `json(10)` is a syntax error
+        // before it reaches here, like `integer(4)`. ADR 0042.
+        DataType::JSON => ColumnType::Json,
+        DataType::JSONB => ColumnType::Jsonb,
         // `character varying` and `varchar` with **no length**: unlimited, which is what the bare
         // spelling means. The lengths are handled by the caller, which is where the typmod is.
         DataType::Varchar(None) | DataType::CharacterVarying(None) => ColumnType::Varchar,

@@ -30,6 +30,7 @@
 //! single `match` be exhaustive over what a column can hold.
 
 pub(crate) mod float;
+pub(crate) mod json;
 mod timestamp;
 
 use std::cmp::Ordering;
@@ -195,11 +196,11 @@ pub fn type_by_name(spelled: &str) -> Option<ColumnType> {
     // `character varying(255)` -> `character varying`; `timestamp(6) without time zone` keeps its
     // tail, because the words after the parentheses are part of the name.
     let name = spelled.trim().to_ascii_lowercase();
-    let name = match (name.find('('), name.find(')')) {
+    let (name, had_typmod) = match (name.find('('), name.find(')')) {
         (Some(open), Some(close)) if open < close => {
-            format!("{}{}", &name[..open], &name[close + 1..])
+            (format!("{}{}", &name[..open], &name[close + 1..]), true)
         }
-        _ => name,
+        _ => (name, false),
     };
     let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
     Some(match name.as_str() {
@@ -209,6 +210,8 @@ pub fn type_by_name(spelled: &str) -> Option<ColumnType> {
         "text" => ColumnType::Text,
         "character varying" | "varchar" => ColumnType::Varchar,
         "character" | "char" | "bpchar" => ColumnType::Bpchar,
+        "json" => ColumnType::Json,
+        "jsonb" => ColumnType::Jsonb,
         "boolean" | "bool" => ColumnType::Bool,
         "bytea" => ColumnType::Bytea,
         "timestamp" | "timestamp without time zone" => ColumnType::Timestamp,
@@ -217,6 +220,20 @@ pub fn type_by_name(spelled: &str) -> Option<ColumnType> {
         // `float` with no precision is `float8` on a real server, not `float4`.
         "double precision" | "float8" | "float" => ColumnType::Double,
         _ => return None,
+    })
+    // **A typmod is only legal on a type that takes one.** `'character varying(255)'::regtype` is
+    // `1043` and `'json(10)'::regtype` is `42601 syntax error at or near "("` — PostgreSQL's
+    // *parser* refuses the second, the way it refuses `integer(4)`. Discarding the number for
+    // every type would have answered `114` for a string a real server will not parse.
+    .filter(|ty| {
+        !had_typmod
+            || matches!(
+                ty,
+                ColumnType::Varchar
+                    | ColumnType::Bpchar
+                    | ColumnType::Timestamp
+                    | ColumnType::TimestampTz
+            )
     })
 }
 
@@ -255,6 +272,8 @@ impl PgType for ColumnType {
             ColumnType::Text => 25,
             ColumnType::Varchar => 1043,
             ColumnType::Bpchar => 1042,
+            ColumnType::Json => 114,
+            ColumnType::Jsonb => 3802,
             ColumnType::Real => 700,
             ColumnType::Double => 701,
             ColumnType::Timestamp => 1114,
@@ -270,6 +289,8 @@ impl PgType for ColumnType {
             ColumnType::Text => "text",
             ColumnType::Varchar => "character varying",
             ColumnType::Bpchar => "character",
+            ColumnType::Json => "json",
+            ColumnType::Jsonb => "jsonb",
             ColumnType::Bool => "boolean",
             ColumnType::Bytea => "bytea",
             ColumnType::TimestampTz => "timestamp with time zone",
@@ -288,7 +309,12 @@ impl PgType for ColumnType {
             | ColumnType::TimestampTz
             | ColumnType::Timestamp
             | ColumnType::Double => 8,
-            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Bytea => -1,
+            ColumnType::Text
+            | ColumnType::Varchar
+            | ColumnType::Bpchar
+            | ColumnType::Json
+            | ColumnType::Jsonb
+            | ColumnType::Bytea => -1,
         }
     }
 }
@@ -379,6 +405,14 @@ impl PgDatum for Datum {
             ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => {
                 Datum::Text(text.to_owned())
             }
+            // `json` keeps the text exactly as sent, once it is known to be a document; `jsonb`
+            // keeps the canonical form it prints as. ADR 0042 is why the two differ here and
+            // nowhere else in this function.
+            ColumnType::Json => {
+                json::validate(text)?;
+                Datum::Text(text.to_owned())
+            }
+            ColumnType::Jsonb => Datum::Text(json::canonicalise(text)?),
             ColumnType::Bool => Datum::Bool(parse_bool(text)?),
             ColumnType::Bytea => Datum::Bytea(parse_bytea(text)?),
             ColumnType::TimestampTz => Datum::TimestampTz(timestamp::from_text(text)?),
@@ -448,6 +482,14 @@ impl PgDatum for Datum {
                     )));
                 }
             },
+            // A `json` or `jsonb` **binary** parameter is its text with a leading version byte
+            // on a real server; this node has never sent one and the corpus does not cover it, so
+            // it is refused rather than guessed. The text path is what a client actually uses.
+            ColumnType::Json | ColumnType::Jsonb => {
+                return Err(SqlError::unsupported(
+                    "a json or jsonb parameter in the binary format",
+                ));
+            }
             ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => {
                 Datum::Text(String::from_utf8(bytes.to_vec()).map_err(|error| {
                     let at = error.utf8_error().valid_up_to();
@@ -735,12 +777,20 @@ mod tests {
         assert_eq!(ColumnType::Timestamp.oid(), 1114);
         assert_eq!(ColumnType::Real.oid(), 700);
         assert_eq!(ColumnType::Bpchar.oid(), 1042);
+        // Tier 2's first pair (ADR 0042).
+        assert_eq!(ColumnType::Json.oid(), 114);
+        assert_eq!(ColumnType::Jsonb.oid(), 3802);
         for ty in ColumnType::ALL {
             assert_eq!(
                 ty.type_len() == -1,
                 matches!(
                     ty,
-                    ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Bytea
+                    ColumnType::Text
+                        | ColumnType::Varchar
+                        | ColumnType::Bpchar
+                        | ColumnType::Json
+                        | ColumnType::Jsonb
+                        | ColumnType::Bytea
                 ),
                 "{ty:?} reports the wrong width"
             );

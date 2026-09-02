@@ -429,6 +429,9 @@ fn placeholder(ty: ColumnType) -> Datum {
         ColumnType::Int4 => Datum::Int4(0),
         ColumnType::Int2 => Datum::Int2(0),
         ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => Datum::Text(String::new()),
+        // The empty string is not a document, so a `json` placeholder is the smallest one that
+        // is. It only ever stands in for a type while a `Describe` is answered.
+        ColumnType::Json | ColumnType::Jsonb => Datum::Text("null".to_owned()),
         ColumnType::Bool => Datum::Bool(false),
         ColumnType::Bytea => Datum::Bytea(Vec::new()),
         ColumnType::TimestampTz => Datum::TimestampTz(0),

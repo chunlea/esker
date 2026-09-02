@@ -429,6 +429,7 @@ fn finish_plan(
     // the target list does not contain has no defined position to sort at. Its keys are resolved
     // against the *output* columns and a key that is not one of them is `42P10`.
     let sort_keys = order_keys(select, scope, aggregation.as_ref(), &exprs, &columns)?;
+    refuse_json_sort(&sort_keys)?;
     if !select.distinct && !sort_keys.is_empty() {
         node = Node::Sort {
             input: Box::new(node),
@@ -468,6 +469,27 @@ fn finish_plan(
         column_names: scope_column_names(scope),
         engine: None,
     })
+}
+
+/// `0A000` for an `ORDER BY` over a `json` or `jsonb` column.
+///
+/// Sorting one would compare the stored text as bytes, and that is neither type's order: a `jsonb`
+/// sorts by **kind** first (`Object > Array > Boolean > Number > String > Null`) and compares
+/// numbers numerically, so `null` sorts below `1.00` where its bytes sort above it. `json` has no
+/// ordering operators at all on a real server. Refusing is contract C2; answering from the bytes
+/// would be a wrong answer, which is what ADR 0042 is about.
+fn refuse_json_sort(keys: &[SortKey]) -> Result<()> {
+    for key in keys {
+        if let Expr::Ordinal { ty, .. } = &key.expr
+            && matches!(ty, ColumnType::Json | ColumnType::Jsonb)
+        {
+            return Err(SqlError::unsupported(format!(
+                "ORDER BY over a {} column",
+                ty.name()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Every column of every table in scope, in row order, so `EXPLAIN` can print the name a user
