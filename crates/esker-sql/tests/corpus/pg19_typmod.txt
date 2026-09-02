@@ -1,0 +1,84 @@
+# The **typmod**: `varchar(n)`, `character(n)` and `timestamp(p)` — tier 1's last unit
+# ([ADR 0033](../../../../docs/adr/0033-tier-1-of-the-type-surface.md)). One mechanism, three
+# types, which is why they arrive together: a length or a precision is a property of the *column*,
+# where PostgreSQL keeps it (`pg_attribute.atttypmod`), and not of the type.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way against one node.
+# It builds its own table.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THE THREE DO DIFFERENT THINGS WITH THEIR NUMBER, and that is the whole of the unit:
+#
+#   * **`varchar(n)` refuses.** Too long is `22001 value too long for type character varying(5)`,
+#     on `INSERT` and on `UPDATE` alike, and trailing spaces are significant — `v = 'abc '` finds
+#     nothing where `v = 'abc'` finds the row.
+#   * **`character(n)` pads.** `'x'` in a `char(3)` is stored and printed as `x  `, and comparison
+#     ignores trailing blanks: `c = 'x'`, `c = 'x  '` and `c = 'x    '` all match the same row.
+#     Those two facts are the same fact — a value padded to `n` on the way in makes plain byte
+#     comparison *be* the blank-insensitive one, which is what lets an index key hold it without
+#     breaking "equal values encode identically".
+#   * **`timestamp(p)` rounds**, and the rounding carries: `.999999` at `timestamp(3)` becomes the
+#     next whole second, `08:30:16`.
+#
+# AND `character` WITH NO NUMBER IS `character(1)`, not "unlimited" — `\gdesc` says `character(1)`
+# and a second character is `22001`. That is the opposite of `character varying`, where a bare
+# spelling means no limit at all, and it is why `char(n)` could not land in the unit that landed
+# bare `varchar`: there is no useful no-typmod form of it to land first.
+#
+# ONE MORE, MEASURED: `min`/`max` over a `character(n)` come back as **`bpchar`**, where over a
+# `character varying` they come back as `text`. The string family does not decay uniformly.
+#
+# TWO THINGS THE ROUNDING DOES THAT NOBODY WOULD GUESS, both at the bottom of this file:
+#
+#   * **`timestamp(p)` rounds half away from zero, not half to even.** `.0005` at `timestamp(3)`
+#     is `.001` and `.0025` is `.003` — a tie goes *up* in both, where the microsecond rounding in
+#     the timestamp *parser* breaks a tie to the even neighbour. One type, two rounding rules, and
+#     they are in different functions for a reason: this one is `AdjustTimestampForTypmod`.
+#   * **And "away from zero" is away from PostgreSQL's epoch, not from the earlier instant.** A
+#     timestamp before 2000-01-01 is a negative microsecond count internally, and PostgreSQL
+#     negates it, rounds the magnitude, and negates back. So `1970-01-01 00:00:00.0005` at
+#     `timestamp(3)` rounds **down**, to `1970-01-01 00:00:00`, where the same fraction in 2020
+#     rounds up. Ties on the two sides of the year 2000 go opposite ways in wall-clock terms.
+#
+# AND A DECLARED LENGTH HAS BOTH ENDS, in the short vocabulary: `varchar(0)` is `22023 length for
+# type varchar must be at least 1` — zero is not a legal length, which is the one a reader would
+# guess wrong — and `10485761` is `cannot exceed 10485760`. Note `varchar` and `char` here where
+# the `22001` above says `character varying(5)` and `character(3)`: PostgreSQL uses two
+# vocabularies for one type and this file carries both rather than inferring either.
+#
+CREATE TABLE tm (id int8 PRIMARY KEY, v varchar(5), c char(3), t timestamp(3), u character varying, w character)		-
+INSERT INTO tm VALUES (1, 'abc', 'x', '2020-01-01 12:00:00.123456', 'anything at all', 'y')		-
+INSERT INTO tm VALUES (2, '', '', '2020-06-15 08:30:15.999999', '', ' ')		-
+SELECT id, v, c, t, u, w FROM tm ORDER BY id	bigint,character varying(5),character(3),timestamp(3) without time zone,character varying,character(1)	1|abc|x  |2020-01-01 12:00:00.123|anything at all|y ; 2||   |2020-06-15 08:30:16|| 
+INSERT INTO tm VALUES (3, 'toolong', 'x', '2020-01-01', 'x', 'y')	!22001 value too long for type character varying(5)
+INSERT INTO tm VALUES (3, 'ab', 'abcd', '2020-01-01', 'x', 'y')	!22001 value too long for type character(3)
+INSERT INTO tm VALUES (3, 'ab', 'ab', '2020-01-01', 'x', 'yy')	!22001 value too long for type character(1)
+INSERT INTO tm VALUES (3, 'exact', 'abc', '2020-01-01 00:00:00.4', 'x', 'y')		-
+SELECT id, v, c, t FROM tm WHERE id = 3	bigint,character varying(5),character(3),timestamp(3) without time zone	3|exact|abc|2020-01-01 00:00:00.4
+SELECT id, length(c), c || '|' FROM tm WHERE id = 1	bigint,integer,text	1|1|x|
+SELECT id FROM tm WHERE c = 'x'	bigint	1
+SELECT id FROM tm WHERE c = 'x  '	bigint	1
+SELECT id FROM tm WHERE c = 'x    '	bigint	1
+SELECT id FROM tm WHERE v = 'abc'	bigint	1
+SELECT id FROM tm WHERE v = 'abc '	bigint	-
+SELECT id, t FROM tm WHERE id = 2	bigint,timestamp(3) without time zone	2|2020-06-15 08:30:16
+UPDATE tm SET v = 'waytoolong' WHERE id = 1	!22001 value too long for type character varying(5)
+UPDATE tm SET c = 'toolong' WHERE id = 1	!22001 value too long for type character(3)
+SELECT id, c FROM tm ORDER BY c	bigint,character(3)	2|    ; 3|abc ; 1|x  
+SELECT count(*), min(c), max(c) FROM tm	bigint,bpchar,bpchar	3|   |x  
+SELECT count(*), min(v), max(v) FROM tm	bigint,text,text	3||exact
+DELETE FROM tm WHERE id = 3		-
+SELECT count(*) FROM tm	bigint	2
+CREATE TABLE tr (id int8 PRIMARY KEY, t timestamp(3), s timestamp(0), m timestamp(6))		-
+INSERT INTO tr VALUES (1, '2020-01-01 00:00:00.0005', '2020-01-01 00:00:00.5', '2020-01-01 00:00:00.123456')		-
+INSERT INTO tr VALUES (2, '2020-01-01 00:00:00.0025', '2020-01-01 00:00:01.5', '2020-06-15 08:30:15.999999')		-
+INSERT INTO tr VALUES (3, '1970-01-01 00:00:00.0005', '1970-01-01 00:00:00.5', '1970-01-01 00:00:00.0015')		-
+INSERT INTO tr VALUES (4, '2020-06-15 08:30:15.999999', '2020-01-01 00:00:00.4', '1999-12-31 23:59:59.9999995')		-
+SELECT id, t, s, m FROM tr ORDER BY id	bigint,timestamp(3) without time zone,timestamp(0) without time zone,timestamp(6) without time zone	1|2020-01-01 00:00:00.001|2020-01-01 00:00:01|2020-01-01 00:00:00.123456 ; 2|2020-01-01 00:00:00.003|2020-01-01 00:00:02|2020-06-15 08:30:15.999999 ; 3|1970-01-01 00:00:00|1970-01-01 00:00:00|1970-01-01 00:00:00.0015 ; 4|2020-06-15 08:30:16|2020-01-01 00:00:00|2000-01-01 00:00:00
+CREATE TABLE tz (id int8 PRIMARY KEY, v varchar(0))	!22023 length for type varchar must be at least 1
+CREATE TABLE tz (id int8 PRIMARY KEY, v varchar(10485761))	!22023 length for type varchar cannot exceed 10485760
+CREATE TABLE tz (id int8 PRIMARY KEY, c char(0))	!22023 length for type char must be at least 1
+CREATE TABLE tz (id int8 PRIMARY KEY, c character(10485761))	!22023 length for type char cannot exceed 10485760

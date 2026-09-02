@@ -133,6 +133,12 @@ Checked rather than assumed, and it is the reason this is one unit rather than a
 * **The catalog's `ColumnDef` record does change** — it grows a typmod — and that record has a
   format version and a golden. It is the one place a version bump is owed, and an absent typmod
   reads as `-1`, which is "no length given" and is what every column written before this ADR meant.
+  **Paid: `CATALOG_FORMAT_VERSION` is 4**, the typmod is four little-endian bytes at the end of
+  each column, and version 3 and version 2 records still decode — each with its own golden of the
+  bytes it wrote, kept rather than regenerated. The typmod is stored as PostgreSQL's own
+  `atttypmod` (`varchar(5)` is `9`, `timestamp(3)` is `3`), because `RowDescription`'s
+  type-modifier column and `pg_attribute.atttypmod` are both *defined* as that number; nothing
+  inside the crate does the arithmetic, it asks `ColumnDef::length` or `ColumnDef::precision`.
 
 `CLAUDE.md`'s "ask before doing" covers a format change with a golden. This one is authorised in
 the brief that commissioned the unit, which grants `crates/esker-keys/**` and

@@ -106,7 +106,7 @@ fn value_of(ty: ColumnType) -> impl Strategy<Value = Value> {
             any::<f64>().prop_map(Value::Double),
         ]
         .boxed(),
-        ColumnType::Text | ColumnType::Varchar => (0usize..5)
+        ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => (0usize..5)
             .prop_map(|pick| Value::Text(["", "a", "beta", "gamma", "\u{1f600}"][pick].to_owned()))
             .boxed(),
         ColumnType::Bytea => prop::collection::vec(any::<u8>(), 0..8)

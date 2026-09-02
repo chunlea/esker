@@ -49,6 +49,12 @@ pub const INVALID_DATETIME_FORMAT: &str = "22007";
 pub const DATETIME_FIELD_OVERFLOW: &str = "22008";
 /// A time zone displacement past `±15:59`, which is its own condition and not a field overflow.
 pub const INVALID_TIME_ZONE_DISPLACEMENT_VALUE: &str = "22009";
+/// A value longer than the length its column declared: `varchar(5)` given six characters.
+///
+/// PostgreSQL's own name for it is `string_data_right_truncation`, which describes what the
+/// standard says should happen and not what PostgreSQL does — it raises rather than truncates,
+/// and an explicit `::varchar(5)` cast is the one place it really does truncate.
+pub const STRING_DATA_RIGHT_TRUNCATION: &str = "22001";
 /// Bytes that are not valid in the server encoding.
 pub const CHARACTER_NOT_IN_REPERTOIRE: &str = "22021";
 /// What `bytea`'s hexadecimal input reports a bad digit or an odd count with. Surprising — the

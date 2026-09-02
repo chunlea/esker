@@ -145,12 +145,15 @@ fn decode_row(types: &[ColumnType], bytes: &[u8]) -> Vec<Value> {
                 at += 1;
                 value
             }
-            ColumnType::Text | ColumnType::Varchar | ColumnType::Bytea => {
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Bytea => {
                 let (len, used) = varint::get_u64(&bytes[at..]).unwrap();
                 at += used;
                 let raw = bytes[at..at + len as usize].to_vec();
                 at += len as usize;
-                if matches!(ty, ColumnType::Text | ColumnType::Varchar) {
+                if matches!(
+                    ty,
+                    ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar
+                ) {
                     Value::Text(String::from_utf8(raw).unwrap())
                 } else {
                     Value::Bytea(raw)

@@ -128,8 +128,8 @@ conditions.
 
 ### Recorded
 
-Seeds and run counts for every model go in this file's §6 as they are produced, so a failure is
-a number to rerun rather than a story.
+Seeds and run counts for every model go in §10 as they are produced, so a failure is a number to
+rerun rather than a story.
 
 ## 3. U2 — the two-level iterator
 
@@ -228,3 +228,97 @@ somebody else's.
 | U3 | `esker-engine` unit tests + a working-set test | unit |
 | U4 | `esker-engine/tests/tier_minio.rs` (measurement only) | measurement |
 | U5 | — | none; ADR only |
+
+## 10. The runs, with seeds
+
+Every model runs the same fixed seed list, so a failure is a rerun and not a story:
+
+```
+1 2 3 5 8 13 21 34 55 89 144 233 377 610 987 1597 2584 4181 6765 10946 17711 28657 46368 75025
+```
+
+### U1a — balance versus repair (`548dd62`)
+
+| | |
+|---|---|
+| Model | `esker-sim/src/mech/placement.rs`, seeded five-store cluster, 8 regions |
+| Binding | `esker-pd/tests/sim_balance.rs` → `esker_pd::balance::balance_for` |
+| Runs | 24 seeds × 400 rounds = 9,600 rounds, every region queried twice per round |
+| Reached | **24,953** policy queries against a region holding an unpromoted learner with **every store up** — the state the narrow rule could not see — out of 84,569 mid-repair queries in all |
+| Also reached | 1,084 learners added, 1,052 promoted, 1,177 store-down events, 1,278 balance moves applied |
+
+Green at `875d9c4` (this branch): 4 passed.
+
+**Red at `ba8ed2e` (`548dd62^`)**, in a detached worktree with only `crates/esker-sim/` and
+`crates/esker-pd/tests/sim_balance.rs` + `Cargo.toml` copied in — 3 of 4 fail:
+
+```
+test balance_never_touches_a_mid_repair_region ... FAILED
+seed 1, round 0: balance planned AddPeer { region_id: 1, store_id: 4 } against region 1,
+which is mid-repair (UnpromotedLearner { peer_id: 25, all_stores_live: true })
+
+test leader_balance_has_a_repair_guard_of_its_own ... FAILED
+the office moved out from under an unfinished repair
+  left: Some(TransferLeader { region_id: 1, to_peer_id: 20 })
+ right: None
+
+test a_columnar_learner_is_not_a_repair ... FAILED
+a plain learner must still stop balance
+  left: Some(AddPeer { region_id: 1, store_id: 4 })
+ right: None
+```
+
+The second is the one worth pointing at: `548dd62`'s trace is a `TransferLeader`, and the seeded
+run cannot isolate it because `balance_for` asks `region_balance` first and it answers first. So
+that shape is constructed — region counts dead level, leader counts far apart — and it fails at
+the parent because `leader_balance` had no repair guard at all.
+
+The fourth test, `the_checker_names_the_learner_when_it_fires`, passes at both revisions by
+design: it is a guard on the checker's own output, not on the placement driver.
+
+`esker-sim`'s own `tests/mech_placement.rs` proves the same three things about the *model* using a
+reference policy, including that the checker fires on all 24 seeds against a deliberately narrowed
+rule. That is not evidence about `esker-pd` and is not counted as any.
+
+### U1b — the retry budget under a moving epoch (`9791e16`)
+
+| | |
+|---|---|
+| Model | `esker-sim/src/mech/retry.rs`, 24 seeded scripts of 10 answers + a tail |
+| Binding | `esker-client/tests/sim_retry.rs` → the real `RawClient` over `FakeTransport` + `FakeClock` |
+| Runs | 24 scripts, plus three constructed shapes |
+| Reached | 19 of 24 scripts oblige an answer **past** the old attempt budget; 5 oblige giving up; 21 mix both kinds of refusal — the shape neither hand-written test contains |
+
+Green at `486fef9` (this branch): 4 passed. The endless-progress run ends at the deadline after
+14 calls and 9,940 ms of a 10,000 ms budget.
+
+**Red at `1502d0f` (`9791e16^`)** — all 4 fail, and the first reproduces the recorded production
+failure to the millisecond:
+
+```
+seed 1: the client gave up on attempts having spent 2266ms of a 10000ms deadline.
+The script was [fppppfpppf then a], which obliged Answer { on_call: 11 };
+it answered OutOfAttempts { calls: 9, elapsed_ms: 2266 }
+
+an_epoch_that_never_settles_ends_at_the_deadline
+  seed 0: [ then p forever] obliged RunOutOfTime; it answered OutOfAttempts { calls: 9 }
+
+the_two_kinds_of_refusal_are_told_apart_on_the_wire
+  left:  OutOfAttempts { calls: 9, elapsed_ms: 2266 }
+  right: Answered { calls: 11 }
+```
+
+`2.266s of a 10s deadline, with 9 calls made` is the number in `9791e16`'s own commit message,
+arrived at from a different direction: that one was a hand-built script of ten uniform refusals,
+this is a drawn mixture. `fppppfpppf` is the interesting part — a budget that resets on progress
+and one that never resets agree on every *uniform* script, so a model that only drew uniform ones
+would have proved nothing the fix's own tests had not.
+
+One thing the model got wrong first, and it was the model rather than the code: a constructed
+20-refusal script asserted an answer on call 21, and the real client ended it at call 14 with
+`OutOfTime` after 9,940 ms. That is correct — twenty backoffs on a 10 ms base doubling to a 2 s
+cap do not fit inside a 10 s deadline. The assertion became the right one (the deadline is what
+stops a long run of progress, which is the half that makes "progress does not spend the budget"
+safe), and it is why the drawn scripts are capped at ten: a longer one would let the deadline end
+a run the model meant to end on attempts, and the checker would have to accept two answers where
+it should accept one.

@@ -642,6 +642,27 @@ pub enum SqlError {
     #[error("SET TRANSACTION SNAPSHOT must be called before any query")]
     SnapshotAfterQuery,
 
+    /// A value longer than its column's declared length: `22001`.
+    ///
+    /// The type is spelled as `format_type` writes it — `character varying(5)`, `character(3)` —
+    /// and **not** the way the two messages below spell it. PostgreSQL really does use two
+    /// vocabularies for one type, `tests/corpus/pg19_typmod.txt` has both, and neither was
+    /// guessed.
+    #[error("value too long for type {0}")]
+    StringDataRightTruncation(String),
+
+    /// A declared length below PostgreSQL's floor of one: `22023`.
+    ///
+    /// Spelled `varchar` and `char`, which is the short form — the opposite of
+    /// [`SqlError::StringDataRightTruncation`] right above it. Measured on 19beta1:
+    /// `varchar(0)` is `length for type varchar must be at least 1`.
+    #[error("length for type {0} must be at least 1")]
+    TypeLengthTooSmall(&'static str),
+
+    /// A declared length above PostgreSQL's ceiling: `22023`.
+    #[error("length for type {0} cannot exceed {1}")]
+    TypeLengthTooLarge(&'static str, u32),
+
     /// A string that cannot be a snapshot identifier at all.
     ///
     /// Distinct from [`SqlError::SnapshotDoesNotExist`], and the distinction is PostgreSQL's:
@@ -849,7 +870,13 @@ impl SqlError {
             SqlError::NoActiveTransaction
             | SqlError::SetTransactionOutsideBlock
             | SqlError::OutsideTransactionBlock(_) => sqlstate::NO_ACTIVE_SQL_TRANSACTION,
-            SqlError::InvalidSnapshotIdentifier(_)
+            SqlError::StringDataRightTruncation(_) => sqlstate::STRING_DATA_RIGHT_TRUNCATION,
+            // A declared length is `22023` too, which is not a family resemblance with the
+            // parameter errors beside it — it is `anychar_typmodin` reaching for the same code.
+            // Captured, both ends: `varchar(0)` and `varchar(10485761)`.
+            SqlError::TypeLengthTooSmall(_)
+            | SqlError::TypeLengthTooLarge(..)
+            | SqlError::InvalidSnapshotIdentifier(_)
             | SqlError::InvalidParameterValue { .. }
             | SqlError::NonBooleanParameter(_)
             | SqlError::ParameterOutOfRange { .. } => sqlstate::INVALID_PARAMETER_VALUE,

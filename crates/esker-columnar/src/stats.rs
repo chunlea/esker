@@ -119,7 +119,7 @@ impl Bound {
                 <[u8; 4]>::try_from(self.bytes.as_slice()).ok()?,
             )),
             ColumnType::Bool => Value::Bool(self.as_bool()?),
-            ColumnType::Text | ColumnType::Varchar | ColumnType::Bytea => {
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Bytea => {
                 Value::Bytea(self.bytes.clone())
             }
         })
@@ -267,7 +267,7 @@ impl ColumnStats {
             ColumnType::Int4 | ColumnType::Real => Some(4),
             ColumnType::Int2 => Some(2),
             ColumnType::Bool => Some(1),
-            ColumnType::Text | ColumnType::Varchar | ColumnType::Bytea => None,
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Bytea => None,
         };
         [self.min.as_ref(), self.max.as_ref()]
             .into_iter()
@@ -777,9 +777,11 @@ mod tests {
                 any::<f64>().prop_map(Value::Double),
             ]
             .boxed(),
-            ColumnType::Text | ColumnType::Varchar => prop::collection::vec(any::<char>(), 0..90)
-                .prop_map(|chars| Value::Text(chars.into_iter().collect()))
-                .boxed(),
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => {
+                prop::collection::vec(any::<char>(), 0..90)
+                    .prop_map(|chars| Value::Text(chars.into_iter().collect()))
+                    .boxed()
+            }
             ColumnType::Bytea => prop::collection::vec(any::<u8>(), 0..90)
                 .prop_map(Value::Bytea)
                 .boxed(),

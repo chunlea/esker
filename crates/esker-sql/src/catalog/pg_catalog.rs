@@ -172,6 +172,8 @@ impl CatalogView {
                             .map(|(name, ty)| ColumnDef {
                                 name: (*name).to_owned(),
                                 ty: *ty,
+                                // A computed relation declares no lengths.
+                                typmod: crate::value::NO_TYPMOD,
                                 not_null: false,
                                 default: None,
                                 missing: None,
@@ -231,6 +233,7 @@ fn typname(ty: ColumnType) -> &'static str {
         ColumnType::Int2 => "int2",
         ColumnType::Text => "text",
         ColumnType::Varchar => "varchar",
+        ColumnType::Bpchar => "bpchar",
         ColumnType::Bool => "bool",
         ColumnType::Bytea => "bytea",
         ColumnType::TimestampTz => "timestamptz",
@@ -253,6 +256,7 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::Int2 => "int2in",
         ColumnType::Text => "textin",
         ColumnType::Varchar => "varcharin",
+        ColumnType::Bpchar => "bpcharin",
         ColumnType::Bool => "boolin",
         ColumnType::Bytea => "byteain",
         ColumnType::TimestampTz => "timestamptz_in",

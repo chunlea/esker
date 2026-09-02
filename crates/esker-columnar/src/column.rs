@@ -97,9 +97,7 @@ pub enum ColumnData {
     /// A `Double` column.
     Doubles(Vec<f64>),
     /// A `Real` column: four bytes each, never widened into [`ColumnData::Doubles`].
-    /// `crate::encode::float` says why the widening an `Int4` gets is wrong one width down.
-    /// Plain words rather than a link: that module is `pub(crate)`, and `just doc` denies a public
-    /// item linking a private one.
+    /// `encode::float` says why the widening an `Int4` gets is wrong one width down.
     Floats(Vec<f32>),
     /// A `Bool` column.
     Bools(Vec<bool>),
@@ -129,13 +127,15 @@ impl ColumnData {
             // A `Real` gets its **own** run rather than riding in the doubles one widened, which
             // is the one place the integer trick above does not carry over: widening an `f32` is
             // exact for every value except a `NaN` payload, where it is unspecified, and it would
-            // write eight bytes for a four-byte type. [`crate::encode::float`] has the argument.
+            // write eight bytes for a four-byte type. `encode::float` has the argument.
             ColumnType::Real => ColumnData::Floats(Vec::new()),
             ColumnType::Bool => ColumnData::Bools(Vec::new()),
-            ColumnType::Text | ColumnType::Varchar | ColumnType::Bytea => ColumnData::Bytes {
-                offsets: vec![0],
-                data: Vec::new(),
-            },
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Bytea => {
+                ColumnData::Bytes {
+                    offsets: vec![0],
+                    data: Vec::new(),
+                }
+            }
         }
     }
 
@@ -174,7 +174,7 @@ impl ColumnData {
                 | (ColumnData::Bools(_), ColumnType::Bool)
                 | (
                     ColumnData::Bytes { .. },
-                    ColumnType::Text | ColumnType::Varchar | ColumnType::Bytea
+                    ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Bytea
                 )
         )
     }
@@ -461,10 +461,12 @@ impl ColumnBuilder {
             ColumnType::Double => ColumnData::Doubles(std::mem::take(&mut self.doubles)),
             ColumnType::Real => ColumnData::Floats(std::mem::take(&mut self.floats)),
             ColumnType::Bool => ColumnData::Bools(std::mem::take(&mut self.bools)),
-            ColumnType::Text | ColumnType::Varchar | ColumnType::Bytea => ColumnData::Bytes {
-                offsets: std::mem::replace(&mut self.offsets, vec![0]),
-                data: std::mem::take(&mut self.data),
-            },
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Bytea => {
+                ColumnData::Bytes {
+                    offsets: std::mem::replace(&mut self.offsets, vec![0]),
+                    data: std::mem::take(&mut self.data),
+                }
+            }
         };
         self.nulls.clear();
         Column::new(self.ty, nulls, data)

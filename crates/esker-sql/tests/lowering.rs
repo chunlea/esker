@@ -73,16 +73,15 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
             "PARTITION BY",
         ),
         ("CREATE TABLE t (a int8) INHERITS (u)", "INHERITS"),
-        // Every tier-1 type without a typmod runs since ADR 0033. What is left is the three
-        // that need one — `varchar(n)`, `character(n)`, `timestamp(p)` — plus `numeric`, which is
-        // tier 2. Each line goes with the unit that lands its type. What is left of tier 1
-        // is refused by name, in the order that ADR gives them, and each of these lines is
-        // deleted by the unit that lands its type. A **length or precision** is refused too: it
-        // is a typmod, which this node has nowhere to keep, and ignoring one would store a value
-        // a real server rejects with `22001`.
-        ("CREATE TABLE t (a varchar(10))", "the type VARCHAR"),
-        ("CREATE TABLE t (a timestamp(3))", "the type TIMESTAMP"),
+        // Tier 1 is complete: every type it names runs, typmods included. What is left here is
+        // tier 2, refused by name, and each line is deleted by the unit that lands its type.
         ("CREATE TABLE t (a numeric)", "the type NUMERIC"),
+        // A length unit is the standard's spelling and PostgreSQL takes neither — named rather
+        // than dropped, since a dropped unit changes what a multi-byte value the column holds.
+        (
+            "CREATE TABLE t (a varchar(5 OCTETS))",
+            "a length unit on varchar",
+        ),
         ("CREATE TABLE t (a int8[])", "the type"),
         ("CREATE TABLE s.t (a int8)", "the qualified name"),
         ("DROP TABLE t CASCADE", "DROP ... CASCADE"),

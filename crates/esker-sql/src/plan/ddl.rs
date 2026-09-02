@@ -37,8 +37,11 @@ pub struct CreateTable {
 pub struct Column {
     /// Folded.
     pub name: String,
-    /// One of the six.
+    /// The type it was declared as.
     pub ty: ColumnType,
+    /// PostgreSQL's `atttypmod` for the declaration, or `crate::value::NO_TYPMOD`. See
+    /// `crate::catalog::ColumnDef::typmod`, which is where it comes to rest.
+    pub typmod: i32,
     /// Whether `NOT NULL` was declared. A primary key column becomes `NOT NULL` whether or not it
     /// said so, which the executor applies.
     pub not_null: bool,
@@ -52,9 +55,12 @@ pub struct Column {
     /// The sequence that fills this column — `bigserial` or `GENERATED ... AS IDENTITY` — and
     /// which of the three it is.
     ///
-    /// `serial` is **not** among them: it is `int4` under another name, this crate has no `int4`,
-    /// and answering it with an `int8` would accept every value between 2^31 and 2^63 that a real
-    /// server refuses with `22003` (ADR 0031, `docs/plans/phase-9-rails.md` §2 unit 2).
+    /// All three serial spellings are among them, since [ADR
+    /// 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md) gave this node the integers
+    /// they stand for: `smallserial` is an `int2`, `serial` an `int4` and `bigserial` an `int8`,
+    /// each plus a sequence. Before `int4` existed, `serial` was `0A000` rather than an `int8` in
+    /// disguise, which would have accepted every value between 2^31 and 2^63 that a real server
+    /// refuses with `22003`.
     pub sequence: Option<Identity>,
 }
 

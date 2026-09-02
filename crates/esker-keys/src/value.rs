@@ -112,6 +112,16 @@ pub enum ColumnType {
     /// a `text` column's and this is not a format change even in principle
     /// ([ADR 0033](../../docs/adr/0033-tier-1-of-the-type-surface.md)).
     Varchar,
+    /// PostgreSQL's `character(n)`, whose internal name is `bpchar` — "blank-padded char".
+    ///
+    /// The same representation as [`ColumnType::Text`] again, and a third type telling itself
+    /// apart by OID. What makes it different is not the bytes but **what is in them**: a value is
+    /// padded to the column's length on the way in, so two equal values are equal byte strings and
+    /// a plain byte comparison *is* PostgreSQL's blank-insensitive one. That is what lets an index
+    /// key hold a `character(n)` without breaking "equal values encode identically", and it is why
+    /// this type could not arrive before the typmod did — there is nowhere to pad to without an
+    /// `n` ([ADR 0033](../../docs/adr/0033-tier-1-of-the-type-surface.md)).
+    Bpchar,
     /// Two-valued, with no third state but NULL.
     Bool,
     /// Variable-length byte string.
@@ -133,12 +143,13 @@ pub enum ColumnType {
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 11] = [
+    pub const ALL: [ColumnType; 12] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
         ColumnType::Text,
         ColumnType::Varchar,
+        ColumnType::Bpchar,
         ColumnType::Bool,
         ColumnType::Bytea,
         ColumnType::TimestampTz,
@@ -234,11 +245,17 @@ impl Datum {
     #[must_use]
     pub fn fits(&self, ty: ColumnType) -> bool {
         match (self.column_type(), ty) {
-            // NULL fits every column; and `text` fits `varchar` as well as `text`, because they are
-            // **one representation and two types**. [`Datum`] has no `Varchar` variant, since there
-            // would be nothing in one that a `Text` does not already hold — what differs is the
-            // column's declared type, which comes from the schema and not from the value.
-            (None, _) | (Some(ColumnType::Text), ColumnType::Text | ColumnType::Varchar) => true,
+            // NULL fits every column; and `text` fits `varchar` and `bpchar` as well as `text`,
+            // because they are **one representation and three types**. [`Datum`] has no `Varchar`
+            // or `Bpchar` variant, since there would be nothing in one that a `Text` does not
+            // already hold — what differs is the column's declared type, which comes from the
+            // schema and not from the value. A `bpchar`'s padding is part of its *value*: it is
+            // applied before the datum is built, not carried beside it.
+            (None, _)
+            | (
+                Some(ColumnType::Text),
+                ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar,
+            ) => true,
             (Some(actual), wanted) => actual == wanted,
         }
     }

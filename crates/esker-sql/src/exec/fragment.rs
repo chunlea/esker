@@ -554,6 +554,7 @@ fn column_type(ty: crate::value::ColumnType) -> esker_columnar::ColumnType {
         Row::Real => Col::Real,
         Row::Text => Col::Text,
         Row::Varchar => Col::Varchar,
+        Row::Bpchar => Col::Bpchar,
         Row::Bool => Col::Bool,
         Row::Bytea => Col::Bytea,
         Row::TimestampTz => Col::TimestampTz,

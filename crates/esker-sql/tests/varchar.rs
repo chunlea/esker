@@ -12,7 +12,6 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use esker_sql::sqlstate;
 use esker_sql::value::{ColumnType, PgType};
 
 #[path = "parity_harness/mod.rs"]
@@ -88,29 +87,69 @@ fn trailing_spaces_are_significant() {
     );
 }
 
-/// A length is refused by name rather than ignored.
+/// A length is **kept and enforced**, where it used to be `0A000` naming itself.
 ///
-/// Ignoring it is the tempting shortcut and it is a **wrong answer**: a `varchar(5)` that stored a
-/// six-character value would answer a later `SELECT` with a row a real server never had, where
-/// that server raises `22001`. Refusing is the state between units, and the unit that adds the
-/// typmod deletes this test.
+/// This test replaces the one that asserted the refusal, whose own doc said the typmod unit would
+/// delete it. Ignoring a length was never on the table: a `varchar(5)` that stored a
+/// six-character value would answer a later `SELECT` with a row a real server never had.
 #[test]
-fn a_length_is_refused_by_name() {
+fn a_length_is_kept_and_enforced() {
     let mut node = parity::Node::new(&[]);
-    for statement in [
-        "CREATE TABLE t (a varchar(5))",
-        "CREATE TABLE t (a character varying(255))",
+    node.run("CREATE TABLE t (id int8 PRIMARY KEY, a varchar(5))")
+        .unwrap();
+    node.run("CREATE TABLE u (id int8 PRIMARY KEY, a character varying(255))")
+        .unwrap();
+
+    // Exactly `n` fits; `n + 1` does not, and the message spells the type the way `format_type`
+    // does rather than the way the declaration errors do.
+    node.run("INSERT INTO t VALUES (1, 'exact')").unwrap();
+    let error = node.run("INSERT INTO t VALUES (2, 'toolong')").unwrap_err();
+    assert_eq!(error.sqlstate(), "22001");
+    assert_eq!(
+        error.to_string(),
+        "value too long for type character varying(5)"
+    );
+
+    // `UPDATE` too, which is a separate path through the executor and was worth its own line in
+    // the capture.
+    let error = node
+        .run("UPDATE t SET a = 'waytoolong' WHERE id = 1")
+        .unwrap_err();
+    assert_eq!(error.sqlstate(), "22001");
+
+    // Trailing spaces are significant in a `varchar`, unlike a `character(n)`: they count towards
+    // the length and they count in a comparison.
+    let error = node.run("INSERT INTO t VALUES (3, 'abc   ')").unwrap_err();
+    assert_eq!(error.sqlstate(), "22001");
+}
+
+/// A declared length has two ends, and both are `22023` in the **short** vocabulary.
+///
+/// `varchar` and `char` here, where the `22001` above says `character varying(5)`. One type, two
+/// vocabularies, both captured — neither is inferred from the other.
+#[test]
+fn a_length_outside_postgresqls_range_is_refused_at_both_ends() {
+    let mut node = parity::Node::new(&[]);
+    for (statement, message) in [
+        (
+            "CREATE TABLE z (a varchar(0))",
+            "length for type varchar must be at least 1",
+        ),
+        (
+            "CREATE TABLE z (a varchar(10485761))",
+            "length for type varchar cannot exceed 10485760",
+        ),
+        (
+            "CREATE TABLE z (a char(0))",
+            "length for type char must be at least 1",
+        ),
+        (
+            "CREATE TABLE z (a character(10485761))",
+            "length for type char cannot exceed 10485760",
+        ),
     ] {
         let error = node.run(statement).unwrap_err();
-        assert_eq!(
-            error.sqlstate(),
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "{statement}"
-        );
-        assert!(
-            error.to_string().to_ascii_lowercase().contains("varchar")
-                || error.to_string().to_ascii_lowercase().contains("varying"),
-            "{statement} -> `{error}`, which does not name the type"
-        );
+        assert_eq!(error.sqlstate(), "22023", "{statement}");
+        assert_eq!(error.to_string(), message, "{statement}");
     }
 }

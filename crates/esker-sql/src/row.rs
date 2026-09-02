@@ -48,7 +48,9 @@ mod tests {
                 .prop_map(Datum::Real),
             ]
             .boxed(),
-            ColumnType::Text | ColumnType::Varchar => ".{0,32}".prop_map(Datum::Text).boxed(),
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => {
+                ".{0,32}".prop_map(Datum::Text).boxed()
+            }
             ColumnType::Bool => any::<bool>().prop_map(Datum::Bool).boxed(),
             ColumnType::Bytea => proptest::collection::vec(any::<u8>(), 0..32)
                 .prop_map(Datum::Bytea)

@@ -49,20 +49,24 @@ use esker_keys::{codec, prefix};
 
 use crate::catalog::{ColumnDef, Identity, IndexDef, Relation, SchemaState, SequenceDef, TableDef};
 use crate::error::{Result, SqlError};
-use crate::value::{ColumnType, Datum};
+use crate::value::{ColumnType, Datum, NO_TYPMOD};
 
 /// The version byte on every catalog record.
 ///
 /// Version 2 added a table's schema version (ADR 0019). Version 3 added a column's default and its
 /// missing value, and the schema state on every column and index (ADR 0020,
-/// `docs/plans/phase-6e.md` §4).
+/// `docs/plans/phase-6e.md` §4). Version 4 added a column's **typmod** — the length of a
+/// `varchar(n)` or `character(n)` and the precision of a `timestamp(p)` — which
+/// [ADR 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md) named as the one version bump
+/// tier 1 owes. A version 3 column reads back `-1`, which is what a column declared without a
+/// number means, and is what every column a version 3 catalog could hold was.
 ///
 /// Version 1 is not read: nothing had ever persisted a catalog when version 2 landed, so a
 /// compatibility path for it was one nothing could check. **Version 2 is different** — this crate
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 3;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 4;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -108,6 +112,9 @@ const TAG_TIMESTAMP: u8 = 9;
 const TAG_INT2: u8 = 10;
 /// Appended by ADR 0033 with `real`; a record written before it has no tag above 10.
 const TAG_REAL: u8 = 11;
+/// `character(n)`, whose internal name is `bpchar`. Version 4's type, and the reason version 4
+/// exists: it is the one type that cannot be declared without a typmod.
+const TAG_BPCHAR: u8 = 12;
 
 /// Tags for [`SchemaState`] as stored. Ours, and they must never move: an index read as the wrong
 /// state is an index a node writes when it should not, which is the whole failure ADR 0020 is about.
@@ -154,6 +161,7 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Timestamp => TAG_TIMESTAMP,
         ColumnType::Int2 => TAG_INT2,
         ColumnType::Real => TAG_REAL,
+        ColumnType::Bpchar => TAG_BPCHAR,
     }
 }
 
@@ -170,6 +178,7 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_TIMESTAMP => ColumnType::Timestamp,
         TAG_INT2 => ColumnType::Int2,
         TAG_REAL => ColumnType::Real,
+        TAG_BPCHAR => ColumnType::Bpchar,
         other => return Err(corrupt(format!("column type tag {other}"))),
     })
 }
@@ -586,6 +595,10 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         // reader that knows the type knows the length, and neither needs a tag of its own.
         put_value(column.default.as_ref(), column.ty, &mut out)?;
         put_value(column.missing.as_ref(), column.ty, &mut out)?;
+        // Version 4. Appended rather than placed beside the type tag it belongs to, so that a
+        // version 3 column's bytes are a prefix of a version 4 one's and the diff between the two
+        // goldens is one field at one end.
+        out.extend_from_slice(&column.typmod.to_le_bytes());
     }
 
     varint::put_u64(table.primary_key.len() as u64, &mut out);
@@ -629,9 +642,18 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
         } else {
             (None, None)
         };
+        // A version 3 column has no typmod, which is what a column declared without a number
+        // means — and every column a version 3 catalog could hold was declared without one,
+        // because no type this crate had before version 4 took a number.
+        let typmod = if reader.version >= 4 {
+            reader.i32_le()?
+        } else {
+            NO_TYPMOD
+        };
         columns.push(ColumnDef {
             name,
             ty,
+            typmod,
             not_null,
             default,
             missing,
@@ -819,6 +841,17 @@ impl<'a> Reader<'a> {
             .ok_or_else(|| corrupt("a catalog record ends inside an id"))?;
         self.bytes = rest;
         Ok(u64::from_le_bytes(*head))
+    }
+
+    /// A typmod. Signed and fixed-width because `-1` is a real value here, not a sentinel a
+    /// varint would be asked to spend ten bytes on.
+    fn i32_le(&mut self) -> Result<i32> {
+        let (head, rest) = self
+            .bytes
+            .split_first_chunk::<4>()
+            .ok_or_else(|| corrupt("a catalog record ends inside a typmod"))?;
+        self.bytes = rest;
+        Ok(i32::from_le_bytes(*head))
     }
 
     fn varint(&mut self) -> Result<u64> {
