@@ -52,6 +52,11 @@ esker-engine.workspace = true
 # fake could show. Workspace-internal and dev-only: it adds nothing to the runtime graph or to
 # `deny.toml`'s budget, and `esker-pd` does not depend on this crate, so there is no cycle.
 esker-pd.workspace = true
+# `tests/sim_sweep.rs` and `tests/sim_snapshot_ask.rs`: the deterministic models of the sweep and
+# the snapshot ask own their case tables and checkers; this crate supplies the real store they are
+# put in front of. Dev-only, so outside the runtime crate budget, and `esker-sim` depends on
+# nothing above `esker-raft`, so there is no cycle.
+esker-sim.workspace = true
 # `tests/balance.rs` runs a two-store cluster whose interesting failures are all "something was
 # dropped somewhere"; without a subscriber the store's own tracing goes nowhere. Dev-only.
 tracing-subscriber.workspace = true

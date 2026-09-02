@@ -487,6 +487,7 @@ dependencies = [
  "esker-pd",
  "esker-proto",
  "esker-raft",
+ "esker-sim",
  "esker-store",
  "esker-txn",
  "tempfile",

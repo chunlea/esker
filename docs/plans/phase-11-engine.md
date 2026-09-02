@@ -322,3 +322,57 @@ stops a long run of progress, which is the half that makes "progress does not sp
 safe), and it is why the drawn scripts are capped at ten: a longer one would let the deadline end
 a run the model meant to end on attempts, and the checker would have to accept two answers where
 it should accept one.
+
+### U1c — the sweep of a removed peer (`92a5add`)
+
+| | |
+|---|---|
+| Model | `esker-sim/src/mech/sweep.rs`, an **exhaustive** table of every answer PD can give |
+| Binding | `esker-store/tests/sim_sweep.rs` → a real two-store cluster per case |
+| Runs | 7 cases; 5 driven through the cluster, 2 skipped with reasons (below) |
+| Reached | 1 case is evidence of a removal and reclaims; 4 must leave the range alone |
+
+No seed, because there is nothing to draw: the state space *is* the answer table, and enumerating
+it is cheaper and stronger than sampling it. `tests/retire.rs` drives the one ordering where the
+sweep is supposed to fire; this drives the ones where it must not, and those are the expensive
+direction — a store that keeps a region it was removed from wastes disk, a store that drops one it
+still holds loses acknowledged writes.
+
+The removed peer's state is built without a removal: store 1 is **stopped**, which leaves store 2's
+peer leaderless against a group of two it cannot reach. That is what a peer the cluster has
+replaced is permanently, and what the probe counts rounds of — and it is what lets a case decide
+what PD says next, including answers a real removal would never produce.
+
+Green at `8f62ab2` (this branch): 2 passed, 19 s.
+
+**Red at `c31a8a8` (`92a5add^`)**:
+
+```
+case "a newer membership that does not name this store":
+required Reclaim,
+observed Observed { still_hosted: true, keys_left: 6, keys_before: 6 } (NotReclaimed)
+```
+
+Both halves of `92a5add` in one line. `still_hosted: true` is "nobody tells a removed peer" — there
+is no sweep at that revision, so on the operator path `retire_region` never runs. `keys_left: 6` of
+`keys_before: 6` is the leak it was hiding. The file compiles there because it counts its own keys
+rather than calling `snapshot::key_counts`, which `92a5add` added.
+
+#### Two cases are not driven through the cluster, and both say why
+
+* **"a region this store hosts covers the range."** Two overlapping regions cannot both be in one
+  `RegionMap`, so the state only arises from a *stale* record — a parent narrowed by a split,
+  retiring against the range it used to have — and a leaderless store cannot split. The gate is
+  asserted directly instead, against `RegionMap::overlapping`, which is the call the reclamation
+  makes.
+* **"PD has never heard of the range."** Not constructible through `FakePd`'s public surface:
+  `get_region` walks back to the last record containing the probe key, the region under test
+  starts at the empty key, and the bootstrap wrote a record there. Overwriting it with any range
+  still leaves a range containing the empty key.
+
+The second one is worth recording because of how it was found. The first version of this file
+"covered" it by placing a record elsewhere and watching nothing happen — which it did, because PD
+went on answering with the bootstrap record that names this store. **It passed, for the wrong
+reason.** `place_and_verify` now asserts what PD will actually answer *before* the case is watched,
+so a mis-set-up case fails loudly instead. That assertion is what turned a green test into a
+documented skip.

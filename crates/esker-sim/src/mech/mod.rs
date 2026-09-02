@@ -43,7 +43,9 @@
 pub mod placement;
 pub mod reference;
 pub mod retry;
+pub mod sweep;
 
 pub use placement::{BalancePolicy, ClusterView, MidRepair, Move, PeerView, RegionView, StoreView};
 pub use reference::ReferenceBalance;
 pub use retry::{Answer, Budget, RetryClient, Script};
+pub use sweep::{Case, Expected, Observed, PdAnswer, RegionSpan};
