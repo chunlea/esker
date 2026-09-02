@@ -1664,11 +1664,15 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
             Datum::Text(PUBLIC_SCHEMA.to_owned()),
         ))));
     }
+    // **The array, written out.** `= ANY (current_schemas(false))` is still expanded into an `IN`
+    // list where it is lowered — that is what lets a catalog query keep the plan it has — and this
+    // is the same value in its other spelling, for the places a list cannot go:
+    // `SELECT current_schemas(false)` and `array_length(current_schemas(false), 1)`.
     if let Some(schemas) = schema_function(function)? {
-        return Err(SqlError::unsupported(format!(
-            "current_schemas outside an ANY, which would need an array value where this node has              only array expressions ({} schemas)",
-            schemas.len()
-        )));
+        let elements: Vec<Option<String>> = schemas.into_iter().map(Some).collect();
+        return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+            Datum::Text(value::vector::Array::write(&elements)),
+        ))));
     }
     // `lower` and `upper`, the two scalar functions this node has. Both take exactly one
     // argument and a wrong count is `42883` naming the signature, not a badly-called function —
@@ -2088,12 +2092,21 @@ fn schema_function(function: &sqlparser::ast::Function) -> Result<Option<Vec<Str
         return Err(SqlError::UndefinedFunction("current_schemas()".to_owned()));
     };
     let include_implicit = match args.as_slice() {
-        [FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(value)))] => match &value.value {
-            Value::Boolean(flag) => *flag,
-            other => {
-                return Err(SqlError::unsupported(format!("current_schemas({other})")));
-            }
-        },
+        [FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(value)))]
+            if matches!(value.value, Value::Boolean(_)) =>
+        {
+            matches!(value.value, Value::Boolean(true))
+        }
+        // A wrong **type** is `42883` naming the signature, not `0A000` naming the call:
+        // PostgreSQL resolves a function by name *and* argument types, so `current_schemas(1)` is
+        // a function that does not exist rather than one this node has not built. Measured — and
+        // its DETAIL differs from the wrong-*arity* one `refuse_wrong_arity` raises above.
+        [arg] => {
+            return Err(SqlError::UndefinedFunctionTypes(format!(
+                "current_schemas({})",
+                argument_type_name(arg)
+            )));
+        }
         _ => return Err(SqlError::unsupported("current_schemas with that argument")),
     };
     Ok(Some(if include_implicit {

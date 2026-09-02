@@ -119,10 +119,14 @@ const FIXTURE: &[&str] =
 /// the array it needed is a *value of the row*, which is the thing plan-time `IN` expansion could
 /// never give it (`crate::value::vector`).
 ///
+/// **Twenty-eight with boot statement 22**, `SELECT current_schemas(false)` — the same array in
+/// its other spelling, written out where a list cannot go. The `ANY` form was never the problem
+/// and still expands where it is lowered.
+///
 /// The two that still do not run are the rest of the array surface: line 52 (`indexes()`) wants
 /// `ARRAY(SELECT …)` and `generate_subscripts`, and lines 55 and 56 want `array_agg` and
 /// `c.conkey[idx]`. **The rows behind both are here and agree** (`tests/pg_catalog_*.rs`).
-const RUNS: usize = 27;
+const RUNS: usize = 28;
 
 #[test]
 fn every_statement_activerecord_sends_parses_and_is_answered_by_name() {

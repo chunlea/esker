@@ -1,0 +1,39 @@
+# `current_schemas(bool)` **as a value**, not as an `ANY` operand — boot statement 22.
+#
+# The function has been here since the rung-4 unit, but only in the one place the lowering could
+# expand it: `n.nspname = ANY (current_schemas(false))` became an `IN` list where it was lowered.
+# Written on its own — `SELECT current_schemas(false)` — it was `0A000` naming itself, because the
+# answer is an array and this node had no array value to answer with. The `indkey` unit gave it
+# one (`crate::value::vector`), and this is the same array in its other spelling.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **This array is 1-based where `pg_index.indkey` is 0-based.** `array_lower` is `1` here and
+#     `0` there, and `array_position(current_schemas(true), 'public')` is **2**. Two array-ish
+#     types, two lower bounds, and the contrast is the reason `crate::value::vector` carries the
+#     bound rather than assuming one.
+#   * **`true` includes `pg_catalog`, and it comes first**: `{pg_catalog,public}`, in search order,
+#     which is what makes `array_position(…, 'public')` 2 rather than 1.
+#   * **`current_schema` is not `current_schemas`.** The singular is a bare name with no
+#     parentheses and answers `public` as a scalar; the plural takes exactly one boolean and
+#     answers an array. Calling either with the other's arity is `42883`, and PostgreSQL uses two
+#     different DETAILs for the two ways to get it wrong: **no arguments** is `No function of that
+#     name accepts the given number of arguments.` and a **wrong type** is `No function of that
+#     name accepts the given argument types.` with a HINT about casts.
+SELECT current_schemas(false)	name[]	{public}
+SELECT current_schemas(true)	name[]	{pg_catalog,public}
+SELECT current_schemas(false)::text	text	{public}
+SELECT array_length(current_schemas(false), 1), array_length(current_schemas(true), 1)	integer,integer	1|2
+SELECT cardinality(current_schemas(false)), cardinality(current_schemas(true))	integer,integer	1|2
+SELECT array_lower(current_schemas(true), 1), array_upper(current_schemas(true), 1)	integer,integer	1|2
+SELECT array_position(current_schemas(true), 'public'), array_position(current_schemas(true), 'pg_catalog')	integer,integer	2|1
+SELECT array_position(current_schemas(false), 'nope')	integer	\N
+SELECT 'public' = ANY(current_schemas(false)), 'nope' = ANY(current_schemas(false))	boolean,boolean	t|f
+SELECT current_schema	name	public
+SELECT current_schemas()	!42883 function current_schemas() does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT current_schemas(1)	!42883 function current_schemas(integer) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT n.nspname FROM pg_namespace n WHERE n.nspname = ANY (current_schemas(false))	name	public

@@ -85,6 +85,46 @@ impl Array {
         Some(Array { elements, lower: 1 })
     }
 
+    /// The `{a,b}` text a real server prints, quoting **only what needs it**.
+    ///
+    /// `array_out`'s rule, measured: `{a,b}` but `{"a b","c,d"}`, `{NULL,"NULL"}` and `{""}`. An
+    /// element is quoted when leaving it bare would read back as something else — when it is
+    /// empty, when it holds a delimiter, a brace, a quote, a backslash or whitespace, or when it
+    /// spells `NULL`, which unquoted is the SQL NULL.
+    #[must_use]
+    pub fn write(elements: &[Option<String>]) -> String {
+        let mut out = String::from("{");
+        for (at, element) in elements.iter().enumerate() {
+            if at > 0 {
+                out.push(',');
+            }
+            match element {
+                None => out.push_str("NULL"),
+                Some(text) => {
+                    let bare = !text.is_empty()
+                        && !text.eq_ignore_ascii_case("null")
+                        && !text.chars().any(|c| {
+                            c.is_whitespace() || matches!(c, ',' | '{' | '}' | '"' | '\\')
+                        });
+                    if bare {
+                        out.push_str(text);
+                    } else {
+                        out.push('"');
+                        for character in text.chars() {
+                            if matches!(character, '"' | '\\') {
+                                out.push('\\');
+                            }
+                            out.push(character);
+                        }
+                        out.push('"');
+                    }
+                }
+            }
+        }
+        out.push('}');
+        out
+    }
+
     /// The subscript `value` sits at, or `None` when it is not there — `array_position`.
     #[must_use]
     pub fn position_of(&self, value: &str) -> Option<i32> {
@@ -179,6 +219,28 @@ mod tests {
     fn a_quoted_null_is_the_word() {
         let array = Array::read("{NULL,\"NULL\"}").unwrap();
         assert_eq!(array.elements, [None, Some("NULL".to_owned())]);
+    }
+
+    /// What is written is what is read back, and only what needs quoting gets it.
+    #[test]
+    fn the_text_round_trips_and_quotes_only_what_needs_it() {
+        for (elements, text) in [
+            (vec![Some("a".to_owned()), Some("b".to_owned())], "{a,b}"),
+            (
+                vec![Some("a b".to_owned()), Some("c,d".to_owned())],
+                "{\"a b\",\"c,d\"}",
+            ),
+            (vec![None, Some("NULL".to_owned())], "{NULL,\"NULL\"}"),
+            (vec![Some(String::new())], "{\"\"}"),
+            (Vec::new(), "{}"),
+        ] {
+            assert_eq!(Array::write(&elements), text, "writing {elements:?}");
+            assert_eq!(
+                Array::read(text).unwrap().elements,
+                elements,
+                "reading {text}"
+            );
+        }
     }
 
     /// A comma inside quotes is part of the element, and a nested array is refused rather than

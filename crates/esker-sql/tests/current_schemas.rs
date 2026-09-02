@@ -22,19 +22,28 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT n.nspname FROM pg_namespace n WHERE n.nspname = ANY(current_schemas(false))",
     ],
     answers: &[
+        // **The reason changed under these two and the entry has to say so.** Selecting the
+        // function used to be `0A000` — this node had array *expressions* only, nothing a
+        // `RowDescription` could type — and boot statement 22's unit gave it the value. The
+        // **first** read of each now agrees byte for byte, `{pg_catalog,public}` included, and
+        // differs only in the declared type: `name[]` against `text`, the same trade as every
+        // entry in `types` above.
+        //
+        // What keeps them here is the **second** read of each, after
+        // `SET search_path TO public, pg_catalog` — a statement this node refuses by name three
+        // entries below, so the path never changes and the answer stays `{public}` where a real
+        // server then says `{public,pg_catalog}`. A divergence list keyed by statement *text*
+        // cannot say "the second one", which is the same limitation `tests/corpus/pg19_date.txt`
+        // records for `DateStyle`; listing them here is what that limitation costs, and it will
+        // cost nothing the day `search_path` is honoured.
         (
             "SELECT current_schemas(false)",
-            "Selecting it returns an **array**, and this node has array expressions only — no \
-             array `Datum`, nothing a `RowDescription` could type. Inside an `= ANY` it answers \
-             exactly. ADR 0033's roadmap puts stored arrays in tier 2.",
+            "The first read agrees exactly but for `name[]` against `text`. The second follows a \
+             `SET search_path` this node refuses, so it answers for the path that is still set.",
         ),
         (
             "SELECT current_schemas(true)",
             "The same, for the form that also lists `pg_catalog`.",
-        ),
-        (
-            "SELECT current_schemas(false)::text",
-            "The same again: the cast is fine and the value it would cast is the array.",
         ),
         (
             "SELECT current_schemas(NULL)",
@@ -68,10 +77,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT version() IS NOT NULL",
             "`version()` is not implemented. It is the one line here a client actually reads, and \
              it belongs with the session-identity unit beside `current_user`.",
-        ),
-        (
-            "SELECT array_length(current_schemas(false), 1), array_length(current_schemas(true), 1)",
-            "`array_length` is an array function, queued with `array_agg`.",
         ),
         (
             "SELECT unnest(current_schemas(true))",
