@@ -235,7 +235,11 @@ is how that TODO closes.
   > **Nothing coordinates the re-drivers, because a step is already a catalog transaction.** Two
   > that overlap write the same table record and one is rolled back with `40001`; one that merely
   > *follows* another is refused by the step itself, which takes the state its caller expected and
-  > answers `overtaken` if it has moved. Both halves are needed: without the second, two drivers
+  > answers `overtaken` if it has moved — **or if the whole change has finished**, since a job
+  > record outlives its change by exactly as long as it takes to delete it and a driver arriving
+  > inside that window reads no job at all. That is the same fact one step further on and it is
+  > answered the same way, not as an internal error (`docs/plans/phase-14-flakes.md` U1).
+  > Both halves are needed: without the second, two drivers
   > that never overlap take consecutive transitions moments apart, each legal alone and together
   > exactly the acceleration this interval forbids. A lock would be a second mechanism to keep in
   > step with the first, and it would have a holder that can die — which is the failure being

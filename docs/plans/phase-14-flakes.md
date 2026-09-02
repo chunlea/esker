@@ -130,6 +130,109 @@ message captured this time.
 
 ---
 
+## U1 — `redrive::two_re_drivers_racing_take_each_step_exactly_once`
+
+### The reproduction, and it is not the one the name suggests
+
+Alone, **60 of 60 green**. Sixteen copies of the binary at once, five times over: **68 of 80 red**,
+every one on the same line and none of them on the count:
+
+```
+two re-drivers: 2 transitions, 0 overtaken, 0 rolled back
+panicked at crates/esker-sql/tests/redrive.rs:574:5:
+the two re-drivers never actually collided, so nothing about racing was tested
+```
+
+`moved` was `["write-only", "public"]` in all 140 runs. So the recorded flake is **not** a step
+taken twice or zero times; it is the test's own guard saying it proved nothing — which is the guard
+working, and a gate that is red one run in N for a correct system.
+
+### The mechanism, off a per-round trace
+
+Printing each round's two `Pass` values under the same load says it in three lines:
+
+```
+round: b=Ok(Pass { jobs: 1, steps: [], failed: [] })
+       c=Ok(Pass { jobs: 1, steps: [Step { said: "write-only", moved: true, batches: 0 }], failed: [] })
+round: b=Ok(Pass { jobs: 1, steps: [Step { said: "public", moved: true, batches: 3 }], failed: [] })
+       c=Ok(Pass { jobs: 1, steps: [], failed: [] })
+```
+
+B took **no step at all** in the round C stepped, and C took none in the round B stepped. A
+`std::sync::Barrier` synchronises the moment two passes *start*, and a pass is not a step: it is a
+catalog scan, a table read and, at write-only, a whole backfill. On a loaded box one pass runs to
+completion before the other is scheduled — and the second then finds the job's fingerprint changed,
+resets its wait and skips (`redrive.rs`: *"Somebody stepped it since the last pass ... the wait
+starts again from here"*). Nothing overlaps, so nothing is refused, so nothing is counted.
+
+Aligning two threads is not the same as overlapping two transactions, and only the second is what
+this test is about.
+
+### The fix: an interleaving the test builds
+
+`Gate` in `tests/redrive.rs`, in the seam the file already owns — `NodeBackend` — so no production
+code learns about the test. Every transaction reports its two edges, and one node's driver is held
+at whichever the test names: **before its next snapshot** (`Hold::Begin`), or **between its last
+read and its commit** (`Hold::Commit`). The other driver's *whole pass* then runs inside that
+window, and only then is the held one let go. There is no window to lose and no order to get lucky
+about; `wait_until_parked` panics rather than proceeding if the driver never arrives, so a schedule
+that stops being the built one fails loudly instead of quietly going back to hoping.
+
+The racing test now collides on **both** of its rounds, on every run, and keeps
+`overtaken + conflicts > 0` plus the exact `(0, 2)` it now constructs.
+
+### What the forced race then found, which 140 runs of the old one had not
+
+Two windows the barrier version never reached, both **red first**:
+
+| held at | what it read | before |
+|---|---|---|
+| the read that chooses its step | `XX000 internal error: index 2 has no schema-change job in flight` | `verbs::step_job` |
+| the batch it was about to run | `XX000 internal error: no schema-change job for index 2` | `job::backfill_batch` |
+
+Both are the same fact: the **other** driver ran the backfill out, took `public` and forgot the job,
+and this one's next read found nothing. Which is the most ordinary outcome in this module — two
+nodes re-driving one job is what it is *for* — reported as an internal error.
+
+The second one matters more than it looks. `adding_step` treats anything but `40001` out of a
+backfill batch as a change that failed on **data** and calls `job::unwind`, which walks the index
+back to `absent`. What stops it tearing down an index that is already `public` is that `unwind`
+finds no job and returns early — a guard, not a reason, and one transaction of distance from a
+`CREATE INDEX` that undoes itself because two nodes both did their job.
+
+**The fix, three reads on the step path:** a job that is gone is `Overtaken` — "somebody else did it
+first", the same sentence one step further on.
+
+* `verbs::step_job` — absent job → `Ok(Stepped::Overtaken)`. `esker_schema_step` still answers a
+  human who names an index with no job at all; it checks in the same transaction before it gets
+  here, so this arm is only ever the race.
+* `job::advance` — absent job → `Ok(false)`, which is what its own contract already called "somebody
+  else did it first".
+* `job::backfill_batch` — absent job → `Ok(true)`; a job that is gone has no backfill left, and the
+  advance that follows answers `overtaken`.
+
+ADR 0020's re-driver amendment said `overtaken` covered a state that *has moved*; it now says a
+change that has *finished* too.
+
+### Numbers
+
+| | before the fix | after |
+|---|---:|---:|
+| the racing test alone | 60 of 60 | 10 of 10 tests, every run below |
+| 16 copies at once × 5 (the reproduction) | **12 of 80** | **80 of 80** |
+| 16 copies at once × 4, after the rename | — | **64 of 64** |
+| `a_driver_whose_job_is_finished_before_its_step…` | **red**, `XX000` | green |
+| `a_driver_whose_job_is_finished_inside_its_step…` | **red**, `XX000` | green |
+| `cargo nextest run -p esker-sql --all-features` | — | **597 of 597** |
+
+144 concurrent runs of the whole binary is 1,440 test executions, on the load that produced 68
+failures out of 80 before. The one new test that was **green against the unfixed code** is
+`a_re_driver_that_reads_after_the_winner_is_overtaken_rather_than_stepping`, and it is written down
+as such: it pins the sequential half of the race, which already worked and had no test that forced
+it.
+
+---
+
 ## 2. Units
 
 | unit | test | done when |

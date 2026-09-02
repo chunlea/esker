@@ -357,6 +357,11 @@ pub(crate) enum Stepped {
     /// Not an error and not a step: the change is exactly one further on than it was, just not by
     /// this caller. A driver's next move is to look again — and to wait first, because the step
     /// that did happen happened just now (`crate::exec::job::advance`).
+    ///
+    /// **A job that has been forgotten is this too**, and it is the same sentence one step
+    /// further: the change is over, and not by this caller. Every read of a job record on the
+    /// step path answers it that way rather than erroring, because a driver that arrives after
+    /// another has finished the change is what a cluster of re-drivers *is*.
     Overtaken,
     /// The change was already finished; this only cleared what it left behind.
     ///
@@ -412,9 +417,18 @@ pub(crate) fn step_job(
 ) -> Result<Stepped> {
     let tenant = executor.tenant;
     let Some(job) = catalog::job(txn, tenant, index_id)? else {
-        return Err(SqlError::Internal(format!(
-            "index {index_id} has no schema-change job in flight"
-        )));
+        // **A job that is gone was finished by somebody else**, and that is the ordinary outcome
+        // of two nodes re-driving one change, not a fault. A job record outlives its change by
+        // exactly as long as it takes to delete it, so a second driver arriving inside that
+        // window reads nothing — and answering `XX000` for it would put an internal error in
+        // front of an operator for a cluster behaving exactly as designed, and bury the `23505`
+        // that is the one failure here that really is one
+        // (`redrive.rs::a_driver_whose_job_is_finished_before_its_step_says_it_lost_a_race`).
+        //
+        // `esker_schema_step` still answers a human who names an index with no job at all: it
+        // checks for one before it gets here, in the same transaction, so this arm is only ever
+        // the race.
+        return Ok(Stepped::Overtaken);
     };
     let table = executor.table_by_id(txn, job.table_id)?;
     let state = table

@@ -57,9 +57,13 @@ pub(super) fn backfill_batch(executor: &Executor, index_id: u64) -> Result<bool>
     let mut txn = executor.plain_read()?;
 
     let Some(job) = catalog::job(&*txn, tenant, index_id)? else {
-        return Err(SqlError::Internal(format!(
-            "no schema-change job for index {index_id}"
-        )));
+        // A job that is gone has no backfill left to run. Another node finished the change while
+        // this batch was being decided on, which is ordinary — and it matters that it is not an
+        // error, because the arm above this one treats anything but `40001` as a change that
+        // failed on **data** and unwinds it. An internal error here is one transaction away from
+        // tearing down an index that is already `public`
+        // (`redrive.rs::a_driver_whose_job_is_finished_inside_its_step_does_not_unwind_the_change`).
+        return Ok(true);
     };
     if job.done {
         return Ok(true);
@@ -171,8 +175,8 @@ fn index_entry(
 ///
 /// Two drivers that overlap conflict on the table record and one is rolled back; two that merely
 /// *follow* each other do not overlap, and this is what stops the second. Returns whether it
-/// moved: `false` means somebody else did it first, which is an ordinary outcome and not an
-/// error.
+/// moved: `false` means somebody else did it first — the state has already moved, or the whole
+/// change has finished and its job is gone — which is an ordinary outcome and not an error.
 pub(super) fn advance(
     executor: &Executor,
     index_id: u64,
@@ -180,8 +184,12 @@ pub(super) fn advance(
     to: SchemaState,
 ) -> Result<bool> {
     let mut txn = executor.plain_read()?;
-    let job = catalog::job(&*txn, executor.tenant, index_id)?
-        .ok_or_else(|| SqlError::Internal(format!("no schema-change job for index {index_id}")))?;
+    // A job that is gone is the strongest form of "somebody else did it first" there is: the
+    // change is finished and forgotten. Same answer as a state that has already moved, for the
+    // same reason.
+    let Some(job) = catalog::job(&*txn, executor.tenant, index_id)? else {
+        return Ok(false);
+    };
     let table = executor.table_by_id(&*txn, job.table_id)?;
     // Read inside the transaction that writes, so that what is checked is what is committed
     // against: a reader outside it would be checking a snapshot the write does not share.
