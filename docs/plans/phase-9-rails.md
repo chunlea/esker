@@ -1125,6 +1125,64 @@ comma-separated `FROM`. It has always run, and the harness failed the test until
 — the second time this session that checking both directions has caught a note somebody wrote once
 and never re-measured.
 
+#### Rung 4: `pg_class`, `pg_namespace`, and `= ANY (current_schemas(false))`
+
+One statement wants three features at once, which is why the rung is one unit and why no earlier
+unit could move any part of it — a statement is served or it is not:
+
+```sql
+SELECT c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = ANY (current_schemas(false)) AND c.relkind IN ('r','v','m','p','f')
+```
+
+##### `= ANY(array)` is `IN`, and the three-valued logic is why that was checked first
+
+`NULL = ANY(ARRAY['a'])` is NULL, `'a' = ANY(ARRAY['a', NULL])` is true, `'z' = ANY(ARRAY['a',
+NULL])` is NULL, and an **empty** array is plain false. This node's `IN` answers all four the same
+way — measured on both sides before the arm was written — so the lowering is free rather than a
+guess.
+
+**Expression-level arrays only**, which is the split ADR 0033's roadmap describes. There is no
+array `Datum`, no array column, and nothing a `RowDescription` could type: an array exists only as
+an `ANY` operand and becomes an `IN` list before the planner sees it. `SELECT current_schemas(false)`
+**on its own** is therefore `0A000` — selecting it would return an array — and that is the honest
+half of the split rather than an oversight, since `ActiveRecord` only ever writes it inside an `ANY`.
+
+##### Two category-(a) bugs the capture replay found after the first version shipped
+
+Both were in the `= ANY` half, both invisible to the boot capture, and both reachable from ordinary
+`ActiveRecord` code:
+
+1. **An unquoted `NULL` element was handed to the element's input function as the word `NULL`.**
+   `text` accepted it as a string; `int4` answered `22P02`. So `1 = ANY('{NULL,1}'::int[])` was an
+   error where a real server says `t` — and `where(id: [1, nil])` emits exactly that. A quoted
+   `"NULL"` *is* the four characters, so the parser has to remember whether an element was quoted,
+   which is why it returns `Option<String>` per element.
+2. **`current_schema(false)` returned `public`.** PostgreSQL resolves a function by name *and*
+   argument types, so the wrong arity is `42883 function current_schema(boolean) does not exist`,
+   not a function that shrugged at an argument.
+
+The first shipped with a comment saying the simplification "cannot be reached from anything
+`ActiveRecord` sends". It could. **A claim about what a client sends belongs in a capture, not in
+a comment** — and the corpus now carries both lines, which is what a replay of the corpus against
+the node is for.
+
+##### `pg_class` is the first view whose rows are not constants
+
+They come from one scan of the same name records `CREATE TABLE` writes, so there is nothing to keep
+in step and no way for the two to disagree: a table created and then dropped appears and disappears
+without any code between the two knowing `pg_class` exists. That property is the whole reason unit
+5 chose computed views over stored catalog tables, and this is the first view that exercises it.
+
+`relkind` is what the name record already says the relation is: `r` for a table, `i` for an index —
+and `i` for a **primary key**, which a real server lists as `r4a_pkey` even though here the row key
+*is* the primary key and no separate index exists. What `relkind` describes is a relation a client
+can name, and a client can name it.
+
+Every corpus query filters by `relname`, because a real server's `pg_class` holds several hundred
+system relations and this node's holds none. Comparing unfiltered counts would compare two catalogs
+rather than one answer.
+
 ## 3. The test ladder
 
 Each rung is a thing that either works or does not, and none of them is reached by asserting

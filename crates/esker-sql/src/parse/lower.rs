@@ -1208,7 +1208,14 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
     // `current_schema()` is the scalar half of `current_schemas()`: one name rather than a list,
     // and `public` on this node because `public` is the only schema it has. Measured; the two are
     // together here so a reader finds both at once.
+    //
+    // **The arity is checked**, because PostgreSQL resolves a function by name *and* argument
+    // types: `current_schema(false)` is `42883 function current_schema(boolean) does not exist`,
+    // not a `current_schema()` that shrugged at an argument. A node that ignored the argument
+    // would answer `public` where a real server refuses, which is a wrong answer rather than a
+    // gap — and it did, until r1's capture replay caught it.
     if name.eq_ignore_ascii_case("current_schema") {
+        refuse_wrong_arity(function, "current_schema", 0)?;
         return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
             Datum::Text(PUBLIC_SCHEMA.to_owned()),
         ))));
@@ -1463,7 +1470,12 @@ fn lower_array(expr: &Expr) -> Result<Vec<plan::Expr>> {
         Expr::Value(value) => match &value.value {
             Value::SingleQuotedString(text) => Ok(parse_array_literal(text)?
                 .into_iter()
-                .map(|item| plan::Expr::Literal(plan::Literal::String(item)))
+                .map(|item| {
+                    plan::Expr::Literal(match item {
+                        Some(text) => plan::Literal::String(text),
+                        None => plan::Literal::Null,
+                    })
+                })
                 .collect()),
             _ => Err(SqlError::unsupported(format!("{expr} as an ANY operand"))),
         },
@@ -1471,13 +1483,23 @@ fn lower_array(expr: &Expr) -> Result<Vec<plan::Expr>> {
     }
 }
 
-/// `'{a,b,"c d"}'` as its elements.
+/// `'{a,b,"c d"}'` as its elements, with `None` for a SQL NULL.
 ///
 /// PostgreSQL's array input syntax, narrowed to what an `= ANY` operand needs: braces, commas, and
-/// double quotes around an element containing a comma, a brace or a space. A NULL element is the
-/// unquoted word `NULL`, which this node does not produce and reads as the string — the one thing
-/// here that is a simplification, and it cannot be reached from anything `ActiveRecord` sends.
-fn parse_array_literal(text: &str) -> Result<Vec<String>> {
+/// double quotes around an element containing a comma, a brace or a space.
+///
+/// **An unquoted `NULL`, in any case, is a SQL NULL; a quoted `"NULL"` is the four characters.**
+/// That distinction is the whole reason this returns `Option<String>` rather than `String`, and it
+/// is not decoration: `'{NULL,a}'` and `'{"NULL",a}'` answer differently for the same probe —
+/// `'NULL' = ANY(…)` is unknown against the first and true against the second, measured. Getting
+/// it wrong handed the element input function the *word* `NULL`, which `text` accepted as a string
+/// and `int4` refused with `22P02`, so `1 = ANY('{NULL,1}'::int[])` was an error where a real
+/// server says `t`.
+///
+/// An earlier version of this function noted that simplification and said it "cannot be reached
+/// from anything `ActiveRecord` sends". It can: `where(id: [1, nil])` emits exactly it. A claim
+/// about what a client sends belongs in a capture, not in a comment.
+fn parse_array_literal(text: &str) -> Result<Vec<Option<String>>> {
     let inner = text
         .trim()
         .strip_prefix('{')
@@ -1489,23 +1511,42 @@ fn parse_array_literal(text: &str) -> Result<Vec<String>> {
     if inner.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let mut items = Vec::new();
+
+    let mut items: Vec<Option<String>> = Vec::new();
     let mut current = String::new();
+    // Whether *any* part of the element was quoted. `"NULL"` is a string and so is `"NU"LL`,
+    // which is why this is a flag on the element rather than a test of its first character.
+    let mut was_quoted = false;
     let mut quoted = false;
     let mut chars = inner.chars();
+    let mut finish = |current: &mut String, was_quoted: &mut bool, items: &mut Vec<_>| {
+        let text = std::mem::take(current);
+        items.push(
+            if !*was_quoted && text.trim().eq_ignore_ascii_case("null") {
+                None
+            } else {
+                Some(text)
+            },
+        );
+        *was_quoted = false;
+    };
     while let Some(character) = chars.next() {
         match character {
-            '"' => quoted = !quoted,
+            '"' => {
+                quoted = !quoted;
+                was_quoted = true;
+            }
             '\\' => {
                 if let Some(escaped) = chars.next() {
+                    was_quoted = true;
                     current.push(escaped);
                 }
             }
-            ',' if !quoted => items.push(std::mem::take(&mut current)),
+            ',' if !quoted => finish(&mut current, &mut was_quoted, &mut items),
             _ => current.push(character),
         }
     }
-    items.push(current);
+    finish(&mut current, &mut was_quoted, &mut items);
     Ok(items)
 }
 
@@ -1524,8 +1565,9 @@ fn schema_function(function: &sqlparser::ast::Function) -> Result<Option<Vec<Str
     {
         return Ok(None);
     }
+    refuse_wrong_arity(function, "current_schemas", 1)?;
     let FunctionArguments::List(FunctionArgumentList { args, .. }) = &function.args else {
-        return Err(SqlError::unsupported("current_schemas with no argument"));
+        return Err(SqlError::UndefinedFunction("current_schemas()".to_owned()));
     };
     let include_implicit = match args.as_slice() {
         [FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(value)))] => match &value.value {
@@ -1541,6 +1583,55 @@ fn schema_function(function: &sqlparser::ast::Function) -> Result<Option<Vec<Str
     } else {
         vec![PUBLIC_SCHEMA.to_owned()]
     }))
+}
+
+/// `42883` when a function is called with the wrong number of arguments.
+///
+/// PostgreSQL resolves a function by name **and** argument types, so the wrong arity is not a
+/// badly-called function — it is a function that does not exist, and the message says so with the
+/// types spelled out: `function current_schema(boolean) does not exist`. Only the shapes this node
+/// can produce are named; a type it has no name for is written as it was parsed.
+fn refuse_wrong_arity(
+    function: &sqlparser::ast::Function,
+    name: &'static str,
+    wanted: usize,
+) -> Result<()> {
+    use sqlparser::ast::{FunctionArgumentList, FunctionArguments};
+    let given: Vec<String> = match &function.args {
+        FunctionArguments::List(FunctionArgumentList { args, .. }) => {
+            args.iter().map(argument_type_name).collect()
+        }
+        FunctionArguments::None => Vec::new(),
+        FunctionArguments::Subquery(_) => vec!["record".to_owned()],
+    };
+    if given.len() == wanted {
+        return Ok(());
+    }
+    Err(SqlError::UndefinedFunction(format!(
+        "{name}({})",
+        given.join(", ")
+    )))
+}
+
+/// The type name PostgreSQL would print for one argument in a `42883`.
+fn argument_type_name(arg: &sqlparser::ast::FunctionArg) -> String {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr};
+    let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg else {
+        return "unknown".to_owned();
+    };
+    match expr {
+        Expr::Value(value) => match &value.value {
+            Value::Boolean(_) => "boolean",
+            Value::Number(..) => "integer",
+            // An unadorned string literal really is `unknown` to a real server's resolver, which
+            // is why `current_schema('x')` names `unknown` rather than `text`.
+            Value::SingleQuotedString(_) => "unknown",
+            Value::Null => "unknown",
+            _ => "unknown",
+        }
+        .to_owned(),
+        _ => "unknown".to_owned(),
+    }
 }
 
 /// The one schema this node has. `public`, which is what `current_schema()` answers.

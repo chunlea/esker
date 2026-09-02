@@ -1,0 +1,37 @@
+# `pg_class` and `pg_namespace` as computed views — the other half of rung 4's blocker
+#
+# The statement rung 4 stops on, verbatim from `ActiveRecord`:
+#
+#   SELECT c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
+#   WHERE n.nspname = ANY (current_schemas(false)) AND c.relkind IN ('r','v','m','p','f')
+#
+# It needs three things at once and that is why the two halves are one rung: a chain-free but
+# aliased `LEFT JOIN`, the `= ANY` of the previous commit, and these two relations.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#
+# `pg_class` is the **first catalog view whose rows are not constants**: they come from one scan of
+# the same name records `CREATE TABLE` writes, so there is nothing to keep in step. `relkind` is
+# what the name record already says the relation is — measured, `r` for a table, `i` for an index,
+# and `i` for a **primary key**, which appears in `pg_class` as `r4a_pkey` on a real server even
+# though here the row key *is* the primary key and no separate index exists. A client can name it,
+# so it is a relation.
+#
+# Every query below filters by `relname`, because a real server's `pg_class` holds several hundred
+# system relations and this node's holds none: comparing the unfiltered counts would compare two
+# catalogs rather than one answer. What is compared is what `ActiveRecord` asks for.
+#
+# This file builds and drops its own tables, so replaying it twice is the same as replaying it
+# once — verified by capturing it twice and diffing.
+#
+DROP TABLE IF EXISTS r4b		-
+DROP TABLE IF EXISTS r4a		-
+CREATE TABLE r4a (id int8 PRIMARY KEY, v text)		-
+CREATE TABLE r4b (id int8 PRIMARY KEY)		-
+SELECT c.relname, c.relkind FROM pg_class c WHERE c.relname IN ('r4a','r4b') ORDER BY c.relname	name,"char"	r4a|r ; r4b|r
+SELECT n.nspname FROM pg_namespace n WHERE n.nspname = 'public'	name	public
+SELECT c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ANY(current_schemas(false)) AND c.relname IN ('r4a','r4b') AND c.relkind IN ('r','v','m','p','f') ORDER BY c.relname	name	r4a ; r4b
+SELECT c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ANY(current_schemas(false)) AND c.relname = 'r4a' AND c.relkind IN ('r','p')	name	r4a
+SELECT count(*) FROM pg_class c WHERE c.relname = 'r4a'	bigint	1
+SELECT c.relkind FROM pg_class c WHERE c.relname = 'r4a_pkey'	"char"	i

@@ -217,6 +217,35 @@ pub(super) fn name_key(tenant: u64, name: &str) -> Vec<u8> {
     prefix::meta_key(&suffix)
 }
 
+/// The relation name out of a key [`name_key`] wrote.
+///
+/// The name is the whole tail of the key, so it needs no length and cannot be confused with a
+/// longer one — the same property the checkpoint keys rely on.
+pub(super) fn name_of(tenant: u64, key: &[u8]) -> Result<String> {
+    let prefix = name_key(tenant, "");
+    let tail = key
+        .strip_prefix(prefix.as_slice())
+        .ok_or_else(|| corrupt("a catalog name key for another tenant"))?;
+    String::from_utf8(tail.to_vec()).map_err(|error| corrupt(format!("a relation name: {error}")))
+}
+
+/// Every relation name a tenant has, as a scan range over the same key space [`name_key`] writes.
+///
+/// One scan is the whole of `pg_class`: a name record exists for every table, index, primary key
+/// and sequence, and its value says which. That is the same shape `columnar_range` gives the
+/// placement driver — the catalog is already a scannable key space, so a computed relation over it
+/// needs no second copy of anything.
+#[must_use]
+pub(super) fn name_range(tenant: u64) -> (Vec<u8>, Vec<u8>) {
+    let mut suffix = [SQL, &[KIND_NAME]].concat();
+    codec::encode_u64(tenant, &mut suffix);
+    let start = prefix::meta_key(&suffix);
+    let mut end = start.clone();
+    // The successor of the prefix: every key that starts with it sorts below this.
+    end.push(0xff);
+    (start, end)
+}
+
 /// `'m' ++ "sql" ++ 'd'`. One number for the cluster, absent until somebody sets it.
 #[must_use]
 pub(super) fn default_retention_key() -> Vec<u8> {

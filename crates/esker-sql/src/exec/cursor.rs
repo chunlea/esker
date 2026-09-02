@@ -133,7 +133,7 @@ fn inner_side(
     probe: &Probe,
 ) -> Result<Vec<Vec<Datum>>> {
     if let Some(view) = inner_view {
-        return Ok(view.rows());
+        return view.rows_of(txn, tenant);
     }
     if !matches!(probe, Probe::Materialize) {
         return Ok(Vec::new());
@@ -169,7 +169,7 @@ impl<'a> Cursor<'a> {
             Node::OneRow => Kind::One(false),
             // Computed here, once, rather than page by page: `pg_type` is six rows and `pg_range`
             // is none. If a catalog view ever is not small, this is the line that changes.
-            Node::CatalogView { view, .. } => Kind::Rows(view.rows().into_iter()),
+            Node::CatalogView { view, .. } => Kind::Rows(view.rows_of(txn, tenant)?.into_iter()),
             Node::SeqScan {
                 columns,
                 start,
