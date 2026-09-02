@@ -1,0 +1,25 @@
+crates/esker-client/tests/sim_retry.rs
+  s_e2fd0c54b9d574::t_7b342fa6262eb7 1-344
+crates/esker-sim/src/mech/mod.rs
+  s_e2fd0c54b9d574::t_ced5e89ca94990 45,49
+crates/esker-sim/src/mech/retry.rs
+  s_e2fd0c54b9d574::t_3432f34e55a2bf 1-471
+docs/plans/phase-11-engine.md
+  s_e2fd0c54b9d574::t_ee5228907cc67f 282-324
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "8f62ab24ed2def5f372628a8a7c809e7ec436a96",
+  "prompts": {},
+  "sessions": {
+    "s_e2fd0c54b9d574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "671f3143-5435-4676-97d9-490a56835160",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
