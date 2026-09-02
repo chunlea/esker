@@ -1,0 +1,31 @@
+crates/esker-client/src/fragment.rs
+  s_ed1cd635740377::t_d4dd81489b0020 1-320
+crates/esker-client/src/lib.rs
+  s_ed1cd635740377::t_d1d8183a834071 31,45
+crates/esker-client/src/router.rs
+  s_ed1cd635740377::t_4405d6bc4fb3b3 161-183,324,343
+crates/esker-client/src/testing.rs
+  s_ed1cd635740377::t_4c77a8fff7a8fa 40-41,149-155,183
+crates/esker-client/tests/fragment.rs
+  s_ed1cd635740377::t_8f765e44da54ba 1-352
+crates/esker-store/src/server.rs
+  s_ed1cd635740377::t_878c7316a13f4f 2406-2417,2459-2468,2480-2487,2489-2500,2504-2510
+docs/plans/phase-10-routing.md
+  s_ed1cd635740377::t_4f3038e4e5f992 340-351
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "9e672048a4684bee881040d8911225cd3d470ccb",
+  "prompts": {},
+  "sessions": {
+    "s_ed1cd635740377": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "19199d55-8453-4673-a0ab-b13f22806878",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
