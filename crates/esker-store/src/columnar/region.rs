@@ -239,7 +239,7 @@ impl ColumnarSlot {
 
     /// Whether this store's **own engine** holds the record for `(tenant, table_id)`.
     ///
-    /// The same read [`ensure`](Self::ensure) would do, so a `true` here is a promise the next call
+    /// The same read the copy's own build would do, so a `true` here is a promise the next call
     /// can keep — and it deliberately does **not** consider a record that was fetched from another
     /// store. A store that can read the record locally re-reads it on every fragment already
     /// (`table` clears the miss cache and `ensure` reads through), so its schema cannot go stale;
@@ -420,7 +420,7 @@ fn decoder_of(published: &esker_keys::columnar::Published) -> Result<TableDecode
 
 /// The columnar record for a table as **bytes**, for a store answering another store's ask.
 ///
-/// The same read [`published_schema`] does and deliberately without the decode: what travels is
+/// The same read the decoder's own lookup does, and deliberately without the decode: what travels is
 /// the record as it is stored, so the asking store parses it with the parser it would have used on
 /// its own engine ([`esker_proto::schema`] says why the wire does not learn the format).
 pub fn published_record(db: &Db, tenant: u64, table_id: u64) -> Result<Option<Bytes>> {
