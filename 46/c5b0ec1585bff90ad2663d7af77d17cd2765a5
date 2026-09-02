@@ -1,0 +1,27 @@
+crates/esker-sql/src/parse/lower.rs
+  s_e2fd0c54b9d574::t_4ace0569498d2a 1111-1124
+crates/esker-sql/tests/activerecord_surface.rs
+  s_e2fd0c54b9d574::t_e620dcd7987d77 98-104
+crates/esker-sql/tests/any.rs
+  s_e2fd0c54b9d574::t_ea786ee7d45259 148-169
+crates/esker-sql/tests/corpus/pg19_current_schemas.txt
+  s_e2fd0c54b9d574::t_0c0d29e5a5ed31 1-87
+crates/esker-sql/tests/current_schemas.rs
+  s_e2fd0c54b9d574::t_c919905dda363e 1-105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "46c5b0ec1585bff90ad2663d7af77d17cd2765a5",
+  "prompts": {},
+  "sessions": {
+    "s_e2fd0c54b9d574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "671f3143-5435-4676-97d9-490a56835160",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
