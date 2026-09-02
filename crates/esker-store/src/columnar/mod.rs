@@ -155,6 +155,15 @@ pub struct ColumnarApply {
     schema_version: u64,
     buffered: Vec<Row>,
     buffered_bytes: usize,
+    /// The region apply index whose versions have all been handed to this target — buffered or
+    /// sealed. Moved by [`ColumnarApply::entry_applied`] and by nothing else.
+    complete_index: u64,
+    /// Whether the budget sealed a run **inside** the entry now being fed.
+    ///
+    /// That run holds some of the entry's rows while the manifest still names the entry before it,
+    /// so the rest of the entry must be sealed at its end — otherwise a reopen would replay an
+    /// entry a run already partly holds, and the copy would carry those rows twice.
+    sealed_mid_entry: bool,
     /// The live runs, and the manifest that names them.
     ///
     /// Owned here rather than beside here, because sealing is the only thing that creates a run
@@ -193,6 +202,7 @@ impl ColumnarApply {
 
         let (schema, key_slot) = Self::run_schema(decoder.as_ref())?;
         let ts_slot = key_slot + 1;
+        let applied = runs.applied();
 
         Ok(Self {
             fs,
@@ -206,6 +216,8 @@ impl ColumnarApply {
             schema_version: 0,
             buffered: Vec::new(),
             buffered_bytes: 0,
+            complete_index: applied,
+            sealed_mid_entry: false,
             runs,
         })
     }
@@ -299,6 +311,56 @@ impl ColumnarApply {
         self.schema_version
     }
 
+    /// The region apply index the **runs on disk** are complete to.
+    ///
+    /// What a reopen resumes from. Never the index the buffer has reached: rows in the buffer are
+    /// not durable, and a manifest that named them would lose them to a crash without ever saying
+    /// so.
+    #[must_use]
+    pub fn applied_index(&self) -> u64 {
+        self.runs.applied()
+    }
+
+    /// Records that this copy has just been built or resumed up to `index`, and makes the manifest
+    /// say so.
+    ///
+    /// The open path's counterpart to [`ColumnarApply::entry_applied`], and it differs in one way
+    /// that matters: it always leaves the manifest naming `index`, sealing what is buffered and
+    /// republishing when there was nothing to seal. An open happens once, so the extra rename is
+    /// paid once — and without it a table whose rebuild found no rows would claim nothing and be
+    /// re-walked at every open for ever.
+    pub fn built_to(&mut self, index: u64) -> Result<()> {
+        self.complete_index = self.complete_index.max(index);
+        self.sealed_mid_entry = false;
+        self.seal()?;
+        self.runs.republish(self.complete_index)
+    }
+
+    /// Records that every version entry `index` committed has now been handed to this target.
+    ///
+    /// Called at the **end** of an entry, which is the only boundary at which the applied index
+    /// means anything: half an entry is not a state any replay can resume from.
+    ///
+    /// The seal here is the mid-entry case and only that. When the budget sealed a run part way
+    /// through this entry, that run's rows are already durable under a manifest that names the
+    /// *previous* entry; sealing the remainder now lets the manifest name this one, so a resume
+    /// starts after it and re-feeds nothing. Everything else buffers on, and the manifest keeps
+    /// naming the last entry a seal covered — which is the honest answer, because that is all the
+    /// runs hold.
+    pub fn entry_applied(&mut self, index: u64) -> Result<()> {
+        self.complete_index = self.complete_index.max(index);
+        if !self.sealed_mid_entry {
+            return Ok(());
+        }
+        self.sealed_mid_entry = false;
+        if self.seal()?.is_none() {
+            // The budget seal took the entry's last row too, so there is nothing left to write and
+            // the runs already hold the whole entry. Only the claim is missing.
+            self.runs.republish(self.complete_index)?;
+        }
+        Ok(())
+    }
+
     /// Where `__key`, `__commit_ts` and `__deleted` landed, for a read that resolves versions.
     #[must_use]
     pub fn visibility_slots(&self) -> (u32, u32, u32) {
@@ -354,6 +416,7 @@ impl ColumnarApply {
             || self.buffered_bytes >= self.options.seal_bytes
         {
             self.seal()?;
+            self.sealed_mid_entry = true;
         }
         Ok(())
     }
@@ -402,7 +465,7 @@ impl ColumnarApply {
         );
         // The manifest write is the commit point: until it lands the file is an orphan the sweep
         // would collect, which is exactly right for a seal that crashed half way.
-        self.runs.commit(number)?;
+        self.runs.commit(number, self.complete_index)?;
         self.buffered.clear();
         self.buffered_bytes = 0;
         Ok(Some(path))

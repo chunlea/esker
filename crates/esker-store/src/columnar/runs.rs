@@ -29,6 +29,20 @@
 //!
 //! At **open** there is no such window: nothing is in flight, so an unnamed run is a merge that did
 //! not commit and deleting it is right.
+//!
+//! # The applied index, and why it is in *this* pointer
+//!
+//! Version 2 adds one number: the region apply index the live runs are complete to
+//! ([ADR 0038](../../../../docs/adr/0038-a-run-manifest-names-the-index-its-runs-are-complete-to.md)).
+//! It has to live here rather than in a file beside here, because "these runs hold every version
+//! through index N" is a statement about the live set and nothing else — a second file could be
+//! written a moment after the manifest and name an index the runs do not hold, which is precisely
+//! the claim that must never be made. One atomic rename says both things or neither.
+//!
+//! The number is only ever advanced **by a seal**, in the same manifest write that makes the run
+//! live, and it names the last *entry* whose versions are all in that run or an older one. A
+//! manifest that understates costs a replay; one that overstates loses versions silently, so every
+//! choice here is the understating one.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -43,13 +57,23 @@ use crate::error::{Result, StoreError};
 pub const RUNS_MAGIC: [u8; 8] = *b"ESKRRUNS";
 
 /// The format version these bytes are written at.
-pub const RUNS_FORMAT_VERSION: u8 = 1;
+///
+/// Version 1 is still **read** — it is the same manifest without an applied index, so it decodes
+/// as one complete to index zero, which is the value that asks for a full rebuild. Nothing is
+/// written at version 1 any more.
+pub const RUNS_FORMAT_VERSION: u8 = 2;
+
+/// The first version, which named no applied index.
+pub const RUNS_FORMAT_VERSION_1: u8 = 1;
 
 /// The manifest's name inside a region's columnar directory.
 pub const RUNS_MANIFEST: &str = "RUNS";
 
-/// Bytes before the run numbers: magic, version, `next`, count.
-const HEADER_LEN: usize = 8 + 1 + 8 + 4;
+/// Bytes before the run numbers at version 2: magic, version, `next`, `applied`, count.
+const HEADER_LEN: usize = 8 + 1 + 8 + 8 + 4;
+
+/// The same, at version 1, which carried no applied index.
+const HEADER_LEN_V1: usize = 8 + 1 + 8 + 4;
 
 /// So a corrupt count is refused rather than allocated.
 const MAX_RUNS: u32 = 1 << 20;
@@ -61,6 +85,11 @@ pub struct RunSet {
     dir: PathBuf,
     live: Vec<u64>,
     next: u64,
+    /// The region apply index every version in `live` is complete to; `0` for "unknown".
+    ///
+    /// Advanced only by [`RunSet::commit`], which is the manifest write that makes a run live —
+    /// see this module's header for why the two travel together.
+    applied: u64,
     /// Numbers a merge or a seal has taken and not yet committed. Never swept.
     pending: BTreeSet<u64>,
 }
@@ -73,7 +102,7 @@ impl RunSet {
             .map_err(|error| bootstrap(&dir, &error.to_string()))?;
         let path = dir.join(RUNS_MANIFEST);
 
-        let (live, next) = if fs
+        let (live, next, applied) = if fs
             .exists(&path)
             .map_err(|e| bootstrap(&path, &e.to_string()))?
         {
@@ -86,7 +115,7 @@ impl RunSet {
                 .map_err(|e| bootstrap(&path, &e.to_string()))?;
             decode(&bytes).map_err(|detail| bootstrap(&path, &detail))?
         } else {
-            (Vec::new(), 0)
+            (Vec::new(), 0, 0)
         };
 
         let mut set = Self {
@@ -94,6 +123,7 @@ impl RunSet {
             dir,
             live,
             next,
+            applied,
             pending: BTreeSet::new(),
         };
         // Nothing is in flight at open, so an unnamed run is a merge that did not commit.
@@ -105,6 +135,15 @@ impl RunSet {
     #[must_use]
     pub fn live(&self) -> &[u64] {
         &self.live
+    }
+
+    /// The region apply index the live runs are complete to; `0` when nothing says.
+    ///
+    /// A reopen that trusts this replays the log from here rather than re-walking the region, so
+    /// the number must never be larger than what the runs durably hold — see the module header.
+    #[must_use]
+    pub fn applied(&self) -> u64 {
+        self.applied
     }
 
     /// The path of one run.
@@ -121,15 +160,35 @@ impl RunSet {
         number
     }
 
-    /// Commits a freshly written run into the live set.
+    /// Commits a freshly written run into the live set, complete to `applied`.
     ///
-    /// The manifest write is the commit point, so this is where the run becomes real.
-    pub fn commit(&mut self, number: u64) -> Result<()> {
+    /// The manifest write is the commit point, so this is where the run becomes real **and** where
+    /// the applied index moves: one rename publishes the run and the claim about it together.
+    ///
+    /// `applied` never goes backwards. A compaction commits no new versions and a seal of an older
+    /// buffer cannot un-hold what a newer one held, so the highest claim any commit has made is
+    /// still true.
+    pub fn commit(&mut self, number: u64, applied: u64) -> Result<()> {
         self.live.push(number);
         self.live.sort_unstable();
+        self.applied = self.applied.max(applied);
         self.write_manifest()?;
         self.pending.remove(&number);
         Ok(())
+    }
+
+    /// Republishes the manifest with a higher applied index and the live set it already has.
+    ///
+    /// The one caller is a seal that found nothing buffered because a mid-entry seal had already
+    /// taken the entry's rows: the runs are unchanged and durable, and what is missing is only the
+    /// claim that they cover that entry. Writing an index the runs do not hold is the one thing
+    /// this must never do, which is why it refuses to move without a caller that has just sealed.
+    pub fn republish(&mut self, applied: u64) -> Result<()> {
+        if applied <= self.applied {
+            return Ok(());
+        }
+        self.applied = applied;
+        self.write_manifest()
     }
 
     /// Abandons a reserved number whose run was never written.
@@ -192,7 +251,7 @@ impl RunSet {
     /// Write, `sync_data`, rename, `fsync` the directory — the row engine's `CURRENT` discipline
     /// (invariant 3), because this pointer has exactly the same job.
     fn write_manifest(&self) -> Result<()> {
-        let bytes = encode(&self.live, self.next);
+        let bytes = encode(&self.live, self.next, self.applied);
         let temp = self.dir.join(format!("{RUNS_MANIFEST}.tmp"));
         {
             let mut file = self
@@ -215,13 +274,15 @@ impl RunSet {
     }
 }
 
-/// The manifest's bytes: magic, version, `next`, count, the numbers, CRC32C over all of it.
+/// The manifest's bytes: magic, version, `next`, `applied`, count, the numbers, CRC32C over all
+/// of it.
 #[must_use]
-pub fn encode(live: &[u64], next: u64) -> Vec<u8> {
+pub fn encode(live: &[u64], next: u64, applied: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_LEN + live.len() * 8 + 4);
     out.extend_from_slice(&RUNS_MAGIC);
     out.push(RUNS_FORMAT_VERSION);
     out.extend_from_slice(&next.to_le_bytes());
+    out.extend_from_slice(&applied.to_le_bytes());
     out.extend_from_slice(&(u32::try_from(live.len()).unwrap_or(u32::MAX)).to_le_bytes());
     for number in live {
         out.extend_from_slice(&number.to_le_bytes());
@@ -231,9 +292,16 @@ pub fn encode(live: &[u64], next: u64) -> Vec<u8> {
     out
 }
 
-/// Reads a manifest, or says what is wrong with it. Never panics on any input (invariant 9).
-pub fn decode(bytes: &[u8]) -> std::result::Result<(Vec<u64>, u64), String> {
-    if bytes.len() < HEADER_LEN + 4 {
+/// Reads a manifest — the live runs, the next number, the applied index — or says what is wrong
+/// with it. Never panics on any input (invariant 9).
+///
+/// A **version 1** manifest is read rather than refused, and answers applied index `0`: it is this
+/// format without the number, and `0` is exactly "nothing says how far these runs go", which is
+/// what makes the caller rebuild. Refusing it instead would make an upgrade fail to open a copy
+/// that is perfectly good, and the fallback it takes is the behaviour every build before version 2
+/// had.
+pub fn decode(bytes: &[u8]) -> std::result::Result<(Vec<u64>, u64, u64), String> {
+    if bytes.len() < HEADER_LEN_V1 + 4 {
         return Err(format!("{} bytes is shorter than a manifest", bytes.len()));
     }
     if bytes[0..8] != RUNS_MAGIC {
@@ -252,33 +320,79 @@ pub fn decode(bytes: &[u8]) -> std::result::Result<(Vec<u64>, u64), String> {
             "the manifest's CRC32C is {stored:#010x} but its bytes hash to {computed:#010x}"
         ));
     }
-    if bytes[8] != RUNS_FORMAT_VERSION {
-        return Err(format!(
-            "format version {}, and this build understands {RUNS_FORMAT_VERSION}",
-            bytes[8]
-        ));
+    let header = match bytes[8] {
+        RUNS_FORMAT_VERSION => HEADER_LEN,
+        RUNS_FORMAT_VERSION_1 => HEADER_LEN_V1,
+        other => {
+            return Err(format!(
+                "format version {other}, and this build understands {RUNS_FORMAT_VERSION_1} \
+                 and {RUNS_FORMAT_VERSION}"
+            ));
+        }
+    };
+    if bytes.len() < header + 4 {
+        return Err(format!("{} bytes is shorter than a manifest", bytes.len()));
     }
     let mut word = [0u8; 8];
     word.copy_from_slice(&bytes[9..17]);
     let next = u64::from_le_bytes(word);
-    let count = u32::from_le_bytes([bytes[17], bytes[18], bytes[19], bytes[20]]);
+    let applied = if header == HEADER_LEN {
+        word.copy_from_slice(&bytes[17..25]);
+        u64::from_le_bytes(word)
+    } else {
+        0
+    };
+    let at = header - 4;
+    let count = u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
     if count > MAX_RUNS {
         return Err(format!("{count} runs is more than any region has"));
     }
     let count = count as usize;
-    if body != HEADER_LEN + count * 8 {
+    if body != header + count * 8 {
         return Err(format!(
             "a manifest of {count} runs is {} bytes, not {body}",
-            HEADER_LEN + count * 8
+            header + count * 8
         ));
     }
     let mut live = Vec::with_capacity(count);
     for index in 0..count {
-        let at = HEADER_LEN + index * 8;
+        let at = header + index * 8;
         word.copy_from_slice(&bytes[at..at + 8]);
         live.push(u64::from_le_bytes(word));
     }
-    Ok((live, next))
+    Ok((live, next, applied))
+}
+
+/// The applied index a table's manifest names, without opening the runs.
+///
+/// What a reopen asks **before** deciding between a resume and a rebuild, because the rebuild's
+/// first move is to delete this file. A directory with no manifest, and a manifest that cannot be
+/// read, both answer `0`: they are the two shapes of "nothing here says how far the runs go", and
+/// the caller's answer to both is the full walk.
+pub fn applied_index_of(fs: &dyn FileSystem, dir: &Path) -> Result<u64> {
+    let path = dir.join(RUNS_MANIFEST);
+    if !fs
+        .exists(&path)
+        .map_err(|error| bootstrap(&path, &error.to_string()))?
+    {
+        return Ok(0);
+    }
+    let file = fs
+        .open(&path)
+        .map_err(|error| bootstrap(&path, &error.to_string()))?;
+    let size = file
+        .size()
+        .map_err(|error| bootstrap(&path, &error.to_string()))?;
+    let mut bytes = vec![0u8; usize::try_from(size).unwrap_or(usize::MAX)];
+    esker_engine::fs::read_exact_at(file.as_ref(), 0, &mut bytes)
+        .map_err(|error| bootstrap(&path, &error.to_string()))?;
+    match decode(&bytes) {
+        Ok((_, _, applied)) => Ok(applied),
+        Err(detail) => {
+            tracing::warn!(path = %path.display(), detail, "a run manifest could not be read");
+            Ok(0)
+        }
+    }
 }
 
 fn bootstrap(path: &Path, detail: &str) -> StoreError {
@@ -311,30 +425,73 @@ mod tests {
     #[test]
     fn the_manifest_bytes_are_exactly_these() {
         assert_eq!(
-            encode(&[1, 2], 3),
+            encode(&[1, 2], 3, 41),
             [
                 0x45, 0x53, 0x4b, 0x52, 0x52, 0x55, 0x4e, 0x53, // "ESKRRUNS"
-                0x01, // format version
+                0x02, // format version
                 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // next = 3
+                0x29, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // applied = 41
                 0x02, 0x00, 0x00, 0x00, // two runs
                 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
                 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
-                0xa9, 0x42, 0xd4, 0x32, // CRC32C
+                0xfa, 0x18, 0x2d, 0x2b, // CRC32C
             ]
         );
     }
 
+    /// Version 1's bytes, written out longhand so that a build which stopped reading them fails
+    /// here rather than on somebody's data directory.
+    ///
+    /// It answers applied index **zero**, which is the value that asks for the full rebuild — the
+    /// behaviour every build before version 2 had, which is exactly what an old manifest deserves.
+    #[test]
+    fn a_version_one_manifest_still_reads_and_asks_for_a_rebuild() {
+        let mut bytes = vec![
+            0x45, 0x53, 0x4b, 0x52, 0x52, 0x55, 0x4e, 0x53, // "ESKRRUNS"
+            0x01, // format version 1
+            0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // next = 3
+            0x02, 0x00, 0x00, 0x00, // two runs
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+        ];
+        let crc = esker_base::crc32c::checksum(&bytes);
+        bytes.extend_from_slice(&crc.to_le_bytes());
+        assert_eq!(decode(&bytes).unwrap(), (vec![1, 2], 3, 0));
+    }
+
     #[test]
     fn a_manifest_round_trips() {
-        assert_eq!(decode(&encode(&[7, 9], 12)).unwrap(), (vec![7, 9], 12));
-        assert_eq!(decode(&encode(&[], 0)).unwrap(), (Vec::new(), 0));
+        assert_eq!(
+            decode(&encode(&[7, 9], 12, 900)).unwrap(),
+            (vec![7, 9], 12, 900)
+        );
+        assert_eq!(decode(&encode(&[], 0, 0)).unwrap(), (Vec::new(), 0, 0));
+    }
+
+    /// The claim and the runs travel in one rename, so a reopen cannot see one without the other.
+    #[test]
+    fn the_applied_index_survives_a_reopen_and_never_goes_backwards() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut runs = RunSet::open(fs(), dir.path()).unwrap();
+            assert_eq!(runs.applied(), 0, "a fresh set claims nothing");
+            let number = runs.reserve();
+            touch(dir.path(), number);
+            runs.commit(number, 17).unwrap();
+            let second = runs.reserve();
+            touch(dir.path(), second);
+            // An older claim from a later seal leaves the higher one standing.
+            runs.commit(second, 4).unwrap();
+            assert_eq!(runs.applied(), 17);
+        }
+        assert_eq!(RunSet::open(fs(), dir.path()).unwrap().applied(), 17);
     }
 
     /// Every byte matters, and a manifest that cannot be read must never be guessed at: it is the
     /// only thing that says which runs are real.
     #[test]
     fn a_single_flipped_bit_anywhere_is_refused() {
-        let good = encode(&[3, 4], 5);
+        let good = encode(&[3, 4], 5, 6);
         for byte in 0..good.len() {
             for bit in 0..8 {
                 let mut bad = good.clone();
@@ -349,7 +506,7 @@ mod tests {
 
     #[test]
     fn a_newer_format_version_is_named_rather_than_guessed_at() {
-        let mut bytes = encode(&[1], 2);
+        let mut bytes = encode(&[1], 2, 3);
         bytes[8] = RUNS_FORMAT_VERSION + 1;
         let body = bytes.len() - 4;
         let crc = esker_base::crc32c::checksum(&bytes[..body]);
@@ -366,7 +523,7 @@ mod tests {
             let mut runs = RunSet::open(fs(), dir.path()).unwrap();
             let number = runs.reserve();
             touch(dir.path(), number);
-            runs.commit(number).unwrap();
+            runs.commit(number, 0).unwrap();
             number
         };
         let runs = RunSet::open(fs(), dir.path()).unwrap();
@@ -385,7 +542,7 @@ mod tests {
             let mut runs = RunSet::open(fs(), dir.path()).unwrap();
             let live = runs.reserve();
             touch(dir.path(), live);
-            runs.commit(live).unwrap();
+            runs.commit(live, 0).unwrap();
         }
         // The merge output that never made it into the manifest.
         touch(dir.path(), 99);
@@ -406,7 +563,7 @@ mod tests {
         // A committed run, so there is a manifest for the sweep to spare.
         let committed = runs.reserve();
         touch(dir.path(), committed);
-        runs.commit(committed).unwrap();
+        runs.commit(committed, 0).unwrap();
 
         let in_flight = runs.reserve();
         touch(dir.path(), in_flight);
@@ -427,7 +584,7 @@ mod tests {
         for _ in 0..3 {
             let number = runs.reserve();
             touch(dir.path(), number);
-            runs.commit(number).unwrap();
+            runs.commit(number, 0).unwrap();
             inputs.push(number);
         }
         let output = runs.reserve();
@@ -452,7 +609,7 @@ mod tests {
             let mut runs = RunSet::open(fs(), dir.path()).unwrap();
             let number = runs.reserve();
             touch(dir.path(), number);
-            runs.commit(number).unwrap();
+            runs.commit(number, 0).unwrap();
             number
         };
         let mut runs = RunSet::open(fs(), dir.path()).unwrap();

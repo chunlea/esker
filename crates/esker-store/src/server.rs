@@ -2495,6 +2495,7 @@ impl Store {
             Arc::new(ColumnarSlot::new(
                 Arc::clone(&self.fs),
                 self.data_dir.join("columnar").join(region_id.to_string()),
+                region_id,
                 ColumnarOptions::default(),
             ))
         }))

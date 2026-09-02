@@ -31,12 +31,28 @@
 //!
 //! A learner is placed on a region that already has data, and a crash can lose an unsealed
 //! memtable. Neither is visible from the runs themselves — a short run looks exactly like a
-//! complete one — so **opening a table's target rebuilds it** from the region's own committed
-//! state and then extends it from the log (the plan's "reuse then convert", applied at every open
-//! rather than only after a snapshot). A columnar copy is therefore complete by construction at
-//! every point a reader can observe it, at the cost of a walk per open. Making that incremental
-//! needs the manifest to carry the applied index its runs are complete to, which is the follow-up
-//! this note exists to name.
+//! complete one — so an open may never simply trust what it finds on disk.
+//!
+//! It no longer has to re-read the region to avoid that. The run manifest names the region apply
+//! index its runs are complete to ([`super::runs`],
+//! [ADR 0038](../../../../docs/adr/0038-a-run-manifest-names-the-index-its-runs-are-complete-to.md)),
+//! written in the same atomic rename that makes a run live, so an open **resumes**: it replays the
+//! Raft log from that index to the applied index and feeds what those entries committed, which is
+//! the same input the tee would have given it. The cost of an open stops being the region's size
+//! and becomes the log since the last seal.
+//!
+//! Three things make it safe, and each is the conservative choice:
+//!
+//! * the manifest may only ever **understate**. It moves on a seal, to the last *entry* whose
+//!   versions are all in a run — never to a buffered row, and never past a partly-fed entry;
+//! * the resume decision is made **at one engine snapshot**, and the applied index it trusts is
+//!   read at that same snapshot. Reading the index and the data at two instants is how a copy ends
+//!   up claiming an entry it never saw, because the apply path writes both while a fragment on
+//!   another thread is walking;
+//! * anything that does not add up — no manifest, a version-1 manifest, an index below the log's
+//!   truncation point, a log entry that will not decode — **falls back to the full walk, loudly**.
+//!   The walk is the behaviour that was always correct; the resume is an optimisation, and an
+//!   optimisation that is unsure of itself must give way to it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -45,7 +61,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use bytes::Bytes;
 use esker_columnar::Schema;
 use esker_engine::fs::FileSystem;
-use esker_engine::{Db, ReadOptions, cf};
+use esker_engine::{Db, ReadOptions, Snapshot, cf};
 use esker_keys::prefix::{self, TablePart};
 use esker_txn::{Kind, ReadOutcome, TxnSnapshot, WriteRecord};
 
@@ -65,8 +81,29 @@ pub struct ColumnarSlot {
     fs: Arc<dyn FileSystem>,
     /// `<data-dir>/columnar/<region-id>`, with one directory per table under it.
     dir: PathBuf,
+    /// The region whose log a resume replays. The directory names it too, and a slot that read it
+    /// back out of its own path would be one rename away from replaying another region's entries.
+    region_id: u64,
     options: ColumnarOptions,
     tables: Mutex<Tables>,
+}
+
+/// What the last open of one table's copy had to read.
+///
+/// Published because "did this open resume or re-walk the region" is the question the whole of
+/// [ADR 0038](../../../../docs/adr/0038-a-run-manifest-names-the-index-its-runs-are-complete-to.md)
+/// is about, and it is not answerable from the runs: a resumed copy and a rebuilt one are the same
+/// files. A test asserts on it and an operator would want it as a metric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Build {
+    /// The apply index the runs were complete to when the copy was opened; `0` for a full walk.
+    pub from_index: u64,
+    /// The apply index the copy is complete to now.
+    pub to_index: u64,
+    /// Versions fed into the copy by this open.
+    pub versions: usize,
+    /// Whether the open replayed the log from `from_index` instead of re-walking the region.
+    pub resumed: bool,
 }
 
 /// The per-table targets, and what has been looked for and not found.
@@ -92,6 +129,8 @@ struct Tables {
     /// newer fetch is a decode that refuses — `DecodeOutcome::SchemaBehind`, which is the loud
     /// half of `crate::columnar::decode`'s "a stale schema is lag, not corruption".
     fetched: BTreeMap<(u64, u64), (u8, esker_keys::columnar::Published)>,
+    /// What the last open of each table's copy had to read.
+    builds: BTreeMap<(u64, u64), Build>,
 }
 
 /// What a fragment needs to evaluate, taken under the lock and used outside it.
@@ -115,13 +154,25 @@ pub struct TableRuns {
 impl ColumnarSlot {
     /// A slot for one region. Opens nothing: a peer that is not a columnar learner never will.
     #[must_use]
-    pub fn new(fs: Arc<dyn FileSystem>, dir: impl AsRef<Path>, options: ColumnarOptions) -> Self {
+    pub fn new(
+        fs: Arc<dyn FileSystem>,
+        dir: impl AsRef<Path>,
+        region_id: u64,
+        options: ColumnarOptions,
+    ) -> Self {
         Self {
             fs,
             dir: dir.as_ref().to_path_buf(),
+            region_id,
             options,
             tables: Mutex::new(Tables::default()),
         }
+    }
+
+    /// What the last open of `(tenant, table_id)`'s copy read, if one has been opened here.
+    #[must_use]
+    pub fn last_build(&self, tenant: u64, table_id: u64) -> Option<Build> {
+        self.lock().builds.get(&(tenant, table_id)).copied()
     }
 
     fn lock(&self) -> MutexGuard<'_, Tables> {
@@ -133,7 +184,11 @@ impl ColumnarSlot {
     /// Called from the apply path **after** the batch is durable, so every version it reads is one
     /// this region has actually committed — the same records a row read would resolve, rather than
     /// a prediction made from the command.
-    pub fn commit(&self, db: &Db, commit_ts: u64, keys: &[Bytes]) -> Result<()> {
+    ///
+    /// `index` is the log index of the entry that committed them, and it is what a later reopen
+    /// resumes from: it is recorded once the entry's last key has been fed, never before, because
+    /// half an entry is not a point anything can resume at.
+    pub fn commit(&self, db: &Db, index: u64, commit_ts: u64, keys: &[Bytes]) -> Result<()> {
         let mut tables = self.lock();
 
         // A catalog write is the only thing that can add a columnar record or move a schema
@@ -146,6 +201,9 @@ impl ColumnarSlot {
         // A table whose target was built by this very call has already been converted from the
         // engine, which now includes this batch — feeding these keys again would double them.
         let mut converted: BTreeSet<(u64, u64)> = BTreeSet::new();
+        // Every table this entry touched, so the index is recorded on each of them once the whole
+        // entry has been fed.
+        let mut touched: BTreeSet<(u64, u64)> = BTreeSet::new();
         for key in keys {
             let Some((tenant, table_id)) = row_of(key)? else {
                 continue;
@@ -154,6 +212,7 @@ impl ColumnarSlot {
             if built {
                 converted.insert((tenant, table_id));
             }
+            touched.insert((tenant, table_id));
             if converted.contains(&(tenant, table_id)) {
                 continue;
             }
@@ -178,6 +237,15 @@ impl ColumnarSlot {
                 }
                 Committed::Tombstone => apply.apply(&versioned(key, commit_ts), None)?,
                 Committed::Nothing => {}
+            }
+        }
+
+        // The entry is fed. **Now** its index may be claimed — and only for the tables it reached,
+        // because a table this entry did not touch is complete to whatever its own last entry was
+        // and saying otherwise would let a resume skip an entry that did touch it.
+        for table in touched {
+            if let Some(apply) = tables.open.get_mut(&table) {
+                apply.entry_applied(index)?;
             }
         }
         Ok(())
@@ -342,9 +410,157 @@ impl ColumnarSlot {
         }
 
         let dir = self.dir.join(format!("{tenant}-{table_id}"));
-        // The rebuild, and the whole of it: dropping the manifest makes every run an orphan, and
-        // `RunSet::open` sweeps orphans. See this module's header for why a partial copy is not
-        // something a reader could be allowed to see.
+        let decoder = Arc::new(decoder_of(&published)?);
+
+        // One snapshot for the whole decision. The apply path writes the state record and the data
+        // in one batch while a fragment on another thread may be in here, so an applied index read
+        // at a different instant from the data is an index this copy may not hold.
+        let pinned = db.snapshot();
+        let state = crate::raft_log::read_state(db, self.region_id, Some(pinned.clone()))?;
+
+        let build = match self.resume(
+            db,
+            &dir,
+            state.as_ref(),
+            &pinned,
+            &decoder,
+            tenant,
+            table_id,
+        ) {
+            Ok(Some(resumed)) => Some(resumed),
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(
+                    tenant,
+                    table_id,
+                    region_id = self.region_id,
+                    %error,
+                    "resuming a columnar copy from its manifest failed; re-walking the region"
+                );
+                None
+            }
+        };
+        let (apply, build) = match build {
+            Some(resumed) => resumed,
+            None => self.rebuild(db, &dir, state.as_ref(), &pinned, decoder, tenant, table_id)?,
+        };
+
+        tracing::info!(
+            tenant,
+            table_id,
+            versions = build.versions,
+            from_index = build.from_index,
+            to_index = build.to_index,
+            resumed = build.resumed,
+            replicas,
+            schema_version = published.schema_version,
+            dir = %dir.display(),
+            "opened a columnar copy of a table"
+        );
+        tables.builds.insert((tenant, table_id), build);
+        tables.open.insert((tenant, table_id), apply);
+        Ok(true)
+    }
+
+    /// Opens a copy by replaying the log from the index its manifest names, or `None` when the
+    /// manifest does not let it.
+    ///
+    /// The four refusals are the whole of the safety argument, and each answers `None` so the
+    /// caller re-walks: no manifest or a version-1 one (`applied` is `0`), no state record for
+    /// this region, an applied index below the log's truncation point — the entries that would be
+    /// replayed are gone — and a manifest claiming an index the region has not applied, which is a
+    /// manifest from somewhere else.
+    #[allow(clippy::too_many_arguments)]
+    fn resume(
+        &self,
+        db: &Db,
+        dir: &Path,
+        state: Option<&crate::raft_log::PersistedState>,
+        pinned: &Snapshot,
+        decoder: &Arc<TableDecoder>,
+        tenant: u64,
+        table_id: u64,
+    ) -> Result<Option<(ColumnarApply, Build)>> {
+        let from = super::runs::applied_index_of(self.fs.as_ref(), dir)?;
+        if from == 0 {
+            return Ok(None);
+        }
+        let Some(state) = state else {
+            tracing::warn!(
+                region_id = self.region_id,
+                from,
+                "a columnar copy names an apply index but this store has no log for its region"
+            );
+            return Ok(None);
+        };
+        if from < state.truncated_index {
+            tracing::warn!(
+                region_id = self.region_id,
+                tenant,
+                table_id,
+                from,
+                truncated_index = state.truncated_index,
+                "a columnar copy is older than its region's log; re-walking the region instead"
+            );
+            return Ok(None);
+        }
+        if from > state.applied_index {
+            tracing::warn!(
+                region_id = self.region_id,
+                tenant,
+                table_id,
+                from,
+                applied_index = state.applied_index,
+                "a columnar copy claims an apply index its region has not reached"
+            );
+            return Ok(None);
+        }
+
+        let mut apply = ColumnarApply::open(
+            Arc::clone(&self.fs),
+            dir,
+            Arc::clone(decoder) as Arc<dyn super::RowDecoder>,
+            self.options.clone(),
+        )?;
+        let versions = replay(
+            db,
+            pinned,
+            &mut apply,
+            self.region_id,
+            from,
+            state.applied_index,
+            tenant,
+            table_id,
+        )?;
+        apply.built_to(state.applied_index)?;
+        Ok(Some((
+            apply,
+            Build {
+                from_index: from,
+                to_index: state.applied_index,
+                versions,
+                resumed: true,
+            },
+        )))
+    }
+
+    /// Opens a copy by converting everything the region holds, which is what a resume falls back
+    /// to and what every open did before ADR 0038.
+    ///
+    /// Dropping the manifest first is the whole of it: it makes every run an orphan, and
+    /// `RunSet::open` sweeps orphans. See this module's header for why a partial copy is not
+    /// something a reader could be allowed to see.
+    #[allow(clippy::too_many_arguments)]
+    fn rebuild(
+        &self,
+        db: &Db,
+        dir: &Path,
+        state: Option<&crate::raft_log::PersistedState>,
+        pinned: &Snapshot,
+        decoder: Arc<TableDecoder>,
+        tenant: u64,
+        table_id: u64,
+    ) -> Result<(ColumnarApply, Build)> {
         let manifest = dir.join(super::runs::RUNS_MANIFEST);
         if self
             .fs
@@ -355,27 +571,91 @@ impl ColumnarSlot {
                 .delete(&manifest)
                 .map_err(|error| bootstrap(&format!("{}: {error}", manifest.display())))?;
         }
-        let decoder = decoder_of(&published)?;
         let mut apply = ColumnarApply::open(
             Arc::clone(&self.fs),
-            &dir,
-            Arc::new(decoder),
+            dir,
+            decoder as Arc<dyn super::RowDecoder>,
             self.options.clone(),
         )?;
-        let rows = convert(db, &mut apply, tenant, table_id)?;
-        apply.seal()?;
-        tracing::info!(
-            tenant,
-            table_id,
-            rows,
-            replicas,
-            schema_version = published.schema_version,
-            dir = %dir.display(),
-            "built a columnar copy of a table from the region's own committed state"
-        );
-        tables.open.insert((tenant, table_id), apply);
-        Ok(true)
+        let versions = convert(db, pinned, &mut apply, tenant, table_id)?;
+        // The walk read the region at `pinned`, and the state record says which entry that is —
+        // read at the same snapshot, so it can name neither more nor less than the walk covered.
+        let to = state.map_or(0, |state| state.applied_index);
+        apply.built_to(to)?;
+        Ok((
+            apply,
+            Build {
+                from_index: 0,
+                to_index: to,
+                versions,
+                resumed: false,
+            },
+        ))
     }
+}
+
+/// Feeds what the entries after `from`, up to and including `to`, committed for one table.
+///
+/// The same input the tee gets, taken from the same place: the entry names the keys and the commit
+/// timestamp, and the *version* is read back out of the `write` column family, so a resumed copy
+/// and a teed one are built from one source of truth.
+#[allow(clippy::too_many_arguments)]
+fn replay(
+    db: &Db,
+    pinned: &Snapshot,
+    apply: &mut ColumnarApply,
+    region_id: u64,
+    from: u64,
+    to: u64,
+    tenant: u64,
+    table_id: u64,
+) -> Result<usize> {
+    let snapshot = EngineSnapshot::at(db, pinned.clone());
+    let mut versions = 0;
+    for index in (from + 1)..=to {
+        let Some(entry) = crate::raft_log::read_entry(db, region_id, index, Some(pinned.clone()))?
+        else {
+            return Err(bootstrap(&format!(
+                "region {region_id} has no log entry {index}, which a resume from {from} needs"
+            )));
+        };
+        if entry.kind != esker_raft::EntryKind::Normal || entry.data.is_empty() {
+            continue;
+        }
+        let command = crate::Command::decode(&entry.data)
+            .map_err(|error| bootstrap(&format!("the entry at {index}: {error}")))?;
+        let Some((commit_ts, keys)) = crate::peer::commits_of(&command) else {
+            continue;
+        };
+        for key in &keys {
+            if row_of(key)? != Some((tenant, table_id)) {
+                continue;
+            }
+            let Some(version) = snapshot
+                .seek_write(key, commit_ts)
+                .map_err(|error| bootstrap(&format!("reading a committed version: {error}")))?
+            else {
+                continue;
+            };
+            // The entry proposed this commit; whether it took is what the `write` record says.
+            if version.commit_ts != commit_ts {
+                continue;
+            }
+            match committed_of(&snapshot, key, &version.record)? {
+                Committed::Row(value) => {
+                    apply.apply(&versioned(key, commit_ts), Some(&value))?;
+                    versions += 1;
+                }
+                Committed::Tombstone => {
+                    apply.apply(&versioned(key, commit_ts), None)?;
+                    versions += 1;
+                }
+                Committed::Nothing => {}
+            }
+        }
+        apply.entry_applied(index)?;
+    }
+    Ok(versions)
 }
 
 /// Re-reads every open table's published schema, installing one that has moved forward.
@@ -465,15 +745,27 @@ fn published_schema(
 /// Walks the `write` column family, which *is* the region's record of what it has committed —
 /// the same place a row read resolves from, so a disagreement between the two engines cannot come
 /// from disagreeing about what happened.
-fn convert(db: &Db, apply: &mut ColumnarApply, tenant: u64, table_id: u64) -> Result<usize> {
+fn convert(
+    db: &Db,
+    pinned: &Snapshot,
+    apply: &mut ColumnarApply,
+    tenant: u64,
+    table_id: u64,
+) -> Result<usize> {
     let (start, end) = esker_keys::row::table_row_range(tenant, table_id);
     let low = esker_txn::key::prefix(&start);
     let high = esker_txn::key::prefix(&end);
-    let snapshot = EngineSnapshot::new(db);
+    let snapshot = EngineSnapshot::at(db, pinned.clone());
     let mut rows = 0;
 
     let mut iter = db
-        .iter(cf::WRITE, &ReadOptions::default())
+        .iter(
+            cf::WRITE,
+            &ReadOptions {
+                snapshot: Some(pinned.clone()),
+                ..ReadOptions::default()
+            },
+        )
         .map_err(|error| bootstrap(&format!("walking the write column family: {error}")))?;
     iter.seek(&low);
     while iter.valid() && iter.key() < high.as_slice() {
