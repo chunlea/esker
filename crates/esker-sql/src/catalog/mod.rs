@@ -39,6 +39,7 @@
 //! anyway.
 
 pub mod def_functions;
+pub mod information_schema;
 pub mod pg_attribute;
 pub mod pg_catalog;
 pub mod pg_constraint;

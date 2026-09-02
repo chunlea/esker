@@ -81,6 +81,21 @@ pub enum CatalogView {
     /// Every constraint this tenant has: its primary keys, and PostgreSQL 19's `NOT NULL` rows
     /// ([`crate::catalog::pg_constraint`]).
     PgConstraint,
+    /// `information_schema.tables`: one row per table, and nothing else this tenant has.
+    ///
+    /// The five below are the SQL standard's view of the same records, and their names carry the
+    /// schema because a bare `tables` is `42P01` on a real server
+    /// ([`crate::catalog::information_schema`]).
+    InformationSchemaTables,
+    /// `information_schema.columns`.
+    InformationSchemaColumns,
+    /// `information_schema.table_constraints`, where a `NOT NULL` appears as a `CHECK`.
+    InformationSchemaTableConstraints,
+    /// `information_schema.key_column_usage`: a primary key's columns, **one row each** — the
+    /// answer `pg_index.indkey` cannot give without an array value.
+    InformationSchemaKeyColumnUsage,
+    /// `information_schema.referential_constraints`, which is empty: no foreign keys.
+    InformationSchemaReferentialConstraints,
     /// The collations this server has, which is none.
     ///
     /// Empty for the reason [`CatalogView::PgRange`] is: a collation is a feature this node does
@@ -94,7 +109,7 @@ pub enum CatalogView {
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 9] = [
+    pub const ALL: [CatalogView; 14] = [
         CatalogView::PgType,
         CatalogView::PgRange,
         CatalogView::PgClass,
@@ -104,6 +119,11 @@ impl CatalogView {
         CatalogView::PgIndex,
         CatalogView::PgConstraint,
         CatalogView::PgCollation,
+        CatalogView::InformationSchemaTables,
+        CatalogView::InformationSchemaColumns,
+        CatalogView::InformationSchemaTableConstraints,
+        CatalogView::InformationSchemaKeyColumnUsage,
+        CatalogView::InformationSchemaReferentialConstraints,
     ];
 
     /// The name a query spells it.
@@ -119,6 +139,15 @@ impl CatalogView {
             CatalogView::PgIndex => "pg_index",
             CatalogView::PgConstraint => "pg_constraint",
             CatalogView::PgCollation => "pg_collation",
+            CatalogView::InformationSchemaTables => "information_schema.tables",
+            CatalogView::InformationSchemaColumns => "information_schema.columns",
+            CatalogView::InformationSchemaTableConstraints => {
+                "information_schema.table_constraints"
+            }
+            CatalogView::InformationSchemaKeyColumnUsage => "information_schema.key_column_usage",
+            CatalogView::InformationSchemaReferentialConstraints => {
+                "information_schema.referential_constraints"
+            }
         }
     }
 
@@ -136,6 +165,11 @@ impl CatalogView {
                 CatalogView::PgIndex => 6,
                 CatalogView::PgConstraint => 7,
                 CatalogView::PgCollation => 8,
+                CatalogView::InformationSchemaTables => 9,
+                CatalogView::InformationSchemaColumns => 10,
+                CatalogView::InformationSchemaTableConstraints => 11,
+                CatalogView::InformationSchemaKeyColumnUsage => 12,
+                CatalogView::InformationSchemaReferentialConstraints => 13,
             }
     }
 
@@ -192,6 +226,17 @@ impl CatalogView {
             CatalogView::PgCollation => {
                 &[("oid", ColumnType::Int8), ("collname", ColumnType::Text)]
             }
+            CatalogView::InformationSchemaTables => super::information_schema::TABLES_COLUMNS,
+            CatalogView::InformationSchemaColumns => super::information_schema::COLUMNS_COLUMNS,
+            CatalogView::InformationSchemaTableConstraints => {
+                super::information_schema::TABLE_CONSTRAINTS_COLUMNS
+            }
+            CatalogView::InformationSchemaKeyColumnUsage => {
+                super::information_schema::KEY_COLUMN_USAGE_COLUMNS
+            }
+            CatalogView::InformationSchemaReferentialConstraints => {
+                super::information_schema::REFERENTIAL_CONSTRAINTS_COLUMNS
+            }
         }
     }
 
@@ -214,6 +259,16 @@ impl CatalogView {
             CatalogView::PgAttrdef => super::pg_attribute::default_rows(txn, tenant),
             CatalogView::PgIndex => super::pg_index::rows(txn, tenant),
             CatalogView::PgConstraint => super::pg_constraint::rows(txn, tenant),
+            CatalogView::InformationSchemaTables => super::information_schema::tables(txn, tenant),
+            CatalogView::InformationSchemaColumns => {
+                super::information_schema::columns(txn, tenant)
+            }
+            CatalogView::InformationSchemaTableConstraints => {
+                super::information_schema::table_constraints(txn, tenant)
+            }
+            CatalogView::InformationSchemaKeyColumnUsage => {
+                super::information_schema::key_column_usage(txn, tenant)
+            }
             CatalogView::PgNamespace => Ok(vec![vec![
                 Datum::Int8(PUBLIC_NAMESPACE_OID),
                 Datum::Text(PUBLIC_SCHEMA.to_owned()),
@@ -263,7 +318,14 @@ impl CatalogView {
             | CatalogView::PgAttribute
             | CatalogView::PgAttrdef
             | CatalogView::PgIndex
-            | CatalogView::PgConstraint => Vec::new(),
+            | CatalogView::PgConstraint
+            | CatalogView::InformationSchemaTables
+            | CatalogView::InformationSchemaColumns
+            | CatalogView::InformationSchemaTableConstraints
+            | CatalogView::InformationSchemaKeyColumnUsage
+            // Empty, and a correct answer: this node has no foreign keys, so there is nothing
+            // referential to constrain.
+            | CatalogView::InformationSchemaReferentialConstraints => Vec::new(),
         }
     }
 
@@ -383,7 +445,7 @@ fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
 
 /// `pg_type.typname`: the internal name, which is not the one this node complains with — a column
 /// is declared `int8` and named `bigint` in an error. Measured against 19beta1, all six.
-fn typname(ty: ColumnType) -> &'static str {
+pub(super) fn typname(ty: ColumnType) -> &'static str {
     match ty {
         ColumnType::Int8 => "int8",
         ColumnType::Int4 => "int4",

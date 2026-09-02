@@ -146,6 +146,15 @@ fn every_catalog_view_is_read_only() {
     let mut node = parity::Node::new(&[]);
     for view in esker_sql::catalog::pg_catalog::CatalogView::ALL {
         let name = view.name();
+        // The `information_schema` views carry their schema in their name, and a real server
+        // refuses a write to one as a **view** rather than as a permission — `42809 "tables" is
+        // not a table`, measured, because `information_schema` really is built out of views where
+        // `pg_catalog` is built out of tables. Here the DDL path refuses a schema-qualified name
+        // before it reaches this guard at all, which is a `0A000` naming the qualified name.
+        // Declared in `tests/pg_catalog_information.rs`; this loop is about the other rule.
+        if name.contains('.') {
+            continue;
+        }
         for statement in [
             format!("DROP TABLE {name}"),
             format!("ALTER TABLE {name} ADD COLUMN a bigint"),

@@ -1,0 +1,314 @@
+//! `information_schema`: the SQL standard's view of the same records `pg_catalog` describes.
+//!
+//! Five relations, computed from one snapshot like everything else in this phase. Two of them
+//! answer a question this node cannot answer through `pg_catalog` at all: `key_column_usage` gives
+//! a primary key's columns **one row each**, where `pg_index.indkey` gives them as an
+//! `int2vector` that needs `= ANY` over an array value to read — so a client that wants a table's
+//! key can have it here today.
+//!
+//! # Two names, and the schema is part of them
+//!
+//! A bare `tables` is not a relation on a real server and must stay `42P01` here, so these views
+//! are named `information_schema.tables` and the qualifier is part of the name rather than
+//! something stripped before lookup. `pg_catalog.pg_class` is the mirror case: there the qualifier
+//! *is* stripped, because `pg_class` is a relation on its own. Both are measured, and
+//! `parse::lower` learns exactly these two schemas — `public.t` stays refused by name.
+//!
+//! # What the capture settled
+//!
+//! * **Only tables are in it.** An index, a sequence and a primary key are all in `pg_class` and
+//!   none of them is in `information_schema.tables` or `.columns` — measured, `count(*)` is 0 for
+//!   each of the three.
+//! * **A `NOT NULL` is reported as a `CHECK`.** `table_constraints` reads `pg_constraint`, and
+//!   PostgreSQL 19's `contype` `n` rows come out with `constraint_type` `CHECK`. So a five-column
+//!   table with two `NOT NULL`s and a key has **three** rows here, two of them `CHECK`.
+//! * **`is_nullable` is `YES`/`NO` and `is_identity` is `YES`/`NO`** — the standard's `yes_or_no`
+//!   domain, not a boolean. A client reading them as booleans reads every column as true.
+//! * **An integer's `numeric_scale` is 0 and a float's is NULL.** The one asymmetry in the type
+//!   table below, and the one a reader would get wrong.
+//! * **`datetime_precision` is 6 for a `timestamp` with no declared precision**, not NULL — the
+//!   number of digits it actually stores — while `character_maximum_length` for a `varchar` with
+//!   no length *is* NULL. Two "no modifier" cases, two different answers.
+//! * **`referential_constraints` is empty**, which is a correct answer: this node has no foreign
+//!   keys, so there is nothing referential to constrain.
+
+use crate::backend::Txn;
+use crate::catalog::pg_relations::{RelKind, Relations};
+use crate::catalog::{ColumnDef, Identity};
+use crate::error::Result;
+use crate::value::{self, ColumnType, Datum};
+
+/// The one schema every relation is in.
+const PUBLIC_SCHEMA: &str = "public";
+
+/// The standard's `yes_or_no` domain, which is two strings and not a boolean.
+const YES: &str = "YES";
+/// The other one.
+const NO: &str = "NO";
+
+/// Every `information_schema.tables` row: one per **table**, and nothing else.
+pub fn tables(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+    let relations = Relations::read(txn, tenant)?;
+    Ok(relations
+        .of_kind(RelKind::Table)
+        .map(|relation| {
+            vec![
+                Datum::Text(PUBLIC_SCHEMA.to_owned()),
+                Datum::Text(relation.name.clone()),
+                // `BASE TABLE` for every one of them: a view, a materialised view, a partitioned
+                // table and a foreign table are the other four values and this node has none.
+                Datum::Text("BASE TABLE".to_owned()),
+            ]
+        })
+        .collect())
+}
+
+/// Every `information_schema.columns` row: one per column of a table, in declaration order.
+pub fn columns(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+    let relations = Relations::read(txn, tenant)?;
+    let mut rows = Vec::new();
+    for relation in relations.of_kind(RelKind::Table) {
+        let Some(table) = relations.table(relation) else {
+            continue;
+        };
+        for (position, (at, column)) in table.user_columns().enumerate() {
+            let sequence = super::pg_relations::sequence_for(table, at);
+            let identity = sequence.map(|sequence| sequence.identity);
+            rows.push(vec![
+                Datum::Text(PUBLIC_SCHEMA.to_owned()),
+                Datum::Text(table.name.clone()),
+                Datum::Text(column.name.clone()),
+                Datum::Int4(i32::try_from(position + 1).unwrap_or(i32::MAX)),
+                match super::pg_attribute::default_expression(column, table, at) {
+                    Some(expression) => Datum::Text(expression),
+                    None => Datum::Null,
+                },
+                Datum::Text(if column.not_null { NO } else { YES }.to_owned()),
+                // The **spelling**, which is `format_type` with no modifier — `character` and not
+                // `bpchar`, and `timestamp without time zone` in full.
+                Datum::Text(data_type(column.ty)),
+                length_of(column),
+                numeric_precision(column.ty),
+                numeric_scale(column.ty),
+                datetime_precision(column),
+                // The type's internal name, which is `pg_type.typname`.
+                Datum::Text(super::pg_catalog::typname(column.ty).to_owned()),
+                Datum::Text(
+                    match identity {
+                        // `bigserial` is a default, not an identity — measured, `is_identity` is
+                        // `NO` for it and its `column_default` is the `nextval`.
+                        None | Some(Identity::Default) => NO,
+                        Some(_) => YES,
+                    }
+                    .to_owned(),
+                ),
+                match identity {
+                    Some(Identity::ByDefault) => Datum::Text("BY DEFAULT".to_owned()),
+                    Some(Identity::Always) => Datum::Text("ALWAYS".to_owned()),
+                    None | Some(Identity::Default) => Datum::Null,
+                },
+                // `NEVER` for every column, including an identity one: `is_generated` is about a
+                // `GENERATED … AS (expr)` column and an identity is not one. Measured — an
+                // identity column is `is_identity YES` and `is_generated NEVER` at once.
+                Datum::Text("NEVER".to_owned()),
+            ]);
+        }
+    }
+    Ok(rows)
+}
+
+/// Every `information_schema.table_constraints` row, out of `pg_constraint`.
+pub fn table_constraints(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+    // One snapshot for the constraint rows *and* for the table each names, rather than one read
+    // per row: this is a view over a view, and the catalog underneath is read once.
+    let relations = Relations::read(txn, tenant)?;
+    let mut rows = Vec::new();
+    for row in super::pg_constraint::rows_from(&relations) {
+        let (Some(Datum::Text(name)), Some(Datum::Text(contype))) = (row.get(1), row.get(3)) else {
+            continue;
+        };
+        let Some(Datum::Int8(conrelid)) = row.get(7) else {
+            continue;
+        };
+        let Some(table) = relations.by_oid(*conrelid) else {
+            continue;
+        };
+        rows.push(vec![
+            Datum::Text(PUBLIC_SCHEMA.to_owned()),
+            Datum::Text(name.clone()),
+            Datum::Text(PUBLIC_SCHEMA.to_owned()),
+            Datum::Text(table.name.clone()),
+            Datum::Text(constraint_type(contype).to_owned()),
+            // Nothing here is deferrable, and `initially_deferred` follows it.
+            Datum::Text(NO.to_owned()),
+            Datum::Text(NO.to_owned()),
+        ]);
+    }
+    Ok(rows)
+}
+
+/// Every `information_schema.key_column_usage` row: a primary key's columns, one each.
+///
+/// The answer `pg_index` cannot give without an array. `position_in_unique_constraint` is NULL for
+/// a primary key and a unique constraint alike — it is the position in the *referenced* key of a
+/// foreign key, and there are none.
+pub fn key_column_usage(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+    let relations = Relations::read(txn, tenant)?;
+    let mut rows = Vec::new();
+    for relation in relations.of_kind(RelKind::Table) {
+        let Some(table) = relations.table(relation) else {
+            continue;
+        };
+        if table.primary_key_name.is_empty() {
+            continue;
+        }
+        for (position, at) in table.primary_key.iter().enumerate() {
+            let Some(column) = table.columns.get(*at) else {
+                continue;
+            };
+            rows.push(vec![
+                Datum::Text(PUBLIC_SCHEMA.to_owned()),
+                Datum::Text(table.primary_key_name.clone()),
+                Datum::Text(PUBLIC_SCHEMA.to_owned()),
+                Datum::Text(table.name.clone()),
+                Datum::Text(column.name.clone()),
+                Datum::Int4(i32::try_from(position + 1).unwrap_or(i32::MAX)),
+                Datum::Null,
+            ]);
+        }
+    }
+    Ok(rows)
+}
+
+/// `pg_constraint.contype` as the standard spells it.
+///
+/// **A `NOT NULL` is a `CHECK`**, measured on 19beta1 — the `n` rows that major added come out of
+/// `table_constraints` under the standard's older name for the same thing.
+fn constraint_type(contype: &str) -> &'static str {
+    match contype {
+        "p" => "PRIMARY KEY",
+        "u" => "UNIQUE",
+        "f" => "FOREIGN KEY",
+        _ => "CHECK",
+    }
+}
+
+/// `data_type`: the type's name with no modifier on it.
+///
+/// `character`, not `bpchar` — the one type whose bare spelling differs from what
+/// `format_type(oid, -1)` gives, and the distinction `crate::catalog::def_functions` calls
+/// `typemod_given`.
+fn data_type(ty: ColumnType) -> String {
+    match ty {
+        ColumnType::Bpchar => "character".to_owned(),
+        other => value::format_type(other, value::NO_TYPMOD),
+    }
+}
+
+/// `character_maximum_length`: the declared length of a string type, or NULL.
+fn length_of(column: &ColumnDef) -> Datum {
+    match column.length() {
+        Some(length) => Datum::Int4(i32::try_from(length).unwrap_or(i32::MAX)),
+        None => Datum::Null,
+    }
+}
+
+/// `numeric_precision`: how many bits or digits the type holds, for the types that are numbers.
+fn numeric_precision(ty: ColumnType) -> Datum {
+    match ty {
+        ColumnType::Int8 => Datum::Int4(64),
+        ColumnType::Int4 => Datum::Int4(32),
+        ColumnType::Int2 => Datum::Int4(16),
+        ColumnType::Double => Datum::Int4(53),
+        ColumnType::Real => Datum::Int4(24),
+        _ => Datum::Null,
+    }
+}
+
+/// `numeric_scale`: **0 for an integer and NULL for a float**, which is the asymmetry.
+///
+/// An integer has a scale and it is zero; a float has none at all, because a binary float's scale
+/// is not a property it has. Measured, and a reader would give both the same answer.
+fn numeric_scale(ty: ColumnType) -> Datum {
+    match ty {
+        ColumnType::Int8 | ColumnType::Int4 | ColumnType::Int2 => Datum::Int4(0),
+        _ => Datum::Null,
+    }
+}
+
+/// `datetime_precision`: the declared precision of a timestamp, or **6** for one with none.
+///
+/// Not NULL, unlike `character_maximum_length` for an unqualified `varchar`: six is the number of
+/// fractional digits a `timestamp` stores, so a column with no modifier still has a precision.
+fn datetime_precision(column: &ColumnDef) -> Datum {
+    match column.ty {
+        ColumnType::Timestamp | ColumnType::TimestampTz => {
+            Datum::Int4(i32::try_from(column.precision().unwrap_or(6)).unwrap_or(6))
+        }
+        _ => Datum::Null,
+    }
+}
+
+/// The columns of `information_schema.tables`, in the standard's order.
+///
+/// **No `table_catalog`.** A real server reports the database it is connected to, and this node has
+/// no database concept at all — no `current_database()`, and the startup parameter never reaches
+/// the executor — so there is no name to report and a constant would be a value nobody measured.
+/// `42703`, the same answer `pg_range` gives for `oid`.
+pub const TABLES_COLUMNS: &[(&str, ColumnType)] = &[
+    ("table_schema", ColumnType::Text),
+    ("table_name", ColumnType::Text),
+    ("table_type", ColumnType::Text),
+];
+
+/// The columns of `information_schema.columns`, in the standard's order.
+pub const COLUMNS_COLUMNS: &[(&str, ColumnType)] = &[
+    ("table_schema", ColumnType::Text),
+    ("table_name", ColumnType::Text),
+    ("column_name", ColumnType::Text),
+    ("ordinal_position", ColumnType::Int4),
+    ("column_default", ColumnType::Text),
+    ("is_nullable", ColumnType::Text),
+    ("data_type", ColumnType::Text),
+    ("character_maximum_length", ColumnType::Int4),
+    ("numeric_precision", ColumnType::Int4),
+    ("numeric_scale", ColumnType::Int4),
+    ("datetime_precision", ColumnType::Int4),
+    ("udt_name", ColumnType::Text),
+    ("is_identity", ColumnType::Text),
+    ("identity_generation", ColumnType::Text),
+    ("is_generated", ColumnType::Text),
+];
+
+/// The columns of `information_schema.table_constraints`, in the standard's order.
+pub const TABLE_CONSTRAINTS_COLUMNS: &[(&str, ColumnType)] = &[
+    ("constraint_schema", ColumnType::Text),
+    ("constraint_name", ColumnType::Text),
+    ("table_schema", ColumnType::Text),
+    ("table_name", ColumnType::Text),
+    ("constraint_type", ColumnType::Text),
+    ("is_deferrable", ColumnType::Text),
+    ("initially_deferred", ColumnType::Text),
+];
+
+/// The columns of `information_schema.key_column_usage`, in the standard's order.
+pub const KEY_COLUMN_USAGE_COLUMNS: &[(&str, ColumnType)] = &[
+    ("constraint_schema", ColumnType::Text),
+    ("constraint_name", ColumnType::Text),
+    ("table_schema", ColumnType::Text),
+    ("table_name", ColumnType::Text),
+    ("column_name", ColumnType::Text),
+    ("ordinal_position", ColumnType::Int4),
+    ("position_in_unique_constraint", ColumnType::Int4),
+];
+
+/// The columns of `information_schema.referential_constraints`, which has no rows.
+pub const REFERENTIAL_CONSTRAINTS_COLUMNS: &[(&str, ColumnType)] = &[
+    ("constraint_schema", ColumnType::Text),
+    ("constraint_name", ColumnType::Text),
+    ("unique_constraint_schema", ColumnType::Text),
+    ("unique_constraint_name", ColumnType::Text),
+    ("match_option", ColumnType::Text),
+    ("update_rule", ColumnType::Text),
+    ("delete_rule", ColumnType::Text),
+];

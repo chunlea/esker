@@ -78,7 +78,10 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
             refuse_if(*restrict, "DROP ... RESTRICT")?;
             refuse_if(*purge, "DROP ... PURGE")?;
             refuse_if(*temporary, "DROP TEMPORARY")?;
-            let names = names.iter().map(object_name).collect::<Result<Vec<_>>>()?;
+            let names = names
+                .iter()
+                .map(relation_name)
+                .collect::<Result<Vec<_>>>()?;
             Ok(match object_type {
                 ObjectType::Table => plan::Statement::DropTable(plan::DropTable {
                     names,
@@ -746,7 +749,7 @@ fn refuse_create_table_clauses(create: &sqlparser::ast::CreateTable) -> Result<(
 fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::CreateTable> {
     refuse_create_table_clauses(create)?;
 
-    let name = object_name(&create.name)?;
+    let name = relation_name(&create.name)?;
     let mut columns = Vec::with_capacity(create.columns.len());
     let mut primary_key = Vec::new();
     let mut primary_key_name = None;
@@ -937,7 +940,7 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
     }
 
     Ok(plan::AlterTable {
-        name: object_name(&alter.name)?,
+        name: relation_name(&alter.name)?,
         if_exists: alter.if_exists,
         actions,
     })
@@ -999,7 +1002,7 @@ fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<plan::Crea
     }
     Ok(plan::CreateIndex {
         name: create.name.as_ref().map(object_name).transpose()?,
-        table: object_name(&create.table_name)?,
+        table: relation_name(&create.table_name)?,
         columns: index_columns(&create.columns)?,
         unique: create.unique,
         if_not_exists: create.if_not_exists,
@@ -1034,7 +1037,7 @@ fn lower_insert(insert: &sqlparser::ast::Insert) -> Result<plan::Insert> {
     refuse_if(!insert.optimizer_hints.is_empty(), "an optimizer hint")?;
 
     let table = match &insert.table {
-        TableObject::TableName(name) => object_name(name)?,
+        TableObject::TableName(name) => relation_name(name)?,
         other => return Err(SqlError::unsupported(format!("INSERT INTO {other}"))),
     };
     let columns = if insert.columns.is_empty() {
@@ -2468,7 +2471,7 @@ fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
                 }
             };
             Ok(plan::TableRef {
-                name: object_name(name)?,
+                name: relation_name(name)?,
                 alias,
                 derived: None,
                 hidden_cte: false,
@@ -2799,6 +2802,49 @@ fn index_columns(columns: &[IndexColumn]) -> Result<Vec<String>> {
             }
         })
         .collect()
+}
+
+/// A relation **anywhere a relation is named** — a `FROM` clause, a `DROP`, an `INSERT INTO`, a
+/// `CREATE INDEX ... ON` — which is where a schema may be written.
+///
+/// Two schemas and no others, and they behave differently on purpose:
+///
+/// * **`pg_catalog.x` is `x`.** `pg_class` is a relation on its own here, and `pg_catalog` is the
+///   schema it is in, so the qualifier names the thing that is already there. Measured:
+///   `SELECT relname FROM pg_catalog.pg_class` and `FROM pg_class` are the same query on a real
+///   server, and `ActiveRecord` writes the qualified form in three of its boot statements.
+/// * **`information_schema.tables` keeps its qualifier**, because a bare `tables` is **not** a
+///   relation on a real server — `42P01` — and answering it here would invent one. So the schema
+///   is part of the view's name (`crate::catalog::information_schema`).
+///
+/// Everything else stays refused by name. `public.t` is the interesting one: a real server takes
+/// it, this node has one schema, and answering it would be right *when the qualifier is `public`*
+/// and a wrong answer when it is not — so it waits for a unit that has schemas rather than being
+/// guessed at here.
+///
+/// **This is what a write reaches too**, and it has to be: `DROP TABLE pg_catalog.pg_class` is
+/// `42501 permission denied` on a real server, and a lowering that refused the *qualifier* first
+/// would answer `0A000` and skip the guard that stops a client dropping a catalog relation
+/// (`crate::catalog::pg_catalog::refuse_write`). Measured, and `CREATE TABLE pg_catalog.pg_type`
+/// is `42P07` there for the same reason.
+fn relation_name(name: &ObjectName) -> Result<String> {
+    let parts: Option<Vec<&str>> = name
+        .0
+        .iter()
+        .map(|part| part.as_ident().map(|ident| ident.value.as_str()))
+        .collect();
+    if let Some([schema, relation]) = parts.as_deref() {
+        if schema.eq_ignore_ascii_case("pg_catalog") {
+            return Ok(fold_identifier(relation, false).0);
+        }
+        if schema.eq_ignore_ascii_case("information_schema") {
+            return Ok(format!(
+                "information_schema.{}",
+                fold_identifier(relation, false).0
+            ));
+        }
+    }
+    object_name(name)
 }
 
 /// A name, folded and truncated the way PostgreSQL stores it. Schema qualification is refused

@@ -71,13 +71,19 @@ const PUBLIC_NAMESPACE_OID: i64 = 11;
 
 /// Every `pg_constraint` row this tenant has.
 pub fn rows(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
-    let relations = Relations::read(txn, tenant)?;
+    Ok(rows_from(&Relations::read(txn, tenant)?))
+}
+
+/// The same, over a snapshot somebody else has already read — which is how
+/// `information_schema.table_constraints` gets these rows without a second scan of the catalog.
+#[must_use]
+pub fn rows_from(relations: &Relations) -> Vec<Vec<Datum>> {
     let mut rows = Vec::new();
     for relation in relations.of_kind(RelKind::Table) {
         let Some(table) = relations.table(relation) else {
             continue;
         };
-        for constraint in constraints_of(&relations, table, relation.oid) {
+        for constraint in constraints_of(relations, table, relation.oid) {
             rows.push(vec![
                 Datum::Int8(constraint.oid),
                 Datum::Text(constraint.name),
@@ -99,7 +105,7 @@ pub fn rows(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
             ]);
         }
     }
-    Ok(rows)
+    rows
 }
 
 /// `pg_get_constraintdef(oid [, pretty])`.

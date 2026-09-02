@@ -1,0 +1,83 @@
+# `information_schema`, as a real PostgreSQL 19beta1 answers it -- phase 13 unit 4.
+#
+# The SQL standard's view of the same records `pg_catalog` describes. Five relations, and two of
+# them answer a question `pg_catalog` cannot answer on this node at all: `key_column_usage` gives a
+# primary key's columns **one row each**, where `pg_index.indkey` gives them as an `int2vector`
+# that needs `= ANY` over an array value to read.
+#
+# Captured in one session with `scratchpad/sesscap.py` inside one `BEGIN ... ROLLBACK`, and
+# replayed the same way against one node. The corpus builds its own tables.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **Only tables are in it.** An index, a sequence and a primary key are all in `pg_class` and
+#     none of them is in `information_schema.tables` or `.columns` -- `count(*)` is 0 for each of
+#     the three, measured one at a time.
+#   * **A `NOT NULL` is reported as a `CHECK`.** `table_constraints` reads `pg_constraint`, and
+#     PostgreSQL 19's `contype` `n` rows come out with `constraint_type` **CHECK** -- so
+#     `sb (id int8 PRIMARY KEY, x int4 NOT NULL, ...)` has three rows here, two of them CHECK, and
+#     a `constraint_type = 'CHECK'` filter returns two constraints on a table with no `CHECK` in
+#     its DDL.
+#   * **`is_nullable` and `is_identity` are `YES`/`NO`**, the standard's `yes_or_no` domain, and
+#     not booleans. A client reading them as booleans reads every column as true.
+#   * **An integer's `numeric_scale` is 0 and a float's is NULL.** `bigint` is 64/0, `integer` is
+#     32/0, `smallint` is 16/0, `double precision` is 53/NULL and `real` is 24/NULL.
+#   * **`datetime_precision` is 6 for a `timestamp` with no declared precision**, not NULL -- the
+#     number of fractional digits it stores -- while `character_maximum_length` for a `varchar`
+#     with no length *is* NULL. Two "no modifier" cases, two different answers.
+#   * **`udt_name` is the internal name and `data_type` is the spelled one**: `varchar` against
+#     `character varying`, `bpchar` against `character`, `timestamptz` against
+#     `timestamp with time zone`.
+#   * **A `bigserial` column is `is_identity NO`** with the `nextval` in `column_default`, where a
+#     `GENERATED ... AS IDENTITY` column is `is_identity YES` with `column_default` NULL. Both are
+#     `is_generated NEVER` -- that column is about `GENERATED ... AS (expr)` and neither is one.
+#   * **`referential_constraints` is empty here even on a real server** for a schema with no
+#     foreign keys, which is why an empty answer is a correct one rather than a gap.
+#   * **A write to `information_schema` is refused as a *view*, not as a permission.** `DROP TABLE
+#     information_schema.tables` is `42809 "tables" is not a table` with
+#     `HINT: Use DROP VIEW to remove a view.`, where `DROP TABLE pg_catalog.pg_class` is
+#     `42501 permission denied`. Two neighbouring schemas, two refusals -- because
+#     `information_schema` really is built out of views and `pg_catalog` out of tables. And a bare
+#     `DROP TABLE tables` is `42P01`, which is the same answer as reading one.
+DROP TABLE IF EXISTS sa		-
+DROP TABLE IF EXISTS sb		-
+DROP TABLE IF EXISTS sc		-
+CREATE TABLE sa (id bigserial PRIMARY KEY, a int8, b int4, c int2, d text, e varchar(5), f varchar, g character(3), h json, i jsonb, j bool, k bytea, l timestamptz, m timestamp(3), n float8, o float4)		-
+CREATE TABLE sb (id int8 PRIMARY KEY, x int4 NOT NULL, y text DEFAULT 'hi', z int8 DEFAULT 7, w timestamp)		-
+CREATE TABLE sc (k1 int8, k2 text, v int4, PRIMARY KEY (k1, k2))		-
+CREATE UNIQUE INDEX sb_x_idx ON sb (x)		-
+SELECT table_name, table_type, table_schema, table_catalog FROM information_schema.tables WHERE table_name IN ('sa','sb','sc') ORDER BY table_name	name,character varying,name,name	sa|BASE TABLE|public|esker ; sb|BASE TABLE|public|esker ; sc|BASE TABLE|public|esker
+SELECT count(*) FROM information_schema.tables WHERE table_name = 'sb_x_idx'	bigint	0
+SELECT count(*) FROM information_schema.tables WHERE table_name = 'sa_id_seq'	bigint	0
+SELECT count(*) FROM information_schema.tables WHERE table_name = 'sb_pkey'	bigint	0
+SELECT column_name, ordinal_position, is_nullable, data_type FROM information_schema.columns WHERE table_name = 'sa' ORDER BY ordinal_position	name,integer,character varying(3),character varying	id|1|NO|bigint ; a|2|YES|bigint ; b|3|YES|integer ; c|4|YES|smallint ; d|5|YES|text ; e|6|YES|character varying ; f|7|YES|character varying ; g|8|YES|character ; h|9|YES|json ; i|10|YES|jsonb ; j|11|YES|boolean ; k|12|YES|bytea ; l|13|YES|timestamp with time zone ; m|14|YES|timestamp without time zone ; n|15|YES|double precision ; o|16|YES|real
+SELECT column_name, character_maximum_length, numeric_precision, numeric_scale, datetime_precision FROM information_schema.columns WHERE table_name = 'sa' ORDER BY ordinal_position	name,integer,integer,integer,integer	id|\N|64|0|\N ; a|\N|64|0|\N ; b|\N|32|0|\N ; c|\N|16|0|\N ; d|\N|\N|\N|\N ; e|5|\N|\N|\N ; f|\N|\N|\N|\N ; g|3|\N|\N|\N ; h|\N|\N|\N|\N ; i|\N|\N|\N|\N ; j|\N|\N|\N|\N ; k|\N|\N|\N|\N ; l|\N|\N|\N|6 ; m|\N|\N|\N|3 ; n|\N|53|\N|\N ; o|\N|24|\N|\N
+SELECT column_name, udt_name, column_default FROM information_schema.columns WHERE table_name = 'sa' ORDER BY ordinal_position	name,name,character varying	id|int8|nextval('sa_id_seq'::regclass) ; a|int8|\N ; b|int4|\N ; c|int2|\N ; d|text|\N ; e|varchar|\N ; f|varchar|\N ; g|bpchar|\N ; h|json|\N ; i|jsonb|\N ; j|bool|\N ; k|bytea|\N ; l|timestamptz|\N ; m|timestamp|\N ; n|float8|\N ; o|float4|\N
+SELECT column_name, ordinal_position, is_nullable, data_type, column_default FROM information_schema.columns WHERE table_name = 'sb' ORDER BY ordinal_position	name,integer,character varying(3),character varying,character varying	id|1|NO|bigint|\N ; x|2|NO|integer|\N ; y|3|YES|text|'hi'::text ; z|4|YES|bigint|7 ; w|5|YES|timestamp without time zone|\N
+SELECT column_name, is_identity, identity_generation, is_generated FROM information_schema.columns WHERE table_name = 'sb' ORDER BY ordinal_position	name,character varying(3),character varying,character varying	id|NO|\N|NEVER ; x|NO|\N|NEVER ; y|NO|\N|NEVER ; z|NO|\N|NEVER ; w|NO|\N|NEVER
+SELECT count(*) FROM information_schema.columns WHERE table_name = 'sb_x_idx'	bigint	0
+SELECT count(*) FROM information_schema.columns WHERE table_name = 'nosuchtable'	bigint	0
+SELECT constraint_name, constraint_type, table_name, is_deferrable, initially_deferred FROM information_schema.table_constraints WHERE table_name IN ('sa','sb','sc') ORDER BY constraint_name	name,character varying,name,character varying(3),character varying(3)	sa_id_not_null|CHECK|sa|NO|NO ; sa_pkey|PRIMARY KEY|sa|NO|NO ; sb_id_not_null|CHECK|sb|NO|NO ; sb_pkey|PRIMARY KEY|sb|NO|NO ; sb_x_not_null|CHECK|sb|NO|NO ; sc_k1_not_null|CHECK|sc|NO|NO ; sc_k2_not_null|CHECK|sc|NO|NO ; sc_pkey|PRIMARY KEY|sc|NO|NO
+SELECT constraint_name, table_name, column_name, ordinal_position, position_in_unique_constraint FROM information_schema.key_column_usage WHERE table_name IN ('sa','sb','sc') ORDER BY constraint_name, ordinal_position	name,name,name,integer,integer	sa_pkey|sa|id|1|\N ; sb_pkey|sb|id|1|\N ; sc_pkey|sc|k1|1|\N ; sc_pkey|sc|k2|2|\N
+SELECT constraint_catalog, constraint_schema, table_catalog, table_schema FROM information_schema.key_column_usage WHERE table_name = 'sb'	name,name,name,name	esker|public|esker|public
+SELECT count(*) FROM information_schema.referential_constraints WHERE constraint_name = 'nosuch'	bigint	0
+SELECT count(*) FROM information_schema.table_constraints WHERE table_name = 'sc'	bigint	3
+SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('sa','sb') ORDER BY table_name	name	sa ; sb
+SELECT count(*) FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_name IN ('sa','sb','sc')	bigint	3
+SELECT c.column_name, c.data_type FROM information_schema.columns c WHERE c.table_name = 'sb' AND c.column_name = 'x'	name,character varying	x|integer
+SELECT constraint_name FROM information_schema.table_constraints WHERE table_name = 'sb' AND constraint_type = 'PRIMARY KEY'	name	sb_pkey
+SELECT constraint_name FROM information_schema.table_constraints WHERE table_name = 'sb' AND constraint_type = 'CHECK' ORDER BY constraint_name	name	sb_id_not_null ; sb_x_not_null
+SELECT constraint_name FROM information_schema.table_constraints WHERE table_name = 'sb' AND constraint_type = 'FOREIGN KEY'	name	-
+SELECT constraint_name FROM information_schema.table_constraints WHERE table_name = 'sb' AND constraint_type = 'UNIQUE'	name	-
+SELECT count(*) FROM information_schema.tables	bigint	265
+SELECT table_name FROM information_schema.tables WHERE table_schema = 'information_schema' AND table_name IN ('tables','columns') ORDER BY table_name	name	columns ; tables
+SELECT column_name FROM information_schema.columns WHERE table_name = 'sc' ORDER BY ordinal_position	name	k1 ; k2 ; v
+DROP TABLE tables	!42P01 table "tables" does not exist
+DROP TABLE information_schema.tables	!42809 "tables" is not a table HINT: Use DROP VIEW to remove a view.
+ALTER TABLE information_schema.tables ADD COLUMN a bigint	!42809 ALTER action ADD COLUMN cannot be performed on relation "tables" DETAIL: This operation is not supported for views.
+CREATE INDEX ixq ON information_schema.tables (table_name)	!42809 cannot create index on relation "tables" DETAIL: This operation is not supported for views.
+DROP TABLE pg_catalog.pg_class	!42501 permission denied: "pg_class" is a system catalog
