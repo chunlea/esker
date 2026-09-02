@@ -242,7 +242,7 @@ impl Node {
             Ok(Outcome::Rows { fields, rows, .. }) => Answer::Rows {
                 types: fields
                     .iter()
-                    .map(|field| type_name(field.type_oid).to_owned())
+                    .map(|field| type_name(field.type_oid, field.type_modifier))
                     .collect(),
                 rows: rows
                     .into_iter()
@@ -333,11 +333,19 @@ pub(crate) fn replay(corpus: &str, fixture: &[&str], divergences: &Divergences) 
 }
 
 /// The name `\gdesc` prints for an OID, which is the name [`PgType`] already knows.
-fn type_name(oid: u32) -> &'static str {
+/// A column's type as `\gdesc` writes it, **with its typmod**: `character varying(5)`, not
+/// `character varying`.
+///
+/// The number is what the capture holds, so leaving it out would make every corpus with a
+/// `varchar(n)`, a `character(n)` or a `timestamp(p)` in it agree by not looking.
+fn type_name(oid: u32, typmod: i32) -> String {
     esker_sql::value::ColumnType::ALL
         .into_iter()
         .find(|ty| ty.oid() == oid)
-        .map_or("?", PgType::name)
+        .map_or_else(
+            || "?".to_owned(),
+            |ty| esker_sql::value::format_type(ty, typmod),
+        )
 }
 
 /// One corpus file, as `(line number, statement, what PostgreSQL answered)`.

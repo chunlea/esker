@@ -47,6 +47,14 @@ pub(crate) enum Workload {
     ReadMissing,
     /// Iterate the whole database.
     ReadSeq,
+    /// Seek to a random key and read `--batch-size` entries from it, `--num` times.
+    ///
+    /// The workload a **short range scan** is, and the one `readseq` cannot stand in for: one
+    /// scan of the whole database pays for building its iterator once and amortises it over
+    /// every key, so it is nearly blind to what building one costs. A SQL index lookup, a
+    /// prefix scan and a `LIMIT` are all this shape instead — thousands of iterators, each
+    /// reading a handful of entries — which is where the per-level file handling shows up.
+    ScanRange,
     /// Take timestamps from the placement driver's oracle ([`crate::bench_pd`]).
     ///
     /// Not an engine workload: phase 5 takes two of these per transaction
@@ -75,6 +83,7 @@ impl Workload {
             "readrandom" => Some(Self::ReadRandom),
             "readmissing" => Some(Self::ReadMissing),
             "readseq" => Some(Self::ReadSeq),
+            "scanrange" => Some(Self::ScanRange),
             "tso" => Some(Self::Tso),
             "allocid" => Some(Self::AllocId),
             "txnput" => Some(Self::TxnPut),
@@ -91,6 +100,7 @@ impl Workload {
             Self::ReadRandom => "readrandom",
             Self::ReadMissing => "readmissing",
             Self::ReadSeq => "readseq",
+            Self::ScanRange => "scanrange",
             Self::Tso => "tso",
             Self::AllocId => "allocid",
             Self::TxnPut => "txnput",
@@ -119,7 +129,12 @@ impl Workload {
     pub(crate) fn needs_a_populated_database(self) -> bool {
         matches!(
             self,
-            Self::Overwrite | Self::ReadRandom | Self::ReadMissing | Self::ReadSeq | Self::TxnGet
+            Self::Overwrite
+                | Self::ReadRandom
+                | Self::ReadMissing
+                | Self::ReadSeq
+                | Self::ScanRange
+                | Self::TxnGet
         )
     }
 }
@@ -241,6 +256,24 @@ pub(crate) struct Run {
     /// Off by default, like everywhere else. A benchmark pointed at a stale prefix should get a
     /// fresh one; this is for the run that meant to reuse the objects it can see.
     pub(crate) adopt_sst_store: bool,
+    /// Memtable bytes before a flush. `None` is the engine's 64 MiB default.
+    ///
+    /// A knob rather than a constant because the *shape of the tree* is what several engine
+    /// questions are actually about, and a benchmark that can only measure a database whose data
+    /// all fits in one memtable can only measure one of them.
+    pub(crate) write_buffer_size: Option<usize>,
+    /// Bytes per compaction output file. `None` is the engine's default.
+    ///
+    /// This is the knob that decides how many files a *level* holds. The memtable decides how
+    /// many L0 files a fill produces; a compaction then cuts a new output every
+    /// `target_file_size` bytes regardless of how many inputs it had.
+    pub(crate) target_file_size: Option<u64>,
+    /// Compact the whole database before the measured phase.
+    ///
+    /// Off by default, because a benchmark should measure the shape a workload actually leaves.
+    /// On, it is what puts data *below* L0 — and every question about a level that partitions the
+    /// key space is unanswerable until something does.
+    pub(crate) compact: bool,
 }
 
 impl Default for Run {
@@ -259,6 +292,9 @@ impl Default for Run {
             duration_secs: 0,
             bloom_bits: 10,
             remote: None,
+            write_buffer_size: None,
+            target_file_size: None,
+            compact: false,
             sst_store: None,
             sst_cache_bytes: None,
             adopt_sst_store: false,
@@ -370,6 +406,12 @@ fn run_in(options: &Run, dir: &Path) -> Result<Report, String> {
             wal_sync_mode: WalSyncMode::Never,
             cf_options: CfOptions {
                 bloom_bits_per_key: usize::try_from(options.bloom_bits).unwrap_or(0),
+                write_buffer_size: options
+                    .write_buffer_size
+                    .unwrap_or(CfOptions::default().write_buffer_size),
+                target_file_size: options
+                    .target_file_size
+                    .unwrap_or(CfOptions::default().target_file_size),
                 ..CfOptions::default()
             },
             ..Options::default()
@@ -385,6 +427,13 @@ fn run_in(options: &Run, dir: &Path) -> Result<Report, String> {
         // is being measured.
         populate(&db, options)?;
         db.flush(cf::DEFAULT).map_err(|err| err.to_string())?;
+        if options.compact {
+            // Also untimed. A fill leaves everything in L0, whose files overlap and are read one
+            // cursor each; the levels below it are the ones that partition the key space, and
+            // nothing reaches them without this.
+            db.compact_range(cf::DEFAULT, None, None)
+                .map_err(|err| err.to_string())?;
+        }
     }
     // Untimed for the same reason, and *before* the clock starts so that the measured phase
     // sees whatever steady state the budget implies: everything local, nothing local, or the
@@ -394,6 +443,7 @@ fn run_in(options: &Run, dir: &Path) -> Result<Report, String> {
     let started = Instant::now();
     let latencies = match options.workload {
         Workload::ReadSeq => measure_scan(&db, options)?,
+        Workload::ScanRange => measure_parallel(&db, options, scan_range)?,
         Workload::ReadRandom => measure_parallel(&db, options, read_random)?,
         Workload::ReadMissing => measure_parallel(&db, options, read_missing)?,
         Workload::FillSeq => measure_parallel(&db, options, write_sequential)?,
@@ -638,6 +688,49 @@ fn read_missing(
 }
 
 /// A scan is one cursor, so it runs on one thread whatever `--threads` says.
+/// Seeks to a random key and reads `--batch-size` entries from it, once per operation.
+///
+/// **One iterator per operation, and that is the point.** `readseq` builds one and walks four
+/// hundred thousand keys with it, so whatever building it cost is divided by four hundred
+/// thousand; this builds one per scan and divides by `--batch-size`. Both are real workloads and
+/// they answer different questions — the first is a table scan, the second is every index lookup,
+/// prefix scan and `LIMIT` the SQL layer will issue.
+///
+/// The latency recorded covers the whole operation, iterator construction included, because that
+/// is what a caller waits for.
+fn scan_range(
+    db: &Db,
+    options: &Run,
+    worker: u32,
+    _start: u64,
+    count: u64,
+) -> Result<Vec<Duration>, String> {
+    let mut rng = Pcg32::new(0x5CA4_0000 + u64::from(worker), u64::from(worker));
+    let read = ReadOptions::default();
+    let deadline = deadline_of(options);
+    let per_scan = options.batch_size.max(1);
+    let mut latencies = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+
+    for _ in 0..count {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break;
+        }
+        let key = key_for(rng.range_inclusive(0, options.num.saturating_sub(1)));
+        let started = Instant::now();
+        let mut iter = db.iter(cf::DEFAULT, &read).map_err(|err| err.to_string())?;
+        iter.seek(&key);
+        let mut seen = 0;
+        while seen < per_scan && iter.valid() {
+            let _unused = (iter.key().len(), iter.value().len());
+            iter.next();
+            seen += 1;
+        }
+        iter.status().map_err(|err| err.to_string())?;
+        latencies.push(started.elapsed());
+    }
+    Ok(latencies)
+}
+
 fn measure_scan(db: &Arc<Db>, options: &Run) -> Result<Vec<Duration>, String> {
     let deadline = deadline_of(options);
     let mut iter = db
@@ -696,6 +789,9 @@ mod tests {
             duration_secs: 0,
             bloom_bits: 10,
             remote: None,
+            write_buffer_size: None,
+            target_file_size: None,
+            compact: false,
             sst_store: None,
             sst_cache_bytes: None,
             adopt_sst_store: false,
@@ -709,9 +805,13 @@ mod tests {
             "fillrandom",
             "overwrite",
             "readrandom",
+            "readmissing",
             "readseq",
+            "scanrange",
             "tso",
             "allocid",
+            "txnput",
+            "txnget",
         ] {
             let workload = Workload::parse(name).expect(name);
             assert_eq!(workload.name(), name);
@@ -748,6 +848,7 @@ mod tests {
             Workload::ReadRandom,
             Workload::ReadMissing,
             Workload::ReadSeq,
+            Workload::ScanRange,
             Workload::Tso,
             Workload::AllocId,
         ] {

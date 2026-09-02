@@ -45,7 +45,7 @@ use crate::value::{PgDatum, PgType};
 /// would be nothing left to read; more importantly it would answer with what a *later* statement
 /// could see rather than with what this one did, which is not what `RETURNING` means.
 struct Returned {
-    columns: Vec<(String, ColumnType)>,
+    columns: Vec<(String, ColumnType, i32)>,
     exprs: Vec<crate::plan::Expr>,
     rows: Vec<Vec<Option<Vec<u8>>>>,
 }
@@ -92,7 +92,7 @@ fn finish(returned: Option<Returned>, tag: String) -> Outcome {
             fields: returned
                 .columns
                 .iter()
-                .map(|(name, ty)| FieldDescription::computed(name.clone(), *ty))
+                .map(|(name, ty, typmod)| FieldDescription::of(name.clone(), *ty, *typmod))
                 .collect(),
             rows: returned.rows,
             tag,

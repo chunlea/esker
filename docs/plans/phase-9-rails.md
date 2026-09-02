@@ -1021,6 +1021,18 @@ granted class and is reported rather than assumed: see the note in ADR 0033 and 
 `ba8ed2e`, which deleted a duplicated conversion rather than adding an arm to it. A future edit of
 the granted kind — one match arm for one new type — needs no further routing.
 
+##### The harness was comparing types without their numbers
+
+`parity_harness`'s `type_name` rendered an OID and dropped the modifier, so every corpus holding a
+`varchar(n)`, a `character(n)` or a `timestamp(p)` would have agreed **by not looking**. It renders
+what `\gdesc` renders now. Same shape as the three defects the `real` unit turned up: a check that
+passes because it does not ask.
+
+Fixing it made the harness's *other* direction fire, which is the half that usually sits idle:
+three entries in `tests/timestamp.rs`'s type divergences had started agreeing — a `timestamp(6)`
+column whose precision this node could not print back — and the test refused to pass until they
+were deleted. A divergence list that only ever grows is a list nobody reads.
+
 ##### `bpchar` costs no wire change, unlike `real`
 
 `character(n)` is a twelfth `ColumnType` and a third member of the string family — `text`,

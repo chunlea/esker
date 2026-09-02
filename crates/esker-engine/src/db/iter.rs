@@ -33,6 +33,7 @@ use crate::range_del::RangeTombstones;
 use crate::sst::TableIter;
 use crate::version::Version;
 
+use super::level_iter::LevelCursor;
 use super::merge::MergeCursor;
 use super::{Db, Snapshot, lock, read_lock};
 
@@ -403,26 +404,38 @@ impl Db {
 
         let version = lock(&self.inner.versions)?.current();
         let table_options = self.inner.table_options(&cf);
-        // TODO(post-v1): one cursor per file opens every file in a level. LevelDB uses a
-        // two-level iterator that opens a level's files as it reaches them; that matters once
-        // compaction fills the deeper levels.
         let levels = version
             .cf(cf.id())
             .map_or(0, crate::version::CfVersion::num_levels);
-        for level in 0..levels {
-            for file in version.files(cf.id(), level) {
-                let reader = self.inner.table_cache.get(file.number, &table_options)?;
-                if !reader.range_tombstones().is_empty() {
-                    debug_assert_eq!(
-                        level, 0,
-                        "a range tombstone below L0 in file {}: ADR 0017 decision 6 says a \
-                         compaction discharges them and never writes one out",
-                        file.number
-                    );
-                    tombstones.extend(reader.range_tombstones(), user_order.as_ref());
-                }
-                children.push(table_cursor(reader.iter()));
+
+        // **L0 is opened file by file, and has to be.** Its files overlap, so any of them can
+        // hold the next key and all of them are live at once — and it is the only level a range
+        // tombstone can be in (ADR 0017 decision 6: a compaction whose inputs carry one becomes a
+        // discharge). Collecting the tombstone set is therefore an L0 walk rather than a walk of
+        // every file in the database, which is the second reason the old shape opened them all.
+        for file in version.files(cf.id(), 0) {
+            let reader = self.inner.table_cache.get(file.number, &table_options)?;
+            if !reader.range_tombstones().is_empty() {
+                tombstones.extend(reader.range_tombstones(), user_order.as_ref());
             }
+            children.push(table_cursor(reader.iter()));
+        }
+
+        // Every deeper level **partitions** the key space, so it is one cursor that opens the
+        // file it has reached (`level_iter`). A scan of a database with a full L4 used to open
+        // every L4 file — four reads each, index and filter resident for the scan's life —
+        // before it read a byte of the range it wanted.
+        for level in 1..levels {
+            let files = version.files(cf.id(), level);
+            if files.is_empty() {
+                continue;
+            }
+            children.push(Box::new(LevelCursor::new(
+                files.to_vec(),
+                Arc::clone(&self.inner.table_cache),
+                table_options.clone(),
+                Arc::clone(&self.inner.comparator),
+            )));
         }
 
         Ok(DbIterator {

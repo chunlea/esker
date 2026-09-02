@@ -155,8 +155,11 @@ impl Aggregation {
             AggregateFunc::Min | AggregateFunc::Max => match arg {
                 ColumnType::Bool => undefined(),
                 // Measured: `min(varchar)` and `max(varchar)` come back as **`text`** on a real
-                // server. There is one `min` for the whole string family and it is `text`'s, so the
-                // declared type decays even though the value does not change.
+                // server, and `min(character(n))` comes back as **`bpchar`**. The string family
+                // does not decay uniformly — `bpchar` has a `min` of its own where `varchar`
+                // borrows `text`'s — and that asymmetry is captured rather than smoothed over
+                // (`tests/corpus/pg19_typmod.txt`). The value does not change either way; the
+                // declared type does.
                 ColumnType::Varchar => Ok(ColumnType::Text),
                 _ => Ok(arg),
             },
@@ -350,6 +353,10 @@ impl Aggregation {
             return Ok(Expr::Ordinal {
                 at,
                 ty: self.output_type(at),
+                // An aggregate's output carries no typmod: `min(c)` over a `character(3)` is
+                // `bpchar` with none on a real server, and a grouping key has already been
+                // through whatever coercion its own comparison needed.
+                typmod: crate::value::NO_TYPMOD,
             });
         }
         Ok(match expr {
@@ -376,6 +383,7 @@ impl Aggregation {
                 Expr::Ordinal {
                     at,
                     ty: self.output_type(at),
+                    typmod: crate::value::NO_TYPMOD,
                 }
             }
             // The one failure this function exists for. Resolution has already turned the name

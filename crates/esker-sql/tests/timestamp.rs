@@ -24,16 +24,11 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    types: &[
-        // Column `b` is declared `timestamp(6)`, and a real server prints the precision back:
-        // `timestamp(6) without time zone`. This node has nowhere to keep a typmod yet, so it says
-        // `timestamp without time zone` — the same type, the same values, one string shorter. The
-        // typmod unit closes it, and until then the *rows* on every one of these lines agree,
-        // which is what the harness reaching this list at all already proves.
-        "SELECT id, a, b, c FROM ts ORDER BY id",
-        "SELECT id, a, b FROM ts WHERE id = 4",
-        "SELECT id, a, b FROM ts WHERE id = 5",
-    ],
+    // Three entries stood here: a `timestamp(6)` column whose precision this node could not print
+    // back, because it had nowhere to keep a typmod. The typmod unit gave it one and the harness
+    // said so — it checks both directions, so a divergence that has started agreeing fails the
+    // test until the entry is deleted, which is how these three came out.
+    types: &[],
     answers: &[],
 };
 

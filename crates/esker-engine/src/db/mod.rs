@@ -7,6 +7,7 @@
 //! * [`checkpoint`] — a consistent copy, made of hard links
 //! * [`ingest`] — adopting an SST that was built elsewhere
 //! * [`iter`] — many versions in, one entry per user key out
+//! * [`level_iter`] — one cursor over a whole level, opening the file it has reached
 //! * [`merge`] — several sorted cursors walked as one
 //! * [`read`] — point lookups, through memtables and then down the levels
 //! * [`table_cache`] — open SSTs, kept open
@@ -32,6 +33,7 @@ pub mod compact;
 pub mod flush;
 pub mod ingest;
 pub mod iter;
+pub mod level_iter;
 pub mod merge;
 pub mod open;
 pub mod read;
@@ -140,7 +142,10 @@ pub(crate) struct DbInner {
     pub(crate) wal: Mutex<Wal>,
     pub(crate) writers: Mutex<WriteQueue>,
     pub(crate) write_ready: Condvar,
-    pub(crate) table_cache: TableCache,
+    /// Behind an `Arc` so a [`level_iter::LevelCursor`] can hold the cache for the life of a
+    /// scan without holding the whole database: the cursor opens the file it has reached and
+    /// drops it on the way past, which needs the cache and nothing else.
+    pub(crate) table_cache: Arc<TableCache>,
     /// Guards the background thread's wake-up flag and its last error.
     pub(crate) flush: Mutex<FlushState>,
     /// Signalled to wake the background thread.
