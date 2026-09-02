@@ -349,3 +349,81 @@ single-row applies through `Db::put` on a `Never` database went from **90.37 s t
 4.5 ms to 8.5 µs per row. **531×**, and the before-number reproduces the recorded 95.94 s almost
 exactly. The columnar half of the same benchmark did not move, because it never touches the
 engine's write path — which is what makes the pair a measurement rather than an anecdote.
+
+## 5. The macOS power-loss gap was closed before it was recorded
+
+Inventory #1, the widest standing gap against invariant 1 as the inventory ranked it:
+`crates/esker-engine/src/fs/mod.rs`, `TODO(full-fsync)`, with the rationale in the module header.
+
+### What the check found
+
+The brief said to read the toolchain's own `std` before adding anything, and to stop rather than
+add a dependency. `rust-src` is a rustup component rather than a dependency, so reading it costs
+nothing:
+
+```text
+$ grep -rn F_FULLFSYNC $(rustc --print sysroot)/lib/rustlib/src/rust/library/
+library/std/src/sys/fs/unix.rs:1397:            libc::fcntl(fd, libc::F_FULLFSYNC)
+library/std/src/sys/fs/unix.rs:1411:            libc::fcntl(fd, libc::F_FULLFSYNC)
+```
+
+Line 1411 is inside `File::datasync`:
+
+```rust
+pub fn datasync(&self) -> io::Result<()> {
+    cvt_r(|| unsafe { os_datasync(self.as_raw_fd()) })?;
+    return Ok(());
+
+    #[cfg(target_vendor = "apple")]
+    unsafe fn os_datasync(fd: c_int) -> c_int {
+        libc::fcntl(fd, libc::F_FULLFSYNC)
+    }
+    ...
+```
+
+and 1397 is the same thing inside `File::fsync`. **`std` issues `F_FULLFSYNC` for both calls on
+Apple targets.** `LocalWritableFile::sync_data` calls `File::sync_data`, which calls `datasync`. So
+the engine has had power-loss durability on macOS for as long as it has been built with a `std`
+that does this, and the recorded debt — "on macOS an acknowledged write can be lost to a power
+cut", ranked first of twenty-two — was **not true of this toolchain**.
+
+The premise it rested on is true and was reasoned one step too far: `fsync(2)` on macOS really does
+return without forcing the drive's own write cache, and `fcntl(F_FULLFSYNC)` really is the only
+thing that does. What the comment did not check is that the standard library had already made that
+substitution on the caller's behalf.
+
+### What was actually built
+
+The knob, because the brief asks for one and because the sentence above is a claim about somebody
+else's code. `Options::sync_call` — a `SyncCall` of `Data` (the default) or `All`, an enum rather
+than the `bool` it started as because clippy's `struct_excessive_bools` was right that `Options`
+had enough of those and because naming the two calls reads better than naming one of them "full" —
+makes the log take `sync_all` instead of `sync_data`:
+
+| | `SyncCall::Data` (default) | `SyncCall::All` |
+|---|---|---|
+| Apple | `fcntl(F_FULLFSYNC)` | `fcntl(F_FULLFSYNC)` — identical |
+| Linux | `fdatasync` | `fsync`, which flushes the inode's other metadata too |
+
+So it buys nothing on Apple and buys metadata on Linux. It is worth having anyway as the lever to
+pull if a future `std` stops doing what the citation says — which is the whole reason the wiring
+gets a test rather than the durability doing.
+
+`WritableFile::sync_all` is new, with no default implementation: one that answered by quietly doing
+the weaker thing would make the option a lie in the direction that costs data, and the compiler is
+the only reviewer that reads every implementation. The fault injector counts and faults it as a
+`SyncData`, deliberately — a crash test is exercising a durability barrier that did not hold, and
+which of the two calls raised it is a distinction none of those tests draws; a separate operation
+would silently halve the fault rate of every plan naming `SyncData`.
+
+The module header now states what is true per platform, with the `std` line quoted in it, and the
+`TODO(full-fsync)` is gone. **No dependency was added**, and none was needed: `libc` is `std`'s own
+business here, not ours.
+
+### The test
+
+`a_sync_chooses_by_option` counts `sync_all` against `sync_data` through the same counting
+filesystem §4 uses, and asserts the option changes which call is made. It cannot assert durability,
+because on this platform there is none to tell apart — the two calls are the same syscall. What it
+pins is the thing that actually rots: that the option still reaches the call site. Shown red by
+replacing the branch with `if false`: *"the option is on and the log still took `sync_data`"*.

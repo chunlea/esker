@@ -108,10 +108,11 @@ impl Db {
             mem.active_log = log_number;
         }
         let wal_path = filename::wal(&dir, wal_number);
-        let writer = LogWriter::new(
+        let mut writer = LogWriter::new(
             fs.create(&wal_path).at(&wal_path)?,
             wal_path.display().to_string(),
         );
+        writer.set_sync_call(options.sync_call);
 
         versions.set_last_seqno(last_seqno);
         versions.set_log_number(log_number);

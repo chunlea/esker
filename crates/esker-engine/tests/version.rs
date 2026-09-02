@@ -245,6 +245,10 @@ impl WritableFile for CrashFile {
         self.fs.check(Op::SyncData)?;
         self.inner.sync_data()
     }
+    fn sync_all(&mut self) -> io::Result<()> {
+        self.fs.check(Op::SyncData)?;
+        self.inner.sync_all()
+    }
 }
 
 /// A comparator that is not the default one, for the reopen-mismatch test.

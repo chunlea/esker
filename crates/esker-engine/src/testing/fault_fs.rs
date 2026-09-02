@@ -384,6 +384,18 @@ impl WritableFile for FaultWritableFile {
         }
         self.inner.sync_data()
     }
+
+    /// Counted and faulted as a `SyncData`, on purpose: what a crash test is exercising is a
+    /// durability barrier that did not hold, and which of the two calls raised it is not a
+    /// distinction any of those tests draws. Giving it an operation of its own would silently
+    /// halve the fault rate of every plan that names `SyncData`.
+    fn sync_all(&mut self) -> io::Result<()> {
+        let operation = Operation::SyncData(self.path.clone());
+        if let Decision::Inject(fault) = self.shared.begin(&operation) {
+            return Err(injected(&operation, fault));
+        }
+        self.inner.sync_all()
+    }
 }
 
 #[cfg(test)]

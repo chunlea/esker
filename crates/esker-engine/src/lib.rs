@@ -83,7 +83,8 @@ pub use fs::{FileSystem, LocalFileSystem, RandomAccessFile, WritableFile};
 pub use iterator::Cursor;
 pub use memtable::MemTable;
 pub use options::{
-    CfOptions, Compression, Options, PrefixExtractor, ReadOptions, WalSyncMode, WriteOptions,
+    CfOptions, Compression, Durability, Options, PrefixExtractor, ReadOptions, SyncCall,
+    WalSyncMode, WriteOptions,
 };
 pub use version::{FileMeta, VersionEdit, VersionSet};
 pub use wal::{LogReader, LogWriter, ReadOutcome};

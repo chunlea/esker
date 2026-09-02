@@ -227,6 +227,12 @@ impl WritableFile for MemWritableFile {
         file.synced = file.bytes.len();
         Ok(())
     }
+
+    fn sync_all(&mut self) -> io::Result<()> {
+        // There is no metadata here that is not already in the map, so the stronger call is the
+        // same call. Written out rather than aliased so that it is obvious it was considered.
+        self.sync_data()
+    }
 }
 
 /// A positioned-read in-memory file.

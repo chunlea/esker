@@ -39,6 +39,9 @@ pub struct LogWriter {
     len: u64,
     /// Set once an append has failed. See the module docs: the segment is finished.
     failed: Option<String>,
+    /// Which call [`sync`](Self::sync) makes ([`crate::SyncCall`]). `Data` unless a caller says
+    /// otherwise, which is what every release so far has done.
+    sync_call: crate::options::SyncCall,
 }
 
 // `WritableFile` is deliberately not `Debug`: it is a two-method trait the SST lane also
@@ -65,6 +68,7 @@ impl LogWriter {
             buf: Vec::with_capacity(BLOCK_SIZE),
             len: 0,
             failed: None,
+            sync_call: crate::options::SyncCall::Data,
         }
     }
 
@@ -143,7 +147,23 @@ impl LogWriter {
     /// Flushes, then makes the segment durable. Invariant 1's "fsync before ack" is this call.
     pub fn sync(&mut self) -> Result<()> {
         self.flush()?;
-        self.file.sync_data().at(&self.path)
+        // The one place the option is read. `Data` is the default and is identical to `All` on
+        // Apple targets — both are `fcntl(F_FULLFSYNC)` inside `std` — so this branch only
+        // separates `fdatasync` from `fsync` on Linux (`crate::fs`, which cites the line).
+        // `wal_sync::a_sync_chooses_by_option` is what says the wire is still connected.
+        match self.sync_call {
+            crate::options::SyncCall::All => self.file.sync_all().at(&self.path),
+            crate::options::SyncCall::Data => self.file.sync_data().at(&self.path),
+        }
+    }
+
+    /// Sets which call [`sync`](Self::sync) makes.
+    ///
+    /// Set from [`Options::sync_call`](crate::Options::sync_call) when a segment is opened, rather
+    /// than threaded through every `sync()`: which call to make is a property of the database, and
+    /// a per-call parameter would invite two call sites to disagree about it.
+    pub fn set_sync_call(&mut self, call: crate::options::SyncCall) {
+        self.sync_call = call;
     }
 
     /// The segment's length in bytes, buffered writes included.
@@ -318,6 +338,10 @@ mod tests {
         }
 
         fn sync_data(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn sync_all(&mut self) -> io::Result<()> {
             Ok(())
         }
     }

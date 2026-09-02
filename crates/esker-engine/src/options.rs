@@ -118,6 +118,30 @@ impl PrefixExtractor for StripSuffix {
 
 /// When the engine syncs the write-ahead log on its own initiative.
 ///
+/// Which call makes a durably-written file durable.
+///
+/// **This is a smaller choice than the `TODO(full-fsync)` it replaced believed**, and the
+/// difference is entirely Linux's. `std` already issues `fcntl(F_FULLFSYNC)` for *both* calls on
+/// Apple targets — [`crate::fs`]'s module docs quote the line — so the engine has had power-loss
+/// durability on macOS for as long as it has been built with such a `std`.
+///
+/// | | [`Data`](Self::Data) | [`All`](Self::All) |
+/// |---|---|---|
+/// | Apple | `fcntl(F_FULLFSYNC)` | `fcntl(F_FULLFSYNC)` — identical |
+/// | Linux | `fdatasync` | `fsync`, which flushes the inode's other metadata too |
+///
+/// So it exists mainly as the lever to pull if a future `std` stops doing what that citation says,
+/// which is why the wiring has a test (`tests/wal_sync.rs::a_sync_chooses_by_option`) and the
+/// durability does not: on this platform there is nothing for a test to tell apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SyncCall {
+    /// `File::sync_data`. The default, and what every release so far has done.
+    #[default]
+    Data,
+    /// `File::sync_all`: the data and all of the file's metadata.
+    All,
+}
+
 /// The policy for writes that expressed no preference — [`Durability::Policy`], which is what
 /// [`WriteOptions::default`] is. A write that asked for [`Durability::Durable`] or
 /// [`Durability::Buffered`] has already answered the question and does not consult this.
@@ -233,6 +257,8 @@ impl WriteOptions {
 pub struct Options {
     /// Create the database if the directory does not hold one.
     pub create_if_missing: bool,
+    /// Which of the two durability calls the write-ahead log makes.
+    pub sync_call: SyncCall,
     /// Fail if it does. Useful when a caller means "this must be new".
     pub error_if_exists: bool,
     /// Treat corruption anywhere but a log's final record as fatal. Off, recovery salvages
@@ -276,6 +302,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             create_if_missing: false,
+            sync_call: SyncCall::default(),
             error_if_exists: false,
             paranoid_checks: true,
             comparator: Arc::new(BytewiseComparator),

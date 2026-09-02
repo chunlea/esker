@@ -182,6 +182,18 @@ pub trait WritableFile: Send {
 
     /// Makes every previously appended byte durable, at the level the module docs describe.
     fn sync_data(&mut self) -> io::Result<()>;
+
+    /// Makes every previously appended byte **and all of this file's metadata** durable.
+    ///
+    /// `File::sync_all`. On Apple targets this is byte-for-byte what
+    /// [`sync_data`](Self::sync_data) does — both are `fcntl(F_FULLFSYNC)`, see the module docs —
+    /// and on Linux it is `fsync` where the other is `fdatasync`. Selected by
+    /// [`Options::sync_call`](crate::Options::sync_call), which is off by default.
+    ///
+    /// No default implementation, deliberately: one that answered this by quietly doing the
+    /// weaker thing would make the option a lie in the direction that costs data, and the
+    /// compiler is the only reviewer that reads every implementation.
+    fn sync_all(&mut self) -> io::Result<()>;
 }
 
 /// A file read by position, concurrently, without a shared cursor.
@@ -282,10 +294,13 @@ impl WritableFile for LocalWritableFile {
     }
 
     fn sync_data(&mut self) -> io::Result<()> {
-        // TODO(full-fsync): on macOS this is not power-loss durable; that needs
-        // fcntl(F_FULLFSYNC), which should become an `Options` knob when power-loss
-        // durability becomes a stated goal. See the module docs.
+        // On Apple targets `std` makes this `fcntl(F_FULLFSYNC)` itself, so this *is* the full
+        // fsync the module header used to say was missing. See there for the citation.
         self.file.sync_data()
+    }
+
+    fn sync_all(&mut self) -> io::Result<()> {
+        self.file.sync_all()
     }
 }
 

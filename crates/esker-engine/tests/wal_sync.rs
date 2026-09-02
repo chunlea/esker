@@ -22,7 +22,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use esker_engine::memfs::MemFileSystem;
 use esker_engine::{
-    Db, FileSystem, Options, RandomAccessFile, WalSyncMode, WritableFile, WriteOptions, cf,
+    Db, FileSystem, Options, RandomAccessFile, SyncCall, WalSyncMode, WritableFile, WriteOptions,
+    cf,
 };
 
 /// A filesystem that counts `sync_data` per path and otherwise gets out of the way.
@@ -34,6 +35,8 @@ struct CountingFs {
     inner: Arc<MemFileSystem>,
     syncs: Arc<Mutex<BTreeMap<PathBuf, u64>>>,
     appends: Arc<AtomicU64>,
+    /// Of those syncs, how many were the **full** one — `sync_all` rather than `sync_data`.
+    full: Arc<AtomicU64>,
 }
 
 impl CountingFs {
@@ -42,6 +45,7 @@ impl CountingFs {
             inner: Arc::new(MemFileSystem::new()),
             syncs: Arc::new(Mutex::new(BTreeMap::new())),
             appends: Arc::new(AtomicU64::new(0)),
+            full: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -63,6 +67,11 @@ impl CountingFs {
     fn wal_appends(&self) -> u64 {
         self.appends.load(Ordering::Relaxed)
     }
+
+    /// How many of the syncs were `sync_all`.
+    fn full_syncs(&self) -> u64 {
+        self.full.load(Ordering::Relaxed)
+    }
 }
 
 impl FileSystem for CountingFs {
@@ -72,6 +81,7 @@ impl FileSystem for CountingFs {
             path: path.to_path_buf(),
             syncs: Arc::clone(&self.syncs),
             appends: Arc::clone(&self.appends),
+            full: Arc::clone(&self.full),
             is_log: path.extension().is_some_and(|ext| ext == "wal"),
         }))
     }
@@ -112,6 +122,7 @@ struct CountingFile {
     path: PathBuf,
     syncs: Arc<Mutex<BTreeMap<PathBuf, u64>>>,
     appends: Arc<AtomicU64>,
+    full: Arc<AtomicU64>,
     is_log: bool,
 }
 
@@ -137,12 +148,28 @@ impl WritableFile for CountingFile {
             .or_default() += 1;
         self.inner.sync_data()
     }
+
+    fn sync_all(&mut self) -> io::Result<()> {
+        self.full.fetch_add(1, Ordering::Relaxed);
+        *self
+            .syncs
+            .lock()
+            .unwrap()
+            .entry(self.path.clone())
+            .or_default() += 1;
+        self.inner.sync_all()
+    }
 }
 
 fn open(fs: &Arc<CountingFs>, mode: WalSyncMode) -> Db {
+    open_with_sync_call(fs, mode, SyncCall::Data)
+}
+
+fn open_with_sync_call(fs: &Arc<CountingFs>, mode: WalSyncMode, sync_call: SyncCall) -> Db {
     let options = Options {
         create_if_missing: true,
         wal_sync_mode: mode,
+        sync_call,
         ..Options::default()
     };
     Db::open_with(
@@ -277,4 +304,42 @@ fn a_clean_close_syncs_what_the_mode_deferred() {
         fs.wal_syncs() >= 1,
         "a clean close left the log unsynced, so an orderly shutdown can lose writes"
     );
+}
+
+/// The `sync_call` option reaches the write-ahead log's sync, and picks the other call.
+///
+/// # Why this is a wiring test and not a durability one
+///
+/// It cannot assert durability, because on this platform there is none to tell apart: `std` issues
+/// `fcntl(F_FULLFSYNC)` for **both** `sync_data` and `sync_all` on Apple targets
+/// (`library/std/src/sys/fs/unix.rs`, cited in `esker_engine::fs`'s module docs), so the two calls
+/// are byte-for-byte the same syscall here. On Linux they are `fdatasync` and `fsync`, and the
+/// difference is the inode's other metadata.
+///
+/// So what this pins is the only thing a test on either platform *can* pin, and the thing that
+/// actually rots: that the option still reaches the call site and still changes which call is
+/// made. An option wired to nothing is what the `TODO` this replaced was afraid of, and it is
+/// exactly what would happen silently if the log's sync were ever rewritten.
+#[test]
+fn a_sync_chooses_by_option() {
+    let off = CountingFs::new();
+    let db = open_with_sync_call(&off, WalSyncMode::PerWrite, SyncCall::Data);
+    puts(&db, PUTS, WriteOptions::default());
+    assert_eq!(off.wal_syncs(), u64::from(PUTS), "the control did not sync");
+    assert_eq!(
+        off.full_syncs(),
+        0,
+        "the log took the stronger call with the option off"
+    );
+    drop(db);
+
+    let on = CountingFs::new();
+    let db = open_with_sync_call(&on, WalSyncMode::PerWrite, SyncCall::All);
+    puts(&db, PUTS, WriteOptions::default());
+    assert_eq!(
+        on.full_syncs(),
+        u64::from(PUTS),
+        "the option is on and the log still took `sync_data`"
+    );
+    drop(db);
 }

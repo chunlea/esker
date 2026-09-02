@@ -152,7 +152,9 @@ impl DbInner {
         let number = lock(&self.versions)?.new_file_number();
         let path = filename::wal(&self.dir, number);
         let file = self.fs.create(&path).at(&path)?;
-        let writer = LogWriter::new(file, path.display().to_string());
+        let mut writer = LogWriter::new(file, path.display().to_string());
+        // Carried across the roll, or the option would hold only until the log next filled up.
+        writer.set_sync_call(self.options.sync_call);
 
         {
             let mut wal = lock(&self.wal)?;
