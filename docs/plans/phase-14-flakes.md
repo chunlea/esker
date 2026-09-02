@@ -33,10 +33,11 @@ and exactly two are taken, however many passes race.
 | when | at | how it was seen | message |
 |---|---|---|---|
 | phase 13 (catalog lane), 2026-09-01/02 | `catalog` branch gate | relayed in this lane's brief: "fails about one run in N" | not captured |
+| 2026-09-02, the type lane's per-unit gate | **`73c7cfc`** on `main`, inside a parallel `nextest` run | the third sighting, relayed while this lane was on U4 | not captured — **but reproduced at that exact commit below** |
 
-Nothing in `docs/` records it; the brief is the only sighting on paper, and it names no assertion.
-That is the first thing to fix — a flake with no captured message is a flake nobody can tell from a
-different one.
+Nothing in `docs/` recorded the first two; the brief was the only sighting on paper and it named no
+assertion. That is the first thing to fix — a flake with no captured message is a flake nobody can
+tell from a different one.
 
 **Hypothesis.** The name of the test says *racing* and the assertion says *exactly once*, so the
 two failure families are far apart: a step taken twice or zero times is a correctness bug in the
@@ -230,6 +231,31 @@ failures out of 80 before. The one new test that was **green against the unfixed
 `a_re_driver_that_reads_after_the_winner_is_overtaken_rather_than_stepping`, and it is written down
 as such: it pins the sequential half of the race, which already worked and had no test that forced
 it.
+
+### The third sighting, answered at the commit it happened on
+
+Relayed while this lane was running U4's gate: the type lane's per-unit gate hit it again on `main`
+at **`73c7cfc`**, inside a parallel `nextest` run, with no message captured. `73c7cfc` carries
+neither half of the fix — its `redrive.rs` still has the `Barrier` and its `verbs.rs` still has both
+`has no schema-change job in flight` arms — so the answer is an A/B on that commit rather than an
+argument about it. A detached worktree at `73c7cfc`, its own `CARGO_TARGET_DIR`, sixteen copies at
+once, five batches, then the same eighty runs with `740f6c0` cherry-picked on top:
+
+| arm | runs | failed | what every run printed |
+|---|---:|---:|---|
+| `73c7cfc`, as the gate ran it | 80 | **60** | `the two re-drivers never actually collided, so nothing about racing was tested` |
+| `73c7cfc` + `740f6c0` | 80 | **0** | `two re-drivers: 2 transitions, 0 overtaken, 2 rolled back` |
+
+**Sixty of sixty on one message, and none on the count.** The third sighting is the first two: the
+barrier releases two passes and one finishes before the other is scheduled, so nothing overlaps and
+the test's own guard fires. Not one of the 220 runs of the pre-fix code across all three arms has
+ever failed on `moved`.
+
+The second row is the same number on every one of eighty runs, which is what "constructed rather
+than hoped for" buys: two transitions, both collided, both refused once.
+
+The three code files cherry-picked **clean** onto `73c7cfc` — only `docs/plans/phase-14-flakes.md`
+conflicted, and only because it does not exist there — so the fix fast-forwards without a merge.
 
 ---
 
