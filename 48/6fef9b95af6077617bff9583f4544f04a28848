@@ -1,0 +1,35 @@
+Cargo.lock
+  s_ed1cd635740377::t_9541c71d952741 403
+crates/esker-pd/Cargo.toml
+  s_ed1cd635740377::t_044c007ceb90a9 37-40
+crates/esker-pd/tests/sim_balance.rs
+  s_ed1cd635740377::t_330aa875943c88 1-345
+crates/esker-sim/src/lib.rs
+  s_ed1cd635740377::t_2a985f23453b7f 22
+crates/esker-sim/src/mech/mod.rs
+  s_ed1cd635740377::t_a9d7d8d8265902 1-47
+crates/esker-sim/src/mech/placement.rs
+  s_ed1cd635740377::t_371fff17eeccdb 1-762
+crates/esker-sim/src/mech/reference.rs
+  s_ed1cd635740377::t_69a5116361470f 1-115
+crates/esker-sim/tests/mech_placement.rs
+  s_ed1cd635740377::t_330ea81380ad6f 1-100
+docs/plans/phase-11-engine.md
+  s_ed1cd635740377::t_b8c5689ff0df91 131-132,231-281
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "486fef9b95af6077617bff9583f4544f04a28848",
+  "prompts": {},
+  "sessions": {
+    "s_ed1cd635740377": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "19199d55-8453-4673-a0ab-b13f22806878",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
