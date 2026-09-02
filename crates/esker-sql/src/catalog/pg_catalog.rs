@@ -78,6 +78,9 @@ pub enum CatalogView {
     /// Every index this tenant has, and every primary key — which has no index behind it here
     /// and a row all the same ([`crate::catalog::pg_index`]).
     PgIndex,
+    /// Every constraint this tenant has: its primary keys, and PostgreSQL 19's `NOT NULL` rows
+    /// ([`crate::catalog::pg_constraint`]).
+    PgConstraint,
     /// The collations this server has, which is none.
     ///
     /// Empty for the reason [`CatalogView::PgRange`] is: a collation is a feature this node does
@@ -91,7 +94,7 @@ pub enum CatalogView {
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 8] = [
+    pub const ALL: [CatalogView; 9] = [
         CatalogView::PgType,
         CatalogView::PgRange,
         CatalogView::PgClass,
@@ -99,6 +102,7 @@ impl CatalogView {
         CatalogView::PgAttribute,
         CatalogView::PgAttrdef,
         CatalogView::PgIndex,
+        CatalogView::PgConstraint,
         CatalogView::PgCollation,
     ];
 
@@ -113,6 +117,7 @@ impl CatalogView {
             CatalogView::PgAttribute => "pg_attribute",
             CatalogView::PgAttrdef => "pg_attrdef",
             CatalogView::PgIndex => "pg_index",
+            CatalogView::PgConstraint => "pg_constraint",
             CatalogView::PgCollation => "pg_collation",
         }
     }
@@ -129,7 +134,8 @@ impl CatalogView {
                 CatalogView::PgAttribute => 4,
                 CatalogView::PgAttrdef => 5,
                 CatalogView::PgIndex => 6,
-                CatalogView::PgCollation => 7,
+                CatalogView::PgConstraint => 7,
+                CatalogView::PgCollation => 8,
             }
     }
 
@@ -182,6 +188,7 @@ impl CatalogView {
             CatalogView::PgAttribute => super::pg_attribute::ATTRIBUTE_COLUMNS,
             CatalogView::PgAttrdef => super::pg_attribute::ATTRDEF_COLUMNS,
             CatalogView::PgIndex => super::pg_index::INDEX_COLUMNS,
+            CatalogView::PgConstraint => super::pg_constraint::CONSTRAINT_COLUMNS,
             CatalogView::PgCollation => {
                 &[("oid", ColumnType::Int8), ("collname", ColumnType::Text)]
             }
@@ -206,6 +213,7 @@ impl CatalogView {
             CatalogView::PgAttribute => super::pg_attribute::rows(txn, tenant),
             CatalogView::PgAttrdef => super::pg_attribute::default_rows(txn, tenant),
             CatalogView::PgIndex => super::pg_index::rows(txn, tenant),
+            CatalogView::PgConstraint => super::pg_constraint::rows(txn, tenant),
             CatalogView::PgNamespace => Ok(vec![vec![
                 Datum::Int8(PUBLIC_NAMESPACE_OID),
                 Datum::Text(PUBLIC_SCHEMA.to_owned()),
@@ -254,7 +262,8 @@ impl CatalogView {
             | CatalogView::PgNamespace
             | CatalogView::PgAttribute
             | CatalogView::PgAttrdef
-            | CatalogView::PgIndex => Vec::new(),
+            | CatalogView::PgIndex
+            | CatalogView::PgConstraint => Vec::new(),
         }
     }
 

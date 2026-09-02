@@ -1,0 +1,68 @@
+# `pg_constraint` and `pg_get_constraintdef`, as a real PostgreSQL 19beta1 answers them --
+# phase 13 unit 3.
+#
+# `ActiveRecord` reads this relation for four things and this node has none of them:
+# `foreign_keys()` (contype `f`), `check_constraints()` (`c`), `unique_constraints()` (`u`) and
+# `exclusion_constraints()` (`x`). No rows is the *correct* answer about this catalog for three of
+# the four -- FOREIGN KEY, CHECK and EXCLUDE are all `0A000` in the DDL -- and a gap for the
+# fourth, which the divergence list names.
+#
+# Captured in one session with `scratchpad/sesscap.py` inside one `BEGIN ... ROLLBACK`, and
+# replayed the same way against one node. The corpus builds its own tables.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **PostgreSQL 19 has a `pg_constraint` row for `NOT NULL`**, contype `n`, named
+#     `<table>_<column>_not_null`, whose definition is the two words `NOT NULL id`. That row did
+#     not exist in older majors, so a catalog written from an older memory is missing it -- and it
+#     is why `information_schema.table_constraints` reports a `NOT NULL` as a **CHECK** (unit 4).
+#   * **A primary key's columns each get one, and a column that is both gets one row, not two.**
+#     `kc (k1 int8, k2 text NOT NULL, ..., PRIMARY KEY (k1, k2))` has three rows: two `n` and one
+#     `p`. A key column is NOT NULL whether it says so or not.
+#   * **A table with no key and no NOT NULL column has no rows here at all** -- not an empty
+#     constraint, no row. `count(*)` for `kb (a int4, b text)` is 0.
+#   * **`confupdtype` and `confdeltype` are a single space for a constraint that is not a foreign
+#     key**, not the empty string and not NULL -- where `pg_attribute.attidentity` spells "none"
+#     as the empty string. Two neighbouring catalogs, two spellings.
+#   * **`conindid` is 0 for a `NOT NULL` and the index's oid for a primary key.**
+#   * **`pg_get_constraintdef` never raises**: an unknown oid is NULL, as `pg_get_indexdef`'s is.
+#   * **A `UNIQUE` constraint and a `CREATE UNIQUE INDEX` are different things on a real server**
+#     and the same record here: `kd_u_key` is both a `u` row in `pg_constraint` and a unique index
+#     in `pg_index` there, and only the index here. See the divergence list -- closing it is one
+#     bool on the catalog record and therefore a question for a human.
+DROP TABLE IF EXISTS ka		-
+DROP TABLE IF EXISTS kb		-
+DROP TABLE IF EXISTS kc		-
+CREATE TABLE ka (id int8 PRIMARY KEY, x int4 NOT NULL, y text, z int8)		-
+CREATE TABLE kb (a int4, b text)		-
+CREATE TABLE kc (k1 int8, k2 text NOT NULL, v int4, PRIMARY KEY (k1, k2))		-
+CREATE UNIQUE INDEX ka_x_idx ON ka (x)		-
+CREATE INDEX ka_yz_idx ON ka (y, z)		-
+SELECT conname, contype, condeferrable, condeferred, convalidated FROM pg_constraint WHERE conrelid = 'ka'::regclass ORDER BY conname	name,"char",boolean,boolean,boolean	ka_id_not_null|n|f|f|t ; ka_pkey|p|f|f|t ; ka_x_not_null|n|f|f|t
+SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'ka'::regclass ORDER BY conname	name,"char",text	ka_id_not_null|n|NOT NULL id ; ka_pkey|p|PRIMARY KEY (id) ; ka_x_not_null|n|NOT NULL x
+SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'kc'::regclass ORDER BY conname	name,"char",text	kc_k1_not_null|n|NOT NULL k1 ; kc_k2_not_null|n|NOT NULL k2 ; kc_pkey|p|PRIMARY KEY (k1, k2)
+SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'kb'::regclass ORDER BY conname	name,"char",text	-
+SELECT count(*) FROM pg_constraint WHERE conrelid = 'kb'::regclass	bigint	0
+SELECT count(*) FROM pg_constraint WHERE conrelid = 'ka'::regclass	bigint	3
+SELECT conname, conindid = 'ka_pkey'::regclass FROM pg_constraint WHERE conrelid = 'ka'::regclass AND contype = 'p'	name,boolean	ka_pkey|t
+SELECT conname, conrelid = 'ka'::regclass, confrelid FROM pg_constraint WHERE conrelid = 'ka'::regclass AND contype = 'p'	name,boolean,oid	ka_pkey|t|0
+SELECT conname, confupdtype = ' ', confdeltype = ' ', confrelid, conindid = 0 FROM pg_constraint WHERE conrelid = 'ka'::regclass ORDER BY conname	name,boolean,boolean,oid,boolean	ka_id_not_null|t|t|0|t ; ka_pkey|t|t|0|f ; ka_x_not_null|t|t|0|t
+SELECT c.conname FROM pg_constraint c JOIN pg_class t ON c.conrelid = t.oid JOIN pg_namespace n ON n.oid = c.connamespace WHERE c.contype = 'p' AND t.relname = 'ka' AND n.nspname = 'public'	name	ka_pkey
+SELECT conname, pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conrelid = 'ka'::regclass AND contype = 'p'	name,text	ka_pkey|PRIMARY KEY (id)
+SELECT pg_get_constraintdef(999999)	text	\N
+SELECT pg_get_constraintdef(NULL)	text	\N
+SELECT conname FROM pg_constraint c JOIN pg_class t ON c.conrelid = t.oid JOIN pg_namespace n ON n.oid = c.connamespace WHERE c.contype = 'c' AND t.relname = 'ka' AND n.nspname = 'public'	name	-
+SELECT conname FROM pg_constraint c JOIN pg_class t ON c.conrelid = t.oid JOIN pg_namespace n ON n.oid = c.connamespace WHERE c.contype = 'f' AND t.relname = 'ka' AND n.nspname = 'public'	name	-
+SELECT conname FROM pg_constraint c JOIN pg_class t ON c.conrelid = t.oid JOIN pg_namespace n ON n.oid = c.connamespace WHERE c.contype = 'u' AND t.relname = 'ka' AND n.nspname = 'public'	name	-
+SELECT conname FROM pg_constraint c JOIN pg_class t ON c.conrelid = t.oid JOIN pg_namespace n ON n.oid = c.connamespace WHERE c.contype = 'x' AND t.relname = 'ka' AND n.nspname = 'public'	name	-
+DROP TABLE IF EXISTS kd		-
+CREATE TABLE kd (id int8 PRIMARY KEY, u int4 UNIQUE, w text, v int8, UNIQUE (w, v))		-
+SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'kd'::regclass ORDER BY conname	name,"char",text	kd_id_not_null|n|NOT NULL id ; kd_pkey|p|PRIMARY KEY (id) ; kd_u_key|u|UNIQUE (u) ; kd_w_v_key|u|UNIQUE (w, v)
+SELECT i.relname, x.indisunique, x.indisprimary, x.indkey FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'kd'::regclass ORDER BY i.relname	name,boolean,boolean,int2vector	kd_pkey|t|t|1 ; kd_u_key|t|f|2 ; kd_w_v_key|t|f|3 4
+SELECT c.conname, c.conindid = i.oid FROM pg_constraint c JOIN pg_class i ON i.oid = c.conindid WHERE c.conrelid = 'kd'::regclass AND c.contype = 'u' ORDER BY c.conname	name,boolean	kd_u_key|t ; kd_w_v_key|t
+SELECT conname, contype, conkey FROM pg_constraint WHERE conrelid = 'kd'::regclass ORDER BY conname	name,"char",smallint[]	kd_id_not_null|n|{1} ; kd_pkey|p|{1} ; kd_u_key|u|{2} ; kd_w_v_key|u|{3,4}
+SELECT pg_typeof(contype), pg_typeof(conname), pg_typeof(conrelid) FROM pg_constraint WHERE conrelid = 'kd'::regclass AND contype = 'p'	regtype,regtype,regtype	"char"|name|oid

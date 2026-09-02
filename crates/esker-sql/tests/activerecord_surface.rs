@@ -95,7 +95,20 @@ const FIXTURE: &[&str] =
 /// a feature and moved no number is exactly what a counter asserted *exactly* is for — the
 /// shapes it did unblock are measured in `tests/activerecord_subquery.rs` instead, so the day the
 /// catalog functions land the subquery half is already known to work.
-const RUNS: usize = 22;
+///
+/// **Twenty-four now, and both are `pg_constraint`** — phase 13 unit 3. Line 53 is
+/// `check_constraints()` and line 54 is `exclusion_constraints()`, and what makes them run is that
+/// they need **only** the relation and `pg_get_constraintdef`: no array, no `obj_description`, no
+/// `::text` on an oid. Both answer **no rows**, which is the correct answer about this catalog —
+/// `CHECK` and `EXCLUDE` are `0A000` in the DDL, so a table cannot have one.
+///
+/// The four that still do not run are worth naming beside them, because three of them are one
+/// missing feature: line 35 (`columns()`) wants `col_description`, line 37 (`primary_keys()`)
+/// wants `= ANY` over an `int2vector` and `array_position`, line 52 (`indexes()`) wants
+/// `ARRAY(SELECT …)` and `obj_description`, and lines 55 and 56 want `array_agg` and
+/// `c.conkey[idx]`. **The rows behind all of them are here and agree** (`tests/pg_catalog_*.rs`);
+/// what is missing is the array surface, which is another lane's.
+const RUNS: usize = 24;
 
 #[test]
 fn every_statement_activerecord_sends_parses_and_is_answered_by_name() {

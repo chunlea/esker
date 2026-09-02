@@ -1041,6 +1041,12 @@ fn catalog_function(
             oid_argument(args.first())?,
             column_argument(args.get(1))?,
         ),
+        // The `pretty` flag changes nothing this node prints: it re-wraps a long `CHECK`
+        // expression on a real server, and there are no `CHECK` constraints here.
+        CatalogFunc::PgGetConstraintdef => crate::catalog::pg_constraint::constraint_definition(
+            env.relations()?,
+            oid_argument(args.first())?,
+        ),
         // Resolved before the plan was built (`crate::exec::Executor::bound`). One here means the
         // resolution was skipped, and answering it from the row would be a catalog read per row.
         CatalogFunc::RegClass => {
