@@ -617,6 +617,7 @@ pub(super) fn returning_columns(items: &[SelectItem], table: &TableDef) -> Resul
     let scope = Scope::single(table);
     let select = Select {
         from: Some(crate::plan::TableRef::bare(table.name.clone())),
+        ctes: Vec::new(),
         joins: Vec::new(),
         projection: items.to_vec(),
         filter: None,

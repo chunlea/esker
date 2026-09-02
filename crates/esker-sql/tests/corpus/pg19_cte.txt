@@ -1,0 +1,105 @@
+# What a real PostgreSQL 19beta1 does with a **non-recursive CTE** -- `WITH a AS (…) SELECT …`,
+# phase 12 unit 3 (`docs/plans/phase-12-subquery.md`). Captured before a line of the
+# implementation, in ONE session inside `BEGIN ... ROLLBACK` with `ON_ERROR_ROLLBACK on`, so the
+# shared oracle is left exactly as it was found.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THE FOUR THAT DECIDE THE IMPLEMENTATION:
+#
+#   1. **An unreferenced CTE is still analysed.** `WITH t AS (SELECT nope FROM ct_a) SELECT 1` is
+#      `42703`, and so are a missing relation and a column alias list of the wrong length. An
+#      implementation that inlines a CTE where it is referenced -- which is what this node does,
+#      because PostgreSQL 12+ inlines a single-reference CTE and the observable behaviour is what
+#      is matched -- would never look at a CTE nobody references, and would answer one row.
+#   2. **A CTE cannot be referenced before it is written, and that includes by itself.** Both are
+#      `42P01 relation "a" does not exist` with a **DETAIL and a HINT** that name the WITH item and
+#      suggest `WITH RECURSIVE` -- three parts no reader would invent.
+#   3. **The nouns are different.** A CTE's wrong-length alias list is `WITH query "t" has 1
+#      columns available but 2 columns specified` where a derived table's is `table "t" has …`, and
+#      a duplicate CTE name is `WITH query name "t" specified more than once` where two `FROM`
+#      entries of one name are `table name "t" specified more than once`. Same SQLSTATEs, four
+#      sentences.
+#   4. **`MATERIALIZED` and `NOT MATERIALIZED` change nothing observable.** PostgreSQL 12+ inlines
+#      a single-reference CTE and materialises a multi-reference one, and both spellings of the
+#      hint return the same rows -- which is what makes "inline it everywhere" a plan difference
+#      rather than an answer difference.
+#
+# And one that is not a trap but is worth having: a CTE **shadows a real table of the same name**,
+# and `WITH RECURSIVE` over a non-recursive body runs on a real server (this node refuses the
+# keyword by name -- contract C2, and `docs/plans/phase-12-subquery.md` §4).
+CREATE TABLE ct_a (id int8 PRIMARY KEY, n text, k int8)		-
+INSERT INTO ct_a VALUES (1, 'one', 7), (2, 'two', NULL), (3, NULL, 9)		-
+CREATE TABLE ct_b (id int8 PRIMARY KEY, a_id int8, v int8)		-
+INSERT INTO ct_b VALUES (10, 1, 100), (11, 1, 200), (12, 3, NULL)		-
+
+# --- the ordinary shape
+WITH t AS (SELECT id, n FROM ct_a) SELECT * FROM t ORDER BY id	bigint,text	1|one ; 2|two ; 3|\N
+WITH t AS (SELECT id, n FROM ct_a) SELECT id FROM t ORDER BY id	bigint	1 ; 2 ; 3
+WITH t AS (SELECT id, n FROM ct_a) SELECT t.id FROM t ORDER BY t.id	bigint	1 ; 2 ; 3
+WITH t AS (SELECT id FROM ct_a) SELECT count(*) FROM t	bigint	3
+WITH t AS (SELECT id FROM ct_a) SELECT * FROM t AS u ORDER BY u.id	bigint	1 ; 2 ; 3
+WITH t AS (SELECT id FROM ct_a) SELECT * FROM t t2 ORDER BY t2.id	bigint	1 ; 2 ; 3
+WITH t AS (SELECT id FROM ct_a) SELECT * FROM t WHERE id > 1 ORDER BY id	bigint	2 ; 3
+WITH t AS (SELECT id FROM ct_a) SELECT * FROM t ORDER BY t.id	bigint	1 ; 2 ; 3
+WITH t AS (SELECT id FROM ct_a ORDER BY id DESC LIMIT 2) SELECT * FROM t	bigint	3 ; 2
+WITH t AS (SELECT DISTINCT a_id FROM ct_b) SELECT count(*) FROM t	bigint	2
+WITH t AS (SELECT a_id, count(*) AS c FROM ct_b GROUP BY a_id) SELECT * FROM t ORDER BY a_id	bigint,bigint	1|2 ; 3|1
+WITH t AS (SELECT id AS "Q" FROM ct_a) SELECT "Q" FROM t ORDER BY 1	bigint	1 ; 2 ; 3
+WITH t AS (SELECT id FROM ct_a) SELECT * FROM ct_a ORDER BY id	bigint,text,bigint	1|one|7 ; 2|two|\N ; 3|\N|9
+WITH t AS (SELECT id FROM ct_a) SELECT 1	integer	1
+
+# --- referenced more than once, and joined to itself
+WITH t AS (SELECT id FROM ct_a) SELECT (SELECT count(*) FROM t), (SELECT max(id) FROM t)	bigint,bigint	3|3
+WITH t AS (SELECT id FROM ct_a) SELECT * FROM t x JOIN t y ON x.id = y.id ORDER BY x.id	bigint,bigint	1|1 ; 2|2 ; 3|3
+WITH t AS (SELECT id FROM ct_a) SELECT * FROM t, t	!42712 table name "t" specified more than once
+WITH t AS (SELECT id FROM ct_a) SELECT a.id FROM ct_a a JOIN t ON t.id = a.id ORDER BY a.id	bigint	1 ; 2 ; 3
+WITH t AS (SELECT id FROM ct_a) SELECT * FROM t JOIN ct_b b ON b.a_id = t.id ORDER BY t.id, b.id	bigint,bigint,bigint,bigint	1|10|1|100 ; 1|11|1|200 ; 3|12|3|\N
+WITH t AS (SELECT id FROM ct_a) SELECT id FROM ct_a WHERE id IN (SELECT id FROM t) ORDER BY id	bigint	1 ; 2 ; 3
+WITH t AS (SELECT id FROM ct_a) SELECT id FROM ct_a WHERE EXISTS (SELECT 1 FROM t WHERE t.id = 9) ORDER BY id	bigint	-
+WITH t AS (SELECT id FROM ct_a) SELECT * FROM (SELECT id FROM t) AS u ORDER BY id	bigint	1 ; 2 ; 3
+
+# --- a WITH inside a subquery and inside a derived table
+SELECT * FROM (WITH t AS (SELECT id FROM ct_a) SELECT * FROM t) AS u ORDER BY id	bigint	1 ; 2 ; 3
+SELECT id FROM ct_a WHERE id IN (WITH t AS (SELECT a_id FROM ct_b) SELECT a_id FROM t) ORDER BY id	bigint	1 ; 3
+
+# --- one CTE reading an earlier one, and the forward reference that is not allowed
+WITH a AS (SELECT id FROM ct_a), b AS (SELECT id FROM a WHERE id > 1) SELECT * FROM b ORDER BY id	bigint	2 ; 3
+WITH a AS (SELECT id FROM ct_a), b AS (SELECT count(*) AS c FROM a) SELECT * FROM b	bigint	3
+WITH b AS (SELECT id FROM a), a AS (SELECT id FROM ct_a) SELECT * FROM b	!42P01 relation "a" does not exist DETAIL: There is a WITH item named "a", but it cannot be referenced from this part of the query. HINT: Use WITH RECURSIVE, or re-order the WITH items to remove forward references.
+WITH t AS (SELECT id FROM t) SELECT * FROM t	!42P01 relation "t" does not exist DETAIL: There is a WITH item named "t", but it cannot be referenced from this part of the query. HINT: Use WITH RECURSIVE, or re-order the WITH items to remove forward references.
+
+# --- the column alias list, and the noun that is not "table"
+WITH t (p) AS (SELECT id FROM ct_a) SELECT p FROM t ORDER BY p	bigint	1 ; 2 ; 3
+WITH t (p, q) AS (SELECT id, n FROM ct_a) SELECT * FROM t ORDER BY p	bigint,text	1|one ; 2|two ; 3|\N
+WITH t (p) AS (SELECT id, n FROM ct_a) SELECT * FROM t ORDER BY p	bigint,text	1|one ; 2|two ; 3|\N
+WITH t (p, q) AS (SELECT id FROM ct_a) SELECT * FROM t	!42P10 WITH query "t" has 1 columns available but 2 columns specified
+WITH t (p, q) AS (SELECT id, n FROM ct_a) SELECT id FROM t	!42703 column "id" does not exist
+WITH t (p, q) AS (SELECT id FROM ct_a) SELECT 1	!42P10 WITH query "t" has 1 columns available but 2 columns specified
+
+# --- AN UNREFERENCED CTE IS STILL ANALYSED
+WITH t AS (SELECT nope FROM ct_a) SELECT 1	!42703 column "nope" does not exist
+WITH t AS (SELECT id FROM nosuch) SELECT 1	!42P01 relation "nosuch" does not exist
+WITH a AS (SELECT id FROM ct_a), b AS (SELECT nope FROM a) SELECT 1	!42703 column "nope" does not exist
+
+# --- names: a CTE shadows a table, and two CTEs may not share one
+WITH ct_a AS (SELECT 99 AS id) SELECT * FROM ct_a	integer	99
+WITH ct_a AS (SELECT 99 AS id) SELECT id FROM ct_a	integer	99
+WITH t AS (SELECT id FROM ct_a), t AS (SELECT 1) SELECT * FROM t	!42712 WITH query name "t" specified more than once
+WITH t AS (SELECT 1 AS a, 2 AS a) SELECT * FROM t	integer,integer	1|2
+WITH t AS (SELECT 1 AS a, 2 AS a) SELECT a FROM t	!42702 column reference "a" is ambiguous
+WITH t AS (SELECT id FROM ct_a) SELECT * FROM t ORDER BY p	!42703 column "p" does not exist
+WITH t AS (SELECT id FROM ct_a) SELECT t.nope FROM t	!42703 column t.nope does not exist
+
+# --- the hint that changes a plan and not an answer
+WITH t AS MATERIALIZED (SELECT id FROM ct_a) SELECT * FROM t ORDER BY id	bigint	1 ; 2 ; 3
+WITH t AS NOT MATERIALIZED (SELECT id FROM ct_a) SELECT * FROM t ORDER BY id	bigint	1 ; 2 ; 3
+
+# --- what this phase does not do
+WITH RECURSIVE t AS (SELECT 1 AS n) SELECT * FROM t	integer	1
+WITH RECURSIVE t (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT * FROM t	integer	1 ; 2 ; 3
+WITH t AS (DELETE FROM ct_b WHERE id = 12 RETURNING id) SELECT * FROM t	bigint	12
+WITH t AS (INSERT INTO ct_b VALUES (99, 1, 1) RETURNING id) SELECT * FROM t	bigint	99
+WITH t AS (UPDATE ct_b SET v = 1 WHERE id = 10 RETURNING id) SELECT * FROM t	bigint	10

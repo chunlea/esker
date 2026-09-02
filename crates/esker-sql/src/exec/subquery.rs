@@ -35,11 +35,12 @@ use crate::value::{Datum, PgDatum};
 /// with none — which is nearly all of them — is planned from the `Select` the caller already has,
 /// and nothing is cloned.
 pub(super) fn present(select: &Select) -> bool {
-    if select
-        .from
-        .iter()
-        .chain(select.joins.iter().map(|join| &join.table))
-        .any(|entry| entry.derived.is_some())
+    if !select.ctes.is_empty()
+        || select
+            .from
+            .iter()
+            .chain(select.joins.iter().map(|join| &join.table))
+            .any(|entry| entry.derived.is_some())
     {
         return true;
     }
@@ -83,6 +84,13 @@ pub(super) fn plan_subqueries(
     outcome?;
     // The `FROM` entries after the expressions, because a derived table's plan is what the
     // statement's own scope is built from and a `LIMIT` may name neither.
+    // The `WITH` items first, and **all** of them: an unreferenced CTE is still analysed on a real
+    // server (`WITH t AS (SELECT nope FROM a) SELECT 1` is `42703`, measured) and inlining alone
+    // would never look at one. The plan each produces here is thrown away; what is kept is the
+    // error it would have raised.
+    for cte in &mut select.ctes {
+        plan_derived(cte, tenant, txn, tables)?;
+    }
     for entry in std::iter::once(&mut select.from)
         .flatten()
         .chain(select.joins.iter_mut().map(|join| &mut join.table))
@@ -117,8 +125,12 @@ fn plan_derived(
     // Refusing a short one reads like the obvious symmetry and would refuse a statement a real
     // server runs.
     if derived.columns.len() > planned.columns.len() {
+        // The **noun differs**: a CTE's is `WITH query "t" has …` and a derived table's is
+        // `table "t" has …`, under the same SQLSTATE. Measured, both, and a client that greps the
+        // text sees two sentences.
+        let what = if derived.cte { "WITH query" } else { "table" };
         return Err(SqlError::InvalidColumnReference(format!(
-            "table \"{name}\" has {} columns available but {} columns specified",
+            "{what} \"{name}\" has {} columns available but {} columns specified",
             planned.columns.len(),
             derived.columns.len()
         )));
@@ -207,7 +219,15 @@ pub(super) fn relation_of(
     tables: &dyn Tables,
 ) -> Result<std::sync::Arc<crate::catalog::TableDef>> {
     match entry.derived.as_ref() {
-        None => tables.get(&entry.name),
+        // A name that is a `WITH` item this part of the query cannot see becomes PostgreSQL's
+        // three-part answer -- **only when the catalog has no such relation**, because a later CTE
+        // does not hide a real table of the same name from an earlier body (measured).
+        None => tables.get(&entry.name).map_err(|error| match error {
+            SqlError::UndefinedTable(name) if entry.hidden_cte => {
+                SqlError::ForwardCteReference(name)
+            }
+            other => other,
+        }),
         Some(derived) => derived.def.clone().ok_or_else(|| {
             SqlError::Internal("a derived table reached the planner without a shape".to_owned())
         }),

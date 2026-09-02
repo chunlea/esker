@@ -1,0 +1,182 @@
+//! `WITH a AS (…) SELECT …`, and why a CTE is a derived table wearing a name.
+//!
+//! `docs/plans/phase-12-subquery.md` §3 unit 3. A non-recursive CTE is **inlined at each
+//! reference**: every `FROM a` that names one is replaced by the derived table `FROM (…) AS a`,
+//! and from there unit 2's machinery does the rest — a synthetic relation, a plan under it, the
+//! alias list on top. There is no CTE node, no CTE scope and no second name-resolution path.
+//!
+//! # Why inlining is not an approximation
+//!
+//! PostgreSQL 12+ **inlines a single-reference CTE** and materialises a multi-reference one, and
+//! `MATERIALIZED` / `NOT MATERIALIZED` ask for one or the other by hand. All three spellings
+//! return the same rows — measured, `tests/corpus/pg19_cte.txt` — because a non-recursive CTE over
+//! a read-only statement has nothing in it that can be run twice to different effect: this node
+//! refuses every volatile function inside a subquery, so there is no `nextval` and no `random()`
+//! to disagree with itself. What inlining changes is the **plan**, and [ADR
+//! 0031](../../../docs/adr/0031-rails-compatibility-is-measured.md) matches observable behaviour
+//! rather than plans.
+//!
+//! The cost is real and is recorded rather than hidden: a CTE referenced twice is **read twice**.
+//! `TODO(post-v1)`: materialise a multi-reference CTE once, which is a shared plan node and a
+//! lifetime question this phase does not need to answer.
+//!
+//! # The three things the capture decided
+//!
+//! * **An unreferenced CTE is still analysed.** `WITH t AS (SELECT nope FROM a) SELECT 1` is
+//!   `42703` on a real server, and inlining alone would never look at `t`. So every CTE is carried
+//!   on [`crate::plan::Select::ctes`] whether anything referenced it or not, and the planner plans
+//!   all of them.
+//! * **A CTE may not be referenced before it is written, including by itself**, and both are
+//!   `42P01` with a `DETAIL` naming the WITH item and a `HINT` suggesting `WITH RECURSIVE`. That
+//!   falls out of substituting in order: a name not yet defined is simply not substituted, and the
+//!   relation lookup that follows is the error — with the two extra fields added here, because a
+//!   bare `relation "a" does not exist` would send a reader looking for a missing table.
+//! * **A CTE shadows a real table of the same name.** Substitution replaces the `FROM` entry
+//!   before anything looks in the catalog, so this is the order of operations rather than a rule.
+
+use crate::error::{Result, SqlError};
+use crate::plan::{Derived, Expr, Select, TableRef};
+
+/// Replaces every reference to `name` in `select` with the derived table `body` is, in place.
+///
+/// The reference's own alias survives: `FROM t AS u` becomes a derived table called `u`, which is
+/// what a real server calls it (measured, `ORDER BY u.id` resolves). Answers whether anything
+/// referenced it, which is only used to say so — every CTE is analysed either way.
+pub fn inline(select: &mut Select, name: &str, body: &Select, columns: &[String]) -> bool {
+    let mut referenced = false;
+    for_each_from_mut(select, &mut |entry| {
+        // `hidden_cte` is the one thing that stops this: an entry inside an **earlier** item's
+        // body that names this one is a forward reference, and substituting it would answer the
+        // statement PostgreSQL refuses. It was marked when that body was lowered, before this item
+        // existed to be substituted.
+        if entry.derived.is_some() || entry.hidden_cte || entry.name != name {
+            return;
+        }
+        referenced = true;
+        // The alias replaces the CTE's name the way it replaces a table's, so what the derived
+        // table is called is what a qualifier in this query has to write.
+        *entry = TableRef {
+            name: entry.referred_as().to_owned(),
+            alias: None,
+            derived: Some(Box::new(Derived::from_cte(
+                Box::new(body.clone()),
+                columns.to_vec(),
+            ))),
+            hidden_cte: false,
+        };
+    });
+    referenced
+}
+
+/// Marks every `FROM` entry in `select` that names a `WITH` item it cannot see.
+///
+/// Called on one CTE's body once the items **before** it have been inlined, so what is left of
+/// `names` is exactly what this body may not reference: the items after it, and itself. The flag
+/// only changes the message, and only when the catalog lookup fails — a later CTE does not hide a
+/// real table of the same name from an earlier body, measured.
+pub fn mark_hidden(select: &mut Select, names: &[String]) {
+    for_each_from_mut(select, &mut |entry| {
+        if entry.derived.is_none() && names.contains(&entry.name) {
+            entry.hidden_cte = true;
+        }
+    });
+}
+
+/// Two CTEs of one name. `42712`, and the noun is **`WITH query name`** rather than `table name` —
+/// the same SQLSTATE two `FROM` entries of one name get, with a different sentence. Measured.
+pub fn refuse_duplicate(names: &[String], name: &str) -> Result<()> {
+    if names.iter().any(|earlier| earlier == name) {
+        return Err(SqlError::DuplicateCteName(name.to_owned()));
+    }
+    Ok(())
+}
+
+/// Every `FROM` entry reachable from this statement, including the ones inside its subqueries and
+/// inside the derived tables it already has.
+///
+/// The recursion is what makes `WHERE id IN (SELECT id FROM t)` and `FROM (SELECT id FROM t) AS u`
+/// resolve `t` — both measured. It stops at nothing, because a `WITH` nested inside a subquery has
+/// already been inlined by the time this runs: `lower_query` handles its own `WITH` before the
+/// statement holding it does, so a name an inner CTE defined is gone before an outer one looks for
+/// it. That is the shadowing rule, obtained by construction rather than by a scope.
+fn for_each_from_mut(select: &mut Select, visit: &mut impl FnMut(&mut TableRef)) {
+    for entry in std::iter::once(&mut select.from)
+        .flatten()
+        .chain(select.joins.iter_mut().map(|join| &mut join.table))
+    {
+        // Whether it was derived **before** the visit, which is what stops a self-reference from
+        // substituting for ever: `WITH t AS (SELECT id FROM t)` puts a body containing `FROM t`
+        // where `FROM t` was, and descending into it would find the same name again. A body that
+        // was just substituted in is already complete, because the items before it were inlined
+        // into it before it was stored.
+        let descend = entry.derived.is_some();
+        visit(entry);
+        if descend && let Some(derived) = entry.derived.as_mut() {
+            for_each_from_mut(&mut derived.select, visit);
+        }
+    }
+    for cte in &mut select.ctes {
+        if let Some(derived) = cte.derived.as_mut() {
+            for_each_from_mut(&mut derived.select, visit);
+        }
+    }
+    let mut walk = |expr: &mut Expr| for_each_subquery_mut(expr, visit);
+    for item in &mut select.projection {
+        if let crate::plan::SelectItem::Expr { expr, .. } = item {
+            walk(expr);
+        }
+    }
+    for join in &mut select.joins {
+        if let Some(on) = &mut join.on {
+            walk(on);
+        }
+    }
+    for expr in select
+        .filter
+        .iter_mut()
+        .chain(&mut select.having)
+        .chain(&mut select.limit)
+        .chain(&mut select.offset)
+        .chain(&mut select.group_by)
+    {
+        walk(expr);
+    }
+    for item in &mut select.order_by {
+        for_each_subquery_mut(&mut item.expr, visit);
+    }
+}
+
+/// Into every sub-select an expression holds.
+fn for_each_subquery_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut TableRef)) {
+    match expr {
+        Expr::Subquery(sub) => {
+            for_each_from_mut(&mut sub.select, visit);
+            if let Some(operand) = &mut sub.operand {
+                for_each_subquery_mut(operand, visit);
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            for_each_subquery_mut(left, visit);
+            for_each_subquery_mut(right, visit);
+        }
+        Expr::Not(inner) => for_each_subquery_mut(inner, visit),
+        Expr::IsNull { operand, .. } => for_each_subquery_mut(operand, visit),
+        Expr::InList { operand, list, .. } => {
+            for_each_subquery_mut(operand, visit);
+            for item in list {
+                for_each_subquery_mut(item, visit);
+            }
+        }
+        Expr::Aggregate(call) => {
+            for arg in &mut call.args {
+                for_each_subquery_mut(arg, visit);
+            }
+        }
+        Expr::Literal(_)
+        | Expr::Parameter(_)
+        | Expr::Column { .. }
+        | Expr::Ordinal { .. }
+        | Expr::Default
+        | Expr::Sequence(_) => {}
+    }
+}

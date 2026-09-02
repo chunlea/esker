@@ -1836,7 +1836,6 @@ fn lower_projection(items: &[SelectItem]) -> Result<Vec<plan::SelectItem>> {
     reason = "most of it is the refusal list, which is the point: one line per clause not honoured"
 )]
 fn lower_query(query: &Query) -> Result<plan::Select> {
-    refuse_if(query.with.is_some(), "WITH")?;
     refuse_if(!query.locks.is_empty(), "a row-level locking clause")?;
     refuse_if(query.fetch.is_some(), "FETCH FIRST")?;
     refuse_if(query.for_clause.is_some(), "FOR XML/JSON")?;
@@ -1989,8 +1988,9 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
         Some(other) => return Err(SqlError::unsupported(format!("the limit clause {other}"))),
     };
 
-    Ok(plan::Select {
+    let mut lowered = plan::Select {
         from,
+        ctes: Vec::new(),
         joins,
         projection,
         filter,
@@ -2000,7 +2000,87 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
         order_by,
         limit,
         offset,
-    })
+    };
+    lower_with(query.with.as_ref(), &mut lowered)?;
+    Ok(lowered)
+}
+
+/// The `WITH` list, inlined into the statement it belongs to.
+///
+/// It runs **after** the statement is lowered, because what it does is a rewrite of the lowered
+/// form: a `FROM a` that names a CTE becomes the derived table `FROM (…) AS a`, and unit 2's
+/// machinery does everything from there (`crate::plan::cte`). It runs **before** the statement
+/// holding this one, which is what makes an inner `WITH` shadow an outer one — by the time the
+/// outer list looks for its own names, the inner one has already taken the ones it defined.
+///
+/// Each item is lowered against the ones before it, in the order written, so a forward reference
+/// is simply a name nothing substituted — and the relation lookup that follows it is the `42P01`
+/// with the `DETAIL` and `HINT` PostgreSQL sends. That ordering is also what makes a
+/// self-reference an error rather than a loop.
+fn lower_with(with: Option<&sqlparser::ast::With>, into: &mut plan::Select) -> Result<()> {
+    let Some(with) = with else { return Ok(()) };
+    // A second evaluation model -- a working table iterated to a fixed point, with its own
+    // termination and its own memory bound. It is a phase, not a unit
+    // (`docs/plans/phase-12-subquery.md` §4).
+    refuse_if(with.recursive, "WITH RECURSIVE")?;
+
+    // Every name up front, because deciding whether a reference is a *forward* one needs the list
+    // the body being lowered is not yet part of.
+    let all_names: Vec<String> = with
+        .cte_tables
+        .iter()
+        .map(|cte| ident(&cte.alias.name))
+        .collect();
+    let mut named: Vec<String> = Vec::new();
+    let mut bodies: Vec<(String, plan::Select, Vec<String>)> = Vec::new();
+    for cte in &with.cte_tables {
+        // `AS MATERIALIZED` and `AS NOT MATERIALIZED` are **accepted and change nothing**, which
+        // is not the usual "reject rather than ignore": both spellings return the same rows on a
+        // real server (measured), because what they choose is a plan and not an answer.
+        refuse_if(cte.from.is_some(), "a WITH item with a FROM identifier")?;
+        let name = ident(&cte.alias.name);
+        plan::cte::refuse_duplicate(&named, &name)?;
+        // Data-modifying CTEs are the read path's write half and are a unit of their own.
+        let body = match cte.query.body.as_ref() {
+            SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) => {
+                return Err(SqlError::unsupported("a data-modifying WITH item"));
+            }
+            _ => lower_query(&cte.query)?,
+        };
+        let mut body = body;
+        // Each item sees the ones before it and **not itself**: `WITH t AS (SELECT id FROM t)` is
+        // the same `42P01` a forward reference gets, measured.
+        for (earlier, earlier_body, earlier_columns) in &bodies {
+            plan::cte::inline(&mut body, earlier, earlier_body, earlier_columns);
+        }
+        // What is left of the list is what this body may not reference -- itself included -- and a
+        // reference to one of those is only an error if the catalog has no such relation.
+        plan::cte::mark_hidden(&mut body, &all_names[bodies.len()..]);
+        let columns: Vec<String> = cte
+            .alias
+            .columns
+            .iter()
+            .map(|column| ident(&column.name))
+            .collect();
+        named.push(name.clone());
+        bodies.push((name, body, columns));
+    }
+
+    for (name, body, columns) in &bodies {
+        plan::cte::inline(into, name, body, columns);
+        // Carried whether anything referenced it or not: **an unreferenced CTE is still
+        // analysed**, measured, and inlining alone would never look at one.
+        into.ctes.push(plan::TableRef {
+            name: name.clone(),
+            alias: None,
+            derived: Some(Box::new(plan::Derived::from_cte(
+                Box::new(body.clone()),
+                columns.clone(),
+            ))),
+            hidden_cte: false,
+        });
+    }
+    Ok(())
 }
 
 /// One `JOIN`, lowered. Every join this crate does not run is named rather than approximated.
@@ -2098,6 +2178,7 @@ fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
                 name: object_name(name)?,
                 alias,
                 derived: None,
+                hidden_cte: false,
             })
         }
         // `FROM (SELECT …) AS t` — a **derived table**. The alias is optional on PostgreSQL 19
@@ -2131,6 +2212,7 @@ fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
                     Box::new(lower_query(subquery)?),
                     columns,
                 ))),
+                hidden_cte: false,
             })
         }
         other => Err(SqlError::unsupported(format!("the FROM item {other}"))),

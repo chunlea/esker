@@ -61,6 +61,16 @@ pub struct TableRef {
     pub alias: Option<String>,
     /// `FROM (SELECT …) AS t` — the sub-select this entry is, or `None` for a real relation.
     pub derived: Option<Box<crate::plan::Derived>>,
+    /// Set when this name is a `WITH` item **this part of the query cannot see** — a forward
+    /// reference, or a CTE referring to itself.
+    ///
+    /// It changes the message and nothing else, and only when the lookup fails: a later CTE does
+    /// **not** hide a real table of the same name from an earlier body (measured), so the flag is
+    /// read after the catalog has been asked and answered `42P01`. Then it becomes PostgreSQL's
+    /// three-part answer, whose `DETAIL` is the half that matters — a bare `relation "a" does not
+    /// exist` sends a reader looking for a missing table when what is wrong is the order of two
+    /// things they wrote.
+    pub hidden_cte: bool,
 }
 
 impl TableRef {
@@ -71,6 +81,7 @@ impl TableRef {
             name,
             alias: None,
             derived: None,
+            hidden_cte: false,
         }
     }
 
@@ -118,6 +129,14 @@ pub struct Select {
     /// The table, or `None` for `SELECT 1` — a single row of no table at all, which drivers use to
     /// check a connection. With any [`Select::joins`] it is the left-most one.
     pub from: Option<TableRef>,
+    /// The `WITH` list, lowered, as the derived tables they are inlined as.
+    ///
+    /// Every CTE is here whether anything referenced it or not, and that is the whole reason the
+    /// field exists: **an unreferenced CTE is still analysed** — `WITH t AS (SELECT nope FROM a)
+    /// SELECT 1` is `42703` on a real server, measured — and inlining alone would never look at
+    /// one nobody references. The planner plans each of these for its errors and throws the plan
+    /// away (`crate::plan::cte`).
+    pub ctes: Vec<TableRef>,
     /// The joins, in the order written. Empty for a statement with none.
     ///
     /// A chain rather than one, because `ActiveRecord`'s `indexes()` sends four tables and three

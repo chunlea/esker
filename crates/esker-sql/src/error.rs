@@ -56,6 +56,22 @@ impl fmt::Display for Severity {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SqlError {
+    /// A `WITH` item referenced before it was written, or by itself.
+    ///
+    /// The whole three-part answer, verbatim: without the `DETAIL` a user reads `relation "a" does
+    /// not exist` and goes looking for a missing table, where what is actually wrong is the
+    /// *order* of two things they wrote. Measured — and the `HINT` names `WITH RECURSIVE`, which
+    /// is the feature that would make it legal and which this node refuses by name.
+    #[error("relation \"{0}\" does not exist")]
+    ForwardCteReference(String),
+
+    /// Two `WITH` items of one name.
+    ///
+    /// `42712`, the code two `FROM` entries of one name get — with a different sentence, because
+    /// PostgreSQL says `WITH query name` where it says `table name`. Measured, both.
+    #[error("WITH query name \"{0}\" specified more than once")]
+    DuplicateCteName(String),
+
     /// A subquery has the wrong number of columns for where it was written.
     ///
     /// `42601` like a syntax error, and **not** [`SqlError::Syntax`], which prefixes its message
@@ -826,8 +842,11 @@ impl SqlError {
             SqlError::UndefinedTable(_)
             | SqlError::UndefinedTableForDrop(_)
             | SqlError::MissingFromEntry(_)
+            | SqlError::ForwardCteReference(_)
             | SqlError::InvalidFromReference { .. } => sqlstate::UNDEFINED_TABLE,
-            SqlError::DuplicateTableName(_) => sqlstate::DUPLICATE_ALIAS,
+            SqlError::DuplicateTableName(_) | SqlError::DuplicateCteName(_) => {
+                sqlstate::DUPLICATE_ALIAS
+            }
             SqlError::AmbiguousColumn(_) | SqlError::AmbiguousOrderBy(_) => {
                 sqlstate::AMBIGUOUS_COLUMN
             }
@@ -955,6 +974,10 @@ impl SqlError {
     #[must_use]
     pub fn detail(&self) -> Option<String> {
         match self {
+            SqlError::ForwardCteReference(name) => Some(format!(
+                "There is a WITH item named \"{name}\", but it cannot be referenced from this \
+                 part of the query."
+            )),
             SqlError::UniqueViolation { key: Some(key), .. } => {
                 Some(format!("{key} already exists."))
             }
@@ -988,6 +1011,10 @@ impl SqlError {
     #[must_use]
     pub fn hint(&self) -> Option<String> {
         match self {
+            SqlError::ForwardCteReference(_) => Some(
+                "Use WITH RECURSIVE, or re-order the WITH items to remove forward references."
+                    .to_owned(),
+            ),
             SqlError::Syntax { hint, .. } => hint.map(str::to_owned),
             // PostgreSQL owns `CHECKPOINT` for forcing a WAL checkpoint, so this node refuses it
             // by name (contract C2) and does not take the word for something else. A user who

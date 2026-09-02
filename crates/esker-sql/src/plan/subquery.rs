@@ -244,6 +244,11 @@ pub struct Derived {
     pub select: Box<Select>,
     /// `AS t(a, b)` — the column names, in order, or empty for a bare alias.
     pub columns: Vec<String>,
+    /// Whether this derived table is an inlined CTE, which changes **one message and nothing
+    /// else**: a wrong-length column alias list is `WITH query "t" has 1 columns available but 2
+    /// columns specified` for a CTE and `table "t" has …` for a `FROM (SELECT …)`. Same SQLSTATE,
+    /// two sentences, measured — and a client that greps the text sees two.
+    pub cte: bool,
     /// The plan its rows come from, filled by [`crate::exec::subquery::plan_subqueries`].
     pub plan: Option<Box<Node>>,
     /// The relation it looks like from above: one column per output column of the sub-select,
@@ -255,7 +260,7 @@ pub struct Derived {
 /// [`SubqueryExpr`]'s equality is hand-written, and the same two fields left out.
 impl PartialEq for Derived {
     fn eq(&self, other: &Self) -> bool {
-        self.select == other.select && self.columns == other.columns
+        self.select == other.select && self.columns == other.columns && self.cte == other.cte
     }
 }
 
@@ -266,8 +271,18 @@ impl Derived {
         Derived {
             select,
             columns,
+            cte: false,
             plan: None,
             def: None,
+        }
+    }
+
+    /// The same thing, arrived at by inlining a `WITH` item.
+    #[must_use]
+    pub fn from_cte(select: Box<Select>, columns: Vec<String>) -> Self {
+        Derived {
+            cte: true,
+            ..Derived::new(select, columns)
         }
     }
 }
