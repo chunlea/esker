@@ -108,13 +108,18 @@ const FIXTURE: &[&str] =
 /// `::text` on an oid. Both answer **no rows**, which is the correct answer about this catalog —
 /// `CHECK` and `EXCLUDE` are `0A000` in the DDL, so a table cannot have one.
 ///
-/// The four that still do not run are worth naming beside them, because three of them are one
-/// missing feature: line 35 (`columns()`) wants `col_description`, line 37 (`primary_keys()`)
-/// wants `= ANY` over an `int2vector` and `array_position`, line 52 (`indexes()`) wants
-/// `ARRAY(SELECT …)` and `obj_description`, and lines 55 and 56 want `array_agg` and
+/// **Twenty-six now, and the twenty-sixth is `columns()`** — line 35, the statement
+/// `ActiveRecord` sends about every table it has ever heard of, and the one this file's previous
+/// paragraph named as wanting `col_description`. The catalog-functions unit built it, and what
+/// makes the statement run is that `col_description` was the **only** thing it was missing.
+///
+/// The three that still do not run are all one missing feature, and it is not this lane's: line 37
+/// (`primary_keys()`) wants `= ANY` over an `int2vector` and `array_position`, line 52
+/// (`indexes()`) wants `ARRAY(SELECT …)`, and lines 55 and 56 want `array_agg` and
 /// `c.conkey[idx]`. **The rows behind all of them are here and agree** (`tests/pg_catalog_*.rs`);
-/// what is missing is the array surface, which is another lane's.
-const RUNS: usize = 25;
+/// what is missing is the array surface. `obj_description`, which line 52 also wanted, is no
+/// longer part of why it fails.
+const RUNS: usize = 26;
 
 #[test]
 fn every_statement_activerecord_sends_parses_and_is_answered_by_name() {

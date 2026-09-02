@@ -1068,6 +1068,15 @@ fn catalog_function(
             env.relations()?,
             oid_argument(args.first())?,
         ),
+        // **NULL for every input, and that is the answer rather than a stub.** A comment is a row
+        // in `pg_description`, `COMMENT ON` is `0A000` naming itself, and a partitioned table is
+        // `PARTITION BY`, which is too — so this node has nothing for any of the three to find,
+        // and NULL is exactly what a real server answers when it has nothing either. The
+        // arguments are still evaluated, because an error inside one is the user's error: it is
+        // the *result* that is empty here, not the call.
+        CatalogFunc::ColDescription
+        | CatalogFunc::ObjDescription
+        | CatalogFunc::PgGetPartkeydef => Datum::Null,
         // Resolved before the plan was built (`crate::exec::Executor::bound`). One here means the
         // resolution was skipped, and answering it from the row would be a catalog read per row.
         CatalogFunc::RegClass => {

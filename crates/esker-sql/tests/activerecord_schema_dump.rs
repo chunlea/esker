@@ -87,6 +87,12 @@ fn every_schema_dump_answer_is_postgresql_19_s() {
 /// Contract C2 in the one place it matters most: a client that cannot get an answer must be able
 /// to read which feature is missing out of the error. Every one of these is ADR 0031 category (c),
 /// and every one of them is a clause wrapped around rows this node already has.
+///
+/// **Two entries left this list when the catalog-functions unit landed**: the comment columns,
+/// `col_description` and `obj_description`, which now answer NULL rather than refusing — and NULL
+/// is what a real server answers about a table nobody has commented on. What remains is one
+/// missing feature wearing two hats: the array surface, as `ARRAY(SELECT …)` over
+/// `generate_subscripts` and as `= ANY` over an `int2vector`.
 #[test]
 fn what_the_schema_dump_still_needs_names_itself() {
     let mut node = parity::Node::new(&[
@@ -101,15 +107,6 @@ fn what_the_schema_dump_still_needs_names_itself() {
              generate_subscripts(d.indkey, 1) AS k ORDER BY k) FROM pg_index d \
              WHERE d.indrelid = 'nd'::regclass",
             "array",
-        ),
-        // `indexes()` and `columns()`: the comment columns.
-        (
-            "SELECT col_description('nd'::regclass, 1)",
-            "col_description",
-        ),
-        (
-            "SELECT pg_catalog.obj_description('nd_a_idx'::regclass, 'pg_class')",
-            "obj_description",
         ),
         // `primary_keys()`, `unique_constraints()`, `foreign_keys()`: the array over a key.
         (

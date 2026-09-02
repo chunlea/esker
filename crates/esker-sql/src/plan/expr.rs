@@ -281,6 +281,30 @@ pub enum CatalogFunc {
     /// Like `pg_get_indexdef` its argument is a column, and like it, an oid that names no
     /// constraint is NULL rather than an error.
     PgGetConstraintdef,
+    /// `col_description(oid, attnum)`: a column's comment.
+    ///
+    /// **Always NULL here, and that is the answer rather than a stub**: a comment is a row in
+    /// `pg_description`, `COMMENT ON` is `0A000` naming itself, and a server with no comments has
+    /// none to return. A real server answers NULL for every one of these too — an uncommented
+    /// column, an attnum out of range, a negative one, an oid that names nothing, and a NULL
+    /// argument are all NULL there. The one subscript that is neither out of range nor a column
+    /// is **`0`, which returns the *table's* comment** — `pg_description` keys a table comment as
+    /// `objsubid = 0` and this function does not special-case it. Measured; it costs nothing here
+    /// and it is the value most likely to be passed by accident.
+    ColDescription,
+    /// `obj_description(oid)` and `obj_description(oid, catalog)`: an object's comment.
+    ///
+    /// NULL for the same reason. The catalog-name argument is **not validated** on a real server —
+    /// `obj_description(oid, 'nosuchcatalog')` is NULL rather than an error, because the name
+    /// filters `pg_description.classoid` and one that matches nothing matches nothing.
+    ObjDescription,
+    /// `pg_get_partkeydef(oid)`: a partitioned table's key, as `RANGE (r)` / `LIST (s)` /
+    /// `HASH (id, r)`.
+    ///
+    /// NULL here because this node has no partitioned tables — `PARTITION BY` is `0A000` naming
+    /// itself — and NULL is what a real server answers for a table that is not partitioned, for
+    /// an **index**, and for an oid that names nothing. Measured all three.
+    PgGetPartkeydef,
     /// `'name'::regclass`: the oid of a relation, by name.
     ///
     /// Not a function a client can call by that name — it is the cast, lowered to one, because a
@@ -303,6 +327,11 @@ impl CatalogFunc {
             () if name.eq_ignore_ascii_case("pg_get_constraintdef") => {
                 Some(CatalogFunc::PgGetConstraintdef)
             }
+            () if name.eq_ignore_ascii_case("col_description") => Some(CatalogFunc::ColDescription),
+            () if name.eq_ignore_ascii_case("obj_description") => Some(CatalogFunc::ObjDescription),
+            () if name.eq_ignore_ascii_case("pg_get_partkeydef") => {
+                Some(CatalogFunc::PgGetPartkeydef)
+            }
             () => None,
         }
     }
@@ -315,6 +344,9 @@ impl CatalogFunc {
             CatalogFunc::PgGetExpr => "pg_get_expr",
             CatalogFunc::PgGetIndexdef => "pg_get_indexdef",
             CatalogFunc::PgGetConstraintdef => "pg_get_constraintdef",
+            CatalogFunc::ColDescription => "col_description",
+            CatalogFunc::ObjDescription => "obj_description",
+            CatalogFunc::PgGetPartkeydef => "pg_get_partkeydef",
             CatalogFunc::RegClass => "regclass",
         }
     }
@@ -328,11 +360,11 @@ impl CatalogFunc {
     #[must_use]
     pub fn arities(self) -> &'static [usize] {
         match self {
-            CatalogFunc::FormatType => &[2],
+            CatalogFunc::FormatType | CatalogFunc::ColDescription => &[2],
             CatalogFunc::PgGetExpr => &[2, 3],
             CatalogFunc::PgGetIndexdef => &[1, 3],
-            CatalogFunc::PgGetConstraintdef => &[1, 2],
-            CatalogFunc::RegClass => &[1],
+            CatalogFunc::PgGetConstraintdef | CatalogFunc::ObjDescription => &[1, 2],
+            CatalogFunc::PgGetPartkeydef | CatalogFunc::RegClass => &[1],
         }
     }
 
@@ -343,7 +375,10 @@ impl CatalogFunc {
             CatalogFunc::FormatType
             | CatalogFunc::PgGetExpr
             | CatalogFunc::PgGetIndexdef
-            | CatalogFunc::PgGetConstraintdef => ColumnType::Text,
+            | CatalogFunc::PgGetConstraintdef
+            | CatalogFunc::ColDescription
+            | CatalogFunc::ObjDescription
+            | CatalogFunc::PgGetPartkeydef => ColumnType::Text,
             // An `oid` on a real server, and a `bigint` here for the reason `pg_class.oid` is one.
             CatalogFunc::RegClass => ColumnType::Int8,
         }

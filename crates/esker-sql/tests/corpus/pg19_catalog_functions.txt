@@ -1,0 +1,70 @@
+# `col_description`, `obj_description` and `pg_get_partkeydef`, as a real PostgreSQL 19beta1
+# answers them — boot statements 15, 29, 31 and 32.
+#
+# NOT types. All three come out of `ActiveRecord`'s `columns()` and its schema-dump path, and
+# `col_description` is rung 3's blocker at `443074a`.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# CAPTURED AGAINST A TABLE WITH NO COMMENT AND NO PARTITION KEY, which is the state this node is
+# always in — `COMMENT ON` and `PARTITION BY` are both `0A000` naming themselves here. So every
+# line below is NULL on **both** servers, and that is the point rather than a limitation: NULL is
+# what a real server answers whenever it has nothing to find, and this node has nothing to find
+# ever. Captured in one session with an **inline** `\gdesc`, and the table is dropped at the end,
+# so nothing is left on the oracle and no system catalog was written to.
+#
+# THE HARNESS CAPTURE IS `captures/pg19_catalog_functions.txt` AND IS NOT REPLAYED HERE. It runs
+# inside `BEGIN … ROLLBACK` because `COMMENT ON` writes to `pg_description`; replaying it against
+# this node makes the first `COMMENT ON` abort the block and turns every line after it into
+# `25P02`, which measures the transaction rule rather than these three functions. Its evidence
+# still stands and three facts from it are worth carrying:
+#
+#   * **`col_description(oid, 0)` returns the TABLE's comment, not a column's.** `pg_description`
+#     keys a table comment as `objsubid = 0` and the function does not special-case it. Attnum 0
+#     is the one subscript that is neither out of range nor a column, and it is the value most
+#     likely to be passed by accident. Below it is NULL because there is no comment at all.
+#   * **`COMMENT ON … IS ''` is the same as `IS NULL`** — PostgreSQL deletes the row rather than
+#     storing an empty comment, so a comment that *is* the empty string cannot be observed.
+#   * **`pg_get_partkeydef` answers `RANGE (r)` / `LIST (s)` / `HASH (id, r)`** for a partitioned
+#     table — upper-case strategy, one space, the key list parenthesised — and NULL for everything
+#     that is not one, an **index** included. That is the shape to build to when partitioning
+#     lands; below it is NULL because nothing here is partitioned.
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **All three answer NULL far more often than they raise.** An out-of-range attnum (`99`), a
+#     negative one (`-1`), an oid that names nothing at all (`999999`), a NULL argument, an index
+#     rather than a table, and an unknown *catalog name* are every one of them NULL. There is no
+#     "not found" error anywhere in this file — every refusal below is an **arity** failure.
+#   * **`obj_description`'s catalog-name argument is not validated.**
+#     `obj_description(oid, 'nosuchcatalog')` is NULL, not an error: the name filters
+#     `pg_description.classoid`, and one that matches nothing matches nothing. The one-argument
+#     form exists too and answers the same as `(oid, 'pg_class')`.
+#   * **Every arity failure is `42883`, and the DETAIL says *number*, not types** — the same
+#     sentence `current_schemas()` and `format_type(23)` give, and not the "given argument types"
+#     one a wrong-type call gets.
+DROP TABLE IF EXISTS cfx		-
+CREATE TABLE cfx (id int8 PRIMARY KEY, a int4, b text)		-
+SELECT obj_description('cfx'::regclass)	text	\N
+SELECT obj_description('cfx'::regclass, 'pg_class')	text	\N
+SELECT obj_description('cfx'::regclass, 'nosuchcatalog')	text	\N
+SELECT obj_description('cfx'::regclass, 'pg_type')	text	\N
+SELECT col_description('cfx'::regclass, 0)	text	\N
+SELECT col_description('cfx'::regclass, 1)	text	\N
+SELECT col_description('cfx'::regclass, 2)	text	\N
+SELECT col_description('cfx'::regclass, 99)	text	\N
+SELECT col_description('cfx'::regclass, -1)	text	\N
+SELECT pg_get_partkeydef('cfx'::regclass)	text	\N
+SELECT pg_get_partkeydef('cfx'::regclass) IS NULL	boolean	t
+SELECT pg_get_partkeydef('cfx_pkey'::regclass)	text	\N
+SELECT obj_description('cfx_pkey'::regclass, 'pg_class')	text	\N
+SELECT obj_description(999999), obj_description(999999, 'pg_class'), col_description(999999, 1), pg_get_partkeydef(999999)	text,text,text,text	\N|\N|\N|\N
+SELECT obj_description(NULL), col_description(NULL, 1), col_description('cfx'::regclass, NULL), pg_get_partkeydef(NULL)	text,text,text,text	\N|\N|\N|\N
+SELECT col_description('cfx'::regclass)	!42883 function col_description(regclass) does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT obj_description()	!42883 function obj_description() does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT pg_get_partkeydef()	!42883 function pg_get_partkeydef() does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT pg_get_partkeydef('cfx'::regclass, 1)	!42883 function pg_get_partkeydef(regclass, integer) does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT col_description('cfx'::regclass, 2, 3)	!42883 function col_description(regclass, integer, integer) does not exist DETAIL: No function of that name accepts the given number of arguments.
+DROP TABLE cfx		-

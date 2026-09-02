@@ -2061,8 +2061,28 @@ fn argument_type_name(arg: &sqlparser::ast::FunctionArg) -> String {
             _ => "unknown",
         }
         .to_owned(),
+        // **A cast names the type it casts to.** `'cf'::regclass` is a `regclass` argument, not an
+        // `unknown` one, and `col_description('cf'::regclass)` says so on a real server. Without
+        // this the message named the *literal underneath* the cast, which is the one thing the
+        // user did not write.
+        Expr::Cast { data_type, .. } => cast_type_name(data_type),
+        Expr::Nested(inner) => argument_type_name(&FunctionArg::Unnamed(FunctionArgExpr::Expr(
+            (**inner).clone(),
+        ))),
         _ => "unknown".to_owned(),
     }
+}
+
+/// What a cast's target is called in a `42883`.
+///
+/// The stored types answer with their own PostgreSQL names; `regclass` and the other catalog
+/// pseudo-types are not stored types here and are spelled from the syntax, which is what they are
+/// on a real server too — `'x'::regclass` is a cast to `regclass` whatever the catalog holds.
+fn cast_type_name(data_type: &DataType) -> String {
+    if let Ok((ty, _)) = lower_type(data_type) {
+        return ty.name().to_owned();
+    }
+    data_type.to_string().to_ascii_lowercase()
 }
 
 /// The one schema this node has. `public`, which is what `current_schema()` answers.
