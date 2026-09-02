@@ -68,6 +68,12 @@ fn encode_row(values: &[Value]) -> Vec<u8> {
                 varint::put_u64(v.len() as u64, &mut out);
                 out.extend_from_slice(v);
             }
+            // The baseline corpus has no `numeric` column. Mirroring the row codec's
+            // kind-byte/zigzag-scale/digits encoding would mean a second decimal parser in a
+            // crate that must not depend on `esker-sql` (ADR 0022) — so adding a numeric column
+            // to the corpus means writing that parser here, deliberately, rather than inheriting
+            // a wrong number from a wildcard arm.
+            Value::Numeric(_) => unimplemented!("the compression corpus has no numeric column"),
         }
     }
     out

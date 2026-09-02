@@ -136,6 +136,7 @@ impl ColumnData {
             | ColumnType::Bpchar
             | ColumnType::Json
             | ColumnType::Jsonb
+            | ColumnType::Numeric
             | ColumnType::Bytea => ColumnData::Bytes {
                 offsets: vec![0],
                 data: Vec::new(),
@@ -184,6 +185,9 @@ impl ColumnData {
                         | ColumnType::Bpchar
                         | ColumnType::Json
                         | ColumnType::Jsonb
+                        // A `numeric` is stored as its text, so it rides the byte run like a
+                        // string; `stats::fit` says why its *bounds* are not a number's.
+                        | ColumnType::Numeric
                         | ColumnType::Bytea
                 )
         )
@@ -421,7 +425,7 @@ impl ColumnBuilder {
             Value::Double(v) => self.doubles.push(*v),
             Value::Real(v) => self.floats.push(*v),
             Value::Bool(v) => self.bools.push(*v),
-            Value::Text(v) => self.push_bytes(v.as_bytes())?,
+            Value::Text(v) | Value::Numeric(v) => self.push_bytes(v.as_bytes())?,
             Value::Bytea(v) => self.push_bytes(v)?,
         }
         Ok(())
@@ -478,6 +482,7 @@ impl ColumnBuilder {
             | ColumnType::Bpchar
             | ColumnType::Json
             | ColumnType::Jsonb
+            | ColumnType::Numeric
             | ColumnType::Bytea => ColumnData::Bytes {
                 offsets: std::mem::replace(&mut self.offsets, vec![0]),
                 data: std::mem::take(&mut self.data),

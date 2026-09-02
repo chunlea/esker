@@ -146,11 +146,15 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "the same `0A000`. A real server answers no rows, having compared 1 against 1.5 as \
              `numeric`.",
         ),
-        // --- a cast of a *number*, which is still `0A000` --------------------------------------
+        // --- a cast of a *number*, which now runs ----------------------------------------------
         //
-        // Seven entries stood here and have gone: a cast of a **string** literal runs since the
-        // json unit, which needed `'{"a":1}'::jsonb`, and the harness failed until they were
-        // deleted. What is left is the cast of a numeric literal, which nothing has needed yet.
+        // Twelve entries stood here and have gone. A cast of a **string** literal runs since the
+        // json unit, which needed `'{"a":1}'::jsonb`; a cast of a **numeric** literal runs since
+        // the numeric unit, which needed `1.5::numeric` and taught `cast_literal_text` to read a
+        // number and a leading sign. Both times the harness failed until the entries were
+        // deleted, which is the point of listing a divergence rather than describing one.
+        //
+        // What is left is the pair below, and it is not about casting a number at all.
         (
             "SELECT 1 = '1'::text",
             "**a cast of a number is `0A000` naming itself.** These lines are the corpus's \
@@ -159,21 +163,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              numeric side and so cannot get it wrong there: the quoted string is `unknown`.",
         ),
         ("SELECT '1'::text = 1", "a cast, as above."),
-        ("SELECT 1::int8 = '1'", "a cast, as above."),
-        (
-            "SELECT 1::bigint = '9223372036854775807'",
-            "a cast, as above.",
-        ),
-        (
-            "SELECT 1.5::float8 = '1.5'",
-            "a cast, as above; the `float8` half.",
-        ),
-        (
-            "SELECT 1.5::float8 = 'NaN'",
-            "a cast, as above. `NaN` reads and then equals nothing, which is the one value where \
-             reading a string successfully still answers `f`.",
-        ),
-        ("SELECT 1.5::float8 = 'x'", "a cast, as above."),
         // --- the collation, already declared ---------------------------------------------------
         (
             "SELECT 'B' < 'a'",

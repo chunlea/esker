@@ -855,6 +855,42 @@ pub enum SqlError {
         detail: String,
     },
 
+    /// A `numeric` special cast to an integer: **`0A000`**, not `22003`.
+    ///
+    /// The one SQLSTATE nobody would predict here — `'NaN'::numeric::int` is
+    /// `cannot convert NaN to integer` with a *feature-not-supported* code, where the same cast
+    /// of a value that is merely too large is `22003 integer out of range`. Measured; PostgreSQL
+    /// treats "this value has no integer at all" as a missing conversion rather than an overflow.
+    #[error("cannot convert {value} to {target}")]
+    CannotConvert {
+        /// `NaN` or `infinity` — PostgreSQL spells the first with capitals and the second without.
+        value: &'static str,
+        /// The target type, as it is named in the message.
+        target: &'static str,
+    },
+
+    /// A `numeric` value that does not fit its declared precision and scale: `22003`.
+    ///
+    /// Two conditions with one code and **two different sentences**, which is what makes the
+    /// detail worth carrying rather than deriving: an infinity cannot be held by any typmod at
+    /// all, where a finite value that is merely too large names the bound it broke. `NaN` fits
+    /// every typmod and reaches neither.
+    #[error("numeric field overflow")]
+    NumericFieldOverflow {
+        /// `A field with precision 10, scale 2 must round to an absolute value less than 10^8.`
+        detail: String,
+    },
+
+    /// A declared `numeric` precision outside `1..=1000`: `22023`. PostgreSQL shouts the type
+    /// name in this one.
+    #[error("NUMERIC precision {0} must be between 1 and 1000")]
+    NumericPrecisionOutOfRange(i32),
+
+    /// A declared `numeric` scale outside `-1000..=1000`: `22023`, and the scale is **signed** —
+    /// `numeric(10,-2)` is a real type.
+    #[error("NUMERIC scale {0} must be between -1000 and 1000")]
+    NumericScaleOutOfRange(i32),
+
     /// A `float(p)` whose precision is outside `1..=53`: `22023`.
     ///
     /// Its own message, not [`SqlError::TypeLengthTooSmall`]'s: PostgreSQL says "precision" and
@@ -1002,9 +1038,10 @@ impl SqlError {
     #[allow(clippy::too_many_lines)]
     pub fn sqlstate(&self) -> &'static str {
         match self {
-            SqlError::FeatureNotSupported(_) | SqlError::SnapshotIsolationRequired => {
-                sqlstate::FEATURE_NOT_SUPPORTED
-            }
+            SqlError::FeatureNotSupported(_)
+            | SqlError::CannotConvert { .. }
+            | SqlError::NonStandardStringLiterals
+            | SqlError::SnapshotIsolationRequired => sqlstate::FEATURE_NOT_SUPPORTED,
             SqlError::CardinalityViolation => sqlstate::CARDINALITY_VIOLATION,
             SqlError::SubqueryColumns(_)
             | SqlError::Syntax { .. }
@@ -1052,6 +1089,7 @@ impl SqlError {
             | SqlError::FloatOutOfRange { .. }
             | SqlError::IntegerLiteralOutOfRange(_)
             | SqlError::BigintOutOfRange
+            | SqlError::NumericFieldOverflow { .. }
             | SqlError::SetvalOutOfBounds { .. } => sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
             SqlError::InvalidDatetimeFormat { .. } => sqlstate::INVALID_DATETIME_FORMAT,
             SqlError::CannotCast { .. } => sqlstate::CANNOT_COERCE,
@@ -1118,9 +1156,10 @@ impl SqlError {
             | SqlError::InvalidSnapshotIdentifier(_)
             | SqlError::InvalidParameterValue { .. }
             | SqlError::NonBooleanParameter(_)
+            | SqlError::NumericPrecisionOutOfRange(_)
+            | SqlError::NumericScaleOutOfRange(_)
             | SqlError::ParameterOutOfRange { .. } => sqlstate::INVALID_PARAMETER_VALUE,
             SqlError::CannotChangeParameter(_) => sqlstate::CANT_CHANGE_RUNTIME_PARAM,
-            SqlError::NonStandardStringLiterals => sqlstate::FEATURE_NOT_SUPPORTED,
             SqlError::SnapshotDoesNotExist(_) | SqlError::UnrecognizedParameter(_) => {
                 sqlstate::UNDEFINED_OBJECT
             }
@@ -1175,7 +1214,8 @@ impl SqlError {
             | SqlError::CheckViolation { row, .. } => {
                 Some(format!("Failing row contains ({row})."))
             }
-            SqlError::ForeignKeyViolation { detail, .. }
+            SqlError::NumericFieldOverflow { detail }
+            | SqlError::ForeignKeyViolation { detail, .. }
             | SqlError::ForeignKeyStillReferenced { detail, .. }
             | SqlError::DependentTable { detail, .. } => Some(detail.clone()),
             SqlError::UndefinedOperator { .. } => {

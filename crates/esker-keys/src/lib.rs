@@ -20,6 +20,7 @@
 
 pub mod codec;
 pub mod columnar;
+pub mod numeric;
 pub mod prefix;
 pub mod row;
 pub mod value;

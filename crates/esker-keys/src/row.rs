@@ -61,6 +61,7 @@
 
 use esker_base::varint;
 
+use crate::numeric::{Decimal, Numeric};
 use crate::value::{ColumnType, Datum, sort_bits_of_f64};
 use crate::{codec, prefix};
 
@@ -132,6 +133,13 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
         Datum::Text(v) => {
             varint::put_u64(v.len() as u64, out);
             out.extend_from_slice(v.as_bytes());
+        }
+        // A kind byte, then — for a finite value only — the scale and the digits. **The digits
+        // are stored as written**, trailing zeros included: the scale is part of a `numeric` and
+        // `1.00` is not `1.0`. The key encoding below is the one that normalises, because there
+        // two spellings of one number have to become one key.
+        Datum::Numeric(v) => {
+            put_numeric(v, out);
         }
         Datum::Bytea(v) => {
             varint::put_u64(v.len() as u64, out);
@@ -305,6 +313,7 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
                 other => return Err(corrupt(format!("boolean byte {other} is neither 0 nor 1"))),
             }
         }
+        ColumnType::Numeric => return take_numeric(bytes),
         ColumnType::Text
         | ColumnType::Varchar
         | ColumnType::Bpchar
@@ -456,7 +465,58 @@ fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
         Datum::Double(v) => codec::encode_u64(sort_bits_of_f64(*v), out),
         Datum::Text(v) => codec::encode_bytes(v.as_bytes(), out),
         Datum::Bytea(v) => codec::encode_bytes(v, out),
+        // **The one encoding here that normalises**, and it has to: `1.0` and `1.00` are
+        // different values of this type that *compare equal*, and an index key whose bytes
+        // differed for them would let a `UNIQUE` index hold both. The row keeps the scale it was
+        // written with; the key keeps the number.
+        Datum::Numeric(v) => encode_key_numeric(v, out),
     }
+}
+
+/// A `numeric` as bytes that sort by value.
+///
+/// Five ordered groups, so a byte comparison answers before any digit is looked at:
+/// `-Infinity` < negative < zero < positive < `Infinity` < `NaN`. **`NaN` sorts above everything**,
+/// which is PostgreSQL's rule for this type and the opposite of `float8`'s — measured,
+/// `'NaN'::numeric > 1` is `t`.
+///
+/// Inside the positive group the value is the exponent then the digits, both in a form that
+/// compares as bytes: a bigger exponent is a bigger number whatever the digits, and two numbers
+/// with one exponent are ordered by their digits from the left. The negative group is the same
+/// bytes **complemented**, which reverses the order the way two's complement does for an integer.
+fn encode_key_numeric(value: &Numeric, out: &mut Vec<u8>) {
+    const NEG_INFINITY: u8 = 0;
+    const NEGATIVE: u8 = 1;
+    const ZERO: u8 = 2;
+    const POSITIVE: u8 = 3;
+    const POS_INFINITY: u8 = 4;
+    const NAN: u8 = 5;
+
+    let decimal = match value {
+        Numeric::NegInfinity => return out.push(NEG_INFINITY),
+        Numeric::PosInfinity => return out.push(POS_INFINITY),
+        Numeric::NaN => return out.push(NAN),
+        Numeric::Finite(decimal) => decimal.normalised(),
+    };
+    if decimal.is_zero() {
+        return out.push(ZERO);
+    }
+    out.push(if decimal.negative { NEGATIVE } else { POSITIVE });
+    // The exponent, in the codec's own order-preserving `i64`: big-endian with the sign bit
+    // flipped. Offsetting it by a constant instead would sort correctly only until the exponent
+    // reached the end of the offset, and this one is total over every `i64`.
+    let mut body = Vec::with_capacity(9 + decimal.digits.len());
+    codec::encode_i64(decimal.exponent(), &mut body);
+    // Digits with a terminator below every digit, so `1` sorts before `11` — the same reason a
+    // string encoding needs one.
+    body.extend(decimal.digits.iter().map(|digit| digit + 1));
+    body.push(0);
+    if decimal.negative {
+        for byte in &mut body {
+            *byte = !*byte;
+        }
+    }
+    out.extend_from_slice(&body);
 }
 
 /// Reads **index**-key columns back, which is what a secondary index lookup does to recover the
@@ -509,6 +569,10 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
             let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
             (Datum::Int8(value), rest)
         }
+        // Read back **normalised**, which is what was written: an index key holds the number and
+        // the row holds the scale it was spelled with. A decoder that claimed otherwise would be
+        // inventing trailing zeros the key never carried.
+        ColumnType::Numeric => return decode_key_numeric(bytes),
         ColumnType::Int4 => {
             let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
             let value = i32::try_from(value)
@@ -608,6 +672,134 @@ fn successor(mut prefix: Vec<u8>) -> Vec<u8> {
     }
     // An all-0xFF prefix has no successor; an empty vector is the end of the key space.
     prefix
+}
+
+/// The other half of [`encode_key_numeric`].
+fn decode_key_numeric(bytes: &[u8]) -> Result<(Datum, &[u8])> {
+    let (&group, rest) = bytes
+        .split_first()
+        .ok_or_else(|| corrupt("a numeric key with no group byte"))?;
+    let negative = match group {
+        0 => return Ok((Datum::Numeric(Numeric::NegInfinity), rest)),
+        2 => return Ok((Datum::Numeric(Numeric::Finite(Decimal::zero())), rest)),
+        4 => return Ok((Datum::Numeric(Numeric::PosInfinity), rest)),
+        5 => return Ok((Datum::Numeric(Numeric::NaN), rest)),
+        1 => true,
+        3 => false,
+        other => return Err(corrupt(format!("numeric key group byte {other}"))),
+    };
+    let flip = |byte: u8| if negative { !byte } else { byte };
+    let (head, rest) = rest
+        .split_first_chunk::<8>()
+        .ok_or_else(|| corrupt("a numeric key with no exponent"))?;
+    let mut exponent_bytes = *head;
+    for byte in &mut exponent_bytes {
+        *byte = flip(*byte);
+    }
+    let (exponent, _) = codec::decode_i64(&exponent_bytes)
+        .map_err(|_| corrupt("a numeric key with a short exponent"))?;
+    let mut digits = Vec::new();
+    let mut rest = rest;
+    loop {
+        let (&byte, tail) = rest
+            .split_first()
+            .ok_or_else(|| corrupt("a numeric key with no terminator"))?;
+        rest = tail;
+        let byte = flip(byte);
+        if byte == 0 {
+            break;
+        }
+        if byte > 10 {
+            return Err(corrupt(format!("numeric key digit byte {byte}")));
+        }
+        digits.push(byte - 1);
+    }
+    if digits.is_empty() {
+        return Err(corrupt("a numeric key with no digits"));
+    }
+    let scale = i64::try_from(digits.len()).unwrap_or(i64::MAX) - 1 - exponent;
+    let scale =
+        i32::try_from(scale).map_err(|_| corrupt(format!("a numeric key scale {scale}")))?;
+    Ok((
+        Datum::Numeric(Numeric::Finite(Decimal {
+            negative,
+            digits,
+            scale,
+        })),
+        rest,
+    ))
+}
+
+/// Tags for the four shapes a [`Numeric`] can be. Ours, like every tag in this format.
+const NUMERIC_NAN: u8 = 0;
+const NUMERIC_POS_INFINITY: u8 = 1;
+const NUMERIC_NEG_INFINITY: u8 = 2;
+const NUMERIC_FINITE: u8 = 3;
+const NUMERIC_FINITE_NEGATIVE: u8 = 4;
+
+/// One `numeric`, into a row.
+///
+/// A kind byte, and for a finite value a zigzag scale and the digits **one per byte**. One byte
+/// per digit rather than two per byte: a `numeric` here is a column of a row and not a hot loop,
+/// and a nibble-packed form would need a length parity bit to say whether the last nibble is a
+/// digit — a second thing to get wrong for half the bytes of a value that is usually short.
+fn put_numeric(value: &Numeric, out: &mut Vec<u8>) {
+    let decimal = match value {
+        Numeric::NaN => return out.push(NUMERIC_NAN),
+        Numeric::PosInfinity => return out.push(NUMERIC_POS_INFINITY),
+        Numeric::NegInfinity => return out.push(NUMERIC_NEG_INFINITY),
+        Numeric::Finite(decimal) => decimal,
+    };
+    out.push(if decimal.negative {
+        NUMERIC_FINITE_NEGATIVE
+    } else {
+        NUMERIC_FINITE
+    });
+    // Zigzag, because a scale is signed and small in both directions: `numeric(10,-2)` is real.
+    varint::put_u64(varint::zigzag_encode(i64::from(decimal.scale)), out);
+    varint::put_u64(decimal.digits.len() as u64, out);
+    out.extend_from_slice(&decimal.digits);
+}
+
+/// The other half of [`put_numeric`].
+fn take_numeric(bytes: &[u8]) -> Result<(Datum, &[u8])> {
+    let (&kind, rest) = bytes
+        .split_first()
+        .ok_or_else(|| corrupt("a numeric with no kind byte"))?;
+    let negative = match kind {
+        NUMERIC_NAN => return Ok((Datum::Numeric(Numeric::NaN), rest)),
+        NUMERIC_POS_INFINITY => return Ok((Datum::Numeric(Numeric::PosInfinity), rest)),
+        NUMERIC_NEG_INFINITY => return Ok((Datum::Numeric(Numeric::NegInfinity), rest)),
+        NUMERIC_FINITE => false,
+        NUMERIC_FINITE_NEGATIVE => true,
+        other => return Err(corrupt(format!("numeric kind byte {other}"))),
+    };
+    let (scale, consumed) =
+        varint::get_u64(rest).map_err(|error| corrupt(format!("numeric scale: {error}")))?;
+    let rest = &rest[consumed..];
+    let (len, consumed) =
+        varint::get_u64(rest).map_err(|error| corrupt(format!("numeric length: {error}")))?;
+    let len = usize::try_from(len).map_err(|_| corrupt("a numeric longer than this machine"))?;
+    let (digits, rest) = rest[consumed..]
+        .split_at_checked(len)
+        .ok_or_else(|| corrupt(format!("a numeric of {len} digits is truncated")))?;
+    if digits.is_empty() || digits.iter().any(|digit| *digit > 9) {
+        return Err(corrupt("a numeric digit outside 0..=9"));
+    }
+    Ok((
+        Datum::Numeric(Numeric::Finite(Decimal {
+            negative,
+            digits: digits.to_vec(),
+            scale: unzigzag(scale)?,
+        })),
+        rest,
+    ))
+}
+
+/// A signed scale back from [`varint::zigzag_encode`], refused if it is not an `i32`.
+fn unzigzag(value: u64) -> Result<i32> {
+    let wide = varint::zigzag_decode(value);
+    i32::try_from(wide).map_err(|_| corrupt(format!("a numeric scale of {wide}")))
 }
 
 #[cfg(test)]
@@ -987,6 +1179,26 @@ mod tests {
             ColumnType::Int8 => any::<i64>().prop_map(Datum::Int8).boxed(),
             ColumnType::Int4 => any::<i32>().prop_map(Datum::Int4).boxed(),
             ColumnType::Date => any::<i32>().prop_map(Datum::Date).boxed(),
+            // Weighted towards the shapes the encoding has cases for: the three specials, zero,
+            // and a finite value at a scale on either side of nothing.
+            ColumnType::Numeric => prop_oneof![
+                6 => (any::<bool>(), proptest::collection::vec(0u8..=9, 1..12), -6i32..6)
+                    .prop_map(|(negative, digits, scale)| Datum::Numeric(
+                        crate::numeric::Numeric::Finite(crate::numeric::Decimal {
+                            negative: negative && !digits.iter().all(|d| *d == 0),
+                            digits,
+                            scale,
+                        })
+                    )),
+                4 => proptest::sample::select(vec![
+                    crate::numeric::Numeric::NaN,
+                    crate::numeric::Numeric::PosInfinity,
+                    crate::numeric::Numeric::NegInfinity,
+                    crate::numeric::Numeric::Finite(crate::numeric::Decimal::zero()),
+                ])
+                .prop_map(Datum::Numeric),
+            ]
+            .boxed(),
             ColumnType::Int2 => any::<i16>().prop_map(Datum::Int2).boxed(),
             ColumnType::Real => prop_oneof![
                 7 => any::<f32>().prop_map(Datum::Real),
@@ -1053,6 +1265,106 @@ mod tests {
             let row: Vec<_> = types.iter().map(|ty| values_of(*ty)).collect();
             (Just(types), proptest::collection::vec(row, rows..=rows))
         })
+    }
+
+    /// **The key bytes sort the way the numbers do**, and equal numbers written differently
+    /// produce the *same* bytes.
+    ///
+    /// `tests/proptest_codec.rs` opens by naming the failure this catches: an encoding that is
+    /// "right way up, round-trips perfectly and sorts wrongly". A `numeric` key is the encoding
+    /// in this module most able to do that — five ordered groups, an exponent ahead of the
+    /// digits, a terminator under every digit and a complement over the whole body when the
+    /// value is negative — and a round-trip property sees none of it.
+    ///
+    /// The ladder is written as groups: within a group every spelling must encode to identical
+    /// bytes, because `1`, `1.0` and `1.00` are one value and an index may hold it once.
+    #[test]
+    fn a_numeric_key_sorts_the_way_the_number_does() {
+        use crate::numeric::{Decimal, Numeric};
+
+        /// `digits` as written, with `scale` of them after the point.
+        fn finite(negative: bool, digits: &str, scale: i32) -> Numeric {
+            Numeric::Finite(Decimal {
+                negative,
+                digits: digits.bytes().map(|byte| byte - b'0').collect(),
+                scale,
+            })
+        }
+        let key =
+            |value: &Numeric| index_key(1, 2, 3, &[Datum::Numeric(value.clone())], None).unwrap();
+
+        // Ascending. Every inner slice is one value, spelled every way this codec allows.
+        let ladder: Vec<Vec<Numeric>> = vec![
+            vec![Numeric::NegInfinity],
+            vec![finite(true, "123456789012345678905", 1)],
+            // A negative scale multiplies, so this is -1230 three ways — and it is *below*
+            // -1.5, which is the ordering a magnitude-blind encoding gets backwards.
+            vec![
+                finite(true, "1230", 0),
+                finite(true, "123", -1),
+                finite(true, "12300", 1),
+            ],
+            vec![finite(true, "15", 1)],
+            vec![
+                finite(true, "10", 1),
+                finite(true, "1", 0),
+                finite(true, "100", 2),
+            ],
+            vec![finite(true, "1", 3)],
+            // Zero carries no sign, and every scale of it is the same value.
+            vec![
+                Decimal::zero(),
+                Decimal {
+                    negative: false,
+                    digits: vec![0, 0],
+                    scale: 2,
+                },
+                Decimal {
+                    negative: true,
+                    digits: vec![0],
+                    scale: -2,
+                },
+            ]
+            .into_iter()
+            .map(Numeric::Finite)
+            .collect(),
+            vec![finite(false, "1", 3)],
+            vec![
+                finite(false, "1", 0),
+                finite(false, "10", 1),
+                finite(false, "100", 2),
+            ],
+            vec![finite(false, "15", 1)],
+            vec![finite(false, "9", 0)],
+            // The pair a lexicographic encoding gets wrong: "10" sorts under "9" as text.
+            vec![finite(false, "10", 0)],
+            vec![finite(false, "123", -1), finite(false, "1230", 0)],
+            vec![finite(false, "123456789012345678905", 1)],
+            vec![Numeric::PosInfinity],
+            vec![Numeric::NaN],
+        ];
+
+        for group in &ladder {
+            let first = key(&group[0]);
+            for other in &group[1..] {
+                assert_eq!(
+                    key(other),
+                    first,
+                    "{:?} and {:?} are one value and must be one key",
+                    group[0],
+                    other
+                );
+            }
+        }
+        for pair in ladder.windows(2) {
+            let (low, high) = (key(&pair[0][0]), key(&pair[1][0]));
+            assert!(
+                low < high,
+                "{:?} must sort below {:?}",
+                pair[0][0],
+                pair[1][0]
+            );
+        }
     }
 
     proptest::proptest! {

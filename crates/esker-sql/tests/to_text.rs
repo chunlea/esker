@@ -28,13 +28,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              the padding strip directly — and the line stays here so the operator unit inherits \
              the whole statement rather than half of it.",
         ),
-        (
-            "SELECT 1.0::float8::text, 1.5::real::text",
-            "A cast of a **numeric literal**, which is `0A000` and was before this unit: \
-             `cast_literal_text` reads a string literal and a number is not one. Unrelated to \
-             `::text`, already declared in `tests/unknown_literal.rs`, and closing it is that \
-             unit's business.",
-        ),
     ],
 };
 

@@ -160,6 +160,7 @@ pub fn decode_column(
         | ColumnType::Bpchar
         | ColumnType::Json
         | ColumnType::Jsonb
+        | ColumnType::Numeric
         | ColumnType::Bytea => {
             let run = bytes::decode(encoding, &mut cursor, present)?;
             ColumnData::Bytes {
@@ -278,6 +279,23 @@ mod tests {
                 .boxed(),
             ColumnType::Bytea => prop::collection::vec(any::<u8>(), 0..6)
                 .prop_map(Value::Bytea)
+                .boxed(),
+            // A `numeric` rides the column as its text: the three non-finite spellings, a value
+            // no integer type could hold, and the two zeroes that differ only in scale.
+            ColumnType::Numeric => (0usize..6)
+                .prop_map(|pick| {
+                    Value::Numeric(
+                        [
+                            "0",
+                            "0.00",
+                            "-1.5",
+                            "12345678901234567890.5",
+                            "NaN",
+                            "-Infinity",
+                        ][pick]
+                            .to_owned(),
+                    )
+                })
                 .boxed(),
         };
         prop_oneof![1 => Just(Value::Null), 6 => present]

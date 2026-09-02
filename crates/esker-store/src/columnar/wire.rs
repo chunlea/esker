@@ -103,6 +103,7 @@ fn type_of(value: &Value) -> Option<ValueType> {
         Value::Timestamp(_) => ValueType::Timestamp,
         Value::Double(_) => ValueType::Double,
         Value::Date(_) => ValueType::Date,
+        Value::Numeric(_) => ValueType::Numeric,
     })
 }
 
@@ -120,6 +121,7 @@ fn value_of(value: &Value) -> WireValue {
         Value::Timestamp(ts) => WireValue::Timestamp(*ts),
         Value::Double(double) => WireValue::Double(*double),
         Value::Date(day) => WireValue::Date(*day),
+        Value::Numeric(text) => WireValue::Numeric(text.clone()),
     }
 }
 

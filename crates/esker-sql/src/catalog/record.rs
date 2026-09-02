@@ -134,6 +134,8 @@ const TAG_JSONB: u8 = 14;
 /// Appended by tier 2's first type, never renumbered: a record written before it has no tag above
 /// 14 and decodes unchanged.
 const TAG_DATE: u8 = 15;
+/// Appended by tier 2's hard half, never renumbered.
+const TAG_NUMERIC: u8 = 16;
 
 /// Tags for [`SchemaState`] as stored. Ours, and they must never move: an index read as the wrong
 /// state is an index a node writes when it should not, which is the whole failure ADR 0020 is about.
@@ -184,6 +186,7 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Json => TAG_JSON,
         ColumnType::Jsonb => TAG_JSONB,
         ColumnType::Date => TAG_DATE,
+        ColumnType::Numeric => TAG_NUMERIC,
     }
 }
 
@@ -226,6 +229,7 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_JSON => ColumnType::Json,
         TAG_JSONB => ColumnType::Jsonb,
         TAG_DATE => ColumnType::Date,
+        TAG_NUMERIC => ColumnType::Numeric,
         other => return Err(corrupt(format!("column type tag {other}"))),
     })
 }

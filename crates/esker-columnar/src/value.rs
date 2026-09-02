@@ -82,6 +82,11 @@ pub enum ColumnType {
     Real,
     /// PostgreSQL's `date`: a day, as a signed count from 2000-01-01 in four bytes.
     Date,
+    /// PostgreSQL's `numeric`: an arbitrary-precision decimal, carried as its **text**.
+    ///
+    /// Variable-length like a `Text`, and the text is lossless for this type — the scale is in
+    /// the digits, so a value that goes out as `1.00` comes back as `1.00` and not as `1`.
+    Numeric,
     /// PostgreSQL's `character(n)`, whose internal name is `bpchar`. The same bytes as a `Text`
     /// again; what differs is that its values arrive **already padded** to the column's length, so
     /// byte comparison is the blank-insensitive comparison PostgreSQL specifies.
@@ -96,7 +101,7 @@ pub enum ColumnType {
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 15] = [
+    pub const ALL: [ColumnType; 16] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -112,6 +117,7 @@ impl ColumnType {
         ColumnType::Json,
         ColumnType::Jsonb,
         ColumnType::Date,
+        ColumnType::Numeric,
     ];
 
     /// The tag byte this type is stored as. Frozen: see the module docs.
@@ -134,6 +140,7 @@ impl ColumnType {
             ColumnType::Json => 13,
             ColumnType::Jsonb => 14,
             ColumnType::Date => 15,
+            ColumnType::Numeric => 16,
         }
     }
 
@@ -155,6 +162,7 @@ impl ColumnType {
             13 => ColumnType::Json,
             14 => ColumnType::Jsonb,
             15 => ColumnType::Date,
+            16 => ColumnType::Numeric,
             other => {
                 return Err(Error::corruption(
                     "schema",
@@ -183,6 +191,7 @@ impl ColumnType {
             ColumnType::Json => "json",
             ColumnType::Jsonb => "jsonb",
             ColumnType::Date => "date",
+            ColumnType::Numeric => "numeric",
         }
     }
 
@@ -228,6 +237,8 @@ pub enum Value {
     Real(f32),
     /// A [`ColumnType::Date`], days from 2000-01-01.
     Date(i32),
+    /// A [`ColumnType::Numeric`], as its text.
+    Numeric(String),
 }
 
 impl Value {
@@ -256,6 +267,7 @@ impl Value {
             Value::Double(_) => ty == ColumnType::Double,
             Value::Real(_) => ty == ColumnType::Real,
             Value::Date(_) => ty == ColumnType::Date,
+            Value::Numeric(_) => ty == ColumnType::Numeric,
         }
     }
 
@@ -281,6 +293,7 @@ impl Value {
             Value::Double(_) => ColumnType::Double,
             Value::Real(_) => ColumnType::Real,
             Value::Date(_) => ColumnType::Date,
+            Value::Numeric(_) => ColumnType::Numeric,
         })
     }
 
@@ -296,7 +309,7 @@ impl Value {
             Value::Bool(v) => ValueRef::Bool(*v),
             Value::Double(v) => ValueRef::Double(*v),
             Value::Real(v) => ValueRef::Real(*v),
-            Value::Text(v) => ValueRef::Bytes(v.as_bytes()),
+            Value::Text(v) | Value::Numeric(v) => ValueRef::Bytes(v.as_bytes()),
             Value::Bytea(v) => ValueRef::Bytes(v),
         }
     }
@@ -415,6 +428,11 @@ impl ValueRef<'_> {
             (ValueRef::Int(v), ColumnType::Date) => Value::Date(
                 i32::try_from(v)
                     .map_err(|_| Error::corruption("column", format!("a date column holds {v}")))?,
+            ),
+            (ValueRef::Bytes(v), ColumnType::Numeric) => Value::Numeric(
+                std::str::from_utf8(v)
+                    .map_err(|_| Error::corruption("column", "a numeric column holds non-UTF-8"))?
+                    .to_owned(),
             ),
             (ValueRef::Bytes(v), ColumnType::Bytea) => Value::Bytea(v.to_vec()),
             (

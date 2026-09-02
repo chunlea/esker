@@ -375,6 +375,19 @@ fn literal(rng: &mut Pcg32, ty: ColumnType) -> Value {
         return Value::Null;
     }
     match ty {
+        // The fixed `schema()` has no numeric column, but the generator stays total so that
+        // adding one is a schema edit and not also a panic.
+        ColumnType::Numeric => {
+            let pool = [
+                "0",
+                "0.00",
+                "-1.5",
+                "12345678901234567890.5",
+                "NaN",
+                "-Infinity",
+            ];
+            Value::Numeric(pool[rng.below(pool.len() as u32) as usize].to_owned())
+        }
         ColumnType::Int8 => {
             let pool = [0i64, 1, -1, i64::MIN, i64::MAX, 42, -42, 7];
             Value::Int8(pool[rng.below(pool.len() as u32) as usize])

@@ -151,6 +151,13 @@ pub enum ColumnType {
     /// shortest digits that round-trip at 32 bits — and because a value a `double` holds is
     /// `22003` here at both ends of the range.
     Real,
+    /// PostgreSQL's `numeric` / `decimal`: an **arbitrary-precision decimal whose scale is part
+    /// of the value**.
+    ///
+    /// `1.0`, `1.00` and `1.000` are three values of this type, all equal and all printed as
+    /// written — which is the property ADR 0031 has been refusing `avg(int8)` over since unit 0,
+    /// and the reason this type is tier 2's hard half. Variable-length, like a `text`.
+    Numeric,
     /// PostgreSQL's `date`: a **day**, stored as a signed count of days from 2000-01-01 — the same
     /// four bytes and the same epoch a real server uses.
     ///
@@ -162,7 +169,7 @@ pub enum ColumnType {
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 15] = [
+    pub const ALL: [ColumnType; 16] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -178,6 +185,7 @@ impl ColumnType {
         ColumnType::Double,
         ColumnType::Real,
         ColumnType::Date,
+        ColumnType::Numeric,
     ];
 }
 
@@ -221,6 +229,8 @@ pub enum Datum {
     /// [`ColumnType::Date`], in days from 2000-01-01. PostgreSQL's own representation, including
     /// the infinities, which to this crate are ordinary `i32` sentinels.
     Date(i32),
+    /// [`ColumnType::Numeric`]. Its scale is part of it (`crate::numeric`).
+    Numeric(crate::numeric::Numeric),
 }
 
 impl PartialEq for Datum {
@@ -231,6 +241,10 @@ impl PartialEq for Datum {
                 a == b
             }
             (Datum::Int4(a), Datum::Int4(b)) | (Datum::Date(a), Datum::Date(b)) => a == b,
+            // Representation equality, not value equality: `1.0` and `1.00` are different values
+            // of this type and this asks whether a round trip preserved one. `pg_cmp` is where
+            // the number is compared.
+            (Datum::Numeric(a), Datum::Numeric(b)) => a == b,
             (Datum::Int2(a), Datum::Int2(b)) => a == b,
             (Datum::Timestamp(a), Datum::Timestamp(b)) => a == b,
             (Datum::Text(a), Datum::Text(b)) => a == b,
@@ -256,6 +270,7 @@ impl Datum {
             Datum::Int8(_) => ColumnType::Int8,
             Datum::Int4(_) => ColumnType::Int4,
             Datum::Date(_) => ColumnType::Date,
+            Datum::Numeric(_) => ColumnType::Numeric,
             Datum::Int2(_) => ColumnType::Int2,
             Datum::Real(_) => ColumnType::Real,
             Datum::Timestamp(_) => ColumnType::Timestamp,

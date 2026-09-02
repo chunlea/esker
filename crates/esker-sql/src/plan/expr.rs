@@ -661,6 +661,7 @@ impl Literal {
                     | ColumnType::Int2
                     | ColumnType::Double
                     | ColumnType::Real
+                    | ColumnType::Numeric
             ),
             Literal::Decimal(_) => matches!(
                 ty,
@@ -669,6 +670,7 @@ impl Literal {
                     | ColumnType::Int2
                     | ColumnType::Double
                     | ColumnType::Real
+                    | ColumnType::Numeric
             ),
             Literal::Bool(_) => matches!(ty, ColumnType::Bool),
             Literal::Typed(value) => value.fits(ty),
@@ -705,6 +707,9 @@ impl Literal {
                 ColumnType::Int2 => i16::try_from(*value)
                     .map(Datum::Int2)
                     .map_err(|_| SqlError::IntegerLiteralOutOfRange(ColumnType::Int2.name())),
+                // Exactly, at scale zero — there is no width to overflow, which is what an
+                // arbitrary-precision type means.
+                ColumnType::Numeric => Datum::from_text(ColumnType::Numeric, &value.to_string()),
                 #[allow(
                     clippy::cast_precision_loss,
                     reason = "the widening is PostgreSQL's own assignment cast, and lossy the same way"
@@ -734,6 +739,12 @@ impl Literal {
             },
 
             Literal::Decimal(digits) => match ty {
+                // **The digits as written, trailing zeros and all.** This is the assignment the
+                // type exists for: `1.000` into a `numeric` column is `1.000`, where the same
+                // literal into a `double precision` one is `1`. No rounding and no widening —
+                // the column's declared scale, if it has one, is applied afterwards by
+                // `value::fit_to_typmod`, which is where the rounding rule lives.
+                ColumnType::Numeric => Datum::from_text(ColumnType::Numeric, digits),
                 // The same refusal `int8` gets, naming the column's own type.
                 ColumnType::Int4 => Err(SqlError::unsupported(format!(
                     "assigning the numeric literal {digits} to the integer column \"{column}\""
@@ -803,6 +814,7 @@ impl Literal {
                 | ColumnType::Json
                 | ColumnType::Jsonb
                 | ColumnType::Date
+                | ColumnType::Numeric
                 | ColumnType::Real => mismatch(),
             },
         }
