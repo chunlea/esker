@@ -422,6 +422,16 @@ Regions cover the whole key space contiguously; the first region is `["", "")`.
     the leader's, because "has it caught up" is a comparison of two stores' applied indices and PD
     is the only party that sees both. A leader promoting on a guess puts a peer with no data into
     the quorum and the group stops committing.
+  - **An operator is a repeat by *store*, not by peer id.** PD mints a fresh peer id every time it
+    issues one (§7), so a re-derived `AddPeer` naming a store this region already has a peer on is
+    the same operator arriving twice and the leader proposes nothing. Asked by peer id it could
+    never be recognised as a repeat, and the second change puts **two peers of one region on one
+    store** — which `RegionMap::insert` refuses outright, so that peer exists in the configuration
+    and nowhere else: unaddressable, never caught up, never promoted, and counted by PD as a
+    replica the region no longer needs. What it is checked against is the **core's** membership as
+    well as the applied record, because a conf change is in force when its entry is *appended* and
+    the record moves only when it applies — and the re-derived operator arrives at the new leader
+    inside exactly that window.
   - **`RemovePeer` tears down the raft state and leaves the data.** Removing the keys means point
     deletes over the range (no range tombstones in v1, ADR 0006), and the tombstones that leaves
     are keys in the range — which is exactly the state that stops the range ever receiving a
