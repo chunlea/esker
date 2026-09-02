@@ -61,6 +61,15 @@ pub(crate) enum Command {
     Pd(PdCommand),
     /// Look at, split, or hand over a region.
     Region(RegionOptions),
+    /// Compare an SST store prefix against a database's manifest.
+    SstStore(SstStoreCommand),
+}
+
+/// The `sst-store` verbs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SstStoreCommand {
+    /// List what the prefix holds and what nothing references.
+    Reconcile(crate::reconcile::ReconcileOptions),
 }
 
 /// Why the arguments could not be understood.
@@ -164,6 +173,9 @@ Commands:
                         which is what a SQL node needs to be given with --pd
   pd serve|inspect      Run the placement driver, or print what it has stored
   region <verb> ...     Look at, split, or hand over a region
+  sst-store reconcile <url>
+                        Compare an SST store prefix against a database's manifest
+                        and say what nothing references any more
 
 Options:
   -V, --version         Print the version
@@ -228,6 +240,20 @@ Server options:
 
 Ctrl-C stops the listener, lets in-flight requests finish and closes the
 database. A second one does not wait.
+
+Sst-store options:
+  sst-store reconcile s3://bucket/prefix
+                            List the prefix, compare it against the manifest in
+                            --data-dir, and print what nothing references. A
+                            DeleteObject that failed leaks its object on purpose;
+                            this is where the leak is found. Offline: run it
+                            against a database that is not running
+      --data-dir PATH       The database whose manifest says what is live
+                            (default .)
+      --delete              Actually remove what is unreferenced. Without it
+                            nothing is deleted. Never removes an object newer
+                            than the manifest, and refuses a prefix whose claim
+                            marker names another database
 
 Region options:
   region ls                 Print every region in the cluster, in key order
@@ -295,6 +321,7 @@ where
         "cluster" => parse_cluster(&arguments[1..]),
         "pd" => parse_pd(&arguments[1..]),
         "region" => parse_region(&arguments[1..]),
+        "sst-store" => parse_sst_store(&arguments[1..]),
         other if other.starts_with('-') => Err(ParseError::UnknownFlag(other.to_owned())),
         other => Err(ParseError::UnknownCommand(other.to_owned())),
     }
@@ -639,6 +666,54 @@ fn read_key(word: &str, hex: bool) -> Result<bytes::Bytes, ParseError> {
 }
 
 /// `esker pd serve|inspect [--data-dir PATH] [--listen HOST:PORT]`.
+/// `sst-store reconcile <s3://bucket/prefix> --data-dir DIR [--delete]`.
+fn parse_sst_store(arguments: &[String]) -> Result<Command, ParseError> {
+    let Some(verb) = arguments.first() else {
+        return Err(ParseError::MissingArgument("an sst-store command"));
+    };
+    if verb == "--help" || verb == "-h" || verb == "help" {
+        return Ok(Command::Help);
+    }
+    if verb != "reconcile" {
+        return Err(ParseError::UnknownCommand(format!("sst-store {verb}")));
+    }
+
+    let mut options = crate::reconcile::ReconcileOptions::default();
+    let mut url: Option<String> = None;
+    let mut index = 1;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        index += 1;
+
+        if argument == "--help" || argument == "-h" {
+            return Ok(Command::Help);
+        }
+        let (flag, inline) = match argument.split_once('=') {
+            Some((flag, value)) => (flag, Some(value.to_owned())),
+            None => (argument.as_str(), None),
+        };
+
+        match flag {
+            "--data-dir" => {
+                options.data_dir =
+                    PathBuf::from(take_value(arguments, &mut index, inline, "--data-dir")?);
+            }
+            "--delete" => options.delete = true,
+            other if other.starts_with('-') => {
+                return Err(ParseError::UnknownFlag(other.to_owned()));
+            }
+            other if url.is_none() => url = Some(other.to_owned()),
+            other => return Err(ParseError::UnexpectedArgument(other.to_owned())),
+        }
+    }
+
+    let Some(url) = url else {
+        return Err(ParseError::MissingArgument("an s3://bucket/prefix URL"));
+    };
+    options.store_url = url;
+    Ok(Command::SstStore(SstStoreCommand::Reconcile(options)))
+}
+
 fn parse_pd(arguments: &[String]) -> Result<Command, ParseError> {
     let Some(verb) = arguments.first() else {
         return Err(ParseError::MissingArgument("a pd command"));

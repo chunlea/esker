@@ -192,3 +192,36 @@ Three things deliberately did **not** change:
 
 ADR 0029's "the race we do not win" consequence is rewritten to say what closed it and what did not
 change.
+
+## 4. Leaked objects after a failed `DeleteObject`
+
+Inventory #12. `esker sst-store reconcile s3://bucket/prefix --data-dir DIR [--delete]`.
+
+A `DeleteObject` that fails leaks its object on purpose (ADR 0024): a leaked object costs storage
+and a wrongly deleted one costs data. That is right on the write path and it leaves somebody to
+clean up.
+
+**It is a tool and not a background task for a reason.** The bucket's listing and the database's
+manifest are read at two instants, and a *running* database moves the manifest between them — so an
+object that looks unreferenced may be one a compaction uploaded a moment ago and is about to name.
+On the write path that is a race with a data-loss ending; offline it is not a race at all.
+
+Three gates in front of a delete, and the third was not in the brief:
+
+1. **the prefix must carry this database's own claim marker.** ADR 0029's marker answers exactly the
+   question this tool must not get wrong, and a prefix with no marker is refused as well — it might
+   be somebody's, which is the same reasoning `--adopt-sst-store` exists for. There is deliberately
+   no such hatch here: adopting a prefix *in order to delete from it* is not a thing to make easy;
+2. **dry run by default**, and what `--delete` removes is what the dry run printed;
+3. **nothing at or above the manifest's next file number is ever deleted**, `--delete` or not. Such
+   an object is one the manifest has not caught up with, and "the manifest is behind" is not a
+   reason to delete data. A torn manifest tail is refused outright for the same reason: a truncated
+   manifest names *fewer* files than the database does, and this tool would call the difference
+   garbage.
+
+Anything that is neither an SST nor the marker is reported and never touched.
+
+`crates/esker-cli/src/reconcile.rs`'s tests, five of them, against `MemoryStore` and a real
+database on a real tier: a planted orphan is reported and then deleted; an object newer than the
+manifest is kept even under `--delete`; another database's prefix is refused with both identities in
+the message; an unclaimed prefix is refused; a clean prefix says so rather than printing nothing.

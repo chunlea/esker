@@ -16,6 +16,7 @@ mod cluster;
 mod manifest_dump;
 mod pd;
 mod raw;
+mod reconcile;
 mod region;
 mod server;
 mod sst_dump;
@@ -38,6 +39,22 @@ const EXIT_FAILURE: u8 = 1;
 /// Exit code for a request the server refused, or a server that could not be reached. Distinct
 /// from [`EXIT_FAILURE`] so a script can tell "the key is absent" from "the cluster is down".
 const EXIT_SERVER: u8 = 3;
+
+/// The `sst-store` verbs, out of line so `main` stays a dispatch table.
+fn run_sst_store(command: &args::SstStoreCommand) -> ExitCode {
+    match command {
+        args::SstStoreCommand::Reconcile(options) => {
+            let mut stdout = std::io::stdout().lock();
+            match reconcile::run(options, &mut stdout) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("esker sst-store reconcile: {error}");
+                    ExitCode::from(EXIT_FAILURE)
+                }
+            }
+        }
+    }
+}
 
 fn main() -> ExitCode {
     match args::parse(std::env::args().skip(1)) {
@@ -121,6 +138,7 @@ fn main() -> ExitCode {
                 ExitCode::from(EXIT_FAILURE)
             }
         },
+        Ok(Command::SstStore(command)) => run_sst_store(&command),
         Ok(Command::Pd(command)) => match pd::run(&command) {
             Ok(()) => ExitCode::SUCCESS,
             Err(reason) => {
