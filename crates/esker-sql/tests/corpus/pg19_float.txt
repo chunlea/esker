@@ -1,0 +1,25 @@
+# `FLOAT` — statement 73 of `schema.rb`, and **a spelling rather than a type**
+#
+# Bare, it is `double precision`. With a precision **in bits** it is whichever IEEE width holds
+# that many: `float(1)` through `float(24)` are `real`, and `float(25)` through `float(53)` are
+# `double precision`. So one keyword names two types this node already has, and nothing new is
+# stored — which is what makes it the smallest unit in r1's list of seventeen.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#
+# BOTH ENDS OF THE RANGE HAVE THEIR OWN MESSAGE, and it is not the one a string gets: `float(0)`
+# is `22023 precision for type float must be at least 1 bit` and `float(54)` is `must be less than
+# 54 bits` — "precision" and "bits" where `varchar(0)` says "length". Same SQLSTATE, different
+# vocabulary, and the third time in this corpus set that PostgreSQL has used two vocabularies for
+# what looks like one condition.
+#
+DROP TABLE IF EXISTS fl		-
+CREATE TABLE fl (id int8 PRIMARY KEY, a FLOAT, b FLOAT(1), c FLOAT(24), d FLOAT(25), e FLOAT(53), f REAL, g DOUBLE PRECISION)		-
+SELECT a, b, c, d, e, f, g FROM fl	double precision,real,real,double precision,double precision,real,double precision	-
+SELECT 'float'::regtype::oid, 'float4'::regtype::oid, 'float8'::regtype::oid	oid,oid,oid	701|700|701
+INSERT INTO fl VALUES (1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1)		-
+SELECT a, b, c, d, e, f, g FROM fl WHERE id = 1	double precision,real,real,double precision,double precision,real,double precision	0.1|0.1|0.1|0.1|0.1|0.1|0.1
+SELECT 1.0/3.0::FLOAT, 1.0/3.0::FLOAT(24)	double precision,double precision	0.3333333333333333|0.3333333333333333
+CREATE TABLE fl2 (a FLOAT(0))	!22023 precision for type float must be at least 1 bit
+CREATE TABLE fl2 (a FLOAT(54))	!22023 precision for type float must be less than 54 bits
