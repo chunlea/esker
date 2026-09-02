@@ -1041,6 +1041,39 @@ were deleted. A divergence list that only ever grows is a list nobody reads.
 no `Value::Varchar` to add, so all three travel as `ValueType::Text`. The fourth format ADR 0033
 found is only owed by a type with a new representation.
 
+#### The cast: `'x'::regtype::oid`, and what run 3 cost by shipping without it
+
+ADR 0033 scoped this cast **with** the type surface, in writing, "because neither moves the ladder
+alone". Tier 1 shipped without it. Scoreboard run 3 then measured the prediction coming true: six
+types landed, `ActiveRecord`'s migration ran, the boot counter went 15 → 18, and the ladder stayed
+at **rung 1** — the same statement, with the same message, as in run 2.
+
+    SELECT 'integer'::regtype::oid  →  0A000
+
+One cast later, rung 2 passes and rung 4 gets far enough to create tables before it stops. The
+lesson is not about types, which were right and measured throughout. It is that a unit scoped as
+two things was allowed to deliver one, and **the only thing that noticed was the scoreboard** —
+the boot counter said 18 and rising, which reads like progress until the ladder beside it says 1.
+
+##### Three rules a naive lookup gets wrong
+
+* **Both spellings of every type resolve.** PostgreSQL keeps two names, the SQL one (`integer`,
+  `character varying`) and `pg_type.typname`'s (`int4`, `varchar`), and `regtype` takes either.
+  `'float'` is `float8` — the one alias that is neither of a type's two names.
+* **Case and surrounding space do not matter.** `'INTEGER'` is `23`.
+* **A typmod is parsed and discarded.** `'character varying(255)'` is `1043`. A `regtype` names a
+  *type*, and the length never was part of one.
+
+##### Why the nested cast is matched rather than composed
+
+A real `regtype` is four bytes holding an OID that print as the type's name, and `::oid` from one
+is a free coercion. This node has no such type, so `'x'::regtype` lowers to the **name** as text —
+which makes `SELECT 'int4'::regtype` answer `integer` exactly, leaving only `RowDescription`'s OID
+different. That would make `::oid` a text-to-oid cast, and a real server refuses one: `'integer'::oid`
+is `22P02`, which this node answers too. So the pair is recognised together. It is not a shortcut
+around the missing type; it is the one place where composing the two steps would have to permit a
+cast PostgreSQL forbids.
+
 ## 3. The test ladder
 
 Each rung is a thing that either works or does not, and none of them is reached by asserting

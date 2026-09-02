@@ -30,7 +30,7 @@ use crate::parse::{Parsed, feature_name};
 use crate::plan;
 use crate::time_machine;
 use crate::value::PgDatum;
-use crate::value::{self, ColumnType, Datum, NO_TYPMOD};
+use crate::value::{self, ColumnType, Datum, NO_TYPMOD, PgType};
 
 impl Parsed {
     /// Lowers this statement into the plan types the executor runs, or names the construct that
@@ -1167,6 +1167,9 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             negated: *negated,
         }),
         Expr::Function(function) => lower_function(function),
+        Expr::Cast {
+            expr, data_type, ..
+        } => lower_cast(expr, data_type),
         other => Err(SqlError::unsupported(format!("the expression {other}"))),
     }
 }
@@ -1391,6 +1394,113 @@ fn sequence_reference(text: &str) -> String {
     {
         Some(quoted) => fold_identifier(quoted, true).0,
         None => fold_identifier(bare, false).0,
+    }
+}
+
+/// `'<name>'::regtype`, `'<name>'::regtype::oid` and `'<digits>'::oid`.
+///
+/// The three shapes `ActiveRecord` needs and no others. The middle one is what stopped the ladder
+/// at rung 2 for three scoreboard runs: `Quoting#lookup_cast_type` sends
+/// `SELECT 'integer'::regtype::oid` once per column type, and `pg_type` here already held the
+/// answer — what was missing was only the cast that asks it.
+///
+/// # Why the nested shape is matched rather than composed
+///
+/// A `regtype` is a real type on a real server, four bytes holding an OID that *print* as the
+/// type's name; `::oid` from one is then a free coercion. This node has no `regtype`, so
+/// `'x'::regtype` lowers to the **name**, as text — which makes `SELECT 'int4'::regtype` answer
+/// `integer`, exactly right, and leaves only `RowDescription`'s OID differing (`text` where a real
+/// server says `regtype`). It also means a composed `::oid` would be a text-to-oid cast, which a
+/// real server refuses: `'integer'::oid` is `22P02`, and this node answers that too.
+///
+/// So the pair is recognised together. That is not a shortcut around a missing type — it is the
+/// one place where composing the two steps would have to allow a cast PostgreSQL forbids.
+fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
+    let target = cast_target(data_type)
+        .ok_or_else(|| SqlError::unsupported(format!("a cast to {data_type}")))?;
+    match (target, expr) {
+        // `'integer'::regtype::oid` — the inner cast is matched here rather than lowered first.
+        (
+            CastTarget::Oid,
+            Expr::Cast {
+                expr: inner,
+                data_type: inner_type,
+                ..
+            },
+        ) if cast_target(inner_type) == Some(CastTarget::RegType) => {
+            let name = cast_operand(inner, data_type)?;
+            let ty = crate::value::type_by_name(&name)
+                .ok_or_else(|| SqlError::UndefinedType(name.trim().to_owned()))?;
+            Ok(plan::Expr::Literal(plan::Literal::Integer(i64::from(
+                ty.oid(),
+            ))))
+        }
+        // `'integer'::regtype` on its own, which answers the name PostgreSQL prints it by.
+        (CastTarget::RegType, _) => {
+            let name = cast_operand(expr, data_type)?;
+            let ty = crate::value::type_by_name(&name)
+                .ok_or_else(|| SqlError::UndefinedType(name.trim().to_owned()))?;
+            Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                Datum::Text(crate::value::format_type(ty, crate::value::NO_TYPMOD)),
+            ))))
+        }
+        // `'23'::oid`. An `oid` reads digits and nothing else — a type *name* here is `22P02` on a
+        // real server, which is why the pair above exists.
+        (CastTarget::Oid, _) => {
+            let text = cast_operand(expr, data_type)?;
+            let value =
+                text.trim()
+                    .parse::<u32>()
+                    .map_err(|_| SqlError::InvalidTextRepresentation {
+                        ty: "oid",
+                        value: text,
+                    })?;
+            Ok(plan::Expr::Literal(plan::Literal::Integer(i64::from(
+                value,
+            ))))
+        }
+    }
+}
+
+/// The string a cast is applied to, or `0A000` naming the cast.
+///
+/// Only a literal: `column::regtype` would need the cast at run time, and answering it here from
+/// the text of an expression would be a wrong answer rather than a missing feature.
+fn cast_operand(expr: &Expr, data_type: &DataType) -> Result<String> {
+    match expr {
+        Expr::Value(value) => match &value.value {
+            Value::SingleQuotedString(text) => Ok(text.clone()),
+            _ => Err(SqlError::unsupported(format!(
+                "the cast {expr}::{data_type}"
+            ))),
+        },
+        _ => Err(SqlError::unsupported(format!(
+            "the cast {expr}::{data_type}"
+        ))),
+    }
+}
+
+/// The two cast targets this node answers, or `None` for every other one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CastTarget {
+    /// PostgreSQL's `regtype`: a type, named.
+    RegType,
+    /// PostgreSQL's `oid`.
+    Oid,
+}
+
+/// `sqlparser` files both as custom type names, since neither is in its `DataType`.
+fn cast_target(data_type: &DataType) -> Option<CastTarget> {
+    let DataType::Custom(name, modifiers) = data_type else {
+        return None;
+    };
+    if !modifiers.is_empty() {
+        return None;
+    }
+    match name.to_string().to_ascii_lowercase().as_str() {
+        "regtype" => Some(CastTarget::RegType),
+        "oid" => Some(CastTarget::Oid),
+        _ => None,
     }
 }
 

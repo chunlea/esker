@@ -642,6 +642,16 @@ pub enum SqlError {
     #[error("SET TRANSACTION SNAPSHOT must be called before any query")]
     SnapshotAfterQuery,
 
+    /// A type name that names no type on this node: `42704`.
+    ///
+    /// What `'nope'::regtype` answers on a real server, word for word. It is also what this node
+    /// answers for a type PostgreSQL *has* and it does not — `numeric`, an array — which is a
+    /// declared divergence rather than an oversight: answering `1700` would hand a client the OID
+    /// of a type this node can neither store nor send, and `crates/esker-sql/src/catalog/
+    /// pg_catalog.rs` already refuses to list one for exactly that reason.
+    #[error("type \"{0}\" does not exist")]
+    UndefinedType(String),
+
     /// A value longer than its column's declared length: `22001`.
     ///
     /// The type is spelled as `format_type` writes it — `character varying(5)`, `character(3)` —
@@ -801,7 +811,7 @@ impl SqlError {
             SqlError::AmbiguousColumn(_) | SqlError::AmbiguousOrderBy(_) => {
                 sqlstate::AMBIGUOUS_COLUMN
             }
-            SqlError::UndefinedIndex(_) => sqlstate::UNDEFINED_OBJECT,
+            SqlError::UndefinedIndex(_) | SqlError::UndefinedType(_) => sqlstate::UNDEFINED_OBJECT,
             SqlError::SystemCatalog(_) => sqlstate::INSUFFICIENT_PRIVILEGE,
             SqlError::DependentObjectsStillExist { .. } => sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
             SqlError::WrongObjectType { .. } | SqlError::AlterActionOnWrongObject { .. } => {

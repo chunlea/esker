@@ -76,7 +76,14 @@ const FIXTURE: &[&str] =
 /// landed before them). That is what the three numbers together are for — this counter says what
 /// is answered, the scoreboard's per-statement table says what is in the way, and the ladder says
 /// whether a client can get through.
-const RUNS: usize = 18;
+///
+/// **Nineteen now, and the nineteenth is statement 12** — `SELECT 'integer'::regtype::oid`, the
+/// cast `Quoting#lookup_cast_type` sends once per column type. It is worth one line of its own,
+/// because it is the number that did **not** move that made it matter: scoreboard run 3 measured
+/// tier 1 complete, this counter at eighteen, and the ladder still at rung 1. One statement, and
+/// rung 2 passes. A counter and a ladder disagreeing is the most useful thing the three numbers
+/// have done so far.
+const RUNS: usize = 19;
 
 #[test]
 fn every_statement_activerecord_sends_parses_and_is_answered_by_name() {

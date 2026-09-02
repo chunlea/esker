@@ -175,6 +175,51 @@ pub fn format_type(ty: ColumnType, typmod: i32) -> String {
     }
 }
 
+/// The type a name means, under **every spelling PostgreSQL accepts for it**.
+///
+/// What `'x'::regtype` resolves. Three rules, all measured against 19beta1 rather than assumed,
+/// and each one is a way a caller can spell a type that a naive `match` on `typname` would miss:
+///
+/// * **Case does not matter.** `'INTEGER'::regtype::oid` is `23`.
+/// * **Surrounding space does not matter.** `' integer '::regtype::oid` is `23`.
+/// * **A typmod is parsed and discarded.** `'character varying(255)'::regtype::oid` is `1043` and
+///   `'timestamp(6) without time zone'::regtype::oid` is `1114` — the *type* is what a `regtype`
+///   names, and the length never was part of it.
+///
+/// Both spellings of every type answer, because PostgreSQL keeps two: the SQL name a column is
+/// declared and complained about with (`integer`, `character varying`) and the internal one
+/// `pg_type.typname` holds (`int4`, `varchar`). `'float'` is `float8`, which is the one alias that
+/// is not either of a type's two names.
+#[must_use]
+pub fn type_by_name(spelled: &str) -> Option<ColumnType> {
+    // `character varying(255)` -> `character varying`; `timestamp(6) without time zone` keeps its
+    // tail, because the words after the parentheses are part of the name.
+    let name = spelled.trim().to_ascii_lowercase();
+    let name = match (name.find('('), name.find(')')) {
+        (Some(open), Some(close)) if open < close => {
+            format!("{}{}", &name[..open], &name[close + 1..])
+        }
+        _ => name,
+    };
+    let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(match name.as_str() {
+        "bigint" | "int8" => ColumnType::Int8,
+        "integer" | "int4" | "int" => ColumnType::Int4,
+        "smallint" | "int2" => ColumnType::Int2,
+        "text" => ColumnType::Text,
+        "character varying" | "varchar" => ColumnType::Varchar,
+        "character" | "char" | "bpchar" => ColumnType::Bpchar,
+        "boolean" | "bool" => ColumnType::Bool,
+        "bytea" => ColumnType::Bytea,
+        "timestamp" | "timestamp without time zone" => ColumnType::Timestamp,
+        "timestamp with time zone" | "timestamptz" => ColumnType::TimestampTz,
+        "real" | "float4" => ColumnType::Real,
+        // `float` with no precision is `float8` on a real server, not `float4`.
+        "double precision" | "float8" | "float" => ColumnType::Double,
+        _ => return None,
+    })
+}
+
 /// What a stored type *means* to a PostgreSQL client.
 ///
 /// The six shapes themselves are [`esker_keys::value`]'s — the storage layer's shared vocabulary,

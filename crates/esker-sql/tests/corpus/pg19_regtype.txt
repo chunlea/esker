@@ -1,0 +1,54 @@
+# `'x'::regtype` and `'x'::oid` — the cast that stopped the ladder at rung 2 for three runs
+#
+# `ActiveRecord::ConnectionAdapters::PostgreSQL::Quoting#lookup_cast_type` sends
+# `SELECT '<sql_type>'::regtype::oid` once per column type during a migration.
+# `pg_type` on this node already held the answer; what was missing was the cast that asks it.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it
+#
+# THREE RULES A NAIVE LOOKUP GETS WRONG, all measured here:
+#
+#   * **Both spellings of every type resolve.** PostgreSQL keeps two names — the SQL one a column
+#     is declared with (`integer`, `character varying`) and the internal one `pg_type.typname`
+#     holds (`int4`, `varchar`) — and `regtype` takes either. `'float'` is `float8`, which is the
+#     one alias that is neither of a type's two names.
+#   * **Case and surrounding space do not matter**: `'INTEGER'` is `23`.
+#   * **A typmod is parsed and discarded**: `'character varying(255)'` is `1043` and
+#     `'timestamp(6) without time zone'` is `1114`. A `regtype` names a *type*; the length never
+#     was part of one.
+#
+# AND `::oid` IS NOT A FREE CAST FROM TEXT. `'23'::oid` is `23` and `'integer'::oid` is
+# `22P02 invalid input syntax for type oid: "integer"` — it reads digits and nothing else. What
+# makes `'integer'::regtype::oid` legal is that the *regtype* is already an OID underneath. That
+# is why this node recognises the pair together rather than composing two casts it would then
+# have to allow separately.
+#
+SELECT 'integer'::regtype::oid	oid	23
+SELECT 'int4'::regtype::oid	oid	23
+SELECT 'bigint'::regtype::oid	oid	20
+SELECT 'int8'::regtype::oid	oid	20
+SELECT 'smallint'::regtype::oid	oid	21
+SELECT 'character varying'::regtype::oid	oid	1043
+SELECT 'character varying(255)'::regtype::oid	oid	1043
+SELECT 'varchar'::regtype::oid	oid	1043
+SELECT 'text'::regtype::oid	oid	25
+SELECT 'character(3)'::regtype::oid	oid	1042
+SELECT 'bpchar'::regtype::oid	oid	1042
+SELECT 'timestamp(6) without time zone'::regtype::oid	oid	1114
+SELECT 'timestamp'::regtype::oid	oid	1114
+SELECT 'timestamp with time zone'::regtype::oid	oid	1184
+SELECT 'boolean'::regtype::oid	oid	16
+SELECT 'bytea'::regtype::oid	oid	17
+SELECT 'real'::regtype::oid	oid	700
+SELECT 'double precision'::regtype::oid	oid	701
+SELECT 'INTEGER'::regtype::oid	oid	23
+SELECT 'nope'::regtype::oid	!42704 type "nope" does not exist
+SELECT 'numeric'::regtype::oid	oid	1700
+SELECT 'int4[]'::regtype::oid	oid	1007
+SELECT 'integer'::regtype	regtype	integer
+SELECT 'int4'::regtype	regtype	integer
+SELECT 'varchar'::regtype	regtype	character varying
+SELECT pg_typeof('int4'::regtype)	regtype	regtype
+SELECT '23'::oid	oid	23
+SELECT 'integer'::oid	!22P02 invalid input syntax for type oid: "integer"

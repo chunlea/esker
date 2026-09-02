@@ -28,6 +28,100 @@ is a claim with the other two hidden behind it.
 
 ---
 
+## Run 3 — 2026-09-02, `main` at `ae0c8d5`: tier 1 complete, and the ladder did not move
+
+| Field | Value |
+|---|---|
+| Esker | `ae0c8d5` — tier 1's twelve types, catalog record v4, and d1's routing merge |
+| Rails | `v8.1.3.1` (`3989ebf`) |
+| Ruby | 4.0.6, `pg` 1.6.3, `minitest` 5.27 |
+| Node | one `esker-sql --release`, in-process backend, `127.0.0.1:55433` — same as runs 1 and 2 |
+| Machine | Darwin 27.0.0, aarch64 |
+
+### One of the three numbers moved
+
+| Number | Run 1 | Run 2 | **Run 3** |
+|---|---|---|---|
+| ladder rung reached | 1 | 1 | **1** |
+| boot statements served | 11/36 | 15/36 | **18/36** |
+| suite files that reached a test | 59/426 | 59/426 | **59/426** |
+| suite files that never loaded | 367 | 367 | **367** |
+| tests run / passed | 772 / 525 | 772 / 771 | **772 / 771** |
+| failures / errors | 0 / 247 | 1 / 0 | **1 / 0** |
+
+**Six types landed and the ladder moved by zero rungs.** That is this run's finding and it is worth
+stating without softening. `int4`, `int2`, `real`, `varchar(n)`, `character(n)`, `timestamp(p)` and
+the serials all work; `ActiveRecord`'s migration statement — `CREATE TABLE "harness_widgets" (…
+"name" character varying NOT NULL, "count" integer DEFAULT 0, … "created_at" timestamp(6) NOT NULL
+…)` — **runs**. Three boot statements moved because of it (13, 14 and 20, the type-surface group).
+The ladder and the suite did not move at all.
+
+They did not move because of **one cast**:
+
+```
+SELECT 'integer'::regtype::oid
+  →  0A000  the expression 'integer'::regtype::oid is not supported
+```
+
+`ActiveRecord::ConnectionAdapters::PostgreSQL::Quoting#lookup_cast_type` sends it once per column
+type, and rung 2 stops there — at the same statement, with the same message, as in run 2.
+
+**ADR 0033 predicted this exactly and it was shipped anyway.** Its consequences say
+`'integer'::regtype::oid` "is a second feature and is scoped with this one because *neither moves
+the ladder alone*". Tier 1 shipped without it, and the prediction came true to the letter. The
+lesson is not about the types, which are right and measured; it is that a unit scoped as "these two
+together" was allowed to deliver one half, and the scoreboard is the only thing that noticed.
+
+`pg_type` **already holds the answer** — `SELECT oid FROM pg_type WHERE typname = 'int4'` returns
+`23` on this node. What is missing is only the cast that asks it.
+
+### The ladder
+
+| Rung | What it is | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|---|
+| 1 | `PG.connect` and one `SELECT 1`, over a socket | **PASS** | **PASS** | **PASS** |
+| 2 | `establish_connection` and one migration | FAIL — `pg_type` missing | FAIL — `'integer'::regtype::oid` | **FAIL — the same cast, unchanged** |
+| 3 | CRUD through the adapter, and a schema dump | not reached | not reached | **not reached** |
+| 4 | the suite's own schema loads | not reached | not reached | **not reached** |
+
+### What stops the other 18 boot statements
+
+| Stops on | SQLSTATE | Statements | Run 2 | Run 3 |
+|---|---|---|---|---|
+| — *runs* | — | 1–11, 13, 14, 18, 19, 20, 25, 27 | 15 | **18** |
+| more than one `JOIN` | `0A000` | 15, 26, 32–36 | 7 | 7 |
+| `= ANY(…)` | `0A000` | 16, 17, 21, 28 | 4 | 4 |
+| a qualified name (`pg_catalog.pg_class`) | `0A000` | 29, 30, 31 | 3 | 3 |
+| a type — `character varying`, `integer`, `timestamp(6)` | — | 13, 14, 20 | 3 | **0** |
+| **a cast (`'integer'::regtype::oid`)** | `0A000` | 12 | 1 | **1 — and the ladder** |
+| `current_schemas(false)` | `0A000` | 22 | 1 | 1 |
+| a bare `current_schema` | `42703` | 24 | 1 | 1 |
+| `pg_extension` | `42P01` | 23 | 1 | 1 |
+
+### The suite
+
+Unchanged from run 2, and for the same reason: 367 of 426 files stop at `establish_connection`,
+which is rung 2's blocker under another name. The 59 that run are exactly the files under
+`test/cases/arel/`, which open no connection. The single failure is `to_sql_test.rb`'s
+`visit_BigDecimal` — Ruby 4.0.6 prints `0.214e1` where the test expects `2.14` — which is not about
+this server and is correctly **not** excluded.
+
+### How this run was verified, after one that was not
+
+The first attempt at run 3 reported `RUNG 1 PASS` **without ever starting a node**: `ESKER_REPO`
+was a detached worktree and `CARGO_TARGET_DIR` sent the binary to `target-verify/release/` while
+`run-scoreboard.sh` execs `$ESKER_REPO/target/release/`. The script talks to a *port*, so rung 1
+passed against a stale node left listening from an earlier run, and rung 2 gave the same
+`regtype` error either way — the bogus run was indistinguishable from the real one by its output.
+
+Run 3's numbers come from a re-run in which the binary's path and mtime were checked and the
+listening node was **asked to identify itself**: `SELECT oid, typname FROM pg_type WHERE oid IN
+(700, 1042)` answered `float4` and `bpchar`, two types that exist only in this session's commits.
+A scoreboard's whole value is that the number names a commit, and a number from an unidentified
+binary is worse than no number, because it gets quoted.
+
+---
+
 ## Run 2 — 2026-09-01, `pg_type` and `pg_range`
 
 | Field | Value |
