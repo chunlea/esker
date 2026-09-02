@@ -1,0 +1,37 @@
+crates/esker-store/src/columnar/mod.rs
+  s_e2fd0c54b9d574::t_184dfc05f64a9d 158-166,205,219-220,314-363,419,468
+crates/esker-store/src/columnar/region.rs
+  s_e2fd0c54b9d574::t_29ed133dee982c 34-55,64,84-86,91-108,132-133,157-162,166,172-177,187-191,204-206,215,242-250,413-563,576-577,580-593,597-660,748-754,758,762-768
+crates/esker-store/src/columnar/runs.rs
+  s_e2fd0c54b9d574::t_1705bceb31b40d 32-45,60-67,72-76,88-92,105,118,126,140-148,163,165-171,174,180-193,254,277-278,280,285,295-304,323-334,339-346,351,354,359,363-395,428,431,433,437,442-461,464-487,494,509,526,545,566,587,612
+crates/esker-store/src/peer.rs
+  s_e2fd0c54b9d574::t_5dceedf5e8e3c2 745,783-784,792,805,1237
+crates/esker-store/src/raft_log.rs
+  s_e2fd0c54b9d574::t_24b564262dae16 203-244
+crates/esker-store/src/server.rs
+  s_e2fd0c54b9d574::t_17014ac8affc4e 2498
+crates/esker-store/tests/columnar_region.rs
+  s_e2fd0c54b9d574::t_a0bf53b08006e4 148-150,154,192,199,246
+crates/esker-store/tests/columnar_resume.rs
+  s_e2fd0c54b9d574::t_1e9ede0c9eb2c2 1-362
+docs/adr/0038-a-run-manifest-names-the-index-its-runs-are-complete-to.md
+  s_e2fd0c54b9d574::t_b2eadcfd290658 1-80
+docs/plans/debt-c4.md
+  s_e2fd0c54b9d574::t_7d9c0fdef216fd 1-74
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "258e0af53b1bd6fc451fdd4d574bcf16e20e8f50",
+  "prompts": {},
+  "sessions": {
+    "s_e2fd0c54b9d574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "671f3143-5435-4676-97d9-490a56835160",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
