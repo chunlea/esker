@@ -481,6 +481,17 @@ pub struct IndexDef {
     /// rows the index happens to hold, which is ADR 0020's "skip the backfill" anomaly arriving
     /// by a different road. So it enforces its `UNIQUE` and never narrows a read.
     pub predicate: Option<String>,
+    /// `NULLS NOT DISTINCT`, which makes **two NULLs collide** in a unique index.
+    ///
+    /// PostgreSQL admits any number of NULLs in a `UNIQUE` column by default — two unknowns are
+    /// not known to be equal — and this is the clause that says to treat them as one value
+    /// instead. It is the only thing in an index definition that changes which rows are *refused*
+    /// rather than how they are stored or printed, which is why it reaches
+    /// `crate::exec::index::entry` and the direction and the predicate do not.
+    ///
+    /// Stored and printed on a **non-unique** index too, where it can refuse nothing: a real
+    /// server accepts `CREATE INDEX … NULLS NOT DISTINCT` and prints it back. Measured.
+    pub nulls_not_distinct: bool,
 }
 
 impl IndexDef {
@@ -1804,6 +1815,7 @@ mod tests {
                 state: SchemaState::Public,
                 state_since: 1,
                 predicate: None,
+                nulls_not_distinct: false,
             }],
             primary_key_name: "accounts_pkey".into(),
             schema_version: 1,
@@ -1830,7 +1842,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "0a",               // catalog format version
+                "0b",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -1882,7 +1894,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "0a",                 // catalog format version
+                "0b",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -1920,6 +1932,7 @@ mod tests {
                 "00", // version 8: its one key part is a column, not an expression
                 "00", // version 9: ascending, with its NULLs where ascending puts them
                 "00", // version 10: no FOREIGN KEY constraints
+                "00", // version 11: the one index is not NULLS NOT DISTINCT
             )
         );
         assert_eq!(record::decode_table(&encoded).unwrap(), accounts(7));
@@ -1981,6 +1994,56 @@ mod tests {
         assert_eq!(read.indexes[0].keys[0].order.indoption(), 0);
         assert_eq!(read.indexes[0].keys[1].order.indoption(), 1);
         assert_eq!(read.indexes[0].keys[1].order.suffix(), " DESC NULLS LAST");
+    }
+
+    /// The **version 10** golden, kept for the same reason the nine before it are.
+    ///
+    /// These are the bytes version 10 wrote — the record ends at the count of `FOREIGN KEY`
+    /// constraints, with no `NULLS NOT DISTINCT` flag after it. Every index reads back without
+    /// one, which is what every index a version 10 catalog could hold had: the clause was `0A000`
+    /// until version 11.
+    #[test]
+    fn a_version_10_table_record_still_decodes() {
+        let v10 = decode_hex(concat!(
+            "0a",                 // catalog format version 10
+            "0700000000000000",   // table id 7
+            "086163636f756e7473", // varint 8, "accounts"
+            "0d6163636f756e74735f706b6579",
+            "01", // schema version 1
+            "02", // two columns
+            "026964",
+            "01",
+            "01",
+            "00",
+            "00",
+            "ffffffff",
+            "00",
+            "05656d61696c",
+            "02",
+            "00",
+            "00",
+            "00",
+            "ffffffff",
+            "00",
+            "01",
+            "00",                                     // primary key: one column, column 0
+            "01",                                     // one index
+            "0800000000000000",                       // index id 8
+            "126163636f756e74735f656d61696c5f6b6579", // "accounts_email_key"
+            "01",                                     // unique
+            "03",                                     // state: public
+            "01",                                     // entered at schema version 1
+            "01",
+            "01", // one column, column 1
+            "00", // no CHECK constraints
+            "00", // no WHERE predicate
+            "00", // its one key part is a column
+            "00", // ascending
+            "00", // no FOREIGN KEY constraints -- and nothing after it
+        ));
+        let table = record::decode_table(&v10).unwrap();
+        assert_eq!(table, accounts(7));
+        assert!(table.indexes.iter().all(|index| !index.nulls_not_distinct));
     }
 
     /// The **version 9** golden, kept for the same reason the eight before it are.
@@ -2575,6 +2638,7 @@ mod tests {
             state: SchemaState::Public,
             state_since: 1,
             predicate: None,
+            nulls_not_distinct: false,
         });
         replace_table(&mut *adding, 1, &accounts(1), &with_more).unwrap();
         adding.commit().unwrap();
@@ -2632,6 +2696,7 @@ mod tests {
             state: SchemaState::Public,
             state_since: 1,
             predicate: None,
+            nulls_not_distinct: false,
         });
         let error = replace_table(&mut *ddl, 1, &table, &clash).unwrap_err();
         assert_eq!(error.sqlstate(), sqlstate::DUPLICATE_TABLE);
@@ -2820,7 +2885,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "0a",               // catalog format version
+                "0b",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

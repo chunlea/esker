@@ -62,10 +62,7 @@ pub fn rows(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
             Datum::Int8(oid_of_table(&relations, relation.table_id)),
             Datum::Int2(i16::try_from(key.keys.len()).unwrap_or(i16::MAX)),
             Datum::Bool(key.unique),
-            // `NULLS NOT DISTINCT` is a clause this node's `CREATE INDEX` refuses by name, so no
-            // index here has it. Measured: the default is `f` and the clause prints after the
-            // column list when it is `t`.
-            Datum::Bool(false),
+            Datum::Bool(key.nulls_not_distinct),
             Datum::Bool(key.primary),
             Datum::Bool(key.valid),
             Datum::Text(key.indkey(table)),
@@ -143,6 +140,12 @@ fn definition(
         table.name,
         parts.join(", ")
     );
+    // **After the key list and before the `WHERE`**, which is the order a real server prints
+    // them in: `USING btree (a, b) NULLS NOT DISTINCT WHERE (c IS NOT NULL)`. Measured, and it is
+    // printed for a **non-unique** index too, where it can refuse nothing.
+    if key.nulls_not_distinct {
+        out.push_str(" NULLS NOT DISTINCT");
+    }
     if let Some(predicate) = key.predicate {
         out.push_str(" WHERE ");
         out.push_str(&parenthesised(predicate));
@@ -163,7 +166,16 @@ fn parenthesised(expr: &str) -> String {
 /// A primary key and an index are two records of different shapes describing the same thing, and
 /// every column of `pg_index` is a function of this — so they are read into one and the row is
 /// built once.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each one mirrors a boolean column of pg_index -- indisunique, indisprimary, \
+              indisvalid, indnullsnotdistinct -- and grouping them would name a thing the catalog \
+              does not have"
+)]
 struct Key<'a> {
+    /// `NULLS NOT DISTINCT`: a column of `pg_index` and **not** part of the key, which is why it
+    /// prints after the column list rather than inside it.
+    nulls_not_distinct: bool,
     /// Borrowed from the index, and **owned** for a primary key — whose parts are columns that
     /// live in `TableDef::primary_key` as bare positions and have no `IndexKey` to point at.
     keys: Cow<'a, [IndexKey]>,
@@ -277,6 +289,7 @@ fn key_of<'a>(relation: &RelationRow, table: &'a TableDef) -> Option<Key<'a>> {
         RelKind::Index => {
             let index = table.indexes.get(relation.index_at?)?;
             Some(Key {
+                nulls_not_distinct: index.nulls_not_distinct,
                 keys: Cow::Borrowed(&index.keys),
                 unique: index.unique,
                 primary: false,
@@ -290,6 +303,9 @@ fn key_of<'a>(relation: &RelationRow, table: &'a TableDef) -> Option<Key<'a>> {
             })
         }
         RelKind::PrimaryKey => Some(Key {
+            // A primary key's columns are `NOT NULL`, so the clause could change nothing and a
+            // real server reports `f` for it. Measured.
+            nulls_not_distinct: false,
             keys: table
                 .primary_key
                 .iter()

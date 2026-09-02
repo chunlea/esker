@@ -67,7 +67,8 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// Version 5 added an expression default (`DEFAULT CURRENT_TIMESTAMP`), version 6 the table's
 /// `CHECK` constraints, version 7 a partial index's predicate, version 8 an index's key
 /// **expressions**, version 9 each key part's **order** — `DESC` and where its NULLs go — and
-/// version 10 the table's `FOREIGN KEY` constraints. Each is appended at the end, so a record of
+/// version 10 the table's `FOREIGN KEY` constraints, and version 11 each index's
+/// `NULLS NOT DISTINCT`. Each is appended at the end, so a record of
 /// every earlier version is a prefix of a later one's and the goldens below still decode.
 ///
 /// Version 1 is not read: nothing had ever persisted a catalog when version 2 landed, so a
@@ -75,7 +76,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 10;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 11;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -809,6 +810,14 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         out.push(action_tag(key.on_delete));
         out.push(u8::from(key.deferrable));
     }
+
+    // Version 11. One flag per index, at the **very end** — after the foreign keys, not beside
+    // the indexes, for the reason every bump before it went to the end: a version 10 record's
+    // bytes have to stay a prefix of a version 11 one's, and a section inserted in the middle
+    // would break that for every golden below.
+    for index in &table.indexes {
+        out.push(u8::from(index.nulls_not_distinct));
+    }
     Ok(out)
 }
 
@@ -997,8 +1006,9 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
             keys,
             state,
             state_since,
-            // Both filled after the loop, for version 7 and version 8 respectively.
+            // All three filled after the loop, for versions 7, 8 and 11.
             predicate: None,
+            nulls_not_distinct: false,
         });
     }
 
@@ -1020,6 +1030,14 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
     read_index_tails(&mut reader, &mut indexes)?;
 
     let foreign_keys = read_foreign_keys(&mut reader, columns.len())?;
+    // A version 10 index has no flag, which is what every index a version 10 catalog could hold
+    // had: `NULLS NOT DISTINCT` was `0A000` until version 11. Read **before** `finish`, which
+    // consumes the reader and asserts the record is exhausted.
+    if reader.version >= 11 {
+        for index in &mut indexes {
+            index.nulls_not_distinct = reader.flag()?;
+        }
+    }
     reader.finish()?;
 
     Ok(TableDef {

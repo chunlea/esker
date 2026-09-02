@@ -117,6 +117,10 @@ pub(super) fn create_table(
                 .unwrap_or_else(|| plan::unique_constraint_name(&create.name, &constraint.columns)),
             unique: true,
             keys: ordinals.into_iter().map(IndexKey::column).collect(),
+            // A `UNIQUE` constraint's grammar takes `NULLS NOT DISTINCT` on a real server; this
+            // node refuses the clause there (`parse::lower`), so a constraint's index never has
+            // it and the default is the truth rather than a placeholder.
+            nulls_not_distinct: false,
             // Born public. Nothing predates a `UNIQUE` declared with the table, so there is no
             // interleaving for the states to protect: the ADR's whole argument is about rows and
             // writers that already exist (`docs/plans/phase-6e.md` §2).
@@ -588,6 +592,7 @@ pub(super) fn create_index(
         unique: create.unique,
         keys,
         predicate: create.predicate.clone(),
+        nulls_not_distinct: create.nulls_not_distinct,
         // Public the moment it is declared, because it is built inside this statement's own
         // transaction: no other node ever sees it half-made. That is what makes the plain form
         // correct and also what makes it `TODO(post-v1)` for a table large enough to matter — the

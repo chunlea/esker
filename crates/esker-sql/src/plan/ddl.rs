@@ -134,6 +134,12 @@ pub enum KeyPartName {
 
 /// `CREATE INDEX`, including `CREATE UNIQUE INDEX`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each one is an independent clause of the statement -- UNIQUE, IF NOT EXISTS, \
+              CONCURRENTLY, NULLS NOT DISTINCT -- written or not written on its own, and a \
+              struct of flags would be a name for a grouping SQL does not have"
+)]
 pub struct CreateIndex {
     /// The name it was given, or `None` for PostgreSQL's derived one.
     pub name: Option<String>,
@@ -157,6 +163,9 @@ pub struct CreateIndex {
     ///
     /// See `crate::catalog::IndexDef::predicate`: maintained, and never chosen for a read.
     pub predicate: Option<String>,
+    /// `NULLS NOT DISTINCT`. See `crate::catalog::IndexDef::nulls_not_distinct` — the one clause
+    /// in an index definition that changes which rows are refused.
+    pub nulls_not_distinct: bool,
 }
 
 /// A `FOREIGN KEY` as written, before the parent has been looked up.

@@ -47,7 +47,13 @@ pub(super) fn entry(
         return Ok(None);
     }
     let values = key_values(table, index, row)?;
-    let by_value = index.unique && row::unique_index_key_is_unique_by_value(&values);
+    // **`NULLS NOT DISTINCT` is what makes two NULLs collide.** A unique key with a NULL in it is
+    // normally *not* unique by value — PostgreSQL admits any number of NULLs in a `UNIQUE` column,
+    // because two unknowns are not known to be equal — so the entry carries the primary key as a
+    // suffix and the NULLs stay apart. The clause says to treat them as one value instead, which
+    // is exactly "drop the suffix": the second NULL then writes the key the first one holds.
+    let by_value = index.unique
+        && (index.nulls_not_distinct || row::unique_index_key_is_unique_by_value(&values));
     let suffix = if by_value { None } else { Some(primary_key) };
     let key = row::index_key(tenant, table.id, index.id, &values, suffix)?;
     Ok(Some(Entry {

@@ -1,0 +1,54 @@
+# **`NULLS NOT DISTINCT`** — statement 195 of `schema.rb`
+#
+# `t.index [:firm_id], name: "company_nulls_not_distinct", nulls_not_distinct: true`. The one
+# clause in an index definition that changes which rows are **refused** rather than how they are
+# stored or printed.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **The default is that NULLs do not collide, and this clause is what reverses it.** A
+#     `UNIQUE` index normally admits any number of NULLs, because two unknowns are not known to be
+#     equal. Rows 2 and 4 below both have `b = NULL` and the second is `23505` — but the same two
+#     rows have `a = NULL` under a plain unique index and are both admitted. One table, two
+#     indexes, opposite answers about the same pair of NULLs.
+#   * **The DETAIL writes the NULL as `null`** — lower case, unquoted, no `NULL` keyword:
+#     `Key (b)=(null) already exists.`
+#   * **An `UPDATE` into the NULL is checked too**, which is the half an implementation that only
+#     hooks `INSERT` misses.
+#   * **`NULLS DISTINCT` written out prints nothing.** It is the default, so a real server stores
+#     it as `f` and `pg_get_indexdef` gives it back with no clause at all — the same
+#     "keep only what differs from the default" rule the `DESC` unit met.
+#   * **The clause prints after the key list and before the `WHERE`**:
+#     `USING btree (a, b) NULLS NOT DISTINCT WHERE (c IS NOT NULL)`.
+#   * **A non-unique index takes it, and prints it**, where it can refuse nothing at all. Accepted
+#     and stored rather than rejected as meaningless.
+#   * **It is a column of `pg_index`, not part of the key** — `indnullsnotdistinct`, beside
+#     `indisunique` rather than inside `indkey`.
+#
+# The table is left behind on the oracle, which is what lets `\gdesc` fill the declared-types
+# column (`captures/README.md`).
+DROP TABLE IF EXISTS nd		-
+CREATE TABLE nd (id int8 PRIMARY KEY, a int8, b int8, c int8)		-
+CREATE UNIQUE INDEX nd_plain ON nd (a)		-
+CREATE UNIQUE INDEX nd_nnd ON nd (b) NULLS NOT DISTINCT		-
+CREATE UNIQUE INDEX nd_d ON nd (c) NULLS DISTINCT		-
+INSERT INTO nd VALUES (1, 1, 1, 1)		-
+INSERT INTO nd VALUES (2, NULL, NULL, NULL)		-
+INSERT INTO nd VALUES (3, NULL, 9, 9)		-
+INSERT INTO nd VALUES (4, 8, NULL, 8)	!23505 duplicate key value violates unique constraint "nd_nnd" DETAIL: Key (b)=(null) already exists.
+INSERT INTO nd VALUES (5, 7, 7, NULL)		-
+SELECT id, a, b, c FROM nd ORDER BY id	bigint,bigint,bigint,bigint	1|1|1|1 ; 2|\N|\N|\N ; 3|\N|9|9 ; 5|7|7|\N
+UPDATE nd SET b = NULL WHERE id = 1	!23505 duplicate key value violates unique constraint "nd_nnd" DETAIL: Key (b)=(null) already exists.
+SELECT pg_get_indexdef('nd_plain'::regclass)	text	CREATE UNIQUE INDEX nd_plain ON public.nd USING btree (a)
+SELECT pg_get_indexdef('nd_nnd'::regclass)	text	CREATE UNIQUE INDEX nd_nnd ON public.nd USING btree (b) NULLS NOT DISTINCT
+SELECT pg_get_indexdef('nd_d'::regclass)	text	CREATE UNIQUE INDEX nd_d ON public.nd USING btree (c)
+SELECT i.relname, x.indisunique, x.indnullsnotdistinct FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'nd'::regclass ORDER BY i.relname	name,boolean,boolean	nd_d|t|f ; nd_nnd|t|t ; nd_pkey|t|f ; nd_plain|t|f
+CREATE UNIQUE INDEX nd_both ON nd (a, b) NULLS NOT DISTINCT WHERE c IS NOT NULL		-
+SELECT pg_get_indexdef('nd_both'::regclass)	text	CREATE UNIQUE INDEX nd_both ON public.nd USING btree (a, b) NULLS NOT DISTINCT WHERE (c IS NOT NULL)
+CREATE INDEX nd_nonunique ON nd (c) NULLS NOT DISTINCT		-
+SELECT pg_get_indexdef('nd_nonunique'::regclass)	text	CREATE INDEX nd_nonunique ON public.nd USING btree (c) NULLS NOT DISTINCT
+ALTER TABLE nd ADD CONSTRAINT nd_u UNIQUE NULLS NOT DISTINCT (a)	!23505 could not create unique index "nd_u" DETAIL: Key (a)=(null) is duplicated.

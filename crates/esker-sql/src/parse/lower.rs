@@ -1199,10 +1199,7 @@ fn referential_action(
 
 fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<plan::CreateIndex> {
     refuse_if(!create.include.is_empty(), "CREATE INDEX ... INCLUDE")?;
-    refuse_if(
-        create.nulls_distinct.is_some(),
-        "CREATE INDEX ... NULLS [NOT] DISTINCT",
-    )?;
+
     refuse_if(!create.with.is_empty(), "CREATE INDEX ... WITH")?;
 
     refuse_if(
@@ -1229,6 +1226,12 @@ fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<plan::Crea
             .predicate
             .as_ref()
             .map(|predicate| unwrap_nested(predicate).to_string()),
+        // `NULLS DISTINCT` written out is the **default**, and a real server stores and prints
+        // nothing for it — so only the negative form is carried, which is also the only one that
+        // changes an answer.
+        // `sqlparser` spells this clause as `Option<bool>` on a `CREATE INDEX` and as a
+        // three-valued enum on a table constraint — `Some(false)` here is `NULLS NOT DISTINCT`.
+        nulls_not_distinct: create.nulls_distinct == Some(false),
         name: create.name.as_ref().map(object_name).transpose()?,
         table: relation_name(&create.table_name)?,
         keys: index_keys(&create.columns)?,
