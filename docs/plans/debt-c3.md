@@ -592,3 +592,49 @@ distinguishable on the variant, which today it is only in a message string; and 
 **apply** path at all, which is where a width mismatch is actually met and which
 `crate::columnar::decode` forbids from fetching. Re-reading on the read path is where the existing
 design already puts this question.
+
+## The lane's gate
+
+`just check`'s five steps, run with this lane's own `CARGO_TARGET_DIR` at `d1a798f`:
+
+| | result |
+|---|---|
+| `cargo fmt --all --check` | **clean**, workspace-wide |
+| `cargo clippy --all-targets --all-features -- -D warnings` | **clean**, workspace-wide |
+| `cargo deny check` | **advisories ok, bans ok, licenses ok, sources ok** — no dependency was added anywhere in this wave, and unit 5 is the one that could have: `libc` was never needed because `std` does the `fcntl` itself |
+| `RUSTDOCFLAGS="-D warnings" cargo doc` | one failure, `crates/esker-sql/src/parameter.rs:63` — another lane's file and another lane's line |
+| `cargo nextest run --workspace --all-features` | **2355 of 2358 passed**, 33 skipped, 3 failed |
+
+The three failures are `esker-columnar::value::tests::tags_match_the_row_side`,
+`esker-sql::pg_catalog::activerecord_s_four_type_map_queries_answer` and
+`esker-sql::joint_gate::a_lock_the_ttl_kills_resolves_the_same_way_on_both_engines` — all in the
+type-surface lane's live work, and none of this lane's twelve commits touches those crates.
+
+### One thing the gate caught that this lane's own runs did not
+
+`a035ba7` shipped with `esker-client`'s tests not compiling. Adding `Request::Schema` to
+`esker-proto` broke three exhaustive matches in the client's scripted transport — which is those
+matches working as designed, each written out rather than defaulted so that a new request has to say
+which of the three it is. `cargo clippy -p esker-proto -p esker-store` was clean and said nothing
+about it, because a per-crate gate checks the crates you edited and a shared enum is a change to
+every crate that matches on it. Fixed in `3815eb6`, minutes later, and the rule is now: after
+touching `esker-proto`, gate `esker-client`, `esker-store`, `esker-pd` and `esker-cli`; after
+touching `esker-engine`, gate `esker-store` and `esker-cli`.
+
+### And one recurring failure that was not a bug in the code under test
+
+`esker-cli::cluster_start::a_four_node_cluster_with_a_driver_registers_four_stores` failed three
+times in this session, every time at 60.2 s against its own sixty-second budget and every time on
+the run right after a build, with the same command passing in 0.33 s immediately afterwards. macOS
+charges for the first execution of a freshly linked binary — `syspolicyd` evaluates it while the
+process sits at `_dyld_start` at 0% CPU — and this test spawns the binary and *then* starts its
+clock, so the budget was paying for the operating system. It now runs the binary once for `--help`
+before the clock starts (`c3b64d9`), and passed in the full-workspace run above.
+
+## What this lane did not do
+
+**Inventory #10** — the columnar copy rebuilt by a full walk at every open, where the manifest
+should carry the applied index its runs are complete to. It was the "if budget remains" item and
+the budget went to 1b and 7b, both of which were bugs rather than improvements. It remains the
+best-specified item left in the inventory: `crates/esker-store/src/columnar/region.rs:30-39` names
+the fix in its own words.

@@ -59,5 +59,8 @@ Nothing on the durability path, and this is the assertion that matters most.
 * `esker-store` has **no** `WriteOptions::default()` write site: every one of its writes says
   `synced()` or `unsynced()` explicitly, so the store's behaviour is bit-for-bit what it was. The
   store has always opened its engine `Never` and has always done its own syncing.
+* `esker-pd` is the same and was audited separately, because it is the other component whose
+  durability a mode change could quietly move: it opens `Never` too, and all four of its write
+  sites say `synced()`. Nothing about the placement driver's durability changed either.
 * `crates/esker-engine/tests/crash_kill.rs` and the rest of the engine suite: **409 tests, 409
   passed, 7 skipped.**
