@@ -291,12 +291,15 @@ That is a licence these tests have and a client does not.
 
 ## What this lane did not do
 
-* **The simultaneous-claim race** is narrowed to two round trips by a read-back, not closed.
-  Closing it wants `PutObject` with `If-None-Match: *`; ADR 0029 records why that waits for the
-  next change to `esker-s3`.
-* **`esker bench` has no `--adopt-sst-store`.** A benchmark pointed at a stale prefix should get
-  a fresh one, not adopt somebody's objects; `esker server` is where an operator has a database
-  worth keeping.
+* ~~**The simultaneous-claim race** is narrowed to two round trips by a read-back, not closed.~~
+  Closed in debt wave C4, by the change ADR 0029 said it was waiting for: `put_if_absent` is
+  `PutObject` with `If-None-Match: *`, and the read-back stays for the retried-claim case and for
+  an endpoint that ignores the precondition. `docs/plans/debt-c4.md` §3.
+* ~~**`esker bench` has no `--adopt-sst-store`.**~~ Added in debt wave C4. The reasoning above is
+  still the default — a benchmark pointed at a stale prefix gets a fresh one — but the refusal
+  named a flag the command did not have, and a benchmark's claim id is new on every run because
+  its database is a temporary directory, so every re-run against a named prefix hit it.
+  `docs/plans/debt-c4.md` §8.
 * **Nothing was done about the store-level heartbeat intervals** (`heartbeat_tick` and friends
   at 5-20 ms in these tests). They are a schedule resolution, not a correctness threshold, and
   the traces never implicated them. Left alone deliberately.

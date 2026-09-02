@@ -339,7 +339,8 @@ and applied index an operator's progress is read from.
   damage. If repair latency ever matters, the knob is the region-heartbeat interval.
 - **In-flight operators are invisible to `esker pd inspect`**, which opens a stopped PD's
   database. Live operators need a status endpoint on a running PD — an observability item for
-  4d, not a gap in the durable state.
+  4d, not a gap in the durable state. **Built in debt wave C4:** `Pd::Status` (`0x0309`) and
+  `esker pd status`, `docs/plans/debt-c4.md` §5.
 
 ---
 
