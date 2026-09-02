@@ -36,6 +36,8 @@ mod tests {
         use proptest::prelude::*;
         let values: BoxedStrategy<Datum> = match ty {
             ColumnType::Int8 => any::<i64>().prop_map(Datum::Int8).boxed(),
+            // The whole closed range, `24:00:00` included.
+            ColumnType::Time => (0i64..=86_400_000_000).prop_map(Datum::Time).boxed(),
             ColumnType::Int4 => any::<i32>().prop_map(Datum::Int4).boxed(),
             ColumnType::Int2 => any::<i16>().prop_map(Datum::Int2).boxed(),
             // Weighted towards the ties, as `Double` is: PostgreSQL has fewer floats than IEEE

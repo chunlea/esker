@@ -681,6 +681,14 @@ impl Literal {
     ///
     /// `column` is only for the message; PostgreSQL names the column in a type mismatch and a
     /// client reading "is of type bytea but expression is of type integer" needs to know which one.
+    ///
+    /// One arm per literal kind per column type, which is why it is long: it grows by a line each
+    /// time a type is added, and every arm is a measured answer rather than a fallthrough — a `_`
+    /// here is how a new type would silently take some other type's assignment rule.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per literal kind per column type, and a `_` would hide the next one"
+    )]
     pub fn assign(&self, ty: ColumnType, column: &str) -> Result<Datum> {
         let mismatch = || {
             Err(SqlError::DatatypeMismatchInColumn {
@@ -732,6 +740,9 @@ impl Literal {
                 // date` on a real server; the Julian day is an implementation detail with no cast
                 // to reach it, in either direction.
                 | ColumnType::Date
+                // A time is not a number either, and for the same reason: `1::time` is `42846`,
+                // and a microsecond count since midnight has no cast to reach it.
+                | ColumnType::Time
                 // Neither takes a number or a boolean: `INSERT INTO t (j) VALUES (1)` is a type
                 // mismatch on a real server, not a one-element document.
                 | ColumnType::Json
@@ -788,6 +799,7 @@ impl Literal {
                 // A number is not a document, whichever way it is written.
                 | ColumnType::Json
                 | ColumnType::Jsonb
+                | ColumnType::Time
                 | ColumnType::Timestamp => mismatch(),
             },
 
@@ -815,6 +827,7 @@ impl Literal {
                 | ColumnType::Jsonb
                 | ColumnType::Date
                 | ColumnType::Numeric
+                | ColumnType::Time
                 | ColumnType::Real => mismatch(),
             },
         }

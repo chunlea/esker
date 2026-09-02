@@ -180,6 +180,7 @@ fn columnar_type(ty: StoredType) -> esker_columnar::ColumnType {
         StoredType::Double => esker_columnar::ColumnType::Double,
         StoredType::Date => esker_columnar::ColumnType::Date,
         StoredType::Numeric => esker_columnar::ColumnType::Numeric,
+        StoredType::Time => esker_columnar::ColumnType::Time,
     }
 }
 
@@ -200,6 +201,7 @@ fn value_of(datum: &Datum) -> Value {
         Datum::Date(day) => Value::Date(*day),
         // Its text, which is lossless for this type: a `numeric`'s scale is in its digits.
         Datum::Numeric(value) => Value::Numeric(esker_keys::numeric::to_text(value)),
+        Datum::Time(micros) => Value::Time(*micros),
     }
 }
 

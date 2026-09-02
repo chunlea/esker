@@ -384,6 +384,10 @@ fn put_literal(value: &Value, out: &mut Vec<u8>) {
             out.push(ColumnType::Int2.tag());
             out.extend_from_slice(&v.to_le_bytes());
         }
+        Value::Time(v) => {
+            out.push(ColumnType::Time.tag());
+            out.extend_from_slice(&v.to_le_bytes());
+        }
         Value::Date(v) => {
             out.push(ColumnType::Date.tag());
             out.extend_from_slice(&v.to_le_bytes());
@@ -432,6 +436,7 @@ fn take_literal(cursor: &mut Cursor<'_>) -> Result<Value> {
         ColumnType::Int8 => Value::Int8(take_i64(cursor)?),
         ColumnType::TimestampTz => Value::TimestampTz(take_i64(cursor)?),
         ColumnType::Timestamp => Value::Timestamp(take_i64(cursor)?),
+        ColumnType::Time => Value::Time(take_i64(cursor)?),
         ColumnType::Int4 => Value::Int4(i32::from_le_bytes(
             cursor.u32_le("literal int4")?.to_le_bytes(),
         )),

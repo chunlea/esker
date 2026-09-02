@@ -1736,9 +1736,15 @@ fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // and it is its own family: `json = jsonb` is `42883` like everything else about
             // `json`, and there is no implicit cast between `jsonb` and `text`. Measured.
             ColumnType::Jsonb => 5,
+            // **A family of one, and not the datetime family.** A `date` joins `timestamp`
+            // because `date = timestamp` is a real operator; a `time` does not, because
+            // `time = timestamp` and `time = date` are both `42883 operator does not exist` on
+            // 19beta1 — measured, because putting it in family 4 by analogy would answer where a
+            // real server raises, which is ADR 0031's worst class.
+            ColumnType::Time => 6,
             // Unreachable: returned above, and kept as an arm rather than a `_` so that the next
-            // type added here is a compile error rather than a silent family 6.
-            ColumnType::Json => 6,
+            // type added here is a compile error rather than a silent family 7.
+            ColumnType::Json => 7,
         }
     }
     if matches!(left, ColumnType::Json) || matches!(right, ColumnType::Json) {

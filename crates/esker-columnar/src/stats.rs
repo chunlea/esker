@@ -114,6 +114,7 @@ impl Bound {
             )),
             ColumnType::TimestampTz => Value::TimestampTz(i64::from_le_bytes(fixed()?)),
             ColumnType::Timestamp => Value::Timestamp(i64::from_le_bytes(fixed()?)),
+            ColumnType::Time => Value::Time(i64::from_le_bytes(fixed()?)),
             ColumnType::Double => Value::Double(f64::from_le_bytes(fixed()?)),
             ColumnType::Real => Value::Real(f32::from_le_bytes(
                 <[u8; 4]>::try_from(self.bytes.as_slice()).ok()?,
@@ -269,6 +270,7 @@ impl ColumnStats {
             ColumnType::Int8
             | ColumnType::TimestampTz
             | ColumnType::Timestamp
+            | ColumnType::Time
             | ColumnType::Double => Some(8),
             // Each at its own width, which is what makes it a different type.
             ColumnType::Int4 | ColumnType::Real | ColumnType::Date => Some(4),
@@ -795,6 +797,7 @@ mod tests {
             .boxed(),
             ColumnType::TimestampTz => any::<i64>().prop_map(Value::TimestampTz).boxed(),
             ColumnType::Timestamp => any::<i64>().prop_map(Value::Timestamp).boxed(),
+            ColumnType::Time => (0i64..=86_400_000_000).prop_map(Value::Time).boxed(),
             ColumnType::Bool => any::<bool>().prop_map(Value::Bool).boxed(),
             ColumnType::Double => prop_oneof![
                 Just(Value::Double(f64::NAN)),
@@ -849,7 +852,7 @@ mod tests {
         };
         for value in present {
             let inside = match value {
-                Value::Int8(v) | Value::TimestampTz(v) | Value::Timestamp(v) => {
+                Value::Int8(v) | Value::TimestampTz(v) | Value::Timestamp(v) | Value::Time(v) => {
                     min.as_i64() <= Some(*v) && Some(*v) <= max.as_i64()
                 }
                 // A four-byte bound, read as its own width: `as_i64` wants eight and answers
