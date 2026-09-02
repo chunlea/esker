@@ -800,6 +800,18 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
   which costs no executor at all and no observable difference — `MATERIALIZED` and `NOT MATERIALIZED`
   return the same rows, measured. Every one of them is bounded where `Sort` is (`53400`), and none of
   them routes to the columnar engine.
+  **`pg_catalog` and `information_schema` are computed relations**
+  ([ADR 0044](adr/0044-a-catalog-relation-is-computed-and-its-oid-is-the-record-s-id.md)): fourteen
+  views over the same `'m'`-space records the planner already reads, materialised per query, with no
+  second store to keep in step. Their oids are the ids those records already carry — a table's, an
+  index's, a sequence's — from **one** snapshot read once per statement and bounded like every other
+  scan (`53400`), because every statement a schema dump sends is an oid join and two views computing
+  one independently is how they silently stop joining. The two relations with no record of their own,
+  a primary-key constraint and a `NOT NULL`, derive theirs reversibly from the table and the column.
+  A `pg_catalog` function is resolved where its argument allows: `'x'::regclass` before the plan is
+  built, `pg_get_indexdef(d.indexrelid)` per row against a snapshot the cursor holds. Every write is
+  `42501`, and a type this node has no value for is provided where the client reads it as text
+  (`pg_index.indkey`) and refused where the client subscripts it (`pg_constraint.conkey`).
 - **Scale-to-zero:** because SQL nodes are stateless and SSTs can live in object storage, an idle tenant
   costs only its Raft metadata; PD may later hibernate cold regions (ADR).
 - **Multi-tenancy:** tenant id is the first field of every SQL key; RawKV/TxnKV users may adopt the same

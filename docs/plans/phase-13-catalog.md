@@ -57,7 +57,7 @@ Every join `ActiveRecord` writes is an oid join: `t.oid = d.indrelid`, `d.indexr
 them silently, and an oid that **collides** breaks them in a way that looks like it works.
 
 **The rule: a relation's oid is the id the catalog already gave it, and every view derives it from
-the same function.** One function, `pg_relations::oid_of`, and no view computes one itself.
+the same function.** One snapshot, `pg_relations::Relations`, which computes every oid as it reads the records, and no view computes one itself.
 
 | Relation | oid | Where it comes from |
 |---|---|---|
@@ -294,7 +294,7 @@ oid is the id the record already carries**. The two collisions, the derived prim
 New:
 
 ```
-crates/esker-sql/src/catalog/pg_relations.rs        the snapshot, and oid_of
+crates/esker-sql/src/catalog/pg_relations.rs        the snapshot, and every oid in it
 crates/esker-sql/src/catalog/pg_attribute.rs        pg_attribute, pg_attrdef
 crates/esker-sql/src/catalog/pg_index.rs            pg_index
 crates/esker-sql/src/catalog/pg_constraint.rs       pg_constraint
@@ -339,7 +339,52 @@ Fourteen types, a sequence-backed key, both identity kinds, a unique index, a mu
 table with nothing at all. Captured inside one `BEGIN … ROLLBACK` with `ON_ERROR_ROLLBACK on` and
 `\gdesc` inline, so the shared `esker-pg19` oracle is left exactly as it was found.
 
-## 6. Risks
+## 6. What was built, and what moved
+
+Six commits, one per unit, each with its own capture and corpus. Fourteen views where there were
+four; `format_type`, `pg_get_expr`, `pg_get_indexdef`, `pg_get_constraintdef` and `'x'::regclass`
+where there were none.
+
+**`ActiveRecord`'s boot counter moved 22 → 24** (`check_constraints()` and
+`exclusion_constraints()`, verified by running the corpus rather than inferred), and main's
+`current_schema` unit took it to 25 in the same window.
+
+Four things the plan did not predict, all of them found by a capture or a replay:
+
+1. **`pg_class` had two oid collisions** (§1.1). Predicted for the primary key, not for the
+   sequence — and the sequence's fix was to *read a field that was already there*.
+2. **`indkey` numbered from the wrong list.** A keyless table hides a column in slot 0, so an index
+   on `ib (a int4, b text)`'s first column reported `2` where PostgreSQL says `1`. Caught by the
+   replay, and closed by making `attnum_of` the one function every view numbers with.
+3. **`pg_get_indexdef` is strict in its second argument when there is one**, which is not the same
+   as having none: `(oid)` prints a definition and `(oid, NULL, true)` is NULL. The first
+   implementation flattened both into one `Option` and printed a definition where a real server
+   says nothing.
+4. **The write path needed the read path's name resolution.** `DROP TABLE pg_catalog.pg_class` was
+   answering `0A000` on the qualifier and skipping `refuse_write` — the guard that stops a client
+   dropping a catalog relation. It now answers `42501`, exactly as measured.
+
+And two the plan predicted and the capture confirmed: PostgreSQL 19's `NOT NULL` rows in
+`pg_constraint`, and the default expression printed from the *literal's* type rather than the
+column's (`int8 DEFAULT -3` is `'-3'::integer`). All fourteen default shapes agreed on the first
+run, which is why the divergence entries written for them had to be deleted.
+
+### What is refused, in one list
+
+`pg_depend`, `pg_am`, `pg_extension`, `pg_description`; `pg_collation`'s rows; comments
+(`col_description`, `obj_description`); `information_schema.table_catalog`; `pg_constraint.conkey`
+and `confkey`; `contype = 'u'`; foreign keys, `CHECK` and `EXCLUDE`; `attnum <= 0`. Each is `0A000`
+or `42703` naming itself, counted under ADR 0031 (c), and each is in
+[ADR 0044](../adr/0044-a-catalog-relation-is-computed-and-its-oid-is-the-record-s-id.md) §5 with
+its reason.
+
+**One of them is a question for a human rather than a decision for this lane**: `contype = 'u'`
+needs one bool on `IndexDef` to tell a `UNIQUE` constraint from a `CREATE UNIQUE INDEX`, which is a
+catalog **record format** change (`CLAUDE.md`, "Ask before doing"). Until then a schema dump writes
+`t.index …, unique: true` where a real server writes `t.unique_constraint …`, and the schema that
+round-trips is the same schema.
+
+## 7. Risks
 
 * **An oid that disagrees between two views.** The reason for §3.3's single snapshot. The test that
   catches it is not a value assertion — it is `pg_class ⋈ pg_index ⋈ pg_attribute` returning the
