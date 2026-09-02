@@ -66,6 +66,28 @@ pub(crate) fn for_node(store_url: &str, node: u64) -> String {
     format!("{}/node-{node}", store_url.trim_end_matches('/'))
 }
 
+/// The client for one store URL, and the key prefix it resolves to.
+///
+/// The half of [`filesystem`] that is only about the object store, for a caller that wants the
+/// bucket and not a database on top of it — `esker sst-store reconcile`, which compares what the
+/// prefix holds against what a manifest names. Same environment, same parser, so the tool and the
+/// server can never disagree about which prefix a URL means.
+pub(crate) fn object_store(
+    store_url: &str,
+) -> Result<(Arc<dyn esker_s3::ObjectStore>, String), String> {
+    let endpoint_url = env_or("ESKER_S3_ENDPOINT", "http://localhost:19000");
+    let endpoint = esker_s3::Endpoint::parse(&endpoint_url).map_err(|err| err.to_string())?;
+    let credentials = esker_s3::Credentials::new(
+        env_or("ESKER_S3_KEY", "eskertest"),
+        env_or("ESKER_S3_SECRET", "eskertest123"),
+    );
+    let region = env_or("ESKER_S3_REGION", "us-east-1");
+    let config = esker_s3::Config::from_store_url(store_url, endpoint, region, credentials)
+        .map_err(|err| err.to_string())?;
+    let prefix = config.prefix.clone();
+    Ok((Arc::new(esker_s3::S3Client::new(config)), prefix))
+}
+
 /// The filesystem the engine should run on.
 ///
 /// `None` for `store_url` is the ordinary local filesystem, which is every store before phase 6b

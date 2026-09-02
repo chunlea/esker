@@ -29,7 +29,7 @@
 //! index key's leading byte, in a `DataRow`'s -1 length. Keeping them in one type is what lets a
 //! single `match` be exhaustive over what a column can hold.
 
-mod float;
+pub(crate) mod float;
 mod timestamp;
 
 use std::cmp::Ordering;
@@ -69,9 +69,11 @@ impl PgType for ColumnType {
             ColumnType::Bool => 16,
             ColumnType::Bytea => 17,
             ColumnType::Int8 => 20,
+            ColumnType::Int2 => 21,
             ColumnType::Int4 => 23,
             ColumnType::Text => 25,
             ColumnType::Varchar => 1043,
+            ColumnType::Real => 700,
             ColumnType::Double => 701,
             ColumnType::Timestamp => 1114,
             ColumnType::TimestampTz => 1184,
@@ -82,6 +84,7 @@ impl PgType for ColumnType {
         match self {
             ColumnType::Int8 => "bigint",
             ColumnType::Int4 => "integer",
+            ColumnType::Int2 => "smallint",
             ColumnType::Text => "text",
             ColumnType::Varchar => "character varying",
             ColumnType::Bool => "boolean",
@@ -89,13 +92,15 @@ impl PgType for ColumnType {
             ColumnType::TimestampTz => "timestamp with time zone",
             ColumnType::Timestamp => "timestamp without time zone",
             ColumnType::Double => "double precision",
+            ColumnType::Real => "real",
         }
     }
 
     fn type_len(self) -> i16 {
         match self {
             ColumnType::Bool => 1,
-            ColumnType::Int4 => 4,
+            ColumnType::Int4 | ColumnType::Real => 4,
+            ColumnType::Int2 => 2,
             ColumnType::Int8
             | ColumnType::TimestampTz
             | ColumnType::Timestamp
@@ -161,6 +166,7 @@ impl PgDatum for Datum {
             Datum::Null => return None,
             Datum::Int8(v) => v.to_string(),
             Datum::Int4(v) => v.to_string(),
+            Datum::Int2(v) => v.to_string(),
             Datum::Text(v) => v.clone(),
             // One character. See the module note: the `::text` cast says `true`, the output
             // function says `t`, and the wire carries the output function.
@@ -178,6 +184,7 @@ impl PgDatum for Datum {
             // No offset, which is the whole visible difference between the two types.
             Datum::Timestamp(v) => timestamp::to_text_without_zone(*v),
             Datum::Double(v) => float::to_text(*v),
+            Datum::Real(v) => float::to_text_f32(*v),
         })
     }
 
@@ -185,12 +192,14 @@ impl PgDatum for Datum {
         Ok(match ty {
             ColumnType::Int8 => Datum::Int8(parse_int8(text)?),
             ColumnType::Int4 => Datum::Int4(parse_int4(text)?),
+            ColumnType::Int2 => Datum::Int2(parse_int2(text)?),
             ColumnType::Text | ColumnType::Varchar => Datum::Text(text.to_owned()),
             ColumnType::Bool => Datum::Bool(parse_bool(text)?),
             ColumnType::Bytea => Datum::Bytea(parse_bytea(text)?),
             ColumnType::TimestampTz => Datum::TimestampTz(timestamp::from_text(text)?),
             ColumnType::Timestamp => Datum::Timestamp(timestamp::from_text_without_zone(text)?),
             ColumnType::Double => Datum::Double(float::from_text(text)?),
+            ColumnType::Real => Datum::Real(float::from_text_f32(text)?),
         })
     }
 
@@ -201,8 +210,10 @@ impl PgDatum for Datum {
                 v.to_be_bytes().to_vec()
             }
             Datum::Int4(v) => v.to_be_bytes().to_vec(),
+            Datum::Int2(v) => v.to_be_bytes().to_vec(),
             Datum::Bool(v) => vec![u8::from(*v)],
             Datum::Double(v) => v.to_be_bytes().to_vec(),
+            Datum::Real(v) => v.to_be_bytes().to_vec(),
             Datum::Text(v) => v.as_bytes().to_vec(),
             Datum::Bytea(v) => v.clone(),
         })
@@ -234,6 +245,14 @@ impl PgDatum for Datum {
             ColumnType::Int4 => {
                 let head: [u8; 4] = fixed(4)?.try_into().unwrap_or([0; 4]);
                 Datum::Int4(i32::from_be_bytes(head))
+            }
+            ColumnType::Real => {
+                let head: [u8; 4] = fixed(4)?.try_into().unwrap_or([0; 4]);
+                Datum::Real(f32::from_be_bytes(head))
+            }
+            ColumnType::Int2 => {
+                let head: [u8; 2] = fixed(2)?.try_into().unwrap_or([0; 2]);
+                Datum::Int2(i16::from_be_bytes(head))
             }
             ColumnType::Bool => match fixed(1)?[0] {
                 0 => Datum::Bool(false),
@@ -267,6 +286,11 @@ impl PgDatum for Datum {
             // `1::integer = 1::bigint` with `t`. Widening is exact in this direction, so there is
             // no rounding to argue about — an `i32` is an `i64`.
             (Datum::Int4(a), Datum::Int4(b)) => a.cmp(b),
+            (Datum::Int2(a), Datum::Int2(b)) => a.cmp(b),
+            (Datum::Int2(a), Datum::Int4(b)) => i32::from(*a).cmp(b),
+            (Datum::Int4(a), Datum::Int2(b)) => a.cmp(&i32::from(*b)),
+            (Datum::Int2(a), Datum::Int8(b)) => i64::from(*a).cmp(b),
+            (Datum::Int8(a), Datum::Int2(b)) => a.cmp(&i64::from(*b)),
             (Datum::Int4(a), Datum::Int8(b)) => i64::from(*a).cmp(b),
             (Datum::Int8(a), Datum::Int4(b)) => a.cmp(&i64::from(*b)),
             // Byte order, not the database's collation: see `crate::row` for why that is a
@@ -275,6 +299,10 @@ impl PgDatum for Datum {
             (Datum::Bool(a), Datum::Bool(b)) => a.cmp(b),
             (Datum::Bytea(a), Datum::Bytea(b)) => a.cmp(b),
             (Datum::Double(a), Datum::Double(b)) => float::pg_cmp(*a, *b),
+            (Datum::Real(a), Datum::Real(b)) => float::pg_cmp_f32(*a, *b),
+            // The two float widths compare as one type, as the integers do.
+            (Datum::Real(a), Datum::Double(b)) => float::pg_cmp(f64::from(*a), *b),
+            (Datum::Double(a), Datum::Real(b)) => float::pg_cmp(*a, f64::from(*b)),
             (a, b) => variant_rank(a).cmp(&variant_rank(b)),
         }
     }
@@ -290,8 +318,8 @@ fn variant_rank(value: &Datum) -> u8 {
         Datum::Bool(_) => 0,
         // The two integer widths share a rank: they are one type to a comparison, and `pg_cmp`
         // answers the pair above rather than falling through to here.
-        Datum::Int8(_) | Datum::Int4(_) => 1,
-        Datum::Double(_) => 2,
+        Datum::Int8(_) | Datum::Int4(_) | Datum::Int2(_) => 1,
+        Datum::Double(_) | Datum::Real(_) => 2,
         Datum::TimestampTz(_) | Datum::Timestamp(_) => 3,
         Datum::Text(_) => 4,
         Datum::Bytea(_) => 5,
@@ -300,6 +328,28 @@ fn variant_rank(value: &Datum) -> u8 {
 }
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
+
+/// PostgreSQL's `int2in`, one width below [`parse_int4`] and the same shape.
+///
+/// The name in the error is `smallint`, measured: `invalid input syntax for type smallint: "x"`
+/// and `value "32768" is out of range for type smallint`.
+fn parse_int2(text: &str) -> Result<i16> {
+    let wide = parse_int8(text).map_err(|error| match error {
+        SqlError::InvalidTextRepresentation { .. } => SqlError::InvalidTextRepresentation {
+            ty: ColumnType::Int2.name(),
+            value: text.to_owned(),
+        },
+        SqlError::IntegerOutOfRange { .. } => SqlError::IntegerOutOfRange {
+            ty: ColumnType::Int2.name(),
+            value: text.to_owned(),
+        },
+        other => other,
+    })?;
+    i16::try_from(wide).map_err(|_| SqlError::IntegerOutOfRange {
+        ty: ColumnType::Int2.name(),
+        value: text.to_owned(),
+    })
+}
 
 /// PostgreSQL's `int4in`, which is `pg_strtoint32_safe` — the same lexer as the 64-bit one with a
 /// narrower accumulator, so `0x` literals and `_` separators are taken here too.

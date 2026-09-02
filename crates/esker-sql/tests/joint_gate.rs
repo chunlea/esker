@@ -492,6 +492,9 @@ impl Gate {
             std::slice::from_ref(node),
             region_id,
             "fragment call",
+            // A fragment is a scan at a fixed `ts`: repeating it cannot change what the
+            // cluster holds, so its deadline is retryable where the `TxnKv` call's is not.
+            Idempotent::Yes,
             |_| Some((node.address, request.clone())),
         );
         match answer {
@@ -511,24 +514,32 @@ impl Gate {
         // two different reasons under a fully parallel `cargo test`
         // (`docs/plans/phase-9-rails.md` §8). The leader is looked up **per attempt**, because
         // the thing being retried is precisely that it changed.
-        let answer = call_through_an_election(&self.nodes, region_id, "call", |nodes| {
-            let leader = nodes.iter().find(|node| {
-                node.store
-                    .peer_of(region_id)
-                    .is_some_and(|peer| peer.is_leader())
-            })?;
-            let epoch = leader
-                .store
-                .regions()
-                .get(region_id)
-                .expect("the leader hosts the region")
-                .region()
-                .epoch;
-            Some((
-                leader.address,
-                Request::txn_kv(RequestHeader::new(region_id, epoch, 0), request.clone()),
-            ))
-        });
+        let answer = call_through_an_election(
+            &self.nodes,
+            region_id,
+            "call",
+            // A prewrite whose commit never comes is the point of the test around this call. A
+            // timed-out write has an unknown outcome, so it dumps rather than repeating.
+            Idempotent::No,
+            |nodes| {
+                let leader = nodes.iter().find(|node| {
+                    node.store
+                        .peer_of(region_id)
+                        .is_some_and(|peer| peer.is_leader())
+                })?;
+                let epoch = leader
+                    .store
+                    .regions()
+                    .get(region_id)
+                    .expect("the leader hosts the region")
+                    .region()
+                    .epoch;
+                Some((
+                    leader.address,
+                    Request::txn_kv(RequestHeader::new(region_id, epoch, 0), request.clone()),
+                ))
+            },
+        );
         answer.into_txn_kv().expect("a TxnKv answer")
     }
 
@@ -701,6 +712,7 @@ fn call_through_an_election(
     nodes: &[Node],
     region_id: u64,
     what: &str,
+    idempotent: Idempotent,
     mut address_and_request: impl FnMut(&[Node]) -> Option<(SocketAddr, Request)>,
 ) -> Response {
     // Eight attempts a quarter-second apart. An election on an idle cluster takes one heartbeat;
@@ -720,9 +732,11 @@ fn call_through_an_election(
         let outcome = BlockingTransport::connect(address).and_then(|transport| {
             transport.call(request, Instant::now() + Duration::from_secs(30))
         });
+        let retryable = is_a_leadership_change(&error_of(&outcome))
+            || (idempotent == Idempotent::Yes && is_a_deadline(&error_of(&outcome)));
         match outcome {
             Ok(answer) => return answer,
-            Err(error) if is_a_leadership_change(&error) => last = format!("{error}"),
+            Err(error) if retryable => last = format!("{error}"),
             Err(error) => transport_dump(nodes, region_id, what, &format!("{error}")),
         }
     }
@@ -732,6 +746,41 @@ fn call_through_an_election(
         what,
         &format!("{ATTEMPTS} attempts each lost the leader; the last said: {last}"),
     )
+}
+
+/// Whether a call may be repeated after a timeout, which is a property of the *request* and not of
+/// the error.
+///
+/// A timed-out call has an **unknown outcome**: the request may have been applied and the answer
+/// lost. Repeating a write on that is how a test invents a second prewrite; repeating a read is
+/// free. So the two call sites in this file answer differently, and neither answers for the other
+/// — the `TxnKv` one is a half-finished transaction and stays a hard failure, the fragment one is
+/// a scan at a fixed `ts` and is idempotent by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Idempotent {
+    /// A read. Repeating it cannot change what the cluster holds.
+    Yes,
+    /// A write, or anything whose outcome a lost answer leaves unknown.
+    No,
+}
+
+/// The error of an outcome, or a placeholder for the `Ok` case the caller has already handled.
+fn error_of(outcome: &Result<Response, ProtoError>) -> ProtoError {
+    match outcome {
+        Err(error) => error.clone(),
+        Ok(_) => ProtoError::internal("no error"),
+    }
+}
+
+/// Whether an error is the 30-second deadline expiring with no answer at all.
+///
+/// The **first** mechanism `docs/plans/phase-9-rails.md` §8 recorded, and a different thing from
+/// the election gap: there the peer answers immediately to say it stepped down, here nothing comes
+/// back. Its cause is the same saturation — this machine runs a 1,153-test suite in parallel, and
+/// another lane's build beside it — but a caller cannot tell a slow server from a lost one, which
+/// is why only an idempotent call may retry it.
+fn is_a_deadline(error: &ProtoError) -> bool {
+    matches!(error, ProtoError::Timeout { .. })
 }
 
 /// Whether an error is the region changing leader while the call was in flight.

@@ -150,11 +150,7 @@ pub fn region_balance(region: &RegionRecord, cluster: &Cluster<'_>) -> Option<Ba
     // shed the *healthy* replica on the store that happened to tie for busiest, and repair then
     // had to put one back on that same store. Five membership changes for a repair that needed
     // two.
-    let mid_repair = region
-        .region
-        .peers
-        .iter()
-        .any(|peer| cluster.is_store_down(peer.store_id));
+    let mid_repair = is_mid_repair(region, cluster);
 
     // The second half first: a region over its replica target is one whose move has landed and
     // needs finishing. Doing this before considering a new move is what stops PD starting a
@@ -278,11 +274,52 @@ pub fn region_balance(region: &RegionRecord, cluster: &Cluster<'_>) -> Option<Ba
     })
 }
 
+/// Whether this region is still being repaired, and is therefore not balance's to touch.
+///
+/// **Two states, and the second was learned from a trace.**
+///
+/// * a peer on a **down store**: the region is a failure away from losing quorum, and a replica
+///   moved now is one repair has to move back;
+/// * a plain **`Learner`**: a replica that has been added and not yet promoted. Repair and balance
+///   both add before they remove, and the peer they add starts as a learner — so a region holding
+///   one is a move in progress whoever started it, and the region is not in its settled shape.
+///
+/// The second one costs more than an extra membership change, which is why it is a rule and not a
+/// preference. The promotion is proposed by the **leader**, on the learner's `matched`, because a
+/// region heartbeat comes only from a leader and PD can therefore never see a learner's progress
+/// (`docs/plans/phase-4.md` §14.1). A leader with a leadership transfer in progress **refuses
+/// proposals**. So a `TransferLeader` issued against a region with an un-promoted learner blocks
+/// the very `AddVoter` that would finish the repair, the transfer times out waiting for a target
+/// the promotion would have caught up, PD re-derives it, and the region can sit like that
+/// indefinitely — which is what `esker-store`'s `promotion.rs` acceptance test caught.
+///
+/// **A `ColumnarLearner` is not a repair.** ADR 0022 Decision 1 says it is never promoted, so
+/// counting it here would freeze every region holding one out of balance for ever. It is the same
+/// distinction `region_balance` draws twice already when it counts voters rather than peers; this
+/// is the third site.
+fn is_mid_repair(region: &RegionRecord, cluster: &Cluster<'_>) -> bool {
+    region.region.peers.iter().any(|peer| {
+        cluster.is_store_down(peer.store_id)
+            || match peer.role {
+                PeerRole::Learner => true,
+                // Exhaustive, like every other role match in this codebase: a role added later
+                // must state its own answer rather than inherit one.
+                PeerRole::Voter | PeerRole::ColumnarLearner => false,
+            }
+    })
+}
+
 /// Hand this region's leadership to a peer on a quieter store, if that helps enough.
 #[must_use]
 pub fn leader_balance(region: &RegionRecord, cluster: &Cluster<'_>) -> Option<Balance> {
     if region.leader_peer_id == 0 {
         // PD has no opinion about who leads, so it has no business moving the office.
+        return None;
+    }
+    if is_mid_repair(region, cluster) {
+        // The office does not move out from under an unfinished repair. See `is_mid_repair`:
+        // a leader mid-transfer refuses the promotion that would finish it, and the two then
+        // wait for each other.
         return None;
     }
     let leader = region
@@ -375,6 +412,76 @@ mod tests {
             max_store_down_time_ms: DOWN_AFTER,
             target_replicas: TARGET_REPLICAS,
         }
+    }
+
+    /// A region as `region` builds it, plus one peer in `role` — a replica that has been added
+    /// and has not yet finished becoming what it will be.
+    fn region_with(
+        peers: &[(u64, u64)],
+        leader: u64,
+        extra: (u64, u64),
+        role: PeerRole,
+    ) -> RegionRecord {
+        let mut record = region(peers, leader);
+        record.region.peers.push(Peer {
+            store_id: extra.0,
+            peer_id: extra.1,
+            role,
+        });
+        record
+    }
+
+    /// **A region with an un-promoted learner belongs to repair, and balance leaves it alone.**
+    ///
+    /// The bug this is written from, off a real trace (`docs/plans/debt-c4.md` §9): PD issued a
+    /// `TransferLeader` for a region whose learner was still catching up. A leader with a transfer
+    /// in progress **refuses proposals** — including the `AddVoter` the store proposes to finish
+    /// the repair — so the transfer and the promotion each waited for the other, the transfer
+    /// timed out, PD re-derived it, and the learner sat there past the acceptance deadline.
+    ///
+    /// `mid_repair` counted a peer on a *down store* and nothing else, so a replica added on a
+    /// live store and not yet promoted looked like a settled region. It is the same
+    /// voters-are-not-peers family this module names twice already; this is the third site.
+    #[test]
+    fn a_region_with_a_learner_is_mid_repair_and_balance_leaves_it_alone() {
+        // The busiest store by a wide margin, so both rules would otherwise fire.
+        let stores = [store(1, 40, 20), store(2, 10, 4), store(3, 10, 1)];
+        let settled = region(&[(1, 10), (2, 20), (3, 30)], 10);
+        assert!(
+            leader_balance(&settled, &cluster(&stores)).is_some(),
+            "the imbalance has to be real, or this test would pass for the wrong reason"
+        );
+
+        // The same region, one learner still catching up on store 3.
+        let repairing = region_with(&[(1, 10), (2, 20), (3, 30)], 10, (3, 40), PeerRole::Learner);
+        assert_eq!(
+            leader_balance(&repairing, &cluster(&stores)),
+            None,
+            "leadership was moved out from under a promotion that had not landed"
+        );
+        assert_eq!(
+            region_balance(&repairing, &cluster(&stores)),
+            None,
+            "a replica was moved while the region was still repairing"
+        );
+        assert_eq!(balance_for(&repairing, &cluster(&stores)), None);
+    }
+
+    /// A **columnar** learner is not a repair in progress: ADR 0022 says it is never promoted, so
+    /// a region holding one would otherwise be frozen out of balance for ever.
+    #[test]
+    fn a_columnar_learner_does_not_freeze_a_region_out_of_balance() {
+        let stores = [store(1, 40, 20), store(2, 10, 4), store(3, 10, 1)];
+        let region = region_with(
+            &[(1, 10), (2, 20), (3, 30)],
+            10,
+            (3, 40),
+            PeerRole::ColumnarLearner,
+        );
+        assert!(
+            balance_for(&region, &cluster(&stores)).is_some(),
+            "a columnar learner was mistaken for an unfinished repair"
+        );
     }
 
     #[test]

@@ -183,6 +183,35 @@ pub fn lookup(db: &Db, key: &[u8]) -> Result<Option<RegionRecord>> {
     Ok(Some(record))
 }
 
+/// A page of region records in **key** order, starting with the region that contains `start_key`.
+///
+/// The range index is the key-ordered view — the same one [`lookup`] seeks into — so this is a
+/// seek and a walk rather than a sort of [`regions`], which is in id order and would need one.
+///
+/// An index entry naming a region with no record is **skipped with a warning**, not an error: a
+/// hole in the table is a bug to report and not a reason to fail a listing that can still show
+/// everything else (`CLAUDE.md` invariant 9, the same call [`lookup`] makes).
+pub fn scan_ranges(db: &Db, start_key: &[u8], limit: usize) -> Result<Vec<RegionRecord>> {
+    let mut out = Vec::new();
+    if limit == 0 {
+        return Ok(out);
+    }
+    let mut iter = db.iter(cf::DEFAULT, &ReadOptions::default())?;
+    let prefix = keys::prefix(keys::RANGE);
+    iter.seek(&keys::range_seek_key(start_key));
+    while iter.valid() && iter.key().starts_with(&prefix) && out.len() < limit {
+        let region_id = crate::record::decode_range_entry(iter.value())?;
+        if let Some(record) = read_region(db, region_id)? {
+            out.push(record);
+        } else {
+            tracing::warn!(region_id, "the range index names a region with no record");
+        }
+        iter.next();
+    }
+    iter.status()?;
+    Ok(out)
+}
+
 /// Every region record, in id order.
 pub fn regions(db: &Db) -> Result<Vec<RegionRecord>> {
     let mut out = Vec::new();

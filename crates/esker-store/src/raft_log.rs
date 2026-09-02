@@ -200,6 +200,48 @@ pub fn destroy(db: &Db, region_id: u64) -> Result<u64> {
     Ok(entries)
 }
 
+/// One region's state record, read straight from the engine.
+///
+/// `None` when this store holds no log for the region. `snapshot` pins the read, which matters to
+/// the one caller that needs the applied index and the data it names to be **the same instant**:
+/// the apply path writes both in one batch, so a reader on another thread that took them
+/// separately could see an index the data does not back (`crate::columnar::region`).
+pub fn read_state(
+    db: &Db,
+    region_id: u64,
+    snapshot: Option<esker_engine::Snapshot>,
+) -> Result<Option<PersistedState>> {
+    let options = ReadOptions {
+        snapshot,
+        ..ReadOptions::default()
+    };
+    match db.get(cf::RAFT, &state_key(region_id), &options)? {
+        Some(bytes) => PersistedState::decode(&bytes).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// One log entry, by index, or `None` when the log does not hold it.
+///
+/// The standalone form of [`RaftLogStorage`]'s own read, for a caller that has a `Db` and a region
+/// id and no business owning the region's storage — the columnar resume, which replays entries the
+/// driver has already applied.
+pub fn read_entry(
+    db: &Db,
+    region_id: u64,
+    index: Index,
+    snapshot: Option<esker_engine::Snapshot>,
+) -> Result<Option<Entry>> {
+    let options = ReadOptions {
+        snapshot,
+        ..ReadOptions::default()
+    };
+    match db.get(cf::RAFT, &log_entry_key(region_id, index), &options)? {
+        Some(bytes) => decode_entry(index, &bytes).map(Some),
+        None => Ok(None),
+    }
+}
+
 fn corrupt(error: &esker_proto::DecodeError) -> StoreError {
     StoreError::Bootstrap(format!("corrupt raft record: {error}"))
 }

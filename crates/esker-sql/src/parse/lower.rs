@@ -1823,6 +1823,8 @@ fn lower_type(data_type: &DataType) -> Result<ColumnType> {
         // each its own variant. A display width — `int(11)` — is MySQL's and is refused below
         // with the type as the user wrote it.
         DataType::Int4(None) | DataType::Int(None) | DataType::Integer(None) => ColumnType::Int4,
+        DataType::Int2(None) | DataType::SmallInt(None) => ColumnType::Int2,
+        DataType::Float4 | DataType::Real => ColumnType::Real,
         DataType::Text => ColumnType::Text,
         // `character varying` and `varchar` with **no length**. A length is a typmod and this node
         // has no column to keep one on yet, so `varchar(n)` is `0A000` naming itself until the
@@ -1914,6 +1916,9 @@ fn serial_width(data_type: &DataType) -> Option<ColumnType> {
     }
     if name.eq_ignore_ascii_case("serial") || name.eq_ignore_ascii_case("serial4") {
         return Some(ColumnType::Int4);
+    }
+    if name.eq_ignore_ascii_case("smallserial") || name.eq_ignore_ascii_case("serial2") {
+        return Some(ColumnType::Int2);
     }
     None
 }

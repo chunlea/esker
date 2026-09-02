@@ -28,7 +28,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use esker_columnar::{ColumnType, Reader, Schema, Value, ValueRef, Writer, WriterOptions};
+use esker_columnar::{ColumnType, Reader, Schema, Value, Writer, WriterOptions};
 use esker_engine::fs::FileSystem;
 
 use super::runs::RunSet;
@@ -92,7 +92,7 @@ impl Cursor {
             for (slot, column) in columns.iter().enumerate() {
                 let ty = self.types.get(slot).copied().unwrap_or(ColumnType::Int8);
                 for (row, value) in column.iter().enumerate() {
-                    decoded[row].push(owned(&value, ty));
+                    decoded[row].push(value.to_value(ty).map_err(|error| columnar(&error))?);
                 }
             }
             self.rows = decoded;
@@ -206,28 +206,6 @@ fn order(
     match left.get(ts_slot).zip(right.get(ts_slot)) {
         Some((a, b)) => b.pg_cmp(a),
         None => std::cmp::Ordering::Equal,
-    }
-}
-
-/// Owns a borrowed value, using the column's type to say which of the two it is.
-///
-/// [`ValueRef`] deliberately collapses the pairs that share a representation — `Int8` and
-/// `TimestampTz` are the same 64 bits, `Text` and `Bytea` the same bytes — so the schema is what
-/// distinguishes them. Getting this wrong would round-trip a timestamp column into an integer one
-/// and change the file's type on the way through a merge.
-fn owned(value: &ValueRef<'_>, ty: ColumnType) -> Value {
-    match value {
-        ValueRef::Null => Value::Null,
-        ValueRef::Bool(flag) => Value::Bool(*flag),
-        ValueRef::Double(double) => Value::Double(*double),
-        ValueRef::Int(int) => match ty {
-            ColumnType::TimestampTz => Value::TimestampTz(*int),
-            _ => Value::Int8(*int),
-        },
-        ValueRef::Bytes(bytes) => match ty {
-            ColumnType::Bytea => Value::Bytea((*bytes).to_vec()),
-            _ => Value::Text(String::from_utf8_lossy(bytes).into_owned()),
-        },
     }
 }
 

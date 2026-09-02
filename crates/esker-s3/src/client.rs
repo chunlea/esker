@@ -19,7 +19,7 @@ use crate::http::{Method, Request, Response};
 use crate::sigv4::{self, CanonicalRequest, Credentials, Scope};
 use crate::transport::{TcpTransport, Transport};
 use crate::xml;
-use crate::{GetResponse, MAX_SINGLE_PUT, ObjectStore, ObjectSummary};
+use crate::{GetResponse, MAX_SINGLE_PUT, ObjectStore, ObjectSummary, PutOutcome};
 
 /// Where the object store is, on the network.
 ///
@@ -317,6 +317,37 @@ impl ObjectStore for S3Client {
             .with_body(body);
         let response = self.send("PutObject", key, request)?;
         Ok(response.header("etag").map(xml::normalise_etag))
+    }
+
+    fn put_if_absent(&self, key: &str, body: &[u8]) -> Result<PutOutcome> {
+        if body.len() > MAX_SINGLE_PUT {
+            return Err(Error::Config(format!(
+                "{key} is {} bytes, past the {MAX_SINGLE_PUT}-byte single-request limit; \
+                 this client has no multipart upload",
+                body.len()
+            )));
+        }
+        // `*` is "any entity tag", so `If-None-Match: *` reads as "only if there is no object
+        // here at all". The header is signed like every other, because `Request::headers` is what
+        // the canonical request is built from — which is also what stops a proxy stripping it
+        // without the signature noticing.
+        let request = Request::new(Method::Put, self.path_for(key))
+            .header("content-length", body.len().to_string())
+            .header("if-none-match", "*")
+            .with_body(body);
+        match self.send("PutObject", key, request) {
+            Ok(response) => Ok(PutOutcome::Stored(
+                response.header("etag").map(xml::normalise_etag),
+            )),
+            // 412 is the precondition failing, which here means exactly one thing. 409 is what S3
+            // answers when two conditional writes to one key overlap: the loser is told to retry,
+            // and for a claim "somebody else is writing this marker right now" is the same answer
+            // as "somebody else has it" — the read-back that follows says who.
+            Err(Error::Status { status, .. }) if status == 412 || status == 409 => {
+                Ok(PutOutcome::AlreadyThere)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn get(&self, key: &str) -> Result<GetResponse> {

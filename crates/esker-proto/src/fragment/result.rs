@@ -93,6 +93,10 @@ pub enum ValueType {
     Double,
     /// Microseconds from 2000-01-01, with **no** zone: PostgreSQL's `timestamp`.
     Timestamp,
+    /// A 32-bit float.
+    Real,
+    /// A 16-bit signed integer.
+    Int2,
     /// A 32-bit signed integer.
     ///
     /// Appended by [ADR 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md), never
@@ -103,9 +107,11 @@ pub enum ValueType {
 
 impl ValueType {
     /// Every type, so a test cannot silently skip one.
-    pub const ALL: [ValueType; 8] = [
+    pub const ALL: [ValueType; 10] = [
         ValueType::Int8,
         ValueType::Int4,
+        ValueType::Int2,
+        ValueType::Real,
         ValueType::Timestamp,
         ValueType::Text,
         ValueType::Bool,
@@ -126,6 +132,8 @@ impl ValueType {
             ValueType::Double => 6,
             ValueType::Int4 => 7,
             ValueType::Timestamp => 8,
+            ValueType::Int2 => 9,
+            ValueType::Real => 10,
         }
     }
 
@@ -140,6 +148,8 @@ impl ValueType {
             6 => ValueType::Double,
             7 => ValueType::Int4,
             8 => ValueType::Timestamp,
+            9 => ValueType::Int2,
+            10 => ValueType::Real,
             _ => return Err(DecodeError::invalid("result.type", "unknown type tag")),
         })
     }
@@ -168,6 +178,10 @@ pub enum Value {
     Double(f64),
     /// [`ValueType::Int4`].
     Int4(i32),
+    /// [`ValueType::Int2`].
+    Int2(i16),
+    /// [`ValueType::Real`].
+    Real(f32),
     /// [`ValueType::Timestamp`].
     Timestamp(i64),
 }
@@ -185,6 +199,8 @@ impl Value {
             Value::TimestampTz(_) => ValueType::TimestampTz,
             Value::Double(_) => ValueType::Double,
             Value::Int4(_) => ValueType::Int4,
+            Value::Int2(_) => ValueType::Int2,
+            Value::Real(_) => ValueType::Real,
             Value::Timestamp(_) => ValueType::Timestamp,
         })
     }
@@ -208,11 +224,21 @@ impl Value {
                 out.put_u8(ValueType::Double.tag());
                 out.put_u64(v.to_bits());
             }
+            Value::Real(v) => {
+                out.put_u8(ValueType::Real.tag());
+                out.put_u32(v.to_bits());
+            }
             // Its own width on the wire, as it is on disk: four bytes, so a reader that knows the
             // tag cannot mistake the framing.
             Value::Int4(v) => {
                 out.put_u8(ValueType::Int4.tag());
                 out.put_u32(u32::from_le_bytes(v.to_le_bytes()));
+            }
+            // Two bytes, its own width: the tag already says how to read them, and widening would
+            // make this frame disagree with `pg_type.typlen`.
+            Value::Int2(v) => {
+                out.put_u8(ValueType::Int2.tag());
+                out.put_u16(u16::from_le_bytes(v.to_le_bytes()));
             }
             Value::Bool(v) => {
                 out.put_u8(ValueType::Bool.tag());
@@ -247,8 +273,12 @@ impl Value {
             ValueType::Double => {
                 Value::Double(f64::from_bits(input.get_u64("result.value.double")?))
             }
+            ValueType::Real => Value::Real(f32::from_bits(input.get_u32("result.value.real")?)),
             ValueType::Int4 => Value::Int4(i32::from_le_bytes(
                 input.get_u32("result.value.int4")?.to_le_bytes(),
+            )),
+            ValueType::Int2 => Value::Int2(i16::from_le_bytes(
+                input.get_u16("result.value.int2")?.to_le_bytes(),
             )),
             ValueType::Bool => Value::Bool(input.get_bool("result.value.bool")?),
             ValueType::Text => Value::Text(input.get_str("result.value.text")?.to_owned()),

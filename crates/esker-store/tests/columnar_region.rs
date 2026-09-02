@@ -145,9 +145,13 @@ fn read(slot: &ColumnarSlot, db: &Db, ts: u64) -> Vec<(i64, String)> {
 }
 
 fn slot(dir: &std::path::Path) -> ColumnarSlot {
+    // Region 1, with no log written for it: these tests tee by hand rather than through a
+    // driver, so there is nothing for a resume to replay and every open re-walks the region —
+    // which is what makes them still about the conversion (`columnar_resume.rs` is the resume).
     ColumnarSlot::new(
         Arc::new(LocalFileSystem::new()) as Arc<dyn FileSystem>,
         dir.join("columnar"),
+        1,
         ColumnarOptions::default(),
     )
 }
@@ -185,14 +189,14 @@ fn a_copy_is_built_from_what_the_region_holds_and_kept_up_by_what_arrives() {
 
     // And then the apply path extends it: an update, a delete, and a new row.
     let keys = commit(&db, 40, 41, &[put(1, "ada lovelace")]);
-    slot.commit(&db, 41, &keys).unwrap();
+    slot.commit(&db, 0, 41, &keys).unwrap();
     let keys = commit(
         &db,
         50,
         51,
         &[TxnMutation::Delete { key: row_key(2) }, put(4, "barbara")],
     );
-    slot.commit(&db, 51, &keys).unwrap();
+    slot.commit(&db, 0, 51, &keys).unwrap();
 
     assert_eq!(
         read(&slot, &db, 100),
@@ -239,7 +243,7 @@ fn a_table_with_no_columnar_record_has_no_copy() {
     );
     // And the apply path leaves it alone rather than buffering rows it cannot decode.
     let keys = commit(&db, 30, 31, &[put(2, "grace")]);
-    slot.commit(&db, 31, &keys).unwrap();
+    slot.commit(&db, 0, 31, &keys).unwrap();
     assert!(!slot.is_open());
 }
 

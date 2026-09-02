@@ -166,6 +166,8 @@ fn columnar_type(ty: StoredType) -> esker_columnar::ColumnType {
     match ty {
         StoredType::Int8 => esker_columnar::ColumnType::Int8,
         StoredType::Int4 => esker_columnar::ColumnType::Int4,
+        StoredType::Int2 => esker_columnar::ColumnType::Int2,
+        StoredType::Real => esker_columnar::ColumnType::Real,
         StoredType::Varchar => esker_columnar::ColumnType::Varchar,
         StoredType::Text => esker_columnar::ColumnType::Text,
         StoredType::Bool => esker_columnar::ColumnType::Bool,
@@ -182,6 +184,8 @@ fn value_of(datum: &Datum) -> Value {
         Datum::Null => Value::Null,
         Datum::Int8(int) => Value::Int8(*int),
         Datum::Int4(int) => Value::Int4(*int),
+        Datum::Int2(int) => Value::Int2(*int),
+        Datum::Real(real) => Value::Real(*real),
         Datum::Text(text) => Value::Text(text.clone()),
         Datum::Bool(flag) => Value::Bool(*flag),
         Datum::Bytea(bytes) => Value::Bytea(bytes.clone()),

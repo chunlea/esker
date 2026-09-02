@@ -42,6 +42,40 @@ pub fn sort_bits_of_f64(value: f64) -> u64 {
     if bits & SIGN == 0 { bits | SIGN } else { !bits }
 }
 
+/// The same for an `f32`, and 32 bits rather than 64.
+///
+/// **Not** `sort_bits_of_f64(value.into())`: widening an `f32` is exact, so that would sort
+/// correctly — and it would write eight bytes where the type is four, which is the same lie about
+/// a width that [`ColumnType::Real`] exists to avoid.
+#[must_use]
+pub fn sort_bits_of_f32(value: f32) -> u32 {
+    const SIGN32: u32 = 1 << 31;
+    let canonical = if value.is_nan() {
+        f32::NAN
+    } else if value == 0.0 {
+        0.0
+    } else {
+        value
+    };
+    let bits = canonical.to_bits();
+    if bits & SIGN32 == 0 {
+        bits | SIGN32
+    } else {
+        !bits
+    }
+}
+
+/// The inverse of [`sort_bits_of_f32`], up to the canonicalisation it performs.
+#[must_use]
+pub fn f32_of_sort_bits(bits: u32) -> f32 {
+    const SIGN32: u32 = 1 << 31;
+    f32::from_bits(if bits & SIGN32 == 0 {
+        !bits
+    } else {
+        bits & !SIGN32
+    })
+}
+
 /// The inverse of [`sort_bits_of_f64`], up to the canonicalisation it performs.
 #[must_use]
 pub fn f64_of_sort_bits(bits: u64) -> f64 {
@@ -60,6 +94,9 @@ pub fn f64_of_sort_bits(bits: u64) -> f64 {
 pub enum ColumnType {
     /// 64-bit integer. PostgreSQL calls it `bigint` in messages and `int8` in DDL.
     Int8,
+    /// 16-bit integer. PostgreSQL calls it `smallint` in messages and `int2` in DDL. A distinct
+    /// type for the same reason `int4` is: two bytes, and `22003` past its own range.
+    Int2,
     /// 32-bit integer. PostgreSQL calls it `integer` in messages and `int4` in DDL.
     ///
     /// A **distinct type and not an alias for [`ColumnType::Int8`]** ([ADR
@@ -88,13 +125,18 @@ pub enum ColumnType {
     Timestamp,
     /// IEEE-754 binary64.
     Double,
+    /// IEEE-754 binary32; PostgreSQL's `real`. A distinct type because its **text** differs — the
+    /// shortest digits that round-trip at 32 bits — and because a value a `double` holds is
+    /// `22003` here at both ends of the range.
+    Real,
 }
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 9] = [
+    pub const ALL: [ColumnType; 11] = [
         ColumnType::Int8,
         ColumnType::Int4,
+        ColumnType::Int2,
         ColumnType::Text,
         ColumnType::Varchar,
         ColumnType::Bool,
@@ -102,6 +144,7 @@ impl ColumnType {
         ColumnType::TimestampTz,
         ColumnType::Timestamp,
         ColumnType::Double,
+        ColumnType::Real,
     ];
 }
 
@@ -121,6 +164,8 @@ pub enum Datum {
     /// [`ColumnType::Int4`]. Four bytes on disk, and four bytes is the point: the width is what
     /// makes it a different type from an `int8` that happens to hold a small number.
     Int4(i32),
+    /// [`ColumnType::Int2`]. Two bytes, for the same reason.
+    Int2(i16),
     /// [`ColumnType::Text`]. Always valid UTF-8: the server encoding is UTF8, and bytes that are
     /// not are refused on the way in the way PostgreSQL refuses them.
     Text(String),
@@ -134,6 +179,8 @@ pub enum Datum {
     TimestampTz(i64),
     /// [`ColumnType::Double`].
     Double(f64),
+    /// [`ColumnType::Real`].
+    Real(f32),
     /// [`ColumnType::Timestamp`], in microseconds from 2000-01-01 — the same representation as
     /// [`Datum::TimestampTz`], and a separate variant because the two print differently and a
     /// value has to know which it is.
@@ -148,6 +195,7 @@ impl PartialEq for Datum {
                 a == b
             }
             (Datum::Int4(a), Datum::Int4(b)) => a == b,
+            (Datum::Int2(a), Datum::Int2(b)) => a == b,
             (Datum::Timestamp(a), Datum::Timestamp(b)) => a == b,
             (Datum::Text(a), Datum::Text(b)) => a == b,
             (Datum::Bool(a), Datum::Bool(b)) => a == b,
@@ -155,6 +203,7 @@ impl PartialEq for Datum {
             // Bitwise, so a round-trip test cannot pass by turning -0.0 into 0.0 or one NaN
             // payload into another.
             (Datum::Double(a), Datum::Double(b)) => a.to_bits() == b.to_bits(),
+            (Datum::Real(a), Datum::Real(b)) => a.to_bits() == b.to_bits(),
             _ => false,
         }
     }
@@ -170,6 +219,8 @@ impl Datum {
             Datum::Null => return None,
             Datum::Int8(_) => ColumnType::Int8,
             Datum::Int4(_) => ColumnType::Int4,
+            Datum::Int2(_) => ColumnType::Int2,
+            Datum::Real(_) => ColumnType::Real,
             Datum::Timestamp(_) => ColumnType::Timestamp,
             Datum::Text(_) => ColumnType::Text,
             Datum::Bool(_) => ColumnType::Bool,

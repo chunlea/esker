@@ -32,6 +32,23 @@ pub(crate) enum PdCommand {
     Serve(ServeOptions),
     /// Print what PD has stored, without serving anything.
     Inspect(InspectOptions),
+    /// Ask a **running** PD what it is doing right now.
+    Status(StatusOptions),
+}
+
+/// `esker pd status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StatusOptions {
+    /// The placement driver to ask.
+    pub(crate) pd: String,
+}
+
+impl Default for StatusOptions {
+    fn default() -> Self {
+        Self {
+            pd: crate::region::DEFAULT_PD.to_owned(),
+        }
+    }
 }
 
 /// `esker pd serve`.
@@ -75,7 +92,80 @@ pub(crate) fn run(command: &PdCommand) -> Result<(), String> {
             let mut stdout = std::io::stdout().lock();
             inspect(options, &mut stdout)
         }
+        PdCommand::Status(options) => {
+            let mut stdout = std::io::stdout().lock();
+            status(options, &mut stdout)
+        }
     }
+}
+
+/// Asks a **running** placement driver what it has in flight.
+///
+/// `inspect` opens a *stopped* PD's database and therefore cannot see an operator at all: the
+/// in-flight set is memory and dies with the process
+/// ([ADR 0013](../../../docs/adr/0013-repair-operators-are-requests-not-commands.md)). The two
+/// commands are complements, not alternatives — `inspect` answers "what does PD believe about the
+/// cluster", this one answers "what is it doing about it".
+pub(crate) fn status(options: &StatusOptions, out: &mut impl std::io::Write) -> Result<(), String> {
+    let address: SocketAddr = options
+        .pd
+        .parse()
+        .map_err(|error| format!("`--pd {}` is not an address: {error}", options.pd))?;
+    let pd = crate::region::PdConn::connect(address)?;
+    let response = pd
+        .call(&esker_proto::PdReq::Status)
+        .map_err(|error| format!("asking the placement driver for its status: {error}"))?;
+    let esker_proto::PdResp::Status { now_ms, operators } = response else {
+        return Err("the placement driver answered a different question".to_owned());
+    };
+    print_status(now_ms, &operators, out)
+}
+
+/// The report itself, taking the answer rather than the connection so a test can drive it.
+fn print_status(
+    now_ms: u64,
+    operators: &[esker_proto::OperatorStatus],
+    out: &mut impl std::io::Write,
+) -> Result<(), String> {
+    let write = |error: std::io::Error| format!("writing: {error}");
+    writeln!(out, "operators in flight ({})", operators.len()).map_err(write)?;
+    if operators.is_empty() {
+        // Said rather than left blank: an empty report and a broken one look the same otherwise,
+        // and "PD has nothing to do" is the answer an operator is usually hoping for.
+        writeln!(out, "  (none — PD is not moving anything)").map_err(write)?;
+        return Ok(());
+    }
+    for status in operators {
+        let operator = &status.operator;
+        let epoch = operator.epoch();
+        writeln!(
+            out,
+            "  region {:<5} {:<15} {:<8} epoch ({},{})  age {}  since {}  sends {}",
+            operator.region_id(),
+            operator.name(),
+            status.progress.name(),
+            epoch.conf_ver,
+            epoch.version,
+            age(now_ms, status.issued_ms),
+            age(now_ms, status.since_ms),
+            status.sends,
+        )
+        .map_err(write)?;
+    }
+    Ok(())
+}
+
+/// How long ago `then_ms` was, on PD's clock.
+///
+/// Saturating, and that is not paranoia: PD's clock is the only one in the answer, but a record
+/// written before a clock adjustment can still sit above `now_ms`, and an age that wrapped to
+/// nineteen billion seconds would be read as a hung operator.
+fn age(now_ms: u64, then_ms: u64) -> String {
+    let ms = now_ms.saturating_sub(then_ms);
+    if ms < 1_000 {
+        return format!("{ms}ms");
+    }
+    format!("{}.{:01}s", ms / 1_000, (ms % 1_000) / 100)
 }
 
 fn serve(options: &ServeOptions) -> Result<(), String> {
@@ -425,5 +515,76 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("(not bootstrapped)"), "{text}");
         assert!(text.contains("regions (0)"), "{text}");
+    }
+
+    /// The report an operator reads, including the shape of an age.
+    #[test]
+    fn status_prints_every_operator_with_its_progress_and_age() {
+        use esker_proto::{Epoch, Operator, OperatorProgress, OperatorStatus};
+
+        let now = 1_700_000_000_000_u64;
+        let operators = vec![
+            OperatorStatus {
+                operator: Operator::AddPeer {
+                    region_id: 7,
+                    epoch: Epoch::new(2, 3),
+                    store_id: 4,
+                    peer_id: 5,
+                },
+                progress: OperatorProgress::Issued,
+                issued_ms: now - 12_400,
+                since_ms: now - 12_400,
+                sends: 9,
+            },
+            OperatorStatus {
+                operator: Operator::RemovePeer {
+                    region_id: 8,
+                    epoch: Epoch::new(5, 1),
+                    peer_id: 6,
+                },
+                progress: OperatorProgress::Started,
+                issued_ms: now - 60_000,
+                since_ms: now - 300,
+                sends: 1,
+            },
+        ];
+
+        let mut out = Vec::new();
+        super::print_status(now, &operators, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+
+        assert!(text.contains("operators in flight (2)"), "{text}");
+        assert!(text.contains("region 7"), "{text}");
+        assert!(text.contains("AddPeer"), "{text}");
+        assert!(text.contains("issued"), "{text}");
+        assert!(text.contains("epoch (2,3)"), "{text}");
+        assert!(text.contains("age 12.4s"), "{text}");
+        assert!(text.contains("sends 9"), "{text}");
+        // The second line is where the two clocks differ, which is the whole reason `since_ms` is
+        // reported beside `issued_ms`: a minute old and moving is not a minute old and stuck.
+        assert!(text.contains("RemovePeer"), "{text}");
+        assert!(text.contains("started"), "{text}");
+        assert!(
+            text.contains("age 60.0s  since 300ms"),
+            "an operator that is old and moving reads as stuck:\n{text}"
+        );
+    }
+
+    /// Nothing in flight is said out loud, because an empty report and a broken one look the same.
+    #[test]
+    fn status_says_when_there_is_nothing_in_flight() {
+        let mut out = Vec::new();
+        super::print_status(1, &[], &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("operators in flight (0)"), "{text}");
+        assert!(text.contains("PD is not moving anything"), "{text}");
+    }
+
+    /// A clock that went backwards must not read as a nineteen-billion-second-old operator.
+    #[test]
+    fn an_age_from_a_future_timestamp_saturates_rather_than_wrapping() {
+        assert_eq!(super::age(1_000, 5_000), "0ms");
+        assert_eq!(super::age(5_000, 1_000), "4.0s");
+        assert_eq!(super::age(1_500, 1_000), "500ms");
     }
 }

@@ -742,7 +742,7 @@ impl PeerCore {
         // out of the `write` column family this batch just landed, so the two engines cannot
         // disagree about what was committed (`crate::columnar::region`).
         if let Some((commit_ts, keys)) = committed
-            && let Some(refused) = self.tee_columnar(commit_ts, &keys, &outcome)
+            && let Some(refused) = self.tee_columnar(entry.index, commit_ts, &keys, &outcome)
         {
             tracing::error!(
                 region_id = self.region_id,
@@ -780,7 +780,8 @@ impl PeerCore {
         Ok(())
     }
 
-    /// Feeds one entry's committed versions to this region's columnar copy.
+    /// Feeds one entry's committed versions to this region's columnar copy, and tells it which
+    /// entry they came from.
     ///
     /// Answers with the failure rather than propagating it. A columnar copy is a **convenience**
     /// and the row state is the region's truth, so a copy that cannot take a commit is closed —
@@ -788,6 +789,7 @@ impl PeerCore {
     /// the driver here would take a healthy replica out of its group over an optional index.
     fn tee_columnar(
         &self,
+        index: u64,
         commit_ts: u64,
         keys: &[Bytes],
         outcome: &std::result::Result<Applied, ProtoError>,
@@ -800,7 +802,7 @@ impl PeerCore {
         if !matches!(outcome, Ok(Applied::Txn(response)) if committed_ok(response)) {
             return None;
         }
-        match slot.commit(self.node.storage().db(), commit_ts, keys) {
+        match slot.commit(self.node.storage().db(), index, commit_ts, keys) {
             Ok(()) => None,
             Err(error) => {
                 slot.close();
@@ -1232,7 +1234,7 @@ fn propose_error(error: &esker_raft::RaftError, region_id: u64) -> ProtoError {
 /// Only a `Commit` and a **rolled forward** `ResolveLock` make versions visible. A rollback and a
 /// prewrite make none: a prewrite's value is not visible until its commit, which is the fact that
 /// makes the columnar copy's input the `write` column family rather than the log's payload.
-fn commits_of(command: &Command) -> Option<(u64, Vec<Bytes>)> {
+pub(crate) fn commits_of(command: &Command) -> Option<(u64, Vec<Bytes>)> {
     use crate::txn_command::TxnCommand;
     match command {
         Command::Txn(TxnCommand::Commit {

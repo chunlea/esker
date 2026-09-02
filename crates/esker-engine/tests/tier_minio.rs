@@ -39,6 +39,7 @@ use esker_engine::fs::claim::{Identity, id_for_directory};
 use esker_engine::fs::tier::{TierOptions, TieredFileSystem};
 use esker_engine::fs::{FileSystem, LocalFileSystem};
 use esker_engine::{Db, Options, ReadOptions};
+use esker_s3::ObjectStore;
 
 fn env_or(name: &str, fallback: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| fallback.to_string())
@@ -117,7 +118,12 @@ fn claiming_fs(
     )
 }
 
-/// A unique prefix per run, so a re-run does not meet its own claim from last time.
+/// A unique prefix per run, so a re-run does not meet its own objects from last time.
+///
+/// **Every test here needs this, not only the claim ones.** A fresh database numbers its first
+/// SST `000004` whatever else has ever existed, and `TieredFileSystem::new` adopts what the bucket
+/// already holds — so a second run under a fixed prefix finds `000004` already uploaded, skips the
+/// upload, and fails on a count of zero. Two tests learned that the hard way.
 fn unique_prefix(what: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -185,7 +191,8 @@ fn docker(action: &str, container: &str) -> bool {
 #[ignore = "needs a MinIO container; see the module docs"]
 fn a_database_that_lost_its_ssts_rebuilds_from_the_bucket() {
     let dir = tempfile::tempdir().unwrap();
-    let prefix = "acceptance";
+    let prefix = unique_prefix("acceptance");
+    let prefix = prefix.as_str();
 
     let db = open(dir.path(), prefix, None);
     for batch in 0..3 {
@@ -235,7 +242,8 @@ fn a_database_that_lost_its_ssts_rebuilds_from_the_bucket() {
 fn an_outage_leaves_the_sst_local_and_the_retry_lands() {
     let container = env_or("ESKER_S3_CONTAINER", "esker-minio");
     let dir = tempfile::tempdir().unwrap();
-    let prefix = "outage";
+    let prefix = unique_prefix("outage");
+    let prefix = prefix.as_str();
     let db = open(dir.path(), prefix, None);
 
     write_and_flush(&db, "before-", 200);
@@ -381,4 +389,106 @@ fn a_prefix_claimed_over_http_refuses_the_second_database() {
         text.contains("store 1") && text.contains("store 2"),
         "{text}"
     );
+}
+
+/// **The endpoint really honours `If-None-Match: *`**, which is the fact the closed race rests on.
+///
+/// `MemoryStore` can be made to do anything; this asserts the real one does the same. If `MinIO`
+/// ever stopped enforcing the precondition, the claim would quietly go back to being narrowed
+/// rather than closed, and nothing else in the suite would notice.
+#[test]
+#[ignore = "needs the MinIO container; see this file's header"]
+fn a_conditional_put_is_refused_by_the_real_endpoint() {
+    let store = object_store(&unique_prefix("conditional"));
+    let key = format!("{}marker", store.1);
+    let store = store.0;
+
+    assert!(
+        matches!(
+            store.put_if_absent(&key, b"first").unwrap(),
+            esker_s3::PutOutcome::Stored(_)
+        ),
+        "the first conditional put did not store",
+    );
+    assert_eq!(
+        store.put_if_absent(&key, b"second").unwrap(),
+        esker_s3::PutOutcome::AlreadyThere,
+        "the endpoint ignored If-None-Match, so the claim race is only narrowed",
+    );
+    assert_eq!(
+        store.get(&key).unwrap().body,
+        b"first",
+        "the refused put wrote anyway",
+    );
+}
+
+/// **Two databases claiming one prefix in the same instant**, over real HTTP.
+///
+/// The window ADR 0029 could not close. Both threads reach `PutObject` before either reads
+/// anything back, so the only thing that can separate them is the store's own precondition.
+#[test]
+#[ignore = "needs the MinIO container; see this file's header"]
+fn two_databases_claiming_at_once_over_http_leave_one_winner() {
+    let prefix = unique_prefix("race");
+    let first_dir = tempfile::tempdir().unwrap();
+    let second_dir = tempfile::tempdir().unwrap();
+    let local = LocalFileSystem::new();
+    let first = Identity::new(id_for_directory(&local, first_dir.path()).unwrap()).of(1, 1);
+    let second = Identity::new(id_for_directory(&local, second_dir.path()).unwrap()).of(1, 2);
+
+    let outcomes: Vec<_> = std::thread::scope(|scope| {
+        let handles = [
+            {
+                let prefix = prefix.clone();
+                let dir = first_dir.path().to_path_buf();
+                scope.spawn(move || claiming_fs(&dir, &prefix, first, false).map(|_| ()))
+            },
+            {
+                let prefix = prefix.clone();
+                let dir = second_dir.path().to_path_buf();
+                scope.spawn(move || claiming_fs(&dir, &prefix, second, false).map(|_| ()))
+            },
+        ];
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+
+    let winners = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+    assert_eq!(
+        winners, 1,
+        "{winners} databases claimed one prefix over HTTP"
+    );
+    let error = outcomes
+        .iter()
+        .find_map(|outcome| outcome.as_ref().err())
+        .unwrap()
+        .to_string();
+    assert!(
+        error.contains(&first.claim.to_string()) && error.contains(&second.claim.to_string()),
+        "the loser was not told whose the prefix is: {error}",
+    );
+}
+
+/// An `S3Client` for one prefix, and the prefix as the client stores it.
+fn object_store(prefix: &str) -> (esker_s3::S3Client, String) {
+    let endpoint =
+        esker_s3::Endpoint::parse(&env_or("ESKER_S3_ENDPOINT", "http://localhost:19000"))
+            .expect("the endpoint must parse");
+    let config = esker_s3::Config::from_store_url(
+        &format!(
+            "s3://{}/engine/{prefix}",
+            env_or("ESKER_S3_BUCKET", "esker")
+        ),
+        endpoint,
+        "us-east-1",
+        esker_s3::Credentials::new(
+            env_or("ESKER_S3_KEY", "eskertest"),
+            env_or("ESKER_S3_SECRET", "eskertest123"),
+        ),
+    )
+    .expect("the store URL must parse");
+    let key_prefix = config.prefix.clone();
+    (esker_s3::S3Client::new(config), key_prefix)
 }

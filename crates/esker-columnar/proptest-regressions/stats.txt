@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 6eee718271a27d25ad4ba0e866002bbde087285aba3e2049b1d5c0fa5ca969e3 # shrinks to values = [Double(NaN), Double(-0.0)]
+cc 4ce8222e82341b1f9e4a21dec5da86368563c78662599a1f30dd9d463da40f4d # shrinks to (ty, values) = (Int4, [Int4(0)])

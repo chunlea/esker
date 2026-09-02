@@ -236,6 +236,7 @@ impl Accumulator {
                 let addend = match (value, *integral) {
                     (ValueRef::Int(v), true) => Value::Int8(v),
                     (ValueRef::Double(v), false) => Value::Double(v),
+                    (ValueRef::Real(v), false) => Value::Real(v),
                     (other, _) => {
                         return Err(Error::InvalidArgument(format!("summing {other:?}")));
                     }

@@ -561,13 +561,24 @@ log, PD elects a leader, and clients discover it.
   and sixteen in a row still empty a store, which is what the phase-4 retest measured. So a retired
   operator's `LoadDelta` is held until every store it names has reported since, and dropped after
   `max_store_down_time` regardless ([ADR 0023](adr/0023-a-retired-operators-load-outlives-it.md)).
-- **Balance never touches a region that is mid-repair.** A region can be over its replica target for two
+- **Balance never touches a region that is mid-repair**, and a region is mid-repair while it holds a
+  peer on a **down store** *or* a plain **`Learner`**. A region can be over its replica target for two
   reasons — a balance move has landed, or repair has put a replacement beside a peer on a down store —
   and only the first is balance's to finish. Told apart by the state: a peer on a down store means the
   second, and then the peer that goes is the dead one and repair alone says when the region can afford
   to lose it. Without this, balance shed a *healthy* replica from a region under repair and repair had
   to put one back on the same store, which is two of the five membership changes a two-change repair
   spent in the retest.
+
+  The learner half is the same rule reaching the state repair passes *through* rather than the state
+  it starts from, and it costs more than an extra membership change. Repair and balance both add
+  before they remove, and the peer they add is a learner until the **leader** promotes it — on the
+  learner's `matched`, because a region heartbeat comes only from a leader and PD can therefore never
+  see a learner's progress. A leader with a leadership transfer in progress *refuses proposals*, so a
+  `TransferLeader` issued against a region whose learner has not been promoted blocks the very
+  `AddVoter` that would finish the repair: the transfer times out, PD re-derives it, and the region can
+  stay that way indefinitely. A `ColumnarLearner` is excluded, because ADR 0022 says it is never
+  promoted and counting it would freeze such a region out of balance for ever.
 - **Operator history.** The last 64 operator events — issued, done, cancelled, timed out — are kept in
   one bounded record on disk, so `esker pd inspect` can say what PD asked a cluster to do after the
   process is gone. A debugging record only: no decision reads it, and losing it costs an explanation

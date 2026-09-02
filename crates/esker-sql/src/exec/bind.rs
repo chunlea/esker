@@ -427,11 +427,13 @@ fn placeholder(ty: ColumnType) -> Datum {
     match ty {
         ColumnType::Int8 => Datum::Int8(0),
         ColumnType::Int4 => Datum::Int4(0),
+        ColumnType::Int2 => Datum::Int2(0),
         ColumnType::Text | ColumnType::Varchar => Datum::Text(String::new()),
         ColumnType::Bool => Datum::Bool(false),
         ColumnType::Bytea => Datum::Bytea(Vec::new()),
         ColumnType::TimestampTz => Datum::TimestampTz(0),
         ColumnType::Timestamp => Datum::Timestamp(0),
         ColumnType::Double => Datum::Double(0.0),
+        ColumnType::Real => Datum::Real(0.0),
     }
 }

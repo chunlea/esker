@@ -872,6 +872,95 @@ form (`operator does not exist: timestamp without time zone = integer`). An impl
 routed both through `ColumnType::name()` would say the long form for the input error, which a real
 server never does.
 
+#### Tier 1, type 4: `smallint`, and the last serial refusal
+
+`tests/corpus/pg19_int2.txt` is 26 statements and its shape is `int4`'s exactly, one width down —
+which is the argument for capturing it rather than deriving it. Both ends of the range, every
+direction past them, and the same two `22003` messages: a bare `smallint out of range` for a
+constant, `value "32768" is out of range for type smallint` for a string.
+
+**`smallserial` closes the last serial divergence.** `tests/sequence.rs` declares none now: both
+entries went, each removed by the arrival of its integer, and the test that asserted the two were
+refused asserts instead that all three widths run. A serial is not a type — it is an integer, a
+`NOT NULL` and a `nextval` default — so each refusal lasted exactly as long as its integer was
+missing.
+
+**The fragment wire needed a reader it did not have.** An `int2` literal is two bytes, and
+`esker_columnar::Cursor` had `u8`, `u32_le` and `u64_le` and no `u16_le`. Widening the literal to
+four bytes was the alternative and it is the same mistake the type exists to avoid: the frame would
+disagree with `put_literal` and with `pg_type.typlen`, and a width that lies is what makes an alias
+an alias. One reader added, symmetric with the two beside it.
+
+And the same narrowing bug as `int4`, one width down: `sequence_datum` gave a `smallserial` column
+`Datum::Int8` and the row codec refused it — `column 4 is Int2 and was given Int8(1)`, the schema
+check doing its job twice.
+
+#### Tier 1, type 5: `real`, and a `float8` message that was wrong all along
+
+`tests/corpus/pg19_real.txt` is 24 statements. What makes it a type rather than an alias for
+`double precision` is the **text** and the **range**:
+
+* `float4out` prints the shortest digits that round-trip *as an `f32`*, so `1.0/3.0` is
+  `0.33333334` where a `float8` says `0.3333333333333333`. Stored as a `double` it would print
+  seventeen digits a real server never wrote. The formatter already took the shortest digits from
+  `{:e}`; giving it an `f32` is the whole change, because Rust writes the fewest that round-trip at
+  the value's own width.
+* **underflow is an error, not a zero.** `1e-50` is a perfectly good `double` and is `22003` as a
+  `real`. Rounding it to zero would store a value a real server refused — the mirror of the `int4`
+  overflow argument, at the other end of the range.
+
+Its **key** encoding is four bytes of its own (`sort_bits_of_f32`) rather than a widened `f64`:
+widening would sort correctly *and* write eight bytes where the type is four, which is the same lie
+about a width the type exists to refuse.
+
+**It was first written to ride in the columnar `Doubles` run**, widened, the way `int4` and `int2`
+ride in `Ints` — and that was wrong, for a reason the integer case does not have. Widening an
+integer is a bit operation; widening a float is not. `f32 → f64 → f32` is exact for every finite
+value and both infinities and is **unspecified for a `NaN` payload**: this machine preserves even a
+signalling one, an x86 `cvtss2sd` quiets it. A fragment whose answer depends on which target read
+it is not answering. So `real` gets `ColumnData::Floats` and `encode::float`, four bytes wide, and
+the bits survive exactly — which is what the row codec has done all along (`esker_keys::row` writes
+`to_le_bytes`), and the two storage paths for one type have to agree or the differential harness is
+comparing two different systems.
+
+The eight-byte run was also, incidentally, the cost of columnar storage paid backwards: a type
+chosen because it is half the width, stored at twice it.
+
+**Three test defects came out of the same hour**, and each had been hiding one of the others:
+
+* `roundtrip.rs` compared values with `Value`'s derived `PartialEq`, which is IEEE `==` — so
+  `Real(NaN) == Real(NaN)` was false and *every* NaN failed, while a bitwise arm for `Double` right
+  above it made the same comparison correctly. The failure that looked like a dropped payload was
+  the comparison; the dropped payload was underneath it.
+* Its twin `generated_files_round_trip_without_compression` asserted only `back.len() == rows.len()`
+  while its doc comment claimed "the codec must not be load-bearing for correctness" — a claim no
+  line in it tested. Both now share `same_rows`, which compares floats by bits.
+* `stats.rs` had a `bounds_hold` proptest for six of the eleven types and none for `Int4`, `Int2`,
+  `Timestamp`, `Varchar` or `Real`. It was hiding a live bug: `ColumnStats::of` wrote bounds at the
+  **run's** width, so an `int4` column's bound was eight bytes, `Bound::as_value` answered `None`
+  for it, and `scan.rs` read that as "no bound" and **silently stopped pruning** — slow rather than
+  wrong, which is why nothing else could have noticed. Fixed with `int_bound`, and the replacement
+  test is driven by `ColumnType::ALL`, so a type cannot be added again without statistics that were
+  ever checked. Verified non-vacuous by reverting the fix and watching it go red.
+
+The lesson is the one this lane keeps relearning: a test that passes too easily is worth more
+attention than one that fails.
+
+**And the corpus found a `float8` message that has been wrong as long as `float8` has existed.**
+A float that will not fit is `22003`, and PostgreSQL quotes **two different texts** for one value:
+
+```
+SELECT 1e400::float8     "1000…000" is out of range for type double precision   (401 digits)
+SELECT '1e400'::float8   "1e400"    is out of range for type double precision
+```
+
+The difference is not the float. A bare `1e400` is a **`numeric`** before anything casts it, so the
+error quotes `numeric`'s own text, which has no exponent notation; a string reaches the input
+function unchanged and is quoted unchanged. This crate quoted the literal as written in both cases.
+Nothing caught it because `tests/corpus/pg19_values.txt` is the *string* path by construction —
+every line in it is `type ⇥ input ⇥ output` — so the literal path had never been captured for
+either width. `real` is only the type that made it visible, and `tests/real.rs` pins both.
+
 ## 3. The test ladder
 
 Each rung is a thing that either works or does not, and none of them is reached by asserting
@@ -1043,6 +1132,28 @@ epoch does not match")`. The second is not this fix's: it is the *client's* own 
 already retries nine times, exhausting them against an epoch that keeps moving. Same cause
 (saturation), third mechanism, and it is recorded here rather than claimed to be fixed. Three
 consecutive standalone runs are clean.
+
+### Closed again, at the fourth sighting: the deadline
+
+The retry above covers the **election gap** and deliberately not the **deadline**, which is §8's
+first mechanism. The fourth sighting was a `just`-style per-crate gate run on 2026-09-01, and the
+dump named it exactly: `a_lock_the_ttl_kills_resolves_the_same_way_on_both_engines` died on its
+*fragment* call with `timed out: no answer from 127.0.0.1:61519 in 30s`, one store visible and not
+leading. Same saturation as before and worse — two lanes now build in one tree.
+
+**What the fix turns on is a distinction the first one did not need: retryability after a timeout
+is a property of the *request*, not of the error.** A timed-out call has an **unknown** outcome —
+the request may have applied and the answer been lost — so "retry a timeout" is safe for one of
+these two calls and unsafe for the other:
+
+* the **fragment** call is a scan at a fixed `ts`. Repeating it cannot change what the cluster
+  holds, so it retries its deadline: `Idempotent::Yes`.
+* the **`TxnKv`** call is a prewrite whose commit never comes, which is the whole subject of the
+  test around it. Repeating it would invent a second prewrite, so it still dumps:
+  `Idempotent::No`.
+
+Neither call answers for the other, and the enum is at the call sites rather than inside the helper
+so that a future third caller has to say which it is.
 
 ## 8b. Handover — what unit 6 leaves, and what the ladder says to do next
 

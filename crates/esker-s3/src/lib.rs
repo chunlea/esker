@@ -75,6 +75,20 @@ pub struct GetResponse {
     pub total_size: Option<u64>,
 }
 
+/// What a conditional [`ObjectStore::put_if_absent`] did.
+///
+/// Two outcomes and no third: either this call created the object, or something was already
+/// there. **Nothing about the existing object comes back**, deliberately — the caller's next move
+/// is to read it and decide, and handing it over here would invite a decision made from a response
+/// the store never promised to fill in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PutOutcome {
+    /// This call created the object; the `ETag` if the server gave one.
+    Stored(Option<String>),
+    /// The key already existed, and nothing was written.
+    AlreadyThere,
+}
+
 /// The object-storage operations SST tiering needs.
 ///
 /// Smaller than S3 on purpose. The engine's tiered filesystem is written against this, so a
@@ -88,6 +102,26 @@ pub trait ObjectStore: Send + Sync + fmt::Debug {
     /// was lost has to be harmless. Returns the stored object's `ETag` when the server gives
     /// one, so a later ranged read can check it (ADR 0024 decision 6).
     fn put(&self, key: &str, body: &[u8]) -> Result<Option<String>>;
+
+    /// Stores `body` under `key` **only if nothing is there**, answering which happened.
+    ///
+    /// `PutObject` with `If-None-Match: *`, which S3 and `MinIO` both honour and which is what
+    /// closes the SST-store claim race
+    /// ([ADR 0029](../../../docs/adr/0029-the-sst-store-claim.md)) — two databases claiming one
+    /// prefix in the same instant are separated by the store rather than by a read-back that both
+    /// might win.
+    ///
+    /// **Not idempotent in the way [`ObjectStore::put`] is**, and that is the whole point: a
+    /// replay of a call whose response was lost answers [`PutOutcome::AlreadyThere`] even though
+    /// this caller is what put it there. So the caller must read the object back and decide from
+    /// its contents, never from the outcome alone. `esker_engine::fs::claim` does exactly that,
+    /// which is why a retried claim recognises its own marker instead of refusing it.
+    ///
+    /// An endpoint that **ignores** the header is a real possibility outside S3 and `MinIO`, and
+    /// it degrades to [`ObjectStore::put`]: the write lands, the outcome says `Stored`, and the
+    /// caller's read-back is what still catches a simultaneous claim. Narrowed rather than closed,
+    /// which is where this was before — never unsafe.
+    fn put_if_absent(&self, key: &str, body: &[u8]) -> Result<PutOutcome>;
 
     /// Reads `len` bytes of `key` starting at `offset`.
     ///

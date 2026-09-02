@@ -41,6 +41,18 @@ pub fn pg_cmp_f64(left: f64, right: f64) -> Ordering {
     }
 }
 
+/// The same ordering one width down, for [`ColumnType::Real`].
+#[must_use]
+pub fn pg_cmp_f32(left: f32, right: f32) -> Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        // Neither is NaN, so the comparison is total; `-0.0 == 0.0` falls out of IEEE equality.
+        (false, false) => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
+    }
+}
+
 /// One of the types a row carries (`esker_sql::value::ColumnType`), mirrored here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ColumnType {
@@ -49,6 +61,8 @@ pub enum ColumnType {
     /// 32-bit signed integer; PostgreSQL's `integer`. A **distinct type** and not an `Int8` that
     /// happens to be small ([ADR 0033](../../docs/adr/0033-tier-1-of-the-type-surface.md)).
     Int4,
+    /// 16-bit signed integer; PostgreSQL's `smallint`. Distinct for the same reason.
+    Int2,
     /// Variable-length UTF-8 string.
     Text,
     /// PostgreSQL's `character varying`: the same representation as [`ColumnType::Text`] and a
@@ -64,13 +78,16 @@ pub enum ColumnType {
     Timestamp,
     /// IEEE-754 binary64.
     Double,
+    /// IEEE-754 binary32; PostgreSQL's `real`.
+    Real,
 }
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 9] = [
+    pub const ALL: [ColumnType; 11] = [
         ColumnType::Int8,
         ColumnType::Int4,
+        ColumnType::Int2,
         ColumnType::Text,
         ColumnType::Varchar,
         ColumnType::Bool,
@@ -78,6 +95,7 @@ impl ColumnType {
         ColumnType::TimestampTz,
         ColumnType::Timestamp,
         ColumnType::Double,
+        ColumnType::Real,
     ];
 
     /// The tag byte this type is stored as. Frozen: see the module docs.
@@ -94,6 +112,8 @@ impl ColumnType {
             ColumnType::Int4 => 7,
             ColumnType::Varchar => 8,
             ColumnType::Timestamp => 9,
+            ColumnType::Int2 => 10,
+            ColumnType::Real => 11,
         }
     }
 
@@ -109,6 +129,8 @@ impl ColumnType {
             7 => ColumnType::Int4,
             8 => ColumnType::Varchar,
             9 => ColumnType::Timestamp,
+            10 => ColumnType::Int2,
+            11 => ColumnType::Real,
             other => {
                 return Err(Error::corruption(
                     "schema",
@@ -124,6 +146,7 @@ impl ColumnType {
         match self {
             ColumnType::Int8 => "bigint",
             ColumnType::Int4 => "integer",
+            ColumnType::Int2 => "smallint",
             ColumnType::Varchar => "character varying",
             ColumnType::Text => "text",
             ColumnType::Bool => "boolean",
@@ -131,6 +154,7 @@ impl ColumnType {
             ColumnType::TimestampTz => "timestamp with time zone",
             ColumnType::Timestamp => "timestamp without time zone",
             ColumnType::Double => "double precision",
+            ColumnType::Real => "real",
         }
     }
 
@@ -153,6 +177,8 @@ pub enum Value {
     Int8(i64),
     /// An [`ColumnType::Int4`].
     Int4(i32),
+    /// An [`ColumnType::Int2`].
+    Int2(i16),
     /// A [`ColumnType::Text`], already valid UTF-8 by construction.
     Text(String),
     /// A [`ColumnType::Bool`].
@@ -165,6 +191,8 @@ pub enum Value {
     Timestamp(i64),
     /// A [`ColumnType::Double`].
     Double(f64),
+    /// A [`ColumnType::Real`].
+    Real(f32),
 }
 
 impl Value {
@@ -175,6 +203,7 @@ impl Value {
             Value::Null => true,
             Value::Int8(_) => ty == ColumnType::Int8,
             Value::Int4(_) => ty == ColumnType::Int4,
+            Value::Int2(_) => ty == ColumnType::Int2,
             // One representation, two types: there is no `Value::Varchar` because there would be
             // nothing in it a `Text` does not hold.
             Value::Text(_) => matches!(ty, ColumnType::Text | ColumnType::Varchar),
@@ -183,6 +212,7 @@ impl Value {
             Value::TimestampTz(_) => ty == ColumnType::TimestampTz,
             Value::Timestamp(_) => ty == ColumnType::Timestamp,
             Value::Double(_) => ty == ColumnType::Double,
+            Value::Real(_) => ty == ColumnType::Real,
         }
     }
 
@@ -199,12 +229,14 @@ impl Value {
             Value::Null => return None,
             Value::Int8(_) => ColumnType::Int8,
             Value::Int4(_) => ColumnType::Int4,
+            Value::Int2(_) => ColumnType::Int2,
             Value::Text(_) => ColumnType::Text,
             Value::Bool(_) => ColumnType::Bool,
             Value::Bytea(_) => ColumnType::Bytea,
             Value::TimestampTz(_) => ColumnType::TimestampTz,
             Value::Timestamp(_) => ColumnType::Timestamp,
             Value::Double(_) => ColumnType::Double,
+            Value::Real(_) => ColumnType::Real,
         })
     }
 
@@ -215,8 +247,10 @@ impl Value {
             Value::Null => ValueRef::Null,
             Value::Int8(v) | Value::TimestampTz(v) | Value::Timestamp(v) => ValueRef::Int(*v),
             Value::Int4(v) => ValueRef::Int(i64::from(*v)),
+            Value::Int2(v) => ValueRef::Int(i64::from(*v)),
             Value::Bool(v) => ValueRef::Bool(*v),
             Value::Double(v) => ValueRef::Double(*v),
+            Value::Real(v) => ValueRef::Real(*v),
             Value::Text(v) => ValueRef::Bytes(v.as_bytes()),
             Value::Bytea(v) => ValueRef::Bytes(v),
         }
@@ -243,6 +277,11 @@ pub enum ValueRef<'a> {
     Bool(bool),
     /// A `Double`.
     Double(f64),
+    /// A `Real`, at its own width. **Not** a widened [`ValueRef::Double`], for the reason
+    /// `crate::encode::float` gives — plain words, because that module is `pub(crate)` and a
+    /// public item may not link a private one: the widening is unspecified for a `NaN` payload, and a
+    /// scan that answered differently on two targets would not be answering at all.
+    Real(f32),
     /// A `Text` (validated UTF-8) or a `Bytea`.
     Bytes(&'a [u8]),
 }
@@ -281,6 +320,7 @@ impl ValueRef<'_> {
             (ValueRef::Int(a), ValueRef::Int(b)) => a.cmp(b),
             (ValueRef::Bool(a), ValueRef::Bool(b)) => a.cmp(b),
             (ValueRef::Double(a), ValueRef::Double(b)) => pg_cmp_f64(*a, *b),
+            (ValueRef::Real(a), ValueRef::Real(b)) => pg_cmp_f32(*a, *b),
             (ValueRef::Bytes(a), ValueRef::Bytes(b)) => a.cmp(b),
             (a, b) => a.rank().cmp(&b.rank()),
         }
@@ -292,8 +332,9 @@ impl ValueRef<'_> {
             ValueRef::Bool(_) => 0,
             ValueRef::Int(_) => 1,
             ValueRef::Double(_) => 2,
-            ValueRef::Bytes(_) => 3,
-            ValueRef::Null => 4,
+            ValueRef::Real(_) => 3,
+            ValueRef::Bytes(_) => 4,
+            ValueRef::Null => 5,
         }
     }
 
@@ -314,8 +355,17 @@ impl ValueRef<'_> {
                     Error::corruption("column", format!("an integer column holds {v}"))
                 })?)
             }
+            (ValueRef::Int(v), ColumnType::Int2) => {
+                Value::Int2(i16::try_from(v).map_err(|_| {
+                    Error::corruption("column", format!("a smallint column holds {v}"))
+                })?)
+            }
             (ValueRef::Bool(v), ColumnType::Bool) => Value::Bool(v),
             (ValueRef::Double(v), ColumnType::Double) => Value::Double(v),
+            // No narrowing and no check: a `real` is carried at its own width the whole way, so
+            // there is no widened value that might not have been written by an `f32` and nothing
+            // for a `NaN` payload to be lost to.
+            (ValueRef::Real(v), ColumnType::Real) => Value::Real(v),
             (ValueRef::Bytes(v), ColumnType::Bytea) => Value::Bytea(v.to_vec()),
             (ValueRef::Bytes(v), ColumnType::Text | ColumnType::Varchar) => Value::Text(
                 std::str::from_utf8(v)
@@ -461,6 +511,8 @@ mod tests {
         assert_eq!(ColumnType::Int4.tag(), 7);
         assert_eq!(ColumnType::Varchar.tag(), 8);
         assert_eq!(ColumnType::Timestamp.tag(), 9);
+        assert_eq!(ColumnType::Int2.tag(), 10);
+        assert_eq!(ColumnType::Real.tag(), 11);
 
         for ty in ColumnType::ALL {
             assert_eq!(ColumnType::from_tag(ty.tag()).unwrap(), ty);
@@ -468,7 +520,7 @@ mod tests {
         assert!(ColumnType::from_tag(0).unwrap_err().is_corruption());
         // One past the last: a reader that meets a tag a newer writer used answers corruption
         // rather than guessing, which is the direction this vocabulary is built to fail in.
-        assert!(ColumnType::from_tag(10).unwrap_err().is_corruption());
+        assert!(ColumnType::from_tag(12).unwrap_err().is_corruption());
     }
 
     /// A value fits its own type and nothing else — **except** the one pair that is deliberately

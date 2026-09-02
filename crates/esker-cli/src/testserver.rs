@@ -61,6 +61,34 @@ impl TestServer {
     }
 }
 
+/// Wraps a service and counts the requests that reach it, per method.
+///
+/// The observable behind "one round trip instead of sixty". A round-trip count is not visible in
+/// anything a command prints, and a claim about it that no test can see is a claim that stops
+/// being true the moment somebody reintroduces a loop.
+#[derive(Debug)]
+struct Counting {
+    inner: Arc<dyn Service>,
+    calls: Arc<std::sync::Mutex<std::collections::BTreeMap<&'static str, usize>>>,
+}
+
+impl Service for Counting {
+    fn call(
+        &self,
+        request: esker_proto::Request,
+    ) -> esker_proto::BoxFuture<'_, Result<esker_proto::transport::Reply, esker_proto::ProtoError>>
+    {
+        if let Ok(mut calls) = self.calls.lock() {
+            *calls.entry(request.method().name()).or_default() += 1;
+        }
+        self.inner.call(request)
+    }
+
+    fn store_id(&self) -> u64 {
+        self.inner.store_id()
+    }
+}
+
 /// A real placement driver on a real socket, already bootstrapped.
 ///
 /// Bootstrapped on purpose, and it is the whole point: a fresh PD has no cluster id, and a
@@ -70,6 +98,8 @@ impl TestServer {
 pub(crate) struct TestPd {
     addr: SocketAddr,
     cluster_id: u64,
+    pd: Arc<esker_pd::Pd>,
+    calls: Arc<std::sync::Mutex<std::collections::BTreeMap<&'static str, usize>>>,
     _handle: ServerHandle,
     _runtime: tokio::runtime::Runtime,
     _dir: tempfile::TempDir,
@@ -94,7 +124,11 @@ impl TestPd {
                 .expect("the store registers")
                 .cluster_id;
         }
-        let service: Arc<dyn Service> = esker_pd::PdService::new(pd);
+        let calls = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let service: Arc<dyn Service> = Arc::new(Counting {
+            inner: esker_pd::PdService::new(Arc::clone(&pd)),
+            calls: Arc::clone(&calls),
+        });
 
         let handle = runtime.block_on(async {
             Server::bind("127.0.0.1:0", service, TransportConfig::new())
@@ -107,6 +141,8 @@ impl TestPd {
         Self {
             addr: handle.local_addr(),
             cluster_id,
+            pd,
+            calls,
             _handle: handle,
             _runtime: runtime,
             _dir: dir,
@@ -116,6 +152,18 @@ impl TestPd {
     /// Where it is listening, as `--pd` would be given it.
     pub(crate) fn addr(&self) -> String {
         self.addr.to_string()
+    }
+
+    /// How many requests of each method have reached it.
+    pub(crate) fn calls(&self, method: &str) -> usize {
+        self.calls
+            .lock()
+            .map_or(0, |calls| calls.get(method).copied().unwrap_or(0))
+    }
+
+    /// The driver itself, so a test can put regions into its table without a store.
+    pub(crate) fn pd(&self) -> &Arc<esker_pd::Pd> {
+        &self.pd
     }
 
     /// The cluster it created, which is not zero.

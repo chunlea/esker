@@ -125,8 +125,10 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
         // Four bytes, not eight. Nothing written before `int4` existed has a column of this type,
         // so the narrower width costs no compatibility and is what `pg_type.typlen` says it is.
         Datum::Int4(v) => out.extend_from_slice(&v.to_le_bytes()),
+        Datum::Int2(v) => out.extend_from_slice(&v.to_le_bytes()),
         Datum::Bool(v) => out.push(u8::from(*v)),
         Datum::Double(v) => out.extend_from_slice(&v.to_le_bytes()),
+        Datum::Real(v) => out.extend_from_slice(&v.to_le_bytes()),
         Datum::Text(v) => {
             varint::put_u64(v.len() as u64, out);
             out.extend_from_slice(v.as_bytes());
@@ -279,6 +281,14 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
             let (head, rest) = bytes.split_first_chunk::<4>().ok_or_else(truncated)?;
             (Datum::Int4(i32::from_le_bytes(*head)), rest)
         }
+        ColumnType::Int2 => {
+            let (head, rest) = bytes.split_first_chunk::<2>().ok_or_else(truncated)?;
+            (Datum::Int2(i16::from_le_bytes(*head)), rest)
+        }
+        ColumnType::Real => {
+            let (head, rest) = bytes.split_first_chunk::<4>().ok_or_else(truncated)?;
+            (Datum::Real(f32::from_le_bytes(*head)), rest)
+        }
         ColumnType::Bool => {
             let (&byte, rest) = bytes.split_first().ok_or_else(truncated)?;
             // Any other byte is a value we never wrote; refusing it keeps a corrupt row from
@@ -417,6 +427,9 @@ fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
         // second encoding would be a second thing to get wrong for no gain — a key is not a row,
         // and nothing reads its width back except the decoder beside it, which knows the type.
         Datum::Int4(v) => codec::encode_i64(i64::from(*v), out),
+        Datum::Int2(v) => codec::encode_i64(i64::from(*v), out),
+        // Four bytes, its own width, in the order `sort_bits_of_f32` puts floats.
+        Datum::Real(v) => out.extend_from_slice(&crate::value::sort_bits_of_f32(*v).to_be_bytes()),
         // One byte, already in order: false is 0 and true is 1.
         Datum::Bool(v) => out.push(u8::from(*v)),
         // Sign-magnitude does not sort as an integer does, and PostgreSQL has fewer floats than
@@ -483,6 +496,12 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
                 .map_err(|_| corrupt(format!("index key holds {value}, which is not an int4")))?;
             (Datum::Int4(value), rest)
         }
+        ColumnType::Int2 => {
+            let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
+            let value = i16::try_from(value)
+                .map_err(|_| corrupt(format!("index key holds {value}, which is not an int2")))?;
+            (Datum::Int2(value), rest)
+        }
         ColumnType::TimestampTz => {
             let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
             (Datum::TimestampTz(value), rest)
@@ -494,6 +513,13 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         ColumnType::Double => {
             let (bits, rest) = codec::decode_u64(bytes).map_err(decoded)?;
             (Datum::Double(crate::value::f64_of_sort_bits(bits)), rest)
+        }
+        ColumnType::Real => {
+            let (head, rest) = bytes
+                .split_first_chunk::<4>()
+                .ok_or_else(|| corrupt("index key ends inside a real"))?;
+            let bits = u32::from_be_bytes(*head);
+            (Datum::Real(crate::value::f32_of_sort_bits(bits)), rest)
         }
         ColumnType::Bool => {
             let (&byte, rest) = bytes
@@ -927,6 +953,15 @@ mod tests {
         let values: BoxedStrategy<Datum> = match ty {
             ColumnType::Int8 => any::<i64>().prop_map(Datum::Int8).boxed(),
             ColumnType::Int4 => any::<i32>().prop_map(Datum::Int4).boxed(),
+            ColumnType::Int2 => any::<i16>().prop_map(Datum::Int2).boxed(),
+            ColumnType::Real => prop_oneof![
+                7 => any::<f32>().prop_map(Datum::Real),
+                3 => proptest::sample::select(vec![
+                    0.0f32, -0.0, f32::NAN, -f32::NAN, f32::INFINITY, f32::NEG_INFINITY,
+                ])
+                .prop_map(Datum::Real),
+            ]
+            .boxed(),
             ColumnType::Text | ColumnType::Varchar => ".{0,32}".prop_map(Datum::Text).boxed(),
             ColumnType::Bool => any::<bool>().prop_map(Datum::Bool).boxed(),
             ColumnType::Bytea => proptest::collection::vec(any::<u8>(), 0..32)

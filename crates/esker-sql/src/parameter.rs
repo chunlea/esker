@@ -67,6 +67,12 @@ pub enum Values {
     Boolean,
     /// Any text. PostgreSQL validates `search_path` not at all and `TimeZone` against a zone
     /// database this node does not carry, so what narrows both here is [`Parameter::honour`].
+    ///
+    /// Qualified, which is what a bare `[honour]` was missing: rustdoc resolves a name in the
+    /// *module*'s scope, and an inherent method is not in one. It is not that the method is
+    /// private — it is `pub`, on a `pub` struct — so the link resolves once it says which type it
+    /// belongs to. Both lanes that met this under `-D warnings` fixed it; this is the fix that
+    /// keeps the link.
     Free,
 }
 

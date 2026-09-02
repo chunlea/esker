@@ -362,12 +362,22 @@ impl Literal {
         match self {
             // `unknown` takes whatever type the other side has -- if it can be read as one.
             Literal::Null | Literal::String(_) => true,
-            Literal::Integer(_) => {
-                matches!(ty, ColumnType::Int8 | ColumnType::Int4 | ColumnType::Double)
-            }
-            Literal::Decimal(_) => {
-                matches!(ty, ColumnType::Int8 | ColumnType::Int4 | ColumnType::Double)
-            }
+            Literal::Integer(_) => matches!(
+                ty,
+                ColumnType::Int8
+                    | ColumnType::Int4
+                    | ColumnType::Int2
+                    | ColumnType::Double
+                    | ColumnType::Real
+            ),
+            Literal::Decimal(_) => matches!(
+                ty,
+                ColumnType::Int8
+                    | ColumnType::Int4
+                    | ColumnType::Int2
+                    | ColumnType::Double
+                    | ColumnType::Real
+            ),
             Literal::Bool(_) => matches!(ty, ColumnType::Bool),
             Literal::Typed(value) => value.fits(ty),
         }
@@ -400,11 +410,19 @@ impl Literal {
                 ColumnType::Int4 => i32::try_from(*value)
                     .map(Datum::Int4)
                     .map_err(|_| SqlError::IntegerLiteralOutOfRange(ColumnType::Int4.name())),
+                ColumnType::Int2 => i16::try_from(*value)
+                    .map(Datum::Int2)
+                    .map_err(|_| SqlError::IntegerLiteralOutOfRange(ColumnType::Int2.name())),
                 #[allow(
                     clippy::cast_precision_loss,
                     reason = "the widening is PostgreSQL's own assignment cast, and lossy the same way"
                 )]
                 ColumnType::Double => Ok(Datum::Double(*value as f64)),
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "the widening is PostgreSQL's own assignment cast, and lossy the same way"
+                )]
+                ColumnType::Real => Ok(Datum::Real(*value as f32)),
                 // PostgreSQL's assignment cast to text is the value's own text.
                 ColumnType::Text | ColumnType::Varchar => Ok(Datum::Text(value.to_string())),
                 ColumnType::Bool
@@ -418,16 +436,30 @@ impl Literal {
                 ColumnType::Int4 => Err(SqlError::unsupported(format!(
                     "assigning the numeric literal {digits} to the integer column \"{column}\""
                 ))),
+                ColumnType::Int2 => Err(SqlError::unsupported(format!(
+                    "assigning the numeric literal {digits} to the smallint column \"{column}\""
+                ))),
                 // `numeric` has no signed zero, so `-0.0` in a `double precision` column is `0`
                 // and not `-0`. Measured: the literal goes through `numeric` on its way, and that
                 // is where the sign is lost.
-                ColumnType::Double => {
-                    Datum::from_text(ColumnType::Double, digits).map(|value| match value {
-                        // `0.0` as a pattern already matches `-0.0`, which is
-                        // exactly the case being normalised away.
-                        Datum::Double(0.0) => Datum::Double(0.0),
-                        other => other,
+                // The same `numeric` road one width down, and the same signed-zero loss.
+                ColumnType::Real => {
+                    numeric_text(Datum::from_text(ColumnType::Real, digits), digits).map(|value| {
+                        match value {
+                            Datum::Real(0.0) => Datum::Real(0.0),
+                            other => other,
+                        }
                     })
+                }
+                ColumnType::Double => {
+                    numeric_text(Datum::from_text(ColumnType::Double, digits), digits).map(
+                        |value| match value {
+                            // `0.0` as a pattern already matches `-0.0`, which is
+                            // exactly the case being normalised away.
+                            Datum::Double(0.0) => Datum::Double(0.0),
+                            other => other,
+                        },
+                    )
                 }
                 // The digits as written, which is what `numeric`'s own text is.
                 ColumnType::Text | ColumnType::Varchar => Ok(Datum::Text(digits.clone())),
@@ -452,13 +484,31 @@ impl Literal {
                 )),
                 ColumnType::Int8
                 | ColumnType::Int4
+                | ColumnType::Int2
                 | ColumnType::Bytea
                 | ColumnType::TimestampTz
                 | ColumnType::Timestamp
-                | ColumnType::Double => mismatch(),
+                | ColumnType::Double
+                | ColumnType::Real => mismatch(),
             },
         }
     }
+}
+
+/// Rewrites a float's out-of-range message to quote the literal as **`numeric`** would print it.
+///
+/// A bare `1e400` is a `numeric` before anything casts it, so the value PostgreSQL quotes is
+/// `numeric`'s own text — plain decimal, no exponent — where a *string* `'1e400'` is quoted
+/// exactly as written. Measured on 19beta1 for both float widths
+/// ([`crate::value::float::plain_decimal`] carries the two statements).
+fn numeric_text(outcome: Result<Datum>, digits: &str) -> Result<Datum> {
+    outcome.map_err(|error| match error {
+        SqlError::FloatOutOfRange { ty, .. } => SqlError::FloatOutOfRange {
+            ty,
+            value: crate::value::float::plain_decimal(digits),
+        },
+        other => other,
+    })
 }
 
 impl Expr {

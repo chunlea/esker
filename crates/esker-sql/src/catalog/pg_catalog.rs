@@ -228,6 +228,7 @@ fn typname(ty: ColumnType) -> &'static str {
     match ty {
         ColumnType::Int8 => "int8",
         ColumnType::Int4 => "int4",
+        ColumnType::Int2 => "int2",
         ColumnType::Text => "text",
         ColumnType::Varchar => "varchar",
         ColumnType::Bool => "bool",
@@ -235,6 +236,7 @@ fn typname(ty: ColumnType) -> &'static str {
         ColumnType::TimestampTz => "timestamptz",
         ColumnType::Timestamp => "timestamp",
         ColumnType::Double => "float8",
+        ColumnType::Real => "float4",
     }
 }
 
@@ -248,6 +250,7 @@ fn typinput(ty: ColumnType) -> &'static str {
     match ty {
         ColumnType::Int8 => "int8in",
         ColumnType::Int4 => "int4in",
+        ColumnType::Int2 => "int2in",
         ColumnType::Text => "textin",
         ColumnType::Varchar => "varcharin",
         ColumnType::Bool => "boolin",
@@ -255,5 +258,6 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::TimestampTz => "timestamptz_in",
         ColumnType::Timestamp => "timestamp_in",
         ColumnType::Double => "float8in",
+        ColumnType::Real => "float4in",
     }
 }

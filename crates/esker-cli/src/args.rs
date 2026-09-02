@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use crate::bench::{Run as BenchOptions, Workload};
 use crate::cluster::ClusterOptions;
 use crate::manifest_dump::DumpOptions as ManifestDumpOptions;
-use crate::pd::{InspectOptions, PdCommand, ServeOptions};
+use crate::pd::{InspectOptions, PdCommand, ServeOptions, StatusOptions};
 use crate::raw::{RawCommand, RawOptions, from_hex};
 use crate::region::{RegionCommand, RegionOptions};
 use crate::server::ServerOptions;
@@ -61,6 +61,15 @@ pub(crate) enum Command {
     Pd(PdCommand),
     /// Look at, split, or hand over a region.
     Region(RegionOptions),
+    /// Compare an SST store prefix against a database's manifest.
+    SstStore(SstStoreCommand),
+}
+
+/// The `sst-store` verbs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SstStoreCommand {
+    /// List what the prefix holds and what nothing references.
+    Reconcile(crate::reconcile::ReconcileOptions),
 }
 
 /// Why the arguments could not be understood.
@@ -162,8 +171,13 @@ Commands:
                         the one given). --pd also starts a placement driver on
                         the port above the nodes and points every node at it,
                         which is what a SQL node needs to be given with --pd
-  pd serve|inspect      Run the placement driver, or print what it has stored
+  pd serve|inspect|status
+                        Run the placement driver, print what a stopped one has
+                        stored, or ask a running one what it is doing
   region <verb> ...     Look at, split, or hand over a region
+  sst-store reconcile <url>
+                        Compare an SST store prefix against a database's manifest
+                        and say what nothing references any more
 
 Options:
   -V, --version         Print the version
@@ -188,6 +202,12 @@ Bench options:
       --sst-cache-bytes N
                         Local SST bytes the tier may keep; 0 is a cold cache. Needs
                         --sst-store
+      --adopt-sst-store Claim an --sst-store prefix that already holds objects but no
+                        claim marker, instead of refusing. A benchmark's database is a
+                        temporary directory, so its claim id is new every run and every
+                        re-run against a named prefix meets objects it did not write.
+                        Off by default: a benchmark pointed at a stale prefix should get
+                        a fresh one
       --remote HOST:PORT  Drive the workload over the network against a running
                         server instead of an in-process database. The engine
                         options above belong to that server and are ignored.
@@ -211,6 +231,21 @@ Server options:
       --peer ID@ADDR    A peer of the region, repeatable, this store's included
       --write-buffer-size N
                         Memtable bytes before a flush (default 64 MiB)
+      --region-split-size N
+                        Approximate region bytes past which a leader looks for a split
+                        key (default 96 MiB). A store with no --pd never splits,
+                        whatever this says: a split needs cluster-unique ids
+      --store-heartbeat-ms N
+                        How often this store reports itself to PD (default 10000)
+      --region-heartbeat-ms N
+                        How often each region's leader reports it absent a change
+                        (default 60000). Also the latency of an operator: PD answers
+                        a region heartbeat and has no other way to reach a store
+      --heartbeat-tick-ms N
+                        The resolution of the two intervals above, which are counted
+                        in these ticks (default 1000). An interval below one tick is
+                        rounded up to one, so shortening an interval without also
+                        shortening the tick does nothing
       --sst-store URL   Tier this store's SSTs into s3://bucket/prefix, keeping the
                         WAL and the Raft log local. The endpoint and credentials
                         come from ESKER_S3_ENDPOINT, ESKER_S3_KEY, ESKER_S3_SECRET
@@ -228,6 +263,33 @@ Server options:
 
 Ctrl-C stops the listener, lets in-flight requests finish and closes the
 database. A second one does not wait.
+
+Pd options:
+  pd serve                  Run the placement driver
+  pd inspect                Print what a **stopped** PD has stored: the cluster, the
+                            allocator, the oracle's mark, every store and region, and
+                            the operator history
+  pd status                 Ask a **running** PD what it has in flight. The in-flight
+                            set is memory and dies with the process, so `inspect`
+                            cannot show it and this is the only thing that can
+      --data-dir PATH       PD's database, for serve and inspect (default ./esker-pd)
+      --listen HOST:PORT    Address to serve on, for serve (default 127.0.0.1:2379)
+      --pd HOST:PORT        The placement driver to ask, for status
+                            (default 127.0.0.1:2379)
+
+Sst-store options:
+  sst-store reconcile s3://bucket/prefix
+                            List the prefix, compare it against the manifest in
+                            --data-dir, and print what nothing references. A
+                            DeleteObject that failed leaks its object on purpose;
+                            this is where the leak is found. Offline: run it
+                            against a database that is not running
+      --data-dir PATH       The database whose manifest says what is live
+                            (default .)
+      --delete              Actually remove what is unreferenced. Without it
+                            nothing is deleted. Never removes an object newer
+                            than the manifest, and refuses a prefix whose claim
+                            marker names another database
 
 Region options:
   region ls                 Print every region in the cluster, in key order
@@ -295,6 +357,7 @@ where
         "cluster" => parse_cluster(&arguments[1..]),
         "pd" => parse_pd(&arguments[1..]),
         "region" => parse_region(&arguments[1..]),
+        "sst-store" => parse_sst_store(&arguments[1..]),
         other if other.starts_with('-') => Err(ParseError::UnknownFlag(other.to_owned())),
         other => Err(ParseError::UnknownCommand(other.to_owned())),
     }
@@ -350,6 +413,11 @@ fn parse_bench(arguments: &[String]) -> Result<Command, ParseError> {
             options.sst_store = Some(take_value(arguments, &mut index, inline, "--sst-store")?);
             continue;
         }
+        if flag == "--adopt-sst-store" {
+            options.adopt_sst_store = true;
+            continue;
+        }
+
         if flag == "--sst-cache-bytes" {
             let raw = take_value(arguments, &mut index, inline, "--sst-cache-bytes")?;
             // Zero is the point of the flag — it is what makes the cache cold — so this
@@ -639,6 +707,54 @@ fn read_key(word: &str, hex: bool) -> Result<bytes::Bytes, ParseError> {
 }
 
 /// `esker pd serve|inspect [--data-dir PATH] [--listen HOST:PORT]`.
+/// `sst-store reconcile <s3://bucket/prefix> --data-dir DIR [--delete]`.
+fn parse_sst_store(arguments: &[String]) -> Result<Command, ParseError> {
+    let Some(verb) = arguments.first() else {
+        return Err(ParseError::MissingArgument("an sst-store command"));
+    };
+    if verb == "--help" || verb == "-h" || verb == "help" {
+        return Ok(Command::Help);
+    }
+    if verb != "reconcile" {
+        return Err(ParseError::UnknownCommand(format!("sst-store {verb}")));
+    }
+
+    let mut options = crate::reconcile::ReconcileOptions::default();
+    let mut url: Option<String> = None;
+    let mut index = 1;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        index += 1;
+
+        if argument == "--help" || argument == "-h" {
+            return Ok(Command::Help);
+        }
+        let (flag, inline) = match argument.split_once('=') {
+            Some((flag, value)) => (flag, Some(value.to_owned())),
+            None => (argument.as_str(), None),
+        };
+
+        match flag {
+            "--data-dir" => {
+                options.data_dir =
+                    PathBuf::from(take_value(arguments, &mut index, inline, "--data-dir")?);
+            }
+            "--delete" => options.delete = true,
+            other if other.starts_with('-') => {
+                return Err(ParseError::UnknownFlag(other.to_owned()));
+            }
+            other if url.is_none() => url = Some(other.to_owned()),
+            other => return Err(ParseError::UnexpectedArgument(other.to_owned())),
+        }
+    }
+
+    let Some(url) = url else {
+        return Err(ParseError::MissingArgument("an s3://bucket/prefix URL"));
+    };
+    options.store_url = url;
+    Ok(Command::SstStore(SstStoreCommand::Reconcile(options)))
+}
+
 fn parse_pd(arguments: &[String]) -> Result<Command, ParseError> {
     let Some(verb) = arguments.first() else {
         return Err(ParseError::MissingArgument("a pd command"));
@@ -649,6 +765,7 @@ fn parse_pd(arguments: &[String]) -> Result<Command, ParseError> {
 
     let mut serve = ServeOptions::default();
     let mut inspect = InspectOptions::default();
+    let mut status = StatusOptions::default();
     let mut index = 1;
     while index < arguments.len() {
         let argument = &arguments[index];
@@ -671,6 +788,9 @@ fn parse_pd(arguments: &[String]) -> Result<Command, ParseError> {
             "--listen" => {
                 serve.listen = take_value(arguments, &mut index, inline, "--listen")?;
             }
+            "--pd" => {
+                status.pd = take_value(arguments, &mut index, inline, "--pd")?;
+            }
             other if other.starts_with('-') => {
                 return Err(ParseError::UnknownFlag(other.to_owned()));
             }
@@ -681,10 +801,57 @@ fn parse_pd(arguments: &[String]) -> Result<Command, ParseError> {
     match verb.as_str() {
         "serve" => Ok(Command::Pd(PdCommand::Serve(serve))),
         "inspect" => Ok(Command::Pd(PdCommand::Inspect(inspect))),
+        "status" => Ok(Command::Pd(PdCommand::Status(status))),
         other => Err(ParseError::UnknownPdCommand(other.to_owned())),
     }
 }
 
+/// Sets one of `esker server`'s numeric knobs, refusing zero.
+///
+/// Zero is a typo rather than "the default": a split size of zero would ask a leader to split every
+/// region for ever, and a heartbeat interval of zero would beat on every tick.
+fn set_server_knob(
+    options: &mut ServerOptions,
+    flag: &'static str,
+    raw: &str,
+) -> Result<(), ParseError> {
+    let value = Some(positive_u64(raw, flag)?);
+    match flag {
+        "--region-split-size" => options.region_split_size = value,
+        "--store-heartbeat-ms" => options.store_heartbeat_ms = value,
+        "--region-heartbeat-ms" => options.region_heartbeat_ms = value,
+        _ => options.heartbeat_tick_ms = value,
+    }
+    Ok(())
+}
+
+/// The `'static` name of one of `esker server`'s numeric knobs.
+///
+/// `ParseError::InvalidValue` carries a `&'static str`, and `flag` here is borrowed from the
+/// argument vector — so the arm that handles four flags at once has to map back to the literal.
+fn server_knob(flag: &str) -> &'static str {
+    match flag {
+        "--region-split-size" => "--region-split-size",
+        "--store-heartbeat-ms" => "--store-heartbeat-ms",
+        "--region-heartbeat-ms" => "--region-heartbeat-ms",
+        _ => "--heartbeat-tick-ms",
+    }
+}
+
+/// A `u64` flag value that must be above zero.
+fn positive_u64(raw: &str, flag: &'static str) -> Result<u64, ParseError> {
+    raw.parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or(ParseError::InvalidValue {
+            flag,
+            value: raw.to_owned(),
+        })
+}
+
+/// A flat dispatch over eighteen flags, which is the shape it should be: grouping them into
+/// helpers to satisfy a line count would put the flag and what it sets in two different places.
+#[allow(clippy::too_many_lines)]
 fn parse_server(arguments: &[String]) -> Result<Command, ParseError> {
     let mut options = ServerOptions::default();
     let mut index = 0;
@@ -725,6 +892,16 @@ fn parse_server(arguments: &[String]) -> Result<Command, ParseError> {
                         value: raw.clone(),
                     },
                 )?);
+            }
+            // The four `StoreOptions` knobs `docs/bench/phase-4.md` had to wrap this binary to
+            // reach. Each takes the same shape, so they take one arm.
+            "--region-split-size"
+            | "--store-heartbeat-ms"
+            | "--region-heartbeat-ms"
+            | "--heartbeat-tick-ms" => {
+                let named = server_knob(flag);
+                let raw = take_value(arguments, &mut index, inline, named)?;
+                set_server_knob(&mut options, named, &raw)?;
             }
             "--store-id" => {
                 let raw = take_value(arguments, &mut index, inline, "--store-id")?;
@@ -1190,6 +1367,28 @@ mod tests {
         );
     }
 
+    /// `bench` has the same switch as `server`, with the same default.
+    ///
+    /// Without it the refusal names a flag the command did not have, which is a dead end with
+    /// instructions on it — and it bites `bench` hardest, because a benchmark's database is a
+    /// temporary directory and its claim id is therefore new on every run.
+    #[test]
+    fn the_bench_takes_the_same_adoption_switch_as_the_server() {
+        let Command::Bench(options) = parse_ok(&["bench", "--sst-store", "s3://esker/tier"]) else {
+            panic!("expected a bench command");
+        };
+        assert!(
+            !options.adopt_sst_store,
+            "a benchmark adopts somebody else's objects by default"
+        );
+        let Command::Bench(options) =
+            parse_ok(&["bench", "--sst-store=s3://esker/tier", "--adopt-sst-store"])
+        else {
+            panic!("expected a bench command");
+        };
+        assert!(options.adopt_sst_store);
+    }
+
     /// `--sst-store` on a server, and on a cluster where every node must get a *different*
     /// prefix — two databases sharing one silently overwrite each other's `000007.sst`.
     #[test]
@@ -1233,6 +1432,55 @@ mod tests {
             panic!("expected a server command");
         };
         assert_eq!(options.sst_store, None, "absent means local SSTs");
+
+        // The four knobs `docs/bench/phase-4.md` had to wrap this binary to reach, in both
+        // spellings, because `--flag value` and `--flag=value` are two code paths.
+        let Command::Server(options) = parse_ok(&[
+            "server",
+            "--region-split-size",
+            "1048576",
+            "--store-heartbeat-ms=2000",
+            "--region-heartbeat-ms",
+            "1000",
+            "--heartbeat-tick-ms=100",
+        ]) else {
+            panic!("expected a server command");
+        };
+        assert_eq!(options.region_split_size, Some(1024 * 1024));
+        assert_eq!(options.store_heartbeat_ms, Some(2_000));
+        assert_eq!(options.region_heartbeat_ms, Some(1_000));
+        assert_eq!(options.heartbeat_tick_ms, Some(100));
+
+        // Absent is the store's default, not zero, and each of them refuses a zero: a split size
+        // of zero splits for ever and a heartbeat of zero beats on every tick.
+        let Command::Server(options) = parse_ok(&["server"]) else {
+            panic!("expected a server command");
+        };
+        assert_eq!(options.region_split_size, None);
+        assert_eq!(options.store_heartbeat_ms, None);
+        assert_eq!(options.region_heartbeat_ms, None);
+        assert_eq!(options.heartbeat_tick_ms, None);
+        for flag in [
+            "--region-split-size",
+            "--store-heartbeat-ms",
+            "--region-heartbeat-ms",
+            "--heartbeat-tick-ms",
+        ] {
+            assert!(
+                matches!(
+                    parse(["server", flag, "0"]),
+                    Err(ParseError::InvalidValue { .. })
+                ),
+                "{flag} accepted zero"
+            );
+            assert!(
+                matches!(
+                    parse(["server", flag, "not-a-number"]),
+                    Err(ParseError::InvalidValue { .. })
+                ),
+                "{flag} accepted a word"
+            );
+        }
 
         let Command::Cluster(ClusterOptions::Start { sst_store, .. }) =
             parse_ok(&["cluster", "start", "--sst-store=s3://esker/c1"])

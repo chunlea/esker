@@ -550,6 +550,8 @@ fn column_type(ty: crate::value::ColumnType) -> esker_columnar::ColumnType {
     match ty {
         Row::Int8 => Col::Int8,
         Row::Int4 => Col::Int4,
+        Row::Int2 => Col::Int2,
+        Row::Real => Col::Real,
         Row::Text => Col::Text,
         Row::Varchar => Col::Varchar,
         Row::Bool => Col::Bool,
@@ -567,6 +569,8 @@ fn datum_to_value(datum: &Datum) -> esker_columnar::Value {
         Datum::Null => Value::Null,
         Datum::Int8(int) => Value::Int8(*int),
         Datum::Int4(int) => Value::Int4(*int),
+        Datum::Int2(int) => Value::Int2(*int),
+        Datum::Real(float) => Value::Real(*float),
         Datum::Text(text) => Value::Text(text.clone()),
         Datum::Bool(flag) => Value::Bool(*flag),
         Datum::Bytea(bytes) => Value::Bytea(bytes.clone()),
@@ -582,6 +586,8 @@ fn value_to_datum(value: &WireValue) -> Datum {
         WireValue::Null => Datum::Null,
         WireValue::Int8(int) => Datum::Int8(*int),
         WireValue::Int4(int) => Datum::Int4(*int),
+        WireValue::Int2(int) => Datum::Int2(*int),
+        WireValue::Real(float) => Datum::Real(*float),
         WireValue::Text(text) => Datum::Text(text.clone()),
         WireValue::Bool(flag) => Datum::Bool(*flag),
         WireValue::Bytea(bytes) => Datum::Bytea(bytes.clone()),
@@ -727,7 +733,9 @@ pub(super) fn evaluate(columnar: &mut Columnar, source: &dyn FragmentSource, ts:
                     slot.insert(group.partials);
                 }
                 std::collections::btree_map::Entry::Occupied(mut slot) => {
-                    combine(slot.get_mut(), &group.partials);
+                    if let Err(why) = combine(slot.get_mut(), &group.partials) {
+                        return refused(columnar, shards.len(), why);
+                    }
                 }
             }
         }
@@ -774,39 +782,57 @@ fn add(into: &mut ScanStats, cost: ScanStats) {
 /// two regions answering different shapes for the same fragment is a protocol failure, and the
 /// safe reading of it is not to mix them. Every fragment sent is the same bytes, so it cannot
 /// happen without one of them being a different build — which is what refusal exists for.
-fn combine(running: &mut [Partial], arriving: &[Partial]) {
+fn combine(running: &mut [Partial], arriving: &[Partial]) -> Result<(), &'static str> {
     for (running, arriving) in running.iter_mut().zip(arriving) {
         *running = match (&*running, arriving) {
-            (Partial::Count(a), Partial::Count(b)) => Partial::Count(a.saturating_add(*b)),
-            (Partial::Sum(a), Partial::Sum(b)) => Partial::Sum(sum(a.as_ref(), b.as_ref())),
+            (Partial::Count(a), Partial::Count(b)) => Partial::Count(
+                a.checked_add(*b)
+                    .ok_or("a count of more rows than a u64 holds")?,
+            ),
+            (Partial::Sum(a), Partial::Sum(b)) => Partial::Sum(sum(a.as_ref(), b.as_ref())?),
             (Partial::Min(a), Partial::Min(b)) => {
                 Partial::Min(extreme(a.as_ref(), b.as_ref(), std::cmp::Ordering::Less))
             }
             (Partial::Max(a), Partial::Max(b)) => {
                 Partial::Max(extreme(a.as_ref(), b.as_ref(), std::cmp::Ordering::Greater))
             }
-            (running, _) => running.clone(),
+            // Two regions answering different *kinds* for one aggregate. Every region is sent the
+            // same fragment bytes, so this needs two different builds — which is what refusal
+            // exists for, and is why it is not quietly resolved in favour of either side.
+            (running, arriving) => {
+                let _ = (running, arriving);
+                return Err("two regions answered different aggregates for one fragment");
+            }
         };
     }
+    Ok(())
 }
 
 /// Two partial sums. **NULL is "no rows", not zero**, which is why this is not an addition with a
 /// zero identity: `sum` over nothing is NULL on a real server, and a region that matched nothing
 /// must not turn another region's sum into a different number.
-fn sum(left: Option<&WireValue>, right: Option<&WireValue>) -> Option<WireValue> {
-    match (left, right) {
+fn sum(
+    left: Option<&WireValue>,
+    right: Option<&WireValue>,
+) -> Result<Option<WireValue>, &'static str> {
+    Ok(match (left, right) {
+        // Absence is *no rows contributed*, not zero, on either side.
         (None, right) => right.cloned(),
-        (Some(WireValue::Int8(a)), Some(WireValue::Int8(b))) => {
-            Some(WireValue::Int8(a.wrapping_add(*b)))
-        }
+        (left, None) => left.cloned(),
+        // **Overflow is an error, not a wrap**, and that is `esker_columnar`'s own rule one level
+        // down (`scan::group::add`): PostgreSQL's `sum(bigint)` is `numeric` and cannot overflow,
+        // this node has no `numeric`, and a wrong total is worse than a missing one. A fold that
+        // wrapped where the evaluator refuses would make the two levels of one aggregate disagree
+        // about the same arithmetic.
+        (Some(WireValue::Int8(a)), Some(WireValue::Int8(b))) => Some(WireValue::Int8(
+            a.checked_add(*b).ok_or("a bigint sum that does not fit")?,
+        )),
         (Some(WireValue::Double(a)), Some(WireValue::Double(b))) => Some(WireValue::Double(a + b)),
-        // `(left, None)` — the other side matched nothing — and the mismatch below are one arm on
-        // purpose. Both mean *there is nothing here to add*, and the difference between them is
-        // that the second cannot happen: every region is sent the same fragment bytes, so two
-        // answering different types for one aggregate would be two different builds, which is what
-        // refusal exists for. Inventing a total for it would be worse than keeping what we have.
-        (left, _) => left.cloned(),
-    }
+        // Int8 and Double are the only sums that exist: `esker_columnar::scan::group::add` refuses
+        // every other pair, so a partial of another type is a peer that does not agree with this
+        // build about what a sum is.
+        _ => return Err("a sum of a type this build cannot add"),
+    })
 }
 
 /// The lesser or greater of two partial extremes, in `pg_cmp` order — this system's ordering, the
@@ -900,10 +926,12 @@ fn value_of(finish: Finish, partials: &[Partial]) -> Datum {
                 reason = "avg is float8 here; `avg(int8)` is numeric on a real server and this \
                           node has no numeric, which ADR 0031 records as a divergence"
             )]
+            // Only the two a sum can be. Anything else cannot reach here — `sum` above refuses
+            // every other pair — and NULL is the honest answer if it ever did, because a division
+            // this function cannot do is not a number it may invent.
             match total {
                 Datum::Double(total) => Datum::Double(total / rows as f64),
                 Datum::Int8(total) => Datum::Double(total as f64 / rows as f64),
-                Datum::Int4(total) => Datum::Double(f64::from(total) / rows as f64),
                 _ => Datum::Null,
             }
         }

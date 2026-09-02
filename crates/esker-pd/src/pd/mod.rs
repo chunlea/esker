@@ -40,13 +40,13 @@ use esker_engine::{
     cf,
 };
 use esker_proto::pd::ColumnarWish;
-use esker_proto::{Operator, Region, StoreInfo};
+use esker_proto::{Operator, OperatorProgress, OperatorStatus, Region, ScannedRegion, StoreInfo};
 
 use crate::alloc::{ALLOC_BATCH, Allocator};
 use crate::clock::{Clock, SystemClock};
 use crate::error::{PdError, Result};
 use crate::keys;
-use crate::operator::InFlight;
+use crate::operator::{InFlight, Progress};
 use crate::record::{
     AllocRecord, ClusterRecord, ColumnarRecord, HistoryRecord, OperatorEvent, RegionRecord,
     StoreRecord, TsoRecord,
@@ -59,6 +59,19 @@ mod repair;
 
 /// How long a store may be silent before it is considered down (`docs/DESIGN.md` §7).
 pub const MAX_STORE_DOWN_TIME_MS: u64 = 30_000;
+
+/// How many regions one [`Pd::scan_regions`] page carries when the caller names no limit.
+///
+/// Chosen so the ordinary cluster is one round trip and a large one is a handful: at 96 bytes of
+/// region record apiece a page is tens of kilobytes, well under any frame limit, and a thousand
+/// regions is eight calls instead of a thousand.
+pub const DEFAULT_SCAN_REGIONS: u32 = 128;
+
+/// The most a caller may ask for in one page, however large a limit it sends.
+///
+/// A caller's limit is a request; the server's cap is the thing that decides. Without one, "give
+/// me every region" is a message whose size the caller chose and the server allocated.
+pub const MAX_SCAN_REGIONS: u32 = 1024;
 
 /// How long a SQL node may serve **writes** from a cached schema before asking PD again
 /// ([ADR 0028](../../../docs/adr/0028-the-schema-lease.md), ADR 0020 as amended).
@@ -624,6 +637,49 @@ impl Pd {
         }))
     }
 
+    /// A page of the routing table in key order, and the stores its peers are on.
+    ///
+    /// What `esker region ls` walks with. The walk it replaces asked `GetRegion` once per region
+    /// — correct, and `O(regions)` round trips (`docs/plans/phase-4.md` §14.6, bullet 3).
+    ///
+    /// `limit` is clamped to [`MAX_SCAN_REGIONS`] and zero means [`DEFAULT_SCAN_REGIONS`]: a
+    /// caller's limit is a request, and a response size nobody chose is how a wire format grows a
+    /// denial of service. Fewer regions than the limit means the end of the table.
+    ///
+    /// The store list is **deduplicated across the page** rather than repeated per region, which
+    /// is the whole saving on a cluster of many regions and few stores.
+    pub fn scan_regions(
+        &self,
+        start_key: &[u8],
+        limit: u32,
+    ) -> Result<(Vec<ScannedRegion>, Vec<StoreInfo>)> {
+        let _ = self.cluster_id()?;
+        let limit = match limit {
+            0 => DEFAULT_SCAN_REGIONS,
+            asked => asked.min(MAX_SCAN_REGIONS),
+        };
+        let records = routing::scan_ranges(&self.db, start_key, limit as usize)?;
+
+        let mut store_ids = std::collections::BTreeSet::new();
+        let mut regions = Vec::with_capacity(records.len());
+        for record in records {
+            for peer in &record.region.peers {
+                store_ids.insert(peer.store_id);
+            }
+            regions.push(ScannedRegion {
+                region: record.region,
+                leader_peer_id: record.leader_peer_id,
+            });
+        }
+        let mut stores = Vec::with_capacity(store_ids.len());
+        for store_id in store_ids {
+            if let Some(store) = routing::read_store(&self.db, store_id)? {
+                stores.push(StoreInfo::new(store.store_id, store.address));
+            }
+        }
+        Ok((regions, stores))
+    }
+
     /// Records a store's capacity and load, and refreshes its liveness.
     ///
     /// A heartbeat from a store PD has no record of is **refused**, not auto-registered:
@@ -716,6 +772,39 @@ impl Pd {
     /// a repair ([`crate::record::HistoryRecord`]).
     pub fn history(&self) -> Result<Vec<OperatorEvent>> {
         Ok(self.lock()?.history.events.clone())
+    }
+
+    /// Every operator in flight right now, in region order, with PD's clock.
+    ///
+    /// **The one thing `esker pd inspect` cannot show.** That command opens a *stopped* PD's
+    /// database, and the in-flight set is deliberately not in it
+    /// ([ADR 0013](../../../docs/adr/0013-repair-operators-are-requests-not-commands.md)): a
+    /// restart forgets every operator and re-derives what is needed from the next round of
+    /// heartbeats. So the only way to see one is to ask the running process, which is what
+    /// `PdReq::Status` is for.
+    ///
+    /// The clock is taken **under the same lock** as the set, so an age computed from the two
+    /// cannot be negative — which is exactly what reading them separately would eventually
+    /// produce. That is also why this is not `in_flight()` plus a separate `clock()` call at the
+    /// caller: the pairing is the point.
+    pub fn status(&self) -> Result<(u64, Vec<OperatorStatus>)> {
+        let state = self.lock()?;
+        let now_ms = self.clock.now_ms();
+        let operators = state
+            .in_flight
+            .values()
+            .map(|entry| OperatorStatus {
+                operator: entry.operator.clone(),
+                progress: match entry.progress {
+                    Progress::Issued => OperatorProgress::Issued,
+                    Progress::Started => OperatorProgress::Started,
+                },
+                issued_ms: entry.issued_ms,
+                since_ms: entry.since_ms,
+                sends: entry.sends,
+            })
+            .collect();
+        Ok((now_ms, operators))
     }
 
     /// Appends one event to the history, on disk and in memory.

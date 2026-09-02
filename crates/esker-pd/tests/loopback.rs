@@ -325,6 +325,171 @@ async fn a_dead_store_earns_a_repair_on_the_heartbeat_response() {
         .expect("still asking");
     assert_eq!(again, operator);
     assert_eq!(cluster.pd.in_flight().unwrap().len(), 1);
+
+    // **And it is visible from outside the process.** `esker pd inspect` opens a stopped PD's
+    // database, and this set was never in it — so before `Pd::Status` an operator in flight was
+    // something only PD's own logs could show.
+    let (now_ms, in_flight) = pd.status().await.unwrap();
+    assert_eq!(in_flight.len(), 1, "the status did not show the repair");
+    let status = &in_flight[0];
+    assert_eq!(
+        status.operator, operator,
+        "a different operator was reported"
+    );
+    assert_eq!(
+        status.progress,
+        esker_proto::OperatorProgress::Issued,
+        "nothing has been observed acting on it yet"
+    );
+    assert_eq!(status.sends, 2, "it has been asked for twice");
+    assert!(
+        now_ms >= status.issued_ms && status.since_ms >= status.issued_ms,
+        "the clock and the operator disagree: now {now_ms}, issued {}, since {}",
+        status.issued_ms,
+        status.since_ms,
+    );
+
+    // A second call is a read: nothing about PD's state moves because somebody looked at it.
+    let (_, again) = pd.status().await.unwrap();
+    assert_eq!(again, in_flight, "asking for the status changed it");
+}
+
+/// The ordinary answer, which is the one an operator hopes for: nothing in flight.
+///
+/// Asserted on its own because "no operators" and "the call failed" are the same shape to a
+/// reader who only sees an empty list.
+#[tokio::test]
+async fn a_quiet_placement_driver_reports_no_operators() {
+    let cluster = Cluster::start().await;
+    let pd = cluster.channel().await;
+    pd.bootstrap(StoreInfo::new(1, "127.0.0.1:20161"))
+        .await
+        .unwrap();
+
+    let (now_ms, operators) = pd.status().await.unwrap();
+    assert!(operators.is_empty(), "a quiet PD reported {operators:?}");
+    assert_eq!(now_ms, 1_700_000_000_000, "the report carries PD's clock");
+}
+
+/// **The routing table, in pages instead of one region at a time.**
+///
+/// Fifty regions, because the shape only shows up above a page: the default page is 128, so a
+/// caller asking with a small limit has to continue and this asserts the continuation lands on the
+/// right region rather than skipping or repeating one.
+#[tokio::test]
+async fn fifty_regions_come_back_in_key_order_a_page_at_a_time() {
+    const COUNT: usize = 50;
+
+    let cluster = Cluster::start().await;
+    let pd = cluster.channel().await;
+    let (_, region) = pd
+        .bootstrap(StoreInfo::new(1, "127.0.0.1:20161"))
+        .await
+        .unwrap();
+    let bootstrapped = region.expect("the first store bootstraps a region");
+
+    // Fifty contiguous regions: [""..k01), [k01..k02), ... [k49..""). Reported as heartbeats,
+    // which is the only way a region enters PD's table.
+    let key = |index: usize| Bytes::from(format!("k{index:02}"));
+    for index in 0..COUNT {
+        let start = if index == 0 { Bytes::new() } else { key(index) };
+        let end = if index == COUNT - 1 {
+            Bytes::new()
+        } else {
+            key(index + 1)
+        };
+        let region = Region {
+            id: if index == 0 {
+                bootstrapped.id
+            } else {
+                100 + index as u64
+            },
+            start_key: start,
+            end_key: end,
+            peers: vec![Peer::voter(1, 10 + index as u64)],
+            epoch: Epoch::new(1, 1 + index as u64),
+        };
+        pd.region_heartbeat(region, 10 + index as u64, 1, 0, 0)
+            .await
+            .unwrap();
+    }
+
+    // One call, because fifty is below the default page.
+    let (regions, stores) = pd.scan_regions("", 0).await.unwrap();
+    assert_eq!(regions.len(), COUNT, "the default page did not cover fifty");
+    assert_eq!(
+        stores.len(),
+        1,
+        "one store hosts every peer, and it is sent once for the page, not fifty times"
+    );
+    assert_eq!(stores[0].address, "127.0.0.1:20161");
+
+    // In key order, and a partition: each region starts where the last one ended.
+    let mut expected = Bytes::new();
+    for scanned in &regions {
+        assert_eq!(
+            scanned.region.start_key, expected,
+            "region {} is out of order or leaves a gap",
+            scanned.region.id
+        );
+        expected = scanned.region.end_key.clone();
+    }
+    assert!(
+        expected.is_empty(),
+        "the last region does not close the key space"
+    );
+
+    // And paged: seven at a time, continuing from the previous page's end key, is the same list.
+    let mut paged = Vec::new();
+    let mut next = Bytes::new();
+    loop {
+        let (page, _) = pd.scan_regions(next.clone(), 7).await.unwrap();
+        assert!(
+            page.len() <= 7,
+            "the server handed out more than was asked for"
+        );
+        let Some(last) = page.last() else { break };
+        let end = last.region.end_key.clone();
+        paged.extend(page);
+        if end.is_empty() {
+            break;
+        }
+        next = end;
+    }
+    assert_eq!(paged, regions, "paging saw a different table from one call");
+
+    // A limit above the cap is clamped rather than refused.
+    let (all, _) = pd.scan_regions("", u32::MAX).await.unwrap();
+    assert_eq!(all.len(), COUNT);
+
+    // Starting inside the table starts at the region *containing* the key, not the one after it.
+    let (from_middle, _) = pd
+        .scan_regions(Bytes::from_static(b"k25x"), 3)
+        .await
+        .unwrap();
+    assert_eq!(from_middle.len(), 3);
+    assert_eq!(from_middle[0].region.start_key, key(25));
+}
+
+/// **A PD with no cluster still answers.**
+///
+/// Every other method is gated on the cluster id, and rightly: they read or write cluster-scoped
+/// state. A status is a question about the *process*, and an un-bootstrapped PD is exactly when an
+/// operator most wants to ask one — answering "the cluster is not bootstrapped" would be a reply
+/// to a question nobody asked.
+#[tokio::test]
+async fn a_placement_driver_with_no_cluster_still_answers_a_status() {
+    let cluster = Cluster::start().await;
+    let pd = cluster.channel().await;
+    assert_eq!(pd.cluster_id(), 0, "nothing has bootstrapped yet");
+
+    let (_, operators) = pd.status().await.expect("a status must not need a cluster");
+    assert!(operators.is_empty());
+
+    // And the gate is still on everything else, which is what makes the exemption a decision
+    // rather than a hole.
+    let refused = pd.get_region("").await.expect_err("the gate is off");
+    assert!(refused.to_string().contains("bootstrap"), "{refused}");
 }
 
 /// PD is not a store. A client that reached it by mistake is told so, rather than being

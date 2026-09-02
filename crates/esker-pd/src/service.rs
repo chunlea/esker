@@ -84,8 +84,14 @@ fn serve(pd: &Pd, cluster_id: u64, request: &PdReq) -> Result<PdResp, ProtoError
     // The cluster check, in one place. `Bootstrap` may carry zero — asking is how a caller
     // learns the id — but a caller that *does* name a cluster is checked even there, so a store
     // that already belongs to one cannot bootstrap a second cluster on a wiped PD by accident.
+    //
+    // `Status` is exempt for a different reason: it is a question about **this process**, not
+    // about a cluster. A PD that has not been bootstrapped is exactly when an operator most wants
+    // to ask, and refusing with "the cluster is not bootstrapped" would answer a question nobody
+    // asked. It reads no cluster-scoped state, so there is nothing for the check to protect.
     match request {
         PdReq::Bootstrap { .. } if cluster_id == 0 => {}
+        PdReq::Status => {}
         _ => pd.check_cluster(cluster_id)?,
     }
 
@@ -163,6 +169,17 @@ fn serve(pd: &Pd, cluster_id: u64, request: &PdReq) -> Result<PdResp, ProtoError
         PdReq::ReportColumnar { wishes } => {
             pd.report_columnar(wishes.clone())?;
             PdResp::ReportColumnar
+        }
+        // **Not** exempt from the cluster check above, unlike `Status`: this reads the routing
+        // table, which is cluster-scoped state, and a scan addressed to another cluster is the
+        // same mistake `GetRegion` is checked for.
+        PdReq::ScanRegions { start_key, limit } => {
+            let (regions, stores) = pd.scan_regions(start_key, *limit)?;
+            PdResp::ScanRegions { regions, stores }
+        }
+        PdReq::Status => {
+            let (now_ms, operators) = pd.status()?;
+            PdResp::Status { now_ms, operators }
         }
         PdReq::SchemaLease => {
             let lease = pd.schema_lease();

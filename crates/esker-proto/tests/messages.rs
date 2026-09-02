@@ -178,6 +178,23 @@ fn golden_pd_requests() -> Vec<(&'static str, Request)> {
                 request: PdReq::SchemaLease,
             },
         ),
+        (
+            "pd-status",
+            Request::Pd {
+                cluster_id: PD_CLUSTER,
+                request: PdReq::Status,
+            },
+        ),
+        (
+            "pd-scan-regions",
+            Request::Pd {
+                cluster_id: PD_CLUSTER,
+                request: PdReq::ScanRegions {
+                    start_key: Bytes::from_static(b"m"),
+                    limit: 64,
+                },
+            },
+        ),
     ]
 }
 
@@ -625,6 +642,7 @@ fn golden_operator_responses() -> Vec<(&'static str, Response)> {
     ]
 }
 
+#[allow(clippy::too_many_lines)]
 fn golden_pd_responses() -> Vec<(&'static str, Response)> {
     vec![
         (
@@ -681,6 +699,70 @@ fn golden_pd_responses() -> Vec<(&'static str, Response)> {
                 lease_ms: 5_000,
                 step_interval_ms: 8_000,
                 removal_extra_ms: 3_600_000,
+            }),
+        ),
+        (
+            // Two operators of different kinds and different progress, because a status with one
+            // of anything pins neither the repeat nor the tag it repeats.
+            "pd-status",
+            Response::Pd(PdResp::Status {
+                now_ms: 1_700_000_000_000,
+                operators: vec![
+                    esker_proto::OperatorStatus {
+                        operator: Operator::AddPeer {
+                            region_id: 1,
+                            epoch: Epoch::new(2, 3),
+                            store_id: 4,
+                            peer_id: 5,
+                        },
+                        progress: esker_proto::OperatorProgress::Issued,
+                        issued_ms: 1_699_999_000_000,
+                        since_ms: 1_699_999_000_000,
+                        sends: 3,
+                    },
+                    esker_proto::OperatorStatus {
+                        operator: Operator::RemovePeer {
+                            region_id: 7,
+                            epoch: Epoch::new(9, 11),
+                            peer_id: 13,
+                        },
+                        progress: esker_proto::OperatorProgress::Started,
+                        issued_ms: 1_699_998_000_000,
+                        since_ms: 1_699_999_500_000,
+                        sends: 1,
+                    },
+                ],
+            }),
+        ),
+        (
+            // Two regions that meet, so the golden pins the contiguity the caller checks, and one
+            // store shared by both — which is the deduplication this shape exists for.
+            "pd-scan-regions",
+            Response::Pd(PdResp::ScanRegions {
+                regions: vec![
+                    esker_proto::ScannedRegion {
+                        region: Region {
+                            id: 1,
+                            start_key: Bytes::from_static(b"a"),
+                            end_key: Bytes::from_static(b"m"),
+                            peers: vec![Peer::voter(1, 10)],
+                            epoch: Epoch::new(1, 2),
+                        },
+                        leader_peer_id: 10,
+                    },
+                    esker_proto::ScannedRegion {
+                        region: Region {
+                            id: 2,
+                            start_key: Bytes::from_static(b"m"),
+                            end_key: Bytes::new(),
+                            peers: vec![Peer::voter(1, 20)],
+                            epoch: Epoch::new(1, 3),
+                        },
+                        // No leader PD has heard from, which is zero and not an absent field.
+                        leader_peer_id: 0,
+                    },
+                ],
+                stores: vec![StoreInfo::new(1, "127.0.0.1:20160")],
             }),
         ),
     ]

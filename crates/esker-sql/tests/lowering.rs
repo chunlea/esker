@@ -58,11 +58,6 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
             "CREATE TABLE t (a int8 GENERATED ALWAYS AS IDENTITY (START WITH 100))",
             "a sequence option on an identity column",
         ),
-        // `serial` is `int4` under another name and **runs** since ADR 0033 gave this node an
-        // `int4`; `tests/ddl.rs` asserts what it builds. `smallserial` is `int2`, which is the
-        // next type in tier 1's order and is refused by name until it lands — the same shape
-        // `serial` was in, and for the same reason.
-        ("CREATE TABLE t (a smallserial)", "smallserial"),
         (
             "ALTER TABLE t ADD COLUMN b bigserial",
             "ALTER TABLE ... ADD COLUMN ... bigserial",
@@ -78,15 +73,15 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
             "PARTITION BY",
         ),
         ("CREATE TABLE t (a int8) INHERITS (u)", "INHERITS"),
-        // `int4`, `character varying` and `timestamp` run since ADR 0033. What is left of tier 1
+        // Every tier-1 type without a typmod runs since ADR 0033. What is left is the three
+        // that need one — `varchar(n)`, `character(n)`, `timestamp(p)` — plus `numeric`, which is
+        // tier 2. Each line goes with the unit that lands its type. What is left of tier 1
         // is refused by name, in the order that ADR gives them, and each of these lines is
         // deleted by the unit that lands its type. A **length or precision** is refused too: it
         // is a typmod, which this node has nowhere to keep, and ignoring one would store a value
         // a real server rejects with `22001`.
         ("CREATE TABLE t (a varchar(10))", "the type VARCHAR"),
         ("CREATE TABLE t (a timestamp(3))", "the type TIMESTAMP"),
-        ("CREATE TABLE t (a int2)", "the type INT2"),
-        ("CREATE TABLE t (a real)", "the type REAL"),
         ("CREATE TABLE t (a numeric)", "the type NUMERIC"),
         ("CREATE TABLE t (a int8[])", "the type"),
         ("CREATE TABLE s.t (a int8)", "the qualified name"),

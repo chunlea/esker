@@ -68,6 +68,29 @@ pub(crate) struct ServerOptions {
     /// its own region and reports to nobody — phase 2's single node and phase 3e's static
     /// cluster, both of which this command still starts.
     pub(crate) pd: Option<String>,
+    /// Approximate region bytes past which a leader looks for a split key, or `None` for the
+    /// store's 96 MiB default (`docs/DESIGN.md` §14).
+    ///
+    /// A store with no `--pd` never splits whatever this says, because a split needs
+    /// cluster-unique ids. Exposed for the same reason `--write-buffer-size` is: an acceptance
+    /// run that wants a split otherwise has to push 96 MiB through Raft to get one, and
+    /// `docs/bench/phase-4.md` had to wrap this binary to do it.
+    pub(crate) region_split_size: Option<u64>,
+    /// How often this store reports itself to PD, in milliseconds. `None` is §14's 10 s.
+    pub(crate) store_heartbeat_ms: Option<u64>,
+    /// How often each region's leader reports it absent a change, in milliseconds. `None` is
+    /// §14's 60 s.
+    ///
+    /// **Also the latency of an operator**: PD answers a region heartbeat and has no other way to
+    /// reach a store, so a repair waits at most this long. That is why a test cluster sets it low
+    /// and why it is a flag rather than a constant.
+    pub(crate) region_heartbeat_ms: Option<u64>,
+    /// What one heartbeat tick is worth, in milliseconds. `None` is the store's default.
+    ///
+    /// The **resolution** of the schedule rather than its period: the two intervals above are
+    /// counted in these ([`esker_store::Heartbeats`]), so an interval below one tick is rounded up
+    /// to one and setting a short interval without also shortening the tick does nothing.
+    pub(crate) heartbeat_tick_ms: Option<u64>,
 }
 
 impl Default for ServerOptions {
@@ -80,6 +103,10 @@ impl Default for ServerOptions {
             peers: Vec::new(),
             seed: 0,
             write_buffer_size: None,
+            region_split_size: None,
+            store_heartbeat_ms: None,
+            region_heartbeat_ms: None,
+            heartbeat_tick_ms: None,
             sst_store: None,
             adopt_sst_store: false,
             pd: None,
@@ -157,18 +184,7 @@ pub(crate) fn run(options: &ServerOptions) -> Result<(), String> {
 
     let store = Store::open(
         &options.data_dir,
-        StoreOptions {
-            store_id: options.store_id,
-            peer_id: options.peer_id,
-            engine,
-            fs,
-            raft,
-            pd,
-            // What PD records as this store's address is the address it was told to listen on,
-            // not the one it resolved to: `0.0.0.0:0` resolves to something no peer can use.
-            address: options.listen.clone(),
-            ..StoreOptions::new()
-        },
+        store_options(options, engine, fs, raft, pd),
     )
     .map_err(|error| format!("opening {}: {error}", options.data_dir.display()))?;
 
@@ -183,6 +199,45 @@ pub(crate) fn run(options: &ServerOptions) -> Result<(), String> {
     }
     drop(store);
     served
+}
+
+/// The store's options, from the flags and the pieces `run` has already built.
+///
+/// A function rather than an expression inside `run` because it is the half a test can check:
+/// every knob here is a flag that parses fine and does nothing at all if it is dropped on the way
+/// through, which is a failure no parse test can see.
+fn store_options(
+    options: &ServerOptions,
+    engine: esker_engine::Options,
+    fs: Arc<dyn esker_engine::fs::FileSystem>,
+    raft: Option<RaftOptions>,
+    pd: Option<Arc<dyn PdClient>>,
+) -> StoreOptions {
+    let defaults = StoreOptions::new();
+    let mut split = defaults.split;
+    if let Some(size) = options.region_split_size {
+        split.region_split_size = size;
+    }
+    let ms = |value: Option<u64>, fallback: std::time::Duration| {
+        value.map_or(fallback, std::time::Duration::from_millis)
+    };
+
+    StoreOptions {
+        store_id: options.store_id,
+        peer_id: options.peer_id,
+        engine,
+        fs,
+        raft,
+        pd,
+        // What PD records as this store's address is the address it was told to listen on, not
+        // the one it resolved to: `0.0.0.0:0` resolves to something no peer can use.
+        address: options.listen.clone(),
+        split,
+        heartbeat_tick: ms(options.heartbeat_tick_ms, defaults.heartbeat_tick),
+        store_heartbeat: ms(options.store_heartbeat_ms, defaults.store_heartbeat),
+        region_heartbeat: ms(options.region_heartbeat_ms, defaults.region_heartbeat),
+        ..defaults
+    }
 }
 
 async fn serve(
@@ -267,5 +322,59 @@ mod tests {
         assert_eq!(options.listen, DEFAULT_LISTEN);
         assert_eq!(options.store_id, 1);
         assert!(!options.data_dir.as_os_str().is_empty());
+    }
+
+    /// **The knobs reach the store.** Each of these parses fine and does nothing at all if it is
+    /// dropped on the way through, which is a failure a parse test cannot see.
+    #[test]
+    fn the_new_knobs_reach_the_store_options() {
+        use std::time::Duration;
+
+        let options = ServerOptions {
+            region_split_size: Some(4 * 1024 * 1024),
+            store_heartbeat_ms: Some(250),
+            region_heartbeat_ms: Some(500),
+            heartbeat_tick_ms: Some(50),
+            ..ServerOptions::default()
+        };
+        let built = super::store_options(
+            &options,
+            esker_store::StoreOptions::new().engine,
+            std::sync::Arc::new(esker_engine::fs::LocalFileSystem::new()),
+            None,
+            None,
+        );
+
+        assert_eq!(built.split.region_split_size, 4 * 1024 * 1024);
+        assert_eq!(built.store_heartbeat, Duration::from_millis(250));
+        assert_eq!(built.region_heartbeat, Duration::from_millis(500));
+        assert_eq!(built.heartbeat_tick, Duration::from_millis(50));
+        // Nothing else moved: `max_sampled_keys` is the other half of `SplitOptions` and has no
+        // flag, so it must still be the store's own default.
+        assert_eq!(
+            built.split.max_sampled_keys,
+            esker_store::StoreOptions::new().split.max_sampled_keys
+        );
+    }
+
+    /// Without the flags, the store's own defaults — `docs/DESIGN.md` §14's, and this is what
+    /// keeps a flag's absence from being a different configuration from not having the flag.
+    #[test]
+    fn without_the_knobs_the_store_defaults_stand() {
+        let defaults = esker_store::StoreOptions::new();
+        let built = super::store_options(
+            &ServerOptions::default(),
+            defaults.engine.clone(),
+            std::sync::Arc::new(esker_engine::fs::LocalFileSystem::new()),
+            None,
+            None,
+        );
+        assert_eq!(
+            built.split.region_split_size,
+            defaults.split.region_split_size
+        );
+        assert_eq!(built.store_heartbeat, defaults.store_heartbeat);
+        assert_eq!(built.region_heartbeat, defaults.region_heartbeat);
+        assert_eq!(built.heartbeat_tick, defaults.heartbeat_tick);
     }
 }

@@ -96,6 +96,11 @@ pub enum ColumnData {
     Ints(Vec<i64>),
     /// A `Double` column.
     Doubles(Vec<f64>),
+    /// A `Real` column: four bytes each, never widened into [`ColumnData::Doubles`].
+    /// `crate::encode::float` says why the widening an `Int4` gets is wrong one width down.
+    /// Plain words rather than a link: that module is `pub(crate)`, and `just doc` denies a public
+    /// item linking a private one.
+    Floats(Vec<f32>),
     /// A `Bool` column.
     Bools(Vec<bool>),
     /// A `Text` or `Bytea` column: value `i` is `data[offsets[i]..offsets[i + 1]]`.
@@ -118,8 +123,14 @@ impl ColumnData {
             ColumnType::Int8
             | ColumnType::TimestampTz
             | ColumnType::Timestamp
-            | ColumnType::Int4 => ColumnData::Ints(Vec::new()),
+            | ColumnType::Int4
+            | ColumnType::Int2 => ColumnData::Ints(Vec::new()),
             ColumnType::Double => ColumnData::Doubles(Vec::new()),
+            // A `Real` gets its **own** run rather than riding in the doubles one widened, which
+            // is the one place the integer trick above does not carry over: widening an `f32` is
+            // exact for every value except a `NaN` payload, where it is unspecified, and it would
+            // write eight bytes for a four-byte type. [`crate::encode::float`] has the argument.
+            ColumnType::Real => ColumnData::Floats(Vec::new()),
             ColumnType::Bool => ColumnData::Bools(Vec::new()),
             ColumnType::Text | ColumnType::Varchar | ColumnType::Bytea => ColumnData::Bytes {
                 offsets: vec![0],
@@ -134,6 +145,7 @@ impl ColumnData {
         match self {
             ColumnData::Ints(values) => values.len(),
             ColumnData::Doubles(values) => values.len(),
+            ColumnData::Floats(values) => values.len(),
             ColumnData::Bools(values) => values.len(),
             ColumnData::Bytes { offsets, .. } => offsets.len().saturating_sub(1),
         }
@@ -156,7 +168,9 @@ impl ColumnData {
                     | ColumnType::TimestampTz
                     | ColumnType::Timestamp
                     | ColumnType::Int4
+                    | ColumnType::Int2
             ) | (ColumnData::Doubles(_), ColumnType::Double)
+                | (ColumnData::Floats(_), ColumnType::Real)
                 | (ColumnData::Bools(_), ColumnType::Bool)
                 | (
                     ColumnData::Bytes { .. },
@@ -282,6 +296,13 @@ impl Column {
                         .zip(right)
                         .all(|(a, b)| a.to_bits() == b.to_bits())
             }
+            (ColumnData::Floats(left), ColumnData::Floats(right)) => {
+                left.len() == right.len()
+                    && left
+                        .iter()
+                        .zip(right)
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+            }
             (left, right) => left == right,
         }
     }
@@ -323,6 +344,7 @@ impl<'a> Iterator for ColumnIter<'a> {
         Some(match &self.column.data {
             ColumnData::Ints(values) => ValueRef::Int(values[index]),
             ColumnData::Doubles(values) => ValueRef::Double(values[index]),
+            ColumnData::Floats(values) => ValueRef::Real(values[index]),
             ColumnData::Bools(values) => ValueRef::Bool(values[index]),
             ColumnData::Bytes { offsets, data } => {
                 ValueRef::Bytes(&data[offsets[index] as usize..offsets[index + 1] as usize])
@@ -349,6 +371,7 @@ pub struct ColumnBuilder {
     nulls: Vec<bool>,
     ints: Vec<i64>,
     doubles: Vec<f64>,
+    floats: Vec<f32>,
     bools: Vec<bool>,
     offsets: Vec<u32>,
     data: Vec<u8>,
@@ -363,6 +386,7 @@ impl ColumnBuilder {
             nulls: Vec::new(),
             ints: Vec::new(),
             doubles: Vec::new(),
+            floats: Vec::new(),
             bools: Vec::new(),
             offsets: vec![0],
             data: Vec::new(),
@@ -382,7 +406,9 @@ impl ColumnBuilder {
             Value::Null => {}
             Value::Int8(v) | Value::TimestampTz(v) | Value::Timestamp(v) => self.ints.push(*v),
             Value::Int4(v) => self.ints.push(i64::from(*v)),
+            Value::Int2(v) => self.ints.push(i64::from(*v)),
             Value::Double(v) => self.doubles.push(*v),
+            Value::Real(v) => self.floats.push(*v),
             Value::Bool(v) => self.bools.push(*v),
             Value::Text(v) => self.push_bytes(v.as_bytes())?,
             Value::Bytea(v) => self.push_bytes(v)?,
@@ -417,6 +443,7 @@ impl ColumnBuilder {
         self.nulls.len()
             + self.ints.len() * 8
             + self.doubles.len() * 8
+            + self.floats.len() * 4
             + self.bools.len()
             + self.offsets.len() * 4
             + self.data.len()
@@ -429,8 +456,10 @@ impl ColumnBuilder {
             ColumnType::Int8
             | ColumnType::TimestampTz
             | ColumnType::Timestamp
-            | ColumnType::Int4 => ColumnData::Ints(std::mem::take(&mut self.ints)),
+            | ColumnType::Int4
+            | ColumnType::Int2 => ColumnData::Ints(std::mem::take(&mut self.ints)),
             ColumnType::Double => ColumnData::Doubles(std::mem::take(&mut self.doubles)),
+            ColumnType::Real => ColumnData::Floats(std::mem::take(&mut self.floats)),
             ColumnType::Bool => ColumnData::Bools(std::mem::take(&mut self.bools)),
             ColumnType::Text | ColumnType::Varchar | ColumnType::Bytea => ColumnData::Bytes {
                 offsets: std::mem::replace(&mut self.offsets, vec![0]),

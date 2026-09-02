@@ -134,6 +134,7 @@ fn owned(value: &ValueRef<'_>) -> Value {
         ValueRef::Int(int) => Value::Int8(*int),
         ValueRef::Bool(flag) => Value::Bool(*flag),
         ValueRef::Double(double) => Value::Double(*double),
+        ValueRef::Real(real) => Value::Real(*real),
         ValueRef::Bytes(bytes) => Value::Bytea((*bytes).to_vec()),
     }
 }

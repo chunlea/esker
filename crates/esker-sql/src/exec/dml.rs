@@ -110,6 +110,9 @@ fn sequence_datum(ty: ColumnType, value: i64) -> Result<Datum> {
         ColumnType::Int4 => Datum::Int4(
             i32::try_from(value).map_err(|_| SqlError::IntegerLiteralOutOfRange(ty.name()))?,
         ),
+        ColumnType::Int2 => Datum::Int2(
+            i16::try_from(value).map_err(|_| SqlError::IntegerLiteralOutOfRange(ty.name()))?,
+        ),
         _ => Datum::Int8(value),
     })
 }

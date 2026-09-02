@@ -18,7 +18,7 @@ distribution, repair, and the chaos run substituting for the deterministic multi
 | build | `cargo build --release`, the workspace's own `esker-store`/`esker-pd`/`esker-proto`/`esker-client`/`esker-base` |
 | **not idle** | Four other agent sessions were active on this machine for the whole of this run, each building/testing the same workspace concurrently (`uptime` load average measured 5–8 throughout, against 16 cores) — unlike phases 1–3's dedicated-machine runs. Every number below should be read as a lower bound on what a dedicated machine would show, not a ceiling |
 | harness | `esker-cli bench`/`raw` have no PD-aware routing — `bench --remote` binds one static region (`StaticRegion`) and cannot follow a real cluster's splits or leader moves. A scratchpad-only tool (never committed; per this lane's mandate to write only the two files in `docs/bench/`) supplies a `RegionResolver`/`StoreTransport` backed by a live placement driver and otherwise reuses `esker_client::RawClient` as-is — no retry/backoff/epoch logic was reimplemented, only "how do I reach a store" and "who do I ask." Verified by reading, not by the tool that wrote it: see the Methodology note at the end of this file |
-| server knobs | `esker-cli server`/`pd serve` do not expose `region_split_size` or the heartbeat intervals; a second scratchpad wrapper (`storewrap`/`pdwrap`) is `esker-cli`'s own `server.rs`/`pd.rs` with those `StoreOptions`/`PdOptions` fields exposed as flags, otherwise identical |
+| server knobs | *As of this run:* `esker-cli server`/`pd serve` do not expose `region_split_size` or the heartbeat intervals; a second scratchpad wrapper (`storewrap`/`pdwrap`) is `esker-cli`'s own `server.rs`/`pd.rs` with those `StoreOptions`/`PdOptions` fields exposed as flags, otherwise identical. **The store half of that is closed** — debt wave C4 added `--region-split-size`, `--store-heartbeat-ms`, `--region-heartbeat-ms` and `--heartbeat-tick-ms` to `esker server` (`docs/plans/debt-c4.md` §7), so `storewrap` is no longer needed. `pdwrap` still is: `pd serve` exposes no `PdOptions` field, and this run set `max_store_down_time_ms` among others |
 | topology | every store is started with every store's address in its `--peer` list from the start (the *address book*, `RaftOptions.peers`) even for a store not yet running — this is what lets a peer added later (by `AddPeer`) be dialed at all. Region membership itself is **not** set this way: PD's `Bootstrap` always answers with a single voter, on whichever store registers first (`docs/DESIGN.md` §7); growing that to `target_replicas` is `balance`'s job, not bootstrap's — see the finding below, which affects every run in this file |
 
 ## 1. Linear scale-out — 1, 3, 5 stores
@@ -472,10 +472,12 @@ a correctness one, and orthogonal to what this run was asked to confirm.
 
 ## Methodology note: what the scratchpad tooling is, and isn't
 
-None of the four items above could be produced with the checked-in `esker-cli`: `bench`/`raw` only
-ever resolve one static region, and `server`/`pd serve` do not expose the split-size or
-heartbeat-interval knobs this lane needed to get a meaningful region count without minutes of
-writing at the 96 MiB default. Two small scratchpad-only programs filled the gap (never committed,
+None of the four items above could be produced with the checked-in `esker-cli` **at the time of
+this run**: `bench`/`raw` only ever resolve one static region, and `server`/`pd serve` did not
+expose the split-size or heartbeat-interval knobs this lane needed to get a meaningful region count
+without minutes of writing at the 96 MiB default. `esker server` exposes them now (debt wave C4,
+`docs/plans/debt-c4.md` §7); `bench --remote`'s static region and `pd serve`'s knobs are still as
+described. Two small scratchpad-only programs filled the gap (never committed,
 per this lane's write restriction): a load generator that hands `esker_client::RawClient` a
 `RegionResolver`/`StoreTransport` backed by a live PD instead of `StaticRegion`, and two thin
 wrappers around `esker_store::Store`/`esker_pd::Pd` — themselves near-verbatim copies of

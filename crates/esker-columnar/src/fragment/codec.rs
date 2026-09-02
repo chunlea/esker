@@ -380,8 +380,16 @@ fn put_literal(value: &Value, out: &mut Vec<u8>) {
             out.push(ColumnType::Int4.tag());
             out.extend_from_slice(&v.to_le_bytes());
         }
+        Value::Int2(v) => {
+            out.push(ColumnType::Int2.tag());
+            out.extend_from_slice(&v.to_le_bytes());
+        }
         Value::Double(v) => {
             out.push(ColumnType::Double.tag());
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        Value::Real(v) => {
+            out.push(ColumnType::Real.tag());
             out.extend_from_slice(&v.to_le_bytes());
         }
         Value::Bool(v) => {
@@ -416,7 +424,11 @@ fn take_literal(cursor: &mut Cursor<'_>) -> Result<Value> {
         ColumnType::Int4 => Value::Int4(i32::from_le_bytes(
             cursor.u32_le("literal int4")?.to_le_bytes(),
         )),
+        ColumnType::Int2 => Value::Int2(i16::from_le_bytes(
+            cursor.u16_le("literal int2")?.to_le_bytes(),
+        )),
         ColumnType::Double => Value::Double(f64::from_bits(cursor.u64_le("literal double")?)),
+        ColumnType::Real => Value::Real(f32::from_bits(cursor.u32_le("literal real")?)),
         ColumnType::Bool => match cursor.u8("literal boolean")? {
             0 => Value::Bool(false),
             1 => Value::Bool(true),

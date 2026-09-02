@@ -98,6 +98,19 @@ impl StandIn {
                 step_interval_ms: 1_500,
                 removal_extra_ms: 0,
             },
+            // An operator's question, not a store's: `esker pd status` asks it. Answered rather
+            // than refused so the match stays exhaustive — which is what made this file the first
+            // place to notice the new method.
+            PdReq::Status => PdResp::Status {
+                now_ms: 0,
+                operators: Vec::new(),
+            },
+            // Also an operator's: `esker region ls` pages the routing table with it. A store
+            // asks `GetRegion` about the key it has, never for a list.
+            PdReq::ScanRegions { .. } => PdResp::ScanRegions {
+                regions: Vec::new(),
+                stores: Vec::new(),
+            },
         }
     }
 }
