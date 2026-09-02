@@ -1,0 +1,19 @@
+crates/esker-store/src/columnar/region.rs
+  s_7a3132f4d02a00::t_9350661a72ebbf 242,423
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "d1a798f8bc7d6b61a7f0f9b4aab1de041b7992dc",
+  "prompts": {},
+  "sessions": {
+    "s_7a3132f4d02a00": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "176f3779-1c8f-49ac-8e22-08bb3b8ac7c3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
