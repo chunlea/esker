@@ -328,6 +328,25 @@ async fn watch_until_every_learner_votes(
 
     loop {
         for region in pd_regions(pd) {
+            // **One peer per region per store, checked before anything is timed.**
+            //
+            // A store keys its regions by region id and its transport refuses to address a peer
+            // that resolves to itself, so a second peer of one region on one store is a peer that
+            // can never be created: the leader drops every message to it, its `matched` stays 0,
+            // and it is a learner for ever. That is a *stranded* learner rather than a slow one,
+            // and it used to arrive here as `PROMOTION_DEADLINE` expiring — thirty seconds later,
+            // naming the clock instead of the cause. It is a state, so it is asserted as one
+            // (`docs/plans/phase-14-flakes.md` U2).
+            let mut by_store: BTreeMap<u64, u64> = BTreeMap::new();
+            for peer in &region.peers {
+                if let Some(first) = by_store.insert(peer.store_id, peer.peer_id) {
+                    panic!(
+                        "region {} has peers {} and {} both on store {} — a store hosts one peer \
+                         per region, so the second can never be created and never votes",
+                        region.id, first, peer.peer_id, peer.store_id
+                    );
+                }
+            }
             for peer in &region.peers {
                 let id = (region.id, peer.peer_id);
                 if peer.store_id != 1 {
@@ -335,6 +354,26 @@ async fn watch_until_every_learner_votes(
                 }
                 match peer.role {
                     PeerRole::Learner => {
+                        // **A role only ever moves forward.** Nothing in this system demotes a
+                        // voter — `RemovePeer` takes a replica away and there is no `Demote` — so
+                        // a peer PD has already reported as a voter and now reports as a learner
+                        // is PD's *view* going backwards, not a promotion that failed. Told apart
+                        // here because the two arrive at the deadline looking identical, thirty
+                        // seconds after whichever of them happened.
+                        assert!(
+                            !promoted.contains(&id),
+                            "region {} peer {} is a learner again after PD reported it a voter; \
+                             PD holds {:?} at epoch {:?} from leader {}",
+                            region.id,
+                            peer.peer_id,
+                            region
+                                .peers
+                                .iter()
+                                .map(|peer| (peer.peer_id, peer.store_id, peer.role))
+                                .collect::<Vec<_>>(),
+                            region.epoch,
+                            region.id
+                        );
                         let since = *first_seen.entry(id).or_insert_with(Instant::now);
                         if since.elapsed() >= PROMOTION_DEADLINE {
                             // What the *learner's own store* thinks, which is the half the
@@ -353,10 +392,22 @@ async fn watch_until_every_learner_votes(
                                 .collect();
                             panic!(
                                 "peer {} of region {} has been a learner for {:?} — the phase-4 \
-                                 acceptance stall. the learner's own store says: {theirs:?}",
+                                 acceptance stall. the placement driver holds {:?} at epoch {:?}, \
+                                 led by peer {}. the learner's own store says: {theirs:?}",
                                 peer.peer_id,
                                 region.id,
-                                since.elapsed()
+                                since.elapsed(),
+                                region
+                                    .peers
+                                    .iter()
+                                    .map(|peer| (peer.peer_id, peer.store_id, peer.role))
+                                    .collect::<Vec<_>>(),
+                                region.epoch,
+                                pd.regions()
+                                    .unwrap()
+                                    .iter()
+                                    .find(|record| record.region.id == region.id)
+                                    .map_or(0, |record| record.leader_peer_id)
                             );
                         }
                     }

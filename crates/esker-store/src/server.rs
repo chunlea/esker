@@ -2962,6 +2962,42 @@ fn bootstrap(db: &Arc<Db>, options: &BootstrapOptions<'_>) -> Result<Option<Regi
 /// preamble to the proposal carrying it. `TransferLeader` is deliberately not here: it moves
 /// leadership by the core's own `TimeoutNow` path rather than by a conf change, so it leaves
 /// `apply_operator` before this is reached.
+/// Whether this region already has the peer an `AddPeer` or `AddLearner` would place.
+///
+/// **By store, and not only by peer id.** A store hosts at most one peer per region — `Regions` is
+/// keyed by region id and the transport drops a message it would have to address to itself — so
+/// "already here" is a question about the *store*, and asking it by peer id answers "no" to every
+/// repeat PD issues.
+///
+/// It answers "no" because PD mints a **fresh peer id every time**: `esker-pd`'s `repair.rs` says
+/// so in as many words — *"a fresh peer id, from the persisted allocator, every time an `AddPeer`
+/// is issued ... reusing the id of an operator PD has forgotten would risk two peers with one
+/// id"* — and burning ids is the right call there. It is the check here that was reading the wrong
+/// half of the pair.
+///
+/// # What that cost, found under load
+///
+/// An `AddPeer` is answered when its conf change *applies*, and a leader that steps down with the
+/// proposal in its log answers "it may still commit" — which is not "it did not". PD sees nothing,
+/// times the operator out, re-derives the same plan onto the same store with a new peer id, and
+/// the second change commits beside the first. The region then has two peers on one store, and the
+/// second one can never exist: while the record catches up the leader logs *"no store known for a
+/// peer of this region; the message was dropped"*, and once it has, *"a message was addressed to a
+/// peer on this store; it was dropped"* — for ever. The peer sits at `matched=0`,
+/// `recent_active=false`, is never promoted, and PD, counting a peer that is only on paper, no
+/// longer sees the region as short and never repairs it.
+///
+/// The same family as `balance::is_mid_repair`'s "voters, not peers": an identity read off the
+/// wrong field, turning a transient ambiguity into a permanent state
+/// (`docs/plans/phase-14-flakes.md` U2).
+fn already_placed(state: &RegionState, peer_id: u64, store_id: u64) -> bool {
+    state
+        .region()
+        .peers
+        .iter()
+        .any(|peer| peer.peer_id == peer_id || peer.store_id == store_id)
+}
+
 fn conf_change_for(
     operator: &esker_proto::Operator,
     state: &RegionState,
@@ -2984,22 +3020,19 @@ fn conf_change_for(
         // promotion criterion, which is to say by leaving it to the round that checks it.
         esker_proto::Operator::AddPeer {
             store_id, peer_id, ..
-        } => match state
-            .region()
-            .peers
-            .iter()
-            .find(|peer| peer.peer_id == *peer_id)
-        {
-            None => (
+        } => {
+            // Already here. A learner is on its way to being a voter under its own criterion,
+            // and a voter is what was asked for: either way there is nothing to propose.
+            if already_placed(state, *peer_id, *store_id) {
+                return None;
+            }
+            (
                 esker_raft::ConfChangeKind::AddLearner,
                 *peer_id,
                 *store_id,
                 PeerRole::Learner,
-            ),
-            // Already here. A learner is on its way to being a voter under its own criterion,
-            // and a voter is what was asked for: either way there is nothing to propose.
-            Some(_) => return None,
-        },
+            )
+        }
         // **A columnar replica: a learner that is never promoted** (ADR 0022 Decision 1).
         //
         // The same `ConfChangeKind::AddLearner` a row replica gets — `esker-raft` has one
@@ -3012,23 +3045,20 @@ fn conf_change_for(
         // columnar replica never does, so it would be a repair that never finishes.
         esker_proto::Operator::AddLearner {
             store_id, peer_id, ..
-        } => match state
-            .region()
-            .peers
-            .iter()
-            .find(|peer| peer.peer_id == *peer_id)
-        {
-            None => (
+        } => {
+            // Already here, in whatever role it was added as. Nothing to propose, and
+            // certainly not a change of role: that would be a promotion or a demotion and
+            // neither is what this operator asks for.
+            if already_placed(state, *peer_id, *store_id) {
+                return None;
+            }
+            (
                 esker_raft::ConfChangeKind::AddLearner,
                 *peer_id,
                 *store_id,
                 PeerRole::ColumnarLearner,
-            ),
-            // Already here, in whatever role it was added as. Nothing to propose, and
-            // certainly not a change of role: that would be a promotion or a demotion and
-            // neither is what this operator asks for.
-            Some(_) => return None,
-        },
+            )
+        }
         esker_proto::Operator::RemovePeer { peer_id, .. } => {
             let existing = state
                 .region()
@@ -3405,10 +3435,114 @@ impl Service for StoreService {
 
 #[cfg(test)]
 mod tests {
-    use super::{Store, StoreOptions};
+    use super::{Store, StoreOptions, conf_change_for};
+    use crate::region::RegionMeta;
+    use crate::regions::RegionState;
     use bytes::Bytes;
-    use esker_proto::{Epoch, ProtoError, RawKvReq, RawKvResp, RequestHeader};
+    use esker_proto::{Epoch, Operator, Peer, ProtoError, RawKvReq, RawKvResp, RequestHeader};
     use std::sync::Arc;
+
+    /// A region with the peers named, and nothing else: what `conf_change_for` reads.
+    fn placed(peers: Vec<Peer>) -> RegionState {
+        RegionState::unreplicated(RegionMeta::replicated(1, peers))
+    }
+
+    /// A re-issued `AddPeer` for a store that already has a peer of this region proposes nothing.
+    ///
+    /// **PD mints a fresh peer id every time it issues one** — `repair.rs`, "a fresh peer id, from
+    /// the persisted allocator, every time an `AddPeer` is issued ... reusing the id of an operator
+    /// PD has forgotten would risk two peers with one id". So "is this already done?" cannot be
+    /// asked by peer id: the id is different by construction on every re-derivation, and the check
+    /// that asked by id answered "no" to every repeat.
+    ///
+    /// What that produced, found under load in `tests/promotion.rs`: an `AddPeer` whose proposal
+    /// was answered *ambiguously* — the leader stepped down with it in its log and it committed
+    /// anyway — was re-derived by PD onto the same store, and the second one committed too. The
+    /// region then had two peers on one store, and a store hosts one peer per region, so the second
+    /// could never be created: `no store known for a peer of this region` while the record caught
+    /// up, then `a message was addressed to a peer on this store; it was dropped` for ever after.
+    /// A learner at `matched=0`, `recent_active=false`, never promoted, with PD no longer seeing
+    /// the region as short and so never repairing it.
+    #[test]
+    fn a_re_issued_add_peer_does_not_place_a_second_peer_on_a_store_that_has_one() {
+        let state = placed(vec![Peer::voter(1, 10), Peer::learner(3, 20)]);
+        // Store 3 already has peer 20. PD, whose view has not caught up, asks again with a new id.
+        assert!(
+            conf_change_for(
+                &Operator::AddPeer {
+                    region_id: 1,
+                    epoch: Epoch::INITIAL,
+                    store_id: 3,
+                    peer_id: 27,
+                },
+                &state
+            )
+            .is_none(),
+            "a second peer was placed on a store that already hosts one, which no store can \
+             create and nothing can undo"
+        );
+        // And the same store with no peer of this region is still added, or the guard would have
+        // turned a repeat into a refusal to repair at all.
+        assert!(
+            conf_change_for(
+                &Operator::AddPeer {
+                    region_id: 1,
+                    epoch: Epoch::INITIAL,
+                    store_id: 4,
+                    peer_id: 27,
+                },
+                &state
+            )
+            .is_some(),
+            "a store with no peer of this region was refused"
+        );
+    }
+
+    /// The peer id is still a repeat when it *is* reused, which is the case the guard was written
+    /// for and which must not be lost while widening it.
+    #[test]
+    fn an_add_peer_for_a_peer_id_already_here_still_proposes_nothing() {
+        let state = placed(vec![Peer::voter(1, 10), Peer::learner(3, 20)]);
+        assert!(
+            conf_change_for(
+                &Operator::AddPeer {
+                    region_id: 1,
+                    epoch: Epoch::INITIAL,
+                    store_id: 3,
+                    peer_id: 20,
+                },
+                &state
+            )
+            .is_none()
+        );
+    }
+
+    /// A columnar learner is placed by the same rule and breaks the same way.
+    ///
+    /// ADR 0022 puts a columnar replica on a store *without* a peer — "three voters need a fourth"
+    /// — so a second one on a store that already has any peer of the region is the same
+    /// unroutable state, arriving through the other operator.
+    #[test]
+    fn a_re_issued_add_learner_does_not_place_a_second_peer_on_a_store_that_has_one() {
+        let state = placed(vec![
+            Peer::voter(1, 10),
+            Peer::voter(2, 11),
+            Peer::voter(3, 12),
+        ]);
+        assert!(
+            conf_change_for(
+                &Operator::AddLearner {
+                    region_id: 1,
+                    epoch: Epoch::INITIAL,
+                    store_id: 2,
+                    peer_id: 30,
+                },
+                &state
+            )
+            .is_none(),
+            "a columnar learner was placed on a store that already hosts a peer of this region"
+        );
+    }
 
     fn open() -> (tempfile::TempDir, Arc<Store>) {
         let dir = tempfile::tempdir().unwrap();
