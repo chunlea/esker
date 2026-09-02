@@ -1638,7 +1638,14 @@ fn lower_array(expr: &Expr) -> Result<Vec<plan::Expr>> {
                 .collect()),
             _ => Err(SqlError::unsupported(format!("{expr} as an ANY operand"))),
         },
-        other => Err(SqlError::unsupported(format!("{other} as an ANY operand"))),
+        // A **column** — `a.attnum = ANY(i.indkey)`, which is how `ActiveRecord`'s
+        // `primary_keys()` reads a key. That needs an array *value*, where everything above is an
+        // array **expression** the lowering turns into an `IN` list. Named as the array rather
+        // than as the operand, so a reader searching for what is missing finds the feature and not
+        // the column that happened to be in front of it.
+        other => Err(SqlError::unsupported(format!(
+            "{other} as an ANY operand, which would need an array value where this node has only              array expressions"
+        ))),
     }
 }
 

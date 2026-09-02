@@ -1,0 +1,58 @@
+# The `ActiveRecord` schema-dump path, statement for statement -- phase 13 unit 5.
+#
+# The acceptance for this phase. Every statement `schema_dumper`, `indexes()`, `foreign_keys()`,
+# `columns()` and `primary_keys()` send, **verbatim from `activerecord-8.1.3.1`**
+# (`connection_adapters/postgresql/schema_statements.rb` and `postgresql_adapter.rb`), over a
+# fixture schema of this node's own types, put to both servers.
+#
+# Where a statement carries a piece of SQL this node has no feature for -- `ARRAY(SELECT ...)`,
+# `array_agg`, `generate_subscripts`, `col_description`, `obj_description`, `oid::regclass::text` --
+# the *rest* of it is here and the piece is named in the divergence list. That is the point of
+# putting the real statements rather than a paraphrase: what is missing is a clause, not a row, and
+# the rows behind every one of them agree.
+#
+# Captured in one session with `scratchpad/sesscap.py` inside one `BEGIN ... ROLLBACK`, and
+# replayed the same way against one node.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# WHAT THIS PINS THAT NO EARLIER UNIT COULD
+#
+#   * **The oid joins, three deep.** `pg_class t -> pg_index d -> pg_class i` in one statement, with
+#     `pg_namespace` on the side. Every unit before this asserted rows; this asserts that the rows
+#     *join*, which is the thing two views computed independently would get wrong.
+#   * **`columns()` over eighteen columns of fourteen types**, with `format_type` reading each
+#     column's own `atttypid` and `atttypmod` rather than a literal: `character varying(1024)` from
+#     a typmod of 1028, `character(3)` from 7, `timestamp(3) without time zone` from 3, and
+#     `character varying` bare from -1.
+#   * **A `bigserial`'s default read back through the join it arrives by**:
+#     `nextval('dumpy_id_seq'::regclass)` out of a `LEFT JOIN pg_attrdef`, beside seventeen columns
+#     whose `pg_get_expr` is NULL because the join matched nothing.
+#   * **`indisvalid`, `indisunique` and `indkey` for two indexes at once**, and `indkey` `7 8` --
+#     the attnums of the seventh and eighth columns, which is the number that was wrong when it was
+#     read off the wrong list.
+DROP TABLE IF EXISTS dumpy		-
+DROP TABLE IF EXISTS dumpz		-
+CREATE TABLE dumpy (id bigserial PRIMARY KEY, name character varying, settings character varying(1024), tag character(3), amount double precision, small smallint, count integer, big bigint, live boolean, blob bytea, doc json, made_at timestamp, made_at_tz timestamptz, precise timestamp(3), ratio real, note text NOT NULL, code integer DEFAULT 7, label text DEFAULT 'x')		-
+CREATE TABLE dumpz (k1 int8, k2 text, v int4, PRIMARY KEY (k1, k2))		-
+CREATE UNIQUE INDEX index_dumpy_on_name ON dumpy (name)		-
+CREATE INDEX index_dumpy_on_count_and_big ON dumpy (count, big)		-
+SELECT c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ANY (current_schemas(false)) AND c.relkind IN ('r','v','m','p','f') AND c.relname IN ('dumpy','dumpz') ORDER BY c.relname	name	dumpy ; dumpz
+SELECT c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ANY (current_schemas(false)) AND c.relname = 'dumpy' AND c.relkind IN ('r','p')	name	dumpy
+SELECT a.attname, format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid), a.attnotnull, a.atttypid, a.atttypmod FROM pg_attribute a LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE a.attrelid = '"dumpy"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum	name,text,text,boolean,oid,integer	id|bigint|nextval('dumpy_id_seq'::regclass)|t|20|-1 ; name|character varying|\N|f|1043|-1 ; settings|character varying(1024)|\N|f|1043|1028 ; tag|character(3)|\N|f|1042|7 ; amount|double precision|\N|f|701|-1 ; small|smallint|\N|f|21|-1 ; count|integer|\N|f|23|-1 ; big|bigint|\N|f|20|-1 ; live|boolean|\N|f|16|-1 ; blob|bytea|\N|f|17|-1 ; doc|json|\N|f|114|-1 ; made_at|timestamp without time zone|\N|f|1114|-1 ; made_at_tz|timestamp with time zone|\N|f|1184|-1 ; precise|timestamp(3) without time zone|\N|f|1114|3 ; ratio|real|\N|f|700|-1 ; note|text|\N|t|25|-1 ; code|integer|7|f|23|-1 ; label|text|'x'::text|f|25|-1
+SELECT a.attname, format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid), a.attnotnull, a.atttypid, a.atttypmod, attidentity, attgenerated FROM pg_attribute a LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE a.attrelid = '"dumpz"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum	name,text,text,boolean,oid,integer,"char","char"	k1|bigint|\N|t|20|-1|| ; k2|text|\N|t|25|-1|| ; v|integer|\N|f|23|-1||
+SELECT c.collname FROM pg_attribute a LEFT JOIN pg_type t ON a.atttypid = t.oid LEFT JOIN pg_collation c ON a.attcollation = c.oid AND a.attcollation <> t.typcollation WHERE a.attrelid = '"dumpy"'::regclass AND a.attnum > 0 ORDER BY a.attnum	name	\N ; \N ; \N ; \N ; \N ; \N ; \N ; \N ; \N ; \N ; \N ; \N ; \N ; \N ; \N ; \N ; \N ; \N
+SELECT distinct i.relname, d.indisunique, d.indkey, pg_get_indexdef(d.indexrelid), d.indisvalid FROM pg_class t INNER JOIN pg_index d ON t.oid = d.indrelid INNER JOIN pg_class i ON d.indexrelid = i.oid LEFT JOIN pg_namespace n ON n.oid = t.relnamespace WHERE i.relkind IN ('i','I') AND d.indisprimary = 'f' AND t.relname = 'dumpy' AND n.nspname = ANY (current_schemas(false)) ORDER BY i.relname	name,boolean,int2vector,text,boolean	index_dumpy_on_count_and_big|f|7 8|CREATE INDEX index_dumpy_on_count_and_big ON public.dumpy USING btree (count, big)|t ; index_dumpy_on_name|t|2|CREATE UNIQUE INDEX index_dumpy_on_name ON public.dumpy USING btree (name)|t
+SELECT COUNT(*) FROM pg_class t INNER JOIN pg_index d ON t.oid = d.indrelid INNER JOIN pg_class i ON d.indexrelid = i.oid LEFT JOIN pg_namespace n ON n.oid = t.relnamespace WHERE i.relkind IN ('i','I') AND i.relname = 'index_dumpy_on_name' AND t.relname = 'dumpy' AND n.nspname = ANY (current_schemas(false))	bigint	1
+SELECT conname, pg_get_constraintdef(c.oid, true) AS constraintdef, c.convalidated AS valid FROM pg_constraint c JOIN pg_class t ON c.conrelid = t.oid JOIN pg_namespace n ON n.oid = c.connamespace WHERE c.contype = 'c' AND t.relname = 'dumpy' AND n.nspname = ANY (current_schemas(false))	name,text,boolean	-
+SELECT conname, pg_get_constraintdef(c.oid) AS constraintdef, c.condeferrable, c.condeferred FROM pg_constraint c JOIN pg_class t ON c.conrelid = t.oid JOIN pg_namespace n ON n.oid = c.connamespace WHERE c.contype = 'x' AND t.relname = 'dumpy' AND n.nspname = ANY (current_schemas(false))	name,text,boolean,boolean	-
+SELECT conname, contype, pg_get_constraintdef(c.oid) FROM pg_constraint c JOIN pg_class t ON c.conrelid = t.oid JOIN pg_namespace n ON n.oid = c.connamespace WHERE c.contype = 'p' AND t.relname = 'dumpz' AND n.nspname = ANY (current_schemas(false))	name,"char",text	dumpz_pkey|p|PRIMARY KEY (k1, k2)
+SELECT column_name, ordinal_position FROM information_schema.key_column_usage WHERE table_name = 'dumpz' ORDER BY ordinal_position	name,integer	k1|1 ; k2|2
+SELECT column_name, ordinal_position FROM information_schema.key_column_usage WHERE table_name = 'dumpy' ORDER BY ordinal_position	name,integer	id|1
+SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_name = 'dumpy' ORDER BY ordinal_position	name,character varying,character varying(3),character varying	id|bigint|NO|nextval('dumpy_id_seq'::regclass) ; name|character varying|YES|\N ; settings|character varying|YES|\N ; tag|character|YES|\N ; amount|double precision|YES|\N ; small|smallint|YES|\N ; count|integer|YES|\N ; big|bigint|YES|\N ; live|boolean|YES|\N ; blob|bytea|YES|\N ; doc|json|YES|\N ; made_at|timestamp without time zone|YES|\N ; made_at_tz|timestamp with time zone|YES|\N ; precise|timestamp without time zone|YES|\N ; ratio|real|YES|\N ; note|text|NO|\N ; code|integer|YES|7 ; label|text|YES|'x'::text
+SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indrelid = '"dumpy"'::regclass AND i.indisprimary	name	id
+SELECT t2.oid::regclass::text AS to_table, c.conname AS name FROM pg_constraint c JOIN pg_class t1 ON c.conrelid = t1.oid JOIN pg_class t2 ON c.confrelid = t2.oid JOIN pg_namespace n ON c.connamespace = n.oid WHERE c.contype = 'f' AND t1.relname = 'dumpy' AND n.nspname = ANY (current_schemas(false)) ORDER BY c.conname	text,name	-
+SELECT pg_get_indexdef('index_dumpy_on_count_and_big'::regclass)	text	CREATE INDEX index_dumpy_on_count_and_big ON public.dumpy USING btree (count, big)
+SELECT pg_get_indexdef('dumpy_pkey'::regclass)	text	CREATE UNIQUE INDEX dumpy_pkey ON public.dumpy USING btree (id)
