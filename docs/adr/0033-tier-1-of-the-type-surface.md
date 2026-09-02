@@ -218,7 +218,11 @@ missing type is a decision. Tier 1 is above; the two below are **format addition
 own ADR — a key-codec encoding for the indexable ones, a columnar column encoding, goldens, old
 bytes still decoding, and the row/column differential green.
 
-**Tier 2 — new physical types.** `date`, `time`, `numeric(p, s)`, `uuid`, `json` / `jsonb`,
+**Tier 2 — new physical types.** `date` (**landed**: four bytes, days from 2000-01-01, tag 15 in
+all three tag tables; the two things it settled are that a `date` is **not** a rounded-down
+timestamp — its arithmetic answers different types and it prints without a time — and that
+`DateStyle` changes both halves of its text, so a type whose output looks fixed has four
+spellings and two readings of one literal), `time`, `numeric(p, s)`, `uuid`, `json` / `jsonb`,
 `interval`, and **arrays** (`text[]` and `integer[]` columns *and* `= ANY($1)`, which
 `ActiveRecord` uses for every `IN` with binds — four of its 36 boot statements). Two of them carry
 the hard part: `numeric`'s text parity, because PostgreSQL prints the *declared* scale exactly and

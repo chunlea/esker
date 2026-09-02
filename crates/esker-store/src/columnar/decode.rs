@@ -178,6 +178,7 @@ fn columnar_type(ty: StoredType) -> esker_columnar::ColumnType {
         StoredType::TimestampTz => esker_columnar::ColumnType::TimestampTz,
         StoredType::Timestamp => esker_columnar::ColumnType::Timestamp,
         StoredType::Double => esker_columnar::ColumnType::Double,
+        StoredType::Date => esker_columnar::ColumnType::Date,
     }
 }
 
@@ -195,6 +196,7 @@ fn value_of(datum: &Datum) -> Value {
         Datum::TimestampTz(ts) => Value::TimestampTz(*ts),
         Datum::Timestamp(ts) => Value::Timestamp(*ts),
         Datum::Double(double) => Value::Double(*double),
+        Datum::Date(day) => Value::Date(*day),
     }
 }
 

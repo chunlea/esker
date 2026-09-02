@@ -142,7 +142,8 @@ pub fn decode_column(
         | ColumnType::TimestampTz
         | ColumnType::Timestamp
         | ColumnType::Int4
-        | ColumnType::Int2 => ColumnData::Ints(integer::decode(encoding, &mut cursor, present)?),
+        | ColumnType::Int2
+        | ColumnType::Date => ColumnData::Ints(integer::decode(encoding, &mut cursor, present)?),
         ColumnType::Double => ColumnData::Doubles(double::decode(encoding, &mut cursor, present)?),
         ColumnType::Real => ColumnData::Floats(float::decode(encoding, &mut cursor, present)?),
         ColumnType::Bool => {
@@ -254,6 +255,7 @@ mod tests {
             ColumnType::Int8 => any::<i64>().prop_map(Value::Int8).boxed(),
             ColumnType::Int4 => any::<i32>().prop_map(Value::Int4).boxed(),
             ColumnType::Int2 => any::<i16>().prop_map(Value::Int2).boxed(),
+            ColumnType::Date => any::<i32>().prop_map(Value::Date).boxed(),
             ColumnType::Real => any::<u32>()
                 .prop_map(|bits| Value::Real(f32::from_bits(bits)))
                 .boxed(),

@@ -55,6 +55,9 @@ pub const DIVISION_BY_ZERO: &str = "22012";
 /// this is *not* `22P02`: the datetime types have their own condition, and a client that branches
 /// on the code would see the difference.
 pub const INVALID_DATETIME_FORMAT: &str = "22007";
+/// A cast between two types that have none. Not a *failed* cast — that is the value's own error —
+/// but a pair for which no cast exists at all, which PostgreSQL decides before it reads a value.
+pub const CANNOT_COERCE: &str = "42846";
 /// A datetime field is out of range — a thirteenth month, or an instant past the type's end.
 pub const DATETIME_FIELD_OVERFLOW: &str = "22008";
 /// A time zone displacement past `±15:59`, which is its own condition and not a field overflow.

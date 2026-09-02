@@ -124,7 +124,7 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
         }
         // Four bytes, not eight. Nothing written before `int4` existed has a column of this type,
         // so the narrower width costs no compatibility and is what `pg_type.typlen` says it is.
-        Datum::Int4(v) => out.extend_from_slice(&v.to_le_bytes()),
+        Datum::Int4(v) | Datum::Date(v) => out.extend_from_slice(&v.to_le_bytes()),
         Datum::Int2(v) => out.extend_from_slice(&v.to_le_bytes()),
         Datum::Bool(v) => out.push(u8::from(*v)),
         Datum::Double(v) => out.extend_from_slice(&v.to_le_bytes()),
@@ -280,6 +280,13 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         ColumnType::Int4 => {
             let (head, rest) = bytes.split_first_chunk::<4>().ok_or_else(truncated)?;
             (Datum::Int4(i32::from_le_bytes(*head)), rest)
+        }
+        // The same four little-endian bytes an `int4` is, which is what a `date` is on a real
+        // server too — a day count from 2000-01-01, told apart from an integer by the column's
+        // type and not by its bytes.
+        ColumnType::Date => {
+            let (head, rest) = bytes.split_first_chunk::<4>().ok_or_else(truncated)?;
+            (Datum::Date(i32::from_le_bytes(*head)), rest)
         }
         ColumnType::Int2 => {
             let (head, rest) = bytes.split_first_chunk::<2>().ok_or_else(truncated)?;
@@ -438,7 +445,7 @@ fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
         // by value and the memcomparable `i64` form already does, for every `i32` there is. A
         // second encoding would be a second thing to get wrong for no gain — a key is not a row,
         // and nothing reads its width back except the decoder beside it, which knows the type.
-        Datum::Int4(v) => codec::encode_i64(i64::from(*v), out),
+        Datum::Int4(v) | Datum::Date(v) => codec::encode_i64(i64::from(*v), out),
         Datum::Int2(v) => codec::encode_i64(i64::from(*v), out),
         // Four bytes, its own width, in the order `sort_bits_of_f32` puts floats.
         Datum::Real(v) => out.extend_from_slice(&crate::value::sort_bits_of_f32(*v).to_be_bytes()),
@@ -507,6 +514,12 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
             let value = i32::try_from(value)
                 .map_err(|_| corrupt(format!("index key holds {value}, which is not an int4")))?;
             (Datum::Int4(value), rest)
+        }
+        ColumnType::Date => {
+            let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
+            let value = i32::try_from(value)
+                .map_err(|_| corrupt(format!("index key holds {value}, which is not a date")))?;
+            (Datum::Date(value), rest)
         }
         ColumnType::Int2 => {
             let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
@@ -973,6 +986,7 @@ mod tests {
         let values: BoxedStrategy<Datum> = match ty {
             ColumnType::Int8 => any::<i64>().prop_map(Datum::Int8).boxed(),
             ColumnType::Int4 => any::<i32>().prop_map(Datum::Int4).boxed(),
+            ColumnType::Date => any::<i32>().prop_map(Datum::Date).boxed(),
             ColumnType::Int2 => any::<i16>().prop_map(Datum::Int2).boxed(),
             ColumnType::Real => prop_oneof![
                 7 => any::<f32>().prop_map(Datum::Real),

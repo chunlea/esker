@@ -40,7 +40,7 @@ const SECONDS_PER_DAY: i64 = 86_400;
 const MICROS_PER_DAY: i64 = SECONDS_PER_DAY * MICROS_PER_SECOND;
 
 /// Days from the Unix epoch to PostgreSQL's, which is where our zero is.
-const UNIX_TO_PG_EPOCH_DAYS: i64 = 10_957;
+pub(super) const UNIX_TO_PG_EPOCH_DAYS: i64 = 10_957;
 
 /// The earliest instant: 4714-11-24 00:00:00 BC, the start of Julian day 0, which is where
 /// PostgreSQL's range starts too.
@@ -185,8 +185,17 @@ pub(super) fn from_text(text: &str) -> Result<i64> {
 
     match parse_iso(body) {
         Ok(micros) if (MIN_MICROS..=MAX_MICROS).contains(&micros) => Ok(micros),
-        Ok(_) | Err(Reject::OutOfRange) => Err(SqlError::TimestampOutOfRange(text.to_owned())),
-        Err(Reject::FieldOutOfRange) => Err(SqlError::DatetimeFieldOutOfRange(text.to_owned())),
+        // **`timestamp`, not `timestamp without time zone`** — and the same word for a
+        // `timestamptz`, whose *syntax* error names the full type. Measured: PostgreSQL words
+        // this one condition with the short name for both zone variants.
+        Ok(_) | Err(Reject::OutOfRange) => Err(SqlError::DatetimeOutOfRange {
+            ty: "timestamp",
+            value: text.to_owned(),
+        }),
+        Err(Reject::FieldOutOfRange { datestyle_hint }) => Err(SqlError::DatetimeFieldOutOfRange {
+            value: text.to_owned(),
+            datestyle_hint,
+        }),
         Err(Reject::ZoneOutOfRange) => {
             Err(SqlError::TimeZoneDisplacementOutOfRange(text.to_owned()))
         }
@@ -217,7 +226,11 @@ fn invalid_format(text: &str) -> SqlError {
 enum Reject {
     Invalid,
     Unsupported(&'static str),
-    FieldOutOfRange,
+    /// A field outside its own range, with PostgreSQL's `DateStyle` hint rule
+    /// ([`crate::error::SqlError::DatetimeFieldOutOfRange`]).
+    FieldOutOfRange {
+        datestyle_hint: bool,
+    },
     ZoneOutOfRange,
     OutOfRange,
 }
@@ -243,7 +256,11 @@ fn parse_iso(body: &str) -> std::result::Result<i64, Reject> {
     }
 
     if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
-        return Err(Reject::FieldOutOfRange);
+        // The hint only where the month could have been a day, which is the rule a real server
+        // follows for both datetime types.
+        return Err(Reject::FieldOutOfRange {
+            datestyle_hint: month > 12 && month <= 31,
+        });
     }
     days_from_pg_epoch_checked(year, month, day)
         .and_then(|days| days.checked_mul(MICROS_PER_DAY))
@@ -347,11 +364,16 @@ impl<'a> Scan<'a> {
         // one microsecond past it is not. The check is on the whole time rather than on the hour,
         // which is what lets those two through and keeps `24:00:01` out.
         if !(0..=24).contains(&hour) || !(0..=59).contains(&minute) || !(0..=60).contains(&second) {
-            return Err(Reject::FieldOutOfRange);
+            // No hint: a clock field is never a date field the setting could have reordered.
+            return Err(Reject::FieldOutOfRange {
+                datestyle_hint: false,
+            });
         }
         let micros = ((hour * 60 + minute) * 60 + second) * MICROS_PER_SECOND + fraction;
         if micros > MICROS_PER_DAY {
-            return Err(Reject::FieldOutOfRange);
+            return Err(Reject::FieldOutOfRange {
+                datestyle_hint: false,
+            });
         }
         Ok((micros, self.zone()?))
     }
@@ -439,7 +461,7 @@ impl<'a> Scan<'a> {
 /// Days from 2000-01-01 to `year-month-day` in the proleptic Gregorian calendar, where year 0 is
 /// 1 BC. Howard Hinnant's `days_from_civil`, shifted to our epoch; it is exact for every year an
 /// `i64` of microseconds can reach and has no branches on leap rules.
-const fn days_from_pg_epoch(year: i64, month: i64, day: i64) -> i64 {
+pub(super) const fn days_from_pg_epoch(year: i64, month: i64, day: i64) -> i64 {
     let year = year - if month <= 2 { 1 } else { 0 };
     let era = if year >= 0 { year } else { year - 399 } / 400;
     let year_of_era = year - era * 400;
@@ -450,14 +472,17 @@ const fn days_from_pg_epoch(year: i64, month: i64, day: i64) -> i64 {
 
 /// [`days_from_pg_epoch`] for a year that may not fit, which is how a five-digit year past the
 /// range is caught before it overflows.
-fn days_from_pg_epoch_checked(year: i64, month: i64, day: i64) -> Option<i64> {
-    (-5_000_000..=5_000_000)
+pub(super) fn days_from_pg_epoch_checked(year: i64, month: i64, day: i64) -> Option<i64> {
+    // Wide enough for both types that use it: a `timestamp` stops at 294276 AD and a `date` at
+    // **5874897 AD**, which is what this bound has to clear. Everything past it is refused here so
+    // the multiplication below cannot overflow on the way to being found out of range.
+    (-6_000_000..=6_000_000)
         .contains(&year)
         .then(|| days_from_pg_epoch(year, month, day))
 }
 
 /// The inverse: the civil date `days` after 1970-01-01.
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
+pub(super) fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let shifted = days + 719_468;
     let era = if shifted >= 0 {
         shifted
@@ -475,7 +500,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (year + i64::from(month <= 2), month, day)
 }
 
-fn days_in_month(year: i64, month: i64) -> i64 {
+pub(super) fn days_in_month(year: i64, month: i64) -> i64 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,

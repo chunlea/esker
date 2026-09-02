@@ -575,6 +575,7 @@ fn column_type(ty: crate::value::ColumnType) -> esker_columnar::ColumnType {
         Row::TimestampTz => Col::TimestampTz,
         Row::Timestamp => Col::Timestamp,
         Row::Double => Col::Double,
+        Row::Date => Col::Date,
     }
 }
 
@@ -593,6 +594,7 @@ fn datum_to_value(datum: &Datum) -> esker_columnar::Value {
         Datum::TimestampTz(ts) => Value::TimestampTz(*ts),
         Datum::Timestamp(ts) => Value::Timestamp(*ts),
         Datum::Double(double) => Value::Double(*double),
+        Datum::Date(day) => Value::Date(*day),
     }
 }
 
@@ -602,6 +604,7 @@ fn value_to_datum(value: &WireValue) -> Datum {
         WireValue::Null => Datum::Null,
         WireValue::Int8(int) => Datum::Int8(*int),
         WireValue::Int4(int) => Datum::Int4(*int),
+        WireValue::Date(day) => Datum::Date(*day),
         WireValue::Int2(int) => Datum::Int2(*int),
         WireValue::Real(float) => Datum::Real(*float),
         WireValue::Text(text) => Datum::Text(text.clone()),

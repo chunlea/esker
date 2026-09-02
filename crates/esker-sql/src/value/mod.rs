@@ -29,6 +29,7 @@
 //! index key's leading byte, in a `DataRow`'s -1 length. Keeping them in one type is what lets a
 //! single `match` be exhaustive over what a column can hold.
 
+pub mod date;
 pub(crate) mod float;
 pub(crate) mod json;
 mod timestamp;
@@ -287,6 +288,7 @@ impl PgType for ColumnType {
             ColumnType::Double => 701,
             ColumnType::Timestamp => 1114,
             ColumnType::TimestampTz => 1184,
+            ColumnType::Date => 1082,
         }
     }
 
@@ -306,13 +308,14 @@ impl PgType for ColumnType {
             ColumnType::Timestamp => "timestamp without time zone",
             ColumnType::Double => "double precision",
             ColumnType::Real => "real",
+            ColumnType::Date => "date",
         }
     }
 
     fn type_len(self) -> i16 {
         match self {
             ColumnType::Bool => 1,
-            ColumnType::Int4 | ColumnType::Real => 4,
+            ColumnType::Int4 | ColumnType::Real | ColumnType::Date => 4,
             ColumnType::Int2 => 2,
             ColumnType::Int8
             | ColumnType::TimestampTz
@@ -403,6 +406,7 @@ impl PgDatum for Datum {
             Datum::Timestamp(v) => timestamp::to_text_without_zone(*v),
             Datum::Double(v) => float::to_text(*v),
             Datum::Real(v) => float::to_text_f32(*v),
+            Datum::Date(v) => date::to_text(*v),
         })
     }
 
@@ -428,6 +432,11 @@ impl PgDatum for Datum {
             ColumnType::Timestamp => Datum::Timestamp(timestamp::from_text_without_zone(text)?),
             ColumnType::Double => Datum::Double(float::from_text(text)?),
             ColumnType::Real => Datum::Real(float::from_text_f32(text)?),
+            // The clock words -- `today`, `tomorrow` -- need an instant, and this function has
+            // none: a value read from a wire parameter or a stored literal is not the place a
+            // session's clock enters. `crate::exec` resolves them where it has the transaction's
+            // start timestamp, which is the only clock this crate is allowed to read (DESIGN §6).
+            ColumnType::Date => Datum::Date(date::from_text(text, 0)?),
         })
     }
 
@@ -437,7 +446,8 @@ impl PgDatum for Datum {
             Datum::Int8(v) | Datum::TimestampTz(v) | Datum::Timestamp(v) => {
                 v.to_be_bytes().to_vec()
             }
-            Datum::Int4(v) => v.to_be_bytes().to_vec(),
+            // Four big-endian bytes for both, which is what `int4send` and `date_send` write.
+            Datum::Int4(v) | Datum::Date(v) => v.to_be_bytes().to_vec(),
             Datum::Int2(v) => v.to_be_bytes().to_vec(),
             Datum::Bool(v) => vec![u8::from(*v)],
             Datum::Double(v) => v.to_be_bytes().to_vec(),
@@ -477,6 +487,10 @@ impl PgDatum for Datum {
             ColumnType::Real => {
                 let head: [u8; 4] = fixed(4)?.try_into().unwrap_or([0; 4]);
                 Datum::Real(f32::from_be_bytes(head))
+            }
+            ColumnType::Date => {
+                let head: [u8; 4] = fixed(4)?.try_into().unwrap_or([0; 4]);
+                Datum::Date(i32::from_be_bytes(head))
             }
             ColumnType::Int2 => {
                 let head: [u8; 2] = fixed(2)?.try_into().unwrap_or([0; 2]);
@@ -521,7 +535,17 @@ impl PgDatum for Datum {
             // Across the two widths, because PostgreSQL has an `int4 = int8` operator and answers
             // `1::integer = 1::bigint` with `t`. Widening is exact in this direction, so there is
             // no rounding to argue about — an `i32` is an `i64`.
-            (Datum::Int4(a), Datum::Int4(b)) => a.cmp(b),
+            // **A date is the midnight it names**, which is how `'2020-01-01'::date =
+            // '2020-01-01'::timestamp` is `t` on a real server. The infinities are the ends of
+            // both types and stay at the ends after the promotion, so the comparison is total
+            // without a special case for them.
+            (Datum::Date(a), Datum::Timestamp(b) | Datum::TimestampTz(b)) => {
+                date::as_micros(*a).cmp(b)
+            }
+            (Datum::Timestamp(a) | Datum::TimestampTz(a), Datum::Date(b)) => {
+                a.cmp(&date::as_micros(*b))
+            }
+            (Datum::Int4(a), Datum::Int4(b)) | (Datum::Date(a), Datum::Date(b)) => a.cmp(b),
             (Datum::Int2(a), Datum::Int2(b)) => a.cmp(b),
             (Datum::Int2(a), Datum::Int4(b)) => i32::from(*a).cmp(b),
             (Datum::Int4(a), Datum::Int2(b)) => a.cmp(&i32::from(*b)),
@@ -556,7 +580,7 @@ fn variant_rank(value: &Datum) -> u8 {
         // answers the pair above rather than falling through to here.
         Datum::Int8(_) | Datum::Int4(_) | Datum::Int2(_) => 1,
         Datum::Double(_) | Datum::Real(_) => 2,
-        Datum::TimestampTz(_) | Datum::Timestamp(_) => 3,
+        Datum::TimestampTz(_) | Datum::Timestamp(_) | Datum::Date(_) => 3,
         Datum::Text(_) => 4,
         Datum::Bytea(_) => 5,
         Datum::Null => 6,

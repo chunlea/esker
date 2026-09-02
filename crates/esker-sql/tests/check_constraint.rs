@@ -149,4 +149,3 @@ fn a_constraint_added_later_binds_later_rows() {
     let error = node.run("INSERT INTO ck VALUES (2, -1)").unwrap_err();
     assert_eq!(error.sqlstate(), "23514");
 }
-

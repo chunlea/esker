@@ -122,7 +122,8 @@ impl ColumnData {
             | ColumnType::TimestampTz
             | ColumnType::Timestamp
             | ColumnType::Int4
-            | ColumnType::Int2 => ColumnData::Ints(Vec::new()),
+            | ColumnType::Int2
+            | ColumnType::Date => ColumnData::Ints(Vec::new()),
             ColumnType::Double => ColumnData::Doubles(Vec::new()),
             // A `Real` gets its **own** run rather than riding in the doubles one widened, which
             // is the one place the integer trick above does not carry over: widening an `f32` is
@@ -172,6 +173,7 @@ impl ColumnData {
                     | ColumnType::Timestamp
                     | ColumnType::Int4
                     | ColumnType::Int2
+                    | ColumnType::Date
             ) | (ColumnData::Doubles(_), ColumnType::Double)
                 | (ColumnData::Floats(_), ColumnType::Real)
                 | (ColumnData::Bools(_), ColumnType::Bool)
@@ -413,7 +415,8 @@ impl ColumnBuilder {
         match value {
             Value::Null => {}
             Value::Int8(v) | Value::TimestampTz(v) | Value::Timestamp(v) => self.ints.push(*v),
-            Value::Int4(v) => self.ints.push(i64::from(*v)),
+            // A day is an integer to the encoder, the way a timestamp is: the schema says which.
+            Value::Int4(v) | Value::Date(v) => self.ints.push(i64::from(*v)),
             Value::Int2(v) => self.ints.push(i64::from(*v)),
             Value::Double(v) => self.doubles.push(*v),
             Value::Real(v) => self.floats.push(*v),
@@ -465,7 +468,8 @@ impl ColumnBuilder {
             | ColumnType::TimestampTz
             | ColumnType::Timestamp
             | ColumnType::Int4
-            | ColumnType::Int2 => ColumnData::Ints(std::mem::take(&mut self.ints)),
+            | ColumnType::Int2
+            | ColumnType::Date => ColumnData::Ints(std::mem::take(&mut self.ints)),
             ColumnType::Double => ColumnData::Doubles(std::mem::take(&mut self.doubles)),
             ColumnType::Real => ColumnData::Floats(std::mem::take(&mut self.floats)),
             ColumnType::Bool => ColumnData::Bools(std::mem::take(&mut self.bools)),

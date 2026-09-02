@@ -151,11 +151,18 @@ pub enum ColumnType {
     /// shortest digits that round-trip at 32 bits — and because a value a `double` holds is
     /// `22003` here at both ends of the range.
     Real,
+    /// PostgreSQL's `date`: a **day**, stored as a signed count of days from 2000-01-01 — the same
+    /// four bytes and the same epoch a real server uses.
+    ///
+    /// Tier 2's first type, and a distinct one rather than a [`ColumnType::Timestamp`] rounded
+    /// down: a `date` has no time in it at all, prints without one, and its arithmetic answers
+    /// different types from a timestamp's (`date - date` is an `integer`).
+    Date,
 }
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 14] = [
+    pub const ALL: [ColumnType; 15] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -170,6 +177,7 @@ impl ColumnType {
         ColumnType::Timestamp,
         ColumnType::Double,
         ColumnType::Real,
+        ColumnType::Date,
     ];
 }
 
@@ -210,6 +218,9 @@ pub enum Datum {
     /// [`Datum::TimestampTz`], and a separate variant because the two print differently and a
     /// value has to know which it is.
     Timestamp(i64),
+    /// [`ColumnType::Date`], in days from 2000-01-01. PostgreSQL's own representation, including
+    /// the infinities, which to this crate are ordinary `i32` sentinels.
+    Date(i32),
 }
 
 impl PartialEq for Datum {
@@ -219,7 +230,7 @@ impl PartialEq for Datum {
             (Datum::Int8(a), Datum::Int8(b)) | (Datum::TimestampTz(a), Datum::TimestampTz(b)) => {
                 a == b
             }
-            (Datum::Int4(a), Datum::Int4(b)) => a == b,
+            (Datum::Int4(a), Datum::Int4(b)) | (Datum::Date(a), Datum::Date(b)) => a == b,
             (Datum::Int2(a), Datum::Int2(b)) => a == b,
             (Datum::Timestamp(a), Datum::Timestamp(b)) => a == b,
             (Datum::Text(a), Datum::Text(b)) => a == b,
@@ -244,6 +255,7 @@ impl Datum {
             Datum::Null => return None,
             Datum::Int8(_) => ColumnType::Int8,
             Datum::Int4(_) => ColumnType::Int4,
+            Datum::Date(_) => ColumnType::Date,
             Datum::Int2(_) => ColumnType::Int2,
             Datum::Real(_) => ColumnType::Real,
             Datum::Timestamp(_) => ColumnType::Timestamp,

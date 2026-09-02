@@ -80,6 +80,8 @@ pub enum ColumnType {
     Double,
     /// IEEE-754 binary32; PostgreSQL's `real`.
     Real,
+    /// PostgreSQL's `date`: a day, as a signed count from 2000-01-01 in four bytes.
+    Date,
     /// PostgreSQL's `character(n)`, whose internal name is `bpchar`. The same bytes as a `Text`
     /// again; what differs is that its values arrive **already padded** to the column's length, so
     /// byte comparison is the blank-insensitive comparison PostgreSQL specifies.
@@ -94,7 +96,7 @@ pub enum ColumnType {
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 14] = [
+    pub const ALL: [ColumnType; 15] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -109,6 +111,7 @@ impl ColumnType {
         ColumnType::Bpchar,
         ColumnType::Json,
         ColumnType::Jsonb,
+        ColumnType::Date,
     ];
 
     /// The tag byte this type is stored as. Frozen: see the module docs.
@@ -130,6 +133,7 @@ impl ColumnType {
             ColumnType::Bpchar => 12,
             ColumnType::Json => 13,
             ColumnType::Jsonb => 14,
+            ColumnType::Date => 15,
         }
     }
 
@@ -150,6 +154,7 @@ impl ColumnType {
             12 => ColumnType::Bpchar,
             13 => ColumnType::Json,
             14 => ColumnType::Jsonb,
+            15 => ColumnType::Date,
             other => {
                 return Err(Error::corruption(
                     "schema",
@@ -177,6 +182,7 @@ impl ColumnType {
             ColumnType::Bpchar => "character",
             ColumnType::Json => "json",
             ColumnType::Jsonb => "jsonb",
+            ColumnType::Date => "date",
         }
     }
 
@@ -220,6 +226,8 @@ pub enum Value {
     Double(f64),
     /// A [`ColumnType::Real`].
     Real(f32),
+    /// A [`ColumnType::Date`], days from 2000-01-01.
+    Date(i32),
 }
 
 impl Value {
@@ -247,6 +255,7 @@ impl Value {
             Value::Timestamp(_) => ty == ColumnType::Timestamp,
             Value::Double(_) => ty == ColumnType::Double,
             Value::Real(_) => ty == ColumnType::Real,
+            Value::Date(_) => ty == ColumnType::Date,
         }
     }
 
@@ -271,6 +280,7 @@ impl Value {
             Value::Timestamp(_) => ColumnType::Timestamp,
             Value::Double(_) => ColumnType::Double,
             Value::Real(_) => ColumnType::Real,
+            Value::Date(_) => ColumnType::Date,
         })
     }
 
@@ -280,7 +290,8 @@ impl Value {
         match self {
             Value::Null => ValueRef::Null,
             Value::Int8(v) | Value::TimestampTz(v) | Value::Timestamp(v) => ValueRef::Int(*v),
-            Value::Int4(v) => ValueRef::Int(i64::from(*v)),
+            // A day is an integer to the encoder, the way a timestamp is: the schema says which.
+            Value::Int4(v) | Value::Date(v) => ValueRef::Int(i64::from(*v)),
             Value::Int2(v) => ValueRef::Int(i64::from(*v)),
             Value::Bool(v) => ValueRef::Bool(*v),
             Value::Double(v) => ValueRef::Double(*v),
@@ -399,6 +410,12 @@ impl ValueRef<'_> {
             // there is no widened value that might not have been written by an `f32` and nothing
             // for a `NaN` payload to be lost to.
             (ValueRef::Real(v), ColumnType::Real) => Value::Real(v),
+            // Narrowed back the way an `Int4` is, and for the same reason: a value outside `i32`
+            // cannot have been written by a `Date` column.
+            (ValueRef::Int(v), ColumnType::Date) => Value::Date(
+                i32::try_from(v)
+                    .map_err(|_| Error::corruption("column", format!("a date column holds {v}")))?,
+            ),
             (ValueRef::Bytes(v), ColumnType::Bytea) => Value::Bytea(v.to_vec()),
             (
                 ValueRef::Bytes(v),
@@ -554,6 +571,7 @@ mod tests {
         assert_eq!(ColumnType::Int2.tag(), 10);
         assert_eq!(ColumnType::Real.tag(), 11);
         assert_eq!(ColumnType::Bpchar.tag(), 12);
+        assert_eq!(ColumnType::Date.tag(), 15);
 
         for ty in ColumnType::ALL {
             assert_eq!(ColumnType::from_tag(ty.tag()).unwrap(), ty);

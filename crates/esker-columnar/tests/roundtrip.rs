@@ -90,6 +90,7 @@ fn value_of(ty: ColumnType) -> impl Strategy<Value = Value> {
         ColumnType::Int8 => any::<i64>().prop_map(Value::Int8).boxed(),
         ColumnType::Int4 => any::<i32>().prop_map(Value::Int4).boxed(),
         ColumnType::Int2 => any::<i16>().prop_map(Value::Int2).boxed(),
+        ColumnType::Date => any::<i32>().prop_map(Value::Date).boxed(),
         ColumnType::Real => any::<u32>()
             .prop_map(|bits| Value::Real(f32::from_bits(bits)))
             .boxed(),

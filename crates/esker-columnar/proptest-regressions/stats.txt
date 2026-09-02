@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 6eee718271a27d25ad4ba0e866002bbde087285aba3e2049b1d5c0fa5ca969e3 # shrinks to values = [Double(NaN), Double(-0.0)]
 cc 4ce8222e82341b1f9e4a21dec5da86368563c78662599a1f30dd9d463da40f4d # shrinks to (ty, values) = (Int4, [Int4(0)])
+cc 8180909acfe0b864c729dc5784a7088bb622ea89687e7374a3f989286c9f2448 # shrinks to (ty, values) = (Date, [Date(0)])

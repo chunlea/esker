@@ -185,6 +185,10 @@ fn activerecord_s_four_type_map_queries_answer() {
             // `bpchar` is `character(n)`'s internal name and is in this query's list of forty.
             vec!["1042", "bpchar", "0", ",", "bpcharin", "\\N", "b", "0"],
             vec!["1043", "varchar", "0", ",", "varcharin", "\\N", "b", "0"],
+            // `date` is in `ActiveRecord`'s list of forty and arrived with tier 2's first
+            // type — added to `ColumnType::ALL` and nowhere else, which is what "the catalog
+            // derives itself" means: no row was written here by hand.
+            vec!["1082", "date", "0", ",", "date_in", "\\N", "b", "0"],
             vec![
                 "1114",
                 "timestamp",

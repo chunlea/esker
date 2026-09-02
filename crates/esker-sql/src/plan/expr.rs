@@ -655,6 +655,10 @@ impl Literal {
                 | ColumnType::Bytea
                 | ColumnType::TimestampTz
                 | ColumnType::Timestamp
+                // **A date is not a number.** `1::date` is `42846 cannot cast type integer to
+                // date` on a real server; the Julian day is an implementation detail with no cast
+                // to reach it, in either direction.
+                | ColumnType::Date
                 // Neither takes a number or a boolean: `INSERT INTO t (j) VALUES (1)` is a type
                 // mismatch on a real server, not a one-element document.
                 | ColumnType::Json
@@ -701,6 +705,7 @@ impl Literal {
                 ColumnType::Bool
                 | ColumnType::Bytea
                 | ColumnType::TimestampTz
+                | ColumnType::Date
                 // A number is not a document, whichever way it is written.
                 | ColumnType::Json
                 | ColumnType::Jsonb
@@ -729,6 +734,7 @@ impl Literal {
                 // assignment cast from one to `json`.
                 | ColumnType::Json
                 | ColumnType::Jsonb
+                | ColumnType::Date
                 | ColumnType::Real => mismatch(),
             },
         }

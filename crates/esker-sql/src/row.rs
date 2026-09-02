@@ -48,6 +48,20 @@ mod tests {
                 .prop_map(Datum::Real),
             ]
             .boxed(),
+            // Weighted towards the ends and the infinities, which is where a key encoding that
+            // widened a day into an `i64` the wrong way would show it.
+            ColumnType::Date => prop_oneof![
+                7 => any::<i32>().prop_map(Datum::Date),
+                3 => proptest::sample::select(vec![
+                    crate::value::date::MIN_DAY,
+                    crate::value::date::MAX_DAY,
+                    crate::value::date::POS_INFINITY,
+                    crate::value::date::NEG_INFINITY,
+                    0,
+                ])
+                .prop_map(Datum::Date),
+            ]
+            .boxed(),
             ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => {
                 ".{0,32}".prop_map(Datum::Text).boxed()
             }

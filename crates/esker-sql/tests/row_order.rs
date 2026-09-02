@@ -87,6 +87,7 @@ fn column_type(name: &str) -> ColumnType {
         // Its values are captured already padded, which is what a `character(n)` stores.
         "bpchar" => ColumnType::Bpchar,
         "timestamp" => ColumnType::Timestamp,
+        "date" => ColumnType::Date,
         "bool" => ColumnType::Bool,
         "bytea" => ColumnType::Bytea,
         "timestamptz" => ColumnType::TimestampTz,

@@ -102,6 +102,7 @@ fn type_of(value: &Value) -> Option<ValueType> {
         Value::TimestampTz(_) => ValueType::TimestampTz,
         Value::Timestamp(_) => ValueType::Timestamp,
         Value::Double(_) => ValueType::Double,
+        Value::Date(_) => ValueType::Date,
     })
 }
 
@@ -118,6 +119,7 @@ fn value_of(value: &Value) -> WireValue {
         Value::TimestampTz(ts) => WireValue::TimestampTz(*ts),
         Value::Timestamp(ts) => WireValue::Timestamp(*ts),
         Value::Double(double) => WireValue::Double(*double),
+        Value::Date(day) => WireValue::Date(*day),
     }
 }
 

@@ -97,6 +97,9 @@ pub enum ValueType {
     Real,
     /// A 16-bit signed integer.
     Int2,
+    /// A day, as a signed count from 2000-01-01: PostgreSQL's `date`. Four bytes, appended by
+    /// tier 2's first type and never renumbered, for the reason `Int4` gives above.
+    Date,
     /// A 32-bit signed integer.
     ///
     /// Appended by [ADR 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md), never
@@ -107,7 +110,7 @@ pub enum ValueType {
 
 impl ValueType {
     /// Every type, so a test cannot silently skip one.
-    pub const ALL: [ValueType; 10] = [
+    pub const ALL: [ValueType; 11] = [
         ValueType::Int8,
         ValueType::Int4,
         ValueType::Int2,
@@ -118,6 +121,7 @@ impl ValueType {
         ValueType::Bytea,
         ValueType::TimestampTz,
         ValueType::Double,
+        ValueType::Date,
     ];
 
     /// The tag byte. Frozen — see the type's docs.
@@ -134,6 +138,7 @@ impl ValueType {
             ValueType::Timestamp => 8,
             ValueType::Int2 => 9,
             ValueType::Real => 10,
+            ValueType::Date => 11,
         }
     }
 
@@ -150,6 +155,7 @@ impl ValueType {
             8 => ValueType::Timestamp,
             9 => ValueType::Int2,
             10 => ValueType::Real,
+            11 => ValueType::Date,
             _ => return Err(DecodeError::invalid("result.type", "unknown type tag")),
         })
     }
@@ -184,6 +190,8 @@ pub enum Value {
     Real(f32),
     /// [`ValueType::Timestamp`].
     Timestamp(i64),
+    /// [`ValueType::Date`].
+    Date(i32),
 }
 
 impl Value {
@@ -202,6 +210,7 @@ impl Value {
             Value::Int2(_) => ValueType::Int2,
             Value::Real(_) => ValueType::Real,
             Value::Timestamp(_) => ValueType::Timestamp,
+            Value::Date(_) => ValueType::Date,
         })
     }
 
@@ -227,6 +236,11 @@ impl Value {
             Value::Real(v) => {
                 out.put_u8(ValueType::Real.tag());
                 out.put_u32(v.to_bits());
+            }
+            // Four bytes, like an `Int4`, because a day count is one.
+            Value::Date(v) => {
+                out.put_u8(ValueType::Date.tag());
+                out.put_u32(u32::from_le_bytes(v.to_le_bytes()));
             }
             // Its own width on the wire, as it is on disk: four bytes, so a reader that knows the
             // tag cannot mistake the framing.
@@ -279,6 +293,9 @@ impl Value {
             )),
             ValueType::Int2 => Value::Int2(i16::from_le_bytes(
                 input.get_u16("result.value.int2")?.to_le_bytes(),
+            )),
+            ValueType::Date => Value::Date(i32::from_le_bytes(
+                input.get_u32("result.value.date")?.to_le_bytes(),
             )),
             ValueType::Bool => Value::Bool(input.get_bool("result.value.bool")?),
             ValueType::Text => Value::Text(input.get_str("result.value.text")?.to_owned()),

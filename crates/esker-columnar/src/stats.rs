@@ -118,6 +118,9 @@ impl Bound {
             ColumnType::Real => Value::Real(f32::from_le_bytes(
                 <[u8; 4]>::try_from(self.bytes.as_slice()).ok()?,
             )),
+            ColumnType::Date => Value::Date(i32::from_le_bytes(
+                <[u8; 4]>::try_from(self.bytes.as_slice()).ok()?,
+            )),
             ColumnType::Bool => Value::Bool(self.as_bool()?),
             ColumnType::Text
             | ColumnType::Varchar
@@ -267,7 +270,7 @@ impl ColumnStats {
             | ColumnType::Timestamp
             | ColumnType::Double => Some(8),
             // Each at its own width, which is what makes it a different type.
-            ColumnType::Int4 | ColumnType::Real => Some(4),
+            ColumnType::Int4 | ColumnType::Real | ColumnType::Date => Some(4),
             ColumnType::Int2 => Some(2),
             ColumnType::Bool => Some(1),
             ColumnType::Text
@@ -426,6 +429,13 @@ fn int_bound(value: i64, ty: ColumnType) -> Vec<u8> {
             |narrow| narrow.to_le_bytes().to_vec(),
         ),
         ColumnType::Int2 => i16::try_from(value).map_or_else(
+            |_| value.to_le_bytes().to_vec(),
+            |narrow| narrow.to_le_bytes().to_vec(),
+        ),
+        // A `date` rides in the same widened run and is four bytes at its own width, like an
+        // `int4` — which `ColumnStats::fit` checks, so a bound left at eight would be rejected
+        // rather than silently excluding rows.
+        ColumnType::Date => i32::try_from(value).map_or_else(
             |_| value.to_le_bytes().to_vec(),
             |narrow| narrow.to_le_bytes().to_vec(),
         ),
@@ -770,6 +780,7 @@ mod tests {
             ColumnType::Int8 => any::<i64>().prop_map(Value::Int8).boxed(),
             ColumnType::Int4 => any::<i32>().prop_map(Value::Int4).boxed(),
             ColumnType::Int2 => any::<i16>().prop_map(Value::Int2).boxed(),
+            ColumnType::Date => any::<i32>().prop_map(Value::Date).boxed(),
             ColumnType::Real => prop_oneof![
                 Just(Value::Real(f32::NAN)),
                 Just(Value::Real(-0.0)),
@@ -832,6 +843,13 @@ mod tests {
                 Value::Int2(v) => {
                     let read = |bound: &Bound| match bound.as_value(ColumnType::Int2) {
                         Some(Value::Int2(value)) => Some(value),
+                        _ => None,
+                    };
+                    read(min) <= Some(*v) && Some(*v) <= read(max)
+                }
+                Value::Date(v) => {
+                    let read = |bound: &Bound| match bound.as_value(ColumnType::Date) {
+                        Some(Value::Date(value)) => Some(value),
                         _ => None,
                     };
                     read(min) <= Some(*v) && Some(*v) <= read(max)

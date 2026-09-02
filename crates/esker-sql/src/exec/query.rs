@@ -1635,7 +1635,11 @@ fn same_family(left: ColumnType, right: ColumnType) -> bool {
             ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => 1,
             ColumnType::Bool => 2,
             ColumnType::Bytea => 3,
-            ColumnType::TimestampTz | ColumnType::Timestamp => 4,
+            // A `date` is in the datetime family, not one of its own: `'2020-01-01'::date =
+            // '2020-01-01'::timestamp` is `t` on a real server, and `pg_cmp` promotes the day to
+            // the midnight it names to answer it. `date = integer` is `42883` there, which is what
+            // keeping it out of family 0 says.
+            ColumnType::TimestampTz | ColumnType::Timestamp | ColumnType::Date => 4,
             // `jsonb` **is** ordered -- `=`, `<>` and `<` all work and `ORDER BY` sorts by it --
             // and it is its own family: `json = jsonb` is `42883` like everything else about
             // `json`, and there is no implicit cast between `jsonb` and `text`. Measured.
@@ -1693,6 +1697,23 @@ fn reconcile(op: BinaryOp, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
             ),
             None => (left, right),
         },
+        // **Two literals that both have a type, and no operator between them.** The column case
+        // is checked where a literal meets an `Ordinal`; this is the same rule for the case where
+        // neither side is a column, and without it `'2020-01-01'::date = 1` compares a `Datum` to
+        // a `Datum`, falls through `pg_cmp`'s cross-variant order and answers **`f`** — a value
+        // where a real server raises, which is the worst class ADR 0031 ranks.
+        (Expr::Literal(left_literal), Expr::Literal(right_literal)) => {
+            match (literal_type(left_literal), literal_type(right_literal)) {
+                (Some(a), Some(b)) if !same_family(a, b) => {
+                    return Err(SqlError::UndefinedOperator {
+                        left: a.name(),
+                        op: op.symbol(),
+                        right: b.name(),
+                    });
+                }
+                _ => (left, right),
+            }
+        }
         _ => (left, right),
     })
 }

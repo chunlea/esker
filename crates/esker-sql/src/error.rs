@@ -331,14 +331,45 @@ pub enum SqlError {
         value: String,
     },
 
-    /// A datetime field is outside its own range — a thirteenth month, a thirtieth of February.
-    #[error("date/time field value out of range: \"{0}\"")]
-    DatetimeFieldOutOfRange(String),
+    /// Two types with no cast between them: `42846`.
+    ///
+    /// Decided **before** a value is read, which is what makes it different from an input error.
+    /// `'2020-01-01'::date::int` is this on a real server and not a `22P02` about the digits —
+    /// the Julian day a `date` holds is an implementation detail with no cast to reach it, in
+    /// either direction.
+    #[error("cannot cast type {from} to {to}")]
+    CannotCast {
+        /// The source type, as PostgreSQL names it in the message.
+        from: &'static str,
+        /// The target type.
+        to: &'static str,
+    },
 
-    /// Every field was in range and the instant they name is not: past 294276 AD, or before
-    /// 4714 BC.
-    #[error("timestamp out of range: \"{0}\"")]
-    TimestampOutOfRange(String),
+    /// A datetime field is outside its own range — a thirteenth month, a thirtieth of February.
+    #[error("date/time field value out of range: \"{value}\"")]
+    DatetimeFieldOutOfRange {
+        /// The text that could not be read.
+        value: String,
+        /// Whether to add PostgreSQL's `DateStyle` hint.
+        ///
+        /// **It appears only when the offending field could have been a day.** `2020-13-01` gets
+        /// it, because a 13 is a plausible day under `DMY` and the user may have meant one;
+        /// `2020-02-30` does not, because a 30 is not a plausible month under anything. Measured
+        /// for `date` and for `timestamp`, which follow the same rule.
+        datestyle_hint: bool,
+    },
+
+    /// Every field was in range and the day or instant they name is not: past 294276 AD for a
+    /// `timestamp`, past 5874897 AD for a `date`, or before 4714 BC for either.
+    #[error("{ty} out of range: \"{value}\"")]
+    DatetimeOutOfRange {
+        /// The type name **as this message spells it**, which is not always the type's own name:
+        /// `timestamp out of range` for both zone variants, where their syntax errors say
+        /// `timestamp without time zone` and `timestamp with time zone`. Measured.
+        ty: &'static str,
+        /// The text that could not be read.
+        value: String,
+    },
 
     /// A time zone displacement past `±15:59`. Its own condition, not a field overflow.
     #[error("time zone displacement out of range: \"{0}\"")]
@@ -1000,7 +1031,8 @@ impl SqlError {
             | SqlError::BigintOutOfRange
             | SqlError::SetvalOutOfBounds { .. } => sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
             SqlError::InvalidDatetimeFormat { .. } => sqlstate::INVALID_DATETIME_FORMAT,
-            SqlError::DatetimeFieldOutOfRange(_) | SqlError::TimestampOutOfRange(_) => {
+            SqlError::CannotCast { .. } => sqlstate::CANNOT_COERCE,
+            SqlError::DatetimeFieldOutOfRange { .. } | SqlError::DatetimeOutOfRange { .. } => {
                 sqlstate::DATETIME_FIELD_OVERFLOW
             }
             SqlError::TimeZoneDisplacementOutOfRange(_) => {
@@ -1171,6 +1203,10 @@ impl SqlError {
                 )
             }
             SqlError::GeneratedAlways { .. } => Some("Use OVERRIDING SYSTEM VALUE to override.".to_owned()),
+            SqlError::DatetimeFieldOutOfRange {
+                datestyle_hint: true,
+                ..
+            } => Some("Perhaps you need a different \"DateStyle\" setting.".to_owned()),
             // The hint names a form this node does not have — `DROP … CASCADE` is `0A000` here —
             // and it is still the right sentence: it is what a real server says, and it is what
             // the user has to write once that unit lands. Saying something else would send them

@@ -1423,6 +1423,16 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
         Expr::Cast {
             expr, data_type, ..
         } => lower_cast(expr, data_type),
+        // `DATE '2020-01-01'` and `TIMESTAMP '…'`: SQL's typed-literal spelling, which is the
+        // **same thing** as the cast written the other way round — a real server records no
+        // difference between `DATE 'x'` and `'x'::date`, so neither does this.
+        Expr::TypedString(typed) => lower_cast(
+            &Expr::Value(
+                Value::SingleQuotedString(typed.value.clone().into_string().unwrap_or_default())
+                    .into(),
+            ),
+            &typed.data_type,
+        ),
         // The five spellings of a subquery in an expression. Each carries the sub-select lowered
         // the same way the outer one is -- `lower_query` refuses inside a subquery exactly what it
         // refuses outside one, so a `WITH` or a second `JOIN` in there is the same `0A000` by the
@@ -2088,6 +2098,14 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
         // of that type would. Only a literal, and only a chain of them — `'{"a":1}'::json::jsonb`
         // is two of these — because a cast of a *column* has to happen per row and this node has
         // no expression-level cast to do it with.
+        // **A cast that does not exist is `42846`, before any value is read.** A `date` and a
+        // number have none in either direction — the day count it holds is an implementation
+        // detail — and neither does a `date` and a `json`. Without this the cast would go through
+        // text and answer `22P02` about the digits, which blames the value for a pair that has no
+        // cast at all.
+        if let Some(refusal) = refused_cast(expr, data_type)? {
+            return Err(refusal);
+        }
         return match cast_literal_text(expr)? {
             Some(text) => {
                 // **The typmod applies**, which is the whole difference between `::timestamp` and
@@ -2231,6 +2249,56 @@ fn is_comparison(op: &BinaryOperator) -> bool {
             | BinaryOperator::Gt
             | BinaryOperator::GtEq
     )
+}
+
+/// The `42846` a pair of types with no cast between them gets, or `None` for a pair that has one.
+///
+/// Only the pairs a `date` is one half of, because it is the only type here that PostgreSQL
+/// refuses to cast to a number: every other pair in this crate either has a cast or fails on the
+/// value. Both directions, measured — `'2020-01-01'::date::int` and `1::date`.
+fn refused_cast(expr: &Expr, data_type: &DataType) -> Result<Option<SqlError>> {
+    let target = lower_type(data_type).ok().map(|(ty, _)| ty);
+    let source = source_type(expr)?;
+    let numeric = |ty: ColumnType| {
+        matches!(
+            ty,
+            ColumnType::Int8
+                | ColumnType::Int4
+                | ColumnType::Int2
+                | ColumnType::Double
+                | ColumnType::Real
+                | ColumnType::Json
+                | ColumnType::Jsonb
+        )
+    };
+    Ok(match (source, target) {
+        (Some(ColumnType::Date), Some(to)) if numeric(to) => Some(SqlError::CannotCast {
+            from: ColumnType::Date.name(),
+            to: to.name(),
+        }),
+        (Some(from), Some(ColumnType::Date)) if numeric(from) => Some(SqlError::CannotCast {
+            from: from.name(),
+            to: ColumnType::Date.name(),
+        }),
+        _ => None,
+    })
+}
+
+/// The type a cast's operand already has, for the pairs [`refused_cast`] decides between.
+///
+/// A bare number is `integer` — PostgreSQL's type for an unadorned constant, and the one it names
+/// in `cannot cast type integer to date`. A string literal is `unknown` and has no type to refuse
+/// a cast from, which is why `'2020-01-01'::date` is a value and `1::date` is not.
+fn source_type(expr: &Expr) -> Result<Option<ColumnType>> {
+    Ok(match expr {
+        Expr::Nested(inner) => source_type(inner)?,
+        Expr::Value(value) => match &value.value {
+            Value::Number(..) => Some(ColumnType::Int4),
+            _ => None,
+        },
+        Expr::Cast { data_type, .. } => lower_type(data_type).ok().map(|(ty, _)| ty),
+        _ => None,
+    })
 }
 
 /// The text a literal — or a chain of casts over one — carries, for a cast to read.
@@ -2988,6 +3056,10 @@ fn lower_plain_type(data_type: &DataType) -> Result<ColumnType> {
         DataType::Timestamp(None, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
             ColumnType::Timestamp
         }
+        // `date` takes no typmod at all — `format_type(1082, 3)` prints `date(3)` on a real
+        // server and `CREATE TABLE t (d date(3))` is a syntax error there, so the number has
+        // nowhere to come from and nothing here produces one.
+        DataType::Date => ColumnType::Date,
         // `bigserial` and `serial` are `bigint`/`integer` plus a sequence, and `sqlparser` 0.62
         // has no variant for either -- both arrive as a custom type name. `smallserial` arrives
         // the same way and falls through to the refusal below until `int2` lands, which names
