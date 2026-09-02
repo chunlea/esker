@@ -47,7 +47,7 @@ use std::borrow::Cow;
 
 use crate::backend::Txn;
 use crate::catalog::pg_relations::{RelKind, RelationRow, Relations};
-use crate::catalog::{ColumnDef, Identity, IndexKey, TableDef};
+use crate::catalog::{ColumnDef, Identity, KeyPart, TableDef};
 use crate::error::Result;
 use crate::value::{ColumnType, Datum, PgType};
 
@@ -149,12 +149,12 @@ fn columns_of<'a>(
                 index
                     .keys
                     .iter()
-                    .filter_map(|key| match key {
-                        IndexKey::Column(at) => table
+                    .filter_map(|key| match &key.part {
+                        KeyPart::Column(at) => table
                             .columns
                             .get(*at)
                             .map(|column| (Cow::Borrowed(column), Some(*at))),
-                        IndexKey::Expression { ty, .. } => Some((
+                        KeyPart::Expression { ty, .. } => Some((
                             Cow::Owned(ColumnDef {
                                 name: key.attname(table).to_owned(),
                                 ty: *ty,

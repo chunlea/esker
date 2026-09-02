@@ -368,7 +368,7 @@ pub(super) fn write_row(
 fn render_key(table: &TableDef, ordinals: &[usize], values: &[Datum]) -> String {
     let keys: Vec<crate::catalog::IndexKey> = ordinals
         .iter()
-        .map(|&ordinal| crate::catalog::IndexKey::Column(ordinal))
+        .map(|&ordinal| crate::catalog::IndexKey::column(ordinal))
         .collect();
     super::index::render_key(table, &keys, values)
 }

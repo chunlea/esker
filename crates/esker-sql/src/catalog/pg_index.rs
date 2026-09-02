@@ -42,7 +42,7 @@ use std::borrow::Cow;
 
 use crate::backend::Txn;
 use crate::catalog::pg_relations::{RelKind, RelationRow, Relations};
-use crate::catalog::{IndexKey, SchemaState, TableDef};
+use crate::catalog::{IndexKey, KeyPart, SchemaState, TableDef};
 use crate::error::Result;
 use crate::value::{ColumnType, Datum};
 
@@ -69,6 +69,7 @@ pub fn rows(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
             Datum::Bool(key.primary),
             Datum::Bool(key.valid),
             Datum::Text(key.indkey(table)),
+            Datum::Text(key.indoption()),
             // `indexprs` and `indpred` hold a `pg_node_tree` on a real server and the **printed
             // text** here, for the reason `pg_attrdef.adbin` does: `pg_get_expr` is the only way
             // a client reads either, and here that function is the identity
@@ -190,7 +191,7 @@ impl Key<'_> {
         self.keys
             .iter()
             .map(|key| {
-                key.column()
+                key.position()
                     .map_or(0, |at| super::pg_relations::attnum_of(table, at))
                     .to_string()
             })
@@ -206,9 +207,9 @@ impl Key<'_> {
         let printed: Vec<String> = self
             .keys
             .iter()
-            .filter_map(|key| match key {
-                IndexKey::Column(_) => None,
-                IndexKey::Expression { expr, shape, .. } => Some(shape.printed(expr)),
+            .filter_map(|key| match &key.part {
+                KeyPart::Column(_) => None,
+                KeyPart::Expression { expr, shape, .. } => Some(shape.printed(expr)),
             })
             .collect();
         (!printed.is_empty()).then(|| printed.join(", "))
@@ -224,13 +225,16 @@ impl Key<'_> {
     fn listed(&self, table: &TableDef) -> Vec<String> {
         self.keys
             .iter()
-            .map(|key| match key {
-                IndexKey::Column(at) => table
-                    .columns
-                    .get(*at)
-                    .map(|column| column.name.clone())
-                    .unwrap_or_default(),
-                IndexKey::Expression { expr, shape, .. } => shape.listed(expr),
+            .map(|key| {
+                let part = match &key.part {
+                    KeyPart::Column(at) => table
+                        .columns
+                        .get(*at)
+                        .map(|column| column.name.clone())
+                        .unwrap_or_default(),
+                    KeyPart::Expression { expr, shape, .. } => shape.listed(expr),
+                };
+                format!("{part}{}", key.order.suffix())
             })
             .collect()
     }
@@ -243,15 +247,27 @@ impl Key<'_> {
     fn per_column(&self, table: &TableDef) -> Vec<String> {
         self.keys
             .iter()
-            .map(|key| match key {
-                IndexKey::Column(at) => table
+            .map(|key| match &key.part {
+                KeyPart::Column(at) => table
                     .columns
                     .get(*at)
                     .map(|column| column.name.clone())
                     .unwrap_or_default(),
-                IndexKey::Expression { expr, shape, .. } => shape.per_column(expr),
+                KeyPart::Expression { expr, shape, .. } => shape.per_column(expr),
             })
             .collect()
+    }
+
+    /// `indoption`: one bitmask per key part, space-separated, like [`Key::indkey`].
+    ///
+    /// PostgreSQL's `INDOPTION_DESC` and `INDOPTION_NULLS_FIRST` — a two-column key over an
+    /// ascending part and a `DESC` one is `0 3`, measured.
+    fn indoption(&self) -> String {
+        self.keys
+            .iter()
+            .map(|key| key.order.indoption().to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
@@ -277,7 +293,7 @@ fn key_of<'a>(relation: &RelationRow, table: &'a TableDef) -> Option<Key<'a>> {
             keys: table
                 .primary_key
                 .iter()
-                .map(|at| IndexKey::Column(*at))
+                .map(|at| IndexKey::column(*at))
                 .collect(),
             unique: true,
             primary: true,
@@ -306,6 +322,11 @@ pub const INDEX_COLUMNS: &[(&str, ColumnType)] = &[
     ("indisprimary", ColumnType::Bool),
     ("indisvalid", ColumnType::Bool),
     ("indkey", ColumnType::Text),
+    // Like `indkey` an `int2vector` on a real server, and text here for the same reason: the way
+    // a client uses it is text-shaped. `ActiveRecord` reads the ordering out of
+    // `pg_get_indexdef`'s string rather than from here, so this is the honest record of a fact
+    // rather than a column anything depends on.
+    ("indoption", ColumnType::Text),
     ("indexprs", ColumnType::Text),
     ("indpred", ColumnType::Text),
 ];

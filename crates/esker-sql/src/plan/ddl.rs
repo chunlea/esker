@@ -10,7 +10,7 @@
 //! what a `23505` message quotes back, and a client that matches on the constraint name would not
 //! recognise ours if we invented them.
 
-use crate::catalog::{ExprShape, Identity, fold_identifier};
+use crate::catalog::{ExprShape, Identity, KeyOrder, fold_identifier};
 use crate::value::{ColumnType, Datum};
 
 /// `CREATE TABLE`.
@@ -95,7 +95,27 @@ pub struct DropTable {
 /// The catalog's [`crate::catalog::IndexKey`] with a name where the position will be: nothing can
 /// resolve `b` to a column until the table has been read, and nothing may resolve it *twice*.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IndexKeyPart {
+pub struct IndexKeyPart {
+    /// What the key part is over.
+    pub part: KeyPartName,
+    /// `DESC` and `NULLS FIRST/LAST`, already resolved against the direction's own default.
+    pub order: KeyOrder,
+}
+
+impl IndexKeyPart {
+    /// An ascending column part, which is what everything but a `CREATE INDEX` produces.
+    #[must_use]
+    pub fn column(name: impl Into<String>) -> Self {
+        IndexKeyPart {
+            part: KeyPartName::Column(name.into()),
+            order: KeyOrder::ASCENDING,
+        }
+    }
+}
+
+/// What one `CREATE INDEX` key part is over, before the table is known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyPartName {
     /// A column, by name, folded.
     Column(String),
     /// An expression over the row — `((lower(b)))`.
@@ -188,17 +208,17 @@ pub fn index_name(table: &str, keys: &[IndexKeyPart]) -> String {
 /// `((a + c))` and `((1))` `xj_expr_idx` — the second disambiguated to `xj_expr_idx1`, which is
 /// the collision loop `crate::exec::ddl::create_index` already runs for a derived name.
 fn key_part_name(key: &IndexKeyPart) -> String {
-    match key {
-        IndexKeyPart::Column(name) => name.clone(),
+    match &key.part {
+        KeyPartName::Column(name) => name.clone(),
         // The callee's name is everything before the first `(` — a call's text is `name(args)`
         // and nothing else, because that is what `ExprShape::Call` means.
-        IndexKeyPart::Expression {
+        KeyPartName::Expression {
             expr,
             shape: ExprShape::Call,
         } => expr
             .split_once('(')
             .map_or_else(|| expr.clone(), |(name, _)| name.to_owned()),
-        IndexKeyPart::Expression { .. } => "expr".to_owned(),
+        KeyPartName::Expression { .. } => "expr".to_owned(),
     }
 }
 
@@ -215,12 +235,12 @@ fn derived(parts: &[&str]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{IndexKeyPart, index_name, primary_key_name, unique_constraint_name};
-    use crate::catalog::ExprShape;
+    use super::{IndexKeyPart, KeyPartName, index_name, primary_key_name, unique_constraint_name};
     use crate::catalog::MAX_IDENTIFIER_BYTES;
+    use crate::catalog::{ExprShape, KeyOrder};
 
     fn column(name: &str) -> IndexKeyPart {
-        IndexKeyPart::Column(name.to_owned())
+        IndexKeyPart::column(name)
     }
 
     /// The names a real PostgreSQL 19 gave a table with a primary key, a `UNIQUE` column and two
@@ -243,14 +263,15 @@ mod tests {
     /// function's name for a call, and `expr` for anything else. Measured on `xj (id, a, b, c)`.
     #[test]
     fn a_derived_name_takes_the_function_from_an_expression_key() {
-        let call = |expr: &str| IndexKeyPart::Expression {
-            expr: expr.to_owned(),
-            shape: ExprShape::Call,
+        let expression = |expr: &str, shape| IndexKeyPart {
+            part: KeyPartName::Expression {
+                expr: expr.to_owned(),
+                shape,
+            },
+            order: KeyOrder::ASCENDING,
         };
-        let other = |expr: &str| IndexKeyPart::Expression {
-            expr: expr.to_owned(),
-            shape: ExprShape::Operator,
-        };
+        let call = |expr: &str| expression(expr, ExprShape::Call);
+        let other = |expr: &str| expression(expr, ExprShape::Operator);
         assert_eq!(index_name("xj", &[call("lower(b)")]), "xj_lower_idx");
         assert_eq!(index_name("xj", &[call("abs(a)")]), "xj_abs_idx");
         assert_eq!(

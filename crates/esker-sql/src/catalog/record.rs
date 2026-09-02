@@ -48,8 +48,8 @@ use esker_base::varint;
 use esker_keys::{codec, prefix};
 
 use crate::catalog::{
-    CheckDef, ColumnDef, ExprShape, Identity, IndexDef, IndexKey, Relation, SchemaState,
-    SequenceDef, TableDef,
+    CheckDef, ColumnDef, ExprShape, Identity, IndexDef, IndexKey, KeyOrder, KeyPart, Relation,
+    SchemaState, SequenceDef, TableDef,
 };
 use crate::error::{Result, SqlError};
 use crate::value::{ColumnType, Datum, NO_TYPMOD};
@@ -65,16 +65,17 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// number means, and is what every column a version 3 catalog could hold was.
 ///
 /// Version 5 added an expression default (`DEFAULT CURRENT_TIMESTAMP`), version 6 the table's
-/// `CHECK` constraints, version 7 a partial index's predicate, and version 8 an index's key
-/// **expressions**. Each is appended at the end, so a record of every earlier version is a prefix
-/// of a later one's and the goldens below still decode.
+/// `CHECK` constraints, version 7 a partial index's predicate, version 8 an index's key
+/// **expressions**, and version 9 each key part's **order** — `DESC` and where its NULLs go. Each
+/// is appended at the end, so a record of every earlier version is a prefix of a later one's and
+/// the goldens below still decode.
 ///
 /// Version 1 is not read: nothing had ever persisted a catalog when version 2 landed, so a
 /// compatibility path for it was one nothing could check. **Version 2 is different** — this crate
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 8;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 9;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -693,7 +694,7 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
             // take this for is at least in range — it is the wrong column rather than a corrupt
             // record, and a version 7 reader is a binary older than the record it is reading,
             // which `Reader::at_least` already refuses at the top.
-            varint::put_u64(key.column().unwrap_or(0) as u64, &mut out);
+            varint::put_u64(key.position().unwrap_or(0) as u64, &mut out);
         }
     }
 
@@ -720,14 +721,23 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
     // table of ordinary indexes the same size it was.
     for index in &table.indexes {
         for key in &index.keys {
-            match key {
-                IndexKey::Column(_) => put_str("", &mut out),
-                IndexKey::Expression { expr, shape, ty } => {
+            match &key.part {
+                KeyPart::Column(_) => put_str("", &mut out),
+                KeyPart::Expression { expr, shape, ty } => {
                     put_str(expr, &mut out);
                     out.push(shape_tag(*shape));
                     out.push(tag_of(*ty));
                 }
             }
+        }
+    }
+
+    // Version 9. One byte per key part, for the fourth time in the same place and for the same
+    // reason — `pg_index.indoption`'s own two bits, which is what makes an ascending part cost a
+    // zero byte and every table written before this read back as one.
+    for index in &table.indexes {
+        for key in &index.keys {
+            out.push(u8::try_from(key.order.indoption()).unwrap_or(0));
         }
     }
     Ok(out)
@@ -756,7 +766,7 @@ fn read_index_tails(reader: &mut Reader<'_>, indexes: &mut [IndexDef]) -> Result
             for key in &mut index.keys {
                 let expr = reader.string()?;
                 if !expr.is_empty() {
-                    *key = IndexKey::Expression {
+                    key.part = KeyPart::Expression {
                         expr,
                         shape: shape_of(reader.byte()?)?,
                         ty: type_of(reader.byte()?)?,
@@ -765,7 +775,27 @@ fn read_index_tails(reader: &mut Reader<'_>, indexes: &mut [IndexDef]) -> Result
             }
         }
     }
+    // A version 8 key part is **ascending with its NULLs last**, which is what every key part a
+    // version 8 catalog could hold was: a `DESC` index column was `0A000` until version 9.
+    if reader.version >= 9 {
+        for index in indexes.iter_mut() {
+            for key in &mut index.keys {
+                key.order = order_of(reader.byte()?)?;
+            }
+        }
+    }
     Ok(())
+}
+
+/// The other half of [`KeyOrder::indoption`], which is PostgreSQL's own bitmask.
+fn order_of(indoption: u8) -> Result<KeyOrder> {
+    if indoption & !0b11 != 0 {
+        return Err(corrupt(format!("index key order bits {indoption}")));
+    }
+    Ok(KeyOrder {
+        descending: indoption & 1 != 0,
+        nulls_first: indoption & 2 != 0,
+    })
 }
 
 /// Reads a table record back. Every failure is typed: a catalog is on-disk data like any other.
@@ -826,7 +856,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
         };
         let mut keys = Vec::with_capacity(reader.count()?);
         for _ in 0..keys.capacity() {
-            keys.push(IndexKey::Column(reader.ordinal(columns.len())?));
+            keys.push(IndexKey::column(reader.ordinal(columns.len())?));
         }
         indexes.push(IndexDef {
             id,

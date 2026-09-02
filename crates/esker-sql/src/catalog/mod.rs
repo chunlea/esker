@@ -234,7 +234,7 @@ impl SchemaState {
 /// column position with a sentinel — a sentinel is what `0` is on the wire, and it is only safe
 /// there because attribute numbers are one-based and positions here are not.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IndexKey {
+pub enum KeyPart {
     /// A position into [`TableDef::columns`]. Renaming the column cannot orphan the index.
     Column(usize),
     /// An expression over the row — `CREATE UNIQUE INDEX … ON t ((lower(b)))`.
@@ -321,13 +321,33 @@ impl ExprShape {
     }
 }
 
+/// One part of an index's key, in the order it is stored in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexKey {
+    /// What the key part is over.
+    pub part: KeyPart,
+    /// Which way it is stored, and where its NULLs go.
+    pub order: KeyOrder,
+}
+
 impl IndexKey {
-    /// The column this part is, or `None` for an expression.
+    /// An ascending column part, which is what a primary key and a `UNIQUE` constraint are made
+    /// of: neither takes a direction, because `UNIQUE (a DESC)` is a **syntax error** on a real
+    /// server — measured — and a key nothing can order differently has one spelling.
     #[must_use]
-    pub fn column(&self) -> Option<usize> {
-        match self {
-            IndexKey::Column(at) => Some(*at),
-            IndexKey::Expression { .. } => None,
+    pub fn column(at: usize) -> Self {
+        IndexKey {
+            part: KeyPart::Column(at),
+            order: KeyOrder::ASCENDING,
+        }
+    }
+
+    /// The column this part is over, or `None` for an expression.
+    #[must_use]
+    pub fn position(&self) -> Option<usize> {
+        match self.part {
+            KeyPart::Column(at) => Some(at),
+            KeyPart::Expression { .. } => None,
         }
     }
 
@@ -340,18 +360,87 @@ impl IndexKey {
     /// this joined with `_idx`.
     #[must_use]
     pub fn attname<'a>(&'a self, table: &'a TableDef) -> &'a str {
-        match self {
-            IndexKey::Column(at) => table
+        match &self.part {
+            KeyPart::Column(at) => table
                 .columns
                 .get(*at)
                 .map_or(INTERNAL_ROW_ID_NAME, |column| column.name.as_str()),
-            IndexKey::Expression {
+            KeyPart::Expression {
                 expr,
                 shape: ExprShape::Call,
                 ..
             } => expr.split_once('(').map_or(expr.as_str(), |(name, _)| name),
-            IndexKey::Expression { .. } => "expr",
+            KeyPart::Expression { .. } => "expr",
         }
+    }
+}
+
+/// Which way one key part is stored, and where its NULLs go.
+///
+/// **Recorded and printed, and it changes nothing else.** An index here is read in exactly two
+/// ways — a `UNIQUE` check and a lookup with the whole key pinned to constants — and neither
+/// depends on the order the entries are in. Nothing chooses an index to satisfy an `ORDER BY`, so
+/// there is no plan for a direction to be wrong in; when something does, this is the field it
+/// will read. Storing it is what makes `pg_get_indexdef` reproduce the statement, which is how
+/// `ActiveRecord` gets `order: :desc` back out of a schema dump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyOrder {
+    /// `DESC`.
+    pub descending: bool,
+    /// `NULLS FIRST`. **The default depends on the direction** — ascending sorts NULLs last and
+    /// descending sorts them first — which is the whole reason both are stored rather than one.
+    pub nulls_first: bool,
+}
+
+impl KeyOrder {
+    /// The order a key part written with no direction and no null placement has.
+    pub const ASCENDING: KeyOrder = KeyOrder {
+        descending: false,
+        nulls_first: false,
+    };
+
+    /// The order for a direction, with PostgreSQL's default null placement for it.
+    #[must_use]
+    pub fn of(descending: bool) -> Self {
+        KeyOrder {
+            descending,
+            nulls_first: descending,
+        }
+    }
+
+    /// What `pg_get_indexdef` prints after a key part — **only what differs from the default**,
+    /// and the default depends on the direction.
+    ///
+    /// Measured on PostgreSQL 19, and it is why the text cannot be round-tripped from what was
+    /// written (`tests/corpus/pg19_desc_index.txt`):
+    ///
+    /// | written | printed |
+    /// |---|---|
+    /// | `a` / `a ASC` / `a ASC NULLS LAST` | `a` |
+    /// | `a ASC NULLS FIRST` | `a NULLS FIRST` |
+    /// | `a DESC` / `a DESC NULLS FIRST` | `a DESC` |
+    /// | `a DESC NULLS LAST` | `a DESC NULLS LAST` |
+    ///
+    /// `ASC` never prints, because it is the default; `NULLS FIRST` prints under `ASC` and not
+    /// under `DESC`, and `NULLS LAST` the other way round.
+    #[must_use]
+    pub fn suffix(self) -> &'static str {
+        match (self.descending, self.nulls_first) {
+            (false, false) => "",
+            (false, true) => " NULLS FIRST",
+            (true, true) => " DESC",
+            (true, false) => " DESC NULLS LAST",
+        }
+    }
+
+    /// `pg_index.indoption`'s bitmask for this part: `1` for `DESC`, `2` for `NULLS FIRST`.
+    ///
+    /// PostgreSQL's own `INDOPTION_DESC` and `INDOPTION_NULLS_FIRST`, measured across all four
+    /// combinations — an ascending part is `0` and a plain `DESC` one is `3`, because descending
+    /// carries its own default null placement in the same word.
+    #[must_use]
+    pub fn indoption(self) -> u16 {
+        u16::from(self.descending) | (u16::from(self.nulls_first) << 1)
     }
 }
 
@@ -405,7 +494,7 @@ impl IndexDef {
     /// [`IndexDef::predicate`] is kept out of a read for.
     #[must_use]
     pub fn key_columns(&self) -> Option<Vec<usize>> {
-        self.keys.iter().map(IndexKey::column).collect()
+        self.keys.iter().map(IndexKey::position).collect()
     }
 }
 
@@ -1547,7 +1636,7 @@ pub fn bump_version(txn: &mut dyn Txn) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Catalog, ColumnDef, DEFAULT_RETENTION_MS, Identity, IndexDef, IndexKey,
+        Catalog, ColumnDef, DEFAULT_RETENTION_MS, Identity, IndexDef, IndexKey, KeyOrder, KeyPart,
         MAX_IDENTIFIER_BYTES, RETENTION_FOREVER, Relation, SchemaState, SequenceDef, TableDef,
         allocate_id, clear_table_retention, create_table, default_retention, drop_table,
         fold_identifier, record, replace_table, set_default_retention, set_table_retention,
@@ -1604,7 +1693,7 @@ mod tests {
                 id: id + 1,
                 name: "accounts_email_key".into(),
                 unique: true,
-                keys: vec![IndexKey::Column(1)],
+                keys: vec![IndexKey::column(1)],
                 state: SchemaState::Public,
                 state_since: 1,
                 predicate: None,
@@ -1633,7 +1722,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "08",               // catalog format version
+                "09",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -1685,7 +1774,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "08",                 // catalog format version
+                "09",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -1721,6 +1810,7 @@ mod tests {
                 "00", // version 6: no CHECK constraints
                 "00", // version 7: the one index has no WHERE predicate
                 "00", // version 8: its one key part is a column, not an expression
+                "00", // version 9: ascending, with its NULLs where ascending puts them
             )
         );
         assert_eq!(record::decode_table(&encoded).unwrap(), accounts(7));
@@ -1757,6 +1847,85 @@ mod tests {
             "01",
         ));
         assert_eq!(record::decode_table(&v2).unwrap(), accounts(7));
+    }
+
+    /// A key part's order survives the record, which is what a schema dump reads back.
+    ///
+    /// Not the same thing as printing it: the `TableDef` is re-read from the store, and a version
+    /// that dropped the two bits would print correctly until the cache was cold.
+    #[test]
+    fn an_index_key_keeps_its_order_through_a_record() {
+        let mut table = accounts(7);
+        table.indexes[0].keys = vec![
+            IndexKey::column(0),
+            IndexKey {
+                part: KeyPart::Column(1),
+                order: KeyOrder {
+                    descending: true,
+                    nulls_first: false,
+                },
+            },
+        ];
+        let encoded = record::encode_table(&table).unwrap();
+        let read = record::decode_table(&encoded).unwrap();
+        assert_eq!(read, table);
+        assert_eq!(read.indexes[0].keys[0].order.indoption(), 0);
+        assert_eq!(read.indexes[0].keys[1].order.indoption(), 1);
+        assert_eq!(read.indexes[0].keys[1].order.suffix(), " DESC NULLS LAST");
+    }
+
+    /// The **version 8** golden, kept for the same reason the seven before it are.
+    ///
+    /// These are the bytes version 8 wrote — the record ends at the key expressions, with no key
+    /// order after them. Every key part reads back **ascending with its NULLs last**, which is
+    /// what every key part a version 8 catalog could hold was: a `DESC` index column was `0A000`
+    /// until version 9.
+    #[test]
+    fn a_version_8_table_record_still_decodes() {
+        let v8 = decode_hex(concat!(
+            "08",                 // catalog format version 8
+            "0700000000000000",   // table id 7
+            "086163636f756e7473", // varint 8, "accounts"
+            "0d6163636f756e74735f706b6579",
+            "01", // schema version 1
+            "02", // two columns
+            "026964",
+            "01",
+            "01",
+            "00",
+            "00",
+            "ffffffff",
+            "00",
+            "05656d61696c",
+            "02",
+            "00",
+            "00",
+            "00",
+            "ffffffff",
+            "00",
+            "01",
+            "00",                                     // primary key: one column, column 0
+            "01",                                     // one index
+            "0800000000000000",                       // index id 8
+            "126163636f756e74735f656d61696c5f6b6579", // "accounts_email_key"
+            "01",                                     // unique
+            "03",                                     // state: public
+            "01",                                     // entered at schema version 1
+            "01",
+            "01", // one column, column 1
+            "00", // no CHECK constraints
+            "00", // no WHERE predicate
+            "00", // its one key part is a column -- and nothing after it
+        ));
+        let table = record::decode_table(&v8).unwrap();
+        assert_eq!(table, accounts(7));
+        assert!(
+            table
+                .indexes
+                .iter()
+                .flat_map(|index| &index.keys)
+                .all(|key| key.order == KeyOrder::ASCENDING)
+        );
     }
 
     /// The **version 7** golden, kept for the same reason the six before it are.
@@ -2245,7 +2414,7 @@ mod tests {
             id: 5,
             name: "accounts_id_idx".into(),
             unique: false,
-            keys: vec![IndexKey::Column(0)],
+            keys: vec![IndexKey::column(0)],
             state: SchemaState::Public,
             state_since: 1,
             predicate: None,
@@ -2302,7 +2471,7 @@ mod tests {
             id: 9,
             name: "accounts".into(),
             unique: false,
-            keys: vec![IndexKey::Column(0)],
+            keys: vec![IndexKey::column(0)],
             state: SchemaState::Public,
             state_since: 1,
             predicate: None,
@@ -2494,7 +2663,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "08",               // catalog format version
+                "09",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

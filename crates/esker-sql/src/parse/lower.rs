@@ -24,7 +24,7 @@ use sqlparser::ast::{
     TableObject, TimezoneInfo, UnaryOperator, Value,
 };
 
-use crate::catalog::fold_identifier;
+use crate::catalog::{KeyOrder, fold_identifier};
 use crate::error::{Result, SqlError};
 use crate::parse::{Parsed, feature_name};
 use crate::plan;
@@ -2994,6 +2994,19 @@ fn index_columns(columns: &[IndexColumn]) -> Result<Vec<String>> {
         .iter()
         .map(|column| {
             index_key_options(column)?;
+            // `UNIQUE (a DESC)` and `PRIMARY KEY (a NULLS FIRST)` are **syntax errors** on a real
+            // server — measured, `42601 syntax error at or near "DESC"` — because a constraint's
+            // grammar has no direction in it at all. Refused by name rather than accepted and
+            // ignored, and the SQLSTATE is the one divergence
+            // (`tests/desc_index.rs`'s `DIVERGENCES`).
+            refuse_if(
+                column.column.options.asc.is_some(),
+                "a direction on a constraint's columns",
+            )?;
+            refuse_if(
+                column.column.options.nulls_first.is_some(),
+                "NULLS FIRST/LAST on a constraint's columns",
+            )?;
             match &column.column.expr {
                 Expr::Identifier(name) => Ok(ident(name)),
                 other => Err(SqlError::unsupported(format!(
@@ -3007,16 +3020,26 @@ fn index_columns(columns: &[IndexColumn]) -> Result<Vec<String>> {
 /// The options a key part may not carry, whichever kind of key it is in.
 fn index_key_options(column: &IndexColumn) -> Result<()> {
     refuse_if(column.operator_class.is_some(), "an index operator class")?;
-    refuse_if(
-        column.column.options.asc == Some(false),
-        "a DESC index column",
-    )?;
-    refuse_if(
-        column.column.options.nulls_first.is_some(),
-        "NULLS FIRST/LAST on an index",
-    )?;
     refuse_if(column.column.with_fill.is_some(), "WITH FILL")?;
     Ok(())
+}
+
+/// The order a `CREATE INDEX` key part is written in.
+///
+/// `ASC` is the default and `DESC` is not, and **each direction has its own default null
+/// placement**: ascending sorts NULLs last, descending sorts them first. So an unwritten
+/// `NULLS …` is not "last", it is "whatever this direction means", which is what
+/// [`crate::catalog::KeyOrder::of`] says once rather than at each call.
+fn index_key_order(column: &IndexColumn) -> KeyOrder {
+    let descending = column.column.options.asc == Some(false);
+    KeyOrder {
+        descending,
+        nulls_first: column
+            .column
+            .options
+            .nulls_first
+            .unwrap_or(KeyOrder::of(descending).nulls_first),
+    }
 }
 
 /// A `CREATE INDEX`'s key parts: a column by name, or an expression.
@@ -3032,12 +3055,16 @@ fn index_keys(columns: &[IndexColumn]) -> Result<Vec<plan::IndexKeyPart>> {
         .iter()
         .map(|column| {
             index_key_options(column)?;
-            Ok(match unwrap_nested(&column.column.expr) {
-                Expr::Identifier(name) => plan::IndexKeyPart::Column(ident(name)),
-                expr => plan::IndexKeyPart::Expression {
+            let part = match unwrap_nested(&column.column.expr) {
+                Expr::Identifier(name) => plan::KeyPartName::Column(ident(name)),
+                expr => plan::KeyPartName::Expression {
                     expr: expr.to_string(),
                     shape: expr_shape(expr),
                 },
+            };
+            Ok(plan::IndexKeyPart {
+                part,
+                order: index_key_order(column),
             })
         })
         .collect()

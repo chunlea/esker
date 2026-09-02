@@ -13,7 +13,7 @@
 //! the four callers cannot drift from it.
 
 use crate::backend::Txn;
-use crate::catalog::{IndexDef, IndexKey, TableDef};
+use crate::catalog::{IndexDef, IndexKey, KeyPart, TableDef};
 use crate::error::{Result, SqlError};
 use crate::exec::{cursor, query};
 use crate::row;
@@ -85,9 +85,9 @@ fn key_values(table: &TableDef, index: &IndexDef, row: &[Datum]) -> Result<Vec<D
     index
         .keys
         .iter()
-        .map(|key| match key {
-            IndexKey::Column(at) => Ok(row[*at].clone()),
-            IndexKey::Expression { expr, .. } => evaluate_stored(table, index, expr, row),
+        .map(|key| match &key.part {
+            KeyPart::Column(at) => Ok(row[*at].clone()),
+            KeyPart::Expression { expr, .. } => evaluate_stored(table, index, expr, row),
         })
         .collect()
 }
@@ -122,9 +122,9 @@ fn evaluate_stored(table: &TableDef, index: &IndexDef, expr: &str, row: &[Datum]
 pub(super) fn render_key(table: &TableDef, keys: &[IndexKey], values: &[Datum]) -> String {
     let names: Vec<String> = keys
         .iter()
-        .map(|key| match key {
-            IndexKey::Column(at) => table.columns[*at].name.clone(),
-            IndexKey::Expression { expr, shape, .. } => shape.printed(expr),
+        .map(|key| match &key.part {
+            KeyPart::Column(at) => table.columns[*at].name.clone(),
+            KeyPart::Expression { expr, shape, .. } => shape.printed(expr),
         })
         .collect();
     format!("Key ({})=({})", names.join(", "), render_values(values))

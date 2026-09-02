@@ -1,0 +1,71 @@
+# A **`DESC` index column** — statement 189 of `schema.rb`
+#
+# `CREATE INDEX "index_companies_on_name_and_rating" ON "companies" ("name" DESC, "rating" DESC)`,
+# which is `t.index [:name, :rating], order: :desc` on the way back out of a schema dump.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **The definition keeps only what differs from the default, and the default depends on the
+#     direction.** `(a ASC NULLS FIRST)` comes back `(a NULLS FIRST)` — the `ASC` dropped because
+#     it is the default, the `NULLS FIRST` kept because ascending's default is NULLS **LAST**. And
+#     `(a DESC NULLS FIRST)` comes back `(a DESC)`, because descending's default *is* FIRST. So
+#     the text cannot be round-tripped from what was written: direction and null placement have to
+#     be stored and the shortest spelling re-derived. All four combinations are below.
+#   * **`indoption` is the bitmask that says so**: `1` is `DESC`, `2` is `NULLS FIRST`. An
+#     ascending part is `0`, a plain `DESC` one is **`3`** — descending carries its own default
+#     null placement in the same word — and a two-part key is `0 3`.
+#   * **The per-column form drops the ordering entirely.** `pg_get_indexdef(ix, 1, true)` over
+#     `(a DESC, c DESC)` is `a`, not `a DESC`. `ActiveRecord` gets the ordering by scanning the
+#     whole definition, which is the string that has it.
+#   * **A constraint has no direction at all.** `ALTER TABLE … ADD CONSTRAINT u UNIQUE (a DESC)` is
+#     `42601 syntax error at or near "DESC"` — the grammar has no place for it, unlike
+#     `CREATE INDEX`.
+#   * **`NULLS` alone is an operator class name.** `CREATE INDEX ON t (a NULLS)` is
+#     `42704 operator class "nulls" does not exist for access method "btree"`, not a syntax error:
+#     the parser reads the bare word as the opclass slot.
+#   * **The order changes nothing a read can see here.** Uniqueness is order-independent, and this
+#     node never chooses an index to satisfy an `ORDER BY` — so the rows below are the same rows an
+#     ascending index would give, and that is the claim being pinned rather than an omission.
+#
+# The table is left behind on the oracle, which is what lets `\gdesc` fill the declared-types
+# column in a second session (`captures/README.md`).
+DROP TABLE IF EXISTS xdsc		-
+CREATE TABLE xdsc (id int8 PRIMARY KEY, a int8, b text, c int8)		-
+INSERT INTO xdsc VALUES (1, 10, 'alpha', 1)		-
+INSERT INTO xdsc VALUES (2, 20, 'beta', 2)		-
+INSERT INTO xdsc VALUES (3, NULL, 'gamma', 3)		-
+CREATE INDEX xdsc_d ON xdsc (a DESC, c DESC)		-
+CREATE INDEX xdsc_dl ON xdsc (a DESC NULLS LAST)		-
+CREATE INDEX xdsc_df ON xdsc (a DESC NULLS FIRST)		-
+CREATE INDEX xdsc_af ON xdsc (a ASC NULLS FIRST)		-
+CREATE INDEX xdsc_al ON xdsc (a ASC NULLS LAST)		-
+CREATE INDEX xdsc_mix ON xdsc (b, a DESC)		-
+CREATE INDEX xdsc_expr ON xdsc ((lower(b)) DESC)		-
+CREATE UNIQUE INDEX xdsc_u ON xdsc (b DESC)		-
+CREATE INDEX ON xdsc (c DESC)		-
+SELECT pg_get_indexdef('xdsc_d'::regclass)	text	CREATE INDEX xdsc_d ON public.xdsc USING btree (a DESC, c DESC)
+SELECT pg_get_indexdef('xdsc_dl'::regclass)	text	CREATE INDEX xdsc_dl ON public.xdsc USING btree (a DESC NULLS LAST)
+SELECT pg_get_indexdef('xdsc_df'::regclass)	text	CREATE INDEX xdsc_df ON public.xdsc USING btree (a DESC)
+SELECT pg_get_indexdef('xdsc_af'::regclass)	text	CREATE INDEX xdsc_af ON public.xdsc USING btree (a NULLS FIRST)
+SELECT pg_get_indexdef('xdsc_al'::regclass)	text	CREATE INDEX xdsc_al ON public.xdsc USING btree (a)
+SELECT pg_get_indexdef('xdsc_mix'::regclass)	text	CREATE INDEX xdsc_mix ON public.xdsc USING btree (b, a DESC)
+SELECT pg_get_indexdef('xdsc_expr'::regclass)	text	CREATE INDEX xdsc_expr ON public.xdsc USING btree (lower(b) DESC)
+SELECT pg_get_indexdef('xdsc_u'::regclass)	text	CREATE UNIQUE INDEX xdsc_u ON public.xdsc USING btree (b DESC)
+SELECT pg_get_indexdef('xdsc_c_idx'::regclass)	text	CREATE INDEX xdsc_c_idx ON public.xdsc USING btree (c DESC)
+SELECT pg_get_indexdef('xdsc_d'::regclass, 1, true)	text	a
+SELECT pg_get_indexdef('xdsc_d'::regclass, 2, true)	text	c
+SELECT pg_get_indexdef('xdsc_mix'::regclass, 1, true)	text	b
+SELECT pg_get_indexdef('xdsc_mix'::regclass, 2, true)	text	a
+SELECT pg_get_indexdef('xdsc_expr'::regclass, 1, true)	text	lower(b)
+SELECT i.relname, x.indkey::text, x.indoption::text FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'xdsc'::regclass ORDER BY i.relname	name,text,text	xdsc_af|2|2 ; xdsc_al|2|0 ; xdsc_c_idx|4|3 ; xdsc_d|2 4|3 3 ; xdsc_df|2|3 ; xdsc_dl|2|1 ; xdsc_expr|0|3 ; xdsc_mix|3 2|0 3 ; xdsc_pkey|1|0 ; xdsc_u|3|3
+INSERT INTO xdsc VALUES (4, 40, 'alpha', 4)	!23505 duplicate key value violates unique constraint "xdsc_u" DETAIL: Key (b)=(alpha) already exists.
+SELECT id, a FROM xdsc ORDER BY id	bigint,bigint	1|10 ; 2|20 ; 3|\N
+SELECT id FROM xdsc WHERE b = 'beta'	bigint	2
+SELECT id FROM xdsc ORDER BY a DESC	bigint	3 ; 2 ; 1
+CREATE INDEX xdsc_bad ON xdsc (nosuchcol DESC)	!42703 column "nosuchcol" does not exist
+ALTER TABLE xdsc ADD CONSTRAINT xdsc_uc UNIQUE (a DESC)	!42601 syntax error at or near "DESC"
+CREATE INDEX xdsc_bad2 ON xdsc (a NULLS)	!42704 operator class "nulls" does not exist for access method "btree"

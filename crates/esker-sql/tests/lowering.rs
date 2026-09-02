@@ -12,9 +12,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use esker_sql::catalog::ExprShape;
+use esker_sql::catalog::{ExprShape, KeyOrder};
 use esker_sql::parse::parse_statements;
-use esker_sql::plan::{IndexKeyPart, Statement};
+use esker_sql::plan::{IndexKeyPart, KeyPartName, Statement};
 use esker_sql::sqlstate;
 use esker_sql::value::ColumnType;
 
@@ -90,7 +90,6 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
         ("CREATE TABLE s.t (a int8)", "the qualified name"),
         ("DROP TABLE t CASCADE", "DROP ... CASCADE"),
         ("CREATE INDEX i ON t USING hash (a)", "an index USING"),
-        ("CREATE INDEX i ON t (a DESC)", "a DESC index column"),
         (
             "CREATE INDEX i ON t (a) INCLUDE (b)",
             "CREATE INDEX ... INCLUDE",
@@ -310,10 +309,7 @@ fn drop_and_create_index_lower_to_their_lists() {
     assert_eq!(create.table, "accounts");
     assert_eq!(
         create.keys,
-        [
-            IndexKeyPart::Column("email".into()),
-            IndexKeyPart::Column("id".into())
-        ]
+        [IndexKeyPart::column("email"), IndexKeyPart::column("id")]
     );
     assert!(create.unique);
 
@@ -336,13 +332,13 @@ fn an_index_key_is_a_column_or_an_expression() {
         };
         create.keys
     };
-    assert_eq!(
-        keys("CREATE INDEX ON t ((b))"),
-        [IndexKeyPart::Column("b".into())]
-    );
-    let expression = |expr: &str, shape| IndexKeyPart::Expression {
-        expr: expr.to_owned(),
-        shape,
+    assert_eq!(keys("CREATE INDEX ON t ((b))"), [IndexKeyPart::column("b")]);
+    let expression = |expr: &str, shape| IndexKeyPart {
+        part: KeyPartName::Expression {
+            expr: expr.to_owned(),
+            shape,
+        },
+        order: KeyOrder::ASCENDING,
     };
     assert_eq!(
         keys("CREATE INDEX ON t ((lower(b)))"),
@@ -355,7 +351,7 @@ fn an_index_key_is_a_column_or_an_expression() {
     assert_eq!(
         keys("CREATE INDEX ON t (a, (lower(b)))"),
         [
-            IndexKeyPart::Column("a".into()),
+            IndexKeyPart::column("a"),
             expression("lower(b)", ExprShape::Call)
         ]
     );
@@ -367,6 +363,25 @@ fn an_index_key_is_a_column_or_an_expression() {
         keys("CREATE INDEX ON t ((1))"),
         [expression("1", ExprShape::Value)]
     );
+}
+
+/// A key part's order is resolved against **its own direction's default**, not against a single
+/// one: an unwritten `NULLS …` means LAST under `ASC` and FIRST under `DESC`.
+#[test]
+fn an_index_key_resolves_its_null_placement_from_its_direction() {
+    let order = |sql: &str| {
+        let Statement::CreateIndex(create) = lower(sql).unwrap() else {
+            panic!("not a CREATE INDEX")
+        };
+        create.keys[0].order
+    };
+    assert_eq!(order("CREATE INDEX ON t (a)"), KeyOrder::ASCENDING);
+    assert_eq!(order("CREATE INDEX ON t (a ASC)"), KeyOrder::ASCENDING);
+    assert_eq!(order("CREATE INDEX ON t (a DESC)"), KeyOrder::of(true));
+    assert!(order("CREATE INDEX ON t (a DESC)").nulls_first);
+    assert!(!order("CREATE INDEX ON t (a DESC NULLS LAST)").nulls_first);
+    assert!(order("CREATE INDEX ON t (a NULLS FIRST)").nulls_first);
+    assert!(!order("CREATE INDEX ON t (a NULLS FIRST)").descending);
 }
 
 /// A stored predicate keeps **one** pair of parentheses however it was written, because that is

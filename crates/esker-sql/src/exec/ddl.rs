@@ -33,7 +33,7 @@
 //! without a key can now be created, written and read.
 
 use crate::backend::Txn;
-use crate::catalog::{self, CheckDef, ColumnDef, IndexDef, IndexKey, TableDef};
+use crate::catalog::{self, CheckDef, ColumnDef, IndexDef, IndexKey, KeyPart, TableDef};
 use crate::error::{Result, SqlError};
 use crate::exec::Executor;
 use crate::pgwire::session::Outcome;
@@ -116,7 +116,7 @@ pub(super) fn create_table(
                 .clone()
                 .unwrap_or_else(|| plan::unique_constraint_name(&create.name, &constraint.columns)),
             unique: true,
-            keys: ordinals.into_iter().map(IndexKey::Column).collect(),
+            keys: ordinals.into_iter().map(IndexKey::column).collect(),
             // Born public. Nothing predates a `UNIQUE` declared with the table, so there is no
             // interleaving for the states to protect: the ADR's whole argument is about rows and
             // writers that already exist (`docs/plans/phase-6e.md` §2).
@@ -345,16 +345,22 @@ pub(super) fn create_index(
     let keys = create
         .keys
         .iter()
-        .map(|key| match key {
-            plan::IndexKeyPart::Column(column) => table
-                .column(column)
-                .map(IndexKey::Column)
-                .ok_or_else(|| SqlError::UndefinedColumn(column.clone())),
-            plan::IndexKeyPart::Expression { expr, shape } => Ok(IndexKey::Expression {
-                expr: expr.clone(),
-                shape: *shape,
-                ty: index_expression(&table, expr)?,
-            }),
+        .map(|key| {
+            let part = match &key.part {
+                plan::KeyPartName::Column(column) => table
+                    .column(column)
+                    .map(KeyPart::Column)
+                    .ok_or_else(|| SqlError::UndefinedColumn(column.clone()))?,
+                plan::KeyPartName::Expression { expr, shape } => KeyPart::Expression {
+                    expr: expr.clone(),
+                    shape: *shape,
+                    ty: index_expression(&table, expr)?,
+                },
+            };
+            Ok(IndexKey {
+                part,
+                order: key.order,
+            })
         })
         .collect::<Result<Vec<_>>>()?;
 
