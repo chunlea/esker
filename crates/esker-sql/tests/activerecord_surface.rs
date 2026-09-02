@@ -96,7 +96,13 @@ const FIXTURE: &[&str] =
 /// shapes it did unblock are measured in `tests/activerecord_subquery.rs` instead, so the day the
 /// catalog functions land the subquery half is already known to work.
 ///
-/// **Twenty-four now, and both are `pg_constraint`** — phase 13 unit 3. Line 53 is
+/// **Twenty-three**, and the twenty-third is the smallest change in this file's history:
+/// statement 24 is `SELECT current_schema`, the bare parenthesis-free spelling of a function
+/// whose parenthesised form had worked since the rung-4 unit. It took three rounds of
+/// contradictory reports to find, because "`current_schema` fails" and "`current_schema(false)`
+/// is `42883`" were true at the same time.
+///
+/// **Twenty-five now, and the two are `pg_constraint`** — phase 13 unit 3. Line 53 is
 /// `check_constraints()` and line 54 is `exclusion_constraints()`, and what makes them run is that
 /// they need **only** the relation and `pg_get_constraintdef`: no array, no `obj_description`, no
 /// `::text` on an oid. Both answer **no rows**, which is the correct answer about this catalog —
@@ -108,7 +114,7 @@ const FIXTURE: &[&str] =
 /// `ARRAY(SELECT …)` and `obj_description`, and lines 55 and 56 want `array_agg` and
 /// `c.conkey[idx]`. **The rows behind all of them are here and agree** (`tests/pg_catalog_*.rs`);
 /// what is missing is the array surface, which is another lane's.
-const RUNS: usize = 24;
+const RUNS: usize = 25;
 
 #[test]
 fn every_statement_activerecord_sends_parses_and_is_answered_by_name() {

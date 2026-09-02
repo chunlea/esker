@@ -1111,6 +1111,20 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
         {
             Ok(plan::Expr::Default)
         }
+        // **`current_schema` with no parentheses is the function**, not a column. SQL's niladic
+        // functions may be written bare, and a real server answers `public` where a bare name it
+        // does not know is `42703`. Unquoted only: `"current_schema"` is a column called that and
+        // stays one, exactly as `DEFAULT` above.
+        //
+        // This is the shape r1's capture was failing on while `current_schema()` had been right
+        // since the rung-4 unit — one name, two spellings, and only one of them was implemented.
+        Expr::Identifier(name)
+            if name.quote_style.is_none() && name.value.eq_ignore_ascii_case("current_schema") =>
+        {
+            Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                Datum::Text(PUBLIC_SCHEMA.to_owned()),
+            ))))
+        }
         Expr::Identifier(name) => Ok(plan::Expr::Column {
             table: None,
             name: ident(name),

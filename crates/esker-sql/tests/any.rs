@@ -145,6 +145,28 @@ fn a_schema_function_with_the_wrong_arity_does_not_exist() {
     }
 }
 
+/// `current_schema` **without parentheses** is the function, not a column.
+///
+/// SQL's niladic functions may be written bare. A real server answers `public`; this node answered
+/// `42703 column "current_schema" does not exist`, because a bare identifier is a column
+/// everywhere else. One name, two spellings, and only the parenthesised one was implemented —
+/// which is why a triage reading "`current_schema` fails" and a test asserting
+/// `current_schema(false)` is `42883` were both right at the same time, and the report went round
+/// three times before the capture was replayed statement by statement instead of paraphrased.
+///
+/// Quoted, it is a column again: `"current_schema"` names one, the same rule the `DEFAULT`
+/// keyword follows.
+#[test]
+fn a_bare_current_schema_is_the_function() {
+    let mut node = parity::Node::new(&[]);
+    assert_eq!(node.rows("SELECT current_schema"), vec![vec!["public"]]);
+    assert_eq!(node.rows("SELECT current_schema()"), vec![vec!["public"]]);
+
+    // Quoted, it is an ordinary name and there is no such column.
+    let error = node.run("SELECT \"current_schema\"").unwrap_err();
+    assert_eq!(error.sqlstate(), "42703");
+}
+
 /// A quantifier this node does not have is named rather than answered by the one it does.
 #[test]
 fn another_quantifier_is_refused_by_name() {
