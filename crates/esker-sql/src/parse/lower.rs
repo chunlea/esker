@@ -1424,7 +1424,7 @@ fn lower_catalog_function(
     refuse_if(function.filter.is_some(), "an aggregate FILTER clause")?;
     refuse_if(!function.within_group.is_empty(), "WITHIN GROUP")?;
 
-    refuse_wrong_arity(function, func.name(), func.arity())?;
+    refuse_wrong_arities(function, func.name(), func.arities())?;
     let FunctionArguments::List(FunctionArgumentList { args, .. }) = &function.args else {
         // No argument list at all, which `refuse_wrong_arity` has already answered for every
         // function here — none of them takes zero arguments.
@@ -1738,6 +1738,16 @@ fn refuse_wrong_arity(
     name: &'static str,
     wanted: usize,
 ) -> Result<()> {
+    refuse_wrong_arities(function, name, std::slice::from_ref(&wanted))
+}
+
+/// The same, for a function with more than one form — `pg_get_expr` has a two- and a
+/// three-argument one and a real server takes both.
+fn refuse_wrong_arities(
+    function: &sqlparser::ast::Function,
+    name: &str,
+    wanted: &[usize],
+) -> Result<()> {
     use sqlparser::ast::{FunctionArgumentList, FunctionArguments};
     let given: Vec<String> = match &function.args {
         FunctionArguments::List(FunctionArgumentList { args, .. }) => {
@@ -1746,7 +1756,7 @@ fn refuse_wrong_arity(
         FunctionArguments::None => Vec::new(),
         FunctionArguments::Subquery(_) => vec!["record".to_owned()],
     };
-    if given.len() == wanted {
+    if wanted.contains(&given.len()) {
         return Ok(());
     }
     Err(SqlError::UndefinedFunction(format!(
@@ -1834,6 +1844,22 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                 ty.oid(),
             ))))
         }
+        // `'cb'::regclass::oid` — the same value, since a `regclass` here already *is* the oid.
+        (
+            CastTarget::Oid,
+            Expr::Cast {
+                expr: inner,
+                data_type: inner_type,
+                ..
+            },
+        ) if cast_target(inner_type) == Some(CastTarget::RegClass) => {
+            lower_regclass(inner, data_type)
+        }
+        // `'cb'::regclass`. The text is a **name**, read the way `nextval`'s argument is — so
+        // `'"companies"'::regclass`, which is what `ActiveRecord` writes, keeps its case and
+        // `'CB'::regclass` folds. Measured: `'"CB"'::regclass` is `42P01 relation "CB" does not
+        // exist`, quoted spelling and all.
+        (CastTarget::RegClass, _) => lower_regclass(expr, data_type),
         // `'integer'::regtype` on its own, which answers the name PostgreSQL prints it by.
         (CastTarget::RegType, _) => {
             let name = cast_operand(expr, data_type)?;
@@ -1859,6 +1885,19 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             ))))
         }
     }
+}
+
+/// `'name'::regclass` as the call that resolves it.
+///
+/// The name is folded here, where the quoting is still visible, and the *lookup* happens in the
+/// executor — a cast that reads the catalog is a function of the catalog, and one resolved per row
+/// would read it once per row filtered.
+fn lower_regclass(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
+    let name = sequence_reference(&cast_operand(expr, data_type)?);
+    Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+        func: plan::CatalogFunc::RegClass,
+        args: vec![plan::Expr::Literal(plan::Literal::String(name))],
+    })))
 }
 
 /// `0A000` for a comparison over `json` or `jsonb`.
@@ -1956,6 +1995,10 @@ fn cast_operand(expr: &Expr, data_type: &DataType) -> Result<String> {
 /// The two cast targets this node answers, or `None` for every other one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CastTarget {
+    /// PostgreSQL's `regclass`: a **relation**, named. Unlike `regtype` this cannot be answered
+    /// from the text — it is a name to look up in the catalog — so it lowers to a
+    /// [`plan::CatalogFunc::RegClass`] the executor resolves before it plans.
+    RegClass,
     /// PostgreSQL's `regtype`: a type, named.
     RegType,
     /// PostgreSQL's `oid`.
@@ -1964,6 +2007,11 @@ enum CastTarget {
 
 /// `sqlparser` files both as custom type names, since neither is in its `DataType`.
 fn cast_target(data_type: &DataType) -> Option<CastTarget> {
+    // `regclass` is the one of the three `sqlparser` has a variant for — it parses it because
+    // `serial` expands to `nextval('s'::regclass)` — so it never reaches the custom-name path.
+    if matches!(data_type, DataType::Regclass) {
+        return Some(CastTarget::RegClass);
+    }
     let DataType::Custom(name, modifiers) = data_type else {
         return None;
     };
@@ -1972,6 +2020,7 @@ fn cast_target(data_type: &DataType) -> Option<CastTarget> {
     }
     match name.to_string().to_ascii_lowercase().as_str() {
         "regtype" => Some(CastTarget::RegType),
+        "regclass" => Some(CastTarget::RegClass),
         "oid" => Some(CastTarget::Oid),
         _ => None,
     }

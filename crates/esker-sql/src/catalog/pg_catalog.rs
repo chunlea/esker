@@ -39,7 +39,7 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use crate::catalog::{ColumnDef, Relation, TableDef};
+use crate::catalog::{ColumnDef, TableDef};
 use crate::error::{Result, SqlError};
 use crate::value::{ColumnType, Datum, PgType};
 
@@ -49,7 +49,11 @@ use crate::value::{ColumnType, Datum, PgType};
 /// reach here. The id exists because a `TableDef` has one and `EXPLAIN` prints it; no key is ever
 /// built from it, because a view is never scanned — [`crate::exec`]'s access path returns a
 /// [`crate::plan::Node::CatalogView`] before a range is computed.
-const VIEW_ID_BASE: u64 = u64::MAX - 1023;
+///
+/// **Inside `i64`**, because `'pg_type'::regclass` answers this number and `pg_class.oid` is a
+/// `bigint`: above `i64::MAX` every view would clamp to the same value and three of them would
+/// share an oid, which is the failure `crate::catalog::pg_relations` exists to prevent.
+const VIEW_ID_BASE: u64 = (i64::MAX as u64) - 1023;
 
 /// One relation of `pg_catalog`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -66,15 +70,32 @@ pub enum CatalogView {
     PgClass,
     /// The schemas this tenant has, which is one.
     PgNamespace,
+    /// Every column of every relation this tenant has — a table's own, and the ones an index or a
+    /// primary key is over ([`crate::catalog::pg_attribute`]).
+    PgAttribute,
+    /// One row per column that has a **default**, and none for the rest.
+    PgAttrdef,
+    /// The collations this server has, which is none.
+    ///
+    /// Empty for the reason [`CatalogView::PgRange`] is: a collation is a feature this node does
+    /// not have at all, so listing PostgreSQL's 880 would tell a client it could ask for one. What
+    /// makes the emptiness safe is measured — `ActiveRecord` reads it only through
+    /// `LEFT JOIN pg_collation c ON a.attcollation = c.oid AND a.attcollation <> t.typcollation`,
+    /// and that condition is **false for every column on a real server too**, so the answer is
+    /// NULL on both.
+    PgCollation,
 }
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 4] = [
+    pub const ALL: [CatalogView; 7] = [
         CatalogView::PgType,
         CatalogView::PgRange,
         CatalogView::PgClass,
         CatalogView::PgNamespace,
+        CatalogView::PgAttribute,
+        CatalogView::PgAttrdef,
+        CatalogView::PgCollation,
     ];
 
     /// The name a query spells it.
@@ -85,6 +106,9 @@ impl CatalogView {
             CatalogView::PgRange => "pg_range",
             CatalogView::PgClass => "pg_class",
             CatalogView::PgNamespace => "pg_namespace",
+            CatalogView::PgAttribute => "pg_attribute",
+            CatalogView::PgAttrdef => "pg_attrdef",
+            CatalogView::PgCollation => "pg_collation",
         }
     }
 
@@ -97,6 +121,9 @@ impl CatalogView {
                 CatalogView::PgRange => 1,
                 CatalogView::PgClass => 2,
                 CatalogView::PgNamespace => 3,
+                CatalogView::PgAttribute => 4,
+                CatalogView::PgAttrdef => 5,
+                CatalogView::PgCollation => 6,
             }
     }
 
@@ -122,6 +149,11 @@ impl CatalogView {
                 ("typinput", ColumnType::Text),
                 ("typtype", ColumnType::Text),
                 ("typbasetype", ColumnType::Int8),
+                // **Last**, because `SELECT *` expands in this order (`7be39ca`) and a column
+                // added anywhere else would move every one after it. Read only by
+                // `ActiveRecord`'s `columns()`, and only as `a.attcollation <> t.typcollation`
+                // — see `CatalogView::PgCollation`.
+                ("typcollation", ColumnType::Int8),
             ],
             // No `oid`: see the module note. It is what keeps `ON oid = rngtypid` unambiguous.
             CatalogView::PgRange => &[
@@ -137,6 +169,15 @@ impl CatalogView {
                 ("relkind", ColumnType::Text),
             ],
             CatalogView::PgNamespace => &[("oid", ColumnType::Int8), ("nspname", ColumnType::Text)],
+            // In PostgreSQL's own order, restricted to what this node has — `SELECT *` expands in
+            // that order and a client reading by position would otherwise read the wrong column.
+            // `attnum` is an `int2` and `atttypmod` an `int4` on both servers, which is two fewer
+            // declared-type divergences than `pg_class` has.
+            CatalogView::PgAttribute => super::pg_attribute::ATTRIBUTE_COLUMNS,
+            CatalogView::PgAttrdef => super::pg_attribute::ATTRDEF_COLUMNS,
+            CatalogView::PgCollation => {
+                &[("oid", ColumnType::Int8), ("collname", ColumnType::Text)]
+            }
         }
     }
 
@@ -155,6 +196,8 @@ impl CatalogView {
     pub fn rows_of(self, txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
         match self {
             CatalogView::PgClass => pg_class_rows(txn, tenant),
+            CatalogView::PgAttribute => super::pg_attribute::rows(txn, tenant),
+            CatalogView::PgAttrdef => super::pg_attribute::default_rows(txn, tenant),
             CatalogView::PgNamespace => Ok(vec![vec![
                 Datum::Int8(PUBLIC_NAMESPACE_OID),
                 Datum::Text(PUBLIC_SCHEMA.to_owned()),
@@ -182,6 +225,10 @@ impl CatalogView {
                             Datum::Text(typinput(*ty).to_owned()),
                             Datum::Text("b".to_owned()),
                             Datum::Int8(0),
+                            // No collation on any type here, which is what makes
+                            // `a.attcollation <> t.typcollation` false for every column — the
+                            // same answer a real server gives, by the same comparison.
+                            Datum::Int8(0),
                         ]
                     })
                     .collect();
@@ -191,9 +238,14 @@ impl CatalogView {
                 });
                 rows
             }
-            // `PgRange` has none, and the two catalog-backed views never reach here —
-            // `rows_of` answers for those before it delegates.
-            CatalogView::PgRange | CatalogView::PgClass | CatalogView::PgNamespace => Vec::new(),
+            // `PgRange` and `PgCollation` have none, and the catalog-backed views never reach
+            // here — `rows_of` answers for those before it delegates.
+            CatalogView::PgRange
+            | CatalogView::PgCollation
+            | CatalogView::PgClass
+            | CatalogView::PgNamespace
+            | CatalogView::PgAttribute
+            | CatalogView::PgAttrdef => Vec::new(),
         }
     }
 
@@ -280,7 +332,7 @@ const PUBLIC_NAMESPACE_OID: i64 = 11;
 /// The schema every relation is in.
 const PUBLIC_SCHEMA: &str = "public";
 
-/// Every relation this tenant has, out of one scan of the catalog's name records.
+/// Every relation this tenant has, out of the one snapshot every view in this phase reads.
 ///
 /// The value of a name record says which kind of relation it is, and that is exactly what
 /// `relkind` reports. Measured on 19beta1: a table is `r`, an index is `i`, and a sequence is `S`
@@ -288,31 +340,27 @@ const PUBLIC_SCHEMA: &str = "public";
 /// *is* the primary key and no separate index exists. That is the right answer rather than a
 /// convenient one: what `relkind` describes is the relation a client can name, and a client can
 /// name `r4a_pkey`.
+///
+/// The **oid** is [`crate::catalog::pg_relations`]'s, which is what changed here: this function
+/// used to read the id out of the name record's *key*, so a primary key and a sequence both
+/// reported the table's own id and three rows of `pg_class` shared one oid. Nothing read the
+/// column before phase 13; every statement in the schema-dump path joins on it.
 fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
-    let (start, end) = super::record::name_range(tenant);
-    let mut rows: Vec<Vec<Datum>> = Vec::new();
-    for (key, value) in txn.scan(&start, &end, 0)? {
-        let name = super::record::name_of(tenant, &key)?;
-        let relation = super::record::decode_relation(&value)?;
-        let (id, kind) = match relation {
-            Relation::Table { table_id } => (table_id, "r"),
-            Relation::Index { index_id, .. } => (index_id, "i"),
-            Relation::PrimaryKey { table_id } => (table_id, "i"),
-            Relation::Sequence { table_id, .. } => (table_id, "S"),
-        };
-        rows.push(vec![
-            // The relation's own id, where a real server has a 32-bit `oid`. Ours are `u64` and
-            // the column is a `bigint`, which is the trade `pg_type.oid` already makes.
-            Datum::Int8(i64::try_from(id).unwrap_or(i64::MAX)),
-            Datum::Text(name),
-            Datum::Int8(PUBLIC_NAMESPACE_OID),
-            Datum::Text(kind.to_owned()),
-        ]);
-    }
+    let relations = super::pg_relations::Relations::read(txn, tenant)?;
     // By name, which is the order the scan already returns them in and the order a reader can
     // predict. PostgreSQL promises no order without an `ORDER BY`; a deterministic one is a
     // superset of that promise, as `pg_type`'s rows are.
-    Ok(rows)
+    Ok(relations
+        .rows()
+        .map(|relation| {
+            vec![
+                Datum::Int8(relation.oid),
+                Datum::Text(relation.name.clone()),
+                Datum::Int8(PUBLIC_NAMESPACE_OID),
+                Datum::Text(relation.kind.relkind().to_owned()),
+            ]
+        })
+        .collect())
 }
 
 /// `pg_type.typname`: the internal name, which is not the one this node complains with — a column

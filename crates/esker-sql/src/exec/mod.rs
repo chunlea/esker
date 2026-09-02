@@ -1061,21 +1061,76 @@ impl Executor {
         self.notices.push(notice);
     }
 
-    /// Reads every `$n` in a statement as the type its context gives it, leaving a statement with
-    /// no parameters left in it.
+    /// Reads every `$n` in a statement as the type its context gives it, and turns every
+    /// `'name'::regclass` into the oid it names — leaving a statement with neither left in it.
     fn bound(
         &self,
         txn: &dyn Txn,
         mut statement: Statement,
         params: &Params<'_>,
     ) -> Result<Statement> {
-        if params.values.is_empty() && !bind::has_parameters(&statement) {
-            return Ok(statement);
+        if !params.values.is_empty() || bind::has_parameters(&statement) {
+            let tables = self.tables_for(txn, &statement)?;
+            let types = bind::infer(&statement, &tables, params.declared);
+            bind::substitute(&mut statement, params, &types)?;
         }
-        let tables = self.tables_for(txn, &statement)?;
-        let types = bind::infer(&statement, &tables, params.declared);
-        bind::substitute(&mut statement, params, &types)?;
+        self.resolve_regclass(txn, &mut statement)?;
         Ok(statement)
+    }
+
+    /// Replaces every `'name'::regclass` with the oid that name has.
+    ///
+    /// **Once per statement**, here rather than in the row evaluator, for the reason a sequence
+    /// call is resolved before the plan: `WHERE a.attrelid = 'companies'::regclass` is one lookup
+    /// and the evaluator would make it one lookup per row it filtered — over a catalog view, one
+    /// per column of the whole catalog.
+    ///
+    /// A name nothing answers to is `42P01`, which is what a real server says and is the answer
+    /// `ActiveRecord` relies on to tell a missing table from an empty one.
+    fn resolve_regclass(&self, txn: &dyn Txn, statement: &mut Statement) -> Result<()> {
+        use crate::plan::{CatalogFunc, Expr, Literal};
+
+        let mut failure = None;
+        let mut resolve = |expr: &mut Expr| {
+            let Expr::CatalogFunc(call) = expr else {
+                return;
+            };
+            if call.func != CatalogFunc::RegClass {
+                return;
+            }
+            let Some(Expr::Literal(Literal::String(name))) = call.args.first() else {
+                failure.get_or_insert(SqlError::Internal(
+                    "a ::regclass whose argument is not a name".to_owned(),
+                ));
+                return;
+            };
+            match self.relation_oid(txn, name) {
+                Ok(oid) => *expr = Expr::Literal(Literal::Typed(Box::new(Datum::Int8(oid)))),
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+        };
+        bind::walk_mut(statement, &mut resolve);
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// The oid of a relation by name, or `42P01`.
+    ///
+    /// A `pg_catalog` view answers with its own reserved id, which is what makes
+    /// `'pg_class'::regclass` a number rather than a refusal — a real server answers there too, and
+    /// this node's `pg_class` really does hold `pg_class`'s columns.
+    fn relation_oid(&self, txn: &dyn Txn, name: &str) -> Result<i64> {
+        if let Some(view) = crate::catalog::pg_catalog::view(name) {
+            return Ok(i64::try_from(view.table_def().id).unwrap_or(i64::MAX));
+        }
+        crate::catalog::pg_relations::Relations::read(txn, self.tenant)?
+            .by_name(name)
+            .map(|relation| relation.oid)
+            .ok_or_else(|| SqlError::UndefinedTable(name.to_owned()))
     }
 
     /// The tables a statement is about, in the order their columns appear in a row.

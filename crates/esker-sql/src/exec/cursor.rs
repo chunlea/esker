@@ -966,6 +966,17 @@ fn catalog_function(
             type_oid_argument(args.first())?,
             typmod_argument(args.get(1))?,
         ),
+        // The identity on its first argument, which is where the printed expression already is —
+        // and NULL-propagating, so a `LEFT JOIN pg_attrdef` that matched nothing is NULL rather
+        // than an error. The third argument is `pretty`, which changes nothing this node prints.
+        CatalogFunc::PgGetExpr => args.first().cloned().unwrap_or(Datum::Null),
+        // Resolved before the plan was built (`crate::exec::Executor::bound`). One here means the
+        // resolution was skipped, and answering it from the row would be a catalog read per row.
+        CatalogFunc::RegClass => {
+            return Err(SqlError::Internal(
+                "a ::regclass reached the row evaluator unresolved".to_owned(),
+            ));
+        }
     })
 }
 
@@ -981,6 +992,8 @@ fn type_oid_argument(arg: Option<&Datum>) -> Result<Option<i64>> {
     Ok(match arg {
         None | Some(Datum::Null) => None,
         Some(Datum::Int8(oid)) => Some(*oid),
+        Some(Datum::Int4(oid)) => Some(i64::from(*oid)),
+        Some(Datum::Int2(oid)) => Some(i64::from(*oid)),
         Some(Datum::Text(name)) => {
             use crate::value::PgType as _;
             let ty = crate::value::type_by_name(name)
@@ -1000,6 +1013,10 @@ fn type_oid_argument(arg: Option<&Datum>) -> Result<Option<i64>> {
 fn typmod_argument(arg: Option<&Datum>) -> Result<Option<i32>> {
     Ok(match arg {
         None | Some(Datum::Null) => None,
+        // An `int4` is what `pg_attribute.atttypmod` is on both servers, and an `int8` is what a
+        // literal written in the statement is. Both are the same number.
+        Some(Datum::Int4(typmod)) => Some(*typmod),
+        Some(Datum::Int2(typmod)) => Some(i32::from(*typmod)),
         Some(Datum::Int8(typmod)) => Some(i32::try_from(*typmod).unwrap_or(i32::MAX)),
         Some(other) => {
             return Err(SqlError::DatatypeMismatch(format!(

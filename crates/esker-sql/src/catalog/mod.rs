@@ -39,7 +39,9 @@
 //! anyway.
 
 pub mod def_functions;
+pub mod pg_attribute;
 pub mod pg_catalog;
+pub mod pg_relations;
 mod record;
 
 use std::collections::BTreeMap;

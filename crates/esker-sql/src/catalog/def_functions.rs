@@ -96,6 +96,101 @@ pub fn type_of_oid(oid: i64) -> Option<ColumnType> {
         .find(|ty| i64::from(ty.oid()) == oid)
 }
 
+/// A stored constant as `pg_get_expr` prints it — what `pg_attrdef.adbin` holds and what
+/// `information_schema.columns.column_default` shows.
+///
+/// PostgreSQL prints a default from the parse tree it stored, so the **cast it names is the type
+/// the literal was written as**, not the column's. Measured on 19beta1, every one of these over a
+/// column of a different type:
+///
+/// | written | printed |
+/// |---|---|
+/// | `int8 DEFAULT 3` | `3` |
+/// | `int8 DEFAULT -3`, `int4 DEFAULT -3`, `int2 DEFAULT -3` | `'-3'::integer` |
+/// | `int4 DEFAULT 2147483647` | `2147483647` |
+/// | `int8 DEFAULT 9999999999` | `'9999999999'::bigint` |
+/// | `int8 DEFAULT -9999999999` | `'-9999999999'::bigint` |
+/// | `float8 DEFAULT 2` | `2` |
+/// | `float8 DEFAULT -2` | `'-2'::integer` |
+/// | `float4 DEFAULT 1.5`, `float8 DEFAULT 0.1` | `1.5`, `0.1` |
+/// | `float8 DEFAULT -1.5` | `'-1.5'::numeric` |
+/// | `bool DEFAULT true` | `true` |
+/// | `text DEFAULT 'x'` | `'x'::text` |
+/// | `text DEFAULT 'it''s'` | `'it''s'::text` |
+/// | `varchar(5) DEFAULT 'ab'` | `'ab'::character varying` — the type **without** its length |
+/// | `character(3) DEFAULT 'ab'` | `'ab'::bpchar` — and `bpchar`, not `character(3)` |
+/// | `timestamp DEFAULT '2020-01-01 00:00:00'` | `'2020-01-01 00:00:00'::timestamp without time zone` |
+/// | `jsonb DEFAULT '{"b":2}'` | `'{"b": 2}'::jsonb` — canonicalised on the way in |
+///
+/// So the rule is about the **value**, not the column, and it reproduces from the value alone: a
+/// number that prints as digits with no point or exponent is an integer literal, which is
+/// `integer` when it fits in 32 bits and `bigint` when it does not, and it needs no cast at all
+/// when it is `integer` and not negative; a number that prints with a point or an exponent is a
+/// `numeric` literal, which needs no cast when it is not negative. Everything else is quoted, with
+/// `'` doubled, and cast to the column's own type spelled bare.
+///
+/// One shape this cannot reproduce, and it is named rather than approximated: an integer-looking
+/// value too large for 32 bits in a **float** column is `'10000000000'::numeric` there and
+/// `'10000000000'::bigint` here, because reaching `numeric` needs a `numeric`. The digits inside
+/// the quotes — the half every client parses — are identical.
+#[must_use]
+pub fn constant_expression(value: &Datum, ty: ColumnType) -> String {
+    use crate::value::PgDatum as _;
+
+    // A boolean prints as the word, where its *output function* writes one character. The two are
+    // different functions and this is the one that a `::text` cast and a stored default share.
+    if let Datum::Bool(flag) = value {
+        return (if *flag { "true" } else { "false" }).to_owned();
+    }
+    let Some(text) = value.to_text() else {
+        return "NULL".to_owned();
+    };
+    match numeric_literal(&text) {
+        Some(literal) => literal,
+        // Quoted, with every `'` doubled, and cast to this column's type written bare — no length
+        // and no precision, which is what `format_type(oid, -1)` gives and what the capture shows.
+        None => format!(
+            "'{}'::{}",
+            text.replace('\'', "''"),
+            value::format_type(ty, value::NO_TYPMOD)
+        ),
+    }
+}
+
+/// A number as a default expression, or `None` for a value that is not one.
+///
+/// The `strspn` rule PostgreSQL's own `get_const_expr` uses: a constant prints unquoted only when
+/// every character of it is one the scanner would take unquoted. `NaN` and `Infinity` are the
+/// values that fail it for a float, and they are quoted and cast like a string.
+fn numeric_literal(text: &str) -> Option<String> {
+    if text.is_empty()
+        || !text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'e' | b'E' | b'.'))
+    {
+        return None;
+    }
+    let negative = text.starts_with('-');
+    // A point or an exponent makes it a `numeric` literal rather than an integer one, and a
+    // `numeric` needs a cast only when it is negative.
+    if text.contains(['.', 'e', 'E']) {
+        return Some(if negative {
+            format!("'{text}'::numeric")
+        } else {
+            text.to_owned()
+        });
+    }
+    let Ok(number) = text.parse::<i128>() else {
+        return Some(format!("'{text}'::numeric"));
+    };
+    let fits_int4 = i32::try_from(number).is_ok();
+    Some(match (negative, fits_int4) {
+        (false, true) => text.to_owned(),
+        (_, true) => format!("'{text}'::integer"),
+        (_, false) => format!("'{text}'::bigint"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

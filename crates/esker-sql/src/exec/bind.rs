@@ -236,7 +236,7 @@ fn walk_predicate(
 }
 
 /// Visits every expression in a statement, for substitution.
-fn walk_mut(statement: &mut Statement, visit: &mut impl FnMut(&mut Expr)) {
+pub(super) fn walk_mut(statement: &mut Statement, visit: &mut impl FnMut(&mut Expr)) {
     match statement {
         Statement::Insert(insert) => {
             for row in &mut insert.rows {

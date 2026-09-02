@@ -196,6 +196,22 @@ pub enum CatalogFunc {
     /// typmod on a type that takes none, and this one ignores it
     /// ([`crate::catalog::def_functions`]).
     FormatType,
+    /// `pg_get_expr(expr, relid)` and `pg_get_expr(expr, relid, pretty)`: a stored expression,
+    /// printed.
+    ///
+    /// On a real server the first argument is a `pg_node_tree` and this parses and re-prints it.
+    /// Here `pg_attrdef.adbin` **holds the printed text already**, so this is the identity on it —
+    /// a divergence visible in exactly one statement (`SELECT adbin`) and in none `ActiveRecord`
+    /// writes, because the only way it reads that column is through this function.
+    PgGetExpr,
+    /// `'name'::regclass`: the oid of a relation, by name.
+    ///
+    /// Not a function a client can call by that name — it is the cast, lowered to one, because a
+    /// cast that has to look a name up in the catalog is a function of the catalog and not of the
+    /// text. **Resolved before the plan is built** (`crate::exec::Executor::bound`), the way a
+    /// sequence call is: once per statement, not once per row, or a `WHERE attrelid =
+    /// 'x'::regclass` would read the catalog for every row it filtered.
+    RegClass,
 }
 
 impl CatalogFunc {
@@ -205,6 +221,7 @@ impl CatalogFunc {
     pub fn from_name(name: &str) -> Option<CatalogFunc> {
         match () {
             () if name.eq_ignore_ascii_case("format_type") => Some(CatalogFunc::FormatType),
+            () if name.eq_ignore_ascii_case("pg_get_expr") => Some(CatalogFunc::PgGetExpr),
             () => None,
         }
     }
@@ -214,23 +231,33 @@ impl CatalogFunc {
     pub fn name(self) -> &'static str {
         match self {
             CatalogFunc::FormatType => "format_type",
+            CatalogFunc::PgGetExpr => "pg_get_expr",
+            CatalogFunc::RegClass => "regclass",
         }
     }
 
-    /// How many arguments it takes. PostgreSQL resolves by name *and* arity, and answers `42883`
-    /// naming the number rather than running the function it nearly matched.
+    /// How many arguments it takes, in the order PostgreSQL lists the overloads.
+    ///
+    /// A **set**, because two of these have more than one form and PostgreSQL resolves by name
+    /// *and* arity: `format_type(23)` is `42883` naming the number of arguments rather than
+    /// running the two-argument function it nearly matched, and `pg_get_expr` really does have
+    /// both a two- and a three-argument form.
     #[must_use]
-    pub fn arity(self) -> usize {
+    pub fn arities(self) -> &'static [usize] {
         match self {
-            CatalogFunc::FormatType => 2,
+            CatalogFunc::FormatType => &[2],
+            CatalogFunc::PgGetExpr => &[2, 3],
+            CatalogFunc::RegClass => &[1],
         }
     }
 
-    /// The type of its result, which is `text` for every one of them.
+    /// The type of its result.
     #[must_use]
     pub fn result_type(self) -> ColumnType {
         match self {
-            CatalogFunc::FormatType => ColumnType::Text,
+            CatalogFunc::FormatType | CatalogFunc::PgGetExpr => ColumnType::Text,
+            // An `oid` on a real server, and a `bigint` here for the reason `pg_class.oid` is one.
+            CatalogFunc::RegClass => ColumnType::Int8,
         }
     }
 }
