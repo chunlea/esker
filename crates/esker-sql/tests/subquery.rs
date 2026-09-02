@@ -37,7 +37,9 @@ fn names(node: &mut parity::Node, sql: &str) -> Vec<String> {
         esker_sql::pgwire::session::Outcome::Rows { fields, .. } => {
             fields.into_iter().map(|field| field.name).collect()
         }
-        other => panic!("{sql} returned no result set: {other:?}"),
+        other @ esker_sql::pgwire::session::Outcome::Done { .. } => {
+            panic!("{sql} returned no result set: {other:?}")
+        }
     }
 }
 

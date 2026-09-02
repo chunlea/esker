@@ -1588,15 +1588,6 @@ fn subquery_operand(
 /// lifted to two columns. Coarse in the safe direction: it refuses only pairs that no cast in
 /// PostgreSQL relates either, so it cannot turn a comparison a real server runs into an error.
 fn same_family(left: ColumnType, right: ColumnType) -> bool {
-    // **`json` compares with nothing, including another `json`.** Measured:
-    // `'{"a":1}'::json = '{"a":1}'::json` is `42883 operator does not exist: json = json` -- the
-    // type has no equality operator at all, which is a property of it rather than a gap, and is
-    // why `json` cannot be a key, `DISTINCT`ed or grouped either. So this is checked before the
-    // families, because a family test says "the same type compares with itself" and here that is
-    // the case PostgreSQL refuses.
-    if matches!(left, ColumnType::Json) || matches!(right, ColumnType::Json) {
-        return false;
-    }
     fn family(ty: ColumnType) -> u8 {
         match ty {
             ColumnType::Int8
@@ -1616,6 +1607,15 @@ fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // type added here is a compile error rather than a silent family 6.
             ColumnType::Json => 6,
         }
+    }
+    // **`json` compares with nothing, including another `json`.** Measured:
+    // `'{"a":1}'::json = '{"a":1}'::json` is `42883 operator does not exist: json = json` -- the
+    // type has no equality operator at all, which is a property of it rather than a gap, and is
+    // why `json` cannot be a key, `DISTINCT`ed or grouped either. So this is checked before the
+    // families, because a family test says "the same type compares with itself" and here that is
+    // the case PostgreSQL refuses.
+    if matches!(left, ColumnType::Json) || matches!(right, ColumnType::Json) {
+        return false;
     }
     family(left) == family(right)
 }
