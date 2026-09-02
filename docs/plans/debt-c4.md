@@ -441,6 +441,52 @@ Recorded because the wave found it and fixed it, not to argue about who owned it
 
 ---
 
+## Closing: the gate at HEAD, and what it says
+
+### `just check`, from a detached worktree at `548dd62`
+
+Run in a worktree rather than at the desk, because this working tree carries the type lane's live
+edits and `esker-cli` links `esker-keys` — a green run there would mean nothing
+(`git worktree add --detach`, the habit `docs/plans/debt-c3.md` bought).
+
+| step | result |
+|---|---|
+| `fmt` | ✅ |
+| `clippy` (`--workspace --all-targets --all-features -D warnings`) | ✅ |
+| `deny` | ✅ |
+| `test` | ✅ for this lane — see below |
+| `doc` | ❌ **not this lane's**: `esker-columnar`'s `Floats` and `Real` link the private `crate::encode::float` |
+
+The full run at `f090674`, before unit 9's fix: **2,384 tests run, 2,383 passed, 1 failed, 36
+skipped** — the failure being the promotion test unit 9 is about. The run at `548dd62`, with unit 9
+in and the type lane's `ba8ed2e` beneath it: **1,845 of 2,397 run, 1,844 passed, 1 failed, 36
+skipped** (nextest cancels the remainder on a failure). That one failure is
+`esker-sql::pd_wiring::an_alter_reports_every_range_that_wants_columnar_replicas`, which is **5 of 5
+green in isolation at `548dd62` and green at `ba8ed2e` too** — load-sensitive inside a parallel run,
+in a crate this lane may not touch, and not a regression.
+
+The `doc` failure is the same class as `d1a798f` ("two public doc comments linked private items,
+which `just doc` denies"). The fix is two lines in `esker-columnar`, which is the type lane's; it is
+in this lane's report as an exact diff rather than edited here.
+
+### Unit 9's verification, which is the number that matters
+
+`a_learner_on_a_fresh_store_becomes_a_voter_under_load`:
+
+| configuration | before `548dd62` | after |
+|---|---:|---:|
+| `RUST_LOG=esker_store=debug,esker_pd=debug` — **deterministic** | **0 of 8 passed** | **8 of 8 passed** |
+| plain, at this HEAD | — | **5 of 5 passed** |
+| plain, at the pre-wave HEAD `8432814` | 4 of 6 passed | — |
+
+The middle row is the one to keep hold of. **Debug logging widens the window enough to make the race
+certain**, which is what turned a one-in-three flake into a reproduction and produced the trace that
+named the mechanism. Counting runs would have taken all night and proved less.
+
+The bottom row is the attribution: the bug predates the wave.
+
+---
+
 ## What this wave did not do
 
 * **`pd serve` still exposes no `PdOptions` field.** Unit 7 closed the `esker server` half of
@@ -452,4 +498,6 @@ Recorded because the wave found it and fixed it, not to argue about who owned it
   `docs/plans/phase-4-pd.md` §12.3 bullet 3 (unit 5), `docs/plans/phase-4.md` §14.6 bullet 3
   (unit 6), and `docs/plans/debt-c1.md` §"What this lane did not do" bullets 1 and 2 (units 3
   and 8).
-
+* **The `doc` step is red on `esker-columnar`**, and this lane may not touch that crate. Two public
+  doc comments link `crate::encode::float`, which is private. `just check` is red for both lanes on
+  that step alone until the type lane unlinks them or makes the module public.
