@@ -39,6 +39,28 @@ const NODES: u64 = 4;
 /// this file is about — arriving from the wrong direction.
 static PORTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Runs the binary once, and throws the result away.
+///
+/// **macOS charges for the first execution of a freshly linked binary.** `syspolicyd` evaluates it
+/// — Gatekeeper, notarisation, the provenance check — while the process sits at `_dyld_start` at
+/// 0% CPU, and on a loaded box that has taken tens of seconds. This test spawns the binary as a
+/// subprocess and then gives the cluster a sixty-second budget to register four stores, so on the
+/// first run after a rebuild the two overlap and the budget pays for the evaluation. Seen three
+/// times in one session, every time at 60.2 s and every time on the run right after a build, with
+/// the same command passing in **0.33 s** immediately afterwards.
+///
+/// Paying it here, before the clock starts, is the whole fix: the second execution is free, so the
+/// budget measures the cluster rather than the operating system. An invocation that fails is
+/// ignored on purpose — this is a warm-up and not an assertion, and
+/// [`the_kill_command_exists`](super) is the file that checks the tools are there.
+fn warm_the_binary() {
+    let _unused = Command::new(env!("CARGO_BIN_EXE_esker-cli"))
+        .arg("--help")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// A run of `NODES + 1` free ports: the stores' own, and the driver's one above them.
 fn free_port_run() -> u16 {
     let span = usize::try_from(NODES).unwrap() + 1;
@@ -96,6 +118,7 @@ fn a_four_node_cluster_with_a_driver_registers_four_stores() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let data_dir = TempDir::new().unwrap();
     let base_port = free_port_run();
+    warm_the_binary();
 
     let supervisor = Supervisor(
         Command::new(env!("CARGO_BIN_EXE_esker-cli"))
@@ -154,6 +177,8 @@ fn a_driver_that_cannot_listen_is_a_failure_and_not_a_cluster() {
     // Held for the whole test: the driver's port belongs to somebody else.
     let _squatter = TcpListener::bind(("127.0.0.1", pd_port)).expect("the driver's port is free");
 
+    // Under nextest each test is its own process, so the other one's warm-up does not help.
+    warm_the_binary();
     let mut command = Command::new(env!("CARGO_BIN_EXE_esker-cli"));
     command
         .arg("cluster")
