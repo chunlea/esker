@@ -1,0 +1,108 @@
+Cargo.lock
+  h_44076b318daf9c 403
+crates/esker-client/tests/sim_retry.rs
+  h_44076b318daf9c 1-344
+crates/esker-columnar/src/column.rs
+  h_44076b318daf9c 100,130,133-138,177,464-469
+crates/esker-columnar/src/encode/mod.rs
+  h_44076b318daf9c 157,168-171,261
+crates/esker-columnar/src/fragment/codec.rs
+  h_44076b318daf9c 442
+crates/esker-columnar/src/stats.rs
+  h_44076b318daf9c 122,270,780-784
+crates/esker-columnar/src/value.rs
+  h_44076b318daf9c 83-86,91,103,122,140,165,174,217-220,292,380-386,528,536-543,561-564
+crates/esker-columnar/tests/bench_scan.rs
+  h_44076b318daf9c 148,153-156
+crates/esker-columnar/tests/differential.rs
+  h_44076b318daf9c 400
+crates/esker-columnar/tests/roundtrip.rs
+  h_44076b318daf9c 109
+crates/esker-keys/src/columnar.rs
+  h_44076b318daf9c 71,88
+crates/esker-keys/src/row.rs
+  h_44076b318daf9c 301,309-312,536,968-970
+crates/esker-keys/src/value.rs
+  h_44076b318daf9c 115-124,146,152,248-258
+crates/esker-pd/Cargo.toml
+  h_44076b318daf9c 37-40
+crates/esker-pd/tests/sim_balance.rs
+  h_44076b318daf9c 1-345
+crates/esker-sim/src/lib.rs
+  h_44076b318daf9c 22
+crates/esker-sim/src/mech/mod.rs
+  h_44076b318daf9c 1-49
+crates/esker-sim/src/mech/placement.rs
+  h_44076b318daf9c 1-762
+crates/esker-sim/src/mech/reference.rs
+  h_44076b318daf9c 1-115
+crates/esker-sim/src/mech/retry.rs
+  h_44076b318daf9c 1-471
+crates/esker-sim/tests/mech_placement.rs
+  h_44076b318daf9c 1-100
+crates/esker-sql/src/catalog/mod.rs
+  h_44076b318daf9c 49,78,80-94,302-328,1374,1382,1420,1472,1483-1486,1489-1492,1541-1630,2004-2008,2034,2084
+crates/esker-sql/src/catalog/pg_catalog.rs
+  h_44076b318daf9c 175-176,236,259
+crates/esker-sql/src/catalog/record.rs
+  h_44076b318daf9c 52,58-62,69,115-117,164,181,598-601,645-652,656,846-856
+crates/esker-sql/src/error.rs
+  h_44076b318daf9c 645-665,873-879
+crates/esker-sql/src/exec/bind.rs
+  h_44076b318daf9c 431
+crates/esker-sql/src/exec/ddl.rs
+  h_44076b318daf9c 70,97,540
+crates/esker-sql/src/exec/dml.rs
+  h_44076b318daf9c 108-128,220,437
+crates/esker-sql/src/exec/fragment.rs
+  h_44076b318daf9c 557
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 19-24,33,757,804,885,930,1813,1821-1896,1906-1907,1917-1921
+crates/esker-sql/src/plan/ddl.rs
+  h_44076b318daf9c 40,42-44,58-63
+crates/esker-sql/src/plan/expr.rs
+  h_44076b318daf9c 427-429,467-469,486
+crates/esker-sql/src/row.rs
+  h_44076b318daf9c 51-53
+crates/esker-sql/src/sqlstate.rs
+  h_44076b318daf9c 52-57
+crates/esker-sql/src/value/mod.rs
+  h_44076b318daf9c 42-172,207,222,241,329-331,401,686-687,693
+crates/esker-sql/src/value/timestamp.rs
+  h_44076b318daf9c 58-90
+crates/esker-sql/tests/corpus/pg19_order.txt
+  h_44076b318daf9c 28-34
+crates/esker-sql/tests/corpus/pg19_typmod.txt
+  h_44076b318daf9c 1-84
+crates/esker-sql/tests/lowering.rs
+  h_44076b318daf9c 76-77,79-84
+crates/esker-sql/tests/pg_catalog.rs
+  h_44076b318daf9c 183-184
+crates/esker-sql/tests/row_order.rs
+  h_44076b318daf9c 75-76
+crates/esker-sql/tests/slt/unsupported.slt
+  h_44076b318daf9c 69-70,72
+crates/esker-sql/tests/timestamp.rs
+  h_44076b318daf9c 84-86,88-95,97,99-107
+crates/esker-sql/tests/varchar.rs
+  h_44076b318daf9c 90,92-94,96,98-149,152-153
+crates/esker-store/src/columnar/decode.rs
+  h_44076b318daf9c 162,172
+docs/adr/0033-tier-1-of-the-type-surface.md
+  h_44076b318daf9c 136-141
+docs/plans/phase-11-engine.md
+  h_44076b318daf9c 131-132,231-324
+docs/plans/phase-9-rails.md
+  h_44076b318daf9c 964-1031
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "3eeb0e240781ab1c93638cee9f5bfb368fa724ca",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
