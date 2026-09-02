@@ -1,4 +1,4 @@
-# 0042 — A subquery is a plan node, run once or per outer row
+# 0043 — A subquery is a plan node, run once or per outer row
 
 Status: **accepted**, and built — `docs/plans/phase-12-subquery.md`, units 1–5.
 `crates/esker-sql/src/plan/subquery.rs` and `plan/cte.rs` are the types,

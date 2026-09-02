@@ -867,8 +867,7 @@ impl Executor {
             .iter()
             .map(|join| subquery::relation_of(&join.table, &catalogued))
             .collect::<Result<Vec<_>>>()?;
-        let inner_refs: Vec<&crate::catalog::TableDef> =
-            inners.iter().map(std::convert::AsRef::as_ref).collect();
+        let inner_refs: Vec<&crate::catalog::TableDef> = inners.iter().map(AsRef::as_ref).collect();
         let mut planned = query::plan(select, self.tenant, table.as_deref(), &inner_refs)?;
         // **After the row plan, never instead of it.** Routing is a rewrite of a plan that already
         // exists and is already correct, which is what lets a refusal be answered by putting the

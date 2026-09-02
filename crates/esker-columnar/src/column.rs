@@ -130,12 +130,15 @@ impl ColumnData {
             // write eight bytes for a four-byte type. `encode::float` has the argument.
             ColumnType::Real => ColumnData::Floats(Vec::new()),
             ColumnType::Bool => ColumnData::Bools(Vec::new()),
-            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Bytea => {
-                ColumnData::Bytes {
-                    offsets: vec![0],
-                    data: Vec::new(),
-                }
-            }
+            ColumnType::Text
+            | ColumnType::Varchar
+            | ColumnType::Bpchar
+            | ColumnType::Json
+            | ColumnType::Jsonb
+            | ColumnType::Bytea => ColumnData::Bytes {
+                offsets: vec![0],
+                data: Vec::new(),
+            },
         }
     }
 
@@ -174,7 +177,12 @@ impl ColumnData {
                 | (ColumnData::Bools(_), ColumnType::Bool)
                 | (
                     ColumnData::Bytes { .. },
-                    ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Bytea
+                    ColumnType::Text
+                        | ColumnType::Varchar
+                        | ColumnType::Bpchar
+                        | ColumnType::Json
+                        | ColumnType::Jsonb
+                        | ColumnType::Bytea
                 )
         )
     }
@@ -461,12 +469,15 @@ impl ColumnBuilder {
             ColumnType::Double => ColumnData::Doubles(std::mem::take(&mut self.doubles)),
             ColumnType::Real => ColumnData::Floats(std::mem::take(&mut self.floats)),
             ColumnType::Bool => ColumnData::Bools(std::mem::take(&mut self.bools)),
-            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Bytea => {
-                ColumnData::Bytes {
-                    offsets: std::mem::replace(&mut self.offsets, vec![0]),
-                    data: std::mem::take(&mut self.data),
-                }
-            }
+            ColumnType::Text
+            | ColumnType::Varchar
+            | ColumnType::Bpchar
+            | ColumnType::Json
+            | ColumnType::Jsonb
+            | ColumnType::Bytea => ColumnData::Bytes {
+                offsets: std::mem::replace(&mut self.offsets, vec![0]),
+                data: std::mem::take(&mut self.data),
+            },
         };
         self.nulls.clear();
         Column::new(self.ty, nulls, data)

@@ -178,6 +178,8 @@ fn activerecord_s_four_type_map_queries_answer() {
             vec!["21", "int2", "0", ",", "int2in", "\\N", "b", "0"],
             vec!["23", "int4", "0", ",", "int4in", "\\N", "b", "0"],
             vec!["25", "text", "0", ",", "textin", "\\N", "b", "0"],
+            // Tier 2's first pair, and `ActiveRecord`'s list of forty names holds both.
+            vec!["114", "json", "0", ",", "json_in", "\\N", "b", "0"],
             vec!["700", "float4", "0", ",", "float4in", "\\N", "b", "0"],
             vec!["701", "float8", "0", ",", "float8in", "\\N", "b", "0"],
             // `bpchar` is `character(n)`'s internal name and is in this query's list of forty.
@@ -203,6 +205,7 @@ fn activerecord_s_four_type_map_queries_answer() {
                 "b",
                 "0"
             ],
+            vec!["3802", "jsonb", "0", ",", "jsonb_in", "\\N", "b", "0"],
         ]
     );
 

@@ -553,6 +553,7 @@ fn finish_plan(
     // the target list does not contain has no defined position to sort at. Its keys are resolved
     // against the *output* columns and a key that is not one of them is `42P10`.
     let sort_keys = order_keys(select, scope, aggregation.as_ref(), &exprs, &columns)?;
+    refuse_json_sort(&sort_keys)?;
     if !select.distinct && !sort_keys.is_empty() {
         node = Node::Sort {
             input: Box::new(node),
@@ -592,6 +593,27 @@ fn finish_plan(
         column_names: scope_column_names(scope),
         engine: None,
     })
+}
+
+/// `0A000` for an `ORDER BY` over a `json` or `jsonb` column.
+///
+/// Sorting one would compare the stored text as bytes, and that is neither type's order: a `jsonb`
+/// sorts by **kind** first (`Object > Array > Boolean > Number > String > Null`) and compares
+/// numbers numerically, so `null` sorts below `1.00` where its bytes sort above it. `json` has no
+/// ordering operators at all on a real server. Refusing is contract C2; answering from the bytes
+/// would be a wrong answer, which is what ADR 0042 is about.
+fn refuse_json_sort(keys: &[SortKey]) -> Result<()> {
+    for key in keys {
+        if let Expr::Ordinal { ty, .. } = &key.expr
+            && matches!(ty, ColumnType::Json | ColumnType::Jsonb)
+        {
+            return Err(SqlError::unsupported(format!(
+                "ORDER BY over a {} column",
+                ty.name()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Every column of every table in scope, in row order, so `EXPLAIN` can print the name a user
@@ -1552,6 +1574,15 @@ fn subquery_operand(
 /// lifted to two columns. Coarse in the safe direction: it refuses only pairs that no cast in
 /// PostgreSQL relates either, so it cannot turn a comparison a real server runs into an error.
 fn same_family(left: ColumnType, right: ColumnType) -> bool {
+    // **`json` compares with nothing, including another `json`.** Measured:
+    // `'{"a":1}'::json = '{"a":1}'::json` is `42883 operator does not exist: json = json` -- the
+    // type has no equality operator at all, which is a property of it rather than a gap, and is
+    // why `json` cannot be a key, `DISTINCT`ed or grouped either. So this is checked before the
+    // families, because a family test says "the same type compares with itself" and here that is
+    // the case PostgreSQL refuses.
+    if matches!(left, ColumnType::Json) || matches!(right, ColumnType::Json) {
+        return false;
+    }
     fn family(ty: ColumnType) -> u8 {
         match ty {
             ColumnType::Int8
@@ -1563,6 +1594,13 @@ fn same_family(left: ColumnType, right: ColumnType) -> bool {
             ColumnType::Bool => 2,
             ColumnType::Bytea => 3,
             ColumnType::TimestampTz | ColumnType::Timestamp => 4,
+            // `jsonb` **is** ordered -- `=`, `<>` and `<` all work and `ORDER BY` sorts by it --
+            // and it is its own family: `json = jsonb` is `42883` like everything else about
+            // `json`, and there is no implicit cast between `jsonb` and `text`. Measured.
+            ColumnType::Jsonb => 5,
+            // Unreachable: returned above, and kept as an arm rather than a `_` so that the next
+            // type added here is a compile error rather than a silent family 6.
+            ColumnType::Json => 6,
         }
     }
     family(left) == family(right)

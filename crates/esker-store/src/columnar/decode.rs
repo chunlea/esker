@@ -170,6 +170,8 @@ fn columnar_type(ty: StoredType) -> esker_columnar::ColumnType {
         StoredType::Real => esker_columnar::ColumnType::Real,
         StoredType::Varchar => esker_columnar::ColumnType::Varchar,
         StoredType::Bpchar => esker_columnar::ColumnType::Bpchar,
+        StoredType::Json => esker_columnar::ColumnType::Json,
+        StoredType::Jsonb => esker_columnar::ColumnType::Jsonb,
         StoredType::Text => esker_columnar::ColumnType::Text,
         StoredType::Bool => esker_columnar::ColumnType::Bool,
         StoredType::Bytea => esker_columnar::ColumnType::Bytea,

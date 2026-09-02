@@ -397,7 +397,11 @@ fn literal(rng: &mut Pcg32, ty: ColumnType) -> Value {
         ColumnType::TimestampTz => {
             Value::TimestampTz(757_382_400_000_000 + i64::from(rng.below(10_000)))
         }
-        ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => {
+        ColumnType::Text
+        | ColumnType::Varchar
+        | ColumnType::Bpchar
+        | ColumnType::Json
+        | ColumnType::Jsonb => {
             let pool = ["", "alpha", "beta", "\u{1f600}", "zzz"];
             Value::Text(pool[rng.below(pool.len() as u32) as usize].to_owned())
         }

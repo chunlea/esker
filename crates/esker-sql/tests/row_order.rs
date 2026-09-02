@@ -54,6 +54,18 @@ fn encoded_keys_sort_the_way_postgresql_sorts_the_values() {
     }
 
     for ty in ColumnType::ALL {
+        // `json` and `jsonb` are the two types that **cannot** be index columns, so there is no
+        // key order for a fixture to check: `jsonb`'s equality is not its byte equality, which is
+        // exactly why ADR 0042 keeps it out of a key. Exempting them here rather than inventing a
+        // fixture is the honest form of this assertion — and it is narrow, so the next type that
+        // forgets its fixture still fails.
+        if matches!(ty, ColumnType::Json | ColumnType::Jsonb) {
+            assert!(
+                !types_seen.contains(&ty),
+                "{ty:?} has an ordering fixture and cannot be an index column"
+            );
+            continue;
+        }
         assert!(
             types_seen.contains(&ty),
             "{ty:?} has no ordering fixture; a type whose key order is unchecked is a type whose \

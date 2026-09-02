@@ -790,7 +790,7 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
   large dependency exception, `sqlparser`, PostgreSQL dialect, by ADR) → catalog in `'m'` key space →
   planner/executor over `esker-client` transactions, using the `'t'` key layout from §3. Postgres
   compatibility is a surface, not a storage format.
-  **A subquery is a plan node** ([ADR 0042](adr/0042-a-subquery-is-a-plan-node-run-once-or-per-row.md)):
+  **A subquery is a plan node** ([ADR 0043](adr/0043-a-subquery-is-a-plan-node-run-once-or-per-row.md)):
   one that names nothing outside itself runs **once**, before the cursor opens — the same pass shape
   that fills a `Node::Columnar` from its fragments — and one that names an outer column runs **once per
   outer row**, with the outer values substituted into a copy of the sub-plan first, so what a cursor

@@ -115,6 +115,10 @@ const TAG_REAL: u8 = 11;
 /// `character(n)`, whose internal name is `bpchar`. Version 4's type, and the reason version 4
 /// exists: it is the one type that cannot be declared without a typmod.
 const TAG_BPCHAR: u8 = 12;
+/// `json`, tier 2's first type ([ADR 0042](../../../docs/adr/0042-json-and-jsonb-are-two-types-and-one-of-them-is-not-a-key.md)).
+const TAG_JSON: u8 = 13;
+/// `jsonb`, its canonicalising twin.
+const TAG_JSONB: u8 = 14;
 
 /// Tags for [`SchemaState`] as stored. Ours, and they must never move: an index read as the wrong
 /// state is an index a node writes when it should not, which is the whole failure ADR 0020 is about.
@@ -162,6 +166,8 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Int2 => TAG_INT2,
         ColumnType::Real => TAG_REAL,
         ColumnType::Bpchar => TAG_BPCHAR,
+        ColumnType::Json => TAG_JSON,
+        ColumnType::Jsonb => TAG_JSONB,
     }
 }
 
@@ -179,6 +185,8 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_INT2 => ColumnType::Int2,
         TAG_REAL => ColumnType::Real,
         TAG_BPCHAR => ColumnType::Bpchar,
+        TAG_JSON => ColumnType::Json,
+        TAG_JSONB => ColumnType::Jsonb,
         other => return Err(corrupt(format!("column type tag {other}"))),
     })
 }

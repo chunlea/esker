@@ -561,6 +561,8 @@ fn column_type(ty: crate::value::ColumnType) -> esker_columnar::ColumnType {
         Row::Text => Col::Text,
         Row::Varchar => Col::Varchar,
         Row::Bpchar => Col::Bpchar,
+        Row::Json => Col::Json,
+        Row::Jsonb => Col::Jsonb,
         Row::Bool => Col::Bool,
         Row::Bytea => Col::Bytea,
         Row::TimestampTz => Col::TimestampTz,

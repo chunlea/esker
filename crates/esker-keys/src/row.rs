@@ -298,7 +298,12 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
                 other => return Err(corrupt(format!("boolean byte {other} is neither 0 nor 1"))),
             }
         }
-        ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Bytea => {
+        ColumnType::Text
+        | ColumnType::Varchar
+        | ColumnType::Bpchar
+        | ColumnType::Json
+        | ColumnType::Jsonb
+        | ColumnType::Bytea => {
             let (len, consumed) = varint::get_u64(bytes)
                 .map_err(|error| corrupt(format!("column length: {error}")))?;
             let len =
@@ -308,7 +313,11 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
                 .ok_or_else(|| corrupt(format!("a column of {len} bytes is truncated")))?;
             let value = if matches!(
                 ty,
-                ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar
+                ColumnType::Text
+                    | ColumnType::Varchar
+                    | ColumnType::Bpchar
+                    | ColumnType::Json
+                    | ColumnType::Jsonb
             ) {
                 Datum::Text(text_from_utf8(body)?)
             } else {
@@ -532,6 +541,14 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
                 0 | 1 => (Datum::Bool(byte == 1), rest),
                 other => return Err(corrupt(format!("boolean byte {other} in an index key"))),
             }
+        }
+        // **Not a key column**, either of them. A `jsonb`'s equality is not its byte equality —
+        // `1.0` and `1.00` print differently and compare equal — so an index over one would return
+        // rows a scan does not, and `json` has no equality operator at all on a real server. The
+        // SQL layer refuses both at `CREATE TABLE`; reaching here means the bytes claim a key this
+        // crate never wrote, which is corruption rather than something to decode.
+        ColumnType::Json | ColumnType::Jsonb => {
+            return Err(corrupt("an index key column of type json or jsonb"));
         }
         ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => {
             let (body, rest) = codec::decode_bytes(bytes).map_err(decoded)?;
@@ -968,6 +985,21 @@ mod tests {
             ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => {
                 ".{0,32}".prop_map(Datum::Text).boxed()
             }
+            // Valid documents, because that is what a `json` column holds — an arbitrary string
+            // is not one, and the row codec is only ever handed a value the SQL layer validated.
+            ColumnType::Json | ColumnType::Jsonb => proptest::sample::select(vec![
+                "null",
+                "true",
+                "1",
+                "1.00",
+                "\"s\"",
+                "[]",
+                "[1, 2]",
+                "{}",
+                "{\"a\": 1}",
+            ])
+            .prop_map(|text| Datum::Text(text.to_owned()))
+            .boxed(),
             ColumnType::Bool => any::<bool>().prop_map(Datum::Bool).boxed(),
             ColumnType::Bytea => proptest::collection::vec(any::<u8>(), 0..32)
                 .prop_map(Datum::Bytea)

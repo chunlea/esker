@@ -154,7 +154,12 @@ pub fn decode_column(
                 "values",
             )?)
         }
-        ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Bytea => {
+        ColumnType::Text
+        | ColumnType::Varchar
+        | ColumnType::Bpchar
+        | ColumnType::Json
+        | ColumnType::Jsonb
+        | ColumnType::Bytea => {
             let run = bytes::decode(encoding, &mut cursor, present)?;
             ColumnData::Bytes {
                 offsets: run.offsets,
@@ -167,7 +172,11 @@ pub fn decode_column(
     let column = Column::new(ty, nulls, data)?;
     if matches!(
         ty,
-        ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar
+        ColumnType::Text
+            | ColumnType::Varchar
+            | ColumnType::Bpchar
+            | ColumnType::Json
+            | ColumnType::Jsonb
     ) {
         // Text is UTF-8 by definition, and a `String` built from unchecked bytes is how a corrupt
         // file becomes a wrong answer somewhere far away. Pay for the check once, here.
@@ -258,7 +267,11 @@ mod tests {
             ColumnType::Double => any::<u64>()
                 .prop_map(|bits| Value::Double(f64::from_bits(bits)))
                 .boxed(),
-            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => (0usize..4)
+            ColumnType::Text
+            | ColumnType::Varchar
+            | ColumnType::Bpchar
+            | ColumnType::Json
+            | ColumnType::Jsonb => (0usize..4)
                 .prop_map(|pick| Value::Text(["", "a", "beta", "\u{1f600}"][pick].to_owned()))
                 .boxed(),
             ColumnType::Bytea => prop::collection::vec(any::<u8>(), 0..6)

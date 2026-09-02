@@ -439,7 +439,11 @@ fn take_literal(cursor: &mut Cursor<'_>) -> Result<Value> {
                 ));
             }
         },
-        ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => {
+        ColumnType::Text
+        | ColumnType::Varchar
+        | ColumnType::Bpchar
+        | ColumnType::Json
+        | ColumnType::Jsonb => {
             let bytes = take_literal_bytes(cursor, "literal text")?;
             Value::Text(String::from_utf8(bytes).map_err(|error| {
                 Error::corruption("fragment", format!("literal text is not utf-8: {error}"))

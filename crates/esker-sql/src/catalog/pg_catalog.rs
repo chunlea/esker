@@ -166,7 +166,6 @@ impl CatalogView {
     #[must_use]
     fn rows(self) -> Vec<Vec<Datum>> {
         match self {
-            CatalogView::PgClass | CatalogView::PgNamespace => Vec::new(),
             // Derived from `ColumnType::ALL` rather than written out, so a type cannot be added
             // to this node and left out of its own `pg_type`.
             CatalogView::PgType => {
@@ -192,7 +191,9 @@ impl CatalogView {
                 });
                 rows
             }
-            CatalogView::PgRange => Vec::new(),
+            // `PgRange` has none, and the two catalog-backed views never reach here —
+            // `rows_of` answers for those before it delegates.
+            CatalogView::PgRange | CatalogView::PgClass | CatalogView::PgNamespace => Vec::new(),
         }
     }
 
@@ -324,6 +325,8 @@ fn typname(ty: ColumnType) -> &'static str {
         ColumnType::Text => "text",
         ColumnType::Varchar => "varchar",
         ColumnType::Bpchar => "bpchar",
+        ColumnType::Json => "json",
+        ColumnType::Jsonb => "jsonb",
         ColumnType::Bool => "bool",
         ColumnType::Bytea => "bytea",
         ColumnType::TimestampTz => "timestamptz",
@@ -347,6 +350,8 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::Text => "textin",
         ColumnType::Varchar => "varcharin",
         ColumnType::Bpchar => "bpcharin",
+        ColumnType::Json => "json_in",
+        ColumnType::Jsonb => "jsonb_in",
         ColumnType::Bool => "boolin",
         ColumnType::Bytea => "byteain",
         ColumnType::TimestampTz => "timestamptz_in",

@@ -1,0 +1,141 @@
+# VERIFIED BEFORE IMPORT, not taken on trust: replayed twice against 19beta1 for self-idempotence
+# (two captures byte-identical), then diffed against this file's own answers, also byte-identical.
+# `docs/adr/0042-json-and-jsonb-are-two-types-and-one-of-them-is-not-a-key.md` is what it decided.
+#
+# `json` and `jsonb`, as a real PostgreSQL 19beta1 answers them — tier 2, and the pair
+# ([ADR 0033](../../../../docs/adr/0033-tier-1-of-the-type-surface.md)'s roadmap singles out:
+# "jsonb's stored form, because it normalises key order and whitespace, so a capture decides what
+# is stored rather than a preference"). `json` is OID 114 and `jsonb` is 3802, both varlena, both
+# `typcategory` U. They are captured together because almost every fact below is a *difference*.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way against one node.
+# It builds its own table, dropping whatever a previous run left, so a replay of `cut -f1` is
+# byte-identical. The table is deliberately *not* dropped at the end: `sesscap.py` asks `\gdesc`
+# for the declared types after the session closes, and a dropped table makes that column empty.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`json` stores the text you sent, byte for byte.** Whitespace, key order and **duplicate
+#     keys** all survive: `{"a":1,"a":2}` comes back exactly like that. `json` is a validated
+#     string, and that is the whole of it.
+#   * **`jsonb` stores a parsed value and prints a canonical one**, and the canonical form is not
+#     the input: `{"b":1, "a":2}` becomes `{"a": 2, "b": 1}` — reordered, deduplicated (**last
+#     key wins**), and with **a space after every colon and comma** that was not in the input.
+#     An implementation that stored the text and sorted on read would still print the wrong
+#     separators.
+#   * **jsonb key order is by length first, then bytewise.** Measured twice:
+#     `{"bb":1,"a":2,"ccc":3}` is `{"a": 2, "bb": 1, "ccc": 3}`, and `{"ab":1,"ba":2,"aa":3}` is
+#     `{"aa": 3, "ab": 1, "ba": 2}`. Plain lexicographic ordering would put `ab` before `b`-
+#     anything of any length and get the first one wrong.
+#   * **A jsonb number is a `numeric`, so it carries `numeric`'s scale rule.** `1.00` stays `1.00`
+#     and `1e2` becomes `100` — one is preserved and the other is not, because both are what
+#     `numeric` does with that text. `1E400` becomes a four-hundred-digit integer in `jsonb` and
+#     stays `1E400` in `json`. And **`'1.0'::jsonb = '1.00'::jsonb` is `t`** while the two print
+#     differently: jsonb equality is numeric equality, not text equality.
+#   * **`json` has no equality operator at all.** `'{"a":1}'::json = '{"a":1}'::json` is
+#     `42883 operator does not exist: json = json`, and so is `@>`. Every operator below except
+#     `->`, `->>`, `#>` and `#>>` is jsonb-only. So `json` cannot be a primary key, cannot be
+#     `DISTINCT`ed and cannot be grouped, and that is a property of the type rather than a gap.
+#   * **`jsonb` is ordered but has no `min`/`max`.** `<` works, `ORDER BY` works, and
+#     `min(jsonb)` is `42883 function min(jsonb) does not exist` — the third time in this corpus
+#     (`boolean`, `uuid`, `jsonb`) that a totally ordered type has no aggregate over it. The sort
+#     order between *kinds* is its own fact: `true > 1` is `t` and `"s" > 1` is `f`.
+#   * **`-> ` on a missing key is SQL NULL; `->` on a JSON null is JSON `null`.** `{"a":null} -> 'a'`
+#     `IS NULL` is **`f`** and `->> 'a' IS NULL` is **`t`**. Two nulls, and only one of them is
+#     SQL's. An out-of-range array index, and an object indexed by a number, are both SQL NULL
+#     rather than errors.
+#   * **`\u0000` splits the two types**, and it is the one input `jsonb` refuses that `json`
+#     takes: `22P05 unsupported Unicode escape sequence` with `DETAIL: \u0000 cannot be converted
+#     to text.` — a SQLSTATE that appears nowhere else here. `json` stores it, and casting that
+#     stored `json` to `jsonb` raises the same error later.
+#   * **Neither takes a typmod**, and the refusal is the *parser's*: `json(10)` is
+#     `42601 syntax error at or near "("`, like `integer(4)` and unlike `uuid(10)`'s
+#     `42601 type modifier is not allowed`.
+#   * **Not captured, and deliberately: `jsonb_pretty`.** Its output is indented over several
+#     lines, and `sesscap.py` drops any output row beginning with a space — so it would record a
+#     silently truncated answer. Same class of trap as `pg19_varchar.txt`'s vanishing empty
+#     string, recorded here so the next capture does not walk into it.
+DROP TABLE IF EXISTS js		-
+SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname IN ('json','jsonb') ORDER BY oid	oid,name,smallint,regproc,"char"	114|json|-1|json_in|U ; 3802|jsonb|-1|jsonb_in|U
+SELECT pg_typeof('{}'::json), pg_typeof('{}'::jsonb), format_type(114, -1), format_type(3802, -1)	regtype,regtype,text,text	json|jsonb|json|jsonb
+CREATE TABLE js (id int8 PRIMARY KEY, j json, b jsonb)		-
+INSERT INTO js VALUES (1, '{"b":1, "a":2}', '{"b":1, "a":2}')		-
+INSERT INTO js VALUES (2, '{"a":1,"a":2}', '{"a":1,"a":2}')		-
+INSERT INTO js VALUES (3, '[1,2,3]', '[1,2,3]')		-
+INSERT INTO js VALUES (4, 'null', 'null')		-
+INSERT INTO js VALUES (5, '1.00', '1.00')		-
+INSERT INTO js VALUES (6, NULL, NULL)		-
+SELECT id, j, b FROM js ORDER BY id	bigint,json,jsonb	1|{"b":1, "a":2}|{"a": 2, "b": 1} ; 2|{"a":1,"a":2}|{"a": 2} ; 3|[1,2,3]|[1, 2, 3] ; 4|null|null ; 5|1.00|1.00 ; 6|\N|\N
+SELECT id, b FROM js ORDER BY b	bigint,jsonb	4|null ; 5|1.00 ; 3|[1, 2, 3] ; 2|{"a": 2} ; 1|{"a": 2, "b": 1} ; 6|\N
+SELECT id FROM js WHERE b IS NULL	bigint	6
+SELECT id FROM js WHERE b = '{"a": 2, "b": 1}'	bigint	1
+SELECT id FROM js WHERE b @> '{"a":2}'	bigint	1 ; 2
+SELECT count(*), count(j), count(b) FROM js	bigint,bigint,bigint	6|5|5
+SELECT min(b) FROM js	!42883 function min(jsonb) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT max(b) FROM js	!42883 function max(jsonb) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT min(j) FROM js	!42883 function min(json) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT sum(b) FROM js	!42883 function sum(jsonb) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT '{"b":1, "a":2}'::json, '{"b":1, "a":2}'::jsonb	json,jsonb	{"b":1, "a":2}|{"a": 2, "b": 1}
+SELECT '{"a":1,"a":2}'::json, '{"a":1,"a":2}'::jsonb	json,jsonb	{"a":1,"a":2}|{"a": 2}
+SELECT '{  "a"  :  1  }'::json, '{  "a"  :  1  }'::jsonb	json,jsonb	{  "a"  :  1  }|{"a": 1}
+SELECT '{"bb":1,"a":2,"ccc":3}'::jsonb	jsonb	{"a": 2, "bb": 1, "ccc": 3}
+SELECT '{"ab":1,"ba":2,"aa":3}'::jsonb	jsonb	{"aa": 3, "ab": 1, "ba": 2}
+SELECT '{"":1,"a":2}'::jsonb	jsonb	{"": 1, "a": 2}
+SELECT '{"a":{"z":1,"b":{"y":1,"a":2}}}'::jsonb	jsonb	{"a": {"b": {"a": 2, "y": 1}, "z": 1}}
+SELECT '1.0'::json, '1.0'::jsonb, '1.00'::jsonb, '1e2'::jsonb	json,jsonb,jsonb,jsonb	1.0|1.0|1.00|100
+SELECT '1E400'::jsonb	jsonb	10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+SELECT '1E400'::json	json	1E400
+SELECT '[1,2,3]'::json, '[1,2,3]'::jsonb, 'null'::json, 'true'::jsonb, '"s"'::jsonb	json,jsonb,json,jsonb,jsonb	[1,2,3]|[1, 2, 3]|null|true|"s"
+SELECT '[]'::jsonb, '{}'::jsonb	jsonb,jsonb	[]|{}
+SELECT '{bad}'::json	!22P02 invalid input syntax for type json DETAIL: Token "bad" is invalid.
+SELECT ''::json	!22P02 invalid input syntax for type json DETAIL: The input string ended unexpectedly.
+SELECT '{bad}'::jsonb	!22P02 invalid input syntax for type json DETAIL: Token "bad" is invalid.
+SELECT '"\u0041"'::jsonb	jsonb	"A"
+SELECT '"\u00e9"'::jsonb	jsonb	"é"
+SELECT '"\u0000"'::json	json	"\u0000"
+SELECT '"\u0000"'::jsonb	!22P05 unsupported Unicode escape sequence DETAIL: \u0000 cannot be converted to text.
+SELECT ('"\u0000"'::json)::jsonb	!22P05 unsupported Unicode escape sequence DETAIL: \u0000 cannot be converted to text.
+SELECT '{"a":1}'::json = '{"a":1}'::json	!42883 operator does not exist: json = json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT '{"a":1}'::json = '{"a":1}'::jsonb	!42883 operator does not exist: json = jsonb DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT '{"a":1}'::jsonb = '{"a": 1}'::jsonb	boolean	t
+SELECT '1.0'::jsonb = '1.00'::jsonb	boolean	t
+SELECT '{"a":1}'::jsonb = '{"a":1.0}'::jsonb	boolean	t
+SELECT '{"a":1}'::jsonb <> '{"a":2}'::jsonb	boolean	t
+SELECT '{"a":1}'::jsonb < '{"b":1}'::jsonb	boolean	t
+SELECT 'true'::jsonb > '1'::jsonb, '"s"'::jsonb > '1'::jsonb, '[]'::jsonb > '{}'::jsonb	boolean,boolean,boolean	t|f|f
+SELECT '{"a":1}'::json -> 'a', '{"a":1}'::json ->> 'a'	json,text	1|1
+SELECT '{"a":1}'::jsonb -> 'a', '{"a":1}'::jsonb ->> 'a'	jsonb,text	1|1
+SELECT '{"a":1}'::jsonb -> 'z', '{"a":1}'::jsonb ->> 'z'	jsonb,text	\N|\N
+SELECT '{"a":null}'::jsonb ->> 'a', '{"a":null}'::jsonb -> 'a'	text,jsonb	\N|null
+SELECT ('{"a":null}'::jsonb -> 'a') IS NULL, ('{"a":null}'::jsonb ->> 'a') IS NULL	boolean,boolean	f|t
+SELECT '[1,2,3]'::json -> 0, '[1,2,3]'::json ->> 0, '[1,2,3]'::json -> -1	json,text,json	1|1|3
+SELECT '[1,2,3]'::jsonb -> 5	jsonb	\N
+SELECT '{"a":1}'::jsonb -> 0	jsonb	\N
+SELECT '[1,2]'::jsonb -> 'a'	jsonb	\N
+SELECT '{"a":{"b":2}}'::json #> '{a,b}', '{"a":{"b":2}}'::json #>> '{a,b}'	json,text	2|2
+SELECT '{"a":1,"b":2}'::jsonb @> '{"a":1}'::jsonb, '{"a":1}'::jsonb <@ '{"a":1,"b":2}'::jsonb	boolean,boolean	t|t
+SELECT '{"a":1,"b":2}'::json @> '{"a":1}'::json	!42883 operator does not exist: json @> json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT '{"a":1}'::jsonb ? 'a'	boolean	t
+SELECT '{"a":1}'::jsonb || '{"b":2}'::jsonb, '{"a":1,"b":2}'::jsonb - 'a'	jsonb,jsonb	{"a": 1, "b": 2}|{"b": 2}
+SELECT '[1,2]'::jsonb || '[3]'::jsonb	jsonb	[1, 2, 3]
+SELECT '{"a":1}'::jsonb #- '{a}'	jsonb	{}
+SELECT json_typeof('1'::json), jsonb_typeof('"s"'::jsonb), jsonb_typeof('null'::jsonb)	text,text,text	number|string|null
+SELECT jsonb_typeof('[]'::jsonb), jsonb_typeof('{}'::jsonb), jsonb_typeof('1.0'::jsonb)	text,text,text	array|object|number
+SELECT jsonb_array_length('[1,2,3]'::jsonb), json_array_length('[1,2,3]'::json)	integer,integer	3|3
+SELECT jsonb_object_keys('{"b":1,"a":2}'::jsonb)	text	a ; b
+SELECT jsonb_strip_nulls('{"a":null,"b":1}'::jsonb)	jsonb	{"b": 1}
+SELECT jsonb_build_object('b',1,'a',2), jsonb_build_array(1,'x')	jsonb,jsonb	{"a": 2, "b": 1}|[1, "x"]
+SELECT to_jsonb('1 day'::interval), to_json('2020-01-01'::date)	jsonb,json	"1 day"|"2020-01-01"
+SELECT json_agg(x), jsonb_agg(x) FROM (VALUES (1), (2)) v(x)	json,jsonb	[1, 2]|[1, 2]
+SELECT '{"a":1}'::json::jsonb, '{"b":1,"a":2}'::jsonb::json	jsonb,json	{"a": 1}|{"a": 2, "b": 1}
+SELECT '{"a":1}'::json::text, '{"a":1}'::text::json	text,json	{"a":1}|{"a":1}
+SELECT '{"a":1}'::jsonb::text	text	{"a": 1}
+SELECT '1'::jsonb::int, '1'::jsonb::numeric, '"s"'::jsonb::text	integer,numeric,text	1|1|"s"
+SELECT '{"a":1}'::jsonb::int	!22023 cannot cast jsonb object to type integer
+SELECT 'json(10)'::regtype::oid	!42601 syntax error at or near "("
+SELECT 'jsonb(10)'::regtype::oid	!42601 type modifier is not allowed for type "jsonb"
+SELECT NULL::jsonb IS NULL, '{"a":1}'::jsonb = NULL	boolean,boolean	t|\N

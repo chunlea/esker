@@ -470,7 +470,11 @@ impl Literal {
                 ColumnType::Bool
                 | ColumnType::Bytea
                 | ColumnType::TimestampTz
-                | ColumnType::Timestamp => mismatch(),
+                | ColumnType::Timestamp
+                // Neither takes a number or a boolean: `INSERT INTO t (j) VALUES (1)` is a type
+                // mismatch on a real server, not a one-element document.
+                | ColumnType::Json
+                | ColumnType::Jsonb => mismatch(),
             },
 
             Literal::Decimal(digits) => match ty {
@@ -513,6 +517,9 @@ impl Literal {
                 ColumnType::Bool
                 | ColumnType::Bytea
                 | ColumnType::TimestampTz
+                // A number is not a document, whichever way it is written.
+                | ColumnType::Json
+                | ColumnType::Jsonb
                 | ColumnType::Timestamp => mismatch(),
             },
 
@@ -533,6 +540,11 @@ impl Literal {
                 | ColumnType::TimestampTz
                 | ColumnType::Timestamp
                 | ColumnType::Double
+                // `true` *is* a JSON document, and `INSERT INTO t (j) VALUES (true)` is still a
+                // type mismatch on a real server: the literal is a `boolean`, and there is no
+                // assignment cast from one to `json`.
+                | ColumnType::Json
+                | ColumnType::Jsonb
                 | ColumnType::Real => mismatch(),
             },
         }

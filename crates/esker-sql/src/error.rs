@@ -685,6 +685,15 @@ pub enum SqlError {
     #[error("function {0} does not exist")]
     UndefinedFunction(String),
 
+    /// A `jsonb` document containing a NUL escape: `22P05`.
+    ///
+    /// The one input that tells `json` from `jsonb`. `json` stores it, because `json` stores the
+    /// text; `jsonb`'s stored form is text and a NUL cannot be in one, so it refuses — and casting
+    /// a stored `json` that contains one to `jsonb` raises this later, which is what makes `json`'s
+    /// permissiveness safe rather than a trap. Measured, and the only `22P05` in this project.
+    #[error("unsupported Unicode escape sequence")]
+    UnsupportedUnicodeEscape,
+
     /// A type name that names no type on this node: `42704`.
     ///
     /// What `'nope'::regtype` answers on a real server, word for word. It is also what this node
@@ -930,6 +939,7 @@ impl SqlError {
             | SqlError::SetTransactionOutsideBlock
             | SqlError::OutsideTransactionBlock(_) => sqlstate::NO_ACTIVE_SQL_TRANSACTION,
             SqlError::StringDataRightTruncation(_) => sqlstate::STRING_DATA_RIGHT_TRUNCATION,
+            SqlError::UnsupportedUnicodeEscape => sqlstate::UNSUPPORTED_UNICODE_ESCAPE,
             // A declared length is `22023` too, which is not a family resemblance with the
             // parameter errors beside it — it is `anychar_typmodin` reaching for the same code.
             // Captured, both ends: `varchar(0)` and `varchar(10485761)`.
