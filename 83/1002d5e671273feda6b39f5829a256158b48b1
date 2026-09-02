@@ -1,0 +1,37 @@
+crates/esker-sql/src/catalog/mod.rs
+  s_3ae23601ee3f84::t_bb0877ecdf8747 253-264,1464,1490,1542,1576,1615-1659,2053,2110,2299
+crates/esker-sql/src/catalog/pg_relations.rs
+  s_3ae23601ee3f84::t_46c45c48f14e59 13
+crates/esker-sql/src/catalog/record.rs
+  s_3ae23601ee3f84::t_3071575206daf7 71,673-679,750-751,770-777
+crates/esker-sql/src/exec/ddl.rs
+  s_3ae23601ee3f84::t_cf76de3fb465a2 125,355-361,367
+crates/esker-sql/src/exec/dml.rs
+  s_3ae23601ee3f84::t_92d4cde5f38827 330-335,521-540,603-606,614-618
+crates/esker-sql/src/exec/query.rs
+  s_3ae23601ee3f84::t_1f08de63425042 1179-1186
+crates/esker-sql/src/parse/lower.rs
+  s_3ae23601ee3f84::t_1ee7828dc2e7a1 1095,1113-1114
+crates/esker-sql/src/plan/ddl.rs
+  s_3ae23601ee3f84::t_36531350b48281 114-117
+crates/esker-sql/tests/corpus/pg19_partial_index.txt
+  s_3ae23601ee3f84::t_0e7f729b360054 1-33
+crates/esker-sql/tests/partial_index.rs
+  s_3ae23601ee3f84::t_57c544af29ec6e 1-104
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "831002d5e671273feda6b39f5829a256158b48b1",
+  "prompts": {},
+  "sessions": {
+    "s_3ae23601ee3f84": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "28a5221f-dddc-4b17-adc2-74658236cfd3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
