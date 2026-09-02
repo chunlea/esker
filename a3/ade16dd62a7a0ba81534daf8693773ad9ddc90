@@ -1,0 +1,19 @@
+docs/plans/phase-14-flakes.md
+  s_bc33c8643b4ae7::t_d56f6598072fc5 1-153
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a3ade16dd62a7a0ba81534daf8693773ad9ddc90",
+  "prompts": {},
+  "sessions": {
+    "s_bc33c8643b4ae7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "88b16408-76b4-4204-a052-e5ee13ebdcf5",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
