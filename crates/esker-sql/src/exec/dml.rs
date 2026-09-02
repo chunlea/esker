@@ -126,6 +126,27 @@ fn fit_typmods(table: &TableDef, row: &mut [Datum]) -> Result<()> {
     Ok(())
 }
 
+/// What a column writes when an `INSERT` omits it, or a `SET c = DEFAULT` names it.
+///
+/// `now` is the **transaction's** timestamp, not the statement's and not a wall-clock reading: it
+/// is what `CURRENT_TIMESTAMP` means on a real server — constant within a transaction, equal to
+/// `now()` — and it is the only clock this node is allowed (`CLAUDE.md` invariant 6). Two columns
+/// defaulting to `CURRENT_TIMESTAMP` in one `INSERT` therefore hold the same instant, which is a
+/// thing the capture checks (`a = b` is `t`).
+///
+/// A `timestamptz` column takes it as it is and a `timestamp` column takes the same number: this
+/// node stores both as microseconds from 2000-01-01 UTC, and the assignment cast a real server
+/// applies here is a zone conversion that is the identity at UTC.
+fn column_default_value(column: &crate::catalog::ColumnDef, now: i64) -> Datum {
+    if column.default_now {
+        return match column.ty {
+            ColumnType::TimestampTz => Datum::TimestampTz(now),
+            _ => Datum::Timestamp(now),
+        };
+    }
+    column.default.clone().unwrap_or(Datum::Null)
+}
+
 fn sequence_datum(ty: ColumnType, value: i64) -> Result<Datum> {
     Ok(match ty {
         ColumnType::Int4 => Datum::Int4(
@@ -163,10 +184,11 @@ pub(super) fn insert(
         // The default and the *missing* value are different fields and this is the one that reads
         // the default (`crate::catalog::ColumnDef`). A row written now is written at full width,
         // so nothing about it is missing; the other field answers for rows that predate the column.
+        let now = crate::time_machine::micros_of_ts(txn.start_ts());
         let mut row: Vec<Datum> = table
             .columns
             .iter()
-            .map(|column| column.default.clone().unwrap_or(Datum::Null))
+            .map(|column| column_default_value(column, now))
             .collect();
         for (target, expr) in targets.iter().zip(values) {
             let column = &table.columns[*target];
@@ -417,7 +439,10 @@ pub(super) fn update(
                         table.columns[sequence.column].ty,
                         executor.next_sequence_value(sequence.id)?,
                     )?,
-                    None => column.default.clone().unwrap_or(Datum::Null),
+                    None => column_default_value(
+                        column,
+                        crate::time_machine::micros_of_ts(txn.start_ts()),
+                    ),
                 },
                 crate::plan::Expr::Literal(literal) => literal.assign(column.ty, &column.name)?,
                 other => {

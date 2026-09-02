@@ -1,0 +1,32 @@
+# `DEFAULT CURRENT_TIMESTAMP` — statement 30 of `schema.rb`, and the first default that is not a value
+#
+# Every default this node stored before was a **constant**, and a volatile one was refused by name
+# on the grounds that the catalog holds one value. `CURRENT_TIMESTAMP` is the case where that
+# refusal is not good enough: `ActiveRecord` emits it for `created_at`/`updated_at` on almost every
+# table, and storing the instant `CREATE TABLE` ran would give every row the table's birthday.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#
+# WHAT THE CAPTURE SETTLES:
+#
+#   * `CURRENT_TIMESTAMP` **is** `now()` — `CURRENT_TIMESTAMP = now()` is `t` — and both are
+#     `timestamp with time zone`. `pg_get_expr` prints `CURRENT_TIMESTAMP` for a column declared
+#     either way, which is why this node records one flag rather than two.
+#   * It is the **transaction's** timestamp, not the statement's: two columns defaulting to it in
+#     one `INSERT` hold the same instant, and `a = b` is `t`. That is what makes the TSO's
+#     `start_ts` the right clock here rather than a coincidence — a node may not read its wall
+#     clock for anything that orders (`CLAUDE.md` invariant 6), and it does not have to.
+#   * A `timestamp` column takes it as readily as a `timestamptz` one: the assignment cast is a
+#     zone conversion, and at UTC it is the identity.
+#
+DROP TABLE IF EXISTS dt		-
+CREATE TABLE dt (id int8 PRIMARY KEY, a timestamp DEFAULT CURRENT_TIMESTAMP, b timestamp(6) DEFAULT CURRENT_TIMESTAMP, c timestamptz DEFAULT CURRENT_TIMESTAMP, d timestamp DEFAULT now())		-
+SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef d JOIN pg_class c ON c.oid = d.adrelid WHERE c.relname = 'dt' ORDER BY adnum	text	CURRENT_TIMESTAMP ; CURRENT_TIMESTAMP ; CURRENT_TIMESTAMP ; now()
+SELECT CURRENT_TIMESTAMP = now()	boolean	t
+SELECT pg_typeof(CURRENT_TIMESTAMP), pg_typeof(now()), pg_typeof(LOCALTIMESTAMP), pg_typeof(CURRENT_DATE)	regtype,regtype,regtype,regtype	timestamp with time zone|timestamp with time zone|timestamp without time zone|date
+SELECT CURRENT_TIMESTAMP IS NOT NULL, LOCALTIMESTAMP IS NOT NULL	boolean,boolean	t|t
+SELECT CURRENT_TIMESTAMP(0) IS NOT NULL	boolean	t
+INSERT INTO dt (id) VALUES (1)		-
+SELECT id, a IS NOT NULL, b IS NOT NULL, c IS NOT NULL, d IS NOT NULL FROM dt	bigint,boolean,boolean,boolean,boolean	1|t|t|t|t
+SELECT a = b FROM dt	boolean	t

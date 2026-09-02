@@ -94,6 +94,17 @@ pub struct ColumnDef {
     pub typmod: i32,
     /// Whether a NULL is refused. Primary key columns are always `NOT NULL`.
     pub not_null: bool,
+    /// Whether the default is an **expression evaluated per row** rather than the constant above.
+    ///
+    /// Exactly one expression is admitted, `CURRENT_TIMESTAMP` — and its synonym `now()`, which
+    /// PostgreSQL records as the same thing. It cannot be a [`ColumnDef::default`] because a
+    /// constant is what a constant is: storing the instant `CREATE TABLE` ran would give every
+    /// row the table's birthday, which is a wrong answer rather than an approximation.
+    ///
+    /// It also has **no missing value**, and that is PostgreSQL's own rule rather than a
+    /// simplification: `atthasmissing` is cleared for a volatile default, because there is no one
+    /// value a row that predates the column could be said to hold.
+    pub default_now: bool,
     /// What an `INSERT` that omits this column writes. `None` is NULL.
     ///
     /// A **constant**, not an expression: `DEFAULT 7` and `DEFAULT 'x'` are stored, `DEFAULT
@@ -1392,6 +1403,7 @@ mod tests {
                     name: "id".into(),
                     ty: ColumnType::Int8,
                     typmod: crate::value::NO_TYPMOD,
+                    default_now: false,
                     not_null: true,
                     default: None,
                     missing: None,
@@ -1400,6 +1412,7 @@ mod tests {
                     name: "email".into(),
                     ty: ColumnType::Text,
                     typmod: crate::value::NO_TYPMOD,
+                    default_now: false,
                     not_null: false,
                     default: None,
                     missing: None,
@@ -1437,7 +1450,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "04",               // catalog format version
+                "05",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -1489,7 +1502,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "04",                 // catalog format version
+                "05",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -1504,12 +1517,14 @@ mod tests {
                 "00",       // no DEFAULT
                 "00",       // and no missing value
                 "ffffffff", // version 4: no typmod, which is -1 and not 0
+                "00",       // version 5: the default is not an expression
                 "05656d61696c",
                 "02",
                 "00",       // "email", TEXT, nullable
                 "00",       // no DEFAULT
                 "00",       // and no missing value
                 "ffffffff", // no typmod
+                "00",       // and not an expression default
                 "01",
                 "00",                                     // primary key: one column, column 0
                 "01",                                     // one index
@@ -1556,6 +1571,51 @@ mod tests {
             "01",
         ));
         assert_eq!(record::decode_table(&v2).unwrap(), accounts(7));
+    }
+
+    /// The **version 4** golden, kept for the same reason the three before it are.
+    ///
+    /// These are the bytes version 4 wrote — every column ends at its typmod, with no
+    /// expression-default byte after it — and a cluster that ran the typmod unit has them. Each
+    /// column reads back `default_now: false`, which is what every column a version 4 catalog
+    /// could hold was: `CURRENT_TIMESTAMP` was `0A000` until version 5.
+    #[test]
+    fn a_version_4_table_record_still_decodes() {
+        let v4 = decode_hex(concat!(
+            "04",                 // catalog format version 4
+            "0700000000000000",   // table id 7
+            "086163636f756e7473", // varint 8, "accounts"
+            "0d6163636f756e74735f706b6579",
+            "01", // schema version 1
+            "02", // two columns
+            "026964",
+            "01",
+            "01",       // "id", INT8, NOT NULL
+            "00",       // no DEFAULT
+            "00",       // and no missing value
+            "ffffffff", // no typmod -- and nothing after it
+            "05656d61696c",
+            "02",
+            "00",
+            "00",
+            "00",
+            "ffffffff",
+            "01",
+            "00",                                     // primary key: one column, column 0
+            "01",                                     // one index
+            "0800000000000000",                       // index id 8
+            "126163636f756e74735f656d61696c5f6b6579", // "accounts_email_key"
+            "01",                                     // unique
+            "03",                                     // state: public
+            "01",                                     // entered at schema version 1
+            "01",
+            "01", // one column, column 1
+        ));
+        let table = record::decode_table(&v4).unwrap();
+        assert_eq!(table, accounts(7));
+        for column in &table.columns {
+            assert!(!column.default_now);
+        }
     }
 
     /// The **version 3** golden, kept for the same reason the version 2 one is.
@@ -1613,6 +1673,7 @@ mod tests {
             name: "v".into(),
             ty: ColumnType::Varchar,
             typmod: crate::value::typmod_of_length(5),
+            default_now: false,
             not_null: false,
             default: None,
             missing: None,
@@ -1621,6 +1682,7 @@ mod tests {
             name: "c".into(),
             ty: ColumnType::Bpchar,
             typmod: crate::value::typmod_of_length(3),
+            default_now: false,
             not_null: false,
             default: None,
             missing: None,
@@ -1629,6 +1691,7 @@ mod tests {
             name: "t".into(),
             ty: ColumnType::Timestamp,
             typmod: crate::value::typmod_of_precision(3),
+            default_now: false,
             not_null: false,
             default: None,
             missing: None,
@@ -2052,6 +2115,7 @@ mod tests {
             name: "tier".into(),
             ty: ColumnType::Int8,
             typmod: crate::value::NO_TYPMOD,
+            default_now: false,
             not_null: true,
             default: Some(Datum::Int8(42)),
             missing: Some(Datum::Int8(42)),
@@ -2101,7 +2165,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "04",               // catalog format version
+                "05",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );
