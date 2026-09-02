@@ -1,0 +1,21 @@
+docs/adr/0041-the-in-house-arena-skiplist.md
+  s_a0868d54f0983f::t_f6ee15923509c7 3-21,218-225
+docs/plans/phase-11-engine.md
+  s_a0868d54f0983f::t_6f0a279761f0d9 518-520,572-646
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "669a79efbb2fd015184369633c3623fb7a2c0f62",
+  "prompts": {},
+  "sessions": {
+    "s_a0868d54f0983f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "001c95bd-db24-4085-b657-66d3a8400c25",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
