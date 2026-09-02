@@ -28,6 +28,22 @@ use esker_proto::{
 
 /// A short lease, so a lapse is a second of test rather than five.
 pub const LEASE_MS: u64 = 600;
+/// A lease no test body can outlive, for the tests that are not about the lease.
+///
+/// A node renews on a thread ([`esker_sql::pd::LeaseRefresher::run`]), and a test that can spawn
+/// one needs nothing from here. A test that *counts what the node sent PD* cannot spawn one — a
+/// refresher asserts the columnar set on every renewal, so the thread it would need is the thread
+/// that would spoil what it is counting — and it therefore holds the one lease it fetched at
+/// startup for its whole body. With [`LEASE_MS`] that puts the machine's speed inside an
+/// assertion about report content: `an_alter_reports_every_range_that_wants_columnar_replicas`
+/// failed **4 of 48** under load with `SchemaLeaseExpired { command: "ALTER TABLE" }`, which is
+/// ADR 0028 working exactly as designed and nothing to do with what the test asserts
+/// (`docs/plans/phase-14-flakes.md` U3).
+///
+/// An hour, so that "the lease did not lapse" is a fact rather than a bet. Not a widened
+/// deadline: the lapse itself is what `a_lapsed_lease_refuses_writes_and_still_serves_reads` is
+/// for, and it keeps [`LEASE_MS`].
+pub const NO_LAPSE_MS: u64 = 3_600_000;
 /// PD's `lease_ms + lock_ttl_ms`, as PD computes it — the wait between the states of a schema
 /// change. Short here for the same reason PD's own tests shorten it: the arithmetic is PD's, and
 /// what a node must not do is hold an opinion of its own about the number.
@@ -36,11 +52,23 @@ pub const STEP_MS: u64 = 300;
 pub const REMOVAL_EXTRA_MS: u64 = 0;
 
 /// The placement driver these tests point a SQL node at.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct StandInPd {
     /// Every columnar report it has been sent, in order. The whole set each time: a report is a
     /// full assertion, so what is recorded here is what PD would have replaced its record with.
     reports: Mutex<Vec<Vec<ColumnarWish>>>,
+    /// How long a lease this driver hands out. Per driver, because the two things a test can want
+    /// from a lease are opposite: one watches it lapse, the others must not.
+    lease_ms: u64,
+}
+
+impl Default for StandInPd {
+    fn default() -> Self {
+        StandInPd {
+            reports: Mutex::new(Vec::new()),
+            lease_ms: LEASE_MS,
+        }
+    }
 }
 
 impl StandInPd {
@@ -68,7 +96,7 @@ impl Service for StandInPd {
             };
             let response = match request {
                 PdReq::SchemaLease => PdResp::SchemaLease {
-                    lease_ms: LEASE_MS,
+                    lease_ms: self.lease_ms,
                     step_interval_ms: STEP_MS,
                     removal_extra_ms: REMOVAL_EXTRA_MS,
                 },
@@ -98,9 +126,19 @@ impl Service for StandInPd {
     }
 }
 
-/// Starts one on an ephemeral port.
+/// Starts one on an ephemeral port, handing out [`LEASE_MS`] leases.
 pub async fn serve() -> (Arc<StandInPd>, ServerHandle, std::net::SocketAddr) {
-    let pd = Arc::new(StandInPd::default());
+    serve_with_lease(LEASE_MS).await
+}
+
+/// The same, with the lease this test needs — [`NO_LAPSE_MS`] for one that is not about leases.
+pub async fn serve_with_lease(
+    lease_ms: u64,
+) -> (Arc<StandInPd>, ServerHandle, std::net::SocketAddr) {
+    let pd = Arc::new(StandInPd {
+        lease_ms,
+        ..StandInPd::default()
+    });
     let server = Server::bind(
         "127.0.0.1:0",
         Arc::clone(&pd) as Arc<dyn Service>,

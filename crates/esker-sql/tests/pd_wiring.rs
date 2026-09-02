@@ -169,7 +169,12 @@ async fn a_lapsed_lease_refuses_writes_and_still_serves_reads() {
 /// its own.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_alter_reports_every_range_that_wants_columnar_replicas() {
-    let (pd, pd_handle, address) = standin_pd::serve().await;
+    // **A lease that cannot lapse inside this test**, because this test cannot renew one: a
+    // refresher thread asserts the columnar set on every renewal, and what is counted below is
+    // exactly those assertions. Held on the one lease `serve()` hands out, the later `ALTER`s
+    // here are refused on a loaded machine — correctly, by ADR 0028 — and the failure is the
+    // machine's speed rather than anything this test is about (`standin_pd::NO_LAPSE_MS`).
+    let (pd, pd_handle, address) = standin_pd::serve_with_lease(standin_pd::NO_LAPSE_MS).await;
     let cluster = cluster::Cluster::start_on_this_runtime().await;
     let (node, refresher) = tokio::task::block_in_place(|| Node::start(&cluster, address));
 
