@@ -495,6 +495,18 @@ fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
             substitute_in_expr(inner, outer, depth);
         }
         Expr::IsNull { operand, .. } => substitute_in_expr(operand, outer, depth),
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            for branch in branches {
+                substitute_in_expr(&mut branch.when, outer, depth);
+                substitute_in_expr(&mut branch.then, outer, depth);
+            }
+            if let Some(otherwise) = otherwise {
+                substitute_in_expr(otherwise, outer, depth);
+            }
+        }
         Expr::InList { operand, list, .. } => {
             substitute_in_expr(operand, outer, depth);
             for item in list {
@@ -879,6 +891,18 @@ pub(super) fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
         | Expr::ToText { operand: inner, .. }
         | Expr::Scalar { operand: inner, .. } => walk(inner, visit),
         Expr::IsNull { operand, .. } => walk(operand, visit),
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            for branch in branches {
+                walk(&branch.when, visit);
+                walk(&branch.then, visit);
+            }
+            if let Some(otherwise) = otherwise {
+                walk(otherwise, visit);
+            }
+        }
         Expr::InList { operand, list, .. } => {
             walk(operand, visit);
             for item in list {
@@ -926,6 +950,18 @@ fn walk_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr) -> Result<()>) ->
         | Expr::ToText { operand: inner, .. }
         | Expr::Scalar { operand: inner, .. } => walk_mut(inner, visit)?,
         Expr::IsNull { operand, .. } => walk_mut(operand, visit)?,
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            for branch in branches {
+                walk_mut(&mut branch.when, visit)?;
+                walk_mut(&mut branch.then, visit)?;
+            }
+            if let Some(otherwise) = otherwise {
+                walk_mut(otherwise, visit)?;
+            }
+        }
         Expr::InList { operand, list, .. } => {
             walk_mut(operand, visit)?;
             for item in list {

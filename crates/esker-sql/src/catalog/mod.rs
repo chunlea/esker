@@ -273,8 +273,14 @@ pub enum KeyPart {
 /// | `lower(b)` | `lower(b)` | `lower(b)` | `lower(b)` |
 /// | `b IS NULL` | `(b IS NULL)` | `(b IS NULL)` | `((b IS NULL))` |
 /// | `1` | `1` | `(1)` | `(1)` |
+/// | `CASE …` | `CASE …` | `(CASE …)` | `(CASE …)` |
 ///
 /// Three columns and no two rows alike, which is the whole reason this is an enum and not a flag.
+///
+/// The fourth row is a `CASE`, and it is [`ExprShape::Value`] rather than a variant of its own:
+/// measured, its parentheses are a value's in all three columns. What is unlike a value about it
+/// is its **text** — five lines with the implicit `ELSE` materialised — and that is decided where
+/// the expression is deparsed (`crate::exec::ddl`), not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExprShape {
     /// A bare function call. Printed and listed unparenthesised, the only shape that is.

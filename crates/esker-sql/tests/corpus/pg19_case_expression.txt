@@ -1,0 +1,142 @@
+# `CASE WHEN … THEN … [ELSE …] END`, as a real PostgreSQL 19beta1 answers it — as a value in a
+# `SELECT`, as a predicate in a `WHERE`, and as the key of an index.
+#
+# NOT a type. This is `schema.rb`'s statement 198 and the one line **every** non-loading file of
+# `activerecord/test` stopped on at run 16:
+#
+#     CREATE INDEX "company_expression_index" ON "companies" ((CASE WHEN rating > 0 THEN lower(name) END) DESC)
+#
+# The index half of it was captured by the `r1-harness` lane in
+# `captures/pg19_index_constraint.txt` (the `cx_*` rows); the expression half — what a `CASE` is
+# worth in a `SELECT`, how its branches are typed, and what it refuses — had no oracle at all, and
+# was captured here the same way, one `psql -c` per statement against the same `esker-pg19`
+# container. Nothing below is reasoned; every answer came back from the server.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **A `CASE` short-circuits, and that is observable rather than an optimisation.**
+#     `CASE WHEN true THEN 1 ELSE 1/0 END` is `1`, and `CASE WHEN false THEN 1 WHEN 1/0 = 0 THEN 2
+#     ELSE 3 END` is `22012 division by zero` — the second `WHEN` is reached and the first is not.
+#     An implementation that evaluated every branch and then chose would raise on the first and
+#     answer the second, which is two wrong answers from one shortcut.
+#   * **The branch types are resolved with the `ELSE` FIRST, and the error message proves it.**
+#     `CASE WHEN true THEN 1::int8 ELSE 'x'::text END` is `42804 CASE types text and bigint cannot
+#     be matched` — `text` is named first even though it was written last, because PostgreSQL
+#     builds the list it resolves as `[ELSE, THEN₁, THEN₂, …]` (`transformCaseExpr` conses the
+#     default onto the front). Written the other way round the message swaps: `CASE types bigint
+#     and text`. A left-to-right resolution would name them in the opposite order every time.
+#   * **An `unknown` branch is not a type mismatch, it is a *conversion*.** With one branch typed,
+#     `CASE WHEN true THEN 1::int8 ELSE 'x' END` is not `42804` but
+#     `22P02 invalid input syntax for type bigint: "x"` — the quoted string is read *as* the
+#     resolved type and fails at the input function. Only two **known** types disagreeing is
+#     `42804`.
+#   * **All-unknown resolves to `text`**: `CASE WHEN true THEN 'a' ELSE 'b' END` is `text`, and so
+#     is a `CASE` with no typed branch at all.
+#   * **A NULL condition is not a match**, the same as false: `CASE WHEN NULL THEN 'a' ELSE 'b'
+#     END` is `b`. And in a `WHERE`, a `CASE` that falls off the end is NULL, which selects no row
+#     — `WHERE CASE WHEN flag THEN true END` returns only the row whose `flag` is true, not the
+#     one whose `flag` is NULL and not the one whose `flag` is false.
+#   * **A non-boolean condition is `42804`, and it names `CASE/WHEN` with a slash**: `argument of
+#     CASE/WHEN must be type boolean, not type bigint`. The same sentence a bare non-boolean
+#     `WHERE` gets, with a different subject.
+#   * **`pg_get_indexdef` materialises the implicit `ELSE` with its resolved type** and
+#     parenthesises the condition — written `(CASE WHEN rating > 0 THEN lower(name) END)`, it
+#     comes back `CASE WHEN (rating > 0) THEN lower(name) ELSE NULL::text END`. A condition that
+#     is a **bare boolean column** gets no parentheses (`WHEN flag THEN name`), which is the same
+#     three-shape deparse rule this node already stores beside every index expression.
+#   * **That definition is printed over five lines**, so it cannot be a row in this format — a
+#     corpus line is tab-separated and holds no newline. The four `pg_get_indexdef` answers and
+#     the one `pg_get_expr` answer are asserted in `tests/case_expression.rs` instead, where a Rust
+#     string can hold the newlines. They were captured with `replace(…, chr(10), '<NL>')` and are
+#     recorded here so the evidence is beside everything else:
+#
+#       pg_get_indexdef('cs_case')  CREATE INDEX cs_case ON public.cs USING btree ((<NL>CASE<NL>    WHEN (rating > 0) THEN lower(name)<NL>    ELSE NULL::text<NL>END) DESC)
+#       pg_get_indexdef('cs_case2') CREATE INDEX cs_case2 ON public.cs USING btree ((<NL>CASE<NL>    WHEN (rating > 0) THEN lower(name)<NL>    ELSE upper(name)<NL>END))
+#       pg_get_indexdef('cs_mixed') CREATE INDEX cs_mixed ON public.cs USING btree (rating, (<NL>CASE<NL>    WHEN (rating > 0) THEN lower(name)<NL>    ELSE NULL::text<NL>END))
+#       pg_get_indexdef('cs_bare')  CREATE INDEX cs_bare ON public.cs USING btree ((<NL>CASE<NL>    WHEN flag THEN name<NL>    ELSE NULL::text<NL>END))
+#       pg_get_expr(indexprs, …)    <NL>CASE<NL>    WHEN (rating > 0) THEN lower(name)<NL>    ELSE NULL::text<NL>END
+#
+#     Two spellings of the same value differ by one pair of parentheses and by nothing else, which
+#     is what `catalog::ExprShape` is for.
+#   * **An expression index column needs its own parentheses, and so does every expression that is
+#     not a bare function call.** `ON cs ((CASE … END))` is accepted and `ON cs (CASE … END)` is
+#     `42601 syntax error at or near "CASE"` — and the same refusal, naming a different token each
+#     time, covers `(name::text)`, `(rating + 1)`, `(name IS NULL)`, `(NOT (…))` and `(1)`.
+#     PostgreSQL's `index_elem` is `ColId | func_expr_windowless | '(' a_expr ')'` and the token it
+#     names is where that grammar stopped: the **first** token when nothing could begin an index
+#     element, and the **second** when a column name could and what followed it could not.
+#   * **An expression index column is `indkey` 0**, a mixed one `2 0`, and `indnatts` counts it.
+#   * **A `23505` names the key the way `pg_get_indexdef_columns` does**, which is one pair of
+#     parentheses more than `pg_get_expr` for a *value* and the same for a call. The last two rows
+#     here are that rule, and they are a regression test rather than a new feature: this node
+#     printed `Key (1)` for a unique index on `((1))` where a real server prints `Key ((1))`, and
+#     the call shape agreed all along, which is why it went unnoticed.
+#
+#     The `CASE` spelling of it cannot be a row for the newline reason above. Measured, it is
+#     `Key ((<NL>CASE<NL>    WHEN b > 'a' THEN upper(b)<NL>    ELSE NULL::text<NL>END))=(X)` —
+#     and note `WHEN b > 'a'` with **no parentheses**, where `pg_get_indexdef` writes
+#     `WHEN (b > 'a')`. That is PostgreSQL's `PRETTYFLAG_PAREN`, which only this one caller passes,
+#     and it is this unit's single declared divergence: the stored text carries the parentheses, so
+#     the `DETAIL` of a duplicate in a **unique** `CASE` index prints them. `ActiveRecord` writes no
+#     unique `CASE` index; the code, the message and every other spelling agree.
+CREATE TABLE cs (id int8 PRIMARY KEY, rating int4, name text, flag boolean)		-
+INSERT INTO cs VALUES (1, 5, 'Alpha', true)		-
+INSERT INTO cs VALUES (2, 0, 'beta', false)		-
+INSERT INTO cs VALUES (3, NULL, 'Gamma', NULL)		-
+SELECT id, CASE WHEN rating > 0 THEN 'yes' ELSE 'no' END FROM cs ORDER BY id	bigint,text	1|yes ; 2|no ; 3|no
+SELECT id, CASE WHEN rating > 0 THEN lower(name) END FROM cs ORDER BY id	bigint,text	1|alpha ; 2|\N ; 3|\N
+SELECT id, CASE WHEN rating > 3 THEN 'high' WHEN rating > 0 THEN 'low' ELSE 'none' END FROM cs ORDER BY id	bigint,text	1|high ; 2|none ; 3|none
+SELECT id, CASE WHEN flag THEN upper(name) ELSE lower(name) END FROM cs ORDER BY id	bigint,text	1|ALPHA ; 2|beta ; 3|gamma
+SELECT id FROM cs WHERE CASE WHEN rating IS NULL THEN false ELSE rating > 0 END ORDER BY id	bigint	1
+SELECT id FROM cs WHERE CASE WHEN flag THEN true END ORDER BY id	bigint	1
+SELECT CASE WHEN true THEN 'a' ELSE 'b' END	text	a
+SELECT CASE WHEN false THEN 'a' ELSE 'b' END	text	b
+SELECT CASE WHEN NULL THEN 'a' ELSE 'b' END	text	b
+SELECT CASE WHEN false THEN 'a' END	text	\N
+SELECT CASE WHEN true THEN 'a' END IS NULL	boolean	f
+SELECT CASE WHEN false THEN 'a' END IS NULL	boolean	t
+SELECT id, CASE WHEN flag THEN id ELSE 0 END FROM cs ORDER BY id	bigint,bigint	1|1 ; 2|0 ; 3|0
+SELECT CASE WHEN true THEN true ELSE false END	boolean	t
+SELECT CASE WHEN true THEN 'a'::text ELSE 'b'::text END	text	a
+SELECT CASE WHEN true THEN 1 ELSE 1/0 END	integer	1
+SELECT CASE WHEN false THEN 1/0 ELSE 2 END	integer	2
+SELECT CASE WHEN false THEN 1 WHEN 1/0 = 0 THEN 2 ELSE 3 END	!22012 division by zero
+SELECT CASE WHEN true THEN id ELSE name END FROM cs	!42804 CASE types text and bigint cannot be matched
+SELECT CASE WHEN true THEN name ELSE id END FROM cs	!42804 CASE types bigint and text cannot be matched
+SELECT CASE WHEN true THEN id ELSE 'x' END FROM cs	!22P02 invalid input syntax for type bigint: "x"
+SELECT CASE WHEN id THEN 'a' ELSE 'b' END FROM cs	!42804 argument of CASE/WHEN must be type boolean, not type bigint
+SELECT id FROM cs WHERE CASE WHEN true THEN id ELSE id END	!42804 argument of WHERE must be type boolean, not type bigint
+SELECT CASE WHEN nosuchcol > 0 THEN 'a' END FROM cs	!42703 column "nosuchcol" does not exist
+SELECT CASE WHEN rating > 0 THEN 'a' END FROM nosuchtable	!42P01 relation "nosuchtable" does not exist
+SELECT CASE WHEN true THEN CASE WHEN false THEN 'a' ELSE 'b' END ELSE 'c' END	text	b
+SELECT CASE WHEN rating > 0 THEN id ELSE 0 END AS f, count(*) FROM cs GROUP BY 1 ORDER BY 1	bigint,bigint	0|2 ; 1|1
+SELECT max(CASE WHEN rating > 0 THEN id ELSE 0 END) FROM cs	bigint	1
+SELECT id FROM cs ORDER BY CASE WHEN name = 'beta' THEN 0 ELSE 1 END, id	bigint	2 ; 1 ; 3
+UPDATE cs SET rating = CASE WHEN rating IS NULL THEN 0 ELSE rating END		-
+SELECT id, rating FROM cs ORDER BY id	bigint,integer	1|5 ; 2|0 ; 3|0
+CREATE INDEX cs_case ON cs ((CASE WHEN rating > 0 THEN lower(name) END) DESC)		-
+CREATE INDEX cs_case2 ON cs ((CASE WHEN rating > 0 THEN lower(name) ELSE upper(name) END))		-
+CREATE INDEX cs_mixed ON cs (rating, (CASE WHEN rating > 0 THEN lower(name) END))		-
+CREATE INDEX cs_bare ON cs ((CASE WHEN flag THEN name END))		-
+SELECT indisunique, indnatts, indkey::text FROM pg_index WHERE indexrelid = 'cs_case'::regclass	boolean,smallint,text	f|1|0
+SELECT indisunique, indnatts, indkey::text FROM pg_index WHERE indexrelid = 'cs_mixed'::regclass	boolean,smallint,text	f|2|2 0
+CREATE INDEX cs_bad ON cs ((CASE WHEN nosuchcol > 0 THEN 'a' END))	!42703 column "nosuchcol" does not exist
+CREATE INDEX cs_noparen ON cs (CASE WHEN rating > 0 THEN lower(name) END)	!42601 syntax error at or near "CASE"
+CREATE INDEX cs_p1 ON cs (name::text)	!42601 syntax error at or near "::"
+CREATE INDEX cs_p2 ON cs (rating + 1)	!42601 syntax error at or near "+"
+CREATE INDEX cs_p3 ON cs (name IS NULL)	!42601 syntax error at or near "IS"
+CREATE INDEX cs_p4 ON cs (NOT (name IS NULL))	!42601 syntax error at or near "NOT"
+CREATE INDEX cs_p6 ON cs (1)	!42601 syntax error at or near "1"
+CREATE INDEX cs_agg ON cs ((CASE WHEN count(rating) > 0 THEN 'a' END))	!42803 aggregate functions are not allowed in index expressions
+SELECT id FROM cs WHERE CASE WHEN rating > 0 THEN lower(name) ELSE NULL END = 'alpha'	bigint	1
+CREATE TABLE cv (id int8 PRIMARY KEY, b text)		-
+CREATE UNIQUE INDEX cv_val ON cv ((1))		-
+INSERT INTO cv VALUES (1, 'x')		-
+INSERT INTO cv VALUES (2, 'X')	!23505 duplicate key value violates unique constraint "cv_val" DETAIL: Key ((1))=(1) already exists.
+DROP INDEX cv_val		-
+CREATE UNIQUE INDEX cv_call ON cv ((lower(b)))		-
+INSERT INTO cv VALUES (2, 'X')	!23505 duplicate key value violates unique constraint "cv_call" DETAIL: Key (lower(b))=(x) already exists.

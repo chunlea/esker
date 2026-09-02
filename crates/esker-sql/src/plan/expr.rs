@@ -203,6 +203,39 @@ pub enum Expr {
         /// does not know it came from a `bpchar`.
         strip_blanks: bool,
     },
+    /// `CASE WHEN … THEN … [WHEN … THEN …] [ELSE …] END` — the **searched** form.
+    ///
+    /// The one expression in this crate whose operands are *not all evaluated*, and that is
+    /// observable rather than an optimisation: `CASE WHEN true THEN 1 ELSE 1/0 END` is `1` on a
+    /// real server and `CASE WHEN false THEN 1 WHEN 1/0 = 0 THEN 2 ELSE 3 END` is
+    /// `22012 division by zero`, because the second `WHEN` is reached and the first `ELSE` is not.
+    /// So it is a variant rather than three operands of something generic — an evaluator that
+    /// computed its children and then chose would get both of those wrong, in opposite
+    /// directions.
+    ///
+    /// The **simple** form (`CASE x WHEN 1 THEN …`) is `0A000` naming itself where it is lowered.
+    /// It is not this shape with a rewrite in front of it: a real server prints it back as
+    /// `CASE x WHEN 1 THEN …`, so an index over one desugared into `WHEN x = 1` would store a
+    /// definition `ActiveRecord` would not recognise.
+    Case {
+        /// The `WHEN`/`THEN` pairs, in the order written. PostgreSQL's grammar has no empty one.
+        branches: Vec<CaseBranch>,
+        /// The `ELSE`, or `None` when it was not written — which is a NULL of the resolved type
+        /// and not an error (`CASE WHEN false THEN 'a' END` is NULL).
+        otherwise: Option<Box<Expr>>,
+    },
+}
+
+/// One `WHEN … THEN …` of a [`Expr::Case`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaseBranch {
+    /// The condition. Must be `boolean` — anything else is
+    /// `42804 argument of CASE/WHEN must be type boolean, not type …`, checked where the
+    /// expression is resolved rather than when a row reaches it.
+    pub when: Expr,
+    /// What the `CASE` is worth when that condition is **true**. NULL and false are both "not
+    /// this branch", which is why the check is against `true` and not against "not false".
+    pub then: Expr,
 }
 /// The scalar functions this node has, all of them one argument over a string.
 ///
@@ -826,6 +859,7 @@ fn describe(expr: &Expr) -> &'static str {
         Expr::Default => "DEFAULT",
         Expr::Sequence(_) => "a sequence function",
         Expr::CatalogFunc(_) => "a catalog function",
+        Expr::Case { .. } => "CASE",
         Expr::Subquery(sub) => sub.kind.describe(),
     }
 }

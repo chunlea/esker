@@ -880,6 +880,41 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                 })
             }
         },
+        // **One branch is evaluated, and the others are not.** `CASE WHEN true THEN 1 ELSE 1/0
+        // END` is `1` on a real server and `CASE WHEN false THEN 1 WHEN 1/0 = 0 THEN 2 ELSE 3 END`
+        // is `22012` — the second condition is reached and the first result is not. So this walks
+        // and returns rather than computing the branches and selecting among them, which would get
+        // both of those wrong in opposite directions.
+        //
+        // A condition is this branch only when it is **`true`**: NULL and false are both "not
+        // this one", which is why `CASE WHEN NULL THEN 'a' ELSE 'b' END` is `b`.
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            let mut answer = Datum::Null;
+            for branch in branches {
+                match evaluate_in(&branch.when, row, env)? {
+                    Datum::Bool(true) => return evaluate_in(&branch.then, row, env),
+                    Datum::Bool(false) | Datum::Null => {}
+                    other => {
+                        // Caught where the expression is resolved for every shape whose type is
+                        // known then; this is the one that is not — an `unknown` condition, whose
+                        // type nothing gives it.
+                        return Err(SqlError::DatatypeMismatch(format!(
+                            "argument of CASE/WHEN must be type boolean, not type {}",
+                            other
+                                .column_type()
+                                .map_or("unknown", crate::value::PgType::name)
+                        )));
+                    }
+                }
+            }
+            if let Some(otherwise) = otherwise {
+                answer = evaluate_in(otherwise, row, env)?;
+            }
+            answer
+        }
         Expr::Literal(Literal::Null) => Datum::Null,
         Expr::Literal(Literal::Bool(value)) => Datum::Bool(*value),
         Expr::Literal(Literal::Integer(value)) => Datum::Int8(*value),

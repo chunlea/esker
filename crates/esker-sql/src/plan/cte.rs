@@ -171,6 +171,18 @@ fn for_each_subquery_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut TableRef))
                 for_each_subquery_mut(item, visit);
             }
         }
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            for branch in branches {
+                for_each_subquery_mut(&mut branch.when, visit);
+                for_each_subquery_mut(&mut branch.then, visit);
+            }
+            if let Some(otherwise) = otherwise {
+                for_each_subquery_mut(otherwise, visit);
+            }
+        }
         Expr::Aggregate(call) => {
             for arg in &mut call.args {
                 for_each_subquery_mut(arg, visit);

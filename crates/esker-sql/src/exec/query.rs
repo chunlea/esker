@@ -1545,6 +1545,10 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             operand: Box::new(resolve(operand, scope)?),
             negated: *negated,
         },
+        Expr::Case {
+            branches,
+            otherwise,
+        } => resolve_case(branches, otherwise.as_deref(), scope)?,
         // Its arguments are ordinary expressions of the row — `format_type(a.atttypid,
         // a.atttypmod)` is two column references — so they resolve like any others. Falling
         // through to the clone below would leave them as `Expr::Column` and the evaluator would
@@ -1570,6 +1574,89 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             Expr::Subquery(resolved)
         }
         other => other.clone(),
+    })
+}
+
+/// One `CASE`, resolved: its conditions checked for `boolean` and its branches given one type.
+///
+/// **The `ELSE` is resolved first**, which is not a stylistic ordering. PostgreSQL builds the list
+/// it runs `select_common_type` over as `[ELSE, THEN₁, THEN₂, …]` — `transformCaseExpr` conses the
+/// default onto the front — and the error message names the types **in that order**. Measured, over
+/// a `bigint` column and a `text` one: `CASE WHEN true THEN id ELSE name END` is
+/// `CASE types text and bigint cannot be matched` and `THEN name ELSE id` is the same sentence with
+/// the two swapped. Resolving left to right would name them the wrong way round in both.
+fn resolve_case(
+    branches: &[crate::plan::CaseBranch],
+    otherwise: Option<&Expr>,
+    scope: &Scope<'_>,
+) -> Result<Expr> {
+    let mut otherwise = match otherwise {
+        Some(expr) => Some(Box::new(resolve(expr, scope)?)),
+        None => None,
+    };
+    let mut resolved = Vec::with_capacity(branches.len());
+    for branch in branches {
+        let when = resolve(&branch.when, scope)?;
+        // A condition that is not boolean is `42804` here rather than a row that quietly
+        // never matches. An **`unknown`** condition is left alone, and that is not a
+        // detail: `CASE WHEN NULL THEN 'a' ELSE 'b' END` is `b` on a real server, because
+        // a bare NULL takes the type it is used at — and `expr_type` calls a NULL `text`,
+        // which would refuse it here. `WHEN 'x'` is left for the same reason, and reaches
+        // the evaluator's own `42804`.
+        if !matches!(when, Expr::Literal(Literal::Null | Literal::String(_)))
+            && let Ok(ty) = expr_type(&when, scope)
+            && ty != ColumnType::Bool
+        {
+            return Err(SqlError::DatatypeMismatch(format!(
+                "argument of CASE/WHEN must be type boolean, not type {}",
+                ty.name()
+            )));
+        }
+        resolved.push(crate::plan::CaseBranch {
+            when,
+            then: resolve(&branch.then, scope)?,
+        });
+    }
+    // The result type, over the same list and in the same order. The first branch with a
+    // type decides it; a later one whose type is in a different family is `42804`, and an
+    // `unknown` one is **converted** rather than refused — `ELSE 'x'` against a `bigint`
+    // is `22P02 invalid input syntax for type bigint`, which is what `give_type` raises.
+    let results = otherwise
+        .iter()
+        .map(AsRef::as_ref)
+        .chain(resolved.iter().map(|branch| &branch.then));
+    let mut common = None;
+    for result in results {
+        let Some(ty) = branch_type(result, scope) else {
+            continue;
+        };
+        match common {
+            None => common = Some(ty),
+            Some(chosen) if same_family(chosen, ty) => {}
+            Some(chosen) => {
+                // The **resolved** type first and the offending one second, which is the
+                // order the list is walked in and therefore the order PostgreSQL names
+                // them: `THEN id ELSE name` is `CASE types text and bigint`, because the
+                // `ELSE` is the head of the list and `text` is what it settled on first.
+                return Err(SqlError::DatatypeMismatch(format!(
+                    "CASE types {} and {} cannot be matched",
+                    chosen.name(),
+                    ty.name()
+                )));
+            }
+        }
+    }
+    if let Some(ty) = common {
+        if let Some(expr) = &mut otherwise {
+            give_branch_type(expr, ty)?;
+        }
+        for branch in &mut resolved {
+            give_branch_type(&mut branch.then, ty)?;
+        }
+    }
+    Ok(Expr::Case {
+        branches: resolved,
+        otherwise,
     })
 }
 
@@ -1751,6 +1838,41 @@ fn unknown_of(expr: &Expr) -> &Literal {
 /// The **first** operand with a type wins, operand or item, and every `unknown` in the expression
 /// takes it. Where two typed operands disagree nothing is decided here: the pairwise `reconcile`
 /// that follows is what raises `42883`, and it names the two types.
+/// Reads one `CASE` branch's constant **as the type the branches resolved to**.
+///
+/// Wider than [`give_type`], which only retypes an `unknown`, and the difference is what makes
+/// `UPDATE t SET n = CASE WHEN n IS NULL THEN 0 ELSE n END` work over an `integer` column: the `0`
+/// is an integer constant, `n` is the branch that has a type, and without narrowing the constant
+/// to it the `CASE` evaluates to an `int8` that will not assign. A real server does the same thing
+/// for the same reason — `select_common_type` coerces every input to the chosen type, not only the
+/// untyped ones.
+///
+/// Only the three **spellings that carry no type of their own** are read this way. A
+/// `Literal::Typed` was written with a cast and keeps what it was given; the family check above
+/// has already refused it if that disagrees.
+fn give_branch_type(expr: &mut Expr, ty: ColumnType) -> Result<()> {
+    if let Expr::Literal(
+        literal @ (Literal::String(_) | Literal::Integer(_) | Literal::Decimal(_)),
+    ) = expr
+    {
+        *literal = retype(ty, &literal.clone(), BinaryOp::Eq, false)?;
+    }
+    Ok(())
+}
+
+/// The type one `CASE` branch already has, or `None` for the two spellings that have none.
+///
+/// `unknown` is the point: a quoted string and a bare NULL take their type from the branch that
+/// has one, so they are skipped here and coerced afterwards. Anything whose type cannot be read at
+/// all — a parameter with no value yet — is skipped too rather than refused, because a `CASE` over
+/// one is typed by its other branches on a real server as well.
+fn branch_type(expr: &Expr, scope: &Scope<'_>) -> Option<ColumnType> {
+    match expr {
+        Expr::Literal(literal) => literal_type(literal),
+        other => expr_type(other, scope).ok(),
+    }
+}
+
 fn common_type(operand: &Expr, items: &[Expr]) -> Option<ColumnType> {
     std::iter::once(operand)
         .chain(items)
@@ -1881,6 +2003,14 @@ fn check_predicate(expr: &Expr, clause: &'static str, scope: &Scope<'_>) -> Resu
             ty: ColumnType::Bool,
             ..
         } => Ok(()),
+        // A `CASE` is a predicate exactly when its **branches** resolved to `boolean`. This list
+        // is otherwise a list of shapes, because every other shape on it has one type; a `CASE`
+        // is the first whose type is a property of what is inside it, so it is the first arm here
+        // that has to ask. `WHERE CASE WHEN flag THEN true END` is a filter and
+        // `WHERE CASE WHEN true THEN id ELSE id END` is `42804 … not type bigint`.
+        Expr::Case { .. } if expr_type(expr, scope).is_ok_and(|ty| ty == ColumnType::Bool) => {
+            Ok(())
+        }
         // `EXISTS`, `IN` and `ANY`/`ALL` are predicates; a **scalar** subquery is not, and falls
         // through to the arm below so that `WHERE (SELECT max(id) FROM a)` gets PostgreSQL's own
         // sentence with the subquery's type in it — measured, `not type bigint`.
@@ -2054,6 +2184,19 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // A scalar subquery has the type of the column it returns and the other four are
         // predicates, which is the whole of what `SubqueryExpr::value_type` says.
         Expr::Subquery(sub) => sub.value_type(),
+        // The type the branches resolved to, read back in the order they were resolved in
+        // (`resolve`'s `Expr::Case` arm) — the `ELSE` first. All-`unknown` is `text`, which is
+        // PostgreSQL's own fallback and is why `CASE WHEN true THEN 'a' ELSE 'b' END` is `text`
+        // rather than untyped.
+        Expr::Case {
+            branches,
+            otherwise,
+        } => otherwise
+            .iter()
+            .map(AsRef::as_ref)
+            .chain(branches.iter().map(|branch| &branch.then))
+            .find_map(|result| branch_type(result, scope))
+            .unwrap_or(ColumnType::Text),
         Expr::Parameter(number) => return Err(SqlError::UndefinedParameter(*number)),
         // An aggregate's type is the aggregation's business, and by the time a plan is typed
         // every one of them has been rewritten into an `Ordinal` carrying the answer. One here

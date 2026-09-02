@@ -32,6 +32,8 @@
 //! under any spelling, and the only user-visible consequence of its existence is that a table
 //! without a key can now be created, written and read.
 
+use std::fmt::Write as _;
+
 use crate::backend::Txn;
 use crate::catalog::{self, CheckDef, ColumnDef, IndexDef, IndexKey, KeyPart, TableDef};
 use crate::error::{Result, SqlError};
@@ -40,7 +42,7 @@ use crate::pgwire::session::Outcome;
 use crate::plan::{
     self, AlterTable, AlterTableAction, CreateIndex, CreateTable, DropIndex, DropTable,
 };
-use crate::value::{ColumnType, Datum};
+use crate::value::{ColumnType, Datum, PgDatum as _, PgType as _};
 
 pub(super) fn create_table(
     executor: &mut Executor,
@@ -566,11 +568,14 @@ pub(super) fn create_index(
                     .column(column)
                     .map(KeyPart::Column)
                     .ok_or_else(|| SqlError::UndefinedColumn(column.clone()))?,
-                plan::KeyPartName::Expression { expr, shape } => KeyPart::Expression {
-                    expr: expr.clone(),
-                    shape: *shape,
-                    ty: index_expression(&table, expr)?,
-                },
+                plan::KeyPartName::Expression { expr, shape } => {
+                    let (expr, ty) = index_expression(&table, expr)?;
+                    KeyPart::Expression {
+                        expr,
+                        shape: *shape,
+                        ty,
+                    }
+                }
             };
             Ok(IndexKey {
                 part,
@@ -656,12 +661,140 @@ pub(super) fn create_index(
 /// An index whose key is not a function of the row is not a slow index, it is a **wrong** one: the
 /// entry is written from the value the expression had at insert and looked up from the value it
 /// has at read, and nothing ever notices they differ.
-fn index_expression(table: &TableDef, expr: &str) -> Result<ColumnType> {
+fn index_expression(table: &TableDef, expr: &str) -> Result<(String, ColumnType)> {
     let parsed = crate::parse::parse_stored_expr(expr)?;
     let scope = crate::exec::query::Scope::single(table);
     let resolved = crate::exec::query::resolve(&parsed, &scope)?;
     refuse_unless_immutable(&resolved)?;
-    crate::exec::query::expr_type(&resolved, &scope)
+    let ty = crate::exec::query::expr_type(&resolved, &scope)?;
+    // **A `CASE` is stored deparsed and every other expression is stored as written**, which is
+    // the smallest form of what a real server does: PostgreSQL stores a parse tree everywhere and
+    // prints it back, so the text that comes out is never quite the text that went in. For a
+    // function call or an operator the two agree once the outer parentheses are normalised, and
+    // this crate has stored the written text since the expression-index unit. A `CASE` is the
+    // first shape where they cannot agree — the implicit `ELSE` is **filled in with the resolved
+    // type**, which is not in the written text at all and is not knowable until here, where the
+    // expression has met the table.
+    let text = match &resolved {
+        plan::Expr::Case { .. } => deparse(&resolved, table, ty),
+        _ => expr.to_owned(),
+    };
+    Ok((text, ty))
+}
+
+/// One resolved expression, as `pg_get_expr` prints it.
+///
+/// Only reached for a `CASE` today — everything else is stored as written — but total over the
+/// expression type on purpose: a new variant that can be an index key has to decide how it prints
+/// before it compiles, which is the same reason [`catalog::ExprShape`] exists.
+///
+/// Operator-shaped nodes carry their own parentheses, exactly as PostgreSQL's deparser adds them,
+/// so a `WHEN` writes its condition unadorned and gets `WHEN (rating > 0)` for a comparison and
+/// `WHEN flag` for a boolean column. Measured, both.
+fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
+    use crate::plan::Expr;
+    let sub = |expr: &Expr| deparse(expr, table, ty);
+    match expr {
+        Expr::Ordinal { at, .. } => table
+            .columns
+            .get(*at)
+            .map_or_else(|| format!("<column {at}>"), |column| column.name.clone()),
+        Expr::Literal(literal) => deparse_literal(literal, ty),
+        Expr::Binary { op, left, right } => {
+            format!("({} {} {})", sub(left), op.symbol(), sub(right))
+        }
+        Expr::Not(operand) => format!("(NOT {})", sub(operand)),
+        Expr::IsNull { operand, negated } => format!(
+            "({} IS {}NULL)",
+            sub(operand),
+            if *negated { "NOT " } else { "" }
+        ),
+        Expr::InList {
+            operand,
+            list,
+            negated,
+        } => format!(
+            "({} {}IN ({}))",
+            sub(operand),
+            if *negated { "NOT " } else { "" },
+            list.iter().map(&sub).collect::<Vec<_>>().join(", ")
+        ),
+        Expr::Scalar { func, operand } => format!("{}({})", func.name(), sub(operand)),
+        Expr::ToText { operand, .. } => format!("({})::text", sub(operand)),
+        // **Five lines, indented four spaces, with the implicit `ELSE` materialised.** This layout
+        // is what `pg_get_indexdef` answers on a real server — `pg_get_indexdef` deparses with
+        // `PRETTYFLAG_INDENT`, which puts every keyword of a `CASE` on its own line — and it is
+        // why `ActiveRecord`'s schema dumper sees a multi-line definition for statement 198.
+        // Captured with the newlines escaped, because a corpus line cannot hold one
+        // (`tests/corpus/pg19_case_expression.txt`).
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            let mut text = "\nCASE".to_owned();
+            for branch in branches {
+                let _ = write!(
+                    text,
+                    "\n    WHEN {} THEN {}",
+                    sub(&branch.when),
+                    sub(&branch.then)
+                );
+            }
+            // An `ELSE` that was not written is **not** absent from the printed form: it is
+            // `NULL` of the type the branches resolved to, which is the one part of this text that
+            // could not have been produced before the expression met the table.
+            let otherwise = otherwise
+                .as_deref()
+                .map_or_else(|| deparse_literal(&plan::Literal::Null, ty), &sub);
+            let _ = write!(text, "\n    ELSE {otherwise}\nEND");
+            text
+        }
+        // Refused before this is reached: `refuse_unless_immutable` rejects every one of them as
+        // an index key, and a column reference has been resolved to an `Ordinal` by then. Printed
+        // rather than panicked on, because this is a catalog write and not a place to abort.
+        Expr::Column { name, .. } => name.clone(),
+        Expr::Parameter(number) => format!("${number}"),
+        Expr::Outer { at, .. } => format!("<outer {at}>"),
+        Expr::Default => "DEFAULT".to_owned(),
+        Expr::Sequence(call) => format!("{}()", call.func.name()),
+        Expr::CatalogFunc(call) => format!("{}(...)", call.func.name()),
+        Expr::Aggregate(call) => format!("{}(...)", call.func.name()),
+        Expr::Subquery(sub) => sub.kind.describe().to_owned(),
+    }
+}
+
+/// A constant, with the cast PostgreSQL prints on the ones whose type is not in their spelling.
+///
+/// `'a'::text` and `NULL::text`, not `'a'` and `NULL`: a constant in a stored tree carries a type,
+/// and the deparser writes it out wherever the literal alone would not say what it is. A number
+/// and a boolean say it themselves.
+fn deparse_literal(literal: &plan::Literal, ty: ColumnType) -> String {
+    use crate::plan::Literal;
+    match literal {
+        Literal::Null => format!("NULL::{}", ty.name()),
+        Literal::Bool(value) => value.to_string(),
+        Literal::Integer(value) => value.to_string(),
+        Literal::Decimal(digits) => digits.clone(),
+        Literal::String(text) => format!("'{}'::{}", text.replace('\'', "''"), ty.name()),
+        // **A number prints bare and everything else prints with its type**, which is
+        // PostgreSQL's `get_const_expr` and is measured: `(rating > 0)` for an integer column,
+        // `(t > 'a'::text)` for a text one and `(d > '2020-01-01'::date)` for a date. The label is
+        // what tells the reader — and the re-parse — which type a quoted constant is; a numeral
+        // says so itself.
+        Literal::Typed(value) => match value.as_ref() {
+            Datum::Bool(flag) => flag.to_string(),
+            number @ (Datum::Int8(_)
+            | Datum::Int4(_)
+            | Datum::Int2(_)
+            | Datum::Double(_)
+            | Datum::Real(_)) => number.to_text().unwrap_or_default(),
+            other => format!(
+                "'{}'::{}",
+                other.to_text().unwrap_or_default().replace('\'', "''"),
+                other.column_type().map_or(ty, |own| own).name()
+            ),
+        },
+    }
 }
 
 /// Walks one resolved expression, refusing every node that may not be an index key.

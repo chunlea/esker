@@ -410,6 +410,10 @@ fn push_filter(
         Expr::ToText { .. } => return Err(refused("a cast to text")),
         // Not expressible in the fragment language; the filter stays on the row side.
         Expr::Scalar { .. } => return Err(refused("a scalar function")),
+        // The fragment language has no conditional, and a `CASE` is the one expression whose
+        // branches must **not** all be evaluated — pushing it down as anything else would change
+        // which of them raises. Rows, and the row evaluator answers it.
+        Expr::Case { .. } => return Err(refused("a CASE expression")),
         Expr::Literal(literal) => ColExpr::Literal(literal_value(literal)?),
         // A catalog function is a function of the catalog, not of the fragment's columns, and the
         // columnar reader has no expression for it. Rows, and the row evaluator answers it.
@@ -645,6 +649,21 @@ fn collect_columns(expr: &Expr, into: &mut Vec<usize>) {
             collect_columns(operand, into);
             for item in list {
                 collect_columns(item, into);
+            }
+        }
+        // Every branch's columns, condition and result alike: a projection that left out a column
+        // only one unreached branch names would still have to read it, because which branch is
+        // reached is a property of the row and not of the plan.
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            for branch in branches {
+                collect_columns(&branch.when, into);
+                collect_columns(&branch.then, into);
+            }
+            if let Some(otherwise) = otherwise {
+                collect_columns(otherwise, into);
             }
         }
         Expr::Aggregate(call) => {

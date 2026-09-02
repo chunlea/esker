@@ -19,6 +19,8 @@
 //! slow. `EXPLAIN` prints which one was chosen, because a plan a user cannot see is a plan they
 //! cannot fix.
 
+use std::fmt::Write as _;
+
 use crate::catalog::pg_catalog::CatalogView;
 use crate::plan::{AggregateFunc, Expr, Literal};
 use crate::row::RowSchema;
@@ -812,6 +814,27 @@ fn render(expr: &Expr, columns: &[String]) -> String {
             render(operand, columns),
             if *negated { "NOT " } else { "" }
         ),
+        // On one line, the way `EXPLAIN` prints everything else — `pg_get_indexdef`'s five-line
+        // layout is for a stored definition and is built where that is written
+        // (`crate::exec::ddl`), not here.
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            let mut text = "CASE".to_owned();
+            for branch in branches {
+                let _ = write!(
+                    text,
+                    " WHEN {} THEN {}",
+                    render(&branch.when, columns),
+                    render(&branch.then, columns)
+                );
+            }
+            if let Some(otherwise) = otherwise {
+                let _ = write!(text, " ELSE {}", render(otherwise, columns));
+            }
+            text + " END"
+        }
         // The sub-plan is **not** printed inside the condition. It is a tree, and a tree rendered
         // on one line is unreadable; what a reader needs here is that there is a subquery and
         // which kind, the way PostgreSQL prints `SubPlan 1` and puts the plan below.

@@ -122,15 +122,21 @@ fn evaluate_stored(table: &TableDef, index: &IndexDef, expr: &str, row: &[Datum]
 /// `Key (a, lower(b))=(1, x)`, PostgreSQL's `DETAIL` for a uniqueness failure.
 ///
 /// An expression key part prints **as the expression**, which is what a real server does:
-/// `Key (lower(b))=(alpha) already exists.` Measured — and the form it prints is the one
-/// `pg_get_expr` gives, not the one that goes in the key list, so the parentheses here are one
-/// pair fewer than in `pg_get_indexdef` ([`crate::catalog::pg_index`]).
+/// `Key (lower(b))=(alpha) already exists.` Measured — and the form it prints is the
+/// **per-column** one, `pg_get_indexdef_columns`, which is what PostgreSQL's
+/// `BuildIndexValueDescription` calls: it joins the key parts and wraps the whole list in one
+/// pair, so each part arrives already carrying whatever parentheses its shape gives it.
+///
+/// That is one pair more than [`catalog::ExprShape::printed`] for a **value**, and getting it from
+/// `printed` was wrong for exactly that shape: a unique index on `((1))` printed `Key (1)` where a
+/// real server prints `Key ((1))`. The call and operator shapes were already right, which is why
+/// it went unnoticed — they are the two whose printed and per-column forms agree.
 pub(super) fn render_key(table: &TableDef, keys: &[IndexKey], values: &[Datum]) -> String {
     let names: Vec<String> = keys
         .iter()
         .map(|key| match &key.part {
             KeyPart::Column(at) => table.columns[*at].name.clone(),
-            KeyPart::Expression { expr, shape, .. } => shape.printed(expr),
+            KeyPart::Expression { expr, shape, .. } => shape.per_column(expr),
         })
         .collect();
     format!("Key ({})=({})", names.join(", "), render_values(values))

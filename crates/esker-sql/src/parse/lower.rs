@@ -1496,6 +1496,38 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             compare_op,
             right,
         } => lower_quantified(left, compare_op, right, true),
+        // `CASE WHEN … THEN … [ELSE …] END`. The **simple** form carries an operand after `CASE`
+        // and is refused by name: a real server prints it back as `CASE x WHEN 1 THEN …`, so
+        // desugaring it into `WHEN x = 1` would store a definition that is not the one written and
+        // `pg_get_indexdef` would answer with something `ActiveRecord` never wrote. Nothing in
+        // `schema.rb` uses it.
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            refuse_if(
+                operand.is_some(),
+                "CASE <expression> WHEN ..., the simple form",
+            )?;
+            Ok(plan::Expr::Case {
+                branches: conditions
+                    .iter()
+                    .map(|branch| {
+                        Ok(plan::CaseBranch {
+                            when: lower_expr(&branch.condition)?,
+                            then: lower_expr(&branch.result)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                otherwise: else_result
+                    .as_deref()
+                    .map(lower_expr)
+                    .transpose()?
+                    .map(Box::new),
+            })
+        }
         other => Err(SqlError::unsupported(format!("the expression {other}"))),
     }
 }
@@ -1644,7 +1676,9 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
     if let Some(at) = star_at
         && args.len() > 1
     {
-        return Err(SqlError::SyntaxAtOrNear(if at == 0 { "," } else { "*" }));
+        return Err(SqlError::SyntaxAtOrNear(
+            if at == 0 { "," } else { "*" }.to_owned(),
+        ));
     }
 
     let star = star_at.is_some();
@@ -3262,12 +3296,25 @@ fn index_keys(columns: &[IndexColumn]) -> Result<Vec<plan::IndexKeyPart>> {
         .iter()
         .map(|column| {
             index_key_options(column)?;
-            let part = match unwrap_nested(&column.column.expr) {
+            let written = &column.column.expr;
+            let part = match unwrap_nested(written) {
                 Expr::Identifier(name) => plan::KeyPartName::Column(ident(name)),
-                expr => plan::KeyPartName::Expression {
-                    expr: expr.to_string(),
-                    shape: expr_shape(expr),
-                },
+                expr => {
+                    // **The doubled parenthesis is grammar, not style.** PostgreSQL's `index_elem`
+                    // is `ColId | func_expr_windowless | '(' a_expr ')'`, so `ON t ((lower(b)))`
+                    // and the bare call `ON t (lower(b))` are both accepted and everything else
+                    // needs a pair of its own: `ON t (a + 1)` is `42601`, and so is
+                    // `ON t (CASE … END)`. `sqlparser` parses all of them, so this is where the
+                    // narrower grammar is enforced — without it this node builds an index a real
+                    // server refuses to create, which is a wrong answer and not a gap.
+                    if !matches!(written, Expr::Nested(_) | Expr::Function(_)) {
+                        return Err(SqlError::SyntaxAtOrNear(index_elem_token(written)));
+                    }
+                    plan::KeyPartName::Expression {
+                        expr: expr.to_string(),
+                        shape: expr_shape(expr),
+                    }
+                }
             };
             Ok(plan::IndexKeyPart {
                 part,
@@ -3275,6 +3322,44 @@ fn index_keys(columns: &[IndexColumn]) -> Result<Vec<plan::IndexKeyPart>> {
             })
         })
         .collect()
+}
+
+/// The token PostgreSQL names in the `42601` an unparenthesised index expression gets.
+///
+/// Not the first token of the expression in every case, and that is the whole of what this
+/// function is: PostgreSQL's parser consumes what the grammar allows and then names where it
+/// stopped. `ON t (1)` stops at the **first** token because nothing may begin an index element
+/// with a constant; `ON t (a + 1)` stops at the **second**, because `a` is a perfectly good
+/// `ColId` and the `+` after it is not. Measured, all six spellings
+/// (`tests/corpus/pg19_case_expression.txt`).
+fn index_elem_token(expr: &Expr) -> String {
+    /// Whether this could have begun an index element, which decides whether the offending token
+    /// is the first one or the one after it.
+    fn begins_an_element(expr: &Expr) -> bool {
+        matches!(
+            expr,
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Function(_)
+        )
+    }
+    match expr {
+        Expr::BinaryOp { left, op, .. } if begins_an_element(left) => op.to_string(),
+        Expr::Cast { expr: inner, .. } if begins_an_element(inner) => "::".to_owned(),
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) if begins_an_element(inner) => "IS".to_owned(),
+        Expr::Case { .. } => "CASE".to_owned(),
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            ..
+        } => "NOT".to_owned(),
+        Expr::Value(value) => value.value.to_string(),
+        // Every other shape stops at its own first token, which is the first word of what was
+        // written — the same fallback [`alter_action_name`] uses for an action it has no name for.
+        other => other
+            .to_string()
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_owned(),
+    }
 }
 
 /// An expression with its redundant outer parentheses removed.
@@ -3302,7 +3387,14 @@ fn expr_shape(expr: &Expr) -> catalog::ExprShape {
     use catalog::ExprShape;
     match expr {
         Expr::Function(_) => ExprShape::Call,
-        Expr::Value(_) | Expr::Cast { .. } | Expr::TypedString { .. } => ExprShape::Value,
+        // **A `CASE` is parenthesised exactly like a value**, which is measured rather than
+        // assumed: `pg_get_expr` gives it bare, the key list gives it one pair, and the per-column
+        // form gives it one pair — the `Value` row of [`catalog::ExprShape`]'s table, and not the
+        // `Operator` row its `WHEN` conditions might suggest. What is different about it is the
+        // text, not the parentheses (`crate::exec::ddl::index_expression`).
+        Expr::Value(_) | Expr::Cast { .. } | Expr::TypedString { .. } | Expr::Case { .. } => {
+            ExprShape::Value
+        }
         _ => ExprShape::Operator,
     }
 }

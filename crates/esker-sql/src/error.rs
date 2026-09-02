@@ -498,8 +498,15 @@ pub enum SqlError {
     /// `sqlparser`'s message behind a `syntax error:` prefix, and here the exact sentence a real
     /// server sends is **known** — it was measured, both spellings: `count(*, 1)` names the comma
     /// and `count(1, *)` names the star.
+    ///
+    /// The second place it is raised is an **index key**, where the token is read off the
+    /// expression rather than being one of a fixed pair — which is why this carries a `String`.
+    /// PostgreSQL's `index_elem` is `ColId | func_expr_windowless | '(' a_expr ')'`, so
+    /// `ON t (a + 1)` is a syntax error there while `sqlparser` parses it happily, and accepting
+    /// it would build an index a real server refuses to create
+    /// (`crate::parse::lower::index_elem_token`).
     #[error("syntax error at or near \"{0}\"")]
-    SyntaxAtOrNear(&'static str),
+    SyntaxAtOrNear(String),
 
     /// `ORDER BY <name>` where more than one **output** column is called that.
     ///
