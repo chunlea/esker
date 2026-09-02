@@ -1,0 +1,27 @@
+crates/esker-sql/src/parse/lower.rs
+  s_2ed9df2fd94fee::t_7e9b80e5d857b2 1441-1457,2487-2498,2508-2525,2530-2565
+crates/esker-sql/src/value/time.rs
+  s_2ed9df2fd94fee::t_a55fb36a1f7e38 64,109-139
+crates/esker-sql/tests/time.rs
+  s_2ed9df2fd94fee::t_6f90a14ab90594 163-237
+docs/adr/0033-tier-1-of-the-type-surface.md
+  s_2ed9df2fd94fee::t_2dabbedc333bb4 225-229
+docs/plans/phase-9-rails.md
+  s_2ed9df2fd94fee::t_3101f3c6abe564 1232-1236
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "250ee37fbb90e12e0bc2d43e7451e29b002de34c",
+  "prompts": {},
+  "sessions": {
+    "s_2ed9df2fd94fee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ec622e3b-48a0-4735-8805-fe22838e8b26",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
