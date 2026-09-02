@@ -193,6 +193,13 @@ pub enum PeerMsg {
     },
     /// A snapshot of what this peer believes, for the request path and for tests.
     Status(oneshot::Sender<Status>),
+    /// Answered once everything queued ahead of it has been **driven**, not merely handled.
+    ///
+    /// Every other query here is answered inside `handle`, which runs before the batch's
+    /// `PeerCore::drive` — so a caller that awaits one and then looks for the messages its own
+    /// input produced can find none, because they have not been sent yet. This one waits for the
+    /// drive, which is where persist, send and apply happen.
+    Settled(oneshot::Sender<()>),
     /// How far each peer of this region has got, as its leader sees it. Empty on a follower.
     Progress(oneshot::Sender<Vec<esker_raft::PeerProgress>>),
     /// Ask this region's leadership to move to another peer.
@@ -379,6 +386,8 @@ pub struct PeerCore {
     /// end (`docs/plans/debt-c1.md` section 7).
     pending: Vec<Pending>,
     reads: Vec<PendingRead>,
+    /// Callers waiting to be told this region has driven; see [`PeerMsg::Settled`].
+    settled: Vec<oneshot::Sender<()>>,
     /// Whether this peer led at the end of the last [`PeerCore::drive`], so that a step-down is
     /// noticed once rather than re-scanned on every pass.
     led: bool,
@@ -463,6 +472,10 @@ impl PeerCore {
 
         self.resolve_unreachable_proposals();
         self.publish_leader();
+        // After the loop above, so that a waiter sees the effects of everything it queued: the
+        // entries are durable, the messages are with the transport and the committed ones have
+        // applied.
+        self.release_settled();
         self.answer_ready_reads();
         self.compact()?;
         // The invariant in its checkable form. `pending` is only populated on a leader, and a
@@ -1037,7 +1050,18 @@ impl PeerCore {
     /// the test drop operations the store said changed nothing and got a linearizability
     /// violation on every run: a final read returning a value whose only write had been
     /// refused with `NotSent`.
+    /// Answers every waiter that asked to be told when this region had settled.
+    ///
+    /// Called at the end of [`PeerCore::drive`] and from [`PeerCore::fail_outstanding`], so a
+    /// waiter is released whether the region drove or went away.
+    fn release_settled(&mut self) {
+        for notify in self.settled.drain(..) {
+            let _ = notify.send(());
+        }
+    }
+
     pub(crate) fn fail_outstanding(&mut self, what: &str) {
+        self.release_settled();
         // Deliberately not `not_sent`: see above. The detail says why the outcome is unknown,
         // because that is what a human reading the client's log needs in order to trust it.
         let appended = ProtoError::Closed {
@@ -1071,6 +1095,8 @@ impl PeerCore {
             PeerMsg::Status(notify) => {
                 let _ = notify.send(self.node.status());
             }
+            // Held until the drive at the end of this batch, which is the whole point of it.
+            PeerMsg::Settled(notify) => self.settled.push(notify),
             PeerMsg::SnapshotSource(notify) => {
                 let _ = notify.send(self.snapshot_source());
             }
@@ -1312,6 +1338,7 @@ impl RaftPeer {
             peer_id: options.peer_id,
             pending: Vec::new(),
             reads: Vec::new(),
+            settled: Vec::new(),
             led: false,
             leader: Arc::clone(&leader),
             published: Arc::clone(&published),
@@ -1521,6 +1548,27 @@ impl RaftPeer {
         answer
             .await
             .map_err(|_| ProtoError::internal("the Raft peer stopped"))?
+    }
+
+    /// Waits until everything sent to this peer so far has been **driven**.
+    ///
+    /// Persisted, sent and applied — the five steps of [`PeerCore::drive`] — not merely handled by
+    /// the core. Every other query is answered inside the driver's handling of a message, which
+    /// runs before the batch is driven, so awaiting one of those and then looking for the
+    /// messages your own input produced can find nothing.
+    ///
+    /// That gap is what made `peer::tests`' pump load-sensitive: it ticked a logical clock in a
+    /// loop, and under contention the driver had not yet sent the heartbeats the loop was there to
+    /// answer — so the leader went an election timeout without hearing from a quorum, stepped down
+    /// exactly as `check_quorum` requires, and the proposal in flight was correctly refused with
+    /// `NotLeader`. The clock ran while the peer had said nothing. This is the barrier that
+    /// couples the two.
+    pub async fn settled(&self) -> std::result::Result<(), ProtoError> {
+        let (notify, answer) = oneshot::channel();
+        self.send(PeerMsg::Settled(notify)).await?;
+        answer
+            .await
+            .map_err(|_| ProtoError::internal("the Raft peer stopped"))
     }
 
     /// What this peer believes.
@@ -1919,7 +1967,11 @@ mod tests {
                 }
             }
             peer.tick().await.unwrap();
-            let _ = peer.status().await.unwrap();
+            // **Wait for the drive, not for the handling.** `status` is answered before the batch
+            // is driven, so a loop that used it advanced this clock while the peer had not yet
+            // sent the heartbeat this loop exists to answer — a partition the test manufactured
+            // for itself under load, and a leader that then stepped down for want of quorum.
+            peer.settled().await.unwrap();
         }
     }
 
@@ -1986,6 +2038,11 @@ mod tests {
 
         for _ in 0..200 {
             peer.tick().await.unwrap();
+            // `tick` only *enqueues*, and `is_leader` reads what the driver last published — so
+            // without this barrier the loop can queue two hundred ticks and read the atomic
+            // before the driver has handled one. That is the whole of this test's
+            // load-sensitivity: nothing here waited for the peer.
+            peer.settled().await.unwrap();
             if peer.is_leader() {
                 break;
             }
