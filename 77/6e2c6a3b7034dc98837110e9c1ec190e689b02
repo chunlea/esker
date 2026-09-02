@@ -1,0 +1,39 @@
+crates/esker-engine/src/db/flush.rs
+  s_7a3132f4d02a00::t_c7f380d61e8075 155-157
+crates/esker-engine/src/db/open.rs
+  s_7a3132f4d02a00::t_6118de0fcc37c2 111,115
+crates/esker-engine/src/fs/mod.rs
+  s_7a3132f4d02a00::t_5c0212e7b71841 185-196,297-298,301-304
+crates/esker-engine/src/lib.rs
+  s_7a3132f4d02a00::t_6e348e60c89271 86-87
+crates/esker-engine/src/memfs.rs
+  s_7a3132f4d02a00::t_4d645adb595f0a 230-235
+crates/esker-engine/src/options.rs
+  s_7a3132f4d02a00::t_91b04173ba1804 121-144,260-261,305
+crates/esker-engine/src/testing/fault_fs.rs
+  s_7a3132f4d02a00::t_a7318549e9e83f 387-398
+crates/esker-engine/src/wal/writer.rs
+  s_7a3132f4d02a00::t_e22662a0b47562 42-44,71,150-166,343-346
+crates/esker-engine/tests/version.rs
+  s_7a3132f4d02a00::t_f1e2cbd06de965 248-251
+crates/esker-engine/tests/wal_sync.rs
+  s_7a3132f4d02a00::t_b5de256487d408 25-26,38-39,48,70-74,84,125,151-161,165-168,172,308-345
+docs/plans/debt-c3.md
+  s_7a3132f4d02a00::t_c1c059ebd9a5c6 352-429
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "776e2c6a3b7034dc98837110e9c1ec190e689b02",
+  "prompts": {},
+  "sessions": {
+    "s_7a3132f4d02a00": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "176f3779-1c8f-49ac-8e22-08bb3b8ac7c3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
