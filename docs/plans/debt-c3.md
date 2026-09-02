@@ -543,15 +543,52 @@ Every failure in the fetch is silent and leaves the table refused — no PD, no 
 reachable, a record that does not decode. A fetch that could fail a *fragment* would make a columnar
 read less available than the row read it is an optimisation of.
 
-### Owed, and safe in the meantime
+## 7b. And the fetched record is re-read, so a widened table is not frozen at its first version
 
-A store holding a fetched record sees no catalog writes for that table, so nothing pushes a schema
-**change** at it. That is safe rather than merely tolerable, and the design already says why:
-`decode_row` refuses a row wider than its schema — `DecodeOutcome::SchemaBehind` — so a stale schema
-makes the copy stop, loudly, instead of answering wrongly. A copy that stops is a learner that is
-behind, which the heartbeat reports and `RefusalReason::TooFarBehind` already turns into a row-scan
-fallback.
+Unit 7 shipped this as "owed and safe in the meantime", which under the standing order is a bug: a
+store that cannot read `'m'` sees no catalog writes for that table **at all**, so nothing tells it
+when the schema moves. Fetch once and cache, and after an `ALTER TABLE ADD COLUMN` the copy is built
+against a two-column schema while the rows have three — which `decode_row` refuses, safely and for
+ever. The same never-ending `NotColumnar` unit 7 was about, one step later.
 
-What is not built is the **re-fetch** that would clear a `SchemaBehind` on a fetched table
-automatically. Until it is, that copy is rebuilt rather than repaired. Written down here rather than
-left in the ADR's consequences alone, because it is the next thing somebody will need.
+### What the red run said, and why it changed the fix
+
+`a_widened_table_is_answered_rather_than_frozen_at_the_first_version` fetches, widens the record on
+the catalog store, commits a three-column row on the rows store, and asks again. It came back
+
+```
+the widened table answered 2 of 3 rows
+```
+
+— **not a refusal**. The wide row was simply absent, because the copy had been built and nothing
+re-decoded it. That is the harness (this file's stores run without Raft, so no apply path tees new
+commits into the copy), but it is also the shape of the answer: the problem is not a mismatch to
+catch after the fact, it is a copy built from a schema nobody ever re-reads.
+
+### The rule was already written down, one function away
+
+`columnar::region::table` clears the miss cache on **every** fragment, on this reasoning:
+
+> The apply path may remember a miss — it is hot, and a catalog write there clears the cache
+> exactly — but a fragment is rare enough to pay a point read and must never answer `NotColumnar`
+> from a stale "no".
+
+A store that can read the record locally therefore re-reads it per fragment already, and its schema
+cannot go stale. A store whose record is elsewhere pays the same price as a round trip instead of a
+point read, on the same schedule and for the same reason. `Store::ensure_schema` no longer
+short-circuits on "already fetched"; `ColumnarSlot::knows_schema` became
+`reads_schema_locally`, which deliberately does not consider the fetched cache — answering `true`
+from it is exactly what froze the store at the version it first saw.
+
+The cost is one `SchemaFetch` per fragment for a table whose record is remote, and
+`install_record` drops an answer whose version has not moved — so the **copy** is rebuilt only when
+the schema actually changed. The re-read is a question, not a rebuild.
+
+### Why not the width mismatch the amendment named
+
+Invalidate-and-re-fetch-once on a `SchemaBehind` is strictly more machinery for strictly less. It
+repairs *after* a refusal where this never issues one; it needs a `SchemaBehind` to be
+distinguishable on the variant, which today it is only in a message string; and it cannot help the
+**apply** path at all, which is where a width mismatch is actually met and which
+`crate::columnar::decode` forbids from fetching. Re-reading on the read path is where the existing
+design already puts this question.

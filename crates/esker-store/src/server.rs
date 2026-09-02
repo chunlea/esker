@@ -2238,11 +2238,28 @@ impl Store {
     /// into a row-scan fallback. This is the other end of that: the **fragment** is a request, it
     /// may wait, and it is the moment the schema is actually needed.
     ///
+    /// # Asked on every fragment, not once
+    ///
+    /// A store that can read the record locally re-reads it per fragment already — `table` clears
+    /// the miss cache and `ensure` reads through, on the rule `columnar::region` states in as many
+    /// words: *"a fragment is rare enough to pay a point read and must never answer `NotColumnar`
+    /// from a stale 'no'"*. A store that **cannot** read it locally has the same problem one step
+    /// worse: it sees no catalog writes for that table at all, so nothing tells it when the schema
+    /// moves. Fetching once and caching froze such a store at the version it first saw, and after
+    /// an `ADD COLUMN` its copy refused the table for ever — the same never-ending refusal
+    /// [ADR 0037](../../../docs/adr/0037-a-columnar-learner-fetches-the-schema-it-cannot-read.md)
+    /// was written to remove, one step later (`docs/plans/debt-c3.md` §7b).
+    ///
+    /// So the remote read happens on the same schedule the local one does. The cost is one round
+    /// trip per fragment for a table whose record is elsewhere, which is the same order as the
+    /// point read the local path already pays, and `install_record` drops an answer whose version
+    /// has not moved — so the *copy* is rebuilt only when the schema actually changed.
+    ///
     /// # The three steps, and what each is allowed to fail at
     ///
-    /// 1. **Is it already known?** A record this store can read locally, or one already installed,
-    ///    needs nothing. On a single-region cluster this is every table, which is why the whole
-    ///    path was invisible for a phase.
+    /// 1. **Can this store read it itself?** Then nothing here: its own read is already
+    ///    per-fragment and cannot be stale. On a single-region cluster this is every table, which
+    ///    is why the whole path was invisible for a phase.
     /// 2. **Where does it live?** `PdClient::get_region` on the record's own key — the placement
     ///    driver is the authority on which region covers a key and which stores host it, and it is
     ///    the same answer a client's routing rests on. No PD, no fetch.
@@ -2255,7 +2272,7 @@ impl Store {
     /// available than the row read it is an optimisation of.
     async fn ensure_schema(self: &Arc<Self>, slot: &Arc<ColumnarSlot>, table: (u64, u64)) {
         let (tenant, table_id) = table;
-        if slot.knows_schema(&self.db, tenant, table_id) {
+        if slot.reads_schema_locally(&self.db, tenant, table_id) {
             return;
         }
         let Some(pd) = self.pd.clone() else {
@@ -2287,7 +2304,7 @@ impl Store {
                         );
                         return;
                     }
-                    tracing::info!(
+                    tracing::debug!(
                         tenant,
                         table_id,
                         from = store_id,

@@ -237,21 +237,20 @@ impl ColumnarSlot {
         }))
     }
 
-    /// Whether this store can build a decoder for `(tenant, table_id)` without asking anyone.
+    /// Whether this store's **own engine** holds the record for `(tenant, table_id)`.
     ///
-    /// True when the record has already been fetched, and when this store's own engine holds it —
-    /// which is the same read [`ensure`](Self::ensure) would do, so a `true` here is a promise the
-    /// next call can keep. False is not "there is no columnar copy": it is "this store cannot say",
-    /// and the answer to it is [`Store::ensure_schema`](crate::server::Store), not a refusal.
+    /// The same read [`ensure`](Self::ensure) would do, so a `true` here is a promise the next call
+    /// can keep — and it deliberately does **not** consider a record that was fetched from another
+    /// store. A store that can read the record locally re-reads it on every fragment already
+    /// (`table` clears the miss cache and `ensure` reads through), so its schema cannot go stale;
+    /// a store that cannot has no other way to notice one moving, and answering `true` from its
+    /// cache is what would freeze it at the version it first saw.
     ///
-    /// An error reading the engine answers `false` as well. The caller's next move is a fetch,
-    /// which either succeeds or leaves the table refused; turning a transient read failure into a
-    /// hard error here would fail a fragment that a row scan could have answered.
+    /// An error reading the engine answers `false`. The caller's next move is a fetch, which
+    /// either succeeds or leaves the table refused; turning a transient read failure into a hard
+    /// error here would fail a fragment that a row scan could have answered.
     #[must_use]
-    pub fn knows_schema(&self, db: &Db, tenant: u64, table_id: u64) -> bool {
-        if self.lock().fetched.contains_key(&(tenant, table_id)) {
-            return true;
-        }
+    pub fn reads_schema_locally(&self, db: &Db, tenant: u64, table_id: u64) -> bool {
         matches!(published_schema(db, tenant, table_id), Ok(Some(_)))
     }
 
@@ -261,14 +260,17 @@ impl ColumnarSlot {
     /// read from this store's own engine go through one parser
     /// ([`esker_keys::columnar::decode`]) and cannot come to disagree about the format.
     ///
-    /// A record older than the one already held is dropped rather than installed. Nothing orders
-    /// two fetches — a slow answer from one store can land after a fast one from another — and
-    /// installing an older schema over a newer one would make the copy refuse rows it had already
-    /// decoded. `schema_version` is monotonic per table and is exactly the comparison
-    /// `esker_keys::columnar::Published` documents itself for.
+    /// A record older **or equal** is dropped rather than installed, and the equal case is the one
+    /// that matters for cost: a fragment re-fetches every time, and the answer is almost always the
+    /// version already held, so this is what keeps a re-fetch from rebuilding a copy that is
+    /// already right. An older one is dropped because nothing orders two fetches — a slow answer
+    /// from one store can land after a fast one from another — and installing an older schema over
+    /// a newer would make the copy refuse rows it had already decoded. `schema_version` is
+    /// monotonic per table and is exactly the comparison `esker_keys::columnar::Published`
+    /// documents itself for.
     ///
-    /// Any table whose copy is open is **closed**, so the next read rebuilds it under the new
-    /// schema rather than extending a copy built under the old one.
+    /// When the version really has moved, any open copy of that table is **closed**, so the next
+    /// read rebuilds it under the new schema rather than extending a copy built under the old one.
     pub fn install_record(&self, tenant: u64, table_id: u64, record: &[u8]) -> Result<()> {
         let (replicas, published) = esker_keys::columnar::decode(record)
             .map_err(|error| bootstrap(&format!("a fetched columnar record: {error}")))?;

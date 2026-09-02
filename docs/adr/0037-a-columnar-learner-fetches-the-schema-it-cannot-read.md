@@ -1,7 +1,7 @@
 # 0037 — a columnar learner fetches the schema it cannot read
 
-Status: accepted. Debt wave c3, unit 7, from `docs/plans/debt-c3.md` §7 — recorded as "no schema
-push, so a table outside the `'m'` region gets no columnar copy at all".
+Status: accepted. Debt wave c3, units 7 and 7b, from `docs/plans/debt-c3.md` §§7 and 7b — recorded
+as "no schema push, so a table outside the `'m'` region gets no columnar copy at all".
 
 ## Context
 
@@ -73,23 +73,29 @@ an older schema over a newer would make the copy refuse rows it had already deco
 Installing one closes any open copy of that table, so the next read rebuilds under the new schema
 rather than extending a copy built under the old one.
 
+**6. The remote read happens on every fragment, like the local one.** `columnar::region::table`
+clears the miss cache per fragment already, on the rule that *"a fragment is rare enough to pay a
+point read and must never answer `NotColumnar` from a stale 'no'"*. A store whose record is
+elsewhere pays that price as a round trip rather than a point read, on the same schedule. Caching
+the fetch instead froze such a store at the version it first saw: after an `ADD COLUMN` its copy was
+built from a two-column schema while the rows had three, and `decode_row` refused them — safely, and
+for ever.
+
 ## Consequences
 
 A table whose rows live outside the `'m'` region gets a columnar copy. That is the feature ADR 0022
 describes, working on the cluster shape it was always meant for.
 
-**A store holding this cache sees no catalog writes for these tables**, so nothing pushes a schema
-change at it. That is safe rather than merely tolerable, and the reason is already in the design:
-`decode_row` **refuses** a row wider than the schema it is read against — `DecodeOutcome::
-SchemaBehind` — so a stale schema makes the copy stop, loudly, rather than answer wrongly. A copy
-that stops is a learner that is behind, which the system already reports and already falls back
-from. What is *not* yet built is the re-fetch that would clear it automatically; until it is, a
-`SchemaBehind` on a fetched table is resolved by the copy being rebuilt. Recorded in
-`docs/plans/debt-c3.md` §7 rather than hidden here.
+**A store holding a remote record sees no catalog writes for that table**, so nothing tells it when
+the schema moves. Decision 6 is what covers that, and it was added after the first version of this
+ADR shipped without it — recorded as `docs/plans/debt-c3.md` §7b rather than quietly folded in,
+because "owed and safe in the meantime" was the wrong call and the record of that is worth more than
+a tidy ADR.
 
-One `SchemaFetch` round trip per table per store, on the first fragment for that table. A store
-that can read the record locally never makes one, which on a single-region cluster is every store —
-so nothing about the existing shape changes cost.
+So the cost is one `SchemaFetch` per fragment for a table whose record is remote, and decision 5
+drops an answer whose version has not moved, so the *copy* is rebuilt only when the schema actually
+changed. A store that can read the record locally makes no round trip at all, which on a
+single-region cluster is every store — nothing about the existing shape changes cost.
 
 ## Alternatives rejected
 

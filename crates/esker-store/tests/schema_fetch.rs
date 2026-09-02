@@ -146,7 +146,7 @@ fn rows_region() -> Region {
     }
 }
 
-/// `id int8, name text`, which is what the rows below encode.
+/// `id int8, name text` at version 1, which is what the two-column rows below encode.
 fn published() -> Vec<u8> {
     esker_keys::columnar::encode(
         1,
@@ -156,6 +156,42 @@ fn published() -> Vec<u8> {
         }),
     )
     .unwrap()
+}
+
+/// The same table after `ADD COLUMN note text`: version 2, three columns.
+///
+/// The added column's missing value is `None` — NULL for rows written before it — which is what
+/// `ADD COLUMN` with no `DEFAULT` means and is the shape that makes a two-column row still
+/// decodable *against this schema*. What is not decodable is the other direction: a **three**-
+/// column row against the two-column schema, which is what a store holding a cached record sees
+/// after the `ALTER`.
+fn published_widened() -> Vec<u8> {
+    esker_keys::columnar::encode(
+        1,
+        Some(&Published {
+            schema_version: 2,
+            columns: vec![
+                (ColumnType::Int8, None),
+                (ColumnType::Text, None),
+                (ColumnType::Text, None),
+            ],
+        }),
+    )
+    .unwrap()
+}
+
+fn wide_row(id: i64, name: &str, note: &str) -> Bytes {
+    Bytes::from(
+        esker_keys::row::encode_row(
+            &[ColumnType::Int8, ColumnType::Text, ColumnType::Text],
+            &[
+                Datum::Int8(id),
+                Datum::Text(name.into()),
+                Datum::Text(note.into()),
+            ],
+        )
+        .unwrap(),
+    )
 }
 
 fn row_key(id: i64) -> Bytes {
@@ -284,8 +320,19 @@ async fn a_learner_without_the_catalog_fetches_the_schema_and_answers() {
     pd.place(catalog_region());
     pd.place(rows_region());
 
-    // Over the wire, through the service, because that is the only way a fragment ever arrives
-    // and because the fetch this test is about is itself a wire call.
+    let got = ask_fragment(rows_address).await;
+    assert_eq!(got, 3, "the copy answered {got} of 3 rows");
+
+    rows.stop().await;
+    catalog.stop().await;
+}
+
+/// Sends one fragment over the wire and answers how many rows came back, panicking with the
+/// refusal if there was one.
+///
+/// Over the wire, through the service, because that is the only way a fragment ever arrives and
+/// because the fetch these tests are about is itself a wire call.
+async fn ask_fragment(rows_address: std::net::SocketAddr) -> usize {
     let connection = esker_proto::TcpTransport::connect(rows_address)
         .await
         .unwrap();
@@ -301,14 +348,13 @@ async fn a_learner_without_the_catalog_fetches_the_schema_and_answers() {
     let esker_proto::Response::Fragment(answer) = reply else {
         panic!("a fragment was answered with something else");
     };
-
     match answer {
         esker_proto::fragment::FragmentResp::Result { result, .. } => {
             let body = esker_proto::fragment::result::decode(&result).unwrap();
             let esker_proto::fragment::result::Body::Rows { rows: got, .. } = body else {
                 panic!("a projection answered with groups");
             };
-            assert_eq!(got.len(), 3, "the copy answered {} of 3 rows", got.len());
+            got.len()
         }
         esker_proto::fragment::FragmentResp::Refused { reason, detail } => {
             panic!(
@@ -317,6 +363,106 @@ async fn a_learner_without_the_catalog_fetches_the_schema_and_answers() {
             );
         }
     }
+}
+
+/// A table widened *after* its record was fetched is answered, not frozen at the version the
+/// store first saw.
+///
+/// # The bug is the one the fetch fixed, one step later
+///
+/// A store that cannot read `'m'` sees no catalog writes for that table at all, so nothing tells
+/// it when the schema moves. Fetch once and cache, and after an `ALTER TABLE ADD COLUMN` the copy
+/// is built against a two-column schema while the rows have three — which `decode_row` refuses,
+/// safely (`DecodeOutcome::SchemaBehind` is the loud half of `crate::columnar::decode`'s "a stale
+/// schema is lag, not corruption") and for ever.
+///
+/// # The rule this settles on was already written down
+///
+/// `columnar::region::table` clears the miss cache on every fragment, on the reasoning that *"a
+/// fragment is rare enough to pay a point read and must never answer `NotColumnar` from a stale
+/// 'no'"*. A store whose record is elsewhere pays the same price in a round trip rather than a
+/// point read, on the same schedule and for the same reason. `install_record` drops an answer
+/// whose version has not moved, so the *copy* is rebuilt only when the schema actually changed —
+/// the re-read is a question, not a rebuild.
+///
+/// The alternative — catch the width mismatch and re-fetch once on it — is strictly more machinery
+/// for strictly less: it repairs after a refusal where this never issues one, and it cannot help
+/// the apply path, which may not fetch at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_widened_table_is_answered_rather_than_frozen_at_the_first_version() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+
+    let pd = Arc::new(FakePd::new());
+    let catalog_address = reserve();
+    let rows_address = reserve();
+    let catalog = open(catalog_address, 1, &pd, &[catalog_region()]).await;
+    let rows = open(rows_address, 2, &pd, &[rows_region()]).await;
+
+    commit(
+        &catalog.store,
+        &catalog_region(),
+        10,
+        11,
+        vec![TxnMutation::Put {
+            key: Bytes::from(esker_keys::columnar::key(TENANT, TABLE)),
+            value: Bytes::from(published()),
+        }],
+    )
+    .await;
+    for (id, name) in [(1_i64, "one"), (2, "two")] {
+        commit(
+            &rows.store,
+            &rows_region(),
+            20 + u64::try_from(id).unwrap() * 2,
+            21 + u64::try_from(id).unwrap() * 2,
+            vec![TxnMutation::Put {
+                key: row_key(id),
+                value: row(id, name),
+            }],
+        )
+        .await;
+    }
+    pd.place(catalog_region());
+    pd.place(rows_region());
+
+    // First fragment: the record is fetched and cached, which is U7 working.
+    assert_eq!(ask_fragment(rows_address).await, 2, "the U7 path is broken");
+
+    // The `ALTER`: a wider record on the catalog store, and a row written under it on the rows
+    // store. Nothing tells the rows store about either.
+    commit(
+        &catalog.store,
+        &catalog_region(),
+        40,
+        41,
+        vec![TxnMutation::Put {
+            key: Bytes::from(esker_keys::columnar::key(TENANT, TABLE)),
+            value: Bytes::from(published_widened()),
+        }],
+    )
+    .await;
+    commit(
+        &rows.store,
+        &rows_region(),
+        50,
+        51,
+        vec![TxnMutation::Put {
+            key: row_key(3),
+            value: wide_row(3, "three", "a note"),
+        }],
+    )
+    .await;
+
+    // The store's cached schema has two columns and one of the rows now has three. Before the
+    // re-fetch this refused, and went on refusing.
+    let got = ask_fragment(rows_address).await;
+    assert_eq!(
+        got, 3,
+        "the widened table answered {got} of 3 rows, so the re-read did not take"
+    );
 
     rows.stop().await;
     catalog.stop().await;
