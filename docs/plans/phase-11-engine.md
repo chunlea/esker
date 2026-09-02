@@ -644,3 +644,59 @@ Eleven commits, `875d9c4` through the close. The acceptance checklist:
 
 What this lane deliberately did not do is unchanged from §7, plus one addition: the in-house
 skiplist is designed and not built, by the maintainer's decision recorded in ADR 0041.
+
+## 16. `just check`, and the one step that is red for somebody else
+
+Run in `target-c5` at the lane's close.
+
+| step | result |
+|---|---|
+| `cargo fmt --all --check` | ✅ |
+| `cargo deny check` | ✅ advisories, bans, licenses, sources |
+| `cargo doc --workspace --all-features --no-deps` (`RUSTDOCFLAGS=-D warnings`) | ✅ |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | ❌ — **`crates/esker-sql`**, see below |
+| `cargo nextest run --workspace --all-features` | ✅ **2,485 passed, 0 failed, 37 skipped** in 156 s |
+| `cargo test --workspace --all-features --doc` | ❌ — `esker-sql` again, and differently; see below |
+
+### The clippy failure is not this lane's, and was not fixed by it
+
+```
+error: unnecessary qualification
+    --> crates/esker-sql/src/parse/lower.rs:1432:22
+    --> crates/esker-sql/src/parse/lower.rs:1441:22
+    --> crates/esker-sql/src/parse/lower.rs:1444:29
+    --> crates/esker-sql/src/parse/lower.rs:1444:59
+```
+
+`git blame` puts all four on `51390c9` — *feat(sql): 'integer'::regtype::oid, the one statement
+three scoreboard runs stopped on* — committed at 22:15 on 2026-09-01 by the `b3-scoreboard` lane,
+which was still working when this lane closed. `crates/esker-sql/**` is on this lane's forbidden
+list, so the four lines were left alone rather than tidied: a lane that edits another's live file
+to make its own gate green is how two lanes lose an afternoon.
+
+It is a **lint** failure and not a build one — `cargo build -p esker-sql` reports the same four as
+warnings and compiles — so the workspace still builds and tests. Every crate this lane touched
+(`esker-engine`, `esker-sim`, `esker-cli`, and the three `tests/sim_*.rs` bindings in
+`esker-store`, `esker-pd`, `esker-client`) passes clippy at `-D warnings` on its own.
+
+### The doctest failure is the same lane, still typing
+
+Minutes after the workspace test run passed 2,485 tests, the doctest step found `esker-sql` no
+longer compiling at all:
+
+```
+error[E0425]: cannot find value `join` in this scope
+error[E0425]: cannot find function `plan_chain` in this scope
+error[E0560]: struct `plan::query::Select` has no field named `join`
+```
+
+`git status` shows five uncommitted files under `crates/esker-sql/src/` — a join feature being
+written as this ran. It is not a regression and there is nothing to fix: a shared checkout has
+another lane's half-finished code in it, and a gate run against a working tree measures whatever
+was in the tree at that second.
+
+The two facts worth carrying instead: the workspace **did** pass 2,485 tests at the moment
+`esker-sql` last compiled, and the doctests of every crate this lane touched pass on their own
+(`esker-engine`, `esker-sim`, `esker-cli`, `esker-store`, `esker-pd`, `esker-client`,
+`esker-base`). A clean workspace gate is the coordinator's to take once the other lanes are
+quiet — this lane's own file list is green under every step.
