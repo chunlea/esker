@@ -1,0 +1,61 @@
+# `i.indkey` as an `= ANY` operand and as `array_position`'s array — as a real PostgreSQL 19beta1
+# answers them.
+#
+# NOT a type, and deliberately not the array *type*. This is boot statement **17**, which is how
+# `ActiveRecord::ConnectionAdapters::PostgreSQL#primary_keys` reads a table's key, and it is also
+# the ladder's rung-3 blocker:
+#
+#     SELECT a.attname FROM pg_index i
+#     JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+#     WHERE i.indrelid = '"harness_widgets"'::regclass AND i.indisprimary
+#     ORDER BY array_position(i.indkey, a.attnum)
+#
+# Until now this node refused it by name — `i.indkey as an ANY operand, which would need an array
+# value where this node has only array expressions` — because `= ANY(...)` was expanded into an
+# `IN` list at **plan** time, which works for `ARRAY[1,2]` and `current_schemas(false)` and cannot
+# work for a column.
+#
+# Captured against the `esker-pg19` container the way every corpus here is, one `psql -c` per
+# statement.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`indkey` is an `int2vector`, and an `int2vector` is 0-based.** This is the one that a
+#     working implementation still gets wrong: `array_position` over `indkey` answers **0** for the
+#     first column, 1 for the second — where `array_position('{a,b,c}'::text[], 'a')` is **1**,
+#     because an ordinary array's lower bound is 1 and this type's is 0. Both lines are below, side
+#     by side. An off-by-one here **sorts identically** — `ORDER BY` only compares — so boot 17
+#     passes either way and every caller that reads the number is wrong.
+#     `array_lower(indkey, 1)` is `0` and `array_upper` is `1` for a two-column index, which is the
+#     same fact stated directly.
+#   * **Its text form is space-separated, not `{...}`.** `2 3`, and `indkey::text` is the same
+#     `2 3`. That is `int2vectorout`, not `array_out`, and it is why `ActiveRecord`'s `indexes()`
+#     reads the column with a plain `String#split(" ")` — the text is the interface.
+#   * **`= ANY` over it is the ordinary three-valued rule**, which this node already has for `IN`:
+#     a match wins, and with no match a NULL operand is NULL rather than false.
+#   * **The `ORDER BY` is what makes the statement correct, not decoration.** A composite key
+#     declared `PRIMARY KEY (y, x)` has `indkey` `2 1`, so the key's own order is *not* `attnum`
+#     order: the answer is `y` then `x`, and an implementation that dropped the `ORDER BY` — or
+#     that sorted by `attnum` — would hand `ActiveRecord` a reversed composite key.
+#   * **`array_position` of a NULL is NULL**, not 0 and not an error.
+CREATE TABLE ak (id int8 PRIMARY KEY, a int4, b text, c int4)		-
+CREATE TABLE ak2 (x int8, y text, PRIMARY KEY (y, x))		-
+CREATE INDEX ak_ab ON ak (a, b)		-
+CREATE UNIQUE INDEX ak_c ON ak (c)		-
+SELECT i.relname, x.indkey FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'ak'::regclass ORDER BY i.relname	name,int2vector	ak_ab|2 3 ; ak_c|4 ; ak_pkey|1
+SELECT x.indkey, x.indkey::text FROM pg_index x WHERE x.indexrelid = 'ak_c'::regclass	int2vector,text	4|4
+SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indrelid = 'ak'::regclass AND i.indisprimary ORDER BY array_position(i.indkey, a.attnum)	name	id
+SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indrelid = 'ak2'::regclass AND i.indisprimary ORDER BY array_position(i.indkey, a.attnum)	name	y ; x
+SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indexrelid = 'ak_ab'::regclass ORDER BY array_position(i.indkey, a.attnum)	name	a ; b
+SELECT count(*) FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indrelid = 'ak'::regclass	bigint	4
+SELECT 2 = ANY(x.indkey), 9 = ANY(x.indkey) FROM pg_index x WHERE x.indexrelid = 'ak_ab'::regclass	boolean,boolean	t|f
+SELECT NULL::int2 = ANY(x.indkey) FROM pg_index x WHERE x.indexrelid = 'ak_ab'::regclass	boolean	\N
+SELECT array_position(x.indkey, 2::int2), array_position(x.indkey, 3::int2), array_position(x.indkey, 99::int2) FROM pg_index x WHERE x.indexrelid = 'ak_ab'::regclass	integer,integer,integer	0|1|\N
+SELECT array_position(x.indkey, 2::int2), array_position(x.indkey, 1::int2) FROM pg_index x WHERE x.indrelid = 'ak2'::regclass AND x.indisprimary	integer,integer	0|1
+SELECT array_lower(x.indkey, 1), array_upper(x.indkey, 1), array_length(x.indkey, 1), cardinality(x.indkey) FROM pg_index x WHERE x.indexrelid = 'ak_ab'::regclass	integer,integer,integer,integer	0|1|2|2
+SELECT array_position('{a,b,c}'::text[], 'a'), array_position('{a,b,c}'::text[], 'b')	integer,integer	1|2
+SELECT array_position(x.indkey, NULL::int2) FROM pg_index x WHERE x.indexrelid = 'ak_ab'::regclass	integer	\N

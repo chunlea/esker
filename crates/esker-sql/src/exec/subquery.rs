@@ -496,6 +496,10 @@ fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
             substitute_in_expr(inner, outer, depth);
         }
         Expr::IsNull { operand, .. } => substitute_in_expr(operand, outer, depth),
+        Expr::AnyArray { operand, array } => {
+            substitute_in_expr(operand, outer, depth);
+            substitute_in_expr(array, outer, depth);
+        }
         Expr::Case {
             branches,
             otherwise,
@@ -892,6 +896,10 @@ pub(super) fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
         | Expr::ToText { operand: inner, .. }
         | Expr::Scalar { operand: inner, .. } => walk(inner, visit),
         Expr::IsNull { operand, .. } => walk(operand, visit),
+        Expr::AnyArray { operand, array } => {
+            walk(operand, visit);
+            walk(array, visit);
+        }
         Expr::Case {
             branches,
             otherwise,
@@ -951,6 +959,10 @@ fn walk_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr) -> Result<()>) ->
         | Expr::ToText { operand: inner, .. }
         | Expr::Scalar { operand: inner, .. } => walk_mut(inner, visit)?,
         Expr::IsNull { operand, .. } => walk_mut(operand, visit)?,
+        Expr::AnyArray { operand, array } => {
+            walk_mut(operand, visit)?;
+            walk_mut(array, visit)?;
+        }
         Expr::Case {
             branches,
             otherwise,

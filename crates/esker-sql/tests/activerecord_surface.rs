@@ -113,13 +113,16 @@ const FIXTURE: &[&str] =
 /// paragraph named as wanting `col_description`. The catalog-functions unit built it, and what
 /// makes the statement run is that `col_description` was the **only** thing it was missing.
 ///
-/// The three that still do not run are all one missing feature, and it is not this lane's: line 37
-/// (`primary_keys()`) wants `= ANY` over an `int2vector` and `array_position`, line 52
-/// (`indexes()`) wants `ARRAY(SELECT …)`, and lines 55 and 56 want `array_agg` and
-/// `c.conkey[idx]`. **The rows behind all of them are here and agree** (`tests/pg_catalog_*.rs`);
-/// what is missing is the array surface. `obj_description`, which line 52 also wanted, is no
-/// longer part of why it fails.
-const RUNS: usize = 26;
+/// **Twenty-seven now, and the twenty-seventh is `primary_keys()`** — line 37, boot statement 17
+/// and the ladder's rung-3 blocker, which wanted `= ANY` over an `int2vector` and
+/// `array_position` over one. The `indkey` unit built both; what makes the statement run is that
+/// the array it needed is a *value of the row*, which is the thing plan-time `IN` expansion could
+/// never give it (`crate::value::vector`).
+///
+/// The two that still do not run are the rest of the array surface: line 52 (`indexes()`) wants
+/// `ARRAY(SELECT …)` and `generate_subscripts`, and lines 55 and 56 want `array_agg` and
+/// `c.conkey[idx]`. **The rows behind both are here and agree** (`tests/pg_catalog_*.rs`).
+const RUNS: usize = 27;
 
 #[test]
 fn every_statement_activerecord_sends_parses_and_is_answered_by_name() {

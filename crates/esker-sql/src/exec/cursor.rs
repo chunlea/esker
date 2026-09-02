@@ -1010,6 +1010,33 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             list,
             negated,
         } => in_list(operand, list, *negated, row, env)?,
+        // The same three-valued rule as the line above, over an array that is a value of the row
+        // rather than a list the lowering could see. Shared rather than copied: `IN` and
+        // `= ANY` are one operator on a real server, and a second implementation of "a match wins
+        // over a NULL" is a second place for it to be wrong.
+        Expr::AnyArray { operand, array } => {
+            let operand = evaluate_in(operand, row, env)?;
+            if matches!(operand, Datum::Null) {
+                return Ok(Datum::Null);
+            }
+            let Some(array) = read_array(&evaluate_in(array, row, env)?)? else {
+                // A NULL array, which is not an empty one: `1 = ANY(NULL::int[])` is NULL where
+                // `1 = ANY('{}')` is false. Measured, both.
+                return Ok(Datum::Null);
+            };
+            // Each element is read **as the operand's type**, which is the same rule the plan-time
+            // form uses: an array's elements have no type of their own here, and what gives them
+            // one is what they are being compared against.
+            let ty = operand.column_type().unwrap_or(ColumnType::Text);
+            let mut values = Vec::with_capacity(array.elements.len());
+            for element in &array.elements {
+                values.push(match element {
+                    Some(text) => Datum::from_text(ty, text)?,
+                    None => Datum::Null,
+                });
+            }
+            three_valued_match(&operand, &values, false)
+        }
 
         Expr::Binary { op, left, right } => {
             let (left, right) = (evaluate_in(left, row, env)?, evaluate_in(right, row, env)?);
@@ -1081,6 +1108,18 @@ fn catalog_function(
             type_oid_argument(args.first())?,
             typmod_argument(args.get(1))?,
         ),
+        // **The five array operators, over the text the catalog holds** — see
+        // `crate::value::vector` for why an array is text here and not a `Datum`. Every one is
+        // strict: a NULL array or a NULL argument is NULL, never an error and never 0.
+        //
+        // The dimension argument is accepted and only dimension 1 has an answer, because these
+        // arrays are one-dimensional; a real server answers NULL for any other dimension, which is
+        // what asking for one of a one-dimensional array means.
+        CatalogFunc::ArrayPosition
+        | CatalogFunc::ArrayLower
+        | CatalogFunc::ArrayUpper
+        | CatalogFunc::ArrayLength
+        | CatalogFunc::Cardinality => array_function(call.func, &args)?,
         // The identity on its first argument, which is where the printed expression already is —
         // and NULL-propagating, so a `LEFT JOIN pg_attrdef` that matched nothing is NULL rather
         // than an error. The third argument is `pretty`, which changes nothing this node prints.
@@ -1218,23 +1257,106 @@ fn in_list(
     if matches!(operand, Datum::Null) {
         return Ok(Datum::Null);
     }
-    let mut unknown = false;
-    let mut matched = false;
+    let mut values = Vec::with_capacity(list.len());
     for item in list {
-        let item = evaluate_in(item, row, env)?;
-        if matches!(item, Datum::Null) {
+        values.push(evaluate_in(item, row, env)?);
+    }
+    Ok(three_valued_match(&operand, &values, negated))
+}
+
+/// `x IN (…)` and `x = ANY(…)`, over values that have already been evaluated.
+///
+/// **The rule is not "NULL means false".** A match wins over a NULL and a NULL wins over no match,
+/// so `1 IN (1, NULL)` is true, `1 IN (2, NULL)` is NULL, and `1 NOT IN (2, NULL)` is NULL — which
+/// is why a `NOT IN` over a list containing NULL matches nothing at all. Measured,
+/// `tests/corpus/pg19_in.txt`; the caller has already answered NULL for a NULL operand.
+fn three_valued_match(operand: &Datum, values: &[Datum], negated: bool) -> Datum {
+    let mut unknown = false;
+    for value in values {
+        if matches!(value, Datum::Null) {
             unknown = true;
             continue;
         }
-        if operand.pg_cmp(&item).is_eq() {
-            matched = true;
-            break;
+        if operand.pg_cmp(value).is_eq() {
+            return Datum::Bool(!negated);
         }
     }
-    Ok(match (matched, unknown) {
-        (true, _) => Datum::Bool(!negated),
-        (false, true) => Datum::Null,
-        (false, false) => Datum::Bool(negated),
+    if unknown {
+        Datum::Null
+    } else {
+        Datum::Bool(negated)
+    }
+}
+
+/// The array a value holds, or `None` for a NULL — which is a different answer from an empty one.
+///
+/// A value that is not text at all is `42883`, the way a real server answers an operator it has no
+/// overload for: `array_length(1, 1)` names the function and the type rather than pretending.
+fn read_array(value: &Datum) -> Result<Option<crate::value::vector::Array>> {
+    match value {
+        Datum::Null => Ok(None),
+        Datum::Text(text) => crate::value::vector::Array::read(text)
+            .map(Some)
+            .ok_or_else(|| {
+                SqlError::UndefinedFunctionTypes(format!(
+                    "an array literal this node cannot read: {text}"
+                ))
+            }),
+        other => Err(SqlError::UndefinedFunctionTypes(format!(
+            "array operator on {}",
+            other
+                .column_type()
+                .map_or("unknown", crate::value::PgType::name)
+        ))),
+    }
+}
+
+/// The five array operators, over the text form the catalog holds.
+fn array_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Result<Datum> {
+    use crate::plan::CatalogFunc;
+    let Some(array) = read_array(args.first().unwrap_or(&Datum::Null))? else {
+        return Ok(Datum::Null);
+    };
+    // Every one of these is strict, so a NULL in any argument is a NULL answer.
+    if args.iter().any(|arg| matches!(arg, Datum::Null)) {
+        return Ok(Datum::Null);
+    }
+    // **Only three of the five take a dimension.** `cardinality(a)` has one argument, and
+    // `array_position(a, value)`'s second argument is the value it is looking for — reading that
+    // as a dimension answers NULL for every needle that is not `1`, which is a wrong answer and
+    // not a gap. Of the three that do take one, only the first dimension of a one-dimensional
+    // array has an answer; a real server gives NULL for every other.
+    let first_dimension = !matches!(
+        func,
+        CatalogFunc::ArrayLower | CatalogFunc::ArrayUpper | CatalogFunc::ArrayLength
+    ) || matches!(
+        args.get(1),
+        Some(Datum::Int8(1) | Datum::Int4(1) | Datum::Int2(1))
+    );
+    let length = i32::try_from(array.elements.len()).unwrap_or(i32::MAX);
+    Ok(match func {
+        CatalogFunc::Cardinality => Datum::Int4(length),
+        _ if !first_dimension => Datum::Null,
+        // An empty array has **no dimensions**, so its bounds and its length are NULL where its
+        // cardinality is 0. Measured, and it is the shape that breaks a `LIMIT` computed from it.
+        CatalogFunc::ArrayLength | CatalogFunc::ArrayLower if length == 0 => Datum::Null,
+        CatalogFunc::ArrayLength => Datum::Int4(length),
+        CatalogFunc::ArrayLower => Datum::Int4(array.lower),
+        CatalogFunc::ArrayUpper => array.upper().map_or(Datum::Null, Datum::Int4),
+        CatalogFunc::ArrayPosition => {
+            // The needle is compared **as text**, which is what the elements are: the argument was
+            // already read at its own type, and its text form is the one the array was written in.
+            args.get(1)
+                .and_then(Datum::to_text)
+                .and_then(|needle| array.position_of(&needle))
+                .map_or(Datum::Null, Datum::Int4)
+        }
+        other => {
+            return Err(SqlError::Internal(format!(
+                "{} reached the array evaluator",
+                other.name()
+            )));
+        }
     })
 }
 

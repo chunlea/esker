@@ -1505,45 +1505,18 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             operand,
             list,
             negated,
-        } => {
-            // `x IN (a, b)` is a set of `=`, so every item is typed the way `x = a` types it — but
-            // the list is typed as a **whole** and not pairwise, which is a rule of its own.
-            // PostgreSQL's `select_common_type` runs over the operand and every item at once, so
-            // one typed item gives *every* `unknown` in the expression its type, the operand
-            // included: `'01' IN ('1', 1)` is true, because the `1` makes it `1 IN (1, 1)`. A
-            // left-to-right pairwise reconcile answers `f` for that, which is a wrong answer and
-            // not a refusal. Measured, `tests/corpus/pg19_unknown.txt`.
-            let mut operand = resolve(operand, scope)?;
-            let mut items = Vec::with_capacity(list.len());
-            for item in list {
-                items.push(resolve(item, scope)?);
-            }
-            // The coercion happens here, at plan time, and not when a row is scanned: PostgreSQL
-            // answers `1 IN (NULL, 'x')` with `22P02` even though the NULL alone could have
-            // decided it.
-            if let Some(ty) = common_type(&operand, &items) {
-                give_type(&mut operand, ty)?;
-                for item in &mut items {
-                    give_type(item, ty)?;
-                }
-            }
-            // Then the ordinary pairwise rule, which is what still raises `42883` when two items
-            // have types no `=` covers — `n IN ('one', 1)` over a `text` column.
-            let mut resolved = Vec::with_capacity(items.len());
-            for item in items {
-                let (left, right) = reconcile(BinaryOp::Eq, operand, item)?;
-                operand = left;
-                resolved.push(right);
-            }
-            Expr::InList {
-                operand: Box::new(operand),
-                list: resolved,
-                negated: *negated,
-            }
-        }
+        } => resolve_in_list(operand, list, *negated, scope)?,
         Expr::IsNull { operand, negated } => Expr::IsNull {
             operand: Box::new(resolve(operand, scope)?),
             negated: *negated,
+        },
+        // Both sides resolve, and **neither is reconciled against the other**: an array's elements
+        // have no type of their own here — they are text in the catalog — so what gives them one
+        // is the operand, at evaluation, exactly as the plan-time form types its list against the
+        // operand it is compared with.
+        Expr::AnyArray { operand, array } => Expr::AnyArray {
+            operand: Box::new(resolve(operand, scope)?),
+            array: Box::new(resolve(array, scope)?),
         },
         Expr::Case {
             branches,
@@ -1574,6 +1547,52 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             Expr::Subquery(resolved)
         }
         other => other.clone(),
+    })
+}
+
+/// `x IN (a, b)`, resolved: every element typed, and the pair checked for an operator.
+///
+/// The list is typed as a **whole** and not pairwise, which is a rule of its own — see the comments
+/// inside.
+fn resolve_in_list(
+    operand: &Expr,
+    list: &[Expr],
+    negated: bool,
+    scope: &Scope<'_>,
+) -> Result<Expr> {
+    // `x IN (a, b)` is a set of `=`, so every item is typed the way `x = a` types it — but
+    // the list is typed as a **whole** and not pairwise, which is a rule of its own.
+    // PostgreSQL's `select_common_type` runs over the operand and every item at once, so
+    // one typed item gives *every* `unknown` in the expression its type, the operand
+    // included: `'01' IN ('1', 1)` is true, because the `1` makes it `1 IN (1, 1)`. A
+    // left-to-right pairwise reconcile answers `f` for that, which is a wrong answer and
+    // not a refusal. Measured, `tests/corpus/pg19_unknown.txt`.
+    let mut operand = resolve(operand, scope)?;
+    let mut items = Vec::with_capacity(list.len());
+    for item in list {
+        items.push(resolve(item, scope)?);
+    }
+    // The coercion happens here, at plan time, and not when a row is scanned: PostgreSQL
+    // answers `1 IN (NULL, 'x')` with `22P02` even though the NULL alone could have
+    // decided it.
+    if let Some(ty) = common_type(&operand, &items) {
+        give_type(&mut operand, ty)?;
+        for item in &mut items {
+            give_type(item, ty)?;
+        }
+    }
+    // Then the ordinary pairwise rule, which is what still raises `42883` when two items
+    // have types no `=` covers — `n IN ('one', 1)` over a `text` column.
+    let mut resolved = Vec::with_capacity(items.len());
+    for item in items {
+        let (left, right) = reconcile(BinaryOp::Eq, operand, item)?;
+        operand = left;
+        resolved.push(right);
+    }
+    Ok(Expr::InList {
+        operand: Box::new(operand),
+        list: resolved,
+        negated,
     })
 }
 
@@ -2003,6 +2022,9 @@ fn check_predicate(expr: &Expr, clause: &'static str, scope: &Scope<'_>) -> Resu
         | Expr::Not(_)
         | Expr::IsNull { .. }
         | Expr::InList { .. }
+        // A comparison like the rest, and the shape `ActiveRecord` puts a join condition in:
+        // `JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)`.
+        | Expr::AnyArray { .. }
         | Expr::Literal(Literal::Bool(_) | Literal::Null)
         | Expr::Ordinal {
             ty: ColumnType::Bool,
@@ -2185,7 +2207,8 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         | Expr::Binary { .. }
         | Expr::Not(_)
         | Expr::IsNull { .. }
-        | Expr::InList { .. } => ColumnType::Bool,
+        | Expr::InList { .. }
+        | Expr::AnyArray { .. } => ColumnType::Bool,
         // A scalar subquery has the type of the column it returns and the other four are
         // predicates, which is the whole of what `SubqueryExpr::value_type` says.
         Expr::Subquery(sub) => sub.value_type(),

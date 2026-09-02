@@ -813,6 +813,9 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
         Expr::CatalogFunc(call) => format!("{}(...)", call.func.name()),
         Expr::Aggregate(call) => format!("{}(...)", call.func.name()),
         Expr::Subquery(sub) => sub.kind.describe().to_owned(),
+        Expr::AnyArray { operand, array } => {
+            format!("({} = ANY ({}))", sub(operand), sub(array))
+        }
     }
 }
 

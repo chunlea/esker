@@ -414,6 +414,8 @@ fn push_filter(
         // branches must **not** all be evaluated — pushing it down as anything else would change
         // which of them raises. Rows, and the row evaluator answers it.
         Expr::Case { .. } => return Err(refused("a CASE expression")),
+        // The fragment language has no array. Rows, and the row evaluator answers it.
+        Expr::AnyArray { .. } => return Err(refused("= ANY over an array value")),
         Expr::Literal(literal) => ColExpr::Literal(literal_value(literal)?),
         // A catalog function is a function of the catalog, not of the fragment's columns, and the
         // columnar reader has no expression for it. Rows, and the row evaluator answers it.
@@ -672,6 +674,10 @@ fn collect_columns(expr: &Expr, into: &mut Vec<usize>) {
             if let Some(otherwise) = otherwise {
                 collect_columns(otherwise, into);
             }
+        }
+        Expr::AnyArray { operand, array } => {
+            collect_columns(operand, into);
+            collect_columns(array, into);
         }
         Expr::Aggregate(call) => {
             for arg in &call.args {

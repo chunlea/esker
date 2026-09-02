@@ -183,6 +183,10 @@ fn for_each_subquery_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut TableRef))
                 for_each_subquery_mut(otherwise, visit);
             }
         }
+        Expr::AnyArray { operand, array } => {
+            for_each_subquery_mut(operand, visit);
+            for_each_subquery_mut(array, visit);
+        }
         Expr::Aggregate(call) => {
             for arg in &mut call.args {
                 for_each_subquery_mut(arg, visit);

@@ -100,6 +100,25 @@ pub enum Expr {
         /// entirely in what NULL does.
         negated: bool,
     },
+    /// `x = ANY(<array>)` where the array is a **value of the row** rather than a list the
+    /// lowering could see — `a.attnum = ANY(i.indkey)`.
+    ///
+    /// [`Expr::InList`] is the same rule over a list known at plan time, and every array this node
+    /// had until now was one: `ARRAY[1,2]`, `'{a,b}'` and `current_schemas(false)` are all expanded
+    /// where they are lowered. A **column** cannot be, because its value differs per row — which is
+    /// why this is a variant and not a rewrite, and why boot statement 17 was refused by name until
+    /// it existed.
+    ///
+    /// The three-valued rule is [`Expr::InList`]'s, shared rather than copied: a match wins over a
+    /// NULL, a NULL wins over no match, and a NULL operand is NULL whatever the array holds.
+    AnyArray {
+        /// The left-hand side, evaluated once.
+        operand: Box<Expr>,
+        /// The array, evaluated once per row and read from its own text form
+        /// (`crate::value::vector`). A NULL array makes the whole comparison NULL — measured,
+        /// `1 = ANY(NULL::int[])` is NULL where `1 = ANY('{}')` is false.
+        array: Box<Expr>,
+    },
     /// `x IS NULL`, or `IS NOT NULL` when negated. Never NULL itself — that is the whole point of
     /// the operator, and the reason `x = NULL` is not a way to write it.
     IsNull {
@@ -284,8 +303,10 @@ pub struct CatalogFuncCall {
 
 /// The `pg_catalog` functions this node answers.
 ///
-/// Every one of them is read-only, is a function of its arguments alone, and returns `text` — the
-/// three properties that let them be evaluated beside a row rather than planned.
+/// Every one of them is read-only and is a function of its arguments alone — the two properties
+/// that let them be evaluated beside a row rather than planned. Most return `text`; the array
+/// operators return `integer` and `'x'::regclass` a `bigint`, which is what [`Self::result_type`]
+/// is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatalogFunc {
     /// `format_type(oid, typmod)`: the name a client is shown for a type and a modifier.
@@ -346,6 +367,29 @@ pub enum CatalogFunc {
     /// sequence call is: once per statement, not once per row, or a `WHERE attrelid =
     /// 'x'::regclass` would read the catalog for every row it filtered.
     RegClass,
+    /// `array_position(array, value)`: the subscript `value` sits at, or NULL.
+    ///
+    /// The five below are the array operators the catalog's own columns need, and they read the
+    /// array out of its text form (`crate::value::vector`) rather than out of an array *value*,
+    /// for the three reasons that module gives. They are here rather than in a family of their own
+    /// because they are the same shape as everything else in this one — several arguments,
+    /// evaluated per row, a function of those arguments and nothing else.
+    ///
+    /// **The subscript is not always 1-based**: `pg_index.indkey` is an `int2vector`, whose lower
+    /// bound is `0`. Measured, both.
+    ArrayPosition,
+    /// `array_lower(array, dimension)`: the first subscript — `0` for an `int2vector` and `1` for
+    /// an ordinary array, and NULL for an empty one, which has no dimensions at all.
+    ArrayLower,
+    /// `array_upper(array, dimension)`: the last subscript, NULL for an empty array.
+    ArrayUpper,
+    /// `array_length(array, dimension)`: how many elements that dimension has, and **NULL** for an
+    /// empty array rather than 0 — the shape that breaks a `LIMIT` computed from it.
+    ArrayLength,
+    /// `cardinality(array)`: how many elements in total, and **0** for an empty array where
+    /// `array_length` is NULL. One argument, and the one of the five that disagrees with
+    /// `array_length` about emptiness.
+    Cardinality,
 }
 
 impl CatalogFunc {
@@ -362,6 +406,11 @@ impl CatalogFunc {
             }
             () if name.eq_ignore_ascii_case("col_description") => Some(CatalogFunc::ColDescription),
             () if name.eq_ignore_ascii_case("obj_description") => Some(CatalogFunc::ObjDescription),
+            () if name.eq_ignore_ascii_case("array_position") => Some(CatalogFunc::ArrayPosition),
+            () if name.eq_ignore_ascii_case("array_lower") => Some(CatalogFunc::ArrayLower),
+            () if name.eq_ignore_ascii_case("array_upper") => Some(CatalogFunc::ArrayUpper),
+            () if name.eq_ignore_ascii_case("array_length") => Some(CatalogFunc::ArrayLength),
+            () if name.eq_ignore_ascii_case("cardinality") => Some(CatalogFunc::Cardinality),
             () if name.eq_ignore_ascii_case("pg_get_partkeydef") => {
                 Some(CatalogFunc::PgGetPartkeydef)
             }
@@ -381,6 +430,11 @@ impl CatalogFunc {
             CatalogFunc::ObjDescription => "obj_description",
             CatalogFunc::PgGetPartkeydef => "pg_get_partkeydef",
             CatalogFunc::RegClass => "regclass",
+            CatalogFunc::ArrayPosition => "array_position",
+            CatalogFunc::ArrayLower => "array_lower",
+            CatalogFunc::ArrayUpper => "array_upper",
+            CatalogFunc::ArrayLength => "array_length",
+            CatalogFunc::Cardinality => "cardinality",
         }
     }
 
@@ -393,11 +447,16 @@ impl CatalogFunc {
     #[must_use]
     pub fn arities(self) -> &'static [usize] {
         match self {
-            CatalogFunc::FormatType | CatalogFunc::ColDescription => &[2],
+            CatalogFunc::FormatType
+            | CatalogFunc::ColDescription
+            | CatalogFunc::ArrayPosition
+            | CatalogFunc::ArrayLower
+            | CatalogFunc::ArrayUpper
+            | CatalogFunc::ArrayLength => &[2],
             CatalogFunc::PgGetExpr => &[2, 3],
             CatalogFunc::PgGetIndexdef => &[1, 3],
             CatalogFunc::PgGetConstraintdef | CatalogFunc::ObjDescription => &[1, 2],
-            CatalogFunc::PgGetPartkeydef | CatalogFunc::RegClass => &[1],
+            CatalogFunc::PgGetPartkeydef | CatalogFunc::RegClass | CatalogFunc::Cardinality => &[1],
         }
     }
 
@@ -414,6 +473,13 @@ impl CatalogFunc {
             | CatalogFunc::PgGetPartkeydef => ColumnType::Text,
             // An `oid` on a real server, and a `bigint` here for the reason `pg_class.oid` is one.
             CatalogFunc::RegClass => ColumnType::Int8,
+            // Every one of the five answers `integer` on a real server, including `cardinality`,
+            // which counts every element of every dimension where `array_length` counts one.
+            CatalogFunc::ArrayPosition
+            | CatalogFunc::ArrayLower
+            | CatalogFunc::ArrayUpper
+            | CatalogFunc::ArrayLength
+            | CatalogFunc::Cardinality => ColumnType::Int4,
         }
     }
 }
@@ -866,6 +932,7 @@ fn describe(expr: &Expr) -> &'static str {
         Expr::Not(_) => "NOT",
         Expr::IsNull { .. } => "IS NULL",
         Expr::InList { negated: false, .. } => "IN",
+        Expr::AnyArray { .. } => "= ANY",
         Expr::InList { negated: true, .. } => "NOT IN",
         Expr::Aggregate(_) => "an aggregate function",
         Expr::Default => "DEFAULT",

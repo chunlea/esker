@@ -814,6 +814,11 @@ fn render(expr: &Expr, columns: &[String]) -> String {
             render(operand, columns),
             if *negated { "NOT " } else { "" }
         ),
+        Expr::AnyArray { operand, array } => format!(
+            "{} = ANY ({})",
+            render(operand, columns),
+            render(array, columns)
+        ),
         // On one line, the way `EXPLAIN` prints everything else — `pg_get_indexdef`'s five-line
         // layout is for a stored definition and is built where that is written
         // (`crate::exec::ddl`), not here.

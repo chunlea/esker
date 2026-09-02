@@ -1521,16 +1521,30 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
         } if matches!(strip_nesting(right), Expr::Subquery(_)) => {
             lower_quantified(left, compare_op, right, false)
         }
+        // **A list when the lowering can see one, and a value when it cannot.** `ARRAY[1,2]`,
+        // `'{a,b}'` and `current_schemas(false)` are all known here, and expanding them into an
+        // `IN` list is what lets an index seek use them. A **column** — `a.attnum =
+        // ANY(i.indkey)` — is not: its value differs per row, so it stays an array and is read
+        // when the row is (`plan::Expr::AnyArray`).
         Expr::AnyOp {
             left,
             compare_op,
             right,
             ..
-        } if *compare_op == BinaryOperator::Eq => Ok(plan::Expr::InList {
-            operand: Box::new(lower_expr(left)?),
-            list: lower_array(right)?,
-            negated: false,
-        }),
+        } if *compare_op == BinaryOperator::Eq => {
+            let operand = Box::new(lower_expr(left)?);
+            match lower_array(right)? {
+                Some(list) => Ok(plan::Expr::InList {
+                    operand,
+                    list,
+                    negated: false,
+                }),
+                None => Ok(plan::Expr::AnyArray {
+                    operand,
+                    array: Box::new(lower_expr(strip_nesting(right))?),
+                }),
+            }
+        }
         // Any other operator against an array — `> ANY`, `<> ANY` — is a different quantifier and
         // is named rather than approximated by the one this node has.
         Expr::AnyOp { compare_op, .. } => Err(SqlError::unsupported(format!(
@@ -1948,25 +1962,28 @@ fn sequence_reference(text: &str) -> String {
 /// `IN` list before the planner sees it, and a `Datum` is never an array. That is the split ADR
 /// 0033's roadmap describes — expression-level arrays now, stored arrays with the tier-2 unit that
 /// needs a column of them.
-fn lower_array(expr: &Expr) -> Result<Vec<plan::Expr>> {
-    match expr {
-        Expr::Array(array) => array.elem.iter().map(lower_expr).collect(),
-        Expr::Nested(inner) => lower_array(inner),
+fn lower_array(expr: &Expr) -> Result<Option<Vec<plan::Expr>>> {
+    Ok(Some(match expr {
+        Expr::Array(array) => array
+            .elem
+            .iter()
+            .map(lower_expr)
+            .collect::<Result<Vec<_>>>()?,
+        Expr::Nested(inner) => return lower_array(inner),
         Expr::Function(function) => match schema_function(function)? {
-            Some(schemas) => Ok(schemas
+            Some(schemas) => schemas
                 .into_iter()
                 .map(|name| plan::Expr::Literal(plan::Literal::String(name)))
-                .collect()),
-            None => Err(SqlError::unsupported(format!(
-                "the function {} as an ANY operand",
-                function.name
-            ))),
+                .collect(),
+            // Any other function is an ordinary expression whose value is an array, and the row
+            // evaluator reads it.
+            None => return Ok(None),
         },
         // `'{a,b}'::text[]` and a bare `'{a,b}'`: the cast is a no-op here, because what the array
         // holds is decided by what it is compared against, exactly as an `IN` list's elements are.
-        Expr::Cast { expr, .. } => lower_array(expr),
+        Expr::Cast { expr, .. } => return lower_array(expr),
         Expr::Value(value) => match &value.value {
-            Value::SingleQuotedString(text) => Ok(parse_array_literal(text)?
+            Value::SingleQuotedString(text) => parse_array_literal(text)?
                 .into_iter()
                 .map(|item| {
                     plan::Expr::Literal(match item {
@@ -1974,18 +1991,14 @@ fn lower_array(expr: &Expr) -> Result<Vec<plan::Expr>> {
                         None => plan::Literal::Null,
                     })
                 })
-                .collect()),
-            _ => Err(SqlError::unsupported(format!("{expr} as an ANY operand"))),
+                .collect(),
+            _ => return Ok(None),
         },
         // A **column** — `a.attnum = ANY(i.indkey)`, which is how `ActiveRecord`'s
-        // `primary_keys()` reads a key. That needs an array *value*, where everything above is an
-        // array **expression** the lowering turns into an `IN` list. Named as the array rather
-        // than as the operand, so a reader searching for what is missing finds the feature and not
-        // the column that happened to be in front of it.
-        other => Err(SqlError::unsupported(format!(
-            "{other} as an ANY operand, which would need an array value where this node has only              array expressions"
-        ))),
-    }
+        // `primary_keys()` reads a key. Not a list this lowering can see, so it stays an
+        // expression and the row evaluator reads its value.
+        _ => return Ok(None),
+    }))
 }
 
 /// `'{a,b,"c d"}'` as its elements, with `None` for a SQL NULL.
@@ -2193,6 +2206,17 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
     // is and changes nothing about the value.
     if matches!(expr, Expr::Value(value) if matches!(value.value, Value::Null)) {
         return Ok(plan::Expr::Literal(plan::Literal::Null));
+    }
+    // **A cast to an array type is the identity on the text.** `'{a,b}'::text[]` is `{a,b}`, which
+    // is already the array's own canonical form and already what the array operators read
+    // (`crate::value::vector`). There is no array *column* type here, so this is not a cast to a
+    // stored type and never becomes one: it is how a literal array reaches the operators, and the
+    // same no-op `= ANY` has always made of it. A cast of anything but a literal is refused below
+    // with the type named, because a per-row cast to an array would have to build one.
+    if matches!(data_type, DataType::Array(_))
+        && let Some(text) = cast_literal_text(expr)?
+    {
+        return Ok(plan::Expr::Literal(plan::Literal::String(text)));
     }
     let Some(target) = cast_target(data_type) else {
         // A cast to a **stored type**, which is a different thing from `regtype` and `oid`: it

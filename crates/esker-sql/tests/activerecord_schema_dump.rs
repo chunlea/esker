@@ -90,17 +90,19 @@ fn every_schema_dump_answer_is_postgresql_19_s() {
 ///
 /// **Two entries left this list when the catalog-functions unit landed**: the comment columns,
 /// `col_description` and `obj_description`, which now answer NULL rather than refusing — and NULL
-/// is what a real server answers about a table nobody has commented on. What remains is one
-/// missing feature wearing two hats: the array surface, as `ARRAY(SELECT …)` over
-/// `generate_subscripts` and as `= ANY` over an `int2vector`.
+/// is what a real server answers about a table nobody has commented on.
+///
+/// **A third left with the `indkey` unit**: `= ANY` over an `int2vector`, which is how
+/// `primary_keys()` reads a key, runs now — the array it needed is a value of the row, and
+/// `crate::value::vector` says why that is text rather than a `Datum`. What remains is the other
+/// half of the array surface, `ARRAY(SELECT …)` over `generate_subscripts`.
 #[test]
 fn what_the_schema_dump_still_needs_names_itself() {
-    let mut node = parity::Node::new(&[
-        "CREATE TABLE nd (id bigserial PRIMARY KEY, a int4)",
-        "CREATE INDEX nd_a_idx ON nd (a)",
-    ]);
-
-    for (statement, wanted) in [
+    // A **register**, not a list of examples: an entry leaves it when its unit lands, and the
+    // last two left when `col_description` and `= ANY` over an `int2vector` were built. One is
+    // left, which is why this is a `const` rather than a literal in the loop — the shape has to
+    // survive going down to one and back up again.
+    const GAPS: &[(&str, &str)] = &[
         // `indexes()`: the column list it builds per index.
         (
             "SELECT ARRAY(SELECT pg_get_indexdef(d.indexrelid, k + 1, true) FROM \
@@ -108,13 +110,14 @@ fn what_the_schema_dump_still_needs_names_itself() {
              WHERE d.indrelid = 'nd'::regclass",
             "array",
         ),
-        // `primary_keys()`, `unique_constraints()`, `foreign_keys()`: the array over a key.
-        (
-            "SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid \
-             AND a.attnum = ANY(i.indkey) WHERE i.indrelid = 'nd'::regclass AND i.indisprimary",
-            "array",
-        ),
-    ] {
+    ];
+
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE nd (id bigserial PRIMARY KEY, a int4)",
+        "CREATE INDEX nd_a_idx ON nd (a)",
+    ]);
+
+    for (statement, wanted) in GAPS {
         let error = node.run(statement).unwrap_err();
         assert_eq!(
             error.sqlstate(),

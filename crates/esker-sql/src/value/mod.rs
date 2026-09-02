@@ -34,6 +34,8 @@ pub(crate) mod float;
 pub(crate) mod json;
 pub mod numeric;
 mod timestamp;
+/// Arrays as the catalog holds them: text, read by the operators (`vector::Array`).
+pub mod vector;
 
 use std::cmp::Ordering;
 
