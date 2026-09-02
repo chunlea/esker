@@ -1,0 +1,25 @@
+crates/esker-s3/src/http.rs
+  s_5887b8dc15d0eb::t_b17474ca2ae631 19-25,152-158,172,205-242
+crates/esker-s3/src/transport.rs
+  s_5887b8dc15d0eb::t_85ead7cd02170f 14-32,37-38,44-49,82-83,87-101,114-117,120-180,206,220-230,232-234,242-267,269
+crates/esker-s3/tests/keep_alive.rs
+  s_5887b8dc15d0eb::t_c9d5dd81b3552f 1-219
+docs/adr/0039-a-kept-alive-s3-connection.md
+  s_5887b8dc15d0eb::t_4b0d8c29e47454 1-80
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "097c2e510dea35a285cbe485ff04e3e0d2a1b07c",
+  "prompts": {},
+  "sessions": {
+    "s_5887b8dc15d0eb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a3f26108-d8c6-4ca4-8418-c2dce63dbbae",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
