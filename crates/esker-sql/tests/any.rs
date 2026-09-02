@@ -93,6 +93,58 @@ fn every_spelling_of_an_array_operand_answers() {
     }
 }
 
+/// An unquoted `NULL` element is a SQL NULL; a quoted `"NULL"` is the four characters.
+///
+/// A regression test. The first version of this unit handed the *word* `NULL` to the element's
+/// input function, which `text` accepted as a string and `int4` refused with `22P02` — so
+/// `1 = ANY('{NULL,1}'::int[])` was an error where a real server answers `t`. Rails'
+/// `where(id: [1, nil])` emits exactly that shape.
+///
+/// The comment that shipped with the bug said the simplification "cannot be reached from anything
+/// `ActiveRecord` sends". It could. A claim about what a client sends belongs in a capture.
+#[test]
+fn a_null_element_is_null_and_a_quoted_null_is_a_string() {
+    let mut node = parity::Node::new(&[]);
+    for (sql, expected) in [
+        // The integer case, which is the one that used to raise rather than answer.
+        ("SELECT 1 = ANY('{NULL,1}'::int[])", "t"),
+        ("SELECT 2 = ANY('{NULL,1}'::int[])", "\\N"),
+        ("SELECT 1 = ANY(ARRAY[1,NULL])", "t"),
+        // And the quoting rule, which is what makes the two spellings different values.
+        ("SELECT 'a' = ANY('{NULL,a}'::text[])", "t"),
+        ("SELECT 'z' = ANY('{NULL,a}'::text[])", "\\N"),
+        ("SELECT 'NULL' = ANY('{NULL,a}'::text[])", "\\N"),
+        ("SELECT 'NULL' = ANY('{\"NULL\",a}'::text[])", "t"),
+        ("SELECT 'null' = ANY('{null,a}'::text[])", "\\N"),
+    ] {
+        assert_eq!(node.rows(sql), vec![vec![expected.to_owned()]], "{sql}");
+    }
+}
+
+/// A function is resolved by name **and** arity, so the wrong one does not exist.
+///
+/// The second regression test. `current_schema(false)` answered `public` here where a real server
+/// says `42883 function current_schema(boolean) does not exist` — a wrong answer rather than a
+/// gap, since the argument was simply ignored.
+#[test]
+fn a_schema_function_with_the_wrong_arity_does_not_exist() {
+    let mut node = parity::Node::new(&[]);
+    for (sql, message) in [
+        (
+            "SELECT current_schema(false)",
+            "function current_schema(boolean) does not exist",
+        ),
+        (
+            "SELECT current_schemas()",
+            "function current_schemas() does not exist",
+        ),
+    ] {
+        let error = node.run(sql).unwrap_err();
+        assert_eq!(error.sqlstate(), "42883", "{sql}");
+        assert_eq!(error.to_string(), message, "{sql}");
+    }
+}
+
 /// A quantifier this node does not have is named rather than answered by the one it does.
 #[test]
 fn another_quantifier_is_refused_by_name() {

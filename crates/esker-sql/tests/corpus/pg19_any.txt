@@ -21,6 +21,21 @@
 # forms are constants here because this node has one schema and no `search_path`; what would make
 # them vary is schema support, which is a unit of its own.
 #
+# TWO THINGS THIS FILE DID NOT SAY UNTIL A REPLAY OF IT FOUND THEM, both at the bottom:
+#
+#   * **An unquoted `NULL` element, in any case, is a SQL NULL; a quoted `"NULL"` is the four
+#     characters.** `'NULL' = ANY('{NULL,a}')` is unknown and `'NULL' = ANY('{"NULL",a}')` is
+#     true. Handing the *word* to the element input function is what a naive parser does, and
+#     `text` accepts it while `int4` answers `22P02` — so `1 = ANY('{NULL,1}'::int[])` was an
+#     error here where a real server says `t`. Rails' `where(id: [1, nil])` emits exactly that.
+#   * **A function is resolved by name *and* arity.** `current_schema(false)` is
+#     `42883 function current_schema(boolean) does not exist`, not a `current_schema()` that
+#     ignored an argument; `current_schemas()` with none is the same answer the other way round.
+#
+# Both were category-(a) bugs in the first version of this unit. Neither was reachable from the
+# statements captured at boot, and both are reachable from ordinary `ActiveRecord` code — which is
+# why a corpus is replayed against the node rather than read.
+#
 SELECT current_schema()	name	public
 SELECT current_schemas(false)	name[]	{public}
 SELECT current_schemas(true)	name[]	{pg_catalog,public}
@@ -33,3 +48,15 @@ SELECT 1 = ANY(ARRAY[1,2,3])	boolean	t
 SELECT 'x' = ANY(ARRAY[]::text[])	boolean	f
 SELECT NULL = ANY(ARRAY['a'])	boolean	\N
 SELECT 'a' = ANY(ARRAY['a', NULL])	boolean	t
+SELECT 1 = ANY('{NULL,1}'::int[])	boolean	t
+SELECT 2 = ANY('{NULL,1}'::int[])	boolean	\N
+SELECT 1 = ANY(ARRAY[1,NULL])	boolean	t
+SELECT 'a' = ANY('{NULL,a}'::text[])	boolean	t
+SELECT 'z' = ANY('{NULL,a}'::text[])	boolean	\N
+SELECT 'NULL' = ANY('{NULL,a}'::text[])	boolean	\N
+SELECT 'NULL' = ANY('{"NULL",a}'::text[])	boolean	t
+SELECT 'null' = ANY('{null,a}'::text[])	boolean	\N
+SELECT 1 = ANY('{}'::int[])	boolean	f
+SELECT current_schema(false)	!42883 function current_schema(boolean) does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT current_schema(true)	!42883 function current_schema(boolean) does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT current_schemas()	!42883 function current_schemas() does not exist DETAIL: No function of that name accepts the given number of arguments.

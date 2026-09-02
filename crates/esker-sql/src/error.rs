@@ -676,6 +676,15 @@ pub enum SqlError {
     #[error("SET TRANSACTION SNAPSHOT must be called before any query")]
     SnapshotAfterQuery,
 
+    /// A function this node has under a name but not with that signature: `42883`.
+    ///
+    /// PostgreSQL resolves a function by name **and** argument types, so the wrong arity is not a
+    /// badly-called function — it is a function that does not exist, and the message spells the
+    /// types out: `function current_schema(boolean) does not exist`. The `0A000` a function this
+    /// node has never heard of gets is a different answer for a different condition.
+    #[error("function {0} does not exist")]
+    UndefinedFunction(String),
+
     /// A type name that names no type on this node: `42704`.
     ///
     /// What `'nope'::regtype` answers on a real server, word for word. It is also what this node
@@ -896,6 +905,7 @@ impl SqlError {
             SqlError::UndefinedParameter(_) => sqlstate::UNDEFINED_PARAMETER,
             SqlError::UndefinedOperator { .. }
             | SqlError::UndefinedAggregate { .. }
+            | SqlError::UndefinedFunction(_)
             | SqlError::UndefinedAggregateArity { .. } => sqlstate::UNDEFINED_FUNCTION,
             SqlError::ParameterlessAggregate => sqlstate::WRONG_OBJECT_TYPE,
             SqlError::GeneratedAlways { .. } => sqlstate::GENERATED_ALWAYS,
@@ -990,7 +1000,10 @@ impl SqlError {
             SqlError::UndefinedAggregate { .. } => {
                 Some("No function of that name accepts the given argument types.".to_owned())
             }
-            SqlError::UndefinedAggregateArity { .. } => {
+            // The same sentence for the same condition: a function whose *name* exists and whose
+            // arity does not. PostgreSQL says it for an aggregate and for `current_schema` alike,
+            // which is why the two share it rather than each carrying a copy.
+            SqlError::UndefinedAggregateArity { .. } | SqlError::UndefinedFunction(_) => {
                 Some("No function of that name accepts the given number of arguments.".to_owned())
             }
             SqlError::GeneratedAlways { column } => Some(format!(

@@ -83,7 +83,12 @@ const FIXTURE: &[&str] =
 /// tier 1 complete, this counter at eighteen, and the ladder still at rung 1. One statement, and
 /// rung 2 passes. A counter and a ladder disagreeing is the most useful thing the three numbers
 /// have done so far.
-const RUNS: usize = 19;
+///
+/// **Twenty-two now.** The rung-4 unit answered three at once — the relation-listing statements
+/// that need `pg_class`, `pg_namespace` and `= ANY (current_schemas(false))` together. They are
+/// one shape asked three ways, which is why no single earlier unit could move any of them: a
+/// statement is served or it is not, and this one wanted three features before it was either.
+const RUNS: usize = 22;
 
 #[test]
 fn every_statement_activerecord_sends_parses_and_is_answered_by_name() {

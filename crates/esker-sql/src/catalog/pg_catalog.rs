@@ -39,7 +39,7 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use crate::catalog::{ColumnDef, TableDef};
+use crate::catalog::{ColumnDef, Relation, TableDef};
 use crate::error::{Result, SqlError};
 use crate::value::{ColumnType, Datum, PgType};
 
@@ -58,11 +58,24 @@ pub enum CatalogView {
     PgType,
     /// The range types this server has, which is none.
     PgRange,
+    /// Every relation this tenant has: tables, indexes and sequences.
+    ///
+    /// The first catalog view whose rows are **not** constants — they come from a scan of the
+    /// catalog's own name records, which is what makes it a view over the records rather than a
+    /// second copy of them. `ActiveRecord` lists a schema's tables through it on every boot.
+    PgClass,
+    /// The schemas this tenant has, which is one.
+    PgNamespace,
 }
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 2] = [CatalogView::PgType, CatalogView::PgRange];
+    pub const ALL: [CatalogView; 4] = [
+        CatalogView::PgType,
+        CatalogView::PgRange,
+        CatalogView::PgClass,
+        CatalogView::PgNamespace,
+    ];
 
     /// The name a query spells it.
     #[must_use]
@@ -70,6 +83,8 @@ impl CatalogView {
         match self {
             CatalogView::PgType => "pg_type",
             CatalogView::PgRange => "pg_range",
+            CatalogView::PgClass => "pg_class",
+            CatalogView::PgNamespace => "pg_namespace",
         }
     }
 
@@ -80,6 +95,8 @@ impl CatalogView {
             + match self {
                 CatalogView::PgType => 0,
                 CatalogView::PgRange => 1,
+                CatalogView::PgClass => 2,
+                CatalogView::PgNamespace => 3,
             }
     }
 
@@ -111,6 +128,15 @@ impl CatalogView {
                 ("rngtypid", ColumnType::Int8),
                 ("rngsubtype", ColumnType::Int8),
             ],
+            // Exactly the four `ActiveRecord` reads. `relname` and `nspname` are `name` on a real
+            // server — the 64-byte identifier type — and `text` here, which compares identically.
+            CatalogView::PgClass => &[
+                ("oid", ColumnType::Int8),
+                ("relname", ColumnType::Text),
+                ("relnamespace", ColumnType::Int8),
+                ("relkind", ColumnType::Text),
+            ],
+            CatalogView::PgNamespace => &[("oid", ColumnType::Int8), ("nspname", ColumnType::Text)],
         }
     }
 
@@ -120,9 +146,27 @@ impl CatalogView {
     /// order; this one is deterministic, which is a superset of that promise and is the order
     /// `ORDER BY oid` would have given anyway. The same choice `crate::exec::aggregate` made for
     /// group order, and for the same reason.
-    #[must_use]
-    pub fn rows(self) -> Vec<Vec<Datum>> {
+    /// Every row, in OID order — reading the catalog for the views whose rows are not constants.
+    ///
+    /// `txn` and `tenant` are what make `pg_class` a **view over the records** rather than a
+    /// second copy of them: its rows are one scan of the same name keys `CREATE TABLE` writes, so
+    /// there is no state to keep in step and no way for the two to disagree. The constant views
+    /// ignore both.
+    pub fn rows_of(self, txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
         match self {
+            CatalogView::PgClass => pg_class_rows(txn, tenant),
+            CatalogView::PgNamespace => Ok(vec![vec![
+                Datum::Int8(PUBLIC_NAMESPACE_OID),
+                Datum::Text(PUBLIC_SCHEMA.to_owned()),
+            ]]),
+            constant => Ok(constant.rows()),
+        }
+    }
+
+    #[must_use]
+    fn rows(self) -> Vec<Vec<Datum>> {
+        match self {
+            CatalogView::PgClass | CatalogView::PgNamespace => Vec::new(),
             // Derived from `ColumnType::ALL` rather than written out, so a type cannot be added
             // to this node and left out of its own `pg_type`.
             CatalogView::PgType => {
@@ -222,6 +266,52 @@ pub fn refuse_write(name: &str) -> Result<()> {
         Some(view) => Err(SqlError::SystemCatalog(view.name())),
         None => Ok(()),
     }
+}
+
+/// The one schema this node has, and the id `pg_class.relnamespace` points at.
+///
+/// A real server's is whatever `CREATE SCHEMA` allocated and differs per database; this one is
+/// reserved beside the view ids for the same reason they are — nothing a user creates can reach
+/// it. What has to be true is only that `relnamespace` equals `pg_namespace.oid`, which is the
+/// join `ActiveRecord` writes.
+const PUBLIC_NAMESPACE_OID: i64 = 11;
+
+/// The schema every relation is in.
+const PUBLIC_SCHEMA: &str = "public";
+
+/// Every relation this tenant has, out of one scan of the catalog's name records.
+///
+/// The value of a name record says which kind of relation it is, and that is exactly what
+/// `relkind` reports. Measured on 19beta1: a table is `r`, an index is `i`, and a sequence is `S`
+/// — and a **primary key is an index**, `r4a_pkey` with relkind `i`, even here where the row key
+/// *is* the primary key and no separate index exists. That is the right answer rather than a
+/// convenient one: what `relkind` describes is the relation a client can name, and a client can
+/// name `r4a_pkey`.
+fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+    let (start, end) = super::record::name_range(tenant);
+    let mut rows: Vec<Vec<Datum>> = Vec::new();
+    for (key, value) in txn.scan(&start, &end, 0)? {
+        let name = super::record::name_of(tenant, &key)?;
+        let relation = super::record::decode_relation(&value)?;
+        let (id, kind) = match relation {
+            Relation::Table { table_id } => (table_id, "r"),
+            Relation::Index { index_id, .. } => (index_id, "i"),
+            Relation::PrimaryKey { table_id } => (table_id, "i"),
+            Relation::Sequence { table_id, .. } => (table_id, "S"),
+        };
+        rows.push(vec![
+            // The relation's own id, where a real server has a 32-bit `oid`. Ours are `u64` and
+            // the column is a `bigint`, which is the trade `pg_type.oid` already makes.
+            Datum::Int8(i64::try_from(id).unwrap_or(i64::MAX)),
+            Datum::Text(name),
+            Datum::Int8(PUBLIC_NAMESPACE_OID),
+            Datum::Text(kind.to_owned()),
+        ]);
+    }
+    // By name, which is the order the scan already returns them in and the order a reader can
+    // predict. PostgreSQL promises no order without an `ORDER BY`; a deterministic one is a
+    // superset of that promise, as `pg_type`'s rows are.
+    Ok(rows)
 }
 
 /// `pg_type.typname`: the internal name, which is not the one this node complains with — a column
