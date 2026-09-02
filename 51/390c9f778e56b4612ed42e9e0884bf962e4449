@@ -1,0 +1,33 @@
+crates/esker-sql/src/error.rs
+  s_f3955267395e69::t_da337b00d1828d 645-654,814
+crates/esker-sql/src/parse/lower.rs
+  s_f3955267395e69::t_3aa8e0374860aa 33,1170-1172,1400-1506
+crates/esker-sql/src/value/mod.rs
+  s_f3955267395e69::t_28f725b8da0bdf 178-222
+crates/esker-sql/tests/activerecord_surface.rs
+  s_f3955267395e69::t_940ab41e11983d 79-86
+crates/esker-sql/tests/corpus/pg19_regtype.txt
+  s_f3955267395e69::t_d5c2d7cdd41b85 1-54
+crates/esker-sql/tests/regtype.rs
+  s_f3955267395e69::t_c46f1e0e6ea580 1-98
+docs/bench/rails-scoreboard.md
+  s_f3955267395e69::t_83f5c334f11201 30-123
+docs/plans/phase-9-rails.md
+  s_f3955267395e69::t_add999baa4ab48 1044-1076
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "51390c9f778e56b4612ed42e9e0884bf962e4449",
+  "prompts": {},
+  "sessions": {
+    "s_f3955267395e69": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f99c5188-2954-40ae-b928-dc5eaa3b622d",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
