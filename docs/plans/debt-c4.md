@@ -72,3 +72,76 @@ Red twice, each red isolating one half of the rule:
 
 The third test compacts the log past what a copy names and asserts the open falls back to the full
 walk and loses nothing.
+
+## 2. One TCP connection per S3 request
+
+Inventory #9. `crates/esker-s3/src/transport.rs`, whose own doc said *"plain HTTP over a fresh TCP
+connection per request"*, and `docs/bench/phase-6b.md` §3, which measured what that costs and named
+the fix without doing it.
+
+### What was there, and why it was right once
+
+The transport sent `Connection: close` and opened a socket per request. `http.rs` said why: *"one
+connection per request means no state to get wrong between them, and an upload per flush does not
+need pooling."* True for the uploader. The read path is a different shape — 6b §2 measured 200,016
+ranged `GET`s for 200,000 cold reads, one round trip per read by design — so on that path the
+handshake is paid per block.
+
+### The fix
+
+[ADR 0039](../adr/0039-a-kept-alive-s3-connection.md). Idle connections are kept, at most 16 per
+endpoint, and a request says `Connection: keep-alive`. The three rules that bound it are in the ADR;
+the one worth repeating here is the third, because it is where the temptation was. A pooled
+connection the peer has closed is the ordinary case — every server has an idle timeout — and the
+obvious answer is to retry the request on a fresh connection. **That answer is wrong**, and more
+wrong now than before: ADR 0024 decision 2 puts retrying in `S3Client` because only it knows what is
+idempotent, and unit 3 below adds `PutObject` with `If-None-Match: *`, a request whose silent replay
+would answer `412` and hand a prefix to the wrong owner. So the transport does not retry; it
+**checks before reusing**, with a non-blocking peek, and the rare loss surfaces as `Error::Io`,
+which `is_retryable` already answers for.
+
+### The test
+
+`crates/esker-s3/tests/keep_alive.rs`, four tests, 0.06 s, against a server that counts what it
+accepts — reuse is invisible in a response, so `TcpTransport::connections_opened` is the observable.
+The three server shapes are the three that exist: one that keeps the connection, one that says
+`Connection: close`, and one that keeps it and drops it anyway, which is an idle timeout and is the
+case a pool gets wrong if it trusts what it holds.
+
+Red with pooling disabled:
+
+```
+assertion `left == right` failed: ten requests opened 10 connections
+  left: 10
+ right: 1
+```
+
+Gated against the real container as well: `esker-engine`'s four `tier_minio` tests, green.
+
+### The numbers
+
+`docs/bench/debt-c4.md` §1, interleaved before and after so a loaded box cannot favour one side.
+Cold `readrandom`, one thread — the configuration where the p50 *is* one round trip:
+
+| | ops/s | p50 | p99 |
+|---|---:|---:|---:|
+| before (median of 3) | 1,071 | 887.3 µs | 2,247.6 µs |
+| after (median of 3) | 2,311 | 411.4 µs | 763.8 µs |
+
+**The cold-read p99 falls from 2,247.6 µs to 763.8 µs**, and the two distributions do not overlap:
+the after runs' worst p99 is below the before runs' best. At four threads, 1,910 → 4,276 ops/s with
+p50 1,580 → 716 µs; the p99 moves less there because what is left is `MinIO` saturating, which is
+the same reading 6b §2 gave of the four-thread plateau.
+
+## 2b. Two `tier_minio` tests passed exactly once per bucket
+
+Found on the way to that measurement, at HEAD and before any change of this lane's:
+`a_database_that_lost_its_ssts_rebuilds_from_the_bucket` and
+`an_outage_leaves_the_sst_local_and_the_retry_lands` both failed on the first upload, `left: 0,
+right: 1`.
+
+The bucket still held `engine/acceptance/000004.sst` and `engine/outage/000004.sst` from a run six
+weeks earlier. A fresh database numbers its first SST `000004` whatever has ever existed, and
+`TieredFileSystem::new` **adopts what the bucket already holds** — so the tier found `000004`
+uploaded already, skipped it, and drained nothing. `unique_prefix` was already in the file, used by
+the claim tests only; the reason it exists is wider than the claim, and now says so.
