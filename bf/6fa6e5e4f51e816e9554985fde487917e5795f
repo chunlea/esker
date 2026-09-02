@@ -1,0 +1,21 @@
+crates/esker-sql/tests/routing_aggregate.proptest-regressions
+  s_ed1cd635740377::t_33324a041c5034 1-7
+crates/esker-sql/tests/routing_aggregate.rs
+  s_ed1cd635740377::t_f8d26ad188f080 1-674
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "bf6fa6e5e4f51e816e9554985fde487917e5795f",
+  "prompts": {},
+  "sessions": {
+    "s_ed1cd635740377": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "19199d55-8453-4673-a0ab-b13f22806878",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
