@@ -279,3 +279,46 @@ design: it is a guard on the checker's own output, not on the placement driver.
 `esker-sim`'s own `tests/mech_placement.rs` proves the same three things about the *model* using a
 reference policy, including that the checker fires on all 24 seeds against a deliberately narrowed
 rule. That is not evidence about `esker-pd` and is not counted as any.
+
+### U1b — the retry budget under a moving epoch (`9791e16`)
+
+| | |
+|---|---|
+| Model | `esker-sim/src/mech/retry.rs`, 24 seeded scripts of 10 answers + a tail |
+| Binding | `esker-client/tests/sim_retry.rs` → the real `RawClient` over `FakeTransport` + `FakeClock` |
+| Runs | 24 scripts, plus three constructed shapes |
+| Reached | 19 of 24 scripts oblige an answer **past** the old attempt budget; 5 oblige giving up; 21 mix both kinds of refusal — the shape neither hand-written test contains |
+
+Green at `486fef9` (this branch): 4 passed. The endless-progress run ends at the deadline after
+14 calls and 9,940 ms of a 10,000 ms budget.
+
+**Red at `1502d0f` (`9791e16^`)** — all 4 fail, and the first reproduces the recorded production
+failure to the millisecond:
+
+```
+seed 1: the client gave up on attempts having spent 2266ms of a 10000ms deadline.
+The script was [fppppfpppf then a], which obliged Answer { on_call: 11 };
+it answered OutOfAttempts { calls: 9, elapsed_ms: 2266 }
+
+an_epoch_that_never_settles_ends_at_the_deadline
+  seed 0: [ then p forever] obliged RunOutOfTime; it answered OutOfAttempts { calls: 9 }
+
+the_two_kinds_of_refusal_are_told_apart_on_the_wire
+  left:  OutOfAttempts { calls: 9, elapsed_ms: 2266 }
+  right: Answered { calls: 11 }
+```
+
+`2.266s of a 10s deadline, with 9 calls made` is the number in `9791e16`'s own commit message,
+arrived at from a different direction: that one was a hand-built script of ten uniform refusals,
+this is a drawn mixture. `fppppfpppf` is the interesting part — a budget that resets on progress
+and one that never resets agree on every *uniform* script, so a model that only drew uniform ones
+would have proved nothing the fix's own tests had not.
+
+One thing the model got wrong first, and it was the model rather than the code: a constructed
+20-refusal script asserted an answer on call 21, and the real client ended it at call 14 with
+`OutOfTime` after 9,940 ms. That is correct — twenty backoffs on a 10 ms base doubling to a 2 s
+cap do not fit inside a 10 s deadline. The assertion became the right one (the deadline is what
+stops a long run of progress, which is the half that makes "progress does not spend the budget"
+safe), and it is why the drawn scripts are capped at ten: a longer one would let the deadline end
+a run the model meant to end on attempts, and the checker would have to accept two answers where
+it should accept one.

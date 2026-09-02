@@ -42,6 +42,8 @@
 
 pub mod placement;
 pub mod reference;
+pub mod retry;
 
 pub use placement::{BalancePolicy, ClusterView, MidRepair, Move, PeerView, RegionView, StoreView};
 pub use reference::ReferenceBalance;
+pub use retry::{Answer, Budget, RetryClient, Script};
