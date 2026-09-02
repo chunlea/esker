@@ -110,6 +110,20 @@ impl RegionState {
     pub fn peer(&self) -> Option<&Arc<RaftPeer>> {
         self.peer.as_ref()
     }
+
+    /// Whether this region already has a peer on `store_id`, **including one whose conf change
+    /// has been appended and not yet applied**.
+    ///
+    /// [`crate::transport::RegionTransport::hosts_store`] is where that "and not yet applied" is:
+    /// the peer list on `region()` moves on apply, the core's configuration moves on append, and
+    /// between the two only the routing table knows the new peer exists. A region with no
+    /// transport has no replication and therefore no peer anywhere but here.
+    #[must_use]
+    pub fn hosts_store(&self, store_id: u64) -> bool {
+        self.transport
+            .as_ref()
+            .is_some_and(|transport| transport.hosts_store(store_id))
+    }
 }
 
 /// Every region this store hosts, indexed by id and by range.

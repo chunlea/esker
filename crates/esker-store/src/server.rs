@@ -2996,6 +2996,14 @@ fn already_placed(state: &RegionState, peer_id: u64, store_id: u64) -> bool {
         .peers
         .iter()
         .any(|peer| peer.peer_id == peer_id || peer.store_id == store_id)
+        // **And the record is not the whole membership.** A conf change is in force from the
+        // moment its entry is on disk; the region record only moves when it applies. The
+        // re-derived operator arrives at the *new* leader in exactly that window — the old one
+        // stepped down with the first change in its log, which is why PD re-derived at all — and
+        // a check that reads only the record sees a region that is still short and adds a second
+        // peer beside the first. Asked against the record alone this guard let
+        // `region 3 has peers 16 and 27 both on store 3` through on the very next run.
+        || state.hosts_store(store_id)
 }
 
 fn conf_change_for(

@@ -315,6 +315,25 @@ impl RegionTransport {
             .map_or(Epoch::INITIAL, |membership| membership.epoch)
     }
 
+    /// Whether any peer this region knows of is on `store_id`.
+    ///
+    /// The question `store_of` answers backwards, and it is asked at a moment the region *record*
+    /// cannot answer: a conf change takes effect when its entry is **appended**, and the record
+    /// only moves when it applies. Between those, the peer exists in every core that appended the
+    /// entry and the only thing that knows where it lives is this table —
+    /// [`learn`](Self::learn) puts it there from the change's own context, which is what that
+    /// method exists for. A store hosts one peer per region (`RegionMap::insert` refuses a
+    /// second), so "this store already has one" is a refusal and not a preference.
+    #[must_use]
+    pub fn hosts_store(&self, store_id: u64) -> bool {
+        self.membership.lock().is_ok_and(|membership| {
+            membership
+                .routes
+                .iter()
+                .any(|(_, store)| *store == store_id)
+        })
+    }
+
     /// The store hosting `peer`, if this region knows of it.
     #[must_use]
     pub fn store_of(&self, peer: NodeId) -> Option<u64> {
@@ -457,6 +476,43 @@ mod tests {
             PeerAddress::new(2, 1, addr(7999)),
         ]);
         assert_eq!(stores, vec![StoreAddress::new(1, addr(7001))]);
+    }
+
+    /// A peer whose conf change has been **appended and not applied** is already on its store.
+    ///
+    /// The window `RegionState::hosts_store` exists for. `learn` is called from the `Ready` that
+    /// persists the entry, on every peer that appends it, so between the append and the apply this
+    /// table is the only thing that knows the new peer exists — and a placement decision that read
+    /// the region record instead put a second peer on a store that already had one
+    /// (`docs/plans/phase-14-flakes.md` U2).
+    #[tokio::test]
+    async fn a_peer_learned_at_append_already_counts_as_placed_on_its_store() {
+        let peers = vec![
+            PeerAddress::new(1, 1, addr(7201)),
+            PeerAddress::new(2, 2, addr(7202)),
+            PeerAddress::new(3, 3, addr(7203)),
+        ];
+        let transport =
+            StoreTransport::spawn(1, &StoreAddress::from_peers(&peers), TransportConfig::new());
+        let members = vec![
+            esker_proto::Peer::voter(1, 1),
+            esker_proto::Peer::voter(2, 2),
+        ];
+        let region = transport.for_region(7, Epoch::INITIAL, &members);
+        assert!(region.hosts_store(1));
+        assert!(region.hosts_store(2));
+        assert!(
+            !region.hosts_store(3),
+            "no peer of this region is on store 3 yet"
+        );
+
+        // The conf change adding peer 9 on store 3 is on disk; the region record has not moved.
+        RaftTransport::learn(&*region, 9, 3);
+        assert!(
+            region.hosts_store(3),
+            "a peer added by an appended conf change is on its store from that moment"
+        );
+        assert_eq!(region.store_of(9), Some(3));
     }
 
     #[tokio::test]

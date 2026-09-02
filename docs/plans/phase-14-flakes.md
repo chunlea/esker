@@ -233,6 +233,140 @@ it.
 
 ---
 
+## U2 — `promotion::a_learner_on_a_fresh_store_becomes_a_voter_under_load`
+
+### `548dd62`'s lever is spent, so the reproduction had to be a new one
+
+`RUST_LOG=esker_store=debug,esker_pd=debug`, alone: **3 of 3 green**, 23–28 s. That was the
+configuration that failed 8 of 8 before `548dd62`, and it no longer fails at all — the balance/repair
+race is fixed and is not what is left.
+
+What does reproduce it is **load**: four copies of the binary at once, twelve stores and four
+placement drivers on one machine. **2 of 4 red**, with the traces below. Both reds are the same
+state and neither is a slow cluster.
+
+### The mechanism, in four log lines
+
+```
+WARN  transport: no store known for a peer of this region; the message was dropped
+      region_id=5 peer=27                                       (x51, over 9.5 s)
+WARN  transport: a message was addressed to a peer on this store; it was dropped
+      region_id=5 peer=27                                       (x31, for the rest of the run)
+DEBUG not promoting: the learner has not caught up region_id=5 learner=27
+      matched=0 next=88 leader_matched=88 pending_snapshot=0 recent_active=false
+```
+
+`matched=0` with `next` tracking the leader exactly, `recent_active=false`, and both of the region's
+stores fully applied at `applied=92`. The learner is not behind; **it does not exist**. The second
+warning says why: the route for peer 27 resolves to the sending store itself, so region 5 has *two
+peers on one store* — and `RegionMap::insert` refuses a second outright, "a store never holds two
+peers of one region". A peer that can never be created is a learner for ever, and PD, counting a
+replica that exists only on paper, stops seeing the region as short and never repairs it.
+
+### Where the second peer came from
+
+An `AddPeer` is answered when its conf change **applies**. A leader that steps down with the
+proposal in its log answers `it may still commit` — which is not *it did not*:
+
+```
+10:35:33.449  stopped leading; answering what this peer can no longer promise region_id=5 applied=69
+10:35:33.449  an operator did not apply ... node=27 error=... it may still commit
+```
+
+PD observes nothing, times the operator out (`operator timed out with nothing observed; it will be
+re-derived ... sends=3`), re-derives the same plan onto the same store — and both changes commit.
+
+The store is the party that could have refused, and its check was on the wrong key:
+
+```rust
+esker_proto::Operator::AddPeer { store_id, peer_id, .. } => match state
+    .region().peers.iter().find(|peer| peer.peer_id == *peer_id)
+```
+
+**PD mints a fresh peer id every time it issues one.** `esker-pd`'s `repair.rs` says so and is right
+to: *"a fresh peer id, from the persisted allocator, every time an `AddPeer` is issued ... reusing
+the id of an operator PD has forgotten would risk two peers with one id"*. So the id differs by
+construction on every re-derivation, and the guard answered "not a repeat" to every one of them. The
+comment directly above it already described the intent correctly — *"arriving here for a peer that
+is already a learner is a repeat rather than a second step, PD re-deriving after a timeout"* — and
+the check could not see one.
+
+The same family as `balance::is_mid_repair`'s "**voters, not peers**", which that module names four
+times: an identity read off the wrong field, turning a transient ambiguity into a permanent state.
+
+### And the record is not the whole membership — the second half, found by the fix's own test
+
+`already_placed` asked the region **record**, and the very next run said:
+
+```
+region 3 has peers 16 and 27 both on store 3 — a store hosts one peer per region, so the second
+can never be created and never votes
+```
+
+with, ten lines above it, ADR 0035's own sentence:
+
+```
+WARN a snapshot did not arrive; the leader will offer it again region_id=3
+     error=unsupported: peer 16 is in region 3's configuration but the change that put it there
+     has not applied here within 500ms
+```
+
+**In the configuration, not in the record.** A conf change is in force from the moment its entry is
+on disk; the record only moves when it applies — and the re-derived operator arrives at the *new*
+leader in exactly that window, because the old one stepping down with the change in its log is why
+PD re-derived at all. So the guard reads the routing table too: `learn_routes` fills it from the
+change's own context in the `Ready` that persists the entry, on every peer that appends it,
+precisely so a brand-new peer is addressable before the record moves. `RegionTransport::hosts_store`
+asks it the question `store_of` answers backwards.
+
+The same lesson ADR 0035 records one path over: *the core's membership decides whether the caller is
+a stranger; the record decides when it is served.*
+
+### What is red first
+
+| test | red against | with |
+|---|---|---|
+| `a_re_issued_add_peer_does_not_place_a_second_peer_on_a_store_that_has_one` | the peer-id guard | assertion, `conf_change_for` proposed a second peer |
+| `a_re_issued_add_learner_does_not_place_a_second_peer_on_a_store_that_has_one` | the peer-id guard | the same, through the columnar operator |
+| `an_add_peer_for_a_peer_id_already_here_still_proposes_nothing` | — | **green throughout**, so widening the guard cannot lose the case it was written for |
+| `promotion.rs`'s `one_peer_per_store` | the record-only guard | `region 3 has peers 16 and 27 both on store 3`, on the run after the first half landed |
+| `a_peer_learned_at_append_already_counts_as_placed_on_its_store` | — | coverage for the new method; the red for that half is the row above |
+
+### What is left, and it is a clock
+
+At **two** copies rather than four: **5 of 6 green**, and the one failure is not a stranded learner
+but the test's own load generator giving up —
+
+```
+writing b"k000551" never succeeded; the last refusal was: None
+```
+
+`None` is the whole of it: no store refused the write, no store answered as leader for that key for
+ninety seconds. At four copies the same failure takes three of four runs and the passing runs
+stretch from 88 s to 168 s. That is `docs/plans/phase-11-engine.md`'s rule reading true — *"the way
+to tell them apart is that the failure does not survive being run alone"* — and it is starvation of
+a machine running twelve stores and four drivers, not an ordering bug.
+
+So the deadline stays where it is. **What changed is what the test says when it expires**: it now
+asserts the state behind the two known causes *before* it times anything —
+
+* **no region has two peers on one store**, which is the bug above, named where it happens rather
+  than thirty seconds later; and
+* **a peer PD reported as a voter is never a learner again**, because nothing here demotes one, so
+  that is PD's view going backwards and not a promotion that failed;
+
+and when it does expire it prints PD's own peer list, roles, epoch and leader beside the learner's
+store's view, so the next sighting is diagnosable from the panic instead of from a re-run.
+
+| configuration | before | after |
+|---|---:|---:|
+| alone, `RUST_LOG=…=debug` | 8 of 8 red before `548dd62` | **3 of 3 green** |
+| 4 copies at once | **2 of 4 red**, both the duplicate peer | no duplicate peer in any run since |
+| 2 copies at once, 3 batches | — | **5 of 6**, the sixth the load generator's own deadline |
+| `cargo nextest run -p esker-store` | — | **299 of 299**, twice |
+
+---
+
 ## 2. Units
 
 | unit | test | done when |

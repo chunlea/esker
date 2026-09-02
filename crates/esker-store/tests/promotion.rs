@@ -313,6 +313,30 @@ async fn a_learner_on_a_fresh_store_becomes_a_voter_under_load() {
     let _ = pd_handle.shutdown().await;
 }
 
+/// **One peer per region per store**, checked before anything is timed.
+///
+/// A store keys its regions by region id — `RegionMap::insert` refuses a second outright, "a store
+/// never holds two peers of one region" — and its transport drops a message it would have to
+/// address to itself. So a second peer of one region on one store is a peer that can never be
+/// created: every message to it is dropped, its `matched` stays 0, and it is a learner for ever,
+/// while the placement driver counts it as a replica and stops repairing the region.
+///
+/// It used to arrive here as `PROMOTION_DEADLINE` expiring — thirty seconds later, naming the
+/// clock instead of the cause. It is a state, so it is asserted as one
+/// (`docs/plans/phase-14-flakes.md` U2).
+fn one_peer_per_store(region: &Region) {
+    let mut by_store: BTreeMap<u64, u64> = BTreeMap::new();
+    for peer in &region.peers {
+        if let Some(first) = by_store.insert(peer.store_id, peer.peer_id) {
+            panic!(
+                "region {} has peers {} and {} both on store {} — a store hosts one peer per \
+                 region, so the second can never be created and never votes",
+                region.id, first, peer.peer_id, peer.store_id
+            );
+        }
+    }
+}
+
 /// Polls until every learner that appears has been promoted, failing the moment one outlives
 /// [`PROMOTION_DEADLINE`]. Each is timed from when it was first seen, so a learner that is merely
 /// new is not mistaken for one that is stranded.
@@ -328,25 +352,7 @@ async fn watch_until_every_learner_votes(
 
     loop {
         for region in pd_regions(pd) {
-            // **One peer per region per store, checked before anything is timed.**
-            //
-            // A store keys its regions by region id and its transport refuses to address a peer
-            // that resolves to itself, so a second peer of one region on one store is a peer that
-            // can never be created: the leader drops every message to it, its `matched` stays 0,
-            // and it is a learner for ever. That is a *stranded* learner rather than a slow one,
-            // and it used to arrive here as `PROMOTION_DEADLINE` expiring — thirty seconds later,
-            // naming the clock instead of the cause. It is a state, so it is asserted as one
-            // (`docs/plans/phase-14-flakes.md` U2).
-            let mut by_store: BTreeMap<u64, u64> = BTreeMap::new();
-            for peer in &region.peers {
-                if let Some(first) = by_store.insert(peer.store_id, peer.peer_id) {
-                    panic!(
-                        "region {} has peers {} and {} both on store {} — a store hosts one peer \
-                         per region, so the second can never be created and never votes",
-                        region.id, first, peer.peer_id, peer.store_id
-                    );
-                }
-            }
+            one_peer_per_store(&region);
             for peer in &region.peers {
                 let id = (region.id, peer.peer_id);
                 if peer.store_id != 1 {
