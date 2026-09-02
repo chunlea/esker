@@ -416,6 +416,7 @@ fn push_filter(
         Expr::Case { .. } => return Err(refused("a CASE expression")),
         // The fragment language has no array. Rows, and the row evaluator answers it.
         Expr::AnyArray { .. } => return Err(refused("= ANY over an array value")),
+        Expr::Subscript { .. } => return Err(refused("an array subscript")),
         Expr::Literal(literal) => ColExpr::Literal(literal_value(literal)?),
         // A catalog function is a function of the catalog, not of the fragment's columns, and the
         // columnar reader has no expression for it. Rows, and the row evaluator answers it.
@@ -681,6 +682,10 @@ fn collect_columns(expr: &Expr, into: &mut Vec<usize>) {
         Expr::AnyArray { operand, array } => {
             collect_columns(operand, into);
             collect_columns(array, into);
+        }
+        Expr::Subscript { operand, index, .. } => {
+            collect_columns(operand, into);
+            collect_columns(index, into);
         }
         Expr::Aggregate(call) => {
             for arg in &call.args {

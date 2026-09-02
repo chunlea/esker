@@ -119,6 +119,29 @@ pub enum Expr {
         /// `1 = ANY(NULL::int[])` is NULL where `1 = ANY('{}')` is false.
         array: Box<Expr>,
     },
+    /// `a[i]` — one element of an array, by **absolute** subscript.
+    ///
+    /// Not an offset: it follows the array's own lower bound, so `indkey[0]` is an index's first
+    /// column and `conkey[1]` is a constraint's, because an `int2vector` starts at 0 and an
+    /// `int2[]` starts at 1. Both spellings are what `ActiveRecord` writes.
+    ///
+    /// **Every way of missing is NULL and none is an error** — out of range at either end, an
+    /// empty array, a NULL array, a NULL subscript. That is what lets a caller walk an array
+    /// without checking its length.
+    Subscript {
+        /// The array, read from its own text form (`crate::value::vector`).
+        operand: Box<Expr>,
+        /// The subscript, evaluated per row.
+        index: Box<Expr>,
+        /// The type to read the element **as**.
+        ///
+        /// An array is text here and so are its elements, so an element has no type of its own —
+        /// what gives it one is what it is compared against, exactly as an `= ANY`'s elements take
+        /// the operand's type. `a.attnum = d.indkey[0]` is an `int2` column against a subscript,
+        /// and a node that compared the element as text would find nothing and report an **empty
+        /// join** rather than an error. Set where the comparison is reconciled; `text` until then.
+        element: ColumnType,
+    },
     /// `x IS NULL`, or `IS NOT NULL` when negated. Never NULL itself — that is the whole point of
     /// the operator, and the reason `x = NULL` is not a way to write it.
     IsNull {
@@ -984,6 +1007,7 @@ fn describe(expr: &Expr) -> &'static str {
         Expr::IsNull { .. } => "IS NULL",
         Expr::InList { negated: false, .. } => "IN",
         Expr::AnyArray { .. } => "= ANY",
+        Expr::Subscript { .. } => "a subscript",
         Expr::InList { negated: true, .. } => "NOT IN",
         Expr::Aggregate(_) => "an aggregate function",
         Expr::Default => "DEFAULT",

@@ -1038,6 +1038,40 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         // rather than a list the lowering could see. Shared rather than copied: `IN` and
         // `= ANY` are one operator on a real server, and a second implementation of "a match wins
         // over a NULL" is a second place for it to be wrong.
+        // **Every way of missing is NULL**: out of range at either end, an empty array, a NULL
+        // array, a NULL subscript. Five shapes and one answer, which is what lets a caller walk an
+        // array without checking its length first — and none of them is an error.
+        Expr::Subscript {
+            operand,
+            index,
+            element,
+        } => {
+            let Some(array) = read_array(&evaluate_in(operand, row, env)?)? else {
+                return Ok(Datum::Null);
+            };
+            let index = match evaluate_in(index, row, env)? {
+                Datum::Null => return Ok(Datum::Null),
+                Datum::Int8(at) => at,
+                Datum::Int4(at) => i64::from(at),
+                Datum::Int2(at) => i64::from(at),
+                other => {
+                    return Err(SqlError::DatatypeMismatch(format!(
+                        "array subscript must be type integer, not {other:?}"
+                    )));
+                }
+            };
+            // The subscript is **absolute**, so the array's own lower bound is subtracted to find
+            // the position: `indkey[0]` is the first element of an `int2vector` and `conkey[1]` is
+            // the first of an `int2[]`.
+            let at = index - i64::from(array.lower);
+            match usize::try_from(at)
+                .ok()
+                .and_then(|at| array.elements.get(at))
+            {
+                Some(Some(text)) => Datum::from_text(*element, text)?,
+                Some(None) | None => Datum::Null,
+            }
+        }
         Expr::AnyArray { operand, array } => {
             let operand = evaluate_in(operand, row, env)?;
             if matches!(operand, Datum::Null) {

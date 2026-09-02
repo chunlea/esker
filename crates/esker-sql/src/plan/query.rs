@@ -826,6 +826,9 @@ fn render(expr: &Expr, columns: &[String]) -> String {
             render(operand, columns),
             render(array, columns)
         ),
+        Expr::Subscript { operand, index, .. } => {
+            format!("{}[{}]", render(operand, columns), render(index, columns))
+        }
         // On one line, the way `EXPLAIN` prints everything else — `pg_get_indexdef`'s five-line
         // layout is for a stored definition and is built where that is written
         // (`crate::exec::ddl`), not here.

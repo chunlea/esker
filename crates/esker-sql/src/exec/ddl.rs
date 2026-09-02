@@ -816,6 +816,7 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
         Expr::AnyArray { operand, array } => {
             format!("({} = ANY ({}))", sub(operand), sub(array))
         }
+        Expr::Subscript { operand, index, .. } => format!("{}[{}]", sub(operand), sub(index)),
     }
 }
 

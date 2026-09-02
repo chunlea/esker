@@ -1518,6 +1518,15 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             operand: Box::new(resolve(operand, scope)?),
             array: Box::new(resolve(array, scope)?),
         },
+        Expr::Subscript {
+            operand,
+            index,
+            element,
+        } => Expr::Subscript {
+            operand: Box::new(resolve(operand, scope)?),
+            index: Box::new(resolve(index, scope)?),
+            element: *element,
+        },
         Expr::Case {
             branches,
             otherwise,
@@ -1797,6 +1806,17 @@ fn reconcile(op: BinaryOp, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
             Expr::Literal(blank_pad(retype(*ty, literal, op, true)?, *ty, *typmod)),
             right.clone(),
         ),
+        // **A subscript takes the other side's type**, which is the same rule an `= ANY`'s
+        // elements follow and for the same reason: an array is text here, so its elements have no
+        // type of their own and what gives them one is what they are compared against. Without
+        // this, `a.attnum = d.indkey[0]` compares an `int2` to a `Datum::Text` and finds nothing —
+        // an **empty join** rather than an error, which is the failure that looks like data.
+        (Expr::Subscript { .. }, Expr::Ordinal { ty, .. }) => {
+            (retype_subscript(&left, *ty), right.clone())
+        }
+        (Expr::Ordinal { ty, .. }, Expr::Subscript { .. }) => {
+            (left.clone(), retype_subscript(&right, *ty))
+        }
         // An `unknown` beside a literal that has a type. `Literal::String` is the only `unknown`
         // there is: a NULL has no type either, and needs none — a comparison with one is NULL
         // whatever type the other side turns out to be.
@@ -1833,6 +1853,18 @@ fn reconcile(op: BinaryOp, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
         }
         _ => (left, right),
     })
+}
+
+/// One subscript, told which type to read its element as.
+fn retype_subscript(expr: &Expr, ty: ColumnType) -> Expr {
+    match expr {
+        Expr::Subscript { operand, index, .. } => Expr::Subscript {
+            operand: operand.clone(),
+            index: index.clone(),
+            element: ty,
+        },
+        other => other.clone(),
+    }
 }
 
 /// The type a literal already carries, or `None` for the two that carry none.
@@ -2222,6 +2254,9 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // (`resolve`'s `Expr::Case` arm) — the `ELSE` first. All-`unknown` is `text`, which is
         // PostgreSQL's own fallback and is why `CASE WHEN true THEN 'a' ELSE 'b' END` is `text`
         // rather than untyped.
+        // The type the element is read **as**, which a comparison sets and which is `text` until
+        // one does — the same rule an `= ANY`'s elements follow.
+        Expr::Subscript { element, .. } => *element,
         Expr::Case {
             branches,
             otherwise,

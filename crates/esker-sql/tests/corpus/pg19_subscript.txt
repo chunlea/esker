@@ -1,0 +1,43 @@
+# `a[i]` — subscripting an array. A piece of boot statements 35 and 36.
+#
+# `ActiveRecord`'s `foreign_keys()` reads a constraint's columns as `c.conkey[idx]`, and its
+# `indexes()` walks an index's with `d.indkey[k]`. Both were `0A000`, because this node had no
+# subscript at all.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **Out of range is NULL and never an error.** `[0]` and `[9]` on a three-element array are
+#     both NULL, an empty array is NULL at every subscript, a NULL array is NULL, and a NULL
+#     subscript is NULL. Five ways to miss and one answer, which is what lets `ActiveRecord` walk
+#     an array without checking its length first.
+#   * **The subscript is absolute, not an offset**, so it follows the array's own lower bound:
+#     `d.indkey[0]` is the **first** index column, because an `int2vector` starts at 0, while
+#     `c.conkey[1]` is the first constraint column, because an `int2[]` starts at 1. The same
+#     written number means different positions in the two, and both are here.
+#   * **`conkey` is NULL here for anything but a foreign key**, where a real server fills it for
+#     every constraint that has columns — a primary key's is `{1}` there and NULL here. That is a
+#     pre-existing `pg_constraint` gap and **not** this unit's: the subscript over a foreign key's
+#     `conkey`, two lines below, is exact. Declared rather than worked around.
+#   * **The element is compared as its own type.** `a.attnum = d.indkey[0]` joins on it — an
+#     `int2` column against a subscript — so an implementation that answered the element as text
+#     and compared it to a number would find nothing and report an empty join rather than an error.
+CREATE TABLE sb (id int8 PRIMARY KEY, a int4, b text)		-
+CREATE INDEX sb_ab ON sb (a, b)		-
+SELECT ('{a,b,c}'::text[])[1], ('{a,b,c}'::text[])[3]	text,text	a|c
+SELECT ('{a,b,c}'::text[])[0], ('{a,b,c}'::text[])[9]	text,text	\N|\N
+SELECT ('{}'::text[])[1]	text	\N
+SELECT (NULL::text[])[1]	text	\N
+SELECT ('{a,b,c}'::text[])[NULL]	text	\N
+SELECT d.indkey[0], d.indkey[1], d.indkey[2] FROM pg_index d WHERE d.indexrelid = 'sb_ab'::regclass	smallint,smallint,smallint	2|3|\N
+SELECT c.conkey[1], c.conkey[2] FROM pg_constraint c WHERE c.conrelid = 'sb'::regclass AND c.contype = 'p'	smallint,smallint	1|\N
+SELECT a.attname FROM pg_index d JOIN pg_attribute a ON a.attrelid = d.indrelid AND a.attnum = d.indkey[0] WHERE d.indexrelid = 'sb_ab'::regclass	name	a
+SELECT a.attname FROM pg_index d JOIN pg_attribute a ON a.attrelid = d.indrelid AND a.attnum = d.indkey[1] WHERE d.indexrelid = 'sb_ab'::regclass	name	b
+CREATE TABLE sbp (id int8 PRIMARY KEY, n text)		-
+CREATE TABLE sbc (id int8 PRIMARY KEY, p int8 REFERENCES sbp (id))		-
+SELECT c.conkey[1], c.confkey[1], c.conkey[2] FROM pg_constraint c WHERE c.conrelid = 'sbc'::regclass AND c.contype = 'f'	smallint,smallint,smallint	2|1|\N
+SELECT a.attname FROM pg_constraint c JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1] WHERE c.conrelid = 'sbc'::regclass AND c.contype = 'f'	name	p
+DROP TABLE sb CASCADE		-

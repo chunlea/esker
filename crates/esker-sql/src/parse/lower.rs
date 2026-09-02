@@ -1380,6 +1380,42 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             expr,
         } => lower_expr(expr),
         Expr::Nested(inner) => lower_expr(inner),
+        // `a[i]`. Only a **single** subscript: a slice (`a[1:2]`) answers an array rather than an
+        // element and a second dimension is a shape the catalog's arrays do not have, so both are
+        // named rather than approximated by the one this node has.
+        Expr::CompoundFieldAccess { root, access_chain } => {
+            use sqlparser::ast::{AccessExpr, Subscript};
+            // **A qualified column puts its qualifier in the chain**: `d.indkey[0]` is the root
+            // `d` with `indkey` and then the subscript after it, where `('{a,b}')[1]` is the array
+            // with only the subscript. Both are one element of one array; a longer chain is a
+            // field access this node does not have.
+            let (operand, subscript) = match access_chain.as_slice() {
+                [AccessExpr::Subscript(subscript)] => (lower_expr(root)?, subscript),
+                [
+                    AccessExpr::Dot(Expr::Identifier(column)),
+                    AccessExpr::Subscript(subscript),
+                ] => (
+                    plan::Expr::Column {
+                        table: Some(qualifier(root)?),
+                        name: ident(column),
+                    },
+                    subscript,
+                ),
+                _ => return Err(SqlError::unsupported(format!("the access chain on {root}"))),
+            };
+            // A slice answers an **array** rather than an element, which is a different feature
+            // and not a wider subscript; named rather than approximated by the one this node has.
+            let Subscript::Index { index } = subscript else {
+                return Err(SqlError::unsupported("an array slice"));
+            };
+            Ok(plan::Expr::Subscript {
+                operand: Box::new(operand),
+                index: Box::new(lower_expr(index)?),
+                // `text` until a comparison gives it one, which is where an element's type comes
+                // from (`plan::Expr::Subscript::element`).
+                element: ColumnType::Text,
+            })
+        }
         // `DEFAULT` is a keyword `sqlparser` hands back as a bare identifier. Quoted, it is a
         // column called `DEFAULT` and stays one; unquoted, it is the clause.
         Expr::Identifier(name)
@@ -1849,6 +1885,16 @@ fn is_string_literal(expr: &Expr) -> bool {
             Value::SingleQuotedString(_) | Value::DoubleQuotedString(_)
         ),
         _ => false,
+    }
+}
+
+/// The table qualifier at the root of an access chain — the `d` in `d.indkey[0]`.
+fn qualifier(root: &Expr) -> Result<String> {
+    match root {
+        Expr::Identifier(name) => Ok(ident(name)),
+        other => Err(SqlError::unsupported(format!(
+            "the access chain on {other}"
+        ))),
     }
 }
 

@@ -322,6 +322,10 @@ fn walk_expr_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr)) {
             walk_expr_mut(operand, visit);
             walk_expr_mut(array, visit);
         }
+        Expr::Subscript { operand, index, .. } => {
+            walk_expr_mut(operand, visit);
+            walk_expr_mut(index, visit);
+        }
         Expr::Case {
             branches,
             otherwise,
@@ -451,6 +455,10 @@ fn descend(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
         Expr::AnyArray { operand, array } => {
             descend(operand, visit);
             descend(array, visit);
+        }
+        Expr::Subscript { operand, index, .. } => {
+            descend(operand, visit);
+            descend(index, visit);
         }
         Expr::Case {
             branches,

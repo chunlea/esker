@@ -500,6 +500,10 @@ fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
             substitute_in_expr(operand, outer, depth);
             substitute_in_expr(array, outer, depth);
         }
+        Expr::Subscript { operand, index, .. } => {
+            substitute_in_expr(operand, outer, depth);
+            substitute_in_expr(index, outer, depth);
+        }
         Expr::Case {
             branches,
             otherwise,
@@ -900,6 +904,10 @@ pub(super) fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
             walk(operand, visit);
             walk(array, visit);
         }
+        Expr::Subscript { operand, index, .. } => {
+            walk(operand, visit);
+            walk(index, visit);
+        }
         Expr::Case {
             branches,
             otherwise,
@@ -962,6 +970,10 @@ fn walk_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr) -> Result<()>) ->
         Expr::AnyArray { operand, array } => {
             walk_mut(operand, visit)?;
             walk_mut(array, visit)?;
+        }
+        Expr::Subscript { operand, index, .. } => {
+            walk_mut(operand, visit)?;
+            walk_mut(index, visit)?;
         }
         Expr::Case {
             branches,
