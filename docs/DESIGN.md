@@ -153,7 +153,9 @@ expose both as metrics so the stall is visible, never mysterious.
 
 ### 4.5 SST format (*fixed*, version 1)
 
-Block-based table: data blocks (4 KiB *default*) with prefix-compressed entries and restart points every
+Block-based table: data blocks (4 KiB *default* on local disk, **16 KiB when the database's SSTs
+are tiered** — a block is one ranged `GET` there rather than a page-cache read, measured in
+`docs/bench/phase-11-engine.md` §3) with prefix-compressed entries and restart points every
 16 entries; an index block (one entry per data block: separator key → block handle); a filter block
 (bloom, 10 bits/key *default*, built over the prefix-extracted key when the CF has a prefix extractor);
 a properties block (entry count, raw sizes, smallest/largest key, creation seqno range, format version);
@@ -799,7 +801,7 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
 |---|---|
 | WAL block | 32 KiB (fixed) |
 | memtable | 64 MiB, max 4 immutables |
-| SST data block / restart interval | 4 KiB / 16 |
+| SST data block / restart interval | 4 KiB local, 16 KiB tiered / 16 |
 | bloom | 10 bits/key, prefix-extracted for versioned CFs |
 | L0 trigger / slowdown / stop | 4 / 8 / 12 files |
 | L1 base / multiplier / levels | 64 MiB / 10 / 7 |

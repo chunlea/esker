@@ -26,7 +26,9 @@ use std::time::{Duration, Instant};
 
 use esker_base::rng::Pcg32;
 use esker_engine::batch::WriteBatch;
-use esker_engine::options::{CfOptions, Options, ReadOptions, WalSyncMode, WriteOptions};
+use esker_engine::options::{
+    BlockSize, CfOptions, Options, ReadOptions, WalSyncMode, WriteOptions,
+};
 use esker_engine::{Db, cf};
 
 /// One of the workloads: six over the engine, two over the placement driver.
@@ -422,7 +424,7 @@ fn run_in(options: &Run, dir: &Path) -> Result<Report, String> {
                     .unwrap_or(CfOptions::default().target_file_size),
                 block_size: options
                     .block_size
-                    .unwrap_or(CfOptions::default().block_size),
+                    .map_or(CfOptions::default().block_size, BlockSize::Fixed),
                 ..CfOptions::default()
             },
             ..Options::default()

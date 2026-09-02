@@ -185,15 +185,26 @@ says that is the wrong shape:
 `docs/plans/phase-11-engine.md` §5 said a configuration option nobody can choose correctly is a
 liability rather than a feature. This is one. **Nothing was added.**
 
-### What to do instead, which the numbers do support
+### What the numbers did change: the tiered default (U6)
 
-**16 KiB is the better default for a tiered column family** and 64 KiB is defensible: both are
-strictly better than 4 KiB on this fixture in *both* workloads, and 16 KiB is the peak for point
-reads. That is a change to `defaults::BLOCK_SIZE` (or a per-CF recommendation for tiered families),
-it is a format decision for the files a database writes rather than a read-side one, and it is
-**not this lane's to make**: it changes the shape of every SST a non-tiered database writes too,
-and the local-disk numbers for those sizes are not in this table. Recorded here as the finding,
-with the measurement attached, for whoever picks it up.
+The measurement said 4 KiB is a poor default *when the SSTs are tiered*, and phase 11 U6 acted on
+it. `defaults::TIERED_BLOCK_SIZE` is **16 KiB** and applies to a database whose filesystem has a
+tier; the local default stays at 4 KiB, untouched.
+
+16 KiB rather than 64 KiB, which is faster still for scans: the point-read column is already flat
+between them (2,284 against 2,151, one run each — not a difference this table can resolve), and
+256 KiB shows where flat ends. Between two sizes that are within noise for point reads, the smaller
+one wastes fewer bytes on the read that only wanted one key.
+
+It is expressed as `BlockSize::Storage` versus `BlockSize::Fixed(n)` rather than as a different
+default number, so that a caller who deliberately asks for 4 KiB on tiered storage still gets it.
+Overriding a value "when it happens to equal the default" would make an explicit choice
+indistinguishable from no choice — `dd182cb`'s bug in a different field.
+
+The end-to-end effect, from `tests/tiered_block_size.rs` rather than from this bench: the same
+4,000 keys come to **54 data blocks at 4 KiB and 14 at 16 KiB**, a 3.9× reduction against the 4×
+the size ratio predicts. A data block is one ranged `GET`, so that count *is* what a cold scan
+costs.
 
 ### The honest limits of this table
 

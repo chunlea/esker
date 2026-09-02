@@ -498,7 +498,7 @@ impl Db {
     /// `esker.table-cache-evictions`, `esker.compactions`, `esker.compactions-running`,
     /// `esker.bloom-skips`, `esker.bloom-probes`,
     /// `esker.mem-table-size.<cf>`, `esker.num-immutable-mem-table.<cf>`,
-    /// `esker.oldest-log.<cf>`, `esker.num-files-at-level<n>.<cf>`.
+    /// `esker.oldest-log.<cf>`, `esker.block-size.<cf>`, `esker.num-files-at-level<n>.<cf>`.
     pub fn property(&self, name: &str) -> Option<String> {
         let inner = &self.inner;
         match name {
@@ -548,6 +548,11 @@ impl Db {
                                 .map_or(mem.active_log, |(_, log)| *log)
                                 .to_string(),
                         )
+                    }
+                    "esker.block-size" => {
+                        // The *resolved* size, which is the only interesting one: the option can
+                        // say `Storage`, and what that means depends on the filesystem.
+                        Some(inner.table_options(&cf).block_size.to_string())
                     }
                     other => {
                         let level: usize = other

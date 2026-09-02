@@ -328,6 +328,48 @@ impl Default for Options {
     }
 }
 
+/// Bytes in an SST data block, or an instruction to work it out from where the SSTs live.
+///
+/// # Why this is not a `usize`
+///
+/// The right block size depends on the storage underneath, and the two answers are far apart. On
+/// local disk a block is a page-cache read and 4 KiB is right. Tiered into object storage a block
+/// is **one ranged `GET`** — `fs::tier::TieredFile::read_at` issues exactly one per call — so the
+/// block size is the round-trip granularity of every cold read, and 4 KiB makes a scan pay a
+/// round trip per 4 KiB of it.
+///
+/// A plain `usize` cannot express "I have no opinion, use whatever suits the storage". Defaulting
+/// it to 4 KiB and then overriding the value *when it happens to equal the default* would silently
+/// ignore a caller who deliberately asked for 4 KiB on a tiered database — which is
+/// [`super::WalSyncMode`]'s bug in a different field, and `dd182cb` is the commit that fixed it
+/// there: "a bool cannot say no opinion, so the sync policy decided nothing". This is the same
+/// missing state, given a name before it can cost anything.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BlockSize {
+    /// Let the storage decide: [`defaults::BLOCK_SIZE`] on local disk,
+    /// [`defaults::TIERED_BLOCK_SIZE`] when this database's SSTs are tiered.
+    #[default]
+    Storage,
+    /// Exactly this many bytes, wherever the SSTs live. Never overridden.
+    Fixed(usize),
+}
+
+impl BlockSize {
+    /// The size in bytes, given whether this database's SSTs are tiered.
+    ///
+    /// Resolved per **database** rather than per family, because tiering is a property of the
+    /// filesystem the whole database was opened on (`fs::FileSystem::tier`) and not of one family.
+    /// A future per-family tier would change this signature and nothing else.
+    #[must_use]
+    pub fn resolve(self, tiered: bool) -> usize {
+        match self {
+            Self::Storage if tiered => defaults::TIERED_BLOCK_SIZE,
+            Self::Storage => defaults::BLOCK_SIZE,
+            Self::Fixed(bytes) => bytes,
+        }
+    }
+}
+
 /// How one column family stores its data.
 #[derive(Debug, Clone)]
 pub struct CfOptions {
@@ -337,8 +379,8 @@ pub struct CfOptions {
     pub memtable_slowdown: usize,
     /// Immutable memtables at which writers are stopped.
     pub memtable_stop: usize,
-    /// Uncompressed size of an SST data block.
-    pub block_size: usize,
+    /// Uncompressed size of an SST data block, or [`BlockSize::Storage`] to suit the storage.
+    pub block_size: BlockSize,
     /// Entries between restart points inside a block.
     pub restart_interval: usize,
     /// Bloom filter bits per key; zero disables the filter.
@@ -370,7 +412,7 @@ impl Default for CfOptions {
             write_buffer_size: defaults::WRITE_BUFFER_SIZE,
             memtable_slowdown: defaults::MEMTABLE_SLOWDOWN,
             memtable_stop: defaults::MEMTABLE_STOP,
-            block_size: defaults::BLOCK_SIZE,
+            block_size: BlockSize::Storage,
             restart_interval: defaults::RESTART_INTERVAL,
             bloom_bits_per_key: defaults::BLOOM_BITS_PER_KEY,
             prefix_extractor: None,
@@ -426,6 +468,28 @@ pub mod defaults {
 
     /// Uncompressed size of an SST data block.
     pub const BLOCK_SIZE: usize = 4 * 1024;
+
+    /// SST data block for a database whose SSTs are **tiered** into object storage.
+    ///
+    /// Four times the local default, because a block is one ranged `GET` there rather than a
+    /// page-cache read. Measured in `docs/bench/phase-11-engine.md` §3, against `MinIO` over
+    /// loopback with a cold local cache, 50,000 operations of 100-byte values:
+    ///
+    /// | block | `readrandom` | ranged GETs | `readseq` | ranged GETs |
+    /// |---|---|---|---|---|
+    /// | 4 KiB | 2,044 ops/s | 50,004 | 67,894 ops/s | 1,393 |
+    /// | **16 KiB** | **2,284 ops/s** | 50,004 | 280,552 ops/s | 349 |
+    /// | 64 KiB | 2,151 ops/s | 50,004 | 823,364 ops/s | 91 |
+    /// | 256 KiB | 1,420 ops/s | 50,004 | 1,000,615 ops/s | 26 |
+    ///
+    /// A point read is one `GET` at every size — it touches one block — so the size cannot buy it
+    /// a round trip and can only change how many bytes that trip carries. A scan's `GET` count
+    /// falls exactly in proportion. 16 KiB is the point-read peak and is better than 4 KiB in
+    /// both columns; 64 KiB is faster still for scans and this default does not take it, because
+    /// the point-read column is already flat there and 256 KiB shows where flat ends — a 34%
+    /// regression and a 6× worse p99. Between two sizes that are within noise for point reads,
+    /// the smaller one wastes less on the read that only wanted one key.
+    pub const TIERED_BLOCK_SIZE: usize = 16 * 1024;
 
     /// Entries between restart points in a data block.
     pub const RESTART_INTERVAL: usize = 16;

@@ -458,10 +458,16 @@ impl DbInner {
 
     /// How a column family's tables are built and read. The same options must be used for
     /// both, which is why there is one function producing them.
+    ///
+    /// This is where [`crate::options::BlockSize::Storage`] becomes a number, and it is the right
+    /// place because it is the one function that sees both the family's options and the
+    /// filesystem underneath. A reader never consults `block_size` — a table's real block bounds
+    /// come from its own index — so resolving it differently than the file was written with
+    /// changes nothing about reading that file. Only the *next* table written is affected.
     pub(crate) fn table_options(&self, cf: &ColumnFamily) -> TableOptions {
         let options = cf.options();
         TableOptions {
-            block_size: options.block_size,
+            block_size: options.block_size.resolve(self.fs.tier().is_some()),
             restart_interval: options.restart_interval,
             bloom_bits_per_key: options.bloom_bits_per_key,
             // The filter goes over the user key inside the internal key; see
