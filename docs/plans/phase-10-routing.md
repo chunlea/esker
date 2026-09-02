@@ -337,6 +337,18 @@ changes. DESIGN.md §16's "Not built here" paragraph loses planner routing and `
   green test that proved nothing (phase 6b's lesson: *"a test that passed too easily hid an idle-CF
   WAL pin"*). Every differential asserts, per query, that the routed plan *was* columnar.
 * **PD placement takes seconds.** Every wait is on an observable.
+* **A region a store does not replicate has no `ReadIndex` round to run.** §2's change makes the
+  round unconditional for a *running* peer; a store holding a region's record without a Raft peer
+  for it has nothing to ask, and answers from whatever its copy holds. `TooFarBehind` is the wrong
+  word for that state — it means *another replica may be closer* — and no reason on the wire means
+  "not part of the group". A placed learner is never in that state for long, and what constructs it
+  deliberately is a harness with no consensus in it (`esker-store/tests/schema_fetch.rs`). Closing
+  it needs a fourth `RefusalReason`, which is a wire change and therefore an ADR of its own.
+* **§2's `ReadIndex` change is pinned by U5, not by U1.** The assertion that would fail without it
+  needs a real Raft group with a real columnar learner — the differential's harness — and a
+  bespoke one in `esker-store` would be that harness written twice. U5 asks a fragment at
+  `min_apply_index = 0` for a commit made microseconds earlier, which is exactly what the guarded
+  version could miss.
 * **The rebase.** The type lane is editing `parse/lower.rs`, `plan/expr.rs` and `exec/query.rs` on
   `main`; this lane's hunks in those three files are kept to the smallest that will compile.
 

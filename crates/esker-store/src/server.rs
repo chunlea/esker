@@ -2403,9 +2403,18 @@ impl Store {
         // *wait*. `min_apply_index` is what tells the two apart, so it is satisfied before
         // anything is read (ADR 0022 Decision 4). Found by the differential, which asked a learner
         // the instant PD placed it.
-        if request.min_apply_index > 0
-            && let Some(refusal) = self.catch_up(&state, request.min_apply_index).await
-        {
+        //
+        // **Unconditional, including for `min_apply_index = 0`.** It was guarded by `> 0` until
+        // milestone 4, which made the default value the *unsafe* one: a caller with no Raft index
+        // to name got no round at all and was answered from whatever the learner happened to hold.
+        // A SQL node is exactly that caller — it holds a snapshot `ts` and a region id, and the
+        // leader's commit index is not a number it can compute — and it does not need to be. The
+        // round is the mechanism: a transaction the client has been told committed was committed
+        // on the leader *before* this statement's `ts` was allocated, so the leader's commit index
+        // when the fragment arrives is at or past that entry, and waiting for it covers every
+        // commit visible at `ts`. ADR 0022 Decision 4 states the round unconditionally for this
+        // reason (`docs/plans/phase-10-routing.md` §2).
+        if let Some(refusal) = self.catch_up(&state, request.min_apply_index).await {
             return Ok(refusal);
         }
 
@@ -2447,7 +2456,16 @@ impl Store {
         }
     }
 
-    /// Waits for this peer to have applied `min_apply_index`, or says why it will not.
+    /// Brings this peer up to the leader's commit index, and then to `min_apply_index` on top of
+    /// it, or says why it will not.
+    ///
+    /// **The round always runs.** `min_apply_index` is a *floor a caller can name*, not the
+    /// trigger: the freshness a fragment needs comes from the `ReadIndex` round itself, which
+    /// `read_index_as_learner` returns from only once the state machine has applied through the
+    /// index it established. A caller with a number asks for at least that much as well; a caller
+    /// with none — a SQL node, which has a snapshot `ts` and no way to turn it into a Raft index —
+    /// passes zero and is still answered from a state that includes every commit it could have
+    /// been told about.
     ///
     /// `read_index_as_learner` rather than `read_index`, because the row path's version refuses on
     /// a peer that does not lead — right for a row read, which only a leader serves, and wrong for
@@ -2459,26 +2477,37 @@ impl Store {
     ) -> Option<esker_proto::fragment::FragmentResp> {
         use esker_proto::fragment::RefusalReason;
 
+        // **A named limit, not an oversight.** A region this store holds the record for but does
+        // not replicate has no peer to run a round with, so there is no freshness to establish and
+        // the copy answers with whatever it holds. `TooFarBehind` would be the wrong word for it —
+        // that reason means *another replica may be closer*, and this store is not behind a stream,
+        // it is not receiving one — and no reason on the wire means "not part of the group". A
+        // placed learner is never in this state for long; what constructs it deliberately is a
+        // harness with no consensus in it (`esker-store/tests/schema_fetch.rs`, which says so).
+        // Named in `docs/plans/phase-10-routing.md` §5 rather than left here to be discovered.
         let peer = state.peer()?;
+        let index = match peer.read_index_as_learner().await {
+            Ok(index) => index,
+            Err(error) => {
+                return Some(refused(
+                    RefusalReason::TooFarBehind,
+                    format!("could not reach the leader to catch up: {error}"),
+                ));
+            }
+        };
+        // The round has already waited for the index it established. What is left is the caller's
+        // own floor, which can be higher than the leader's commit index when the caller learned it
+        // somewhere this peer has not caught up to.
         if peer.applied_index() >= min_apply_index {
             return None;
         }
-        match peer.read_index_as_learner().await {
-            // The round only tells this peer how far it must be; having *reached* it is what the
-            // call waits for, so an index still short of the bound is a peer that is behind.
-            Ok(_) if peer.applied_index() >= min_apply_index => None,
-            Ok(index) => Some(refused(
-                RefusalReason::TooFarBehind,
-                format!(
-                    "applied {} of the {min_apply_index} asked for, at read index {index}",
-                    peer.applied_index()
-                ),
-            )),
-            Err(error) => Some(refused(
-                RefusalReason::TooFarBehind,
-                format!("could not reach the leader to catch up: {error}"),
-            )),
-        }
+        Some(refused(
+            RefusalReason::TooFarBehind,
+            format!(
+                "applied {} of the {min_apply_index} asked for, at read index {index}",
+                peer.applied_index()
+            ),
+        ))
     }
 
     /// This region's columnar copy, created on first ask.

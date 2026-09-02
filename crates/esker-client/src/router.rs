@@ -158,6 +158,29 @@ impl Router {
         self.transport.max_frame_size()
     }
 
+    /// The transport, for a caller in this crate that addresses a **peer** rather than a region.
+    ///
+    /// [`Router::call`] sends to [`Route::target`], which is the believed *leader*; a fragment
+    /// goes to a columnar learner, which is the one peer that is never it
+    /// (`crates/esker-client/src/fragment.rs`). Everything else that call does — the cache, the
+    /// resolver, the clock, the in-flight gate — is shared through the three accessors here
+    /// rather than copied, so there is still one region cache and one bound on calls in flight.
+    pub(crate) fn transport(&self) -> &Arc<dyn StoreTransport> {
+        &self.transport
+    }
+
+    /// The in-flight bound, so a caller that does not go through [`Router::call`] is still
+    /// counted by it.
+    pub(crate) fn gate(&self) -> &Gate {
+        &self.gate
+    }
+
+    /// The backoff jitter, so two loops in this crate draw from one generator and a seeded
+    /// client stays reproducible whichever loop ran.
+    pub(crate) fn jitter(&self) -> &Jitter {
+        &self.jitter
+    }
+
     /// A scan limit the transport can actually answer.
     #[must_use]
     pub fn bounded_limit(&self, limit: u32, default: u32) -> u32 {
@@ -298,7 +321,7 @@ impl Router {
     /// cost the caller something: a hit, a `GetRegion` that says no region covers the key —
     /// terminal, because waiting does not create one — and a `GetRegion` that could not be
     /// answered, which is the caller's to classify and usually to retry.
-    fn route(&self, key: &[u8]) -> std::result::Result<Route, ProtoError> {
+    pub(crate) fn route(&self, key: &[u8]) -> std::result::Result<Route, ProtoError> {
         if let Some(route) = self.cache.lookup(key) {
             return Ok(route);
         }
@@ -317,7 +340,7 @@ impl Router {
     }
 
     /// Applies what a redirectable refusal said to fix.
-    fn repair(&self, redirect: &Redirect, region_id: u64) {
+    pub(crate) fn repair(&self, redirect: &Redirect, region_id: u64) {
         match redirect {
             Redirect::Leader { hint } => self.cache.set_leader(region_id, *hint),
             Redirect::Epoch { replacements } if replacements.is_empty() => {

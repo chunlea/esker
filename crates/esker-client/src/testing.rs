@@ -37,6 +37,8 @@ use crate::wire::{
     Response, TxnKvReq, TxnKvResp, routing_key,
 };
 
+pub use esker_proto::fragment::FragmentResp;
+
 /// The `TxnKv` body of a request, when it has one.
 #[must_use]
 fn txn_body(request: &Request) -> Option<&TxnKvReq> {
@@ -144,6 +146,13 @@ pub enum Outcome {
     Reply(RawKvResp),
     /// Answer with this `TxnKv` body (`docs/DESIGN.md` §8).
     TxnReply(TxnKvResp),
+    /// Answer a fragment (`docs/adr/0022-columnar-learner-replica.md` Decision 3).
+    ///
+    /// A [`FragmentResp::Refused`] goes here rather than in [`Outcome::Fail`], because that is
+    /// where a real store puts it: a refusal is a *response* variant and not an error frame, and a
+    /// fake that raised it as an error would let a client pass its tests by treating a normal
+    /// answer as a fault.
+    FragmentReply(FragmentResp),
     /// Answer a `Prewrite` with "every key locked", sized from the request.
     ///
     /// A `Prewrite` answers one status per mutation
@@ -171,6 +180,7 @@ impl Outcome {
         match self {
             Self::Reply(response) => Ok(Response::RawKv(response)),
             Self::TxnReply(response) => Ok(Response::TxnKv(response)),
+            Self::FragmentReply(response) => Ok(Response::Fragment(response)),
             Self::PrewriteOk => {
                 let count = match txn_body(request) {
                     Some(TxnKvReq::Prewrite { mutations, .. }) => mutations.len(),
