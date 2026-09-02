@@ -1,0 +1,33 @@
+crates/esker-sql/src/catalog/mod.rs
+  s_dc640bf0df4adb::t_a684c9384b075f 44
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_dc640bf0df4adb::t_9789307bf992b7 81-83,97,105,120,137-138,191,216,265-266
+crates/esker-sql/src/catalog/pg_constraint.rs
+  s_dc640bf0df4adb::t_ea3d78db6ecd50 1-235
+crates/esker-sql/src/exec/cursor.rs
+  s_dc640bf0df4adb::t_15c8c8de43d8f7 1044-1049
+crates/esker-sql/src/plan/expr.rs
+  s_dc640bf0df4adb::t_a68dd094cb78e3 238-242,262-264,276,293,302-305
+crates/esker-sql/tests/activerecord_surface.rs
+  s_dc640bf0df4adb::t_ebfa10c55a2d5f 98-111
+crates/esker-sql/tests/corpus/pg19_catalog_constraint.txt
+  s_dc640bf0df4adb::t_8d9c901424ad25 1-68
+crates/esker-sql/tests/pg_catalog_constraint.rs
+  s_dc640bf0df4adb::t_305e2e95834b76 1-144
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "414d8f025a4af99e74a8f5d1759ae0eb79c78b07",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
