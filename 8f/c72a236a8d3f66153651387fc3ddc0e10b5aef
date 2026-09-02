@@ -1,0 +1,27 @@
+crates/esker-cli/src/args.rs
+  s_5887b8dc15d0eb::t_01bfd5d2e995f3 64-72,176-178,244-257,324,669-716
+crates/esker-cli/src/main.rs
+  s_5887b8dc15d0eb::t_cee22fe2f7b388 19,43-58,141
+crates/esker-cli/src/reconcile.rs
+  s_5887b8dc15d0eb::t_9dde3a1d429e50 1-634
+crates/esker-cli/src/sst_store.rs
+  s_5887b8dc15d0eb::t_ea6c6950a86327 69-90
+docs/plans/debt-c4.md
+  s_5887b8dc15d0eb::t_f7fbe0663a8e9d 195-227
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "8fc72a236a8d3f66153651387fc3ddc0e10b5aef",
+  "prompts": {},
+  "sessions": {
+    "s_5887b8dc15d0eb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a3f26108-d8c6-4ca4-8418-c2dce63dbbae",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
