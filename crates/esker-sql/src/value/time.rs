@@ -20,7 +20,6 @@
 //! Both are measured, in `tests/corpus/pg19_time.txt`.
 
 use crate::error::{Result, SqlError};
-use crate::value::{ColumnType, PgType as _};
 
 /// Microseconds in one second, minute, hour and day.
 const MICROS_PER_SECOND: i64 = 1_000_000;
@@ -203,7 +202,10 @@ fn fraction_micros(text: &str) -> Option<i64> {
 
 fn invalid(text: &str) -> SqlError {
     SqlError::InvalidDatetimeFormat {
-        ty: ColumnType::Time.name(),
+        // **`time`, not `time without time zone`**: the input function's own name and not the
+        // type's long one, the same split `timestamp` makes at the same place. Measured — PG19
+        // answers `invalid input syntax for type time: "-01:00:00"`.
+        ty: "time",
         value: text.to_owned(),
     }
 }

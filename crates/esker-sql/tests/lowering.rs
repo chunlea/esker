@@ -62,7 +62,6 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
             "ALTER TABLE ... ADD COLUMN ... bigserial",
         ),
         ("CREATE TABLE t (a text COLLATE \"C\")", "COLLATE"),
-        ("CREATE TABLE t (a time)", "the type TIME"),
         (
             "CREATE TABLE t (a int8) PARTITION BY RANGE (a)",
             "PARTITION BY",

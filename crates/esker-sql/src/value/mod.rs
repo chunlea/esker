@@ -145,6 +145,12 @@ pub fn fit_to_typmod(value: Datum, ty: ColumnType, typmod: i32) -> Result<Datum>
             Some(precision) => Datum::Timestamp(timestamp::round_to_precision(*micros, precision)),
             None => value,
         },
+        // The same rounding one type over, and it may carry past the end of the day — which is a
+        // value here, so there is nothing to clamp: `23:59:59.9999` at `time(3)` is `24:00:00`.
+        (Datum::Time(micros), ColumnType::Time) => match precision_of_typmod(typmod) {
+            Some(precision) => Datum::Time(time::round_to_precision(*micros, precision)),
+            None => value,
+        },
         (Datum::TimestampTz(micros), ColumnType::TimestampTz) => {
             match precision_of_typmod(typmod) {
                 Some(precision) => {
@@ -188,6 +194,12 @@ pub fn format_type(ty: ColumnType, typmod: i32) -> String {
         },
         (ColumnType::TimestampTz, _) => match precision_of_typmod(typmod) {
             Some(precision) => format!("timestamp({precision}) with time zone"),
+            None => ty.name().to_owned(),
+        },
+        // `time(3) without time zone`, the same shape one type over. Measured, including
+        // `format_type(1083, 0)`, which is `time(0) without time zone` and not the bare name.
+        (ColumnType::Time, _) => match precision_of_typmod(typmod) {
+            Some(precision) => format!("time({precision}) without time zone"),
             None => ty.name().to_owned(),
         },
         // `numeric(10,2)`, and `numeric(11,-2)` — the scale is signed and prints signed.
@@ -574,6 +586,9 @@ impl PgDatum for Datum {
             (_, Datum::Null) => Ordering::Less,
             (Datum::Int8(a), Datum::Int8(b))
             | (Datum::TimestampTz(a), Datum::TimestampTz(b))
+            // Plain integer order, and only against another `time`: this type compares with
+            // nothing else, so there is no promotion arm to write beside it.
+            | (Datum::Time(a), Datum::Time(b))
             | (Datum::Timestamp(a), Datum::Timestamp(b)) => a.cmp(b),
             // Across the two widths, because PostgreSQL has an `int4 = int8` operator and answers
             // `1::integer = 1::bigint` with `t`. Widening is exact in this direction, so there is
@@ -621,9 +636,6 @@ impl PgDatum for Datum {
                 Datum::Double(f64::from(*a)).pg_cmp(&Datum::Double(numeric::as_f64(b)))
             }
             (Datum::Int4(a), Datum::Int4(b)) | (Datum::Date(a), Datum::Date(b)) => a.cmp(b),
-            // Plain integer order, and only against another `time`: this type compares with
-            // nothing else, so there is no promotion arm to write beside it.
-            (Datum::Time(a), Datum::Time(b)) => a.cmp(b),
             (Datum::Int2(a), Datum::Int2(b)) => a.cmp(b),
             (Datum::Int2(a), Datum::Int4(b)) => i32::from(*a).cmp(b),
             (Datum::Int4(a), Datum::Int2(b)) => a.cmp(&i32::from(*b)),
