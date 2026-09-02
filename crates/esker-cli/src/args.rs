@@ -202,6 +202,12 @@ Bench options:
       --sst-cache-bytes N
                         Local SST bytes the tier may keep; 0 is a cold cache. Needs
                         --sst-store
+      --adopt-sst-store Claim an --sst-store prefix that already holds objects but no
+                        claim marker, instead of refusing. A benchmark's database is a
+                        temporary directory, so its claim id is new every run and every
+                        re-run against a named prefix meets objects it did not write.
+                        Off by default: a benchmark pointed at a stale prefix should get
+                        a fresh one
       --remote HOST:PORT  Drive the workload over the network against a running
                         server instead of an in-process database. The engine
                         options above belong to that server and are ignored.
@@ -407,6 +413,11 @@ fn parse_bench(arguments: &[String]) -> Result<Command, ParseError> {
             options.sst_store = Some(take_value(arguments, &mut index, inline, "--sst-store")?);
             continue;
         }
+        if flag == "--adopt-sst-store" {
+            options.adopt_sst_store = true;
+            continue;
+        }
+
         if flag == "--sst-cache-bytes" {
             let raw = take_value(arguments, &mut index, inline, "--sst-cache-bytes")?;
             // Zero is the point of the flag — it is what makes the cache cold — so this
@@ -1354,6 +1365,28 @@ mod tests {
             parse(["bench", "--sst-store"]),
             Err(ParseError::MissingValue("--sst-store"))
         );
+    }
+
+    /// `bench` has the same switch as `server`, with the same default.
+    ///
+    /// Without it the refusal names a flag the command did not have, which is a dead end with
+    /// instructions on it — and it bites `bench` hardest, because a benchmark's database is a
+    /// temporary directory and its claim id is therefore new on every run.
+    #[test]
+    fn the_bench_takes_the_same_adoption_switch_as_the_server() {
+        let Command::Bench(options) = parse_ok(&["bench", "--sst-store", "s3://esker/tier"]) else {
+            panic!("expected a bench command");
+        };
+        assert!(
+            !options.adopt_sst_store,
+            "a benchmark adopts somebody else's objects by default"
+        );
+        let Command::Bench(options) =
+            parse_ok(&["bench", "--sst-store=s3://esker/tier", "--adopt-sst-store"])
+        else {
+            panic!("expected a bench command");
+        };
+        assert!(options.adopt_sst_store);
     }
 
     /// `--sst-store` on a server, and on a cluster where every node must get a *different*

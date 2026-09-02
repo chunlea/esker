@@ -230,6 +230,17 @@ pub(crate) struct Run {
     /// `Some(0)` keeps nothing, which is the cold-cache number `docs/bench/phase-6b.md`
     /// records. Ignored without `--sst-store`.
     pub(crate) sst_cache_bytes: Option<u64>,
+    /// Claim an `--sst-store` prefix that already holds objects but carries no claim marker.
+    ///
+    /// The same hatch `esker server` has, and needed here for a sharper reason: a benchmark's
+    /// database is a temporary directory, so its claim id is new on every run and *every* re-run
+    /// against a hand-named prefix meets objects it did not write. Without this flag the refusal
+    /// names `--adopt-sst-store` on a command that had no such flag, which is a dead end with
+    /// instructions on it ([ADR 0029](../../../docs/adr/0029-the-sst-store-claim.md)).
+    ///
+    /// Off by default, like everywhere else. A benchmark pointed at a stale prefix should get a
+    /// fresh one; this is for the run that meant to reuse the objects it can see.
+    pub(crate) adopt_sst_store: bool,
 }
 
 impl Default for Run {
@@ -250,6 +261,7 @@ impl Default for Run {
             remote: None,
             sst_store: None,
             sst_cache_bytes: None,
+            adopt_sst_store: false,
         }
     }
 }
@@ -344,7 +356,10 @@ fn run_in(options: &Run, dir: &Path) -> Result<Report, String> {
         dir,
         options.sst_cache_bytes,
         false,
-        crate::sst_store::Claim::default(),
+        crate::sst_store::Claim {
+            adopt: options.adopt_sst_store,
+            ..crate::sst_store::Claim::default()
+        },
     )?;
     let db = Db::open_with(
         dir,
@@ -683,6 +698,7 @@ mod tests {
             remote: None,
             sst_store: None,
             sst_cache_bytes: None,
+            adopt_sst_store: false,
         }
     }
 

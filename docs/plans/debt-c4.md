@@ -346,3 +346,49 @@ half is; the PD half is not** — `pd serve` still exposes no `PdOptions` field,
 `max_store_down_time_ms` among others, so `pdwrap` is still needed and the note says so rather than
 claiming a fix that does not exist.
 
+## 8. `esker bench` had no `--adopt-sst-store`
+
+Inventory #17. `docs/plans/debt-c1.md` §"What this lane did not do", bullet 2.
+
+`bench` passed `Claim::default()`, so `adopt` was false and a prefix holding objects with no marker
+was **refused** — with a message ending *"re-run with `--adopt-sst-store` to claim it"*, on a
+command that had no such flag. A dead end with instructions on it.
+
+It matters more for `bench` than for `server`, and for a reason `server` does not have: a
+benchmark's database is a **temporary directory**, so its claim id
+([ADR 0029](../adr/0029-the-sst-store-claim.md) decision 2 puts the id in the database's own
+directory) is new on every run. Every re-run against a hand-named prefix therefore meets objects it
+did not write, and every one of them hit that message.
+
+The flag is the same switch `server` has, off by default and for the same reason: a benchmark
+pointed at a stale prefix should get a fresh one. What changed is that the run which *did* mean to
+reuse what it can see now has the way to say so.
+
+Tested at both layers. The parse test asserts the default is off and both spellings set it.
+`crates/esker-cli/tests/tier_acceptance.rs::a_bench_is_refused_by_an_unclaimed_prefix_and_adopts_it_when_asked`
+drives the real binary against the container through all three states — a first run that claims the
+prefix, the marker removed and an object left behind, a second run refused with the flag named in
+its message, and the same run succeeding with the flag. Red with the flag parsed but not passed
+through to `Claim`:
+
+```
+the hatch did not open: ... re-run with --adopt-sst-store to claim it
+```
+
+which is the failure this unit is named for, reproduced by the one-line regression that would cause
+it.
+
+---
+
+## What this wave did not do
+
+* **`pd serve` still exposes no `PdOptions` field.** Unit 7 closed the `esker server` half of
+  `docs/bench/phase-4.md`'s wrapper note; `pdwrap` is still needed for `max_store_down_time_ms` and
+  the balance knobs, and the note says so rather than claiming otherwise. Not in this brief.
+* **`bench --remote` still resolves one static region**, which is the other half of that same note.
+* Three documents outside this lane's file list now say something stale, and are listed in this
+  lane's report as exact diffs for the coordinator rather than edited here:
+  `docs/plans/phase-4-pd.md` §12.3 bullet 3 (unit 5), `docs/plans/phase-4.md` §14.6 bullet 3
+  (unit 6), and `docs/plans/debt-c1.md` §"What this lane did not do" bullets 1 and 2 (units 3
+  and 8).
+

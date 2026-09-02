@@ -625,3 +625,110 @@ fn without_a_tier_the_same_deletion_leaves_a_store_that_cannot_open() {
          deleted — the SSTs held nothing, and the acceptance test above proves nothing"
     );
 }
+
+/// **`esker bench --adopt-sst-store`**, which is the hatch the refusal names.
+///
+/// A benchmark's database is a temporary directory, so its claim id is new on every run and every
+/// re-run against a hand-named prefix meets objects it did not write. Before this flag existed the
+/// refusal told the operator to *"re-run with `--adopt-sst-store`"* on a command that had no such
+/// flag — a dead end with instructions on it.
+///
+/// The prefix is left holding objects and no marker, which is what a pre-6c prefix looks like and
+/// what the refusal is written for.
+#[test]
+#[ignore = "needs a MinIO container; see the module docs"]
+fn a_bench_is_refused_by_an_unclaimed_prefix_and_adopts_it_when_asked() {
+    let bucket = env_or("ESKER_S3_BUCKET", "esker");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    let store_url = format!("s3://{bucket}/bench-adopt-{nanos:x}");
+
+    let run = |dir: &Path, adopt: bool| -> std::process::Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_esker-cli"));
+        command
+            .args(["bench", "fillrandom", "--num", "2000"])
+            .arg("--dir")
+            .arg(dir)
+            .arg(format!("--sst-store={store_url}"))
+            .env(
+                "ESKER_S3_ENDPOINT",
+                env_or("ESKER_S3_ENDPOINT", "http://localhost:19000"),
+            )
+            .env("ESKER_S3_KEY", env_or("ESKER_S3_KEY", "eskertest"))
+            .env("ESKER_S3_SECRET", env_or("ESKER_S3_SECRET", "eskertest123"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if adopt {
+            command.arg("--adopt-sst-store");
+        }
+        command.output().expect("the benchmark runs")
+    };
+
+    // The first run claims the prefix and writes into it.
+    let first = tempfile::tempdir().unwrap();
+    let output = run(first.path(), false);
+    assert!(
+        output.status.success(),
+        "the first run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The marker goes, and an object stays: a prefix with data and nothing saying whose it is,
+    // which is what a pre-6c prefix looks like from outside.
+    let (store, prefix) = plain_store(&store_url);
+    store
+        .put(&format!("{prefix}000004.sst"), b"somebody's sst")
+        .expect("the object store takes it");
+    store
+        .delete(&format!("{prefix}ESKER-CLAIM"))
+        .expect("the marker is removed");
+    assert!(
+        store.get(&format!("{prefix}ESKER-CLAIM")).is_err(),
+        "the marker survived the delete, so the refusal below would be the wrong one"
+    );
+
+    // A second run, from a different directory and therefore a different claim id, is refused —
+    // and the message names the flag.
+    let second = tempfile::tempdir().unwrap();
+    let output = run(second.path(), false);
+    assert!(
+        !output.status.success(),
+        "an unclaimed prefix was adopted silently"
+    );
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(text.contains("no claim marker"), "{text}");
+    assert!(text.contains("--adopt-sst-store"), "{text}");
+
+    // With the flag, the same run succeeds. That is the whole unit: the hatch the refusal names
+    // now exists on the command that prints it.
+    let third = tempfile::tempdir().unwrap();
+    let output = run(third.path(), true);
+    assert!(
+        output.status.success(),
+        "the hatch did not open: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// An `ObjectStore` for a whole `s3://bucket/prefix`, and the key prefix it resolves to.
+///
+/// The prefix comes back because [`ObjectStore`] keys are **whole** keys: the client does not
+/// prepend anything, `TieredFileSystem` does. Computing it here by hand is how the first draft of
+/// this test deleted nothing and then asserted on the wrong refusal.
+fn plain_store(store_url: &str) -> (Arc<dyn ObjectStore>, String) {
+    let endpoint =
+        esker_s3::Endpoint::parse(&env_or("ESKER_S3_ENDPOINT", "http://localhost:19000")).unwrap();
+    let config = esker_s3::Config::from_store_url(
+        store_url,
+        endpoint,
+        env_or("ESKER_S3_REGION", "us-east-1"),
+        esker_s3::Credentials::new(
+            env_or("ESKER_S3_KEY", "eskertest"),
+            env_or("ESKER_S3_SECRET", "eskertest123"),
+        ),
+    )
+    .unwrap();
+    let prefix = config.prefix.clone();
+    (Arc::new(esker_s3::S3Client::new(config)), prefix)
+}
