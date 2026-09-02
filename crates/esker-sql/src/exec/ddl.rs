@@ -122,6 +122,7 @@ pub(super) fn create_table(
             // writers that already exist (`docs/plans/phase-6e.md` §2).
             state: catalog::SchemaState::Public,
             state_since: 1,
+            predicate: None,
         });
     }
 
@@ -351,11 +352,19 @@ pub(super) fn create_index(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    // A predicate naming a column the table does not have is `42703` here, not an internal error
+    // at the first write — the same rule, and the same reason, as a `CHECK`'s.
+    if let Some(predicate) = &create.predicate {
+        let parsed = crate::parse::parse_predicate(predicate)?;
+        let scope = crate::exec::query::Scope::single(&table);
+        crate::exec::query::resolve(&parsed, &scope)?;
+    }
     let index = IndexDef {
         id: catalog::allocate_id(txn, executor.tenant)?,
         name,
         unique: create.unique,
         columns,
+        predicate: create.predicate.clone(),
         // Public the moment it is declared, because it is built inside this statement's own
         // transaction: no other node ever sees it half-made. That is what makes the plain form
         // correct and also what makes it `TODO(post-v1)` for a table large enough to matter — the

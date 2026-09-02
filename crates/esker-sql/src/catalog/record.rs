@@ -68,7 +68,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 6;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 7;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -670,6 +670,13 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         put_str(&check.name, &mut out);
         put_str(&check.expr, &mut out);
     }
+
+    // Version 7. The predicates come **after** the checks rather than beside each index, so that
+    // a version 6 record's bytes stay a prefix of a version 7 one's — the property every bump in
+    // this record has kept, and the only reason four old goldens still decode.
+    for index in &table.indexes {
+        put_str(index.predicate.as_deref().unwrap_or(""), &mut out);
+    }
     Ok(out)
 }
 
@@ -740,6 +747,8 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
             columns: index_columns,
             state,
             state_since,
+            // Filled after the loop, for version 7 and later.
+            predicate: None,
         });
     }
 
@@ -758,6 +767,14 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
     } else {
         Vec::new()
     };
+    // An empty string is "no predicate": a partial index whose `WHERE` was empty is not a thing
+    // the parser can produce, so the two cannot be confused.
+    if reader.version >= 7 {
+        for index in &mut indexes {
+            let predicate = reader.string()?;
+            index.predicate = (!predicate.is_empty()).then_some(predicate);
+        }
+    }
     reader.finish()?;
 
     Ok(TableDef {

@@ -71,9 +71,6 @@ CREATE TABLE tn (id int8 PRIMARY KEY, a numeric)
 statement error (0A000)
 CREATE TABLE public.q (id int8 PRIMARY KEY)
 
-statement error (0A000)
-CREATE INDEX ON t (a) WHERE a > 0
-
 
 # `ALTER TABLE ADD COLUMN` runs for a nullable column and for one with a **constant** default
 # (see alter_table.slt). What is left is what would need a row rewritten, and each is named rather

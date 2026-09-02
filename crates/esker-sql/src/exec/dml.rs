@@ -327,6 +327,12 @@ pub(super) fn write_row(
         if !index.state.written() {
             continue;
         }
+        // A **partial** index holds entries only for the rows its predicate admits, and "admits"
+        // is the same three-valued rule a `CHECK` uses in reverse: a row is in the index when the
+        // predicate is *true*, so a NULL keeps it out where a NULL keeps a `CHECK` happy.
+        if !index_admits(table, index, row)? {
+            continue;
+        }
         let columns: Vec<Datum> = index
             .columns
             .iter()
@@ -512,6 +518,26 @@ fn collect(
     Ok(rows)
 }
 
+/// Whether a partial index holds an entry for this row.
+///
+/// True for an index with no predicate, and for one whose predicate is **true** of the row. A
+/// NULL keeps the row out: `WHERE published_on IS NOT NULL` admits only rows where the predicate
+/// is true, and unknown is not true. That is the mirror of a `CHECK`, which admits everything the
+/// predicate does not make *false* — the two rules look alike and point opposite ways, which is
+/// why each says so where it is written.
+fn index_admits(table: &TableDef, index: &crate::catalog::IndexDef, row: &[Datum]) -> Result<bool> {
+    let Some(predicate) = &index.predicate else {
+        return Ok(true);
+    };
+    let parsed = crate::parse::parse_predicate(predicate)?;
+    let scope = query::Scope::single(table);
+    let resolved = query::resolve(&parsed, &scope)?;
+    Ok(matches!(
+        cursor::evaluate(&resolved, row)?,
+        Datum::Bool(true)
+    ))
+}
+
 /// Every `CHECK` on the table, against the row about to be written.
 ///
 /// **A NULL passes.** A `CHECK` fails only when its predicate is *false*, and SQL's three-valued
@@ -574,6 +600,10 @@ pub(super) fn remove_row(
         .collect();
 
     for index in &table.indexes {
+        // See the note below: a partial index is removed from only for a row it actually holds.
+        if !index_admits(table, index, row)? {
+            continue;
+        }
         // **Delete-only removes, and that is one state earlier than write-only inserts.** The
         // asymmetry is the whole reason there are four states rather than three: every node has to
         // be removing entries before any node starts creating them, or a node still at `Absent`
@@ -581,7 +611,11 @@ pub(super) fn remove_row(
         // table does not contain (ADR 0020, "skip delete-only").
         //
         // Deleting an entry that is not there costs one tombstone and is correct, which is what
-        // makes "remove first, ask later" affordable.
+        // makes "remove first, ask later" affordable — **for a whole index**. For a *partial* one
+        // it is not: two rows may share an index key when only one of them is in the index, and
+        // deleting on behalf of the one that is out would delete the entry belonging to the one
+        // that is in. The predicate is checked here for that reason, against the row being
+        // removed, and it is the only place in this file where "delete blindly" is wrong.
         if !index.state.maintained() {
             continue;
         }

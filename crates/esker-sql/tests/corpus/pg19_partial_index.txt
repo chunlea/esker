@@ -1,0 +1,33 @@
+# A **partial** index — statement 77 of `schema.rb`
+#
+# `CREATE UNIQUE INDEX … WHERE …`: entries exist only for the rows the predicate admits, so the
+# `UNIQUE` constrains only those rows and the rest may duplicate freely.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#
+# THE SEQUENCE IN THE MIDDLE IS THE WHOLE TEST, and it is why this file does more than create an
+# index: rows 2 and 3 both have `b = 7` and are admitted, because a NULL `published_on` keeps them
+# **out** of the index; row 4 has `b = 7` and a non-NULL, so it collides with row 1. Then an
+# `UPDATE` that moves row 2 *into* the index collides — until row 1 is moved out, after which the
+# same `UPDATE` succeeds. An index maintained on insert but not on update passes the first half
+# of that and fails the second.
+#
+# **A NULL keeps a row out**, which is the mirror of a `CHECK`: a check admits everything its
+# predicate does not make *false*, and a partial index admits only what its predicate makes
+# **true**. The two rules look alike and point opposite ways.
+#
+DROP TABLE IF EXISTS px		-
+CREATE TABLE px (id int8 PRIMARY KEY, b int8, published_on int8)		-
+CREATE UNIQUE INDEX px_partial ON px (b) WHERE published_on IS NOT NULL		-
+INSERT INTO px VALUES (1, 7, 100)		-
+INSERT INTO px VALUES (2, 7, NULL)		-
+INSERT INTO px VALUES (3, 7, NULL)		-
+INSERT INTO px VALUES (4, 7, 200)	!23505 duplicate key value violates unique constraint "px_partial" DETAIL: Key (b)=(7) already exists.
+SELECT id FROM px ORDER BY id	bigint	1 ; 2 ; 3
+SELECT id FROM px WHERE b = 7 ORDER BY id	bigint	1 ; 2 ; 3
+UPDATE px SET published_on = 300 WHERE id = 2	!23505 duplicate key value violates unique constraint "px_partial" DETAIL: Key (b)=(7) already exists.
+UPDATE px SET published_on = NULL WHERE id = 1		-
+UPDATE px SET published_on = 300 WHERE id = 2		-
+SELECT id, published_on FROM px ORDER BY id	bigint,bigint	1|\N ; 2|300 ; 3|\N
+CREATE INDEX px_bad ON px (b) WHERE nosuchcol > 1	!42703 column "nosuchcol" does not exist

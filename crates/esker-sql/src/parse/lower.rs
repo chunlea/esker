@@ -1092,7 +1092,7 @@ fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<plan::Crea
         "CREATE INDEX ... NULLS [NOT] DISTINCT",
     )?;
     refuse_if(!create.with.is_empty(), "CREATE INDEX ... WITH")?;
-    refuse_if(create.predicate.is_some(), "a partial index")?;
+
     refuse_if(
         !create.index_options.is_empty(),
         "CREATE INDEX with options",
@@ -1110,6 +1110,8 @@ fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<plan::Crea
         )?;
     }
     Ok(plan::CreateIndex {
+        // Kept as text and lowered per row, the same trade a `CHECK` makes.
+        predicate: create.predicate.as_ref().map(ToString::to_string),
         name: create.name.as_ref().map(object_name).transpose()?,
         table: relation_name(&create.table_name)?,
         columns: index_columns(&create.columns)?,

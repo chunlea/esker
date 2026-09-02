@@ -111,6 +111,10 @@ pub struct CreateIndex {
     /// plain form is still one transaction, which is correct for a small table and is the
     /// `TODO(post-v1)` for a large one.
     pub concurrently: bool,
+    /// `WHERE …`, which makes it a **partial** index. `None` for an ordinary one.
+    ///
+    /// See `crate::catalog::IndexDef::predicate`: maintained, and never chosen for a read.
+    pub predicate: Option<String>,
 }
 
 /// `DROP INDEX`.

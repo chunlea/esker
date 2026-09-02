@@ -10,7 +10,7 @@
 //! # What an oid is
 //!
 //! The id the catalog record already carries. Table and index ids come from one sequence per
-//! tenant ([`crate::catalog::record`]), so no two relations of one tenant can share one.
+//! tenant (`catalog::record`, which is private), so no two relations of one tenant can share one.
 //!
 //! | Relation | oid |
 //! |---|---|

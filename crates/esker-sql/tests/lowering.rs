@@ -89,7 +89,6 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
         ("CREATE TABLE s.t (a int8)", "the qualified name"),
         ("DROP TABLE t CASCADE", "DROP ... CASCADE"),
         ("CREATE INDEX i ON t USING hash (a)", "an index USING"),
-        ("CREATE INDEX i ON t (a) WHERE a > 0", "a partial index"),
         ("CREATE INDEX i ON t (lower(a))", "the index expression"),
         ("CREATE INDEX i ON t (a DESC)", "a DESC index column"),
         (

@@ -250,6 +250,18 @@ pub struct IndexDef {
     /// is measured in. It is written on every transition and read by the job, never by a read or a
     /// write of a row.
     pub state_since: u64,
+    /// `WHERE …` — a **partial** index, whose entries exist only for rows the predicate admits.
+    ///
+    /// Stored as text and lowered per row, the same trade [`CheckDef`] makes and for the same two
+    /// reasons: `pg_get_indexdef` needs the text anyway, and one string is an encoding the table
+    /// record already writes.
+    ///
+    /// A partial index is **maintained and never read**. Choosing one for a scan is only correct
+    /// when the query's own predicate implies the index's, and this crate has no implication
+    /// prover — a planner that picked it anyway would answer a correct-looking query with the
+    /// rows the index happens to hold, which is ADR 0020's "skip the backfill" anomaly arriving
+    /// by a different road. So it enforces its `UNIQUE` and never narrows a read.
+    pub predicate: Option<String>,
 }
 
 /// The name the internal row id column carries: **no name at all**.
@@ -1449,6 +1461,7 @@ mod tests {
                 columns: vec![1],
                 state: SchemaState::Public,
                 state_since: 1,
+                predicate: None,
             }],
             primary_key_name: "accounts_pkey".into(),
             schema_version: 1,
@@ -1474,7 +1487,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "06",               // catalog format version
+                "07",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -1526,7 +1539,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "06",                 // catalog format version
+                "07",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -1560,6 +1573,7 @@ mod tests {
                 "01",
                 "01", // one column, column 1
                 "00", // version 6: no CHECK constraints
+                "00", // version 7: the one index has no WHERE predicate
             )
         );
         assert_eq!(record::decode_table(&encoded).unwrap(), accounts(7));
@@ -1596,6 +1610,51 @@ mod tests {
             "01",
         ));
         assert_eq!(record::decode_table(&v2).unwrap(), accounts(7));
+    }
+
+    /// The **version 6** golden, kept for the same reason the five before it are.
+    ///
+    /// These are the bytes version 6 wrote — the record ends at the count of `CHECK` constraints,
+    /// with no index predicate after it. Every index reads back with none, which is what every
+    /// index a version 6 catalog could hold had: a partial index was `0A000` until version 7.
+    #[test]
+    fn a_version_6_table_record_still_decodes() {
+        let v6 = decode_hex(concat!(
+            "06",                 // catalog format version 6
+            "0700000000000000",   // table id 7
+            "086163636f756e7473", // varint 8, "accounts"
+            "0d6163636f756e74735f706b6579",
+            "01", // schema version 1
+            "02", // two columns
+            "026964",
+            "01",
+            "01",
+            "00",
+            "00",
+            "ffffffff",
+            "00",
+            "05656d61696c",
+            "02",
+            "00",
+            "00",
+            "00",
+            "ffffffff",
+            "00",
+            "01",
+            "00",                                     // primary key: one column, column 0
+            "01",                                     // one index
+            "0800000000000000",                       // index id 8
+            "126163636f756e74735f656d61696c5f6b6579", // "accounts_email_key"
+            "01",                                     // unique
+            "03",                                     // state: public
+            "01",                                     // entered at schema version 1
+            "01",
+            "01", // one column, column 1
+            "00", // no CHECK constraints -- and nothing after it
+        ));
+        let table = record::decode_table(&v6).unwrap();
+        assert_eq!(table, accounts(7));
+        assert!(table.indexes.iter().all(|index| index.predicate.is_none()));
     }
 
     /// The **version 5** golden, kept for the same reason the four before it are.
@@ -1991,6 +2050,7 @@ mod tests {
             columns: vec![0],
             state: SchemaState::Public,
             state_since: 1,
+            predicate: None,
         });
         replace_table(&mut *adding, 1, &accounts(1), &with_more).unwrap();
         adding.commit().unwrap();
@@ -2047,6 +2107,7 @@ mod tests {
             columns: vec![0],
             state: SchemaState::Public,
             state_since: 1,
+            predicate: None,
         });
         let error = replace_table(&mut *ddl, 1, &table, &clash).unwrap_err();
         assert_eq!(error.sqlstate(), sqlstate::DUPLICATE_TABLE);
@@ -2235,7 +2296,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "06",               // catalog format version
+                "07",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

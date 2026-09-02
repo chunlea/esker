@@ -1176,6 +1176,14 @@ fn access_path(filter: Option<&Expr>, tenant: u64, table: &TableDef) -> Result<N
         if !index.state.readable() {
             continue;
         }
+        // **A partial index is never read.** Choosing one is correct only when the query's own
+        // predicate implies the index's, and this crate has no implication prover — picking it
+        // otherwise would answer with the rows the index happens to hold, which is a correct
+        // looking query missing rows, the same anomaly `readable()` above exists to prevent. It
+        // still enforces its `UNIQUE`; it just never narrows a scan.
+        if index.predicate.is_some() {
+            continue;
+        }
         if !index.unique {
             continue;
         }
