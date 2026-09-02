@@ -1,0 +1,35 @@
+crates/esker-cli/src/args.rs
+  s_ba543800305a95::t_009adb480db627 14-15,214-216,439-441,520-545
+crates/esker-cli/src/bench.rs
+  s_ba543800305a95::t_18831721287ada 271-277,304,423-425,805
+docs/adr/0040-the-in-house-arena-skiplist.md
+  s_f3955267395e69::t_2e1abf2ceeaafc 1-205
+docs/bench/phase-11-engine.md
+  s_f3955267395e69::t_5148c51a680566 1-208
+docs/plans/phase-11-engine.md
+  s_f3955267395e69::t_d056824c914fca 227-229,232-235,444-569
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a8cfb4a57d3b0cd97284982b5c01666ca830e792",
+  "prompts": {},
+  "sessions": {
+    "s_ba543800305a95": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0605d-b122-7721-9a9e-cfeaa14e8774",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    },
+    "s_f3955267395e69": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f99c5188-2954-40ae-b928-dc5eaa3b622d",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
