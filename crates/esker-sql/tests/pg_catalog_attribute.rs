@@ -137,6 +137,60 @@ fn a_keyless_table_does_not_report_its_internal_row_id() {
     );
 }
 
+/// A **volatile** default is a row of `pg_attrdef` and an `atthasdef`, like any other.
+///
+/// Catalog record v5 records `DEFAULT CURRENT_TIMESTAMP` as a flag rather than a value, because a
+/// constant cannot express it — so a `pg_attrdef` built from `ColumnDef::default` alone reports no
+/// default at all for it, which is what this node did until the record grew the flag. Measured on
+/// 19beta1: `atthasdef` is `t` and the expression prints **unparenthesised**, unlike a computed
+/// default such as `DEFAULT 1 + 1`, which a real server prints as `(1 + 1)`.
+///
+/// **This node prints the canonical spelling for both of them.** PostgreSQL keeps the one the user
+/// wrote — `DEFAULT now()` prints `now()` — and catalog record v5 stores a bool, so the two cannot
+/// be told apart here. The value a row gets is identical either way, which is why one flag is the
+/// right record; the divergence is in the text alone and is asserted nowhere else, so it is stated
+/// here.
+#[test]
+fn a_volatile_default_is_reported_like_any_other() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE cv (id int8 PRIMARY KEY, made_at timestamp DEFAULT CURRENT_TIMESTAMP, \
+         plain text DEFAULT 'x', none int4)",
+    ]);
+
+    assert_eq!(
+        node.rows(
+            "SELECT adnum, pg_get_expr(adbin, adrelid) FROM pg_attrdef \
+             WHERE adrelid = 'cv'::regclass ORDER BY adnum"
+        ),
+        vec![vec!["2", "CURRENT_TIMESTAMP"], vec!["3", "'x'::text"]]
+    );
+    assert_eq!(
+        node.rows(
+            "SELECT attname, atthasdef FROM pg_attribute WHERE attrelid = 'cv'::regclass \
+             AND attnum > 0 ORDER BY attnum"
+        ),
+        vec![
+            vec!["id", "f"],
+            vec!["made_at", "t"],
+            vec!["plain", "t"],
+            vec!["none", "f"],
+        ]
+    );
+    // And `information_schema` reads the same expression, because it reads the same function.
+    assert_eq!(
+        node.rows(
+            "SELECT column_name, column_default FROM information_schema.columns \
+             WHERE table_name = 'cv' ORDER BY ordinal_position"
+        ),
+        vec![
+            vec!["id", "\\N"],
+            vec!["made_at", "CURRENT_TIMESTAMP"],
+            vec!["plain", "'x'::text"],
+            vec!["none", "\\N"],
+        ]
+    );
+}
+
 /// Every view in the registry refuses every write with `42501`, including the ones added here.
 ///
 /// Written over `CatalogView::ALL` rather than over a list of names, so a view added to the

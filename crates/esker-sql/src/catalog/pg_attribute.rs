@@ -55,6 +55,19 @@ use crate::value::{ColumnType, Datum, PgType};
 /// and what `ActiveRecord` would then treat as a missing column rather than an ordinary one.
 const NOT_IDENTITY: &str = "";
 
+/// How a volatile default prints.
+///
+/// **PostgreSQL keeps the spelling the user wrote**: a column declared `DEFAULT CURRENT_TIMESTAMP`
+/// prints `CURRENT_TIMESTAMP` and one declared `DEFAULT now()` prints `now()`, even though the two
+/// are the same function and `CURRENT_TIMESTAMP = now()` is `t`. Measured on 19beta1 — and the
+/// capture that landed with catalog record v5 says the opposite in its header while showing this in
+/// its own rows, so it is worth being explicit.
+///
+/// `ColumnDef::default_now` is a **bool**, so this node cannot tell the two spellings apart and
+/// prints the canonical one for both. Declared in `tests/pg_catalog_attribute.rs`; the *value* a
+/// row gets is identical either way, which is why one flag is still the right record.
+const CURRENT_TIMESTAMP: &str = "CURRENT_TIMESTAMP";
+
 /// `attcollation`: none, for every column of every type.
 ///
 /// A real server says `100` for a `text` column and `0` for an `int8` one, and its `pg_type` says
@@ -191,6 +204,13 @@ fn attribute(
 /// (measured — no `pg_attrdef` row and `atthasdef` `f`), a **`bigserial`** column's default is the
 /// `nextval` its sequence makes, and everything else is the stored constant.
 pub fn default_expression(column: &ColumnDef, table: &TableDef, at: usize) -> Option<String> {
+    // A **volatile** default, which catalog record v5 records as a flag rather than a value
+    // (`ColumnDef::default_now`) because a constant cannot express it. It prints unparenthesised,
+    // exactly as written — measured, and unlike a computed default such as `DEFAULT 1 + 1`, which
+    // a real server prints as `(1 + 1)`.
+    if column.default_now {
+        return Some(CURRENT_TIMESTAMP.to_owned());
+    }
     if let Some(sequence) = super::pg_relations::sequence_for(table, at) {
         return match sequence.identity {
             // `nextval('ca_id_seq'::regclass)`, exactly as a real server prints it — the cast
