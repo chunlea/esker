@@ -29,7 +29,9 @@ mod bind;
 mod cursor;
 mod ddl;
 mod dml;
+pub(crate) mod explain;
 mod flashback;
+mod fragment;
 mod job;
 
 pub use job::BATCH_ROWS;
@@ -117,6 +119,12 @@ pub struct Executor {
     block_read_only: bool,
     /// Where columnar placement is reported, on a node that has a placement driver.
     columnar: Option<Arc<dyn crate::pd::ColumnarReport>>,
+    /// Where this node sends fragments, or `None` for a node that cannot ask one.
+    ///
+    /// `None` is a real configuration and not a broken one — a cluster with no placement driver,
+    /// and every in-process test cluster in this crate — so a node without it plans every query on
+    /// rows and says so in `EXPLAIN` ([`crate::plan::routing::Reason::NoFragmentService`]).
+    fragments: Option<Arc<dyn crate::fragment::FragmentSource>>,
     /// Whether the open transaction has changed a table's columnar setting.
     ///
     /// Set by the `ALTER` and acted on **after the commit**, because what is reported is what the
@@ -163,6 +171,7 @@ impl Executor {
             open_used: false,
             block_read_only: false,
             columnar: None,
+            fragments: None,
             columnar_changed: false,
         }
     }
@@ -176,6 +185,27 @@ impl Executor {
     pub fn reporting_columnar_to(mut self, report: Arc<dyn crate::pd::ColumnarReport>) -> Self {
         self.columnar = Some(report);
         self
+    }
+
+    /// The same executor, able to ask a columnar learner to evaluate a plan fragment.
+    ///
+    /// Without one the planner still *decides* — and decides rows, naming the reason — so an
+    /// `EXPLAIN` on a node with no placement driver says why rather than saying nothing
+    /// (ADR 0022 milestone 4).
+    #[must_use]
+    pub fn asking_fragments_of(mut self, source: Arc<dyn crate::fragment::FragmentSource>) -> Self {
+        self.fragments = Some(source);
+        self
+    }
+
+    /// This session's `esker.engine`.
+    fn engine(&self) -> crate::plan::routing::Setting {
+        // The parameter is in the table, so `lookup` cannot fail; a session that never set it
+        // reads the boot value, which is `auto`.
+        crate::parameter::lookup("esker.engine").map_or_else(
+            |_| crate::plan::routing::Setting::default(),
+            |parameter| crate::plan::routing::Setting::parse(&self.parameter(parameter)),
+        )
     }
 
     /// Marks the open transaction as having changed a table's columnar setting.
@@ -634,7 +664,13 @@ impl Executor {
         // a `FROM` and is why that shape is refused rather than approximated.
         let resolved = self.resolve_sequence_calls(&*txn, select)?;
         let select = resolved.as_ref();
-        let planned = self.plan_select(txn, select)?;
+        let mut planned = self.plan_select(txn, select)?;
+        // The fragments, before the cursor: a `Cursor` has no way to make a network call, and
+        // running them here is what puts the fallback in the *same* transaction at the *same*
+        // snapshot as the plan it replaces.
+        if let Some(source) = self.fragments.clone() {
+            fragment::resolve(&mut planned.node, &*source, txn.start_ts());
+        }
         let mut cursor = cursor::Cursor::open(txn, self.tenant, &planned.node)?;
         let mut rows = Vec::new();
         while let Some(row) = cursor.next()? {
@@ -802,7 +838,24 @@ impl Executor {
             Some(join) => Some(self.require_table(txn, &join.table.name)?),
             None => None,
         };
-        query::plan(select, self.tenant, table.as_deref(), inner.as_deref())
+        let mut planned = query::plan(select, self.tenant, table.as_deref(), inner.as_deref())?;
+        // **After the row plan, never instead of it.** Routing is a rewrite of a plan that already
+        // exists and is already correct, which is what lets a refusal be answered by putting the
+        // original back (`crate::exec::fragment`). A join has no outer table to route and is left
+        // alone by `consider` in any case.
+        if let Some(table) = table.as_deref()
+            && inner.is_none()
+        {
+            fragment::route(
+                txn,
+                self.tenant,
+                table,
+                self.fragments.as_deref(),
+                self.engine(),
+                &mut planned,
+            );
+        }
+        Ok(planned)
     }
 
     /// `EXPLAIN`: the plan, as rows, and nothing run.

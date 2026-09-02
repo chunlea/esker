@@ -237,6 +237,30 @@ impl<'a> Cursor<'a> {
                 input: Box::new(Cursor::open(txn, tenant, input)?),
                 seen: BTreeSet::new(),
             },
+            // **Resolved before the cursor is opened, never here.** A columnar node's rows come
+            // from a network call to a columnar learner, which this type has no way to make and
+            // deliberately does not: everything a `Cursor` does happens inside one transaction
+            // against one store. `crate::exec::fragment::resolve` walks the plan first and leaves
+            // either the rows the fragments produced or the row plan they fell back to, so what
+            // reaches here is one of those two. A `Columnar` that did not is a bug in this crate
+            // and says so rather than answering an empty result, which is the one thing it must
+            // not do — an aggregate with no rows is a *number*, and zero would look like an answer.
+            Node::Columnar(columnar) => match &columnar.run {
+                // The fragments answered. Their finished rows are the aggregate's output rows,
+                // which is what makes the substitution exact.
+                Some(run) if run.rows.is_some() => {
+                    Kind::Rows(run.rows.clone().unwrap_or_default().into_iter())
+                }
+                // Something refused, so the rows answer — **in this transaction, at this
+                // snapshot**, which is what makes the fallback silent to the client and correct.
+                // The node stays in the plan so `EXPLAIN` can still say what was tried.
+                Some(_) => return Cursor::open(txn, tenant, &columnar.fallback),
+                None => {
+                    return Err(SqlError::Internal(
+                        "a columnar node reached the cursor without being resolved".to_owned(),
+                    ));
+                }
+            },
             Node::Limit {
                 input,
                 offset,

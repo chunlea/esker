@@ -175,6 +175,17 @@ impl Txn for StoreTxn {
         self.inner.as_ref().map_or(0, Transaction::start_ts)
     }
 
+    /// The client's own write buffer, which is where read-your-writes is served from.
+    ///
+    /// A transaction that has ended answers `true`, which is the conservative reading: nothing
+    /// reaches this through one, and "may have written" is the safe direction for a caller
+    /// deciding whether a *different machine* can answer its read.
+    fn has_written(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_none_or(|txn| !Transaction::is_empty(txn))
+    }
+
     /// **Not the trait's default.** The default is `false`, and taking it here was a real defect
     /// for as long as it stood: the executor's `25006` check asks this, so a write at a past
     /// snapshot was refused against the fake and not against a real cluster — where it instead

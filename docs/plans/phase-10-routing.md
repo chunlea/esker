@@ -189,22 +189,25 @@ pub struct Columnar {
 `Node` gains **one** variant, `Node::Columnar(Box<Columnar>)`. It carries its own fallback, which
 is what makes R2 structural: the node that fails is the node that knows what to run instead.
 
-### The `RowSpace`, which is how R1 is guaranteed by construction
+### One substitution, and how R1 is guaranteed by construction
 
-Two shapes, and the reason there are exactly two is that these are the two whose output row space
-is *identical* to a row node's:
+**Exactly one sub-plan shape is replaced**: `Aggregate { input: [Filter] { SeqScan } }`, by a
+`Node::Columnar` whose output row is the grouping keys followed by the aggregate values. That is
+*precisely* what `Node::Aggregate` produces and precisely what every expression above it was
+rewritten against, so the substitution is exact by construction rather than by care, and `Project`,
+`Sort`, `Limit` and `Distinct` above it are untouched. The filter sits *below* the aggregate, so it
+**must** be expressible or the whole substitution is declined (R3) — an aggregate pushed down
+without its filter aggregates the wrong rows.
 
-1. **`RowSpace::Table`** replaces a `SeqScan`. The fragment projects every column any node above
-   the scan reads; the executor materialises a row in the **table's full row space**, with the
-   projected columns in their table positions and the rest `Datum::Null`. Nothing above reads
-   those positions — that is what "any node above the scan reads" means, computed from the plan —
-   so the answer is bit-identical to the scan's. `Filter`, `Project`, `Sort` and `Limit` above are
-   untouched, which is a large part of why this is safe.
-2. **`RowSpace::Aggregate`** replaces a whole `Aggregate { input: [Filter] { SeqScan } }`. Its
-   output row is the grouping keys followed by the aggregate values, which is exactly what
-   `Node::Aggregate` produces and exactly what every expression above it was rewritten against.
-   The filter **must** be expressible in the fragment or the substitution is refused (R3), because
-   here the filter is *below* the aggregate and dropping it would aggregate the wrong rows.
+`HAVING` comes out of the aggregate and becomes a `Filter` above the substitution, **on both
+paths**. The two are the same operator over the same row, and moving it on both paths is what stops
+it being applied twice when the fallback runs.
+
+**A bare projection scan is deliberately not routed**, and the reason is memory rather than taste:
+a fragment returns its whole answer in one message, so a rows-output fragment is a whole region
+materialised on the SQL node and framed as one response, where the row path streams a page at a
+time. An aggregate's answer is one row per group, which is what makes it the shape that fits — and
+it is the shape ADR 0022 exists for. It is in §6 with the rest of what this phase does not do.
 
 ## 4. The units
 
@@ -349,6 +352,13 @@ changes. DESIGN.md §16's "Not built here" paragraph loses planner routing and `
   bespoke one in `esker-store` would be that harness written twice. U5 asks a fragment at
   `min_apply_index = 0` for a commit made microseconds earlier, which is exactly what the guarded
   version could miss.
+* **A region that split after its columnar copy was built.** `esker-store`'s columnar slot is per
+  region and nothing prunes it on a split, so a parent's copy may still hold rows the child now
+  owns — which a fragment to each would count twice. The **epoch pins it**: shards carry the epoch
+  the planner saw, a split bumps it, and the store refuses the stale one, so the query falls back
+  to rows rather than double-counting. What that leaves is a table that stops being routable until
+  the plan is rebuilt, which is a performance bound and not a wrong answer. A split-aware columnar
+  copy is `esker-store`'s and is not in this milestone.
 * **The rebase.** The type lane is editing `parse/lower.rs`, `plan/expr.rs` and `exec/query.rs` on
   `main`; this lane's hunks in those three files are kept to the smallest that will compile.
 
@@ -364,6 +374,11 @@ changes. DESIGN.md §16's "Not built here" paragraph loses planner routing and `
   and is untouched.
 * **No join, `DISTINCT` or `ORDER BY` push-down.** A fragment's output is scan/filter/project/
   aggregate; everything else runs above it, on the SQL node, over the rows it returned.
+* **No rows-output fragment**, so no bare `SELECT a, b FROM t` on columns — see the substitution
+  above. It is a memory bound rather than a missing feature, and lifting it needs a streamed or
+  paged fragment response, which is a wire change.
+* **No `LIMIT` push-down.** A `Filter` between the limit and the scan makes it wrong, and there is
+  no cardinality estimate to say when there is not one.
 * **No routing of a statement that writes**, and none inside a transaction that has written — ADR
   0022 Decision 2 rule 2, and the one refusal that is about correctness rather than capability.
 * **No second fragment format**, no change to `FragmentReq`, `FragmentResp` or the result format,

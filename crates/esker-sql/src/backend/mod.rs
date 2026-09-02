@@ -150,6 +150,20 @@ pub trait Txn: fmt::Debug + Send {
     /// new timestamp would export a moment nobody had looked at.
     fn start_ts(&self) -> u64;
 
+    /// Whether this transaction has already buffered a write.
+    ///
+    /// **The one rule in ADR 0022 Decision 2 that is about correctness rather than cost**: a
+    /// transaction that has written and then reads cannot be answered from a columnar learner at
+    /// all, because the learner has not seen an uncommitted write. Read-your-writes is served out
+    /// of the buffer this asks about, and a fragment goes to a different machine, which has none
+    /// of it.
+    ///
+    /// **No default**, for the reason [`Txn::is_read_only`] has none, and it is the same lesson: a
+    /// default that is right for the in-memory fake and silently wrong for a real cluster is
+    /// exactly the shape of a bug that passes every test in this crate and returns a wrong answer
+    /// against a store.
+    fn has_written(&self) -> bool;
+
     /// Whether this transaction may write.
     ///
     /// False for one opened by [`Backend::begin_at`]. The executor asks *before* it plans, so that
@@ -376,6 +390,10 @@ impl MemoryTxn {
 impl Txn for MemoryTxn {
     fn start_ts(&self) -> u64 {
         self.start_ts
+    }
+
+    fn has_written(&self) -> bool {
+        !self.buffer.is_empty()
     }
 
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {

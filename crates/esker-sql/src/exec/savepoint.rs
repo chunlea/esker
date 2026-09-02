@@ -204,6 +204,12 @@ impl Txn for Recording<'_> {
         self.inner.get(key)
     }
 
+    /// The transaction underneath's answer. A `Recording` is a lens over one, not a second buffer:
+    /// what it adds is the pre-image, and a write reaches the inner transaction either way.
+    fn has_written(&self) -> bool {
+        self.inner.has_written()
+    }
+
     fn scan(&self, start: &[u8], end: &[u8], limit: u32) -> Result<Vec<(Bytes, Bytes)>> {
         self.inner.scan(start, end, limit)
     }

@@ -1,0 +1,49 @@
+# What a real PostgreSQL 19beta1 does with `esker.engine`, the session override ADR 0022
+# Decision 2 rule 4 asks for -- `docs/plans/phase-10-routing.md` U2.
+#
+# Every line was produced by running the script against the `esker-pg19` container on :55432 and
+# recording either `ok` or the SQLSTATE and message it refused with. Nothing here was written from
+# the documentation, and four of the lines below are the reason that matters.
+#
+#   script <tab> ok                the last statement succeeded
+#   script <tab> !SQLSTATE msg     PostgreSQL refused it
+#
+# A script is `;`-separated and the answer is the **last** statement's; everything before it is
+# setup. `#` starts a comment and a blank line is ignored.
+#
+# WHAT THE CAPTURE FOUND, and each is a thing a plausible implementation gets wrong:
+#
+#   * **`SHOW` of a namespaced GUC is `42704` until the first `SET` in the session**, and after a
+#     `RESET` it is *not* `42704` again -- it is the **empty string**. So the "unrecognized"
+#     answer is reachable exactly once per session, before anything sets it. No reading of the
+#     documentation produces that asymmetry; only asking the server does.
+#   * **PostgreSQL validates no custom parameter's value, ever.** `SET esker.engine = 'sideways'`
+#     succeeds and `SHOW` hands `sideways` back. This node **refuses** it, which is a declared
+#     divergence in the direction `crate::parameter` takes for every row in its table: accepting a
+#     value this node will not act on is the one answer the contract forbids.
+#   * **the value keeps its case and the name does not.** `SET ESKER.ENGINE = 'AUTO'` sets
+#     `esker.engine`, and `SHOW esker.engine` answers `AUTO` -- not `auto`. This node folds the
+#     value, because it is an enum here and every enum in `crate::parameter` folds.
+#   * **an un-namespaced unknown name is `42704` on `SET` as well as on `SHOW`**, while any
+#     namespace at all is accepted: `SET nonesker.engine = 'row'` is fine and `SET engine = 'row'`
+#     is not.
+#
+# The `RESET` asymmetry ADR 0022's phase-8 amendment found for storage parameters holds here too:
+# `RESET esker.never_existed` is accepted, because `RESET` validates no name.
+
+SET esker.engine = 'row'; SHOW esker.engine	ok
+SET esker.engine = 'columnar'; SHOW esker.engine	ok
+SET esker.engine TO 'auto'; SHOW esker.engine	ok
+SET esker.engine = row; SHOW esker.engine	ok
+SET esker.engine = 'COLUMNAR'; SHOW esker.engine	ok
+SET esker.engine = 'sideways'	ok
+BEGIN; SET LOCAL esker.engine = 'columnar'; SHOW esker.engine	ok
+BEGIN; SET esker.engine = 'columnar'; ROLLBACK; SHOW esker.engine	ok
+BEGIN; SET esker.engine = 'row'; COMMIT; SHOW esker.engine	ok
+RESET esker.engine	ok
+SET esker.engine = DEFAULT	ok
+RESET esker.never_existed	ok
+SET nonesker.engine = 'row'	ok
+SET engine = 'row'	!42704 unrecognized configuration parameter "engine"
+SHOW esker.no_such_setting	!42704 unrecognized configuration parameter "esker.no_such_setting"
+SET esker.engine = 'row', 'columnar'	!22023 SET esker.engine takes only one argument

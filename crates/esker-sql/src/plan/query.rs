@@ -326,6 +326,14 @@ pub enum Node {
         /// NULL) and a **grouped** one is no rows at all. Measured, both ways.
         grouped: bool,
     },
+    /// An aggregate evaluated on columnar replicas, one fragment per region, finished here.
+    ///
+    /// **It stands exactly where a [`Node::Aggregate`] stood**, and produces exactly the row that
+    /// one produces — the grouping keys followed by the aggregate values — which is what lets
+    /// everything above it be untouched by the routing decision
+    /// ([`crate::plan::routing`], ADR 0022 milestone 4). It carries the row plan it falls back to,
+    /// so a refusal is answered by a field rather than by a branch somebody remembers.
+    Columnar(Box<crate::plan::routing::Columnar>),
     /// `SELECT DISTINCT`: the first row of each distinct value, in the order the input gave them.
     ///
     /// Distinctness is [`crate::value::PgDatum::pg_cmp`] equality, the same rule grouping uses, so
@@ -405,6 +413,9 @@ impl Node {
             | Node::Sort { input, .. }
             | Node::Limit { input, .. }
             | Node::Distinct { input } => input.row_names(columns),
+            // The row space of the aggregate it replaced, which is the whole point of the
+            // substitution: ask the plan it falls back to, because that *is* that aggregate.
+            Node::Columnar(columnar) => columnar.fallback.row_names(columns),
             _ => columns.to_vec(),
         }
     }
@@ -540,6 +551,12 @@ impl Node {
                 (name, Some(input), Some(extra))
             }
             Node::Distinct { input } => ("Unique".to_owned(), Some(input), None),
+            // Its own line and its own extras, in `crate::exec::explain`, which is the one place
+            // that knows how to say what a routing decision was and what it cost.
+            Node::Columnar(columnar) => {
+                let (name, extra) = crate::exec::explain::describe(columnar, columns);
+                (name, crate::exec::explain::child(columnar), Some(extra))
+            }
         }
     }
 

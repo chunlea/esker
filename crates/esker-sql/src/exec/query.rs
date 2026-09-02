@@ -257,6 +257,10 @@ pub(super) struct Planned {
     /// The table's column names, so `EXPLAIN` can print the names a user typed rather than the
     /// positions the executor resolved them to.
     pub(super) column_names: Vec<String>,
+    /// Which engine the planner chose and why, or `None` for a plan that was never considered for
+    /// one — a `SELECT` with no table, a catalog view. Filled in by `crate::exec::fragment::route`,
+    /// which is the only thing that decides one.
+    pub(super) engine: Option<crate::plan::routing::Decision>,
 }
 
 /// The access path and filter for every row of `table` a predicate matches — the half of a plan
@@ -419,14 +423,19 @@ pub(super) fn plan(
         node,
         columns,
         table: outer_table.map_or_else(|| "-".to_owned(), |table| table.name.clone()),
-        // Every column of every table in scope, in row order, so `EXPLAIN` can print the name a
-        // user typed for any position the executor resolved.
-        column_names: scope
-            .tables
-            .iter()
-            .flat_map(|table| table.columns.iter().map(|column| column.name.clone()))
-            .collect(),
+        column_names: scope_column_names(&scope),
+        engine: None,
     })
+}
+
+/// Every column of every table in scope, in row order, so `EXPLAIN` can print the name a user
+/// typed for any position the executor resolved.
+fn scope_column_names(scope: &Scope<'_>) -> Vec<String> {
+    scope
+        .tables
+        .iter()
+        .flat_map(|table| table.columns.iter().map(|column| column.name.clone()))
+        .collect()
 }
 
 /// The `ORDER BY` keys, resolved into whichever row space the sort will run over.

@@ -22,6 +22,7 @@ mod ddl;
 mod dml;
 mod expr;
 mod query;
+pub mod routing;
 mod session;
 mod time_machine;
 
@@ -36,6 +37,7 @@ pub use expr::{AggregateCall, AggregateFunc, BinaryOp, Expr, Literal, SequenceCa
 pub use query::{
     AggregateSpec, Join, JoinKind, Node, OrderItem, Probe, Select, SelectItem, SortKey, TableRef,
 };
+pub use routing::{Columnar, Decision, Engine, Reason, Setting};
 pub use session::SessionStatement;
 pub use time_machine::TimeMachineVerb;
 

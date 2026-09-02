@@ -14,6 +14,15 @@ esker-base.workspace = true
 # The transactional store this node reads and writes through. A workspace crate, so nothing on
 # the dependency budget moves: its own dependencies are the ones this crate already has.
 esker-client.workspace = true
+# **The fragment request's bytes, and nothing else.** There is one definition of them and it is
+# this crate's (`docs/plans/phase-8-learner.md` §wire: "One definition of fragment bytes, and it is
+# `esker-columnar`'s"), so a planner that builds a fragment has to link it. This reverses the
+# dev-only note that stood here until milestone 4, whose reason -- "the planner's columnar half is
+# a later milestone" -- expires at this milestone; the other half of that reason was about
+# `esker-proto`, which still must not link this crate and still does not. A workspace crate, so
+# the dependency budget does not move: its externals are `lz4_flex`, `thiserror` and `tracing`,
+# all already here (`docs/plans/phase-10-routing.md` §2).
+esker-columnar.workspace = true
 esker-keys.workspace = true
 # The wire types the client's constructors take (`TransportConfig`). Already in this crate's
 # graph through esker-client; naming it here is what lets the binary build one.
@@ -40,11 +49,6 @@ esker-store.workspace = true
 # does not depend on this crate, so there is no cycle. The same dependency `esker-store` and
 # `esker-client` take, for the same reason.
 esker-pd.workspace = true
-# The joint gate builds the fragment it sends and reads the answer back, so it needs the format
-# both sides speak. Dev-only, and `esker-sql` deliberately does not link it at runtime: the
-# planner's columnar half is a later milestone, and a leaf crate whose format versions could
-# reach the SQL layer is what `esker-proto`'s result format exists to prevent.
-esker-columnar.workspace = true
 proptest.workspace = true
 sqllogictest.workspace = true
 tempfile.workspace = true

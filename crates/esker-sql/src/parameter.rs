@@ -27,6 +27,12 @@
 //!   is the safe direction.
 //! * `max_identifier_length` is **read-only**, as it is on a real server — `55P02`, which is a
 //!   different answer from `42704` and means a different thing.
+//! * `esker.engine` is **this node's own** and is honoured in the strongest sense in this table: it
+//!   decides which engine a query runs on, and `EXPLAIN` names what it decided
+//!   ([ADR 0022](../../docs/adr/0022-columnar-learner-replica.md) Decision 2). A real server
+//!   accepts every value for it, because it validates no custom parameter at all; this one refuses
+//!   anything but `row`, `columnar` and `auto`, which is the same direction every other row here
+//!   takes.
 //!
 //! A parameter not in this table is `42704`, which is what a real server says and is *not*
 //! contract C2's `0A000`: the statement is one this node runs, and what is missing is the
@@ -105,6 +111,24 @@ pub const PARAMETERS: &[Parameter] = &[
         reported: "search_path",
         boot: "\"$user\", public",
         values: Values::Free,
+        read_only: false,
+    },
+    // **This node's own, and it is honoured** — `EXPLAIN` names the engine it chose and this is
+    // what a user says when the estimate is wrong (ADR 0022 Decision 2, rule 4). Measured against
+    // PostgreSQL 19 like everything else here, and the measurement is what makes it a *declared*
+    // divergence rather than an accident: a real server accepts `SET esker.engine = 'sideways'`,
+    // because it validates no custom parameter's value, ever. Accepting a value this node will not
+    // act on is the one answer this module exists to refuse, so `22023` with the three spellings
+    // as a `HINT` — PostgreSQL's own shape for an enum it *does* know
+    // (`tests/corpus/pg19_routing_engine.txt`).
+    Parameter {
+        name: "esker.engine",
+        reported: "esker.engine",
+        // `auto` rather than "unset": this node has a real default and it is the rule. PostgreSQL
+        // answers `42704` for a namespaced GUC until the first `SET`, which is the other half of
+        // the declared divergence.
+        boot: "auto",
+        values: Values::Enum(&["row", "columnar", "auto"]),
         read_only: false,
     },
     Parameter {
