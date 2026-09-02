@@ -316,7 +316,7 @@ pub(super) fn table_names(statement: &Statement) -> Vec<&str> {
             .from
             .iter()
             .map(|table| table.name.as_str())
-            .chain(select.join.iter().map(|join| join.table.name.as_str()))
+            .chain(select.joins.iter().map(|join| join.table.name.as_str()))
             .collect(),
         Statement::Update(update) => vec![update.table.as_str()],
         Statement::Delete(delete) => vec![delete.table.as_str()],

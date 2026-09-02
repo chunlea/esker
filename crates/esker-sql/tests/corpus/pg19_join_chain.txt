@@ -1,0 +1,53 @@
+# A **chain** of joins — the rung-3 blocker, and what a left-deep fold has to get right
+#
+# `ActiveRecord`'s `indexes()` sends four tables and three joins, `pg_class` twice under two
+# aliases, all `ON`, mixing `INNER` and `LEFT`. Rung 3 stopped on it for four scoreboard runs with
+# `0A000 more than one JOIN is not supported`.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it
+#
+# THE ONE THAT DECIDES WHETHER A FOLD IS A JOIN PLANNER OR A GUESS:
+#
+#   `ja LEFT JOIN jb … JOIN jc …` returns **one** row, not four. The inner join is applied to the
+#   already-NULL-extended rows and throws them back out. A chain planned as "each join against the
+#   original left table" would keep all four, and a chain that reordered the steps would keep two.
+#   Left-deep, in the order written, is not an optimisation choice here — it is the semantics.
+#
+# The four combinations are all here (INNER-INNER, LEFT-LEFT, LEFT-INNER, INNER-LEFT) and they
+# return 1, 4, 1 and 2 rows. Any two of them agreeing by accident is possible; all four is not.
+#
+# `SELECT *` across a chain returns every table's columns left to right, in the order **written**,
+# which is not necessarily the order the executor reads them.
+#
+# This file builds and drops its own tables, so replaying it twice is the same as replaying it
+# once — verified by capturing it twice and diffing.
+#
+DROP TABLE IF EXISTS jc		-
+DROP TABLE IF EXISTS jb		-
+DROP TABLE IF EXISTS ja		-
+CREATE TABLE ja (id int8 PRIMARY KEY, name text, bid int8)		-
+CREATE TABLE jb (id int8 PRIMARY KEY, label text, cid int8)		-
+CREATE TABLE jc (id int8 PRIMARY KEY, tag text)		-
+INSERT INTO ja VALUES (1, 'a-one', 10), (2, 'a-two', 20), (3, 'a-three', NULL), (4, 'a-four', 99)		-
+INSERT INTO jb VALUES (10, 'b-ten', 100), (20, 'b-twenty', NULL), (30, 'b-thirty', 300)		-
+INSERT INTO jc VALUES (100, 'c-hundred'), (300, 'c-threehundred')		-
+SELECT a.id, b.label, c.tag FROM ja a JOIN jb b ON a.bid = b.id JOIN jc c ON b.cid = c.id ORDER BY a.id	bigint,text,text	1|b-ten|c-hundred
+SELECT a.id, b.label, c.tag FROM ja a LEFT JOIN jb b ON a.bid = b.id LEFT JOIN jc c ON b.cid = c.id ORDER BY a.id	bigint,text,text	1|b-ten|c-hundred ; 2|b-twenty|\N ; 3|\N|\N ; 4|\N|\N
+SELECT a.id, b.label, c.tag FROM ja a LEFT JOIN jb b ON a.bid = b.id JOIN jc c ON b.cid = c.id ORDER BY a.id	bigint,text,text	1|b-ten|c-hundred
+SELECT a.id, b.label, c.tag FROM ja a JOIN jb b ON a.bid = b.id LEFT JOIN jc c ON b.cid = c.id ORDER BY a.id	bigint,text,text	1|b-ten|c-hundred ; 2|b-twenty|\N
+SELECT count(*) FROM ja a JOIN jb b ON a.bid = b.id JOIN jc c ON b.cid = c.id	bigint	1
+SELECT count(*) FROM ja a LEFT JOIN jb b ON a.bid = b.id LEFT JOIN jc c ON b.cid = c.id	bigint	4
+SELECT a.id, c.tag FROM ja a JOIN jb b ON a.bid = b.id JOIN jc c ON b.cid = c.id WHERE c.tag = 'c-hundred'	bigint,text	1|c-hundred
+SELECT * FROM ja a JOIN jb b ON a.bid = b.id JOIN jc c ON b.cid = c.id ORDER BY a.id	bigint,text,bigint,bigint,text,bigint,bigint,text	1|a-one|10|10|b-ten|100|100|c-hundred
+SELECT ja.id, jb.label, jc.tag FROM ja JOIN jb ON ja.bid = jb.id JOIN jc ON jb.cid = jc.id ORDER BY ja.id	bigint,text,text	1|b-ten|c-hundred
+SELECT a.id, b.label FROM ja a JOIN jb b ON a.bid = b.id JOIN jc c ON b.cid = c.id ORDER BY a.id DESC	bigint,text	1|b-ten
+SELECT a.id FROM ja a JOIN jb b ON a.bid = b.id AND b.label = 'b-ten' JOIN jc c ON b.cid = c.id	bigint	1
+SELECT a.id, c.tag FROM ja a JOIN jb b ON a.bid = b.id JOIN jc c ON a.id = c.id ORDER BY a.id	bigint,text	-
+SELECT a.id, x.name FROM ja a JOIN ja x ON a.bid = x.id ORDER BY a.id	bigint,text	-
+SELECT ja.id, jb.id FROM ja JOIN jb ON ja.bid = jb.id ORDER BY ja.id	bigint,bigint	1|10 ; 2|20
+SELECT a.id FROM ja a JOIN jb b ON a.bid = b.id JOIN jc c ON b.cid = c.id JOIN ja d ON d.id = a.id	bigint	1
+SELECT a.id, b.label, c.tag FROM ja a RIGHT JOIN jb b ON a.bid = b.id JOIN jc c ON b.cid = c.id	bigint,text,text	1|b-ten|c-hundred ; \N|b-thirty|c-threehundred
+SELECT a.id, b.label FROM ja a CROSS JOIN jb b ORDER BY a.id, b.id	bigint,text	1|b-ten ; 1|b-twenty ; 1|b-thirty ; 2|b-ten ; 2|b-twenty ; 2|b-thirty ; 3|b-ten ; 3|b-twenty ; 3|b-thirty ; 4|b-ten ; 4|b-twenty ; 4|b-thirty
+SELECT a.id FROM ja a JOIN jb b ON a.bid = b.id WHERE b.cid IS NULL	bigint	2

@@ -834,17 +834,20 @@ impl Executor {
             Some(table) => Some(self.require_table(txn, &table.name)?),
             None => None,
         };
-        let inner = match &select.join {
-            Some(join) => Some(self.require_table(txn, &join.table.name)?),
-            None => None,
-        };
-        let mut planned = query::plan(select, self.tenant, table.as_deref(), inner.as_deref())?;
+        let inners = select
+            .joins
+            .iter()
+            .map(|join| self.require_table(txn, &join.table.name))
+            .collect::<Result<Vec<_>>>()?;
+        let inner_refs: Vec<&crate::catalog::TableDef> =
+            inners.iter().map(std::convert::AsRef::as_ref).collect();
+        let mut planned = query::plan(select, self.tenant, table.as_deref(), &inner_refs)?;
         // **After the row plan, never instead of it.** Routing is a rewrite of a plan that already
         // exists and is already correct, which is what lets a refusal be answered by putting the
         // original back (`crate::exec::fragment`). A join has no outer table to route and is left
         // alone by `consider` in any case.
         if let Some(table) = table.as_deref()
-            && inner.is_none()
+            && inners.is_empty()
         {
             fragment::route(
                 txn,
@@ -1271,7 +1274,7 @@ impl Execute for Executor {
                     select,
                     self.tenant,
                     tables.first().map(AsRef::as_ref),
-                    tables.get(1).map(AsRef::as_ref),
+                    &tables.iter().skip(1).map(AsRef::as_ref).collect::<Vec<_>>(),
                 )?
                 .columns
                 .into_iter()

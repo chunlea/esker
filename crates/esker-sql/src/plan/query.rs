@@ -70,8 +70,10 @@ impl TableRef {
 
 /// One `JOIN`, as written.
 ///
-/// Exactly one. A second join is refused by name (contract C2) rather than approximated; the two
-/// **kinds** and both constraint spellings are executed.
+/// A statement may have a **chain** of them, executed left-deep in the order written — which is
+/// what the SQL means, not a planner choice: `A LEFT JOIN B ON … JOIN C ON …` is
+/// `((A LJ B) JOIN C)`, and the inner join filters back out the rows the left join NULL-extended.
+/// Measured, `tests/corpus/pg19_join_chain.txt`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Join {
     /// The right-hand table, under the name the query refers to it by.
@@ -92,10 +94,13 @@ pub struct Join {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
     /// The table, or `None` for `SELECT 1` — a single row of no table at all, which drivers use to
-    /// check a connection. With a [`Select::join`] it is the left-hand one.
+    /// check a connection. With any [`Select::joins`] it is the left-most one.
     pub from: Option<TableRef>,
-    /// The one join this crate runs, if the statement has one.
-    pub join: Option<Join>,
+    /// The joins, in the order written. Empty for a statement with none.
+    ///
+    /// A chain rather than one, because `ActiveRecord`'s `indexes()` sends four tables and three
+    /// joins — `pg_class` twice under two aliases — and rung 3 of the ladder stops on it.
+    pub joins: Vec<Join>,
     /// What to return.
     pub projection: Vec<SelectItem>,
     /// `WHERE`.

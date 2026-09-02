@@ -1666,16 +1666,29 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
     refuse_if(select.exclude.is_some(), "EXCLUDE")?;
     refuse_if(!select.optimizer_hints.is_empty(), "an optimizer hint")?;
 
-    let (from, join) = match select.from.as_slice() {
-        [] => (None, None),
+    let (from, joins) = match select.from.as_slice() {
+        [] => (None, Vec::new()),
         [table] => {
             let left = table_reference(&table.relation)?;
-            let join = match table.joins.as_slice() {
-                [] => None,
-                [one] => Some(lower_join(one)?),
-                _ => return Err(SqlError::unsupported("more than one JOIN")),
-            };
-            (Some(left), join)
+            let joins = table
+                .joins
+                .iter()
+                .map(lower_join)
+                .collect::<Result<Vec<_>>>()?;
+            // `USING` in a **chain** is refused by name, and only in a chain. It does a second
+            // thing an `ON` does not — it *merges* the named column — and the merging compounds:
+            // `SELECT *` returns the column once rather than once per table, and a later `ON`
+            // join that brings a third column of the same name makes a bare reference `42702`
+            // rather than resolving to the merged one. Both measured
+            // (`tests/corpus/pg19_join_chain.txt`). Approximating either would be a wrong answer,
+            // and `ActiveRecord` sends no `USING` at all — zero in 5396 captured statements — so
+            // this is a gap nothing is waiting on.
+            if joins.len() > 1 && joins.iter().any(|join| !join.using.is_empty()) {
+                return Err(SqlError::unsupported(
+                    "USING in a chain of more than one JOIN",
+                ));
+            }
+            (Some(left), joins)
         }
         // `FROM a, b` is a cross join in PostgreSQL, and writing it that way is how a user asks
         // for one. Refused by name rather than lowered to a cross join, because the comma form
@@ -1734,7 +1747,7 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
 
     Ok(plan::Select {
         from,
-        join,
+        joins,
         projection,
         filter,
         distinct,
