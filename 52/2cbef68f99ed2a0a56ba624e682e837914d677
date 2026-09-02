@@ -1,0 +1,19 @@
+docs/plans/phase-13-catalog.md
+  s_8213a31ba756d1::t_3088a8457b0ff9 1-351
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "522cbef68f99ed2a0a56ba624e682e837914d677",
+  "prompts": {},
+  "sessions": {
+    "s_8213a31ba756d1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6f90895c-f344-4eae-bdcb-fc8ddda55532",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
