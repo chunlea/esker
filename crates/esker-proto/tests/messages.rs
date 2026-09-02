@@ -178,6 +178,13 @@ fn golden_pd_requests() -> Vec<(&'static str, Request)> {
                 request: PdReq::SchemaLease,
             },
         ),
+        (
+            "pd-status",
+            Request::Pd {
+                cluster_id: PD_CLUSTER,
+                request: PdReq::Status,
+            },
+        ),
     ]
 }
 
@@ -681,6 +688,39 @@ fn golden_pd_responses() -> Vec<(&'static str, Response)> {
                 lease_ms: 5_000,
                 step_interval_ms: 8_000,
                 removal_extra_ms: 3_600_000,
+            }),
+        ),
+        (
+            // Two operators of different kinds and different progress, because a status with one
+            // of anything pins neither the repeat nor the tag it repeats.
+            "pd-status",
+            Response::Pd(PdResp::Status {
+                now_ms: 1_700_000_000_000,
+                operators: vec![
+                    esker_proto::OperatorStatus {
+                        operator: Operator::AddPeer {
+                            region_id: 1,
+                            epoch: Epoch::new(2, 3),
+                            store_id: 4,
+                            peer_id: 5,
+                        },
+                        progress: esker_proto::OperatorProgress::Issued,
+                        issued_ms: 1_699_999_000_000,
+                        since_ms: 1_699_999_000_000,
+                        sends: 3,
+                    },
+                    esker_proto::OperatorStatus {
+                        operator: Operator::RemovePeer {
+                            region_id: 7,
+                            epoch: Epoch::new(9, 11),
+                            peer_id: 13,
+                        },
+                        progress: esker_proto::OperatorProgress::Started,
+                        issued_ms: 1_699_998_000_000,
+                        since_ms: 1_699_999_500_000,
+                        sends: 1,
+                    },
+                ],
             }),
         ),
     ]

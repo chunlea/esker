@@ -125,14 +125,14 @@ pub(crate) fn run(options: &RegionOptions) -> Result<(), String> {
 /// it the only other way PD offers — the refusal names the cluster PD serves, so the first call
 /// adopts that id and retries, and every call afterwards carries it. One extra round trip per
 /// invocation, on a tool a person runs by hand.
-struct PdConn {
+pub(crate) struct PdConn {
     transport: BlockingTransport,
     /// The cluster PD said it serves, or `0` before it has said.
     cluster_id: Cell<u64>,
 }
 
 impl PdConn {
-    fn connect(address: SocketAddr) -> Result<Self, String> {
+    pub(crate) fn connect(address: SocketAddr) -> Result<Self, String> {
         let transport = BlockingTransport::connect_with(address, TransportConfig::new())
             .map_err(|error| format!("connecting to the placement driver at {address}: {error}"))?;
         Ok(Self {
@@ -145,7 +145,7 @@ impl PdConn {
     ///
     /// Retried **once** and only on a mismatch that names a different cluster, so a PD that
     /// somehow refused the id it had just given would be reported rather than looped on.
-    fn call(&self, request: &PdReq) -> Result<PdResp, ProtoError> {
+    pub(crate) fn call(&self, request: &PdReq) -> Result<PdResp, ProtoError> {
         let deadline = || std::time::Instant::now() + CALL_TIMEOUT;
         let known = self.cluster_id.get();
         let response = match self

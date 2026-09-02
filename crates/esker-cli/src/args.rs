@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use crate::bench::{Run as BenchOptions, Workload};
 use crate::cluster::ClusterOptions;
 use crate::manifest_dump::DumpOptions as ManifestDumpOptions;
-use crate::pd::{InspectOptions, PdCommand, ServeOptions};
+use crate::pd::{InspectOptions, PdCommand, ServeOptions, StatusOptions};
 use crate::raw::{RawCommand, RawOptions, from_hex};
 use crate::region::{RegionCommand, RegionOptions};
 use crate::server::ServerOptions;
@@ -171,7 +171,9 @@ Commands:
                         the one given). --pd also starts a placement driver on
                         the port above the nodes and points every node at it,
                         which is what a SQL node needs to be given with --pd
-  pd serve|inspect      Run the placement driver, or print what it has stored
+  pd serve|inspect|status
+                        Run the placement driver, print what a stopped one has
+                        stored, or ask a running one what it is doing
   region <verb> ...     Look at, split, or hand over a region
   sst-store reconcile <url>
                         Compare an SST store prefix against a database's manifest
@@ -240,6 +242,19 @@ Server options:
 
 Ctrl-C stops the listener, lets in-flight requests finish and closes the
 database. A second one does not wait.
+
+Pd options:
+  pd serve                  Run the placement driver
+  pd inspect                Print what a **stopped** PD has stored: the cluster, the
+                            allocator, the oracle's mark, every store and region, and
+                            the operator history
+  pd status                 Ask a **running** PD what it has in flight. The in-flight
+                            set is memory and dies with the process, so `inspect`
+                            cannot show it and this is the only thing that can
+      --data-dir PATH       PD's database, for serve and inspect (default ./esker-pd)
+      --listen HOST:PORT    Address to serve on, for serve (default 127.0.0.1:2379)
+      --pd HOST:PORT        The placement driver to ask, for status
+                            (default 127.0.0.1:2379)
 
 Sst-store options:
   sst-store reconcile s3://bucket/prefix
@@ -724,6 +739,7 @@ fn parse_pd(arguments: &[String]) -> Result<Command, ParseError> {
 
     let mut serve = ServeOptions::default();
     let mut inspect = InspectOptions::default();
+    let mut status = StatusOptions::default();
     let mut index = 1;
     while index < arguments.len() {
         let argument = &arguments[index];
@@ -746,6 +762,9 @@ fn parse_pd(arguments: &[String]) -> Result<Command, ParseError> {
             "--listen" => {
                 serve.listen = take_value(arguments, &mut index, inline, "--listen")?;
             }
+            "--pd" => {
+                status.pd = take_value(arguments, &mut index, inline, "--pd")?;
+            }
             other if other.starts_with('-') => {
                 return Err(ParseError::UnknownFlag(other.to_owned()));
             }
@@ -756,6 +775,7 @@ fn parse_pd(arguments: &[String]) -> Result<Command, ParseError> {
     match verb.as_str() {
         "serve" => Ok(Command::Pd(PdCommand::Serve(serve))),
         "inspect" => Ok(Command::Pd(PdCommand::Inspect(inspect))),
+        "status" => Ok(Command::Pd(PdCommand::Status(status))),
         other => Err(ParseError::UnknownPdCommand(other.to_owned())),
     }
 }

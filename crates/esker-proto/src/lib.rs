@@ -56,7 +56,7 @@ pub use messages::{
     AdminReq, AdminResp, Hello, HelloAck, Method, RawKvReq, RawKvResp, RegionStatus, Request,
     RequestHeader, Response, SnapshotRequest,
 };
-pub use pd::{Operator, PdChannel, PdReq, PdResp, StoreInfo};
+pub use pd::{Operator, OperatorProgress, OperatorStatus, PdChannel, PdReq, PdResp, StoreInfo};
 pub use raft::{RaftBatch, RaftMessage};
 pub use region::{Epoch, Peer, PeerRole, Region};
 pub use transport::{

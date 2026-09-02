@@ -98,6 +98,13 @@ impl StandIn {
                 step_interval_ms: 1_500,
                 removal_extra_ms: 0,
             },
+            // An operator's question, not a store's: `esker pd status` asks it. Answered rather
+            // than refused so the match stays exhaustive — which is what made this file the first
+            // place to notice the new method.
+            PdReq::Status => PdResp::Status {
+                now_ms: 0,
+                operators: Vec::new(),
+            },
         }
     }
 }

@@ -40,13 +40,13 @@ use esker_engine::{
     cf,
 };
 use esker_proto::pd::ColumnarWish;
-use esker_proto::{Operator, Region, StoreInfo};
+use esker_proto::{Operator, OperatorProgress, OperatorStatus, Region, StoreInfo};
 
 use crate::alloc::{ALLOC_BATCH, Allocator};
 use crate::clock::{Clock, SystemClock};
 use crate::error::{PdError, Result};
 use crate::keys;
-use crate::operator::InFlight;
+use crate::operator::{InFlight, Progress};
 use crate::record::{
     AllocRecord, ClusterRecord, ColumnarRecord, HistoryRecord, OperatorEvent, RegionRecord,
     StoreRecord, TsoRecord,
@@ -716,6 +716,39 @@ impl Pd {
     /// a repair ([`crate::record::HistoryRecord`]).
     pub fn history(&self) -> Result<Vec<OperatorEvent>> {
         Ok(self.lock()?.history.events.clone())
+    }
+
+    /// Every operator in flight right now, in region order, with PD's clock.
+    ///
+    /// **The one thing `esker pd inspect` cannot show.** That command opens a *stopped* PD's
+    /// database, and the in-flight set is deliberately not in it
+    /// ([ADR 0013](../../../docs/adr/0013-repair-operators-are-requests-not-commands.md)): a
+    /// restart forgets every operator and re-derives what is needed from the next round of
+    /// heartbeats. So the only way to see one is to ask the running process, which is what
+    /// `PdReq::Status` is for.
+    ///
+    /// The clock is taken **under the same lock** as the set, so an age computed from the two
+    /// cannot be negative — which is exactly what reading them separately would eventually
+    /// produce. That is also why this is not `in_flight()` plus a separate `clock()` call at the
+    /// caller: the pairing is the point.
+    pub fn status(&self) -> Result<(u64, Vec<OperatorStatus>)> {
+        let state = self.lock()?;
+        let now_ms = self.clock.now_ms();
+        let operators = state
+            .in_flight
+            .values()
+            .map(|entry| OperatorStatus {
+                operator: entry.operator.clone(),
+                progress: match entry.progress {
+                    Progress::Issued => OperatorProgress::Issued,
+                    Progress::Started => OperatorProgress::Started,
+                },
+                issued_ms: entry.issued_ms,
+                since_ms: entry.since_ms,
+                sends: entry.sends,
+            })
+            .collect();
+        Ok((now_ms, operators))
     }
 
     /// Appends one event to the history, on disk and in memory.

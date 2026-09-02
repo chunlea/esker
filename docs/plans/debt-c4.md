@@ -225,3 +225,47 @@ Anything that is neither an SST nor the marker is reported and never touched.
 database on a real tier: a planted orphan is reported and then deleted; an object newer than the
 manifest is kept even under `--delete`; another database's prefix is refused with both identities in
 the message; an unclaimed prefix is refused; a clean prefix says so rather than printing nothing.
+
+## 5. In-flight operators were invisible to `esker pd inspect`
+
+Inventory #14. `docs/plans/phase-4-pd.md` §12.3 "Not built, deliberately", bullet 3.
+
+`pd inspect` opens a **stopped** PD's database, and the in-flight set is deliberately not in it:
+[ADR 0013](../adr/0013-repair-operators-are-requests-not-commands.md) makes an operator a request
+rather than a command, and a restart forgets every one and re-derives what is needed from the next
+round of heartbeats. So "what is PD moving right now" was answerable only from PD's own log lines,
+on a process an operator may not be able to attach to.
+
+`Pd::Status` (method `0x0309`) answers it: PD's clock, and every operator in flight with its
+progress, when it was issued, when progress was last observed, and how many times it has been sent.
+`esker pd status --pd HOST:PORT` prints it. `inspect` and `status` are complements — one says what
+PD believes about the cluster, the other what it is doing about it.
+
+Four decisions in it are worth the words:
+
+* **the clock travels with the set, taken under the same lock.** An age computed from two reads can
+  be negative, and `CLAUDE.md` invariant 6 is the same instinct: one clock, PD's;
+* **`since_ms` is reported beside `issued_ms`**, because the timeout runs from the last observed
+  progress and not from the issue. A minute old and moving is not a minute old and stuck, and a
+  report that showed only the age would make the two look identical;
+* **the region id is not a field.** It is `Operator::region_id()`, and duplicating it would make a
+  disagreement between the two expressible;
+* **`Status` is exempt from the cluster-id gate**, alone with `Bootstrap`. It reads no
+  cluster-scoped state, and an un-bootstrapped PD is exactly when an operator most wants to ask —
+  answering "the cluster is not bootstrapped" would be a reply to a question nobody asked. A test
+  asserts the gate is still on everything else, so the exemption is a decision rather than a hole.
+
+Golden bytes for both the request and the response, **derived independently** in the file's own
+terms (tag LE, LEB128 varints) rather than dumped from the encoder, which is the only way a golden
+pins anything. The response golden carries two operators of different kinds and different progress:
+one of anything pins neither the repeat nor the tag it repeats.
+
+`crates/esker-pd/tests/loopback.rs` over a real socket: a repair in flight is visible from outside
+the process with the right progress and send count, asking twice does not change it, a quiet PD says
+so, and a PD with no cluster still answers. `crates/esker-cli/src/pd.rs`'s tests pin the report's
+shape, including that an age from a timestamp in the future saturates instead of wrapping to
+nineteen billion seconds and reading as a hung operator.
+
+The reverse-dependent gate earned its keep immediately: a new `PdReq` variant broke an exhaustive
+match in `crates/esker-store/tests/pd_client.rs`, a crate this unit does not otherwise touch.
+

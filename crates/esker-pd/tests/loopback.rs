@@ -325,6 +325,71 @@ async fn a_dead_store_earns_a_repair_on_the_heartbeat_response() {
         .expect("still asking");
     assert_eq!(again, operator);
     assert_eq!(cluster.pd.in_flight().unwrap().len(), 1);
+
+    // **And it is visible from outside the process.** `esker pd inspect` opens a stopped PD's
+    // database, and this set was never in it — so before `Pd::Status` an operator in flight was
+    // something only PD's own logs could show.
+    let (now_ms, in_flight) = pd.status().await.unwrap();
+    assert_eq!(in_flight.len(), 1, "the status did not show the repair");
+    let status = &in_flight[0];
+    assert_eq!(
+        status.operator, operator,
+        "a different operator was reported"
+    );
+    assert_eq!(
+        status.progress,
+        esker_proto::OperatorProgress::Issued,
+        "nothing has been observed acting on it yet"
+    );
+    assert_eq!(status.sends, 2, "it has been asked for twice");
+    assert!(
+        now_ms >= status.issued_ms && status.since_ms >= status.issued_ms,
+        "the clock and the operator disagree: now {now_ms}, issued {}, since {}",
+        status.issued_ms,
+        status.since_ms,
+    );
+
+    // A second call is a read: nothing about PD's state moves because somebody looked at it.
+    let (_, again) = pd.status().await.unwrap();
+    assert_eq!(again, in_flight, "asking for the status changed it");
+}
+
+/// The ordinary answer, which is the one an operator hopes for: nothing in flight.
+///
+/// Asserted on its own because "no operators" and "the call failed" are the same shape to a
+/// reader who only sees an empty list.
+#[tokio::test]
+async fn a_quiet_placement_driver_reports_no_operators() {
+    let cluster = Cluster::start().await;
+    let pd = cluster.channel().await;
+    pd.bootstrap(StoreInfo::new(1, "127.0.0.1:20161"))
+        .await
+        .unwrap();
+
+    let (now_ms, operators) = pd.status().await.unwrap();
+    assert!(operators.is_empty(), "a quiet PD reported {operators:?}");
+    assert_eq!(now_ms, 1_700_000_000_000, "the report carries PD's clock");
+}
+
+/// **A PD with no cluster still answers.**
+///
+/// Every other method is gated on the cluster id, and rightly: they read or write cluster-scoped
+/// state. A status is a question about the *process*, and an un-bootstrapped PD is exactly when an
+/// operator most wants to ask one — answering "the cluster is not bootstrapped" would be a reply
+/// to a question nobody asked.
+#[tokio::test]
+async fn a_placement_driver_with_no_cluster_still_answers_a_status() {
+    let cluster = Cluster::start().await;
+    let pd = cluster.channel().await;
+    assert_eq!(pd.cluster_id(), 0, "nothing has bootstrapped yet");
+
+    let (_, operators) = pd.status().await.expect("a status must not need a cluster");
+    assert!(operators.is_empty());
+
+    // And the gate is still on everything else, which is what makes the exemption a decision
+    // rather than a hole.
+    let refused = pd.get_region("").await.expect_err("the gate is off");
+    assert!(refused.to_string().contains("bootstrap"), "{refused}");
 }
 
 /// PD is not a store. A client that reached it by mistake is told so, rather than being

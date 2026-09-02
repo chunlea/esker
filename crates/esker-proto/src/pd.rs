@@ -303,6 +303,99 @@ impl Operator {
     }
 }
 
+/// How far an in-flight operator has been *seen* to get.
+///
+/// Observed, never assumed: PD moves this only when a later region heartbeat shows the effect
+/// (`esker_pd::operator`). An operator that was applied and whose heartbeat has not arrived is
+/// indistinguishable from one that was lost, and this says which of the two PD believes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorProgress {
+    /// Sent, and nothing has been seen yet. PD keeps re-sending it.
+    Issued,
+    /// A heartbeat has shown the store acting on it, so PD has stopped re-sending.
+    Started,
+}
+
+/// Wire tag for [`OperatorProgress`] (*fixed*). Zero is reserved, as everywhere in this format.
+mod operator_progress {
+    pub(super) const ISSUED: u8 = 1;
+    pub(super) const STARTED: u8 = 2;
+}
+
+impl OperatorProgress {
+    /// The name a log line or a report uses.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Issued => "issued",
+            Self::Started => "started",
+        }
+    }
+
+    fn encode(self, out: &mut Encoder) {
+        out.put_u8(match self {
+            Self::Issued => operator_progress::ISSUED,
+            Self::Started => operator_progress::STARTED,
+        });
+    }
+
+    fn decode(input: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        match input.get_u8("progress.kind")? {
+            operator_progress::ISSUED => Ok(Self::Issued),
+            operator_progress::STARTED => Ok(Self::Started),
+            other => Err(DecodeError::UnknownTag {
+                what: "operator progress",
+                tag: u64::from(other),
+            }),
+        }
+    }
+}
+
+/// One operator PD has in flight right now.
+///
+/// The in-flight set is **memory** and dies with the process
+/// ([ADR 0013](../../docs/adr/0013-repair-operators-are-requests-not-commands.md)), which is why
+/// `esker pd inspect` — which opens a *stopped* PD's database — cannot show it and why this
+/// exists. The region id is not a field: it is [`Operator::region_id`], and duplicating it would
+/// make a disagreement between the two expressible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorStatus {
+    /// What PD is asking for.
+    pub operator: Operator,
+    /// How far it has been seen to get.
+    pub progress: OperatorProgress,
+    /// When it was issued, on PD's clock.
+    pub issued_ms: u64,
+    /// When progress was last observed, on PD's clock. **The timeout runs from here**, not from
+    /// `issued_ms`: an operator that reached [`OperatorProgress::Started`] gets its allowance
+    /// again, because a snapshot for a large region is slow and cancelling one that is working
+    /// would throw away the work.
+    pub since_ms: u64,
+    /// How many times it has been sent. A high count with `Issued` means heartbeats are arriving
+    /// and nothing is happening.
+    pub sends: u32,
+}
+
+impl OperatorStatus {
+    fn encode(&self, out: &mut Encoder) {
+        self.operator.encode(out);
+        self.progress.encode(out);
+        out.put_varint(self.issued_ms);
+        out.put_varint(self.since_ms);
+        out.put_varint(u64::from(self.sends));
+    }
+
+    fn decode(input: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        Ok(Self {
+            operator: Operator::decode(input)?,
+            progress: OperatorProgress::decode(input)?,
+            issued_ms: input.get_varint("status.issued_ms")?,
+            since_ms: input.get_varint("status.since_ms")?,
+            sends: input.get_varint_u32("status.sends")?,
+        })
+    }
+}
+
 /// Anything a caller asks the placement driver.
 ///
 /// The heartbeat field sets are the ones `docs/plans/phase-4.md` §3.2 pins, so the store's
@@ -395,6 +488,16 @@ pub enum PdReq {
         /// simply absent, which is how a cleared flag arrives.
         wishes: Vec<ColumnarWish>,
     },
+
+    /// What this placement driver is doing **right now**.
+    ///
+    /// The one question `esker pd inspect` cannot answer, because it opens a stopped PD's
+    /// database and the in-flight set was never in it. Carries no arguments: PD has one answer
+    /// and it is the same for everyone who asks.
+    ///
+    /// Read-only and inbound like every other method here — a status request changes nothing,
+    /// which is what makes it safe to point at a production driver.
+    Status,
 }
 
 impl PdReq {
@@ -410,6 +513,7 @@ impl PdReq {
             Self::Tso { .. } => Method::PdTso,
             Self::SchemaLease => Method::PdSchemaLease,
             Self::ReportColumnar { .. } => Method::PdReportColumnar,
+            Self::Status => Method::PdStatus,
         }
     }
 
@@ -447,8 +551,8 @@ impl PdReq {
             Self::GetRegion { key } => out.put_bytes(key),
             Self::AllocId { count } => out.put_varint(*count),
             Self::Tso { count } => out.put_varint(u64::from(*count)),
-            // No fields, so nothing to write. The method is the whole request.
-            Self::SchemaLease => {}
+            // No fields, so nothing to write. The method is the whole request, for both of these.
+            Self::SchemaLease | Self::Status => {}
             Self::ReportColumnar { wishes } => {
                 out.put_varint(wishes.len() as u64);
                 for wish in wishes {
@@ -490,6 +594,7 @@ impl PdReq {
                 count: input.get_varint_u32("tso.count")?,
             },
             Method::PdSchemaLease => Self::SchemaLease,
+            Method::PdStatus => Self::Status,
             Method::PdReportColumnar => {
                 let count = input.get_count("columnar.wishes")?;
                 let mut wishes = Vec::with_capacity(count.min(1024));
@@ -594,6 +699,18 @@ pub enum PdResp {
         /// change take one.
         removal_extra_ms: u64,
     },
+
+    /// What the placement driver is doing right now.
+    Status {
+        /// PD's own clock, so a caller can turn `issued_ms` into an age without holding an
+        /// opinion about time. `CLAUDE.md` invariant 6 keeps ordering out of every other node's
+        /// wall clock; this is the same instinct applied to a report — two clocks would let a
+        /// reader print a negative age and believe it.
+        now_ms: u64,
+        /// Every operator in flight, in region order. Empty is the ordinary answer: PD issues one
+        /// only when a region needs repairing or rebalancing.
+        operators: Vec<OperatorStatus>,
+    },
 }
 
 impl PdResp {
@@ -609,6 +726,7 @@ impl PdResp {
             Self::Tso { .. } => Method::PdTso,
             Self::SchemaLease { .. } => Method::PdSchemaLease,
             Self::ReportColumnar => Method::PdReportColumnar,
+            Self::Status { .. } => Method::PdStatus,
         }
     }
 
@@ -655,6 +773,13 @@ impl PdResp {
                 out.put_varint(*step_interval_ms);
                 out.put_varint(*removal_extra_ms);
             }
+            Self::Status { now_ms, operators } => {
+                out.put_varint(*now_ms);
+                out.put_varint(operators.len() as u64);
+                for status in operators {
+                    status.encode(out);
+                }
+            }
         }
     }
 
@@ -694,6 +819,15 @@ impl PdResp {
                 start_ts: input.get_varint("tso.start_ts")?,
                 count: input.get_varint_u32("tso.count")?,
             },
+            Method::PdStatus => {
+                let now_ms = input.get_varint("status.now_ms")?;
+                let count = input.get_count("status.operators")?;
+                let mut operators = Vec::with_capacity(count);
+                for _ in 0..count {
+                    operators.push(OperatorStatus::decode(input)?);
+                }
+                Self::Status { now_ms, operators }
+            }
             Method::PdSchemaLease => Self::SchemaLease {
                 lease_ms: input.get_varint("schema_lease.lease_ms")?,
                 step_interval_ms: input.get_varint("schema_lease.step_interval_ms")?,
@@ -929,6 +1063,18 @@ impl PdChannel {
                 removal_extra_ms,
             } => Ok((lease_ms, step_interval_ms, removal_extra_ms)),
             other => Err(mismatch("SchemaLease", &other)),
+        }
+    }
+
+    /// What this placement driver is doing right now: its clock, and every operator in flight.
+    ///
+    /// An operator's question rather than a node's — nothing in the cluster acts on the answer,
+    /// which is why it is `esker pd status` and not a step in anybody's loop.
+    pub async fn status(&self) -> Result<(u64, Vec<OperatorStatus>), ProtoError> {
+        let response = self.call(PdReq::Status).await?;
+        match response {
+            PdResp::Status { now_ms, operators } => Ok((now_ms, operators)),
+            other => Err(mismatch("Status", &other)),
         }
     }
 
