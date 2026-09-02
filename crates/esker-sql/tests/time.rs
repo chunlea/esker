@@ -39,18 +39,6 @@ const FUNCTIONS: &str = "A function this node does not implement for any type, n
      `pg_typeof` reads the catalog; none is `time`'s to add, and each closes for every type at \
      once when it lands.";
 
-/// The casts and the one addition that work on a real server and are not wired here yet.
-///
-/// Listed rather than left failing, so that the commit which wires them **has** to delete these
-/// entries: the harness fails on a listed divergence that starts agreeing, which is what stops a
-/// declaration outliving the gap it describes.
-const NEXT: &str = "A cast or an addition that a real server answers and this node does not \
-     reach yet. `timestamp::time` truncates to the clock, `time + date` and `date + time` build a \
-     `timestamp`, and a cast from `time` to a type with no path to it is `42846 cannot cast type \
-     …` — where this node renders the time to text and hands it to the target's input function, \
-     which refuses it with the wrong code. Wiring is the next commit; these lines are what will \
-     fail if it does not happen.";
-
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
@@ -77,18 +65,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT '1 day 02:00:00'::interval::time",
         "SELECT '12:34:56'::time::timetz",
         "SELECT '12:34:56'::timetz::time",
-        "SELECT '2020-01-01 12:34:56'::timestamp::time",
-        "SELECT '12:34:56'::time + '2020-01-01'::date",
-        "SELECT '2020-01-01'::date + '12:34:56'::time",
         "SELECT '12:34:56'::time - '01:00:00'::time",
         "SELECT '12:34:56'::time + '1 hour'::interval",
         "SELECT '24:00:00'::time + '1 second'::interval",
         "SELECT '12:34:56'::time * 2",
         "SELECT extract(hour FROM '12:34:56'::time), extract(epoch FROM '12:34:56'::time)",
         "SELECT date_part('minute', '12:34:56'::time)",
-        "SELECT '12:34:56'::time::timestamp",
-        "SELECT '12:34:56'::time::int",
-        "SELECT '12:34:56'::time::json",
         "SELECT '12:34:56'::time = '12:34:56'::timetz",
         "SELECT greatest('12:00:00'::time, '13:00:00'::time), least('12:00:00'::time, \
          '13:00:00'::time)",
@@ -128,12 +110,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         ("SELECT '1 day 02:00:00'::interval::time", INTERVAL),
         ("SELECT '12:34:56'::time::timetz", TIMETZ),
         ("SELECT '12:34:56'::timetz::time", TIMETZ),
-        ("SELECT '2020-01-01 12:34:56'::timestamp::time", NEXT),
-        ("SELECT '12:34:56'::time::timestamp", NEXT),
-        ("SELECT '12:34:56'::time::int", NEXT),
-        ("SELECT '12:34:56'::time::json", NEXT),
-        ("SELECT '12:34:56'::time + '2020-01-01'::date", NEXT),
-        ("SELECT '2020-01-01'::date + '12:34:56'::time", NEXT),
         ("SELECT '12:34:56'::time - '01:00:00'::time", INTERVAL),
         ("SELECT '12:34:56'::time + '1 hour'::interval", INTERVAL),
         ("SELECT '24:00:00'::time + '1 second'::interval", INTERVAL),
@@ -183,4 +159,79 @@ fn every_time_answer_is_postgresql_19_s() {
         checked > 55,
         "only {checked} statements ran; the corpus did not load"
     );
+}
+
+/// `date + time` is folded over **constants**, and a column pair is still named.
+///
+/// The boundary is deliberate and is the same one `lower_cast` draws. A per-row `+` needs a
+/// `plan::BinaryOp::Plus` that produces a *value* where every one of that enum's seventy uses
+/// assumes a comparison producing a boolean — an arithmetic unit, not a `time` one, and
+/// `interval` (what every other `time` arithmetic answers) would have to land first for the
+/// family to make sense. This test exists so that the gap is pinned rather than discovered.
+#[test]
+fn a_column_plus_a_column_is_still_named() {
+    let mut node = parity::Node::new(&[]);
+    for statement in [
+        "CREATE TABLE tp (id int8 PRIMARY KEY, t time, d date)",
+        "INSERT INTO tp VALUES (1, '12:34:56', '2020-01-01')",
+    ] {
+        node.run(statement).unwrap();
+    }
+
+    // The constant form answers, both ways round.
+    assert_eq!(
+        node.rows("SELECT '12:34:56'::time + '2020-01-01'::date"),
+        vec![vec!["2020-01-01 12:34:56"]]
+    );
+    assert_eq!(
+        node.rows("SELECT '2020-01-01'::date + '12:34:56'::time"),
+        vec![vec!["2020-01-01 12:34:56"]]
+    );
+
+    // The per-row form is `0A000` naming the operator — a refusal, never a wrong value.
+    let error = node.run("SELECT d + t FROM tp").unwrap_err();
+    assert_eq!(error.sqlstate(), "0A000");
+    assert_eq!(error.to_string(), "the operator + is not supported");
+}
+
+/// A `time` casts to a string and to nothing else, and the refusal is `42846` before any value.
+#[test]
+fn a_cast_with_no_path_is_refused_before_the_value_is_read() {
+    let mut node = parity::Node::new(&[]);
+    for (statement, target) in [
+        (
+            "SELECT '12:34:56'::time::timestamp",
+            "timestamp without time zone",
+        ),
+        ("SELECT '12:34:56'::time::int", "integer"),
+        ("SELECT '12:34:56'::time::json", "json"),
+        ("SELECT '12:34:56'::time::numeric", "numeric"),
+        ("SELECT '12:34:56'::time::date", "date"),
+        ("SELECT '12:34:56'::time::bytea", "bytea"),
+        ("SELECT '12:34:56'::time::boolean", "boolean"),
+    ] {
+        let error = node.run(statement).unwrap_err();
+        assert_eq!(error.sqlstate(), "42846", "{statement}");
+        assert_eq!(
+            error.to_string(),
+            format!("cannot cast type time without time zone to {target}"),
+            "{statement}"
+        );
+    }
+
+    // The three that do have a path, and the one that comes back the other way.
+    assert_eq!(
+        node.rows("SELECT '12:34:56'::time::text, '12:34:56'::time::varchar"),
+        vec![vec!["12:34:56", "12:34:56"]]
+    );
+    assert_eq!(
+        node.rows("SELECT '2020-01-01 12:34:56'::timestamp::time"),
+        vec![vec!["12:34:56"]]
+    );
+    // ...and the shapes `time_in` will *not* read, which is narrower than a timestamp's parser:
+    // the separator must be a space and there must be a time after it.
+    for text in ["2020-01-01", "2020-01-01T12:34:56", "Jan 2 2020 12:34:56"] {
+        let error = node.run(&format!("SELECT '{text}'::time")).unwrap_err();
+        assert_eq!(error.sqlstate(), "22007", "{text}");
+    }
 }

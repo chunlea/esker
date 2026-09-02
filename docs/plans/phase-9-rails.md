@@ -1229,6 +1229,11 @@ three real stores rather than the in-memory fake.
   real server gives everyone who is not a superuser. `ALTER SYSTEM` and every other administrative
   surface phase-6a §9 classifies as such stay `0A000`.
 * **No `plpgsql`, no `CREATE FUNCTION`, no triggers.** They parse (C1) and they are `0A000` (C2).
+* ~~**No `time` type.**~~ **Landed.** Statement 574's `t.time :bonus_time`, and the type surface
+  ADR 0033 called tier 2's second. What it does not do is arithmetic: `time - time`, `time * 2`,
+  `sum` and `avg` all answer `interval`, which is a type this node does not have, so each is
+  `0A000` naming it. `date + time` is folded over constants only — the engine has no arithmetic
+  operator at all, and adding one is its own unit.
 * ~~**No `numeric` type.**~~ **Landed** (ADR 0045). It got the unit the count justified: stored as
   digits and a scale with the written text preserved, ordered and indexable through a normalised
   key, printed by `numeric_out`'s rules, refused in the binary wire format both ways. What it

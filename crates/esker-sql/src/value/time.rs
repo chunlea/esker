@@ -61,6 +61,7 @@ pub fn from_text(text: &str) -> Result<i64> {
     if body.eq_ignore_ascii_case("allballs") {
         return Ok(0);
     }
+    let body = strip_date_and_zone(body);
     let (body, meridiem) = split_meridiem(body);
     let (hour, minute, second, fraction) = fields(body).ok_or_else(|| invalid(text))?;
     let hour = apply_meridiem(hour, meridiem).ok_or_else(|| invalid(text))?;
@@ -102,6 +103,37 @@ pub fn round_to_precision(micros: i64, precision: u32) -> i64 {
         (whole + 1) * step
     } else {
         whole * step
+    }
+}
+
+/// An **ISO date** ahead of the time, and a zone offset behind it, both discarded.
+///
+/// What makes `'2020-01-01 12:34:56'::time` a value and `'2020-01-01 12:34:56'::timestamp::time`
+/// the clock of that instant. The accepted shape is narrow and was measured one spelling at a
+/// time: the date must be ISO and the separator must be a **space** — `'2020-01-01T12:34:56'` is
+/// `22007` on a real server, where the same string is a perfectly good `timestamp` — a date with
+/// no time at all is `22007`, and `'Jan 2 2020 12:34:56'` is too. So this is not "parse a
+/// timestamp and keep the clock"; it is one specific prefix.
+fn strip_date_and_zone(body: &str) -> &str {
+    // The zone goes first: `12:34:56+02` is `12:34:56`, and a `-` offset must not be mistaken for
+    // the sign that makes a bare `-01:00:00` a syntax error, so it is only stripped after a time.
+    let body = match body.rfind(['+', '-']) {
+        Some(at) if at > 0 && body[..at].contains(':') => &body[..at],
+        _ => body,
+    };
+    let Some((head, tail)) = body.split_once(' ') else {
+        return body;
+    };
+    // An ISO date is digits and dashes with two dashes in it. Anything else — a month name, a
+    // meridiem — is not a date and the split belongs to whoever comes next.
+    let is_iso_date = head.matches('-').count() == 2
+        && head
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'-');
+    if is_iso_date && tail.contains(':') {
+        tail.trim_start()
+    } else {
+        body
     }
 }
 
