@@ -1,0 +1,89 @@
+crates/esker-keys/src/columnar.rs
+  s_a0868d54f0983f::t_bd25bfa015cb0a 74,94
+crates/esker-keys/src/row.rs
+  s_a0868d54f0983f::t_0059bf6c2b6149 127,284-290,448,518-523,989
+crates/esker-columnar/proptest-regressions/stats.txt
+  s_a0868d54f0983f::t_aed7d45a5d8939 9
+crates/esker-columnar/src/column.rs
+  s_a0868d54f0983f::t_afecfd29ac69d1 125-126,176,418-419,471-472
+crates/esker-columnar/src/encode/mod.rs
+  s_a0868d54f0983f::t_4dde0c39410ec5 145-146,258
+crates/esker-columnar/src/fragment/codec.rs
+  s_a0868d54f0983f::t_71dc147017a64f 387-390,434-436
+crates/esker-columnar/src/stats.rs
+  s_a0868d54f0983f::t_2a157e1c5feef3 121-123,273,435-441,783,848-854
+crates/esker-columnar/src/value.rs
+  s_a0868d54f0983f::t_3702a271ff15c1 83-84,99,114,136,157,185,229-230,258,283,293-294,413-418,574
+crates/esker-columnar/tests/bench_scan.rs
+  s_a0868d54f0983f::t_a11a09af87a626 66,116-121
+crates/esker-columnar/tests/compression.rs
+  s_a0868d54f0983f::t_245c3366c7a1ec 58
+crates/esker-columnar/tests/differential.rs
+  s_a0868d54f0983f::t_a3c4d9ae333100 394-406
+crates/esker-columnar/tests/roundtrip.rs
+  s_a0868d54f0983f::t_2476bb90949fc2 93
+crates/esker-keys/src/value.rs
+  s_a0868d54f0983f::t_56abbf663ded32 154-160,165,180,221-223,233,258
+crates/esker-proto/src/fragment/result.rs
+  s_a0868d54f0983f::t_0240a2db7c440d 100-102,113,124,141,158,193-194,213,240-244,297-299
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_a0868d54f0983f::t_8aea0f3623afeb 467,493
+crates/esker-sql/src/catalog/record.rs
+  s_a0868d54f0983f::t_ee98e9ec62da8c 133-135,185,227
+crates/esker-sql/src/error.rs
+  s_a0868d54f0983f::t_12b363b2b9e672 334-347,349-360,362-372,1034-1035,1206-1209
+crates/esker-sql/src/exec/bind.rs
+  s_a0868d54f0983f::t_ccb4bae632b0cb 454
+crates/esker-sql/src/exec/fragment.rs
+  s_a0868d54f0983f::t_7f385c19269771 578,597,607
+crates/esker-sql/src/exec/query.rs
+  s_a0868d54f0983f::t_a63ecdba00614a 1638-1642,1700-1716
+crates/esker-sql/src/parse/lower.rs
+  s_a0868d54f0983f::t_11f82ad2cc05bd 1426-1435,2101-2108,2254-2303,3059-3062
+crates/esker-sql/src/plan/expr.rs
+  s_a0868d54f0983f::t_d194aac6850989 658-661,708,737
+crates/esker-sql/src/row.rs
+  s_a0868d54f0983f::t_4c0f7e07db1c13 51-64
+crates/esker-sql/src/sqlstate.rs
+  s_a0868d54f0983f::t_5a6bb9ab5956cd 58-60
+crates/esker-sql/src/value/date.rs
+  s_a0868d54f0983f::t_10fe0d8d9d4a7a 1-268
+crates/esker-sql/src/value/mod.rs
+  s_a0868d54f0983f::t_780e9e8760438d 32,291,311,318,409,435-439,449-450,491-494,538-548,583
+crates/esker-sql/src/value/timestamp.rs
+  s_a0868d54f0983f::t_fe287bf85f1604 43,188-198,229-233,259-263,367-370,374-376,464,475-479,485,503
+crates/esker-sql/tests/corpus/pg19_date.txt
+  s_a0868d54f0983f::t_745bd45062dda2 1-117
+crates/esker-sql/tests/corpus/pg19_order.txt
+  s_a0868d54f0983f::t_57e8a4366d434b 27
+crates/esker-sql/tests/date.rs
+  s_a0868d54f0983f::t_9ff7e6f3ec163a 1-250
+crates/esker-sql/tests/pg_catalog.rs
+  s_a0868d54f0983f::t_0a7bce4eb8f234 188-191
+crates/esker-sql/tests/row_order.rs
+  s_a0868d54f0983f::t_5859a91472b136 90
+crates/esker-store/src/columnar/decode.rs
+  s_a0868d54f0983f::t_350b7c8b09bf82 181,199
+crates/esker-store/src/columnar/wire.rs
+  s_a0868d54f0983f::t_970b7fa965b743 105,122
+docs/adr/0033-tier-1-of-the-type-surface.md
+  s_a0868d54f0983f::t_fd85205681ed0a 221-225
+docs/plans/phase-9-rails.md
+  s_a0868d54f0983f::t_ee6909a544fe4a 1269-1270,1453
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "ad23c4c8b27a53b72d061873337c4650124a7606",
+  "prompts": {},
+  "sessions": {
+    "s_a0868d54f0983f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "001c95bd-db24-4085-b657-66d3a8400c25",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
