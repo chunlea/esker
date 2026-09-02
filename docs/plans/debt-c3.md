@@ -427,3 +427,57 @@ filesystem §4 uses, and asserts the option changes which call is made. It canno
 because on this platform there is none to tell apart — the two calls are the same syscall. What it
 pins is the thing that actually rots: that the option still reaches the call site. Shown red by
 replacing the branch with `if false`: *"the option is on and the log still took `sync_data`"*.
+
+## 6. The hour-long chaos hang did not reproduce, under load, three times
+
+Inventory #8. `docs/plans/phase-8-learner.md` §"The hour-long chaos test did not reproduce"
+instructs: reproduce the hang under load **before** changing the retry path, and take a sample
+while it is wedged. `retry::may_ask_again` had been named as the likely cause from a single stack
+sample of a single hour-long run.
+
+### What was run
+
+`fifty_sigkills_of_the_leader_process` — the `#[ignore]`d 50-kill acceptance battery, the long form
+of the test that hung — three times, in release, on a box carrying a parallel `cargo build` loop
+the whole time. Load average sat between 20 and 23 for the duration, against a machine that was
+otherwise quiet when the two clean runs in phase 8 were taken.
+
+```
+cargo build --release -p esker-cli --tests
+target-c3/release/deps/cluster_chaos-<hash> fifty_sigkills_of_the_leader_process \
+    --ignored --nocapture --test-threads 1
+```
+
+The load ran against a **detached worktree** with its own target directory, not the shared tree:
+the first version of the load script rebuilt in place and touched a file to force it, which would
+have invalidated the other lane's build as a side effect. It changed no content and was stopped
+within a minute, but the shape was wrong and is worth naming.
+
+### The three runs
+
+| run | wall | acknowledged | ambiguous | refused | worst convergence |
+|---|---|---|---|---|---|
+| 1 | 150.55 s | 2537 | 137 | 202 | 2.835 s |
+| 2 | 151.42 s | 2506 | 124 | 228 | 2.712 s |
+| 3 | 150.07 s | 2568 | 152 | 202 | 2.761 s |
+
+Every key's history linearizable in every run — 1364 to 1408 operations each — and worst
+convergence a little over half the 5 s budget in all three. **No hang, and nothing near one**: the
+spread across three loaded runs is under 1.5 seconds, which is the opposite of the signature a
+liveness bug leaves.
+
+### What this does and does not settle
+
+It does not refute the original observation. An hour-long run happened, and a test that takes 150 s
+under load average 22 could still wedge under some condition this did not produce — a different
+kill pattern, a slower disk, a machine with fewer cores than the four clients want.
+
+What it does settle is that **there is nothing here to fix against**. The instruction the plan left
+was to reproduce first precisely so that nobody would change `retry::may_ask_again` against a green
+test, and three loaded runs at 150 seconds are as green as this test gets. `retry::may_ask_again`
+is **untouched**, which is the whole content of this unit: the recorded hypothesis stays recorded,
+now with a load figure beside it rather than only a quiet-box one.
+
+Anyone picking it up again should note that the numbers above are the baseline to beat. A run that
+takes materially longer than 152 s under comparable load is the reproduction this could not get,
+and the thing to do with it is `sample <pid>` before anything else.
