@@ -11,7 +11,8 @@
 //! esker [--version | -V] [--help | -h]
 //! esker bench [<workload>] [--num N] [--value-size N] [--batch-size N] [--threads N]
 //!             [--sync] [--dir PATH] [--duration-secs N] [--remote HOST:PORT]
-//!             [--write-buffer-size N] [--target-file-size N] [--compact] [--help]
+//!             [--write-buffer-size N] [--target-file-size N] [--block-size N]
+//!             [--compact] [--help]
 //! esker sst-dump <path> [--verbose | -v] [--prefix-len N] [--help]
 //! esker wal-dump <path> [--verbose | -v] [--help]
 //! esker manifest-dump <dir> [--help]
@@ -210,6 +211,9 @@ Bench options:
       --target-file-size N
                         Bytes per compaction output file. This is what decides how
                         many files a level below L0 holds
+      --block-size N    Bytes per SST data block (default 4 KiB). With --sst-store
+                        this is the round-trip granularity of a cold read: one
+                        ranged GET per block
       --compact         Compact the whole database before the measured phase, so the
                         read workload runs against levels rather than against L0.
                         Untimed, like the fill
@@ -432,14 +436,9 @@ fn parse_bench(arguments: &[String]) -> Result<Command, ParseError> {
             options.compact = true;
             continue;
         }
-        if flag == "--write-buffer-size" {
-            let raw = take_value(arguments, &mut index, inline, "--write-buffer-size")?;
-            options.write_buffer_size = Some(positive_bytes("--write-buffer-size", &raw)?);
-            continue;
-        }
-        if flag == "--target-file-size" {
-            let raw = take_value(arguments, &mut index, inline, "--target-file-size")?;
-            options.target_file_size = Some(positive_bytes("--target-file-size", &raw)?);
+        if let Some(name) = shape_flag(flag) {
+            let raw = take_value(arguments, &mut index, inline, name)?;
+            apply_shape_flag(&mut options, name, &raw)?;
             continue;
         }
 
@@ -516,6 +515,32 @@ fn take_value(
     };
     *index += 1;
     Ok(value.clone())
+}
+
+/// Sets one of the shape flags. Split out of [`parse_bench`] only for its length.
+fn apply_shape_flag(
+    options: &mut BenchOptions,
+    name: &'static str,
+    raw: &str,
+) -> Result<(), ParseError> {
+    match name {
+        "--write-buffer-size" => options.write_buffer_size = Some(positive_bytes(name, raw)?),
+        "--target-file-size" => options.target_file_size = Some(positive_bytes(name, raw)?),
+        _ => options.block_size = Some(positive_bytes(name, raw)?),
+    }
+    Ok(())
+}
+
+/// The three flags that describe the *shape* of the tree a benchmark builds, rather than the
+/// workload run against it. Grouped because they are parsed identically and because a reader
+/// looking for "how do I make this database have many files at a level" should find them together.
+fn shape_flag(flag: &str) -> Option<&'static str> {
+    match flag {
+        "--write-buffer-size" => Some("--write-buffer-size"),
+        "--target-file-size" => Some("--target-file-size"),
+        "--block-size" => Some("--block-size"),
+        _ => None,
+    }
 }
 
 /// A byte count that must be greater than zero.

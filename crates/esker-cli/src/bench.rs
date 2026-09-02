@@ -268,6 +268,13 @@ pub(crate) struct Run {
     /// many L0 files a fill produces; a compaction then cuts a new output every
     /// `target_file_size` bytes regardless of how many inputs it had.
     pub(crate) target_file_size: Option<u64>,
+    /// Bytes per SST data block. `None` is the engine's 4 KiB default.
+    ///
+    /// The knob a **tiered** read is actually about: `TieredFile::read_at` issues one ranged
+    /// `GET` per block, so the block size is the round-trip granularity of a cold read against
+    /// object storage. It is a format choice for the files a run writes, not a read-side setting,
+    /// which is why measuring it needs a fresh database per size.
+    pub(crate) block_size: Option<usize>,
     /// Compact the whole database before the measured phase.
     ///
     /// Off by default, because a benchmark should measure the shape a workload actually leaves.
@@ -294,6 +301,7 @@ impl Default for Run {
             remote: None,
             write_buffer_size: None,
             target_file_size: None,
+            block_size: None,
             compact: false,
             sst_store: None,
             sst_cache_bytes: None,
@@ -412,6 +420,9 @@ fn run_in(options: &Run, dir: &Path) -> Result<Report, String> {
                 target_file_size: options
                     .target_file_size
                     .unwrap_or(CfOptions::default().target_file_size),
+                block_size: options
+                    .block_size
+                    .unwrap_or(CfOptions::default().block_size),
                 ..CfOptions::default()
             },
             ..Options::default()
@@ -791,6 +802,7 @@ mod tests {
             remote: None,
             write_buffer_size: None,
             target_file_size: None,
+            block_size: None,
             compact: false,
             sst_store: None,
             sst_cache_bytes: None,

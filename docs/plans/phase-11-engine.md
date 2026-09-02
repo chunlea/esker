@@ -224,10 +224,14 @@ somebody else's.
 | U1b | `esker-sim/tests/mech_retry.rs`, `esker-client/tests/sim_retry.rs` | seeded runs, no wall clock |
 | U1c | `esker-sim/tests/mech_sweep.rs`, `esker-store/tests/sim_sweep.rs` | `stateright` + a real store |
 | U1d | `esker-sim/tests/mech_ask.rs`, `esker-store/tests/sim_snapshot_ask.rs` | `stateright` + a real store |
-| U2 | `esker-engine/tests/db.rs`, a new level-iterator property test | property, unit |
-| U3 | `esker-engine` unit tests + a working-set test | unit |
-| U4 | `esker-engine/tests/tier_minio.rs` (measurement only) | measurement |
+| U2 | `esker-engine/tests/level_iter.rs` (3) | differential against a single-file level, plus a laziness measurement |
+| U3 | `esker-engine/tests/table_cache.rs` (3) | hit rate, capacity, the degenerate capacity of one |
+| U4 | measurement only, against `esker-minio` | measurement |
 | U5 | — | none; ADR only |
+
+Every one of U2's and U3's assertions was run against the code as it was before the change, by
+patching the old rule back in — see §12. Two of them did not discriminate on the first attempt and
+both are recorded there rather than quietly fixed.
 
 ## 10. The runs, with seeds
 
@@ -437,3 +441,129 @@ intermittent and that widening the window with debug logging made the race deter
 a different mode with the same symptom — starvation rather than a race — and the way to tell them
 apart is that the failure does not survive being run alone. Do not read a red `promotion.rs` under
 a parallel gate as the return of that bug without re-running it by itself first.
+
+## 11. U2–U5, as built
+
+### U2 — the two-level iterator (`07a3b97`)
+
+Built as planned, with two things the plan did not say.
+
+**The tombstone walk was doing as much work as the cursors.** `Db::iter` opened every file at every
+level twice over: once to push a cursor, and once — the same call — to ask whether the file carried
+a range tombstone. ADR 0017 decision 6 says a compaction whose inputs carry one becomes a discharge,
+so no tombstone is ever written below L0 and that question only ever had one possible answer below
+L0. The collection is now an L0 walk. The `debug_assert` that checked the invariant moved into
+`LevelCursor::open`, where it fires on every file actually opened rather than on every file in the
+database.
+
+**`esker-cli bench` could not express the shape.** Four flags were added, all bench-only:
+`--write-buffer-size`, `--target-file-size`, `--compact`, and later `--block-size`. Without a
+compaction everything is in L0, which is the one level this change leaves alone; without a small
+`--target-file-size` a compaction writes one output file and there is nothing to be lazy about. A
+benchmark that can only measure the default shape can only answer questions about the default
+shape.
+
+And a workload, `scanrange`: seek to a random key, read `--batch-size` entries, once per operation.
+`readseq` builds one iterator and walks 400,000 keys with it, so whatever building one costs is
+divided by 400,000 — it is nearly blind to the thing this unit changed.
+
+### U3 — the table cache evicts by use
+
+`db/table_cache.rs`'s victim was `open.keys().next()`, the **lowest file number**. File numbers rise
+monotonically, so that is the oldest file, which in a levelled engine is the one that has survived
+the most compactions — the deepest, largest, most-read file in the tree. The cache was
+systematically discarding its best entry.
+
+Now a `HashMap` beside a `BTreeMap` from a monotonic use tick to a file number: exact LRU, O(log n)
+eviction, forty lines of safe code, one lock so the two views cannot disagree.
+
+**Not the sharded LRU the plan named, and the reason is written into the module.** `cache/lru.rs` is
+eight shards of an index-linked arena because it holds hundreds of thousands of blocks on the path
+of every block read. This holds 256 entries and its critical section is a map lookup and an `Arc`
+clone. Sharding it would be optimising before a profile, which `CLAUDE.md` forbids, and would trade
+an exact LRU for a per-shard approximation. `cache/lru.rs` is named as the shape to copy if a
+profile ever shows this mutex.
+
+`Options::max_open_tables` is new, because the question "which entry goes" has no observable answer
+on a database with fewer files than the cache has room for.
+
+### U4 — the tiered read block size: measured, and **no knob added**
+
+The plan said measure first and add the knob only if the numbers say so. They say not to.
+
+`TieredFile::read_at` issues exactly one ranged `GET` per call, so a **point read costs one round
+trip whatever the block size** — 50,004 GETs for 50,000 operations at 4, 16, 64 and 256 KiB alike.
+The block size cannot buy a point read a round trip; it can only change how many bytes that trip
+carries, which is free up to 64 KiB and costs 34% of the throughput and 6× the p99 at 256 KiB.
+
+A **scan** is the opposite: its GET count falls exactly in proportion (1,393 → 349 → 91 → 26) and
+its throughput rises 14.7× across the same range.
+
+So the knob contemplated — a tiered read size separate from the SST block size — would duplicate
+`CfOptions::block_size` for scans and actively harm point reads, with no setting a reader could
+choose correctly without knowing which workload was about to arrive. Nothing was added.
+
+What the numbers *do* support is that **4 KiB is a poor default for a tiered column family**: 16
+KiB is better in both workloads and 64 KiB is defensible. That is a format decision affecting every
+non-tiered database too, the local-disk numbers for it are not in this table, and it is explicitly
+**not this lane's to take**. It is recorded with its measurement in `docs/bench/phase-11-engine.md`
+§3 for whoever does.
+
+The bench flag `--block-size` stays, because it is what made the question answerable and what will
+make the follow-up answerable.
+
+### U5 — the skiplist ADR
+
+[ADR 0040](../adr/0040-the-in-house-arena-skiplist.md), **design only**, as the brief required. The
+lane stopped at the ADR and did not write the code.
+
+The argument the ADR makes that was not obvious going in: the memtable does not need a general
+lock-free ordered map. Writers are serialised by group commit, the structure is append-only for its
+whole life, and a reader outliving a table's retirement is already handled by the `Arc` that
+`MemTable::iter` holds. `crossbeam-epoch` exists to answer "when may a node freed by one thread be
+reclaimed" — a structure that frees nothing until the arena drops never asks it. That reduces the
+job to LevelDB's single-writer arena skiplist, and the `unsafe` surface to three functions.
+
+## 12. The two tests that did not discriminate, and what fixed them
+
+Both are U2/U3 tests that passed against the code they were written to catch. Recorded because the
+failure mode is the same one §2 is built to avoid, and it does not stop being possible because the
+lane has a rule about it.
+
+**The level-iterator differential compared the level cursor with itself.** It spread the data by
+turning `write_buffer_size` down, which controls how many *L0* files a fill produces — and the
+compaction then merged them into one output file either way. `target_file_size` is the knob that
+decides how many files a level holds. The shape assertion (`many > one`) is what caught it, and it
+stayed in the test: a differential whose two sides came out identical proves nothing, and it should
+say so rather than pass.
+
+**The table-cache hit-rate test scored 0.215 under both rules.** Capacity 2 with three distinct
+files touched per round evicts the hot file whatever the victim rule is, so the two rules were
+indistinguishable by construction. At capacity 3 they separate cleanly:
+
+```
+least-recently-used   0.992  (595 hits,   5 misses, 254 evictions)
+lowest file number    0.615  (369 hits, 231 misses, 469 evictions)
+```
+
+The threshold was then 0.55 — below **both** numbers. Two mistakes stacked: a fixture that could
+not discriminate, and a bound that would not have noticed if it could. It is 0.90 now, with both
+measurements written into the test beside it so the next reader can see where the bound came from.
+
+The old rule also evicts nearly twice as often, which is the part that makes it worse than random
+rather than merely different: everything it discards is something that gets asked for again.
+
+## 13. `DESIGN.md` was right and the code was behind
+
+Worth recording because it inverts the usual drift. §4.9 has said *"a merge iterator over memtables
+and per-level two-level iterators"* since phase 1. The code has never done that — it pushed one
+cursor per file at every level — so U2 is not a design change, it is the code catching up with a
+document that was correct for four phases. The `TODO(post-v1)` at `db/iter.rs:406` names LevelDB's
+shape without noticing that this project's own design document had already specified it.
+
+`CLAUDE.md` says code and DESIGN.md must never drift and that a change fixes one of them. The
+disagreement here was in the direction nobody checks for: the document was ahead.
+
+§4.9 gains the two paragraphs the change makes true — why L0 is the exception, and why the
+tombstone walk is an L0 walk — and §14 gains a row for the open-reader bound, which had no default
+recorded anywhere.
