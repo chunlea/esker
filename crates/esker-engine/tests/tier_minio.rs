@@ -117,7 +117,12 @@ fn claiming_fs(
     )
 }
 
-/// A unique prefix per run, so a re-run does not meet its own claim from last time.
+/// A unique prefix per run, so a re-run does not meet its own objects from last time.
+///
+/// **Every test here needs this, not only the claim ones.** A fresh database numbers its first
+/// SST `000004` whatever else has ever existed, and `TieredFileSystem::new` adopts what the bucket
+/// already holds — so a second run under a fixed prefix finds `000004` already uploaded, skips the
+/// upload, and fails on a count of zero. Two tests learned that the hard way.
 fn unique_prefix(what: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -185,7 +190,8 @@ fn docker(action: &str, container: &str) -> bool {
 #[ignore = "needs a MinIO container; see the module docs"]
 fn a_database_that_lost_its_ssts_rebuilds_from_the_bucket() {
     let dir = tempfile::tempdir().unwrap();
-    let prefix = "acceptance";
+    let prefix = unique_prefix("acceptance");
+    let prefix = prefix.as_str();
 
     let db = open(dir.path(), prefix, None);
     for batch in 0..3 {
@@ -235,7 +241,8 @@ fn a_database_that_lost_its_ssts_rebuilds_from_the_bucket() {
 fn an_outage_leaves_the_sst_local_and_the_retry_lands() {
     let container = env_or("ESKER_S3_CONTAINER", "esker-minio");
     let dir = tempfile::tempdir().unwrap();
-    let prefix = "outage";
+    let prefix = unique_prefix("outage");
+    let prefix = prefix.as_str();
     let db = open(dir.path(), prefix, None);
 
     write_and_flush(&db, "before-", 200);
