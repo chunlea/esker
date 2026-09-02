@@ -16,8 +16,13 @@
 //!   connection closing.
 //!
 //! Everything else — `100 Continue` handling, trailers with meaning, content codings,
-//! pipelining, keep-alive reuse — is out. The client opens a connection per request, which is
-//! wasteful and completely adequate for one upload per flush.
+//! pipelining — is out.
+//!
+//! **Keep-alive is in**, since [ADR 0039](../../../docs/adr/0039-a-kept-alive-s3-connection.md):
+//! a request says `Connection: keep-alive` and [`Response::may_reuse_connection`] says whether the
+//! answer allows it. Pipelining stays out, and that is what makes reuse safe to parse for — a
+//! response's bytes are the only bytes in flight when it is read, so no reader here can over-read
+//! into the next one.
 
 use std::io::Read;
 
@@ -144,9 +149,13 @@ impl<'a> Request<'a> {
 
     /// The bytes to put on the wire.
     ///
-    /// `Connection: close` is deliberate: one connection per request means no state to get
-    /// wrong between them, and an upload per flush does not need pooling. When that becomes a
-    /// measured cost it is a change to [`crate::transport`], not to this.
+    /// `Connection: keep-alive` since ADR 0039. It is redundant on HTTP/1.1, where persistence is
+    /// the default, and it is written anyway because a proxy or an HTTP/1.0 endpoint in the middle
+    /// reads it — and because the header is what makes the intent visible in a packet capture.
+    ///
+    /// **Not signed.** Every header in `self.headers` goes into the canonical request; this one is
+    /// appended after them and is a hop-by-hop header, which `SigV4` does not cover. That is why
+    /// changing it here changed no signature.
     #[must_use]
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(512 + self.body.len());
@@ -160,7 +169,7 @@ impl<'a> Request<'a> {
             out.extend_from_slice(value.as_bytes());
             out.extend_from_slice(b"\r\n");
         }
-        out.extend_from_slice(b"Connection: close\r\n\r\n");
+        out.extend_from_slice(b"Connection: keep-alive\r\n\r\n");
         out.extend_from_slice(self.body);
         out
     }
@@ -191,6 +200,44 @@ impl Response {
     #[must_use]
     pub fn is_success(&self) -> bool {
         (200..300).contains(&self.status)
+    }
+
+    /// Whether the connection this arrived on may carry another request.
+    ///
+    /// Three things say no, and the first two are the ones that matter:
+    ///
+    /// * **`Connection: close`.** The server has said this is the last exchange. The value is a
+    ///   comma-separated list of tokens, so it is searched rather than compared.
+    /// * **No framing.** A response with neither `Content-Length` nor `Transfer-Encoding: chunked`
+    ///   is delimited by the close itself, so there is nothing left to reuse. This is also the case
+    ///   an HTTP/1.0 endpoint without keep-alive produces, which is why the version is not needed
+    ///   here to reach the right answer.
+    /// * a status that carries no body is exempt from the framing rule, because `204` and `304`
+    ///   have no body to delimit and are perfectly reusable.
+    ///
+    /// Erring towards `false` costs a connection; erring towards `true` costs a request sent into
+    /// a socket the peer has finished with.
+    #[must_use]
+    pub fn may_reuse_connection(&self) -> bool {
+        let closing = self
+            .headers
+            .iter()
+            .filter(|(name, _)| name == "connection")
+            .any(|(_, value)| {
+                value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("close"))
+            });
+        if closing {
+            return false;
+        }
+        if matches!(self.status, 204 | 304) || (100..200).contains(&self.status) {
+            return true;
+        }
+        self.headers.iter().any(|(name, value)| {
+            name == "content-length"
+                || (name == "transfer-encoding" && value.eq_ignore_ascii_case("chunked"))
+        })
     }
 
     /// The body as text, truncated, for an error message.
