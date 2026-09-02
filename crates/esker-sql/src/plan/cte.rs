@@ -176,6 +176,7 @@ fn for_each_subquery_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut TableRef))
         | Expr::Parameter(_)
         | Expr::Column { .. }
         | Expr::Ordinal { .. }
+        | Expr::Outer { .. }
         | Expr::Default
         | Expr::Sequence(_) => {}
     }

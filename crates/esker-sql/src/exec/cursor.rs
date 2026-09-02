@@ -294,6 +294,13 @@ impl<'a> Cursor<'a> {
         reason = "one arm per node kind; splitting it would hide the pipeline rather than clarify it"
     )]
     pub(super) fn next(&mut self) -> Result<Option<Vec<Datum>>> {
+        // Copied out before the match borrows `self.kind`, and it is why a correlated subquery can
+        // run at all: the evaluator is handed the transaction this cursor is already reading in,
+        // so the sub-plan it opens sees the same snapshot as the row it is correlated to.
+        let env = Env {
+            txn: Some(self.txn),
+            tenant: self.tenant,
+        };
         match &mut self.kind {
             Kind::One(used) => Ok(if std::mem::replace(used, true) {
                 None
@@ -419,7 +426,7 @@ impl<'a> Cursor<'a> {
                         let keep = match residual {
                             None => true,
                             Some(condition) => {
-                                matches!(evaluate(condition, &joined)?, Datum::Bool(true))
+                                matches!(evaluate_in(condition, &joined, env)?, Datum::Bool(true))
                             }
                         };
                         if keep {
@@ -434,7 +441,7 @@ impl<'a> Cursor<'a> {
                 while let Some(row) = input.next()? {
                     // NULL is not true. That is the whole of three-valued logic in a `WHERE`: only
                     // a definite true keeps a row, which is why `n = NULL` matches nothing.
-                    if matches!(evaluate(predicate, &row)?, Datum::Bool(true)) {
+                    if matches!(evaluate_in(predicate, &row, env)?, Datum::Bool(true)) {
                         return Ok(Some(row));
                     }
                 }
@@ -445,7 +452,7 @@ impl<'a> Cursor<'a> {
                 None => Ok(None),
                 Some(row) => exprs
                     .iter()
-                    .map(|expr| evaluate(expr, &row))
+                    .map(|expr| evaluate_in(expr, &row, env))
                     .collect::<Result<Vec<_>>>()
                     .map(Some),
             },
@@ -468,7 +475,7 @@ impl<'a> Cursor<'a> {
                     }
                     let mut failure = None;
                     rows.sort_by(|left, right| {
-                        compare_rows(keys, left, right).unwrap_or_else(|error| {
+                        compare_rows(keys, left, right, env).unwrap_or_else(|error| {
                             failure.get_or_insert(error);
                             Ordering::Equal
                         })
@@ -499,8 +506,15 @@ impl<'a> Cursor<'a> {
                             "an aggregate cursor over a node that is not one".to_owned(),
                         ));
                     };
-                    *groups =
-                        fold(&mut source, keys, aggregates, having.as_ref(), *grouped)?.into_iter();
+                    *groups = fold(
+                        &mut source,
+                        keys,
+                        aggregates,
+                        having.as_ref(),
+                        *grouped,
+                        env,
+                    )?
+                    .into_iter();
                 }
                 Ok(groups.next())
             }
@@ -574,18 +588,23 @@ fn left_extend(left_join: bool, row: &[Datum], inner_width: usize) -> Option<Vec
 /// has an answer even when there are none — and a *grouped* one produces nothing, because there is
 /// no group to describe. Both were measured; getting the first wrong turns `SELECT count(*)` on an
 /// empty table into an empty result, which a client reads as a failed query.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one aggregate fold, and every argument is a field of the node it folds"
+)]
 fn fold(
     input: &mut Cursor<'_>,
     keys: &[Expr],
     aggregates: &[AggregateSpec],
     having: Option<&Expr>,
     grouped: bool,
+    env: Env<'_>,
 ) -> Result<Vec<Vec<Datum>>> {
     let mut groups: BTreeMap<GroupKey, Vec<Accumulator>> = BTreeMap::new();
     while let Some(row) = input.next()? {
         let key = GroupKey(
             keys.iter()
-                .map(|key| evaluate(key, &row))
+                .map(|key| evaluate_in(key, &row, env))
                 .collect::<Result<Vec<_>>>()?,
         );
         if !groups.contains_key(&key) && groups.len() == GROUP_LIMIT {
@@ -601,7 +620,7 @@ fn fold(
             // is NULL. Handing it a non-NULL placeholder keeps that in one place.
             let value = match &spec.arg {
                 None => Datum::Bool(true),
-                Some(arg) => evaluate(arg, &row)?,
+                Some(arg) => evaluate_in(arg, &row, env)?,
             };
             accumulator.push(&value)?;
         }
@@ -623,7 +642,7 @@ fn fold(
         // without the clause returns one row of zero. Measured, and not a shape anybody guesses.
         let keep = match having {
             None => true,
-            Some(having) => matches!(evaluate(having, &row)?, Datum::Bool(true)),
+            Some(having) => matches!(evaluate_in(having, &row, env)?, Datum::Bool(true)),
         };
         if keep {
             rows.push(row);
@@ -707,9 +726,17 @@ fn point(txn: &dyn Txn, tenant: u64, node: &Node) -> Result<Option<Vec<Datum>>> 
     }
 }
 
-fn compare_rows(keys: &[SortKey], left: &[Datum], right: &[Datum]) -> Result<Ordering> {
+fn compare_rows(
+    keys: &[SortKey],
+    left: &[Datum],
+    right: &[Datum],
+    env: Env<'_>,
+) -> Result<Ordering> {
     for key in keys {
-        let (a, b) = (evaluate(&key.expr, left)?, evaluate(&key.expr, right)?);
+        let (a, b) = (
+            evaluate_in(&key.expr, left, env)?,
+            evaluate_in(&key.expr, right, env)?,
+        );
         let ordering = match (matches!(a, Datum::Null), matches!(b, Datum::Null)) {
             (true, true) => Ordering::Equal,
             // NULL is the largest value, and `NULLS FIRST` is what moves it. PostgreSQL's default
@@ -738,7 +765,38 @@ fn nulls(first: bool, when_first: Ordering, otherwise: Ordering) -> Ordering {
 }
 
 /// Evaluates an expression against a row.
+/// What a correlated subquery needs from the executor: a transaction to run in.
+///
+/// [`Env::none`] is what everything that is not a `Cursor` passes — `crate::exec::dml`'s
+/// `RETURNING` and its `UPDATE ... SET`, which evaluate expressions over a row they already have.
+/// A correlated subquery cannot appear in either, because this phase does not lower a subquery
+/// into a statement that writes, and one arriving there says so rather than answering NULL.
+#[derive(Clone, Copy)]
+pub(super) struct Env<'a> {
+    txn: Option<&'a dyn Txn>,
+    tenant: u64,
+}
+
+impl Env<'_> {
+    /// No transaction: a caller that evaluates over a row and cannot start a query.
+    pub(super) fn none() -> Self {
+        Env {
+            txn: None,
+            tenant: 0,
+        }
+    }
+}
+
+/// Evaluates an expression over a row, with no way to run a subquery of its own.
 pub(super) fn evaluate(expr: &Expr, row: &[Datum]) -> Result<Datum> {
+    evaluate_in(expr, row, Env::none())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per expression shape; splitting it would hide the vocabulary rather than clarify it"
+)]
+pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Datum> {
     use crate::plan::Literal;
     Ok(match expr {
         Expr::Ordinal { at, .. } => row.get(*at).cloned().unwrap_or(Datum::Null),
@@ -751,6 +809,14 @@ pub(super) fn evaluate(expr: &Expr, row: &[Datum]) -> Result<Datum> {
         Expr::Column { name, .. } => {
             return Err(SqlError::Internal(format!(
                 "column \"{name}\" reached the executor unresolved"
+            )));
+        }
+        // Substituted before the sub-plan it lives in is opened, the way an aggregate is rewritten
+        // before the tree is built. One here means a correlated sub-plan was run without being
+        // given the row it is correlated to.
+        Expr::Outer { level, at, .. } => {
+            return Err(SqlError::Internal(format!(
+                "an outer reference to column {at}, {level} scopes out, reached the row evaluator"
             )));
         }
         Expr::Parameter(number) => return Err(SqlError::UndefinedParameter(*number)),
@@ -782,18 +848,34 @@ pub(super) fn evaluate(expr: &Expr, row: &[Datum]) -> Result<Datum> {
         // which is three-valued logic and lives beside the rules it implements.
         Expr::Subquery(sub) => {
             let operand = match &sub.operand {
-                Some(operand) => Some(evaluate(operand, row)?),
+                Some(operand) => Some(evaluate_in(operand, row, env)?),
                 None => None,
             };
-            crate::exec::subquery::value(sub, operand)?
+            match (sub.correlated, env.txn) {
+                // Uncorrelated: its rows were produced before this cursor was opened, by
+                // `crate::exec::subquery::resolve`.
+                (false, _) => crate::exec::subquery::value(sub, operand)?,
+                // Correlated: a different answer for this row, so it runs now. The nested loop
+                // this makes is the shape, not an accident (`docs/plans/phase-12-subquery.md` §1).
+                (true, Some(txn)) => {
+                    let values = crate::exec::subquery::run_correlated(sub, row, txn, env.tenant)?;
+                    crate::exec::subquery::value_of(sub.kind, operand, &values)?
+                }
+                (true, None) => {
+                    return Err(SqlError::Internal(format!(
+                        "{} reached an evaluator with no transaction to run in",
+                        sub.kind.describe()
+                    )));
+                }
+            }
         }
 
         Expr::IsNull { operand, negated } => {
-            let value = evaluate(operand, row)?;
+            let value = evaluate_in(operand, row, env)?;
             Datum::Bool(matches!(value, Datum::Null) != *negated)
         }
 
-        Expr::Not(operand) => match evaluate(operand, row)? {
+        Expr::Not(operand) => match evaluate_in(operand, row, env)? {
             Datum::Bool(value) => Datum::Bool(!value),
             // NOT of unknown is unknown.
             Datum::Null => Datum::Null,
@@ -808,10 +890,10 @@ pub(super) fn evaluate(expr: &Expr, row: &[Datum]) -> Result<Datum> {
             operand,
             list,
             negated,
-        } => in_list(operand, list, *negated, row)?,
+        } => in_list(operand, list, *negated, row, env)?,
 
         Expr::Binary { op, left, right } => {
-            let (left, right) = (evaluate(left, row)?, evaluate(right, row)?);
+            let (left, right) = (evaluate_in(left, row, env)?, evaluate_in(right, row, env)?);
             match op {
                 // Three-valued AND and OR, and they are not symmetric: a definite `false` makes an
                 // AND false whatever the other side is, and a definite `true` makes an OR true.
@@ -862,8 +944,14 @@ pub(super) fn evaluate(expr: &Expr, row: &[Datum]) -> Result<Datum> {
 /// Measured on 19beta1, `tests/corpus/pg19_in.txt`. A scan rather than a rewrite to `= a OR = b`,
 /// so the left-hand side is evaluated once — which also keeps a `nextval` on the left from
 /// running per item.
-fn in_list(operand: &Expr, list: &[Expr], negated: bool, row: &[Datum]) -> Result<Datum> {
-    let operand = evaluate(operand, row)?;
+fn in_list(
+    operand: &Expr,
+    list: &[Expr],
+    negated: bool,
+    row: &[Datum],
+    env: Env<'_>,
+) -> Result<Datum> {
+    let operand = evaluate_in(operand, row, env)?;
     // A NULL on the left can neither match nor definitely fail to, so nothing in the list can
     // change the answer.
     if matches!(operand, Datum::Null) {
@@ -872,7 +960,7 @@ fn in_list(operand: &Expr, list: &[Expr], negated: bool, row: &[Datum]) -> Resul
     let mut unknown = false;
     let mut matched = false;
     for item in list {
-        let item = evaluate(item, row)?;
+        let item = evaluate_in(item, row, env)?;
         if matches!(item, Datum::Null) {
             unknown = true;
             continue;

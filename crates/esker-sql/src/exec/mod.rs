@@ -848,6 +848,7 @@ impl Executor {
                 self.tenant,
                 txn,
                 &Catalogued { exec: self, txn },
+                None,
             )?;
             &owned
         } else {

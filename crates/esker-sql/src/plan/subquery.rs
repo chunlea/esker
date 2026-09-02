@@ -140,6 +140,15 @@ pub struct SubqueryExpr {
     /// `None` for an `EXISTS`, which reads no value, and only ever `None` there: every other kind
     /// is `42601` when the subquery does not have exactly one column.
     pub column: Option<(String, ColumnType)>,
+    /// Whether anything in the sub-plan names a column of the row **outside** it.
+    ///
+    /// The one field that decides how many times this runs. `false` and it runs once, before the
+    /// cursor opens; `true` and it runs per outer row, with the outer values substituted in first.
+    /// Filled by [`crate::exec::subquery::plan_subqueries`] from the plan it built — a fact about
+    /// the plan rather than a reading of the statement, so a reference that resolved to the inner
+    /// scope after all does not count (`SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE
+    /// b.a_id = id)` is **not** correlated: `id` is `b`'s).
+    pub correlated: bool,
     /// The subquery's answer: its single column, one entry per row — or, for an `EXISTS`, one
     /// entry per row of any value at all, because only the length is read.
     ///
@@ -173,6 +182,7 @@ impl SubqueryExpr {
             select,
             plan: None,
             column: None,
+            correlated: false,
             run: None,
         }
     }

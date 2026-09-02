@@ -64,6 +64,16 @@ pub(super) struct Scope<'a> {
     /// either equal or NULL. There is no third case here, because there is no `RIGHT` or `FULL`
     /// join in this crate to make one.
     using: Vec<String>,
+    /// The scope of the statement this one is a subquery of, or `None` for a statement that is not
+    /// one.
+    ///
+    /// This is the whole of correlation. A name the inner scope has is resolved there and the
+    /// outer scope is never asked — **the inner shadows the outer**, measured and not obvious:
+    /// `SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.a_id = id)` returns *no rows*,
+    /// because `b` has an `id` of its own and the query is `b.a_id = b.id`. A name it does not
+    /// have walks out one level at a time and becomes an [`crate::plan::Expr::Outer`] carrying how
+    /// far it walked.
+    outer: Option<&'a Scope<'a>>,
 }
 
 impl<'a> Scope<'a> {
@@ -74,6 +84,7 @@ impl<'a> Scope<'a> {
             names: Vec::new(),
             written: Vec::new(),
             using: Vec::new(),
+            outer: None,
         }
     }
 
@@ -89,6 +100,7 @@ impl<'a> Scope<'a> {
             names: vec![name],
             written: vec![0],
             using: Vec::new(),
+            outer: None,
         }
     }
 
@@ -105,7 +117,14 @@ impl<'a> Scope<'a> {
             names: vec![outer.1.to_owned(), inner.1.to_owned()],
             written: if swapped { vec![1, 0] } else { vec![0, 1] },
             using: using.to_vec(),
+            outer: None,
         }
+    }
+
+    /// The same scope, with the statement this one is a subquery of behind it.
+    pub(super) fn under(mut self, outer: Option<&'a Scope<'a>>) -> Self {
+        self.outer = outer;
+        self
     }
 
     /// N tables, in the order the query wrote them — which for a chain of joins is also the
@@ -119,6 +138,7 @@ impl<'a> Scope<'a> {
             names: entries.iter().map(|(_, name)| name.clone()).collect(),
             written: (0..entries.len()).collect(),
             using: Vec::new(),
+            outer: None,
         }
     }
 
@@ -223,6 +243,47 @@ impl<'a> Scope<'a> {
     /// and resolving twice — once for the type and once for the number beside it — is two lookups
     /// that can disagree about which `id` an ambiguous name meant.
     fn resolve_column(&self, qualifier: Option<&str>, name: &str) -> Result<(usize, &ColumnDef)> {
+        let (_, at, column) = self.lookup(qualifier, name)?;
+        Ok((at, column))
+    }
+
+    /// The same lookup, saying **how many scopes out** the name was found.
+    ///
+    /// `0` is this row and anything above it is a correlated reference. Two rules, both measured:
+    ///
+    /// * **the inner scope shadows the outer**, so a name this level has is never looked for
+    ///   further out — `SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.a_id = id)` is
+    ///   `b.a_id = b.id` and returns no rows;
+    /// * a name **no** level has, and a qualifier no level has, keep the errors they already had:
+    ///   `42703 column a.nope does not exist` and `42P01 missing FROM-clause entry for table "z"`,
+    ///   reported from the outermost level so the message names what the user wrote.
+    ///
+    /// Ambiguity stays a question about **one** level: PostgreSQL resolves innermost-first and two
+    /// tables of one level sharing a name is the `42702` it already was.
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<(usize, usize, &ColumnDef)> {
+        match self.resolve_here(qualifier, name) {
+            Ok((at, column)) => Ok((0, at, column)),
+            // **Only two failures walk outward**, and they are the two that mean "not here":
+            // a qualifier this level does not have, and a bare name none of its tables has.
+            // Everything else is *this* level's answer and is final — above all
+            // `42703 column b.nope does not exist`, where the qualifier resolved here and the
+            // column did not. Walking out from that reports the outer query's missing `b`
+            // instead, which is a different mistake with a different fix. Measured.
+            Err(error @ (SqlError::MissingFromEntry(_) | SqlError::UndefinedColumn(_))) => {
+                match self.outer {
+                    None => Err(error),
+                    Some(outer) => {
+                        let (level, at, column) = outer.lookup(qualifier, name)?;
+                        Ok((level + 1, at, column))
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The lookup at this level only.
+    fn resolve_here(&self, qualifier: Option<&str>, name: &str) -> Result<(usize, &ColumnDef)> {
         if let Some(qualifier) = qualifier {
             let index = self.entry(qualifier)?;
             if duplicated(self.tables[index], name) {
@@ -317,6 +378,21 @@ pub(super) fn plan(
     table: Option<&TableDef>,
     inners: &[&TableDef],
 ) -> Result<Planned> {
+    plan_under(select, tenant, table, inners, None)
+}
+
+/// The same, under the scope of the statement this one is a subquery of.
+///
+/// Everything a correlated subquery needs is here and it is one argument: the scopes this builds
+/// carry `outer`, so a name the sub-select does not have resolves one level out and becomes an
+/// [`crate::plan::Expr::Outer`]. Nothing else in the planner changes shape.
+pub(super) fn plan_under(
+    select: &Select,
+    tenant: u64,
+    table: Option<&TableDef>,
+    inners: &[&TableDef],
+    outer: Option<&Scope<'_>>,
+) -> Result<Planned> {
     // A **chain** of joins takes the other path: left-deep, in the order written, with no choice
     // of driving side. That is not a simplification of what one join does below — it is what the
     // SQL means. `A LEFT JOIN B ON … JOIN C ON …` is `((A LJ B) JOIN C)`, and swapping any step
@@ -324,7 +400,7 @@ pub(super) fn plan(
     // paths are not merged. The single-join case keeps its choice because an inner join of two
     // tables really is commutative and the probe only works on the inner side.
     if inners.len() > 1 {
-        return plan_chain(select, tenant, table, inners);
+        return plan_chain(select, tenant, table, inners, outer);
     }
     let inner = inners.first().copied();
     // Which side drives the loop. An inner join is commutative, so this is free to choose — and
@@ -352,11 +428,17 @@ pub(super) fn plan(
     // A **derived** side never drives the choice. `drive_from` swaps in order to reach a probe on
     // the inner table's key, and a derived table has none -- so a swap could only move the plan
     // that produces its rows to the side that is read once per outer row, for no gain.
+    // A **derived** side never drives the choice, and neither does a statement with a correlated
+    // subquery in it. The second is not taste: a swap moves each table's columns to a different
+    // place in the joined row, and an `Expr::Outer` is a *position* in that row — resolved against
+    // the written order by `written_scope` before this function ran. Swapping after that would
+    // read the wrong column, silently.
     let swappable = select
         .from
         .as_ref()
         .is_none_or(|from| from.derived.is_none())
-        && only_join.is_none_or(|join| join.table.derived.is_none());
+        && only_join.is_none_or(|join| join.table.derived.is_none())
+        && !has_correlated_subquery(select);
     let (scope, swapped) = drive_from(
         named_table,
         named_inner,
@@ -364,6 +446,7 @@ pub(super) fn plan(
         left_join,
         using,
     );
+    let scope = scope.under(outer);
     let (outer_table, inner_table) = match (table, inner, swapped) {
         (Some(left), Some(right), false) => (Some(left), Some(right)),
         (Some(left), Some(right), true) => (Some(right), Some(left)),
@@ -673,6 +756,7 @@ fn plan_chain(
     tenant: u64,
     table: Option<&TableDef>,
     inners: &[&TableDef],
+    enclosing: Option<&Scope<'_>>,
 ) -> Result<Planned> {
     let Some(outer) = table else {
         return Err(SqlError::Internal(
@@ -714,7 +798,7 @@ fn plan_chain(
     // one being joined — which is what makes a reference to a table two steps back resolve, and a
     // reference to one further right an "undefined column" rather than a silent NULL.
     for (at, (join, inner)) in select.joins.iter().zip(inners).enumerate() {
-        let scope = Scope::chain(&entries[..=at + 1]);
+        let scope = Scope::chain(&entries[..=at + 1]).under(enclosing);
         let left_join = join.kind == crate::plan::JoinKind::Left;
         node = join_node(
             node,
@@ -726,7 +810,7 @@ fn plan_chain(
         )?;
     }
 
-    let scope = Scope::chain(&entries);
+    let scope = Scope::chain(&entries).under(enclosing);
     if let Some(filter) = &select.filter {
         let predicate = resolve(filter, &scope)?;
         check_predicate(&predicate, "WHERE", &scope)?;
@@ -736,6 +820,75 @@ fn plan_chain(
         };
     }
     finish_plan(select, node, &scope, Some(outer))
+}
+
+/// Whether any subquery in this statement turned out to be correlated.
+///
+/// Read after `crate::exec::subquery::plan_subqueries` has planned them, which is where the answer
+/// is decided — before that every `correlated` is still `false`.
+fn has_correlated_subquery(select: &Select) -> bool {
+    fn in_expr(expr: &Expr) -> bool {
+        match expr {
+            Expr::Subquery(sub) => sub.correlated || sub.operand.as_deref().is_some_and(in_expr),
+            Expr::Binary { left, right, .. } => in_expr(left) || in_expr(right),
+            Expr::Not(inner) => in_expr(inner),
+            Expr::IsNull { operand, .. } => in_expr(operand),
+            Expr::InList { operand, list, .. } => in_expr(operand) || list.iter().any(in_expr),
+            Expr::Aggregate(call) => call.args.iter().any(in_expr),
+            _ => false,
+        }
+    }
+    let projected = select.projection.iter().any(|item| match item {
+        SelectItem::Expr { expr, .. } => in_expr(expr),
+        _ => false,
+    });
+    projected
+        || select
+            .joins
+            .iter()
+            .any(|join| join.on.as_ref().is_some_and(in_expr))
+        || select
+            .filter
+            .iter()
+            .chain(&select.having)
+            .chain(&select.group_by)
+            .any(in_expr)
+        || select.order_by.iter().any(|item| in_expr(&item.expr))
+}
+
+/// The scope a statement's subqueries are planned under: every table it names, **in the order
+/// written**.
+///
+/// Written order matters and is not free: [`drive_from`] may swap a two-table join, which changes
+/// where each column sits in the row — and an [`crate::plan::Expr::Outer`] is a *position* in that
+/// row. So a statement with a correlated subquery in it does not swap (`plan`'s `swappable`), and
+/// this builds the layout that decision guarantees.
+pub(super) fn written_scope<'a>(
+    select: &Select,
+    table: Option<&'a TableDef>,
+    inners: &'a [&'a TableDef],
+) -> Scope<'a> {
+    let Some(table) = table else {
+        return Scope::empty();
+    };
+    let named = |entry: &crate::plan::TableRef| entry.referred_as().to_owned();
+    let left = select.from.as_ref().map(named).unwrap_or_default();
+    // One join is `Scope::joined` rather than a two-entry chain, because only that carries a
+    // `USING` merge -- and without it a bare reference to a merged column would be `42702` from a
+    // subquery where the statement itself resolves it.
+    if let ([inner], [join]) = (inners, select.joins.as_slice()) {
+        return Scope::joined(
+            (table, &left),
+            (*inner, &named(&join.table)),
+            false,
+            &join.using,
+        );
+    }
+    let mut entries: Vec<(&TableDef, String)> = vec![(table, left)];
+    for (join, inner) in select.joins.iter().zip(inners) {
+        entries.push((*inner, named(&join.table)));
+    }
+    Scope::chain(&entries)
 }
 
 fn from_names(select: &Select) -> Result<(&str, &str)> {
@@ -1253,11 +1406,20 @@ const SYSTEM_COLUMNS: [&str; 6] = ["ctid", "xmin", "xmax", "cmin", "cmax", "tabl
 pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
     Ok(match expr {
         Expr::Column { table, name } => {
-            let (at, column) = scope.resolve_column(table.as_deref(), name)?;
-            Expr::Ordinal {
-                at,
-                ty: column.ty,
-                typmod: column.typmod,
+            let (level, at, column) = scope.lookup(table.as_deref(), name)?;
+            if level == 0 {
+                Expr::Ordinal {
+                    at,
+                    ty: column.ty,
+                    typmod: column.typmod,
+                }
+            } else {
+                Expr::Outer {
+                    level,
+                    at,
+                    ty: column.ty,
+                    typmod: column.typmod,
+                }
             }
         }
         Expr::Binary { op, left, right } => {
@@ -1758,7 +1920,7 @@ pub(super) fn typmod_of(expr: &Expr, scope: &Scope<'_>) -> i32 {
 pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
     Ok(match expr {
         Expr::Column { table, name } => scope.resolve_column(table.as_deref(), name)?.1.ty,
-        Expr::Ordinal { ty, .. } => *ty,
+        Expr::Ordinal { ty, .. } | Expr::Outer { ty, .. } => *ty,
         // A sequence function answers `bigint` on a real server, all four of them.
         Expr::Literal(Literal::Integer(_)) | Expr::Sequence(_) => ColumnType::Int8,
         Expr::Literal(Literal::Decimal(_)) => ColumnType::Double,

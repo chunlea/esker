@@ -124,6 +124,29 @@ pub enum Expr {
     /// once per statement in the order the statement names it. The executor evaluates these before
     /// it plans and substitutes the values it got; one reaching a row evaluator is a planner bug.
     Sequence(Box<SequenceCall>),
+    /// A column of a row **outside** the plan this expression is in: a correlated reference.
+    ///
+    /// `WHERE EXISTS (SELECT 1 FROM b WHERE b.a_id = a.id)` resolves `b.a_id` to an
+    /// [`Expr::Ordinal`] in the sub-plan's own row and `a.id` to one of these. It is never
+    /// evaluated: before a correlated sub-plan is run for one outer row, every `Outer` in it whose
+    /// `level` matches that row is replaced by the value it names, so the plan a cursor is opened
+    /// on has none left (`docs/plans/phase-12-subquery.md` §1).
+    Outer {
+        /// How many scopes out, one-based: `1` is the row immediately outside this plan.
+        ///
+        /// Needed rather than implied, because a sub-plan inside a sub-plan has **two** rows
+        /// outside it and both can be named — measured, a three-level `EXISTS` chain where the
+        /// innermost query references the middle table and the outermost one. Substitution matches
+        /// this against the depth it has descended to, which is why nothing has to be renumbered.
+        level: usize,
+        /// Position in that row.
+        at: usize,
+        /// The column's type, so a comparison against it resolves a literal the same way a
+        /// comparison against a column of this row does.
+        ty: ColumnType,
+        /// The column's typmod, for the same reason [`Expr::Ordinal`] carries one.
+        typmod: i32,
+    },
     /// A subquery written where a value goes — `(SELECT …)`, `EXISTS (…)`, `x IN (SELECT …)`,
     /// `x = ANY (SELECT …)`.
     ///
@@ -554,6 +577,7 @@ fn describe(expr: &Expr) -> &'static str {
         Expr::Literal(_) => "a literal",
         Expr::Parameter(_) => "a parameter",
         Expr::Column { .. } | Expr::Ordinal { .. } => "a column reference",
+        Expr::Outer { .. } => "a correlated column reference",
         Expr::Binary { .. } => "an operator",
         Expr::Not(_) => "NOT",
         Expr::IsNull { .. } => "IS NULL",

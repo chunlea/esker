@@ -1,6 +1,6 @@
 # Phase 12 — subqueries and CTEs: a query whose FROM is a query
 
-Status: **planning**. Unit 0 is this file.
+Status: **units 0–4 landed**; unit 5 (the `ActiveRecord` shapes) and unit 6 (the ADR) remain. §6 records what each unit cost and what it changed about the plan.
 
 `docs/plans/phase-9-rails.md` §5 left one sentence that this phase exists to delete:
 
@@ -197,12 +197,29 @@ itself, which is contract C2 and is checked by a test.
 
 ## 6. Progress
 
-| Unit | State | Commit |
+| Unit | State | What it cost |
 |---|---|---|
-| 0 — the plan | ✅ | this commit |
-| 1 — uncorrelated expressions | | |
-| 2 — derived tables | | |
-| 3 — CTEs | | |
-| 4 — correlated | | |
+| 0 — the plan | ✅ | `355cf84` |
+| 1 — uncorrelated expressions | ✅ | `f5e738e`, `f85740b`; 124-statement capture |
+| 2 — derived tables | ✅ | `468c1b6`; 65-statement capture, one new `Node` variant |
+| 3 — CTEs | ✅ | `ee2fcc3`; 51-statement capture, no executor at all |
+| 4 — correlated | ✅ | 34-statement capture; `Expr::Outer`, a scope chain, a nested loop |
 | 5 — the `ActiveRecord` shapes | | |
 | 6 — ADR and DESIGN.md | | |
+
+### What each unit changed about the plan above
+
+* **Unit 1** found the empty-subquery rule §1 does not mention and the capture header does:
+  `NULL IN (SELECT … no rows)` is **false**, so emptiness is decided before the three-valued rule.
+  And `LIMIT (SELECT …)` is the one subquery that cannot wait for the resolve pass — `Node::Limit`
+  holds a `usize` — so it is folded where the planner has a transaction.
+* **Unit 2** added `Node::Derived`, which computes nothing and exists for `EXPLAIN`: the plan text
+  threads one table name down the whole tree, and without a node to change it at, a scan inside a
+  derived table prints the wrong relation. It also needed `TableDef::row_id` to name the derived
+  relation id, or `SELECT *` came back one column short.
+* **Unit 3** needed no executor and one field: **an unreferenced CTE is still analysed**, which
+  inlining alone never does.
+* **Unit 4** made an outer reference carry **how far out** it reaches, because a three-level
+  `EXISTS` chain can name two rows outside itself; and it made a statement with a correlated
+  subquery in it refuse to swap its join, because a swap moves the columns an `Expr::Outer` is a
+  position into. A correlated `LIMIT` is `42P10`, measured.

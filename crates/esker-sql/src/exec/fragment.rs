@@ -461,6 +461,7 @@ fn push_filter(
         // line it means: a query with a subquery in its `WHERE` runs on rows.
         Expr::Subquery(sub) => return Err(refused(sub.kind.describe())),
         Expr::Column { .. } => return Err(refused("an unresolved column")),
+        Expr::Outer { .. } => return Err(refused("a correlated column reference")),
         Expr::Parameter(_) => return Err(refused("a parameter inside a pushed-down filter")),
         Expr::Default | Expr::Sequence(_) | Expr::Aggregate(_) => {
             return Err(refused("this expression"));
@@ -647,6 +648,8 @@ fn collect_columns(expr: &Expr, into: &mut Vec<usize>) {
         Expr::Literal(_)
         | Expr::Parameter(_)
         | Expr::Column { .. }
+        // A position in a row **outside** this plan, so it names no column of the one being read.
+        | Expr::Outer { .. }
         | Expr::Default
         | Expr::Sequence(_) => {}
     }

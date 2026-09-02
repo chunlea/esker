@@ -770,6 +770,10 @@ fn render(expr: &Expr, columns: &[String]) -> String {
             .get(*at)
             .cloned()
             .unwrap_or_else(|| format!("<column {at}>")),
+        // A column of a row this plan does not have, so `columns` cannot name it: the outer
+        // query's own plan text does, one level up, and printing a name from the wrong row would
+        // be worse than printing none.
+        Expr::Outer { level, at, .. } => format!("<outer {level}.{at}>"),
         Expr::Binary { op, left, right } => format!(
             "({} {} {})",
             render(left, columns),

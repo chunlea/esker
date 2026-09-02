@@ -71,12 +71,39 @@ pub(super) fn plan_subqueries(
     tenant: u64,
     txn: &dyn Txn,
     tables: &dyn Tables,
+    outer: Option<&crate::exec::query::Scope<'_>>,
 ) -> Result<()> {
+    // The `FROM` entries first, so the scope a correlated subquery resolves against exists before
+    // any subquery is planned. A derived table's own sub-select is planned here too, and it is
+    // planned **without** an outer scope: a `FROM` item that could see the ones beside it is
+    // `LATERAL`, which this phase refuses by name (measured, `42P01` without it).
+    for entry in std::iter::once(&mut select.from)
+        .flatten()
+        .chain(select.joins.iter_mut().map(|join| &mut join.table))
+    {
+        plan_derived(entry, tenant, txn, tables)?;
+    }
+    let table = match &select.from {
+        Some(from) => Some(relation_of(from, tables)?),
+        None => None,
+    };
+    let inners = select
+        .joins
+        .iter()
+        .map(|join| relation_of(&join.table, tables))
+        .collect::<Result<Vec<_>>>()?;
+    let inner_refs: Vec<&crate::catalog::TableDef> = inners.iter().map(AsRef::as_ref).collect();
+    // `.under(outer)` is what makes correlation reach **past one level**: a subquery inside a
+    // subquery resolves against its own tables, then the statement holding it, then the one
+    // holding that. Measured, a three-level `EXISTS` chain naming both.
+    let scope =
+        crate::exec::query::written_scope(select, table.as_deref(), &inner_refs).under(outer);
+
     let mut outcome = Ok(());
     for_each_written_expr_mut(select, &mut |expr| {
         if outcome.is_ok() {
             outcome = walk_mut(expr, &mut |expr| match expr {
-                Expr::Subquery(sub) => plan_one(sub, tenant, txn, tables),
+                Expr::Subquery(sub) => plan_one(sub, tenant, txn, tables, Some(&scope)),
                 _ => Ok(()),
             });
         }
@@ -90,12 +117,6 @@ pub(super) fn plan_subqueries(
     // error it would have raised.
     for cte in &mut select.ctes {
         plan_derived(cte, tenant, txn, tables)?;
-    }
-    for entry in std::iter::once(&mut select.from)
-        .flatten()
-        .chain(select.joins.iter_mut().map(|join| &mut join.table))
-    {
-        plan_derived(entry, tenant, txn, tables)?;
     }
     fold_counts(select, txn, tenant)
 }
@@ -117,8 +138,8 @@ fn plan_derived(
     let Some(derived) = entry.derived.as_mut() else {
         return Ok(());
     };
-    plan_subqueries(&mut derived.select, tenant, txn, tables)?;
-    let planned = plan_select_of(&derived.select, tenant, tables)?;
+    plan_subqueries(&mut derived.select, tenant, txn, tables, None)?;
+    let planned = plan_select_of(&derived.select, tenant, tables, None)?;
 
     // A column alias list **may be shorter** than the target list — `AS t(a)` over two columns
     // renames the first and leaves the second alone, measured — and only a longer one is an error.
@@ -192,6 +213,7 @@ fn plan_select_of(
     select: &Select,
     tenant: u64,
     tables: &dyn Tables,
+    outer: Option<&crate::exec::query::Scope<'_>>,
 ) -> Result<crate::exec::query::Planned> {
     let table = match &select.from {
         // A derived table inside a derived table: its own pass has already run, so the relation it
@@ -210,7 +232,7 @@ fn plan_select_of(
     // what ADR 0040 asks a plan carrying a subquery to be able to say
     // (`docs/plans/phase-12-subquery.md` §4). A fragment's filter language has no subquery in it
     // and its answer arrives whole in one message, so there is nothing here for a replica to do.
-    crate::exec::query::plan(select, tenant, table.as_deref(), &inner_refs)
+    crate::exec::query::plan_under(select, tenant, table.as_deref(), &inner_refs, outer)
 }
 
 /// The relation one `FROM` entry stands for: a real table, or a derived table's synthetic one.
@@ -242,12 +264,24 @@ pub(super) fn relation_of(
 /// already does with a `nextval` in a target list, and it happens exactly once per statement,
 /// which is what a real server does too.
 fn fold_counts(select: &mut Select, txn: &dyn Txn, tenant: u64) -> Result<()> {
-    for expr in select.limit.iter_mut().chain(select.offset.iter_mut()) {
-        let Expr::Subquery(sub) = expr else { continue };
+    for (clause, expr) in std::iter::once(("LIMIT", select.limit.as_mut()))
+        .chain(std::iter::once(("OFFSET", select.offset.as_mut())))
+    {
+        let Some(slot) = expr else { continue };
+        let Expr::Subquery(sub) = slot else { continue };
+        // A **correlated** one is `42P10 argument of LIMIT must not contain variables` on a real
+        // server, and it has to be: a limit that changed per row would not be a limit, and there
+        // is no row here to change with. Measured, both clauses, with their own names in the
+        // message.
+        if sub.correlated {
+            return Err(SqlError::InvalidColumnReference(format!(
+                "argument of {clause} must not contain variables"
+            )));
+        }
         run_one(sub, txn, tenant)?;
         // `LIMIT NULL` means no limit, which is PostgreSQL's rule and what `Literal::Null`
         // already reaches; anything else is the value the subquery answered with.
-        *expr = Expr::Literal(match value(sub, None)? {
+        *slot = Expr::Literal(match value(sub, None)? {
             Datum::Null => Literal::Null,
             Datum::Int8(count) => Literal::Integer(count),
             other => Literal::Typed(Box::new(other)),
@@ -267,10 +301,16 @@ pub(super) trait Tables {
 }
 
 /// One subquery: its own subqueries first, then its plan, then the column it answers with.
-fn plan_one(sub: &mut SubqueryExpr, tenant: u64, txn: &dyn Txn, tables: &dyn Tables) -> Result<()> {
-    plan_subqueries(&mut sub.select, tenant, txn, tables)?;
+fn plan_one(
+    sub: &mut SubqueryExpr,
+    tenant: u64,
+    txn: &dyn Txn,
+    tables: &dyn Tables,
+    outer: Option<&crate::exec::query::Scope<'_>>,
+) -> Result<()> {
+    plan_subqueries(&mut sub.select, tenant, txn, tables, outer)?;
 
-    let planned = plan_select_of(&sub.select, tenant, tables)?;
+    let planned = plan_select_of(&sub.select, tenant, tables, outer)?;
 
     // `EXISTS` reads rows and not values, so any number of columns is legal under it — measured,
     // `SELECT EXISTS (SELECT id, n FROM sq_a)` is `t`. Every other kind wants exactly one, and
@@ -287,8 +327,41 @@ fn plan_one(sub: &mut SubqueryExpr, tenant: u64, txn: &dyn Txn, tables: &dyn Tab
         .columns
         .first()
         .map(|(name, ty, _)| (name.clone(), *ty));
+    // Correlation is a fact about the **plan**, not a reading of the statement: a reference that
+    // resolved to the sub-select's own scope after all is not one, which is exactly the shadowing
+    // case (`WHERE EXISTS (SELECT 1 FROM b WHERE b.a_id = id)` is `b.a_id = b.id`).
+    sub.correlated = reaches_outward(&planned.node, 1);
     sub.plan = Some(Box::new(planned.node));
     Ok(())
+}
+
+/// Whether anything in this plan names a row outside it, at `depth` levels in.
+///
+/// `depth` counts how far this plan sits inside the one being asked about, so a nested sub-plan's
+/// `Outer { level: 1 }` — which names *its* parent, not ours — does not make us correlated, while
+/// its `Outer { level: 2 }` does. Measured: a three-level `EXISTS` chain where the innermost query
+/// names the middle table and the outermost one makes the **middle** query correlated even though
+/// nothing in the middle query's own expressions reaches out.
+fn reaches_outward(node: &Node, depth: usize) -> bool {
+    let mut found = false;
+    for_each_node_expr(node, &mut |expr| {
+        found = found || expr_reaches_outward(expr, depth);
+    });
+    found
+}
+
+fn expr_reaches_outward(expr: &Expr, depth: usize) -> bool {
+    let mut found = false;
+    walk(expr, &mut |expr| match expr {
+        Expr::Outer { level, .. } => found = found || *level >= depth,
+        Expr::Subquery(sub) => {
+            if let Some(plan) = sub.plan.as_deref() {
+                found = found || reaches_outward(plan, depth + 1);
+            }
+        }
+        _ => {}
+    });
+    found
 }
 
 /// Runs every subquery in a plan and writes its answer into it.
@@ -312,16 +385,115 @@ pub(super) fn resolve(node: &mut Node, txn: &dyn Txn, tenant: u64) -> Result<()>
 
 /// One subquery, run: its plan drained into the values the expression around it reads.
 fn run_one(sub: &mut SubqueryExpr, txn: &dyn Txn, tenant: u64) -> Result<()> {
-    let Some(plan) = sub.plan.as_deref() else {
+    let Some(plan) = sub.plan.as_deref_mut() else {
         return Err(SqlError::Internal(format!(
             "{} reached the executor without a plan",
             sub.kind.describe()
         )));
     };
-    let mut plan = plan.clone();
-    resolve(&mut plan, txn, tenant)?;
-    sub.run = Some(rows_of(&plan, sub.kind, txn, tenant)?);
+    // In place, and **before** the correlated check: whatever is uncorrelated inside a correlated
+    // subquery is still a constant of the whole statement, so it is run once here rather than once
+    // per outer row.
+    resolve(plan, txn, tenant)?;
+    if sub.correlated {
+        return Ok(());
+    }
+    let rows = match sub.plan.as_deref() {
+        Some(plan) => rows_of(plan, sub.kind, txn, tenant)?,
+        // Unreachable: `as_deref_mut` above returned `Some` from the same field.
+        None => Vec::new(),
+    };
+    sub.run = Some(rows);
     Ok(())
+}
+
+/// One correlated subquery, run for **one outer row**.
+///
+/// The sub-plan is copied and every [`Expr::Outer`] in it that names this row is replaced by the
+/// value it names, so what a cursor is opened on has no outer reference left in it and is an
+/// ordinary plan. That copy is what a nested loop costs, and it is the honest price of the shape:
+/// the answer really is a different answer per row.
+///
+/// `TODO(post-v1)`: the access path inside is planned **once**, from a filter whose outer operand
+/// is a hole, so `WHERE b.a_id = <outer>` is a scan with a filter rather than the point read the
+/// same predicate gets against a constant (`docs/plans/phase-12-subquery.md` §3 unit 4).
+pub(super) fn run_correlated(
+    sub: &SubqueryExpr,
+    outer: &[Datum],
+    txn: &dyn Txn,
+    tenant: u64,
+) -> Result<Vec<Datum>> {
+    let Some(plan) = sub.plan.as_deref() else {
+        return Err(SqlError::Internal(format!(
+            "{} reached the row evaluator without a plan",
+            sub.kind.describe()
+        )));
+    };
+    let mut plan = plan.clone();
+    substitute_outer(&mut plan, outer, 1);
+    rows_of(&plan, sub.kind, txn, tenant)
+}
+
+/// Replaces every `Outer { level: depth }` in a plan with the value that row has there.
+///
+/// `depth` counts how far down this walk has gone, and **nothing is renumbered**: a reference two
+/// levels out is `Outer { level: 2 }` wherever it is written, and it is matched when the
+/// substitution for that row descends to depth 2. A nested sub-plan's own `Outer { level: 1 }`,
+/// which names the row between, is left exactly as it is for the run that will supply it.
+fn substitute_outer(node: &mut Node, outer: &[Datum], depth: usize) {
+    for_each_node_expr_mut(node, &mut |expr| substitute_in_expr(expr, outer, depth));
+}
+
+fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
+    match expr {
+        Expr::Outer { level, at, .. } if *level == depth => {
+            *expr = Expr::Literal(match outer.get(*at) {
+                // A NULL has no type to carry and needs none: every comparison with one is NULL.
+                Some(Datum::Null) | None => Literal::Null,
+                Some(value) => Literal::Typed(Box::new(value.clone())),
+            });
+        }
+        Expr::Binary { left, right, .. } => {
+            substitute_in_expr(left, outer, depth);
+            substitute_in_expr(right, outer, depth);
+        }
+        Expr::Not(inner) => substitute_in_expr(inner, outer, depth),
+        Expr::IsNull { operand, .. } => substitute_in_expr(operand, outer, depth),
+        Expr::InList { operand, list, .. } => {
+            substitute_in_expr(operand, outer, depth);
+            for item in list {
+                substitute_in_expr(item, outer, depth);
+            }
+        }
+        Expr::Aggregate(call) => {
+            for arg in &mut call.args {
+                substitute_in_expr(arg, outer, depth);
+            }
+        }
+        // Into the sub-plan, **one level deeper**, and into the operand at this level. The
+        // sub-plan's cached `run` is dropped: it was computed for a different outer row.
+        Expr::Subquery(sub) => {
+            if let Some(operand) = &mut sub.operand {
+                substitute_in_expr(operand, outer, depth);
+            }
+            if let Some(plan) = sub.plan.as_deref_mut() {
+                substitute_outer(plan, outer, depth + 1);
+            }
+            if sub.correlated {
+                sub.run = None;
+            }
+        }
+        // An outer reference at a **different** level names a row this substitution is not for:
+        // one further out, which a later descent will match, or the row between, which the run
+        // this plan is being prepared for will supply.
+        Expr::Outer { .. }
+        | Expr::Literal(_)
+        | Expr::Parameter(_)
+        | Expr::Column { .. }
+        | Expr::Ordinal { .. }
+        | Expr::Default
+        | Expr::Sequence(_) => {}
+    }
 }
 
 /// The values one run of a sub-plan produced, bounded.
@@ -366,7 +538,16 @@ pub(super) fn value(sub: &SubqueryExpr, operand: Option<Datum>) -> Result<Datum>
             sub.kind.describe()
         )));
     };
-    Ok(match sub.kind {
+    value_of(sub.kind, operand, values)
+}
+
+/// The same, from the rows one run of a correlated sub-plan just produced.
+pub(super) fn value_of(
+    kind: SubqueryKind,
+    operand: Option<Datum>,
+    values: &[Datum],
+) -> Result<Datum> {
+    Ok(match kind {
         // No rows is NULL, one row is the value, and two is an error rather than the first of
         // them. The error is per *execution*, which is why it is raised here and not when the
         // subquery was planned.
@@ -517,6 +698,68 @@ fn for_each_written_expr_mut(select: &mut Select, visit: &mut impl FnMut(&mut Ex
     }
 }
 
+/// The same walk over a plan's expressions, immutably.
+fn for_each_node_expr(node: &Node, visit: &mut impl FnMut(&Expr)) {
+    match node {
+        Node::Filter { input, predicate } => {
+            visit(predicate);
+            for_each_node_expr(input, visit);
+        }
+        Node::Project { input, exprs } => {
+            for expr in exprs {
+                visit(expr);
+            }
+            for_each_node_expr(input, visit);
+        }
+        Node::Sort { input, keys } => {
+            for key in keys {
+                visit(&key.expr);
+            }
+            for_each_node_expr(input, visit);
+        }
+        Node::Aggregate {
+            input,
+            keys,
+            aggregates,
+            having,
+            ..
+        } => {
+            for expr in keys.iter().chain(having.iter()) {
+                visit(expr);
+            }
+            for AggregateSpec { arg, .. } in aggregates {
+                if let Some(arg) = arg {
+                    visit(arg);
+                }
+            }
+            for_each_node_expr(input, visit);
+        }
+        Node::NestedLoop {
+            outer,
+            residual,
+            inner_plan,
+            ..
+        } => {
+            if let Some(residual) = residual {
+                visit(residual);
+            }
+            if let Some(inner) = inner_plan {
+                for_each_node_expr(inner, visit);
+            }
+            for_each_node_expr(outer, visit);
+        }
+        Node::Limit { input, .. } | Node::Distinct { input } | Node::Derived { input, .. } => {
+            for_each_node_expr(input, visit);
+        }
+        Node::Columnar(columnar) => for_each_node_expr(&columnar.fallback, visit),
+        Node::OneRow
+        | Node::CatalogView { .. }
+        | Node::SeqScan { .. }
+        | Node::PointGet { .. }
+        | Node::IndexLookup { .. } => {}
+    }
+}
+
 /// Every expression a *plan node* holds, in one place. Recursive over the tree.
 fn for_each_node_expr_mut(node: &mut Node, visit: &mut impl FnMut(&mut Expr)) {
     match node {
@@ -554,10 +797,16 @@ fn for_each_node_expr_mut(node: &mut Node, visit: &mut impl FnMut(&mut Expr)) {
             for_each_node_expr_mut(input, visit);
         }
         Node::NestedLoop {
-            outer, residual, ..
+            outer,
+            residual,
+            inner_plan,
+            ..
         } => {
             if let Some(residual) = residual {
                 visit(residual);
+            }
+            if let Some(inner) = inner_plan {
+                for_each_node_expr_mut(inner, visit);
             }
             for_each_node_expr_mut(outer, visit);
         }
@@ -610,6 +859,7 @@ fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
         | Expr::Parameter(_)
         | Expr::Column { .. }
         | Expr::Ordinal { .. }
+        | Expr::Outer { .. }
         | Expr::Default
         | Expr::Sequence(_) => {}
     }
@@ -646,6 +896,7 @@ fn walk_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr) -> Result<()>) ->
         | Expr::Parameter(_)
         | Expr::Column { .. }
         | Expr::Ordinal { .. }
+        | Expr::Outer { .. }
         | Expr::Default
         | Expr::Sequence(_) => {}
     }
