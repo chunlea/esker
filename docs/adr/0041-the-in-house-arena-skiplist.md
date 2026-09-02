@@ -1,4 +1,4 @@
-# 0040 — The in-house arena skiplist
+# 0041 — The in-house arena skiplist
 
 Status: **proposed, design only.** No code is written under this ADR without a coordinator's GO.
 It replaces the one bought piece of concurrent code named in `CLAUDE.md`'s dependency policy and in

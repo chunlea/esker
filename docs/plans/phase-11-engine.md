@@ -514,7 +514,7 @@ make the follow-up answerable.
 
 ### U5 — the skiplist ADR
 
-[ADR 0040](../adr/0040-the-in-house-arena-skiplist.md), **design only**, as the brief required. The
+[ADR 0041](../adr/0041-the-in-house-arena-skiplist.md), **design only**, as the brief required. The
 lane stopped at the ADR and did not write the code.
 
 The argument the ADR makes that was not obvious going in: the memtable does not need a general
