@@ -1,0 +1,39 @@
+crates/esker-sql/src/plan/mod.rs
+  s_a0868d54f0983f::t_b94eeb4b25630d 21
+crates/esker-sql/src/plan/subquery.rs
+  s_a0868d54f0983f::t_13c159a0a55a60 247-251,263,274,279-287
+crates/esker-sql/src/error.rs
+  s_a0868d54f0983f::t_95e8e20db795c9 59-74,845,847-849,977-980,1014-1017
+crates/esker-sql/src/exec/query.rs
+  s_a0868d54f0983f::t_ab6f1bdb5c128a 620
+crates/esker-sql/src/exec/subquery.rs
+  s_a0868d54f0983f::t_f170db661bdf1d 38-43,87-93,128-131,133,222-230
+crates/esker-sql/src/parse/lower.rs
+  s_a0868d54f0983f::t_20d0f3945bb288 1991,1993,2003-2083,2181,2215
+crates/esker-sql/src/plan/cte.rs
+  s_a0868d54f0983f::t_2d0799c851b9af 1-182
+crates/esker-sql/src/plan/query.rs
+  s_a0868d54f0983f::t_e3c668accbbe6f 64-73,84,132-139
+crates/esker-sql/tests/corpus/pg19_cte.txt
+  s_a0868d54f0983f::t_8dfc87a4eb3a22 1-105
+crates/esker-sql/tests/cte.rs
+  s_a0868d54f0983f::t_d85924d6b8a78b 1-317
+crates/esker-sql/tests/slt/unsupported.slt
+  s_a0868d54f0983f::t_58fd91df04ff58 31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "ee2fcc3eba8dbf68f363b42d57fdac6627a3493f",
+  "prompts": {},
+  "sessions": {
+    "s_a0868d54f0983f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "001c95bd-db24-4085-b657-66d3a8400c25",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
