@@ -1,0 +1,25 @@
+docs/plans/debt-c1.md
+  s_ed1cd635740377::t_ca8863a14bc507 294-302
+docs/plans/phase-11-engine.md
+  s_ed1cd635740377::t_8b3618265bc0d5 1-230
+docs/plans/phase-4-pd.md
+  s_ed1cd635740377::t_92529ecf6aea66 342-343
+docs/plans/phase-4.md
+  s_ed1cd635740377::t_cc9bf3cd1d5359 822-825
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "875d9c4e98de3d5afcc812f2d512c20e66c088a4",
+  "prompts": {},
+  "sessions": {
+    "s_ed1cd635740377": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "19199d55-8453-4673-a0ab-b13f22806878",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
