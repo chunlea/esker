@@ -1,0 +1,19 @@
+crates/esker-engine/tests/wal_sync_crash.rs
+  s_a0868d54f0983f::t_33141af783c204 1-447
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2cffd6bd297503f5b8aba01ca236c9446aa4edaa",
+  "prompts": {},
+  "sessions": {
+    "s_a0868d54f0983f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "001c95bd-db24-4085-b657-66d3a8400c25",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
