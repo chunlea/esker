@@ -1,0 +1,31 @@
+crates/esker-sql/src/parse/lower.rs
+  s_a0868d54f0983f::t_ccd64e2ba18003 1821-1837,2405-2414
+crates/esker-sql/tests/regclass_name.rs
+  s_a0868d54f0983f::t_6663dbc079af26 1-116
+crates/esker-sql/src/exec/bind.rs
+  s_a0868d54f0983f::t_17d579882d7c96 314-341,436-439,451-471
+crates/esker-sql/src/exec/cursor.rs
+  s_a0868d54f0983f::t_f14957924c701e 1165-1176
+crates/esker-sql/src/plan/expr.rs
+  s_a0868d54f0983f::t_ff2f6950e515ff 370-382,445-446,473-476,490-493,496
+crates/esker-sql/tests/corpus/pg19_regclass_name.txt
+  s_a0868d54f0983f::t_768d30ef78b983 1-31
+docs/plans/phase-9-rails.md
+  s_a0868d54f0983f::t_b04815e1846b76 1275,1469
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "795de62f5d487ecb61926a0f50946a083d2073b4",
+  "prompts": {},
+  "sessions": {
+    "s_a0868d54f0983f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "001c95bd-db24-4085-b657-66d3a8400c25",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
