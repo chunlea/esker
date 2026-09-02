@@ -1,0 +1,39 @@
+crates/esker-proto/src/transport/server.rs
+  s_188859e919bef5::t_5b7ceb7fbe8fc2 125-152
+crates/esker-proto/tests/loopback.rs
+  s_188859e919bef5::t_82e79e251f4730 792-837
+crates/esker-store/tests/balance.rs
+  s_188859e919bef5::t_e8ce26fe4aa43b 88-94,97-100,102,108,152-153,250-253,261,280,396-397,399
+crates/esker-store/tests/cluster.rs
+  s_188859e919bef5::t_70e921a87b5c95 37,40-46,52-55,57-61,67,85-86
+crates/esker-store/tests/pd_wire.rs
+  s_188859e919bef5::t_de5f426d2452a0 119-125,142-145,149-150,178-179
+crates/esker-store/tests/promotion.rs
+  s_188859e919bef5::t_51995cb69d7663 54-60,71-74,76,81,113-114,233-240,268-269,276,298-299
+crates/esker-store/tests/retire.rs
+  s_188859e919bef5::t_89abece7be64bd 90-96,110-113,115,121,146-147,363-366,373,389
+crates/esker-store/tests/schema_fetch.rs
+  s_188859e919bef5::t_b66b42cbf86b2e 51-57,71-74,76,81,116-117,285-287,289-290,408-412
+crates/esker-store/tests/sim_snapshot_ask.rs
+  s_188859e919bef5::t_38144fe37ed35a 57-63,81-86,111-112,191-193
+crates/esker-store/tests/sim_sweep.rs
+  s_188859e919bef5::t_8461bb07c31017 55-61,86-89,91,97,121-122,323-326,333,349
+crates/esker-store/tests/snapshot.rs
+  s_188859e919bef5::t_66f43bcae2a898 105-111,114-117,119,125,153-154,317-318,320,379-380,382,440-443,457,479,564-567,577,607,703-706,720,737,824-827,834,860,995-998,1009,1026,1116-1117,1119,1201-1202,1204
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "6d3f7b12142def07a72cd115b48975d5831c62b6",
+  "prompts": {},
+  "sessions": {
+    "s_188859e919bef5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5b0a7ebb-6297-4871-91b4-2650c25d6c33",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
