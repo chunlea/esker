@@ -1,0 +1,51 @@
+# `pg_available_extensions`, as a real PostgreSQL 19beta1 answers it.
+#
+# NOT a type. It is the relation **rung 4 and all 367 suite files stop on** at `5dd7b6f` and
+# `4febed7` — and it is not a `schema.rb` statement, which is why the 699-statement schema probe
+# reports zero refusals while no file loads. `test/cases/helper.rb` reaches it around the schema
+# load, through two `ActiveRecord` methods that are one line each
+# (`postgresql_adapter.rb:509` and `:513`):
+#
+#   extension_available?(name)  →  SELECT true FROM pg_available_extensions WHERE name = $1
+#   extension_enabled?(name)    →  SELECT installed_version IS NOT NULL FROM pg_available_extensions WHERE name = $1
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way. It writes nothing.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **One query shape, three different answers**, and `ActiveRecord` distinguishes all three
+#     because `query_value` maps "no rows" to `nil`:
+#       - an **installed** extension (`plpgsql`) → `installed_version IS NOT NULL` is **`t`**;
+#       - an **available but not installed** one (`hstore`) → **`f`**, with a real
+#         `default_version` (`1.8`) and a NULL `installed_version`;
+#       - an **unknown** name → **no rows at all**, not `f` and not an error.
+#     A view that returned a row for every name, or none for an uninstalled one, would answer two
+#     of `ActiveRecord`'s three cases wrongly while looking correct in the third.
+#   * **It is a view, not a table.** `pg_class.relkind` is **`v`**. That matters for the catalog
+#     this node computes: `pg_class` has to carry a row for it with the right `relkind`, or
+#     anything that filters `relkind IN ('r','p')` — which `ActiveRecord`'s own table list does —
+#     will behave differently from a real server.
+#   * **`name` is of type `name`, not `text`**, and the version columns are `text`. The same
+#     `name`-vs-`text` distinction `current_schemas` has.
+#   * **It is not `pg_extension`.** `pg_extension` lists what is *installed* (here: `plpgsql` only);
+#     `pg_available_extensions` lists what *could* be installed, which is a superset and is where
+#     the `installed_version IS NULL` case lives. A node that aliased one to the other would answer
+#     `extension_available?('hstore')` as false where a real server says true.
+SELECT relkind, relname FROM pg_class WHERE relname = 'pg_available_extensions'	"char",name	v|pg_available_extensions
+SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'pg_available_extensions' ORDER BY ordinal_position	name,character varying	name|name ; default_version|text ; installed_version|text ; location|text ; comment|text
+SELECT 'g', count(*) > 0 FROM pg_available_extensions	text,boolean	g|t
+SELECT true FROM pg_available_extensions WHERE name = 'plpgsql'	boolean	t
+SELECT true FROM pg_available_extensions WHERE name = 'hstore'	boolean	t
+SELECT true FROM pg_available_extensions WHERE name = 'nosuchextension'	boolean	-
+SELECT installed_version IS NOT NULL FROM pg_available_extensions WHERE name = 'plpgsql'	boolean	t
+SELECT installed_version IS NOT NULL FROM pg_available_extensions WHERE name = 'hstore'	boolean	f
+SELECT installed_version IS NOT NULL FROM pg_available_extensions WHERE name = 'nosuchextension'	boolean	-
+SELECT 'g', count(*) FROM pg_available_extensions WHERE name = 'nosuchextension'	text,bigint	g|0
+SELECT name, default_version, installed_version FROM pg_available_extensions WHERE name = 'plpgsql'	name,text,text	plpgsql|1.0|1.0
+SELECT name, default_version, installed_version FROM pg_available_extensions WHERE name = 'hstore'	name,text,text	hstore|1.8|\N
+SELECT extname, extversion FROM pg_extension ORDER BY extname	name,text	plpgsql|1.0
+SELECT 'g', pg_typeof(name), pg_typeof(default_version), pg_typeof(installed_version) FROM pg_available_extensions WHERE name = 'plpgsql'	text,regtype,regtype,regtype	g|name|text|text
