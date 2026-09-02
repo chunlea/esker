@@ -376,3 +376,64 @@ went on answering with the bootstrap record that names this store. **It passed, 
 reason.** `place_and_verify` now asserts what PD will actually answer *before* the case is watched,
 so a mis-set-up case fails loudly instead. That assertion is what turned a green test into a
 documented skip.
+
+### U1d — the snapshot ask's wait (`1502d0f`)
+
+| | |
+|---|---|
+| Model | `esker-sim/src/mech/ask.rs`, the answer table over (region hosted?, core knows?, record knows?) |
+| Binding | `esker-store/tests/sim_snapshot_ask.rs` → the real sender, one single-node store per case |
+| Runs | 6 cases; 5 driven, 1 not constructible |
+| Reached | exactly 1 case serves, exactly 1 case is waited for |
+
+The addition this makes over `tests/snapshot.rs` is **timing on every answer**, not just on the one
+the fix's test looks at. "Not a member, on sight" and "not applied here, after the wait" are the
+pre-fix and post-fix answers to the same question, so a checker that reads only the words would
+pass a pre-fix sender that happened to phrase its refusal well. `WAIT_FLOOR_MS` is 400 against a
+500 ms bound and a 2 ms poll: a sender that consulted the record twice cannot answer under it, and
+one that answered on sight cannot exceed it.
+
+The run also asserts `waited == 1` in both directions. A run where nothing waited is the pre-fix
+sender; a run where more than one thing waited is a sender that makes every wrong ask cost the
+bound.
+
+Green at `b37e264` (this branch): 1 passed, 3.9 s.
+
+**Red at `c062f91` (`1502d0f^`)**:
+
+```
+case "the core has the peer and the change can never commit":
+required Required { answer: NotAppliedHere, waits: true },
+got      Outcome  { answer: NotAMember,     waited_ms: 0 }   (RefusedAMember)
+```
+
+`waited_ms: 0` is the half a words-only assertion would miss. `RefusedAMember` is the model's own
+name for it: a correct sentence about the wrong membership.
+
+#### One state is not constructible
+
+"The core has the peer and the change **commits**" — the gap that should end in a snapshot being
+served rather than refused. A learner's addition commits on the existing voters alone, so the gap
+is microseconds wide and cannot be held open from outside the store. Its mirror — the record
+knowing more than the core — does not exist at all, because the record is applied *from* the log.
+
+The half of `1502d0f` that this therefore cannot reach through a cluster is the one the *recorded*
+fix got wrong: serving on the core's word ships a header that does not name the peer receiving it,
+and `tests/promotion.rs` failed 3 of 3 with a learner stranded. The checker names that case
+(`Half::ServedAStranger`) and `mech/ask.rs`'s own unit tests exercise it, but no revision in this
+repository's history has it — the recorded fix was bisected out before it landed — so there is no
+worktree to run it red in. Written down rather than claimed.
+
+#### One thing the gate caught that is not a regression
+
+`cargo test -p esker-store --test sim_snapshot_ask --test snapshot --test promotion` runs the
+three binaries **concurrently**, and `promotion.rs` failed there at 151.82 s. Alone it passes in
+31.20 s, and the full `cargo test -p esker-store` (21 binaries, cargo's own scheduling) passed it
+too. Three multi-node cluster tests competing for cores on a box already running two other agent lanes'
+compiles is the cause; nothing in this lane touches any `src/`.
+
+Worth writing down rather than dropping, because `548dd62`'s own body says this test was
+intermittent and that widening the window with debug logging made the race deterministic. This is
+a different mode with the same symptom — starvation rather than a race — and the way to tell them
+apart is that the failure does not survive being run alone. Do not read a red `promotion.rs` under
+a parallel gate as the return of that bug without re-running it by itself first.
