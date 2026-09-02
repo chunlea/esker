@@ -275,13 +275,13 @@ fn strip_drop_index_concurrently(sql: &str, scanned: &Scan<'_>) -> Option<String
     Some(rewritten)
 }
 
-/// One predicate, parsed and lowered — a stored `CHECK`, read back.
+/// One stored expression, parsed and lowered — a `CHECK`, an index predicate, or an index key.
 ///
 /// It goes through the real parser rather than a second one: the text came from a statement this
 /// parser accepted, so anything it will not read back is a bug here rather than in the catalog.
 /// Wrapped in a `SELECT` because that is the smallest statement with an expression in it.
-pub(crate) fn parse_predicate(expr: &str) -> Result<plan::Expr> {
-    let not_one = || SqlError::Internal("a stored CHECK is not one expression".to_owned());
+pub(crate) fn parse_stored_expr(expr: &str) -> Result<plan::Expr> {
+    let not_one = || SqlError::Internal("a stored expression is not one expression".to_owned());
     let statements = parse_statements(&format!("SELECT {expr}"))?;
     let [parsed] = statements.as_slice() else {
         return Err(not_one());

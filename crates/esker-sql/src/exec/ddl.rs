@@ -33,14 +33,14 @@
 //! without a key can now be created, written and read.
 
 use crate::backend::Txn;
-use crate::catalog::{self, CheckDef, ColumnDef, IndexDef, TableDef};
+use crate::catalog::{self, CheckDef, ColumnDef, IndexDef, IndexKey, TableDef};
 use crate::error::{Result, SqlError};
 use crate::exec::Executor;
 use crate::pgwire::session::Outcome;
 use crate::plan::{
     self, AlterTable, AlterTableAction, CreateIndex, CreateTable, DropIndex, DropTable,
 };
-use crate::value::Datum;
+use crate::value::{ColumnType, Datum};
 
 pub(super) fn create_table(
     executor: &mut Executor,
@@ -72,7 +72,7 @@ pub(super) fn create_table(
         let mut with_row_id = Vec::with_capacity(columns.len() + 1);
         with_row_id.push(ColumnDef {
             name: catalog::INTERNAL_ROW_ID_NAME.to_owned(),
-            ty: crate::value::ColumnType::Int8,
+            ty: ColumnType::Int8,
             typmod: crate::value::NO_TYPMOD,
             // The executor fills it, so it has no default of either kind.
             default_now: false,
@@ -116,7 +116,7 @@ pub(super) fn create_table(
                 .clone()
                 .unwrap_or_else(|| plan::unique_constraint_name(&create.name, &constraint.columns)),
             unique: true,
-            columns: ordinals,
+            keys: ordinals.into_iter().map(IndexKey::Column).collect(),
             // Born public. Nothing predates a `UNIQUE` declared with the table, so there is no
             // interleaving for the states to protect: the ADR's whole argument is about rows and
             // writers that already exist (`docs/plans/phase-6e.md` §2).
@@ -218,7 +218,7 @@ fn add_check(
 /// stored text stops being trusted.
 fn validate_checks(table: &TableDef) -> Result<()> {
     for check in &table.checks {
-        let parsed = crate::parse::parse_predicate(&check.expr)?;
+        let parsed = crate::parse::parse_stored_expr(&check.expr)?;
         let scope = crate::exec::query::Scope::single(table);
         crate::exec::query::resolve(&parsed, &scope)?;
     }
@@ -332,7 +332,7 @@ pub(super) fn create_index(
         // `t_a_idx` and `t_a_idx1`, not an error. Measured against a real server, which produced
         // `..._idx`, `..._idx1` and `..._idx2` for three. The user named nothing, so there is
         // nothing of theirs to collide with.
-        let derived = plan::index_name(&create.table, &create.columns);
+        let derived = plan::index_name(&create.table, &create.keys);
         let mut name = derived.clone();
         let mut suffix = 0u32;
         while existing_relation(executor, txn, &name)?.is_some() {
@@ -342,20 +342,26 @@ pub(super) fn create_index(
         name
     };
 
-    let columns = create
-        .columns
+    let keys = create
+        .keys
         .iter()
-        .map(|column| {
-            table
+        .map(|key| match key {
+            plan::IndexKeyPart::Column(column) => table
                 .column(column)
-                .ok_or_else(|| SqlError::UndefinedColumn(column.clone()))
+                .map(IndexKey::Column)
+                .ok_or_else(|| SqlError::UndefinedColumn(column.clone())),
+            plan::IndexKeyPart::Expression { expr, shape } => Ok(IndexKey::Expression {
+                expr: expr.clone(),
+                shape: *shape,
+                ty: index_expression(&table, expr)?,
+            }),
         })
         .collect::<Result<Vec<_>>>()?;
 
     // A predicate naming a column the table does not have is `42703` here, not an internal error
     // at the first write — the same rule, and the same reason, as a `CHECK`'s.
     if let Some(predicate) = &create.predicate {
-        let parsed = crate::parse::parse_predicate(predicate)?;
+        let parsed = crate::parse::parse_stored_expr(predicate)?;
         let scope = crate::exec::query::Scope::single(&table);
         crate::exec::query::resolve(&parsed, &scope)?;
     }
@@ -363,7 +369,7 @@ pub(super) fn create_index(
         id: catalog::allocate_id(txn, executor.tenant)?,
         name,
         unique: create.unique,
-        columns,
+        keys,
         predicate: create.predicate.clone(),
         // Public the moment it is declared, because it is built inside this statement's own
         // transaction: no other node ever sees it half-made. That is what makes the plain form
@@ -409,6 +415,60 @@ pub(super) fn create_index(
     updated.indexes.push(index);
     catalog::replace_table(txn, executor.tenant, &table, &updated)?;
     Ok(Outcome::done("CREATE INDEX"))
+}
+
+/// Checks that an index expression can be an index key, and resolves it against the table.
+///
+/// Three refusals, each measured against PostgreSQL 19:
+///
+/// * a column the table does not have is **`42703`** — from `resolve`, the same rule and the same
+///   reason as an index predicate's and a `CHECK`'s: at `CREATE INDEX`, not at the first write;
+/// * an aggregate is **`42803 aggregate functions are not allowed in index expressions`**;
+/// * anything whose value is not a function of the row alone is
+///   **`42P17 functions in index expression must be marked IMMUTABLE`** — the code a real server
+///   gives for `nextval`, and also for `format_type` and `pg_get_indexdef`, which are *stable*
+///   there rather than volatile. Every function this crate has is in one of those two groups:
+///   `lower` and `upper` are immutable, a sequence call writes, and a `pg_catalog` function reads
+///   the catalog, which the index would then have to be rebuilt whenever anybody changed.
+///
+/// An index whose key is not a function of the row is not a slow index, it is a **wrong** one: the
+/// entry is written from the value the expression had at insert and looked up from the value it
+/// has at read, and nothing ever notices they differ.
+fn index_expression(table: &TableDef, expr: &str) -> Result<ColumnType> {
+    let parsed = crate::parse::parse_stored_expr(expr)?;
+    let scope = crate::exec::query::Scope::single(table);
+    let resolved = crate::exec::query::resolve(&parsed, &scope)?;
+    refuse_unless_immutable(&resolved)?;
+    crate::exec::query::expr_type(&resolved, &scope)
+}
+
+/// Walks one resolved expression, refusing every node that may not be an index key.
+fn refuse_unless_immutable(expr: &plan::Expr) -> Result<()> {
+    use crate::plan::Expr;
+    let mut refusal = None;
+    super::subquery::walk(expr, &mut |node| {
+        if refusal.is_some() {
+            return;
+        }
+        refusal = match node {
+            Expr::Aggregate(_) => Some(SqlError::AggregateNotAllowed(
+                "aggregate functions are not allowed in index expressions",
+            )),
+            Expr::Sequence(_) | Expr::CatalogFunc(_) => Some(SqlError::NotImmutableInIndex),
+            // A parameter has no value at `CREATE INDEX` time; a real server answers
+            // `42P02 there is no parameter $1`, which is what this prints.
+            Expr::Parameter(at) => Some(SqlError::UndefinedParameter(*at)),
+            // None of the three can be produced by `parse::lower` from an index column — a
+            // sub-select there is a syntax error on both servers, an outer reference needs a
+            // query around it, and `DEFAULT` is refused where it is written. This arm is what
+            // says so rather than a panic if one ever arrives.
+            Expr::Subquery(_) | Expr::Outer { .. } | Expr::Default => {
+                Some(SqlError::unsupported("that index expression"))
+            }
+            _ => None,
+        };
+    });
+    refusal.map_or(Ok(()), Err)
 }
 
 pub(super) fn drop_index(
@@ -689,25 +749,19 @@ fn backfill(
     super::for_each_page(txn, &start, &end, |_, page| {
         for (_, value) in page {
             let row = crate::row::decode_row(&schema, value)?;
-            let columns: Vec<Datum> = index
-                .columns
-                .iter()
-                .map(|&ordinal| row[ordinal].clone())
-                .collect();
             let primary_key: Vec<Datum> = table
                 .primary_key
                 .iter()
                 .map(|&ordinal| row[ordinal].clone())
                 .collect();
-            let by_value =
-                index.unique && crate::row::unique_index_key_is_unique_by_value(&columns);
-            let suffix = if by_value {
-                None
-            } else {
-                Some(primary_key.as_slice())
+            // `None` is a row a **partial** index excludes, and it is why this goes through
+            // `super::index` rather than building the key here: a backfill that indexed the rows
+            // the predicate leaves out would refuse `CREATE UNIQUE INDEX … WHERE …` for a
+            // duplicate among them, and leave entries no writer would ever remove.
+            let Some(entry) = super::index::entry(tenant, table, index, &row, &primary_key)? else {
+                continue;
             };
-            let key = crate::row::index_key(tenant, table.id, index.id, &columns, suffix)?;
-            if by_value && entries.iter().any(|(existing, _)| existing == &key) {
+            if entry.by_value && entries.iter().any(|(existing, _)| existing == &entry.key) {
                 // Out of the walk as well as out of the page: the index cannot be built and
                 // reading the rest of the table would learn nothing.
                 return Err(SqlError::UniqueViolation {
@@ -716,7 +770,7 @@ fn backfill(
                 });
             }
             entries.push((
-                key,
+                entry.key,
                 crate::row::encode_row(&primary_key_types, &primary_key)?,
             ));
         }

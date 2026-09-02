@@ -43,9 +43,11 @@
 //! none that `ActiveRecord` writes, because the only way it ever reads the column is through
 //! `pg_get_expr(d.adbin, d.adrelid)`.
 
+use std::borrow::Cow;
+
 use crate::backend::Txn;
 use crate::catalog::pg_relations::{RelKind, RelationRow, Relations};
-use crate::catalog::{ColumnDef, Identity, TableDef};
+use crate::catalog::{ColumnDef, Identity, IndexKey, TableDef};
 use crate::error::Result;
 use crate::value::{ColumnType, Datum, PgType};
 
@@ -86,7 +88,7 @@ pub fn rows(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
             continue;
         };
         for (at, (column, position)) in columns_of(relation, table).into_iter().enumerate() {
-            rows.push(attribute(relation, column, table, position, at + 1));
+            rows.push(attribute(relation, &column, table, position, at + 1));
         }
     }
     Ok(rows)
@@ -124,30 +126,64 @@ pub fn default_rows(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
 /// A table describes its own; an index and a primary key describe the columns they are over, in
 /// **key order** rather than table order, which is what makes `cb_yz_idx`'s attributes `y` then
 /// `z` whatever order the table declares them in.
+///
+/// An **expression** key part has no column in the table to describe, and a real server still
+/// gives the index relation a row for it: `CREATE INDEX xa_e ON xa (a, (lower(b)))` has
+/// `pg_attribute` rows `a bigint` and **`lower text`**. So one is synthesised — named by
+/// [`IndexKey::attname`] and typed by the type the expression resolved to when the index was
+/// built — rather than skipped, which would leave the relation with fewer attributes than its own
+/// `pg_index.indnatts` says it has.
 fn columns_of<'a>(
     relation: &RelationRow,
     table: &'a TableDef,
-) -> Vec<(&'a ColumnDef, Option<usize>)> {
+) -> Vec<(Cow<'a, ColumnDef>, Option<usize>)> {
     match relation.kind {
         RelKind::Table => table
             .user_columns()
-            .map(|(at, column)| (column, Some(at)))
+            .map(|(at, column)| (Cow::Borrowed(column), Some(at)))
             .collect(),
         RelKind::Index => relation
             .index_at
             .and_then(|at| table.indexes.get(at))
             .map(|index| {
                 index
-                    .columns
+                    .keys
                     .iter()
-                    .filter_map(|at| table.columns.get(*at).map(|column| (column, Some(*at))))
+                    .filter_map(|key| match key {
+                        IndexKey::Column(at) => table
+                            .columns
+                            .get(*at)
+                            .map(|column| (Cow::Borrowed(column), Some(*at))),
+                        IndexKey::Expression { ty, .. } => Some((
+                            Cow::Owned(ColumnDef {
+                                name: key.attname(table).to_owned(),
+                                ty: *ty,
+                                typmod: crate::value::NO_TYPMOD,
+                                // An index column is nullable, has no default and no missing
+                                // value — three facts about the *index*, which stores whatever
+                                // the expression evaluated to and never fills a gap.
+                                not_null: false,
+                                default_now: false,
+                                default: None,
+                                missing: None,
+                            }),
+                            // No position in the table: there is no column under it, which is
+                            // what `attnum = 0` says in `pg_index.indkey` for the same part.
+                            None,
+                        )),
+                    })
                     .collect()
             })
             .unwrap_or_default(),
         RelKind::PrimaryKey => table
             .primary_key
             .iter()
-            .filter_map(|at| table.columns.get(*at).map(|column| (column, Some(*at))))
+            .filter_map(|at| {
+                table
+                    .columns
+                    .get(*at)
+                    .map(|column| (Cow::Borrowed(column), Some(*at)))
+            })
             .collect(),
         // **A sequence has no attributes here.** A real server's has three — `last_value`,
         // `log_cnt`, `is_called` — because a sequence there is a one-row relation you can

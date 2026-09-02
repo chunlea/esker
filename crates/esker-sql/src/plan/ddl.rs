@@ -10,7 +10,7 @@
 //! what a `23505` message quotes back, and a client that matches on the constraint name would not
 //! recognise ours if we invented them.
 
-use crate::catalog::{Identity, fold_identifier};
+use crate::catalog::{ExprShape, Identity, fold_identifier};
 use crate::value::{ColumnType, Datum};
 
 /// `CREATE TABLE`.
@@ -90,6 +90,23 @@ pub struct DropTable {
     pub if_exists: bool,
 }
 
+/// One part of a `CREATE INDEX` key, before the table is known.
+///
+/// The catalog's [`crate::catalog::IndexKey`] with a name where the position will be: nothing can
+/// resolve `b` to a column until the table has been read, and nothing may resolve it *twice*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexKeyPart {
+    /// A column, by name, folded.
+    Column(String),
+    /// An expression over the row — `((lower(b)))`.
+    Expression {
+        /// The expression's own text, with no parentheses of its own.
+        expr: String,
+        /// Which of PostgreSQL's three deparse shapes it is.
+        shape: ExprShape,
+    },
+}
+
 /// `CREATE INDEX`, including `CREATE UNIQUE INDEX`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateIndex {
@@ -97,8 +114,8 @@ pub struct CreateIndex {
     pub name: Option<String>,
     /// The table it is on, folded.
     pub table: String,
-    /// Column names, in key order.
-    pub columns: Vec<String>,
+    /// The key, in key order.
+    pub keys: Vec<IndexKeyPart>,
     /// Whether a duplicate is refused.
     pub unique: bool,
     /// `IF NOT EXISTS`.
@@ -156,11 +173,33 @@ pub fn sequence_name(table: &str, column: &str) -> String {
 
 /// `<table>_<column>…_idx`, PostgreSQL's name for an unnamed index.
 #[must_use]
-pub fn index_name(table: &str, columns: &[String]) -> String {
-    let mut parts = vec![table];
-    parts.extend(columns.iter().map(String::as_str));
-    parts.push("idx");
-    derived(&parts)
+pub fn index_name(table: &str, keys: &[IndexKeyPart]) -> String {
+    let mut parts = vec![table.to_owned()];
+    parts.extend(keys.iter().map(key_part_name));
+    parts.push("idx".to_owned());
+    derived(&parts.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+/// What one key part contributes to a derived index name.
+///
+/// A column contributes its name; an expression contributes the **function it calls**, and
+/// `expr` when it is not a call. Measured against PostgreSQL 19, which named
+/// `CREATE INDEX ON xj (a, (lower(b)))` `xj_a_lower_idx`, `((abs(a)))` `xj_abs_idx` and both
+/// `((a + c))` and `((1))` `xj_expr_idx` — the second disambiguated to `xj_expr_idx1`, which is
+/// the collision loop `crate::exec::ddl::create_index` already runs for a derived name.
+fn key_part_name(key: &IndexKeyPart) -> String {
+    match key {
+        IndexKeyPart::Column(name) => name.clone(),
+        // The callee's name is everything before the first `(` — a call's text is `name(args)`
+        // and nothing else, because that is what `ExprShape::Call` means.
+        IndexKeyPart::Expression {
+            expr,
+            shape: ExprShape::Call,
+        } => expr
+            .split_once('(')
+            .map_or_else(|| expr.clone(), |(name, _)| name.to_owned()),
+        IndexKeyPart::Expression { .. } => "expr".to_owned(),
+    }
 }
 
 /// Joins the parts and applies the same 63-byte limit every identifier has.
@@ -176,8 +215,13 @@ fn derived(parts: &[&str]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{index_name, primary_key_name, unique_constraint_name};
+    use super::{IndexKeyPart, index_name, primary_key_name, unique_constraint_name};
+    use crate::catalog::ExprShape;
     use crate::catalog::MAX_IDENTIFIER_BYTES;
+
+    fn column(name: &str) -> IndexKeyPart {
+        IndexKeyPart::Column(name.to_owned())
+    }
 
     /// The names a real PostgreSQL 19 gave a table with a primary key, a `UNIQUE` column and two
     /// indexes. A client matching on a constraint name would not recognise anything else.
@@ -188,11 +232,39 @@ mod tests {
             unique_constraint_name("mixed", &["val".into()]),
             "mixed_val_key"
         );
-        assert_eq!(index_name("mixed", &["a".into()]), "mixed_a_idx");
+        assert_eq!(index_name("mixed", &[column("a")]), "mixed_a_idx");
         assert_eq!(
-            index_name("mixed", &["a".into(), "b".into()]),
+            index_name("mixed", &[column("a"), column("b")]),
             "mixed_a_b_idx"
         );
+    }
+
+    /// The names PostgreSQL 19 derived for an index with an **expression** in its key: the
+    /// function's name for a call, and `expr` for anything else. Measured on `xj (id, a, b, c)`.
+    #[test]
+    fn a_derived_name_takes_the_function_from_an_expression_key() {
+        let call = |expr: &str| IndexKeyPart::Expression {
+            expr: expr.to_owned(),
+            shape: ExprShape::Call,
+        };
+        let other = |expr: &str| IndexKeyPart::Expression {
+            expr: expr.to_owned(),
+            shape: ExprShape::Operator,
+        };
+        assert_eq!(index_name("xj", &[call("lower(b)")]), "xj_lower_idx");
+        assert_eq!(index_name("xj", &[call("abs(a)")]), "xj_abs_idx");
+        assert_eq!(
+            index_name("xj", &[column("a"), call("lower(b)")]),
+            "xj_a_lower_idx"
+        );
+        assert_eq!(
+            index_name("xj", &[call("lower(b)"), call("upper(b)")]),
+            "xj_lower_upper_idx"
+        );
+        // `((a + c))` and `((1))` are both `xj_expr_idx`; the second is disambiguated by the
+        // collision loop in `crate::exec::ddl::create_index`, not here.
+        assert_eq!(index_name("xj", &[other("a + c")]), "xj_expr_idx");
+        assert_eq!(index_name("xj", &[other("1")]), "xj_expr_idx");
     }
 
     /// A derived name is an identifier like any other and obeys the same limit.

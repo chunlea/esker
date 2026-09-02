@@ -32,7 +32,8 @@ pub use crate::catalog::Identity;
 pub use crate::catalog::pg_catalog::CatalogView;
 pub use ddl::{
     AlterTable, AlterTableAction, Column, CreateIndex, CreateTable, DropIndex, DropTable,
-    UniqueConstraint, index_name, primary_key_name, sequence_name, unique_constraint_name,
+    IndexKeyPart, UniqueConstraint, index_name, primary_key_name, sequence_name,
+    unique_constraint_name,
 };
 pub use dml::{Delete, Insert, Returning, Update};
 pub use expr::{

@@ -867,7 +867,7 @@ fn for_each_node_expr_mut(node: &mut Node, visit: &mut impl FnMut(&mut Expr)) {
 }
 
 /// Every expression under this one, itself included, outermost first.
-fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
+pub(super) fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
     visit(expr);
     match expr {
         Expr::Binary { left, right, .. } => {

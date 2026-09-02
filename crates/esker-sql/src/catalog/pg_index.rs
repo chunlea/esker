@@ -38,9 +38,11 @@
 //!   `(oid, n, …)` for `n >= 1` is the *column name alone*; and past the last column it is the
 //!   **empty string**, not NULL and not an error.
 
+use std::borrow::Cow;
+
 use crate::backend::Txn;
 use crate::catalog::pg_relations::{RelKind, RelationRow, Relations};
-use crate::catalog::{SchemaState, TableDef};
+use crate::catalog::{IndexKey, SchemaState, TableDef};
 use crate::error::Result;
 use crate::value::{ColumnType, Datum};
 
@@ -58,7 +60,7 @@ pub fn rows(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
         rows.push(vec![
             Datum::Int8(relation.oid),
             Datum::Int8(oid_of_table(&relations, relation.table_id)),
-            Datum::Int2(i16::try_from(key.columns.len()).unwrap_or(i16::MAX)),
+            Datum::Int2(i16::try_from(key.keys.len()).unwrap_or(i16::MAX)),
             Datum::Bool(key.unique),
             // `NULLS NOT DISTINCT` is a clause this node's `CREATE INDEX` refuses by name, so no
             // index here has it. Measured: the default is `f` and the clause prints after the
@@ -67,11 +69,15 @@ pub fn rows(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
             Datum::Bool(key.primary),
             Datum::Bool(key.valid),
             Datum::Text(key.indkey(table)),
-            // No expression indexes and no partial indexes: both are `0A000` in
-            // `parse::lower::index_columns`, so there is nothing to print and NULL is what a
-            // catalog with no such index says.
-            Datum::Null,
-            Datum::Null,
+            // `indexprs` and `indpred` hold a `pg_node_tree` on a real server and the **printed
+            // text** here, for the reason `pg_attrdef.adbin` does: `pg_get_expr` is the only way
+            // a client reads either, and here that function is the identity
+            // (`crate::plan::expr::CatalogFunc::PgGetExpr`). NULL where there is none, which is
+            // what a client tests for — `ActiveRecord` prints a partial index's `WHERE` from it.
+            key.indexprs().map_or(Datum::Null, Datum::Text),
+            key.predicate.map_or(Datum::Null, |predicate| {
+                Datum::Text(parenthesised(predicate))
+            }),
         ]);
     }
     Ok(rows)
@@ -95,51 +101,60 @@ pub fn index_definition(relations: &Relations, oid: Option<i64>, column: Option<
     let Some(key) = key_of(relation, table) else {
         return Datum::Null;
     };
-    let names: Vec<&str> = key
-        .columns
-        .iter()
-        .filter_map(|at| table.columns.get(*at).map(|column| column.name.as_str()))
-        .collect();
+    let parts = key.listed(table);
     match column {
         // One column of it, by position, and the **empty string** past the last one. Measured:
         // `pg_get_indexdef(ix, 3, true)` over a two-column index is `''`, not NULL.
         Some(at) if at >= 1 => Datum::Text(
             usize::try_from(at - 1)
                 .ok()
-                .and_then(|at| names.get(at))
-                .map(|name| (*name).to_owned())
+                .and_then(|at| key.per_column(table).get(at).cloned())
                 .unwrap_or_default(),
         ),
         // Column 0 is the whole definition **unqualified** — the one difference between the two
         // forms, and it is not decoration: `ON ia` rather than `ON public.ia`.
-        Some(_) => Datum::Text(definition(
-            &relation.name,
-            &table.name,
-            &names,
-            key.unique,
-            false,
-        )),
-        None => Datum::Text(definition(
-            &relation.name,
-            &table.name,
-            &names,
-            key.unique,
-            true,
-        )),
+        Some(_) => Datum::Text(definition(relation, table, &key, &parts, false)),
+        None => Datum::Text(definition(relation, table, &key, &parts, true)),
     }
 }
 
-/// `CREATE [UNIQUE ]INDEX <name> ON [public.]<table> USING btree (<columns>)`.
+/// `CREATE [UNIQUE ]INDEX <name> ON [public.]<table> USING btree (<key>)[ WHERE (<predicate>)]`.
 ///
 /// Every index here is a btree, which is not a simplification: `USING` is refused by name in the
 /// DDL, so btree is the only access method this node has and naming another would be a claim.
-fn definition(name: &str, table: &str, columns: &[&str], unique: bool, qualified: bool) -> String {
-    format!(
-        "CREATE {}INDEX {name} ON {}{table} USING btree ({})",
-        if unique { "UNIQUE " } else { "" },
+///
+/// The `WHERE` is **re-printed parenthesised** whatever was written — `WHERE published_on IS NOT
+/// NULL` comes back `WHERE (published_on IS NOT NULL)` and `WHERE (a > 10)` comes back
+/// `WHERE (a > 10)`, one pair either way. Measured; and it matters beyond looks, because
+/// `ActiveRecord` recovers a partial index's predicate by scanning this string.
+fn definition(
+    relation: &RelationRow,
+    table: &TableDef,
+    key: &Key<'_>,
+    parts: &[String],
+    qualified: bool,
+) -> String {
+    let mut out = format!(
+        "CREATE {}INDEX {} ON {}{} USING btree ({})",
+        if key.unique { "UNIQUE " } else { "" },
+        relation.name,
         if qualified { "public." } else { "" },
-        columns.join(", ")
-    )
+        table.name,
+        parts.join(", ")
+    );
+    if let Some(predicate) = key.predicate {
+        out.push_str(" WHERE ");
+        out.push_str(&parenthesised(predicate));
+    }
+    out
+}
+
+/// One pair of parentheses around a stored expression, and never two.
+///
+/// The text a `WHERE` is stored with has had its own outer pair removed when it was lowered
+/// (`crate::parse::lower::unwrap_nested`), so this is where PostgreSQL's pair goes back on.
+fn parenthesised(expr: &str) -> String {
+    format!("({expr})")
 }
 
 /// One index's key, however it is stored.
@@ -148,10 +163,15 @@ fn definition(name: &str, table: &str, columns: &[&str], unique: bool, qualified
 /// every column of `pg_index` is a function of this — so they are read into one and the row is
 /// built once.
 struct Key<'a> {
-    columns: &'a [usize],
+    /// Borrowed from the index, and **owned** for a primary key — whose parts are columns that
+    /// live in `TableDef::primary_key` as bare positions and have no `IndexKey` to point at.
+    keys: Cow<'a, [IndexKey]>,
     unique: bool,
     primary: bool,
     valid: bool,
+    /// A partial index's predicate as it is stored — one pair of parentheses short of how it
+    /// prints ([`parenthesised`]).
+    predicate: Option<&'a str>,
 }
 
 impl Key<'_> {
@@ -161,12 +181,77 @@ impl Key<'_> {
     /// ([`super::pg_relations::attnum_of`]): a keyless table hides a column in slot 0, and
     /// numbering from there would make `a.attnum = ANY(i.indkey)` name the column after the one
     /// the index is on.
+    ///
+    /// An expression part is **`0`**, which is what makes the whole column readable: attribute
+    /// numbers are one-based there, so zero is free, and `ActiveRecord` branches on exactly this
+    /// (`indkey.include?(0)`) to decide whether to believe its column list or re-read the
+    /// definition text. A two-part key over `a` and `lower(b)` is `2 0`, measured.
     fn indkey(&self, table: &TableDef) -> String {
-        self.columns
+        self.keys
             .iter()
-            .map(|at| super::pg_relations::attnum_of(table, *at).to_string())
+            .map(|key| {
+                key.column()
+                    .map_or(0, |at| super::pg_relations::attnum_of(table, at))
+                    .to_string()
+            })
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// `indexprs`: the key's expressions, in key order, or `None` when every part is a column.
+    ///
+    /// Comma-joined, which is what `pg_get_expr` over a node **list** prints — measured for a
+    /// two-expression key.
+    fn indexprs(&self) -> Option<String> {
+        let printed: Vec<String> = self
+            .keys
+            .iter()
+            .filter_map(|key| match key {
+                IndexKey::Column(_) => None,
+                IndexKey::Expression { expr, shape, .. } => Some(shape.printed(expr)),
+            })
+            .collect();
+        (!printed.is_empty()).then(|| printed.join(", "))
+    }
+
+    /// The key parts as the definition lists them, and as the per-column form prints them.
+    ///
+    /// A column is its name. An expression is its printed form, wrapped in **one more** pair of
+    /// parentheses unless it is a bare call: `lower(b)` stays `lower(b)` where `(b IS NULL)`
+    /// becomes `((b IS NULL))` and `1` becomes `(1)`. Measured across a call, an operator, a
+    /// comparison, a cast and two constants — the rule is about the node, not about the text,
+    /// which is why [`IndexKey::Expression::call`] is stored rather than guessed at here.
+    fn listed(&self, table: &TableDef) -> Vec<String> {
+        self.keys
+            .iter()
+            .map(|key| match key {
+                IndexKey::Column(at) => table
+                    .columns
+                    .get(*at)
+                    .map(|column| column.name.clone())
+                    .unwrap_or_default(),
+                IndexKey::Expression { expr, shape, .. } => shape.listed(expr),
+            })
+            .collect()
+    }
+
+    /// The key parts as `pg_get_indexdef(oid, n, pretty)` prints them one at a time.
+    ///
+    /// The same as [`Key::listed`] except for a **value** expression, which the key list wraps
+    /// and this does not — the one cell where PostgreSQL's two forms disagree
+    /// ([`crate::catalog::ExprShape`]).
+    fn per_column(&self, table: &TableDef) -> Vec<String> {
+        self.keys
+            .iter()
+            .map(|key| match key {
+                IndexKey::Column(at) => table
+                    .columns
+                    .get(*at)
+                    .map(|column| column.name.clone())
+                    .unwrap_or_default(),
+                IndexKey::Expression { expr, shape, .. } => shape.per_column(expr),
+            })
+            .collect()
     }
 }
 
@@ -176,9 +261,10 @@ fn key_of<'a>(relation: &RelationRow, table: &'a TableDef) -> Option<Key<'a>> {
         RelKind::Index => {
             let index = table.indexes.get(relation.index_at?)?;
             Some(Key {
-                columns: &index.columns,
+                keys: Cow::Borrowed(&index.keys),
                 unique: index.unique,
                 primary: false,
+                predicate: index.predicate.as_deref(),
                 // **`indisvalid` is the schema state, read honestly.** An index that is not
                 // `Public` is one no reader may use (ADR 0020), and `indisvalid` is exactly the
                 // column a client checks before trusting one — `ActiveRecord`'s `indexes()`
@@ -188,10 +274,15 @@ fn key_of<'a>(relation: &RelationRow, table: &'a TableDef) -> Option<Key<'a>> {
             })
         }
         RelKind::PrimaryKey => Some(Key {
-            columns: &table.primary_key,
+            keys: table
+                .primary_key
+                .iter()
+                .map(|at| IndexKey::Column(*at))
+                .collect(),
             unique: true,
             primary: true,
             valid: true,
+            predicate: None,
         }),
         RelKind::Table | RelKind::Sequence => None,
     }

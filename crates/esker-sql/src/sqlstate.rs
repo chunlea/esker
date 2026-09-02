@@ -198,6 +198,10 @@ pub const GROUPING_ERROR: &str = "42803";
 pub const INVALID_COLUMN_REFERENCE: &str = "42P10";
 /// A `$1` with nothing bound to it.
 pub const UNDEFINED_PARAMETER: &str = "42P02";
+/// A definition that cannot be what it claims: an index expression whose value is not a function
+/// of the row alone. PostgreSQL's `invalid_object_definition`, and the code it gives for
+/// `CREATE INDEX ON t ((now()))`.
+pub const INVALID_OBJECT_DEFINITION: &str = "42P17";
 /// A table definition that cannot be built — no primary key, in our case.
 pub const INVALID_TABLE_DEFINITION: &str = "42P16";
 /// An identifier longer than 63 bytes. A *notice*, not an error: PostgreSQL truncates and carries

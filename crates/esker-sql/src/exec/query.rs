@@ -1132,7 +1132,11 @@ fn probe_for(on: &Expr, scope: &Scope<'_>, inner: &TableDef) -> Option<crate::pl
     inner
         .indexes
         .iter()
-        .find(|index| index.unique && index.columns == [inner_at])
+        .find(|index| {
+            // An expression index has no column key to match, so `key_columns` is `None` and it
+            // is never the unique index a join probe follows (`catalog::IndexDef::key_columns`).
+            index.unique && index.key_columns().is_some_and(|key| key == [inner_at])
+        })
         .map(|index| crate::plan::Probe::UniqueIndex {
             index_id: index.id,
             index_name: index.name.clone(),
@@ -1187,7 +1191,13 @@ fn access_path(filter: Option<&Expr>, tenant: u64, table: &TableDef) -> Result<N
         if !index.unique {
             continue;
         }
-        if let Some(key) = pinned(&index.columns, &equalities)
+        // **An expression index is never read**, for the reason a partial one is not: there is
+        // no constant in the `WHERE` to pin an expression to, and pinning it to the column
+        // underneath would be answering `WHERE b = 'X'` from an index on `lower(b)`.
+        let Some(key_columns) = index.key_columns() else {
+            continue;
+        };
+        if let Some(key) = pinned(&key_columns, &equalities)
             && row::unique_index_key_is_unique_by_value(&key)
         {
             return Ok(Node::IndexLookup {

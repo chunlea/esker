@@ -380,6 +380,16 @@ pub enum SqlError {
     #[error("there is no parameter ${0}")]
     UndefinedParameter(u32),
 
+    /// An index expression whose value is not a function of the row alone.
+    ///
+    /// PostgreSQL words it about the *function* rather than about the expression, and this copies
+    /// the sentence exactly because a client matching on it would not recognise anything else. It
+    /// is the answer there for a volatile function (`nextval`) **and** for a merely stable one
+    /// (`format_type`, `pg_get_indexdef`) — measured — which is every function this crate has
+    /// apart from `lower` and `upper`.
+    #[error("functions in index expression must be marked IMMUTABLE")]
+    NotImmutableInIndex,
+
     /// A **qualified** column reference — `o.nosuch` — that the named table does not have.
     ///
     /// Three sentences for one condition, and all three are PostgreSQL's, captured rather than
@@ -952,6 +962,7 @@ impl SqlError {
                 sqlstate::DATATYPE_MISMATCH
             }
             SqlError::UndefinedParameter(_) => sqlstate::UNDEFINED_PARAMETER,
+            SqlError::NotImmutableInIndex => sqlstate::INVALID_OBJECT_DEFINITION,
             SqlError::UndefinedOperator { .. }
             | SqlError::UndefinedAggregate { .. }
             | SqlError::UndefinedFunction(_)

@@ -1,0 +1,97 @@
+# An **expression** index — statement 78 of `schema.rb`, and the partial index's two loose ends
+#
+# `CREATE UNIQUE INDEX "index_books_on_lower_external_id" ON "books" ((lower(external_id)))`. The
+# key is a value computed from the row rather than a column of it, so the `UNIQUE` constrains
+# `lower(b)` and two rows may hold `Alpha` and `ALPHA` only if nothing else does.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **The printed form is not the written form, and one pair of parentheses is not the other.**
+#     `((lower(b)))` prints `lower(b)` — the outer pair is the column list's and the inner pair is
+#     dropped — but `((b IS NULL))` prints `((b IS NULL))`, keeping both. The rule is about the
+#     node and not about the text: a bare function call is listed unwrapped and everything else is
+#     wrapped once more than `pg_get_expr` prints it. Measured over a call, a comparison, an
+#     `IS NULL`, a cast and two constants; `pg_get_expr(indexprs, …)` is the column that shows the
+#     difference, `lower(b)` against `(b IS NULL)`.
+#   * **`indkey` is `0` for an expression part**, and `ActiveRecord` branches on exactly that
+#     (`indkey.include?(0)`) to decide whether to believe its column list. A key over `a` and
+#     `lower(b)` is `2 0`. Attribute numbers are one-based, which is what leaves `0` free.
+#   * **A bare column in expression position is a column**: `((b))` has `indkey = 3` and no
+#     `indexprs` at all, not an expression that happens to be a variable.
+#   * **The derived name takes the function's name**, not `expr`: `((upper(b)))` unnamed is
+#     `xidx_upper_idx` and `((b IS NULL))` is `xidx_expr_idx`.
+#   * **The `23505` DETAIL names the expression**, in the form `pg_get_expr` prints and not the
+#     one the key list uses: `Key (lower(b))=(alpha) already exists.`
+#   * **A bad column inside an expression is `42703`, the same as one in the key**, and a wrong
+#     argument *type* is `42883` naming the argument type — `lower(bigint)` here where a real
+#     server says `lower(integer)`, the bare-integer divergence declared in
+#     `tests/unknown_literal.rs`. An aggregate is `42803` with a sentence of its own.
+#   * **The index relation has a `pg_attribute` row per key part**, and an expression's is named
+#     after the function: `xidx_mixed`'s two rows are `a` and **`lower`**.
+#
+# THE TWO PARTIAL-INDEX LINES AT THE END ARE REGRESSIONS, not new ground. `pg_get_indexdef` prints
+# a `WHERE` — statement 77's unit left it out, and `ActiveRecord` recovers the predicate by
+# scanning that string — and `indpred` is that text rather than NULL. The last block is the other
+# one: an index built over rows that **already exist** must leave out the rows its predicate
+# excludes. Rows 2 and 3 share `b = 7` with a NULL `published_on`, so the index holds only row 1
+# and the statement succeeds; a backfill that indexed all three would refuse it with `23505`.
+#
+# The tables are left behind on the oracle, which is what lets `\gdesc` fill the declared-types
+# column in a second session (`captures/README.md`).
+DROP TABLE IF EXISTS xidx		-
+CREATE TABLE xidx (id int8 PRIMARY KEY, a int8, b text, c int8)		-
+INSERT INTO xidx VALUES (1, 10, 'Alpha', 1)		-
+INSERT INTO xidx VALUES (2, 20, 'beta', 2)		-
+CREATE UNIQUE INDEX xidx_expr ON xidx ((lower(b)))		-
+INSERT INTO xidx VALUES (3, 30, 'ALPHA', 3)	!23505 duplicate key value violates unique constraint "xidx_expr" DETAIL: Key (lower(b))=(alpha) already exists.
+INSERT INTO xidx VALUES (3, 30, 'Gamma', 3)		-
+SELECT id, b FROM xidx ORDER BY id	bigint,text	1|Alpha ; 2|beta ; 3|Gamma
+UPDATE xidx SET b = 'BETA' WHERE id = 1	!23505 duplicate key value violates unique constraint "xidx_expr" DETAIL: Key (lower(b))=(beta) already exists.
+UPDATE xidx SET b = 'delta' WHERE id = 1		-
+SELECT id, b FROM xidx ORDER BY id	bigint,text	1|delta ; 2|beta ; 3|Gamma
+DELETE FROM xidx WHERE id = 2		-
+INSERT INTO xidx VALUES (4, 40, 'BETA', 4)		-
+SELECT id, b FROM xidx ORDER BY id	bigint,text	1|delta ; 3|Gamma ; 4|BETA
+SELECT id FROM xidx WHERE lower(b) = 'beta' ORDER BY id	bigint	4
+CREATE INDEX xidx_mixed ON xidx (a, (lower(b)))		-
+CREATE INDEX ON xidx ((upper(b)))		-
+CREATE INDEX ON xidx ((b IS NULL))		-
+CREATE INDEX ON xidx ((b))		-
+CREATE UNIQUE INDEX xidx_partial ON xidx (c) WHERE b IS NOT NULL		-
+CREATE INDEX xidx_paren ON xidx (a) WHERE (a > 10)		-
+SELECT pg_get_indexdef('xidx_expr'::regclass)	text	CREATE UNIQUE INDEX xidx_expr ON public.xidx USING btree (lower(b))
+SELECT pg_get_indexdef('xidx_mixed'::regclass)	text	CREATE INDEX xidx_mixed ON public.xidx USING btree (a, lower(b))
+SELECT pg_get_indexdef('xidx_upper_idx'::regclass)	text	CREATE INDEX xidx_upper_idx ON public.xidx USING btree (upper(b))
+SELECT pg_get_indexdef('xidx_expr_idx'::regclass)	text	CREATE INDEX xidx_expr_idx ON public.xidx USING btree (((b IS NULL)))
+SELECT pg_get_indexdef('xidx_b_idx'::regclass)	text	CREATE INDEX xidx_b_idx ON public.xidx USING btree (b)
+SELECT pg_get_indexdef('xidx_partial'::regclass)	text	CREATE UNIQUE INDEX xidx_partial ON public.xidx USING btree (c) WHERE (b IS NOT NULL)
+SELECT pg_get_indexdef('xidx_paren'::regclass)	text	CREATE INDEX xidx_paren ON public.xidx USING btree (a) WHERE (a > 10)
+SELECT pg_get_indexdef('xidx_expr'::regclass, 0, true)	text	CREATE UNIQUE INDEX xidx_expr ON xidx USING btree (lower(b))
+SELECT pg_get_indexdef('xidx_expr'::regclass, 1, true)	text	lower(b)
+SELECT pg_get_indexdef('xidx_mixed'::regclass, 1, true)	text	a
+SELECT pg_get_indexdef('xidx_mixed'::regclass, 2, true)	text	lower(b)
+SELECT pg_get_indexdef('xidx_expr_idx'::regclass, 1, true)	text	(b IS NULL)
+SELECT i.relname, x.indnatts, x.indisunique, x.indkey::text, pg_get_expr(x.indexprs, x.indrelid), pg_get_expr(x.indpred, x.indrelid) FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'xidx'::regclass ORDER BY i.relname	name,smallint,boolean,text,text,text	xidx_b_idx|1|f|3|\N|\N ; xidx_expr|1|t|0|lower(b)|\N ; xidx_expr_idx|1|f|0|(b IS NULL)|\N ; xidx_mixed|2|f|2 0|lower(b)|\N ; xidx_paren|1|f|2|\N|(a > 10) ; xidx_partial|1|t|4|\N|(b IS NOT NULL) ; xidx_pkey|1|t|1|\N|\N ; xidx_upper_idx|1|f|0|upper(b)|\N
+SELECT a.attnum, a.attname FROM pg_attribute a WHERE a.attrelid = 'xidx_mixed'::regclass ORDER BY a.attnum	smallint,name	1|a ; 2|lower
+CREATE INDEX xidx_not ON xidx ((NOT (b IS NULL)))		-
+SELECT pg_get_indexdef('xidx_not'::regclass)	text	CREATE INDEX xidx_not ON public.xidx USING btree (((NOT (b IS NULL))))
+SELECT pg_get_indexdef('xidx_not'::regclass, 1, true)	text	(NOT b IS NULL)
+CREATE INDEX xidx_cast ON xidx ((a::text))		-
+SELECT pg_get_indexdef('xidx_cast'::regclass)	text	CREATE INDEX xidx_cast ON public.xidx USING btree (((a)::text))
+SELECT pg_get_indexdef('xidx_cast'::regclass, 1, true)	text	(a::text)
+CREATE INDEX xidx_bad ON xidx ((lower(nosuchcol)))	!42703 column "nosuchcol" does not exist
+CREATE INDEX xidx_expr ON xidx ((upper(b)))	!42P07 relation "xidx_expr" already exists
+CREATE INDEX xidx_agg ON xidx ((count(a)))	!42803 aggregate functions are not allowed in index expressions
+CREATE INDEX xidx_type ON xidx ((lower(a)))	!42883 function lower(bigint) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+DROP TABLE IF EXISTS xidb		-
+CREATE TABLE xidb (id int8 PRIMARY KEY, b int8, published_on int8)		-
+INSERT INTO xidb VALUES (1, 7, 100)		-
+INSERT INTO xidb VALUES (2, 7, NULL)		-
+INSERT INTO xidb VALUES (3, 7, NULL)		-
+CREATE UNIQUE INDEX xidb_partial ON xidb (b) WHERE published_on IS NOT NULL		-
+SELECT id FROM xidb ORDER BY id	bigint	1 ; 2 ; 3
+INSERT INTO xidb VALUES (4, 7, 200)	!23505 duplicate key value violates unique constraint "xidb_partial" DETAIL: Key (b)=(7) already exists.

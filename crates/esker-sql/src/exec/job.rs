@@ -101,8 +101,9 @@ pub(super) fn backfill_batch(executor: &Executor, index_id: u64) -> Result<bool>
     let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(read.len());
     for (_, value) in &read {
         let row = crate::row::decode_row(&schema, value)?;
-        let (key, entry) = index_entry(tenant, &table, &index, &row)?;
-        entries.push((key, entry));
+        if let Some(entry) = index_entry(tenant, &table, &index, &row)? {
+            entries.push(entry);
+        }
     }
 
     for (key, entry) in entries {
@@ -130,34 +131,28 @@ pub(super) fn backfill_batch(executor: &Executor, index_id: u64) -> Result<bool>
     Ok(false)
 }
 
-/// The index key and value for one row — the same encoding `crate::exec::dml` writes, because an
-/// entry a backfill wrote and one a writer wrote have to be the same bytes or the two would
-/// conflict forever.
+/// The index key and value for one row, or `None` for a row a **partial** index excludes.
+///
+/// Both come from `crate::exec::index`, which is the same code `crate::exec::dml` writes through:
+/// an entry a backfill wrote and one a writer wrote have to be the same bytes or the two would
+/// conflict forever, and a row one of them indexes and the other does not is an entry nothing
+/// ever removes.
 fn index_entry(
     tenant: u64,
     table: &TableDef,
     index: &catalog::IndexDef,
     row: &[Datum],
-) -> Result<(Vec<u8>, Vec<u8>)> {
-    let columns: Vec<Datum> = index
-        .columns
-        .iter()
-        .map(|&ordinal| row[ordinal].clone())
-        .collect();
+) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
     let primary_key: Vec<Datum> = table
         .primary_key
         .iter()
         .map(|&ordinal| row[ordinal].clone())
         .collect();
-    let by_value = index.unique && crate::row::unique_index_key_is_unique_by_value(&columns);
-    let suffix = if by_value {
-        None
-    } else {
-        Some(primary_key.as_slice())
+    let Some(entry) = crate::exec::index::entry(tenant, table, index, row, &primary_key)? else {
+        return Ok(None);
     };
-    let key = crate::row::index_key(tenant, table.id, index.id, &columns, suffix)?;
     let value = crate::row::encode_row(&table.primary_key_types(), &primary_key)?;
-    Ok((key, value))
+    Ok(Some((entry.key, value)))
 }
 
 /// Moves an index one state on, in a transaction of its own, **if it is still where the caller

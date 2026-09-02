@@ -48,7 +48,8 @@ use esker_base::varint;
 use esker_keys::{codec, prefix};
 
 use crate::catalog::{
-    CheckDef, ColumnDef, Identity, IndexDef, Relation, SchemaState, SequenceDef, TableDef,
+    CheckDef, ColumnDef, ExprShape, Identity, IndexDef, IndexKey, Relation, SchemaState,
+    SequenceDef, TableDef,
 };
 use crate::error::{Result, SqlError};
 use crate::value::{ColumnType, Datum, NO_TYPMOD};
@@ -63,12 +64,17 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// tier 1 owes. A version 3 column reads back `-1`, which is what a column declared without a
 /// number means, and is what every column a version 3 catalog could hold was.
 ///
+/// Version 5 added an expression default (`DEFAULT CURRENT_TIMESTAMP`), version 6 the table's
+/// `CHECK` constraints, version 7 a partial index's predicate, and version 8 an index's key
+/// **expressions**. Each is appended at the end, so a record of every earlier version is a prefix
+/// of a later one's and the goldens below still decode.
+///
 /// Version 1 is not read: nothing had ever persisted a catalog when version 2 landed, so a
 /// compatibility path for it was one nothing could check. **Version 2 is different** — this crate
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 7;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 8;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -171,6 +177,28 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Json => TAG_JSON,
         ColumnType::Jsonb => TAG_JSONB,
     }
+}
+
+/// Tags for [`ExprShape`] as stored, ours like every other tag in this record.
+const SHAPE_CALL: u8 = 1;
+const SHAPE_VALUE: u8 = 2;
+const SHAPE_OPERATOR: u8 = 3;
+
+fn shape_tag(shape: ExprShape) -> u8 {
+    match shape {
+        ExprShape::Call => SHAPE_CALL,
+        ExprShape::Value => SHAPE_VALUE,
+        ExprShape::Operator => SHAPE_OPERATOR,
+    }
+}
+
+fn shape_of(tag: u8) -> Result<ExprShape> {
+    Ok(match tag {
+        SHAPE_CALL => ExprShape::Call,
+        SHAPE_VALUE => ExprShape::Value,
+        SHAPE_OPERATOR => ExprShape::Operator,
+        other => return Err(corrupt(format!("index expression shape tag {other}"))),
+    })
 }
 
 fn type_of(tag: u8) -> Result<ColumnType> {
@@ -657,9 +685,15 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         // schema version — which is what an index that never staged a change means.
         out.push(state_tag(index.state));
         varint::put_u64(index.state_since, &mut out);
-        varint::put_u64(index.columns.len() as u64, &mut out);
-        for &ordinal in &index.columns {
-            varint::put_u64(ordinal as u64, &mut out);
+        varint::put_u64(index.keys.len() as u64, &mut out);
+        for key in &index.keys {
+            // An expression part writes ordinal **0**, which is the number PostgreSQL's own
+            // `indkey` reserves for one, and the expression itself is written in the version 8
+            // section below. Every table has a column 0, so the number a version 7 reader would
+            // take this for is at least in range — it is the wrong column rather than a corrupt
+            // record, and a version 7 reader is a binary older than the record it is reading,
+            // which `Reader::at_least` already refuses at the top.
+            varint::put_u64(key.column().unwrap_or(0) as u64, &mut out);
         }
     }
 
@@ -677,7 +711,61 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
     for index in &table.indexes {
         put_str(index.predicate.as_deref().unwrap_or(""), &mut out);
     }
+
+    // Version 8. The expressions come after the predicates, for the third time and the same
+    // reason: a version 7 record's bytes stay a prefix of a version 8 one's.
+    //
+    // One string per key part, empty for a column, and the `call` flag **only after a non-empty
+    // one** — a column part costs the one byte a zero-length string costs, which is what keeps a
+    // table of ordinary indexes the same size it was.
+    for index in &table.indexes {
+        for key in &index.keys {
+            match key {
+                IndexKey::Column(_) => put_str("", &mut out),
+                IndexKey::Expression { expr, shape, ty } => {
+                    put_str(expr, &mut out);
+                    out.push(shape_tag(*shape));
+                    out.push(tag_of(*ty));
+                }
+            }
+        }
+    }
     Ok(out)
+}
+
+/// The two per-index sections that were appended after version 6: predicates, then expressions.
+///
+/// They are at the end of the record and in that order, so a version 6 record's bytes are a prefix
+/// of a version 7 one's and a version 7 one's of a version 8 one's — which is what keeps every
+/// golden below decoding.
+fn read_index_tails(reader: &mut Reader<'_>, indexes: &mut [IndexDef]) -> Result<()> {
+    // An empty string is "no predicate": a partial index whose `WHERE` was empty is not a thing
+    // the parser can produce, so the two cannot be confused.
+    if reader.version >= 7 {
+        for index in indexes.iter_mut() {
+            let predicate = reader.string()?;
+            index.predicate = (!predicate.is_empty()).then_some(predicate);
+        }
+    }
+    // An empty string is "a column part", for the same reason and with the same guarantee: the
+    // parser cannot produce an empty index expression. A version 7 index reads back with every
+    // part a column, which is what every index a version 7 catalog could hold was — an expression
+    // index was `0A000` until version 8.
+    if reader.version >= 8 {
+        for index in indexes.iter_mut() {
+            for key in &mut index.keys {
+                let expr = reader.string()?;
+                if !expr.is_empty() {
+                    *key = IndexKey::Expression {
+                        expr,
+                        shape: shape_of(reader.byte()?)?,
+                        ty: type_of(reader.byte()?)?,
+                    };
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Reads a table record back. Every failure is typed: a catalog is on-disk data like any other.
@@ -736,18 +824,18 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
         } else {
             (SchemaState::Public, schema_version)
         };
-        let mut index_columns = Vec::with_capacity(reader.count()?);
-        for _ in 0..index_columns.capacity() {
-            index_columns.push(reader.ordinal(columns.len())?);
+        let mut keys = Vec::with_capacity(reader.count()?);
+        for _ in 0..keys.capacity() {
+            keys.push(IndexKey::Column(reader.ordinal(columns.len())?));
         }
         indexes.push(IndexDef {
             id,
             name,
             unique,
-            columns: index_columns,
+            keys,
             state,
             state_since,
-            // Filled after the loop, for version 7 and later.
+            // Both filled after the loop, for version 7 and version 8 respectively.
             predicate: None,
         });
     }
@@ -767,14 +855,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
     } else {
         Vec::new()
     };
-    // An empty string is "no predicate": a partial index whose `WHERE` was empty is not a thing
-    // the parser can produce, so the two cannot be confused.
-    if reader.version >= 7 {
-        for index in &mut indexes {
-            let predicate = reader.string()?;
-            index.predicate = (!predicate.is_empty()).then_some(predicate);
-        }
-    }
+    read_index_tails(&mut reader, &mut indexes)?;
     reader.finish()?;
 
     Ok(TableDef {

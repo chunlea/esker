@@ -155,7 +155,7 @@ fn create_table_puts_the_columns_the_key_and_the_unique_indexes_in_the_catalog()
     assert_eq!(table.indexes.len(), 1, "the UNIQUE constraint is an index");
     assert_eq!(table.indexes[0].name, "accounts_email_key");
     assert!(table.indexes[0].unique);
-    assert_eq!(table.indexes[0].columns, [1]);
+    assert_eq!(table.indexes[0].key_columns(), Some(vec![1]));
 }
 
 /// A table with no declared key gets an internal row id, and every trace of it is hidden: it is
@@ -333,8 +333,8 @@ fn create_index_adds_to_the_table_and_drop_index_removes_it() {
     let table = node.table("t").unwrap();
     assert_eq!(table.indexes.len(), 2);
     assert_eq!(
-        table.indexes[1].columns,
-        [1, 0],
+        table.indexes[1].key_columns(),
+        Some(vec![1, 0]),
         "index order, not column order"
     );
     assert!(table.indexes[1].unique);

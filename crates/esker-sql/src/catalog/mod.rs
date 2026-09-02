@@ -225,8 +225,138 @@ impl SchemaState {
     }
 }
 
-/// One index on one table. Its columns are positions into the table's column list, so renaming a
-/// column cannot orphan an index.
+/// One part of an index's key: a column of the table, or an expression over the row.
+///
+/// PostgreSQL keeps the same distinction and a client reads it: `pg_index.indkey` holds an
+/// attribute number for a column part and **`0`** for an expression one, and `ActiveRecord`'s
+/// `indexes()` branches on exactly that (`indkey.include?(0)`) to decide whether to believe the
+/// column list or re-read the definition text. So the two are different shapes here rather than a
+/// column position with a sentinel — a sentinel is what `0` is on the wire, and it is only safe
+/// there because attribute numbers are one-based and positions here are not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexKey {
+    /// A position into [`TableDef::columns`]. Renaming the column cannot orphan the index.
+    Column(usize),
+    /// An expression over the row — `CREATE UNIQUE INDEX … ON t ((lower(b)))`.
+    ///
+    /// Stored as text and lowered per row, the same trade [`CheckDef`] and
+    /// [`IndexDef::predicate`] make, and for the same two reasons: `pg_get_indexdef` needs the
+    /// text anyway, and one string is an encoding the table record already writes.
+    Expression {
+        /// The expression's own text, with no parentheses of its own: `lower(b)`, `b IS NULL`,
+        /// `1`. The parentheses PostgreSQL prints are a function of the [`ExprShape`] beside it,
+        /// and there are three different ones — which is why they are added where they are read
+        /// rather than baked in here.
+        expr: String,
+        /// Which of PostgreSQL's three deparse shapes this expression is.
+        shape: ExprShape,
+        /// The type the expression evaluates to, resolved once when the index was created.
+        ///
+        /// Stored rather than re-derived because the index **relation** has a `pg_attribute` row
+        /// per key part and that row has to declare a type: `pg_attribute` is in this module and
+        /// re-lowering the text to ask would put the executor's resolver under the catalog. It is
+        /// also the honest place for it — the type an index key has is the type it had when the
+        /// index was built, and an expression that would resolve differently today is a rebuild,
+        /// not a re-read.
+        ty: ColumnType,
+    },
+}
+
+/// How PostgreSQL prints one index expression, in the three places it prints one.
+///
+/// Not a property of the text and not recoverable from it — `'x)'::text` and `f(x)` end the same
+/// way — so it is decided where the expression is lowered and stored beside it. Measured on
+/// PostgreSQL 19 (`tests/corpus/pg19_expression_index.txt`):
+///
+/// | written | `pg_get_expr(indexprs)` | `pg_get_indexdef(i, n, t)` | in the key list |
+/// |---|---|---|---|
+/// | `lower(b)` | `lower(b)` | `lower(b)` | `lower(b)` |
+/// | `b IS NULL` | `(b IS NULL)` | `(b IS NULL)` | `((b IS NULL))` |
+/// | `1` | `1` | `(1)` | `(1)` |
+///
+/// Three columns and no two rows alike, which is the whole reason this is an enum and not a flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExprShape {
+    /// A bare function call. Printed and listed unparenthesised, the only shape that is.
+    Call,
+    /// A value with no operator at its top — a constant, a cast. Printed bare and listed in one
+    /// pair, and the **one** shape whose per-column form is not its printed form.
+    Value,
+    /// An operator or a connective. Printed in one pair already, and listed in two.
+    Operator,
+}
+
+impl ExprShape {
+    /// What `pg_get_expr(indexprs, indrelid)` answers, and what a `23505` `DETAIL` names.
+    #[must_use]
+    pub fn printed(self, expr: &str) -> String {
+        match self {
+            ExprShape::Call | ExprShape::Value => expr.to_owned(),
+            ExprShape::Operator => format!("({expr})"),
+        }
+    }
+
+    /// What the key list inside `pg_get_indexdef`'s `USING btree (…)` holds.
+    ///
+    /// One pair more than [`ExprShape::printed`] for everything that is not a call — so an
+    /// operator, already printed in one pair, is listed in **two**: `((b IS NULL))`.
+    #[must_use]
+    pub fn listed(self, expr: &str) -> String {
+        match self {
+            ExprShape::Call => expr.to_owned(),
+            ExprShape::Value | ExprShape::Operator => format!("({})", self.printed(expr)),
+        }
+    }
+
+    /// What `pg_get_indexdef(oid, n, pretty)` answers for this key part alone.
+    ///
+    /// [`ExprShape::listed`] for a value and [`ExprShape::printed`] for the other two, which is
+    /// the row of the table above where the last two columns disagree.
+    #[must_use]
+    pub fn per_column(self, expr: &str) -> String {
+        match self {
+            ExprShape::Call | ExprShape::Operator => self.printed(expr),
+            ExprShape::Value => format!("({expr})"),
+        }
+    }
+}
+
+impl IndexKey {
+    /// The column this part is, or `None` for an expression.
+    #[must_use]
+    pub fn column(&self) -> Option<usize> {
+        match self {
+            IndexKey::Column(at) => Some(*at),
+            IndexKey::Expression { .. } => None,
+        }
+    }
+
+    /// The name the index **relation**'s own column carries: the table's column name for a column
+    /// part, and for an expression the function it calls, or `expr`.
+    ///
+    /// PostgreSQL's `ChooseIndexColumnNames`, measured: `CREATE INDEX xa_e ON xa (a, (lower(b)))`
+    /// has `pg_attribute` rows `a` and **`lower`** on the index. It is the same rule that names a
+    /// derived index (`crate::plan::index_name`), which is not a coincidence — a derived name is
+    /// this joined with `_idx`.
+    #[must_use]
+    pub fn attname<'a>(&'a self, table: &'a TableDef) -> &'a str {
+        match self {
+            IndexKey::Column(at) => table
+                .columns
+                .get(*at)
+                .map_or(INTERNAL_ROW_ID_NAME, |column| column.name.as_str()),
+            IndexKey::Expression {
+                expr,
+                shape: ExprShape::Call,
+                ..
+            } => expr.split_once('(').map_or(expr.as_str(), |(name, _)| name),
+            IndexKey::Expression { .. } => "expr",
+        }
+    }
+}
+
+/// One index on one table. Its column parts are positions into the table's column list, so
+/// renaming a column cannot orphan an index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexDef {
     /// From the tenant's relation-id sequence, like a table's.
@@ -235,8 +365,8 @@ pub struct IndexDef {
     pub name: String,
     /// Whether a duplicate is refused with `23505`.
     pub unique: bool,
-    /// Positions into [`TableDef::columns`].
-    pub columns: Vec<usize>,
+    /// The key, in key order: a column of the table or an expression over the row.
+    pub keys: Vec<IndexKey>,
     /// Where this index is in a staged schema change (ADR 0020).
     ///
     /// [`SchemaState::Public`] for an index that was built the old way — one statement, one
@@ -262,6 +392,21 @@ pub struct IndexDef {
     /// rows the index happens to hold, which is ADR 0020's "skip the backfill" anomaly arriving
     /// by a different road. So it enforces its `UNIQUE` and never narrows a read.
     pub predicate: Option<String>,
+}
+
+impl IndexDef {
+    /// The key's column positions, or `None` for an index with an expression in its key.
+    ///
+    /// `None` is what stops a read from choosing one. The planner narrows a scan by pinning every
+    /// key column to a constant from the `WHERE`, and there is no constant to pin an expression
+    /// to: proving `WHERE lower(b) = 'x'` reaches the same entries as an index on `lower(b)`
+    /// needs the equivalence this crate has no prover for, and picking it without one would
+    /// answer a correct-looking query with the rows the index happens to hold — the same anomaly
+    /// [`IndexDef::predicate`] is kept out of a read for.
+    #[must_use]
+    pub fn key_columns(&self) -> Option<Vec<usize>> {
+        self.keys.iter().map(IndexKey::column).collect()
+    }
 }
 
 /// The name the internal row id column carries: **no name at all**.
@@ -1402,10 +1547,11 @@ pub fn bump_version(txn: &mut dyn Txn) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Catalog, ColumnDef, DEFAULT_RETENTION_MS, Identity, IndexDef, MAX_IDENTIFIER_BYTES,
-        RETENTION_FOREVER, Relation, SchemaState, SequenceDef, TableDef, allocate_id,
-        clear_table_retention, create_table, default_retention, drop_table, fold_identifier,
-        record, replace_table, set_default_retention, set_table_retention, table_retention,
+        Catalog, ColumnDef, DEFAULT_RETENTION_MS, Identity, IndexDef, IndexKey,
+        MAX_IDENTIFIER_BYTES, RETENTION_FOREVER, Relation, SchemaState, SequenceDef, TableDef,
+        allocate_id, clear_table_retention, create_table, default_retention, drop_table,
+        fold_identifier, record, replace_table, set_default_retention, set_table_retention,
+        table_retention,
     };
     use crate::backend::{Backend, MemoryBackend};
     use crate::sqlstate;
@@ -1458,7 +1604,7 @@ mod tests {
                 id: id + 1,
                 name: "accounts_email_key".into(),
                 unique: true,
-                columns: vec![1],
+                keys: vec![IndexKey::Column(1)],
                 state: SchemaState::Public,
                 state_since: 1,
                 predicate: None,
@@ -1487,7 +1633,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "07",               // catalog format version
+                "08",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -1539,7 +1685,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "07",                 // catalog format version
+                "08",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -1574,6 +1720,7 @@ mod tests {
                 "01", // one column, column 1
                 "00", // version 6: no CHECK constraints
                 "00", // version 7: the one index has no WHERE predicate
+                "00", // version 8: its one key part is a column, not an expression
             )
         );
         assert_eq!(record::decode_table(&encoded).unwrap(), accounts(7));
@@ -1610,6 +1757,57 @@ mod tests {
             "01",
         ));
         assert_eq!(record::decode_table(&v2).unwrap(), accounts(7));
+    }
+
+    /// The **version 7** golden, kept for the same reason the six before it are.
+    ///
+    /// These are the bytes version 7 wrote — the record ends at the index predicates, with no key
+    /// expressions after them. Every key part reads back as a **column**, which is what every
+    /// index a version 7 catalog could hold had: an expression index was `0A000` until version 8.
+    #[test]
+    fn a_version_7_table_record_still_decodes() {
+        let v7 = decode_hex(concat!(
+            "07",                 // catalog format version 7
+            "0700000000000000",   // table id 7
+            "086163636f756e7473", // varint 8, "accounts"
+            "0d6163636f756e74735f706b6579",
+            "01", // schema version 1
+            "02", // two columns
+            "026964",
+            "01",
+            "01",
+            "00",
+            "00",
+            "ffffffff",
+            "00",
+            "05656d61696c",
+            "02",
+            "00",
+            "00",
+            "00",
+            "ffffffff",
+            "00",
+            "01",
+            "00",                                     // primary key: one column, column 0
+            "01",                                     // one index
+            "0800000000000000",                       // index id 8
+            "126163636f756e74735f656d61696c5f6b6579", // "accounts_email_key"
+            "01",                                     // unique
+            "03",                                     // state: public
+            "01",                                     // entered at schema version 1
+            "01",
+            "01", // one column, column 1
+            "00", // no CHECK constraints
+            "00", // the one index has no WHERE predicate -- and nothing after it
+        ));
+        let table = record::decode_table(&v7).unwrap();
+        assert_eq!(table, accounts(7));
+        assert!(
+            table
+                .indexes
+                .iter()
+                .all(|index| index.key_columns().is_some())
+        );
     }
 
     /// The **version 6** golden, kept for the same reason the five before it are.
@@ -2047,7 +2245,7 @@ mod tests {
             id: 5,
             name: "accounts_id_idx".into(),
             unique: false,
-            columns: vec![0],
+            keys: vec![IndexKey::Column(0)],
             state: SchemaState::Public,
             state_since: 1,
             predicate: None,
@@ -2104,7 +2302,7 @@ mod tests {
             id: 9,
             name: "accounts".into(),
             unique: false,
-            columns: vec![0],
+            keys: vec![IndexKey::Column(0)],
             state: SchemaState::Public,
             state_since: 1,
             predicate: None,
@@ -2296,7 +2494,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "07",               // catalog format version
+                "08",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

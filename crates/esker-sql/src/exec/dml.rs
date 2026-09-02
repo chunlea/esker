@@ -300,7 +300,7 @@ pub(super) fn write_row(
         if table.row_id().is_some() {
             return Err(SqlError::Internal(format!(
                 "internal row id {} of table \"{}\" is already taken",
-                render_values(&primary_key),
+                super::index::render_values(&primary_key),
                 table.name
             )));
         }
@@ -327,45 +327,33 @@ pub(super) fn write_row(
         if !index.state.written() {
             continue;
         }
-        // A **partial** index holds entries only for the rows its predicate admits, and "admits"
-        // is the same three-valued rule a `CHECK` uses in reverse: a row is in the index when the
-        // predicate is *true*, so a NULL keeps it out where a NULL keeps a `CHECK` happy.
-        if !index_admits(table, index, row)? {
+        // A **partial** index holds entries only for the rows its predicate admits, and an
+        // expression index holds the expression's value rather than a column's. Both are
+        // `super::index`'s to decide, so that a writer, a deleter and the two backfills cannot
+        // decide them differently.
+        let Some(entry) = super::index::entry(tenant, table, index, row, &primary_key)? else {
             continue;
-        }
-        let columns: Vec<Datum> = index
-            .columns
-            .iter()
-            .map(|&ordinal| row[ordinal].clone())
-            .collect();
+        };
         // A unique index leaves the primary key off, which is what makes a duplicate a collision
         // on one key -- unless a column is NULL, because PostgreSQL admits any number of NULLs in
         // a `UNIQUE` column and those entries need the suffix to stay apart (`crate::row`).
-        let by_value = index.unique && row::unique_index_key_is_unique_by_value(&columns);
-        let suffix = if by_value {
-            None
-        } else {
-            Some(primary_key.as_slice())
-        };
-        let index_key = row::index_key(tenant, table.id, index.id, &columns, suffix)?;
-
-        if by_value {
-            let detail = render_key(table, &index.columns, &columns);
-            if txn.get(&index_key)?.is_some() {
+        if entry.by_value {
+            let detail = super::index::render_key(table, &index.keys, &entry.values);
+            if txn.get(&entry.key)?.is_some() {
                 return Err(SqlError::UniqueViolation {
                     constraint: index.name.clone(),
                     key: Some(detail),
                 });
             }
             written.unique_keys.push(Unique {
-                key: index_key.clone(),
+                key: entry.key.clone(),
                 constraint: index.name.clone(),
                 detail,
             });
         }
         // The value is the primary key, which is what an index lookup follows back to the row.
         txn.put(
-            &index_key,
+            &entry.key,
             &row::encode_row(&table.primary_key_types(), &primary_key)?,
         );
     }
@@ -374,25 +362,15 @@ pub(super) fn write_row(
     Ok(())
 }
 
-/// `Key (a, b)=(1, x)`, PostgreSQL's `DETAIL` for a uniqueness failure.
+/// `Key (a, b)=(1, x)` for the **primary key**, whose parts are always columns.
 ///
-/// Nothing is quoted or escaped, which is PostgreSQL's own behaviour and not a shortcut: a text
-/// value containing `, y)` really does come back as `Key (a, b)=(1, x, y))`. Copied exactly.
+/// An index's is [`super::index::render_key`], which has an expression key part to print too.
 fn render_key(table: &TableDef, ordinals: &[usize], values: &[Datum]) -> String {
-    let names: Vec<&str> = ordinals
+    let keys: Vec<crate::catalog::IndexKey> = ordinals
         .iter()
-        .map(|&ordinal| table.columns[ordinal].name.as_str())
+        .map(|&ordinal| crate::catalog::IndexKey::Column(ordinal))
         .collect();
-    format!("Key ({})=({})", names.join(", "), render_values(values))
-}
-
-/// Values joined with `, `, a NULL written `null`, nothing quoted.
-fn render_values(values: &[Datum]) -> String {
-    values
-        .iter()
-        .map(|value| value.to_text().unwrap_or_else(|| "null".to_owned()))
-        .collect::<Vec<_>>()
-        .join(", ")
+    super::index::render_key(table, &keys, values)
 }
 
 /// `UPDATE`: read the rows that match, rewrite them, and keep every index in step.
@@ -518,26 +496,6 @@ fn collect(
     Ok(rows)
 }
 
-/// Whether a partial index holds an entry for this row.
-///
-/// True for an index with no predicate, and for one whose predicate is **true** of the row. A
-/// NULL keeps the row out: `WHERE published_on IS NOT NULL` admits only rows where the predicate
-/// is true, and unknown is not true. That is the mirror of a `CHECK`, which admits everything the
-/// predicate does not make *false* — the two rules look alike and point opposite ways, which is
-/// why each says so where it is written.
-fn index_admits(table: &TableDef, index: &crate::catalog::IndexDef, row: &[Datum]) -> Result<bool> {
-    let Some(predicate) = &index.predicate else {
-        return Ok(true);
-    };
-    let parsed = crate::parse::parse_predicate(predicate)?;
-    let scope = query::Scope::single(table);
-    let resolved = query::resolve(&parsed, &scope)?;
-    Ok(matches!(
-        cursor::evaluate(&resolved, row)?,
-        Datum::Bool(true)
-    ))
-}
-
 /// Every `CHECK` on the table, against the row about to be written.
 ///
 /// **A NULL passes.** A `CHECK` fails only when its predicate is *false*, and SQL's three-valued
@@ -552,7 +510,7 @@ fn index_admits(table: &TableDef, index: &crate::catalog::IndexDef, row: &[Datum
 /// cheaper mistake to make, and the only one that cannot go stale.
 fn check_constraints(table: &TableDef, row: &[Datum]) -> Result<()> {
     for check in &table.checks {
-        let parsed = crate::parse::parse_predicate(&check.expr).map_err(|error| {
+        let parsed = crate::parse::parse_stored_expr(&check.expr).map_err(|error| {
             SqlError::Internal(format!(
                 "the stored CHECK {} of {} no longer parses: {error}",
                 check.name, table.name
@@ -565,7 +523,7 @@ fn check_constraints(table: &TableDef, row: &[Datum]) -> Result<()> {
             return Err(SqlError::CheckViolation {
                 constraint: check.name.clone(),
                 relation: table.name.clone(),
-                row: render_values(row),
+                row: super::index::render_values(row),
             });
         }
     }
@@ -578,7 +536,7 @@ fn check_not_null(table: &TableDef, row: &[Datum]) -> Result<()> {
             return Err(SqlError::NotNullViolationInRelation {
                 column: column.name.clone(),
                 relation: table.name.clone(),
-                row: Some(render_values(row)),
+                row: Some(super::index::render_values(row)),
             });
         }
     }
@@ -599,41 +557,7 @@ pub(super) fn remove_row(
         .map(|&ordinal| row[ordinal].clone())
         .collect();
 
-    for index in &table.indexes {
-        // See the note below: a partial index is removed from only for a row it actually holds.
-        if !index_admits(table, index, row)? {
-            continue;
-        }
-        // **Delete-only removes, and that is one state earlier than write-only inserts.** The
-        // asymmetry is the whole reason there are four states rather than three: every node has to
-        // be removing entries before any node starts creating them, or a node still at `Absent`
-        // deletes a row and leaves behind an entry that a scan will later return as a row the
-        // table does not contain (ADR 0020, "skip delete-only").
-        //
-        // Deleting an entry that is not there costs one tombstone and is correct, which is what
-        // makes "remove first, ask later" affordable — **for a whole index**. For a *partial* one
-        // it is not: two rows may share an index key when only one of them is in the index, and
-        // deleting on behalf of the one that is out would delete the entry belonging to the one
-        // that is in. The predicate is checked here for that reason, against the row being
-        // removed, and it is the only place in this file where "delete blindly" is wrong.
-        if !index.state.maintained() {
-            continue;
-        }
-        let columns: Vec<Datum> = index
-            .columns
-            .iter()
-            .map(|&ordinal| row[ordinal].clone())
-            .collect();
-        let by_value = index.unique && row::unique_index_key_is_unique_by_value(&columns);
-        let suffix = if by_value {
-            None
-        } else {
-            Some(primary_key.as_slice())
-        };
-        txn.delete(&row::index_key(
-            tenant, table.id, index.id, &columns, suffix,
-        )?);
-    }
+    super::index::remove_entries(tenant, txn, table, row, &primary_key)?;
     txn.delete(&row::row_key(tenant, table.id, &primary_key)?);
     Ok(())
 }

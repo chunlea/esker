@@ -32,6 +32,7 @@ mod dml;
 pub(crate) mod explain;
 mod flashback;
 mod fragment;
+mod index;
 mod job;
 
 pub use job::BATCH_ROWS;

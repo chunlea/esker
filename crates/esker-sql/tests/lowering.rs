@@ -12,8 +12,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use esker_sql::catalog::ExprShape;
 use esker_sql::parse::parse_statements;
-use esker_sql::plan::Statement;
+use esker_sql::plan::{IndexKeyPart, Statement};
 use esker_sql::sqlstate;
 use esker_sql::value::ColumnType;
 
@@ -89,7 +90,6 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
         ("CREATE TABLE s.t (a int8)", "the qualified name"),
         ("DROP TABLE t CASCADE", "DROP ... CASCADE"),
         ("CREATE INDEX i ON t USING hash (a)", "an index USING"),
-        ("CREATE INDEX i ON t (lower(a))", "the index expression"),
         ("CREATE INDEX i ON t (a DESC)", "a DESC index column"),
         (
             "CREATE INDEX i ON t (a) INCLUDE (b)",
@@ -308,13 +308,85 @@ fn drop_and_create_index_lower_to_their_lists() {
     };
     assert_eq!(create.name.as_deref(), Some("by_email"));
     assert_eq!(create.table, "accounts");
-    assert_eq!(create.columns, ["email", "id"]);
+    assert_eq!(
+        create.keys,
+        [
+            IndexKeyPart::Column("email".into()),
+            IndexKeyPart::Column("id".into())
+        ]
+    );
     assert!(create.unique);
 
     let Statement::CreateIndex(unnamed) = lower("CREATE INDEX ON t (a)").unwrap() else {
         panic!("not a CREATE INDEX")
     };
     assert_eq!(unnamed.name, None, "PostgreSQL derives it");
+}
+
+/// An index key part is a **column** when it is a bare name however many parentheses are around
+/// it, and an expression otherwise — with the shape PostgreSQL's deparser would give it.
+///
+/// The parentheses in `((lower(b)))` are the column list's and the expression's, and a real
+/// server takes `(lower(b))` for the same index: measured, both print `lower(b)`.
+#[test]
+fn an_index_key_is_a_column_or_an_expression() {
+    let keys = |sql: &str| {
+        let Statement::CreateIndex(create) = lower(sql).unwrap() else {
+            panic!("not a CREATE INDEX")
+        };
+        create.keys
+    };
+    assert_eq!(
+        keys("CREATE INDEX ON t ((b))"),
+        [IndexKeyPart::Column("b".into())]
+    );
+    let expression = |expr: &str, shape| IndexKeyPart::Expression {
+        expr: expr.to_owned(),
+        shape,
+    };
+    assert_eq!(
+        keys("CREATE INDEX ON t ((lower(b)))"),
+        [expression("lower(b)", ExprShape::Call)]
+    );
+    assert_eq!(
+        keys("CREATE INDEX ON t (lower(b))"),
+        [expression("lower(b)", ExprShape::Call)]
+    );
+    assert_eq!(
+        keys("CREATE INDEX ON t (a, (lower(b)))"),
+        [
+            IndexKeyPart::Column("a".into()),
+            expression("lower(b)", ExprShape::Call)
+        ]
+    );
+    assert_eq!(
+        keys("CREATE INDEX ON t ((b IS NULL))"),
+        [expression("b IS NULL", ExprShape::Operator)]
+    );
+    assert_eq!(
+        keys("CREATE INDEX ON t ((1))"),
+        [expression("1", ExprShape::Value)]
+    );
+}
+
+/// A stored predicate keeps **one** pair of parentheses however it was written, because that is
+/// how `pg_get_indexdef` prints it back: `WHERE a > 1` and `WHERE (a > 1)` are the same index.
+#[test]
+fn an_index_predicate_is_stored_without_its_own_parentheses() {
+    let predicate = |sql: &str| {
+        let Statement::CreateIndex(create) = lower(sql).unwrap() else {
+            panic!("not a CREATE INDEX")
+        };
+        create.predicate
+    };
+    assert_eq!(
+        predicate("CREATE INDEX ON t (a) WHERE a > 1"),
+        Some("a > 1".to_owned())
+    );
+    assert_eq!(
+        predicate("CREATE INDEX ON t (a) WHERE ((a > 1))"),
+        Some("a > 1".to_owned())
+    );
 }
 
 /// `EXPLAIN` wraps the statement it is about; the statement inside is lowered like any other, so a

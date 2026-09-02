@@ -786,7 +786,7 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
                             .name
                             .as_ref()
                             .map_or_else(|| format!("{name}_{column_name}_check"), ident),
-                        expr: constraint.expr.to_string(),
+                        expr: unwrap_nested(&constraint.expr).to_string(),
                     });
                 }
                 ColumnOption::NotNull => not_null = true,
@@ -899,7 +899,7 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
                     .name
                     .as_ref()
                     .map_or_else(|| format!("{table_name}_check"), ident),
-                expr: check.expr.to_string(),
+                expr: unwrap_nested(&check.expr).to_string(),
             }));
             continue;
         }
@@ -1033,7 +1033,7 @@ fn lower_table_constraints(
                         .name
                         .as_ref()
                         .map_or_else(|| format!("{name}_check"), ident),
-                    expr: check.expr.to_string(),
+                    expr: unwrap_nested(&check.expr).to_string(),
                 });
             }
             other => {
@@ -1110,11 +1110,16 @@ fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<plan::Crea
         )?;
     }
     Ok(plan::CreateIndex {
-        // Kept as text and lowered per row, the same trade a `CHECK` makes.
-        predicate: create.predicate.as_ref().map(ToString::to_string),
+        // Kept as text and lowered per row, the same trade a `CHECK` makes — and normalised the
+        // way `pg_get_indexdef` prints it, which is one pair of parentheses however it was
+        // written (`unwrap_nested`).
+        predicate: create
+            .predicate
+            .as_ref()
+            .map(|predicate| unwrap_nested(predicate).to_string()),
         name: create.name.as_ref().map(object_name).transpose()?,
         table: relation_name(&create.table_name)?,
-        columns: index_columns(&create.columns)?,
+        keys: index_keys(&create.columns)?,
         unique: create.unique,
         if_not_exists: create.if_not_exists,
         concurrently: create.concurrently,
@@ -2979,21 +2984,16 @@ fn serial_width(data_type: &DataType) -> Option<ColumnType> {
     None
 }
 
-/// An index's columns, which must be plain names: an expression index is a different feature.
+/// A **constraint's** columns, which must be plain names.
+///
+/// `UNIQUE ((lower(b)))` is a syntax error on a real server — measured — so an expression here
+/// would be inventing a feature rather than implementing one. `CREATE INDEX` is the form that
+/// takes expressions, and it uses [`index_keys`].
 fn index_columns(columns: &[IndexColumn]) -> Result<Vec<String>> {
     columns
         .iter()
         .map(|column| {
-            refuse_if(column.operator_class.is_some(), "an index operator class")?;
-            refuse_if(
-                column.column.options.asc == Some(false),
-                "a DESC index column",
-            )?;
-            refuse_if(
-                column.column.options.nulls_first.is_some(),
-                "NULLS FIRST/LAST on an index",
-            )?;
-            refuse_if(column.column.with_fill.is_some(), "WITH FILL")?;
+            index_key_options(column)?;
             match &column.column.expr {
                 Expr::Identifier(name) => Ok(ident(name)),
                 other => Err(SqlError::unsupported(format!(
@@ -3002,6 +3002,75 @@ fn index_columns(columns: &[IndexColumn]) -> Result<Vec<String>> {
             }
         })
         .collect()
+}
+
+/// The options a key part may not carry, whichever kind of key it is in.
+fn index_key_options(column: &IndexColumn) -> Result<()> {
+    refuse_if(column.operator_class.is_some(), "an index operator class")?;
+    refuse_if(
+        column.column.options.asc == Some(false),
+        "a DESC index column",
+    )?;
+    refuse_if(
+        column.column.options.nulls_first.is_some(),
+        "NULLS FIRST/LAST on an index",
+    )?;
+    refuse_if(column.column.with_fill.is_some(), "WITH FILL")?;
+    Ok(())
+}
+
+/// A `CREATE INDEX`'s key parts: a column by name, or an expression.
+///
+/// The parentheses around an index expression are the **column list's**, not the expression's, so
+/// `((lower(b)))` reaches here as `(lower(b))` and `(lower(b))` as `lower(b)` — a real server
+/// takes both spellings and prints one. [`unwrap_nested`] is what makes them the same thing.
+///
+/// A bare identifier after that unwrapping is a **column**, not an expression, which is also
+/// PostgreSQL's answer: `CREATE INDEX ON t ((b))` has `indkey = 3` and no `indexprs` at all.
+fn index_keys(columns: &[IndexColumn]) -> Result<Vec<plan::IndexKeyPart>> {
+    columns
+        .iter()
+        .map(|column| {
+            index_key_options(column)?;
+            Ok(match unwrap_nested(&column.column.expr) {
+                Expr::Identifier(name) => plan::IndexKeyPart::Column(ident(name)),
+                expr => plan::IndexKeyPart::Expression {
+                    expr: expr.to_string(),
+                    shape: expr_shape(expr),
+                },
+            })
+        })
+        .collect()
+}
+
+/// An expression with its redundant outer parentheses removed.
+///
+/// PostgreSQL stores a *parsed* expression and re-prints it, so the parentheses that come back
+/// are the ones its own deparser adds and not the ones that were written: `WHERE (a > 10)` comes
+/// back `WHERE (a > 10)` and `WHERE a > 10` comes back the same, one pair either way. This crate
+/// stores text, so the normalising has to happen where the text is taken — here — or the two
+/// spellings would print differently for the rest of the record's life.
+fn unwrap_nested(expr: &Expr) -> &Expr {
+    let mut expr = expr;
+    while let Expr::Nested(inner) = expr {
+        expr = inner;
+    }
+    expr
+}
+
+/// Which of PostgreSQL's three deparse shapes an index expression is
+/// ([`crate::catalog::ExprShape`]).
+///
+/// The shape is a property of the **node**, and this is the one place that still knows which node
+/// it was: by the time the expression is text, `'x)'::text` and `f(x)` are the same characters at
+/// the ends.
+fn expr_shape(expr: &Expr) -> crate::catalog::ExprShape {
+    use crate::catalog::ExprShape;
+    match expr {
+        Expr::Function(_) => ExprShape::Call,
+        Expr::Value(_) | Expr::Cast { .. } | Expr::TypedString { .. } => ExprShape::Value,
+        _ => ExprShape::Operator,
+    }
 }
 
 /// A relation **anywhere a relation is named** — a `FROM` clause, a `DROP`, an `INSERT INTO`, a
