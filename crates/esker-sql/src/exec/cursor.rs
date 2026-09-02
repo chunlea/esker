@@ -841,6 +841,27 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         Expr::Ordinal { at, .. } => row.get(*at).cloned().unwrap_or(Datum::Null),
         // A cast to `text` is the operand's own output function, and NULL stays NULL: a cast
         // changes a value's type and never invents one.
+        // Rust's own case conversion, which is full Unicode and agrees with PostgreSQL's
+        // under a UTF-8 locale — measured on an accented pair, since that is where a byte-wise
+        // implementation would differ. NULL in, NULL out.
+        Expr::Scalar { func, operand } => match evaluate_in(operand, row, env)? {
+            Datum::Null => Datum::Null,
+            Datum::Text(text) => Datum::Text(match func {
+                crate::plan::ScalarFunc::Lower => text.to_lowercase(),
+                crate::plan::ScalarFunc::Upper => text.to_uppercase(),
+            }),
+            other => {
+                // A non-text argument: `lower(1)` is `42883 function lower(integer) does not
+                // exist` on a real server, not a cast. Measured.
+                return Err(SqlError::UndefinedFunctionTypes(format!(
+                    "{}({})",
+                    func.name(),
+                    other
+                        .column_type()
+                        .map_or("unknown", crate::value::PgType::name)
+                )));
+            }
+        },
         Expr::ToText {
             operand,
             strip_blanks,

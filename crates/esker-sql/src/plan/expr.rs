@@ -172,6 +172,13 @@ pub enum Expr {
     /// with an [`Expr::Ordinal`] into the aggregated row before the tree is built. One reaching a
     /// row evaluator is a planner bug and says so rather than returning a number.
     Aggregate(Box<AggregateCall>),
+    /// A one-argument scalar function over a string.
+    Scalar {
+        /// Which one.
+        func: ScalarFunc,
+        /// Its argument.
+        operand: Box<Expr>,
+    },
     /// `<expr>::text`, evaluated per row.
     ///
     /// The **output function** of whatever the operand turns out to be, which is what a cast to
@@ -196,6 +203,40 @@ pub enum Expr {
         /// does not know it came from a `bpchar`.
         strip_blanks: bool,
     },
+}
+/// The scalar functions this node has, all of them one argument over a string.
+///
+/// Each maps to Rust's own case conversion, which is full Unicode: `upper('àéî')` is `ÀÉÎ`, the
+/// same as PostgreSQL's under a UTF-8 locale. That agreement is measured rather than assumed —
+/// `tests/corpus/pg19_lower.txt` has the accented pair — and it is the reason these two could be
+/// added without a collation, which is the thing this project has decided it will not link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarFunc {
+    /// `lower(text)`.
+    Lower,
+    /// `upper(text)`.
+    Upper,
+}
+
+impl ScalarFunc {
+    /// The name a `42883` spells it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            ScalarFunc::Lower => "lower",
+            ScalarFunc::Upper => "upper",
+        }
+    }
+
+    /// The function a name is, if it is one.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "lower" => Some(ScalarFunc::Lower),
+            "upper" => Some(ScalarFunc::Upper),
+            _ => None,
+        }
+    }
 }
 
 /// One call to a `pg_catalog` function that prints a definition.
@@ -730,6 +771,7 @@ impl Expr {
 fn describe(expr: &Expr) -> &'static str {
     match expr {
         Expr::ToText { .. } => "a cast to text",
+        Expr::Scalar { func, .. } => func.name(),
         Expr::Literal(_) => "a literal",
         Expr::Parameter(_) => "a parameter",
         Expr::Column { .. } | Expr::Ordinal { .. } => "a column reference",

@@ -1449,6 +1449,25 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
             schemas.len()
         )));
     }
+    // `lower` and `upper`, the two scalar functions this node has. Both take exactly one
+    // argument and a wrong count is `42883` naming the signature, not a badly-called function —
+    // `lower()` and `lower('a','b')` are each their own message, measured.
+    if let Some(func) = plan::ScalarFunc::from_name(&name) {
+        refuse_wrong_arity(function, func.name(), 1)?;
+        let FunctionArguments::List(FunctionArgumentList { args, .. }) = &function.args else {
+            return Err(SqlError::UndefinedFunction(format!("{}()", func.name())));
+        };
+        let [FunctionArg::Unnamed(FunctionArgExpr::Expr(operand))] = args.as_slice() else {
+            return Err(SqlError::UndefinedFunction(format!(
+                "{}(unknown)",
+                func.name()
+            )));
+        };
+        return Ok(plan::Expr::Scalar {
+            func,
+            operand: Box::new(lower_expr(operand)?),
+        });
+    }
     if let Some(func) = plan::SequenceFunc::from_name(&name) {
         return lower_sequence_function(func, function);
     }

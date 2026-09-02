@@ -1,0 +1,28 @@
+# `lower` and `upper` — the two scalar functions `schema.rb` indexes on
+#
+# Statement 78 is `CREATE UNIQUE INDEX … ON … ((lower(b)))`, so the expression index needs the
+# function before it needs anything else. These are the first scalar functions in this crate.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#
+# **THE CASE MAPPING IS FULL UNICODE**, which is the line that decides whether these can exist
+# here at all: `upper('àéî')` is `ÀÉÎ`. Rust's `to_uppercase` agrees, so the two need no
+# collation between them — and a collation is the thing this project has decided not to link.
+# A byte-wise implementation would pass every ASCII line above and fail that one.
+#
+# AND `42883` HAS TWO DETAILS. `lower(1)` is `No function of that name accepts the given argument
+# types.` with a `HINT`; `lower()` and `lower('a','b')` are `…the given number of arguments.` with
+# none. One SQLSTATE, one message, two explanations — the wrong *type* and the wrong *count* are
+# different conditions and PostgreSQL says so.
+#
+DROP TABLE IF EXISTS lw		-
+CREATE TABLE lw (id int8 PRIMARY KEY, b text)		-
+INSERT INTO lw VALUES (1, 'Ann'), (2, 'BOB'), (3, ''), (4, NULL), (5, 'Éa')		-
+SELECT id, lower(b), upper(b) FROM lw ORDER BY id	bigint,text,text	1|ann|ANN ; 2|bob|BOB ; 3|| ; 4|\N|\N ; 5|éa|ÉA
+SELECT lower('MiXeD'), upper('MiXeD'), lower(''), upper('')	text,text,text,text	mixed|MIXED||
+SELECT lower(NULL), upper(NULL)	text,text	\N|\N
+SELECT lower('ÀÉÎ'), upper('àéî')	text,text	àéî|ÀÉÎ
+SELECT lower(1)	!42883 function lower(integer) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT lower('a', 'b')	!42883 function lower(unknown, unknown) does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT lower()	!42883 function lower() does not exist DETAIL: No function of that name accepts the given number of arguments.

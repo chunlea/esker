@@ -1445,6 +1445,10 @@ const SYSTEM_COLUMNS: [&str; 6] = ["ctid", "xmin", "xmax", "cmin", "cmax", "tabl
 pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
     Ok(match expr {
         // The strip is decided here, where the operand's type is still known.
+        Expr::Scalar { func, operand } => Expr::Scalar {
+            func: *func,
+            operand: Box::new(resolve(operand, scope)?),
+        },
         Expr::ToText { operand, .. } => {
             let operand = resolve(operand, scope)?;
             let strip_blanks = matches!(expr_type(&operand, scope), Ok(ColumnType::Bpchar));
@@ -2006,7 +2010,10 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         Expr::Literal(Literal::Decimal(_)) => ColumnType::Double,
 
         // Whatever the operand is, a cast to `text` answers `text` — that is what it is for.
-        Expr::ToText { .. } | Expr::Literal(Literal::String(_) | Literal::Null) => ColumnType::Text,
+        // Both scalar functions take text and answer text.
+        Expr::Scalar { .. }
+        | Expr::ToText { .. }
+        | Expr::Literal(Literal::String(_) | Literal::Null) => ColumnType::Text,
         Expr::Literal(Literal::Typed(value)) => value.column_type().unwrap_or(ColumnType::Text),
         Expr::Literal(Literal::Bool(_))
         | Expr::Binary { .. }

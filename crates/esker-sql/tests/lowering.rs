@@ -134,7 +134,8 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
             "an aggregate FILTER clause",
         ),
         ("SELECT sum(*) FROM t", "sum(*)"),
-        ("SELECT lower(b) FROM t", "the function lower"),
+        // `lower` and `upper` run since the scalar-function unit; `length` does not.
+        ("SELECT length(b) FROM t", "the function length"),
     ];
 
     refuses_by_name(&cases);

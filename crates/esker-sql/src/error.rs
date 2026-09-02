@@ -676,6 +676,14 @@ pub enum SqlError {
     #[error("SET TRANSACTION SNAPSHOT must be called before any query")]
     SnapshotAfterQuery,
 
+    /// A function called with an argument of the wrong **type**: `42883`.
+    ///
+    /// A different `DETAIL` and a `HINT` from [`SqlError::UndefinedFunction`], which is the
+    /// wrong *arity* — PostgreSQL distinguishes the two and says "argument types" for one and
+    /// "number of arguments" for the other. Measured on `lower(1)` against `lower('a','b')`.
+    #[error("function {0} does not exist")]
+    UndefinedFunctionTypes(String),
+
     /// A function this node has under a name but not with that signature: `42883`.
     ///
     /// PostgreSQL resolves a function by name **and** argument types, so the wrong arity is not a
@@ -947,6 +955,7 @@ impl SqlError {
             SqlError::UndefinedOperator { .. }
             | SqlError::UndefinedAggregate { .. }
             | SqlError::UndefinedFunction(_)
+            | SqlError::UndefinedFunctionTypes(_)
             | SqlError::UndefinedAggregateArity { .. } => sqlstate::UNDEFINED_FUNCTION,
             SqlError::ParameterlessAggregate => sqlstate::WRONG_OBJECT_TYPE,
             SqlError::GeneratedAlways { .. } => sqlstate::GENERATED_ALWAYS,
@@ -1044,7 +1053,7 @@ impl SqlError {
             SqlError::UndefinedOperator { .. } => {
                 Some("No operator of that name accepts the given argument types.".to_owned())
             }
-            SqlError::UndefinedAggregate { .. } => {
+            SqlError::UndefinedAggregate { .. } | SqlError::UndefinedFunctionTypes(_) => {
                 Some("No function of that name accepts the given argument types.".to_owned())
             }
             // The same sentence for the same condition: a function whose *name* exists and whose
@@ -1111,7 +1120,9 @@ impl SqlError {
             }
             // The same hint a real server sends with the same `42883`, word for word, for an
             // operator and for an aggregate alike.
-            SqlError::UndefinedOperator { .. } | SqlError::UndefinedAggregate { .. } => {
+            SqlError::UndefinedOperator { .. }
+            | SqlError::UndefinedAggregate { .. }
+            | SqlError::UndefinedFunctionTypes(_) => {
                 Some("You might need to add explicit type casts.".to_owned())
             }
             // PostgreSQL lists the values an enum parameter takes, and the list is the parameter's
