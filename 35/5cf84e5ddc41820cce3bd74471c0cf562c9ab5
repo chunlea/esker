@@ -1,0 +1,19 @@
+docs/plans/phase-12-subquery.md
+  s_f3955267395e69::t_23c4d49e4e6f1f 1-208
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "355cf84e5ddc41820cce3bd74471c0cf562c9ab5",
+  "prompts": {},
+  "sessions": {
+    "s_f3955267395e69": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f99c5188-2954-40ae-b928-dc5eaa3b622d",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
