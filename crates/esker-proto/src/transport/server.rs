@@ -122,6 +122,34 @@ impl Server {
         })
     }
 
+    /// Adopts a listener that is **already bound**, so the port never has to be let go of.
+    ///
+    /// `bind` takes an address, which means a caller who needs to know the port *before* the
+    /// server exists — every test that builds a peer table out of addresses — has to bind a
+    /// socket, read the port off it, close it, and bind again later. Between those two binds the
+    /// port belongs to nobody, and under a parallel test run something else takes it: the
+    /// second bind is then `Address already in use`, which is how a whole family of cluster
+    /// tests failed under load while passing alone.
+    ///
+    /// Handing the listener over closes the window instead of narrowing it. The socket stays
+    /// bound from the moment the port is allocated until the server is serving on it, so there is
+    /// no instant at which another process can claim it.
+    ///
+    /// The listener is switched to non-blocking, which is what the async runtime requires of an
+    /// adopted socket; a caller does not have to do it.
+    pub fn from_listener(
+        listener: std::net::TcpListener,
+        service: Arc<dyn Service>,
+        config: TransportConfig,
+    ) -> Result<Self, ProtoError> {
+        listener.set_nonblocking(true)?;
+        Ok(Self {
+            listener: TcpListener::from_std(listener)?,
+            service,
+            config,
+        })
+    }
+
     /// The address actually bound, which is how a caller learns an ephemeral port.
     pub fn local_addr(&self) -> Result<SocketAddr, ProtoError> {
         Ok(self.listener.local_addr()?)

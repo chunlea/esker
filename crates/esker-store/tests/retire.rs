@@ -87,9 +87,13 @@ fn trace() {
         .try_init();
 }
 
-fn reserve() -> std::net::SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
+/// A port, **held** until the server that will serve on it adopts the socket.
+///
+/// Returning the address and dropping the listener leaves the port belonging to nobody until the
+/// rebind, and under a parallel suite run something else takes it — `Address already in use`.
+/// `Server::from_listener` takes the socket itself, so there is no window.
+fn reserve() -> std::net::TcpListener {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap()
 }
 
 /// 25 ms and not 5: `esker-raft` counts ticks, so the election timeout is 10-20 of these, and a
@@ -103,13 +107,18 @@ fn raft_options(peers: Vec<PeerAddress>, bootstrap_voters: Option<Vec<u64>>) -> 
     raft
 }
 
+#[allow(
+    clippy::unused_async,
+    reason = "the caller awaits it; adopting a listener is what stopped being async, not the helper"
+)]
 async fn open(
-    address: std::net::SocketAddr,
+    address_listener: std::net::TcpListener,
     store_id: u64,
     pd: &Arc<FakePd>,
     raft: RaftOptions,
     bootstrap_region: u64,
 ) -> Node {
+    let address = address_listener.local_addr().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(
         dir.path(),
@@ -134,12 +143,11 @@ async fn open(
     )
     .unwrap();
 
-    let server = Server::bind(
-        address,
+    let server = Server::from_listener(
+        address_listener,
         StoreService::new(Arc::clone(&store)) as Arc<dyn Service>,
         TransportConfig::new(),
     )
-    .await
     .unwrap();
     let handle = server.spawn().unwrap();
     Node { store, handle, dir }
@@ -352,15 +360,17 @@ async fn place_on(pd: &Arc<FakePd>, first: &Node, second: &Node) -> Region {
 async fn a_removed_peer_reclaims_the_range_in_every_column_family() {
     trace();
     let pd = Arc::new(FakePd::new());
-    let first_address = reserve();
-    let second_address = reserve();
+    let first_address_listener = reserve();
+    let first_address = first_address_listener.local_addr().unwrap();
+    let second_address_listener = reserve();
+    let second_address = second_address_listener.local_addr().unwrap();
     let peers = vec![
         PeerAddress::new(1, 1, first_address),
         PeerAddress::new(2, 2, second_address),
     ];
 
     let first = open(
-        first_address,
+        first_address_listener,
         1,
         &pd,
         raft_options(peers.clone(), Some(vec![1])),
@@ -376,7 +386,7 @@ async fn a_removed_peer_reclaims_the_range_in_every_column_family() {
     seed_all_three_families(&first.store, &region).await;
 
     let second = open(
-        second_address,
+        second_address_listener,
         2,
         &pd,
         raft_options(peers.clone(), Some(vec![2])),

@@ -116,9 +116,13 @@ impl Service for ScriptedPd {
     }
 }
 
-fn reserve() -> std::net::SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
+/// A port, **held** until the server that will serve on it adopts the socket.
+///
+/// Returning the address and dropping the listener leaves the port belonging to nobody until the
+/// rebind, and under a parallel suite run something else takes it — `Address already in use`.
+/// `Server::from_listener` takes the socket itself, so there is no window.
+fn reserve() -> std::net::TcpListener {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap()
 }
 
 async fn wait_for<F: FnMut() -> bool>(what: &str, seconds: u64, mut ready: F) {
@@ -135,17 +139,18 @@ async fn wait_for<F: FnMut() -> bool>(what: &str, seconds: u64, mut ready: F) {
 /// proposed, committed and applied, so nothing short of the whole path satisfies it.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_operator_decided_over_the_wire_reaches_a_raft_proposal() {
-    let pd_address = reserve();
-    let store_address = reserve();
+    let pd_address_listener = reserve();
+    let pd_address = pd_address_listener.local_addr().unwrap();
+    let store_address_listener = reserve();
+    let store_address = store_address_listener.local_addr().unwrap();
 
     let region = Region::bootstrap(1, 1, 1);
     let pd = ScriptedPd::new(region);
-    let pd_server = Server::bind(
-        pd_address,
+    let pd_server = Server::from_listener(
+        pd_address_listener,
         Arc::clone(&pd) as Arc<dyn Service>,
         TransportConfig::new(),
     )
-    .await
     .unwrap();
     let pd_handle = pd_server.spawn().unwrap();
 
@@ -170,12 +175,11 @@ async fn an_operator_decided_over_the_wire_reaches_a_raft_proposal() {
         },
     )
     .unwrap();
-    let store_server = Server::bind(
-        store_address,
+    let store_server = Server::from_listener(
+        store_address_listener,
         StoreService::new(Arc::clone(&store)) as Arc<dyn Service>,
         TransportConfig::new(),
     )
-    .await
     .unwrap();
     let store_handle = store_server.spawn().unwrap();
 
