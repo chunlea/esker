@@ -615,6 +615,9 @@ fn lower_storage_parameters(
 /// `DEFAULT NULL` normalises to `None` — the same thing as no default, which is what PostgreSQL
 /// makes of it too.
 fn column_default(expr: &Expr, ty: ColumnType) -> Result<Option<Datum>> {
+    // `CURRENT_TIMESTAMP` is handled by the caller, which records it as an expression default
+    // rather than a value. Reaching here with one would mean the two disagreed.
+    debug_assert!(!is_current_timestamp(expr));
     let literal = match expr {
         Expr::Value(value) => &value.value,
         Expr::UnaryOp { .. } => {
@@ -760,6 +763,7 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
         let (ty, typmod) = lower_type(&column.data_type)?;
         let mut not_null = false;
         let mut default = None;
+        let mut default_now = false;
         // `bigserial` is the type saying it; `GENERATED ... AS IDENTITY` is an option saying it.
         // Both end here, because what they produce is the same record.
         let mut sequence = serial_identity(&column.data_type);
@@ -767,6 +771,9 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
             match &option.option {
                 ColumnOption::NotNull => not_null = true,
                 ColumnOption::Null => {}
+                // `DEFAULT CURRENT_TIMESTAMP` is an expression rather than a value, so it is
+                // recorded as one: a constant would freeze the instant `CREATE TABLE` ran.
+                ColumnOption::Default(expr) if is_current_timestamp(expr) => default_now = true,
                 ColumnOption::Default(expr) => default = column_default(expr, ty)?,
                 ColumnOption::Unique(constraint) => {
                     refuse_if(
@@ -805,6 +812,7 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
             name: column_name,
             ty,
             typmod,
+            default_now,
             not_null,
             default,
             sequence,
@@ -888,6 +896,7 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
         let (ty, typmod) = lower_type(&column_def.data_type)?;
         let mut not_null = false;
         let mut default = None;
+        let mut default_now = false;
         for option in &column_def.options {
             let named = match &option.option {
                 // A **constant** default is admitted: it is stored as the column's missing value
@@ -895,7 +904,11 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
                 // generalised; `crate::catalog::ColumnDef::missing`). Volatility and unfolded
                 // expressions are refused inside `column_default`, by name.
                 ColumnOption::Default(expr) => {
-                    default = column_default(expr, ty)?;
+                    if is_current_timestamp(expr) {
+                        default_now = true;
+                    } else {
+                        default = column_default(expr, ty)?;
+                    }
                     continue;
                 }
                 ColumnOption::NotNull => {
@@ -931,6 +944,7 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
                 name: ident(&column_def.name),
                 ty,
                 typmod,
+                default_now,
                 not_null,
                 default,
                 sequence: None,
@@ -2735,6 +2749,39 @@ fn lower_plain_type(data_type: &DataType) -> Result<ColumnType> {
         },
         other => return Err(SqlError::unsupported(format!("the type {other}"))),
     })
+}
+
+/// Whether a `DEFAULT` is `CURRENT_TIMESTAMP`, under any of the spellings that mean it.
+///
+/// `CURRENT_TIMESTAMP` reaches this as a bare identifier — it is a niladic function and SQL lets
+/// one be written without parentheses, the same rule a bare `current_schema` follows — and `now()`
+/// reaches it as a call. PostgreSQL records both as the same default, which is why they are one
+/// test here rather than two: `pg_get_expr` prints `CURRENT_TIMESTAMP` for a column declared
+/// either way.
+///
+/// `CURRENT_TIMESTAMP(0)` is **not** among them. It is the same instant rounded, and rounding it
+/// needs the precision carried into the default, which nothing yet reads — it is refused by name
+/// rather than silently given full precision.
+fn is_current_timestamp(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identifier(name) => {
+            name.quote_style.is_none() && name.value.eq_ignore_ascii_case("current_timestamp")
+        }
+        Expr::Function(function) => {
+            use sqlparser::ast::{FunctionArgumentList, FunctionArguments};
+            let name = function.name.to_string();
+            let niladic = match &function.args {
+                FunctionArguments::None => true,
+                FunctionArguments::List(FunctionArgumentList { args, .. }) => args.is_empty(),
+                FunctionArguments::Subquery(_) => false,
+            };
+            niladic
+                && (name.eq_ignore_ascii_case("now")
+                    || name.eq_ignore_ascii_case("current_timestamp")
+                    || name.eq_ignore_ascii_case("transaction_timestamp"))
+        }
+        _ => false,
+    }
 }
 
 /// `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY`, and the two things that share its variant.

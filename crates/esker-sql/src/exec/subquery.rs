@@ -198,8 +198,9 @@ fn plan_derived(
                 .unwrap_or_else(|| column.clone()),
             ty: *ty,
             typmod: *typmod,
-            // Nothing is ever written into a derived table, so neither of these can be read: a
+            // Nothing is ever written into a derived table, so none of these can be read: a
             // `NOT NULL` is checked on insert and a default is applied on one.
+            default_now: false,
             not_null: false,
             default: None,
             // Every row this relation produces is exactly as wide as its target list, because the

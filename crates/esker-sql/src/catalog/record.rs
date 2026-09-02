@@ -66,7 +66,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 4;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 5;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -636,6 +636,9 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         // version 3 column's bytes are a prefix of a version 4 one's and the diff between the two
         // goldens is one field at one end.
         out.extend_from_slice(&column.typmod.to_le_bytes());
+        // Version 5. One byte, appended for the same reason the typmod was: a version 4 column's
+        // bytes are a prefix of a version 5 one's.
+        out.push(u8::from(column.default_now));
     }
 
     varint::put_u64(table.primary_key.len() as u64, &mut out);
@@ -687,11 +690,15 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
         } else {
             NO_TYPMOD
         };
+        // A version 4 column has no expression default, which is what every column written before
+        // version 5 was: the only default a v4 catalog could hold was a constant.
+        let default_now = reader.version >= 5 && reader.flag()?;
         columns.push(ColumnDef {
             name,
             ty,
             typmod,
             not_null,
+            default_now,
             default,
             missing,
         });

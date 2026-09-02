@@ -185,7 +185,12 @@ fn ts_of_micros(micros: i64) -> Option<u64> {
 }
 
 /// An instant back in `crate::value`'s representation, for a message that names a window.
-fn micros_of_ts(ts: u64) -> i64 {
+///
+/// Also what `CURRENT_TIMESTAMP` is: the **transaction's** timestamp, which is PostgreSQL's own
+/// rule — `CURRENT_TIMESTAMP` is constant within a transaction and equals `now()` — and which this
+/// project needs anyway, since a node may not read its wall clock for anything that orders
+/// (`CLAUDE.md`, invariant 6). The TSO's physical half is the only clock here.
+pub(crate) fn micros_of_ts(ts: u64) -> i64 {
     let unix_ms = i64::try_from(physical_ms(ts)).unwrap_or(i64::MAX);
     unix_ms
         .saturating_sub(POSTGRES_EPOCH_UNIX_MS)
