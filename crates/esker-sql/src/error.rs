@@ -751,6 +751,58 @@ pub enum SqlError {
         row: String,
     },
 
+    /// A child row pointing at a parent row that is not there: `23503`, from the child's side.
+    #[error(
+        "insert or update on table \"{relation}\" violates foreign key constraint \"{constraint}\""
+    )]
+    ForeignKeyViolation {
+        /// The **child** table, whose row was written.
+        relation: String,
+        /// The constraint's name, given or derived.
+        constraint: String,
+        /// `Key (p)=(99) is not present in table "fxp".`
+        detail: String,
+    },
+
+    /// A parent row something still points at: `23503`, from the parent's side.
+    ///
+    /// One SQLSTATE with the one above and a **different sentence**, which names both tables. An
+    /// implementation with one message for both looks right on half the cases; measured on
+    /// PostgreSQL 19, `tests/corpus/pg19_foreign_key.txt`.
+    #[error(
+        "update or delete on table \"{relation}\" violates foreign key constraint \
+         \"{constraint}\" on table \"{child}\""
+    )]
+    ForeignKeyStillReferenced {
+        /// The **parent** table, whose row was deleted or re-keyed.
+        relation: String,
+        /// The constraint's name.
+        constraint: String,
+        /// The child table that still holds a reference.
+        child: String,
+        /// `Key (id)=(2) is still referenced from table "fxc".`
+        detail: String,
+    },
+
+    /// A `FOREIGN KEY` whose referenced columns have no unique index behind them: `42830`.
+    #[error("there is no unique constraint matching given keys for referenced table \"{0}\"")]
+    NoUniqueConstraintForReference(String),
+
+    /// A column named in a `FOREIGN KEY` that the table does not have: `42703`, with a sentence of
+    /// its own rather than the plain "column … does not exist".
+    #[error("column \"{0}\" referenced in foreign key constraint does not exist")]
+    UndefinedColumnInForeignKey(String),
+
+    /// A table a `FOREIGN KEY` still references: `2BP01`, the same code as the index one above and
+    /// a different sentence — PostgreSQL words this class per dependency.
+    #[error("cannot drop table {relation} because other objects depend on it")]
+    DependentTable {
+        /// The table that cannot be dropped.
+        relation: String,
+        /// `constraint fxc_p on table fxc depends on table fxp`
+        detail: String,
+    },
+
     /// A `float(p)` whose precision is outside `1..=53`: `22023`.
     ///
     /// Its own message, not [`SqlError::TypeLengthTooSmall`]'s: PostgreSQL says "precision" and
@@ -920,11 +972,11 @@ impl SqlError {
             }
             SqlError::UndefinedIndex(_) | SqlError::UndefinedType(_) => sqlstate::UNDEFINED_OBJECT,
             SqlError::SystemCatalog(_) => sqlstate::INSUFFICIENT_PRIVILEGE,
-            SqlError::DependentObjectsStillExist { .. } => sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
             SqlError::WrongObjectType { .. } | SqlError::AlterActionOnWrongObject { .. } => {
                 sqlstate::WRONG_OBJECT_TYPE
             }
             SqlError::UndefinedColumn(_)
+            | SqlError::UndefinedColumnInForeignKey(_)
             | SqlError::UndefinedColumnInKey(_)
             | SqlError::UndefinedQualifiedColumn { .. }
             | SqlError::UsingColumnMissing { .. }
@@ -991,6 +1043,13 @@ impl SqlError {
             | SqlError::SetTransactionOutsideBlock
             | SqlError::OutsideTransactionBlock(_) => sqlstate::NO_ACTIVE_SQL_TRANSACTION,
             SqlError::CheckViolation { .. } => sqlstate::CHECK_VIOLATION,
+            SqlError::ForeignKeyViolation { .. } | SqlError::ForeignKeyStillReferenced { .. } => {
+                sqlstate::FOREIGN_KEY_VIOLATION
+            }
+            SqlError::NoUniqueConstraintForReference(_) => sqlstate::INVALID_FOREIGN_KEY,
+            SqlError::DependentObjectsStillExist { .. } | SqlError::DependentTable { .. } => {
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST
+            }
             SqlError::DuplicateConstraint { .. } => sqlstate::DUPLICATE_OBJECT,
             SqlError::StringDataRightTruncation(_) => sqlstate::STRING_DATA_RIGHT_TRUNCATION,
             SqlError::UnsupportedUnicodeEscape => sqlstate::UNSUPPORTED_UNICODE_ESCAPE,
@@ -1061,6 +1120,9 @@ impl SqlError {
             | SqlError::CheckViolation { row, .. } => {
                 Some(format!("Failing row contains ({row})."))
             }
+            SqlError::ForeignKeyViolation { detail, .. }
+            | SqlError::ForeignKeyStillReferenced { detail, .. }
+            | SqlError::DependentTable { detail, .. } => Some(detail.clone()),
             SqlError::UndefinedOperator { .. } => {
                 Some("No operator of that name accepts the given argument types.".to_owned())
             }
@@ -1109,6 +1171,13 @@ impl SqlError {
                 )
             }
             SqlError::GeneratedAlways { .. } => Some("Use OVERRIDING SYSTEM VALUE to override.".to_owned()),
+            // The hint names a form this node does not have — `DROP … CASCADE` is `0A000` here —
+            // and it is still the right sentence: it is what a real server says, and it is what
+            // the user has to write once that unit lands. Saying something else would send them
+            // looking for a different fix.
+            SqlError::DependentTable { .. } => {
+                Some("Use DROP ... CASCADE to drop the dependent objects too.".to_owned())
+            }
             SqlError::WrongObjectType {
                 found: "DROP INDEX",
                 ..

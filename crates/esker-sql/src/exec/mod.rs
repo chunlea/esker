@@ -31,6 +31,7 @@ mod ddl;
 mod dml;
 pub(crate) mod explain;
 mod flashback;
+mod foreign_key;
 mod fragment;
 mod index;
 mod job;

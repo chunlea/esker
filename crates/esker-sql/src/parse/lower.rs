@@ -17,14 +17,15 @@
 
 use sqlparser::ast::{
     AlterTableOperation, AssignmentTarget, BinaryOperator, CharacterLength, ColumnOption,
-    CreateTableOptions, DataType, Distinct, DollarQuotedString, ExactNumberInfo, Expr, FromTable,
-    GeneratedAs, GroupByExpr, Ident, IndexColumn, IndexType, JoinConstraint, JoinOperator,
-    LimitClause, NullsDistinctOption, ObjectName, ObjectType, OffsetRows, OrderByKind, Query,
-    SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, TableConstraint, TableFactor,
-    TableObject, TimezoneInfo, UnaryOperator, Value,
+    ConstraintReferenceMatchKind, CreateTableOptions, DataType, DeferrableInitial, Distinct,
+    DollarQuotedString, ExactNumberInfo, Expr, FromTable, GeneratedAs, GroupByExpr, Ident,
+    IndexColumn, IndexType, JoinConstraint, JoinOperator, LimitClause, NullsDistinctOption,
+    ObjectName, ObjectType, OffsetRows, OrderByKind, Query, SelectItem,
+    SelectItemQualifiedWildcardKind, SetExpr, Statement, TableConstraint, TableFactor, TableObject,
+    TimezoneInfo, UnaryOperator, Value,
 };
 
-use crate::catalog::{KeyOrder, fold_identifier};
+use crate::catalog::{self, KeyOrder, fold_identifier};
 use crate::error::{Result, SqlError};
 use crate::parse::{Parsed, feature_name};
 use crate::plan;
@@ -705,7 +706,7 @@ fn lower_retention(value: &Expr) -> Result<Option<u64>> {
         other => other.to_string(),
     };
     if text.eq_ignore_ascii_case("forever") {
-        return Ok(Some(crate::catalog::RETENTION_FOREVER));
+        return Ok(Some(catalog::RETENTION_FOREVER));
     }
     time_machine::retention_ms(&text).map(Some)
 }
@@ -757,7 +758,8 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
     let mut primary_key = Vec::new();
     let mut primary_key_name = None;
     let mut unique = Vec::new();
-    let mut checks: Vec<crate::catalog::CheckDef> = Vec::new();
+    let mut checks: Vec<catalog::CheckDef> = Vec::new();
+    let mut foreign_keys: Vec<plan::ForeignKey> = Vec::new();
 
     for column in &create.columns {
         let column_name = ident(&column.name);
@@ -781,13 +783,16 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
                         constraint.enforced.is_some(),
                         "CHECK ... ENFORCED, which is MySQL's",
                     )?;
-                    checks.push(crate::catalog::CheckDef {
+                    checks.push(catalog::CheckDef {
                         name: constraint
                             .name
                             .as_ref()
                             .map_or_else(|| format!("{name}_{column_name}_check"), ident),
                         expr: unwrap_nested(&constraint.expr).to_string(),
                     });
+                }
+                ColumnOption::ForeignKey(constraint) => {
+                    foreign_keys.push(lower_column_foreign_key(&name, &column_name, constraint)?);
                 }
                 ColumnOption::NotNull => not_null = true,
                 ColumnOption::Null => {}
@@ -846,11 +851,13 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
         &mut primary_key_name,
         &mut unique,
         &mut checks,
+        &mut foreign_keys,
     )?;
 
     Ok(plan::CreateTable {
         name,
         checks,
+        foreign_keys,
         if_not_exists: create.if_not_exists,
         columns,
         primary_key,
@@ -882,25 +889,7 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
             continue;
         }
         if let AlterTableOperation::AddConstraint { constraint, .. } = operation {
-            let TableConstraint::Check(check) = constraint else {
-                // A `FOREIGN KEY`, `UNIQUE` or `PRIMARY KEY` added after the fact. Named rather
-                // than recorded: see `plan::AlterTableAction::AddCheck`.
-                return Err(SqlError::unsupported(format!(
-                    "ALTER TABLE ... ADD CONSTRAINT ... {}",
-                    constraint_kind(constraint)
-                )));
-            };
-            refuse_if(
-                check.enforced.is_some(),
-                "CHECK ... ENFORCED, which is MySQL's",
-            )?;
-            actions.push(plan::AlterTableAction::AddCheck(crate::catalog::CheckDef {
-                name: check
-                    .name
-                    .as_ref()
-                    .map_or_else(|| format!("{table_name}_check"), ident),
-                expr: unwrap_nested(&check.expr).to_string(),
-            }));
+            actions.push(lower_added_constraint(&table_name, constraint)?);
             continue;
         }
         let AlterTableOperation::AddColumn {
@@ -926,7 +915,7 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
             let named = match &option.option {
                 // A **constant** default is admitted: it is stored as the column's missing value
                 // and the decoder pads with it, so no row is rewritten (ADR 0019's pad rule
-                // generalised; `crate::catalog::ColumnDef::missing`). Volatility and unfolded
+                // generalised; `catalog::ColumnDef::missing`). Volatility and unfolded
                 // expressions are refused inside `column_default`, by name.
                 ColumnOption::Default(expr) => {
                     if is_current_timestamp(expr) {
@@ -997,7 +986,8 @@ fn lower_table_constraints(
     primary_key: &mut Vec<String>,
     primary_key_name: &mut Option<String>,
     unique: &mut Vec<plan::UniqueConstraint>,
-    checks: &mut Vec<crate::catalog::CheckDef>,
+    checks: &mut Vec<catalog::CheckDef>,
+    foreign_keys: &mut Vec<plan::ForeignKey>,
 ) -> Result<()> {
     for constraint in &create.constraints {
         match constraint {
@@ -1018,8 +1008,8 @@ fn lower_table_constraints(
                     columns: index_columns(&key.columns)?,
                 });
             }
-            TableConstraint::ForeignKey(_) => {
-                return Err(SqlError::unsupported("FOREIGN KEY"));
+            TableConstraint::ForeignKey(constraint) => {
+                foreign_keys.push(lower_foreign_key(name, constraint)?);
             }
             // A named table `CHECK`, or an unnamed one, which PostgreSQL names
             // `<table>_check` — the same derivation a column constraint gets without the column.
@@ -1028,7 +1018,7 @@ fn lower_table_constraints(
                     check.enforced.is_some(),
                     "CHECK ... ENFORCED, which is MySQL's",
                 )?;
-                checks.push(crate::catalog::CheckDef {
+                checks.push(catalog::CheckDef {
                     name: check
                         .name
                         .as_ref()
@@ -1083,6 +1073,128 @@ fn alter_action_name(operation: &AlterTableOperation) -> String {
             }
         }
     }
+}
+
+/// `ALTER TABLE … ADD CONSTRAINT …`: the two kinds this node records, and a name for the rest.
+///
+/// A `UNIQUE` or `PRIMARY KEY` added after the fact is `0A000` naming itself — recording a
+/// constraint that does not constrain would let a schema load and then accept the rows it forbids,
+/// which ADR 0031 calls a wrong answer rather than a gap.
+fn lower_added_constraint(
+    table: &str,
+    constraint: &TableConstraint,
+) -> Result<plan::AlterTableAction> {
+    if let TableConstraint::ForeignKey(foreign_key) = constraint {
+        return Ok(plan::AlterTableAction::AddForeignKey(lower_foreign_key(
+            table,
+            foreign_key,
+        )?));
+    }
+    let TableConstraint::Check(check) = constraint else {
+        return Err(SqlError::unsupported(format!(
+            "ALTER TABLE ... ADD CONSTRAINT ... {}",
+            constraint_kind(constraint)
+        )));
+    };
+    refuse_if(
+        check.enforced.is_some(),
+        "CHECK ... ENFORCED, which is MySQL's",
+    )?;
+    Ok(plan::AlterTableAction::AddCheck(catalog::CheckDef {
+        name: check
+            .name
+            .as_ref()
+            .map_or_else(|| format!("{table}_check"), ident),
+        expr: unwrap_nested(&check.expr).to_string(),
+    }))
+}
+
+/// `p int8 REFERENCES t` — a column constraint that is the same thing as the table constraint.
+///
+/// The form `t.references :parrot, foreign_key: true` writes, and the one whose referencing column
+/// is not in its own text: it is the column it is written on, and the derived name is the table's
+/// plus that column's (`fxe_p_fkey`, measured).
+fn lower_column_foreign_key(
+    table: &str,
+    column: &str,
+    constraint: &sqlparser::ast::ForeignKeyConstraint,
+) -> Result<plan::ForeignKey> {
+    let mut lowered = lower_foreign_key(table, constraint)?;
+    if lowered.columns.is_empty() {
+        lowered.columns = vec![column.to_owned()];
+        if constraint.name.is_none() {
+            lowered.name = plan::foreign_key_name(table, &lowered.columns);
+        }
+    }
+    Ok(lowered)
+}
+
+/// One `FOREIGN KEY`, as written.
+///
+/// **`MATCH` is refused unless it is `SIMPLE`**, which is the default and the only one this node
+/// implements: `MATCH FULL` refuses a row with *some* of its key NULL where `SIMPLE` admits it,
+/// so accepting the word and behaving as `SIMPLE` would admit rows a real server rejects.
+fn lower_foreign_key(
+    table: &str,
+    key: &sqlparser::ast::ForeignKeyConstraint,
+) -> Result<plan::ForeignKey> {
+    refuse_if(key.index_name.is_some(), "an index name on a FOREIGN KEY")?;
+    if let Some(kind) = &key.match_kind {
+        refuse_if(
+            !matches!(kind, ConstraintReferenceMatchKind::Simple),
+            format!("FOREIGN KEY ... MATCH {kind}"),
+        )?;
+    }
+    let deferrable = match &key.characteristics {
+        None => false,
+        Some(characteristics) => {
+            // `INITIALLY DEFERRED` is the one form that would **change an answer**: a transaction
+            // that violates the constraint in the middle and repairs it before `COMMIT` succeeds
+            // on a real server and would be refused here, because every check in this crate is
+            // immediate. Refused by name rather than accepted, which is contract C2's whole rule.
+            // `ActiveRecord` writes `DEFERRABLE INITIALLY IMMEDIATE` and never this one.
+            refuse_if(
+                characteristics.initially == Some(DeferrableInitial::Deferred),
+                "FOREIGN KEY ... INITIALLY DEFERRED",
+            )?;
+            refuse_if(
+                characteristics.enforced.is_some(),
+                "FOREIGN KEY ... ENFORCED, which is MySQL's",
+            )?;
+            characteristics.deferrable.unwrap_or(false)
+        }
+    };
+    let columns: Vec<String> = key.columns.iter().map(ident).collect();
+    Ok(plan::ForeignKey {
+        name: key
+            .name
+            .as_ref()
+            .map_or_else(|| plan::foreign_key_name(table, &columns), ident),
+        columns,
+        parent: relation_name(&key.foreign_table)?,
+        parent_columns: key.referred_columns.iter().map(ident).collect(),
+        on_update: referential_action(key.on_update.as_ref())?,
+        on_delete: referential_action(key.on_delete.as_ref())?,
+        deferrable,
+    })
+}
+
+/// `ON UPDATE`/`ON DELETE`, defaulting to `NO ACTION` the way a real server does.
+///
+/// `SET NULL` and `SET DEFAULT` are refused by name: each writes a value into the child's columns
+/// rather than refusing or removing, and neither appears in anything `ActiveRecord` emits.
+fn referential_action(
+    action: Option<&sqlparser::ast::ReferentialAction>,
+) -> Result<catalog::ReferentialAction> {
+    use sqlparser::ast::ReferentialAction as Written;
+    Ok(match action {
+        None | Some(Written::NoAction) => catalog::ReferentialAction::NoAction,
+        Some(Written::Restrict) => catalog::ReferentialAction::Restrict,
+        Some(Written::Cascade) => catalog::ReferentialAction::Cascade,
+        Some(other) => {
+            return Err(SqlError::unsupported(format!("ON DELETE/UPDATE {other}")));
+        }
+    })
 }
 
 fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<plan::CreateIndex> {
@@ -3029,7 +3141,7 @@ fn index_key_options(column: &IndexColumn) -> Result<()> {
 /// `ASC` is the default and `DESC` is not, and **each direction has its own default null
 /// placement**: ascending sorts NULLs last, descending sorts them first. So an unwritten
 /// `NULLS …` is not "last", it is "whatever this direction means", which is what
-/// [`crate::catalog::KeyOrder::of`] says once rather than at each call.
+/// [`catalog::KeyOrder::of`] says once rather than at each call.
 fn index_key_order(column: &IndexColumn) -> KeyOrder {
     let descending = column.column.options.asc == Some(false);
     KeyOrder {
@@ -3086,13 +3198,13 @@ fn unwrap_nested(expr: &Expr) -> &Expr {
 }
 
 /// Which of PostgreSQL's three deparse shapes an index expression is
-/// ([`crate::catalog::ExprShape`]).
+/// ([`catalog::ExprShape`]).
 ///
 /// The shape is a property of the **node**, and this is the one place that still knows which node
 /// it was: by the time the expression is text, `'x)'::text` and `f(x)` are the same characters at
 /// the ends.
-fn expr_shape(expr: &Expr) -> crate::catalog::ExprShape {
-    use crate::catalog::ExprShape;
+fn expr_shape(expr: &Expr) -> catalog::ExprShape {
+    use catalog::ExprShape;
     match expr {
         Expr::Function(_) => ExprShape::Call,
         Expr::Value(_) | Expr::Cast { .. } | Expr::TypedString { .. } => ExprShape::Value,
@@ -3111,7 +3223,7 @@ fn expr_shape(expr: &Expr) -> crate::catalog::ExprShape {
 ///   server, and `ActiveRecord` writes the qualified form in three of its boot statements.
 /// * **`information_schema.tables` keeps its qualifier**, because a bare `tables` is **not** a
 ///   relation on a real server — `42P01` — and answering it here would invent one. So the schema
-///   is part of the view's name (`crate::catalog::information_schema`).
+///   is part of the view's name (`catalog::information_schema`).
 ///
 /// Everything else stays refused by name. `public.t` is the interesting one: a real server takes
 /// it, this node has one schema, and answering it would be right *when the qualifier is `public`*
@@ -3121,7 +3233,7 @@ fn expr_shape(expr: &Expr) -> crate::catalog::ExprShape {
 /// **This is what a write reaches too**, and it has to be: `DROP TABLE pg_catalog.pg_class` is
 /// `42501 permission denied` on a real server, and a lowering that refused the *qualifier* first
 /// would answer `0A000` and skip the guard that stops a client dropping a catalog relation
-/// (`crate::catalog::pg_catalog::refuse_write`). Measured, and `CREATE TABLE pg_catalog.pg_type`
+/// (`catalog::pg_catalog::refuse_write`). Measured, and `CREATE TABLE pg_catalog.pg_type`
 /// is `42P07` there for the same reason.
 fn relation_name(name: &ObjectName) -> Result<String> {
     let parts: Option<Vec<&str>> = name

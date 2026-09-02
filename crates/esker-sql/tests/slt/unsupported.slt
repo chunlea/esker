@@ -60,9 +60,6 @@ CREATE TABLE copy AS SELECT * FROM t
 statement error (0A000)
 CREATE TABLE d (id int8 PRIMARY KEY, a float8 DEFAULT random())
 
-statement error (0A000)
-CREATE TABLE f (id int8 PRIMARY KEY, a int8, FOREIGN KEY (a) REFERENCES t (id))
-
 # Tier 1 is complete since the typmod unit: `varchar(n)`, `character(n)` and `timestamp(p)` all
 # run, so the two lines that stood here are gone. What is refused now is tier 2.
 statement error (0A000)

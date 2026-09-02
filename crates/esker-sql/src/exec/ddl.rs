@@ -135,6 +135,8 @@ pub(super) fn create_table(
         primary_key,
         indexes,
         checks: create.checks.clone(),
+        // Filled below: resolving one needs the table it is on, which is this value.
+        foreign_keys: Vec::new(),
         primary_key_name,
         // A table starts at schema version 1; `ALTER TABLE ADD COLUMN` moves it.
         schema_version: 1,
@@ -142,7 +144,23 @@ pub(super) fn create_table(
     };
 
     validate_checks(&table)?;
+    // Resolved against a table that is not in the catalog yet, which is what lets a
+    // self-reference — `CREATE TABLE t (id int8 PRIMARY KEY, parent int8 REFERENCES t)` — work
+    // in the statement that declares it.
+    let mut table = table;
+    let mut backrefs = Vec::new();
+    for key in &create.foreign_keys {
+        let resolved = resolve_foreign_key(txn, executor, &table, key)?;
+        backrefs.push((resolved.parent, table.id));
+        table.foreign_keys.push(resolved);
+    }
     catalog::create_table(txn, executor.tenant, &table)?;
+    for (parent, child) in backrefs {
+        txn.put(
+            &catalog::foreign_key_backref_key(executor.tenant, parent, child),
+            &[],
+        );
+    }
     for sequence in &table.sequences {
         catalog::create_sequence(txn, executor.tenant, sequence)?;
     }
@@ -207,6 +225,160 @@ fn add_check(
     validate_checks(updated)?;
     updated.schema_version += 1;
     catalog::replace_table(txn, executor.tenant, table, updated)
+}
+
+/// `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY (…) REFERENCES … (…)`.
+///
+/// Everything is resolved here and nothing is left for the first write to discover: the parent
+/// must exist (`42P01`), the referencing columns must (`42703`, with a sentence of its own), and
+/// the referenced columns must be **a key of the parent** (`42830`) — a primary key or a whole
+/// unique index — because a reference to a column that can repeat has no single row to point at.
+/// Each was measured; each would otherwise surface as an internal error at an `INSERT`.
+///
+/// The constraint is **not** validated against the rows already there. A real server does check
+/// them, and this is the one place that difference shows: `ActiveRecord` writes every
+/// `ADD CONSTRAINT` before it writes any rows, so nothing it does reaches the gap. Declared, and
+/// the `TODO(post-v1)` is a scan of the child table with the parent lookup this module already
+/// has.
+fn add_foreign_key(
+    txn: &mut dyn Txn,
+    executor: &Executor,
+    table: &TableDef,
+    updated: &mut TableDef,
+    key: &plan::ForeignKey,
+) -> Result<()> {
+    if updated.checks.iter().any(|seen| seen.name == key.name)
+        || updated
+            .foreign_keys
+            .iter()
+            .any(|seen| seen.name == key.name)
+    {
+        return Err(SqlError::DuplicateConstraint {
+            constraint: key.name.clone(),
+            relation: updated.name.clone(),
+        });
+    }
+    let resolved = resolve_foreign_key(txn, executor, updated, key)?;
+    let parent_id = resolved.parent;
+    // **Creation order, not name order.** `pg_constraint` sorts by name where it is read
+    // (`catalog::pg_constraint::constraints_of`), and the one place the order in this list shows
+    // is the `2BP01` a `DROP TABLE` gives: a real server names the *first* constraint that
+    // depends on the table, which is the first one made.
+    updated.foreign_keys.push(resolved);
+    updated.schema_version += 1;
+    catalog::replace_table(txn, executor.tenant, table, updated)?;
+    // The reverse direction, so a `DELETE` on the parent is a prefix scan rather than a scan of
+    // every table this tenant has.
+    txn.put(
+        &catalog::foreign_key_backref_key(executor.tenant, parent_id, updated.id),
+        &[],
+    );
+    Ok(())
+}
+
+/// `ALTER TABLE … SET (columnar_replicas = n | DEFAULT)`.
+///
+/// Not part of the table definition and deliberately does **not** bump the schema version, for the
+/// reason retention does not: it says how many *copies* the cluster keeps, not how a row is
+/// written or read. The placement driver acts on it; no reader of rows does, so no node's cached
+/// `TableDef` is stale because of it.
+fn set_columnar_replicas(
+    txn: &mut dyn Txn,
+    executor: &mut Executor,
+    table: &TableDef,
+    replicas: Option<u8>,
+) -> Result<()> {
+    match replicas {
+        // The row schema is published in the same write, because a store that holds a learner
+        // needs it to decode a row and cannot ask this crate for it.
+        Some(replicas) => {
+            catalog::set_table_columnar_replicas(txn, executor.tenant, table, replicas)?;
+        }
+        None => catalog::clear_table_columnar_replicas(txn, executor.tenant, table.id),
+    }
+    // PD acts on this and **cannot read it**: the setting is in the cluster's own key space and PD
+    // links neither this crate nor a client (ADR 0022 Decision 5). So the node that ran the
+    // `ALTER` tells it — after the commit, from the executor, as a full assertion of every wish
+    // rather than this one's delta.
+    executor.columnar_changed();
+    Ok(())
+}
+
+/// One `FOREIGN KEY`, resolved against the table it is on and the table it points at.
+///
+/// The **self-reference** is why `child` is passed rather than read from the catalog: a table
+/// declaring a constraint into itself is not in the catalog in that shape yet, whether it is being
+/// created or altered.
+fn resolve_foreign_key(
+    txn: &dyn Txn,
+    executor: &Executor,
+    child: &TableDef,
+    key: &plan::ForeignKey,
+) -> Result<catalog::ForeignKeyDef> {
+    let columns = key
+        .columns
+        .iter()
+        .map(|column| {
+            child
+                .column(column)
+                .ok_or_else(|| SqlError::UndefinedColumnInForeignKey(column.clone()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let parent = if key.parent == child.name {
+        None
+    } else {
+        Some(executor.require_table(txn, &key.parent)?)
+    };
+    let parent_def: &TableDef = parent.as_deref().unwrap_or(child);
+
+    let parent_columns = if key.parent_columns.is_empty() {
+        // `REFERENCES t` with no list is the parent's **primary key**, which is what
+        // `t.references :parrot, foreign_key: true` writes.
+        parent_def.primary_key.clone()
+    } else {
+        key.parent_columns
+            .iter()
+            .map(|column| {
+                parent_def
+                    .column(column)
+                    .ok_or_else(|| SqlError::UndefinedColumnInForeignKey(column.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    if !references_a_key(parent_def, &parent_columns) || columns.len() != parent_columns.len() {
+        return Err(SqlError::NoUniqueConstraintForReference(
+            parent_def.name.clone(),
+        ));
+    }
+    Ok(catalog::ForeignKeyDef {
+        name: key.name.clone(),
+        columns,
+        parent: parent_def.id,
+        parent_columns,
+        on_update: key.on_update,
+        on_delete: key.on_delete,
+        deferrable: key.deferrable,
+    })
+}
+
+/// Whether these columns of `parent` are a key: its primary key, or a whole unique index's.
+///
+/// **In order and in full.** PostgreSQL matches the referenced columns against a unique
+/// constraint as a set, and a prefix of a composite key is not one — a reference to the first
+/// column of a two-column key would have several rows to point at, which is the whole condition
+/// `42830` names. A **partial** unique index does not count either: it constrains only the rows
+/// its predicate admits, so the column can repeat among the others.
+fn references_a_key(parent: &TableDef, columns: &[usize]) -> bool {
+    if parent.primary_key == columns {
+        return true;
+    }
+    parent.indexes.iter().any(|index| {
+        index.unique
+            && index.state.readable()
+            && index.predicate.is_none()
+            && index.key_columns().as_deref() == Some(columns)
+    })
 }
 
 /// Every `CHECK` on `table`, resolved against its own columns — **now**, not on the first row.
@@ -284,6 +456,45 @@ pub(super) fn drop_table(
                 return Err(SqlError::UndefinedTableForDrop(name.clone()));
             }
         };
+        // **A table something references cannot be dropped**, and `2BP01` names the constraint
+        // that stops it. `DROP … CASCADE` is what removes the constraint with it and is `0A000`
+        // here, so this is the whole of the answer rather than half of it.
+        //
+        // A self-reference does not count: dropping the table takes its own constraint with it,
+        // which is what a real server does too.
+        let (start, end) = catalog::foreign_key_backref_range(executor.tenant, table.id);
+        for (key, _) in txn.scan(&start, &end, 0)? {
+            let child_id = catalog::foreign_key_backref_child(executor.tenant, table.id, &key)?;
+            if child_id == table.id {
+                continue;
+            }
+            let child = executor.table_by_id(txn, child_id)?;
+            let Some(constraint) = child
+                .foreign_keys
+                .iter()
+                .find(|constraint| constraint.parent == table.id)
+            else {
+                continue;
+            };
+            return Err(SqlError::DependentTable {
+                relation: table.name.clone(),
+                detail: format!(
+                    "constraint {} on table {} depends on table {}",
+                    constraint.name, child.name, table.name
+                ),
+            });
+        }
+        // Its own back-references go with it: this table as a **child** is a key under every
+        // parent it points at, and a parent that outlives it must not be told it is still
+        // referenced.
+        for constraint in &table.foreign_keys {
+            txn.delete(&catalog::foreign_key_backref_key(
+                executor.tenant,
+                constraint.parent,
+                table.id,
+            ));
+        }
+
         // The rows go with the table. A range delete is what this wants and the transaction layer
         // has none, so every key is deleted individually -- correct, and `TODO(post-v1)` for a
         // table large enough that this is a problem.
@@ -608,44 +819,27 @@ pub(super) fn alter_table(
             add_check(txn, executor, &table, &mut updated, check)?;
             continue;
         }
+        if let AlterTableAction::AddForeignKey(key) = action {
+            add_foreign_key(txn, executor, &table, &mut updated, key)?;
+            continue;
+        }
+        if let AlterTableAction::SetColumnarReplicas { replicas } = action {
+            set_columnar_replicas(txn, executor, &updated, *replicas)?;
+            continue;
+        }
         let AlterTableAction::AddColumn {
             column,
             if_not_exists,
         } = action
         else {
+            let AlterTableAction::SetRetention { retention_ms } = action else {
+                unreachable!("every other action was handled above")
+            };
             // Retention is not part of the table definition and deliberately does **not** bump the
             // schema version (`docs/adr/0021-time-machine.md` Decision 4). It changes nothing
             // about how a row is written or read, and bumping would make every node in the cluster
             // discard its table cache to learn a number none of them uses. The collector picks it
             // up on its next pass, which is the only place it means anything.
-            // The columnar setting is not part of the table definition either, and for the same
-            // reason: it says how many *copies* the cluster keeps, not how a row is written or
-            // read. The placement driver acts on it; no reader of rows does, so no node's cached
-            // `TableDef` is stale because of it.
-            if let AlterTableAction::SetColumnarReplicas { replicas } = action {
-                match replicas {
-                    // The row schema is published in the same write, because a store that holds
-                    // a learner needs it to decode a row and cannot ask this crate for it.
-                    Some(replicas) => catalog::set_table_columnar_replicas(
-                        txn,
-                        executor.tenant,
-                        &updated,
-                        *replicas,
-                    )?,
-                    None => {
-                        catalog::clear_table_columnar_replicas(txn, executor.tenant, table.id);
-                    }
-                }
-                // PD acts on this and **cannot read it**: the setting is in the cluster's own key
-                // space and PD links neither this crate nor a client (ADR 0022 Decision 5). So the
-                // node that ran the `ALTER` tells it — after the commit, from the executor, as a
-                // full assertion of every wish rather than this one's delta.
-                executor.columnar_changed();
-                continue;
-            }
-            let AlterTableAction::SetRetention { retention_ms } = action else {
-                unreachable!("every action is one of the three")
-            };
             match retention_ms {
                 Some(retention_ms) => {
                     catalog::set_table_retention(txn, executor.tenant, table.id, *retention_ms);

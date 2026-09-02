@@ -48,8 +48,8 @@ use esker_base::varint;
 use esker_keys::{codec, prefix};
 
 use crate::catalog::{
-    CheckDef, ColumnDef, ExprShape, Identity, IndexDef, IndexKey, KeyOrder, KeyPart, Relation,
-    SchemaState, SequenceDef, TableDef,
+    CheckDef, ColumnDef, ExprShape, ForeignKeyDef, Identity, IndexDef, IndexKey, KeyOrder, KeyPart,
+    ReferentialAction, Relation, SchemaState, SequenceDef, TableDef,
 };
 use crate::error::{Result, SqlError};
 use crate::value::{ColumnType, Datum, NO_TYPMOD};
@@ -66,16 +66,16 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 ///
 /// Version 5 added an expression default (`DEFAULT CURRENT_TIMESTAMP`), version 6 the table's
 /// `CHECK` constraints, version 7 a partial index's predicate, version 8 an index's key
-/// **expressions**, and version 9 each key part's **order** — `DESC` and where its NULLs go. Each
-/// is appended at the end, so a record of every earlier version is a prefix of a later one's and
-/// the goldens below still decode.
+/// **expressions**, version 9 each key part's **order** — `DESC` and where its NULLs go — and
+/// version 10 the table's `FOREIGN KEY` constraints. Each is appended at the end, so a record of
+/// every earlier version is a prefix of a later one's and the goldens below still decode.
 ///
 /// Version 1 is not read: nothing had ever persisted a catalog when version 2 landed, so a
 /// compatibility path for it was one nothing could check. **Version 2 is different** — this crate
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 9;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 10;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -101,6 +101,8 @@ const KIND_JOB: u8 = b'j';
 const KIND_FLASHBACK: u8 = b'f';
 const KIND_SEQUENCE: u8 = b'q';
 const KIND_SEQUENCE_VALUE: u8 = b'e';
+/// A `FOREIGN KEY`'s **back**-reference: parent id first, so "who references me" is a prefix scan.
+const KIND_FK_BACKREF: u8 = b'k';
 
 /// Tags for [`ColumnType`] as stored. Ours rather than PostgreSQL's OIDs, because these are a
 /// format we own and must never move; the OIDs stay on the wire where they belong.
@@ -283,6 +285,47 @@ pub(super) fn name_range(tenant: u64) -> (Vec<u8>, Vec<u8>) {
     // The successor of the prefix: every key that starts with it sorts below this.
     end.push(0xff);
     (start, end)
+}
+
+/// `'m' ++ "sql" ++ 'k' ++ tenant ++ parent_id ++ child_id`. Value: empty.
+///
+/// The **reverse** of a `FOREIGN KEY`, and the only reason a `DELETE` on a parent row is not a
+/// scan of the whole catalog. A table's own record holds the constraints it is the *child* of,
+/// because that is the direction an `INSERT` checks; a `DELETE` asks the opposite question — who
+/// points at me — and no table can answer it about itself. One key per (parent, child) pair,
+/// whatever the number of constraints between them, because the child's record is read anyway to
+/// find which of them apply.
+pub(super) fn fk_backref_key(tenant: u64, parent: u64, child: u64) -> Vec<u8> {
+    let mut suffix = [SQL, &[KIND_FK_BACKREF]].concat();
+    codec::encode_u64(tenant, &mut suffix);
+    codec::encode_u64(parent, &mut suffix);
+    codec::encode_u64(child, &mut suffix);
+    prefix::meta_key(&suffix)
+}
+
+/// Every child of one parent: the range [`fk_backref_key`] writes into.
+pub(super) fn fk_backref_range(tenant: u64, parent: u64) -> (Vec<u8>, Vec<u8>) {
+    let mut suffix = [SQL, &[KIND_FK_BACKREF]].concat();
+    codec::encode_u64(tenant, &mut suffix);
+    codec::encode_u64(parent, &mut suffix);
+    let start = prefix::meta_key(&suffix);
+    let mut end = start.clone();
+    end.push(0xff);
+    (start, end)
+}
+
+/// The child id out of a key [`fk_backref_key`] wrote.
+pub(super) fn fk_backref_child(tenant: u64, parent: u64, key: &[u8]) -> Result<u64> {
+    let prefix = fk_backref_range(tenant, parent).0;
+    let tail = key
+        .strip_prefix(prefix.as_slice())
+        .ok_or_else(|| corrupt("a foreign-key back-reference outside its own range"))?;
+    let (child, rest) = codec::decode_u64(tail)
+        .map_err(|_| corrupt("a foreign-key back-reference with no child id"))?;
+    if !rest.is_empty() {
+        return Err(corrupt("a foreign-key back-reference with a tail"));
+    }
+    Ok(child)
 }
 
 /// `'m' ++ "sql" ++ 'd'`. One number for the cluster, absent until somebody sets it.
@@ -740,7 +783,51 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
             out.push(u8::try_from(key.order.indoption()).unwrap_or(0));
         }
     }
+
+    // Version 10. The `FOREIGN KEY` constraints, last, like every bump before it.
+    varint::put_u64(table.foreign_keys.len() as u64, &mut out);
+    for key in &table.foreign_keys {
+        put_str(&key.name, &mut out);
+        varint::put_u64(key.columns.len() as u64, &mut out);
+        for &ordinal in &key.columns {
+            varint::put_u64(ordinal as u64, &mut out);
+        }
+        out.extend_from_slice(&key.parent.to_le_bytes());
+        // The parent's ordinals are **not** checked against this table's column count when they
+        // are read back, because they are positions in another table's record which this one
+        // cannot see. They are validated where they are made (`crate::exec::ddl`).
+        varint::put_u64(key.parent_columns.len() as u64, &mut out);
+        for &ordinal in &key.parent_columns {
+            varint::put_u64(ordinal as u64, &mut out);
+        }
+        out.push(action_tag(key.on_update));
+        out.push(action_tag(key.on_delete));
+        out.push(u8::from(key.deferrable));
+    }
     Ok(out)
+}
+
+/// Tags for [`ReferentialAction`] as stored. PostgreSQL's own `confdeltype` characters would do,
+/// and are not used: this is a format we own, and its bytes are ours the way the type tags are.
+const ACTION_NO_ACTION: u8 = 1;
+const ACTION_RESTRICT: u8 = 2;
+const ACTION_CASCADE: u8 = 3;
+
+fn action_tag(action: ReferentialAction) -> u8 {
+    match action {
+        ReferentialAction::NoAction => ACTION_NO_ACTION,
+        ReferentialAction::Restrict => ACTION_RESTRICT,
+        ReferentialAction::Cascade => ACTION_CASCADE,
+    }
+}
+
+fn action_of(tag: u8) -> Result<ReferentialAction> {
+    Ok(match tag {
+        ACTION_NO_ACTION => ReferentialAction::NoAction,
+        ACTION_RESTRICT => ReferentialAction::Restrict,
+        ACTION_CASCADE => ReferentialAction::Cascade,
+        other => return Err(corrupt(format!("referential action tag {other}"))),
+    })
 }
 
 /// The two per-index sections that were appended after version 6: predicates, then expressions.
@@ -796,6 +883,46 @@ fn order_of(indoption: u8) -> Result<KeyOrder> {
         descending: indoption & 1 != 0,
         nulls_first: indoption & 2 != 0,
     })
+}
+
+/// The `FOREIGN KEY` section, appended by version 10.
+///
+/// A version 9 table has none, which is what every table written before version 10 had:
+/// `FOREIGN KEY` was `0A000` until then.
+///
+/// The **parent's** ordinals are not checked against a column count, because they are positions in
+/// another table's record which this one cannot see; they are validated where they are made
+/// (`crate::exec::ddl::resolve_foreign_key`).
+fn read_foreign_keys(reader: &mut Reader<'_>, columns: usize) -> Result<Vec<ForeignKeyDef>> {
+    if reader.version < 10 {
+        return Ok(Vec::new());
+    }
+    let mut keys = Vec::with_capacity(reader.count()?);
+    for _ in 0..keys.capacity() {
+        let name = reader.string()?;
+        let mut referencing = Vec::with_capacity(reader.count()?);
+        for _ in 0..referencing.capacity() {
+            referencing.push(reader.ordinal(columns)?);
+        }
+        let parent = reader.u64_le()?;
+        let mut parent_columns = Vec::with_capacity(reader.count()?);
+        for _ in 0..parent_columns.capacity() {
+            parent_columns
+                .push(usize::try_from(reader.varint()?).map_err(|_| {
+                    corrupt("a referenced column ordinal larger than this machine")
+                })?);
+        }
+        keys.push(ForeignKeyDef {
+            name,
+            columns: referencing,
+            parent,
+            parent_columns,
+            on_update: action_of(reader.byte()?)?,
+            on_delete: action_of(reader.byte()?)?,
+            deferrable: reader.flag()?,
+        });
+    }
+    Ok(keys)
 }
 
 /// Reads a table record back. Every failure is typed: a catalog is on-disk data like any other.
@@ -886,6 +1013,8 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
         Vec::new()
     };
     read_index_tails(&mut reader, &mut indexes)?;
+
+    let foreign_keys = read_foreign_keys(&mut reader, columns.len())?;
     reader.finish()?;
 
     Ok(TableDef {
@@ -901,6 +1030,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
         // straight from bytes therefore has none, which is what this function is for.
         sequences: Vec::new(),
         checks,
+        foreign_keys,
     })
 }
 

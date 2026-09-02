@@ -363,6 +363,7 @@ impl CatalogView {
                         schema_version: 1,
                         sequences: Vec::new(),
                         checks: Vec::new(),
+                        foreign_keys: Vec::new(),
                     })
                 })
                 .collect()

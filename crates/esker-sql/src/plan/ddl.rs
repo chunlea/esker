@@ -10,7 +10,7 @@
 //! what a `23505` message quotes back, and a client that matches on the constraint name would not
 //! recognise ours if we invented them.
 
-use crate::catalog::{ExprShape, Identity, KeyOrder, fold_identifier};
+use crate::catalog::{ExprShape, Identity, KeyOrder, ReferentialAction, fold_identifier};
 use crate::value::{ColumnType, Datum};
 
 /// `CREATE TABLE`.
@@ -33,6 +33,11 @@ pub struct CreateTable {
     /// Every `CHECK`, named the way PostgreSQL names one: as written, or
     /// `<table>_<column>_check` for a column constraint with no name of its own.
     pub checks: Vec<crate::catalog::CheckDef>,
+    /// Every `FOREIGN KEY`, from a column option (`p int8 REFERENCES t`) or a table constraint.
+    ///
+    /// Resolved by the executor rather than here, for the reason a `CREATE INDEX`'s key parts are:
+    /// the parent is a name until the catalog has been read.
+    pub foreign_keys: Vec<ForeignKey>,
 }
 
 /// One declared column.
@@ -154,6 +159,26 @@ pub struct CreateIndex {
     pub predicate: Option<String>,
 }
 
+/// A `FOREIGN KEY` as written, before the parent has been looked up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKey {
+    /// Its name — given, or derived as `<table>_<column>_fkey`.
+    pub name: String,
+    /// This table's columns, by name, folded.
+    pub columns: Vec<String>,
+    /// The referenced table, folded.
+    pub parent: String,
+    /// The referenced columns, by name — **empty for `REFERENCES t` with no list**, which means
+    /// the parent's primary key and is the form `t.references :parrot, foreign_key: true` emits.
+    pub parent_columns: Vec<String>,
+    /// `ON UPDATE …`.
+    pub on_update: ReferentialAction,
+    /// `ON DELETE …`.
+    pub on_delete: ReferentialAction,
+    /// `DEFERRABLE`, which is recorded and changes nothing here.
+    pub deferrable: bool,
+}
+
 /// `DROP INDEX`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropIndex {
@@ -189,6 +214,18 @@ pub fn unique_constraint_name(table: &str, columns: &[String]) -> String {
 #[must_use]
 pub fn sequence_name(table: &str, column: &str) -> String {
     derived(&[table, column, "seq"])
+}
+
+/// `<table>_<column>_fkey`, PostgreSQL's name for an unnamed foreign key constraint.
+///
+/// Measured: `CREATE TABLE fxe (id int8 PRIMARY KEY, p int8 REFERENCES fxp)` names it
+/// `fxe_p_fkey`. Every referencing column contributes, the way an index's do.
+#[must_use]
+pub fn foreign_key_name(table: &str, columns: &[String]) -> String {
+    let mut parts = vec![table];
+    parts.extend(columns.iter().map(String::as_str));
+    parts.push("fkey");
+    derived(&parts)
 }
 
 /// `<table>_<column>…_idx`, PostgreSQL's name for an unnamed index.
@@ -328,11 +365,12 @@ pub enum AlterTableAction {
         if_not_exists: bool,
     },
     /// `ALTER TABLE … ADD CONSTRAINT … CHECK (…)`.
-    ///
-    /// Only a `CHECK`. A `FOREIGN KEY` is `0A000` naming itself until the unit that *enforces*
-    /// one lands: recording a constraint that does not constrain would let a schema load and then
-    /// accept the rows it forbids, which ADR 0031 calls a wrong answer rather than a gap.
     AddCheck(crate::catalog::CheckDef),
+    /// `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY (…) REFERENCES … (…)`.
+    ///
+    /// The parent is named rather than resolved: nothing can turn `author_addresses` into a table
+    /// id until the catalog has been read, and the executor is where that happens once.
+    AddForeignKey(ForeignKey),
     /// `SET (retention = '7d' | 'forever' | DEFAULT)` — how far back this table can be read.
     ///
     /// A storage parameter, which is PostgreSQL's own shape for a per-table knob and one this

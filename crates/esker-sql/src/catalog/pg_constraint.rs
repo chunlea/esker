@@ -57,6 +57,43 @@ use crate::value::{ColumnType, Datum};
 /// a column number is at most `i16::MAX`, so it cannot carry into the table's half.
 const NOT_NULL_OID_BASE: u64 = 0x2000_0000_0000_0000;
 
+/// Where a `FOREIGN KEY`'s synthetic oid starts: its own region **below** the `NOT NULL` one.
+///
+/// The fourth region, for the reason the other three exist — `pg_get_constraintdef(oid)` is given
+/// nothing but the number. Below `NOT_NULL_OID_BASE` and far above the ids a tenant's sequence
+/// hands out, so the four regions and the relation ids cannot collide.
+const FOREIGN_KEY_OID_BASE: u64 = 0x1000_0000_0000_0000;
+
+/// Bits reserved for a foreign key's position within its table, mirroring [`CHECK_INDEX_BITS`].
+const FOREIGN_KEY_INDEX_BITS: u32 = 16;
+
+/// The oid of the `at`-th `FOREIGN KEY` on `table_id`.
+fn foreign_key_oid(table_id: u64, at: usize) -> i64 {
+    let at = u64::try_from(at).unwrap_or(0);
+    i64::try_from(FOREIGN_KEY_OID_BASE + (table_id << FOREIGN_KEY_INDEX_BITS) + at)
+        .unwrap_or(i64::MAX)
+}
+
+/// The table and position a `FOREIGN KEY` oid names, or `None` for an oid outside that region.
+fn foreign_key_of(oid: i64) -> Option<(u64, usize)> {
+    let oid = u64::try_from(oid).ok()?;
+    let below = oid.checked_sub(FOREIGN_KEY_OID_BASE)?;
+    if below >= NOT_NULL_OID_BASE - FOREIGN_KEY_OID_BASE {
+        return None;
+    }
+    let at = usize::try_from(below & ((1 << FOREIGN_KEY_INDEX_BITS) - 1)).ok()?;
+    Some((below >> FOREIGN_KEY_INDEX_BITS, at))
+}
+
+/// `{2}` / `{1,3}` — attribute numbers as an `int2vector` prints them.
+fn attnum_vector(table: &TableDef, ordinals: &[usize]) -> String {
+    let numbers: Vec<String> = ordinals
+        .iter()
+        .map(|at| pg_relations::attnum_of(table, *at).to_string())
+        .collect();
+    format!("{{{}}}", numbers.join(","))
+}
+
 /// How many bits the attnum occupies at the bottom of a `NOT NULL` constraint's oid.
 const NOT_NULL_COLUMN_BITS: u32 = 16;
 
@@ -118,19 +155,48 @@ pub fn rows_from(relations: &Relations) -> Vec<Vec<Datum>> {
                 Datum::Text(constraint.name),
                 Datum::Int8(PUBLIC_NAMESPACE_OID),
                 Datum::Text(constraint.contype.to_owned()),
-                // Nothing here is deferrable: `DEFERRABLE` is refused by name in the DDL, and a
-                // constraint that is not deferrable is `f`/`f` — which is also what a real server
-                // says for a `DEFERRABLE INITIALLY IMMEDIATE` one's `condeferred`.
-                Datum::Bool(false),
+                // `condeferrable` is what was written; `condeferred` is **always `f`**, because
+                // `INITIALLY DEFERRED` is refused by name and `DEFERRABLE INITIALLY IMMEDIATE` —
+                // the only deferrable form here — is `t`/`f` on a real server too. Measured.
+                Datum::Bool(
+                    constraint
+                        .foreign
+                        .as_ref()
+                        .is_some_and(|foreign| foreign.condeferrable),
+                ),
                 Datum::Bool(false),
                 // Every constraint here is validated: there is no `NOT VALID` to leave one behind.
                 Datum::Bool(true),
                 Datum::Int8(relation.oid),
                 Datum::Int8(constraint.conindid),
-                // No foreign keys, so no referenced relation and no referential actions.
-                Datum::Int8(0),
-                Datum::Text(NO_FOREIGN_ACTION.to_owned()),
-                Datum::Text(NO_FOREIGN_ACTION.to_owned()),
+                Datum::Int8(
+                    constraint
+                        .foreign
+                        .as_ref()
+                        .map_or(0, |foreign| foreign.confrelid),
+                ),
+                Datum::Text(
+                    constraint
+                        .foreign
+                        .as_ref()
+                        .map_or(NO_FOREIGN_ACTION, |foreign| foreign.confupdtype)
+                        .to_owned(),
+                ),
+                Datum::Text(
+                    constraint
+                        .foreign
+                        .as_ref()
+                        .map_or(NO_FOREIGN_ACTION, |foreign| foreign.confdeltype)
+                        .to_owned(),
+                ),
+                match &constraint.foreign {
+                    Some(foreign) => Datum::Text(foreign.conkey.clone()),
+                    None => Datum::Null,
+                },
+                match &constraint.foreign {
+                    Some(foreign) => Datum::Text(foreign.confkey.clone()),
+                    None => Datum::Null,
+                },
             ]);
         }
     }
@@ -158,25 +224,25 @@ pub fn constraint_definition(relations: &Relations, oid: Option<i64>) -> Datum {
     }
     // A `CHECK`: the oid is the table and the check's position, read back the same way.
     if let Some((table_id, at)) = check_of(oid)
-        && let Some(table) = relations
-            .rows()
-            .find(|row| row.kind == RelKind::Table && row.table_id == table_id)
-            .and_then(|row| relations.table(row))
+        && let Some(table) = table_of(relations, table_id)
         && let Some(check) = table.checks.get(at)
     {
         // `CHECK ((p > 0))` — the doubled parentheses are PostgreSQL's, which wraps the whole
         // predicate and then prints it parenthesised. Measured.
         return Datum::Text(format!("CHECK (({}))", check.expr));
     }
+    // A `FOREIGN KEY`: the oid is the table and the constraint's position in its list.
+    if let Some((table_id, at)) = foreign_key_of(oid)
+        && let Some(table) = table_of(relations, table_id)
+        && let Some(key) = table.foreign_keys.get(at)
+    {
+        return Datum::Text(foreign_key_definition(relations, table, key));
+    }
     // A `NOT NULL`: the oid is the table and the column, and this is where it is read back.
     let Some((table_id, attnum)) = not_null_of(oid) else {
         return Datum::Null;
     };
-    let Some(table) = relations
-        .rows()
-        .find(|row| row.kind == RelKind::Table && row.table_id == table_id)
-        .and_then(|row| relations.table(row))
-    else {
+    let Some(table) = table_of(relations, table_id) else {
         return Datum::Null;
     };
     match not_null_columns(table)
@@ -194,6 +260,19 @@ struct Constraint {
     name: String,
     contype: &'static str,
     conindid: i64,
+    /// A `FOREIGN KEY`'s five columns, or `None` for every other kind.
+    foreign: Option<ForeignColumns>,
+}
+
+/// What a `FOREIGN KEY` row carries that no other constraint does.
+struct ForeignColumns {
+    confrelid: i64,
+    confupdtype: &'static str,
+    confdeltype: &'static str,
+    condeferrable: bool,
+    /// `conkey` and `confkey` as an `int2vector` prints: `{2}`, `{1,3}`.
+    conkey: String,
+    confkey: String,
 }
 
 /// Every constraint one table has, in name order — which is the order `pg_constraint` is read in.
@@ -207,6 +286,7 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             contype: "n",
             // Zero, measured: a `NOT NULL` is enforced by the column and has no index behind it.
             conindid: 0,
+            foreign: None,
         })
         .collect();
     if !table.primary_key_name.is_empty() {
@@ -221,6 +301,7 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             name: table.primary_key_name.clone(),
             contype: "p",
             conindid: oid,
+            foreign: None,
         });
     }
     // `CHECK`, contype `c`. It has no index behind it, so `conindid` is zero for the same reason
@@ -231,10 +312,93 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             name: check.name.clone(),
             contype: "c",
             conindid: 0,
+            foreign: None,
+        });
+    }
+    // `FOREIGN KEY`, contype `f`. `conindid` is the index on the **parent** that the constraint
+    // is enforced through — zero here, because the parent's key is read by its primary key or by
+    // a unique index this row does not name, and reporting an index oid that is not the one a
+    // real server would report is a worse answer than reporting none.
+    for (at, key) in table.foreign_keys.iter().enumerate() {
+        let parent_row = relations
+            .rows()
+            .find(|row| row.kind == RelKind::Table && row.table_id == key.parent);
+        let parent_oid = parent_row.map_or(0, |row| row.oid);
+        let parent = parent_row.and_then(|row| relations.table(row));
+        out.push(Constraint {
+            oid: foreign_key_oid(table.id, at),
+            name: key.name.clone(),
+            contype: "f",
+            conindid: 0,
+            foreign: Some(ForeignColumns {
+                confrelid: parent_oid,
+                confupdtype: key.on_update.code(),
+                confdeltype: key.on_delete.code(),
+                condeferrable: key.deferrable,
+                conkey: attnum_vector(table, &key.columns),
+                confkey: parent.map_or_else(String::new, |parent| {
+                    attnum_vector(parent, &key.parent_columns)
+                }),
+            }),
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// `FOREIGN KEY (p) REFERENCES fxp(id) ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE`.
+///
+/// Four things the capture settled and none of them guessable:
+///
+/// * **no space before the parent's column list** — `REFERENCES fxp(id)`, where the child's side
+///   has one (`FOREIGN KEY (p)`);
+/// * **`ON UPDATE` before `ON DELETE`**, whichever order they were written in;
+/// * **the default prints nothing**, so `ON DELETE NO ACTION` written out comes back absent;
+/// * **`DEFERRABLE` is kept and `INITIALLY IMMEDIATE` is dropped**, because that one is the
+///   default — so the exact clause `ActiveRecord` writes is *not* what comes back out.
+fn foreign_key_definition(
+    relations: &Relations,
+    table: &TableDef,
+    key: &crate::catalog::ForeignKeyDef,
+) -> String {
+    let parent = table_of(relations, key.parent);
+    let parent_name = parent.map_or("?", |parent| parent.name.as_str());
+    let parent_columns = parent.map_or_else(String::new, |parent| {
+        column_list(parent, &key.parent_columns)
+    });
+    let mut out = format!(
+        "FOREIGN KEY ({}) REFERENCES {parent_name}({parent_columns})",
+        column_list(table, &key.columns)
+    );
+    if !key.on_update.clause().is_empty() {
+        out.push_str(" ON UPDATE ");
+        out.push_str(key.on_update.clause());
+    }
+    if !key.on_delete.clause().is_empty() {
+        out.push_str(" ON DELETE ");
+        out.push_str(key.on_delete.clause());
+    }
+    if key.deferrable {
+        out.push_str(" DEFERRABLE");
+    }
+    out
+}
+
+/// `a, b` — a constraint's columns as every definition above prints them.
+fn column_list(table: &TableDef, ordinals: &[usize]) -> String {
+    ordinals
+        .iter()
+        .filter_map(|at| table.columns.get(*at).map(|column| column.name.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// One table out of the snapshot, by id.
+fn table_of(relations: &Relations, table_id: u64) -> Option<&TableDef> {
+    relations
+        .rows()
+        .find(|row| row.kind == RelKind::Table && row.table_id == table_id)
+        .and_then(|row| relations.table(row))
 }
 
 /// `PRIMARY KEY (a, b)`, as `pg_get_constraintdef` writes it.
@@ -289,4 +453,12 @@ pub const CONSTRAINT_COLUMNS: &[(&str, ColumnType)] = &[
     ("confrelid", ColumnType::Int8),
     ("confupdtype", ColumnType::Text),
     ("confdeltype", ColumnType::Text),
+    // `int2vector`s on a real server, and text here for the reason `pg_index.indkey` is text: the
+    // characters are the same and so is what they mean. **This is not the column that unblocks
+    // `ActiveRecord`'s `foreign_keys()`** — that one subscripts them (`c.conkey[idx]`) under
+    // `generate_subscripts` and `array_agg`, which needs the array type and its functions. They
+    // are here because a `contype = 'f'` row without its key columns is an incomplete record, and
+    // `SELECT conkey` is answerable where `conkey[1]` is still `0A000`.
+    ("conkey", ColumnType::Text),
+    ("confkey", ColumnType::Text),
 ];

@@ -1,0 +1,97 @@
+# **`FOREIGN KEY`, enforced** — statement 52 of `schema.rb`, and everything behind it
+#
+# `ALTER TABLE "authors" ADD CONSTRAINT "fk_rails_94423a17a3" FOREIGN KEY ("author_address_id")
+# REFERENCES "author_addresses" ("id") DEFERRABLE INITIALLY IMMEDIATE`. Nothing later in the file
+# is reachable until this works, which is why it comes before the remaining types.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **One SQLSTATE, two sentences, and the second names both tables.** Writing a child row that
+#     points at nothing is `insert or update on table "fxc" violates …` with
+#     `Key (p)=(99) is not present in table "fxp".`; removing a parent row something points at is
+#     `update or delete on table "fxp" violates … on table "fxc"` with
+#     `Key (id)=(2) is still referenced from table "fxc".` An implementation with one message for
+#     both looks right on half the cases.
+#   * **A NULL points at nothing and that is not a violation.** `MATCH SIMPLE`, the default:
+#     `INSERT INTO fxc VALUES (12, NULL, NULL)` succeeds under the constraint that refuses `99`.
+#   * **`UPDATE` on the parent is a referential event too**, and it is the one an implementation
+#     that only hooks `DELETE` misses: `UPDATE fxp SET id = 3 WHERE id = 2` is the same `23503`,
+#     and under `ON UPDATE CASCADE` it **rewrites the children's key** rather than deleting them.
+#   * **`pg_get_constraintdef` prints four things not as they were written**: no space before the
+#     parent's column list (`REFERENCES fxp(id)`, where the child's side has one); `ON UPDATE`
+#     before `ON DELETE` whichever order was written; **nothing at all** for the default, so
+#     `ON DELETE NO ACTION` comes back absent; and `DEFERRABLE` kept while `INITIALLY IMMEDIATE`
+#     is dropped — so the exact clause `ActiveRecord` writes is not what comes back out.
+#   * **`NO ACTION` and `RESTRICT` are different codes for the same immediate behaviour.**
+#     `confdeltype` is `a` and `r`, the definition text differs, and both refuse. The difference on
+#     a real server is that `NO ACTION` can be deferred to the end of the statement and `RESTRICT`
+#     cannot; with every check immediate the two are one behaviour, which is what the rows show.
+#   * **A cascade is a chain.** Deleting `fxq` row 2 removes `fxd` row 12 and then `fxg` row 100,
+#     which points at `fxd`. Depth-first, or a row is removed while something still points at it.
+#   * **The DDL errors are four different codes.** A missing parent is `42P01`; a missing column is
+#     `42703` with a sentence of its own — `column "nosuchcol" referenced in foreign key constraint
+#     does not exist`, not the plain one; a referenced column with no unique index behind it is
+#     `42830`; a name the table already uses is `42710`. And dropping the parent is `2BP01`.
+#   * **`REFERENCES t` with no column list means the parent's primary key**, and derives the name
+#     `fxe_p_fkey`. That is the form `t.references :parrot, foreign_key: true` writes.
+#
+# The tables are left behind on the oracle, which is what lets `\gdesc` fill the declared-types
+# column in a second session (`captures/README.md`). They are named `fx*` rather than `fk*`
+# because `fk*` belongs to `captures/pg19_ddl_cascade_fk_trigger.txt` and a `DROP … CASCADE` on a
+# shared name takes that file's constraints with it.
+DROP TABLE IF EXISTS fxg		-
+DROP TABLE IF EXISTS fxd		-
+DROP TABLE IF EXISTS fxe		-
+DROP TABLE IF EXISTS fxc		-
+DROP TABLE IF EXISTS fxq		-
+DROP TABLE IF EXISTS fxp		-
+CREATE TABLE fxp (id int8 PRIMARY KEY, n text)		-
+CREATE TABLE fxc (id int8 PRIMARY KEY, p int8, q int8)		-
+INSERT INTO fxp VALUES (1, 'one')		-
+INSERT INTO fxp VALUES (2, 'two')		-
+ALTER TABLE fxc ADD CONSTRAINT fxc_p FOREIGN KEY (p) REFERENCES fxp (id) DEFERRABLE INITIALLY IMMEDIATE		-
+INSERT INTO fxc VALUES (10, 1, NULL)		-
+INSERT INTO fxc VALUES (11, 99, NULL)	!23503 insert or update on table "fxc" violates foreign key constraint "fxc_p" DETAIL: Key (p)=(99) is not present in table "fxp".
+INSERT INTO fxc VALUES (12, NULL, NULL)		-
+SELECT id, p FROM fxc ORDER BY id	bigint,bigint	10|1 ; 12|\N
+UPDATE fxc SET p = 98 WHERE id = 10	!23503 insert or update on table "fxc" violates foreign key constraint "fxc_p" DETAIL: Key (p)=(98) is not present in table "fxp".
+UPDATE fxc SET p = 2 WHERE id = 10		-
+DELETE FROM fxp WHERE id = 2	!23503 update or delete on table "fxp" violates foreign key constraint "fxc_p" on table "fxc" DETAIL: Key (id)=(2) is still referenced from table "fxc".
+UPDATE fxp SET id = 3 WHERE id = 2	!23503 update or delete on table "fxp" violates foreign key constraint "fxc_p" on table "fxc" DETAIL: Key (id)=(2) is still referenced from table "fxc".
+DELETE FROM fxp WHERE id = 1		-
+SELECT id, n FROM fxp ORDER BY id	bigint,text	2|two
+SELECT conname, contype, condeferrable, condeferred, convalidated, confupdtype, confdeltype, pg_get_constraintdef(c.oid), c.conkey::text, c.confkey::text, t2.relname FROM pg_constraint c JOIN pg_class t2 ON t2.oid = c.confrelid WHERE c.conrelid = 'fxc'::regclass ORDER BY conname	name,"char",boolean,boolean,boolean,"char","char",text,text,text,name	fxc_p|f|t|f|t|a|a|FOREIGN KEY (p) REFERENCES fxp(id) DEFERRABLE|{2}|{1}|fxp
+CREATE TABLE fxq (id int8 PRIMARY KEY, n text)		-
+CREATE TABLE fxd (id int8 PRIMARY KEY, p int8)		-
+ALTER TABLE fxd ADD CONSTRAINT fxd_p FOREIGN KEY (p) REFERENCES fxq (id) ON DELETE CASCADE ON UPDATE CASCADE		-
+INSERT INTO fxq VALUES (1, 'a')		-
+INSERT INTO fxq VALUES (2, 'b')		-
+INSERT INTO fxd VALUES (10, 1)		-
+INSERT INTO fxd VALUES (11, 1)		-
+INSERT INTO fxd VALUES (12, 2)		-
+UPDATE fxq SET id = 5 WHERE id = 1		-
+SELECT id, p FROM fxd ORDER BY id	bigint,bigint	10|5 ; 11|5 ; 12|2
+DELETE FROM fxq WHERE id = 5		-
+SELECT id, p FROM fxd ORDER BY id	bigint,bigint	12|2
+CREATE TABLE fxg (id int8 PRIMARY KEY, p int8)		-
+ALTER TABLE fxg ADD CONSTRAINT fxg_p FOREIGN KEY (p) REFERENCES fxd (id) ON DELETE CASCADE		-
+INSERT INTO fxg VALUES (100, 12)		-
+DELETE FROM fxq WHERE id = 2		-
+SELECT id FROM fxd ORDER BY id	bigint	-
+SELECT id FROM fxg ORDER BY id	bigint	-
+SELECT conname, pg_get_constraintdef(oid), confupdtype, confdeltype FROM pg_constraint WHERE conrelid = 'fxd'::regclass AND contype = 'f' ORDER BY conname	name,text,"char","char"	fxd_p|FOREIGN KEY (p) REFERENCES fxq(id) ON UPDATE CASCADE ON DELETE CASCADE|c|c
+CREATE TABLE fxe (id int8 PRIMARY KEY, p int8 REFERENCES fxp)		-
+SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'fxe'::regclass AND contype = 'f'	name,text	fxe_p_fkey|FOREIGN KEY (p) REFERENCES fxp(id)
+INSERT INTO fxe VALUES (1, 77)	!23503 insert or update on table "fxe" violates foreign key constraint "fxe_p_fkey" DETAIL: Key (p)=(77) is not present in table "fxp".
+ALTER TABLE fxc ADD CONSTRAINT fxc_r FOREIGN KEY (q) REFERENCES fxp (id) ON DELETE RESTRICT		-
+ALTER TABLE fxc ADD CONSTRAINT fxc_n FOREIGN KEY (q) REFERENCES fxp (id) ON DELETE NO ACTION ON UPDATE NO ACTION		-
+SELECT conname, pg_get_constraintdef(oid), confupdtype, confdeltype FROM pg_constraint WHERE conrelid = 'fxc'::regclass AND contype = 'f' ORDER BY conname	name,text,"char","char"	fxc_n|FOREIGN KEY (q) REFERENCES fxp(id)|a|a ; fxc_p|FOREIGN KEY (p) REFERENCES fxp(id) DEFERRABLE|a|a ; fxc_r|FOREIGN KEY (q) REFERENCES fxp(id) ON DELETE RESTRICT|a|r
+ALTER TABLE fxc ADD CONSTRAINT fxc_bad FOREIGN KEY (q) REFERENCES nosuchtable (id)	!42P01 relation "nosuchtable" does not exist
+ALTER TABLE fxc ADD CONSTRAINT fxc_bad FOREIGN KEY (nosuchcol) REFERENCES fxp (id)	!42703 column "nosuchcol" referenced in foreign key constraint does not exist
+ALTER TABLE fxc ADD CONSTRAINT fxc_bad FOREIGN KEY (q) REFERENCES fxp (n)	!42830 there is no unique constraint matching given keys for referenced table "fxp"
+ALTER TABLE fxc ADD CONSTRAINT fxc_p FOREIGN KEY (q) REFERENCES fxp (id)	!42710 constraint "fxc_p" for relation "fxc" already exists
+DROP TABLE fxp	!2BP01 cannot drop table fxp because other objects depend on it DETAIL: constraint fxc_p on table fxc depends on table fxp HINT: Use DROP ... CASCADE to drop the dependent objects too.

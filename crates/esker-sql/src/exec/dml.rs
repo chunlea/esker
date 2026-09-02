@@ -319,6 +319,10 @@ pub(super) fn write_row(
         });
     }
 
+    // The row it points at has to exist, and this is where a `CHECK` is enforced too — before
+    // anything is stored, so a violation leaves nothing behind.
+    super::foreign_key::check_references(executor, txn, table, row)?;
+
     for index in &table.indexes {
         // **Write-only and public write an entry; delete-only and absent do not.** One state later
         // than [`SchemaState::maintained`], and the asymmetry is the design: removal has to lead
@@ -447,8 +451,13 @@ pub(super) fn update(
         fit_typmods(&table, &mut new)?;
         check_not_null(&table, &new)?;
         check_constraints(&table, &new)?;
+        // Anything pointing at the row's **old** key. Refusing comes first, so a `RESTRICT` leaves
+        // the table as it was; the cascade comes *after* the row has moved, because a child whose
+        // key follows the parent's re-checks that key and it has to be there already.
+        super::foreign_key::refuse_if_referenced(executor, txn, &table, &old, &new)?;
         remove_row(executor, txn, &table, &old)?;
         write_row(executor, txn, &table, &new, written)?;
+        super::foreign_key::cascade_update(executor, txn, &table, &old, &new, written)?;
         // The row **after** the assignments: `UPDATE t SET n = n + 1 RETURNING n` answers with
         // the new value, which is the whole reason a client writes it.
         if let Some(returned) = &mut returned {
@@ -475,9 +484,33 @@ pub(super) fn delete(
         if let Some(returned) = &mut returned {
             returned.push(&row)?;
         }
+        // Anything pointing at this row: refused, or cascaded into first. Before the row goes, so
+        // a refusal leaves the table as it was.
+        super::foreign_key::on_parent_removed(executor, txn, &table, &row)?;
         remove_row(executor, txn, &table, &row)?;
     }
     Ok(finish(returned, format!("DELETE {count}")))
+}
+
+/// One row replaced by another, running every check a written row runs.
+///
+/// What `ON UPDATE CASCADE` does to a child: its key follows the parent's, and because it goes
+/// through [`write_row`] it re-checks its own foreign keys, its `CHECK`s and its unique indexes —
+/// so a three-level chain stays consistent without a second rule.
+pub(super) fn rewrite_row(
+    executor: &Executor,
+    txn: &mut dyn Txn,
+    table: &TableDef,
+    old: &[Datum],
+    new: &[Datum],
+    written: &mut Written,
+) -> Result<()> {
+    check_not_null(table, new)?;
+    check_constraints(table, new)?;
+    remove_row(executor, txn, table, old)?;
+    // The statement's own `Written`, not a fresh one: a unique key a cascade took is a key this
+    // statement wrote, and a lost race on it has to be reported as the `23505` it is.
+    write_row(executor, txn, table, new, written)
 }
 
 /// Every row a predicate matches, read before anything is written. See [`update`] for why.

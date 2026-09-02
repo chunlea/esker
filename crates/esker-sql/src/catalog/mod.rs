@@ -580,6 +580,92 @@ pub struct TableDef {
     /// needs the text anyway, and one string is an encoding this record already knows how to
     /// write, where a serialised expression tree would be a second format to version.
     pub checks: Vec<CheckDef>,
+    /// `FOREIGN KEY` constraints **this table is the child of**, in name order.
+    ///
+    /// The other direction is not here and cannot be: a table does not know who references it
+    /// without reading every other table. That question — which a `DELETE` on a parent row asks
+    /// once per statement — is answered by a key space instead
+    /// ([`foreign_key_backref_range`]), so a parent's delete costs a short prefix
+    /// scan rather than a scan of the whole catalog.
+    pub foreign_keys: Vec<ForeignKeyDef>,
+}
+
+/// One `FOREIGN KEY` constraint, held by the **child** — the table whose rows must point at
+/// something.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKeyDef {
+    /// Its name — given, or derived as `<table>_<column>_fkey` the way PostgreSQL derives one.
+    pub name: String,
+    /// Positions into this table's columns: `conkey`.
+    pub columns: Vec<usize>,
+    /// The referenced table's id, which is also its oid: `confrelid`.
+    ///
+    /// An id rather than a name, for the reason an index's key parts are positions — renaming the
+    /// parent cannot orphan the constraint, and the name in a message is read back out of the
+    /// parent's own record.
+    pub parent: u64,
+    /// Positions into the **parent's** columns, in the order they pair with [`Self::columns`]:
+    /// `confkey`.
+    pub parent_columns: Vec<usize>,
+    /// `ON UPDATE …`: `confupdtype`.
+    pub on_update: ReferentialAction,
+    /// `ON DELETE …`: `confdeltype`.
+    pub on_delete: ReferentialAction,
+    /// `DEFERRABLE`, which is recorded and **changes nothing**: every check here is immediate,
+    /// and `DEFERRABLE INITIALLY IMMEDIATE` — the only deferrable form `ActiveRecord` writes — is
+    /// immediate on a real server too. `INITIALLY DEFERRED` is `0A000` naming itself, because
+    /// accepting it and checking immediately would refuse a transaction PostgreSQL commits.
+    pub deferrable: bool,
+}
+
+/// What a `FOREIGN KEY` does when the row it points at is deleted or its key is changed.
+///
+/// `SET NULL` and `SET DEFAULT` are PostgreSQL's other two and are `0A000` naming themselves:
+/// nothing `ActiveRecord` writes uses them, and each would need a rule about which columns it
+/// touches that this crate has nowhere to put yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferentialAction {
+    /// `NO ACTION`, the default — refuse. On a real server this one is deferrable to the end of
+    /// the statement and [`ReferentialAction::Restrict`] is not; with every check immediate here
+    /// the two behave identically and differ only in what they print and store, which is exactly
+    /// what the capture shows for an immediate constraint.
+    NoAction,
+    /// `RESTRICT` — refuse.
+    Restrict,
+    /// `CASCADE` — delete the referencing rows, or rewrite their key to follow the parent's.
+    Cascade,
+}
+
+impl ReferentialAction {
+    /// `confupdtype` / `confdeltype`: PostgreSQL's one-character code.
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            ReferentialAction::NoAction => "a",
+            ReferentialAction::Restrict => "r",
+            ReferentialAction::Cascade => "c",
+        }
+    }
+
+    /// What `pg_get_constraintdef` prints for it — **nothing at all** for the default, which is
+    /// why `ON DELETE NO ACTION` written out comes back absent.
+    #[must_use]
+    pub fn clause(self) -> &'static str {
+        match self {
+            ReferentialAction::NoAction => "",
+            ReferentialAction::Restrict => "RESTRICT",
+            ReferentialAction::Cascade => "CASCADE",
+        }
+    }
+
+    /// Whether a parent row this action guards may be removed or re-keyed at all.
+    #[must_use]
+    pub fn refuses(self) -> bool {
+        matches!(
+            self,
+            ReferentialAction::NoAction | ReferentialAction::Restrict
+        )
+    }
 }
 
 /// One `CHECK` constraint.
@@ -1038,6 +1124,27 @@ impl View<'_> {
         }
         Err(SqlError::UndefinedTable(name.to_owned()))
     }
+}
+
+/// The key that records "`child` has a `FOREIGN KEY` into `parent`".
+///
+/// Written when the constraint is made and removed when either table is dropped. See
+/// `record::fk_backref_key`: the parent comes first so that "who references me" is a prefix scan
+/// rather than a scan of every table in the catalog.
+#[must_use]
+pub fn foreign_key_backref_key(tenant: u64, parent: u64, child: u64) -> Vec<u8> {
+    record::fk_backref_key(tenant, parent, child)
+}
+
+/// Every child of one parent: the range [`foreign_key_backref_key`] writes into.
+#[must_use]
+pub fn foreign_key_backref_range(tenant: u64, parent: u64) -> (Vec<u8>, Vec<u8>) {
+    record::fk_backref_range(tenant, parent)
+}
+
+/// The child id out of a key [`foreign_key_backref_key`] wrote.
+pub fn foreign_key_backref_child(tenant: u64, parent: u64, key: &[u8]) -> Result<u64> {
+    record::fk_backref_child(tenant, parent, key)
 }
 
 /// Writes a new table, its name, and its indexes' names, and bumps the catalog version.
@@ -1702,6 +1809,7 @@ mod tests {
             schema_version: 1,
             sequences: Vec::new(),
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
         }
     }
 
@@ -1722,7 +1830,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "09",               // catalog format version
+                "0a",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -1774,7 +1882,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "09",                 // catalog format version
+                "0a",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -1811,6 +1919,7 @@ mod tests {
                 "00", // version 7: the one index has no WHERE predicate
                 "00", // version 8: its one key part is a column, not an expression
                 "00", // version 9: ascending, with its NULLs where ascending puts them
+                "00", // version 10: no FOREIGN KEY constraints
             )
         );
         assert_eq!(record::decode_table(&encoded).unwrap(), accounts(7));
@@ -1872,6 +1981,54 @@ mod tests {
         assert_eq!(read.indexes[0].keys[0].order.indoption(), 0);
         assert_eq!(read.indexes[0].keys[1].order.indoption(), 1);
         assert_eq!(read.indexes[0].keys[1].order.suffix(), " DESC NULLS LAST");
+    }
+
+    /// The **version 9** golden, kept for the same reason the eight before it are.
+    ///
+    /// These are the bytes version 9 wrote — the record ends at the key orders, with no count of
+    /// `FOREIGN KEY` constraints after it. The table reads back with none, which is what every
+    /// table a version 9 catalog could hold had: `FOREIGN KEY` was `0A000` until version 10.
+    #[test]
+    fn a_version_9_table_record_still_decodes() {
+        let v9 = decode_hex(concat!(
+            "09",                 // catalog format version 9
+            "0700000000000000",   // table id 7
+            "086163636f756e7473", // varint 8, "accounts"
+            "0d6163636f756e74735f706b6579",
+            "01", // schema version 1
+            "02", // two columns
+            "026964",
+            "01",
+            "01",
+            "00",
+            "00",
+            "ffffffff",
+            "00",
+            "05656d61696c",
+            "02",
+            "00",
+            "00",
+            "00",
+            "ffffffff",
+            "00",
+            "01",
+            "00",                                     // primary key: one column, column 0
+            "01",                                     // one index
+            "0800000000000000",                       // index id 8
+            "126163636f756e74735f656d61696c5f6b6579", // "accounts_email_key"
+            "01",                                     // unique
+            "03",                                     // state: public
+            "01",                                     // entered at schema version 1
+            "01",
+            "01", // one column, column 1
+            "00", // no CHECK constraints
+            "00", // no WHERE predicate
+            "00", // its one key part is a column
+            "00", // ascending -- and nothing after it
+        ));
+        let table = record::decode_table(&v9).unwrap();
+        assert_eq!(table, accounts(7));
+        assert!(table.foreign_keys.is_empty());
     }
 
     /// The **version 8** golden, kept for the same reason the seven before it are.
@@ -2663,7 +2820,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "09",               // catalog format version
+                "0a",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

@@ -150,18 +150,3 @@ fn a_constraint_added_later_binds_later_rows() {
     assert_eq!(error.sqlstate(), "23514");
 }
 
-/// A `FOREIGN KEY` is refused by name until the unit that enforces one lands.
-#[test]
-fn a_foreign_key_is_still_refused_by_name() {
-    let mut node = parity::Node::new(&[]);
-    node.run("CREATE TABLE ck (id int8 PRIMARY KEY, p int8)")
-        .unwrap();
-    let error = node
-        .run("ALTER TABLE ck ADD CONSTRAINT fk FOREIGN KEY (p) REFERENCES ck (id)")
-        .unwrap_err();
-    assert_eq!(error.sqlstate(), "0A000");
-    assert!(
-        error.to_string().contains("FOREIGN KEY"),
-        "`{error}` does not name the construct"
-    );
-}

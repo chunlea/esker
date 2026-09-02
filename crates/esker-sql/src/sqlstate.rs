@@ -90,6 +90,12 @@ pub const NOT_NULL_VIOLATION: &str = "23502";
 pub const UNIQUE_VIOLATION: &str = "23505";
 /// A row a `CHECK` constraint refuses.
 pub const CHECK_VIOLATION: &str = "23514";
+/// A row that points at a parent row that is not there, and a parent row something still points
+/// at. **One code for both directions**, which is why the two messages differ so much: the second
+/// names the child table as well as the parent.
+pub const FOREIGN_KEY_VIOLATION: &str = "23503";
+/// A `FOREIGN KEY` whose referenced columns are not a key of the parent.
+pub const INVALID_FOREIGN_KEY: &str = "42830";
 
 // --- Class 25 — Invalid Transaction State ---
 
