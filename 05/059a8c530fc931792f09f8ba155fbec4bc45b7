@@ -1,0 +1,33 @@
+crates/esker-engine/src/fs/claim.rs
+  s_5887b8dc15d0eb::t_e1c62b97bdc4c7 44,258,260-271,309-310,312-314,319-330
+crates/esker-engine/tests/tier_claim.rs
+  s_5887b8dc15d0eb::t_4bf402029a06c0 52-128
+crates/esker-engine/tests/tier_minio.rs
+  s_5887b8dc15d0eb::t_b26098dfa733f7 42,393-494
+crates/esker-s3/src/client.rs
+  s_5887b8dc15d0eb::t_47856caf2f45be 22,322-352
+crates/esker-s3/src/lib.rs
+  s_5887b8dc15d0eb::t_947545d246c487 78-91,106-125
+crates/esker-s3/src/memory.rs
+  s_5887b8dc15d0eb::t_8be43d10c47ed3 22,125-147
+docs/adr/0029-the-sst-store-claim.md
+  s_5887b8dc15d0eb::t_a05d6641bb7d75 73-94
+docs/plans/debt-c4.md
+  s_5887b8dc15d0eb::t_6a9e85b998ac50 148-194
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "05059a8c530fc931792f09f8ba155fbec4bc45b7",
+  "prompts": {},
+  "sessions": {
+    "s_5887b8dc15d0eb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a3f26108-d8c6-4ca4-8418-c2dce63dbbae",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
