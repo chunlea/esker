@@ -39,6 +39,21 @@ use crate::value::Datum;
 /// it, small enough that a runaway stops instead of exhausting the stack.
 const MAX_CASCADE_DEPTH: usize = 32;
 
+/// Whether this table's referential checks are running.
+///
+/// **A foreign key is two triggers, on two different tables**, and `DISABLE TRIGGER ALL` disables
+/// the ones on the table it names. So the child's check — "the row I point at must exist" — is
+/// suspended by disabling the **child**, and the parent's — "nothing may point at the row I am
+/// removing" — by disabling the **parent**. Measured on PostgreSQL 19, including the case that
+/// looks like it should be symmetric and is not: with the parent disabled, an `INSERT` into the
+/// child naming a missing parent is still `23503`.
+///
+/// `DISABLE TRIGGER USER` sets nothing, because it covers only triggers a user created and this
+/// clause is about PostgreSQL's internal ones (`crate::parse::lower::lower_trigger_state`).
+fn enforcing(table: &TableDef) -> bool {
+    !table.triggers_disabled
+}
+
 /// Every constraint this row must satisfy as a **child**: the row it points at has to exist.
 ///
 /// Called for every row an `INSERT` or an `UPDATE` writes, after the row is built and before it is
@@ -50,6 +65,9 @@ pub(super) fn check_references(
     table: &TableDef,
     row: &[Datum],
 ) -> Result<()> {
+    if !enforcing(table) {
+        return Ok(());
+    }
     for key in &table.foreign_keys {
         let Some(values) = referencing_values(key, row) else {
             // A NULL in the key: `MATCH SIMPLE` admits it, and this is the whole of that rule.
@@ -82,6 +100,9 @@ pub(super) fn on_parent_removed(
     table: &TableDef,
     row: &[Datum],
 ) -> Result<()> {
+    if !enforcing(table) {
+        return Ok(());
+    }
     cascade_delete(executor, txn, table, row, 0)
 }
 
@@ -96,6 +117,9 @@ pub(super) fn refuse_if_referenced(
     old: &[Datum],
     new: &[Datum],
 ) -> Result<()> {
+    if !enforcing(table) {
+        return Ok(());
+    }
     for (child, key) in children_of(executor, txn, table)? {
         if !key.on_update.refuses() {
             continue;
@@ -125,6 +149,9 @@ pub(super) fn cascade_update(
     new: &[Datum],
     written: &mut super::Written,
 ) -> Result<()> {
+    if !enforcing(table) {
+        return Ok(());
+    }
     for (child, key) in children_of(executor, txn, table)? {
         if key.on_update.refuses() {
             continue;

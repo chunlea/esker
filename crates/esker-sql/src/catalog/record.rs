@@ -76,7 +76,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 11;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 12;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -818,6 +818,12 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
     for index in &table.indexes {
         out.push(u8::from(index.nulls_not_distinct));
     }
+    // Version 12. One byte, last, like every bump before it: whether
+    // `ALTER TABLE … DISABLE TRIGGER ALL` has suspended this table's referential checks. Every
+    // table written before version 12 read back `false`, which is what a table nobody disabled
+    // means and what the statement answered until now (`0A000`).
+    out.push(u8::from(table.triggers_disabled));
+
     Ok(out)
 }
 
@@ -1038,6 +1044,9 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
             index.nulls_not_distinct = reader.flag()?;
         }
     }
+    // A version 11 table has no flag, and `false` is what it meant: `DISABLE TRIGGER` was `0A000`
+    // until version 12, so no table written before it could have been disabled.
+    let triggers_disabled = reader.version >= 12 && reader.flag()?;
     reader.finish()?;
 
     Ok(TableDef {
@@ -1054,6 +1063,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
         sequences: Vec::new(),
         checks,
         foreign_keys,
+        triggers_disabled,
     })
 }
 

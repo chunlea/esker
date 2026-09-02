@@ -98,39 +98,7 @@ pub(super) fn create_table(
         (columns, primary_key, name)
     };
 
-    let key_position = |name: &String| {
-        columns
-            .iter()
-            .position(|column: &ColumnDef| &column.name == name)
-            .ok_or_else(|| SqlError::UndefinedColumnInKey(name.clone()))
-    };
-    let mut indexes = Vec::with_capacity(create.unique.len());
-    for constraint in &create.unique {
-        let ordinals = constraint
-            .columns
-            .iter()
-            .map(key_position)
-            .collect::<Result<Vec<_>>>()?;
-        indexes.push(IndexDef {
-            id: catalog::allocate_id(txn, executor.tenant)?,
-            name: constraint
-                .name
-                .clone()
-                .unwrap_or_else(|| plan::unique_constraint_name(&create.name, &constraint.columns)),
-            unique: true,
-            keys: ordinals.into_iter().map(IndexKey::column).collect(),
-            // A `UNIQUE` constraint's grammar takes `NULLS NOT DISTINCT` on a real server; this
-            // node refuses the clause there (`parse::lower`), so a constraint's index never has
-            // it and the default is the truth rather than a placeholder.
-            nulls_not_distinct: false,
-            // Born public. Nothing predates a `UNIQUE` declared with the table, so there is no
-            // interleaving for the states to protect: the ADR's whole argument is about rows and
-            // writers that already exist (`docs/plans/phase-6e.md` §2).
-            state: catalog::SchemaState::Public,
-            state_since: 1,
-            predicate: None,
-        });
-    }
+    let indexes = unique_indexes(executor, txn, create, &columns)?;
 
     let table_id = catalog::allocate_id(txn, executor.tenant)?;
     let sequences = sequences_for(executor, txn, create, table_id)?;
@@ -141,8 +109,10 @@ pub(super) fn create_table(
         primary_key,
         indexes,
         checks: create.checks.clone(),
-        // Filled below: resolving one needs the table it is on, which is this value.
+        // Filled below: resolving one needs the table it is on, which is this value. A new
+        // table's checks are on; `DISABLE TRIGGER` is a statement of its own.
         foreign_keys: Vec::new(),
+        triggers_disabled: false,
         primary_key_name,
         // A table starts at schema version 1; `ALTER TABLE ADD COLUMN` moves it.
         schema_version: 1,
@@ -280,6 +250,72 @@ fn add_foreign_key(
         &[],
     );
     Ok(())
+}
+
+/// The index behind each `UNIQUE` declared with the table.
+///
+/// Every one is born **public**. Nothing predates a `UNIQUE` declared with the table, so there is
+/// no interleaving for the schema states to protect — the ADR's whole argument is about rows and
+/// writers that already exist (`docs/plans/phase-6e.md` §2).
+fn unique_indexes(
+    executor: &Executor,
+    txn: &mut dyn Txn,
+    create: &CreateTable,
+    columns: &[ColumnDef],
+) -> Result<Vec<IndexDef>> {
+    let key_position = |name: &String| {
+        columns
+            .iter()
+            .position(|column: &ColumnDef| &column.name == name)
+            .ok_or_else(|| SqlError::UndefinedColumnInKey(name.clone()))
+    };
+    let mut indexes = Vec::with_capacity(create.unique.len());
+    for constraint in &create.unique {
+        let ordinals = constraint
+            .columns
+            .iter()
+            .map(key_position)
+            .collect::<Result<Vec<_>>>()?;
+        indexes.push(IndexDef {
+            id: catalog::allocate_id(txn, executor.tenant)?,
+            name: constraint
+                .name
+                .clone()
+                .unwrap_or_else(|| plan::unique_constraint_name(&create.name, &constraint.columns)),
+            unique: true,
+            keys: ordinals.into_iter().map(IndexKey::column).collect(),
+            // A `UNIQUE` constraint's grammar takes `NULLS NOT DISTINCT` on a real server; this
+            // node refuses the clause there (`parse::lower`), so a constraint's index never has
+            // it and the default is the truth rather than a placeholder.
+            nulls_not_distinct: false,
+            state: catalog::SchemaState::Public,
+            state_since: 1,
+            predicate: None,
+        });
+    }
+    Ok(indexes)
+}
+
+/// `ALTER TABLE … ENABLE`/`DISABLE TRIGGER ALL`.
+///
+/// One flag on the table, written the way every other constraint change is written — and it
+/// **does not bump the schema version**, for the reason retention does not: no row is written or
+/// read differently because of it, so no node's cached row schema is stale. What it changes is
+/// which checks run, and those are read from the table record each statement asks for.
+///
+/// `ENABLE` on a table that was never disabled is a write of the value it already has. That is
+/// what a real server does too — `ALTER TABLE … ENABLE TRIGGER ALL` on an untouched table is a
+/// plain success — and it is the shape `ActiveRecord` emits: `disable_referential_integrity`
+/// re-enables every table it named, whether or not it changed any of them.
+fn set_triggers_disabled(
+    txn: &mut dyn Txn,
+    executor: &Executor,
+    table: &TableDef,
+    updated: &mut TableDef,
+    disabled: bool,
+) -> Result<()> {
+    updated.triggers_disabled = disabled;
+    catalog::replace_table(txn, executor.tenant, table, updated)
 }
 
 /// `ALTER TABLE … SET (columnar_replicas = n | DEFAULT)`.
@@ -463,11 +499,16 @@ pub(super) fn drop_table(
             }
         };
         // **A table something references cannot be dropped**, and `2BP01` names the constraint
-        // that stops it. `DROP … CASCADE` is what removes the constraint with it and is `0A000`
-        // here, so this is the whole of the answer rather than half of it.
+        // that stops it — unless `CASCADE`, which takes the constraint with the table instead.
+        // `RESTRICT` is the default and the same thing as writing nothing; measured, both.
         //
-        // A self-reference does not count: dropping the table takes its own constraint with it,
-        // which is what a real server does too.
+        // What cascades is the **constraint**, not the child: a real server drops
+        // `constraint tc_p_fkey on table tc` and leaves `tc` and every one of its rows exactly
+        // where they were. Measured — the rows are still there afterwards and `pg_constraint` has
+        // one fewer entry.
+        //
+        // A self-reference does not count in either direction: dropping the table takes its own
+        // constraint with it, which is what a real server does too.
         let (start, end) = catalog::foreign_key_backref_range(executor.tenant, table.id);
         for (key, _) in txn.scan(&start, &end, 0)? {
             let child_id = catalog::foreign_key_backref_child(executor.tenant, table.id, &key)?;
@@ -482,13 +523,25 @@ pub(super) fn drop_table(
             else {
                 continue;
             };
-            return Err(SqlError::DependentTable {
-                relation: table.name.clone(),
-                detail: format!(
-                    "constraint {} on table {} depends on table {}",
-                    constraint.name, child.name, table.name
-                ),
-            });
+            if !drop.cascade {
+                return Err(SqlError::DependentTable {
+                    relation: table.name.clone(),
+                    detail: format!(
+                        "constraint {} on table {} depends on table {}",
+                        constraint.name, child.name, table.name
+                    ),
+                });
+            }
+            // Every constraint of this child that points here, not only the first: a child may
+            // hold two (`CONSTRAINT c1 … REFERENCES p, CONSTRAINT c2 … REFERENCES p`), and
+            // leaving the second behind would leave the child referring to a table that is gone.
+            let mut without = (*child).clone();
+            without
+                .foreign_keys
+                .retain(|constraint| constraint.parent != table.id);
+            without.schema_version += 1;
+            catalog::replace_table(txn, executor.tenant, &child, &without)?;
+            txn.delete(&key);
         }
         // Its own back-references go with it: this table as a **child** is a key under every
         // parent it points at, and a parent that outlives it must not be told it is still
@@ -963,6 +1016,10 @@ pub(super) fn alter_table(
         }
         if let AlterTableAction::SetColumnarReplicas { replicas } = action {
             set_columnar_replicas(txn, executor, &updated, *replicas)?;
+            continue;
+        }
+        if let AlterTableAction::SetTriggersDisabled { disabled } = action {
+            set_triggers_disabled(txn, executor, &table, &mut updated, *disabled)?;
             continue;
         }
         let AlterTableAction::AddColumn {

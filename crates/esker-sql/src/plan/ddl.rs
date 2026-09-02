@@ -93,6 +93,16 @@ pub struct DropTable {
     pub names: Vec<String>,
     /// `IF EXISTS`: a missing table is a notice rather than a `42P01`.
     pub if_exists: bool,
+    /// `CASCADE`: take the dependent objects with it instead of refusing.
+    ///
+    /// One flag and not two, because `RESTRICT` **is** the default — `DROP TABLE t` and
+    /// `DROP TABLE t RESTRICT` are the same statement and both are `2BP01` when something depends
+    /// on the table. Measured, both spellings.
+    ///
+    /// `CASCADE` and `IF EXISTS` are **independent**: `DROP TABLE IF EXISTS x CASCADE` on a table
+    /// that never existed is a plain success, and without `IF EXISTS` it is `42P01` whatever
+    /// `CASCADE` says.
+    pub cascade: bool,
 }
 
 /// One part of a `CREATE INDEX` key, before the table is known.
@@ -201,6 +211,10 @@ pub struct DropIndex {
     pub concurrently: bool,
     /// `IF EXISTS`.
     pub if_exists: bool,
+    /// `CASCADE`, accepted and with nothing to do: **nothing depends on an index** here. A real
+    /// server takes the word too and drops the same index, which is why it is carried rather than
+    /// refused — the answer is identical and refusing would be inventing a difference.
+    pub cascade: bool,
 }
 
 /// `<table>_pkey`, PostgreSQL's name for an unnamed primary key constraint.
@@ -380,6 +394,29 @@ pub enum AlterTableAction {
     /// The parent is named rather than resolved: nothing can turn `author_addresses` into a table
     /// id until the catalog has been read, and the executor is where that happens once.
     AddForeignKey(ForeignKey),
+    /// `ENABLE`/`DISABLE TRIGGER ALL` — and it is **not** a no-op on a node with no triggers.
+    ///
+    /// `ALL` includes PostgreSQL's *internal* foreign-key triggers, which is why a real server
+    /// requires superuser for it and why `ActiveRecord` writes it around every fixture load:
+    /// `disable_referential_integrity` is this statement, and the point of it is to insert rows
+    /// whose parents are not there yet. Measured on PostgreSQL 19, all four halves:
+    ///
+    /// * with the **child's** triggers disabled, an `INSERT` naming a parent row that does not
+    ///   exist **succeeds**;
+    /// * with the **parent's** disabled, a `DELETE` of a referenced row succeeds and leaves the
+    ///   child pointing at nothing;
+    /// * disabling the *parent's* does **not** suspend the child's insert check, because the two
+    ///   triggers live on different tables;
+    /// * `USER` suspends none of it — an `INSERT` under `DISABLE TRIGGER USER` is still `23503`.
+    ///
+    /// So this carries whether it was `ALL`, and `USER` is accepted with nothing to record. A
+    /// named trigger is `42704` where it is lowered: this node has none to name.
+    SetTriggersDisabled {
+        /// Whether the table's checks are suspended from here on. Stored on the table, because
+        /// PostgreSQL's is stored too — `pg_trigger.tgenabled` outlives the transaction that set
+        /// it and every session sees it.
+        disabled: bool,
+    },
     /// `SET (retention = '7d' | 'forever' | DEFAULT)` — how far back this table can be read.
     ///
     /// A storage parameter, which is PostgreSQL's own shape for a per-table knob and one this

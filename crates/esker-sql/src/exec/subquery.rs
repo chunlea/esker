@@ -223,6 +223,7 @@ fn plan_derived(
         sequences: Vec::new(),
         checks: Vec::new(),
         foreign_keys: Vec::new(),
+        triggers_disabled: false,
     }));
     // Wrapped rather than used bare, so `EXPLAIN` has a node to change the relation's name at:
     // the plan text threads one table name down the whole tree, and without this a scan of `dt_a`

@@ -146,6 +146,14 @@ impl Relations {
         self.rows.iter().filter(move |row| row.kind == kind)
     }
 
+    /// Every table definition, in id order — for the views whose answer about one relation is a
+    /// property of **all** of them. `pg_class.relhastriggers` is the first: a table is either side
+    /// of a foreign key, and the referenced side is not written down on the table that is
+    /// referenced.
+    pub fn tables(&self) -> impl Iterator<Item = &TableDef> {
+        self.tables.values()
+    }
+
     /// The table a row belongs to. `None` only for a record that names a table with no definition,
     /// which [`Relations::read`] already refused to build.
     #[must_use]

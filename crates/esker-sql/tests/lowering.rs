@@ -78,7 +78,15 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
         ),
         ("CREATE TABLE t (a int8[])", "the type"),
         ("CREATE TABLE s.t (a int8)", "the qualified name"),
-        ("DROP TABLE t CASCADE", "DROP ... CASCADE"),
+        // `CASCADE` is built and `DROP ... PURGE` is Oracle's, which PostgreSQL does not take
+        // either — so it is the one `DROP` clause left to name.
+        ("DROP TABLE t PURGE", "DROP ... PURGE"),
+        // The **simple** form of `CASE`. The searched form runs; this one prints back as
+        // `CASE x WHEN 1 THEN …`, so desugaring it would store a definition nobody wrote.
+        (
+            "SELECT CASE a WHEN 1 THEN 'x' END FROM t",
+            "CASE <expression> WHEN ..., the simple form",
+        ),
         ("CREATE INDEX i ON t USING hash (a)", "an index USING"),
         (
             "CREATE INDEX i ON t (a) INCLUDE (b)",

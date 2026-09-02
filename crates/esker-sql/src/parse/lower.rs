@@ -75,10 +75,11 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
             temporary,
             ..
         } => {
-            refuse_if(*cascade, "DROP ... CASCADE")?;
-            refuse_if(*restrict, "DROP ... RESTRICT")?;
             refuse_if(*purge, "DROP ... PURGE")?;
             refuse_if(*temporary, "DROP TEMPORARY")?;
+            // `RESTRICT` is the default and needs no flag of its own: written or not, a dependent
+            // object is `2BP01`. Measured, both spellings.
+            let _ = *restrict;
             let names = names
                 .iter()
                 .map(relation_name)
@@ -87,6 +88,7 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
                 ObjectType::Table => plan::Statement::DropTable(plan::DropTable {
                     names,
                     if_exists: *if_exists,
+                    cascade: *cascade,
                 }),
                 ObjectType::Index => plan::Statement::DropIndex(plan::DropIndex {
                     names,
@@ -97,6 +99,7 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
                     // to prevent.
                     concurrently: false,
                     if_exists: *if_exists,
+                    cascade: *cascade,
                 }),
                 other => return Err(SqlError::unsupported(format!("DROP {other}"))),
             })
@@ -892,6 +895,13 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
             actions.push(lower_added_constraint(&table_name, constraint)?);
             continue;
         }
+        if let AlterTableOperation::DisableTrigger { name }
+        | AlterTableOperation::EnableTrigger { name } = operation
+        {
+            let disabled = matches!(operation, AlterTableOperation::DisableTrigger { .. });
+            actions.push(lower_trigger_state(&table_name, name, disabled)?);
+            continue;
+        }
         let AlterTableOperation::AddColumn {
             column_keyword: _,
             if_not_exists,
@@ -1034,6 +1044,41 @@ fn lower_table_constraints(
         }
     }
     Ok(())
+}
+
+/// `ENABLE`/`DISABLE TRIGGER [ ALL | USER | <name> ]`.
+///
+/// `sqlparser` hands all three spellings back as an `Ident`, because `ALL` and `USER` are keywords
+/// only in this position. Unquoted is what makes them keywords here, exactly as it does for
+/// `DEFAULT` and `current_schema` above: `"ALL"` in quotes is a trigger called `ALL` and is
+/// `42704` with the rest.
+///
+/// * **`ALL`** is the one that does something. It covers the internal foreign-key triggers, so it
+///   suspends this table's referential checks until it is enabled again — measured, and the whole
+///   reason `ActiveRecord` writes it ([`plan::AlterTableAction::SetTriggersDisabled`]).
+/// * **`USER`** covers only triggers a user created, of which this node has none, so it is
+///   accepted and records nothing. Measured: an `INSERT` under it is still `23503` on a real
+///   server, so accepting it and suspending the checks would be a **wrong answer** rather than a
+///   generous one.
+/// * **A name** is `42704`, naming the trigger and the table the way PostgreSQL does. There are no
+///   triggers here to name, so every name is missing.
+fn lower_trigger_state(
+    table: &str,
+    name: &Ident,
+    disabled: bool,
+) -> Result<plan::AlterTableAction> {
+    let keyword = |word: &str| name.quote_style.is_none() && name.value.eq_ignore_ascii_case(word);
+    if keyword("all") {
+        return Ok(plan::AlterTableAction::SetTriggersDisabled { disabled });
+    }
+    if keyword("user") {
+        // Accepted, and it records nothing: there are no user triggers to enable or disable.
+        return Ok(plan::AlterTableAction::SetTriggersDisabled { disabled: false });
+    }
+    Err(SqlError::UndefinedTrigger {
+        trigger: ident(name),
+        table: table.to_owned(),
+    })
 }
 
 /// Which kind of constraint an `ADD CONSTRAINT` names, for the refusal that follows.

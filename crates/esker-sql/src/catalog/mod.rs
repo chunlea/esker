@@ -605,6 +605,18 @@ pub struct TableDef {
     /// ([`foreign_key_backref_range`]), so a parent's delete costs a short prefix
     /// scan rather than a scan of the whole catalog.
     pub foreign_keys: Vec<ForeignKeyDef>,
+    /// Whether `ALTER TABLE … DISABLE TRIGGER ALL` has suspended this table's referential checks.
+    ///
+    /// **Stored, because PostgreSQL's is stored**: `pg_trigger.tgenabled` outlives the transaction
+    /// that set it and every session sees it, so a flag kept beside the connection would leave a
+    /// second client enforcing what the first one turned off.
+    ///
+    /// It suspends the checks *attached to this table*, which is not the same as the checks this
+    /// table is named in. A foreign key has two internal triggers, one on the child and one on the
+    /// parent; disabling the child's lets a row in with no parent, disabling the parent's lets a
+    /// referenced row be deleted, and neither does the other's job. Measured on PostgreSQL 19, all
+    /// four combinations ([`crate::plan::AlterTableAction::SetTriggersDisabled`]).
+    pub triggers_disabled: bool,
 }
 
 /// One `FOREIGN KEY` constraint, held by the **child** — the table whose rows must point at
@@ -1828,6 +1840,7 @@ mod tests {
             sequences: Vec::new(),
             checks: Vec::new(),
             foreign_keys: Vec::new(),
+            triggers_disabled: false,
         }
     }
 
@@ -1848,7 +1861,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "0b",               // catalog format version
+                "0c",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -1900,7 +1913,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "0b",                 // catalog format version
+                "0c",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -1939,6 +1952,7 @@ mod tests {
                 "00", // version 9: ascending, with its NULLs where ascending puts them
                 "00", // version 10: no FOREIGN KEY constraints
                 "00", // version 11: the one index is not NULLS NOT DISTINCT
+                "00", // version 12: its triggers have not been disabled
             )
         );
         assert_eq!(record::decode_table(&encoded).unwrap(), accounts(7));
@@ -2891,7 +2905,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "0b",               // catalog format version
+                "0c",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

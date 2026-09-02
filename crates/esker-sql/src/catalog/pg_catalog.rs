@@ -206,13 +206,14 @@ impl CatalogView {
                 ("rngtypid", ColumnType::Int8),
                 ("rngsubtype", ColumnType::Int8),
             ],
-            // Exactly the four `ActiveRecord` reads. `relname` and `nspname` are `name` on a real
+            // Exactly the five `ActiveRecord` reads. `relname` and `nspname` are `name` on a real
             // server — the 64-byte identifier type — and `text` here, which compares identically.
             CatalogView::PgClass => &[
                 ("oid", ColumnType::Int8),
                 ("relname", ColumnType::Text),
                 ("relnamespace", ColumnType::Int8),
                 ("relkind", ColumnType::Text),
+                ("relhastriggers", ColumnType::Bool),
             ],
             CatalogView::PgNamespace => &[("oid", ColumnType::Int8), ("nspname", ColumnType::Text)],
             // In PostgreSQL's own order, restricted to what this node has — `SELECT *` expands in
@@ -364,6 +365,7 @@ impl CatalogView {
                         sequences: Vec::new(),
                         checks: Vec::new(),
                         foreign_keys: Vec::new(),
+                        triggers_disabled: false,
                     })
                 })
                 .collect()
@@ -430,6 +432,15 @@ const PUBLIC_SCHEMA: &str = "public";
 /// column before phase 13; every statement in the schema-dump path joins on it.
 fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
     let relations = super::pg_relations::Relations::read(txn, tenant)?;
+    // **`relhastriggers` is `t` for either side of a foreign key**, because a foreign key *is* two
+    // internal triggers — one on the child and one on the parent. Measured: a table with no
+    // constraint at all is `f`, the child is `t` and the parent is `t`. So the referenced side has
+    // to be collected, and it is collected here in one pass over every table rather than by a
+    // back-reference scan per row, since `Relations` already holds them all.
+    let referenced: std::collections::BTreeSet<u64> = relations
+        .tables()
+        .flat_map(|table| table.foreign_keys.iter().map(|key| key.parent))
+        .collect();
     // By name, which is the order the scan already returns them in and the order a reader can
     // predict. PostgreSQL promises no order without an `ORDER BY`; a deterministic one is a
     // superset of that promise, as `pg_type`'s rows are.
@@ -441,6 +452,15 @@ fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
                 Datum::Text(relation.name.clone()),
                 Datum::Int8(PUBLIC_NAMESPACE_OID),
                 Datum::Text(relation.kind.relkind().to_owned()),
+                // Only a **table** has them: an index over a table with a foreign key is `f` on a
+                // real server, and the index's row here names that table.
+                Datum::Bool(
+                    relation.kind == super::pg_relations::RelKind::Table
+                        && (referenced.contains(&relation.table_id)
+                            || relations
+                                .table(relation)
+                                .is_some_and(|table| !table.foreign_keys.is_empty())),
+                ),
             ]
         })
         .collect())

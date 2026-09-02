@@ -136,6 +136,20 @@ pub enum SqlError {
     #[error("table \"{0}\" does not exist")]
     UndefinedTableForDrop(String),
 
+    /// `ALTER TABLE t DISABLE TRIGGER x` naming a trigger that is not there.
+    ///
+    /// `42704 undefined_object`, and PostgreSQL names **both** the trigger and the table it looked
+    /// on, which is the useful half — a trigger name is unique per table, not per schema, so the
+    /// name alone would not say where it was looked for. This node has no triggers at all, so
+    /// every name reaches this; `ALL` and `USER` are keywords in that position and do not.
+    #[error("trigger \"{trigger}\" for table \"{table}\" does not exist")]
+    UndefinedTrigger {
+        /// The trigger named.
+        trigger: String,
+        /// The table it was looked for on.
+        table: String,
+    },
+
     /// A write to a `pg_catalog` relation, which is computed here and read-only everywhere.
     ///
     /// The sentence is a real server's, measured: `DROP TABLE pg_type`, `ALTER TABLE pg_type ADD
@@ -1008,7 +1022,9 @@ impl SqlError {
             SqlError::AmbiguousColumn(_) | SqlError::AmbiguousOrderBy(_) => {
                 sqlstate::AMBIGUOUS_COLUMN
             }
-            SqlError::UndefinedIndex(_) | SqlError::UndefinedType(_) => sqlstate::UNDEFINED_OBJECT,
+            SqlError::UndefinedIndex(_)
+            | SqlError::UndefinedType(_)
+            | SqlError::UndefinedTrigger { .. } => sqlstate::UNDEFINED_OBJECT,
             SqlError::SystemCatalog(_) => sqlstate::INSUFFICIENT_PRIVILEGE,
             SqlError::WrongObjectType { .. } | SqlError::AlterActionOnWrongObject { .. } => {
                 sqlstate::WRONG_OBJECT_TYPE
