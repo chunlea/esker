@@ -1,0 +1,23 @@
+docs/DESIGN.md
+  s_ed1cd635740377::t_2d9468b2eb0f82 911-944
+docs/adr/0022-columnar-learner-replica.md
+  s_ed1cd635740377::t_e5bc699f5a82be 3-8,75-83,134-142,288
+docs/adr/0040-the-engine-a-query-runs-on.md
+  s_ed1cd635740377::t_d9e4b4346243ce 1-174
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "460f2f4b6f5f8300d75ef5d35584dd8f7af7ffda",
+  "prompts": {},
+  "sessions": {
+    "s_ed1cd635740377": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "19199d55-8453-4673-a0ab-b13f22806878",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
