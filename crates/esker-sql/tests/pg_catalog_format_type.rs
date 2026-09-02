@@ -35,12 +35,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
     answers: &[
         (
-            "SELECT format_type(1082, NULL), format_type(1700, NULL), format_type(2950, NULL)",
-            "`date`, `numeric` and `uuid` are three types this node does not have, so it has no \
-             `pg_type` row for their OIDs and answers `???` — which is what a real server answers \
-             for an OID **it** has no row for. Tier 2 closes these three.",
-        ),
-        (
             "SELECT format_type(26, NULL), format_type(19, NULL), format_type(2206, NULL)",
             "the same, for the three types this node deliberately does not have: `oid`, `name` and \
              `regtype` are the ones `pg_catalog`'s own columns are declared as on a real server, \

@@ -225,8 +225,9 @@ timestamp — its arithmetic answers different types and it prints without a tim
 spellings and two readings of one literal), `time` (**landed**: eight bytes, microseconds since
 midnight, tag 17 — a range **closed at both ends**, so `24:00:00` is a value and three inputs
 reach it, and its own comparison family because `time = timestamp` is `42883` where
-`date = timestamp` is an operator), `numeric(p, s)` (**landed**, ADR 0045), `uuid`, `json` /
-`jsonb`,
+`date = timestamp` is an operator), `numeric(p, s)` (**landed**, ADR 0045), `uuid` (**landed**: sixteen fixed bytes, tag 18 — five
+spellings read as one value where only one is ever written, and `min`/`max` refuse it although
+`<` and `ORDER BY` work, which is the `min(boolean)` rule a second time), `json` / `jsonb`,
 `interval`, and **arrays** (`text[]` and `integer[]` columns *and* `= ANY($1)`, which
 `ActiveRecord` uses for every `IN` with binds — four of its 36 boot statements). Two of them carry
 the hard part: `numeric`'s text parity, because PostgreSQL prints the *declared* scale exactly and

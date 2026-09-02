@@ -138,6 +138,8 @@ const TAG_DATE: u8 = 15;
 const TAG_NUMERIC: u8 = 16;
 /// `time` without time zone.
 const TAG_TIME: u8 = 17;
+/// `uuid`.
+const TAG_UUID: u8 = 18;
 
 /// Tags for [`SchemaState`] as stored. Ours, and they must never move: an index read as the wrong
 /// state is an index a node writes when it should not, which is the whole failure ADR 0020 is about.
@@ -190,6 +192,7 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Date => TAG_DATE,
         ColumnType::Numeric => TAG_NUMERIC,
         ColumnType::Time => TAG_TIME,
+        ColumnType::Uuid => TAG_UUID,
     }
 }
 
@@ -234,6 +237,7 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_DATE => ColumnType::Date,
         TAG_NUMERIC => ColumnType::Numeric,
         TAG_TIME => ColumnType::Time,
+        TAG_UUID => ColumnType::Uuid,
         other => return Err(corrupt(format!("column type tag {other}"))),
     })
 }

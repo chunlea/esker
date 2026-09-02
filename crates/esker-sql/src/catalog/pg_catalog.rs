@@ -251,6 +251,14 @@ impl CatalogView {
                 // difference in the schema model and not in this column
                 // (`PUBLIC_NAMESPACE_OID`).
                 ("typnamespace", ColumnType::Int8),
+                // **Last again**, and for the third time the reason is `SELECT *`'s order. Two
+                // columns three captures wanted and none of them could get: `typlen` is the
+                // width in bytes, `-1` for a varlena, and `typcategory` is PostgreSQL's coarse
+                // grouping. Both are derived — the width from `PgType::type_len`, the category
+                // from a match a new type has to answer — so neither can drift from the type it
+                // describes.
+                ("typlen", ColumnType::Int2),
+                ("typcategory", ColumnType::Text),
             ],
             // No `oid`: see the module note. It is what keeps `ON oid = rngtypid` unambiguous.
             CatalogView::PgRange => &[
@@ -385,6 +393,8 @@ impl CatalogView {
                             // The one namespace this node has, the same one every relation
                             // reports.
                             Datum::Int8(PUBLIC_NAMESPACE_OID),
+                            Datum::Int2(ty.type_len()),
+                            Datum::Text(typcategory(*ty).to_owned()),
                         ]
                     })
                     .collect();
@@ -622,6 +632,30 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::Date => "date",
         ColumnType::Numeric => "numeric",
         ColumnType::Time => "time",
+        ColumnType::Uuid => "uuid",
+    }
+}
+
+/// `pg_type.typcategory`: PostgreSQL's coarse grouping of types, one character each.
+///
+/// Measured on 19beta1 for all eighteen rather than reasoned about, because the groupings are not
+/// what a reader would guess: `bytea` is `U` (user-defined) and not `S` (string), a `uuid` is `U`
+/// too, and all three datetime types are `D` while an `interval` is `T`. An exhaustive match, so
+/// a type added here has to answer instead of inheriting somebody else's letter.
+fn typcategory(ty: ColumnType) -> &'static str {
+    match ty {
+        ColumnType::Int8
+        | ColumnType::Int4
+        | ColumnType::Int2
+        | ColumnType::Double
+        | ColumnType::Real
+        | ColumnType::Numeric => "N",
+        ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => "S",
+        ColumnType::Bool => "B",
+        ColumnType::Timestamp | ColumnType::TimestampTz | ColumnType::Date | ColumnType::Time => {
+            "D"
+        }
+        ColumnType::Bytea | ColumnType::Json | ColumnType::Jsonb | ColumnType::Uuid => "U",
     }
 }
 
@@ -650,5 +684,6 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::Date => "date_in",
         ColumnType::Numeric => "numeric_in",
         ColumnType::Time => "time_in",
+        ColumnType::Uuid => "uuid_in",
     }
 }

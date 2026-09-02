@@ -35,6 +35,7 @@ pub(crate) mod json;
 pub mod numeric;
 pub mod time;
 mod timestamp;
+pub mod uuid;
 /// Arrays as the catalog holds them: text, read by the operators (`vector::Array`).
 pub mod vector;
 
@@ -354,6 +355,7 @@ fn takes_typmod(ty: ColumnType) -> bool {
         | ColumnType::Bytea
         | ColumnType::Double
         | ColumnType::Real
+        | ColumnType::Uuid
         | ColumnType::Date => false,
     }
 }
@@ -456,6 +458,7 @@ impl PgType for ColumnType {
             ColumnType::Date => 1082,
             ColumnType::Numeric => 1700,
             ColumnType::Time => 1083,
+            ColumnType::Uuid => 2950,
         }
     }
 
@@ -478,6 +481,7 @@ impl PgType for ColumnType {
             ColumnType::Date => "date",
             ColumnType::Numeric => "numeric",
             ColumnType::Time => "time without time zone",
+            ColumnType::Uuid => "uuid",
         }
     }
 
@@ -486,6 +490,8 @@ impl PgType for ColumnType {
             ColumnType::Bool => 1,
             ColumnType::Int4 | ColumnType::Real | ColumnType::Date => 4,
             ColumnType::Int2 => 2,
+            // Sixteen fixed bytes, which is what `pg_type.typlen` says.
+            ColumnType::Uuid => 16,
             ColumnType::Int8
             | ColumnType::TimestampTz
             | ColumnType::Timestamp
@@ -585,6 +591,7 @@ impl PgDatum for Datum {
             Datum::Real(v) => float::to_text_f32(*v),
             Datum::Date(v) => date::to_text(*v),
             Datum::Time(v) => time::to_text(*v),
+            Datum::Uuid(v) => uuid::to_text(v),
             Datum::Numeric(v) => numeric::to_text(v),
         })
     }
@@ -617,6 +624,7 @@ impl PgDatum for Datum {
             // start timestamp, which is the only clock this crate is allowed to read (DESIGN §6).
             ColumnType::Date => Datum::Date(date::from_text(text, 0)?),
             ColumnType::Time => Datum::Time(time::from_text(text)?),
+            ColumnType::Uuid => Datum::Uuid(uuid::from_text(text)?),
             ColumnType::Numeric => Datum::Numeric(numeric::from_text(text)?),
         })
     }
@@ -627,6 +635,9 @@ impl PgDatum for Datum {
             // base-10000 digit groups (`numeric_send(1.5)` is `\x000200000000000100011388`) —
             // nothing here has ever sent or read that shape, so it is refused rather than
             // guessed. See the contract above for why the two share one answer.
+            // A uuid's binary form is its sixteen bytes, which is what `uuid_send` writes —
+            // the same bytes the row holds, in the same order.
+            Datum::Uuid(v) => v.to_vec(),
             Datum::Null | Datum::Numeric(_) => return None,
             // A `time` joins them: `time_send` is the microsecond count as eight big-endian
             // bytes, measured with `COPY ... (FORMAT binary)` — `12:34:56` is `0x0a8bda1c00`
@@ -689,6 +700,10 @@ impl PgDatum for Datum {
                 return Err(SqlError::unsupported(
                     "a numeric parameter in the binary format",
                 ));
+            }
+            ColumnType::Uuid => {
+                let head: [u8; 16] = fixed(16)?.try_into().unwrap_or([0; 16]);
+                Datum::Uuid(head)
             }
             ColumnType::Int2 => {
                 let head: [u8; 2] = fixed(2)?.try_into().unwrap_or([0; 2]);
@@ -779,6 +794,8 @@ impl PgDatum for Datum {
                 Datum::Double(f64::from(*a)).pg_cmp(&Datum::Double(numeric::as_f64(b)))
             }
             (Datum::Int4(a), Datum::Int4(b)) | (Datum::Date(a), Datum::Date(b)) => a.cmp(b),
+            // `uuid_cmp` is a `memcmp`, so this is the type's whole ordering.
+            (Datum::Uuid(a), Datum::Uuid(b)) => a.cmp(b),
             (Datum::Int2(a), Datum::Int2(b)) => a.cmp(b),
             (Datum::Int2(a), Datum::Int4(b)) => i32::from(*a).cmp(b),
             (Datum::Int4(a), Datum::Int2(b)) => a.cmp(&i32::from(*b)),
@@ -815,6 +832,8 @@ fn variant_rank(value: &Datum) -> u8 {
         Datum::Double(_) | Datum::Real(_) => 2,
         Datum::TimestampTz(_) | Datum::Timestamp(_) | Datum::Date(_) => 3,
         Datum::Numeric(_) => 7,
+        // Its own rank: a uuid compares with a uuid and with nothing else.
+        Datum::Uuid(_) => 9,
         // Its own rank, because it is its own family: a `time` compares with a `time` and with
         // nothing else, so this rank exists to give the cross-type order a total answer rather
         // than to describe an operator a real server has.

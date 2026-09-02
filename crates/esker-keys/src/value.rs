@@ -173,11 +173,17 @@ pub enum ColumnType {
     /// PostgreSQL's rule, not a rounding artefact, and it is why nothing may assume a time is
     /// strictly less than a day.
     Time,
+    /// PostgreSQL's `uuid`: **sixteen fixed bytes**, and nothing about them is a number.
+    ///
+    /// Its order is its bytes' order, which is what lets an index key hold one unchanged. Its
+    /// *text* is far more permissive on the way in than on the way out — five spellings read as
+    /// one value — but that is `esker-sql`'s business; here it is sixteen bytes.
+    Uuid,
 }
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 17] = [
+    pub const ALL: [ColumnType; 18] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -195,6 +201,7 @@ impl ColumnType {
         ColumnType::Date,
         ColumnType::Numeric,
         ColumnType::Time,
+        ColumnType::Uuid,
     ];
 }
 
@@ -243,6 +250,8 @@ pub enum Datum {
     /// [`ColumnType::Time`], in microseconds since midnight. `86_400_000_000` — `24:00:00` — is a
     /// value and not an overflow.
     Time(i64),
+    /// [`ColumnType::Uuid`], as the sixteen bytes it is.
+    Uuid([u8; 16]),
 }
 
 impl PartialEq for Datum {
@@ -259,6 +268,7 @@ impl PartialEq for Datum {
             (Datum::Numeric(a), Datum::Numeric(b)) => a == b,
             (Datum::Int2(a), Datum::Int2(b)) => a == b,
             (Datum::Timestamp(a), Datum::Timestamp(b)) | (Datum::Time(a), Datum::Time(b)) => a == b,
+            (Datum::Uuid(a), Datum::Uuid(b)) => a == b,
             (Datum::Text(a), Datum::Text(b)) => a == b,
             (Datum::Bool(a), Datum::Bool(b)) => a == b,
             (Datum::Bytea(a), Datum::Bytea(b)) => a == b,
@@ -283,6 +293,7 @@ impl Datum {
             Datum::Int4(_) => ColumnType::Int4,
             Datum::Date(_) => ColumnType::Date,
             Datum::Time(_) => ColumnType::Time,
+            Datum::Uuid(_) => ColumnType::Uuid,
             Datum::Numeric(_) => ColumnType::Numeric,
             Datum::Int2(_) => ColumnType::Int2,
             Datum::Real(_) => ColumnType::Real,

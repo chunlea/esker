@@ -170,6 +170,7 @@ pub fn decode_column(
         | ColumnType::Json
         | ColumnType::Jsonb
         | ColumnType::Numeric
+        | ColumnType::Uuid
         | ColumnType::Bytea => {
             let run = bytes::decode(encoding, &mut cursor, present)?;
             ColumnData::Bytes {
@@ -288,6 +289,11 @@ mod tests {
             | ColumnType::Json
             | ColumnType::Jsonb => (0usize..4)
                 .prop_map(|pick| Value::Text(["", "a", "beta", "\u{1f600}"][pick].to_owned()))
+                .boxed(),
+            ColumnType::Uuid => prop::collection::vec(any::<u8>(), 16..=16)
+                .prop_map(|bytes| {
+                    Value::Uuid(<[u8; 16]>::try_from(bytes.as_slice()).unwrap_or([0; 16]))
+                })
                 .boxed(),
             ColumnType::Bytea => prop::collection::vec(any::<u8>(), 0..6)
                 .prop_map(Value::Bytea)
