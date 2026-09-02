@@ -1,0 +1,35 @@
+crates/esker-engine/src/fs/mod.rs
+  s_7a3132f4d02a00::t_ed1e33eafccbae 93-108,261-267
+crates/esker-engine/src/fs/tier.rs
+  s_7a3132f4d02a00::t_6bc508c4f30554 678-685
+crates/esker-engine/src/memfs.rs
+  s_7a3132f4d02a00::t_2d1bd87ffb65b1 185-198
+crates/esker-engine/src/testing/fault_fs.rs
+  s_7a3132f4d02a00::t_3b28d8429acccc 338-345
+crates/esker-engine/tests/version.rs
+  s_7a3132f4d02a00::t_67f00eb9fa3b9b 221-223
+crates/esker-store/src/server.rs
+  s_7a3132f4d02a00::t_ca861690a5dea9 709,833,836,852-905
+crates/esker-store/tests/retire.rs
+  s_7a3132f4d02a00::t_62c348feeca67b 13-17,39,47-65,145,279-299,376,393-397,426-437
+docs/adr/0034-a-removed-peer-is-swept-and-its-range-reclaimed.md
+  s_7a3132f4d02a00::t_34245d44d4abc4 3-4,111-137
+docs/plans/debt-c3.md
+  s_7a3132f4d02a00::t_11ea9cd88714ef 100-138
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "c062f91f6a8ffdd99409ef0e166e22e8a8441778",
+  "prompts": {},
+  "sessions": {
+    "s_7a3132f4d02a00": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "176f3779-1c8f-49ac-8e22-08bb3b8ac7c3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
