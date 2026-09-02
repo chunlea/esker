@@ -1,0 +1,41 @@
+# `pg_catalog.f(…)` — the schema-qualified spelling of a function. Boot statements 29, 31 and 32.
+#
+# Every one of these functions was already built and answering; what stopped three boot statements
+# was the **qualifier**. `SELECT pg_catalog.obj_description(c.oid, 'pg_class')` was
+# `0A000 the function pg_catalog.obj_description is not supported`, because the name a call
+# resolves by was taken with the schema still attached.
+#
+# `crate::parse::lower::relation_name` has had the same rule for relations since the rung-4 unit —
+# `pg_catalog.pg_class` is `pg_class` — and this is that rule for functions.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **The qualifier is checked, not stripped.** `public.obj_description('qf'::regclass)` is
+#     `42883 function public.obj_description(regclass) does not exist` — these functions live in
+#     `pg_catalog` and in no other schema, so a *different* qualifier must refuse. An
+#     implementation that dropped whatever schema it was given would accept a name a real server
+#     rejects, which is a wrong answer and not a gap.
+#   * **The refusal names the whole qualified spelling**, `public.obj_description(regclass)`, and
+#     not the bare one — so the message tells the user what they wrote.
+#   * **It is a keyword-style match: unquoted it folds case, and quoted it still matches**, because
+#     the schema really is called `pg_catalog` in lower case. `PG_CATALOG.` and `"pg_catalog".` are
+#     both the same function.
+#   * **The strip happens before the name is resolved**, so a function this node does not have is
+#     refused under its **bare** name: `pg_catalog.length('abc')` names `length`, which is the
+#     answer a reader can act on.
+CREATE TABLE qf (id int8 PRIMARY KEY, a int4)		-
+SELECT pg_catalog.obj_description(c.oid, 'pg_class') FROM pg_catalog.pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'qf' AND c.relkind IN ('r','p') AND n.nspname = ANY (current_schemas(false))	text	\N
+SELECT pg_catalog.pg_get_partkeydef(c.oid) FROM pg_catalog.pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'qf' AND c.relkind IN ('r','p') AND n.nspname = ANY (current_schemas(false))	text	\N
+SELECT obj_description('qf'::regclass), pg_catalog.obj_description('qf'::regclass)	text,text	\N|\N
+SELECT col_description('qf'::regclass, 1), pg_catalog.col_description('qf'::regclass, 1)	text,text	\N|\N
+SELECT pg_catalog.format_type(20, -1), format_type(20, -1)	text,text	bigint|bigint
+SELECT pg_catalog.length('abc')	integer	3
+SELECT public.obj_description('qf'::regclass)	!42883 function public.obj_description(regclass) does not exist
+SELECT pg_catalog.array_position('{a,b}'::text[], 'b')	integer	2
+SELECT PG_CATALOG.obj_description('qf'::regclass)	text	\N
+SELECT "pg_catalog".obj_description('qf'::regclass)	text	\N
+DROP TABLE qf CASCADE		-

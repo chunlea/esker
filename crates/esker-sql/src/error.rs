@@ -746,6 +746,16 @@ pub enum SqlError {
     #[error("function {0} does not exist")]
     UndefinedFunctionTypes(String),
 
+    /// A **schema-qualified** function name that names nothing: `42883`, and with **no `DETAIL`**.
+    ///
+    /// The third of the three shapes, and the one that says least. PostgreSQL's other two describe
+    /// the candidates it nearly matched — "No function of that name accepts the given argument
+    /// types." for a wrong type, "…the given number of arguments." for a wrong arity — and here
+    /// there are no candidates to describe, because the schema itself holds nothing by that name.
+    /// Measured: `public.obj_description('x'::regclass)` is one line and no more.
+    #[error("function {0} does not exist")]
+    UndefinedQualifiedFunction(String),
+
     /// A function this node has under a name but not with that signature: `42883`.
     ///
     /// PostgreSQL resolves a function by name **and** argument types, so the wrong arity is not a
@@ -1111,6 +1121,7 @@ impl SqlError {
             SqlError::UndefinedOperator { .. }
             | SqlError::UndefinedAggregate { .. }
             | SqlError::UndefinedFunction(_)
+            | SqlError::UndefinedQualifiedFunction(_)
             | SqlError::UndefinedFunctionTypes(_)
             | SqlError::UndefinedAggregateArity { .. } => sqlstate::UNDEFINED_FUNCTION,
             SqlError::ParameterlessAggregate => sqlstate::WRONG_OBJECT_TYPE,

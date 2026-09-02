@@ -132,10 +132,15 @@ const FIXTURE: &[&str] =
 /// `pg_enum`, `array_agg`, and an `ORDER BY` **inside** an aggregate's parentheses. All three
 /// landed together because the statement needs all three.
 ///
+/// **Thirty-three with boot statements 29, 31 and 32**, which wanted nothing but the
+/// **qualifier**: every function in them was already built and answering, and
+/// `pg_catalog.obj_description(…)` was refused because the name a call resolves by was taken with
+/// the schema still attached. Three statements for one rule.
+///
 /// The one that still does not run is the other half of the array surface: line 52 (`indexes()`)
 /// wants `ARRAY(SELECT …)` over `generate_subscripts`, and `c.conkey[idx]` with it. **The rows
 /// behind it are here and agree** (`tests/pg_catalog_*.rs`).
-const RUNS: usize = 31;
+const RUNS: usize = 33;
 
 #[test]
 fn every_statement_activerecord_sends_parses_and_is_answered_by_name() {

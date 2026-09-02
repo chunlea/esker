@@ -1648,7 +1648,7 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
         DuplicateTreatment, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments,
     };
 
-    let name = function.name.to_string();
+    let name = unqualified_function_name(function)?;
     // `current_schema()` is the scalar half of `current_schemas()`: one name rather than a list,
     // and `public` on this node because `public` is the only schema it has. Measured; the two are
     // together here so a reader finds both at once.
@@ -1771,6 +1771,51 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
         distinct,
         order_by,
     })))
+}
+
+/// A function's name with its `pg_catalog.` qualifier removed — and any **other** qualifier
+/// refused.
+///
+/// **Checked rather than stripped.** These functions live in `pg_catalog` and in no other schema,
+/// so `public.obj_description(…)` is `42883 function public.obj_description(regclass) does not
+/// exist` on a real server; a lowering that dropped whatever schema it was handed would answer
+/// where a real server raises, which is a wrong answer and not a gap. Measured, and the refusal
+/// keeps the spelling the user wrote.
+///
+/// Matched the way a schema name is: unquoted it folds case, and quoted it still matches, because
+/// the schema really is `pg_catalog` in lower case. The same rule [`relation_name`] has had for
+/// relations since the rung-4 unit — `pg_catalog.pg_class` is `pg_class` — applied to the other
+/// kind of name a query can qualify.
+///
+/// The strip happens **before** the name is resolved, so a function this node does not have is
+/// refused under its bare name: `pg_catalog.length('abc')` names `length`, which is what a reader
+/// can search for.
+fn unqualified_function_name(function: &sqlparser::ast::Function) -> Result<String> {
+    let parts: Option<Vec<&Ident>> = function.name.0.iter().map(|part| part.as_ident()).collect();
+    let Some([schema, name]) = parts.as_deref() else {
+        return Ok(function.name.to_string());
+    };
+    if schema.value.eq_ignore_ascii_case("pg_catalog") {
+        return Ok(ident(name));
+    }
+    Err(SqlError::UndefinedQualifiedFunction(format!(
+        "{}.{}({})",
+        ident(schema),
+        ident(name),
+        function_argument_types(function)
+    )))
+}
+
+/// The argument types a `42883` names, in the order they were written.
+fn function_argument_types(function: &sqlparser::ast::Function) -> String {
+    let sqlparser::ast::FunctionArguments::List(list) = &function.args else {
+        return String::new();
+    };
+    list.args
+        .iter()
+        .map(argument_type_name)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The clauses inside an aggregate's parentheses.
