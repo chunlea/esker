@@ -1,0 +1,93 @@
+crates/esker-columnar/src/column.rs
+  s_7a3132f4d02a00::t_46b7aae12d6b97 118-121,124,155-158,163,383,429-432,435
+crates/esker-columnar/src/encode/mod.rs
+  s_7a3132f4d02a00::t_d162c5e8818157 139,152,163,239-241,249
+crates/esker-columnar/src/fragment/codec.rs
+  s_7a3132f4d02a00::t_ab756c2700a9df 375,415-418,430
+crates/esker-columnar/src/stats.rs
+  s_7a3132f4d02a00::t_77ca711f98567e 113,116-118,252-255,259,704,712,740
+crates/esker-columnar/src/value.rs
+  s_7a3132f4d02a00::t_4215fa8d05125e 54-56,63-64,71,75,79,95-96,110-111,127,132,140-143,164-165,178-180,184,206,216,309,320,458-460,462-463,469-471,474-481,483,485-495,497,499-503,505,507-510
+crates/esker-columnar/tests/bench_scan.rs
+  s_7a3132f4d02a00::t_59c076a12418f5 63-65,114-118,134,139
+crates/esker-columnar/tests/compression.rs
+  s_7a3132f4d02a00::t_fda0ad371c41d7 55-57
+crates/esker-columnar/tests/differential.rs
+  s_7a3132f4d02a00::t_c90f08d7a0d12f 386-388,392
+crates/esker-columnar/tests/fragment_golden.rs
+  s_7a3132f4d02a00::t_3f0c8d9b1122ca 219-222,224
+crates/esker-columnar/tests/roundtrip.rs
+  s_7a3132f4d02a00::t_4de2309370ae9e 92-94,105
+crates/esker-keys/src/columnar.rs
+  s_7a3132f4d02a00::t_6e431d5e8cc85d 67-68,81-82
+crates/esker-keys/src/row.rs
+  s_7a3132f4d02a00::t_9f00701e9c3acb 122-124,268,273,291,299,414,490-493,507,930,935
+crates/esker-keys/src/value.rs
+  s_7a3132f4d02a00::t_cc5203ad353a04 72-77,84-88,95,99,103,137-140,151,173,185-192
+crates/esker-proto/src/fragment/result.rs
+  s_7a3132f4d02a00::t_25dde2eec39951 94-95,106,109,128,142,171-172,188,203-206,244-246
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_7a3132f4d02a00::t_9efc7a5efbd8c1 232,236,252,256
+crates/esker-sql/src/catalog/record.rs
+  s_7a3132f4d02a00::t_827ea81aa49e56 103-106,149-150,163-164
+crates/esker-sql/src/exec/aggregate.rs
+  s_7a3132f4d02a00::t_dfac36c74d55d9 157-160
+crates/esker-sql/src/exec/bind.rs
+  s_7a3132f4d02a00::t_f978e17b2f9992 430,434
+crates/esker-sql/src/parse/lower.rs
+  s_7a3132f4d02a00::t_360bfd3fe0fac6 1821-1826,1835-1842
+crates/esker-sql/src/plan/expr.rs
+  s_7a3132f4d02a00::t_dd740365bc21f0 409-413,433,437-440,450,457
+crates/esker-sql/src/row.rs
+  s_7a3132f4d02a00::t_313a50a02b04a2 39-40,45
+crates/esker-sql/src/value/mod.rs
+  s_7a3132f4d02a00::t_2c3e90ae22f889 74,76,86,90,99-103,178-179,188,192,200-202,222-225,230,247,263-265,295,497-500,504-507,511-514
+crates/esker-sql/src/value/timestamp.rs
+  s_7a3132f4d02a00::t_5cb12c06f04eb0 59-73,102-104,109-128,341-359
+crates/esker-sql/tests/activerecord_surface.rs
+  s_7a3132f4d02a00::t_b43c98501bc36c 67-79
+crates/esker-sql/tests/corpus/pg19_order.txt
+  s_7a3132f4d02a00::t_db44f39955fe64 20,24,26
+crates/esker-sql/tests/corpus/pg19_timestamp.txt
+  s_7a3132f4d02a00::t_42b4cb1c08e9f2 1-52
+crates/esker-sql/tests/corpus/pg19_values.txt
+  s_7a3132f4d02a00::t_12022ffab9d2db 178-186
+crates/esker-sql/tests/corpus/pg19_varchar.txt
+  s_7a3132f4d02a00::t_c6509a5426e4c7 1-54
+crates/esker-sql/tests/lowering.rs
+  s_7a3132f4d02a00::t_e45ccb76354261 81-85,87
+crates/esker-sql/tests/pg_catalog.rs
+  s_7a3132f4d02a00::t_830f36ce98cc9e 151-152,177-187
+crates/esker-sql/tests/row_order.rs
+  s_7a3132f4d02a00::t_52d74a8fae254e 68,70-74
+crates/esker-sql/tests/sequence.rs
+  s_7a3132f4d02a00::t_606fe4a4f045f8 23-26,29-30,59-67,69,71-89
+crates/esker-sql/tests/slt/unsupported.slt
+  s_7a3132f4d02a00::t_9905b894611eca 69-70,72-81
+crates/esker-sql/tests/timestamp.rs
+  s_7a3132f4d02a00::t_d8eb33fb273e09 1-175
+crates/esker-sql/tests/varchar.rs
+  s_7a3132f4d02a00::t_aa0bad7ee1bc3c 1-116
+crates/esker-store/src/columnar/decode.rs
+  s_7a3132f4d02a00::t_67c33950bdfd0d 169,174,189
+crates/esker-store/src/columnar/wire.rs
+  s_7a3132f4d02a00::t_01ea4ef67c6552 101,115
+docs/plans/phase-9-rails.md
+  s_7a3132f4d02a00::t_693177bb5b2e03 805-874
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a9f4c50e72717c8aeb8f3ccf7a56d5ef089ec637",
+  "prompts": {},
+  "sessions": {
+    "s_7a3132f4d02a00": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "176f3779-1c8f-49ac-8e22-08bb3b8ac7c3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
