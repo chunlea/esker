@@ -16,12 +16,12 @@
 //! each asserting that the clause's own name comes back.
 
 use sqlparser::ast::{
-    AlterTableOperation, AssignmentTarget, BinaryOperator, ColumnOption, CreateTableOptions,
-    DataType, Distinct, DollarQuotedString, ExactNumberInfo, Expr, FromTable, GeneratedAs,
-    GroupByExpr, Ident, IndexColumn, IndexType, JoinConstraint, JoinOperator, LimitClause,
-    NullsDistinctOption, ObjectName, ObjectType, OffsetRows, OrderByKind, Query, SelectItem,
-    SelectItemQualifiedWildcardKind, SetExpr, Statement, TableConstraint, TableFactor, TableObject,
-    TimezoneInfo, UnaryOperator, Value,
+    AlterTableOperation, AssignmentTarget, BinaryOperator, CharacterLength, ColumnOption,
+    CreateTableOptions, DataType, Distinct, DollarQuotedString, ExactNumberInfo, Expr, FromTable,
+    GeneratedAs, GroupByExpr, Ident, IndexColumn, IndexType, JoinConstraint, JoinOperator,
+    LimitClause, NullsDistinctOption, ObjectName, ObjectType, OffsetRows, OrderByKind, Query,
+    SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, TableConstraint, TableFactor,
+    TableObject, TimezoneInfo, UnaryOperator, Value,
 };
 
 use crate::catalog::fold_identifier;
@@ -30,7 +30,7 @@ use crate::parse::{Parsed, feature_name};
 use crate::plan;
 use crate::time_machine;
 use crate::value::PgDatum;
-use crate::value::{ColumnType, Datum};
+use crate::value::{self, ColumnType, Datum, NO_TYPMOD};
 
 impl Parsed {
     /// Lowers this statement into the plan types the executor runs, or names the construct that
@@ -748,7 +748,7 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
 
     for column in &create.columns {
         let column_name = ident(&column.name);
-        let ty = lower_type(&column.data_type)?;
+        let (ty, typmod) = lower_type(&column.data_type)?;
         let mut not_null = false;
         let mut default = None;
         // `bigserial` is the type saying it; `GENERATED ... AS IDENTITY` is an option saying it.
@@ -795,6 +795,7 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
         columns.push(plan::Column {
             name: column_name,
             ty,
+            typmod,
             not_null,
             default,
             sequence,
@@ -875,7 +876,7 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
             column_position.is_some(),
             "ALTER TABLE ... ADD COLUMN at a position",
         )?;
-        let ty = lower_type(&column_def.data_type)?;
+        let (ty, typmod) = lower_type(&column_def.data_type)?;
         let mut not_null = false;
         let mut default = None;
         for option in &column_def.options {
@@ -920,6 +921,7 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
             column: plan::Column {
                 name: ident(&column_def.name),
                 ty,
+                typmod,
                 not_null,
                 default,
                 sequence: None,
@@ -1802,7 +1804,7 @@ fn lower_delete(delete: &sqlparser::ast::Delete) -> Result<plan::Delete> {
 }
 
 /// Every stored type, under every spelling PostgreSQL accepts for it — and the serial spellings,
-/// which are not types at all.
+/// which are not types at all — with the **typmod** the declaration carries.
 ///
 /// A serial is its integer plus a sequence: `bigserial` lowers to [`ColumnType::Int8`] and
 /// `serial` to [`ColumnType::Int4`], with the caller reading [`serial_identity`] to find out that
@@ -1810,7 +1812,82 @@ fn lower_delete(delete: &sqlparser::ast::Delete) -> Result<plan::Delete> {
 /// 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md), and only because `int4` was
 /// missing — accepting it as an `int8` would have taken every value between 2^31 and 2^63 that a
 /// real server answers `22003` for. With `int4` there is nothing left of that argument.
-fn lower_type(data_type: &DataType) -> Result<ColumnType> {
+///
+/// # The number after the type
+///
+/// Three types take one and each does something different with it, which is the whole of the
+/// typmod unit: `varchar(n)` **refuses** a longer value, `character(n)` **pads** a shorter one,
+/// and `timestamp(p)` **rounds**. The number is returned rather than folded into the type because
+/// that is where PostgreSQL keeps it — one `varchar` row in `pg_type` and an `atttypmod` per
+/// column — and `crate::value::NO_TYPMOD` is what a declaration without one carries.
+///
+/// **A bare `character` is `character(1)`**, not "unlimited": measured on 19beta1, where
+/// `format_type` says `character(1)` and a second character is `22001`. That is the opposite of
+/// `character varying`, whose bare spelling means no limit at all.
+fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
+    let plain = |ty| Ok((ty, NO_TYPMOD));
+    match data_type {
+        // The three that take a number. Each is checked against PostgreSQL's own limit, because a
+        // length this node accepted and a real server refused would be a table that exists here
+        // and not there.
+        DataType::Varchar(Some(length)) | DataType::CharacterVarying(Some(length)) => {
+            Ok((ColumnType::Varchar, string_typmod(length, "varchar")?))
+        }
+        DataType::Char(length) | DataType::Character(length) => match length {
+            Some(length) => Ok((ColumnType::Bpchar, string_typmod(length, "char")?)),
+            // `character` with no number is `character(1)`.
+            None => Ok((ColumnType::Bpchar, value::typmod_of_length(1))),
+        },
+        DataType::Timestamp(
+            Some(precision),
+            TimezoneInfo::None | TimezoneInfo::WithoutTimeZone,
+        ) if *precision <= 6 => Ok((
+            ColumnType::Timestamp,
+            value::typmod_of_precision(u32::try_from(*precision).unwrap_or(6)),
+        )),
+        other => lower_plain_type(other).and_then(&plain),
+    }
+}
+
+/// PostgreSQL's ceiling on a declared string length, and its floor is one.
+///
+/// Measured on 19beta1, both ends: `varchar(10485761)` is `22023 length for type varchar cannot
+/// exceed 10485760` and `varchar(0)` is `22023 length for type varchar must be at least 1`. Zero
+/// is **not** legal, which is the one a reader would guess wrong — a `varchar(0)` holding only the
+/// empty string is a perfectly coherent type and PostgreSQL declines to have it.
+const MAX_STRING_LENGTH: u32 = 10_485_760;
+
+/// The declared length of a `varchar(n)` or `character(n)`, as a typmod.
+///
+/// `spelled` is the **short** name — `varchar`, `char` — because that is what these two messages
+/// use, where `22001 value too long for type character varying(5)` uses the long one. One type,
+/// two vocabularies, and `tests/corpus/pg19_typmod.txt` carries both rather than either being
+/// inferred from the other.
+fn string_typmod(length: &CharacterLength, spelled: &'static str) -> Result<i32> {
+    let length = match length {
+        CharacterLength::IntegerLength { length, unit } => {
+            // `varchar(5 OCTETS)` and `varchar(5 CHARACTERS)` are the standard's spellings, which
+            // PostgreSQL does not take. Named rather than ignored: a unit this node dropped would
+            // silently change what the column holds for a multi-byte value.
+            refuse_if(unit.is_some(), format!("a length unit on {spelled}"))?;
+            *length
+        }
+        // `varchar(MAX)` is SQL Server's.
+        CharacterLength::Max => return Err(SqlError::unsupported(format!("{spelled}(MAX)"))),
+    };
+    if length < 1 {
+        return Err(SqlError::TypeLengthTooSmall(spelled));
+    }
+    if length > u64::from(MAX_STRING_LENGTH) {
+        return Err(SqlError::TypeLengthTooLarge(spelled, MAX_STRING_LENGTH));
+    }
+    Ok(value::typmod_of_length(
+        u32::try_from(length).unwrap_or(MAX_STRING_LENGTH),
+    ))
+}
+
+/// Every type that takes no number.
+fn lower_plain_type(data_type: &DataType) -> Result<ColumnType> {
     Ok(match data_type {
         DataType::Int8(None) | DataType::BigInt(None) => ColumnType::Int8,
         // `int`, `int4` and `integer` are one type under three spellings, and `sqlparser` gives
@@ -1820,11 +1897,8 @@ fn lower_type(data_type: &DataType) -> Result<ColumnType> {
         DataType::Int2(None) | DataType::SmallInt(None) => ColumnType::Int2,
         DataType::Float4 | DataType::Real => ColumnType::Real,
         DataType::Text => ColumnType::Text,
-        // `character varying` and `varchar` with **no length**. A length is a typmod and this node
-        // has no column to keep one on yet, so `varchar(n)` is `0A000` naming itself until the
-        // typmod unit lands -- refusing the length rather than ignoring it, because a `varchar(5)`
-        // that took a six-character value would be a wrong answer where a real server raises
-        // `22001` (ADR 0033).
+        // `character varying` and `varchar` with **no length**: unlimited, which is what the bare
+        // spelling means. The lengths are handled by the caller, which is where the typmod is.
         DataType::Varchar(None) | DataType::CharacterVarying(None) => ColumnType::Varchar,
         DataType::Bool | DataType::Boolean => ColumnType::Bool,
         DataType::Bytea => ColumnType::Bytea,
@@ -1834,12 +1908,11 @@ fn lower_type(data_type: &DataType) -> Result<ColumnType> {
         DataType::Timestamp(None, TimezoneInfo::Tz | TimezoneInfo::WithTimeZone) => {
             ColumnType::TimestampTz
         }
-        // `timestamp` and `timestamp(6)` are the **same type**: six is PostgreSQL's default and
-        // its maximum, so the two hold identical values and print identically, and the only thing
-        // that differs is the string `format_type` prints. `timestamp(0)` through `timestamp(5)`
-        // really do round, so they fall through to the refusal below until the typmod unit —
-        // accepting one and storing microseconds would be a wrong answer rather than a gap.
-        DataType::Timestamp(None | Some(6), TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
+        // `timestamp` with no precision: six digits, PostgreSQL's default and its maximum.
+        // `timestamp(6)` is handled by the caller and carries a typmod, which is the only
+        // difference between the two — `format_type` prints one as `timestamp(6) without time
+        // zone` and the other as `timestamp without time zone`, and they hold the same values.
+        DataType::Timestamp(None, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
             ColumnType::Timestamp
         }
         // `bigserial` and `serial` are `bigint`/`integer` plus a sequence, and `sqlparser` 0.62

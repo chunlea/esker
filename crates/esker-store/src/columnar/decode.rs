@@ -159,7 +159,7 @@ impl RowDecoder for TableDecoder {
 
 /// The storage vocabulary into the columnar one.
 ///
-/// Two enums of the same six shapes, which ADR 0030 leaves deliberately unconverged — a dedup for
+/// Two enums of the same shapes, which ADR 0030 leaves deliberately unconverged — a dedup for
 /// somebody not in the middle of a milestone. A **total** match, so that a seventh type added to
 /// either side is a compile error here rather than a column that silently reads NULL.
 fn columnar_type(ty: StoredType) -> esker_columnar::ColumnType {
@@ -169,6 +169,7 @@ fn columnar_type(ty: StoredType) -> esker_columnar::ColumnType {
         StoredType::Int2 => esker_columnar::ColumnType::Int2,
         StoredType::Real => esker_columnar::ColumnType::Real,
         StoredType::Varchar => esker_columnar::ColumnType::Varchar,
+        StoredType::Bpchar => esker_columnar::ColumnType::Bpchar,
         StoredType::Text => esker_columnar::ColumnType::Text,
         StoredType::Bool => esker_columnar::ColumnType::Bool,
         StoredType::Bytea => esker_columnar::ColumnType::Bytea,

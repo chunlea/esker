@@ -55,6 +55,39 @@ pub const MAX_MICROS: i64 =
 const MAX_ZONE_SECONDS: i64 = 16 * 3600;
 
 /// What PostgreSQL's `timestamptz_out` writes, for a server whose `TimeZone` is UTC.
+/// `micros` rounded to `precision` fractional digits, which is what a `timestamp(p)` column does
+/// to a value on the way in.
+///
+/// **Half away from zero, and zero is PostgreSQL's epoch.** Two rules, both measured
+/// (`tests/corpus/pg19_typmod.txt`), and neither is the one the parser uses a few lines below —
+/// which breaks a microsecond tie to the *even* neighbour. They are different functions in
+/// PostgreSQL too (`AdjustTimestampForTypmod` against the datetime parser), and this is what it
+/// looks like when one type has two rounding rules.
+///
+/// The sign is what makes it strange from outside. A timestamp before 2000-01-01 is a negative
+/// count, so rounding its magnitude away from zero moves it *earlier*: `1970-01-01 00:00:00.0005`
+/// at `timestamp(3)` is `1970-01-01 00:00:00`, where the same fraction in 2020 rounds up. A tie
+/// therefore goes opposite ways on the two sides of the year 2000, which is not a bug here and
+/// not one there — it is what negate-round-negate does, and a client sees it either way.
+///
+/// The infinities have no fraction and are returned as they are.
+pub(super) fn round_to_precision(micros: i64, precision: u32) -> i64 {
+    if precision >= 6 || micros == POS_INFINITY || micros == NEG_INFINITY {
+        return micros;
+    }
+    // 10^(6 - precision): the number of microseconds one digit of the kept fraction is worth.
+    let scale = 10i64.pow(6 - precision);
+    let half = scale / 2;
+    let magnitude = micros.unsigned_abs();
+    let scale = scale.unsigned_abs();
+    let half = half.unsigned_abs();
+    // In `u64`, so that a value near the ends of the range cannot overflow on the way to being
+    // rounded down to something well inside it.
+    let rounded = (magnitude + half) / scale * scale;
+    let rounded = i64::try_from(rounded).unwrap_or(i64::MAX);
+    if micros < 0 { -rounded } else { rounded }
+}
+
 pub(super) fn to_text(micros: i64) -> String {
     with_zone(micros, true)
 }

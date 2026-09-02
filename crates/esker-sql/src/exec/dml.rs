@@ -105,6 +105,27 @@ fn finish(returned: Option<Returned>, tag: String) -> Outcome {
 /// A sequence counts in `i64` whatever width it fills, so an `integer` identity column narrows
 /// here — and a sequence that has run past 2^31 answers the same `22003` a constant that far out
 /// would, which is what a real server does when a `serial` runs out rather than wrapping.
+/// Every value of a row as its column's typmod requires it: `varchar(n)` refused, `character(n)`
+/// padded, `timestamp(p)` rounded.
+///
+/// Applied to the **whole row** just before it is written, rather than where each value is
+/// produced, and that is deliberate: a row reaches this point from four directions — a literal in
+/// a `VALUES` list, an expression in a `SET`, a column's `DEFAULT` from the catalog, and a
+/// sequence — and only one of them passes through anything that knows the column's type. Padding
+/// three of the four and forgetting the fourth would store a `char(3)` holding `x` beside one
+/// holding `x  `, which compare equal to PostgreSQL and not to a byte comparison, and the row key
+/// built from them would be two different keys for one value.
+fn fit_typmods(table: &TableDef, row: &mut [Datum]) -> Result<()> {
+    for (value, column) in row.iter_mut().zip(&table.columns) {
+        if column.typmod == crate::value::NO_TYPMOD {
+            continue;
+        }
+        let taken = std::mem::replace(value, Datum::Null);
+        *value = crate::value::fit_to_typmod(taken, column.ty, column.typmod)?;
+    }
+    Ok(())
+}
+
 fn sequence_datum(ty: ColumnType, value: i64) -> Result<Datum> {
     Ok(match ty {
         ColumnType::Int4 => Datum::Int4(
@@ -196,6 +217,7 @@ pub(super) fn insert(
             row[at] = Datum::Int8(executor.next_row_id(table.id)?);
         }
 
+        fit_typmods(&table, &mut row)?;
         check_not_null(&table, &row)?;
         write_row(executor, txn, &table, &row, written)?;
         // The row **as stored**, so a column filled from its `DEFAULT` comes back with that value
@@ -412,6 +434,7 @@ pub(super) fn update(
             }
             new[*ordinal] = evaluated;
         }
+        fit_typmods(&table, &mut new)?;
         check_not_null(&table, &new)?;
         remove_row(executor, txn, &table, &old)?;
         write_row(executor, txn, &table, &new, written)?;

@@ -39,6 +39,137 @@ use crate::error::{Result, SqlError};
 pub use esker_keys::value::{ColumnType, Datum, f64_of_sort_bits, sort_bits_of_f64};
 pub use timestamp::{MAX_MICROS, MIN_MICROS, NEG_INFINITY, POS_INFINITY};
 
+/// The four bytes a varlena's header takes, which PostgreSQL adds to a declared length to make a
+/// typmod. Its own `VARHDRSZ`.
+///
+/// Measured rather than read: on 19beta1 a `varchar(5)` column's `pg_attribute.atttypmod` is `9`
+/// and a `character(3)`'s is `7`, while a `timestamp(3)`'s is `3` — the string types carry the
+/// header and the time types do not.
+const VARHDRSZ: i32 = 4;
+
+/// No typmod: the number a column declared without one carries.
+pub const NO_TYPMOD: i32 = -1;
+
+/// The typmod a declared **length** makes, for `varchar(n)` and `character(n)`.
+///
+/// The one place this arithmetic happens. `ColumnDef::typmod` holds PostgreSQL's number because
+/// two wire surfaces are defined as it; nothing else in this crate should know that the number is
+/// `n + 4`.
+#[must_use]
+pub fn typmod_of_length(length: u32) -> i32 {
+    i32::try_from(length).unwrap_or(i32::MAX - VARHDRSZ) + VARHDRSZ
+}
+
+/// The declared length back out of a typmod, or `None` when there was none.
+#[must_use]
+pub fn length_of_typmod(typmod: i32) -> Option<u32> {
+    u32::try_from(typmod - VARHDRSZ).ok()
+}
+
+/// The typmod a declared **precision** makes, for `timestamp(p)`. It is `p` itself.
+#[must_use]
+pub fn typmod_of_precision(precision: u32) -> i32 {
+    i32::try_from(precision).unwrap_or(i32::MAX)
+}
+
+/// The declared precision back out of a typmod, or `None` when there was none.
+#[must_use]
+pub fn precision_of_typmod(typmod: i32) -> Option<u32> {
+    u32::try_from(typmod).ok()
+}
+
+/// A value as the column's **typmod** requires it, or the error PostgreSQL raises instead.
+///
+/// The three types that take a number each do something different with it, which is the whole of
+/// the unit ([ADR 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md),
+/// `tests/corpus/pg19_typmod.txt`):
+///
+/// * **`varchar(n)` refuses.** Longer is `22001`, on `INSERT` and `UPDATE` alike. Trailing spaces
+///   count: `'abc '` is four characters and `v = 'abc '` finds no row that holds `'abc'`.
+/// * **`character(n)` pads.** Shorter is padded with spaces to exactly `n`, and longer is the same
+///   `22001`. Those are one rule, not two: a value stored padded makes plain byte comparison *be*
+///   PostgreSQL's blank-insensitive comparison, so `c = 'x'`, `c = 'x  '` and `c = 'x    '` all
+///   match a `char(3)` holding `x`, and an index key over it still holds "equal values encode
+///   identically". That invariant is why `character(n)` waited for the typmod: without an `n`
+///   there is nowhere to pad to.
+/// * **`timestamp(p)` rounds**, half away from zero, and carries — `.999999` at `timestamp(3)` is
+///   the next whole second. [`timestamp::round_to_precision`] holds the two surprises.
+///
+/// A NULL and a column with no typmod are returned untouched, which is every column this crate
+/// had before version 4 of the catalog record.
+pub fn fit_to_typmod(value: Datum, ty: ColumnType, typmod: i32) -> Result<Datum> {
+    if typmod == NO_TYPMOD {
+        return Ok(value);
+    }
+    Ok(match (&value, ty) {
+        (Datum::Text(text), ColumnType::Varchar) => {
+            let Some(limit) = length_of_typmod(typmod) else {
+                return Ok(value);
+            };
+            refuse_if_longer(text, limit, ty, typmod)?;
+            value
+        }
+        (Datum::Text(text), ColumnType::Bpchar) => {
+            let Some(limit) = length_of_typmod(typmod) else {
+                return Ok(value);
+            };
+            refuse_if_longer(text, limit, ty, typmod)?;
+            // Counted in **characters**, not bytes, which is what the length means: a `char(3)`
+            // holding `'é'` is padded with two spaces and occupies four bytes.
+            let short_by = limit as usize - text.chars().count();
+            let mut padded = String::with_capacity(text.len() + short_by);
+            padded.push_str(text);
+            padded.extend(std::iter::repeat_n(' ', short_by));
+            Datum::Text(padded)
+        }
+        (Datum::Timestamp(micros), ColumnType::Timestamp) => match precision_of_typmod(typmod) {
+            Some(precision) => Datum::Timestamp(timestamp::round_to_precision(*micros, precision)),
+            None => value,
+        },
+        (Datum::TimestampTz(micros), ColumnType::TimestampTz) => {
+            match precision_of_typmod(typmod) {
+                Some(precision) => {
+                    Datum::TimestampTz(timestamp::round_to_precision(*micros, precision))
+                }
+                None => value,
+            }
+        }
+        _ => value,
+    })
+}
+
+/// `22001` if `text` is longer than `limit` characters, naming the type the way `format_type`
+/// writes it — `character varying(5)`, not `varchar`, which is what the *declaration* errors use.
+fn refuse_if_longer(text: &str, limit: u32, ty: ColumnType, typmod: i32) -> Result<()> {
+    if text.chars().count() > limit as usize {
+        return Err(SqlError::StringDataRightTruncation(format_type(ty, typmod)));
+    }
+    Ok(())
+}
+
+/// A type as `format_type` writes it, with its typmod: what an error message and `\gdesc` say.
+#[must_use]
+pub fn format_type(ty: ColumnType, typmod: i32) -> String {
+    match (ty, typmod) {
+        (_, NO_TYPMOD) => ty.name().to_owned(),
+        (ColumnType::Varchar | ColumnType::Bpchar, _) => match length_of_typmod(typmod) {
+            Some(length) => format!("{}({length})", ty.name()),
+            None => ty.name().to_owned(),
+        },
+        // `timestamp(3) without time zone`, with the precision *inside* the name — which is why
+        // this is not a suffix on `name()`.
+        (ColumnType::Timestamp, _) => match precision_of_typmod(typmod) {
+            Some(precision) => format!("timestamp({precision}) without time zone"),
+            None => ty.name().to_owned(),
+        },
+        (ColumnType::TimestampTz, _) => match precision_of_typmod(typmod) {
+            Some(precision) => format!("timestamp({precision}) with time zone"),
+            None => ty.name().to_owned(),
+        },
+        _ => ty.name().to_owned(),
+    }
+}
+
 /// What a stored type *means* to a PostgreSQL client.
 ///
 /// The six shapes themselves are [`esker_keys::value`]'s — the storage layer's shared vocabulary,
@@ -73,6 +204,7 @@ impl PgType for ColumnType {
             ColumnType::Int4 => 23,
             ColumnType::Text => 25,
             ColumnType::Varchar => 1043,
+            ColumnType::Bpchar => 1042,
             ColumnType::Real => 700,
             ColumnType::Double => 701,
             ColumnType::Timestamp => 1114,
@@ -87,6 +219,7 @@ impl PgType for ColumnType {
             ColumnType::Int2 => "smallint",
             ColumnType::Text => "text",
             ColumnType::Varchar => "character varying",
+            ColumnType::Bpchar => "character",
             ColumnType::Bool => "boolean",
             ColumnType::Bytea => "bytea",
             ColumnType::TimestampTz => "timestamp with time zone",
@@ -105,7 +238,7 @@ impl PgType for ColumnType {
             | ColumnType::TimestampTz
             | ColumnType::Timestamp
             | ColumnType::Double => 8,
-            ColumnType::Text | ColumnType::Varchar | ColumnType::Bytea => -1,
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Bytea => -1,
         }
     }
 }
@@ -193,7 +326,9 @@ impl PgDatum for Datum {
             ColumnType::Int8 => Datum::Int8(parse_int8(text)?),
             ColumnType::Int4 => Datum::Int4(parse_int4(text)?),
             ColumnType::Int2 => Datum::Int2(parse_int2(text)?),
-            ColumnType::Text | ColumnType::Varchar => Datum::Text(text.to_owned()),
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => {
+                Datum::Text(text.to_owned())
+            }
             ColumnType::Bool => Datum::Bool(parse_bool(text)?),
             ColumnType::Bytea => Datum::Bytea(parse_bytea(text)?),
             ColumnType::TimestampTz => Datum::TimestampTz(timestamp::from_text(text)?),
@@ -263,7 +398,7 @@ impl PgDatum for Datum {
                     )));
                 }
             },
-            ColumnType::Text | ColumnType::Varchar => {
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => {
                 Datum::Text(String::from_utf8(bytes.to_vec()).map_err(|error| {
                     let at = error.utf8_error().valid_up_to();
                     SqlError::InvalidByteSequence(error.as_bytes().get(at).copied().unwrap_or(0))
@@ -548,12 +683,14 @@ mod tests {
         assert_eq!(ColumnType::Int4.oid(), 23);
         assert_eq!(ColumnType::Varchar.oid(), 1043);
         assert_eq!(ColumnType::Timestamp.oid(), 1114);
+        assert_eq!(ColumnType::Real.oid(), 700);
+        assert_eq!(ColumnType::Bpchar.oid(), 1042);
         for ty in ColumnType::ALL {
             assert_eq!(
                 ty.type_len() == -1,
                 matches!(
                     ty,
-                    ColumnType::Text | ColumnType::Varchar | ColumnType::Bytea
+                    ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Bytea
                 ),
                 "{ty:?} reports the wrong width"
             );

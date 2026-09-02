@@ -67,6 +67,7 @@ pub(super) fn create_table(
         columns.push(ColumnDef {
             name: column.name.clone(),
             ty: column.ty,
+            typmod: column.typmod,
             // A primary key column is NOT NULL whether or not it said so, which is PostgreSQL's
             // rule and also ours by necessity: a NULL cannot be part of a row key.
             not_null: column.not_null || create.primary_key.contains(&column.name),
@@ -93,6 +94,7 @@ pub(super) fn create_table(
         with_row_id.push(ColumnDef {
             name: catalog::INTERNAL_ROW_ID_NAME.to_owned(),
             ty: crate::value::ColumnType::Int8,
+            typmod: crate::value::NO_TYPMOD,
             not_null: true,
             // The executor fills it on every insert, so it has neither.
             default: None,
@@ -535,6 +537,7 @@ pub(super) fn alter_table(
         updated.columns.push(ColumnDef {
             name: column.name.clone(),
             ty: column.ty,
+            typmod: column.typmod,
             // `NOT NULL` is admissible **only with a constant default**, which is what makes every
             // row already stored hold a value: the missing value below is that value, and the
             // decoder pads with it. Without one the lowering refuses `NOT NULL`, because the

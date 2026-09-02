@@ -25,5 +25,12 @@ float8	-Infinity	-1e+308	-1	0	-0	5e-324	1	1e+308	Infinity	NaN
 timestamptz	-infinity	4714-11-24 00:00:00+00 BC	1999-01-01 00:00:00+00	2000-01-01 00:00:00+00	294276-12-31 23:59:59+00	infinity
 timestamp	-infinity	4714-11-24 00:00:00 BC	1999-01-01 00:00:00	2000-01-01 00:00:00	294276-12-31 23:59:59	infinity
 text		A	B	_a	a	a b	ab	b	~	é	🌊
+#
+# `bpchar` is captured as a `char(3)` column, so every value below is **padded to three
+# characters** -- which is how PostgreSQL stores and prints one, and the whole reason a
+# `character(n)` can live in an index key. Padded values compare as bytes, and byte comparison over
+# them *is* PostgreSQL's blank-insensitive comparison; the first value is three spaces, which is
+# what the empty string becomes. Sorted with `COLLATE "C"` for the reason `text` is.
+bpchar	   	  a	A  	B  	_a 	a  	a b	ab 	b  	~  	~~~
 varchar		A	B	_a	a	a b	ab	b	~	é	🌊
 bytea	\x	\x00	\x0000	\x01	\x7f	\x80	\xff	\xffff

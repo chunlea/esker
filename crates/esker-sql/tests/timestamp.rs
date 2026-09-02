@@ -81,24 +81,30 @@ fn six_is_the_default_and_the_maximum() {
     // The same value, stored twice through two spellings of one type.
     assert_eq!(node.rows("SELECT id FROM p WHERE a = b"), vec![vec!["1"]]);
 
-    // A precision that really rounds is `0A000` naming itself, not silently widened. Storing
-    // microseconds in a `timestamp(3)` column would answer a later `SELECT` with digits a real
-    // server discarded.
+    // A precision that really rounds now **rounds**, where it used to be `0A000` naming itself.
+    // Half away from zero, and away from zero means away from the year 2000 — the two surprises
+    // `tests/corpus/pg19_typmod.txt` carries and `value::timestamp::round_to_precision` explains.
     for statement in [
-        "CREATE TABLE q (a timestamp(3))",
-        "CREATE TABLE q (a timestamp(0))",
+        "CREATE TABLE q (id int8 PRIMARY KEY, a timestamp(3), b timestamp(0))",
+        "INSERT INTO q VALUES (1, '2020-01-01 00:00:00.0005', '2020-01-01 00:00:00.5')",
+        // A tie whose even neighbour is below it: half-to-even would answer `.002`.
+        "INSERT INTO q VALUES (2, '2020-01-01 00:00:00.0025', '2020-01-01 00:00:01.5')",
+        // Before PostgreSQL's epoch, where the count is negative and the same tie rounds *down*.
+        "INSERT INTO q VALUES (3, '1970-01-01 00:00:00.0005', '1970-01-01 00:00:00.5')",
+        // And the rounding carries into the next second.
+        "INSERT INTO q VALUES (4, '2020-06-15 08:30:15.999999', '2020-01-01 00:00:00.4')",
     ] {
-        let error = node.run(statement).unwrap_err();
-        assert_eq!(
-            error.sqlstate(),
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "{statement}"
-        );
-        assert!(
-            error.to_string().to_ascii_uppercase().contains("TIMESTAMP"),
-            "{statement} -> `{error}`, which does not name the type"
-        );
+        node.run(statement).unwrap();
     }
+    assert_eq!(
+        node.rows("SELECT id, a, b FROM q ORDER BY id"),
+        vec![
+            vec!["1", "2020-01-01 00:00:00.001", "2020-01-01 00:00:01"],
+            vec!["2", "2020-01-01 00:00:00.003", "2020-01-01 00:00:02"],
+            vec!["3", "1970-01-01 00:00:00", "1970-01-01 00:00:00"],
+            vec!["4", "2020-06-15 08:30:16", "2020-01-01 00:00:00"],
+        ]
+    );
 }
 
 /// A seventh fractional digit rounds, and a tie rounds to **even** — not up.

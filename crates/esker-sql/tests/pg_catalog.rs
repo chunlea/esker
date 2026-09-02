@@ -180,6 +180,8 @@ fn activerecord_s_four_type_map_queries_answer() {
             vec!["25", "text", "0", ",", "textin", "\\N", "b", "0"],
             vec!["700", "float4", "0", ",", "float4in", "\\N", "b", "0"],
             vec!["701", "float8", "0", ",", "float8in", "\\N", "b", "0"],
+            // `bpchar` is `character(n)`'s internal name and is in this query's list of forty.
+            vec!["1042", "bpchar", "0", ",", "bpcharin", "\\N", "b", "0"],
             vec!["1043", "varchar", "0", ",", "varcharin", "\\N", "b", "0"],
             vec![
                 "1114",

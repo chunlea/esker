@@ -80,11 +80,15 @@ pub enum ColumnType {
     Double,
     /// IEEE-754 binary32; PostgreSQL's `real`.
     Real,
+    /// PostgreSQL's `character(n)`, whose internal name is `bpchar`. The same bytes as a `Text`
+    /// again; what differs is that its values arrive **already padded** to the column's length, so
+    /// byte comparison is the blank-insensitive comparison PostgreSQL specifies.
+    Bpchar,
 }
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 11] = [
+    pub const ALL: [ColumnType; 12] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -96,6 +100,7 @@ impl ColumnType {
         ColumnType::Timestamp,
         ColumnType::Double,
         ColumnType::Real,
+        ColumnType::Bpchar,
     ];
 
     /// The tag byte this type is stored as. Frozen: see the module docs.
@@ -114,6 +119,7 @@ impl ColumnType {
             ColumnType::Timestamp => 9,
             ColumnType::Int2 => 10,
             ColumnType::Real => 11,
+            ColumnType::Bpchar => 12,
         }
     }
 
@@ -131,6 +137,7 @@ impl ColumnType {
             9 => ColumnType::Timestamp,
             10 => ColumnType::Int2,
             11 => ColumnType::Real,
+            12 => ColumnType::Bpchar,
             other => {
                 return Err(Error::corruption(
                     "schema",
@@ -155,6 +162,7 @@ impl ColumnType {
             ColumnType::Timestamp => "timestamp without time zone",
             ColumnType::Double => "double precision",
             ColumnType::Real => "real",
+            ColumnType::Bpchar => "character",
         }
     }
 
@@ -163,7 +171,7 @@ impl ColumnType {
     pub fn is_variable_length(self) -> bool {
         matches!(
             self,
-            ColumnType::Text | ColumnType::Varchar | ColumnType::Bytea
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Bytea
         )
     }
 }
@@ -206,7 +214,10 @@ impl Value {
             Value::Int2(_) => ty == ColumnType::Int2,
             // One representation, two types: there is no `Value::Varchar` because there would be
             // nothing in it a `Text` does not hold.
-            Value::Text(_) => matches!(ty, ColumnType::Text | ColumnType::Varchar),
+            Value::Text(_) => matches!(
+                ty,
+                ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar
+            ),
             Value::Bool(_) => ty == ColumnType::Bool,
             Value::Bytea(_) => ty == ColumnType::Bytea,
             Value::TimestampTz(_) => ty == ColumnType::TimestampTz,
@@ -278,7 +289,7 @@ pub enum ValueRef<'a> {
     /// A `Double`.
     Double(f64),
     /// A `Real`, at its own width. **Not** a widened [`ValueRef::Double`], for the reason
-    /// [`crate::encode::float`] gives: the widening is unspecified for a `NaN` payload, and a
+    /// `encode::float` gives: the widening is unspecified for a `NaN` payload, and a
     /// scan that answered differently on two targets would not be answering at all.
     Real(f32),
     /// A `Text` (validated UTF-8) or a `Bytea`.
@@ -366,11 +377,13 @@ impl ValueRef<'_> {
             // for a `NaN` payload to be lost to.
             (ValueRef::Real(v), ColumnType::Real) => Value::Real(v),
             (ValueRef::Bytes(v), ColumnType::Bytea) => Value::Bytea(v.to_vec()),
-            (ValueRef::Bytes(v), ColumnType::Text | ColumnType::Varchar) => Value::Text(
-                std::str::from_utf8(v)
-                    .map_err(|error| Error::corruption("text column", error.to_string()))?
-                    .to_owned(),
-            ),
+            (ValueRef::Bytes(v), ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar) => {
+                Value::Text(
+                    std::str::from_utf8(v)
+                        .map_err(|error| Error::corruption("text column", error.to_string()))?
+                        .to_owned(),
+                )
+            }
             (other, ty) => {
                 return Err(Error::corruption(
                     "column",
@@ -512,6 +525,7 @@ mod tests {
         assert_eq!(ColumnType::Timestamp.tag(), 9);
         assert_eq!(ColumnType::Int2.tag(), 10);
         assert_eq!(ColumnType::Real.tag(), 11);
+        assert_eq!(ColumnType::Bpchar.tag(), 12);
 
         for ty in ColumnType::ALL {
             assert_eq!(ColumnType::from_tag(ty.tag()).unwrap(), ty);
@@ -519,7 +533,14 @@ mod tests {
         assert!(ColumnType::from_tag(0).unwrap_err().is_corruption());
         // One past the last: a reader that meets a tag a newer writer used answers corruption
         // rather than guessing, which is the direction this vocabulary is built to fail in.
-        assert!(ColumnType::from_tag(12).unwrap_err().is_corruption());
+        // Derived from `ALL` rather than written, because a literal here goes stale the moment a
+        // type is appended — and it has, once per type, which is a test asserting the absence of
+        // the very thing the next unit adds.
+        assert!(
+            ColumnType::from_tag(u8::try_from(ColumnType::ALL.len()).unwrap() + 1)
+                .unwrap_err()
+                .is_corruption()
+        );
     }
 
     /// A value fits its own type and nothing else — **except** the one pair that is deliberately
@@ -537,7 +558,10 @@ mod tests {
             (Value::Int4(1), &[ColumnType::Int4][..]),
             (
                 Value::Text("a".into()),
-                &[ColumnType::Text, ColumnType::Varchar][..],
+                // Three types, one representation — the string family PostgreSQL has, told apart
+                // by OID and not by bytes. A `bpchar`'s padding is applied before the value gets
+                // here, so what arrives is a `Text` like any other.
+                &[ColumnType::Text, ColumnType::Varchar, ColumnType::Bpchar][..],
             ),
             (Value::Bool(true), &[ColumnType::Bool][..]),
             (Value::Bytea(vec![1]), &[ColumnType::Bytea][..]),

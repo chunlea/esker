@@ -298,7 +298,7 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
                 other => return Err(corrupt(format!("boolean byte {other} is neither 0 nor 1"))),
             }
         }
-        ColumnType::Text | ColumnType::Varchar | ColumnType::Bytea => {
+        ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Bytea => {
             let (len, consumed) = varint::get_u64(bytes)
                 .map_err(|error| corrupt(format!("column length: {error}")))?;
             let len =
@@ -306,7 +306,10 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
             let (body, rest) = bytes[consumed..]
                 .split_at_checked(len)
                 .ok_or_else(|| corrupt(format!("a column of {len} bytes is truncated")))?;
-            let value = if matches!(ty, ColumnType::Text | ColumnType::Varchar) {
+            let value = if matches!(
+                ty,
+                ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar
+            ) {
                 Datum::Text(text_from_utf8(body)?)
             } else {
                 Datum::Bytea(body.to_vec())
@@ -530,7 +533,7 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
                 other => return Err(corrupt(format!("boolean byte {other} in an index key"))),
             }
         }
-        ColumnType::Text | ColumnType::Varchar => {
+        ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => {
             let (body, rest) = codec::decode_bytes(bytes).map_err(decoded)?;
             (Datum::Text(text_from_utf8(&body)?), rest)
         }
@@ -962,7 +965,9 @@ mod tests {
                 .prop_map(Datum::Real),
             ]
             .boxed(),
-            ColumnType::Text | ColumnType::Varchar => ".{0,32}".prop_map(Datum::Text).boxed(),
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => {
+                ".{0,32}".prop_map(Datum::Text).boxed()
+            }
             ColumnType::Bool => any::<bool>().prop_map(Datum::Bool).boxed(),
             ColumnType::Bytea => proptest::collection::vec(any::<u8>(), 0..32)
                 .prop_map(Datum::Bytea)

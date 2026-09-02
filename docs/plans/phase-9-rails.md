@@ -961,6 +961,74 @@ Nothing caught it because `tests/corpus/pg19_values.txt` is the *string* path by
 every line in it is `type ⇥ input ⇥ output` — so the literal path had never been captured for
 either width. `real` is only the type that made it visible, and `tests/real.rs` pins both.
 
+#### Tier 1, the typmod: `varchar(n)`, `character(n)`, `timestamp(p)`
+
+One mechanism, three types, which is why they arrive together. A length or a precision is a
+property of the **column**, where PostgreSQL keeps it (`pg_attribute.atttypmod`), and not of the
+type — there is one `varchar` row in `pg_type` and a number per column. So the unit is a catalog
+record change first and three behaviours second, and the three do different things with their
+number:
+
+* **`varchar(n)` refuses.** Longer is `22001`, on `INSERT` and `UPDATE` alike, and trailing spaces
+  are significant: `v = 'abc '` finds nothing where `v = 'abc'` finds the row.
+* **`character(n)` pads.** `'x'` in a `char(3)` is stored and printed `x  `, and comparison ignores
+  trailing blanks. Those are one fact, not two — a value padded to `n` on the way in makes plain
+  byte comparison *be* the blank-insensitive comparison, which is what lets an index key hold a
+  `character(n)` without breaking "equal values encode identically". It is why this type could not
+  land in the unit that landed bare `varchar`: there is nowhere to pad to without an `n`.
+* **`timestamp(p)` rounds**, and the rounding carries — `.999999` at `timestamp(3)` is the next
+  whole second.
+
+`character` with **no** number is `character(1)`, not unlimited — the opposite of `character
+varying`, whose bare spelling means no limit at all.
+
+##### The record: catalog format version 4
+
+The one version bump tier 1 owes, and ADR 0033 named it in advance. Four little-endian bytes at the
+end of each column; version 3 and version 2 records still decode, each against a golden of the
+bytes it actually wrote rather than a regenerated one. Every column a version 3 catalog could hold
+reads back `-1`, and that is not a compatibility shim — no type version 3 had took a number.
+
+Stored as PostgreSQL's **own** `atttypmod` rather than a plain `n`: `varchar(5)` is `9` and
+`character(3)` is `7` (the length plus a varlena header) while `timestamp(3)` is `3`. That looks
+like a trap and is the opposite of one — `RowDescription`'s type-modifier column and
+`pg_attribute.atttypmod` are both *defined* as that number, so any other representation means
+converting on the way out to two places and getting it wrong in one.
+
+##### Four things the capture said and reasoning would not have
+
+1. **`timestamp(p)` rounds half away from zero**, where the microsecond rounding in the timestamp
+   *parser* — fixed two units ago — breaks a tie to the **even** neighbour. `.0005` at
+   `timestamp(3)` is `.001` and `.0025` is `.003`. One type, two rounding rules, in two functions.
+2. **And "away from zero" is away from the year 2000.** A timestamp before 2000-01-01 is a negative
+   microsecond count, and PostgreSQL negates, rounds the magnitude, and negates back — so
+   `1970-01-01 00:00:00.0005` at `timestamp(3)` rounds **down**, to `.000`, where the same fraction
+   in 2020 rounds up. Ties on the two sides of the epoch go opposite ways in wall-clock terms.
+3. **A declared length of zero is illegal**: `varchar(0)` is `22023 length for type varchar must be
+   at least 1`. A `varchar(0)` holding only the empty string is perfectly coherent and PostgreSQL
+   declines to have it. The ceiling is `10485760`.
+4. **One type, two vocabularies.** The declaration errors say `varchar` and `char`; the value error
+   says `character varying(5)` and `character(3)`. Neither can be inferred from the other and
+   `tests/corpus/pg19_typmod.txt` carries both.
+
+##### Files this lane may edit outside `esker-sql`
+
+The standing grant is `crates/esker-proto/src/fragment/result.rs`,
+`crates/esker-store/src/columnar/decode.rs` and `crates/esker-store/src/columnar/wire.rs`, under a
+git-status-first protocol. **`crates/esker-store/src/columnar/compact.rs` was added to that list**
+after the `real` unit had to touch it — but the edit that got it there was *larger* than the
+granted class and is reported rather than assumed: see the note in ADR 0033 and the `real` commit
+`ba8ed2e`, which deleted a duplicated conversion rather than adding an arm to it. A future edit of
+the granted kind — one match arm for one new type — needs no further routing.
+
+##### `bpchar` costs no wire change, unlike `real`
+
+`character(n)` is a twelfth `ColumnType` and a third member of the string family — `text`,
+`varchar` and `bpchar` are one varlena told apart by OID, exactly as PostgreSQL has it. Unlike
+`real` it needed **nothing** in `esker-proto`: the fragment wire maps by *value* shape and there is
+no `Value::Varchar` to add, so all three travel as `ValueType::Text`. The fourth format ADR 0033
+found is only owed by a type with a new representation.
+
 ## 3. The test ladder
 
 Each rung is a thing that either works or does not, and none of them is reached by asserting

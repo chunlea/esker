@@ -46,7 +46,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::backend::Txn;
 use crate::error::{Result, SqlError};
-use crate::value::{ColumnType, Datum};
+use crate::value::{self, ColumnType, Datum};
 
 /// The version byte on every catalog record. An unknown one is an error, never a guess
 /// (`CLAUDE.md` invariant 2).
@@ -75,8 +75,23 @@ pub const MAX_IDENTIFIER_BYTES: usize = 63;
 pub struct ColumnDef {
     /// As the user wrote it, already folded (see [`fold_identifier`]).
     pub name: String,
-    /// One of the six types phase 6a stores.
+    /// One of the types this node stores ([ADR 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md)).
     pub ty: ColumnType,
+    /// PostgreSQL's `pg_attribute.atttypmod`, **verbatim**, or `-1` for a type given no number.
+    ///
+    /// The length of a `varchar(n)` or `character(n)` and the precision of a `timestamp(p)` are
+    /// properties of the *column*, not of the type — which is why there is one `varchar` row in
+    /// `pg_type` and a number here, exactly as a real server arranges it.
+    ///
+    /// **Stored in PostgreSQL's own encoding rather than as a plain `n`**, measured against
+    /// 19beta1: `varchar(5)` is `9` and `character(3)` is `7` — the length plus the four bytes of
+    /// a varlena header — while `timestamp(3)` is `3`. That looks like a trap and is the opposite
+    /// of one: the two things that read this field are `RowDescription`'s type-modifier column and
+    /// `pg_attribute.atttypmod`, and **both are defined as this number**, so storing anything else
+    /// would mean converting on the way out to two places and getting it wrong in one of them.
+    /// Everything inside this crate asks [`ColumnDef::length`] or [`ColumnDef::precision`] instead
+    /// and never does the arithmetic itself.
+    pub typmod: i32,
     /// Whether a NULL is refused. Primary key columns are always `NOT NULL`.
     pub not_null: bool,
     /// What an `INSERT` that omits this column writes. `None` is NULL.
@@ -282,6 +297,33 @@ pub struct TableDef {
     ///
     /// In column order, which is the order the scan returns them in.
     pub sequences: Vec<SequenceDef>,
+}
+
+impl ColumnDef {
+    /// The declared length of a `varchar(n)` or `character(n)`, or `None` for a column given no
+    /// number — which for `character varying` means unlimited and for nothing else means anything.
+    ///
+    /// A `character` with no number is **not** one of those: PostgreSQL reads a bare `character` as
+    /// `character(1)`, so the parser gives it a typmod and this answers `Some(1)`.
+    #[must_use]
+    pub fn length(&self) -> Option<u32> {
+        match self.ty {
+            ColumnType::Varchar | ColumnType::Bpchar => value::length_of_typmod(self.typmod),
+            _ => None,
+        }
+    }
+
+    /// The declared precision of a `timestamp(p)`, or `None` for one given no number — which means
+    /// the full six digits PostgreSQL stores.
+    #[must_use]
+    pub fn precision(&self) -> Option<u32> {
+        match self.ty {
+            ColumnType::Timestamp | ColumnType::TimestampTz => {
+                value::precision_of_typmod(self.typmod)
+            }
+            _ => None,
+        }
+    }
 }
 
 impl TableDef {
@@ -1329,6 +1371,7 @@ mod tests {
                 ColumnDef {
                     name: "id".into(),
                     ty: ColumnType::Int8,
+                    typmod: crate::value::NO_TYPMOD,
                     not_null: true,
                     default: None,
                     missing: None,
@@ -1336,6 +1379,7 @@ mod tests {
                 ColumnDef {
                     name: "email".into(),
                     ty: ColumnType::Text,
+                    typmod: crate::value::NO_TYPMOD,
                     not_null: false,
                     default: None,
                     missing: None,
@@ -1373,7 +1417,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "03",               // catalog format version
+                "04",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -1425,7 +1469,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "03",                 // catalog format version
+                "04",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -1436,14 +1480,16 @@ mod tests {
                 "02", // two columns
                 "026964",
                 "01",
-                "01", // "id", INT8, NOT NULL
-                "00", // no DEFAULT
-                "00", // and no missing value
+                "01",       // "id", INT8, NOT NULL
+                "00",       // no DEFAULT
+                "00",       // and no missing value
+                "ffffffff", // version 4: no typmod, which is -1 and not 0
                 "05656d61696c",
                 "02",
-                "00", // "email", TEXT, nullable
-                "00", // no DEFAULT
-                "00", // and no missing value
+                "00",       // "email", TEXT, nullable
+                "00",       // no DEFAULT
+                "00",       // and no missing value
+                "ffffffff", // no typmod
                 "01",
                 "00",                                     // primary key: one column, column 0
                 "01",                                     // one index
@@ -1490,6 +1536,96 @@ mod tests {
             "01",
         ));
         assert_eq!(record::decode_table(&v2).unwrap(), accounts(7));
+    }
+
+    /// The **version 3** golden, kept for the same reason the version 2 one is.
+    ///
+    /// These are the bytes version 3 wrote — every column ends at its missing value, with no
+    /// typmod after it — and a cluster that ran any phase from 6e to the typmod unit has them.
+    /// Each column reads back `NO_TYPMOD`, which is what a column declared without a number means
+    /// and what **every** column a version 3 catalog could hold was: not one of the types version
+    /// 3 had took a number.
+    #[test]
+    fn a_version_3_table_record_still_decodes() {
+        let v3 = decode_hex(concat!(
+            "03",                 // catalog format version 3
+            "0700000000000000",   // table id 7
+            "086163636f756e7473", // varint 8, "accounts"
+            "0d6163636f756e74735f706b6579",
+            "01", // schema version 1
+            "02", // two columns
+            "026964",
+            "01",
+            "01", // "id", INT8, NOT NULL
+            "00", // no DEFAULT
+            "00", // and no missing value -- and nothing after it
+            "05656d61696c",
+            "02",
+            "00", // "email", TEXT, nullable
+            "00",
+            "00",
+            "01",
+            "00",                                     // primary key: one column, column 0
+            "01",                                     // one index
+            "0800000000000000",                       // index id 8
+            "126163636f756e74735f656d61696c5f6b6579", // "accounts_email_key"
+            "01",                                     // unique
+            "03",                                     // state: public
+            "01",                                     // entered at schema version 1
+            "01",
+            "01", // one column, column 1
+        ));
+        let table = record::decode_table(&v3).unwrap();
+        assert_eq!(table, accounts(7));
+        for column in &table.columns {
+            assert_eq!(column.typmod, crate::value::NO_TYPMOD);
+            assert_eq!(column.length(), None);
+            assert_eq!(column.precision(), None);
+        }
+    }
+
+    /// A `varchar(5)`, a `character(3)` and a `timestamp(3)` survive the record that version 4
+    /// exists for — read back as the numbers PostgreSQL's `atttypmod` holds, `9`, `7` and `3`.
+    #[test]
+    fn a_version_4_record_carries_every_typmod() {
+        let mut table = accounts(7);
+        table.columns.push(ColumnDef {
+            name: "v".into(),
+            ty: ColumnType::Varchar,
+            typmod: crate::value::typmod_of_length(5),
+            not_null: false,
+            default: None,
+            missing: None,
+        });
+        table.columns.push(ColumnDef {
+            name: "c".into(),
+            ty: ColumnType::Bpchar,
+            typmod: crate::value::typmod_of_length(3),
+            not_null: false,
+            default: None,
+            missing: None,
+        });
+        table.columns.push(ColumnDef {
+            name: "t".into(),
+            ty: ColumnType::Timestamp,
+            typmod: crate::value::typmod_of_precision(3),
+            not_null: false,
+            default: None,
+            missing: None,
+        });
+        let back = record::decode_table(&record::encode_table(&table).unwrap()).unwrap();
+        assert_eq!(back, table);
+        // Measured on 19beta1, `pg_attribute.atttypmod`: the string types carry the four bytes of
+        // a varlena header and the time types do not.
+        assert_eq!(back.columns[2].typmod, 9);
+        assert_eq!(back.columns[3].typmod, 7);
+        assert_eq!(back.columns[4].typmod, 3);
+        assert_eq!(back.columns[2].length(), Some(5));
+        assert_eq!(back.columns[3].length(), Some(3));
+        assert_eq!(back.columns[4].precision(), Some(3));
+        // And the accessors answer for the type, not for the number: an `int8` never has a length
+        // however the bytes read.
+        assert_eq!(back.columns[0].length(), None);
     }
 
     /// Version 3 changed the **table** record's layout and nothing else's, so a version 2 record of
@@ -1865,8 +2001,11 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "03", // catalog format version
-                "02", // two columnar replicas -- byte 1, where PD stops
+                // **`esker_keys::columnar`'s** format version, not the catalog record's —
+                // `encode_columnar` delegates, so this byte is not `CATALOG_FORMAT_VERSION`. The
+                // two were both 3 until the typmod made the catalog record 4, which is the first
+                // time anything has told them apart.
+                "03", "02", // two columnar replicas -- byte 1, where PD stops
                 "01", // schema_version 1
                 "02", // two columns
                 "01", "00", // int8, no missing value
@@ -1892,6 +2031,7 @@ mod tests {
         widened.columns.push(ColumnDef {
             name: "tier".into(),
             ty: ColumnType::Int8,
+            typmod: crate::value::NO_TYPMOD,
             not_null: true,
             default: Some(Datum::Int8(42)),
             missing: Some(Datum::Int8(42)),
@@ -1941,7 +2081,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "03",               // catalog format version
+                "04",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );
