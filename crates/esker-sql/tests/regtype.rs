@@ -13,6 +13,44 @@ mod parity;
 /// Nothing: every statement is a constant expression.
 const CORPUS_FIXTURE: &[&str] = &[];
 
+/// One of `DIVERGENCES`' reasons: a type this node does not have.
+///
+/// `'x'::regtype` answering an OID for a type that cannot be stored or sent would hand a client a
+/// number this node can do nothing with — the same argument `pg_catalog.rs` makes for keeping
+/// `pg_type` short. A name it does not have is a name that does not exist here, and each closes
+/// when its type lands: `interval` 1186, `timetz` 1266, `uuid` 2950, the array types, and the
+/// three system types `oid` 26, `name` 19 and `regtype` 2206.
+const NO_SUCH_TYPE: &str = "A type this node does not have, so its name does not resolve: `42704` \
+     rather than an OID a client could do nothing with. Each closes when its type does.";
+
+/// `float(p)` picks a *different type* by its precision.
+const FLOAT_PRECISION: &str = "**A precision on `float` selects the type**: `float(24)` is `real` \
+     and `float(25)` is `double precision`, and the bounds are their own `22023`s — `at least 1 \
+     bit`, `less than 54 bits`. This node takes no typmod on `float` at all (`value::takes_typmod` \
+     says so, and the two float widths are distinct types here rather than one parameterised \
+     one), so the whole spelling is `42704`. The only typmod in PostgreSQL that changes which \
+     type you get, and it needs the float pair to be modelled as one type to close.";
+
+/// `pg_typeof` is not implemented for any type.
+const PG_TYPEOF: &str = "`pg_typeof` is not implemented at all, so this is `0A000` naming the \
+     function rather than a wrong type — the honest answer under contract C2. Several of these \
+     lines would *prove* the `regtype`-is-`text` divergence above if the function existed.";
+
+/// Names with quoting or a schema on them.
+const NAME_SYNTAX: &str = "**A type name is parsed, not compared.** PostgreSQL reads \
+     `'\"int4\"'::regtype` and `'pg_catalog.int4'::regtype` with its own name grammar — quoting \
+     suppresses the alias folding, so `'\"int4\"'` is 23 and `'\"integer\"'` is `42704`, and a \
+     schema qualifier is stripped when it is `pg_catalog`. This node lower-cases and looks the \
+     whole string up, so every one of these is `42704`. It closes when the name is tokenised \
+     rather than matched.";
+
+/// The other direction: an OID back to a name.
+const REVERSE: &str = "**The reverse direction is not implemented**: `23::regtype` is `integer` \
+     on a real server and an unknown number prints as itself (`999999::regtype` is `999999`, not \
+     an error). This node has no cast from a number to a `regtype` at all, so it is `0A000` \
+     naming the cast. The forward direction is what the scoreboard needed and what ADR 0033 \
+     scoped; this half has had no caller.";
+
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
@@ -45,6 +83,33 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 'double precision'::regtype::oid",
         "SELECT 'INTEGER'::regtype::oid",
         "SELECT '23'::oid",
+        // Every remaining spelling the corpus asks for, answering the right OID and declaring
+        // `bigint` where a real server declares `oid` — the same one trade as the lines above,
+        // and the reason this list is long rather than deep. `numeric`, `decimal`, `date` and
+        // `time` are in it because they resolve now: `value::type_by_name` derives its names from
+        // `ColumnType::ALL`, so a type that exists is a name that resolves.
+        "SELECT 'int'::regtype::oid, 'int4'::regtype::oid",
+        "SELECT 'character varying'::regtype::oid, 'varchar'::regtype::oid",
+        "SELECT 'character'::regtype::oid, 'char'::regtype::oid, 'bpchar'::regtype::oid",
+        "SELECT 'timestamp'::regtype::oid, 'timestamp without time zone'::regtype::oid",
+        "SELECT 'timestamptz'::regtype::oid, 'timestamp with time zone'::regtype::oid",
+        "SELECT 'bool'::regtype::oid, 'boolean'::regtype::oid",
+        "SELECT 'text'::regtype::oid, 'bytea'::regtype::oid",
+        "SELECT 'int8'::regtype::oid, 'bigint'::regtype::oid",
+        "SELECT 'int2'::regtype::oid, 'smallint'::regtype::oid",
+        "SELECT 'float4'::regtype::oid, 'real'::regtype::oid",
+        "SELECT 'float8'::regtype::oid, 'double precision'::regtype::oid",
+        "SELECT 'numeric'::regtype::oid, 'decimal'::regtype::oid",
+        "SELECT 'character varying(1024)'::regtype::oid",
+        "SELECT 'character varying(1)'::regtype::oid",
+        "SELECT 'numeric(10,2)'::regtype::oid",
+        "SELECT 'timestamp(6)'::regtype::oid",
+        "SELECT 'timestamp(9)'::regtype::oid",
+        "SELECT 'INTEGER'::regtype::oid, 'Integer'::regtype::oid",
+        "SELECT '  integer  '::regtype::oid",
+        "SELECT 'int4 '::regtype::oid, ' int4'::regtype::oid",
+        "SELECT 'character varying(1024)'::regtype",
+        "SELECT 'time'::regtype, 'timestamptz'::regtype",
     ],
     answers: &[
         (
@@ -55,12 +120,84 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              expression's type is `regtype`, and this node would say `text`.",
         ),
         (
-            "SELECT 'numeric'::regtype::oid",
-            "PostgreSQL answers `1700`; this node answers `42704 type \"numeric\" does not \
-             exist`, because it has no `numeric`. Answering `1700` would hand a client the OID of \
-             a type this node can neither store nor send — the same argument `pg_catalog.rs` \
-             makes for keeping `pg_type` short, and the honest half of it: a name it does not \
-             have is a name that does not exist here. It closes when `numeric` lands in tier 2.",
+            "SELECT 'float'::regtype::oid, 'float(24)'::regtype::oid, 'float(25)'::regtype::oid, \
+             'float(53)'::regtype::oid",
+            FLOAT_PRECISION,
+        ),
+        ("SELECT 'float(0)'::regtype::oid", FLOAT_PRECISION),
+        ("SELECT 'float(54)'::regtype::oid", FLOAT_PRECISION),
+        (
+            "SELECT pg_typeof(NULL::float), pg_typeof(NULL::float(24)), pg_typeof(NULL::float(25))",
+            FLOAT_PRECISION,
+        ),
+        (
+            "SELECT 'decimal'::regtype::oid, pg_typeof(NULL::decimal), \
+             pg_typeof(NULL::decimal(10,2))",
+            PG_TYPEOF,
+        ),
+        (
+            "SELECT 'oid'::regtype::oid, 'name'::regtype::oid, 'regtype'::regtype::oid",
+            NO_SUCH_TYPE,
+        ),
+        (
+            "SELECT 'date'::regtype::oid, 'time'::regtype::oid, 'interval'::regtype::oid",
+            NO_SUCH_TYPE,
+        ),
+        (
+            "SELECT 'time without time zone'::regtype::oid, 'timetz'::regtype::oid, \
+             'time with time zone'::regtype::oid",
+            NO_SUCH_TYPE,
+        ),
+        (
+            "SELECT 'uuid'::regtype::oid, 'json'::regtype::oid, 'jsonb'::regtype::oid",
+            NO_SUCH_TYPE,
+        ),
+        ("SELECT '\"int4\"'::regtype::oid", NAME_SYNTAX),
+        ("SELECT '\"varchar\"'::regtype::oid", NAME_SYNTAX),
+        ("SELECT '\"integer\"'::regtype::oid", NAME_SYNTAX),
+        ("SELECT 'pg_catalog.int4'::regtype::oid", NAME_SYNTAX),
+        (
+            "SELECT 'integer[]'::regtype::oid, 'int4[]'::regtype::oid, 'text[]'::regtype::oid",
+            NO_SUCH_TYPE,
+        ),
+        (
+            "SELECT 'integer[][]'::regtype::oid, 'integer[3]'::regtype::oid",
+            NO_SUCH_TYPE,
+        ),
+        ("SELECT '_int4'::regtype::oid", NO_SUCH_TYPE),
+        (
+            "SELECT 'date'::regtype, 'numeric'::regtype, 'uuid'::regtype, 'json'::regtype, \
+             'jsonb'::regtype, 'interval'::regtype",
+            NO_SUCH_TYPE,
+        ),
+        ("SELECT 23::regtype, 1043::regtype", REVERSE),
+        ("SELECT 1007::regtype, 1009::regtype", REVERSE),
+        ("SELECT 999999::regtype", REVERSE),
+        ("SELECT 999999::regtype::text", REVERSE),
+        (
+            "SELECT '1'::regtype",
+            "PostgreSQL reads a bare number in a type name as an **OID**, so `'1'::regtype` is \
+             `1` rather than a lookup failure. The same reverse direction as `23::regtype`, \
+             reached through the forward spelling.",
+        ),
+        (
+            "SELECT 'integer'::regtype = 23",
+            "A `regtype` **is** an OID on a real server, so comparing one with an integer is `t`. \
+             Here `'integer'::regtype` is `text` and the comparison is `42883 operator does not \
+             exist: text = bigint`. The declared consequence of the `regtype`-is-`text` trade at \
+             the top of this file, and the statement that shows what it costs.",
+        ),
+        (
+            "SELECT pg_typeof('integer'::regtype), pg_typeof('integer'::regtype::oid)",
+            PG_TYPEOF,
+        ),
+        (
+            "SELECT oid, typname, typlen, typcategory FROM pg_type WHERE typname IN \
+             ('date','time','numeric','uuid','json','jsonb','interval') ORDER BY oid",
+            "**`pg_type.typlen` is a column this node's catalog view does not have**, so the \
+             statement is `42703` before any row is built. `date`, `time`, `numeric`, `json` and \
+             `jsonb` all have correct rows — `tests/pg_catalog.rs` asserts them in ActiveRecord's \
+             own query — and `uuid` and `interval` would be absent in any case.",
         ),
         (
             "SELECT 'int4[]'::regtype::oid",
@@ -95,4 +232,56 @@ fn the_statement_that_stopped_rung_2_answers() {
         node.rows("SELECT 'integer'::regtype::oid"),
         vec![vec!["23"]]
     );
+}
+
+/// Statement 390 of `schema.rb`, which stopped **all 367 suite files** in r1's run 18.
+///
+/// `SELECT 'decimal(3,2)'::regtype::oid` was `42704 type "decimal(3,2)" does not exist` on a node
+/// whose `pg_type` already listed `numeric` at 1700 — because `pg_type` derives itself from
+/// `ColumnType::ALL` and the name table did not. Two sources for one fact, and the one nobody
+/// read drifted.
+///
+/// The fix is that there is now one source: `value::type_by_name` resolves from `ColumnType::ALL`
+/// too. This test is the blocker itself, plus the two other tier-2 types that had drifted the
+/// same way and were invisible to the suite because nothing had asked for them yet.
+#[test]
+fn the_statement_that_stopped_every_suite_file() {
+    let mut node = parity::Node::new(&[]);
+    for (statement, expect) in [
+        // The blocker, in the spelling Rails writes.
+        ("SELECT 'decimal(3,2)'::regtype::oid", "1700"),
+        ("SELECT 'decimal'::regtype::oid", "1700"),
+        ("SELECT 'numeric'::regtype::oid", "1700"),
+        ("SELECT 'numeric(10,2)'::regtype::oid", "1700"),
+        // Missing the same way and never asked for, so never seen.
+        ("SELECT 'date'::regtype::oid", "1082"),
+        ("SELECT 'time'::regtype::oid", "1083"),
+        ("SELECT 'time without time zone'::regtype::oid", "1083"),
+    ] {
+        assert_eq!(node.rows(statement), vec![vec![expect]], "{statement}");
+    }
+
+    // And the number beside the name is **read**, not skipped: a bound that a real server
+    // refuses is refused here, which is what makes discarding the rest of it safe.
+    for (statement, sqlstate, message) in [
+        (
+            "SELECT 'numeric(1001,0)'::regtype::oid",
+            "22023",
+            "NUMERIC precision 1001 must be between 1 and 1000",
+        ),
+        (
+            "SELECT 'character varying(0)'::regtype::oid",
+            "22023",
+            "length for type varchar must be at least 1",
+        ),
+        (
+            "SELECT 'timestamp(-1)'::regtype::oid",
+            "42601",
+            "syntax error at or near \"-\"",
+        ),
+    ] {
+        let error = node.run(statement).unwrap_err();
+        assert_eq!(error.sqlstate(), sqlstate, "{statement}");
+        assert_eq!(error.to_string(), message, "{statement}");
+    }
 }

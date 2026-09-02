@@ -501,7 +501,7 @@ fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
 
 /// `pg_type.typname`: the internal name, which is not the one this node complains with — a column
 /// is declared `int8` and named `bigint` in an error. Measured against 19beta1, all six.
-pub(super) fn typname(ty: ColumnType) -> &'static str {
+pub(crate) fn typname(ty: ColumnType) -> &'static str {
     match ty {
         ColumnType::Int8 => "int8",
         ColumnType::Int4 => "int4",

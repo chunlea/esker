@@ -2293,7 +2293,7 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             },
         ) if cast_target(inner_type) == Some(CastTarget::RegType) => {
             let name = cast_operand(inner, data_type)?;
-            let ty = value::type_by_name(&name)
+            let ty = value::type_by_name(&name)?
                 .ok_or_else(|| SqlError::UndefinedType(name.trim().to_owned()))?;
             Ok(plan::Expr::Literal(plan::Literal::Integer(i64::from(
                 ty.oid(),
@@ -2318,7 +2318,7 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
         // `'integer'::regtype` on its own, which answers the name PostgreSQL prints it by.
         (CastTarget::RegType, _) => {
             let name = cast_operand(expr, data_type)?;
-            let ty = value::type_by_name(&name)
+            let ty = value::type_by_name(&name)?
                 .ok_or_else(|| SqlError::UndefinedType(name.trim().to_owned()))?;
             Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
                 Datum::Text(value::format_type(ty, NO_TYPMOD)),
@@ -3230,13 +3230,9 @@ fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
     }
 }
 
-/// PostgreSQL's ceiling on a declared string length, and its floor is one.
-///
-/// Measured on 19beta1, both ends: `varchar(10485761)` is `22023 length for type varchar cannot
-/// exceed 10485760` and `varchar(0)` is `22023 length for type varchar must be at least 1`. Zero
-/// is **not** legal, which is the one a reader would guess wrong — a `varchar(0)` holding only the
-/// empty string is a perfectly coherent type and PostgreSQL declines to have it.
-const MAX_STRING_LENGTH: u32 = 10_485_760;
+/// PostgreSQL's ceiling on a declared string length: [`value::MAX_TYPE_LENGTH`], which a
+/// `regtype` name is held to as well so that the two cannot disagree.
+use crate::value::MAX_TYPE_LENGTH as MAX_STRING_LENGTH;
 
 /// The declared length of a `varchar(n)` or `character(n)`, as a typmod.
 ///
