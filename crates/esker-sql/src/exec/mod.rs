@@ -38,6 +38,7 @@ pub use job::BATCH_ROWS;
 pub(crate) mod query;
 pub mod redrive;
 mod savepoint;
+mod subquery;
 mod verbs;
 
 use std::sync::Arc;
@@ -671,6 +672,10 @@ impl Executor {
         if let Some(source) = self.fragments.clone() {
             fragment::resolve(&mut planned.node, &*source, txn.start_ts());
         }
+        // And the subqueries, for the same reason and in the same place: a `Cursor` has a row and
+        // no transaction, so running them here is what puts their answers in the *same*
+        // transaction at the *same* snapshot as the plan that reads them.
+        subquery::resolve(&mut planned.node, &*txn, self.tenant)?;
         let mut cursor = cursor::Cursor::open(txn, self.tenant, &planned.node)?;
         let mut rows = Vec::new();
         while let Some(row) = cursor.next()? {
@@ -830,6 +835,19 @@ impl Executor {
 
     /// Resolves the tables a `SELECT` names and plans against them.
     fn plan_select(&self, txn: &dyn Txn, select: &crate::plan::Select) -> Result<query::Planned> {
+        // Every subquery is planned **before** the statement holding it, because the statement
+        // cannot be typed until they are: `WHERE n IN (SELECT a_id FROM b)` is `42883 operator
+        // does not exist: text = bigint`, and nothing can say so without knowing the subquery's
+        // column type. `Cow`-shaped by hand the way `resolve_sequence_calls` is — a statement with
+        // no subquery in it is planned from the caller's own `Select` and nothing is cloned.
+        let mut owned;
+        let select = if subquery::present(select) {
+            owned = select.clone();
+            subquery::plan_subqueries(&mut owned, self.tenant, &Catalogued { exec: self, txn })?;
+            &owned
+        } else {
+            select
+        };
         let table = match &select.from {
             Some(table) => Some(self.require_table(txn, &table.name)?),
             None => None,
@@ -872,6 +890,7 @@ impl Executor {
                     if let Some(source) = self.fragments.clone() {
                         fragment::resolve(&mut planned.node, &*source, txn.start_ts());
                     }
+                    subquery::resolve(&mut planned.node, txn, self.tenant)?;
                     let mut cursor = cursor::Cursor::open(txn, self.tenant, &planned.node)?;
                     while cursor.next()?.is_some() {}
                 }
@@ -1381,5 +1400,21 @@ impl Execute for Executor {
             return Ok(());
         };
         txn.rollback()
+    }
+}
+
+/// The catalog as a subquery's planner sees it: one lookup, in this transaction.
+///
+/// A borrowed pair rather than a method on [`Executor`], because `crate::exec::subquery` is given
+/// exactly what it needs and no way to start a statement of its own — a subquery names tables, and
+/// that is the whole of its access to anything outside its own plan.
+struct Catalogued<'a> {
+    exec: &'a Executor,
+    txn: &'a dyn Txn,
+}
+
+impl subquery::Tables for Catalogued<'_> {
+    fn get(&self, name: &str) -> Result<Arc<crate::catalog::TableDef>> {
+        self.exec.require_table(self.txn, name)
     }
 }

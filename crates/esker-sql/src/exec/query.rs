@@ -1509,6 +1509,9 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         | Expr::Not(_)
         | Expr::IsNull { .. }
         | Expr::InList { .. } => ColumnType::Bool,
+        // A scalar subquery has the type of the column it returns and the other four are
+        // predicates, which is the whole of what `SubqueryExpr::value_type` says.
+        Expr::Subquery(sub) => sub.value_type(),
         Expr::Parameter(number) => return Err(SqlError::UndefinedParameter(*number)),
         // An aggregate's type is the aggregation's business, and by the time a plan is typed
         // every one of them has been rewritten into an `Ordinal` carrying the answer. One here

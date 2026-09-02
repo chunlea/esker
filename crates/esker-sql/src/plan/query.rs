@@ -702,6 +702,13 @@ fn render(expr: &Expr, columns: &[String]) -> String {
             render(operand, columns),
             if *negated { "NOT " } else { "" }
         ),
+        // The sub-plan is **not** printed inside the condition. It is a tree, and a tree rendered
+        // on one line is unreadable; what a reader needs here is that there is a subquery and
+        // which kind, the way PostgreSQL prints `SubPlan 1` and puts the plan below.
+        Expr::Subquery(sub) => match &sub.operand {
+            Some(operand) => format!("{} {}", render(operand, columns), sub.kind.describe()),
+            None => sub.kind.describe().to_owned(),
+        },
         Expr::Default => "DEFAULT".to_owned(),
         Expr::Sequence(call) => match (&call.name, call.value) {
             (Some(name), Some(value)) => format!("{}('{name}', {value})", call.func.name()),

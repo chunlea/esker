@@ -56,6 +56,15 @@ impl fmt::Display for Severity {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SqlError {
+    /// A subquery written where one value goes returned more than one row.
+    ///
+    /// PostgreSQL's own sentence, verbatim. It is raised **while the statement runs** rather than
+    /// while it is planned, which is not a detail: the same statement is fine on a snapshot where
+    /// the subquery matches one row and `21000` on the next, and a client that saw it at plan time
+    /// would be told its SQL was wrong when its data had changed.
+    #[error("more than one row returned by a subquery used as an expression")]
+    CardinalityViolation,
+
     /// Contract C2. The statement parsed and we will not run it — the feature is named so the
     /// message reads the way PostgreSQL's own does.
     #[error("{0} is not supported")]
@@ -799,6 +808,7 @@ impl SqlError {
             SqlError::FeatureNotSupported(_) | SqlError::SnapshotIsolationRequired => {
                 sqlstate::FEATURE_NOT_SUPPORTED
             }
+            SqlError::CardinalityViolation => sqlstate::CARDINALITY_VIOLATION,
             SqlError::Syntax { .. }
             | SqlError::InsertTooManyExpressions
             | SqlError::SyntaxAtOrNear(_) => sqlstate::SYNTAX_ERROR,

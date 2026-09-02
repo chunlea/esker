@@ -455,6 +455,11 @@ fn push_filter(
             }
         }
         Expr::InList { .. } => return Err(refused("IN inside a pushed-down filter")),
+        // A fragment's filter language has no subquery in it, and adding one would mean sending a
+        // plan to a learner rather than an expression. `docs/plans/phase-12-subquery.md` §4 says
+        // this refusal is by construction rather than by remembering to check, and this is the
+        // line it means: a query with a subquery in its `WHERE` runs on rows.
+        Expr::Subquery(sub) => return Err(refused(sub.kind.describe())),
         Expr::Column { .. } => return Err(refused("an unresolved column")),
         Expr::Parameter(_) => return Err(refused("a parameter inside a pushed-down filter")),
         Expr::Default | Expr::Sequence(_) | Expr::Aggregate(_) => {
@@ -630,6 +635,13 @@ fn collect_columns(expr: &Expr, into: &mut Vec<usize>) {
         Expr::Aggregate(call) => {
             for arg in &call.args {
                 collect_columns(arg, into);
+            }
+        }
+        // Only the operand: everything inside the sub-select is resolved against the sub-select's
+        // own row, so a position in it is a position in a different row entirely.
+        Expr::Subquery(sub) => {
+            if let Some(operand) = &sub.operand {
+                collect_columns(operand, into);
             }
         }
         Expr::Literal(_)

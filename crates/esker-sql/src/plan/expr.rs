@@ -124,6 +124,16 @@ pub enum Expr {
     /// once per statement in the order the statement names it. The executor evaluates these before
     /// it plans and substitutes the values it got; one reaching a row evaluator is a planner bug.
     Sequence(Box<SequenceCall>),
+    /// A subquery written where a value goes — `(SELECT …)`, `EXISTS (…)`, `x IN (SELECT …)`,
+    /// `x = ANY (SELECT …)`.
+    ///
+    /// **Never evaluated with its `run` field empty**, for the same reason a
+    /// [`crate::plan::routing::Columnar`] node is never opened unresolved: the value it carries
+    /// comes from *running* a plan, which the row evaluator has no transaction to do until
+    /// `crate::exec::subquery` has given it one. An unresolved one says so rather than answering
+    /// "no rows", because no rows from a scalar subquery is a **NULL** and a NULL looks like an
+    /// answer (`docs/plans/phase-12-subquery.md` §1).
+    Subquery(Box<crate::plan::SubqueryExpr>),
     /// An aggregate call — `count(*)`, `sum(a)`, `min(DISTINCT b)`.
     ///
     /// **Never evaluated.** It is a value *of a group*, not of a row, so the executor's
@@ -552,5 +562,6 @@ fn describe(expr: &Expr) -> &'static str {
         Expr::Aggregate(_) => "an aggregate function",
         Expr::Default => "DEFAULT",
         Expr::Sequence(_) => "a sequence function",
+        Expr::Subquery(sub) => sub.kind.describe(),
     }
 }

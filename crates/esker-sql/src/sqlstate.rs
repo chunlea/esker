@@ -33,6 +33,16 @@ pub const PROTOCOL_VIOLATION: &str = "08P01";
 /// can read but cannot run comes back as this, naming the feature.
 pub const FEATURE_NOT_SUPPORTED: &str = "0A000";
 
+// --- Class 21 — Cardinality Violation ---
+
+/// A subquery used where one value goes returned more than one row.
+///
+/// The whole of class 21, and it is a class of its own rather than a data exception because the
+/// wrong thing is the *number of rows*, not the values in them: PostgreSQL raises it while the
+/// statement runs and only when the rows are actually there, so the same statement can succeed on
+/// one snapshot and raise on the next (`docs/plans/phase-12-subquery.md` §1).
+pub const CARDINALITY_VIOLATION: &str = "21000";
+
 // --- Class 22 — Data Exception ---
 
 /// A literal could not be read as its target type — `'abc'::int8`.
@@ -287,6 +297,7 @@ mod tests {
             super::DEPENDENT_OBJECTS_STILL_EXIST,
         ),
         ("INVALID_CATALOG_NAME", super::INVALID_CATALOG_NAME),
+        ("CARDINALITY_VIOLATION", super::CARDINALITY_VIOLATION),
         ("SYNTAX_ERROR", super::SYNTAX_ERROR),
         ("UNDEFINED_COLUMN", super::UNDEFINED_COLUMN),
         ("UNDEFINED_TABLE", super::UNDEFINED_TABLE),

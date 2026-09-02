@@ -1,0 +1,173 @@
+# What a real PostgreSQL 19beta1 does with a **subquery in an expression** -- phase 12 unit 1
+# (`docs/plans/phase-12-subquery.md`). Every line below was put to the `esker-pg19` container
+# before a line of the implementation was written, in ONE session inside `BEGIN ... ROLLBACK` with
+# `ON_ERROR_ROLLBACK on`, so the shared oracle is left exactly as it was found.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# It builds its own tables. `sq_e` is empty on purpose: an empty subquery is the case every rule
+# below turns on.
+#
+# THE FIVE THINGS THAT WOULD HAVE BEEN GOT WRONG BY READING RATHER THAN MEASURING:
+#
+#   1. **An empty subquery beats a NULL left-hand side.** `NULL IN (SELECT ... no rows)` is
+#      **false**, not NULL -- where `NULL IN (1)` is NULL. So emptiness is decided *before* the
+#      three-valued rule, and an implementation that short-circuited on a NULL operand (which is
+#      exactly what `IN (list)` correctly does, because PostgreSQL's grammar has no empty list)
+#      answers NULL and drops a row. Same for `NULL = ANY (empty)` = f, `NULL <> ALL (empty)` = t
+#      and `NULL > ALL (empty)` = t.
+#   2. **Two different messages for one mistake.** A subquery with two columns is
+#      `42601 subquery must return only one column` where it is used as a *scalar*, and
+#      `42601 subquery has too many columns` under `IN` and under `ANY`/`ALL`. Same SQLSTATE,
+#      different sentence, and a client that greps the text sees two.
+#   3. **A scalar subquery returning no rows is NULL, and returning two is `21000`** -- an error,
+#      not the first row. The error is per *execution*, so it is only reachable when the rows are.
+#   4. **`ANY`/`ALL` are three-valued in the same asymmetric way `IN` is, per operator**: a
+#      definite match makes `ANY` true whatever NULLs are beside it (`100 = ANY (100,200,NULL)`
+#      is t), a definite failure makes `ALL` false (`100 > ALL (100,200,NULL)` is f), and with
+#      neither, a NULL anywhere makes it unknown (`300 > ALL (100,200,NULL)` is NULL).
+#   5. **A scalar subquery in a target list is named after the subquery's own column** -- `max`,
+#      `id`, `count`, or the inner `AS` -- while `EXISTS (...)` is named `exists` and `NOT EXISTS`,
+#      `IN` and `= ANY` are all `?column?`. Measured with `psql`, which the corpus format cannot
+#      record; `tests/subquery.rs` asserts it.
+#
+# And one that reads as a trap and is not: `EXISTS (SELECT 1/0 FROM sq_e)` is **false** rather than
+# `22012`, because a subquery over no rows evaluates no expression.
+CREATE TABLE sq_a (id int8 PRIMARY KEY, n text, k int8)		-
+INSERT INTO sq_a VALUES (1, 'one', 7), (2, 'two', NULL), (3, NULL, 9)		-
+CREATE TABLE sq_b (id int8 PRIMARY KEY, a_id int8, v int8)		-
+INSERT INTO sq_b VALUES (10, 1, 100), (11, 1, 200), (12, 3, NULL)		-
+CREATE TABLE sq_e (id int8 PRIMARY KEY, v int8)		-
+
+# --- a scalar subquery: one value, and what happens when it is not one
+SELECT (SELECT max(id) FROM sq_a)	bigint	3
+SELECT (SELECT id FROM sq_a WHERE id = 2)	bigint	2
+SELECT (SELECT id FROM sq_a WHERE id = 99)	bigint	\N
+SELECT (SELECT id FROM sq_e)	bigint	\N
+SELECT (SELECT id FROM sq_a)	!21000 more than one row returned by a subquery used as an expression
+SELECT (SELECT id FROM sq_a WHERE id IN (1,2))	!21000 more than one row returned by a subquery used as an expression
+SELECT (SELECT id FROM sq_a ORDER BY id LIMIT 1)	bigint	1
+SELECT (SELECT id, n FROM sq_a WHERE id = 1)	!42601 subquery must return only one column
+SELECT (SELECT n FROM sq_a WHERE id = 3)	text	\N
+SELECT (SELECT n FROM sq_a WHERE id = 1) = 'one'	boolean	t
+SELECT id, (SELECT max(v) FROM sq_b) FROM sq_a ORDER BY id	bigint,bigint	1|200 ; 2|200 ; 3|200
+SELECT id FROM sq_a WHERE id = (SELECT max(id) FROM sq_a)	bigint	3
+SELECT id FROM sq_a WHERE (SELECT max(id) FROM sq_a) = id	bigint	3
+SELECT id FROM sq_a WHERE id > (SELECT min(id) FROM sq_a) ORDER BY id	bigint	2 ; 3
+SELECT id FROM sq_a WHERE id = (SELECT id FROM sq_e)	bigint	-
+SELECT id FROM sq_a WHERE k = (SELECT max(v) FROM sq_b)	bigint	-
+SELECT id FROM sq_a WHERE id = (SELECT count(*) FROM sq_b) ORDER BY id	bigint	3
+SELECT (SELECT (SELECT max(id) FROM sq_a))	bigint	3
+SELECT (SELECT count(*) FROM sq_a)	bigint	3
+SELECT (SELECT count(*) FROM sq_e)	bigint	0
+SELECT (SELECT max(id) FROM sq_e)	bigint	\N
+SELECT (SELECT max(id) FROM sq_a WHERE id > 99)	bigint	\N
+SELECT (SELECT max(id) FROM sq_a) IS NULL	boolean	f
+SELECT (SELECT max(id) FROM sq_e) IS NULL	boolean	t
+SELECT (SELECT a_id FROM sq_b GROUP BY a_id HAVING count(*) = 2)	bigint	1
+SELECT max((SELECT max(id) FROM sq_a))	bigint	3
+
+# --- EXISTS and NOT EXISTS: a row is a row, whatever is in it
+SELECT EXISTS (SELECT 1 FROM sq_a)	boolean	t
+SELECT EXISTS (SELECT 1 FROM sq_e)	boolean	f
+SELECT NOT EXISTS (SELECT 1 FROM sq_e)	boolean	t
+SELECT EXISTS (SELECT NULL FROM sq_a)	boolean	t
+SELECT EXISTS (SELECT 1 FROM sq_a WHERE id = 99)	boolean	f
+SELECT EXISTS (SELECT id, n FROM sq_a)	boolean	t
+SELECT EXISTS (SELECT * FROM sq_a WHERE n IS NULL)	boolean	t
+SELECT EXISTS (SELECT 1 FROM sq_a LIMIT 0)	boolean	f
+SELECT EXISTS (SELECT 1/0 FROM sq_e)	boolean	f
+SELECT id FROM sq_a WHERE EXISTS (SELECT 1 FROM sq_b) ORDER BY id	bigint	1 ; 2 ; 3
+SELECT id FROM sq_a WHERE NOT EXISTS (SELECT 1 FROM sq_b) ORDER BY id	bigint	-
+SELECT id FROM sq_a WHERE EXISTS (SELECT 1 FROM sq_e) ORDER BY id	bigint	-
+SELECT id FROM sq_a WHERE EXISTS (SELECT 1 FROM sq_b) AND id > 1 ORDER BY id	bigint	2 ; 3
+SELECT id FROM sq_a WHERE EXISTS (SELECT 1 FROM sq_e) OR id = 2 ORDER BY id	bigint	2
+SELECT id, EXISTS (SELECT 1 FROM sq_e) FROM sq_a ORDER BY id	bigint,boolean	1|f ; 2|f ; 3|f
+
+# --- IN (subquery): the three-valued rule `pg19_in.txt` pins for a list, plus the empty case
+SELECT id FROM sq_a WHERE id IN (SELECT a_id FROM sq_b) ORDER BY id	bigint	1 ; 3
+SELECT id FROM sq_a WHERE id NOT IN (SELECT a_id FROM sq_b) ORDER BY id	bigint	2
+SELECT id FROM sq_a WHERE NOT (id IN (SELECT a_id FROM sq_b)) ORDER BY id	bigint	2
+SELECT id FROM sq_a WHERE id IN (SELECT id FROM sq_e) ORDER BY id	bigint	-
+SELECT id FROM sq_a WHERE id NOT IN (SELECT id FROM sq_e) ORDER BY id	bigint	1 ; 2 ; 3
+SELECT id FROM sq_a WHERE id IN (SELECT v FROM sq_b) ORDER BY id	bigint	-
+SELECT id FROM sq_a WHERE id NOT IN (SELECT v FROM sq_b) ORDER BY id	bigint	-
+SELECT id FROM sq_a WHERE id NOT IN (SELECT a_id FROM sq_b WHERE a_id IS NOT NULL) ORDER BY id	bigint	2
+SELECT 1 IN (SELECT v FROM sq_b)	boolean	\N
+SELECT 1 NOT IN (SELECT v FROM sq_b)	boolean	\N
+SELECT 100 IN (SELECT v FROM sq_b)	boolean	t
+SELECT 100 NOT IN (SELECT v FROM sq_b)	boolean	f
+SELECT NULL IN (SELECT a_id FROM sq_b)	boolean	\N
+SELECT NULL NOT IN (SELECT a_id FROM sq_b)	boolean	\N
+SELECT 1 IN (SELECT v FROM sq_e)	boolean	f
+SELECT 1 NOT IN (SELECT v FROM sq_e)	boolean	t
+SELECT NULL IN (SELECT v FROM sq_e)	boolean	f
+SELECT NULL NOT IN (SELECT v FROM sq_e)	boolean	t
+SELECT 1 IN (SELECT 1)	boolean	t
+SELECT id, id IN (SELECT a_id FROM sq_b) FROM sq_a ORDER BY id	bigint,boolean	1|t ; 2|f ; 3|t
+SELECT k IN (SELECT v FROM sq_b) FROM sq_a ORDER BY id	boolean	\N ; \N ; \N
+SELECT k NOT IN (SELECT v FROM sq_b) FROM sq_a ORDER BY id	boolean	\N ; \N ; \N
+SELECT DISTINCT id IN (SELECT a_id FROM sq_b) FROM sq_a ORDER BY 1	boolean	f ; t
+SELECT id FROM sq_a WHERE id IN (SELECT id, a_id FROM sq_b)	!42601 subquery has too many columns
+SELECT id FROM sq_a WHERE n IN (SELECT a_id FROM sq_b)	!42883 operator does not exist: text = bigint DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT id FROM sq_a WHERE id IN (SELECT a_id FROM sq_b ORDER BY a_id) ORDER BY id	bigint	1 ; 3
+SELECT id FROM sq_a WHERE id IN (SELECT DISTINCT a_id FROM sq_b) ORDER BY id	bigint	1 ; 3
+SELECT id FROM sq_a WHERE id IN (SELECT a_id FROM sq_b WHERE v IS NOT NULL) ORDER BY id	bigint	1
+SELECT id FROM sq_a WHERE id IN (SELECT a_id FROM sq_b LIMIT 1) ORDER BY id	bigint	1
+SELECT id FROM sq_a WHERE id IN (SELECT a_id FROM sq_b OFFSET 1) ORDER BY id	bigint	1 ; 3
+SELECT id FROM sq_a WHERE id IN (SELECT b.a_id FROM sq_b AS b JOIN sq_a AS a2 ON a2.id = b.a_id) ORDER BY id	bigint	1 ; 3
+SELECT id FROM sq_a WHERE id IN (SELECT a_id FROM sq_b WHERE a_id IN (SELECT id FROM sq_a WHERE id = 1)) ORDER BY id	bigint	1
+
+# --- ANY, SOME and ALL with a subquery, per operator
+SELECT 1 = ANY (SELECT a_id FROM sq_b)	boolean	t
+SELECT 2 = ANY (SELECT a_id FROM sq_b)	boolean	f
+SELECT 1 = SOME (SELECT a_id FROM sq_b)	boolean	t
+SELECT 1 <> ALL (SELECT a_id FROM sq_b)	boolean	f
+SELECT 2 <> ALL (SELECT a_id FROM sq_b)	boolean	t
+SELECT 1 = ANY (SELECT v FROM sq_b)	boolean	\N
+SELECT 100 = ANY (SELECT v FROM sq_b)	boolean	t
+SELECT 1 <> ALL (SELECT v FROM sq_b)	boolean	\N
+SELECT 100 <> ALL (SELECT v FROM sq_b)	boolean	f
+SELECT 1 = ANY (SELECT v FROM sq_e)	boolean	f
+SELECT 1 <> ALL (SELECT v FROM sq_e)	boolean	t
+SELECT 1 > ALL (SELECT v FROM sq_e)	boolean	t
+SELECT 1 < ANY (SELECT v FROM sq_e)	boolean	f
+SELECT NULL = ANY (SELECT v FROM sq_e)	boolean	f
+SELECT NULL <> ALL (SELECT v FROM sq_e)	boolean	t
+SELECT NULL > ALL (SELECT v FROM sq_e)	boolean	t
+SELECT 4 > ANY (SELECT id FROM sq_a)	boolean	t
+SELECT 4 > ALL (SELECT id FROM sq_a)	boolean	t
+SELECT 2 > ALL (SELECT id FROM sq_a)	boolean	f
+SELECT 2 >= ANY (SELECT id FROM sq_a)	boolean	t
+SELECT 2 <= ALL (SELECT id FROM sq_a)	boolean	f
+SELECT 1 <= ALL (SELECT id FROM sq_a)	boolean	t
+SELECT 3 < ANY (SELECT id FROM sq_a)	boolean	f
+SELECT NULL = ANY (SELECT id FROM sq_a)	boolean	\N
+SELECT NULL <> ALL (SELECT id FROM sq_a)	boolean	\N
+SELECT 100 > ALL (SELECT v FROM sq_b)	boolean	f
+SELECT 100 > ANY (SELECT v FROM sq_b)	boolean	\N
+SELECT 300 > ALL (SELECT v FROM sq_b)	boolean	\N
+SELECT id FROM sq_a WHERE id = ANY (SELECT a_id FROM sq_b) ORDER BY id	bigint	1 ; 3
+SELECT id FROM sq_a WHERE id <> ALL (SELECT a_id FROM sq_b) ORDER BY id	bigint	2
+SELECT id FROM sq_a WHERE id < ALL (SELECT v FROM sq_b) ORDER BY id	bigint	-
+SELECT 1 = ANY (SELECT id, a_id FROM sq_b)	!42601 subquery has too many columns
+
+# --- where a subquery is and is not allowed, and what it is not
+SELECT count(*) FROM sq_a WHERE id IN (SELECT a_id FROM sq_b)	bigint	2
+SELECT count(*) FROM sq_a HAVING count(*) > (SELECT count(*) FROM sq_b)	bigint	-
+SELECT count(*) FROM sq_a HAVING count(*) > (SELECT count(*) FROM sq_e)	bigint	3
+SELECT id FROM sq_a ORDER BY (SELECT max(v) FROM sq_b), id	bigint	1 ; 2 ; 3
+SELECT id FROM sq_a GROUP BY id, (SELECT 1) ORDER BY id	bigint	1 ; 2 ; 3
+SELECT id FROM sq_a LIMIT (SELECT count(*) FROM sq_b)	bigint	1 ; 2 ; 3
+SELECT id FROM sq_a WHERE (SELECT count(*) FROM sq_b) > 2 ORDER BY id	bigint	1 ; 2 ; 3
+SELECT id FROM sq_a WHERE (SELECT max(id) FROM sq_a) ORDER BY id	!42804 argument of WHERE must be type boolean, not type bigint
+SELECT * FROM sq_a WHERE id IN (SELECT a_id FROM sq_b) ORDER BY id	bigint,text,bigint	1|one|7 ; 3|\N|9
+
+# --- and once a NULL is in the column IN reads, NOT IN matches nothing at all
+INSERT INTO sq_b VALUES (13, NULL, 300)		-
+SELECT id FROM sq_a WHERE id IN (SELECT a_id FROM sq_b) ORDER BY id	bigint	1 ; 3
+SELECT id FROM sq_a WHERE id NOT IN (SELECT a_id FROM sq_b) ORDER BY id	bigint	-
+SELECT 2 = ANY (SELECT a_id FROM sq_b)	boolean	\N
+SELECT 2 <> ALL (SELECT a_id FROM sq_b)	boolean	\N

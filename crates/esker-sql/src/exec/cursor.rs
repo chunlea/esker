@@ -762,6 +762,18 @@ pub(super) fn evaluate(expr: &Expr, row: &[Datum]) -> Result<Datum> {
             ));
         }
 
+        // Its rows were produced before this cursor was opened, by `crate::exec::subquery::resolve`
+        // -- the same arrangement a `Node::Columnar` has, and for the same reason: this function
+        // has a row and no transaction. What is left here is turning those rows into one value,
+        // which is three-valued logic and lives beside the rules it implements.
+        Expr::Subquery(sub) => {
+            let operand = match &sub.operand {
+                Some(operand) => Some(evaluate(operand, row)?),
+                None => None,
+            };
+            crate::exec::subquery::value(sub, operand)?
+        }
+
         Expr::IsNull { operand, negated } => {
             let value = evaluate(operand, row)?;
             Datum::Bool(matches!(value, Datum::Null) != *negated)

@@ -1170,7 +1170,92 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
         Expr::Cast {
             expr, data_type, ..
         } => lower_cast(expr, data_type),
+        // The five spellings of a subquery in an expression. Each carries the sub-select lowered
+        // the same way the outer one is -- `lower_query` refuses inside a subquery exactly what it
+        // refuses outside one, so a `WITH` or a second `JOIN` in there is the same `0A000` by the
+        // same name (`docs/plans/phase-12-subquery.md` §3).
+        Expr::Subquery(query) => Ok(plan::Expr::Subquery(Box::new(plan::SubqueryExpr::bare(
+            plan::SubqueryKind::Scalar,
+            Box::new(lower_query(query)?),
+        )))),
+        Expr::Exists { subquery, negated } => {
+            Ok(plan::Expr::Subquery(Box::new(plan::SubqueryExpr::bare(
+                plan::SubqueryKind::Exists { negated: *negated },
+                Box::new(lower_query(subquery)?),
+            ))))
+        }
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => Ok(plan::Expr::Subquery(Box::new(
+            plan::SubqueryExpr::compared(
+                plan::SubqueryKind::In { negated: *negated },
+                lower_expr(expr)?,
+                Box::new(lower_query(subquery)?),
+            ),
+        ))),
+        // `ANY`/`SOME` and `ALL` are one shape with a flag, and `SOME` is not carried at all: it is
+        // a **spelling** of `ANY` rather than a second operator, and a real server answers the two
+        // identically (measured, `SELECT 1 = SOME (SELECT …)`).
+        Expr::AnyOp {
+            left,
+            compare_op,
+            right,
+            ..
+        } => lower_quantified(left, compare_op, right, false),
+        Expr::AllOp {
+            left,
+            compare_op,
+            right,
+        } => lower_quantified(left, compare_op, right, true),
         other => Err(SqlError::unsupported(format!("the expression {other}"))),
+    }
+}
+
+/// `x <op> ANY (SELECT …)` and `x <op> ALL (SELECT …)`.
+///
+/// The right-hand side has to be a **subquery**. `= ANY (array)` is the same grammar over a value
+/// of an array type, which this node has no types for yet, and it is refused by that name rather
+/// than by "the expression", so a reader searching for what is missing finds the array and not the
+/// quantifier (`docs/plans/phase-12-subquery.md` §4).
+fn lower_quantified(
+    left: &Expr,
+    compare_op: &BinaryOperator,
+    right: &Expr,
+    all: bool,
+) -> Result<plan::Expr> {
+    let op = match compare_op {
+        BinaryOperator::Eq => plan::BinaryOp::Eq,
+        BinaryOperator::NotEq => plan::BinaryOp::NotEq,
+        BinaryOperator::Lt => plan::BinaryOp::Lt,
+        BinaryOperator::LtEq => plan::BinaryOp::LtEq,
+        BinaryOperator::Gt => plan::BinaryOp::Gt,
+        BinaryOperator::GtEq => plan::BinaryOp::GtEq,
+        other => {
+            return Err(SqlError::unsupported(format!(
+                "the operator {other} with ANY/ALL"
+            )));
+        }
+    };
+    let quantifier = if all { "ALL" } else { "ANY" };
+    let Expr::Subquery(query) = strip_nesting(right) else {
+        return Err(SqlError::unsupported(format!("{quantifier} over an array")));
+    };
+    Ok(plan::Expr::Subquery(Box::new(
+        plan::SubqueryExpr::compared(
+            plan::SubqueryKind::Quantified { op, all },
+            lower_expr(left)?,
+            Box::new(lower_query(query)?),
+        ),
+    )))
+}
+
+/// Past any number of `(…)` wrappers, which is how `= ANY ((SELECT …))` parses.
+fn strip_nesting(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Nested(inner) => strip_nesting(inner),
+        other => other,
     }
 }
 
