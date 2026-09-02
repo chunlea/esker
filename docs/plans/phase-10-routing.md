@@ -396,6 +396,13 @@ changes. DESIGN.md §16's "Not built here" paragraph loses planner routing and `
   to rows rather than double-counting. What that leaves is a table that stops being routable until
   the plan is rebuilt, which is a performance bound and not a wrong answer. A split-aware columnar
   copy is `esker-store`'s and is not in this milestone.
+* **`esker-store::promotion::a_learner_on_a_fresh_store_becomes_a_voter_under_load`, seen twice**
+  under a full workspace run and passing standalone in 34 s both times. It fails at
+  `promotion.rs:308` — its own 30-second `PROMOTION_DEADLINE`, an assertion rather than a timeout —
+  so nextest's slow-test handling is not what governs it; what governs it is that a learner has to
+  become a voter within thirty seconds on a machine running two thousand other tests. Its name
+  says "under load" and this is that, arriving from the wrong direction. In the serialised cluster
+  group since this lane added one, which bounds the *clusters* and not the rest of the suite.
 * **`esker-cli::cluster_start` under a full workspace run, seen twice.** Both of its tests passed
   standalone in 0.57 s and each failed once at its own 60-second budget during
   `cargo nextest run --workspace` — once before `.config/nextest.toml` put the CLI's cluster
