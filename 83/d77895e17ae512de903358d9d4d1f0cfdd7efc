@@ -1,0 +1,27 @@
+crates/esker-store/src/columnar/region.rs
+  s_7a3132f4d02a00::t_7d149380e5fa1b 240,242-247,249-251,253,263-270,272-273
+crates/esker-store/src/server.rs
+  s_7a3132f4d02a00::t_6f428d46009f3b 2241-2257,2260-2262,2275,2307
+crates/esker-store/tests/schema_fetch.rs
+  s_7a3132f4d02a00::t_94ee1829302a96 149,161-196,323-335,357,366-465
+docs/adr/0037-a-columnar-learner-fetches-the-schema-it-cannot-read.md
+  s_7a3132f4d02a00::t_546da0177914f3 3-4,76-83,89-98
+docs/plans/debt-c3.md
+  s_7a3132f4d02a00::t_901984fbd45a76 546-594
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "83d77895e17ae512de903358d9d4d1f0cfdd7efc",
+  "prompts": {},
+  "sessions": {
+    "s_7a3132f4d02a00": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "176f3779-1c8f-49ac-8e22-08bb3b8ac7c3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
