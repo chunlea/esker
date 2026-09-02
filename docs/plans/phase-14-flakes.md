@@ -470,6 +470,50 @@ read.
 
 ---
 
+## U4 — the gate
+
+`just check` — `fmt-check`, `clippy`, `deny`, `test`, `doc` — run **six times**, three at `eb97ea8`
+and three at the merge that brings `main`'s `73c7cfc` in, every one of them beside a
+`cargo build --workspace --tests` loop running from a detached worktree with its own
+`CARGO_TARGET_DIR`. Load average through them was around 20 on an eight-core machine, with two
+other lanes building.
+
+| | at `eb97ea8` ×3 | at the merge ×3 |
+|---|---|---|
+| `cargo fmt --all --check` | ✅ ✅ ✅ | ✅ ✅ ✅ |
+| `cargo clippy --workspace --all-targets --all-features -D warnings` | ✅ ✅ ✅ | ✅ ✅ ✅ |
+| `cargo deny check` | ✅ ✅ ✅ | ✅ ✅ ✅ |
+| `cargo nextest run --workspace --all-features` | **2587 of 2587**, ×3 | **2594 of 2594**, ×3 |
+| `cargo doc` | ❌ ×3, **not this lane's** | ❌ ×3, the same one |
+
+The first four steps are proven by the fifth being reached: `just check` stops at the first failure
+and `doc` is last.
+
+**Six for six on the test step**, and that step is what this lane is about: it runs `redrive`,
+`promotion`, `cluster_start` and `pd_wiring` in the same parallel run the sightings came from.
+
+### The one failure, and it is on `main`
+
+```
+error: public documentation for `pg_relations` links to private item `crate::catalog::record`
+  --> crates/esker-sql/src/catalog/pg_relations.rs:13:15
+```
+
+From `1b4e57e`, which is on `main`; this lane touches nothing under `crates/esker-sql/src/catalog/`.
+The same class as `d1a798f` ("two public doc comments linked private items, which `just doc`
+denies") and as debt wave c4's own gate, and handed over the same way that one was — as the exact
+diff rather than as an edit in another lane's file:
+
+```diff
+--- a/crates/esker-sql/src/catalog/pg_relations.rs
++++ b/crates/esker-sql/src/catalog/pg_relations.rs
+@@
+-//! tenant ([`crate::catalog::record`]), so no two relations of one tenant can share one.
++//! tenant (`crate::catalog::record`), so no two relations of one tenant can share one.
+```
+
+---
+
 ## 2. Units
 
 | unit | test | done when |
@@ -478,7 +522,21 @@ read.
 | U1 | `redrive::two_re_drivers_racing_take_each_step_exactly_once` | deterministic repro, mechanism, fix, regression red-first, 50 of 50 green |
 | U2 | `promotion::a_learner_on_a_fresh_store_becomes_a_voter_under_load` | the same, or the evidence that the remainder is a clock and the test made to watch an event |
 | U3 | `cluster_start` and `pd_wiring::an_alter_reports_every_range…` | the same, for each |
-| U4 | the gate | `just check` three times in a row under load, recorded below |
+| U4 | the gate | `just check` **six** times under load — three before the merge and three after — recorded above |
+
+## What this lane found, in one list
+
+| # | where | what |
+|---|---|---|
+| 1 | `esker-sql` `exec/verbs.rs`, `exec/job.rs` | a schema job finished by another node was reported as `XX000`, one transaction from `job::unwind` tearing down an index that is already `public` |
+| 2 | `esker-store` `server.rs` | a re-derived `AddPeer` put a **second peer of one region on one store**, which no store can create and PD counts as a replica |
+| 3 | `esker-store` `server.rs`, `transport.rs` | and the check for it read the applied record, which does not yet hold a conf change that is already in force |
+| 4 | `esker-sql` `tests/standin_pd` | one lease constant served the test that watches a lapse and the test that must not have one |
+| 5 | `esker-cli` `tests/cluster_start.rs` | a port band that contained another cluster test's band entirely |
+
+Three of the five are in `src/`. Two of the four tests were failing for a reason that was not the
+system, and **both of those had already been mitigated** — one by the serialised nextest group, one
+by a Gatekeeper warm-up — which is what a mitigation does to a diagnosis.
 
 ## 3. What this lane will NOT do
 
