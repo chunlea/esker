@@ -356,6 +356,9 @@ pub(super) struct Planned {
 /// is not changing still have to be written back, and the index entries it is replacing were built
 /// from the old ones.
 pub(super) fn matching_rows(filter: Option<&Expr>, tenant: u64, table: &TableDef) -> Result<Node> {
+    if let Some(filter) = filter {
+        crate::exec::subquery::refuse_in(filter, "the WHERE of a statement that writes")?;
+    }
     let mut node = access_path(filter, tenant, table)?;
     if let Some(filter) = filter {
         let scope = Scope::single(table);
@@ -697,6 +700,11 @@ pub(super) type TargetList = (Vec<(String, ColumnType, i32)>, Vec<Expr>);
 /// order under the same names. An aggregate is refused here rather than resolved: there is no
 /// group in a statement that writes rows, and PostgreSQL says so.
 pub(super) fn returning_columns(items: &[SelectItem], table: &TableDef) -> Result<TargetList> {
+    for item in items {
+        if let SelectItem::Expr { expr, .. } = item {
+            crate::exec::subquery::refuse_in(expr, "a RETURNING list")?;
+        }
+    }
     let scope = Scope::single(table);
     let select = Select {
         from: Some(crate::plan::TableRef::bare(table.name.clone())),
@@ -1345,6 +1353,7 @@ fn pinned(ordinals: &[usize], equalities: &[(usize, Datum)]) -> Option<Vec<Datum
 
 /// Resolves a column reference against one table — what `UPDATE`'s `SET` expressions need.
 pub(super) fn resolve_against(expr: &Expr, table: &TableDef) -> Result<Expr> {
+    crate::exec::subquery::refuse_in(expr, "an UPDATE assignment")?;
     resolve(expr, &Scope::single(table))
 }
 

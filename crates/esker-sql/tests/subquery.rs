@@ -349,6 +349,53 @@ fn the_shapes_this_phase_does_not_run_name_themselves() {
     );
 }
 
+/// A subquery in a statement that **writes** is `0A000` naming the construct and the clause.
+///
+/// This phase is the read path. A statement that writes never reaches the pass that plans
+/// subqueries, so without a refusal each of these arrives at the row evaluator with no plan behind
+/// it and answers `XX000 internal error` — a code that says *this server has a bug* about a
+/// statement a real server runs. Every one of them is a `0A000` instead, which is what
+/// `docs/plans/phase-12-subquery.md` §4 promises and what a later phase turns into an answer.
+#[test]
+fn a_subquery_in_a_statement_that_writes_names_itself() {
+    let mut node = parity::Node::new(FIXTURE);
+
+    for (statement, named) in [
+        (
+            "UPDATE sq_a SET k = 9 WHERE id IN (SELECT a_id FROM sq_b)",
+            "IN (subquery) in the WHERE of a statement that writes",
+        ),
+        (
+            "DELETE FROM sq_a WHERE EXISTS (SELECT 1 FROM sq_b WHERE sq_b.a_id = sq_a.id)",
+            "EXISTS in the WHERE of a statement that writes",
+        ),
+        (
+            "UPDATE sq_a SET k = (SELECT max(v) FROM sq_b)",
+            "a scalar subquery in an UPDATE assignment",
+        ),
+        (
+            "UPDATE sq_a SET k = 1 RETURNING (SELECT count(*) FROM sq_b)",
+            "a scalar subquery in a RETURNING list",
+        ),
+        (
+            "INSERT INTO sq_a VALUES ((SELECT 5), 'x', 1)",
+            "a scalar subquery in a VALUES list",
+        ),
+    ] {
+        let error = refusal(&mut node, statement);
+        assert_eq!(
+            error.sqlstate(),
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "{statement} -> {error}"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!("{named} is not supported"),
+            "{statement}"
+        );
+    }
+}
+
 /// A subquery is never routed to the columnar engine, and the refusal is by construction.
 ///
 /// ADR 0040 and `docs/plans/phase-12-subquery.md` §4. `exec::fragment::push_filter` has one arm per

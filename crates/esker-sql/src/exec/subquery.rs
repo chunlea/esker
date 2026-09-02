@@ -51,6 +51,29 @@ pub(super) fn present(select: &Select) -> bool {
     found
 }
 
+/// Refuses a subquery written where this phase does not run one, naming it — contract C2.
+///
+/// The read path is this phase; the write path is not. A statement that **writes** never reaches
+/// `plan_subqueries`, so a subquery in an `UPDATE`'s `WHERE`, in a `SET`, or in a `RETURNING` would
+/// arrive at the row evaluator with no plan behind it and answer `XX000 internal error` — a
+/// five-character code that says "this server has a bug" about a statement a real server runs.
+/// This turns each of those into `0A000` naming the construct and the clause, which is what
+/// `docs/plans/phase-12-subquery.md` §4 promises for them.
+pub(super) fn refuse_in(expr: &Expr, clause: &'static str) -> Result<()> {
+    let mut found = None;
+    walk(expr, &mut |expr| {
+        if let Expr::Subquery(sub) = expr
+            && found.is_none()
+        {
+            found = Some(sub.kind.describe());
+        }
+    });
+    match found {
+        None => Ok(()),
+        Some(kind) => Err(SqlError::unsupported(format!("{kind} in {clause}"))),
+    }
+}
+
 /// Whether this expression, or one under it, is a subquery.
 fn contains_subquery(expr: &Expr) -> bool {
     let mut found = false;
