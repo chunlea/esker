@@ -1,0 +1,31 @@
+crates/esker-sql/src/parse/lower.rs
+  s_fd699569a45331::t_4552098990ab3d 1667-1670,1672-1675,2095-2109
+crates/esker-sql/src/value/vector.rs
+  s_fd699569a45331::t_87dffeb7e094ed 88-127,224-245
+crates/esker-sql/tests/corpus/pg19_current_schemas_value.txt
+  s_fd699569a45331::t_96f8e94ded070e 1-39
+crates/esker-sql/tests/activerecord_surface.rs
+  s_fd699569a45331::t_346062a7a5a336 122-125,129
+crates/esker-sql/tests/current_schemas.rs
+  s_fd699569a45331::t_afbc9c5624f05d 25-38,41-42
+crates/esker-sql/tests/current_schemas_value.rs
+  s_fd699569a45331::t_32fccf39ea0386 1-85
+docs/plans/phase-9-rails.md
+  s_fd699569a45331::t_44bcc60597a2d0 1464
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "bce3768c2d19fe83c8e8d1a6436539d6fd7d5c7f",
+  "prompts": {},
+  "sessions": {
+    "s_fd699569a45331": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cd0a4880-ec88-4a19-aaa2-d3c0300c3ffd",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
