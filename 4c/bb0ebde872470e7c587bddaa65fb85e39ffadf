@@ -1,0 +1,25 @@
+crates/esker-sql/src/error.rs
+  s_e2fd0c54b9d574::t_5d105f8120aac5 716-727,960-961
+crates/esker-sql/src/parse/lower.rs
+  s_e2fd0c54b9d574::t_ff3cc459ad51e4 2732-2747
+crates/esker-sql/tests/corpus/pg19_float.txt
+  s_e2fd0c54b9d574::t_d7195ba12d6123 1-25
+crates/esker-sql/tests/float_spelling.rs
+  s_e2fd0c54b9d574::t_48597779a0da2b 1-89
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "4cbb0ebde872470e7c587bddaa65fb85e39ffadf",
+  "prompts": {},
+  "sessions": {
+    "s_e2fd0c54b9d574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "671f3143-5435-4676-97d9-490a56835160",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
