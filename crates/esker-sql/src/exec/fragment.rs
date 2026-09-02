@@ -406,6 +406,8 @@ fn push_filter(
     let refused = |what: &'static str| Decision::rows(Reason::NotExpressible(what));
     Ok(match expr {
         Expr::Ordinal { at, .. } => ColExpr::Column(slot(*at)),
+        // A cast is not expressible in the fragment language, so the filter stays on the row side.
+        Expr::ToText { .. } => return Err(refused("a cast to text")),
         Expr::Literal(literal) => ColExpr::Literal(literal_value(literal)?),
         Expr::Not(inner) => ColExpr::Not(Box::new(push_filter(inner, slot, types)?)),
         Expr::IsNull { operand, negated } => ColExpr::IsNull {
@@ -627,7 +629,7 @@ fn collect_columns(expr: &Expr, into: &mut Vec<usize>) {
             collect_columns(left, into);
             collect_columns(right, into);
         }
-        Expr::Not(inner) => collect_columns(inner, into),
+        Expr::Not(inner) | Expr::ToText { operand: inner, .. } => collect_columns(inner, into),
         Expr::IsNull { operand, .. } => collect_columns(operand, into),
         Expr::InList { operand, list, .. } => {
             collect_columns(operand, into);

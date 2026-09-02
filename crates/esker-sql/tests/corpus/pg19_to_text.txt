@@ -1,0 +1,37 @@
+# `::text` — the cast every type has, and the two that are not their own output function
+#
+# Three of `ActiveRecord`'s boot statements die on `a cast to TEXT is not supported` before they
+# reach anything else. This is that cast: for a **column**, evaluated per row, which is the part
+# the literal-folding path could not do.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#
+# TWO TYPES WHERE THE CAST IS NOT THE OUTPUT FUNCTION, and they are the whole content of this file:
+#
+#   * **`boolean`.** `SELECT true` prints `t` and `SELECT true::text` is `true`. PostgreSQL has a
+#     separate `booltext` for the cast, and a node that reused its output function would answer
+#     `t` — which is a wrong answer rather than a missing one.
+#   * **`character(n)`.** A `char(3)` holding `x` prints `x  ` and casts to `x`: the cast **strips**
+#     the padding the type stores. That pair is why `tests/typmod.rs` had to declare
+#     `length(c)` and `c || '|'` as divergences instead of pinning them.
+#
+# Everything else casts to exactly what it prints, `json` and `jsonb` included — which is the
+# useful half of the answer, since it means the cast is the output function plus two exceptions
+# rather than a table of fifteen rules.
+#
+DROP TABLE IF EXISTS tt		-
+CREATE TABLE tt (id int8 PRIMARY KEY, a int8, b int4, c int2, d text, e varchar(5), f char(3), g bool, h bytea, i timestamp(3), j timestamptz, k float8, l real, m json, n jsonb)		-
+INSERT INTO tt VALUES (1, 42, 7, 3, 'hi', 'ab', 'x', true, '\x0102', '2020-01-01 12:00:00.123456', '2020-01-01 12:00:00+00', 1.5, 1.5, '{"b":1,"a":2}', '{"b":1,"a":2}')		-
+INSERT INTO tt VALUES (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)		-
+SELECT a::text, b::text, c::text, d::text FROM tt WHERE id = 1	text,text,text,text	42|7|3|hi
+SELECT e::text, f::text, g::text, h::text FROM tt WHERE id = 1	text,text,text,text	ab|x|true|\x0102
+SELECT i::text, j::text, k::text, l::text FROM tt WHERE id = 1	text,text,text,text	2020-01-01 12:00:00.123|2020-01-01 12:00:00+00|1.5|1.5
+SELECT m::text, n::text FROM tt WHERE id = 1	text,text	{"b":1,"a":2}|{"a": 2, "b": 1}
+SELECT a::text FROM tt WHERE id = 2	text	\N
+SELECT 42::text, (-7)::text, true::text, false::text	text,text,text,text	42|-7|true|false
+SELECT 1.5::text, 'x'::text, NULL::text	text,text,text	1.5|x|\N
+SELECT 42::text || '!', length(123::text)	text,integer	42!|3
+SELECT f::text, length(f::text), f::text || '|' FROM tt WHERE id = 1	text,integer,text	x|1|x|
+SELECT '2020-01-01 12:00:00.123456'::timestamp(3)::text	text	2020-01-01 12:00:00.123
+SELECT 1.0::float8::text, 1.5::real::text	text,text	1|1.5

@@ -1436,6 +1436,15 @@ const SYSTEM_COLUMNS: [&str; 6] = ["ctid", "xmin", "xmax", "cmin", "cmax", "tabl
 
 pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
     Ok(match expr {
+        // The strip is decided here, where the operand's type is still known.
+        Expr::ToText { operand, .. } => {
+            let operand = resolve(operand, scope)?;
+            let strip_blanks = matches!(expr_type(&operand, scope), Ok(ColumnType::Bpchar));
+            Expr::ToText {
+                operand: Box::new(operand),
+                strip_blanks,
+            }
+        }
         Expr::Column { table, name } => {
             let (level, at, column) = scope.lookup(table.as_deref(), name)?;
             if level == 0 {
@@ -1580,9 +1589,6 @@ fn same_family(left: ColumnType, right: ColumnType) -> bool {
     // why `json` cannot be a key, `DISTINCT`ed or grouped either. So this is checked before the
     // families, because a family test says "the same type compares with itself" and here that is
     // the case PostgreSQL refuses.
-    if matches!(left, ColumnType::Json) || matches!(right, ColumnType::Json) {
-        return false;
-    }
     fn family(ty: ColumnType) -> u8 {
         match ty {
             ColumnType::Int8
@@ -1602,6 +1608,9 @@ fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // type added here is a compile error rather than a silent family 6.
             ColumnType::Json => 6,
         }
+    }
+    if matches!(left, ColumnType::Json) || matches!(right, ColumnType::Json) {
+        return false;
     }
     family(left) == family(right)
 }
@@ -1972,7 +1981,8 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         Expr::Literal(Literal::Integer(_)) | Expr::Sequence(_) => ColumnType::Int8,
         Expr::Literal(Literal::Decimal(_)) => ColumnType::Double,
 
-        Expr::Literal(Literal::String(_) | Literal::Null) => ColumnType::Text,
+        // Whatever the operand is, a cast to `text` answers `text` — that is what it is for.
+        Expr::ToText { .. } | Expr::Literal(Literal::String(_) | Literal::Null) => ColumnType::Text,
         Expr::Literal(Literal::Typed(value)) => value.column_type().unwrap_or(ColumnType::Text),
         Expr::Literal(Literal::Bool(_))
         | Expr::Binary { .. }

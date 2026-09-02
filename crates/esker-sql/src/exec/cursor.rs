@@ -800,6 +800,26 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
     use crate::plan::Literal;
     Ok(match expr {
         Expr::Ordinal { at, .. } => row.get(*at).cloned().unwrap_or(Datum::Null),
+        // A cast to `text` is the operand's own output function, and NULL stays NULL: a cast
+        // changes a value's type and never invents one.
+        Expr::ToText {
+            operand,
+            strip_blanks,
+        } => match evaluate_in(operand, row, env)? {
+            Datum::Null => Datum::Null,
+            // **A boolean is the one type whose cast is not its output function.** `SELECT true`
+            // prints `t` and `SELECT true::text` is `true`; PostgreSQL has a separate `booltext`
+            // for the cast. Measured — every other type here casts to exactly what it prints.
+            Datum::Bool(flag) => Datum::Text(if flag { "true" } else { "false" }.to_owned()),
+            value => {
+                let text = value.to_text().unwrap_or_default();
+                Datum::Text(if *strip_blanks {
+                    text.trim_end_matches(' ').to_owned()
+                } else {
+                    text
+                })
+            }
+        },
         Expr::Literal(Literal::Null) => Datum::Null,
         Expr::Literal(Literal::Bool(value)) => Datum::Bool(*value),
         Expr::Literal(Literal::Integer(value)) => Datum::Int8(*value),

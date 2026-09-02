@@ -762,6 +762,8 @@ impl Node {
 fn render(expr: &Expr, columns: &[String]) -> String {
     match expr {
         Expr::Literal(literal) => render_literal(literal),
+        // As the user wrote it: `EXPLAIN` prints a cast the way SQL spells one.
+        Expr::ToText { operand, .. } => format!("{}::text", render(operand, columns)),
         Expr::Parameter(number) => format!("${number}"),
         Expr::Column { name, .. } => name.clone(),
         // Resolved to a position by the planner; put the name back for the reader. A position with

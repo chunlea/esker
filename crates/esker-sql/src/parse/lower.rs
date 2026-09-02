@@ -1762,10 +1762,25 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
         // no expression-level cast to do it with.
         return match cast_literal_text(expr)? {
             Some(text) => {
-                let (ty, _) = lower_type(data_type)?;
-                Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
-                    Datum::from_text(ty, &text)?,
-                ))))
+                // **The typmod applies**, which is the whole difference between `::timestamp` and
+                // `::timestamp(3)`: the second rounds. Dropping it here read the text and then
+                // ignored the number beside it, so `'…123456'::timestamp(3)` kept its microseconds
+                // where a real server rounds to `.123`. Same function the write path uses, so a
+                // cast and an `INSERT` cannot disagree about what `(3)` means.
+                let (ty, typmod) = lower_type(data_type)?;
+                let value = value::fit_to_typmod(Datum::from_text(ty, &text)?, ty, typmod)?;
+                Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(value))))
+            }
+            // Not a literal, so the cast happens **per row**. Only `text` is a target: a cast to
+            // `text` is the operand's own output function and needs nothing of the operand but
+            // that it have one, where a cast *to* another type has to read the text back and can
+            // fail per row — a different feature with its own errors.
+            None if matches!(lower_type(data_type), Ok((ColumnType::Text, _))) => {
+                Ok(plan::Expr::ToText {
+                    operand: Box::new(lower_expr(expr)?),
+                    // Set at resolution, where the operand's type is known.
+                    strip_blanks: false,
+                })
             }
             None => Err(SqlError::unsupported(format!("a cast to {data_type}"))),
         };
