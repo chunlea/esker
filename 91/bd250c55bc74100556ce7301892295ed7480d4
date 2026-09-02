@@ -1,0 +1,103 @@
+crates/esker-columnar/src/fragment/codec.rs
+  s_fd699569a45331::t_f8efa92ea91be6 407-413,456-461
+crates/esker-columnar/src/value.rs
+  s_fd699569a45331::t_7c785c6c80c5db 85-89,104,120,143,165,194,240-241,270,296,312,432-436
+crates/esker-keys/src/columnar.rs
+  s_fd699569a45331::t_92e574da2d389e 75,96
+crates/esker-keys/src/lib.rs
+  s_fd699569a45331::t_8a52f3ce48fb7c 23
+crates/esker-keys/src/value.rs
+  s_fd699569a45331::t_88184a93e5dab9 154-160,172,188,232-233,244-247,273
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_fd699569a45331::t_58a238b6158f80 468,495
+crates/esker-sql/src/catalog/record.rs
+  s_fd699569a45331::t_0e450a611c9f7d 137-138,189,232
+crates/esker-sql/src/exec/fragment.rs
+  s_fd699569a45331::t_82e93f2492e8e5 579,599,610-614
+crates/esker-sql/src/exec/query.rs
+  s_fd699569a45331::t_5616ca0429ff32 1634-1639
+crates/esker-sql/src/plan/expr.rs
+  s_fd699569a45331::t_d152060d42a98b 631,640,677-679,709-714,784
+crates/esker-sql/src/row.rs
+  s_fd699569a45331::t_e1f94e983f980b 65-81
+crates/esker-store/src/columnar/decode.rs
+  s_fd699569a45331::t_3463300cb6e8cf 182,201-202
+crates/esker-store/src/columnar/wire.rs
+  s_fd699569a45331::t_c9c052ba97ef0c 106,124
+docs/DESIGN.md
+  s_a0868d54f0983f::t_2c9e4a8ad7e763 906-910,958-960
+crates/esker-columnar/src/column.rs
+  s_fd699569a45331::t_56e046b7bc9cd7 139,188-190,428,485
+crates/esker-columnar/src/encode/mod.rs
+  s_fd699569a45331::t_1c342c6a80139b 163,283-299
+crates/esker-columnar/src/stats.rs
+  s_fd699569a45331::t_2f28aaa5767606 130,282-286,815-829,899-902
+crates/esker-columnar/tests/bench_scan.rs
+  s_fd699569a45331::t_9ae8e0b7e94771 75-78,181
+crates/esker-columnar/tests/compression.rs
+  s_fd699569a45331::t_5018ce6e9e89eb 71-76
+crates/esker-columnar/tests/differential.rs
+  s_fd699569a45331::t_d36216f994ddb9 378-390
+crates/esker-columnar/tests/roundtrip.rs
+  s_fd699569a45331::t_916d9780b2fcec 120-136
+crates/esker-keys/src/numeric.rs
+  s_fd699569a45331::t_a3b4da9f389bb3 1-148
+crates/esker-keys/src/row.rs
+  s_fd699569a45331::t_7d2972ef0dd21a 64,137-143,316,468-517,519,572-575,677-804,1182-1201,1270-1369
+crates/esker-proto/src/fragment/result.rs
+  s_fd699569a45331::t_c8d96f30bbf57c 103-105,116,128,146,164,201-202,222,274-277,315
+crates/esker-sql/src/error.rs
+  s_fd699569a45331::t_235cd973e114a4 837-872,1020-1023,1069,1136-1137,1194-1195
+crates/esker-sql/src/exec/bind.rs
+  s_fd699569a45331::t_f6fcf6093fd9cd 455-457
+crates/esker-sql/src/parse/lower.rs
+  s_fd699569a45331::t_1863f8a1402c16 2132-2143,2289-2313,2334-2353,2374-2380,2382-2386,2391-2393,2406-2412,2415-2418,2421-2426,3067-3090
+crates/esker-sql/src/value/mod.rs
+  s_fd699569a45331::t_5c4b46edb56fc9 35,117-122,192-193,301,322,340,368-374,428,459,465-469,519-526,580-611,648,881,893-896
+crates/esker-sql/src/value/numeric.rs
+  s_fd699569a45331::t_cfe7d619780ad2 1-381
+crates/esker-sql/tests/corpus/pg19_numeric.txt
+  s_fd699569a45331::t_e14d9e793b1351 1-134
+crates/esker-sql/tests/corpus/pg19_order.txt
+  s_fd699569a45331::t_505498555f8148 28
+crates/esker-sql/tests/json.rs
+  s_fd699569a45331::t_b2560d5d573ee8 94-101
+crates/esker-sql/tests/numeric.rs
+  s_fd699569a45331::t_d9e28763bf58e6 1-340
+crates/esker-sql/tests/pg_catalog.rs
+  s_fd699569a45331::t_5b8327a4614f92 157-159,215-217
+crates/esker-sql/tests/row_order.rs
+  s_fd699569a45331::t_308ee174683439 90-93
+crates/esker-sql/tests/slt/unsupported.slt
+  s_fd699569a45331::t_5bd6e22b43484a 63-64
+crates/esker-sql/tests/unknown_literal.rs
+  s_fd699569a45331::t_ca8435419f42b2 149,151-157
+docs/adr/0045-numeric-is-a-decimal-and-its-key-is-normalised.md
+  s_fd699569a45331::t_1511ab73833905 1-76
+docs/plans/phase-9-rails.md
+  s_fd699569a45331::t_fecdd45e6839bf 1232-1236
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "91bd250c55bc74100556ce7301892295ed7480d4",
+  "prompts": {},
+  "sessions": {
+    "s_a0868d54f0983f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "001c95bd-db24-4085-b657-66d3a8400c25",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    },
+    "s_fd699569a45331": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cd0a4880-ec88-4a19-aaa2-d3c0300c3ffd",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
