@@ -50,6 +50,9 @@ fn txn_body(request: &Request) -> Option<&TxnKvReq> {
         // A fragment has a body, but not this one: it is a plan for a columnar replica, and this
         // crate carries it without interpreting it ([`esker_proto::fragment`]).
         | Request::Fragment { .. }
+        // A schema fetch is store-to-store: one store asking another for a catalog record it
+        // cannot read itself ([`esker_proto::schema`]). A client never sends one.
+        | Request::Schema(_)
         | Request::RawKv { .. } => None,
     }
 }
@@ -68,6 +71,7 @@ fn routed_key(request: &Request) -> Option<&[u8]> {
         // terms of keys can match one. A fragment addresses a region the same way: its key range
         // is inside the opaque fragment bytes, which this crate does not decode.
         | Request::Admin(_)
+        | Request::Schema(_)
         | Request::Fragment { .. } => None,
     }
 }
@@ -89,6 +93,7 @@ fn raw_body(request: &Request) -> Option<&RawKvReq> {
         | Request::Pd { .. }
         | Request::Admin(_)
         | Request::Fragment { .. }
+        | Request::Schema(_)
         | Request::TxnKv { .. } => None,
     }
 }
