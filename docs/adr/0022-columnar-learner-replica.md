@@ -1,7 +1,11 @@
 # 0022 — A columnar learner replica
 
-Status: **design only.** No code, and none is implied by anything that has shipped. The milestone
-is `docs/plans/phase-6a.md` §12. See `crates/esker-raft/src/config.rs` (learners),
+Status: **accepted, and built through milestone 4.** It was written as *design only* and stayed
+that way for three phases; milestones 1 to 3 are `docs/plans/phase-7-columnar.md` and
+`phase-8-learner.md`, and milestone 4 is `phase-10-routing.md` with
+[ADR 0040](0040-the-engine-a-query-runs-on.md). Milestone 5 — MPP — is still design only and still
+last. The amendments below are marked where the built thing differs from what this page assumed.
+See `crates/esker-raft/src/config.rs` (learners),
 `crates/esker-raft/src/readonly.rs` (`ReadIndex`), `crates/esker-engine/src/fs.rs` (the filesystem
 seam), `docs/DESIGN.md` §13, [ADR 0021](0021-time-machine.md) (the catalog-flag pattern this
 borrows).
@@ -68,6 +72,15 @@ The rule, in the order it is evaluated:
 `EXPLAIN` must name the engine it chose. A routing decision nobody can see is one nobody can
 debug — and this is the feature most likely to produce "it was fast yesterday".
 
+> **Amended (milestone 4): "overrides all of it" means the estimate, and only the estimate.**
+> Rule 4 above is written as though a session could override rules 1 to 3 as well. Read that way
+> it lets a user ask for an answer no fragment can produce — a read of a transaction's own
+> uncommitted writes, a point read a columnar file cannot restrict to, an aggregate with a
+> `DISTINCT` inside it. What the override overrides is **rule 3**: `'row'` forces rows, which is
+> always possible, and `'columnar'` skips the estimate and skips nothing else.
+> [ADR 0040](0040-the-engine-a-query-runs-on.md) Decision 1 carries the argument, and the measured
+> PostgreSQL surface of the variable itself.
+
 ## Decision 3: push-down is a plan fragment, on the seam that already exists
 
 Sending ten million rows to the SQL node to count them would waste the entire point. The columnar
@@ -117,6 +130,15 @@ The rule has two halves and both mechanisms exist:
 
 The cost is one round trip to the leader per fragment, amortised over a scan of millions of rows,
 which is the trade TiFlash makes and it is not close.
+
+> **Amended (milestone 4): the round is unconditional, and it had stopped being so.** Half 2 above
+> is written without a condition and `Store::serve_fragment` guarded it with
+> `min_apply_index > 0`, which made the field's *default* value the unsafe one. A SQL node is
+> exactly the caller that passes zero — it holds a snapshot `ts` and a region id, and a Raft index
+> is not a number it can compute — and it does not need one: the round itself covers every commit
+> visible at `ts`, because a commit the client was told about was committed on the leader before
+> that `ts` was allocated. `min_apply_index` stays as an *additional* floor.
+> [ADR 0040](0040-the-engine-a-query-runs-on.md) Decision 6.
 
 ## Decision 5: per-table opt-in, through the catalog
 
@@ -263,6 +285,7 @@ the argument for building those first and choosing the delivery mechanism afterw
    continuously-analysed table needs. Whichever comes first, the second is smaller for having the
    first.
 4. **Planner routing**, with `EXPLAIN` naming the engine and the session override from day one.
+   **Done** — `docs/plans/phase-10-routing.md`, [ADR 0040](0040-the-engine-a-query-runs-on.md).
 5. **MPP exchange — last, and only if measured.** Shuffling intermediate results *between*
    columnar nodes so that a join or a high-cardinality `GROUP BY` runs distributed rather than
    finishing on one SQL node. It is the largest piece of work in this ADR, it needs a shuffle

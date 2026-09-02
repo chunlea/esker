@@ -908,7 +908,37 @@ the same fragment over the rows the file was *written from*, never opening the f
 the evaluator again with pruning switched off, and compared as a `Result` so that an error is an
 answer too. Pruning may only ever remove work.
 
-Not built here: the learner feed and the tiering rewrite (ADR 0022 milestone 3), planner routing
-and `EXPLAIN` (milestone 4), MPP exchange (milestone 5), compaction, and any wire service — the
-fragment's bytes are defined in `esker-columnar` and `esker-proto` carries them when there is
-something to carry them between.
+Not built here: the tiering rewrite (ADR 0022 milestone 3's other half), MPP exchange
+(milestone 5), compaction, and any wire service — the fragment's bytes are defined in
+`esker-columnar` and `esker-proto` carries them when there is something to carry them between.
+
+### 16.4 Choosing between the two
+
+The learner feed is phase 8 and planner routing is
+[ADR 0040](adr/0040-the-engine-a-query-runs-on.md), so a query over a table with
+`ALTER TABLE t SET (columnar_replicas = 1)` now runs on the copy when it should.
+
+The rule is ADR 0022 Decision 2's, in its order: a point read or a bounded range stays on rows
+always, because a columnar file records no key range and cannot restrict to one; anything the
+columnar side cannot answer stays on rows, of which the only rule about a *wrong* answer rather
+than a slow one is that a transaction which has written cannot be answered by a learner that has
+not seen the write; and otherwise the **ratio** decides — `projected / stored`, at most a half,
+which is bytes read rather than rows and moves on its own when a table grows a column.
+`SET esker.engine = 'row' | 'columnar' | 'auto'` overrides the *estimate* and never the correctness
+rules.
+
+Exactly one plan shape is substituted — `Aggregate { [Filter] { SeqScan } }` — by a node producing
+the same row the aggregate produced, one fragment per region, finished on the SQL node. A rows-
+output fragment is not routed: a fragment answers in one framed message, so it would materialise a
+whole region where the row path streams a page.
+
+Every routed plan **carries the row plan it falls back to**, so a refusal — `NotColumnar`,
+`TooFarBehind`, `Unsupported`, or a store that could not be reached — is answered in the same
+transaction at the same snapshot. Silent to the client, because the answer is the one the snapshot
+always had; visible in `EXPLAIN`, which names the engine, the reason, the fragment count and, under
+`ANALYZE`, what the scan cost.
+
+What holds it up is a differential on a real cluster: every query run twice at one instant, once
+routed and once under `esker.engine = 'row'`, with a concurrent writer and with the learner's store
+stopped — and each comparison asserting that the columns *did* answer, because a query that fell
+back agrees with the row engine for free.
