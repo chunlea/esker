@@ -49,6 +49,83 @@ fn identity_of(dir: &Path, cluster: u64, store_id: u64) -> Identity {
     Identity::new(id_for_directory(&local, dir).unwrap()).of(cluster, store_id)
 }
 
+/// **The simultaneous claim**, which the read-back narrowed and the conditional put closes.
+///
+/// Two databases claim one empty prefix from two threads. Before `put_if_absent` this was a real
+/// window: both wrote the marker, both read it back, and whichever wrote *second* was the one both
+/// of them then agreed with — so the first could read its own claim confirmed and carry on while
+/// the marker named the other. Here exactly one may win, and the loser is told whose it is.
+///
+/// The fake's conditional put checks and inserts under one lock, which is what makes this a test
+/// of the rule rather than of the fake's luck.
+#[test]
+fn two_databases_claiming_at_once_leave_exactly_one_winner() {
+    for attempt in 0..32 {
+        let store = Arc::new(MemoryStore::new());
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let first = identity_of(first_dir.path(), 1, 1);
+        let second = identity_of(second_dir.path(), 1, 2);
+
+        let outcomes: Vec<_> = std::thread::scope(|scope| {
+            let handles = [
+                {
+                    let store = Arc::clone(&store);
+                    let dir = first_dir.path().to_path_buf();
+                    scope.spawn(move || open(&store, &dir, first, false).map(|_| ()))
+                },
+                {
+                    let store = Arc::clone(&store);
+                    let dir = second_dir.path().to_path_buf();
+                    scope.spawn(move || open(&store, &dir, second, false).map(|_| ()))
+                },
+            ];
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+
+        let winners = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+        assert_eq!(
+            winners, 1,
+            "attempt {attempt}: {winners} databases claimed one prefix",
+        );
+        let error = outcomes
+            .iter()
+            .find_map(|outcome| outcome.as_ref().err())
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("claimed by"),
+            "attempt {attempt}: the loser was not told whose the prefix is: {error}",
+        );
+        // And the marker on disk is the winner's, not the last writer's.
+        let marker = store
+            .keys()
+            .iter()
+            .filter(|key| key.ends_with(CLAIM_OBJECT))
+            .count();
+        assert_eq!(marker, 1, "attempt {attempt}");
+    }
+}
+
+/// A claim that is retried — the response to the first `put_if_absent` was lost, so the second
+/// one is told the marker is already there — recognises its own marker rather than refusing it.
+///
+/// This is the case the outcome alone cannot answer, and the reason the read-back stayed.
+#[test]
+fn a_retried_claim_recognises_its_own_marker() {
+    let store = Arc::new(MemoryStore::new());
+    let dir = tempfile::tempdir().unwrap();
+    let identity = identity_of(dir.path(), 7, 7);
+
+    esker_engine::fs::claim::settle(store.as_ref(), PREFIX, identity, false).unwrap();
+    // The replay: the same call again, against a store that now says AlreadyThere.
+    esker_engine::fs::claim::settle(store.as_ref(), PREFIX, identity, false)
+        .expect("a database was refused by its own marker");
+}
+
 /// **(a)** A second database is refused, and told whose the prefix is.
 #[test]
 fn a_second_database_is_refused_and_the_error_names_both() {

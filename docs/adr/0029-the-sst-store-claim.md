@@ -70,14 +70,28 @@ parse, because one that will not parse might still be somebody's.
 
 ## Consequences
 
-**The race we do not win.** Two databases claiming an empty prefix in the same instant cannot be
-separated by a `PutObject`: S3 has no conditional put in the subset `ObjectStore` exposes, and
-adding `If-None-Match` would be a fifth S3 call and a compatibility question for every
-S3-compatible endpoint we support. Instead the claim is **read back** after it is written, so
-the loser of a simultaneous claim reads the winner's marker and refuses. That narrows the window
-from the lifetime of a database to two overlapping round trips. Closing it entirely wants
-`PutObject` with `If-None-Match: *`, which is worth doing when we next touch `esker-s3` and is
-not worth a new call today.
+**The race we do not win — closed in wave C4, by the change this said to wait for.** As shipped,
+two databases claiming an empty prefix in the same instant could not be separated by a
+`PutObject`: the claim was **read back** after it was written, so the loser of a simultaneous claim
+read the winner's marker and refused, which narrowed the window from the lifetime of a database to
+two overlapping round trips. This paragraph said closing it wanted `PutObject` with
+`If-None-Match: *` and was worth doing *when we next touch `esker-s3`*.
+
+That happened: [ADR 0039](0039-a-kept-alive-s3-connection.md). So the marker is now written with
+`ObjectStore::put_if_absent`, and the window is gone — exactly one conditional put creates the
+object and the other is told the key exists. Three notes on what did **not** change:
+
+* it is a **header on an existing call**, not the fifth S3 call this paragraph feared. `S3Client`
+  maps `412` and `409` to `PutOutcome::AlreadyThere` and nothing else moves;
+* **the read-back stays**, and now does two jobs. It is what turns "already there" into an answer —
+  the marker names its owner, so a *retried* claim recognises its own marker instead of refusing
+  it, which the outcome alone cannot say — and it is the whole safety story on an endpoint that
+  ignores the precondition, where the conditional put degrades to the unconditional one and the
+  window is the narrowed one described above. Never wider, never silent;
+* the compatibility question is answered by a test rather than by assumption:
+  `a_conditional_put_is_refused_by_the_real_endpoint` asserts that the endpoint under test really
+  enforces `If-None-Match`, so an endpoint that stopped doing so is a red test rather than a quiet
+  return to the narrow window.
 
 **Losing `ESKER-CLAIM-ID` costs two deliberate steps.** A database whose id file is gone draws a
 new one and is refused by its own prefix. That is the safe way to be wrong — the alternative is a

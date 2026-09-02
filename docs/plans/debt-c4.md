@@ -145,3 +145,50 @@ weeks earlier. A fresh database numbers its first SST `000004` whatever has ever
 `TieredFileSystem::new` **adopts what the bucket already holds** — so the tier found `000004`
 uploaded already, skipped it, and drained nothing. `unique_prefix` was already in the file, used by
 the claim tests only; the reason it exists is wider than the claim, and now says so.
+
+## 3. The SST-store claim race was narrowed, not closed
+
+Inventory #13. [ADR 0029](../adr/0029-the-sst-store-claim.md) §Consequences, which said the window
+would close *"when we next touch `esker-s3`"* — and unit 2 is that touch.
+
+### What was there
+
+Two databases claiming an empty prefix in the same instant both wrote the marker and both read it
+back, so whichever wrote *second* was the one both then agreed with: the first could read a
+confirmation of its own claim while the marker named the other. The read-back narrowed the window
+from the lifetime of a database to two overlapping round trips. It did not remove it.
+
+### The fix
+
+`ObjectStore::put_if_absent` — `PutObject` with `If-None-Match: *` — and the marker is written with
+it. Exactly one conditional put creates the object; the other is told `AlreadyThere`. `S3Client`
+maps `412` and `409` (S3's answer to two overlapping conditional writes) to that outcome.
+
+Three things deliberately did **not** change:
+
+* **the read-back stays**, and now does two jobs. It is what turns "already there" into an answer,
+  because the outcome alone cannot distinguish *somebody else has it* from *this is my own claim,
+  retried* — and a claim whose response was lost must recognise its own marker rather than refuse
+  it. It is also the whole safety story on an endpoint that ignores the precondition, where the
+  conditional put degrades to the unconditional one and the window is the narrowed one above. Never
+  wider, never silent;
+* the transport still does not retry, which is what makes a non-idempotent conditional put safe to
+  send at all (unit 2);
+* `MemoryStore`'s conditional put checks and inserts **under one lock**, so the fake is as atomic as
+  the real thing. A fake that checked and then inserted would pass a test the real store would fail.
+
+### The tests
+
+* `crates/esker-engine/tests/tier_claim.rs::two_databases_claiming_at_once_leave_exactly_one_winner`
+  — two threads, one empty prefix, 32 attempts; exactly one wins and the loser's message names both
+  identities. And `a_retried_claim_recognises_its_own_marker`, which is the case the outcome alone
+  cannot answer;
+* `crates/esker-engine/tests/tier_minio.rs::two_databases_claiming_at_once_over_http_leave_one_winner`
+  — the same race over real HTTP;
+* `a_conditional_put_is_refused_by_the_real_endpoint` — the endpoint really enforces
+  `If-None-Match`. This is the assumption the closed race rests on, and without a test for it an
+  endpoint that stopped enforcing the header would quietly return the claim to the narrow window
+  with nothing red anywhere.
+
+ADR 0029's "the race we do not win" consequence is rewritten to say what closed it and what did not
+change.

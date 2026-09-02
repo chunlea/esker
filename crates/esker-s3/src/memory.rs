@@ -19,7 +19,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::error::{Error, Result};
-use crate::{GetResponse, ObjectStore, ObjectSummary};
+use crate::{GetResponse, ObjectStore, ObjectSummary, PutOutcome};
 
 /// An in-memory object store.
 #[derive(Debug, Default)]
@@ -120,6 +120,29 @@ impl ObjectStore for MemoryStore {
             .map_err(|_| Error::Config("the memory store was poisoned".into()))?;
         objects.insert(key.to_string(), body.to_vec());
         Ok(Some(etag))
+    }
+
+    /// The conditional put, and it is **genuinely** conditional: the check and the insert happen
+    /// under one lock, so two threads racing here are separated the same way S3 separates them.
+    /// A fake that checked and then inserted would pass a test the real store would fail.
+    fn put_if_absent(&self, key: &str, body: &[u8]) -> Result<PutOutcome> {
+        self.puts.fetch_add(1, Ordering::SeqCst);
+        if Self::take_failure(&self.failing_puts) {
+            return Err(Error::io(
+                "PutObject",
+                std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "injected"),
+            ));
+        }
+        let etag = Self::etag(body);
+        let mut objects = self
+            .objects
+            .lock()
+            .map_err(|_| Error::Config("the memory store was poisoned".into()))?;
+        if objects.contains_key(key) {
+            return Ok(PutOutcome::AlreadyThere);
+        }
+        objects.insert(key.to_string(), body.to_vec());
+        Ok(PutOutcome::Stored(Some(etag)))
     }
 
     fn get_range(

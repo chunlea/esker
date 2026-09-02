@@ -41,7 +41,7 @@ use std::path::Path;
 
 use esker_base::rng::Pcg32;
 use esker_base::{crc32c, hash};
-use esker_s3::ObjectStore;
+use esker_s3::{ObjectStore, PutOutcome};
 
 /// The marker's magic.
 pub const CLAIM_MAGIC: [u8; 8] = *b"ESKERCLM";
@@ -255,14 +255,20 @@ pub enum ClaimError {
 /// carries on. A crash before the marker landed leaves an empty prefix, which the next open
 /// claims. Neither needs a recovery path, which is why there is not one.
 ///
-/// # The race this does not win
+/// # The race, which the store now settles
 ///
-/// Two databases claiming an empty prefix in the same instant cannot be separated by a
-/// `PutObject`: S3 has no conditional put in the subset [`ObjectStore`] exposes. So the claim is
-/// **read back** after it is written — the loser of a simultaneous claim reads the winner's
-/// marker and refuses, and the window narrows from the lifetime of a database to two overlapping
-/// round trips. [ADR 0029](../../../docs/adr/0029-the-sst-store-claim.md) records why that is
-/// enough today and what would close it.
+/// Two databases claiming an empty prefix in the same instant are separated by the store itself:
+/// the marker is written with [`ObjectStore::put_if_absent`] — `PutObject` with
+/// `If-None-Match: *` — so exactly one of them creates it and the other is told
+/// [`PutOutcome::AlreadyThere`]. There is no window in which both believe they won, because there
+/// is no instant at which both writes take.
+///
+/// The **read-back stays**, and does two jobs now rather than one. It is what turns
+/// `AlreadyThere` into an answer — the marker names its owner, and a retry of our own claim
+/// recognises itself instead of refusing — and it is the whole of the safety story on an endpoint
+/// that ignores `If-None-Match`, where a conditional put degrades to an unconditional one and the
+/// window is the narrowed one [ADR 0029](../../../docs/adr/0029-the-sst-store-claim.md)
+/// originally shipped. Never wider, never silent.
 pub fn settle(
     store: &dyn ObjectStore,
     prefix: &str,
@@ -300,16 +306,28 @@ pub fn settle(
         );
     }
 
-    store
-        .put(&key, &ours.encode())
+    let outcome = store
+        .put_if_absent(&key, &ours.encode())
         .map_err(|error| ClaimError::Store(error.to_string()))?;
-    // Read back, so a simultaneous claim by another database is caught here rather than by
-    // whichever of the two later reads the other's SST.
+    // Read back either way. After `AlreadyThere` it is the only thing that can say *whose* marker
+    // is there — including the case where it is ours, which is what a retried claim looks like.
+    // After `Stored` it is what catches an endpoint that ignored the precondition.
     let written = store
         .get(&key)
         .map_err(|error| ClaimError::Store(error.to_string()))?;
     verify(prefix, ours, &written.body)?;
-    tracing::info!(prefix, identity = %ours, "claimed the SST store prefix");
+    match outcome {
+        PutOutcome::Stored(_) => {
+            tracing::info!(prefix, identity = %ours, "claimed the SST store prefix");
+        }
+        PutOutcome::AlreadyThere => {
+            tracing::info!(
+                prefix,
+                identity = %ours,
+                "the SST store prefix was already claimed, by us"
+            );
+        }
+    }
     Ok(())
 }
 
