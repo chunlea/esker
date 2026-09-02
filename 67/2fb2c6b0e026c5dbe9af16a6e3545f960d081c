@@ -1,0 +1,27 @@
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_a0868d54f0983f::t_f0d77ea7ea1a3c 108-120,125,135-136,157-158,185-186,249-260,348-349
+crates/esker-sql/tests/activerecord_surface.rs
+  s_a0868d54f0983f::t_297f6cf248b408 126-130,134
+crates/esker-sql/tests/corpus/pg19_extension_inherits.txt
+  s_a0868d54f0983f::t_ed3d43db8f53c9 1-32
+crates/esker-sql/tests/extension_inherits.rs
+  s_a0868d54f0983f::t_d7546cc628f495 1-98
+docs/plans/phase-9-rails.md
+  s_a0868d54f0983f::t_3aa820701be193 1465
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "672fb2c6b0e026c5dbe9af16a6e3545f960d081c",
+  "prompts": {},
+  "sessions": {
+    "s_a0868d54f0983f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "001c95bd-db24-4085-b657-66d3a8400c25",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
