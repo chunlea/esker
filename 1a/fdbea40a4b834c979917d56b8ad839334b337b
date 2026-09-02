@@ -1,0 +1,27 @@
+crates/esker-store/src/regions.rs
+  s_3ae23601ee3f84::t_2375c406cee00e 113-126
+crates/esker-store/src/server.rs
+  s_3ae23601ee3f84::t_5d8c3c6750a88f 2999-3006
+crates/esker-store/src/transport.rs
+  s_3ae23601ee3f84::t_5c87a067fd6636 318-336,481-517
+crates/esker-store/tests/promotion.rs
+  s_3ae23601ee3f84::t_98f45c32ffb987 316-339,355
+docs/plans/phase-14-flakes.md
+  s_3ae23601ee3f84::t_80bd9eec704166 236-369
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "1afdbea40a4b834c979917d56b8ad839334b337b",
+  "prompts": {},
+  "sessions": {
+    "s_3ae23601ee3f84": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "28a5221f-dddc-4b17-adc2-74658236cfd3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
