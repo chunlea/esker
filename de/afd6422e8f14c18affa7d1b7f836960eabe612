@@ -1,0 +1,19 @@
+crates/esker-engine/tests/tier_minio.rs
+  s_ed1cd635740377::t_f9b6e4c9a7f028 120-125,193-194,244-245
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "deafd6422e8f14c18affa7d1b7f836960eabe612",
+  "prompts": {},
+  "sessions": {
+    "s_ed1cd635740377": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "19199d55-8453-4673-a0ab-b13f22806878",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
