@@ -1,0 +1,37 @@
+crates/esker-sql/src/exec/bind.rs
+  s_ed1cd635740377::t_6b41d5c80fb01e 165,279,323,380
+crates/esker-sql/src/exec/fragment.rs
+  s_ed1cd635740377::t_62c80a973ef054 186-194,293
+crates/esker-sql/src/exec/mod.rs
+  s_ed1cd635740377::t_c8c71ac0ba148b 359,862,866-882,1201,1281
+crates/esker-sql/src/parse/lower.rs
+  s_ed1cd635740377::t_ba889e6a5b5be4 116-125
+crates/esker-sql/src/plan/mod.rs
+  s_ed1cd635740377::t_7d7d9adf15df8c 77-83,160,183
+crates/esker-sql/src/plan/query.rs
+  s_ed1cd635740377::t_5eb8124a151575 381-386,388,442-449,451,459-467,478,494-498,502,589-611
+crates/esker-sql/src/plan/routing.rs
+  s_ed1cd635740377::t_4824666993f127 153-165
+crates/esker-sql/tests/corpus/pg19_routing_explain.txt
+  s_ed1cd635740377::t_70505be999cb6f 1-68
+crates/esker-sql/tests/lowering.rs
+  s_ed1cd635740377::t_da9435bcce32a6 113-122,327
+crates/esker-sql/tests/routing.rs
+  s_ed1cd635740377::t_8989d45c3c25fb 122-195,289-302,318-320,339-343,397-399,448-490,700-708,730-743,746-755
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "11e266c64816738dccbc7d462176dc5fa78f8f20",
+  "prompts": {},
+  "sessions": {
+    "s_ed1cd635740377": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "19199d55-8453-4673-a0ab-b13f22806878",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
