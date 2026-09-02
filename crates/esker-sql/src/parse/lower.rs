@@ -2129,6 +2129,18 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
         if let Some(refusal) = refused_cast(expr, data_type)? {
             return Err(refusal);
         }
+        // **A `numeric` cast to an integer rounds**, half away from zero — `1.5::int` is `2`,
+        // `2.5::int` is `3` and `0.5::int` is `1`. One rule for the cast, the assignment and the
+        // `round` function, and it is not the parser's: reading `1.5` with `int4in` is
+        // `22P02 invalid input syntax`, which is what this arm exists to not do.
+        if source_type(expr)? == Some(ColumnType::Numeric)
+            && let Some(to) = lower_type(data_type).ok().map(|(ty, _)| ty)
+            && matches!(to, ColumnType::Int8 | ColumnType::Int4 | ColumnType::Int2)
+            && let Some(text) = cast_literal_text(expr)?
+        {
+            return numeric_to_integer(&text, to)
+                .map(|value| plan::Expr::Literal(plan::Literal::Typed(Box::new(value))));
+        }
         return match cast_literal_text(expr)? {
             Some(text) => {
                 // **The typmod applies**, which is the whole difference between `::timestamp` and
@@ -2274,6 +2286,31 @@ fn is_comparison(op: &BinaryOperator) -> bool {
     )
 }
 
+/// A `numeric` as an integer of `to`'s width, rounded half away from zero.
+///
+/// The width check is the type's own and gives `22003` naming it, which is the same message a
+/// constant that far out gets — a `numeric` past `int4` is `integer out of range`, not a
+/// `numeric` error.
+fn numeric_to_integer(text: &str, to: ColumnType) -> Result<Datum> {
+    let value = value::numeric::from_text(text)?;
+    // Scale zero is what "an integer" means here, and `fit_to_typmod` is where the rounding rule
+    // lives — so the cast and an assignment into a `numeric(p,0)` round identically.
+    let rounded = value::numeric::fit_to_typmod(value, value::numeric::typmod_of(1000, 0))?;
+    let digits = value::numeric::to_text(&rounded);
+    let wide: i64 = digits
+        .parse()
+        .map_err(|_| SqlError::IntegerLiteralOutOfRange(to.name()))?;
+    Ok(match to {
+        ColumnType::Int8 => Datum::Int8(wide),
+        ColumnType::Int4 => Datum::Int4(
+            i32::try_from(wide).map_err(|_| SqlError::IntegerLiteralOutOfRange(to.name()))?,
+        ),
+        _ => Datum::Int2(
+            i16::try_from(wide).map_err(|_| SqlError::IntegerLiteralOutOfRange(to.name()))?,
+        ),
+    })
+}
+
 /// The `42846` a pair of types with no cast between them gets, or `None` for a pair that has one.
 ///
 /// Only the pairs a `date` is one half of, because it is the only type here that PostgreSQL
@@ -2294,6 +2331,26 @@ fn refused_cast(expr: &Expr, data_type: &DataType) -> Result<Option<SqlError>> {
                 | ColumnType::Jsonb
         )
     };
+    // A `numeric` whose value has no integer at all: `0A000 cannot convert NaN to integer`, which
+    // is a *different* refusal from the `22003` a merely-too-large value gets. Decided from the
+    // literal's text, which is the only place the value is known at lowering.
+    if source == Some(ColumnType::Numeric)
+        && let Some(to) = target
+        && matches!(to, ColumnType::Int8 | ColumnType::Int4 | ColumnType::Int2)
+        && let Some(text) = cast_literal_text(expr)?
+    {
+        let special = match text.trim() {
+            "NaN" => Some("NaN"),
+            "Infinity" | "-Infinity" => Some("infinity"),
+            _ => None,
+        };
+        if let Some(value) = special {
+            return Ok(Some(SqlError::CannotConvert {
+                value,
+                target: to.name(),
+            }));
+        }
+    }
     Ok(match (source, target) {
         (Some(ColumnType::Date), Some(to)) if numeric(to) => Some(SqlError::CannotCast {
             from: ColumnType::Date.name(),
@@ -2314,12 +2371,26 @@ fn refused_cast(expr: &Expr, data_type: &DataType) -> Result<Option<SqlError>> {
 /// a cast from, which is why `'2020-01-01'::date` is a value and `1::date` is not.
 fn source_type(expr: &Expr) -> Result<Option<ColumnType>> {
     Ok(match expr {
-        Expr::Nested(inner) => source_type(inner)?,
+        // A sign is transparent to the question: `-1` is an `integer` exactly as `1` is, and
+        // `(1)` is too.
+        Expr::Nested(inner)
+        | Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr: inner,
+        } => source_type(inner)?,
         Expr::Value(value) => match &value.value {
+            // A **bare integer** constant is `integer`, which is what `cannot cast type integer
+            // to date` names. A decimal one is a `numeric` on a real server — and this crate
+            // still types it `double` everywhere else, which is the declared divergence
+            // `tests/unknown_literal.rs` holds and the next unit's to close.
+            Value::Number(digits, _) if digits.contains('.') => Some(ColumnType::Numeric),
             Value::Number(..) => Some(ColumnType::Int4),
             _ => None,
         },
         Expr::Cast { data_type, .. } => lower_type(data_type).ok().map(|(ty, _)| ty),
+        // A bare decimal constant is a `numeric` on a real server, which is what makes
+        // `1.5::int` and `'NaN'::numeric::int` two different questions.
+        Expr::TypedString(typed) => lower_type(&typed.data_type).ok().map(|(ty, _)| ty),
         _ => None,
     })
 }
@@ -2332,11 +2403,27 @@ fn source_type(expr: &Expr) -> Result<Option<ColumnType>> {
 /// text as `json` directly would answer `{"b":1,"a":2}`. One reordering, two different answers.
 fn cast_literal_text(expr: &Expr) -> Result<Option<String>> {
     match expr {
-        Expr::Nested(inner) => cast_literal_text(inner),
+        // A `+` is transparent here the way parentheses are; a `-` is not, and keeps its own arm
+        // below because it has to put the sign back on the text.
+        Expr::Nested(inner)
+        | Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr: inner,
+        } => cast_literal_text(inner),
         Expr::Value(value) => Ok(match &value.value {
             Value::SingleQuotedString(text) => Some(text.clone()),
+            // **A number is a literal too.** `1.5::numeric` reads the digits with `numeric`'s
+            // input function, exactly as `'1.5'::numeric` does — and it is the spelling the
+            // corpus uses everywhere, because it is the one a person writes.
+            Value::Number(digits, _) => Some(digits.clone()),
             _ => None,
         }),
+        // `(-1.5)::numeric`: a signed number is a unary minus over a literal, and the sign is
+        // part of the value being cast rather than an operator applied to the result.
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: inner,
+        } => Ok(cast_literal_text(inner)?.map(|text| format!("-{text}"))),
         // The inner cast, run: its *result* is what the outer one reads.
         Expr::Cast { .. } => match lower_expr(expr)? {
             plan::Expr::Literal(plan::Literal::Typed(value)) => Ok(match value.as_ref() {
@@ -2976,6 +3063,30 @@ fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
         // and not there.
         DataType::Varchar(Some(length)) | DataType::CharacterVarying(Some(length)) => {
             Ok((ColumnType::Varchar, string_typmod(length, "varchar")?))
+        }
+        // `numeric` and `decimal` are one type under two spellings, which is PostgreSQL's own
+        // model: `'decimal(3,2)'::regtype` is `numeric(3,2)` there. A **bare precision means
+        // scale zero**, not "no scale" — `numeric(10)` is `numeric(10,0)` and rounds — which is
+        // the reading that would silently keep a fraction if it were got wrong.
+        DataType::Numeric(info) | DataType::Decimal(info) | DataType::Dec(info) => {
+            // A number too large for an `i32` cannot be in range either, so it is clamped rather
+            // than a second error path: `declared_typmod` names the bound it broke.
+            let (precision, scale) = match info {
+                ExactNumberInfo::None => (None, None),
+                ExactNumberInfo::Precision(precision) => {
+                    (Some(i32::try_from(*precision).unwrap_or(i32::MAX)), None)
+                }
+                // The scale is **signed** on a real server — `numeric(10,-2)` is a real type —
+                // which is why this one is an `i64` where the precision is a `u64`.
+                ExactNumberInfo::PrecisionAndScale(precision, scale) => (
+                    Some(i32::try_from(*precision).unwrap_or(i32::MAX)),
+                    Some(i32::try_from(*scale).unwrap_or(i32::MAX)),
+                ),
+            };
+            Ok((
+                ColumnType::Numeric,
+                value::numeric::declared_typmod(precision, scale)?,
+            ))
         }
         DataType::Char(length) | DataType::Character(length) => match length {
             Some(length) => Ok((ColumnType::Bpchar, string_typmod(length, "char")?)),

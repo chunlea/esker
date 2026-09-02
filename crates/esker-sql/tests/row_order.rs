@@ -87,6 +87,10 @@ fn column_type(name: &str) -> ColumnType {
         // Its values are captured already padded, which is what a `character(n)` stores.
         "bpchar" => ColumnType::Bpchar,
         "timestamp" => ColumnType::Timestamp,
+        // `1.0` and `1.00` are in the fixture on purpose: PostgreSQL returns them in either
+        // order because they are **equal**, and the test's stronger half — a tie encodes to one
+        // key — is what proves the index encoding normalises where the row does not.
+        "numeric" => ColumnType::Numeric,
         "date" => ColumnType::Date,
         "bool" => ColumnType::Bool,
         "bytea" => ColumnType::Bytea,

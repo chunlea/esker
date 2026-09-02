@@ -72,6 +72,10 @@ fn encode_row(values: &[Value]) -> Vec<u8> {
                 varint::put_u64(v.len() as u64, &mut out);
                 out.extend_from_slice(v.as_bytes());
             }
+            // The bench corpus has no `numeric` column, and this helper mirrors the row codec
+            // byte for byte; a guessed encoding here would measure the wrong thing silently.
+            // Adding a numeric column means writing the kind-byte/zigzag-scale/digits pair.
+            Value::Numeric(_) => unimplemented!("the bench corpus has no numeric column"),
             Value::Bytea(v) => {
                 varint::put_u64(v.len() as u64, &mut out);
                 out.extend_from_slice(v);
@@ -174,6 +178,7 @@ fn decode_row(types: &[ColumnType], bytes: &[u8]) -> Vec<Value> {
                     Value::Bytea(raw)
                 }
             }
+            ColumnType::Numeric => unimplemented!("the bench corpus has no numeric column"),
         });
     }
     values

@@ -154,6 +154,9 @@ fn activerecord_s_four_type_map_queries_answer() {
             // `timestamp` is in ActiveRecord's list of ten and arrived with tier 1's third type.
             vec!["1114", "timestamp"],
             vec!["1184", "timestamptz"],
+            // `numeric` is the tenth name ActiveRecord asks for and the last of the ten this node
+            // did not have; the list it sends is now fully answered.
+            vec!["1700", "numeric"],
         ]
     );
 
@@ -209,6 +212,9 @@ fn activerecord_s_four_type_map_queries_answer() {
                 "b",
                 "0"
             ],
+            // `numeric` is in this list of forty too, and its `typinput` is PostgreSQL's own
+            // `numeric_in` — derived from `ColumnType::ALL` like every row above it.
+            vec!["1700", "numeric", "0", ",", "numeric_in", "\\N", "b", "0"],
             vec!["3802", "jsonb", "0", ",", "jsonb_in", "\\N", "b", "0"],
         ]
     );

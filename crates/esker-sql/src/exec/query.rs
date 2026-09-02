@@ -1631,7 +1631,12 @@ fn same_family(left: ColumnType, right: ColumnType) -> bool {
             | ColumnType::Int4
             | ColumnType::Int2
             | ColumnType::Double
-            | ColumnType::Real => 0,
+            | ColumnType::Real
+            // **A number**, and in the same family as the rest: `numeric = int4`, `numeric >
+            // int8` and `numeric = float8` are all real operators on a real server, and
+            // `pg_cmp` has an arm for each pairing. Keeping it apart would refuse `WHERE n > 0`,
+            // which is the commonest thing anybody writes about a decimal column.
+            | ColumnType::Numeric => 0,
             ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => 1,
             ColumnType::Bool => 2,
             ColumnType::Bytea => 3,

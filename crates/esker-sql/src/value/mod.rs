@@ -32,6 +32,7 @@
 pub mod date;
 pub(crate) mod float;
 pub(crate) mod json;
+pub mod numeric;
 mod timestamp;
 
 use std::cmp::Ordering;
@@ -113,6 +114,12 @@ pub fn fit_to_typmod(value: Datum, ty: ColumnType, typmod: i32) -> Result<Datum>
         return Ok(value);
     }
     Ok(match (&value, ty) {
+        // The declared scale is applied here rather than at the parse, which is what makes one
+        // rule serve the cast, the assignment and the `INSERT`: `1.245::numeric(10,2)` and a
+        // `1.245` written into a `numeric(10,2)` column are the same rounding.
+        (Datum::Numeric(value), ColumnType::Numeric) => {
+            Datum::Numeric(numeric::fit_to_typmod(value.clone(), typmod)?)
+        }
         (Datum::Text(text), ColumnType::Varchar) => {
             let Some(limit) = length_of_typmod(typmod) else {
                 return Ok(value);
@@ -182,6 +189,8 @@ pub fn format_type(ty: ColumnType, typmod: i32) -> String {
             Some(precision) => format!("timestamp({precision}) with time zone"),
             None => ty.name().to_owned(),
         },
+        // `numeric(10,2)`, and `numeric(11,-2)` — the scale is signed and prints signed.
+        (ColumnType::Numeric, _) => numeric::format_typmod(typmod),
         _ => ty.name().to_owned(),
     }
 }
@@ -289,6 +298,7 @@ impl PgType for ColumnType {
             ColumnType::Timestamp => 1114,
             ColumnType::TimestampTz => 1184,
             ColumnType::Date => 1082,
+            ColumnType::Numeric => 1700,
         }
     }
 
@@ -309,6 +319,7 @@ impl PgType for ColumnType {
             ColumnType::Double => "double precision",
             ColumnType::Real => "real",
             ColumnType::Date => "date",
+            ColumnType::Numeric => "numeric",
         }
     }
 
@@ -326,6 +337,7 @@ impl PgType for ColumnType {
             | ColumnType::Bpchar
             | ColumnType::Json
             | ColumnType::Jsonb
+            | ColumnType::Numeric
             | ColumnType::Bytea => -1,
         }
     }
@@ -353,7 +365,13 @@ pub trait PgDatum: Sized {
     /// C2's `0A000` naming the construct — never a wrong value and never a syntax error about
     /// valid input. `tests/value_parity.rs` holds the list of those from both sides.
     fn from_text(ty: ColumnType, text: &str) -> Result<Datum>;
-    /// The bytes PostgreSQL puts in a **binary**-format field, or `None` for NULL.
+    /// The bytes PostgreSQL puts in a **binary**-format field, or `None` when there are none to
+    /// put there.
+    ///
+    /// `None` is a NULL **or** a type this node will not write in binary. The two are one answer
+    /// because nothing sends binary results yet; the day something does, it must refuse the
+    /// second kind before asking rather than send it as a NULL. `from_binary` refuses
+    /// the same types on the way in, with the `0A000` that names the type.
     ///
     /// Big-endian throughout, which is the one place this project is: everything it writes for
     /// itself is little-endian and everything on this wire is not. The formats were captured with
@@ -407,6 +425,7 @@ impl PgDatum for Datum {
             Datum::Double(v) => float::to_text(*v),
             Datum::Real(v) => float::to_text_f32(*v),
             Datum::Date(v) => date::to_text(*v),
+            Datum::Numeric(v) => numeric::to_text(v),
         })
     }
 
@@ -437,12 +456,17 @@ impl PgDatum for Datum {
             // session's clock enters. `crate::exec` resolves them where it has the transaction's
             // start timestamp, which is the only clock this crate is allowed to read (DESIGN §6).
             ColumnType::Date => Datum::Date(date::from_text(text, 0)?),
+            ColumnType::Numeric => Datum::Numeric(numeric::from_text(text)?),
         })
     }
 
     fn to_binary(&self) -> Option<Vec<u8>> {
         Some(match self {
-            Datum::Null => return None,
+            // A NULL, and a `numeric`, whose binary wire form is its own four-`i16` header plus
+            // base-10000 digit groups (`numeric_send(1.5)` is `\x000200000000000100011388`) —
+            // nothing here has ever sent or read that shape, so it is refused rather than
+            // guessed. See the contract above for why the two share one answer.
+            Datum::Null | Datum::Numeric(_) => return None,
             Datum::Int8(v) | Datum::TimestampTz(v) | Datum::Timestamp(v) => {
                 v.to_be_bytes().to_vec()
             }
@@ -491,6 +515,14 @@ impl PgDatum for Datum {
             ColumnType::Date => {
                 let head: [u8; 4] = fixed(4)?.try_into().unwrap_or([0; 4]);
                 Datum::Date(i32::from_be_bytes(head))
+            }
+            // `numeric_recv` reads a four-`i16` header and base-10000 digit groups. Nothing here
+            // has ever sent that shape and the corpus cannot reach it — `psql` sends text — so it
+            // is refused rather than guessed, the same call `json` makes two arms below.
+            ColumnType::Numeric => {
+                return Err(SqlError::unsupported(
+                    "a numeric parameter in the binary format",
+                ));
             }
             ColumnType::Int2 => {
                 let head: [u8; 2] = fixed(2)?.try_into().unwrap_or([0; 2]);
@@ -545,6 +577,38 @@ impl PgDatum for Datum {
             (Datum::Timestamp(a) | Datum::TimestampTz(a), Datum::Date(b)) => {
                 a.cmp(&date::as_micros(*b))
             }
+            (Datum::Numeric(a), Datum::Numeric(b)) => numeric::pg_cmp(a, b),
+            // **Exact against an integer, lossy against a float** — PostgreSQL's own promotion
+            // rule, and the reason the two pairings are written separately rather than folded
+            // into one `as_f64`: `numeric + int4` stays `numeric` there and `numeric + float8`
+            // does not, so a comparison that went through `f64` for both would answer `t` for a
+            // pair of integers a real server tells apart.
+            (Datum::Numeric(a), Datum::Int8(b)) => numeric::pg_cmp(a, &numeric::of_i64(*b)),
+            (Datum::Int8(a), Datum::Numeric(b)) => numeric::pg_cmp(&numeric::of_i64(*a), b),
+            (Datum::Numeric(a), Datum::Int4(b)) => {
+                numeric::pg_cmp(a, &numeric::of_i64(i64::from(*b)))
+            }
+            (Datum::Int4(a), Datum::Numeric(b)) => {
+                numeric::pg_cmp(&numeric::of_i64(i64::from(*a)), b)
+            }
+            (Datum::Numeric(a), Datum::Int2(b)) => {
+                numeric::pg_cmp(a, &numeric::of_i64(i64::from(*b)))
+            }
+            (Datum::Int2(a), Datum::Numeric(b)) => {
+                numeric::pg_cmp(&numeric::of_i64(i64::from(*a)), b)
+            }
+            (Datum::Numeric(a), Datum::Double(b)) => {
+                Datum::Double(numeric::as_f64(a)).pg_cmp(&Datum::Double(*b))
+            }
+            (Datum::Double(a), Datum::Numeric(b)) => {
+                Datum::Double(*a).pg_cmp(&Datum::Double(numeric::as_f64(b)))
+            }
+            (Datum::Numeric(a), Datum::Real(b)) => {
+                Datum::Double(numeric::as_f64(a)).pg_cmp(&Datum::Double(f64::from(*b)))
+            }
+            (Datum::Real(a), Datum::Numeric(b)) => {
+                Datum::Double(f64::from(*a)).pg_cmp(&Datum::Double(numeric::as_f64(b)))
+            }
             (Datum::Int4(a), Datum::Int4(b)) | (Datum::Date(a), Datum::Date(b)) => a.cmp(b),
             (Datum::Int2(a), Datum::Int2(b)) => a.cmp(b),
             (Datum::Int2(a), Datum::Int4(b)) => i32::from(*a).cmp(b),
@@ -581,6 +645,7 @@ fn variant_rank(value: &Datum) -> u8 {
         Datum::Int8(_) | Datum::Int4(_) | Datum::Int2(_) => 1,
         Datum::Double(_) | Datum::Real(_) => 2,
         Datum::TimestampTz(_) | Datum::Timestamp(_) | Datum::Date(_) => 3,
+        Datum::Numeric(_) => 7,
         Datum::Text(_) => 4,
         Datum::Bytea(_) => 5,
         Datum::Null => 6,
@@ -813,6 +878,7 @@ mod tests {
         // Tier 2's first pair (ADR 0042).
         assert_eq!(ColumnType::Json.oid(), 114);
         assert_eq!(ColumnType::Jsonb.oid(), 3802);
+        assert_eq!(ColumnType::Numeric.oid(), 1700);
         for ty in ColumnType::ALL {
             assert_eq!(
                 ty.type_len() == -1,
@@ -824,6 +890,10 @@ mod tests {
                         | ColumnType::Json
                         | ColumnType::Jsonb
                         | ColumnType::Bytea
+                        // Variable width for the same reason as a string: the digits a value
+                        // carries are the value, and `numeric(10,2)` bounds them in the typmod,
+                        // not in the type.
+                        | ColumnType::Numeric
                 ),
                 "{ty:?} reports the wrong width"
             );

@@ -69,7 +69,6 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
         ("CREATE TABLE t (a int8) INHERITS (u)", "INHERITS"),
         // Tier 1 is complete: every type it names runs, typmods included. What is left here is
         // tier 2, refused by name, and each line is deleted by the unit that lands its type.
-        ("CREATE TABLE t (a numeric)", "the type NUMERIC"),
         // A length unit is the standard's spelling and PostgreSQL takes neither — named rather
         // than dropped, since a dropped unit changes what a multi-byte value the column holds.
         (

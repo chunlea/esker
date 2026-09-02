@@ -404,6 +404,13 @@ fn put_literal(value: &Value, out: &mut Vec<u8>) {
             out.push(ColumnType::Text.tag());
             put_bytes(v.as_bytes(), out);
         }
+        // Its own tag, and the same bytes: a `numeric` literal has to come back as a `numeric`
+        // rather than as a `text` that happens to hold digits, because the two are different
+        // families to a comparison.
+        Value::Numeric(v) => {
+            out.push(ColumnType::Numeric.tag());
+            put_bytes(v.as_bytes(), out);
+        }
         Value::Bytea(v) => {
             out.push(ColumnType::Bytea.tag());
             put_bytes(v, out);
@@ -446,6 +453,12 @@ fn take_literal(cursor: &mut Cursor<'_>) -> Result<Value> {
                 ));
             }
         },
+        ColumnType::Numeric => {
+            let bytes = take_literal_bytes(cursor, "literal numeric")?;
+            Value::Numeric(String::from_utf8(bytes).map_err(|error| {
+                Error::corruption("fragment", format!("literal numeric is not utf-8: {error}"))
+            })?)
+        }
         ColumnType::Text
         | ColumnType::Varchar
         | ColumnType::Bpchar

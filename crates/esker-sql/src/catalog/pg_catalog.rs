@@ -465,6 +465,7 @@ pub(super) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::Double => "float8",
         ColumnType::Real => "float4",
         ColumnType::Date => "date",
+        ColumnType::Numeric => "numeric",
     }
 }
 
@@ -491,5 +492,6 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::Double => "float8in",
         ColumnType::Real => "float4in",
         ColumnType::Date => "date_in",
+        ColumnType::Numeric => "numeric_in",
     }
 }

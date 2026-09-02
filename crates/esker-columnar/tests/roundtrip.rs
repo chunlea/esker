@@ -117,6 +117,23 @@ fn value_of(ty: ColumnType) -> impl Strategy<Value = Value> {
         ColumnType::Bytea => prop::collection::vec(any::<u8>(), 0..8)
             .prop_map(Value::Bytea)
             .boxed(),
+        // A `numeric` rides the column as its text, so the interesting cases are the three
+        // non-finite spellings and a value wider than any integer type.
+        ColumnType::Numeric => (0usize..6)
+            .prop_map(|pick| {
+                Value::Numeric(
+                    [
+                        "0",
+                        "0.00",
+                        "-1.5",
+                        "12345678901234567890.5",
+                        "NaN",
+                        "-Infinity",
+                    ][pick]
+                        .to_owned(),
+                )
+            })
+            .boxed(),
     };
     prop_oneof![1 => Just(Value::Null), 6 => present]
 }

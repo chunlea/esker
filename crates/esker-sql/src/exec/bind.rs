@@ -452,5 +452,8 @@ fn placeholder(ty: ColumnType) -> Datum {
         ColumnType::Double => Datum::Double(0.0),
         ColumnType::Real => Datum::Real(0.0),
         ColumnType::Date => Datum::Date(0),
+        ColumnType::Numeric => Datum::Numeric(esker_keys::numeric::Numeric::Finite(
+            esker_keys::numeric::Decimal::zero(),
+        )),
     }
 }

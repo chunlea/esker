@@ -127,6 +127,7 @@ impl Bound {
             | ColumnType::Bpchar
             | ColumnType::Json
             | ColumnType::Jsonb
+            | ColumnType::Numeric
             | ColumnType::Bytea => Value::Bytea(self.bytes.clone()),
         })
     }
@@ -278,6 +279,11 @@ impl ColumnStats {
             | ColumnType::Bpchar
             | ColumnType::Json
             | ColumnType::Jsonb
+            // A `numeric` is stored as its text, so its bounds are **byte bounds of that text**
+            // and their order is not the type's: `"10" < "9"` and `"-1.5" < "0"` as bytes, both
+            // backwards as numbers. Nothing prunes yet; the first pruner that does must either
+            // decode both bounds and compare with `numeric`'s own ordering or skip this type.
+            | ColumnType::Numeric
             | ColumnType::Bytea => None,
         };
         [self.min.as_ref(), self.max.as_ref()]
@@ -806,6 +812,21 @@ mod tests {
             ColumnType::Bytea => prop::collection::vec(any::<u8>(), 0..90)
                 .prop_map(Value::Bytea)
                 .boxed(),
+            ColumnType::Numeric => (0usize..6)
+                .prop_map(|pick| {
+                    Value::Numeric(
+                        [
+                            "0",
+                            "0.00",
+                            "-1.5",
+                            "12345678901234567890.5",
+                            "NaN",
+                            "-Infinity",
+                        ][pick]
+                            .to_owned(),
+                    )
+                })
+                .boxed(),
         };
         prop_oneof![1 => Just(Value::Null), 5 => present]
     }
@@ -875,7 +896,10 @@ mod tests {
                     read(min).is_some_and(|low| pg_cmp_f32(low, *v).is_le())
                         && read(max).is_some_and(|high| pg_cmp_f32(*v, high).is_le())
                 }
-                Value::Text(v) => {
+                // A numeric shares this arm because **its bound is its text's bound, not its
+                // value's**; see the warning on the byte-run list in `fit` for why a pruner may
+                // not read it as a number.
+                Value::Text(v) | Value::Numeric(v) => {
                     min.bytes.as_slice() <= v.as_bytes() && v.as_bytes() <= max.bytes.as_slice()
                 }
                 Value::Bytea(v) => {

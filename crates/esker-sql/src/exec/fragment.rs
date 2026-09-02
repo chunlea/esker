@@ -576,6 +576,7 @@ fn column_type(ty: crate::value::ColumnType) -> esker_columnar::ColumnType {
         Row::Timestamp => Col::Timestamp,
         Row::Double => Col::Double,
         Row::Date => Col::Date,
+        Row::Numeric => Col::Numeric,
     }
 }
 
@@ -595,6 +596,7 @@ fn datum_to_value(datum: &Datum) -> esker_columnar::Value {
         Datum::Timestamp(ts) => Value::Timestamp(*ts),
         Datum::Double(double) => Value::Double(*double),
         Datum::Date(day) => Value::Date(*day),
+        Datum::Numeric(value) => Value::Numeric(crate::value::numeric::to_text(value)),
     }
 }
 
@@ -605,6 +607,11 @@ fn value_to_datum(value: &WireValue) -> Datum {
         WireValue::Int8(int) => Datum::Int8(*int),
         WireValue::Int4(int) => Datum::Int4(*int),
         WireValue::Date(day) => Datum::Date(*day),
+        // Carried across the wire as its **text**, which is lossless for this type: the scale is
+        // in the digits, so the string a fragment sends reads back as the value it was.
+        WireValue::Numeric(text) => {
+            Datum::from_text(crate::value::ColumnType::Numeric, text).unwrap_or(Datum::Null)
+        }
         WireValue::Int2(int) => Datum::Int2(*int),
         WireValue::Real(float) => Datum::Real(*float),
         WireValue::Text(text) => Datum::Text(text.clone()),

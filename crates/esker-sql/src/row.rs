@@ -62,6 +62,23 @@ mod tests {
                 .prop_map(Datum::Date),
             ]
             .boxed(),
+            // The two spellings of one number are in here on purpose: `1.0` and `1.00` compare
+            // equal and **must** encode to one key, which is the property this test exists for.
+            ColumnType::Numeric => prop_oneof![
+                6 => (any::<bool>(), proptest::collection::vec(0u8..=9, 1..10), -4i32..6)
+                    .prop_map(|(negative, digits, scale)| Datum::Numeric(
+                        esker_keys::numeric::Numeric::Finite(esker_keys::numeric::Decimal {
+                            negative: negative && !digits.iter().all(|d| *d == 0),
+                            digits,
+                            scale,
+                        })
+                    )),
+                4 => proptest::sample::select(vec![
+                    "NaN", "Infinity", "-Infinity", "0", "0.0", "1.0", "1.00", "-1.0", "1e3",
+                ])
+                .prop_map(|text| Datum::from_text(ColumnType::Numeric, text).unwrap_or(Datum::Null)),
+            ]
+            .boxed(),
             ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => {
                 ".{0,32}".prop_map(Datum::Text).boxed()
             }

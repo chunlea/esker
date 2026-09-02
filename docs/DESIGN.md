@@ -903,7 +903,11 @@ Encodings, chosen by encoding both ways and keeping the smaller rather than by a
 frame-of-reference or delta for `int8` and `timestamptz`, dictionary or bit-packed lengths plus
 bytes for `text` and `bytea`, bit-packed or run-length for `bool` and the null mask, plain for
 `double`. Then LZ4 over the payload when it saves more than an eighth — the engine's rule (§4.5).
-The type set is the six `esker_sql::value::ColumnType` carries, with the row side's own tag bytes.
+The type set is whatever `esker_sql::value::ColumnType` carries, with the row side's own tag
+bytes — a number that has risen with every type unit rather than a fixed six. A `numeric`
+rides the byte run as its text, so its statistics bounds are that text's bounds and **not**
+the number's: `"10" < "9"` as bytes. Nothing prunes yet, and the first pruner must decode
+both bounds and compare with `numeric`'s own ordering or skip the type (ADR 0045).
 
 The **trailer** is 32 fixed bytes at the very end: the footer's offset, length and CRC, a CRC over
 itself, a format version, and the magic `ESKERCOL`. It is written last, so **its magic is the
@@ -951,8 +955,9 @@ not implement them, not a damaged message, and the caller falls back to a row sc
 Aggregate semantics are PostgreSQL's, defined here because the row executor has none yet:
 `count(*)` counts rows and `count(col)` skips NULLs, `sum`/`min`/`max` over nothing are NULL and
 not zero, extremes order by `pg_cmp`, NULL forms one `GROUP BY` group of its own. One declared
-divergence: `sum(bigint)` returns `numeric` on a real server and cannot overflow, and phase 6a has
-no `numeric`, so an `int8` sum that does not fit is a typed error rather than a wrapped number.
+divergence: `sum(bigint)` returns `numeric` on a real server and cannot overflow, and this node's
+`sum` does not promote to it, so an `int8` sum that does not fit is a typed error rather than a
+wrapped number. The type itself exists since ADR 0045; the aggregate is what has not moved.
 
 A fragment's aggregates are folded into **one accumulator per group across the whole file**, in row
 order, so its answer does not depend on where stripe boundaries fell — floating-point addition is

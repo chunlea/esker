@@ -91,8 +91,14 @@ const FUNCTIONS: &str = "A `json` function this node does not have, named under 
      unit's scope; the corpus carries them so the unit that adds them starts from the \
      measurement.";
 /// One of `DIVERGENCES`' nine reasons.
-const CASTS: &str = "A cast out of `jsonb` to a scalar type. `numeric` does not exist here at all, and \
-     the others wait on the `::text` cast that `r1`'s triage has queued as its own unit.";
+const CASTS: &str = "**Both refuse a `jsonb` *object* cast to a scalar; the code and the \
+     message differ.** PostgreSQL rejects it in the cast itself, `22023 cannot cast jsonb \
+     object to type integer`, where this node renders the object to its text and hands that \
+     to `integer`s input function, which refuses the rendered object as `22P02 invalid \
+     input syntax for type integer`. A refusal of the right shape with the wrong code, \
+     closing when the cast checks the `jsonb` *kind* before rendering. The scalar casts \
+     this reason also covered now agree: `::text` landed with the json unit and `::numeric` \
+     with this one.";
 /// One of `DIVERGENCES`' nine reasons.
 const REGTYPE: &str = "Both refuse, with different codes: PostgreSQL's *parser* answers `42601 syntax error \
      at or near \"(\"` because `json` takes no typmod, and this node answers `42704 type \
@@ -224,10 +230,6 @@ const ANSWERS: &[(&str, &str)] = &[
     (
         "SELECT json_agg(x), jsonb_agg(x) FROM (VALUES (1), (2)) v(x)",
         FUNCTIONS,
-    ),
-    (
-        "SELECT '1'::jsonb::int, '1'::jsonb::numeric, '\"s\"'::jsonb::text",
-        CASTS,
     ),
     ("SELECT '{\"a\":1}'::jsonb::int", CASTS),
     ("SELECT 'json(10)'::regtype::oid", REGTYPE),

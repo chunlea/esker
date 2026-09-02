@@ -1229,8 +1229,11 @@ three real stores rather than the in-memory fake.
   real server gives everyone who is not a superuser. `ALTER SYSTEM` and every other administrative
   surface phase-6a §9 classifies as such stay `0A000`.
 * **No `plpgsql`, no `CREATE FUNCTION`, no triggers.** They parse (C1) and they are `0A000` (C2).
-* **No `numeric` type.** Refused by name and counted, per ADR 0031. It gets its own ADR and its own
-  unit when the count justifies it.
+* ~~**No `numeric` type.**~~ **Landed** (ADR 0045). It got the unit the count justified: stored as
+  digits and a scale with the written text preserved, ordered and indexable through a normalised
+  key, printed by `numeric_out`'s rules, refused in the binary wire format both ways. What it
+  still does not do is arithmetic — `numeric` addition, `round`, `trunc` and `sum` are the
+  twenty-nine declared `answers` divergences in `tests/numeric.rs`.
 * **No window functions, no CTEs, no subqueries in `FROM`.** Each is `0A000` today and stays so;
   a subquery is the next thing after this phase, not inside it.
 * **No planner cost model.** The join stays nested-loop and rule-based. Benchmarks are recorded
