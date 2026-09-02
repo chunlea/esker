@@ -19,6 +19,7 @@
 pub mod clock;
 pub mod fault;
 pub mod lin;
+pub mod mech;
 pub mod net;
 pub mod raft;
 

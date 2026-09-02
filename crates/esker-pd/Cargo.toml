@@ -34,6 +34,10 @@ tokio = { workspace = true, features = ["rt", "sync"] }
 # library as an ordinary dependency, so `#[cfg(test)]` does not reach it and the feature is
 # the only way in — the same shape `esker-engine` uses for its fault-injecting filesystem.
 esker-pd = { path = ".", features = ["testing"] }
+# `tests/sim_balance.rs`: the deterministic model of balance-versus-repair owns the world and the
+# checker; this crate supplies the decision. Dev-only, so it is outside the runtime crate budget,
+# and `esker-sim` depends on nothing above `esker-raft`, so there is no cycle.
+esker-sim = { path = "../esker-sim" }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["net", "time", "rt-multi-thread", "macros"] }
 

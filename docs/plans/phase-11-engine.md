@@ -128,8 +128,8 @@ conditions.
 
 ### Recorded
 
-Seeds and run counts for every model go in this file's §6 as they are produced, so a failure is
-a number to rerun rather than a story.
+Seeds and run counts for every model go in §10 as they are produced, so a failure is a number to
+rerun rather than a story.
 
 ## 3. U2 — the two-level iterator
 
@@ -228,3 +228,54 @@ somebody else's.
 | U3 | `esker-engine` unit tests + a working-set test | unit |
 | U4 | `esker-engine/tests/tier_minio.rs` (measurement only) | measurement |
 | U5 | — | none; ADR only |
+
+## 10. The runs, with seeds
+
+Every model runs the same fixed seed list, so a failure is a rerun and not a story:
+
+```
+1 2 3 5 8 13 21 34 55 89 144 233 377 610 987 1597 2584 4181 6765 10946 17711 28657 46368 75025
+```
+
+### U1a — balance versus repair (`548dd62`)
+
+| | |
+|---|---|
+| Model | `esker-sim/src/mech/placement.rs`, seeded five-store cluster, 8 regions |
+| Binding | `esker-pd/tests/sim_balance.rs` → `esker_pd::balance::balance_for` |
+| Runs | 24 seeds × 400 rounds = 9,600 rounds, every region queried twice per round |
+| Reached | **24,953** policy queries against a region holding an unpromoted learner with **every store up** — the state the narrow rule could not see — out of 84,569 mid-repair queries in all |
+| Also reached | 1,084 learners added, 1,052 promoted, 1,177 store-down events, 1,278 balance moves applied |
+
+Green at `875d9c4` (this branch): 4 passed.
+
+**Red at `ba8ed2e` (`548dd62^`)**, in a detached worktree with only `crates/esker-sim/` and
+`crates/esker-pd/tests/sim_balance.rs` + `Cargo.toml` copied in — 3 of 4 fail:
+
+```
+test balance_never_touches_a_mid_repair_region ... FAILED
+seed 1, round 0: balance planned AddPeer { region_id: 1, store_id: 4 } against region 1,
+which is mid-repair (UnpromotedLearner { peer_id: 25, all_stores_live: true })
+
+test leader_balance_has_a_repair_guard_of_its_own ... FAILED
+the office moved out from under an unfinished repair
+  left: Some(TransferLeader { region_id: 1, to_peer_id: 20 })
+ right: None
+
+test a_columnar_learner_is_not_a_repair ... FAILED
+a plain learner must still stop balance
+  left: Some(AddPeer { region_id: 1, store_id: 4 })
+ right: None
+```
+
+The second is the one worth pointing at: `548dd62`'s trace is a `TransferLeader`, and the seeded
+run cannot isolate it because `balance_for` asks `region_balance` first and it answers first. So
+that shape is constructed — region counts dead level, leader counts far apart — and it fails at
+the parent because `leader_balance` had no repair guard at all.
+
+The fourth test, `the_checker_names_the_learner_when_it_fires`, passes at both revisions by
+design: it is a guard on the checker's own output, not on the placement driver.
+
+`esker-sim`'s own `tests/mech_placement.rs` proves the same three things about the *model* using a
+reference policy, including that the checker fires on all 24 seeds against a deliberately narrowed
+rule. That is not evidence about `esker-pd` and is not counted as any.
