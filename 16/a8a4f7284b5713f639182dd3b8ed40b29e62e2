@@ -1,0 +1,27 @@
+crates/esker-sql/src/plan/query.rs
+  s_8213a31ba756d1::t_9aa0a6ff924cf6 390
+crates/esker-sql/src/plan/subquery.rs
+  s_8213a31ba756d1::t_a8f3c0af2d60d6 7,135,147,155,203,262
+docs/DESIGN.md
+  s_8213a31ba756d1::t_beee36d2665b49 793-802
+docs/adr/0042-a-subquery-is-a-plan-node-run-once-or-per-row.md
+  s_8213a31ba756d1::t_0ec4bdb7c360a4 1-155
+docs/plans/phase-12-subquery.md
+  s_8213a31ba756d1::t_89a9c8f51afe0c 3,154,156-159,211
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "16a8a4f7284b5713f639182dd3b8ed40b29e62e2",
+  "prompts": {},
+  "sessions": {
+    "s_8213a31ba756d1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6f90895c-f344-4eae-bdcb-fc8ddda55532",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
