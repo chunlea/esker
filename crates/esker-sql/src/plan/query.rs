@@ -781,6 +781,16 @@ fn render(expr: &Expr, columns: &[String]) -> String {
             render(right, columns)
         ),
         Expr::Not(operand) => format!("NOT {}", render(operand, columns)),
+        // As the user wrote it: the name and its arguments.
+        Expr::CatalogFunc(call) => format!(
+            "{}({})",
+            call.func.name(),
+            call.args
+                .iter()
+                .map(|arg| render(arg, columns))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Expr::InList {
             operand,
             list,

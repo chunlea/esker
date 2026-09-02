@@ -172,6 +172,11 @@ fn for_each_subquery_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut TableRef))
                 for_each_subquery_mut(arg, visit);
             }
         }
+        Expr::CatalogFunc(call) => {
+            for arg in &mut call.args {
+                for_each_subquery_mut(arg, visit);
+            }
+        }
         Expr::Literal(_)
         | Expr::Parameter(_)
         | Expr::Column { .. }

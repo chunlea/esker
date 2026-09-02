@@ -1,0 +1,98 @@
+# `format_type(oid, typmod)`, as a real PostgreSQL 19beta1 answers it -- phase 13 unit 1a.
+#
+# NOT a type. The function the whole of `ActiveRecord`'s `columns()` stops on: statement 193 of
+# `activerecord/test/schema/schema.rb` is
+#
+#   SELECT a.attname, format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid), ...
+#
+# and until this answers, nothing behind it in the schema-dump path can be measured at all. It is
+# the inverse of `::regtype`: that turns a name into an OID, this turns an OID plus a typmod back
+# into the name a client is shown.
+#
+# Captured in one session with `scratchpad/sesscap.py`, inside one `BEGIN ... ROLLBACK`, and
+# replayed the same way against one node. It creates nothing and needs no fixture.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **It almost never fails.** An OID with no `pg_type` row is not an error -- it is the three
+#     characters `???` -- and `format_type(0, NULL)` is a single `-`. A NULL OID is NULL. Nothing
+#     in this file raises except the three wrong arities.
+#   * **A typmod on a type that has none is silently ignored**, where the same thing through
+#     `::regtype` is a syntax error: `format_type(23, 4)` is `integer`, but `'integer(4)'::regtype`
+#     is `42601`. The two halves of the round trip do not agree about what is legal.
+#   * **It does not clamp and it does not validate.** `format_type(1114, 7)` is
+#     `timestamp(7) without time zone` -- a precision no `CREATE TABLE` will store, since DDL
+#     clamps 7 to 6 with a `WARNING`. `format_type` prints what it is handed.
+#   * **Each family's "no typmod" threshold is its own, and it is not `-1`.** For `varchar` the
+#     typmod is the length **plus four**, so **0, 1 and 4 all print bare** and `5` is the first
+#     real one, `character varying(1)`. For `timestamp` the typmod is the precision directly, so
+#     **`0` is a real precision** -- `timestamp(0) without time zone` -- and only a negative is
+#     bare.
+#   * **A NULL typmod and a typmod of `-1` are different arguments**, and for exactly one type they
+#     give different answers: `format_type(1042, NULL)` is `character` and `format_type(1042, -1)`
+#     is `bpchar`. PostgreSQL calls the distinction `typemod_given`; `character(n)` is the one type
+#     whose bare spelling is not its parameterised one, and every other type is unmoved by it. An
+#     implementation that read a NULL typmod as `-1` gets exactly one row of this file wrong.
+#   * **The arity is exact and the DETAIL says so.** `format_type(23)` is
+#     `42883 function format_type(integer) does not exist` with `DETAIL: No function of that name
+#     accepts the given number of arguments.` -- the *number*, not the types, which is a different
+#     sentence from the one an unknown name gets (`There is no function of that name.`).
+#   * **A capture-format note.** `format_type(0, NULL)` returns the literal string `-`, which this
+#     format also uses for **no rows at all** -- and there the two really are indistinguishable, so
+#     the replay harness reads `stmt <tab> text <tab> -` as an empty result. Every `-` answer below
+#     is therefore captured beside a second column, which is a real statement and an unambiguous
+#     row. The same class as `pg19_varchar.txt`'s vanishing empty string.
+#
+# WHOSE TYPES DOES IT KNOW? This server's, which is the rule `pg_type` already follows -- and the
+# shape of the answer is identical either way, because `???` is exactly what a real server prints
+# for an OID **it** has no row for. So `format_type(1082, NULL)` is `date` there and `???` here,
+# which is the declared divergence at the foot of `tests/pg_catalog_format_type.rs`, and it closes
+# one type at a time as types arrive.
+
+# --- the types with no typmod at all: the answer is the name, and a typmod is ignored
+SELECT format_type(23, NULL), format_type(23, -1), format_type(23, 4)	text,text,text	integer|integer|integer
+SELECT format_type(20, NULL), format_type(21, NULL), format_type(16, NULL), format_type(25, NULL), format_type(17, NULL)	text,text,text,text,text	bigint|smallint|boolean|text|bytea
+SELECT format_type(700, NULL), format_type(701, NULL)	text,text	real|double precision
+SELECT format_type(114, NULL), format_type(3802, NULL)	text,text	json|jsonb
+
+# --- varchar: the typmod is the length plus four, so 0, 1 and 4 are bare and 5 is the first real one
+SELECT format_type(1043, NULL), format_type(1043, -1)	text,text	character varying|character varying
+SELECT format_type(1043, 0), format_type(1043, 1), format_type(1043, 4), format_type(1043, 5)	text,text,text,text	character varying|character varying|character varying|character varying(1)
+SELECT format_type(1043, 9), format_type(1043, 1028)	text,text	character varying(5)|character varying(1024)
+
+# --- character: the one type where a NULL typmod and a -1 typmod differ
+SELECT format_type(1042, NULL), format_type(1042, -1), format_type(1042, 7)	text,text,text	character|bpchar|character(3)
+
+# --- timestamp: the typmod is the precision itself, so 0 is real and only a negative is bare
+SELECT format_type(1114, NULL), format_type(1114, -1), format_type(1114, -2)	text,text,text	timestamp without time zone|timestamp without time zone|timestamp without time zone
+SELECT format_type(1114, 0), format_type(1114, 3), format_type(1114, 6), format_type(1114, 7)	text,text,text,text	timestamp(0) without time zone|timestamp(3) without time zone|timestamp(6) without time zone|timestamp(7) without time zone
+SELECT format_type(1184, NULL), format_type(1184, 0), format_type(1184, 6)	text,text,text	timestamp with time zone|timestamp(0) with time zone|timestamp(6) with time zone
+
+# --- the three answers that are not a type name
+SELECT format_type(NULL, NULL)	text	\N
+SELECT format_type(NULL, 4)	text	\N
+SELECT format_type(0, NULL), format_type(23, NULL)	text,text	-|integer
+SELECT format_type(0, 4), format_type(0, -1)	text,text	-|-
+SELECT format_type(999999, NULL), format_type(0, NULL)	text,text	???|-
+SELECT format_type(999999, NULL)	text	???
+SELECT format_type(999999, 4)	text	???
+
+# --- the arity, which is checked by name and number
+SELECT format_type(23)	!42883 function format_type(integer) does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT format_type()	!42883 function format_type() does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT format_type(23, 4, 5)	!42883 function format_type(integer, integer, integer) does not exist DETAIL: No function of that name accepts the given number of arguments.
+
+# --- composed with the cast that is its inverse, which is how a client writes it
+SELECT format_type('integer'::regtype, NULL)	text	integer
+SELECT format_type('character varying'::regtype, 1028)	text	character varying(1024)
+SELECT format_type('timestamp without time zone'::regtype, 3)	text	timestamp(3) without time zone
+SELECT format_type('bigint'::regtype, NULL), format_type('boolean'::regtype, NULL)	text,text	bigint|boolean
+
+# --- and the types a real server has and this one does not, which is the declared divergence
+SELECT format_type(1082, NULL), format_type(1700, NULL), format_type(2950, NULL)	text,text,text	date|numeric|uuid
+SELECT format_type(26, NULL), format_type(19, NULL), format_type(2206, NULL)	text,text,text	oid|name|regtype
+SELECT format_type(1007, NULL), format_type(1009, NULL)	text,text	integer[]|text[]

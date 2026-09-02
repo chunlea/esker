@@ -499,6 +499,11 @@ fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
                 substitute_in_expr(arg, outer, depth);
             }
         }
+        Expr::CatalogFunc(call) => {
+            for arg in &mut call.args {
+                substitute_in_expr(arg, outer, depth);
+            }
+        }
         // Into the sub-plan, **one level deeper**, and into the operand at this level. The
         // sub-plan's cached `run` is dropped: it was computed for a different outer row.
         Expr::Subquery(sub) => {
@@ -876,6 +881,11 @@ fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
                 walk(arg, visit);
             }
         }
+        Expr::CatalogFunc(call) => {
+            for arg in &call.args {
+                walk(arg, visit);
+            }
+        }
         // **Not into the sub-select.** A subquery's own expressions belong to its own plan, which
         // is walked separately once it has one; visiting them here would type them against the
         // outer statement's scope.
@@ -912,6 +922,11 @@ fn walk_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr) -> Result<()>) ->
             }
         }
         Expr::Aggregate(call) => {
+            for arg in &mut call.args {
+                walk_mut(arg, visit)?;
+            }
+        }
+        Expr::CatalogFunc(call) => {
             for arg in &mut call.args {
                 walk_mut(arg, visit)?;
             }

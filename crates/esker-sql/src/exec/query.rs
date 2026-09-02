@@ -1514,6 +1514,20 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             operand: Box::new(resolve(operand, scope)?),
             negated: *negated,
         },
+        // Its arguments are ordinary expressions of the row — `format_type(a.atttypid,
+        // a.atttypmod)` is two column references — so they resolve like any others. Falling
+        // through to the clone below would leave them as `Expr::Column` and the evaluator would
+        // report them as having reached it unresolved.
+        Expr::CatalogFunc(call) => {
+            let mut args = Vec::with_capacity(call.args.len());
+            for arg in &call.args {
+                args.push(resolve(arg, scope)?);
+            }
+            Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall {
+                func: call.func,
+                args,
+            }))
+        }
         // Only the **operand** is resolved here. Everything inside the sub-select was resolved
         // against the sub-select's own scope when `crate::exec::subquery::plan_subqueries` planned
         // it, and resolving it again here would type it against a row it will never see.
@@ -1970,6 +1984,8 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         Expr::Ordinal { ty, .. } | Expr::Outer { ty, .. } => *ty,
         // A sequence function answers `bigint` on a real server, all four of them.
         Expr::Literal(Literal::Integer(_)) | Expr::Sequence(_) => ColumnType::Int8,
+        // Every catalog function returns `text`, which is what makes them one variant.
+        Expr::CatalogFunc(call) => call.func.result_type(),
         Expr::Literal(Literal::Decimal(_)) => ColumnType::Double,
 
         Expr::Literal(Literal::String(_) | Literal::Null) => ColumnType::Text,

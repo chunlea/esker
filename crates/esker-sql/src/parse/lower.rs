@@ -1324,6 +1324,9 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
     if let Some(func) = plan::SequenceFunc::from_name(&name) {
         return lower_sequence_function(func, function);
     }
+    if let Some(func) = plan::CatalogFunc::from_name(&name) {
+        return lower_catalog_function(func, function);
+    }
     let Some(func) = plan::AggregateFunc::from_name(&name) else {
         return Err(SqlError::unsupported(format!("the function {name}")));
     };
@@ -1396,6 +1399,50 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
         args,
         star,
         distinct,
+    })))
+}
+
+/// A `pg_catalog` function that prints a definition — `format_type(oid, typmod)`.
+///
+/// **The arity is checked and nothing else is**, which is the shape PostgreSQL resolves a function
+/// by: `format_type(23)` is `42883 function format_type(integer) does not exist` with
+/// `DETAIL: No function of that name accepts the given number of arguments.`, naming the *number*
+/// rather than the types. Measured (`esker-rails-harness/captures/pg19_format_type.txt`).
+///
+/// The arguments are ordinary expressions and are evaluated per row, because that is how
+/// `ActiveRecord` writes it: `format_type(a.atttypid, a.atttypmod)` over every row of
+/// `pg_attribute`.
+fn lower_catalog_function(
+    func: plan::CatalogFunc,
+    function: &sqlparser::ast::Function,
+) -> Result<plan::Expr> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments};
+
+    // Each of these would turn the call into a different call, so honouring it and dropping the
+    // clause would answer a question nobody asked.
+    refuse_if(function.over.is_some(), "a window function")?;
+    refuse_if(function.filter.is_some(), "an aggregate FILTER clause")?;
+    refuse_if(!function.within_group.is_empty(), "WITHIN GROUP")?;
+
+    refuse_wrong_arity(function, func.name(), func.arity())?;
+    let FunctionArguments::List(FunctionArgumentList { args, .. }) = &function.args else {
+        // No argument list at all, which `refuse_wrong_arity` has already answered for every
+        // function here — none of them takes zero arguments.
+        return Err(SqlError::UndefinedFunction(format!("{}()", func.name())));
+    };
+    let args = args
+        .iter()
+        .map(|arg| match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => lower_expr(expr),
+            other => Err(SqlError::unsupported(format!(
+                "{}({other}) with an argument that is not an expression",
+                func.name()
+            ))),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+        func,
+        args,
     })))
 }
 

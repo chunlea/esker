@@ -842,6 +842,10 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             ));
         }
 
+        // A catalog function **is** a row function, unlike the two above it, and this is where it
+        // is answered: a value of its arguments, once per row, with nothing to resolve first.
+        Expr::CatalogFunc(call) => catalog_function(call, row, env)?,
+
         // Its rows were produced before this cursor was opened, by `crate::exec::subquery::resolve`
         // -- the same arrangement a `Node::Columnar` has, and for the same reason: this function
         // has a row and no transaction. What is left here is turning those rows into one value,
@@ -941,6 +945,70 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
 /// answers NULL and drops a row the user asked for, which is what this crate did until the corpus
 /// was extended with a NULL before the match.
 ///
+/// One call to a `pg_catalog` function that prints a definition.
+///
+/// The arity was checked where the call was lowered, so an argument that is not there is a bug
+/// rather than a user's mistake — and it is answered as NULL rather than as a panic, because every
+/// one of these functions is NULL-propagating anyway ([`crate::catalog::def_functions`]).
+fn catalog_function(
+    call: &crate::plan::CatalogFuncCall,
+    row: &[Datum],
+    env: Env<'_>,
+) -> Result<Datum> {
+    use crate::plan::CatalogFunc;
+
+    let mut args = Vec::with_capacity(call.args.len());
+    for arg in &call.args {
+        args.push(evaluate_in(arg, row, env)?);
+    }
+    Ok(match call.func {
+        CatalogFunc::FormatType => crate::catalog::def_functions::format_type(
+            type_oid_argument(args.first())?,
+            typmod_argument(args.get(1))?,
+        ),
+    })
+}
+
+/// `format_type`'s first argument: an `oid`.
+///
+/// **Text is taken as a type name**, and that is not a liberty — it is the one coercion this node
+/// cannot express any other way. A real server writes `format_type('integer'::regtype, NULL)` and
+/// coerces `regtype` to `oid` for free; here `'integer'::regtype` lowers to the *name as text*
+/// (`crate::parse::lower::lower_cast`), so the same statement arrives with a string in it and
+/// resolving it is what makes the answer identical. A name that is no type of this server's is
+/// `42704`, which is what `'x'::regtype` itself answers.
+fn type_oid_argument(arg: Option<&Datum>) -> Result<Option<i64>> {
+    Ok(match arg {
+        None | Some(Datum::Null) => None,
+        Some(Datum::Int8(oid)) => Some(*oid),
+        Some(Datum::Text(name)) => {
+            use crate::value::PgType as _;
+            let ty = crate::value::type_by_name(name)
+                .ok_or_else(|| SqlError::UndefinedType(name.trim().to_owned()))?;
+            Some(i64::from(ty.oid()))
+        }
+        Some(other) => {
+            return Err(SqlError::DatatypeMismatch(format!(
+                "format_type() takes an oid, not {other:?}"
+            )));
+        }
+    })
+}
+
+/// `format_type`'s second argument: a type modifier, or NULL — **which is not the same as `-1`**,
+/// and is the whole reason this returns an `Option` rather than defaulting.
+fn typmod_argument(arg: Option<&Datum>) -> Result<Option<i32>> {
+    Ok(match arg {
+        None | Some(Datum::Null) => None,
+        Some(Datum::Int8(typmod)) => Some(i32::try_from(*typmod).unwrap_or(i32::MAX)),
+        Some(other) => {
+            return Err(SqlError::DatatypeMismatch(format!(
+                "a type modifier is an integer, not {other:?}"
+            )));
+        }
+    })
+}
+
 /// Measured on 19beta1, `tests/corpus/pg19_in.txt`. A scan rather than a rewrite to `= a OR = b`,
 /// so the left-hand side is evaluated once — which also keeps a `nextval` on the left from
 /// running per item.

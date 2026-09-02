@@ -62,8 +62,17 @@ pub fn typmod_of_length(length: u32) -> i32 {
 }
 
 /// The declared length back out of a typmod, or `None` when there was none.
+///
+/// **Strictly greater than the header**, which is PostgreSQL's own rule and not an off-by-one:
+/// `varchartypmodout` prints nothing at all for a typmod of `4`, so `format_type(1043, 4)` is
+/// `character varying` and `format_type(1043, 5)` is `character varying(1)` (measured). A typmod
+/// of exactly `4` means a length of zero, which no column can have — `varchar(0)` is `22023` on
+/// input — so the only thing that can reach this branch is a hand-written `format_type`.
 #[must_use]
 pub fn length_of_typmod(typmod: i32) -> Option<u32> {
+    if typmod <= VARHDRSZ {
+        return None;
+    }
     u32::try_from(typmod - VARHDRSZ).ok()
 }
 

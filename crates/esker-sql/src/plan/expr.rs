@@ -124,6 +124,14 @@ pub enum Expr {
     /// once per statement in the order the statement names it. The executor evaluates these before
     /// it plans and substitutes the values it got; one reaching a row evaluator is a planner bug.
     Sequence(Box<SequenceCall>),
+    /// A `pg_catalog` function that prints a definition — `format_type(oid, typmod)`.
+    ///
+    /// An ordinary row function, unlike the two above it: a value of its arguments, evaluated once
+    /// per row, with no side effect and nothing to resolve first. It is a variant rather than a
+    /// name in a general call node because this node has no general call node — a function is
+    /// either one of these, an aggregate, a sequence write, or `0A000` naming itself
+    /// (`crate::parse::lower::lower_function`).
+    CatalogFunc(Box<CatalogFuncCall>),
     /// A column of a row **outside** the plan this expression is in: a correlated reference.
     ///
     /// `WHERE EXISTS (SELECT 1 FROM b WHERE b.a_id = a.id)` resolves `b.a_id` to an
@@ -164,6 +172,67 @@ pub enum Expr {
     /// with an [`Expr::Ordinal`] into the aggregated row before the tree is built. One reaching a
     /// row evaluator is a planner bug and says so rather than returning a number.
     Aggregate(Box<AggregateCall>),
+}
+
+/// One call to a `pg_catalog` function that prints a definition.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatalogFuncCall {
+    /// Which function.
+    pub func: CatalogFunc,
+    /// Its arguments, in the order written. The arity is checked where the call is lowered, so
+    /// the evaluator can read them by position.
+    pub args: Vec<Expr>,
+}
+
+/// The `pg_catalog` functions this node answers.
+///
+/// Every one of them is read-only, is a function of its arguments alone, and returns `text` — the
+/// three properties that let them be evaluated beside a row rather than planned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogFunc {
+    /// `format_type(oid, typmod)`: the name a client is shown for a type and a modifier.
+    ///
+    /// The inverse of `'x'::regtype`, and the more permissive half: that one is `42601` for a
+    /// typmod on a type that takes none, and this one ignores it
+    /// ([`crate::catalog::def_functions`]).
+    FormatType,
+}
+
+impl CatalogFunc {
+    /// The function a name is, if it is one. Case-insensitive, as PostgreSQL resolves a function
+    /// name written unquoted.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<CatalogFunc> {
+        match () {
+            () if name.eq_ignore_ascii_case("format_type") => Some(CatalogFunc::FormatType),
+            () => None,
+        }
+    }
+
+    /// How it is spelled in a `42883`.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            CatalogFunc::FormatType => "format_type",
+        }
+    }
+
+    /// How many arguments it takes. PostgreSQL resolves by name *and* arity, and answers `42883`
+    /// naming the number rather than running the function it nearly matched.
+    #[must_use]
+    pub fn arity(self) -> usize {
+        match self {
+            CatalogFunc::FormatType => 2,
+        }
+    }
+
+    /// The type of its result, which is `text` for every one of them.
+    #[must_use]
+    pub fn result_type(self) -> ColumnType {
+        match self {
+            CatalogFunc::FormatType => ColumnType::Text,
+        }
+    }
 }
 
 /// The four functions a sequence answers to.
@@ -598,6 +667,7 @@ fn describe(expr: &Expr) -> &'static str {
         Expr::Aggregate(_) => "an aggregate function",
         Expr::Default => "DEFAULT",
         Expr::Sequence(_) => "a sequence function",
+        Expr::CatalogFunc(_) => "a catalog function",
         Expr::Subquery(sub) => sub.kind.describe(),
     }
 }

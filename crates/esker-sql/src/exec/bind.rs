@@ -303,6 +303,14 @@ fn walk_expr_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr)) {
                 walk_expr_mut(item, visit);
             }
         }
+        // `format_type($1, $2)` is a statement a client may prepare, so its arguments are walked
+        // like any other operand — without this the parameter would never be substituted and the
+        // statement would answer `42P02` for a parameter that was bound.
+        Expr::CatalogFunc(call) => {
+            for arg in &mut call.args {
+                walk_expr_mut(arg, visit);
+            }
+        }
         _ => {}
     }
 }
@@ -402,6 +410,11 @@ fn descend(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
             descend(operand, visit);
             for item in list {
                 descend(item, visit);
+            }
+        }
+        Expr::CatalogFunc(call) => {
+            for arg in &call.args {
+                descend(arg, visit);
             }
         }
         _ => {}

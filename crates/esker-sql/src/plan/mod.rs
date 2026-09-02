@@ -35,7 +35,10 @@ pub use ddl::{
     UniqueConstraint, index_name, primary_key_name, sequence_name, unique_constraint_name,
 };
 pub use dml::{Delete, Insert, Returning, Update};
-pub use expr::{AggregateCall, AggregateFunc, BinaryOp, Expr, Literal, SequenceCall, SequenceFunc};
+pub use expr::{
+    AggregateCall, AggregateFunc, BinaryOp, CatalogFunc, CatalogFuncCall, Expr, Literal,
+    SequenceCall, SequenceFunc,
+};
 pub use query::{
     AggregateSpec, Join, JoinKind, Node, OrderItem, Probe, Select, SelectItem, SortKey, TableRef,
 };

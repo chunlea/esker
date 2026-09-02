@@ -407,6 +407,9 @@ fn push_filter(
     Ok(match expr {
         Expr::Ordinal { at, .. } => ColExpr::Column(slot(*at)),
         Expr::Literal(literal) => ColExpr::Literal(literal_value(literal)?),
+        // A catalog function is a function of the catalog, not of the fragment's columns, and the
+        // columnar reader has no expression for it. Rows, and the row evaluator answers it.
+        Expr::CatalogFunc(_) => return Err(refused("a catalog function")),
         Expr::Not(inner) => ColExpr::Not(Box::new(push_filter(inner, slot, types)?)),
         Expr::IsNull { operand, negated } => ColExpr::IsNull {
             operand: Box::new(push_filter(operand, slot, types)?),
@@ -636,6 +639,11 @@ fn collect_columns(expr: &Expr, into: &mut Vec<usize>) {
             }
         }
         Expr::Aggregate(call) => {
+            for arg in &call.args {
+                collect_columns(arg, into);
+            }
+        }
+        Expr::CatalogFunc(call) => {
             for arg in &call.args {
                 collect_columns(arg, into);
             }

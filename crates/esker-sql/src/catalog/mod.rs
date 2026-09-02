@@ -38,6 +38,7 @@
 //! puts nothing back. DDL is rare and this is the statement that just paid for a round trip
 //! anyway.
 
+pub mod def_functions;
 pub mod pg_catalog;
 mod record;
 
