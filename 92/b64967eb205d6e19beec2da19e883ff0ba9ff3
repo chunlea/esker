@@ -1,0 +1,21 @@
+docs/bench/debt-c4.md
+  s_5887b8dc15d0eb::t_37b3b3e477af54 1-95
+docs/plans/debt-c4.md
+  s_5887b8dc15d0eb::t_47ec14e1b35d6f 75-147
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "92b64967eb205d6e19beec2da19e883ff0ba9ff3",
+  "prompts": {},
+  "sessions": {
+    "s_5887b8dc15d0eb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a3f26108-d8c6-4ca4-8418-c2dce63dbbae",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
