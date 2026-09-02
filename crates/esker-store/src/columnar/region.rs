@@ -79,6 +79,19 @@ struct Tables {
     /// can turn one of these into a table that wants a copy — so the cache is exact rather than
     /// expiring on a timer.
     missing: BTreeSet<(u64, u64)>,
+    /// Records fetched from a store that holds the catalog, for the tables this region cannot
+    /// read the record of itself.
+    ///
+    /// **Only ever the tables whose record is not here.** A store that can read `'m'` never
+    /// populates this, so on a single-region cluster it is empty and nothing behaves differently
+    /// (`crate::server::Store::ensure_schema`,
+    /// [ADR 0037](../../../../docs/adr/0037-a-columnar-learner-fetches-the-schema-it-cannot-read.md)).
+    ///
+    /// Not cleared by a catalog write, because a store holding this map by definition sees no
+    /// catalog writes for these tables. What replaces one is a newer fetch, and what asks for a
+    /// newer fetch is a decode that refuses — `DecodeOutcome::SchemaBehind`, which is the loud
+    /// half of `crate::columnar::decode`'s "a stale schema is lag, not corruption".
+    fetched: BTreeMap<(u64, u64), (u8, esker_keys::columnar::Published)>,
 }
 
 /// What a fragment needs to evaluate, taken under the lock and used outside it.
@@ -224,6 +237,56 @@ impl ColumnarSlot {
         }))
     }
 
+    /// Whether this store can build a decoder for `(tenant, table_id)` without asking anyone.
+    ///
+    /// True when the record has already been fetched, and when this store's own engine holds it —
+    /// which is the same read [`ensure`](Self::ensure) would do, so a `true` here is a promise the
+    /// next call can keep. False is not "there is no columnar copy": it is "this store cannot say",
+    /// and the answer to it is [`Store::ensure_schema`](crate::server::Store), not a refusal.
+    ///
+    /// An error reading the engine answers `false` as well. The caller's next move is a fetch,
+    /// which either succeeds or leaves the table refused; turning a transient read failure into a
+    /// hard error here would fail a fragment that a row scan could have answered.
+    #[must_use]
+    pub fn knows_schema(&self, db: &Db, tenant: u64, table_id: u64) -> bool {
+        if self.lock().fetched.contains_key(&(tenant, table_id)) {
+            return true;
+        }
+        matches!(published_schema(db, tenant, table_id), Ok(Some(_)))
+    }
+
+    /// Installs a columnar record fetched from a store that holds the catalog.
+    ///
+    /// Takes the **bytes** and decodes them here, so a record that arrived over the wire and one
+    /// read from this store's own engine go through one parser
+    /// ([`esker_keys::columnar::decode`]) and cannot come to disagree about the format.
+    ///
+    /// A record older than the one already held is dropped rather than installed. Nothing orders
+    /// two fetches — a slow answer from one store can land after a fast one from another — and
+    /// installing an older schema over a newer one would make the copy refuse rows it had already
+    /// decoded. `schema_version` is monotonic per table and is exactly the comparison
+    /// `esker_keys::columnar::Published` documents itself for.
+    ///
+    /// Any table whose copy is open is **closed**, so the next read rebuilds it under the new
+    /// schema rather than extending a copy built under the old one.
+    pub fn install_record(&self, tenant: u64, table_id: u64, record: &[u8]) -> Result<()> {
+        let (replicas, published) = esker_keys::columnar::decode(record)
+            .map_err(|error| bootstrap(&format!("a fetched columnar record: {error}")))?;
+        let mut tables = self.lock();
+        if let Some((_, held)) = tables.fetched.get(&(tenant, table_id))
+            && held.schema_version >= published.schema_version
+        {
+            return Ok(());
+        }
+        tables
+            .fetched
+            .insert((tenant, table_id), (replicas, published));
+        // The miss cache said "no record here", which has just stopped being the useful answer.
+        tables.missing.remove(&(tenant, table_id));
+        tables.open.remove(&(tenant, table_id));
+        Ok(())
+    }
+
     /// The filesystem the runs live on, for the reader the fragment service opens.
     #[must_use]
     pub fn fs(&self) -> &Arc<dyn FileSystem> {
@@ -255,7 +318,13 @@ impl ColumnarSlot {
         {
             return Ok(false);
         }
-        let Some((replicas, published)) = published_schema(db, tenant, table_id)? else {
+        // A fetched record first: this store has one only when it could not read the record
+        // itself, so preferring it costs a map lookup on a path that is about to read the engine.
+        let local = match tables.fetched.get(&(tenant, table_id)) {
+            Some(record) => Some(record.clone()),
+            None => published_schema(db, tenant, table_id)?,
+        };
+        let Some((replicas, published)) = local else {
             tracing::debug!(
                 tenant,
                 table_id,
@@ -345,6 +414,22 @@ fn decoder_of(published: &esker_keys::columnar::Published) -> Result<TableDecode
         .map(|(_, value)| value.clone())
         .collect();
     TableDecoder::new(&names, &types, &missing, published.schema_version)
+}
+
+/// The columnar record for a table as **bytes**, for a store answering another store's ask.
+///
+/// The same read [`published_schema`] does and deliberately without the decode: what travels is
+/// the record as it is stored, so the asking store parses it with the parser it would have used on
+/// its own engine ([`esker_proto::schema`] says why the wire does not learn the format).
+pub fn published_record(db: &Db, tenant: u64, table_id: u64) -> Result<Option<Bytes>> {
+    let key = esker_keys::columnar::key(tenant, table_id);
+    let snapshot = EngineSnapshot::new(db);
+    match esker_txn::read(&snapshot, &key, u64::MAX)
+        .map_err(|error| bootstrap(&format!("reading a columnar record: {error}")))?
+    {
+        ReadOutcome::Value(bytes) => Ok(Some(bytes)),
+        ReadOutcome::NotFound | ReadOutcome::Locked(_) => Ok(None),
+    }
 }
 
 /// The columnar record for a table, read as a transaction would read it.

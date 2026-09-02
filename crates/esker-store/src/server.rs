@@ -2200,6 +2200,145 @@ impl Store {
     /// differently: one refuses with `TooFarBehind`, the other would silently answer from an older
     /// state. A build that derived one from the other would answer from a state it had not
     /// reached.
+    /// Answers another store's ask for a table's columnar record, out of this store's own catalog.
+    ///
+    /// The record is an ordinary transactional value in the `'m'` key space, so "do I have it" is
+    /// "do I host the region that covers its key" — and this store does not have to work that out:
+    /// reading it is the test. A store that does not hold the range reads nothing and answers
+    /// nothing, which is the same answer as a table that never asked for a columnar copy, and the
+    /// asker treats the two the same way ([`esker_proto::schema::SchemaResp`] says why).
+    ///
+    /// Read at `u64::MAX` — whatever is committed — for the same reason
+    /// `columnar::region::published_schema` is: a reader on an older snapshot would hand back a
+    /// schema that later rows are not written under.
+    async fn serve_schema(
+        self: &Arc<Self>,
+        ask: esker_proto::schema::SchemaReq,
+    ) -> std::result::Result<esker_proto::schema::SchemaResp, ProtoError> {
+        let db = Arc::clone(&self.db);
+        blocking(move || {
+            let record = crate::columnar::region::published_record(&db, ask.tenant, ask.table_id)
+                .map_err(|error| {
+                ProtoError::internal(format!("reading a columnar record: {error}"))
+            })?;
+            Ok(esker_proto::schema::SchemaResp { record })
+        })
+        .await
+    }
+
+    /// Makes sure this store can decode `table`, fetching the record from whoever holds it.
+    ///
+    /// # Why this is on the request path and never on the apply path
+    ///
+    /// `crate::columnar::decode`'s module header states the rule and the reason: *"the apply path
+    /// may not fetch — a schema lookup on the log's critical path makes apply latency depend on
+    /// another region's availability, and a lookup that fails stalls the log rather than failing a
+    /// request"*. So a learner whose schema has not arrived stops advancing its applied index,
+    /// which the heartbeat already reports and which `RefusalReason::TooFarBehind` already turns
+    /// into a row-scan fallback. This is the other end of that: the **fragment** is a request, it
+    /// may wait, and it is the moment the schema is actually needed.
+    ///
+    /// # The three steps, and what each is allowed to fail at
+    ///
+    /// 1. **Is it already known?** A record this store can read locally, or one already installed,
+    ///    needs nothing. On a single-region cluster this is every table, which is why the whole
+    ///    path was invisible for a phase.
+    /// 2. **Where does it live?** `PdClient::get_region` on the record's own key — the placement
+    ///    driver is the authority on which region covers a key and which stores host it, and it is
+    ///    the same answer a client's routing rests on. No PD, no fetch.
+    /// 3. **Ask a store that hosts it.** Every peer's store in turn, because the first may be
+    ///    down; the first store that answers with a record wins.
+    ///
+    /// Every failure here is silent and leaves the schema unknown, on purpose: the caller's next
+    /// step is `slot.table(..)`, which answers `NotColumnar`, which is a refusal the planner
+    /// already falls back from. A fetch that could fail a fragment would make a columnar read less
+    /// available than the row read it is an optimisation of.
+    async fn ensure_schema(self: &Arc<Self>, slot: &Arc<ColumnarSlot>, table: (u64, u64)) {
+        let (tenant, table_id) = table;
+        if slot.knows_schema(&self.db, tenant, table_id) {
+            return;
+        }
+        let Some(pd) = self.pd.clone() else {
+            return;
+        };
+        let key = esker_keys::columnar::key(tenant, table_id);
+        let Ok(Ok(Some(route))) = tokio::task::spawn_blocking(move || pd.get_region(&key)).await
+        else {
+            return;
+        };
+
+        for (store_id, address) in &route.stores {
+            if *store_id == self.store_id {
+                // Already asked, by reading. Asking this store over a socket would answer the
+                // same nothing a round trip later.
+                continue;
+            }
+            let Ok(address) = address.parse::<std::net::SocketAddr>() else {
+                continue;
+            };
+            match self.ask_for_schema(address, tenant, table_id).await {
+                Ok(Some(record)) => {
+                    if let Err(error) = slot.install_record(tenant, table_id, &record) {
+                        tracing::warn!(
+                            tenant,
+                            table_id,
+                            %error,
+                            "a columnar record fetched from another store did not decode"
+                        );
+                        return;
+                    }
+                    tracing::info!(
+                        tenant,
+                        table_id,
+                        from = store_id,
+                        region_id = route.region.id,
+                        "fetched a table's columnar record from the store that holds the catalog"
+                    );
+                    return;
+                }
+                // That store does not have it either, which for a peer of the region PD named
+                // means it is behind rather than wrong. Try the next.
+                Ok(None) => {}
+                Err(error) => tracing::debug!(
+                    tenant,
+                    table_id,
+                    store_id,
+                    %error,
+                    "a store could not be asked for a columnar record"
+                ),
+            }
+        }
+    }
+
+    /// One `Schema::Fetch` round trip to one store.
+    async fn ask_for_schema(
+        &self,
+        address: std::net::SocketAddr,
+        tenant: u64,
+        table_id: u64,
+    ) -> std::result::Result<Option<Bytes>, ProtoError> {
+        let transport = self
+            .raft
+            .as_ref()
+            .map_or_else(TransportConfig::new, |raft| raft.transport);
+        let connection = esker_proto::TcpTransport::connect_with(address, transport).await?;
+        // Through the `Transport` trait, which numbers the request itself: ids zero and one are
+        // the keepalive's and the handshake's, and a caller that picks its own starts by colliding
+        // with the `Hello` it just sent.
+        match esker_proto::Transport::call(
+            &connection,
+            Request::Schema(esker_proto::schema::SchemaReq { tenant, table_id }),
+        )
+        .await?
+        {
+            Response::Schema(response) => Ok(response.record),
+            other => Err(ProtoError::invalid(format!(
+                "a schema fetch was answered with {}",
+                other.method().name()
+            ))),
+        }
+    }
+
     async fn serve_fragment(
         self: &Arc<Self>,
         header: RequestHeader,
@@ -2254,6 +2393,13 @@ impl Store {
         }
 
         let slot = self.columnar_slot(header.region_id);
+        // **Before the slot is asked, not after it refuses.** A store holding this table's rows
+        // and not the `'m'` region cannot read the record the decoder is built from, and until
+        // this call existed it answered `NotColumnar` for ever — a refusal that says *look
+        // elsewhere* where the truth was *nobody here can read the schema*
+        // ([ADR 0037](../../../docs/adr/0037-a-columnar-learner-fetches-the-schema-it-cannot-read.md)).
+        self.ensure_schema(&slot, (fragment.table.tenant, fragment.table.table_id))
+            .await;
         let runs = match slot.table(&self.db, fragment.table.tenant, fragment.table.table_id) {
             Ok(Some(runs)) => runs,
             Ok(None) => {
@@ -3168,6 +3314,16 @@ impl Service for StoreService {
                         .serve_fragment(header, request)
                         .await
                         .map(|response| Reply::Unary(Response::Fragment(response)));
+                }
+                // A table's columnar record, read out of this store's own catalog for a store
+                // that cannot read it — see `Store::serve_schema` and [`esker_proto::schema`].
+                // "I do not have it" is an answer and not an error, for the same reason a
+                // fragment's refusal is one: the asker's next move is to ask somewhere else.
+                Request::Schema(request) => {
+                    return store
+                        .serve_schema(request)
+                        .await
+                        .map(|response| Reply::Unary(Response::Schema(response)));
                 }
                 // A store is not a placement driver. Answering anything but a refusal — even a
                 // helpful-looking one — would let a misconfigured client believe it had reached

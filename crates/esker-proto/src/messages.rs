@@ -117,6 +117,11 @@ pub enum Method {
     /// `Fragment::Evaluate` — run a plan fragment against a node's columnar copy of a region
     /// ([ADR 0022](../../docs/adr/0022-columnar-learner-replica.md), [`crate::fragment`]).
     FragmentEvaluate = 0x0601,
+
+    /// `Schema::Fetch` — ask a store for a table's columnar record, because the asker does not
+    /// host the region that holds it ([`crate::schema`],
+    /// [ADR 0037](../../docs/adr/0037-a-columnar-learner-fetches-the-schema-it-cannot-read.md)).
+    SchemaFetch = 0x0701,
 }
 
 /// Service byte of the system methods — version negotiation and, later, connection control.
@@ -136,6 +141,14 @@ pub const SERVICE_RAFT: u8 = 0x04;
 /// or metering on the service byte has to tell it from key-value work without decoding a body.
 pub const SERVICE_FRAGMENT: u8 = 0x06;
 
+/// Service byte of `Schema` — asking a store for a table's columnar record ([`crate::schema`]).
+///
+/// Its own service for the reason [`SERVICE_ADMIN`] gives for itself, and one more: this is the
+/// only store-to-store request addressed to a **store** rather than to a region, so anything that
+/// routes or meters on the service byte must be able to see that it carries no
+/// [`RequestHeader`] without decoding a body.
+pub const SERVICE_SCHEMA: u8 = 0x07;
+
 /// Service byte of `Admin` — the operator-facing requests `esker-cli region` sends.
 ///
 /// Separate from `Pd` because these are addressed to a **store**: the placement driver schedules,
@@ -146,7 +159,7 @@ pub const SERVICE_ADMIN: u8 = 0x05;
 
 impl Method {
     /// Every method this version defines.
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 32] = [
         Self::Hello,
         Self::RawGet,
         Self::RawBatchGet,
@@ -178,6 +191,7 @@ impl Method {
         Self::AdminTransferLeader,
         Self::AdminRegions,
         Self::FragmentEvaluate,
+        Self::SchemaFetch,
     ];
 
     /// The wire tag.
@@ -208,6 +222,7 @@ impl Method {
             0x0307 => Some(Self::PdSchemaLease),
             0x0308 => Some(Self::PdReportColumnar),
             0x0601 => Some(Self::FragmentEvaluate),
+            0x0701 => Some(Self::SchemaFetch),
             0x0401 => Some(Self::RaftBatch),
             0x0402 => Some(Self::RaftSnapshot),
             0x0201 => Some(Self::TxnGet),
@@ -262,6 +277,7 @@ impl Method {
             Self::PdTso => "Pd::Tso",
             Self::PdReportColumnar => "Pd::ReportColumnar",
             Self::FragmentEvaluate => "Fragment::Evaluate",
+            Self::SchemaFetch => "Schema::Fetch",
             Self::PdSchemaLease => "Pd::SchemaLease",
             Self::AdminSplit => "Admin::Split",
             Self::AdminTransferLeader => "Admin::TransferLeader",
@@ -323,6 +339,12 @@ impl Method {
     #[must_use]
     pub fn is_txn_kv(self) -> bool {
         self.service() == SERVICE_TXN_KV
+    }
+
+    /// Whether this method belongs to the schema service ([`crate::schema`]).
+    #[must_use]
+    pub fn is_schema(self) -> bool {
+        self.service() == SERVICE_SCHEMA
     }
 }
 
@@ -880,6 +902,12 @@ pub enum Request {
     /// It carries no [`RequestHeader`]: an operator names a region by id and does not hold an
     /// epoch to be checked against — the store checks what it can and refuses what it cannot.
     Admin(AdminReq),
+    /// One store asking another for a table's columnar record ([`crate::schema`]).
+    ///
+    /// It carries no [`RequestHeader`] either, and for a sharper reason than `Admin`'s: the asker
+    /// does not know which region covers the record — that is what it is asking about — so an
+    /// epoch it invented would be checked against a region it never routed to.
+    Schema(crate::schema::SchemaReq),
 }
 
 /// What an operator asks a store to do (`docs/DESIGN.md` §12).
@@ -1009,6 +1037,7 @@ impl Request {
             Self::Raft(_) => Method::RaftBatch,
             Self::Snapshot(_) => Method::RaftSnapshot,
             Self::Admin(request) => request.method(),
+            Self::Schema(_) => Method::SchemaFetch,
         }
     }
 
@@ -1020,6 +1049,7 @@ impl Request {
             | Self::Raft(_)
             | Self::Snapshot(_)
             | Self::Admin(_)
+            | Self::Schema(_)
             | Self::Pd { .. } => None,
             Self::RawKv { header, .. }
             | Self::TxnKv { header, .. }
@@ -1060,6 +1090,7 @@ impl Request {
                 out.put_varint(request.peer_id);
             }
             Self::Admin(request) => request.encode(&mut out),
+            Self::Schema(request) => request.encode(&mut out),
         }
         out.finish()
     }
@@ -1076,6 +1107,7 @@ impl Request {
             method if method.service() == SERVICE_ADMIN => {
                 Self::Admin(AdminReq::decode(method, &mut input)?)
             }
+            Method::SchemaFetch => Self::Schema(crate::schema::SchemaReq::decode(&mut input)?),
             Method::RaftSnapshot => Self::Snapshot(SnapshotRequest {
                 region_id: input.get_varint("snapshot.region_id")?,
                 index: input.get_varint("snapshot.index")?,
@@ -1132,6 +1164,8 @@ pub enum Response {
     Fragment(crate::fragment::FragmentResp),
     /// The answer to an operator's request.
     Admin(AdminResp),
+    /// A store's answer to a schema fetch: the record's bytes, or nothing ([`crate::schema`]).
+    Schema(crate::schema::SchemaResp),
 }
 
 /// What a store answers an operator with.
@@ -1227,6 +1261,7 @@ impl Response {
             Self::TxnKv(response) => response.method(),
             Self::Pd(response) => response.method(),
             Self::Fragment(_) => Method::FragmentEvaluate,
+            Self::Schema(_) => Method::SchemaFetch,
             Self::Raft => Method::RaftBatch,
             Self::Admin(response) => response.method(),
         }
@@ -1271,6 +1306,7 @@ impl Response {
             Self::TxnKv(response) => response.encode(&mut out),
             Self::Pd(response) => response.encode(&mut out),
             Self::Fragment(response) => response.encode(&mut out),
+            Self::Schema(response) => response.encode(&mut out),
             // The acknowledgement carries nothing: Raft's own retries are what make a lost
             // message survivable, so there is no outcome for the sender to act on.
             Self::Raft => {}
@@ -1296,6 +1332,9 @@ impl Response {
             other if other.is_pd() => Self::Pd(crate::pd::PdResp::decode(other, &mut input)?),
             other if other.is_fragment() => {
                 Self::Fragment(crate::fragment::FragmentResp::decode(&mut input)?)
+            }
+            other if other.is_schema() => {
+                Self::Schema(crate::schema::SchemaResp::decode(&mut input)?)
             }
             other if other.is_txn_kv() => {
                 Self::TxnKv(crate::txn::TxnKvResp::decode(other, &mut input)?)
@@ -1492,6 +1531,7 @@ mod tests {
                 | Method::TxnHeartbeat
                 | Method::TxnGcSafepoint => SERVICE_TXN_KV,
                 Method::FragmentEvaluate => crate::messages::SERVICE_FRAGMENT,
+                Method::SchemaFetch => crate::messages::SERVICE_SCHEMA,
                 _ => SERVICE_RAW_KV,
             };
             assert_eq!(method.service(), service, "{method:?}");

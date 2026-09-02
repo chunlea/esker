@@ -157,3 +157,6 @@ result groups 0101010202000001010202016103010a00000000000000020162000049b60f5b
 request pd-report-columnar 0803cdd70202027401027402010274090002
 # A full assertion has no partial outcome, so the answer carries nothing.
 response pd-report-columnar 0803
+request schema-fetch 0107ac02a01f
+response schema-record 0107010a017075626c6973686564
+response schema-absent 010700

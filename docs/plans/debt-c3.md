@@ -481,3 +481,77 @@ now with a load figure beside it rather than only a quiet-box one.
 Anyone picking it up again should note that the numbers above are the baseline to beat. A run that
 takes materially longer than 152 s under comparable load is the reproduction this could not get,
 and the thing to do with it is `sample <pid>` before anything else.
+
+## 7. A table outside the `'m'` region gets a columnar copy
+
+Inventory #3. `crates/esker-store/src/columnar/region.rs`, whose module header names the gap and
+names the fix.
+
+### The shape of the bug, which is why nobody saw it
+
+A columnar learner decodes rows with a schema, and the schema is a **catalog record** in the
+cluster's `'m'` key space. `published_schema` reads it out of the store's own engine, which works
+exactly when the store hosts the region covering `'m'`. Every cluster this feature was built and
+measured on was single-region, where every store does.
+
+So on a cluster that has split once, the store holding a table's **rows** and not the catalog
+answers `RefusalReason::NotColumnar` for that table, for ever. That is the worst shape a missing
+feature can take: not an error, not a wrong answer, but the sentence that tells the planner *this
+replica has no copy, read the rows instead* — correct, useful, and never stopping. A columnar
+replica that is never used is indistinguishable from one that is not helping.
+
+`crates/esker-store/tests/schema_fetch.rs` is that cluster, in 0.14 s: the catalog below `"t"` on
+one store, the table's rows above it on another — `'m'` sorts below `'t'`, so one cut separates
+every catalog record from every row — and a fragment sent over the wire to the store with the rows.
+Its red is the recorded sentence exactly:
+
+```
+the learner refused a table whose schema it could have fetched:
+NotColumnar: store 2 holds region 2 without a columnar copy of table 7
+```
+
+### A pull, where the note expected a push
+
+[ADR 0037](../adr/0037-a-columnar-learner-fetches-the-schema-it-cannot-read.md). The recorded fix
+was a schema **push** from wherever the `ALTER` runs. A pull is better here and the reason is
+short: the record is already replicated, durable and versioned — what the asking store lacks is not
+the data but a way to reach it, and `PdClient::get_region` already answers exactly that for any key.
+
+So `esker-sql` changes **not at all**, which the brief expected to need a NEEDS entry and does not.
+A push would put the retry, the routing knowledge — which stores hold which rows — and the failure
+handling in the layer with least of each. And PD learns nothing new: it answers where a key lives,
+which it is already the authority on.
+
+`esker_proto::schema` is the new message, in its own file as Amendment 1 requires:
+`Method::SchemaFetch = 0x0701` under a new `SERVICE_SCHEMA`, because this is the only store-to-store
+request addressed to a **store** rather than a region and anything metering on the service byte
+must see that without decoding a body. The record travels as **bytes** — `esker-proto` does not
+depend on `esker-keys` and must not start, or the record's format gets a second owner — and the
+response carries a presence byte, because an empty record and an absent one are different facts.
+Both goldens are pinned, and the golden coverage test is what forced them: it fails until every
+method has one, which is the guard working as designed.
+
+### Where the fetch runs, which the design had already decided
+
+`crate::columnar::decode`'s module header states the rule: *"the apply path may not fetch — a schema
+lookup on the log's critical path makes apply latency depend on another region's availability, and a
+lookup that fails stalls the log rather than failing a request"*. So `Store::ensure_schema` runs in
+`serve_fragment`: the moment the schema is actually needed, and a place that may wait. This unit did
+not choose that; it found it written down and followed it.
+
+Every failure in the fetch is silent and leaves the table refused — no PD, no answer, no store
+reachable, a record that does not decode. A fetch that could fail a *fragment* would make a columnar
+read less available than the row read it is an optimisation of.
+
+### Owed, and safe in the meantime
+
+A store holding a fetched record sees no catalog writes for that table, so nothing pushes a schema
+**change** at it. That is safe rather than merely tolerable, and the design already says why:
+`decode_row` refuses a row wider than its schema — `DecodeOutcome::SchemaBehind` — so a stale schema
+makes the copy stop, loudly, instead of answering wrongly. A copy that stops is a learner that is
+behind, which the heartbeat reports and `RefusalReason::TooFarBehind` already turns into a row-scan
+fallback.
+
+What is not built is the **re-fetch** that would clear a `SchemaBehind` on a fetched table
+automatically. Until it is, that copy is rebuilt rather than repaired. Written down here rather than
+left in the ADR's consequences alone, because it is the next thing somebody will need.

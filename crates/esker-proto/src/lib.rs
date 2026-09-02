@@ -45,6 +45,7 @@ pub mod messages;
 pub mod pd;
 pub mod raft;
 pub mod region;
+pub mod schema;
 pub mod transport;
 pub mod txn;
 

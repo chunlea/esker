@@ -14,6 +14,7 @@ use esker_proto::fragment::{
 };
 use esker_proto::messages::{DEFAULT_SCAN_LIMIT, Hello, HelloAck, RawKvReq, RawKvResp};
 use esker_proto::pd::{ColumnarWish, Operator, PdReq, PdResp, StoreInfo};
+use esker_proto::schema::{SchemaReq, SchemaResp};
 use esker_proto::txn::{LockInfo, TxnKvReq, TxnKvResp, TxnMutation, TxnStatus};
 use esker_proto::{
     Epoch, MAX_FRAME_SIZE, Method, Peer, PeerRole, ProtoError, RaftBatch, RaftMessage, Region,
@@ -310,6 +311,7 @@ fn golden_requests() -> Vec<(&'static str, Request)> {
     requests.extend(golden_pd_requests());
     requests.extend(golden_txn_requests());
     requests.extend(golden_fragment_requests());
+    requests.extend(golden_schema_requests());
     requests
 }
 
@@ -782,6 +784,7 @@ fn golden_responses() -> Vec<(&'static str, Response)> {
     responses.extend(golden_txn_responses());
     responses.extend(golden_operator_responses());
     responses.extend(golden_fragment_responses());
+    responses.extend(golden_schema_responses());
     responses
 }
 
@@ -949,6 +952,40 @@ fn golden_lock_info() {
 const FRAGMENT_BYTES: &[u8] = &[0x01, 0xAA, 0xBB];
 /// Big enough that its varint is three bytes, so the golden pins a multi-byte one.
 const MIN_APPLY_INDEX: u64 = 1 << 20;
+
+/// The tenant and table the schema goldens name. Both above 127 so their varints are two bytes:
+/// a golden built from single-byte numbers pins nothing about the encoding it is there to pin.
+const SCHEMA_TENANT: u64 = 300;
+const SCHEMA_TABLE: u64 = 4_000;
+
+/// A stand-in for a stored record. Its **bytes** are the golden's subject: `esker-proto` does not
+/// decode this and must not learn how (see [`esker_proto::schema`]), so what is pinned is that the
+/// envelope carries an opaque run of bytes back unchanged.
+const SCHEMA_RECORD: &[u8] = b"\x01published";
+
+fn golden_schema_requests() -> Vec<(&'static str, Request)> {
+    vec![(
+        "schema-fetch",
+        Request::Schema(SchemaReq {
+            tenant: SCHEMA_TENANT,
+            table_id: SCHEMA_TABLE,
+        }),
+    )]
+}
+
+/// Both answers, because the difference between them is one byte and is the whole point: an empty
+/// record and an absent one must not encode alike.
+fn golden_schema_responses() -> Vec<(&'static str, Response)> {
+    vec![
+        (
+            "schema-record",
+            Response::Schema(SchemaResp {
+                record: Some(Bytes::from_static(SCHEMA_RECORD)),
+            }),
+        ),
+        ("schema-absent", Response::Schema(SchemaResp::absent())),
+    ]
+}
 
 fn golden_fragment_requests() -> Vec<(&'static str, Request)> {
     vec![(
