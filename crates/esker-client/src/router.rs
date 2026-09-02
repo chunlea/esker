@@ -315,6 +315,22 @@ impl Router {
         }
     }
 
+    /// The route the **resolver** answers with, cached over whatever was there.
+    ///
+    /// [`Router::route`] prefers the cache, which is right for a request that only needs to know
+    /// where to send bytes: a stale entry costs a redirect and never a wrong answer. It is not
+    /// right for a caller that needs the region's *membership* — a columnar learner joins through
+    /// a conf change, and a cached entry taken before it joined lists no learner and causes no
+    /// refusal to repair itself with. Such a caller asks the authority once
+    /// (`crates/esker-client/src/fragment.rs`).
+    pub(crate) fn locate(&self, key: &[u8]) -> std::result::Result<Option<Route>, ProtoError> {
+        let route = self.resolver.locate(key)?;
+        if let Some(route) = &route {
+            self.cache.insert(route.clone());
+        }
+        Ok(route)
+    }
+
     /// The cached route for `key`, or a fresh one from the resolver.
     ///
     /// The three outcomes are three different things, and flattening any pair of them would

@@ -19,7 +19,7 @@
 //!
 //! **The retry set is deliberately narrower.** [`Router::call`] retries every error `esker-proto`
 //! marks retryable, because for a key-value request a redirect is a redirect. A fragment is
-//! evaluated over *the whole of a region's columnar copy* — [`esker_columnar::fragment::KeyRange`]
+//! evaluated over *the whole of a region's columnar copy* — `esker_columnar`'s `KeyRange`
 //! is refused by the evaluator, because a columnar file records no key range — so "which region"
 //! is not a hint here, it is the definition of what the answer covers. A region that split under
 //! this call answers about a different set of rows than the caller planned for, and retrying into
@@ -141,10 +141,21 @@ impl FragmentClient {
         let mut shards = Vec::new();
         let mut key = Bytes::copy_from_slice(start);
         loop {
-            let route = self
+            let mut route = self
                 .router
                 .route(&key)
                 .map_err(|error| terminal(error, Method::FragmentEvaluate))?;
+            // **One confirmation from the authority when the cache lists no learner.** The region
+            // cache is a hint repaired by the refusals it causes, and a *missing learner* causes
+            // none: a columnar replica joins through a conf change, and a client holding an entry
+            // from before it joined would keep planning on rows for ever and never be told
+            // otherwise. Paid only by a table whose catalog record asks for a copy — the planner
+            // checks that before it asks for shards — so an ordinary table costs nothing.
+            if columnar_peer(&route).is_none()
+                && let Ok(Some(fresh)) = self.router.locate(&key)
+            {
+                route = fresh;
+            }
             let region_end = route.region.end_key.clone();
             shards.push(Shard {
                 region_id: route.region.id,

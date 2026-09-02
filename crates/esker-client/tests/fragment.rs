@@ -8,7 +8,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -212,6 +212,63 @@ fn shards_walk_the_range_region_by_region() {
         two.iter().map(|s| s.region_id).collect::<Vec<_>>(),
         vec![2, 3]
     );
+}
+
+/// A learner that joined **after** the cache was filled is still found.
+///
+/// The cache is a hint repaired by the refusals it causes, and a missing learner causes none: a
+/// columnar replica joins through a conf change, so a client holding an entry from before it
+/// joined would plan on rows for ever and never be told otherwise. `shards` asks the authority
+/// once when the cached route lists no learner, which is the only case that needs it.
+#[test]
+fn a_learner_that_joined_after_the_cache_was_filled_is_found() {
+    /// A resolver whose answer changes, as a placement driver's does.
+    #[derive(Debug)]
+    struct Moving {
+        route: Mutex<Route>,
+    }
+
+    impl esker_client::RegionResolver for Moving {
+        fn locate(&self, key: &[u8]) -> Result<Option<Route>, ProtoError> {
+            let route = self.route.lock().unwrap().clone();
+            Ok(route.region.contains(key).then_some(route))
+        }
+    }
+
+    let transport = Arc::new(FakeTransport::new());
+    transport.script(Rule::new(Matcher::Any, answered()).forever());
+    let resolver = Arc::new(Moving {
+        route: Mutex::new(region(1, b"", b"", &[1, 2, 3], None)),
+    });
+    let router = Arc::new(
+        Router::with_options(
+            Arc::clone(&transport) as Arc<dyn esker_client::StoreTransport>,
+            Arc::clone(&resolver) as Arc<dyn esker_client::RegionResolver>,
+            ClientOptions {
+                jitter_seed: Some(3),
+                ..ClientOptions::default()
+            },
+        )
+        .with_clock(Arc::new(FakeClock::new())),
+    );
+    let client = FragmentClient::new(Arc::clone(&router));
+
+    // The cache is filled while the region has no learner.
+    assert!(!client.shards(b"t", b"u").unwrap()[0].is_columnar());
+    assert_eq!(router.cache().len(), 1, "the cache was not filled");
+
+    // PD places one. Nothing invalidates the cache, because nothing refused anything.
+    *resolver.route.lock().unwrap() = region(1, b"", b"", &[1, 2, 3], Some(9));
+
+    let shards = client.shards(b"t", b"u").unwrap();
+    assert_eq!(
+        shards[0].columnar.map(|peer| peer.store_id),
+        Some(9),
+        "the learner PD placed was never seen"
+    );
+    let answer = client.evaluate(&shards[0], &request()).unwrap();
+    assert!(matches!(answer, FragmentAnswer::Answered { .. }));
+    assert_eq!(transport.stores(), vec![9]);
 }
 
 /// The shard's own epoch goes on the wire, not whatever the cache believes at send time.

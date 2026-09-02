@@ -4,7 +4,7 @@
 //! `docs/plans/phase-10-routing.md` U2. Everything in this module is **pure**: it decides against a
 //! [`Shape`] and a [`Setting`] and touches no catalog, no network and no clock, so the rule can be
 //! tested as a table rather than against a cluster. Building the fragment, asking for it and
-//! folding what comes back is [`crate::exec::fragment`]'s.
+//! folding what comes back is `crate::exec::fragment`'s.
 //!
 //! # The rule, in ADR 0022 Decision 2's order
 //!
@@ -144,7 +144,7 @@ pub enum Reason {
     NotExpressible(&'static str),
     /// It was routed, asked, and refused at run time; the rows answered instead.
     ///
-    /// Only ever set by [`crate::exec::fragment`] after a call, so a plain `EXPLAIN` never carries
+    /// Only ever set by `crate::exec::fragment` after a call, so a plain `EXPLAIN` never carries
     /// one and `EXPLAIN ANALYZE` can.
     Refused(&'static str),
 }

@@ -70,6 +70,12 @@ New: `esker-client/src/fragment.rs`, `esker-sql/src/plan/routing.rs`,
 (the seam), `esker-sql/tests/routing.rs`, `esker-sql/tests/routing_differential.rs`,
 `esker-sql/tests/corpus/pg19_routing_engine.txt`, `esker-cli/tests/columnar_cluster.rs`.
 
+Also new, and not in the original sketch: `PdConn` implements `RegionResolver`
+(`esker-sql/src/pd.rs`). A SQL node routed from a static one-region table until this milestone,
+which a fragment cannot use — the peer list is what carries a columnar learner, and a learner joins
+through a conf change *after* any table a test or a binary wrote down. `GetRegion` is the only
+routing question PD answers and now a SQL node asks it.
+
 Edited, as little as possible: `esker-client/src/{lib,router}.rs` (three accessors and a re-export),
 `esker-sql/src/{lib,parameter}.rs`, `esker-sql/src/plan/{mod,query,session}.rs`,
 `esker-sql/src/exec/mod.rs`, `esker-sql/src/parse/lower.rs` (the GUC and `EXPLAIN ANALYZE`),
@@ -298,6 +304,22 @@ what makes the differential's comparison meaningful rather than flaky.
 Tests: a proptest — **any** split of a row set into fragments folds to the same answer as one
 fragment; the empty-input rules (`count` 0, everything else NULL; a grouped aggregate over no rows
 is no rows); a NULL group key is one group.
+
+### What U5 found, recorded here because it is a rule and not a bug
+
+**A pushed-down comparison is type-checked, and a literal is mapped the row evaluator's way.**
+`SELECT count(*) FROM t WHERE region = 'north'` was not routed at first: the planner leaves a
+string compared against a `text` column as `Literal::String`, and the first version of the filter
+push-down refused anything that was not already `Literal::Typed`. The fix is not to accept
+everything — the far side compares with **a second implementation** of `pg_cmp`
+(`esker_columnar::ValueRef::pg_cmp`), and two implementations agree about same-typed values by
+construction and about mixed ones only by luck. So a literal is mapped exactly as
+`crate::exec::cursor`'s row evaluator maps it (integer → `int8`, decimal → `float8`, string →
+`text`), and then **refused unless it fits the column beside it**. A refusal costs a fallback; a
+mixed-type comparison could cost an answer.
+
+The differential is what surfaced it, and it surfaced it as *"this query was not answered by the
+columns"* rather than as a wrong number — because the test asserts its own denominator.
 
 ### U5 — the differential
 

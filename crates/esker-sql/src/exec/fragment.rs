@@ -273,6 +273,17 @@ fn consider(
         .filter_map(|key| ordinal(key).map(&slot))
         .collect();
 
+    // One columnar type per projection slot, for the comparison check below.
+    let slot_types: Vec<esker_columnar::ColumnType> = columns
+        .iter()
+        .filter_map(|column| table.columns.get(*column).map(|def| column_type(def.ty)))
+        .collect();
+    if slot_types.len() != columns.len() {
+        return Err(Decision::rows(Reason::NotExpressible(
+            "a column this table's record does not describe",
+        )));
+    }
+
     let mut fragment = esker_columnar::Fragment::aggregate(
         esker_columnar::TableRef {
             tenant,
@@ -283,7 +294,7 @@ fn consider(
         asks,
     );
     if let Some(filter) = filter {
-        fragment.filter = Some(push_filter(filter, &slot)?);
+        fragment.filter = Some(push_filter(filter, &slot, &slot_types)?);
     }
 
     let shape = Shape {
@@ -387,6 +398,7 @@ fn push_down(
 fn push_filter(
     expr: &Expr,
     slot: &impl Fn(usize) -> u32,
+    types: &[esker_columnar::ColumnType],
 ) -> Routed<esker_columnar::fragment::Expr> {
     use crate::plan::BinaryOp;
     use esker_columnar::fragment::{CompareOp, Expr as ColExpr};
@@ -395,14 +407,18 @@ fn push_filter(
     Ok(match expr {
         Expr::Ordinal { at, .. } => ColExpr::Column(slot(*at)),
         Expr::Literal(literal) => ColExpr::Literal(literal_value(literal)?),
-        Expr::Not(inner) => ColExpr::Not(Box::new(push_filter(inner, slot)?)),
+        Expr::Not(inner) => ColExpr::Not(Box::new(push_filter(inner, slot, types)?)),
         Expr::IsNull { operand, negated } => ColExpr::IsNull {
-            operand: Box::new(push_filter(operand, slot)?),
+            operand: Box::new(push_filter(operand, slot, types)?),
             negated: *negated,
         },
         Expr::Binary { op, left, right } => {
-            let left = Box::new(push_filter(left, slot)?);
-            let right = Box::new(push_filter(right, slot)?);
+            let left = push_filter(left, slot, types)?;
+            let right = push_filter(right, slot, types)?;
+            if op.is_comparison() {
+                comparable(&left, &right, types)?;
+            }
+            let (left, right) = (Box::new(left), Box::new(right));
             match op {
                 BinaryOp::And => ColExpr::And(left, right),
                 BinaryOp::Or => ColExpr::Or(left, right),
@@ -457,23 +473,91 @@ fn literal_value(literal: &crate::plan::Literal) -> Routed<esker_columnar::Value
     use crate::plan::Literal;
     use esker_columnar::Value;
 
+    // **The row evaluator's own mapping, and that is the specification rather than a
+    // convenience.** `crate::exec::cursor`'s row evaluator reads a bare integer as `int8`, a
+    // decimal as `float8` and a quoted string as `text`, and a fragment has to compare what the
+    // row engine would have compared. Anything the planner already resolved against a column's
+    // type arrives as `Typed` and is used as it is. Whether the result may be compared with the
+    // column beside it is [`comparable`]'s question, not this one's.
     Ok(match literal {
         Literal::Null => Value::Null,
         Literal::Bool(flag) => Value::Bool(*flag),
         Literal::Integer(int) => Value::Int8(*int),
+        Literal::String(text) => Value::Text(text.clone()),
         Literal::Typed(datum) => datum_to_value(datum),
-        // **Both are refused rather than converted, and the reason is the same one twice.** The
-        // row evaluator reads a decimal as `float8` and a bare string as `text`, in the row's own
-        // type context; a fragment compares with `pg_cmp` against a *column's* type, and the two
-        // agree only where the planner has already resolved the literal — which is exactly what
-        // `Literal::Typed` is. Guessing here is how a comparison against a `timestamptz` column
-        // silently becomes a comparison against text.
-        Literal::Decimal(_) | Literal::String(_) => {
-            return Err(Decision::rows(Reason::NotExpressible(
-                "a literal the planner did not resolve to a column's type",
-            )));
+        Literal::Decimal(digits) => {
+            let Ok(Datum::Double(double)) =
+                Datum::from_text(crate::value::ColumnType::Double, digits)
+            else {
+                return Err(Decision::rows(Reason::NotExpressible(
+                    "a decimal literal this node cannot read as float8",
+                )));
+            };
+            Value::Double(double)
         }
     })
+}
+
+/// Whether a comparison may be pushed down: its two sides must be the same type.
+///
+/// **The far side compares with a second implementation of `pg_cmp`**
+/// (`esker_columnar::ValueRef::pg_cmp`), and two implementations agree about same-typed values by
+/// construction and about mixed ones only by luck. So a literal whose type is not the column's is
+/// refused rather than sent — the row plan above still evaluates the same predicate, so the cost
+/// is a fallback and never an answer. NULL fits every type and is not a mismatch: it makes a
+/// comparison unknown on both sides, which is the same answer.
+fn comparable(
+    left: &esker_columnar::fragment::Expr,
+    right: &esker_columnar::fragment::Expr,
+    types: &[esker_columnar::ColumnType],
+) -> Routed<()> {
+    use esker_columnar::fragment::Expr as ColExpr;
+
+    let refused = Decision::rows(Reason::NotExpressible(
+        "a comparison between a column and a value of another type",
+    ));
+    let (slot, value) = match (left, right) {
+        (ColExpr::Column(slot), ColExpr::Literal(value))
+        | (ColExpr::Literal(value), ColExpr::Column(slot)) => (*slot, value),
+        // Two literals, or two columns. Column-to-column is the useful one and it is left for a
+        // milestone that can type it; a fragment that guessed here would be comparing whatever
+        // the evaluator decided.
+        _ => {
+            return Err(Decision::rows(Reason::NotExpressible(
+                "a comparison that is not a column against a value",
+            )));
+        }
+    };
+    let Some(ty) = types.get(slot as usize) else {
+        return Err(refused);
+    };
+    if value.fits(*ty) {
+        Ok(())
+    } else {
+        Err(refused)
+    }
+}
+
+/// A row-side column type as the columnar vocabulary spells it.
+///
+/// A total match, so a ninth type on either side is a compile error here rather than a column that
+/// silently stops being comparable — the same rule `esker_store::columnar::wire` keeps for the
+/// value vocabulary, and for the same reason.
+fn column_type(ty: crate::value::ColumnType) -> esker_columnar::ColumnType {
+    use crate::value::ColumnType as Row;
+    use esker_columnar::ColumnType as Col;
+
+    match ty {
+        Row::Int8 => Col::Int8,
+        Row::Int4 => Col::Int4,
+        Row::Text => Col::Text,
+        Row::Varchar => Col::Varchar,
+        Row::Bool => Col::Bool,
+        Row::Bytea => Col::Bytea,
+        Row::TimestampTz => Col::TimestampTz,
+        Row::Timestamp => Col::Timestamp,
+        Row::Double => Col::Double,
+    }
 }
 
 /// A row-side datum as a columnar value. Total on both sides by construction.

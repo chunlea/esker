@@ -38,6 +38,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use esker_client::region_cache::{RegionResolver, Route};
 use esker_proto::pd::ColumnarWish;
 use esker_proto::{BlockingTransport, PdReq, PdResp, ProtoError, TransportConfig};
 
@@ -107,6 +108,42 @@ impl PdConn {
             }),
             other => Err(mismatch("SchemaLease", &other)),
         }
+    }
+
+    /// The region covering `key`, as PD has it, with the peer it believes leads.
+    ///
+    /// `GetRegion` is the only routing question PD answers, and this is a SQL node asking it —
+    /// which until milestone 4 nothing did: the binary routed from a static one-region table, so a
+    /// cluster that had split served every key from a region that no longer covered it. It is also
+    /// the only way a node learns that a region has a **columnar learner**, because a learner joins
+    /// through a conf change and the peer list is what carries it (ADR 0022 Decision 1).
+    ///
+    /// `Ok(None)` is *no region covers this key*, which is a routing failure the caller reports and
+    /// does not retry; an `Err` is *PD could not say*, which usually is retryable. Collapsing the
+    /// two would turn a momentary PD outage into a terminal error on every call in the process.
+    pub fn get_region(&self, key: &[u8]) -> Result<Option<Route>, ProtoError> {
+        let PdResp::GetRegion {
+            region,
+            leader_peer_id,
+            ..
+        } = self.call(&PdReq::GetRegion {
+            key: Bytes::copy_from_slice(key),
+        })?
+        else {
+            return Err(mismatch("GetRegion", &PdResp::ReportColumnar));
+        };
+        Ok(region.map(|region| {
+            let leader = (leader_peer_id != 0)
+                .then(|| {
+                    region
+                        .peers
+                        .iter()
+                        .find(|peer| peer.peer_id == leader_peer_id)
+                        .copied()
+                })
+                .flatten();
+            Route { region, leader }
+        }))
     }
 
     /// Tells PD **the whole** set of ranges that want columnar replicas.
@@ -291,6 +328,18 @@ impl SchemaLease for PdLease {
 pub trait ColumnarReport: std::fmt::Debug + Send + Sync {
     /// Asserts the whole set of ranges that want columnar replicas.
     fn report(&self, wishes: Vec<ColumnarWish>) -> Result<(), ProtoError>;
+}
+
+/// Routing, from the one thing that knows it.
+///
+/// A SQL node's region cache is a hint repaired by the refusals it causes (`esker-client`'s
+/// invariant); this is the authority behind it. Nothing about the impl is specific to this crate —
+/// it is `GetRegion` with the network in it — and it lives here rather than in `esker-client`
+/// because that crate deliberately does not link a placement driver: it is handed a resolver.
+impl RegionResolver for PdConn {
+    fn locate(&self, key: &[u8]) -> Result<Option<Route>, ProtoError> {
+        self.get_region(key)
+    }
 }
 
 impl ColumnarReport for PdConn {

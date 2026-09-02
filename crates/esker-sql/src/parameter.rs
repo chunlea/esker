@@ -66,7 +66,7 @@ pub enum Values {
     /// its own rather than a list — measured: `parameter "x" requires a Boolean value`.
     Boolean,
     /// Any text. PostgreSQL validates `search_path` not at all and `TimeZone` against a zone
-    /// database this node does not carry, so what narrows both here is [`honour`].
+    /// database this node does not carry, so what narrows both here is [`Parameter::honour`].
     Free,
 }
 

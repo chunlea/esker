@@ -1,0 +1,37 @@
+# Test groups for `cargo nextest`, which `just check` uses when it is installed.
+#
+# WHY THIS FILE EXISTS. A handful of test binaries in this workspace start **whole clusters** — a
+# placement driver, four stores with real Raft groups over real sockets, and a SQL node — and
+# nextest runs every test in its own process, in parallel, up to the core count. Ten of those at
+# once is forty Raft peers heart-beating on 25 ms ticks on one machine, and what that produces is
+# not a failed assertion about the system: it is a leader missing a heartbeat because the machine
+# is saturated, a follower campaigning, and an in-flight proposal's leader stepping down under it.
+#
+# `docs/plans/phase-9-rails.md` §8 is the register of exactly that, with three sightings and two
+# distinct mechanisms — a 30-second RPC deadline that expires, and an election gap that does not.
+# Both were diagnosed as "however many test binaries this machine is running at once", and both
+# were then worked around inside the tests, with retries. This is the other half of that answer,
+# and the cheaper one: **do not run them at once.**
+#
+# What is NOT here is a global concurrency limit. Every other test in this workspace is a unit
+# test that finishes in milliseconds, and slowing 470 of them down to protect ten would be paying
+# the wrong cost.
+
+[test-groups.cluster]
+# One cluster at a time. Not two: the point is the absence of contention between them, and a
+# second is enough to reintroduce it — the differential's four clusters landing beside the joint
+# gate's six is what made this file necessary.
+max-threads = 1
+
+[[profile.default.overrides]]
+# The binaries that start a placement driver **and** several stores with real Raft groups. Named
+# rather than pattern-matched, so that a new one is a deliberate addition: a test that belongs in
+# this group and is not in it fails intermittently and blames the system.
+#
+# `esker-pd`'s own tests are not here. They drive a placement driver in process against store
+# heartbeats they synthesise, so they run no consensus and cost no ticks.
+filter = """
+    (package(esker-sql) and (binary(joint_gate) or binary(routing_differential) or binary(pd_wiring)))
+    or (package(esker-store) and (binary(promotion) or binary(balance)))
+"""
+test-group = 'cluster'
