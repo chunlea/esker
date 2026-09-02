@@ -311,6 +311,34 @@ fn walk_expr_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr)) {
                 walk_expr_mut(arg, visit);
             }
         }
+        // **Every other node that holds an expression**, and the reason the list has to be
+        // complete: whatever is not here is never visited, so a `$1` inside it is never bound and
+        // a `'x'::regclass` inside it is never resolved. Measured — `'rc'::regclass::text` reached
+        // the row evaluator with the cast unresolved, because a cast to text was not on this list.
+        Expr::ToText { operand, .. } | Expr::Scalar { operand, .. } => {
+            walk_expr_mut(operand, visit);
+        }
+        Expr::AnyArray { operand, array } => {
+            walk_expr_mut(operand, visit);
+            walk_expr_mut(array, visit);
+        }
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            for branch in branches {
+                walk_expr_mut(&mut branch.when, visit);
+                walk_expr_mut(&mut branch.then, visit);
+            }
+            if let Some(otherwise) = otherwise {
+                walk_expr_mut(otherwise, visit);
+            }
+        }
+        Expr::Aggregate(call) => {
+            for arg in &mut call.args {
+                walk_expr_mut(arg, visit);
+            }
+        }
         _ => {}
     }
 }
@@ -405,7 +433,10 @@ fn descend(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
             descend(left, visit);
             descend(right, visit);
         }
-        Expr::Not(operand) | Expr::IsNull { operand, .. } => descend(operand, visit),
+        Expr::Not(operand)
+        | Expr::IsNull { operand, .. }
+        | Expr::ToText { operand, .. }
+        | Expr::Scalar { operand, .. } => descend(operand, visit),
         Expr::InList { operand, list, .. } => {
             descend(operand, visit);
             for item in list {
@@ -413,6 +444,27 @@ fn descend(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
             }
         }
         Expr::CatalogFunc(call) => {
+            for arg in &call.args {
+                descend(arg, visit);
+            }
+        }
+        Expr::AnyArray { operand, array } => {
+            descend(operand, visit);
+            descend(array, visit);
+        }
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            for branch in branches {
+                descend(&branch.when, visit);
+                descend(&branch.then, visit);
+            }
+            if let Some(otherwise) = otherwise {
+                descend(otherwise, visit);
+            }
+        }
+        Expr::Aggregate(call) => {
             for arg in &call.args {
                 descend(arg, visit);
             }

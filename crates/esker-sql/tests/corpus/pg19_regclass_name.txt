@@ -1,0 +1,31 @@
+# `<oid>::regclass` — the **inverse** of `'name'::regclass`. The first piece of boot statement 36.
+#
+# `ActiveRecord`'s `foreign_keys()` reads the referenced table as `t2.oid::regclass::text`. This
+# node had the forward direction since the rung-2 unit — a name resolved to an oid once per
+# statement — and refused this one: `the cast t2.oid::REGCLASS is not supported`.
+#
+# Unlike its inverse it is **per row**, because its argument is a column.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **An oid that names nothing is not an error — it prints the number back.**
+#     `2147483647::regclass::text` is `2147483647`. A `LEFT JOIN` that legitimately has no match
+#     would raise on a node that refused, so the permissive answer is the correct one.
+#   * **Oid 0 prints `-`**, which is PostgreSQL's rendering of `InvalidOid` and not an empty
+#     string: `length(0::regclass::text)` is 1. That line cannot be a row here, because a lone `-`
+#     in the rows column is this format's marker for *no rows*; it is asserted in
+#     `tests/regclass_name.rs` instead.
+#   * **It is strict**: `NULL::oid::regclass::text` is NULL.
+#   * **An index is a relation**, so `rc_pkey` comes back by name like any table.
+CREATE TABLE rc (id int8 PRIMARY KEY, a int4)		-
+SELECT c.oid::regclass::text FROM pg_class c WHERE c.relname = 'rc'	text	rc
+SELECT c.oid::regclass FROM pg_class c WHERE c.relname = 'rc'	regclass	rc
+SELECT 'rc'::regclass::oid::regclass::text	text	rc
+SELECT 2147483647::regclass::text	text	2147483647
+SELECT c.oid::regclass::text FROM pg_class c WHERE c.relname = 'rc_pkey'	text	rc_pkey
+SELECT NULL::oid::regclass::text	text	\N
+DROP TABLE rc CASCADE		-

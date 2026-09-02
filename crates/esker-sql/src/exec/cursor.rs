@@ -1162,6 +1162,18 @@ fn catalog_function(
         ),
         // The `pretty` flag changes nothing this node prints: it re-wraps a long `CHECK`
         // expression on a real server, and there are no `CHECK` constraints here.
+        // **The inverse of `'x'::regclass`, and per row.** An oid that names nothing is not an
+        // error: it prints the number back, and oid 0 prints `-`, PostgreSQL's rendering of
+        // `InvalidOid`. Measured, both — raising here would break a `LEFT JOIN` that legitimately
+        // has no match.
+        CatalogFunc::RegClassName => match oid_argument(args.first())? {
+            None => Datum::Null,
+            Some(oid) => match env.relations()?.by_oid(oid) {
+                Some(relation) => Datum::Text(relation.name.clone()),
+                None if oid == 0 => Datum::Text("-".to_owned()),
+                None => Datum::Text(oid.to_string()),
+            },
+        },
         CatalogFunc::PgGetConstraintdef => crate::catalog::pg_constraint::constraint_definition(
             env.relations()?,
             oid_argument(args.first())?,

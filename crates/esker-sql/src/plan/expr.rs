@@ -367,6 +367,19 @@ pub enum CatalogFunc {
     /// sequence call is: once per statement, not once per row, or a `WHERE attrelid =
     /// 'x'::regclass` would read the catalog for every row it filtered.
     RegClass,
+    /// `<oid>::regclass`: the **name** of the relation an oid names — the inverse of
+    /// [`CatalogFunc::RegClass`], and the direction `ActiveRecord`'s `foreign_keys()` reads a
+    /// referenced table with (`t2.oid::regclass::text`).
+    ///
+    /// Unlike its inverse this is a **per-row** call: its argument is a column, so the answer
+    /// differs per row and cannot be resolved before the plan. The catalog it reads is the
+    /// cursor's snapshot, the same one `pg_get_indexdef` uses.
+    ///
+    /// **An oid that names nothing is not an error.** It prints the number back —
+    /// `2147483647::regclass::text` is `2147483647` — and oid **0** prints `-`, which is
+    /// PostgreSQL's rendering of `InvalidOid`. Measured, both; an implementation that raised would
+    /// break a `LEFT JOIN` that legitimately has no match.
+    RegClassName,
     /// `array_position(array, value)`: the subscript `value` sits at, or NULL.
     ///
     /// The five below are the array operators the catalog's own columns need, and they read the
@@ -429,7 +442,8 @@ impl CatalogFunc {
             CatalogFunc::ColDescription => "col_description",
             CatalogFunc::ObjDescription => "obj_description",
             CatalogFunc::PgGetPartkeydef => "pg_get_partkeydef",
-            CatalogFunc::RegClass => "regclass",
+            // Two directions of one cast, and PostgreSQL names both of them `regclass`.
+            CatalogFunc::RegClass | CatalogFunc::RegClassName => "regclass",
             CatalogFunc::ArrayPosition => "array_position",
             CatalogFunc::ArrayLower => "array_lower",
             CatalogFunc::ArrayUpper => "array_upper",
@@ -456,7 +470,10 @@ impl CatalogFunc {
             CatalogFunc::PgGetExpr => &[2, 3],
             CatalogFunc::PgGetIndexdef => &[1, 3],
             CatalogFunc::PgGetConstraintdef | CatalogFunc::ObjDescription => &[1, 2],
-            CatalogFunc::PgGetPartkeydef | CatalogFunc::RegClass | CatalogFunc::Cardinality => &[1],
+            CatalogFunc::PgGetPartkeydef
+            | CatalogFunc::RegClass
+            | CatalogFunc::RegClassName
+            | CatalogFunc::Cardinality => &[1],
         }
     }
 
@@ -470,9 +487,13 @@ impl CatalogFunc {
             | CatalogFunc::PgGetConstraintdef
             | CatalogFunc::ColDescription
             | CatalogFunc::ObjDescription
-            | CatalogFunc::PgGetPartkeydef => ColumnType::Text,
+            // A `regclass` on a real server is an oid that *prints* as a name; `text` here, which
+            // is what it prints as. The one place the difference shows is the declared type.
+            | CatalogFunc::PgGetPartkeydef
+            | CatalogFunc::RegClassName => ColumnType::Text,
             // An `oid` on a real server, and a `bigint` here for the reason `pg_class.oid` is one.
             CatalogFunc::RegClass => ColumnType::Int8,
+
             // Every one of the five answers `integer` on a real server, including `cardinality`,
             // which counts every element of every dimension where `array_length` counts one.
             CatalogFunc::ArrayPosition

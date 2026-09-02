@@ -1818,6 +1818,23 @@ fn function_argument_types(function: &sqlparser::ast::Function) -> String {
         .join(", ")
 }
 
+/// Whether a cast's operand is a **quoted string**, which is what tells the two `regclass`
+/// directions apart.
+///
+/// `'rc'::regclass` is a name being resolved to an oid; `2147483647::regclass` and
+/// `c.oid::regclass` are oids being resolved to a name. The test cannot be "is it a literal" — a
+/// number is one too, and reading `2147483647` as a relation *name* is how the first version of
+/// this got it wrong.
+fn is_string_literal(expr: &Expr) -> bool {
+    match unwrap_nested(expr) {
+        Expr::Value(value) => matches!(
+            value.value,
+            Value::SingleQuotedString(_) | Value::DoubleQuotedString(_)
+        ),
+        _ => false,
+    }
+}
+
 /// The clauses inside an aggregate's parentheses.
 ///
 /// **`ORDER BY` is honoured and every other clause is named.** It orders the values within one
@@ -2385,7 +2402,16 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
         // `'"companies"'::regclass`, which is what `ActiveRecord` writes, keeps its case and
         // `'CB'::regclass` folds. Measured: `'"CB"'::regclass` is `42P01 relation "CB" does not
         // exist`, quoted spelling and all.
-        (CastTarget::RegClass, _) => lower_regclass(expr, data_type),
+        // **Both directions of `regclass`, told apart by what is being cast.** A *name* — a string
+        // literal — is the forward form, resolved once per statement before the plan is built. An
+        // **oid**, which in practice is a column, is the inverse: the relation's name, read per
+        // row. `ActiveRecord`'s `foreign_keys()` writes `t2.oid::regclass::text`, and the `::text`
+        // after it is the identity on what this already answers.
+        (CastTarget::RegClass, _) if is_string_literal(expr) => lower_regclass(expr, data_type),
+        (CastTarget::RegClass, _) => Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+            func: plan::CatalogFunc::RegClassName,
+            args: vec![lower_expr(expr)?],
+        }))),
         // `'integer'::regtype` on its own, which answers the name PostgreSQL prints it by.
         (CastTarget::RegType, _) => {
             let name = cast_operand(expr, data_type)?;
