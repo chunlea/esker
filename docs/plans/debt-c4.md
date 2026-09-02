@@ -380,6 +380,67 @@ it.
 
 ---
 
+## 9. Balance preempted an unfinished repair, and the two then waited for each other
+
+Not an inventory item — a red gate. `esker-store`'s
+`promotion.rs::a_learner_on_a_fresh_store_becomes_a_voter_under_load` failed in this wave's closing
+`just check` (2,383 of 2,384) and was relayed by the type lane as failing reproducibly in isolation,
+with *"server is busy: leadership transfer to 40 is in progress"* and then *"region epoch does not
+match"*.
+
+### What the trace shows
+
+Run with `RUST_LOG=esker_store=debug,esker_pd=debug` the test fails **8 of 8** — the logging widens
+the window enough to make the race deterministic, which is what turned a flaky test into a
+reproduction. The sequence, for region 7:
+
+```
+02:56:50.876  an operator applied  region_id=7 node=24 kind=AddLearner
+02:56:51.035  a learner has caught up; promoting it to voter region_id=7 learner=24 matched=61
+02:56:54.187  operator issued  region_id=7 operator="TransferLeader"     <- balance, learner still a learner
+02:56:54.268  leadership was asked to move region_id=7 to_peer_id=8
+02:57:00.046  operator issued  region_id=7 operator="TransferLeader"     <- and again
+```
+
+and for region 5, `operator timed out with nothing observed; it will be re-derived ... sends=3`.
+
+**The promotion is proposed by the leader**, on the learner's `matched`, because a region heartbeat
+comes only from a leader and PD can therefore never see a learner's progress
+(`docs/plans/phase-4.md` §14.1). A leader with a leadership transfer in progress **refuses
+proposals**. So a `TransferLeader` against a region whose learner has not been promoted blocks the
+very `AddVoter` that would finish the repair; the transfer times out waiting for a target the
+promotion would have caught up; PD re-derives it; and the region stays that way past the 30-second
+acceptance deadline.
+
+### The fix
+
+`balance::is_mid_repair`. A region is mid-repair while it holds a peer on a **down store** *or* a
+plain **`Learner`** — and both `region_balance` and `leader_balance` consult it. `leader_balance`
+previously had no repair guard at all beyond "the leader's store is down".
+
+`mid_repair` had counted a peer on a down store and nothing else, so a replica added on a *live*
+store and not yet promoted looked like a settled region. It is the same family this module already
+names twice — "**Voters, not peers** ... the third instance", "the fourth instance, found by reading
+the second half of this function while fixing the first" — reaching the state repair passes
+*through* rather than the one it starts from.
+
+A **`ColumnarLearner` is excluded**: ADR 0022 Decision 1 says it is never promoted, so counting it
+would freeze every region holding one out of balance for ever. A test pins that too.
+
+`docs/DESIGN.md` §7's "Balance never touches a region that is mid-repair" bullet stated the narrow
+definition and is updated in the same change.
+
+### Attribution, since the relay asked
+
+**Not introduced by this wave.** A 6-versus-6 A/B in a detached worktree puts the pre-wave HEAD
+`8432814` at **4 passed, 2 failed** — the same intermittent failure, before any commit here. My
+`esker-pd` diff up to that point was purely additive (two read-only methods, one routing helper, two
+service arms) and touches no scheduling path. The relay's "passed at 18:58, began failing after" was
+a true observation of a bug whose rate is roughly one in three and which any slowdown makes certain.
+Recorded because the wave found it and fixed it, not to argue about who owned it.
+
+---
+
 ## What this wave did not do
 
 * **`pd serve` still exposes no `PdOptions` field.** Unit 7 closed the `esker server` half of
