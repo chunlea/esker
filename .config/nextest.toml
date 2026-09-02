@@ -30,8 +30,13 @@ max-threads = 1
 #
 # `esker-pd`'s own tests are not here. They drive a placement driver in process against store
 # heartbeats they synthesise, so they run no consensus and cost no ticks.
+#
+# `esker-cli`'s are, and they are the heaviest of all: they start the cluster as **real
+# processes**, so a store there costs an operating-system process rather than a task, and their
+# deadlines are wall-clock budgets rather than assertions about a state.
 filter = """
     (package(esker-sql) and (binary(joint_gate) or binary(routing_differential) or binary(pd_wiring)))
     or (package(esker-store) and (binary(promotion) or binary(balance)))
+    or (package(esker-cli) and (binary(cluster_start) or binary(cluster_chaos) or binary(columnar_cluster)))
 """
 test-group = 'cluster'

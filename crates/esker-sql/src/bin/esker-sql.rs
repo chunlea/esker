@@ -18,6 +18,7 @@ use esker_sql::backend::{Backend, MemoryBackend, StoreBackend};
 use esker_sql::catalog::Catalog;
 use esker_sql::exec::Executor;
 use esker_sql::exec::redrive::ReDriver;
+use esker_sql::fragment::{ClientFragments, FragmentSource};
 use esker_sql::pd::{ColumnarReport, LeaseRefresher, PdConn, PdLease};
 use esker_sql::pgwire::server::{Auth, Config, Executors, serve};
 use esker_sql::pgwire::session::Execute;
@@ -31,15 +32,25 @@ struct Sessions {
     catalog: Arc<Catalog>,
     /// Where an `ALTER ... SET (columnar_replicas = N)` reports to, on a node that has a PD.
     columnar: Option<Arc<dyn ColumnarReport>>,
+    /// Where a plan fragment goes, on a node that can send one (ADR 0022 milestone 4).
+    ///
+    /// `None` without `--pd`, and that is not a degraded node: routing needs to know which peer of
+    /// a region is the columnar learner, and only the placement driver can say. A node without one
+    /// plans every query on rows and `EXPLAIN` says why.
+    fragments: Option<Arc<dyn FragmentSource>>,
 }
 
 impl Executors for Sessions {
     fn for_session(&self) -> Box<dyn Execute + Send> {
-        let executor = Executor::new(Arc::clone(&self.backend), Arc::clone(&self.catalog), TENANT);
-        Box::new(match &self.columnar {
-            Some(report) => executor.reporting_columnar_to(Arc::clone(report)),
-            None => executor,
-        })
+        let mut executor =
+            Executor::new(Arc::clone(&self.backend), Arc::clone(&self.catalog), TENANT);
+        if let Some(report) = &self.columnar {
+            executor = executor.reporting_columnar_to(Arc::clone(report));
+        }
+        if let Some(source) = &self.fragments {
+            executor = executor.asking_fragments_of(Arc::clone(source));
+        }
+        Box::new(executor)
     }
 }
 
@@ -68,6 +79,9 @@ async fn main() -> std::io::Result<()> {
     // source, so `Backend::schema_lease_remaining` answers "unbounded" and every write is
     // unrestricted, exactly as it was before this flag existed.
     let lease = pd.as_ref().map(|_| Arc::new(PdLease::new()));
+    // The router the client was built on, kept so the fragment path can share it: one region cache
+    // for both, so an entry a row read warmed is warm for a fragment.
+    let mut router: Option<Arc<esker_client::Router>> = None;
     let backend: Arc<dyn Backend> = if stores.is_empty() {
         if pd.is_some() {
             // The fake keeps nothing and is in this process; a lease from a real placement driver
@@ -89,9 +103,10 @@ async fn main() -> std::io::Result<()> {
         // "Cannot start a runtime from within a runtime" — on the first line of every node
         // started against real stores, which is the one path no test took until this phase
         // started one from a shell.
-        let (client, oracle) = tokio::task::spawn_blocking(move || connect(&stores))
+        let (client, oracle, built) = tokio::task::spawn_blocking(move || connect(&stores, pd))
             .await
             .map_err(std::io::Error::other)??;
+        router = Some(built);
         let backend = StoreBackend::new(Arc::new(client), oracle);
         match &lease {
             Some(lease) => Arc::new(backend.with_schema_lease(Arc::clone(lease) as Arc<_>)),
@@ -143,10 +158,22 @@ async fn main() -> std::io::Result<()> {
         .name("schema-redriver".to_owned())
         .spawn(move || redriver.run())?;
 
+    // **Both halves or neither.** A fragment goes to a peer PD named, so a node with a router and
+    // no placement driver has nowhere to send one; a node with a driver and the in-process fake
+    // has no cluster to send it to. Either way the planner still decides and `EXPLAIN` still says
+    // what it decided — on rows, naming the reason.
+    let fragments: Option<Arc<dyn FragmentSource>> = router
+        .filter(|_| pd.is_some())
+        .map(|router| Arc::new(ClientFragments::new(router)) as Arc<dyn FragmentSource>);
+    if fragments.is_some() {
+        tracing::info!("columnar routing is available: fragments go to the learners PD placed");
+    }
+
     let sessions = Sessions {
         backend,
         catalog,
         columnar,
+        fragments,
     };
     serve(config, Arc::new(sessions)).await
 }
@@ -258,9 +285,11 @@ async fn attach_pd(
 /// (`CLAUDE.md` invariant 6).
 fn connect(
     stores: &[String],
+    pd: Option<std::net::SocketAddr>,
 ) -> std::io::Result<(
     esker_client::TxnClient,
     Arc<dyn esker_client::TimestampOracle>,
+    Arc<esker_client::Router>,
 )> {
     use esker_proto::transport::TransportConfig;
 
@@ -277,16 +306,24 @@ fn connect(
         .collect::<std::io::Result<_>>()?;
     let transport = esker_client::TcpStores::connect_all(&addresses, TransportConfig::default())
         .map_err(std::io::Error::other)?;
-    // One region over every store given, which is what a cluster bootstraps with and what a
-    // redirect needs to be able to follow. `TODO(phase-6a)`: the real routing table comes from
-    // PD, and then a node is told where PD is rather than where the stores are.
-    let store_ids = transport.store_ids();
-    let resolver = Arc::new(esker_client::StaticRegion::replicated(1, &store_ids));
-    let router = esker_client::Router::new(Arc::new(transport), resolver);
+    // **With `--pd`, the routing table is PD's.** The `TODO(phase-6a)` that stood here is done:
+    // a static one-region table is what a cluster *bootstraps* with, and it stops being true the
+    // first time the cluster splits — and it can never say which peer of a region is a columnar
+    // learner, because a learner joins through a conf change long after any table was written
+    // down. Without `--pd` the old table stands, which is a node told where the stores are and
+    // nothing else.
+    let resolver: Arc<dyn esker_client::RegionResolver> = if let Some(address) = pd {
+        Arc::new(PdConn::new(address))
+    } else {
+        let store_ids = transport.store_ids();
+        Arc::new(esker_client::StaticRegion::replicated(1, &store_ids))
+    };
+    let router = Arc::new(esker_client::Router::new(Arc::new(transport), resolver));
     let oracle: Arc<dyn esker_client::TimestampOracle> =
         Arc::new(esker_client::CountingOracle::starting_at(1));
     Ok((
-        esker_client::TxnClient::on_router(Arc::new(router), Arc::clone(&oracle)),
+        esker_client::TxnClient::on_router(Arc::clone(&router), Arc::clone(&oracle)),
         oracle,
+        router,
     ))
 }

@@ -340,6 +340,21 @@ count(*)` is served by the fragment. `#[ignore]`d in `esker-cli/tests/columnar_c
 `--help` Gatekeeper warm-up `cluster_start` already uses, plus the in-process form in
 `tests/routing_differential.rs` that runs in the gate.
 
+It needed the binary as well as the test. `esker-sql`'s `connect` carried a
+`TODO(phase-6a)` — *"the real routing table comes from PD, and then a node is told where PD is
+rather than where the stores are"* — and a static one-region table is exactly what routing cannot
+use: it stops being true the first time a cluster splits, and it can never say which peer of a
+region is a columnar learner. With `--pd` the resolver is now `PdConn`, and the router the client
+was built on is shared with a `ClientFragments` the sessions ask through. Without `--pd` nothing
+changes, which keeps the flag additive.
+
+**What the shell path is not.** `esker-sql` still hands out timestamps from
+`CountingOracle::starting_at(1)` on a real cluster, whose physical half is zero — so
+`esker_client::is_expired` can never judge a stranded Percolator lock dead there (the joint gate
+records the same trap and works around it with a wall-clock oracle). Not this milestone's, not
+touched by it, and named here because a reader of this test could otherwise conclude the binary is
+production-shaped.
+
 ### U7 — the ADR, and DESIGN.md
 
 `docs/adr/00NN-the-engine-a-query-runs-on.md`: the session GUC and its measured PG19 surface, the
@@ -381,6 +396,16 @@ changes. DESIGN.md §16's "Not built here" paragraph loses planner routing and `
   to rows rather than double-counting. What that leaves is a table that stops being routable until
   the plan is rebuilt, which is a performance bound and not a wrong answer. A split-aware columnar
   copy is `esker-store`'s and is not in this milestone.
+* **`esker-cli::cluster_start` under a full workspace run, seen twice.** Both of its tests passed
+  standalone in 0.57 s and each failed once at its own 60-second budget during
+  `cargo nextest run --workspace` — once before `.config/nextest.toml` put the CLI's cluster
+  binaries in the serialised group and once after, with the two runs either side of that change
+  green. It starts four stores and a driver as **real processes**, so it is the heaviest thing in
+  the suite and the first to notice a loaded machine; `cluster start` re-spawns `current_exe()`, so
+  Gatekeeper is already paid by the file's own warm-up and is not the cause. Recorded rather than
+  chased: it is another lane's test, this lane's change to it was to stop it running beside the
+  other clusters, and a third sighting makes it a chase
+  (`docs/plans/phase-9-rails.md` §8's rule).
 * **The rebase.** The type lane is editing `parse/lower.rs`, `plan/expr.rs` and `exec/query.rs` on
   `main`; this lane's hunks in those three files are kept to the smallest that will compile.
 
