@@ -82,6 +82,9 @@ pub enum Method {
     /// has in flight, which are memory and are therefore invisible to `esker pd inspect`
     /// ([`crate::pd`]).
     PdStatus = 0x0309,
+    /// `Pd::ScanRegions` — a page of the routing table in **key** order, so a tool that wants
+    /// every region does not ask `GetRegion` once per region ([`crate::pd`]).
+    PdScanRegions = 0x030a,
 
     /// `RaftTransport::Batch` — a tick's worth of Raft messages between two stores
     /// (`docs/DESIGN.md` §6, [ADR 0009](../../docs/adr/0009-the-wire-carries-the-raft-message.md)).
@@ -163,7 +166,7 @@ pub const SERVICE_ADMIN: u8 = 0x05;
 
 impl Method {
     /// Every method this version defines.
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 34] = [
         Self::Hello,
         Self::RawGet,
         Self::RawBatchGet,
@@ -182,6 +185,7 @@ impl Method {
         Self::PdSchemaLease,
         Self::PdReportColumnar,
         Self::PdStatus,
+        Self::PdScanRegions,
         Self::RaftBatch,
         Self::RaftSnapshot,
         Self::TxnGet,
@@ -227,6 +231,7 @@ impl Method {
             0x0307 => Some(Self::PdSchemaLease),
             0x0308 => Some(Self::PdReportColumnar),
             0x0309 => Some(Self::PdStatus),
+            0x030a => Some(Self::PdScanRegions),
             0x0601 => Some(Self::FragmentEvaluate),
             0x0701 => Some(Self::SchemaFetch),
             0x0401 => Some(Self::RaftBatch),
@@ -283,6 +288,7 @@ impl Method {
             Self::PdTso => "Pd::Tso",
             Self::PdReportColumnar => "Pd::ReportColumnar",
             Self::PdStatus => "Pd::Status",
+            Self::PdScanRegions => "Pd::ScanRegions",
             Self::FragmentEvaluate => "Fragment::Evaluate",
             Self::SchemaFetch => "Schema::Fetch",
             Self::PdSchemaLease => "Pd::SchemaLease",
@@ -1529,7 +1535,8 @@ mod tests {
                 | Method::PdTso
                 | Method::PdSchemaLease
                 | Method::PdReportColumnar
-                | Method::PdStatus => crate::messages::SERVICE_PD,
+                | Method::PdStatus
+                | Method::PdScanRegions => crate::messages::SERVICE_PD,
                 Method::TxnGet
                 | Method::TxnScan
                 | Method::TxnPrewrite

@@ -371,6 +371,106 @@ async fn a_quiet_placement_driver_reports_no_operators() {
     assert_eq!(now_ms, 1_700_000_000_000, "the report carries PD's clock");
 }
 
+/// **The routing table, in pages instead of one region at a time.**
+///
+/// Fifty regions, because the shape only shows up above a page: the default page is 128, so a
+/// caller asking with a small limit has to continue and this asserts the continuation lands on the
+/// right region rather than skipping or repeating one.
+#[tokio::test]
+async fn fifty_regions_come_back_in_key_order_a_page_at_a_time() {
+    const COUNT: usize = 50;
+
+    let cluster = Cluster::start().await;
+    let pd = cluster.channel().await;
+    let (_, region) = pd
+        .bootstrap(StoreInfo::new(1, "127.0.0.1:20161"))
+        .await
+        .unwrap();
+    let bootstrapped = region.expect("the first store bootstraps a region");
+
+    // Fifty contiguous regions: [""..k01), [k01..k02), ... [k49..""). Reported as heartbeats,
+    // which is the only way a region enters PD's table.
+    let key = |index: usize| Bytes::from(format!("k{index:02}"));
+    for index in 0..COUNT {
+        let start = if index == 0 { Bytes::new() } else { key(index) };
+        let end = if index == COUNT - 1 {
+            Bytes::new()
+        } else {
+            key(index + 1)
+        };
+        let region = Region {
+            id: if index == 0 {
+                bootstrapped.id
+            } else {
+                100 + index as u64
+            },
+            start_key: start,
+            end_key: end,
+            peers: vec![Peer::voter(1, 10 + index as u64)],
+            epoch: Epoch::new(1, 1 + index as u64),
+        };
+        pd.region_heartbeat(region, 10 + index as u64, 1, 0, 0)
+            .await
+            .unwrap();
+    }
+
+    // One call, because fifty is below the default page.
+    let (regions, stores) = pd.scan_regions("", 0).await.unwrap();
+    assert_eq!(regions.len(), COUNT, "the default page did not cover fifty");
+    assert_eq!(
+        stores.len(),
+        1,
+        "one store hosts every peer, and it is sent once for the page, not fifty times"
+    );
+    assert_eq!(stores[0].address, "127.0.0.1:20161");
+
+    // In key order, and a partition: each region starts where the last one ended.
+    let mut expected = Bytes::new();
+    for scanned in &regions {
+        assert_eq!(
+            scanned.region.start_key, expected,
+            "region {} is out of order or leaves a gap",
+            scanned.region.id
+        );
+        expected = scanned.region.end_key.clone();
+    }
+    assert!(
+        expected.is_empty(),
+        "the last region does not close the key space"
+    );
+
+    // And paged: seven at a time, continuing from the previous page's end key, is the same list.
+    let mut paged = Vec::new();
+    let mut next = Bytes::new();
+    loop {
+        let (page, _) = pd.scan_regions(next.clone(), 7).await.unwrap();
+        assert!(
+            page.len() <= 7,
+            "the server handed out more than was asked for"
+        );
+        let Some(last) = page.last() else { break };
+        let end = last.region.end_key.clone();
+        paged.extend(page);
+        if end.is_empty() {
+            break;
+        }
+        next = end;
+    }
+    assert_eq!(paged, regions, "paging saw a different table from one call");
+
+    // A limit above the cap is clamped rather than refused.
+    let (all, _) = pd.scan_regions("", u32::MAX).await.unwrap();
+    assert_eq!(all.len(), COUNT);
+
+    // Starting inside the table starts at the region *containing* the key, not the one after it.
+    let (from_middle, _) = pd
+        .scan_regions(Bytes::from_static(b"k25x"), 3)
+        .await
+        .unwrap();
+    assert_eq!(from_middle.len(), 3);
+    assert_eq!(from_middle[0].region.start_key, key(25));
+}
+
 /// **A PD with no cluster still answers.**
 ///
 /// Every other method is gated on the cluster id, and rightly: they read or write cluster-scoped

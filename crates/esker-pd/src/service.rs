@@ -170,6 +170,13 @@ fn serve(pd: &Pd, cluster_id: u64, request: &PdReq) -> Result<PdResp, ProtoError
             pd.report_columnar(wishes.clone())?;
             PdResp::ReportColumnar
         }
+        // **Not** exempt from the cluster check above, unlike `Status`: this reads the routing
+        // table, which is cluster-scoped state, and a scan addressed to another cluster is the
+        // same mistake `GetRegion` is checked for.
+        PdReq::ScanRegions { start_key, limit } => {
+            let (regions, stores) = pd.scan_regions(start_key, *limit)?;
+            PdResp::ScanRegions { regions, stores }
+        }
         PdReq::Status => {
             let (now_ms, operators) = pd.status()?;
             PdResp::Status { now_ms, operators }

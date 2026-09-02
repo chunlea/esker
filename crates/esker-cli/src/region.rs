@@ -14,10 +14,15 @@
 //! forwarding — an operator's tool that quietly did the work somewhere else would make "which
 //! store did this" unanswerable, which is the one thing the tool is for.
 //!
-//! `ls` walks the key space rather than asking for a list, because `GetRegion` is the only routing
-//! question PD answers: ask for `""`, take the region's end key, ask again, stop when a region's
-//! end key is empty. The walk is also the check — a gap or an overlap shows up as a region whose
-//! start is not the previous one's end, and it is reported rather than smoothed over.
+//! `ls` asks for **pages** of the routing table (`Pd::ScanRegions`) rather than one region at a
+//! time. It used to walk with `GetRegion` — ask for `""`, take the region's end key, ask again —
+//! which was correct and `O(regions)` round trips.
+//!
+//! **The walk's check survives the change, and that is the part worth keeping.** A gap or an
+//! overlap shows up as a region whose start is not the previous one's end, and it is reported
+//! rather than smoothed over. The old shape got that for free, because it asked *by key* and a gap
+//! answered "no region"; a page of records has to check it explicitly, so it does — across page
+//! boundaries too, which is where a scan that only checked within a page would miss one.
 //!
 //! # Exit codes
 //!
@@ -165,46 +170,88 @@ impl PdConn {
     }
 }
 
-/// Every region in the cluster, walked from the start of the key space.
+/// Every region in the cluster, in key order, a page at a time.
+///
+/// The contiguity check is this function's, not PD's: each region must start exactly where the
+/// previous one ended, and the last must run to the end of the key space. A gap or an overlap is
+/// **reported**, because a routing table that is not a partition is the kind of bug an operator's
+/// tool exists to surface rather than to render tidily.
 fn walk(pd: &PdConn) -> Result<Vec<Located>, String> {
-    let mut found = Vec::new();
+    let mut found: Vec<Located> = Vec::new();
     let mut next = Bytes::new();
     loop {
-        let PdResp::GetRegion {
-            region,
-            leader_peer_id,
-            stores,
-        } = pd
-            .call(&PdReq::GetRegion { key: next.clone() })
-            .map_err(|error| format!("asking the placement driver about {next:?}: {error}"))?
+        let PdResp::ScanRegions { regions, stores } = pd
+            .call(&PdReq::ScanRegions {
+                start_key: next.clone(),
+                limit: 0,
+            })
+            .map_err(|error| {
+                format!(
+                    "asking the placement driver for the regions from {}: {error}",
+                    escape(&next)
+                )
+            })?
         else {
             return Err("the placement driver answered a different question".to_owned());
         };
-        let Some(region) = region else {
-            // No region covers the key. At `""` that is a cluster with nothing in it; anywhere
-            // else it is a gap, and the walk stops at it rather than skipping past.
+        if regions.is_empty() {
+            // At the start of the key space that is a cluster with nothing in it. Anywhere else
+            // it is a gap: something ended and nothing begins there.
             if found.is_empty() {
                 return Ok(found);
             }
             return Err(format!(
                 "no region covers {}, which is a gap in the key space after region {}",
                 escape(&next),
-                found.last().map_or(0, |(region, _, _): &Located| region.id)
+                found.last().map_or(0, |(region, _, _)| region.id)
             ));
-        };
-        let end = region.end_key.clone();
-        found.push((
-            region,
-            (leader_peer_id != 0).then_some(leader_peer_id),
-            stores
-                .into_iter()
-                .map(|store| (store.store_id, store.address))
-                .collect(),
-        ));
+        }
+        let addresses: Vec<(u64, String)> = stores
+            .into_iter()
+            .map(|store| (store.store_id, store.address))
+            .collect();
+
+        let mut end = Bytes::new();
+        for scanned in regions {
+            // The check the old per-key walk got for free. `next` is where the previous region
+            // ended — or the empty key on the first page — so a region that does not start there
+            // is a gap or an overlap, and this catches it **across** page boundaries as well as
+            // within one.
+            if scanned.region.start_key != next {
+                return Err(format!(
+                    "region {} starts at {} where {} was expected: the routing table is not a \
+                     partition of the key space",
+                    scanned.region.id,
+                    escape(&scanned.region.start_key),
+                    escape(&next),
+                ));
+            }
+            end = scanned.region.end_key.clone();
+            next = end.clone();
+            let leader = (scanned.leader_peer_id != 0).then_some(scanned.leader_peer_id);
+            // Only the stores this region's peers are on, out of the page's shared list: the
+            // caller prints them per region and a region must not be shown a peer it has not got.
+            let peers: Vec<(u64, String)> = addresses
+                .iter()
+                .filter(|(store_id, _)| {
+                    scanned
+                        .region
+                        .peers
+                        .iter()
+                        .any(|peer| peer.store_id == *store_id)
+                })
+                .cloned()
+                .collect();
+            found.push((scanned.region, leader, peers));
+        }
+
         if end.is_empty() {
+            // The last region runs to the end of the key space, so the table is complete.
             return Ok(found);
         }
-        next = end;
+        // A short page means the table ended without the last region closing the key space,
+        // which is a gap at `next` — caught by the empty page the next round asks for, so there
+        // is one place that reports it rather than two.
     }
 }
 
@@ -484,6 +531,110 @@ mod tests {
         // No region has been placed yet, so the listing is empty — but it is an *answer*, which
         // is what the fixed cluster id was preventing.
         assert_eq!(run(&options), Ok(()));
+    }
+
+    /// **The paged walk**, over more regions than one `GetRegion` round trip each would be worth.
+    ///
+    /// Sixty contiguous regions in PD's table, listed in one command. What is asserted is that the
+    /// walk returns them all, in key order, and that it composes a partition — the check the old
+    /// per-key walk got for free from PD answering "no region".
+    #[test]
+    fn ls_pages_the_whole_routing_table_in_key_order() {
+        use esker_proto::{Epoch, Peer, Region};
+
+        let pd = TestPd::start(1);
+        let count = 60_u64;
+        for index in 0..count {
+            let start = if index == 0 {
+                bytes::Bytes::new()
+            } else {
+                bytes::Bytes::from(format!("k{index:03}"))
+            };
+            let end = if index == count - 1 {
+                bytes::Bytes::new()
+            } else {
+                bytes::Bytes::from(format!("k{:03}", index + 1))
+            };
+            pd.pd()
+                .region_heartbeat(&esker_pd::RegionBeat {
+                    region: Region {
+                        id: index + 1,
+                        start_key: start,
+                        end_key: end,
+                        peers: vec![Peer::voter(1, index + 10)],
+                        epoch: Epoch::new(1, index + 1),
+                    },
+                    leader_peer_id: index + 10,
+                    term: 1,
+                    approximate_size: 0,
+                    applied_index: 0,
+                })
+                .expect("the heartbeat is recorded");
+        }
+
+        let connection = PdConn::connect(pd.addr().parse().unwrap()).unwrap();
+        let found = super::walk(&connection).expect("the walk lists the table");
+        assert_eq!(
+            found.len(),
+            usize::try_from(count).unwrap(),
+            "the walk lost regions"
+        );
+
+        // **The point of the unit**, and the count is the only place it is visible. The walk this
+        // replaced asked `GetRegion` once per region.
+        //
+        // Two calls rather than one, because the *first* call of a session is refused with the
+        // cluster id and retried — `PdConn`'s documented discovery round trip, which every command
+        // here pays once. So the listing itself is one call, and a second listing on the same
+        // connection proves it: one more, not sixty-one more.
+        assert_eq!(
+            pd.calls("Pd::ScanRegions"),
+            2,
+            "sixty regions took {} scans, discovery included",
+            pd.calls("Pd::ScanRegions"),
+        );
+        let again = super::walk(&connection).expect("a second listing");
+        assert_eq!(again.len(), found.len());
+        assert_eq!(
+            pd.calls("Pd::ScanRegions"),
+            3,
+            "a warm listing of sixty regions cost more than one call"
+        );
+        assert_eq!(
+            pd.calls("Pd::GetRegion"),
+            0,
+            "the listing still asks about regions one key at a time"
+        );
+
+        let mut expected = bytes::Bytes::new();
+        for (region, leader, stores) in &found {
+            assert_eq!(
+                region.start_key, expected,
+                "region {} is out of order or leaves a gap",
+                region.id
+            );
+            expected = region.end_key.clone();
+            assert_eq!(*leader, Some(region.peers[0].peer_id));
+            assert_eq!(
+                stores.len(),
+                1,
+                "a region was shown the page's whole store list rather than its own peers'"
+            );
+        }
+        assert!(
+            expected.is_empty(),
+            "the last region does not close the key space"
+        );
+
+        // And the command itself runs, which is the thing an operator types.
+        assert_eq!(
+            run(&RegionOptions {
+                pd: pd.addr(),
+                command: RegionCommand::Ls,
+                hex: false,
+            }),
+            Ok(())
+        );
     }
 
     /// A key is bytes and a terminal is not. Escaped by default, hex on request, and never the

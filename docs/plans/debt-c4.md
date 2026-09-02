@@ -269,3 +269,50 @@ nineteen billion seconds and reading as a hung operator.
 The reverse-dependent gate earned its keep immediately: a new `PdReq` variant broke an exhaustive
 match in `crates/esker-store/tests/pd_client.rs`, a crate this unit does not otherwise touch.
 
+## 6. `region ls` walked the key space one `GetRegion` at a time
+
+Inventory #15. `docs/plans/phase-4.md` §14.6, bullet 3.
+
+`GetRegion` is the routing question a *client* asks: one key, one region. `esker region ls` had
+nothing else to ask, so it walked — ask for `""`, take the region's end key, ask again — which is
+correct and is `O(regions)` round trips. Measured, with the walk restored under the new test:
+**61 `GetRegion` calls for 60 regions**.
+
+`Pd::ScanRegions` (method `0x030a`) answers a page of the routing table in **key** order.
+
+* **Paged, not whole.** A cluster's region count grows with its data, and a single frame carrying
+  all of them is a message whose size nobody chose. `limit` of zero means the server's default
+  (128) and the server caps it at 1024 either way: a caller's limit is a request, never an
+  instruction. Fewer regions than the limit means the end of the table, so no separate flag says
+  when to stop.
+* **The store table is sent once per page**, deduplicated, rather than per region. `GetRegion`
+  answers about one region and has nothing to deduplicate against, which is why the two response
+  shapes differ rather than one being reused.
+* **The scan starts at the region *containing* `start_key`**, not the one after it, so continuing
+  from the previous page's end key lands on the region that starts there. The key-ordered range
+  index — the one `lookup` already seeks into — is what makes that a seek and a walk rather than a
+  sort of the id-ordered records.
+* **`ScanRegions` is not exempt from the cluster-id gate**, unlike `Status`: it reads the routing
+  table, which is cluster-scoped, and a scan addressed to another cluster is the same mistake
+  `GetRegion` is checked for.
+
+**The walk's contiguity check survives the change, and that is the part worth keeping.** The old
+shape got it for free — a gap answered "no region" — while a page of records has to check it
+explicitly. `region ls` now checks that each region starts exactly where the previous one ended,
+**across page boundaries as well as within one**, and reports a gap or an overlap rather than
+rendering it tidily.
+
+Tests: `crates/esker-pd/tests/loopback.rs::fifty_regions_come_back_in_key_order_a_page_at_a_time`
+over a real socket — fifty regions in one page, the same fifty seven at a time with the pages
+matching one call exactly, a limit above the cap clamped rather than refused, and a scan from the
+middle of a key starting at the region that contains it. `crates/esker-cli/src/region.rs`'s
+`ls_pages_the_whole_routing_table_in_key_order` lists sixty regions and asserts the **round-trip
+count**, which is the only place the change is visible: 2 calls including `PdConn`'s documented
+cluster-id discovery, and 1 for the second listing on the same connection — against 61 before.
+`TestPd` grew a counting service for it, because a claim about round trips that no test can see
+stops being true the moment somebody reintroduces a loop.
+
+Golden bytes for the request and the response, derived independently again. The response golden
+carries two regions that meet and one store shared by both, so it pins the contiguity the caller
+checks and the deduplication the shape exists for.
+

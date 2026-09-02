@@ -396,6 +396,34 @@ impl OperatorStatus {
     }
 }
 
+/// One region as a scan reports it: the region, and the peer PD last heard was leading it.
+///
+/// **No store list per region**, unlike [`PdResp::GetRegion`]. A scan returns many regions on a
+/// cluster whose stores number in the tens, so the addresses are sent **once** for the whole page
+/// ([`PdResp::ScanRegions::stores`]) rather than repeated per region. `GetRegion` answers about one
+/// region and has nothing to deduplicate against, which is why the two shapes differ.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScannedRegion {
+    /// The region: its range, its peers and its epoch.
+    pub region: Region,
+    /// The peer PD last heard was leading it; zero when PD has heard from no leader.
+    pub leader_peer_id: u64,
+}
+
+impl ScannedRegion {
+    fn encode(&self, out: &mut Encoder) {
+        self.region.encode(out);
+        out.put_varint(self.leader_peer_id);
+    }
+
+    fn decode(input: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        Ok(Self {
+            region: Region::decode(input)?,
+            leader_peer_id: input.get_varint("scan.leader_peer_id")?,
+        })
+    }
+}
+
 /// Anything a caller asks the placement driver.
 ///
 /// The heartbeat field sets are the ones `docs/plans/phase-4.md` §3.2 pins, so the store's
@@ -498,6 +526,28 @@ pub enum PdReq {
     /// Read-only and inbound like every other method here — a status request changes nothing,
     /// which is what makes it safe to point at a production driver.
     Status,
+
+    /// A page of the routing table, in **key** order, starting at `start_key`.
+    ///
+    /// [`PdReq::GetRegion`] is the routing question a *client* asks: one key, one region. A tool
+    /// that wants the whole table had to ask it once per region — take a region's end key, ask
+    /// again — which is correct and is `O(regions)` round trips.
+    ///
+    /// **Paged rather than whole**, because a response has to be bounded by something other than
+    /// hope: a cluster's region count grows with its data, and a single frame carrying all of them
+    /// is a message whose size nobody chose. A caller that wants everything asks again from the
+    /// last region's end key, which is the same walk as before with a much larger stride.
+    ScanRegions {
+        /// Where to start, in **user** key space. Empty is the beginning of the key space.
+        ///
+        /// The region *containing* this key is the first one returned, not the one after it — so
+        /// a caller continuing a scan passes the previous page's last end key and gets the region
+        /// that starts there.
+        start_key: Bytes,
+        /// How many regions at most. Zero asks for the server's default, and the server caps it
+        /// either way: a limit is a request, never an instruction.
+        limit: u32,
+    },
 }
 
 impl PdReq {
@@ -514,6 +564,7 @@ impl PdReq {
             Self::SchemaLease => Method::PdSchemaLease,
             Self::ReportColumnar { .. } => Method::PdReportColumnar,
             Self::Status => Method::PdStatus,
+            Self::ScanRegions { .. } => Method::PdScanRegions,
         }
     }
 
@@ -553,6 +604,10 @@ impl PdReq {
             Self::Tso { count } => out.put_varint(u64::from(*count)),
             // No fields, so nothing to write. The method is the whole request, for both of these.
             Self::SchemaLease | Self::Status => {}
+            Self::ScanRegions { start_key, limit } => {
+                out.put_bytes(start_key);
+                out.put_varint(u64::from(*limit));
+            }
             Self::ReportColumnar { wishes } => {
                 out.put_varint(wishes.len() as u64);
                 for wish in wishes {
@@ -595,6 +650,10 @@ impl PdReq {
             },
             Method::PdSchemaLease => Self::SchemaLease,
             Method::PdStatus => Self::Status,
+            Method::PdScanRegions => Self::ScanRegions {
+                start_key: Bytes::copy_from_slice(input.get_bytes("scan.start_key")?),
+                limit: input.get_varint_u32("scan.limit")?,
+            },
             Method::PdReportColumnar => {
                 let count = input.get_count("columnar.wishes")?;
                 let mut wishes = Vec::with_capacity(count.min(1024));
@@ -700,6 +759,19 @@ pub enum PdResp {
         removal_extra_ms: u64,
     },
 
+    /// A page of the routing table, in key order.
+    ScanRegions {
+        /// The regions, contiguous and in key order. Fewer than the limit asked for means the end
+        /// of the table — which is how a caller knows to stop without a separate flag.
+        regions: Vec<ScannedRegion>,
+        /// Every store hosting a peer of any region in this page, deduplicated.
+        ///
+        /// Sent with the page rather than per region for the reason [`ScannedRegion`] gives, and
+        /// sent at all for the reason [`PdResp::GetRegion`] sends its own: a caller addresses a
+        /// store by id and *"resolving one to a socket is PD's job"* (`docs/DESIGN.md` §10).
+        stores: Vec<StoreInfo>,
+    },
+
     /// What the placement driver is doing right now.
     Status {
         /// PD's own clock, so a caller can turn `issued_ms` into an age without holding an
@@ -727,6 +799,7 @@ impl PdResp {
             Self::SchemaLease { .. } => Method::PdSchemaLease,
             Self::ReportColumnar => Method::PdReportColumnar,
             Self::Status { .. } => Method::PdStatus,
+            Self::ScanRegions { .. } => Method::PdScanRegions,
         }
     }
 
@@ -780,6 +853,16 @@ impl PdResp {
                     status.encode(out);
                 }
             }
+            Self::ScanRegions { regions, stores } => {
+                out.put_varint(regions.len() as u64);
+                for region in regions {
+                    region.encode(out);
+                }
+                out.put_varint(stores.len() as u64);
+                for store in stores {
+                    store.encode(out);
+                }
+            }
         }
     }
 
@@ -819,6 +902,19 @@ impl PdResp {
                 start_ts: input.get_varint("tso.start_ts")?,
                 count: input.get_varint_u32("tso.count")?,
             },
+            Method::PdScanRegions => {
+                let count = input.get_count("scan.regions")?;
+                let mut regions = Vec::with_capacity(count);
+                for _ in 0..count {
+                    regions.push(ScannedRegion::decode(input)?);
+                }
+                let count = input.get_count("scan.stores")?;
+                let mut stores = Vec::with_capacity(count);
+                for _ in 0..count {
+                    stores.push(StoreInfo::decode(input)?);
+                }
+                Self::ScanRegions { regions, stores }
+            }
             Method::PdStatus => {
                 let now_ms = input.get_varint("status.now_ms")?;
                 let count = input.get_count("status.operators")?;
@@ -1063,6 +1159,27 @@ impl PdChannel {
                 removal_extra_ms,
             } => Ok((lease_ms, step_interval_ms, removal_extra_ms)),
             other => Err(mismatch("SchemaLease", &other)),
+        }
+    }
+
+    /// A page of the routing table in key order, starting at `start_key`.
+    ///
+    /// `limit` of zero asks for the server's default. Fewer regions than the limit means the end
+    /// of the table; a caller continuing a scan passes the last region's end key.
+    pub async fn scan_regions(
+        &self,
+        start_key: impl Into<Bytes>,
+        limit: u32,
+    ) -> Result<(Vec<ScannedRegion>, Vec<StoreInfo>), ProtoError> {
+        let response = self
+            .call(PdReq::ScanRegions {
+                start_key: start_key.into(),
+                limit,
+            })
+            .await?;
+        match response {
+            PdResp::ScanRegions { regions, stores } => Ok((regions, stores)),
+            other => Err(mismatch("ScanRegions", &other)),
         }
     }
 
