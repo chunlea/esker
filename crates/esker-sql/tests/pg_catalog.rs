@@ -133,8 +133,10 @@ fn every_catalog_answer_is_postgresql_19_s() {
 fn activerecord_s_four_type_map_queries_answer() {
     let mut node = parity::Node::new(&[]);
 
-    // 4 — the first query `AbstractAdapter` ever sends. Four of its ten names are types this
-    // node has, and the other six are the declared divergence.
+    // 4 — the first query `AbstractAdapter` ever sends. **Six** of its ten names are types this
+    // node has, and the other four are the declared divergence. The count has risen with each of
+    // tier 1's types and the rows were never edited to match: `CatalogView::rows` is derived from
+    // `ColumnType::ALL`, so the catalog grows on its own and this assertion is what notices.
     assert_eq!(
         node.rows(
             "SELECT t.oid, t.typname FROM pg_type as t WHERE t.typname IN ('int2', 'int4', \
@@ -145,10 +147,9 @@ fn activerecord_s_four_type_map_queries_answer() {
             vec!["20", "int8"],
             // `smallint` arrived with tier 1's fourth type, and is in ActiveRecord's list of ten.
             vec!["21", "int2"],
-            // `int4` arrived with ADR 0033 and the catalog grew a row for it without being
-            // touched, because `CatalogView::rows` is derived from `ColumnType::ALL`. Five of
-            // this query's ten names are answered now where four were.
             vec!["23", "int4"],
+            // `float4` is `real` in a `CREATE TABLE`, and is what `ActiveRecord` maps to `Float`.
+            vec!["700", "float4"],
             vec!["701", "float8"],
             // `timestamp` is in ActiveRecord's list of ten and arrived with tier 1's third type.
             vec!["1114", "timestamp"],
@@ -156,8 +157,9 @@ fn activerecord_s_four_type_map_queries_answer() {
         ]
     );
 
-    // 7 — the `LEFT JOIN pg_range` one, with `ON oid = rngtypid` unqualified. All six types are
-    // in its list of forty names, and none of them is a range, so every `rngsubtype` is NULL.
+    // 7 — the `LEFT JOIN pg_range` one, with `ON oid = rngtypid` unqualified. Every type this
+    // node has is in its list of forty names, and none of them is a range, so every `rngsubtype`
+    // is NULL.
     let seven = node.rows(
         "SELECT t.oid, t.typname, t.typelem, t.typdelim, t.typinput, r.rngsubtype, t.typtype, \
          t.typbasetype FROM pg_type as t LEFT JOIN pg_range as r ON oid = rngtypid WHERE \
@@ -176,6 +178,7 @@ fn activerecord_s_four_type_map_queries_answer() {
             vec!["21", "int2", "0", ",", "int2in", "\\N", "b", "0"],
             vec!["23", "int4", "0", ",", "int4in", "\\N", "b", "0"],
             vec!["25", "text", "0", ",", "textin", "\\N", "b", "0"],
+            vec!["700", "float4", "0", ",", "float4in", "\\N", "b", "0"],
             vec!["701", "float8", "0", ",", "float8in", "\\N", "b", "0"],
             vec!["1043", "varchar", "0", ",", "varcharin", "\\N", "b", "0"],
             vec![

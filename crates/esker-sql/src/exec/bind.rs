@@ -434,5 +434,6 @@ fn placeholder(ty: ColumnType) -> Datum {
         ColumnType::TimestampTz => Datum::TimestampTz(0),
         ColumnType::Timestamp => Datum::Timestamp(0),
         ColumnType::Double => Datum::Double(0.0),
+        ColumnType::Real => Datum::Real(0.0),
     }
 }

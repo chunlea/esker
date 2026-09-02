@@ -15,6 +15,7 @@ pub(crate) mod bitpack;
 pub(crate) mod boolean;
 pub(crate) mod bytes;
 pub(crate) mod double;
+pub(crate) mod float;
 pub(crate) mod integer;
 
 use esker_base::varint;
@@ -44,6 +45,7 @@ pub fn encode_column(column: &Column) -> Result<(Encoding, Vec<u8>)> {
     let (encoding, body) = match column.data() {
         ColumnData::Ints(values) => integer::encode(values),
         ColumnData::Doubles(values) => double::encode(values),
+        ColumnData::Floats(values) => float::encode(values),
         ColumnData::Bools(values) => {
             let mut out = Vec::new();
             let layout = boolean::encode_smaller(values, &mut out);
@@ -142,6 +144,7 @@ pub fn decode_column(
         | ColumnType::Int4
         | ColumnType::Int2 => ColumnData::Ints(integer::decode(encoding, &mut cursor, present)?),
         ColumnType::Double => ColumnData::Doubles(double::decode(encoding, &mut cursor, present)?),
+        ColumnType::Real => ColumnData::Floats(float::decode(encoding, &mut cursor, present)?),
         ColumnType::Bool => {
             let layout = boolean::BoolLayout::from_encoding(encoding)?;
             ColumnData::Bools(boolean::decode_with(
@@ -239,6 +242,9 @@ mod tests {
             ColumnType::Int8 => any::<i64>().prop_map(Value::Int8).boxed(),
             ColumnType::Int4 => any::<i32>().prop_map(Value::Int4).boxed(),
             ColumnType::Int2 => any::<i16>().prop_map(Value::Int2).boxed(),
+            ColumnType::Real => any::<u32>()
+                .prop_map(|bits| Value::Real(f32::from_bits(bits)))
+                .boxed(),
             ColumnType::Timestamp => (-1_000i64..1_000)
                 .prop_map(|d| Value::Timestamp(757_382_400_000_000 + d * 1_000))
                 .boxed(),

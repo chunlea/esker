@@ -38,6 +38,16 @@ mod tests {
             ColumnType::Int8 => any::<i64>().prop_map(Datum::Int8).boxed(),
             ColumnType::Int4 => any::<i32>().prop_map(Datum::Int4).boxed(),
             ColumnType::Int2 => any::<i16>().prop_map(Datum::Int2).boxed(),
+            // Weighted towards the ties, as `Double` is: PostgreSQL has fewer floats than IEEE
+            // does at either width, and it is the ties an encoding gets wrong.
+            ColumnType::Real => prop_oneof![
+                7 => any::<f32>().prop_map(Datum::Real),
+                3 => proptest::sample::select(vec![
+                    0.0f32, -0.0, f32::NAN, -f32::NAN, f32::INFINITY, f32::NEG_INFINITY,
+                ])
+                .prop_map(Datum::Real),
+            ]
+            .boxed(),
             ColumnType::Text | ColumnType::Varchar => ".{0,32}".prop_map(Datum::Text).boxed(),
             ColumnType::Bool => any::<bool>().prop_map(Datum::Bool).boxed(),
             ColumnType::Bytea => proptest::collection::vec(any::<u8>(), 0..32)

@@ -77,6 +77,7 @@ fn column_type(name: &str) -> ColumnType {
         "bytea" => ColumnType::Bytea,
         "timestamptz" => ColumnType::TimestampTz,
         "float8" => ColumnType::Double,
+        "real" => ColumnType::Real,
         other => panic!("the fixture names a type this crate does not have: {other}"),
     }
 }

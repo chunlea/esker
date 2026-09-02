@@ -57,6 +57,7 @@ fn encode_row(values: &[Value]) -> Vec<u8> {
             }
             Value::Int4(v) => out.extend_from_slice(&v.to_le_bytes()),
             Value::Int2(v) => out.extend_from_slice(&v.to_le_bytes()),
+            Value::Real(v) => out.extend_from_slice(&v.to_le_bytes()),
             Value::Double(v) => out.extend_from_slice(&v.to_le_bytes()),
             Value::Bool(v) => out.push(u8::from(*v)),
             Value::Text(v) => {

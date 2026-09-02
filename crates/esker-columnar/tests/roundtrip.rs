@@ -90,6 +90,9 @@ fn value_of(ty: ColumnType) -> impl Strategy<Value = Value> {
         ColumnType::Int8 => any::<i64>().prop_map(Value::Int8).boxed(),
         ColumnType::Int4 => any::<i32>().prop_map(Value::Int4).boxed(),
         ColumnType::Int2 => any::<i16>().prop_map(Value::Int2).boxed(),
+        ColumnType::Real => any::<u32>()
+            .prop_map(|bits| Value::Real(f32::from_bits(bits)))
+            .boxed(),
         ColumnType::Timestamp => (-5_000i64..5_000)
             .prop_map(|d| Value::Timestamp(757_382_400_000_000 + d * 1_000))
             .boxed(),
@@ -216,15 +219,8 @@ proptest! {
         let options = WriterOptions { stripe_rows, ..WriterOptions::default() };
         let back = write_and_read(&schema, &rows, options);
         prop_assert_eq!(back.len(), rows.len());
-        for (before, after) in rows.iter().zip(&back) {
-            for (a, b) in before.iter().zip(after) {
-                let same = match (a, b) {
-                    // NaN is not equal to itself, so a double is compared by bits.
-                    (Value::Double(x), Value::Double(y)) => x.to_bits() == y.to_bits(),
-                    _ => a == b,
-                };
-                prop_assert!(same, "{:?} became {:?}", a, b);
-            }
+        if let Err(why) = same_rows(&rows, &back) {
+            prop_assert!(false, "{}", why);
         }
     }
 
@@ -240,5 +236,29 @@ proptest! {
         };
         let back = write_and_read(&schema, &rows, options);
         prop_assert_eq!(back.len(), rows.len());
+        if let Err(why) = same_rows(&rows, &back) {
+            prop_assert!(false, "{}", why);
+        }
     }
+}
+
+/// Whether every value came back, **comparing floats by bits**.
+///
+/// `==` would say a `NaN` column differs from itself, so a value comparison would fail for every
+/// `NaN` and a `PartialEq` that skipped them would pass for a payload the storage path had
+/// dropped. Both mistakes have been made here; this is the comparison that makes neither.
+fn same_rows(before: &[Vec<Value>], after: &[Vec<Value>]) -> Result<(), String> {
+    for (row, (before, after)) in before.iter().zip(after).enumerate() {
+        for (a, b) in before.iter().zip(after) {
+            let same = match (a, b) {
+                (Value::Double(x), Value::Double(y)) => x.to_bits() == y.to_bits(),
+                (Value::Real(x), Value::Real(y)) => x.to_bits() == y.to_bits(),
+                _ => a == b,
+            };
+            if !same {
+                return Err(format!("row {row}: {a:?} became {b:?}"));
+            }
+        }
+    }
+    Ok(())
 }

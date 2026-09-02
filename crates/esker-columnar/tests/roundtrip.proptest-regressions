@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 5a286ad35980d90b521bf0c7bb21716967678ffd067b1817a4b74cf54ad0c232 # shrinks to (schema, rows) = (Schema { columns: [ColumnDef { name: "c0", ty: Int4 }, ColumnDef { name: "c1", ty: Text }] }, [[Int4(-1779), Null]])
 cc 99e84a92932f2979b98705db30575a3c67833c123e2ec80ee1328c41cc45ca66 # shrinks to (schema, rows) = (Schema { columns: [ColumnDef { name: "c0", ty: Int4 }, ColumnDef { name: "c1", ty: TimestampTz }, ColumnDef { name: "c2", ty: Double }, ColumnDef { name: "c3", ty: Int8 }] }, [[Int4(0), TimestampTz(757382400005000), Double(NaN), Int8(-8196973576451524065)]]), stripe_rows = 35
+cc dab517880e637225e459c8e4a8675130aaaf350469bb09306e4b65e6de67e3ca # shrinks to (schema, rows) = (Schema { columns: [ColumnDef { name: "c0", ty: Real }, ColumnDef { name: "c1", ty: Timestamp }, ColumnDef { name: "c2", ty: Bool }, ColumnDef { name: "c3", ty: Text }] }, [[Real(NaN), Null, Null, Null]]), stripe_rows = 33

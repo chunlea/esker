@@ -157,6 +157,32 @@ this is reported rather than assumed: the store's two arms are mechanical (`Stor
 one four-byte framing. Every tier-2 type will need the same fourth edit, and this section is here
 so the next one budgets for it.
 
+### What this section missed a second time, found by building `real`
+
+**A tier-1 type did need a new columnar encoding after all.** The argument above is that these
+types are not format *additions* because the row codec has no per-value tag and the columnar tag
+byte is append-only. Both are still true, and both are about how a value is *labelled*. `real` is
+the type where how a value is *stored* also had to change.
+
+It was built the way `int4` and `int2` were — widened into the run one size up, `Doubles`, and
+narrowed on read. For an integer that is a bit operation and loses nothing. For a float it is not:
+`f32 → f64 → f32` is exact for every finite value and both infinities and **unspecified for a
+`NaN` payload**, which the Rust reference declines to promise, the machine this was built on
+preserves, and an x86 `cvtss2sd` quiets. The row codec had meanwhile been writing `to_le_bytes`
+all along, so the two storage paths for one type would have disagreed on exactly the values the
+differential harness exists to compare — on some targets and not others.
+
+So `real` has `ColumnData::Floats` and `crates/esker-columnar/src/encode/float.rs`, four bytes
+wide. This is still not a format change: no file written before this ADR has a `real` column,
+because the tag did not exist. It is a **new encoding inside an additive tag**, which is the thing
+the roadmap below lists as tier 2's hallmark, arriving one tier early.
+
+The rule the next type should take from this: *a type whose values are a subset of a wider type's
+may share its run only if the widening is a bit operation.* Integers qualify. Floats do not.
+Nothing in tier 2 or 3 is a float, so this is a rule about `real` alone — but it is the second time
+this ADR's "no new storage" has needed a footnote, and a third would mean the claim is the wrong
+way to define the tier.
+
 ## Consequences
 
 * `ColumnType::ALL` goes from six to twelve, and every `match` over it is a compile error until it

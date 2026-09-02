@@ -29,7 +29,7 @@
 //! index key's leading byte, in a `DataRow`'s -1 length. Keeping them in one type is what lets a
 //! single `match` be exhaustive over what a column can hold.
 
-mod float;
+pub(crate) mod float;
 mod timestamp;
 
 use std::cmp::Ordering;
@@ -73,6 +73,7 @@ impl PgType for ColumnType {
             ColumnType::Int4 => 23,
             ColumnType::Text => 25,
             ColumnType::Varchar => 1043,
+            ColumnType::Real => 700,
             ColumnType::Double => 701,
             ColumnType::Timestamp => 1114,
             ColumnType::TimestampTz => 1184,
@@ -91,13 +92,14 @@ impl PgType for ColumnType {
             ColumnType::TimestampTz => "timestamp with time zone",
             ColumnType::Timestamp => "timestamp without time zone",
             ColumnType::Double => "double precision",
+            ColumnType::Real => "real",
         }
     }
 
     fn type_len(self) -> i16 {
         match self {
             ColumnType::Bool => 1,
-            ColumnType::Int4 => 4,
+            ColumnType::Int4 | ColumnType::Real => 4,
             ColumnType::Int2 => 2,
             ColumnType::Int8
             | ColumnType::TimestampTz
@@ -182,6 +184,7 @@ impl PgDatum for Datum {
             // No offset, which is the whole visible difference between the two types.
             Datum::Timestamp(v) => timestamp::to_text_without_zone(*v),
             Datum::Double(v) => float::to_text(*v),
+            Datum::Real(v) => float::to_text_f32(*v),
         })
     }
 
@@ -196,6 +199,7 @@ impl PgDatum for Datum {
             ColumnType::TimestampTz => Datum::TimestampTz(timestamp::from_text(text)?),
             ColumnType::Timestamp => Datum::Timestamp(timestamp::from_text_without_zone(text)?),
             ColumnType::Double => Datum::Double(float::from_text(text)?),
+            ColumnType::Real => Datum::Real(float::from_text_f32(text)?),
         })
     }
 
@@ -209,6 +213,7 @@ impl PgDatum for Datum {
             Datum::Int2(v) => v.to_be_bytes().to_vec(),
             Datum::Bool(v) => vec![u8::from(*v)],
             Datum::Double(v) => v.to_be_bytes().to_vec(),
+            Datum::Real(v) => v.to_be_bytes().to_vec(),
             Datum::Text(v) => v.as_bytes().to_vec(),
             Datum::Bytea(v) => v.clone(),
         })
@@ -240,6 +245,10 @@ impl PgDatum for Datum {
             ColumnType::Int4 => {
                 let head: [u8; 4] = fixed(4)?.try_into().unwrap_or([0; 4]);
                 Datum::Int4(i32::from_be_bytes(head))
+            }
+            ColumnType::Real => {
+                let head: [u8; 4] = fixed(4)?.try_into().unwrap_or([0; 4]);
+                Datum::Real(f32::from_be_bytes(head))
             }
             ColumnType::Int2 => {
                 let head: [u8; 2] = fixed(2)?.try_into().unwrap_or([0; 2]);
@@ -290,6 +299,10 @@ impl PgDatum for Datum {
             (Datum::Bool(a), Datum::Bool(b)) => a.cmp(b),
             (Datum::Bytea(a), Datum::Bytea(b)) => a.cmp(b),
             (Datum::Double(a), Datum::Double(b)) => float::pg_cmp(*a, *b),
+            (Datum::Real(a), Datum::Real(b)) => float::pg_cmp_f32(*a, *b),
+            // The two float widths compare as one type, as the integers do.
+            (Datum::Real(a), Datum::Double(b)) => float::pg_cmp(f64::from(*a), *b),
+            (Datum::Double(a), Datum::Real(b)) => float::pg_cmp(*a, f64::from(*b)),
             (a, b) => variant_rank(a).cmp(&variant_rank(b)),
         }
     }
@@ -306,7 +319,7 @@ fn variant_rank(value: &Datum) -> u8 {
         // The two integer widths share a rank: they are one type to a comparison, and `pg_cmp`
         // answers the pair above rather than falling through to here.
         Datum::Int8(_) | Datum::Int4(_) | Datum::Int2(_) => 1,
-        Datum::Double(_) => 2,
+        Datum::Double(_) | Datum::Real(_) => 2,
         Datum::TimestampTz(_) | Datum::Timestamp(_) => 3,
         Datum::Text(_) => 4,
         Datum::Bytea(_) => 5,

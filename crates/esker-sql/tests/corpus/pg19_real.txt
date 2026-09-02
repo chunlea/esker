@@ -1,0 +1,47 @@
+# `real` / `float4`, as a real PostgreSQL 19beta1 answers it — tier 1's fifth type
+# ([ADR 0033](../../../../docs/adr/0033-tier-1-of-the-type-surface.md)).
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way against one node.
+# It builds its own table.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# WHAT MAKES IT A TYPE AND NOT AN ALIAS FOR `double precision`: the **text**, and the range.
+#
+#   * `float4out` prints the shortest digits that round-trip **as an f32**, so `1.0/3.0` is
+#     `0.33333334` where a `float8` says `0.3333333333333333`. Storing a `real` as a `double`
+#     would print seventeen digits a real server never wrote.
+#   * **underflow is an error, not a zero.** `1e-50` is `22003` here where a `float8` holds it as
+#     a denormal. Both ends raise, and the message **quotes the value expanded to plain decimal** —
+#     `1e40` comes back as forty-one digits — because the literal is a `numeric` on its way in and
+#     that is `numeric`'s own text.
+#
+# The two rules it shares with `float8` and does not re-derive: `-0.0` is stored as `0` (the
+# literal goes through `numeric`, which has no signed zero), and `NaN` sorts **above** every
+# number, so `n > 0` returns it and `max` is `NaN`.
+CREATE TABLE r4 (id int8 PRIMARY KEY, n real, m float4, d float8)		-
+INSERT INTO r4 VALUES (1, 0.1, 0.1, 0.1)		-
+INSERT INTO r4 VALUES (2, 1.5, 1.5, 1.5)		-
+INSERT INTO r4 VALUES (3, -0.0, 0.0, 0.0)		-
+INSERT INTO r4 VALUES (4, 'NaN', 'Infinity', '-Infinity')		-
+INSERT INTO r4 VALUES (5, 3.4028235e38, -3.4028235e38, 1e308)		-
+SELECT id, n, m, d FROM r4 ORDER BY id	bigint,real,real,double precision	1|0.1|0.1|0.1 ; 2|1.5|1.5|1.5 ; 3|0|0|0 ; 4|NaN|Infinity|-Infinity ; 5|3.4028235e+38|-3.4028235e+38|1e+308
+INSERT INTO r4 VALUES (6, 1e40, 0, 0)	!22003 "10000000000000000000000000000000000000000" is out of range for type real
+INSERT INTO r4 VALUES (6, 'x', 0, 0)	!22P02 invalid input syntax for type real: "x"
+INSERT INTO r4 VALUES (6, 1e-50, 0, 0)	!22003 "0.00000000000000000000000000000000000000000000000001" is out of range for type real
+SELECT id, n FROM r4 WHERE id = 6	bigint,real	-
+SELECT id FROM r4 WHERE n = 1.5	bigint	2
+SELECT id FROM r4 WHERE n = '1.5'	bigint	2
+SELECT id FROM r4 WHERE n = 0	bigint	3
+SELECT id FROM r4 WHERE n > 0 ORDER BY id	bigint	1 ; 2 ; 4 ; 5
+SELECT id FROM r4 WHERE n = 'x'	!22P02 invalid input syntax for type real: "x"
+SELECT count(*), min(n), max(n) FROM r4	bigint,real,real	5|0|NaN
+SELECT id, n FROM r4 ORDER BY n	bigint,real	3|0 ; 1|0.1 ; 2|1.5 ; 5|3.4028235e+38 ; 4|NaN
+SELECT (1.0/3.0)::real	real	0.33333334
+SELECT id FROM r4 WHERE n IS NULL	bigint	-
+UPDATE r4 SET n = 2.5 WHERE id = 1		-
+SELECT id, n FROM r4 WHERE id = 1	bigint,real	1|2.5
+DELETE FROM r4 WHERE id = 6		-
+SELECT count(*) FROM r4	bigint	5

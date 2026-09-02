@@ -1818,6 +1818,7 @@ fn lower_type(data_type: &DataType) -> Result<ColumnType> {
         // with the type as the user wrote it.
         DataType::Int4(None) | DataType::Int(None) | DataType::Integer(None) => ColumnType::Int4,
         DataType::Int2(None) | DataType::SmallInt(None) => ColumnType::Int2,
+        DataType::Float4 | DataType::Real => ColumnType::Real,
         DataType::Text => ColumnType::Text,
         // `character varying` and `varchar` with **no length**. A length is a typmod and this node
         // has no column to keep one on yet, so `varchar(n)` is `0A000` naming itself until the

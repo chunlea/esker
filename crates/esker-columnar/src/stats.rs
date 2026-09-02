@@ -30,7 +30,7 @@ use crate::column::{Column, ColumnData};
 use crate::cursor::Cursor;
 use crate::error::{Error, Result};
 use crate::format::MAX_BOUND_LEN;
-use crate::value::{ColumnType, Value, pg_cmp_f64};
+use crate::value::{ColumnType, Value, pg_cmp_f32, pg_cmp_f64};
 
 /// Bit 0 of `flags`: a minimum is present.
 const FLAG_HAS_MIN: u8 = 1 << 0;
@@ -115,6 +115,9 @@ impl Bound {
             ColumnType::TimestampTz => Value::TimestampTz(i64::from_le_bytes(fixed()?)),
             ColumnType::Timestamp => Value::Timestamp(i64::from_le_bytes(fixed()?)),
             ColumnType::Double => Value::Double(f64::from_le_bytes(fixed()?)),
+            ColumnType::Real => Value::Real(f32::from_le_bytes(
+                <[u8; 4]>::try_from(self.bytes.as_slice()).ok()?,
+            )),
             ColumnType::Bool => Value::Bool(self.as_bool()?),
             ColumnType::Text | ColumnType::Varchar | ColumnType::Bytea => {
                 Value::Bytea(self.bytes.clone())
@@ -207,14 +210,18 @@ impl ColumnStats {
     pub fn of(column: &Column) -> Self {
         let null_count = column.nulls().nulls() as u64;
         let (min, max) = match column.data() {
+            // At the **column's** width, not the run's: `Int4` and `Int2` ride in the widened
+            // integers run, and a bound eight bytes wide is one `Bound::as_value` answers `None`
+            // for — which the scan reads as "no bound" and silently stops pruning with.
             ColumnData::Ints(values) => match (values.iter().min(), values.iter().max()) {
                 (Some(low), Some(high)) => (
-                    Some(Bound::exact(low.to_le_bytes().to_vec())),
-                    Some(Bound::exact(high.to_le_bytes().to_vec())),
+                    Some(Bound::exact(int_bound(*low, column.ty()))),
+                    Some(Bound::exact(int_bound(*high, column.ty()))),
                 ),
                 _ => (None, None),
             },
             ColumnData::Doubles(values) => double_bounds(values),
+            ColumnData::Floats(values) => float_bounds(values),
             ColumnData::Bools(values) => {
                 if values.is_empty() {
                     (None, None)
@@ -256,8 +263,8 @@ impl ColumnStats {
             | ColumnType::TimestampTz
             | ColumnType::Timestamp
             | ColumnType::Double => Some(8),
-            // Its own width, which is what makes it a different type.
-            ColumnType::Int4 => Some(4),
+            // Each at its own width, which is what makes it a different type.
+            ColumnType::Int4 | ColumnType::Real => Some(4),
             ColumnType::Int2 => Some(2),
             ColumnType::Bool => Some(1),
             ColumnType::Text | ColumnType::Varchar | ColumnType::Bytea => None,
@@ -398,6 +405,56 @@ fn double_bounds(values: &[f64]) -> (Option<Bound>, Option<Bound>) {
     )
 }
 
+/// One integer bound, at the width of the column rather than of the run it rides in.
+///
+/// The value came out of the widened `i64` run and was written there by a column of `ty`, so it
+/// fits `ty` by construction; `try_from` is how that is proved rather than assumed, and a value
+/// that somehow did not fit keeps the eight-byte form, where [`ColumnStats::fit`] rejects it
+/// instead of a narrowing silently inventing a bound that excludes real rows.
+fn int_bound(value: i64, ty: ColumnType) -> Vec<u8> {
+    match ty {
+        ColumnType::Int4 => i32::try_from(value).map_or_else(
+            |_| value.to_le_bytes().to_vec(),
+            |narrow| narrow.to_le_bytes().to_vec(),
+        ),
+        ColumnType::Int2 => i16::try_from(value).map_or_else(
+            |_| value.to_le_bytes().to_vec(),
+            |narrow| narrow.to_le_bytes().to_vec(),
+        ),
+        _ => value.to_le_bytes().to_vec(),
+    }
+}
+
+/// The same as [`double_bounds`] one width down, over a `real` column's own four-byte run.
+fn float_bounds(values: &[f32]) -> (Option<Bound>, Option<Bound>) {
+    let mut low: Option<f32> = None;
+    let mut high: Option<f32> = None;
+    for value in values {
+        if low.is_none_or(|current| pg_cmp_f32(*value, current).is_lt()) {
+            low = Some(*value);
+        }
+        if high.is_none_or(|current| pg_cmp_f32(*value, current).is_gt()) {
+            high = Some(*value);
+        }
+    }
+    let (Some(mut low), Some(mut high)) = (low, high) else {
+        return (None, None);
+    };
+
+    // As above: `-0.0 == 0.0` under this ordering, so widen each bound to the side that also
+    // holds for a reader comparing the stored bytes.
+    if low == 0.0 {
+        low = -0.0;
+    }
+    if high == 0.0 {
+        high = 0.0;
+    }
+    (
+        Some(Bound::exact(low.to_le_bytes().to_vec())),
+        Some(Bound::exact(high.to_le_bytes().to_vec())),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
@@ -406,7 +463,7 @@ mod tests {
     use crate::column::Column;
     use crate::cursor::Cursor;
     use crate::format::MAX_BOUND_LEN;
-    use crate::value::{ColumnType, Value, pg_cmp_f64};
+    use crate::value::{ColumnType, Value, pg_cmp_f32, pg_cmp_f64};
 
     fn round_trip(stats: &ColumnStats) -> ColumnStats {
         let mut bytes = Vec::new();
@@ -705,6 +762,12 @@ mod tests {
             ColumnType::Int8 => any::<i64>().prop_map(Value::Int8).boxed(),
             ColumnType::Int4 => any::<i32>().prop_map(Value::Int4).boxed(),
             ColumnType::Int2 => any::<i16>().prop_map(Value::Int2).boxed(),
+            ColumnType::Real => prop_oneof![
+                Just(Value::Real(f32::NAN)),
+                Just(Value::Real(-0.0)),
+                any::<f32>().prop_map(Value::Real),
+            ]
+            .boxed(),
             ColumnType::TimestampTz => any::<i64>().prop_map(Value::TimestampTz).boxed(),
             ColumnType::Timestamp => any::<i64>().prop_map(Value::Timestamp).boxed(),
             ColumnType::Bool => any::<bool>().prop_map(Value::Bool).boxed(),
@@ -772,6 +835,16 @@ mod tests {
                             .as_f64()
                             .is_some_and(|high| pg_cmp_f64(*v, high).is_le())
                 }
+                // Its own four-byte bound, read as its own width; `as_f64` wants eight and would
+                // answer `None`, making this arm vacuously false.
+                Value::Real(v) => {
+                    let read = |bound: &Bound| match bound.as_value(ColumnType::Real) {
+                        Some(Value::Real(value)) => Some(value),
+                        _ => None,
+                    };
+                    read(min).is_some_and(|low| pg_cmp_f32(low, *v).is_le())
+                        && read(max).is_some_and(|high| pg_cmp_f32(*v, high).is_le())
+                }
                 Value::Text(v) => {
                     min.bytes.as_slice() <= v.as_bytes() && v.as_bytes() <= max.bytes.as_slice()
                 }
@@ -788,6 +861,25 @@ mod tests {
     }
 
     proptest! {
+        /// Every type there is, so a type cannot be added to this crate and left without
+        /// statistics that were ever checked. The named tests below stay because a failure that
+        /// names its type is easier to read; this is the one that cannot be forgotten.
+        ///
+        /// It is the test the widened runs needed and did not have: `Int4`, `Int2` and `Real` all
+        /// ride in a run wider than themselves or did, and each wrote a bound at the run's width
+        /// that `Bound::as_value` then answered `None` for — a scan reads that as "no bound" and
+        /// stops pruning, which is slow rather than wrong and so had no other way to be noticed.
+        #[test]
+        fn every_type_s_statistics_hold(
+            (ty, values) in prop::sample::select(ColumnType::ALL.as_slice())
+                .prop_flat_map(|ty| (Just(ty), prop::collection::vec(value_of(ty), 0..60))),
+        ) {
+            let stats = stats_of(ty, &values);
+            if let Err(why) = bounds_hold(ty, &values, &stats) {
+                prop_assert!(false, "{}: {}", ty.name(), why);
+            }
+        }
+
         #[test]
         fn int_statistics_hold(values in prop::collection::vec(value_of(ColumnType::Int8), 0..60)) {
             let stats = stats_of(ColumnType::Int8, &values);

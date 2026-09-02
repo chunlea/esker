@@ -387,6 +387,10 @@ fn literal(rng: &mut Pcg32, ty: ColumnType) -> Value {
             let pool = [0i16, 1, -1, i16::MIN, i16::MAX, 42, -42, 7];
             Value::Int2(pool[rng.below(pool.len() as u32) as usize])
         }
+        ColumnType::Real => {
+            let pool = [0.0f32, 1.5, -1.5, f32::NAN, f32::INFINITY, 0.1, -0.0, 42.0];
+            Value::Real(pool[rng.below(pool.len() as u32) as usize])
+        }
         ColumnType::Timestamp => {
             Value::Timestamp(757_382_400_000_000 + i64::from(rng.below(10_000)))
         }
