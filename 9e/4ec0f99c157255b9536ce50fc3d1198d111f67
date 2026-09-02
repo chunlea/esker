@@ -1,0 +1,19 @@
+crates/esker-store/tests/balance.rs
+  s_40d3c51002c36c::t_cc7bd1bf081a51 235-238,274-296,301-304,312
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "9e4ec0f99c157255b9536ce50fc3d1198d111f67",
+  "prompts": {},
+  "sessions": {
+    "s_40d3c51002c36c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8ff7c235-70a4-4081-9d1d-80947d5f004c",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
