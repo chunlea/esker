@@ -273,3 +273,79 @@ All 22 tests in `crates/esker-client/tests/retry.rs` pass, including the three t
 for the cases that are not progress: `a_redirectable_error_is_retried_exactly_the_documented_number_of_times`,
 `a_read_that_never_gets_an_answer_exhausts_the_budget_and_says_why`, and
 `the_deadline_stops_a_retry_storm_before_the_budget_does`.
+
+## 4. `WalSyncMode::Never` did not disable what it names — and `Interval` was never read at all
+
+Inventory #5. `crates/esker-engine/src/db/write.rs`; the mode in `options.rs`.
+
+### The repro, which is a counter and not a stopwatch
+
+`crates/esker-engine/tests/wal_sync.rs` puts a filesystem that counts `sync_data` per path under
+the engine and writes twenty rows. That is the only way to settle a question about a durability
+knob: a benchmark can be slow for a dozen reasons, and the recorded evidence for this debt was a
+benchmark plus a stack sample. Four assertions, and three were red:
+
+* `per_write_syncs_every_group` — **green**, the control: twenty puts, twenty syncs. The counter
+  works.
+* `never_does_not_sync_a_write_that_only_took_the_default` — **red**: *"a mode that names itself
+  `Never` synced 20 default writes"*. Twenty, not zero.
+* `interval_syncs_in_the_background_without_the_writer_waiting` — **red**, and red at the first
+  assertion: the writer waited for every sync itself.
+* `a_clean_close_syncs_what_the_mode_deferred` — **red** at its *precondition*, for the same reason.
+
+### The mechanism, and why the recorded diagnosis was wrong
+
+One line decided everything:
+
+```rust
+let sync = options.sync || self.options.wal_sync_mode == WalSyncMode::PerWrite;
+```
+
+An **OR**, so the mode could only ever *add* syncing, never remove it. And
+`WriteOptions::default()` was `sync: true`, which `Db::put` and `Db::delete` take — so no write in
+this repository ever left the mode anything to decide. The root cause is a missing state, not a
+wrong comparison: a `bool` can say "durable" and "not durable" but not **"no opinion"**, and
+without a write the policy is entitled to decide, a policy is decoration.
+
+`docs/bench/columnar-learner.md` read a stack sample of this — 2075 of 2114 frames in
+`commit_group`, 31 in the WAL flush — and concluded that "whatever it is waiting on, it is not an
+`fsync`". It was an `fsync`: `wal.writer.sync()` is called from inside `commit_group` under the WAL
+lock, and the sample was reading the syscall's frames as its caller's. The lead was recorded
+honestly and pointed at the right line; only the inference from the sample was wrong.
+
+`Interval(d)` was a second defect hiding behind the first. **Nothing read that variant** — the line
+above compares against `PerWrite` and nothing else — so it was `Never` under another name, and a
+database configured for *bounded* loss had unbounded loss without saying so.
+
+### The fix
+
+[ADR 0036](../adr/0036-a-write-may-have-no-opinion-about-durability.md). `WriteOptions` carries a
+`Durability` — `Policy` (the default), `Durable`, `Buffered` — the precedence lives in one function
+so the mode and the demand cannot drift, `Interval` is a real background thread, and a clean close
+syncs whatever the mode deferred, because these modes trade durability away for a *crash* and an
+orderly shutdown is not one.
+
+Every `WriteOptions { sync: … }` literal in the tree became `synced()` or `unsynced()`, which
+preserves each site's intent exactly because each site had already written down which one it meant.
+
+### Invariant 1, checked rather than asserted
+
+`Durable` outranks every mode, so a caller that demanded durability still gets it. `Buffered` is
+invariant 1's one sanctioned opt-out and stays explicit. What changed is only what a caller with
+*no* opinion gets, and under the default `WalSyncMode::PerWrite` that is what it always was.
+
+**`esker-store` is bit-for-bit what it was**, and that is the audit rather than a hope: the crate
+has no `WriteOptions::default()` write site at all — every write says `synced()` or `unsynced()` —
+so its durability was never resting on this knob. It has always opened its engine `Never` and has
+always done its own syncing.
+
+`esker-engine`: **409 tests, 409 passed**, `crash_kill` included. Store, PD, CLI and client
+together: **691 passed**.
+
+### The numbers
+
+`docs/bench/debt-c3.md`, both from the same command on the same machine minutes apart: 20,000
+single-row applies through `Db::put` on a `Never` database went from **90.37 s to 170.26 ms**, or
+4.5 ms to 8.5 µs per row. **531×**, and the before-number reproduces the recorded 95.94 s almost
+exactly. The columnar half of the same benchmark did not move, because it never touches the
+engine's write path — which is what makes the pair a measurement rather than an anecdote.

@@ -420,7 +420,7 @@ impl PeerCore {
                 self.node
                     .storage()
                     .db()
-                    .write(batch, &WriteOptions { sync: true })?;
+                    .write(batch, &WriteOptions::synced())?;
             }
             if ready.snapshot.is_some() {
                 // Unreachable by construction, and loud because of what it meant when it was not.
@@ -643,7 +643,7 @@ impl PeerCore {
         self.node
             .storage()
             .db()
-            .write(batch, &WriteOptions { sync: true })?;
+            .write(batch, &WriteOptions::synced())?;
         tracing::debug!(
             region_id = self.region_id,
             truncated_to = target,
@@ -735,7 +735,7 @@ impl PeerCore {
         self.node
             .storage()
             .db()
-            .write(batch, &WriteOptions { sync: false })?;
+            .write(batch, &WriteOptions::unsynced())?;
         self.applied_index = entry.index;
 
         // The columnar copy, after the row state and never before it: what it ingests is read back

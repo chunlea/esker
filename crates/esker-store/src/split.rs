@@ -232,7 +232,7 @@ mod tests {
         for key in keys {
             batch.put(cf_id, &prefix::raw_key(&key), b"v");
         }
-        db.write(batch, &WriteOptions { sync: false }).unwrap();
+        db.write(batch, &WriteOptions::unsynced()).unwrap();
     }
 
     fn keys(count: u32) -> Vec<Vec<u8>> {

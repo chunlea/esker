@@ -34,10 +34,7 @@ fn seed(store: &Store, regions: &[Region]) {
     for region in regions {
         meta::stage_region(&mut batch, cf_id, region);
     }
-    store
-        .db()
-        .write(batch, &WriteOptions { sync: true })
-        .unwrap();
+    store.db().write(batch, &WriteOptions::synced()).unwrap();
 }
 
 fn region(id: u64, start: &[u8], end: &[u8], peer_id: u64, epoch: Epoch) -> Region {

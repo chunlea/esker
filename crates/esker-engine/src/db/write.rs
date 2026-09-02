@@ -28,7 +28,7 @@ use std::sync::atomic::Ordering;
 use crate::batch::WriteBatch;
 use crate::dbformat::{EntryKind, SeqNo};
 use crate::error::{Error, Result};
-use crate::options::{WalSyncMode, WriteOptions};
+use crate::options::WriteOptions;
 
 use super::{Db, DbInner, Pending, lock, read_lock};
 
@@ -63,8 +63,7 @@ impl Db {
     /// A `sync = false` write is acknowledged before its bytes reach the device; this is how a
     /// caller that batched many of them makes them all durable at once.
     pub fn sync_wal(&self) -> Result<()> {
-        let mut wal = lock(&self.inner.wal)?;
-        wal.writer.sync()
+        self.inner.sync_wal_now()
     }
 
     fn require_cf(&self, name: &str) -> Result<u32> {
@@ -75,7 +74,12 @@ impl Db {
 impl DbInner {
     fn write(&self, batch: WriteBatch, options: WriteOptions) -> Result<SeqNo> {
         self.check_batch(&batch)?;
-        let sync = options.sync || self.options.wal_sync_mode == WalSyncMode::PerWrite;
+        // The whole precedence rule is [`WriteOptions::wants_sync`], in one place so that the
+        // mode and the per-write demand cannot drift apart. Before debt wave c3 this line was
+        // `options.sync || mode == PerWrite`, an OR that could only ever *add* syncing — and since
+        // `WriteOptions::default()` said `sync: true`, no write in this repository ever left the
+        // mode anything to decide (`docs/plans/debt-c3.md` §4).
+        let sync = options.wants_sync(self.options.wal_sync_mode);
 
         // Before anything is logged: make room, which may switch a memtable, roll the log
         // and stall this writer.
@@ -160,6 +164,50 @@ impl DbInner {
             drop(queue);
             return mine;
         }
+    }
+
+    /// The background WAL syncer: makes the log durable every
+    /// [`WalSyncMode::Interval`](crate::WalSyncMode::Interval), so writers never wait for it.
+    ///
+    /// **This variant used to be read by nothing at all.** The one line that consulted the mode
+    /// compared it against `PerWrite`, so `Interval(d)` behaved exactly like `Never` — a database
+    /// configured for *bounded* loss had unbounded loss and said nothing about it
+    /// (`docs/plans/debt-c3.md` §4).
+    ///
+    /// It waits on the flush condvar rather than sleeping, which is what makes shutdown prompt:
+    /// `Drop` sets `shutdown` under that lock and notifies, so the thread leaves within one wake
+    /// rather than within one interval. The cost is that flush activity can wake it early and it
+    /// syncs sooner than asked — which only ever makes writes durable sooner, and the contract
+    /// this mode offers is an upper bound on what a crash may lose.
+    ///
+    /// A sync that fails is logged and the loop continues. It cannot be reported to a writer,
+    /// because every writer it would concern was acknowledged before it ran; what it must not do
+    /// is stop, since a syncer that exits on one bad sync turns a transient I/O error into the
+    /// unbounded loss this mode exists to avoid.
+    pub(crate) fn wal_sync_loop(&self, interval: std::time::Duration) {
+        while !self.shutdown.load(Ordering::Acquire) {
+            {
+                let Ok(state) = self.flush.lock() else {
+                    return;
+                };
+                let Ok(_guard) = self.flush_wanted.wait_timeout(state, interval) else {
+                    return;
+                };
+            }
+            if self.shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            if let Err(error) = self.sync_wal_now() {
+                tracing::warn!(%error, "the background write-ahead log sync failed");
+            }
+        }
+    }
+
+    /// Makes every buffered log byte durable. The one place that reaches the log to sync it, so
+    /// the background loop, [`Db::sync_wal`] and the close all take the same lock in the same way.
+    pub(crate) fn sync_wal_now(&self) -> Result<()> {
+        let mut wal = lock(&self.wal)?;
+        wal.writer.sync()
     }
 
     /// Writes one group: merge, log, sync, insert, publish. Returns each ticket's sequence

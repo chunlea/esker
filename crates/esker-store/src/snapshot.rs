@@ -356,7 +356,7 @@ pub fn clear_range(db: &Db, region: &Region) -> Result<(), ProtoError> {
             batch.delete_range(cf_id, &low, &high);
         }
     }
-    db.write(batch, &WriteOptions { sync: true })
+    db.write(batch, &WriteOptions::synced())
         .map_err(|error| engine_to_proto(&error))?;
     for (_, name) in SNAPSHOT_CFS {
         db.flush(name).map_err(|error| engine_to_proto(&error))?;
@@ -499,7 +499,7 @@ pub fn stage_pairs(db: &Db, cf_tag: u8, pairs: &[(Bytes, Bytes)]) -> Result<(), 
     for (key, value) in pairs {
         batch.put(cf_id, key, value);
     }
-    db.write(batch, &WriteOptions { sync: false })
+    db.write(batch, &WriteOptions::unsynced())
         .map(|_| ())
         .map_err(|error| engine_to_proto(&error))
 }
@@ -538,7 +538,7 @@ pub fn discard_range(db: &Db, region: &Region) -> Result<u64, ProtoError> {
     if removed > 0 {
         // Synced: the announcement record is removed in a later write, and a crash between the
         // two must not leave the keys behind with nothing pointing at them.
-        db.write(batch, &WriteOptions { sync: true })
+        db.write(batch, &WriteOptions::synced())
             .map_err(|error| engine_to_proto(&error))?;
     }
     Ok(removed)
@@ -738,7 +738,7 @@ mod tests {
             &esker_txn::key::lock(user_key),
             b"lock",
         );
-        db.write(batch, &WriteOptions { sync: false }).unwrap();
+        db.write(batch, &WriteOptions::unsynced()).unwrap();
     }
 
     /// Every batch a read produces, by the column family it names.

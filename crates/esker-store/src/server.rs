@@ -303,7 +303,7 @@ fn discard_interrupted_snapshots(db: &Arc<Db>) -> Result<()> {
             .cf_id(cf::RAFT)
             .ok_or_else(|| StoreError::Bootstrap("the `raft` column family is missing".into()))?;
         meta::stage_snapshot_done(&mut batch, cf_id, region.id);
-        db.write(batch, &WriteOptions { sync: true })?;
+        db.write(batch, &WriteOptions::synced())?;
         tracing::warn!(
             region_id = region.id,
             index,
@@ -2135,7 +2135,7 @@ impl Store {
             // cleared range with nothing to say why.
             let mut batch = WriteBatch::new();
             meta::stage_pending_snapshot(&mut batch, cf_id, &region, index);
-            db.write(batch, &WriteOptions { sync: true })
+            db.write(batch, &WriteOptions::synced())
                 .map_err(|error| crate::error::engine_to_proto(&error))?;
             snapshot::clear_range(&db, &region)
         })
@@ -2175,7 +2175,7 @@ impl Store {
                 &state.encode(),
             );
             meta::stage_snapshot_done(&mut batch, cf_id, region.id);
-            db.write(batch, &WriteOptions { sync: true })
+            db.write(batch, &WriteOptions::synced())
                 .map(|_| ())
                 .map_err(|error| crate::error::engine_to_proto(&error))
         })
@@ -2752,7 +2752,7 @@ fn bootstrap(db: &Arc<Db>, options: &BootstrapOptions<'_>) -> Result<Option<Regi
         .ok_or_else(|| StoreError::Bootstrap("the `raft` column family is missing".into()))?;
     let mut batch = WriteBatch::new();
     meta::stage_region(&mut batch, cf_id, &region);
-    db.write(batch, &WriteOptions { sync: true })?;
+    db.write(batch, &WriteOptions::synced())?;
     tracing::info!(
         store_id = options.store_id,
         region_id = region.id,

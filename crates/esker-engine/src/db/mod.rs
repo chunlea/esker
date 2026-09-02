@@ -74,6 +74,8 @@ pub struct Db {
     compactors: Vec<JoinHandle<()>>,
     /// The uploader, present only when the filesystem has an object tier.
     uploader: Option<JoinHandle<()>>,
+    /// The write-ahead log syncer, present only under [`crate::WalSyncMode::Interval`].
+    syncer: Option<JoinHandle<()>>,
 }
 
 impl Drop for Db {
@@ -104,10 +106,23 @@ impl Drop for Db {
         for handle in self.compactors.drain(..) {
             let _unused = handle.join();
         }
+        if let Some(handle) = self.syncer.take() {
+            let _unused = handle.join();
+        }
         if let Some(handle) = self.flusher.take() {
             // A background thread that panicked has already reported through `flush.error`;
             // there is nothing useful to do with the join result here.
             let _unused = handle.join();
+        }
+        // **The close syncs the log, whatever the mode says.** `Never` and `Interval` trade away
+        // durability *for a crash*, and an orderly shutdown is not one: without this, closing a
+        // database cleanly could lose its most recent writes, which is not a trade either mode
+        // offers. After the syncer has been joined, so nothing is writing behind it.
+        //
+        // Ignored on failure and deliberately: a `Drop` cannot report, the process is going away,
+        // and the log's own recovery is what covers a tail that did not reach the device.
+        if let Err(error) = self.inner.sync_wal_now() {
+            tracing::warn!(%error, "the write-ahead log could not be synced at close");
         }
     }
 }

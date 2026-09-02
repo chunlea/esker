@@ -1299,7 +1299,7 @@ async fn an_interrupted_receive_is_cleared_by_the_restart() {
         // between steps 2 and 4 leaves.
         let mut batch = esker_engine::WriteBatch::new();
         esker_store::meta::stage_pending_snapshot(&mut batch, cf_id, &region, 42);
-        db.write(batch, &esker_engine::WriteOptions { sync: true })
+        db.write(batch, &esker_engine::WriteOptions::synced())
             .unwrap();
         esker_store::snapshot::stage_pairs(
             &db,

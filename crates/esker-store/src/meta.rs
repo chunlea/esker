@@ -328,7 +328,7 @@ mod tests {
         for region in regions {
             stage_region(&mut batch, cf_id, region);
         }
-        db.write(batch, &WriteOptions { sync: true }).unwrap();
+        db.write(batch, &WriteOptions::synced()).unwrap();
     }
 
     #[test]
@@ -464,7 +464,7 @@ mod tests {
             b"not a region",
         );
         batch.put(cf_id, &crate::raft_log::state_key(1), b"not a region");
-        db.write(batch, &WriteOptions { sync: true }).unwrap();
+        db.write(batch, &WriteOptions::synced()).unwrap();
 
         let loaded = load_regions(&db).unwrap();
         assert_eq!(loaded.len(), 1);
@@ -479,7 +479,7 @@ mod tests {
 
         let mut batch = WriteBatch::new();
         stage_removal(&mut batch, cf_id, 1);
-        db.write(batch, &WriteOptions { sync: true }).unwrap();
+        db.write(batch, &WriteOptions::synced()).unwrap();
 
         let loaded = load_regions(&db).unwrap();
         assert_eq!(loaded.iter().map(|r| r.id).collect::<Vec<_>>(), [2]);
@@ -497,7 +497,7 @@ mod tests {
             &crate::raft_log::metadata_key(1),
             &encode_region(&region(2, b"", b"")),
         );
-        db.write(batch, &WriteOptions { sync: true }).unwrap();
+        db.write(batch, &WriteOptions::synced()).unwrap();
 
         let error = load_regions(&db).unwrap_err();
         assert!(error.to_string().contains("says it is region 2"), "{error}");

@@ -523,7 +523,7 @@ fn crash_inside_a_split(dir: &tempfile::TempDir, split_key: &Bytes) {
     let cf_id = db.cf_id(cf::RAFT).unwrap();
     let mut batch = WriteBatch::new();
     meta::stage_region(&mut batch, cf_id, &Region::bootstrap(1, 1, 1));
-    db.write(batch, &WriteOptions { sync: true }).unwrap();
+    db.write(batch, &WriteOptions::synced()).unwrap();
 
     let entries = vec![
         Entry {
@@ -556,7 +556,7 @@ fn crash_inside_a_split(dir: &tempfile::TempDir, split_key: &Bytes) {
         }),
         &entries,
     );
-    db.write(batch, &WriteOptions { sync: true }).unwrap();
+    db.write(batch, &WriteOptions::synced()).unwrap();
     assert_eq!(storage.applied_index(), 0, "the apply index is behind");
 }
 

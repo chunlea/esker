@@ -81,11 +81,11 @@ fn commit(db: &Db, start_ts: u64, commit_ts: u64, mutations: &[TxnMutation]) -> 
 
     let mut batch = WriteBatch::new();
     esker_store::txnkv::prewrite(db, &mut batch, start_ts, &primary, 3_000, mutations).unwrap();
-    db.write(batch, &WriteOptions { sync: false }).unwrap();
+    db.write(batch, &WriteOptions::unsynced()).unwrap();
 
     let mut batch = WriteBatch::new();
     esker_store::txnkv::commit(db, &mut batch, start_ts, commit_ts, &keys).unwrap();
-    db.write(batch, &WriteOptions { sync: false }).unwrap();
+    db.write(batch, &WriteOptions::unsynced()).unwrap();
     keys
 }
 

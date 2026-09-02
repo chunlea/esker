@@ -161,13 +161,14 @@ impl Db {
             snapshots: SnapshotList::new(),
         });
 
-        let (flusher, compactors, uploader) = spawn_background(&inner, &dir_for_error)?;
+        let (flusher, compactors, uploader, syncer) = spawn_background(&inner, &dir_for_error)?;
 
         let db = Self {
             inner,
             flusher: Some(flusher),
             compactors,
             uploader,
+            syncer,
         };
         db.purge_obsolete_files()?;
         Ok(db)
@@ -187,8 +188,14 @@ impl Db {
 /// mid-wait. The pool is bounded rather than one thread per compaction: compaction is
 /// throughput work, and an unbounded pool starves the foreground of the disk
 /// (`docs/DESIGN.md` §4.7).
-/// The flusher, the compaction pool, and the uploader when there is a tier to upload to.
-type Background = (JoinHandle<()>, Vec<JoinHandle<()>>, Option<JoinHandle<()>>);
+/// The flusher, the compaction pool, the uploader when there is a tier to upload to, and the
+/// write-ahead log syncer when the sync mode names an interval.
+type Background = (
+    JoinHandle<()>,
+    Vec<JoinHandle<()>>,
+    Option<JoinHandle<()>>,
+    Option<JoinHandle<()>>,
+);
 
 fn spawn_background(inner: &Arc<DbInner>, dir: &Path) -> Result<Background> {
     let weak = Arc::downgrade(inner);
@@ -237,7 +244,26 @@ fn spawn_background(inner: &Arc<DbInner>, dir: &Path) -> Result<Background> {
         None
     };
 
-    Ok((flusher, compactors, uploader))
+    // Only when the mode names one. A database that syncs per write, or never, does not carry a
+    // thread whose whole job would be to have nothing to do.
+    let syncer = match inner.options.wal_sync_mode {
+        crate::options::WalSyncMode::Interval(interval) => {
+            let weak = Arc::downgrade(inner);
+            Some(
+                std::thread::Builder::new()
+                    .name("esker-wal-sync".to_string())
+                    .spawn(move || {
+                        if let Some(inner) = weak.upgrade() {
+                            inner.wal_sync_loop(interval);
+                        }
+                    })
+                    .map_err(|err| Error::io(dir, err))?,
+            )
+        }
+        _ => None,
+    };
+
+    Ok((flusher, compactors, uploader, syncer))
 }
 
 /// Creates or recovers the version set, and makes sure every column family the caller named

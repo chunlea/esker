@@ -68,7 +68,7 @@ fn persist_without_applying(db: &Arc<Db>, entries: &[Entry]) {
         }),
         entries,
     );
-    db.write(batch, &WriteOptions { sync: true }).unwrap();
+    db.write(batch, &WriteOptions::synced()).unwrap();
 }
 
 fn command_entry(index: u64, command: &Command) -> Entry {

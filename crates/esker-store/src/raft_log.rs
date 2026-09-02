@@ -196,7 +196,7 @@ pub fn destroy(db: &Db, region_id: u64) -> Result<u64> {
     batch.delete(cf_id, &pending_snapshot_key(region_id));
     // Synced: a region this store has been removed from must not come back after a crash and
     // rejoin a group that has already replaced it (`docs/plans/phase-4.md` §6, race 3).
-    db.write(batch, &WriteOptions { sync: true })?;
+    db.write(batch, &WriteOptions::synced())?;
     Ok(entries)
 }
 
@@ -366,7 +366,7 @@ impl RaftLogStorage {
             };
             let mut batch = WriteBatch::new();
             batch.put(cf, &state_key(region_id), &fresh.encode());
-            db.write(batch, &WriteOptions { sync: true })?;
+            db.write(batch, &WriteOptions::synced())?;
             fresh
         };
 
@@ -684,7 +684,7 @@ mod tests {
     fn append(db: &Db, log: &mut RaftLogStorage, entries: &[Entry], hard: Option<HardState>) {
         let mut batch = WriteBatch::new();
         log.stage_ready(&mut batch, hard, entries);
-        db.write(batch, &WriteOptions { sync: false }).unwrap();
+        db.write(batch, &WriteOptions::unsynced()).unwrap();
     }
 
     /// The keys are an on-disk format. These bytes are the golden: a change to them is a format
@@ -886,7 +886,7 @@ mod tests {
         let mut batch = WriteBatch::new();
         batch.put(log.cf(), b"anything", b"value");
         log.stage_applied(&mut batch, 2);
-        db.write(batch, &WriteOptions { sync: false }).unwrap();
+        db.write(batch, &WriteOptions::unsynced()).unwrap();
 
         let reopened =
             RaftLogStorage::open(Arc::clone(&db), 7, ConfState::from_voters(vec![9])).unwrap();
@@ -1013,13 +1013,13 @@ mod tests {
         let mut batch = WriteBatch::new();
         log.stage_ready(&mut batch, None, &entries);
         log.stage_applied(&mut batch, 10);
-        db.write(batch, &WriteOptions { sync: true }).unwrap();
+        db.write(batch, &WriteOptions::synced()).unwrap();
 
         assert_eq!(log.first_index().unwrap(), 1);
         let mut batch = WriteBatch::new();
         log.stage_compact(&mut batch, 6, 2, ConfState::from_voters(vec![1, 2, 3]))
             .unwrap();
-        db.write(batch, &WriteOptions { sync: true }).unwrap();
+        db.write(batch, &WriteOptions::synced()).unwrap();
 
         assert_eq!(log.truncated_index(), 6);
         assert_eq!(log.first_index().unwrap(), 7, "the log begins after 6");
@@ -1065,7 +1065,7 @@ mod tests {
         let mut batch = WriteBatch::new();
         log.stage_ready(&mut batch, None, &entries);
         log.stage_applied(&mut batch, 3);
-        db.write(batch, &WriteOptions { sync: true }).unwrap();
+        db.write(batch, &WriteOptions::synced()).unwrap();
 
         let mut batch = WriteBatch::new();
         assert!(
@@ -1076,7 +1076,7 @@ mod tests {
         // triggers may agree.
         log.stage_compact(&mut batch, 3, 1, ConfState::from_voters(vec![1]))
             .unwrap();
-        db.write(batch, &WriteOptions { sync: true }).unwrap();
+        db.write(batch, &WriteOptions::synced()).unwrap();
         log.stage_compact(&mut WriteBatch::new(), 2, 1, ConfState::default())
             .unwrap();
         assert_eq!(log.truncated_index(), 3);

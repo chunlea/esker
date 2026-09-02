@@ -794,7 +794,7 @@ mod tests {
         let mut batch = WriteBatch::new();
         check_scope(command, &whole()).unwrap();
         let outcome = stage(db, &mut batch, command, &whole()).unwrap();
-        db.write(batch, &WriteOptions { sync: false }).unwrap();
+        db.write(batch, &WriteOptions::unsynced()).unwrap();
         outcome
     }
 
@@ -1021,7 +1021,7 @@ mod tests {
         // A key in a neighbouring namespace, written directly.
         let mut batch = WriteBatch::new();
         batch.put(db.cf_id(cf::DEFAULT).unwrap(), b"x-other", b"v");
-        db.write(batch, &WriteOptions { sync: false }).unwrap();
+        db.write(batch, &WriteOptions::unsynced()).unwrap();
 
         assert_eq!(
             apply(
@@ -1207,7 +1207,7 @@ mod tests {
             &narrowed,
         )
         .unwrap();
-        db.write(batch, &WriteOptions { sync: false }).unwrap();
+        db.write(batch, &WriteOptions::unsynced()).unwrap();
 
         assert_eq!(outcome, Applied::Deleted { keys: 2 }, "only `a` and `g`");
         assert_eq!(read(&db, b"a"), None);
@@ -1318,7 +1318,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read(&db, b"k"), None, "staging is not writing");
-        db.write(batch, &WriteOptions { sync: false }).unwrap();
+        db.write(batch, &WriteOptions::unsynced()).unwrap();
         assert!(read(&db, b"k").is_some());
     }
 

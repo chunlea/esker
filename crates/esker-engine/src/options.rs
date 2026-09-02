@@ -118,8 +118,13 @@ impl PrefixExtractor for StripSuffix {
 
 /// When the engine syncs the write-ahead log on its own initiative.
 ///
-/// Orthogonal to [`WriteOptions::sync`], which is a per-write demand that is always honoured.
-/// This is the policy for writes that did not ask.
+/// The policy for writes that expressed no preference — [`Durability::Policy`], which is what
+/// [`WriteOptions::default`] is. A write that asked for [`Durability::Durable`] or
+/// [`Durability::Buffered`] has already answered the question and does not consult this.
+///
+/// Before debt wave c3 there was no way to express "no preference": [`WriteOptions`] held a
+/// `bool` whose default was `true`, so every write looked like a demand and this mode could only
+/// ever add syncing. `Never` disabled nothing and `Interval` was never read at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WalSyncMode {
     /// Sync once per group commit. Every acknowledged write is durable — invariant 1's
@@ -128,38 +133,98 @@ pub enum WalSyncMode {
     PerWrite,
     /// Sync in the background at this interval. Writes are acknowledged before their bytes
     /// are durable, so a crash can lose up to one interval of them.
+    ///
+    /// A real background thread since debt wave c3 (`crate::db::write`). Before that nothing read
+    /// this variant, so it was [`Never`](Self::Never) wearing another name — a database configured
+    /// for *bounded* loss had unbounded loss, and said nothing.
     Interval(Duration),
-    /// Never sync except when a write asks. The fastest and the least durable.
+    /// Never sync except when a write asks for [`Durability::Durable`], or when the database is
+    /// closed. The fastest and the least durable.
+    ///
+    /// A clean close still syncs, and that is not a hedge: the trade this mode makes is "a crash
+    /// may lose recent writes", never "an orderly shutdown may".
     Never,
 }
 
-/// Per-write options.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WriteOptions {
-    /// Whether the write's WAL bytes must be durable before it is acknowledged.
+/// What one write asks of the log before it is acknowledged.
+///
+/// Three states and not two, and the third is the one that was missing. A `bool` can say "durable"
+/// and "not durable" but it cannot say **"no opinion"** — and without that, a caller taking
+/// `WriteOptions::default()` was indistinguishable from one demanding durability, so
+/// [`WalSyncMode`] had nothing left to decide. It could only ever *add* syncing, never remove it,
+/// and `WalSyncMode::Never` was a no-op for every caller in this repository
+/// (`docs/plans/debt-c3.md` §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Durability {
+    /// Whatever the database's [`WalSyncMode`] says. The default, and what a caller that has not
+    /// thought about durability should get: the decision then belongs to whoever opened the
+    /// database, which is where a policy belongs.
+    #[default]
+    Policy,
+    /// Durable before acknowledgement, whatever the policy says.
     ///
-    /// **Defaults to `true`.** `CLAUDE.md` invariant 1 says a write is acknowledged only once
-    /// it is durable "unless the caller explicitly passed `sync = false`" — so the opt-out is
-    /// explicit, and the default is the safe one. This is deliberately the opposite of
-    /// `LevelDB`'s and `RocksDB`'s default.
-    pub sync: bool,
+    /// `CLAUDE.md` invariant 1's demand, and it outranks the mode in the safe direction: a caller
+    /// that asked for durability gets it even on a database opened [`WalSyncMode::Never`].
+    Durable,
+    /// Acknowledged before the bytes are durable, whatever the policy says.
+    ///
+    /// Invariant 1's one sanctioned opt-out — "unless the caller explicitly passed `sync = false`"
+    /// — and it stays explicit. A database opened [`WalSyncMode::PerWrite`] still syncs the group
+    /// this write shares, because a group is one record and one caller cannot un-ask for another's
+    /// durability; what this buys is that *this* caller never waits for it.
+    Buffered,
 }
 
-impl Default for WriteOptions {
-    fn default() -> Self {
-        Self { sync: true }
-    }
+/// Per-write options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WriteOptions {
+    /// What this write asks of the log. Defaults to [`Durability::Policy`].
+    ///
+    /// **The default changed in debt wave c3, and under the default `WalSyncMode` nothing
+    /// changed with it.** `WalSyncMode::PerWrite` is still the database default and still syncs a
+    /// write that expressed no preference, so every caller that took the default before takes the
+    /// same behaviour now. What moved is that a database opened `Never` or `Interval` can now
+    /// actually be opened that way.
+    pub durability: Durability,
 }
 
 impl WriteOptions {
-    /// Durable before acknowledgement. Same as [`WriteOptions::default`].
+    /// Durable before acknowledgement, whatever the database's policy is.
+    #[must_use]
     pub fn synced() -> Self {
-        Self { sync: true }
+        Self {
+            durability: Durability::Durable,
+        }
     }
 
     /// Acknowledged before the bytes are durable. A deliberate, explicit trade.
+    #[must_use]
     pub fn unsynced() -> Self {
-        Self { sync: false }
+        Self {
+            durability: Durability::Buffered,
+        }
+    }
+
+    /// Whatever the database was opened with. Same as [`WriteOptions::default`].
+    #[must_use]
+    pub fn policy() -> Self {
+        Self {
+            durability: Durability::Policy,
+        }
+    }
+
+    /// Whether this write must be durable before it is acknowledged, on a database opened with
+    /// `mode`.
+    ///
+    /// The whole of the precedence rule, in one place so that neither side can drift: an explicit
+    /// answer wins, and only a write with no opinion asks the mode.
+    #[must_use]
+    pub fn wants_sync(self, mode: WalSyncMode) -> bool {
+        match self.durability {
+            Durability::Durable => true,
+            Durability::Buffered => false,
+            Durability::Policy => mode == WalSyncMode::PerWrite,
+        }
     }
 }
 
@@ -396,8 +461,10 @@ mod tests {
     /// Invariant 1: durable-then-acknowledge is the default, and skipping it is explicit.
     #[test]
     fn writes_are_synced_unless_asked_otherwise() {
-        assert!(WriteOptions::default().sync);
-        assert!(!WriteOptions::unsynced().sync);
+        assert!(WriteOptions::default().wants_sync(WalSyncMode::PerWrite));
+        assert!(!WriteOptions::default().wants_sync(WalSyncMode::Never));
+        assert!(WriteOptions::synced().wants_sync(WalSyncMode::Never));
+        assert!(!WriteOptions::unsynced().wants_sync(WalSyncMode::PerWrite));
         assert_eq!(WalSyncMode::default(), WalSyncMode::PerWrite);
     }
 
