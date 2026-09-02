@@ -1053,6 +1053,22 @@ async fn snapshot_refused(
     region_id: u64,
     peer_id: u64,
 ) -> bool {
+    snapshot_refusal(connection, region_id, peer_id)
+        .await
+        .is_some()
+}
+
+/// What a refused snapshot ask said, or `None` if it was served.
+///
+/// **A refusal arrives in one of two places** and a test that reads only one of them is testing
+/// the framing rather than the decision: a store that refuses before the stream is opened fails
+/// the call, and one that refuses after — which is what a *waited* refusal does — sends the error
+/// as the stream's first chunk. Both are the same answer to the caller, so both are read here.
+async fn snapshot_refusal(
+    connection: &esker_proto::TcpTransport,
+    region_id: u64,
+    peer_id: u64,
+) -> Option<String> {
     match connection
         .call_stream(esker_proto::Request::Snapshot(
             esker_proto::SnapshotRequest {
@@ -1063,8 +1079,12 @@ async fn snapshot_refused(
         ))
         .await
     {
-        Err(_) => true,
-        Ok(mut stream) => matches!(stream.next_chunk().await, None | Some(Err(_))),
+        Err(error) => Some(error.to_string()),
+        Ok(mut stream) => match stream.next_chunk().await {
+            None => Some("the stream ended before its header".to_owned()),
+            Some(Err(error)) => Some(error.to_string()),
+            Some(Ok(_)) => None,
+        },
     }
 }
 
@@ -1119,6 +1139,132 @@ async fn a_store_outside_the_region_is_refused_a_copy() {
     assert_eq!(header.region.id, 1);
     assert!(header.meta.index > 0);
 
+    node.stop().await;
+}
+
+/// The sender tells a **stranger** from a member it has not caught up to, and waits for the
+/// second rather than refusing it — but it will not serve a snapshot whose record omits the peer
+/// receiving it.
+///
+/// A conf change takes effect in the Raft core when it is *appended*, and in the region record
+/// when it is *applied*. Between those two the leader already knows about the new peer and its own
+/// record does not — and that gap is exactly where the new peer asks, because the traffic that
+/// tells it the region exists is the traffic the leader started sending the moment it appended.
+/// The refusal it met, *"peer N is not a member of region M and may not have a copy of it"*, is a
+/// correct sentence about the wrong membership (`docs/plans/phase-8-learner.md` §close bullet 4).
+///
+/// **What this test is really guarding is the fix that was tried first.** Answering the ask
+/// straight from the core's membership — the fix the plan named — ships a header carrying the
+/// *applied* record, which does not list the peer receiving it; the receiver then writes the
+/// record and the whole region and `host_region` declines to start it, so the transfer "succeeds"
+/// and nothing is hosted, for ever. `tests/promotion.rs` fails 3 of 3 that way with a learner
+/// stranded for the length of the run. So the sender waits for the record instead, which is to say
+/// it waits for the change to **commit**, and refuses only if that does not happen.
+///
+/// # Holding the ordering still
+///
+/// A voter is added on a store that does not exist. The core takes the change when it appends it,
+/// and the commit then needs a quorum of the **new** configuration — which the absent peer is half
+/// of — so it never commits, never applies, and the region record never moves. The state is stable
+/// rather than a window to hit: the core has peer 2 for the rest of the process and the applied
+/// record does not. The leader steps down one election window later, having lost its quorum, and
+/// that changes nothing here — `Status::conf` is the latest configuration *in the log*, committed
+/// or not.
+///
+/// That is also a conf change that **can still be rolled back**, and the answer this asserts is
+/// the one such a peer must get: not a copy of the region.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_the_core_has_and_the_log_has_not_committed_is_waited_for_and_then_refused() {
+    trace();
+    let pd = Arc::new(FakePd::new());
+    let address = reserve();
+    let node = open(
+        address,
+        1,
+        &pd,
+        raft_options(
+            vec![PeerAddress::new(1, 1, address)],
+            LogCompaction::new(),
+            None,
+        ),
+        1,
+    )
+    .await;
+    wait_for("a leader", || {
+        node.store.peer_of(1).is_some_and(|peer| peer.is_leader())
+    })
+    .await;
+    let region = node.store.regions().regions()[0].clone();
+    put(&node.store, &region, key(0), b"v").await;
+
+    let peer = node.store.peer_of(1).unwrap();
+    // Never awaited: this proposal is one the group cannot commit, which is the whole point.
+    let proposing = tokio::spawn({
+        let peer = Arc::clone(&peer);
+        async move {
+            peer.propose_conf_change(esker_raft::ConfChangeKind::AddVoter, 2, 2, PeerRole::Voter)
+                .await
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let conf = within("the core's status", peer.status())
+            .await
+            .unwrap()
+            .conf;
+        if conf.is_voter(2) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the core never took the conf change"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        !node
+            .store
+            .regions()
+            .get(1)
+            .unwrap()
+            .region()
+            .peers
+            .iter()
+            .any(|member| member.peer_id == 2),
+        "the record applied the change, so this is not the ordering the test is about"
+    );
+
+    let connection = esker_proto::TcpTransport::connect(address).await.unwrap();
+    let asked_at = Instant::now();
+    let refusal = within("the snapshot ask", snapshot_refusal(&connection, 1, 2))
+        .await
+        .expect("a region was shipped to a peer whose conf change can still be rolled back");
+    // **Which refusal it is, is the whole assertion.** "Not a member" is the old answer and means
+    // the sender read the applied record and stopped there; this one means it read the core, found
+    // the peer, and waited for the change to apply.
+    assert!(
+        refusal.contains("has not applied here"),
+        "the sender refused as if peer 2 were a stranger: {refusal}"
+    );
+    assert!(
+        asked_at.elapsed() >= Duration::from_millis(400),
+        "the sender refused on sight rather than waiting for the record: {:?}",
+        asked_at.elapsed()
+    );
+
+    // A stranger is refused too — and told the other thing, on sight. The check reads a wider
+    // membership; it does not read none.
+    let stranger_at = Instant::now();
+    assert!(
+        snapshot_refused(&connection, 1, 77).await,
+        "widening the membership check let a stranger in"
+    );
+    assert!(
+        stranger_at.elapsed() < Duration::from_millis(400),
+        "a stranger was waited for as if it were a member"
+    );
+
+    proposing.abort();
     node.stop().await;
 }
 

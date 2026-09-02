@@ -52,6 +52,18 @@ use crate::split::{self, SplitOptions};
 use crate::transport::{PeerAddress, StoreAddress, StoreTransport};
 use crate::{OPERATOR_TIMEOUT, SNAPSHOT_STREAM_DEPTH, TRANSFER_LAG_ALLOWANCE};
 
+/// How long a snapshot ask waits for the conf change that placed its peer to apply here.
+///
+/// An apply is microseconds behind its commit, so this is a bound on a mistake rather than a
+/// latency anyone pays: see [`Store::await_record_of`]. Below the shortest region-heartbeat
+/// interval any test uses, so an expired wait is answered by the leader's next announcement
+/// rather than stacking behind it.
+const RECORD_CATCHUP_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How often that wait looks. The region record is replaced under a lock by an apply, and there is
+/// nothing to subscribe to; two milliseconds is far below what it is waiting for.
+const RECORD_CATCHUP_POLL: std::time::Duration = std::time::Duration::from_millis(2);
+
 /// How many consecutive leaderless heartbeat rounds make a region worth asking PD about.
 ///
 /// A throttle rather than a bound; see [`Store::sweep_orphaned_regions`] for why the safety is
@@ -1381,6 +1393,37 @@ impl Store {
     /// that is not replicating a range has no claim to a copy of it, and a snapshot is the one
     /// request that hands over a region wholesale.
     ///
+    /// # A peer the core has and the record does not is **waited for**, not refused and not served
+    ///
+    /// A conf change takes effect in the core when it is *appended* and in the region record when
+    /// it is *applied*, and between those two this leader already knows about the new peer while
+    /// its own record does not. That gap is precisely where the new peer asks, because the traffic
+    /// that tells it the region exists is the traffic this leader started sending the moment it
+    /// appended. Checking only the record therefore refused the one caller the check was written
+    /// to admit, with a correct sentence about the wrong membership
+    /// (`docs/plans/phase-8-learner.md` §close bullet 4).
+    ///
+    /// **Answering it from the core's membership alone is worse than the refusal**, and this is
+    /// measured rather than argued. The snapshot's header carries `source.region` — the *applied*
+    /// record — so a snapshot served on the strength of the core's membership arrives with a
+    /// region record that does not list the peer receiving it. The receiver writes that record,
+    /// writes every byte of the region, and then [`host_region`](Self::host_region) declines to
+    /// start it, because a record that does not name this store is one it must not serve. Nothing
+    /// fails: the transfer "succeeds", the region is not hosted, the leader announces again and
+    /// the whole thing repeats. `tests/promotion.rs` fails three times out of three with a learner
+    /// stranded for the length of the test — the phase-4 acceptance stall, reintroduced by the fix
+    /// for a retry.
+    ///
+    /// So the ask is held instead. The core's membership decides whether the caller is a stranger
+    /// or a member this store has not caught up to; a member is waited for, up to
+    /// [`RECORD_CATCHUP_WAIT`], and served the moment the record lists it — which is when the
+    /// change has **committed and applied**, and therefore when it can no longer be rolled back.
+    /// A wait that expires refuses, and says that it expired: that is where this was before, and
+    /// the leader's next announcement asks again.
+    ///
+    /// The record is consulted first and answers on its own, so a region with no core to ask
+    /// behaves as it did, and a store in neither membership is still refused.
+    ///
     /// Refused, too, when this store cannot produce a snapshot at least as recent as the index the
     /// follower was told about. A snapshot older than the announcement would leave a hole between
     /// where the follower's log resumes and where the data actually reaches — the one shape a
@@ -1399,23 +1442,29 @@ impl Store {
             .ok_or(ProtoError::RegionNotFound {
                 region_id: ask.region_id,
             })?;
-        if !state
+        let in_record = state
             .region()
             .peers
             .iter()
-            .any(|peer| peer.peer_id == ask.peer_id)
-        {
-            return Err(ProtoError::invalid(format!(
-                "peer {} is not a member of region {} and may not have a copy of it",
-                ask.peer_id, ask.region_id
-            )));
-        }
+            .any(|peer| peer.peer_id == ask.peer_id);
         let peer = state.peer().map(Arc::clone).ok_or_else(|| {
             ProtoError::invalid(format!(
                 "region {} is not replicated on this store",
                 ask.region_id
             ))
         })?;
+        if !in_record {
+            // The configuration in force — the latest in the log, committed or not — which is
+            // where a conf change lands one step before the record does.
+            let conf = peer.status().await?.conf;
+            if !conf.is_voter(ask.peer_id) && !conf.is_learner(ask.peer_id) {
+                return Err(ProtoError::invalid(format!(
+                    "peer {} is not a member of region {} and may not have a copy of it",
+                    ask.peer_id, ask.region_id
+                )));
+            }
+            self.await_record_of(ask.region_id, ask.peer_id).await?;
+        }
 
         let source = peer.snapshot_source().await?;
         if source.meta.index < ask.index {
@@ -1457,6 +1506,57 @@ impl Store {
             }
         });
         Ok(Reply::Stream(stream))
+    }
+
+    /// Waits for this store's region record to list `peer_id`, so a snapshot of it can name the
+    /// peer it is being sent to.
+    ///
+    /// Called only when the core's configuration already has the peer and the record does not, so
+    /// what is being waited for is one apply: the conf change is appended, and this returns when
+    /// it has committed and been applied here. That is the right thing to wait for and not merely
+    /// the convenient one — an appended change can still be rolled back by a new leader, and a
+    /// region shipped to a peer a rollback removes is a copy of a range with no owner.
+    ///
+    /// Bounded, and the bound is what keeps a design mistake from becoming a deadlock. Adding a
+    /// **voter** to a group that then needs it for a quorum cannot commit until that voter has the
+    /// region, which is what this call is trying to give it; nothing in this system does that —
+    /// `AddPeer` adds a learner and promotes it once it is caught up, and a learner's addition
+    /// commits on the existing voters alone — but a wait with no end would turn the day somebody
+    /// tries into a hang instead of a retry.
+    async fn await_record_of(
+        &self,
+        region_id: u64,
+        peer_id: u64,
+    ) -> std::result::Result<(), ProtoError> {
+        let deadline = tokio::time::Instant::now() + RECORD_CATCHUP_WAIT;
+        loop {
+            let listed = self.regions.get(region_id).is_some_and(|state| {
+                state
+                    .region()
+                    .peers
+                    .iter()
+                    .any(|peer| peer.peer_id == peer_id)
+            });
+            if listed {
+                tracing::debug!(
+                    region_id,
+                    peer_id,
+                    "a snapshot ask waited for the conf change that placed its peer to apply"
+                );
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ProtoError::Unsupported {
+                    detail: format!(
+                        "peer {peer_id} is in region {region_id}'s configuration but the change \
+                         that put it there has not applied here within {RECORD_CATCHUP_WAIT:?}, \
+                         so a snapshot of it would carry a record that does not name the peer \
+                         receiving it"
+                    ),
+                });
+            }
+            tokio::time::sleep(RECORD_CATCHUP_POLL).await;
+        }
     }
 
     /// Walks a region into the stream, and says whether every byte of it got there.
@@ -1924,6 +2024,25 @@ impl Store {
                 "asked for region {region_id} and was sent {}",
                 header.region.id
             )));
+        }
+        // **Before a byte is written.** A record that does not name this store is one
+        // `host_region` refuses to start — correctly — so adopting the snapshot behind it would
+        // write the whole region, host nothing, and leave the leader announcing into a transfer
+        // that can only repeat. Refusing here costs the same retry and leaves nothing behind, and
+        // it is the loud version of a failure that was silent.
+        if !header
+            .region
+            .peers
+            .iter()
+            .any(|peer| peer.store_id == self.store_id)
+        {
+            return Err(ProtoError::Unsupported {
+                detail: format!(
+                    "the snapshot offered for region {region_id} carries a record that does not \
+                     name store {}, so it could be stored but never served",
+                    self.store_id
+                ),
+            });
         }
         // A region this store already hosts is **replaced**, not refused. Refusing it was 4c's
         // limitation and phase-4 acceptance showed it is not an edge case: a peer that falls

@@ -136,3 +136,77 @@ Asserted in the same test as the range, and in both directions:
 `a_removed_peer_reclaims_the_range_in_every_column_family` plants a copy for the region being shed
 **and one for a region that is not**, and the second is what says the removal is per region id
 rather than a sweep of `<data_dir>/columnar`.
+
+## 2. The `receive_raft` snapshot ask races the conf change — and the recorded fix is worse
+
+Inventory #7. `crates/esker-store/src/server.rs`, `send_snapshot`.
+
+### The repro, and the fix that failed it
+
+`crates/esker-store/tests/snapshot.rs` holds the ordering still by adding a **voter on a store that
+does not exist**: the core takes the change when it appends it, the commit then needs a quorum of
+the new configuration — which the absent peer is half of — so it never commits, never applies, and
+the record never moves. The core has peer 2 for the rest of the process and the applied record does
+not. Red immediately, with the recorded sentence:
+
+```
+InvalidRequest { detail: "peer 2 is not a member of region 1 and may not have a copy of it" }
+```
+
+`docs/plans/phase-8-learner.md` §close bullet 4 names the fix: *"the sender could check the core's
+membership rather than the applied record."* Implemented exactly as written, that test goes green
+and **`tests/promotion.rs` fails 3 runs of 3**, with a learner stranded for the whole 30 s deadline.
+Bisected by reverting that one condition: 2 of 2 green, and eight seconds faster.
+
+The mechanism is in `host_region` (`server.rs:489`). A snapshot's header carries `source.region` —
+the *applied* record — so serving on the strength of the core's membership ships a header that does
+not list the peer receiving it. The receiver writes that record, writes every byte of the region,
+and then `host_region` declines to start it, correctly, because a record that does not name this
+store is one it must not serve. It logs a warning and returns `Ok(())`. The transfer "succeeds",
+nothing is hosted, the leader announces again, and it repeats. A retry that cost one heartbeat
+interval became a stall with no end — the same shape phase-4 kept finding, produced this time by
+the fix for it.
+
+### What landed instead
+
+[ADR 0035](../adr/0035-a-snapshot-ask-waits-for-the-record-that-names-its-peer.md). The core's
+membership decides whether the caller is a **stranger**; the record decides **when** it is served.
+A peer the core has and the record does not is held for up to 500 ms and served the moment the
+record lists it — which is when the change has committed and applied, and therefore when it can no
+longer be rolled back by a new leader. That is a stronger check than reading the core rather than a
+more convenient one: the ask the core alone would have admitted is exactly the one that must not be
+admitted yet, because a region shipped to a peer a rollback removes is a copy of a range with no
+owner.
+
+The bound is what keeps a design mistake from becoming a deadlock: adding a *voter* to a group that
+then needs it for quorum cannot commit until that voter has the region, which is what the wait is
+trying to give it. Nothing here does that — `AddPeer` adds a learner and promotes it, and a
+learner's addition commits on the existing voters alone — but a wait with no end would turn the day
+somebody tries into a hang instead of a retry.
+
+And the receiver refuses a header whose record does not name it, **before a byte is written**. Same
+retry, nothing left durable, and the silent version of this failure becomes a loud one — including
+against a sender at an older version, which nothing in this build can otherwise cover.
+
+### The test, and what it can and cannot assert
+
+`a_peer_the_core_has_and_the_log_has_not_committed_is_waited_for_and_then_refused` asserts three
+things, all deterministic: the ask is **refused**, the refusal says the change *has not applied*
+rather than that the peer *is not a member* — which is the whole assertion, since only the second
+sentence can come from reading the applied record and stopping — and it took at least 400 ms, which
+says the sender waited rather than refusing on sight. A stranger, by contrast, is refused in under
+400 ms.
+
+Writing it turned up something about the harness worth keeping. **A refusal arrives in one of two
+places**: a store that refuses before the stream is opened fails the call, and one that refuses
+*after* — which is what a waited refusal does — sends the error as the stream's first chunk. The
+first version of this test read only the failed call and reported a refusal as a snapshot that had
+been served. `snapshot_refusal` now reads both, and `snapshot_refused` is written in terms of it,
+so the older tests in the file gain the same coverage rather than keeping their own half of it.
+
+**What it does not assert is the served-after-waiting path, and that is a real gap.** The window it
+would need — a conf change committed but not yet applied *here* — closes at the speed of one apply,
+and every way of holding it open that this lane could construct also stops the change committing,
+which is the thing being waited for. The end-to-end evidence for that path is
+`tests/promotion.rs` and `a_placed_columnar_learner_holds_what_the_leader_holds`, which are the
+tests that failed 3 of 3 under the naive fix and are green under this one.
