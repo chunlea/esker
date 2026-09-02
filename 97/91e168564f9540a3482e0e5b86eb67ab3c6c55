@@ -1,0 +1,23 @@
+crates/esker-client/src/router.rs
+  s_7a3132f4d02a00::t_ee9a524aae7004 48,202-206,211-213,245,267-276,340-371
+crates/esker-client/tests/retry.rs
+  s_7a3132f4d02a00::t_ace70a0b533312 316-407
+docs/plans/debt-c3.md
+  s_7a3132f4d02a00::t_17d19a931cfecf 213-275
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "9791e168564f9540a3482e0e5b86eb67ab3c6c55",
+  "prompts": {},
+  "sessions": {
+    "s_7a3132f4d02a00": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "176f3779-1c8f-49ac-8e22-08bb3b8ac7c3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
