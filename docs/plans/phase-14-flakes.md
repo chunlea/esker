@@ -367,6 +367,83 @@ store's view, so the next sighting is diagnosable from the panic instead of from
 
 ---
 
+## U3 — `pd_wiring::an_alter_reports_every_range…` and `cluster_start`
+
+### 3.1 `pd_wiring`: one fixture constant serving two tests with opposite needs
+
+Twelve copies of the binary at once, four batches: **4 of 48 red**, all identical —
+
+```
+called `Result::unwrap()` on an `Err` value: SchemaLeaseExpired { command: "ALTER TABLE" }
+```
+
+which is ADR 0028 fail-closed working exactly as designed, in a test about *report content*.
+
+`standin_pd` hands out `LEASE_MS = 600`, *"a short lease, so a lapse is a second of test rather
+than five"* — which is what `a_lapsed_lease_refuses_writes_and_still_serves_reads` needs and the
+exact opposite of what this one does. A node renews on a thread, and `redrive_live` spawns one for
+this reason (*"the test runs for several lease terms, so the refresher thread is load-bearing"*).
+This test **cannot**: a refresher asserts the whole columnar set on every renewal, and those
+assertions are what it counts. So it holds the one lease it fetched at startup across a body of DDL
+over three real stores, and on a loaded machine that body outlives 600 ms.
+
+The lease is now per driver: `serve_with_lease(NO_LAPSE_MS)` for the tests that are not about
+leases, `serve()` and `LEASE_MS` kept for the one that is. Not a widened deadline — the lapse is
+still exactly `LEASE_MS` where a lapse is the subject.
+
+| lease | runs | failed |
+|---|---:|---:|
+| 600 ms (the shared default) | 48 | **4** |
+| **1 ms** | 5 | **5** |
+| 3,600,000 ms (`NO_LAPSE_MS`) | 48 | **0** |
+
+The 1 ms arm is the deterministic red: the same `SchemaLeaseExpired`, arriving at the first `CREATE
+TABLE` instead of the fifth statement. One variable, three points, monotone.
+
+### 3.2 `cluster_start`: not reproduced in 21 runs, and a trap found beside it
+
+| configuration | runs | failed |
+|---|---:|---:|
+| alone | 3 | 0 |
+| under a `cargo build --workspace --tests` loop from a detached worktree, load average ≈ 20 | 8 | 0 |
+| with `esker-cli` **relinked before every run**, under that load | 4 | 0 |
+| after the band change below | 6 | 0 |
+| inside a full `just check` under that load | 1 | 0 |
+
+The third row is the recorded scenario exactly — *"every time on the run right after a build"* — and
+`c3b64d9`'s `warm_the_binary()` holds it at under a second. But that is not the whole story, because
+the two phase-10 sightings **postdate** it: `c3b64d9` is 2026-09-01 18:05 and
+`.config/nextest.toml` first exists in `c887382` at 20:05, so a sighting "before the CLI's binaries
+were serialised" is already after the warm-up. The warm-up fixed the three failures it was written
+for; it did not fix those two.
+
+**What was found instead is a trap, and it is stated as one.** `free_port_run` binds a run of
+ports, releases it and returns the base — a race the file's own `PORTS` mutex closes only for the
+other test *in this file*, since a mutex is process-local. The band is therefore the real
+mitigation, and this file scanned **30,100–40,000**, which swallows `tier_acceptance`'s
+**31,000–39,000** entirely:
+
+| test | band, before | after |
+|---|---|---|
+| `cluster_chaos` | 21,000–30,000 | unchanged |
+| `cluster_start` | **30,100–40,000** | **30,100–31,000** |
+| `tier_acceptance` | 31,000–39,000 | unchanged |
+| `columnar_cluster` | 41,000–50,000 | unchanged |
+
+`tier_acceptance` is `#[ignore]`d — it needs a MinIO container — so it does not run in the gate and
+**cannot be what the two sightings were**. That is why this is recorded as a trap rather than
+claimed as the diagnosis: run its three tests beside a workspace run, which is exactly what checking
+phase 6b means, and the failure lands in `cluster_start` sixty seconds later in another crate with
+nothing pointing back. An exhausted band now panics by name, which is the right failure: it says the
+ports ran out, where a collision says nothing at all.
+
+**The sighting stays open**, with the reproduction recipe written down: relink `esker-cli`, run
+under a build loop, and read `sample`/`ps` on a store that has not registered to tell *"the OS has
+not started it"* from *"it started and did not register"*. Twenty-one runs did not produce one to
+read.
+
+---
+
 ## 2. Units
 
 | unit | test | done when |

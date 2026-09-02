@@ -31,8 +31,9 @@ const NODES: u64 = 4;
 ///
 /// **They cannot share a port space and one of them squats a port on purpose.** `free_port_run`
 /// binds a run, releases it and returns the base, which is the usual trick and is a race between
-/// the release and the cluster's own bind — harmless against other test binaries, which scan other
-/// bands, and not harmless against the test next door. Run in parallel under a loaded box they
+/// the release and the cluster's own bind — harmless against other test binaries **only because
+/// they scan other bands**, which [`free_port_run`] now makes true and did not, and not harmless
+/// against the test next door. Run in parallel under a loaded box they
 /// picked the same base, [`a_driver_that_cannot_listen_is_a_failure_and_not_a_cluster`]'s squatter
 /// took the *other* test's driver port, and the four-node start failed with a placement driver
 /// that could never listen: `stores (0)`, `(not bootstrapped)`. Which is, to be fair, the failure
@@ -62,9 +63,34 @@ fn warm_the_binary() {
 }
 
 /// A run of `NODES + 1` free ports: the stores' own, and the driver's one above them.
+///
+/// # The band is this file's alone, and it was not
+///
+/// Binding a run, releasing it and returning the base is a race against whoever binds next, and
+/// [`PORTS`] closes it only for the *other test in this file* — a `Mutex` is process-local, and
+/// every other cluster test is another binary. So the band has to be the mitigation, and each of
+/// these four scans a different one:
+///
+/// | test | band |
+/// |---|---|
+/// | `cluster_chaos` | 21,000–30,000 |
+/// | **this file** | **30,100–31,000** |
+/// | `tier_acceptance` | 31,000–39,000 |
+/// | `columnar_cluster` | 41,000–50,000 |
+///
+/// This one used to scan **30,100–40,000**, which swallows `tier_acceptance`'s whole band. That
+/// one is `#[ignore]`d and so does not run in the gate — it needs a `MinIO` container — which is
+/// why this is a trap rather than a diagnosis: run its three tests beside a workspace run, which
+/// is exactly what somebody checking phase 6b does, and the failure lands *here*, as a placement
+/// driver that could never listen and a four-node start that announced four nodes and has
+/// `stores (0)`. Sixty seconds later, in another crate, with nothing pointing back
+/// (`docs/plans/phase-14-flakes.md` U3).
+///
+/// A band that is exhausted panics by name. That is the right failure: it says the ports ran out,
+/// where a collision says nothing at all.
 fn free_port_run() -> u16 {
     let span = usize::try_from(NODES).unwrap() + 1;
-    for base in (30_100_u16..40_000).step_by(span) {
+    for base in (30_100_u16..31_000).step_by(span) {
         let bound: Vec<TcpListener> = (0..span)
             .filter_map(|at| {
                 let offset = u16::try_from(at).ok()?;
@@ -75,7 +101,10 @@ fn free_port_run() -> u16 {
             return base;
         }
     }
-    panic!("no run of {} consecutive free ports", NODES + 1);
+    panic!(
+        "no run of {} consecutive free ports in 30,100–31,000, this file's own band",
+        NODES + 1
+    );
 }
 
 /// The supervisor, stopped however the test ends.
