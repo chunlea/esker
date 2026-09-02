@@ -1,0 +1,25 @@
+crates/esker-sim/src/mech/ask.rs
+  s_e2fd0c54b9d574::t_9bb7a2c80209f3 1-373
+crates/esker-sim/src/mech/mod.rs
+  s_e2fd0c54b9d574::t_7a25299d8e00f8 43,49
+crates/esker-store/tests/sim_snapshot_ask.rs
+  s_e2fd0c54b9d574::t_838c979ee4d93d 1-325
+docs/plans/phase-11-engine.md
+  s_e2fd0c54b9d574::t_d523b5804f8fc4 379-439
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "4d0e098e7dc8325dc6b5abab9282af5671cc4967",
+  "prompts": {},
+  "sessions": {
+    "s_e2fd0c54b9d574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "671f3143-5435-4676-97d9-490a56835160",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
