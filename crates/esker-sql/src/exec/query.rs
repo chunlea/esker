@@ -1250,8 +1250,80 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             operand: Box::new(resolve(operand, scope)?),
             negated: *negated,
         },
+        // Only the **operand** is resolved here. Everything inside the sub-select was resolved
+        // against the sub-select's own scope when `crate::exec::subquery::plan_subqueries` planned
+        // it, and resolving it again here would type it against a row it will never see.
+        Expr::Subquery(sub) => {
+            let mut resolved = sub.clone();
+            if let Some(operand) = &sub.operand {
+                resolved.operand = Some(Box::new(subquery_operand(operand, sub, scope)?));
+            }
+            Expr::Subquery(resolved)
+        }
         other => other.clone(),
     })
+}
+
+/// The left-hand side of an `IN`/`ANY`/`ALL`, typed against the subquery's column.
+///
+/// The subquery's single column is what the operand is compared against, so it types the operand
+/// exactly as a column on the other side of an `=` would — which is why the whole of the rule is
+/// [`reconcile`] against a stand-in for that column. The stand-in's *position* is never read: it
+/// is discarded on the next line, and the only field of it that matters is the type.
+///
+/// What `reconcile` cannot decide is two operands that both already have types, because it has
+/// nothing to resolve. That is the case the capture cares about — `WHERE n IN (SELECT a_id FROM
+/// b)` over a `text` column is `42883 operator does not exist: text = bigint` — and it is checked
+/// here rather than left to the evaluator, where it would be a silent `false`.
+fn subquery_operand(
+    operand: &Expr,
+    sub: &crate::plan::SubqueryExpr,
+    scope: &Scope<'_>,
+) -> Result<Expr> {
+    let operand = resolve(operand, scope)?;
+    let Some((_, ty)) = sub.column else {
+        return Ok(operand);
+    };
+    let op = sub.kind.comparison().unwrap_or(BinaryOp::Eq);
+    let stand_in = Expr::Ordinal {
+        at: 0,
+        ty,
+        typmod: crate::value::NO_TYPMOD,
+    };
+    let (operand, _) = reconcile(op, operand, stand_in)?;
+    if let Expr::Ordinal { ty: left, .. } = &operand
+        && !same_family(*left, ty)
+    {
+        return Err(SqlError::UndefinedOperator {
+            left: left.name(),
+            op: op.symbol(),
+            right: ty.name(),
+        });
+    }
+    Ok(operand)
+}
+
+/// Whether an operator exists between two types, as coarsely as this node's type surface allows.
+///
+/// PostgreSQL's answer comes out of `pg_operator` and its implicit casts; ours is the same
+/// grouping [`crate::plan::Literal::comparable_with`] already uses for a literal against a column,
+/// lifted to two columns. Coarse in the safe direction: it refuses only pairs that no cast in
+/// PostgreSQL relates either, so it cannot turn a comparison a real server runs into an error.
+fn same_family(left: ColumnType, right: ColumnType) -> bool {
+    fn family(ty: ColumnType) -> u8 {
+        match ty {
+            ColumnType::Int8
+            | ColumnType::Int4
+            | ColumnType::Int2
+            | ColumnType::Double
+            | ColumnType::Real => 0,
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => 1,
+            ColumnType::Bool => 2,
+            ColumnType::Bytea => 3,
+            ColumnType::TimestampTz | ColumnType::Timestamp => 4,
+        }
+    }
+    family(left) == family(right)
 }
 
 /// Gives a literal the type of whatever it is being compared against, or says the comparison is
@@ -1463,6 +1535,10 @@ fn check_predicate(expr: &Expr, clause: &'static str, scope: &Scope<'_>) -> Resu
             ty: ColumnType::Bool,
             ..
         } => Ok(()),
+        // `EXISTS`, `IN` and `ANY`/`ALL` are predicates; a **scalar** subquery is not, and falls
+        // through to the arm below so that `WHERE (SELECT max(id) FROM a)` gets PostgreSQL's own
+        // sentence with the subquery's type in it — measured, `not type bigint`.
+        Expr::Subquery(sub) if sub.value_type() == ColumnType::Bool => Ok(()),
         // PostgreSQL names the type it got, and a user reading "must be type boolean" without it
         // has to work out which of their columns was the problem. Measured, both clauses:
         // `argument of WHERE must be type boolean, not type bigint`.
@@ -1526,6 +1602,10 @@ fn output_columns(
                 let name = alias.clone().unwrap_or_else(|| match expr {
                     Expr::Column { name, .. } => name.clone(),
                     Expr::Aggregate(call) => call.func.name().to_owned(),
+                    // A scalar subquery takes the **subquery's own** column name and `EXISTS` is
+                    // called `exists`; everything else about a subquery is `?column?`. Measured
+                    // with `psql`, which a corpus of types and rows cannot record.
+                    Expr::Subquery(sub) => sub.output_name().unwrap_or("?column?").to_owned(),
                     _ => "?column?".to_owned(),
                 });
                 // A typmod travels only with a **plain column reference**, which is

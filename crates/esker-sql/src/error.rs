@@ -56,6 +56,15 @@ impl fmt::Display for Severity {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SqlError {
+    /// A subquery has the wrong number of columns for where it was written.
+    ///
+    /// `42601` like a syntax error, and **not** [`SqlError::Syntax`], which prefixes its message
+    /// with `syntax error:` — PostgreSQL's own sentence here has no such prefix. Two sentences
+    /// share the variant because PostgreSQL uses two: a scalar subquery is `subquery must return
+    /// only one column` and an `IN`/`ANY`/`ALL` is `subquery has too many columns`. Measured.
+    #[error("{0}")]
+    SubqueryColumns(&'static str),
+
     /// A subquery written where one value goes returned more than one row.
     ///
     /// PostgreSQL's own sentence, verbatim. It is raised **while the statement runs** rather than
@@ -809,6 +818,7 @@ impl SqlError {
                 sqlstate::FEATURE_NOT_SUPPORTED
             }
             SqlError::CardinalityViolation => sqlstate::CARDINALITY_VIOLATION,
+            SqlError::SubqueryColumns(_) => sqlstate::SYNTAX_ERROR,
             SqlError::Syntax { .. }
             | SqlError::InsertTooManyExpressions
             | SqlError::SyntaxAtOrNear(_) => sqlstate::SYNTAX_ERROR,

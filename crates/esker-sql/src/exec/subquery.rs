@@ -25,7 +25,7 @@ use crate::backend::Txn;
 use crate::error::{Result, SqlError};
 use crate::exec::cursor::{Cursor, SORT_LIMIT};
 use crate::plan::{
-    AggregateSpec, BinaryOp, Expr, Node, Select, SelectItem, SubqueryExpr, SubqueryKind,
+    AggregateSpec, BinaryOp, Expr, Literal, Node, Select, SelectItem, SubqueryExpr, SubqueryKind,
 };
 use crate::value::{Datum, PgDatum};
 
@@ -57,17 +57,45 @@ fn contains_subquery(expr: &Expr) -> bool {
 /// what this produces. A subquery inside a subquery is planned by the same call on the inner
 /// `Select` before the outer one is planned, so by the time a `SubqueryExpr` is typed everything
 /// it contains already is.
-pub(super) fn plan_subqueries(select: &mut Select, tenant: u64, tables: &dyn Tables) -> Result<()> {
+pub(super) fn plan_subqueries(
+    select: &mut Select,
+    tenant: u64,
+    txn: &dyn Txn,
+    tables: &dyn Tables,
+) -> Result<()> {
     let mut outcome = Ok(());
     for_each_written_expr_mut(select, &mut |expr| {
         if outcome.is_ok() {
             outcome = walk_mut(expr, &mut |expr| match expr {
-                Expr::Subquery(sub) => plan_one(sub, tenant, tables),
+                Expr::Subquery(sub) => plan_one(sub, tenant, txn, tables),
                 _ => Ok(()),
             });
         }
     });
-    outcome
+    outcome?;
+    fold_counts(select, txn, tenant)
+}
+
+/// `LIMIT (SELECT …)` and `OFFSET (SELECT …)`, run here and replaced by the number they answered.
+///
+/// The one place a subquery cannot wait for [`resolve`]: a `LIMIT` is a *number in the plan* —
+/// `Node::Limit` holds a `usize`, because a limit that changed per row would not be a limit — so
+/// it has to be known before the node is built. Running it here is the same thing the executor
+/// already does with a `nextval` in a target list, and it happens exactly once per statement,
+/// which is what a real server does too.
+fn fold_counts(select: &mut Select, txn: &dyn Txn, tenant: u64) -> Result<()> {
+    for expr in select.limit.iter_mut().chain(select.offset.iter_mut()) {
+        let Expr::Subquery(sub) = expr else { continue };
+        run_one(sub, txn, tenant)?;
+        // `LIMIT NULL` means no limit, which is PostgreSQL's rule and what `Literal::Null`
+        // already reaches; anything else is the value the subquery answered with.
+        *expr = Expr::Literal(match value(sub, None)? {
+            Datum::Null => Literal::Null,
+            Datum::Int8(count) => Literal::Integer(count),
+            other => Literal::Typed(Box::new(other)),
+        });
+    }
+    Ok(())
 }
 
 /// The catalog, as much of it as planning a subquery needs.
@@ -81,24 +109,26 @@ pub(super) trait Tables {
 }
 
 /// One subquery: its own subqueries first, then its plan, then the column it answers with.
-fn plan_one(sub: &mut SubqueryExpr, tenant: u64, tables: &dyn Tables) -> Result<()> {
-    plan_subqueries(&mut sub.select, tenant, tables)?;
+fn plan_one(sub: &mut SubqueryExpr, tenant: u64, txn: &dyn Txn, tables: &dyn Tables) -> Result<()> {
+    plan_subqueries(&mut sub.select, tenant, txn, tables)?;
 
     let table = match &sub.select.from {
         Some(from) => Some(tables.get(&from.name)?),
         None => None,
     };
-    let inner = match &sub.select.join {
-        Some(join) => Some(tables.get(&join.table.name)?),
-        None => None,
-    };
+    let inners = sub
+        .select
+        .joins
+        .iter()
+        .map(|join| tables.get(&join.table.name))
+        .collect::<Result<Vec<_>>>()?;
+    let inner_refs: Vec<&crate::catalog::TableDef> = inners.iter().map(AsRef::as_ref).collect();
     // **Never routed.** `crate::exec::query::plan` leaves `Planned::engine` at `None` and only
     // `crate::exec::fragment::route` fills it in; this is the call that does not make it, which is
     // what ADR 0040 asks a plan carrying a subquery to be able to say (§4 of the plan file). A
     // fragment's filter language has no subquery in it and its answer arrives whole in one
     // message, so there is nothing here for a columnar replica to do.
-    let planned =
-        crate::exec::query::plan(&sub.select, tenant, table.as_deref(), inner.as_deref())?;
+    let planned = crate::exec::query::plan(&sub.select, tenant, table.as_deref(), &inner_refs)?;
 
     // `EXISTS` reads rows and not values, so any number of columns is legal under it — measured,
     // `SELECT EXISTS (SELECT id, n FROM sq_a)` is `t`. Every other kind wants exactly one, and
@@ -106,18 +136,10 @@ fn plan_one(sub: &mut SubqueryExpr, tenant: u64, tables: &dyn Tables) -> Result<
     // subquery is `subquery must return only one column` and an `IN`/`ANY`/`ALL` is `subquery has
     // too many columns`. A client that greps the text sees two messages, so this node sends two.
     if sub.kind.reads_a_value() && planned.columns.len() != 1 {
-        return Err(match sub.kind {
-            SubqueryKind::Scalar => SqlError::Syntax {
-                message: "subquery must return only one column".to_owned(),
-                position: None,
-                hint: None,
-            },
-            _ => SqlError::Syntax {
-                message: "subquery has too many columns".to_owned(),
-                position: None,
-                hint: None,
-            },
-        });
+        return Err(SqlError::SubqueryColumns(match sub.kind {
+            SubqueryKind::Scalar => "subquery must return only one column",
+            _ => "subquery has too many columns",
+        }));
     }
     sub.column = planned
         .columns
@@ -304,10 +326,10 @@ fn for_each_written_expr(select: &Select, visit: &mut impl FnMut(&Expr)) {
             visit(expr);
         }
     }
-    if let Some(join) = &select.join
-        && let Some(on) = &join.on
-    {
-        visit(on);
+    for join in &select.joins {
+        if let Some(on) = &join.on {
+            visit(on);
+        }
     }
     for expr in select
         .filter
@@ -333,10 +355,10 @@ fn for_each_written_expr_mut(select: &mut Select, visit: &mut impl FnMut(&mut Ex
             visit(expr);
         }
     }
-    if let Some(join) = &mut select.join
-        && let Some(on) = &mut join.on
-    {
-        visit(on);
+    for join in &mut select.joins {
+        if let Some(on) = &mut join.on {
+            visit(on);
+        }
     }
     for expr in select
         .filter

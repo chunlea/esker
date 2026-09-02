@@ -843,7 +843,12 @@ impl Executor {
         let mut owned;
         let select = if subquery::present(select) {
             owned = select.clone();
-            subquery::plan_subqueries(&mut owned, self.tenant, &Catalogued { exec: self, txn })?;
+            subquery::plan_subqueries(
+                &mut owned,
+                self.tenant,
+                txn,
+                &Catalogued { exec: self, txn },
+            )?;
             &owned
         } else {
             select

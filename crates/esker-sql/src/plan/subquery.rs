@@ -84,6 +84,20 @@ impl SubqueryKind {
         }
     }
 
+    /// The comparison this kind puts between its operand and each of the subquery's values, or
+    /// `None` for the two kinds that have no operand.
+    ///
+    /// `IN` is `=` and `NOT IN` is `<>`, which is the other half of "`NOT IN` is `<> ALL`".
+    #[must_use]
+    pub fn comparison(self) -> Option<BinaryOp> {
+        match self {
+            SubqueryKind::Scalar | SubqueryKind::Exists { .. } => None,
+            SubqueryKind::In { negated: false } => Some(BinaryOp::Eq),
+            SubqueryKind::In { negated: true } => Some(BinaryOp::NotEq),
+            SubqueryKind::Quantified { op, .. } => Some(op),
+        }
+    }
+
     /// What a refusal calls this, in the words a user wrote.
     #[must_use]
     pub fn describe(self) -> &'static str {
