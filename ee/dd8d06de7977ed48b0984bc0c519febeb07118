@@ -1,0 +1,25 @@
+.config/nextest.toml
+  s_5887b8dc15d0eb::t_0f0094caaa6972 33-36,40
+crates/esker-cli/tests/columnar_cluster.rs
+  s_5887b8dc15d0eb::t_dea73c4571032b 1-282
+crates/esker-sql/src/bin/esker-sql.rs
+  s_5887b8dc15d0eb::t_417c79f455e55c 21,35-40,45-53,82-84,106,109,161-171,176,288,292,309-321,325,327
+docs/plans/phase-10-routing.md
+  s_5887b8dc15d0eb::t_e399dcdaf23632 343-357,399-408
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "eedd8d06de7977ed48b0984bc0c519febeb07118",
+  "prompts": {},
+  "sessions": {
+    "s_5887b8dc15d0eb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a3f26108-d8c6-4ca4-8418-c2dce63dbbae",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
