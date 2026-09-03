@@ -109,6 +109,7 @@ pub(super) fn create_table(
             missing: None,
             generated: None,
             comment: None,
+            dropped: false,
         });
         with_row_id.extend(columns);
         (with_row_id, vec![0], String::new())
@@ -233,6 +234,7 @@ fn declared_columns(create: &CreateTable) -> Result<Vec<ColumnDef>> {
             missing: None,
             generated: column.generated.clone(),
             comment: None,
+            dropped: false,
         });
     }
     Ok(columns)
@@ -2444,6 +2446,7 @@ pub(super) fn alter_table(
             missing: column.default.clone(),
             generated: None,
             comment: None,
+            dropped: false,
         });
         changed = true;
     }

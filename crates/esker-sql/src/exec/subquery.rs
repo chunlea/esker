@@ -216,6 +216,7 @@ pub(super) fn table_function_def(
             missing: None,
             generated: None,
             comment: None,
+            dropped: false,
         }],
         primary_key: Vec::new(),
         indexes: Vec::new(),
@@ -329,6 +330,7 @@ fn plan_derived(
             missing: None,
             generated: None,
             comment: None,
+            dropped: false,
         })
         .collect();
     derived.def = Some(std::sync::Arc::new(crate::catalog::TableDef {

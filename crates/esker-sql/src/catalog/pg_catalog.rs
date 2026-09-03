@@ -722,6 +722,7 @@ impl CatalogView {
                                 missing: None,
                                 generated: None,
                                 comment: None,
+                                dropped: false,
                             })
                             .collect(),
                         primary_key: Vec::new(),
