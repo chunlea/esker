@@ -1,0 +1,19 @@
+crates/esker-store/tests/cluster.rs
+  s_188859e919bef5::t_916ecd11b15826 138-211,475-490,510-520,522-530,545-551,553-556,558,560-578
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "331d8d997d9e8cd939f023f11122a553f72343c5",
+  "prompts": {},
+  "sessions": {
+    "s_188859e919bef5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5b0a7ebb-6297-4871-91b4-2650c25d6c33",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
