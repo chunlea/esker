@@ -231,6 +231,20 @@ pub enum Expr {
         /// `implicit` is its argument — `true` prepends `pg_catalog` and nothing else.
         all: Option<bool>,
     },
+    /// `current_setting(name)` and `current_setting(name, missing_ok)`.
+    ///
+    /// Folded to a literal in `crate::exec::Executor::bound`, the way [`Expr::CurrentSchema`] is
+    /// and for the same reason: the value is a property of the **session**, which the row
+    /// evaluator has no handle on — and a parameter cannot change in the middle of a statement, so
+    /// resolving it once per statement is not an approximation.
+    CurrentSetting {
+        /// The parameter's name, as written.
+        name: String,
+        /// `missing_ok`: the two-argument form's escape hatch. `true` answers NULL for a name the
+        /// server does not know where the one-argument form raises `42704` — the documented
+        /// difference, and the one shape here that must not error.
+        missing_ok: bool,
+    },
     /// `x IS NULL`, or `IS NOT NULL` when negated. Never NULL itself — that is the whole point of
     /// the operator, and the reason `x = NULL` is not a way to write it.
     IsNull {
@@ -544,6 +558,20 @@ pub fn like_matches(subject: &[char], pattern: &[char], escape: Option<char>) ->
         }
         p = star + 1;
         s = star_s;
+    }
+}
+
+/// `current_setting('x')` or `current_setting('x', true)`, as the call was written.
+///
+/// Its own function because two printers need the same two spellings — the plan's and the one
+/// `ALTER TABLE` deparses a stored default with — and because keeping it out of either match keeps
+/// both under the line limit.
+#[must_use]
+pub fn current_setting_text(name: &str, missing_ok: bool) -> String {
+    if missing_ok {
+        format!("current_setting('{name}', true)")
+    } else {
+        format!("current_setting('{name}')")
     }
 }
 
@@ -1548,6 +1576,7 @@ fn describe(expr: &Expr) -> &'static str {
         Expr::AnyArray { .. } => "= ANY",
         Expr::Subscript { .. } => "a subscript",
         Expr::Uuid(func) => func.name(),
+        Expr::CurrentSetting { .. } => "current_setting",
         Expr::CurrentSchema { all: None } => "current_schema",
         Expr::CurrentSchema { .. } => "current_schemas",
         Expr::Like {

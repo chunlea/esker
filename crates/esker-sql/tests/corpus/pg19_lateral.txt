@@ -1,0 +1,49 @@
+# **Implicit `LATERAL`** — a set-returning function in a comma `FROM` list that names the entry to
+# its left, as PostgreSQL 19beta1 answers it.
+#
+# `FROM pg_constraint c, generate_subscripts(c.conkey, 1) AS idx` is what `ActiveRecord`'s schema
+# dump writes, and it is the shape `tests/catalog_vectors.rs` declared as a gap: the function is
+# implicitly `LATERAL` there and the entries here were independent, so `c` was not in scope.
+#
+# Captured in one session inside `BEGIN … ROLLBACK`, error probes in `SAVEPOINT` / `ROLLBACK TO`.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **Only the entries to the left are visible.** `FROM lt l, unnest(l.tags) u` answers; the same
+#     two written the other way round is `42P01 missing FROM-clause entry for table "l"`. It is a
+#     rule about position, not about the pair.
+#   * **A function is implicitly `LATERAL`; a subquery is not.** `FROM lt l, (SELECT l.id) s` is
+#     `42P01 invalid reference to FROM-clause entry for table "l"` with a DETAIL and a HINT naming
+#     `LATERAL` — the same statement with the word written answers. Two shapes, one comma, two
+#     different rules.
+#   * **An empty result drops the outer row from an inner join and keeps it in a left one.**
+#     `unnest('{}')` makes `id = 3` vanish under a comma and survive with NULL under
+#     `LEFT JOIN … ON true`. No rule of its own: it is what a join does with no matching row.
+#   * A function with **no** outer reference is an ordinary cross join: `lt` (3 rows) with
+#     `generate_series(1,2)` is six.
+#   * The outer row is visible in the *target list* through the lateral value too:
+#     `l.tags[i]` picks the element the subscript names.
+BEGIN		-
+CREATE TABLE lt (id bigint primary key, tags text[])		-
+INSERT INTO lt VALUES (1, '{x,y}'), (2, '{z}'), (3, '{}')		-
+SELECT 'r', l.id, u FROM lt l, unnest(l.tags) AS u ORDER BY l.id, u	text,bigint,text	r|1|x ; r|1|y ; r|2|z
+SELECT 'r', l.id, i FROM lt l, generate_subscripts(l.tags, 1) AS i ORDER BY l.id, i	text,bigint,integer	r|1|1 ; r|1|2 ; r|2|1
+SELECT 'r', l.id, i, l.tags[i] FROM lt l, generate_subscripts(l.tags, 1) AS i ORDER BY l.id, i	text,bigint,integer,text	r|1|1|x ; r|1|2|y ; r|2|1|z
+SELECT 'r', l.id, u FROM lt l JOIN unnest(l.tags) AS u ON true ORDER BY l.id, u	text,bigint,text	r|1|x ; r|1|y ; r|2|z
+SELECT 'r', l.id, u FROM lt l LEFT JOIN unnest(l.tags) AS u ON true ORDER BY l.id, u	text,bigint,text	r|1|x ; r|1|y ; r|2|z ; r|3|\N
+SELECT 'r', count(*) FROM lt l, unnest(l.tags) AS u	text,bigint	r|3
+SAVEPOINT s1		-
+SELECT 'r', u FROM unnest(l.tags) AS u, lt l	!42P01 missing FROM-clause entry for table "l"
+ROLLBACK TO s1		-
+SAVEPOINT s2		-
+SELECT 'r', s.x FROM lt l, (SELECT l.id AS x) s	!42P01 invalid reference to FROM-clause entry for table "l" DETAIL: There is an entry for table "l", but it cannot be referenced from this part of the query. HINT: To reference that table, you must mark this subquery with LATERAL.
+ROLLBACK TO s2		-
+SELECT 'r', s.x FROM lt l, LATERAL (SELECT l.id AS x) s ORDER BY s.x	text,bigint	r|1 ; r|2 ; r|3
+SELECT 'r', l.id, g FROM lt l, generate_series(1, 2) AS g ORDER BY l.id, g	text,bigint,integer	r|1|1 ; r|1|2 ; r|2|1 ; r|2|2 ; r|3|1 ; r|3|2
+SELECT 'r', l.id, u FROM lt l, unnest(l.tags) u ORDER BY l.id, u	text,bigint,text	r|1|x ; r|1|y ; r|2|z
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname = 'lt'	bigint	0

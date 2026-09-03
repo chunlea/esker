@@ -565,7 +565,7 @@ fn lower_set(set: &sqlparser::ast::Set) -> Result<plan::Statement> {
             hivevar,
             variable,
             values,
-        } if guc_name(variable).is_some_and(|name| crate::parameter::lookup(&name).is_ok()) => {
+        } if is_guc_assignment(variable) => {
             refuse_if(*hivevar, "SET HIVEVAR")?;
             let name = guc_name(variable).unwrap_or_default();
             // `SET LOCAL` is undone when the transaction ends, whichever way it ends — which needs
@@ -684,7 +684,7 @@ fn lower_reset(reset: &sqlparser::ast::ResetStatement) -> Result<plan::Statement
                 },
             ))
         }
-        Reset::ALL => Err(SqlError::unsupported("RESET ALL")),
+        Reset::ALL => Ok(plan::Statement::Session(plan::SessionStatement::ResetAll)),
         // Named with `guc_name` rather than `object_name`: a parameter is not a relation, so a
         // qualified one must not be refused as "a qualified name". `esker.no_such_thing` is a
         // parameter this node does not have, which is `42704` and not a feature gap.
@@ -742,11 +742,24 @@ fn guc_list_item(value: &Expr) -> String {
     }
 }
 
+/// Whether a `SET` names a run-time parameter at all, known or not.
+///
+/// **A name this node has never heard of is still a `SET`**, and its answer is `42704` from the
+/// executor rather than `0A000` from here: a real server parses the statement and raises
+/// "unrecognized configuration parameter" when it runs, so refusing at lowering would both use the
+/// wrong SQLSTATE and use it earlier. Contract C2 is about constructs this node cannot *do*, and
+/// this is one it does — for a parameter that does not exist.
+fn is_guc_assignment(variable: &ObjectName) -> bool {
+    guc_name(variable).is_some()
+}
+
 /// The feature name for a `SET` this node does not execute.
 ///
 /// Rendered from the statement rather than from the AST variant, so a user is told the construct
-/// they wrote — and a *named* parameter is named, because "SET is not supported" tells somebody
-/// who set `search_path` nothing about which of their statements to remove.
+/// they wrote. **What reaches it is no longer a named parameter**: every `SET <name> = <value>`
+/// now lowers, so what is left here is the spellings that are not an assignment at all —
+/// `SET TRANSACTION`, `SET ROLE`, `SET CONSTRAINTS` — plus the assignment whose variable has no
+/// name, which the `None` arm below is for.
 fn set_feature_name(set: &sqlparser::ast::Set) -> String {
     use sqlparser::ast::Set;
 
@@ -2854,6 +2867,45 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
             all: Some(implicit),
         });
     }
+    // `current_setting(name)` and `current_setting(name, missing_ok)`. The **name is not checked
+    // here**: a real server parses `current_setting('nosuch')` and raises `42704` when it runs, so
+    // refusing at lowering would answer earlier than PostgreSQL does — the reading `SET` already
+    // takes for the same reason.
+    if name.eq_ignore_ascii_case("current_setting") {
+        let FunctionArguments::List(FunctionArgumentList { args, .. }) = &function.args else {
+            return Err(SqlError::UndefinedFunction("current_setting()".to_owned()));
+        };
+        let text = |arg: &FunctionArg| match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(value))) => match &value.value {
+                Value::SingleQuotedString(text) => Some(text.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let flag = |arg: &FunctionArg| match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(value))) => match value.value {
+                Value::Boolean(flag) => Some(flag),
+                _ => None,
+            },
+            _ => None,
+        };
+        let setting = match args.as_slice() {
+            [one] => text(one).map(|name| (name, false)),
+            [one, two] => text(one).zip(flag(two)),
+            _ => {
+                refuse_wrong_arity(function, "current_setting", 1)?;
+                None
+            }
+        };
+        let Some((name, missing_ok)) = setting else {
+            // A wrong **type** is `42883` naming the signature, the reading `current_schemas`
+            // takes: PostgreSQL resolves by name *and* argument types.
+            return Err(SqlError::UndefinedFunctionTypes(
+                "current_setting(...)".to_owned(),
+            ));
+        };
+        return Ok(plan::Expr::CurrentSetting { name, missing_ok });
+    }
     // `lower` and `upper`, the two scalar functions this node has. Both take exactly one
     // argument and a wrong count is `42883` naming the signature, not a badly-called function —
     // `lower()` and `lower('a','b')` are each their own message, measured.
@@ -4789,6 +4841,47 @@ fn join_constraint(constraint: &JoinConstraint) -> Result<(Option<plan::Expr>, V
 )]
 fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
     match factor {
+        // **`sqlparser` gives `UNNEST` a `TableFactor` of its own**, where every other table
+        // function is a `Table` with arguments — so the same call that lowers one way in the
+        // target list arrives here in another shape, and both have to end at the same
+        // `plan::TableFunction`. `WITH OFFSET` and `WITH ORDINALITY` add a second column, which is
+        // a different relation from the one this node builds.
+        TableFactor::UNNEST {
+            alias,
+            array_exprs,
+            with_offset,
+            with_offset_alias,
+            with_ordinality,
+        } => {
+            refuse_if(
+                *with_offset || with_offset_alias.is_some(),
+                "UNNEST WITH OFFSET",
+            )?;
+            refuse_if(*with_ordinality, "UNNEST WITH ORDINALITY")?;
+            let alias = match alias {
+                None => None,
+                Some(alias) => {
+                    refuse_if(!alias.columns.is_empty(), "a column alias list")?;
+                    Some(ident(&alias.name))
+                }
+            };
+            let args = array_exprs
+                .iter()
+                .map(lower_expr)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(plan::TableRef {
+                values: None,
+                name: "unnest".to_owned(),
+                alias,
+                derived: None,
+                function: Some(Box::new(plan::TableFunction {
+                    name: "unnest".to_owned(),
+                    args,
+                    def: None,
+                })),
+                hidden_cte: false,
+            })
+        }
         TableFactor::Table {
             name,
             alias,
@@ -4805,7 +4898,10 @@ fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
             if let Some(args) = args {
                 let folded = relation_name(name)?;
                 refuse_if(
-                    !matches!(folded.as_str(), "generate_subscripts" | "generate_series"),
+                    !matches!(
+                        folded.as_str(),
+                        "generate_subscripts" | "generate_series" | "unnest"
+                    ),
                     format!("the table function {folded}"),
                 )?;
                 let alias = match alias {

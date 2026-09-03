@@ -27,15 +27,13 @@ const FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    answers: &[(
-        "SET no_such_parameter = 1",
-        "PostgreSQL answers 42704 because an un-namespaced name it does not know cannot be a \
-             custom GUC. This node cannot tell `work_mem` — a parameter a real server has and \
-             this one does not — from a name nobody has, without carrying PostgreSQL's whole GUC \
-             table; so a SET it does not run is 0A000 naming it, which is contract C2 and does \
-             not claim the parameter is absent. `SHOW` and `RESET` answer 42704 for both, which \
-             is the same trade made the other way and is older than this unit.",
-    )],
+    // **This list was one entry and is now none.** It held `SET no_such_parameter = 1`, on the
+    // argument that a `SET` this node does not run should be `0A000` naming it rather than a claim
+    // that the parameter is absent — and the `SET`-parameters unit ruled the other way, because
+    // `SHOW` and `RESET` had been answering `42704` for the same name all along. Three entry
+    // points disagreeing about whether a name exists was the worse answer; they now agree, and the
+    // entry is deleted rather than kept (ADR 0031's rule 2).
+    answers: &[],
 };
 
 #[test]

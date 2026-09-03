@@ -114,6 +114,9 @@ enum Kind<'a> {
     /// A nested-loop join. The outer side streams; the inner side is either one probe per outer
     /// row (at most one row back) or the whole inner table, read once and paired with each.
     NestedLoop {
+        /// The inner side's call, when it is a set-returning function: its rows depend on the
+        /// outer row, so they are recomputed for each one instead of materialised once.
+        lateral: Option<Box<crate::plan::TableFunction>>,
         outer: Box<Cursor<'a>>,
         left_join: bool,
         inner_table_id: u64,
@@ -257,6 +260,15 @@ impl<'a> Cursor<'a> {
                     probe,
                 )?;
                 Kind::NestedLoop {
+                    // **The inner side is a set-returning function, so it is lateral.** Its rows
+                    // are computed from the *outer* row rather than once at open — which is what
+                    // `FROM lt l, unnest(l.tags) u` means and what makes `l` visible inside it. A
+                    // function with no outer reference recomputes the same rows per outer row,
+                    // which is the cross join it is.
+                    lateral: match inner_plan.as_deref() {
+                        Some(Node::TableFunction { call, .. }) => Some(call.clone()),
+                        _ => None,
+                    },
                     outer: Box::new(Cursor::open(txn, tenant, outer)?),
                     left_join: *left_join,
                     inner_table_id: *inner_table_id,
@@ -417,6 +429,7 @@ impl<'a> Cursor<'a> {
             }
 
             Kind::NestedLoop {
+                lateral,
                 outer,
                 left_join,
                 inner_table_id,
@@ -478,6 +491,15 @@ impl<'a> Cursor<'a> {
                         }
                     }
                     Probe::Materialize => {
+                        // A lateral inner side is computed from this outer row, once, when the
+                        // row is first reached. An **empty** result is what makes the outer row
+                        // disappear from an inner join and survive a left one, with no rule of
+                        // its own: the loop below already does both.
+                        if let Some(call) = lateral
+                            && *position == 0
+                        {
+                            *materialized = super::table_function::rows(call, row)?;
+                        }
                         let Some(inner) = materialized.get(*position) else {
                             // The inner side is exhausted. A left join whose outer row kept no
                             // pair is emitted now, with every inner column NULL — and it is
@@ -1334,7 +1356,7 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         // Resolved before the plan was built (`crate::exec::Executor::bound`), exactly as a
         // `::regclass` is. One here means the resolution was skipped, and answering it from the
         // row would be reading a session this evaluator cannot see.
-        Expr::CurrentSchema { .. } => {
+        Expr::CurrentSchema { .. } | Expr::CurrentSetting { .. } => {
             return Err(SqlError::Internal(
                 "a current_schema reached the row evaluator unresolved".to_owned(),
             ));

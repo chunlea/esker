@@ -31,6 +31,12 @@ pub enum SessionStatement {
     },
     /// `SHOW esker.read_as_of`.
     ShowReadAsOf,
+    /// `RESET ALL`: every parameter back to its boot value in one statement.
+    ///
+    /// Its own variant rather than a loop of `SetParameter { value: None }`, because the set it
+    /// resets is *what the session has set* and only the executor knows that — and because a real
+    /// server's `RESET ALL` leaves the ones it cannot change alone rather than failing on them.
+    ResetAll,
     /// `SET TRANSACTION SNAPSHOT '<id>'`.
     SetSnapshot(String),
     /// `SET <parameter> = <value>`, for one of the parameters in [`crate::parameter`].
@@ -60,6 +66,10 @@ impl SessionStatement {
             SessionStatement::SetReadAsOf { .. }
             | SessionStatement::SetSnapshot(_)
             | SessionStatement::SetParameter { .. } => "SET",
+            // **`RESET`, not `SET`.** A `RESET ALL` reports its own verb, which is what a client
+            // reading the command tag expects; `RESET <name>` is a `SetParameter` with no value
+            // and reports `SET`, exactly as a real server does. Measured, both.
+            SessionStatement::ResetAll => "RESET",
             SessionStatement::ShowReadAsOf | SessionStatement::ShowParameter(_) => "SHOW",
         }
     }

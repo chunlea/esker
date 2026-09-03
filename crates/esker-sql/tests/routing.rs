@@ -31,8 +31,12 @@ use esker_sql::pgwire::session::{Execute, Outcome, Params};
 
 /// Statements a real PostgreSQL answers differently, each with its reason.
 ///
-/// All six are in the **safe** direction: this node refuses something PostgreSQL accepts and does
+/// All five are in the **safe** direction: this node refuses something PostgreSQL accepts and does
 /// nothing with. None of them is this node answering a question PostgreSQL answers, differently.
+///
+/// There were six. `SET engine = 'row'` left the list when the `SET`-parameters unit made an
+/// unknown name `42704` from `SET` as well as from `SHOW` and `RESET`, which is what PostgreSQL
+/// answers for it — so that line agrees now and its row is deleted (ADR 0031 rule 2).
 const DIVERGENCES: &[(&str, &str)] = &[
     (
         "SET esker.engine = 'sideways'",
@@ -51,16 +55,12 @@ const DIVERGENCES: &[(&str, &str)] = &[
     ),
     (
         "SET nonesker.engine = 'row'",
-        "PostgreSQL accepts any namespaced name and stores it. This node has a list of the \
-         parameters it means and answers `0A000` naming the statement for anything else; \
-         answering `42704` instead would claim a parameter does not exist when what is true is \
-         that this node does not have it.",
-    ),
-    (
-        "SET engine = 'row'",
-        "PostgreSQL knows which parameters it has, so an un-namespaced name it does not \
-         recognise is `42704`. This node does not have that list and applies the only safe half \
-         of the rule, exactly as `pg19_time_machine.txt` records for `SET nonamespace_thing`.",
+        "PostgreSQL accepts **any** namespaced name and stores it, validating nothing — a custom \
+         GUC is whatever a session says it is. This node has a list of the parameters it means, \
+         and a name outside it is `42704` from all three of `SET`, `SHOW` and `RESET`: the \
+         `SET`-parameters unit made the three agree, where `SET` alone used to answer `0A000`. \
+         The divergence is the refusal, not its code — a namespaced name is one PostgreSQL would \
+         have accepted and this node will not act on.",
     ),
     (
         "RESET esker.never_existed",
