@@ -45,6 +45,11 @@ pub struct CreateTable {
 pub struct Column {
     /// Folded.
     pub name: String,
+    /// `GENERATED ALWAYS AS (expr) STORED`: the expression, normalised the way a `CHECK` is.
+    ///
+    /// A generated column is **not** a defaulted one: a writer may not supply a value for it at
+    /// all, and the catalog reports it in a different place (`catalog::ColumnDef::generated`).
+    pub generated: Option<String>,
     /// The type it was declared as.
     pub ty: ColumnType,
     /// PostgreSQL's `atttypmod` for the declaration, or `crate::value::NO_TYPMOD`. See

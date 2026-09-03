@@ -207,6 +207,7 @@ fn plan_derived(
             // projection above the sub-plan built it — so no row is ever short and there is
             // nothing to pad with.
             missing: None,
+            generated: None,
         })
         .collect();
     derived.def = Some(std::sync::Arc::new(crate::catalog::TableDef {

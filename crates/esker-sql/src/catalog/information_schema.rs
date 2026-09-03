@@ -79,7 +79,12 @@ pub fn columns(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
                 Datum::Text(table.name.clone()),
                 Datum::Text(column.name.clone()),
                 Datum::Int4(i32::try_from(position + 1).unwrap_or(i32::MAX)),
+                // **NULL for a generated column**, where `pg_attrdef` holds its expression:
+                // a generated column has no *default*, and this is the column that says so. The
+                // two views read one `pg_attrdef` row and disagree about what it is; measured, and
+                // a reader that looked here for a generation expression would find nothing.
                 match super::pg_attribute::default_expression(column, table, at) {
+                    _ if column.generated.is_some() => Datum::Null,
                     Some(expression) => Datum::Text(expression),
                     None => Datum::Null,
                 },
@@ -107,10 +112,24 @@ pub fn columns(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
                     Some(Identity::Always) => Datum::Text("ALWAYS".to_owned()),
                     None | Some(Identity::Default) => Datum::Null,
                 },
-                // `NEVER` for every column, including an identity one: `is_generated` is about a
-                // `GENERATED … AS (expr)` column and an identity is not one. Measured — an
-                // identity column is `is_identity YES` and `is_generated NEVER` at once.
-                Datum::Text("NEVER".to_owned()),
+                // `ALWAYS` for a `GENERATED … AS (expr) STORED` column and `NEVER` for every
+                // other, **including an identity one**: `is_generated` is about a generation
+                // expression and an identity is not one. Measured — an identity column is
+                // `is_identity YES` and `is_generated NEVER` at once.
+                Datum::Text(
+                    if column.generated.is_some() {
+                        "ALWAYS"
+                    } else {
+                        "NEVER"
+                    }
+                    .to_owned(),
+                ),
+                // The expression itself, where `column_default` above is **NULL** for the same
+                // column: one `pg_attrdef` row, and the two views disagree about what it is.
+                match &column.generated {
+                    Some(expr) => Datum::Text(expr.clone()),
+                    None => Datum::Null,
+                },
             ]);
         }
     }
@@ -278,6 +297,9 @@ pub const COLUMNS_COLUMNS: &[(&str, ColumnType)] = &[
     ("is_identity", ColumnType::Text),
     ("identity_generation", ColumnType::Text),
     ("is_generated", ColumnType::Text),
+    // **Last**, the rule `pg_type`'s columns follow: `SELECT *` expands in declared order, so a
+    // column added anywhere else moves every one after it.
+    ("generation_expression", ColumnType::Text),
 ];
 
 /// The columns of `information_schema.table_constraints`, in the standard's order.

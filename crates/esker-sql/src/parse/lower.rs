@@ -770,6 +770,10 @@ fn refuse_create_table_clauses(create: &sqlparser::ast::CreateTable) -> Result<(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per column option; splitting the loop would hide the vocabulary rather than clarify it"
+)]
 fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::CreateTable> {
     refuse_create_table_clauses(create)?;
 
@@ -790,6 +794,7 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
         // `bigserial` is the type saying it; `GENERATED ... AS IDENTITY` is an option saying it.
         // Both end here, because what they produce is the same record.
         let mut sequence = serial_identity(&column.data_type);
+        let mut generated: Option<String> = None;
         for option in &column.options {
             match &option.option {
                 // A column `CHECK`, named the way PostgreSQL names one when nothing else does:
@@ -840,18 +845,24 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
                     primary_key.push(column_name.clone());
                     primary_key_name = primary_key_name.or_else(|| option.name.as_ref().map(ident));
                 }
+                // **Two different features under one keyword**, told apart by whether an
+                // expression was written: `GENERATED ALWAYS AS IDENTITY` brings a sequence and
+                // `GENERATED ALWAYS AS (expr) STORED` brings an expression.
                 ColumnOption::Generated {
                     generated_as,
                     sequence_options,
                     generation_expr,
+                    generation_expr_mode,
                     ..
-                } => {
-                    sequence = Some(identity_kind(
-                        *generated_as,
-                        sequence_options.as_deref(),
-                        generation_expr.as_ref(),
-                    )?);
-                }
+                } => match lower_generated(
+                    *generated_as,
+                    sequence_options.as_deref(),
+                    generation_expr.as_ref(),
+                    generation_expr_mode.as_ref(),
+                )? {
+                    Ok(expr) => generated = Some(expr),
+                    Err(identity) => sequence = Some(identity),
+                },
                 other => return Err(SqlError::unsupported(column_option_name(other))),
             }
         }
@@ -867,6 +878,7 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
             not_null,
             default,
             sequence,
+            generated,
         });
     }
 
@@ -995,6 +1007,10 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
                 not_null,
                 default,
                 sequence: None,
+                // `ADD COLUMN … GENERATED ALWAYS AS (…) STORED` would have to compute the
+                // expression for every row already there, which is a backfill and not a catalog
+                // write — refused by name with every other option this action does not take.
+                generated: None,
             },
             if_not_exists: *if_not_exists,
         });
@@ -1947,6 +1963,42 @@ fn qualifier(root: &Expr) -> Result<String> {
             "the access chain on {other}"
         ))),
     }
+}
+
+/// `GENERATED …` on a column: an **expression** or an **identity**, told apart by whether an
+/// expression was written.
+///
+/// `Ok(expr)` is a `GENERATED ALWAYS AS (expr) STORED` column and `Err(identity)` is one of the
+/// three identity kinds — a `Result` used as a two-way answer rather than as a failure, because
+/// both outcomes are success and the caller stores them in different fields.
+fn lower_generated(
+    generated_as: GeneratedAs,
+    sequence_options: Option<&[sqlparser::ast::SequenceOptions]>,
+    generation_expr: Option<&Expr>,
+    mode: Option<&sqlparser::ast::GeneratedExpressionMode>,
+) -> Result<std::result::Result<String, plan::Identity>> {
+    let Some(expr) = generation_expr else {
+        return Ok(Err(identity_kind(generated_as, sequence_options, None)?));
+    };
+    // `VIRTUAL` computes on read where `STORED` computes on write, so a node that took the word
+    // and stored anyway would answer the same value after the source changed under it. Named
+    // rather than approximated.
+    //
+    // **Currently unreachable, and kept anyway**: `sqlparser` 0.62.0 expects `STORED` and makes
+    // `VIRTUAL` a syntax error, which is a contract C1 gap in the plan's register — PostgreSQL 19
+    // takes the word and reports `attgenerated` `v`. This is what the day the parser learns it
+    // needs.
+    refuse_if(
+        matches!(mode, Some(sqlparser::ast::GeneratedExpressionMode::Virtual)),
+        "GENERATED ALWAYS AS (expression) VIRTUAL",
+    )?;
+    refuse_if(
+        generated_as == GeneratedAs::ByDefault,
+        "GENERATED BY DEFAULT AS (expression)",
+    )?;
+    // The **normalised** text, the way a `CHECK` and an index predicate are stored: `pg_get_expr`
+    // prints this back, so the parentheses a user wrote must not survive into the catalog.
+    Ok(Ok(unwrap_nested(expr).to_string()))
 }
 
 /// Which volatile function a `DEFAULT` clause names, or `None` for anything else.

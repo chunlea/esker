@@ -216,6 +216,14 @@ pub(super) fn insert(
                     column: column.name.clone(),
                 });
             }
+            // A `GENERATED ALWAYS AS (…) STORED` column refuses one too, with its **own** sentence
+            // — `cannot insert a non-DEFAULT value into column "x"`, where an `UPDATE` says
+            // `column "x" can only be updated to DEFAULT`. One SQLSTATE, two messages, measured.
+            if column.generated.is_some() {
+                return Err(SqlError::GeneratedColumnInsert {
+                    column: column.name.clone(),
+                });
+            }
             row[*target] = expr.evaluate(column.ty, &column.name)?;
         }
         // A sequence fills its column when the statement did not name it, or named it and wrote
@@ -247,6 +255,7 @@ pub(super) fn insert(
         }
 
         fit_typmods(&table, &mut row)?;
+        fill_generated(&table, &mut row)?;
         check_not_null(&table, &row)?;
         check_constraints(&table, &row)?;
         write_row(executor, txn, &table, &row, written)?;
@@ -426,6 +435,14 @@ pub(super) fn update(
         let mut new = old.clone();
         for (ordinal, value) in &assignments {
             let column = &table.columns[*ordinal];
+            // A `GENERATED ALWAYS AS (…) STORED` column takes `DEFAULT` and nothing else, and
+            // an `UPDATE`'s sentence for that is **not** the `INSERT`'s: `column "x" can only be
+            // updated to DEFAULT`. Measured, both.
+            if column.generated.is_some() && !matches!(value, crate::plan::Expr::Default) {
+                return Err(SqlError::GeneratedColumnUpdate {
+                    column: column.name.clone(),
+                });
+            }
             // Evaluated against the row as it was, so `SET a = b, b = a` swaps them.
             let evaluated = match value {
                 // `SET a = DEFAULT` is the column's own default, which for a sequence column is
@@ -456,6 +473,9 @@ pub(super) fn update(
             new[*ordinal] = evaluated;
         }
         fit_typmods(&table, &mut new)?;
+        // The column is a function of the row, so an `UPDATE` that moved its source moves it too
+        // — and a `SET generated = DEFAULT` recomputes rather than storing NULL.
+        fill_generated(&table, &mut new)?;
         check_not_null(&table, &new)?;
         check_constraints(&table, &new)?;
         // Anything pointing at the row's **old** key. Refusing comes first, so a `RESTRICT` leaves
@@ -548,6 +568,41 @@ fn collect(
 /// once when the table is loaded; it is not, because the catalog caches a `TableDef` and a lowered
 /// expression would have to be invalidated with it. Re-lowering a short predicate per row is the
 /// cheaper mistake to make, and the only one that cannot go stale.
+/// Computes every `GENERATED ALWAYS AS (…) STORED` column of a row.
+///
+/// **After the values and before the checks**, and both halves of that matter: after, because the
+/// expression reads the columns the statement just wrote; before, because a `CHECK` or a `NOT
+/// NULL` on a generated column is about the value the expression produced.
+///
+/// Run on **every write**, not only on insert — the column is a function of the row, so an
+/// `UPDATE` that moves its source moves it too. Measured: `UPDATE gen SET name = 'zoe'` carries
+/// `upper_name` with it.
+///
+/// The expression is re-lowered from its stored text per row, the trade
+/// [`check_constraints`] already makes and for the same reason.
+fn fill_generated(table: &TableDef, row: &mut [Datum]) -> Result<()> {
+    for (at, column) in table.columns.iter().enumerate() {
+        let Some(expr) = &column.generated else {
+            continue;
+        };
+        let parsed = crate::parse::parse_stored_expr(expr).map_err(|error| {
+            SqlError::Internal(format!(
+                "the stored generation expression of {}.{} no longer parses: {error}",
+                table.name, column.name
+            ))
+        })?;
+        let scope = query::Scope::single(table);
+        let resolved = query::resolve(&parsed, &scope).map_err(|error| {
+            SqlError::Internal(format!(
+                "the stored generation expression of {}.{} no longer resolves: {error}",
+                table.name, column.name
+            ))
+        })?;
+        row[at] = cursor::evaluate(&resolved, row)?;
+    }
+    Ok(())
+}
+
 fn check_constraints(table: &TableDef, row: &[Datum]) -> Result<()> {
     for check in &table.checks {
         let parsed = crate::parse::parse_stored_expr(&check.expr).map_err(|error| {

@@ -83,6 +83,7 @@ pub(super) fn create_table(
             // The executor fills it on every insert, so it has neither.
             default: None,
             missing: None,
+            generated: None,
         });
         with_row_id.extend(columns);
         (with_row_id, vec![0], String::new())
@@ -170,6 +171,7 @@ fn declared_columns(create: &CreateTable) -> Result<Vec<ColumnDef>> {
             // column the table was created with, so there is no narrower row for a pad to answer
             // for — and writing one would be a claim about rows that cannot exist.
             missing: None,
+            generated: column.generated.clone(),
         });
     }
     Ok(columns)
@@ -1142,6 +1144,7 @@ pub(super) fn alter_table(
             // (`docs/plans/phase-6e.md` §5 unit 1). One field for both would rewrite history the
             // first time somebody changed a default.
             missing: column.default.clone(),
+            generated: None,
         });
         changed = true;
     }

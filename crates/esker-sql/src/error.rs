@@ -850,6 +850,26 @@ pub enum SqlError {
     #[error("function {0} does not exist")]
     UndefinedFunctionName(String),
 
+    /// A value written into a `GENERATED ALWAYS AS (…) STORED` column by an `INSERT`: `428C9`.
+    ///
+    /// **Two sentences under one SQLSTATE**, measured: an `INSERT` is
+    /// `cannot insert a non-DEFAULT value into column "x"` and an `UPDATE` is
+    /// [`SqlError::GeneratedColumnUpdate`]'s `column "x" can only be updated to DEFAULT`. The
+    /// `DETAIL` is the same for both and is what says why. `DEFAULT` is accepted by both, which is
+    /// the same asymmetry `GENERATED ALWAYS AS IDENTITY` has.
+    #[error("cannot insert a non-DEFAULT value into column \"{column}\"")]
+    GeneratedColumnInsert {
+        /// The generated column.
+        column: String,
+    },
+
+    /// The same, for an `UPDATE`, which PostgreSQL words differently: `428C9`.
+    #[error("column \"{column}\" can only be updated to DEFAULT")]
+    GeneratedColumnUpdate {
+        /// The generated column.
+        column: String,
+    },
+
     /// `CREATE EXTENSION x` where `x` is already installed: `42710 duplicate_object`.
     ///
     /// `IF NOT EXISTS` turns this into a plain success — that is the **only** thing the clause
@@ -1208,7 +1228,9 @@ impl SqlError {
             | SqlError::UndefinedFunctionName(_)
             | SqlError::UndefinedAggregateArity { .. } => sqlstate::UNDEFINED_FUNCTION,
             SqlError::ParameterlessAggregate => sqlstate::WRONG_OBJECT_TYPE,
-            SqlError::GeneratedAlways { .. } => sqlstate::GENERATED_ALWAYS,
+            SqlError::GeneratedAlways { .. }
+            | SqlError::GeneratedColumnInsert { .. }
+            | SqlError::GeneratedColumnUpdate { .. } => sqlstate::GENERATED_ALWAYS,
             SqlError::SequenceNotYetDefined(_) => sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
             SqlError::NoSuchSavepoint(_) => sqlstate::NO_SUCH_SAVEPOINT,
             SqlError::GroupingError(_) | SqlError::AggregateNotAllowed(_) => {
@@ -1328,6 +1350,12 @@ impl SqlError {
             }
             SqlError::UndefinedAggregateArity { .. } | SqlError::UndefinedFunction(_) => {
                 Some("No function of that name accepts the given number of arguments.".to_owned())
+            }
+            // The same sentence under both spellings, which is what says *why* two different
+            // messages share one SQLSTATE.
+            SqlError::GeneratedColumnInsert { column }
+            | SqlError::GeneratedColumnUpdate { column } => {
+                Some(format!("Column \"{column}\" is a generated column."))
             }
             SqlError::GeneratedAlways { column } => Some(format!(
                 "Column \"{column}\" is an identity column defined as GENERATED ALWAYS."

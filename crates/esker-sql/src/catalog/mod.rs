@@ -135,6 +135,17 @@ pub struct ColumnDef {
     /// column still read `old` and new rows get `new`. Storing one field for both would rewrite
     /// history the first time somebody changed a default.
     pub missing: Option<Datum>,
+    /// `GENERATED ALWAYS AS (expr) STORED`: the expression, as text.
+    ///
+    /// Text and re-lowered per write, the trade [`CheckDef`] and an index expression already make
+    /// — and for the extra reason that `pg_get_expr` has to print it back anyway.
+    ///
+    /// **A generated column is not a defaulted one**, and the catalog says so twice: it is
+    /// `pg_attrdef`'s expression *and* `information_schema.columns.column_default` is NULL for it,
+    /// with `generation_expression` carrying the text instead. Measured. So this is its own field
+    /// rather than a flag beside [`ColumnDef::default`] — the two are read by different columns of
+    /// different views, and a writer may not supply a value for this one at all.
+    pub generated: Option<String>,
 }
 
 /// A column default that is **not a constant**: which volatile function fills it.
@@ -1880,6 +1891,7 @@ mod tests {
                     not_null: true,
                     default: None,
                     missing: None,
+                    generated: None,
                 },
                 ColumnDef {
                     name: "email".into(),
@@ -1889,6 +1901,7 @@ mod tests {
                     not_null: false,
                     default: None,
                     missing: None,
+                    generated: None,
                 },
             ],
             primary_key: vec![0],
@@ -2059,6 +2072,8 @@ mod tests {
                 "00", // version 10: no FOREIGN KEY constraints
                 "00", // version 11: the one index is not NULLS NOT DISTINCT
                 "00", // version 12: its triggers have not been disabled
+                "00", // version 13: neither column is generated
+                "00",
             )
         );
         assert_eq!(record::decode_table(&encoded).unwrap(), accounts(7));
@@ -2519,6 +2534,7 @@ mod tests {
             not_null: false,
             default: None,
             missing: None,
+            generated: None,
         });
         table.columns.push(ColumnDef {
             name: "c".into(),
@@ -2528,6 +2544,7 @@ mod tests {
             not_null: false,
             default: None,
             missing: None,
+            generated: None,
         });
         table.columns.push(ColumnDef {
             name: "t".into(),
@@ -2537,6 +2554,7 @@ mod tests {
             not_null: false,
             default: None,
             missing: None,
+            generated: None,
         });
         let back = record::decode_table(&record::encode_table(&table).unwrap()).unwrap();
         assert_eq!(back, table);
@@ -2965,6 +2983,7 @@ mod tests {
             not_null: true,
             default: Some(Datum::Int8(42)),
             missing: Some(Datum::Int8(42)),
+            generated: None,
         });
         let (_, published) =
             record::decode_columnar(&record::encode_columnar(1, Some(&widened)).unwrap()).unwrap();

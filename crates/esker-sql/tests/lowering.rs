@@ -46,13 +46,15 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
             "CREATE TABLE t (a int8 DEFAULT (1+1))",
             "DEFAULT (1 + 1), which is not a constant",
         ),
-        // The identity forms run now (phase 9 unit 2). The computed column that shares their
-        // grammar does not, and neither do the sequence options after one -- a `START WITH` this
-        // node ignored would hand out numbers nobody asked for.
-        (
-            "CREATE TABLE t (a int8, b int8 GENERATED ALWAYS AS (a * 2) STORED)",
-            "GENERATED ALWAYS AS (expression) STORED",
-        ),
+        // The identity forms run, and so does the computed column that shares their grammar:
+        // `GENERATED ALWAYS AS (expr) STORED` landed with statement 738. **`VIRTUAL` is not on
+        // this list and is not implemented either** — `sqlparser` 0.62.0 cannot parse the word, so
+        // it is a *syntax error* rather than a `0A000`, which is a contract **C1** gap and is in
+        // the plan's register rather than here. The lowering refuses it by name for the day the
+        // parser can read it.
+        //
+        // The sequence options after an identity are still named: a `START WITH` this node
+        // ignored would hand out numbers nobody asked for.
         (
             "CREATE TABLE t (a int8 GENERATED ALWAYS AS IDENTITY (START WITH 100))",
             "a sequence option on an identity column",

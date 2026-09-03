@@ -1,0 +1,51 @@
+# `GENERATED ALWAYS AS (expr) STORED` — statement 741 of `postgresql_specific_schema.rb`.
+#
+# The suite's own column is
+# `"virtual_stored_number" integer GENERATED ALWAYS AS (random_number * 10) STORED`, whose
+# expression needs **integer arithmetic this node does not have** — `*` is `0A000` naming itself
+# for every type. So the clause is exercised here with an expression this node can compute,
+# `upper(name)`, and the statement's own remains blocked on the operator rather than on the
+# clause. That is stated in the register rather than hidden: 741 does not run yet, and what stops
+# it is not this unit.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`INSERT` and `UPDATE` refuse it with two different sentences**, under one SQLSTATE:
+#     `428C9 cannot insert a non-DEFAULT value into column "x"` and
+#     `428C9 column "x" can only be updated to DEFAULT`. Same `DETAIL` — `Column "x" is a
+#     generated column.` — and an implementation that reused one message for both would be wrong
+#     half the time.
+#   * **`DEFAULT` is accepted where a value is not**, in both statements, and it recomputes rather
+#     than storing NULL. The asymmetry is the same one `GENERATED ALWAYS AS IDENTITY` has.
+#   * **The expression lives where a default does**, but a generated column has no default:
+#     `pg_get_expr(adbin, adrelid)` on `pg_attrdef` returns it, while
+#     `information_schema.columns.column_default` for the same column is **NULL** and
+#     `generation_expression` carries it instead. A reader that looked at `column_default` would
+#     find nothing.
+#   * **`attgenerated` is `s`**, one character, where an ordinary column's is the empty string.
+#   * **It recomputes when its source changes.** `UPDATE gen SET name = 'zoe'` moves `upper_name`
+#     with it — the column is a function of the row, re-evaluated on every write, not a value
+#     computed once at insert.
+#   * **A NULL source gives a NULL generated value**, and the column is nullable: `attnotnull` is
+#     `f` for it, so nothing forces the expression to produce a value.
+CREATE TABLE gen (id int8 PRIMARY KEY, name text, upper_name text GENERATED ALWAYS AS (upper(name)) STORED)		-
+SELECT attname, attgenerated, attnotnull FROM pg_attribute WHERE attrelid = 'gen'::regclass AND attnum > 0 ORDER BY attnum	name,"char",boolean	id||t ; name||f ; upper_name|s|f
+SELECT a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'gen'::regclass	name,text	upper_name|upper(name)
+SELECT column_name, column_default, is_generated, generation_expression FROM information_schema.columns WHERE table_name = 'gen' AND column_name = 'upper_name'	name,character varying,character varying,character varying	upper_name|\N|ALWAYS|upper(name)
+INSERT INTO gen (id, name) VALUES (1, 'ada')		-
+SELECT id, name, upper_name FROM gen ORDER BY id	bigint,text,text	1|ada|ADA
+INSERT INTO gen (id, name, upper_name) VALUES (2, 'bob', 'BOB')	!428C9 cannot insert a non-DEFAULT value into column "upper_name" DETAIL: Column "upper_name" is a generated column.
+INSERT INTO gen (id, name, upper_name) VALUES (2, 'bob', DEFAULT)		-
+SELECT id, name, upper_name FROM gen ORDER BY id	bigint,text,text	1|ada|ADA ; 2|bob|BOB
+UPDATE gen SET name = 'zoe' WHERE id = 1		-
+SELECT id, name, upper_name FROM gen ORDER BY id	bigint,text,text	1|zoe|ZOE ; 2|bob|BOB
+UPDATE gen SET upper_name = 'X' WHERE id = 1	!428C9 column "upper_name" can only be updated to DEFAULT DETAIL: Column "upper_name" is a generated column.
+UPDATE gen SET upper_name = DEFAULT WHERE id = 1		-
+INSERT INTO gen (id, name) VALUES (3, NULL)		-
+SELECT id, upper_name IS NULL FROM gen WHERE id = 3	bigint,boolean	3|t
+INSERT INTO gen VALUES (4, 'kit', 'KIT')	!428C9 cannot insert a non-DEFAULT value into column "upper_name" DETAIL: Column "upper_name" is a generated column.
+SELECT count(*) FROM gen	bigint	3

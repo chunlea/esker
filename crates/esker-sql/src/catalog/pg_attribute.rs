@@ -57,6 +57,10 @@ use crate::value::{ColumnType, Datum, PgType};
 /// and what `ActiveRecord` would then treat as a missing column rather than an ordinary one.
 const NOT_IDENTITY: &str = "";
 
+/// `attgenerated` for a `GENERATED ALWAYS AS (…) STORED` column. A real server's other value is
+/// `v`, for a *virtual* one — computed on read, which this node refuses by name.
+const STORED_GENERATED: &str = "s";
+
 /// `attcollation`: none, for every column of every type.
 ///
 /// A real server says `100` for a `text` column and `0` for an `int8` one, and its `pg_type` says
@@ -153,6 +157,7 @@ fn columns_of<'a>(
                                 volatile_default: None,
                                 default: None,
                                 missing: None,
+                                generated: None,
                             }),
                             // No position in the table: there is no column under it, which is
                             // what `attnum = 0` says in `pg_index.indkey` for the same part.
@@ -212,8 +217,17 @@ fn attribute(
         Datum::Bool(own && column.not_null),
         Datum::Bool(has_default),
         Datum::Text(identity.to_owned()),
-        // No generated columns: `GENERATED ... AS (expr) STORED` is `0A000` here.
-        Datum::Text(NOT_IDENTITY.to_owned()),
+        // **`s` for a stored generated column**, one character, and the empty string for every
+        // other — the same shape `attidentity` has. A real server's other value is `v`, for the
+        // virtual generated columns this node refuses by name.
+        Datum::Text(
+            if column.generated.is_some() && own {
+                STORED_GENERATED
+            } else {
+                NOT_IDENTITY
+            }
+            .to_owned(),
+        ),
         // Nothing can drop a column yet, so no column is dropped.
         Datum::Bool(false),
         Datum::Int8(NO_COLLATION),
@@ -231,6 +245,13 @@ pub fn default_expression(column: &ColumnDef, table: &TableDef, at: usize) -> Op
     // (`ColumnDef::default_now`) because a constant cannot express it. It prints unparenthesised,
     // exactly as written — measured, and unlike a computed default such as `DEFAULT 1 + 1`, which
     // a real server prints as `(1 + 1)`.
+    // **A generated column's expression lives where a default does.** `pg_get_expr(adbin,
+    // adrelid)` returns it — measured — while `information_schema.columns.column_default` for the
+    // same column is NULL and `generation_expression` carries the text instead. One `pg_attrdef`
+    // row, read by two views that disagree about what it is.
+    if let Some(generated) = &column.generated {
+        return Some(generated.clone());
+    }
     // A **volatile** default, which the catalog records as *which* one it is rather than as a
     // value (`ColumnDef::volatile_default`) because a constant cannot express it. It prints
     // unparenthesised, exactly as written — unlike a computed default such as `DEFAULT 1 + 1`,

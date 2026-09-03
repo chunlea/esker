@@ -926,6 +926,18 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
     // means and what the statement answered until now (`0A000`).
     out.push(u8::from(table.triggers_disabled));
 
+    // Version 13. One string per column, **after** version 12's byte — sections are appended in
+    // version order, and a reader takes them in that order too. Writing this one first put the
+    // triggers byte where the decoder expected a string length, which read a generation
+    // expression onto the wrong column and refused an ordinary `INSERT`.
+    //
+    // The expression of a `GENERATED ALWAYS AS (…) STORED` column, empty for every other. A
+    // version 12 table has none, which is what every table written before it had — the clause was
+    // `0A000` until now.
+    for column in &table.columns {
+        put_str(column.generated.as_deref().unwrap_or(""), &mut out);
+    }
+
     Ok(out)
 }
 
@@ -1047,6 +1059,22 @@ fn read_foreign_keys(reader: &mut Reader<'_>, columns: usize) -> Result<Vec<Fore
     Ok(keys)
 }
 
+/// The version 13 tail: one generation expression per column.
+///
+/// A version 12 column has none, which is what every column written before version 13 had — the
+/// clause was `0A000` until then. An **empty string is "not generated"**, and it is unambiguous:
+/// a generated column's expression is never empty, because the grammar has no empty parentheses.
+fn read_generation_expressions(reader: &mut Reader<'_>, columns: &mut [ColumnDef]) -> Result<()> {
+    if reader.version < 13 {
+        return Ok(());
+    }
+    for column in columns {
+        let expr = reader.string()?;
+        column.generated = (!expr.is_empty()).then_some(expr);
+    }
+    Ok(())
+}
+
 /// Reads a table record back. Every failure is typed: a catalog is on-disk data like any other.
 pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
     let mut reader = Reader::at_least(bytes, OLDEST_TABLE_VERSION)?;
@@ -1089,6 +1117,8 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
             volatile_default,
             default,
             missing,
+            // Filled from the version 13 section below, after every column has been read.
+            generated: None,
         });
     }
 
@@ -1153,6 +1183,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
     // A version 11 table has no flag, and `false` is what it meant: `DISABLE TRIGGER` was `0A000`
     // until version 12, so no table written before it could have been disabled.
     let triggers_disabled = reader.version >= 12 && reader.flag()?;
+    read_generation_expressions(&mut reader, &mut columns)?;
     reader.finish()?;
 
     Ok(TableDef {

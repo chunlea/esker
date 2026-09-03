@@ -502,6 +502,7 @@ impl CatalogView {
                                 not_null: false,
                                 default: None,
                                 missing: None,
+                                generated: None,
                             })
                             .collect(),
                         primary_key: Vec::new(),
