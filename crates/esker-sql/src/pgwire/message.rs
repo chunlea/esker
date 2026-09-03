@@ -251,6 +251,25 @@ impl FieldDescription {
             format: 0,
         }
     }
+
+    /// The same, for a column declared as a **user-defined type**.
+    ///
+    /// The oid is the type's own and the size is the **rendered** value's, not the stored one's:
+    /// an enum is an `int2` in the row and a variable-length label on the wire, so the length is
+    /// `-1` exactly as it is for `text`. A client reads the oid, asks the catalog what it is, and
+    /// gets `typtype = 'e'` — which is how `ActiveRecord` decides a column is an enum (ADR 0050).
+    #[must_use]
+    pub fn of_user_type(name: impl Into<String>, oid: u32) -> Self {
+        FieldDescription {
+            name: name.into(),
+            table_oid: 0,
+            column_id: 0,
+            type_oid: oid,
+            type_size: -1,
+            type_modifier: crate::value::NO_TYPMOD,
+            format: 0,
+        }
+    }
 }
 
 /// One field of an `ErrorResponse` or `NoticeResponse`.

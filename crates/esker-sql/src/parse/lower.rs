@@ -1960,6 +1960,15 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
                 // where a real server gives them values, which is a wrong answer rather than a
                 // gap. `CREATE TABLE` has no rows to rewrite and takes the same expression.
                 ColumnOption::Default(expr) => {
+                    // **A user-defined type's default is folded by the executor, not here.** The
+                    // column's `ty` is a placeholder until the catalog has been read, so folding
+                    // `'happy'` against it would read a label as a smallint; `text` keeps the
+                    // label as written and `exec::ddl` turns it into the ordinal (ADR 0050).
+                    let ty = if user_type_name.is_some() {
+                        ColumnType::Text
+                    } else {
+                        ty
+                    };
                     let (folded, unfolded) = column_default(expr, ty)?;
                     if let Some(unfolded) = unfolded {
                         return Err(SqlError::unsupported(format!(
@@ -4077,8 +4086,9 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             None if matches!(lower_type(data_type), Ok((ColumnType::Text, _))) => {
                 Ok(plan::Expr::ToText {
                     operand: Box::new(lower_expr(expr)?),
-                    // Set at resolution, where the operand's type is known.
+                    // Both set at resolution, where the operand's type is known.
                     strip_blanks: false,
+                    enum_labels: None,
                 })
             }
             None => Err(SqlError::unsupported(format!("a cast to {data_type}"))),

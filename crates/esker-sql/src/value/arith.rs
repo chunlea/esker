@@ -32,9 +32,9 @@ use esker_keys::value::Datum;
 pub fn result_type(op: ArithOp, left: ColumnType, right: ColumnType) -> Result<ColumnType> {
     let undefined = || {
         Err(SqlError::UndefinedOperator {
-            left: left.name(),
+            left: left.name().to_owned(),
             op: op.symbol(),
-            right: right.name(),
+            right: right.name().to_owned(),
         })
     };
     // **The date and time types have their own table** and it is not a promotion: `date - date`

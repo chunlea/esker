@@ -355,6 +355,18 @@ pub enum Expr {
         /// Decided where the operand's type is known — at resolution — because a `Datum::Text`
         /// does not know it came from a `bpchar`.
         strip_blanks: bool,
+        /// The labels of the **enum** the operand was declared as, or `None`.
+        ///
+        /// An enum column holds the `int2` of its label's position, so its output function is a
+        /// catalog lookup rather than the number's own text — `current_mood::text` is `sad` and not
+        /// `1`. Set at resolution beside `strip_blanks` and for the same reason: a `Datum::Int2`
+        /// does not know it came from an enum, and only the scope does.
+        ///
+        /// Carried as a field of the cast that already exists rather than as an `Expr` variant of
+        /// its own, which is what keeps every walker over this tree unchanged — a new variant that
+        /// holds another expression has to be taught to two of them, and they have drifted before
+        /// (ADR 0050).
+        enum_labels: Option<Vec<String>>,
     },
     /// A **set-returning function in the target list**: `SELECT generate_series(1,3)`.
     ///
@@ -1085,6 +1097,17 @@ pub enum AggregateFunc {
 }
 
 impl AggregateFunc {
+    /// Whether this aggregate's result is **the argument's own type**.
+    ///
+    /// `min` and `max` are, and it is what makes `min(current_mood)` a `mood` on a real server
+    /// rather than the `int2` an enum is stored as. `count` is a `bigint` whatever it counts,
+    /// `sum` and `avg` promote, and `array_agg` makes an array — none of the four can hand a
+    /// user-defined type back (ADR 0050).
+    #[must_use]
+    pub fn keeps_its_argument_type(self) -> bool {
+        matches!(self, AggregateFunc::Min | AggregateFunc::Max)
+    }
+
     /// The five names, matched the way PostgreSQL matches them: case-insensitively, so `COUNT(*)`
     /// and `Count(*)` are the same call. Measured — both forms execute on a real server.
     #[must_use]
@@ -1366,7 +1389,7 @@ impl Literal {
         let mismatch = || {
             Err(SqlError::DatatypeMismatchInColumn {
                 column: column.to_owned(),
-                column_type: ty.name(),
+                column_type: ty.name().to_owned(),
                 expression_type: self.type_name(),
             })
         };

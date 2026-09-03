@@ -278,6 +278,25 @@ impl<'a> Scope<'a> {
         Ok((at, column))
     }
 
+    /// The enum the column at a resolved position was declared as, or `None`.
+    ///
+    /// A position is an index into the **concatenated** row, so this walks the tables the way
+    /// [`Scope::offset`] builds it: the labels live on the table
+    /// (`crate::catalog::TableDef::enums`) and the oid on the column, so both halves have to be
+    /// found together (ADR 0050).
+    fn user_type_at(&self, at: usize) -> Option<&'a crate::catalog::TypeDef> {
+        let mut start = 0;
+        for table in &self.tables {
+            let end = start + table.columns.len();
+            if at < end {
+                let column = table.columns.get(at - start)?;
+                return super::assign::enum_of(table, column);
+            }
+            start = end;
+        }
+        None
+    }
+
     /// The same lookup, saying **how many scopes out** the name was found.
     ///
     /// `0` is this row and anything above it is a correlated reference. Two rules, both measured:
@@ -386,13 +405,31 @@ impl<'a> Scope<'a> {
 
 /// A planned query, with everything the executor needs to describe its output before running it.
 #[derive(Debug)]
+pub(super) struct OutputColumn {
+    /// The name a client is told, which is the alias where there is one.
+    pub(super) name: String,
+    /// What the value physically is — the type the wire's `RowDescription` carries, unless
+    /// [`OutputColumn::user_type`] replaces it.
+    pub(super) ty: ColumnType,
+    /// PostgreSQL's `atttypmod` for the declaration, or `crate::value::NO_TYPMOD`.
+    pub(super) typmod: i32,
+    /// The **user-defined type** this column was declared as, or `None`.
+    ///
+    /// Carried beside the storage type rather than instead of it, because both are needed and they
+    /// answer different questions: `ty` is how the value in the row is read, and this is what the
+    /// client is told and what the value is rendered *as* — an enum's ordinal goes onto the wire
+    /// as its label (ADR 0050). Kept in the same struct as `ty` rather than in a list beside it, so
+    /// that a column can never have one and not the other.
+    pub(super) user_type: Option<crate::catalog::TypeDef>,
+}
+
 pub(super) struct Planned {
     /// The tree to pull rows through.
     pub(super) node: Node,
     /// One name and type per output column, for `RowDescription`.
     /// One name, type and **typmod** per output column, for `RowDescription`. The typmod is
     /// `NO_TYPMOD` for everything but a plain column reference, which is PostgreSQL's rule.
-    pub(super) columns: Vec<(String, ColumnType, i32)>,
+    pub(super) columns: Vec<OutputColumn>,
     /// The table's name, for `EXPLAIN`.
     pub(super) table: String,
     /// The table's column names, so `EXPLAIN` can print the names a user typed rather than the
@@ -762,7 +799,7 @@ fn order_keys(
     scope: &Scope<'_>,
     aggregation: Option<&aggregate::Aggregation>,
     outputs: &[Expr],
-    columns: &[(String, ColumnType, i32)],
+    columns: &[OutputColumn],
     over_output: bool,
 ) -> Result<Vec<SortKey>> {
     let mut keys = Vec::new();
@@ -790,7 +827,7 @@ fn order_keys(
             // one, which this does not do. Every case the corpus holds is covered by the
             // ambiguity alone, and a preference nothing has measured would be invented.
             if let Expr::Column { table: None, name } = &item.expr
-                && columns.iter().filter(|(output, ..)| output == name).count() > 1
+                && columns.iter().filter(|output| &output.name == name).count() > 1
             {
                 return Err(SqlError::AmbiguousOrderBy(name.clone()));
             }
@@ -832,7 +869,7 @@ fn order_keys(
 }
 
 /// A resolved target list: one name and type per output column, and the expression that fills it.
-pub(super) type TargetList = (Vec<(String, ColumnType, i32)>, Vec<Expr>);
+pub(super) type TargetList = (Vec<OutputColumn>, Vec<Expr>);
 
 /// `RETURNING`, resolved against one table: the output columns and the expression per column.
 ///
@@ -2030,9 +2067,19 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
         Expr::ToText { operand, .. } => {
             let operand = resolve(operand, scope)?;
             let strip_blanks = matches!(expr_type(&operand, scope), Ok(ColumnType::Bpchar));
+            // The operand's output function, where the operand is an enum column: the label, not
+            // the ordinal the row holds.
+            let enum_labels = match &operand {
+                Expr::Ordinal { at, .. } => match scope.user_type_at(*at).map(|def| &def.kind) {
+                    Some(crate::catalog::TypeKind::Enum { labels }) => Some(labels.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
             Expr::ToText {
                 operand: Box::new(operand),
                 strip_blanks,
+                enum_labels,
             }
         }
         Expr::Column { table, name } => {
@@ -2054,6 +2101,17 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
         }
         Expr::Binary { op, left, right } => {
             let (left, right) = (resolve(left, scope)?, resolve(right, scope)?);
+            // **An enum is reconciled before the ordinary rule, and by a different one.** The
+            // column is an `int2` in the row, so the ordinary rule would read `'sad'` as a
+            // smallint and answer `22P02 invalid input syntax for type smallint`. See
+            // [`reconcile_enum`] for the three answers a real server gives here.
+            if let Some((left, right)) = reconcile_enum(*op, &left, &right, scope)? {
+                return Ok(Expr::Binary {
+                    op: *op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                });
+            }
             let (left, right) = if op.is_comparison() {
                 // A literal has no type until something gives it one, and here that something is
                 // the other operand. Without this the comparison would run between a `text` and an
@@ -2135,10 +2193,28 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             for arg in &call.args {
                 args.push(resolve(arg, scope)?);
             }
-            Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall {
-                func: call.func,
-                args,
-            }))
+            // **`pg_typeof` of an enum column is folded here, where the type has a name.** The
+            // evaluator reads a `Datum`'s own type and a `Datum` is an `int2`, so it would answer
+            // `smallint` — the storage, which is the one thing about an enum a client must not be
+            // told, and a *wrong value* rather than a refusal (ADR 0031's worst class). The name is
+            // known at plan time and nowhere else, so this is where it is answered.
+            match (call.func, args.first()) {
+                (crate::plan::CatalogFunc::PgTypeof, Some(Expr::Ordinal { at, .. }))
+                    if args.len() == 1 =>
+                {
+                    match scope.user_type_at(*at) {
+                        Some(def) => Expr::Literal(Literal::String(def.name.clone())),
+                        None => Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall {
+                            func: call.func,
+                            args,
+                        })),
+                    }
+                }
+                _ => Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall {
+                    func: call.func,
+                    args,
+                })),
+            }
         }
         // Only the **operand** is resolved here. Everything inside the sub-select was resolved
         // against the sub-select's own scope when `crate::exec::subquery::plan_subqueries` planned
@@ -2175,6 +2251,27 @@ fn resolve_in_list(
     let mut items = Vec::with_capacity(list.len());
     for item in list {
         items.push(resolve(item, scope)?);
+    }
+    // **An enum operand types the whole list before the common-type rule sees it**, for the reason
+    // `reconcile_enum` exists: the column is an `int2` in the row, so `select_common_type` would
+    // read `'sad'` as a smallint and answer `22P02 invalid input syntax for type smallint`. Each
+    // item is reconciled against the operand on its own, which is what `x IN (a, b)` means — a set
+    // of `=` — and each gives the same three answers a single `=` gives (ADR 0050).
+    if let Expr::Ordinal { at, .. } = &operand
+        && scope.user_type_at(*at).is_some()
+    {
+        let mut coerced = Vec::with_capacity(items.len());
+        for item in items {
+            match reconcile_enum(BinaryOp::Eq, &operand, &item, scope)? {
+                Some((_, right)) => coerced.push(right),
+                None => coerced.push(item),
+            }
+        }
+        return Ok(Expr::InList {
+            operand: Box::new(operand),
+            list: coerced,
+            negated,
+        });
     }
     // The coercion happens here, at plan time, and not when a row is scanned: PostgreSQL
     // answers `1 IN (NULL, 'x')` with `22P02` even though the NULL alone could have
@@ -2371,9 +2468,9 @@ fn subquery_operand(
         && !same_family(*left, ty)
     {
         return Err(SqlError::UndefinedOperator {
-            left: left.name(),
+            left: left.name().to_owned(),
             op: op.symbol(),
-            right: ty.name(),
+            right: ty.name().to_owned(),
         });
     }
     Ok(operand)
@@ -2449,6 +2546,88 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
     family(left) == family(right)
 }
 
+/// A comparison with a column declared as an **enum**, or `None` when neither side is one.
+///
+/// Three answers, all measured on 19beta1 against `mood` = `('sad','ok','happy')`:
+///
+/// * `current_mood = 'sad'` — an **unquoted** literal is `unknown` and is coerced to the enum, so
+///   it becomes the label's ordinal and the comparison is between two `int2`s. That is what makes
+///   the ordering and the equality the ordinal's, which is the whole of ADR 0050;
+/// * `current_mood = 'sad'::text` is **`42883 operator does not exist: mood = text`** — a `text`
+///   is not an `unknown` and there is no operator between the two. The distinction is the one
+///   thing about this that reasoning gets backwards, because both spellings look like strings;
+/// * `current_mood = 1` is the same `42883` naming `integer`, and a label nobody declared is
+///   `22P02 invalid input value for enum mood: "angry"`.
+///
+/// A NULL on either side is left alone: a comparison with one is NULL whatever the types are.
+fn reconcile_enum(
+    op: BinaryOp,
+    left: &Expr,
+    right: &Expr,
+    scope: &Scope<'_>,
+) -> Result<Option<(Expr, Expr)>> {
+    if !op.is_comparison() {
+        return Ok(None);
+    }
+    let enum_of = |expr: &Expr| match expr {
+        Expr::Ordinal { at, .. } => scope.user_type_at(*at),
+        _ => None,
+    };
+    let (def, other, flipped) = match (enum_of(left), enum_of(right)) {
+        (Some(def), None) => (def, right, false),
+        (None, Some(def)) => (def, left, true),
+        // Neither side is one, or **both are**: two ordinals compare as they stand, and the
+        // ordinary path is already right for them.
+        _ => return Ok(None),
+    };
+    let coerced = match other {
+        // Still nothing, whatever the type it was written with.
+        Expr::Literal(Literal::Null | Literal::TypedNull(_)) => return Ok(None),
+        // The `unknown` literal, and the only spelling that is coerced.
+        Expr::Literal(Literal::String(text)) => {
+            match crate::catalog::enum_ordinal(enum_labels(def)?, text) {
+                Some(ordinal) => Expr::Literal(Literal::Typed(Box::new(Datum::Int2(ordinal)))),
+                None => {
+                    return Err(SqlError::InvalidEnumValue {
+                        ty: def.name.clone(),
+                        value: text.clone(),
+                    });
+                }
+            }
+        }
+        // Anything with a type of its own, including a cast that folded to one.
+        other => {
+            let named = expr_type(other, scope)
+                .map_or_else(|_| "unknown".to_owned(), |ty| ty.name().to_owned());
+            let (left, right) = if flipped {
+                (named, def.name.clone())
+            } else {
+                (def.name.clone(), named)
+            };
+            return Err(SqlError::UndefinedOperator {
+                left,
+                op: op.symbol(),
+                right,
+            });
+        }
+    };
+    Ok(Some(if flipped {
+        (coerced, right.clone())
+    } else {
+        (left.clone(), coerced)
+    }))
+}
+
+/// An enum type's labels, or the internal error of a column carrying a type that is not one.
+fn enum_labels(def: &crate::catalog::TypeDef) -> Result<&[String]> {
+    match &def.kind {
+        crate::catalog::TypeKind::Enum { labels } => Ok(labels),
+        _ => Err(SqlError::Internal(
+            "a column carrying a user type that is not an enum reached a comparison".to_owned(),
+        )),
+    }
+}
+
 /// Gives a literal the type of whatever it is being compared against, or says the comparison is
 /// between types no operator covers.
 ///
@@ -2511,9 +2690,9 @@ fn reconcile(op: BinaryOp, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
             match (literal_type(left_literal), literal_type(right_literal)) {
                 (Some(a), Some(b)) if !same_family(a, b) => {
                     return Err(SqlError::UndefinedOperator {
-                        left: a.name(),
+                        left: a.name().to_owned(),
                         op: op.symbol(),
-                        right: b.name(),
+                        right: b.name().to_owned(),
                     });
                 }
                 _ => (left, right),
@@ -2537,9 +2716,9 @@ fn reconcile(op: BinaryOp, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
                 unreachable!("both types are Some in the guard above")
             };
             return Err(SqlError::UndefinedOperator {
-                left: a.name(),
+                left: a.name().to_owned(),
                 op: op.symbol(),
-                right: b.name(),
+                right: b.name().to_owned(),
             });
         }
         _ => (left, right),
@@ -2777,9 +2956,9 @@ fn undefined_operator(
         (ty.name(), literal.type_name())
     };
     SqlError::UndefinedOperator {
-        left,
+        left: left.to_owned(),
         op: op.symbol(),
-        right,
+        right: right.to_owned(),
     }
 }
 
@@ -2855,7 +3034,7 @@ fn output_columns(
     select: &Select,
     scope: &Scope<'_>,
     aggregation: Option<&aggregate::Aggregation>,
-) -> Result<Vec<(String, ColumnType, i32)>> {
+) -> Result<Vec<OutputColumn>> {
     let mut columns = Vec::new();
     for item in &select.projection {
         match item {
@@ -2871,11 +3050,14 @@ fn output_columns(
                 // with no declared key returns what the user declared and nothing else. Across a
                 // join it is every table's, left to right, which is the order PostgreSQL gives,
                 // and `t.*` is one table's.
-                columns.extend(
-                    scope
-                        .expand(qualifier_of(item))?
-                        .map(|(_, column)| (column.name.clone(), column.ty, column.typmod)),
-                );
+                columns.extend(scope.expand(qualifier_of(item))?.map(|(at, column)| {
+                    OutputColumn {
+                        name: column.name.clone(),
+                        ty: column.ty,
+                        typmod: column.typmod,
+                        user_type: scope.user_type_at(at).cloned(),
+                    }
+                }));
             }
             SelectItem::Expr { expr, alias } => {
                 // With an aggregation the type comes from the rewritten expression, because an
@@ -2905,7 +3087,34 @@ fn output_columns(
                     Expr::Column { .. } if aggregation.is_none() => typmod_of(expr, scope),
                     _ => crate::value::NO_TYPMOD,
                 };
-                columns.push((name, ty, typmod));
+                // **The type a client is told, for a column declared as a user-defined one.**
+                // A plain column reference and an aggregate over one both keep it — `min(mood)` is
+                // `mood` on a real server — and everything else loses it, because an expression
+                // over an enum is an expression over its ordinal and has no name to give back.
+                let user_type = match expr {
+                    Expr::Column { table, name } => scope
+                        .resolve_column(table.as_deref(), name)
+                        .ok()
+                        .and_then(|(at, _)| scope.user_type_at(at))
+                        .cloned(),
+                    Expr::Aggregate(call) if call.func.keeps_its_argument_type() => {
+                        match call.arg() {
+                            Some(Expr::Column { table, name }) => scope
+                                .resolve_column(table.as_deref(), name)
+                                .ok()
+                                .and_then(|(at, _)| scope.user_type_at(at))
+                                .cloned(),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                columns.push(OutputColumn {
+                    name,
+                    ty,
+                    typmod,
+                    user_type,
+                });
             }
         }
     }

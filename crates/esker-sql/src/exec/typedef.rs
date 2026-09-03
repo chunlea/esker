@@ -45,6 +45,34 @@ pub(super) fn create(
     Ok(Outcome::done("CREATE TYPE"))
 }
 
+/// `2BP01` when a column is still declared as this type.
+///
+/// **The first dependent, not all of them**, which is what a real server reports: it names one
+/// column and its table in the DETAIL and stops. Without this a `DROP TYPE` would leave every row
+/// of that column holding an ordinal with no labels to read it by — the one way ADR 0050's stored
+/// ordinal can become a *wrong* value rather than a missing one, which is why the rule and the
+/// refusal arrived together.
+fn refuse_if_a_column_depends(executor: &Executor, txn: &dyn Txn, name: &str) -> Result<()> {
+    let Some(def) = catalog::type_by_name(txn, executor.tenant, name)? else {
+        return Ok(());
+    };
+    let relations = catalog::pg_relations::Relations::read(txn, executor.tenant)?;
+    for table in relations.tables() {
+        for column in &table.columns {
+            if column.user_type == Some(def.oid) {
+                return Err(SqlError::DependentType {
+                    ty: name.to_owned(),
+                    detail: format!(
+                        "column {} of table {} depends on type {name}",
+                        column.name, table.name
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `DROP TYPE [IF EXISTS] <name> [, …]`.
 pub(super) fn drop(executor: &mut Executor, txn: &mut dyn Txn, drop: &DropType) -> Result<Outcome> {
     for name in &drop.names {
@@ -58,6 +86,7 @@ pub(super) fn drop(executor: &mut Executor, txn: &mut dyn Txn, drop: &DropType) 
             }
             return Err(SqlError::UndefinedType(name.clone()));
         }
+        refuse_if_a_column_depends(executor, txn, name)?;
         catalog::drop_type(txn, executor.tenant, name);
     }
     Ok(Outcome::done("DROP TYPE"))

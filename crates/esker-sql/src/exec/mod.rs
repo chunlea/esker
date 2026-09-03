@@ -917,14 +917,30 @@ impl Executor {
         while let Some(row) = cursor.next()? {
             rows.push(
                 row.iter()
-                    .map(|value| value.to_text().map(String::into_bytes))
+                    .enumerate()
+                    .map(|(at, value)| {
+                        // **An enum leaves as its label.** The ordinal is what was ordered,
+                        // grouped and indexed by — all of that happened below this line — and the
+                        // label is what a client is told, which is the whole shape ADR 0050 chose.
+                        match planned.columns.get(at).and_then(|c| c.user_type.as_ref()) {
+                            Some(def) => assign::from_enum(value, def).to_text(),
+                            None => value.to_text(),
+                        }
+                        .map(String::into_bytes)
+                    })
                     .collect(),
             );
         }
         let fields = planned
             .columns
             .iter()
-            .map(|(name, ty, typmod)| FieldDescription::of(name.clone(), *ty, *typmod))
+            .map(|column| match &column.user_type {
+                Some(def) => FieldDescription::of_user_type(
+                    column.name.clone(),
+                    u32::try_from(def.oid).unwrap_or(0),
+                ),
+                None => FieldDescription::of(column.name.clone(), column.ty, column.typmod),
+            })
             .collect();
         let tag = format!("SELECT {}", rows.len());
         Ok(Outcome::Rows { fields, rows, tag })
@@ -1944,10 +1960,10 @@ fn update_returning_fields(
 }
 
 /// A resolved target list as the wire describes it.
-fn described(columns: Vec<(String, ColumnType, i32)>) -> Vec<FieldDescription> {
+fn described(columns: Vec<query::OutputColumn>) -> Vec<FieldDescription> {
     columns
         .into_iter()
-        .map(|(name, ty, typmod)| FieldDescription::of(name, ty, typmod))
+        .map(|column| FieldDescription::of(column.name, column.ty, column.typmod))
         .collect()
 }
 
@@ -2016,7 +2032,7 @@ impl Execute for Executor {
                 )?
                 .columns
                 .into_iter()
-                .map(|(name, ty, typmod)| FieldDescription::of(name, ty, typmod))
+                .map(|column| FieldDescription::of(column.name, column.ty, column.typmod))
                 .collect(),
             ),
             Statement::Explain(..) => Some(vec![FieldDescription::computed(

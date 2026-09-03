@@ -311,15 +311,15 @@ fn plan_derived(
         .columns
         .iter()
         .enumerate()
-        .map(|(at, (column, ty, typmod))| crate::catalog::ColumnDef {
+        .map(|(at, output)| crate::catalog::ColumnDef {
             // The alias replaces the name outright: after `AS t(a, b)`, `t.id` is `42703`.
             name: derived
                 .columns
                 .get(at)
                 .cloned()
-                .unwrap_or_else(|| column.clone()),
-            ty: *ty,
-            typmod: *typmod,
+                .unwrap_or_else(|| output.name.clone()),
+            ty: output.ty,
+            typmod: output.typmod,
             // Nothing is ever written into a derived table, so none of these can be read: a
             // `NOT NULL` is checked on insert and a default is applied on one.
             default_expr: None,
@@ -510,7 +510,7 @@ fn plan_one(
     sub.column = planned
         .columns
         .first()
-        .map(|(name, ty, _)| (name.clone(), *ty));
+        .map(|output| (output.name.clone(), output.ty));
     // Correlation is a fact about the **plan**, not a reading of the statement: a reference that
     // resolved to the sub-select's own scope after all is not one, which is exactly the shadowing
     // case (`WHERE EXISTS (SELECT 1 FROM b WHERE b.a_id = id)` is `b.a_id = b.id`).

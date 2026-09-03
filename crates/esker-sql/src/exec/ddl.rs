@@ -248,6 +248,13 @@ fn declared_columns(
     Ok(columns)
 }
 
+/// One user-defined type by oid, for the places that hold an oid rather than a name.
+fn type_by_oid(txn: &dyn Txn, executor: &Executor, oid: u64) -> Result<Option<catalog::TypeDef>> {
+    Ok(catalog::user_types(txn, executor.tenant)?
+        .into_iter()
+        .find(|def| def.oid == oid))
+}
+
 /// A column's type, once the catalog has been asked about the name lowering could not resolve.
 ///
 /// [ADR 0050](../../../docs/adr/0050-a-user-defined-type-is-a-value.md)'s first unit. Lowering
@@ -2732,9 +2739,38 @@ pub(super) fn alter_table(
                 relation: alter.name.clone(),
             });
         }
+        // The catalog decides what the declared name is, exactly as it does at `CREATE TABLE`,
+        // and the default is folded against the answer rather than against the placeholder.
+        let (ty, user_type) = resolve_user_type(&*txn, executor, column)?;
+        let default = match (
+            &column.default,
+            match user_type {
+                Some(oid) => type_by_oid(&*txn, executor, oid)?,
+                None => None,
+            },
+        ) {
+            (Some(value), Some(def)) => Some(super::assign::into_enum(
+                value.clone(),
+                &ColumnDef {
+                    name: column.name.clone(),
+                    ty,
+                    typmod: column.typmod,
+                    default_expr: None,
+                    not_null: false,
+                    default: None,
+                    missing: None,
+                    generated: None,
+                    comment: None,
+                    dropped: false,
+                    user_type,
+                },
+                &def,
+            )?),
+            (other, _) => other.clone(),
+        };
         updated.columns.push(ColumnDef {
             name: column.name.clone(),
-            ty: column.ty,
+            ty,
             typmod: column.typmod,
             default_expr: column.default_expr.clone(),
             // `NOT NULL` is admissible **only with a constant default**, which is what makes every
@@ -2742,17 +2778,17 @@ pub(super) fn alter_table(
             // decoder pads with it. Without one the lowering refuses `NOT NULL`, because the
             // alternative is a rewrite and this `ALTER` touches no row.
             not_null: column.not_null,
-            default: column.default.clone(),
+            default: default.clone(),
             // **The missing value is frozen here**, at `ADD COLUMN` time, and a later
             // `ALTER COLUMN SET DEFAULT` must not touch it. Measured on PostgreSQL 19beta1: after
             // `SET DEFAULT 'new'`, rows that predate the column still read `old`
             // (`docs/plans/phase-6e.md` §5 unit 1). One field for both would rewrite history the
             // first time somebody changed a default.
-            missing: column.default.clone(),
+            missing: default,
             generated: None,
             comment: None,
             dropped: false,
-            user_type: None,
+            user_type,
         });
         changed = true;
     }

@@ -495,7 +495,12 @@ pub enum SqlError {
         /// The column being assigned to.
         column: String,
         /// Its type, as PostgreSQL names it.
-        column_type: &'static str,
+        ///
+        /// Owned rather than `&'static`, because a column may be declared as a **user-defined**
+        /// type whose name is not known until the catalog is read: measured, an integer into an
+        /// enum column is `column "current_mood" is of type mood but expression is of type
+        /// integer` — the type's own name, in the same sentence every built-in type uses.
+        column_type: String,
         /// The expression's type, as PostgreSQL names it — `integer` for a small constant, not
         /// `bigint`.
         expression_type: &'static str,
@@ -713,11 +718,17 @@ pub enum SqlError {
     #[error("operator does not exist: {left} {op} {right}")]
     UndefinedOperator {
         /// The left operand's type.
-        left: &'static str,
+        ///
+        /// Owned rather than `&'static`, for the reason
+        /// [`SqlError::DatatypeMismatchInColumn`]'s `column_type` is: an operand may be of a
+        /// **user-defined** type whose name only the catalog knows — measured,
+        /// `current_mood = 'sad'::text` is `operator does not exist: mood = text`, where the
+        /// *unquoted* `'sad'` is coerced to the enum and answers.
+        left: String,
         /// The operator symbol.
         op: &'static str,
         /// The right operand's type.
-        right: &'static str,
+        right: String,
     },
 
     /// An aggregate applied to a type it has no form for: `sum(text)`, `min(boolean)`.
@@ -1512,6 +1523,21 @@ pub enum SqlError {
         detail: String,
     },
 
+    /// `DROP TYPE` while a column is still declared as it: `2BP01`.
+    ///
+    /// The DETAIL names **the column and its table**, not the table alone — measured,
+    /// `column current_mood of table postgresql_enums depends on type mood` — and it is the
+    /// refusal that makes ADR 0050's never-reuse rule enforceable: a type dropped out from under a
+    /// column would leave rows holding ordinals with nothing to read them by, which is the one way
+    /// a stored ordinal can become a wrong value rather than a missing one.
+    #[error("cannot drop type {ty} because other objects depend on it")]
+    DependentType {
+        /// The type that cannot be dropped.
+        ty: String,
+        /// `column current_mood of table postgresql_enums depends on type mood`
+        detail: String,
+    },
+
     /// A `numeric` special cast to an integer: **`0A000`**, not `22003`.
     ///
     /// The one SQLSTATE nobody would predict here — `'NaN'::numeric::int` is
@@ -1916,6 +1942,7 @@ impl SqlError {
             | SqlError::DependentSchema { .. }
             | SqlError::DependentTable { .. }
             | SqlError::DependentColumn { .. }
+            | SqlError::DependentType { .. }
             | SqlError::DependentSequence { .. }
             | SqlError::FunctionRequiredBySystem(_)
             | SqlError::DependentFunction { .. } => {
@@ -2021,7 +2048,8 @@ impl SqlError {
             } => Some(format!(
                 "Key ({key})=({value}) conflicts with existing key ({key})=({existing})."
             )),
-            SqlError::MalformedArrayLiteral { detail, .. }
+            SqlError::DependentType { detail, .. }
+            | SqlError::MalformedArrayLiteral { detail, .. }
             | SqlError::NumericFieldOverflow { detail }
             | SqlError::ForeignKeyViolation { detail, .. }
             | SqlError::ForeignKeyStillReferenced { detail, .. }
@@ -2153,6 +2181,7 @@ impl SqlError {
             | SqlError::DependentTable { .. }
             | SqlError::DependentColumn { .. }
             | SqlError::DependentSequence { .. }
+            | SqlError::DependentType { .. }
             | SqlError::DependentFunction { .. } => {
                 Some("Use DROP ... CASCADE to drop the dependent objects too.".to_owned())
             }

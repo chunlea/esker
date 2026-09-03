@@ -1028,16 +1028,17 @@ fn range_argument(value: Option<&Datum>) -> Result<Option<crate::value::range::D
             Some(range) => Ok(Some(range)),
             None => Err(SqlError::UndefinedOperator {
                 op: "&&",
-                left: "text",
-                right: "text",
+                left: "text".to_owned(),
+                right: "text".to_owned(),
             }),
         },
         Some(other) => Err(SqlError::UndefinedOperator {
             op: "&&",
-            left: other
-                .column_type()
-                .map_or("unknown", crate::value::PgType::name),
-            right: "unknown",
+            left: other.column_type().map_or_else(
+                || "unknown".to_owned(),
+                |ty| crate::value::PgType::name(ty).to_owned(),
+            ),
+            right: "unknown".to_owned(),
         }),
     }
 }
@@ -1053,10 +1054,11 @@ fn like_text(value: &Datum) -> Result<Option<String>> {
         Datum::Text(text) => Ok(Some(text.clone())),
         other => Err(SqlError::UndefinedOperator {
             op: "~~",
-            left: other
-                .column_type()
-                .map_or("unknown", crate::value::PgType::name),
-            right: "unknown",
+            left: other.column_type().map_or_else(
+                || "unknown".to_owned(),
+                |ty| crate::value::PgType::name(ty).to_owned(),
+            ),
+            right: "unknown".to_owned(),
         }),
     }
 }
@@ -1072,10 +1074,11 @@ fn regex_text(value: &Datum, operator: &'static str) -> Result<Option<String>> {
         Datum::Text(text) => Ok(Some(text.clone())),
         other => Err(SqlError::UndefinedOperator {
             op: operator,
-            left: other
-                .column_type()
-                .map_or("unknown", crate::value::PgType::name),
-            right: "unknown",
+            left: other.column_type().map_or_else(
+                || "unknown".to_owned(),
+                |ty| crate::value::PgType::name(ty).to_owned(),
+            ),
+            right: "unknown".to_owned(),
         }),
     }
 }
@@ -1275,8 +1278,19 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         Expr::ToText {
             operand,
             strip_blanks,
+            enum_labels,
         } => match evaluate_in(operand, row, env)? {
             Datum::Null => Datum::Null,
+            // An enum's output function is its label, which is a lookup and not a rendering.
+            Datum::Int2(ordinal) if enum_labels.is_some() => {
+                match enum_labels
+                    .as_deref()
+                    .and_then(|labels| crate::catalog::enum_label(labels, ordinal))
+                {
+                    Some(label) => Datum::Text(label.to_owned()),
+                    None => Datum::Null,
+                }
+            }
             // **A boolean is the one type whose cast is not its output function.** `SELECT true`
             // prints `t` and `SELECT true::text` is `true`; PostgreSQL has a separate `booltext`
             // for the cast. Measured — every other type here casts to exactly what it prints.

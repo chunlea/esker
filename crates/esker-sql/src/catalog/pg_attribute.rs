@@ -340,6 +340,24 @@ pub fn default_expression(column: &ColumnDef, table: &TableDef, at: usize) -> Op
     if matches!(value, Datum::Null) {
         return None;
     }
+    // **A user-defined type's default prints as its label and its own cast**: `'happy'::mood`,
+    // not the `3` the row holds — measured on 19beta1 from both `pg_get_expr` and
+    // `information_schema.columns.column_default`, and `ActiveRecord`'s `column_defaults` reads
+    // exactly this string. The ordinal is storage and a client must never be shown it (ADR 0050).
+    if let Some(def) = column
+        .user_type
+        .and_then(|oid| table.enums.get(&oid))
+        .filter(|def| matches!(def.kind, super::TypeKind::Enum { .. }))
+    {
+        let super::TypeKind::Enum { labels } = &def.kind else {
+            return None;
+        };
+        let Datum::Int2(ordinal) = value else {
+            return None;
+        };
+        let label = super::enum_label(labels, *ordinal)?;
+        return Some(format!("'{label}'::{}", def.name));
+    }
     Some(super::def_functions::constant_expression(value, column.ty))
 }
 

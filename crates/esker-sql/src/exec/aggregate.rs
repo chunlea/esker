@@ -465,9 +465,11 @@ impl Aggregation {
             Expr::ToText {
                 operand,
                 strip_blanks,
+                enum_labels,
             } => Expr::ToText {
                 operand: Box::new(self.rewrite(operand, scope)?),
                 strip_blanks: *strip_blanks,
+                enum_labels: enum_labels.clone(),
             },
             Expr::CatalogFunc(call) => {
                 let mut rewritten = call.clone();
