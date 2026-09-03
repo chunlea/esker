@@ -240,6 +240,34 @@ pub fn format_type(ty: ColumnType, typmod: i32) -> String {
 /// that line. Deriving the names from the same array `pg_type` uses means a new type is reachable
 /// here the moment it exists, and the only hand-written part left is `ALIASES` — the handful of
 /// spellings that are neither of a type's two names.
+pub fn named_type(spelled: &str) -> Result<Option<Named>> {
+    let lowered = spelled.trim().to_ascii_lowercase();
+    // **Dimensions are ignored and the internal name works.** `integer[]`, `integer[][]`,
+    // `integer[3]` and `_int4` are all 1007 on a real server — an array's *shape* is not part of
+    // its type — so every one of those spellings reduces to the element name here.
+    let (element, is_array) = match lowered.split_once('[') {
+        Some((head, tail))
+            if tail
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == '[' || c == ']') =>
+        {
+            (head.trim_end().to_owned(), true)
+        }
+        Some(_) => (lowered.clone(), false),
+        None => match lowered.strip_prefix('_') {
+            Some(rest) if !rest.is_empty() => (rest.to_owned(), true),
+            _ => (lowered.clone(), false),
+        },
+    };
+    if is_array {
+        // A typmod on an array name is refused by the same rule the scalar is, so this goes
+        // through the ordinary resolution and wraps whatever it finds.
+        return Ok(type_by_name(&element)?.map(Named::Array));
+    }
+    type_by_name(&lowered).map(|found| found.map(Named::Scalar))
+}
+
+/// The type a name means, ignoring arrays. See [`named_type`] for the whole answer.
 pub fn type_by_name(spelled: &str) -> Result<Option<ColumnType>> {
     let lowered = spelled.trim().to_ascii_lowercase();
     if lowered.is_empty() {
@@ -291,6 +319,91 @@ pub fn type_by_name(spelled: &str) -> Result<Option<ColumnType>> {
 /// agree about it: `'character varying(0)'::regtype` raises the same `22023` that
 /// `CREATE TABLE t (v varchar(0))` does.
 pub const MAX_TYPE_LENGTH: u32 = 10_485_760;
+
+/// A type name, which may name an **array** of a type this node has.
+///
+/// Arrays are not storable here — there is no `ColumnType` for one — but their *names* resolve,
+/// because `ActiveRecord` asks `pg_type` for them and statement 766 of `schema.rb` stops on
+/// `'decimal[]'::regtype`. Resolving the name is not claiming the type: nothing can create a
+/// column of one, and `Named::Array` exists only so that the two things a `regtype` answers —
+/// the OID and the printed name — can be produced for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Named {
+    /// The type itself.
+    Scalar(ColumnType),
+    /// An array **of** that type: `numeric[]`, `_numeric`, `numeric[3]`, `numeric[][]`.
+    Array(ColumnType),
+}
+
+impl Named {
+    /// The OID a `regtype` answers for it.
+    #[must_use]
+    pub fn oid(self) -> u32 {
+        match self {
+            Named::Scalar(ty) => ty.oid(),
+            Named::Array(ty) => array_oid(ty),
+        }
+    }
+
+    /// The name a `regtype` prints it by: `integer[]`, not `_int4`.
+    #[must_use]
+    pub fn printed(self) -> String {
+        match self {
+            Named::Scalar(ty) => format_type(ty, NO_TYPMOD),
+            Named::Array(ty) => format!("{}[]", format_type(ty, NO_TYPMOD)),
+        }
+    }
+
+    /// The element type, whether or not this is an array.
+    #[must_use]
+    pub fn element(self) -> ColumnType {
+        match self {
+            Named::Scalar(ty) | Named::Array(ty) => ty,
+        }
+    }
+
+    /// Whether it names an array.
+    #[must_use]
+    pub fn is_array(self) -> bool {
+        matches!(self, Named::Array(_))
+    }
+}
+
+/// The OID of the array type PostgreSQL pairs with `ty`, from `pg_type.typarray`.
+///
+/// An exhaustive match, measured one row at a time off a real server, so that **a type added to
+/// `ColumnType` has to answer this** rather than leaving its array name unresolvable. That is the
+/// whole reason it is a match and not a lookup beside the scalar table: the scalar names already
+/// derive from `ColumnType::ALL`, and this is what keeps the array half from drifting away from
+/// them the way `type_by_name` once drifted from `pg_type`.
+///
+/// The numbers are not derivable — `_int4` is 1007 and `_int8` is 1016, out of order with their
+/// element types, and `_json` is 199 where `json` is 114 — so each is a measurement.
+#[must_use]
+pub fn array_oid(ty: ColumnType) -> u32 {
+    match ty {
+        ColumnType::Bool => 1000,
+        ColumnType::Bytea => 1001,
+        ColumnType::Int8 => 1016,
+        ColumnType::Int2 => 1005,
+        ColumnType::Int4 => 1007,
+        ColumnType::Text => 1009,
+        ColumnType::Oid => 1028,
+        ColumnType::Json => 199,
+        ColumnType::Real => 1021,
+        ColumnType::Double => 1022,
+        ColumnType::Bpchar => 1014,
+        ColumnType::Varchar => 1015,
+        ColumnType::Date => 1182,
+        ColumnType::Time => 1183,
+        ColumnType::Timestamp => 1115,
+        ColumnType::TimestampTz => 1185,
+        ColumnType::Interval => 1187,
+        ColumnType::Numeric => 1231,
+        ColumnType::Uuid => 2951,
+        ColumnType::Jsonb => 3807,
+    }
+}
 
 /// The spellings PostgreSQL's grammar has a **keyword** for, among the types this node has.
 ///

@@ -1368,13 +1368,27 @@ fn the_background_pool_compacts_by_itself() {
     // Give the pool a moment; then finish the job synchronously so the test is not a race.
     db.compact_range(cf::DEFAULT, None, None).unwrap();
 
-    assert!(db.compactions_run() > 0);
-    assert_eq!(db.property("esker.compactions-running").unwrap(), "0");
+    // Each of these says what it saw. This test has failed once in a full parallel run and never
+    // alone, and "assertion failed" told nobody which of the three it was.
+    assert!(
+        db.compactions_run() > 0,
+        "no compaction ran at all: compactions={}, running={:?}",
+        db.compactions_run(),
+        db.property("esker.compactions-running")
+    );
+    assert_eq!(
+        db.property("esker.compactions-running").unwrap(),
+        "0",
+        "a compaction was still running after `compact_range` returned; {} have run",
+        db.compactions_run()
+    );
     for i in 0..200u32 {
         assert_eq!(
             get(&db, format!("key-{i:04}").as_bytes()).as_deref(),
             Some(&b"round5"[..]),
-            "key-{i:04}"
+            "key-{i:04} after {} compactions, running={:?}",
+            db.compactions_run(),
+            db.property("esker.compactions-running")
         );
     }
 }

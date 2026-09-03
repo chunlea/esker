@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use esker_pd::record::{EventKind, EventOutcome};
 use esker_pd::{Pd, PdOptions, PdService};
 use esker_proto::{PeerRole, RawKvReq, Region, RequestHeader, Server, Service, TransportConfig};
 use esker_store::pd_remote::RemotePd;
@@ -353,6 +354,10 @@ fn one_peer_per_store(region: &Region) {
 /// Polls until every learner that appears has been promoted, failing the moment one outlives
 /// [`PROMOTION_DEADLINE`]. Each is timed from when it was first seen, so a learner that is merely
 /// new is not mistaken for one that is stranded.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one loop, and the failure has to explain itself"
+)]
 async fn watch_until_every_learner_votes(
     pd: &Arc<Pd>,
     joined: &[&Node],
@@ -451,17 +456,52 @@ async fn watch_until_every_learner_votes(
                 }
             }
         }
-        // Every learner that appeared has been promoted, and there was at least one to promote.
-        // Not a bigger number: with two stores at `target_replicas` two, two is all the placement
-        // driver ever has reason to create.
-        if writer.is_finished() && !promoted.is_empty() && first_seen.len() == promoted.len() {
+        // **Neither observation is sufficient alone, so this takes either.**
+        //
+        // The roles above are sampled every 200 ms, and a promotion that completes between two
+        // polls is invisible to them — on a fast cluster the loop could never break and always
+        // ran to the 180-second deadline, reporting "0 learners seen" for a replica it had
+        // already placed.
+        //
+        // PD's history is durable and unsampled, and an `AddPeer` is **done when the peer is a
+        // voter** — the whole difference from `AddLearner`, which a columnar replica gets and
+        // which finishes as soon as the peer exists. But the history is a **64-entry ring**, and
+        // a run that transfers leadership often enough pushes the `AddPeer` out of it: a failing
+        // run showed sixty-four consecutive `TransferLeader` events and nothing else.
+        //
+        // So each covers the other's blind spot, and a run has to miss both to hang.
+        let seen_promoted = !promoted.is_empty() && first_seen.len() == promoted.len();
+        let recorded_promoted = pd.history().unwrap_or_default().iter().any(|event| {
+            event.kind == EventKind::AddPeer
+                && event.outcome == EventOutcome::Done
+                && joined
+                    .iter()
+                    .any(|node| node.store.store_id() == event.store_id)
+        });
+        if writer.is_finished() && (seen_promoted || recorded_promoted) {
             break;
         }
+        // The history is what decides success, so it is what a failure has to show: "0 learners
+        // seen" said nothing about why, and the answer was that nobody had been looking at the
+        // right thing.
         assert!(
             Instant::now() < deadline,
-            "the cluster never settled: {} learners seen, {} promoted",
+            "the cluster never settled: {} learners seen, {} promoted, writer_done={}; PD's \
+             history is {:?}",
             first_seen.len(),
-            promoted.len()
+            promoted.len(),
+            writer.is_finished(),
+            pd.history()
+                .unwrap_or_default()
+                .iter()
+                .map(|event| (
+                    event.region_id,
+                    event.kind,
+                    event.outcome,
+                    event.store_id,
+                    event.peer_id
+                ))
+                .collect::<Vec<_>>()
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
