@@ -66,13 +66,44 @@ struct Cluster {
     nodes: Vec<Node>,
 }
 
-/// A run of `NODES` consecutive free ports.
+/// A run of `NODES` consecutive ports, **held** until the caller hands them over.
 ///
 /// `cluster start` numbers its nodes from one base port, so they have to be consecutive — which
-/// rules out the usual trick of binding port zero. Binding the whole run and releasing it is the
-/// next best thing: another process could take one in the gap, which is why this retries.
-fn free_port_run() -> u16 {
-    for base in (21_000_u16..30_000).step_by(NODE_COUNT + 1) {
+/// rules out binding port zero. And the servers are separate **processes**, so the sockets cannot
+/// be passed to them the way an in-process harness passes a listener to `Server::from_listener`.
+/// The hold therefore cannot last all the way to the bind, and pretending otherwise is what the
+/// comment here used to do. Three things are available instead, and together they are what closed
+/// this:
+///
+/// * the run is **held through the caller's setup** and released on the line before the child is
+///   spawned, rather than at the top of it — the window shrinks from a whole `Cluster::start` to
+///   one statement;
+/// * the scan **starts at a random slot** rather than walking from the bottom of the range, so two
+///   processes running this file at once do not both pick `21_000`;
+/// * and the caller **retries with a fresh run** if the cluster does not come up, because the
+///   remaining window is real and cannot be closed from here.
+///
+/// The first two are why a collision is rare; the third is why one is not a failure.
+fn reserve_port_run() -> (u16, Vec<TcpListener>) {
+    const LOW: u16 = 21_000;
+    const HIGH: u16 = 30_000;
+    let stride = u16::try_from(NODE_COUNT).expect("a small node count") + 1;
+    let slots = (HIGH - LOW) / stride;
+    // No `rand` here (`CLAUDE.md`'s dependency policy), and none is needed: the clock and the pid
+    // are enough to keep two processes from starting at the same slot.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.subsec_nanos());
+    let start = (nanos ^ std::process::id()) % u32::from(slots);
+    for step in 0..slots {
+        let slot = (start + u32::from(step)) % u32::from(slots);
+        let Some(base) = u16::try_from(slot)
+            .ok()
+            .and_then(|slot| slot.checked_mul(stride))
+            .and_then(|offset| LOW.checked_add(offset))
+        else {
+            continue;
+        };
         let bound: Vec<TcpListener> = (0..NODE_COUNT)
             .filter_map(|at| {
                 let offset = u16::try_from(at).ok()?;
@@ -80,10 +111,10 @@ fn free_port_run() -> u16 {
             })
             .collect();
         if bound.len() == NODE_COUNT {
-            return base;
+            return (base, bound);
         }
     }
-    panic!("no run of {NODES} consecutive free ports");
+    panic!("no run of {NODES} consecutive free ports between {LOW} and {HIGH}");
 }
 
 fn address_of(base_port: u16, id: u64) -> SocketAddr {
@@ -114,10 +145,28 @@ fn read_state(data_dir: &Path) -> Option<Vec<Node>> {
 }
 
 impl Cluster {
+    /// Starts the cluster, **retrying on a fresh port run** if it does not come up.
+    ///
+    /// The reservation cannot be handed to a child process, so a run this test holds is released
+    /// a moment before the supervisor's nodes bind it and another process can still take one in
+    /// between (see [`reserve_port_run`]). That window is narrow and it is not zero, so losing it
+    /// is treated as a retry rather than as a failure — three attempts, each on a different run.
     fn start() -> Self {
+        for attempt in 1..=3_u32 {
+            if let Some(cluster) = Self::try_start() {
+                return cluster;
+            }
+            eprintln!("the cluster did not come up on attempt {attempt}; trying another port run");
+        }
+        panic!("the supervisor never wrote cluster.state, on three different port runs");
+    }
+
+    /// One attempt, on one reserved run. `None` if the cluster did not come up.
+    fn try_start() -> Option<Self> {
         let data_dir = TempDir::new().unwrap();
-        let base_port = free_port_run();
-        let supervisor = Command::new(env!("CARGO_BIN_EXE_esker-cli"))
+        let (base_port, held) = reserve_port_run();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_esker-cli"));
+        command
             .arg("cluster")
             .arg("start")
             .arg("--nodes")
@@ -129,28 +178,36 @@ impl Cluster {
             .arg("--seed")
             .arg(SEED.to_string())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("the cluster command starts");
+            .stderr(Stdio::null());
+        // **Released here and nowhere earlier.** Everything above this line happened while the run
+        // was still ours; the child binds it on the next.
+        drop(held);
+        let supervisor = command.spawn().expect("the cluster command starts");
 
         let deadline = Instant::now() + Duration::from_secs(30);
         let nodes = loop {
             if let Some(nodes) = read_state(data_dir.path()) {
                 break nodes;
             }
-            assert!(
-                Instant::now() < deadline,
-                "the supervisor never wrote cluster.state"
-            );
+            if Instant::now() >= deadline {
+                // Built and dropped so the supervisor is killed the way it is anywhere else.
+                drop(Self {
+                    supervisor,
+                    data_dir,
+                    base_port,
+                    nodes: Vec::new(),
+                });
+                return None;
+            }
             std::thread::sleep(Duration::from_millis(50));
         };
 
-        Self {
+        Some(Self {
             supervisor,
             data_dir,
             base_port,
             nodes,
-        }
+        })
     }
 
     fn addrs(&self) -> Vec<SocketAddr> {
@@ -518,4 +575,30 @@ fn the_kill_command_exists() {
         }
         Err(error) => panic!("running `kill`: {error}"),
     }
+}
+
+/// **A reserved port run has to still be ours when the child processes bind it.**
+///
+/// Two claims, and the scan satisfies neither. It binds a run to prove it is free and then drops
+/// every listener, so the ports belong to nobody until the supervisor's children get to them; and
+/// it walks from the same base every time, so two processes running this file at once pick the
+/// same run and one of them loses.
+#[test]
+fn a_reserved_port_run_is_held_and_never_handed_out_twice() {
+    let (first, held) = reserve_port_run();
+    for at in 0..NODE_COUNT {
+        let offset = u16::try_from(at).expect("a small offset");
+        let port = first.checked_add(offset).expect("in range");
+        assert!(
+            TcpListener::bind(("127.0.0.1", port)).is_err(),
+            "port {port} of the reserved run was still bindable, so the reservation holds nothing"
+        );
+    }
+    // And a second reservation cannot be the same run while the first is held.
+    let (second, _also_held) = reserve_port_run();
+    assert_ne!(
+        first, second,
+        "two reservations returned the same run, so two processes doing this at once collide"
+    );
+    drop(held);
 }
