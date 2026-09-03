@@ -1,0 +1,23 @@
+crates/esker-sql/tests/corpus/pg19_schema.txt
+  s_2ed9df2fd94fee::t_3b891a00882e00 1-120
+crates/esker-sql/tests/schema_namespace.rs
+  s_2ed9df2fd94fee::t_5b027a41129571 1-85
+docs/plans/phase-9-rails.md
+  s_2ed9df2fd94fee::t_71b0d3d5c67ea7 1288,1500
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "6caa3db1c7b2e8261da1f4cdfb6bd53b6f031768",
+  "prompts": {},
+  "sessions": {
+    "s_2ed9df2fd94fee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ec622e3b-48a0-4735-8805-fe22838e8b26",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
