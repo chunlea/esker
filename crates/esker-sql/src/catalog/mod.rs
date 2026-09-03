@@ -163,6 +163,44 @@ pub struct ColumnDef {
     /// a `RENAME COLUMN` keeps it and a `DROP COLUMN` takes it away, both without a line of code
     /// (ADR 0049).
     pub comment: Option<String>,
+    /// The oid of the **user-defined type** this column was declared as, or `None` for a column
+    /// declared as one of this node's own types.
+    ///
+    /// [ADR 0050](../../../docs/adr/0050-a-user-defined-type-is-a-value.md)'s shape, and the field
+    /// exists because [`ColumnType`] must not learn one. `ty` stays what the value physically
+    /// **is** — an enum label is stored as the `int2` of its position — and this is what it is
+    /// *called*, which is the half that needs a catalog to answer. Putting the oid in
+    /// `ColumnType` instead would give every exhaustive match over it an arm that cannot be
+    /// answered without a catalog lookup, in a crate (`esker-keys`) that must not have one:
+    /// invariant 7, and the reason option 1 of the ADR was not taken.
+    ///
+    /// It rides on the column for the same reason [`ColumnDef::comment`] does: a `DROP COLUMN`
+    /// takes it away and a `RENAME` keeps it, with no lifetime code to forget.
+    pub user_type: Option<u64>,
+}
+
+/// An enum's labels, in declaration order — which **is** its sort order.
+///
+/// The ordinal a row stores is the label's position **plus one**, matching
+/// `pg_enum.enumsortorder`, which starts at 1. Nothing depends on the offset except that it is the
+/// same in both directions, and matching the catalog column a client can read is worth more than
+/// saving the addition.
+#[must_use]
+pub fn enum_ordinal(labels: &[String], label: &str) -> Option<i16> {
+    let at = labels.iter().position(|known| known == label)?;
+    i16::try_from(at + 1).ok()
+}
+
+/// The label an ordinal names, or `None` for one no label has.
+///
+/// `None` is not reachable from a value this node wrote — an ordinal only ever comes from
+/// [`enum_ordinal`] — and it is what makes the never-reuse rule of ADR 0050 visible: a stored
+/// ordinal whose label has gone would land here, and the answer is nothing rather than a
+/// neighbouring label.
+#[must_use]
+pub fn enum_label(labels: &[String], ordinal: i16) -> Option<&str> {
+    let at = usize::try_from(ordinal.checked_sub(1)?).ok()?;
+    labels.get(at).map(String::as_str)
 }
 
 /// What kind of `UNIQUE` constraint an index belongs to, when it belongs to one.
@@ -680,6 +718,7 @@ pub fn sequence_relation_def(name: &str, sequence_id: u64) -> Arc<TableDef> {
         missing: None,
         generated: None,
         comment: None,
+        user_type: None,
     };
     Arc::new(TableDef {
         id: SEQUENCE_RELATION_ID_BASE.wrapping_add(sequence_id),
@@ -707,6 +746,7 @@ pub fn sequence_relation_def(name: &str, sequence_id: u64) -> Arc<TableDef> {
         partition_bound: None,
         comment: None,
         primary_key_comment: None,
+        enums: std::collections::BTreeMap::new(),
     })
 }
 
@@ -844,6 +884,21 @@ pub struct TableDef {
     ///
     /// In column order, which is the order the scan returns them in.
     pub sequences: Vec<SequenceDef>,
+    /// The user-defined types this table's columns were declared as, by oid.
+    ///
+    /// **Not part of the table record either**, and for the same reason [`TableDef::sequences`] is
+    /// not: the type is its own catalog record, keyed by name, and a column stores only its oid
+    /// ([`ColumnDef::user_type`], ADR 0050). Hydrating it where the table is loaded is what makes
+    /// every consumer able to answer without a catalog of its own — resolution has a `Scope`, and
+    /// a `Scope` holds `TableDef`s.
+    ///
+    /// **Only read when a column has one**, so a table of ordinary columns costs nothing: the
+    /// lookup is skipped entirely rather than fetching an empty map.
+    ///
+    /// This is what makes an enum's label a label. The row holds the `int2` of the label's
+    /// position — which is what gives it PostgreSQL's ordering — and the labels here are how it is
+    /// written back out and how a literal on the way in is read.
+    pub enums: std::collections::BTreeMap<u64, TypeDef>,
     /// `CHECK` constraints, in the order `pg_constraint` lists them — by name.
     ///
     /// Each holds its predicate as **text**, not as a parsed tree, and is re-lowered when the
@@ -1857,6 +1912,10 @@ impl View<'_> {
         let inherited = inherited_sequences(self.txn, self.tenant, &table, &table.parents.clone())?;
         table.sequences.extend(inherited);
         table.child_scans = child_scans(self.txn, self.tenant, &table)?;
+        // And the user-defined types its columns were declared as, for the same reason and in the
+        // same place: a `TableDef` in anybody's hands can name them. **Only when a column has
+        // one** — the common table pays nothing, which is what keeps this off the hot path.
+        table.enums = column_user_types(self.txn, self.tenant, &table)?;
         let table = Arc::new(table);
         if let Some(cache) = cache {
             cache.lock().tables.insert(key, Arc::clone(&table));
@@ -1922,6 +1981,39 @@ pub fn type_by_name(txn: &dyn Txn, tenant: u64, name: &str) -> Result<Option<Typ
         Some(bytes) => record::decode_type(name, &bytes).map(Some),
         None => Ok(None),
     }
+}
+
+/// The user-defined types a table's columns were declared as, by oid.
+///
+/// **A table with no such column reads nothing**, which is every table until a `CREATE TABLE`
+/// names a `CREATE TYPE`. That guard is the whole cost story: this runs where a `TableDef` is
+/// loaded, which is the hottest catalog path there is.
+///
+/// A type is keyed by **name** and a column stores its **oid**, so this is a scan and not a point
+/// read — which is also what makes a `RENAME TYPE` free, since the oid a column holds does not
+/// move when the record does.
+fn column_user_types(
+    txn: &dyn Txn,
+    tenant: u64,
+    table: &TableDef,
+) -> Result<std::collections::BTreeMap<u64, TypeDef>> {
+    if table
+        .columns
+        .iter()
+        .all(|column| column.user_type.is_none())
+    {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let wanted: std::collections::BTreeSet<u64> = table
+        .columns
+        .iter()
+        .filter_map(|column| column.user_type)
+        .collect();
+    Ok(user_types(txn, tenant)?
+        .into_iter()
+        .filter(|def| wanted.contains(&def.oid))
+        .map(|def| (def.oid, def))
+        .collect())
 }
 
 /// Every user-defined type of one tenant, in name order — which is the order the key space returns
@@ -3027,6 +3119,7 @@ mod tests {
                     missing: None,
                     generated: None,
                     comment: None,
+                    user_type: None,
                 },
                 ColumnDef {
                     name: "email".into(),
@@ -3038,6 +3131,7 @@ mod tests {
                     missing: None,
                     generated: None,
                     comment: None,
+                    user_type: None,
                 },
             ],
             primary_key: vec![0],
@@ -3067,6 +3161,7 @@ mod tests {
             child_scans: Vec::new(),
             partition_by: None,
             partition_bound: None,
+            enums: std::collections::BTreeMap::new(),
         }
     }
 
@@ -3091,7 +3186,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "17",               // catalog format version
+                "18",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -3184,7 +3279,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "17",       // catalog format version
+                "18",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -3242,7 +3337,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "17",                 // catalog format version
+                "18",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -3322,6 +3417,12 @@ mod tests {
                 // Version 23. Permanent: this table was not created `UNLOGGED`. One byte for the
                 // whole table, because every relation it owns reads its persistence from here.
                 "00",
+                // Version 24. One varint per column: the oid of the user-defined type it was
+                // declared as, and **0 for none**. An oid comes from the tenant's relation-id
+                // sequence, which starts above zero, so zero is free to mean "one of this node's
+                // own types" without a flag byte in front of it (ADR 0050).
+                "00", // `id` is an `int8`
+                "00", // `email` is a `text`
             )
         );
         assert_eq!(record::decode_table(&encoded).unwrap(), accounts(7));
@@ -3784,6 +3885,7 @@ mod tests {
             missing: None,
             generated: None,
             comment: None,
+            user_type: None,
         });
         table.columns.push(ColumnDef {
             name: "c".into(),
@@ -3795,6 +3897,7 @@ mod tests {
             missing: None,
             generated: None,
             comment: None,
+            user_type: None,
         });
         table.columns.push(ColumnDef {
             name: "t".into(),
@@ -3806,6 +3909,7 @@ mod tests {
             missing: None,
             generated: None,
             comment: None,
+            user_type: None,
         });
         let back = record::decode_table(&record::encode_table(&table).unwrap()).unwrap();
         assert_eq!(back, table);
@@ -4242,6 +4346,7 @@ mod tests {
             missing: Some(Datum::Int8(42)),
             generated: None,
             comment: None,
+            user_type: None,
         });
         let (_, published) =
             record::decode_columnar(&record::encode_columnar(1, Some(&widened)).unwrap()).unwrap();
@@ -4288,7 +4393,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "17",               // catalog format version
+                "18",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

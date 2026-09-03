@@ -68,7 +68,7 @@ pub(super) fn create_table(
     // relation where it actually is.
     let create = &qualified_create(&*txn, executor, create)?;
     refuse_missing_schema(&*txn, executor, &create.name)?;
-    let declared = declared_columns(create)?;
+    let declared = declared_columns(&*txn, executor, create)?;
     // **The parents' columns come first**, whatever order the child declared its own in, and a
     // child that redeclares an inherited name merges into it rather than adding a second column.
     let (parents, columns) = inherited_columns(executor, txn, create, declared)?;
@@ -109,6 +109,7 @@ pub(super) fn create_table(
             missing: None,
             generated: None,
             comment: None,
+            user_type: None,
         });
         with_row_id.extend(columns);
         (with_row_id, vec![0], String::new())
@@ -162,6 +163,7 @@ pub(super) fn create_table(
         sequences,
         comment: None,
         primary_key_comment: None,
+        enums: std::collections::BTreeMap::new(),
     };
 
     validate_checks(&table)?;
@@ -209,7 +211,11 @@ pub(super) fn create_table(
 /// taking that name in the same namespace tables and indexes share — `CREATE TABLE t_id_seq` after
 /// a `bigserial` is `42P07` on both servers.
 /// The table's columns, as the catalog holds them, refusing a name written twice.
-fn declared_columns(create: &CreateTable) -> Result<Vec<ColumnDef>> {
+fn declared_columns(
+    txn: &dyn Txn,
+    executor: &Executor,
+    create: &CreateTable,
+) -> Result<Vec<ColumnDef>> {
     let mut columns = Vec::with_capacity(create.columns.len());
     for column in &create.columns {
         if columns
@@ -218,9 +224,10 @@ fn declared_columns(create: &CreateTable) -> Result<Vec<ColumnDef>> {
         {
             return Err(SqlError::DuplicateColumn(column.name.clone()));
         }
+        let (ty, user_type) = resolve_user_type(txn, executor, column)?;
         columns.push(ColumnDef {
             name: column.name.clone(),
-            ty: column.ty,
+            ty,
             typmod: column.typmod,
             default_expr: column.default_expr.clone(),
             // A primary key column is NOT NULL whether or not it said so, which is PostgreSQL's
@@ -233,9 +240,49 @@ fn declared_columns(create: &CreateTable) -> Result<Vec<ColumnDef>> {
             missing: None,
             generated: column.generated.clone(),
             comment: None,
+            user_type,
         });
     }
     Ok(columns)
+}
+
+/// A column's type, once the catalog has been asked about the name lowering could not resolve.
+///
+/// [ADR 0050](../../../docs/adr/0050-a-user-defined-type-is-a-value.md)'s first unit. Lowering
+/// hands over a bare type name it does not recognise (`crate::plan::Column::user_type_name`) and
+/// this is where it becomes a type or an error, because this is where the catalog is.
+///
+/// **An enum's value is the `int2` of its label's position**, which is what makes ordering,
+/// grouping, `=` and an index over the column all the ordinal's — `pg_enum.enumsortorder` is
+/// PostgreSQL's own sort key for exactly the same reason. The label is rendered back through the
+/// catalog on the way out; nothing below this crate ever sees anything but a small integer, which
+/// is invariant 7 kept rather than worked around.
+///
+/// The other two kinds are **refused by name**. A range's and a composite's values are their own
+/// units in the ADR's order, and answering a `CREATE TABLE` for one of them would make a column
+/// nothing can read — a wrong answer where a refusal is available (ADR 0031).
+fn resolve_user_type(
+    txn: &dyn Txn,
+    executor: &Executor,
+    column: &crate::plan::Column,
+) -> Result<(ColumnType, Option<u64>)> {
+    let Some(name) = &column.user_type_name else {
+        return Ok((column.ty, None));
+    };
+    let Some(def) = catalog::type_by_name(txn, executor.tenant, name)? else {
+        // The name is not a type anybody declared, which is where lowering's own refusal has been
+        // waiting for a catalog to confirm it. Same `0A000` and same wording as before.
+        return Err(SqlError::unsupported(format!("the type {name}")));
+    };
+    match def.kind {
+        catalog::TypeKind::Enum { .. } => Ok((ColumnType::Int2, Some(def.oid))),
+        catalog::TypeKind::Range { .. } => Err(SqlError::unsupported(format!(
+            "a column of the range type {name}"
+        ))),
+        catalog::TypeKind::Composite { .. } => Err(SqlError::unsupported(format!(
+            "a column of the composite type {name}"
+        ))),
+    }
 }
 
 /// A `CHECK` added after the fact.
@@ -2450,6 +2497,7 @@ pub(super) fn alter_table(
             missing: column.default.clone(),
             generated: None,
             comment: None,
+            user_type: None,
         });
         changed = true;
     }

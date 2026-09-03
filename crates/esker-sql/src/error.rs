@@ -363,6 +363,25 @@ pub enum SqlError {
         value: String,
     },
 
+    /// A string that is not one of an enum's labels.
+    ///
+    /// **`22P02`, the input-syntax class**, and the sentence is a different one from
+    /// [`SqlError::InvalidTextRepresentation`]'s — "invalid input **value** for enum", not
+    /// "invalid input **syntax** for type". Measured on 19beta1 from three statements that all
+    /// give it: an `INSERT`, an `UPDATE` and a bare `'angry'::mood`. It is not `42704` (which
+    /// would be an undefined object) and not a constraint violation, which is what an
+    /// implementation that modelled an enum as a `CHECK` would answer.
+    ///
+    /// The type's name is owned rather than `&'static`: a user-defined type's name is not known
+    /// until the catalog is read.
+    #[error("invalid input value for enum {ty}: \"{value}\"")]
+    InvalidEnumValue {
+        /// The enum type's name, as the message quotes it.
+        ty: String,
+        /// The text that is not one of its labels.
+        value: String,
+    },
+
     /// An integer literal is well-formed and too big. PostgreSQL phrases the two numeric ranges
     /// differently — this one leads with `value` and [`SqlError::FloatOutOfRange`] does not — and
     /// both are copied verbatim because a client may be matching on either.
@@ -1678,7 +1697,9 @@ impl SqlError {
             SqlError::NotNullViolation(_) | SqlError::NotNullViolationInRelation { .. } => {
                 sqlstate::NOT_NULL_VIOLATION
             }
-            SqlError::InvalidTextRepresentation { .. } | SqlError::InvalidByteaFormat => {
+            SqlError::InvalidTextRepresentation { .. }
+            | SqlError::InvalidEnumValue { .. }
+            | SqlError::InvalidByteaFormat => {
                 sqlstate::INVALID_TEXT_REPRESENTATION
             }
             SqlError::IntegerOutOfRange { .. }

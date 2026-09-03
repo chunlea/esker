@@ -87,7 +87,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 23;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 24;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -1461,7 +1461,32 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         Persistence::Unlogged => 1,
     });
 
+    // Version 24. One varint per column: the oid of the user-defined type it was declared as, and
+    // **0 for none** — an oid comes from the tenant's relation-id sequence, which starts above
+    // zero, so no present-or-absent byte is needed and the section costs one byte for a column
+    // that has no user type. Twelfth section, appended like every one before it (ADR 0050).
+    for column in &table.columns {
+        varint::put_u64(column.user_type.unwrap_or(0), &mut out);
+    }
+
     Ok(out)
+}
+
+/// The version 24 tail: each column's user-defined type oid, or 0 for a column declared as one of
+/// this node's own types.
+///
+/// A column written before 24 has none, which is what every column had while a user type could not
+/// be a column's type at all — `CREATE TABLE t (c mood)` was `0A000 the type mood is not
+/// supported` until ADR 0050's first unit.
+fn read_user_types(reader: &mut Reader<'_>, columns: &mut [ColumnDef]) -> Result<()> {
+    if reader.version < 24 {
+        return Ok(());
+    }
+    for column in columns {
+        let oid = reader.varint()?;
+        column.user_type = (oid != 0).then_some(oid);
+    }
+    Ok(())
 }
 
 /// The version 23 section: whether the table is `UNLOGGED`.
@@ -1913,6 +1938,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
             // Filled from the version 13 section below, after every column has been read.
             generated: None,
             comment: None,
+            user_type: None,
         });
     }
 
@@ -1999,6 +2025,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
     let excludes = read_excludes(&mut reader)?;
     let (comment, primary_key_comment) = read_comments(&mut reader, &mut columns, &mut indexes)?;
     let persistence = read_persistence(&mut reader)?;
+    read_user_types(&mut reader, &mut columns)?;
     reader.finish()?;
 
     Ok(TableDef {
@@ -2026,6 +2053,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
         checks,
         foreign_keys,
         triggers_disabled,
+        enums: std::collections::BTreeMap::new(),
     })
 }
 
