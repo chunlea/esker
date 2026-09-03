@@ -2820,6 +2820,16 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
         refuse_wrong_arity(function, "current_schema", 0)?;
         return Ok(plan::Expr::CurrentSchema { all: None });
     }
+    // **The database this node has.** Folded here like `current_schema()` because it is the same
+    // kind of answer: a constant of the server, not a property of the row. `ActiveRecord`'s adapter
+    // runs it four times while connecting — once alone and three times joined to `pg_database` for
+    // the encoding, the collation and the ctype.
+    if name.eq_ignore_ascii_case("current_database") {
+        refuse_wrong_arity(function, "current_database", 0)?;
+        return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+            Datum::Text(DATABASE_NAME.to_owned()),
+        ))));
+    }
     // **The array, unresolved.** It was folded here into a literal `{public}` while `public` was
     // the only schema; now the value is the session's `search_path` and a lowering has no session,
     // so it becomes an expression `crate::exec::Executor::bound` fills in. The `= ANY (…)`
@@ -2853,6 +2863,20 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
     if let Some(func) = plan::UuidFunc::from_name(&name) {
         refuse_wrong_arity(function, func.name(), 0)?;
         return Ok(plan::Expr::Uuid(func));
+    }
+    // **`COALESCE` is a construct, not a function**, so its failures are the grammar's: no
+    // arguments at all is `42601 syntax error at or near ")"` where a function would be `42883`.
+    // `sqlparser` parses it as an ordinary call, which is why the distinction has to be made here.
+    if name.eq_ignore_ascii_case("coalesce") {
+        let args = function_arguments(function, "coalesce")?;
+        if args.is_empty() {
+            return Err(SqlError::SyntaxAtOrNear(")".to_owned()));
+        }
+        return Ok(plan::Expr::Coalesce(
+            args.into_iter()
+                .map(lower_expr)
+                .collect::<Result<Vec<_>>>()?,
+        ));
     }
     if let Some(func) = plan::SequenceFunc::from_name(&name) {
         return lower_sequence_function(func, function);
@@ -3586,6 +3610,15 @@ fn cast_type_name(data_type: &DataType) -> String {
 
 /// The one schema this node has. `public`, which is what `current_schema()` answers.
 const PUBLIC_SCHEMA: &str = "public";
+
+/// The one database this node has, which is what `current_database()` answers.
+///
+/// A constant for the reason [`PUBLIC_SCHEMA`] is one: there is exactly one, and every statement
+/// that names a database names this one. A client may connect under another name — the startup
+/// packet's `database` is not read — and gets this back, which is the declared divergence; what
+/// matters to the adapter is that `pg_database.datname` carries the **same** name, so
+/// `WHERE datname = current_database()` matches by construction rather than by coincidence.
+pub(crate) const DATABASE_NAME: &str = "esker";
 
 /// A cast to one of the four array types, or `None` when this is not one.
 ///

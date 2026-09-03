@@ -183,6 +183,11 @@ fn for_each_subquery_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut TableRef))
                 for_each_subquery_mut(item, visit);
             }
         }
+        Expr::Coalesce(args) => {
+            for arg in args {
+                for_each_subquery_mut(arg, visit);
+            }
+        }
         Expr::Case {
             branches,
             otherwise,

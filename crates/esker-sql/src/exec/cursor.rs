@@ -1170,6 +1170,19 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         //
         // A condition is this branch only when it is **`true`**: NULL and false are both "not
         // this one", which is why `CASE WHEN NULL THEN 'a' ELSE 'b' END` is `b`.
+        // **The first argument that is not NULL**, and NULL when they all are. Every argument is
+        // evaluated in turn and none after the answer, which is what makes
+        // `COALESCE(a, 1/0)` safe when `a` is not NULL — the same short circuit a `CASE` has.
+        Expr::Coalesce(args) => {
+            let mut answer = Datum::Null;
+            for arg in args {
+                answer = evaluate_in(arg, row, env)?;
+                if !matches!(answer, Datum::Null) {
+                    break;
+                }
+            }
+            answer
+        }
         Expr::Case {
             branches,
             otherwise,
@@ -1584,6 +1597,13 @@ fn catalog_function(
                 None if oid == 0 => Datum::Text("-".to_owned()),
                 None => Datum::Text(oid.to_string()),
             },
+        },
+        // The one encoding this node speaks. Anything else is the empty string, which is what a
+        // real server answers for a number that names no encoding.
+        CatalogFunc::PgEncodingToChar => match oid_argument(args.first())? {
+            Some(6) => Datum::Text("UTF8".to_owned()),
+            Some(_) => Datum::Text(String::new()),
+            None => Datum::Null,
         },
         // **The sequence a column's default draws from, schema-qualified.** Its arguments are
         // names rather than oids, which is why it is the one catalog function here that looks a

@@ -502,6 +502,11 @@ impl Aggregation {
                 case_insensitive: *case_insensitive,
                 escape: *escape,
             },
+            Expr::Coalesce(args) => Expr::Coalesce(
+                args.iter()
+                    .map(|arg| self.rewrite(arg, scope))
+                    .collect::<Result<Vec<_>>>()?,
+            ),
             Expr::Case {
                 branches,
                 otherwise,
@@ -607,6 +612,11 @@ fn walk<'a>(expr: &'a Expr, found: &mut Vec<&'a AggregateCall>) {
         }
         Expr::CatalogFunc(call) => {
             for arg in &call.args {
+                walk(arg, found);
+            }
+        }
+        Expr::Coalesce(args) => {
+            for arg in args {
                 walk(arg, found);
             }
         }

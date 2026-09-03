@@ -352,6 +352,11 @@ pub(super) fn walk_expr_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr)) 
             walk_expr_mut(operand, visit);
             walk_expr_mut(index, visit);
         }
+        Expr::Coalesce(args) => {
+            for arg in args {
+                walk_expr_mut(arg, visit);
+            }
+        }
         Expr::Case {
             branches,
             otherwise,
@@ -519,6 +524,11 @@ pub(super) fn descend(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
         Expr::Subscript { operand, index, .. } => {
             descend(operand, visit);
             descend(index, visit);
+        }
+        Expr::Coalesce(args) => {
+            for arg in args {
+                descend(arg, visit);
+            }
         }
         Expr::Case {
             branches,

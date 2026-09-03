@@ -1688,6 +1688,7 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             branches,
             otherwise,
         } => resolve_case(branches, otherwise.as_deref(), scope)?,
+        Expr::Coalesce(args) => resolve_coalesce(args, scope)?,
         // Its arguments are ordinary expressions of the row — `format_type(a.atttypid,
         // a.atttypmod)` is two column references — so they resolve like any others. Falling
         // through to the clone below would leave them as `Expr::Column` and the evaluator would
@@ -1843,6 +1844,54 @@ fn resolve_case(
         branches: resolved,
         otherwise,
     })
+}
+
+/// One `COALESCE`, resolved: its arguments given one type.
+///
+/// **The same rules a `CASE`'s results follow**, because they are the same rules on a real server —
+/// `select_common_type` over the argument list — and only two things differ. The list is walked
+/// **left to right**, where a `CASE`'s starts with its `ELSE`; and the message names `COALESCE`.
+/// Both measured: `COALESCE(1, 'x'::text)` is `42804 COALESCE types integer and text cannot be
+/// matched`, while `COALESCE(1, 'notanumber')` — an *unknown* rather than a typed argument — is
+/// `22P02 invalid input syntax for type integer`, because an unknown is **coerced** to the common
+/// type rather than compared with it. Same pair of arguments, two different failures.
+fn resolve_coalesce(args: &[Expr], scope: &Scope<'_>) -> Result<Expr> {
+    let mut resolved = Vec::with_capacity(args.len());
+    for arg in args {
+        resolved.push(resolve(arg, scope)?);
+    }
+    let mut common = None;
+    for arg in &resolved {
+        let Some(ty) = branch_type(arg, scope) else {
+            continue;
+        };
+        match common {
+            None => common = Some(ty),
+            // **The wider of the two, not the first.** `COALESCE(1, 2.5)` is `numeric` on a real
+            // server — the integer is promoted — so the common type is taken from the same
+            // promotion table arithmetic uses (ADR 0046) rather than from whichever argument came
+            // first. A pair with no promotion between them keeps the family test's answer.
+            Some(chosen) if same_family(chosen, ty) => {
+                common = Some(
+                    crate::value::arith::result_type(crate::plan::ArithOp::Add, chosen, ty)
+                        .unwrap_or(chosen),
+                );
+            }
+            Some(chosen) => {
+                return Err(SqlError::DatatypeMismatch(format!(
+                    "COALESCE types {} and {} cannot be matched",
+                    chosen.name(),
+                    ty.name()
+                )));
+            }
+        }
+    }
+    if let Some(ty) = common {
+        for arg in &mut resolved {
+            give_branch_type(arg, ty)?;
+        }
+    }
+    Ok(Expr::Coalesce(resolved))
 }
 
 /// The left-hand side of an `IN`/`ANY`/`ALL`, typed against the subquery's column.
@@ -2586,6 +2635,15 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
             .and_then(esker_keys::array::ArrayValue::element_of)
             .unwrap_or(*element),
         Expr::Uuid(_) => ColumnType::Uuid,
+        // Resolution has already given every argument the common type, so the first one that
+        // **carries** a type is the answer. `branch_type` rather than `expr_type` is the whole of
+        // it: a bare NULL answers `text` from the second and nothing from the first, and
+        // `COALESCE(NULL, 2)` typed as `text` made `COALESCE(1, NULL) + COALESCE(NULL, 2)` the
+        // `42883 operator does not exist: bigint + text` that a real server adds without blinking.
+        Expr::Coalesce(args) => args
+            .iter()
+            .find_map(|arg| branch_type(arg, scope))
+            .unwrap_or(ColumnType::Text),
         Expr::Case {
             branches,
             otherwise,

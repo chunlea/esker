@@ -424,6 +424,9 @@ fn push_filter(
         // The fragment language has no conditional, and a `CASE` is the one expression whose
         // branches must **not** all be evaluated — pushing it down as anything else would change
         // which of them raises. Rows, and the row evaluator answers it.
+        // A fragment is pushed down to a learner that has no expression evaluator of its own, so
+        // the two conditional constructs are refused there and computed here.
+        Expr::Coalesce(_) => return Err(refused("a COALESCE expression")),
         Expr::Case { .. } => return Err(refused("a CASE expression")),
         // The fragment language has no array. Rows, and the row evaluator answers it.
         Expr::AnyArray { .. } => return Err(refused("= ANY over an array value")),
@@ -722,9 +725,11 @@ fn collect_columns(expr: &Expr, into: &mut Vec<usize>) {
                 collect_columns(item, into);
             }
         }
-        // Every branch's columns, condition and result alike: a projection that left out a column
-        // only one unreached branch names would still have to read it, because which branch is
-        // reached is a property of the row and not of the plan.
+        Expr::Coalesce(args) => {
+            for arg in args {
+                collect_columns(arg, into);
+            }
+        }
         Expr::Case {
             branches,
             otherwise,
