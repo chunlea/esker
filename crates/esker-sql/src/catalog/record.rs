@@ -49,7 +49,7 @@ use esker_keys::{codec, prefix};
 
 use crate::catalog::{
     CheckDef, ColumnDef, ExprShape, ForeignKeyDef, Identity, IndexDef, IndexKey, KeyOrder, KeyPart,
-    ReferentialAction, Relation, SchemaState, SequenceDef, TableDef,
+    ReferentialAction, Relation, SchemaState, SequenceDef, TableDef, UniqueKind,
 };
 use crate::error::{Result, SqlError};
 use crate::value::{ColumnType, Datum, NO_TYPMOD};
@@ -76,7 +76,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 16;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 17;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -1024,7 +1024,35 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         out.extend_from_slice(&child.to_le_bytes());
     }
 
+    // Version 17. One byte per index, in index order and **after** version 16's edges — the fifth
+    // section to go on the end for the same reason as the four before it.
+    //
+    // `0` is an index that is not a constraint, which is what every index written before 17 was
+    // read as: a `UNIQUE` constraint's index and a `CREATE UNIQUE INDEX`'s were indistinguishable
+    // until this byte, so a record that predates it cannot claim to be one.
+    for index in &table.indexes {
+        out.push(unique_kind_tag(index.constraint));
+    }
+
     Ok(out)
+}
+
+/// The version 17 byte: whether an index is a `UNIQUE` constraint's, and whether it is deferrable.
+fn unique_kind_tag(kind: Option<UniqueKind>) -> u8 {
+    match kind {
+        None => 0,
+        Some(UniqueKind::Immediate) => 1,
+        Some(UniqueKind::Deferrable) => 2,
+    }
+}
+
+fn unique_kind_of(tag: u8) -> Result<Option<UniqueKind>> {
+    Ok(match tag {
+        0 => None,
+        1 => Some(UniqueKind::Immediate),
+        2 => Some(UniqueKind::Deferrable),
+        other => return Err(corrupt(format!("unique constraint tag {other}"))),
+    })
 }
 
 /// Tags for [`ReferentialAction`] as stored. PostgreSQL's own `confdeltype` characters would do,
@@ -1275,6 +1303,8 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
             // All three filled after the loop, for versions 7, 8 and 11.
             predicate: None,
             nulls_not_distinct: false,
+            // Filled from the version 17 section below, after every index has been read.
+            constraint: None,
         });
     }
 
@@ -1310,6 +1340,14 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
     read_generation_expressions(&mut reader, &mut columns)?;
     read_default_expressions(&mut reader, &mut columns)?;
     let (parents, children) = read_inheritance(&mut reader)?;
+    // A table written before version 17 has no byte here, and `None` is what it meant: nothing
+    // could tell a constraint's index from a bare one, so none of them may claim to be a
+    // constraint.
+    if reader.version >= 17 {
+        for index in &mut indexes {
+            index.constraint = unique_kind_of(reader.byte()?)?;
+        }
+    }
     reader.finish()?;
 
     Ok(TableDef {

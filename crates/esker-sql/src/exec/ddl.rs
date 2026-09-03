@@ -336,10 +336,14 @@ fn unique_indexes(
                 .unwrap_or_else(|| plan::unique_constraint_name(&create.name, &constraint.columns)),
             unique: true,
             keys: ordinals.into_iter().map(IndexKey::column).collect(),
-            // A `UNIQUE` constraint's grammar takes `NULLS NOT DISTINCT` on a real server; this
-            // node refuses the clause there (`parse::lower`), so a constraint's index never has
-            // it and the default is the truth rather than a placeholder.
-            nulls_not_distinct: false,
+            nulls_not_distinct: constraint.nulls_not_distinct,
+            // It **is** a constraint, which is what separates it from the identical index a
+            // `CREATE UNIQUE INDEX` builds: only this one gets a `pg_constraint` row.
+            constraint: Some(if constraint.deferrable {
+                catalog::UniqueKind::Deferrable
+            } else {
+                catalog::UniqueKind::Immediate
+            }),
             state: catalog::SchemaState::Public,
             state_since: 1,
             predicate: None,
@@ -1182,6 +1186,11 @@ pub(super) fn create_index(
         keys,
         predicate: create.predicate.clone(),
         nulls_not_distinct: create.nulls_not_distinct,
+        // **`CREATE UNIQUE INDEX` is not a constraint.** It builds the same index a `UNIQUE (c)`
+        // does and PostgreSQL tells them apart by exactly this: only the constraint has a
+        // `pg_constraint` row, and a node that gave one to every unique index would report a
+        // constraint the schema never declared.
+        constraint: None,
         // Public the moment it is declared, because it is built inside this statement's own
         // transaction: no other node ever sees it half-made. That is what makes the plain form
         // correct and also what makes it `TODO(post-v1)` for a table large enough to matter — the

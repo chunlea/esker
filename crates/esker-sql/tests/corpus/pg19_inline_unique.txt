@@ -1,0 +1,52 @@
+# Inline `UNIQUE` table constraints — statement 779 of `postgresql_specific_schema.rb`, which
+# declares four of them in one `CREATE TABLE`: a plain one, `DEFERRABLE INITIALLY IMMEDIATE`,
+# `DEFERRABLE INITIALLY DEFERRED`, and `NULLS NOT DISTINCT`.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`NULLS NOT DISTINCT` means the table holds at most one row with a NULL there.** Every later
+#     `INSERT` that simply *omits* the column collides with the first — `23505 … Key
+#     (position_4)=(null) already exists`, with `null` lower-case and in parentheses. Four of the
+#     inserts below fail for a column they never mention.
+#   * **`DEFERRABLE INITIALLY IMMEDIATE` is not deferred at all.** It checks at the statement, like
+#     any other unique constraint; the only difference is what the catalog says and what
+#     `pg_get_constraintdef` prints. `INITIALLY DEFERRED` is the one that really waits — both rows
+#     go in and the violation is raised by `COMMIT`, which rolls the whole transaction back.
+#   * **`pg_get_constraintdef` drops `INITIALLY IMMEDIATE` and keeps `DEFERRABLE`**, so the text
+#     that comes out is not the text that went in.
+#   * **The clause sits on opposite sides in the two renderings**: a constraint prints
+#     `UNIQUE NULLS NOT DISTINCT (position_4)` and its index prints
+#     `… USING btree (position_4) NULLS NOT DISTINCT`.
+#   * **`CREATE UNIQUE INDEX` is not a constraint.** It builds an index identical to the one a
+#     `UNIQUE (a)` builds and gets **no** `pg_constraint` row — the count below stays at one
+#     after a second unique index appears. A node that read every unique index as a constraint
+#     would report one the schema never declared.
+CREATE TABLE tuc (id bigserial primary key, position_1 integer, position_2 integer, position_4 integer, CONSTRAINT tuc_pos_false UNIQUE (position_1), CONSTRAINT tuc_pos_immediate UNIQUE (position_2) DEFERRABLE INITIALLY IMMEDIATE, CONSTRAINT tuc_pos_nnd UNIQUE NULLS NOT DISTINCT (position_4))		-
+SELECT conname, contype, condeferrable, condeferred, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'tuc'::regclass AND contype = 'u' ORDER BY conname	name,"char",boolean,boolean,text	tuc_pos_false|u|f|f|UNIQUE (position_1) ; tuc_pos_immediate|u|t|f|UNIQUE (position_2) DEFERRABLE ; tuc_pos_nnd|u|f|f|UNIQUE NULLS NOT DISTINCT (position_4)
+SELECT c.relname, i.indisunique, i.indnullsnotdistinct FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE i.indrelid = 'tuc'::regclass ORDER BY c.relname	name,boolean,boolean	tuc_pkey|t|f ; tuc_pos_false|t|f ; tuc_pos_immediate|t|f ; tuc_pos_nnd|t|t
+SELECT pg_get_indexdef('tuc_pos_nnd'::regclass)	text	CREATE UNIQUE INDEX tuc_pos_nnd ON public.tuc USING btree (position_4) NULLS NOT DISTINCT
+INSERT INTO tuc (position_4) VALUES (NULL)		-
+INSERT INTO tuc (position_4) VALUES (NULL)	!23505 duplicate key value violates unique constraint "tuc_pos_nnd" DETAIL: Key (position_4)=(null) already exists.
+INSERT INTO tuc (id, position_4) VALUES (99, 1)		-
+SELECT 'g', count(*) FROM tuc	text,bigint	g|2
+INSERT INTO tuc (id, position_1, position_4) VALUES (100, NULL, 2)		-
+INSERT INTO tuc (id, position_1, position_4) VALUES (101, NULL, 3)		-
+SELECT 'g', count(*) FROM tuc	text,bigint	g|4
+INSERT INTO tuc (id, position_2, position_4) VALUES (102, 5, 4)		-
+INSERT INTO tuc (id, position_2, position_4) VALUES (103, 5, 5)	!23505 duplicate key value violates unique constraint "tuc_pos_immediate" DETAIL: Key (position_2)=(5) already exists.
+CREATE TABLE tuc3 (a integer UNIQUE NULLS NOT DISTINCT)		-
+SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'tuc3'::regclass AND contype = 'u'	name,text	tuc3_a_key|UNIQUE NULLS NOT DISTINCT (a)
+CREATE TABLE tuc2 (a integer, CONSTRAINT u2 UNIQUE (a) DEFERRABLE)		-
+SELECT conname, condeferrable, condeferred, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'tuc2'::regclass AND contype = 'u'	name,boolean,boolean,text	u2|t|f|UNIQUE (a) DEFERRABLE
+CREATE UNIQUE INDEX tuc2_ix ON tuc2 (a)		-
+SELECT 'g', count(*) FROM pg_constraint WHERE conrelid = 'tuc2'::regclass AND contype = 'u'	text,bigint	g|1
+CREATE TABLE tucd (a integer, CONSTRAINT d UNIQUE (a) DEFERRABLE INITIALLY DEFERRED)		-
+SELECT conname, condeferrable, condeferred, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'tucd'::regclass AND contype = 'u'	name,boolean,boolean,text	d|t|t|UNIQUE (a) DEFERRABLE INITIALLY DEFERRED
+CREATE TABLE td (id integer, CONSTRAINT td_imm UNIQUE (id) DEFERRABLE INITIALLY IMMEDIATE)		-
+INSERT INTO td VALUES (1)		-
+INSERT INTO td VALUES (1)	!23505 duplicate key value violates unique constraint "td_imm" DETAIL: Key (id)=(1) already exists.
+SELECT 'g', count(*) FROM td	text,bigint	g|1

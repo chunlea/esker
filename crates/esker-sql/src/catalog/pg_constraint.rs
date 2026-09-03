@@ -43,9 +43,11 @@
 //! [`constraint_definition`] reverses it. Both are stable for as long as the column is, which is
 //! what a client that reads `c.oid` and then calls `pg_get_constraintdef(c.oid)` needs.
 
+use std::fmt::Write as _;
+
 use crate::backend::Txn;
-use crate::catalog::TableDef;
 use crate::catalog::pg_relations::{self, RelKind, Relations};
+use crate::catalog::{IndexDef, TableDef, UniqueKind};
 use crate::error::Result;
 use crate::value::{ColumnType, Datum};
 
@@ -158,12 +160,7 @@ pub fn rows_from(relations: &Relations) -> Vec<Vec<Datum>> {
                 // `condeferrable` is what was written; `condeferred` is **always `f`**, because
                 // `INITIALLY DEFERRED` is refused by name and `DEFERRABLE INITIALLY IMMEDIATE` —
                 // the only deferrable form here — is `t`/`f` on a real server too. Measured.
-                Datum::Bool(
-                    constraint
-                        .foreign
-                        .as_ref()
-                        .is_some_and(|foreign| foreign.condeferrable),
-                ),
+                Datum::Bool(constraint.condeferrable),
                 Datum::Bool(false),
                 // Every constraint here is validated: there is no `NOT VALID` to leave one behind.
                 Datum::Bool(true),
@@ -222,6 +219,16 @@ pub fn constraint_definition(relations: &Relations, oid: Option<i64>) -> Datum {
     {
         return Datum::Text(primary_key_definition(table));
     }
+    // A `UNIQUE` constraint: it **is** its index, so the oid is that relation's — and only an
+    // index a constraint made answers here, which is what keeps `CREATE UNIQUE INDEX` out.
+    if let Some(relation) = relations.by_oid(oid)
+        && relation.kind == RelKind::Index
+        && let Some(table) = relations.table(relation)
+        && let Some(index) = relation.index_at.and_then(|at| table.indexes.get(at))
+        && let Some(kind) = index.constraint
+    {
+        return Datum::Text(unique_definition(table, index, kind));
+    }
     // A `CHECK`: the oid is the table and the check's position, read back the same way.
     if let Some((table_id, at)) = check_of(oid)
         && let Some(table) = table_of(relations, table_id)
@@ -272,6 +279,10 @@ struct Constraint {
     conkey: Option<String>,
     /// A `FOREIGN KEY`'s columns, or `None` for every other kind.
     foreign: Option<ForeignColumns>,
+    /// `condeferrable`. A `UNIQUE` constraint carries it as well as a `FOREIGN KEY`, and it says
+    /// nothing about *when* the check runs here — `INITIALLY DEFERRED` is refused by name, so
+    /// every constraint this node holds is checked at the statement.
+    condeferrable: bool,
 }
 
 /// What a `FOREIGN KEY` row carries that no other constraint does.
@@ -279,7 +290,6 @@ struct ForeignColumns {
     confrelid: i64,
     confupdtype: &'static str,
     confdeltype: &'static str,
-    condeferrable: bool,
     /// The **parent**'s key columns, as an `int2vector` prints. The child's are `Constraint`'s
     /// `conkey`, which every kind of constraint has.
     confkey: String,
@@ -298,6 +308,7 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             conindid: 0,
             conkey: Some(attnum_vector(table, &[at])),
             foreign: None,
+            condeferrable: false,
         })
         .collect();
     if !table.primary_key_name.is_empty() {
@@ -314,6 +325,7 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             conindid: oid,
             conkey: Some(attnum_vector(table, &table.primary_key)),
             foreign: None,
+            condeferrable: false,
         });
     }
     // `CHECK`, contype `c`. It has no index behind it, so `conindid` is zero for the same reason
@@ -326,6 +338,7 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             conindid: 0,
             conkey: None,
             foreign: None,
+            condeferrable: false,
         });
     }
     // `FOREIGN KEY`, contype `f`. `conindid` is the index on the **parent** that the constraint
@@ -348,14 +361,59 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
                 confrelid: parent_oid,
                 confupdtype: key.on_update.code(),
                 confdeltype: key.on_delete.code(),
-                condeferrable: key.deferrable,
                 confkey: parent.map_or_else(String::new, |parent| {
                     attnum_vector(parent, &key.parent_columns)
                 }),
             }),
+            condeferrable: key.deferrable,
+        });
+    }
+    // `UNIQUE`, contype `u`. **Only an index a constraint made**: `CREATE UNIQUE INDEX` builds an
+    // identical index and gets no row here, which is the distinction `IndexDef::constraint` exists
+    // for. The constraint *is* its index, so the oid and `conindid` are that relation's — the same
+    // arrangement a primary key has.
+    for index in &table.indexes {
+        let Some(kind) = index.constraint else {
+            continue;
+        };
+        let oid = relations
+            .by_name(&index.name)
+            .map_or(table_oid, |relation| relation.oid);
+        out.push(Constraint {
+            oid,
+            name: index.name.clone(),
+            contype: "u",
+            conindid: oid,
+            // An expression key has no column to name, so `conkey` is absent rather than wrong —
+            // the same reading a `CHECK`'s takes. A `UNIQUE` constraint over an expression is not
+            // a shape this node can build anyway; the `None` is what makes that visible.
+            conkey: index.key_columns().map(|keys| attnum_vector(table, &keys)),
+            foreign: None,
+            condeferrable: kind == UniqueKind::Deferrable,
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// `UNIQUE (a, b)`, `UNIQUE NULLS NOT DISTINCT (a)`, `UNIQUE (a) DEFERRABLE`.
+///
+/// **The clause sits on the other side from the index's own rendering**: a constraint writes
+/// `UNIQUE NULLS NOT DISTINCT (position_4)` and `pg_get_indexdef` writes
+/// `… USING btree (position_4) NULLS NOT DISTINCT`. Measured, both.
+///
+/// `DEFERRABLE` is kept and `INITIALLY IMMEDIATE` is dropped, so the text that comes back is not
+/// the text that went in — the same rule a deferrable foreign key follows.
+fn unique_definition(table: &TableDef, index: &IndexDef, kind: UniqueKind) -> String {
+    let mut out = "UNIQUE".to_owned();
+    if index.nulls_not_distinct {
+        out.push_str(" NULLS NOT DISTINCT");
+    }
+    let columns = index.key_columns().unwrap_or_default();
+    let _ = write!(out, " ({})", column_list(table, &columns));
+    if kind == UniqueKind::Deferrable {
+        out.push_str(" DEFERRABLE");
+    }
     out
 }
 

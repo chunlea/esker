@@ -155,6 +155,20 @@ pub struct ColumnDef {
     pub generated: Option<String>,
 }
 
+/// What kind of `UNIQUE` constraint an index belongs to, when it belongs to one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UniqueKind {
+    /// `UNIQUE (c)` — checked at the statement, and no `DEFERRABLE` in its printed definition.
+    Immediate,
+    /// `UNIQUE (c) DEFERRABLE [INITIALLY IMMEDIATE]` — **also** checked at the statement.
+    ///
+    /// `INITIALLY DEFERRED` is the form that really waits and it is refused where it is lowered,
+    /// so every constraint this node holds is checked immediately and the flag reaches exactly two
+    /// readers: `pg_constraint.condeferrable` and `pg_get_constraintdef`, which keeps the word
+    /// `DEFERRABLE` and drops the `INITIALLY IMMEDIATE` half.
+    Deferrable,
+}
+
 /// Where an index or a column is in a staged schema change (ADR 0020).
 ///
 /// Four states, moved one at a time, and each exists because the pair on either side of it is safe
@@ -520,6 +534,16 @@ pub struct IndexDef {
     /// Stored and printed on a **non-unique** index too, where it can refuse nothing: a real
     /// server accepts `CREATE INDEX … NULLS NOT DISTINCT` and prints it back. Measured.
     pub nulls_not_distinct: bool,
+    /// Whether a `UNIQUE` **constraint** made this index, and whether that constraint is
+    /// `DEFERRABLE` — `None` for an index that is not a constraint at all.
+    ///
+    /// **Three states, not two.** `CREATE UNIQUE INDEX` and `UNIQUE (c)` build the same index and
+    /// PostgreSQL tells them apart: only the second has a `pg_constraint` row, so a node storing
+    /// one bit would either invent a constraint for every unique index or report none for any.
+    /// The third state carries `DEFERRABLE`, which is not deferred — it checks at the statement
+    /// like any other, and only `condeferrable` and `pg_get_constraintdef` can see it
+    /// (`crate::plan::UniqueConstraint::deferrable`).
+    pub constraint: Option<UniqueKind>,
 }
 
 impl IndexDef {
@@ -2081,6 +2105,7 @@ mod tests {
                 state_since: 1,
                 predicate: None,
                 nulls_not_distinct: false,
+                constraint: None,
             }],
             primary_key_name: "accounts_pkey".into(),
             schema_version: 1,
@@ -2115,7 +2140,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "10",               // catalog format version
+                "11",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -2208,7 +2233,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "10",       // catalog format version
+                "11",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -2241,7 +2266,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "10",                 // catalog format version
+                "11",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -2292,6 +2317,9 @@ mod tests {
                 // Version 16. No parents and no children: this table inherits from nothing and
                 // nothing inherits from it, which is every table until `INHERITS` runs.
                 "00",
+                "00",
+                // Version 17. One byte per index: this one is a `CREATE UNIQUE INDEX`, not a
+                // `UNIQUE` constraint, so it gets no `pg_constraint` row and no `DEFERRABLE`.
                 "00",
             )
         );
@@ -3002,6 +3030,7 @@ mod tests {
             state_since: 1,
             predicate: None,
             nulls_not_distinct: false,
+            constraint: None,
         });
         replace_table(&mut *adding, 1, &accounts(1), &with_more).unwrap();
         adding.commit().unwrap();
@@ -3060,6 +3089,7 @@ mod tests {
             state_since: 1,
             predicate: None,
             nulls_not_distinct: false,
+            constraint: None,
         });
         let error = replace_table(&mut *ddl, 1, &table, &clash).unwrap_err();
         assert_eq!(error.sqlstate(), sqlstate::DUPLICATE_TABLE);
@@ -3249,7 +3279,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "10",               // catalog format version
+                "11",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

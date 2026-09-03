@@ -90,6 +90,18 @@ pub struct UniqueConstraint {
     pub name: Option<String>,
     /// Column names, in key order.
     pub columns: Vec<String>,
+    /// `NULLS NOT DISTINCT`: two NULLs collide, so **one** row may have a NULL there and no more.
+    ///
+    /// The consequence catches a reader out: an `INSERT` that never mentions the column still
+    /// collides with the first, because omitting it writes a NULL.
+    pub nulls_not_distinct: bool,
+    /// `DEFERRABLE INITIALLY IMMEDIATE`, which is **not deferred**.
+    ///
+    /// It checks at the statement like any other unique constraint; what differs is `condeferrable`
+    /// and what `pg_get_constraintdef` prints — which keeps `DEFERRABLE` and drops the
+    /// `INITIALLY IMMEDIATE` half, so the text out is not the text in. `INITIALLY DEFERRED` really
+    /// waits for `COMMIT` and is refused by name where this is lowered.
+    pub deferrable: bool,
 }
 
 /// `CREATE EXTENSION [IF NOT EXISTS] name`.

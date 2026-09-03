@@ -986,6 +986,35 @@ fn lower_drop_function(drop: &sqlparser::ast::DropFunction) -> Result<plan::Drop
     })
 }
 
+/// `UNIQUE … [NOT] DEFERRABLE [INITIALLY IMMEDIATE | DEFERRED]`, and which half of it lands.
+///
+/// **`DEFERRABLE INITIALLY IMMEDIATE` is not deferred.** Measured: the second of two colliding
+/// rows is refused by the statement that writes it, exactly as a plain `UNIQUE` refuses it, and
+/// all that differs is `pg_constraint.condeferrable` and what `pg_get_constraintdef` prints. So it
+/// is taken, and the flag is stored for those two readers alone.
+///
+/// **`INITIALLY DEFERRED` really waits**, and is refused by name for the reason the foreign-key
+/// form is: a transaction that breaks the constraint in the middle and repairs it before `COMMIT`
+/// succeeds on a real server, and every check in this crate is immediate — so accepting the clause
+/// would refuse a transaction PostgreSQL commits, which is a wrong answer rather than a gap.
+/// Measured: both rows go in and `COMMIT` raises the `23505`, rolling the whole transaction back.
+fn unique_deferrable(
+    characteristics: Option<&sqlparser::ast::ConstraintCharacteristics>,
+) -> Result<bool> {
+    let Some(characteristics) = characteristics else {
+        return Ok(false);
+    };
+    refuse_if(
+        characteristics.initially == Some(DeferrableInitial::Deferred),
+        "UNIQUE ... DEFERRABLE INITIALLY DEFERRED",
+    )?;
+    refuse_if(
+        characteristics.enforced.is_some(),
+        "UNIQUE ... ENFORCED, which is MySQL's",
+    )?;
+    Ok(characteristics.deferrable.unwrap_or(false))
+}
+
 /// A columnar-replica count: a plain non-negative integer, and nothing else.
 ///
 /// No interval grammar, no `'forever'`, no `DEFAULT` — it is a replica count, so the only thing
@@ -1137,13 +1166,12 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
                 // primary key that refuses the second insert.
                 ColumnOption::Default(expr) => (default, default_expr) = column_default(expr, ty)?,
                 ColumnOption::Unique(constraint) => {
-                    refuse_if(
-                        constraint.nulls_distinct != NullsDistinctOption::None,
-                        "UNIQUE NULLS [NOT] DISTINCT",
-                    )?;
                     unique.push(plan::UniqueConstraint {
                         name: option.name.as_ref().map(ident),
                         columns: vec![column_name.clone()],
+                        nulls_not_distinct: constraint.nulls_distinct
+                            == NullsDistinctOption::NotDistinct,
+                        deferrable: unique_deferrable(constraint.characteristics.as_ref())?,
                     });
                 }
                 ColumnOption::PrimaryKey(_) => {
@@ -1395,13 +1423,11 @@ fn lower_table_constraints(
                     .or_else(|| key.name.as_ref().map(ident));
             }
             TableConstraint::Unique(key) => {
-                refuse_if(
-                    key.nulls_distinct != NullsDistinctOption::None,
-                    "UNIQUE NULLS [NOT] DISTINCT",
-                )?;
                 unique.push(plan::UniqueConstraint {
                     name: key.name.as_ref().map(ident),
                     columns: index_columns(&key.columns)?,
+                    nulls_not_distinct: key.nulls_distinct == NullsDistinctOption::NotDistinct,
+                    deferrable: unique_deferrable(key.characteristics.as_ref())?,
                 });
             }
             TableConstraint::ForeignKey(constraint) => {
