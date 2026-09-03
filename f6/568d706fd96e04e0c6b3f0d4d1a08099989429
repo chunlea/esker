@@ -1,0 +1,21 @@
+crates/esker-cli/tests/cluster_chaos.rs
+  s_792befbffafc33::t_4989c59f4e35a1 69,72-106,114,117,148-153,155-165,167-169,181-185,192-201,205,210,579-604
+crates/esker-cli/tests/tier_acceptance.rs
+  s_792befbffafc33::t_78cc64a27f2f33 96-133,141,144,180-186,188-204,206,230-234,241-252,256,262,801-826
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "f6568d706fd96e04e0c6b3f0d4d1a08099989429",
+  "prompts": {},
+  "sessions": {
+    "s_792befbffafc33": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5a959529-913e-4560-a03d-9f3c43faa7c7",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
