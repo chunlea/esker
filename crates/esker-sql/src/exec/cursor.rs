@@ -1152,7 +1152,12 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                 // this makes is the shape, not an accident (`docs/plans/phase-12-subquery.md` §1).
                 (true, Some(txn)) => {
                     let values = crate::exec::subquery::run_correlated(sub, row, txn, env.tenant)?;
-                    crate::exec::subquery::value_of(sub.kind, operand, &values)?
+                    crate::exec::subquery::value_of(
+                        sub.kind,
+                        operand,
+                        &values,
+                        sub.column.as_ref().map(|(_, ty)| *ty),
+                    )?
                 }
                 (true, None) => {
                     return Err(SqlError::Internal(format!(
@@ -1399,6 +1404,14 @@ fn catalog_function(
                 .collect::<String>(),
         ),
         CatalogFunc::ConvertTo => convert_to(args.first(), args.get(1))?,
+        // The value's own type. An untyped NULL has none and is `text`, which is what it is
+        // everywhere else in this crate.
+        CatalogFunc::PgTypeof => Datum::Text(
+            args.first()
+                .and_then(Datum::column_type)
+                .map_or("text", crate::value::PgType::name)
+                .to_owned(),
+        ),
         // **Per call, and the corpus pins the consequence rather than a value**: two calls in one
         // statement differ, and every draw is inside `[0, 1)`. The bytes come from the OS pool
         // through the same file `gen_random_uuid` reads (`crate::value::random`).

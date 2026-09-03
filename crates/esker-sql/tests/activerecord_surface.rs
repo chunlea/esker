@@ -142,10 +142,15 @@ const FIXTURE: &[&str] =
 /// a relation does is a third kind of `FROM` entry beside a relation and a derived table, and the
 /// two statements are one unit because they are the same shape twice.
 ///
-/// The one that still does not run is line 52 (`indexes()`), which wants `ARRAY(SELECT …)` —
-/// the array *constructor*, a different thing from the array-valued column it reads. **The rows
-/// behind it are here and agree** (`tests/pg_catalog_*.rs`).
-const RUNS: usize = 35;
+/// **Thirty-six — all of them — with boot statement 32**, `indexes()`, which wanted
+/// `ARRAY( SELECT … )`: the array **subquery** constructor, whose argument is a query and whose
+/// elements are that query's rows in that query's order. Not `ARRAY[…]`, which had landed a
+/// commit earlier and left this statement exactly where it was; the two are different grammar
+/// productions and this lane spent four rounds calling statement 32 the other one.
+///
+/// **There is no thirty-seventh.** This number cannot move again, and what it asserts from here
+/// is that none of the thirty-six stops running — which is the direction it was always guarding.
+const RUNS: usize = 36;
 
 #[test]
 fn every_statement_activerecord_sends_parses_and_is_answered_by_name() {

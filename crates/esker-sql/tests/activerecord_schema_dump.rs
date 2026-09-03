@@ -94,23 +94,24 @@ fn every_schema_dump_answer_is_postgresql_19_s() {
 ///
 /// **A third left with the `indkey` unit**: `= ANY` over an `int2vector`, which is how
 /// `primary_keys()` reads a key, runs now — the array it needed is a value of the row, and
-/// `crate::value::vector` says why that is text rather than a `Datum`. What remains is the other
-/// half of the array surface, `ARRAY(SELECT …)` over `generate_subscripts`.
+/// `crate::value::vector` says why that is text rather than a `Datum`.
+///
+/// **The register is empty.** `ARRAY(SELECT …)` over `generate_subscripts` was the last entry and
+/// it runs, so what this test asserts has turned around: it used to name what the dump could not
+/// do, and now it holds the statement that emptied it and checks that it still answers. The
+/// `GAPS` shape stays because the register may fill again — a schema this node has not met yet
+/// puts an entry back — and an empty one is a state it was written to reach.
 #[test]
 fn what_the_schema_dump_still_needs_names_itself() {
-    // A **register**, not a list of examples: an entry leaves it when its unit lands, and the
-    // last two left when `col_description` and `= ANY` over an `int2vector` were built. One is
-    // left, which is why this is a `const` rather than a literal in the loop — the shape has to
-    // survive going down to one and back up again.
-    const GAPS: &[(&str, &str)] = &[
-        // `indexes()`: the column list it builds per index.
-        (
-            "SELECT ARRAY(SELECT pg_get_indexdef(d.indexrelid, k + 1, true) FROM \
-             generate_subscripts(d.indkey, 1) AS k ORDER BY k) FROM pg_index d \
-             WHERE d.indrelid = 'nd'::regclass",
-            "array",
-        ),
-    ];
+    // A **register**, not a list of examples: an entry leaves it when its unit lands.
+    // `col_description` and `= ANY` over an `int2vector` left it, then `ARRAY(SELECT …)` did.
+    const GAPS: &[(&str, &str)] = &[];
+
+    // The last entry to leave, kept as an assertion rather than deleted: it is the statement
+    // `indexes()` builds each index's column list with, and the one boot statement 32 is.
+    const CLOSED: &str = "SELECT ARRAY(SELECT pg_get_indexdef(d.indexrelid, k + 1, true) FROM \
+                          generate_subscripts(d.indkey, 1) AS k ORDER BY k) AS columns FROM \
+                          pg_index d WHERE d.indrelid = 'nd'::regclass ORDER BY columns";
 
     let mut node = parity::Node::new(&[
         "CREATE TABLE nd (id bigserial PRIMARY KEY, a int4)",
@@ -130,6 +131,14 @@ fn what_the_schema_dump_still_needs_names_itself() {
             "the refusal for {statement} does not name {wanted}: {named}"
         );
     }
+
+    // **Two indexes**, the one declared and the primary key's, each a single column — so the
+    // answer is one array per index holding that index's column. Which is the whole of what
+    // `indexes()` reads this statement for.
+    assert_eq!(
+        node.rows(CLOSED),
+        vec![vec!["{a}".to_owned()], vec!["{id}".to_owned()]]
+    );
 }
 
 /// The whole of `columns()` over a table of every type this node has, joined as `ActiveRecord`

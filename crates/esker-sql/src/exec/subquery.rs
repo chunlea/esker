@@ -27,7 +27,7 @@ use crate::exec::cursor::{Cursor, SORT_LIMIT};
 use crate::plan::{
     AggregateSpec, BinaryOp, Expr, Literal, Node, Select, SelectItem, SubqueryExpr, SubqueryKind,
 };
-use crate::value::{Datum, PgDatum};
+use crate::value::{ColumnType, Datum, PgDatum};
 
 /// Whether a statement has a subquery anywhere the planner will look.
 ///
@@ -163,12 +163,20 @@ pub(super) fn table_function_def(
     entry: &crate::plan::TableRef,
 ) -> std::sync::Arc<crate::catalog::TableDef> {
     let name = entry.referred_as().to_owned();
+    // **`generate_subscripts` yields subscripts and `generate_series` yields the values it was
+    // given.** A subscript is an `int4` on a real server whatever the array is; a series takes
+    // its arguments' type, which for this node's integer constants is `int8` where PostgreSQL's
+    // are `int4` — the standing constant-width divergence, showing through one more surface.
+    let ty = match entry.function.as_deref().map(|call| call.name.as_str()) {
+        Some("generate_series") => ColumnType::Int8,
+        _ => ColumnType::Int4,
+    };
     std::sync::Arc::new(crate::catalog::TableDef {
         id: crate::catalog::DERIVED_TABLE_ID,
         name: name.clone(),
         columns: vec![crate::catalog::ColumnDef {
             name,
-            ty: crate::value::ColumnType::Int4,
+            ty,
             typmod: crate::value::NO_TYPMOD,
             default_expr: None,
             not_null: false,
@@ -411,7 +419,10 @@ fn plan_one(
     // too many columns`. A client that greps the text sees two messages, so this node sends two.
     if sub.kind.reads_a_value() && planned.columns.len() != 1 {
         return Err(SqlError::SubqueryColumns(match sub.kind {
-            SubqueryKind::Scalar => "subquery must return only one column",
+            // `ARRAY(SELECT a, b)` and `ARRAY(SELECT)` both get the scalar's wording, measured —
+            // the second is this error and not a syntax error, which is what says the empty
+            // select list is a *column count* of zero rather than a parse failure.
+            SubqueryKind::Scalar | SubqueryKind::Array => "subquery must return only one column",
             _ => "subquery has too many columns",
         }));
     }
@@ -668,7 +679,12 @@ pub(super) fn value(sub: &SubqueryExpr, operand: Option<Datum>) -> Result<Datum>
             sub.kind.describe()
         )));
     };
-    value_of(sub.kind, operand, values)
+    value_of(
+        sub.kind,
+        operand,
+        values,
+        sub.column.as_ref().map(|(_, ty)| *ty),
+    )
 }
 
 /// The same, from the rows one run of a correlated sub-plan just produced.
@@ -676,8 +692,24 @@ pub(super) fn value_of(
     kind: SubqueryKind,
     operand: Option<Datum>,
     values: &[Datum],
+    element: Option<ColumnType>,
 ) -> Result<Datum> {
     Ok(match kind {
+        // **Every row is an element, in the subquery's own order**, and a NULL row is a NULL
+        // element rather than an absence — which is what makes `{}`, `{NULL}` and NULL three
+        // different answers. The element type is the plan's, not the values': an empty subquery
+        // has no value to read one from and is still an array of something.
+        SubqueryKind::Array => Datum::Array(esker_keys::array::ArrayValue::one_dimensional(
+            element.unwrap_or(ColumnType::Text),
+            1,
+            values
+                .iter()
+                .map(|value| match value {
+                    Datum::Null => None,
+                    other => Some(other.clone()),
+                })
+                .collect(),
+        )),
         // No rows is NULL, one row is the value, and two is an error rather than the first of
         // them. The error is per *execution*, which is why it is raised here and not when the
         // subquery was planned.
