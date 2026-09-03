@@ -2505,6 +2505,106 @@ pub fn drop_schema(txn: &mut dyn Txn, tenant: u64, name: &str) -> Result<()> {
     bump_version(txn)
 }
 
+/// The tenant a cluster that has never been told about databases is served as.
+///
+/// **The seed, not a default that can be changed.** An existing cluster has this tenant full of
+/// rows and no directory record, so a directory that is empty answers with exactly one database —
+/// this id, under [`crate::parse::DATABASE_NAME`] — which is what this node reported before it
+/// could name a second. The upgrade is therefore no step at all, and the first `CREATE DATABASE`
+/// writes this row beside the new one
+/// ([ADR 0052](../../../../docs/adr/0052-a-database-is-a-tenant-and-the-directory-that-names-them.md)).
+pub const DEFAULT_DATABASE_ID: u64 = 1;
+
+/// Where ids for databases a user creates begin.
+///
+/// PostgreSQL's own convention, and taken for the same reason: everything a user made is above
+/// 16384 and everything the cluster was born with is below it, so the two can never be confused
+/// and the range in between stays free for a tenant that is not a database.
+const FIRST_USER_DATABASE_ID: u64 = 16_384;
+
+/// Every database in the cluster, by name, with the tenant id each **is**.
+///
+/// Sorted by name, which is the order `pg_database` reports. An empty directory is the seed above
+/// rather than a cluster with no databases: there is no such cluster, because the tenant serving
+/// this session is one whether or not anything wrote it down.
+pub fn databases(txn: &dyn Txn) -> Result<Vec<(String, u64)>> {
+    let (start, end) = record::database_range();
+    let mut out = Vec::new();
+    for (key, value) in txn.scan(&start, &end, u32::MAX)? {
+        out.push((
+            record::database_name_of(&key)?,
+            record::decode_database(&value)?,
+        ));
+    }
+    if out.is_empty() {
+        return Ok(vec![(
+            crate::parse::DATABASE_NAME.to_owned(),
+            DEFAULT_DATABASE_ID,
+        )]);
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+/// The tenant a database name is, or `None` when the cluster has no such database.
+///
+/// The lookup startup performs, and the one `DROP DATABASE` performs. It reads the seed the same
+/// way [`databases`] does, so a cluster nobody has written a directory for still answers for the
+/// database it is serving.
+pub fn database_id(txn: &dyn Txn, name: &str) -> Result<Option<u64>> {
+    if let Some(bytes) = txn.get(&record::database_key(name))? {
+        return Ok(Some(record::decode_database(&bytes)?));
+    }
+    if name == crate::parse::DATABASE_NAME && seeded(txn)? {
+        return Ok(Some(DEFAULT_DATABASE_ID));
+    }
+    Ok(None)
+}
+
+/// Whether the directory has never been written, in which case the seed is what it means.
+fn seeded(txn: &dyn Txn) -> Result<bool> {
+    let (start, end) = record::database_range();
+    // One key is enough to answer it: the question is whether *anything* was written.
+    Ok(txn.scan(&start, &end, 1)?.is_empty())
+}
+
+/// Records a database. The caller has already decided the name is free.
+///
+/// **The seed is written here**, the first time anything is, so that the directory stops being
+/// empty in the same transaction that gives it a second row — otherwise a cluster with two
+/// databases would report only the one somebody typed.
+pub fn create_database(txn: &mut dyn Txn, name: &str, id: u64) -> Result<()> {
+    if seeded(&*txn)? {
+        txn.put(
+            &record::database_key(crate::parse::DATABASE_NAME),
+            &record::encode_database(DEFAULT_DATABASE_ID),
+        );
+    }
+    txn.put(&record::database_key(name), &record::encode_database(id));
+    bump_version(txn)
+}
+
+/// Removes one from the directory. The caller has already removed what it held.
+pub fn drop_database(txn: &mut dyn Txn, name: &str) -> Result<()> {
+    txn.delete(&record::database_key(name));
+    bump_version(txn)
+}
+
+/// Takes the next database id, which is the next **tenant** id: two databases sharing one would
+/// share their tables.
+pub fn allocate_database_id(txn: &mut dyn Txn) -> Result<u64> {
+    let key = record::next_database_key();
+    let next = match txn.get(&key)? {
+        Some(bytes) => record::decode_counter(&bytes)?,
+        None => FIRST_USER_DATABASE_ID,
+    };
+    let after = next
+        .checked_add(1)
+        .ok_or_else(|| SqlError::Internal("the database id sequence is exhausted".into()))?;
+    txn.put(&key, &record::encode_counter(after));
+    Ok(next)
+}
+
 /// The one schema every tenant has.
 pub const PUBLIC_SCHEMA: &str = "public";
 
@@ -2884,9 +2984,9 @@ mod tests {
     use super::{
         Catalog, ColumnDef, DEFAULT_RETENTION_MS, Identity, IndexDef, IndexKey, KeyOrder, KeyPart,
         MAX_IDENTIFIER_BYTES, RETENTION_FOREVER, Relation, SchemaState, SequenceDef, TableDef,
-        allocate_id, clear_table_retention, create_table, default_retention, drop_table,
-        fold_identifier, record, replace_table, set_default_retention, set_table_retention,
-        table_retention,
+        allocate_database_id, allocate_id, clear_table_retention, create_database, create_table,
+        database_id, databases, default_retention, drop_database, drop_table, fold_identifier,
+        record, replace_table, set_default_retention, set_table_retention, table_retention,
     };
     use crate::backend::{Backend, MemoryBackend};
     use crate::sqlstate;
@@ -3135,6 +3235,30 @@ mod tests {
             function < extension_start || function >= extension_end,
             "a function record sits inside the extension range"
         );
+        // **The directory carries no tenant**, so its range is the one that could swallow a whole
+        // kind rather than a record of one: everything tenant-scoped must sit outside it, and so
+        // must the counter that hands out its ids — a `databases()` scan would otherwise decode
+        // that counter as a database whose name is the empty string.
+        let (directory_start, directory_end) = record::database_range();
+        for key in [record::database_key(""), record::database_key("arunit2")] {
+            assert!(
+                key >= directory_start && key < directory_end,
+                "a database record sits outside the directory range"
+            );
+        }
+        for key in [
+            record::next_database_key(),
+            record::schema_key(7, "s"),
+            record::name_key(7, "t"),
+            record::table_key(7, 1),
+            record::version_key(),
+            function,
+        ] {
+            assert!(
+                key < directory_start || key >= directory_end,
+                "a record of another kind sits inside the directory range"
+            );
+        }
     }
 
     #[test]
@@ -3800,6 +3924,126 @@ mod tests {
         let wide = format!("{}é", "x".repeat(62));
         let (folded, _) = fold_identifier(&wide, false);
         assert_eq!(folded, "x".repeat(62));
+    }
+
+    /// **A cluster nobody has told about databases has one, and it is the one it is serving.**
+    ///
+    /// The seed is what makes ADR 0052's upgrade path no step at all: an existing cluster has
+    /// tenant 1 full of rows and an empty directory, and it must go on answering exactly what it
+    /// answered before the directory existed.
+    #[test]
+    fn an_empty_directory_is_one_database_and_not_none() {
+        let backend = MemoryBackend::new();
+        let txn = backend.begin().unwrap();
+
+        assert_eq!(
+            databases(&*txn).unwrap(),
+            vec![(crate::parse::DATABASE_NAME.to_owned(), 1)]
+        );
+        assert_eq!(
+            database_id(&*txn, crate::parse::DATABASE_NAME).unwrap(),
+            Some(1)
+        );
+        assert_eq!(database_id(&*txn, "arunit2").unwrap(), None);
+    }
+
+    /// The first `CREATE DATABASE` writes **two** rows, and the seed is the one nobody typed.
+    ///
+    /// Without it the directory would stop being empty and the database the cluster was already
+    /// serving would vanish from `pg_database` — a row disappearing because a *different* row was
+    /// added, which is the failure this rule exists to prevent.
+    #[test]
+    fn the_first_database_created_carries_the_seed_with_it() {
+        let backend = MemoryBackend::new();
+
+        let mut ddl = backend.begin().unwrap();
+        let id = allocate_database_id(&mut *ddl).unwrap();
+        create_database(&mut *ddl, "arunit2", id).unwrap();
+        ddl.commit().unwrap();
+
+        let txn = backend.begin().unwrap();
+        assert_eq!(
+            databases(&*txn).unwrap(),
+            vec![
+                ("arunit2".to_owned(), 16_384),
+                (crate::parse::DATABASE_NAME.to_owned(), 1),
+            ],
+            "sorted by name, and the seed is there beside the new one"
+        );
+        assert_eq!(database_id(&*txn, "arunit2").unwrap(), Some(16_384));
+        assert_eq!(
+            database_id(&*txn, crate::parse::DATABASE_NAME).unwrap(),
+            Some(1),
+            "the seed answers from the directory once it is written, not from the fallback"
+        );
+    }
+
+    /// **Ids for databases a user creates begin at PostgreSQL's own boundary**, and no two share
+    /// one — a database id is a tenant id, so two databases sharing one would share their tables.
+    #[test]
+    fn every_database_gets_an_id_of_its_own_above_the_user_boundary() {
+        let backend = MemoryBackend::new();
+
+        let mut ddl = backend.begin().unwrap();
+        let first = allocate_database_id(&mut *ddl).unwrap();
+        let second = allocate_database_id(&mut *ddl).unwrap();
+        ddl.commit().unwrap();
+
+        assert_eq!((first, second), (16_384, 16_385));
+        assert!(first > super::DEFAULT_DATABASE_ID, "above the seed");
+
+        let mut more = backend.begin().unwrap();
+        assert_eq!(
+            allocate_database_id(&mut *more).unwrap(),
+            16_386,
+            "the counter survives the transaction that moved it"
+        );
+    }
+
+    /// Dropping one leaves the rest, and the name is free again.
+    #[test]
+    fn a_dropped_database_leaves_the_directory_it_was_in() {
+        let backend = MemoryBackend::new();
+
+        let mut ddl = backend.begin().unwrap();
+        create_database(&mut *ddl, "arunit2", 16_384).unwrap();
+        create_database(&mut *ddl, "arunit3", 16_385).unwrap();
+        drop_database(&mut *ddl, "arunit2").unwrap();
+        ddl.commit().unwrap();
+
+        let txn = backend.begin().unwrap();
+        assert_eq!(
+            databases(&*txn).unwrap(),
+            vec![
+                ("arunit3".to_owned(), 16_385),
+                (crate::parse::DATABASE_NAME.to_owned(), 1),
+            ]
+        );
+        assert_eq!(database_id(&*txn, "arunit2").unwrap(), None);
+    }
+
+    /// **A name is the whole tail of its key**, so one database cannot be found under the name of
+    /// another it is a prefix of. The property `name_key` relies on, checked where it is new.
+    #[test]
+    fn a_database_name_is_not_confused_with_a_longer_one() {
+        let backend = MemoryBackend::new();
+
+        let mut ddl = backend.begin().unwrap();
+        create_database(&mut *ddl, "ar", 16_384).unwrap();
+        create_database(&mut *ddl, "arunit", 16_385).unwrap();
+        create_database(&mut *ddl, "arunit2", 16_386).unwrap();
+        ddl.commit().unwrap();
+
+        let txn = backend.begin().unwrap();
+        assert_eq!(database_id(&*txn, "ar").unwrap(), Some(16_384));
+        assert_eq!(database_id(&*txn, "arunit").unwrap(), Some(16_385));
+        assert_eq!(database_id(&*txn, "arunit2").unwrap(), Some(16_386));
+        assert_eq!(database_id(&*txn, "arunit23").unwrap(), None);
+        assert_eq!(
+            databases(&*txn).unwrap().len(),
+            4,
+            "three written and the seed"
+        );
     }
 
     #[test]
