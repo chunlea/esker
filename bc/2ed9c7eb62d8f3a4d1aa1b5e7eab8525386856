@@ -1,0 +1,21 @@
+crates/esker-sql/src/parse/mod.rs
+  s_dc640bf0df4adb::t_65745a7bd6624b 515-518,521,524-530
+crates/esker-sql/tests/exclusion_constraint.rs
+  s_dc640bf0df4adb::t_512c2bc2649332 245-283
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "bc2ed9c7eb62d8f3a4d1aa1b5e7eab8525386856",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
