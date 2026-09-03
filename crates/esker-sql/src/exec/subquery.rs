@@ -997,6 +997,8 @@ fn for_each_node_expr(node: &Node, visit: &mut impl FnMut(&Expr)) {
         Node::Columnar(columnar) => for_each_node_expr(&columnar.fallback, visit),
         Node::OneRow
         | Node::CatalogView { .. }
+        // A sequence's one row is a counter, not an expression.
+        | Node::SequenceRead { .. }
         | Node::SeqScan { .. }
         | Node::PointGet { .. }
         | Node::IndexLookup { .. } => {}
@@ -1079,6 +1081,8 @@ fn for_each_node_expr_mut(node: &mut Node, visit: &mut impl FnMut(&mut Expr)) {
         Node::Columnar(columnar) => for_each_node_expr_mut(&mut columnar.fallback, visit),
         Node::OneRow
         | Node::CatalogView { .. }
+        // A sequence's one row is a counter, not an expression.
+        | Node::SequenceRead { .. }
         | Node::SeqScan { .. }
         | Node::PointGet { .. }
         | Node::IndexLookup { .. } => {}

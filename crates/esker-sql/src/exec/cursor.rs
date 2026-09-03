@@ -216,6 +216,25 @@ impl<'a> Cursor<'a> {
             // catalog view's are — there is no key range to seek in and the row count is the
             // length of one array. Its arguments are evaluated against **no row**, which is what
             // makes an argument that reads a column the refusal below rather than a wrong answer.
+            // One row, read from the catalog at open exactly as a catalog view's rows are.
+            Node::SequenceRead { state, .. } => {
+                let Some((last, is_called)) = *state else {
+                    return Err(SqlError::Internal(
+                        "a sequence read reached the cursor before its value was taken".to_owned(),
+                    ));
+                };
+                Kind::Rows(
+                    vec![vec![
+                        Datum::Int8(last),
+                        // **`log_cnt` is 0**, which is what a freshly written sequence shows on a
+                        // real server too: it counts values left in a WAL-logged batch, and this
+                        // node reaches crash safety another way.
+                        Datum::Int8(0),
+                        Datum::Bool(is_called),
+                    ]]
+                    .into_iter(),
+                )
+            }
             Node::TableFunction { call, .. } => {
                 Kind::Rows(super::table_function::rows(call, &[])?.into_iter())
             }

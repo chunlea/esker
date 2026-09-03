@@ -1308,6 +1308,14 @@ fn access_path(filter: Option<&Expr>, tenant: u64, table: &TableDef) -> Result<N
     if let Some(view) = pg_catalog::view_of(table) {
         return Ok(Node::CatalogView { view, columns });
     }
+    // A sequence's relation has no rows of its own: its one row is the counter, read at open.
+    if let Some(sequence_id) = crate::catalog::sequence_of_relation(table.id) {
+        return Ok(Node::SequenceRead {
+            sequence_id,
+            state: None,
+            columns,
+        });
+    }
     let Some(filter) = filter else {
         return Ok(seq_scan(tenant, table, &columns, false));
     };

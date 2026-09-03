@@ -654,6 +654,68 @@ pub const SEQUENCE_BATCH: u64 = 32;
 /// counter would be a number in the output of `EXPLAIN` that changed with the statement around it.
 pub const DERIVED_TABLE_ID: u64 = u64::MAX - 1024;
 
+/// Where a **sequence read as a relation** carries its sequence id.
+///
+/// `SELECT last_value, is_called FROM s` is a three-column relation on a real server, and the
+/// relation is the sequence itself — there is no table behind it. So the synthetic `TableDef` the
+/// planner is given carries the sequence's id *in* its own, above every id a tenant can allocate,
+/// and `crate::exec::query` reads it back rather than seeking a key range that does not exist. The
+/// same trick `PRIMARY_KEY_OID_BASE` uses one catalog over.
+pub const SEQUENCE_RELATION_ID_BASE: u64 = u64::MAX - 1_048_576;
+
+/// The three columns PostgreSQL shows for a sequence, in its own order.
+///
+/// `log_cnt` is how many values are left in the WAL-logged batch on a real server — an
+/// implementation detail of *its* crash safety, which this node reaches differently — and it
+/// reports **0**, which is what a freshly written sequence shows there too.
+#[must_use]
+pub fn sequence_relation_def(name: &str, sequence_id: u64) -> Arc<TableDef> {
+    let column = |name: &str, ty: ColumnType| ColumnDef {
+        name: name.to_owned(),
+        ty,
+        typmod: value::NO_TYPMOD,
+        not_null: false,
+        default_expr: None,
+        default: None,
+        missing: None,
+        generated: None,
+        comment: None,
+    };
+    Arc::new(TableDef {
+        id: SEQUENCE_RELATION_ID_BASE.wrapping_add(sequence_id),
+        name: name.to_owned(),
+        columns: vec![
+            column("last_value", ColumnType::Int8),
+            column("log_cnt", ColumnType::Int8),
+            column("is_called", ColumnType::Bool),
+        ],
+        persistence: Persistence::Permanent,
+        primary_key: Vec::new(),
+        indexes: Vec::new(),
+        primary_key_name: String::new(),
+        schema_version: 1,
+        sequences: Vec::new(),
+        checks: Vec::new(),
+        foreign_keys: Vec::new(),
+        triggers_disabled: false,
+        parents: Vec::new(),
+        children: Vec::new(),
+        triggers: Vec::new(),
+        child_scans: Vec::new(),
+        excludes: Vec::new(),
+        partition_by: None,
+        partition_bound: None,
+        comment: None,
+        primary_key_comment: None,
+    })
+}
+
+/// The sequence a synthetic relation id names, or `None` for an ordinary table.
+#[must_use]
+pub fn sequence_of_relation(id: u64) -> Option<u64> {
+    id.checked_sub(SEQUENCE_RELATION_ID_BASE)
+}
+
 /// A user-defined type: what `CREATE TYPE` made, by name.
 ///
 /// **Its oid comes from the tenant's relation-id sequence**, the same counter tables and indexes
@@ -1416,6 +1478,13 @@ impl TableDef {
         if self.id == DERIVED_TABLE_ID {
             return None;
         }
+        // A **sequence** read as a relation, for the third time and the same reason: its one row
+        // is a counter rather than something stored, so there is no identity in column 0 — and
+        // hiding one dropped `last_value` from `SELECT * FROM <sequence>`, which is the same wrong
+        // answer the two above it gave before their lines existed.
+        if sequence_of_relation(self.id).is_some() {
+            return None;
+        }
         self.primary_key_name.is_empty().then_some(0)
     }
 
@@ -1813,10 +1882,12 @@ impl View<'_> {
         if let Some(table) = self.table(name)? {
             return Ok(table);
         }
-        if matches!(self.relation(name)?, Some(Relation::Sequence { .. })) {
-            return Err(SqlError::unsupported(format!(
-                "reading a sequence as a relation, which is what \"{name}\" is"
-            )));
+        // **A sequence is a three-column relation**, which is what PostgreSQL shows for one, and
+        // the relation *is* the sequence — there is no table behind it. The def carries the
+        // sequence's id in its own so that the planner can read the counter rather than seek a key
+        // range that does not exist (`sequence_relation_def`).
+        if let Some(Relation::Sequence { sequence_id, .. }) = self.relation(name)? {
+            return Ok(sequence_relation_def(name, sequence_id));
         }
         Err(SqlError::UndefinedTable(name.to_owned()))
     }
@@ -2796,12 +2867,13 @@ pub fn allocate_sequence_values(
 ) -> Result<i64> {
     let key = record::sequence_value_key(tenant, sequence_id);
     let next = match txn.get(&key)? {
-        Some(bytes) => record::decode_counter(&bytes)?,
+        Some(bytes) => record::decode_sequence_counter(&bytes)?.0,
         // A sequence starts at 1, which is PostgreSQL's `START WITH` default.
         None => 1,
     };
     let after = next.checked_add(count).ok_or(SqlError::BigintOutOfRange)?;
-    txn.put(&key, &record::encode_counter(after));
+    // Handing a value out is what `is_called` means, so it is true from here on whatever it was.
+    txn.put(&key, &record::encode_sequence_counter(after, true));
     i64::try_from(next).map_err(|_| SqlError::BigintOutOfRange)
 }
 
@@ -2811,11 +2883,38 @@ pub fn allocate_sequence_values(
 /// with `is_called` true stores 6 and `setval(s, 5, false)` stores 5. The caller does that sum,
 /// because it is the one place the two spellings differ and it belongs with the function that
 /// reads them.
-pub fn set_sequence_value(txn: &mut dyn Txn, tenant: u64, sequence_id: u64, next: u64) {
+pub fn set_sequence_value(
+    txn: &mut dyn Txn,
+    tenant: u64,
+    sequence_id: u64,
+    next: u64,
+    is_called: bool,
+) {
     txn.put(
         &record::sequence_value_key(tenant, sequence_id),
-        &record::encode_counter(next),
+        &record::encode_sequence_counter(next, is_called),
     );
+}
+
+/// What `SELECT last_value, is_called FROM <sequence>` answers.
+///
+/// **`last_value` is not the counter**: the counter is the value that will be handed out *next*, so
+/// a sequence that has called reports the one before it and a sequence that has not reports the
+/// counter itself. That is the whole of the difference between `setval(s, 5, true)` and
+/// `setval(s, 5, false)` — the first reports 5 and hands out 6, the second reports 5 and hands out
+/// 5 — and it is why the flag is stored rather than derived.
+pub fn sequence_state(txn: &dyn Txn, tenant: u64, sequence_id: u64) -> Result<(i64, bool)> {
+    let key = record::sequence_value_key(tenant, sequence_id);
+    let (next, is_called) = match txn.get(&key)? {
+        Some(bytes) => record::decode_sequence_counter(&bytes)?,
+        None => (1, false),
+    };
+    let last = if is_called {
+        next.saturating_sub(1)
+    } else {
+        next
+    };
+    Ok((i64::try_from(last).unwrap_or(i64::MAX), is_called))
 }
 
 /// Reserves `count` consecutive row ids for one table and answers with the first.

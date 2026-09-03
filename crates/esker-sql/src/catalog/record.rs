@@ -1110,6 +1110,38 @@ pub(super) fn encode_counter(value: u64) -> Vec<u8> {
     value.to_le_bytes().to_vec()
 }
 
+/// A **sequence's** counter: the next value, and whether one has been handed out.
+///
+/// Nine bytes where a row-id counter is eight, and the ninth is what `SELECT is_called FROM <seq>`
+/// answers. It cannot be derived from the counter alone: `setval(s, 5, false)` stores 5 with
+/// `is_called` false and `setval(s, 4, true)` stores 5 with it true, and those are two different
+/// sequences — the first hands out 5 next and reports `last_value 5`, the second hands out 5 next
+/// and reports `last_value 4`.
+///
+/// **Eight bytes is a record this format wrote before the flag existed**, and it reads back
+/// exactly right: every sequence here starts at 1, so a counter still at 1 has handed nothing out
+/// and any higher one has.
+#[must_use]
+pub(super) fn encode_sequence_counter(next: u64, is_called: bool) -> Vec<u8> {
+    let mut out = next.to_le_bytes().to_vec();
+    out.push(u8::from(is_called));
+    out
+}
+
+/// Reads one back, in either width.
+pub(super) fn decode_sequence_counter(bytes: &[u8]) -> Result<(u64, bool)> {
+    match bytes.len() {
+        8 => {
+            let next = decode_counter(bytes)?;
+            Ok((next, next > 1))
+        }
+        9 => Ok((decode_counter(&bytes[..8])?, bytes[8] != 0)),
+        other => Err(corrupt(format!(
+            "a sequence counter is 8 or 9 bytes, not {other}"
+        ))),
+    }
+}
+
 /// Reads a counter, or says the bytes are not one.
 pub(super) fn decode_counter(bytes: &[u8]) -> Result<u64> {
     bytes

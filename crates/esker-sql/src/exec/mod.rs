@@ -887,6 +887,10 @@ impl Executor {
         // no transaction, so running them here is what puts their answers in the *same*
         // transaction at the *same* snapshot as the plan that reads them.
         subquery::resolve(&mut planned.node, &*txn, self.tenant)?;
+        // And a sequence read, which is the opposite case and in the same place: its value must
+        // come from **outside** this transaction, because a sequence is not transactional and a
+        // read through the statement's own snapshot would report the sequence as of `BEGIN`.
+        self.fill_sequence_reads(&mut planned.node)?;
         let mut cursor = cursor::Cursor::open(txn, self.tenant, &planned.node)?;
         let mut rows = Vec::new();
         while let Some(row) = cursor.next()? {
@@ -1064,12 +1068,34 @@ impl Executor {
             self.tenant,
             sequence_id,
             u64::try_from(next).unwrap_or(u64::MAX),
+            call.is_called,
         );
         txn.commit()?;
         // `currval` answers the value that was set, whether or not it was called -- measured.
         self.sequences.insert(sequence_id, (value + 1, value + 1));
         self.last_sequence = Some(sequence_id);
         Ok(value)
+    }
+
+    /// Takes each sequence read's value in a transaction of its own.
+    ///
+    /// **Not the statement's**, and that is the whole of it: `nextval` and `setval` commit outside
+    /// the block that calls them, so a sequence read through the block's snapshot answers the value
+    /// as of `BEGIN`. A real server reads the sequence itself, which is what this does.
+    fn fill_sequence_reads(&mut self, node: &mut crate::plan::Node) -> Result<()> {
+        let mut ids = Vec::new();
+        collect_sequence_reads(node, &mut ids);
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let txn = self.backend.begin()?;
+        let mut states = std::collections::BTreeMap::new();
+        for id in ids {
+            states.insert(id, crate::catalog::sequence_state(&*txn, self.tenant, id)?);
+        }
+        let _ = txn.rollback();
+        fill_sequence_reads_in(node, &states);
+        Ok(())
     }
 
     /// Resolves the tables a `SELECT` names and plans against them.
@@ -1690,6 +1716,32 @@ fn has_sequence_call(expr: &crate::plan::Expr) -> bool {
         found |= matches!(expr, crate::plan::Expr::Sequence(_));
     });
     found
+}
+
+/// Every sequence a plan reads, so their values can be taken in one transaction.
+fn collect_sequence_reads(node: &mut crate::plan::Node, into: &mut Vec<u64>) {
+    if let crate::plan::Node::SequenceRead { sequence_id, .. } = node {
+        into.push(*sequence_id);
+    }
+    for child in node.children_mut() {
+        collect_sequence_reads(child, into);
+    }
+}
+
+/// Puts those values into the plan.
+fn fill_sequence_reads_in(
+    node: &mut crate::plan::Node,
+    states: &std::collections::BTreeMap<u64, (i64, bool)>,
+) {
+    if let crate::plan::Node::SequenceRead {
+        sequence_id, state, ..
+    } = node
+    {
+        *state = states.get(sequence_id).copied();
+    }
+    for child in node.children_mut() {
+        fill_sequence_reads_in(child, states);
+    }
 }
 
 /// The `EXPLAIN` output for a statement. One line per plan node, indented by depth, which is the

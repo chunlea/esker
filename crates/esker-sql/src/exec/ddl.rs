@@ -1204,6 +1204,9 @@ pub(super) fn create_sequence(
         executor.tenant,
         sequence.id,
         sequence_start(create.start)?,
+        // Nothing has been handed out yet, which is what a fresh sequence reports: `last_value` is
+        // the start value and `is_called` is false, so the first `nextval` answers the start.
+        false,
     );
     if let Some((table, _)) = owner {
         // The owning table's cached definition now has one more sequence in it.
