@@ -888,6 +888,17 @@ fn render(expr: &Expr, columns: &[String]) -> String {
             if *case_insensitive { "ILIKE" } else { "LIKE" },
             render(pattern, columns)
         ),
+        Expr::RegexMatch {
+            operand,
+            pattern,
+            negated,
+            case_insensitive,
+        } => format!(
+            "{} {} {}",
+            render(operand, columns),
+            crate::plan::regex_operator(*negated, *case_insensitive),
+            render(pattern, columns)
+        ),
         Expr::Parameter(number) => format!("${number}"),
         Expr::Column { name, .. } => name.clone(),
         // Resolved to a position by the planner; put the name back for the reader. A position with

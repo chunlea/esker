@@ -2162,6 +2162,28 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             expr,
         } => lower_expr(expr),
         Expr::Nested(inner) => lower_expr(inner),
+        // `~`, `~*`, `!~`, `!~*` — POSIX matching, in `LIKE`'s shape and for `LIKE`'s reason: a
+        // subject and a *pattern*, with modifiers a binary op has nowhere to put.
+        Expr::BinaryOp {
+            left,
+            op:
+                op @ (BinaryOperator::PGRegexMatch
+                | BinaryOperator::PGRegexIMatch
+                | BinaryOperator::PGRegexNotMatch
+                | BinaryOperator::PGRegexNotIMatch),
+            right,
+        } => Ok(plan::Expr::RegexMatch {
+            operand: Box::new(lower_expr(left)?),
+            pattern: Box::new(lower_expr(right)?),
+            negated: matches!(
+                op,
+                BinaryOperator::PGRegexNotMatch | BinaryOperator::PGRegexNotIMatch
+            ),
+            case_insensitive: matches!(
+                op,
+                BinaryOperator::PGRegexIMatch | BinaryOperator::PGRegexNotIMatch
+            ),
+        }),
         // `x [NOT] LIKE p [ESCAPE c]` and `ILIKE`, which is the same matcher with both sides
         // folded. `ANY` is Snowflake's and is refused by name.
         Expr::Like {

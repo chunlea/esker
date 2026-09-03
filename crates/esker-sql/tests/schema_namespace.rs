@@ -25,14 +25,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     ],
     answers: &[
         (
-            "SELECT 'r', nspname FROM pg_namespace WHERE nspname !~ '^pg_.*' AND nspname NOT IN ('information_schema') ORDER by nspname",
-            "**Not a schema gap at all**: `!~` is PostgreSQL\u{2019}s regex non-match, and this node \
-             has neither it nor `~`. It is the first statement `schema_names` sends, so it aborts \
-             the block and takes the sixty-two after it — the same shape `LIKE`\u{2019}s absence had \
-             before that landed. It belongs in `plan::Expr` beside `LIKE`, which is another \
-             lane\u{2019}s file",
-        ),
-        (
             "CREATE SCHEMA test_schema CREATE TABLE things (id integer, name character varying(50), email character varying(50), description character varying(100), moment timestamp without time zone default now())",
             "**`CREATE SCHEMA … CREATE TABLE …` is one statement**, and `sqlparser` 0.62.0 reads \
              only the first half — `Expected: end of statement, found: CREATE`. A C1 parser gap, \
@@ -43,6 +35,18 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "CREATE SCHEMA test_schema2 CREATE TABLE things (id integer, name character varying(50), email character varying(50), description character varying(100), moment timestamp without time zone default now())",
             "The second of the pair, and the same gap. The two together are what make the file\u{2019}s \
              central fact — two tables called `things`, one per schema — even statable",
+        ),
+        (
+            "SELECT 'r', COUNT(*) FROM pg_namespace WHERE nspname = 'test_schema'",
+            "A consequence of the CREATE SCHEMA gap above, not a divergence of its own: with no second namespace, a schema-qualified name is refused by name and the relations the setup would have created are not there. Every one of these closes with that unit.",
+        ),
+        (
+            "SELECT 'r', nspname FROM pg_namespace WHERE nspname !~ '^pg_.*' AND nspname NOT IN ('information_schema') ORDER by nspname",
+            "A consequence of the CREATE SCHEMA gap above, not a divergence of its own: with no second namespace, a schema-qualified name is refused by name and the relations the setup would have created are not there. Every one of these closes with that unit.",
+        ),
+        (
+            "CREATE TABLE test_schema.\"things.table\" (id integer, name character varying(50))",
+            "A consequence of the CREATE SCHEMA gap above, not a divergence of its own: with no second namespace, a schema-qualified name is refused by name and the relations the setup would have created are not there. Every one of these closes with that unit.",
         ),
     ],
 };

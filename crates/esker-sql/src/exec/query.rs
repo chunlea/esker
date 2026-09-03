@@ -1584,6 +1584,17 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             case_insensitive: *case_insensitive,
             escape: *escape,
         },
+        Expr::RegexMatch {
+            operand,
+            pattern,
+            negated,
+            case_insensitive,
+        } => Expr::RegexMatch {
+            operand: Box::new(resolve(operand, scope)?),
+            pattern: Box::new(resolve(pattern, scope)?),
+            negated: *negated,
+            case_insensitive: *case_insensitive,
+        },
         // The strip is decided here, where the operand's type is still known.
         Expr::Scalar { func, operand } => Expr::Scalar {
             func: *func,
@@ -2246,6 +2257,7 @@ fn check_predicate(expr: &Expr, clause: &'static str, scope: &Scope<'_>) -> Resu
     match expr {
         Expr::Binary { .. }
         | Expr::Like { .. }
+        | Expr::RegexMatch { .. }
         | Expr::Not(_)
         | Expr::IsNull { .. }
         | Expr::InList { .. }
@@ -2545,6 +2557,7 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         Expr::Literal(Literal::Typed(value)) => value.column_type().unwrap_or(ColumnType::Text),
         Expr::Literal(Literal::Bool(_))
         | Expr::Like { .. }
+        | Expr::RegexMatch { .. }
         | Expr::Binary { .. }
         | Expr::Not(_)
         | Expr::IsNull { .. }

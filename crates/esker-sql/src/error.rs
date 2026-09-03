@@ -950,6 +950,13 @@ pub enum SqlError {
         detail: String,
     },
 
+    /// A pattern `~` cannot compile: `2201B`, with PostgreSQL's own reason.
+    ///
+    /// **The sentence names which thing is wrong** — `brackets [] not balanced`, `parentheses ()
+    /// not balanced`, `quantifier operand invalid` — under one SQLSTATE. Measured, all three.
+    #[error("invalid regular expression: {0}")]
+    InvalidRegex(String),
+
     /// `ON CONFLICT (c)` where no unique index has that key: `42P10`.
     ///
     /// **The target names columns and PostgreSQL infers an index from them**, so the failure is
@@ -1494,6 +1501,7 @@ impl SqlError {
             | SqlError::PartitionKeyNotCovered { .. }
             | SqlError::AccessMethodWithoutInclude(_)
             | SqlError::OnConflictMovesPartition => sqlstate::FEATURE_NOT_SUPPORTED,
+            SqlError::InvalidRegex(_) => sqlstate::INVALID_REGULAR_EXPRESSION,
             SqlError::OnConflictAffectedTwice | SqlError::CardinalityViolation => {
                 sqlstate::CARDINALITY_VIOLATION
             }

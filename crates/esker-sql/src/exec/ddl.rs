@@ -1825,6 +1825,17 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
             if *case_insensitive { "ILIKE" } else { "LIKE" },
             sub(pattern)
         ),
+        Expr::RegexMatch {
+            operand,
+            pattern,
+            negated,
+            case_insensitive,
+        } => format!(
+            "({} {} {})",
+            sub(operand),
+            plan::regex_operator(*negated, *case_insensitive),
+            sub(pattern)
+        ),
         Expr::Binary { op, left, right } => {
             format!("({} {} {})", sub(left), op.symbol(), sub(right))
         }

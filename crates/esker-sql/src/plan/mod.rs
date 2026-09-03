@@ -40,7 +40,7 @@ pub use ddl::{
 pub use dml::{ConflictAction, Delete, Insert, OnConflict, Returning, Update};
 pub use expr::{
     AggregateCall, AggregateFunc, ArithOp, BinaryOp, CaseBranch, CatalogFunc, CatalogFuncCall,
-    Expr, Literal, ScalarFunc, SequenceCall, SequenceFunc, UuidFunc, like_matches,
+    Expr, Literal, ScalarFunc, SequenceCall, SequenceFunc, UuidFunc, like_matches, regex_operator,
 };
 pub use query::{
     AggregateSpec, Join, JoinKind, Node, OrderItem, Probe, Select, SelectItem, SortKey,

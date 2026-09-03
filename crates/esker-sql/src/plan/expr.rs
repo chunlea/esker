@@ -200,6 +200,22 @@ pub enum Expr {
         /// `ESCAPE` **replaces** the backslash rather than adding to it.
         escape: Option<char>,
     },
+    /// `x ~ p`, `x ~* p`, `x !~ p`, `x !~* p` — POSIX regular-expression matching.
+    ///
+    /// [`Expr::Like`]'s shape, for [`Expr::Like`]'s reason: the sides are a subject and a
+    /// *pattern*, and the operator carries modifiers a [`BinaryOp`] has nowhere to put. The
+    /// matcher is `crate::value::regex`, written in-house because `deny.toml` forbids a regex
+    /// crate.
+    RegexMatch {
+        /// The subject.
+        operand: Box<Expr>,
+        /// The pattern, a POSIX extended regular expression.
+        pattern: Box<Expr>,
+        /// `!~` and `!~*`. **Not a rescue for NULL**: the negation of unknown is unknown.
+        negated: bool,
+        /// The `*` half of the pair: fold while matching.
+        case_insensitive: bool,
+    },
     /// `x IS NULL`, or `IS NOT NULL` when negated. Never NULL itself — that is the whole point of
     /// the operator, and the reason `x = NULL` is not a way to write it.
     IsNull {
@@ -1354,6 +1370,20 @@ impl Expr {
     }
 }
 
+/// `~`, `~*`, `!~` or `!~*` — which of the four an [`Expr::RegexMatch`] is.
+///
+/// Written from *our* side rather than from the AST's, the way every other name in this crate is:
+/// it is what a plan prints and what a message quotes back.
+#[must_use]
+pub fn regex_operator(negated: bool, case_insensitive: bool) -> &'static str {
+    match (negated, case_insensitive) {
+        (false, false) => "~",
+        (false, true) => "~*",
+        (true, false) => "!~",
+        (true, true) => "!~*",
+    }
+}
+
 fn describe(expr: &Expr) -> &'static str {
     match expr {
         Expr::ToText { .. } => "a cast to text",
@@ -1375,6 +1405,11 @@ fn describe(expr: &Expr) -> &'static str {
             ..
         } => "LIKE",
         Expr::Like { .. } => "ILIKE",
+        Expr::RegexMatch {
+            negated,
+            case_insensitive,
+            ..
+        } => regex_operator(*negated, *case_insensitive),
         Expr::InList { negated: true, .. } => "NOT IN",
         Expr::Aggregate(_) => "an aggregate function",
         Expr::Default => "DEFAULT",

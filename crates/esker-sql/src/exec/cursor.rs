@@ -998,6 +998,25 @@ fn like_text(value: &Datum) -> Result<Option<String>> {
     }
 }
 
+/// A `~` operand, which must be text.
+///
+/// **A non-text operand is `42883`, not a cast**: `1 ~ 'a'` is `operator does not exist: integer ~
+/// unknown`, with the *other* side reported as `unknown` whichever side is at fault. Measured,
+/// both ways round, and it is the same shape `~~` gets.
+fn regex_text(value: &Datum, operator: &'static str) -> Result<Option<String>> {
+    match value {
+        Datum::Null => Ok(None),
+        Datum::Text(text) => Ok(Some(text.clone())),
+        other => Err(SqlError::UndefinedOperator {
+            op: operator,
+            left: other
+                .column_type()
+                .map_or("unknown", crate::value::PgType::name),
+            right: "unknown",
+        }),
+    }
+}
+
 pub(super) fn evaluate(expr: &Expr, row: &[Datum]) -> Result<Datum> {
     evaluate_in(expr, row, Env::none())
 }
@@ -1076,6 +1095,31 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                     let matched =
                         crate::plan::like_matches(&subject, &pattern, escape.or(Some('\\')));
                     Datum::Bool(matched != *negated)
+                }
+                _ => Datum::Null,
+            }
+        }
+        // **`~` is not a comparison either**, and a NULL in either side is unknown — which the
+        // negated spelling does not rescue, exactly as `LIKE`'s does not.
+        Expr::RegexMatch {
+            operand,
+            pattern,
+            negated,
+            case_insensitive,
+        } => {
+            let subject = evaluate_in(operand, row, env)?;
+            let pattern_value = evaluate_in(pattern, row, env)?;
+            let operator = if *case_insensitive { "~*" } else { "~" };
+            match (
+                regex_text(&subject, operator)?,
+                regex_text(&pattern_value, operator)?,
+            ) {
+                (Some(subject), Some(pattern)) => {
+                    // Compiled per row, which is what a plan without a constant-folding pass can
+                    // do honestly. The pattern is almost always a literal, so this is where a
+                    // cache would go once one is measured to be needed.
+                    let compiled = crate::value::regex::compile(&pattern)?;
+                    Datum::Bool(compiled.is_match(&subject, *case_insensitive) != *negated)
                 }
                 _ => Datum::Null,
             }

@@ -43,6 +43,10 @@ pub const FEATURE_NOT_SUPPORTED: &str = "0A000";
 /// one snapshot and raise on the next (`docs/plans/phase-12-subquery.md` §1).
 pub const CARDINALITY_VIOLATION: &str = "21000";
 
+/// `2201B invalid_regular_expression` — a pattern `~` cannot compile. One code, and the *message*
+/// is what says which thing is malformed.
+pub const INVALID_REGULAR_EXPRESSION: &str = "2201B";
+
 // --- Class 22 — Data Exception ---
 
 /// A literal could not be read as its target type — `'abc'::int8`.
@@ -330,6 +334,10 @@ mod tests {
         ),
         ("INVALID_CATALOG_NAME", super::INVALID_CATALOG_NAME),
         ("CARDINALITY_VIOLATION", super::CARDINALITY_VIOLATION),
+        (
+            "INVALID_REGULAR_EXPRESSION",
+            super::INVALID_REGULAR_EXPRESSION,
+        ),
         ("SYNTAX_ERROR", super::SYNTAX_ERROR),
         ("UNDEFINED_COLUMN", super::UNDEFINED_COLUMN),
         ("UNDEFINED_TABLE", super::UNDEFINED_TABLE),
