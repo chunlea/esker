@@ -207,19 +207,33 @@ fn another_parameter_is_42704_and_not_a_feature_gap() {
     );
 }
 
-/// A `SET` this node does not execute keeps contract C2's answer, and names the **parameter** —
-/// "SET is not supported" tells somebody who set `work_mem` nothing about which line to remove.
+/// A `SET` naming a parameter this node does not have is `42704`, the same as `SHOW` and `RESET`
+/// of the same name — **and the price is `work_mem`, which a real server does have.**
 ///
-/// The example used to be `search_path`, which phase 9 unit 5 now executes
-/// (`tests/session_parameters.rs`). `work_mem` is the shape that is left and the one the rule is
-/// really about: a parameter a real server *has* and this node does not, which is `0A000` naming
-/// it rather than the `42704` that would claim it does not exist.
+/// This is the declared divergence the `SET`-parameters unit chose, and it replaced a `0A000`.
+/// The old answer had the better argument for this one statement: refusing by name never claims a
+/// real parameter is absent. What decided it the other way is that `SET` was the only one of the
+/// three entry points saying so — `SHOW work_mem` and `RESET work_mem` have answered `42704` since
+/// phase 8 — and the capture settles the commoner shape: `SET nosuchparameter` is `42704` on a
+/// real server (`tests/corpus/pg19_set_parameters.txt`). Telling the two apart needs PostgreSQL's
+/// whole GUC table, which this node does not carry, so the three answers now agree with each other
+/// and are wrong together about `work_mem` rather than disagreeing about whether it exists.
 #[test]
-fn another_set_is_0a000_naming_the_parameter() {
+fn another_set_is_42704_naming_the_parameter() {
     let mut node = Node::new();
-    let error = node.fails("SET work_mem = '4MB'");
-    assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED);
-    assert_eq!(error.to_string(), "SET work_mem is not supported");
+    for written in ["SET work_mem = '4MB'", "SHOW work_mem", "RESET work_mem"] {
+        let error = node.fails(written);
+        assert_eq!(
+            error.sqlstate(),
+            sqlstate::UNDEFINED_OBJECT,
+            "for {written}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "unrecognized configuration parameter \"work_mem\"",
+            "for {written}"
+        );
+    }
 }
 
 /// The value grammar's failure is PostgreSQL's own condition for a `SET` it cannot read, with

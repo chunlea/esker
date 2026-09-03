@@ -565,7 +565,7 @@ fn lower_set(set: &sqlparser::ast::Set) -> Result<plan::Statement> {
             hivevar,
             variable,
             values,
-        } if guc_name(variable).is_some_and(|name| crate::parameter::lookup(&name).is_ok()) => {
+        } if is_guc_assignment(variable) => {
             refuse_if(*hivevar, "SET HIVEVAR")?;
             let name = guc_name(variable).unwrap_or_default();
             // `SET LOCAL` is undone when the transaction ends, whichever way it ends — which needs
@@ -684,7 +684,7 @@ fn lower_reset(reset: &sqlparser::ast::ResetStatement) -> Result<plan::Statement
                 },
             ))
         }
-        Reset::ALL => Err(SqlError::unsupported("RESET ALL")),
+        Reset::ALL => Ok(plan::Statement::Session(plan::SessionStatement::ResetAll)),
         // Named with `guc_name` rather than `object_name`: a parameter is not a relation, so a
         // qualified one must not be refused as "a qualified name". `esker.no_such_thing` is a
         // parameter this node does not have, which is `42704` and not a feature gap.
@@ -742,11 +742,24 @@ fn guc_list_item(value: &Expr) -> String {
     }
 }
 
+/// Whether a `SET` names a run-time parameter at all, known or not.
+///
+/// **A name this node has never heard of is still a `SET`**, and its answer is `42704` from the
+/// executor rather than `0A000` from here: a real server parses the statement and raises
+/// "unrecognized configuration parameter" when it runs, so refusing at lowering would both use the
+/// wrong SQLSTATE and use it earlier. Contract C2 is about constructs this node cannot *do*, and
+/// this is one it does — for a parameter that does not exist.
+fn is_guc_assignment(variable: &ObjectName) -> bool {
+    guc_name(variable).is_some()
+}
+
 /// The feature name for a `SET` this node does not execute.
 ///
 /// Rendered from the statement rather than from the AST variant, so a user is told the construct
-/// they wrote — and a *named* parameter is named, because "SET is not supported" tells somebody
-/// who set `search_path` nothing about which of their statements to remove.
+/// they wrote. **What reaches it is no longer a named parameter**: every `SET <name> = <value>`
+/// now lowers, so what is left here is the spellings that are not an assignment at all —
+/// `SET TRANSACTION`, `SET ROLE`, `SET CONSTRAINTS` — plus the assignment whose variable has no
+/// name, which the `None` arm below is for.
 fn set_feature_name(set: &sqlparser::ast::Set) -> String {
     use sqlparser::ast::Set;
 
@@ -2855,7 +2868,7 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
         };
         let setting = match args.as_slice() {
             [one] => text(one).map(|name| (name, false)),
-            [one, two] => text(one).zip(flag(two)).map(|(name, ok)| (name, ok)),
+            [one, two] => text(one).zip(flag(two)),
             _ => {
                 refuse_wrong_arity(function, "current_setting", 1)?;
                 None

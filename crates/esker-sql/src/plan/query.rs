@@ -905,11 +905,7 @@ fn render(expr: &Expr, columns: &[String]) -> String {
             all: Some(implicit),
         } => format!("current_schemas({implicit})"),
         Expr::CurrentSetting { name, missing_ok } => {
-            if *missing_ok {
-                format!("current_setting('{name}', true)")
-            } else {
-                format!("current_setting('{name}')")
-            }
+            crate::plan::current_setting_text(name, *missing_ok)
         }
         Expr::Column { name, .. } => name.clone(),
         // Resolved to a position by the planner; put the name back for the reader. A position with

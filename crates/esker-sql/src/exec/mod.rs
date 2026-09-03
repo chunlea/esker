@@ -605,6 +605,13 @@ impl Executor {
                 self.set_snapshot(id)?;
                 Ok(Outcome::done("SET"))
             }
+            // **What the session set, not every parameter there is.** A real server's `RESET ALL`
+            // leaves alone the ones it may not change; clearing what was set is the same answer
+            // and needs no read-only special case.
+            SessionStatement::ResetAll => {
+                self.parameters.clear();
+                Ok(Outcome::done("RESET"))
+            }
             SessionStatement::SetParameter { name, value } => {
                 self.set_parameter(name, value.as_deref())?;
                 Ok(Outcome::done("SET"))

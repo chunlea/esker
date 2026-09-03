@@ -1,8 +1,8 @@
 //! `SET` / `SHOW` / `RESET` of run-time parameters — four rows of run 45's ranking, one shape.
 //!
 //! 33 tests between them, and the statements are verbatim from the tests that send them:
-//! `set lc_monetary = 'C'` (money_test), `set idle_in_transaction_session_timeout = '10ms'`
-//! (connection_test), `SET search_path TO '$user',public` (schema_authorization_test), and
+//! `set lc_monetary = 'C'` (`money_test`), `set idle_in_transaction_session_timeout = '10ms'`
+//! (`connection_test`), `SET search_path TO '$user',public` (`schema_authorization_test`), and
 //! `SET geqo TO off` read back with `show geqo`.
 //!
 //! **`SHOW` is half the requirement, not an extra.** The tests read the value back rather than
@@ -19,8 +19,30 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    types: &[],
-    answers: &[],
+    // An array is `text` here and `name[]` there, with the same characters in it — the standing
+    // trade every `pg_catalog` column makes, and the reason `crate::value::vector` exists.
+    types: &["SELECT 'r', current_schemas(false)"],
+    answers: &[
+        // **A property of the oracle's container, not of PostgreSQL** — the capture's own header
+        // says so. `esker-pg19` boots `lc_monetary` at `en_US.utf8`; this node has no locale
+        // database at all, so `C` is the honest default: the one locale whose rules are "no
+        // rules". What the suite needs is that `SET` changes it and `SHOW` reports the change, and
+        // both do.
+        (
+            "SHOW lc_monetary",
+            "The boot value differs: `en_US.utf8` on the oracle's container, `C` here. Every \
+             other line about this parameter agrees.",
+        ),
+        // **A standing refusal, and it predates this unit.** `timestamptz` is printed in UTC and
+        // nowhere else, so a zone that is not UTC would be a setting honoured by `SHOW` and
+        // ignored by every row — which is the one failure a client cannot see. Accepting it here
+        // would make `SHOW TimeZone` lie about what the next `SELECT` will print.
+        (
+            "SET TIME ZONE 'America/New_York'",
+            "`0A000` naming the zone: this node prints `timestamptz` in UTC only, so it refuses \
+             rather than reporting a zone it will not use (`crate::parameter::Parameter::honour`).",
+        ),
+    ],
 };
 
 #[test]

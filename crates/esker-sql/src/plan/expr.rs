@@ -534,6 +534,20 @@ pub fn like_matches(subject: &[char], pattern: &[char], escape: Option<char>) ->
     }
 }
 
+/// `current_setting('x')` or `current_setting('x', true)`, as the call was written.
+///
+/// Its own function because two printers need the same two spellings — the plan's and the one
+/// `ALTER TABLE` deparses a stored default with — and because keeping it out of either match keeps
+/// both under the line limit.
+#[must_use]
+pub fn current_setting_text(name: &str, missing_ok: bool) -> String {
+    if missing_ok {
+        format!("current_setting('{name}', true)")
+    } else {
+        format!("current_setting('{name}')")
+    }
+}
+
 /// One call to a `pg_catalog` function that prints a definition.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatalogFuncCall {
