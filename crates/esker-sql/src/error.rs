@@ -943,6 +943,37 @@ pub enum SqlError {
         detail: String,
     },
 
+    /// `ON CONFLICT (c)` where no unique index has that key: `42P10`.
+    ///
+    /// **The target names columns and PostgreSQL infers an index from them**, so the failure is
+    /// about the *specification* rather than about a name that does not resolve — which is why the
+    /// message quotes nothing back. A **partial** index matches only when the statement repeats
+    /// its predicate, so a bare target over one is this error too. Measured, both.
+    #[error("there is no unique or exclusion constraint matching the ON CONFLICT specification")]
+    NoUniqueForOnConflict,
+
+    /// Two rows proposed by one statement that conflict with **each other**: `21000`.
+    ///
+    /// `DO NOTHING` accepts the pair and keeps the first; only `DO UPDATE` raises, because it
+    /// would write the same row twice in one command and the second write would see the first.
+    #[error("ON CONFLICT DO UPDATE command cannot affect row a second time")]
+    OnConflictAffectedTwice,
+
+    /// A `DO UPDATE` whose result belongs in another partition: `0A000`.
+    ///
+    /// **A plain `UPDATE` moves the row and this does not**, which is the one place the two paths
+    /// disagree. Measured, with PostgreSQL's own `DETAIL`.
+    #[error("invalid ON UPDATE specification")]
+    OnConflictMovesPartition,
+
+    /// `excluded.c` naming no column: `42703`.
+    ///
+    /// **Qualified and unquoted**, where a conflict target's missing column is quoted and bare:
+    /// `column excluded.nosuchcol does not exist` against `column "nosuchcol" does not exist`. One
+    /// SQLSTATE, two shapes, both measured in one statement pair.
+    #[error("column excluded.{0} does not exist")]
+    UndefinedExcludedColumn(String),
+
     /// `CREATE INDEX … USING hash (…) INCLUDE (…)`: `0A000`, naming the access method.
     ///
     /// **`amcaninclude` is a property of the method, checked before anything is built** — so the
@@ -970,8 +1001,14 @@ pub enum SqlError {
     /// **The parent is named, not a partition** — there is no partition to name, which is the
     /// whole condition. A row sent straight to a partition it does not belong in gets the other
     /// sentence, [`SqlError::PartitionConstraintViolation`], naming that partition.
-    #[error("no partition of relation \"{0}\" found for row")]
-    NoPartitionForRow(String),
+    #[error("no partition of relation \"{relation}\" found for row")]
+    NoPartitionForRow {
+        /// The partitioned table, which is the only relation there is to name.
+        relation: String,
+        /// `Partition key of the failing row contains (city_id) = (99).` — the **key**, not the
+        /// row, which is the other `23514`'s shape.
+        detail: String,
+    },
 
     /// A row written straight into a partition whose bound excludes it: `23514`.
     #[error("new row for relation \"{0}\" violates partition constraint")]
@@ -1448,8 +1485,11 @@ impl SqlError {
             // misses a partition column is not a *syntax* problem, it is a constraint this
             // server cannot enforce — which is what `0A000` says.
             | SqlError::PartitionKeyNotCovered { .. }
-            | SqlError::AccessMethodWithoutInclude(_) => sqlstate::FEATURE_NOT_SUPPORTED,
-            SqlError::CardinalityViolation => sqlstate::CARDINALITY_VIOLATION,
+            | SqlError::AccessMethodWithoutInclude(_)
+            | SqlError::OnConflictMovesPartition => sqlstate::FEATURE_NOT_SUPPORTED,
+            SqlError::OnConflictAffectedTwice | SqlError::CardinalityViolation => {
+                sqlstate::CARDINALITY_VIOLATION
+            }
             SqlError::SubqueryColumns(_)
             | SqlError::Syntax { .. }
             // PostgreSQL's type-name grammar, refusing in the same class as its statement
@@ -1490,6 +1530,7 @@ impl SqlError {
             | SqlError::UndefinedColumnInKey(_)
             | SqlError::UndefinedQualifiedColumn { .. }
             | SqlError::UsingColumnMissing { .. }
+            | SqlError::UndefinedExcludedColumn(_)
             | SqlError::UndefinedColumnInRelation { .. } => sqlstate::UNDEFINED_COLUMN,
             SqlError::ColumnTypeConflict { .. } => sqlstate::DATATYPE_MISMATCH,
 
@@ -1500,7 +1541,7 @@ impl SqlError {
             SqlError::NotPartitioned(_) | SqlError::PartitionOverlap { .. } => {
                 sqlstate::INVALID_OBJECT_DEFINITION
             }
-            SqlError::NoPartitionForRow(_) | SqlError::PartitionConstraintViolation(_) => {
+            SqlError::NoPartitionForRow { .. } | SqlError::PartitionConstraintViolation(_) => {
                 sqlstate::CHECK_VIOLATION
             }
             SqlError::DuplicateTable(_) | SqlError::AlreadyExistsSkipping(_) => {
@@ -1566,7 +1607,11 @@ impl SqlError {
             SqlError::GroupingError(_) | SqlError::AggregateNotAllowed(_) => {
                 sqlstate::GROUPING_ERROR
             }
-            SqlError::InvalidColumnReference(_) => sqlstate::INVALID_COLUMN_REFERENCE,
+            // `42P10`, and `ON CONFLICT` shares it for the same reason the casts do: the columns
+            // exist and it is the *inference* over them that fails, so it is not `42703`.
+            SqlError::InvalidColumnReference(_) | SqlError::NoUniqueForOnConflict => {
+                sqlstate::INVALID_COLUMN_REFERENCE
+            }
             SqlError::NegativeLimit("LIMIT") => sqlstate::INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
             SqlError::NegativeLimit(_) => sqlstate::INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
             SqlError::SerializationFailure { .. } => sqlstate::SERIALIZATION_FAILURE,
@@ -1687,7 +1732,12 @@ impl SqlError {
             | SqlError::ForeignKeyViolation { detail, .. }
             | SqlError::ForeignKeyStillReferenced { detail, .. }
             | SqlError::DependentTable { detail, .. }
-            | SqlError::DependentFunction { detail, .. } => Some(detail.clone()),
+            | SqlError::DependentFunction { detail, .. }
+            | SqlError::NoPartitionForRow { detail, .. } => Some(detail.clone()),
+            SqlError::OnConflictMovesPartition => Some(
+                "The result tuple would appear in a different partition than the original tuple."
+                    .to_owned(),
+            ),
             SqlError::PartitionKeyNotCovered {
                 kind,
                 relation,
@@ -1784,6 +1834,11 @@ impl SqlError {
                         .to_owned(),
                 )
             }
+            SqlError::OnConflictAffectedTwice => Some(
+                "Ensure that no rows proposed for insertion within the same command have \
+                 duplicate constrained values."
+                    .to_owned(),
+            ),
             SqlError::GeneratedAlways { .. } => Some("Use OVERRIDING SYSTEM VALUE to override.".to_owned()),
             SqlError::DatetimeFieldOutOfRange {
                 datestyle_hint: true,

@@ -266,6 +266,16 @@ pub(super) fn insert(
     let table = executor.require_table(txn, &insert.table)?;
     let targets = target_columns(&table, insert)?;
     let mut returned = Returned::open(insert.returning.as_ref(), &table)?;
+    // The row keys this statement has written, for the `21000` above. Only `ON CONFLICT` fills it:
+    // without the clause a second write to one key is the ordinary `23505`.
+    let mut touched: Vec<Vec<u8>> = Vec::new();
+    // **The conflict target is resolved before any row is built**, which is what a real server
+    // does and is observable: a `42P10` or a `42703` here must not have drawn a sequence value
+    // first. Measured — three statements that fail this way leave the counter exactly where they
+    // found it, and a node that validated later would report ids three higher for every row after.
+    if let Some(on_conflict) = &insert.on_conflict {
+        validate_on_conflict(&table, on_conflict)?;
+    }
 
     for values in &insert.rows {
         if values.len() > targets.len() {
@@ -363,13 +373,35 @@ pub(super) fn insert(
         if routed.is_none() {
             check_partition_bound(executor, txn, &table, &row)?;
         }
-        write_row(
-            executor,
-            txn,
-            routed.as_ref().unwrap_or(&table),
-            &row,
-            written,
-        )?;
+        let target = routed.as_ref().unwrap_or(&table);
+        // **The conflict is routed first and arbitrated second.** A row no partition takes is
+        // `23514` above even under `DO NOTHING` — the clause never gets a chance, because there is
+        // no partition whose index could arbitrate. Here the partition is known, and it is *its*
+        // indexes the target is inferred against.
+        if let Some(on_conflict) = &insert.on_conflict
+            && let Some(existing) = conflicting_row(executor, txn, target, on_conflict, &row)?
+        {
+            if let Some(updated) = resolve_conflict(
+                executor,
+                txn,
+                target,
+                on_conflict,
+                &existing,
+                &row,
+                &mut touched,
+                written,
+            )? {
+                // `RETURNING` answers with the row it wrote, which is the one already there.
+                if let Some(returned) = &mut returned {
+                    returned.push(&updated)?;
+                }
+            }
+            continue;
+        }
+        write_row(executor, txn, target, &row, written)?;
+        if insert.on_conflict.is_some() {
+            touched.push(row_key_of(executor, target, &row)?);
+        }
         // The row **as stored**, so a column filled from its `DEFAULT` comes back with that value
         // rather than with the NULL the user did not write.
         if let Some(returned) = &mut returned {
@@ -692,6 +724,266 @@ pub(super) fn delete(
 /// The projection is `None` for the named table itself, whose rows already are its own shape.
 type Target = (std::sync::Arc<TableDef>, Option<Vec<usize>>);
 
+/// A row's primary-key bytes, which is the identity the `21000` check compares rows by.
+fn row_key_of(executor: &Executor, table: &TableDef, row: &[Datum]) -> Result<Vec<u8>> {
+    let values: Vec<Datum> = table
+        .primary_key
+        .iter()
+        .map(|&at| row[at].clone())
+        .collect();
+    Ok(row::row_key(executor.tenant, table.id, &values)?)
+}
+
+/// What an `ON CONFLICT` does with a proposal that collided: the row it wrote, or `None`.
+///
+/// `None` is `DO NOTHING`, and it is **not the same as writing nothing quietly**: `RETURNING` does
+/// not answer for a row this returns `None` for, which is what makes `DO NOTHING RETURNING "id"`
+/// come back empty rather than with the existing id.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one per thing the write needs; grouping them would \
+                                              name a struct the executor does not otherwise have"
+)]
+fn resolve_conflict(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    target: &TableDef,
+    on_conflict: &crate::plan::OnConflict,
+    existing: &Conflicting,
+    proposed: &[Datum],
+    touched: &mut Vec<Vec<u8>>,
+    written: &mut Written,
+) -> Result<Option<Vec<Datum>>> {
+    let crate::plan::ConflictAction::DoUpdate(assignments) = &on_conflict.action else {
+        return Ok(None);
+    };
+    let updated = apply_conflict_update(target, assignments, &existing.row, proposed)?;
+    // **A `DO UPDATE` cannot move a row between partitions**, where a plain `UPDATE` can. Setting
+    // the key to what it already holds is fine; setting it to another partition's value is `0A000`
+    // with PostgreSQL's own `DETAIL`.
+    if let Some(parent) = parent_of_partition(executor, txn, target)?
+        && let Some(destination) = route_to_partition(executor, txn, &parent, &updated)?
+        && destination.id != target.id
+    {
+        return Err(SqlError::OnConflictMovesPartition);
+    }
+    // The same statement cannot write one row twice: a proposed row that lands on a row this
+    // statement itself inserted is `21000`.
+    if touched.contains(&existing.key) {
+        return Err(SqlError::OnConflictAffectedTwice);
+    }
+    remove_row(executor, txn, target, &existing.row)?;
+    write_row(executor, txn, target, &updated, written)?;
+    touched.push(existing.key.clone());
+    Ok(Some(updated))
+}
+
+/// The parts of `ON CONFLICT` a real server settles **before it builds a row**.
+///
+/// Both failures here are observable through the sequence: PostgreSQL raises them at plan time, so
+/// the statement draws no `nextval`, and a node that checked them after building the proposed row
+/// would leave the counter three higher over the capture's three probes. The inference itself is
+/// re-done per row against the *partition* the row routes to, whose indexes mirror these.
+fn validate_on_conflict(table: &TableDef, on_conflict: &crate::plan::OnConflict) -> Result<()> {
+    let wanted: Vec<usize> = on_conflict
+        .target
+        .iter()
+        .map(|name| {
+            table
+                .column(name)
+                .ok_or_else(|| SqlError::UndefinedColumn(name.clone()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let primary = !table.primary_key.is_empty()
+        && table.row_id().is_none()
+        && (wanted.is_empty() || same_key(&wanted, &table.primary_key));
+    let indexed = table.indexes.iter().any(|index| {
+        index.unique
+            && index.predicate.is_none()
+            && index
+                .key_columns()
+                .is_some_and(|columns| wanted.is_empty() || same_key(&wanted, &columns))
+    });
+    if !primary && !indexed {
+        return Err(SqlError::NoUniqueForOnConflict);
+    }
+    // The assignments are resolved here too, for the reason the target is: `excluded.nosuchcol` is
+    // `42703` before anything is drawn.
+    if let crate::plan::ConflictAction::DoUpdate(assignments) = &on_conflict.action {
+        let scope = query::Scope::conflicting(table);
+        for (name, value) in assignments {
+            table
+                .column(name)
+                .ok_or_else(|| SqlError::UndefinedColumnInRelation {
+                    column: name.clone(),
+                    relation: table.name.clone(),
+                })?;
+            if !matches!(value, crate::plan::Expr::Literal(_)) {
+                query::resolve(value, &scope).map_err(excluded_column)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The row an `ON CONFLICT` proposal collides with, and the key it is stored under.
+struct Conflicting {
+    /// The primary-key bytes of the row already there — the identity the `21000` check compares.
+    key: Vec<u8>,
+    /// The row itself, which a `DO UPDATE` rewrites.
+    row: Vec<Datum>,
+}
+
+/// The row a proposed one conflicts with, or `None` if nothing is in its way.
+///
+/// **The target names columns and the index is inferred from them**, which is why a list matching
+/// no unique index is `42P10` rather than a name that does not resolve. A **bare** `ON CONFLICT`
+/// takes any unique index and stops at the first that collides — which is what `insert_all`
+/// without a `unique_by` sends.
+///
+/// A **partial** index is never inferred: PostgreSQL matches one only when the statement repeats
+/// its predicate, and that spelling does not parse here (`lower_on_conflict`). Leaving it out is
+/// what makes a bare target over a partial index the `42P10` a real server gives it too.
+fn conflicting_row(
+    executor: &Executor,
+    txn: &dyn Txn,
+    table: &TableDef,
+    on_conflict: &crate::plan::OnConflict,
+    row: &[Datum],
+) -> Result<Option<Conflicting>> {
+    let wanted: Vec<usize> = on_conflict
+        .target
+        .iter()
+        .map(|name| {
+            table
+                .column(name)
+                .ok_or_else(|| SqlError::UndefinedColumn(name.clone()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut inferred = 0;
+    // The primary key is a unique index whose entry **is** the row, so it is tried the same way
+    // and answers with the row it found rather than with a pointer to one.
+    if !table.primary_key.is_empty()
+        && table.row_id().is_none()
+        && (wanted.is_empty() || same_key(&wanted, &table.primary_key))
+    {
+        inferred += 1;
+        let values: Vec<Datum> = table
+            .primary_key
+            .iter()
+            .map(|&at| row[at].clone())
+            .collect();
+        let key = row::row_key(executor.tenant, table.id, &values)?;
+        if let Some(bytes) = txn.get(&key)? {
+            return Ok(Some(Conflicting {
+                row: row::decode_row(&table.row_schema(), &bytes)?,
+                key,
+            }));
+        }
+    }
+    for index in table.indexes.iter().filter(|index| index.unique) {
+        let Some(columns) = index.key_columns() else {
+            continue;
+        };
+        // A partial index is not inferable; see above.
+        if index.predicate.is_some() || !(wanted.is_empty() || same_key(&wanted, &columns)) {
+            continue;
+        }
+        inferred += 1;
+        let Some(entry) = super::index::entry(executor.tenant, table, index, row, &[])? else {
+            continue;
+        };
+        // Only a by-value entry can collide: one with a NULL in its key carries a suffix so that
+        // any number of them coexist, which is the same rule `write_row` follows.
+        if !entry.by_value {
+            continue;
+        }
+        let Some(bytes) = txn.get(&entry.key)? else {
+            continue;
+        };
+        // An index entry's value is the primary key, which is what a lookup follows back.
+        let values = row::decode_row(&row::RowSchema::nullable(table.primary_key_types()), &bytes)?;
+        let key = row::row_key(executor.tenant, table.id, &values)?;
+        let Some(bytes) = txn.get(&key)? else {
+            continue;
+        };
+        return Ok(Some(Conflicting {
+            row: row::decode_row(&table.row_schema(), &bytes)?,
+            key,
+        }));
+    }
+    if inferred == 0 {
+        return Err(SqlError::NoUniqueForOnConflict);
+    }
+    Ok(None)
+}
+
+/// Whether a conflict target names exactly one index's key columns, in any order.
+///
+/// PostgreSQL infers by the **set**, not the order: `ON CONFLICT ("city_id","logdate")` finds the
+/// index on `(logdate, city_id)`.
+fn same_key(wanted: &[usize], columns: &[usize]) -> bool {
+    wanted.len() == columns.len() && wanted.iter().all(|at| columns.contains(at))
+}
+
+/// The row a `DO UPDATE` writes: the one already there, with the assignments applied.
+///
+/// **Both rows are in scope.** A bare column, or one qualified with the table's name, is the row
+/// already there; `excluded.c` is the row that would have been inserted. They are evaluated
+/// against the two concatenated, which is what [`super::query::Scope::conflicting`] describes.
+fn apply_conflict_update(
+    table: &TableDef,
+    assignments: &[(String, crate::plan::Expr)],
+    existing: &[Datum],
+    proposed: &[Datum],
+) -> Result<Vec<Datum>> {
+    let mut both = existing.to_vec();
+    both.extend_from_slice(proposed);
+    let scope = query::Scope::conflicting(table);
+    let mut updated = existing.to_vec();
+    for (name, value) in assignments {
+        let ordinal = table
+            .column(name)
+            .ok_or_else(|| SqlError::UndefinedColumnInRelation {
+                column: name.clone(),
+                relation: table.name.clone(),
+            })?;
+        let column = &table.columns[ordinal];
+        let evaluated = match value {
+            crate::plan::Expr::Literal(literal) => literal.assign(column.ty, &column.name)?,
+            other => {
+                // **`excluded.nosuchcol` has its own sentence** — qualified and unquoted — where a
+                // missing column of the table keeps the ordinary one. Measured, one pair.
+                let resolved = query::resolve(other, &scope).map_err(excluded_column)?;
+                cursor::evaluate(&resolved, &both)?
+            }
+        };
+        if !evaluated.fits(column.ty) {
+            return Err(SqlError::DatatypeMismatchInColumn {
+                column: column.name.clone(),
+                column_type: column.ty.name(),
+                expression_type: "the expression's",
+            });
+        }
+        updated[ordinal] = evaluated;
+    }
+    fit_typmods(table, &mut updated)?;
+    fill_generated(table, &mut updated)?;
+    check_not_null(table, &updated)?;
+    check_constraints(table, &updated)?;
+    Ok(updated)
+}
+
+/// A column of `excluded` that does not exist, said the way PostgreSQL says it.
+fn excluded_column(error: SqlError) -> SqlError {
+    match error {
+        SqlError::UndefinedQualifiedColumn { qualifier, column } if qualifier == "excluded" => {
+            SqlError::UndefinedExcludedColumn(column)
+        }
+        other => other,
+    }
+}
+
 /// The partitioned table this one is a partition of, if it is one.
 ///
 /// A partition has exactly one parent — the edge it shares with `INHERITS` — and only a
@@ -736,7 +1028,28 @@ fn route_to_partition(
         }
     }
     fallback.map_or_else(
-        || Err(SqlError::NoPartitionForRow(table.name.clone())),
+        || {
+            // **The key, not the row** — which is the other `23514`'s shape. A row sent straight
+            // into the wrong partition prints every column; this one prints only the columns that
+            // decided, because it is the *key* that no partition claims.
+            let names: Vec<&str> = key
+                .columns
+                .iter()
+                .filter_map(|&at| table.columns.get(at).map(|column| column.name.as_str()))
+                .collect();
+            let printed: Vec<String> = values
+                .iter()
+                .map(|value| PgDatum::to_text(*value).unwrap_or_else(|| "null".to_owned()))
+                .collect();
+            Err(SqlError::NoPartitionForRow {
+                relation: table.name.clone(),
+                detail: format!(
+                    "Partition key of the failing row contains ({}) = ({}).",
+                    names.join(", "),
+                    printed.join(", ")
+                ),
+            })
+        },
         |child| Ok(Some(child)),
     )
 }

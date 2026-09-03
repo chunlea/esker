@@ -93,6 +93,23 @@ impl<'a> Scope<'a> {
         Scope::single_as(table, table.name.clone())
     }
 
+    /// The target row and the **proposed** row side by side, for an `ON CONFLICT … DO UPDATE`.
+    ///
+    /// PostgreSQL puts both in scope while the assignments are evaluated: a bare column or one
+    /// qualified with the table's name is the row **already there**, and `excluded.c` is the row
+    /// that would have been inserted. Two entries of one table under two names is exactly that,
+    /// and it makes the ordinals run `0..n` for the first and `n..2n` for the second — which is
+    /// the shape of the concatenated row the evaluator is handed.
+    pub(super) fn conflicting(table: &'a TableDef) -> Self {
+        Scope {
+            tables: vec![table, table],
+            names: vec![table.name.clone(), "excluded".to_owned()],
+            written: vec![0, 1],
+            using: Vec::new(),
+            outer: None,
+        }
+    }
+
     /// One table under the name the query refers to it by.
     fn single_as(table: &'a TableDef, name: String) -> Self {
         Scope {

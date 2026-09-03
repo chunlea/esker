@@ -1996,7 +1996,6 @@ fn lower_insert(insert: &sqlparser::ast::Insert) -> Result<plan::Insert> {
     refuse_if(insert.ignore, "INSERT IGNORE")?;
     refuse_if(insert.overwrite, "INSERT OVERWRITE")?;
     refuse_if(insert.replace_into, "REPLACE INTO")?;
-    refuse_if(insert.on.is_some(), "INSERT ... ON CONFLICT")?;
     let returning = insert
         .returning
         .as_deref()
@@ -2059,7 +2058,67 @@ fn lower_insert(insert: &sqlparser::ast::Insert) -> Result<plan::Insert> {
         columns,
         rows,
         returning,
+        on_conflict: insert.on.as_ref().map(lower_on_conflict).transpose()?,
     })
+}
+
+/// `ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET …`.
+///
+/// **The arbiter's `WHERE` has nowhere to go.** PostgreSQL infers a *partial* unique index only
+/// when the statement repeats its predicate — `ON CONFLICT ("a") WHERE "b" IS NOT NULL` — and
+/// `sqlparser` 0.62.0's `ConflictTarget::Columns` is a bare `Vec<Ident>`, so that spelling does not
+/// parse at all. A C1 gap, in the plan's register; the target-less and column-list forms, which are
+/// the two `build_insert_sql` writes, both parse.
+fn lower_on_conflict(on: &sqlparser::ast::OnInsert) -> Result<plan::OnConflict> {
+    use sqlparser::ast::{ConflictTarget, OnConflictAction, OnInsert};
+    let OnInsert::OnConflict(conflict) = on else {
+        return Err(SqlError::unsupported("INSERT ... ON DUPLICATE KEY UPDATE"));
+    };
+    let target = match &conflict.conflict_target {
+        None => Vec::new(),
+        Some(ConflictTarget::Columns(columns)) => columns
+            .iter()
+            .map(|name| fold_identifier(&name.value, name.quote_style.is_some()).0)
+            .collect(),
+        // A constraint by name is a different inference: it names the constraint rather than
+        // asking PostgreSQL to find one, and nothing captured it.
+        Some(ConflictTarget::OnConstraint(_)) => {
+            return Err(SqlError::unsupported("ON CONFLICT ON CONSTRAINT"));
+        }
+    };
+    let action = match &conflict.action {
+        OnConflictAction::DoNothing => plan::ConflictAction::DoNothing,
+        OnConflictAction::DoUpdate(update) => {
+            refuse_if(
+                update.selection.is_some(),
+                "ON CONFLICT ... DO UPDATE ... WHERE",
+            )?;
+            // **A target-less `DO UPDATE` is refused by a real server too**, which has nothing to
+            // infer from; this node names the clause instead of guessing an index.
+            refuse_if(
+                target.is_empty(),
+                "ON CONFLICT DO UPDATE with no conflict target",
+            )?;
+            plan::ConflictAction::DoUpdate(
+                update
+                    .assignments
+                    .iter()
+                    .map(|assignment| {
+                        let name = match &assignment.target {
+                            AssignmentTarget::ColumnName(name) => object_name(name)?,
+                            other @ AssignmentTarget::Tuple(_) => {
+                                return Err(SqlError::unsupported(format!(
+                                    "the assignment target {other}"
+                                )));
+                            }
+                        };
+                        Ok((name, lower_expr(&assignment.value)?))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        }
+    };
+    Ok(plan::OnConflict { target, action })
 }
 
 /// An expression, as far as phase 6a's `VALUES` needs one.
