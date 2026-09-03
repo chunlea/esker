@@ -46,18 +46,8 @@ const FIXTURE: &[&str] = &[
 /// client sees only in the OID rather than a wrong number. The input that *does* overflow is in
 /// [`DIVERGENCES`], where it belongs.
 const TYPE_DIVERGENCES: &[&str] = &[
-    "SELECT sum(n) FROM wide",
-    "SELECT sum(n) FROM agg WHERE n > 1000",
-    "SELECT sum(n) FROM agg",
-    "SELECT sum(DISTINCT n) FROM agg",
-    "SELECT g, count(n), sum(n), min(n), max(n) FROM agg GROUP BY g ORDER BY g",
-    "SELECT g, sum(n) FROM agg GROUP BY g ORDER BY g",
-    "SELECT sum(n) FROM agg HAVING sum(n) IS NOT NULL",
     // A self-join under two aliases, which ran for the first time when unit 5 built them. Its
     // rows agree; what differs is what `sum(int8)` is called, the same as every line above.
-    "SELECT sum(a.n) FROM agg a JOIN agg b ON a.id = b.id",
-    "SELECT sum(n) FROM agg GROUP BY g ORDER BY sum(n) NULLS LAST",
-    "SELECT sum(n) FROM big GROUP BY id ORDER BY id",
 ];
 
 /// Queries this node answers differently, each with its reason.
@@ -67,47 +57,14 @@ const TYPE_DIVERGENCES: &[&str] = &[
 /// edge of ADR 0031, and the group order, which PostgreSQL does not promise and this node does.
 const DIVERGENCES: &[(&str, &str)] = &[
     // ADR 0031, and the whole of what an int8 sum costs.
-    (
-        "SELECT sum(n) FROM big",
-        "PostgreSQL's sum(bigint) is numeric and cannot overflow; ours is int8 and answers 22003 \
-         rather than wrapping",
-    ),
     // avg over an integer column: numeric with sixteen fractional digits, which no float8 renders.
-    (
-        "SELECT avg(n) FROM wide",
-        "avg(bigint) is numeric there and 0A000 here",
-    ),
-    (
-        "SELECT avg(n) FROM agg",
-        "avg(bigint) is numeric there and 0A000 here",
-    ),
     (
         "SELECT avg(n) FROM agg WHERE id = 1",
         "avg(bigint) is numeric there and 0A000 here",
     ),
     (
-        "SELECT avg(n) FROM agg WHERE id IN (1, 4)",
-        "avg(bigint) is numeric there and 0A000 here",
-    ),
-    (
-        "SELECT avg(n) FROM agg WHERE id IN (1, 2)",
-        "avg(bigint) is numeric there and 0A000 here",
-    ),
-    (
-        "SELECT avg(n) FROM agg WHERE id IN (1, 2, 4)",
-        "avg(bigint) is numeric there and 0A000 here",
-    ),
-    (
-        "SELECT avg(id) FROM agg",
-        "avg(bigint) is numeric there and 0A000 here",
-    ),
-    (
         "SELECT avg(n)::text FROM agg",
         "a cast, and avg(bigint) under it",
-    ),
-    (
-        "SELECT avg(n), sum(n), count(n), min(n), max(n) FROM agg GROUP BY g ORDER BY g",
-        "avg(bigint) is numeric there and 0A000 here",
     ),
     // The group order, which is a promise PostgreSQL does not make and this node does.
     (

@@ -274,6 +274,8 @@ pub(crate) fn type_letter(oid: u32) -> char {
         701 => 'R',
         17 => 'X',
         1184 => 'D',
+        // `N` for numeric, which `sum(int8)` and every `avg` over an exact type answer now.
+        1700 => 'N',
         _ => '?',
     }
 }

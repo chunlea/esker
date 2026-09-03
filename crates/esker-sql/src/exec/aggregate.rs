@@ -152,8 +152,14 @@ impl Aggregation {
             // `text` here, which is what an array is on this node (`crate::value::vector`). The
             // declared type is the standing divergence; the value is byte-identical.
             AggregateFunc::ArrayAgg => Ok(ColumnType::Text),
+            // **`sum` widens, and the width it goes to is not uniform.** Measured: `int2` and
+            // `int4` sum to `bigint`, `int8` sums to **numeric** — which is why an `int8` sum
+            // cannot overflow on a real server — and a `numeric` sums to `numeric`. A `float8`
+            // stays itself.
             AggregateFunc::Sum => match arg {
-                ColumnType::Int8 | ColumnType::Double => Ok(arg),
+                ColumnType::Int2 | ColumnType::Int4 => Ok(ColumnType::Int8),
+                ColumnType::Int8 | ColumnType::Numeric => Ok(ColumnType::Numeric),
+                ColumnType::Double => Ok(arg),
                 _ => undefined(),
             },
             // Every type has an ordering here, and `bool` is the one PostgreSQL has no aggregate
@@ -179,12 +185,16 @@ impl Aggregation {
                 ColumnType::Varchar => Ok(ColumnType::Text),
                 _ => Ok(arg),
             },
+            // **Every integer width averages to `numeric`**, and so does a `numeric`. The
+            // refusal that used to stand here said this node had no numeric type to reproduce
+            // the answer with; it has had one since ADR 0045, and the scale is
+            // `numeric::div_scale`'s — sixteen *significant* digits, not sixteen fractional
+            // ones, which is why `3/3` prints twenty places and `5/3` sixteen.
             AggregateFunc::Avg => match arg {
                 ColumnType::Double => Ok(ColumnType::Double),
-                ColumnType::Int8 => Err(SqlError::unsupported(
-                    "avg over a bigint column, which PostgreSQL answers as numeric with sixteen \
-                     fractional digits and this node has no numeric type to reproduce",
-                )),
+                ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8 | ColumnType::Numeric => {
+                    Ok(ColumnType::Numeric)
+                }
                 _ => undefined(),
             },
         }
@@ -530,14 +540,24 @@ pub(super) struct Accumulator {
 enum State {
     /// `count(*)` and `count(col)`, which differ only in whether a NULL reaches here.
     Count(i64),
-    /// `sum(int8)`. `None` until a non-NULL arrives, because a sum over nothing is NULL.
-    SumInt(Option<i64>),
     /// `sum(float8)`, and the running half of `avg(float8)`.
     SumFloat(Option<f64>),
     /// `min`/`max`, holding the best value seen.
     Extreme(Option<Datum>),
     /// `avg(float8)`: the sum, and how many values went into it.
     AvgFloat { sum: f64, seen: i64 },
+    /// `sum(int2)` and `sum(int4)`, which widen to an `int8` and cannot overflow it.
+    SumWide(Option<i64>),
+    /// `sum(int8)` and `sum(numeric)`, both of which answer a `numeric`.
+    SumNumeric(Option<esker_keys::numeric::Numeric>),
+    /// `avg` over any exact type: the running sum as a decimal, and the count to divide it by.
+    ///
+    /// The count is kept rather than the average, because an average cannot be folded — the mean
+    /// of two means is not the mean.
+    AvgNumeric {
+        sum: Option<esker_keys::numeric::Numeric>,
+        seen: i64,
+    },
     /// `array_agg`: every value, with the sort key it was collected under.
     ///
     /// The only state here that is **not** constant in the group's size, which is the price of an
@@ -586,12 +606,32 @@ fn resolve_aggregate_order_by(call: &AggregateCall, scope: &Scope<'_>) -> Result
         .collect()
 }
 
+/// A running total plus one more value, starting from nothing.
+///
+/// The `None` start is what makes a sum over no rows NULL rather than zero.
+fn add_numeric(
+    total: Option<&esker_keys::numeric::Numeric>,
+    addend: &esker_keys::numeric::Numeric,
+) -> esker_keys::numeric::Numeric {
+    match total {
+        Some(total) => crate::value::numeric::sum(total, addend),
+        None => addend.clone(),
+    }
+}
+
 impl Accumulator {
     /// A fresh accumulator for one group.
     pub(super) fn new(spec: &AggregateSpec) -> Self {
         let state = match (spec.func, spec.arg_type) {
             (AggregateFunc::Count, _) => State::Count(0),
-            (AggregateFunc::Sum, Some(ColumnType::Int8)) => State::SumInt(None),
+            (AggregateFunc::Sum, Some(ColumnType::Int2 | ColumnType::Int4)) => State::SumWide(None),
+            (AggregateFunc::Sum, Some(ColumnType::Int8 | ColumnType::Numeric)) => {
+                State::SumNumeric(None)
+            }
+            (
+                AggregateFunc::Avg,
+                Some(ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8 | ColumnType::Numeric),
+            ) => State::AvgNumeric { sum: None, seen: 0 },
             (AggregateFunc::Avg, _) => State::AvgFloat { sum: 0.0, seen: 0 },
             (AggregateFunc::Sum, _) => State::SumFloat(None),
             (AggregateFunc::Min | AggregateFunc::Max, _) => State::Extreme(None),
@@ -632,12 +672,37 @@ impl Accumulator {
         }
         match (&mut self.state, value) {
             (State::Count(count), _) => *count += 1,
-            (State::SumInt(total), Datum::Int8(value)) => {
-                let sum = total.unwrap_or(0);
-                // ADR 0031: PostgreSQL's `sum(bigint)` is `numeric` and cannot overflow. Ours is
-                // `int8` and errors rather than wrapping, which is what the columnar evaluator
-                // does with the same input.
-                *total = Some(sum.checked_add(*value).ok_or(SqlError::BigintOutOfRange)?);
+            // `int2` and `int4` widen into an `int8`, which their sum cannot overflow: the
+            // widest sum of `i32`s is bounded by the row count, and the group table is bounded.
+            (State::SumWide(total), Datum::Int2(value)) => {
+                *total = Some(total.unwrap_or(0) + i64::from(*value));
+            }
+            (State::SumWide(total), Datum::Int4(value)) => {
+                *total = Some(total.unwrap_or(0) + i64::from(*value));
+            }
+            // **`sum(int8)` is a `numeric` and cannot overflow**, which is the whole reason
+            // PostgreSQL widens it — `9223372036854775807 + 1` is a value there, not `22003`.
+            (State::SumNumeric(total), Datum::Int8(value)) => {
+                let addend = crate::value::numeric::of_i64(*value);
+                *total = Some(add_numeric(total.as_ref(), &addend));
+            }
+            (State::SumNumeric(total), Datum::Numeric(value)) => {
+                *total = Some(add_numeric(total.as_ref(), value));
+            }
+            (State::AvgNumeric { sum, seen }, value) => {
+                let addend = match value {
+                    Datum::Int2(value) => crate::value::numeric::of_i64(i64::from(*value)),
+                    Datum::Int4(value) => crate::value::numeric::of_i64(i64::from(*value)),
+                    Datum::Int8(value) => crate::value::numeric::of_i64(*value),
+                    Datum::Numeric(value) => value.clone(),
+                    other => {
+                        return Err(SqlError::Internal(format!(
+                            "avg accumulated a {other:?}, which its type check refuses"
+                        )));
+                    }
+                };
+                *sum = Some(add_numeric(sum.as_ref(), &addend));
+                *seen += 1;
             }
             (State::SumFloat(total), Datum::Double(value)) => {
                 *total = Some(total.unwrap_or(0.0) + value);
@@ -690,10 +755,21 @@ impl Accumulator {
     pub(super) fn finish(&self) -> Datum {
         match &self.state {
             State::Count(count) => Datum::Int8(*count),
-            State::SumInt(total) => total.map_or(Datum::Null, Datum::Int8),
+            State::SumWide(total) => total.map_or(Datum::Null, Datum::Int8),
+            State::SumNumeric(total) => total.clone().map_or(Datum::Null, Datum::Numeric),
+            // A sum over no rows is NULL, and so is an average over none — the same rule, and
+            // the reason the divisor is never zero below.
+            State::AvgNumeric {
+                sum: Some(sum),
+                seen,
+            } => crate::value::numeric::mean(sum, *seen).map_or(Datum::Null, Datum::Numeric),
             State::SumFloat(total) => total.map_or(Datum::Null, Datum::Double),
             State::Extreme(best) => best.clone().unwrap_or(Datum::Null),
-            State::AvgFloat { seen: 0, .. } => Datum::Null,
+            // An average over nothing is NULL, whichever accumulator held it — the same rule
+            // as a sum over nothing, and the reason neither divisor is ever zero.
+            State::AvgFloat { seen: 0, .. }
+            | State::AvgNumeric { seen: 0, .. }
+            | State::AvgNumeric { sum: None, .. } => Datum::Null,
             #[allow(
                 clippy::cast_precision_loss,
                 reason = "the count is the divisor PostgreSQL's own float8 average divides by"

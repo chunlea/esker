@@ -954,10 +954,10 @@ not implement them, not a damaged message, and the caller falls back to a row sc
 
 Aggregate semantics are PostgreSQL's, defined here because the row executor has none yet:
 `count(*)` counts rows and `count(col)` skips NULLs, `sum`/`min`/`max` over nothing are NULL and
-not zero, extremes order by `pg_cmp`, NULL forms one `GROUP BY` group of its own. One declared
-divergence: `sum(bigint)` returns `numeric` on a real server and cannot overflow, and this node's
-`sum` does not promote to it, so an `int8` sum that does not fit is a typed error rather than a
-wrapped number. The type itself exists since ADR 0045; the aggregate is what has not moved.
+not zero, extremes order by `pg_cmp`, NULL forms one `GROUP BY` group of its own. `sum` widens the way a real server widens: `int2` and `int4` to `bigint`, `int8` and `numeric` to
+**`numeric`** — so an `int8` sum cannot overflow here either — and every exact type averages to
+`numeric` at PostgreSQL's own division scale, which aims at sixteen *significant* digits rather
+than sixteen fractional ones. A `float8` stays a `float8` for both.
 
 A fragment's aggregates are folded into **one accumulator per group across the whole file**, in row
 order, so its answer does not depend on where stripe boundaries fell — floating-point addition is

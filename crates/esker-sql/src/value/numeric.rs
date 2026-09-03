@@ -379,3 +379,315 @@ pub fn as_f64(value: &Numeric) -> f64 {
         Numeric::Finite(_) => to_text(value).parse().unwrap_or(f64::NAN),
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Arithmetic
+//
+// The numeric unit shipped the type "stored, compared, ordered, indexed and printed; not yet
+// computed with". `sum` and `avg` are what needed it computed with, and these are the two
+// operations they need — nothing else, deliberately: a general arithmetic surface is the
+// engine's missing `BinaryOp` and its own unit.
+// ---------------------------------------------------------------------------------------------
+
+/// The magnitudes of two digit strings compared, longest-first then lexicographically.
+fn cmp_digits(a: &[u8], b: &[u8]) -> Ordering {
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+
+/// `a + b` on magnitudes, most significant digit first.
+fn add_digits(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(a.len().max(b.len()) + 1);
+    let mut carry = 0u8;
+    for at in 0..a.len().max(b.len()) {
+        let left = a.get(a.len().wrapping_sub(at + 1)).copied().unwrap_or(0);
+        let right = b.get(b.len().wrapping_sub(at + 1)).copied().unwrap_or(0);
+        let sum = left + right + carry;
+        out.push(sum % 10);
+        carry = sum / 10;
+    }
+    if carry != 0 {
+        out.push(carry);
+    }
+    out.reverse();
+    out
+}
+
+/// `a - b` on magnitudes, where `a >= b`.
+fn sub_digits(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(a.len());
+    let mut borrow = 0i8;
+    for at in 0..a.len() {
+        let left = i8::try_from(a[a.len() - at - 1]).unwrap_or(0);
+        let right = b
+            .get(b.len().wrapping_sub(at + 1))
+            .copied()
+            .map_or(0, |digit| i8::try_from(digit).unwrap_or(0));
+        let mut value = left - right - borrow;
+        if value < 0 {
+            value += 10;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        out.push(u8::try_from(value).unwrap_or(0));
+    }
+    out.reverse();
+    trim_leading(out)
+}
+
+/// Drops leading zeros, keeping at least one digit.
+fn trim_leading(mut digits: Vec<u8>) -> Vec<u8> {
+    let keep = digits
+        .iter()
+        .position(|digit| *digit != 0)
+        .unwrap_or(digits.len() - 1);
+    digits.drain(..keep);
+    digits
+}
+
+/// `value` with `count` zeros appended, which multiplies it by `10^count`.
+fn shift_left(digits: &[u8], count: usize) -> Vec<u8> {
+    let mut out = digits.to_vec();
+    out.extend(std::iter::repeat_n(0u8, count));
+    out
+}
+
+/// Two decimals added, keeping the wider scale — which is what PostgreSQL's `+` does.
+#[must_use]
+pub fn add(left: &Decimal, right: &Decimal) -> Decimal {
+    let scale = left.scale.max(right.scale);
+    let left_digits = shift_left(
+        &left.digits,
+        usize::try_from(scale - left.scale).unwrap_or(0),
+    );
+    let right_digits = shift_left(
+        &right.digits,
+        usize::try_from(scale - right.scale).unwrap_or(0),
+    );
+    let (negative, digits) = if left.negative == right.negative {
+        (left.negative, add_digits(&left_digits, &right_digits))
+    } else if cmp_digits(&left_digits, &right_digits).is_ge() {
+        (left.negative, sub_digits(&left_digits, &right_digits))
+    } else {
+        (right.negative, sub_digits(&right_digits, &left_digits))
+    };
+    // Zero is never negative here, which is the invariant `Decimal` states.
+    let negative = negative && digits.iter().any(|digit| *digit != 0);
+    Decimal {
+        negative,
+        digits,
+        scale,
+    }
+}
+
+/// The fractional digits PostgreSQL's division produces for these two operands.
+///
+/// This is `select_div_scale` from `numeric.c`, and it is **not** a fixed number of places: it
+/// aims at sixteen *significant* digits, so `3 / 3` comes out at twenty fractional digits and
+/// `5 / 3` at sixteen. Measured against 19beta1 before it was written, and each of those two is
+/// a test below.
+///
+/// The weights are in PostgreSQL's base-10000 digits, which is why they are computed here rather
+/// than taken from the base-10 representation this crate stores: the rule counts groups of four.
+#[must_use]
+pub fn div_scale(numerator: &Decimal, denominator: &Decimal) -> i32 {
+    /// The base-10000 weight and leading group of a decimal's magnitude.
+    fn weight_and_lead(value: &Decimal) -> (i32, i32) {
+        let normalised = value.normalised();
+        if normalised.is_zero() {
+            return (0, 0);
+        }
+        let integer_digits =
+            i32::try_from(normalised.digits.len()).unwrap_or(i32::MAX) - normalised.scale;
+        // The leading base-10000 group is the first `integer_digits mod 4` digits (or four).
+        let lead_len = integer_digits.rem_euclid(4);
+        let lead_len = if lead_len == 0 { 4 } else { lead_len };
+        let lead: i32 = normalised
+            .digits
+            .iter()
+            .take(usize::try_from(lead_len).unwrap_or(1))
+            .fold(0, |acc, digit| acc * 10 + i32::from(*digit));
+        // `weight` counts whole base-10000 groups above the point, less one.
+        ((integer_digits - 1).div_euclid(4), lead)
+    }
+
+    let (weight1, lead1) = weight_and_lead(numerator);
+    let (weight2, lead2) = weight_and_lead(denominator);
+    let mut qweight = weight1 - weight2;
+    if lead1 <= lead2 {
+        qweight -= 1;
+    }
+    // Sixteen significant digits, less whatever the quotient's own weight already provides.
+    let mut rscale = 16 - qweight * 4;
+    rscale = rscale.max(numerator.scale).max(denominator.scale).max(0);
+    rscale.min(1000)
+}
+
+/// `left / right` at `scale` fractional digits, rounded **half away from zero**.
+///
+/// `None` for a division by zero, which the caller turns into `22012`.
+#[must_use]
+pub fn divide(left: &Decimal, right: &Decimal, scale: i32) -> Option<Decimal> {
+    if right.is_zero() {
+        return None;
+    }
+    // left/right = (L × 10^-ls) / (R × 10^-rs) = (L / R) × 10^(rs-ls); wanted at 10^-scale, so
+    // the numerator is shifted by `scale + rs - ls` and one more digit for the rounding decision.
+    let shift = scale + right.scale - left.scale + 1;
+    let numerator = if shift >= 0 {
+        shift_left(&left.digits, usize::try_from(shift).unwrap_or(0))
+    } else {
+        let drop = usize::try_from(-shift).unwrap_or(0);
+        if drop >= left.digits.len() {
+            vec![0]
+        } else {
+            left.digits[..left.digits.len() - drop].to_vec()
+        }
+    };
+    // Schoolbook long division, one digit at a time.
+    let mut quotient: Vec<u8> = Vec::with_capacity(numerator.len());
+    let mut remainder: Vec<u8> = vec![0];
+    for digit in &numerator {
+        // `remainder = remainder * 10 + digit`, which is one push and **not** a shift as well:
+        // doing both multiplied by a hundred and quietly divided by ten.
+        if remainder == [0] {
+            remainder = vec![*digit];
+        } else {
+            remainder.push(*digit);
+        }
+        remainder = trim_leading(remainder);
+        let mut count = 0u8;
+        while cmp_digits(&remainder, &right.digits).is_ge() {
+            remainder = sub_digits(&remainder, &right.digits);
+            count += 1;
+        }
+        quotient.push(count);
+    }
+    // The extra digit decides the rounding, half away from zero.
+    let last = quotient.pop().unwrap_or(0);
+    let mut digits = trim_leading(quotient);
+    if last >= 5 {
+        digits = add_digits(&digits, &[1]);
+    }
+    let negative = (left.negative != right.negative) && digits.iter().any(|digit| *digit != 0);
+    Some(Decimal {
+        negative,
+        digits,
+        scale,
+    })
+}
+
+/// Two numerics added, with the non-finite rules PostgreSQL's `+` has.
+///
+/// `NaN` absorbs everything, and two infinities of opposite sign are `NaN` — the same answers
+/// `float8` gives, and measured for this type rather than assumed from that one.
+#[must_use]
+pub fn sum(left: &Numeric, right: &Numeric) -> Numeric {
+    match (left, right) {
+        // A `NaN` absorbs, and two opposite infinities make one — measured for this type, not
+        // borrowed from `float8`, though the answers turn out to be the same.
+        (Numeric::NaN, _)
+        | (_, Numeric::NaN)
+        | (Numeric::PosInfinity, Numeric::NegInfinity)
+        | (Numeric::NegInfinity, Numeric::PosInfinity) => Numeric::NaN,
+        (Numeric::PosInfinity, _) | (_, Numeric::PosInfinity) => Numeric::PosInfinity,
+        (Numeric::NegInfinity, _) | (_, Numeric::NegInfinity) => Numeric::NegInfinity,
+        (Numeric::Finite(left), Numeric::Finite(right)) => Numeric::Finite(add(left, right)),
+    }
+}
+
+/// `sum / count` at PostgreSQL's own division scale — what `avg` answers.
+///
+/// `None` only for a zero count, which the caller has already turned into NULL.
+#[must_use]
+pub fn mean(sum: &Numeric, count: i64) -> Option<Numeric> {
+    if count == 0 {
+        return None;
+    }
+    let Numeric::Finite(total) = sum else {
+        // An infinity or a `NaN` divided by a count is itself, which is what `float8`'s average
+        // does with the same inputs.
+        return Some(sum.clone());
+    };
+    let Numeric::Finite(divisor) = of_i64(count) else {
+        return None;
+    };
+    let scale = div_scale(total, &divisor);
+    divide(total, &divisor, scale).map(Numeric::Finite)
+}
+
+#[cfg(test)]
+mod arithmetic_tests {
+    use super::{Numeric, add, div_scale, divide, from_text, to_text};
+
+    fn dec(text: &str) -> super::Decimal {
+        match from_text(text).unwrap() {
+            Numeric::Finite(value) => value,
+            other => panic!("{other:?} is not finite"),
+        }
+    }
+
+    /// Addition keeps the wider scale, which is what `sum` prints by.
+    #[test]
+    fn addition_keeps_the_wider_scale() {
+        for (left, right, expect) in [
+            ("1.5", "2.25", "3.75"),
+            ("1.00", "2", "3.00"),
+            ("-1.5", "1.5", "0.0"),
+            ("-2.5", "1.5", "-1.0"),
+            ("1.5", "-2.5", "-1.0"),
+            ("9223372036854775807", "1", "9223372036854775808"),
+        ] {
+            let sum = add(&dec(left), &dec(right));
+            assert_eq!(to_text(&Numeric::Finite(sum)), expect, "{left} + {right}");
+        }
+    }
+
+    /// **The division scale is not a fixed number of places**, and these are PostgreSQL's own
+    /// answers: `3/3` is twenty fractional digits and `5/3` is sixteen, because the rule aims at
+    /// sixteen *significant* ones. Captured from 19beta1 before this was written.
+    #[test]
+    fn the_division_scale_is_postgresqls_own() {
+        for (left, right, expect) in [
+            ("3", "3", 20),
+            ("5", "3", 16),
+            ("4.0", "2", 16),
+            ("3.123456789012345678", "2", 18),
+            ("3", "2", 16),
+        ] {
+            assert_eq!(
+                div_scale(&dec(left), &dec(right)),
+                expect,
+                "{left} / {right}"
+            );
+        }
+    }
+
+    /// And the quotient itself, to the digit — every one of these is an `avg` a real server
+    /// printed in the capture this unit was built from.
+    #[test]
+    fn the_quotient_matches_postgresql_to_the_digit() {
+        for (left, right, expect) in [
+            ("3", "3", "1.00000000000000000000"),
+            ("5", "3", "1.6666666666666667"),
+            ("4.0", "2", "2.0000000000000000"),
+            ("3", "2", "1.5000000000000000"),
+            ("3.75", "2", "1.8750000000000000"),
+            ("3.123456789012345678", "2", "1.561728394506172839"),
+            ("30", "2", "15.0000000000000000"),
+            ("300", "2", "150.0000000000000000"),
+            ("-3", "2", "-1.5000000000000000"),
+        ] {
+            let (a, b) = (dec(left), dec(right));
+            let scale = div_scale(&a, &b);
+            let quotient = divide(&a, &b, scale).expect("a non-zero divisor");
+            assert_eq!(
+                to_text(&Numeric::Finite(quotient)),
+                expect,
+                "{left} / {right}"
+            );
+        }
+        // A zero divisor is the caller's `22012`, not a value.
+        assert!(divide(&dec("1"), &dec("0"), 16).is_none());
+    }
+}
