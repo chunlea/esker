@@ -77,7 +77,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 20;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 21;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -90,6 +90,10 @@ const OLDEST_TABLE_VERSION: u8 = 2;
 /// a reader newer than 12 must still accept the ones version 12 wrote — which is what this floor
 /// says and `CATALOG_FORMAT_VERSION` would not.
 const OLDEST_EXTENSION_VERSION: u8 = 12;
+
+/// The version a **schema** record was introduced at, its own floor for the reason the extension's
+/// is: a reader newer than 21 must still accept what 21 wrote.
+const OLDEST_SCHEMA_VERSION: u8 = 21;
 
 /// The version a **function** record was introduced at, read as its own floor for the reason the
 /// extension's is: a reader newer than 18 must still accept what 18 wrote.
@@ -130,6 +134,9 @@ const KIND_FK_BACKREF: u8 = b'k';
 const KIND_EXTENSION: u8 = b'x';
 /// A stored function, keyed by name.
 const KIND_FUNCTION: u8 = b'f';
+/// A **schema**, keyed by name. `public` is not stored: it is a property of the build, the way the
+/// available extensions are, and a tenant that has created nothing still has it.
+const KIND_SCHEMA: u8 = b'g';
 
 /// Tags for [`ColumnType`] as stored. Ours rather than PostgreSQL's OIDs, because these are a
 /// format we own and must never move; the OIDs stay on the wire where they belong.
@@ -486,6 +493,57 @@ pub(super) fn decode_extension(bytes: &[u8]) -> Result<String> {
 ///
 /// Not in a table record, because a function belongs to no table: the trigger function statement
 /// 790 defines is named by a trigger on one table and could be named by a trigger on another.
+/// `'m' ++ "sql" ++ 'g' ++ tenant ++ name`. Value: the schema's own relation id, which is the oid
+/// `pg_namespace` reports.
+///
+/// Keyed by **name** rather than by id, because every question asked of a schema is asked by name:
+/// does it exist, what is in it, resolve this qualified relation.
+#[must_use]
+pub(super) fn schema_key(tenant: u64, name: &str) -> Vec<u8> {
+    let mut suffix = [SQL, &[KIND_SCHEMA]].concat();
+    codec::encode_u64(tenant, &mut suffix);
+    suffix.extend_from_slice(name.as_bytes());
+    prefix::meta_key(&suffix)
+}
+
+/// Every schema of one tenant: the range [`schema_key`] writes into.
+#[must_use]
+pub(super) fn schema_range(tenant: u64) -> (Vec<u8>, Vec<u8>) {
+    let mut suffix = [SQL, &[KIND_SCHEMA]].concat();
+    codec::encode_u64(tenant, &mut suffix);
+    let start = prefix::meta_key(&suffix);
+    let mut end = start.clone();
+    end.push(0xff);
+    (start, end)
+}
+
+/// The schema name out of a key [`schema_key`] wrote.
+pub(super) fn schema_name_of(tenant: u64, key: &[u8]) -> Result<String> {
+    let prefix = schema_key(tenant, "");
+    let tail = key
+        .strip_prefix(prefix.as_slice())
+        .ok_or_else(|| corrupt("a schema key outside this tenant's range"))?;
+    String::from_utf8(tail.to_vec()).map_err(|_| corrupt("a schema name that is not UTF-8"))
+}
+
+/// A schema record: the version byte and the schema's own id.
+#[must_use]
+pub(super) fn encode_schema(id: u64) -> Vec<u8> {
+    let mut out = vec![CATALOG_FORMAT_VERSION];
+    // **Little-endian in a record body**, where a *key* is big-endian: a key is sorted and a body
+    // is not, which is the whole difference between `codec::encode_u64` and this.
+    out.extend_from_slice(&id.to_le_bytes());
+    out
+}
+
+/// Reads one back.
+pub(super) fn decode_schema(bytes: &[u8]) -> Result<u64> {
+    let mut reader = Reader::at_least(bytes, OLDEST_SCHEMA_VERSION)?;
+    let id = reader.u64_le()?;
+    reader.finish()?;
+    Ok(id)
+}
+
 #[must_use]
 pub(super) fn function_key(tenant: u64, name: &str) -> Vec<u8> {
     let mut suffix = [SQL, &[KIND_FUNCTION]].concat();

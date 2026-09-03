@@ -950,6 +950,29 @@ pub enum SqlError {
         detail: String,
     },
 
+    /// `CREATE SCHEMA x` where `x` is already there: `42P06`.
+    #[error("schema \"{0}\" already exists")]
+    DuplicateSchema(String),
+
+    /// A schema that is not there: `3F000`.
+    ///
+    /// **Its own class**, not `42P01`: a missing *schema* and a missing *relation* are different
+    /// answers, and `CREATE TABLE nosuchschema.t` gives this one — it fails on the schema before
+    /// it looks for the table. Measured.
+    #[error("schema \"{0}\" does not exist")]
+    UndefinedSchema(String),
+
+    /// `DROP SCHEMA` with something still in it: `2BP01`, naming one dependent.
+    ///
+    /// **`IF EXISTS` does not excuse it**: the clause covers absence, not dependence. Measured.
+    #[error("cannot drop schema {schema} because other objects depend on it")]
+    DependentSchema {
+        /// The schema, unquoted — which is how PostgreSQL prints it here.
+        schema: String,
+        /// `table test_schema.things depends on schema test_schema`.
+        detail: String,
+    },
+
     /// A pattern `~` cannot compile: `2201B`, with PostgreSQL's own reason.
     ///
     /// **The sentence names which thing is wrong** — `brackets [] not balanced`, `parentheses ()
@@ -1502,6 +1525,8 @@ impl SqlError {
             | SqlError::AccessMethodWithoutInclude(_)
             | SqlError::OnConflictMovesPartition => sqlstate::FEATURE_NOT_SUPPORTED,
             SqlError::InvalidRegex(_) => sqlstate::INVALID_REGULAR_EXPRESSION,
+            SqlError::DuplicateSchema(_) => sqlstate::DUPLICATE_SCHEMA,
+            SqlError::UndefinedSchema(_) => sqlstate::INVALID_SCHEMA_NAME,
             SqlError::OnConflictAffectedTwice | SqlError::CardinalityViolation => {
                 sqlstate::CARDINALITY_VIOLATION
             }
@@ -1651,6 +1676,7 @@ impl SqlError {
             }
             SqlError::NoUniqueConstraintForReference(_) => sqlstate::INVALID_FOREIGN_KEY,
             SqlError::DependentObjectsStillExist { .. }
+            | SqlError::DependentSchema { .. }
             | SqlError::DependentTable { .. }
             | SqlError::DependentSequence { .. }
             | SqlError::FunctionRequiredBySystem(_)
@@ -1751,6 +1777,7 @@ impl SqlError {
             | SqlError::ForeignKeyStillReferenced { detail, .. }
             | SqlError::DependentTable { detail, .. }
             | SqlError::DependentFunction { detail, .. }
+            | SqlError::DependentSchema { detail, .. }
             | SqlError::NoPartitionForRow { detail, .. } => Some(detail.clone()),
             SqlError::OnConflictMovesPartition => Some(
                 "The result tuple would appear in a different partition than the original tuple."
@@ -1866,7 +1893,7 @@ impl SqlError {
             // and it is still the right sentence: it is what a real server says, and it is what
             // the user has to write once that unit lands. Saying something else would send them
             // looking for a different fix.
-            SqlError::DependentTable { .. }
+            SqlError::DependentSchema { .. } | SqlError::DependentTable { .. }
             | SqlError::DependentSequence { .. }
             | SqlError::DependentFunction { .. } => {
                 Some("Use DROP ... CASCADE to drop the dependent objects too.".to_owned())

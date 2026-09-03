@@ -31,11 +31,11 @@ mod time_machine;
 pub use crate::catalog::Identity;
 pub use crate::catalog::pg_catalog::CatalogView;
 pub use ddl::{
-    AlterTable, AlterTableAction, Column, ColumnDefault, CreateExtension, CreateFunction,
-    CreateIndex, CreateSequence, CreateTable, CreateTrigger, DropFunction, DropIndex, DropSequence,
-    DropTable, DropTrigger, ForeignKey, IndexKeyPart, KeyPartName, PartitionSpec, RangeEnd,
-    UniqueConstraint, foreign_key_name, index_name, primary_key_name, sequence_name,
-    unique_constraint_name,
+    AlterSchemaRename, AlterTable, AlterTableAction, Column, ColumnDefault, CreateExtension,
+    CreateFunction, CreateIndex, CreateSchema, CreateSequence, CreateTable, CreateTrigger,
+    DropFunction, DropIndex, DropSchema, DropSequence, DropTable, DropTrigger, ForeignKey,
+    IndexKeyPart, KeyPartName, PartitionSpec, RangeEnd, UniqueConstraint, foreign_key_name,
+    index_name, primary_key_name, sequence_name, unique_constraint_name,
 };
 pub use dml::{ConflictAction, Delete, Insert, OnConflict, Returning, Update};
 pub use expr::{
@@ -83,6 +83,12 @@ pub enum Statement {
     /// that the extension is installed, and what an extension *carries* is either already in this
     /// build or is why the name is not available.
     CreateExtension(CreateExtension),
+    /// `CREATE SCHEMA` — a second namespace, which is a catalog object like any other here.
+    CreateSchema(CreateSchema),
+    /// `DROP SCHEMA [CASCADE]`.
+    DropSchema(DropSchema),
+    /// `ALTER SCHEMA … RENAME TO …`.
+    AlterSchemaRename(AlterSchemaRename),
     /// `CREATE INDEX`, and the `UNIQUE` variant.
     CreateIndex(CreateIndex),
     /// `DROP INDEX`.
@@ -167,6 +173,9 @@ impl Statement {
             Statement::CreateTable(_) => Some("CREATE TABLE"),
             // A catalog write like the rest, so a read-only or time-travelling block refuses it.
             Statement::CreateExtension(_) => Some("CREATE EXTENSION"),
+            Statement::CreateSchema(_) => Some("CREATE SCHEMA"),
+            Statement::DropSchema(_) => Some("DROP SCHEMA"),
+            Statement::AlterSchemaRename(_) => Some("ALTER SCHEMA"),
             Statement::DropTable(_) => Some("DROP TABLE"),
             Statement::DropSequence(_) => Some("DROP SEQUENCE"),
             Statement::CreateSequence(_) => Some("CREATE SEQUENCE"),
@@ -207,6 +216,9 @@ impl Statement {
         match self {
             Statement::CreateTable(_) => "CREATE TABLE",
             Statement::CreateExtension(_) => "CREATE EXTENSION",
+            Statement::CreateSchema(_) => "CREATE SCHEMA",
+            Statement::DropSchema(_) => "DROP SCHEMA",
+            Statement::AlterSchemaRename(_) => "ALTER SCHEMA",
             Statement::DropTable(_) => "DROP TABLE",
             Statement::DropSequence(_) => "DROP SEQUENCE",
             Statement::CreateSequence(_) => "CREATE SEQUENCE",

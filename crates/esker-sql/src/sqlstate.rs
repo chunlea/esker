@@ -150,6 +150,15 @@ pub const INVALID_AUTHORIZATION_SPECIFICATION: &str = "28000";
 /// constraint is what put that index there.
 pub const DEPENDENT_OBJECTS_STILL_EXIST: &str = "2BP01";
 
+/// `42P06 duplicate_schema` — `CREATE SCHEMA` over one that is there.
+pub const DUPLICATE_SCHEMA: &str = "42P06";
+
+/// `3F000 invalid_schema_name` — a schema that is not there.
+///
+/// **Its own class**, not `42P01`: `CREATE TABLE nosuchschema.t` fails on the *schema* and gives
+/// this, where a relation missing from a schema that exists gives `42P01`. Measured, both.
+pub const INVALID_SCHEMA_NAME: &str = "3F000";
+
 // --- Class 34 — Invalid Cursor Name ---
 
 /// `Bind`/`Execute`/`Close` naming a portal that does not exist.
@@ -332,6 +341,8 @@ mod tests {
             "DEPENDENT_OBJECTS_STILL_EXIST",
             super::DEPENDENT_OBJECTS_STILL_EXIST,
         ),
+        ("DUPLICATE_SCHEMA", super::DUPLICATE_SCHEMA),
+        ("INVALID_SCHEMA_NAME", super::INVALID_SCHEMA_NAME),
         ("INVALID_CATALOG_NAME", super::INVALID_CATALOG_NAME),
         ("CARDINALITY_VIOLATION", super::CARDINALITY_VIOLATION),
         (

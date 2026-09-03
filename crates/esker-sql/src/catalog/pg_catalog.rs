@@ -509,10 +509,18 @@ impl CatalogView {
                     Datum::Text("i".to_owned()),
                 ],
             ]),
-            CatalogView::PgNamespace => Ok(vec![vec![
-                Datum::Int8(PUBLIC_NAMESPACE_OID),
-                Datum::Text(PUBLIC_SCHEMA.to_owned()),
-            ]]),
+            // **One row per schema**, `public` included — and `public` is not a record: it is a
+            // property of the build, the way the available extensions are, so a tenant that has
+            // created nothing still reports it.
+            CatalogView::PgNamespace => Ok(super::schema_names(txn, tenant)?
+                .into_iter()
+                .map(|(name, id)| {
+                    vec![
+                        Datum::Int8(super::pg_relations::as_oid(id)),
+                        Datum::Text(name),
+                    ]
+                })
+                .collect()),
             // **One fact read two ways.** Which extensions are installed is stored, and both of
             // these views report it — `pg_extension` as a row per installed extension and
             // `pg_available_extensions` as a non-NULL `installed_version` beside every available

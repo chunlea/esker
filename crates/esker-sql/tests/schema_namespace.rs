@@ -64,6 +64,75 @@ fn every_schema_answer_is_postgresql_19_s() {
     );
 }
 
+/// **`CREATE SCHEMA` makes a real catalog object**, and `pg_namespace` reports it beside `public`.
+#[test]
+fn a_created_schema_is_a_row_in_pg_namespace() {
+    let mut node = parity::Node::new(&[]);
+    // `public` is not a record — it is a property of the build — and is there before anything is
+    // created.
+    assert_eq!(node.rows("SELECT nspname FROM pg_namespace"), [["public"]]);
+    node.run("CREATE SCHEMA test_schema").unwrap();
+    assert_eq!(
+        node.rows("SELECT COUNT(*) FROM pg_namespace WHERE nspname = 'test_schema'"),
+        [["1"]]
+    );
+    // `schema_names`, the statement that gates the whole adapter — and the `!~` in it now runs.
+    assert_eq!(
+        node.rows(
+            "SELECT nspname FROM pg_namespace WHERE nspname !~ '^pg_.*' AND nspname NOT IN \
+             ('information_schema') ORDER by nspname"
+        ),
+        vec![vec!["public"], vec!["test_schema"]]
+    );
+    // Every schema has its own oid, and they are distinct.
+    assert_eq!(
+        node.rows("SELECT count(DISTINCT oid) FROM pg_namespace"),
+        [["2"]]
+    );
+}
+
+/// **Three codes for three ways of naming a schema wrong**, and `3F000` is its own class.
+#[test]
+fn each_way_of_naming_a_schema_wrong_has_its_own_code() {
+    let mut node = parity::Node::new(&["CREATE SCHEMA test_schema"]);
+    let error = node.run("CREATE SCHEMA test_schema").unwrap_err();
+    assert_eq!(error.sqlstate(), "42P06");
+    assert_eq!(error.to_string(), "schema \"test_schema\" already exists");
+    // `IF NOT EXISTS` over one that is there is a **success**, not an error.
+    node.run("CREATE SCHEMA IF NOT EXISTS test_schema").unwrap();
+    let error = node.run("DROP SCHEMA nosuchschema").unwrap_err();
+    assert_eq!(error.sqlstate(), "3F000");
+    assert_eq!(error.to_string(), "schema \"nosuchschema\" does not exist");
+    // `IF EXISTS` covers absence, and `CASCADE` beside it changes nothing about that.
+    node.run("DROP SCHEMA IF EXISTS nosuchschema CASCADE")
+        .unwrap();
+}
+
+/// `DROP SCHEMA` removes it, and `ALTER SCHEMA … RENAME TO` moves the name.
+#[test]
+fn a_schema_can_be_dropped_and_renamed() {
+    let mut node = parity::Node::new(&["CREATE SCHEMA test_schema", "CREATE SCHEMA test_schema2"]);
+    node.run("ALTER SCHEMA test_schema2 RENAME TO test_schema3")
+        .unwrap();
+    assert_eq!(
+        node.rows(
+            "SELECT nspname FROM pg_namespace WHERE nspname LIKE 'test_schema%' ORDER BY nspname"
+        ),
+        vec![vec!["test_schema"], vec!["test_schema3"]]
+    );
+    // A rename onto a name that is taken is the same `42P06` a create gets.
+    let error = node
+        .run("ALTER SCHEMA test_schema3 RENAME TO test_schema")
+        .unwrap_err();
+    assert_eq!(error.sqlstate(), "42P06");
+    node.run("DROP SCHEMA test_schema CASCADE").unwrap();
+    node.run("DROP SCHEMA test_schema3").unwrap();
+    assert_eq!(
+        node.rows("SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'test_schema%'"),
+        [["0"]]
+    );
+}
+
 /// What this node answers **today** for the three schema statements a real server takes, so that
 /// the refusals are pinned rather than merely absent.
 ///

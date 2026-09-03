@@ -209,9 +209,12 @@ impl Parameter {
             ("timezone", zone) if !is_utc(zone) => {
                 Err(SqlError::unsupported(format!("the time zone \"{zone}\"")))
             }
-            // One schema, because a schema qualifier is `0A000` here. Both spellings
-            // `ActiveRecord` sends resolve to it; anything else would leave an unqualified name
-            // resolving where a real server would find nothing.
+            // **Still one schema for *resolution*, even though `CREATE SCHEMA` now makes more.**
+            // `current_schema` and `current_schemas` are folded to `public` where a statement is
+            // lowered, and an unqualified name resolves in `public` — so accepting a path that
+            // names another schema would answer `public` where a real server answers the other
+            // one, which ADR 0031 ranks worse than the refusal. It is lifted by the unit that
+            // makes both session-aware, and not before.
             ("search_path", path) if !is_public(path) => Err(SqlError::unsupported(format!(
                 "a search_path of \"{path}\""
             ))),
