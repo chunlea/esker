@@ -34,7 +34,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          typname IN ('_int4','_text') ORDER BY oid",
         "SELECT 'integer[]'::regtype::oid, 'int4[]'::regtype::oid, '_int4'::regtype::oid, \
          'text[]'::regtype::oid",
-        "SELECT array_agg(id ORDER BY id) FROM ar",
     ],
     answers: &[
         (
@@ -44,10 +43,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT id FROM ar WHERE n @> '{1}' ORDER BY id",
             "The array **operators** — `@>`, `<@`, `&&`, `||` — which are the slice after the constructor. Nothing here is approximated in the meantime: each is `0A000` naming itself.",
-        ),
-        (
-            "SELECT count(*), count(n), array_length(min(n), 1) FROM ar",
-            "An aggregate **inside a function's arguments** — `array_length(min(n), 1)`. The aggregate rewrite does not descend into a call's arguments, which predates arrays and is why `abs(min(n))` is the same shape. Not an array gap; the `min(n)` beside it answers.",
         ),
         (
             "SELECT '{1,2,3}'::int[], ARRAY[1,2,3], ARRAY[1,2,3]::int[]",

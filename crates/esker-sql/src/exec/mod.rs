@@ -26,6 +26,7 @@
 
 mod aggregate;
 mod bind;
+mod comment;
 mod cursor;
 mod ddl;
 mod deferred;
@@ -551,6 +552,7 @@ impl Executor {
             Statement::DropTable(drop) => ddl::drop_table(self, txn, drop),
             Statement::CreateIndex(create) => ddl::create_index(self, txn, create),
             Statement::DropIndex(drop) => ddl::drop_index(self, txn, drop),
+            Statement::Comment(statement) => comment::comment(self, txn, statement),
             Statement::AlterTable(alter) => ddl::alter_table(self, txn, alter),
             Statement::Insert(insert) => dml::insert(self, txn, insert, written),
             Statement::Select(select) => self.select(txn, select),
@@ -1549,6 +1551,7 @@ fn explain_lines(statement: &Statement) -> Vec<String> {
         }
         Statement::CreateIndex(create) => vec![format!("Create Index on {}", create.table)],
         Statement::DropIndex(drop) => vec![format!("Drop Index on {}", drop.names.join(", "))],
+        Statement::Comment(statement) => vec![format!("Comment on {}", statement.name)],
         Statement::AlterTable(alter) => vec![format!("Alter Table on {}", alter.name)],
         // A `SELECT`'s plan is the interesting one, and it needs the catalog to be built, so
         // `EXPLAIN SELECT` is handled where the catalog is in reach rather than here.

@@ -31,11 +31,11 @@ mod time_machine;
 pub use crate::catalog::Identity;
 pub use crate::catalog::pg_catalog::CatalogView;
 pub use ddl::{
-    AlterSchemaRename, AlterTable, AlterTableAction, Column, ColumnDefault, CreateExtension,
-    CreateFunction, CreateIndex, CreateSchema, CreateSequence, CreateTable, CreateTrigger,
-    DropFunction, DropIndex, DropSchema, DropSequence, DropTable, DropTrigger, ForeignKey,
-    IndexKeyPart, KeyPartName, PartitionSpec, RangeEnd, UniqueConstraint, foreign_key_name,
-    index_name, primary_key_name, sequence_name, unique_constraint_name,
+    AlterSchemaRename, AlterTable, AlterTableAction, Column, ColumnDefault, Comment, CommentObject,
+    CreateExtension, CreateFunction, CreateIndex, CreateSchema, CreateSequence, CreateTable,
+    CreateTrigger, DropFunction, DropIndex, DropSchema, DropSequence, DropTable, DropTrigger,
+    ForeignKey, IndexKeyPart, KeyPartName, PartitionSpec, RangeEnd, UniqueConstraint,
+    foreign_key_name, index_name, primary_key_name, sequence_name, unique_constraint_name,
 };
 pub use dml::{ConflictAction, Delete, Insert, OnConflict, Returning, Update};
 pub use expr::{
@@ -93,6 +93,8 @@ pub enum Statement {
     CreateIndex(CreateIndex),
     /// `DROP INDEX`.
     DropIndex(DropIndex),
+    /// `COMMENT ON TABLE | COLUMN | INDEX`.
+    Comment(Comment),
     /// `ALTER TABLE`, of which only `ADD COLUMN` is executed.
     AlterTable(AlterTable),
     /// `INSERT`.
@@ -137,6 +139,9 @@ impl Statement {
                 | Statement::DropTable(_)
                 | Statement::CreateIndex(_)
                 | Statement::DropIndex(_)
+                // A comment is a field of the table record, so setting one rewrites it — and
+                // every later lookup in this transaction has to see the row it wrote.
+                | Statement::Comment(_)
         )
     }
 
@@ -177,6 +182,8 @@ impl Statement {
             Statement::DropSchema(_) => Some("DROP SCHEMA"),
             Statement::AlterSchemaRename(_) => Some("ALTER SCHEMA"),
             Statement::DropTable(_) => Some("DROP TABLE"),
+            // A catalog write like the rest: it rewrites the table record the comment lives in.
+            Statement::Comment(_) => Some("COMMENT"),
             Statement::DropSequence(_) => Some("DROP SEQUENCE"),
             Statement::CreateSequence(_) => Some("CREATE SEQUENCE"),
             Statement::DropFunction(_) => Some("DROP FUNCTION"),
@@ -220,6 +227,9 @@ impl Statement {
             Statement::DropSchema(_) => "DROP SCHEMA",
             Statement::AlterSchemaRename(_) => "ALTER SCHEMA",
             Statement::DropTable(_) => "DROP TABLE",
+            // **`COMMENT`, not `COMMENT ON`** — PostgreSQL's tag is the first word alone, which
+            // `psql` prints back and a script may branch on.
+            Statement::Comment(_) => "COMMENT",
             Statement::DropSequence(_) => "DROP SEQUENCE",
             Statement::CreateSequence(_) => "CREATE SEQUENCE",
             Statement::DropFunction(_) => "DROP FUNCTION",

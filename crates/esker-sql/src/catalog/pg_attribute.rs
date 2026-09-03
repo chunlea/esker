@@ -158,6 +158,7 @@ fn columns_of<'a>(
                                 default: None,
                                 missing: None,
                                 generated: None,
+                                comment: None,
                             }),
                             // No position in the table: there is no column under it, which is
                             // what `attnum = 0` says in `pg_index.indkey` for the same part.
@@ -194,6 +195,7 @@ fn columns_of<'a>(
                         default: None,
                         missing: None,
                         generated: None,
+                        comment: None,
                     }),
                     None,
                 )]

@@ -15,18 +15,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // which is what an array is on this node (`crate::value::vector`). Every row is
     // byte-identical, `{10,20,30,NULL}` and the NULL-first descending form included.
     types: &[
-        "SELECT array_agg(id) FROM ag",
-        "SELECT array_agg(id ORDER BY id DESC) FROM ag",
-        "SELECT array_agg(n ORDER BY n) FROM ag",
-        "SELECT array_agg(n ORDER BY n DESC) FROM ag",
-        "SELECT g, array_agg(id ORDER BY id) FROM ag GROUP BY g ORDER BY g",
-        "SELECT g, array_agg(n ORDER BY id) FROM ag GROUP BY g ORDER BY g",
-        "SELECT array_agg(id) FROM ag WHERE id > 99",
-        "SELECT array_agg(g) FROM ag",
-        "SELECT array_agg(DISTINCT g) FROM ag",
-        "SELECT array_agg(g ORDER BY g) FROM ag WHERE g = 'a'",
-        "SELECT count(*), array_agg(id ORDER BY id) FROM ag",
-        "SELECT array_agg(id ORDER BY g, id DESC) FROM ag",
         "SELECT enumlabel, enumtypid, enumsortorder FROM pg_enum",
         "SELECT type.typname AS name, type.OID AS oid, n.nspname AS schema, array_agg(enum.enumlabel ORDER BY enum.enumsortorder) AS value FROM pg_enum AS enum JOIN pg_type AS type ON (type.oid = enum.enumtypid) JOIN pg_namespace n ON type.typnamespace = n.oid WHERE n.nspname = ANY (current_schemas(false)) GROUP BY type.OID, n.nspname, type.typname",
     ],

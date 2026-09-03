@@ -1,0 +1,92 @@
+# `COMMENT ON` and the two functions that read it back, as PostgreSQL 19beta1 answers them.
+#
+# `ActiveRecord` writes a table's and a column's comment into its schema dump and reads them with
+# `obj_description(c.oid, 'pg_class')` and `col_description(a.attrelid, a.attnum)` — boot
+# statements 29 and 32, and the two joins those live in are in this file verbatim.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# Captured in one session inside `BEGIN … ROLLBACK`, in this order, so the state each line sees is
+# the state the line above left. Nothing was left on the oracle.
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **A table's comment and its columns' comments are separate rows.** `COMMENT ON TABLE t IS
+#     NULL` removes the table's and leaves every column's — measured on the line after it.
+#   * **`col_description(oid, 0)` returns the TABLE's comment.** `pg_description` keys a table
+#     comment as `objsubid = 0` and the function does not special-case it. Attnum 0 is the one
+#     subscript that is neither out of range nor a column.
+#   * **`IS ''` is the same as `IS NULL`** — the row is deleted rather than an empty comment
+#     stored, so a comment that *is* the empty string cannot be observed.
+#   * **A comment is keyed by the object, not by its name**: it survives `ALTER TABLE … RENAME TO`
+#     and `RENAME COLUMN`, and it dies with `DROP COLUMN`, `DROP INDEX` and `DROP TABLE`. An index
+#     dropped and recreated under the same name has no comment: it is a different index.
+#   * **The wrong object kind is `42809`, not `42P01`**: `COMMENT ON INDEX <a table>` is
+#     `"cm" is not an index`, and the message names the kind that was asked for.
+#   * A missing relation is `42P01` and a missing column is `42703` naming both — the messages a
+#     real server raises for them anywhere else.
+CREATE TABLE cm (id int8 PRIMARY KEY, a int4, b text)		-
+CREATE INDEX cm_a_idx ON cm (a)		-
+SELECT 'r', obj_description('cm'::regclass, 'pg_class')	text,text	r|\N
+COMMENT ON TABLE cm IS 'the table comment'		-
+SELECT 'r', obj_description('cm'::regclass, 'pg_class')	text,text	r|the table comment
+SELECT 'r', obj_description('cm'::regclass)	text,text	r|the table comment
+SELECT 'r', col_description('cm'::regclass, 0)	text,text	r|the table comment
+SELECT 'r', col_description('cm'::regclass, 2)	text,text	r|\N
+COMMENT ON COLUMN cm.a IS 'the column comment'		-
+SELECT 'r', col_description('cm'::regclass, 2)	text,text	r|the column comment
+SELECT 'r', col_description('cm'::regclass, 1)	text,text	r|\N
+SELECT 'r', obj_description('cm'::regclass, 'pg_class')	text,text	r|the table comment
+COMMENT ON INDEX cm_a_idx IS 'the index comment'		-
+SELECT 'r', obj_description('cm_a_idx'::regclass, 'pg_class')	text,text	r|the index comment
+SELECT 'r', i.relname, pg_catalog.obj_description(i.oid, 'pg_class') AS comment FROM pg_class t INNER JOIN pg_index d ON t.oid = d.indrelid INNER JOIN pg_class i ON d.indexrelid = i.oid WHERE i.relkind IN ('i','I') AND d.indisprimary = 'f' AND t.relname = 'cm' ORDER BY i.relname	text,name,text	r|cm_a_idx|the index comment
+COMMENT ON TABLE cm IS 'a second comment'		-
+SELECT 'r', obj_description('cm'::regclass, 'pg_class')	text,text	r|a second comment
+COMMENT ON TABLE cm IS NULL		-
+SELECT 'r', obj_description('cm'::regclass, 'pg_class')	text,text	r|\N
+SELECT 'r', col_description('cm'::regclass, 2)	text,text	r|the column comment
+COMMENT ON TABLE cm IS 'quote '' and backslash \ inside'		-
+SELECT 'r', obj_description('cm'::regclass, 'pg_class')	text,text	r|quote ' and backslash \ inside
+COMMENT ON TABLE cm IS ''		-
+SELECT 'r', obj_description('cm'::regclass, 'pg_class')	text,text	r|\N
+COMMENT ON COLUMN cm.a IS NULL		-
+SELECT 'r', col_description('cm'::regclass, 2)	text,text	r|\N
+COMMENT ON TABLE nosuchtable IS 'x'	!42P01 relation "nosuchtable" does not exist
+COMMENT ON COLUMN cm.nosuchcolumn IS 'x'	!42703 column "nosuchcolumn" of relation "cm" does not exist
+COMMENT ON INDEX cm IS 'x'	!42809 "cm" is not an index
+COMMENT ON TABLE cm_a_idx IS 'x'	!42809 "cm_a_idx" is not a table
+COMMENT ON COLUMN cm.b IS 'b comment'		-
+SELECT 'r', col_description('cm'::regclass, 3)	text,text	r|b comment
+ALTER TABLE cm RENAME TO cm2		-
+SELECT 'r', col_description('cm2'::regclass, 3)	text,text	r|b comment
+SELECT 'r', obj_description('cm2'::regclass, 'pg_class')	text,text	r|\N
+ALTER TABLE cm2 RENAME COLUMN b TO c		-
+SELECT 'r', col_description('cm2'::regclass, 3)	text,text	r|b comment
+ALTER TABLE cm2 DROP COLUMN c		-
+SELECT 'r', col_description('cm2'::regclass, 3)	text,text	r|\N
+CREATE TABLE "Quoted" (id int8 PRIMARY KEY)		-
+COMMENT ON TABLE "Quoted" IS 'quoted table'		-
+SELECT 'r', obj_description('"Quoted"'::regclass, 'pg_class')	text,text	r|quoted table
+SELECT 'r', obj_description('cm2'::regclass, 'pg_type')	text,text	r|\N
+CREATE TABLE cm3 (id int8 PRIMARY KEY, a int4, b text)		-
+CREATE INDEX cm3_a_idx ON cm3 (a)		-
+COMMENT ON TABLE public.cm3 IS 'qualified table comment'		-
+SELECT 'r', obj_description('cm3'::regclass, 'pg_class')	text,text	r|qualified table comment
+COMMENT ON COLUMN public.cm3.a IS 'qualified column comment'		-
+SELECT 'r', col_description('cm3'::regclass, 2)	text,text	r|qualified column comment
+SELECT 'r', pg_catalog.obj_description(c.oid, 'pg_class') FROM pg_catalog.pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'cm3' AND c.relkind IN ('r','p') AND n.nspname = ANY (current_schemas(false))	text,text	r|qualified table comment
+SELECT 'r', a.attname, col_description(a.attrelid, a.attnum) FROM pg_attribute a WHERE a.attrelid = 'cm3'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum	text,name,text	r|id|\N ; r|a|qualified column comment ; r|b|\N
+COMMENT ON INDEX cm3_pkey IS 'the primary key index'		-
+SELECT 'r', obj_description('cm3_pkey'::regclass, 'pg_class')	text,text	r|the primary key index
+SELECT 'r', objoid::regclass::text, objsubid, description FROM pg_description WHERE objoid = 'cm3'::regclass ORDER BY objsubid	text,text,integer,text	r|cm3|0|qualified table comment ; r|cm3|2|qualified column comment
+COMMENT ON COLUMN cm3.id IS 'pk comment'		-
+SELECT 'r', col_description('cm3'::regclass, 1)	text,text	r|pk comment
+DROP INDEX cm3_a_idx		-
+CREATE INDEX cm3_a_idx ON cm3 (a)		-
+SELECT 'r', obj_description('cm3_a_idx'::regclass, 'pg_class')	text,text	r|\N
+COMMENT ON SEQUENCE cm3 IS 'x'	!42809 "cm3" is not a sequence
+COMMENT ON VIEW cm3 IS 'x'	!42809 "cm3" is not a view
+DROP TABLE cm3		-
+SELECT 'r', count(*) FROM pg_description WHERE description = 'qualified table comment'	text,bigint	r|0

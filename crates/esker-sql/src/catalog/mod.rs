@@ -153,6 +153,16 @@ pub struct ColumnDef {
     /// rather than a flag beside [`ColumnDef::default`] — the two are read by different columns of
     /// different views, and a writer may not supply a value for this one at all.
     pub generated: Option<String>,
+    /// `COMMENT ON COLUMN t.c IS '…'`, or `None` for a column that has none.
+    ///
+    /// **`None` and the empty string are the same thing**, which is not a shortcut: PostgreSQL
+    /// deletes the `pg_description` row for `IS ''` rather than storing an empty comment, so a
+    /// comment that *is* the empty string cannot exist there and needs no representation here.
+    ///
+    /// It lives on the column rather than in a table of its own so that it moves with the column:
+    /// a `RENAME COLUMN` keeps it and a `DROP COLUMN` takes it away, both without a line of code
+    /// (ADR 0049).
+    pub comment: Option<String>,
 }
 
 /// What kind of `UNIQUE` constraint an index belongs to, when it belongs to one.
@@ -565,6 +575,13 @@ pub struct IndexDef {
     /// like any other, and only `condeferrable` and `pg_get_constraintdef` can see it
     /// (`crate::plan::UniqueConstraint::deferrable`).
     pub constraint: Option<UniqueKind>,
+    /// `COMMENT ON INDEX i IS '…'`, or `None`. `ActiveRecord`'s schema dump reads it for every
+    /// index of every table — boot statement 32.
+    ///
+    /// On the index for the reason a column's is on the column: it dies with the index, and an
+    /// index dropped and recreated under the same name has none, which is what a real server
+    /// answers because it is a different index.
+    pub comment: Option<String>,
 }
 
 impl IndexDef {
@@ -745,6 +762,19 @@ pub struct TableDef {
     /// returns its children's rows too, and the planner has no catalog in reach to work out how.
     /// A record decoded straight from bytes therefore has none.
     pub child_scans: Vec<ChildScan>,
+    /// `COMMENT ON TABLE t IS '…'`, or `None`.
+    ///
+    /// Separate from the columns' comments, exactly as `pg_description` keeps them separate:
+    /// `COMMENT ON TABLE t IS NULL` removes this one and leaves every column's. Measured.
+    pub comment: Option<String>,
+    /// `COMMENT ON INDEX t_pkey IS '…'`, or `None`.
+    ///
+    /// Here rather than on an [`IndexDef`] because **there is no index behind a primary key** in
+    /// this node — the row key *is* the key — and yet `t_pkey` is a relation a client can name
+    /// (`RelKind::PrimaryKey`), so `COMMENT ON INDEX t_pkey` is a statement a real server accepts
+    /// and `obj_description('t_pkey'::regclass, 'pg_class')` answers. Measured; it is the one
+    /// comment that has nowhere else to live.
+    pub primary_key_comment: Option<String>,
 }
 
 /// A stored function — **defined and never executed**.
@@ -2629,6 +2659,8 @@ mod tests {
         TableDef {
             id,
             name: "accounts".into(),
+            comment: None,
+            primary_key_comment: None,
             columns: vec![
                 ColumnDef {
                     name: "id".into(),
@@ -2639,6 +2671,7 @@ mod tests {
                     default: None,
                     missing: None,
                     generated: None,
+                    comment: None,
                 },
                 ColumnDef {
                     name: "email".into(),
@@ -2649,6 +2682,7 @@ mod tests {
                     default: None,
                     missing: None,
                     generated: None,
+                    comment: None,
                 },
             ],
             primary_key: vec![0],
@@ -2663,6 +2697,7 @@ mod tests {
                 predicate: None,
                 nulls_not_distinct: false,
                 constraint: None,
+                comment: None,
             }],
             primary_key_name: "accounts_pkey".into(),
             schema_version: 1,
@@ -2701,7 +2736,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "15",               // catalog format version
+                "16",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -2794,7 +2829,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "15",       // catalog format version
+                "16",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -2852,7 +2887,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "15",                 // catalog format version
+                "16",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -2920,6 +2955,15 @@ mod tests {
                 // Version 20. No `EXCLUDE` constraints, which is every table until one parses —
                 // and until this version it could not, being a syntax error rather than a refusal.
                 "00",
+                // Version 21. Five empty comments: the table's, its primary key's, one per column
+                // and one for the index. **An empty string is "no comment"** — PostgreSQL deletes
+                // the `pg_description` row for `IS ''` rather than storing an empty one — so a
+                // table nobody has commented costs one byte per object and no flag.
+                "00", // the table's
+                "00", // `accounts_pkey`'s
+                "00", // `id`'s
+                "00", // `email`'s
+                "00", // `accounts_email_key`'s
             )
         );
         assert_eq!(record::decode_table(&encoded).unwrap(), accounts(7));
@@ -3381,6 +3425,7 @@ mod tests {
             default: None,
             missing: None,
             generated: None,
+            comment: None,
         });
         table.columns.push(ColumnDef {
             name: "c".into(),
@@ -3391,6 +3436,7 @@ mod tests {
             default: None,
             missing: None,
             generated: None,
+            comment: None,
         });
         table.columns.push(ColumnDef {
             name: "t".into(),
@@ -3401,6 +3447,7 @@ mod tests {
             default: None,
             missing: None,
             generated: None,
+            comment: None,
         });
         let back = record::decode_table(&record::encode_table(&table).unwrap()).unwrap();
         assert_eq!(back, table);
@@ -3631,6 +3678,7 @@ mod tests {
             predicate: None,
             nulls_not_distinct: false,
             constraint: None,
+            comment: None,
         });
         replace_table(&mut *adding, 1, &accounts(1), &with_more).unwrap();
         adding.commit().unwrap();
@@ -3691,6 +3739,7 @@ mod tests {
             predicate: None,
             nulls_not_distinct: false,
             constraint: None,
+            comment: None,
         });
         let error = replace_table(&mut *ddl, 1, &table, &clash).unwrap_err();
         assert_eq!(error.sqlstate(), sqlstate::DUPLICATE_TABLE);
@@ -3834,6 +3883,7 @@ mod tests {
             default: Some(Datum::Int8(42)),
             missing: Some(Datum::Int8(42)),
             generated: None,
+            comment: None,
         });
         let (_, published) =
             record::decode_columnar(&record::encode_columnar(1, Some(&widened)).unwrap()).unwrap();
@@ -3880,7 +3930,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "15",               // catalog format version
+                "16",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

@@ -1577,13 +1577,30 @@ fn catalog_function(
             env.relations()?,
             oid_argument(args.first())?,
         ),
-        // **NULL for every input, and that is the answer rather than a stub.** A comment is a row
-        // in `pg_description`, `COMMENT ON` is `0A000` naming itself, and a partitioned table is
-        // `PARTITION BY`, which is too — so this node has nothing for any of the three to find,
-        // and NULL is exactly what a real server answers when it has nothing either. The
-        // arguments are still evaluated, because an error inside one is the user's error: it is
-        // the *result* that is empty here, not the call.
-        CatalogFunc::ColDescription | CatalogFunc::ObjDescription => Datum::Null,
+        // **Nothing found is NULL and never an error** — an uncommented object, an attnum out of
+        // range, a negative one, an oid that names nothing, an unknown catalog name and a NULL
+        // argument are all NULL on a real server. There is no not-found error anywhere in this
+        // surface, which is what makes a `LEFT JOIN` over it work.
+        CatalogFunc::ObjDescription => match oid_argument(args.first())? {
+            None => Datum::Null,
+            Some(oid) => match env.relations()?.comment_of(oid) {
+                Some(comment) => Datum::Text(comment.to_owned()),
+                None => Datum::Null,
+            },
+        },
+        // **The attnum is an `int2` when it comes from `pg_attribute`**, which is the shape the
+        // schema dump writes: `col_description(a.attrelid, a.attnum)`. Reading only the wider
+        // integers answered NULL for every column of a real join while a hand-written
+        // `col_description(oid, 2)` worked — the same function, two widths, one of them wrong.
+        CatalogFunc::ColDescription => {
+            match (oid_argument(args.first())?, oid_argument(args.get(1))?) {
+                (Some(oid), Some(attnum)) => match env.relations()?.column_comment(oid, attnum) {
+                    Some(comment) => Datum::Text(comment.to_owned()),
+                    None => Datum::Null,
+                },
+                _ => Datum::Null,
+            }
+        }
         CatalogFunc::DateRange | CatalogFunc::IsEmpty | CatalogFunc::RangeOverlaps => {
             range_function(call.func, &args)?
         }

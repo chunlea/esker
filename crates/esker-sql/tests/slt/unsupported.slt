@@ -59,8 +59,19 @@ CREATE TABLE copy AS SELECT * FROM t
 # Tier 1 is complete since the typmod unit and `numeric` since the numeric one, so the three
 # lines that stood here are gone. No column type in ADR 0033's first two tiers is refused now.
 
-statement error (0A000)
+# **`public.` is no longer a refusal.** `public` is this node's only schema — it is what
+# `current_schema()` answers — so a qualifier naming it names the same relation the bare name does,
+# and `relation_name` drops it exactly as it already dropped `pg_catalog.`. A qualifier naming any
+# *other* schema is still `0A000`: `s.t` and `t` would be different tables on a real server, and
+# answering about the second would be a wrong answer rather than a missing feature.
+statement ok
 CREATE TABLE public.q (id int8 PRIMARY KEY)
+
+statement ok
+DROP TABLE public.q
+
+statement error (0A000)
+CREATE TABLE other_schema.q (id int8 PRIMARY KEY)
 
 
 # `ALTER TABLE ADD COLUMN` runs for a nullable column and for one with a **constant** default

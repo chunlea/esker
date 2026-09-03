@@ -258,6 +258,12 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
             )?;
             Ok(plan::Statement::Explain(Box::new(inner), *analyze))
         }
+        Statement::Comment {
+            object_type,
+            object_name,
+            comment,
+            if_exists,
+        } => lower_comment(*object_type, object_name, comment.as_deref(), *if_exists),
         Statement::Set(set) => lower_set(set),
         Statement::ShowVariable { variable } => lower_show(variable),
         Statement::Reset(reset) => lower_reset(reset),
@@ -2289,6 +2295,17 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             // `d` with `indkey` and then the subscript after it, where `('{a,b}')[1]` is the array
             // with only the subscript. Both are one element of one array; a longer chain is a
             // field access this node does not have.
+            // **A function call cannot be subscripted directly**, and that is PostgreSQL's
+            // grammar rather than a limitation here: `array_agg(i)[1]` is
+            // `42601 syntax error at or near "["` on a real server and `(array_agg(i))[1]` is the
+            // spelling that works. `sqlparser` accepts both, so the parenthesised one is told
+            // apart by the `Nested` it keeps — without this, this node answered a value where a
+            // real server refuses the statement.
+            if let [AccessExpr::Subscript(_)] = access_chain.as_slice()
+                && matches!(root.as_ref(), Expr::Function(_))
+            {
+                return Err(SqlError::SyntaxAtOrNear("[".to_owned()));
+            }
             let (operand, subscript) = match access_chain.as_slice() {
                 [AccessExpr::Subscript(subscript)] => (lower_expr(root)?, subscript),
                 [
@@ -5254,6 +5271,13 @@ fn relation_name(name: &ObjectName) -> Result<String> {
         if schema.eq_ignore_ascii_case("pg_catalog") {
             return Ok(fold_identifier(relation, false).0);
         }
+        // **`public` is this node's only schema**, which is what `current_schema()` answers two
+        // screens up — so `public.t` and `t` are the same relation and the qualifier is dropped
+        // rather than refused. A qualifier naming any *other* schema still is: `s.t` and `t` would
+        // be different tables on a real server and answering about the second would be wrong.
+        if schema.eq_ignore_ascii_case(PUBLIC_SCHEMA) {
+            return Ok(fold_identifier(relation, false).0);
+        }
         if schema.eq_ignore_ascii_case("information_schema") {
             return Ok(format!(
                 "information_schema.{}",
@@ -5262,6 +5286,58 @@ fn relation_name(name: &ObjectName) -> Result<String> {
         }
     }
     object_name(name)
+}
+
+/// `COMMENT ON TABLE | COLUMN | INDEX <name> IS '…' | NULL`.
+///
+/// **The three kinds this node has, and no others.** PostgreSQL takes a comment on a schema, a
+/// type, a role and eleven more; each of those is an object this node does not have, so a comment
+/// on one has nowhere to live and is `0A000` naming the kind rather than a write that goes
+/// nowhere.
+///
+/// `IF EXISTS` is not PostgreSQL's — it is Snowflake's, which `sqlparser` parses for every
+/// dialect — so it is refused rather than honoured: accepting a spelling a real server rejects
+/// would make this node's grammar wider than the one it is copying.
+fn lower_comment(
+    object_type: sqlparser::ast::CommentObject,
+    name: &ObjectName,
+    comment: Option<&str>,
+    if_exists: bool,
+) -> Result<plan::Statement> {
+    use sqlparser::ast::CommentObject as Object;
+    refuse_if(if_exists, "COMMENT ON ... IF EXISTS")?;
+    let object = match object_type {
+        Object::Table => plan::CommentObject::Table,
+        Object::Column => plan::CommentObject::Column,
+        Object::Index => plan::CommentObject::Index,
+        // Taken so that the *kind* can be reported: a real server resolves the name first, so
+        // `COMMENT ON SEQUENCE <a table>` is `42809` there and not a refusal of the statement.
+        Object::Sequence => plan::CommentObject::Sequence,
+        Object::View => plan::CommentObject::View,
+        other => return Err(SqlError::unsupported(format!("COMMENT ON {other}"))),
+    };
+    // A column's name is the table's plus one more part, so the last part is split off before the
+    // rest is read as a relation name — which is what lets `public.t.a` work wherever `public.t`
+    // does, and keeps one place deciding what a schema qualifier means.
+    let (name, column) = if object == plan::CommentObject::Column {
+        let mut parts = name.0.clone();
+        let last = parts.pop().ok_or_else(|| {
+            SqlError::unsupported("COMMENT ON COLUMN without a column".to_owned())
+        })?;
+        let column = last
+            .as_ident()
+            .map(ident)
+            .ok_or_else(|| SqlError::unsupported(format!("the name {name}")))?;
+        (relation_name(&ObjectName(parts))?, Some(column))
+    } else {
+        (relation_name(name)?, None)
+    };
+    Ok(plan::Statement::Comment(plan::Comment {
+        object,
+        name,
+        column,
+        comment: comment.map(str::to_owned),
+    }))
 }
 
 /// A name, folded and truncated the way PostgreSQL stores it. Schema qualification is refused

@@ -205,6 +205,46 @@ impl Relations {
         self.rows.iter().find(|row| row.oid == oid)
     }
 
+    /// `obj_description(oid, …)`: the comment on the relation an oid names.
+    ///
+    /// **The catalog-name argument is not consulted**, because it filters `pg_description.classoid`
+    /// on a real server and every relation here is in `pg_class` — so `'pg_class'` matches and
+    /// anything else matches nothing, which the caller decides. NULL for an oid that names nothing
+    /// is the caller's answer too: there is no not-found error anywhere in this surface.
+    #[must_use]
+    pub fn comment_of(&self, oid: i64) -> Option<&str> {
+        let row = self.by_oid(oid)?;
+        let table = self.table(row)?;
+        match row.kind {
+            RelKind::Table => table.comment.as_deref(),
+            RelKind::PrimaryKey => table.primary_key_comment.as_deref(),
+            RelKind::Index => table.indexes.get(row.index_at?)?.comment.as_deref(),
+            // An `EXCLUDE` constraint's index is synthesised from the constraint and has no record
+            // to keep a comment in; a sequence's record has no field for one either.
+            RelKind::Exclusion | RelKind::Sequence => None,
+        }
+    }
+
+    /// `col_description(oid, attnum)`: the comment on one column.
+    ///
+    /// **Attnum 0 is the table's own comment**, which is not a special case anywhere but here:
+    /// `pg_description` keys a table comment as `objsubid = 0` and a real server's
+    /// `col_description` does not filter it out. Measured. Everything else out of range — a
+    /// negative attnum, one past the last column, an oid that is not a table — is NULL.
+    #[must_use]
+    pub fn column_comment(&self, oid: i64, attnum: i64) -> Option<&str> {
+        let row = self.by_oid(oid)?;
+        let table = self.table(row)?;
+        if !matches!(row.kind, RelKind::Table) {
+            return None;
+        }
+        if attnum == 0 {
+            return table.comment.as_deref();
+        }
+        let at = usize::try_from(attnum - 1).ok()?;
+        table.columns.get(at)?.comment.as_deref()
+    }
+
     /// The relation a name names, if this tenant has one.
     #[must_use]
     pub fn by_name(&self, name: &str) -> Option<&RelationRow> {

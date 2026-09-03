@@ -44,6 +44,10 @@ use crate::plan::{
 };
 use crate::value::{ColumnType, Datum, PgDatum as _, PgType as _};
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one block per clause of CREATE TABLE; splitting it would hide the vocabulary"
+)]
 pub(super) fn create_table(
     executor: &mut Executor,
     txn: &mut dyn Txn,
@@ -98,6 +102,7 @@ pub(super) fn create_table(
             default: None,
             missing: None,
             generated: None,
+            comment: None,
         });
         with_row_id.extend(columns);
         (with_row_id, vec![0], String::new())
@@ -148,6 +153,8 @@ pub(super) fn create_table(
         // A table starts at schema version 1; `ALTER TABLE ADD COLUMN` moves it.
         schema_version: 1,
         sequences,
+        comment: None,
+        primary_key_comment: None,
     };
 
     validate_checks(&table)?;
@@ -218,6 +225,7 @@ fn declared_columns(create: &CreateTable) -> Result<Vec<ColumnDef>> {
             // for — and writing one would be a claim about rows that cannot exist.
             missing: None,
             generated: column.generated.clone(),
+            comment: None,
         });
     }
     Ok(columns)
@@ -375,6 +383,7 @@ fn unique_indexes(
             state_since: 1,
             include: Vec::new(),
             predicate: None,
+            comment: None,
         });
     }
     Ok(indexes)
@@ -676,6 +685,7 @@ fn copy_parent_indexes(
                 constraint: None,
                 state: catalog::SchemaState::Public,
                 state_since: 1,
+                comment: None,
             });
         }
     }
@@ -1805,6 +1815,7 @@ pub(super) fn create_index(
             catalog::SchemaState::Public
         },
         state_since: table.schema_version,
+        comment: None,
     };
 
     if create.concurrently {
@@ -2324,6 +2335,7 @@ pub(super) fn alter_table(
             // first time somebody changed a default.
             missing: column.default.clone(),
             generated: None,
+            comment: None,
         });
         changed = true;
     }
