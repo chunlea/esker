@@ -725,10 +725,12 @@ pub struct AlterTable {
 
 /// One action of an `ALTER TABLE`.
 ///
-/// Only `ADD COLUMN` is here. Every other action parses and comes back `0A000` naming itself
-/// (contract C2) — `DROP COLUMN` and a type change because the row format carries a column
-/// *count* and not column identity ([ADR 0019](../../../docs/adr/0019-a-row-says-how-many-columns-it-has.md)),
-/// and the rest because nothing below this crate implements them yet.
+/// `ADD COLUMN` and `DROP COLUMN` are here. Every other action parses and comes back `0A000`
+/// naming itself (contract C2), a type change included: the row format carries a column *count*
+/// and not column identity ([ADR 0019](../../../docs/adr/0019-a-row-says-how-many-columns-it-has.md)),
+/// so a column cannot change width under rows already written. `DROP COLUMN` used to be refused
+/// for that same reason and no longer is — it does not need identity, because the slot never moves
+/// ([ADR 0051](../../../docs/adr/0051-a-dropped-column-keeps-its-slot.md)).
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlterTableAction {
     /// `ADD [COLUMN] [IF NOT EXISTS] <column> <type>`, nullable and with no default — the only
@@ -738,6 +740,25 @@ pub enum AlterTableAction {
         column: Column,
         /// `IF NOT EXISTS`: a column that is already there is a notice rather than a `42701`.
         if_not_exists: bool,
+    },
+    /// `DROP [COLUMN] [IF EXISTS] <name> [CASCADE|RESTRICT]`.
+    ///
+    /// The column is **tombstoned, not removed** (ADR 0051): a row is decoded by position, so
+    /// taking the slot out would turn every row written before this statement into a decode
+    /// error. What the executor changes is `ColumnDef::dropped` and the objects that depended on
+    /// the column; the rows are not read and not written.
+    DropColumn {
+        /// The column, folded.
+        column: String,
+        /// `IF EXISTS`: a column that is not there is a notice rather than a `42703`.
+        if_exists: bool,
+        /// `CASCADE`: also drop the objects **outside this table** that depend on the column.
+        ///
+        /// It does not govern the ones on the table itself — an index over the column, its
+        /// `CHECK`, its `NOT NULL`, its default and a foreign key declared on it go either way,
+        /// measured. What `CASCADE` buys is a view over the column, or another table's foreign key
+        /// referencing it; without it those are `2BP01`.
+        cascade: bool,
     },
     /// `ALTER COLUMN c SET DEFAULT <expr>` and `ALTER COLUMN c DROP DEFAULT`.
     SetDefault {

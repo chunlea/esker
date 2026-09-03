@@ -103,9 +103,6 @@ statement error (0A000)
 ALTER TABLE t ADD COLUMN c int8 PRIMARY KEY
 
 statement error (0A000)
-ALTER TABLE t DROP COLUMN a
-
-statement error (0A000)
 ALTER TABLE t RENAME COLUMN a TO b
 
 statement error (0A000)

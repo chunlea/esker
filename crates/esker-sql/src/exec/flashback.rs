@@ -262,5 +262,8 @@ fn remove(
     value: &[u8],
 ) -> Result<()> {
     let row = crate::row::decode_row(schema, value)?;
-    crate::exec::dml::remove_row(executor, txn, table, &row)
+    // The keys it removed are of no interest here: a flashback is a rewrite of the whole table
+    // rather than a statement whose failed commit has to be explained per key.
+    crate::exec::dml::remove_row(executor, txn, table, &row)?;
+    Ok(())
 }

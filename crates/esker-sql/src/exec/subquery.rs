@@ -215,6 +215,7 @@ pub(super) fn table_function_def(
             missing: None,
             generated: None,
             comment: None,
+            dropped: false,
             user_type: None,
         }],
         primary_key: Vec::new(),
@@ -330,6 +331,7 @@ fn plan_derived(
             missing: None,
             generated: None,
             comment: None,
+            dropped: false,
             user_type: None,
         })
         .collect();

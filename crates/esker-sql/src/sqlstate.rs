@@ -131,6 +131,13 @@ pub const READ_ONLY_SQL_TRANSACTION: &str = "25006";
 /// Any statement after an error inside a transaction block, until `ROLLBACK`. Half of contract
 /// C2's state-machine promise lives on this code.
 pub const IN_FAILED_SQL_TRANSACTION: &str = "25P02";
+/// A session that sat idle inside a transaction block for longer than
+/// `idle_in_transaction_session_timeout`, and is being **terminated** for it.
+///
+/// The one condition in this module whose severity is `FATAL` rather than `ERROR`: it does not
+/// fail a statement, it ends the connection, and a client that treats it as a statement error
+/// waits for a server that has gone (`crate::pgwire::server::Connection::run`).
+pub const IDLE_IN_TRANSACTION_SESSION_TIMEOUT: &str = "25P03";
 
 // --- Class 26 — Invalid SQL Statement Name ---
 
@@ -335,6 +342,10 @@ mod tests {
         (
             "IN_FAILED_SQL_TRANSACTION",
             super::IN_FAILED_SQL_TRANSACTION,
+        ),
+        (
+            "IDLE_IN_TRANSACTION_SESSION_TIMEOUT",
+            super::IDLE_IN_TRANSACTION_SESSION_TIMEOUT,
         ),
         (
             "INVALID_SQL_STATEMENT_NAME",

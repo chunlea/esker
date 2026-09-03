@@ -96,7 +96,10 @@ fn set_column_comment(
     let column = table
         .columns
         .iter_mut()
-        .find(|column| column.name == name)
+        // A tombstoned column is not one a user can comment on: `DROP COLUMN` keeps the slot and
+        // the stored name, and `COMMENT ON COLUMN t.gone` must be the `42703` every other clause
+        // gives (ADR 0051).
+        .find(|column| column.name == name && !column.dropped)
         .ok_or_else(|| SqlError::UndefinedColumnInRelation {
             column: name.to_owned(),
             relation: statement.name.clone(),

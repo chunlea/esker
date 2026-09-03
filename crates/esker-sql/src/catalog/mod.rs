@@ -163,6 +163,21 @@ pub struct ColumnDef {
     /// a `RENAME COLUMN` keeps it and a `DROP COLUMN` takes it away, both without a line of code
     /// (ADR 0049).
     pub comment: Option<String>,
+    /// `ALTER TABLE ... DROP COLUMN` **tombstoned this column rather than removing it**
+    /// ([ADR 0051](../../../docs/adr/0051-a-dropped-column-keeps-its-slot.md)).
+    ///
+    /// The column keeps its place in [`TableDef::columns`] for the life of the table, because a row
+    /// is decoded by *position*: taking the entry out would shift every column after it and turn
+    /// every row written before the `ALTER` into a decode error. So the slot stays, the row bytes
+    /// are never touched, and what changes is who can see it.
+    ///
+    /// **Read [`TableDef::live_columns`] rather than iterating `columns` directly.** Everything a
+    /// user can reach — name resolution, `SELECT *`, `RowDescription`, an `INSERT` with no column
+    /// list, `information_schema` — is over live columns; the raw list is for building a
+    /// [`esker_keys::row::RowSchema`] and for `pg_attribute`, which is the one catalog view that
+    /// must show the tombstone (`ActiveRecord`'s own `column_definitions` filters on
+    /// `NOT attisdropped`, so the row has to be there to be filtered).
+    pub dropped: bool,
     /// The oid of the **user-defined type** this column was declared as, or `None` for a column
     /// declared as one of this node's own types.
     ///
@@ -719,6 +734,7 @@ pub fn sequence_relation_def(name: &str, sequence_id: u64) -> Arc<TableDef> {
         generated: None,
         comment: None,
         user_type: None,
+        dropped: false,
     };
     Arc::new(TableDef {
         id: SEQUENCE_RELATION_ID_BASE.wrapping_add(sequence_id),
@@ -1490,6 +1506,46 @@ impl ColumnDef {
 }
 
 impl TableDef {
+    /// The columns a user can see, with their ordinals — everything except what `DROP COLUMN`
+    /// tombstoned (ADR 0051).
+    ///
+    /// **The ordinal comes with the column** because it is the column's identity everywhere else:
+    /// it is the position the row codec decodes at, the `attnum` `pg_attribute` reports, and the
+    /// `ordinal_position` `information_schema` reports — and after a drop those are no longer the
+    /// index in this iterator. A caller that enumerated the result instead would renumber the
+    /// columns after the gap, which is the divergence the capture pins with `1, 2, 4`.
+    pub fn live_columns(&self) -> impl Iterator<Item = (usize, &ColumnDef)> + Clone {
+        self.columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| !column.dropped)
+    }
+
+    /// Every column below the row id **including the ones `DROP COLUMN` tombstoned**, with their
+    /// ordinals.
+    ///
+    /// The one caller is `pg_attribute`, and it is the one view that must show a tombstone: a real
+    /// server keeps the row with `attisdropped` set, and `ActiveRecord`'s `column_definitions`
+    /// filters `AND NOT a.attisdropped` — so the row has to be there for that query to be the one
+    /// PostgreSQL answers. Everything else wants [`TableDef::user_columns`] (ADR 0051).
+    pub fn all_user_columns(&self) -> impl Iterator<Item = (usize, &ColumnDef)> {
+        let skip = usize::from(self.row_id().is_some());
+        self.columns.iter().enumerate().skip(skip)
+    }
+
+    /// How many columns a user can see. Not `columns.len()`, once anything has been dropped.
+    #[must_use]
+    pub fn live_column_count(&self) -> usize {
+        self.columns.iter().filter(|column| !column.dropped).count()
+    }
+
+    /// The ordinal of a live column of that name, or `None` — **a dropped column is not found**,
+    /// which is what makes `SELECT gone` the `42703` PostgreSQL answers.
+    #[must_use]
+    pub fn live_column(&self, name: &str) -> Option<(usize, &ColumnDef)> {
+        self.live_columns().find(|(_, column)| column.name == name)
+    }
+
     /// The sequence that fills column `at`, if one does.
     #[must_use]
     pub fn sequence_for(&self, at: usize) -> Option<&SequenceDef> {
@@ -1501,13 +1557,19 @@ impl TableDef {
     /// The position of a column by name, or `None`.
     ///
     /// A user's name never finds the internal row id, because that column's name is one no
-    /// statement can contain ([`INTERNAL_ROW_ID_NAME`]).
+    /// statement can contain ([`INTERNAL_ROW_ID_NAME`]), and it never finds a column `DROP COLUMN`
+    /// tombstoned — which is the one edit that makes `SELECT gone` the `42703` PostgreSQL answers,
+    /// and makes it so for every clause at once rather than for the ones somebody remembered
+    /// (ADR 0051). A tombstone's *stored* name is unchanged here; the mangled
+    /// `........pg.dropped.N........` spelling is `pg_attribute`'s, and is rendered there.
     #[must_use]
     pub fn column(&self, name: &str) -> Option<usize> {
         if name.is_empty() {
             return None;
         }
-        self.columns.iter().position(|column| column.name == name)
+        self.columns
+            .iter()
+            .position(|column| column.name == name && !column.dropped)
     }
 
     /// The position of the internal row id, or `None` for a table whose user declared a primary
@@ -1549,7 +1611,14 @@ impl TableDef {
     /// the whole of what makes the row id *hidden* rather than merely unnamed.
     pub fn user_columns(&self) -> impl Iterator<Item = (usize, &ColumnDef)> {
         let skip = usize::from(self.row_id().is_some());
-        self.columns.iter().enumerate().skip(skip)
+        // **And nothing `DROP COLUMN` tombstoned.** This is the `SELECT *` half of ADR 0051, and
+        // it is here rather than at each call site because "the columns a user can see" is what
+        // this method already meant — a dropped column simply stopped being one.
+        self.columns
+            .iter()
+            .enumerate()
+            .skip(skip)
+            .filter(|(_, column)| !column.dropped)
     }
 
     /// Every column's type, in encoding order — what [`crate::row`] needs.
@@ -3248,6 +3317,7 @@ mod tests {
                     missing: None,
                     generated: None,
                     comment: None,
+                    dropped: false,
                     user_type: None,
                 },
                 ColumnDef {
@@ -3260,6 +3330,7 @@ mod tests {
                     missing: None,
                     generated: None,
                     comment: None,
+                    dropped: false,
                     user_type: None,
                 },
             ],
@@ -3315,7 +3386,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "18",               // catalog format version
+                "19",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -3408,7 +3479,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "18",       // catalog format version
+                "19",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -3490,7 +3561,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "18",                 // catalog format version
+                "19",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -3570,7 +3641,11 @@ mod tests {
                 // Version 23. Permanent: this table was not created `UNLOGGED`. One byte for the
                 // whole table, because every relation it owns reads its persistence from here.
                 "00",
-                // Version 24. One varint per column: the oid of the user-defined type it was
+                // Version 24. No tombstoned columns, which is every table until `DROP COLUMN` runs
+                // (ADR 0051). A **count** of ordinals rather than a byte per column, so a table
+                // that never dropped one pays a single zero however wide it is.
+                "00",
+                // Version 25. One varint per column: the oid of the user-defined type it was
                 // declared as, and **0 for none**. An oid comes from the tenant's relation-id
                 // sequence, which starts above zero, so zero is free to mean "one of this node's
                 // own types" without a flag byte in front of it (ADR 0050).
@@ -4038,6 +4113,7 @@ mod tests {
             missing: None,
             generated: None,
             comment: None,
+            dropped: false,
             user_type: None,
         });
         table.columns.push(ColumnDef {
@@ -4050,6 +4126,7 @@ mod tests {
             missing: None,
             generated: None,
             comment: None,
+            dropped: false,
             user_type: None,
         });
         table.columns.push(ColumnDef {
@@ -4062,6 +4139,7 @@ mod tests {
             missing: None,
             generated: None,
             comment: None,
+            dropped: false,
             user_type: None,
         });
         let back = record::decode_table(&record::encode_table(&table).unwrap()).unwrap();
@@ -4666,6 +4744,7 @@ mod tests {
             missing: Some(Datum::Int8(42)),
             generated: None,
             comment: None,
+            dropped: false,
             user_type: None,
         });
         let (_, published) =
@@ -4713,7 +4792,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "18",               // catalog format version
+                "19",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

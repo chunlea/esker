@@ -1973,7 +1973,12 @@ fn duplicated(table: &TableDef, name: &str) -> bool {
     table
         .columns
         .iter()
-        .filter(|column| column.name == name)
+        // **A tombstone is not one of the two.** `DROP COLUMN gone` keeps the column's slot and its
+        // stored name, so a later `ADD COLUMN gone` puts a second `gone` in this list — and
+        // counting it here made a re-added column `42702` on a real server's ordinary sequence of
+        // migrations (ADR 0051). `TableDef::column` already skips it; this is the second place
+        // that reads the raw list by name, and the one the compiler cannot point at.
+        .filter(|column| column.name == name && !column.dropped)
         .nth(1)
         .is_some()
 }

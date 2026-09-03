@@ -102,7 +102,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 24;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 25;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -1565,10 +1565,29 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         Persistence::Unlogged => 1,
     });
 
-    // Version 24. One varint per column: the oid of the user-defined type it was declared as, and
+    // Version 24. The tombstoned columns, by ordinal, on the end for the twelfth time and the same
+    // reason (ADR 0051). **Ordinals rather than a byte per column**, because a table with no
+    // dropped column — every table written before this version, and most tables after it — writes
+    // one varint zero rather than one byte per column it has.
+    let dropped: Vec<u64> = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.dropped)
+        .map(|(ordinal, _)| ordinal as u64)
+        .collect();
+    varint::put_u64(dropped.len() as u64, &mut out);
+    for ordinal in dropped {
+        varint::put_u64(ordinal, &mut out);
+    }
+
+    // Version 25. One varint per column: the oid of the user-defined type it was declared as, and
     // **0 for none** — an oid comes from the tenant's relation-id sequence, which starts above
     // zero, so no present-or-absent byte is needed and the section costs one byte for a column
-    // that has no user type. Twelfth section, appended like every one before it (ADR 0050).
+    // that has no user type. Thirteenth section, appended like every one before it (ADR 0050).
+    // **It was written as 24 and renumbered**: `ALTER TABLE … DROP COLUMN` took that number on
+    // `main` while this was in review, which is the rule about claiming a version at HEAD in the
+    // commit that uses it rather than reserving one in advance.
     for column in &table.columns {
         varint::put_u64(column.user_type.unwrap_or(0), &mut out);
     }
@@ -1576,14 +1595,15 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// The version 24 tail: each column's user-defined type oid, or 0 for a column declared as one of
+/// The version 25 tail: each column's user-defined type oid, or 0 for a column declared as one of
 /// this node's own types.
 ///
-/// A column written before 24 has none, which is what every column had while a user type could not
+/// A column written before 25 has none, which is what every column had while a user type could not
 /// be a column's type at all — `CREATE TABLE t (c mood)` was `0A000 the type mood is not
-/// supported` until ADR 0050's first unit.
+/// supported` until ADR 0050's first unit. Read **after** version 24's dropped ordinals, because
+/// the sections come off in the order they went on.
 fn read_user_types(reader: &mut Reader<'_>, columns: &mut [ColumnDef]) -> Result<()> {
-    if reader.version < 24 {
+    if reader.version < 25 {
         return Ok(());
     }
     for column in columns {
@@ -1608,6 +1628,29 @@ fn read_persistence(reader: &mut Reader<'_>) -> Result<Persistence> {
         1 => Ok(Persistence::Unlogged),
         other => Err(corrupt(format!("relpersistence byte {other}"))),
     }
+}
+
+/// The version 24 section: which columns are tombstoned by `DROP COLUMN` (ADR 0051).
+///
+/// A record written before 24 has none, which is right: `DROP COLUMN` was `0A000` for the whole of
+/// that history, so no table written by such a node can have a dropped column. The ordinals are
+/// checked against the column count rather than trusted — a record naming a column that is not
+/// there is corruption, and reading it as "no dropped columns" would silently un-drop one.
+fn read_dropped(reader: &mut Reader<'_>, columns: &mut [ColumnDef]) -> Result<()> {
+    if reader.version < 24 {
+        return Ok(());
+    }
+    let count = reader.varint()?;
+    for _ in 0..count {
+        let ordinal = usize::try_from(reader.varint()?)
+            .map_err(|_| corrupt("a dropped column ordinal larger than this machine can index"))?;
+        let width = columns.len();
+        let column = columns
+            .get_mut(ordinal)
+            .ok_or_else(|| corrupt(format!("dropped column {ordinal} in a table of {width}")))?;
+        column.dropped = true;
+    }
+    Ok(())
 }
 
 /// Version 21: the table's comment, the primary key's, then one per column and one per index.
@@ -2042,6 +2085,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
             // Filled from the version 13 section below, after every column has been read.
             generated: None,
             comment: None,
+            dropped: false,
             user_type: None,
         });
     }
@@ -2129,6 +2173,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
     let excludes = read_excludes(&mut reader)?;
     let (comment, primary_key_comment) = read_comments(&mut reader, &mut columns, &mut indexes)?;
     let persistence = read_persistence(&mut reader)?;
+    read_dropped(&mut reader, &mut columns)?;
     read_user_types(&mut reader, &mut columns)?;
     reader.finish()?;
 

@@ -161,17 +161,24 @@ pub(super) fn render_values(values: &[Datum]) -> String {
         .join(", ")
 }
 
-/// Removes this row's entry from every index that holds one and is being maintained.
+/// Removes this row's entry from every index that holds one and is being maintained, and answers
+/// the keys it deleted.
 ///
 /// The state check is the caller's above; here it is one state — `maintained` — because every
 /// caller that removes checks the same one.
+///
+/// **The keys are returned because a key this row already owned cannot be a duplicate.** A
+/// `rewrite_row` removes them and puts them straight back, so a lost race on one of them is an
+/// ordinary row-level conflict rather than a `23505` — and only the remover knows which keys those
+/// were (`crate::exec::Written::rewritten`).
 pub(super) fn remove_entries(
     tenant: u64,
     txn: &mut dyn Txn,
     table: &TableDef,
     row: &[Datum],
     primary_key: &[Datum],
-) -> Result<()> {
+) -> Result<Vec<Vec<u8>>> {
+    let mut removed = Vec::new();
     for index in &table.indexes {
         // **Delete-only removes, and that is one state earlier than write-only inserts.** The
         // asymmetry is the whole reason there are four states rather than three: every node has
@@ -190,7 +197,8 @@ pub(super) fn remove_entries(
         }
         if let Some(entry) = entry(tenant, table, index, row, primary_key)? {
             txn.delete(&entry.key);
+            removed.push(entry.key);
         }
     }
-    Ok(())
+    Ok(removed)
 }

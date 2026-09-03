@@ -734,6 +734,7 @@ impl CatalogView {
                                 missing: None,
                                 generated: None,
                                 comment: None,
+                                dropped: false,
                                 user_type: None,
                             })
                             .collect(),

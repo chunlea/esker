@@ -36,8 +36,28 @@
 #   * **The value comes back normalised, not as it was sent.** `SET search_path TO '$user',public`
 #     reads back from `SHOW search_path` as **`"$user", public`** — requoted and with a space after
 #     the comma. An implementation that echoes the input fails the tests that compare the read-back.
-#   * **`idle_in_transaction_session_timeout` keeps its unit in the value**: `SHOW` gives `10ms`,
+#   * **`idle_in_transaction_session_timeout` keeps a unit in the value**: `SHOW` gives `10ms`,
 #     and `pg_settings.unit` is `ms` separately. Setting it to `0` reads back as `0`, not `0ms`.
+#   * **But the unit it keeps is not the one it was given.** A duration is converted to the
+#     parameter's base unit and re-printed in the largest unit that divides it exactly, which is
+#     three separate surprises: a bare `250` reads back **`250ms`** (the unit is *added*),
+#     `'2000ms'` reads back **`2s`** and `'120s'` reads back **`2min`** (the unit is *promoted*),
+#     and `'1500us'` reads back **`2ms`** (the unit is *converted away* — `us` is smaller than the
+#     base and never comes back). A node that echoed the unit it was given passes the `'10ms'`
+#     line, which is a fixed point of all three rules, and fails every other one.
+#   * **The conversion rounds half to *even*, and can round to `0`.** `'1500us'` and `'2500us'`
+#     are both `2ms`; `'3500us'` is `4ms`. `'500us'` is **`0`** — which is the spelling of *off*,
+#     so the shortest timeouts a client can ask for turn the feature off rather than on. That is
+#     `rint`, PostgreSQL's own conversion, and rounding ties up instead would diverge on half the
+#     inputs.
+#   * **A fraction is legal**: `'1.5s'` is `1500ms`. The count is `strtod`'s, not an integer's.
+#   * **Three refusals, not one, and two of them share a sentence.** A value it cannot read is
+#     `invalid value for parameter "x": "banana"`; a value whose base-unit magnitude will not fit a
+#     C `int` is the *same sentence* plus `HINT: Value exceeds integer range.` (`'2147483648'`,
+#     `'25d'`); and a value that fits and is out of range names the range and reports itself **in
+#     the base unit** — `SET statement_timeout = '-5s'` is `-5000 ms is outside the valid range for
+#     parameter "statement_timeout" (0 ms .. 2147483647 ms)`. All three are `22023`. The range is
+#     0 .. INT_MAX base units, so `'24d'` is accepted and `'25d'` is not.
 #   * **An unknown parameter is `42704` from all three of `SET`, `SHOW` and `current_setting()`** —
 #     the same SQLSTATE and the same sentence, `unrecognized configuration parameter "…"`. But
 #     **`current_setting('…', true)` returns NULL instead of raising**: the two-argument form is the
@@ -61,6 +81,25 @@ SHOW idle_in_transaction_session_timeout	text	0
 set idle_in_transaction_session_timeout = '10ms'		-
 SHOW idle_in_transaction_session_timeout	text	10ms
 SELECT 'r', current_setting('idle_in_transaction_session_timeout')	text,text	r|10ms
+set idle_in_transaction_session_timeout = 0		-
+SHOW idle_in_transaction_session_timeout	text	0
+set idle_in_transaction_session_timeout = '250'		-
+SHOW idle_in_transaction_session_timeout	text	250ms
+set idle_in_transaction_session_timeout = '2000ms'		-
+SHOW idle_in_transaction_session_timeout	text	2s
+set idle_in_transaction_session_timeout = '120s'		-
+SHOW idle_in_transaction_session_timeout	text	2min
+set idle_in_transaction_session_timeout = '60min'		-
+SHOW idle_in_transaction_session_timeout	text	1h
+set idle_in_transaction_session_timeout = '1500us'		-
+SHOW idle_in_transaction_session_timeout	text	2ms
+SELECT 'r', current_setting('idle_in_transaction_session_timeout')	text,text	r|2ms
+set idle_in_transaction_session_timeout = '2500us'		-
+SHOW idle_in_transaction_session_timeout	text	2ms
+set idle_in_transaction_session_timeout = '500us'		-
+SHOW idle_in_transaction_session_timeout	text	0
+set idle_in_transaction_session_timeout = '0s'		-
+SHOW idle_in_transaction_session_timeout	text	0
 set idle_in_transaction_session_timeout = 0		-
 SHOW idle_in_transaction_session_timeout	text	0
 show geqo	text	on
@@ -106,6 +145,29 @@ ROLLBACK TO s4		-
 SAVEPOINT s5		-
 set idle_in_transaction_session_timeout = 'banana'	!22023 invalid value for parameter "idle_in_transaction_session_timeout": "banana"
 ROLLBACK TO s5		-
+SAVEPOINT s6		-
+set idle_in_transaction_session_timeout = '2147483648'	!22023 invalid value for parameter "idle_in_transaction_session_timeout": "2147483648" HINT: Value exceeds integer range.
+ROLLBACK TO s6		-
+SAVEPOINT s7		-
+set idle_in_transaction_session_timeout = '25d'	!22023 invalid value for parameter "idle_in_transaction_session_timeout": "25d" HINT: Value exceeds integer range.
+ROLLBACK TO s7		-
+SAVEPOINT s8		-
+set idle_in_transaction_session_timeout = '-1'	!22023 -1 ms is outside the valid range for parameter "idle_in_transaction_session_timeout" (0 ms .. 2147483647 ms)
+ROLLBACK TO s8		-
+SAVEPOINT s9		-
+set statement_timeout = '-5s'	!22023 -5000 ms is outside the valid range for parameter "statement_timeout" (0 ms .. 2147483647 ms)
+ROLLBACK TO s9		-
+set idle_in_transaction_session_timeout = '2147483647'		-
+SHOW idle_in_transaction_session_timeout	text	2147483647ms
+set idle_in_transaction_session_timeout = '24d'		-
+SHOW idle_in_transaction_session_timeout	text	24d
+set idle_in_transaction_session_timeout = '1.5s'		-
+SHOW idle_in_transaction_session_timeout	text	1500ms
+set idle_in_transaction_session_timeout = '2s'		-
+SELECT 'r', name, setting, unit FROM pg_settings WHERE name = 'idle_in_transaction_session_timeout'	text,text,text,text	r|idle_in_transaction_session_timeout|2000|ms
+set idle_in_transaction_session_timeout = '1 s'		-
+SHOW idle_in_transaction_session_timeout	text	1s
+set idle_in_transaction_session_timeout = 0		-
 SELECT 'r', pg_typeof(current_setting('lc_monetary')), pg_typeof(current_schemas(false))	text,regtype,regtype	r|text|name[]
 SELECT 'r', name, setting, unit, context, vartype FROM pg_settings WHERE name IN ('lc_monetary','idle_in_transaction_session_timeout','geqo') ORDER BY name	text,text,text,text,text,text	r|geqo|on|\N|user|bool ; r|idle_in_transaction_session_timeout|0|ms|user|integer ; r|lc_monetary|en_US.utf8|\N|user|string
 ROLLBACK		-
