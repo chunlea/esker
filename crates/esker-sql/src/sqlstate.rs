@@ -43,6 +43,10 @@ pub const FEATURE_NOT_SUPPORTED: &str = "0A000";
 /// one snapshot and raise on the next (`docs/plans/phase-12-subquery.md` §1).
 pub const CARDINALITY_VIOLATION: &str = "21000";
 
+/// `2201B invalid_regular_expression` — a pattern `~` cannot compile. One code, and the *message*
+/// is what says which thing is malformed.
+pub const INVALID_REGULAR_EXPRESSION: &str = "2201B";
+
 // --- Class 22 — Data Exception ---
 
 /// A literal could not be read as its target type — `'abc'::int8`.
@@ -145,6 +149,15 @@ pub const INVALID_AUTHORIZATION_SPECIFICATION: &str = "28000";
 /// Something else needs the object being dropped — `DROP INDEX t_pkey` when a primary key
 /// constraint is what put that index there.
 pub const DEPENDENT_OBJECTS_STILL_EXIST: &str = "2BP01";
+
+/// `42P06 duplicate_schema` — `CREATE SCHEMA` over one that is there.
+pub const DUPLICATE_SCHEMA: &str = "42P06";
+
+/// `3F000 invalid_schema_name` — a schema that is not there.
+///
+/// **Its own class**, not `42P01`: `CREATE TABLE nosuchschema.t` fails on the *schema* and gives
+/// this, where a relation missing from a schema that exists gives `42P01`. Measured, both.
+pub const INVALID_SCHEMA_NAME: &str = "3F000";
 
 // --- Class 34 — Invalid Cursor Name ---
 
@@ -331,8 +344,14 @@ mod tests {
             "DEPENDENT_OBJECTS_STILL_EXIST",
             super::DEPENDENT_OBJECTS_STILL_EXIST,
         ),
+        ("DUPLICATE_SCHEMA", super::DUPLICATE_SCHEMA),
+        ("INVALID_SCHEMA_NAME", super::INVALID_SCHEMA_NAME),
         ("INVALID_CATALOG_NAME", super::INVALID_CATALOG_NAME),
         ("CARDINALITY_VIOLATION", super::CARDINALITY_VIOLATION),
+        (
+            "INVALID_REGULAR_EXPRESSION",
+            super::INVALID_REGULAR_EXPRESSION,
+        ),
         ("SYNTAX_ERROR", super::SYNTAX_ERROR),
         ("UNDEFINED_COLUMN", super::UNDEFINED_COLUMN),
         ("UNDEFINED_TABLE", super::UNDEFINED_TABLE),

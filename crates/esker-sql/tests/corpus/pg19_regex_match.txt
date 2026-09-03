@@ -1,0 +1,119 @@
+# `~`, `~*`, `!~`, `!~*` — POSIX regular-expression matching — as a real PostgreSQL 19beta1
+# answers it.
+#
+# **`ActiveRecord`'s PostgreSQL adapter sends exactly four patterns**, and they are the whole
+# reason this exists:
+#
+#     schema_names          nspname !~ '^pg_.*'
+#     pk_and_sequence_for   pg_get_expr(…) ~* 'nextval|uuid_generate|gen_random_uuid'
+#     pk_and_sequence_for   pg_get_expr(…) !~* 'nextval'
+#     pk_and_sequence_for   split_part(…, '''', 2) ~ '.'
+#
+# Between them: an anchor, `.`, `*`, alternation, and all four operators. The first is the opening
+# statement of `schema_names`, which is why `pg19_schema.txt` loses sixty-two statements behind it,
+# and the other three are on the path every model takes at boot.
+#
+# **No regex crate.** `deny.toml` forbids one, and the matcher is written in-house for the POSIX
+# ERE subset these need and a little around it — literals, `.`, character classes with ranges and
+# `[[:name:]]`, `^`/`$`, alternation, grouping, `*`, `+`, `?`, `{m}`/`{m,n}`, and `\` escapes.
+# Anything outside that subset is refused by name (ADR 0031) and is declared here.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way.
+#
+# **The whole capture runs inside `BEGIN … ROLLBACK`**, error probes in `SAVEPOINT` / `ROLLBACK TO`.
+# The `SELECT count(*)` at the end proves it left nothing behind and answers `0`. `\gdesc` runs
+# inline, so every statement has its declared types pinned.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`.` matches a newline.** `E'a\nb' ~ '^a.b$'` is **true**. Almost every regex engine outside
+#     POSIX makes `.` stop at a newline, and an implementation that copied one would answer `f`
+#     where a real server answers `t`.
+#   * **The empty pattern matches everything**: `'abc' ~ ''` is `t` and `'abc' !~ ''` is `f`. A
+#     matcher that treated an empty pattern as "no match" would invert both.
+#   * **A pattern is unanchored**: `~` is a *search*, not a full match, so `'abc' ~ 'b'` is true and
+#     `'^abc$'` is what makes it whole-string. The suite's `'^pg_.*'` is anchored at the front only,
+#     and `.*` at the end is therefore doing nothing at all — `'^pg_'` would answer identically.
+#   * **NULL on either side is NULL, for all four operators**, and the negated ones do not rescue
+#     it: `'abc' !~ NULL` is NULL, not true.
+#   * **`]` first inside a class is a literal**: `'a]b' ~ '^a[]]b$'` is true. `[]]` is a class
+#     containing `]`, not an empty class followed by `]`.
+#   * **`\a` is not `a`.** `'a' ~ '^\a$'` is **false** — a backslash before an ordinary letter is an
+#     escape PostgreSQL gives its own meaning (`\a` is the alert character), so escaping is not
+#     "drop the backslash". `\.` and `\*` do work, and are what a pattern needs them for.
+#   * **Bounds are in the subset**: `'foo' ~ 'o{2}'` is true, `'fo' ~ 'o{2}'` is false, and
+#     `'^fo{1,2}$'` matches `foo`.
+#   * **Three different `2201B` reasons, and the sentence names which**: `brackets [] not balanced`,
+#     `parentheses () not balanced`, `quantifier operand invalid`. One code, three messages.
+#   * **A non-text operand is `42883`, not a cast**: `1 ~ 'a'` is `operator does not exist: integer
+#     ~ unknown` with PostgreSQL's DETAIL and HINT, and `'abc' ~ 1` is the same sentence with the
+#     sides swapped — `unknown ~ integer`.
+#   * **`~*` folds both sides, and `!~*` is its negation**: `'ABC' ~* 'b'` is true while `'ABC' ~ 'b'`
+#     is false, and the suite's `~* 'nextval|…'` is why — a default of `nextval('s'::regclass)`
+#     matches whatever case it was written in.
+#
+# OUTSIDE THE SUBSET, AND DECLARED
+#
+#   * `(?i)` and the rest of PostgreSQL's *advanced* regular expressions, which are not POSIX ERE.
+#   * Back-references (`\1`). Both are captured here so the boundary is written down rather than
+#     merely absent, and both are refused by name.
+BEGIN		-
+SELECT 'r', 'abc' ~ 'b', 'abc' ~ 'z', 'abc' !~ 'b', 'abc' !~ 'z'	text,boolean,boolean,boolean,boolean	r|t|f|f|t
+SELECT 'r', 'ABC' ~ 'b', 'ABC' ~* 'b', 'ABC' !~ 'b', 'ABC' !~* 'b'	text,boolean,boolean,boolean,boolean	r|f|t|t|f
+SELECT 'r', pg_typeof('abc' ~ 'b')	text,regtype	r|boolean
+SELECT 'r', NULL::text ~ 'b', 'abc' ~ NULL::text, NULL::text !~ 'b', 'abc' !~ NULL::text	text,boolean,boolean,boolean,boolean	r|\N|\N|\N|\N
+SELECT 'r', 'pg_catalog' !~ '^pg_.*', 'public' !~ '^pg_.*', 'test_schema' !~ '^pg_.*'	text,boolean,boolean,boolean	r|f|t|t
+SELECT 'r', 'nextval(''s''::regclass)' ~* 'nextval|uuid_generate|gen_random_uuid'	text,boolean	r|t
+SELECT 'r', 'now()' ~* 'nextval|uuid_generate|gen_random_uuid'	text,boolean	r|f
+SELECT 'r', 'gen_random_uuid()' ~* 'nextval|uuid_generate|gen_random_uuid'	text,boolean	r|t
+SELECT 'r', 'now()' !~* 'nextval'	text,boolean	r|t
+SELECT 'r', 's' ~ '.', '' ~ '.'	text,boolean,boolean	r|t|f
+SELECT 'r', 'abc' ~ '^abc$', 'xabc' ~ '^abc$', 'abcx' ~ '^abc$'	text,boolean,boolean,boolean	r|t|f|f
+SELECT 'r', 'aaa' ~ '^a*$', '' ~ '^a*$', 'b' ~ '^a*$'	text,boolean,boolean,boolean	r|t|t|f
+SELECT 'r', 'aaa' ~ '^a+$', '' ~ '^a+$'	text,boolean,boolean	r|t|f
+SELECT 'r', 'a' ~ '^ab?$', 'ab' ~ '^ab?$', 'abb' ~ '^ab?$'	text,boolean,boolean,boolean	r|t|t|f
+SELECT 'r', 'cat' ~ '^(cat|dog)$', 'dog' ~ '^(cat|dog)$', 'cow' ~ '^(cat|dog)$'	text,boolean,boolean,boolean	r|t|t|f
+SELECT 'r', 'ab' ~ '^(ab)*$', 'abab' ~ '^(ab)*$', 'aba' ~ '^(ab)*$'	text,boolean,boolean,boolean	r|t|t|f
+SELECT 'r', 'a' ~ '^[abc]$', 'd' ~ '^[abc]$', 'a' ~ '^[^abc]$', 'd' ~ '^[^abc]$'	text,boolean,boolean,boolean,boolean	r|t|f|f|t
+SELECT 'r', 'f' ~ '^[a-z]$', 'F' ~ '^[a-z]$', '5' ~ '^[0-9]+$', '5a' ~ '^[0-9]+$'	text,boolean,boolean,boolean,boolean	r|t|f|t|f
+SELECT 'r', 'a' ~ '^[[:alpha:]]$', '1' ~ '^[[:alpha:]]$', '1' ~ '^[[:digit:]]$'	text,boolean,boolean,boolean	r|t|f|t
+SELECT 'r', 'a.c' ~ '^a\.c$', 'abc' ~ '^a\.c$'	text,boolean,boolean	r|t|f
+SELECT 'r', 'a*c' ~ '^a\*c$', 'a' ~ '^\a$'	text,boolean,boolean	r|t|f
+SELECT 'r', E'a\nb' ~ 'a.b', E'a\nb' ~ '^a.b$'	text,boolean,boolean	r|t|t
+SELECT 'r', 'abc' ~ '', 'abc' !~ ''	text,boolean,boolean	r|t|f
+SELECT 'r', 'aXbXc' ~ 'X.*X', 'abc' ~ 'X.*X'	text,boolean,boolean	r|t|f
+SELECT 'r', 'foo' ~ 'o{2}', 'fo' ~ 'o{2}', 'foo' ~ '^fo{1,2}$'	text,boolean,boolean,boolean	r|t|f|t
+SELECT 'r', 'a]b' ~ '^a[]]b$'	text,boolean	r|t
+SAVEPOINT s0a		-
+SELECT 'r', 'abc' ~ '(?i)ABC'	text,boolean	r|t
+ROLLBACK TO s0a		-
+SAVEPOINT s0b		-
+SELECT 'r', 'aab' ~ '^(a)\1b$'	text,boolean	r|t
+ROLLBACK TO s0b		-
+SAVEPOINT s1		-
+SELECT 'r', 'abc' ~ '['	!2201B invalid regular expression: brackets [] not balanced
+ROLLBACK TO s1		-
+SAVEPOINT s2		-
+SELECT 'r', 'abc' ~ '(a'	!2201B invalid regular expression: parentheses () not balanced
+ROLLBACK TO s2		-
+SAVEPOINT s3		-
+SELECT 'r', 'abc' ~ '*'	!2201B invalid regular expression: quantifier operand invalid
+ROLLBACK TO s3		-
+SAVEPOINT s4		-
+SELECT 'r', 1 ~ 'a'	!42883 operator does not exist: integer ~ unknown DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO s4		-
+SAVEPOINT s5		-
+SELECT 'r', 'abc' ~ 1	!42883 operator does not exist: unknown ~ integer DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO s5		-
+CREATE TABLE "rx" ("id" bigserial primary key, "s" character varying)		-
+INSERT INTO "rx" ("s") VALUES ('pg_catalog'), ('public'), ('test_schema'), (NULL)		-
+SELECT 'r', s FROM "rx" WHERE s !~ '^pg_.*' ORDER BY id	text,character varying	r|public ; r|test_schema
+SELECT 'r', s FROM "rx" WHERE s ~ '^pg_.*' ORDER BY id	text,character varying	r|pg_catalog
+SELECT 'r', count(*) FROM "rx" WHERE s ~* 'PUBLIC'	text,bigint	r|1
+SELECT 'r', nspname FROM pg_namespace WHERE nspname !~ '^pg_.*' AND nspname NOT IN ('information_schema') ORDER by nspname	text,name	r|public
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname = 'rx'	bigint	0

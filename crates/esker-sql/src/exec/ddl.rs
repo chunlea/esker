@@ -1480,6 +1480,91 @@ fn sequences_for(
     Ok(sequences)
 }
 
+/// `CREATE SCHEMA [IF NOT EXISTS] name`.
+///
+/// **A second namespace, and nothing is in it yet.** A relation still lives in `public`, so a
+/// schema-qualified relation name is refused by name where this node cannot resolve it — a gap
+/// rather than a wrong answer, which is what keeps `CREATE SCHEMA` honest before the relations
+/// follow it.
+pub(super) fn create_schema(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    create: &plan::CreateSchema,
+) -> Result<Outcome> {
+    if catalog::schema_exists(&*txn, executor.tenant, &create.name)? {
+        // **`IF NOT EXISTS` is a notice and a success**, which is what a real server answers; the
+        // notice itself is on stderr in `psql` and is not a row.
+        if create.if_not_exists {
+            executor.notice(SqlError::DoesNotExistSkipping {
+                kind: "schema",
+                name: create.name.clone(),
+            });
+            return Ok(Outcome::done("CREATE SCHEMA"));
+        }
+        return Err(SqlError::DuplicateSchema(create.name.clone()));
+    }
+    let id = catalog::allocate_id(txn, executor.tenant)?;
+    catalog::create_schema(txn, executor.tenant, &create.name, id)?;
+    Ok(Outcome::done("CREATE SCHEMA"))
+}
+
+/// `DROP SCHEMA [IF EXISTS] name [CASCADE]`.
+///
+/// **`IF EXISTS` covers absence and not dependence**: a schema with something in it is `2BP01`
+/// with the clause written, naming one dependent and pointing at `CASCADE`. Measured.
+pub(super) fn drop_schema(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    drop: &plan::DropSchema,
+) -> Result<Outcome> {
+    for name in &drop.names {
+        if !catalog::schema_exists(&*txn, executor.tenant, name)? {
+            if drop.if_exists {
+                executor.notice(SqlError::DoesNotExistSkipping {
+                    kind: "schema",
+                    name: name.clone(),
+                });
+                continue;
+            }
+            return Err(SqlError::UndefinedSchema(name.clone()));
+        }
+        // **Nothing can be in a schema yet**, because a qualified relation name is refused where
+        // it is lowered — so there is no dependent to find and `CASCADE` has nothing to take.
+        // `SqlError::DependentSchema` carries the sentence a real server uses, measured, and the
+        // check that raises it belongs with the unit that puts relations in schemas.
+        // TODO(namespaces): raise `DependentSchema` for a schema that still holds a relation.
+        let _ = drop.cascade;
+        catalog::drop_schema(txn, executor.tenant, name)?;
+    }
+    Ok(Outcome::done("DROP SCHEMA"))
+}
+
+/// `ALTER SCHEMA name RENAME TO other`.
+pub(super) fn alter_schema_rename(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    rename: &plan::AlterSchemaRename,
+) -> Result<Outcome> {
+    if !catalog::schema_exists(&*txn, executor.tenant, &rename.name)? {
+        return Err(SqlError::UndefinedSchema(rename.name.clone()));
+    }
+    if catalog::schema_exists(&*txn, executor.tenant, &rename.to)? {
+        return Err(SqlError::DuplicateSchema(rename.to.clone()));
+    }
+    // `public` is a property of the build rather than a record, so there is nothing to rename and
+    // a real server refuses it for its own reason (ownership). Named rather than half-done.
+    if rename.name == catalog::PUBLIC_SCHEMA {
+        return Err(SqlError::unsupported("ALTER SCHEMA public RENAME TO"));
+    }
+    let id = catalog::schemas(&*txn, executor.tenant)?
+        .into_iter()
+        .find(|(name, _)| *name == rename.name)
+        .map_or(0, |(_, id)| id);
+    catalog::drop_schema(txn, executor.tenant, &rename.name)?;
+    catalog::create_schema(txn, executor.tenant, &rename.to, id)?;
+    Ok(Outcome::done("ALTER SCHEMA"))
+}
+
 pub(super) fn drop_table(
     executor: &mut Executor,
     txn: &mut dyn Txn,
@@ -1834,6 +1919,17 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
             sub(operand),
             if *negated { "NOT " } else { "" },
             if *case_insensitive { "ILIKE" } else { "LIKE" },
+            sub(pattern)
+        ),
+        Expr::RegexMatch {
+            operand,
+            pattern,
+            negated,
+            case_insensitive,
+        } => format!(
+            "({} {} {})",
+            sub(operand),
+            plan::regex_operator(*negated, *case_insensitive),
             sub(pattern)
         ),
         Expr::Binary { op, left, right } => {

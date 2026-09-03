@@ -540,6 +540,9 @@ impl Executor {
         match statement {
             Statement::CreateTable(create) => ddl::create_table(self, txn, create),
             Statement::CreateExtension(create) => ddl::create_extension(self, txn, create),
+            Statement::CreateSchema(create) => ddl::create_schema(self, txn, create),
+            Statement::DropSchema(drop) => ddl::drop_schema(self, txn, drop),
+            Statement::AlterSchemaRename(rename) => ddl::alter_schema_rename(self, txn, rename),
             Statement::DropSequence(drop) => ddl::drop_sequence(self, txn, drop),
             Statement::CreateSequence(create) => ddl::create_sequence(self, txn, create),
             Statement::DropFunction(drop) => ddl::drop_function(self, txn, drop),
@@ -1518,6 +1521,11 @@ fn explain_lines(statement: &Statement) -> Vec<String> {
         Statement::CreateTable(create) => vec![format!("Create Table on {}", create.name)],
         Statement::CreateExtension(create) => {
             vec![format!("Create Extension on {}", create.name)]
+        }
+        Statement::CreateSchema(create) => vec![format!("Create Schema on {}", create.name)],
+        Statement::DropSchema(drop) => vec![format!("Drop Schema on {}", drop.names.join(", "))],
+        Statement::AlterSchemaRename(rename) => {
+            vec![format!("Alter Schema on {}", rename.name)]
         }
         Statement::DropTable(drop) => vec![format!("Drop Table on {}", drop.names.join(", "))],
         Statement::DropSequence(drop) => {

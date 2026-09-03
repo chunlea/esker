@@ -1,0 +1,120 @@
+# `CREATE SCHEMA` and the named-schema half of `schema_test.rb` — as a real PostgreSQL 19beta1
+# answers it.
+#
+# `test/cases/adapters/postgresql/schema_test.rb` puts **everything** in `test_schema` and
+# `test_schema2` and then asks the adapter to tell them apart: two tables called `things`, two
+# indexes of one name over *different columns* in each schema, a schema-qualified `CREATE INDEX`,
+# `remove_index` with a schema in either the table's name or the index's, and a `search_path` that
+# decides which `things` a bare name means. The statements here are the suite's own, out of its
+# `setup` and out of `connection_adapters/postgresql/schema_statements.rb`.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way.
+#
+# **The whole capture runs inside `BEGIN … ROLLBACK`**, error probes in `SAVEPOINT` / `ROLLBACK TO`.
+# The `SELECT count(*)` at the end proves it left nothing behind and answers `0`. `\gdesc` runs
+# inline, so every statement has its declared types pinned.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`CREATE SCHEMA … CREATE TABLE …` is one statement**, not two. The suite's `setup` writes it
+#     that way — `CREATE SCHEMA test_schema CREATE TABLE things (…)` — so a node that reads
+#     `CREATE SCHEMA` and stops has not read the table.
+#   * **A schema is not a prefix on a name; it is a namespace two names can live in.** After the
+#     setup there are two tables called `things` and **two indexes called
+#     `a_index_things_on_name`**, one per schema, and `pg_class` returns two rows for each. A
+#     catalog keyed by name alone cannot hold this.
+#   * **`search_path` decides what a bare name means, and it is ordered.** With
+#     `SET search_path TO test_schema` a bare `things` is `test_schema`'s and holds row `1`; with
+#     `TO test_schema2, test_schema` the same query is row `2`. Neither schema is on the default
+#     path, so before any `SET` the bare name is `42P01 relation "things" does not exist` — even
+#     though two tables of that name exist.
+#   * **`current_schemas(false)` is the path as resolved, not as written.** `SET search_path TO
+#     "$user", public` answers `{public}`: `$user` names no schema here, so it is dropped rather
+#     than reported. Its type is `name[]` and `current_schema`'s is `name`.
+#   * **Three different codes for three ways of naming a schema wrong.** A schema that is already
+#     there is `42P06 schema "test_schema" already exists`; one that is not is `3F000 schema
+#     "nosuchschema" does not exist` — including from `CREATE TABLE nosuchschema.t`, which fails on
+#     the *schema* rather than the table; and a **relation** in a missing schema is the ordinary
+#     `42P01 relation "nosuchschema.t" does not exist`, with the schema **inside the quotes**.
+#   * **`DROP SCHEMA` without `CASCADE` is `2BP01` and names one dependent**, the way a table with
+#     an inheriting child is: `DETAIL: table test_schema.things depends on schema test_schema`,
+#     with the `Use DROP ... CASCADE` hint. `IF EXISTS` covers absence and not dependence, and
+#     `DROP SCHEMA IF EXISTS nosuchschema CASCADE` is a plain success.
+#   * **`ALTER SCHEMA … RENAME TO` moves every relation with it** and is a catalog-only change:
+#     `pg_namespace` shows `test_schema3` and the tables under it are the same tables.
+#   * `CREATE SCHEMA IF NOT EXISTS` over an existing one is a **success**, not a notice this
+#     capture can see — `psql` prints the notice on stderr and the statement's answer is a tag.
+BEGIN		-
+SELECT 'r', current_schema	text,name	r|public
+SELECT 'r', current_schemas(false)	text,name[]	r|{public}
+SELECT 'r', nspname FROM pg_namespace WHERE nspname !~ '^pg_.*' AND nspname NOT IN ('information_schema') ORDER by nspname	text,name	r|public
+CREATE SCHEMA test_schema CREATE TABLE things (id integer, name character varying(50), email character varying(50), description character varying(100), moment timestamp without time zone default now())		-
+SELECT 'r', COUNT(*) FROM pg_namespace WHERE nspname = 'test_schema'	text,bigint	r|1
+SELECT 'r', nspname FROM pg_namespace WHERE nspname !~ '^pg_.*' AND nspname NOT IN ('information_schema') ORDER by nspname	text,name	r|public ; r|test_schema
+CREATE TABLE test_schema."things.table" (id integer, name character varying(50))		-
+CREATE TABLE test_schema."Things" (id integer, name character varying(50))		-
+CREATE SCHEMA test_schema2 CREATE TABLE things (id integer, name character varying(50), email character varying(50), description character varying(100), moment timestamp without time zone default now())		-
+CREATE INDEX a_index_things_on_name ON test_schema.things USING btree (name)		-
+CREATE INDEX a_index_things_on_name ON test_schema2.things USING btree (name)		-
+CREATE INDEX b_index_things_on_different_columns_in_each_schema ON test_schema.things USING btree (email)		-
+CREATE INDEX b_index_things_on_different_columns_in_each_schema ON test_schema2.things USING btree (moment)		-
+CREATE TABLE test_schema.table_with_pk (id serial primary key)		-
+CREATE SEQUENCE test_schema.unmatched_primary_key_default_value_seq		-
+SELECT 'r', c.relname, n.nspname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'things' AND c.relkind IN ('r','v','m','p','f') ORDER BY n.nspname	text,name,name	r|things|test_schema ; r|things|test_schema2
+SELECT 'r', c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'test_schema' AND c.relname = 'things' AND c.relkind IN ('r','v','m','p','f')	text,name	r|things
+SELECT 'r', c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ANY (current_schemas(false)) AND c.relname = 'things' AND c.relkind IN ('r','v','m','p','f')	text,name	-
+SELECT 'r', COUNT(*) FROM pg_class t INNER JOIN pg_index d ON t.oid = d.indrelid INNER JOIN pg_class i ON d.indexrelid = i.oid LEFT JOIN pg_namespace n ON n.oid = t.relnamespace WHERE i.relkind IN ('i', 'I') AND i.relname = 'a_index_things_on_name' AND t.relname = 'things' AND n.nspname = 'test_schema'	text,bigint	r|1
+INSERT INTO test_schema.things (id, name) VALUES (1, 'one')		-
+INSERT INTO test_schema2.things (id, name) VALUES (2, 'two')		-
+SELECT 'r', id, name FROM test_schema.things	text,integer,character varying(50)	r|1|one
+SELECT 'r', id, name FROM test_schema2.things	text,integer,character varying(50)	r|2|two
+SAVEPOINT s1		-
+SELECT 'r', id, name FROM things	!42P01 relation "things" does not exist
+ROLLBACK TO s1		-
+SET search_path TO test_schema		-
+SELECT 'r', current_schema	text,name	r|test_schema
+SELECT 'r', current_schemas(false)	text,name[]	r|{test_schema}
+SELECT 'r', id, name FROM things	text,integer,character varying(50)	r|1|one
+SELECT 'r', id, name FROM "things.table"	text,integer,character varying(50)	-
+SET search_path TO test_schema2, test_schema		-
+SELECT 'r', current_schemas(false)	text,name[]	r|{test_schema2,test_schema}
+SELECT 'r', id, name FROM things	text,integer,character varying(50)	r|2|two
+SET search_path TO "$user", public		-
+SELECT 'r', current_schemas(false)	text,name[]	r|{public}
+SAVEPOINT s2		-
+CREATE SCHEMA test_schema	!42P06 schema "test_schema" already exists
+ROLLBACK TO s2		-
+SAVEPOINT s3		-
+CREATE SCHEMA IF NOT EXISTS test_schema		-
+ROLLBACK TO s3		-
+SAVEPOINT s4		-
+DROP SCHEMA test_schema	!2BP01 cannot drop schema test_schema because other objects depend on it DETAIL: table test_schema.things depends on schema test_schema HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO s4		-
+SAVEPOINT s5		-
+DROP SCHEMA nosuchschema	!3F000 schema "nosuchschema" does not exist
+ROLLBACK TO s5		-
+SAVEPOINT s6		-
+DROP SCHEMA IF EXISTS nosuchschema CASCADE		-
+ROLLBACK TO s6		-
+SAVEPOINT s7		-
+CREATE TABLE nosuchschema.t (a integer)	!3F000 schema "nosuchschema" does not exist
+ROLLBACK TO s7		-
+SAVEPOINT s8		-
+SELECT 'r', a FROM nosuchschema.t	!42P01 relation "nosuchschema.t" does not exist
+ROLLBACK TO s8		-
+SAVEPOINT s9		-
+ALTER SCHEMA test_schema2 RENAME TO test_schema3		-
+SELECT 'r', nspname FROM pg_namespace WHERE nspname LIKE 'test_schema%' ORDER BY nspname	text,name	r|test_schema ; r|test_schema3
+ROLLBACK TO s9		-
+SELECT 'r', n.nspname, c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname LIKE 'test_schema%' ORDER BY n.nspname, c.relname	text,name,name,"char"	r|test_schema|Things|r ; r|test_schema|a_index_things_on_name|i ; r|test_schema|b_index_things_on_different_columns_in_each_schema|i ; r|test_schema|table_with_pk|r ; r|test_schema|table_with_pk_id_seq|S ; r|test_schema|table_with_pk_pkey|i ; r|test_schema|things|r ; r|test_schema|things.table|r ; r|test_schema|unmatched_primary_key_default_value_seq|S ; r|test_schema2|a_index_things_on_name|i ; r|test_schema2|b_index_things_on_different_columns_in_each_schema|i ; r|test_schema2|things|r
+SELECT 'r', pg_typeof(current_schema), pg_typeof(current_schemas(false))	text,regtype,regtype	r|name|name[]
+DROP SCHEMA test_schema2 CASCADE		-
+SELECT 'r', count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'test_schema2'	text,bigint	r|0
+DROP SCHEMA test_schema CASCADE		-
+SELECT 'r', count(*) FROM pg_namespace WHERE nspname LIKE 'test_schema%'	text,bigint	r|0
+ROLLBACK		-
+SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'test_schema%'	bigint	0

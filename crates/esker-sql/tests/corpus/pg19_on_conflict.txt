@@ -1,0 +1,152 @@
+# `INSERT … ON CONFLICT` — `DO NOTHING`, `DO UPDATE`, `excluded`, and what all three do through a
+# **partitioned** parent — as a real PostgreSQL 19beta1 answers it.
+#
+# This is what `insert_all` and `upsert_all` compile to. The shapes are `ActiveRecord`'s own, out
+# of `connection_adapters/postgresql_adapter.rb#build_insert_sql`:
+#
+#     ON CONFLICT #{conflict_target} DO NOTHING
+#     ON CONFLICT #{conflict_target} DO UPDATE SET <col>=excluded.<col>, …
+#     … RETURNING <cols>
+#
+# `conflict_target` is `(cols)`, optionally with the arbiter index's `WHERE`, and is **empty** for
+# `insert_all` with no `unique_by` — which is where the double space in the third line comes from.
+# `pg19_partition_suite.txt` declared this statement a divergence; this closes it.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way.
+#
+# **The whole capture runs inside `BEGIN … ROLLBACK`**, error probes in `SAVEPOINT` / `ROLLBACK TO`.
+# The `SELECT count(*)` at the end proves it left nothing behind and answers `0`. `\gdesc` runs
+# inline, so every statement has its declared types pinned.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **The sequence is consumed for a row that is never inserted.** Three inserts of `isbn` `2`
+#     and `3` come back with ids `5`, `5`, `7`: the second drew `6` from `books_id_seq`, conflicted,
+#     updated the row that already had `5`, and returned **`5`** — and `6` is gone. `nextval` is
+#     evaluated to build the proposed row, before anything knows there is a conflict, and it does
+#     not roll back. An implementation that allocated after the conflict check would answer `6`
+#     and would never leave a gap.
+#   * **`DO UPDATE SET "id"=excluded."id"` writes the number that was drawn**, which is how you can
+#     see it: the row's `id` becomes `13`, a value no `INSERT` ever returned.
+#   * **`RETURNING` answers only the rows the statement actually touched.** `DO NOTHING RETURNING
+#     "id"` on a row that conflicts returns **no rows at all** — not a NULL, not the existing id.
+#     `DO UPDATE … RETURNING "id"` returns the **existing** row's id, because that is the row it
+#     wrote.
+#   * **Two proposed rows that conflict with each other are two different answers.** With
+#     `DO UPDATE` it is `21000 ON CONFLICT DO UPDATE command cannot affect row a second time`
+#     (`HINT: Ensure that no rows proposed for insertion within the same command have duplicate
+#     constrained values.`); with `DO NOTHING` it is accepted and the **first** of the two wins.
+#   * **The conflict target has to match an index, not a column.** `ON CONFLICT ("name")` where
+#     `name` has no unique index is `42P10 there is no unique or exclusion constraint matching the
+#     ON CONFLICT specification`, and a **partial** index only matches when the statement repeats
+#     its predicate: `ON CONFLICT ("a") WHERE "b" IS NOT NULL` works where bare `ON CONFLICT ("a")`
+#     is `42P10`.
+#   * **Three columns, three messages.** A target naming nothing is `42703 column "nosuchcol" does
+#     not exist`, quoted; an `excluded` column naming nothing is `42703 column excluded.nosuchcol
+#     does not exist`, **unquoted and qualified**; and the target table may be named in the `SET`
+#     (`"name"="books"."name"`), where it means the row already there.
+#   * **`ON CONFLICT` with no target at all takes any unique index.** `ON CONFLICT  DO NOTHING` —
+#     `insert_all`'s spelling, with the double space `build_insert_sql` leaves — skips the row.
+#
+# THROUGH A PARTITIONED PARENT
+#
+#   * **The conflict is routed first and arbitrated second.** `upsert_all` through `measurements`
+#     updates the row in whichever partition holds it and inserts the rest where they belong: one
+#     row in `measurements_toronto`, two in `measurements_concepcion`, from one statement. Sent
+#     straight into `measurements_toronto` it arbitrates on that partition's own index.
+#   * **Routing wins over `DO NOTHING`.** A row no partition takes is `23514 no partition of
+#     relation "measurements" found for row` even with `ON CONFLICT … DO NOTHING` — the clause
+#     never gets a chance, because there is no partition whose index could arbitrate.
+#   * **`DO UPDATE` cannot move a row between partitions, where a plain `UPDATE` can.** Setting the
+#     key to the value it already has is fine; setting it to another partition's value is
+#     `0A000 invalid ON UPDATE specification`, `DETAIL: The result tuple would appear in a different
+#     partition than the original tuple.` `UPDATE measurements SET city_id = '2'` moves the row and
+#     raises nothing (`pg19_partition.txt`), so the two paths differ on exactly this.
+BEGIN		-
+CREATE TABLE "books" ("id" bigserial primary key, "isbn" character varying, "name" character varying, "status" integer)		-
+CREATE UNIQUE INDEX "index_books_on_isbn" ON "books" ("isbn")		-
+INSERT INTO "books" ("isbn","name","status") VALUES ('1','Rework',1)		-
+SELECT 'r', id, isbn, name, status FROM "books" ORDER BY id	text,bigint,character varying,character varying,integer	r|1|1|Rework|1
+INSERT INTO "books" ("isbn","name","status") VALUES ('1','Remote',2) ON CONFLICT  DO NOTHING		-
+SELECT 'r', count(*) FROM "books"	text,bigint	r|1
+INSERT INTO "books" ("isbn","name","status") VALUES ('1','Remote',2) ON CONFLICT ("isbn") DO NOTHING		-
+SELECT 'r', isbn, name FROM "books" ORDER BY id	text,character varying,character varying	r|1|Rework
+INSERT INTO "books" ("isbn","name","status") VALUES ('1','Remote',2) ON CONFLICT ("isbn") DO UPDATE SET "name"=excluded."name","status"=excluded."status"		-
+SELECT 'r', isbn, name, status FROM "books" ORDER BY id	text,character varying,character varying,integer	r|1|Remote|2
+SELECT 'r', count(*) FROM "books"	text,bigint	r|1
+INSERT INTO "books" ("isbn","name","status") VALUES ('2','Getting Real',3) ON CONFLICT ("isbn") DO UPDATE SET "name"=excluded."name" RETURNING "id"	bigint	5
+INSERT INTO "books" ("isbn","name","status") VALUES ('2','Shape Up',4) ON CONFLICT ("isbn") DO UPDATE SET "name"=excluded."name" RETURNING "id"	bigint	5
+INSERT INTO "books" ("isbn","name","status") VALUES ('3','Sprint',5) ON CONFLICT ("isbn") DO NOTHING RETURNING "id"	bigint	7
+INSERT INTO "books" ("isbn","name","status") VALUES ('3','Sprint',5) ON CONFLICT ("isbn") DO NOTHING RETURNING "id"	bigint	-
+SELECT 'r', isbn, name FROM "books" ORDER BY isbn	text,character varying,character varying	r|1|Remote ; r|2|Shape Up ; r|3|Sprint
+SAVEPOINT s1		-
+INSERT INTO "books" ("isbn","name") VALUES ('9','a'),('9','b') ON CONFLICT ("isbn") DO UPDATE SET "name"=excluded."name"	!21000 ON CONFLICT DO UPDATE command cannot affect row a second time HINT: Ensure that no rows proposed for insertion within the same command have duplicate constrained values.
+ROLLBACK TO s1		-
+SAVEPOINT s2		-
+INSERT INTO "books" ("isbn","name") VALUES ('9','a'),('9','b') ON CONFLICT ("isbn") DO NOTHING		-
+SELECT 'r', isbn, name FROM "books" WHERE isbn = '9'	text,character varying,character varying	r|9|a
+ROLLBACK TO s2		-
+SAVEPOINT s3		-
+INSERT INTO "books" ("isbn","name") VALUES ('1','x') ON CONFLICT ("name") DO NOTHING	!42P10 there is no unique or exclusion constraint matching the ON CONFLICT specification
+ROLLBACK TO s3		-
+SAVEPOINT s4		-
+INSERT INTO "books" ("isbn","name") VALUES ('1','x') ON CONFLICT ("nosuchcol") DO NOTHING	!42703 column "nosuchcol" does not exist
+ROLLBACK TO s4		-
+SAVEPOINT s5		-
+INSERT INTO "books" ("isbn","name") VALUES ('1','x') ON CONFLICT ("isbn") DO UPDATE SET "name"=excluded."nosuchcol"	!42703 column excluded.nosuchcol does not exist
+ROLLBACK TO s5		-
+SAVEPOINT s6		-
+INSERT INTO "books" ("isbn","name") VALUES ('1','x') ON CONFLICT ("isbn") DO UPDATE SET "id"=excluded."id"		-
+SELECT 'r', id, isbn FROM "books" WHERE isbn = '1'	text,bigint,character varying	r|13|1
+ROLLBACK TO s6		-
+SAVEPOINT s7		-
+INSERT INTO "books" ("isbn","name") VALUES ('1','x') ON CONFLICT ("isbn") DO UPDATE SET "name"="books"."name"		-
+SELECT 'r', isbn, name FROM "books" WHERE isbn = '1'	text,character varying,character varying	r|1|Remote
+ROLLBACK TO s7		-
+CREATE TABLE "measurements" ("city_id" character varying NOT NULL, "logdate" date NOT NULL, "peaktemp" integer, "unitsales" integer) PARTITION BY LIST (city_id)		-
+CREATE UNIQUE INDEX "index_measurements_on_logdate_and_city_id" ON "measurements" ("logdate", "city_id")		-
+CREATE TABLE "measurements_toronto" PARTITION OF measurements FOR VALUES IN (1)		-
+CREATE TABLE "measurements_concepcion" PARTITION OF measurements FOR VALUES IN (2)		-
+INSERT INTO "measurements" ("city_id","logdate","peaktemp","unitsales") VALUES ('1','2026-09-01',30,10)		-
+INSERT INTO "measurements" ("city_id","logdate","peaktemp","unitsales") VALUES ('1','2026-09-01',99,99),('2','2026-09-02',2,2),('2','2026-09-03',0,0) ON CONFLICT ("logdate","city_id") DO UPDATE SET "peaktemp"=excluded."peaktemp","unitsales"=excluded."unitsales"		-
+SELECT 'r', city_id, logdate, peaktemp, unitsales FROM "measurements" ORDER BY city_id, logdate	text,character varying,date,integer,integer	r|1|2026-09-01|99|99 ; r|2|2026-09-02|2|2 ; r|2|2026-09-03|0|0
+SELECT 'r', count(*) FROM "measurements_toronto"	text,bigint	r|1
+SELECT 'r', count(*) FROM "measurements_concepcion"	text,bigint	r|2
+SAVEPOINT s8		-
+INSERT INTO "measurements_toronto" ("city_id","logdate","peaktemp") VALUES ('1','2026-09-01',7) ON CONFLICT ("logdate","city_id") DO UPDATE SET "peaktemp"=excluded."peaktemp"		-
+SELECT 'r', peaktemp FROM "measurements_toronto"	text,integer	r|7
+ROLLBACK TO s8		-
+SAVEPOINT s9		-
+INSERT INTO "measurements" ("city_id","logdate","peaktemp") VALUES ('99','2026-09-09',1) ON CONFLICT ("logdate","city_id") DO NOTHING	!23514 no partition of relation "measurements" found for row DETAIL: Partition key of the failing row contains (city_id) = (99).
+ROLLBACK TO s9		-
+SAVEPOINT s10		-
+INSERT INTO "measurements" ("city_id","logdate","peaktemp") VALUES ('1','2026-09-01',5) ON CONFLICT ("logdate","city_id") DO UPDATE SET "city_id"=excluded."city_id"		-
+SELECT 'r', count(*) FROM "measurements"	text,bigint	r|3
+ROLLBACK TO s10		-
+SAVEPOINT s11		-
+INSERT INTO "measurements" ("city_id","logdate","peaktemp") VALUES ('1','2026-09-01',5) ON CONFLICT ("logdate","city_id") DO UPDATE SET "city_id"='2'	!0A000 invalid ON UPDATE specification DETAIL: The result tuple would appear in a different partition than the original tuple.
+ROLLBACK TO s11		-
+CREATE TABLE "parts" ("id" bigserial primary key, "a" integer, "b" integer)		-
+CREATE UNIQUE INDEX "parts_partial" ON "parts" ("a") WHERE "b" IS NOT NULL		-
+INSERT INTO "parts" ("a","b") VALUES (1, 1)		-
+SAVEPOINT s12		-
+INSERT INTO "parts" ("a","b") VALUES (1, 2) ON CONFLICT ("a") WHERE "b" IS NOT NULL DO UPDATE SET "b"=excluded."b"		-
+SELECT 'r', a, b FROM "parts" ORDER BY id	text,integer,integer	r|1|2
+ROLLBACK TO s12		-
+SAVEPOINT s13		-
+INSERT INTO "parts" ("a","b") VALUES (1, 2) ON CONFLICT ("a") DO NOTHING	!42P10 there is no unique or exclusion constraint matching the ON CONFLICT specification
+ROLLBACK TO s13		-
+SAVEPOINT s14		-
+CREATE TABLE "ts" ("id" bigserial primary key, "k" integer, "v" integer, "updated_at" timestamp(6))		-
+CREATE UNIQUE INDEX "ts_k" ON "ts" ("k")		-
+INSERT INTO "ts" ("k","v","updated_at") VALUES (1, 1, '2026-01-01 00:00:00')		-
+INSERT INTO "ts" ("k","v","updated_at") VALUES (1, 1, '2026-02-02 00:00:00') ON CONFLICT ("k") DO UPDATE SET updated_at=(CASE WHEN ("ts"."v" IS NOT DISTINCT FROM excluded."v") THEN "ts".updated_at ELSE CURRENT_TIMESTAMP END),"v"=excluded."v"		-
+SELECT 'r', k, v, updated_at FROM "ts"	text,integer,integer,timestamp(6) without time zone	r|1|1|2026-01-01 00:00:00
+ROLLBACK TO s14		-
+SELECT 'r', pg_typeof(id) FROM "books" LIMIT 1	text,regtype	r|bigint
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname LIKE 'books%' OR relname LIKE 'measurements%' OR relname LIKE 'parts%' OR relname LIKE 'ts%'	bigint	0

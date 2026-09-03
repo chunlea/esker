@@ -141,6 +141,47 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
                 if_not_exists: create.if_not_exists,
             }))
         }
+        // `CREATE SCHEMA [IF NOT EXISTS] name`. **The suite writes the nested form**
+        // (`CREATE SCHEMA s CREATE TABLE t (…)`) which `sqlparser` 0.62.0 cannot read at all — a
+        // C1 gap in the plan's register, and the reason `schema_test.rb` is still out of reach.
+        Statement::CreateSchema {
+            schema_name,
+            if_not_exists,
+            with,
+            options,
+            default_collate_spec,
+            clone,
+        } => {
+            use sqlparser::ast::SchemaName;
+            refuse_if(with.is_some(), "CREATE SCHEMA ... WITH")?;
+            refuse_if(options.is_some(), "CREATE SCHEMA with options")?;
+            refuse_if(
+                default_collate_spec.is_some(),
+                "CREATE SCHEMA ... DEFAULT COLLATE",
+            )?;
+            refuse_if(clone.is_some(), "CREATE SCHEMA ... CLONE")?;
+            let SchemaName::Simple(name) = schema_name else {
+                // `AUTHORIZATION` names an owner, and there are no roles here.
+                return Err(SqlError::unsupported("CREATE SCHEMA ... AUTHORIZATION"));
+            };
+            Ok(plan::Statement::CreateSchema(plan::CreateSchema {
+                name: object_name(name)?,
+                if_not_exists: *if_not_exists,
+            }))
+        }
+        Statement::AlterSchema(alter) => {
+            use sqlparser::ast::AlterSchemaOperation;
+            refuse_if(alter.if_exists, "ALTER SCHEMA IF EXISTS")?;
+            let [AlterSchemaOperation::Rename { name: to }] = alter.operations.as_slice() else {
+                return Err(SqlError::unsupported("ALTER SCHEMA, other than RENAME TO"));
+            };
+            Ok(plan::Statement::AlterSchemaRename(
+                plan::AlterSchemaRename {
+                    name: object_name(&alter.name)?,
+                    to: object_name(to)?,
+                },
+            ))
+        }
         Statement::Drop {
             object_type,
             if_exists,
@@ -178,6 +219,11 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
                     cascade: *cascade,
                 }),
                 ObjectType::Sequence => plan::Statement::DropSequence(plan::DropSequence {
+                    names,
+                    if_exists: *if_exists,
+                    cascade: *cascade,
+                }),
+                ObjectType::Schema => plan::Statement::DropSchema(plan::DropSchema {
                     names,
                     if_exists: *if_exists,
                     cascade: *cascade,
@@ -2002,7 +2048,6 @@ fn lower_insert(insert: &sqlparser::ast::Insert) -> Result<plan::Insert> {
     refuse_if(insert.ignore, "INSERT IGNORE")?;
     refuse_if(insert.overwrite, "INSERT OVERWRITE")?;
     refuse_if(insert.replace_into, "REPLACE INTO")?;
-    refuse_if(insert.on.is_some(), "INSERT ... ON CONFLICT")?;
     let returning = insert
         .returning
         .as_deref()
@@ -2065,7 +2110,67 @@ fn lower_insert(insert: &sqlparser::ast::Insert) -> Result<plan::Insert> {
         columns,
         rows,
         returning,
+        on_conflict: insert.on.as_ref().map(lower_on_conflict).transpose()?,
     })
+}
+
+/// `ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET …`.
+///
+/// **The arbiter's `WHERE` has nowhere to go.** PostgreSQL infers a *partial* unique index only
+/// when the statement repeats its predicate — `ON CONFLICT ("a") WHERE "b" IS NOT NULL` — and
+/// `sqlparser` 0.62.0's `ConflictTarget::Columns` is a bare `Vec<Ident>`, so that spelling does not
+/// parse at all. A C1 gap, in the plan's register; the target-less and column-list forms, which are
+/// the two `build_insert_sql` writes, both parse.
+fn lower_on_conflict(on: &sqlparser::ast::OnInsert) -> Result<plan::OnConflict> {
+    use sqlparser::ast::{ConflictTarget, OnConflictAction, OnInsert};
+    let OnInsert::OnConflict(conflict) = on else {
+        return Err(SqlError::unsupported("INSERT ... ON DUPLICATE KEY UPDATE"));
+    };
+    let target = match &conflict.conflict_target {
+        None => Vec::new(),
+        Some(ConflictTarget::Columns(columns)) => columns
+            .iter()
+            .map(|name| fold_identifier(&name.value, name.quote_style.is_some()).0)
+            .collect(),
+        // A constraint by name is a different inference: it names the constraint rather than
+        // asking PostgreSQL to find one, and nothing captured it.
+        Some(ConflictTarget::OnConstraint(_)) => {
+            return Err(SqlError::unsupported("ON CONFLICT ON CONSTRAINT"));
+        }
+    };
+    let action = match &conflict.action {
+        OnConflictAction::DoNothing => plan::ConflictAction::DoNothing,
+        OnConflictAction::DoUpdate(update) => {
+            refuse_if(
+                update.selection.is_some(),
+                "ON CONFLICT ... DO UPDATE ... WHERE",
+            )?;
+            // **A target-less `DO UPDATE` is refused by a real server too**, which has nothing to
+            // infer from; this node names the clause instead of guessing an index.
+            refuse_if(
+                target.is_empty(),
+                "ON CONFLICT DO UPDATE with no conflict target",
+            )?;
+            plan::ConflictAction::DoUpdate(
+                update
+                    .assignments
+                    .iter()
+                    .map(|assignment| {
+                        let name = match &assignment.target {
+                            AssignmentTarget::ColumnName(name) => object_name(name)?,
+                            other @ AssignmentTarget::Tuple(_) => {
+                                return Err(SqlError::unsupported(format!(
+                                    "the assignment target {other}"
+                                )));
+                            }
+                        };
+                        Ok((name, lower_expr(&assignment.value)?))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        }
+    };
+    Ok(plan::OnConflict { target, action })
 }
 
 /// An expression, as far as phase 6a's `VALUES` needs one.
@@ -2109,6 +2214,28 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             expr,
         } => lower_expr(expr),
         Expr::Nested(inner) => lower_expr(inner),
+        // `~`, `~*`, `!~`, `!~*` — POSIX matching, in `LIKE`'s shape and for `LIKE`'s reason: a
+        // subject and a *pattern*, with modifiers a binary op has nowhere to put.
+        Expr::BinaryOp {
+            left,
+            op:
+                op @ (BinaryOperator::PGRegexMatch
+                | BinaryOperator::PGRegexIMatch
+                | BinaryOperator::PGRegexNotMatch
+                | BinaryOperator::PGRegexNotIMatch),
+            right,
+        } => Ok(plan::Expr::RegexMatch {
+            operand: Box::new(lower_expr(left)?),
+            pattern: Box::new(lower_expr(right)?),
+            negated: matches!(
+                op,
+                BinaryOperator::PGRegexNotMatch | BinaryOperator::PGRegexNotIMatch
+            ),
+            case_insensitive: matches!(
+                op,
+                BinaryOperator::PGRegexIMatch | BinaryOperator::PGRegexNotIMatch
+            ),
+        }),
         // `x [NOT] LIKE p [ESCAPE c]` and `ILIKE`, which is the same matcher with both sides
         // folded. `ANY` is Snowflake's and is refused by name.
         Expr::Like {
