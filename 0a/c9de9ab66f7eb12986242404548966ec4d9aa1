@@ -1,0 +1,39 @@
+crates/esker-sql/src/error.rs
+  s_2ed9df2fd94fee::t_b0ef0b195711c9 946-976,1004-1011,1488-1492,1533,1544,1610-1614,1735-1740,1837-1841
+crates/esker-sql/src/exec/dml.rs
+  s_2ed9df2fd94fee::t_257d6b25049ada 269-278,376-404,727-986,1031-1052
+crates/esker-sql/src/exec/query.rs
+  s_2ed9df2fd94fee::t_4466e66f4819ed 96-112
+crates/esker-sql/src/parse/lower.rs
+  s_2ed9df2fd94fee::t_a7a87f8c21117c 2061,2065-2123
+crates/esker-sql/src/plan/dml.rs
+  s_2ed9df2fd94fee::t_0dc0c160175c37 30-55
+crates/esker-sql/src/plan/mod.rs
+  s_2ed9df2fd94fee::t_f25c3c3659158d 40
+crates/esker-sql/tests/corpus/pg19_on_conflict.txt
+  s_2ed9df2fd94fee::t_76c7dcdd4ceb67 1-152
+crates/esker-sql/tests/on_conflict.rs
+  s_2ed9df2fd94fee::t_a1e1e51b624ba2 1-286
+crates/esker-sql/tests/partition_suite.rs
+  s_2ed9df2fd94fee::t_b2f0aae834a326 60-62,67
+crates/esker-sql/tests/slt/unsupported.slt
+  s_2ed9df2fd94fee::t_a9ff1719c47e8f 40-41,43
+docs/plans/phase-9-rails.md
+  s_2ed9df2fd94fee::t_5fe8ed0b7c9500 1287,1498
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "0ac9de9ab66f7eb12986242404548966ec4d9aa1",
+  "prompts": {},
+  "sessions": {
+    "s_2ed9df2fd94fee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ec622e3b-48a0-4735-8805-fe22838e8b26",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
