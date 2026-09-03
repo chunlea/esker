@@ -43,21 +43,29 @@ pub(crate) struct Cluster {
     dirs: Vec<TempDir>,
     /// `None` while that node is down.
     nodes: Vec<Mutex<Option<Node>>>,
+    /// The reserved listener each node has not yet taken, in node-index order. See
+    /// [`reserve_ports`]; emptied by that node's first start.
+    reserved: Vec<Mutex<Option<std::net::TcpListener>>>,
 }
 
 /// Reserves `count` ports by binding and releasing them.
 ///
-/// Every store has to know every peer's address before any server exists, so the addresses
-/// cannot come from the servers. A released port is rebound microseconds later; a peer that is
-/// briefly unreachable simply has its messages dropped and retried, which is the transport's
-/// ordinary behaviour.
-fn reserve_ports(count: usize) -> Vec<SocketAddr> {
-    let listeners: Vec<std::net::TcpListener> = (0..count)
+/// Every store has to know every peer's address before any server exists, so the addresses cannot
+/// come from the servers.
+///
+/// **The listeners are held, not released.** This used to bind each port, read its number and drop
+/// the listener, with a comment saying a released port is rebound microseconds later — and under a
+/// parallel suite run something else takes it in that window and the rebind is `Address already in
+/// use`, which surfaces as a panic in whatever test happened to be starting a cluster.
+/// `esker-store`'s harnesses and this crate's `txn_cluster` both made this fix for that reason.
+///
+/// The reasoning that was here is still true of a *restart*: a killed node's port really is
+/// released, and a peer that is briefly unreachable has its messages dropped and retried, which is
+/// the transport's ordinary behaviour. What it did not cover is the first bind, where nothing had
+/// gone wrong yet and the port was simply given away.
+fn reserve_ports(count: usize) -> Vec<std::net::TcpListener> {
+    (0..count)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    listeners
-        .iter()
-        .map(|listener| listener.local_addr().unwrap())
         .collect()
 }
 
@@ -68,7 +76,11 @@ impl Cluster {
             .enable_all()
             .build()
             .unwrap();
-        let addrs = reserve_ports(count);
+        let reserved = reserve_ports(count);
+        let addrs: Vec<SocketAddr> = reserved
+            .iter()
+            .map(|listener| listener.local_addr().unwrap())
+            .collect();
         let peers: Vec<PeerAddress> = (0..count)
             .map(|at| PeerAddress::new(at as u64 + 1, at as u64 + 1, addrs[at]))
             .collect();
@@ -80,6 +92,7 @@ impl Cluster {
             addrs,
             dirs,
             nodes: (0..count).map(|_| Mutex::new(None)).collect(),
+            reserved: reserved.into_iter().map(|l| Mutex::new(Some(l))).collect(),
         });
         for at in 0..count {
             cluster.start_node(at);
@@ -112,12 +125,19 @@ impl Cluster {
         };
         let addr = self.addrs[at];
         let service = StoreService::new(Arc::clone(&store));
+        // The reservation on the first start, and a fresh bind on a restart — where the killed
+        // node let the port go and nothing can hold it in the gap.
+        let held = self.reserved[at].lock().unwrap().take();
         let handle = self.runtime.block_on(async move {
-            Server::bind(addr, service, TransportConfig::new())
-                .await
-                .unwrap()
-                .spawn()
-                .unwrap()
+            let server = match held {
+                Some(listener) => {
+                    Server::from_listener(listener, service, TransportConfig::new()).unwrap()
+                }
+                None => Server::bind(addr, service, TransportConfig::new())
+                    .await
+                    .unwrap_or_else(|error| panic!("rebinding {addr} after a restart: {error}")),
+            };
+            server.spawn().unwrap()
         });
         *self.nodes[at].lock().unwrap() = Some(Node { store, handle });
     }
