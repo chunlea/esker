@@ -268,6 +268,8 @@ pub(crate) fn replay(corpus: &str, fixture: &[&str], divergences: &Divergences) 
     let mut node = Node::new(fixture);
     let mut checked = 0;
     let mut mismatched = Vec::new();
+    // Statements the aborted transaction swallowed — see the `25P02` arm below.
+    let mut cascaded = 0_usize;
     let mut type_mismatched = Vec::new();
     let mut agreed_after_all = Vec::new();
 
@@ -290,6 +292,15 @@ pub(crate) fn replay(corpus: &str, fixture: &[&str], divergences: &Divergences) 
                     types: ours,
                     rows: theirs,
                 },
+                // An undeclared types column pins nothing: the rows are the whole claim, and a
+                // difference in the declared types is neither a divergence nor a disagreement.
+            ) if rows == theirs && types.is_empty() && types != ours => {}
+            (
+                Answer::Rows { types, rows },
+                Answer::Rows {
+                    types: ours,
+                    rows: theirs,
+                },
             ) if rows == theirs && types != ours => {
                 if !divergences.types.contains(&statement.as_str()) {
                     type_mismatched.push(format!(
@@ -303,6 +314,20 @@ pub(crate) fn replay(corpus: &str, fixture: &[&str], divergences: &Divergences) 
                     agreed_after_all.push(format!("line {line_number}: {statement}"));
                 }
             }
+            // **A cascade, not a disagreement.** A session capture runs inside one `BEGIN`, so the
+            // first statement this node refuses that PostgreSQL answers aborts the transaction and
+            // every statement after it comes back `25P02` — forty of them in one file. Listing
+            // those as forty divergences would bury the one that caused them and would need forty
+            // entries to silence; they are counted instead, and the root divergence above is what
+            // has to be declared or fixed.
+            (_, Answer::Refused(message))
+                if message.starts_with("25P02") || message.starts_with("3B001") =>
+            {
+                // `3B001` is the second-order consequence: the `SAVEPOINT` that would have created
+                // it was itself swallowed by the abort, so the `ROLLBACK TO` has nothing to return
+                // to. Counted with the rest rather than reported as a divergence of its own.
+                cascaded += 1;
+            }
             _ => mismatched.push(format!(
                 "line {line_number}: {statement}\n  PostgreSQL: {expected}\n  Esker:      {actual}"
             )),
@@ -312,7 +337,8 @@ pub(crate) fn replay(corpus: &str, fixture: &[&str], divergences: &Divergences) 
     assert!(
         mismatched.is_empty(),
         "{} of {checked} statements disagree with PostgreSQL 19 and are not listed as \
-         divergences:\n\n{}",
+         divergences ({cascaded} more were swallowed by the aborted transaction and are not \
+         counted):\n\n{}",
         mismatched.len(),
         mismatched.join("\n\n")
     );
@@ -362,9 +388,23 @@ fn parse(corpus: &str) -> Vec<(usize, String, Answer)> {
                 .unwrap_or_else(|| panic!("line {}: no answer", index + 1));
             let answer = match second.strip_prefix('!') {
                 Some(message) => Answer::Refused(message.to_owned()),
-                // An empty types field is a command with no result set: `\gdesc` describes nothing
-                // for a `CREATE TABLE`, so the capture leaves the column blank.
-                None if second.is_empty() => Answer::Done,
+                // **An empty types field means the types were not declared, not that there is no
+                // result set.** A `CREATE TABLE` leaves it blank because `\gdesc` describes
+                // nothing for one — and so does a `SELECT` in a session capture whose `\gdesc`
+                // pass ran after its transaction rolled back, which is how such a capture records
+                // a query over a table that no longer exists. What decides is the *rows* field:
+                // `-` or nothing at all is a command, and anything else is rows whose declared
+                // types this line does not pin.
+                None if second.is_empty() => match fields.next() {
+                    None | Some("-") => Answer::Done,
+                    Some(rows) => Answer::Rows {
+                        types: Vec::new(),
+                        rows: rows
+                            .split(" ; ")
+                            .map(|row| row.split('|').map(str::to_owned).collect())
+                            .collect(),
+                    },
+                },
                 None => Answer::Rows {
                     types: second.split(',').map(str::to_owned).collect(),
                     rows: match fields.next().unwrap_or("-") {

@@ -186,6 +186,7 @@ pub(super) fn table_function_def(
         triggers_disabled: false,
         parents: Vec::new(),
         children: Vec::new(),
+        triggers: Vec::new(),
         child_scans: Vec::new(),
     })
 }
@@ -275,6 +276,7 @@ fn plan_derived(
         triggers_disabled: false,
         parents: Vec::new(),
         children: Vec::new(),
+        triggers: Vec::new(),
         child_scans: Vec::new(),
     }));
     // Wrapped rather than used bare, so `EXPLAIN` has a node to change the relation's name at:

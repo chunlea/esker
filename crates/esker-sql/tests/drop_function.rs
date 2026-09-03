@@ -12,15 +12,9 @@ const CORPUS_FIXTURE: &[&str] = &[];
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
     answers: &[
-        (
-            "SELECT 'g', count(*) FROM pg_proc WHERE proname = 'partitioned_insert_trigger'",
-            "**`pg_proc` is not implemented** — contract C2. It is in the corpus because it is how \
-             a client would check that the drop happened, and on this node the question has a \
-             different answer anyway: there is no `CREATE FUNCTION`, so the function namespace is \
-             a fixed list and `pg_proc` would report the same rows for every database. The list \
-             itself is asserted directly, in the test that keeps it in step with the functions \
-             the language actually has.",
-        ),
+        // **`pg_proc` exists now** and the entry that stood here is deleted (ADR 0031, rule 2).
+        // It said the view was not implemented; the define-only `CREATE FUNCTION` unit added it,
+        // and this line — a count of functions nobody created — agrees at zero.
         (
             "DROP FUNCTION lower",
             "**`lower` is overloaded on a real server and is not here**, so the two disagree about \

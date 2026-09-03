@@ -355,7 +355,10 @@ impl Executor {
             Statement::CreateExtension(create) => ddl::create_extension(self, txn, create),
             Statement::DropSequence(drop) => ddl::drop_sequence(self, txn, drop),
             Statement::CreateSequence(create) => ddl::create_sequence(self, txn, create),
-            Statement::DropFunction(drop) => ddl::drop_function(self, drop),
+            Statement::DropFunction(drop) => ddl::drop_function(self, txn, drop),
+            Statement::CreateFunction(create) => ddl::create_function(self, txn, create),
+            Statement::CreateTrigger(create) => ddl::create_trigger(self, txn, create),
+            Statement::DropTrigger(drop) => ddl::drop_trigger(self, txn, drop),
             Statement::DropTable(drop) => ddl::drop_table(self, txn, drop),
             Statement::CreateIndex(create) => ddl::create_index(self, txn, create),
             Statement::DropIndex(drop) => ddl::drop_index(self, txn, drop),
@@ -1335,6 +1338,13 @@ fn explain_lines(statement: &Statement) -> Vec<String> {
         Statement::CreateSequence(create) => {
             vec![format!("Create Sequence on {}", create.name)]
         }
+        Statement::CreateFunction(create) => {
+            vec![format!("Create Function on {}", create.name)]
+        }
+        Statement::CreateTrigger(create) => {
+            vec![format!("Create Trigger on {}", create.table)]
+        }
+        Statement::DropTrigger(drop) => vec![format!("Drop Trigger on {}", drop.table)],
         Statement::DropFunction(drop) => {
             let names: Vec<&str> = drop
                 .functions

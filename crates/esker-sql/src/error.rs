@@ -183,8 +183,9 @@ pub enum SqlError {
     ///
     /// `42704 undefined_object`, and PostgreSQL names **both** the trigger and the table it looked
     /// on, which is the useful half — a trigger name is unique per table, not per schema, so the
-    /// name alone would not say where it was looked for. This node has no triggers at all, so
-    /// every name reaches this; `ALL` and `USER` are keywords in that position and do not.
+    /// name alone would not say where it was looked for. `ALL` and `USER` are keywords in that
+    /// position and never reach here. Raised by `DROP TRIGGER` and by
+    /// `ALTER TABLE … DISABLE TRIGGER <name>` alike.
     #[error("trigger \"{trigger}\" for table \"{table}\" does not exist")]
     UndefinedTrigger {
         /// The trigger named.
@@ -893,6 +894,34 @@ pub enum SqlError {
         declared: &'static str,
     },
 
+    /// `CREATE FUNCTION … LANGUAGE x` for a language this server does not have: `42704`.
+    ///
+    /// `plpgsql` is the only one, and it is accepted **as a name** rather than as a runtime: the
+    /// body is stored and never executed.
+    #[error("language \"{0}\" does not exist")]
+    UndefinedLanguage(String),
+
+    /// A second `CREATE TRIGGER` of one name on one table: `42710`.
+    ///
+    /// A trigger's name is unique **per table**, not per database — two tables may each have a
+    /// trigger called `t` — which is why the message names both.
+    #[error("trigger \"{trigger}\" for relation \"{relation}\" already exists")]
+    DuplicateTrigger {
+        /// The trigger's name.
+        trigger: String,
+        /// The table it would be on.
+        relation: String,
+    },
+
+    /// `DROP FUNCTION` while a trigger still names it: `2BP01`.
+    #[error("cannot drop function {function} because other objects depend on it")]
+    DependentFunction {
+        /// The function, with its argument list.
+        function: String,
+        /// `trigger t on table x depends on function f()`.
+        detail: String,
+    },
+
     /// `DROP FUNCTION` on a **built-in**: `2BP01`, and `IF EXISTS` does not cover it.
     ///
     /// The clause covers absence and this is not absence — the function is there and is protected.
@@ -1339,6 +1368,7 @@ impl SqlError {
             }
             SqlError::UndefinedIndex(_)
             | SqlError::UndefinedType(_)
+            | SqlError::UndefinedLanguage(_)
             | SqlError::UndefinedTrigger { .. } => sqlstate::UNDEFINED_OBJECT,
             SqlError::SystemCatalog(_) => sqlstate::INSUFFICIENT_PRIVILEGE,
             SqlError::WrongObjectType { .. } | SqlError::AlterActionOnWrongObject { .. } => {
@@ -1351,6 +1381,9 @@ impl SqlError {
             | SqlError::UsingColumnMissing { .. }
             | SqlError::UndefinedColumnInRelation { .. } => sqlstate::UNDEFINED_COLUMN,
             SqlError::ColumnTypeConflict { .. } => sqlstate::DATATYPE_MISMATCH,
+
+            SqlError::DuplicateTrigger { .. } => sqlstate::DUPLICATE_OBJECT,
+
             SqlError::DuplicateTable(_) | SqlError::AlreadyExistsSkipping(_) => {
                 sqlstate::DUPLICATE_TABLE
             }
@@ -1438,7 +1471,8 @@ impl SqlError {
             SqlError::DependentObjectsStillExist { .. }
             | SqlError::DependentTable { .. }
             | SqlError::DependentSequence { .. }
-            | SqlError::FunctionRequiredBySystem(_) => {
+            | SqlError::FunctionRequiredBySystem(_)
+            | SqlError::DependentFunction { .. } => {
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST
             }
             SqlError::DuplicateConstraint { .. } | SqlError::DuplicateExtension(_) => {
@@ -1519,7 +1553,8 @@ impl SqlError {
             | SqlError::NumericFieldOverflow { detail }
             | SqlError::ForeignKeyViolation { detail, .. }
             | SqlError::ForeignKeyStillReferenced { detail, .. }
-            | SqlError::DependentTable { detail, .. } => Some(detail.clone()),
+            | SqlError::DependentTable { detail, .. }
+            | SqlError::DependentFunction { detail, .. } => Some(detail.clone()),
             // **Two sentences**, which PostgreSQL sends as two `DETAIL` lines. The first is the
             // surprising half: a redeclared inherited column is *merged* into the inherited one
             // and moved to its position, not rejected as a duplicate — only the type stops it.
@@ -1617,7 +1652,9 @@ impl SqlError {
             // and it is still the right sentence: it is what a real server says, and it is what
             // the user has to write once that unit lands. Saying something else would send them
             // looking for a different fix.
-            SqlError::DependentTable { .. } | SqlError::DependentSequence { .. } => {
+            SqlError::DependentTable { .. }
+            | SqlError::DependentSequence { .. }
+            | SqlError::DependentFunction { .. } => {
                 Some("Use DROP ... CASCADE to drop the dependent objects too.".to_owned())
             }
             SqlError::WrongObjectType {

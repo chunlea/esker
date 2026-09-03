@@ -1462,6 +1462,11 @@ fn catalog_function(
         CatalogFunc::ColDescription
         | CatalogFunc::ObjDescription
         | CatalogFunc::PgGetPartkeydef => Datum::Null,
+        // **`EXECUTE PROCEDURE` prints back as `EXECUTE FUNCTION`**, so the text out is not the
+        // text in — statement 762 writes the first spelling and statement 790 the second.
+        CatalogFunc::PgGetTriggerdef => {
+            crate::catalog::trigger_definition(env.relations()?, oid_argument(args.first())?)
+        }
         // Resolved before the plan was built (`crate::exec::Executor::bound`). One here means the
         // resolution was skipped, and answering it from the row would be a catalog read per row.
         CatalogFunc::RegClass => {

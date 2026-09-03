@@ -119,6 +119,17 @@ pub enum CatalogView {
     /// `PARTITION BY` here, so the emptiness is complete rather than provisional. Empty on a real
     /// server too until something partitions.
     PgInherits,
+    /// Every stored function: what `CREATE FUNCTION` wrote and nothing else — this node has no
+    /// built-in functions in `pg_proc`, which is a declared divergence.
+    PgProc,
+    /// Every trigger registered on a table, and never fired.
+    PgTrigger,
+    /// The procedural languages, which is **one**: `plpgsql`.
+    ///
+    /// A name rather than a runtime — a `CREATE FUNCTION … LANGUAGE plpgsql` body is stored and
+    /// never executed. Reporting the language is what makes that definition storable, and it is
+    /// the first thing a client asks before writing one.
+    PgLanguage,
     /// The values of every enum type, which is **none**: `CREATE TYPE … AS ENUM` is `0A000`, so
     /// nothing can put a row here. Empty on a real server too until somebody makes an enum.
     PgEnum,
@@ -142,7 +153,7 @@ pub enum CatalogView {
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 18] = [
+    pub const ALL: [CatalogView; 21] = [
         CatalogView::PgType,
         CatalogView::PgRange,
         CatalogView::PgClass,
@@ -154,6 +165,9 @@ impl CatalogView {
         CatalogView::PgCollation,
         CatalogView::PgExtension,
         CatalogView::PgInherits,
+        CatalogView::PgProc,
+        CatalogView::PgTrigger,
+        CatalogView::PgLanguage,
         CatalogView::PgEnum,
         CatalogView::PgAvailableExtensions,
         CatalogView::InformationSchemaTables,
@@ -179,6 +193,9 @@ impl CatalogView {
             CatalogView::PgExtension => "pg_extension",
             CatalogView::PgAvailableExtensions => "pg_available_extensions",
             CatalogView::PgInherits => "pg_inherits",
+            CatalogView::PgProc => "pg_proc",
+            CatalogView::PgTrigger => "pg_trigger",
+            CatalogView::PgLanguage => "pg_language",
             CatalogView::PgEnum => "pg_enum",
             CatalogView::InformationSchemaTables => "information_schema.tables",
             CatalogView::InformationSchemaColumns => "information_schema.columns",
@@ -208,6 +225,9 @@ impl CatalogView {
                 CatalogView::PgCollation => 8,
                 CatalogView::PgExtension => 14,
                 CatalogView::PgInherits => 15,
+                CatalogView::PgProc => 18,
+                CatalogView::PgTrigger => 19,
+                CatalogView::PgLanguage => 20,
                 CatalogView::PgEnum => 16,
                 CatalogView::PgAvailableExtensions => 17,
                 CatalogView::InformationSchemaTables => 9,
@@ -305,6 +325,36 @@ impl CatalogView {
                 ("inhparent", ColumnType::Int8),
                 ("inhseqno", ColumnType::Int4),
             ],
+            // What the capture reads, and `prosrc` because its **length** is how a client checks
+            // the body survived. `prokind` is `f` and `provolatile` `v`, both `"char"` on a real
+            // server and `text` here.
+            CatalogView::PgLanguage => &[
+                ("oid", ColumnType::Int8),
+                ("lanname", ColumnType::Text),
+                ("lanpltrusted", ColumnType::Bool),
+            ],
+            CatalogView::PgProc => &[
+                ("oid", ColumnType::Int8),
+                ("proname", ColumnType::Text),
+                ("pronamespace", ColumnType::Int8),
+                ("prokind", ColumnType::Text),
+                ("pronargs", ColumnType::Int2),
+                ("provolatile", ColumnType::Text),
+                ("prosrc", ColumnType::Text),
+                ("prolang", ColumnType::Text),
+            ],
+            // `tgenabled` is a **letter** and `tgtype` a bitmask, neither of which is the word the
+            // DDL used.
+            CatalogView::PgTrigger => &[
+                ("oid", ColumnType::Int8),
+                ("tgrelid", ColumnType::Int8),
+                ("tgname", ColumnType::Text),
+                ("tgenabled", ColumnType::Text),
+                ("tgtype", ColumnType::Int2),
+                ("tgnargs", ColumnType::Int2),
+                ("tgisinternal", ColumnType::Bool),
+                ("tgfoid", ColumnType::Int8),
+            ],
             // The five a real server has, in its order. `name` is of type `name` there and the
             // four others are `text`; this node has one string type and answers `text` for all
             // five, which is the same trade every `pg_catalog` column makes.
@@ -356,6 +406,8 @@ impl CatalogView {
             CatalogView::PgAttrdef => super::pg_attribute::default_rows(txn, tenant),
             CatalogView::PgIndex => super::pg_index::rows(txn, tenant),
             CatalogView::PgInherits => inherits_rows(txn, tenant),
+            CatalogView::PgProc => proc_rows(txn, tenant),
+            CatalogView::PgTrigger => trigger_rows(txn, tenant),
             CatalogView::PgConstraint => super::pg_constraint::rows(txn, tenant),
             CatalogView::InformationSchemaTables => super::information_schema::tables(txn, tenant),
             CatalogView::InformationSchemaColumns => {
@@ -367,6 +419,14 @@ impl CatalogView {
             CatalogView::InformationSchemaKeyColumnUsage => {
                 super::information_schema::key_column_usage(txn, tenant)
             }
+            // **Trusted**, which is what `lanpltrusted` says of `plpgsql` on a real server: a
+            // non-superuser may write a function in it. Nothing here acts on the flag; it is
+            // reported because a client reads it before defining one.
+            CatalogView::PgLanguage => Ok(vec![vec![
+                Datum::Int8(PLPGSQL_LANGUAGE_OID),
+                Datum::Text("plpgsql".to_owned()),
+                Datum::Bool(true),
+            ]]),
             CatalogView::PgNamespace => Ok(vec![vec![
                 Datum::Int8(PUBLIC_NAMESPACE_OID),
                 Datum::Text(PUBLIC_SCHEMA.to_owned()),
@@ -470,6 +530,9 @@ impl CatalogView {
             | CatalogView::PgCollation
             | CatalogView::PgExtension
             | CatalogView::PgInherits
+            | CatalogView::PgProc
+            | CatalogView::PgTrigger
+            | CatalogView::PgLanguage
             | CatalogView::PgEnum
             | CatalogView::PgClass
             | CatalogView::PgNamespace
@@ -526,6 +589,7 @@ impl CatalogView {
                         triggers_disabled: false,
                         parents: Vec::new(),
                         children: Vec::new(),
+                        triggers: Vec::new(),
                         child_scans: Vec::new(),
                     })
                 })
@@ -573,6 +637,9 @@ pub fn refuse_write(name: &str) -> Result<()> {
 /// reserved beside the view ids for the same reason they are — nothing a user creates can reach
 /// it. What has to be true is only that `relnamespace` equals `pg_namespace.oid`, which is the
 /// join `ActiveRecord` writes.
+/// The oid `pg_language` reports for `plpgsql`, and what a `pg_proc.prolang` would point at.
+const PLPGSQL_LANGUAGE_OID: i64 = 14_024;
+
 const PUBLIC_NAMESPACE_OID: i64 = 11;
 
 /// The extensions this build offers, with the version each installs at.
@@ -644,6 +711,70 @@ const PUBLIC_SCHEMA: &str = "public";
 /// used to read the id out of the name record's *key*, so a primary key and a sequence both
 /// reported the table's own id and three rows of `pg_class` shared one oid. Nothing read the
 /// column before phase 13; every statement in the schema-dump path joins on it.
+/// One row per stored function.
+///
+/// **Only what `CREATE FUNCTION` wrote.** A real server's `pg_proc` also holds every built-in, and
+/// this one does not — a declared divergence, and the reason `DROP FUNCTION`'s protected list is a
+/// table in the executor rather than a query over this view.
+fn proc_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+    Ok(super::functions(txn, tenant)?
+        .into_iter()
+        .map(|function| {
+            vec![
+                Datum::Int8(super::pg_relations::as_oid(function.id)),
+                Datum::Text(function.name),
+                Datum::Int8(PUBLIC_NAMESPACE_OID),
+                // `f` for an ordinary function; `p` is a procedure and `a` an aggregate.
+                Datum::Text("f".to_owned()),
+                Datum::Int2(0),
+                // `v` for volatile, which is the default and what a trigger function is.
+                Datum::Text("v".to_owned()),
+                Datum::Text(function.body),
+                Datum::Text(function.language),
+            ]
+        })
+        .collect())
+}
+
+/// One row per registered trigger.
+fn trigger_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+    let relations = super::pg_relations::Relations::read(txn, tenant)?;
+    let functions = super::functions(txn, tenant)?;
+    let mut rows = Vec::new();
+    for table in relations.tables() {
+        for (at, trigger) in table.triggers.iter().enumerate() {
+            let foid = functions
+                .iter()
+                .find(|function| function.name == trigger.function)
+                .map_or(0, |function| super::pg_relations::as_oid(function.id));
+            rows.push(vec![
+                Datum::Int8(trigger_oid(table.id, at)),
+                Datum::Int8(super::pg_relations::as_oid(table.id)),
+                Datum::Text(trigger.name.clone()),
+                Datum::Text(trigger.tgenabled().to_owned()),
+                Datum::Int2(trigger.tgtype()),
+                Datum::Int2(0),
+                // **Never internal.** A foreign key's own triggers are, and this node has none of
+                // those as rows — `NOT tgisinternal` is how a client filters them out and it must
+                // not hide a user's trigger.
+                Datum::Bool(false),
+                Datum::Int8(foid),
+            ]);
+        }
+    }
+    Ok(rows)
+}
+
+/// A trigger's oid: its table and its position, the way a `CHECK`'s is built.
+pub(super) fn trigger_oid(table_id: u64, at: usize) -> i64 {
+    // A table cannot hold more triggers than a `Vec` can index, and the multiply keeps each
+    // table's block of a thousand to itself.
+    let at = i64::try_from(at).unwrap_or(i64::MAX);
+    super::pg_relations::as_oid(table_id)
+        .wrapping_mul(1_000)
+        .wrapping_add(at.wrapping_add(1))
+}
+
 /// One row per inheritance edge, the way `pg_inherits` holds them.
 ///
 /// Read from the **child** side, because that is where the order lives: `inhseqno` numbers a

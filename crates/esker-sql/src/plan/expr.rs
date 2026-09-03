@@ -557,6 +557,12 @@ pub enum CatalogFunc {
     /// itself — and NULL is what a real server answers for a table that is not partitioned, for
     /// an **index**, and for an oid that names nothing. Measured all three.
     PgGetPartkeydef,
+    /// `pg_get_triggerdef(oid)`: a trigger's `CREATE TRIGGER`, re-printed.
+    ///
+    /// **It normalises `EXECUTE PROCEDURE` to `EXECUTE FUNCTION`**, so the text that comes out is
+    /// not the text that went in — statement 762 writes the first spelling and 790 the second, and
+    /// only the second is ever printed.
+    PgGetTriggerdef,
     /// `'name'::regclass`: the oid of a relation, by name.
     ///
     /// Not a function a client can call by that name — it is the cast, lowered to one, because a
@@ -647,6 +653,9 @@ impl CatalogFunc {
             {
                 Some(CatalogFunc::Now)
             }
+            () if name.eq_ignore_ascii_case("pg_get_triggerdef") => {
+                Some(CatalogFunc::PgGetTriggerdef)
+            }
             () if name.eq_ignore_ascii_case("current_date") => Some(CatalogFunc::CurrentDate),
             () if name.eq_ignore_ascii_case("random") => Some(CatalogFunc::Random),
             () if name.eq_ignore_ascii_case("concat") => Some(CatalogFunc::Concat),
@@ -682,6 +691,7 @@ impl CatalogFunc {
             CatalogFunc::ColDescription => "col_description",
             CatalogFunc::ObjDescription => "obj_description",
             CatalogFunc::PgGetPartkeydef => "pg_get_partkeydef",
+            CatalogFunc::PgGetTriggerdef => "pg_get_triggerdef",
             // Two directions of one cast, and PostgreSQL names both of them `regclass`.
             CatalogFunc::RegClass | CatalogFunc::RegClassName => "regclass",
             CatalogFunc::ArrayPosition => "array_position",
@@ -717,6 +727,7 @@ impl CatalogFunc {
             CatalogFunc::PgGetIndexdef => &[1, 3],
             CatalogFunc::PgGetConstraintdef | CatalogFunc::ObjDescription => &[1, 2],
             CatalogFunc::PgGetPartkeydef
+            | CatalogFunc::PgGetTriggerdef
             | CatalogFunc::RegClass
             | CatalogFunc::RegClassName
             | CatalogFunc::Cardinality => &[1],
@@ -735,6 +746,7 @@ impl CatalogFunc {
             | CatalogFunc::PgGetExpr
             | CatalogFunc::PgGetIndexdef
             | CatalogFunc::PgGetConstraintdef
+            | CatalogFunc::PgGetTriggerdef
             | CatalogFunc::ColDescription
             | CatalogFunc::ObjDescription
             // A `regclass` on a real server is an oid that *prints* as a name; `text` here, which

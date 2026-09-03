@@ -132,6 +132,55 @@ pub enum ColumnDefault {
     },
 }
 
+/// `CREATE [OR REPLACE] FUNCTION f() RETURNS TRIGGER AS $$…$$ LANGUAGE plpgsql`.
+///
+/// **Define-only.** The body is stored verbatim and never parsed, let alone run: the schema load
+/// reaches this twice and inserts nothing through it, so what it needs is a catalog that can hold
+/// a function. PostgreSQL validates a plpgsql body at `CREATE` time and this node does not, which
+/// is a declared divergence and not what the load requires.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateFunction {
+    /// Its name, folded.
+    pub name: String,
+    /// The body between the dollar quotes, exactly as written.
+    pub body: String,
+    /// `LANGUAGE …`, folded. Anything but `plpgsql` is `42704` at execution.
+    pub language: String,
+    /// `OR REPLACE`. Absent, a name already taken is still a success here — PostgreSQL's `42723`
+    /// for a duplicate function is unreachable while every function takes no arguments.
+    pub or_replace: bool,
+}
+
+/// `CREATE TRIGGER t BEFORE|AFTER <events> ON tbl FOR EACH ROW EXECUTE FUNCTION|PROCEDURE f()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTrigger {
+    /// The trigger's name, folded.
+    pub name: String,
+    /// The table it is on.
+    pub table: String,
+    /// `BEFORE` rather than `AFTER`.
+    pub before: bool,
+    /// The events as `tgtype` bits: `4` INSERT, `8` DELETE, `16` UPDATE.
+    pub events: i16,
+    /// `FOR EACH ROW`.
+    pub for_each_row: bool,
+    /// The function it names, folded — **`EXECUTE PROCEDURE` and `EXECUTE FUNCTION` are one
+    /// clause**: statement 762 writes the first and 790 the second, and `pg_get_triggerdef` prints
+    /// only the second.
+    pub function: String,
+}
+
+/// `DROP TRIGGER [IF EXISTS] t ON tbl`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropTrigger {
+    /// The trigger's name.
+    pub name: String,
+    /// The table it is on — a trigger is named per table, not per database.
+    pub table: String,
+    /// `IF EXISTS`.
+    pub if_exists: bool,
+}
+
 /// `DROP FUNCTION [IF EXISTS] f [(<types>)] [, …]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropFunction {

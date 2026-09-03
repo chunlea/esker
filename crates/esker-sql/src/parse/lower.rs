@@ -68,6 +68,27 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
         Statement::CreateIndex(create) => {
             Ok(plan::Statement::CreateIndex(lower_create_index(create)?))
         }
+        Statement::CreateFunction(create) => Ok(plan::Statement::CreateFunction(
+            lower_create_function(create)?,
+        )),
+        Statement::CreateTrigger(create) => Ok(plan::Statement::CreateTrigger(
+            lower_create_trigger(create)?,
+        )),
+        Statement::DropTrigger(drop) => Ok(plan::Statement::DropTrigger(plan::DropTrigger {
+            name: drop
+                .trigger_name
+                .0
+                .last()
+                .and_then(|part| part.as_ident())
+                .map(|ident| fold_identifier(&ident.value, ident.quote_style.is_some()).0)
+                .ok_or_else(|| SqlError::unsupported("DROP TRIGGER with no name"))?,
+            table: relation_name(
+                drop.table_name
+                    .as_ref()
+                    .ok_or_else(|| SqlError::unsupported("DROP TRIGGER with no table"))?,
+            )?,
+            if_exists: drop.if_exists,
+        })),
         Statement::DropFunction(drop) => {
             Ok(plan::Statement::DropFunction(lower_drop_function(drop)?))
         }
@@ -1013,6 +1034,114 @@ fn unique_deferrable(
         "UNIQUE ... ENFORCED, which is MySQL's",
     )?;
     Ok(characteristics.deferrable.unwrap_or(false))
+}
+
+/// `CREATE [OR REPLACE] FUNCTION f() RETURNS TRIGGER AS $$…$$ LANGUAGE plpgsql`.
+///
+/// **The body is taken verbatim and never parsed.** PostgreSQL validates a plpgsql body when the
+/// function is created — a missing semicolon is `42601` from the `CREATE` itself — and this node
+/// does not, which is a declared divergence rather than the thing the schema load needs. What the
+/// load needs is that the definition survives, semicolons and all.
+fn lower_create_function(create: &sqlparser::ast::CreateFunction) -> Result<plan::CreateFunction> {
+    use sqlparser::ast::CreateFunctionBody;
+    refuse_if(create.temporary, "CREATE TEMPORARY FUNCTION")?;
+    // Every function this node stores takes none: the trigger functions the suite defines have no
+    // arguments, and a parameter list would be a signature to resolve calls against.
+    refuse_if(
+        create.args.as_ref().is_some_and(|args| !args.is_empty()),
+        "CREATE FUNCTION with arguments",
+    )?;
+    let language = create
+        .language
+        .as_ref()
+        .map(|ident| fold_identifier(&ident.value, ident.quote_style.is_some()).0)
+        .ok_or_else(|| SqlError::unsupported("CREATE FUNCTION with no LANGUAGE"))?;
+    let body = match &create.function_body {
+        // `AS $$…$$` before the options or after them: PostgreSQL takes both orders and
+        // `ActiveRecord` writes the second.
+        Some(
+            CreateFunctionBody::AsBeforeOptions { body: expr, .. }
+            | CreateFunctionBody::AsAfterOptions(expr),
+        ) => {
+            match expr {
+                Expr::Value(value) => match &value.value {
+                    // A dollar-quoted body arrives with its delimiters already stripped, which is
+                    // exactly what `pg_proc.prosrc` holds.
+                    Value::DollarQuotedString(quoted) => quoted.value.clone(),
+                    Value::SingleQuotedString(text) => text.clone(),
+                    other => other.to_string(),
+                },
+                other => other.to_string(),
+            }
+        }
+        _ => return Err(SqlError::unsupported("CREATE FUNCTION with no body")),
+    };
+    Ok(plan::CreateFunction {
+        name: relation_name(&create.name)?,
+        body,
+        language,
+        or_replace: create.or_replace,
+    })
+}
+
+/// `CREATE TRIGGER t BEFORE|AFTER <events> ON tbl FOR EACH ROW EXECUTE FUNCTION|PROCEDURE f()`.
+///
+/// **`EXECUTE PROCEDURE` and `EXECUTE FUNCTION` are one clause**, and both have to parse: statement
+/// 762 writes the first, statement 790 the second, and `pg_get_triggerdef` prints only the second.
+fn lower_create_trigger(create: &sqlparser::ast::CreateTrigger) -> Result<plan::CreateTrigger> {
+    use sqlparser::ast::{TriggerEvent, TriggerObject, TriggerObjectKind, TriggerPeriod};
+    refuse_if(create.is_constraint, "CREATE CONSTRAINT TRIGGER")?;
+    refuse_if(create.condition.is_some(), "CREATE TRIGGER ... WHEN")?;
+    refuse_if(create.or_replace, "CREATE OR REPLACE TRIGGER")?;
+    let before = match create.period {
+        Some(TriggerPeriod::Before) => true,
+        Some(TriggerPeriod::After) => false,
+        other => {
+            return Err(SqlError::unsupported(format!(
+                "CREATE TRIGGER {}",
+                other.map_or_else(|| "with no period".to_owned(), |period| period.to_string())
+            )));
+        }
+    };
+    // PostgreSQL's own `tgtype` bits, so the mask is the answer rather than a translation of one.
+    let mut events = 0;
+    for event in &create.events {
+        events |= match event {
+            TriggerEvent::Insert => 4,
+            TriggerEvent::Delete => 8,
+            TriggerEvent::Update(columns) if columns.is_empty() => 16,
+            other => {
+                return Err(SqlError::unsupported(format!("CREATE TRIGGER ... {other}")));
+            }
+        };
+    }
+    let function = create
+        .exec_body
+        .as_ref()
+        .map(|body| relation_name(&body.func_desc.name))
+        .transpose()?
+        .ok_or_else(|| SqlError::unsupported("CREATE TRIGGER with no EXECUTE clause"))?;
+    Ok(plan::CreateTrigger {
+        name: create
+            .name
+            .0
+            .last()
+            .and_then(|part| part.as_ident())
+            .map(|ident| fold_identifier(&ident.value, ident.quote_style.is_some()).0)
+            .ok_or_else(|| SqlError::unsupported("CREATE TRIGGER with no name"))?,
+        table: relation_name(&create.table_name)?,
+        before,
+        events,
+        // `FOR EACH ROW` and `FOR ROW` are the same thing; `STATEMENT` is the other object.
+        for_each_row: matches!(
+            create.trigger_object,
+            Some(
+                TriggerObjectKind::For(TriggerObject::Row)
+                    | TriggerObjectKind::ForEach(TriggerObject::Row)
+            )
+        ),
+        function,
+    })
 }
 
 /// A columnar-replica count: a plain non-negative integer, and nothing else.

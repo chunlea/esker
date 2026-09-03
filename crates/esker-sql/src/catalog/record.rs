@@ -48,8 +48,9 @@ use esker_base::varint;
 use esker_keys::{codec, prefix};
 
 use crate::catalog::{
-    CheckDef, ColumnDef, ExprShape, ForeignKeyDef, Identity, IndexDef, IndexKey, KeyOrder, KeyPart,
-    ReferentialAction, Relation, SchemaState, SequenceDef, TableDef, UniqueKind,
+    CheckDef, ColumnDef, ExprShape, ForeignKeyDef, FunctionDef, Identity, IndexDef, IndexKey,
+    KeyOrder, KeyPart, ReferentialAction, Relation, SchemaState, SequenceDef, TableDef, TriggerDef,
+    UniqueKind,
 };
 use crate::error::{Result, SqlError};
 use crate::value::{ColumnType, Datum, NO_TYPMOD};
@@ -76,7 +77,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 17;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 18;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -89,6 +90,10 @@ const OLDEST_TABLE_VERSION: u8 = 2;
 /// a reader newer than 12 must still accept the ones version 12 wrote — which is what this floor
 /// says and `CATALOG_FORMAT_VERSION` would not.
 const OLDEST_EXTENSION_VERSION: u8 = 12;
+
+/// The version a **function** record was introduced at, read as its own floor for the reason the
+/// extension's is: a reader newer than 18 must still accept what 18 wrote.
+const OLDEST_FUNCTION_VERSION: u8 = 18;
 
 /// What every catalog key begins with, after the `'m'` namespace byte.
 const SQL: &[u8] = b"sql";
@@ -113,6 +118,8 @@ const KIND_FK_BACKREF: u8 = b'k';
 /// are not stored; which of them a tenant has installed is state, and a real server's outlives the
 /// session that installed it.
 const KIND_EXTENSION: u8 = b'x';
+/// A stored function, keyed by name.
+const KIND_FUNCTION: u8 = b'f';
 
 /// Tags for [`ColumnType`] as stored. Ours rather than PostgreSQL's OIDs, because these are a
 /// format we own and must never move; the OIDs stay on the wire where they belong.
@@ -463,6 +470,63 @@ pub(super) fn decode_extension(bytes: &[u8]) -> Result<String> {
     let version = reader.string()?;
     reader.finish()?;
     Ok(version)
+}
+
+/// One stored function, keyed by name — a record of its own, as an extension is.
+///
+/// Not in a table record, because a function belongs to no table: the trigger function statement
+/// 790 defines is named by a trigger on one table and could be named by a trigger on another.
+#[must_use]
+pub(super) fn function_key(tenant: u64, name: &str) -> Vec<u8> {
+    let mut suffix = [SQL, &[KIND_FUNCTION]].concat();
+    codec::encode_u64(tenant, &mut suffix);
+    suffix.extend_from_slice(name.as_bytes());
+    prefix::meta_key(&suffix)
+}
+
+/// Every stored function of one tenant: the range [`function_key`] writes into.
+#[must_use]
+pub(super) fn function_range(tenant: u64) -> (Vec<u8>, Vec<u8>) {
+    let start = function_key(tenant, "");
+    let mut end = start.clone();
+    end.push(0xff);
+    (start, end)
+}
+
+/// The name out of a key [`function_key`] wrote.
+pub(super) fn function_name_of(tenant: u64, key: &[u8]) -> Result<String> {
+    let prefix = function_key(tenant, "");
+    let name = key
+        .strip_prefix(prefix.as_slice())
+        .ok_or_else(|| corrupt("a function key outside its own range"))?;
+    String::from_utf8(name.to_vec()).map_err(|_| corrupt("a function name that is not UTF-8"))
+}
+
+/// One function: `version ++ id ++ language ++ body`. The name is in the key.
+#[must_use]
+pub(super) fn encode_function(function: &FunctionDef) -> Vec<u8> {
+    let mut out = vec![CATALOG_FORMAT_VERSION];
+    out.extend_from_slice(&function.id.to_le_bytes());
+    put_str(&function.language, &mut out);
+    // **Verbatim** — semicolons, newlines and all. `pg_proc.prosrc` holds exactly this and
+    // `length(prosrc)` counts it, which is what the capture pins.
+    put_str(&function.body, &mut out);
+    out
+}
+
+/// Reads one back. `name` comes from the key the caller read it under.
+pub(super) fn decode_function(bytes: &[u8], name: String) -> Result<FunctionDef> {
+    let mut reader = Reader::at_least(bytes, OLDEST_FUNCTION_VERSION)?;
+    let id = reader.u64_le()?;
+    let language = reader.string()?;
+    let body = reader.string()?;
+    reader.finish()?;
+    Ok(FunctionDef {
+        id,
+        name,
+        body,
+        language,
+    })
 }
 
 /// A retention, in milliseconds, behind the same version byte as every other record.
@@ -854,6 +918,10 @@ pub(super) fn decode_counter(bytes: &[u8]) -> Result<u64> {
 /// the index list lived under its own keys a cached table could be current while its index list
 /// was stale — which is the one kind of staleness that corrupts data rather than returning old
 /// data, because a row would be written without an entry in an index that exists.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one block per format version, in version order; that order is the invariant"
+)]
 pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
     let mut out = vec![CATALOG_FORMAT_VERSION];
     out.extend_from_slice(&table.id.to_le_bytes());
@@ -1032,6 +1100,21 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
     // until this byte, so a record that predates it cannot claim to be one.
     for index in &table.indexes {
         out.push(unique_kind_tag(index.constraint));
+    }
+
+    // Version 18. The triggers registered on this table: a count, then each one's fields — after
+    // version 17's bytes, the sixth section on the end and in version order like every one before
+    // it. A table written before 18 has none, which is what every table had while `CREATE TRIGGER`
+    // was `0A000`.
+    varint::put_u64(table.triggers.len() as u64, &mut out);
+    for trigger in &table.triggers {
+        put_str(&trigger.name, &mut out);
+        put_str(&trigger.function, &mut out);
+        out.push(u8::from(trigger.before));
+        out.push(u8::from(trigger.for_each_row));
+        out.push(u8::from(trigger.enabled));
+        // Non-negative by construction: the mask is built from PostgreSQL's own event bits.
+        varint::put_u64(trigger.events.unsigned_abs().into(), &mut out);
     }
 
     Ok(out)
@@ -1221,6 +1304,33 @@ fn read_inheritance(reader: &mut Reader<'_>) -> Result<(Vec<u64>, Vec<u64>)> {
     Ok((parents, children))
 }
 
+/// The version 18 section: the triggers registered on this table.
+fn read_triggers(reader: &mut Reader<'_>) -> Result<Vec<TriggerDef>> {
+    if reader.version < 18 {
+        return Ok(Vec::new());
+    }
+    let count = reader.count()?;
+    let mut triggers = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = reader.string()?;
+        let function = reader.string()?;
+        let before = reader.flag()?;
+        let for_each_row = reader.flag()?;
+        let enabled = reader.flag()?;
+        let events = i16::try_from(reader.varint()?)
+            .map_err(|_| corrupt("a trigger event mask that is not an i16"))?;
+        triggers.push(TriggerDef {
+            name,
+            before,
+            events,
+            for_each_row,
+            function,
+            enabled,
+        });
+    }
+    Ok(triggers)
+}
+
 /// Reads a table record back. Every failure is typed: a catalog is on-disk data like any other.
 #[allow(
     clippy::too_many_lines,
@@ -1348,6 +1458,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
             index.constraint = unique_kind_of(reader.byte()?)?;
         }
     }
+    let triggers = read_triggers(&mut reader)?;
     reader.finish()?;
 
     Ok(TableDef {
@@ -1364,6 +1475,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
         sequences: Vec::new(),
         parents,
         children,
+        triggers,
         child_scans: Vec::new(),
         checks,
         foreign_keys,

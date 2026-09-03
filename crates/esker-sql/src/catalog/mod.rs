@@ -677,12 +677,75 @@ pub struct TableDef {
     pub parents: Vec<u64>,
     /// See [`TableDef::parents`].
     pub children: Vec<u64>,
+    /// The triggers registered on this table, in creation order.
+    ///
+    /// **Stored and never fired.** `ALTER TABLE … DISABLE TRIGGER ALL` is a separate flag
+    /// ([`TableDef::triggers_disabled`]) that predates these and means something else: it turns
+    /// off the *internal* triggers a foreign key is made of.
+    pub triggers: Vec<TriggerDef>,
     /// How to read each child's rows **as this table's**, filled where the table is loaded.
     ///
     /// Derived rather than stored, exactly as [`TableDef::sequences`] is: a scan of a parent
     /// returns its children's rows too, and the planner has no catalog in reach to work out how.
     /// A record decoded straight from bytes therefore has none.
     pub child_scans: Vec<ChildScan>,
+}
+
+/// A stored function — **defined and never executed**.
+///
+/// The schema load reaches `CREATE OR REPLACE FUNCTION … LANGUAGE plpgsql` twice (statements 762
+/// and 790) and inserts nothing through it; the capture proves the table is empty immediately
+/// after. So what a suite needs from this node is a catalog that can *hold* a function, not a
+/// procedural-language runtime — and exactly one test in the whole suite ever fires a trigger.
+/// Calling one is refused where the statement is lowered — before any catalog is in reach, so the
+/// message names the function rather than saying what a real server says, which is that trigger
+/// functions can only be called as triggers. A declared divergence, and the load never calls one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionDef {
+    /// Its own relation id, from the same counter tables draw from.
+    pub id: u64,
+    /// Its name, folded. This node holds one function per name: every function it can store takes
+    /// no arguments, so there is nothing to overload on.
+    pub name: String,
+    /// The body **verbatim**, without the dollar quotes — which is what `pg_proc.prosrc` holds and
+    /// what its `length()` counts.
+    pub body: String,
+    /// `LANGUAGE plpgsql`, folded. The only one this node accepts; anything else is `42704`.
+    pub language: String,
+}
+
+/// One trigger on a table — **registered and never fired**.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriggerDef {
+    /// Its name, unique per table rather than per database: `pg_trigger` is keyed by both, and
+    /// a second `CREATE TRIGGER` of the same name on the same table is `42710`.
+    pub name: String,
+    /// `BEFORE` or `AFTER`.
+    pub before: bool,
+    /// The events, as PostgreSQL's own `tgtype` bits: `4` INSERT, `8` DELETE, `16` UPDATE.
+    pub events: i16,
+    /// `FOR EACH ROW` rather than `FOR EACH STATEMENT`.
+    pub for_each_row: bool,
+    /// The function it names — by name, because the function is a separate record.
+    pub function: String,
+    /// `tgenabled`: **`O` when enabled and `D` when disabled**, a letter and not a boolean.
+    pub enabled: bool,
+}
+
+impl TriggerDef {
+    /// `tgtype`, the bitmask a client reads: `1` ROW, `2` BEFORE, then the events.
+    ///
+    /// `7` for `BEFORE INSERT … FOR EACH ROW`, which is what the capture pins.
+    #[must_use]
+    pub fn tgtype(&self) -> i16 {
+        i16::from(self.for_each_row) | (i16::from(self.before) << 1) | self.events
+    }
+
+    /// `tgenabled`.
+    #[must_use]
+    pub fn tgenabled(&self) -> &'static str {
+        if self.enabled { "O" } else { "D" }
+    }
 }
 
 /// One child table, seen from its parent: where its rows are and how they line up.
@@ -1800,6 +1863,91 @@ pub fn replace_sequence(txn: &mut dyn Txn, tenant: u64, sequence: &SequenceDef) 
     );
 }
 
+/// `pg_get_triggerdef(oid)` — a trigger's `CREATE TRIGGER`, re-printed.
+///
+/// **`EXECUTE PROCEDURE` normalises to `EXECUTE FUNCTION`.** The two are one clause and only the
+/// second is ever printed, so a client that round-trips a schema gets the newer spelling whichever
+/// it wrote — which matters because statement 762 writes the older one.
+#[must_use]
+pub fn trigger_definition(relations: &pg_relations::Relations, oid: Option<i64>) -> Datum {
+    let Some(oid) = oid else {
+        return Datum::Null;
+    };
+    for relation in relations.rows() {
+        let Some(table) = relations.table(relation) else {
+            continue;
+        };
+        for (at, trigger) in table.triggers.iter().enumerate() {
+            if pg_catalog::trigger_oid(table.id, at) != oid {
+                continue;
+            }
+            let mut events = Vec::new();
+            if trigger.events & 4 != 0 {
+                events.push("INSERT");
+            }
+            if trigger.events & 8 != 0 {
+                events.push("DELETE");
+            }
+            if trigger.events & 16 != 0 {
+                events.push("UPDATE");
+            }
+            return Datum::Text(format!(
+                "CREATE TRIGGER {} {} {} ON public.{} FOR EACH {} EXECUTE FUNCTION {}()",
+                trigger.name,
+                if trigger.before { "BEFORE" } else { "AFTER" },
+                events.join(" OR "),
+                table.name,
+                if trigger.for_each_row {
+                    "ROW"
+                } else {
+                    "STATEMENT"
+                },
+                trigger.function
+            ));
+        }
+    }
+    Datum::Null
+}
+
+/// Stores a function, replacing one of the same name.
+///
+/// **`CREATE OR REPLACE FUNCTION` run twice is a plain success**, not `42710` — measured, and
+/// unlike a second `CREATE TRIGGER` of the same name, which *is* a duplicate. `OR REPLACE` exists
+/// for the function and not for the trigger.
+pub fn write_function(txn: &mut dyn Txn, tenant: u64, function: &FunctionDef) -> Result<()> {
+    txn.put(
+        &record::function_key(tenant, &function.name),
+        &record::encode_function(function),
+    );
+    bump_version(txn)
+}
+
+/// One function by name, or `None`.
+pub fn function(txn: &dyn Txn, tenant: u64, name: &str) -> Result<Option<FunctionDef>> {
+    let Some(bytes) = txn.get(&record::function_key(tenant, name))? else {
+        return Ok(None);
+    };
+    record::decode_function(&bytes, name.to_owned()).map(Some)
+}
+
+/// Every stored function of one tenant, in name order.
+pub fn functions(txn: &dyn Txn, tenant: u64) -> Result<Vec<FunctionDef>> {
+    let (start, end) = record::function_range(tenant);
+    let mut out = Vec::new();
+    for (key, value) in txn.scan(&start, &end, u32::MAX)? {
+        let name = record::function_name_of(tenant, &key)?;
+        out.push(record::decode_function(&value, name)?);
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// Removes one function.
+pub fn drop_function(txn: &mut dyn Txn, tenant: u64, name: &str) -> Result<()> {
+    txn.delete(&record::function_key(tenant, name));
+    bump_version(txn)
+}
+
 /// One sequence by the pair its name resolves to, read straight from its record.
 ///
 /// Not through the table: a sequence no column owns is filed under
@@ -2115,6 +2263,7 @@ mod tests {
             triggers_disabled: false,
             parents: Vec::new(),
             children: Vec::new(),
+            triggers: Vec::new(),
             child_scans: Vec::new(),
         }
     }
@@ -2140,7 +2289,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "11",               // catalog format version
+                "12",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -2233,7 +2382,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "11",       // catalog format version
+                "12",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -2266,7 +2415,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "11",                 // catalog format version
+                "12",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -2320,6 +2469,8 @@ mod tests {
                 "00",
                 // Version 17. One byte per index: this one is a `CREATE UNIQUE INDEX`, not a
                 // `UNIQUE` constraint, so it gets no `pg_constraint` row and no `DEFERRABLE`.
+                "00",
+                // Version 18. No triggers, which is every table until `CREATE TRIGGER` runs.
                 "00",
             )
         );
@@ -3279,7 +3430,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "11",               // catalog format version
+                "12",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

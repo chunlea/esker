@@ -31,10 +31,10 @@ mod time_machine;
 pub use crate::catalog::Identity;
 pub use crate::catalog::pg_catalog::CatalogView;
 pub use ddl::{
-    AlterTable, AlterTableAction, Column, ColumnDefault, CreateExtension, CreateIndex,
-    CreateSequence, CreateTable, DropFunction, DropIndex, DropSequence, DropTable, ForeignKey,
-    IndexKeyPart, KeyPartName, UniqueConstraint, foreign_key_name, index_name, primary_key_name,
-    sequence_name, unique_constraint_name,
+    AlterTable, AlterTableAction, Column, ColumnDefault, CreateExtension, CreateFunction,
+    CreateIndex, CreateSequence, CreateTable, CreateTrigger, DropFunction, DropIndex, DropSequence,
+    DropTable, DropTrigger, ForeignKey, IndexKeyPart, KeyPartName, UniqueConstraint,
+    foreign_key_name, index_name, primary_key_name, sequence_name, unique_constraint_name,
 };
 pub use dml::{Delete, Insert, Returning, Update};
 pub use expr::{
@@ -72,6 +72,12 @@ pub enum Statement {
     CreateSequence(CreateSequence),
     /// `DROP FUNCTION`.
     DropFunction(DropFunction),
+    /// `CREATE [OR REPLACE] FUNCTION`.
+    CreateFunction(CreateFunction),
+    /// `CREATE TRIGGER`.
+    CreateTrigger(CreateTrigger),
+    /// `DROP TRIGGER`.
+    DropTrigger(DropTrigger),
     /// `CREATE EXTENSION [IF NOT EXISTS] name` — a catalog write and nothing else here: it records
     /// that the extension is installed, and what an extension *carries* is either already in this
     /// build or is why the name is not available.
@@ -164,6 +170,9 @@ impl Statement {
             Statement::DropSequence(_) => Some("DROP SEQUENCE"),
             Statement::CreateSequence(_) => Some("CREATE SEQUENCE"),
             Statement::DropFunction(_) => Some("DROP FUNCTION"),
+            Statement::CreateFunction(_) => Some("CREATE FUNCTION"),
+            Statement::CreateTrigger(_) => Some("CREATE TRIGGER"),
+            Statement::DropTrigger(_) => Some("DROP TRIGGER"),
             Statement::CreateIndex(_) => Some("CREATE INDEX"),
             Statement::DropIndex(_) => Some("DROP INDEX"),
             Statement::AlterTable(_) => Some("ALTER TABLE"),
@@ -201,6 +210,9 @@ impl Statement {
             Statement::DropSequence(_) => "DROP SEQUENCE",
             Statement::CreateSequence(_) => "CREATE SEQUENCE",
             Statement::DropFunction(_) => "DROP FUNCTION",
+            Statement::CreateFunction(_) => "CREATE FUNCTION",
+            Statement::CreateTrigger(_) => "CREATE TRIGGER",
+            Statement::DropTrigger(_) => "DROP TRIGGER",
             Statement::CreateIndex(_) => "CREATE INDEX",
             Statement::DropIndex(_) => "DROP INDEX",
             Statement::AlterTable(_) => "ALTER TABLE",

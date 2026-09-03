@@ -121,6 +121,7 @@ pub(super) fn create_table(
         parents: parents.iter().map(|parent| parent.id).collect(),
         // Filled by the parents, not here: this table is nobody's parent yet.
         children: Vec::new(),
+        triggers: Vec::new(),
         child_scans: Vec::new(),
         primary_key_name,
         // A table starts at schema version 1; `ALTER TABLE ADD COLUMN` moves it.
@@ -525,6 +526,139 @@ fn inherited_columns(
     Ok((parents, columns))
 }
 
+/// The first trigger that names this function, and the table it is on.
+fn trigger_naming(
+    executor: &Executor,
+    txn: &dyn Txn,
+    function: &str,
+) -> Result<Option<(String, String)>> {
+    let relations = catalog::pg_relations::Relations::read(txn, executor.tenant)?;
+    for table in relations.tables() {
+        if let Some(trigger) = table
+            .triggers
+            .iter()
+            .find(|trigger| trigger.function == function)
+        {
+            return Ok(Some((trigger.name.clone(), table.name.clone())));
+        }
+    }
+    Ok(None)
+}
+
+/// `CREATE [OR REPLACE] FUNCTION f() RETURNS TRIGGER AS $$…$$ LANGUAGE plpgsql`.
+///
+/// **Defined, never executed.** The body is stored verbatim and nothing parses it: the schema load
+/// reaches this twice — statement 762's `INHERITS` block and statement 790 — and inserts nothing
+/// through either, so what the suite needs is a catalog that can hold a function. Exactly one test
+/// in the whole suite fires a trigger, and a plpgsql runtime stays out of scope.
+///
+/// **Run twice it is a plain success**, not `42710`: `OR REPLACE` exists for a function and the
+/// second `CREATE` simply overwrites. A second `CREATE TRIGGER` of one name *is* a duplicate.
+pub(super) fn create_function(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    create: &plan::CreateFunction,
+) -> Result<Outcome> {
+    // The only procedural language this node knows the name of. It knows nothing else about it —
+    // and that is the point: a body it cannot run is still a body it can keep.
+    if !create.language.eq_ignore_ascii_case("plpgsql") {
+        return Err(SqlError::UndefinedLanguage(create.language.clone()));
+    }
+    let id = match catalog::function(txn, executor.tenant, &create.name)? {
+        // Replacing keeps the id, so a trigger that named it still names the same relation.
+        Some(existing) => existing.id,
+        None => catalog::allocate_id(txn, executor.tenant)?,
+    };
+    catalog::write_function(
+        txn,
+        executor.tenant,
+        &catalog::FunctionDef {
+            id,
+            name: create.name.clone(),
+            body: create.body.clone(),
+            language: create.language.clone(),
+        },
+    )?;
+    Ok(Outcome::done("CREATE FUNCTION"))
+}
+
+/// `CREATE TRIGGER t BEFORE|AFTER … ON tbl FOR EACH ROW EXECUTE FUNCTION|PROCEDURE f()`.
+///
+/// Registered on the table and **never fired**. The function must already exist — a real server
+/// resolves it here, and a name that is nothing is `42883` from the `CREATE TRIGGER` rather than
+/// from a later insert.
+pub(super) fn create_trigger(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    create: &plan::CreateTrigger,
+) -> Result<Outcome> {
+    catalog::pg_catalog::refuse_write(&create.table)?;
+    let table = executor.require_table(txn, &create.table)?;
+    if catalog::function(txn, executor.tenant, &create.function)?.is_none() {
+        return Err(SqlError::UndefinedFunction(format!(
+            "{}()",
+            create.function
+        )));
+    }
+    // **A trigger's name is unique per table**, not per database, which is what `pg_trigger` is
+    // keyed by — and a second one of the same name on the same table is `42710`.
+    if table
+        .triggers
+        .iter()
+        .any(|trigger| trigger.name == create.name)
+    {
+        return Err(SqlError::DuplicateTrigger {
+            trigger: create.name.clone(),
+            relation: table.name.clone(),
+        });
+    }
+    let mut updated = (*table).clone();
+    updated.triggers.push(catalog::TriggerDef {
+        name: create.name.clone(),
+        before: create.before,
+        events: create.events,
+        for_each_row: create.for_each_row,
+        function: create.function.clone(),
+        enabled: true,
+    });
+    // The schema version moves because a cached `TableDef` would not list it — `pg_trigger` reads
+    // the table, and a node holding the old one would report the trigger missing.
+    updated.schema_version += 1;
+    catalog::replace_table(txn, executor.tenant, &table, &updated)?;
+    Ok(Outcome::done("CREATE TRIGGER"))
+}
+
+/// `DROP TRIGGER [IF EXISTS] t ON tbl`.
+pub(super) fn drop_trigger(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    drop: &plan::DropTrigger,
+) -> Result<Outcome> {
+    let table = executor.require_table(txn, &drop.table)?;
+    if !table
+        .triggers
+        .iter()
+        .any(|trigger| trigger.name == drop.name)
+    {
+        if drop.if_exists {
+            executor.notice(SqlError::DoesNotExistSkipping {
+                kind: "trigger",
+                name: drop.name.clone(),
+            });
+            return Ok(Outcome::done("DROP TRIGGER"));
+        }
+        return Err(SqlError::UndefinedTrigger {
+            trigger: drop.name.clone(),
+            table: table.name.clone(),
+        });
+    }
+    let mut updated = (*table).clone();
+    updated.triggers.retain(|trigger| trigger.name != drop.name);
+    updated.schema_version += 1;
+    catalog::replace_table(txn, executor.tenant, &table, &updated)?;
+    Ok(Outcome::done("DROP TRIGGER"))
+}
+
 /// **Every function this node has, with the signature `DROP FUNCTION` names it by.**
 ///
 /// This node has no `CREATE FUNCTION`, so the whole function namespace is this list — which is
@@ -582,7 +716,11 @@ fn built_in_signature(name: &str, args: &[&str]) -> String {
 /// * a statement with **no argument list** is a different statement, not a shorthand: it selects
 ///   *the* function of that name, and its "not found" sentence is its own, because with no
 ///   argument list there is no signature to name.
-pub(super) fn drop_function(executor: &mut Executor, drop: &plan::DropFunction) -> Result<Outcome> {
+pub(super) fn drop_function(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    drop: &plan::DropFunction,
+) -> Result<Outcome> {
     for (name, args) in &drop.functions {
         let matched = BUILT_IN_FUNCTIONS.iter().find(|(built_in, signature)| {
             *built_in == name
@@ -594,6 +732,20 @@ pub(super) fn drop_function(executor: &mut Executor, drop: &plan::DropFunction) 
             return Err(SqlError::FunctionRequiredBySystem(built_in_signature(
                 built_in, signature,
             )));
+        }
+        // A **stored** function: this node has those now, and dropping one is ordinary — unless a
+        // trigger still names it, which is `2BP01` with the trigger and its table in the DETAIL.
+        if let Some(stored) = catalog::function(txn, executor.tenant, name)? {
+            if let Some((trigger, table)) = trigger_naming(executor, txn, name)? {
+                return Err(SqlError::DependentFunction {
+                    function: format!("{name}()"),
+                    detail: format!(
+                        "trigger {trigger} on table {table} depends on function {name}()"
+                    ),
+                });
+            }
+            catalog::drop_function(txn, executor.tenant, &stored.name)?;
+            continue;
         }
         if drop.if_exists {
             executor.notice(SqlError::DoesNotExistSkipping {
