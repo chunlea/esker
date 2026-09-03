@@ -159,6 +159,20 @@ impl<'a> Scope<'a> {
         }
     }
 
+    /// The same chain, told which order the user wrote the tables in.
+    ///
+    /// `entries` is the order the executor **joins** in, which for a reordered comma list is not
+    /// the order they were written (`comma_list_order`). Only [`Scope::written`] cares, and what it
+    /// decides is what `SELECT *` returns — so a reordering that forgot this would silently give
+    /// back the same columns in a different order, which no `ORDER BY` and no test of one table's
+    /// values would notice. `written[i]` is where the table the user wrote *i*-th ended up.
+    fn chain_written(entries: &[(&'a TableDef, String)], written: Vec<usize>) -> Self {
+        Scope {
+            written,
+            ..Scope::chain(entries)
+        }
+    }
+
     /// The name a `42803` prints for a resolved position: `t.c`, qualified.
     ///
     /// PostgreSQL qualifies it even when the query has one table, and in a join it is the only
@@ -860,13 +874,31 @@ pub(super) fn returning_columns(items: &[SelectItem], table: &TableDef) -> Resul
 /// lets `ON n.oid = t.relnamespace` reach back past the table joined in between, as
 /// `ActiveRecord`'s `indexes()` does.
 ///
-/// # What this deliberately does not do
+/// # The `WHERE` is applied as the chain is built, not once on top of it
 ///
-/// **It does not reorder.** A two-table inner join is commutative and [`plan`] exploits that; a
-/// chain is not free to, because a `LEFT JOIN` anywhere in it fixes the order of everything after
-/// it — `A LEFT JOIN B ON … JOIN C ON …` keeps only the rows the inner join matches, and swapping
-/// the last two steps would keep the NULL-extended ones. Rather than reorder the prefix that
-/// happens to be all-inner and stop at the first outer join, it plans as written: a rule-based
+/// A **comma-separated `FROM` list** has no `ON` anywhere: every condition is in the `WHERE`. Left
+/// on top, that is a cross product of every relation in the list with one filter above it, and run
+/// 49 is what that costs — `ActiveRecord`'s `pk_and_sequence_for` is five catalog relations in one
+/// such list, and it answered in 0 s over 30 relations, 4 s over 90 and never over the suite's 870.
+/// Measured here at 6 tables against 12: **362 ms against 3.92 s**, for a control that went 325 µs
+/// to 472 µs.
+///
+/// So each conjunct of the `WHERE` is applied at the **first step whose tables can answer it**
+/// ([`pushdown`]), which is a filter on the intermediate result rather than on the product. What
+/// is left over — a conjunct naming a table joined later, or one this pass will not touch — stays
+/// on top exactly as before.
+///
+/// # It reorders a comma list, and nothing else
+///
+/// A two-table inner join is commutative and [`plan`] exploits that; a chain with a `LEFT JOIN`
+/// anywhere in it is not free to, because an outer join fixes the order of everything after it —
+/// `A LEFT JOIN B ON … JOIN C ON …` keeps only the rows the inner join matches, and swapping the
+/// last two steps would keep the NULL-extended ones.
+///
+/// A **plain comma list** — every entry a stored relation or a catalog view, every join inner,
+/// every `ON` absent — has none of that, and it is the shape that needs the ordering most, because
+/// with no `ON` at all *nothing* bounds it. [`comma_list_order`] puts the tables a constant can
+/// pin first and grows from there. Every other chain is planned exactly as written: a rule-based
 /// planner that is right everywhere beats one that is faster on the shapes nobody sends.
 ///
 /// The cost is that the inner side of each step is probed by key only when its `ON` allows it,
@@ -904,56 +936,295 @@ fn plan_chain(
         }
     }
 
+    // **A plain comma list may be reordered**; every other chain is planned as written. The
+    // permutation is over `entries`, so everything below reads the tables through it and the row
+    // an ordinal names is the row the executor builds.
+    let order = comma_list_order(select, &entries);
+    let reordered = order.iter().enumerate().any(|(at, to)| at != *to);
+    let entries: Vec<(&TableDef, String)> = order
+        .iter()
+        .map(|at| (entries[*at].0, entries[*at].1.clone()))
+        .collect();
+    // The conjuncts of the `WHERE`, each waiting for the first step that can answer it. One that
+    // never becomes answerable — and one this pass will not touch — is still on top at the end.
+    let mut pending: Vec<&Expr> = select.filter.as_ref().map_or_else(Vec::new, conjuncts_of);
+
     // The `WHERE` cannot narrow the outer access path here: with more than one table it may
     // mention any of them, and a value from a table not yet read is not one a scan can seek on.
-    let mut node = match select.from.as_ref() {
-        // A set-returning function is a third kind of source, beside a relation and a derived
-        // table: no key range, no statistics, and rows that exist only once its arguments are
-        // evaluated.
-        Some(entry) if entry.function.is_some() => {
-            function_node(entry, outer, &Scope::empty().under(enclosing))?
-        }
-        // Rows written into the statement, which is a source with even less to it than a function:
-        // no arguments, no key range, and the row count is the length of the list.
-        Some(entry) if entry.values.is_some() => super::values::node(entry, outer)?,
-        Some(entry) => match entry.derived_plan() {
-            Some(plan) => plan.clone(),
+    let mut node = if reordered {
+        // Only a plain relation or a catalog view can be reordered onto the front, which is what
+        // `comma_list_order` checked before returning anything but the identity.
+        access_path(None, tenant, entries[0].0)?
+    } else {
+        match select.from.as_ref() {
+            // A set-returning function is a third kind of source, beside a relation and a derived
+            // table: no key range, no statistics, and rows that exist only once its arguments are
+            // evaluated.
+            Some(entry) if entry.function.is_some() => {
+                function_node(entry, outer, &Scope::empty().under(enclosing))?
+            }
+            // Rows written into the statement, which is a source with even less to it than a function:
+            // no arguments, no key range, and the row count is the length of the list.
+            Some(entry) if entry.values.is_some() => super::values::node(entry, outer)?,
+            Some(entry) => match entry.derived_plan() {
+                Some(plan) => plan.clone(),
+                None => access_path(None, tenant, outer)?,
+            },
             None => access_path(None, tenant, outer)?,
-        },
-        None => access_path(None, tenant, outer)?,
+        }
     };
+    // The first table's own conjuncts, before a single pair has been built. This is the step that
+    // matters most in a comma list: `seq.relkind = 'S'` here is the difference between joining
+    // every relation and joining the sequences.
+    node = pushdown(node, &mut pending, &entries[..1], enclosing)?;
+
     // Grown one table at a time, so each step's `ON` sees exactly the tables to its left plus the
     // one being joined — which is what makes a reference to a table two steps back resolve, and a
     // reference to one further right an "undefined column" rather than a silent NULL.
-    for (at, (join, inner)) in select.joins.iter().zip(inners).enumerate() {
+    for at in 0..entries.len() - 1 {
         let scope = Scope::chain(&entries[..=at + 1]).under(enclosing);
-        let left_join = join.kind == crate::plan::JoinKind::Left;
-        // Implicitly `LATERAL`: the entries strictly to this one's left, which at step `at` is
-        // everything up to and including the outer side of this join.
-        let left = Scope::chain(&entries[..=at]).under(enclosing);
-        let inner_function = source_function(Some(&join.table), inner, &left)?;
-        node = join_node(
-            node,
-            join.on.as_ref(),
-            left_join,
-            &scope,
-            inner,
-            inner_function
-                .as_ref()
-                .or_else(|| join.table.derived_plan()),
-        )?;
+        let inner = entries[at + 1].0;
+        // A reordered chain is a comma list: every join inner, every `ON` absent, and no entry a
+        // function or a derived table — so the step needs nothing from `select.joins`, whose order
+        // no longer matches.
+        node = if reordered {
+            join_node(node, None, false, &scope, inner, None)?
+        } else {
+            let join = &select.joins[at];
+            let left_join = join.kind == crate::plan::JoinKind::Left;
+            // Implicitly `LATERAL`: the entries strictly to this one's left, which at step `at` is
+            // everything up to and including the outer side of this join.
+            let left = Scope::chain(&entries[..=at]).under(enclosing);
+            let inner_function = source_function(Some(&join.table), inner, &left)?;
+            join_node(
+                node,
+                join.on.as_ref(),
+                left_join,
+                &scope,
+                inner,
+                inner_function
+                    .as_ref()
+                    .or_else(|| join.table.derived_plan()),
+            )?
+        };
+        // **Not below an outer join.** A `WHERE` conjunct applied before the NULL extension would
+        // throw away the rows a `LEFT JOIN` exists to keep, which is the one rewrite of this kind
+        // that changes an answer rather than a cost. Once a chain has taken an outer join, nothing
+        // after it is pushed either: the rows above that step are the extended ones.
+        if !select.joins[..=at]
+            .iter()
+            .any(|join| join.kind == crate::plan::JoinKind::Left)
+        {
+            node = pushdown(node, &mut pending, &entries[..=at + 1], enclosing)?;
+        }
     }
 
-    let scope = Scope::chain(&entries).under(enclosing);
-    if let Some(filter) = &select.filter {
-        let predicate = resolve(filter, &scope)?;
-        check_predicate(&predicate, "WHERE", &scope)?;
+    // The **written** order for the scope every output column is resolved against: `SELECT *`
+    // returns the tables in the order the user wrote them whatever order they were joined in.
+    let written: Vec<usize> = (0..entries.len())
+        .map(|user_at| {
+            order
+                .iter()
+                .position(|joined| *joined == user_at)
+                .unwrap_or(user_at)
+        })
+        .collect();
+    let scope = Scope::chain_written(&entries, written).under(enclosing);
+    // Whatever is left, and the whole `WHERE` for a statement nothing was pushed out of. It is
+    // resolved and checked here exactly as before, so an aggregate in a `WHERE` is still the
+    // `WHERE`'s error and a column nobody has is still resolved against every table.
+    if !pending.is_empty() {
+        let predicate = all_of(&pending);
+        let resolved = resolve(&predicate, &scope)?;
+        check_predicate(&resolved, "WHERE", &scope)?;
         node = Node::Filter {
             input: Box::new(node),
-            predicate,
+            predicate: resolved,
         };
     }
-    finish_plan(select, node, &scope, Some(outer))
+    finish_plan(select, node, &scope, Some(entries[0].0))
+}
+
+/// One `AND`-ed predicate as its conjuncts, in the order written.
+///
+/// `OR` is **not** split: `a OR b` is one condition and applying either half alone would keep rows
+/// the statement excludes. Only the `AND` spine comes apart, which is what makes every piece of it
+/// independently true of any row the statement returns — the whole licence pushdown runs on.
+fn conjuncts_of(predicate: &Expr) -> Vec<&Expr> {
+    let mut out = Vec::new();
+    let mut stack = vec![predicate];
+    while let Some(expr) = stack.pop() {
+        match expr {
+            Expr::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => {
+                stack.push(right);
+                stack.push(left);
+            }
+            other => out.push(other),
+        }
+    }
+    out.reverse();
+    out
+}
+
+/// The conjuncts joined back into one predicate.
+fn all_of(conjuncts: &[&Expr]) -> Expr {
+    let mut out = conjuncts[0].clone();
+    for conjunct in &conjuncts[1..] {
+        out = Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(out),
+            right: Box::new((*conjunct).clone()),
+        };
+    }
+    out
+}
+
+/// Whether a conjunct may be moved below the top of the plan.
+///
+/// **Three shapes stay where they are**, and none of them is about correctness of the filter: an
+/// aggregate belongs to a `WHERE`'s own error (`check_predicate` names the clause, and a pushed
+/// copy would name `JOIN/ON` for a statement the user wrote no join in), a set-returning call in a
+/// predicate is refused there too, and a subquery may be **correlated** — it is planned against the
+/// scope it was resolved in, and moving it under a different one is a question this pass does not
+/// answer. Leaving them on top is what the plan did for all of them before.
+fn is_pushable(expr: &Expr) -> bool {
+    let mut has_subquery = false;
+    super::bind::descend(expr, &mut |inner| {
+        has_subquery |= matches!(inner, Expr::Subquery(_));
+    });
+    !has_subquery && !contains_set_func(expr) && !aggregate::contains_aggregate(expr)
+}
+
+/// Applies every pending conjunct the tables built so far can answer, and keeps the rest.
+///
+/// The test is [`resolve`] itself: a conjunct resolves against a scope exactly when every column
+/// it names is in it. **A conjunct that fails to resolve here is not an error** — it is one naming
+/// a table further right, and it stays pending for a later step or for the filter on top, which is
+/// where a genuinely undefined column is reported against the whole scope with the message it
+/// always had. Nothing is pushed on a failure, so no error is swallowed and none is moved.
+fn pushdown<'a>(
+    node: Node,
+    pending: &mut Vec<&'a Expr>,
+    entries: &[(&TableDef, String)],
+    enclosing: Option<&Scope<'_>>,
+) -> Result<Node> {
+    if pending.is_empty() {
+        return Ok(node);
+    }
+    let scope = Scope::chain(entries).under(enclosing);
+    let mut ready = Vec::new();
+    pending.retain(|conjunct| {
+        if !is_pushable(conjunct) {
+            return true;
+        }
+        match resolve(conjunct, &scope) {
+            Ok(resolved) => {
+                ready.push(resolved);
+                false
+            }
+            Err(_) => true,
+        }
+    });
+    let Some(first) = ready.first() else {
+        return Ok(node);
+    };
+    let mut predicate = first.clone();
+    for next in &ready[1..] {
+        predicate = Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(predicate),
+            right: Box::new(next.clone()),
+        };
+    }
+    Ok(Node::Filter {
+        input: Box::new(node),
+        predicate,
+    })
+}
+
+/// The order to join a **plain comma list** in, or the identity for every other chain.
+///
+/// A comma list is the shape with nothing to bound it: no `ON` anywhere, so every step is a cross
+/// product until the `WHERE` is reached. Ordering it is what turns `pk_and_sequence_for` from the
+/// product of five catalog relations into a walk down one row's dependencies.
+///
+/// **Greedy, and the rule is the one a reader can check by eye**: a table a conjunct pins on its
+/// own — `dep.refobjid = '"accounts"'::regclass` — goes first, because it is one row before
+/// anything is joined to it; then, repeatedly, whichever remaining table shares a conjunct with the
+/// tables already chosen, which is an equijoin rather than a product; and only then, whatever is
+/// left, in the order written. Ties keep the written order, so the permutation is deterministic and
+/// a statement with nothing to choose between is planned exactly as it was.
+///
+/// It reorders **only** when every entry is a stored relation or a catalog view and every join is
+/// an inner one with no `ON`. A derived table, a set-returning function or a `VALUES` list in the
+/// list means the identity, because the outer node for those is built from `select.from` and a
+/// different first table would not be it; an outer join means the identity because reordering
+/// across one changes the answer.
+fn comma_list_order(select: &Select, entries: &[(&TableDef, String)]) -> Vec<usize> {
+    let identity = || (0..entries.len()).collect::<Vec<_>>();
+    let plain = |entry: Option<&crate::plan::TableRef>| {
+        entry.is_none_or(|entry| {
+            entry.function.is_none() && entry.values.is_none() && entry.derived_plan().is_none()
+        })
+    };
+    if entries.len() < 3
+        || !plain(select.from.as_ref())
+        || !select.joins.iter().all(|join| {
+            join.on.is_none()
+                && join.kind != crate::plan::JoinKind::Left
+                && plain(Some(&join.table))
+        })
+    {
+        return identity();
+    }
+    let Some(filter) = select.filter.as_ref() else {
+        return identity();
+    };
+    let conjuncts = conjuncts_of(filter);
+    // Which entries a conjunct can be answered by: the smallest prefix-free set is what matters,
+    // so each conjunct is tested against every single table and against every pair with a chosen
+    // one. `resolve` against a one-table scope is the whole test.
+    let answered_by_one = |at: usize| {
+        let scope = Scope::chain(&entries[at..=at]);
+        conjuncts
+            .iter()
+            .any(|conjunct| is_pushable(conjunct) && resolve(conjunct, &scope).is_ok())
+    };
+    let mut chosen: Vec<usize> = Vec::with_capacity(entries.len());
+    let mut left: Vec<usize> = (0..entries.len()).collect();
+    // The seed: the first table a constant pins, or the first table written.
+    let seed = left
+        .iter()
+        .position(|at| answered_by_one(*at))
+        .unwrap_or_default();
+    chosen.push(left.remove(seed));
+    while !left.is_empty() {
+        let next = left
+            .iter()
+            .position(|at| {
+                let mut with: Vec<(&TableDef, String)> = chosen
+                    .iter()
+                    .map(|c| (entries[*c].0, entries[*c].1.clone()))
+                    .collect();
+                with.push((entries[*at].0, entries[*at].1.clone()));
+                let scope = Scope::chain(&with);
+                // A conjunct this table completes and the tables so far could not answer alone:
+                // that is an equality tying it to what is already in hand.
+                let smaller = Scope::chain(&with[..with.len() - 1]);
+                conjuncts.iter().any(|conjunct| {
+                    is_pushable(conjunct)
+                        && resolve(conjunct, &scope).is_ok()
+                        && resolve(conjunct, &smaller).is_err()
+                })
+            })
+            .unwrap_or_default();
+        chosen.push(left.remove(next));
+    }
+    chosen
 }
 
 /// Whether any subquery in this statement turned out to be correlated.
