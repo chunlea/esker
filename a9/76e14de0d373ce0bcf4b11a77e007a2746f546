@@ -1,0 +1,60 @@
+crates/esker-engine/tests/db.rs
+  h_44076b318daf9c 41-57,1039,1042-1051,1053-1055
+crates/esker-sql/src/catalog/mod.rs
+  h_44076b318daf9c 742-749,868-898,2916,2995,3088,3146,3223-3225,4192
+crates/esker-sql/src/catalog/pg_catalog.rs
+  h_44076b318daf9c 148-157,181,199-200,232-233,269-270,359-363,463-485,520-521,647-648,674-675,992-1059,1198-1199,1255-1266
+crates/esker-sql/src/catalog/record.rs
+  h_44076b318daf9c 52-54,90,1420-1426,1430-1446,1964,1969
+crates/esker-sql/src/error.rs
+  h_44076b318daf9c 719-736,1611-1612,1640
+crates/esker-sql/src/exec/bind.rs
+  h_44076b318daf9c 549,717
+crates/esker-sql/src/exec/cursor.rs
+  h_44076b318daf9c 1488-1491,1588-1612
+crates/esker-sql/src/exec/ddl.rs
+  h_44076b318daf9c 141,1418-1426,2352-2360
+crates/esker-sql/src/exec/mod.rs
+  h_44076b318daf9c 932-952,957-972,1641-1645
+crates/esker-sql/src/exec/subquery.rs
+  h_44076b318daf9c 168-169,280-281
+crates/esker-sql/src/exec/values.rs
+  h_44076b318daf9c 55-56
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 41-90,99-101,1614-1615,2249-2301,2303-2308,4522-4551
+crates/esker-sql/src/parse/mod.rs
+  h_44076b318daf9c 89-117,171-181,242-246,256-265,317,323,334,340-370,783-792,808,1131-1139,1344-1379,1424,1591-1593,1629-1630,1687,1692,1698-1704,1722,1724-1730,1739-1740
+crates/esker-sql/src/plan/ddl.rs
+  h_44076b318daf9c 34-36,718-724
+crates/esker-sql/src/plan/expr.rs
+  h_44076b318daf9c 567-573,731-733,756,790,827
+crates/esker-sql/tests/corpus/pg19_reset_pk_sequence.txt
+  h_44076b318daf9c 1-98
+crates/esker-sql/tests/corpus/pg19_unlogged_table.txt
+  h_44076b318daf9c 1-95
+crates/esker-sql/tests/derived.rs
+  h_44076b318daf9c 67
+crates/esker-sql/tests/lowering_depth.rs
+  h_44076b318daf9c 1-204
+crates/esker-sql/tests/reset_pk_sequence.rs
+  h_44076b318daf9c 1-35
+crates/esker-sql/tests/subquery.rs
+  h_44076b318daf9c 320-322,324
+crates/esker-sql/tests/syntax_corpus.rs
+  h_44076b318daf9c 54-57
+crates/esker-sql/tests/unlogged_table.rs
+  h_44076b318daf9c 1-234
+crates/esker-store/tests/balance.rs
+  h_44076b318daf9c 353-375,377-415
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a976e14de0d373ce0bcf4b11a77e007a2746f546",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
