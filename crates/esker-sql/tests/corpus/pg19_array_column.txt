@@ -1,0 +1,34 @@
+# `bigint_array` — the table `postgresql_specific_schema.rb` declares, end to end.
+#
+# It is the statement `ActiveRecord` failed **client-side** on: `TypeError: can't quote Array`,
+# because the adapter decides a column is an array by reading `pg_type.typinput == 'array_in'` and
+# no type here answered that. So this corpus is the blocker itself rather than a study of arrays:
+# the two columns it declares, the array `DEFAULT` it carries, and what a client is told about
+# them.
+#
+# The three answers that are not about storage at all:
+#
+#   * `format_type` reports `bigint[]` and `numeric[]` — the *element's* name with `[]`, not the
+#     internal `_int8` that `pg_type.typname` holds;
+#   * `pg_get_expr` renders the default as `'{1.23,3.45}'::numeric[]`, cast and all;
+#   * a bad **element** is the element type's own failure — `'{9223372036854775808}'` into an
+#     `int8[]` is `22003 value ... is out of range for type bigint`, and `'{1,x}'` into a
+#     `numeric[]` is `22P02 invalid input syntax for type numeric`. Neither is an array error.
+#
+# And `ORDER BY` over an array column, which is what makes the key encoding's order visible from
+# SQL: `{}` first, then the two-element arrays, with a NULL array last under `NULLS LAST`.
+DROP TABLE IF EXISTS bigint_array		-
+CREATE TABLE bigint_array (id int8 PRIMARY KEY, big_int_data_points int8[], decimal_array_default numeric[] DEFAULT '{1.23,3.45}')		-
+INSERT INTO bigint_array (id) VALUES (1)		-
+INSERT INTO bigint_array (id, big_int_data_points, decimal_array_default) VALUES (2, '{9223372036854775807,-9223372036854775808}', '{0.10,0.20}')		-
+INSERT INTO bigint_array (id, big_int_data_points) VALUES (3, '{}')		-
+SELECT id, big_int_data_points, decimal_array_default FROM bigint_array ORDER BY id	bigint,bigint[],numeric[]	1|\N|{1.23,3.45} ; 2|{9223372036854775807,-9223372036854775808}|{0.10,0.20} ; 3|{}|{1.23,3.45}
+SELECT a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = 'bigint_array'::regclass AND a.attnum > 0 ORDER BY a.attnum	name,text	id|bigint ; big_int_data_points|bigint[] ; decimal_array_default|numeric[]
+SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef d JOIN pg_class c ON c.oid = d.adrelid WHERE c.relname = 'bigint_array'	text	'{1.23,3.45}'::numeric[]
+SELECT id FROM bigint_array WHERE decimal_array_default = '{1.23,3.45}' ORDER BY id	bigint	1 ; 3
+SELECT id FROM bigint_array ORDER BY big_int_data_points NULLS LAST, id	bigint	3 ; 2 ; 1
+UPDATE bigint_array SET big_int_data_points = '{1,2}' WHERE id = 1		-
+SELECT id, big_int_data_points FROM bigint_array ORDER BY id	bigint,bigint[]	1|{1,2} ; 2|{9223372036854775807,-9223372036854775808} ; 3|{}
+INSERT INTO bigint_array (id, big_int_data_points) VALUES (4, '{9223372036854775808}')	!22003 value "9223372036854775808" is out of range for type bigint
+INSERT INTO bigint_array (id, decimal_array_default) VALUES (5, '{1,x}')	!22P02 invalid input syntax for type numeric: "x"
+SELECT count(*), count(big_int_data_points) FROM bigint_array	bigint,bigint	3|3

@@ -26,13 +26,13 @@
 //!
 //! A transaction that reads `k` and writes it commits only if nothing else committed `k` after
 //! its snapshot — first-committer-wins (`docs/txn-spec.md` §6). That is a compare-and-swap
-//! whose `expected` is what the read saw, and the model has one, so that is how it is recorded.
+//! whose `expected` is what the read saw, and the model has one, so that is how it is checked.
 //!
-//! # What a refusal is recorded as
+//! # What a refusal is checked as
 //!
 //! A `TxnConflict` means the transaction definitely did not happen, and the register model has
 //! no way to say "did not happen" — its outputs all describe an operation that did. So a
-//! refusal is recorded as **unknown**, the same as an ambiguous answer: the checker may then
+//! refusal is checked as **unknown**, the same as an ambiguous answer: the checker may then
 //! place it anywhere after its invocation, including at the very end where it is
 //! indistinguishable from never having happened. That is weaker than the truth and never
 //! wrong, and the claim the run is really making — that no acknowledged write is lost — rests
@@ -40,7 +40,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -62,21 +62,63 @@ const KEYS: [&[u8]; 4] = [b"a-lin-1", b"a-lin-2", b"n-lin-1", b"n-lin-2"];
 /// Concurrent clients.
 const CLIENTS: u64 = 4;
 
+/// How many operations each client **records**. Past it the client keeps working, on a key
+/// nothing checks.
+///
+/// The bound is on the history and not on the run, and that distinction is what makes this test
+/// machine-independent: a run that is *faster* gets through more operations in the same
+/// wall-clock window and would otherwise build a bigger history. Measured, before this: the same
+/// test that concluded on a loaded machine ran out of search budget on an idle one, and reported
+/// it as "not linearizable" — because the assertion below treated every non-`Linearizable`
+/// outcome as a violation, which the checker never claimed.
+const RECORDED_OPS_PER_CLIENT: u64 = 40;
+
+/// How many operations with an **unknown outcome** each key's history may hold.
+///
+/// See [`Recorder::accepting`]: this is the quantity the search cost is exponential in, and
+/// bounding the operations alone left it to chance where the leader kills landed.
+const UNKNOWNS_PER_KEY: usize = 6;
+
+/// The key the clients keep working on once they have checked their share.
+///
+/// **Outside `KEYS`, so nothing checks it** — and it has to be worked on rather than idled,
+/// because the leader kills below have to land on a cluster that is under load. Bounding the
+/// history is not the same as bounding the run.
+const LOAD_KEY: &[u8] = b"z-lin-load";
+
 /// The histories, one per key, each recording every client's operations on it in the order they
 /// were observed.
 ///
 /// One mutex per key, taken to stamp an invocation and taken again to stamp the response —
-/// never held across the call itself, which is what makes the recorded order the *observed*
+/// never held across the call itself, which is what makes the checked order the *observed*
 /// order.
 struct Recorder {
     keys: Vec<Mutex<History<RegisterInput, RegisterOutput>>>,
+    /// How many operations on each key ended with an outcome the client never learned.
+    unknowns: Vec<AtomicUsize>,
 }
 
 impl Recorder {
     fn new() -> Self {
         Self {
             keys: KEYS.iter().map(|_| Mutex::new(History::new())).collect(),
+            unknowns: KEYS.iter().map(|_| AtomicUsize::new(0)).collect(),
         }
+    }
+
+    /// Whether this key's history has room for another operation.
+    ///
+    /// **The bound is on the unknowns, because they are what the search costs.** An operation
+    /// whose outcome the client never learned is checked as `Unknown`, which the checker holds
+    /// open to the end of the history — so every later operation overlaps it and the search
+    /// branches on each one. A history of ninety operations with five unknowns settles in
+    /// milliseconds; the same ninety with twenty-five does not settle in a million steps.
+    ///
+    /// Bounding the operations instead is what this test did first, and it was not enough: how
+    /// many of them come back unknown depends on where the leader kills land, so a run could
+    /// still put twenty of them in one history. This is the quantity that actually decides.
+    fn accepting(&self, key: usize) -> bool {
+        self.unknowns[key].load(Ordering::Relaxed) < UNKNOWNS_PER_KEY
     }
 
     fn invoke(&self, key: usize, client: u64, input: RegisterInput) -> OpId {
@@ -90,6 +132,7 @@ impl Recorder {
     /// It may have happened; it may not. A refusal and an ambiguous answer are both this, for
     /// the reason in this file's header.
     fn maybe(&self, key: usize, op: OpId) {
+        self.unknowns[key].fetch_add(1, Ordering::Relaxed);
         let _ = self.keys[key].lock().unwrap().respond_unknown(op);
     }
 }
@@ -123,7 +166,11 @@ fn drive(client_id: u64, cluster: &Cluster, recorder: &Recorder, stop: &AtomicBo
 
     while !stop.load(Ordering::Relaxed) {
         sequence += 1;
+        // Past its share a client stops *recording* and keeps *working*; see
+        // `RECORDED_OPS_PER_CLIENT`.
         let key = usize::try_from((client_id + sequence) % KEYS.len() as u64).unwrap_or(0);
+        let checked = sequence <= RECORDED_OPS_PER_CLIENT && recorder.accepting(key);
+        let target: &[u8] = if checked { KEYS[key] } else { LOAD_KEY };
         // A value that names the write that made it, so no two writes share a value — which is
         // what lets a compare-and-swap's `expected` mean something.
         let value = Bytes::from(format!("c{client_id}-w{sequence}").into_bytes());
@@ -131,28 +178,37 @@ fn drive(client_id: u64, cluster: &Cluster, recorder: &Recorder, stop: &AtomicBo
         let mut reconnect = false;
         match sequence % 4 {
             0 | 1 => {
-                let op = recorder.invoke(key, client_id, RegisterInput::Write(value.clone()));
-                match write(&client, KEYS[key], &value) {
+                let op = checked
+                    .then(|| recorder.invoke(key, client_id, RegisterInput::Write(value.clone())));
+                match write(&client, target, &value) {
                     Ok(()) => {
-                        recorder.responded(key, op, RegisterOutput::Written);
+                        if let Some(op) = op {
+                            recorder.responded(key, op, RegisterOutput::Written);
+                        }
                         tally.writes += 1;
                     }
                     Err(refused) => {
                         reconnect = classify(&refused, &mut tally);
-                        recorder.maybe(key, op);
+                        if let Some(op) = op {
+                            recorder.maybe(key, op);
+                        }
                     }
                 }
             }
             2 => {
-                let op = recorder.invoke(key, client_id, RegisterInput::Read);
-                match read(&client, KEYS[key]) {
+                let op = checked.then(|| recorder.invoke(key, client_id, RegisterInput::Read));
+                match read(&client, target) {
                     Ok(seen) => {
-                        recorder.responded(key, op, RegisterOutput::Value(seen));
+                        if let Some(op) = op {
+                            recorder.responded(key, op, RegisterOutput::Value(seen));
+                        }
                         tally.reads += 1;
                     }
                     Err(refused) => {
                         reconnect = classify(&refused, &mut tally);
-                        recorder.maybe(key, op);
+                        if let Some(op) = op {
+                            recorder.maybe(key, op);
+                        }
                     }
                 }
             }
@@ -162,7 +218,7 @@ fn drive(client_id: u64, cluster: &Cluster, recorder: &Recorder, stop: &AtomicBo
                 let Ok(mut txn) = client.begin() else {
                     continue;
                 };
-                let expected = match txn.get(KEYS[key]) {
+                let expected = match txn.get(target) {
                     Ok(seen) => seen,
                     Err(refused) => {
                         reconnect = classify(&refused, &mut tally);
@@ -172,23 +228,29 @@ fn drive(client_id: u64, cluster: &Cluster, recorder: &Recorder, stop: &AtomicBo
                         continue;
                     }
                 };
-                let op = recorder.invoke(
-                    key,
-                    client_id,
-                    RegisterInput::Cas {
-                        expected: expected.clone(),
-                        new: value.clone(),
-                    },
-                );
-                txn.put(KEYS[key], &value);
+                let op = checked.then(|| {
+                    recorder.invoke(
+                        key,
+                        client_id,
+                        RegisterInput::Cas {
+                            expected: expected.clone(),
+                            new: value.clone(),
+                        },
+                    )
+                });
+                txn.put(target, &value);
                 match txn.commit() {
                     Ok(_) => {
-                        recorder.responded(key, op, RegisterOutput::Swapped(true));
+                        if let Some(op) = op {
+                            recorder.responded(key, op, RegisterOutput::Swapped(true));
+                        }
                         tally.swaps += 1;
                     }
                     Err(refused) => {
                         reconnect = classify(&refused, &mut tally);
-                        recorder.maybe(key, op);
+                        if let Some(op) = op {
+                            recorder.maybe(key, op);
+                        }
                     }
                 }
             }
@@ -327,7 +389,17 @@ fn battery(kills: u32, between: Duration) {
                 order.len(),
                 history.pending()
             ),
-            other => panic!(
+            // **An inconclusive search is not a violation.** The checker says so itself — it
+            // claims neither answer — and a message that calls it one sends the next reader
+            // looking for a transaction bug that was never reported. It still fails the run,
+            // because a run that verified nothing has not verified anything.
+            CheckOutcome::Inconclusive { steps } => panic!(
+                "the transactional history of {} could not be settled: the checker gave up after \
+                 {steps} steps. That is not a linearizability violation — it is a history too \
+                 wide to search, which `UNKNOWNS_PER_KEY` exists to bound.",
+                String::from_utf8_lossy(key)
+            ),
+            other @ CheckOutcome::NotLinearizable { .. } => panic!(
                 "the single-key transactional history of {} is not linearizable after {killed} \
                  leader kills.\n{other}",
                 String::from_utf8_lossy(key)
