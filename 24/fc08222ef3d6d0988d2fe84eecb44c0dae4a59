@@ -1,0 +1,43 @@
+docs/plans/phase-9-rails.md
+  s_a48acfca6122c0::t_bd53311cf674f9 1492
+crates/esker-sql/src/catalog/mod.rs
+  s_a48acfca6122c0::t_09b8af38717234 514-525,956-957,2496,2537,2630,2663,2724-2726,3434,3494,3687
+crates/esker-sql/src/catalog/pg_attribute.rs
+  s_a48acfca6122c0::t_3fa065938d58ef 167-176
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_a48acfca6122c0::t_d64e8636dcc4dc 135-140,164,180,210,244,383-392,455,582,827-863
+crates/esker-sql/src/catalog/pg_index.rs
+  s_a48acfca6122c0::t_e8305ae1e4a3f8 63-66,182-195,241-243,258-262,270-275,369,385-387,406-408
+crates/esker-sql/src/catalog/record.rs
+  s_a48acfca6122c0::t_f130df59b068ca 80,1171-1180,1184-1205,1585,1635
+crates/esker-sql/src/error.rs
+  s_a48acfca6122c0::t_34647a401b42df 934-942,1407-1408
+crates/esker-sql/src/exec/ddl.rs
+  s_a48acfca6122c0::t_353e0bc21178e3 364,517-535,605,1626,1632
+crates/esker-sql/src/parse/lower.rs
+  s_a48acfca6122c0::t_a1db52ee459b55 1915-1931,1947-1955
+crates/esker-sql/src/plan/ddl.rs
+  s_a48acfca6122c0::t_e304c6122592bf 364-370
+crates/esker-sql/tests/corpus/pg19_include_index.txt
+  s_a48acfca6122c0::t_8925b9f1eb1404 1-96
+crates/esker-sql/tests/include_index.rs
+  s_a48acfca6122c0::t_6c624dd9cefeeb 1-220
+crates/esker-sql/tests/lowering.rs
+  s_a48acfca6122c0::t_81b5cba48ac286 104-106
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "24fc08222ef3d6d0988d2fe84eecb44c0dae4a59",
+  "prompts": {},
+  "sessions": {
+    "s_a48acfca6122c0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1ce89436-fd98-49c2-bdf7-60ef343bd273",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
