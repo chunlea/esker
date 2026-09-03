@@ -49,7 +49,7 @@ use esker_keys::{codec, prefix};
 
 use crate::catalog::{
     CheckDef, ColumnDef, ExprShape, ForeignKeyDef, Identity, IndexDef, IndexKey, KeyOrder, KeyPart,
-    ReferentialAction, Relation, SchemaState, SequenceDef, TableDef,
+    ReferentialAction, Relation, SchemaState, SequenceDef, TableDef, VolatileDefault,
 };
 use crate::error::{Result, SqlError};
 use crate::value::{ColumnType, Datum, NO_TYPMOD};
@@ -76,7 +76,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 12;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 13;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -209,6 +209,27 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Interval => TAG_INTERVAL,
         ColumnType::Oid => TAG_OID,
     }
+}
+
+/// Tags for [`VolatileDefault`] as stored. `0` and `1` are the two values the version 5 **bool**
+/// could hold, which is what makes every older record read back unchanged.
+fn volatile_tag(volatile: Option<VolatileDefault>) -> u8 {
+    match volatile {
+        None => 0,
+        Some(VolatileDefault::Now) => 1,
+        Some(VolatileDefault::GenRandomUuid) => 2,
+        Some(VolatileDefault::UuidGenerateV4) => 3,
+    }
+}
+
+fn volatile_of(tag: u8) -> Result<Option<VolatileDefault>> {
+    Ok(match tag {
+        0 => None,
+        1 => Some(VolatileDefault::Now),
+        2 => Some(VolatileDefault::GenRandomUuid),
+        3 => Some(VolatileDefault::UuidGenerateV4),
+        other => return Err(corrupt(format!("volatile default tag {other}"))),
+    })
 }
 
 /// Tags for [`ExprShape`] as stored, ours like every other tag in this record.
@@ -794,7 +815,12 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         out.extend_from_slice(&column.typmod.to_le_bytes());
         // Version 5. One byte, appended for the same reason the typmod was: a version 4 column's
         // bytes are a prefix of a version 5 one's.
-        out.push(u8::from(column.default_now));
+        // Version 5 wrote a **bool** here and version 13 writes a tag: `0` is no volatile
+        // default and `1` is `CURRENT_TIMESTAMP`, which are exactly the two values the bool had,
+        // so every record ever written still reads correctly. The new values are `2` and `3`, and
+        // the version bump is what stops an **older** reader from taking one of those for `true`
+        // and defaulting a `uuid` column to a timestamp.
+        out.push(volatile_tag(column.volatile_default));
     }
 
     varint::put_u64(table.primary_key.len() as u64, &mut out);
@@ -1050,13 +1076,17 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
         };
         // A version 4 column has no expression default, which is what every column written before
         // version 5 was: the only default a v4 catalog could hold was a constant.
-        let default_now = reader.version >= 5 && reader.flag()?;
+        let volatile_default = if reader.version >= 5 {
+            volatile_of(reader.byte()?)?
+        } else {
+            None
+        };
         columns.push(ColumnDef {
             name,
             ty,
             typmod,
             not_null,
-            default_now,
+            volatile_default,
             default,
             missing,
         });

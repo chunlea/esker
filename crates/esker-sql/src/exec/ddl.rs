@@ -59,6 +59,7 @@ pub(super) fn create_table(
     }
 
     let columns = declared_columns(create)?;
+    refuse_unavailable_defaults(txn, executor, &columns)?;
 
     let key_position = |name: &String| {
         columns
@@ -77,7 +78,7 @@ pub(super) fn create_table(
             ty: ColumnType::Int8,
             typmod: crate::value::NO_TYPMOD,
             // The executor fills it, so it has no default of either kind.
-            default_now: false,
+            volatile_default: None,
             not_null: true,
             // The executor fills it on every insert, so it has neither.
             default: None,
@@ -160,7 +161,7 @@ fn declared_columns(create: &CreateTable) -> Result<Vec<ColumnDef>> {
             name: column.name.clone(),
             ty: column.ty,
             typmod: column.typmod,
-            default_now: column.default_now,
+            volatile_default: column.volatile_default,
             // A primary key column is NOT NULL whether or not it said so, which is PostgreSQL's
             // rule and also ours by necessity: a NULL cannot be part of a row key.
             not_null: column.not_null || create.primary_key.contains(&column.name),
@@ -249,6 +250,30 @@ fn add_foreign_key(
         &catalog::foreign_key_backref_key(executor.tenant, parent_id, updated.id),
         &[],
     );
+    Ok(())
+}
+
+/// Refuses a volatile default whose function needs an extension that is not installed.
+///
+/// **At `CREATE TABLE`, not at the first insert.** A real server resolves the default expression
+/// when the table is created, so a table defaulting to `uuid_generate_v4()` cannot exist before
+/// `uuid-ossp` does — and a node that deferred the check would accept the table and then fail
+/// every insert into it, which is a worse answer than refusing the statement that was wrong.
+fn refuse_unavailable_defaults(
+    txn: &dyn Txn,
+    executor: &Executor,
+    columns: &[ColumnDef],
+) -> Result<()> {
+    for column in columns {
+        let Some(catalog::VolatileDefault::UuidGenerateV4) = column.volatile_default else {
+            continue;
+        };
+        if !catalog::pg_catalog::is_installed(txn, executor.tenant, "uuid-ossp")? {
+            return Err(SqlError::UndefinedFunctionName(
+                "uuid_generate_v4()".to_owned(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1104,7 +1129,7 @@ pub(super) fn alter_table(
             name: column.name.clone(),
             ty: column.ty,
             typmod: column.typmod,
-            default_now: column.default_now,
+            volatile_default: column.volatile_default,
             // `NOT NULL` is admissible **only with a constant default**, which is what makes every
             // row already stored hold a value: the missing value below is that value, and the
             // decoder pads with it. Without one the lowering refuses `NOT NULL`, because the

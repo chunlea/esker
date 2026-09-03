@@ -102,15 +102,19 @@ pub struct ColumnDef {
     pub not_null: bool,
     /// Whether the default is an **expression evaluated per row** rather than the constant above.
     ///
-    /// Exactly one expression is admitted, `CURRENT_TIMESTAMP` — and its synonym `now()`, which
-    /// PostgreSQL records as the same thing. It cannot be a [`ColumnDef::default`] because a
+    /// **Which** volatile function fills it, or `None` for a column whose default is a constant
+    /// or absent. `CURRENT_TIMESTAMP` was the only one until statement 710 asked for a UUID; the
+    /// mechanism was already the right one and only the set widened ([`VolatileDefault`]).
+    ///
+    /// `CURRENT_TIMESTAMP` and its synonym `now()` are one entry, which PostgreSQL records as the
+    /// same thing. It cannot be a [`ColumnDef::default`] because a
     /// constant is what a constant is: storing the instant `CREATE TABLE` ran would give every
     /// row the table's birthday, which is a wrong answer rather than an approximation.
     ///
     /// It also has **no missing value**, and that is PostgreSQL's own rule rather than a
     /// simplification: `atthasmissing` is cleared for a volatile default, because there is no one
     /// value a row that predates the column could be said to hold.
-    pub default_now: bool,
+    pub volatile_default: Option<VolatileDefault>,
     /// What an `INSERT` that omits this column writes. `None` is NULL.
     ///
     /// A **constant**, not an expression: `DEFAULT 7` and `DEFAULT 'x'` are stored, `DEFAULT
@@ -131,6 +135,41 @@ pub struct ColumnDef {
     /// column still read `old` and new rows get `new`. Storing one field for both would rewrite
     /// history the first time somebody changed a default.
     pub missing: Option<Datum>,
+}
+
+/// A column default that is **not a constant**: which volatile function fills it.
+///
+/// A default this node can fold is stored as the value ([`ColumnDef::default`]); one that cannot
+/// be folded is stored as *which* it is and evaluated per row. That is the whole mechanism, and it
+/// existed for `CURRENT_TIMESTAMP` alone until statement 710 asked for a UUID.
+///
+/// **Per row, not per statement**: two rows of one `INSERT` get two UUIDs, which is what makes
+/// `id uuid DEFAULT gen_random_uuid() PRIMARY KEY` a workable key and what a default folded once
+/// would get wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolatileDefault {
+    /// `CURRENT_TIMESTAMP` and `now()`, which this node cannot tell apart — both print
+    /// `CURRENT_TIMESTAMP`, which is the divergence `catalog::pg_attribute` declares.
+    Now,
+    /// `gen_random_uuid()`, in core.
+    GenRandomUuid,
+    /// `uuid_generate_v4()`, which needs `uuid-ossp` — checked when the **table** is created, the
+    /// way a real server resolves the expression then.
+    UuidGenerateV4,
+}
+
+impl VolatileDefault {
+    /// How `pg_get_expr` prints it: unparenthesised and uncast, exactly as written. Measured — a
+    /// computed default such as `DEFAULT 1 + 1` prints as `(1 + 1)` on the same server, so the
+    /// parentheses belong to the expression and not to the clause.
+    #[must_use]
+    pub fn printed(self) -> &'static str {
+        match self {
+            VolatileDefault::Now => "CURRENT_TIMESTAMP",
+            VolatileDefault::GenRandomUuid => "gen_random_uuid()",
+            VolatileDefault::UuidGenerateV4 => "uuid_generate_v4()",
+        }
+    }
 }
 
 /// Where an index or a column is in a staged schema change (ADR 0020).
@@ -1837,7 +1876,7 @@ mod tests {
                     name: "id".into(),
                     ty: ColumnType::Int8,
                     typmod: crate::value::NO_TYPMOD,
-                    default_now: false,
+                    volatile_default: None,
                     not_null: true,
                     default: None,
                     missing: None,
@@ -1846,7 +1885,7 @@ mod tests {
                     name: "email".into(),
                     ty: ColumnType::Text,
                     typmod: crate::value::NO_TYPMOD,
-                    default_now: false,
+                    volatile_default: None,
                     not_null: false,
                     default: None,
                     missing: None,
@@ -1889,7 +1928,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "0c",               // catalog format version
+                "0d",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -1947,7 +1986,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "0c",       // catalog format version
+                "0d",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -1980,7 +2019,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "0c",                 // catalog format version
+                "0d",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -1995,14 +2034,14 @@ mod tests {
                 "00",       // no DEFAULT
                 "00",       // and no missing value
                 "ffffffff", // version 4: no typmod, which is -1 and not 0
-                "00",       // version 5: the default is not an expression
+                "00",       // version 5, widened at 13: no volatile default
                 "05656d61696c",
                 "02",
                 "00",       // "email", TEXT, nullable
                 "00",       // no DEFAULT
                 "00",       // and no missing value
                 "ffffffff", // no typmod
-                "00",       // and not an expression default
+                "00",       // and no volatile default
                 "01",
                 "00",                                     // primary key: one column, column 0
                 "01",                                     // one index
@@ -2417,7 +2456,7 @@ mod tests {
         let table = record::decode_table(&v4).unwrap();
         assert_eq!(table, accounts(7));
         for column in &table.columns {
-            assert!(!column.default_now);
+            assert!(column.volatile_default.is_none());
         }
     }
 
@@ -2476,7 +2515,7 @@ mod tests {
             name: "v".into(),
             ty: ColumnType::Varchar,
             typmod: crate::value::typmod_of_length(5),
-            default_now: false,
+            volatile_default: None,
             not_null: false,
             default: None,
             missing: None,
@@ -2485,7 +2524,7 @@ mod tests {
             name: "c".into(),
             ty: ColumnType::Bpchar,
             typmod: crate::value::typmod_of_length(3),
-            default_now: false,
+            volatile_default: None,
             not_null: false,
             default: None,
             missing: None,
@@ -2494,7 +2533,7 @@ mod tests {
             name: "t".into(),
             ty: ColumnType::Timestamp,
             typmod: crate::value::typmod_of_precision(3),
-            default_now: false,
+            volatile_default: None,
             not_null: false,
             default: None,
             missing: None,
@@ -2922,7 +2961,7 @@ mod tests {
             name: "tier".into(),
             ty: ColumnType::Int8,
             typmod: crate::value::NO_TYPMOD,
-            default_now: false,
+            volatile_default: None,
             not_null: true,
             default: Some(Datum::Int8(42)),
             missing: Some(Datum::Int8(42)),
@@ -2972,7 +3011,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "0c",               // catalog format version
+                "0d",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

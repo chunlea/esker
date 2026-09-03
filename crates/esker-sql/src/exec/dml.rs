@@ -137,14 +137,21 @@ fn fit_typmods(table: &TableDef, row: &mut [Datum]) -> Result<()> {
 /// A `timestamptz` column takes it as it is and a `timestamp` column takes the same number: this
 /// node stores both as microseconds from 2000-01-01 UTC, and the assignment cast a real server
 /// applies here is a zone conversion that is the identity at UTC.
-fn column_default_value(column: &crate::catalog::ColumnDef, now: i64) -> Datum {
-    if column.default_now {
-        return match column.ty {
+fn column_default_value(column: &crate::catalog::ColumnDef, now: i64) -> Result<Datum> {
+    use crate::catalog::VolatileDefault;
+    Ok(match column.volatile_default {
+        Some(VolatileDefault::Now) => match column.ty {
             ColumnType::TimestampTz => Datum::TimestampTz(now),
             _ => Datum::Timestamp(now),
-        };
-    }
-    column.default.clone().unwrap_or(Datum::Null)
+        },
+        // **Per row**, which is the whole point: two rows of one `INSERT` get two UUIDs, and a
+        // column defaulted to one can be a primary key. A value folded once at `CREATE TABLE`
+        // would give every row the same key and refuse the second insert.
+        Some(VolatileDefault::GenRandomUuid | VolatileDefault::UuidGenerateV4) => {
+            Datum::Uuid(crate::value::random::uuid_v4()?)
+        }
+        None => column.default.clone().unwrap_or(Datum::Null),
+    })
 }
 
 fn sequence_datum(ty: ColumnType, value: i64) -> Result<Datum> {
@@ -189,7 +196,7 @@ pub(super) fn insert(
             .columns
             .iter()
             .map(|column| column_default_value(column, now))
-            .collect();
+            .collect::<Result<_>>()?;
         for (target, expr) in targets.iter().zip(values) {
             let column = &table.columns[*target];
             // `DEFAULT` written for a column is the column keeping its own default, which is what
@@ -431,7 +438,7 @@ pub(super) fn update(
                     None => column_default_value(
                         column,
                         crate::time_machine::micros_of_ts(txn.start_ts()),
-                    ),
+                    )?,
                 },
                 crate::plan::Expr::Literal(literal) => literal.assign(column.ty, &column.name)?,
                 other => {

@@ -53,11 +53,12 @@ pub struct Column {
     /// Whether `NOT NULL` was declared. A primary key column becomes `NOT NULL` whether or not it
     /// said so, which the executor applies.
     pub not_null: bool,
-    /// Whether the default is `CURRENT_TIMESTAMP` — an expression, evaluated per row.
+    /// Which **volatile** function fills the default, or `None` for a constant or absent one.
     ///
-    /// See `crate::catalog::ColumnDef::default_now`: a constant cannot express it, because
-    /// storing the instant `CREATE TABLE` ran would give every row the table's birthday.
-    pub default_now: bool,
+    /// `CURRENT_TIMESTAMP` was the only one until statement 710 asked for `gen_random_uuid()`;
+    /// the mechanism was already right and only the set widened
+    /// (`crate::catalog::VolatileDefault`).
+    pub volatile_default: Option<crate::catalog::VolatileDefault>,
     /// `DEFAULT <constant>`, already read as a value of the column's own type.
     ///
     /// A constant, and the lowering is where that is enforced: a **volatile** default such as

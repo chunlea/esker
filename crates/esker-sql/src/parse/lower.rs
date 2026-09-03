@@ -786,7 +786,7 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
         let (ty, typmod) = lower_type(&column.data_type)?;
         let mut not_null = false;
         let mut default = None;
-        let mut default_now = false;
+        let mut volatile_default: Option<catalog::VolatileDefault> = None;
         // `bigserial` is the type saying it; `GENERATED ... AS IDENTITY` is an option saying it.
         // Both end here, because what they produce is the same record.
         let mut sequence = serial_identity(&column.data_type);
@@ -818,7 +818,13 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
                 ColumnOption::Null => {}
                 // `DEFAULT CURRENT_TIMESTAMP` is an expression rather than a value, so it is
                 // recorded as one: a constant would freeze the instant `CREATE TABLE` ran.
-                ColumnOption::Default(expr) if is_current_timestamp(expr) => default_now = true,
+                // **A volatile default is recorded as which one it is, not as a value.** A
+                // constant is folded into `default`; these cannot be, because folding one gives
+                // every row the value `CREATE TABLE` ran at — every row the table's birthday, or
+                // every row the same UUID and a primary key that refuses the second insert.
+                ColumnOption::Default(expr) if volatile_default_of(expr).is_some() => {
+                    volatile_default = volatile_default_of(expr);
+                }
                 ColumnOption::Default(expr) => default = column_default(expr, ty)?,
                 ColumnOption::Unique(constraint) => {
                     refuse_if(
@@ -857,7 +863,7 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
             name: column_name,
             ty,
             typmod,
-            default_now,
+            volatile_default,
             not_null,
             default,
             sequence,
@@ -937,7 +943,7 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
         let (ty, typmod) = lower_type(&column_def.data_type)?;
         let mut not_null = false;
         let mut default = None;
-        let mut default_now = false;
+        let mut volatile_default: Option<catalog::VolatileDefault> = None;
         for option in &column_def.options {
             let named = match &option.option {
                 // A **constant** default is admitted: it is stored as the column's missing value
@@ -946,7 +952,7 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
                 // expressions are refused inside `column_default`, by name.
                 ColumnOption::Default(expr) => {
                     if is_current_timestamp(expr) {
-                        default_now = true;
+                        volatile_default = Some(catalog::VolatileDefault::Now);
                     } else {
                         default = column_default(expr, ty)?;
                     }
@@ -985,7 +991,7 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
                 name: ident(&column_def.name),
                 ty,
                 typmod,
-                default_now,
+                volatile_default,
                 not_null,
                 default,
                 sequence: None,
@@ -1940,6 +1946,25 @@ fn qualifier(root: &Expr) -> Result<String> {
         other => Err(SqlError::unsupported(format!(
             "the access chain on {other}"
         ))),
+    }
+}
+
+/// Which volatile function a `DEFAULT` clause names, or `None` for anything else.
+///
+/// The set is closed on purpose: a volatile default is stored as a **tag**, so admitting one means
+/// this node can evaluate it per row. `random()` and every other volatile function stays refused
+/// by name — accepting one and folding it would give every row the same value, which is a wrong
+/// answer rather than a gap.
+fn volatile_default_of(expr: &Expr) -> Option<catalog::VolatileDefault> {
+    if is_current_timestamp(expr) {
+        return Some(catalog::VolatileDefault::Now);
+    }
+    let Expr::Function(function) = unwrap_nested(expr) else {
+        return None;
+    };
+    match plan::UuidFunc::from_name(&function.name.to_string())? {
+        plan::UuidFunc::GenRandomUuid => Some(catalog::VolatileDefault::GenRandomUuid),
+        plan::UuidFunc::UuidGenerateV4 => Some(catalog::VolatileDefault::UuidGenerateV4),
     }
 }
 
