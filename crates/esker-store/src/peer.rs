@@ -1400,6 +1400,17 @@ impl RaftPeer {
 
     /// How far the state machine has applied, without asking the driver thread. Same freshness
     /// rule as [`RaftPeer::term`].
+    ///
+    /// **Which side of a comparison this may sit on is not symmetric.** The driver refreshes it at
+    /// the end of a batch, *after* the apply loop has already told a proposer its entry applied —
+    /// so this can name the entry before the one whose data is on disk. As the **left** side of a
+    /// `>=` against a floor that is what you want: a peer that looks behind is refused or waits,
+    /// which is the safe direction, and that is how the fragment service and the snapshot-offer
+    /// check use it. As the **right** side — as the bar another peer must reach — a stale value is
+    /// a bar that is too low, and whoever clears it has proved nothing. Ask [`RaftPeer::status`]
+    /// for a bar; it is answered inside the driver from the core's own `applied` and cannot name
+    /// an index whose data has not landed. `tests/snapshot.rs`'s placed-columnar-learner test is
+    /// where that distinction was learned, three intermittent failures in.
     #[must_use]
     pub fn applied_index(&self) -> Index {
         self.published.applied.load(Ordering::Acquire)

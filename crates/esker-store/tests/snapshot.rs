@@ -888,15 +888,38 @@ async fn a_placed_columnar_learner_holds_what_the_leader_holds() {
     // transfer — a learner that received nothing and then followed the log perfectly would pass
     // an assertion about the tail alone, and that is the state the cluster was found in.
     let region = first.store.regions().regions()[0].clone();
+    let leader = first.store.peer_of(1).unwrap();
     commit_one(&first.store, &region, key(6), b"committed", 30, 31).await;
 
-    let leader = first.store.peer_of(1).unwrap();
-    wait_for("the learner to reach the leader's applied index", || {
-        second
-            .store
-            .peer_of(1)
-            .is_some_and(|peer| peer.applied_index() >= leader.applied_index())
-    })
+    // **The bar is asked of the driver, not read from what the peer publishes.**
+    //
+    // `RaftPeer::applied_index` reads `Published::applied`, which the driver refreshes at the end
+    // of a batch — *after* `complete_proposal` has already told `commit_one` the entry applied. So
+    // between the acknowledgement and the next publish, the leader holds key 6 and still names the
+    // entry before it, and a learner that has merely caught up to *that* satisfies `>=` while
+    // holding nothing of the commit. `status()` is answered inside the driver from the core's own
+    // `applied`, so it cannot name an index whose data has not landed.
+    //
+    // Measured rather than reasoned: publishing two entries behind on the leader alone —
+    // everything else untouched, so replication keeps its timing — turned this test red 5 times
+    // out of 5 with the identical `(6, 1, 0)`, and reading the bar here instead makes it green
+    // under the same injection. The `>=` on the learner's side stays a *published* read on
+    // purpose: a learner that looks behind only makes this wait longer, which is the safe
+    // direction, and it is the same value the fragment service reads.
+    let bar = leader
+        .status()
+        .await
+        .expect("the leader answers its own status")
+        .applied;
+    wait_for(
+        "the learner to reach the index the leader acknowledged",
+        || {
+            second
+                .store
+                .peer_of(1)
+                .is_some_and(|peer| peer.applied_index() >= bar)
+        },
+    )
     .await;
 
     let short: Vec<(u32, u64, u64)> = (0..7)
@@ -912,7 +935,10 @@ async fn a_placed_columnar_learner_holds_what_the_leader_holds() {
     assert!(
         short.is_empty(),
         "the columnar learner is at the leader's applied index without the leader's data; \
-         (key, leader versions, learner versions) = {short:?}"
+         (key, leader versions, learner versions) = {short:?}; the bar was {bar}, the leader \
+         publishes {}, the learner publishes {:?}",
+        leader.applied_index(),
+        second.store.peer_of(1).map(|peer| peer.applied_index()),
     );
 
     first.stop().await;
