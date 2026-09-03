@@ -849,6 +849,7 @@ impl Literal {
                 | ColumnType::Time
                 // Sixteen bytes are not a number: `1::uuid` is `42846` on a real server.
                 | ColumnType::Uuid
+                | ColumnType::Interval
                 // Neither takes a number or a boolean: `INSERT INTO t (j) VALUES (1)` is a type
                 // mismatch on a real server, not a one-element document.
                 | ColumnType::Json
@@ -907,6 +908,7 @@ impl Literal {
                 | ColumnType::Jsonb
                 | ColumnType::Time
                 | ColumnType::Uuid
+                | ColumnType::Interval
                 | ColumnType::Timestamp => mismatch(),
             },
 
@@ -936,6 +938,7 @@ impl Literal {
                 | ColumnType::Numeric
                 | ColumnType::Time
                 | ColumnType::Uuid
+                | ColumnType::Interval
                 | ColumnType::Real => mismatch(),
             },
         }

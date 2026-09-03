@@ -802,6 +802,18 @@ pub enum SqlError {
     #[error("type modifier is not allowed for type \"{0}\"")]
     TypeModifierNotAllowed(String),
 
+    /// One **field** of an interval past its own width: `22015`.
+    ///
+    /// `'2147483648 months'` is this, where `'178956971 years'` — the same magnitude reached
+    /// through a field that fits — is [`SqlError::IntervalOutOfRange`]'s `22008`. Two codes for
+    /// two overflows, and `22015` appears nowhere else in this project.
+    #[error("interval field value out of range: \"{0}\"")]
+    IntervalFieldOutOfRange(String),
+
+    /// The whole interval past what sixteen bytes hold: `22008`.
+    #[error("interval out of range")]
+    IntervalOutOfRange,
+
     /// A type name with nothing in it: `42601 invalid type name ""`. Not `42704` — PostgreSQL
     /// refuses to look it up rather than failing to find it.
     #[error("invalid type name \"{0}\"")]
@@ -1131,9 +1143,10 @@ impl SqlError {
             | SqlError::SetvalOutOfBounds { .. } => sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
             SqlError::InvalidDatetimeFormat { .. } => sqlstate::INVALID_DATETIME_FORMAT,
             SqlError::CannotCast { .. } => sqlstate::CANNOT_COERCE,
-            SqlError::DatetimeFieldOutOfRange { .. } | SqlError::DatetimeOutOfRange { .. } => {
-                sqlstate::DATETIME_FIELD_OVERFLOW
-            }
+            SqlError::DatetimeFieldOutOfRange { .. }
+            | SqlError::IntervalOutOfRange
+            | SqlError::DatetimeOutOfRange { .. } => sqlstate::DATETIME_FIELD_OVERFLOW,
+            SqlError::IntervalFieldOutOfRange(_) => sqlstate::INTERVAL_FIELD_OVERFLOW,
             SqlError::TimeZoneDisplacementOutOfRange(_) => {
                 sqlstate::INVALID_TIME_ZONE_DISPLACEMENT_VALUE
             }

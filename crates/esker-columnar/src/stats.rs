@@ -130,6 +130,7 @@ impl Bound {
             | ColumnType::Jsonb
             | ColumnType::Numeric
             | ColumnType::Uuid
+            | ColumnType::Interval
             | ColumnType::Bytea => Value::Bytea(self.bytes.clone()),
         })
     }
@@ -288,6 +289,7 @@ impl ColumnStats {
             // decode both bounds and compare with `numeric`'s own ordering or skip this type.
             | ColumnType::Numeric
             | ColumnType::Uuid
+            | ColumnType::Interval
             | ColumnType::Bytea => None,
         };
         [self.min.as_ref(), self.max.as_ref()]
@@ -814,6 +816,11 @@ mod tests {
             | ColumnType::Jsonb => prop::collection::vec(any::<char>(), 0..90)
                 .prop_map(|chars| Value::Text(chars.into_iter().collect()))
                 .boxed(),
+            ColumnType::Interval => prop::collection::vec(any::<u8>(), 16..=16)
+                .prop_map(|bytes| {
+                    Value::Interval(<[u8; 16]>::try_from(bytes.as_slice()).unwrap_or([0; 16]))
+                })
+                .boxed(),
             ColumnType::Uuid => prop::collection::vec(any::<u8>(), 16..=16)
                 .prop_map(|bytes| {
                     Value::Uuid(<[u8; 16]>::try_from(bytes.as_slice()).unwrap_or([0; 16]))
@@ -917,7 +924,11 @@ mod tests {
                 }
                 // Sixteen bytes, bounded by bytes — and here the byte order **is** the type's
                 // order, unlike the `numeric` arm above.
-                Value::Uuid(v) => min.bytes.as_slice() <= &v[..] && &v[..] <= max.bytes.as_slice(),
+                // An interval's bound is its **bytes'** bound, not its value's: the three
+                // fields sit side by side, so a byte comparison is not `pg_cmp`'s conversion.
+                Value::Uuid(v) | Value::Interval(v) => {
+                    min.bytes.as_slice() <= &v[..] && &v[..] <= max.bytes.as_slice()
+                }
                 Value::Null => true,
             };
             if !inside {

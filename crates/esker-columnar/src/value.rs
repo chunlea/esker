@@ -87,6 +87,8 @@ pub enum ColumnType {
     Time,
     /// PostgreSQL's `uuid`: sixteen fixed bytes, ordered by those bytes.
     Uuid,
+    /// PostgreSQL's `interval`: months, days and microseconds, sixteen bytes.
+    Interval,
     /// PostgreSQL's `numeric`: an arbitrary-precision decimal, carried as its **text**.
     ///
     /// Variable-length like a `Text`, and the text is lossless for this type — the scale is in
@@ -106,7 +108,7 @@ pub enum ColumnType {
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 18] = [
+    pub const ALL: [ColumnType; 19] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -124,6 +126,7 @@ impl ColumnType {
         ColumnType::Date,
         ColumnType::Time,
         ColumnType::Uuid,
+        ColumnType::Interval,
         ColumnType::Numeric,
     ];
 
@@ -149,6 +152,7 @@ impl ColumnType {
             ColumnType::Date => 15,
             ColumnType::Time => 17,
             ColumnType::Uuid => 18,
+            ColumnType::Interval => 19,
             ColumnType::Numeric => 16,
         }
     }
@@ -173,6 +177,7 @@ impl ColumnType {
             15 => ColumnType::Date,
             17 => ColumnType::Time,
             18 => ColumnType::Uuid,
+            19 => ColumnType::Interval,
             16 => ColumnType::Numeric,
             other => {
                 return Err(Error::corruption(
@@ -204,6 +209,7 @@ impl ColumnType {
             ColumnType::Date => "date",
             ColumnType::Time => "time without time zone",
             ColumnType::Uuid => "uuid",
+            ColumnType::Interval => "interval",
             ColumnType::Numeric => "numeric",
         }
     }
@@ -254,6 +260,8 @@ pub enum Value {
     Time(i64),
     /// A [`ColumnType::Uuid`], as its sixteen bytes.
     Uuid([u8; 16]),
+    /// A [`ColumnType::Interval`], as the sixteen bytes its three fields occupy.
+    Interval([u8; 16]),
     /// A [`ColumnType::Numeric`], as its text.
     Numeric(String),
 }
@@ -286,6 +294,7 @@ impl Value {
             Value::Date(_) => ty == ColumnType::Date,
             Value::Time(_) => ty == ColumnType::Time,
             Value::Uuid(_) => ty == ColumnType::Uuid,
+            Value::Interval(_) => ty == ColumnType::Interval,
             Value::Numeric(_) => ty == ColumnType::Numeric,
         }
     }
@@ -314,6 +323,7 @@ impl Value {
             Value::Date(_) => ColumnType::Date,
             Value::Time(_) => ColumnType::Time,
             Value::Uuid(_) => ColumnType::Uuid,
+            Value::Interval(_) => ColumnType::Interval,
             Value::Numeric(_) => ColumnType::Numeric,
         })
     }
@@ -334,7 +344,7 @@ impl Value {
             Value::Real(v) => ValueRef::Real(*v),
             Value::Text(v) | Value::Numeric(v) => ValueRef::Bytes(v.as_bytes()),
             // Sixteen bytes, carried as bytes: their order is the type's order.
-            Value::Uuid(v) => ValueRef::Bytes(&v[..]),
+            Value::Uuid(v) | Value::Interval(v) => ValueRef::Bytes(&v[..]),
             Value::Bytea(v) => ValueRef::Bytes(v),
         }
     }
@@ -466,6 +476,11 @@ impl ValueRef<'_> {
                 <[u8; 16]>::try_from(v)
                     .map_err(|_| Error::corruption("column", "a uuid that is not sixteen bytes"))?,
             ),
+            (ValueRef::Bytes(v), ColumnType::Interval) => {
+                Value::Interval(<[u8; 16]>::try_from(v).map_err(|_| {
+                    Error::corruption("column", "an interval that is not sixteen bytes")
+                })?)
+            }
             (ValueRef::Bytes(v), ColumnType::Bytea) => Value::Bytea(v.to_vec()),
             (
                 ValueRef::Bytes(v),
@@ -624,6 +639,7 @@ mod tests {
         assert_eq!(ColumnType::Date.tag(), 15);
         assert_eq!(ColumnType::Time.tag(), 17);
         assert_eq!(ColumnType::Uuid.tag(), 18);
+        assert_eq!(ColumnType::Interval.tag(), 19);
 
         for ty in ColumnType::ALL {
             assert_eq!(ColumnType::from_tag(ty.tag()).unwrap(), ty);

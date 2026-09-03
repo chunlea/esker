@@ -107,6 +107,8 @@ pub enum ValueType {
     Time,
     /// PostgreSQL's `uuid`: sixteen fixed bytes.
     Uuid,
+    /// PostgreSQL's `interval`: months, days and microseconds.
+    Interval,
     /// A 32-bit signed integer.
     ///
     /// Appended by [ADR 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md), never
@@ -117,7 +119,7 @@ pub enum ValueType {
 
 impl ValueType {
     /// Every type, so a test cannot silently skip one.
-    pub const ALL: [ValueType; 14] = [
+    pub const ALL: [ValueType; 15] = [
         ValueType::Int8,
         ValueType::Int4,
         ValueType::Int2,
@@ -132,6 +134,7 @@ impl ValueType {
         ValueType::Numeric,
         ValueType::Time,
         ValueType::Uuid,
+        ValueType::Interval,
     ];
 
     /// The tag byte. Frozen — see the type's docs.
@@ -152,6 +155,7 @@ impl ValueType {
             ValueType::Numeric => 12,
             ValueType::Time => 13,
             ValueType::Uuid => 14,
+            ValueType::Interval => 15,
         }
     }
 
@@ -172,6 +176,7 @@ impl ValueType {
             12 => ValueType::Numeric,
             13 => ValueType::Time,
             14 => ValueType::Uuid,
+            15 => ValueType::Interval,
             _ => return Err(DecodeError::invalid("result.type", "unknown type tag")),
         })
     }
@@ -214,6 +219,8 @@ pub enum Value {
     Time(i64),
     /// [`ValueType::Uuid`], as its sixteen bytes.
     Uuid([u8; 16]),
+    /// [`ValueType::Interval`], as the sixteen bytes its fields occupy.
+    Interval([u8; 16]),
 }
 
 impl Value {
@@ -236,6 +243,7 @@ impl Value {
             Value::Numeric(_) => ValueType::Numeric,
             Value::Time(_) => ValueType::Time,
             Value::Uuid(_) => ValueType::Uuid,
+            Value::Interval(_) => ValueType::Interval,
         })
     }
 
@@ -256,6 +264,10 @@ impl Value {
             }
             Value::Uuid(v) => {
                 out.put_u8(ValueType::Uuid.tag());
+                out.put_bytes(&v[..]);
+            }
+            Value::Interval(v) => {
+                out.put_u8(ValueType::Interval.tag());
                 out.put_bytes(&v[..]);
             }
             Value::Timestamp(v) => {
@@ -331,6 +343,12 @@ impl Value {
                         DecodeError::invalid("result.value.uuid", "not sixteen bytes")
                     })?,
                 )
+            }
+            ValueType::Interval => {
+                let bytes = input.get_bytes("result.value.interval")?;
+                Value::Interval(<[u8; 16]>::try_from(bytes).map_err(|_| {
+                    DecodeError::invalid("result.value.interval", "not sixteen bytes")
+                })?)
             }
             ValueType::Double => {
                 Value::Double(f64::from_bits(input.get_u64("result.value.double")?))

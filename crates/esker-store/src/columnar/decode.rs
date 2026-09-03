@@ -182,6 +182,7 @@ fn columnar_type(ty: StoredType) -> esker_columnar::ColumnType {
         StoredType::Numeric => esker_columnar::ColumnType::Numeric,
         StoredType::Time => esker_columnar::ColumnType::Time,
         StoredType::Uuid => esker_columnar::ColumnType::Uuid,
+        StoredType::Interval => esker_columnar::ColumnType::Interval,
     }
 }
 
@@ -204,6 +205,18 @@ fn value_of(datum: &Datum) -> Value {
         Datum::Numeric(value) => Value::Numeric(esker_keys::numeric::to_text(value)),
         Datum::Time(micros) => Value::Time(*micros),
         Datum::Uuid(bytes) => Value::Uuid(*bytes),
+        // The three fields in the layout the row codec writes, which is what the columnar carries.
+        Datum::Interval {
+            months,
+            days,
+            micros,
+        } => {
+            let mut bytes = [0u8; 16];
+            bytes[..4].copy_from_slice(&months.to_le_bytes());
+            bytes[4..8].copy_from_slice(&days.to_le_bytes());
+            bytes[8..].copy_from_slice(&micros.to_le_bytes());
+            Value::Interval(bytes)
+        }
     }
 }
 

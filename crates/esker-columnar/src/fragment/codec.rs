@@ -392,6 +392,10 @@ fn put_literal(value: &Value, out: &mut Vec<u8>) {
             out.push(ColumnType::Uuid.tag());
             out.extend_from_slice(&v[..]);
         }
+        Value::Interval(v) => {
+            out.push(ColumnType::Interval.tag());
+            out.extend_from_slice(&v[..]);
+        }
         Value::Date(v) => {
             out.push(ColumnType::Date.tag());
             out.extend_from_slice(&v.to_le_bytes());
@@ -448,6 +452,12 @@ fn take_literal(cursor: &mut Cursor<'_>) -> Result<Value> {
             bytes[..8].copy_from_slice(&cursor.u64_le("literal uuid")?.to_le_bytes());
             bytes[8..].copy_from_slice(&cursor.u64_le("literal uuid")?.to_le_bytes());
             Value::Uuid(bytes)
+        }
+        ColumnType::Interval => {
+            let mut bytes = [0u8; 16];
+            bytes[..8].copy_from_slice(&cursor.u64_le("literal interval")?.to_le_bytes());
+            bytes[8..].copy_from_slice(&cursor.u64_le("literal interval")?.to_le_bytes());
+            Value::Interval(bytes)
         }
         ColumnType::Int4 => Value::Int4(i32::from_le_bytes(
             cursor.u32_le("literal int4")?.to_le_bytes(),

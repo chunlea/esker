@@ -633,6 +633,7 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::Numeric => "numeric",
         ColumnType::Time => "time",
         ColumnType::Uuid => "uuid",
+        ColumnType::Interval => "interval",
     }
 }
 
@@ -656,6 +657,8 @@ fn typcategory(ty: ColumnType) -> &'static str {
             "D"
         }
         ColumnType::Bytea | ColumnType::Json | ColumnType::Jsonb | ColumnType::Uuid => "U",
+        // `T` for timespan, which is its own category and not the datetimes' `D`.
+        ColumnType::Interval => "T",
     }
 }
 
@@ -685,5 +688,6 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::Numeric => "numeric_in",
         ColumnType::Time => "time_in",
         ColumnType::Uuid => "uuid_in",
+        ColumnType::Interval => "interval_in",
     }
 }

@@ -179,11 +179,19 @@ pub enum ColumnType {
     /// *text* is far more permissive on the way in than on the way out — five spellings read as
     /// one value — but that is `esker-sql`'s business; here it is sixteen bytes.
     Uuid,
+    /// PostgreSQL's `interval`: **three independent fields** — months, days and microseconds —
+    /// in sixteen bytes.
+    ///
+    /// Almost everything surprising about the type follows from their independence. Storage keeps
+    /// what was written (`1 mon 1 day` stays that, `400 days` never becomes a year), while
+    /// *comparison* converts a month to 30 days and a day to 24 hours — so two intervals can be
+    /// equal and print differently. Signs are per field: `1 day -12:00:00` is a real value.
+    Interval,
 }
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 18] = [
+    pub const ALL: [ColumnType; 19] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -202,6 +210,7 @@ impl ColumnType {
         ColumnType::Numeric,
         ColumnType::Time,
         ColumnType::Uuid,
+        ColumnType::Interval,
     ];
 }
 
@@ -252,6 +261,15 @@ pub enum Datum {
     Time(i64),
     /// [`ColumnType::Uuid`], as the sixteen bytes it is.
     Uuid([u8; 16]),
+    /// [`ColumnType::Interval`]: months, days and microseconds, each with its own sign.
+    Interval {
+        /// Whole months. Years are twelve of these; nothing else carries into them.
+        months: i32,
+        /// Whole days, which never carry into months.
+        days: i32,
+        /// The time of day part, which never carries into days.
+        micros: i64,
+    },
 }
 
 impl PartialEq for Datum {
@@ -269,6 +287,24 @@ impl PartialEq for Datum {
             (Datum::Int2(a), Datum::Int2(b)) => a == b,
             (Datum::Timestamp(a), Datum::Timestamp(b)) | (Datum::Time(a), Datum::Time(b)) => a == b,
             (Datum::Uuid(a), Datum::Uuid(b)) => a == b,
+            // Representation equality, not value equality: `1 mon` and `30 days` are equal
+            // *values* and different rows. `pg_cmp` is where the number of them is compared.
+            (
+                Datum::Interval {
+                    months: left_months,
+                    days: left_days,
+                    micros: left_micros,
+                },
+                Datum::Interval {
+                    months: right_months,
+                    days: right_days,
+                    micros: right_micros,
+                },
+            ) => {
+                left_months == right_months
+                    && left_days == right_days
+                    && left_micros == right_micros
+            }
             (Datum::Text(a), Datum::Text(b)) => a == b,
             (Datum::Bool(a), Datum::Bool(b)) => a == b,
             (Datum::Bytea(a), Datum::Bytea(b)) => a == b,
@@ -294,6 +330,7 @@ impl Datum {
             Datum::Date(_) => ColumnType::Date,
             Datum::Time(_) => ColumnType::Time,
             Datum::Uuid(_) => ColumnType::Uuid,
+            Datum::Interval { .. } => ColumnType::Interval,
             Datum::Numeric(_) => ColumnType::Numeric,
             Datum::Int2(_) => ColumnType::Int2,
             Datum::Real(_) => ColumnType::Real,

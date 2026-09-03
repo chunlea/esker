@@ -60,6 +60,10 @@ pub const INVALID_DATETIME_FORMAT: &str = "22007";
 pub const CANNOT_COERCE: &str = "42846";
 /// A datetime field is out of range — a thirteenth month, or an instant past the type's end.
 pub const DATETIME_FIELD_OVERFLOW: &str = "22008";
+
+/// One field of an interval past its own width, which is a **different** code from the whole
+/// value overflowing: `'2147483648 months'` is this and `'178956971 years'` is `22008`.
+pub const INTERVAL_FIELD_OVERFLOW: &str = "22015";
 /// A time zone displacement past `±15:59`, which is its own condition and not a field overflow.
 pub const INVALID_TIME_ZONE_DISPLACEMENT_VALUE: &str = "22009";
 /// A value longer than the length its column declared: `varchar(5)` given six characters.
@@ -257,6 +261,7 @@ mod tests {
         ("DIVISION_BY_ZERO", super::DIVISION_BY_ZERO),
         ("INVALID_DATETIME_FORMAT", super::INVALID_DATETIME_FORMAT),
         ("DATETIME_FIELD_OVERFLOW", super::DATETIME_FIELD_OVERFLOW),
+        ("INTERVAL_FIELD_OVERFLOW", super::INTERVAL_FIELD_OVERFLOW),
         (
             "INVALID_TIME_ZONE_DISPLACEMENT_VALUE",
             super::INVALID_TIME_ZONE_DISPLACEMENT_VALUE,

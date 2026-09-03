@@ -217,6 +217,7 @@ fn activerecord_s_four_type_map_queries_answer() {
             ],
             // `numeric` is in this list of forty too, and its `typinput` is PostgreSQL's own
             // `numeric_in` — derived from `ColumnType::ALL` like every row above it.
+            vec!["1186", "interval", "0", ",", "interval_in", "\\N", "b", "0"],
             vec!["1700", "numeric", "0", ",", "numeric_in", "\\N", "b", "0"],
             // `uuid` is the tenth type in ADR 0033's tier 2 and the ninth of the twenty
             // refusals in `postgresql_specific_schema.rb`.

@@ -139,6 +139,7 @@ impl ColumnData {
             | ColumnType::Jsonb
             | ColumnType::Numeric
             | ColumnType::Uuid
+            | ColumnType::Interval
             | ColumnType::Bytea => ColumnData::Bytes {
                 offsets: vec![0],
                 data: Vec::new(),
@@ -192,6 +193,7 @@ impl ColumnData {
                         // string; `stats::fit` says why its *bounds* are not a number's.
                         | ColumnType::Numeric
                         | ColumnType::Uuid
+                        | ColumnType::Interval
                         | ColumnType::Bytea
                 )
         )
@@ -432,7 +434,7 @@ impl ColumnBuilder {
             Value::Real(v) => self.floats.push(*v),
             Value::Bool(v) => self.bools.push(*v),
             Value::Text(v) | Value::Numeric(v) => self.push_bytes(v.as_bytes())?,
-            Value::Uuid(v) => self.push_bytes(&v[..])?,
+            Value::Uuid(v) | Value::Interval(v) => self.push_bytes(&v[..])?,
             Value::Bytea(v) => self.push_bytes(v)?,
         }
         Ok(())
@@ -492,6 +494,7 @@ impl ColumnBuilder {
             | ColumnType::Jsonb
             | ColumnType::Numeric
             | ColumnType::Uuid
+            | ColumnType::Interval
             | ColumnType::Bytea => ColumnData::Bytes {
                 offsets: std::mem::replace(&mut self.offsets, vec![0]),
                 data: std::mem::take(&mut self.data),

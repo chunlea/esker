@@ -129,6 +129,16 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
         Datum::Int2(v) => out.extend_from_slice(&v.to_le_bytes()),
         // Sixteen bytes, fixed, so no length precedes them.
         Datum::Uuid(v) => out.extend_from_slice(v),
+        // Sixteen bytes, the three fields in their own widths and in declaration order.
+        Datum::Interval {
+            months,
+            days,
+            micros,
+        } => {
+            out.extend_from_slice(&months.to_le_bytes());
+            out.extend_from_slice(&days.to_le_bytes());
+            out.extend_from_slice(&micros.to_le_bytes());
+        }
         Datum::Bool(v) => out.push(u8::from(*v)),
         Datum::Double(v) => out.extend_from_slice(&v.to_le_bytes()),
         Datum::Real(v) => out.extend_from_slice(&v.to_le_bytes()),
@@ -308,6 +318,19 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
             let (head, rest) = bytes.split_first_chunk::<16>().ok_or_else(truncated)?;
             (Datum::Uuid(*head), rest)
         }
+        ColumnType::Interval => {
+            let (head, rest) = bytes.split_first_chunk::<16>().ok_or_else(truncated)?;
+            let (months, tail) = head.split_at(4);
+            let (days, micros) = tail.split_at(4);
+            (
+                Datum::Interval {
+                    months: i32::from_le_bytes(months.try_into().unwrap_or([0; 4])),
+                    days: i32::from_le_bytes(days.try_into().unwrap_or([0; 4])),
+                    micros: i64::from_le_bytes(micros.try_into().unwrap_or([0; 8])),
+                },
+                rest,
+            )
+        }
         ColumnType::Int2 => {
             let (head, rest) = bytes.split_first_chunk::<2>().ok_or_else(truncated)?;
             (Datum::Int2(i16::from_le_bytes(*head)), rest)
@@ -472,6 +495,14 @@ fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
         // **The bytes are the key.** A uuid's order is its bytes' order — `uuid_cmp` is a
         // `memcmp` — and they are fixed width, so nothing has to be escaped or terminated.
         Datum::Uuid(v) => out.extend_from_slice(v),
+        // **The key is the value, not the representation.** An index over an interval has to put
+        // `1 mon` and `30 days` in the same place, because they are equal — so the key is the
+        // microseconds the comparison converts them to, and the row keeps what was written.
+        Datum::Interval {
+            months,
+            days,
+            micros,
+        } => codec::encode_i64(interval_total(*months, *days, *micros), out),
         Datum::Int2(v) => codec::encode_i64(i64::from(*v), out),
         // Four bytes, its own width, in the order `sort_bits_of_f32` puts floats.
         Datum::Real(v) => out.extend_from_slice(&crate::value::sort_bits_of_f32(*v).to_be_bytes()),
@@ -613,6 +644,19 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
                 .split_first_chunk::<16>()
                 .ok_or_else(|| corrupt("an index key with a short uuid"))?;
             (Datum::Uuid(*head), rest)
+        }
+        // Read back as microseconds with no months and no days, which is what the key holds: the
+        // *value*, not the fields it was written with. The row is where the fields live.
+        ColumnType::Interval => {
+            let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
+            (
+                Datum::Interval {
+                    months: 0,
+                    days: 0,
+                    micros: value,
+                },
+                rest,
+            )
         }
         ColumnType::Int2 => {
             let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
@@ -829,6 +873,21 @@ fn take_numeric(bytes: &[u8]) -> Result<(Datum, &[u8])> {
 fn unzigzag(value: u64) -> Result<i32> {
     let wide = varint::zigzag_decode(value);
     i32::try_from(wide).map_err(|_| corrupt(format!("a numeric scale of {wide}")))
+}
+
+/// An interval as one number of microseconds, which is what comparison and an index key use.
+///
+/// **A month is thirty days and a day is twenty-four hours**, which is PostgreSQL's own rule for
+/// comparing intervals: `'1 mon' = '30 days'` is `t` and `'1 year' = '360 days'` is `t`. It is a
+/// conversion for ordering only — storage keeps the fields, so `1 mon 1 day` prints as itself.
+#[must_use]
+pub fn interval_total(months: i32, days: i32, micros: i64) -> i64 {
+    const MICROS_PER_DAY: i64 = 86_400_000_000;
+    i64::from(months)
+        .saturating_mul(30)
+        .saturating_add(i64::from(days))
+        .saturating_mul(MICROS_PER_DAY)
+        .saturating_add(micros)
 }
 
 #[cfg(test)]
@@ -1211,6 +1270,14 @@ mod tests {
             // The whole closed range, both ends included, because `24:00:00` is a value.
             ColumnType::Time => (0i64..=86_400_000_000).prop_map(Datum::Time).boxed(),
             ColumnType::Uuid => any::<[u8; 16]>().prop_map(Datum::Uuid).boxed(),
+            // Bounded so the total in microseconds cannot overflow, which is what the key holds.
+            ColumnType::Interval => (-100_000i32..100_000, -100_000i32..100_000, any::<i32>())
+                .prop_map(|(months, days, micros)| Datum::Interval {
+                    months,
+                    days,
+                    micros: i64::from(micros),
+                })
+                .boxed(),
             // Weighted towards the shapes the encoding has cases for: the three specials, zero,
             // and a finite value at a scale on either side of nothing.
             ColumnType::Numeric => prop_oneof![

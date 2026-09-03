@@ -1764,9 +1764,12 @@ fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // Its own family too: `uuid = text` and `uuid = integer` are both `42883` on a real
             // server, and its only comparisons are with another uuid.
             ColumnType::Uuid => 7,
+            // Its own family: `interval = integer` is `42883` on a real server, and an interval
+            // compares with another interval and with nothing else here.
+            ColumnType::Interval => 8,
             // Unreachable: returned above, and kept as an arm rather than a `_` so that the next
-            // type added here is a compile error rather than a silent family 8.
-            ColumnType::Json => 8,
+            // type added here is a compile error rather than a silent family 9.
+            ColumnType::Json => 9,
         }
     }
     if matches!(left, ColumnType::Json) || matches!(right, ColumnType::Json) {

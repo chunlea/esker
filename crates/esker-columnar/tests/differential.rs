@@ -392,6 +392,10 @@ fn literal(rng: &mut Pcg32, ty: ColumnType) -> Value {
             let pool = [0i64, 1, -1, i64::MIN, i64::MAX, 42, -42, 7];
             Value::Int8(pool[rng.below(pool.len() as u32) as usize])
         }
+        ColumnType::Interval => {
+            let pool = [[0u8; 16], [1u8; 16], *b"0123456789abcdef"];
+            Value::Interval(pool[rng.below(pool.len() as u32) as usize])
+        }
         ColumnType::Uuid => {
             let pool = [[0u8; 16], [0xff; 16], *b"0123456789abcdef"];
             Value::Uuid(pool[rng.below(pool.len() as u32) as usize])

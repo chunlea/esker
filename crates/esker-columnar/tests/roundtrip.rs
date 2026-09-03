@@ -116,6 +116,9 @@ fn value_of(ty: ColumnType) -> impl Strategy<Value = Value> {
         | ColumnType::Jsonb => (0usize..5)
             .prop_map(|pick| Value::Text(["", "a", "beta", "gamma", "\u{1f600}"][pick].to_owned()))
             .boxed(),
+        ColumnType::Interval => prop::collection::vec(any::<u8>(), 16..=16)
+            .prop_map(|b| Value::Interval(<[u8; 16]>::try_from(b.as_slice()).unwrap_or([0; 16])))
+            .boxed(),
         ColumnType::Uuid => prop::collection::vec(any::<u8>(), 16..=16)
             .prop_map(|bytes| {
                 Value::Uuid(<[u8; 16]>::try_from(bytes.as_slice()).unwrap_or([0; 16]))
