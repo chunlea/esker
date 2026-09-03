@@ -49,7 +49,8 @@
 #     ActiveRecord does **not** use a subquery; it emits
 #     `UPDATE "vl_comments" "__active_record_update_alias" SET … FROM "vl_comments" INNER JOIN …
 #     WHERE "vl_comments"."id" = "__active_record_update_alias"."id"`. Supporting `IN (subquery)`
-#     alone leaves that one failing, and it is in the same test files.
+#     alone left that one failing, and it is in the same test files — so it became its own unit and
+#     its own capture, `pg19_update_from.txt`. The line below runs here now.
 #   * **`RETURNING` composes with the subquery form** — a `DELETE … WHERE id IN (…) RETURNING id,
 #     title` is accepted, and returns nothing when the subquery matched nothing.
 CREATE TABLE vl_posts (id bigserial primary key, vl_author_id bigint, title character varying)	[]		-

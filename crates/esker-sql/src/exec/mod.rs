@@ -1767,12 +1767,46 @@ fn returning_fields(
         return Ok(None);
     };
     let (columns, _) = query::returning_columns(items, table)?;
-    Ok(Some(
-        columns
-            .into_iter()
-            .map(|(name, ty, typmod)| FieldDescription::of(name, ty, typmod))
-            .collect(),
-    ))
+    Ok(Some(described(columns)))
+}
+
+/// The same for an `UPDATE`, whose `RETURNING` may name a `FROM` relation as readily as the row
+/// being written — `RETURNING a.id, a.body, p.title`, measured — and whose target may be under an
+/// alias that took its name away.
+///
+/// The `FROM` relations are resolved here rather than read out of `tables` positionally: a name
+/// the catalog does not have is dropped from that list, and a scope built by position off a list
+/// with a hole in it describes the wrong columns rather than failing.
+fn update_returning_fields(
+    update: &crate::plan::Update,
+    tables: &[Arc<crate::catalog::TableDef>],
+    catalogued: &Catalogued<'_>,
+) -> Result<Option<Vec<FieldDescription>>> {
+    let (Some(items), Some(target)) = (update.returning.as_ref(), tables.first()) else {
+        return Ok(None);
+    };
+    let chain = update.chain();
+    let sources = chain
+        .iter()
+        .map(|join| subquery::relation_of(&join.table, catalogued))
+        .collect::<Result<Vec<_>>>()?;
+    let name = dml::target_name(update, target);
+    let entries = dml::scope_entries(target, &name, &chain, &sources);
+    let from = crate::plan::TableRef {
+        alias: update.alias.clone(),
+        ..crate::plan::TableRef::bare(target.name.clone())
+    };
+    let (columns, _) =
+        query::returning_columns_over(items, Some(from), &chain, &query::Scope::chain(&entries))?;
+    Ok(Some(described(columns)))
+}
+
+/// A resolved target list as the wire describes it.
+fn described(columns: Vec<(String, ColumnType, i32)>) -> Vec<FieldDescription> {
+    columns
+        .into_iter()
+        .map(|(name, ty, typmod)| FieldDescription::of(name, ty, typmod))
+        .collect()
 }
 
 impl Execute for Executor {
@@ -1841,7 +1875,14 @@ impl Execute for Executor {
             // there are no columns and then send it some, which is the one thing a `Describe` is
             // for.
             Statement::Insert(insert) => returning_fields(insert.returning.as_ref(), &tables)?,
-            Statement::Update(update) => returning_fields(update.returning.as_ref(), &tables)?,
+            Statement::Update(update) => update_returning_fields(
+                update,
+                &tables,
+                &Catalogued {
+                    exec: self,
+                    txn: &*txn,
+                },
+            )?,
             Statement::Delete(delete) => returning_fields(delete.returning.as_ref(), &tables)?,
             _ => None,
         };

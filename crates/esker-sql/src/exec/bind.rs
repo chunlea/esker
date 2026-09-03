@@ -229,8 +229,12 @@ fn walk(
                     }
                 }
             }
-            if let Some(filter) = &update.filter {
-                walk_predicate(filter, tables, seen);
+            for predicate in update
+                .filter
+                .iter()
+                .chain(update.joins.iter().filter_map(|join| join.on.as_ref()))
+            {
+                walk_predicate(predicate, tables, seen);
             }
         }
         Statement::Delete(delete) => {
@@ -545,6 +549,14 @@ pub(super) fn walk_mut(statement: &mut Statement, visit: &mut impl FnMut(&mut Ex
             if let Some(filter) = &mut update.filter {
                 walk_expr_mut(filter, visit);
             }
+            // **Every clause, not the two that predate the `FROM`.** A `$1` left unsubstituted
+            // reaches the row evaluator with nothing behind it, which is an `XX000` about a
+            // statement a real server runs.
+            for join in &mut update.joins {
+                if let Some(on) = &mut join.on {
+                    walk_expr_mut(on, visit);
+                }
+            }
         }
         Statement::Delete(delete) => {
             if let Some(filter) = &mut delete.filter {
@@ -732,11 +744,22 @@ pub(super) fn table_names(statement: &Statement) -> Vec<&str> {
         // joined relation sends `DELETE FROM a WHERE (a.id) IN (SELECT a.id FROM a JOIN b … WHERE
         // b.title = $1)`, and `$1` is typed by a column of `b`.
         Statement::Update(update) => {
+            // The table written, then its `FROM` chain **in the order the chain is built** —
+            // `crate::exec::dml::update` puts the `FROM` entry first and its joins after it, and
+            // `returning_fields` reads this list back positionally to rebuild that scope.
             let mut names = vec![update.table.as_str()];
+            names.extend(
+                update
+                    .from
+                    .iter()
+                    .chain(update.joins.iter().map(|join| &join.table))
+                    .map(|entry| entry.name.as_str()),
+            );
             for expr in update
                 .filter
                 .iter()
                 .chain(update.assignments.iter().map(|(_, value)| value))
+                .chain(update.joins.iter().filter_map(|join| join.on.as_ref()))
             {
                 collect_subquery_tables(expr, &mut names);
             }
@@ -819,6 +842,11 @@ pub(super) fn for_each_expr<'a>(statement: &'a Statement, visit: &mut impl FnMut
                 each(value);
             }
             update.filter.iter().for_each(&mut each);
+            update
+                .joins
+                .iter()
+                .filter_map(|join| join.on.as_ref())
+                .for_each(&mut each);
         }
         Statement::Delete(delete) => delete.filter.iter().for_each(&mut each),
         Statement::Explain(inner, _) => for_each_expr(inner, visit),

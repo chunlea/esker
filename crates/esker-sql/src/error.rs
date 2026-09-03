@@ -548,6 +548,23 @@ pub enum SqlError {
         relation: String,
     },
 
+    /// `UPDATE t a SET a.body = 'q'` — a `SET` target with the relation written in front of it.
+    ///
+    /// **The error is about a column, not a relation.** PostgreSQL reads `a.body` as the column
+    /// `a` and a field of it, so what it reports missing is `a` — the same sentence and the same
+    /// `42703` as [`SqlError::UndefinedColumnInRelation`], with a `HINT` that says why. Measured,
+    /// both halves (`tests/corpus/pg19_update_from.txt`).
+    ///
+    /// A separate variant rather than a flag on that one, because the `HINT` is the whole
+    /// difference and a plain `SET nope = 1` must not carry it.
+    #[error("column \"{column}\" of relation \"{relation}\" does not exist")]
+    QualifiedSetTarget {
+        /// The qualifier, which is what PostgreSQL read as the column.
+        column: String,
+        /// The table being written, under its own name rather than its alias.
+        relation: String,
+    },
+
     /// A NULL reached a `NOT NULL` column, with the relation named the way PostgreSQL names it.
     #[error(
         "null value in column \"{column}\" of relation \"{relation}\" violates not-null constraint"
@@ -1655,7 +1672,8 @@ impl SqlError {
             | SqlError::UndefinedQualifiedColumn { .. }
             | SqlError::UsingColumnMissing { .. }
             | SqlError::UndefinedExcludedColumn(_)
-            | SqlError::UndefinedColumnInRelation { .. } => sqlstate::UNDEFINED_COLUMN,
+            | SqlError::UndefinedColumnInRelation { .. }
+            | SqlError::QualifiedSetTarget { .. } => sqlstate::UNDEFINED_COLUMN,
             SqlError::ColumnTypeConflict { .. } => sqlstate::DATATYPE_MISMATCH,
 
             SqlError::DuplicateTrigger { .. } => sqlstate::DUPLICATE_OBJECT,
@@ -2045,6 +2063,11 @@ impl SqlError {
             SqlError::InvalidFromReference { alias, .. } => Some(format!(
                 "Perhaps you meant to reference the table alias \"{alias}\"."
             )),
+            // PostgreSQL's own sentence, and it is the one thing the message does not say: the
+            // column it names as missing is the *qualifier* the user wrote.
+            SqlError::QualifiedSetTarget { .. } => {
+                Some("SET target columns cannot be qualified with the relation name.".to_owned())
+            }
             _ => None,
         }
     }

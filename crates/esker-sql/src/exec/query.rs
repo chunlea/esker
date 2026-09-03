@@ -111,7 +111,7 @@ impl<'a> Scope<'a> {
     }
 
     /// One table under the name the query refers to it by.
-    fn single_as(table: &'a TableDef, name: String) -> Self {
+    pub(super) fn single_as(table: &'a TableDef, name: String) -> Self {
         Scope {
             tables: vec![table],
             names: vec![name],
@@ -149,7 +149,7 @@ impl<'a> Scope<'a> {
     ///
     /// `using` is empty by construction: `USING` in a chain is refused in the lowering, since the
     /// merge it performs compounds in ways an equality cannot express (`plan::Select::joins`).
-    fn chain(entries: &[(&'a TableDef, String)]) -> Self {
+    pub(super) fn chain(entries: &[(&'a TableDef, String)]) -> Self {
         Scope {
             tables: entries.iter().map(|(table, _)| *table).collect(),
             names: entries.iter().map(|(_, name)| name.clone()).collect(),
@@ -397,9 +397,24 @@ pub(super) struct Planned {
 /// is not changing still have to be written back, and the index entries it is replacing were built
 /// from the old ones.
 pub(super) fn matching_rows(filter: Option<&Expr>, tenant: u64, table: &TableDef) -> Result<Node> {
+    matching_rows_as(filter, tenant, table, table.name.clone())
+}
+
+/// The same, under the name the statement refers to the table by.
+///
+/// **An alias replaces the name.** `UPDATE t AS a SET … WHERE t.id = 1` is
+/// `42P01 invalid reference to FROM-clause entry for table "t"` on a real server, with a HINT
+/// naming the alias — measured — and a scope built on the table's own name would answer it
+/// instead of refusing.
+pub(super) fn matching_rows_as(
+    filter: Option<&Expr>,
+    tenant: u64,
+    table: &TableDef,
+    name: String,
+) -> Result<Node> {
     let mut node = access_path(filter, tenant, table)?;
     if let Some(filter) = filter {
-        let scope = Scope::single(table);
+        let scope = Scope::single_as(table, name);
         let predicate = resolve(filter, &scope)?;
         check_predicate(&predicate, "WHERE", &scope)?;
         node = Node::Filter {
@@ -812,16 +827,34 @@ pub(super) type TargetList = (Vec<(String, ColumnType, i32)>, Vec<Expr>);
 /// order under the same names. An aggregate is refused here rather than resolved: there is no
 /// group in a statement that writes rows, and PostgreSQL says so.
 pub(super) fn returning_columns(items: &[SelectItem], table: &TableDef) -> Result<TargetList> {
+    returning_columns_over(
+        items,
+        Some(crate::plan::TableRef::bare(table.name.clone())),
+        &[],
+        &Scope::single(table),
+    )
+}
+
+/// The same, over the relations an `UPDATE … FROM` has in scope.
+///
+/// `RETURNING` there may name a column of a `FROM` relation as readily as one of the row being
+/// written — they are one row by the time it is evaluated — so the scope and the `FROM` shape are
+/// the caller's rather than built from a single table here.
+pub(super) fn returning_columns_over(
+    items: &[SelectItem],
+    from: Option<crate::plan::TableRef>,
+    joins: &[crate::plan::Join],
+    scope: &Scope<'_>,
+) -> Result<TargetList> {
     for item in items {
         if let SelectItem::Expr { expr, .. } = item {
             crate::exec::subquery::refuse_in(expr, "a RETURNING list")?;
         }
     }
-    let scope = Scope::single(table);
     let select = Select {
-        from: Some(crate::plan::TableRef::bare(table.name.clone())),
+        from,
         ctes: Vec::new(),
-        joins: Vec::new(),
+        joins: joins.to_vec(),
         projection: items.to_vec(),
         filter: None,
         distinct: false,
@@ -840,8 +873,8 @@ pub(super) fn returning_columns(items: &[SelectItem], table: &TableDef) -> Resul
             ));
         }
     }
-    let columns = output_columns(&select, &scope, None)?;
-    let exprs = projection_exprs(&select, &scope, None)?;
+    let columns = output_columns(&select, scope, None)?;
+    let exprs = projection_exprs(&select, scope, None)?;
     Ok((columns, exprs))
 }
 
@@ -954,6 +987,74 @@ fn plan_chain(
         };
     }
     finish_plan(select, node, &scope, Some(outer))
+}
+
+/// The rows an `UPDATE … FROM` writes: the target's row, then whatever its `FROM` chain put
+/// beside it.
+///
+/// [`plan_chain`] without its projection, and that is the whole difference. A statement that
+/// rewrites a row needs **all** of it — the columns it is not changing still have to be written
+/// back, and the index entries it is replacing were built from the old ones — so there is nothing
+/// to project down to. What comes out is the concatenated shape
+/// `Scope::conflicting` already describes for `ON CONFLICT … DO UPDATE`: ordinals `0..n` are the
+/// row being written and everything after them is what the `SET` expressions may read.
+///
+/// **The `FROM` entry is joined to the target with no condition.** `UPDATE t a SET … FROM x WHERE
+/// …` means `t CROSS JOIN x` with the `WHERE` doing the tying, exactly as a comma in a `SELECT`'s
+/// `FROM` does — so nothing is approximated by building it as one, and a join written *inside* the
+/// `FROM` keeps its own `ON`.
+pub(super) fn joined_target_rows(
+    tenant: u64,
+    entries: &[(&TableDef, String)],
+    joins: &[crate::plan::Join],
+    filter: Option<&Expr>,
+) -> Result<Node> {
+    let Some((target, _)) = entries.first() else {
+        return Err(SqlError::Internal(
+            "an UPDATE ... FROM with no table to write".to_owned(),
+        ));
+    };
+    // The same rule a `SELECT` follows: the same table may appear twice under two names — which is
+    // exactly what the `update_all` shape does — so a duplicate *name* is the error and a
+    // duplicate table is not.
+    for (at, (_, name)) in entries.iter().enumerate() {
+        if !name.is_empty() && entries[..at].iter().any(|(_, earlier)| earlier == name) {
+            return Err(SqlError::DuplicateTableName(name.clone()));
+        }
+    }
+    // The `WHERE` cannot narrow the target's access path: it may name any of the relations, and a
+    // value from one not yet read is not one a scan can seek on.
+    let mut node = access_path(None, tenant, target)?;
+    // Grown one relation at a time, so each step's `ON` sees the relations to its left plus the
+    // one being joined — the same left-deep shape and the same reason as `plan_chain`.
+    for (at, join) in joins.iter().enumerate() {
+        let Some((inner, _)) = entries.get(at + 1) else {
+            return Err(SqlError::Internal(
+                "an UPDATE ... FROM join with no relation".to_owned(),
+            ));
+        };
+        let scope = Scope::chain(&entries[..=at + 1]);
+        let left = Scope::chain(&entries[..=at]);
+        let inner_source = source_function(Some(&join.table), inner, &left)?;
+        node = join_node(
+            node,
+            join.on.as_ref(),
+            join.kind == crate::plan::JoinKind::Left,
+            &scope,
+            inner,
+            inner_source.as_ref().or_else(|| join.table.derived_plan()),
+        )?;
+    }
+    if let Some(filter) = filter {
+        let scope = Scope::chain(entries);
+        let predicate = resolve(filter, &scope)?;
+        check_predicate(&predicate, "WHERE", &scope)?;
+        node = Node::Filter {
+            input: Box::new(node),
+            predicate,
+        };
+    }
+    Ok(node)
 }
 
 /// Whether any subquery in this statement turned out to be correlated.
@@ -1542,10 +1643,14 @@ fn pinned(ordinals: &[usize], equalities: &[(usize, Datum)]) -> Option<Vec<Datum
         .collect()
 }
 
-/// Resolves a column reference against one table — what `UPDATE`'s `SET` expressions need.
-pub(super) fn resolve_against(expr: &Expr, table: &TableDef) -> Result<Expr> {
+/// Resolves a column reference against the relations an `UPDATE` has in scope — the row being
+/// written, and whatever its `FROM` put beside it.
+///
+/// One entry point for both, because `SET body = c.body || '!'` is the same resolution as
+/// `SET body = body || '!'` against a scope with one more table in it.
+pub(super) fn resolve_against_scope(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
     crate::exec::subquery::refuse_in(expr, "an UPDATE assignment")?;
-    resolve(expr, &Scope::single(table))
+    resolve(expr, scope)
 }
 
 /// `ORDER BY x` where `x` is an output alias means the expression that alias names.

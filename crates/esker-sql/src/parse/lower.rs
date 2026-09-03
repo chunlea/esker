@@ -5036,7 +5036,6 @@ fn table_factor(factor: &TableFactor) -> Result<String> {
 }
 
 fn lower_update(update: &sqlparser::ast::Update) -> Result<plan::Update> {
-    refuse_if(update.from.is_some(), "UPDATE ... FROM")?;
     let returning = update
         .returning
         .as_deref()
@@ -5047,14 +5046,52 @@ fn lower_update(update: &sqlparser::ast::Update) -> Result<plan::Update> {
     refuse_if(!update.order_by.is_empty(), "UPDATE ... ORDER BY")?;
     refuse_if(update.limit.is_some(), "UPDATE ... LIMIT")?;
     refuse_if(!update.optimizer_hints.is_empty(), "an optimizer hint")?;
+    // **A join written on the target itself is not the `FROM` clause.** `UPDATE a JOIN b ON …` is
+    // not PostgreSQL's grammar at all; `UPDATE a SET … FROM b …` is, and it is the one below.
     refuse_if(!update.table.joins.is_empty(), "a JOIN in UPDATE")?;
+    // `FROM` **before** `SET` is Snowflake's spelling and not PostgreSQL's, so it is refused by
+    // name rather than accepted as the same clause in another place.
+    let from_entries = match &update.from {
+        None => &[][..],
+        Some(sqlparser::ast::UpdateTableFromKind::AfterSet(entries)) => entries.as_slice(),
+        Some(sqlparser::ast::UpdateTableFromKind::BeforeSet(_)) => {
+            return Err(SqlError::unsupported("UPDATE ... FROM before SET"));
+        }
+    };
+    let (from, joins) = lower_from_entries(from_entries)?;
+
+    // **The target carries its alias.** Where there is no `FROM` an alias is only a second name
+    // for the only relation there is; with one it is the whole mechanism, because an alias
+    // *replaces* the name and frees it for the `FROM` entry that shares it. One rule for both,
+    // because two would be a rule about a clause the alias is not part of.
+    let target = table_reference(&update.table.relation)?;
+    // A relation, and only a relation: `UPDATE (SELECT …)` is not a statement, and neither is an
+    // `UPDATE` of a `VALUES` list or of a set-returning function.
+    refuse_if(
+        target.derived.is_some() || target.values.is_some() || target.function.is_some(),
+        "an UPDATE of something that is not a table",
+    )?;
+    let alias = target.alias.clone();
 
     let assignments = update
         .assignments
         .iter()
         .map(|assignment| {
             let name = match &assignment.target {
-                AssignmentTarget::ColumnName(name) => object_name(name)?,
+                // **A `SET` target is never qualified**, not even with the target's own alias,
+                // and PostgreSQL's error is about a *column*: `a.body` is read as the column `a`
+                // and a field of it, so `a` is what it reports missing. The relation it names is
+                // the table's own name and not the alias — measured, `HINT` included.
+                AssignmentTarget::ColumnName(name) => match name.0.as_slice() {
+                    [_] => object_name(name)?,
+                    [first, ..] => {
+                        return Err(SqlError::QualifiedSetTarget {
+                            column: first.as_ident().map_or_else(|| first.to_string(), ident),
+                            relation: target.name.clone(),
+                        });
+                    }
+                    [] => return Err(SqlError::unsupported("an empty assignment target")),
+                },
                 other @ AssignmentTarget::Tuple(_) => {
                     return Err(SqlError::unsupported(format!(
                         "the assignment target {other}"
@@ -5064,13 +5101,46 @@ fn lower_update(update: &sqlparser::ast::Update) -> Result<plan::Update> {
             Ok((name, lower_expr(&assignment.value)?))
         })
         .collect::<Result<Vec<_>>>()?;
-
     Ok(plan::Update {
-        table: table_factor(&update.table.relation)?,
+        table: target.name,
+        alias,
+        from,
+        joins,
         assignments,
         filter: update.selection.as_ref().map(lower_expr).transpose()?,
         returning,
     })
+}
+
+/// A comma list of `FROM` entries with their joins, as a left-most relation and a join chain.
+///
+/// The same reading a `SELECT`'s `FROM` gets, and deliberately the same code path: a comma is a
+/// cross join with the condition in the `WHERE`, which is what the comma form *means*, so nothing
+/// is approximated by writing it as one.
+fn lower_from_entries(
+    entries: &[sqlparser::ast::TableWithJoins],
+) -> Result<(Option<plan::TableRef>, Vec<plan::Join>)> {
+    let [first, rest @ ..] = entries else {
+        return Ok((None, Vec::new()));
+    };
+    let left = table_reference(&first.relation)?;
+    let mut joins = first
+        .joins
+        .iter()
+        .map(lower_join)
+        .collect::<Result<Vec<_>>>()?;
+    for entry in rest {
+        joins.push(plan::Join {
+            table: table_reference(&entry.relation)?,
+            kind: plan::JoinKind::Inner,
+            on: None,
+            using: Vec::new(),
+        });
+        for join in &entry.joins {
+            joins.push(lower_join(join)?);
+        }
+    }
+    Ok((Some(left), joins))
 }
 
 fn lower_delete(delete: &sqlparser::ast::Delete) -> Result<plan::Delete> {

@@ -21,16 +21,6 @@ const DIVERGENCES: bind::Divergences = bind::Divergences {
              used",
         ),
         (
-            "UPDATE \"vl_comments\" \"__active_record_update_alias\" SET \"body\" = $1 FROM \"vl_comments\" INNER JOIN \"vl_posts\" ON \"vl_posts\".\"id\" = \"vl_comments\".\"vl_post_id\" WHERE \"vl_comments\".\"id\" = \"__active_record_update_alias\".\"id\"",
-            "**`UPDATE … FROM` is a different statement, not this one with a subquery in it**, and \
-             the capture's own header says so: for a *joined* `update_all` `ActiveRecord` does not \
-             wrap the selection in a subquery at all — it aliases the target, puts the join in a \
-             `FROM`, and ties the two together in the `WHERE`. `plan::Update` has a table, \
-             assignments, a filter and a `RETURNING`; it has no `FROM`, no joins and no alias for \
-             the table it writes, and every one of those is a field. Its own unit, and it is in \
-             the same test files as the shape above",
-        ),
-        (
             "DELETE FROM vl_posts WHERE id IN (SELECT NULL::bigint)",
             "**A typed NULL loses its type at lowering** — `NULL::anything` becomes \
              `plan::Literal::Null`, which has none — so the subquery's column is `text` and the \
@@ -57,11 +47,11 @@ const DIVERGENCES: bind::Divergences = bind::Divergences {
         ),
         (
             "SELECT id, body FROM vl_comments ORDER BY id",
-            "A follow-on of `UPDATE … FROM` above: it set `body` to `joined` there and left it              alone here",
-        ),
-        (
-            "SELECT count(*) FROM vl_posts",
-            "A follow-on of `UPDATE … FROM` above, five lines over. The `DELETE` after it selects              posts by `body = 'joined'`, which no row has here because the `UPDATE` did not run —              so one post outlives the rest of the file. The **rule** each of those lines is              pinning is checked elsewhere and holds: an empty subquery deletes nothing              (`WHERE 1=0`, two lines that agree), and `NOT IN` over a real value set does delete              (`title = 'n1'`, the last statement, which agrees on `min(title)`)",
+            "A follow-on of **the row constructor**, which is the one refusal left above it: the \
+             `DELETE` removed the comment with `body = 'a'` there and none here, so this line \
+             answers with one row too many. The `UPDATE … FROM` two lines up landed \
+             (`tests/update_from.rs`) and both sides set `body` to `joined`, which is why the \
+             values agree and only the count does not",
         ),
     ],
 };

@@ -91,11 +91,10 @@ pub(super) fn plan_in_write_filter(
     tenant: u64,
     txn: &dyn Txn,
     tables: &dyn Tables,
-    table: &crate::catalog::TableDef,
+    scope: &crate::exec::query::Scope<'_>,
 ) -> Result<()> {
-    let scope = crate::exec::query::Scope::single(table);
     walk_mut(filter, &mut |expr| match expr {
-        Expr::Subquery(sub) => plan_one(sub, tenant, txn, tables, Some(&scope)),
+        Expr::Subquery(sub) => plan_one(sub, tenant, txn, tables, Some(scope)),
         _ => Ok(()),
     })
 }

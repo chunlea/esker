@@ -50,11 +50,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              gone, not the feature — which is the clearest statement of what the clause does.",
         ),
         (
-            "UPDATE al AS t SET n = 'ONE' WHERE t.id = 1",
-            "an alias on a statement about one table, which has no second name to tell apart. \
-             Refused by name; the SELECT side is what the 19 catalog statements need.",
-        ),
-        (
             "DELETE FROM al AS t WHERE t.id = 2",
             "an alias on a DELETE, as above.",
         ),
