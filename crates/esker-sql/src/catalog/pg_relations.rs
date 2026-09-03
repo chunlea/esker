@@ -76,6 +76,18 @@ pub enum RelKind {
     PrimaryKey,
     /// A sequence: `relkind` `S`.
     Sequence,
+    /// The index behind an `EXCLUDE` constraint: `relkind` `i`, and `pg_am` says `gist`.
+    ///
+    /// **Synthesised, not stored.** Every other relation here comes from a name record; this one
+    /// is derived in [`Relations::read`] from the table's own `excludes`, because a real server
+    /// makes an index relation for each exclusion constraint and a client names it — the capture
+    /// reads `pg_get_indexdef('…_date_overlap'::regclass)`. No record format changes for it, and
+    /// the constraint's oid is the index's, the arrangement a primary key already has.
+    ///
+    /// There is no `GiST` behind it: the constraint is enforced by a scan
+    /// (`crate::exec::dml::check_exclusions`). What the catalog reports is what the constraint
+    /// *is*, which is what a client reads it for.
+    Exclusion,
 }
 
 impl RelKind {
@@ -84,7 +96,7 @@ impl RelKind {
     pub fn relkind(self) -> &'static str {
         match self {
             RelKind::Table => "r",
-            RelKind::Index | RelKind::PrimaryKey => "i",
+            RelKind::Index | RelKind::PrimaryKey | RelKind::Exclusion => "i",
             RelKind::Sequence => "S",
         }
     }
@@ -104,6 +116,8 @@ pub struct RelationRow {
     pub table_id: u64,
     /// Which of [`TableDef::indexes`] it is, for an index.
     pub index_at: Option<usize>,
+    /// Which of [`TableDef::excludes`] it is, for an exclusion constraint's index.
+    pub exclude_at: Option<usize>,
     /// Which column it fills, for a sequence.
     pub column: Option<usize>,
 }
@@ -133,6 +147,23 @@ impl Relations {
             let relation = super::record::decode_relation(&value)?;
             rows.push(row_of(txn, tenant, name, relation, &mut tables)?);
         }
+        // The `EXCLUDE` constraints' indexes, which have no name record of their own — see
+        // [`RelKind::Exclusion`]. Appended after the scan and then re-sorted, so the whole list
+        // stays in the name order every view reads it in.
+        for table in tables.values() {
+            for (at, exclude) in table.excludes.iter().enumerate() {
+                rows.push(RelationRow {
+                    oid: super::pg_constraint::exclude_oid(table.id, at),
+                    name: exclude.name.clone(),
+                    kind: RelKind::Exclusion,
+                    table_id: table.id,
+                    index_at: None,
+                    exclude_at: Some(at),
+                    column: None,
+                });
+            }
+        }
+        rows.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(Relations { rows, tables })
     }
 
@@ -198,6 +229,7 @@ fn row_of(
                 kind: RelKind::Table,
                 table_id,
                 index_at: None,
+                exclude_at: None,
                 column: None,
             }
         }
@@ -210,6 +242,7 @@ fn row_of(
                 kind: RelKind::Index,
                 table_id,
                 index_at,
+                exclude_at: None,
                 column: None,
             }
         }
@@ -224,6 +257,7 @@ fn row_of(
                 kind: RelKind::PrimaryKey,
                 table_id,
                 index_at: None,
+                exclude_at: None,
                 column: None,
             }
         }
@@ -246,6 +280,7 @@ fn row_of(
                 kind: RelKind::Sequence,
                 table_id,
                 index_at: None,
+                exclude_at: None,
                 column: None,
             }
         }

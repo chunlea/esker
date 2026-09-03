@@ -718,6 +718,8 @@ pub struct TableDef {
     pub parents: Vec<u64>,
     /// See [`TableDef::parents`].
     pub children: Vec<u64>,
+    /// The `EXCLUDE` constraints on this table.
+    pub excludes: Vec<ExcludeDef>,
     /// The triggers registered on this table, in creation order.
     ///
     /// **Stored and never fired.** `ALTER TABLE … DISABLE TRIGGER ALL` is a separate flag
@@ -1022,6 +1024,88 @@ pub struct ChildScan {
     /// By name rather than by position, because the two differ the moment a child has a row id
     /// the parent does not, or a column of its own.
     pub project: Vec<usize>,
+}
+
+/// One `EXCLUDE` constraint: a key expression, an operator, and the rows it applies to.
+///
+/// **No index behind it.** PostgreSQL builds a `GiST` index and this node scans the table instead —
+/// `USING gist` is recorded because `pg_get_indexdef` prints it and `ActiveRecord` reads it, and
+/// the access method is the one thing about an exclusion constraint that is a *performance*
+/// decision rather than an answer. What is not negotiable is the answer: a row that overlaps an
+/// existing one is refused with the same `23P01` either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExcludeDef {
+    /// Its name, as written or as PostgreSQL derives one.
+    pub name: String,
+    /// The key expression, stored as text the way a `CHECK` is — `daterange(start_date, end_date)`.
+    pub key: String,
+    /// The operator two keys are compared with. `&&` is the one this node has.
+    pub operator: String,
+    /// The access method named, recorded and not used: `gist`.
+    pub method: String,
+    /// `WHERE (…)` — the partial predicate, or `None`.
+    ///
+    /// **It is what makes NULLs legal, and duplicates too**: a row the predicate rejects is not in
+    /// the index at all, so two identical ones both insert. Four rows of `(NULL, NULL)` are four
+    /// conflicts without it.
+    pub predicate: Option<String>,
+    /// `DEFERRABLE`.
+    pub deferrable: bool,
+    /// `INITIALLY DEFERRED`: whether the check **starts** held to `COMMIT`.
+    ///
+    /// The default this and [`ExcludeDef::deferrable`] give
+    /// `crate::exec::deferred::Constraints::deferred`, which a `SET CONSTRAINTS` in the
+    /// transaction overrides. Deferring is not a delay for its own sake — it is what lets a
+    /// transaction break the constraint in the middle and repair it before the end, and the check
+    /// is re-examined at `COMMIT` rather than replayed.
+    pub deferred: bool,
+}
+
+/// Each operand of a top-level `AND`/`OR` chain in its own parentheses — PostgreSQL's rule for
+/// re-printing a boolean expression.
+///
+/// `a IS NOT NULL AND b IS NOT NULL` comes back `(a IS NOT NULL) AND (b IS NOT NULL)`; a predicate
+/// that is a single comparison is returned unchanged, which is why `CHECK ((p > 0))` has only the
+/// two pairs `pg_get_constraintdef` adds around it. Measured, both.
+///
+/// Split on the **top level only**: a keyword inside parentheses or inside a string literal is
+/// part of an operand, not a separator.
+pub(crate) fn parenthesised_operands(predicate: &str) -> String {
+    let bytes = predicate.as_bytes();
+    let upper = predicate.to_ascii_uppercase();
+    let upper = upper.as_bytes();
+    let mut operands = Vec::new();
+    let mut separators = Vec::new();
+    let (mut depth, mut quoted, mut start, mut at) = (0_i32, false, 0, 0);
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\'' => quoted = !quoted,
+            b'(' if !quoted => depth += 1,
+            b')' if !quoted => depth -= 1,
+            _ if quoted || depth != 0 => {}
+            _ => {
+                for keyword in [" AND ", " OR "] {
+                    if upper[at..].starts_with(keyword.as_bytes()) {
+                        operands.push(predicate[start..at].trim());
+                        separators.push(keyword.trim());
+                        start = at + keyword.len();
+                        at += keyword.len() - 1;
+                        break;
+                    }
+                }
+            }
+        }
+        at += 1;
+    }
+    if operands.is_empty() {
+        return predicate.to_owned();
+    }
+    operands.push(predicate[start..].trim());
+    let mut out = format!("({})", operands[0]);
+    for (operand, separator) in operands[1..].iter().zip(&separators) {
+        let _ = std::fmt::Write::write_fmt(&mut out, format_args!(" {separator} ({operand})"));
+    }
+    out
 }
 
 /// One `FOREIGN KEY` constraint, held by the **child** — the table whose rows must point at
@@ -2536,6 +2620,7 @@ mod tests {
             parents: Vec::new(),
             children: Vec::new(),
             triggers: Vec::new(),
+            excludes: Vec::new(),
             child_scans: Vec::new(),
             partition_by: None,
             partition_bound: None,
@@ -2563,7 +2648,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "13",               // catalog format version
+                "14",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -2656,7 +2741,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "13",       // catalog format version
+                "14",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -2689,7 +2774,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "13",                 // catalog format version
+                "14",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -2753,6 +2838,9 @@ mod tests {
                 // Version 19, still: one list per index, and the one index here includes
                 // nothing — which is every index until `CREATE INDEX ... INCLUDE` runs. Two
                 // sections under one number, because they arrived in one release.
+                "00",
+                // Version 20. No `EXCLUDE` constraints, which is every table until one parses —
+                // and until this version it could not, being a syntax error rather than a refusal.
                 "00",
             )
         );
@@ -3714,7 +3802,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "13",               // catalog format version
+                "14",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

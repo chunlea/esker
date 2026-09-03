@@ -48,8 +48,8 @@ use esker_base::varint;
 use esker_keys::{codec, prefix};
 
 use crate::catalog::{
-    CheckDef, ColumnDef, ExprShape, ForeignKeyDef, FunctionDef, Identity, IndexDef, IndexKey,
-    KeyOrder, KeyPart, PartitionBound, PartitionKey, PartitionStrategy, RangeBound,
+    CheckDef, ColumnDef, ExcludeDef, ExprShape, ForeignKeyDef, FunctionDef, Identity, IndexDef,
+    IndexKey, KeyOrder, KeyPart, PartitionBound, PartitionKey, PartitionStrategy, RangeBound,
     ReferentialAction, Relation, SchemaState, SequenceDef, TableDef, TriggerDef, UniqueKind,
 };
 use crate::error::{Result, SqlError};
@@ -77,7 +77,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 19;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 20;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -1183,6 +1183,24 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         }
     }
 
+    // Version 20. The `EXCLUDE` constraints, after version 19's two sections — the ninth on the
+    // end, and the rule has not changed: sections go on in version order and come off in that
+    // order. This one was written as 19 while it was the only section claiming that number; the
+    // partition and `INCLUDE` sections landed on main first, so it moved to 20 and moved *after*
+    // them here. A table written before 20 — anything main-with-partitioning wrote — has none,
+    // which is what every table had while an `EXCLUDE` constraint was a *syntax error* rather
+    // than a refusal.
+    varint::put_u64(table.excludes.len() as u64, &mut out);
+    for exclude in &table.excludes {
+        put_str(&exclude.name, &mut out);
+        put_str(&exclude.key, &mut out);
+        put_str(&exclude.operator, &mut out);
+        put_str(&exclude.method, &mut out);
+        put_str(exclude.predicate.as_deref().unwrap_or(""), &mut out);
+        out.push(u8::from(exclude.deferrable));
+        out.push(u8::from(exclude.deferred));
+    }
+
     Ok(out)
 }
 
@@ -1512,6 +1530,32 @@ fn read_partitioning(
     Ok((partition_by, partition_bound))
 }
 
+/// The version 20 section: the `EXCLUDE` constraints on this table.
+fn read_excludes(reader: &mut Reader<'_>) -> Result<Vec<ExcludeDef>> {
+    if reader.version < 20 {
+        return Ok(Vec::new());
+    }
+    let count = reader.count()?;
+    let mut excludes = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = reader.string()?;
+        let key = reader.string()?;
+        let operator = reader.string()?;
+        let method = reader.string()?;
+        let predicate = reader.string()?;
+        excludes.push(ExcludeDef {
+            name,
+            key,
+            operator,
+            method,
+            predicate: (!predicate.is_empty()).then_some(predicate),
+            deferrable: reader.flag()?,
+            deferred: reader.flag()?,
+        });
+    }
+    Ok(excludes)
+}
+
 /// Reads a table record back. Every failure is typed: a catalog is on-disk data like any other.
 #[allow(
     clippy::too_many_lines,
@@ -1643,6 +1687,8 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
     let triggers = read_triggers(&mut reader)?;
     let (partition_by, partition_bound) = read_partitioning(&mut reader)?;
     read_index_include(&mut reader, &mut indexes)?;
+    // Read **after** version 19's two sections, because it is written after them.
+    let excludes = read_excludes(&mut reader)?;
     reader.finish()?;
 
     Ok(TableDef {
@@ -1660,6 +1706,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
         parents,
         children,
         triggers,
+        excludes,
         child_scans: Vec::new(),
         partition_by,
         partition_bound,

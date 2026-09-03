@@ -449,6 +449,7 @@ pub(super) fn write_row(
     // The row it points at has to exist, and this is where a `CHECK` is enforced too — before
     // anything is stored, so a violation leaves nothing behind.
     super::foreign_key::check_references(executor, txn, table, row)?;
+    check_exclusions(executor, txn, table, row)?;
 
     for index in &table.indexes {
         // **Write-only and public write an entry; delete-only and absent do not.** One state later
@@ -958,6 +959,156 @@ fn fill_generated(table: &TableDef, row: &mut [Datum]) -> Result<()> {
         row[at] = cursor::evaluate(&resolved, row)?;
     }
     Ok(())
+}
+
+/// Every `EXCLUDE` constraint on the table, against the row about to be written.
+///
+/// **A scan, not an index.** A real server backs an exclusion constraint with a `GiST` index and
+/// probes it; this node records `USING gist` and has no `GiST`, so it reads the table and compares
+/// the key against every stored row's. That is O(rows) per write and honest about it — the
+/// alternative is an access method, which is a phase of its own. The catalog still reports the
+/// index as `gist` with `indisexclusion`, because that is what the constraint *is*.
+///
+/// **Called from [`write_row`], which is after the old row is gone.** An `UPDATE` removes and
+/// re-writes, so the row being moved is not in the table when its new key is checked and cannot
+/// conflict with itself — measured: moving `end_date` forward is accepted where the new range
+/// still overlaps the old one.
+///
+/// A `DEFERRABLE` constraint the transaction has deferred registers a
+/// [`super::deferred::Check::Exclude`] instead and is scanned at `COMMIT`, which is what lets a
+/// transaction break it in the middle and repair it before the end.
+fn check_exclusions(
+    executor: &Executor,
+    txn: &mut dyn Txn,
+    table: &TableDef,
+    row: &[Datum],
+) -> Result<()> {
+    for (at, exclude) in table.excludes.iter().enumerate() {
+        let Some(error) = exclusion_conflict(&*txn, executor.tenant, table, exclude, row)? else {
+            continue;
+        };
+        if exclude.deferrable && executor.constraint_is_deferred(&exclude.name, exclude.deferred) {
+            // **Queued only because it conflicts**, which is what a real server does: it queues a
+            // recheck for a deferred index tuple whose insert did *not* pass, and none for one
+            // that did. Two consequences, both measured — a row that conflicts with nothing costs
+            // no check at `COMMIT`, and the `23P01` names the **later** row as `Key` and the
+            // earlier one as the existing key, because the later row is the one holding the
+            // recheck. Deferring unconditionally reversed that pair.
+            //
+            // The **row**, not the verdict: it is re-examined against the table as it stands at
+            // `COMMIT`, so a conflict the transaction went on to repair is no violation
+            // (`crate::exec::deferred`).
+            executor.defer_check(super::deferred::Check::Exclude {
+                table: Executor::table_arc(table),
+                at,
+                row: row.to_vec(),
+            });
+            continue;
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// The first stored row `row` conflicts with under one `EXCLUDE`, as the error it is.
+///
+/// Shared by the immediate path above and by the deferred one, so a constraint checked at `COMMIT`
+/// answers exactly what the same constraint checked at the statement would.
+///
+/// **A row the `WHERE` rejects is not in the index at all**, so it neither conflicts nor is
+/// conflicted with — on either side of the comparison. That is what makes the suite's NULL rows
+/// legal, and its two identical rows too.
+///
+/// **The row itself is skipped by primary key**, which is what lets this run after the row is
+/// stored as well as before: at `COMMIT` the written row is in the table and overlaps itself.
+pub(super) fn exclusion_conflict(
+    txn: &dyn Txn,
+    tenant: u64,
+    table: &TableDef,
+    exclude: &crate::catalog::ExcludeDef,
+    row: &[Datum],
+) -> Result<Option<SqlError>> {
+    let scope = query::Scope::single(table);
+    let stored = |text: &str, what: &str| -> Result<crate::plan::Expr> {
+        let parsed = crate::parse::parse_stored_expr(text).map_err(|error| {
+            SqlError::Internal(format!(
+                "the stored EXCLUDE {what} of {} no longer parses: {error}",
+                table.name
+            ))
+        })?;
+        query::resolve(&parsed, &scope)
+    };
+    // The predicate first: a row it rejects is not in the index, so nothing else is evaluated.
+    // NULL is not true, and only true puts the row in — the opposite of a `CHECK`'s rule.
+    let predicate = exclude
+        .predicate
+        .as_ref()
+        .map(|text| stored(text, "WHERE"))
+        .transpose()?;
+    let indexed = |candidate: &[Datum]| -> Result<bool> {
+        match &predicate {
+            None => Ok(true),
+            Some(expr) => Ok(matches!(
+                cursor::evaluate(expr, candidate)?,
+                Datum::Bool(true)
+            )),
+        }
+    };
+    if !indexed(row)? {
+        return Ok(None);
+    }
+    let key = stored(&exclude.key, "key")?;
+    let value = cursor::evaluate(&key, row)?;
+    // A NULL key overlaps nothing, the way a NULL does everywhere else.
+    if matches!(value, Datum::Null) {
+        return Ok(None);
+    }
+    let identity = |candidate: &[Datum]| -> Vec<Datum> {
+        table
+            .primary_key
+            .iter()
+            .filter_map(|at| candidate.get(*at).cloned())
+            .collect()
+    };
+    let mine = identity(row);
+    let node = query::matching_rows(None, tenant, table)?;
+    let mut scan = cursor::Cursor::open(txn, tenant, &node)?;
+    while let Some(existing) = scan.next()? {
+        if identity(&existing) == mine || !indexed(&existing)? {
+            continue;
+        }
+        let against = cursor::evaluate(&key, &existing)?;
+        // `&&` is the only operator this node has, and it is decided by the same
+        // `DateRange::overlaps` the SQL operator is — so what the catalog records is what is
+        // enforced. Any other operator was refused when the constraint was read.
+        if overlap(&value, &against) {
+            return Ok(Some(SqlError::ExclusionViolation {
+                constraint: exclude.name.clone(),
+                key: exclude.key.clone(),
+                // Neither is NULL: a NULL key was skipped above, and a NULL never overlaps.
+                value: value.to_text().unwrap_or_default(),
+                existing: against.to_text().unwrap_or_default(),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// Two keys under `&&`. Anything that is not a range is not a conflict — the parser refused every
+/// other operator, so a non-range here would be a key expression of some other type entirely.
+fn overlap(left: &Datum, right: &Datum) -> bool {
+    match (left, right) {
+        (Datum::Text(left), Datum::Text(right)) => {
+            match (
+                crate::value::range::DateRange::from_text(left),
+                crate::value::range::DateRange::from_text(right),
+            ) {
+                (Some(left), Some(right)) => left.overlaps(right),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 fn check_constraints(table: &TableDef, row: &[Datum]) -> Result<()> {

@@ -212,8 +212,9 @@ impl Executor {
     /// `42704` when nothing has the name — a real server checks that a constraint exists before
     /// it checks whether it is deferrable, and the two errors are different SQLSTATEs.
     ///
-    /// Only `UNIQUE` constraints answer today. A second kind registers here as it registers in
-    /// `crate::exec::deferred`: one more place to look, in the same order.
+    /// `UNIQUE` and `EXCLUDE` answer, which are the two kinds this node can defer. A third
+    /// registers here as it registers in `crate::exec::deferred`: one more place to look, in the
+    /// same order.
     fn constraint_deferrable(&self, txn: &dyn Txn, name: &str) -> Result<bool> {
         let relations = crate::catalog::pg_relations::Relations::read(txn, self.tenant)?;
         for table in relations.rows().filter_map(|row| relations.table(row)) {
@@ -230,6 +231,11 @@ impl Executor {
             for check in &table.checks {
                 if check.name == name {
                     return Ok(false);
+                }
+            }
+            for exclude in &table.excludes {
+                if exclude.name == name {
+                    return Ok(exclude.deferrable);
                 }
             }
             for key in &table.foreign_keys {

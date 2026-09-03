@@ -119,6 +119,13 @@ pub enum CatalogView {
     /// `PARTITION BY` here, so the emptiness is complete rather than provisional. Empty on a real
     /// server too until something partitions.
     PgInherits,
+    /// The index access methods, which is **two**: `btree` and `gist`.
+    ///
+    /// A real server has six. These two are the ones this node's own `pg_class.relam` can point
+    /// at — everything a `CREATE INDEX` builds is a btree, and an `EXCLUDE` constraint records
+    /// `gist` — and a row for a method nothing can be built with would be a claim rather than a
+    /// report. Declared: `hash`, `gin`, `spgist` and `brin` are on a real server and not here.
+    PgAm,
     /// Every stored function: what `CREATE FUNCTION` wrote and nothing else — this node has no
     /// built-in functions in `pg_proc`, which is a declared divergence.
     PgProc,
@@ -161,7 +168,7 @@ pub enum CatalogView {
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 23] = [
+    pub const ALL: [CatalogView; 24] = [
         CatalogView::PgType,
         CatalogView::PgRange,
         CatalogView::PgClass,
@@ -173,6 +180,7 @@ impl CatalogView {
         CatalogView::PgCollation,
         CatalogView::PgExtension,
         CatalogView::PgInherits,
+        CatalogView::PgAm,
         CatalogView::PgProc,
         CatalogView::PgTrigger,
         CatalogView::PgLanguage,
@@ -203,6 +211,7 @@ impl CatalogView {
             CatalogView::PgExtension => "pg_extension",
             CatalogView::PgAvailableExtensions => "pg_available_extensions",
             CatalogView::PgInherits => "pg_inherits",
+            CatalogView::PgAm => "pg_am",
             CatalogView::PgProc => "pg_proc",
             CatalogView::PgTrigger => "pg_trigger",
             CatalogView::PgLanguage => "pg_language",
@@ -237,6 +246,7 @@ impl CatalogView {
                 CatalogView::PgCollation => 8,
                 CatalogView::PgExtension => 14,
                 CatalogView::PgInherits => 15,
+                CatalogView::PgAm => 23,
                 CatalogView::PgProc => 18,
                 CatalogView::PgTrigger => 19,
                 CatalogView::PgLanguage => 20,
@@ -319,6 +329,18 @@ impl CatalogView {
                 ("relispartition", ColumnType::Bool),
                 ("relhassubclass", ColumnType::Bool),
                 ("relpartbound", ColumnType::Text),
+                // **Last**, because `SELECT *` expands in this order. The access method of an
+                // index and **zero** for everything else, which is what a real server reports for
+                // a table — the join `pg_am am ON am.oid = i.relam` then finds nothing for one,
+                // which is how a client filters indexes by method.
+                ("relam", ColumnType::Int8),
+            ],
+            // Exactly the three a client reads. `amname` is a `name` on a real server and `amtype`
+            // a `"char"`; both are `text` here, the trade every `pg_catalog` column makes.
+            CatalogView::PgAm => &[
+                ("oid", ColumnType::Int8),
+                ("amname", ColumnType::Text),
+                ("amtype", ColumnType::Text),
             ],
             CatalogView::PgNamespace => &[("oid", ColumnType::Int8), ("nspname", ColumnType::Text)],
             // In PostgreSQL's own order, restricted to what this node has — `SELECT *` expands in
@@ -472,6 +494,21 @@ impl CatalogView {
                 Datum::Text("plpgsql".to_owned()),
                 Datum::Bool(true),
             ]]),
+            // `amtype` `i` — an index method, which is what both of these are. A real server's
+            // `pg_am` also holds table methods (`amtype` `t`, `heap`); this node has one storage
+            // engine and no `USING` on a table, so there is nothing to name.
+            CatalogView::PgAm => Ok(vec![
+                vec![
+                    Datum::Int8(BTREE_AM_OID),
+                    Datum::Text("btree".to_owned()),
+                    Datum::Text("i".to_owned()),
+                ],
+                vec![
+                    Datum::Int8(GIST_AM_OID),
+                    Datum::Text("gist".to_owned()),
+                    Datum::Text("i".to_owned()),
+                ],
+            ]),
             CatalogView::PgNamespace => Ok(vec![vec![
                 Datum::Int8(PUBLIC_NAMESPACE_OID),
                 Datum::Text(PUBLIC_SCHEMA.to_owned()),
@@ -575,6 +612,7 @@ impl CatalogView {
             | CatalogView::PgCollation
             | CatalogView::PgExtension
             | CatalogView::PgInherits
+            | CatalogView::PgAm
             | CatalogView::PgProc
             | CatalogView::PgTrigger
             | CatalogView::PgLanguage
@@ -637,6 +675,7 @@ impl CatalogView {
                         parents: Vec::new(),
                         children: Vec::new(),
                         triggers: Vec::new(),
+                        excludes: Vec::new(),
                         child_scans: Vec::new(),
                         partition_by: None,
                         partition_bound: None,
@@ -945,6 +984,7 @@ fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
             Datum::Bool(false),
             Datum::Bool(false),
             Datum::Null,
+            Datum::Int8(0),
         ]
     });
     Ok(relations
@@ -995,10 +1035,28 @@ fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
                     .map_or(Datum::Null, |bound| {
                         Datum::Text(super::partition_bound_definition(bound))
                     }),
+                Datum::Int8(access_method_oid(relation.kind)),
             ]
         })
         .chain(views)
         .collect())
+}
+
+/// PostgreSQL's own oid for the `btree` access method, which is a fixed catalog id there.
+const BTREE_AM_OID: i64 = 403;
+
+/// PostgreSQL's own oid for `gist`, likewise fixed.
+const GIST_AM_OID: i64 = 783;
+
+/// `pg_class.relam`: the access method an index is built with, and **zero** for anything that is
+/// not an index — which is what a real server reports for a table, so a join to `pg_am` drops it.
+fn access_method_oid(kind: super::pg_relations::RelKind) -> i64 {
+    use super::pg_relations::RelKind;
+    match kind {
+        RelKind::Index | RelKind::PrimaryKey => BTREE_AM_OID,
+        RelKind::Exclusion => GIST_AM_OID,
+        RelKind::Table | RelKind::Sequence => 0,
+    }
 }
 
 /// The `relkind` letter, which needs the **table** and not only the relation's kind.

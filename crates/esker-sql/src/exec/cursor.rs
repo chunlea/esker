@@ -912,6 +912,69 @@ impl Env<'_> {
 }
 
 /// Evaluates an expression over a row, with no way to run a subquery of its own.
+/// The three functions `crate::value::range` answers: `daterange`, `isempty` and `&&`.
+///
+/// Split out of [`catalog_function`] because they are one family and it is long enough already.
+fn range_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Result<Datum> {
+    use crate::plan::CatalogFunc;
+    Ok(match func {
+        // **`daterange(low, high)`** — a NULL bound is *unbounded*, not NULL, so the call answers a
+        // range either way and is never NULL itself. That is the fact that makes
+        // `daterange(NULL, NULL)` overlap everything rather than nothing.
+        CatalogFunc::DateRange => {
+            // A bare `'2026-01-01'` reaches here as text, the way an unknown literal reaches a
+            // real server's `daterange(unknown, unknown)` — so it is coerced rather than refused.
+            let day = |value: Option<&Datum>| match value {
+                Some(Datum::Date(day)) => Ok(Some(*day)),
+                Some(Datum::Null) | None => Ok(None),
+                Some(Datum::Text(text)) => Ok(Some(crate::value::date::from_text(text, 0)?)),
+                Some(other) => Err(SqlError::UndefinedFunctionTypes(format!(
+                    "daterange({})",
+                    other
+                        .column_type()
+                        .map_or("unknown", crate::value::PgType::name)
+                ))),
+            };
+            Datum::Text(
+                crate::value::range::DateRange::new(day(args.first())?, day(args.get(1))?)
+                    .to_text(),
+            )
+        }
+        CatalogFunc::IsEmpty => match range_argument(args.first())? {
+            None => Datum::Null,
+            Some(range) => Datum::Bool(range.empty),
+        },
+        // Strict on both sides: a NULL range makes the answer unknown, the way every other
+        // operator over a NULL does.
+        _ => match (range_argument(args.first())?, range_argument(args.get(1))?) {
+            (Some(left), Some(right)) => Datum::Bool(left.overlaps(right)),
+            _ => Datum::Null,
+        },
+    })
+}
+
+/// A range argument, or `None` for NULL — and `42883` for a value that is not one.
+fn range_argument(value: Option<&Datum>) -> Result<Option<crate::value::range::DateRange>> {
+    match value {
+        Some(Datum::Null) | None => Ok(None),
+        Some(Datum::Text(text)) => match crate::value::range::DateRange::from_text(text) {
+            Some(range) => Ok(Some(range)),
+            None => Err(SqlError::UndefinedOperator {
+                op: "&&",
+                left: "text",
+                right: "text",
+            }),
+        },
+        Some(other) => Err(SqlError::UndefinedOperator {
+            op: "&&",
+            left: other
+                .column_type()
+                .map_or("unknown", crate::value::PgType::name),
+            right: "unknown",
+        }),
+    }
+}
+
 /// A `LIKE` operand as text, or `None` for NULL — and `42883` for anything that is not a string.
 ///
 /// **A number has no `LIKE` operator**: `100 LIKE '1%'` is
@@ -1473,6 +1536,9 @@ fn catalog_function(
         // arguments are still evaluated, because an error inside one is the user's error: it is
         // the *result* that is empty here, not the call.
         CatalogFunc::ColDescription | CatalogFunc::ObjDescription => Datum::Null,
+        CatalogFunc::DateRange | CatalogFunc::IsEmpty | CatalogFunc::RangeOverlaps => {
+            range_function(call.func, &args)?
+        }
         // **`LIST (city_id)`** — the strategy word and the key columns, and NULL for a relation
         // that is not partitioned, which is what a real server answers there too.
         CatalogFunc::PgGetPartkeydef => {

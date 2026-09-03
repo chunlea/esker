@@ -42,6 +42,16 @@ impl Parsed {
         if let plan::Statement::DropIndex(drop) = &mut lowered {
             drop.concurrently = self.is_concurrently();
         }
+        // And the clauses it could not read at all: an `EXCLUDE` constraint is cut out of the
+        // source so the statement parses, and re-attached here from its own text.
+        if let plan::Statement::CreateTable(create) = &mut lowered {
+            for clause in self.exclude_constraints() {
+                create.excludes.push(crate::parse::parse_exclude_constraint(
+                    clause,
+                    &create.name,
+                )?);
+            }
+        }
         Ok(lowered)
     }
 }
@@ -1147,6 +1157,15 @@ fn lower_create_trigger(create: &sqlparser::ast::CreateTrigger) -> Result<plan::
     })
 }
 
+/// One expression's text, lowered — for a clause the parser had to be handed in pieces.
+///
+/// An `EXCLUDE` constraint never reaches `sqlparser` whole, so its key and its `WHERE` come back
+/// through here: reading them with the real parser is what makes an expression this node cannot
+/// evaluate a refusal at `CREATE TABLE` rather than a surprise at the first insert.
+pub(crate) fn parse_expr_text(text: &str) -> Result<plan::Expr> {
+    crate::parse::parse_stored_expr(text)
+}
+
 /// `PARTITION BY LIST|RANGE (col, …)` — the strategy and the key columns.
 ///
 /// **`HASH` is refused by name.** Nothing captured it — the capture pins `LIST` (the suite's, at
@@ -1484,6 +1503,8 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
         columns,
         primary_key,
         primary_key_name,
+        // Filled by `Parsed::lower`, from the clauses the parser was never given.
+        excludes: Vec::new(),
         partition_by: lower_partition_by(create.partition_by.as_deref())?,
         partition_of: lower_partition_of(create.partition_of.as_ref(), create.for_values.as_ref())?,
         // Names only: a parent's columns come from the catalog and the catalog is the executor's.
@@ -2263,6 +2284,16 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                 BinaryOperator::GtEq => plan::BinaryOp::GtEq,
                 BinaryOperator::And => plan::BinaryOp::And,
                 BinaryOperator::Or => plan::BinaryOp::Or,
+                // **`&&` is carried as a call, not as a comparison.** Two ranges are not ordered
+                // — `pg_cmp` says nothing about them — so it cannot be a `BinaryOp`, and every
+                // walker already descends into a call's arguments
+                // (`crate::plan::expr::CatalogFunc::RangeOverlaps`).
+                BinaryOperator::PGOverlap => {
+                    return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                        func: plan::CatalogFunc::RangeOverlaps,
+                        args: vec![lower_expr(left)?, lower_expr(right)?],
+                    })));
+                }
                 other => {
                     return Err(SqlError::unsupported(format!("the operator {other}")));
                 }

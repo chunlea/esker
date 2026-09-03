@@ -57,15 +57,10 @@ const KNOWN_GAPS: &[(&str, &str)] = &[
     // G03 -- CREATE TABLE LIKE / OF
     ("CREATE TABLE t (LIKE u INCLUDING ALL);", "G03"),
     ("CREATE TABLE t OF person_type;", "G03"),
-    // G04 -- exclusion constraints
-    (
-        "CREATE TABLE t (a int8, EXCLUDE USING gist (a WITH =));",
-        "G04",
-    ),
-    (
-        "CREATE TABLE t (a int8, b daterange, EXCLUDE USING gist (a WITH =, b WITH &&));",
-        "G04",
-    ),
+    // G04 -- exclusion constraints. **Closed**: `sqlparser` still cannot read one, and the
+    // statement parses anyway — the clause is cut out of the source and carried beside the tree
+    // (`parse::strip_exclude_constraints`), which is the same mechanism `DROP INDEX CONCURRENTLY`
+    // uses. The rows that stood here are gone and the register's G04 is closed with them.
     // G05 -- index maintenance
     ("CREATE INDEX i ON ONLY t (a);", "G05"),
     ("REINDEX INDEX i;", "G05"),

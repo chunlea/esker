@@ -80,6 +80,10 @@ pub fn rows(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
             key.predicate.map_or(Datum::Null, |predicate| {
                 Datum::Text(parenthesised(predicate))
             }),
+            // **Last**, for the reason every late column of `pg_type` is last: `SELECT *` expands
+            // in this order and a column inserted in PostgreSQL's own slot would move every one
+            // after it. A real server puts it right after `indisprimary`.
+            Datum::Bool(key.exclusion),
         ]);
     }
     Ok(rows)
@@ -122,8 +126,9 @@ pub fn index_definition(relations: &Relations, oid: Option<i64>, column: Option<
 
 /// `CREATE [UNIQUE ]INDEX <name> ON [public.]<table> USING btree (<key>)[ WHERE (<predicate>)]`.
 ///
-/// Every index here is a btree, which is not a simplification: `USING` is refused by name in the
-/// DDL, so btree is the only access method this node has and naming another would be a claim.
+/// Every index a `CREATE INDEX` builds is a btree, which is not a simplification: `USING` is
+/// refused by name in that DDL, so btree is the only method a user can ask for. An `EXCLUDE`
+/// constraint's index is `gist`, which is what the constraint recorded — see [`Key::method`].
 ///
 /// The `WHERE` is **re-printed parenthesised** whatever was written — `WHERE published_on IS NOT
 /// NULL` comes back `WHERE (published_on IS NOT NULL)` and `WHERE (a > 10)` comes back
@@ -163,7 +168,7 @@ fn definition(
     qualified: bool,
 ) -> String {
     let mut out = format!(
-        "CREATE {}INDEX {} ON {}{}{} USING btree ({})",
+        "CREATE {}INDEX {} ON {}{}{} USING {} ({})",
         if key.unique { "UNIQUE " } else { "" },
         quote_identifier(&relation.name),
         // **`ON ONLY` for an index on a partitioned table** — the word `ONLY` in the definition of
@@ -177,6 +182,7 @@ fn definition(
         },
         if qualified { "public." } else { "" },
         quote_identifier(&table.name),
+        key.method,
         parts.join(", ")
     );
     // **`INCLUDE (…)` comes first of the three tails**: after the key list and before the
@@ -209,9 +215,11 @@ fn definition(
 /// One pair of parentheses around a stored expression, and never two.
 ///
 /// The text a `WHERE` is stored with has had its own outer pair removed when it was lowered
-/// (`crate::parse::lower::unwrap_nested`), so this is where PostgreSQL's pair goes back on.
+/// (`crate::parse::lower::unwrap_nested`), so this is where PostgreSQL's pair goes back on — and
+/// each operand of an `AND`/`OR` chain gets a pair of its own, which is the server's own rule for
+/// re-printing a boolean (`crate::catalog::parenthesised_operands`).
 fn parenthesised(expr: &str) -> String {
-    format!("({expr})")
+    format!("({})", crate::catalog::parenthesised_operands(expr))
 }
 
 /// One index's key, however it is stored.
@@ -235,6 +243,14 @@ struct Key<'a> {
     unique: bool,
     primary: bool,
     valid: bool,
+    /// `indisexclusion`, and it is **not** `indisunique`: an exclusion index refuses a row an
+    /// operator relates, not one that is equal, and a real server reports `f`/`t` where a unique
+    /// index reports `t`/`f`. Measured.
+    exclusion: bool,
+    /// The access method `pg_get_indexdef` names and `pg_am` agrees with. `btree` for everything
+    /// this node builds; `gist` for an exclusion constraint, which is recorded and enforced by a
+    /// scan (`crate::exec::dml::check_exclusions`).
+    method: &'static str,
     /// A partial index's predicate as it is stored — one pair of parentheses short of how it
     /// prints ([`parenthesised`]).
     predicate: Option<&'a str>,
@@ -352,6 +368,33 @@ impl Key<'_> {
 /// The key a relation is, or `None` for one that is not an index at all.
 fn key_of<'a>(relation: &RelationRow, table: &'a TableDef) -> Option<Key<'a>> {
     match relation.kind {
+        RelKind::Exclusion => {
+            let exclude = table.excludes.get(relation.exclude_at?)?;
+            Some(Key {
+                nulls_not_distinct: false,
+                // One part, always an expression: a scalar key needs `btree_gist` and is refused,
+                // so there is no column form. `ExprShape::Call` is what `daterange(a, b)` is, and
+                // it is the one shape the key list prints without adding a pair of its own.
+                keys: Cow::Owned(vec![IndexKey {
+                    part: KeyPart::Expression {
+                        expr: exclude.key.clone(),
+                        shape: crate::catalog::ExprShape::Call,
+                        ty: ColumnType::Text,
+                    },
+                    order: crate::catalog::KeyOrder::ASCENDING,
+                }]),
+                // **Not unique.** The `&&` lives only in `pg_constraint`; the index behind an
+                // exclusion constraint is a plain one, measured.
+                unique: false,
+                primary: false,
+                // Nothing: `INCLUDE` is a `CREATE INDEX` clause, and this index is a constraint's.
+                include: &[],
+                predicate: exclude.predicate.as_deref(),
+                valid: true,
+                exclusion: true,
+                method: "gist",
+            })
+        }
         RelKind::Index => {
             let index = table.indexes.get(relation.index_at?)?;
             Some(Key {
@@ -359,6 +402,8 @@ fn key_of<'a>(relation: &RelationRow, table: &'a TableDef) -> Option<Key<'a>> {
                 keys: Cow::Borrowed(&index.keys),
                 unique: index.unique,
                 primary: false,
+                exclusion: false,
+                method: "btree",
                 predicate: index.predicate.as_deref(),
                 // **`indisvalid` is the schema state, read honestly.** An index that is not
                 // `Public` is one no reader may use (ADR 0020), and `indisvalid` is exactly the
@@ -370,6 +415,8 @@ fn key_of<'a>(relation: &RelationRow, table: &'a TableDef) -> Option<Key<'a>> {
             })
         }
         RelKind::PrimaryKey => Some(Key {
+            exclusion: false,
+            method: "btree",
             // A primary key's columns are `NOT NULL`, so the clause could change nothing and a
             // real server reports `f` for it. Measured.
             nulls_not_distinct: false,
@@ -418,4 +465,6 @@ pub const INDEX_COLUMNS: &[(&str, ColumnType)] = &[
     ("indoption", ColumnType::Text),
     ("indexprs", ColumnType::Text),
     ("indpred", ColumnType::Text),
+    // **Last**, see the row it fills.
+    ("indisexclusion", ColumnType::Bool),
 ];

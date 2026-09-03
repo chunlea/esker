@@ -28,6 +28,9 @@ pub struct CreateTable {
     /// `<table>_pkey`. Carried rather than dropped: a constraint the user named is the name a
     /// `23505` will quote back at them.
     pub primary_key_name: Option<String>,
+    /// The `EXCLUDE` constraints, re-attached after the parser was handed a statement without
+    /// them (`crate::parse::strip_exclude_constraints`).
+    pub excludes: Vec<crate::catalog::ExcludeDef>,
     /// `PARTITION BY LIST (col, …)` — the strategy and the key columns' names, unresolved.
     pub partition_by: Option<(crate::catalog::PartitionStrategy, Vec<String>)>,
     /// `PARTITION OF parent FOR VALUES IN (…)` / `… DEFAULT` — the parent's name and the bound as

@@ -1159,6 +1159,37 @@ pub enum SqlError {
         relation: String,
     },
 
+    /// An `EXCLUDE` whose operator the access method cannot use: `42809`.
+    ///
+    /// What a real server answers for `EXCLUDE (r WITH &&)` and for `EXCLUDE USING btree (r WITH
+    /// &&)` — identically, which is how a reader can tell the bare form defaults to btree. `&&` is
+    /// a `gist` operator and `range_ops` is btree's family for a range, so the two never meet.
+    #[error("operator {operator} is not a member of operator family \"{family}\"")]
+    ExclusionOperatorNotInFamily {
+        /// The operator as PostgreSQL names it, argument types included.
+        operator: String,
+        /// The operator family the access method would have used.
+        family: String,
+    },
+
+    /// A row an `EXCLUDE` constraint refuses: `23P01`.
+    ///
+    /// The `DETAIL` prints **both** keys — the one being written and the one already stored — as
+    /// the expression text followed by its value, which is what tells a client *which* stored row
+    /// it collided with. A `23505` prints only the one key, because for a unique index the two are
+    /// equal by definition.
+    #[error("conflicting key value violates exclusion constraint \"{constraint}\"")]
+    ExclusionViolation {
+        /// The constraint's name, given or derived.
+        constraint: String,
+        /// The key expression as written, e.g. `daterange(start_date, end_date)`.
+        key: String,
+        /// The value the statement produced, e.g. `[2026-01-15,2026-02-15)`.
+        value: String,
+        /// The value the stored row it conflicts with produced.
+        existing: String,
+    },
+
     /// A row a `CHECK` refuses: `23514`.
     #[error("new row for relation \"{relation}\" violates check constraint \"{constraint}\"")]
     CheckViolation {
@@ -1452,7 +1483,8 @@ impl SqlError {
             // A constraint that cannot be deferred is the wrong *kind* of object for the
             // statement, which is the same `42809` an `ALTER` on the wrong kind gets.
             | SqlError::ConstraintNotDeferrable(_)
-            | SqlError::ParameterlessAggregate => sqlstate::WRONG_OBJECT_TYPE,
+            | SqlError::ParameterlessAggregate
+            | SqlError::ExclusionOperatorNotInFamily { .. } => sqlstate::WRONG_OBJECT_TYPE,
             SqlError::UndefinedColumn(_)
             | SqlError::UndefinedColumnInForeignKey(_)
             | SqlError::UndefinedColumnInKey(_)
@@ -1550,6 +1582,7 @@ impl SqlError {
             | SqlError::SetTransactionOutsideBlock
             | SqlError::OutsideTransactionBlock(_) => sqlstate::NO_ACTIVE_SQL_TRANSACTION,
             SqlError::CheckViolation { .. } => sqlstate::CHECK_VIOLATION,
+            SqlError::ExclusionViolation { .. } => sqlstate::EXCLUSION_VIOLATION,
             SqlError::ForeignKeyViolation { .. } | SqlError::ForeignKeyStillReferenced { .. } => {
                 sqlstate::FOREIGN_KEY_VIOLATION
             }
@@ -1636,6 +1669,19 @@ impl SqlError {
             | SqlError::CheckViolation { row, .. } => {
                 Some(format!("Failing row contains ({row})."))
             }
+            SqlError::ExclusionOperatorNotInFamily { .. } => Some(
+                "The exclusion operator must be related to the index operator class for the \
+                 constraint."
+                    .to_owned(),
+            ),
+            SqlError::ExclusionViolation {
+                key,
+                value,
+                existing,
+                ..
+            } => Some(format!(
+                "Key ({key})=({value}) conflicts with existing key ({key})=({existing})."
+            )),
             SqlError::MalformedArrayLiteral { detail, .. }
             | SqlError::NumericFieldOverflow { detail }
             | SqlError::ForeignKeyViolation { detail, .. }

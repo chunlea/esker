@@ -177,6 +177,28 @@ fn columns_of<'a>(
                     .collect()
             })
             .unwrap_or_default(),
+        // An `EXCLUDE`'s index has exactly one attribute, and it is always an expression — a
+        // scalar key needs `btree_gist`, which this node does not have, so there is no column
+        // form to handle. The type is the one `crate::value::range` answers in.
+        RelKind::Exclusion => relation
+            .exclude_at
+            .and_then(|at| table.excludes.get(at))
+            .map(|_| {
+                vec![(
+                    Cow::Owned(ColumnDef {
+                        name: "expr".to_owned(),
+                        ty: ColumnType::Text,
+                        typmod: crate::value::NO_TYPMOD,
+                        not_null: false,
+                        default_expr: None,
+                        default: None,
+                        missing: None,
+                        generated: None,
+                    }),
+                    None,
+                )]
+            })
+            .unwrap_or_default(),
         RelKind::PrimaryKey => table
             .primary_key
             .iter()

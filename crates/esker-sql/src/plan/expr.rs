@@ -557,6 +557,19 @@ pub enum CatalogFunc {
     /// itself — and NULL is what a real server answers for a table that is not partitioned, for
     /// an **index**, and for an oid that names nothing. Measured all three.
     PgGetPartkeydef,
+    /// `daterange(low, high)`: a half-open range of dates, as text.
+    ///
+    /// A **function** rather than a type constructor, because a range reaches this node only as an
+    /// expression (`crate::value::range`). The declared type is `text` where a real server says
+    /// `daterange`, which is the standing trade and a declared divergence.
+    DateRange,
+    /// `isempty(range)`: whether a range contains no day at all.
+    IsEmpty,
+    /// `a && b`: whether two ranges share a day.
+    ///
+    /// Written as an operator and carried as a call, because it is not a comparison — `pg_cmp` says
+    /// nothing about two ranges, and every walker already descends into a call's arguments.
+    RangeOverlaps,
     /// `pg_get_triggerdef(oid)`: a trigger's `CREATE TRIGGER`, re-printed.
     ///
     /// **It normalises `EXECUTE PROCEDURE` to `EXECUTE FUNCTION`**, so the text that comes out is
@@ -661,6 +674,8 @@ impl CatalogFunc {
             {
                 Some(CatalogFunc::Now)
             }
+            () if name.eq_ignore_ascii_case("daterange") => Some(CatalogFunc::DateRange),
+            () if name.eq_ignore_ascii_case("isempty") => Some(CatalogFunc::IsEmpty),
             () if name.eq_ignore_ascii_case("pg_get_triggerdef") => {
                 Some(CatalogFunc::PgGetTriggerdef)
             }
@@ -701,6 +716,9 @@ impl CatalogFunc {
             CatalogFunc::ObjDescription => "obj_description",
             CatalogFunc::PgGetPartkeydef => "pg_get_partkeydef",
             CatalogFunc::PgGetTriggerdef => "pg_get_triggerdef",
+            CatalogFunc::DateRange => "daterange",
+            CatalogFunc::IsEmpty => "isempty",
+            CatalogFunc::RangeOverlaps => "&&",
             // Two directions of one cast, and PostgreSQL names both of them `regclass`.
             CatalogFunc::RegClass | CatalogFunc::RegClassName => "regclass",
             CatalogFunc::ArrayPosition => "array_position",
@@ -732,7 +750,9 @@ impl CatalogFunc {
             | CatalogFunc::ArrayLower
             | CatalogFunc::ArrayUpper
             | CatalogFunc::ArrayLength
-            | CatalogFunc::ConvertTo => &[2],
+            | CatalogFunc::ConvertTo
+            | CatalogFunc::DateRange
+            | CatalogFunc::RangeOverlaps => &[2],
             CatalogFunc::PgGetExpr => &[2, 3],
             CatalogFunc::PgGetIndexdef => &[1, 3],
             CatalogFunc::PgGetConstraintdef | CatalogFunc::ObjDescription => &[1, 2],
@@ -740,6 +760,7 @@ impl CatalogFunc {
             | CatalogFunc::PgGetTriggerdef
             | CatalogFunc::RegClass
             | CatalogFunc::RegClassName
+            | CatalogFunc::IsEmpty
             | CatalogFunc::Cardinality
             | CatalogFunc::PgTypeof => &[1],
             CatalogFunc::Now | CatalogFunc::CurrentDate | CatalogFunc::Random => &[0],
@@ -758,6 +779,7 @@ impl CatalogFunc {
             | CatalogFunc::PgGetIndexdef
             | CatalogFunc::PgGetConstraintdef
             | CatalogFunc::PgGetTriggerdef
+            | CatalogFunc::DateRange
             | CatalogFunc::ColDescription
             | CatalogFunc::ObjDescription
             // A `regclass` on a real server is an oid that *prints* as a name; `text` here, which
@@ -779,6 +801,9 @@ impl CatalogFunc {
             | CatalogFunc::ArrayUpper
             | CatalogFunc::ArrayLength
             | CatalogFunc::Cardinality => ColumnType::Int4,
+            // The two range predicates answer a boolean, which is what lets `&&` stand in a
+            // `WHERE` without a comparison around it.
+            CatalogFunc::IsEmpty | CatalogFunc::RangeOverlaps => ColumnType::Bool,
             CatalogFunc::Now => ColumnType::TimestampTz,
             CatalogFunc::CurrentDate => ColumnType::Date,
             CatalogFunc::ConvertTo => ColumnType::Bytea,

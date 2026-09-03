@@ -55,6 +55,21 @@ pub(crate) enum Check {
         /// The key values to re-examine.
         values: Vec<Datum>,
     },
+    /// An `EXCLUDE` constraint, for one written row.
+    ///
+    /// **The row, not the key.** The key is an *expression* over the row and the partial `WHERE`
+    /// is another, so re-examining means evaluating both again against the table as it stands —
+    /// and the row is also what the `23P01` `DETAIL` prints. Named by position in
+    /// [`TableDef::excludes`] for the reason the unique check names its index by id: the check
+    /// outlives the statement.
+    Exclude {
+        /// The table as it stood when the row was written.
+        table: Arc<TableDef>,
+        /// Which of its `excludes`.
+        at: usize,
+        /// The row that was written.
+        row: Vec<Datum>,
+    },
 }
 
 impl Check {
@@ -66,6 +81,10 @@ impl Check {
                 .iter()
                 .find(|candidate| candidate.id == *index)
                 .map_or("", |candidate| candidate.name.as_str()),
+            Check::Exclude { table, at, .. } => table
+                .excludes
+                .get(*at)
+                .map_or("", |exclude| exclude.name.as_str()),
         }
     }
 
@@ -100,6 +119,20 @@ impl Check {
                     });
                 }
                 Ok(())
+            }
+            // **Re-scanned, and the written row is in the table now** — so it would overlap
+            // itself. `exclusion_conflict` skips the row by primary key, which is what lets one
+            // function answer both here and at the statement.
+            Check::Exclude { table, at, row } => {
+                let Some(exclude) = table.excludes.get(*at) else {
+                    // The constraint went with a `DROP` inside this transaction; there is nothing
+                    // left to break. The reading the unique arm above takes.
+                    return Ok(());
+                };
+                match super::dml::exclusion_conflict(txn, tenant, table, exclude, row)? {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                }
             }
         }
     }
