@@ -274,6 +274,7 @@ fn a_bound_parameter_round_trips_through_the_cluster() {
                 values: &values,
                 formats: &[],
                 declared: &[],
+                bound: true,
             },
         )
         .unwrap();

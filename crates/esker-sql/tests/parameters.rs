@@ -37,15 +37,27 @@ impl Node {
         node
     }
 
+    /// The **simple** query protocol: no `Bind` at all, which is what `bound: false` says.
     fn plain(&mut self, sql: &str) -> esker_sql::Result<Outcome> {
-        self.bound(sql, &[], &[])
+        self.run(sql, &[], &[], false)
     }
 
+    /// The **extended** protocol: a `Bind` happened, even one carrying nothing.
     fn bound(
         &mut self,
         sql: &str,
         values: &[Option<Vec<u8>>],
         formats: &[i16],
+    ) -> esker_sql::Result<Outcome> {
+        self.run(sql, values, formats, true)
+    }
+
+    fn run(
+        &mut self,
+        sql: &str,
+        values: &[Option<Vec<u8>>],
+        formats: &[i16],
+        bound: bool,
     ) -> esker_sql::Result<Outcome> {
         let mut last = Outcome::done("");
         for parsed in parse_statements(sql)? {
@@ -55,6 +67,7 @@ impl Node {
                     values,
                     formats,
                     declared: &[],
+                    bound,
                 },
             )?;
         }
@@ -264,14 +277,25 @@ fn describe_answers_the_row_shape_too() {
     );
 }
 
+/// **Which protocol asked decides the error**, and the two are indistinguishable from the values
+/// alone: a `Bind` carrying nothing looks exactly like no `Bind`.
 #[test]
 fn a_parameter_with_nothing_bound_to_it_is_42p02() {
     let mut node = Node::loaded();
+    // The simple query protocol never binds, and this is what a real server says there.
+    let error = node.plain("INSERT INTO t (id) VALUES ($1)").unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::UNDEFINED_PARAMETER);
+    assert_eq!(error.to_string(), "there is no parameter $1");
+
+    // The extended one always binds, so a count that does not match is a **protocol** error.
     let error = node
         .bound("INSERT INTO t (id) VALUES ($1)", &[], &[])
         .unwrap_err();
-    assert_eq!(error.sqlstate(), sqlstate::UNDEFINED_PARAMETER);
-    assert_eq!(error.to_string(), "there is no parameter $1");
+    assert_eq!(error.sqlstate(), sqlstate::PROTOCOL_VIOLATION);
+    assert_eq!(
+        error.to_string(),
+        "bind message supplies 0 parameters, but prepared statement \"\" requires 1"
+    );
 }
 
 /// A value that will not read as its type keeps the input function's own error, which says what is

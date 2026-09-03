@@ -16,13 +16,20 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::fmt::Write as _;
+
 use std::process::Command;
+
+#[path = "parity_harness/mod.rs"]
+mod parity;
 
 /// What a tokio worker gets by default, and therefore the stack the guard has to be safe on.
 const WORKER_STACK_BYTES: usize = 2 * 1024 * 1024;
 
 /// The environment variable that turns this binary into the probe.
 const DEPTH: &str = "ESKER_LOWER_DEPTH";
+/// Which walk the probe should make: `lower` stops at the plan, `execute` runs the statement.
+const MODE: &str = "ESKER_LOWER_MODE";
 
 /// `a = 0 OR a = 1 OR …`, which is `depth` terms and **one** bracket.
 fn or_chain(depth: usize) -> String {
@@ -31,7 +38,7 @@ fn or_chain(depth: usize) -> String {
         if term > 0 {
             sql.push_str(" OR ");
         }
-        sql.push_str(&format!("a = {term}"));
+        let _ = write!(sql, "a = {term}");
     }
     sql
 }
@@ -41,10 +48,23 @@ fn or_chain(depth: usize) -> String {
 /// Prints what happened and exits 0 either way — a refusal is a correct outcome, and the only
 /// incorrect one is not reaching this line at all.
 fn probe(depth: usize) -> ! {
+    let execute = std::env::var(MODE).is_ok_and(|mode| mode == "execute");
     let handle = std::thread::Builder::new()
         .stack_size(WORKER_STACK_BYTES)
         .spawn(move || {
             let sql = or_chain(depth);
+            // **The whole client path, not just the plan.** Lowering was where the node died, but
+            // a plan the lowering guard admits is then walked by the resolver, the type pass and
+            // the evaluator — each recursive, each on this same worker stack. If any of them
+            // cannot take a tree the guard allows, the guard is in the wrong place.
+            if execute {
+                let mut node = parity::Node::new(&["CREATE TABLE t (a integer)"]);
+                match node.run(&sql) {
+                    Ok(_) => println!("EXECUTED"),
+                    Err(error) => println!("REFUSED {}", error.sqlstate()),
+                }
+                return;
+            }
             // Printed as each phase completes, so a crash says which one it died in rather than
             // leaving the caller to guess between parsing, lowering and dropping the tree.
             let parsed = match esker_sql::parse::parse_statements(&sql) {
@@ -71,9 +91,22 @@ fn probe(depth: usize) -> ! {
     std::process::exit(0);
 }
 
+/// [`run_probe`], but the child runs the statement instead of stopping at the plan.
+fn run_probe_executing(depth: usize) -> Option<String> {
+    run_probe_in(depth, Some("execute"))
+}
+
 /// Runs the probe in a child and answers what it printed, or `None` if it died.
 fn run_probe(depth: usize) -> Option<String> {
-    let output = Command::new(std::env::current_exe().expect("this test binary"))
+    run_probe_in(depth, None)
+}
+
+fn run_probe_in(depth: usize, mode: Option<&str>) -> Option<String> {
+    let mut command = Command::new(std::env::current_exe().expect("this test binary"));
+    if let Some(mode) = mode {
+        command.env(MODE, mode);
+    }
+    let output = command
         .env(DEPTH, depth.to_string())
         .arg("--exact")
         .arg("the_probe_entry_point")
@@ -88,7 +121,10 @@ fn run_probe(depth: usize) -> Option<String> {
     // outcomes by name rather than on a prefix that covers both.
     text.lines()
         .find(|line| {
-            line.starts_with("LOWERED") || line.starts_with("REFUSED") || line.starts_with("PARSE ")
+            line.starts_with("LOWERED")
+                || line.starts_with("EXECUTED")
+                || line.starts_with("REFUSED")
+                || line.starts_with("PARSE ")
         })
         .map(str::to_owned)
 }
@@ -103,7 +139,7 @@ fn the_probe_entry_point() {
 
 /// **A chain deep enough to overflow a worker's stack is refused, not fatal.**
 ///
-/// 100_000 terms is far past anything a guard could admit and far past what 2 MiB can hold — it is
+/// `100_000` terms is far past anything a guard could admit and far past what 2 MiB can hold — it is
 /// the shape that aborted run 46's node. The claim is only that the process survives to tell us.
 #[test]
 fn a_boolean_chain_too_deep_to_lower_is_refused_rather_than_fatal() {
@@ -122,9 +158,47 @@ fn a_boolean_chain_too_deep_to_lower_is_refused_rather_than_fatal() {
 
 /// **And a chain a client might really write still works.**
 ///
-/// A guard set too low would refuse ordinary SQL, which is the other way to fail this. 64 terms is
-/// a plausible `.or()` chain and has to lower.
+/// A guard set too low would refuse ordinary SQL, which is the other way to fail this.
 #[test]
 fn an_ordinary_boolean_chain_still_lowers() {
-    assert_eq!(run_probe(64).as_deref(), Some("LOWERED"));
+    assert_eq!(run_probe(16).as_deref(), Some("LOWERED"));
+}
+
+/// **The whole client path survives the deepest plan this node will build** — on a worker's stack.
+///
+/// This is the claim the bound exists to make, and it is made about *execution* rather than about
+/// lowering because that is where the second overflow was: guarding `lower_expr` alone left a
+/// 500-term chain lowering happily and dying in the resolver. There are some forty recursive walks
+/// over `plan::Expr` — the resolver, the type pass, the evaluator, the binder, the columnar
+/// pushdown, the printer — and none of them carries a counter. None needs one: a tree that cannot
+/// be deeper than `MAX_PLAN_DEPTH` cannot overflow a walk of it, including a walk nobody has
+/// written yet.
+///
+/// Measured, and the margin is deliberate: the same path overflowed at **138** levels in a debug
+/// build, and the bound is 42.
+#[test]
+fn the_deepest_plan_this_node_builds_executes_on_a_worker_stack() {
+    let deepest = esker_sql::parse::MAX_PLAN_DEPTH - 1;
+    assert_eq!(
+        run_probe_executing(deepest).as_deref(),
+        Some("EXECUTED"),
+        "a chain at the limit did not survive the whole path on a {WORKER_STACK_BYTES}-byte stack"
+    );
+}
+
+/// One past it is `54001`, and still not a crash.
+#[test]
+fn a_plan_deeper_than_the_bound_is_refused_rather_than_fatal() {
+    for depth in [
+        esker_sql::parse::MAX_PLAN_DEPTH,
+        esker_sql::parse::MAX_PLAN_DEPTH + 1,
+        1_000,
+    ] {
+        let answer = run_probe_executing(depth);
+        assert!(
+            answer.is_some(),
+            "the child died executing a {depth}-term OR chain: invariant 9"
+        );
+        assert_eq!(answer.as_deref(), Some("REFUSED 54001"), "at depth {depth}");
+    }
 }

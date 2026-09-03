@@ -487,6 +487,32 @@ pub enum SqlError {
     #[error("there is no parameter ${0}")]
     UndefinedParameter(u32),
 
+    /// A `Bind` whose value count does not match what the statement needs: `08P01`.
+    ///
+    /// **A protocol error, not a SQL one** — which is measured and is not obvious: the statement
+    /// is well-formed and the *message* is wrong. The empty name is the **unnamed** prepared
+    /// statement, which is what a plain `exec_params` uses; the simple query protocol never binds
+    /// at all and says [`SqlError::UndefinedParameter`] instead.
+    #[error(
+        "bind message supplies {supplied} parameters, but prepared statement \"\" requires {required}"
+    )]
+    BindParameterCount {
+        /// How many the `Bind` carried.
+        supplied: usize,
+        /// How many the statement references.
+        required: usize,
+    },
+
+    /// A parameter position nothing in the statement mentions: `42P18`.
+    ///
+    /// **Reported against a position you would not name.** Sending one value to a statement that
+    /// references `$2` is `could not determine data type of parameter $1` — `$1`, the one never
+    /// written; sending two where only `$1` is used is `$2`. The type of a parameter comes from
+    /// where it *appears*, so one that appears nowhere has none to come from, and that is the
+    /// failure rather than the count.
+    #[error("could not determine data type of parameter ${0}")]
+    IndeterminateParameterType(u32),
+
     /// An index expression whose value is not a function of the row alone.
     ///
     /// PostgreSQL words it about the *function* rather than about the expression, and this copies
@@ -1654,7 +1680,9 @@ impl SqlError {
             | SqlError::FloatOverflow => sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
             SqlError::DivisionByZero => sqlstate::DIVISION_BY_ZERO,
             SqlError::MalformedArrayLiteral { .. } => sqlstate::INVALID_TEXT_REPRESENTATION,
-            SqlError::EmptyArrayType => sqlstate::INDETERMINATE_DATATYPE,
+            SqlError::EmptyArrayType | SqlError::IndeterminateParameterType(_) => {
+                sqlstate::INDETERMINATE_DATATYPE
+            }
             SqlError::ComplexResult => sqlstate::INVALID_ARGUMENT_FOR_POWER_FUNCTION,
             SqlError::InvalidDatetimeFormat { .. } => sqlstate::INVALID_DATETIME_FORMAT,
             SqlError::CannotCast { .. } => sqlstate::CANNOT_COERCE,
@@ -1757,7 +1785,9 @@ impl SqlError {
                 sqlstate::READ_ONLY_SQL_TRANSACTION
             }
             SqlError::ConfigurationLimitExceeded(_) => sqlstate::CONFIGURATION_LIMIT_EXCEEDED,
-            SqlError::ProtocolViolation(_) => sqlstate::PROTOCOL_VIOLATION,
+            SqlError::ProtocolViolation(_) | SqlError::BindParameterCount { .. } => {
+                sqlstate::PROTOCOL_VIOLATION
+            }
             SqlError::InvalidSqlStatementName(_) => sqlstate::INVALID_SQL_STATEMENT_NAME,
             SqlError::InvalidCursorName(_) => sqlstate::INVALID_CURSOR_NAME,
             SqlError::InvalidPassword(_) => sqlstate::INVALID_PASSWORD,

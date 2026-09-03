@@ -1303,6 +1303,7 @@ impl Executor {
     ) -> Result<Statement> {
         if !params.values.is_empty() || bind::has_parameters(&statement) {
             let tables = self.tables_for(txn, &statement)?;
+            bind::refuse_unmatched_parameters(&statement, params)?;
             let types = bind::infer(&statement, &tables, params.declared);
             bind::substitute(&mut statement, params, &types)?;
         }

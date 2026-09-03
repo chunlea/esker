@@ -3,7 +3,7 @@
 //! **198 tests across 24 files, and one setting rather than twenty-four needs.**
 //! `activerecord/test/cases/helper.rb` sets `create_unlogged_tables = true` unconditionally, so
 //! every `create_table` the suite issues is `UNLOGGED`. This is not a feature test; it is how
-//! ActiveRecord's suite creates every table it makes.
+//! `ActiveRecord`'s suite creates every table it makes.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
