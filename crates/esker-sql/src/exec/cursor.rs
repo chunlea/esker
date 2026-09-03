@@ -1223,7 +1223,7 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         // Resolved before the plan was built (`crate::exec::Executor::bound`), exactly as a
         // `::regclass` is. One here means the resolution was skipped, and answering it from the
         // row would be reading a session this evaluator cannot see.
-        Expr::CurrentSchema { .. } => {
+        Expr::CurrentSchema { .. } | Expr::CurrentSetting { .. } => {
             return Err(SqlError::Internal(
                 "a current_schema reached the row evaluator unresolved".to_owned(),
             ));

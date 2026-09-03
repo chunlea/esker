@@ -2831,6 +2831,45 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
             all: Some(implicit),
         });
     }
+    // `current_setting(name)` and `current_setting(name, missing_ok)`. The **name is not checked
+    // here**: a real server parses `current_setting('nosuch')` and raises `42704` when it runs, so
+    // refusing at lowering would answer earlier than PostgreSQL does — the reading `SET` already
+    // takes for the same reason.
+    if name.eq_ignore_ascii_case("current_setting") {
+        let FunctionArguments::List(FunctionArgumentList { args, .. }) = &function.args else {
+            return Err(SqlError::UndefinedFunction("current_setting()".to_owned()));
+        };
+        let text = |arg: &FunctionArg| match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(value))) => match &value.value {
+                Value::SingleQuotedString(text) => Some(text.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let flag = |arg: &FunctionArg| match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(value))) => match value.value {
+                Value::Boolean(flag) => Some(flag),
+                _ => None,
+            },
+            _ => None,
+        };
+        let setting = match args.as_slice() {
+            [one] => text(one).map(|name| (name, false)),
+            [one, two] => text(one).zip(flag(two)).map(|(name, ok)| (name, ok)),
+            _ => {
+                refuse_wrong_arity(function, "current_setting", 1)?;
+                None
+            }
+        };
+        let Some((name, missing_ok)) = setting else {
+            // A wrong **type** is `42883` naming the signature, the reading `current_schemas`
+            // takes: PostgreSQL resolves by name *and* argument types.
+            return Err(SqlError::UndefinedFunctionTypes(
+                "current_setting(...)".to_owned(),
+            ));
+        };
+        return Ok(plan::Expr::CurrentSetting { name, missing_ok });
+    }
     // `lower` and `upper`, the two scalar functions this node has. Both take exactly one
     // argument and a wrong count is `42883` naming the signature, not a badly-called function —
     // `lower()` and `lower('a','b')` are each their own message, measured.

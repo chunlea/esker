@@ -2070,6 +2070,13 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
         Expr::CurrentSchema {
             all: Some(implicit),
         } => format!("current_schemas({implicit})"),
+        Expr::CurrentSetting { name, missing_ok } => {
+            if *missing_ok {
+                format!("current_setting('{name}', true)")
+            } else {
+                format!("current_setting('{name}')")
+            }
+        }
         Expr::Outer { at, .. } => format!("<outer {at}>"),
         Expr::Default => "DEFAULT".to_owned(),
         Expr::Sequence(call) => format!("{}()", call.func.name()),

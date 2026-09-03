@@ -74,6 +74,19 @@ pub enum Values {
     /// belongs to. Both lanes that met this under `-D warnings` fixed it; this is the fix that
     /// keeps the link.
     Free,
+    /// An integer with an optional time unit: `10ms`, `2s`, `0`.
+    ///
+    /// **The unit stays in the value.** `SHOW idle_in_transaction_session_timeout` answers `10ms`,
+    /// not `10`, and `pg_settings.unit` reports `ms` separately — so the two together would say
+    /// `10ms ms` if the value were bare. Measured. Zero reads back as `0` with no unit, because
+    /// that is what a real server stores for it.
+    Duration,
+    /// A comma-separated list of names, **requoted the way PostgreSQL prints one**.
+    ///
+    /// `'$user',public` reads back as `"$user", public`: an entry that is not a plain identifier
+    /// is double-quoted, and the separator gains a space. A node that echoed the input would fail
+    /// the tests that compare what `SHOW` gives against what they set.
+    NameList,
 }
 
 /// PostgreSQL's boolean spellings, which are one value each side.
@@ -116,7 +129,43 @@ pub const PARAMETERS: &[Parameter] = &[
         name: "search_path",
         reported: "search_path",
         boot: "\"$user\", public",
+        values: Values::NameList,
+        read_only: false,
+    },
+    // **The four run 45's ranking is made of**, 33 tests between them. Every one is a setting the
+    // suite changes and reads back rather than a feature it uses: `money_test` sets `lc_monetary`
+    // to compare formatting, `connection_test` sets the idle timeout and `geqo`, and
+    // `schema_authorization_test` sets `search_path`. Recorded and reported; see `honour` for
+    // which of them this node *acts* on, which is a shorter list.
+    Parameter {
+        name: "lc_monetary",
+        reported: "lc_monetary",
+        // **`C` and not a real locale.** A server's boot value is a property of its container —
+        // `esker-pg19` says `en_US.utf8` — and this node has no locale database at all, so `C`
+        // is the honest default: the one locale whose rules are "no rules".
+        boot: "C",
         values: Values::Free,
+        read_only: false,
+    },
+    Parameter {
+        name: "idle_in_transaction_session_timeout",
+        reported: "idle_in_transaction_session_timeout",
+        boot: "0",
+        values: Values::Duration,
+        read_only: false,
+    },
+    Parameter {
+        name: "geqo",
+        reported: "geqo",
+        boot: "on",
+        values: Values::Boolean,
+        read_only: false,
+    },
+    Parameter {
+        name: "debug_print_plan",
+        reported: "debug_print_plan",
+        boot: "off",
+        values: Values::Boolean,
         read_only: false,
     },
     // **This node's own, and it is honoured** — `EXPLAIN` names the engine it chose and this is
@@ -147,6 +196,52 @@ pub const PARAMETERS: &[Parameter] = &[
         read_only: true,
     },
 ];
+
+/// `10ms`, `2s`, `0` — a count and an optional unit, canonicalised.
+///
+/// `None` for anything that is not one, which the caller turns into `22023`. **Zero loses its
+/// unit**: `SET … = '0ms'` and `SET … = 0` both read back `0`, measured, which is why this is not
+/// simply "trim and keep".
+fn normalise_duration(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let digits = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (count, unit) = trimmed.split_at(digits);
+    let count: u64 = count.parse().ok()?;
+    let unit = unit.trim();
+    if !matches!(unit, "" | "us" | "ms" | "s" | "min" | "h" | "d") {
+        return None;
+    }
+    if count == 0 {
+        return Some("0".to_owned());
+    }
+    Some(format!("{count}{unit}"))
+}
+
+/// `'$user',public` → `"$user", public`.
+///
+/// An entry that is not a plain lower-case identifier is double-quoted, which is what makes
+/// `$user` come back quoted and `public` bare; the separator is a comma **and a space**. Both are
+/// measured, and both are what the read-back comparison in `schema_authorization_test` checks.
+fn normalise_name_list(value: &str) -> String {
+    value
+        .split(',')
+        .map(|entry| {
+            let entry = entry.trim().trim_matches('"').trim_matches('\'');
+            let plain = !entry.is_empty()
+                && entry
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+            if plain {
+                entry.to_owned()
+            } else {
+                format!("\"{entry}\"")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// The parameter of that name, or `42704` — PostgreSQL's answer for a name it has never heard of,
 /// and the reason a `SHOW` of one is not contract C2's `0A000`.
@@ -191,6 +286,13 @@ impl Parameter {
             }
             // Read back exactly as written: a real server hands `Etc/UTC` back as `Etc/UTC`.
             Values::Free => Ok(value.to_owned()),
+            Values::Duration => {
+                normalise_duration(value).ok_or_else(|| SqlError::InvalidParameterValue {
+                    name: self.reported,
+                    value: value.to_owned(),
+                })
+            }
+            Values::NameList => Ok(normalise_name_list(value)),
         }
     }
 

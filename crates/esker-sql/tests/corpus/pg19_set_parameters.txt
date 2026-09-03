@@ -1,0 +1,112 @@
+# `SET` / `SHOW` / `RESET` of run-time parameters — as a real PostgreSQL 19beta1 answers them.
+#
+# Four rows of run 45's failure ranking are one shape, 33 tests between them, and every statement
+# below is verbatim from the test that sends it:
+#
+#   * `SET lc_monetary` — 12 tests, `adapters/postgresql/money_test.rb:15`, `set lc_monetary = 'C'`
+#   * `SET idle_in_transaction_session_timeout` — 10 tests, `connection_test.rb:241`,
+#     `set idle_in_transaction_session_timeout = '10ms'`
+#   * `SET SESSION` — 6 tests, `schema_authorization_test.rb:20`,
+#     `SET search_path TO '$user',public`
+#   * `SET debug_print_plan` (3) and `SET geqo` (2) — `connection_test.rb`, `SET geqo TO off` with
+#     `show geqo` read back
+#
+# Note the tests write `set` in lower case as often as upper, and read the value back with `SHOW`
+# rather than trusting the `SET` — so `SHOW` is half the requirement, not an extra.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way.
+#
+# **The whole capture runs inside `BEGIN … ROLLBACK`**, error probes in `SAVEPOINT` / `ROLLBACK TO`.
+# The final `SHOW lc_monetary` after the rollback proves the session was left as it was found.
+#
+# **One value here is a property of the oracle container, not of PostgreSQL**: `lc_monetary`
+# defaults to `en_US.utf8` on `esker-pg19`. A replay against a differently-configured server will
+# differ on that row and on nothing else; what the suite needs is that `SET` changes it and `SHOW`
+# reports the change.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`SHOW` returns a one-column row of `text`, whatever the parameter's real type is.**
+#     `pg_settings.vartype` says `bool`, `integer` and `string` for these three, and `SHOW` still
+#     answers `on`, `10ms`, `C` as text. `current_setting()` is `text` too.
+#   * **The value comes back normalised, not as it was sent.** `SET search_path TO '$user',public`
+#     reads back from `SHOW search_path` as **`"$user", public`** — requoted and with a space after
+#     the comma. An implementation that echoes the input fails the tests that compare the read-back.
+#   * **`idle_in_transaction_session_timeout` keeps its unit in the value**: `SHOW` gives `10ms`,
+#     and `pg_settings.unit` is `ms` separately. Setting it to `0` reads back as `0`, not `0ms`.
+#   * **An unknown parameter is `42704` from all three of `SET`, `SHOW` and `current_setting()`** —
+#     the same SQLSTATE and the same sentence, `unrecognized configuration parameter "…"`. But
+#     **`current_setting('…', true)` returns NULL instead of raising**: the two-argument form is the
+#     documented escape hatch and is the one shape that must not error.
+#   * **A bad *value* is `22023`, not `42704`**: `invalid value for parameter "TimeZone":
+#     "Nowhere/Notreal"` and `invalid value for parameter "idle_in_transaction_session_timeout":
+#     "banana"`. Unknown name and unknown value are different classes.
+#   * **`SET LOCAL` inside a transaction is undone by `ROLLBACK`**, and so is a plain `SET` issued
+#     inside one — the final `SHOW` after this file's `ROLLBACK` is back to the container default.
+#     `RESET <name>` and `RESET ALL` both restore it mid-transaction.
+#   * **`SET TIME ZONE 'America/New_York'` is read back with `SHOW TimeZone`** — the parameter's
+#     canonical name is `TimeZone`, camel-cased, while the statement that sets it says `TIME ZONE`.
+#   * **`current_schemas(false)` is `name[]`**, and with `search_path` set to `'$user',public` it
+#     answers `{public}` — the `$user` entry contributes nothing when no schema of that name exists.
+BEGIN		-
+SHOW lc_monetary	text	en_US.utf8
+set lc_monetary = 'C'		-
+SHOW lc_monetary	text	C
+SELECT 'r', current_setting('lc_monetary')	text,text	r|C
+SHOW idle_in_transaction_session_timeout	text	0
+set idle_in_transaction_session_timeout = '10ms'		-
+SHOW idle_in_transaction_session_timeout	text	10ms
+SELECT 'r', current_setting('idle_in_transaction_session_timeout')	text,text	r|10ms
+set idle_in_transaction_session_timeout = 0		-
+SHOW idle_in_transaction_session_timeout	text	0
+show geqo	text	on
+SET geqo TO off		-
+show geqo	text	off
+SET geqo TO on		-
+show geqo	text	on
+SET debug_print_plan TO on		-
+SHOW debug_print_plan	text	on
+SET debug_print_plan TO off		-
+SET search_path TO '$user',public		-
+SHOW search_path	text	"$user", public
+SELECT 'r', current_schemas(false)	text,name[]	r|{public}
+SET search_path TO public		-
+SET TIME ZONE 'America/New_York'		-
+SHOW TimeZone	text	America/New_York
+SELECT 'r', current_setting('TimeZone')	text,text	r|America/New_York
+SET TIME ZONE 'America/Jamaica'		-
+SHOW TimeZone	text	America/Jamaica
+SET TIME ZONE 'UTC'		-
+SHOW TimeZone	text	UTC
+SET LOCAL lc_monetary = 'C'		-
+SHOW lc_monetary	text	C
+RESET lc_monetary		-
+SHOW lc_monetary	text	en_US.utf8
+SET SESSION lc_monetary = 'C'		-
+SHOW lc_monetary	text	C
+RESET ALL		-
+SHOW lc_monetary	text	en_US.utf8
+SAVEPOINT s1		-
+SET nosuchparameter = 'x'	!42704 unrecognized configuration parameter "nosuchparameter"
+ROLLBACK TO s1		-
+SAVEPOINT s2		-
+SHOW nosuchparameter	!42704 unrecognized configuration parameter "nosuchparameter"
+ROLLBACK TO s2		-
+SAVEPOINT s3		-
+SELECT current_setting('nosuchparameter')	!42704 unrecognized configuration parameter "nosuchparameter"
+ROLLBACK TO s3		-
+SELECT 'r', current_setting('nosuchparameter', true) IS NULL	text,boolean	r|t
+SAVEPOINT s4		-
+SET TIME ZONE 'Nowhere/Notreal'	!22023 invalid value for parameter "TimeZone": "Nowhere/Notreal"
+ROLLBACK TO s4		-
+SAVEPOINT s5		-
+set idle_in_transaction_session_timeout = 'banana'	!22023 invalid value for parameter "idle_in_transaction_session_timeout": "banana"
+ROLLBACK TO s5		-
+SELECT 'r', pg_typeof(current_setting('lc_monetary')), pg_typeof(current_schemas(false))	text,regtype,regtype	r|text|name[]
+SELECT 'r', name, setting, unit, context, vartype FROM pg_settings WHERE name IN ('lc_monetary','idle_in_transaction_session_timeout','geqo') ORDER BY name	text,text,text,text,text,text	r|geqo|on|\N|user|bool ; r|idle_in_transaction_session_timeout|0|ms|user|integer ; r|lc_monetary|en_US.utf8|\N|user|string
+ROLLBACK		-
+SHOW lc_monetary	text	en_US.utf8
