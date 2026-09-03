@@ -1,0 +1,23 @@
+crates/esker-sql/tests/corpus/pg19_two_database_dogs.txt
+  s_2d916f5f540186::t_efbc7e9d86a692 1-78
+crates/esker-sql/tests/two_database_dogs.rs
+  s_2d916f5f540186::t_e35cc8e0b8ffd5 1-62
+docs/adr/0051-a-database-is-a-tenant-and-the-directory-that-names-them.md
+  s_2d916f5f540186::t_eb5c3a456992d1 1-155
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "bd4d207fe90235dae1a5e2e0f946d37777744168",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
