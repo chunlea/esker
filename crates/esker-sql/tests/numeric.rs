@@ -53,14 +53,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "Arithmetic. The line's point — that a `numeric` grows to a hundred digits without a width to overflow — is the storage half, and that is built: the corpus stores and prints exact values of any length.",
         ),
         (
-            "SELECT sum(d) FROM nm",
-            "`sum(numeric)` needs **addition**, which this crate has for no type. The aggregate set is per type on a real server and this is the pairing that would close ADR 0031's oldest refusal; it is the next unit, not this one.",
-        ),
-        (
-            "SELECT avg(d) FROM nm",
-            "`avg(numeric)` needs addition **and** division, and division picks a scale of its own — `1::numeric / 2` is twenty digits. The type it answers with now exists, which is what ADR 0031 has been waiting for since unit 0.",
-        ),
-        (
             "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname = 'numeric'",
             "`pg_type.typlen` is a column this node's `pg_type` does not have, for every type. Not this unit's — the `numeric` row is there with oid 1700 and `numeric_in`, and `typlen` is `-1` for it because it is a varlena.",
         ),

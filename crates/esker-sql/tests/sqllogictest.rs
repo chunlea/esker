@@ -68,7 +68,7 @@ struct Letter(char);
 
 impl ColumnType for Letter {
     fn from_char(value: char) -> Option<Self> {
-        matches!(value, 'I' | 'T' | 'B' | 'R' | 'X' | 'D' | '?').then_some(Letter(value))
+        matches!(value, 'I' | 'T' | 'B' | 'R' | 'X' | 'D' | 'N' | '?').then_some(Letter(value))
     }
 
     fn to_char(&self) -> char {

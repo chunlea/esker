@@ -63,7 +63,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT * FROM (SELECT 1 AS a, 2 AS a) AS t",
         // `sum(bigint)` is `numeric` there and `int8` here — ADR 0031, because the text agrees for
         // every input that does not overflow.
-        "SELECT sum(x) FROM (SELECT k AS x FROM dt_a) AS t",
     ],
     answers: &[(
         "SELECT * FROM (SELECT id FROM dt_a WHERE id = a.id) AS t, dt_a a",

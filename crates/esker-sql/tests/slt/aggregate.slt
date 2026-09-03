@@ -35,7 +35,7 @@ SELECT count(*) AS total FROM sales
 
 # Ungrouped, over no rows: ONE row. count is zero and everything else is NULL — a sum of zero here
 # would be a wrong answer that looks like data.
-query III
+query INI
 SELECT count(*), sum(amount), max(amount) FROM unsold
 ----
 0	NULL	NULL
@@ -46,7 +46,7 @@ SELECT region, count(*) FROM unsold GROUP BY region
 ----
 
 # A filter that matches nothing is the same as an empty table.
-query II
+query IN
 SELECT count(*), sum(amount) FROM sales WHERE amount > 1000
 ----
 0	NULL
@@ -99,7 +99,7 @@ south	2
 NULL	1
 
 # Every aggregate at once, per group. `south` has one NULL amount: count(amount) is 1, not 2.
-query TIIII
+query TINII
 SELECT region, count(amount), sum(amount), min(amount), max(amount) FROM sales GROUP BY region ORDER BY region
 ----
 north	2	30	10	20
@@ -152,7 +152,7 @@ north	2
 south	2
 NULL	1
 
-query I
+query N
 SELECT sum(amount) FROM sales GROUP BY region ORDER BY sum(amount)
 ----
 -5
@@ -205,7 +205,8 @@ SELECT count(count(*)) FROM sales
 
 # --- Types: what has an aggregate and what does not ----------------------------------------------
 
-# float8 sums and averages exactly as PostgreSQL does.
+# float8 sums and averages exactly as PostgreSQL does — and stays a float8, where every exact
+# type widens: `sum(int8)` and every `avg` over an integer or a numeric answer `numeric`.
 query RR
 SELECT sum(rate), avg(rate) FROM sales
 ----
@@ -225,13 +226,16 @@ SELECT count() FROM sales
 statement error (42883)
 SELECT count(region, amount) FROM sales
 
-# avg over a bigint column is `numeric` there and has no answer here: ADR 0031, and the first entry
-# on the numeric backlog.
-statement error (0A000)
+# avg over a bigint column is `numeric`, at PostgreSQL's own division scale: sixteen *significant*
+# digits, so an average that comes out exactly prints twenty places.
+query N
 SELECT avg(amount) FROM sales
+----
+8.0000000000000000
 
-# sum over a bigint column is an int8 here, so it can overflow where PostgreSQL's numeric cannot.
-# It answers rather than wrapping, which is the whole of what the divergence costs.
+# **sum over a bigint column is a `numeric` too, so it cannot overflow.** This was the visible
+# edge of ADR 0031 — two `int8` maxima summed to `22003` here and to a value there — and it is
+# the same answer now.
 statement ok
 CREATE TABLE huge (id int8 PRIMARY KEY, n int8)
 
@@ -239,11 +243,13 @@ CREATE TABLE huge (id int8 PRIMARY KEY, n int8)
 statement ok
 INSERT INTO huge VALUES (1, 9223372036854775807), (2, 9223372036854775807)
 
-statement error (22003)
+query N
 SELECT sum(n) FROM huge
+----
+18446744073709551614
 
 # One row each, so nothing overflows and the answers are PostgreSQL's exactly.
-query I
+query N
 SELECT sum(n) FROM huge GROUP BY id ORDER BY id
 ----
 9223372036854775807
