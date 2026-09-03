@@ -1,0 +1,27 @@
+crates/esker-sql/src/parse/lower.rs
+  s_188859e919bef5::t_af003f1ee29f0a 2165-2183
+crates/esker-sql/src/plan/dml.rs
+  s_188859e919bef5::t_4ab31e8cf52dac 27-33
+crates/esker-sql/tests/corpus/pg19_insert_default_values.txt
+  s_188859e919bef5::t_5dd6579ef84297 1-86
+crates/esker-sql/tests/insert_default_values.rs
+  s_188859e919bef5::t_52a292193de6a9 1-223
+docs/plans/phase-9-rails.md
+  s_188859e919bef5::t_87a4cb138b69dc 1292,1511
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "d4616d40ad305e178c46da3936255d8c49fe600d",
+  "prompts": {},
+  "sessions": {
+    "s_188859e919bef5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5b0a7ebb-6297-4871-91b4-2650c25d6c33",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
