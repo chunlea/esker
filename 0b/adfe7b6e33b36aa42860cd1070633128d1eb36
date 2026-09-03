@@ -1,0 +1,37 @@
+crates/esker-sql/src/error.rs
+  s_2ed9df2fd94fee::t_0eb87f5a60124a 490-515,1663-1665,1768-1770
+crates/esker-sql/src/exec/bind.rs
+  s_2ed9df2fd94fee::t_4b07b558e7cbca 17-59,178-203,270-283,322-325,328-336,345-369,371-467,476-481,483-485,488,528-548,612-616,673-679,683
+crates/esker-sql/src/exec/mod.rs
+  s_2ed9df2fd94fee::t_a33a6435e10ef1 1282
+crates/esker-sql/src/pgwire/session.rs
+  s_2ed9df2fd94fee::t_4a868f0f5d751d 77-84,93,592
+crates/esker-sql/tests/bind_harness/mod.rs
+  s_2ed9df2fd94fee::t_060d24a36382f3 1-323
+crates/esker-sql/tests/bind_parameters.rs
+  s_2ed9df2fd94fee::t_f602441d7ca911 1-144
+crates/esker-sql/tests/corpus/pg19_bind_parameters.txt
+  s_2ed9df2fd94fee::t_242e0884254080 1-83
+crates/esker-sql/tests/parameters.rs
+  s_2ed9df2fd94fee::t_587344b44b7927 40,42,45,51-60,70,280-281,285-290,294-298
+crates/esker-sql/tests/real_backend.rs
+  s_2ed9df2fd94fee::t_bf3a0ecb3bb398 277
+docs/plans/phase-9-rails.md
+  s_2ed9df2fd94fee::t_fc64e22011259f 1505
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "0badfe7b6e33b36aa42860cd1070633128d1eb36",
+  "prompts": {},
+  "sessions": {
+    "s_2ed9df2fd94fee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ec622e3b-48a0-4735-8805-fe22838e8b26",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
