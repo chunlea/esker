@@ -176,6 +176,7 @@ pub(super) fn table_function_def(
             default: None,
             missing: None,
             generated: None,
+            comment: None,
         }],
         primary_key: Vec::new(),
         indexes: Vec::new(),
@@ -192,6 +193,8 @@ pub(super) fn table_function_def(
         child_scans: Vec::new(),
         partition_by: None,
         partition_bound: None,
+        comment: None,
+        primary_key_comment: None,
     })
 }
 
@@ -268,6 +271,7 @@ fn plan_derived(
             // nothing to pad with.
             missing: None,
             generated: None,
+            comment: None,
         })
         .collect();
     derived.def = Some(std::sync::Arc::new(crate::catalog::TableDef {
@@ -292,6 +296,8 @@ fn plan_derived(
         child_scans: Vec::new(),
         partition_by: None,
         partition_bound: None,
+        comment: None,
+        primary_key_comment: None,
     }));
     // Wrapped rather than used bare, so `EXPLAIN` has a node to change the relation's name at:
     // the plan text threads one table name down the whole tree, and without this a scan of `dt_a`

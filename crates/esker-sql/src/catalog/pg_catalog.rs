@@ -662,6 +662,7 @@ impl CatalogView {
                                 default: None,
                                 missing: None,
                                 generated: None,
+                                comment: None,
                             })
                             .collect(),
                         primary_key: Vec::new(),
@@ -679,6 +680,8 @@ impl CatalogView {
                         child_scans: Vec::new(),
                         partition_by: None,
                         partition_bound: None,
+                        comment: None,
+                        primary_key_comment: None,
                     })
                 })
                 .collect()

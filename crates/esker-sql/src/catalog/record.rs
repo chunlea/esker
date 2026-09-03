@@ -72,12 +72,16 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// `NULLS NOT DISTINCT`. Each is appended at the end, so a record of
 /// every earlier version is a prefix of a later one's and the goldens below still decode.
 ///
+/// Version 21 added the **comments**: the table's, one per column and one per index, in that
+/// order and at the very end like every section before it. A table written before 21 has none,
+/// which is what every table had while `COMMENT ON` was `0A000` naming itself (ADR 0049).
+///
 /// Version 1 is not read: nothing had ever persisted a catalog when version 2 landed, so a
 /// compatibility path for it was one nothing could check. **Version 2 is different** — this crate
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 20;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 21;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -1201,7 +1205,50 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         out.push(u8::from(exclude.deferred));
     }
 
+    // Version 21. The comments, on the end for the tenth time and the same reason. **An empty
+    // string is "no comment"** and needs no present-or-absent byte in front of it, because
+    // PostgreSQL cannot store an empty comment: `COMMENT ON … IS ''` deletes the row exactly as
+    // `IS NULL` does. Measured, and it is why this section costs one byte per object rather than
+    // two.
+    put_str(table.comment.as_deref().unwrap_or(""), &mut out);
+    put_str(table.primary_key_comment.as_deref().unwrap_or(""), &mut out);
+    for column in &table.columns {
+        put_str(column.comment.as_deref().unwrap_or(""), &mut out);
+    }
+    for index in &table.indexes {
+        put_str(index.comment.as_deref().unwrap_or(""), &mut out);
+    }
+
     Ok(out)
+}
+
+/// Version 21: the table's comment, the primary key's, then one per column and one per index.
+///
+/// **An empty string is `None`.** PostgreSQL deletes a `pg_description` row for `IS ''` rather
+/// than storing an empty comment, so the two cannot be told apart on a real server either and
+/// there is nothing to lose by not distinguishing them here.
+fn read_comments(
+    reader: &mut Reader<'_>,
+    columns: &mut [ColumnDef],
+    indexes: &mut [IndexDef],
+) -> Result<(Option<String>, Option<String>)> {
+    if reader.version < 21 {
+        return Ok((None, None));
+    }
+    let table = some_comment(reader.string()?);
+    let primary_key = some_comment(reader.string()?);
+    for column in columns {
+        column.comment = some_comment(reader.string()?);
+    }
+    for index in indexes {
+        index.comment = some_comment(reader.string()?);
+    }
+    Ok((table, primary_key))
+}
+
+/// An empty comment is no comment — see [`read_comments`].
+fn some_comment(text: String) -> Option<String> {
+    (!text.is_empty()).then_some(text)
 }
 
 /// The second half of the version 19 section: each index's `INCLUDE (…)` columns.
@@ -1606,6 +1653,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
             missing,
             // Filled from the version 13 section below, after every column has been read.
             generated: None,
+            comment: None,
         });
     }
 
@@ -1641,6 +1689,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
             nulls_not_distinct: false,
             // Filled from the version 17 section below, after every index has been read.
             constraint: None,
+            comment: None,
         });
     }
 
@@ -1689,11 +1738,14 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
     read_index_include(&mut reader, &mut indexes)?;
     // Read **after** version 19's two sections, because it is written after them.
     let excludes = read_excludes(&mut reader)?;
+    let (comment, primary_key_comment) = read_comments(&mut reader, &mut columns, &mut indexes)?;
     reader.finish()?;
 
     Ok(TableDef {
         id,
         name,
+        comment,
+        primary_key_comment,
         columns,
         primary_key,
         indexes,

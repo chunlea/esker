@@ -398,6 +398,65 @@ pub struct ForeignKey {
     pub deferrable: bool,
 }
 
+/// `COMMENT ON TABLE | COLUMN | INDEX <name> IS '…' | NULL`.
+///
+/// One statement for three objects, exactly as PostgreSQL parses it, because the differences are
+/// all in *which* object is found and none in what happens to it: a comment is set or removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Comment {
+    /// Which kind of object was named, which decides both the lookup and the `42809` message when
+    /// the name is a relation of a different kind.
+    pub object: CommentObject,
+    /// The name, folded. For a column it is the table's name; [`Comment::column`] holds the rest.
+    pub name: String,
+    /// The column, for `COMMENT ON COLUMN t.c`. Folded like every other identifier.
+    pub column: Option<String>,
+    /// The comment, or `None` for `IS NULL`.
+    ///
+    /// **`IS ''` arrives here as `Some("")` and is stored as `None`**, which is where PostgreSQL
+    /// puts the rule too: it deletes the row rather than writing an empty one, so the two spellings
+    /// cannot be told apart afterwards.
+    pub comment: Option<String>,
+}
+
+/// Which kind of object a `COMMENT ON` named.
+///
+/// Only the three this node has. Every other kind PostgreSQL accepts — a schema, a type, a role —
+/// is `0A000` naming itself at lowering, because a comment on an object this node does not have is
+/// a comment with nowhere to live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentObject {
+    /// `COMMENT ON TABLE`.
+    Table,
+    /// `COMMENT ON COLUMN`.
+    Column,
+    /// `COMMENT ON INDEX`.
+    Index,
+    /// `COMMENT ON SEQUENCE`, which is here **to report the kind rather than to succeed**.
+    ///
+    /// PostgreSQL resolves the name before it looks at the word, so `COMMENT ON SEQUENCE <a
+    /// table>` is `42809 "t" is not a sequence` and not a refusal of the statement. Taking the
+    /// word is what lets this node give that answer. A comment on a *real* sequence is `0A000`
+    /// naming itself: a sequence's record has no field to keep one in.
+    Sequence,
+    /// `COMMENT ON VIEW`, for the same reason — and this node has no views at all, so every name
+    /// that resolves is the `42809` and every name that does not is `42P01`.
+    View,
+}
+
+impl CommentObject {
+    /// The word PostgreSQL uses in `42809 "x" is not an index`.
+    #[must_use]
+    pub fn article_and_name(self) -> &'static str {
+        match self {
+            CommentObject::Table | CommentObject::Column => "a table",
+            CommentObject::Index => "an index",
+            CommentObject::Sequence => "a sequence",
+            CommentObject::View => "a view",
+        }
+    }
+}
+
 /// `DROP INDEX`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropIndex {

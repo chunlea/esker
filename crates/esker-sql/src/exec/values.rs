@@ -48,6 +48,7 @@ pub(super) fn def(entry: &TableRef) -> Result<Arc<TableDef>> {
             default: None,
             missing: None,
             generated: None,
+            comment: None,
         })
         .collect();
     Ok(Arc::new(TableDef {
@@ -69,6 +70,8 @@ pub(super) fn def(entry: &TableRef) -> Result<Arc<TableDef>> {
         excludes: Vec::new(),
         partition_by: None,
         partition_bound: None,
+        comment: None,
+        primary_key_comment: None,
     }))
 }
 
