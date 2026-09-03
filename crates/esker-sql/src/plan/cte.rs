@@ -56,6 +56,7 @@ pub fn inline(select: &mut Select, name: &str, body: &Select, columns: &[String]
         // The alias replaces the CTE's name the way it replaces a table's, so what the derived
         // table is called is what a qualifier in this query has to write.
         *entry = TableRef {
+            values: None,
             name: entry.referred_as().to_owned(),
             alias: None,
             derived: Some(Box::new(Derived::from_cte(

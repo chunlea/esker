@@ -145,13 +145,6 @@ pub(super) fn plan_subqueries(
     fold_counts(select, txn, tenant)
 }
 
-/// One `FROM (SELECT …) AS t`: its plan, and the relation it looks like from above.
-///
-/// The relation is a **synthetic [`TableDef`]** — one column per output column of the sub-select,
-/// under [`crate::catalog::DERIVED_TABLE_ID`] — and building one is the whole trick this unit
-/// turns on. With it, `Scope` resolves a name, `SELECT *` expands, `EXPLAIN` prints the names the
-/// user typed and the join machinery probes or materialises, all without learning that nothing
-/// stores these rows. Without it every one of those would need a second code path.
 /// The relation a set-returning function in `FROM` stands for.
 ///
 /// **One column, of the alias's name, typed `integer`** — `generate_subscripts` returns an
@@ -211,6 +204,13 @@ fn plan_table_function(entry: &mut crate::plan::TableRef) {
     function.def = None;
 }
 
+/// One `FROM (SELECT …) AS t`: its plan, and the relation it looks like from above.
+///
+/// The relation is a **synthetic [`TableDef`]** — one column per output column of the sub-select,
+/// under [`crate::catalog::DERIVED_TABLE_ID`] — and building one is the whole trick this unit
+/// turns on. With it, `Scope` resolves a name, `SELECT *` expands, `EXPLAIN` prints the names the
+/// user typed and the join machinery probes or materialises, all without learning that nothing
+/// stores these rows. Without it every one of those would need a second code path.
 fn plan_derived(
     entry: &mut crate::plan::TableRef,
     tenant: u64,
@@ -345,6 +345,11 @@ pub(super) fn relation_of(
     // function's shape is fixed — one column of the alias's name — and needs nothing looked up.
     if entry.function.is_some() {
         return Ok(table_function_def(entry));
+    }
+    // A `VALUES` list is the same trick with a different shape: one column per expression in its
+    // first row, named `column1`, `column2`, … unless an alias list renamed them.
+    if entry.values.is_some() {
+        return super::values::def(entry);
     }
     match entry.derived.as_ref() {
         // A name that is a `WITH` item this part of the query cannot see becomes PostgreSQL's
@@ -869,6 +874,15 @@ fn for_each_written_expr_mut(select: &mut Select, visit: &mut impl FnMut(&mut Ex
 /// The same walk over a plan's expressions, immutably.
 fn for_each_node_expr(node: &Node, visit: &mut impl FnMut(&Expr)) {
     match node {
+        // A written-out row holds expressions like any other node, and they are walked for the
+        // same reason: `VALUES (o.x)` inside a correlated subquery is an outer reference.
+        Node::Values { list, .. } => {
+            for row in &list.rows {
+                for expr in row {
+                    visit(expr);
+                }
+            }
+        }
         // A table function's arguments are expressions like any other, so an outer reference
         // in one is rewritten by the same walk that rewrites everything else.
         Node::TableFunction { call, .. } => {
@@ -938,6 +952,15 @@ fn for_each_node_expr(node: &Node, visit: &mut impl FnMut(&Expr)) {
 /// Every expression a *plan node* holds, in one place. Recursive over the tree.
 fn for_each_node_expr_mut(node: &mut Node, visit: &mut impl FnMut(&mut Expr)) {
     match node {
+        // A written-out row holds expressions like any other node, and they are walked for the
+        // same reason: `VALUES (o.x)` inside a correlated subquery is an outer reference.
+        Node::Values { list, .. } => {
+            for row in &mut list.rows {
+                for expr in row {
+                    visit(expr);
+                }
+            }
+        }
         // A table function's arguments are expressions like any other, so an outer reference
         // in one is rewritten by the same walk that rewrites everything else.
         Node::TableFunction { call, .. } => {

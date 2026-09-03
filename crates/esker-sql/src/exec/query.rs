@@ -78,7 +78,7 @@ pub(super) struct Scope<'a> {
 
 impl<'a> Scope<'a> {
     /// No tables: `SELECT 1`.
-    fn empty() -> Self {
+    pub(super) fn empty() -> Self {
         Scope {
             tables: Vec::new(),
             names: Vec::new(),
@@ -504,6 +504,11 @@ pub(super) fn plan_under(
         Some(table) if outer_entry.is_some_and(|entry| entry.function.is_some()) => {
             function_node(outer_entry.unwrap_or_else(|| unreachable!()), table, outer)?
         }
+        // Rows written into the statement, which is a source with even less to it than a function:
+        // no arguments, no key range, and the row count is the length of the list.
+        Some(table) if outer_entry.is_some_and(|entry| entry.values.is_some()) => {
+            super::values::node(outer_entry.unwrap_or_else(|| unreachable!()), table)?
+        }
         Some(table) => {
             if let Some(plan) = outer_entry.and_then(crate::plan::TableRef::derived_plan) {
                 plan.clone()
@@ -856,6 +861,9 @@ fn plan_chain(
         // table: no key range, no statistics, and rows that exist only once its arguments are
         // evaluated.
         Some(entry) if entry.function.is_some() => function_node(entry, outer, enclosing)?,
+        // Rows written into the statement, which is a source with even less to it than a function:
+        // no arguments, no key range, and the row count is the length of the list.
+        Some(entry) if entry.values.is_some() => super::values::node(entry, outer)?,
         Some(entry) => match entry.derived_plan() {
             Some(plan) => plan.clone(),
             None => access_path(None, tenant, outer)?,
@@ -1186,19 +1194,20 @@ fn probe_for(on: &Expr, scope: &Scope<'_>, inner: &TableDef) -> Option<crate::pl
         })
 }
 
-/// Rule 1, 2 and 3 from `plan::query`: pin the whole primary key, bound its first column, or pin a
-/// unique index's whole key. Otherwise a scan.
-/// The node a `FROM` entry that is a set-returning function becomes.
-/// The plan for a `FROM` entry that is a set-returning function, or `None` when it is a relation.
+/// The plan for a `FROM` entry that is neither a relation nor a derived table — a set-returning
+/// function or a `VALUES` list — or `None` when it is one of those.
 fn source_function(
     entry: Option<&crate::plan::TableRef>,
     def: &TableDef,
     enclosing: Option<&Scope<'_>>,
 ) -> Result<Option<Node>> {
-    entry
-        .filter(|entry| entry.function.is_some())
-        .map(|entry| function_node(entry, def, enclosing))
-        .transpose()
+    match entry {
+        Some(entry) if entry.function.is_some() => function_node(entry, def, enclosing).map(Some),
+        // A `VALUES` list is the fourth kind of source and the simplest: its rows are in the
+        // statement, so there is nothing to resolve against the enclosing scope.
+        Some(entry) if entry.values.is_some() => super::values::node(entry, def).map(Some),
+        _ => Ok(None),
+    }
 }
 
 /// A set-returning function standing where a relation does.
@@ -1230,6 +1239,8 @@ fn function_node(
     })
 }
 
+/// Rule 1, 2 and 3 from `plan::query`: pin the whole primary key, bound its first column, or pin a
+/// unique index's whole key. Otherwise a scan.
 fn access_path(filter: Option<&Expr>, tenant: u64, table: &TableDef) -> Result<Node> {
     let columns = table.row_schema();
     // A `pg_catalog` relation is computed, so it has no key range to narrow and no index to seek
@@ -2034,7 +2045,7 @@ fn retype_subscript(expr: &Expr, ty: ColumnType) -> Expr {
 /// node declares: a bare integer constant is `int4` on a real server and `int8` here, and a
 /// decimal constant is `numeric` there and `double precision` here — the same choice
 /// `Literal::Decimal` already makes everywhere else in this crate, `SELECT 1.5` included.
-fn literal_type(literal: &Literal) -> Option<ColumnType> {
+pub(super) fn literal_type(literal: &Literal) -> Option<ColumnType> {
     match literal {
         Literal::Null | Literal::String(_) => None,
         Literal::Integer(_) => Some(ColumnType::Int8),
@@ -2072,7 +2083,7 @@ fn unknown_of(expr: &Expr) -> &Literal {
 /// Only the three **spellings that carry no type of their own** are read this way. A
 /// `Literal::Typed` was written with a cast and keeps what it was given; the family check above
 /// has already refused it if that disagrees.
-fn give_branch_type(expr: &mut Expr, ty: ColumnType) -> Result<()> {
+pub(super) fn give_branch_type(expr: &mut Expr, ty: ColumnType) -> Result<()> {
     if let Expr::Literal(
         literal @ (Literal::String(_) | Literal::Integer(_) | Literal::Decimal(_)),
     ) = expr

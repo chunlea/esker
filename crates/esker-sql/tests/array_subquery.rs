@@ -17,8 +17,26 @@ const CORPUS_FIXTURE: &[&str] = &[];
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `pg_typeof` answers a `regtype` on a real server and `text` here — the same trade
     // `'x'::regtype` makes, and the same characters either way. The row agrees.
-    types: &["SELECT 'r', ARRAY(SELECT 'a'::text), pg_typeof(ARRAY(SELECT 'a'::text))"],
+    types: &[
+        "SELECT 'r', ARRAY(SELECT 'a'::text), pg_typeof(ARRAY(SELECT 'a'::text))",
+        // The three below are reached for the first time now that a bare `VALUES` list runs; they
+        // were swallowed by the aborted block before. Their rows are right and two facts show in
+        // the declared types: a bare integer constant is `int8` here and `int4` there, so an array
+        // of them is `bigint[]`; and `array_agg` declares `text` here whatever it collects, which
+        // is the aggregate result typing and a unit of its own.
+        "SELECT 'r', ARRAY(SELECT x FROM generate_series(1,3) AS x ORDER BY x DESC)",
+        "SELECT 'r', ARRAY(SELECT x FROM generate_series(1,5) AS x ORDER BY x LIMIT 2)",
+        "SELECT 'r', ARRAY(SELECT x FROM generate_series(1,3) AS x), array_agg(x ORDER BY x) FROM generate_series(1,3) AS x",
+    ],
     answers: &[
+        // Reached for the first time now that a bare `VALUES` list runs: this statement used to be
+        // one of the eight the aborted block swallowed. The refusal is the crate's standing one
+        // for a **per-row** cast — a cast of anything but a constant has only `text` as a target —
+        // and not something about arrays: `ARRAY(SELECT 1)` itself answers on the line above.
+        (
+            "SELECT 'r', ARRAY(SELECT 1)::int8[], pg_typeof(ARRAY(SELECT 1)::int8[])",
+            "a cast of a non-constant expression has only `text` as a target here, whatever the type",
+        ),
         (
             "SELECT 'r', ARRAY(SELECT 1), pg_typeof(ARRAY(SELECT 1))",
             "**The rows agree and the constant's width does not.** `ARRAY(SELECT 1)` is an `integer[]` on a real server and a `bigint[]` here, because a bare integer constant is `int4` there and `int8` here (`tests/unknown_literal.rs`); `generate_series`' column follows its arguments, so it inherits the same difference. `pg_typeof` reports `regtype` there and `text` here, which is the trade `'x'::regtype` already makes. Every value is identical.",

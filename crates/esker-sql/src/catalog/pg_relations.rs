@@ -192,6 +192,13 @@ impl Relations {
         self.tables.get(&row.table_id)
     }
 
+    /// A table by its id, for the edges a `TableDef` records as ids rather than as rows — a
+    /// partition's parent, whose name its inherited constraints are reported under.
+    #[must_use]
+    pub fn table_by_id(&self, table_id: u64) -> Option<&TableDef> {
+        self.tables.get(&table_id)
+    }
+
     /// The relation an oid names, if this tenant has one.
     #[must_use]
     pub fn by_oid(&self, oid: i64) -> Option<&RelationRow> {

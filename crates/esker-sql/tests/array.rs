@@ -22,6 +22,14 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // builds its array as text: now that an array is a type it could build one, and that is the
     // slice after the constructor rather than part of storage.
     types: &[
+        // These three used to be listed below as refusals: a bare `VALUES` list was not a relation
+        // and the statement could not run. It runs now and the **rows are right**; what is left is
+        // that `array_agg` declares `text` whatever it collects, where a real server declares the
+        // array type of its argument. That is the aggregate's result typing, not arrays, and it
+        // shows in `tests/array_subquery.rs` and `tests/values_relation.rs` too.
+        "SELECT array_agg(x) FROM (VALUES (1),(2)) v(x)",
+        "SELECT array_agg(x ORDER BY x DESC) FROM (VALUES (1),(2)) v(x)",
+        "SELECT array_agg(x) FROM (VALUES (NULL::int)) v(x)",
         "SELECT oid, typname, typlen, typinput, typelem, typdelim, typcategory FROM pg_type WHERE \
          typname IN ('_int4','_text') ORDER BY oid",
         "SELECT 'integer[]'::regtype::oid, 'int4[]'::regtype::oid, '_int4'::regtype::oid, \
@@ -80,18 +88,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT unnest('{}'::int[])",
             "`array_ndims`, `array_dims`, `array_remove`, `array_to_string`, `string_to_array` and `unnest`: more of the array function surface, none of which the schema files call. `array_length`, `array_lower`, `array_upper`, `array_position` and `cardinality` answer now, including over a two-dimensional array, which is what the shape is for.",
-        ),
-        (
-            "SELECT array_agg(x) FROM (VALUES (1),(2)) v(x)",
-            "A bare `VALUES` list as a relation, which is not about arrays at all — the statements are in this corpus because `array_agg` needed rows to aggregate. `array_agg` itself answers (`tests/array_agg.rs`).",
-        ),
-        (
-            "SELECT array_agg(x ORDER BY x DESC) FROM (VALUES (1),(2)) v(x)",
-            "A bare `VALUES` list as a relation, which is not about arrays at all — the statements are in this corpus because `array_agg` needed rows to aggregate. `array_agg` itself answers (`tests/array_agg.rs`).",
-        ),
-        (
-            "SELECT array_agg(x) FROM (VALUES (NULL::int)) v(x)",
-            "A bare `VALUES` list as a relation, which is not about arrays at all — the statements are in this corpus because `array_agg` needed rows to aggregate. `array_agg` itself answers (`tests/array_agg.rs`).",
         ),
         (
             "SELECT 1 = ALL('{1,1}'::int[]), 1 = ALL('{1,2}'::int[])",
