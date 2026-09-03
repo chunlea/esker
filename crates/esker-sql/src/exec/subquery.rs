@@ -154,14 +154,25 @@ pub(super) fn plan_subqueries(
 /// them learning that nothing stores these rows.
 pub(super) fn table_function_def(
     entry: &crate::plan::TableRef,
+    tables: &dyn Tables,
 ) -> std::sync::Arc<crate::catalog::TableDef> {
     let name = entry.referred_as().to_owned();
     // **`generate_subscripts` yields subscripts and `generate_series` yields the values it was
     // given.** A subscript is an `int4` on a real server whatever the array is; a series takes
     // its arguments' type, which for this node's integer constants is `int8` where PostgreSQL's
     // are `int4` — the standing constant-width divergence, showing through one more surface.
-    let ty = match entry.function.as_deref().map(|call| call.name.as_str()) {
-        Some("generate_series") => ColumnType::Int8,
+    // **`unnest` answers its array's element type**, which is a fact about the argument and not
+    // about the function — so it is the one of the three that has to look at what it was given.
+    // The argument is not resolved yet (this def is what a scope is built *from*), so the two
+    // shapes that carry their type without one are read directly: a column, through the catalog,
+    // and an array literal, through the value.
+    let ty = match entry
+        .function
+        .as_deref()
+        .map(|call| (call.name.as_str(), &call.args))
+    {
+        Some(("generate_series", _)) => ColumnType::Int8,
+        Some(("unnest", args)) => unnest_element(args.first(), tables).unwrap_or(ColumnType::Text),
         _ => ColumnType::Int4,
     };
     std::sync::Arc::new(crate::catalog::TableDef {
@@ -198,6 +209,24 @@ pub(super) fn table_function_def(
         comment: None,
         primary_key_comment: None,
     })
+}
+
+/// The element type an `unnest`'s argument is over, for the column its relation reports.
+fn unnest_element(arg: Option<&Expr>, tables: &dyn Tables) -> Option<ColumnType> {
+    use crate::plan::Literal;
+    let array = match arg? {
+        Expr::Column {
+            table: Some(table),
+            name,
+        } => {
+            let def = tables.get(table).ok()?;
+            let at = def.column(name)?;
+            def.columns.get(at)?.ty
+        }
+        Expr::Literal(Literal::Typed(value)) => value.column_type()?,
+        _ => return None,
+    };
+    esker_keys::array::ArrayValue::element_of(array)
 }
 
 fn plan_table_function(entry: &mut crate::plan::TableRef) {
@@ -354,7 +383,7 @@ pub(super) fn relation_of(
     // Built here rather than in a pre-pass, so that it cannot depend on one having run: a
     // function's shape is fixed — one column of the alias's name — and needs nothing looked up.
     if entry.function.is_some() {
-        return Ok(table_function_def(entry));
+        return Ok(table_function_def(entry, tables));
     }
     // A `VALUES` list is the same trick with a different shape: one column per expression in its
     // first row, named `column1`, `column2`, … unless an alias list renamed them.
