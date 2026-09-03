@@ -1,0 +1,37 @@
+crates/esker-sql/src/catalog/mod.rs
+  s_2ed9df2fd94fee::t_1060e2c2695028 680-681,768-802,2304,2330,2423,2456,2513-2515,3474
+crates/esker-sql/src/catalog/record.rs
+  s_2ed9df2fd94fee::t_3b1878c91bcab5 51-53,80,1120-1134,1349-1374,1503,1521
+crates/esker-sql/src/exec/ddl.rs
+  s_2ed9df2fd94fee::t_f8f823ee4cb853 125
+crates/esker-sql/src/parse/lower.rs
+  s_2ed9df2fd94fee::t_b908eb427326e6 45-54,1157-1165,1384-1385
+crates/esker-sql/src/parse/mod.rs
+  s_2ed9df2fd94fee::t_4507c0d87c3ba2 183-188,227-232,247-253,262,268-415,445-566,630-632
+crates/esker-sql/src/plan/ddl.rs
+  s_2ed9df2fd94fee::t_46f87060422d43 31-33
+crates/esker-sql/src/value/mod.rs
+  s_2ed9df2fd94fee::t_e0847fe8d69e77 48
+crates/esker-sql/src/value/range.rs
+  s_2ed9df2fd94fee::t_d834887e4703a2 1-167
+crates/esker-sql/tests/corpus/pg19_exclusion_constraint.txt
+  s_2ed9df2fd94fee::t_72c087c1433cc2 1-126
+crates/esker-sql/tests/syntax_corpus.rs
+  s_2ed9df2fd94fee::t_9793071d8ddd1f 60-63
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "5f1e0604495ddfa855db48a2adff3b4d3da32856",
+  "prompts": {},
+  "sessions": {
+    "s_2ed9df2fd94fee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ec622e3b-48a0-4735-8805-fe22838e8b26",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
