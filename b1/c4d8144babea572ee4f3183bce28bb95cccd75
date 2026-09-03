@@ -1,0 +1,59 @@
+crates/esker-sql/src/exec/assign.rs
+  s_e5c0c6e78b5662::t_0d848f8a8343dc 1-64
+crates/esker-sql/src/exec/bind.rs
+  s_e5c0c6e78b5662::t_e1aa94d3a60520 192-200,350-372,377-396,482,514,599-612,699-716,731-751,799-800,850,852-861
+crates/esker-sql/src/exec/cursor.rs
+  s_e5c0c6e78b5662::t_e1cce7a0084059 214,1549-1562,1577-1580,1656-1669,1671-1674,1677,1679-1687
+crates/esker-sql/src/exec/dml.rs
+  s_e5c0c6e78b5662::t_37592edfa5a0f4 326,417-454,681-683,686,793,972,992-994,997,1254-1284
+crates/esker-sql/src/exec/fragment.rs
+  s_e5c0c6e78b5662::t_d661a45188d22a 449-455,496-498
+crates/esker-sql/src/exec/mod.rs
+  s_e5c0c6e78b5662::t_44b0554a2eda51 28,1991-1993
+crates/esker-sql/src/exec/subquery.rs
+  s_e5c0c6e78b5662::t_0aa9a6915f1c57 77-102,104,880-881,891
+crates/esker-sql/src/exec/values.rs
+  s_e5c0c6e78b5662::t_2996d4dcc313a6 103-108,113
+crates/esker-sql/src/parse/lower.rs
+  s_e5c0c6e78b5662::t_55aae14634b074 2536-2548
+crates/esker-sql/src/plan/expr.rs
+  s_e5c0c6e78b5662::t_a72bf89c0d645d 719-752,805-807,809-810,814-819,883-886,923-929,972-978,1204-1219,1235-1236
+crates/esker-sql/src/value/mod.rs
+  s_e5c0c6e78b5662::t_7515faba787f91 1034-1045
+crates/esker-sql/tests/bind_harness/mod.rs
+  s_e5c0c6e78b5662::t_26fe1163028455 61-64,67,69,256-259,269,272-282,324-339
+crates/esker-sql/tests/bind_parameters.rs
+  s_e5c0c6e78b5662::t_db58aab0323ec4 24-29,144-218
+crates/esker-sql/tests/corpus/pg19_values_catalog_function.txt
+  s_e5c0c6e78b5662::t_e2716ad03128ec 1-83
+crates/esker-sql/tests/corpus/pg19_write_in_subquery.txt
+  s_e5c0c6e78b5662::t_e04458dd67a193 1-83
+crates/esker-sql/tests/default_now.rs
+  s_e5c0c6e78b5662::t_96f8880ad2df6b 24-28,32-35
+crates/esker-sql/tests/on_conflict.rs
+  s_e5c0c6e78b5662::t_f3199329fe9950 32-37
+crates/esker-sql/tests/scalar_functions.rs
+  s_e5c0c6e78b5662::t_21784f556d4dac 40,44
+crates/esker-sql/tests/subquery.rs
+  s_e5c0c6e78b5662::t_a7b5d51df09775 350,352-360
+crates/esker-sql/tests/values_catalog_function.rs
+  s_e5c0c6e78b5662::t_c9c8aa338bd2e2 1-56
+crates/esker-sql/tests/write_in_subquery.rs
+  s_e5c0c6e78b5662::t_e6ae264f2b1a79 1-79
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "b1c4d8144babea572ee4f3183bce28bb95cccd75",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
