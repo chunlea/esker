@@ -165,6 +165,8 @@ pub(super) fn table_function_def(
         _ => ColumnType::Int4,
     };
     std::sync::Arc::new(crate::catalog::TableDef {
+        // Synthetic and never stored, so its persistence is the default.
+        persistence: crate::catalog::Persistence::Permanent,
         id: crate::catalog::DERIVED_TABLE_ID,
         name: name.clone(),
         columns: vec![crate::catalog::ColumnDef {
@@ -275,6 +277,8 @@ fn plan_derived(
         })
         .collect();
     derived.def = Some(std::sync::Arc::new(crate::catalog::TableDef {
+        // Synthetic and never stored, so its persistence is the default.
+        persistence: crate::catalog::Persistence::Permanent,
         id: crate::catalog::DERIVED_TABLE_ID,
         name,
         columns,

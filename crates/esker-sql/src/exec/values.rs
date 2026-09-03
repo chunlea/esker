@@ -52,6 +52,8 @@ pub(super) fn def(entry: &TableRef) -> Result<Arc<TableDef>> {
         })
         .collect();
     Ok(Arc::new(TableDef {
+        // Synthetic and never stored, so its persistence is the default.
+        persistence: crate::catalog::Persistence::Permanent,
         id: DERIVED_TABLE_ID,
         name,
         columns,

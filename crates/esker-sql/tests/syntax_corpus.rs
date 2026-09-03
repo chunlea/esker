@@ -51,9 +51,10 @@ const KNOWN_GAPS: &[(&str, &str)] = &[
         "G01",
     ),
     ("ALTER TABLE t DETACH PARTITION p CONCURRENTLY;", "G01"),
-    // G02 -- unlogged / logged tables
-    ("CREATE UNLOGGED TABLE t (a int8);", "G02"),
-    ("ALTER TABLE t SET LOGGED;", "G02"),
+    // G02 -- unlogged / logged tables. **Closed**: `sqlparser` reads `TEMP` before `TABLE` and not
+    // `UNLOGGED`, and has no `LOGGED` keyword at all, so both statements were syntax errors. The
+    // keyword is cut out of the source and `ALTER TABLE ... SET LOGGED` is read off the words, the
+    // same two mechanisms `EXCLUDE` and `SET CONSTRAINTS` use (`crate::parse::strip_unlogged`).
     // G03 -- CREATE TABLE LIKE / OF
     ("CREATE TABLE t (LIKE u INCLUDING ALL);", "G03"),
     ("CREATE TABLE t OF person_type;", "G03"),

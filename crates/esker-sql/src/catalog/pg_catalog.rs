@@ -145,6 +145,16 @@ pub enum CatalogView {
     /// A real server defines it in exactly those terms, and `indexdef` is `pg_get_indexdef` — the
     /// same string, which is why the two agree about `INCLUDE (…)` without being written twice.
     PgIndexes,
+    /// **Which sequence belongs to which column**, and nothing else this node has a dependency
+    /// for. `ActiveRecord`'s `pk_and_sequence_for` joins it to `pg_class`, `pg_attribute`,
+    /// `pg_constraint` and `pg_namespace` to find the sequence behind a primary key, and
+    /// `reset_pk_sequence!` cannot fix a sequence it cannot name — run 46's largest row.
+    PgDepend,
+    /// A sequence's parameters: start, increment, bounds, cache and cycle.
+    ///
+    /// **Not `last_value`**, which is state and lives in the sequence relation itself. Two
+    /// different reads, and `reset_pk_sequence!` uses both.
+    PgSequence,
     /// The values of every enum type, which is **none**: `CREATE TYPE … AS ENUM` is `0A000`, so
     /// nothing can put a row here. Empty on a real server too until somebody makes an enum.
     PgEnum,
@@ -168,7 +178,7 @@ pub enum CatalogView {
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 24] = [
+    pub const ALL: [CatalogView; 26] = [
         CatalogView::PgType,
         CatalogView::PgRange,
         CatalogView::PgClass,
@@ -186,6 +196,8 @@ impl CatalogView {
         CatalogView::PgLanguage,
         CatalogView::PgPartitionedTable,
         CatalogView::PgIndexes,
+        CatalogView::PgDepend,
+        CatalogView::PgSequence,
         CatalogView::PgEnum,
         CatalogView::PgAvailableExtensions,
         CatalogView::InformationSchemaTables,
@@ -217,6 +229,8 @@ impl CatalogView {
             CatalogView::PgLanguage => "pg_language",
             CatalogView::PgPartitionedTable => "pg_partitioned_table",
             CatalogView::PgIndexes => "pg_indexes",
+            CatalogView::PgDepend => "pg_depend",
+            CatalogView::PgSequence => "pg_sequence",
             CatalogView::PgEnum => "pg_enum",
             CatalogView::InformationSchemaTables => "information_schema.tables",
             CatalogView::InformationSchemaColumns => "information_schema.columns",
@@ -252,6 +266,8 @@ impl CatalogView {
                 CatalogView::PgLanguage => 20,
                 CatalogView::PgPartitionedTable => 21,
                 CatalogView::PgIndexes => 22,
+                CatalogView::PgDepend => 24,
+                CatalogView::PgSequence => 25,
                 CatalogView::PgEnum => 16,
                 CatalogView::PgAvailableExtensions => 17,
                 CatalogView::InformationSchemaTables => 9,
@@ -340,6 +356,11 @@ impl CatalogView {
                 // a table — the join `pg_am am ON am.oid = i.relam` then finds nothing for one,
                 // which is how a client filters indexes by method.
                 ("relam", ColumnType::Int8),
+                // **Last again.** A `"char"` on a real server and `text` here, with the same
+                // single character in it. The one column that tells an `UNLOGGED` table from an
+                // ordinary one — `information_schema.tables` calls both `BASE TABLE`, so a client
+                // that reads the standard view cannot see persistence at all.
+                ("relpersistence", ColumnType::Text),
             ],
             // Exactly the three a client reads. `amname` is a `name` on a real server and `amtype`
             // a `"char"`; both are `text` here, the trade every `pg_catalog` column makes.
@@ -439,6 +460,29 @@ impl CatalogView {
             // `enumsortorder` is a `real` on a real server, which is the one place this view's
             // types are worth reading: the order is a float so a value can be inserted *between*
             // two others without renumbering.
+            // PostgreSQL's own seven columns, in its own order. `classid`/`objid`/`objsubid`
+            // name the **dependent** object and `refclassid`/`refobjid`/`refobjsubid` the one it
+            // depends on — a sequence depending on the column it fills, which is the only
+            // dependency this node records.
+            CatalogView::PgDepend => &[
+                ("classid", ColumnType::Int8),
+                ("objid", ColumnType::Int8),
+                ("objsubid", ColumnType::Int4),
+                ("refclassid", ColumnType::Int8),
+                ("refobjid", ColumnType::Int8),
+                ("refobjsubid", ColumnType::Int4),
+                ("deptype", ColumnType::Text),
+            ],
+            CatalogView::PgSequence => &[
+                ("seqrelid", ColumnType::Int8),
+                ("seqtypid", ColumnType::Int8),
+                ("seqstart", ColumnType::Int8),
+                ("seqincrement", ColumnType::Int8),
+                ("seqmax", ColumnType::Int8),
+                ("seqmin", ColumnType::Int8),
+                ("seqcache", ColumnType::Int8),
+                ("seqcycle", ColumnType::Bool),
+            ],
             CatalogView::PgEnum => &[
                 ("enumtypid", ColumnType::Int8),
                 ("enumlabel", ColumnType::Text),
@@ -473,6 +517,8 @@ impl CatalogView {
     pub fn rows_of(self, txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
         match self {
             CatalogView::PgType => pg_type_rows(txn, tenant),
+            CatalogView::PgDepend => pg_depend_rows(txn, tenant),
+            CatalogView::PgSequence => pg_sequence_rows(txn, tenant),
             CatalogView::PgClass => pg_class_rows(txn, tenant),
             CatalogView::PgAttribute => super::pg_attribute::rows(txn, tenant),
             CatalogView::PgAttrdef => super::pg_attribute::default_rows(txn, tenant),
@@ -598,6 +644,8 @@ impl CatalogView {
             | CatalogView::PgNamespace
             | CatalogView::PgAttribute
             | CatalogView::PgType
+            | CatalogView::PgDepend
+            | CatalogView::PgSequence
             | CatalogView::PgAttrdef
             | CatalogView::PgIndex
             | CatalogView::PgConstraint
@@ -623,6 +671,8 @@ impl CatalogView {
                 .iter()
                 .map(|view| {
                     Arc::new(TableDef {
+                        // Synthetic and never stored, so its persistence is the default.
+                        persistence: crate::catalog::Persistence::Permanent,
                         id: view.id(),
                         name: view.name().to_owned(),
                         columns: view
@@ -939,6 +989,74 @@ fn inherits_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
     }
     Ok(rows)
 }
+/// One row per sequence: the sequence depends on the column it fills.
+///
+/// **`deptype` is `a`**, "automatic": the sequence goes away with the column, which is what
+/// `bigserial` makes and what `ActiveRecord` looks for. A sequence that fills nothing — every
+/// `CREATE SEQUENCE` makes one — has no dependency and no row here, exactly as on a real server.
+///
+/// `attnum` is the column's **one-based** position, which is what `pg_attribute` reports and what
+/// `cons.conkey[1]` is compared against.
+fn pg_depend_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+    let class_oid = i64::try_from(CatalogView::PgClass.table_def().id).unwrap_or(i64::MAX);
+    let relations = super::pg_relations::Relations::read(txn, tenant)?;
+    let mut rows = Vec::new();
+    for table in relations.tables() {
+        for sequence in &table.sequences {
+            let Some(column) = sequence.column else {
+                continue;
+            };
+            let Ok(attnum) = i32::try_from(column + 1) else {
+                continue;
+            };
+            rows.push(vec![
+                Datum::Int8(class_oid),
+                Datum::Int8(super::pg_relations::as_oid(sequence.id)),
+                Datum::Int4(0),
+                Datum::Int8(class_oid),
+                Datum::Int8(super::pg_relations::as_oid(table.id)),
+                Datum::Int4(attnum),
+                Datum::Text("a".to_owned()),
+            ]);
+        }
+    }
+    rows.sort_by_key(|row| match row.get(1) {
+        Some(Datum::Int8(oid)) => *oid,
+        _ => 0,
+    });
+    Ok(rows)
+}
+
+/// One row per sequence: its parameters, which are the same for every sequence this node makes.
+///
+/// **`last_value` is not here.** It is state, it lives in the sequence relation, and the two reads
+/// are what `reset_pk_sequence!` uses in its two branches: `seqmin` when the table is empty and
+/// `MAX(pk)` when it is not.
+fn pg_sequence_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+    let relations = super::pg_relations::Relations::read(txn, tenant)?;
+    let mut rows = Vec::new();
+    for table in relations.tables() {
+        for sequence in &table.sequences {
+            rows.push(vec![
+                Datum::Int8(super::pg_relations::as_oid(sequence.id)),
+                // `bigint`, which is what every sequence this node makes counts in.
+                Datum::Int8(i64::from(ColumnType::Int8.oid())),
+                Datum::Int8(1),
+                Datum::Int8(1),
+                Datum::Int8(i64::MAX),
+                Datum::Int8(1),
+                Datum::Int8(1),
+                Datum::Bool(false),
+            ]);
+        }
+    }
+    rows.sort_by_key(|row| match row.first() {
+        Some(Datum::Int8(oid)) => *oid,
+        _ => 0,
+    });
+    Ok(rows)
+}
+
 /// Every `pg_type` row: the built-in types, then this tenant's own.
 ///
 /// The built-ins are derived from `ColumnType::ALL` rather than written out, so a type cannot be
@@ -1077,6 +1195,8 @@ fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
             Datum::Bool(false),
             Datum::Null,
             Datum::Int8(0),
+            // A catalog view is not stored at all, and a real server reports `p` for one.
+            Datum::Text(super::Persistence::Permanent.relpersistence().to_owned()),
         ]
     });
     let schemas = super::schema_names(txn, tenant)?;
@@ -1132,6 +1252,18 @@ fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
                         Datum::Text(super::partition_bound_definition(bound))
                     }),
                 Datum::Int8(access_method_oid(relation.kind)),
+                // **The owning table's, for every relation it owns.** A `bigserial`'s sequence
+                // and every index — the primary key's included — report the table's persistence
+                // on a real server, and `ALTER TABLE … SET LOGGED` moves all of them in one
+                // statement. Reading it from the table rather than storing a copy per relation is
+                // what makes both true at once and leaves nothing that can drift.
+                Datum::Text(
+                    relations
+                        .table(relation)
+                        .map_or(super::Persistence::Permanent, |table| table.persistence)
+                        .relpersistence()
+                        .to_owned(),
+                ),
             ]
         })
         .chain(views)

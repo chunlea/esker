@@ -38,6 +38,56 @@ impl Parsed {
     /// Lowers this statement into the plan types the executor runs, or names the construct that
     /// stopped it (contract C2).
     pub fn lower(&self) -> Result<plan::Statement> {
+        // **Deep once, then deep properly.** `lower_expr` stops at `INLINE_LOWER_DEPTH` on the
+        // caller's stack, which is a tokio worker's 2 MiB. A statement past it is not refused —
+        // it is lowered again on a thread with room for `MAX_NESTING_DEPTH` levels, exactly as
+        // `crate::parse` re-parses a deeply nested statement on one. So the limit a client meets
+        // is the parser's, and the worker's stack decides only *where* the work happens.
+        match self.lower_inline() {
+            Err(SqlError::StatementTooComplex) => self.lower_on_a_deep_stack(),
+            other => other,
+        }
+    }
+
+    /// [`Parsed::lower`] on a thread sized for the full depth, and only for a statement that needs
+    /// it. A thread spawn costs tens of microseconds; the statement is about to become a
+    /// distributed transaction.
+    fn lower_on_a_deep_stack(&self) -> Result<plan::Statement> {
+        // **Borrowed, not cloned.** `Parsed` holds `sqlparser`'s tree, and `Clone` on that tree is
+        // as recursive as lowering it — cloning a 500-term chain to hand it to the deep thread
+        // overflowed the very stack this exists to get off. A scoped thread borrows it instead, so
+        // nothing walks the tree on the caller's stack.
+        std::thread::scope(|scope| {
+            let worker = std::thread::Builder::new()
+                .name("esker-sql-lower".into())
+                .stack_size(crate::parse::DEEP_PARSE_STACK_BYTES)
+                .spawn_scoped(scope, || {
+                    LOWER_LIMIT.with(|cell| cell.set(crate::parse::MAX_PLAN_DEPTH));
+                    self.lower_inline()
+                })
+                .map_err(|error| {
+                    SqlError::Internal(format!("could not spawn a lowering thread: {error}"))
+                })?;
+            // A panic here is a bug in this crate and not something the client did, so it is an
+            // internal error rather than a dropped connection — the reading
+            // `parse_on_a_deep_stack` takes, and for the same invariant.
+            worker
+                .join()
+                .map_err(|_| SqlError::Internal("the lowering thread panicked".into()))?
+        })
+    }
+
+    fn lower_inline(&self) -> Result<plan::Statement> {
+        // **Built here, not parsed.** `ALTER TABLE … SET { LOGGED | UNLOGGED }` was rewritten to a
+        // placeholder because the parser has no `LOGGED` keyword, so the statement is reconstructed
+        // from what the class recorded — and then travels the ordinary `ALTER TABLE` path.
+        if let crate::parse::StatementClass::SetPersistence { table, persistence } = &self.class {
+            return Ok(plan::Statement::AlterTable(plan::AlterTable {
+                name: table.clone(),
+                if_exists: false,
+                actions: vec![plan::AlterTableAction::SetPersistence(*persistence)],
+            }));
+        }
         let mut lowered = lower_statement(&self.statement)?;
         // The one thing the parser could not carry (`crate::parse::Parsed::concurrently`).
         if let plan::Statement::DropIndex(drop) = &mut lowered {
@@ -46,6 +96,9 @@ impl Parsed {
         // And the clauses it could not read at all: an `EXCLUDE` constraint is cut out of the
         // source so the statement parses, and re-attached here from its own text.
         if let plan::Statement::CreateTable(create) = &mut lowered {
+            if self.is_unlogged() {
+                create.persistence = catalog::Persistence::Unlogged;
+            }
             for clause in self.exclude_constraints() {
                 create.excludes.push(crate::parse::parse_exclude_constraint(
                     clause,
@@ -1558,6 +1611,8 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
     )?;
 
     Ok(plan::CreateTable {
+        // Overridden in `Parsed::lower`, which is where the stripped keyword is in reach.
+        persistence: catalog::Persistence::Permanent,
         name,
         checks,
         foreign_keys,
@@ -2191,7 +2246,66 @@ fn lower_on_conflict(on: &sqlparser::ast::OnInsert) -> Result<plan::OnConflict> 
     clippy::too_many_lines,
     reason = "one arm per expression shape; splitting it would hide the vocabulary rather than clarify it"
 )]
+/// How deep [`lower_expr`] may descend on the caller's own stack.
+///
+/// **Measured, not chosen**: an `OR` chain overflows a 2 MiB stack at 59 terms in a debug build,
+/// which is about 35 KiB of frame per level — `lower_expr` is one large match and every arm's
+/// locals get a slot. Half of that measurement, so the guard fires with the stack half used.
+///
+/// A statement past it is not refused: it is lowered again on a thread with room to spare, which
+/// is what `crate::parse` already does for a deeply nested *parse*. Only a statement past
+/// [`crate::parse::MAX_PLAN_DEPTH`] is `54001` — and that limit is set by what the **executor**
+/// can walk on a worker's stack, because a plan this crate builds and then cannot execute would
+/// only move the crash a layer along. It did, once: guarding lowering alone left a 500-term chain
+/// lowering happily and overflowing in the resolver.
+const INLINE_LOWER_DEPTH: usize = if cfg!(debug_assertions) { 24 } else { 128 };
+
+thread_local! {
+    /// How many [`lower_expr`] frames this thread is inside.
+    static LOWER_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The ceiling this thread is working to: the inline budget, or the full limit on a thread
+    /// spawned with a stack for it.
+    static LOWER_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(INLINE_LOWER_DEPTH) };
+}
+
+/// Counts one level of [`lower_expr`] and gives it back on the way out.
+///
+/// A guard object rather than a depth parameter, because `lower_expr` is reached from a dozen
+/// sibling walkers — the query lowerer, the `CASE` arms, the function arguments — and a parameter
+/// would have to be threaded through every one of them, where any missed call site silently
+/// resets the count to zero.
+struct DepthGuard;
+
+impl DepthGuard {
+    fn enter() -> Result<Self> {
+        let limit = LOWER_LIMIT.with(std::cell::Cell::get);
+        let depth = LOWER_DEPTH.with(std::cell::Cell::get);
+        if depth >= limit {
+            return Err(SqlError::StatementTooComplex);
+        }
+        LOWER_DEPTH.with(|cell| cell.set(depth + 1));
+        Ok(DepthGuard)
+    }
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        LOWER_DEPTH.with(|cell| cell.set(cell.get().saturating_sub(1)));
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per `sqlparser` expression node, in the parser's own order; splitting it \
+              would put half the tree's shapes in a function named after nothing"
+)]
 fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
+    // **Invariant 9, at the one place that was missing it.** The parser has been guarded since
+    // phase 6a, and its guard counts *brackets* — which is why it never saw this: `a OR b OR c`
+    // has one bracket and builds an N-deep tree, so run 46's node parsed a boolean chain happily
+    // and then overflowed a tokio worker's stack lowering it. Counted here rather than inferred
+    // from the source, because the tree's depth is what this function descends.
+    let _depth = DepthGuard::enter()?;
     let expr_ref = expr;
     match expr {
         Expr::Value(value) => lower_value(&value.value, false),
@@ -4405,11 +4519,36 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
             }
             (Some(left), joins)
         }
-        // `FROM a, b` is a cross join in PostgreSQL, and writing it that way is how a user asks
-        // for one. Refused by name rather than lowered to a cross join, because the comma form
-        // usually means a `WHERE` was meant to join them and saying so is more useful than
-        // running the cartesian product.
-        _ => return Err(SqlError::unsupported("a comma-separated FROM list")),
+        // **`FROM a, b` is a cross join**, and it is lowered to one rather than refused. It was
+        // refused on the argument that the comma form usually means a `WHERE` was meant to join
+        // the tables and saying so is more useful than running the cartesian product — which is
+        // true of a person's typo and false of generated SQL. `ActiveRecord`'s
+        // `pk_and_sequence_for` is **five tables in one comma list** with the join conditions in
+        // the `WHERE`, and it is what `reset_pk_sequence!` calls before it can fix a sequence:
+        // run 46's largest row, 199 tests over 29 files, all stopped here.
+        //
+        // The `WHERE` does the joining either way — a cross join with an equality above it is what
+        // the comma form *means* — so nothing is approximated by writing it as one.
+        [first, rest @ ..] => {
+            let left = table_reference(&first.relation)?;
+            let mut joins = first
+                .joins
+                .iter()
+                .map(lower_join)
+                .collect::<Result<Vec<_>>>()?;
+            for entry in rest {
+                joins.push(plan::Join {
+                    table: table_reference(&entry.relation)?,
+                    kind: plan::JoinKind::Inner,
+                    on: None,
+                    using: Vec::new(),
+                });
+                for join in &entry.joins {
+                    joins.push(lower_join(join)?);
+                }
+            }
+            (Some(left), joins)
+        }
     };
 
     let projection = lower_projection(&select.projection)?;

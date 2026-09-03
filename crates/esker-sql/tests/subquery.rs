@@ -317,8 +317,11 @@ fn the_shapes_this_phase_does_not_run_name_themselves() {
             "ALL over an array",
         ),
         (
+            // The comma list itself runs now — it is a cross join, and
+            // `tests/reset_pk_sequence.rs` is the five-table one `ActiveRecord` writes. What is
+            // still refused is `LATERAL`, which is what this line names.
             "SELECT id FROM sq_a, LATERAL (SELECT 1) AS x",
-            "a comma-separated FROM list",
+            "LATERAL",
         ),
     ] {
         let error = refusal(&mut node, statement);

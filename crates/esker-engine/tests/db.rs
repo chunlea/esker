@@ -38,6 +38,23 @@ fn memfs() -> (Arc<MemFileSystem>, Arc<dyn FileSystem>) {
     (inner, dynamic)
 }
 
+/// Every SST in the database directory, by file number.
+///
+/// The tables and nothing else: a WAL segment, the manifest and `CURRENT` come and go for reasons
+/// that have nothing to do with which column families exist, so a claim about reclamation that
+/// counted them would be answered by the wrong files.
+fn ssts(memfs: &Arc<MemFileSystem>) -> std::collections::BTreeSet<u64> {
+    memfs
+        .list(std::path::Path::new(DIR))
+        .unwrap()
+        .into_iter()
+        .filter_map(|path| match filename::classify_path(&path) {
+            Some(filename::FileKind::Sst(number)) => Some(number),
+            _ => None,
+        })
+        .collect()
+}
+
 fn get(db: &Db, key: &[u8]) -> Option<Vec<u8>> {
     db.get(cf::DEFAULT, key, &ReadOptions::default())
         .unwrap()
@@ -1019,13 +1036,23 @@ fn dropping_a_column_family_takes_its_data_with_it() {
     db.put(cf::DEFAULT, b"keep", b"me").unwrap();
     db.flush(cf::LOCK).unwrap();
 
-    let before = memfs.list(std::path::Path::new(DIR)).unwrap().len();
+    let before = ssts(&memfs);
     db.drop_cf(cf::LOCK).unwrap();
     assert_eq!(db.cf_id(cf::LOCK), None);
-    assert!(db.get(cf::LOCK, b"k", &ReadOptions::default()).is_err());
+    let read = db.get(cf::LOCK, b"k", &ReadOptions::default());
     assert!(
-        memfs.list(std::path::Path::new(DIR)).unwrap().len() < before,
-        "the dropped family's files should have been reclaimed"
+        read.is_err(),
+        "a dropped family still answered a read: {read:?}"
+    );
+    // **The SSTs, not the directory.** Counting every file made this an assertion about the whole
+    // directory: a WAL segment rolled or a manifest written between the two listings offsets the
+    // reclaimed table and the count does not drop, which has nothing to do with what was reclaimed.
+    // The claim is about the dropped family's tables, so it is made about those.
+    let after = ssts(&memfs);
+    assert!(
+        after.is_subset(&before) && after.len() < before.len(),
+        "the dropped family's tables should have been reclaimed and nothing else added\n  \
+         before: {before:?}\n  after:  {after:?}"
     );
     assert_eq!(get(&db, b"keep").as_deref(), Some(&b"me"[..]));
     drop(db);
