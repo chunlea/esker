@@ -45,6 +45,16 @@ pub enum Expr {
     Literal(Literal),
     /// `$1`, one-based as PostgreSQL writes it.
     Parameter(u32),
+    /// `-operand`, which is **not** `0 - operand`.
+    ///
+    /// It was written as the subtraction at first, and the subtraction is right for every number:
+    /// `-((-2147483648)::int4)` overflows at `int4` because the `0` takes the operand's width. It
+    /// is wrong for the temporal types, and in both directions — `-'1 day'::interval` is
+    /// `-1 days` where `bigint - interval` does not exist, and `-'12:00'::time` is an **interval**
+    /// where `bigint - time` does not exist either. So the negation is its own node, with its own
+    /// per-type result (`crate::value::temporal::negate_type`) and PostgreSQL's **unary** `42883`
+    /// for a type that has none.
+    Negate(Box<Expr>),
     /// `left <op> right` where the operator yields a **value**, not a boolean.
     ///
     /// The type it yields is `crate::value::arith::result_type`'s answer and is computed once, at
@@ -1199,7 +1209,7 @@ fn describe(expr: &Expr) -> &'static str {
         Expr::Column { .. } | Expr::Ordinal { .. } => "a column reference",
         Expr::Outer { .. } => "a correlated column reference",
         Expr::Binary { .. } => "an operator",
-        Expr::Arithmetic { .. } => "an arithmetic operator",
+        Expr::Arithmetic { .. } | Expr::Negate(_) => "an arithmetic operator",
         Expr::Not(_) => "NOT",
         Expr::IsNull { .. } => "IS NULL",
         Expr::InList { negated: false, .. } => "IN",

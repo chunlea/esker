@@ -116,34 +116,10 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         ),
         ("SELECT '1 year 1 month'::interval::interval year", TYPMOD),
         ("SELECT 'interval(9)'::regtype::oid", TYPMOD),
-        ("SELECT interval '1 month' + interval '1 day'", ARITHMETIC),
-        (
-            "SELECT '1 day'::interval - '12 hours'::interval",
-            ARITHMETIC,
-        ),
-        ("SELECT -('1 day'::interval)", ARITHMETIC),
-        (
-            "SELECT '2 days'::interval * 2, '2 days'::interval / 2",
-            ARITHMETIC,
-        ),
-        (
-            "SELECT '1 day'::interval * 0.5, '1 mon'::interval * 0.5",
-            ARITHMETIC,
-        ),
-        ("SELECT '1 day'::interval / 0", ARITHMETIC),
         (
             "SELECT justify_days('35 days'::interval), justify_hours('27 \
              hours'::interval), justify_interval('1 mon 33 days 27 hours'::interval)",
             FUNCTIONS,
-        ),
-        ("SELECT '1 day'::interval + '2020-01-01'::date", ARITHMETIC),
-        (
-            "SELECT '1 day'::interval + '2020-01-01'::timestamp",
-            ARITHMETIC,
-        ),
-        (
-            "SELECT '1 day'::interval + '2020-01-01 00:00:00+00'::timestamptz",
-            ARITHMETIC,
         ),
         (
             "SELECT age('2021-03-01'::timestamp, '2021-01-01'::timestamp)",

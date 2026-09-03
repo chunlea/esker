@@ -1,0 +1,87 @@
+# Arithmetic over the date and time types, as a real PostgreSQL 19beta1 answers.
+#
+# The table is not a promotion and almost none of it is derivable from the rest:
+#
+#   * **`date - date` is an `integer`** — a count of days — where `timestamp - timestamp` and
+#     `time - time` are `interval`s;
+#   * `date + integer` is a `date` and `date + interval` is a **`timestamp`**;
+#   * `time * 2` is an **`interval`**, because twenty-four hours is not a time of day;
+#   * `date + numeric` has no operator at all: `42883`, not a refusal.
+#
+# And four rules about the values:
+#
+#   * **an interval's three fields never carry into each other.** `'25 hours' + '1 day'` is
+#     `1 day 25:00:00` and `'1.5 days' * 2` is `2 days 24:00:00`. Carrying would change the
+#     meaning: a day is not always 24 hours and a month is not a fixed number of days;
+#   * **a month lands on the last day it can, and forgets where it came from.**
+#     `'2020-01-31' + '1 month'` is `2020-02-29`, and another month gives `2020-03-29` — so month
+#     addition is not associative;
+#   * **a time wraps and drops the days.** `'23:00' + '2 hours'` is `01:00` and `'12:00' + '1 day'`
+#     is `12:00`;
+#   * **`-time` is an `interval`** while `-date` and `-timestamp` are `42883` with PostgreSQL's
+#     *unary* wording — one operand, so its `DETAIL` and `HINT` are singular where the binary
+#     form's are plural. An instant has no negative and a duration does.
+#
+# The two failures are their own sentences rather than overflows: `'infinity'::date - <date>` is
+# `22008 cannot subtract infinite dates`, and a shift past the type's ends is `22008 date out of
+# range`. An infinite date **absorbs** a shift: `'infinity'::date + 1` is `infinity`.
+SELECT '2020-03-01'::date - '2020-01-01'::date	integer	60
+SELECT '2020-01-01'::date - '2020-03-01'::date	integer	-60
+SELECT '2020-01-01'::date + 7	date	2020-01-08
+SELECT 7 + '2020-01-01'::date	date	2020-01-08
+SELECT '2020-01-01'::date - 7	date	2019-12-25
+SELECT '2020-01-01'::date + 1.5	!42883 operator does not exist: date + numeric DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT '2020-01-01'::date + '1 day'::interval	timestamp without time zone	2020-01-02 00:00:00
+SELECT '2020-01-01'::date - '1 day'::interval	timestamp without time zone	2019-12-31 00:00:00
+SELECT '2020-01-01'::date + '12:00:00'::time	timestamp without time zone	2020-01-01 12:00:00
+SELECT '2020-01-01'::date - '2020-01-01'::date	integer	0
+SELECT '12:00:00'::time - '10:30:00'::time	interval	01:30:00
+SELECT '10:30:00'::time - '12:00:00'::time	interval	-01:30:00
+SELECT '12:00:00'::time + '01:30:00'::interval	time without time zone	13:30:00
+SELECT '12:00:00'::time - '01:30:00'::interval	time without time zone	10:30:00
+SELECT '12:00:00'::time * 2	interval	24:00:00
+SELECT '12:00:00'::time / 2	interval	06:00:00
+SELECT '2020-01-01 10:00:00'::timestamp - '2020-01-01 08:30:00'::timestamp	interval	01:30:00
+SELECT '2020-01-01 10:00:00'::timestamp + '1 day'::interval	timestamp without time zone	2020-01-02 10:00:00
+SELECT '2020-01-01 10:00:00'::timestamp - '1 day'::interval	timestamp without time zone	2019-12-31 10:00:00
+SELECT '2020-01-01 10:00:00'::timestamptz - '2020-01-01 08:30:00'::timestamptz	interval	01:30:00
+SELECT '2020-01-01 10:00:00'::timestamptz + '1 day'::interval	timestamp with time zone	2020-01-02 10:00:00+00
+SELECT '1 day'::interval + '2 hours'::interval	interval	1 day 02:00:00
+SELECT '1 day'::interval - '2 hours'::interval	interval	1 day -02:00:00
+SELECT '1 day'::interval * 2	interval	2 days
+SELECT '1 day'::interval * 0.5	interval	12:00:00
+SELECT '1 day'::interval / 2	interval	12:00:00
+SELECT '1 day'::interval / 0	!22012 division by zero
+SELECT '1 day'::interval / 0.5	interval	2 days
+SELECT 2 * '1 day'::interval	interval	2 days
+SELECT -('1 day'::interval)	interval	-1 days
+SELECT '1 day'::interval + '2020-01-01'::date	timestamp without time zone	2020-01-02 00:00:00
+SELECT '1 day'::interval + '12:00:00'::time	time without time zone	12:00:00
+SELECT '2020-01-01'::date + NULL::interval	timestamp without time zone	\N
+SELECT '2020-01-01'::date - NULL::int4	date	\N
+SELECT 'infinity'::date - '2020-01-01'::date	!22008 cannot subtract infinite dates
+SELECT '2020-01-01'::date + 2147483647	!22008 date out of range
+SELECT '1 day'::interval * 'Infinity'::float8	interval	infinity
+SELECT '1 day'::interval + '1 month'::interval	interval	1 mon 1 day
+SELECT '1 month'::interval * 2	interval	2 mons
+SELECT '2020-01-31'::date + '1 month'::interval	timestamp without time zone	2020-02-29 00:00:00
+SELECT '23:00:00'::time + '2 hours'::interval	time without time zone	01:00:00
+SELECT '01:00:00'::time - '2 hours'::interval	time without time zone	23:00:00
+SELECT -('12:00:00'::time)	interval	-12:00:00
+SELECT -('2020-01-01'::date)	!42883 operator does not exist: - date DETAIL: No operator of that name accepts the given argument type. HINT: You might need to add an explicit type cast.
+SELECT -('2020-01-01 00:00:00'::timestamp)	!42883 operator does not exist: - timestamp without time zone DETAIL: No operator of that name accepts the given argument type. HINT: You might need to add an explicit type cast.
+SELECT '2020-01-31'::date + '1 month'::interval + '1 month'::interval	timestamp without time zone	2020-03-29 00:00:00
+SELECT '1 day'::interval * 2.5	interval	2 days 12:00:00
+SELECT '1.5 days'::interval * 2	interval	2 days 24:00:00
+SELECT '25 hours'::interval + '1 day'::interval	interval	1 day 25:00:00
+SELECT '1 day'::interval = '24 hours'::interval	boolean	t
+SELECT '2020-01-01'::date + '1 day 12:00:00'::interval	timestamp without time zone	2020-01-02 12:00:00
+SELECT '12:00:00'::time + '1 day'::interval	time without time zone	12:00:00
+SELECT '2020-01-01'::date - '12:00:00'::time	timestamp without time zone	2019-12-31 12:00:00
+SELECT '2020-01-01 10:00:00'::timestamp - '2020-01-01'::date	interval	10:00:00
+SELECT '1 day'::interval / 'Infinity'::float8	interval	00:00:00
+SELECT '1 day'::interval * 0	interval	00:00:00
+SELECT 'infinity'::date + 1	date	infinity
+SELECT '-infinity'::date - '-infinity'::date	!22008 cannot subtract infinite dates
+SELECT '2020-01-01'::date + 2147483646	!22008 date out of range
+SELECT '5874897-12-31'::date + 1	!22008 date out of range

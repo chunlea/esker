@@ -410,7 +410,7 @@ fn push_filter(
         Expr::ToText { .. } => return Err(refused("a cast to text")),
         // Neither is arithmetic: the fragment language compares and combines, and every operator
         // brings an overflow rule the scan would have to reproduce exactly to be worth pushing.
-        Expr::Arithmetic { .. } => return Err(refused("arithmetic")),
+        Expr::Arithmetic { .. } | Expr::Negate(_) => return Err(refused("arithmetic")),
         // Not expressible in the fragment language; the filter stays on the row side.
         Expr::Scalar { .. } => return Err(refused("a scalar function")),
         // The fragment language has no conditional, and a `CASE` is the one expression whose
@@ -684,6 +684,7 @@ fn collect_columns(expr: &Expr, into: &mut Vec<usize>) {
             collect_columns(right, into);
         }
         Expr::Not(inner)
+        | Expr::Negate(inner)
         | Expr::ToText { operand: inner, .. }
         | Expr::Scalar { operand: inner, .. } => collect_columns(inner, into),
         Expr::IsNull { operand, .. } => collect_columns(operand, into),

@@ -1429,16 +1429,7 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                     ty: None,
                 })
             }
-            // **`0 - x`, not a negated value.** It is the same answer for every input and it is
-            // the same *error* too: `-((-2147483648)::int4)` is `22003 integer out of range`,
-            // which a negation written as its own operation has to remember to raise and a
-            // subtraction gets from the width it is done at. Measured.
-            other => Ok(plan::Expr::Arithmetic {
-                op: plan::ArithOp::Subtract,
-                left: Box::new(plan::Expr::Literal(plan::Literal::Integer(0))),
-                right: Box::new(lower_expr(other)?),
-                ty: None,
-            }),
+            other => Ok(plan::Expr::Negate(Box::new(lower_expr(other)?))),
         },
         Expr::UnaryOp {
             op: UnaryOperator::Plus,

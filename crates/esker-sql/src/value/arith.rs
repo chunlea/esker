@@ -37,19 +37,15 @@ pub fn result_type(op: ArithOp, left: ColumnType, right: ColumnType) -> Result<C
             right: right.name(),
         })
     };
+    // **The date and time types have their own table** and it is not a promotion: `date - date`
+    // is an `integer` where `timestamp - timestamp` is an `interval`, and `time * 2` is an
+    // `interval` and not a time (`super::temporal`). A pair it does not have really has no
+    // operator on a real server either — `date + numeric` is `42883` there — so the fall-through
+    // below is the right answer and not a missing feature.
+    if temporal_type(left) || temporal_type(right) {
+        return super::temporal::result_type(op, left, right).map_or_else(undefined, Ok);
+    }
     if !numeric_type(left) || !numeric_type(right) {
-        // **A `42883` says the operator does not exist and a `0A000` says this node has not built
-        // it**, and the difference is which of the two is true. PostgreSQL has `date - date`,
-        // `date + interval` and `time * 2`; it has no `boolean + integer`. Claiming the first
-        // kind does not exist would be a wrong answer about a real server.
-        if temporal_type(left) || temporal_type(right) {
-            return Err(SqlError::unsupported(format!(
-                "the operator {} over {} and {}",
-                op.symbol(),
-                left.name(),
-                right.name()
-            )));
-        }
         return undefined();
     }
     // `%` exists for the integers and for `numeric`, and **not for the floats** — `7::float8 %
@@ -123,6 +119,18 @@ pub fn apply(op: ArithOp, ty: ColumnType, left: &Datum, right: &Datum) -> Result
     // result type's own input function, so `'a' + 1` is that function's `22P02` and not a
     // `42883` about an operator on `text`.
     let (left, right) = (&coerce(left, ty)?, &coerce(right, ty)?);
+    if temporal_type(ty)
+        || matches!(
+            left,
+            Datum::Date(_) | Datum::Time(_) | Datum::Interval { .. }
+        )
+        || matches!(
+            right,
+            Datum::Date(_) | Datum::Time(_) | Datum::Interval { .. }
+        )
+    {
+        return super::temporal::apply(op, ty, left, right);
+    }
     match ty {
         ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8 => {
             integer(op, as_i64(left)?, as_i64(right)?, ty)
@@ -411,6 +419,55 @@ fn as_f64(value: &Datum) -> Result<f64> {
             "{other:?} reached float arithmetic"
         ))),
     }
+}
+
+/// The type `-operand` has, or the `42883` PostgreSQL raises for one with no negation.
+///
+/// Every number negates to itself. **A `time` negates to an `interval`** and a `date` and a
+/// `timestamp` do not negate at all: an instant has no negative and a duration does. Measured.
+pub fn negate_type(operand: ColumnType) -> Result<ColumnType> {
+    if numeric_type(operand) {
+        return Ok(operand);
+    }
+    super::temporal::negate_type(operand).ok_or(SqlError::UndefinedUnaryOperator {
+        op: "-",
+        operand: operand.name(),
+    })
+}
+
+/// `-value`, at the width it is declared to: `-((-2147483648)::int4)` is `22003`, because the
+/// smallest `int4` has no positive at its own width.
+pub fn negate(value: &Datum) -> Result<Datum> {
+    Ok(match value {
+        Datum::Null => Datum::Null,
+        Datum::Int2(value) => Datum::Int2(
+            value
+                .checked_neg()
+                .ok_or(SqlError::IntegerLiteralOutOfRange("smallint"))?,
+        ),
+        Datum::Int4(value) => Datum::Int4(
+            value
+                .checked_neg()
+                .ok_or(SqlError::IntegerLiteralOutOfRange("integer"))?,
+        ),
+        Datum::Int8(value) => Datum::Int8(
+            value
+                .checked_neg()
+                .ok_or(SqlError::IntegerLiteralOutOfRange("bigint"))?,
+        ),
+        Datum::Double(value) => Datum::Double(-value),
+        Datum::Real(value) => Datum::Real(-value),
+        Datum::Numeric(Numeric::Finite(value)) => Datum::Numeric(Numeric::Finite(Decimal {
+            negative: !value.negative && !value.is_zero(),
+            digits: value.digits.clone(),
+            scale: value.scale,
+        })),
+        Datum::Numeric(Numeric::PosInfinity) => Datum::Numeric(Numeric::NegInfinity),
+        Datum::Numeric(Numeric::NegInfinity) => Datum::Numeric(Numeric::PosInfinity),
+        Datum::Numeric(Numeric::NaN) => Datum::Numeric(Numeric::NaN),
+        // A `time` and an `interval`, whose negations are both intervals.
+        other => super::temporal::negate(other)?,
+    })
 }
 
 /// `abs(x)`: the same type in and out, and `22003` where the positive does not exist.

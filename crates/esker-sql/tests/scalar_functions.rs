@@ -36,14 +36,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "A cast from `timestamptz` to `date`, which this node does not have. `CURRENT_DATE` itself answers and is that instant's date — the line beside it (`CURRENT_DATE` is never NULL) and the type assertion in this file cover what this one would.",
         ),
         (
-            "SELECT now() - CURRENT_TIMESTAMP",
-            "Temporal arithmetic — `timestamptz - timestamptz` is an `interval` — which is the commit after this one. The refusal names the operator **and its operand types** rather than claiming `-` does not exist, because PostgreSQL has this one. What the line pins is that the two functions are the *same instant*, which the equality above already shows.",
-        ),
-        (
-            "SELECT CURRENT_TIMESTAMP - now()",
-            "Temporal arithmetic — `timestamptz - timestamptz` is an `interval` — which is the commit after this one. The refusal names the operator **and its operand types** rather than claiming `-` does not exist, because PostgreSQL has this one. What the line pins is that the two functions are the *same instant*, which the equality above already shows.",
-        ),
-        (
             "SELECT CURRENT_TIMESTAMP(0) = date_trunc('second', CURRENT_TIMESTAMP)",
             "`CURRENT_TIME`, `LOCALTIMESTAMP`, `CURRENT_TIMESTAMP(p)` and `date_trunc` are four more members of this family and none is called by statement 738. They are in the corpus so that the day one is needed its answer is already measured; each is refused by name today.",
         ),

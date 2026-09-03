@@ -810,6 +810,7 @@ fn render(expr: &Expr, columns: &[String]) -> String {
     match expr {
         // Its own parentheses, as the comparison operators print theirs — `EXPLAIN` shows the
         // grouping the parser chose rather than the one the user typed.
+        Expr::Negate(operand) => format!("(- {})", render(operand, columns)),
         Expr::Arithmetic {
             op, left, right, ..
         } => format!(

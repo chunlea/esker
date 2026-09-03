@@ -486,6 +486,32 @@ pub enum SqlError {
     #[error("invalid destination encoding name \"{0}\"")]
     InvalidDestinationEncoding(String),
 
+    /// `'infinity'::date - '2020-01-01'::date`: `22008` with a sentence of its own.
+    ///
+    /// **Not an overflow.** The difference of two dates is a count of days and an infinite date is
+    /// not a day, so PostgreSQL says what is wrong rather than reporting a range.
+    #[error("cannot subtract infinite dates")]
+    InfiniteDateSubtraction,
+
+    /// A date shifted past the type's ends: `22008 date out of range`.
+    ///
+    /// The same three words `date_in` uses for a literal past the ends, because a client cannot
+    /// tell which of the two produced the value.
+    #[error("date out of range")]
+    DateOutOfRange,
+
+    /// `-` applied to a type that has no negation: `42883`, with PostgreSQL's **unary** wording.
+    ///
+    /// One operand, so the message and its `DETAIL` are singular where
+    /// [`SqlError::UndefinedOperator`]'s are plural — `operator does not exist: - date`. Measured.
+    #[error("operator does not exist: {op} {operand}")]
+    UndefinedUnaryOperator {
+        /// The operator symbol.
+        op: &'static str,
+        /// The operand's type.
+        operand: &'static str,
+    },
+
     /// A division or a modulo by zero: `22012`, for the integers **and** the floats.
     ///
     /// A float divided by zero raises here as it does on a real server; it does not yield
@@ -1238,7 +1264,9 @@ impl SqlError {
             SqlError::CannotCast { .. } => sqlstate::CANNOT_COERCE,
             SqlError::DatetimeFieldOutOfRange { .. }
             | SqlError::IntervalOutOfRange
-            | SqlError::DatetimeOutOfRange { .. } => sqlstate::DATETIME_FIELD_OVERFLOW,
+            | SqlError::DatetimeOutOfRange { .. }
+            | SqlError::InfiniteDateSubtraction
+            | SqlError::DateOutOfRange => sqlstate::DATETIME_FIELD_OVERFLOW,
             SqlError::IntervalFieldOutOfRange(_) => sqlstate::INTERVAL_FIELD_OVERFLOW,
             SqlError::TimeZoneDisplacementOutOfRange(_) => {
                 sqlstate::INVALID_TIME_ZONE_DISPLACEMENT_VALUE
@@ -1252,7 +1280,8 @@ impl SqlError {
             }
             SqlError::UndefinedParameter(_) => sqlstate::UNDEFINED_PARAMETER,
             SqlError::NotImmutableInIndex => sqlstate::INVALID_OBJECT_DEFINITION,
-            SqlError::UndefinedOperator { .. }
+            SqlError::UndefinedUnaryOperator { .. }
+            | SqlError::UndefinedOperator { .. }
             | SqlError::UndefinedAggregate { .. }
             | SqlError::UndefinedFunction(_)
             | SqlError::UndefinedQualifiedFunction(_)
@@ -1372,6 +1401,10 @@ impl SqlError {
             SqlError::UndefinedOperator { .. } => {
                 Some("No operator of that name accepts the given argument types.".to_owned())
             }
+            // **Singular**, where the binary form is plural: one operand, one type. Measured.
+            SqlError::UndefinedUnaryOperator { .. } => {
+                Some("No operator of that name accepts the given argument type.".to_owned())
+            }
             SqlError::UndefinedAggregate { .. } | SqlError::UndefinedFunctionTypes(_) => {
                 Some("No function of that name accepts the given argument types.".to_owned())
             }
@@ -1469,6 +1502,10 @@ impl SqlError {
             | SqlError::UndefinedAggregate { .. }
             | SqlError::UndefinedFunctionTypes(_) => {
                 Some("You might need to add explicit type casts.".to_owned())
+            }
+            // **One cast, singular**, for the one operand a unary operator has. Measured.
+            SqlError::UndefinedUnaryOperator { .. } => {
+                Some("You might need to add an explicit type cast.".to_owned())
             }
             // PostgreSQL lists the values an enum parameter takes, and the list is the parameter's
             // rather than the error's — looked up so the two can never say different things.
