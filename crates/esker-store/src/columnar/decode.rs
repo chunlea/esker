@@ -194,6 +194,7 @@ fn columnar_type(ty: StoredType) -> Option<esker_columnar::ColumnType> {
         StoredType::Oid => esker_columnar::ColumnType::Oid,
         StoredType::Int8Array
         | StoredType::Int4Array
+        | StoredType::Int2Array
         | StoredType::NumericArray
         | StoredType::TextArray => return None,
     })

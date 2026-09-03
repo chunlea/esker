@@ -195,6 +195,11 @@ pub enum ColumnType {
     Int8Array,
     /// `integer[]`.
     Int4Array,
+    /// `smallint[]`. **The catalog's own array type**: `pg_constraint.conkey` and `confkey` are
+    /// `smallint[]` on a real server, and an element of one is compared with `pg_attribute.attnum`
+    /// in every schema dump `ActiveRecord` writes. It is not `pg_index.indkey`, which looks the
+    /// same and is an `int2vector` — a different type, printed `1 2` and subscripted from zero.
+    Int2Array,
     /// `numeric[]`.
     NumericArray,
     /// `text[]`.
@@ -209,7 +214,7 @@ pub enum ColumnType {
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 24] = [
+    pub const ALL: [ColumnType; 25] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -232,6 +237,7 @@ impl ColumnType {
         ColumnType::Oid,
         ColumnType::Int8Array,
         ColumnType::Int4Array,
+        ColumnType::Int2Array,
         ColumnType::NumericArray,
         ColumnType::TextArray,
     ];

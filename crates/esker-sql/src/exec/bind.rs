@@ -796,6 +796,7 @@ fn placeholder(ty: ColumnType) -> Datum {
         // arrives, and one that answers `column_type` correctly while it stands in.
         ColumnType::Int8Array
         | ColumnType::Int4Array
+        | ColumnType::Int2Array
         | ColumnType::NumericArray
         | ColumnType::TextArray => Datum::Array(esker_keys::array::ArrayValue::empty(
             esker_keys::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text),

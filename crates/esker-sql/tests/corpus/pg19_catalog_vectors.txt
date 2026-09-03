@@ -1,0 +1,42 @@
+# The catalog's two vector shapes — as PostgreSQL 19beta1 answers them.
+#
+# `pg_index.indkey` and `pg_constraint.conkey` look alike and are **two different types**, which is
+# the whole of this file. Both were `text` here, and the last commit's `42883` rule made that visible
+# the hard way: `a.attnum = elem` over a derived table's `conkey[idx]` went from answering to a
+# refusal, because an `int2` was being compared with a `text`.
+#
+# Captured in one session inside `BEGIN … ROLLBACK`.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`conkey` is a `smallint[]` and `indkey` is an `int2vector`.** They print differently —
+#     `{1,2}` against `1 2` — and they are subscripted differently: `conkey[1]` is the first column
+#     and `indkey[0]` is, because an `int2vector` starts at zero. `generate_subscripts` says the
+#     same thing twice: `1, 2` for one and `0, 1` for the other.
+#   * **Both elements are `smallint`.** `pg_typeof(conkey[1])` and `pg_typeof(indkey[0])` agree,
+#     which is what lets either be compared with `pg_attribute.attnum` — and that comparison is what
+#     `ActiveRecord`'s schema dump is made of.
+#   * `indoption` is an `int2vector` too, and it is **not** a copy of `indkey`: it is one flag word
+#     per key part, `0` for an ascending column and `3` for `DESC NULLS FIRST`.
+#   * **`confkey` is NULL on a constraint that is not a foreign key**, not an empty array.
+#   * The **last line is the shape this unit exists for**: the derived table's `elem` joined to
+#     `attnum`. It is what `ActiveRecord`'s schema dump writes, and the comparison behind it is
+#     `smallint = smallint` on a real server.
+CREATE TABLE vt (a int8, b int8, c text, PRIMARY KEY (a, b))		-
+CREATE UNIQUE INDEX vt_ab ON vt (a, b DESC)		-
+SELECT 'r', pg_typeof(indkey), pg_typeof(indoption) FROM pg_index WHERE indexrelid = 'vt_ab'::regclass	text,regtype,regtype	r|int2vector|int2vector
+SELECT 'r', indkey, indoption FROM pg_index WHERE indexrelid = 'vt_ab'::regclass	text,int2vector,int2vector	r|1 2|0 3
+SELECT 'r', indkey[0], indkey[1], array_length(indkey, 1) FROM pg_index WHERE indexrelid = 'vt_ab'::regclass	text,smallint,smallint,integer	r|1|2|2
+SELECT 'r', pg_typeof(conkey), pg_typeof(confkey) FROM pg_constraint WHERE conname = 'vt_pkey'	text,regtype,regtype	r|smallint[]|smallint[]
+SELECT 'r', conkey, conkey[1], conkey[2], array_length(conkey, 1) FROM pg_constraint WHERE conname = 'vt_pkey'	text,smallint[],smallint,smallint,integer	r|{1,2}|1|2|2
+SELECT 'r', conkey::text, confkey IS NULL FROM pg_constraint WHERE conname = 'vt_pkey'	text,text,boolean	r|{1,2}|t
+SELECT 'r', a.attname FROM pg_attribute a, pg_constraint c WHERE c.conname = 'vt_pkey' AND a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) ORDER BY a.attname	text,name	r|a ; r|b
+SELECT 'r', a.attname FROM pg_attribute a, pg_constraint c WHERE c.conname = 'vt_pkey' AND a.attrelid = c.conrelid AND a.attnum = c.conkey[1]	text,name	r|a
+SELECT 'r', pg_typeof(c.conkey[1]), pg_typeof(i.indkey[0]) FROM pg_constraint c, pg_index i WHERE c.conname = 'vt_pkey' AND i.indexrelid = 'vt_ab'::regclass	text,regtype,regtype	r|smallint|smallint
+SELECT 'r', generate_subscripts(conkey, 1) FROM pg_constraint WHERE conname = 'vt_pkey'	text,integer	r|1 ; r|2
+SELECT 'r', generate_subscripts(indkey, 1) FROM pg_index WHERE indexrelid = 'vt_ab'::regclass	text,integer	r|0 ; r|1
+SELECT 'r', a.attname FROM (SELECT idx, c.conkey[idx] AS elem FROM pg_constraint c, generate_subscripts(c.conkey, 1) AS idx WHERE c.conname = 'vt_pkey') k JOIN pg_attribute a ON a.attnum = k.elem AND a.attrelid = 'vt'::regclass ORDER BY idx	text,name	r|a ; r|b

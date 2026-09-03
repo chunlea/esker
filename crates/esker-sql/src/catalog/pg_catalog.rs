@@ -1353,6 +1353,7 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         // client matching on it expects.
         ColumnType::Int8Array => "_int8",
         ColumnType::Int4Array => "_int4",
+        ColumnType::Int2Array => "_int2",
         ColumnType::NumericArray => "_numeric",
         ColumnType::TextArray => "_text",
         ColumnType::Int8 => "int8",
@@ -1406,6 +1407,7 @@ fn typcategory(ty: ColumnType) -> &'static str {
         // element type's.
         ColumnType::Int8Array
         | ColumnType::Int4Array
+        | ColumnType::Int2Array
         | ColumnType::NumericArray
         | ColumnType::TextArray => "A",
     }
@@ -1425,6 +1427,7 @@ fn typinput(ty: ColumnType) -> &'static str {
         // `quote` and fail client-side with `can't quote Array`.
         ColumnType::Int8Array
         | ColumnType::Int4Array
+        | ColumnType::Int2Array
         | ColumnType::NumericArray
         | ColumnType::TextArray => "array_in",
         ColumnType::Int8 => "int8in",

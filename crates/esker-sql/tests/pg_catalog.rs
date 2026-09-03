@@ -264,6 +264,19 @@ fn activerecord_s_four_type_map_queries_answer() {
             // `_int2` is 1005 over `int2` 21, `_int4` 1007 over 23, `_text` 1009 over 25 — the
             // numbers are not derivable from the element's and each is a measurement
             // (`crate::value::array_oid`). `rngsubtype` is NULL because no array is a range.
+            // `_int2` arrived with the unit that made `pg_constraint.conkey` a real `smallint[]`:
+            // the array type is derived from the element, so a new element type brings its array
+            // with it and this row appeared without anyone writing it.
+            vec![
+                "1005".to_owned(),
+                "_int2".to_owned(),
+                "21".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
             vec![
                 "1007".to_owned(),
                 "_int4".to_owned(),

@@ -1279,6 +1279,7 @@ impl Literal {
                 // a cast; writing `{1}` for `1` here would be inventing the user's intent.
                 | ColumnType::Int8Array
                 | ColumnType::Int4Array
+        | ColumnType::Int2Array
                 | ColumnType::NumericArray
                 | ColumnType::TextArray => mismatch(),
             },
@@ -1343,6 +1344,7 @@ impl Literal {
                 // a cast; writing `{1}` for `1` here would be inventing the user's intent.
                 | ColumnType::Int8Array
                 | ColumnType::Int4Array
+        | ColumnType::Int2Array
                 | ColumnType::NumericArray
                 | ColumnType::TextArray => mismatch(),
             },
@@ -1381,6 +1383,7 @@ impl Literal {
                 // a cast; writing `{1}` for `1` here would be inventing the user's intent.
                 | ColumnType::Int8Array
                 | ColumnType::Int4Array
+        | ColumnType::Int2Array
                 | ColumnType::NumericArray
                 | ColumnType::TextArray => mismatch(),
             },

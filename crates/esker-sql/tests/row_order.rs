@@ -108,9 +108,10 @@ fn column_type(name: &str) -> ColumnType {
         "timestamptz" => ColumnType::TimestampTz,
         "float8" => ColumnType::Double,
         "real" => ColumnType::Real,
-        // The four array types, named the way a `CREATE TABLE` declares them.
+        // The five array types, named the way a `CREATE TABLE` declares them.
         "int8[]" => ColumnType::Int8Array,
         "int4[]" => ColumnType::Int4Array,
+        "int2[]" => ColumnType::Int2Array,
         "numeric[]" => ColumnType::NumericArray,
         "text[]" => ColumnType::TextArray,
         other => panic!("the fixture names a type this crate does not have: {other}"),

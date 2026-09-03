@@ -96,6 +96,28 @@ pub(super) fn attnum_vector(table: &TableDef, ordinals: &[usize]) -> String {
     format!("{{{}}}", numbers.join(","))
 }
 
+/// One attnum vector as the `smallint[]` it is.
+///
+/// The text form is what [`attnum_vector`] built and what the record has always held — `{1,2}` —
+/// so this reads it back rather than changing the shape everything else expects. A number that
+/// will not parse is dropped rather than raising: this is a catalog view describing a constraint
+/// that already exists, and a row it cannot describe is worse than one element short.
+fn attnum_array(text: &str) -> Datum {
+    let values: Vec<Option<Datum>> = text
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .split(',')
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.trim().parse::<i16>().ok())
+        .map(|attnum| Some(Datum::Int2(attnum)))
+        .collect();
+    Datum::Array(esker_keys::array::ArrayValue::one_dimensional(
+        ColumnType::Int2,
+        1,
+        values,
+    ))
+}
+
 /// Where an `EXCLUDE` constraint's synthetic oid starts: the fifth region.
 ///
 /// An exclusion constraint is not a relation on this node — its `USING gist` index is recorded and
@@ -219,11 +241,11 @@ pub fn rows_from(relations: &Relations) -> Vec<Vec<Datum>> {
                         .to_owned(),
                 ),
                 match &constraint.conkey {
-                    Some(conkey) => Datum::Text(conkey.clone()),
+                    Some(conkey) => attnum_array(conkey),
                     None => Datum::Null,
                 },
                 match &constraint.foreign {
-                    Some(foreign) => Datum::Text(foreign.confkey.clone()),
+                    Some(foreign) => attnum_array(&foreign.confkey),
                     None => Datum::Null,
                 },
             ]);
@@ -650,12 +672,16 @@ pub const CONSTRAINT_COLUMNS: &[(&str, ColumnType)] = &[
     ("confrelid", ColumnType::Int8),
     ("confupdtype", ColumnType::Text),
     ("confdeltype", ColumnType::Text),
-    // `int2vector`s on a real server, and text here for the reason `pg_index.indkey` is text: the
-    // characters are the same and so is what they mean. **This is not the column that unblocks
-    // `ActiveRecord`'s `foreign_keys()`** — that one subscripts them (`c.conkey[idx]`) under
-    // `generate_subscripts` and `array_agg`, which needs the array type and its functions. They
-    // are here because a `contype = 'f'` row without its key columns is an incomplete record, and
-    // `SELECT conkey` is answerable where `conkey[1]` is still `0A000`.
-    ("conkey", ColumnType::Text),
-    ("confkey", ColumnType::Text),
+    // **`smallint[]`, which is what they are on a real server** — measured:
+    // `pg_typeof(conkey)` is `smallint[]` and `pg_typeof(conkey[1])` is `smallint`. They were
+    // `text` holding the same characters, which read back the same for `SELECT conkey` and was
+    // wrong the moment one was *compared*: `a.attnum = c.conkey[1]` is `smallint = smallint`
+    // there and was `smallint = text` here, which either found nothing or, after the `42883`
+    // rule, refused the statement.
+    //
+    // **`pg_index.indkey` is not this type and stays text**: it is an `int2vector`, which prints
+    // `1 2` rather than `{1,2}` and is subscripted from **zero**. Two shapes that look alike, and
+    // `tests/corpus/pg19_catalog_vectors.txt` is the file that keeps them apart.
+    ("conkey", ColumnType::Int2Array),
+    ("confkey", ColumnType::Int2Array),
 ];

@@ -1953,6 +1953,7 @@ fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // operators — so no two of these share a family and none shares one with a scalar.
             ColumnType::Int8Array => 20,
             ColumnType::Int4Array => 21,
+            ColumnType::Int2Array => 25,
             ColumnType::NumericArray => 22,
             ColumnType::TextArray => 23,
             ColumnType::Int8
@@ -2083,7 +2084,7 @@ fn reconcile(op: BinaryOp, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
         // `text = bigint` — because they are two different operators that both do not exist.
         _ if matches!(
             (carried_type(&left), carried_type(&right)),
-            (Some(a), Some(b)) if !same_family(a, b) && !attnum_against_a_vector(a, b)
+            (Some(a), Some(b)) if !same_family(a, b)
         ) =>
         {
             let (Some(a), Some(b)) = (carried_type(&left), carried_type(&right)) else {
@@ -2125,24 +2126,6 @@ fn attnum_vector_element(operand: &Expr, scope: &Scope<'_>) -> Option<ColumnType
         _ => false,
     };
     vector.then_some(ColumnType::Int2)
-}
-
-/// Whether the pair is an **attnum against a catalog vector's element**, which this node must not
-/// refuse.
-///
-/// `pg_index.indkey` and `pg_constraint.conkey` are `int2vector` on a real server and `text` here
-/// (`attnum_vector_element`), so an element of one is an `int2` there and a `text` here. Where the
-/// subscript is visible, `retype_subscript` puts the type back; where it is hidden behind a derived
-/// table — `(SELECT c.conkey[idx] AS elem …) JOIN pg_attribute a ON a.attnum = elem`, which is what
-/// `ActiveRecord`'s schema dump writes — the column arrives typed `text` and nothing can put it
-/// back. Refusing that pair would turn a statement this node answers today into `42883`, so it is
-/// exempted here and named as what it is: a consequence of the vector trade, not a rule about
-/// `int2`. It closes when the catalog vectors are real `int2[]` columns.
-fn attnum_against_a_vector(left: ColumnType, right: ColumnType) -> bool {
-    matches!(
-        (left, right),
-        (ColumnType::Int2, ColumnType::Text) | (ColumnType::Text, ColumnType::Int2)
-    )
 }
 
 /// The type an expression **carries in the node**, without a scope to resolve it against.

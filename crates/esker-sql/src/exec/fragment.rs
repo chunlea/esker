@@ -612,7 +612,9 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         // by the row engine — which is the answer the caller's length check already produces,
         // and a `NotExpressible` rather than a wrong one. The alternative is an array run in
         // `esker-columnar`'s own vocabulary, which is a unit of its own.
-        Row::Int8Array | Row::Int4Array | Row::NumericArray | Row::TextArray => return None,
+        Row::Int8Array | Row::Int4Array | Row::Int2Array | Row::NumericArray | Row::TextArray => {
+            return None;
+        }
     })
 }
 

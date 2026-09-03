@@ -362,6 +362,7 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         }
         ColumnType::Int8Array
         | ColumnType::Int4Array
+        | ColumnType::Int2Array
         | ColumnType::NumericArray
         | ColumnType::TextArray => return decode_array(ty, bytes),
         ColumnType::Int2 => {
@@ -782,6 +783,7 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
     Ok(match ty {
         ColumnType::Int8Array
         | ColumnType::Int4Array
+        | ColumnType::Int2Array
         | ColumnType::NumericArray
         | ColumnType::TextArray => return decode_key_array(ty, bytes),
         ColumnType::Int8 => {
@@ -1508,6 +1510,7 @@ mod tests {
             // the value the encodings have to carry, so the round trip is what proves they do.
             ColumnType::Int8Array
             | ColumnType::Int4Array
+            | ColumnType::Int2Array
             | ColumnType::NumericArray
             | ColumnType::TextArray => {
                 let element = crate::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text);
