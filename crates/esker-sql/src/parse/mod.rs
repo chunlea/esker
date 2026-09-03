@@ -693,6 +693,19 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
     // *keyword* the parser cannot read. Both are source rewrites for the same reason: the statement
     // is valid PostgreSQL and the gap is the parser's, so the honest fix is to make it parse rather
     // than to report a syntax error about correct SQL (contract C1).
+    // **`CREATE SCHEMA s CREATE TABLE t (…)` is one statement PostgreSQL reads and `sqlparser`
+    // 0.62.0 cannot** — it stops at the first nested `CREATE`. Split rather than rewritten,
+    // because there is no single statement to rewrite it into, and each element is qualified with
+    // the schema because that is what the form *means*: measured, `CREATE SCHEMA sy CREATE TABLE
+    // t (…)` puts `t` in `sy` and not in `public`.
+    if let Some(split) = split_create_schema(sql, &scanned) {
+        let mut out = Vec::new();
+        for part in split {
+            out.extend(parse(&part)?);
+        }
+        return Ok(out);
+    }
+
     let rewritten = rewrite_synonym(sql, &scanned)
         .or_else(|| strip_drop_index_concurrently(sql, &scanned))
         .or_else(|| strip_exclude_constraints(sql, &scanned).map(|(kept, _)| kept));
@@ -1281,6 +1294,151 @@ fn rewrite_synonym(sql: &str, scanned: &Scan<'_>) -> Option<String> {
     rewritten.push_str(replacement);
     rewritten.push_str(sql.get(range.end..)?);
     Some(rewritten)
+}
+
+/// `CREATE SCHEMA s CREATE TABLE t (…) CREATE TABLE u (…)` split into the statements it means.
+///
+/// **A statement PostgreSQL reads and `sqlparser` 0.62.0 cannot**: its `CreateSchema` has no
+/// element list, so it stops at the first nested `CREATE` with `Expected: end of statement`. It is
+/// the spelling `schema_test.rb`'s `setup` uses for both of its schemas, so the whole named-schema
+/// half of that file is unreachable without it.
+///
+/// The elements are **qualified with the schema**, which is what the form means — measured:
+/// `CREATE SCHEMA sy CREATE TABLE t (…)` puts `t` in `sy`, not in `public`.
+///
+/// **What this does not reproduce is the atomicity.** A real server makes the whole thing one
+/// statement, so an element that fails leaves no schema behind — measured, `CREATE SCHEMA sx
+/// CREATE TABLE u (b nosuchtype)` leaves `pg_namespace` with no `sx`. Here it is several
+/// statements, and a multi-statement simple Query is already **not** all-or-nothing on this node
+/// (the plan's divergence register). The split inherits that difference rather than adding one.
+///
+/// `None` unless the statement really begins `CREATE SCHEMA` and really has an element, so a plain
+/// `CREATE SCHEMA s` takes the ordinary path.
+fn split_create_schema(sql: &str, scanned: &Scan<'_>) -> Option<Vec<String>> {
+    let [first, second, ..] = scanned.words.as_slice() else {
+        return None;
+    };
+    if !first.eq_ignore_ascii_case("CREATE") || !second.eq_ignore_ascii_case("SCHEMA") {
+        return None;
+    }
+    // **A semicolon ends the schema statement**, and what follows is an ordinary statement in the
+    // current schema: measured, `CREATE SCHEMA se_semi CREATE TABLE t (i int); CREATE TABLE u
+    // (j int)` puts `t` in `se_semi` and `u` in **public**. So only the text up to the first
+    // top-level `;` is the form's; the rest is handed on for the parser to split as it always did.
+    let (sql, tail) = match top_level_semicolon(sql) {
+        Some(at) => (sql.get(..at)?, sql.get(at..)?),
+        None => (sql, ""),
+    };
+    // Every `CREATE` at bracket depth zero after the first: the elements begin there.
+    let starts = top_level_creates(sql);
+    let [_, elements @ ..] = starts.as_slice() else {
+        return None;
+    };
+    let first_element = *elements.first()?;
+    // The schema's name is the last word of the head, which is `CREATE SCHEMA [IF NOT EXISTS] s`.
+    let head = sql.get(..first_element)?.trim_end();
+    let schema = head.split_whitespace().last()?.trim_matches('"');
+    let mut out = vec![head.to_owned()];
+    for (at, start) in elements.iter().enumerate() {
+        let end = elements.get(at + 1).copied().unwrap_or(sql.len());
+        let element = sql.get(*start..end)?.trim().trim_end_matches(';');
+        out.push(qualify_element(element, schema)?);
+    }
+    let rest = tail.trim_start().trim_start_matches(';').trim();
+    if !rest.is_empty() {
+        out.push(rest.to_owned());
+    }
+    Some(out)
+}
+
+/// The byte offset of the first `;` outside brackets, strings and quoted identifiers.
+fn top_level_semicolon(sql: &str) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            quote @ (b'\'' | b'"') => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != quote {
+                    index += 1;
+                }
+            }
+            b';' if depth == 0 => return Some(index),
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+/// The byte offset of every `CREATE` outside brackets, strings and quoted identifiers.
+fn top_level_creates(sql: &str) -> Vec<usize> {
+    let bytes = sql.as_bytes();
+    let mut found = Vec::new();
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            quote @ (b'\'' | b'"') => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != quote {
+                    index += 1;
+                }
+            }
+            _ if depth == 0
+                && sql.is_char_boundary(index)
+                && sql[index..].len() >= 6
+                && sql[index..index + 6].eq_ignore_ascii_case("CREATE")
+                && (index == 0 || !bytes[index - 1].is_ascii_alphanumeric())
+                && sql
+                    .as_bytes()
+                    .get(index + 6)
+                    .is_none_or(|c| !c.is_ascii_alphanumeric() && *c != b'_') =>
+            {
+                found.push(index);
+                index += 5;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    found
+}
+
+/// An element, qualified with the schema it is being created in.
+///
+/// PostgreSQL's form also takes `VIEW`, `SEQUENCE`, `TRIGGER` and `GRANT`. A form this does not
+/// recognise makes the whole split fail, so the statement takes the ordinary path and the parser
+/// refuses it by name — which is right for `VIEW` above all, since this node has none.
+fn qualify_element(element: &str, schema: &str) -> Option<String> {
+    for head in ["CREATE TABLE ", "CREATE SEQUENCE "] {
+        if let Some(tail) = strip_prefix_ignoring_case(element, head) {
+            return Some(format!("{head}{schema}.{}", tail.trim_start()));
+        }
+    }
+    // `CREATE [UNIQUE] INDEX [name] ON <table> …` — the name after `ON` is what moves, because an
+    // index goes wherever its table is: `pg_get_indexdef('se_idx.t_i_idx')` prints `ON se_idx.t`,
+    // measured, and the index's own name is bare.
+    let upper = element.to_ascii_uppercase();
+    if upper.starts_with("CREATE INDEX") || upper.starts_with("CREATE UNIQUE INDEX") {
+        let at = upper.find(" ON ")?;
+        let (head, rest) = element.split_at(at + 4);
+        return Some(format!("{head}{schema}.{}", rest.trim_start()));
+    }
+    None
+}
+
+/// `strip_prefix`, case-insensitively, for the keyword heads above.
+fn strip_prefix_ignoring_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = text.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| text.get(prefix.len()..))
+        .flatten()
 }
 
 /// The deepest nesting anywhere in the statement.

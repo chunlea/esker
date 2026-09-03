@@ -141,7 +141,13 @@ pub enum SqlError {
     StatementTooComplex,
 
     /// No such table.
-    #[error("relation \"{0}\" does not exist")]
+    ///
+    /// **The schema is inside the quotes**: `relation "nosuchschema.t" does not exist`, measured.
+    /// The name arrives in its *stored* form, where a schema is separated by a NUL
+    /// (`crate::catalog::SCHEMA_SEPARATOR`); rendering it is what turns that back into the dot a
+    /// user wrote, and doing it here rather than at thirty raise sites is what keeps the two forms
+    /// from being confused.
+    #[error("relation \"{}\" does not exist", crate::catalog::display_name(.0))]
     UndefinedTable(String),
 
     /// A `PRIMARY KEY` or `UNIQUE` clause naming a column the table does not have. PostgreSQL
@@ -153,7 +159,7 @@ pub enum SqlError {
     /// No such table, said the way `DROP TABLE` says it. PostgreSQL words the same condition
     /// differently depending on the statement — a query says `relation`, a `DROP TABLE` says
     /// `table` — and both were captured rather than assumed.
-    #[error("table \"{0}\" does not exist")]
+    #[error("table \"{}\" does not exist", crate::catalog::display_name(.0))]
     UndefinedTableForDrop(String),
 
     /// `DROP SEQUENCE` naming nothing: `42P01`, and it says **`sequence`** rather than `relation`.
@@ -254,7 +260,7 @@ pub enum SqlError {
     UndefinedColumn(String),
 
     /// `CREATE TABLE` over a live name.
-    #[error("relation \"{0}\" already exists")]
+    #[error("relation \"{}\" already exists", crate::catalog::display_name(.0))]
     DuplicateTable(String),
 
     /// Two columns of one table share a name.

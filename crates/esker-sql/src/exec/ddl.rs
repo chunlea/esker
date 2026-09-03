@@ -62,6 +62,7 @@ pub(super) fn create_table(
         return Err(SqlError::DuplicateTable(create.name.clone()));
     }
 
+    refuse_missing_schema(&*txn, executor, &create.name)?;
     let declared = declared_columns(create)?;
     // **The parents' columns come first**, whatever order the child declared its own in, and a
     // child that redeclares an inherited name merges into it rather than adding a second column.
@@ -1480,6 +1481,19 @@ fn sequences_for(
     Ok(sequences)
 }
 
+/// The schema a relation names must exist: `3F000`, **before** anything else is looked at.
+///
+/// **Its own class, not `42P01`.** `CREATE TABLE nosuchschema.t` fails on the *schema* — measured
+/// — where a relation missing from a schema that is there is `42P01`. A relation in `public`
+/// passes straight through, which is what keeps every existing answer unchanged.
+fn refuse_missing_schema(txn: &dyn Txn, executor: &Executor, stored: &str) -> Result<()> {
+    let (schema, _) = catalog::split_qualified(stored);
+    if catalog::schema_exists(txn, executor.tenant, schema)? {
+        return Ok(());
+    }
+    Err(SqlError::UndefinedSchema(schema.to_owned()))
+}
+
 /// `CREATE SCHEMA [IF NOT EXISTS] name`.
 ///
 /// **A second namespace, and nothing is in it yet.** A relation still lives in `public`, so a
@@ -1528,12 +1542,30 @@ pub(super) fn drop_schema(
             }
             return Err(SqlError::UndefinedSchema(name.clone()));
         }
-        // **Nothing can be in a schema yet**, because a qualified relation name is refused where
-        // it is lowered — so there is no dependent to find and `CASCADE` has nothing to take.
-        // `SqlError::DependentSchema` carries the sentence a real server uses, measured, and the
-        // check that raises it belongs with the unit that puts relations in schemas.
-        // TODO(namespaces): raise `DependentSchema` for a schema that still holds a relation.
-        let _ = drop.cascade;
+        // **A schema with something in it is `2BP01`, naming one dependent** — the way a table
+        // with an inheriting child is — and `CASCADE` takes the relations with it instead.
+        // `IF EXISTS` does not excuse this: the clause covers absence, not dependence. Measured.
+        let held = catalog::relations_in_schema(&*txn, executor.tenant, name)?;
+        if let Some(first) = held.first()
+            && !drop.cascade
+        {
+            let bare = catalog::split_qualified(first).1;
+            return Err(SqlError::DependentSchema {
+                schema: name.clone(),
+                detail: format!("table {name}.{bare} depends on schema {name}"),
+            });
+        }
+        // Only the **tables** are dropped, and each takes its own indexes, sequences and primary
+        // key with it — the same path `DROP TABLE ... CASCADE` walks, so nothing is left behind
+        // and nothing is dropped twice.
+        for stored in &held {
+            if let Some(catalog::Relation::Table { table_id }) =
+                executor.catalog_view(&*txn)?.relation(stored)?
+            {
+                let table = executor.table_by_id(txn, table_id)?;
+                drop_one_table(executor, txn, &table)?;
+            }
+        }
         catalog::drop_schema(txn, executor.tenant, name)?;
     }
     Ok(Outcome::done("DROP SCHEMA"))
@@ -1731,16 +1763,21 @@ pub(super) fn create_index(
 ) -> Result<Outcome> {
     catalog::pg_catalog::refuse_write(&create.table)?;
     let table = executor.require_table(txn, &create.table)?;
+    // **An index lives in its table's schema**, whatever the statement wrote — `CREATE INDEX i ON
+    // test_schema.things (…)` names the index bare and PostgreSQL puts it beside the table. Two
+    // schemas may each hold an index of one name, which is exactly what `schema_test.rb` creates.
+    let schema = catalog::split_qualified(&table.name).0.to_owned();
     // A name the user chose is theirs, and a collision with it is a `42P07`.
     let name = if let Some(given) = &create.name {
-        if existing_relation(executor, txn, given)?.is_some() {
+        let given = catalog::qualify(&schema, catalog::split_qualified(given).1);
+        if existing_relation(executor, txn, &given)?.is_some() {
             if create.if_not_exists {
                 executor.notice(SqlError::AlreadyExistsSkipping(given.clone()));
                 return Ok(Outcome::done("CREATE INDEX"));
             }
-            return Err(SqlError::DuplicateTable(given.clone()));
+            return Err(SqlError::DuplicateTable(given));
         }
-        given.clone()
+        given
     } else {
         // A name *we* derived is disambiguated instead: `CREATE INDEX ON t (a)` twice gives
         // `t_a_idx` and `t_a_idx1`, not an error. Measured against a real server, which produced

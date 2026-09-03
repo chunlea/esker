@@ -180,8 +180,15 @@ fn definition(
         } else {
             ""
         },
-        if qualified { "public." } else { "" },
-        quote_identifier(&table.name),
+        // **The table's own schema**, not a constant: `pg_get_indexdef` prints
+        // `ON se_idx.t` for an index in `se_idx`, measured. The unqualified form
+        // (`pg_get_indexdef(oid, 0, true)`) still prints no schema at all.
+        if qualified {
+            format!("{}.", super::split_qualified(&table.name).0)
+        } else {
+            String::new()
+        },
+        quote_identifier(super::split_qualified(&table.name).1),
         key.method,
         parts.join(", ")
     );

@@ -741,6 +741,20 @@ const PLPGSQL_LANGUAGE_OID: i64 = 14_024;
 
 const PUBLIC_NAMESPACE_OID: i64 = 11;
 
+/// The oid of a schema by name, for `relnamespace` and its kin.
+///
+/// `public`'s is fixed the way a real server fixes it; every other schema's is the id its record
+/// was allocated. A name with no schema — nothing can produce one — falls back to `public`, which
+/// is the answer that cannot mislead.
+fn namespace_oid(schemas: &[(String, u64)], schema: &str) -> i64 {
+    schemas
+        .iter()
+        .find(|(name, _)| name == schema)
+        .map_or(PUBLIC_NAMESPACE_OID, |(_, id)| {
+            super::pg_relations::as_oid(*id)
+        })
+}
+
 /// The extensions this build offers, with the version each installs at.
 ///
 /// A **property of the build, not of the tenant**: it says what a `CREATE EXTENSION` can succeed
@@ -998,13 +1012,17 @@ fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
             Datum::Int8(0),
         ]
     });
+    let schemas = super::schema_names(txn, tenant)?;
     Ok(relations
         .rows()
         .map(|relation| {
             vec![
                 Datum::Int8(relation.oid),
                 Datum::Text(relation.name.clone()),
-                Datum::Int8(PUBLIC_NAMESPACE_OID),
+                // **The schema the relation is in**, not a constant: `relnamespace` is what joins
+                // `pg_class` to `pg_namespace`, and two tables of one name in two schemas are told
+                // apart by exactly this column.
+                Datum::Int8(namespace_oid(&schemas, &relation.schema)),
                 // **Four `relkind`s in one feature, and one is a capital letter.** A partitioned
                 // table is `p` where an ordinary one is `r`, and an index *on* a partitioned table
                 // is `I` where an ordinary one is `i` — so the letter is not a function of the

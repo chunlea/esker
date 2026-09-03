@@ -1372,10 +1372,14 @@ impl Executor {
         if let Some(view) = crate::catalog::pg_catalog::view(name) {
             return Ok(i64::try_from(view.table_def().id).unwrap_or(i64::MAX));
         }
+        // **`::regclass` takes a name as a *string***, so a schema in it is a dot rather than the
+        // separator the parser would have produced — `'se_idx.t_i_idx'::regclass` is the index in
+        // `se_idx`, and looking it up whole would find nothing.
+        let stored = crate::catalog::parse_qualified(name);
         crate::catalog::pg_relations::Relations::read(txn, self.tenant)?
-            .by_name(name)
+            .by_name(&stored)
             .map(|relation| relation.oid)
-            .ok_or_else(|| SqlError::UndefinedTable(name.to_owned()))
+            .ok_or(SqlError::UndefinedTable(stored))
     }
 
     /// The tables a statement is about, in the order their columns appear in a row.

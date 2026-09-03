@@ -5285,6 +5285,15 @@ fn relation_name(name: &ObjectName) -> Result<String> {
             ));
         }
     }
+    // **A user schema is part of the stored name**, separated by a NUL rather than a dot — see
+    // `catalog::SCHEMA_SEPARATOR` for why a dot cannot do it. Each half is folded on its own,
+    // because each was quoted or not on its own: `test_schema."Things"` is `Things` in
+    // `test_schema`.
+    if let [schema, relation] = name.0.as_slice()
+        && let (Some(schema), Some(relation)) = (schema.as_ident(), relation.as_ident())
+    {
+        return Ok(catalog::qualify(&ident(schema), &ident(relation)));
+    }
     object_name(name)
 }
 
