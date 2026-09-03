@@ -1249,6 +1249,17 @@ impl BinaryOp {
 pub enum Literal {
     /// `NULL`, which fits every column and no type.
     Null,
+    /// `NULL::bigint` — a NULL that **knows what it is**.
+    ///
+    /// PostgreSQL types a NULL the moment a cast names one, and everything after resolves against
+    /// that type rather than around it: `WHERE id IN (SELECT NULL::bigint)` matches nothing, where
+    /// the same subquery over an *untyped* NULL is `42883 operator does not exist: bigint = text`
+    /// — an untyped NULL is `text` in this crate and there is no such operator. Dropping the cast,
+    /// which is what `NULL::anything is NULL` did, loses exactly that.
+    ///
+    /// The **value** is still nothing: it assigns as `Datum::Null`, compares as unknown and prints
+    /// as NULL. Only its type survives, which is the whole of what the cast was for.
+    TypedNull(ColumnType),
     /// An integer.
     Integer(i64),
     /// A decimal, kept as written — see the module note on why the digits matter.
@@ -1269,6 +1280,8 @@ impl Literal {
     #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self {
+            // The type the cast named, which is the whole point of carrying it.
+            Literal::TypedNull(ty) => ty.name(),
             // A NULL has no type to name, and never reaches a mismatch anyway; a quoted string
             // is PostgreSQL's `unknown` and takes whatever type the column gives it.
             Literal::Null | Literal::String(_) => "unknown",
@@ -1291,6 +1304,15 @@ impl Literal {
     #[must_use]
     pub fn comparable_with(&self, ty: ColumnType) -> bool {
         match self {
+            // **A typed NULL is comparable where its type is**, and not otherwise: the value being
+            // nothing does not make an operator exist, so `id = NULL::text` over a `bigint` should
+            // be the same `42883` that `id = 'x'::text` is.
+            //
+            // **Not captured.** It follows from PostgreSQL resolving an operator by the *types* of
+            // its arguments, and `tests/corpus/pg19_operator_types.txt` measures that rule for two
+            // columns — but this exact pair has not been put to the oracle, which was unreachable
+            // when this landed. `docs/plans/phase-9-rails.md` owes it a corpus.
+            Literal::TypedNull(null) => crate::exec::query::same_family(*null, ty),
             // `unknown` takes whatever type the other side has -- if it can be read as one.
             Literal::Null | Literal::String(_) => true,
             Literal::Integer(_) => matches!(
@@ -1341,7 +1363,9 @@ impl Literal {
             })
         };
         match self {
-            Literal::Null => Ok(Datum::Null),
+            // A typed NULL assigns like an untyped one: the type was for resolution, and the
+            // value is nothing whatever column it lands in.
+            Literal::Null | Literal::TypedNull(_) => Ok(Datum::Null),
 
             // The `unknown` literal: whatever the column is, read it as that. This is one
             // function, checked against a real server for all six types, rather than six rules.

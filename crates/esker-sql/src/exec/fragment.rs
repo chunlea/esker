@@ -533,7 +533,7 @@ fn literal_value(literal: &crate::plan::Literal) -> Routed<esker_columnar::Value
     // type arrives as `Typed` and is used as it is. Whether the result may be compared with the
     // column beside it is [`comparable`]'s question, not this one's.
     Ok(match literal {
-        Literal::Null => Value::Null,
+        Literal::Null | Literal::TypedNull(_) => Value::Null,
         Literal::Bool(flag) => Value::Bool(*flag),
         Literal::Integer(int) => Value::Int8(*int),
         Literal::String(text) => Value::Text(text.clone()),

@@ -2004,7 +2004,7 @@ fn subquery_operand(
 /// grouping [`crate::plan::Literal::comparable_with`] already uses for a literal against a column,
 /// lifted to two columns. Coarse in the safe direction: it refuses only pairs that no cast in
 /// PostgreSQL relates either, so it cannot turn a comparison a real server runs into an error.
-fn same_family(left: ColumnType, right: ColumnType) -> bool {
+pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
     // **`json` compares with nothing, including another `json`.** Measured:
     // `'{"a":1}'::json = '{"a":1}'::json` is `42883 operator does not exist: json = json` -- the
     // type has no equality operator at all, which is a property of it rather than a gap, and is
@@ -2230,6 +2230,10 @@ fn retype_subscript(expr: &Expr, ty: ColumnType) -> Expr {
 /// `Literal::Decimal` already makes everywhere else in this crate, `SELECT 1.5` included.
 pub(super) fn literal_type(literal: &Literal) -> Option<ColumnType> {
     match literal {
+        // **The one NULL that has a type**, which is why the variant exists: everything that asks
+        // this question — a subquery's column type, an operator's two sides, a `COALESCE`'s
+        // unification — gets the cast's answer instead of `None`.
+        Literal::TypedNull(ty) => Some(*ty),
         Literal::Null | Literal::String(_) => None,
         Literal::Integer(_) => Some(ColumnType::Int8),
         Literal::Decimal(_) => Some(ColumnType::Double),
@@ -2663,6 +2667,13 @@ enum Operand {
 
 fn operand(expr: &Expr, scope: &Scope<'_>) -> Result<Operand> {
     Ok(match expr {
+        // **A typed NULL is not unknown**: the cast gave it a type, so `NULL::text + 1` should
+        // resolve the way `'x'::text + 1` does and not the way a bare `NULL + 1` does. It is the
+        // one NULL that lands in `Fixed`.
+        //
+        // **Not captured** — see `crate::plan::Literal::TypedNull`. The rule follows from operator
+        // resolution being by type, and the corpus that would pin it is owed.
+        Expr::Literal(Literal::TypedNull(ty)) => Operand::Fixed(*ty),
         Expr::Literal(Literal::Null | Literal::String(_)) => Operand::Unknown,
         Expr::Literal(Literal::Integer(value)) => Operand::Integer(*value),
         other => Operand::Fixed(expr_type(other, scope)?),
@@ -2691,7 +2702,12 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
             op, left, right, ..
         } => arithmetic_type(*op, left, right, scope)?,
         Expr::Column { table, name } => scope.resolve_column(table.as_deref(), name)?.1.ty,
-        Expr::Ordinal { ty, .. } | Expr::Outer { ty, .. } => *ty,
+        // **The type the cast named**, which is the whole reason a typed NULL is a variant: this
+        // is what a subquery's column reports, and reporting `text` for `NULL::bigint` made
+        // `IN (SELECT NULL::bigint)` a `42883` where a real server matches nothing.
+        Expr::Ordinal { ty, .. }
+        | Expr::Outer { ty, .. }
+        | Expr::Literal(Literal::TypedNull(ty)) => *ty,
         // A sequence function answers `bigint` on a real server, all four of them.
         Expr::Literal(Literal::Integer(_)) | Expr::Sequence(_) => ColumnType::Int8,
         // Every catalog function returns `text`, which is what makes them one variant.

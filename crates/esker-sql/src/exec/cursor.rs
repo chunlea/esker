@@ -1352,7 +1352,7 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         // **A fresh value per call**, which is what volatile means: two of these in one statement
         // are two different UUIDs, and neither is cached.
         Expr::Uuid(_) => Datum::Uuid(crate::value::random::uuid_v4()?),
-        Expr::Literal(Literal::Null) => Datum::Null,
+        Expr::Literal(Literal::Null | Literal::TypedNull(_)) => Datum::Null,
         Expr::Literal(Literal::Bool(value)) => Datum::Bool(*value),
         Expr::Literal(Literal::Integer(value)) => Datum::Int8(*value),
         Expr::Literal(Literal::Decimal(digits)) => Datum::from_text(ColumnType::Double, digits)?,

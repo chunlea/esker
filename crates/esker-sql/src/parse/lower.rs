@@ -3781,10 +3781,19 @@ fn lower_array_cast(expr: &Expr, data_type: &DataType) -> Result<Option<plan::Ex
 /// So the pair is recognised together. That is not a shortcut around a missing type — it is the
 /// one place where composing the two steps would have to allow a cast PostgreSQL forbids.
 fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
-    // `NULL::anything` is NULL, whatever the type — the cast tells a client what the column's type
-    // is and changes nothing about the value.
+    // **`NULL::bigint` is a NULL that knows it is a `bigint`.** The value is nothing either way;
+    // what the cast carries is the type, and everything downstream resolves against it — a
+    // subquery's column type, an operator's two sides, a `COALESCE`'s unification. Dropping it
+    // made `IN (SELECT NULL::bigint)` the `42883 bigint = text` an *untyped* NULL deserves, which
+    // is a refusal where a real server matches nothing.
+    //
+    // A type this node does not have keeps the old answer: an untyped NULL is still a NULL, and
+    // refusing `NULL::money` would refuse a statement whose value is not in question.
     if matches!(expr, Expr::Value(value) if matches!(value.value, Value::Null)) {
-        return Ok(plan::Expr::Literal(plan::Literal::Null));
+        return Ok(plan::Expr::Literal(match lower_type(data_type) {
+            Ok((ty, _)) => plan::Literal::TypedNull(ty),
+            Err(_) => plan::Literal::Null,
+        }));
     }
     if let Some(array) = lower_array_cast(expr, data_type)? {
         return Ok(array);

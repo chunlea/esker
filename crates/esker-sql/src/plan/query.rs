@@ -1093,6 +1093,7 @@ fn render_aggregate(spec: &AggregateSpec, columns: &[String]) -> String {
 /// cannot be checked against the query.
 fn render_literal(literal: &Literal) -> String {
     match literal {
+        Literal::TypedNull(ty) => format!("NULL::{}", crate::value::PgType::name(*ty)),
         Literal::Null => "NULL".to_owned(),
         Literal::Integer(value) => value.to_string(),
         Literal::Decimal(digits) => digits.clone(),

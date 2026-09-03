@@ -2116,6 +2116,9 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
 fn deparse_literal(literal: &plan::Literal, ty: ColumnType) -> String {
     use crate::plan::Literal;
     match literal {
+        // A typed NULL deparses under **its own** type, not the column's: it is what the user
+        // wrote, and `pg_get_expr` prints back what was written.
+        Literal::TypedNull(null) => format!("NULL::{}", null.name()),
         Literal::Null => format!("NULL::{}", ty.name()),
         Literal::Bool(value) => value.to_string(),
         Literal::Integer(value) => value.to_string(),
