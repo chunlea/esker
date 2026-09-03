@@ -25,6 +25,11 @@
 //!   *skipped* rather than refused, which is what makes the default `"$user", public` resolve to
 //!   `{public}`. `SHOW` gives the path as **set** and `current_schemas` gives it as **resolved**,
 //!   and the resolving is `crate::exec::Executor`'s, where the catalog is.
+//! * `statement_timeout` and `lock_timeout` are honoured **only at `0`**, which is what they
+//!   permanently are here: nothing cancels a running statement and nothing waits for a row lock,
+//!   so `SHOW` answering `0` is exact. A non-zero value is `0A000` naming the parameter — the one
+//!   entry in this table whose absence was measured as a *hang* rather than a wrong answer
+//!   (`tests/transaction_timeouts.rs`).
 //! * `max_identifier_length` is **read-only**, as it is on a real server — `55P02`, which is a
 //!   different answer from `42704` and means a different thing.
 //! * `esker.engine` is **this node's own** and is honoured in the strongest sense in this table: it
@@ -150,6 +155,25 @@ pub const PARAMETERS: &[Parameter] = &[
     Parameter {
         name: "idle_in_transaction_session_timeout",
         reported: "idle_in_transaction_session_timeout",
+        boot: "0",
+        values: Values::Duration,
+        read_only: false,
+    },
+    // **The two timeouts `adapters/postgresql/transaction_test.rb` sets**, and the reason that
+    // file hung run 47 for twenty minutes. Both were `42704` — the wrong sentence about a
+    // parameter a real server has — and both are here now so that `SHOW` can answer `0`, which is
+    // *true*: no statement here is cancelled by a clock and nothing here waits for a row lock, and
+    // `0` is PostgreSQL's own spelling of both. A non-zero value is refused by name in `honour`.
+    Parameter {
+        name: "statement_timeout",
+        reported: "statement_timeout",
+        boot: "0",
+        values: Values::Duration,
+        read_only: false,
+    },
+    Parameter {
+        name: "lock_timeout",
+        reported: "lock_timeout",
         boot: "0",
         values: Values::Duration,
         read_only: false,
@@ -311,6 +335,20 @@ impl Parameter {
             ("timezone", zone) if !is_utc(zone) => {
                 Err(SqlError::unsupported(format!("the time zone \"{zone}\"")))
             }
+            // **A timeout this node cannot enforce, and `0` is the one value it can.** Nothing
+            // here cancels a running statement — the executor runs one to completion on a
+            // blocking thread and no clock interrupts it — and nothing here waits for a row lock,
+            // because a Percolator prewrite that meets a live lock is `40001` after a bounded
+            // backoff rather than a wait. So there is no wait for `lock_timeout` to bound and no
+            // cancellation for `statement_timeout` to schedule.
+            //
+            // This is the one refusal in this table whose *absence* was measured as a hang rather
+            // than as a wrong answer: a client told it holds a 150 ms cancellation waits for one,
+            // and `adapters/postgresql/transaction_test.rb` waited twenty minutes. `0` is
+            // accepted because it asks for what is already the case.
+            ("statement_timeout" | "lock_timeout", value) if !is_no_timeout(value) => Err(
+                SqlError::unsupported(format!("a non-zero {} ({value})", self.reported)),
+            ),
             // **A `search_path` is not validated**, on a real server or here: an entry naming no
             // schema is *skipped* rather than refused, which is what makes the default
             // `"$user", public` mean `{public}`. `SHOW` gives the path as **set** and
@@ -321,6 +359,15 @@ impl Parameter {
             _ => Ok(()),
         }
     }
+}
+
+/// Whether a duration means "no timeout", which is the only value the two timeouts can honour.
+///
+/// [`Values::Duration`] has already normalised the value, and its rule is that **zero loses its
+/// unit** — `'0ms'` and `0` both store `0` — so one comparison covers every spelling PostgreSQL
+/// accepts for off.
+fn is_no_timeout(value: &str) -> bool {
+    value == "0"
 }
 
 /// The spellings of UTC this node can print in. `Etc/UTC` is the same instant offset and reads

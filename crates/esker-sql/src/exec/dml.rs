@@ -672,7 +672,7 @@ pub(super) fn update(
                 None => None,
             }
             .filter(|target| target.id != table.id);
-            remove_row(executor, txn, &table, &old)?;
+            remove_for_rewrite(executor, txn, &table, &old, written)?;
             match &destination {
                 Some(target) => write_row(executor, txn, target, &new, written)?,
                 None => write_row(executor, txn, &table, &new, written)?,
@@ -772,7 +772,7 @@ fn resolve_conflict(
     if touched.contains(&existing.key) {
         return Err(SqlError::OnConflictAffectedTwice);
     }
-    remove_row(executor, txn, target, &existing.row)?;
+    remove_for_rewrite(executor, txn, target, &existing.row, written)?;
     write_row(executor, txn, target, &updated, written)?;
     touched.push(existing.key.clone());
     Ok(Some(updated))
@@ -1205,7 +1205,11 @@ pub(super) fn rewrite_row(
 ) -> Result<()> {
     check_not_null(table, new)?;
     check_constraints(table, new)?;
-    remove_row(executor, txn, table, old)?;
+    // **The keys the old row owned are remembered**, because `write_row` below is about to put
+    // some of them straight back and a key a row already had cannot be a duplicate of itself. A
+    // lost race on one of them is an ordinary row-level conflict — `40001` — where a lost race on
+    // a key this statement *added* really is a `23505` (`crate::exec::Executor::explain_conflict`).
+    remove_for_rewrite(executor, txn, table, old, written)?;
     // The statement's own `Written`, not a fresh one: a unique key a cascade took is a key this
     // statement wrote, and a lost race on it has to be reported as the `23505` it is.
     write_row(executor, txn, table, new, written)
@@ -1227,18 +1231,6 @@ fn collect(
     Ok(rows)
 }
 
-/// Every `CHECK` on the table, against the row about to be written.
-///
-/// **A NULL passes.** A `CHECK` fails only when its predicate is *false*, and SQL's three-valued
-/// logic makes `NULL > 0` unknown rather than false — so a row with a NULL in the checked column
-/// is admitted. Measured: `INSERT INTO ck VALUES (4, NULL, 'x')` succeeds under `CHECK (p > 0)`.
-/// That is the rule most likely to be got wrong by evaluating the predicate as a boolean and
-/// treating "not true" as a violation.
-///
-/// The predicate is re-lowered from its stored text each time it is checked. It could be lowered
-/// once when the table is loaded; it is not, because the catalog caches a `TableDef` and a lowered
-/// expression would have to be invalidated with it. Re-lowering a short predicate per row is the
-/// cheaper mistake to make, and the only one that cannot go stale.
 /// Computes every `GENERATED ALWAYS AS (…) STORED` column of a row.
 ///
 /// **After the values and before the checks**, and both halves of that matter: after, because the
@@ -1424,6 +1416,18 @@ fn overlap(left: &Datum, right: &Datum) -> bool {
     }
 }
 
+/// Every `CHECK` on the table, against the row about to be written.
+///
+/// **A NULL passes.** A `CHECK` fails only when its predicate is *false*, and SQL's three-valued
+/// logic makes `NULL > 0` unknown rather than false — so a row with a NULL in the checked column
+/// is admitted. Measured: `INSERT INTO ck VALUES (4, NULL, 'x')` succeeds under `CHECK (p > 0)`.
+/// That is the rule most likely to be got wrong by evaluating the predicate as a boolean and
+/// treating "not true" as a violation.
+///
+/// The predicate is re-lowered from its stored text each time it is checked. It could be lowered
+/// once when the table is loaded; it is not, because the catalog caches a `TableDef` and a lowered
+/// expression would have to be invalidated with it. Re-lowering a short predicate per row is the
+/// cheaper mistake to make, and the only one that cannot go stale.
 fn check_constraints(table: &TableDef, row: &[Datum]) -> Result<()> {
     for check in &table.checks {
         let parsed = crate::parse::parse_stored_expr(&check.expr).map_err(|error| {
@@ -1460,12 +1464,32 @@ fn check_not_null(table: &TableDef, row: &[Datum]) -> Result<()> {
 }
 
 /// Deletes a row and every index entry built from it.
+/// [`remove_row`] for a row that is about to be **written again**, remembering the keys it owned.
+///
+/// Its own function because three paths remove-then-write — `UPDATE`, `ON CONFLICT DO UPDATE` and
+/// [`rewrite_row`] for a cascade — and each of them must record, or the loser of a race on a key
+/// none of them changed is told `23505 duplicate key` about it
+/// ([`crate::exec::Written::rewritten`], which carries the whole argument). A fourth such path
+/// added later is meant to find this name rather than three copies of two lines.
+fn remove_for_rewrite(
+    executor: &Executor,
+    txn: &mut dyn Txn,
+    table: &TableDef,
+    row: &[Datum],
+    written: &mut Written,
+) -> Result<()> {
+    written
+        .rewritten
+        .extend(remove_row(executor, txn, table, row)?);
+    Ok(())
+}
+
 pub(super) fn remove_row(
     executor: &Executor,
     txn: &mut dyn Txn,
     table: &TableDef,
     row: &[Datum],
-) -> Result<()> {
+) -> Result<Vec<Vec<u8>>> {
     let tenant = executor.tenant;
     let primary_key: Vec<Datum> = table
         .primary_key
@@ -1473,7 +1497,9 @@ pub(super) fn remove_row(
         .map(|&ordinal| row[ordinal].clone())
         .collect();
 
-    super::index::remove_entries(tenant, txn, table, row, &primary_key)?;
-    txn.delete(&row::row_key(tenant, table.id, &primary_key)?);
-    Ok(())
+    let mut removed = super::index::remove_entries(tenant, txn, table, row, &primary_key)?;
+    let key = row::row_key(tenant, table.id, &primary_key)?;
+    txn.delete(&key);
+    removed.push(key);
+    Ok(removed)
 }
