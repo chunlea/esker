@@ -1,0 +1,29 @@
+crates/esker-sql/src/exec/ddl.rs
+  s_a48acfca6122c0::t_5e8511f6ab105c 77-84,88,105,109-111,124,499-552,1525-1531,1534,1967-1986,2054-2088
+crates/esker-sql/src/catalog/pg_constraint.rs
+  s_a48acfca6122c0::t_d630c5ed31895f 304-319,322-327,333
+crates/esker-sql/src/catalog/pg_relations.rs
+  s_a48acfca6122c0::t_1fddeddb10690d 164-170
+crates/esker-sql/tests/corpus/pg19_partition_suite.txt
+  s_a48acfca6122c0::t_b5c0914aa03225 1-149
+crates/esker-sql/tests/partition_suite.rs
+  s_a48acfca6122c0::t_9867ae132c3d12 1-280
+docs/plans/phase-9-rails.md
+  s_a48acfca6122c0::t_62e9917c3fd3aa 1496
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "78f57fb0e8613b049c4f4e438f2cfe93c4630fae",
+  "prompts": {},
+  "sessions": {
+    "s_a48acfca6122c0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1ce89436-fd98-49c2-bdf7-60ef343bd273",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
