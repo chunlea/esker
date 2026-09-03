@@ -1537,6 +1537,8 @@ impl Executor {
         use crate::plan::{CatalogFunc, Expr, Literal};
 
         let mut failure = None;
+        // One catalog snapshot for the whole statement; see `relation_oid`.
+        let mut relations = None;
         let mut resolve = |expr: &mut Expr| {
             let Expr::CatalogFunc(call) = expr else {
                 return;
@@ -1550,7 +1552,7 @@ impl Executor {
                 ));
                 return;
             };
-            match self.relation_oid(txn, name) {
+            match self.relation_oid(&mut relations, txn, name) {
                 Ok(oid) => *expr = Expr::Literal(Literal::Typed(Box::new(Datum::Int8(oid)))),
                 Err(error) => {
                     failure.get_or_insert(error);
@@ -1569,7 +1571,12 @@ impl Executor {
     /// A `pg_catalog` view answers with its own reserved id, which is what makes
     /// `'pg_class'::regclass` a number rather than a refusal — a real server answers there too, and
     /// this node's `pg_class` really does hold `pg_class`'s columns.
-    fn relation_oid(&self, txn: &dyn Txn, name: &str) -> Result<i64> {
+    fn relation_oid(
+        &self,
+        relations: &mut Option<crate::catalog::pg_relations::Relations>,
+        txn: &dyn Txn,
+        name: &str,
+    ) -> Result<i64> {
         if let Some(view) = crate::catalog::pg_catalog::view(name) {
             return Ok(i64::try_from(view.table_def().id).unwrap_or(i64::MAX));
         }
@@ -1577,7 +1584,20 @@ impl Executor {
         // separator the parser would have produced — `'se_idx.t_i_idx'::regclass` is the index in
         // `se_idx`, and looking it up whole would find nothing.
         let stored = crate::catalog::parse_qualified(name);
-        crate::catalog::pg_relations::Relations::read(txn, self.tenant)?
+        // **Read once per statement, not once per literal.** The catalog scan is one pass over the
+        // name records plus a point read per relation, so a statement with three `::regclass` casts
+        // was three of those — and `ActiveRecord`'s schema dump writes several per statement
+        // against a catalog with hundreds of relations. It is a *snapshot*: every literal in one
+        // statement resolves against the same catalog, which is what a real server does too, and
+        // the statement has not written anything at this point because nothing has run yet.
+        let relations = match relations {
+            Some(relations) => relations,
+            slot => slot.insert(crate::catalog::pg_relations::Relations::read(
+                txn,
+                self.tenant,
+            )?),
+        };
+        relations
             .by_name(&stored)
             .map(|relation| relation.oid)
             .ok_or(SqlError::UndefinedTable(stored))
