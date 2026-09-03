@@ -900,6 +900,10 @@ fn render(expr: &Expr, columns: &[String]) -> String {
             render(pattern, columns)
         ),
         Expr::Parameter(number) => format!("${number}"),
+        Expr::CurrentSchema { all: None } => "current_schema()".to_owned(),
+        Expr::CurrentSchema {
+            all: Some(implicit),
+        } => format!("current_schemas({implicit})"),
         Expr::Column { name, .. } => name.clone(),
         // Resolved to a position by the planner; put the name back for the reader. A position with
         // no name behind it can only be a bug, and saying so beats printing a number.

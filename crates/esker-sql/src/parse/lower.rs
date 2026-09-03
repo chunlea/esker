@@ -2350,9 +2350,7 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
         Expr::Identifier(name)
             if name.quote_style.is_none() && name.value.eq_ignore_ascii_case("current_schema") =>
         {
-            Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
-                Datum::Text(PUBLIC_SCHEMA.to_owned()),
-            ))))
+            Ok(plan::Expr::CurrentSchema { all: None })
         }
         Expr::Identifier(name) => Ok(plan::Expr::Column {
             table: None,
@@ -2698,19 +2696,16 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
     // gap — and it did, until r1's capture replay caught it.
     if name.eq_ignore_ascii_case("current_schema") {
         refuse_wrong_arity(function, "current_schema", 0)?;
-        return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
-            Datum::Text(PUBLIC_SCHEMA.to_owned()),
-        ))));
+        return Ok(plan::Expr::CurrentSchema { all: None });
     }
-    // **The array, written out.** `= ANY (current_schemas(false))` is still expanded into an `IN`
-    // list where it is lowered — that is what lets a catalog query keep the plan it has — and this
-    // is the same value in its other spelling, for the places a list cannot go:
-    // `SELECT current_schemas(false)` and `array_length(current_schemas(false), 1)`.
-    if let Some(schemas) = schema_function(function)? {
-        let elements: Vec<Option<String>> = schemas.into_iter().map(Some).collect();
-        return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
-            Datum::Text(value::vector::Array::write(&elements)),
-        ))));
+    // **The array, unresolved.** It was folded here into a literal `{public}` while `public` was
+    // the only schema; now the value is the session's `search_path` and a lowering has no session,
+    // so it becomes an expression `crate::exec::Executor::bound` fills in. The `= ANY (…)`
+    // expansion into an `IN` list moved with it, for the same reason: the list is not known here.
+    if let Some(implicit) = schema_function(function)? {
+        return Ok(plan::Expr::CurrentSchema {
+            all: Some(implicit),
+        });
     }
     // `lower` and `upper`, the two scalar functions this node has. Both take exactly one
     // argument and a wrong count is `42883` naming the signature, not a badly-called function —
@@ -3220,15 +3215,15 @@ fn lower_array(expr: &Expr) -> Result<Option<Vec<plan::Expr>>> {
             .map(lower_expr)
             .collect::<Result<Vec<_>>>()?,
         Expr::Nested(inner) => return lower_array(inner),
-        Expr::Function(function) => match schema_function(function)? {
-            Some(schemas) => schemas
-                .into_iter()
-                .map(|name| plan::Expr::Literal(plan::Literal::String(name)))
-                .collect(),
-            // Any other function is an ordinary expression whose value is an array, and the row
-            // evaluator reads it.
-            None => return Ok(None),
-        },
+        // **`current_schemas(…)` is no longer a list this lowering can see.** Its value is the
+        // session's `search_path`, which arrives at `crate::exec::Executor::bound`, so it stays an
+        // expression and the row evaluator reads it — the same road a column takes below. The
+        // `IN`-list expansion it used to get was an index-seek optimisation, and every statement
+        // that writes it reads a catalog view, which has no index to seek.
+        Expr::Function(function) => {
+            let _ = schema_function(function)?;
+            return Ok(None);
+        }
         // `'{a,b}'::text[]` and a bare `'{a,b}'`: the cast is a no-op here, because what the array
         // holds is decided by what it is compared against, exactly as an `IN` list's elements are.
         Expr::Cast { expr, .. } => return lower_array(expr),
@@ -3324,7 +3319,7 @@ fn parse_array_literal(text: &str) -> Result<Vec<Option<String>>> {
 /// `{pg_catalog,public}` — the `true` form includes the implicitly-searched catalog schema. This
 /// node has exactly one schema and no `search_path` to vary it, so both answers are constants;
 /// what would make them not constants is schema support, which is a unit of its own.
-fn schema_function(function: &sqlparser::ast::Function) -> Result<Option<Vec<String>>> {
+fn schema_function(function: &sqlparser::ast::Function) -> Result<Option<bool>> {
     use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments};
     if !function
         .name
@@ -3355,11 +3350,7 @@ fn schema_function(function: &sqlparser::ast::Function) -> Result<Option<Vec<Str
         }
         _ => return Err(SqlError::unsupported("current_schemas with that argument")),
     };
-    Ok(Some(if include_implicit {
-        vec!["pg_catalog".to_owned(), PUBLIC_SCHEMA.to_owned()]
-    } else {
-        vec![PUBLIC_SCHEMA.to_owned()]
-    }))
+    Ok(Some(include_implicit))
 }
 
 /// `42883` when a function is called with the wrong number of arguments.

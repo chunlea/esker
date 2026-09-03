@@ -62,6 +62,11 @@ pub(super) fn create_table(
         return Err(SqlError::DuplicateTable(create.name.clone()));
     }
 
+    // **An unqualified `CREATE` goes to the first schema of the path**, not to `public`: measured,
+    // with `sp_a, sp_b` a `CREATE TABLE made_here` lands in `sp_a`. The name is qualified here, so
+    // everything below — the record, the derived key and index names, the messages — is about the
+    // relation where it actually is.
+    let create = &qualified_create(&*txn, executor, create)?;
     refuse_missing_schema(&*txn, executor, &create.name)?;
     let declared = declared_columns(create)?;
     // **The parents' columns come first**, whatever order the child declared its own in, and a
@@ -1481,6 +1486,28 @@ fn sequences_for(
     Ok(sequences)
 }
 
+/// A `CREATE TABLE` whose name has been put in the schema it will live in.
+///
+/// A qualified name is left alone; an unqualified one takes the first schema of the `search_path`
+/// that resolves, which is `public` when none does — so every existing statement lands exactly
+/// where it did.
+fn qualified_create(
+    txn: &dyn Txn,
+    executor: &Executor,
+    create: &CreateTable,
+) -> Result<CreateTable> {
+    if create.name.contains(catalog::SCHEMA_SEPARATOR) {
+        return Ok(create.clone());
+    }
+    let schema = executor.creation_schema(txn)?;
+    if schema == catalog::PUBLIC_SCHEMA {
+        return Ok(create.clone());
+    }
+    let mut qualified = create.clone();
+    qualified.name = catalog::qualify(&schema, &create.name);
+    Ok(qualified)
+}
+
 /// The schema a relation names must exist: `3F000`, **before** anything else is looked at.
 ///
 /// **Its own class, not `42P01`.** `CREATE TABLE nosuchschema.t` fails on the *schema* — measured
@@ -2029,6 +2056,10 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
         // rather than panicked on, because this is a catalog write and not a place to abort.
         Expr::Column { name, .. } => name.clone(),
         Expr::Parameter(number) => format!("${number}"),
+        Expr::CurrentSchema { all: None } => "current_schema()".to_owned(),
+        Expr::CurrentSchema {
+            all: Some(implicit),
+        } => format!("current_schemas({implicit})"),
         Expr::Outer { at, .. } => format!("<outer {at}>"),
         Expr::Default => "DEFAULT".to_owned(),
         Expr::Sequence(call) => format!("{}()", call.func.name()),
@@ -2399,6 +2430,7 @@ fn existing_relation(
     txn: &dyn Txn,
     name: &str,
 ) -> Result<Option<catalog::Relation>> {
+    let name = &executor.resolve_unqualified(txn, name)?;
     // A `pg_catalog` relation is a relation, and every verb that asks this question should see one
     // — so a `DROP INDEX pg_type` is `42809 "pg_type" is not an index` and a `CREATE TABLE
     // pg_type` is `42P07`, which is what a real server answers for the qualified spelling.

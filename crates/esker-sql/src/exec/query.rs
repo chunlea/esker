@@ -2553,6 +2553,9 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // The two text functions take text and answer text.
         Expr::Scalar { .. }
         | Expr::ToText { .. }
+        // `name` on a real server and `text` here — the standing catalog trade; the array
+        // spelling is `text` too, because this node has no array *value* to type.
+        | Expr::CurrentSchema { .. }
         | Expr::Literal(Literal::String(_) | Literal::Null) => ColumnType::Text,
         Expr::Literal(Literal::Typed(value)) => value.column_type().unwrap_or(ColumnType::Text),
         Expr::Literal(Literal::Bool(_))
