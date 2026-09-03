@@ -695,6 +695,22 @@ impl Execute for Idling {
     }
 }
 
+/// One [`Idling`] per session, which is what `Connection::run` asks for now that a connection
+/// picks its executor from the database its startup packet names.
+struct OneIdler {
+    limit: Duration,
+    rolled_back: Arc<AtomicBool>,
+}
+
+impl esker_sql::pgwire::server::Executors for OneIdler {
+    fn for_session(&self, _database: &str) -> esker_sql::Result<Box<dyn Execute + Send>> {
+        Ok(Box::new(Idling {
+            limit: self.limit,
+            rolled_back: Arc::clone(&self.rolled_back),
+        }))
+    }
+}
+
 /// A startup packet, then whatever else the caller wants to send.
 fn startup_packet() -> Vec<u8> {
     let mut body = 0x0003_0000u32.to_be_bytes().to_vec();
@@ -755,7 +771,7 @@ async fn idling_inside_a_block_terminates_the_session() {
 
     let rolled_back = Arc::new(AtomicBool::new(false));
     let (mut client, server) = tokio::io::duplex(64 * 1024);
-    let executor = Idling {
+    let executors = OneIdler {
         limit: Duration::from_millis(80),
         rolled_back: Arc::clone(&rolled_back),
     };
@@ -764,7 +780,7 @@ async fn idling_inside_a_block_terminates_the_session() {
             server,
             esker_sql::pgwire::server::Config::default(),
         );
-        let _ = connection.run(Box::new(executor)).await;
+        let _ = connection.run(&executors).await;
     });
 
     let mut input = startup_packet();
@@ -829,7 +845,7 @@ async fn idling_outside_a_block_is_not_a_timeout() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     let (mut client, server) = tokio::io::duplex(64 * 1024);
-    let executor = Idling {
+    let executors = OneIdler {
         limit: Duration::from_millis(50),
         rolled_back: Arc::new(AtomicBool::new(false)),
     };
@@ -838,7 +854,7 @@ async fn idling_outside_a_block_is_not_a_timeout() {
             server,
             esker_sql::pgwire::server::Config::default(),
         );
-        let _ = connection.run(Box::new(executor)).await;
+        let _ = connection.run(&executors).await;
     });
 
     client.write_all(&startup_packet()).await.unwrap();
