@@ -1,0 +1,33 @@
+crates/esker-sql/src/exec/dml.rs
+  s_d08e34cbbda2a9::t_04096662c57935 675,775,1208-1212,1419-1430,1467-1474,1479,1481-1492,1500-1504
+crates/esker-sql/src/exec/flashback.rs
+  s_d08e34cbbda2a9::t_05626a954e5b75 265-268
+crates/esker-sql/src/exec/index.rs
+  s_d08e34cbbda2a9::t_de2dc5fd0a3841 164-165,169-173,180-181,200,203
+crates/esker-sql/src/exec/mod.rs
+  s_d08e34cbbda2a9::t_6589fceee5b0a5 1191-1194,1197-1202,1207-1208,1218,1661-1675
+crates/esker-sql/src/parameter.rs
+  s_d08e34cbbda2a9::t_9746fe76275f87 28-32,162-180,338-351,364-372
+crates/esker-sql/tests/corpus/pg19_transaction_timeouts.txt
+  s_d08e34cbbda2a9::t_4d143fed1bbdd4 1-110
+crates/esker-sql/tests/transaction_timeouts.rs
+  s_d08e34cbbda2a9::t_c67aa53801f5e1 1-648
+docs/plans/phase-9-rails.md
+  s_d08e34cbbda2a9::t_dad66c5c1f7ca7 1293-1295,1515
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "038b9e6d103ab0e636e91439afc2e8e151d47b8a",
+  "prompts": {},
+  "sessions": {
+    "s_d08e34cbbda2a9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f1fca0df-6833-4c48-8688-2ac235be5cb6",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
