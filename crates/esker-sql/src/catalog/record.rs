@@ -49,8 +49,8 @@ use esker_keys::{codec, prefix};
 
 use crate::catalog::{
     CheckDef, ColumnDef, ExprShape, ForeignKeyDef, FunctionDef, Identity, IndexDef, IndexKey,
-    KeyOrder, KeyPart, ReferentialAction, Relation, SchemaState, SequenceDef, TableDef, TriggerDef,
-    UniqueKind,
+    KeyOrder, KeyPart, PartitionBound, PartitionKey, PartitionStrategy, ReferentialAction,
+    Relation, SchemaState, SequenceDef, TableDef, TriggerDef, UniqueKind,
 };
 use crate::error::{Result, SqlError};
 use crate::value::{ColumnType, Datum, NO_TYPMOD};
@@ -77,7 +77,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 18;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 19;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -1117,6 +1117,43 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         varint::put_u64(trigger.events.unsigned_abs().into(), &mut out);
     }
 
+    // Version 19. The partition key and this table's own bound, in that order and after version
+    // 18's bytes — the seventh section on the end, and the rule has not changed: sections go on in
+    // version order and come off in that order.
+    //
+    // A table written before 19 has neither, which is what every table had while `PARTITION BY`
+    // was `0A000`.
+    match &table.partition_by {
+        None => out.push(0),
+        Some(key) => {
+            out.push(1);
+            out.push(match key.strategy {
+                PartitionStrategy::List => b'l',
+            });
+            varint::put_u64(key.columns.len() as u64, &mut out);
+            for &column in &key.columns {
+                varint::put_u64(column as u64, &mut out);
+            }
+        }
+    }
+    match &table.partition_bound {
+        None => out.push(0),
+        Some(PartitionBound::Default) => out.push(1),
+        Some(PartitionBound::Values(values)) => {
+            out.push(2);
+            varint::put_u64(values.len() as u64, &mut out);
+            for value in values {
+                // As **text**, because a bound's values are the key columns' types and those are
+                // the parent's — a bound decoded without the parent in hand has no type to read
+                // the bytes as, and the parent is not loaded here.
+                put_str(
+                    &crate::value::PgDatum::to_text(value).unwrap_or_default(),
+                    &mut out,
+                );
+            }
+        }
+    }
+
     Ok(out)
 }
 
@@ -1331,6 +1368,51 @@ fn read_triggers(reader: &mut Reader<'_>) -> Result<Vec<TriggerDef>> {
     Ok(triggers)
 }
 
+/// The version 19 section: the partition key, then this table's own bound.
+///
+/// A bound's values come back as **text**, to be read as the key columns' types where the parent
+/// is in hand — which is not here.
+fn read_partitioning(
+    reader: &mut Reader<'_>,
+) -> Result<(Option<PartitionKey>, Option<PartitionBound>)> {
+    if reader.version < 19 {
+        return Ok((None, None));
+    }
+    let partition_by = match reader.byte()? {
+        0 => None,
+        1 => {
+            let strategy = match reader.byte()? {
+                b'l' => PartitionStrategy::List,
+                other => return Err(corrupt(format!("partition strategy byte {other}"))),
+            };
+            let count = reader.count()?;
+            let mut columns = Vec::with_capacity(count);
+            for _ in 0..count {
+                columns.push(
+                    usize::try_from(reader.varint()?)
+                        .map_err(|_| corrupt("a partition key column that is not a usize"))?,
+                );
+            }
+            Some(PartitionKey { strategy, columns })
+        }
+        other => return Err(corrupt(format!("partition key tag {other}"))),
+    };
+    let partition_bound = match reader.byte()? {
+        0 => None,
+        1 => Some(PartitionBound::Default),
+        2 => {
+            let count = reader.count()?;
+            let mut values = Vec::with_capacity(count);
+            for _ in 0..count {
+                values.push(Datum::Text(reader.string()?));
+            }
+            Some(PartitionBound::Values(values))
+        }
+        other => return Err(corrupt(format!("partition bound tag {other}"))),
+    };
+    Ok((partition_by, partition_bound))
+}
+
 /// Reads a table record back. Every failure is typed: a catalog is on-disk data like any other.
 #[allow(
     clippy::too_many_lines,
@@ -1459,6 +1541,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
         }
     }
     let triggers = read_triggers(&mut reader)?;
+    let (partition_by, partition_bound) = read_partitioning(&mut reader)?;
     reader.finish()?;
 
     Ok(TableDef {
@@ -1477,6 +1560,8 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
         children,
         triggers,
         child_scans: Vec::new(),
+        partition_by,
+        partition_bound,
         checks,
         foreign_keys,
         triggers_disabled,

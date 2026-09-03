@@ -33,7 +33,7 @@ pub use crate::catalog::pg_catalog::CatalogView;
 pub use ddl::{
     AlterTable, AlterTableAction, Column, ColumnDefault, CreateExtension, CreateFunction,
     CreateIndex, CreateSequence, CreateTable, CreateTrigger, DropFunction, DropIndex, DropSequence,
-    DropTable, DropTrigger, ForeignKey, IndexKeyPart, KeyPartName, UniqueConstraint,
+    DropTable, DropTrigger, ForeignKey, IndexKeyPart, KeyPartName, PartitionSpec, UniqueConstraint,
     foreign_key_name, index_name, primary_key_name, sequence_name, unique_constraint_name,
 };
 pub use dml::{Delete, Insert, Returning, Update};

@@ -353,7 +353,15 @@ pub(super) fn insert(
         fill_generated(&table, &mut row)?;
         check_not_null(&table, &row)?;
         check_constraints(&table, &row)?;
-        write_row(executor, txn, &table, &row, written)?;
+        // **A partitioned table stores nothing itself**: the row goes to the partition its key
+        // selects, and lands there under that table's own row id, key and indexes. A row no
+        // partition takes is `23514` naming the *parent* — there is no partition to name, which
+        // is the whole condition.
+        let target = route_to_partition(executor, txn, &table, &row)?;
+        let target = target.as_ref().unwrap_or(&table);
+        // Written straight into a partition, the bound is a constraint rather than a route.
+        check_partition_bound(target, &row)?;
+        write_row(executor, txn, target, &row, written)?;
         // The row **as stored**, so a column filled from its `DEFAULT` comes back with that value
         // rather than with the NULL the user did not write.
         if let Some(returned) = &mut returned {
@@ -582,8 +590,21 @@ pub(super) fn update(
             // the table as it was; the cascade comes *after* the row has moved, because a child whose
             // key follows the parent's re-checks that key and it has to be there already.
             super::foreign_key::refuse_if_referenced(executor, txn, &table, &old, &new)?;
+            // **An `UPDATE` that changes the partition key moves the row.** Row movement is the
+            // default on a real server, not an opt-in: the row leaves the partition it was in and
+            // arrives in the one the new key selects, with no error raised. Routed from the
+            // *parent*, because a partition's own bound is one list and the destination may be
+            // any sibling.
+            let destination = match parent_of_partition(executor, txn, &table)? {
+                Some(parent) => route_to_partition(executor, txn, &parent, &new)?,
+                None => None,
+            }
+            .filter(|target| target.id != table.id);
             remove_row(executor, txn, &table, &old)?;
-            write_row(executor, txn, &table, &new, written)?;
+            match &destination {
+                Some(target) => write_row(executor, txn, target, &new, written)?,
+                None => write_row(executor, txn, &table, &new, written)?,
+            }
             super::foreign_key::cascade_update(executor, txn, &table, &old, &new, written)?;
             // The row **after** the assignments: `UPDATE t SET n = n + 1 RETURNING n` answers with
             // the new value, which is the whole reason a client writes it.
@@ -630,6 +651,90 @@ pub(super) fn delete(
 ///
 /// The projection is `None` for the named table itself, whose rows already are its own shape.
 type Target = (std::sync::Arc<TableDef>, Option<Vec<usize>>);
+
+/// The partitioned table this one is a partition of, if it is one.
+///
+/// A partition has exactly one parent — the edge it shares with `INHERITS` — and only a
+/// *partitioned* parent can re-route a row, which is what separates this from an inheriting child.
+fn parent_of_partition(
+    executor: &Executor,
+    txn: &dyn Txn,
+    table: &TableDef,
+) -> Result<Option<std::sync::Arc<TableDef>>> {
+    if table.partition_bound.is_none() {
+        return Ok(None);
+    }
+    let Some(&parent_id) = table.parents.first() else {
+        return Ok(None);
+    };
+    let parent = executor.table_by_id(txn, parent_id)?;
+    Ok(parent.partition_by.is_some().then_some(parent))
+}
+
+/// The partition a row belongs in, or `None` for a table that is not partitioned.
+///
+/// **`DEFAULT` is the fallback and is tried last**, whatever order the partitions were declared
+/// in: it takes what no value list does, so a list that matches must win even when the default
+/// partition was created first.
+fn route_to_partition(
+    executor: &Executor,
+    txn: &dyn Txn,
+    table: &TableDef,
+    row: &[Datum],
+) -> Result<Option<std::sync::Arc<TableDef>>> {
+    let Some(key) = &table.partition_by else {
+        return Ok(None);
+    };
+    let values: Vec<&Datum> = key.columns.iter().map(|&at| &row[at]).collect();
+    let mut fallback = None;
+    for &child_id in &table.children {
+        let child = executor.table_by_id(txn, child_id)?;
+        match &child.partition_bound {
+            Some(crate::catalog::PartitionBound::Values(bound)) => {
+                if bound.len() == values.len()
+                    && bound.iter().zip(&values).all(|(one, other)| one == *other)
+                {
+                    return Ok(Some(child));
+                }
+            }
+            Some(crate::catalog::PartitionBound::Default) => fallback = Some(child),
+            None => {}
+        }
+    }
+    fallback.map_or_else(
+        || Err(SqlError::NoPartitionForRow(table.name.clone())),
+        |child| Ok(Some(child)),
+    )
+}
+
+/// A row written **straight into a partition**, against that partition's own bound.
+///
+/// Routing cannot raise this: a routed row is sent to the partition whose bound admits it. This is
+/// the other way in — `INSERT INTO measurements_toronto … VALUES ('2', …)` — and PostgreSQL calls
+/// it a violated *constraint* rather than a missing partition, naming the partition.
+///
+/// A `DEFAULT` partition admits anything by this test, and correctly: what excludes a row from it
+/// is another partition's list claiming that row, which routing has already settled.
+fn check_partition_bound(table: &TableDef, row: &[Datum]) -> Result<()> {
+    let Some(crate::catalog::PartitionBound::Values(bound)) = &table.partition_bound else {
+        return Ok(());
+    };
+    // The key is the **parent's**, and its ordinals are the parent's — but a partition takes the
+    // parent's columns in the parent's order, so the same positions read the same columns.
+    let matches = bound
+        .iter()
+        .enumerate()
+        .all(|(at, value)| row.get(at + partition_key_offset(table)) == Some(value));
+    if matches {
+        return Ok(());
+    }
+    Err(SqlError::PartitionConstraintViolation(table.name.clone()))
+}
+
+/// Where a partition's inherited columns begin: after its own internal row id, if it has one.
+fn partition_key_offset(table: &TableDef) -> usize {
+    usize::from(table.row_id().is_some())
+}
 
 /// The relations an `UPDATE` or a `DELETE` on this one acts on: itself and everything that
 /// inherits from it, each seen **alone**.

@@ -1144,6 +1144,97 @@ fn lower_create_trigger(create: &sqlparser::ast::CreateTrigger) -> Result<plan::
     })
 }
 
+/// `PARTITION BY LIST (col, …)` — the strategy and the key columns.
+///
+/// **Only `LIST`.** `RANGE` and `HASH` are captured and are refused by name: a bound this node
+/// cannot compare is a row it would misroute, and misrouting is a wrong answer rather than a gap.
+/// The suite partitions by `LIST` (`postgresql_specific_schema.rb` statement 781).
+///
+/// `sqlparser` gives the whole clause as one expression, so `LIST (city_id)` arrives looking like
+/// a function call — the strategy is the "function" and the key columns are its arguments.
+fn lower_partition_by(
+    partition_by: Option<&Expr>,
+) -> Result<Option<(catalog::PartitionStrategy, Vec<String>)>> {
+    let Some(expr) = partition_by else {
+        return Ok(None);
+    };
+    let Expr::Function(function) = unwrap_nested(expr) else {
+        return Err(SqlError::unsupported(format!(
+            "CREATE TABLE ... PARTITION BY {expr}"
+        )));
+    };
+    let name = unqualified_function_name(function)?;
+    let strategy = match name.to_ascii_uppercase().as_str() {
+        "LIST" => catalog::PartitionStrategy::List,
+        other => {
+            return Err(SqlError::unsupported(format!(
+                "CREATE TABLE ... PARTITION BY {other}"
+            )));
+        }
+    };
+    let columns = function_arguments(function, "PARTITION BY")?
+        .into_iter()
+        .map(|argument| match unwrap_nested(argument) {
+            Expr::Identifier(name) => {
+                Ok(fold_identifier(&name.value, name.quote_style.is_some()).0)
+            }
+            other => Err(SqlError::unsupported(format!(
+                "PARTITION BY over the expression {other}"
+            ))),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some((strategy, columns)))
+}
+
+/// `PARTITION OF parent FOR VALUES IN (…)` and `… DEFAULT`.
+///
+/// The values stay literals here: coercing them to the key's types needs the parent, and a plan is
+/// lowered without the catalog. `RANGE` and `HASH` bounds are refused for the reason their
+/// strategies are.
+fn lower_partition_of(
+    partition_of: Option<&ObjectName>,
+    for_values: Option<&sqlparser::ast::ForValues>,
+) -> Result<Option<(String, plan::PartitionSpec)>> {
+    use sqlparser::ast::ForValues;
+    let Some(parent) = partition_of else {
+        return Ok(None);
+    };
+    let spec = match for_values {
+        Some(ForValues::Default) => plan::PartitionSpec::Default,
+        Some(ForValues::In(values)) => plan::PartitionSpec::Values(
+            values
+                .iter()
+                .map(|value| match unwrap_nested(value) {
+                    // Read as text and coerced to the key's type where the parent is in hand,
+                    // which is what makes `IN (1)` on a `character varying` key store `'1'`.
+                    Expr::Value(literal) => Ok(Datum::Text(literal_text(&literal.value))),
+                    other => Err(SqlError::unsupported(format!(
+                        "FOR VALUES IN ({other}), which is not a literal"
+                    ))),
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        Some(ForValues::From { .. }) => {
+            return Err(SqlError::unsupported("PARTITION OF ... FOR VALUES FROM"));
+        }
+        Some(ForValues::With { .. }) => {
+            return Err(SqlError::unsupported("PARTITION OF ... FOR VALUES WITH"));
+        }
+        None => return Err(SqlError::unsupported("PARTITION OF with no bound")),
+    };
+    Ok(Some((relation_name(parent)?, spec)))
+}
+
+/// A literal's text, for a partition bound: what the value would be written as.
+fn literal_text(value: &Value) -> String {
+    match value {
+        Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => text.clone(),
+        Value::Number(digits, _) => digits.clone(),
+        Value::Boolean(flag) => (if *flag { "true" } else { "false" }).to_owned(),
+        other => other.to_string(),
+    }
+}
+
 /// A columnar-replica count: a plain non-negative integer, and nothing else.
 ///
 /// No interval grammar, no `'forever'`, no `DEFAULT` — it is a replica count, so the only thing
@@ -1215,14 +1306,7 @@ fn refuse_create_table_clauses(create: &sqlparser::ast::CreateTable) -> Result<(
     refuse_if(create.query.is_some(), "CREATE TABLE ... AS")?;
     refuse_if(create.like.is_some(), "CREATE TABLE ... LIKE")?;
     refuse_if(create.clone.is_some(), "CREATE TABLE ... CLONE")?;
-    refuse_if(
-        create.partition_of.is_some(),
-        "CREATE TABLE ... PARTITION OF",
-    )?;
-    refuse_if(
-        create.partition_by.is_some(),
-        "CREATE TABLE ... PARTITION BY",
-    )?;
+
     refuse_if(create.on_commit.is_some(), "CREATE TABLE ... ON COMMIT")?;
     refuse_if(create.without_rowid, "CREATE TABLE ... WITHOUT ROWID")?;
     refuse_if(create.strict, "CREATE TABLE ... STRICT")?;
@@ -1362,6 +1446,8 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
         columns,
         primary_key,
         primary_key_name,
+        partition_by: lower_partition_by(create.partition_by.as_deref())?,
+        partition_of: lower_partition_of(create.partition_of.as_ref(), create.for_values.as_ref())?,
         // Names only: a parent's columns come from the catalog and the catalog is the executor's.
         inherits: create
             .inherits

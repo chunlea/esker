@@ -1459,9 +1459,12 @@ fn catalog_function(
         // and NULL is exactly what a real server answers when it has nothing either. The
         // arguments are still evaluated, because an error inside one is the user's error: it is
         // the *result* that is empty here, not the call.
-        CatalogFunc::ColDescription
-        | CatalogFunc::ObjDescription
-        | CatalogFunc::PgGetPartkeydef => Datum::Null,
+        CatalogFunc::ColDescription | CatalogFunc::ObjDescription => Datum::Null,
+        // **`LIST (city_id)`** — the strategy word and the key columns, and NULL for a relation
+        // that is not partitioned, which is what a real server answers there too.
+        CatalogFunc::PgGetPartkeydef => {
+            crate::catalog::partition_key_definition(env.relations()?, oid_argument(args.first())?)
+        }
         // **`EXECUTE PROCEDURE` prints back as `EXECUTE FUNCTION`**, so the text out is not the
         // text in — statement 762 writes the first spelling and statement 790 the second.
         CatalogFunc::PgGetTriggerdef => {

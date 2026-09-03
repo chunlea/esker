@@ -133,9 +133,18 @@ fn definition(
     qualified: bool,
 ) -> String {
     let mut out = format!(
-        "CREATE {}INDEX {} ON {}{} USING btree ({})",
+        "CREATE {}INDEX {} ON {}{}{} USING btree ({})",
         if key.unique { "UNIQUE " } else { "" },
         relation.name,
+        // **`ON ONLY` for an index on a partitioned table** — the word `ONLY` in the definition of
+        // the index that covers *every* partition, which reads backwards and is what a real server
+        // prints. It says the index relation itself holds no entries: the partitions' own indexes
+        // do. Measured, and it does not change when partitions are attached or detached.
+        if table.partition_by.is_some() {
+            "ONLY "
+        } else {
+            ""
+        },
         if qualified { "public." } else { "" },
         table.name,
         parts.join(", ")

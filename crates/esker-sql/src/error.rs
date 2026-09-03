@@ -922,6 +922,46 @@ pub enum SqlError {
         detail: String,
     },
 
+    /// `CREATE TABLE … PARTITION OF t` where `t` is not partitioned: `42P17`.
+    #[error("\"{0}\" is not partitioned")]
+    NotPartitioned(String),
+
+    /// A partition whose bound overlaps one already there: `42P17`, naming both.
+    #[error("partition \"{partition}\" would overlap partition \"{existing}\"")]
+    PartitionOverlap {
+        /// The partition being created.
+        partition: String,
+        /// The one already there whose bound it would collide with.
+        existing: String,
+    },
+
+    /// A row no partition of the named table takes: `23514`.
+    ///
+    /// **The parent is named, not a partition** — there is no partition to name, which is the
+    /// whole condition. A row sent straight to a partition it does not belong in gets the other
+    /// sentence, [`SqlError::PartitionConstraintViolation`], naming that partition.
+    #[error("no partition of relation \"{0}\" found for row")]
+    NoPartitionForRow(String),
+
+    /// A row written straight into a partition whose bound excludes it: `23514`.
+    #[error("new row for relation \"{0}\" violates partition constraint")]
+    PartitionConstraintViolation(String),
+
+    /// A unique index or primary key on a partitioned table that misses a key column: `0A000`.
+    ///
+    /// PostgreSQL's own words, and the reason is not arbitrary: with every partition column in the
+    /// key, two rows that could collide must land in the **same** partition, so a per-partition
+    /// index enforces the constraint exactly. Without one they could not.
+    #[error("{kind} constraint on partitioned table must include all partitioning columns")]
+    PartitionKeyNotCovered {
+        /// `UNIQUE` or `PRIMARY KEY`.
+        kind: &'static str,
+        /// The partitioned table.
+        relation: String,
+        /// The **first** key column the index misses, which is the one PostgreSQL names.
+        missing: String,
+    },
+
     /// `DROP FUNCTION` on a **built-in**: `2BP01`, and `IF EXISTS` does not cover it.
     ///
     /// The clause covers absence and this is not absence — the function is there and is protected.
@@ -1342,7 +1382,11 @@ impl SqlError {
             | SqlError::CannotConvert { .. }
             | SqlError::NonStandardStringLiterals
             | SqlError::ExtensionNotAvailable(_)
-            | SqlError::SnapshotIsolationRequired => sqlstate::FEATURE_NOT_SUPPORTED,
+            | SqlError::SnapshotIsolationRequired
+            // PostgreSQL's own class for it, and it reads oddly on purpose: a unique key that
+            // misses a partition column is not a *syntax* problem, it is a constraint this
+            // server cannot enforce — which is what `0A000` says.
+            | SqlError::PartitionKeyNotCovered { .. } => sqlstate::FEATURE_NOT_SUPPORTED,
             SqlError::CardinalityViolation => sqlstate::CARDINALITY_VIOLATION,
             SqlError::SubqueryColumns(_)
             | SqlError::Syntax { .. }
@@ -1384,6 +1428,14 @@ impl SqlError {
 
             SqlError::DuplicateTrigger { .. } => sqlstate::DUPLICATE_OBJECT,
 
+            // `42P17 invalid_object_definition`, not `42P16` — measured, and the two are one
+            // digit apart.
+            SqlError::NotPartitioned(_) | SqlError::PartitionOverlap { .. } => {
+                sqlstate::INVALID_OBJECT_DEFINITION
+            }
+            SqlError::NoPartitionForRow(_) | SqlError::PartitionConstraintViolation(_) => {
+                sqlstate::CHECK_VIOLATION
+            }
             SqlError::DuplicateTable(_) | SqlError::AlreadyExistsSkipping(_) => {
                 sqlstate::DUPLICATE_TABLE
             }
@@ -1555,6 +1607,14 @@ impl SqlError {
             | SqlError::ForeignKeyStillReferenced { detail, .. }
             | SqlError::DependentTable { detail, .. }
             | SqlError::DependentFunction { detail, .. } => Some(detail.clone()),
+            SqlError::PartitionKeyNotCovered {
+                kind,
+                relation,
+                missing,
+            } => Some(format!(
+                "{kind} constraint on table \"{relation}\" lacks column \"{missing}\" which is \
+                 part of the partition key."
+            )),
             // **Two sentences**, which PostgreSQL sends as two `DETAIL` lines. The first is the
             // surprising half: a redeclared inherited column is *merged* into the inherited one
             // and moved to its position, not rejected as a duplicate — only the type stops it.

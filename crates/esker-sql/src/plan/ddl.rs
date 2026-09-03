@@ -14,7 +14,7 @@ use crate::catalog::{ExprShape, Identity, KeyOrder, ReferentialAction, fold_iden
 use crate::value::{ColumnType, Datum};
 
 /// `CREATE TABLE`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CreateTable {
     /// The table's name, folded.
     pub name: String,
@@ -28,6 +28,16 @@ pub struct CreateTable {
     /// `<table>_pkey`. Carried rather than dropped: a constraint the user named is the name a
     /// `23505` will quote back at them.
     pub primary_key_name: Option<String>,
+    /// `PARTITION BY LIST (col, …)` — the strategy and the key columns' names, unresolved.
+    pub partition_by: Option<(crate::catalog::PartitionStrategy, Vec<String>)>,
+    /// `PARTITION OF parent FOR VALUES IN (…)` / `… DEFAULT` — the parent's name and the bound as
+    /// written, both unresolved.
+    ///
+    /// The bound's values are **expressions here and values in the catalog**: coercing them needs
+    /// the parent's key columns, and a plan is lowered without the catalog. That coercion is
+    /// visible — the suite writes `IN (1)` against a `character varying` key and a real server
+    /// prints `FOR VALUES IN ('1')` back.
+    pub partition_of: Option<(String, PartitionSpec)>,
     /// `INHERITS (parent, …)` — the parents' names, in the order written, unresolved.
     ///
     /// Resolved by the executor, which is where the catalog is: a parent's columns are prepended
@@ -195,6 +205,15 @@ pub struct DropFunction {
     ///
     /// **It covers absence only.** A built-in is `2BP01` with the clause and without it.
     pub if_exists: bool,
+}
+
+/// A partition's bound as the statement wrote it, before the parent's types are in reach.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PartitionSpec {
+    /// `FOR VALUES IN (…)`.
+    Values(Vec<Datum>),
+    /// `DEFAULT`.
+    Default,
 }
 
 /// `CREATE SEQUENCE [IF NOT EXISTS] s [START n] [INCREMENT BY n] [OWNED BY t.c | NONE]`.
