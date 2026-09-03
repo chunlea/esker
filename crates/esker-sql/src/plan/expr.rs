@@ -181,6 +181,25 @@ pub enum Expr {
     /// than a [`CatalogFunc`] for exactly that reason: that family is documented as a function of
     /// its arguments alone, and this is the opposite.
     Uuid(UuidFunc),
+    /// `x [NOT] LIKE p [ESCAPE c]` and its case-insensitive twin `ILIKE`.
+    ///
+    /// Its own variant rather than a [`BinaryOp`], because it is not a comparison: the two sides
+    /// are a subject and a *pattern*, `pg_cmp` says nothing about them, and the operator carries
+    /// two modifiers a binary op has nowhere to put.
+    Like {
+        /// The subject.
+        operand: Box<Expr>,
+        /// The pattern, in which `%` and `_` are wildcards.
+        pattern: Box<Expr>,
+        /// `NOT LIKE`. **Not the same as `NOT (x LIKE p)` for a NULL** only in appearance: both
+        /// are NULL, because the negation of unknown is unknown.
+        negated: bool,
+        /// `ILIKE`: fold both sides before matching.
+        case_insensitive: bool,
+        /// The character that quotes a wildcard, `\\` unless `ESCAPE` named another — and
+        /// `ESCAPE` **replaces** the backslash rather than adding to it.
+        escape: Option<char>,
+    },
     /// `x IS NULL`, or `IS NOT NULL` when negated. Never NULL itself — that is the whole point of
     /// the operator, and the reason `x = NULL` is not a way to write it.
     IsNull {
@@ -416,6 +435,59 @@ const CONCAT_ARITIES: [usize; 100] = {
     }
     arities
 };
+
+/// Whether `subject` matches `pattern` under SQL's `LIKE` rules.
+///
+/// `%` spans any run of characters including none, `_` is exactly one, and `escape` quotes either
+/// back into an ordinary character.
+///
+/// Iterative with one backtrack point rather than recursive: a pattern is user input, and
+/// `%a%a%a%…` against a long subject is the shape that turns the natural recursion into a stack
+/// overflow — which `CLAUDE.md`'s "never panic on user input" rules out.
+#[must_use]
+pub fn like_matches(subject: &[char], pattern: &[char], escape: Option<char>) -> bool {
+    // One pattern element: a literal character to match, or `None` for `_`, which matches any.
+    let element = |at: usize| -> (Option<char>, usize) {
+        match pattern[at] {
+            c if Some(c) == escape && at + 1 < pattern.len() => (Some(pattern[at + 1]), 2),
+            '_' => (None, 1),
+            c => (Some(c), 1),
+        }
+    };
+    let (mut s, mut p) = (0, 0);
+    // Where to resume when the tail after the last `%` turns out not to match from here.
+    let (mut star_p, mut star_s) = (None, 0);
+    loop {
+        if p < pattern.len() && pattern[p] == '%' {
+            star_p = Some(p);
+            p += 1;
+            star_s = s;
+            continue;
+        }
+        let matched = s < subject.len()
+            && p < pattern.len()
+            && matches!(element(p), (wanted, _) if wanted.is_none_or(|c| c == subject[s]));
+        if matched {
+            p += element(p).1;
+            s += 1;
+            continue;
+        }
+        if s == subject.len() {
+            // The subject is spent: what is left of the pattern must be all `%`.
+            return pattern[p..].iter().all(|&c| c == '%');
+        }
+        // Not a match here, and there is subject left: give the last `%` one more character.
+        let Some(star) = star_p else {
+            return false;
+        };
+        star_s += 1;
+        if star_s > subject.len() {
+            return false;
+        }
+        p = star + 1;
+        s = star_s;
+    }
+}
 
 /// One call to a `pg_catalog` function that prints a definition.
 #[derive(Debug, Clone, PartialEq)]
@@ -1247,6 +1319,11 @@ fn describe(expr: &Expr) -> &'static str {
         Expr::AnyArray { .. } => "= ANY",
         Expr::Subscript { .. } => "a subscript",
         Expr::Uuid(func) => func.name(),
+        Expr::Like {
+            case_insensitive: false,
+            ..
+        } => "LIKE",
+        Expr::Like { .. } => "ILIKE",
         Expr::InList { negated: true, .. } => "NOT IN",
         Expr::Aggregate(_) => "an aggregate function",
         Expr::Default => "DEFAULT",

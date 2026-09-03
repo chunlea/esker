@@ -162,6 +162,12 @@ fn for_each_subquery_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut TableRef))
         }
         Expr::Negate(operand) => for_each_subquery_mut(operand, visit),
         Expr::Not(inner) => for_each_subquery_mut(inner, visit),
+        Expr::Like {
+            operand, pattern, ..
+        } => {
+            for_each_subquery_mut(operand, visit);
+            for_each_subquery_mut(pattern, visit);
+        }
         Expr::IsNull { operand, .. }
         | Expr::ToText { operand, .. }
         | Expr::Scalar { operand, .. } => {

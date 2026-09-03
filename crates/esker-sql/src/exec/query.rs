@@ -1537,8 +1537,25 @@ fn undefined_column(name: &str) -> SqlError {
 
 const SYSTEM_COLUMNS: [&str; 6] = ["ctid", "xmin", "xmax", "cmin", "cmax", "tableoid"];
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per expression shape; splitting it would hide the vocabulary rather than clarify it"
+)]
 pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
     Ok(match expr {
+        Expr::Like {
+            operand,
+            pattern,
+            negated,
+            case_insensitive,
+            escape,
+        } => Expr::Like {
+            operand: Box::new(resolve(operand, scope)?),
+            pattern: Box::new(resolve(pattern, scope)?),
+            negated: *negated,
+            case_insensitive: *case_insensitive,
+            escape: *escape,
+        },
         // The strip is decided here, where the operand's type is still known.
         Expr::Scalar { func, operand } => Expr::Scalar {
             func: *func,
@@ -2200,6 +2217,7 @@ fn check_predicate(expr: &Expr, clause: &'static str, scope: &Scope<'_>) -> Resu
     }
     match expr {
         Expr::Binary { .. }
+        | Expr::Like { .. }
         | Expr::Not(_)
         | Expr::IsNull { .. }
         | Expr::InList { .. }
@@ -2498,6 +2516,7 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         | Expr::Literal(Literal::String(_) | Literal::Null) => ColumnType::Text,
         Expr::Literal(Literal::Typed(value)) => value.column_type().unwrap_or(ColumnType::Text),
         Expr::Literal(Literal::Bool(_))
+        | Expr::Like { .. }
         | Expr::Binary { .. }
         | Expr::Not(_)
         | Expr::IsNull { .. }

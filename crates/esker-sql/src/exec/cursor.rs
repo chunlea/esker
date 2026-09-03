@@ -912,6 +912,25 @@ impl Env<'_> {
 }
 
 /// Evaluates an expression over a row, with no way to run a subquery of its own.
+/// A `LIKE` operand as text, or `None` for NULL — and `42883` for anything that is not a string.
+///
+/// **A number has no `LIKE` operator**: `100 LIKE '1%'` is
+/// `operator does not exist: integer ~~ unknown` on a real server, not a cast to text. `~~` is
+/// `LIKE`'s internal name and is what the message shows.
+fn like_text(value: &Datum) -> Result<Option<String>> {
+    match value {
+        Datum::Null => Ok(None),
+        Datum::Text(text) => Ok(Some(text.clone())),
+        other => Err(SqlError::UndefinedOperator {
+            op: "~~",
+            left: other
+                .column_type()
+                .map_or("unknown", crate::value::PgType::name),
+            right: "unknown",
+        }),
+    }
+}
+
 pub(super) fn evaluate(expr: &Expr, row: &[Datum]) -> Result<Datum> {
     evaluate_in(expr, row, Env::none())
 }
@@ -964,6 +983,36 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             func: crate::plan::ScalarFunc::Abs,
             operand,
         } => crate::value::arith::abs(&evaluate_in(operand, row, env)?)?,
+        // **`LIKE` is not a comparison**: the two sides are a subject and a pattern, and a NULL in
+        // either is unknown — which the negation does not rescue, because the negation of unknown
+        // is unknown.
+        Expr::Like {
+            operand,
+            pattern,
+            negated,
+            case_insensitive,
+            escape,
+        } => {
+            let subject = evaluate_in(operand, row, env)?;
+            let pattern_value = evaluate_in(pattern, row, env)?;
+            match (like_text(&subject)?, like_text(&pattern_value)?) {
+                (Some(subject), Some(pattern)) => {
+                    let fold = |text: String| {
+                        if *case_insensitive {
+                            text.to_lowercase()
+                        } else {
+                            text
+                        }
+                    };
+                    let subject: Vec<char> = fold(subject).chars().collect();
+                    let pattern: Vec<char> = fold(pattern).chars().collect();
+                    let matched =
+                        crate::plan::like_matches(&subject, &pattern, escape.or(Some('\\')));
+                    Datum::Bool(matched != *negated)
+                }
+                _ => Datum::Null,
+            }
+        }
         Expr::Scalar { func, operand } => match evaluate_in(operand, row, env)? {
             Datum::Null => Datum::Null,
             Datum::Text(text) => Datum::Text(match func {

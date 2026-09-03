@@ -812,6 +812,10 @@ impl Node {
 /// literal is the value, not a `Debug` rendering of the node holding it. Not SQL that would
 /// re-parse — PostgreSQL's own `EXPLAIN` output is not either — but every token in it is one the
 /// user wrote or could have written.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per expression shape; splitting it would hide the vocabulary rather than clarify it"
+)]
 fn render(expr: &Expr, columns: &[String]) -> String {
     match expr {
         // Its own parentheses, as the comparison operators print theirs — `EXPLAIN` shows the
@@ -829,6 +833,19 @@ fn render(expr: &Expr, columns: &[String]) -> String {
         // As the user wrote it: `EXPLAIN` prints a cast the way SQL spells one.
         Expr::ToText { operand, .. } => format!("{}::text", render(operand, columns)),
         Expr::Scalar { func, operand } => format!("{}({})", func.name(), render(operand, columns)),
+        Expr::Like {
+            operand,
+            pattern,
+            negated,
+            case_insensitive,
+            ..
+        } => format!(
+            "{} {}{} {}",
+            render(operand, columns),
+            if *negated { "NOT " } else { "" },
+            if *case_insensitive { "ILIKE" } else { "LIKE" },
+            render(pattern, columns)
+        ),
         Expr::Parameter(number) => format!("${number}"),
         Expr::Column { name, .. } => name.clone(),
         // Resolved to a position by the planner; put the name back for the reader. A position with

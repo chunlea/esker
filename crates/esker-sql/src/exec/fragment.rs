@@ -418,6 +418,8 @@ fn push_filter(
         Expr::Arithmetic { .. } | Expr::Negate(_) => return Err(refused("arithmetic")),
         // Not expressible in the fragment language; the filter stays on the row side.
         Expr::Scalar { .. } => return Err(refused("a scalar function")),
+        // The fragment language has no pattern match; the filter stays on the row side.
+        Expr::Like { .. } => return Err(refused("LIKE")),
         // The fragment language has no conditional, and a `CASE` is the one expression whose
         // branches must **not** all be evaluated — pushing it down as anything else would change
         // which of them raises. Rows, and the row evaluator answers it.
@@ -700,6 +702,12 @@ fn collect_columns(expr: &Expr, into: &mut Vec<usize>) {
         | Expr::Negate(inner)
         | Expr::ToText { operand: inner, .. }
         | Expr::Scalar { operand: inner, .. } => collect_columns(inner, into),
+        Expr::Like {
+            operand, pattern, ..
+        } => {
+            collect_columns(operand, into);
+            collect_columns(pattern, into);
+        }
         Expr::IsNull { operand, .. } => collect_columns(operand, into),
         Expr::InList { operand, list, .. } => {
             collect_columns(operand, into);

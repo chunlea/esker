@@ -543,6 +543,12 @@ fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
                 Some(value) => Literal::Typed(Box::new(value.clone())),
             });
         }
+        Expr::Like {
+            operand, pattern, ..
+        } => {
+            substitute_in_expr(operand, outer, depth);
+            substitute_in_expr(pattern, outer, depth);
+        }
         Expr::Binary { left, right, .. } | Expr::Arithmetic { left, right, .. } => {
             substitute_in_expr(left, outer, depth);
             substitute_in_expr(right, outer, depth);
@@ -973,6 +979,12 @@ pub(super) fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
         Expr::Not(inner)
         | Expr::ToText { operand: inner, .. }
         | Expr::Scalar { operand: inner, .. } => walk(inner, visit),
+        Expr::Like {
+            operand, pattern, ..
+        } => {
+            walk(operand, visit);
+            walk(pattern, visit);
+        }
         Expr::IsNull { operand, .. } | Expr::Negate(operand) => walk(operand, visit),
         Expr::AnyArray { operand, array } => {
             walk(operand, visit);
@@ -1041,6 +1053,12 @@ fn walk_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr) -> Result<()>) ->
         Expr::Not(inner)
         | Expr::ToText { operand: inner, .. }
         | Expr::Scalar { operand: inner, .. } => walk_mut(inner, visit)?,
+        Expr::Like {
+            operand, pattern, ..
+        } => {
+            walk_mut(operand, visit)?;
+            walk_mut(pattern, visit)?;
+        }
         Expr::IsNull { operand, .. } | Expr::Negate(operand) => walk_mut(operand, visit)?,
         Expr::AnyArray { operand, array } => {
             walk_mut(operand, visit)?;

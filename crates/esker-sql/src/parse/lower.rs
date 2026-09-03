@@ -1778,6 +1778,7 @@ fn lower_insert(insert: &sqlparser::ast::Insert) -> Result<plan::Insert> {
     reason = "one arm per expression shape; splitting it would hide the vocabulary rather than clarify it"
 )]
 fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
+    let expr_ref = expr;
     match expr {
         Expr::Value(value) => lower_value(&value.value, false),
         Expr::UnaryOp {
@@ -1809,6 +1810,52 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             expr,
         } => lower_expr(expr),
         Expr::Nested(inner) => lower_expr(inner),
+        // `x [NOT] LIKE p [ESCAPE c]` and `ILIKE`, which is the same matcher with both sides
+        // folded. `ANY` is Snowflake's and is refused by name.
+        Expr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        }
+        | Expr::ILike {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => {
+            refuse_if(*any, "LIKE ANY, which is Snowflake's")?;
+            Ok(plan::Expr::Like {
+                operand: Box::new(lower_expr(expr)?),
+                pattern: Box::new(lower_expr(pattern)?),
+                negated: *negated,
+                case_insensitive: matches!(expr_ref, Expr::ILike { .. }),
+                // **`ESCAPE` replaces the backslash rather than adding to it**: with one written a
+                // lone `\` is an ordinary character. One character only, which is what
+                // PostgreSQL takes.
+                escape: match escape_char {
+                    None => None,
+                    Some(value) => match &value.value {
+                        Value::SingleQuotedString(text) => {
+                            let mut chars = text.chars();
+                            match (chars.next(), chars.next()) {
+                                (Some(one), None) => Some(one),
+                                _ => {
+                                    return Err(SqlError::unsupported(
+                                        "ESCAPE with more than one character",
+                                    ));
+                                }
+                            }
+                        }
+                        other => {
+                            return Err(SqlError::unsupported(format!("ESCAPE {other}")));
+                        }
+                    },
+                },
+            })
+        }
         // `ARRAY[…]` as a value. `= ANY(ARRAY[…])` never reaches here — that path reads the
         // elements as a list before the expression is lowered (`lower_array`) — so this is the
         // constructor standing on its own, in a projection or beside a comparison.

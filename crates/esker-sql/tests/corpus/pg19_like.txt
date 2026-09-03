@@ -1,0 +1,37 @@
+# `LIKE` and `NOT LIKE`, against PostgreSQL 19beta1.
+#
+# Not a shape any single suite statement needs — it is the operator the **partition capture's own
+# catalog probes** are written with (`relname LIKE 'measurements%'`), and a refusal there aborts the
+# capture's transaction and takes thirty-eight statements after it. Pinned here on its own.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`\` escapes `%` and `_` with no `ESCAPE` clause written.** `'a%c' LIKE 'a\%c'` is `t` and
+#     matches the literal per cent, where `'a%c' LIKE 'a%c'` is also `t` — by the wildcard. The two
+#     agree here and disagree the moment the subject changes, which is what makes the escape real
+#     rather than decorative.
+#   * **A NULL on either side is NULL, not false.** `NULL LIKE 'a%'` and `'abc' LIKE NULL` are both
+#     NULL, so a `WHERE` over them matches nothing and an `IS NOT NULL` beside them is not
+#     redundant.
+#   * **It is case-sensitive**: `'ABC' LIKE 'a%'` is `f`. `ILIKE` is the other operator and is the
+#     same matcher with both sides folded — `'ABC' ILIKE 'a%'` is `t`.
+#   * **`ESCAPE '#'` replaces the backslash**, it does not add to it: with it written, `\` is an
+#     ordinary character and `#` is the escape.
+#   * **A non-text operand is `42883`, not a cast.** `100 LIKE '1%'` is
+#     `operator does not exist: integer ~~ unknown` — `~~` being `LIKE`'s internal name, which is
+#     what a client sees in the message.
+SELECT 'abc' LIKE 'a%', 'abc' LIKE '%c', 'abc' LIKE 'a_c', 'abc' LIKE 'abc', 'abc' LIKE 'b%'	boolean,boolean,boolean,boolean,boolean	t|t|t|t|f
+SELECT 'abc' NOT LIKE 'a%', 'a%c' LIKE 'a\%c', 'a%c' LIKE 'a%c'	boolean,boolean,boolean	f|t|t
+SELECT NULL LIKE 'a%', 'abc' LIKE NULL	boolean,boolean	\N|\N
+SELECT 'ABC' LIKE 'a%', 'abc' LIKE '%'	boolean,boolean	f|t
+SELECT 'a_c' LIKE 'a\_c', 'abc' LIKE 'a\_c'	boolean,boolean	t|f
+SELECT 100 LIKE '1%'	!42883 operator does not exist: integer ~~ unknown DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'abc' LIKE 'a%' AND 'x' LIKE 'x'	boolean	t
+SELECT 'ABC' ILIKE 'a%', 'abc' ILIKE 'A_C', 'abc' NOT ILIKE 'a%'	boolean,boolean,boolean	t|t|f
+SELECT 'ABC' LIKE 'a%'	boolean	f
+SELECT 'x' LIKE 'x' ESCAPE '#', 'a%c' LIKE 'a#%c' ESCAPE '#'	boolean,boolean	t|t
+SELECT 'ab' LIKE 'a\\b'	boolean	f
+SELECT NULL ILIKE 'a%'	boolean	\N

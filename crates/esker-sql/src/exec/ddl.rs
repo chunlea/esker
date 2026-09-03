@@ -1293,6 +1293,19 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
             .get(*at)
             .map_or_else(|| format!("<column {at}>"), |column| column.name.clone()),
         Expr::Literal(literal) => deparse_literal(literal, ty),
+        Expr::Like {
+            operand,
+            pattern,
+            negated,
+            case_insensitive,
+            ..
+        } => format!(
+            "({} {}{} {})",
+            sub(operand),
+            if *negated { "NOT " } else { "" },
+            if *case_insensitive { "ILIKE" } else { "LIKE" },
+            sub(pattern)
+        ),
         Expr::Binary { op, left, right } => {
             format!("({} {} {})", sub(left), op.symbol(), sub(right))
         }
