@@ -1,0 +1,19 @@
+docs/adr/0050-a-user-defined-type-is-a-value.md
+  s_6f7019c05b578b::t_f7bf723e507bb7 1,3-7,79-116,119-122
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "e3172b7e9964d222b39fc2378b14e65ad6cd0baf",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
