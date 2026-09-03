@@ -1,0 +1,75 @@
+# What an aggregate's result **type** is, as PostgreSQL 19beta1 declares it.
+#
+# `array_agg` is the one this file is for: its result is the array type of its argument, and this
+# node declared `text` for every one of them — right rows, wrong type, in three corpora at once
+# (`tests/array.rs`, `tests/array_subquery.rs`, `tests/values_relation.rs`). The rest of the
+# aggregate surface is captured beside it so that fixing one cannot quietly move another.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# Captured in one session inside `BEGIN … ROLLBACK`, in this order.
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **An untyped argument is `42725`, not `text[]`.** `array_agg('lit')` and `array_agg(NULL)`
+#     are "function array_agg(unknown) is not unique" — PostgreSQL has one `array_agg` per element
+#     type and an `unknown` matches all of them. Answering `text[]` there would be answering where
+#     a real server raises.
+#   * **Zero rows is NULL and the declared type is unchanged**: `array_agg(i4)` over no rows is
+#     NULL and still declares `integer[]`. The type is the *argument's*, decided before a row is
+#     read, which is why an empty group cannot make it `text`.
+#   * `DISTINCT`, `ORDER BY` and an expression argument change nothing: `array_agg(i4 + 1)` is
+#     `integer[]` because `i4 + 1` is an `integer`.
+#   * **`array_agg(i4)[1]` is a syntax error on a real server too** — subscripting a function call
+#     needs parentheses — so it is `42601` here and that is parity, not a gap.
+#   * `sum` widens and `avg` does not follow it: `sum(int8)` is `numeric` where `avg(int8)` is
+#     `numeric` too, but `sum(int4)` is `bigint` where `avg(int4)` is `numeric`.
+#   * **An untyped argument is `42725` for three of the six and `text` for the other three.**
+#     `sum('lit')`, `avg('lit')` and `array_agg('lit')` are "is not unique" — one candidate per
+#     input type, and an `unknown` matches all of them — while `min('lit')` answers `lit`,
+#     `max(NULL)` answers NULL and `count('lit')` answers 1. Six measurements, not one rule.
+#   * **`(array_agg(i))[1]` is the spelling that works**: the parentheses are PostgreSQL's grammar,
+#     not a style, and without them `[` is `42601` — a statement a real server refuses.
+CREATE TABLE ag (id int8 PRIMARY KEY, i4 int4, i2 int2, t text, n numeric, d float8, b bool, ts timestamptz, u uuid)		-
+INSERT INTO ag VALUES (1, 10, 5, 'a', 1.5, 2.5, true, '2020-01-01 00:00:00+00', '00000000-0000-0000-0000-000000000001')		-
+SELECT 'r', array_agg(i4) FROM ag	text,integer[]	r|{10}
+SELECT 'r', pg_typeof(array_agg(i4)) FROM ag	text,regtype	r|integer[]
+SELECT 'r', pg_typeof(array_agg(i2)) FROM ag	text,regtype	r|smallint[]
+SELECT 'r', pg_typeof(array_agg(id)) FROM ag	text,regtype	r|bigint[]
+SELECT 'r', pg_typeof(array_agg(t)) FROM ag	text,regtype	r|text[]
+SELECT 'r', pg_typeof(array_agg(n)) FROM ag	text,regtype	r|numeric[]
+SELECT 'r', pg_typeof(array_agg(d)) FROM ag	text,regtype	r|double precision[]
+SELECT 'r', pg_typeof(array_agg(b)) FROM ag	text,regtype	r|boolean[]
+SELECT 'r', pg_typeof(array_agg(ts)) FROM ag	text,regtype	r|timestamp with time zone[]
+SELECT 'r', pg_typeof(array_agg(u)) FROM ag	text,regtype	r|uuid[]
+SELECT 'r', pg_typeof(array_agg(DISTINCT i4)) FROM ag	text,regtype	r|integer[]
+SELECT 'r', pg_typeof(array_agg(i4 ORDER BY i4 DESC)) FROM ag	text,regtype	r|integer[]
+SELECT 'r', pg_typeof(array_agg(i4 + 1)) FROM ag	text,regtype	r|integer[]
+SELECT 'r', pg_typeof(array_agg(i4)) FROM ag WHERE false	text,regtype	r|integer[]
+SELECT 'r', array_agg(i4) FROM ag WHERE false	text,integer[]	r|\N
+SELECT 'r', pg_typeof(array_agg(t || 'x')) FROM ag	text,regtype	r|text[]
+SELECT 'r', pg_typeof(array_agg('lit')) FROM ag	!42725 function array_agg(unknown) is not unique DETAIL: Could not choose a best candidate function. HINT: You might need to add explicit type casts.
+SELECT 'r', pg_typeof(array_agg(1)) FROM ag	text,regtype	r|integer[]
+SELECT 'r', pg_typeof(array_agg(NULL)) FROM ag	!42725 function array_agg(unknown) is not unique DETAIL: Could not choose a best candidate function. HINT: You might need to add explicit type casts.
+SELECT 'r', pg_typeof(string_agg(t, ',')) FROM ag	text,regtype	r|text
+SELECT 'r', pg_typeof(min(i4)), pg_typeof(max(i2)), pg_typeof(count(*)) FROM ag	text,regtype,regtype,regtype	r|integer|smallint|bigint
+SELECT 'r', pg_typeof(sum(i4)), pg_typeof(sum(i2)), pg_typeof(sum(id)), pg_typeof(sum(n)), pg_typeof(sum(d)) FROM ag	text,regtype,regtype,regtype,regtype,regtype	r|bigint|bigint|numeric|numeric|double precision
+SELECT 'r', pg_typeof(avg(i4)), pg_typeof(avg(id)), pg_typeof(avg(n)), pg_typeof(avg(d)) FROM ag	text,regtype,regtype,regtype,regtype	r|numeric|numeric|numeric|double precision
+SELECT 'r', pg_typeof(array_agg(i4)::text) FROM ag	text,regtype	r|text
+SELECT 'r', array_agg(i4)[1] FROM ag	!42601 syntax error at or near "["
+SELECT 'r', array_length(array_agg(i4), 1) FROM ag	text,integer	r|1
+SELECT 'r', min('lit') FROM ag	text,text	r|lit
+SELECT 'r', min(NULL) FROM ag	text,text	r|\N
+SELECT 'r', max(NULL) FROM ag	text,text	r|\N
+SELECT 'r', count('lit') FROM ag	text,bigint	r|1
+SELECT 'r', sum('lit') FROM ag	!42725 function sum(unknown) is not unique DETAIL: Could not choose a best candidate function. HINT: You might need to add explicit type casts.
+SELECT 'r', avg('lit') FROM ag	!42725 function avg(unknown) is not unique DETAIL: Could not choose a best candidate function. HINT: You might need to add explicit type casts.
+SELECT 'r', array_agg('lit') FROM ag	!42725 function array_agg(unknown) is not unique DETAIL: Could not choose a best candidate function. HINT: You might need to add explicit type casts.
+SELECT 'r', pg_typeof(array_agg('lit'::text)) FROM ag	text,regtype	r|text[]
+SELECT 'r', pg_typeof(array_agg(NULL::int4)) FROM ag	text,regtype	r|integer[]
+SELECT 'r', array_agg(NULL::int4) FROM ag	text,integer[]	r|{NULL}
+SELECT 'r', (array_agg(i4))[1] FROM ag	text,integer	r|10
+SELECT 'r', pg_typeof(array_agg(i4)) FROM ag GROUP BY t	text,regtype	r|integer[]
+SELECT 'r', array_agg(i4) IS NULL FROM ag WHERE false	text,boolean	r|t

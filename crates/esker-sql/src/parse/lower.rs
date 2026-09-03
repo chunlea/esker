@@ -2168,6 +2168,17 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             // `d` with `indkey` and then the subscript after it, where `('{a,b}')[1]` is the array
             // with only the subscript. Both are one element of one array; a longer chain is a
             // field access this node does not have.
+            // **A function call cannot be subscripted directly**, and that is PostgreSQL's
+            // grammar rather than a limitation here: `array_agg(i)[1]` is
+            // `42601 syntax error at or near "["` on a real server and `(array_agg(i))[1]` is the
+            // spelling that works. `sqlparser` accepts both, so the parenthesised one is told
+            // apart by the `Nested` it keeps — without this, this node answered a value where a
+            // real server refuses the statement.
+            if let [AccessExpr::Subscript(_)] = access_chain.as_slice()
+                && matches!(root.as_ref(), Expr::Function(_))
+            {
+                return Err(SqlError::SyntaxAtOrNear("[".to_owned()));
+            }
             let (operand, subscript) = match access_chain.as_slice() {
                 [AccessExpr::Subscript(subscript)] => (lower_expr(root)?, subscript),
                 [

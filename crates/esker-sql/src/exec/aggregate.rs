@@ -148,10 +148,13 @@ impl Aggregation {
         };
         match func {
             AggregateFunc::Count => Ok(ColumnType::Int8),
-            // An array of the argument's type on a real server — `bigint[]` over an `int8` — and
-            // `text` here, which is what an array is on this node (`crate::value::vector`). The
-            // declared type is the standing divergence; the value is byte-identical.
-            AggregateFunc::ArrayAgg => Ok(ColumnType::Text),
+            // **The argument's array type**, which is what a real server declares: `array_agg` of
+            // an `int4` is an `integer[]`. This node has four array types (ADR 0047), so an
+            // aggregate over any other element has no type to name and keeps `text` — the value is
+            // the same array either way, and only the declared type differs.
+            AggregateFunc::ArrayAgg => {
+                Ok(esker_keys::array::ArrayValue::array_of(arg).unwrap_or(ColumnType::Text))
+            }
             // **`sum` widens, and the width it goes to is not uniform.** Measured: `int2` and
             // `int4` sum to `bigint`, `int8` sums to **numeric** — which is why an `int8` sum
             // cannot overflow on a real server — and a `numeric` sums to `numeric`. A `float8`
@@ -361,6 +364,10 @@ impl Aggregation {
     /// A grouping key becomes its position; an aggregate call becomes its position after the keys;
     /// anything else recurses. What cannot be rewritten is a column reference that is neither, and
     /// that is `42803` — the whole rule of a grouped query, enforced in one place.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per expression that holds another; the list being complete is the point"
+    )]
     pub(super) fn rewrite(&self, expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
         if let Some(at) = self.keys.iter().position(|key| key == expr) {
             return Ok(Expr::Ordinal {
@@ -433,6 +440,87 @@ impl Aggregation {
                 operand: Box::new(self.rewrite(operand, scope)?),
                 negated: *negated,
             },
+            // **Every expression that holds another has to descend**, and the reason is not
+            // symmetry: an aggregate left un-rewritten inside one reaches the row evaluator, which
+            // has no group to read it from and answers `XX000`. `pg_typeof(array_agg(i))`,
+            // `array_length(array_agg(i), 1)` and `abs(min(n))` were all that internal error —
+            // valid SQL, answered with a bug report. The arms below are every variant with a
+            // child; the `other` at the end is the leaves.
+            Expr::Negate(operand) => Expr::Negate(Box::new(self.rewrite(operand, scope)?)),
+            Expr::Arithmetic {
+                op,
+                left,
+                right,
+                ty,
+            } => Expr::Arithmetic {
+                op: *op,
+                left: Box::new(self.rewrite(left, scope)?),
+                right: Box::new(self.rewrite(right, scope)?),
+                ty: *ty,
+            },
+            Expr::Scalar { func, operand } => Expr::Scalar {
+                func: *func,
+                operand: Box::new(self.rewrite(operand, scope)?),
+            },
+            Expr::ToText {
+                operand,
+                strip_blanks,
+            } => Expr::ToText {
+                operand: Box::new(self.rewrite(operand, scope)?),
+                strip_blanks: *strip_blanks,
+            },
+            Expr::CatalogFunc(call) => {
+                let mut rewritten = call.clone();
+                for arg in &mut rewritten.args {
+                    *arg = self.rewrite(arg, scope)?;
+                }
+                Expr::CatalogFunc(rewritten)
+            }
+            Expr::AnyArray { operand, array } => Expr::AnyArray {
+                operand: Box::new(self.rewrite(operand, scope)?),
+                array: Box::new(self.rewrite(array, scope)?),
+            },
+            Expr::Subscript {
+                operand,
+                index,
+                element,
+            } => Expr::Subscript {
+                operand: Box::new(self.rewrite(operand, scope)?),
+                index: Box::new(self.rewrite(index, scope)?),
+                element: *element,
+            },
+            Expr::Like {
+                operand,
+                pattern,
+                negated,
+                case_insensitive,
+                escape,
+            } => Expr::Like {
+                operand: Box::new(self.rewrite(operand, scope)?),
+                pattern: Box::new(self.rewrite(pattern, scope)?),
+                negated: *negated,
+                case_insensitive: *case_insensitive,
+                escape: *escape,
+            },
+            Expr::Case {
+                branches,
+                otherwise,
+            } => Expr::Case {
+                branches: branches
+                    .iter()
+                    .map(|branch| {
+                        Ok(crate::plan::CaseBranch {
+                            when: self.rewrite(&branch.when, scope)?,
+                            then: self.rewrite(&branch.then, scope)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                otherwise: otherwise
+                    .as_deref()
+                    .map(|expr| self.rewrite(expr, scope))
+                    .transpose()?
+                    .map(Box::new),
+            },
             // A subquery is a constant of the outer row, so the sub-plan is passed through — but
             // its **operand** is an expression of that row like any other, and
             // `HAVING max(k) IN (SELECT …)` needs the `max(k)` rewritten into the aggregated row.
@@ -488,11 +576,52 @@ fn aggregate_calls(expr: &Expr) -> Vec<&AggregateCall> {
 fn walk<'a>(expr: &'a Expr, found: &mut Vec<&'a AggregateCall>) {
     match expr {
         Expr::Aggregate(call) => found.push(call),
-        Expr::Binary { left, right, .. } => {
+        // **Every expression that holds another**, and this list is the reason
+        // `pg_typeof(array_agg(i))` used to be an internal error: an aggregate the collector does
+        // not see is an aggregate the statement is not planned around, so it survives into the row
+        // evaluator, which has no group to read it from. The blind spot was one `_ => {}`, and it
+        // was the same one in `Aggregation::rewrite`.
+        Expr::Not(operand)
+        | Expr::IsNull { operand, .. }
+        | Expr::Negate(operand)
+        | Expr::Scalar { operand, .. }
+        | Expr::ToText { operand, .. } => walk(operand, found),
+        Expr::Binary { left, right, .. }
+        | Expr::Arithmetic { left, right, .. }
+        | Expr::AnyArray {
+            operand: left,
+            array: right,
+        }
+        | Expr::Subscript {
+            operand: left,
+            index: right,
+            ..
+        }
+        | Expr::Like {
+            operand: left,
+            pattern: right,
+            ..
+        } => {
             walk(left, found);
             walk(right, found);
         }
-        Expr::Not(operand) | Expr::IsNull { operand, .. } => walk(operand, found),
+        Expr::CatalogFunc(call) => {
+            for arg in &call.args {
+                walk(arg, found);
+            }
+        }
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            for branch in branches {
+                walk(&branch.when, found);
+                walk(&branch.then, found);
+            }
+            if let Some(otherwise) = otherwise {
+                walk(otherwise, found);
+            }
+        }
         Expr::InList { operand, list, .. } => {
             walk(operand, found);
             for item in list {
@@ -563,7 +692,14 @@ enum State {
     /// The only state here that is **not** constant in the group's size, which is the price of an
     /// aggregate that keeps its inputs rather than folding them. Bounded by the same
     /// [`GROUP_LIMIT`] the group table and the `DISTINCT` set are, and for the same reason.
-    Gather(Vec<(Vec<Datum>, Datum)>),
+    Gather {
+        /// The argument's type, which is the array's element type. `None` for an argument whose
+        /// type this node could not name — the value is then gathered as text, the way every
+        /// `array_agg` was before ADR 0047 gave arrays a type of their own.
+        element: Option<ColumnType>,
+        /// Each value with the sort key its own `ORDER BY` gave it.
+        values: Vec<(Vec<Datum>, Datum)>,
+    },
 }
 
 /// One aggregate call, resolved into the spec the accumulator is built from.
@@ -572,6 +708,20 @@ fn resolve_aggregate(call: &AggregateCall, scope: &Scope<'_>) -> Result<Aggregat
         .arg()
         .map(|arg| super::query::resolve(arg, scope))
         .transpose()?;
+    // **An argument with no type is `42725` for three of the six**, and it is not a blanket rule:
+    // `min`, `max` and `count` resolve an `unknown` to `text` and answer, while `sum`, `avg` and
+    // `array_agg` have one candidate per input type and cannot choose. Each of the six was put to
+    // a real server; a node that defaulted all of them to `text` would answer where three of them
+    // raise, which is ADR 0031's worst class.
+    if matches!(
+        call.func,
+        AggregateFunc::Sum | AggregateFunc::Avg | AggregateFunc::ArrayAgg
+    ) && arg.as_ref().is_some_and(is_unknown)
+    {
+        return Err(SqlError::AmbiguousFunction {
+            func: call.func.name(),
+        });
+    }
     let arg_type = arg
         .as_ref()
         .map(|arg| super::query::expr_type(arg, scope))
@@ -583,6 +733,19 @@ fn resolve_aggregate(call: &AggregateCall, scope: &Scope<'_>) -> Result<Aggregat
         arg_type,
         order_by: resolve_aggregate_order_by(call, scope)?,
     })
+}
+
+/// Whether an argument is PostgreSQL's `unknown`: a **quoted string**, which carries no type until
+/// something else gives it one.
+///
+/// **A bare NULL is not included, and that is a deliberate under-reach.** It is an `unknown` on a
+/// real server too — `array_agg(NULL)` is the same `42725` there — but this crate drops the cast on
+/// a NULL at lowering, so `NULL` and `NULL::int4` arrive here as the same `Literal::Null` and a
+/// rule that refused one would refuse the other. `array_agg(NULL::int4)` is `{NULL}` on a real
+/// server; refusing a statement it answers is worse than answering one it refuses, so the bare NULL
+/// stays a declared divergence until `Literal::Null` carries a type.
+fn is_unknown(arg: &Expr) -> bool {
+    matches!(arg, Expr::Literal(Literal::String(_)))
 }
 
 /// One aggregate's own `ORDER BY`, resolved against the **input** row.
@@ -635,7 +798,10 @@ impl Accumulator {
             (AggregateFunc::Avg, _) => State::AvgFloat { sum: 0.0, seen: 0 },
             (AggregateFunc::Sum, _) => State::SumFloat(None),
             (AggregateFunc::Min | AggregateFunc::Max, _) => State::Extreme(None),
-            (AggregateFunc::ArrayAgg, _) => State::Gather(Vec::new()),
+            (AggregateFunc::ArrayAgg, element) => State::Gather {
+                element,
+                values: Vec::new(),
+            },
         };
         Accumulator {
             func: spec.func,
@@ -713,7 +879,7 @@ impl Accumulator {
             }
             // **Every value kept, with the key it sorts under** — the fold happens at `finish`,
             // because the order is not known until the group is complete.
-            (State::Gather(values), value) => {
+            (State::Gather { values, .. }, value) => {
                 if values.len() == GROUP_LIMIT {
                     return Err(SqlError::ConfigurationLimitExceeded(format!(
                         "an array_agg over more than {GROUP_LIMIT} values needs more memory than                          this node will use; add a WHERE"
@@ -779,20 +945,32 @@ impl Accumulator {
             // that surprises: `array_agg(id) FROM t WHERE false` is NULL where `count(id)` is 0.
             // An empty array would make `array_length(…, 1)` answer NULL for a different reason
             // and `IS NULL` answer false, so the two are not interchangeable.
-            State::Gather(values) if values.is_empty() => Datum::Null,
-            State::Gather(values) => {
+            State::Gather { values, .. } if values.is_empty() => Datum::Null,
+            State::Gather { element, values } => {
                 let mut values = values.clone();
                 // Stable, so values with equal keys keep the order they arrived in — which is the
                 // input order, and is what a real server's sort does with them too.
                 values.sort_by(|(left, _), (right, _)| {
                     super::cursor::compare_values(&self.order_by, left, right)
                 });
-                Datum::Text(crate::value::vector::Array::write(
-                    &values
-                        .into_iter()
-                        .map(|(_, value)| value.to_text())
-                        .collect::<Vec<_>>(),
-                ))
+                let values: Vec<Datum> = values.into_iter().map(|(_, value)| value).collect();
+                match element {
+                    // **A real array value, not its text.** What the declared type says the column
+                    // is, the datum now is — so `pg_typeof` reads `integer[]` off the value and a
+                    // client is sent the array's own oid. An element type this node cannot name
+                    // keeps the text form below, which is what every `array_agg` used to answer.
+                    Some(element) => Datum::Array(esker_keys::array::ArrayValue::one_dimensional(
+                        *element,
+                        1,
+                        values
+                            .into_iter()
+                            .map(|value| (!matches!(value, Datum::Null)).then_some(value))
+                            .collect(),
+                    )),
+                    None => Datum::Text(crate::value::vector::Array::write(
+                        &values.iter().map(Datum::to_text).collect::<Vec<_>>(),
+                    )),
+                }
             }
         }
     }

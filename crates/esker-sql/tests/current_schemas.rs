@@ -53,13 +53,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              stored arrays.",
         ),
         (
-            "SELECT current_schemas(false)[1]",
-            "Subscripting is `42601 syntax error at or near \"[\"` on a real server — its *parser* \
-             refuses it because `current_schemas(false)` is not a subscriptable expression there \
-             either. This node answers `0A000` naming the expression: both refuse, with different \
-             codes.",
-        ),
-        (
             "SELECT pg_typeof(current_schemas(false)), pg_typeof(current_schema)",
             "`pg_typeof` is not implemented, `0A000` naming it.",
         ),

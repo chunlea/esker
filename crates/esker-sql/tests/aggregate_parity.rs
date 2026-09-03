@@ -58,10 +58,6 @@ const TYPE_DIVERGENCES: &[&str] = &[
 const DIVERGENCES: &[(&str, &str)] = &[
     // ADR 0031, and the whole of what an int8 sum costs.
     // avg over an integer column: numeric with sixteen fractional digits, which no float8 renders.
-    (
-        "SELECT avg(n)::text FROM agg",
-        "a cast, and avg(bigint) under it",
-    ),
     // The group order, which is a promise PostgreSQL does not make and this node does.
     (
         "SELECT g, count(*) FROM agg GROUP BY g",
@@ -99,10 +95,6 @@ const DIVERGENCES: &[(&str, &str)] = &[
     (
         "SELECT string_agg(g, ',') FROM agg",
         "string_agg is not among the five aggregates",
-    ),
-    (
-        "SELECT array_agg(n) FROM agg",
-        "array_agg, and there is no array type",
     ),
     ("SELECT count(*) + 1 FROM agg", "arithmetic"),
     ("SELECT sum(n) + 0 FROM agg", "arithmetic"),

@@ -204,6 +204,18 @@ pub enum SqlError {
     #[error("permission denied: \"{0}\" is a system catalog")]
     SystemCatalog(&'static str),
 
+    /// An aggregate whose argument has **no type**: `sum('lit')`, `array_agg(NULL)`.
+    ///
+    /// PostgreSQL has one candidate per input type and an `unknown` matches all of them, so the
+    /// call is ambiguous rather than defaulted. Measured, and it is *not* a blanket rule: `min`,
+    /// `max` and `count` resolve an unknown to `text` and answer, while `sum`, `avg` and
+    /// `array_agg` are this error. Each of those six was put to a real server.
+    #[error("function {func}(unknown) is not unique")]
+    AmbiguousFunction {
+        /// The aggregate's name, as the user spelled the function.
+        func: &'static str,
+    },
+
     /// No such index.
     #[error("index \"{0}\" does not exist")]
     UndefinedIndex(String),
@@ -1482,6 +1494,7 @@ impl SqlError {
             SqlError::AmbiguousColumn(_) | SqlError::AmbiguousOrderBy(_) => {
                 sqlstate::AMBIGUOUS_COLUMN
             }
+            SqlError::AmbiguousFunction { .. } => sqlstate::AMBIGUOUS_FUNCTION,
             SqlError::UndefinedIndex(_)
             | SqlError::UndefinedType(_)
             | SqlError::UndefinedLanguage(_)
@@ -1668,6 +1681,9 @@ impl SqlError {
     #[must_use]
     pub fn detail(&self) -> Option<String> {
         match self {
+            SqlError::AmbiguousFunction { .. } => {
+                Some("Could not choose a best candidate function.".to_owned())
+            }
             SqlError::ForwardCteReference(name) => Some(format!(
                 "There is a WITH item named \"{name}\", but it cannot be referenced from this \
                  part of the query."
@@ -1830,7 +1846,10 @@ impl SqlError {
             }
             // The same hint a real server sends with the same `42883`, word for word, for an
             // operator and for an aggregate alike.
-            SqlError::UndefinedOperator { .. }
+            // The same sentence for all four, which is what a real server sends: an operator or
+            // a function that will not resolve is a cast away from one that would.
+            SqlError::AmbiguousFunction { .. }
+            | SqlError::UndefinedOperator { .. }
             | SqlError::UndefinedAggregate { .. }
             | SqlError::UndefinedFunctionTypes(_) => {
                 Some("You might need to add explicit type casts.".to_owned())

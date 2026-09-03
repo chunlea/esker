@@ -185,6 +185,9 @@ pub const UNDEFINED_COLUMN: &str = "42703";
 pub const UNDEFINED_TABLE: &str = "42P01";
 /// A bare column name that more than one table in the query has.
 pub const AMBIGUOUS_COLUMN: &str = "42702";
+/// A call whose argument types match more than one candidate: `sum('lit')`, where the `unknown`
+/// literal fits every `sum` PostgreSQL has.
+pub const AMBIGUOUS_FUNCTION: &str = "42725";
 /// Two FROM entries under one name — `FROM t JOIN t`, or two aliases spelled the same.
 pub const DUPLICATE_ALIAS: &str = "42712";
 /// `CREATE TABLE` for a name that already exists.
@@ -334,6 +337,7 @@ mod tests {
         ("UNDEFINED_COLUMN", super::UNDEFINED_COLUMN),
         ("UNDEFINED_TABLE", super::UNDEFINED_TABLE),
         ("AMBIGUOUS_COLUMN", super::AMBIGUOUS_COLUMN),
+        ("AMBIGUOUS_FUNCTION", super::AMBIGUOUS_FUNCTION),
         ("DUPLICATE_ALIAS", super::DUPLICATE_ALIAS),
         ("DUPLICATE_TABLE", super::DUPLICATE_TABLE),
         ("DUPLICATE_COLUMN", super::DUPLICATE_COLUMN),
