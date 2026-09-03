@@ -2505,6 +2505,19 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             operand: Box::new(lower_expr(operand)?),
             negated: true,
         }),
+        // **Not a `NOT` around an `=`.** The two are one operator each, because the negation of
+        // unknown is unknown and `NOT (NULL = NULL)` is therefore NULL where
+        // `NULL IS DISTINCT FROM NULL` is `false`.
+        Expr::IsDistinctFrom(left, right) => Ok(plan::Expr::Binary {
+            op: plan::BinaryOp::Distinct,
+            left: Box::new(lower_expr(left)?),
+            right: Box::new(lower_expr(right)?),
+        }),
+        Expr::IsNotDistinctFrom(left, right) => Ok(plan::Expr::Binary {
+            op: plan::BinaryOp::NotDistinct,
+            left: Box::new(lower_expr(left)?),
+            right: Box::new(lower_expr(right)?),
+        }),
         Expr::UnaryOp {
             op: UnaryOperator::Not,
             expr,

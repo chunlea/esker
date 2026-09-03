@@ -446,6 +446,13 @@ fn push_filter(
             operand: Box::new(push_filter(operand, slot, types)?),
             negated: *negated,
         },
+        // **A null-safe comparison is not one of the fragment's six.** The columnar reader's
+        // `Compare` follows the ordinary NULL rule, so pushing `IS NOT DISTINCT FROM` down as an
+        // `Eq` would answer unknown where it must answer `false`. Rows, and the row evaluator.
+        Expr::Binary {
+            op: op @ (BinaryOp::Distinct | BinaryOp::NotDistinct),
+            ..
+        } => return Err(refused(op.symbol())),
         Expr::Binary { op, left, right } => {
             let left = push_filter(left, slot, types)?;
             let right = push_filter(right, slot, types)?;
@@ -486,6 +493,9 @@ fn push_filter(
                     left,
                     right,
                 },
+                BinaryOp::Distinct | BinaryOp::NotDistinct => {
+                    unreachable!("refused above")
+                }
             }
         }
         Expr::InList { .. } => return Err(refused("IN inside a pushed-down filter")),

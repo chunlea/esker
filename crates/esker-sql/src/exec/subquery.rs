@@ -821,7 +821,8 @@ fn quantified(op: BinaryOp, all: bool, operand: Option<Datum>, values: &[Datum])
 ///
 /// The connectives cannot arrive: PostgreSQL's grammar has no `x AND ANY (…)`, and the lowering
 /// refuses every operator but the six. `false` for them is the answer that keeps this total
-/// without a panic on a shape the parser will not produce.
+/// without a panic on a shape the parser will not produce — and the same is true of the two
+/// null-safe comparisons, which PostgreSQL's grammar has no `ANY` form of either.
 fn compare(op: BinaryOp, left: &Datum, right: &Datum) -> bool {
     let ordering = left.pg_cmp(right);
     match op {
@@ -831,7 +832,7 @@ fn compare(op: BinaryOp, left: &Datum, right: &Datum) -> bool {
         BinaryOp::LtEq => ordering.is_le(),
         BinaryOp::Gt => ordering.is_gt(),
         BinaryOp::GtEq => ordering.is_ge(),
-        BinaryOp::And | BinaryOp::Or => false,
+        BinaryOp::And | BinaryOp::Or | BinaryOp::Distinct | BinaryOp::NotDistinct => false,
     }
 }
 
