@@ -141,3 +141,78 @@ fn a_parameter_binds_in_every_clause_that_can_hold_one() {
         }
     );
 }
+
+/// **A parameter inside a subquery is numbered in the statement holding it**, and the pair of
+/// walkers stopped at the boundary.
+///
+/// The same bug the clause list above fixed, one level up: `walk_select_mut` visits every clause
+/// of *a* `SELECT` and neither walker descended into a nested one, so a `$1` under an `IN
+/// (SELECT …)` was never counted, never typed and never substituted — `42P18 could not determine
+/// data type of parameter $1` at `Parse`, for a value the client was about to send.
+///
+/// Nothing here writes. It is in this file rather than beside the `delete_all` corpus that found
+/// it because it is not a fact about writing: `SELECT` had it too, and no corpus had reached it.
+#[test]
+fn a_parameter_binds_inside_a_subquery() {
+    let mut node = bind::Node::new();
+    node.bound(
+        "CREATE TABLE sq_bp (id bigserial primary key, n integer, title text)",
+        &[],
+    )
+    .unwrap();
+    node.bound(
+        "INSERT INTO sq_bp (n, title) VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+        &[],
+    )
+    .unwrap();
+    let one = |text: &str| Some(text.as_bytes().to_vec());
+    let count = |rows: &str| bind::Answer::Rows {
+        types: vec!["bigint".to_owned()],
+        rows: vec![vec![rows.to_owned()]],
+    };
+
+    // The subquery's own `WHERE`: `$1` is typed by `n`, which is a column of a table the outer
+    // statement does not name in its `FROM`.
+    assert_eq!(
+        node.answer(
+            "SELECT count(*) FROM sq_bp WHERE id IN (SELECT id FROM sq_bp WHERE n > $1)",
+            &[one("1")]
+        ),
+        count("2")
+    );
+    // The subquery's `LIMIT`, which is what `delete_all` on a limited relation sends.
+    assert_eq!(
+        node.answer(
+            "SELECT count(*) FROM sq_bp WHERE id IN (SELECT id FROM sq_bp LIMIT $1)",
+            &[one("2")]
+        ),
+        count("2")
+    );
+    // **The operand side of the `IN`**, which is a second field the arm has to walk: it is held
+    // on the subquery expression rather than beside it, so an arm that walked only the
+    // sub-`SELECT` would leave this one behind.
+    assert_eq!(
+        node.answer(
+            "SELECT count(*) FROM sq_bp WHERE $1 IN (SELECT n FROM sq_bp)",
+            &[one("2")]
+        ),
+        count("3")
+    );
+    // An `EXISTS` correlated with the outer row, with the parameter inside it.
+    assert_eq!(
+        node.answer(
+            "SELECT count(*) FROM sq_bp o WHERE EXISTS (SELECT 1 FROM sq_bp i WHERE i.id = o.id \
+             AND i.title = $1)",
+            &[one("b")]
+        ),
+        count("1")
+    );
+    // A scalar subquery in the target list.
+    assert_eq!(
+        node.answer(
+            "SELECT (SELECT count(*) FROM sq_bp WHERE n > $1)",
+            &[one("1")]
+        ),
+        count("2")
+    );
+}
