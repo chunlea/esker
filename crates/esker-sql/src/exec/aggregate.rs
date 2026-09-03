@@ -763,12 +763,15 @@ fn resolve_aggregate(call: &AggregateCall, scope: &Scope<'_>) -> Result<Aggregat
 /// Whether an argument is PostgreSQL's `unknown`: a **quoted string**, which carries no type until
 /// something else gives it one.
 ///
-/// **A bare NULL is not included, and that is a deliberate under-reach.** It is an `unknown` on a
-/// real server too — `array_agg(NULL)` is the same `42725` there — but this crate drops the cast on
-/// a NULL at lowering, so `NULL` and `NULL::int4` arrive here as the same `Literal::Null` and a
-/// rule that refused one would refuse the other. `array_agg(NULL::int4)` is `{NULL}` on a real
-/// server; refusing a statement it answers is worse than answering one it refuses, so the bare NULL
-/// stays a declared divergence until `Literal::Null` carries a type.
+/// **A bare NULL is not included, and the reason it could not be has gone.** It is an `unknown` on
+/// a real server too — `array_agg(NULL)` is the same `42725` there — and the under-reach was that
+/// this crate dropped the cast on a NULL at lowering, so `NULL` and `NULL::int4` arrived here as
+/// the same `Literal::Null` and a rule that refused one would have refused the other.
+/// `Literal::TypedNull` ended that: `array_agg(NULL::int4)` is `{NULL}` here as it is there, and
+/// widening this function to `Literal::Null` would no longer take it with it. What the widening
+/// still owes is a capture — only `array_agg`'s half of the bare-NULL family has been put to the
+/// oracle, and the six aggregates did not agree with each other on the quoted-string form either.
+/// Until then the bare NULL stays a declared divergence in `tests/aggregate_type.rs`.
 fn is_unknown(arg: &Expr) -> bool {
     matches!(arg, Expr::Literal(Literal::String(_)))
 }
