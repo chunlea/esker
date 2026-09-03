@@ -19,36 +19,31 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // The standing catalog trade: `current_schema` is a `name` on a real server and
     // `current_schemas(false)` a `name[]`; both are `text` here, with the same characters in them.
     // The rows agree — `public` and `{public}`.
+    // The standing catalog trade: `nspname` and `relname` are a `name` on a real server and
+    // `text` here, `current_schemas(false)` a `name[]`. Every row agrees, `test_schema` included.
     types: &[
         "SELECT 'r', current_schema",
         "SELECT 'r', current_schemas(false)",
+        "SELECT 'r', nspname FROM pg_namespace WHERE nspname !~ '^pg_.*' AND nspname NOT IN ('information_schema') ORDER by nspname",
+        "SELECT 'r', nspname FROM pg_namespace WHERE nspname !~ '^pg_.*' AND nspname NOT IN ('information_schema') ORDER by nspname",
+        "SELECT 'r', c.relname, n.nspname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'things' AND c.relkind IN ('r','v','m','p','f') ORDER BY n.nspname",
+        "SELECT 'r', c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'test_schema' AND c.relname = 'things' AND c.relkind IN ('r','v','m','p','f')",
+        "SELECT 'r', c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ANY (current_schemas(false)) AND c.relname = 'things' AND c.relkind IN ('r','v','m','p','f')",
     ],
-    answers: &[
-        (
-            "CREATE SCHEMA test_schema CREATE TABLE things (id integer, name character varying(50), email character varying(50), description character varying(100), moment timestamp without time zone default now())",
-            "**`CREATE SCHEMA … CREATE TABLE …` is one statement**, and `sqlparser` 0.62.0 reads \
-             only the first half — `Expected: end of statement, found: CREATE`. A C1 parser gap, \
-             and it is the spelling `schema_test.rb`\u{2019}s `setup` uses for both of its schemas, so \
-             nothing in that file is reachable without it",
-        ),
-        (
-            "CREATE SCHEMA test_schema2 CREATE TABLE things (id integer, name character varying(50), email character varying(50), description character varying(100), moment timestamp without time zone default now())",
-            "The second of the pair, and the same gap. The two together are what make the file\u{2019}s \
-             central fact — two tables called `things`, one per schema — even statable",
-        ),
-        (
-            "SELECT 'r', COUNT(*) FROM pg_namespace WHERE nspname = 'test_schema'",
-            "A consequence of the CREATE SCHEMA gap above, not a divergence of its own: with no second namespace, a schema-qualified name is refused by name and the relations the setup would have created are not there. Every one of these closes with that unit.",
-        ),
-        (
-            "SELECT 'r', nspname FROM pg_namespace WHERE nspname !~ '^pg_.*' AND nspname NOT IN ('information_schema') ORDER by nspname",
-            "A consequence of the CREATE SCHEMA gap above, not a divergence of its own: with no second namespace, a schema-qualified name is refused by name and the relations the setup would have created are not there. Every one of these closes with that unit.",
-        ),
-        (
-            "CREATE TABLE test_schema.\"things.table\" (id integer, name character varying(50))",
-            "A consequence of the CREATE SCHEMA gap above, not a divergence of its own: with no second namespace, a schema-qualified name is refused by name and the relations the setup would have created are not there. Every one of these closes with that unit.",
-        ),
-    ],
+    answers: &[(
+        "SET search_path TO test_schema",
+        "**The one thing still refused, and deliberately.** `current_schema` and \
+         `current_schemas` are folded to `public` where a statement is lowered, and an unqualified \
+         name resolves in `public`, so accepting a path that named another schema would answer \
+         `public` where a real server answers `test_schema` — a wrong answer, which ADR 0031 ranks \
+         worse than the refusal. Making it real is its own unit: the two functions have to become \
+         session-aware (which means resolving them in `Executor::bound`, where the session is, \
+         rather than folding them at lowering, and moving the `= ANY (current_schemas(false))` \
+         expansion with them) and an unqualified name has to be looked for along the path in \
+         order. It is the first statement this node refuses, so the forty after it are swallowed \
+         by the aborted block and counted — `DROP SCHEMA … CASCADE` among them, which is asserted \
+         directly in `dropping_a_schema_needs_cascade_once_something_is_in_it` instead",
+    )],
 };
 
 #[test]
@@ -133,6 +128,166 @@ fn a_schema_can_be_dropped_and_renamed() {
     );
 }
 
+/// **Two tables of one name, one per schema** — the fact a catalog keyed by name alone cannot
+/// hold, and the centre of `schema_test.rb`.
+#[test]
+fn two_schemas_hold_two_tables_of_one_name() {
+    let mut node = parity::Node::new(&[
+        "CREATE SCHEMA test_schema",
+        "CREATE SCHEMA test_schema2",
+        "CREATE TABLE test_schema.things (id integer, name character varying(50))",
+        "CREATE TABLE test_schema2.things (id integer, name character varying(50))",
+        "INSERT INTO test_schema.things (id, name) VALUES (1, 'one')",
+        "INSERT INTO test_schema2.things (id, name) VALUES (2, 'two')",
+    ]);
+    // Each holds its own row, and neither can see the other's.
+    assert_eq!(
+        node.rows("SELECT id, name FROM test_schema.things"),
+        [["1", "one"]]
+    );
+    assert_eq!(
+        node.rows("SELECT id, name FROM test_schema2.things"),
+        [["2", "two"]]
+    );
+    // `pg_class` has both, told apart by `relnamespace` — which is what joins it to
+    // `pg_namespace`, and the only thing that distinguishes them.
+    assert_eq!(
+        node.rows(
+            "SELECT c.relname, n.nspname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = \
+             c.relnamespace WHERE c.relname = 'things' AND c.relkind IN ('r','v','m','p','f') \
+             ORDER BY n.nspname"
+        ),
+        vec![
+            vec!["things", "test_schema"],
+            vec!["things", "test_schema2"],
+        ]
+    );
+    // Two indexes of one name, one per schema — the other half of the same fact.
+    node.run("CREATE INDEX a_index_things_on_name ON test_schema.things (name)")
+        .unwrap();
+    node.run("CREATE INDEX a_index_things_on_name ON test_schema2.things (name)")
+        .unwrap();
+    assert_eq!(
+        node.rows("SELECT count(*) FROM pg_class WHERE relname = 'a_index_things_on_name'"),
+        [["2"]]
+    );
+}
+
+/// **`public` keeps every behaviour it had.** A bare name is stored with no separator at all, so
+/// the key bytes, the catalog rows and the messages are the ones they were.
+#[test]
+fn a_relation_in_public_is_unchanged() {
+    let mut node = parity::Node::new(&["CREATE SCHEMA test_schema"]);
+    node.run("CREATE TABLE things (id integer)").unwrap();
+    node.run("CREATE TABLE test_schema.things (id integer)")
+        .unwrap();
+    // The bare name is `public`'s, and the qualified spelling of it is the same relation.
+    node.run("INSERT INTO things (id) VALUES (1)").unwrap();
+    assert_eq!(node.rows("SELECT id FROM public.things"), [["1"]]);
+    assert_eq!(
+        node.rows("SELECT count(*) FROM test_schema.things"),
+        [["0"]]
+    );
+    assert_eq!(
+        node.rows(
+            "SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE \
+             c.relname = 'things' ORDER BY n.nspname"
+        ),
+        vec![vec!["public"], vec!["test_schema"]]
+    );
+}
+
+/// **A missing schema is `3F000` and a missing relation is `42P01`**, with the schema *inside* the
+/// quotes.
+#[test]
+fn a_missing_schema_and_a_missing_relation_are_different_answers() {
+    let mut node = parity::Node::new(&["CREATE SCHEMA test_schema"]);
+    let error = node
+        .run("CREATE TABLE nosuchschema.t (a integer)")
+        .unwrap_err();
+    assert_eq!(error.sqlstate(), "3F000");
+    assert_eq!(error.to_string(), "schema \"nosuchschema\" does not exist");
+    let error = node.run("SELECT a FROM nosuchschema.t").unwrap_err();
+    assert_eq!(error.sqlstate(), "42P01");
+    assert_eq!(
+        error.to_string(),
+        "relation \"nosuchschema.t\" does not exist"
+    );
+    // A schema that exists and a relation that does not is the ordinary `42P01`, qualified.
+    let error = node.run("SELECT a FROM test_schema.nosuch").unwrap_err();
+    assert_eq!(error.sqlstate(), "42P01");
+    assert_eq!(
+        error.to_string(),
+        "relation \"test_schema.nosuch\" does not exist"
+    );
+}
+
+/// **`DROP SCHEMA` without `CASCADE` is `2BP01` naming one dependent**, and with it takes the
+/// relations.
+#[test]
+fn dropping_a_schema_needs_cascade_once_something_is_in_it() {
+    let mut node = parity::Node::new(&[
+        "CREATE SCHEMA test_schema",
+        "CREATE TABLE test_schema.things (id integer)",
+        "INSERT INTO test_schema.things (id) VALUES (1)",
+    ]);
+    let error = node.run("DROP SCHEMA test_schema").unwrap_err();
+    assert_eq!(error.sqlstate(), "2BP01");
+    assert_eq!(
+        error.to_string(),
+        "cannot drop schema test_schema because other objects depend on it"
+    );
+    assert_eq!(
+        error.detail().as_deref(),
+        Some("table test_schema.things depends on schema test_schema")
+    );
+    // **`IF EXISTS` covers absence and not dependence** — the same `2BP01` with the clause on.
+    let error = node.run("DROP SCHEMA IF EXISTS test_schema").unwrap_err();
+    assert_eq!(error.sqlstate(), "2BP01");
+    node.run("DROP SCHEMA test_schema CASCADE").unwrap();
+    assert_eq!(
+        node.rows("SELECT count(*) FROM pg_class WHERE relname = 'things'"),
+        [["0"]]
+    );
+    assert_eq!(
+        node.rows("SELECT count(*) FROM pg_namespace WHERE nspname = 'test_schema'"),
+        [["0"]]
+    );
+    // And nothing in `public` went with it.
+    node.run("CREATE TABLE things (id integer)").unwrap();
+}
+
+/// A relation in a schema is dropped and altered by its qualified name, and its derived names —
+/// the primary key's, an index's — are **its own**, in its own schema.
+#[test]
+fn a_qualified_relation_is_created_altered_and_dropped() {
+    let mut node = parity::Node::new(&[
+        "CREATE SCHEMA test_schema",
+        "CREATE TABLE test_schema.table_with_pk (id bigserial primary key)",
+    ]);
+    // `<table>_pkey` on the bare name, in the table's schema — not `test_schema.things_pkey`.
+    assert_eq!(
+        node.rows(
+            "SELECT c.relname, n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = \
+             c.relnamespace WHERE c.relname = 'table_with_pk_pkey'"
+        ),
+        [["table_with_pk_pkey", "test_schema"]]
+    );
+    node.run("ALTER TABLE test_schema.table_with_pk ADD COLUMN name character varying")
+        .unwrap();
+    node.run("INSERT INTO test_schema.table_with_pk (name) VALUES ('a')")
+        .unwrap();
+    assert_eq!(
+        node.rows("SELECT name FROM test_schema.table_with_pk"),
+        [["a"]]
+    );
+    node.run("DROP TABLE test_schema.table_with_pk").unwrap();
+    assert_eq!(
+        node.rows("SELECT count(*) FROM pg_class WHERE relname LIKE 'table_with_pk%'"),
+        [["0"]]
+    );
+}
+
 /// What this node answers **today** for the three schema statements a real server takes, so that
 /// the refusals are pinned rather than merely absent.
 ///
@@ -149,10 +304,10 @@ fn a_named_schema_is_refused_rather_than_answered_wrongly() {
     node.run("SET search_path TO \"$user\", public").unwrap();
     let error = node.run("SET search_path TO test_schema").unwrap_err();
     assert_eq!(error.sqlstate(), "0A000");
-    // A schema-qualified relation is refused by name, not resolved to a table of the same name in
-    // the one schema there is — which would be a wrong answer rather than a gap.
+    // A schema-qualified relation whose schema is not there is `3F000` — the *schema* is what is
+    // missing, and it is a different answer from a missing relation.
     let error = node
-        .run("CREATE TABLE test_schema.things (id integer)")
+        .run("CREATE TABLE nosuchschema.things (id integer)")
         .unwrap_err();
-    assert_eq!(error.sqlstate(), "0A000");
+    assert_eq!(error.sqlstate(), "3F000");
 }

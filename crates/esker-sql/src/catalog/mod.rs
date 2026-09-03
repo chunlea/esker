@@ -2469,6 +2469,108 @@ pub fn drop_schema(txn: &mut dyn Txn, tenant: u64, name: &str) -> Result<()> {
 /// The one schema every tenant has.
 pub const PUBLIC_SCHEMA: &str = "public";
 
+/// What separates a schema from a relation name **as stored**.
+///
+/// **A NUL, not a dot.** A dot is ambiguous: `schema_test.rb`'s own `setup` creates
+/// `test_schema."things.table"`, so `"a.b.c"` could be the relation `b.c` in schema `a` or the
+/// relation `c` in schema `a.b`. A NUL cannot appear in a PostgreSQL identifier at all, so it
+/// separates the two without a length prefix — which is what lets the name record's key keep its
+/// shape, where "the name is the whole tail" is the property the scan relies on.
+///
+/// **A relation in `public` is stored with no separator at all**, so every key and every record
+/// written before schemas existed reads back unchanged and every answer about `public` is
+/// byte-identical to what it was.
+pub const SCHEMA_SEPARATOR: char = '\0';
+
+/// The stored name of a relation: bare in `public`, `schema ++ NUL ++ name` anywhere else.
+#[must_use]
+pub fn qualify(schema: &str, name: &str) -> String {
+    if schema == PUBLIC_SCHEMA {
+        return name.to_owned();
+    }
+    format!("{schema}{SCHEMA_SEPARATOR}{name}")
+}
+
+/// The schema and the bare name out of a stored one.
+#[must_use]
+pub fn split_qualified(stored: &str) -> (&str, &str) {
+    match stored.split_once(SCHEMA_SEPARATOR) {
+        Some((schema, name)) => (schema, name),
+        None => (PUBLIC_SCHEMA, stored),
+    }
+}
+
+/// A stored name as a **message** spells it: `schema.name`, or the bare name in `public`.
+///
+/// The separator is a NUL on disk and a dot in a sentence, because that is what PostgreSQL quotes
+/// back: `42P01 relation "nosuchschema.t" does not exist`, with the schema **inside** the quotes.
+#[must_use]
+pub fn display_name(stored: &str) -> String {
+    match stored.split_once(SCHEMA_SEPARATOR) {
+        Some((schema, name)) => format!("{schema}.{name}"),
+        None => stored.to_owned(),
+    }
+}
+
+/// A name **as a user wrote it** — `schema.relation` — turned into the stored form.
+///
+/// This is `::regclass`'s input and nothing else: everywhere else a qualified name arrives already
+/// split by the parser, which knows which halves were quoted. Here it is one string, so the rule is
+/// PostgreSQL's own for an unquoted one — the first dot separates — and the two schemas this node
+/// spells *into* a name keep theirs:
+///
+/// * `pg_catalog.x` is the relation `x`, which is how it is stored;
+/// * `information_schema.x` **is** the stored name, dot and all (`catalog::information_schema`).
+///
+/// A name carrying a quote is left whole, because splitting `test_schema."things.table"` correctly
+/// needs the parser and `::regclass` does not have it. That is a gap in one spelling of one cast,
+/// and it answers `42P01` rather than the wrong relation.
+#[must_use]
+pub fn parse_qualified(written: &str) -> String {
+    if written.contains('"') {
+        return written.to_owned();
+    }
+    let Some((schema, name)) = written.split_once('.') else {
+        return written.to_owned();
+    };
+    if schema.eq_ignore_ascii_case("information_schema") {
+        return written.to_owned();
+    }
+    if schema.eq_ignore_ascii_case("pg_catalog") {
+        return name.to_owned();
+    }
+    qualify(schema, name)
+}
+
+/// Every relation stored in one schema, as stored names.
+///
+/// A prefix scan of the name records: `schema ++ NUL` is a prefix no other schema's names share,
+/// which is what makes `DROP SCHEMA … CASCADE` a range rather than a filter over everything.
+pub fn relations_in_schema(txn: &dyn Txn, tenant: u64, schema: &str) -> Result<Vec<String>> {
+    if schema == PUBLIC_SCHEMA {
+        // `public`'s names have no prefix to scan for — they are every name without a separator.
+        let (start, end) = record::name_range(tenant);
+        let mut out = Vec::new();
+        for (key, _) in txn.scan(&start, &end, u32::MAX)? {
+            let name = record::name_of(tenant, &key)?;
+            if !name.contains(SCHEMA_SEPARATOR) {
+                out.push(name);
+            }
+        }
+        return Ok(out);
+    }
+    let prefix = format!("{schema}{SCHEMA_SEPARATOR}");
+    let (start, end) = record::name_range(tenant);
+    let mut out = Vec::new();
+    for (key, _) in txn.scan(&start, &end, u32::MAX)? {
+        let name = record::name_of(tenant, &key)?;
+        if name.starts_with(&prefix) {
+            out.push(name);
+        }
+    }
+    Ok(out)
+}
+
 /// `public`'s oid, which a real server also fixes rather than allocating.
 pub const PUBLIC_SCHEMA_ID: u64 = 11;
 

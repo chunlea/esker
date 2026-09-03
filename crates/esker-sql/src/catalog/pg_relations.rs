@@ -107,8 +107,11 @@ impl RelKind {
 pub struct RelationRow {
     /// Its oid, from the table above. Equal in every view by construction.
     pub oid: i64,
-    /// Its name, as the name record spells it.
+    /// Its name, **bare** — the relation's own, with no schema on it. A relation in `public` is
+    /// stored exactly this way, which is what keeps every answer about `public` unchanged.
     pub name: String,
+    /// The schema it is in, `public` unless the stored name carried one.
+    pub schema: String,
     /// What it is.
     pub kind: RelKind,
     /// The table it belongs to: itself for a table, the indexed table for an index, the keyed
@@ -143,9 +146,9 @@ impl Relations {
                     "a catalog scan would hold more than {MAX_CATALOG_RELATIONS} relations"
                 )));
             }
-            let name = super::record::name_of(tenant, &key)?;
+            let stored = super::record::name_of(tenant, &key)?;
             let relation = super::record::decode_relation(&value)?;
-            rows.push(row_of(txn, tenant, name, relation, &mut tables)?);
+            rows.push(row_of(txn, tenant, &stored, relation, &mut tables)?);
         }
         // The `EXCLUDE` constraints' indexes, which have no name record of their own — see
         // [`RelKind::Exclusion`]. Appended after the scan and then re-sorted, so the whole list
@@ -155,6 +158,8 @@ impl Relations {
                 rows.push(RelationRow {
                     oid: super::pg_constraint::exclude_oid(table.id, at),
                     name: exclude.name.clone(),
+                    // Synthesised beside its table, so it is in the table's schema.
+                    schema: super::split_qualified(&table.name).0.to_owned(),
                     kind: RelKind::Exclusion,
                     table_id: table.id,
                     index_at: None,
@@ -247,8 +252,15 @@ impl Relations {
 
     /// The relation a name names, if this tenant has one.
     #[must_use]
+    /// A relation by the name it is **stored** under, which carries its schema.
+    ///
+    /// A bare name is `public`'s, so every existing caller keeps working unchanged; a qualified one
+    /// finds the relation in its own schema and not a relation of that name somewhere else.
     pub fn by_name(&self, name: &str) -> Option<&RelationRow> {
-        self.rows.iter().find(|row| row.name == name)
+        let (schema, bare) = super::split_qualified(name);
+        self.rows
+            .iter()
+            .find(|row| row.name == bare && row.schema == schema)
     }
 }
 
@@ -256,16 +268,22 @@ impl Relations {
 fn row_of(
     txn: &dyn Txn,
     tenant: u64,
-    name: String,
+    stored: &str,
     relation: Relation,
     tables: &mut BTreeMap<u64, TableDef>,
 ) -> Result<RelationRow> {
+    // **The stored name carries the schema and every view wants them apart**: `pg_class.relname`
+    // is the bare one and `relnamespace` is the other half. A relation in `public` has no
+    // separator, so both come back exactly as they always did.
+    let (schema, name) = super::split_qualified(stored);
+    let (schema, name) = (schema.to_owned(), name.to_owned());
     Ok(match relation {
         Relation::Table { table_id } => {
             load_table(txn, tenant, table_id, tables)?;
             RelationRow {
                 oid: as_oid(table_id),
-                name,
+                name: name.clone(),
+                schema: schema.clone(),
                 kind: RelKind::Table,
                 table_id,
                 index_at: None,
@@ -278,7 +296,8 @@ fn row_of(
             let index_at = table.indexes.iter().position(|index| index.id == index_id);
             RelationRow {
                 oid: as_oid(index_id),
-                name,
+                name: name.clone(),
+                schema: schema.clone(),
                 kind: RelKind::Index,
                 table_id,
                 index_at,
@@ -293,7 +312,8 @@ fn row_of(
                 // note — it was the table's own id until this module, which made two rows of
                 // `pg_class` join as one.
                 oid: as_oid(PRIMARY_KEY_OID_BASE.wrapping_add(table_id)),
-                name,
+                name: name.clone(),
+                schema: schema.clone(),
                 kind: RelKind::PrimaryKey,
                 table_id,
                 index_at: None,
@@ -316,7 +336,8 @@ fn row_of(
             let id = sequence_id;
             RelationRow {
                 oid: as_oid(id),
-                name,
+                name: name.clone(),
+                schema: schema.clone(),
                 kind: RelKind::Sequence,
                 table_id,
                 index_at: None,

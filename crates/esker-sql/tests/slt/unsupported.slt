@@ -70,7 +70,10 @@ CREATE TABLE public.q (id int8 PRIMARY KEY)
 statement ok
 DROP TABLE public.q
 
-statement error (0A000)
+# A schema that is not there is `3F000`, PostgreSQL's own class for it — the *schema* is what is
+# missing, and it is a different answer from a missing relation (`42P01`). It was `0A000` until
+# `CREATE SCHEMA` existed.
+statement error (3F000)
 CREATE TABLE other_schema.q (id int8 PRIMARY KEY)
 
 
