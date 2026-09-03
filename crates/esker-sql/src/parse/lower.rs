@@ -223,6 +223,38 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
                 if_not_exists: *if_not_exists,
             }))
         }
+        // `CREATE DATABASE [IF NOT EXISTS] name`. **PostgreSQL's option list is a `42601` before
+        // it can be a `0A000`**: `sqlparser` 0.62.0's `CREATE DATABASE` grammar has `LOCATION`,
+        // `MANAGEDLOCATION`, `CLONE` and MySQL's `CHARACTER SET`/`COLLATE` and nothing else, so
+        // `ENCODING = 'utf8'` — what `rake db:create` sends — never reaches this arm. The four it
+        // *can* read are refused by name here, so that a statement this node parses and cannot
+        // honour is never silently taken as the bare form.
+        Statement::CreateDatabase {
+            db_name,
+            if_not_exists,
+            location,
+            managed_location,
+            clone,
+            default_charset,
+            default_collation,
+            ..
+        } => {
+            refuse_if(location.is_some(), "CREATE DATABASE ... LOCATION")?;
+            refuse_if(
+                managed_location.is_some(),
+                "CREATE DATABASE ... MANAGEDLOCATION",
+            )?;
+            refuse_if(clone.is_some(), "CREATE DATABASE ... CLONE")?;
+            refuse_if(
+                default_charset.is_some(),
+                "CREATE DATABASE ... CHARACTER SET",
+            )?;
+            refuse_if(default_collation.is_some(), "CREATE DATABASE ... COLLATE")?;
+            Ok(plan::Statement::CreateDatabase(plan::CreateDatabase {
+                name: object_name(db_name)?,
+                if_not_exists: *if_not_exists,
+            }))
+        }
         Statement::AlterSchema(alter) => {
             use sqlparser::ast::AlterSchemaOperation;
             refuse_if(alter.if_exists, "ALTER SCHEMA IF EXISTS")?;
@@ -287,6 +319,16 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
                     if_exists: *if_exists,
                     cascade: *cascade,
                 }),
+                // **No `CASCADE` and no `RESTRICT`.** PostgreSQL's `DROP DATABASE` takes neither —
+                // there is nothing outside a database that can depend on it — so a spelling that
+                // carries one is refused rather than ignored.
+                ObjectType::Database => {
+                    refuse_if(*cascade, "DROP DATABASE ... CASCADE")?;
+                    plan::Statement::DropDatabase(plan::DropDatabase {
+                        names,
+                        if_exists: *if_exists,
+                    })
+                }
                 other => return Err(SqlError::unsupported(format!("DROP {other}"))),
             })
         }

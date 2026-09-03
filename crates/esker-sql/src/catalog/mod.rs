@@ -2509,7 +2509,7 @@ pub fn drop_schema(txn: &mut dyn Txn, tenant: u64, name: &str) -> Result<()> {
 ///
 /// **The seed, not a default that can be changed.** An existing cluster has this tenant full of
 /// rows and no directory record, so a directory that is empty answers with exactly one database —
-/// this id, under [`crate::parse::DATABASE_NAME`] — which is what this node reported before it
+/// this id, under `crate::parse::DATABASE_NAME` — which is what this node reported before it
 /// could name a second. The upgrade is therefore no step at all, and the first `CREATE DATABASE`
 /// writes this row beside the new one
 /// ([ADR 0052](../../../../docs/adr/0052-a-database-is-a-tenant-and-the-directory-that-names-them.md)).
@@ -2584,8 +2584,24 @@ pub fn create_database(txn: &mut dyn Txn, name: &str, id: u64) -> Result<()> {
     bump_version(txn)
 }
 
-/// Removes one from the directory. The caller has already removed what it held.
-pub fn drop_database(txn: &mut dyn Txn, name: &str) -> Result<()> {
+/// Removes one from the directory **and everything the tenant it is held**.
+///
+/// **The data goes with the row, and it costs a delete per key.** PostgreSQL's `DROP DATABASE`
+/// unlinks a directory and is O(1); here the rows live in the same key space as every other
+/// database's, so emptying one is a scan. Dropping the directory row alone would be cheap and
+/// would leave the user's rows on disk unreachable for ever — ids never repeat, so nothing would
+/// ever read them again and nothing would ever reclaim them either. A statement that says it
+/// deleted a database and did not is the worse of the two, and a database too large for one
+/// transaction fails loudly rather than half-emptying.
+///
+/// Reclaiming in the background instead — a job of the kind `'m' ++ "sql" ++ 'j'` already records
+/// — is the follow-on, and the thing to build when a database is big enough for this to hurt.
+pub fn drop_database(txn: &mut dyn Txn, name: &str, tenant: u64) -> Result<()> {
+    for (start, end) in record::tenant_ranges(tenant) {
+        for (key, _) in txn.scan(&start, &end, u32::MAX)? {
+            txn.delete(&key);
+        }
+    }
     txn.delete(&record::database_key(name));
     bump_version(txn)
 }
@@ -2984,9 +3000,10 @@ mod tests {
     use super::{
         Catalog, ColumnDef, DEFAULT_RETENTION_MS, Identity, IndexDef, IndexKey, KeyOrder, KeyPart,
         MAX_IDENTIFIER_BYTES, RETENTION_FOREVER, Relation, SchemaState, SequenceDef, TableDef,
-        allocate_database_id, allocate_id, clear_table_retention, create_database, create_table,
-        database_id, databases, default_retention, drop_database, drop_table, fold_identifier,
-        record, replace_table, set_default_retention, set_table_retention, table_retention,
+        allocate_database_id, allocate_id, clear_table_retention, create_database, create_schema,
+        create_table, database_id, databases, default_retention, drop_database, drop_table,
+        fold_identifier, record, replace_table, schemas, set_default_retention,
+        set_table_retention, table_retention,
     };
     use crate::backend::{Backend, MemoryBackend};
     use crate::sqlstate;
@@ -4008,7 +4025,7 @@ mod tests {
         let mut ddl = backend.begin().unwrap();
         create_database(&mut *ddl, "arunit2", 16_384).unwrap();
         create_database(&mut *ddl, "arunit3", 16_385).unwrap();
-        drop_database(&mut *ddl, "arunit2").unwrap();
+        drop_database(&mut *ddl, "arunit2", 16_384).unwrap();
         ddl.commit().unwrap();
 
         let txn = backend.begin().unwrap();
@@ -4020,6 +4037,53 @@ mod tests {
             ]
         );
         assert_eq!(database_id(&*txn, "arunit2").unwrap(), None);
+    }
+
+    /// **Dropping a database empties the tenant behind it**, and leaves every other tenant alone.
+    ///
+    /// The rule the sweep exists for: dropping the directory row alone would leave the rows on
+    /// disk unreachable for ever, since ids never repeat — a statement that says it deleted a
+    /// database and did not.
+    #[test]
+    fn dropping_a_database_takes_the_tenants_rows_with_it() {
+        let backend = MemoryBackend::new();
+
+        let mut ddl = backend.begin().unwrap();
+        create_database(&mut *ddl, "gone", 16_384).unwrap();
+        create_database(&mut *ddl, "kept", 16_385).unwrap();
+        for tenant in [16_384, 16_385] {
+            let id = allocate_id(&mut *ddl, tenant).unwrap();
+            create_table(&mut *ddl, tenant, &accounts(id)).unwrap();
+            create_schema(&mut *ddl, tenant, "s", id + 1).unwrap();
+        }
+        ddl.commit().unwrap();
+
+        let mut drop = backend.begin().unwrap();
+        drop_database(&mut *drop, "gone", 16_384).unwrap();
+        drop.commit().unwrap();
+
+        let txn = backend.begin().unwrap();
+        // Nothing of the dropped tenant, under any kind byte.
+        for (start, end) in record::tenant_ranges(16_384) {
+            assert!(
+                txn.scan(&start, &end, 1).unwrap().is_empty(),
+                "a key of the dropped tenant survived"
+            );
+        }
+        // And the neighbour is untouched, which is what says the sweep is bounded by the tenant
+        // and not by the kind.
+        assert_eq!(
+            Catalog::new()
+                .view(&*txn, 16_385)
+                .unwrap()
+                .table("accounts")
+                .unwrap()
+                .map(|table| table.name.clone()),
+            Some("accounts".to_owned())
+        );
+        assert_eq!(schemas(&*txn, 16_385).unwrap().len(), 1);
+        assert_eq!(database_id(&*txn, "gone").unwrap(), None);
+        assert_eq!(database_id(&*txn, "kept").unwrap(), Some(16_385));
     }
 
     /// **A name is the whole tail of its key**, so one database cannot be found under the name of

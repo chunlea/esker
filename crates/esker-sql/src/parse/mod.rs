@@ -1180,8 +1180,101 @@ const UNSUPPORTED: &[Unsupported] = &[
     u("CLUSTER", &["CLUSTER"], &[]),
     u("CHECKPOINT", &["CHECKPOINT"], &[]),
     u("MOVE", &["MOVE"], &[]),
-    u("CREATE DATABASE", &["CREATE", "DATABASE"], &[]),
-    u("DROP DATABASE", &["DROP", "DATABASE"], &[]),
+    // **`CREATE DATABASE` itself is implemented; its option list is not.** `sqlparser` 0.62.0's
+    // grammar for the statement has `LOCATION`, `MANAGEDLOCATION`, `CLONE` and MySQL's
+    // `CHARACTER SET`/`COLLATE` and nothing else, so every PostgreSQL option is a `42601` before
+    // it can be a `0A000` — a C1 break, which is what these rows exist to prevent. One per option
+    // keyword, because the construct a refusal names should be the one the user wrote.
+    //
+    // The cost is a database *named* for one of these words: `CREATE DATABASE encoding` is
+    // refused where a real server takes it. That is a `0A000` about a legal statement rather than
+    // a syntax error about one, which is the better of the two failures and the only one available
+    // without a parser of our own for this statement.
+    u(
+        "CREATE DATABASE with options",
+        &["CREATE", "DATABASE"],
+        &["WITH"],
+    ),
+    u(
+        "CREATE DATABASE ... OWNER",
+        &["CREATE", "DATABASE"],
+        &["OWNER"],
+    ),
+    u(
+        "CREATE DATABASE ... TEMPLATE",
+        &["CREATE", "DATABASE"],
+        &["TEMPLATE"],
+    ),
+    u(
+        "CREATE DATABASE ... ENCODING",
+        &["CREATE", "DATABASE"],
+        &["ENCODING"],
+    ),
+    u(
+        "CREATE DATABASE ... STRATEGY",
+        &["CREATE", "DATABASE"],
+        &["STRATEGY"],
+    ),
+    u(
+        "CREATE DATABASE ... LOCALE",
+        &["CREATE", "DATABASE"],
+        &["LOCALE"],
+    ),
+    u(
+        "CREATE DATABASE ... LC_COLLATE",
+        &["CREATE", "DATABASE"],
+        &["LC_COLLATE"],
+    ),
+    u(
+        "CREATE DATABASE ... LC_CTYPE",
+        &["CREATE", "DATABASE"],
+        &["LC_CTYPE"],
+    ),
+    u(
+        "CREATE DATABASE ... LOCALE_PROVIDER",
+        &["CREATE", "DATABASE"],
+        &["LOCALE_PROVIDER"],
+    ),
+    u(
+        "CREATE DATABASE ... ICU_LOCALE",
+        &["CREATE", "DATABASE"],
+        &["ICU_LOCALE"],
+    ),
+    u(
+        "CREATE DATABASE ... ICU_RULES",
+        &["CREATE", "DATABASE"],
+        &["ICU_RULES"],
+    ),
+    u(
+        "CREATE DATABASE ... COLLATION_VERSION",
+        &["CREATE", "DATABASE"],
+        &["COLLATION_VERSION"],
+    ),
+    u(
+        "CREATE DATABASE ... TABLESPACE",
+        &["CREATE", "DATABASE"],
+        &["TABLESPACE"],
+    ),
+    u(
+        "CREATE DATABASE ... ALLOW_CONNECTIONS",
+        &["CREATE", "DATABASE"],
+        &["ALLOW_CONNECTIONS"],
+    ),
+    u(
+        "CREATE DATABASE ... CONNECTION LIMIT",
+        &["CREATE", "DATABASE"],
+        &["CONNECTION", "LIMIT"],
+    ),
+    u(
+        "CREATE DATABASE ... IS_TEMPLATE",
+        &["CREATE", "DATABASE"],
+        &["IS_TEMPLATE"],
+    ),
+    u("CREATE DATABASE ... OID", &["CREATE", "DATABASE"], &["OID"]),
+    // `DROP DATABASE … WITH (FORCE)` disconnects the sessions on it, which needs a session
+    // registry this node does not have — so it is refused rather than quietly dropped.
+    u("DROP DATABASE ... FORCE", &["DROP", "DATABASE"], &["FORCE"]),
+    u("DROP DATABASE ... WITH", &["DROP", "DATABASE"], &["WITH"]),
     u("ALTER DATABASE", &["ALTER", "DATABASE"], &[]),
     u("ALTER SYSTEM", &["ALTER", "SYSTEM"], &[]),
     // --- Replication and foreign data ---

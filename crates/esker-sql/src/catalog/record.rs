@@ -754,6 +754,39 @@ pub(super) fn next_database_key() -> Vec<u8> {
     prefix::meta_key(&[SQL, &[KIND_NEXT_DATABASE]].concat())
 }
 
+/// Every key range one tenant owns, which is what `DROP DATABASE` empties.
+///
+/// **Every kind byte, not a list of the ones that take a tenant.** A list is a thing to forget:
+/// the next record kind added to this file would leak its tenant's rows on every drop, and nothing
+/// would say so. Sweeping all 256 costs 256 empty scans on a statement that runs once, and it
+/// cannot miss one.
+///
+/// The constraint that makes it exact, and the one a **cluster-wide** kind has to keep: its key
+/// must not have a tail that can begin with an encoded `u64`. The three there are — the catalog
+/// version, the default retention and the id counter — have no tail at all, and the directory's is
+/// a database *name*, which is UTF-8 and can never start with the NUL bytes a memcomparable `u64`
+/// does. A future kind that broke that would have its keys swept away by a drop of tenant zero.
+#[must_use]
+pub(super) fn tenant_ranges(tenant: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut ranges = Vec::with_capacity(257);
+    // The rows and every index, which `esker-keys` lays out as `'t' ++ tenant ++ table_id ++ …`
+    // — one range, because the tenant is the first field.
+    let mut start = vec![prefix::SQL];
+    codec::encode_u64(tenant, &mut start);
+    let mut end = start.clone();
+    end.push(0xff);
+    ranges.push((start, end));
+    for kind in 0..=u8::MAX {
+        let mut suffix = [SQL, &[kind]].concat();
+        codec::encode_u64(tenant, &mut suffix);
+        let start = prefix::meta_key(&suffix);
+        let mut end = start.clone();
+        end.push(0xff);
+        ranges.push((start, end));
+    }
+    ranges
+}
+
 #[must_use]
 pub(super) fn function_key(tenant: u64, name: &str) -> Vec<u8> {
     let mut suffix = [SQL, &[KIND_FUNCTION]].concat();

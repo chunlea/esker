@@ -24,28 +24,16 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 'r', current_database()",
         "SELECT 'r', datname FROM pg_database WHERE datname = current_database()",
     ],
-    answers: &[
-        (
-            "CREATE DATABASE arunit2",
-            "**The shape this capture exists to justify**, and the divergence is in the *reason* \
-             for the refusal rather than in the refusal: PostgreSQL says `25001 CREATE DATABASE \
-             cannot run inside a transaction block` — it would take the statement outside one — \
-             and this node says `0A000` because it has one database and no way to name a second. \
-             [ADR 0052](../../../docs/adr/0052-a-database-is-a-tenant-and-the-directory-that-names-them.md) \
-             is the design; this entry is deleted when it is built, and rule 2 fails this test if \
-             it is not.",
-        ),
-        (
-            "SELECT 'r', 'a'::name = 'a'::name",
-            "**A cast to `name`**, PostgreSQL's 63-byte identifier type, which is not one of the \
+    answers: &[(
+        "SELECT 'r', 'a'::name = 'a'::name",
+        "**A cast to `name`**, PostgreSQL's 63-byte identifier type, which is not one of the \
              stored types (ADR 0033) and has no spelling here at all — the standing choice is that \
              every catalog column and every server function answering a `name` answers a `text`, \
              declared in the `types` list above and in `tests/coalesce.rs`. So the two halves are \
              one fact: a `name` cannot be *reported* and cannot be *cast to*. It compares \
              identically, which is why the row this line asks for is right on both sides and only \
              the cast is refused. A type-surface item, not a database one.",
-        ),
-    ],
+    )],
 };
 
 #[test]

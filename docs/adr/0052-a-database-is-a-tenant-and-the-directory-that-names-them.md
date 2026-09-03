@@ -101,18 +101,23 @@ tenant-scoped, and it is a new record kind in **`esker-sql`'s own metadata space
 `catalog::record` owns end to end:
 
 ```text
-'m' ++ "sql" ++ 'D' ++ id:u64     a database: its name and the properties pg_database reports
-'m' ++ "sql" ++ 'N' ++ name       that name's id, the directory's only index
+'m' ++ "sql" ++ 'D' ++ name       a database: the name, and the tenant it is
 'm' ++ "sql" ++ 'C'               the next database id, one counter for the cluster
 ```
+
+**The name is the key and the id is the body**, rather than a record keyed by id with an index over
+it. Every question asked of the directory goes that way: startup looks a name up, `DROP DATABASE`
+looks a name up, and `pg_database` scans — where the key gives the `datname` and the body the
+`oid`. A second record keyed by id would be a second thing to keep consistent in exchange for a
+lookup nothing performs.
 
 `esker_keys::prefix::meta_key` takes an arbitrary suffix and the `"sql"` kind bytes are constants in
 `catalog::record`, so none of this reaches `esker-keys`: the reserved layout in `docs/DESIGN.md` §3
 is unchanged, and its four namespace bytes still mean what they meant.
 
-Two properties are inherited rather than re-argued. The name is the **whole tail** of its key, so
-it needs no length and cannot be confused with a longer one — the property `name_key` and the
-checkpoint keys already rely on. And the id is memcomparable, so the directory scans in id order.
+One property is inherited rather than re-argued: the name is the **whole tail** of its key, so it
+needs no length and cannot be confused with one it is a prefix of — what `name_key` and the
+checkpoint keys already rely on, and what makes `ar`, `arunit` and `arunit2` three databases.
 
 **The database id is the tenant id is the `pg_database` oid.** One number, so there is no mapping
 to keep consistent and no way for two of them to disagree.
@@ -143,9 +148,23 @@ is `3D000 database "x" does not exist`, at startup, which is what a real server 
 - The same `25001` is a rule here and not only a limitation: creating a database writes the
   directory outside the session's transaction, so a `CREATE DATABASE` inside a block would be a
   write that a `ROLLBACK` could not take back.
-- **`DROP DATABASE` deletes data that no `RESTRICT` protects.** PostgreSQL refuses to drop a
-  database with sessions connected to it; that refusal needs a session registry, and until there is
-  one the node has a way to delete a database another connection is using.
+- **`DROP DATABASE` empties the tenant, and it costs a delete per key.** PostgreSQL unlinks a
+  directory and is O(1); here the rows share one key space, so emptying one is a scan. Dropping the
+  directory row alone would be cheap and would leave the user's rows on disk for ever — ids never
+  repeat, so nothing would read them again and nothing would reclaim them either — and a statement
+  that says it deleted a database and did not is the worse of the two. A database too large for one
+  transaction fails loudly rather than half-emptying, and reclaiming in the background, as a job of
+  the kind `'m' ++ "sql" ++ 'j'` already records, is the follow-on.
+- **The refusal `DROP DATABASE` can make is only about *this* session.** PostgreSQL refuses to drop
+  a database any session is connected to; that needs a registry this node does not have, so what is
+  enforced is `55006` for the one the current session is serving and nothing for the rest.
+- **PostgreSQL's option list is a `42601` before it can be a `0A000`.** `sqlparser` 0.62.0's
+  `CREATE DATABASE` grammar carries `LOCATION`, `MANAGEDLOCATION`, `CLONE` and MySQL's
+  `CHARACTER SET`/`COLLATE`, and nothing PostgreSQL spells — `ENCODING`, which is what
+  `rake db:create` sends, exists in that crate only as a `COPY` option. Every option keyword is
+  therefore a row in `parse`'s refusal table, so the answer is `0A000` naming the option rather than
+  a syntax error about a statement a real server runs (contract C1). The cost is a database *named*
+  for one of those words.
 - Anything that reads the tenant from a constant becomes a session property: the re-driver and the
   columnar asserter in `bin/esker-sql.rs` each take `TENANT` today and each has to say *which*
   database it is working on, or work on all of them.

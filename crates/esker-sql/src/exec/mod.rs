@@ -543,6 +543,8 @@ impl Executor {
             Statement::CreateTable(create) => ddl::create_table(self, txn, create),
             Statement::CreateExtension(create) => ddl::create_extension(self, txn, create),
             Statement::CreateSchema(create) => ddl::create_schema(self, txn, create),
+            Statement::CreateDatabase(create) => ddl::create_database(self, txn, create),
+            Statement::DropDatabase(drop) => ddl::drop_database(self, txn, drop),
             Statement::DropSchema(drop) => ddl::drop_schema(self, txn, drop),
             Statement::AlterSchemaRename(rename) => ddl::alter_schema_rename(self, txn, rename),
             Statement::DropSequence(drop) => ddl::drop_sequence(self, txn, drop),
@@ -1702,6 +1704,10 @@ fn explain_lines(statement: &Statement) -> Vec<String> {
             vec![format!("Create Extension on {}", create.name)]
         }
         Statement::CreateSchema(create) => vec![format!("Create Schema on {}", create.name)],
+        Statement::CreateDatabase(create) => vec![format!("Create Database on {}", create.name)],
+        Statement::DropDatabase(drop) => {
+            vec![format!("Drop Database on {}", drop.names.join(", "))]
+        }
         Statement::DropSchema(drop) => vec![format!("Drop Schema on {}", drop.names.join(", "))],
         Statement::AlterSchemaRename(rename) => {
             vec![format!("Alter Schema on {}", rename.name)]
@@ -1828,9 +1834,9 @@ impl Execute for Executor {
         // naming: `in_a_transaction` *takes* the open transaction out of `self` before it runs the
         // statement, so a check for "am I in a block" further down always reads `None`.
         if self.open.is_some()
-            && let Some(named) = statement.concurrently()
+            && let Some(named) = statement.refused_in_a_transaction_block()
         {
-            return Err(SqlError::ConcurrentlyInTransactionBlock(named));
+            return Err(SqlError::NotInATransactionBlock(named));
         }
         // After the session statements, because `SET TRANSACTION SNAPSHOT` is the one thing a
         // block may run before it counts as having read anything.
