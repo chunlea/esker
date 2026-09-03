@@ -347,26 +347,22 @@ fn the_shapes_this_phase_does_not_run_name_themselves() {
     );
 }
 
-/// A subquery in a statement that **writes** is `0A000` naming the construct and the clause.
+/// The three clauses of a writing statement that still refuse a subquery, each naming itself.
 ///
-/// This phase is the read path. A statement that writes never reaches the pass that plans
-/// subqueries, so without a refusal each of these arrives at the row evaluator with no plan behind
-/// it and answers `XX000 internal error` — a code that says *this server has a bug* about a
-/// statement a real server runs. Every one of them is a `0A000` instead, which is what
-/// `docs/plans/phase-12-subquery.md` §4 promises and what a later phase turns into an answer.
+/// **The `WHERE` is no longer one of them**, and the two entries that stood at the top of this
+/// list are gone: `delete_all` and `update_all` on a relation carrying a `LIMIT` or a `JOIN` send
+/// `IN (subquery)` there — 39 tests across 9 files — so the write path plans and runs its filter's
+/// subqueries (`crate::exec::dml::collect`), and `tests/write_in_subquery.rs` is the capture.
+///
+/// The three below have no such pass yet, and the refusal is what stands between them and the row
+/// evaluator: a subquery arriving there with no plan behind it answers `XX000 internal error` — a
+/// code that says *this server has a bug* about a statement a real server runs. `0A000` naming the
+/// construct and the clause is what `docs/plans/phase-12-subquery.md` §4 promises instead.
 #[test]
 fn a_subquery_in_a_statement_that_writes_names_itself() {
     let mut node = parity::Node::new(FIXTURE);
 
     for (statement, named) in [
-        (
-            "UPDATE sq_a SET k = 9 WHERE id IN (SELECT a_id FROM sq_b)",
-            "IN (subquery) in the WHERE of a statement that writes",
-        ),
-        (
-            "DELETE FROM sq_a WHERE EXISTS (SELECT 1 FROM sq_b WHERE sq_b.a_id = sq_a.id)",
-            "EXISTS in the WHERE of a statement that writes",
-        ),
         (
             "UPDATE sq_a SET k = (SELECT max(v) FROM sq_b)",
             "a scalar subquery in an UPDATE assignment",

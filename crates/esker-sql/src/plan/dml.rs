@@ -24,6 +24,13 @@ pub struct Insert {
     pub columns: Option<Vec<String>>,
     /// One row per `VALUES` tuple. A row may be shorter than the column list — PostgreSQL fills
     /// the rest with NULL rather than refusing — but never longer.
+    ///
+    /// **`DEFAULT VALUES` is one row of no expressions**, which is the shortest such row and needs
+    /// no variant of its own: the executor starts every row at each column's own default and runs
+    /// the sequences after the values, so a row that names nothing is a row of defaults with its
+    /// `bigserial` drawn. A row of NULLs, which is the tempting reading of the syntax, would be a
+    /// different statement. An empty `rows` is a different thing again and never happens: it would
+    /// be an `INSERT` that writes nothing at all.
     pub rows: Vec<Vec<Expr>>,
     /// `RETURNING`, over the rows as stored.
     pub returning: Option<Returning>,

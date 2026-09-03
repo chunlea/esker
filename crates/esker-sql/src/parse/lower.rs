@@ -2162,10 +2162,25 @@ fn lower_insert(insert: &sqlparser::ast::Insert) -> Result<plan::Insert> {
         )
     };
 
-    let source = insert
-        .source
-        .as_ref()
-        .ok_or_else(|| SqlError::unsupported("INSERT with no source"))?;
+    // **`INSERT INTO t DEFAULT VALUES` is an `INSERT` of one row of no expressions.**
+    //
+    // `sqlparser` gives it `columns: []` and `source: None`, and one row of nothing is exactly
+    // what it means: `crate::exec::dml` starts every row at each column's own default — the same
+    // fill a short `VALUES` tuple and an unnamed column already get — and the sequences run after
+    // the values, so a `bigserial` draws its number. So this needs no arm in the executor and
+    // gets none; a row of NULLs, which is the tempting reading, would be a different statement.
+    //
+    // The other `source: None` is MySQL's `INSERT … SET`, refused above by its assignments, so
+    // reaching here with no source means the two words were written.
+    let Some(source) = insert.source.as_ref() else {
+        return Ok(plan::Insert {
+            table,
+            columns,
+            rows: vec![Vec::new()],
+            returning,
+            on_conflict: insert.on.as_ref().map(lower_on_conflict).transpose()?,
+        });
+    };
     refuse_if(source.with.is_some(), "INSERT ... WITH")?;
     refuse_if(source.order_by.is_some(), "INSERT ... ORDER BY")?;
     refuse_if(source.limit_clause.is_some(), "INSERT ... LIMIT")?;
@@ -2517,6 +2532,19 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
         Expr::IsNotNull(operand) => Ok(plan::Expr::IsNull {
             operand: Box::new(lower_expr(operand)?),
             negated: true,
+        }),
+        // **Not a `NOT` around an `=`.** The two are one operator each, because the negation of
+        // unknown is unknown and `NOT (NULL = NULL)` is therefore NULL where
+        // `NULL IS DISTINCT FROM NULL` is `false`.
+        Expr::IsDistinctFrom(left, right) => Ok(plan::Expr::Binary {
+            op: plan::BinaryOp::Distinct,
+            left: Box::new(lower_expr(left)?),
+            right: Box::new(lower_expr(right)?),
+        }),
+        Expr::IsNotDistinctFrom(left, right) => Ok(plan::Expr::Binary {
+            op: plan::BinaryOp::NotDistinct,
+            left: Box::new(lower_expr(left)?),
+            right: Box::new(lower_expr(right)?),
         }),
         Expr::UnaryOp {
             op: UnaryOperator::Not,

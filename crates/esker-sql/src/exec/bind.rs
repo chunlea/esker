@@ -189,6 +189,15 @@ fn walk(
             {
                 walk_predicate(predicate, tables, seen);
             }
+            // **And the target list**, which holds no predicate of its own but may hold a
+            // *subquery* that does: `SELECT (SELECT count(*) FROM t WHERE n > $1)` types `$1`
+            // from `n`, and reaching it means walking the projection the same way. Anything else
+            // there matches no arm and costs one call.
+            for item in &select.projection {
+                if let crate::plan::SelectItem::Expr { expr, .. } = item {
+                    walk_predicate(expr, tables, seen);
+                }
+            }
             // **A derived table's predicates too.** Its parameters are numbered in the same
             // statement, so `SELECT … FROM (SELECT … WHERE n > $1) AS x` types `$1` from `n` —
             // the relations are already all in `tables`, which is the whole statement's.
@@ -338,8 +347,51 @@ fn walk_predicate(
                 walk_predicate(item, tables, seen);
             }
         }
+        // **The subquery's own clauses type their own parameters.** `IN (SELECT id FROM t LIMIT
+        // $1)` types `$1` as `bigint` because it is a count, and `IN (SELECT id FROM t WHERE
+        // title = $1)` types it from `title` — a column of a table the outer statement never
+        // names, which is why [`table_names`] collects a subquery's relations too. Walked as the
+        // `SELECT` it is, so every rule above applies inside it without being restated.
+        Expr::Subquery(sub) => {
+            if let Some(operand) = &sub.operand {
+                walk_predicate(operand, tables, seen);
+                // `$1 IN (SELECT n FROM t)` is the operand taking the **subquery's** column
+                // type, which is the one rule here that reads across the boundary rather than
+                // within it. `SubqueryExpr::column` cannot answer: it is filled by the planner and
+                // this runs at `Parse`, before any plan exists. So the sub-select's single output
+                // column is read the way every other type here is read — through the catalog, by
+                // name — and anything more involved than a column reference keeps the `text`
+                // fallback rather than being guessed at.
+                if let Expr::Parameter(number) = operand.as_ref()
+                    && let Some(ty) = single_column_type(&sub.select, tables)
+                {
+                    seen(*number, ty);
+                }
+            }
+            walk(&Statement::Select(sub.select.clone()), tables, seen);
+        }
         _ => {}
     }
+}
+
+/// The type of a sub-select's **single output column**, when it is a column this inference can
+/// name.
+///
+/// Only the one-item target list, and only a plain column reference in it: those are the shapes
+/// `ActiveRecord` writes — `IN (SELECT "t"."id" FROM …)` — and the type is then a fact in the
+/// catalog rather than a guess. Everything else answers `None` and the parameter keeps `text`,
+/// because a `ParameterDescription` put on the wire from a guess is worse than the fallback.
+fn single_column_type(
+    select: &crate::plan::Select,
+    tables: &[std::sync::Arc<TableDef>],
+) -> Option<ColumnType> {
+    let [crate::plan::SelectItem::Expr { expr, .. }] = select.projection.as_slice() else {
+        return None;
+    };
+    let Expr::Column { table, name } = expr else {
+        return None;
+    };
+    column_type(tables, table.as_deref(), name)
 }
 
 /// One column's type, by name and an optional qualifier.
@@ -427,7 +479,7 @@ fn walk_table_ref_mut(table: &mut crate::plan::TableRef, visit: &mut impl FnMut(
 /// This one **sizes** the parameter list (`infer` takes the highest `$n` it sees) and the other
 /// substitutes. A clause in one and not the other is a parameter counted and never filled, or
 /// filled and never counted — so they are written as a pair and reviewed as a pair.
-fn for_each_in_select(select: &crate::plan::Select, each: &mut impl FnMut(&Expr)) {
+fn for_each_in_select<'a>(select: &'a crate::plan::Select, each: &mut impl FnMut(&'a Expr)) {
     for item in &select.projection {
         if let crate::plan::SelectItem::Expr { expr, .. } = item {
             each(expr);
@@ -459,7 +511,7 @@ fn for_each_in_select(select: &crate::plan::Select, each: &mut impl FnMut(&Expr)
 }
 
 /// A `FROM` entry, for [`for_each_in_select`].
-fn for_each_in_table_ref(table: &crate::plan::TableRef, each: &mut impl FnMut(&Expr)) {
+fn for_each_in_table_ref<'a>(table: &'a crate::plan::TableRef, each: &mut impl FnMut(&'a Expr)) {
     if let Some(derived) = &table.derived {
         for_each_in_select(&derived.select, each);
     }
@@ -544,6 +596,20 @@ fn collect_table_names<'a>(select: &'a crate::plan::Select, into: &mut Vec<&'a s
             collect_table_names(&derived.select, into);
         }
     }
+    // **A subquery's relations are the statement's too**, because the inference is given one list
+    // for the whole statement and a parameter under an `IN (SELECT … WHERE title = $1)` is typed
+    // by a column of a table only the subquery names. Without this the list held the outer
+    // table alone and `$1` fell back to `text`.
+    for_each_in_select(select, &mut |expr| collect_subquery_tables(expr, into));
+}
+
+/// The relations named inside every subquery of one expression, for [`collect_table_names`].
+fn collect_subquery_tables<'a>(expr: &'a Expr, into: &mut Vec<&'a str>) {
+    descend(expr, &mut |expr| {
+        if let Expr::Subquery(sub) = expr {
+            collect_table_names(&sub.select, into);
+        }
+    });
 }
 
 pub(super) fn walk_expr_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr)) {
@@ -630,6 +696,24 @@ pub(super) fn walk_expr_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr)) 
                 walk_expr_mut(arg, visit);
             }
         }
+        // **A subquery is a `SELECT` inside an expression, and its parameters are numbered in the
+        // statement that holds it**: `WHERE id IN (SELECT id FROM t LIMIT $1)` is one `$1`, not a
+        // statement of its own with a `$1` of its own. Without this arm the walk stopped at the
+        // boundary and the parameter was never counted, never typed and never substituted —
+        // `42P18 could not determine data type of parameter $1` at `Parse`, for a value the
+        // client was about to send.
+        //
+        // The same omission the clause list above was written out to prevent, one level up: that
+        // one visited five clauses of a `SELECT` and this one visited none of a nested `SELECT`'s.
+        // **Both fields**, because the operand of an `IN` lives on the subquery expression rather
+        // than beside it, so an arm that walked only the sub-`SELECT` would leave `$1 IN (SELECT
+        // …)` behind.
+        Expr::Subquery(sub) => {
+            if let Some(operand) = &mut sub.operand {
+                walk_expr_mut(operand, visit);
+            }
+            walk_select_mut(&mut sub.select, visit);
+        }
         _ => {}
     }
 }
@@ -644,8 +728,27 @@ pub(super) fn table_names(statement: &Statement) -> Vec<&str> {
             collect_table_names(select, &mut names);
             names
         }
-        Statement::Update(update) => vec![update.table.as_str()],
-        Statement::Delete(delete) => vec![delete.table.as_str()],
+        // The table written, then whatever its `WHERE`'s subqueries read: `delete_all` on a
+        // joined relation sends `DELETE FROM a WHERE (a.id) IN (SELECT a.id FROM a JOIN b … WHERE
+        // b.title = $1)`, and `$1` is typed by a column of `b`.
+        Statement::Update(update) => {
+            let mut names = vec![update.table.as_str()];
+            for expr in update
+                .filter
+                .iter()
+                .chain(update.assignments.iter().map(|(_, value)| value))
+            {
+                collect_subquery_tables(expr, &mut names);
+            }
+            names
+        }
+        Statement::Delete(delete) => {
+            let mut names = vec![delete.table.as_str()];
+            if let Some(filter) = &delete.filter {
+                collect_subquery_tables(filter, &mut names);
+            }
+            names
+        }
         Statement::Explain(inner, _) => table_names(inner),
         Statement::CreateTable(_)
         | Statement::DropTable(_)
@@ -693,8 +796,8 @@ pub(super) fn has_parameters(statement: &Statement) -> bool {
 }
 
 /// Every expression in a statement, read-only.
-pub(super) fn for_each_expr(statement: &Statement, visit: &mut impl FnMut(&Expr)) {
-    let mut each = |expr: &Expr| descend(expr, visit);
+pub(super) fn for_each_expr<'a>(statement: &'a Statement, visit: &mut impl FnMut(&'a Expr)) {
+    let mut each = |expr: &'a Expr| descend(expr, visit);
     match statement {
         Statement::Insert(insert) => {
             for row in &insert.rows {
@@ -744,8 +847,18 @@ pub(super) fn for_each_expr(statement: &Statement, visit: &mut impl FnMut(&Expr)
     }
 }
 
-pub(super) fn descend(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
+pub(super) fn descend<'a>(expr: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
     visit(expr);
+    if let Expr::Subquery(sub) = expr {
+        // [`walk_expr_mut`]'s twin arm, and it has to agree with it: one sizes the parameter list
+        // and the other fills it, so a shape in one and not the other is a parameter counted and
+        // never filled, or filled and never counted.
+        if let Some(operand) = &sub.operand {
+            descend(operand, visit);
+        }
+        for_each_in_select(&sub.select, &mut |expr| descend(expr, &mut *visit));
+        return;
+    }
     match expr {
         Expr::Not(operand)
         | Expr::IsNull { operand, .. }

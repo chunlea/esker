@@ -58,9 +58,15 @@ impl std::fmt::Display for Answer {
 }
 
 /// What a corpus is allowed to disagree about, and why.
+///
+/// Held from **both** sides, the way `parity_harness`'s are: an unlisted divergence fails the
+/// test and so does a listed one that has started agreeing. Closing a gap cannot be absorbed
+/// silently, and neither can opening one.
 #[derive(Default)]
 pub(crate) struct Divergences {
+    /// Statements whose rows agree and whose declared types do not.
     pub(crate) types: &'static [&'static str],
+    /// Statements answered differently, each with the reason.
     pub(crate) answers: &'static [(&'static str, &'static str)],
 }
 
@@ -247,6 +253,10 @@ pub(crate) fn replay(corpus: &str, divergences: &Divergences) -> usize {
     let mut type_mismatched = Vec::new();
     let mut agreed_after_all = Vec::new();
     let mut checked = 0;
+    // **One entry, however many times the statement appears** — `parity_harness` says why. An
+    // entry is stale only when *every* occurrence agreed. `(entry, line, statement)`.
+    let mut listed_agreements: Vec<(usize, usize, String)> = Vec::new();
+    let mut listed_seen: Vec<usize> = Vec::new();
 
     for Probe {
         line: line_number,
@@ -256,14 +266,22 @@ pub(crate) fn replay(corpus: &str, divergences: &Divergences) -> usize {
     } in parse(corpus)
     {
         checked += 1;
-        if let Some((_, _why)) = divergences
+        let listed = divergences
             .answers
             .iter()
-            .find(|(statement, _)| *statement == sql)
-        {
+            .position(|(statement, _)| *statement == sql);
+        // **Run it even when it is listed.** A replay is stateful, so a statement skipped here is
+        // a row this node never wrote and every line after it sees a different table than
+        // PostgreSQL did. A corpus of `SELECT`s hid that; one whose divergences are `DELETE`s
+        // would have compared its counts against a node that never deleted anything.
+        let actual = node.answer(&sql, &values);
+        if let Some(entry) = listed {
+            listed_seen.push(entry);
+            if actual == expected {
+                listed_agreements.push((entry, line_number, sql.clone()));
+            }
             continue;
         }
-        let actual = node.answer(&sql, &values);
         match (&expected, &actual) {
             (
                 Answer::Rows { types, rows },
@@ -303,6 +321,22 @@ pub(crate) fn replay(corpus: &str, divergences: &Divergences) -> usize {
         type_mismatched.len(),
         type_mismatched.join("\n\n")
     );
+    // Rule 2, decided per entry: an entry is stale only when **every** occurrence of its
+    // statement agreed. One that still covers a second occurrence stays.
+    for (at, (sql, _)) in divergences.answers.iter().enumerate() {
+        let occurrences = listed_seen.iter().filter(|&&seen| seen == at).count();
+        let agreements = listed_agreements
+            .iter()
+            .filter(|(entry, ..)| *entry == at)
+            .count();
+        if occurrences > 0 && agreements == occurrences {
+            let line = listed_agreements
+                .iter()
+                .find(|(entry, ..)| *entry == at)
+                .map_or(0, |(_, line, _)| *line);
+            agreed_after_all.push(format!("line {line}: {sql}"));
+        }
+    }
     assert!(
         agreed_after_all.is_empty(),
         "{} statements are listed as divergences and now agree -- delete the entries:\n\n{}",

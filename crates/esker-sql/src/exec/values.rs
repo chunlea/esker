@@ -100,12 +100,17 @@ pub(super) fn node(entry: &TableRef, def: &TableDef) -> Result<Node> {
 /// Against **no row**, exactly as a table function's arguments are: a constant list cannot read a
 /// column, and an expression that tries is the refusal `resolve` already raises rather than a
 /// silent NULL.
-pub(super) fn rows(list: &ValuesList) -> Result<Vec<Vec<Datum>>> {
+///
+/// **In the transaction**, because `CURRENT_TIMESTAMP` is the transaction's instant and reads it
+/// from there. `FROM (VALUES (CURRENT_TIMESTAMP = transaction_timestamp())) AS t(a)` is `t` on a
+/// real server, and without the transaction here it was the internal error of a clock function
+/// that reached an evaluator with nothing to read.
+pub(super) fn rows(list: &ValuesList, txn: &dyn crate::backend::Txn) -> Result<Vec<Vec<Datum>>> {
     list.rows
         .iter()
         .map(|row| {
             row.iter()
-                .map(|expr| super::cursor::evaluate(expr, &[]))
+                .map(|expr| super::cursor::evaluate_in_txn(expr, &[], txn))
                 .collect()
         })
         .collect()

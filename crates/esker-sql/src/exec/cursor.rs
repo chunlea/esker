@@ -211,7 +211,7 @@ impl<'a> Cursor<'a> {
             // Rows written into the statement, evaluated here for the same reason a catalog view's
             // are: nothing is stored, so there is no key range to seek in and the row count is the
             // length of the list.
-            Node::Values { list, .. } => Kind::Rows(super::values::rows(list)?.into_iter()),
+            Node::Values { list, .. } => Kind::Rows(super::values::rows(list, txn)?.into_iter()),
             // A set-returning function in `FROM`: its rows are computed here, once, exactly as a
             // catalog view's are — there is no key range to seek in and the row count is the
             // length of one array. Its arguments are evaluated against **no row**, which is what
@@ -1565,6 +1565,20 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                     (Some(false), Some(false)) => Datum::Bool(false),
                     _ => Datum::Null,
                 },
+                // **The two comparisons that never answer unknown.** `IS NOT DISTINCT FROM` is
+                // `=` made total: two NULLs are not distinct, one NULL is, and neither answer is
+                // unknown. It is decided before the NULL rule below rather than inside it,
+                // because the NULL rule is exactly what these two opt out of.
+                BinaryOp::Distinct | BinaryOp::NotDistinct => {
+                    let same = match (&left, &right) {
+                        (Datum::Null, Datum::Null) => true,
+                        (Datum::Null, _) | (_, Datum::Null) => false,
+                        // The type's own `=`, not representation equality: `1.0` and `1.00` are
+                        // one `numeric` value written two ways and are not distinct.
+                        _ => left.pg_cmp(&right).is_eq(),
+                    };
+                    Datum::Bool(same == matches!(op, BinaryOp::NotDistinct))
+                }
                 comparison => {
                     // Any NULL operand makes a comparison unknown. This is why `x = NULL` never
                     // matches and `x IS NULL` exists.
@@ -1579,7 +1593,10 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                         BinaryOp::LtEq => ordering.is_le(),
                         BinaryOp::Gt => ordering.is_gt(),
                         BinaryOp::GtEq => ordering.is_ge(),
-                        BinaryOp::And | BinaryOp::Or => unreachable!("handled above"),
+                        BinaryOp::And
+                        | BinaryOp::Or
+                        | BinaryOp::Distinct
+                        | BinaryOp::NotDistinct => unreachable!("handled above"),
                     })
                 }
             }
@@ -1655,19 +1672,38 @@ fn catalog_function(
     Ok(match call.func {
         // **The transaction's instant**, so two calls in one transaction are equal and their
         // difference is `00:00:00`. It comes from the TSO and never from a clock this node reads.
-        CatalogFunc::Now | CatalogFunc::CurrentDate => {
+        //
+        // **One instant, six spellings, five types.** Every row of a multi-row `VALUES` therefore
+        // gets the same timestamp, which is what `insert_all` compares and what an implementation
+        // that read a clock per row would get wrong. `statement_timestamp` and `clock_timestamp`
+        // are here too and are *declared divergences*: a real server advances them per statement
+        // and per call, and invariant 6 says the TSO's physical half is the only clock this node
+        // may read — a transaction has exactly one. The corpus pins the consequence that survives
+        // it, `clock_timestamp() >= transaction_timestamp()`.
+        CatalogFunc::Now
+        | CatalogFunc::CurrentDate
+        | CatalogFunc::LocalTimestamp
+        | CatalogFunc::LocalTime
+        | CatalogFunc::StatementTimestamp
+        | CatalogFunc::ClockTimestamp => {
             let Some(txn) = env.txn else {
-                return Err(SqlError::Internal(
-                    "now() reached an evaluator with no transaction".to_owned(),
-                ));
+                return Err(SqlError::Internal(format!(
+                    "{}() reached an evaluator with no transaction",
+                    call.func.name()
+                )));
             };
             let micros = crate::time_machine::micros_of_ts(txn.start_ts());
-            if call.func == CatalogFunc::CurrentDate {
+            match call.func {
                 // Floor division, so an instant before the epoch lands on the day containing it.
-                let day = micros.div_euclid(86_400_000_000);
-                Datum::Date(i32::try_from(day).unwrap_or(i32::MAX))
-            } else {
-                Datum::TimestampTz(micros)
+                CatalogFunc::CurrentDate => {
+                    let day = micros.div_euclid(86_400_000_000);
+                    Datum::Date(i32::try_from(day).unwrap_or(i32::MAX))
+                }
+                CatalogFunc::LocalTimestamp => Datum::Timestamp(micros),
+                // The time of day *within* that instant, so the same floor division decides the
+                // day and the remainder is what is left of it.
+                CatalogFunc::LocalTime => Datum::Time(micros.rem_euclid(86_400_000_000)),
+                _ => Datum::TimestampTz(micros),
             }
         }
         // **Not strict**: a NULL argument is skipped, not propagated, so `concat(NULL, NULL)` is
