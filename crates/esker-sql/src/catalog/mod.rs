@@ -654,6 +654,86 @@ pub const SEQUENCE_BATCH: u64 = 32;
 /// counter would be a number in the output of `EXPLAIN` that changed with the statement around it.
 pub const DERIVED_TABLE_ID: u64 = u64::MAX - 1024;
 
+/// A user-defined type: what `CREATE TYPE` made, by name.
+///
+/// **Its oid comes from the tenant's relation-id sequence**, the same counter tables and indexes
+/// draw from, so a type and a relation can never share one. That is PostgreSQL's arrangement too —
+/// `pg_class` and `pg_type` are two catalogs over one oid space — and it is what lets
+/// `'floatrange'::regtype` and `'people'::regclass` be numbers a client can compare.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeDef {
+    /// As the user wrote it, folded like every other identifier.
+    pub name: String,
+    /// From the tenant's relation-id sequence.
+    pub oid: u64,
+    /// Which of the three `CREATE TYPE` shapes it is.
+    pub kind: TypeKind,
+}
+
+/// One field of a composite type.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeField {
+    /// The field's name.
+    pub name: String,
+    /// Its type.
+    pub ty: ColumnType,
+    /// Its typmod, so `format_type` prints `character varying(90)` and not `character varying`.
+    pub typmod: i32,
+}
+
+/// The three shapes `CREATE TYPE` takes, and the three `typtype` codes they answer.
+///
+/// **`typtype` and `typcategory` are different one-letter codes and both matter**: a range is
+/// `r`/`R`, a composite `c`/`C` and an enum `e`/`E`. Measured; an implementation that answered one
+/// of them for both would pass a `typtype` probe and fail a `typcategory` one.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypeKind {
+    /// `CREATE TYPE r AS RANGE (subtype = …)`.
+    Range {
+        /// The element type the range is over, which `pg_range.rngsubtype` reports.
+        subtype: ColumnType,
+        /// The `subtype_diff` function's name, verbatim — `pg_range.rngsubdiff` prints it back and
+        /// nothing here calls it. `None` when the clause was not written.
+        subtype_diff: Option<String>,
+    },
+    /// `CREATE TYPE c AS (field type, …)`.
+    Composite {
+        /// The fields, in declaration order, which is the order `pg_attribute` reports them in.
+        fields: Vec<TypeField>,
+    },
+    /// `CREATE TYPE e AS ENUM ('a', 'b')` — and **an empty label list is legal**, measured.
+    Enum {
+        /// The labels, in declaration order. That order **is** the sort order: `'past' < 'future'`
+        /// is true for `('past','present','future')` because of where they were declared, not
+        /// because of the alphabet.
+        labels: Vec<String>,
+    },
+}
+
+impl TypeKind {
+    /// `pg_type.typtype`: `r`, `c` or `e`.
+    #[must_use]
+    pub fn typtype(&self) -> &'static str {
+        match self {
+            TypeKind::Range { .. } => "r",
+            TypeKind::Composite { .. } => "c",
+            TypeKind::Enum { .. } => "e",
+        }
+    }
+
+    /// `pg_type.typcategory`: `R`, `C` or `E`. **Not the upper case of `typtype` by accident** —
+    /// they are two different columns of one-letter codes, and only these three pairs happen to
+    /// look alike.
+    #[must_use]
+    pub fn typcategory(&self) -> &'static str {
+        match self {
+            TypeKind::Range { .. } => "R",
+            TypeKind::Composite { .. } => "C",
+            TypeKind::Enum { .. } => "E",
+        }
+    }
+}
+
 /// A table, its columns, its primary key and its indexes — everything needed to write a row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableDef {
@@ -1716,6 +1796,40 @@ pub fn install_extension(txn: &mut dyn Txn, tenant: u64, name: &str, version: &s
         &record::extension_key(tenant, name),
         &record::encode_extension(version),
     );
+}
+
+/// Writes a user-defined type. The caller has already checked that the name is free.
+pub fn put_type(txn: &mut dyn Txn, tenant: u64, def: &TypeDef) {
+    txn.put(
+        &record::type_key(tenant, &def.name),
+        &record::encode_type(def),
+    );
+}
+
+/// One user-defined type by name, or `None`.
+pub fn type_by_name(txn: &dyn Txn, tenant: u64, name: &str) -> Result<Option<TypeDef>> {
+    match txn.get(&record::type_key(tenant, name))? {
+        Some(bytes) => record::decode_type(name, &bytes).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Every user-defined type of one tenant, in name order — which is the order the key space returns
+/// them in, and the order `pg_type` lists them.
+pub fn user_types(txn: &dyn Txn, tenant: u64) -> Result<Vec<TypeDef>> {
+    let (start, end) = record::type_range(tenant);
+    txn.scan(&start, &end, 0)?
+        .into_iter()
+        .map(|(key, value)| {
+            let name = record::type_name_of(tenant, &key)?;
+            record::decode_type(&name, &value)
+        })
+        .collect()
+}
+
+/// Removes one. The caller has already checked that nothing depends on it.
+pub fn drop_type(txn: &mut dyn Txn, tenant: u64, name: &str) {
+    txn.delete(&record::type_key(tenant, name));
 }
 
 /// Every extension this tenant has installed, by name, in name order.

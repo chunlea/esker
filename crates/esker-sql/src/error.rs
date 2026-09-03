@@ -1139,6 +1139,11 @@ pub enum SqlError {
     #[error("type \"{0}\" does not exist")]
     UndefinedType(String),
 
+    /// `CREATE TYPE` for a name that is already a type. `42710`, the same class a duplicate
+    /// trigger gets, and the same one PostgreSQL uses.
+    #[error("type \"{0}\" already exists")]
+    DuplicateType(String),
+
     /// `42601` from PostgreSQL's **type-name** parser, which is a different grammar from a
     /// statement's: `'timestamp(-1)'::regtype` stops at the sign and `'integer(4)'::regtype` stops
     /// at the parenthesis, because a typmod argument is an unsigned integer and `integer` takes no
@@ -1702,7 +1707,9 @@ impl SqlError {
             | SqlError::DependentFunction { .. } => {
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST
             }
-            SqlError::DuplicateConstraint { .. } | SqlError::DuplicateExtension(_) => {
+            SqlError::DuplicateConstraint { .. }
+            | SqlError::DuplicateType(_)
+            | SqlError::DuplicateExtension(_) => {
                 sqlstate::DUPLICATE_OBJECT
             }
             SqlError::StringDataRightTruncation(_) => sqlstate::STRING_DATA_RIGHT_TRUNCATION,

@@ -1,0 +1,45 @@
+# `CREATE TYPE` — `AS RANGE`, `AS (…)` composite and `AS ENUM` — as PostgreSQL 19beta1 answers it.
+#
+# **A subset of the capture, and the subset is the commit.** The full capture is
+# `esker-rails-harness/captures/pg19_create_type.txt`: it goes on to read `pg_type`, `pg_range` and
+# `pg_enum`, to build values of each kind and to drop a type a column depends on. Those lines need
+# `oid::regtype::text` and a value representation, and they arrive with the commit that adds them —
+# a corpus whose first unanswered statement aborts the block verifies nothing after it, so the lines
+# this node cannot yet reach are held back rather than declared en masse.
+#
+# **Run 45 ranking row 3: 51 tests across 3 files**, and the three files want three different forms:
+# `range_test.rb` 46, `composite_test.rb` 4, `timestamp_test.rb` 1. So the row is not "enums": it is
+# ranges first, by nine to one. Each file's `setup` runs its `CREATE TYPE` verbatim, which is why
+# the statement existing at all is the first thing worth having.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **Two `CREATE TYPE` statements arrive in one `execute`**, semicolon-separated, because that
+#     is how `range_test.rb` writes its setup. Both must run.
+#   * **An enum with no labels is legal**: `CREATE TYPE emptyenum AS ENUM ()` succeeds.
+#   * **An unknown subtype is `42704`** naming the *subtype*, not the type being created, and a
+#     duplicate type is `42710`. `DROP TYPE` of a name that is not there is `42704`; with
+#     `IF EXISTS` it is a notice and the statement succeeds.
+BEGIN		-
+CREATE TYPE floatrange AS RANGE ( subtype = float8, subtype_diff = float8mi ); CREATE TYPE stringrange AS RANGE ( subtype = varchar );		-
+CREATE TYPE full_address AS ( city VARCHAR(90), street VARCHAR(90) )		-
+CREATE TYPE custom_time_format AS ENUM ('past', 'present', 'future')		-
+SAVEPOINT s2		-
+CREATE TYPE badrange AS RANGE ( subtype = nosuchtype )	!42704 type "nosuchtype" does not exist
+ROLLBACK TO s2		-
+SAVEPOINT s3		-
+CREATE TYPE floatrange AS RANGE ( subtype = float8 )	!42710 type "floatrange" already exists
+ROLLBACK TO s3		-
+SAVEPOINT s4		-
+CREATE TYPE emptyenum AS ENUM ()		-
+ROLLBACK TO s4		-
+SAVEPOINT s6		-
+DROP TYPE nosuchtype	!42704 type "nosuchtype" does not exist
+ROLLBACK TO s6		-
+DROP TYPE IF EXISTS nosuchtype		-
+ROLLBACK		-
+SELECT count(*) FROM pg_type WHERE typname IN ('floatrange','stringrange','full_address','custom_time_format','emptyenum')	bigint	0
