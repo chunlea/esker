@@ -1,0 +1,70 @@
+crates/esker-sql/src/catalog/mod.rs
+  h_44076b318daf9c 166-180,737,1509-1548,1560-1564,1570-1572,1614-1621,3320,3333,3389,3482,3564,3644-3648,4116,4129,4142,4747,4795
+crates/esker-sql/src/catalog/pg_attribute.rs
+  h_44076b318daf9c 132-135,137,166,205,251,254-273,276-281,284,298
+crates/esker-sql/src/catalog/pg_catalog.rs
+  h_44076b318daf9c 737
+crates/esker-sql/src/catalog/record.rs
+  h_44076b318daf9c 105,1568-1584,1587-1590,1598,1601,1603-1604,1606,1633-1655,2088,2176
+crates/esker-sql/src/error.rs
+  h_44076b318daf9c 1462-1481,1569-1584,1646-1656,1872,1894,1905,1936-1938,1982,2105-2107,2152-2156
+crates/esker-sql/src/exec/comment.rs
+  h_44076b318daf9c 99-102
+crates/esker-sql/src/exec/ddl.rs
+  h_44076b318daf9c 112,244,1509-1664,2660-2676,2733
+crates/esker-sql/src/exec/dml.rs
+  h_44076b318daf9c 761,865,1294-1298,1668-1679,1716-1723,1728,1730-1741,1749-1753
+crates/esker-sql/src/exec/flashback.rs
+  h_44076b318daf9c 265-268
+crates/esker-sql/src/exec/index.rs
+  h_44076b318daf9c 164-165,169-173,180-181,200,203
+crates/esker-sql/src/exec/mod.rs
+  h_44076b318daf9c 1238-1241,1244-1249,1254-1255,1265,1750-1764,1955-1965
+crates/esker-sql/src/exec/query.rs
+  h_44076b318daf9c 1976-1981
+crates/esker-sql/src/exec/subquery.rs
+  h_44076b318daf9c 218,334
+crates/esker-sql/src/exec/values.rs
+  h_44076b318daf9c 52
+crates/esker-sql/src/parameter.rs
+  h_44076b318daf9c 28-32,162-180,224-280,282-286,288-289,291-298,300-316,318-319,321-327,397-402,405-418,438-451,464-496
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 1751-1775
+crates/esker-sql/src/pgwire/server.rs
+  h_44076b318daf9c 176-204
+crates/esker-sql/src/pgwire/session.rs
+  h_44076b318daf9c 187-199
+crates/esker-sql/src/plan/ddl.rs
+  h_44076b318daf9c 728-733,744-762
+crates/esker-sql/src/sqlstate.rs
+  h_44076b318daf9c 134-140,346-349
+crates/esker-sql/tests/corpus/pg19_drop_column.txt
+  h_44076b318daf9c 1-121
+crates/esker-sql/tests/corpus/pg19_set_parameters.txt
+  h_44076b318daf9c 39,41-60,86-104,148-170
+crates/esker-sql/tests/corpus/pg19_transaction_timeouts.txt
+  h_44076b318daf9c 1-110
+crates/esker-sql/tests/drop_column.rs
+  h_44076b318daf9c 1-276
+crates/esker-sql/tests/lowering.rs
+  h_44076b318daf9c 179
+crates/esker-sql/tests/slt/alter_table.slt
+  h_44076b318daf9c 199-261
+crates/esker-sql/tests/transaction_timeouts.rs
+  h_44076b318daf9c 1-954
+docs/adr/0051-a-dropped-column-keeps-its-slot.md
+  h_44076b318daf9c 1-182
+docs/plans/phase-9-rails.md
+  h_44076b318daf9c 1264-1265,1295-1297,1522,1525
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "1517def06542f08b3a70aa903b0985894c2ce047",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
