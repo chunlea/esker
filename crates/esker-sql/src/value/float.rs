@@ -249,6 +249,55 @@ pub(crate) fn plain_decimal(text: &str) -> String {
 
 /// PostgreSQL's ordering, which is not IEEE's: every `NaN` is one value, it is greater than
 /// `Infinity`, and `-0.0` ties with `0.0`.
+/// An integer against a float, **exactly** — no rounding on either side.
+///
+/// # Why not simply widen the integer
+///
+/// Because the two answers differ and PostgreSQL gives the exact one for the operator this node
+/// actually meets. An unsuffixed decimal literal is a `numeric` there, and `int8 = numeric` is
+/// computed exactly: `9007199254740993 = 9007199254740992.0` is **`f`** on 19beta1, where widening
+/// the integer to `f64` rounds it onto the float and answers `t`. This node has one `Datum::Double`
+/// for both `numeric`-shaped literals and true `float8` values, so it has to pick one rule, and
+/// exactness is the one its corpus can tell apart — the widening rule is visible only for a real
+/// `float8` column compared against an integer past 2^53.
+///
+/// Both corpus lines that reach this agree with a real server under it: `1 IN (1.0)` is `t` and the
+/// pair above is `f`.
+pub(super) fn pg_cmp_int(a: i64, b: f64) -> Ordering {
+    // NaN is **greater than everything** in PostgreSQL's float ordering, infinities included.
+    if b.is_nan() {
+        return Ordering::Less;
+    }
+    if b == f64::INFINITY {
+        return Ordering::Less;
+    }
+    if b == f64::NEG_INFINITY {
+        return Ordering::Greater;
+    }
+    // Outside `i64`'s range the answer is the sign, and asking for the truncation would be
+    // undefined. `2^63` is exactly representable, so the bound is exact.
+    if b >= 9_223_372_036_854_775_808.0 {
+        return Ordering::Less;
+    }
+    if b < -9_223_372_036_854_775_808.0 {
+        return Ordering::Greater;
+    }
+    let whole = b.trunc();
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the two bounds above put `whole` inside i64, and it is an integer already"
+    )]
+    let truncated = whole as i64;
+    // The integer parts first, then the fraction — which only matters when they are equal, and
+    // then only its sign. `-2.5` truncates to `-2` and is *less* than `-2`, which is why the
+    // fraction is compared against zero rather than assumed positive.
+    a.cmp(&truncated).then_with(|| match b.partial_cmp(&whole) {
+        Some(Ordering::Greater) => Ordering::Less,
+        Some(Ordering::Less) => Ordering::Greater,
+        _ => Ordering::Equal,
+    })
+}
+
 pub(super) fn pg_cmp(a: f64, b: f64) -> Ordering {
     match (a.is_nan(), b.is_nan()) {
         (true, true) => Ordering::Equal,

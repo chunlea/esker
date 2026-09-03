@@ -316,6 +316,10 @@ impl<'a> Cursor<'a> {
             txn: Some(self.txn),
             tenant: self.tenant,
             catalog: Some(&self.catalog),
+            // The **transaction's** instant, which is what `CURRENT_TIMESTAMP` and `CURRENT_DATE`
+            // mean: every row this cursor answers reads the same clock, and so does every other
+            // cursor in the transaction.
+            now: crate::time_machine::micros_of_ts(self.txn.start_ts()),
         };
         match &mut self.kind {
             Kind::One(used) => Ok(if std::mem::replace(used, true) {
@@ -818,6 +822,13 @@ pub(super) struct Env<'a> {
     /// Where the cursor keeps its catalog snapshot, or `None` for an evaluator that has no cursor
     /// behind it — `RETURNING` and `UPDATE ... SET`, neither of which can hold a catalog function.
     catalog: Option<&'a std::cell::OnceCell<crate::catalog::pg_relations::Relations>>,
+    /// The **transaction's** instant, in microseconds from 2000-01-01.
+    ///
+    /// Not the statement's and not a wall-clock reading: it is what `CURRENT_TIMESTAMP` means on a
+    /// real server — constant within a transaction, equal to `now()` — and it is the only clock
+    /// this node is allowed (`CLAUDE.md` invariant 6). Two columns defaulting to it in one
+    /// `INSERT` therefore hold the same instant, which the capture checks.
+    now: i64,
 }
 
 impl Env<'_> {
@@ -827,7 +838,13 @@ impl Env<'_> {
             txn: None,
             tenant: 0,
             catalog: None,
+            now: 0,
         }
+    }
+
+    /// No transaction, but a clock: what a column `DEFAULT` is evaluated in.
+    pub(super) fn at(now: i64) -> Self {
+        Env { now, ..Env::none() }
     }
 
     /// The tenant's relations, read the first time one is asked for and shared after that.
@@ -850,9 +867,68 @@ impl Env<'_> {
     }
 }
 
+/// The plain functions, evaluated over arguments that are already values.
+///
+/// `now` is the transaction's instant; the two clock functions read it and the other three ignore
+/// it (`Env::now`).
+fn evaluate_call(func: crate::plan::PlainFunc, args: &[Datum], now: i64) -> Result<Datum> {
+    use crate::plan::PlainFunc;
+    Ok(match func {
+        PlainFunc::Random => Datum::Double(crate::value::random::random_f64()?),
+        // **NULL arguments are skipped, not propagated.** That is what separates `concat` from the
+        // `||` operator, which answers NULL if either side is NULL — measured, and the reason a
+        // schema reaches for `concat` when it wants a default that is never NULL.
+        PlainFunc::Concat => Datum::Text(
+            args.iter()
+                .filter(|arg| !matches!(arg, Datum::Null))
+                .filter_map(|arg| match arg {
+                    // A boolean concatenates as `true`, the way its `::text` cast prints it and
+                    // not the way a row of it does.
+                    Datum::Bool(flag) => Some(if *flag { "true" } else { "false" }.to_owned()),
+                    other => other.to_text(),
+                })
+                .collect::<Vec<_>>()
+                .concat(),
+        ),
+        PlainFunc::ConvertTo => {
+            let [text, encoding] = args else {
+                return Err(SqlError::Internal(
+                    "convert_to reached the evaluator with the wrong arity".to_owned(),
+                ));
+            };
+            let (Some(text), Some(encoding)) = (text.to_text(), encoding.to_text()) else {
+                // NULL in either argument is NULL out, which is what a `STRICT` function does.
+                return Ok(Datum::Null);
+            };
+            // **Only UTF-8**, and named rather than approximated. This node stores text as Rust
+            // `String`s, which are UTF-8 by construction, so every other encoding would need a
+            // conversion table — and answering the UTF-8 bytes under another encoding's name would
+            // be a wrong answer rather than a gap. PostgreSQL spells the name without a hyphen.
+            if !encoding.eq_ignore_ascii_case("UTF8") && !encoding.eq_ignore_ascii_case("UTF-8") {
+                return Err(SqlError::unsupported(format!(
+                    "convert_to(..., '{encoding}'), an encoding other than UTF8"
+                )));
+            }
+            Datum::Bytea(text.into_bytes())
+        }
+        PlainFunc::Now => Datum::TimestampTz(now),
+        // **Truncated toward the past, not toward zero.** The two agree after 2000-01-01 and
+        // disagree before it, where a `-1` microsecond is the last day of 1999 and integer
+        // division would call it the first day of 2000.
+        PlainFunc::CurrentDate => {
+            Datum::Date(i32::try_from(now.div_euclid(86_400_000_000)).unwrap_or(i32::MAX))
+        }
+    })
+}
+
 /// Evaluates an expression over a row, with no way to run a subquery of its own.
 pub(super) fn evaluate(expr: &Expr, row: &[Datum]) -> Result<Datum> {
     evaluate_in(expr, row, Env::none())
+}
+
+/// The same, with the transaction's instant — what a column `DEFAULT` is evaluated with.
+pub(super) fn evaluate_at(expr: &Expr, row: &[Datum], now: i64) -> Result<Datum> {
+    evaluate_in(expr, row, Env::at(now))
 }
 
 #[allow(
@@ -868,6 +944,14 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         // Rust's own case conversion, which is full Unicode and agrees with PostgreSQL's
         // under a UTF-8 locale — measured on an accented pair, since that is where a byte-wise
         // implementation would differ. NULL in, NULL out.
+        // `random()`, `concat(...)`, `convert_to(...)` and the two clock functions.
+        Expr::Call { func, args } => {
+            let args = args
+                .iter()
+                .map(|arg| evaluate_in(arg, row, env))
+                .collect::<Result<Vec<_>>>()?;
+            evaluate_call(*func, &args, env.now)?
+        }
         Expr::Scalar { func, operand } => match evaluate_in(operand, row, env)? {
             Datum::Null => Datum::Null,
             Datum::Text(text) => Datum::Text(match func {

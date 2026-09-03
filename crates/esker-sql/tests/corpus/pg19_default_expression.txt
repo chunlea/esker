@@ -1,0 +1,60 @@
+# A column `DEFAULT` is an **arbitrary expression**, evaluated per row — statement 738's ten.
+#
+# This node had two rules of its own and PostgreSQL has neither: a default had to be a *constant*
+# (so `0::bigint` and `1 + 1` were refused) and a function default was refused as *possibly
+# volatile* (so `concat`, `convert_to`, `CURRENT_DATE` and `random` were too). PostgreSQL applies
+# no volatility test and no constant test at all.
+#
+# **What it does forbid is exactly three things**, and all three are below with their messages: a
+# column reference, a subquery, and a set-returning function. An unknown function is not a fourth
+# rule — it is the ordinary `42883`.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **A default is stored as a parse tree and printed back deparsed**, so the text that comes out
+#     is not the text that went in: `random() * 100` prints
+#     `(random() * (100)::double precision)`, `0::bigint` prints `(0)::bigint`, and
+#     `convert_to('A', 'UTF8')` prints `convert_to('A'::text, 'UTF8'::name)`. Every implicit cast
+#     the parser inserted is visible in the output.
+#   * **`CURRENT_DATE` prints as itself**, uncast and unparenthesised, where the function calls
+#     around it gain both — the same rule `CURRENT_TIMESTAMP` already follows.
+#   * **A volatile default really is per row**: `random() * 100` is a different number for each,
+#     which is what makes the constant-folding this node used to attempt wrong rather than merely
+#     narrow.
+CREATE TABLE dd (id int8 PRIMARY KEY, ror varchar DEFAULT concat('Ruby ', 'on ', 'Rails'), md date DEFAULT CURRENT_DATE, mdf date DEFAULT now(), fd date DEFAULT '2004-01-01', mt timestamp(6) DEFAULT CURRENT_TIMESTAMP, ft timestamp(6) DEFAULT '2004-01-01 00:00:00', c1 char(1) DEFAULT 'Y', bd bigint DEFAULT 0::bigint, bdf bytea DEFAULT convert_to('A', 'UTF8'), ml text DEFAULT '--- [] ', rr float8 DEFAULT random())		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = 'dd'::regclass AND a.attname = 'ror'	text	concat('Ruby ', 'on ', 'Rails')
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = 'dd'::regclass AND a.attname = 'md'	text	CURRENT_DATE
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = 'dd'::regclass AND a.attname = 'mdf'	text	now()
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = 'dd'::regclass AND a.attname = 'fd'	text	'2004-01-01'::date
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = 'dd'::regclass AND a.attname = 'mt'	text	CURRENT_TIMESTAMP
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = 'dd'::regclass AND a.attname = 'ft'	text	'2004-01-01 00:00:00'::timestamp without time zone
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = 'dd'::regclass AND a.attname = 'c1'	text	'Y'::bpchar
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = 'dd'::regclass AND a.attname = 'bd'	text	(0)::bigint
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = 'dd'::regclass AND a.attname = 'bdf'	text	convert_to('A'::text, 'UTF8'::name)
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = 'dd'::regclass AND a.attname = 'ml'	text	'--- [] '::text
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = 'dd'::regclass AND a.attname = 'rr'	text	random()
+SELECT count(*) FROM pg_attrdef WHERE adrelid = 'dd'::regclass	bigint	11
+INSERT INTO dd (id) VALUES (1)		-
+INSERT INTO dd (id) VALUES (2)		-
+SELECT ror, fd, ft, c1, bd, bdf, ml FROM dd WHERE id = 1	character varying,date,timestamp(6) without time zone,character(1),bigint,bytea,text	Ruby on Rails|2004-01-01|2004-01-01 00:00:00|Y|0|\x41|--- [] 
+SELECT md = CURRENT_DATE, mdf = CURRENT_DATE, mt <= CURRENT_TIMESTAMP, rr >= 0 AND rr < 1 FROM dd WHERE id = 1	boolean,boolean,boolean,boolean	t|t|t|t
+SELECT count(DISTINCT rr) FROM dd	bigint	2
+SELECT concat('Ruby ', 'on ', 'Rails'), convert_to('A', 'UTF8'), 0::bigint	text,bytea,bigint	Ruby on Rails|\x41|0
+SELECT concat('a', 3, NULL, 'b')	text	a3b
+SELECT concat()	!42883 function concat() does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT length(convert_to('hello', 'UTF8'))	integer	5
+SELECT random() >= 0 AND random() < 1	boolean	t
+SELECT random() = random()	boolean	f
+SELECT pg_typeof(random()), pg_typeof(concat('a','b')), pg_typeof(convert_to('A','UTF8')), pg_typeof(CURRENT_DATE)	regtype,regtype,regtype,regtype	double precision|text|bytea|date
+CREATE TABLE ar1 (a integer DEFAULT random() * 100)		-
+CREATE TABLE ar2 (a int4 DEFAULT 1 + 1)		-
+CREATE TABLE bad1 (a int8, b int8 DEFAULT a)	!0A000 cannot use column reference in DEFAULT expression
+CREATE TABLE bad2 (a int8 DEFAULT (SELECT 1))	!0A000 cannot use subquery in DEFAULT expression
+CREATE TABLE bad3 (a int8 DEFAULT generate_series(1, 2))	!0A000 set-returning functions are not allowed in DEFAULT expressions
+CREATE TABLE bad4 (a int8 DEFAULT nosuchfunc())	!42883 function nosuchfunc() does not exist DETAIL: There is no function of that name.
+CREATE TABLE bad5 (a date DEFAULT 'not a date')	!22007 invalid input syntax for type date: "not a date"
+CREATE TABLE bad6 (a int8, b int8 DEFAULT concat(a, 'x'))	!0A000 cannot use column reference in DEFAULT expression

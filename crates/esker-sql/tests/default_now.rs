@@ -14,20 +14,13 @@ const CORPUS_FIXTURE: &[&str] = &[];
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
     answers: &[
-        (
-            "SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef d JOIN pg_class c ON c.oid = \
-             d.adrelid WHERE c.relname = 'dt' ORDER BY adnum",
-            "`pg_attrdef` and `pg_get_expr` are e2-catalog's: reading a default back out of the \
-             catalog needs the records that hold one. The line is here because it is the proof \
-             that PostgreSQL records `CURRENT_TIMESTAMP` and `now()` as the *same* default, which \
-             is why this node keeps one flag and not two.",
-        ),
-        (
-            "SELECT CURRENT_TIMESTAMP = now()",
-            "Both are the transaction's timestamp here and both would answer `t`, but neither is \
-             a *scalar expression* yet: this unit records the default and does not add \
-             `CURRENT_TIMESTAMP` to the expression language. `0A000` naming it.",
-        ),
+        // **Two entries stood here and both are deleted** (ADR 0031, rule 2). One said this
+        // node could not tell `DEFAULT CURRENT_TIMESTAMP` from `DEFAULT now()`, because a default
+        // was a *tag* over a closed set of expressions and the two shared it; the other said
+        // `CURRENT_TIMESTAMP` was a default and not an expression, so `SELECT CURRENT_TIMESTAMP =
+        // now()` was `0A000`. Generalising a default to any expression answered both at once: the
+        // catalog holds the text the user wrote, so the spellings survive, and the evaluator has
+        // the function, so the comparison runs.
         (
             "SELECT pg_typeof(CURRENT_TIMESTAMP), pg_typeof(now()), pg_typeof(LOCALTIMESTAMP), \
              pg_typeof(CURRENT_DATE)",
@@ -35,8 +28,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         ),
         (
             "SELECT CURRENT_TIMESTAMP IS NOT NULL, LOCALTIMESTAMP IS NOT NULL",
-            "The same: a default is not an expression. `LOCALTIMESTAMP` is the `timestamp` \
-             without time zone form and is not recorded either — `ActiveRecord` does not emit it.",
+            "`LOCALTIMESTAMP` answers the transaction's instant here as `CURRENT_TIMESTAMP` does, \
+             where a real server gives the `timestamp` without time zone form of it — this node \
+             has one clock value and prints it one way. `ActiveRecord` does not emit the keyword; \
+             it is in the corpus because it is the neighbour that would catch a node answering \
+             the two differently.",
         ),
         (
             "SELECT CURRENT_TIMESTAMP(0) IS NOT NULL",
@@ -104,20 +100,37 @@ fn an_explicit_value_beats_the_default_and_the_keyword_asks_for_it() {
     );
 }
 
-/// A volatile default that is **not** `CURRENT_TIMESTAMP` is still refused by name.
+/// **A volatile default is no longer refused, and the refusal it replaced was this node's own.**
 ///
-/// The refusal was never about defaults being hard; it was about a catalog that stores one value
-/// being unable to hold an expression. One expression is admitted now, and the argument for
-/// refusing the rest is unchanged.
+/// This test asserted the opposite until the `DEFAULT` expression unit: a function call in a
+/// default was `0A000 … which may be volatile`, on the argument that a catalog holding one value
+/// cannot hold an expression. The catalog holds the expression now, so `random()` is taken and
+/// evaluated per row — which is what PostgreSQL does, and it applies no volatility test at all.
+///
+/// What is still refused is `CURRENT_TIMESTAMP(0)`, and for a reason that has nothing to do with
+/// volatility: this node has no sub-second precision argument on the clock, so honouring the
+/// number would mean ignoring it.
 #[test]
-fn another_volatile_default_is_still_refused() {
+fn a_volatile_default_is_taken_and_a_precision_argument_is_not() {
     let mut node = parity::Node::new(&[]);
-    for sql in [
-        "CREATE TABLE r (id int8 PRIMARY KEY, a int8 DEFAULT random())",
-        "CREATE TABLE r (id int8 PRIMARY KEY, a int8 DEFAULT (1+1))",
-        "CREATE TABLE r (id int8 PRIMARY KEY, a timestamp DEFAULT CURRENT_TIMESTAMP(0))",
-    ] {
-        let error = node.run(sql).unwrap_err();
-        assert_eq!(error.sqlstate(), "0A000", "{sql}");
+    node.run("CREATE TABLE r (id int8 PRIMARY KEY, a float8 DEFAULT random())")
+        .unwrap();
+    for id in 0..4 {
+        node.run(&format!("INSERT INTO r (id) VALUES ({id})"))
+            .unwrap();
     }
+    assert_eq!(
+        node.rows("SELECT count(DISTINCT a), count(*) FROM r"),
+        [["4", "4"]],
+        "per row, not once at CREATE TABLE"
+    );
+
+    // `CURRENT_TIMESTAMP(0)` is a **precision argument**, which a real server takes and this node
+    // does not have a clock for — refused as a wrong arity (`42883`), where PostgreSQL answers the
+    // instant rounded to the second. A refusal either way, and the code differs because the
+    // function exists here with one signature rather than two.
+    let error = node
+        .run("CREATE TABLE p (id int8 PRIMARY KEY, a timestamp DEFAULT CURRENT_TIMESTAMP(0))")
+        .unwrap_err();
+    assert_eq!(error.sqlstate(), "42883");
 }

@@ -2241,6 +2241,10 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         Expr::Literal(Literal::Integer(_)) | Expr::Sequence(_) => ColumnType::Int8,
         // Every catalog function returns `text`, which is what makes them one variant.
         Expr::CatalogFunc(call) => call.func.result_type(),
+        // Each plain function has its own, measured with `pg_typeof`: `random()` is
+        // `double precision` and `now()` a `timestamp with time zone`, which are the two a reader
+        // would guess wrong from the columns they usually fill.
+        Expr::Call { func, .. } => func.result_type(),
         Expr::Literal(Literal::Decimal(_)) => ColumnType::Double,
 
         // Whatever the operand is, a cast to `text` answers `text` — that is what it is for.

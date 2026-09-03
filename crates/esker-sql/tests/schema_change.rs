@@ -251,30 +251,44 @@ fn not_null_without_a_default_is_still_refused_and_names_the_pair() {
     );
 }
 
-/// A volatile default cannot be one value in the catalog — PostgreSQL rewrites the table for it,
-/// measured (`atthasmissing` comes back false). This node has no rewrite until the job exists, so
-/// it refuses by name rather than storing one row's answer for every row.
+/// An **expression** default on `ADD COLUMN` is refused, and the reason is the rewrite.
+///
+/// PostgreSQL rewrites the table for one — measured, `atthasmissing` comes back false — so every
+/// row already stored gets its own value. This `ALTER` is defined not to rewrite, so taking the
+/// clause would leave those rows NULL where a real server fills them: a wrong answer rather than a
+/// gap, and refused by name.
+///
+/// **The same expression is accepted by `CREATE TABLE`**, which has no rows to rewrite. That is
+/// the whole difference, and it is why the refusal names the statement and not the function.
 #[test]
-fn a_volatile_default_is_refused_by_name() {
+fn an_expression_default_on_add_column_is_refused_by_name() {
     let mut node = Node::new();
     a_populated_table(&mut node);
-    let error = node.fails("ALTER TABLE t ADD COLUMN r int8 DEFAULT random()");
+    let error = node.fails("ALTER TABLE t ADD COLUMN r float8 DEFAULT random()");
     assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED);
     assert_eq!(
         error.to_string(),
-        "DEFAULT random(), which may be volatile is not supported"
+        "ALTER TABLE ... ADD COLUMN ... DEFAULT random(), which would rewrite every row is not \
+         supported"
     );
+    // And the folded half is still taken, because a constant pads without a rewrite.
+    node.run("ALTER TABLE t ADD COLUMN k int8 DEFAULT 7")
+        .unwrap();
 }
 
-/// PostgreSQL folds `(1+1)` to `2` before storing it. There is no folder here, and naming that is
-/// the honest answer — a folder is a feature, not an oversight to paper over.
+/// **PostgreSQL does not fold `(1+1)` either** — it prints the default back as `(1 + 1)`,
+/// unevaluated — so the refusal here names the missing operator rather than a missing folder.
+///
+/// This test asserted "is not a constant" until the `DEFAULT` expression unit, under a rule this
+/// node had invented: a default had to fold to a value. It does not, on any server. What stops
+/// this line now is that there is no `+` operator at any width.
 #[test]
-fn an_unfolded_expression_default_is_refused_by_name() {
+fn an_arithmetic_default_is_refused_by_its_operator() {
     let mut node = Node::new();
     a_populated_table(&mut node);
     let error = node.fails("ALTER TABLE t ADD COLUMN e int8 DEFAULT (1+1)");
     assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED);
-    assert!(error.to_string().contains("is not a constant"), "{error}");
+    assert_eq!(error.to_string(), "the operator + is not supported");
 }
 
 /// A default is read as the column's own type, by the same conversion an `INSERT` does — so a bad

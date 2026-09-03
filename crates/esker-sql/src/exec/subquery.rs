@@ -200,7 +200,7 @@ fn plan_derived(
             typmod: *typmod,
             // Nothing is ever written into a derived table, so none of these can be read: a
             // `NOT NULL` is checked on insert and a default is applied on one.
-            volatile_default: None,
+            default_expr: None,
             not_null: false,
             default: None,
             // Every row this relation produces is exactly as wide as its target list, because the
@@ -490,6 +490,11 @@ fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
         Expr::Binary { left, right, .. } => {
             substitute_in_expr(left, outer, depth);
             substitute_in_expr(right, outer, depth);
+        }
+        Expr::Call { args, .. } => {
+            for arg in args {
+                substitute_in_expr(arg, outer, depth);
+            }
         }
         Expr::Not(inner)
         | Expr::ToText { operand: inner, .. }
@@ -901,6 +906,11 @@ pub(super) fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
         Expr::Not(inner)
         | Expr::ToText { operand: inner, .. }
         | Expr::Scalar { operand: inner, .. } => walk(inner, visit),
+        Expr::Call { args, .. } => {
+            for arg in args {
+                walk(arg, visit);
+            }
+        }
         Expr::IsNull { operand, .. } => walk(operand, visit),
         Expr::AnyArray { operand, array } => {
             walk(operand, visit);
@@ -969,6 +979,11 @@ fn walk_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr) -> Result<()>) ->
         Expr::Not(inner)
         | Expr::ToText { operand: inner, .. }
         | Expr::Scalar { operand: inner, .. } => walk_mut(inner, visit)?,
+        Expr::Call { args, .. } => {
+            for arg in args {
+                walk_mut(arg, visit)?;
+            }
+        }
         Expr::IsNull { operand, .. } => walk_mut(operand, visit)?,
         Expr::AnyArray { operand, array } => {
             walk_mut(operand, visit)?;

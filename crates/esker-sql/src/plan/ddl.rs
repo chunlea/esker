@@ -58,18 +58,13 @@ pub struct Column {
     /// Whether `NOT NULL` was declared. A primary key column becomes `NOT NULL` whether or not it
     /// said so, which the executor applies.
     pub not_null: bool,
-    /// Which **volatile** function fills the default, or `None` for a constant or absent one.
-    ///
-    /// `CURRENT_TIMESTAMP` was the only one until statement 710 asked for `gen_random_uuid()`;
-    /// the mechanism was already right and only the set widened
-    /// (`crate::catalog::VolatileDefault`).
-    pub volatile_default: Option<crate::catalog::VolatileDefault>,
+    /// A default that stays an **expression**, evaluated per row, or `None` for a folded or
+    /// absent one (`crate::catalog::ColumnDef::default_expr`).
+    pub default_expr: Option<String>,
     /// `DEFAULT <constant>`, already read as a value of the column's own type.
     ///
-    /// A constant, and the lowering is where that is enforced: a **volatile** default such as
-    /// `random()` differs per row and so cannot be one value in the catalog, and an unfolded
-    /// expression such as `(1+1)` would need a folder this crate does not have. Both are `0A000`
-    /// naming what they are, rather than a value that is wrong for every row but the first.
+    /// The **folded** half of a default, set for exactly what PostgreSQL's coercion folds to a
+    /// constant: a literal, read as this column's type. Everything else is above, as text.
     pub default: Option<Datum>,
     /// The sequence that fills this column — `bigserial` or `GENERATED ... AS IDENTITY` — and
     /// which of the three it is.

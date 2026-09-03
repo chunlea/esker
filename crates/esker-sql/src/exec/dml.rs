@@ -137,21 +137,65 @@ fn fit_typmods(table: &TableDef, row: &mut [Datum]) -> Result<()> {
 /// A `timestamptz` column takes it as it is and a `timestamp` column takes the same number: this
 /// node stores both as microseconds from 2000-01-01 UTC, and the assignment cast a real server
 /// applies here is a zone conversion that is the identity at UTC.
-fn column_default_value(column: &crate::catalog::ColumnDef, now: i64) -> Result<Datum> {
-    use crate::catalog::VolatileDefault;
-    Ok(match column.volatile_default {
-        Some(VolatileDefault::Now) => match column.ty {
-            ColumnType::TimestampTz => Datum::TimestampTz(now),
-            _ => Datum::Timestamp(now),
-        },
-        // **Per row**, which is the whole point: two rows of one `INSERT` get two UUIDs, and a
-        // column defaulted to one can be a primary key. A value folded once at `CREATE TABLE`
-        // would give every row the same key and refuse the second insert.
-        Some(VolatileDefault::GenRandomUuid | VolatileDefault::UuidGenerateV4) => {
-            Datum::Uuid(crate::value::random::uuid_v4()?)
-        }
-        None => column.default.clone().unwrap_or(Datum::Null),
-    })
+fn column_default_value(
+    table: &TableDef,
+    column: &crate::catalog::ColumnDef,
+    now: i64,
+) -> Result<Datum> {
+    let Some(expr) = &column.default_expr else {
+        return Ok(column.default.clone().unwrap_or(Datum::Null));
+    };
+    // **Parsed and evaluated per row**, which is the whole point: two rows of one `INSERT` get two
+    // UUIDs and two `random()` draws, and a column defaulted to one can be a primary key. A value
+    // folded once at `CREATE TABLE` would give every row the same key and refuse the second
+    // insert. The parse is the same one a `CHECK` and a generation expression pay
+    // (`fill_generated`), and the same failure is the same `Internal`: text this node wrote and
+    // can no longer read is a broken catalog, not a bad statement.
+    let parsed = crate::parse::parse_stored_expr(expr).map_err(|error| {
+        SqlError::Internal(format!(
+            "the stored default of {}.{} no longer parses: {error}",
+            table.name, column.name
+        ))
+    })?;
+    let scope = query::Scope::single(table);
+    let resolved = query::resolve(&parsed, &scope).map_err(|error| {
+        SqlError::Internal(format!(
+            "the stored default of {}.{} no longer resolves: {error}",
+            table.name, column.name
+        ))
+    })?;
+    // No row: a default cannot read one, which is the first of the three things PostgreSQL forbids
+    // in one and is refused where the column is lowered.
+    let value = cursor::evaluate_at(&resolved, &[], now)?;
+    // The expression's type is not the column's — `now()` is a `timestamptz` filling a `date`, and
+    // `concat` a `text` filling a `varchar` — so the assignment cast every other path through an
+    // `INSERT` makes is made here too.
+    assign_default(value, column.ty)
+}
+
+/// A default's value as the column's type: the assignment cast a real server makes here.
+///
+/// The expression's type is rarely the column's — `now()` is a `timestamptz` filling a `date`,
+/// `concat` a `text` filling a `varchar` — and PostgreSQL coerces the default to the column when
+/// the table is created, so a row never sees the difference.
+///
+/// **A timestamp to a date is not a text round trip.** Both are counts from 2000-01-01, so the
+/// conversion is a division; going through text would print a zone offset that `date`'s input
+/// function then has to re-parse, and would answer the wrong day for the last hours of one.
+fn assign_default(value: Datum, ty: ColumnType) -> Result<Datum> {
+    if matches!(value, Datum::Null) || value.column_type() == Some(ty) {
+        return Ok(value);
+    }
+    if let (ColumnType::Date, Datum::Timestamp(micros) | Datum::TimestampTz(micros)) = (ty, &value)
+    {
+        return Ok(Datum::Date(
+            i32::try_from(micros.div_euclid(86_400_000_000)).unwrap_or(i32::MAX),
+        ));
+    }
+    match value.to_text() {
+        Some(text) => Datum::from_text(ty, &text),
+        None => Ok(Datum::Null),
+    }
 }
 
 fn sequence_datum(ty: ColumnType, value: i64) -> Result<Datum> {
@@ -195,7 +239,7 @@ pub(super) fn insert(
         let mut row: Vec<Datum> = table
             .columns
             .iter()
-            .map(|column| column_default_value(column, now))
+            .map(|column| column_default_value(&table, column, now))
             .collect::<Result<_>>()?;
         for (target, expr) in targets.iter().zip(values) {
             let column = &table.columns[*target];
@@ -453,6 +497,7 @@ pub(super) fn update(
                         executor.next_sequence_value(sequence.id)?,
                     )?,
                     None => column_default_value(
+                        &table,
                         column,
                         crate::time_machine::micros_of_ts(txn.start_ts()),
                     )?,

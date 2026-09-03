@@ -126,16 +126,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 1.5 = 'x'",
             "the same divergence in a message: `numeric` there, `double precision` here.",
         ),
-        (
-            "SELECT 1 = 1.0",
-            "**neither side is `unknown`, so this is not the rule under test**: it is an \
-             `integer` beside a `numeric`, which a real server promotes to `numeric` and answers \
-             `t`. This node has no promotion between `int8` and `float8` and answers `f`. \
-             Promoting to `double` would fix this line and break the one below it in the corpus \
-             — `9007199254740993 = 9007199254740992.0`, which is `f` on both servers today and \
-             would become `t` — so it is recorded rather than fixed, with its counterexample \
-             beside it. Same `numeric` question, same backlog.",
-        ),
+        // **`SELECT 1 = 1.0` stood here and is deleted** (ADR 0031, rule 2). The entry recorded
+        // the promotion as unfixable without breaking its own counterexample, `9007199254740993 =
+        // 9007199254740992.0`. It was not: widening the integer to `f64` is what would have broken
+        // it, and comparing the two exactly answers both lines the way a real server does. The
+        // counterexample stays in the corpus, undeclared, which is where it does its work.
         (
             "SELECT id FROM unk WHERE id = 1.0",
             "the same promotion, against a column: `0A000` naming the assignment. A refusal \

@@ -78,7 +78,7 @@ pub(super) fn create_table(
             ty: ColumnType::Int8,
             typmod: crate::value::NO_TYPMOD,
             // The executor fills it, so it has no default of either kind.
-            volatile_default: None,
+            default_expr: None,
             not_null: true,
             // The executor fills it on every insert, so it has neither.
             default: None,
@@ -162,7 +162,7 @@ fn declared_columns(create: &CreateTable) -> Result<Vec<ColumnDef>> {
             name: column.name.clone(),
             ty: column.ty,
             typmod: column.typmod,
-            volatile_default: column.volatile_default,
+            default_expr: column.default_expr.clone(),
             // A primary key column is NOT NULL whether or not it said so, which is PostgreSQL's
             // rule and also ours by necessity: a NULL cannot be part of a row key.
             not_null: column.not_null || create.primary_key.contains(&column.name),
@@ -267,9 +267,15 @@ fn refuse_unavailable_defaults(
     columns: &[ColumnDef],
 ) -> Result<()> {
     for column in columns {
-        let Some(catalog::VolatileDefault::UuidGenerateV4) = column.volatile_default else {
+        // Matched on the **text**, because that is what the catalog holds now that a default is
+        // any expression. `uuid_generate_v4` is the only name `uuid-ossp` promises that this node
+        // has, so a default naming it anywhere in its expression needs the extension.
+        let Some(expr) = &column.default_expr else {
             continue;
         };
+        if !expr.contains("uuid_generate_v4") {
+            continue;
+        }
         if !catalog::pg_catalog::is_installed(txn, executor.tenant, "uuid-ossp")? {
             return Err(SqlError::UndefinedFunctionName(
                 "uuid_generate_v4()".to_owned(),
@@ -812,6 +818,13 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
             .get(*at)
             .map_or_else(|| format!("<column {at}>"), |column| column.name.clone()),
         Expr::Literal(literal) => deparse_literal(literal, ty),
+        // A call prints as a call: `concat('a', 'b')`, `random()`. The arguments are deparsed the
+        // same way, so a nested one comes back too.
+        Expr::Call { func, args } => format!(
+            "{}({})",
+            func.name(),
+            args.iter().map(sub).collect::<Vec<_>>().join(", ")
+        ),
         Expr::Binary { op, left, right } => {
             format!("({} {} {})", sub(left), op.symbol(), sub(right))
         }
@@ -1131,7 +1144,7 @@ pub(super) fn alter_table(
             name: column.name.clone(),
             ty: column.ty,
             typmod: column.typmod,
-            volatile_default: column.volatile_default,
+            default_expr: column.default_expr.clone(),
             // `NOT NULL` is admissible **only with a constant default**, which is what makes every
             // row already stored hold a value: the missing value below is that value, and the
             // decoder pads with it. Without one the lowering refuses `NOT NULL`, because the

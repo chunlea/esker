@@ -410,6 +410,10 @@ fn push_filter(
         Expr::ToText { .. } => return Err(refused("a cast to text")),
         // Not expressible in the fragment language; the filter stays on the row side.
         Expr::Scalar { .. } => return Err(refused("a scalar function")),
+        // The same, and `random()` could not be pushed down even if the language had it: a
+        // volatile function evaluated once per fragment is not the same query as one evaluated
+        // once per row.
+        Expr::Call { .. } => return Err(refused("a function call")),
         // The fragment language has no conditional, and a `CASE` is the one expression whose
         // branches must **not** all be evaluated — pushing it down as anything else would change
         // which of them raises. Rows, and the row evaluator answers it.
@@ -683,6 +687,11 @@ fn collect_columns(expr: &Expr, into: &mut Vec<usize>) {
         Expr::Not(inner)
         | Expr::ToText { operand: inner, .. }
         | Expr::Scalar { operand: inner, .. } => collect_columns(inner, into),
+        Expr::Call { args, .. } => {
+            for arg in args {
+                collect_columns(arg, into);
+            }
+        }
         Expr::IsNull { operand, .. } => collect_columns(operand, into),
         Expr::InList { operand, list, .. } => {
             collect_columns(operand, into);

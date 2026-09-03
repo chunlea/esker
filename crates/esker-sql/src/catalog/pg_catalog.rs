@@ -498,7 +498,7 @@ impl CatalogView {
                                 ty: *ty,
                                 // A computed relation declares no lengths.
                                 typmod: crate::value::NO_TYPMOD,
-                                volatile_default: None,
+                                default_expr: None,
                                 not_null: false,
                                 default: None,
                                 missing: None,

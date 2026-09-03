@@ -90,6 +90,26 @@ pub enum SqlError {
     #[error("more than one row returned by a subquery used as an expression")]
     CardinalityViolation,
 
+    /// The three things PostgreSQL forbids in a column `DEFAULT`, in its own words.
+    ///
+    /// **These are the whole list**, and each carries a message a real server writes rather than
+    /// the "X is not supported" shape, because they are not features this node is missing: a
+    /// default is evaluated with no row in scope and one value out, so a column reference has
+    /// nothing to read, a subquery would need a plan, and a set-returning function would produce a
+    /// column where a value is wanted. All three are `0A000` on 19beta1 — measured, and the code
+    /// is the surprising part: they read like syntax errors and are reported as unsupported
+    /// features.
+    #[error("cannot use column reference in DEFAULT expression")]
+    DefaultColumnReference,
+
+    /// See [`SqlError::DefaultColumnReference`].
+    #[error("cannot use subquery in DEFAULT expression")]
+    DefaultSubquery,
+
+    /// See [`SqlError::DefaultColumnReference`].
+    #[error("set-returning functions are not allowed in DEFAULT expressions")]
+    DefaultSetReturning,
+
     /// Contract C2. The statement parsed and we will not run it — the feature is named so the
     /// message reads the way PostgreSQL's own does.
     #[error("{0} is not supported")]
@@ -1143,6 +1163,9 @@ impl SqlError {
     pub fn sqlstate(&self) -> &'static str {
         match self {
             SqlError::FeatureNotSupported(_)
+            | SqlError::DefaultColumnReference
+            | SqlError::DefaultSubquery
+            | SqlError::DefaultSetReturning
             | SqlError::CannotConvert { .. }
             | SqlError::NonStandardStringLiterals
             | SqlError::ExtensionNotAvailable(_)

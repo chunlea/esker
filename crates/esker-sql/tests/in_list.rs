@@ -45,14 +45,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              with everything this node does have — `AND`, `NOT`, a target list — and \
              `tests/in_list.rs` pins those.",
         ),
-        (
-            "SELECT 1 IN (1.0)",
-            "**not the untyped-literal bug any more** — that one is fixed and its entry is gone, \
-             which is why this list is shorter than the six the `IN` unit declared. Neither side \
-             here is `unknown`: it is an `integer` against a `numeric`, which a real server \
-             promotes and this node does not. `tests/unknown_literal.rs` declares it with the \
-             counterexample that says why promoting to `double` is not the fix.",
-        ),
+        // **`SELECT 1 IN (1.0)` stood here and is deleted** (ADR 0031, rule 2). It said an
+        // `integer` against a `numeric` was a promotion this node did not do, and pointed at
+        // `tests/unknown_literal.rs` for the counterexample that made widening to `double` the
+        // wrong fix. Comparing the two *exactly* rather than through `f64` answers this line and
+        // that counterexample the same way a real server does — see `value::float::pg_cmp_int`.
         (
             "SELECT 'a' IN (1)",
             "the `int4` divergence, not the untyped-literal one: the rule is working and `'a'` \

@@ -49,7 +49,7 @@ use esker_keys::{codec, prefix};
 
 use crate::catalog::{
     CheckDef, ColumnDef, ExprShape, ForeignKeyDef, Identity, IndexDef, IndexKey, KeyOrder, KeyPart,
-    ReferentialAction, Relation, SchemaState, SequenceDef, TableDef, VolatileDefault,
+    ReferentialAction, Relation, SchemaState, SequenceDef, TableDef,
 };
 use crate::error::{Result, SqlError};
 use crate::value::{ColumnType, Datum, NO_TYPMOD};
@@ -76,7 +76,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 13;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 14;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -211,23 +211,23 @@ fn tag_of(ty: ColumnType) -> u8 {
     }
 }
 
-/// Tags for [`VolatileDefault`] as stored. `0` and `1` are the two values the version 5 **bool**
-/// could hold, which is what makes every older record read back unchanged.
-fn volatile_tag(volatile: Option<VolatileDefault>) -> u8 {
-    match volatile {
-        None => 0,
-        Some(VolatileDefault::Now) => 1,
-        Some(VolatileDefault::GenRandomUuid) => 2,
-        Some(VolatileDefault::UuidGenerateV4) => 3,
-    }
-}
-
-fn volatile_of(tag: u8) -> Result<Option<VolatileDefault>> {
+/// The version 5 byte, read as the expression it used to stand for.
+///
+/// It held a closed set: `0` no expression default, `1` `CURRENT_TIMESTAMP`, and — from version
+/// 13 — `2` and `3` for the two UUID functions. Version 14 stores the expression as **text**
+/// instead, because PostgreSQL allows any expression there and a tag per function cannot follow;
+/// this is what the tags a written record already holds mean, so those records read back
+/// unchanged. Version 14 and later write `0` here and the text in their own section.
+///
+/// `1` becomes `CURRENT_TIMESTAMP` rather than `now()`: the tag could not tell the two spellings
+/// apart and that was the divergence it forced, so the canonical one is what a record written
+/// before the text existed can honestly claim.
+fn legacy_volatile_default(tag: u8) -> Result<Option<String>> {
     Ok(match tag {
         0 => None,
-        1 => Some(VolatileDefault::Now),
-        2 => Some(VolatileDefault::GenRandomUuid),
-        3 => Some(VolatileDefault::UuidGenerateV4),
+        1 => Some("CURRENT_TIMESTAMP".to_owned()),
+        2 => Some("gen_random_uuid()".to_owned()),
+        3 => Some("uuid_generate_v4()".to_owned()),
         other => return Err(corrupt(format!("volatile default tag {other}"))),
     })
 }
@@ -815,12 +815,12 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         out.extend_from_slice(&column.typmod.to_le_bytes());
         // Version 5. One byte, appended for the same reason the typmod was: a version 4 column's
         // bytes are a prefix of a version 5 one's.
-        // Version 5 wrote a **bool** here and version 13 writes a tag: `0` is no volatile
-        // default and `1` is `CURRENT_TIMESTAMP`, which are exactly the two values the bool had,
-        // so every record ever written still reads correctly. The new values are `2` and `3`, and
-        // the version bump is what stops an **older** reader from taking one of those for `true`
-        // and defaulting a `uuid` column to a timestamp.
-        out.push(volatile_tag(column.volatile_default));
+        // Version 5 wrote a **bool** here and version 13 a tag over four values. Version 14 always
+        // writes `0` and puts the default expression in its own section as text, because the set
+        // a tag can name is closed and the set of expressions PostgreSQL allows in a `DEFAULT` is
+        // not. The byte stays because removing it would move every field after it, and a record
+        // written by version 5 through 13 still reads through `legacy_volatile_default`.
+        out.push(0);
     }
 
     varint::put_u64(table.primary_key.len() as u64, &mut out);
@@ -936,6 +936,16 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
     // `0A000` until now.
     for column in &table.columns {
         put_str(column.generated.as_deref().unwrap_or(""), &mut out);
+    }
+
+    // Version 14. One string per column, **after** version 13's, for the same reason version 13's
+    // came after version 12's byte: sections go on in version order and come off in that order.
+    //
+    // The default that stays an expression, empty for a column with none or with a folded one.
+    // Version 5 through 13 named one of three expressions with a byte and this replaces that
+    // byte's job, because `DEFAULT` takes any expression and a tag per function cannot follow.
+    for column in &table.columns {
+        put_str(column.default_expr.as_deref().unwrap_or(""), &mut out);
     }
 
     Ok(out)
@@ -1075,7 +1085,26 @@ fn read_generation_expressions(reader: &mut Reader<'_>, columns: &mut [ColumnDef
     Ok(())
 }
 
+/// The version 14 section: each column's default **expression**, or the empty string for none.
+///
+/// Read after the version 13 one and written after it, because the reader takes the sections in
+/// version order and a section read out of order takes the next field's bytes for its own.
+fn read_default_expressions(reader: &mut Reader<'_>, columns: &mut [ColumnDef]) -> Result<()> {
+    if reader.version < 14 {
+        return Ok(());
+    }
+    for column in columns {
+        let expr = reader.string()?;
+        column.default_expr = (!expr.is_empty()).then_some(expr);
+    }
+    Ok(())
+}
+
 /// Reads a table record back. Every failure is typed: a catalog is on-disk data like any other.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one block per format version, in version order; that order is the invariant"
+)]
 pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
     let mut reader = Reader::at_least(bytes, OLDEST_TABLE_VERSION)?;
     let id = reader.u64_le()?;
@@ -1103,9 +1132,11 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
             NO_TYPMOD
         };
         // A version 4 column has no expression default, which is what every column written before
-        // version 5 was: the only default a v4 catalog could hold was a constant.
-        let volatile_default = if reader.version >= 5 {
-            volatile_of(reader.byte()?)?
+        // version 5 was: the only default a v4 catalog could hold was a constant. A version 5 to
+        // 13 column has one of three, named by a tag; a version 14 column writes `0` here and
+        // carries the text in the section below, which overwrites this.
+        let default_expr = if reader.version >= 5 {
+            legacy_volatile_default(reader.byte()?)?
         } else {
             None
         };
@@ -1114,7 +1145,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
             ty,
             typmod,
             not_null,
-            volatile_default,
+            default_expr,
             default,
             missing,
             // Filled from the version 13 section below, after every column has been read.
@@ -1184,6 +1215,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
     // until version 12, so no table written before it could have been disabled.
     let triggers_disabled = reader.version >= 12 && reader.flag()?;
     read_generation_expressions(&mut reader, &mut columns)?;
+    read_default_expressions(&mut reader, &mut columns)?;
     reader.finish()?;
 
     Ok(TableDef {

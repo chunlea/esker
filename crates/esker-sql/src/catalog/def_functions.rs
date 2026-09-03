@@ -145,7 +145,21 @@ pub fn constant_expression(value: &Datum, ty: ColumnType) -> String {
     let Some(text) = value.to_text() else {
         return "NULL".to_owned();
     };
-    match numeric_literal(&text) {
+    // **Only a number prints as one.** The unquoted form is decided by what the constant *is*, the
+    // way PostgreSQL's `get_const_expr` decides it from the type — not by what its characters look
+    // like. Deciding from the characters called `2004-01-01` a numeric literal, because a date is
+    // digits and the signs a negative number is allowed, and printed a `date` default as
+    // `'2004-01-01'::numeric`.
+    let numeric = matches!(
+        value,
+        Datum::Int2(_)
+            | Datum::Int4(_)
+            | Datum::Int8(_)
+            | Datum::Numeric(_)
+            | Datum::Double(_)
+            | Datum::Real(_)
+    );
+    match numeric.then(|| numeric_literal(&text)).flatten() {
         Some(literal) => literal,
         // Quoted, with every `'` doubled, and cast to this column's type written bare — no length
         // and no precision, which is what `format_type(oid, -1)` gives and what the capture shows.

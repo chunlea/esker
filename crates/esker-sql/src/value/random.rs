@@ -31,6 +31,24 @@ fn random_bytes() -> Result<[u8; 16]> {
     Ok(bytes)
 }
 
+/// A `double precision` in `[0, 1)`, which is what `random()` answers.
+///
+/// **53 bits, not 64.** A `f64` has 53 bits of mantissa, so the low eleven bits of a 64-bit draw
+/// cannot be represented and dividing by `2^64` would round some values to exactly `1.0` — outside
+/// the half-open range PostgreSQL documents and this node's own corpus asserts (`random() < 1`).
+/// Shifting first and scaling by `2^-53` gives every representable value in the range one chance.
+pub fn random_f64() -> Result<f64> {
+    let bytes = random_bytes()?;
+    let draw = u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the shift leaves 53 bits, which is exactly what an f64 mantissa holds"
+    )]
+    Ok((draw >> 11) as f64 * (1.0 / 9_007_199_254_740_992.0))
+}
+
 /// A version-4 UUID: sixteen random bytes, with the version and variant written over them.
 ///
 /// **Two nibbles are not random**, and they are the two a formatter that only hyphenated random
@@ -49,6 +67,18 @@ pub fn uuid_v4() -> Result<[u8; 16]> {
 mod tests {
     use super::uuid_v4;
     use std::collections::BTreeSet;
+
+    /// `random()` stays inside the half-open range, over enough draws to catch an endpoint.
+    #[test]
+    fn a_random_double_is_in_the_half_open_unit_range() {
+        let mut seen = BTreeSet::new();
+        for _ in 0..256 {
+            let draw = super::random_f64().unwrap();
+            assert!((0.0..1.0).contains(&draw), "{draw} is outside [0, 1)");
+            seen.insert(draw.to_bits());
+        }
+        assert_eq!(seen.len(), 256, "256 draws, 256 different values");
+    }
 
     /// The two nibbles that are not random, and the fourteen bytes that are.
     #[test]

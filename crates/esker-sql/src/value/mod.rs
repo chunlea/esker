@@ -1013,6 +1013,31 @@ impl PgDatum for Datum {
             // The two float widths compare as one type, as the integers do.
             (Datum::Real(a), Datum::Double(b)) => float::pg_cmp(f64::from(*a), *b),
             (Datum::Double(a), Datum::Real(b)) => float::pg_cmp(*a, f64::from(*b)),
+            // **A float against an integer**, which PostgreSQL has an operator for at every width
+            // and which was missing here: without these the pair fell through to the variant rank
+            // below, where a `double precision` and an `int8` are different variants and every
+            // comparison between them came back the same way whatever the numbers were. Found by
+            // `SELECT random() >= 0 AND random() < 1`, which is `t` on a real server and was `f`
+            // here.
+            //
+            // **Exactly**, not by widening the integer — see `float::pg_cmp_int` for the pair of
+            // captured statements that decide it.
+            (Datum::Double(a), Datum::Int8(b)) => float::pg_cmp_int(*b, *a).reverse(),
+            (Datum::Int8(a), Datum::Double(b)) => float::pg_cmp_int(*a, *b),
+            (Datum::Double(a), Datum::Int4(b)) => float::pg_cmp_int(i64::from(*b), *a).reverse(),
+            (Datum::Int4(a), Datum::Double(b)) => float::pg_cmp_int(i64::from(*a), *b),
+            (Datum::Double(a), Datum::Int2(b)) => float::pg_cmp_int(i64::from(*b), *a).reverse(),
+            (Datum::Int2(a), Datum::Double(b)) => float::pg_cmp_int(i64::from(*a), *b),
+            (Datum::Real(a), Datum::Int8(b)) => float::pg_cmp_int(*b, f64::from(*a)).reverse(),
+            (Datum::Int8(a), Datum::Real(b)) => float::pg_cmp_int(*a, f64::from(*b)),
+            (Datum::Real(a), Datum::Int4(b)) => {
+                float::pg_cmp_int(i64::from(*b), f64::from(*a)).reverse()
+            }
+            (Datum::Int4(a), Datum::Real(b)) => float::pg_cmp_int(i64::from(*a), f64::from(*b)),
+            (Datum::Real(a), Datum::Int2(b)) => {
+                float::pg_cmp_int(i64::from(*b), f64::from(*a)).reverse()
+            }
+            (Datum::Int2(a), Datum::Real(b)) => float::pg_cmp_int(i64::from(*a), f64::from(*b)),
             (a, b) => variant_rank(a).cmp(&variant_rank(b)),
         }
     }

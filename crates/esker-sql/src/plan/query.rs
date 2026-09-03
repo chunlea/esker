@@ -774,6 +774,14 @@ fn render(expr: &Expr, columns: &[String]) -> String {
         // As the user wrote it: `EXPLAIN` prints a cast the way SQL spells one.
         Expr::ToText { operand, .. } => format!("{}::text", render(operand, columns)),
         Expr::Scalar { func, operand } => format!("{}({})", func.name(), render(operand, columns)),
+        Expr::Call { func, args } => format!(
+            "{}({})",
+            func.name(),
+            args.iter()
+                .map(|arg| render(arg, columns))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Expr::Parameter(number) => format!("${number}"),
         Expr::Column { name, .. } => name.clone(),
         // Resolved to a position by the planner; put the name back for the reader. A position with

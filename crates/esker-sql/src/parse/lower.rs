@@ -614,66 +614,170 @@ fn lower_storage_parameters(
     })
 }
 
-/// `DEFAULT <expression>` on a column, as a constant of that column's type.
+/// `DEFAULT <expression>` on a column: the value it folds to, or the expression it stays.
 ///
-/// **Constants only, and the refusals are the interesting part.** PostgreSQL evaluates a default at
-/// insert time and, for `ADD COLUMN`, decides between storing a *missing value* and rewriting every
-/// row by asking one question: is the expression volatile? Measured on 19beta1 — `DEFAULT 'old'`
-/// and `DEFAULT (1+1)` set `atthasmissing` and rewrite nothing; `DEFAULT random()` clears it and
-/// rewrites the table.
+/// **PostgreSQL applies no volatility test here and no constant test.** A default is an arbitrary
+/// expression stored as a parse tree and evaluated once per row, and this function used to carry
+/// two rules of its own that no server has — a function call was refused as *possibly volatile*
+/// and anything else as *not a constant* — which between them refused seven of the ten defaults in
+/// one `ActiveRecord` schema table that 19beta1 accepts, including `concat` and `CURRENT_DATE`,
+/// both of which are `STABLE`.
 ///
-/// This node stores a value and never rewrites, so it takes the half PostgreSQL does not rewrite
-/// for and refuses the other half **by name**:
+/// What a real server does refuse is exactly three things, and they are refused below with its own
+/// messages: a **column reference**, a **subquery**, and a **set-returning function**. An unknown
+/// function is not a fourth rule — it is the ordinary "no such function", raised here because
+/// PostgreSQL resolves the expression when the table is created and not when a row is written.
 ///
-/// * a literal is read as the column's type, which is the same conversion an `INSERT` does, so
-///   `DEFAULT 'x'` in an `int8` column is the same `22P02` it would be in a value list;
-/// * a function call is refused as *volatile* even when it is not (`length('x')` is immutable),
-///   because deciding otherwise needs a volatility catalog and guessing would store one row's
-///   answer for every row;
-/// * `(1+1)` is refused as an unfolded expression, which PostgreSQL folds. Naming it is the honest
-///   answer: a folder is a feature, not an oversight to paper over.
+/// # The two halves, and why both exist
 ///
-/// `DEFAULT NULL` normalises to `None` — the same thing as no default, which is what PostgreSQL
+/// The answer is a pair, and at most one side of it is set:
+///
+/// * a **folded value** ([`catalog::ColumnDef::default`]), for the expressions PostgreSQL's
+///   coercion folds to a `Const` — a literal, read as the column's type. This is the common case
+///   and it stays a value so that reading it costs nothing;
+/// * an **expression** ([`catalog::ColumnDef::default_expr`]), for everything else, stored as the
+///   text `pg_get_expr` prints and evaluated per row.
+///
+/// A literal written with an explicit cast sets **both**: the value is what the column takes and
+/// the text is what a real server prints back, and those disagree — `DEFAULT 0::bigint` answers
+/// `0` and prints `(0)::bigint`. Storing only the value would print `0`; storing only the text
+/// would make every row pay for a parse.
+///
+/// `DEFAULT NULL` normalises to neither — the same thing as no default, which is what PostgreSQL
 /// makes of it too.
-fn column_default(expr: &Expr, ty: ColumnType) -> Result<Option<Datum>> {
-    // `CURRENT_TIMESTAMP` is handled by the caller, which records it as an expression default
-    // rather than a value. Reaching here with one would mean the two disagreed.
-    debug_assert!(!is_current_timestamp(expr));
-    let literal = match expr {
-        Expr::Value(value) => &value.value,
-        Expr::UnaryOp { .. } => {
+fn column_default(expr: &Expr, ty: ColumnType) -> Result<(Option<Datum>, Option<String>)> {
+    let expr = unwrap_nested(expr);
+    refuse_default_shapes(expr)?;
+    // A literal, with the sign or the cast a user wrote around it: what PostgreSQL's coercion
+    // folds, and nothing more. `1 + 1` is *not* folded by a real server either — it prints back as
+    // `(1 + 1)`, measured — so the fold here stops exactly where the server's does.
+    let (literal, cast) = match expr {
+        Expr::Value(value) => (Some(&value.value), None),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr: inner,
+        } => match unwrap_nested(inner) {
             // A signed number: `DEFAULT -1`. Rendered back and read as the column's type, which is
             // how a negative literal reaches `Datum` everywhere else in this crate.
-            return Datum::from_text(ty, &expr.to_string())
-                .map(Some)
-                .map_err(|_| default_not_constant(expr));
-        }
-        Expr::Function(_) => {
-            return Err(SqlError::unsupported(format!(
-                "DEFAULT {expr}, which may be volatile"
-            )));
-        }
-        _ => return Err(default_not_constant(expr)),
+            Expr::Value(_) => {
+                return Ok((Some(Datum::from_text(ty, &expr.to_string())?), None));
+            }
+            _ => (None, None),
+        },
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } => match unwrap_nested(inner) {
+            Expr::Value(value) => (Some(&value.value), Some(data_type)),
+            _ => (None, None),
+        },
+        _ => (None, None),
     };
-    match literal {
-        Value::Null => Ok(None),
-        Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => {
-            Datum::from_text(ty, text).map(Some)
+    if let Some(literal) = literal {
+        let text = match literal {
+            // The same thing as no default at all, and the value a column with no default takes.
+            Value::Null => return Ok((None, None)),
+            Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => text.clone(),
+            Value::Number(digits, _) => digits.clone(),
+            Value::Boolean(flag) => (if *flag { "true" } else { "false" }).to_owned(),
+            other => other.to_string(),
+        };
+        // Read as the **column's** type, not the cast's: `a int4 DEFAULT 0::bigint` stores an
+        // `int4`, because the cast is one step of a coercion that ends at the column. A literal
+        // the type cannot take is that type's own input error, exactly as it would be in a
+        // `VALUES` list — `DEFAULT 'not a date'` on a `date` column is `22007` here and there.
+        let value = Datum::from_text(ty, &text)?;
+        return Ok((
+            Some(value),
+            cast.map(|to| cast_default_text(&text, literal, to)),
+        ));
+    }
+    // Everything else stays an expression. **Lowering it here is what makes a function this node
+    // does not have refused when the table is created** rather than when the first row is written,
+    // which is where a real server raises it — and it is also what refuses `random() * 100` by
+    // naming the operator, since this node has no arithmetic at all.
+    lower_expr(expr)?;
+    Ok((None, Some(expr.to_string())))
+}
+
+/// How a real server prints a literal that was written with a cast: `(0)::bigint`, `'x'::text`.
+///
+/// **The parentheses are not decoration and they are not always there.** PostgreSQL prints a
+/// constant through `get_const_expr`, which writes a number bare and a string quoted, and then
+/// parenthesises only when what it wrote would re-parse wrongly against the `::` that follows. A
+/// bare `0::bigint` is that case and `'x'::text` is not.
+fn cast_default_text(text: &str, literal: &Value, to: &DataType) -> String {
+    let printed = match literal {
+        Value::Number(digits, _) => format!("({digits})"),
+        Value::Boolean(flag) => (if *flag { "true" } else { "false" }).to_owned(),
+        _ => format!("'{}'", text.replace('\'', "''")),
+    };
+    format!("{printed}::{}", cast_type_name(to))
+}
+
+/// The three things PostgreSQL forbids in a `DEFAULT`, with the messages it uses for them.
+///
+/// Not a volatility rule and not a constant rule — those were this node's own and are gone. These
+/// three are refused because a default is evaluated with **no row in scope and one value out**: a
+/// column reference has nothing to read, a subquery would need a plan, and a set-returning
+/// function would produce a column where a value is wanted.
+///
+/// The walk is recursive, because a real server refuses `concat(a, 'x')` for the same reason it
+/// refuses a bare `a` — the column reference is what it objects to, not where it sits.
+fn refuse_default_shapes(expr: &Expr) -> Result<()> {
+    match expr {
+        // **A bare keyword that is a function is not a column.** `CURRENT_DATE` and
+        // `CURRENT_TIMESTAMP` reach the parser as identifiers, and refusing them here as column
+        // references is exactly the mistake this function exists to stop making.
+        Expr::Identifier(name)
+            if name.quote_style.is_some() || keyword_func_from_name(&name.value).is_none() =>
+        {
+            Err(SqlError::DefaultColumnReference)
         }
-        Value::Number(digits, _) => Datum::from_text(ty, digits).map(Some),
-        Value::Boolean(flag) => {
-            Datum::from_text(ty, if *flag { "true" } else { "false" }).map(Some)
+        Expr::CompoundIdentifier(_) => Err(SqlError::DefaultColumnReference),
+        Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
+            Err(SqlError::DefaultSubquery)
         }
-        other => Err(default_not_constant_text(&other.to_string())),
+        Expr::Function(function) if is_set_returning(function) => {
+            Err(SqlError::DefaultSetReturning)
+        }
+        Expr::Function(function) => function_arguments(function, "")
+            .unwrap_or_default()
+            .into_iter()
+            .try_for_each(|arg| refuse_default_shapes(unwrap_nested(arg))),
+        Expr::BinaryOp { left, right, .. } => {
+            refuse_default_shapes(unwrap_nested(left))?;
+            refuse_default_shapes(unwrap_nested(right))
+        }
+        Expr::UnaryOp { expr, .. } | Expr::Cast { expr, .. } | Expr::Nested(expr) => {
+            refuse_default_shapes(unwrap_nested(expr))
+        }
+        _ => Ok(()),
     }
 }
 
-fn default_not_constant(expr: &Expr) -> SqlError {
-    default_not_constant_text(&expr.to_string())
-}
-
-fn default_not_constant_text(rendered: &str) -> SqlError {
-    SqlError::unsupported(format!("DEFAULT {rendered}, which is not a constant"))
+/// Whether a call is to a **set-returning** function, which a `DEFAULT` cannot hold.
+///
+/// Named rather than derived: PostgreSQL knows from `prorettype` and `proretset`, and this node
+/// has no function catalog to ask. The list is the set-returning functions it could plausibly
+/// meet, and one missing from it is refused a step later by `lower_expr` — as a function this node
+/// does not have, which is the truth about every name on the list too.
+fn is_set_returning(function: &sqlparser::ast::Function) -> bool {
+    let Ok(name) = unqualified_function_name(function) else {
+        return false;
+    };
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "generate_series"
+            | "generate_subscripts"
+            | "unnest"
+            | "regexp_split_to_table"
+            | "json_array_elements"
+            | "jsonb_array_elements"
+            | "json_each"
+            | "jsonb_each"
+    )
 }
 
 /// A columnar-replica count: a plain non-negative integer, and nothing else.
@@ -790,7 +894,7 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
         let (ty, typmod) = lower_type(&column.data_type)?;
         let mut not_null = false;
         let mut default = None;
-        let mut volatile_default: Option<catalog::VolatileDefault> = None;
+        let mut default_expr: Option<String> = None;
         // `bigserial` is the type saying it; `GENERATED ... AS IDENTITY` is an option saying it.
         // Both end here, because what they produce is the same record.
         let mut sequence = serial_identity(&column.data_type);
@@ -821,16 +925,12 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
                 }
                 ColumnOption::NotNull => not_null = true,
                 ColumnOption::Null => {}
-                // `DEFAULT CURRENT_TIMESTAMP` is an expression rather than a value, so it is
-                // recorded as one: a constant would freeze the instant `CREATE TABLE` ran.
-                // **A volatile default is recorded as which one it is, not as a value.** A
-                // constant is folded into `default`; these cannot be, because folding one gives
-                // every row the value `CREATE TABLE` ran at — every row the table's birthday, or
-                // every row the same UUID and a primary key that refuses the second insert.
-                ColumnOption::Default(expr) if volatile_default_of(expr).is_some() => {
-                    volatile_default = volatile_default_of(expr);
-                }
-                ColumnOption::Default(expr) => default = column_default(expr, ty)?,
+                // **A default is an arbitrary expression**, and `column_default` decides which of
+                // the two halves holds it: the value, for what PostgreSQL's coercion folds, and
+                // the text for everything else, evaluated once per row. Folding the rest would
+                // give every row the instant `CREATE TABLE` ran, or every row the same UUID and a
+                // primary key that refuses the second insert.
+                ColumnOption::Default(expr) => (default, default_expr) = column_default(expr, ty)?,
                 ColumnOption::Unique(constraint) => {
                     refuse_if(
                         constraint.nulls_distinct != NullsDistinctOption::None,
@@ -874,7 +974,7 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
             name: column_name,
             ty,
             typmod,
-            volatile_default,
+            default_expr,
             not_null,
             default,
             sequence,
@@ -955,19 +1055,28 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
         let (ty, typmod) = lower_type(&column_def.data_type)?;
         let mut not_null = false;
         let mut default = None;
-        let mut volatile_default: Option<catalog::VolatileDefault> = None;
         for option in &column_def.options {
             let named = match &option.option {
-                // A **constant** default is admitted: it is stored as the column's missing value
-                // and the decoder pads with it, so no row is rewritten (ADR 0019's pad rule
-                // generalised; `catalog::ColumnDef::missing`). Volatility and unfolded
-                // expressions are refused inside `column_default`, by name.
+                // A **folded** default is stored as the column's missing value and the decoder
+                // pads with it, so no row is rewritten (ADR 0019's pad rule generalised;
+                // `catalog::ColumnDef::missing`).
+                //
+                // An **expression** default is refused here, and this is the one place where
+                // generalising the `DEFAULT` clause did not widen what is accepted. PostgreSQL
+                // takes it and **rewrites the table**, so every row already stored gets its own
+                // value — measured: `atthasmissing` comes back false for one. This `ALTER` is
+                // defined not to rewrite, so honouring the clause would leave those rows NULL
+                // where a real server gives them values, which is a wrong answer rather than a
+                // gap. `CREATE TABLE` has no rows to rewrite and takes the same expression.
                 ColumnOption::Default(expr) => {
-                    if is_current_timestamp(expr) {
-                        volatile_default = Some(catalog::VolatileDefault::Now);
-                    } else {
-                        default = column_default(expr, ty)?;
+                    let (folded, unfolded) = column_default(expr, ty)?;
+                    if let Some(unfolded) = unfolded {
+                        return Err(SqlError::unsupported(format!(
+                            "ALTER TABLE ... ADD COLUMN ... DEFAULT {unfolded}, which would \
+                             rewrite every row"
+                        )));
                     }
+                    default = folded;
                     continue;
                 }
                 ColumnOption::NotNull => {
@@ -1003,7 +1112,9 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
                 name: ident(&column_def.name),
                 ty,
                 typmod,
-                volatile_default,
+                // Always: an expression default is refused above, because this `ALTER` cannot
+                // rewrite the rows a real server would.
+                default_expr: None,
                 not_null,
                 default,
                 sequence: None,
@@ -1476,6 +1587,19 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                 Datum::Text(PUBLIC_SCHEMA.to_owned()),
             ))))
         }
+        // **A keyword that is a function, written without parentheses.** `CURRENT_DATE` and
+        // `CURRENT_TIMESTAMP` reach the parser as bare identifiers, and reading one as a column
+        // would make `SELECT CURRENT_DATE` a `42703` naming a column nobody wrote. Quoted, it is
+        // a column again — `"current_date"` is an ordinary name, which is what the quotes mean.
+        Expr::Identifier(name) if name.quote_style.is_none() => {
+            match keyword_func_from_name(&name.value) {
+                Some(func) => Ok(plan::Expr::Call { func, args: vec![] }),
+                None => Ok(plan::Expr::Column {
+                    table: None,
+                    name: ident(name),
+                }),
+            }
+        }
         Expr::Identifier(name) => Ok(plan::Expr::Column {
             table: None,
             name: ident(name),
@@ -1757,6 +1881,10 @@ fn strip_nesting(expr: &Expr) -> &Expr {
 /// this function does not make -- a function PostgreSQL has and we do not, against one neither of
 /// us has -- is one no caller can act on anyway. What it must not do is execute a name it does not
 /// know, which is why the fall-through is a refusal rather than a lookup that returns NULL.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per function family; splitting it would hide the vocabulary rather than clarify it"
+)]
 fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
     use sqlparser::ast::{
         DuplicateTreatment, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments,
@@ -1787,6 +1915,30 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
         return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
             Datum::Text(value::vector::Array::write(&elements)),
         ))));
+    }
+    // `random`, `concat`, `convert_to` and the two clock keywords in their function spellings.
+    //
+    // **`concat` is variadic and takes one argument at least**: `concat()` is
+    // `42883 function concat() does not exist`, measured, because the variadic signature has a
+    // parameter. Every other one here is niladic or fixed, and a wrong count is the same `42883`
+    // naming the signature that every function on this node gives.
+    if let Some(func) = plain_func_from_name(&name) {
+        let args = function_arguments(function, func.name())?;
+        match func {
+            plan::PlainFunc::Concat if args.is_empty() => {
+                return Err(SqlError::UndefinedFunction(format!("{}()", func.name())));
+            }
+            plan::PlainFunc::Concat => {}
+            plan::PlainFunc::ConvertTo => refuse_wrong_arity(function, func.name(), 2)?,
+            _ => refuse_wrong_arity(function, func.name(), 0)?,
+        }
+        return Ok(plan::Expr::Call {
+            func,
+            args: args
+                .iter()
+                .map(|arg| lower_expr(arg))
+                .collect::<Result<Vec<_>>>()?,
+        });
     }
     // `lower` and `upper`, the two scalar functions this node has. Both take exactly one
     // argument and a wrong count is `42883` naming the signature, not a badly-called function —
@@ -1999,25 +2151,6 @@ fn lower_generated(
     // The **normalised** text, the way a `CHECK` and an index predicate are stored: `pg_get_expr`
     // prints this back, so the parentheses a user wrote must not survive into the catalog.
     Ok(Ok(unwrap_nested(expr).to_string()))
-}
-
-/// Which volatile function a `DEFAULT` clause names, or `None` for anything else.
-///
-/// The set is closed on purpose: a volatile default is stored as a **tag**, so admitting one means
-/// this node can evaluate it per row. `random()` and every other volatile function stays refused
-/// by name — accepting one and folding it would give every row the same value, which is a wrong
-/// answer rather than a gap.
-fn volatile_default_of(expr: &Expr) -> Option<catalog::VolatileDefault> {
-    if is_current_timestamp(expr) {
-        return Some(catalog::VolatileDefault::Now);
-    }
-    let Expr::Function(function) = unwrap_nested(expr) else {
-        return None;
-    };
-    match plan::UuidFunc::from_name(&function.name.to_string())? {
-        plan::UuidFunc::GenRandomUuid => Some(catalog::VolatileDefault::GenRandomUuid),
-        plan::UuidFunc::UuidGenerateV4 => Some(catalog::VolatileDefault::UuidGenerateV4),
-    }
 }
 
 /// The clauses inside an aggregate's parentheses.
@@ -2425,6 +2558,55 @@ fn refuse_wrong_arities(
         "{name}({})",
         given.join(", ")
     )))
+}
+
+/// The plain functions, by the name a call spells them.
+///
+/// `now()` and `transaction_timestamp()` are one entry: PostgreSQL defines the second as an alias
+/// of the first and both answer the transaction's instant. Which spelling was written survives in
+/// the **text** a default stores, not here, because the value does not depend on it.
+fn plain_func_from_name(name: &str) -> Option<plan::PlainFunc> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "random" => plan::PlainFunc::Random,
+        "concat" => plan::PlainFunc::Concat,
+        "convert_to" => plan::PlainFunc::ConvertTo,
+        "now" | "transaction_timestamp" | "current_timestamp" => plan::PlainFunc::Now,
+        "current_date" => plan::PlainFunc::CurrentDate,
+        _ => return None,
+    })
+}
+
+/// The subset of those that SQL also spells **without parentheses**, as a bare keyword.
+///
+/// `random` is not one of them: `SELECT random` is a column reference on a real server, and
+/// answering a number there would be a wrong answer rather than a gap.
+fn keyword_func_from_name(name: &str) -> Option<plan::PlainFunc> {
+    match name.to_ascii_lowercase().as_str() {
+        "current_timestamp" | "localtimestamp" => Some(plan::PlainFunc::Now),
+        "current_date" => Some(plan::PlainFunc::CurrentDate),
+        _ => None,
+    }
+}
+
+/// A call's positional arguments, or `42883` for a call written in a shape that has none.
+fn function_arguments<'a>(
+    function: &'a sqlparser::ast::Function,
+    name: &str,
+) -> Result<Vec<&'a Expr>> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments};
+    let args = match &function.args {
+        FunctionArguments::None => return Ok(Vec::new()),
+        FunctionArguments::List(FunctionArgumentList { args, .. }) => args,
+        FunctionArguments::Subquery(_) => {
+            return Err(SqlError::UndefinedFunction(format!("{name}(record)")));
+        }
+    };
+    args.iter()
+        .map(|arg| match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Ok(expr),
+            _ => Err(SqlError::UndefinedFunction(format!("{name}(unknown)"))),
+        })
+        .collect()
 }
 
 /// The type name PostgreSQL would print for one argument in a `42883`.
@@ -3725,39 +3907,6 @@ fn lower_plain_type(data_type: &DataType) -> Result<ColumnType> {
         },
         other => return Err(SqlError::unsupported(format!("the type {other}"))),
     })
-}
-
-/// Whether a `DEFAULT` is `CURRENT_TIMESTAMP`, under any of the spellings that mean it.
-///
-/// `CURRENT_TIMESTAMP` reaches this as a bare identifier — it is a niladic function and SQL lets
-/// one be written without parentheses, the same rule a bare `current_schema` follows — and `now()`
-/// reaches it as a call. PostgreSQL records both as the same default, which is why they are one
-/// test here rather than two: `pg_get_expr` prints `CURRENT_TIMESTAMP` for a column declared
-/// either way.
-///
-/// `CURRENT_TIMESTAMP(0)` is **not** among them. It is the same instant rounded, and rounding it
-/// needs the precision carried into the default, which nothing yet reads — it is refused by name
-/// rather than silently given full precision.
-fn is_current_timestamp(expr: &Expr) -> bool {
-    match expr {
-        Expr::Identifier(name) => {
-            name.quote_style.is_none() && name.value.eq_ignore_ascii_case("current_timestamp")
-        }
-        Expr::Function(function) => {
-            use sqlparser::ast::{FunctionArgumentList, FunctionArguments};
-            let name = function.name.to_string();
-            let niladic = match &function.args {
-                FunctionArguments::None => true,
-                FunctionArguments::List(FunctionArgumentList { args, .. }) => args.is_empty(),
-                FunctionArguments::Subquery(_) => false,
-            };
-            niladic
-                && (name.eq_ignore_ascii_case("now")
-                    || name.eq_ignore_ascii_case("current_timestamp")
-                    || name.eq_ignore_ascii_case("transaction_timestamp"))
-        }
-        _ => false,
-    }
 }
 
 /// `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY`, and the two things that share its variant.

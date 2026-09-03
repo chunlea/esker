@@ -55,10 +55,11 @@ CREATE TEMPORARY TABLE tmp (id int8 PRIMARY KEY)
 statement error (0A000)
 CREATE TABLE copy AS SELECT * FROM t
 
-# `DEFAULT <constant>` runs now (alter_table.slt); a volatile one does not, for the reason a
-# volatile one on ADD COLUMN does not.
+# `DEFAULT <expression>` runs now, for any expression this node can evaluate — the line that stood
+# here refused `DEFAULT random()` at CREATE TABLE and no longer does. What is left is an expression
+# with no operator behind it, refused by the operator's name.
 statement error (0A000)
-CREATE TABLE d (id int8 PRIMARY KEY, a float8 DEFAULT random())
+CREATE TABLE d (id int8 PRIMARY KEY, a int8 DEFAULT 1 + 1)
 
 # Tier 1 is complete since the typmod unit and `numeric` since the numeric one, so the three
 # lines that stood here are gone. No column type in ADR 0033's first two tiers is refused now.
@@ -76,12 +77,13 @@ CREATE TABLE public.q (id int8 PRIMARY KEY)
 statement error (0A000)
 ALTER TABLE t ADD COLUMN c int8 NOT NULL
 
-# A volatile default differs per row, so it cannot be one constant in the catalog. PostgreSQL
-# rewrites the table for it; this node has no rewrite yet and says so.
+# Still refused on ADD COLUMN, and for the rewrite rather than for volatility: PostgreSQL gives
+# every row already stored its own value, and this ALTER is defined not to touch them.
 statement error (0A000)
 ALTER TABLE t ADD COLUMN r float8 DEFAULT random()
 
-# PostgreSQL folds this to 2 before storing it. There is no folder here.
+# PostgreSQL does not fold this one either — it stores and prints `(1 + 1)`. What stops it here is
+# that there is no `+` operator at any width.
 statement error (0A000)
 ALTER TABLE t ADD COLUMN e int8 DEFAULT (1+1)
 

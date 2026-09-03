@@ -154,7 +154,7 @@ fn columns_of<'a>(
                                 // value — three facts about the *index*, which stores whatever
                                 // the expression evaluated to and never fills a gap.
                                 not_null: false,
-                                volatile_default: None,
+                                default_expr: None,
                                 default: None,
                                 missing: None,
                                 generated: None,
@@ -252,19 +252,15 @@ pub fn default_expression(column: &ColumnDef, table: &TableDef, at: usize) -> Op
     if let Some(generated) = &column.generated {
         return Some(generated.clone());
     }
-    // A **volatile** default, which the catalog records as *which* one it is rather than as a
-    // value (`ColumnDef::volatile_default`) because a constant cannot express it. It prints
-    // unparenthesised, exactly as written — unlike a computed default such as `DEFAULT 1 + 1`,
-    // which a real server prints as `(1 + 1)`.
-    //
-    // **PostgreSQL keeps the spelling the user wrote**: a column declared
-    // `DEFAULT CURRENT_TIMESTAMP` prints `CURRENT_TIMESTAMP` and one declared `DEFAULT now()`
-    // prints `now()`, even though the two are the same function. The record holds one entry for
-    // both and prints the canonical one — declared in `tests/pg_catalog_attribute.rs`, and the
-    // *value* a row gets is identical either way. The two UUID functions have one spelling each,
-    // so they do not have the question.
-    if let Some(volatile) = column.volatile_default {
-        return Some(volatile.printed().to_owned());
+    // A default that stayed an **expression**, which the catalog holds as the text `pg_get_expr`
+    // prints (`ColumnDef::default_expr`). It comes back verbatim, which is what lets **the
+    // spelling the user wrote survive**: a column declared `DEFAULT CURRENT_TIMESTAMP` prints
+    // `CURRENT_TIMESTAMP` and one declared `DEFAULT now()` prints `now()`, even though the two are
+    // the same function and every row gets the same instant either way. The tag this replaced held
+    // one entry for both and could not tell them apart, which was a declared divergence until the
+    // text arrived.
+    if let Some(expr) = &column.default_expr {
+        return Some(expr.clone());
     }
     if let Some(sequence) = super::pg_relations::sequence_for(table, at) {
         return match sequence.identity {

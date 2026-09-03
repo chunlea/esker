@@ -150,6 +150,15 @@ pub enum Expr {
     /// than a [`CatalogFunc`] for exactly that reason: that family is documented as a function of
     /// its arguments alone, and this is the opposite.
     Uuid(UuidFunc),
+    /// A [`PlainFunc`] and its arguments, in the order written.
+    ///
+    /// The arity is checked where the call is lowered, so the evaluator reads by position.
+    Call {
+        /// Which function.
+        func: PlainFunc,
+        /// Its arguments.
+        args: Vec<Expr>,
+    },
     /// `x IS NULL`, or `IS NOT NULL` when negated. Never NULL itself — that is the whole point of
     /// the operator, and the reason `x = NULL` is not a way to write it.
     IsNull {
@@ -362,6 +371,64 @@ impl ScalarFunc {
             "lower" => Some(ScalarFunc::Lower),
             "upper" => Some(ScalarFunc::Upper),
             _ => None,
+        }
+    }
+}
+
+/// The plain SQL functions this node evaluates: a name, and arguments read by position.
+///
+/// Separate from [`ScalarFunc`], which is one argument over a string and predates any need for a
+/// second. These arrived together with the generalised column `DEFAULT`, where PostgreSQL allows
+/// **any** expression: a default of `concat('Ruby ', 'on ', 'Rails')` or `random() * 100` is not a
+/// special DDL form, it is an ordinary expression that happens to sit in a `DEFAULT` clause, so
+/// the way to accept one is to be able to evaluate it anywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlainFunc {
+    /// `random()`: a `double precision` in `[0, 1)`, drawn per call.
+    Random,
+    /// `concat(v, ...)`: the arguments as text, run together, **skipping NULLs**.
+    ///
+    /// Not the `||` operator, which answers NULL if either side is NULL. One argument at least —
+    /// `concat()` is `42883` on a real server, measured, because the variadic signature needs one.
+    Concat,
+    /// `convert_to(text, encoding)`: the bytes of a string in a named encoding.
+    ConvertTo,
+    /// `now()`, `CURRENT_TIMESTAMP` and `transaction_timestamp()`: the transaction's instant.
+    ///
+    /// **The spelling is not recorded here**, because the value does not depend on it; the text a
+    /// stored default prints back is the text the catalog holds (`catalog::ColumnDef`).
+    Now,
+    /// `CURRENT_DATE`: the transaction's instant, truncated to a day.
+    CurrentDate,
+}
+
+impl PlainFunc {
+    /// The name a `42883` spells it, and the name a default prints.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            PlainFunc::Random => "random",
+            PlainFunc::Concat => "concat",
+            PlainFunc::ConvertTo => "convert_to",
+            PlainFunc::Now => "now",
+            PlainFunc::CurrentDate => "current_date",
+        }
+    }
+
+    /// What it answers, which is what a `RowDescription` has to declare before any row exists.
+    ///
+    /// Measured against `pg_typeof` on 19beta1: `random()` is `double precision`, `concat` is
+    /// `text`, `convert_to` is `bytea` and `CURRENT_DATE` is `date` — and `now()` is
+    /// `timestamp with time zone`, which is the one a reader would guess wrong from the column
+    /// types it usually fills.
+    #[must_use]
+    pub fn result_type(self) -> ColumnType {
+        match self {
+            PlainFunc::Random => ColumnType::Double,
+            PlainFunc::Concat => ColumnType::Text,
+            PlainFunc::ConvertTo => ColumnType::Bytea,
+            PlainFunc::Now => ColumnType::TimestampTz,
+            PlainFunc::CurrentDate => ColumnType::Date,
         }
     }
 }
@@ -1077,6 +1144,7 @@ fn describe(expr: &Expr) -> &'static str {
         Expr::AnyArray { .. } => "= ANY",
         Expr::Subscript { .. } => "a subscript",
         Expr::Uuid(func) => func.name(),
+        Expr::Call { func, .. } => func.name(),
         Expr::InList { negated: true, .. } => "NOT IN",
         Expr::Aggregate(_) => "an aggregate function",
         Expr::Default => "DEFAULT",
