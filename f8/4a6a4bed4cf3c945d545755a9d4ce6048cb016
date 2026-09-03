@@ -1,0 +1,82 @@
+crates/esker-columnar/src/column.rs
+  h_44076b318daf9c 126,143,181,198,434,440,488,501
+crates/esker-columnar/src/encode/mod.rs
+  h_44076b318daf9c 154,175,270,296-300
+crates/esker-columnar/src/fragment/codec.rs
+  h_44076b318daf9c 383-386,399-402,460-465,469
+crates/esker-columnar/src/stats.rs
+  h_44076b318daf9c 112-114,136,281,295,446-450,802,828-832,890-896,943-947
+crates/esker-columnar/src/value.rs
+  h_44076b318daf9c 90-93,113,131-132,158-159,184-185,217-218,269-272,305-306,335-336,351-352,359,454-459,497-501,660-661
+crates/esker-columnar/tests/bench_scan.rs
+  h_44076b318daf9c 67,82-84,95,121-123,141-146
+crates/esker-columnar/tests/compression.rs
+  h_44076b318daf9c 59,70-72
+crates/esker-columnar/tests/differential.rs
+  h_44076b318daf9c 395-398,411-414
+crates/esker-columnar/tests/roundtrip.rs
+  h_44076b318daf9c 92,120-122
+crates/esker-keys/src/columnar.rs
+  h_44076b318daf9c 77-78,102-103
+crates/esker-keys/src/row.rs
+  h_44076b318daf9c 129-130,134-143,323-339,504-514,657-675,893-907,1288-1296
+crates/esker-keys/src/value.rs
+  h_44076b318daf9c 182-195,200,219-220,271-281,299-317,343-344
+crates/esker-proto/src/fragment/result.rs
+  h_44076b318daf9c 110-113,124,139-140,161-162,183-184,227-230,253-254,277-280,306-309,359-364,372
+crates/esker-sql/src/catalog/pg_catalog.rs
+  h_44076b318daf9c 713-714,731-733,740-741,771-772
+crates/esker-sql/src/catalog/record.rs
+  h_44076b318daf9c 152-155,209-210,256-257
+crates/esker-sql/src/error.rs
+  h_44076b318daf9c 805-824,1183,1187-1190
+crates/esker-sql/src/exec/bind.rs
+  h_44076b318daf9c 508-513
+crates/esker-sql/src/exec/fragment.rs
+  h_44076b318daf9c 577-578,616-627,640-645
+crates/esker-sql/src/exec/query.rs
+  h_44076b318daf9c 1754-1755,1778-1780,1782-1783
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 1540-1561,2544-2548,2551-2552,2707-2715,2734-2739,3624-3628,3634-3640
+crates/esker-sql/src/plan/expr.rs
+  h_44076b318daf9c 843-846,898-900,934,993-994,1024-1025
+crates/esker-sql/src/row.rs
+  h_44076b318daf9c 42-49
+crates/esker-sql/src/sqlstate.rs
+  h_44076b318daf9c 63-66,264
+crates/esker-sql/src/value/interval.rs
+  h_44076b318daf9c 1-379
+crates/esker-sql/src/value/mod.rs
+  h_44076b318daf9c 34,37,351-355,368,472-473,497-498,505-506,509-510,611-620,654-662,675-676,678-689,737-740,761-768,859-869,871-885,918-920,926
+crates/esker-sql/src/value/oid.rs
+  h_44076b318daf9c 1-85
+crates/esker-sql/tests/corpus/pg19_interval.txt
+  h_44076b318daf9c 1-139
+crates/esker-sql/tests/corpus/pg19_order.txt
+  h_44076b318daf9c 41-42
+crates/esker-sql/tests/interval.rs
+  h_44076b318daf9c 1-182
+crates/esker-sql/tests/oid.rs
+  h_44076b318daf9c 1-77
+crates/esker-sql/tests/pg_catalog.rs
+  h_44076b318daf9c 136-137,151-153,187,224
+crates/esker-sql/tests/row_order.rs
+  h_44076b318daf9c 99-105
+crates/esker-store/src/columnar/decode.rs
+  h_44076b318daf9c 185-186,209-221
+crates/esker-store/src/columnar/wire.rs
+  h_44076b318daf9c 109-110,131-132
+docs/adr/0033-tier-1-of-the-type-surface.md
+  h_44076b318daf9c 230-233
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "f84a6a4bed4cf3c945d545755a9d4ce6048cb016",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
