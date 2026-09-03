@@ -29,14 +29,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "The row the statement above would have updated, one line later: it did not run here, \
              so `b` is still `1`. A follow-on of the parser gap and not a divergence of its own",
         ),
-        (
-            "INSERT INTO \"ts\" (\"k\",\"v\",\"updated_at\") VALUES (1, 1, \'2026-02-02 00:00:00\') ON CONFLICT (\"k\") DO UPDATE SET updated_at=(CASE WHEN (\"ts\".\"v\" IS NOT DISTINCT FROM excluded.\"v\") THEN \"ts\".updated_at ELSE CURRENT_TIMESTAMP END),\"v\"=excluded.\"v\"",
-            "`IS NOT DISTINCT FROM` is an **operator this node does not have**, and nothing about \
-             it is `ON CONFLICT`: it is what `upsert_all` writes when the model has timestamps, to \
-             leave `updated_at` alone when nothing else changed. The clause around it runs — the \
-             `CASE`, the qualified `\"ts\".updated_at`, the `excluded.\"v\"` — and the operator is \
-             refused by name. It belongs in `plan::Expr`, which is another lane\u{2019}s file",
-        ),
+        // **A third entry stood here and is deleted** (ADR 0031, rule 2): the `upsert_all`
+        // template's `IS NOT DISTINCT FROM` was an operator this node did not have, so the
+        // statement was refused by name and the `SELECT` after it was swallowed by the aborted
+        // block. Both run now — the operator is a `BinaryOp` and the row's `updated_at` is
+        // untouched, which is the whole point of the template
+        // (`tests/values_catalog_function.rs` carries the shape it came from).
     ],
 };
 

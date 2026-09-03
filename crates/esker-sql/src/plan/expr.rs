@@ -716,6 +716,40 @@ pub enum CatalogFunc {
     Now,
     /// `CURRENT_DATE`: the date of [`CatalogFunc::Now`]'s instant.
     CurrentDate,
+    /// `LOCALTIMESTAMP`: the same instant as [`CatalogFunc::Now`], as a `timestamp` **without**
+    /// a time zone.
+    ///
+    /// A separate member rather than a spelling of `now()` because the *type* differs, and the
+    /// type is what a column assignment reads: `LOCALTIMESTAMP` fills a `timestamp` column with no
+    /// cast at all, where `CURRENT_TIMESTAMP` fills it through one. Both store the same
+    /// microseconds here, so the two rows are equal — which is what the capture checks.
+    LocalTimestamp,
+    /// `LOCALTIME`: the time of day of [`CatalogFunc::Now`]'s instant, **without** a zone.
+    ///
+    /// Here for one reason: it is what the capture puts in a `timestamp` column to be refused.
+    /// `time` is not `timestamp` and PostgreSQL offers no assignment cast between them, so the
+    /// answer is the `42804` that names both types — which this node can only give if it knows
+    /// the expression's type, and it only knows it by having the member.
+    ///
+    /// Its zoned twin `CURRENT_TIME` is **not** here: `time with time zone` is not one of the
+    /// stored types (ADR 0033), and a member whose type does not exist could not answer
+    /// `pg_typeof` and could not name itself in that `42804`. See the corpus's two divergences.
+    LocalTime,
+    /// `statement_timestamp()`: **the transaction's instant here**, where a real server advances
+    /// it per statement.
+    ///
+    /// A declared divergence, and it is invariant 6 that forces it: the TSO's physical half is the
+    /// only clock this node may read, and a transaction has exactly one. It is its own member
+    /// rather than an alias of [`CatalogFunc::Now`] so that the difference stays visible — a name
+    /// folded into another cannot later be made to differ, and cannot name itself in a message.
+    StatementTimestamp,
+    /// `clock_timestamp()`: the transaction's instant here too, for [`CatalogFunc::StatementTimestamp`]'s
+    /// reason.
+    ///
+    /// The corpus pins the consequence rather than the value — `clock_timestamp() >=
+    /// transaction_timestamp()` is `t`, which equality satisfies — and the divergence is that a
+    /// real server makes it strictly greater by the time the second call runs.
+    ClockTimestamp,
     /// `random()`: a `double precision` in `[0, 1)`, drawn **per call**.
     ///
     /// The one function here that is not a pure function of its arguments, and the corpus pins the
@@ -768,11 +802,21 @@ impl CatalogFunc {
         match () {
             // `CURRENT_TIMESTAMP` reaches here as a function name, which is what it is: a keyword
             // spelling of `now()`, recorded by PostgreSQL as the same thing.
+            // `transaction_timestamp()` is the third spelling of the same value, and PostgreSQL
+            // documents it as `now()`'s own definition rather than as a function that agrees with
+            // it. Three names, one member.
             () if name.eq_ignore_ascii_case("now")
-                || name.eq_ignore_ascii_case("current_timestamp") =>
+                || name.eq_ignore_ascii_case("current_timestamp")
+                || name.eq_ignore_ascii_case("transaction_timestamp") =>
             {
                 Some(CatalogFunc::Now)
             }
+            () if name.eq_ignore_ascii_case("localtimestamp") => Some(CatalogFunc::LocalTimestamp),
+            () if name.eq_ignore_ascii_case("localtime") => Some(CatalogFunc::LocalTime),
+            () if name.eq_ignore_ascii_case("statement_timestamp") => {
+                Some(CatalogFunc::StatementTimestamp)
+            }
+            () if name.eq_ignore_ascii_case("clock_timestamp") => Some(CatalogFunc::ClockTimestamp),
             () if name.eq_ignore_ascii_case("daterange") => Some(CatalogFunc::DateRange),
             () if name.eq_ignore_ascii_case("isempty") => Some(CatalogFunc::IsEmpty),
             () if name.eq_ignore_ascii_case("pg_get_triggerdef") => {
@@ -836,6 +880,10 @@ impl CatalogFunc {
             CatalogFunc::PgTypeof => "pg_typeof",
             CatalogFunc::Now => "now",
             CatalogFunc::CurrentDate => "current_date",
+            CatalogFunc::LocalTimestamp => "localtimestamp",
+            CatalogFunc::LocalTime => "localtime",
+            CatalogFunc::StatementTimestamp => "statement_timestamp",
+            CatalogFunc::ClockTimestamp => "clock_timestamp",
             CatalogFunc::Random => "random",
             CatalogFunc::Concat => "concat",
             CatalogFunc::ConvertTo => "convert_to",
@@ -872,7 +920,13 @@ impl CatalogFunc {
             | CatalogFunc::IsEmpty
             | CatalogFunc::Cardinality
             | CatalogFunc::PgTypeof => &[1],
-            CatalogFunc::Now | CatalogFunc::CurrentDate | CatalogFunc::Random => &[0],
+            CatalogFunc::Now
+            | CatalogFunc::CurrentDate
+            | CatalogFunc::LocalTimestamp
+            | CatalogFunc::LocalTime
+            | CatalogFunc::StatementTimestamp
+            | CatalogFunc::ClockTimestamp
+            | CatalogFunc::Random => &[0],
             // Variadic: every arity from one up. `concat()` is the `42883` about the *number* of
             // arguments that a real server raises, so zero is not in the set.
             CatalogFunc::Concat => &CONCAT_ARITIES,
@@ -915,7 +969,13 @@ impl CatalogFunc {
             // The two range predicates answer a boolean, which is what lets `&&` stand in a
             // `WHERE` without a comparison around it.
             CatalogFunc::IsEmpty | CatalogFunc::RangeOverlaps => ColumnType::Bool,
-            CatalogFunc::Now => ColumnType::TimestampTz,
+            // **`LOCALTIMESTAMP` is the one of the four without a zone**, which is the whole
+            // reason it is a separate member: the type is what decides whether a column takes it.
+            CatalogFunc::Now
+            | CatalogFunc::StatementTimestamp
+            | CatalogFunc::ClockTimestamp => ColumnType::TimestampTz,
+            CatalogFunc::LocalTimestamp => ColumnType::Timestamp,
+            CatalogFunc::LocalTime => ColumnType::Time,
             CatalogFunc::CurrentDate => ColumnType::Date,
             CatalogFunc::ConvertTo => ColumnType::Bytea,
             CatalogFunc::Random => ColumnType::Double,
@@ -1141,6 +1201,22 @@ pub enum BinaryOp {
     And,
     /// `OR`.
     Or,
+    /// `IS DISTINCT FROM`: `<>` made **total**, so two NULLs are not distinct and one NULL is.
+    ///
+    /// A [`BinaryOp`] rather than a shape of its own, because that is what PostgreSQL makes it:
+    /// its operands are typed by the same rules `=`'s are, which is what lets
+    /// `x IS NOT DISTINCT FROM 1` read the constant as the column's type. The one rule it does
+    /// **not** share is the NULL rule — these two are the comparisons that never answer unknown,
+    /// and that is the whole of why they exist.
+    Distinct,
+    /// `IS NOT DISTINCT FROM`: null-safe equality, and the operator `upsert_all` writes.
+    ///
+    /// Rails' `upsert_all` template is
+    /// `CASE WHEN (t.c IS NOT DISTINCT FROM excluded.c) THEN t.updated_at ELSE CURRENT_TIMESTAMP END`,
+    /// which is how it leaves `updated_at` alone when nothing changed. With `=` there instead, a
+    /// NULL column would make the `WHEN` unknown and touch the timestamp on every upsert — the
+    /// bug this operator exists to prevent.
+    NotDistinct,
 }
 
 impl BinaryOp {
@@ -1156,6 +1232,8 @@ impl BinaryOp {
             BinaryOp::GtEq => ">=",
             BinaryOp::And => "AND",
             BinaryOp::Or => "OR",
+            BinaryOp::Distinct => "IS DISTINCT FROM",
+            BinaryOp::NotDistinct => "IS NOT DISTINCT FROM",
         }
     }
 

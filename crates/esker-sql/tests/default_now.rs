@@ -21,18 +21,18 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // now()` was `0A000`. Generalising a default to any expression answered both at once: the
         // catalog holds the text the user wrote, so the spellings survive, and the evaluator has
         // the function, so the comparison runs.
+        // **A third entry stood here and is deleted** (ADR 0031, rule 2): `LOCALTIMESTAMP`
+        // answered the transaction's instant as `CURRENT_TIMESTAMP` did, where a real server
+        // gives the unzoned form of it. `insert_all` needed the difference — a `timestamp`
+        // column takes one with no cast and the other through one — so the two spellings are
+        // now two members with two types (`tests/values_catalog_function.rs`).
         (
             "SELECT pg_typeof(CURRENT_TIMESTAMP), pg_typeof(now()), pg_typeof(LOCALTIMESTAMP), \
              pg_typeof(CURRENT_DATE)",
-            "`pg_typeof` is not implemented, and neither are three of its four arguments.",
-        ),
-        (
-            "SELECT CURRENT_TIMESTAMP IS NOT NULL, LOCALTIMESTAMP IS NOT NULL",
-            "`LOCALTIMESTAMP` answers the transaction's instant here as `CURRENT_TIMESTAMP` does, \
-             where a real server gives the `timestamp` without time zone form of it — this node \
-             has one clock value and prints it one way. `ActiveRecord` does not emit the keyword; \
-             it is in the corpus because it is the neighbour that would catch a node answering \
-             the two differently.",
+            "**The rows agree and the declared types do not**, which is the standing `regtype` \
+             trade rather than anything about these four: `pg_typeof` answers a `regtype` on a \
+             real server and `text` here, the same trade `'x'::regtype` makes \
+             (`tests/array_subquery.rs`). All four names are the ones a real server prints.",
         ),
         (
             "SELECT CURRENT_TIMESTAMP(0) IS NOT NULL",

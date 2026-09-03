@@ -1,0 +1,83 @@
+# A catalog/time function inside a `VALUES` list — as a real PostgreSQL 19beta1 answers it.
+#
+# **Run 46 ranking: 41 tests across 4 files**, and 40 of them are `insert_all_test.rb`. The shape is
+# `insert_all` / `upsert_all` with timestamps: ActiveRecord inlines `CURRENT_TIMESTAMP` into the
+# `VALUES` list rather than binding it. The first three statements are verbatim from
+# `sql.active_record`, captured while running `VlPost.insert_all` and `upsert_all` inside
+# `transaction { … raise ActiveRecord::Rollback }` against the oracle:
+#
+#     INSERT INTO "vl_posts" ("vl_author_id","title","created_at","updated_at")
+#       VALUES (1, 'x', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT DO NOTHING RETURNING "id"
+#
+#     … ON CONFLICT ("title") DO UPDATE SET updated_at=(CASE WHEN ("vl_posts"."vl_author_id"
+#       IS NOT DISTINCT FROM excluded."vl_author_id") THEN "vl_posts".updated_at
+#       ELSE CURRENT_TIMESTAMP END) RETURNING "id"
+#
+# The second one is also the source of two other rows in the same ranking — the
+# `IS NOT DISTINCT FROM excluded."…"` expressions (19 tests) come from this single `upsert_all`
+# template, so they are one unit with this file rather than three.
+#
+# Captured in one session with `scratchpad/sesscap.py`, inside `BEGIN … ROLLBACK`, error probes in
+# `SAVEPOINT` / `ROLLBACK TO`. The final `SELECT count(*)` proves it left nothing behind.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **Every row of a multi-row `VALUES` gets the SAME timestamp.**
+#     `count(DISTINCT created_at)` over two rows inserted by one statement is **`1`**.
+#     `CURRENT_TIMESTAMP` is `transaction_timestamp()`, fixed for the whole transaction — it is not
+#     evaluated per row and not per statement. An implementation that calls a clock per row makes
+#     `insert_all`'s two rows differ, and the tests compare them.
+#   * **`CURRENT_TIMESTAMP`, `now()` and `transaction_timestamp()` are the same value**, and
+#     `clock_timestamp()` is `>=` it. All three comparisons are `t` in one row here.
+#   * **The five spellings have five different types**, and only two of them fit a `timestamp`
+#     column: `CURRENT_TIMESTAMP` and `now()` are `timestamp with time zone`, `LOCALTIMESTAMP` is
+#     `timestamp without time zone`, `CURRENT_DATE` is `date`, `CURRENT_TIME` is
+#     **`time with time zone`**. Putting `CURRENT_TIME` or `LOCALTIME` into the `updated_at` column
+#     is `42804 column "updated_at" is of type timestamp without time zone but expression is of type
+#     time …` with a rewrite-or-cast HINT — two different DETAILs for the two spellings.
+#   * **`ON CONFLICT DO NOTHING` with `RETURNING` returns NO ROW when it does nothing.** The first
+#     insert returns `1`; the identical second returns **an empty result set** — `(0 rows)` and the
+#     tag `INSERT 0 0` — not a row, not an error and *not* the absence of a result set.
+#     `insert_all` reads that to know what was written. Those two lines are the only ones here that
+#     declare their type, and that is why: with the types field blank a lone `-` is read as a
+#     command that returned nothing, which is a different answer. `\gdesc` says `bigint`.
+#   * **`excluded.` is only in scope inside `DO UPDATE`**, and the `CASE … IS NOT DISTINCT FROM
+#     excluded.…` template is how Rails avoids touching `updated_at` when nothing changed — the
+#     upsert above leaves `vl_author_id` at `1`, not `2`.
+#   * **A function that does not exist is `42883` with `DETAIL: There is no function of that name.`**
+#     — the DETAIL is a sentence, not a signature list, when the name matches nothing at all.
+#   * **A `VALUES` list is a source in its own right**, not only an `INSERT` clause:
+#     `SELECT a FROM (VALUES (CURRENT_TIMESTAMP = transaction_timestamp())) AS t(a)` answers `t`.
+BEGIN		-
+CREATE TABLE vl_posts (id bigserial primary key, vl_author_id bigint, title character varying, created_at timestamp NOT NULL, updated_at timestamp NOT NULL)		-
+CREATE UNIQUE INDEX index_vl_posts_on_title ON vl_posts (title)		-
+INSERT INTO "vl_posts" ("vl_author_id","title","created_at","updated_at") VALUES (1, 'x', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT DO NOTHING RETURNING "id"	bigint	1
+SELECT 'r', id, title, created_at = updated_at, created_at = transaction_timestamp() FROM vl_posts ORDER BY id		r|1|x|t|t
+INSERT INTO "vl_posts" ("vl_author_id","title","created_at","updated_at") VALUES (1, 'x', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT DO NOTHING RETURNING "id"	bigint	-
+SELECT 'r', count(*) FROM vl_posts		r|1
+INSERT INTO "vl_posts" ("vl_author_id","title","created_at","updated_at") VALUES (2, 'x', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT ("title") DO UPDATE SET updated_at=(CASE WHEN ("vl_posts"."vl_author_id" IS NOT DISTINCT FROM excluded."vl_author_id") THEN "vl_posts".updated_at ELSE CURRENT_TIMESTAMP END) RETURNING "id"		1
+SELECT 'r', vl_author_id, title FROM vl_posts ORDER BY id		r|1|x
+INSERT INTO vl_posts (title, created_at, updated_at) VALUES ('n', now(), now()) RETURNING id		4
+INSERT INTO vl_posts (title, created_at, updated_at) VALUES ('t', LOCALTIMESTAMP, statement_timestamp()) RETURNING id		5
+SAVEPOINT s0		-
+INSERT INTO vl_posts (title, created_at, updated_at) VALUES ('c', CURRENT_DATE, CURRENT_TIME) RETURNING id	!42804 column "updated_at" is of type timestamp without time zone but expression is of type time with time zone HINT: You will need to rewrite or cast the expression.
+ROLLBACK TO s0		-
+SAVEPOINT s0b		-
+INSERT INTO vl_posts (title, created_at, updated_at) VALUES ('c', CURRENT_DATE, LOCALTIME) RETURNING id	!42804 column "updated_at" is of type timestamp without time zone but expression is of type time without time zone HINT: You will need to rewrite or cast the expression.
+ROLLBACK TO s0b		-
+INSERT INTO vl_posts (title, created_at, updated_at) VALUES ('c', CURRENT_DATE, LOCALTIMESTAMP) RETURNING id		6
+SELECT 'r', CURRENT_TIMESTAMP = transaction_timestamp(), now() = transaction_timestamp(), clock_timestamp() >= transaction_timestamp()	text,boolean,boolean,boolean	r|t|t|t
+SELECT 'r', pg_typeof(CURRENT_TIMESTAMP), pg_typeof(now()), pg_typeof(LOCALTIMESTAMP), pg_typeof(CURRENT_DATE), pg_typeof(CURRENT_TIME)	text,regtype,regtype,regtype,regtype,regtype	r|timestamp with time zone|timestamp with time zone|timestamp without time zone|date|time with time zone
+SELECT 'r', a AS v FROM (VALUES (CURRENT_TIMESTAMP = transaction_timestamp())) AS t(a)	text,boolean	r|t
+INSERT INTO vl_posts (title, created_at, updated_at) VALUES ('m1', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), ('m2', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING id		7 ; 8
+SELECT 'r', count(DISTINCT created_at) FROM vl_posts WHERE title IN ('m1','m2')		r|1
+SAVEPOINT s1		-
+INSERT INTO vl_posts (title, created_at, updated_at) VALUES ('bad', nosuchfunction(), CURRENT_TIMESTAMP)	!42883 function nosuchfunction() does not exist DETAIL: There is no function of that name.
+ROLLBACK TO s1		-
+SELECT 'r', count(*) FROM vl_posts		r|6
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname LIKE 'vl_%'	bigint	0

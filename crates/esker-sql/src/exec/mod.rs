@@ -25,6 +25,7 @@
 //! conflict really was an ordinary row-level race, which stays `40001` and stays retryable.
 
 mod aggregate;
+mod assign;
 mod bind;
 mod comment;
 mod cursor;
@@ -1987,9 +1988,9 @@ impl Execute for Executor {
 /// A borrowed pair rather than a method on [`Executor`], because `crate::exec::subquery` is given
 /// exactly what it needs and no way to start a statement of its own — a subquery names tables, and
 /// that is the whole of its access to anything outside its own plan.
-struct Catalogued<'a> {
-    exec: &'a Executor,
-    txn: &'a dyn Txn,
+pub(super) struct Catalogued<'a> {
+    pub(super) exec: &'a Executor,
+    pub(super) txn: &'a dyn Txn,
 }
 
 impl subquery::Tables for Catalogued<'_> {

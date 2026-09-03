@@ -1028,11 +1028,21 @@ impl PgDatum for Datum {
                     .then_with(|| a.lower.cmp(&b.lower))
             }
             (Datum::Int8(a), Datum::Int8(b))
-            | (Datum::TimestampTz(a), Datum::TimestampTz(b))
             // Plain integer order, and only against another `time`: this type compares with
             // nothing else, so there is no promotion arm to write beside it.
             | (Datum::Time(a), Datum::Time(b))
-            | (Datum::Timestamp(a), Datum::Timestamp(b)) => a.cmp(b),
+            // **The two timestamps compare across the zone as well as within it**, because
+            // PostgreSQL has a `timestamp = timestamptz` operator and
+            // `created_at = transaction_timestamp()` over a `timestamp` column is `t`. The
+            // conversion is through the session zone there and the identity here: this node
+            // honours `TimeZone` only where it means UTC (`crate::parameter`), so a `timestamptz`
+            // and a `timestamp` holding the same microseconds are the same instant. Without the
+            // mixed pairs the comparison fell through to the cross-variant order below and
+            // answered `f` — a value where a real server answers `t`, which ADR 0031 ranks worst.
+            | (
+                Datum::Timestamp(a) | Datum::TimestampTz(a),
+                Datum::Timestamp(b) | Datum::TimestampTz(b),
+            ) => a.cmp(b),
             // Across the two widths, because PostgreSQL has an `int4 = int8` operator and answers
             // `1::integer = 1::bigint` with `t`. Widening is exact in this direction, so there is
             // no rounding to argue about — an `i32` is an `i64`.

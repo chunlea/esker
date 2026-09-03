@@ -323,7 +323,7 @@ pub(super) fn insert(
                     column: column.name.clone(),
                 });
             }
-            row[*target] = expr.evaluate(column.ty, &column.name)?;
+            row[*target] = value_for_column(expr, column, &*txn)?;
         }
         // A sequence fills its column when the statement did not name it, or named it and wrote
         // `DEFAULT`. It runs **after** the values, so a `bigserial` the user did write keeps their
@@ -412,6 +412,44 @@ pub(super) fn insert(
     // The leading zero is the OID of the inserted row, which PostgreSQL stopped assigning in 8.1
     // and still reports as 0. A client that parses the tag expects three fields.
     Ok(finish(returned, format!("INSERT 0 {}", insert.rows.len())))
+}
+
+/// One `VALUES` expression, as the column's own value.
+///
+/// A literal is read **as** the column's type — `'2020-01-01'` in a `date` column is a date and
+/// not the text — which is what `Literal::assign` is for and why it comes first. Anything else is
+/// an expression carrying a type of its own: resolved against **no row**, because a `VALUES` tuple
+/// has none to read, evaluated in the transaction, and assigned afterwards.
+///
+/// **In the transaction is the whole point.** `CURRENT_TIMESTAMP` *is* the transaction's instant
+/// (`crate::exec::cursor`'s clock arm), which is why the two rows of one `insert_all` get the same
+/// `created_at` and why `count(DISTINCT created_at)` over them is 1. Before this, every one of
+/// these expressions was `0A000 … in a VALUES list is not supported`, and `insert_all` is how
+/// `ActiveRecord` writes timestamps.
+fn value_for_column(
+    expr: &crate::plan::Expr,
+    column: &crate::catalog::ColumnDef,
+    txn: &dyn Txn,
+) -> Result<Datum> {
+    match expr {
+        crate::plan::Expr::Literal(literal) => literal.assign(column.ty, &column.name),
+        // A `$1` with nothing bound to it. The simple query protocol has no way to carry one, and
+        // the extended protocol has already substituted it by the time a plan reaches here.
+        crate::plan::Expr::Parameter(number) => Err(SqlError::UndefinedParameter(*number)),
+        // **Three shapes that are not values**, still refused by name and by the sentence they
+        // already had: an aggregate has no rows to aggregate, a set-returning function makes rows
+        // where one value is wanted, and a scalar subquery needs a plan run for the tuple —
+        // `docs/plans/phase-12-subquery.md` §4's next unit rather than this one. Letting them
+        // through would reach the row evaluator, whose answer for all three is the internal error
+        // of a planner bug, which is a worse thing to tell a client than the name of the gap.
+        crate::plan::Expr::Aggregate(_)
+        | crate::plan::Expr::SetFunc(_)
+        | crate::plan::Expr::Subquery(_) => expr.evaluate(column.ty, &column.name),
+        other => {
+            let resolved = query::resolve(other, &query::Scope::empty())?;
+            super::assign::into_column(cursor::evaluate_in_txn(&resolved, &[], txn)?, column)
+        }
+    }
 }
 
 /// Which column each value in a `VALUES` tuple is for.
@@ -640,17 +678,12 @@ pub(super) fn update(
                     }
                     other => {
                         let resolved = query::resolve_against(other, &table)?;
-                        cursor::evaluate(&resolved, &old)?
+                        // In the transaction, so `SET updated_at = CURRENT_TIMESTAMP` reads the
+                        // instant rather than reporting a clock with nothing to read.
+                        cursor::evaluate_in_txn(&resolved, &old, &*txn)?
                     }
                 };
-                if !evaluated.fits(column.ty) {
-                    return Err(SqlError::DatatypeMismatchInColumn {
-                        column: column.name.clone(),
-                        column_type: column.ty.name(),
-                        expression_type: "the expression's",
-                    });
-                }
-                new[*ordinal] = evaluated;
+                new[*ordinal] = super::assign::into_column(evaluated, column)?;
             }
             fit_typmods(&table, &mut new)?;
             // The column is a function of the row, so an `UPDATE` that moved its source moves it too
@@ -757,7 +790,7 @@ fn resolve_conflict(
     let crate::plan::ConflictAction::DoUpdate(assignments) = &on_conflict.action else {
         return Ok(None);
     };
-    let updated = apply_conflict_update(target, assignments, &existing.row, proposed)?;
+    let updated = apply_conflict_update(target, assignments, &existing.row, proposed, &*txn)?;
     // **A `DO UPDATE` cannot move a row between partitions**, where a plain `UPDATE` can. Setting
     // the key to what it already holds is fine; setting it to another partition's value is `0A000`
     // with PostgreSQL's own `DETAIL`.
@@ -936,6 +969,7 @@ fn apply_conflict_update(
     assignments: &[(String, crate::plan::Expr)],
     existing: &[Datum],
     proposed: &[Datum],
+    txn: &dyn Txn,
 ) -> Result<Vec<Datum>> {
     let mut both = existing.to_vec();
     both.extend_from_slice(proposed);
@@ -955,17 +989,12 @@ fn apply_conflict_update(
                 // **`excluded.nosuchcol` has its own sentence** — qualified and unquoted — where a
                 // missing column of the table keeps the ordinary one. Measured, one pair.
                 let resolved = query::resolve(other, &scope).map_err(excluded_column)?;
-                cursor::evaluate(&resolved, &both)?
+                // In the transaction, for the `ELSE CURRENT_TIMESTAMP` of the `upsert_all`
+                // template — the whole reason this row is being rewritten.
+                cursor::evaluate_in_txn(&resolved, &both, txn)?
             }
         };
-        if !evaluated.fits(column.ty) {
-            return Err(SqlError::DatatypeMismatchInColumn {
-                column: column.name.clone(),
-                column_type: column.ty.name(),
-                expression_type: "the expression's",
-            });
-        }
-        updated[ordinal] = evaluated;
+        updated[ordinal] = super::assign::into_column(evaluated, column)?;
     }
     fit_typmods(table, &mut updated)?;
     fill_generated(table, &mut updated)?;
@@ -1222,7 +1251,37 @@ fn collect(
     filter: Option<&crate::plan::Expr>,
     table: &TableDef,
 ) -> Result<Vec<Vec<Datum>>> {
-    let node = query::matching_rows(filter, executor.tenant, table)?;
+    // **The write path plans its own subqueries**, because nothing above it does: a statement that
+    // writes never reaches `plan_select`, which is why a subquery in an `UPDATE`'s or a `DELETE`'s
+    // `WHERE` used to be `0A000` by name. `delete_all` and `update_all` on a relation carrying a
+    // `LIMIT` or a `JOIN` send exactly that shape — ActiveRecord cannot express either on a
+    // `DELETE`, so it wraps the selection in a subquery.
+    //
+    // `Cow`-shaped by hand the way `plan_select` is: a filter with no subquery in it is used as
+    // the caller's own and nothing is cloned.
+    let mut owned;
+    let filter = match filter {
+        Some(filter) if super::subquery::contains_subquery(filter) => {
+            owned = filter.clone();
+            super::subquery::plan_in_write_filter(
+                &mut owned,
+                executor.tenant,
+                txn,
+                &super::Catalogued {
+                    exec: executor,
+                    txn,
+                },
+                table,
+            )?;
+            Some(&owned)
+        }
+        other => other,
+    };
+    let mut node = query::matching_rows(filter, executor.tenant, table)?;
+    // **Before the cursor opens**, which is what makes the subquery read the pre-statement
+    // snapshot: `DELETE FROM t WHERE id IN (SELECT id FROM t LIMIT 1)` is not circular and does
+    // not loop, and its rows are the ones that were there when it started.
+    super::subquery::resolve(&mut node, txn, executor.tenant)?;
     let mut cursor = cursor::Cursor::open(txn, executor.tenant, &node)?;
     let mut rows = Vec::new();
     while let Some(row) = cursor.next()? {

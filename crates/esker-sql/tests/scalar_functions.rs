@@ -37,15 +37,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         ),
         (
             "SELECT CURRENT_TIMESTAMP(0) = date_trunc('second', CURRENT_TIMESTAMP)",
-            "`CURRENT_TIME`, `LOCALTIMESTAMP`, `CURRENT_TIMESTAMP(p)` and `date_trunc` are four more members of this family and none is called by statement 738. They are in the corpus so that the day one is needed its answer is already measured; each is refused by name today.",
+            "`CURRENT_TIMESTAMP(p)` and `date_trunc` are two more members of this family and neither is called by statement 738. They are in the corpus so that the day one is needed its answer is already measured; both are refused by name today. `LOCALTIMESTAMP` was in this list until `insert_all` needed it (`tests/values_catalog_function.rs`), which is what the list is for.",
         ),
         (
             "SELECT CURRENT_TIME IS NULL",
-            "`CURRENT_TIME`, `LOCALTIMESTAMP`, `CURRENT_TIMESTAMP(p)` and `date_trunc` are four more members of this family and none is called by statement 738. They are in the corpus so that the day one is needed its answer is already measured; each is refused by name today.",
-        ),
-        (
-            "SELECT LOCALTIMESTAMP IS NULL",
-            "`CURRENT_TIME`, `LOCALTIMESTAMP`, `CURRENT_TIMESTAMP(p)` and `date_trunc` are four more members of this family and none is called by statement 738. They are in the corpus so that the day one is needed its answer is already measured; each is refused by name today.",
+            "**`time with time zone` is not one of the stored types** (ADR 0033), so `CURRENT_TIME` is refused by name rather than answered — the one member of this family whose absence is a *type* and not a function. Its unzoned twin `LOCALTIME` is implemented; `tests/values_catalog_function.rs` carries the pair and the `42804` that tells them apart.",
         ),
         (
             "SELECT now() AT TIME ZONE 'UTC' IS NULL",
