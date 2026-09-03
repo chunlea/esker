@@ -2260,6 +2260,7 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // The type the element is read **as**, which a comparison sets and which is `text` until
         // one does — the same rule an `= ANY`'s elements follow.
         Expr::Subscript { element, .. } => *element,
+        Expr::Uuid(_) => ColumnType::Uuid,
         Expr::Case {
             branches,
             otherwise,

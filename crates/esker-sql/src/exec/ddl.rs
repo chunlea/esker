@@ -849,6 +849,7 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
             format!("({} = ANY ({}))", sub(operand), sub(array))
         }
         Expr::Subscript { operand, index, .. } => format!("{}[{}]", sub(operand), sub(index)),
+        Expr::Uuid(func) => format!("{}()", func.name()),
     }
 }
 
@@ -898,7 +899,11 @@ fn refuse_unless_immutable(expr: &plan::Expr) -> Result<()> {
             Expr::Aggregate(_) => Some(SqlError::AggregateNotAllowed(
                 "aggregate functions are not allowed in index expressions",
             )),
-            Expr::Sequence(_) | Expr::CatalogFunc(_) => Some(SqlError::NotImmutableInIndex),
+            // A UUID function is the most volatile thing here: two calls give two values, so an
+            // index built from one would be read back at a key nothing ever wrote.
+            Expr::Sequence(_) | Expr::CatalogFunc(_) | Expr::Uuid(_) => {
+                Some(SqlError::NotImmutableInIndex)
+            }
             // A parameter has no value at `CREATE INDEX` time; a real server answers
             // `42P02 there is no parameter $1`, which is what this prints.
             Expr::Parameter(at) => Some(SqlError::UndefinedParameter(*at)),

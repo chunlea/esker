@@ -16,17 +16,13 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT extname, extversion FROM pg_extension WHERE extname IN ('uuid-ossp','pgcrypto') ORDER BY extname",
         "SELECT name, default_version, installed_version FROM pg_available_extensions WHERE name IN ('uuid-ossp','pgcrypto') ORDER BY name",
     ],
-    // **One, and it is the point of the allowlist.** Installing an extension records that it is
-    // installed; it does not bring the functions it carries. `uuid_generate_v4()` is `42883` here
-    // and a value on a real server — a gap with its own name, its own capture and its own unit,
-    // and deliberately not something `CREATE EXTENSION` pretends to close. The statement's job is
-    // to let the schema **load**.
-    answers: &[(
-        "SELECT uuid_generate_v4() IS NOT NULL",
-        "`CREATE EXTENSION \"uuid-ossp\"` succeeds and `uuid_generate_v4` is still not a function \
-         this node has. The extension is on the allowlist because the schema needs the statement, \
-         not because the functions are here.",
-    )],
+    // **This list was one entry and is now none.** It held `uuid_generate_v4()`, on the argument
+    // that `CREATE EXTENSION` records an install and does not bring the functions — and the user
+    // ruled the other way: the allowlist means the extension *and* what it promises, because a
+    // schema whose next line defaults a column to `uuid_generate_v4()` stops on that instead. The
+    // functions landed in the commit before this one, the line agrees, and the entry is deleted
+    // rather than kept (ADR 0031's rule 2).
+    answers: &[],
 };
 
 #[test]

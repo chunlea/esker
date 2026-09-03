@@ -1763,6 +1763,12 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
             operand: Box::new(lower_expr(operand)?),
         });
     }
+    // The two UUID functions. Zero arguments, and a wrong count is `42883` naming the signature
+    // the way every other function's is — `gen_random_uuid(1)` does not exist either.
+    if let Some(func) = plan::UuidFunc::from_name(&name) {
+        refuse_wrong_arity(function, func.name(), 0)?;
+        return Ok(plan::Expr::Uuid(func));
+    }
     if let Some(func) = plan::SequenceFunc::from_name(&name) {
         return lower_sequence_function(func, function);
     }

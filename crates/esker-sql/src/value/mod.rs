@@ -33,6 +33,8 @@ pub mod date;
 pub(crate) mod float;
 pub(crate) mod json;
 pub mod numeric;
+/// Random bytes from the OS, and the version-4 UUID built from them.
+pub mod random;
 pub mod time;
 mod timestamp;
 pub mod uuid;

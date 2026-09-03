@@ -28,9 +28,11 @@
 #   * **A second `IF NOT EXISTS` does not upgrade anything.** Plain success, same version.
 #   * **`plpgsql` is already installed before anything runs**, on a real server and here, so
 #     `pg_extension` is never empty and the count after installing both is **3**.
-#   * **Installing an extension does not bring the functions it carries.** `uuid_generate_v4()` is
-#     still `42883` on this node — the statement's job is to let the schema load. That is a
-#     declared divergence and the last line of this file.
+#   * **The allowlist means the extension *and* what it promises.** An extension that installs and
+#     then cannot deliver its functions stops the same files one statement later, because the
+#     schema's next lines default columns to `uuid_generate_v4()` and `gen_random_uuid()`. Those
+#     two are built (`tests/uuid_functions.rs`), which is why the last line of this file agrees
+#     rather than being a declared divergence — it was one, for exactly one commit.
 SELECT extname, extversion FROM pg_extension ORDER BY extname	name,text	plpgsql|1.0
 SELECT count(*) FROM pg_extension WHERE extname IN ('uuid-ossp','pgcrypto')	bigint	0
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp"		-

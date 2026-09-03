@@ -389,7 +389,7 @@ pub(super) fn has_parameters(statement: &Statement) -> bool {
 }
 
 /// Every expression in a statement, read-only.
-fn for_each_expr(statement: &Statement, visit: &mut impl FnMut(&Expr)) {
+pub(super) fn for_each_expr(statement: &Statement, visit: &mut impl FnMut(&Expr)) {
     let mut each = |expr: &Expr| descend(expr, visit);
     match statement {
         Statement::Insert(insert) => {

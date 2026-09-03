@@ -550,6 +550,7 @@ fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
         // this plan is being prepared for will supply.
         Expr::Outer { .. }
         | Expr::Literal(_)
+        | Expr::Uuid(_)
         | Expr::Parameter(_)
         | Expr::Column { .. }
         | Expr::Ordinal { .. }
@@ -945,6 +946,7 @@ pub(super) fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
             }
         }
         Expr::Literal(_)
+        | Expr::Uuid(_)
         | Expr::Parameter(_)
         | Expr::Column { .. }
         | Expr::Ordinal { .. }
@@ -1009,6 +1011,7 @@ fn walk_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr) -> Result<()>) ->
             }
         }
         Expr::Literal(_)
+        | Expr::Uuid(_)
         | Expr::Parameter(_)
         | Expr::Column { .. }
         | Expr::Ordinal { .. }

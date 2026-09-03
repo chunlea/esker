@@ -38,7 +38,7 @@ pub use ddl::{
 pub use dml::{Delete, Insert, Returning, Update};
 pub use expr::{
     AggregateCall, AggregateFunc, BinaryOp, CaseBranch, CatalogFunc, CatalogFuncCall, Expr,
-    Literal, ScalarFunc, SequenceCall, SequenceFunc,
+    Literal, ScalarFunc, SequenceCall, SequenceFunc, UuidFunc,
 };
 pub use query::{
     AggregateSpec, Join, JoinKind, Node, OrderItem, Probe, Select, SelectItem, SortKey, TableRef,

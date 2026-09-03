@@ -1078,6 +1078,7 @@ impl Executor {
             bind::substitute(&mut statement, params, &types)?;
         }
         self.resolve_regclass(txn, &mut statement)?;
+        self.refuse_unavailable_functions(txn, &statement)?;
         Ok(statement)
     }
 
@@ -1090,6 +1091,45 @@ impl Executor {
     ///
     /// A name nothing answers to is `42P01`, which is what a real server says and is the answer
     /// `ActiveRecord` relies on to tell a missing table from an empty one.
+    /// Refuses a UUID function whose extension is not installed.
+    ///
+    /// **Checked here rather than at lowering**, because availability is transaction state: the
+    /// same statement is `42883` before a `CREATE EXTENSION "uuid-ossp"` and a value after it, and
+    /// is `42883` again the moment that install rolls back. Measured on PostgreSQL 19, all three.
+    ///
+    /// `gen_random_uuid` is in core and needs no check; only `uuid_generate_v4` has an extension
+    /// behind it.
+    fn refuse_unavailable_functions(&self, txn: &dyn Txn, statement: &Statement) -> Result<()> {
+        use crate::plan::Expr;
+
+        let mut missing = None;
+        bind::for_each_expr(statement, &mut |expr: &Expr| {
+            if missing.is_some() {
+                return;
+            }
+            let Expr::Uuid(func) = expr else { return };
+            let Some(extension) = func.requires() else {
+                return;
+            };
+            match crate::catalog::pg_catalog::is_installed(txn, self.tenant, extension) {
+                Ok(true) => {}
+                // The **name** form of the DETAIL, not the argument-types one: there is no
+                // function of that name at any arity until the extension is there. Measured.
+                Ok(false) => {
+                    missing = Some(SqlError::UndefinedFunctionName(format!(
+                        "{}()",
+                        func.name()
+                    )));
+                }
+                Err(error) => missing = Some(error),
+            }
+        });
+        match missing {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     fn resolve_regclass(&self, txn: &dyn Txn, statement: &mut Statement) -> Result<()> {
         use crate::plan::{CatalogFunc, Expr, Literal};
 

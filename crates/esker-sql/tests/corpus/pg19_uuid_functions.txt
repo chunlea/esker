@@ -1,0 +1,45 @@
+# `gen_random_uuid()` and `uuid_generate_v4()` — the two functions the extensions promise.
+#
+# `CREATE EXTENSION "uuid-ossp"` succeeding is not enough: the schema's **next** lines are columns
+# defaulted to `uuid_generate_v4()` and `gen_random_uuid()`, so an extension that installs and
+# then cannot deliver its functions stops the same files one statement later.
+#
+# A **v4** UUID: sixteen random bytes with the version nibble set to 4 and the variant bits to
+# `10`. Read from the OS random source, in pure Rust and with no crate — the same rule the rest of
+# this project follows for anything a few hundred lines long.
+#
+# Captured in one rolled-back session; the values themselves are random and cannot be asserted, so
+# every line below asks about the **shape** rather than the value.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`gen_random_uuid()` needs no extension.** It has been in core since PostgreSQL 13, so it
+#     answers with `pg_extension` empty of both names — measured, count 0 — even though `pgcrypto`
+#     is where it used to live. `uuid_generate_v4()` is **not** in core and is
+#     `42883 function uuid_generate_v4() does not exist` until `uuid-ossp` is installed, and again
+#     after the transaction that installed it rolls back. One available always, one gated.
+#   * **The `42883` DETAIL is `There is no function of that name.`** — the *name* form, not the
+#     argument-types form, because there is no `uuid_generate_v4` of any arity to nearly match.
+#   * **The version nibble is the 15th character and the variant is the 20th.** A v4 is
+#     `xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx` with `y` in `8`, `9`, `a`, `b` — 36 characters
+#     including the four hyphens. An implementation that returned 16 random bytes and formatted
+#     them would pass a length check and fail both nibble checks.
+#   * **Two calls differ.** It is volatile, not stable: the same statement calling it twice gets
+#     two values, which is what makes it usable as a column default.
+#   * **`length`, `substring` and `pg_typeof` are not on this node**, so the shape checks that
+#     needed them are in `tests/uuid_functions.rs` rather than here — a corpus line asserting a
+#     function this node has not built would be measuring the wrong gap. The values below are what
+#     both servers can be asked without one.
+SELECT count(*) FROM pg_extension WHERE extname IN ('uuid-ossp','pgcrypto')	bigint	0
+SELECT gen_random_uuid() IS NULL	boolean	f
+SELECT gen_random_uuid() = gen_random_uuid()	boolean	f
+SELECT gen_random_uuid()::text = gen_random_uuid()::text	boolean	f
+SELECT uuid_generate_v4()	!42883 function uuid_generate_v4() does not exist DETAIL: There is no function of that name.
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp"		-
+SELECT uuid_generate_v4() IS NULL	boolean	f
+SELECT uuid_generate_v4() = uuid_generate_v4()	boolean	f
+SELECT count(*) FROM pg_extension WHERE extname = 'uuid-ossp'	bigint	1

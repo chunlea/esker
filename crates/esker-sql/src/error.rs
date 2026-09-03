@@ -816,6 +816,20 @@ pub enum SqlError {
     #[error("value too long for type {0}")]
     StringDataRightTruncation(String),
 
+    /// A function **name** this server does not have at any arity: `42883`.
+    ///
+    /// The fourth of PostgreSQL's four shapes for this code, and the one that says the name itself
+    /// is unknown — `DETAIL: There is no function of that name.` The other three are a known name
+    /// with the wrong *arity* ([`SqlError::UndefinedFunction`], "…the given number of arguments"),
+    /// with the wrong *types* ([`SqlError::UndefinedFunctionTypes`], "…the given argument types"
+    /// plus a cast HINT), and a **schema-qualified** name that matches nothing
+    /// ([`SqlError::UndefinedQualifiedFunction`], no DETAIL at all). All four measured.
+    ///
+    /// `uuid_generate_v4()` before its extension is installed is this one: not a signature
+    /// mismatch, but a name that is not there yet.
+    #[error("function {0} does not exist")]
+    UndefinedFunctionName(String),
+
     /// `CREATE EXTENSION x` where `x` is already installed: `42710 duplicate_object`.
     ///
     /// `IF NOT EXISTS` turns this into a plain success — that is the **only** thing the clause
@@ -1169,6 +1183,7 @@ impl SqlError {
             | SqlError::UndefinedFunction(_)
             | SqlError::UndefinedQualifiedFunction(_)
             | SqlError::UndefinedFunctionTypes(_)
+            | SqlError::UndefinedFunctionName(_)
             | SqlError::UndefinedAggregateArity { .. } => sqlstate::UNDEFINED_FUNCTION,
             SqlError::ParameterlessAggregate => sqlstate::WRONG_OBJECT_TYPE,
             SqlError::GeneratedAlways { .. } => sqlstate::GENERATED_ALWAYS,
@@ -1286,6 +1301,9 @@ impl SqlError {
             // The same sentence for the same condition: a function whose *name* exists and whose
             // arity does not. PostgreSQL says it for an aggregate and for `current_schema` alike,
             // which is why the two share it rather than each carrying a copy.
+            SqlError::UndefinedFunctionName(_) => {
+                Some("There is no function of that name.".to_owned())
+            }
             SqlError::UndefinedAggregateArity { .. } | SqlError::UndefinedFunction(_) => {
                 Some("No function of that name accepts the given number of arguments.".to_owned())
             }

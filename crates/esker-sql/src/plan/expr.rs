@@ -142,6 +142,14 @@ pub enum Expr {
         /// join** rather than an error. Set where the comparison is reconciled; `text` until then.
         element: ColumnType,
     },
+    /// `gen_random_uuid()` and `uuid_generate_v4()`: a fresh version-4 UUID, per call.
+    ///
+    /// **Volatile**, which is the property that decides where it may go: two calls in one
+    /// statement give two values — measured, `gen_random_uuid() = gen_random_uuid()` is `f` — so
+    /// it cannot be folded, cached per statement, or used as an index key. It is a variant rather
+    /// than a [`CatalogFunc`] for exactly that reason: that family is documented as a function of
+    /// its arguments alone, and this is the opposite.
+    Uuid(UuidFunc),
     /// `x IS NULL`, or `IS NOT NULL` when negated. Never NULL itself — that is the whole point of
     /// the operator, and the reason `x = NULL` is not a way to write it.
     IsNull {
@@ -279,6 +287,50 @@ pub struct CaseBranch {
     /// this branch", which is why the check is against `true` and not against "not false".
     pub then: Expr,
 }
+/// The two functions that make a UUID, and the difference between them is where they live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UuidFunc {
+    /// `gen_random_uuid()` — **in core since PostgreSQL 13**, so it answers with no extension
+    /// installed. `pgcrypto` is where it used to live and is still where `ActiveRecord` expects to
+    /// find it; measured, it works with `pg_extension` empty of both names.
+    GenRandomUuid,
+    /// `uuid_generate_v4()` — `uuid-ossp`'s, and **not** in core: it is
+    /// `42883 function uuid_generate_v4() does not exist` until that extension is installed, and
+    /// again as soon as the transaction that installed it rolls back. Measured, both directions.
+    UuidGenerateV4,
+}
+
+impl UuidFunc {
+    /// What it is called.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            UuidFunc::GenRandomUuid => "gen_random_uuid",
+            UuidFunc::UuidGenerateV4 => "uuid_generate_v4",
+        }
+    }
+
+    /// The function a name is, if it is one.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "gen_random_uuid" => Some(UuidFunc::GenRandomUuid),
+            "uuid_generate_v4" => Some(UuidFunc::UuidGenerateV4),
+            _ => None,
+        }
+    }
+
+    /// The extension that has to be installed for this function to exist, or `None` for the one
+    /// that is in core.
+    #[must_use]
+    pub fn requires(self) -> Option<&'static str> {
+        match self {
+            UuidFunc::GenRandomUuid => None,
+            UuidFunc::UuidGenerateV4 => Some("uuid-ossp"),
+        }
+    }
+}
+
 /// The scalar functions this node has, all of them one argument over a string.
 ///
 /// Each maps to Rust's own case conversion, which is full Unicode: `upper('àéî')` is `ÀÉÎ`, the
@@ -1012,6 +1064,7 @@ fn describe(expr: &Expr) -> &'static str {
         Expr::InList { negated: false, .. } => "IN",
         Expr::AnyArray { .. } => "= ANY",
         Expr::Subscript { .. } => "a subscript",
+        Expr::Uuid(func) => func.name(),
         Expr::InList { negated: true, .. } => "NOT IN",
         Expr::Aggregate(_) => "an aggregate function",
         Expr::Default => "DEFAULT",

@@ -417,6 +417,9 @@ fn push_filter(
         // The fragment language has no array. Rows, and the row evaluator answers it.
         Expr::AnyArray { .. } => return Err(refused("= ANY over an array value")),
         Expr::Subscript { .. } => return Err(refused("an array subscript")),
+        // Volatile: a fragment the columnar side evaluated would answer a different UUID from the
+        // row side, which is the one thing a differential must never allow.
+        Expr::Uuid(_) => return Err(refused("a UUID function")),
         Expr::Literal(literal) => ColExpr::Literal(literal_value(literal)?),
         // A catalog function is a function of the catalog, not of the fragment's columns, and the
         // columnar reader has no expression for it. Rows, and the row evaluator answers it.
@@ -708,6 +711,7 @@ fn collect_columns(expr: &Expr, into: &mut Vec<usize>) {
             }
         }
         Expr::Literal(_)
+        | Expr::Uuid(_)
         | Expr::Parameter(_)
         | Expr::Column { .. }
         // A position in a row **outside** this plan, so it names no column of the one being read.
