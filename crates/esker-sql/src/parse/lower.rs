@@ -1057,7 +1057,6 @@ fn refuse_create_table_clauses(create: &sqlparser::ast::CreateTable) -> Result<(
     refuse_if(create.query.is_some(), "CREATE TABLE ... AS")?;
     refuse_if(create.like.is_some(), "CREATE TABLE ... LIKE")?;
     refuse_if(create.clone.is_some(), "CREATE TABLE ... CLONE")?;
-    refuse_if(create.inherits.is_some(), "CREATE TABLE ... INHERITS")?;
     refuse_if(
         create.partition_of.is_some(),
         "CREATE TABLE ... PARTITION OF",
@@ -1206,6 +1205,13 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
         columns,
         primary_key,
         primary_key_name,
+        // Names only: a parent's columns come from the catalog and the catalog is the executor's.
+        inherits: create
+            .inherits
+            .iter()
+            .flatten()
+            .map(relation_name)
+            .collect::<Result<Vec<_>>>()?,
         unique,
     })
 }

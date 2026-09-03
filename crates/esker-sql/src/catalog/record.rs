@@ -76,7 +76,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 15;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 16;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -996,6 +996,19 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         put_str(column.default_expr.as_deref().unwrap_or(""), &mut out);
     }
 
+    // Version 16. The inheritance edges, parents then children, each a count and that many ids —
+    // **after** version 14's section, for the fourth time the same reason: sections go on in
+    // version order and come off in that order. A table written before 16 has neither, which is
+    // what every table had while `INHERITS` was `0A000`.
+    varint::put_u64(table.parents.len() as u64, &mut out);
+    for parent in &table.parents {
+        out.extend_from_slice(&parent.to_le_bytes());
+    }
+    varint::put_u64(table.children.len() as u64, &mut out);
+    for child in &table.children {
+        out.extend_from_slice(&child.to_le_bytes());
+    }
+
     Ok(out)
 }
 
@@ -1148,6 +1161,23 @@ fn read_default_expressions(reader: &mut Reader<'_>, columns: &mut [ColumnDef]) 
     Ok(())
 }
 
+/// The version 16 section: the tables this one inherits from, and the tables that inherit from it.
+fn read_inheritance(reader: &mut Reader<'_>) -> Result<(Vec<u64>, Vec<u64>)> {
+    if reader.version < 16 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut edges = [Vec::new(), Vec::new()];
+    for side in &mut edges {
+        let count = reader.count()?;
+        side.reserve(count);
+        for _ in 0..count {
+            side.push(reader.u64_le()?);
+        }
+    }
+    let [parents, children] = edges;
+    Ok((parents, children))
+}
+
 /// Reads a table record back. Every failure is typed: a catalog is on-disk data like any other.
 #[allow(
     clippy::too_many_lines,
@@ -1264,6 +1294,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
     let triggers_disabled = reader.version >= 12 && reader.flag()?;
     read_generation_expressions(&mut reader, &mut columns)?;
     read_default_expressions(&mut reader, &mut columns)?;
+    let (parents, children) = read_inheritance(&mut reader)?;
     reader.finish()?;
 
     Ok(TableDef {
@@ -1278,6 +1309,9 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
         // where the table is loaded (`crate::catalog::View::table_by_id`). A `TableDef` decoded
         // straight from bytes therefore has none, which is what this function is for.
         sequences: Vec::new(),
+        parents,
+        children,
+        child_scans: Vec::new(),
         checks,
         foreign_keys,
         triggers_disabled,

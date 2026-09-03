@@ -1306,6 +1306,7 @@ fn seq_scan(tenant: u64, table: &TableDef, columns: &RowSchema, narrowed: bool) 
         start,
         end,
         narrowed,
+        inherited: table.child_scans.clone(),
     }
 }
 
@@ -1354,6 +1355,7 @@ fn narrowed_scan(tenant: u64, table: &TableDef, columns: &RowSchema, filter: &Ex
         start,
         end,
         narrowed,
+        inherited: table.child_scans.clone(),
     }
 }
 

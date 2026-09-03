@@ -65,6 +65,11 @@ enum Kind<'a> {
         next: Vec<u8>,
         end: Vec<u8>,
         batch: std::vec::IntoIter<(bytes::Bytes, bytes::Bytes)>,
+        /// Children still to read, innermost last — a scan of a parent returns their rows too.
+        inherited: Vec<crate::catalog::ChildScan>,
+        /// How to line the range being read up with the parent's columns, or `None` while the
+        /// parent's own range is being read and the rows already are its shape.
+        project: Option<Vec<usize>>,
     },
     /// At most one row, already found or not yet looked for.
     Point { node: Node, looked: bool },
@@ -165,6 +170,10 @@ fn inner_side(
                 next: start,
                 end,
                 batch: Vec::new().into_iter(),
+                // A join's inner side is materialised from one table's range; a parent on that
+                // side reaches this through its own `SeqScan` above, not through here.
+                inherited: Vec::new(),
+                project: None,
             },
         },
     };
@@ -203,12 +212,17 @@ impl<'a> Cursor<'a> {
                 columns,
                 start,
                 end,
+                inherited,
                 ..
             } => Kind::Scan {
                 columns: columns.clone(),
                 next: start.clone(),
                 end: end.clone(),
                 batch: Vec::new().into_iter(),
+                // Reversed, so the walk can `pop` and still read them in the order the parent
+                // lists its children.
+                inherited: inherited.iter().rev().cloned().collect(),
+                project: None,
             },
             Node::PointGet { .. } | Node::IndexLookup { .. } => Kind::Point {
                 node: node.clone(),
@@ -342,11 +356,24 @@ impl<'a> Cursor<'a> {
                 next,
                 end,
                 batch,
+                inherited,
+                project,
             } => {
                 loop {
                     if let Some((key, value)) = batch.next() {
                         *next = successor(&key);
-                        return Ok(Some(row::decode_row(columns, &value)?));
+                        let row = row::decode_row(columns, &value)?;
+                        // **A child's row is decoded as the child and answered as the parent.**
+                        // The two layouts differ whenever the child has a row id the parent has
+                        // not, or a column of its own, so the values are lifted by position from
+                        // a map built by name (`catalog::ChildScan`).
+                        return Ok(Some(match project {
+                            Some(project) => project
+                                .iter()
+                                .map(|&at| row.get(at).cloned().unwrap_or(Datum::Null))
+                                .collect(),
+                            None => row,
+                        }));
                     }
                     // An **empty** chunk ends the range, not a short one. A short chunk is not
                     // evidence of anything: the store may cap a scan below what was asked
@@ -356,7 +383,18 @@ impl<'a> Cursor<'a> {
                     // say nothing. The price is one extra round trip per scan.
                     let read = self.txn.scan(next, end, SCAN_CHUNK)?;
                     if read.is_empty() {
-                        return Ok(None);
+                        // The range is done. A parent moves on to its next child's range and
+                        // answers those rows as its own; a table with no children stops here,
+                        // which is what every scan did before `INHERITS`.
+                        let Some(child) = inherited.pop() else {
+                            return Ok(None);
+                        };
+                        let (start, stop) = row::table_row_range(self.tenant, child.table_id);
+                        *columns = child.schema;
+                        *next = start;
+                        *end = stop;
+                        *project = Some(child.project);
+                        continue;
                     }
                     *batch = read.into_iter();
                 }

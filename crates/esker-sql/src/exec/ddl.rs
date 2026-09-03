@@ -58,7 +58,10 @@ pub(super) fn create_table(
         return Err(SqlError::DuplicateTable(create.name.clone()));
     }
 
-    let columns = declared_columns(create)?;
+    let declared = declared_columns(create)?;
+    // **The parents' columns come first**, whatever order the child declared its own in, and a
+    // child that redeclares an inherited name merges into it rather than adding a second column.
+    let (parents, columns) = inherited_columns(executor, txn, create, declared)?;
     refuse_unavailable_defaults(txn, executor, &columns)?;
 
     let key_position = |name: &String| {
@@ -115,6 +118,10 @@ pub(super) fn create_table(
         // table's checks are on; `DISABLE TRIGGER` is a statement of its own.
         foreign_keys: Vec::new(),
         triggers_disabled: false,
+        parents: parents.iter().map(|parent| parent.id).collect(),
+        // Filled by the parents, not here: this table is nobody's parent yet.
+        children: Vec::new(),
+        child_scans: Vec::new(),
         primary_key_name,
         // A table starts at schema version 1; `ALTER TABLE ADD COLUMN` moves it.
         schema_version: 1,
@@ -133,6 +140,18 @@ pub(super) fn create_table(
         table.foreign_keys.push(resolved);
     }
     catalog::create_table(txn, executor.tenant, &table)?;
+    // **The other half of the edge.** A parent's `children` is what a scan of it reads to reach
+    // these rows, and what `DROP TABLE` reads to refuse; the child's `parents` alone would answer
+    // neither without a scan of every table record. The two are written in one transaction, so a
+    // reader never sees one without the other.
+    for parent in &parents {
+        let mut updated = (**parent).clone();
+        updated.children.push(table.id);
+        // The schema version moves because every node's cached `TableDef` has to learn it: a node
+        // still holding the old one would scan the parent and miss the child's rows entirely.
+        updated.schema_version += 1;
+        catalog::replace_table(txn, executor.tenant, parent, &updated)?;
+    }
     for (parent, child) in backrefs {
         txn.put(
             &catalog::foreign_key_backref_key(executor.tenant, parent, child),
@@ -444,6 +463,62 @@ fn set_column_default(
         }
     }
     Ok(())
+}
+
+/// The columns a `CREATE TABLE … INHERITS (…)` ends up with, and the parents it resolved.
+///
+/// **The inherited columns come first**, in the parents' order, and the table's own follow —
+/// whatever order they were written in. Measured: `CREATE TABLE ic2 (extra text) INHERITS (ip)`
+/// has `id, number, tag, extra`.
+///
+/// A child redeclaring an inherited name **merges** into that column rather than adding a second
+/// one, and a redeclaration whose type differs is `42804` with two `DETAIL` lines — PostgreSQL
+/// spells the position first and the types second.
+///
+/// What is inherited is the column: its type, its `NOT NULL` and its **default**, the parent's
+/// sequence included. What is not is the parent's indexes or its primary key — `pg_index` for the
+/// child is empty on a real server, so the uniqueness the parent promises does not hold across the
+/// pair, and this node stores the same.
+fn inherited_columns(
+    executor: &Executor,
+    txn: &dyn Txn,
+    create: &CreateTable,
+    declared: Vec<ColumnDef>,
+) -> Result<(Vec<std::sync::Arc<TableDef>>, Vec<ColumnDef>)> {
+    if create.inherits.is_empty() {
+        return Ok((Vec::new(), declared));
+    }
+    let mut parents = Vec::with_capacity(create.inherits.len());
+    let mut columns: Vec<ColumnDef> = Vec::new();
+    for name in &create.inherits {
+        let parent = executor.require_table(txn, name)?;
+        // The parent's **user** columns: its internal row id is its own identity and means nothing
+        // in another table, which gets one of its own if it needs one.
+        for (_, column) in parent.user_columns() {
+            match columns.iter().position(|held| held.name == column.name) {
+                Some(_) => {}
+                None => columns.push(column.clone()),
+            }
+        }
+        parents.push(parent);
+    }
+    for column in declared {
+        match columns.iter_mut().find(|held| held.name == column.name) {
+            // A redeclared column merges, and the types have to agree.
+            Some(held) => {
+                if held.ty != column.ty {
+                    return Err(SqlError::ColumnTypeConflict {
+                        column: column.name.clone(),
+                        inherited: held.ty.name(),
+                        declared: column.ty.name(),
+                    });
+                }
+                held.not_null |= column.not_null;
+            }
+            None => columns.push(column),
+        }
+    }
+    Ok((parents, columns))
 }
 
 /// **Every function this node has, with the signature `DROP FUNCTION` names it by.**
@@ -933,6 +1008,20 @@ pub(super) fn drop_table(
         //
         // A self-reference does not count in either direction: dropping the table takes its own
         // constraint with it, which is what a real server does too.
+        // **An inheriting child is a dependent too**, and it stops the drop the same way a
+        // foreign key does — `2BP01`, with a `DETAIL` naming the child. `CASCADE` takes the child
+        // *table*, unlike the foreign-key case above where it takes only the constraint: a child
+        // has no meaning without the parent whose columns it borrowed.
+        for &child_id in &table.children {
+            let child = executor.table_by_id(txn, child_id)?;
+            if !drop.cascade {
+                return Err(SqlError::DependentTable {
+                    relation: table.name.clone(),
+                    detail: format!("table {} depends on table {}", child.name, table.name),
+                });
+            }
+            drop_one_table(executor, txn, &child)?;
+        }
         let (start, end) = catalog::foreign_key_backref_range(executor.tenant, table.id);
         for (key, _) in txn.scan(&start, &end, 0)? {
             let child_id = catalog::foreign_key_backref_child(executor.tenant, table.id, &key)?;
@@ -978,30 +1067,48 @@ pub(super) fn drop_table(
             ));
         }
 
-        // The rows go with the table. A range delete is what this wants and the transaction layer
-        // has none, so every key is deleted individually -- correct, and `TODO(post-v1)` for a
-        // table large enough that this is a problem.
-        //
-        // Paged, because a whole range cannot be asked for in one call ([`super::for_each_page`]).
-        let (start, end) = crate::row::table_row_range(executor.tenant, table.id);
+        drop_one_table(executor, txn, &table)?;
+    }
+    Ok(Outcome::done("DROP TABLE"))
+}
+
+/// One table's rows, index entries and catalog record — everything but the dependency checks.
+///
+/// Factored out so `CASCADE` can reach an inheriting child with it: a child dropped that way needs
+/// exactly the same removal the named table gets, and doing it by hand at the second call site is
+/// how one of the three steps gets forgotten.
+fn drop_one_table(executor: &Executor, txn: &mut dyn Txn, table: &TableDef) -> Result<()> {
+    // The rows go with the table. A range delete is what this wants and the transaction layer
+    // has none, so every key is deleted individually -- correct, and `TODO(post-v1)` for a
+    // table large enough that this is a problem.
+    //
+    // Paged, because a whole range cannot be asked for in one call ([`super::for_each_page`]).
+    let (start, end) = crate::row::table_row_range(executor.tenant, table.id);
+    super::for_each_page(txn, &start, &end, |txn, page| {
+        for (key, _) in page {
+            txn.delete(key);
+        }
+        Ok(())
+    })?;
+    for index in &table.indexes {
+        let (start, end) = crate::row::index_range(executor.tenant, table.id, index.id);
         super::for_each_page(txn, &start, &end, |txn, page| {
             for (key, _) in page {
                 txn.delete(key);
             }
             Ok(())
         })?;
-        for index in &table.indexes {
-            let (start, end) = crate::row::index_range(executor.tenant, table.id, index.id);
-            super::for_each_page(txn, &start, &end, |txn, page| {
-                for (key, _) in page {
-                    txn.delete(key);
-                }
-                Ok(())
-            })?;
-        }
-        catalog::drop_table(txn, executor.tenant, &table)?;
     }
-    Ok(Outcome::done("DROP TABLE"))
+    // **Its parents stop listing it**, or a later scan of one would look for rows in a table that
+    // is gone. The child's own `parents` goes with its record.
+    for &parent_id in &table.parents {
+        let parent = executor.table_by_id(txn, parent_id)?;
+        let mut updated = (*parent).clone();
+        updated.children.retain(|&held| held != table.id);
+        updated.schema_version += 1;
+        catalog::replace_table(txn, executor.tenant, &parent, &updated)?;
+    }
+    catalog::drop_table(txn, executor.tenant, table)
 }
 
 pub(super) fn create_index(

@@ -64,7 +64,10 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
             "CREATE TABLE t (a int8) PARTITION BY RANGE (a)",
             "PARTITION BY",
         ),
-        ("CREATE TABLE t (a int8) INHERITS (u)", "INHERITS"),
+        // **`INHERITS` left this list** with statement 762: the child takes the parent's
+        // columns, a scan of the parent returns the child's rows, and an `UPDATE` or `DELETE` on
+        // it reaches them. What is still refused is `FROM ONLY`, and that is a *parser* gap
+        // rather than a clause this node declines — it is in the plan's C1 register.
         // Tier 1 is complete: every type it names runs, typmods included. What is left here is
         // tier 2, refused by name, and each line is deleted by the unit that lands its type.
         // A length unit is the standard's spelling and PostgreSQL takes neither — named rather

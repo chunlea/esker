@@ -854,6 +854,22 @@ pub enum SqlError {
     #[error("function {0} does not exist")]
     UndefinedQualifiedFunction(String),
 
+    /// A `CREATE TABLE … INHERITS` whose own column redeclares an inherited one at another type.
+    ///
+    /// `42804`, and PostgreSQL sends **two** `DETAIL` lines for it: one saying the user's column
+    /// moved to the inherited one's position, and one naming the two types. Both are here, because
+    /// the first is the surprising half — the redeclaration is not rejected for being a duplicate,
+    /// it is *merged*, and only the type stops it.
+    #[error("column \"{column}\" has a type conflict")]
+    ColumnTypeConflict {
+        /// The column named twice.
+        column: String,
+        /// The type it has from the parent.
+        inherited: &'static str,
+        /// The type this table declared for it.
+        declared: &'static str,
+    },
+
     /// `DROP FUNCTION` on a **built-in**: `2BP01`, and `IF EXISTS` does not cover it.
     ///
     /// The clause covers absence and this is not absence — the function is there and is protected.
@@ -1311,6 +1327,7 @@ impl SqlError {
             | SqlError::UndefinedQualifiedColumn { .. }
             | SqlError::UsingColumnMissing { .. }
             | SqlError::UndefinedColumnInRelation { .. } => sqlstate::UNDEFINED_COLUMN,
+            SqlError::ColumnTypeConflict { .. } => sqlstate::DATATYPE_MISMATCH,
             SqlError::DuplicateTable(_) | SqlError::AlreadyExistsSkipping(_) => {
                 sqlstate::DUPLICATE_TABLE
             }
@@ -1477,6 +1494,17 @@ impl SqlError {
             | SqlError::ForeignKeyViolation { detail, .. }
             | SqlError::ForeignKeyStillReferenced { detail, .. }
             | SqlError::DependentTable { detail, .. } => Some(detail.clone()),
+            // **Two sentences**, which PostgreSQL sends as two `DETAIL` lines. The first is the
+            // surprising half: a redeclared inherited column is *merged* into the inherited one
+            // and moved to its position, not rejected as a duplicate — only the type stops it.
+            SqlError::ColumnTypeConflict {
+                inherited,
+                declared,
+                ..
+            } => Some(format!(
+                "User-specified column moved to the position of the inherited column. DETAIL: \
+                 {inherited} versus {declared}"
+            )),
             // **A `DETAIL`, not a `HINT`** — it was written into `hint` when this variant landed,
             // which put PostgreSQL's `DETAIL` sentence after `HINT:` and left the real hint
             // unreachable behind it. The corpus caught it: a client reading `DETAIL` to find which

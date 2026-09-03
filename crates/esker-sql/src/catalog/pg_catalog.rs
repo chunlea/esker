@@ -297,9 +297,12 @@ impl CatalogView {
                 // build offers as `default_version`, not one the statement chooses.
                 ("extversion", ColumnType::Text),
             ],
+            // `inhseqno` numbers a child's parents from **1**, in the order the `INHERITS` clause
+            // wrote them — measured, and it is what tells multiple inheritance apart.
             CatalogView::PgInherits => &[
                 ("inhrelid", ColumnType::Int8),
                 ("inhparent", ColumnType::Int8),
+                ("inhseqno", ColumnType::Int4),
             ],
             // The five a real server has, in its order. `name` is of type `name` there and the
             // four others are `text`; this node has one string type and answers `text` for all
@@ -351,6 +354,7 @@ impl CatalogView {
             CatalogView::PgAttribute => super::pg_attribute::rows(txn, tenant),
             CatalogView::PgAttrdef => super::pg_attribute::default_rows(txn, tenant),
             CatalogView::PgIndex => super::pg_index::rows(txn, tenant),
+            CatalogView::PgInherits => inherits_rows(txn, tenant),
             CatalogView::PgConstraint => super::pg_constraint::rows(txn, tenant),
             CatalogView::InformationSchemaTables => super::information_schema::tables(txn, tenant),
             CatalogView::InformationSchemaColumns => {
@@ -513,6 +517,9 @@ impl CatalogView {
                         checks: Vec::new(),
                         foreign_keys: Vec::new(),
                         triggers_disabled: false,
+                        parents: Vec::new(),
+                        children: Vec::new(),
+                        child_scans: Vec::new(),
                     })
                 })
                 .collect()
@@ -630,6 +637,26 @@ const PUBLIC_SCHEMA: &str = "public";
 /// used to read the id out of the name record's *key*, so a primary key and a sequence both
 /// reported the table's own id and three rows of `pg_class` shared one oid. Nothing read the
 /// column before phase 13; every statement in the schema-dump path joins on it.
+/// One row per inheritance edge, the way `pg_inherits` holds them.
+///
+/// Read from the **child** side, because that is where the order lives: `inhseqno` numbers a
+/// child's parents from 1 in the order its `INHERITS` clause wrote them, and the parent's own list
+/// has no such order to offer.
+fn inherits_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+    let relations = super::pg_relations::Relations::read(txn, tenant)?;
+    let mut rows = Vec::new();
+    for table in relations.tables() {
+        for (at, &parent) in table.parents.iter().enumerate() {
+            rows.push(vec![
+                Datum::Int8(super::pg_relations::as_oid(table.id)),
+                Datum::Int8(super::pg_relations::as_oid(parent)),
+                Datum::Int4(i32::try_from(at + 1).unwrap_or(i32::MAX)),
+            ]);
+        }
+    }
+    Ok(rows)
+}
+
 fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
     let relations = super::pg_relations::Relations::read(txn, tenant)?;
     // **`relhastriggers` is `t` for either side of a foreign key**, because a foreign key *is* two

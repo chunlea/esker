@@ -293,6 +293,12 @@ pub enum Node {
         end: Vec<u8>,
         /// What the range came from, for `EXPLAIN` — a narrowed range is the interesting case.
         narrowed: bool,
+        /// The children whose rows this scan also returns, read after the table's own.
+        ///
+        /// **Inheritance is a read rule**: `SELECT … FROM parent` returns a child's rows too, and
+        /// so does `UPDATE` and `DELETE` on it. Empty for every table that is nobody's parent,
+        /// which is all of them until `INHERITS` runs.
+        inherited: Vec<crate::catalog::ChildScan>,
     },
     /// One row, by its primary key.
     PointGet {

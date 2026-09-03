@@ -504,87 +504,94 @@ pub(super) fn update(
     written: &mut Written,
 ) -> Result<Outcome> {
     crate::catalog::pg_catalog::refuse_write(&update.table)?;
-    let table = executor.require_table(txn, &update.table)?;
-    let mut returned = Returned::open(update.returning.as_ref(), &table)?;
-
-    // Resolve the target of every assignment first, so `SET nope = 1` fails before anything is
-    // read rather than after some rows have been rewritten.
-    let assignments = update
-        .assignments
-        .iter()
-        .map(|(name, value)| {
-            let ordinal =
-                table
-                    .column(name)
-                    .ok_or_else(|| SqlError::UndefinedColumnInRelation {
-                        column: name.clone(),
-                        relation: table.name.clone(),
-                    })?;
-            Ok((ordinal, value.clone()))
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let rows = collect(executor, txn, update.filter.as_ref(), &table)?;
+    let named = executor.require_table(txn, &update.table)?;
+    let mut returned = Returned::open(update.returning.as_ref(), &named)?;
+    let targets = inheritance_targets(executor, txn, &named)?;
     let mut count = 0;
-    for old in rows {
-        let mut new = old.clone();
-        for (ordinal, value) in &assignments {
-            let column = &table.columns[*ordinal];
-            // A `GENERATED ALWAYS AS (…) STORED` column takes `DEFAULT` and nothing else, and
-            // an `UPDATE`'s sentence for that is **not** the `INSERT`'s: `column "x" can only be
-            // updated to DEFAULT`. Measured, both.
-            if column.generated.is_some() && !matches!(value, crate::plan::Expr::Default) {
-                return Err(SqlError::GeneratedColumnUpdate {
-                    column: column.name.clone(),
-                });
-            }
-            // Evaluated against the row as it was, so `SET a = b, b = a` swaps them.
-            let evaluated = match value {
-                // `SET a = DEFAULT` is the column's own default, which for a sequence column is
-                // the next value and for every other one is the constant the catalog holds.
-                // `sequence_for` answers only for a sequence that *fills* this column, so an
-                // owned-but-unused one cannot capture a `SET c = DEFAULT`.
-                crate::plan::Expr::Default => match table.sequence_for(*ordinal) {
-                    Some(sequence) => sequence_datum(
-                        table.columns[*ordinal].ty,
-                        executor.next_sequence_value(sequence.id)?,
-                    )?,
-                    None => column_default_value(&table, column, &*txn)?,
-                },
-                crate::plan::Expr::Literal(literal) => literal.assign(column.ty, &column.name)?,
-                other => {
-                    let resolved = query::resolve_against(other, &table)?;
-                    cursor::evaluate(&resolved, &old)?
+
+    for (table, project) in targets {
+        // Resolve the target of every assignment first, so `SET nope = 1` fails before anything is
+        // read rather than after some rows have been rewritten. Per relation, because a child's
+        // ordinals are its own — the same name is a different position the moment it has a row id
+        // the parent has not.
+        let assignments = update
+            .assignments
+            .iter()
+            .map(|(name, value)| {
+                let ordinal =
+                    table
+                        .column(name)
+                        .ok_or_else(|| SqlError::UndefinedColumnInRelation {
+                            column: name.clone(),
+                            relation: table.name.clone(),
+                        })?;
+                Ok((ordinal, value.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let rows = collect(executor, txn, update.filter.as_ref(), &table)?;
+        for old in rows {
+            let mut new = old.clone();
+            for (ordinal, value) in &assignments {
+                let column = &table.columns[*ordinal];
+                // A `GENERATED ALWAYS AS (…) STORED` column takes `DEFAULT` and nothing else, and
+                // an `UPDATE`'s sentence for that is **not** the `INSERT`'s: `column "x" can only be
+                // updated to DEFAULT`. Measured, both.
+                if column.generated.is_some() && !matches!(value, crate::plan::Expr::Default) {
+                    return Err(SqlError::GeneratedColumnUpdate {
+                        column: column.name.clone(),
+                    });
                 }
-            };
-            if !evaluated.fits(column.ty) {
-                return Err(SqlError::DatatypeMismatchInColumn {
-                    column: column.name.clone(),
-                    column_type: column.ty.name(),
-                    expression_type: "the expression's",
-                });
+                // Evaluated against the row as it was, so `SET a = b, b = a` swaps them.
+                let evaluated = match value {
+                    // `SET a = DEFAULT` is the column's own default, which for a sequence column is
+                    // the next value and for every other one is the constant the catalog holds.
+                    // `sequence_for` answers only for a sequence that *fills* this column, so an
+                    // owned-but-unused one cannot capture a `SET c = DEFAULT`.
+                    crate::plan::Expr::Default => match table.sequence_for(*ordinal) {
+                        Some(sequence) => sequence_datum(
+                            table.columns[*ordinal].ty,
+                            executor.next_sequence_value(sequence.id)?,
+                        )?,
+                        None => column_default_value(&table, column, &*txn)?,
+                    },
+                    crate::plan::Expr::Literal(literal) => {
+                        literal.assign(column.ty, &column.name)?
+                    }
+                    other => {
+                        let resolved = query::resolve_against(other, &table)?;
+                        cursor::evaluate(&resolved, &old)?
+                    }
+                };
+                if !evaluated.fits(column.ty) {
+                    return Err(SqlError::DatatypeMismatchInColumn {
+                        column: column.name.clone(),
+                        column_type: column.ty.name(),
+                        expression_type: "the expression's",
+                    });
+                }
+                new[*ordinal] = evaluated;
             }
-            new[*ordinal] = evaluated;
+            fit_typmods(&table, &mut new)?;
+            // The column is a function of the row, so an `UPDATE` that moved its source moves it too
+            // — and a `SET generated = DEFAULT` recomputes rather than storing NULL.
+            fill_generated(&table, &mut new)?;
+            check_not_null(&table, &new)?;
+            check_constraints(&table, &new)?;
+            // Anything pointing at the row's **old** key. Refusing comes first, so a `RESTRICT` leaves
+            // the table as it was; the cascade comes *after* the row has moved, because a child whose
+            // key follows the parent's re-checks that key and it has to be there already.
+            super::foreign_key::refuse_if_referenced(executor, txn, &table, &old, &new)?;
+            remove_row(executor, txn, &table, &old)?;
+            write_row(executor, txn, &table, &new, written)?;
+            super::foreign_key::cascade_update(executor, txn, &table, &old, &new, written)?;
+            // The row **after** the assignments: `UPDATE t SET n = n + 1 RETURNING n` answers with
+            // the new value, which is the whole reason a client writes it.
+            if let Some(returned) = &mut returned {
+                returned.push(&projected(&new, project.as_ref()))?;
+            }
+            count += 1;
         }
-        fit_typmods(&table, &mut new)?;
-        // The column is a function of the row, so an `UPDATE` that moved its source moves it too
-        // — and a `SET generated = DEFAULT` recomputes rather than storing NULL.
-        fill_generated(&table, &mut new)?;
-        check_not_null(&table, &new)?;
-        check_constraints(&table, &new)?;
-        // Anything pointing at the row's **old** key. Refusing comes first, so a `RESTRICT` leaves
-        // the table as it was; the cascade comes *after* the row has moved, because a child whose
-        // key follows the parent's re-checks that key and it has to be there already.
-        super::foreign_key::refuse_if_referenced(executor, txn, &table, &old, &new)?;
-        remove_row(executor, txn, &table, &old)?;
-        write_row(executor, txn, &table, &new, written)?;
-        super::foreign_key::cascade_update(executor, txn, &table, &old, &new, written)?;
-        // The row **after** the assignments: `UPDATE t SET n = n + 1 RETURNING n` answers with
-        // the new value, which is the whole reason a client writes it.
-        if let Some(returned) = &mut returned {
-            returned.push(&new)?;
-        }
-        count += 1;
     }
     Ok(finish(returned, format!("UPDATE {count}")))
 }
@@ -596,21 +603,91 @@ pub(super) fn delete(
     delete: &Delete,
 ) -> Result<Outcome> {
     crate::catalog::pg_catalog::refuse_write(&delete.table)?;
-    let table = executor.require_table(txn, &delete.table)?;
-    let mut returned = Returned::open(delete.returning.as_ref(), &table)?;
-    let rows = collect(executor, txn, delete.filter.as_ref(), &table)?;
-    let count = rows.len();
-    for row in rows {
-        // The row as it was, gathered before it goes: after `remove_row` there is nothing to read.
-        if let Some(returned) = &mut returned {
-            returned.push(&row)?;
+    let named = executor.require_table(txn, &delete.table)?;
+    let mut returned = Returned::open(delete.returning.as_ref(), &named)?;
+    let mut count = 0;
+    // Itself and everything that inherits from it: `DELETE FROM parent` removes a child's rows,
+    // measured, and each row has to go through its own table's keys and indexes.
+    for (table, project) in inheritance_targets(executor, txn, &named)? {
+        let rows = collect(executor, txn, delete.filter.as_ref(), &table)?;
+        count += rows.len();
+        for row in rows {
+            // The row as it was, gathered before it goes: after `remove_row` there is nothing to
+            // read.
+            if let Some(returned) = &mut returned {
+                returned.push(&projected(&row, project.as_ref()))?;
+            }
+            // Anything pointing at this row: refused, or cascaded into first. Before the row goes,
+            // so a refusal leaves the table as it was.
+            super::foreign_key::on_parent_removed(executor, txn, &table, &row)?;
+            remove_row(executor, txn, &table, &row)?;
         }
-        // Anything pointing at this row: refused, or cascaded into first. Before the row goes, so
-        // a refusal leaves the table as it was.
-        super::foreign_key::on_parent_removed(executor, txn, &table, &row)?;
-        remove_row(executor, txn, &table, &row)?;
     }
     Ok(finish(returned, format!("DELETE {count}")))
+}
+
+/// One relation an `UPDATE` or a `DELETE` acts on, and how its rows line up with the one named.
+///
+/// The projection is `None` for the named table itself, whose rows already are its own shape.
+type Target = (std::sync::Arc<TableDef>, Option<Vec<usize>>);
+
+/// The relations an `UPDATE` or a `DELETE` on this one acts on: itself and everything that
+/// inherits from it, each seen **alone**.
+///
+/// **Inheritance is a write rule too.** `UPDATE parent SET …` changes the child's rows and
+/// `DELETE FROM parent` removes them — measured, both. It cannot be done by one scan the way a
+/// `SELECT` is, because each row has to go back where it came from: a child's row key, row layout
+/// and indexes are its own, and writing one through the parent's would put it in the wrong table.
+///
+/// So each relation is acted on separately, with `child_scans` cleared so its own scan returns
+/// only its own rows. The projection beside it is how a child's row is reported back through a
+/// `RETURNING` clause the parent's columns were named in.
+fn inheritance_targets(
+    executor: &Executor,
+    txn: &dyn Txn,
+    table: &std::sync::Arc<TableDef>,
+) -> Result<Vec<Target>> {
+    let alone = |table: &std::sync::Arc<TableDef>| {
+        if table.child_scans.is_empty() {
+            return std::sync::Arc::clone(table);
+        }
+        let mut alone = (**table).clone();
+        alone.child_scans.clear();
+        std::sync::Arc::new(alone)
+    };
+    let mut targets = vec![(alone(table), None)];
+    // Breadth first from the named table, so a grandchild is reached through its own parent's
+    // list rather than being missed for not being named directly.
+    let mut queue: std::collections::VecDeque<(u64, Vec<usize>)> = table
+        .child_scans
+        .iter()
+        .map(|child| (child.table_id, child.project.clone()))
+        .collect();
+    while let Some((child_id, project)) = queue.pop_front() {
+        let child = executor.table_by_id(txn, child_id)?;
+        for grandchild in &child.child_scans {
+            // Composed, so a grandchild's row lands in the *named* table's columns and not in its
+            // own parent's — the two differ as soon as either adds a column.
+            let composed = project
+                .iter()
+                .map(|&at| grandchild.project.get(at).copied().unwrap_or(at))
+                .collect();
+            queue.push_back((grandchild.table_id, composed));
+        }
+        targets.push((alone(&child), Some(project)));
+    }
+    Ok(targets)
+}
+
+/// A row of `table` as the relation an `UPDATE` or `DELETE` named would report it.
+fn projected(row: &[Datum], project: Option<&Vec<usize>>) -> Vec<Datum> {
+    match project {
+        Some(project) => project
+            .iter()
+            .map(|&at| row.get(at).cloned().unwrap_or(Datum::Null))
+            .collect(),
+        None => row.to_vec(),
+    }
 }
 
 /// One row replaced by another, running every check a written row runs.

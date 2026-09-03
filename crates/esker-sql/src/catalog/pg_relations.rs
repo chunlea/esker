@@ -263,6 +263,10 @@ fn load_table<'a>(
         };
         let mut table = super::record::decode_table(&bytes)?;
         table.sequences = crate::catalog::table_sequences(txn, tenant, table_id)?;
+        let inherited =
+            crate::catalog::inherited_sequences(txn, tenant, &table, &table.parents.clone())?;
+        table.sequences.extend(inherited);
+        table.child_scans = crate::catalog::child_scans(txn, tenant, &table)?;
         slot.insert(table);
     }
     tables
@@ -276,7 +280,7 @@ fn load_table<'a>(
 /// `pg_type.oid` already makes and `tests/pg_catalog.rs` already declares. Saturating rather than
 /// wrapping: two relations sharing an oid is the failure this whole module exists to prevent, and
 /// a saturated one is at least visibly wrong.
-fn as_oid(id: u64) -> i64 {
+pub(super) fn as_oid(id: u64) -> i64 {
     i64::try_from(id).unwrap_or(i64::MAX)
 }
 

@@ -28,6 +28,11 @@ pub struct CreateTable {
     /// `<table>_pkey`. Carried rather than dropped: a constraint the user named is the name a
     /// `23505` will quote back at them.
     pub primary_key_name: Option<String>,
+    /// `INHERITS (parent, …)` — the parents' names, in the order written, unresolved.
+    ///
+    /// Resolved by the executor, which is where the catalog is: a parent's columns are prepended
+    /// to this table's own and cannot be known until it has been read.
+    pub inherits: Vec<String>,
     /// Every `UNIQUE` constraint, from a column option or a table constraint.
     pub unique: Vec<UniqueConstraint>,
     /// Every `CHECK`, named the way PostgreSQL names one: as written, or

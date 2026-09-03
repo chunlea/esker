@@ -573,7 +573,7 @@ pub const SEQUENCE_BATCH: u64 = 32;
 pub const DERIVED_TABLE_ID: u64 = u64::MAX - 1024;
 
 /// A table, its columns, its primary key and its indexes — everything needed to write a row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TableDef {
     /// From the tenant's relation-id sequence. Part of every key of every row.
     pub id: u64,
@@ -639,6 +639,41 @@ pub struct TableDef {
     /// referenced row be deleted, and neither does the other's job. Measured on PostgreSQL 19, all
     /// four combinations ([`crate::plan::AlterTableAction::SetTriggersDisabled`]).
     pub triggers_disabled: bool,
+    /// The tables this one **inherits from**, in the order written, and the tables that inherit
+    /// **from** it.
+    ///
+    /// Both directions are stored because both are asked in O(1) and by different callers: a scan
+    /// of a parent needs its children, and `pg_inherits` and the column merge need a child's
+    /// parents. They are one edge written twice, always in the same transaction — a child's
+    /// `CREATE TABLE` appends to its parents' lists, and `DROP TABLE` removes it from them.
+    ///
+    /// **Inheritance is a read rule, not only a DDL one.** A `SELECT`, an `UPDATE` and a `DELETE`
+    /// on a parent all reach the rows in `children`; a node that copied the columns and stopped
+    /// would answer about half a table.
+    pub parents: Vec<u64>,
+    /// See [`TableDef::parents`].
+    pub children: Vec<u64>,
+    /// How to read each child's rows **as this table's**, filled where the table is loaded.
+    ///
+    /// Derived rather than stored, exactly as [`TableDef::sequences`] is: a scan of a parent
+    /// returns its children's rows too, and the planner has no catalog in reach to work out how.
+    /// A record decoded straight from bytes therefore has none.
+    pub child_scans: Vec<ChildScan>,
+}
+
+/// One child table, seen from its parent: where its rows are and how they line up.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChildScan {
+    /// The child's own id, for the key range its rows are in.
+    pub table_id: u64,
+    /// The child's own row schema — what its bytes decode as, which is **not** the parent's: a
+    /// child with no primary key carries an internal row id the parent may not have.
+    pub schema: crate::row::RowSchema,
+    /// For each of the parent's columns in order, where that column sits in a child's row.
+    ///
+    /// By name rather than by position, because the two differ the moment a child has a row id
+    /// the parent does not, or a column of its own.
+    pub project: Vec<usize>,
 }
 
 /// One `FOREIGN KEY` constraint, held by the **child** — the table whose rows must point at
@@ -1168,6 +1203,10 @@ impl View<'_> {
         // The sequences are a second read, and this is the one place it happens: a `TableDef` in
         // anybody's hands has them, so nothing above the catalog has to remember to ask.
         table.sequences = table_sequences(self.txn, self.tenant, table_id)?;
+        // And the parents' — see `inherited_sequences` for why the record stays theirs.
+        let inherited = inherited_sequences(self.txn, self.tenant, &table, &table.parents.clone())?;
+        table.sequences.extend(inherited);
+        table.child_scans = child_scans(self.txn, self.tenant, &table)?;
         let table = Arc::new(table);
         if let Some(cache) = cache {
             cache.lock().tables.insert(key, Arc::clone(&table));
@@ -1757,6 +1796,85 @@ pub fn sequence_by_id(
     record::decode_sequence(&bytes, table_id, key_column).map(Some)
 }
 
+/// How each of this table's children lines up with it, for a scan that has to return both.
+///
+/// One record read per child and no further: the children are decoded directly rather than
+/// through the caching loader, so loading a parent cannot walk into loading its parents again.
+pub(super) fn child_scans(txn: &dyn Txn, tenant: u64, table: &TableDef) -> Result<Vec<ChildScan>> {
+    let mut scans = Vec::with_capacity(table.children.len());
+    for &child_id in &table.children {
+        let Some(bytes) = txn.get(&record::table_key(tenant, child_id))? else {
+            continue;
+        };
+        let child = record::decode_table(&bytes)?;
+        // Every one of this table's columns, found in the child by name. A child that somehow
+        // lacks one is skipped rather than guessed at: a projection with a wrong position in it
+        // would return another column's values under this one's name.
+        let mut project = Vec::with_capacity(table.columns.len());
+        for column in &table.columns {
+            let Some(at) = child.column(&column.name) else {
+                project.clear();
+                break;
+            };
+            project.push(at);
+        }
+        if project.len() != table.columns.len() {
+            continue;
+        }
+        scans.push(ChildScan {
+            table_id: child_id,
+            schema: child.row_schema(),
+            project,
+        });
+    }
+    Ok(scans)
+}
+
+/// A child's inherited sequences: the ones filling a parent's column, remapped to this table's
+/// own ordinals.
+///
+/// **The child draws from the parent's counter, not from one of its own.** Measured: `ic`'s `id`
+/// defaults to `nextval('ip_id_seq'::regclass)`, the parent's, so rows inserted through either
+/// table take numbers from the same sequence and cannot collide. Copying the *record* would give
+/// the child a second counter and two rows the same id.
+///
+/// The record stays the parent's — `SequenceDef::table_id` is untouched — so `DROP SEQUENCE` still
+/// reports the parent's column as the dependent and the child cannot drop what it borrowed. Only
+/// the in-memory list a `TableDef` carries gains an entry, which is what the writer reads to fill
+/// a column and what `pg_attrdef` reads to print the default.
+pub(super) fn inherited_sequences(
+    txn: &dyn Txn,
+    tenant: u64,
+    table: &TableDef,
+    parents: &[u64],
+) -> Result<Vec<SequenceDef>> {
+    let mut inherited = Vec::new();
+    for &parent_id in parents {
+        let Some(bytes) = txn.get(&record::table_key(tenant, parent_id))? else {
+            continue;
+        };
+        let parent = record::decode_table(&bytes)?;
+        for sequence in table_sequences(txn, tenant, parent_id)? {
+            let Some(at) = sequence.column else {
+                continue;
+            };
+            // By **name**, because the child's ordinals are its own: a child with no primary key
+            // carries an internal row id at position 0 and every inherited column sits one later.
+            let Some(name) = parent.columns.get(at).map(|column| &column.name) else {
+                continue;
+            };
+            let Some(mine) = table.column(name) else {
+                continue;
+            };
+            inherited.push(SequenceDef {
+                column: Some(mine),
+                ..sequence
+            });
+        }
+    }
+    Ok(inherited)
+}
+
 /// Every sequence one table owns, in column order.
 ///
 /// A short scan of one prefix rather than a read per column: a table with no sequences costs one
@@ -1970,6 +2088,9 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             triggers_disabled: false,
+            parents: Vec::new(),
+            children: Vec::new(),
+            child_scans: Vec::new(),
         }
     }
 
@@ -1994,7 +2115,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "0f",               // catalog format version
+                "10",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -2087,7 +2208,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "0f",       // catalog format version
+                "10",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -2120,7 +2241,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "0f",                 // catalog format version
+                "10",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -2166,6 +2287,10 @@ mod tests {
                 // stays an expression, which is what the two `no DEFAULT` bytes above already
                 // said. The section is written even so, because a reader takes the sections in
                 // version order and a missing one would be read as the next field's bytes.
+                "00",
+                "00",
+                // Version 16. No parents and no children: this table inherits from nothing and
+                // nothing inherits from it, which is every table until `INHERITS` runs.
                 "00",
                 "00",
             )
@@ -3124,7 +3249,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "0f",               // catalog format version
+                "10",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

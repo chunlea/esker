@@ -1,0 +1,47 @@
+# `CREATE TABLE … INHERITS (parent)`, against PostgreSQL 19beta1 — statement 762 of
+# `postgresql_specific_schema.rb`.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **Inheritance is a read rule, not just a DDL one.** `SELECT … FROM parent` returns the
+#     child's rows too, and so does `UPDATE parent …` and `DELETE FROM parent …`. `ONLY parent`
+#     is the spelling that excludes them. A node that copied the columns and stopped would answer
+#     `1` where a real server answers `2` — a wrong answer, not a missing feature, which is why
+#     the DDL cannot land without the scans.
+#   * **The child inherits defaults, including the parent's sequence.** `ic`'s `id` defaults to
+#     `nextval('ip_id_seq'::regclass)` — the *parent's* counter, not one of its own — so rows
+#     inserted through either table draw from the same sequence and cannot collide.
+#   * **It does not inherit indexes or the primary key.** `pg_index` for the child is empty, so
+#     the uniqueness the parent's key promises does not hold across the pair.
+#   * **A child's own columns come after the inherited ones**, whatever order they were written in.
+#   * **Dropping the parent is `2BP01`**, naming the child as the dependent object.
+#   * A column redeclared with a different type is `42804`, and it carries **two** `DETAIL` lines.
+CREATE TABLE ip (id serial primary key, number integer NOT NULL DEFAULT 7, tag text)		-
+CREATE TABLE ic ( ) INHERITS (ip)		-
+SELECT attname, atttypid::regtype::text, attnotnull FROM pg_attribute WHERE attrelid = 'ic'::regclass AND attnum > 0 ORDER BY attnum	name,text,boolean	id|integer|t ; number|integer|t ; tag|text|f
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = 'ic'::regclass ORDER BY a.attnum	text	nextval('ip_id_seq'::regclass) ; 7
+SELECT 'g', count(*) FROM pg_index WHERE indrelid = 'ic'::regclass	text,bigint	g|0
+SELECT 'g', count(*) FROM pg_constraint WHERE conrelid = 'ic'::regclass	text,bigint	g|2
+SELECT c.relname, p.relname, i.inhseqno FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid JOIN pg_class p ON p.oid = i.inhparent WHERE c.relname = 'ic'	name,name,integer	ic|ip|1
+INSERT INTO ic (number, tag) VALUES (1, 'child')		-
+INSERT INTO ip (number, tag) VALUES (2, 'parent')		-
+SELECT 'g', count(*) FROM ip	text,bigint	g|2
+SELECT 'g', count(*) FROM ic	text,bigint	g|1
+SELECT tag FROM ip ORDER BY tag	text	child ; parent
+SELECT tag FROM ONLY ip ORDER BY tag	text	parent
+INSERT INTO ic (tag) VALUES ('dflt')		-
+SELECT 'g', number FROM ic WHERE tag = 'dflt'	text,integer	g|7
+SELECT 'g', id FROM ic WHERE tag = 'child'	text,integer	g|1
+UPDATE ip SET tag = 'touched' WHERE tag = 'child'		-
+SELECT 'g', tag FROM ic WHERE number = 1	text,text	g|touched
+DELETE FROM ip WHERE tag = 'touched'		-
+SELECT 'g', count(*) FROM ic	text,bigint	g|1
+DROP TABLE ip	!2BP01 cannot drop table ip because other objects depend on it DETAIL: table ic depends on table ip HINT: Use DROP ... CASCADE to drop the dependent objects too.
+CREATE TABLE ic2 (extra text) INHERITS (ip)		-
+SELECT attname FROM pg_attribute WHERE attrelid = 'ic2'::regclass AND attnum > 0 ORDER BY attnum	name	id ; number ; tag ; extra
+CREATE TABLE ic3 ( ) INHERITS (nosuchtable)	!42P01 relation "nosuchtable" does not exist
+CREATE TABLE ic4 (number text) INHERITS (ip)	!42804 column "number" has a type conflict DETAIL: User-specified column moved to the position of the inherited column. DETAIL: integer versus text
