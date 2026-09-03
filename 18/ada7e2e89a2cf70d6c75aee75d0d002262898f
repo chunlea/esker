@@ -1,0 +1,21 @@
+crates/esker-client/tests/chaos_cluster/mod.rs
+  s_188859e919bef5::t_1d5a02fe687be6 46-48,53-67,79-83,95,128-130,132-140
+crates/esker-client/tests/txn_cluster/mod.rs
+  s_188859e919bef5::t_d161c26c99742a 201-206,219-223,243,307-312,314-323,468-475,477-481,485-509
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "18ada7e2e89a2cf70d6c75aee75d0d002262898f",
+  "prompts": {},
+  "sessions": {
+    "s_188859e919bef5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5b0a7ebb-6297-4871-91b4-2650c25d6c33",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
