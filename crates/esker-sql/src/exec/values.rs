@@ -49,6 +49,7 @@ pub(super) fn def(entry: &TableRef) -> Result<Arc<TableDef>> {
             missing: None,
             generated: None,
             comment: None,
+            dropped: false,
         })
         .collect();
     Ok(Arc::new(TableDef {

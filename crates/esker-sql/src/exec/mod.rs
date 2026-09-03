@@ -1209,15 +1209,24 @@ impl Executor {
         if written.unique_keys.is_empty() {
             return error;
         }
+        // **Only a key this statement *added* can be a duplicate.** One it removed and put back is
+        // an entry the row already owned, so a race on it is the row-level conflict it looks like
+        // (`Written::rewritten`, which carries the argument and the wrong answer it fixes).
+        let added = |unique: &Unique| !written.rewritten.contains(&unique.key);
 
         if let Some(lost) = key {
-            return match written.unique_keys.iter().find(|it| &it.key == lost) {
+            return match written
+                .unique_keys
+                .iter()
+                .filter(|it| added(it))
+                .find(|it| &it.key == lost)
+            {
                 Some(unique) => SqlError::UniqueViolation {
                     constraint: unique.constraint.clone(),
                     key: Some(unique.detail.clone()),
                 },
-                // A key this transaction wrote that is not one of its unique index entries: an
-                // ordinary row-level race, and still retryable.
+                // A key this transaction wrote that is not one of its *new* unique index entries:
+                // an ordinary row-level race, and still retryable.
                 None => error,
             };
         }
@@ -1227,7 +1236,7 @@ impl Executor {
         let Ok(txn) = self.backend.begin() else {
             return error;
         };
-        for unique in &written.unique_keys {
+        for unique in written.unique_keys.iter().filter(|it| added(it)) {
             if matches!(txn.get(&unique.key), Ok(Some(_))) {
                 return SqlError::UniqueViolation {
                     constraint: unique.constraint.clone(),
@@ -1692,6 +1701,21 @@ pub(crate) fn for_each_page(
 pub(crate) struct Written {
     /// Unique index entries, with what to say if one of them turns out to have been taken.
     pub(crate) unique_keys: Vec<Unique>,
+    /// Keys this statement **removed before putting them back** — the entries a rewritten row
+    /// already owned.
+    ///
+    /// **A key a row already had cannot be a duplicate of itself.** An `UPDATE` deletes the old
+    /// row's entries and writes the new row's, so an `UPDATE` that leaves a unique column alone
+    /// re-puts the same key and records it in `unique_keys` exactly as an `INSERT` of a new key
+    /// would. Without this list, two sessions updating one row's *unrelated* column ended with
+    /// the loser told `23505 duplicate key value violates unique constraint "t_pkey"` about a
+    /// primary key neither of them changed — a wrong answer, not a divergence: PostgreSQL never
+    /// says that, and `ActiveRecord` maps it to `RecordNotUnique` where the truth is a retryable
+    /// serialization failure.
+    ///
+    /// A key the statement **moved** — an `UPDATE` that sets a unique column to a value another
+    /// row holds — is not in here, so it is still the `23505` it should be.
+    pub(crate) rewritten: Vec<Vec<u8>>,
 }
 
 /// One unique index entry this transaction wrote, and the error it becomes if it lost the race.
@@ -1856,6 +1880,17 @@ fn described(columns: Vec<(String, ColumnType, i32)>) -> Vec<FieldDescription> {
 }
 
 impl Execute for Executor {
+    /// What this session set, or the boot value — which is `0`, meaning no limit.
+    ///
+    /// Read through `Executor::parameter` — a private method, so this is a code span rather than
+    /// a link — instead of from the map directly, so that a session
+    /// that never set it gets the same answer as one that reset it.
+    fn idle_in_transaction_timeout(&self) -> Option<std::time::Duration> {
+        let parameter = crate::parameter::lookup("idle_in_transaction_session_timeout").ok()?;
+        crate::parameter::duration_ms(&self.parameter(parameter))
+            .map(std::time::Duration::from_millis)
+    }
+
     fn execute(&mut self, parsed: &Parsed, params: &Params<'_>) -> Result<Outcome> {
         // **Before lowering**, because the statement the parser was given is a placeholder: what
         // the user wrote is on the class (`crate::parse::StatementClass::SetConstraints`).

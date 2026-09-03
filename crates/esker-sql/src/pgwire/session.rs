@@ -146,7 +146,6 @@ pub trait Execute {
         Vec::new()
     }
 
-    /// Opens a transaction.
     /// Marks a point in the open block that `rollback_to` can return to.
     ///
     /// Names **stack**: two savepoints of one name are two marks, and `rollback_to` and `release`
@@ -184,6 +183,19 @@ pub trait Execute {
     /// Abandons the open transaction.
     fn rollback(&mut self) -> Result<()> {
         Ok(())
+    }
+
+    /// How long this session may sit **idle inside a transaction block** before the server ends
+    /// the connection, or `None` for no limit.
+    ///
+    /// It is on this trait rather than read from a parameter table by the connection, because the
+    /// value is a property of the *session* — a `SET` changes it mid-connection — and the executor
+    /// is what holds a session's settings. The connection is what owns the socket and therefore
+    /// the only place the wait can be bounded (`crate::pgwire::server::Connection::run`).
+    ///
+    /// `None` by default, which is right for an executor with no settings at all.
+    fn idle_in_transaction_timeout(&self) -> Option<std::time::Duration> {
+        None
     }
 }
 

@@ -25,6 +25,11 @@
 //!   *skipped* rather than refused, which is what makes the default `"$user", public` resolve to
 //!   `{public}`. `SHOW` gives the path as **set** and `current_schemas` gives it as **resolved**,
 //!   and the resolving is `crate::exec::Executor`'s, where the catalog is.
+//! * `statement_timeout` and `lock_timeout` are honoured **only at `0`**, which is what they
+//!   permanently are here: nothing cancels a running statement and nothing waits for a row lock,
+//!   so `SHOW` answering `0` is exact. A non-zero value is `0A000` naming the parameter — the one
+//!   entry in this table whose absence was measured as a *hang* rather than a wrong answer
+//!   (`tests/transaction_timeouts.rs`).
 //! * `max_identifier_length` is **read-only**, as it is on a real server — `55P02`, which is a
 //!   different answer from `42704` and means a different thing.
 //! * `esker.engine` is **this node's own** and is honoured in the strongest sense in this table: it
@@ -154,6 +159,25 @@ pub const PARAMETERS: &[Parameter] = &[
         values: Values::Duration,
         read_only: false,
     },
+    // **The two timeouts `adapters/postgresql/transaction_test.rb` sets**, and the reason that
+    // file hung run 47 for twenty minutes. Both were `42704` — the wrong sentence about a
+    // parameter a real server has — and both are here now so that `SHOW` can answer `0`, which is
+    // *true*: no statement here is cancelled by a clock and nothing here waits for a row lock, and
+    // `0` is PostgreSQL's own spelling of both. A non-zero value is refused by name in `honour`.
+    Parameter {
+        name: "statement_timeout",
+        reported: "statement_timeout",
+        boot: "0",
+        values: Values::Duration,
+        read_only: false,
+    },
+    Parameter {
+        name: "lock_timeout",
+        reported: "lock_timeout",
+        boot: "0",
+        values: Values::Duration,
+        read_only: false,
+    },
     Parameter {
         name: "geqo",
         reported: "geqo",
@@ -197,26 +221,110 @@ pub const PARAMETERS: &[Parameter] = &[
     },
 ];
 
-/// `10ms`, `2s`, `0` — a count and an optional unit, canonicalised.
+/// The unit every [`Values::Duration`] parameter in [`PARAMETERS`] is *stored* in.
 ///
-/// `None` for anything that is not one, which the caller turns into `22023`. **Zero loses its
-/// unit**: `SET … = '0ms'` and `SET … = 0` both read back `0`, measured, which is why this is not
-/// simply "trim and keep".
-fn normalise_duration(value: &str) -> Option<String> {
+/// PostgreSQL gives each such parameter a base unit and reports it separately as
+/// `pg_settings.unit`; all three here are `ms`, measured. A parameter whose base unit were
+/// seconds would have to carry it rather than read it from beside the function — there is none,
+/// so this is a constant and not a field.
+const DURATION_BASE_UNIT: &str = "ms";
+
+/// What PostgreSQL admits for the three duration parameters here: **a C `int` of base units**,
+/// and its own sentence quotes both ends. Measured, from the message itself —
+/// `-5000 ms is outside the valid range for parameter "statement_timeout" (0 ms .. 2147483647 ms)`.
+const DURATION_MAX: i64 = i32::MAX as i64;
+
+/// Every unit PostgreSQL accepts, **largest first**, as a fraction of [`DURATION_BASE_UNIT`].
+///
+/// The order is what makes re-printing work: a stored value is written in the first unit that
+/// divides it exactly, which is why `2000ms` reads back as `2s` and `120s` as `2min`. `us` is
+/// last and is deliberately *not* a printing unit — it is smaller than the base, so a value in it
+/// is converted away and never comes back (`1500us` reads back `2ms`, measured).
+const DURATION_UNITS: &[(&str, i64, i64)] = &[
+    ("d", 86_400_000, 1),
+    ("h", 3_600_000, 1),
+    ("min", 60_000, 1),
+    ("s", 1_000, 1),
+    ("ms", 1, 1),
+    ("us", 1, 1_000),
+];
+
+/// Why a duration value was refused. Three conditions, because **PostgreSQL gives them two
+/// different sentences** and a client can tell them apart.
+enum DurationRejection {
+    /// Not a count and a unit at all: `'banana'`. Quoted back as written.
+    NotADuration,
+    /// A count whose value in base units will not fit a C `int`: `'2147483648'`, `'25d'`.
+    /// PostgreSQL quotes it back with the *same* sentence as [`Self::NotADuration`] and separates
+    /// the two by a `HINT` alone — measured, and the reason this is not folded into that one.
+    ExceedsIntegerRange,
+    /// A count that fits and is outside what the parameter takes: `'-1'`, `'-5s'`. Here the
+    /// sentence names the range, and reports the value **converted to the base unit**: `'-5s'` is
+    /// reported as `-5000 ms`.
+    OutOfRange(i64),
+}
+
+/// `10ms`, `2s`, `0` — a count and an optional unit, **converted to the base unit and re-printed
+/// the way PostgreSQL prints one**.
+///
+/// Not "trim and keep", which is what this was and what three measurements refuted:
+///
+/// * **A bare count gains the base unit.** `SET … = '250'` reads back `250ms`, not `250` — and
+///   `pg_settings.unit` says `ms` beside it, so the two together do not say `250ms ms`.
+/// * **The value is re-printed in the largest unit that divides it exactly.** `'2000ms'` reads
+///   back `2s`, `'120s'` reads back `2min`, `'60min'` reads back `1h`. A node that echoed the
+///   unit it was given fails every test that compares a read-back against a literal.
+/// * **A count below the base unit is converted, rounding half to even.** `'1500us'` and
+///   `'2500us'` both read back `2ms`; `'3500us'` reads back `4ms`; `'500us'` reads back **`0`**,
+///   which is the spelling of *off*. That is `rint`, which is what PostgreSQL's own conversion
+///   uses, and it is why this rounds ties to even rather than up.
+///
+/// **Zero loses its unit** in every spelling: `'0ms'`, `'0s'` and `0` all read back `0`.
+///
+/// The count is parsed as a `f64` because PostgreSQL parses it with `strtod` and accepts a
+/// fraction — `'1.5s'` is `1500ms`, measured.
+fn normalise_duration(value: &str) -> std::result::Result<String, DurationRejection> {
     let trimmed = value.trim();
-    let digits = trimmed
-        .find(|c: char| !c.is_ascii_digit())
+    let split = trimmed
+        .find(|c: char| !matches!(c, '0'..='9' | '.' | '-' | '+' | 'e' | 'E'))
         .unwrap_or(trimmed.len());
-    let (count, unit) = trimmed.split_at(digits);
-    let count: u64 = count.parse().ok()?;
+    let (count, unit) = trimmed.split_at(split);
+    let count: f64 = count
+        .trim()
+        .parse()
+        .map_err(|_| DurationRejection::NotADuration)?;
+    if !count.is_finite() {
+        return Err(DurationRejection::NotADuration);
+    }
     let unit = unit.trim();
-    if !matches!(unit, "" | "us" | "ms" | "s" | "min" | "h" | "d") {
-        return None;
+    let (_, numerator, denominator) = *DURATION_UNITS
+        .iter()
+        .find(|(name, ..)| *name == unit || (unit.is_empty() && *name == DURATION_BASE_UNIT))
+        .ok_or(DurationRejection::NotADuration)?;
+
+    // `round_ties_even` **is** `rint`, and the tie is not hypothetical: `2500us` is exactly half a
+    // base unit away and PostgreSQL answers `2ms`, not `3ms`.
+    #[allow(clippy::cast_precision_loss)]
+    let scaled = (count * numerator as f64 / denominator as f64).round_ties_even();
+    #[allow(clippy::cast_precision_loss)]
+    if !(-(DURATION_MAX as f64) - 1.0..=DURATION_MAX as f64).contains(&scaled) {
+        return Err(DurationRejection::ExceedsIntegerRange);
     }
-    if count == 0 {
-        return Some("0".to_owned());
+    #[allow(clippy::cast_possible_truncation)]
+    let base = scaled as i64;
+    if base < 0 {
+        return Err(DurationRejection::OutOfRange(base));
     }
-    Some(format!("{count}{unit}"))
+    if base == 0 {
+        return Ok("0".to_owned());
+    }
+    // `ms` has a numerator of 1 and divides everything, so this always finds a unit; `us` is never
+    // reached, which is what keeps a sub-base value from printing in a unit it was converted out of.
+    let (name, numerator, _) = DURATION_UNITS
+        .iter()
+        .find(|(_, numerator, denominator)| *denominator == 1 && base % *numerator == 0)
+        .unwrap_or(&("ms", 1, 1));
+    Ok(format!("{}{name}", base / numerator))
 }
 
 /// `'$user',public` → `"$user", public`.
@@ -286,12 +394,28 @@ impl Parameter {
             }
             // Read back exactly as written: a real server hands `Etc/UTC` back as `Etc/UTC`.
             Values::Free => Ok(value.to_owned()),
-            Values::Duration => {
-                normalise_duration(value).ok_or_else(|| SqlError::InvalidParameterValue {
+            // Three refusals rather than one, because PostgreSQL gives them two sentences: a
+            // value it cannot read and one whose magnitude will not fit are quoted back
+            // identically and separated by a `HINT` alone, while one that fits and is out of
+            // range names the range and reports itself **in the base unit**.
+            Values::Duration => normalise_duration(value).map_err(|rejection| match rejection {
+                DurationRejection::NotADuration => SqlError::InvalidParameterValue {
                     name: self.reported,
                     value: value.to_owned(),
-                })
-            }
+                },
+                DurationRejection::ExceedsIntegerRange => {
+                    SqlError::ParameterValueExceedsIntegerRange {
+                        name: self.reported,
+                        value: value.to_owned(),
+                    }
+                }
+                DurationRejection::OutOfRange(base) => SqlError::ParameterOutOfRange {
+                    value: format!("{base} {DURATION_BASE_UNIT}"),
+                    name: self.reported,
+                    low: format!("0 {DURATION_BASE_UNIT}"),
+                    high: format!("{DURATION_MAX} {DURATION_BASE_UNIT}"),
+                },
+            }),
             Values::NameList => Ok(normalise_name_list(value)),
         }
     }
@@ -311,6 +435,20 @@ impl Parameter {
             ("timezone", zone) if !is_utc(zone) => {
                 Err(SqlError::unsupported(format!("the time zone \"{zone}\"")))
             }
+            // **A timeout this node cannot enforce, and `0` is the one value it can.** Nothing
+            // here cancels a running statement — the executor runs one to completion on a
+            // blocking thread and no clock interrupts it — and nothing here waits for a row lock,
+            // because a Percolator prewrite that meets a live lock is `40001` after a bounded
+            // backoff rather than a wait. So there is no wait for `lock_timeout` to bound and no
+            // cancellation for `statement_timeout` to schedule.
+            //
+            // This is the one refusal in this table whose *absence* was measured as a hang rather
+            // than as a wrong answer: a client told it holds a 150 ms cancellation waits for one,
+            // and `adapters/postgresql/transaction_test.rb` waited twenty minutes. `0` is
+            // accepted because it asks for what is already the case.
+            ("statement_timeout" | "lock_timeout", value) if !is_no_timeout(value) => Err(
+                SqlError::unsupported(format!("a non-zero {} ({value})", self.reported)),
+            ),
             // **A `search_path` is not validated**, on a real server or here: an entry naming no
             // schema is *skipped* rather than refused, which is what makes the default
             // `"$user", public` mean `{public}`. `SHOW` gives the path as **set** and
@@ -321,6 +459,39 @@ impl Parameter {
             _ => Ok(()),
         }
     }
+}
+
+/// A stored [`Values::Duration`] as milliseconds, or `None` where it means "off".
+///
+/// The inverse of `normalise_duration` (private, so a code span rather than a link), and it
+/// reads **only what that function wrote**: a
+/// non-negative whole count in one of the five printing units, or a bare `0`. That is what lets
+/// it be this short — there is no fraction to round and no `us` to convert, because
+/// that function has already done both. `None` for `0`, which is PostgreSQL's spelling
+/// of "no limit", and `None` for a value that is not a duration at all, which a parameter of
+/// another kind would be.
+#[must_use]
+pub fn duration_ms(value: &str) -> Option<u64> {
+    let digits = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (count, unit) = value.split_at(digits);
+    let count: u64 = count.parse().ok()?;
+    let (_, numerator, _) = DURATION_UNITS.iter().find(|(name, _, denominator)| {
+        *denominator == 1 && (*name == unit || (unit.is_empty() && *name == DURATION_BASE_UNIT))
+    })?;
+    #[allow(clippy::cast_sign_loss)]
+    let scaled = count.checked_mul(*numerator as u64)?;
+    (scaled != 0).then_some(scaled)
+}
+
+/// Whether a duration means "no timeout", which is the only value the two timeouts can honour.
+///
+/// [`Values::Duration`] has already normalised the value, and its rule is that **zero loses its
+/// unit** — `'0ms'` and `0` both store `0` — so one comparison covers every spelling PostgreSQL
+/// accepts for off.
+fn is_no_timeout(value: &str) -> bool {
+    value == "0"
 }
 
 /// The spellings of UTC this node can print in. `Etc/UTC` is the same instant offset and reads

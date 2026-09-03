@@ -129,8 +129,12 @@ fn columns_of<'a>(
     table: &'a TableDef,
 ) -> Vec<(Cow<'a, ColumnDef>, Option<usize>)> {
     match relation.kind {
+        // **`all_user_columns`, not `user_columns`**: a tombstoned column keeps its `pg_attribute`
+        // row on a real server, and the adapter's own query is the one that filters it out
+        // (`AND NOT a.attisdropped`). Hiding it here would answer that query correctly and still
+        // be wrong — `attnum` would close over the gap, where PostgreSQL leaves it (ADR 0051).
         RelKind::Table => table
-            .user_columns()
+            .all_user_columns()
             .map(|(at, column)| (Cow::Borrowed(column), Some(at)))
             .collect(),
         RelKind::Index => relation
@@ -159,6 +163,7 @@ fn columns_of<'a>(
                                 missing: None,
                                 generated: None,
                                 comment: None,
+                                dropped: false,
                             }),
                             // No position in the table: there is no column under it, which is
                             // what `attnum = 0` says in `pg_index.indkey` for the same part.
@@ -196,6 +201,7 @@ fn columns_of<'a>(
                         missing: None,
                         generated: None,
                         comment: None,
+                        dropped: false,
                     }),
                     None,
                 )]
@@ -240,15 +246,30 @@ fn attribute(
         Some(Identity::Always) => "a",
     };
     let has_default = own
+        && !column.dropped
         && position.is_some_and(|at| default_expression(column, table, at).is_some())
         && identity == NOT_IDENTITY;
+    // **A tombstone answers about itself, not about the column it was.** Measured on 19beta1:
+    // the name becomes `........pg.dropped.N........` with the attnum in it, `atttypid` becomes
+    // `0`, and `attnotnull` is **reset** to false — while `attlen` is retained, which is why the
+    // type is still the column's everywhere the codec reads it and only this view says `0`.
+    let name = if column.dropped {
+        format!("........pg.dropped.{attnum}........")
+    } else {
+        column.name.clone()
+    };
+    let type_oid = if column.dropped {
+        0
+    } else {
+        i64::from(column.ty.oid())
+    };
     vec![
         Datum::Int8(relation.oid),
-        Datum::Text(column.name.clone()),
-        Datum::Int8(i64::from(column.ty.oid())),
+        Datum::Text(name),
+        Datum::Int8(type_oid),
         Datum::Int2(i16::try_from(attnum).unwrap_or(i16::MAX)),
         Datum::Int4(column.typmod),
-        Datum::Bool(own && column.not_null),
+        Datum::Bool(own && column.not_null && !column.dropped),
         Datum::Bool(has_default),
         Datum::Text(identity.to_owned()),
         // **`s` for a stored generated column**, one character, and the empty string for every
@@ -262,8 +283,7 @@ fn attribute(
             }
             .to_owned(),
         ),
-        // Nothing can drop a column yet, so no column is dropped.
-        Datum::Bool(false),
+        Datum::Bool(column.dropped),
         Datum::Int8(NO_COLLATION),
     ]
 }
