@@ -361,6 +361,102 @@ pub(super) fn create_extension(
     done
 }
 
+/// `DROP SEQUENCE [IF EXISTS] s [, …] [CASCADE | RESTRICT]`.
+///
+/// **`RESTRICT` and no clause at all are the same statement**, and both refuse: a sequence a
+/// column's default depends on is `2BP01`, with a `DETAIL` naming the **column** and the table and
+/// the same `Use DROP ... CASCADE` hint a dependent table gets. Measured, both spellings.
+///
+/// `CASCADE` takes the default with the sequence and **leaves the column**: the default *is* the
+/// sequence here, so deleting the record removes both facts and nothing else — the rows stay and
+/// the column still takes a value.
+pub(super) fn drop_sequence(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    drop: &plan::DropSequence,
+) -> Result<Outcome> {
+    // **Every name is resolved before any of them is dropped**, because the statement is
+    // all-or-nothing: `DROP SEQUENCE a, b` with `b` absent drops neither, measured. Dropping as
+    // the loop walked the list would take `a` and then fail, leaving a statement that reported an
+    // error and changed the database anyway.
+    let mut targets = Vec::with_capacity(drop.names.len());
+    for name in &drop.names {
+        let (table_id, column) = match existing_relation(executor, txn, name)? {
+            Some(catalog::Relation::Sequence { table_id, column }) => (table_id, column),
+            // The name resolves and is the wrong kind, which is `42809` and not `42P01`: the
+            // `HINT` says which verb would have worked. A `DROP TABLE` over a sequence gets the
+            // mirror of this.
+            Some(catalog::Relation::Table { .. }) => {
+                return Err(SqlError::WrongObjectType {
+                    name: name.clone(),
+                    expected: "a sequence",
+                    found: "DROP TABLE",
+                });
+            }
+            Some(catalog::Relation::Index { .. } | catalog::Relation::PrimaryKey { .. }) => {
+                return Err(SqlError::WrongObjectType {
+                    name: name.clone(),
+                    expected: "a sequence",
+                    found: "DROP INDEX",
+                });
+            }
+            None => {
+                if drop.if_exists {
+                    executor.notice(SqlError::DoesNotExistSkipping {
+                        kind: "sequence",
+                        name: name.clone(),
+                    });
+                    continue;
+                }
+                return Err(SqlError::UndefinedSequenceForDrop(name.clone()));
+            }
+        };
+        let table = executor.table_by_id(txn, table_id)?;
+        let Some(sequence) = table
+            .sequences
+            .iter()
+            .find(|sequence| sequence.column == column)
+        else {
+            continue;
+        };
+        targets.push((name, (*table).clone(), sequence.clone()));
+    }
+
+    // **Existence for every name first, dependencies after** — which is the order a real server
+    // reports in and not an implementation detail: `DROP SEQUENCE a, b` where `a` has a dependent
+    // default and `b` does not exist answers `42P01` about `b`, not `2BP01` about `a`. Checking
+    // each name's dependency as the first loop reached it named the wrong one.
+    for (name, table, sequence) in &targets {
+        // The column's default is this sequence, so dropping it without `CASCADE` is the same
+        // refusal a referenced table gets — and the `DETAIL` names the column, which is what tells
+        // a reader *which* default is in the way.
+        if !drop.cascade {
+            return Err(SqlError::DependentSequence {
+                sequence: (*name).clone(),
+                column: table.columns[sequence.column].name.clone(),
+                table: table.name.clone(),
+            });
+        }
+    }
+
+    for (_, table, sequence) in targets {
+        catalog::drop_sequence(txn, executor.tenant, table.id, &sequence);
+        // **The table record is rewritten and its schema version bumped**, and without that the
+        // drop is invisible: a `TableDef` is cached per node and keyed by this version, the
+        // sequence records live beside the table rather than in it, and deleting them left every
+        // reader still holding a definition that says the column has a sequence. The next `INSERT`
+        // then filled the column from a counter that had been dropped — reported success, and the
+        // corpus caught it on the `23502` that should have followed.
+        let mut updated = table.clone();
+        updated.schema_version += 1;
+        updated
+            .sequences
+            .retain(|kept| kept.column != sequence.column);
+        catalog::replace_table(txn, executor.tenant, &table, &updated)?;
+    }
+    Ok(Outcome::done("DROP SEQUENCE"))
+}
+
 /// `ALTER TABLE … ENABLE`/`DISABLE TRIGGER ALL`.
 ///
 /// One flag on the table, written the way every other constraint change is written — and it

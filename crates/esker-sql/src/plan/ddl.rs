@@ -100,6 +100,20 @@ pub struct CreateExtension {
     pub if_not_exists: bool,
 }
 
+/// `DROP SEQUENCE [IF EXISTS] s [, …] [CASCADE | RESTRICT]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropSequence {
+    /// One or more, folded. PostgreSQL takes a list.
+    pub names: Vec<String>,
+    /// `IF EXISTS`: a missing sequence is a notice rather than a `42P01`.
+    pub if_exists: bool,
+    /// `CASCADE`: take the column default that depends on it too, instead of refusing.
+    ///
+    /// `RESTRICT` is the default and the same statement as writing nothing — measured, both are
+    /// `2BP01` with the same `DETAIL` and the same `HINT`.
+    pub cascade: bool,
+}
+
 /// `DROP TABLE`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropTable {

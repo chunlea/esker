@@ -32,8 +32,8 @@ pub use crate::catalog::Identity;
 pub use crate::catalog::pg_catalog::CatalogView;
 pub use ddl::{
     AlterTable, AlterTableAction, Column, CreateExtension, CreateIndex, CreateTable, DropIndex,
-    DropTable, ForeignKey, IndexKeyPart, KeyPartName, UniqueConstraint, foreign_key_name,
-    index_name, primary_key_name, sequence_name, unique_constraint_name,
+    DropSequence, DropTable, ForeignKey, IndexKeyPart, KeyPartName, UniqueConstraint,
+    foreign_key_name, index_name, primary_key_name, sequence_name, unique_constraint_name,
 };
 pub use dml::{Delete, Insert, Returning, Update};
 pub use expr::{
@@ -63,6 +63,9 @@ pub enum Statement {
     CreateTable(CreateTable),
     /// `DROP TABLE`.
     DropTable(DropTable),
+    /// `DROP SEQUENCE [IF EXISTS] s [CASCADE]` — the sequence, its name, its counter, and the
+    /// column default that *is* it.
+    DropSequence(DropSequence),
     /// `CREATE EXTENSION [IF NOT EXISTS] name` — a catalog write and nothing else here: it records
     /// that the extension is installed, and what an extension *carries* is either already in this
     /// build or is why the name is not available.
@@ -151,6 +154,7 @@ impl Statement {
             Statement::CreateTable(_) => Some("CREATE TABLE"),
             // A catalog write like the rest, so a read-only or time-travelling block refuses it.
             Statement::CreateExtension(_) => Some("CREATE EXTENSION"),
+            Statement::DropSequence(_) => Some("DROP SEQUENCE"),
             Statement::DropTable(_) => Some("DROP TABLE"),
             Statement::CreateIndex(_) => Some("CREATE INDEX"),
             Statement::DropIndex(_) => Some("DROP INDEX"),
@@ -186,6 +190,7 @@ impl Statement {
             Statement::CreateTable(_) => "CREATE TABLE",
             Statement::CreateExtension(_) => "CREATE EXTENSION",
             Statement::DropTable(_) => "DROP TABLE",
+            Statement::DropSequence(_) => "DROP SEQUENCE",
             Statement::CreateIndex(_) => "CREATE INDEX",
             Statement::DropIndex(_) => "DROP INDEX",
             Statement::AlterTable(_) => "ALTER TABLE",

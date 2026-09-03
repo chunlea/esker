@@ -1712,6 +1712,19 @@ pub fn table_sequences(txn: &dyn Txn, tenant: u64, table_id: u64) -> Result<Vec<
     Ok(out)
 }
 
+/// Removes **one** sequence: its record, its name and its counter.
+///
+/// The column's default goes with it and nothing else does, because the default *is* the sequence
+/// — `pg_attrdef` reports one for a column that owns a `nextval` and nothing for a column that
+/// does not, so deleting the record removes both facts at once. Measured: after
+/// `DROP SEQUENCE … CASCADE` a real server has no `pg_attrdef` row for the table and the column is
+/// still there.
+pub fn drop_sequence(txn: &mut dyn Txn, tenant: u64, table_id: u64, sequence: &SequenceDef) {
+    txn.delete(&record::sequence_key(tenant, table_id, sequence.column));
+    txn.delete(&record::name_key(tenant, &sequence.name));
+    txn.delete(&record::sequence_value_key(tenant, sequence.id));
+}
+
 /// Removes one table's sequences: their records, their names and their counters.
 fn drop_sequences(txn: &mut dyn Txn, tenant: u64, table: &TableDef) {
     for sequence in &table.sequences {

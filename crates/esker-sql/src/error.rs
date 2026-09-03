@@ -156,6 +156,29 @@ pub enum SqlError {
     #[error("table \"{0}\" does not exist")]
     UndefinedTableForDrop(String),
 
+    /// `DROP SEQUENCE` naming nothing: `42P01`, and it says **`sequence`** rather than `relation`.
+    ///
+    /// The message names the kind the verb asked for, the way the table one does — a name that
+    /// resolves to the *wrong* kind is `42809` instead, with a `HINT` naming the verb that would
+    /// have worked.
+    #[error("sequence \"{0}\" does not exist")]
+    UndefinedSequenceForDrop(String),
+
+    /// `DROP SEQUENCE` on a sequence a column's default depends on: `2BP01`.
+    ///
+    /// The `DETAIL` names the **column** and not just the table, which is what tells a reader
+    /// which default is in the way. `RESTRICT` and no clause at all get this identically —
+    /// measured, both.
+    #[error("cannot drop sequence {sequence} because other objects depend on it")]
+    DependentSequence {
+        /// The sequence named.
+        sequence: String,
+        /// The column whose default is it.
+        column: String,
+        /// That column's table.
+        table: String,
+    },
+
     /// `ALTER TABLE t DISABLE TRIGGER x` naming a trigger that is not there.
     ///
     /// `42704 undefined_object`, and PostgreSQL names **both** the trigger and the table it looked
@@ -1183,6 +1206,7 @@ impl SqlError {
             SqlError::StatementTooComplex => sqlstate::STATEMENT_TOO_COMPLEX,
             SqlError::UndefinedTable(_)
             | SqlError::UndefinedTableForDrop(_)
+            | SqlError::UndefinedSequenceForDrop(_)
             | SqlError::MissingFromEntry(_)
             | SqlError::ForwardCteReference(_)
             | SqlError::InvalidFromReference { .. } => sqlstate::UNDEFINED_TABLE,
@@ -1279,7 +1303,9 @@ impl SqlError {
                 sqlstate::FOREIGN_KEY_VIOLATION
             }
             SqlError::NoUniqueConstraintForReference(_) => sqlstate::INVALID_FOREIGN_KEY,
-            SqlError::DependentObjectsStillExist { .. } | SqlError::DependentTable { .. } => {
+            SqlError::DependentObjectsStillExist { .. }
+            | SqlError::DependentTable { .. }
+            | SqlError::DependentSequence { .. } => {
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST
             }
             SqlError::DuplicateConstraint { .. } | SqlError::DuplicateExtension(_) => {
@@ -1359,6 +1385,17 @@ impl SqlError {
             | SqlError::ForeignKeyViolation { detail, .. }
             | SqlError::ForeignKeyStillReferenced { detail, .. }
             | SqlError::DependentTable { detail, .. } => Some(detail.clone()),
+            // **A `DETAIL`, not a `HINT`** — it was written into `hint` when this variant landed,
+            // which put PostgreSQL's `DETAIL` sentence after `HINT:` and left the real hint
+            // unreachable behind it. The corpus caught it: a client reading `DETAIL` to find which
+            // default is in the way would have found nothing.
+            SqlError::DependentSequence {
+                sequence,
+                column,
+                table,
+            } => Some(format!(
+                "default value for column {column} of table {table} depends on sequence {sequence}"
+            )),
             SqlError::UndefinedOperator { .. } => {
                 Some("No operator of that name accepts the given argument types.".to_owned())
             }
@@ -1430,7 +1467,7 @@ impl SqlError {
             // and it is still the right sentence: it is what a real server says, and it is what
             // the user has to write once that unit lands. Saying something else would send them
             // looking for a different fix.
-            SqlError::DependentTable { .. } => {
+            SqlError::DependentTable { .. } | SqlError::DependentSequence { .. } => {
                 Some("Use DROP ... CASCADE to drop the dependent objects too.".to_owned())
             }
             SqlError::WrongObjectType {

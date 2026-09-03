@@ -1,0 +1,44 @@
+# `DROP SEQUENCE`, against PostgreSQL 19beta1 — statement 753 of `postgresql_specific_schema.rb`.
+#
+# The suite's own line is `DROP SEQUENCE IF EXISTS companies_nonstd_seq CASCADE` against a sequence
+# that does not exist, which is a plain success. Everything else here is the family around it,
+# because a node that took the easy line and guessed the rest would guess several of them wrong.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`CASCADE` drops the column's *default*, not the column.** After
+#     `DROP SEQUENCE t_id_seq CASCADE` the `bigserial` column is still there and still `NOT NULL`,
+#     with nothing to fill it — so the next ordinary `INSERT` is `23502`, naming a column the user
+#     never mentioned. `pg_attrdef` loses its row; `pg_attribute` keeps its own.
+#   * **A `bigserial`'s sequence cannot be dropped while it is the column's default**, and the
+#     refusal is `2BP01` with a `DETAIL` naming the column *and* the table it is in — not `42P01`
+#     and not a silent success.
+#   * **`IF EXISTS` covers absence and nothing else.** It is a success on a name that was never
+#     there and does not touch the `2BP01` above, exactly as it does not cover availability for
+#     `CREATE EXTENSION`.
+#   * **Dropping a table with `DROP SEQUENCE` is `42809`, not `42P01`** — "is not a sequence",
+#     with a HINT naming the statement that would work. The relation was found; it is the wrong
+#     kind, and reporting it as missing would send a user looking for the wrong bug.
+#   * **A list is all-or-nothing**: `DROP SEQUENCE a, b` with `b` absent drops neither.
+DROP SEQUENCE nosuchseq	!42P01 sequence "nosuchseq" does not exist
+DROP SEQUENCE IF EXISTS nosuchseq		-
+DROP SEQUENCE IF EXISTS nosuchseq CASCADE		-
+CREATE TABLE seqco (id bigserial primary key, name text)		-
+SELECT relname, relkind FROM pg_class WHERE relname = 'seqco_id_seq'	name,"char"	seqco_id_seq|S
+DROP SEQUENCE seqco_id_seq	!2BP01 cannot drop sequence seqco_id_seq because other objects depend on it DETAIL: default value for column id of table seqco depends on sequence seqco_id_seq HINT: Use DROP ... CASCADE to drop the dependent objects too.
+DROP SEQUENCE seqco_id_seq CASCADE		-
+SELECT 'g', count(*) FROM pg_class WHERE relname = 'seqco_id_seq'	text,bigint	g|0
+SELECT 'g', count(*) FROM pg_attrdef WHERE adrelid = 'seqco'::regclass	text,bigint	g|0
+INSERT INTO seqco (name) VALUES ('a')	!23502 null value in column "id" of relation "seqco" violates not-null constraint DETAIL: Failing row contains (null, a).
+SELECT 'g', id, name FROM seqco	text,bigint,text	-
+CREATE SEQUENCE seqfree		-
+DROP SEQUENCE seqfree		-
+SELECT 'g', count(*) FROM pg_class WHERE relname = 'seqfree'	text,bigint	g|0
+DROP SEQUENCE seqco	!42809 "seqco" is not a sequence HINT: Use DROP TABLE to remove a table.
+DROP TABLE seqco_id_seq	!42P01 table "seqco_id_seq" does not exist
+CREATE TABLE seqt2 (id bigserial primary key)		-
+DROP SEQUENCE seqt2_id_seq, nosuchseq	!42P01 sequence "nosuchseq" does not exist

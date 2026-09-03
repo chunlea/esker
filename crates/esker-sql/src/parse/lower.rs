@@ -118,6 +118,11 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
                     if_exists: *if_exists,
                     cascade: *cascade,
                 }),
+                ObjectType::Sequence => plan::Statement::DropSequence(plan::DropSequence {
+                    names,
+                    if_exists: *if_exists,
+                    cascade: *cascade,
+                }),
                 other => return Err(SqlError::unsupported(format!("DROP {other}"))),
             })
         }
