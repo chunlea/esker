@@ -605,6 +605,13 @@ impl Executor {
                 self.set_snapshot(id)?;
                 Ok(Outcome::done("SET"))
             }
+            // **What the session set, not every parameter there is.** A real server's `RESET ALL`
+            // leaves alone the ones it may not change; clearing what was set is the same answer
+            // and needs no read-only special case.
+            SessionStatement::ResetAll => {
+                self.parameters.clear();
+                Ok(Outcome::done("RESET"))
+            }
             SessionStatement::SetParameter { name, value } => {
                 self.set_parameter(name, value.as_deref())?;
                 Ok(Outcome::done("SET"))
@@ -1308,9 +1315,49 @@ impl Executor {
             bind::substitute(&mut statement, params, &types)?;
         }
         self.resolve_current_schema(txn, &mut statement)?;
+        self.resolve_current_setting(&mut statement)?;
         self.resolve_regclass(txn, &mut statement)?;
         self.refuse_unavailable_functions(txn, &statement)?;
         Ok(statement)
+    }
+
+    /// Folds every `current_setting(…)` to the value this session reports.
+    ///
+    /// Once per statement, where [`Executor::resolve_current_schema`] does its own and for the same
+    /// reason: the value is the session's and the row evaluator has no handle on one. A parameter
+    /// cannot change in the middle of a statement, so folding it once is exact rather than
+    /// approximate.
+    ///
+    /// **`42704` here and not at lowering**, which is where a real server raises it too — and the
+    /// two-argument form answers NULL instead, which is the documented escape hatch and the one
+    /// shape that must not error.
+    fn resolve_current_setting(&self, statement: &mut Statement) -> Result<()> {
+        use crate::plan::{Expr, Literal};
+
+        if !bind::any(statement, |expr| {
+            matches!(expr, Expr::CurrentSetting { .. })
+        }) {
+            return Ok(());
+        }
+        let mut failed = None;
+        let mut resolve = |expr: &mut Expr| {
+            let Expr::CurrentSetting { name, missing_ok } = expr else {
+                return;
+            };
+            *expr = match crate::parameter::lookup(name) {
+                Ok(parameter) => Expr::Literal(Literal::String(self.parameter(parameter))),
+                Err(_) if *missing_ok => Expr::Literal(Literal::Null),
+                Err(error) => {
+                    failed.get_or_insert(error);
+                    Expr::Literal(Literal::Null)
+                }
+            };
+        };
+        bind::walk_mut(statement, &mut resolve);
+        match failed {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// The `search_path` **as resolved**: the entries that name a schema this tenant has, in the

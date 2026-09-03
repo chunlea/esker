@@ -53,13 +53,13 @@ const DIVERGENCES: &[(&str, &str)] = &[
          this node can never fail (ADR 0021 said so before it was built). What it answers instead \
          is the next question in PostgreSQL's own order: whether the snapshot is there.",
     ),
-    (
-        "SET nonamespace_thing = '1'",
-        "PostgreSQL knows which parameters it has, so an un-namespaced name it does not recognise \
-         is `42704`. This node does not have that list, and the safe half of the rule is the only \
-         half it can apply: `0A000` never claims a real parameter does not exist, where `42704` \
-         would have said that about `search_path`. Refusing by name in both cases is the divergence.",
-    ),
+    // **`SET nonamespace_thing = '1'` was here and is not any more.** It said this node cannot
+    // tell a parameter a real server *has* from a name nobody has, so it refused both by name with
+    // `0A000`. The `SET`-parameters unit ruled the other way: `SHOW` and `RESET` had been answering
+    // `42704` for the same name since phase 8, so `SET` was the one entry point out of step, and
+    // the capture settles the commoner shape — `SET nosuchparameter` is `42704` on a real server
+    // (`corpus/pg19_set_parameters.txt`). The row is deleted rather than reworded, which is
+    // ADR 0031's rule 2, and `SET work_mem` is the line that pays for it (`tests/time_machine.rs`).
     (
         "CHECKPOINT nightly",
         "`CHECKPOINT` is refused by name here (the plan's gap register, G25), which is right for \

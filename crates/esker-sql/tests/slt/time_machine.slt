@@ -51,10 +51,15 @@ statement error (42704)
 SHOW esker.no_such_parameter
 
 # --- SET, another parameter
-# Contract C2's answer, naming the parameter rather than the statement. `search_path` used to be
-# the example and is executed now (phase 9 unit 5, `tests/session_parameters.rs`); `work_mem` is
-# the shape the rule is about — a parameter a real server has and this node does not.
-statement error (0A000)
+# **42704, and it used to be 0A000.** The old answer had the better argument for this one line:
+# `work_mem` is a parameter a real server *has*, so "not supported" is truer about it than "does
+# not exist". What changed is that `SET` was the only one of the three entry points saying so —
+# `SHOW work_mem` and `RESET work_mem` have always answered 42704 — and a node whose three answers
+# disagree about whether a name exists is worse than one that is uniformly wrong about `work_mem`.
+# The capture settles the commoner case: `SET nosuchparameter` is 42704 on a real server
+# (`pg19_set_parameters.txt`), and this node cannot tell that from `work_mem` without carrying
+# PostgreSQL's whole GUC table. Declared, and the direction is now consistent.
+statement error (42704)
 SET work_mem = '4MB'
 
 # --- pg_export_snapshot
