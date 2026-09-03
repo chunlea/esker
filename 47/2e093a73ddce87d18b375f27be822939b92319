@@ -1,0 +1,80 @@
+crates/esker-sql/src/bin/esker-sql.rs
+  h_44076b318daf9c 44-51,53-54,61
+crates/esker-sql/src/catalog/mod.rs
+  h_44076b318daf9c 2671-2786,3194-3197,3449-3472,4149-4315
+crates/esker-sql/src/catalog/pg_catalog.rs
+  h_44076b318daf9c 585-611
+crates/esker-sql/src/catalog/record.rs
+  h_44076b318daf9c 16-17,20-32,183-192,711-789
+crates/esker-sql/src/error.rs
+  h_44076b318daf9c 570-586,984-985,987-992,994-1010,1713-1714,1809-1812,2109-2113
+crates/esker-sql/src/exec/bind.rs
+  h_44076b318daf9c 232-237,252-253,554-561,575-576,751-753,755-761,766,784-785,851-855,865-866
+crates/esker-sql/src/exec/cursor.rs
+  h_44076b318daf9c 1378
+crates/esker-sql/src/exec/ddl.rs
+  h_44076b318daf9c 1612-1668,2197
+crates/esker-sql/src/exec/dml.rs
+  h_44076b318daf9c 69-91,649-676,681-686,688-699,728-733,736,770-774,795,1300-1367,1369-1372,1378,1380-1455,1457-1466
+crates/esker-sql/src/exec/fragment.rs
+  h_44076b318daf9c 510,794
+crates/esker-sql/src/exec/mod.rs
+  h_44076b318daf9c 78-83,353,385-395,564-565,1365,1372-1392,1819-1822,1888-1927,1949,1951,1996-2003
+crates/esker-sql/src/exec/query.rs
+  h_44076b318daf9c 114,152,414-428,431,844-862,869,871,890-891,1263-1330,1925-1930,1932,3114
+crates/esker-sql/src/exec/subquery.rs
+  h_44076b318daf9c 94,97,726,1202,1289
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 226-257,322-331,2910-2914,2917,5101-5102,5104-5126,5133-5146,5157-5160,5167-5197
+crates/esker-sql/src/parse/mod.rs
+  h_44076b318daf9c 1183-1277
+crates/esker-sql/src/pgwire/server.rs
+  h_44076b318daf9c 69-75,97,111-116,145,156,160-169,251-257,437-438,469
+crates/esker-sql/src/plan/cte.rs
+  h_44076b318daf9c 230
+crates/esker-sql/src/plan/ddl.rs
+  h_44076b318daf9c 254-277
+crates/esker-sql/src/plan/dml.rs
+  h_44076b318daf9c 65,70-87,91-93,101-124
+crates/esker-sql/src/plan/expr.rs
+  h_44076b318daf9c 234-241,1614
+crates/esker-sql/src/plan/mod.rs
+  h_44076b318daf9c 35-39,90-93,161-163,165,171-172,194-195,244-245
+crates/esker-sql/src/plan/query.rs
+  h_44076b318daf9c 957
+crates/esker-sql/src/sqlstate.rs
+  h_44076b318daf9c 156-161,354-355
+crates/esker-sql/tests/corpus/pg19_two_database_dogs.txt
+  h_44076b318daf9c 1-78
+crates/esker-sql/tests/corpus/pg19_update_from.txt
+  h_44076b318daf9c 1-122
+crates/esker-sql/tests/corpus/pg19_write_in_subquery.txt
+  h_44076b318daf9c 52-53
+crates/esker-sql/tests/database.rs
+  h_44076b318daf9c 1-278
+crates/esker-sql/tests/parity_harness/mod.rs
+  h_44076b318daf9c 112-127,129
+crates/esker-sql/tests/psql_smoke.rs
+  h_44076b318daf9c 28-29,98-136,142,206,230,559-562
+crates/esker-sql/tests/two_database_dogs.rs
+  h_44076b318daf9c 1-50
+crates/esker-sql/tests/update_from.rs
+  h_44076b318daf9c 1-47
+crates/esker-sql/tests/write_in_subquery.rs
+  h_44076b318daf9c 23-30,41-45
+docs/adr/0052-a-database-is-a-tenant-and-the-directory-that-names-them.md
+  h_44076b318daf9c 1-174
+docs/plans/phase-9-rails.md
+  h_44076b318daf9c 1293-1297,1519-1520,1524-1525
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "472e093a73ddce87d18b375f27be822939b92319",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
