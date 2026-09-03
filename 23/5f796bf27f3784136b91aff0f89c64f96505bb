@@ -1,0 +1,57 @@
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_a48acfca6122c0::t_c4298f1d1c45ac 133-134,158,173,202,235,258-262,307-312,374-381,435,561,620-621,806-832,887-889,899-905,915-939,946-964
+crates/esker-sql/src/error.rs
+  s_a48acfca6122c0::t_457422931a68f4 925-964,1385-1389,1431-1438,1610-1617
+crates/esker-sql/src/parse/lower.rs
+  s_fd699569a45331::t_5df111580bab26 1147-1237,1309,1449-1450
+crates/esker-sql/src/catalog/mod.rs
+  s_a48acfca6122c0::t_54a146aab11b75 686-698,764-861,2097-2108,2112,2389-2390,2415,2508,2541,2598-2601,3560
+crates/esker-sql/src/catalog/pg_constraint.rs
+  s_a48acfca6122c0::t_a90d044ab9ff88 91
+crates/esker-sql/src/catalog/pg_index.rs
+  s_a48acfca6122c0::t_f21d7b4c38a6ae 136,139-147
+crates/esker-sql/src/catalog/record.rs
+  s_a48acfca6122c0::t_caac277c8a27fd 52-53,80,1120-1156,1371-1415,1544,1563-1564
+crates/esker-sql/src/exec/cursor.rs
+  s_a48acfca6122c0::t_8a77dc8c135b0c 1462-1467
+crates/esker-sql/src/exec/ddl.rs
+  s_a48acfca6122c0::t_893476d37a275d 65-67,110-113,129-130,152-156,487-695,1557-1559
+crates/esker-sql/src/exec/dml.rs
+  s_a48acfca6122c0::t_7444a61f4b9174 356-364,593-602,604-607,655-738
+crates/esker-sql/src/exec/subquery.rs
+  s_a48acfca6122c0::t_c8e7c44ceecf94 191-192,283-284
+crates/esker-sql/src/plan/ddl.rs
+  s_a48acfca6122c0::t_11ac07b721a22a 17,31-40,210-218
+crates/esker-sql/src/plan/mod.rs
+  s_a48acfca6122c0::t_1f0c14dfbb75da 36
+crates/esker-sql/tests/corpus/pg19_partition.txt
+  s_a48acfca6122c0::t_d622c42b4fbff1 1-142
+crates/esker-sql/tests/partition.rs
+  s_a48acfca6122c0::t_5f70a2527625cc 1-262
+docs/plans/phase-9-rails.md
+  s_a48acfca6122c0::t_594baf5d769568 1490
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "235f796bf27f3784136b91aff0f89c64f96505bb",
+  "prompts": {},
+  "sessions": {
+    "s_a48acfca6122c0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1ce89436-fd98-49c2-bdf7-60ef343bd273",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    },
+    "s_fd699569a45331": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cd0a4880-ec88-4a19-aaa2-d3c0300c3ffd",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
