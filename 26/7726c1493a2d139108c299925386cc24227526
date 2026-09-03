@@ -1,0 +1,59 @@
+crates/esker-sql/src/error.rs
+  s_2ed9df2fd94fee::t_d39567a6a12b3b 482-503,1226-1229
+crates/esker-sql/src/exec/cursor.rs
+  s_2ed9df2fd94fee::t_2915f80926a01d 877-898,904-909,915-916
+crates/esker-sql/src/exec/ddl.rs
+  s_2ed9df2fd94fee::t_d7456ed9e5da4a 818-822
+crates/esker-sql/src/exec/fragment.rs
+  s_2ed9df2fd94fee::t_cf208712003edb 411-413,682
+crates/esker-sql/src/exec/query.rs
+  s_2ed9df2fd94fee::t_e03359f56ec381 1612-1618,2353-2445,2448-2452,2461-2465,2467
+crates/esker-sql/src/exec/subquery.rs
+  s_2ed9df2fd94fee::t_df15761a766a64 540,961,1029
+crates/esker-sql/src/parse/lower.rs
+  s_2ed9df2fd94fee::t_dd26da6988140e 1415-1441,1559-1568,2717-2734
+crates/esker-sql/src/plan/cte.rs
+  s_2ed9df2fd94fee::t_f3c3d71514a4c3 159
+crates/esker-sql/src/plan/expr.rs
+  s_2ed9df2fd94fee::t_6d845a0a41fe18 35-41,48-65,367-370,380,390,770-808,1140
+crates/esker-sql/src/plan/mod.rs
+  s_2ed9df2fd94fee::t_6acaf89f4a8b9e 40-41
+crates/esker-sql/src/plan/query.rs
+  s_2ed9df2fd94fee::t_bc73cb3c217d42 811-820
+crates/esker-sql/src/sqlstate.rs
+  s_2ed9df2fd94fee::t_e016e7cc146d46 52-54
+crates/esker-sql/src/value/arith.rs
+  s_2ed9df2fd94fee::t_29a5f4f4aa3233 1-445
+crates/esker-sql/src/value/mod.rs
+  s_2ed9df2fd94fee::t_9835fc8c01c89f 32-33
+crates/esker-sql/tests/arithmetic.rs
+  s_2ed9df2fd94fee::t_e450162949e708 1-71
+crates/esker-sql/tests/corpus/pg19_arithmetic.txt
+  s_2ed9df2fd94fee::t_5c2a7f1b4c682b 1-89
+crates/esker-sql/tests/float_spelling.rs
+  s_2ed9df2fd94fee::t_7fc5489d06ebfb 21
+crates/esker-sql/tests/select.rs
+  s_2ed9df2fd94fee::t_1250d1cb842262 399-404
+crates/esker-sql/tests/subquery.rs
+  s_2ed9df2fd94fee::t_b63f232fade08e 75-77,79
+crates/esker-sql/tests/time.rs
+  s_2ed9df2fd94fee::t_ce8c1d434bd622 191-194,197-200
+docs/adr/0046-arithmetic-is-its-own-node-and-postgresql-s-promotion-table.md
+  s_2ed9df2fd94fee::t_659c1f021484c1 1-87
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "267726c1493a2d139108c299925386cc24227526",
+  "prompts": {},
+  "sessions": {
+    "s_2ed9df2fd94fee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ec622e3b-48a0-4735-8805-fe22838e8b26",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
