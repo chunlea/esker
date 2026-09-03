@@ -198,6 +198,12 @@ pub(crate) struct Cluster {
     dirs: Vec<TempDir>,
     /// `None` while that node is down.
     nodes: Vec<Mutex<Option<Node>>>,
+    /// The reserved listener each node has not yet taken, in node-index order.
+    ///
+    /// Emptied by the first `start_node` for that index. A **restart** finds `None` and binds the
+    /// address again, which is the one window a reservation cannot close: the killed server let
+    /// the port go, and nothing can hold it in the gap.
+    reserved: Vec<Mutex<Option<std::net::TcpListener>>>,
     resolver: Arc<dyn RegionResolver>,
     oracle: Arc<SharedOracle>,
 }
@@ -210,7 +216,11 @@ impl Cluster {
             .enable_all()
             .build()
             .expect("a runtime");
-        let addrs = reserve_ports(topology.nodes());
+        let reserved = reserve_ports(topology.nodes());
+        let addrs: Vec<SocketAddr> = reserved
+            .iter()
+            .map(|listener| listener.local_addr().expect("its address"))
+            .collect();
         let peers: Vec<Vec<PeerAddress>> = (0..topology.regions())
             .map(|group| {
                 (0..topology.replicas)
@@ -230,6 +240,7 @@ impl Cluster {
         let cluster = Arc::new(Self {
             runtime,
             nodes: (0..topology.nodes()).map(|_| Mutex::new(None)).collect(),
+            reserved: reserved.into_iter().map(|l| Mutex::new(Some(l))).collect(),
             topology,
             addrs,
             peers,
@@ -293,12 +304,23 @@ impl Cluster {
         };
         let addr = self.addrs[at];
         let service = StoreService::new(Arc::clone(&store));
+        // The reservation if this node has not started before, and a fresh bind if it is coming
+        // back from a kill — see `Cluster::reserved`.
+        let held = self.reserved[at]
+            .lock()
+            .expect("the reservation lock")
+            .take();
         let handle = self.runtime.block_on(async move {
-            Server::bind(addr, service, TransportConfig::new())
-                .await
-                .expect("the server binds")
-                .spawn()
-                .expect("the server starts")
+            let server = match held {
+                Some(listener) => Server::from_listener(listener, service, TransportConfig::new())
+                    .expect("the reserved listener is adopted"),
+                None => Server::bind(addr, service, TransportConfig::new())
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("the server binds {addr} after a restart: {error}")
+                    }),
+            };
+            server.spawn().expect("the server starts")
         });
         *self.nodes[at].lock().expect("the node lock") = Some(Node { store, handle });
     }
@@ -443,16 +465,45 @@ fn routing(topology: &Topology, peers: &[Vec<PeerAddress>]) -> Arc<dyn RegionRes
     Arc::new(RegionTable::from_routes(routes))
 }
 
-/// Reserves `count` ports by binding and releasing them.
+/// Reserves `count` ports and **keeps holding them**.
 ///
-/// Every store has to know every peer's address before any server exists, so the addresses
-/// cannot come from the servers.
-fn reserve_ports(count: usize) -> Vec<SocketAddr> {
-    let listeners: Vec<std::net::TcpListener> = (0..count)
+/// Every store has to know every peer's address before any server exists, so the addresses cannot
+/// come from the servers. This used to bind each port, read its number and drop the listener —
+/// which left every address free from the moment it was chosen until each `Server` bound it, and
+/// under a parallel suite run another test's cluster took one. The symptom was a panic at
+/// `.expect("the server binds")` in a transaction test, in a workspace run nobody could reproduce
+/// on its own.
+///
+/// The listeners are returned instead of their addresses and handed to `Server::from_listener`, so
+/// each port is held from the moment it is allocated until the server is serving on it.
+/// `esker-store`'s cluster harness made this same fix for this same reason.
+fn reserve_ports(count: usize) -> Vec<std::net::TcpListener> {
+    (0..count)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").expect("a port"))
-        .collect();
-    listeners
-        .iter()
-        .map(|listener| listener.local_addr().expect("its address"))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    /// **A reserved port has to stay reserved until its server binds it.**
+    ///
+    /// `reserve_ports` binds each port to learn its number. If it then drops the listener, every
+    /// address it hands back is free from that moment until each `Server` gets around to binding
+    /// it — and under a parallel suite run that window is long enough for another test's cluster
+    /// to take one. The symptom is a panic at `.expect("the server binds")` in a test that has
+    /// nothing to do with ports, in a run that nobody can reproduce on its own.
+    ///
+    /// `esker-store`'s cluster harness had the identical bug and fixed it the same way; its
+    /// comment says the window was "microseconds" and something took it anyway.
+    #[test]
+    fn a_reserved_port_is_held_until_it_is_handed_over() {
+        let reserved = super::reserve_ports(4);
+        for listener in &reserved {
+            let addr = listener.local_addr().expect("its address");
+            assert!(
+                std::net::TcpListener::bind(addr).is_err(),
+                "{addr} was still bindable, so the reservation is holding nothing"
+            );
+        }
+    }
 }

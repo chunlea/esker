@@ -201,6 +201,10 @@ impl<'a> Cursor<'a> {
             // Computed here, once, rather than page by page: `pg_type` is six rows and `pg_range`
             // is none. If a catalog view ever is not small, this is the line that changes.
             Node::CatalogView { view, .. } => Kind::Rows(view.rows_of(txn, tenant)?.into_iter()),
+            // Rows written into the statement, evaluated here for the same reason a catalog view's
+            // are: nothing is stored, so there is no key range to seek in and the row count is the
+            // length of the list.
+            Node::Values { list, .. } => Kind::Rows(super::values::rows(list)?.into_iter()),
             // A set-returning function in `FROM`: its rows are computed here, once, exactly as a
             // catalog view's are — there is no key range to seek in and the row count is the
             // length of one array. Its arguments are evaluated against **no row**, which is what

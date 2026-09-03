@@ -135,6 +135,80 @@ async fn settled_leader(nodes: &[Node]) -> usize {
     panic!("the cluster never agreed on a leader");
 }
 
+/// One peer's whole consensus position, for a failure message that has to distinguish a write
+/// that never arrived from one that has not been applied yet.
+///
+/// `last_index` is the claim about *durability*: an entry at or below it is in this peer's log, so
+/// a quorum held it and nothing was lost. `applied` is the claim about *visibility*: only at or
+/// below it can `rawkv::get` see the value.
+async fn digest(node: &Node) -> String {
+    let status = node.store.peer().unwrap().status().await.unwrap();
+    format!(
+        "store {} {:?} term={} commit={} applied={} last={}",
+        node.store.store_id(),
+        status.role,
+        status.term,
+        status.commit,
+        status.applied,
+        status.last_index,
+    )
+}
+
+/// **Invariant 1, where it lives.** A quorum holds `index` in its log, durably.
+///
+/// The write was acknowledged, so this was true before the call was made: the follower persists
+/// with `WriteOptions::synced()` before it answers an `AppendEntries`, the leader advances
+/// `matched` only on that answer, and it commits only when a majority of `matched` covers the
+/// index (`esker_raft`'s `maybe_commit`, with §5.4.2's term condition).
+///
+/// Asserted directly rather than inferred from a later read of the state machine, because these
+/// are two different claims: this one is about the **log** and is true the instant the
+/// acknowledgement returns, and it is the one a leader kill can actually break. Reading the data
+/// back tests it only through a state machine that may not have caught up, which is a race — and
+/// that race reported a lost write when nothing had been lost.
+async fn assert_quorum_holds(nodes: &[Node], index: u64, before: &[String]) {
+    let mut holders = 0;
+    for node in nodes {
+        if node
+            .store
+            .peer()
+            .unwrap()
+            .status()
+            .await
+            .unwrap()
+            .last_index
+            >= index
+        {
+            holders += 1;
+        }
+    }
+    assert!(
+        holders > nodes.len() / 2,
+        "only {holders} of {} peers hold the acknowledged entry {index} in their log, which is \
+         not a quorum -- the acknowledgement did not mean what it says: {}",
+        nodes.len(),
+        before.join(" | "),
+    );
+}
+
+/// How long a value takes to appear on one node, or `None` if it never does — **the line that
+/// tells a lost write from a slow one**.
+///
+/// A write the survivor never received is a durability failure and this answers `None`. One it
+/// holds in its log and has not applied is a read that came too early, and this answers how much
+/// too early. Only ever called on the failure path, which is why it may take ten seconds.
+async fn eventually(node: &Node, key: &str, value: &[u8]) -> Option<Duration> {
+    let waited = Instant::now();
+    while waited.elapsed() < Duration::from_secs(10) {
+        let again = esker_store::rawkv::get(node.store.db(), key.as_bytes()).unwrap();
+        if again.as_deref() == Some(value) {
+            return Some(waited.elapsed());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    None
+}
+
 /// Waits for every node's applied index to reach `index`.
 async fn wait_for_applied(nodes: &[Node], index: u64) {
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -398,8 +472,22 @@ async fn a_compare_and_swap_over_the_wire_is_ordered_by_raft() {
 /// remaining two elect a new one — and every write that was acknowledged is still there.
 ///
 /// This is `CLAUDE.md` invariant 1 at the consensus layer. An acknowledgement means the command
-/// applied on this peer, which means it committed, which means a quorum had it durably — so the
-/// two survivors are a quorum and at least one of them must hold every acknowledged write.
+/// applied on this peer, which means it committed, which means a quorum had it **durably in their
+/// log** — so the two survivors are a quorum and at least one of them must already hold every
+/// acknowledged entry, and both must converge on it.
+///
+/// **Those are two claims and they are checked in two places**, because they live in two places
+/// and fail differently. Durability is a fact about the *log* and is true the instant the
+/// acknowledgement returns, so it is asserted before the kill, where nothing can race it.
+/// Convergence is a fact about the *state machine* and is only eventual — a follower may hold an
+/// entry it has not applied — so the survivors are given time to apply before their data is read.
+///
+/// Reading the state machine without that wait is what made this test fail about once in thirty
+/// runs. The instrumentation below is what proved it was a lag and not a loss: the follower had
+/// the entry in its log before the kill (`last=13` against a `commit=12`) and the value appeared
+/// 22 ms later. Nothing was ever lost, and the assertion has not been weakened to say so — the
+/// missing wait was added, and the durability half was made explicit rather than inferred from
+/// the convergence half.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_acknowledged_write_is_lost_when_the_leader_is_killed() {
     let mut nodes = start_cluster(3).await;
@@ -419,8 +507,27 @@ async fn no_acknowledged_write_is_lost_when_the_leader_is_killed() {
             })
             .await
             .unwrap();
-        acknowledged.push((key, index));
+        // The leader's log index for this write, so a failure can say whether a survivor is
+        // missing the entry or merely has not applied it yet.
+        let at = nodes[leader]
+            .store
+            .peer()
+            .unwrap()
+            .status()
+            .await
+            .unwrap()
+            .applied;
+        acknowledged.push((key, index, at));
     }
+    // Every peer's state at the moment before the kill: the leader acked, so a quorum must hold
+    // each entry — this records who actually did.
+    let mut before_kill = Vec::new();
+    for node in &nodes {
+        before_kill.push(digest(node).await);
+    }
+
+    let last_acked = acknowledged.last().unwrap().2;
+    assert_quorum_holds(&nodes, last_acked, &before_kill).await;
 
     // Stop the leader: its driver thread, its ticker and its connections all go away, which is
     // what a store dying looks like to the other two.
@@ -435,15 +542,40 @@ async fn no_acknowledged_write_is_lost_when_the_leader_is_killed() {
     let new_leader = settled_leader(&nodes).await;
     assert_eq!(nodes.len(), 2);
 
+    // **The survivors' state machines have to catch up before their data is read.**
+    // `settled_leader` waits for agreement on who leads, which says nothing about how far anyone
+    // has applied — a follower can hold a committed entry it has not run yet, and reading its
+    // column family in that window reports a write that is on disk in the log as missing. The
+    // same wait the `CompareAndSwap` test above makes before it reads every node.
+    wait_for_applied(&nodes, last_acked).await;
+
     // Every acknowledged write is on both survivors.
+    let mut after_election = Vec::new();
     for node in &nodes {
-        for (key, value) in &acknowledged {
+        after_election.push(digest(node).await);
+    }
+    for node in &nodes {
+        for (key, value, at) in &acknowledged {
             let stored = esker_store::rawkv::get(node.store.db(), key.as_bytes()).unwrap();
-            assert_eq!(
-                stored.as_deref(),
-                Some(&value.to_be_bytes()[..]),
-                "store {} lost the acknowledged write {key}",
-                node.store.store_id()
+            if stored.as_deref() == Some(&value.to_be_bytes()[..]) {
+                continue;
+            }
+            let arrived = eventually(node, key, &value.to_be_bytes()).await;
+            let mut settled = Vec::new();
+            for node in &nodes {
+                settled.push(digest(node).await);
+            }
+            panic!(
+                "store {} lost the acknowledged write {key}\n  \
+                 entry index on the old leader: {at}\n  \
+                 read back within 10s: {arrived:?}\n  \
+                 before the kill:  {}\n  \
+                 after the election: {}\n  \
+                 after the wait:     {}",
+                node.store.store_id(),
+                before_kill.join(" | "),
+                after_election.join(" | "),
+                settled.join(" | "),
             );
         }
     }

@@ -44,7 +44,7 @@ pub use expr::{
 };
 pub use query::{
     AggregateSpec, Join, JoinKind, Node, OrderItem, Probe, Select, SelectItem, SortKey,
-    TableFunction, TableRef,
+    TableFunction, TableRef, ValuesList,
 };
 pub use routing::{Columnar, Decision, Engine, Reason, Setting};
 pub use session::SessionStatement;

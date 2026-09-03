@@ -568,6 +568,13 @@ pub enum SqlError {
     #[error("constraint \"{0}\" does not exist")]
     ConstraintDoesNotExist(String),
 
+    /// `VALUES (1),(2,3)`: rows of different lengths, which is `42601` and a **syntax** error.
+    ///
+    /// Not a type error and not a padded row — PostgreSQL decides this while reading the
+    /// statement, before anything is resolved, and so does this node.
+    #[error("VALUES lists must all be the same length")]
+    ValuesRowLength,
+
     /// `generate_series(1, 3, 0)`: a step that never moves, which is `22023` and not an empty
     /// result.
     ///
@@ -1498,6 +1505,9 @@ impl SqlError {
             | SqlError::TypeModifierNotAllowed(_)
             | SqlError::InvalidTypeName(_)
             | SqlError::InsertTooManyExpressions
+            // A ragged `VALUES` list is a **syntax** error and not a type one, which is worth
+            // saying out loud: the rows have no common shape, so there is nothing to type.
+            | SqlError::ValuesRowLength
             | SqlError::SyntaxAtOrNear(_) => sqlstate::SYNTAX_ERROR,
             SqlError::StatementTooComplex => sqlstate::STATEMENT_TOO_COMPLEX,
             SqlError::UndefinedTable(_)

@@ -4047,6 +4047,103 @@ fn lower_projection(items: &[SelectItem]) -> Result<Vec<plan::SelectItem>> {
         .collect()
 }
 
+/// A `VALUES` list as a relation: its rows and the names its columns take.
+///
+/// **The length check is here and is a syntax error.** PostgreSQL calls a ragged list
+/// `42601 VALUES lists must all be the same length` — not a type error and not a padded row — so
+/// it is raised where the statement is read rather than carried into a plan that cannot hold it.
+///
+/// **The types are not decided here**: a column's type is its first row's, and reading an
+/// expression's type needs a scope this pass does not have. `crate::exec::values` decides it and
+/// reads every other row as it, which is where `VALUES (1),('a')` becomes its `22P02`.
+///
+/// The names are `column1`, `column2`, … unless an alias list renames them — and a list **longer**
+/// than the columns is `42P10` naming both counts, which is `Derived`'s message and the same
+/// mistake, so it is worded the same way.
+fn lower_values(
+    values: &sqlparser::ast::Values,
+    columns: &[String],
+    name: &str,
+) -> Result<plan::ValuesList> {
+    let width = values.rows.first().map_or(0, |row| row.len());
+    if values.rows.iter().any(|row| row.len() != width) {
+        return Err(SqlError::ValuesRowLength);
+    }
+    if columns.len() > width {
+        return Err(SqlError::InvalidColumnReference(format!(
+            "table \"{name}\" has {width} columns available but {} columns specified",
+            columns.len()
+        )));
+    }
+    let mut rows = Vec::with_capacity(values.rows.len());
+    for row in &values.rows {
+        rows.push(row.iter().map(lower_expr).collect::<Result<Vec<_>>>()?);
+    }
+    let names = (0..width)
+        .map(|at| {
+            columns
+                .get(at)
+                .cloned()
+                .unwrap_or_else(|| format!("column{}", at + 1))
+        })
+        .collect();
+    Ok(plan::ValuesList {
+        rows,
+        columns: names,
+    })
+}
+
+/// A query's `ORDER BY`, which belongs to the query and not to the select under it.
+///
+/// Its own function because a `VALUES` list is a query with no select, and the clause it carries
+/// is the same clause — lowering it twice would be two chances for the two to disagree.
+fn lower_order_by(query: &Query) -> Result<Vec<plan::OrderItem>> {
+    let Some(order_by) = &query.order_by else {
+        return Ok(Vec::new());
+    };
+    let OrderByKind::Expressions(exprs) = &order_by.kind else {
+        return Err(SqlError::unsupported("ORDER BY ALL"));
+    };
+    refuse_if(order_by.interpolate.is_some(), "INTERPOLATE")?;
+    exprs
+        .iter()
+        .map(|item| {
+            refuse_if(item.with_fill.is_some(), "WITH FILL")?;
+            Ok(plan::OrderItem {
+                expr: lower_expr(&item.expr)?,
+                descending: item.options.asc == Some(false),
+                nulls_first: item.options.nulls_first,
+            })
+        })
+        .collect()
+}
+
+/// A query's `LIMIT` and `OFFSET`, for the same reason.
+fn lower_limit_offset(query: &Query) -> Result<(Option<plan::Expr>, Option<plan::Expr>)> {
+    match &query.limit_clause {
+        None => Ok((None, None)),
+        Some(LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        }) => {
+            refuse_if(!limit_by.is_empty(), "LIMIT BY")?;
+            let offset = match offset {
+                None => None,
+                Some(offset) => {
+                    refuse_if(
+                        !matches!(offset.rows, OffsetRows::None | OffsetRows::Rows),
+                        "OFFSET ... ROW",
+                    )?;
+                    Some(lower_expr(&offset.value)?)
+                }
+            };
+            Ok((limit.as_ref().map(lower_expr).transpose()?, offset))
+        }
+        Some(other) => Err(SqlError::unsupported(format!("the limit clause {other}"))),
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "most of it is the refusal list, which is the point: one line per clause not honoured"
@@ -4060,9 +4157,34 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
     refuse_if(!query.pipe_operators.is_empty(), "a pipe operator")?;
 
     let SetExpr::Select(select) = query.body.as_ref() else {
-        // `VALUES (...)`, `UNION`, `TABLE t` after the rewrite -- each is its own feature.
+        // **`VALUES …` on its own is a query**, so it takes the clauses a query takes: its rows
+        // are a relation with no name, and the `ORDER BY`, `LIMIT` and `OFFSET` above it are the
+        // ordinary ones over the columns it names itself.
+        if let SetExpr::Values(values) = query.body.as_ref() {
+            let (limit, offset) = lower_limit_offset(query)?;
+            return Ok(plan::Select {
+                projection: vec![plan::SelectItem::Wildcard],
+                from: Some(plan::TableRef {
+                    values: Some(Box::new(lower_values(values, &[], "")?)),
+                    name: String::new(),
+                    alias: None,
+                    derived: None,
+                    function: None,
+                    hidden_cte: false,
+                }),
+                joins: Vec::new(),
+                filter: None,
+                group_by: Vec::new(),
+                having: None,
+                order_by: lower_order_by(query)?,
+                limit,
+                offset,
+                distinct: false,
+                ctes: Vec::new(),
+            });
+        }
+        // `UNION`, `TABLE t` after the rewrite -- each is its own feature.
         return Err(SqlError::unsupported(match query.body.as_ref() {
-            SetExpr::Values(_) => "a bare VALUES list".to_owned(),
             SetExpr::SetOperation { op, .. } => format!("{op}"),
             other => format!("the query body {other}"),
         }));
@@ -4208,49 +4330,8 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
 
     let filter = select.selection.as_ref().map(lower_expr).transpose()?;
 
-    let order_by = match &query.order_by {
-        None => Vec::new(),
-        Some(order_by) => {
-            let OrderByKind::Expressions(exprs) = &order_by.kind else {
-                return Err(SqlError::unsupported("ORDER BY ALL"));
-            };
-            refuse_if(order_by.interpolate.is_some(), "INTERPOLATE")?;
-            exprs
-                .iter()
-                .map(|item| {
-                    refuse_if(item.with_fill.is_some(), "WITH FILL")?;
-                    Ok(plan::OrderItem {
-                        expr: lower_expr(&item.expr)?,
-                        descending: item.options.asc == Some(false),
-                        nulls_first: item.options.nulls_first,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?
-        }
-    };
-
-    let (limit, offset) = match &query.limit_clause {
-        None => (None, None),
-        Some(LimitClause::LimitOffset {
-            limit,
-            offset,
-            limit_by,
-        }) => {
-            refuse_if(!limit_by.is_empty(), "LIMIT BY")?;
-            let offset = match offset {
-                None => None,
-                Some(offset) => {
-                    refuse_if(
-                        !matches!(offset.rows, OffsetRows::None | OffsetRows::Rows),
-                        "OFFSET ... ROW",
-                    )?;
-                    Some(lower_expr(&offset.value)?)
-                }
-            };
-            (limit.as_ref().map(lower_expr).transpose()?, offset)
-        }
-        Some(other) => return Err(SqlError::unsupported(format!("the limit clause {other}"))),
-    };
+    let order_by = lower_order_by(query)?;
+    let (limit, offset) = lower_limit_offset(query)?;
 
     let mut lowered = plan::Select {
         from,
@@ -4335,6 +4416,7 @@ fn lower_with(with: Option<&sqlparser::ast::With>, into: &mut plan::Select) -> R
         // Carried whether anything referenced it or not: **an unreferenced CTE is still
         // analysed**, measured, and inlining alone would never look at one.
         into.ctes.push(plan::TableRef {
+            values: None,
             name: name.clone(),
             alias: None,
             derived: Some(Box::new(plan::Derived::from_cte(
@@ -4417,6 +4499,10 @@ fn join_constraint(constraint: &JoinConstraint) -> Result<(Option<plan::Expr>, V
 /// and not a spelling of this one: after it the table's own column names are gone (`t.id` becomes
 /// `42703`, measured). It is refused by name rather than silently ignored, because ignoring it
 /// would answer a query about `c` with a column called `id`.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per `FROM` shape, and most of each is the refusal list"
+)]
 fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
     match factor {
         TableFactor::Table {
@@ -4459,6 +4545,7 @@ fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
                     }
                 }
                 return Ok(plan::TableRef {
+                    values: None,
                     name: folded.clone(),
                     alias,
                     derived: None,
@@ -4482,6 +4569,7 @@ fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
                 }
             };
             Ok(plan::TableRef {
+                values: None,
                 name: relation_name(name)?,
                 alias,
                 derived: None,
@@ -4513,7 +4601,22 @@ fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
                         .collect(),
                 ),
             };
+            // **A `VALUES` list is not a derived table**, even though it is written like one: a
+            // derived table's rows come from a sub-select, and no select without a `FROM` produces
+            // more than one row. So it is its own kind of entry, with the alias list applied to
+            // the names it gives itself.
+            if let SetExpr::Values(values) = subquery.body.as_ref() {
+                return Ok(plan::TableRef {
+                    values: Some(Box::new(lower_values(values, &columns, &name)?)),
+                    name,
+                    alias: None,
+                    derived: None,
+                    function: None,
+                    hidden_cte: false,
+                });
+            }
             Ok(plan::TableRef {
+                values: None,
                 name,
                 alias: None,
                 derived: Some(Box::new(plan::Derived::new(
