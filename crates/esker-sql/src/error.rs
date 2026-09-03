@@ -567,6 +567,23 @@ pub enum SqlError {
         relation: String,
     },
 
+    /// `UPDATE t a SET a.body = 'q'` — a `SET` target with the relation written in front of it.
+    ///
+    /// **The error is about a column, not a relation.** PostgreSQL reads `a.body` as the column
+    /// `a` and a field of it, so what it reports missing is `a` — the same sentence and the same
+    /// `42703` as [`SqlError::UndefinedColumnInRelation`], with a `HINT` that says why. Measured,
+    /// both halves (`tests/corpus/pg19_update_from.txt`).
+    ///
+    /// A separate variant rather than a flag on that one, because the `HINT` is the whole
+    /// difference and a plain `SET nope = 1` must not carry it.
+    #[error("column \"{column}\" of relation \"{relation}\" does not exist")]
+    QualifiedSetTarget {
+        /// The qualifier, which is what PostgreSQL read as the column.
+        column: String,
+        /// The table being written, under its own name rather than its alias.
+        relation: String,
+    },
+
     /// A NULL reached a `NOT NULL` column, with the relation named the way PostgreSQL names it.
     #[error(
         "null value in column \"{column}\" of relation \"{relation}\" violates not-null constraint"
@@ -964,14 +981,33 @@ pub enum SqlError {
     )]
     SnapshotIsolationRequired,
 
-    /// `CREATE`/`DROP INDEX CONCURRENTLY` inside a transaction block.
+    /// A statement that cannot be part of one: `CREATE`/`DROP INDEX CONCURRENTLY`, and
+    /// `CREATE`/`DROP DATABASE`.
     ///
-    /// PostgreSQL's own refusal, captured: `25001 DROP INDEX CONCURRENTLY cannot run inside a
-    /// transaction block`. The reason is the same on both servers and worth stating — a concurrent
-    /// build is *many* transactions, so it cannot be part of one, and a block that could roll it
-    /// back would be a block that could roll back half a schema change.
+    /// PostgreSQL's own refusal, captured for both: `25001 DROP INDEX CONCURRENTLY cannot run
+    /// inside a transaction block`, `25001 CREATE DATABASE cannot run inside a transaction block`.
+    /// One sentence because it is one rule, and the reason is the same on both servers and worth
+    /// stating — a concurrent build is *many* transactions and a database is state outside every
+    /// one of them, so a block that could roll either back would be a block that could roll back
+    /// half a schema change.
     #[error("{0} cannot run inside a transaction block")]
-    ConcurrentlyInTransactionBlock(&'static str),
+    NotInATransactionBlock(&'static str),
+
+    /// `CREATE DATABASE` naming one the cluster already has.
+    #[error("database \"{0}\" already exists")]
+    DuplicateDatabase(String),
+
+    /// A database name nothing in the directory has — from `DROP DATABASE`, or from the startup
+    /// packet, where it is what tells `rake db:create` that it has work to do.
+    #[error("database \"{0}\" does not exist")]
+    UndefinedDatabase(String),
+
+    /// `DROP DATABASE` naming the one the session is connected to.
+    ///
+    /// PostgreSQL's own sentence and its own class: a database in use is not a missing one and not
+    /// a dependency violation, it is state somebody is holding.
+    #[error("cannot drop the currently open database")]
+    DatabaseInUse(String),
 
     /// `SET TRANSACTION SNAPSHOT` after the block has already read something. Exactly right, and
     /// the reason it is worth copying: a `start_ts` cannot change under a transaction that has
@@ -1674,7 +1710,8 @@ impl SqlError {
             | SqlError::UndefinedQualifiedColumn { .. }
             | SqlError::UsingColumnMissing { .. }
             | SqlError::UndefinedExcludedColumn(_)
-            | SqlError::UndefinedColumnInRelation { .. } => sqlstate::UNDEFINED_COLUMN,
+            | SqlError::UndefinedColumnInRelation { .. }
+            | SqlError::QualifiedSetTarget { .. } => sqlstate::UNDEFINED_COLUMN,
             SqlError::ColumnTypeConflict { .. } => sqlstate::DATATYPE_MISMATCH,
 
             SqlError::DuplicateTrigger { .. } => sqlstate::DUPLICATE_OBJECT,
@@ -1769,7 +1806,10 @@ impl SqlError {
             SqlError::InFailedTransaction => sqlstate::IN_FAILED_SQL_TRANSACTION,
             SqlError::ActiveTransaction
             | SqlError::SnapshotAfterQuery
-            | SqlError::ConcurrentlyInTransactionBlock(_) => sqlstate::ACTIVE_SQL_TRANSACTION,
+            | SqlError::NotInATransactionBlock(_) => sqlstate::ACTIVE_SQL_TRANSACTION,
+            SqlError::DuplicateDatabase(_) => sqlstate::DUPLICATE_DATABASE,
+            SqlError::UndefinedDatabase(_) => sqlstate::INVALID_CATALOG_NAME,
+            SqlError::DatabaseInUse(_) => sqlstate::OBJECT_IN_USE,
             SqlError::NoActiveTransaction
             | SqlError::SetTransactionOutsideBlock
             | SqlError::OutsideTransactionBlock(_) => sqlstate::NO_ACTIVE_SQL_TRANSACTION,
@@ -2066,6 +2106,11 @@ impl SqlError {
             SqlError::InvalidFromReference { alias, .. } => Some(format!(
                 "Perhaps you meant to reference the table alias \"{alias}\"."
             )),
+            // PostgreSQL's own sentence, and it is the one thing the message does not say: the
+            // column it names as missing is the *qualifier* the user wrote.
+            SqlError::QualifiedSetTarget { .. } => {
+                Some("SET target columns cannot be qualified with the relation name.".to_owned())
+            }
             _ => None,
         }
     }

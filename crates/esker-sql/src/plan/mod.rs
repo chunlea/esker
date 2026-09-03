@@ -32,11 +32,11 @@ pub use crate::catalog::Identity;
 pub use crate::catalog::pg_catalog::CatalogView;
 pub use ddl::{
     AlterSchemaRename, AlterTable, AlterTableAction, Column, ColumnDefault, Comment, CommentObject,
-    CreateExtension, CreateFunction, CreateIndex, CreateSchema, CreateSequence, CreateTable,
-    CreateTrigger, CreateType, DropFunction, DropIndex, DropSchema, DropSequence, DropTable,
-    DropTrigger, DropType, ForeignKey, IndexKeyPart, KeyPartName, PartitionSpec, RangeEnd,
-    UniqueConstraint, foreign_key_name, index_name, primary_key_name, sequence_name,
-    unique_constraint_name,
+    CreateDatabase, CreateExtension, CreateFunction, CreateIndex, CreateSchema, CreateSequence,
+    CreateTable, CreateTrigger, CreateType, DropDatabase, DropFunction, DropIndex, DropSchema,
+    DropSequence, DropTable, DropTrigger, DropType, ForeignKey, IndexKeyPart, KeyPartName,
+    PartitionSpec, RangeEnd, UniqueConstraint, foreign_key_name, index_name, primary_key_name,
+    sequence_name, unique_constraint_name,
 };
 pub use dml::{ConflictAction, Delete, Insert, OnConflict, Returning, Update};
 pub use expr::{
@@ -87,6 +87,10 @@ pub enum Statement {
     CreateExtension(CreateExtension),
     /// `CREATE SCHEMA` — a second namespace, which is a catalog object like any other here.
     CreateSchema(CreateSchema),
+    /// `CREATE DATABASE` — a second **tenant**, which is what a database is (ADR 0052).
+    CreateDatabase(CreateDatabase),
+    /// `DROP DATABASE`, which takes everything that tenant held with it.
+    DropDatabase(DropDatabase),
     /// `DROP SCHEMA [CASCADE]`.
     DropSchema(DropSchema),
     /// `ALTER SCHEMA … RENAME TO …`.
@@ -154,16 +158,18 @@ impl Statement {
     /// The statement's name, when it is a `CONCURRENTLY` form that may not run inside a
     /// transaction block — PostgreSQL's `25001`, captured.
     ///
-    /// Both forms, for one reason: a concurrent change is *many* transactions, so it cannot be
-    /// part of one, and a block that could roll it back would be a block that could roll back half
-    /// a schema change.
+    /// Four statements, for one reason: a concurrent change is *many* transactions and a database
+    /// is state outside every one of them, so neither can be part of a block — and a block that
+    /// could roll either back would be a block that could roll back half a schema change.
     #[must_use]
-    pub fn concurrently(&self) -> Option<&'static str> {
+    pub fn refused_in_a_transaction_block(&self) -> Option<&'static str> {
         match self {
             Statement::CreateIndex(create) if create.concurrently => {
                 Some("CREATE INDEX CONCURRENTLY")
             }
             Statement::DropIndex(drop) if drop.concurrently => Some("DROP INDEX CONCURRENTLY"),
+            Statement::CreateDatabase(_) => Some("CREATE DATABASE"),
+            Statement::DropDatabase(_) => Some("DROP DATABASE"),
             _ => None,
         }
     }
@@ -185,6 +191,8 @@ impl Statement {
             // A catalog write like the rest, so a read-only or time-travelling block refuses it.
             Statement::CreateExtension(_) => Some("CREATE EXTENSION"),
             Statement::CreateSchema(_) => Some("CREATE SCHEMA"),
+            Statement::CreateDatabase(_) => Some("CREATE DATABASE"),
+            Statement::DropDatabase(_) => Some("DROP DATABASE"),
             Statement::DropSchema(_) => Some("DROP SCHEMA"),
             Statement::AlterSchemaRename(_) => Some("ALTER SCHEMA"),
             Statement::DropTable(_) => Some("DROP TABLE"),
@@ -233,6 +241,8 @@ impl Statement {
             Statement::CreateExtension(_) => "CREATE EXTENSION",
             Statement::CreateSchema(_) => "CREATE SCHEMA",
             Statement::DropSchema(_) => "DROP SCHEMA",
+            Statement::CreateDatabase(_) => "CREATE DATABASE",
+            Statement::DropDatabase(_) => "DROP DATABASE",
             Statement::AlterSchemaRename(_) => "ALTER SCHEMA",
             Statement::DropTable(_) => "DROP TABLE",
             // **`COMMENT`, not `COMMENT ON`** — PostgreSQL's tag is the first word alone, which

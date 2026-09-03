@@ -13,7 +13,22 @@
 //! 'm' ++ "sql" ++ 'f' ++ tenant:u64 ++ id:u64  a flashback in progress, and how far it got
 //! 'm' ++ "sql" ++ 'q' ++ tenant:u64 ++ table:u64 ++ column:u64   a sequence, by the column it fills
 //! 'm' ++ "sql" ++ 'e' ++ tenant:u64 ++ seq:u64  that sequence's next unhanded-out value
+//! 'm' ++ "sql" ++ 'D' ++ name                  a database: the name, and the tenant it is
+//! 'm' ++ "sql" ++ 'C'                          the next database id, one counter for the cluster
 //! ```
+//!
+//! **The two database records carry no tenant, and that is the whole of what makes them the
+//! directory.** Every other key here is scoped to one, which is what makes a database *be* a
+//! tenant ([ADR 0052](../../../../docs/adr/0052-a-database-is-a-tenant-and-the-directory-that-names-them.md));
+//! `pg_database` has to answer from every database and `CREATE DATABASE` has to check a name that
+//! belongs to none in particular, so the one piece of state that cannot live inside a tenant is
+//! the list of them.
+//!
+//! **The name is the key and the id is the body**, rather than a record and an index over it.
+//! Every question asked of the directory is answered by that one direction: startup looks a name
+//! up, `DROP DATABASE` looks a name up, and `pg_database` scans — where the key gives the
+//! `datname` and the body the `oid`. A second record keyed by id would be a second thing to keep
+//! consistent in exchange for a lookup nothing performs.
 //!
 //! **A sequence is keyed by the column it fills, not by its own id.** Every sequence this node has
 //! is owned by one column — `bigserial` and `GENERATED AS IDENTITY` are the only two spellings
@@ -164,6 +179,16 @@ const KIND_TYPE: u8 = b'y';
 /// A **schema**, keyed by name. `public` is not stored: it is a property of the build, the way the
 /// available extensions are, and a tenant that has created nothing still has it.
 const KIND_SCHEMA: u8 = b'g';
+
+/// A database, keyed by its name and holding the tenant id it is.
+///
+/// **Upper case because it is not scoped to a tenant**, which is the one thing that sets these two
+/// apart from every other kind here — a reader checking whether a key belongs to a tenant can read
+/// the case rather than the table.
+const KIND_DATABASE: u8 = b'D';
+
+/// The next database id, one counter for the cluster.
+const KIND_NEXT_DATABASE: u8 = b'C';
 
 /// Tags for [`ColumnType`] as stored. Ours rather than PostgreSQL's OIDs, because these are a
 /// format we own and must never move; the OIDs stay on the wire where they belong.
@@ -681,6 +706,85 @@ pub(super) fn decode_schema(bytes: &[u8]) -> Result<u64> {
     let id = reader.u64_le()?;
     reader.finish()?;
     Ok(id)
+}
+
+/// `'m' ++ "sql" ++ 'D' ++ name`. The name is the whole rest of the key, so it needs no length and
+/// a database cannot be confused with one whose name it is a prefix of — the property
+/// [`name_key`] and the checkpoint keys already rely on.
+#[must_use]
+pub(super) fn database_key(name: &str) -> Vec<u8> {
+    let mut suffix = [SQL, &[KIND_DATABASE]].concat();
+    suffix.extend_from_slice(name.as_bytes());
+    prefix::meta_key(&suffix)
+}
+
+/// Every database in the cluster: the range [`database_key`] writes into.
+#[must_use]
+pub(super) fn database_range() -> (Vec<u8>, Vec<u8>) {
+    let start = database_key("");
+    let mut end = start.clone();
+    end.push(0xff);
+    (start, end)
+}
+
+/// The database name out of a key [`database_key`] wrote.
+pub(super) fn database_name_of(key: &[u8]) -> Result<String> {
+    let prefix = database_key("");
+    let tail = key
+        .strip_prefix(prefix.as_slice())
+        .ok_or_else(|| corrupt("a database key outside the directory range"))?;
+    String::from_utf8(tail.to_vec()).map_err(|_| corrupt("a database name that is not UTF-8"))
+}
+
+/// A database record: the version byte and the tenant id it is.
+#[must_use]
+pub(super) fn encode_database(id: u64) -> Vec<u8> {
+    encode_schema(id)
+}
+
+/// Reads one back.
+pub(super) fn decode_database(bytes: &[u8]) -> Result<u64> {
+    decode_schema(bytes)
+}
+
+/// `'m' ++ "sql" ++ 'C'`. One counter for the cluster, because a database id is a **tenant** id
+/// and two databases sharing one would share their tables.
+#[must_use]
+pub(super) fn next_database_key() -> Vec<u8> {
+    prefix::meta_key(&[SQL, &[KIND_NEXT_DATABASE]].concat())
+}
+
+/// Every key range one tenant owns, which is what `DROP DATABASE` empties.
+///
+/// **Every kind byte, not a list of the ones that take a tenant.** A list is a thing to forget:
+/// the next record kind added to this file would leak its tenant's rows on every drop, and nothing
+/// would say so. Sweeping all 256 costs 256 empty scans on a statement that runs once, and it
+/// cannot miss one.
+///
+/// The constraint that makes it exact, and the one a **cluster-wide** kind has to keep: its key
+/// must not have a tail that can begin with an encoded `u64`. The three there are — the catalog
+/// version, the default retention and the id counter — have no tail at all, and the directory's is
+/// a database *name*, which is UTF-8 and can never start with the NUL bytes a memcomparable `u64`
+/// does. A future kind that broke that would have its keys swept away by a drop of tenant zero.
+#[must_use]
+pub(super) fn tenant_ranges(tenant: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut ranges = Vec::with_capacity(257);
+    // The rows and every index, which `esker-keys` lays out as `'t' ++ tenant ++ table_id ++ …`
+    // — one range, because the tenant is the first field.
+    let mut start = vec![prefix::SQL];
+    codec::encode_u64(tenant, &mut start);
+    let mut end = start.clone();
+    end.push(0xff);
+    ranges.push((start, end));
+    for kind in 0..=u8::MAX {
+        let mut suffix = [SQL, &[kind]].concat();
+        codec::encode_u64(tenant, &mut suffix);
+        let start = prefix::meta_key(&suffix);
+        let mut end = start.clone();
+        end.push(0xff);
+        ranges.push((start, end));
+    }
+    ranges
 }
 
 #[must_use]

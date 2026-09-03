@@ -1,0 +1,122 @@
+# `UPDATE … FROM` with a self-alias — as a real PostgreSQL 19beta1 answers it.
+#
+# What a **joined** `update_all` sends. `ActiveRecord` cannot put a join on an `UPDATE`, so for a
+# relation carrying one it does not wrap the selection in a subquery the way `delete_all` does
+# (`pg19_write_in_subquery.txt`) — it aliases the target, puts the join in a `FROM`, and ties the
+# two together in the `WHERE`. Verbatim from `sql.active_record`, with the bind written out:
+#
+#     UPDATE "vl_comments" "__active_record_update_alias" SET "body" = $1
+#       FROM "vl_comments" INNER JOIN "vl_posts" ON "vl_posts"."id" = "vl_comments"."vl_post_id"
+#       WHERE "vl_comments"."id" = "__active_record_update_alias"."id"
+#
+# It is in the same 9 test files as the subquery form, and `pg19_write_in_subquery.txt` declares it
+# as a divergence until this file is answered.
+#
+# Captured in one session against the `esker-pg19` container, inside `BEGIN … ROLLBACK`, error
+# probes in `SAVEPOINT` / `ROLLBACK TO`. The final `SELECT count(*)` proves it left nothing behind.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **A target row the join matches MANY times is updated ONCE.** Three matching `FROM` rows and
+#     `SET hits = a.hits + 1` leaves `hits` at **1**, not 3, and the tag is `UPDATE 1`. PostgreSQL
+#     documents which of the matching rows is used as *not readily predictable*; what it does not
+#     leave open is how many times the target is written. An implementation that loops over the
+#     join output writes it once per match and answers 3.
+#   * **The `FROM` entry is a separate scan, and it sees the rows as they were.**
+#     `SET body = c.body || '!'` over `FROM vl_comments c` appends to the **pre-statement** value
+#     for every row, so three rows holding `joined` all become `joined!` — not `joined!!`, and not
+#     one row's new value leaking into the next. Pinned twice, because `||` is a shape of its own
+#     this node refuses by name: `SET hits = c.hits + 1 FROM vl_comments c WHERE c.id =
+#     (a.id % 3) + 1` reads each row through the *next* one, so a node whose `FROM` scan saw its
+#     own writes would answer `1, 1, 2` where a real server answers `1, 1, 1`.
+#   * **An alias replaces the target's name, it does not add one.** With `UPDATE vl_comments a`,
+#     `vl_comments.id` is `42P01 invalid reference to FROM-clause entry` with a HINT naming the
+#     alias — even though the table is right there. That is exactly what frees the name for the
+#     `FROM` entry that shares it, which is the whole mechanism of the Rails statement.
+#   * **A `SET` target is never qualified**, and the error is about a *column* rather than a
+#     relation: `SET a.body = 'q'` is `42703 column "a" of relation "vl_comments" does not exist`,
+#     because `a.body` is read as the column `a` and a field of it.
+#   * **An unaliased target and a `FROM` entry of the same table are fine** as long as the entry
+#     has an alias of its own: `UPDATE vl_comments SET … FROM vl_comments c WHERE c.id =
+#     vl_comments.id` updates one row. It is the *name* that has to be unambiguous, not the table.
+#   * **A bare column that both sides have is `42702`**, not the target's: `WHERE id = 1` over a
+#     target and a `FROM` entry of the same table is ambiguous.
+#   * `RETURNING` names **both sides** — `RETURNING a.id, a.body, p.title` — because by then the
+#     target row and its `FROM` row are one row.
+#   * `DELETE … USING` is the same mechanism spelled for the other verb, and is here so that the
+#     day it is needed its answer is already measured.
+BEGIN		-
+CREATE TABLE vl_posts (id bigserial primary key, vl_author_id bigint, title character varying)		-
+CREATE TABLE vl_comments (id bigserial primary key, vl_post_id bigint, body character varying, hits integer DEFAULT 0)		-
+INSERT INTO vl_posts (vl_author_id, title) VALUES (1,'x'), (1,'y'), (2,'z')		-
+INSERT INTO vl_comments (vl_post_id, body) VALUES (1,'a'), (2,'b'), (3,'c')		-
+UPDATE "vl_comments" "__active_record_update_alias" SET "body" = 'joined' FROM "vl_comments" INNER JOIN "vl_posts" ON "vl_posts"."id" = "vl_comments"."vl_post_id" WHERE "vl_comments"."id" = "__active_record_update_alias"."id"		-
+SELECT 'r', id, body FROM vl_comments ORDER BY id	text,bigint,character varying	r|1|joined ; r|2|joined ; r|3|joined
+SAVEPOINT s2		-
+UPDATE vl_comments a SET body = 'only2' FROM vl_comments c INNER JOIN vl_posts p ON p.id = c.vl_post_id WHERE c.id = a.id AND p.title = 'y'		-
+SELECT 'r', id, body FROM vl_comments ORDER BY id		r|1|joined ; r|2|only2 ; r|3|joined
+ROLLBACK TO s2		-
+SAVEPOINT s3		-
+INSERT INTO vl_posts (vl_author_id, title) VALUES (9,'dup1'), (9,'dup2'), (9,'dup3')		-
+UPDATE vl_comments a SET hits = a.hits + 1 FROM vl_posts p WHERE p.vl_author_id = 9 AND a.id = 1		-
+SELECT 'r', id, hits FROM vl_comments ORDER BY id		r|1|1 ; r|2|0 ; r|3|0
+ROLLBACK TO s3		-
+SAVEPOINT s4		-
+UPDATE vl_comments a SET body = 'q' WHERE vl_comments.id = 1	!42P01 invalid reference to FROM-clause entry for table "vl_comments" HINT: Perhaps you meant to reference the table alias "a".
+ROLLBACK TO s4		-
+SAVEPOINT s5		-
+UPDATE vl_comments SET body = 'q' FROM vl_comments c WHERE c.id = vl_comments.id AND c.id = 1		-
+SELECT 'r', id, body FROM vl_comments ORDER BY id		r|1|q ; r|2|joined ; r|3|joined
+ROLLBACK TO s5		-
+SAVEPOINT s6		-
+UPDATE vl_comments a SET a.body = 'q' WHERE a.id = 1	!42703 column "a" of relation "vl_comments" does not exist HINT: SET target columns cannot be qualified with the relation name.
+ROLLBACK TO s6		-
+SAVEPOINT s7		-
+UPDATE vl_comments a SET body = 'ret' FROM vl_posts p WHERE p.id = a.vl_post_id AND p.title = 'x' RETURNING a.id, a.body, p.title	bigint,character varying,character varying	1|ret|x
+SELECT 'r', a.id, a.body FROM vl_comments a ORDER BY a.id		r|1|ret ; r|2|joined ; r|3|joined
+ROLLBACK TO s7		-
+SAVEPOINT s8		-
+UPDATE vl_comments a SET body = 'two' FROM vl_posts p, vl_comments c WHERE p.id = c.vl_post_id AND c.id = a.id AND p.title = 'z'		-
+SELECT 'r', id, body FROM vl_comments ORDER BY id		r|1|joined ; r|2|joined ; r|3|two
+ROLLBACK TO s8		-
+SAVEPOINT s9		-
+UPDATE vl_comments a SET body = 'left' FROM vl_comments c LEFT JOIN vl_posts p ON p.id = c.vl_post_id WHERE c.id = a.id AND p.id IS NOT NULL		-
+SELECT 'r', id, body FROM vl_comments ORDER BY id		r|1|left ; r|2|left ; r|3|left
+ROLLBACK TO s9		-
+SAVEPOINT s10		-
+UPDATE vl_comments a SET body = c.body || '!' FROM vl_comments c WHERE c.id = a.id		-
+SELECT 'r', id, body FROM vl_comments ORDER BY id		r|1|joined! ; r|2|joined! ; r|3|joined!
+ROLLBACK TO s10		-
+SAVEPOINT s10b		-
+UPDATE vl_comments a SET hits = c.hits + 1 FROM vl_comments c WHERE c.id = (a.id % 3) + 1		-
+SELECT 'r', id, hits FROM vl_comments ORDER BY id		r|1|1 ; r|2|1 ; r|3|1
+ROLLBACK TO s10b		-
+SAVEPOINT s11		-
+UPDATE vl_comments SET body = 'plain' FROM vl_posts WHERE vl_posts.id = vl_comments.vl_post_id AND vl_posts.title = 'y'		-
+SELECT 'r', id, body FROM vl_comments ORDER BY id		r|1|joined ; r|2|plain ; r|3|joined
+ROLLBACK TO s11		-
+SAVEPOINT s12		-
+UPDATE vl_comments a SET body = 'none' FROM vl_posts p WHERE p.id = a.vl_post_id AND p.title = 'nosuch'		-
+SELECT 'r', count(*) FROM vl_comments WHERE body = 'none'		r|0
+ROLLBACK TO s12		-
+SAVEPOINT s13		-
+UPDATE vl_comments a SET body = p.title FROM vl_posts p WHERE p.id = a.vl_post_id		-
+SELECT 'r', id, body FROM vl_comments ORDER BY id		r|1|x ; r|2|y ; r|3|z
+ROLLBACK TO s13		-
+SAVEPOINT s14		-
+UPDATE vl_comments a SET body = 'amb' FROM vl_comments c WHERE id = 1	!42702 column reference "id" is ambiguous
+ROLLBACK TO s14		-
+SAVEPOINT s15		-
+UPDATE vl_comments a SET body = 'x' FROM nosuchtable n WHERE n.id = a.id	!42P01 relation "nosuchtable" does not exist
+ROLLBACK TO s15		-
+SAVEPOINT s16		-
+DELETE FROM vl_comments a USING vl_posts p WHERE p.id = a.vl_post_id AND p.title = 'x'		-
+SELECT 'r', count(*) FROM vl_comments		r|2
+ROLLBACK TO s16		-
+SELECT 'r', id, body, hits FROM vl_comments ORDER BY id		r|1|joined|0 ; r|2|joined|0 ; r|3|joined|0
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname LIKE 'vl_%'	bigint	0

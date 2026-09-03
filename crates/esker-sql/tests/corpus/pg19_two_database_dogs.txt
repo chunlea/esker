@@ -1,0 +1,78 @@
+# The `dogs` table, twice — why `ActiveRecord::Fixture::FixtureError` is a HARNESS artefact and not
+# a server gap.
+#
+# **Run 46 ranking row 7: 103 tests across 3 files** — `counter_cache_test.rb` (56),
+# `associations_test.rb` (46), `fixtures_test.rb` (1) — every one of them:
+#
+#     ActiveRecord::Fixture::FixtureError: table "dogs" has no columns named
+#     "trainer_id", "dog_lover_id".
+#
+# **There is no underlying server error to dig out.** That message is raised by `ActiveRecord`
+# itself, in `abstract/database_statements.rb:625-630`, after it reads the table's columns and finds
+# the fixture's keys missing. The server answered the introspection correctly; the table really does
+# lack the columns. The question is why, and the answer is in the harness:
+#
+#   * `schema.rb:578`  — `create_table :dogs` with `trainer_id, breeder_id, dog_lover_id, alias`,
+#     on the default connection (`arunit`).
+#   * `schema.rb:1496` — the **last line of the file** — `OtherDog.lease_connection.create_table
+#     :dogs, force: true`, a bare `id`-only table. `OtherDog < ARUnit2Model`, so on a real server
+#     that runs against the **`arunit2` database** and creates a second, independent `dogs`.
+#
+# `config.yml` in this harness points `arunit` and `arunit2` at **the same listener**, with the note
+# that "this node has one namespace and ignores the name". So the second `create_table … force: true`
+# does not create a second table — it **drops and recreates the first one**, and the four columns the
+# fixtures need are gone. This file measures exactly that sequence on a real PostgreSQL, in one
+# database, and shows the column list going 5 → 1.
+#
+# Two consequences worth stating plainly:
+#
+#   * **These 103 tests cannot pass until the node has more than one database**, whatever the code
+#     lanes do. They are not a work item for them.
+#   * `config.yml` says cross-database tests "are on the exclusion list with that reason", and
+#     `exclusions.txt` is **empty** — 0 entries. Under ADR 0031 these three files are the first real
+#     candidates for it, each naming this reason.
+#
+# It also explains a probe limitation this lane has carried since run 37: `schema-probe.rb` stops at
+# `schema.rb:1478` on `NameError: uninitialized constant Course` and has never reached line 1496.
+# The statement that breaks `dogs` is in the part the probe cannot see, which is why forty rounds of
+# "0 of 793 refusals" never predicted this.
+#
+# Captured in one session with `scratchpad/sesscap.py`, inside `BEGIN … ROLLBACK`; the final
+# `SELECT count(*)` proves it left nothing behind.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`force: true` is `DROP TABLE IF EXISTS` followed by `CREATE TABLE`** — it is not an ALTER and
+#     it does not merge. The second definition wins completely: `pg_attribute` goes from 5 live
+#     columns to 1.
+#   * **The introspection that AR uses filters `attisdropped`**, so a dropped column is invisible
+#     rather than present-and-null. There is no trace of the first definition left to find.
+#   * **`CREATE DATABASE` cannot be probed the way everything else here is**: it is
+#     `25001 CREATE DATABASE cannot run inside a transaction block`. A node growing multi-database
+#     support cannot have that path covered by a rolled-back capture, which is worth knowing before
+#     someone asks this lane for one.
+#   * **The oracle has neither `arunit` nor `arunit2`** — `count` is `0`. Those names exist only in
+#     ActiveRecord's own configuration, and on a developer's real server they are two databases
+#     created by `rake db:create`. Nothing about them is a PostgreSQL feature.
+BEGIN		-
+DROP TABLE IF EXISTS "dogs"		-
+CREATE TABLE "dogs" ("id" bigserial primary key, "trainer_id" integer, "breeder_id" integer, "dog_lover_id" integer, "alias" character varying)		-
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = '"dogs"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|bigint ; r|trainer_id|integer ; r|breeder_id|integer ; r|dog_lover_id|integer ; r|alias|character varying
+SELECT 'r', count(*) FROM pg_attribute WHERE attrelid = '"dogs"'::regclass AND attnum > 0 AND NOT attisdropped		r|5
+DROP TABLE IF EXISTS "dogs"		-
+CREATE TABLE "dogs" ("id" bigserial primary key)		-
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = '"dogs"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|bigint
+SELECT 'r', count(*) FROM pg_attribute WHERE attrelid = '"dogs"'::regclass AND attnum > 0 AND NOT attisdropped		r|1
+SELECT 'r', current_database()	text,name	r|esker
+SELECT 'r', count(*) FROM pg_database WHERE datname IN ('arunit','arunit2')	text,bigint	r|0
+SELECT 'r', datname FROM pg_database WHERE datname = current_database()	text,name	r|esker
+SAVEPOINT s1		-
+CREATE DATABASE arunit2	!25001 CREATE DATABASE cannot run inside a transaction block
+ROLLBACK TO s1		-
+SELECT 'r', 'a'::name = 'a'::name	text,boolean	r|t
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname = 'dogs'	bigint	0

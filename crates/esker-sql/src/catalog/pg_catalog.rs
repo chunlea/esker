@@ -582,21 +582,33 @@ impl CatalogView {
             // **One row per schema**, `public` included — and `public` is not a record: it is a
             // property of the build, the way the available extensions are, so a tenant that has
             // created nothing still reports it.
-            // **One database, and its name is `current_database()`'s.** The two are one constant so
-            // that `WHERE datname = current_database()` matches without either half knowing about
-            // the other.
-            CatalogView::PgDatabase => Ok(vec![vec![
-                Datum::Int8(DATABASE_OID),
-                Datum::Text(crate::parse::DATABASE_NAME.to_owned()),
-                // 6 is `UTF8` in PostgreSQL's own encoding table, and it is the only encoding this
-                // node speaks — the startup packet says so too (`client_encoding`).
-                Datum::Int4(6),
-                // **`C`, not the oracle's `en_US.utf8`.** A collation is a feature this node does
-                // not have (`CatalogView::PgCollation` is empty for the same reason), so the honest
-                // locale is the one that sorts by byte value.
-                Datum::Text("C".to_owned()),
-                Datum::Text("C".to_owned()),
-            ]]),
+            // **One row per database in the cluster's directory**, and this is the one catalog
+            // view here that is *not* about the tenant asking: `pg_database` answers the same
+            // list from every database, which is why the directory is the one piece of catalog
+            // state that carries no tenant (ADR 0052).
+            //
+            // **The oid is the id is the tenant**, so `WHERE datname = current_database()` matches
+            // by construction rather than by two constants being kept equal by hand — and a
+            // cluster nobody has written a directory for answers with the one database it is
+            // serving, which is what it answered before it could name a second.
+            CatalogView::PgDatabase => Ok(super::databases(txn)?
+                .into_iter()
+                .map(|(name, id)| {
+                    vec![
+                        Datum::Int8(i64::try_from(id).unwrap_or(i64::MAX)),
+                        Datum::Text(name),
+                        // 6 is `UTF8` in PostgreSQL's own encoding table, and it is the only
+                        // encoding this node speaks — the startup packet says so too
+                        // (`client_encoding`).
+                        Datum::Int4(6),
+                        // **`C`, not the oracle's `en_US.utf8`.** A collation is a feature this
+                        // node does not have (`CatalogView::PgCollation` is empty for the same
+                        // reason), so the honest locale is the one that sorts by byte value.
+                        Datum::Text("C".to_owned()),
+                        Datum::Text("C".to_owned()),
+                    ]
+                })
+                .collect()),
             CatalogView::PgNamespace => Ok(super::schema_names(txn, tenant)?
                 .into_iter()
                 .map(|(name, id)| {
@@ -793,11 +805,6 @@ pub fn refuse_write(name: &str) -> Result<()> {
 const PLPGSQL_LANGUAGE_OID: i64 = 14_024;
 
 const PUBLIC_NAMESPACE_OID: i64 = 11;
-
-/// The one database's oid. PostgreSQL's `postgres` database is 5 on a fresh cluster; this is a
-/// number of ours, because the database here is not that one and pretending otherwise would be a
-/// value nobody measured.
-const DATABASE_OID: i64 = 16_384;
 
 /// The oid of a schema by name, for `relnamespace` and its kin.
 ///

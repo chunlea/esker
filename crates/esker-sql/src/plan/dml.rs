@@ -62,19 +62,64 @@ pub enum ConflictAction {
     DoUpdate(Vec<(String, Expr)>),
 }
 
-/// `UPDATE t SET a = ..., b = ... WHERE ...`.
+/// `UPDATE t [AS a] SET a = ..., b = ... [FROM x JOIN y ON ...] WHERE ...`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Update {
     /// The table, folded.
     pub table: String,
+    /// `UPDATE t AS a` — the name the rest of the statement must use for the row being written.
+    ///
+    /// **An alias replaces the name, it does not add one.** Once it is written, a reference to the
+    /// table's real name resolves against the `FROM` entry of that name if there is one and is an
+    /// error if there is not — which is exactly what makes the `update_all` shape below work:
+    /// `UPDATE "c" "__active_record_update_alias" … FROM "c" …` has two relations of one table,
+    /// and `"c"."id"` is the one being *read*.
+    pub alias: Option<String>,
+    /// `FROM x` — the left-most relation the statement reads but does not write, or `None` for
+    /// the ordinary single-table `UPDATE`.
+    ///
+    /// This is what a *joined* `update_all` sends: `ActiveRecord` cannot put a join on an `UPDATE`,
+    /// so it aliases the target, puts the join in a `FROM`, and ties the two together in the
+    /// `WHERE`. The same three fields a [`crate::plan::Select`] carries, because it is the same
+    /// clause — and the rows this statement writes are the rows that `SELECT` would return.
+    pub from: Option<crate::plan::TableRef>,
+    /// The joins of the `FROM` clause, in the order written. Empty for a statement with none.
+    pub joins: Vec<crate::plan::Join>,
     /// Column name and the expression to put in it, in the order written. PostgreSQL evaluates
     /// every one against the row as it was *before* the statement, so `SET a = b, b = a` swaps
     /// them rather than assigning `a` twice.
+    ///
+    /// **The name is never qualified.** `SET a.body = …` is not a spelling PostgreSQL accepts even
+    /// when `a` is the target's own alias, which is why this stays a bare name beside a `FROM`.
     pub assignments: Vec<(String, Expr)>,
     /// `WHERE`. Absent means every row.
     pub filter: Option<Expr>,
     /// `RETURNING`, over the rows **after** the assignments.
     pub returning: Option<Returning>,
+}
+
+impl Update {
+    /// The `FROM` clause as one join chain hanging off the target.
+    ///
+    /// **The `FROM` entry is joined to the target with no condition.** `UPDATE t a SET … FROM x
+    /// WHERE …` means `t CROSS JOIN x` with the `WHERE` doing the tying, which is exactly what a
+    /// comma in a `SELECT`'s `FROM` means — so nothing is approximated by building it as one, and
+    /// a join written *inside* the `FROM` keeps its own `ON`.
+    ///
+    /// Empty for the ordinary single-table `UPDATE`, which is what makes one code path of both.
+    #[must_use]
+    pub fn chain(&self) -> Vec<crate::plan::Join> {
+        self.from
+            .iter()
+            .map(|from| crate::plan::Join {
+                table: from.clone(),
+                kind: crate::plan::JoinKind::Inner,
+                on: None,
+                using: Vec::new(),
+            })
+            .chain(self.joins.iter().cloned())
+            .collect()
+    }
 }
 
 /// `DELETE FROM t WHERE ...`.

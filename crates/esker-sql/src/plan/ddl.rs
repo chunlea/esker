@@ -251,6 +251,30 @@ pub struct DropSchema {
     pub cascade: bool,
 }
 
+/// `CREATE DATABASE [IF NOT EXISTS] name`.
+///
+/// **A database is a tenant** ([ADR 0052](../../../../docs/adr/0052-a-database-is-a-tenant-and-the-directory-that-names-them.md)),
+/// so this statement allocates one and writes the cluster's directory. It carries no options:
+/// PostgreSQL's `ENCODING`, `LC_COLLATE`, `TEMPLATE` and their kin are not in `sqlparser` 0.62.0's
+/// `CREATE DATABASE` grammar at all, so the option list is a `42601` before it can be a `0A000`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateDatabase {
+    /// The database's name, folded.
+    pub name: String,
+    /// `IF NOT EXISTS`, which turns the `42P04` into a notice and a success.
+    pub if_not_exists: bool,
+}
+
+/// `DROP DATABASE [IF EXISTS] name`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropDatabase {
+    /// The databases named, folded.
+    pub names: Vec<String>,
+    /// `IF EXISTS`, which covers absence and nothing else — the database the session is connected
+    /// to is still `55006` with the clause written, because it is there rather than missing.
+    pub if_exists: bool,
+}
+
 /// `ALTER SCHEMA name RENAME TO other`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlterSchemaRename {

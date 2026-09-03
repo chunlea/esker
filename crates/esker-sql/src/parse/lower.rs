@@ -223,6 +223,38 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
                 if_not_exists: *if_not_exists,
             }))
         }
+        // `CREATE DATABASE [IF NOT EXISTS] name`. **PostgreSQL's option list is a `42601` before
+        // it can be a `0A000`**: `sqlparser` 0.62.0's `CREATE DATABASE` grammar has `LOCATION`,
+        // `MANAGEDLOCATION`, `CLONE` and MySQL's `CHARACTER SET`/`COLLATE` and nothing else, so
+        // `ENCODING = 'utf8'` — what `rake db:create` sends — never reaches this arm. The four it
+        // *can* read are refused by name here, so that a statement this node parses and cannot
+        // honour is never silently taken as the bare form.
+        Statement::CreateDatabase {
+            db_name,
+            if_not_exists,
+            location,
+            managed_location,
+            clone,
+            default_charset,
+            default_collation,
+            ..
+        } => {
+            refuse_if(location.is_some(), "CREATE DATABASE ... LOCATION")?;
+            refuse_if(
+                managed_location.is_some(),
+                "CREATE DATABASE ... MANAGEDLOCATION",
+            )?;
+            refuse_if(clone.is_some(), "CREATE DATABASE ... CLONE")?;
+            refuse_if(
+                default_charset.is_some(),
+                "CREATE DATABASE ... CHARACTER SET",
+            )?;
+            refuse_if(default_collation.is_some(), "CREATE DATABASE ... COLLATE")?;
+            Ok(plan::Statement::CreateDatabase(plan::CreateDatabase {
+                name: object_name(db_name)?,
+                if_not_exists: *if_not_exists,
+            }))
+        }
         Statement::AlterSchema(alter) => {
             use sqlparser::ast::AlterSchemaOperation;
             refuse_if(alter.if_exists, "ALTER SCHEMA IF EXISTS")?;
@@ -287,6 +319,16 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
                     if_exists: *if_exists,
                     cascade: *cascade,
                 }),
+                // **No `CASCADE` and no `RESTRICT`.** PostgreSQL's `DROP DATABASE` takes neither —
+                // there is nothing outside a database that can depend on it — so a spelling that
+                // carries one is refused rather than ignored.
+                ObjectType::Database => {
+                    refuse_if(*cascade, "DROP DATABASE ... CASCADE")?;
+                    plan::Statement::DropDatabase(plan::DropDatabase {
+                        names,
+                        if_exists: *if_exists,
+                    })
+                }
                 other => return Err(SqlError::unsupported(format!("DROP {other}"))),
             })
         }
@@ -2865,15 +2907,14 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
         refuse_wrong_arity(function, "current_schema", 0)?;
         return Ok(plan::Expr::CurrentSchema { all: None });
     }
-    // **The database this node has.** Folded here like `current_schema()` because it is the same
-    // kind of answer: a constant of the server, not a property of the row. `ActiveRecord`'s adapter
-    // runs it four times while connecting — once alone and three times joined to `pg_database` for
-    // the encoding, the collation and the ctype.
+    // **The database this session is connected to.** Left unresolved here exactly as
+    // `current_schema()` is, and for the same reason: the answer is a property of the session and
+    // a lowering has no session. `ActiveRecord`'s adapter runs it four times while connecting —
+    // once alone and three times joined to `pg_database` for the encoding, the collation and the
+    // ctype.
     if name.eq_ignore_ascii_case("current_database") {
         refuse_wrong_arity(function, "current_database", 0)?;
-        return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
-            Datum::Text(DATABASE_NAME.to_owned()),
-        ))));
+        return Ok(plan::Expr::CurrentDatabase);
     }
     // **The array, unresolved.** It was folded here into a literal `{public}` while `public` was
     // the only schema; now the value is the session's `search_path` and a lowering has no session,
@@ -5047,7 +5088,6 @@ fn table_factor(factor: &TableFactor) -> Result<String> {
 }
 
 fn lower_update(update: &sqlparser::ast::Update) -> Result<plan::Update> {
-    refuse_if(update.from.is_some(), "UPDATE ... FROM")?;
     let returning = update
         .returning
         .as_deref()
@@ -5058,14 +5098,52 @@ fn lower_update(update: &sqlparser::ast::Update) -> Result<plan::Update> {
     refuse_if(!update.order_by.is_empty(), "UPDATE ... ORDER BY")?;
     refuse_if(update.limit.is_some(), "UPDATE ... LIMIT")?;
     refuse_if(!update.optimizer_hints.is_empty(), "an optimizer hint")?;
+    // **A join written on the target itself is not the `FROM` clause.** `UPDATE a JOIN b ON …` is
+    // not PostgreSQL's grammar at all; `UPDATE a SET … FROM b …` is, and it is the one below.
     refuse_if(!update.table.joins.is_empty(), "a JOIN in UPDATE")?;
+    // `FROM` **before** `SET` is Snowflake's spelling and not PostgreSQL's, so it is refused by
+    // name rather than accepted as the same clause in another place.
+    let from_entries = match &update.from {
+        None => &[][..],
+        Some(sqlparser::ast::UpdateTableFromKind::AfterSet(entries)) => entries.as_slice(),
+        Some(sqlparser::ast::UpdateTableFromKind::BeforeSet(_)) => {
+            return Err(SqlError::unsupported("UPDATE ... FROM before SET"));
+        }
+    };
+    let (from, joins) = lower_from_entries(from_entries)?;
+
+    // **The target carries its alias.** Where there is no `FROM` an alias is only a second name
+    // for the only relation there is; with one it is the whole mechanism, because an alias
+    // *replaces* the name and frees it for the `FROM` entry that shares it. One rule for both,
+    // because two would be a rule about a clause the alias is not part of.
+    let target = table_reference(&update.table.relation)?;
+    // A relation, and only a relation: `UPDATE (SELECT …)` is not a statement, and neither is an
+    // `UPDATE` of a `VALUES` list or of a set-returning function.
+    refuse_if(
+        target.derived.is_some() || target.values.is_some() || target.function.is_some(),
+        "an UPDATE of something that is not a table",
+    )?;
+    let alias = target.alias.clone();
 
     let assignments = update
         .assignments
         .iter()
         .map(|assignment| {
             let name = match &assignment.target {
-                AssignmentTarget::ColumnName(name) => object_name(name)?,
+                // **A `SET` target is never qualified**, not even with the target's own alias,
+                // and PostgreSQL's error is about a *column*: `a.body` is read as the column `a`
+                // and a field of it, so `a` is what it reports missing. The relation it names is
+                // the table's own name and not the alias — measured, `HINT` included.
+                AssignmentTarget::ColumnName(name) => match name.0.as_slice() {
+                    [_] => object_name(name)?,
+                    [first, ..] => {
+                        return Err(SqlError::QualifiedSetTarget {
+                            column: first.as_ident().map_or_else(|| first.to_string(), ident),
+                            relation: target.name.clone(),
+                        });
+                    }
+                    [] => return Err(SqlError::unsupported("an empty assignment target")),
+                },
                 other @ AssignmentTarget::Tuple(_) => {
                     return Err(SqlError::unsupported(format!(
                         "the assignment target {other}"
@@ -5075,13 +5153,46 @@ fn lower_update(update: &sqlparser::ast::Update) -> Result<plan::Update> {
             Ok((name, lower_expr(&assignment.value)?))
         })
         .collect::<Result<Vec<_>>>()?;
-
     Ok(plan::Update {
-        table: table_factor(&update.table.relation)?,
+        table: target.name,
+        alias,
+        from,
+        joins,
         assignments,
         filter: update.selection.as_ref().map(lower_expr).transpose()?,
         returning,
     })
+}
+
+/// A comma list of `FROM` entries with their joins, as a left-most relation and a join chain.
+///
+/// The same reading a `SELECT`'s `FROM` gets, and deliberately the same code path: a comma is a
+/// cross join with the condition in the `WHERE`, which is what the comma form *means*, so nothing
+/// is approximated by writing it as one.
+fn lower_from_entries(
+    entries: &[sqlparser::ast::TableWithJoins],
+) -> Result<(Option<plan::TableRef>, Vec<plan::Join>)> {
+    let [first, rest @ ..] = entries else {
+        return Ok((None, Vec::new()));
+    };
+    let left = table_reference(&first.relation)?;
+    let mut joins = first
+        .joins
+        .iter()
+        .map(lower_join)
+        .collect::<Result<Vec<_>>>()?;
+    for entry in rest {
+        joins.push(plan::Join {
+            table: table_reference(&entry.relation)?,
+            kind: plan::JoinKind::Inner,
+            on: None,
+            using: Vec::new(),
+        });
+        for join in &entry.joins {
+            joins.push(lower_join(join)?);
+        }
+    }
+    Ok((Some(left), joins))
 }
 
 fn lower_delete(delete: &sqlparser::ast::Delete) -> Result<plan::Delete> {
