@@ -1,0 +1,55 @@
+crates/esker-sql/src/catalog/mod.rs
+  s_188859e919bef5::t_793da734ef974b 156-165,578-584,765-777,2609-2610,2621,2632,2647,2686,2779,2812,2880-2888,3350,3361,3372,3603,3664,3808,3855
+crates/esker-sql/src/catalog/pg_attribute.rs
+  s_188859e919bef5::t_582cb23b811bc2 161,198
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_188859e919bef5::t_811d3d64868e47 665,683-684
+crates/esker-sql/src/catalog/pg_relations.rs
+  s_188859e919bef5::t_0b84c671fa4267 208-247
+crates/esker-sql/src/catalog/record.rs
+  s_188859e919bef5::t_29727711b1aba1 75-78,84,1208-1221,1225-1253,1656,1692,1741,1747-1748
+crates/esker-sql/src/exec/bind.rs
+  s_188859e919bef5::t_2a125076333a6f 179,301,391,458
+crates/esker-sql/src/exec/comment.rs
+  s_188859e919bef5::t_0d7d53f53a8ac2 1-131
+crates/esker-sql/src/exec/cursor.rs
+  s_188859e919bef5::t_3ea3bb8edd50de 1536-1559
+crates/esker-sql/src/exec/ddl.rs
+  s_188859e919bef5::t_eff77549708d03 47-50,105,156-157,228,386,688,1733,2242
+crates/esker-sql/src/exec/mod.rs
+  s_188859e919bef5::t_248f8e4a573dbb 29,552,1546
+crates/esker-sql/src/exec/subquery.rs
+  s_188859e919bef5::t_6e5f0881155f18 179,196-197,274,299-300
+crates/esker-sql/src/exec/values.rs
+  s_188859e919bef5::t_9c8b6b77fd49ff 51,73-74
+crates/esker-sql/src/parse/lower.rs
+  s_188859e919bef5::t_f1f65df7fd327c 215-220,5136-5142,5153-5204
+crates/esker-sql/src/plan/ddl.rs
+  s_188859e919bef5::t_f3bf49f5fc2dba 401-459
+crates/esker-sql/src/plan/mod.rs
+  s_188859e919bef5::t_f1b4e7c9266984 34-38,90-91,136-138,176-177,218-220
+crates/esker-sql/tests/comment.rs
+  s_188859e919bef5::t_3824d8f0743464 1-88
+crates/esker-sql/tests/corpus/pg19_comment.txt
+  s_188859e919bef5::t_ce691a59de0db5 1-92
+crates/esker-sql/tests/slt/unsupported.slt
+  s_188859e919bef5::t_92fa145e9dd577 60-65,68-73
+docs/adr/0049-a-comment-is-a-field-of-the-object-it-is-about.md
+  s_188859e919bef5::t_fcb9159da388c5 1-65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "37b394c71dc807c3032505829a0c3d3a33df9b30",
+  "prompts": {},
+  "sessions": {
+    "s_188859e919bef5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5b0a7ebb-6297-4871-91b4-2650c25d6c33",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
