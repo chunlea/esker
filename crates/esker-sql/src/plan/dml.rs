@@ -27,6 +27,32 @@ pub struct Insert {
     pub rows: Vec<Vec<Expr>>,
     /// `RETURNING`, over the rows as stored.
     pub returning: Option<Returning>,
+    /// `ON CONFLICT …`, which is what `insert_all` and `upsert_all` compile to.
+    pub on_conflict: Option<OnConflict>,
+}
+
+/// `ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET …`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OnConflict {
+    /// The arbiter columns, or **empty** for a bare `ON CONFLICT`, which takes any unique index.
+    ///
+    /// A *column* list and not an index name: PostgreSQL infers the index from it, so a list that
+    /// matches no unique index is `42P10` rather than a name that does not resolve.
+    pub target: Vec<String>,
+    /// What to do with a row that conflicts.
+    pub action: ConflictAction,
+}
+
+/// The two halves of `ON CONFLICT`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConflictAction {
+    /// `DO NOTHING`: the row is not written, and `RETURNING` does not answer for it.
+    DoNothing,
+    /// `DO UPDATE SET c = …`, over the row **already there**.
+    ///
+    /// `excluded.c` in one of these expressions is the *proposed* row's column — the row that
+    /// would have been inserted — which is why both rows are in scope while they are evaluated.
+    DoUpdate(Vec<(String, Expr)>),
 }
 
 /// `UPDATE t SET a = ..., b = ... WHERE ...`.

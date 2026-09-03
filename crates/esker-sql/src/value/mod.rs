@@ -46,6 +46,7 @@ pub mod oid;
 /// Random bytes from the OS, and the version-4 UUID built from them.
 pub mod random;
 pub mod range;
+pub mod regex;
 /// Arithmetic over the date and time types: which pairs have an operator, and what it yields.
 pub mod temporal;
 pub mod time;

@@ -215,6 +215,37 @@ pub struct DropFunction {
     pub if_exists: bool,
 }
 
+/// `CREATE SCHEMA [IF NOT EXISTS] name`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateSchema {
+    /// The schema's name, folded.
+    pub name: String,
+    /// `IF NOT EXISTS`, which turns the `42P06` into a notice and a success.
+    pub if_not_exists: bool,
+}
+
+/// `DROP SCHEMA [IF EXISTS] name [CASCADE]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropSchema {
+    /// The schemas named, folded.
+    pub names: Vec<String>,
+    /// `IF EXISTS`, which **covers absence and not dependence**: a schema with a table in it is
+    /// still `2BP01` with the clause written. Measured.
+    pub if_exists: bool,
+    /// `CASCADE`, which takes everything in the schema with it.
+    pub cascade: bool,
+}
+
+/// `ALTER SCHEMA name RENAME TO other`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterSchemaRename {
+    /// The schema as it is now.
+    pub name: String,
+    /// What it becomes. **Every relation moves with it**, because a relation records the schema it
+    /// is in by name and the rename rewrites that name.
+    pub to: String,
+}
+
 /// A partition's bound as the statement wrote it, before the parent's types are in reach.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PartitionSpec {

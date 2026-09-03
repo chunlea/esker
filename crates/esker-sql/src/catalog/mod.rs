@@ -2304,6 +2304,59 @@ pub fn function(txn: &dyn Txn, tenant: u64, name: &str) -> Result<Option<Functio
     };
     record::decode_function(&bytes, name.to_owned()).map(Some)
 }
+/// Every schema this tenant has **created**, in name order.
+///
+/// `public` is not among them: it is a property of the build, the way the available extensions
+/// are, and a tenant that has created nothing still has it. Callers that want the whole list ask
+/// [`schema_names`].
+pub fn schemas(txn: &dyn Txn, tenant: u64) -> Result<Vec<(String, u64)>> {
+    let (start, end) = record::schema_range(tenant);
+    let mut out = Vec::new();
+    for (key, value) in txn.scan(&start, &end, u32::MAX)? {
+        let name = record::schema_name_of(tenant, &key)?;
+        out.push((name, record::decode_schema(&value)?));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+/// Every schema a name can resolve in, `public` first — which is the order `pg_namespace` and
+/// `schema_names` report.
+pub fn schema_names(txn: &dyn Txn, tenant: u64) -> Result<Vec<(String, u64)>> {
+    let mut out = vec![(PUBLIC_SCHEMA.to_owned(), PUBLIC_SCHEMA_ID)];
+    out.extend(schemas(txn, tenant)?);
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+/// Whether a schema exists, `public` included.
+pub fn schema_exists(txn: &dyn Txn, tenant: u64, name: &str) -> Result<bool> {
+    if name == PUBLIC_SCHEMA {
+        return Ok(true);
+    }
+    Ok(txn.get(&record::schema_key(tenant, name))?.is_some())
+}
+
+/// Records a schema. The caller has already decided it is not there.
+pub fn create_schema(txn: &mut dyn Txn, tenant: u64, name: &str, id: u64) -> Result<()> {
+    txn.put(
+        &record::schema_key(tenant, name),
+        &record::encode_schema(id),
+    );
+    bump_version(txn)
+}
+
+/// Removes one. The caller has already decided what depends on it.
+pub fn drop_schema(txn: &mut dyn Txn, tenant: u64, name: &str) -> Result<()> {
+    txn.delete(&record::schema_key(tenant, name));
+    bump_version(txn)
+}
+
+/// The one schema every tenant has.
+pub const PUBLIC_SCHEMA: &str = "public";
+
+/// `public`'s oid, which a real server also fixes rather than allocating.
+pub const PUBLIC_SCHEMA_ID: u64 = 11;
 
 /// Every stored function of one tenant, in name order.
 pub fn functions(txn: &dyn Txn, tenant: u64) -> Result<Vec<FunctionDef>> {
@@ -2683,7 +2736,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "15",               // catalog format version
+                "16",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -2776,7 +2829,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "15",       // catalog format version
+                "16",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -2803,13 +2856,38 @@ mod tests {
         assert_eq!(record::decode_extension(&written_at_12).unwrap(), "1.1");
     }
 
+    /// **Every record kind owns its own key byte**, and two that share one are two records in one
+    /// key range.
+    ///
+    /// `KIND_FUNCTION` and `KIND_FLASHBACK` were both `b'f'`, so `catalog::functions` — which is a
+    /// prefix scan over `'f' ++ tenant` — swept up every flashback record the tenant had and tried
+    /// to decode it as a function. `SELECT * FROM pg_proc` during a flashback is the reachable
+    /// shape. The assertion is over the *keys* rather than over the behaviour, because a key range
+    /// that overlaps is the bug whatever is stored in it.
+    #[test]
+    fn no_two_record_kinds_share_a_key_range() {
+        let (start, end) = record::function_range(7);
+        let flashback = record::flashback_key(7, 1);
+        assert!(
+            flashback < start || flashback >= end,
+            "a flashback record sits inside the function range: functions() would decode it"
+        );
+        // And the other way round, for the range a flashback scan would use if one is added.
+        let function = record::function_key(7, "f");
+        let (extension_start, extension_end) = record::extension_range(7);
+        assert!(
+            function < extension_start || function >= extension_end,
+            "a function record sits inside the extension range"
+        );
+    }
+
     #[test]
     fn a_table_record_is_a_version_and_then_the_definition() {
         let encoded = record::encode_table(&accounts(7)).unwrap();
         assert_eq!(
             hex(&encoded),
             concat!(
-                "15",                 // catalog format version
+                "16",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -3852,7 +3930,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "15",               // catalog format version
+                "16",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

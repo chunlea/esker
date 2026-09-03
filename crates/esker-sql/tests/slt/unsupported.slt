@@ -37,8 +37,10 @@ statement error (0A000)
 SELECT count(*) FILTER (WHERE a > 0) FROM t
 
 
+# `ON CONFLICT` left this file with `upsert_all`. What is still refused is the arbiter's `WHERE`,
+# which `sqlparser` 0.62.0 cannot read at all -- a C1 gap rather than a clause declined here.
 statement error (0A000)
-INSERT INTO t VALUES (1, 2, 'x') ON CONFLICT DO NOTHING
+INSERT INTO t VALUES (1, 2, 'x') ON CONFLICT (a) DO UPDATE SET b = excluded.b WHERE t.b > 0
 
 statement error (0A000)
 INSERT INTO t SELECT * FROM t

@@ -57,26 +57,14 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          WHERE x.indrelid = 'pk_part_1'::regclass",
         "SELECT 'r', conname, contype FROM pg_constraint WHERE conrelid = 'pk_part_1'::regclass",
     ],
-    answers: &[
-        (
-            "INSERT INTO \"measurements\" (\"city_id\",\"logdate\",\"peaktemp\",\"unitsales\") VALUES \
-             (\'1\',\'2026-09-05\',1,1),(\'2\',\'2026-09-06\',2,2),(\'2\',\'2026-09-07\',0,0) ON CONFLICT \
-             (\"logdate\",\"city_id\") DO UPDATE SET \"peaktemp\"=excluded.\"peaktemp\",\"unitsales\"=excluded.\"unitsales\"",
-            "`INSERT ... ON CONFLICT` is a statement this node does not have at all, and nothing \
-             about it is partitioning: `upsert_all` is the same clause on an ordinary table. What \
-             the capture settles here is that a real server routes the conflict through the \
-             *parent* and arbitrates on the *partition\u{2019}s* own index — a fact this node will \
-             need the day `ON CONFLICT` lands, and one it cannot answer before then",
-        ),
-        (
-            "SELECT \'r\', pg_typeof(relhassubclass), pg_typeof(relkind) FROM pg_class WHERE relname = \'measurements\'",
-            "The standing catalog-type trade, and this is the one query that makes it a *row* \
+    answers: &[(
+        "SELECT \'r\', pg_typeof(relhassubclass), pg_typeof(relkind) FROM pg_class WHERE relname = \'measurements\'",
+        "The standing catalog-type trade, and this is the one query that makes it a *row* \
              rather than a declared type: `pg_typeof` returns the type as a value, so `relkind` \
              being `\"char\"` there and `text` here shows up in the answer. `relhassubclass` agrees. \
              Every value in the column is identical; only the name of the type it is stored under \
              differs, which is the trade every `pg_catalog` column in this crate makes",
-        ),
-    ],
+    )],
 };
 
 #[test]

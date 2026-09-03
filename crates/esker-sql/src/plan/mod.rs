@@ -31,16 +31,16 @@ mod time_machine;
 pub use crate::catalog::Identity;
 pub use crate::catalog::pg_catalog::CatalogView;
 pub use ddl::{
-    AlterTable, AlterTableAction, Column, ColumnDefault, Comment, CommentObject, CreateExtension,
-    CreateFunction, CreateIndex, CreateSequence, CreateTable, CreateTrigger, DropFunction,
-    DropIndex, DropSequence, DropTable, DropTrigger, ForeignKey, IndexKeyPart, KeyPartName,
-    PartitionSpec, RangeEnd, UniqueConstraint, foreign_key_name, index_name, primary_key_name,
-    sequence_name, unique_constraint_name,
+    AlterSchemaRename, AlterTable, AlterTableAction, Column, ColumnDefault, Comment, CommentObject,
+    CreateExtension, CreateFunction, CreateIndex, CreateSchema, CreateSequence, CreateTable,
+    CreateTrigger, DropFunction, DropIndex, DropSchema, DropSequence, DropTable, DropTrigger,
+    ForeignKey, IndexKeyPart, KeyPartName, PartitionSpec, RangeEnd, UniqueConstraint,
+    foreign_key_name, index_name, primary_key_name, sequence_name, unique_constraint_name,
 };
-pub use dml::{Delete, Insert, Returning, Update};
+pub use dml::{ConflictAction, Delete, Insert, OnConflict, Returning, Update};
 pub use expr::{
     AggregateCall, AggregateFunc, ArithOp, BinaryOp, CaseBranch, CatalogFunc, CatalogFuncCall,
-    Expr, Literal, ScalarFunc, SequenceCall, SequenceFunc, UuidFunc, like_matches,
+    Expr, Literal, ScalarFunc, SequenceCall, SequenceFunc, UuidFunc, like_matches, regex_operator,
 };
 pub use query::{
     AggregateSpec, Join, JoinKind, Node, OrderItem, Probe, Select, SelectItem, SortKey,
@@ -83,6 +83,12 @@ pub enum Statement {
     /// that the extension is installed, and what an extension *carries* is either already in this
     /// build or is why the name is not available.
     CreateExtension(CreateExtension),
+    /// `CREATE SCHEMA` — a second namespace, which is a catalog object like any other here.
+    CreateSchema(CreateSchema),
+    /// `DROP SCHEMA [CASCADE]`.
+    DropSchema(DropSchema),
+    /// `ALTER SCHEMA … RENAME TO …`.
+    AlterSchemaRename(AlterSchemaRename),
     /// `CREATE INDEX`, and the `UNIQUE` variant.
     CreateIndex(CreateIndex),
     /// `DROP INDEX`.
@@ -172,6 +178,9 @@ impl Statement {
             Statement::CreateTable(_) => Some("CREATE TABLE"),
             // A catalog write like the rest, so a read-only or time-travelling block refuses it.
             Statement::CreateExtension(_) => Some("CREATE EXTENSION"),
+            Statement::CreateSchema(_) => Some("CREATE SCHEMA"),
+            Statement::DropSchema(_) => Some("DROP SCHEMA"),
+            Statement::AlterSchemaRename(_) => Some("ALTER SCHEMA"),
             Statement::DropTable(_) => Some("DROP TABLE"),
             // A catalog write like the rest: it rewrites the table record the comment lives in.
             Statement::Comment(_) => Some("COMMENT"),
@@ -214,6 +223,9 @@ impl Statement {
         match self {
             Statement::CreateTable(_) => "CREATE TABLE",
             Statement::CreateExtension(_) => "CREATE EXTENSION",
+            Statement::CreateSchema(_) => "CREATE SCHEMA",
+            Statement::DropSchema(_) => "DROP SCHEMA",
+            Statement::AlterSchemaRename(_) => "ALTER SCHEMA",
             Statement::DropTable(_) => "DROP TABLE",
             // **`COMMENT`, not `COMMENT ON`** — PostgreSQL's tag is the first word alone, which
             // `psql` prints back and a script may branch on.

@@ -575,6 +575,9 @@ fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
         }
         Expr::Like {
             operand, pattern, ..
+        }
+        | Expr::RegexMatch {
+            operand, pattern, ..
         } => {
             substitute_in_expr(operand, outer, depth);
             substitute_in_expr(pattern, outer, depth);
@@ -1050,6 +1053,9 @@ pub(super) fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
         | Expr::Scalar { operand: inner, .. } => walk(inner, visit),
         Expr::Like {
             operand, pattern, ..
+        }
+        | Expr::RegexMatch {
+            operand, pattern, ..
         } => {
             walk(operand, visit);
             walk(pattern, visit);
@@ -1123,6 +1129,9 @@ fn walk_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr) -> Result<()>) ->
         | Expr::ToText { operand: inner, .. }
         | Expr::Scalar { operand: inner, .. } => walk_mut(inner, visit)?,
         Expr::Like {
+            operand, pattern, ..
+        }
+        | Expr::RegexMatch {
             operand, pattern, ..
         } => {
             walk_mut(operand, visit)?;

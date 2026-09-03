@@ -93,6 +93,23 @@ impl<'a> Scope<'a> {
         Scope::single_as(table, table.name.clone())
     }
 
+    /// The target row and the **proposed** row side by side, for an `ON CONFLICT … DO UPDATE`.
+    ///
+    /// PostgreSQL puts both in scope while the assignments are evaluated: a bare column or one
+    /// qualified with the table's name is the row **already there**, and `excluded.c` is the row
+    /// that would have been inserted. Two entries of one table under two names is exactly that,
+    /// and it makes the ordinals run `0..n` for the first and `n..2n` for the second — which is
+    /// the shape of the concatenated row the evaluator is handed.
+    pub(super) fn conflicting(table: &'a TableDef) -> Self {
+        Scope {
+            tables: vec![table, table],
+            names: vec![table.name.clone(), "excluded".to_owned()],
+            written: vec![0, 1],
+            using: Vec::new(),
+            outer: None,
+        }
+    }
+
     /// One table under the name the query refers to it by.
     fn single_as(table: &'a TableDef, name: String) -> Self {
         Scope {
@@ -1567,6 +1584,17 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             case_insensitive: *case_insensitive,
             escape: *escape,
         },
+        Expr::RegexMatch {
+            operand,
+            pattern,
+            negated,
+            case_insensitive,
+        } => Expr::RegexMatch {
+            operand: Box::new(resolve(operand, scope)?),
+            pattern: Box::new(resolve(pattern, scope)?),
+            negated: *negated,
+            case_insensitive: *case_insensitive,
+        },
         // The strip is decided here, where the operand's type is still known.
         Expr::Scalar { func, operand } => Expr::Scalar {
             func: *func,
@@ -2229,6 +2257,7 @@ fn check_predicate(expr: &Expr, clause: &'static str, scope: &Scope<'_>) -> Resu
     match expr {
         Expr::Binary { .. }
         | Expr::Like { .. }
+        | Expr::RegexMatch { .. }
         | Expr::Not(_)
         | Expr::IsNull { .. }
         | Expr::InList { .. }
@@ -2528,6 +2557,7 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         Expr::Literal(Literal::Typed(value)) => value.column_type().unwrap_or(ColumnType::Text),
         Expr::Literal(Literal::Bool(_))
         | Expr::Like { .. }
+        | Expr::RegexMatch { .. }
         | Expr::Binary { .. }
         | Expr::Not(_)
         | Expr::IsNull { .. }

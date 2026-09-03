@@ -165,6 +165,9 @@ fn for_each_subquery_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut TableRef))
         Expr::Not(inner) => for_each_subquery_mut(inner, visit),
         Expr::Like {
             operand, pattern, ..
+        }
+        | Expr::RegexMatch {
+            operand, pattern, ..
         } => {
             for_each_subquery_mut(operand, visit);
             for_each_subquery_mut(pattern, visit);
