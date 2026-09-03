@@ -31,6 +31,9 @@ pub struct CreateTable {
     /// The `EXCLUDE` constraints, re-attached after the parser was handed a statement without
     /// them (`crate::parse::strip_exclude_constraints`).
     pub excludes: Vec<crate::catalog::ExcludeDef>,
+    /// `UNLOGGED`, re-attached the same way and for the same reason — the parser cannot read the
+    /// keyword, so it is cut out of the source and put back here.
+    pub persistence: crate::catalog::Persistence,
     /// `PARTITION BY LIST (col, …)` — the strategy and the key columns' names, unresolved.
     pub partition_by: Option<(crate::catalog::PartitionStrategy, Vec<String>)>,
     /// `PARTITION OF parent FOR VALUES IN (…)` / `… DEFAULT` — the parent's name and the bound as
@@ -689,6 +692,13 @@ pub enum AlterTableAction {
         /// column used to draw from.
         default: Option<ColumnDefault>,
     },
+    /// `ALTER TABLE … SET { LOGGED | UNLOGGED }`.
+    ///
+    /// Built from the statement's *class* rather than from a parsed action, because `sqlparser`
+    /// 0.62.0 has no `LOGGED` keyword (`crate::parse::set_persistence`). It reaches the executor
+    /// through the ordinary `ALTER TABLE` path all the same, so it gets the same transaction, the
+    /// same `42P01` for a missing table and the same schema-version bump.
+    SetPersistence(crate::catalog::Persistence),
     /// `ALTER TABLE … ADD CONSTRAINT … CHECK (…)`.
     AddCheck(crate::catalog::CheckDef),
     /// `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY (…) REFERENCES … (…)`.

@@ -49,8 +49,9 @@ use esker_keys::{codec, prefix};
 
 use crate::catalog::{
     CheckDef, ColumnDef, ExcludeDef, ExprShape, ForeignKeyDef, FunctionDef, Identity, IndexDef,
-    IndexKey, KeyOrder, KeyPart, PartitionBound, PartitionKey, PartitionStrategy, RangeBound,
-    ReferentialAction, Relation, SchemaState, SequenceDef, TableDef, TriggerDef, UniqueKind,
+    IndexKey, KeyOrder, KeyPart, PartitionBound, PartitionKey, PartitionStrategy, Persistence,
+    RangeBound, ReferentialAction, Relation, SchemaState, SequenceDef, TableDef, TriggerDef,
+    UniqueKind,
 };
 use crate::error::{Result, SqlError};
 use crate::value::{ColumnType, Datum, NO_TYPMOD};
@@ -81,7 +82,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 22;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 23;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -1291,7 +1292,31 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         put_str(index.comment.as_deref().unwrap_or(""), &mut out);
     }
 
+    // Version 23. One byte, `UNLOGGED` or not — see `read_persistence` for why it is the table's
+    // and not each relation's.
+    out.push(match table.persistence {
+        Persistence::Permanent => 0,
+        Persistence::Unlogged => 1,
+    });
+
     Ok(out)
+}
+
+/// The version 23 section: whether the table is `UNLOGGED`.
+///
+/// One byte on the end, for the eleventh time and the same reason: sections go on in version order
+/// and come off in that order. A table written before 23 has none, which is what every table had
+/// while `CREATE UNLOGGED TABLE` was a *syntax error* rather than a refusal — so it decodes
+/// `Permanent`, which is what those tables are.
+fn read_persistence(reader: &mut Reader<'_>) -> Result<Persistence> {
+    if reader.version < 23 {
+        return Ok(Persistence::Permanent);
+    }
+    match reader.byte()? {
+        0 => Ok(Persistence::Permanent),
+        1 => Ok(Persistence::Unlogged),
+        other => Err(corrupt(format!("relpersistence byte {other}"))),
+    }
 }
 
 /// Version 21: the table's comment, the primary key's, then one per column and one per index.
@@ -1811,10 +1836,12 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
     // Read **after** version 19's two sections, because it is written after them.
     let excludes = read_excludes(&mut reader)?;
     let (comment, primary_key_comment) = read_comments(&mut reader, &mut columns, &mut indexes)?;
+    let persistence = read_persistence(&mut reader)?;
     reader.finish()?;
 
     Ok(TableDef {
         id,
+        persistence,
         name,
         comment,
         primary_key_comment,

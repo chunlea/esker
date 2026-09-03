@@ -132,6 +132,7 @@ pub(super) fn create_table(
     let sequences = sequences_for(executor, txn, create, table_id)?;
     let table = TableDef {
         id: table_id,
+        persistence: create.persistence,
         name: create.name.clone(),
         columns,
         primary_key,
@@ -1408,6 +1409,15 @@ fn resolve_foreign_key(
             parent_def.name.clone(),
         ));
     }
+    // **A permanent table may not reference an unlogged one**, and the rule is one-directional:
+    // the reverse is accepted, because losing the child's rows on a crash breaks nothing about the
+    // parent while the other way round leaves a constraint pointing at rows that are gone.
+    // Measured both ways; a symmetric check would refuse half the statements a real server takes.
+    if child.persistence == catalog::Persistence::Permanent
+        && parent_def.persistence == catalog::Persistence::Unlogged
+    {
+        return Err(SqlError::PermanentReferencesUnlogged);
+    }
     Ok(catalog::ForeignKeyDef {
         name: key.name.clone(),
         columns,
@@ -2269,6 +2279,15 @@ pub(super) fn alter_table(
         }
         if let AlterTableAction::SetColumnarReplicas { replicas } = action {
             set_columnar_replicas(txn, executor, &updated, *replicas)?;
+            continue;
+        }
+        // **One field on the table and nothing else.** Every relation reads its persistence from
+        // the table it belongs to, so the indexes and the owned sequence move with it in this same
+        // statement and there is no second place to keep in step.
+        if let AlterTableAction::SetPersistence(persistence) = action {
+            updated.persistence = *persistence;
+            catalog::replace_table(txn, executor.tenant, &table, &mut updated)?;
+            changed = true;
             continue;
         }
         if let AlterTableAction::SetTriggersDisabled { disabled } = action {

@@ -684,6 +684,24 @@ pub enum SqlError {
     #[error("syntax error at or near \"{0}\"")]
     SyntaxAtOrNear(String),
 
+    /// A permanent table whose foreign key points at an unlogged one: `42P16`.
+    ///
+    /// **One-directional, and that is the half a symmetric rule gets wrong.** An unlogged table
+    /// referencing a permanent one is accepted with no error — losing the child on a crash breaks
+    /// nothing about the parent — while the reverse would leave a constraint pointing at rows that
+    /// are gone. Measured, both ways.
+    #[error("constraints on permanent tables may reference only permanent tables")]
+    PermanentReferencesUnlogged,
+
+    /// `CREATE UNLOGGED VIEW`: `42601`, and PostgreSQL explains itself rather than pointing at a
+    /// token.
+    ///
+    /// **A syntax-class error and not a `0A000`**, which is the surprising half: the keyword is
+    /// grammatical and the object is wrong, so a real server rejects the *combination* with a
+    /// sentence. Unlogged is a property of storage, and a view has none.
+    #[error("views cannot be unlogged because they do not have storage")]
+    UnloggedView,
+
     /// `ORDER BY <name>` where more than one **output** column is called that.
     ///
     /// A different sentence from [`SqlError::AmbiguousColumn`] and about a different thing: the
@@ -1553,7 +1571,8 @@ impl SqlError {
             // A ragged `VALUES` list is a **syntax** error and not a type one, which is worth
             // saying out loud: the rows have no common shape, so there is nothing to type.
             | SqlError::ValuesRowLength
-            | SqlError::SyntaxAtOrNear(_) => sqlstate::SYNTAX_ERROR,
+            | SqlError::SyntaxAtOrNear(_)
+            | SqlError::UnloggedView => sqlstate::SYNTAX_ERROR,
             SqlError::StatementTooComplex => sqlstate::STATEMENT_TOO_COMPLEX,
             SqlError::UndefinedTable(_)
             | SqlError::UndefinedTableForDrop(_)
@@ -1581,6 +1600,7 @@ impl SqlError {
             | SqlError::ConstraintNotDeferrable(_)
             | SqlError::ParameterlessAggregate
             | SqlError::ExclusionOperatorNotInFamily { .. } => sqlstate::WRONG_OBJECT_TYPE,
+            SqlError::PermanentReferencesUnlogged => sqlstate::INVALID_TABLE_DEFINITION,
             SqlError::UndefinedColumn(_)
             | SqlError::UndefinedColumnInForeignKey(_)
             | SqlError::UndefinedColumnInKey(_)

@@ -659,6 +659,14 @@ pub const DERIVED_TABLE_ID: u64 = u64::MAX - 1024;
 pub struct TableDef {
     /// From the tenant's relation-id sequence. Part of every key of every row.
     pub id: u64,
+    /// Whether the table was created `UNLOGGED`.
+    ///
+    /// **Stored on the table and nowhere else.** A real server marks the sequence a `bigserial`
+    /// owns and every index — the primary key's included — with the table's persistence, and
+    /// `ALTER TABLE … SET LOGGED` moves all of them together. Deriving each relation's answer from
+    /// its table (`crate::catalog::pg_catalog`) is what makes both of those true at once, and it
+    /// is the only arrangement in which they cannot disagree.
+    pub persistence: Persistence,
     /// Unique across the tenant.
     pub name: String,
     /// In declaration order, which is the order a row's values are encoded in.
@@ -775,6 +783,37 @@ pub struct TableDef {
     /// and `obj_description('t_pkey'::regclass, 'pg_class')` answers. Measured; it is the one
     /// comment that has nowhere else to live.
     pub primary_key_comment: Option<String>,
+}
+
+/// Whether a relation's contents survive a crash: `pg_class.relpersistence`.
+///
+/// Three values on a real server and two here — `t`, temporary, is a different feature and
+/// `CREATE TEMPORARY TABLE` is refused by name, so a value for it would describe a table this node
+/// cannot make. **`u` is not a kind of `t`**: an unlogged table is permanent and shared, and only
+/// its *contents* are expendable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Persistence {
+    /// `p`. Written to the log, and what every table is unless it says otherwise.
+    #[default]
+    Permanent,
+    /// `u`. **Recorded and not yet acted on**: this node logs an unlogged table's writes like any
+    /// other, so the only difference a client can see is the catalog column. The saving an
+    /// unlogged table exists for is an engine decision — which column family a write goes to and
+    /// whether it is truncated on recovery — and skipping the WAL for one would be a durability
+    /// change (`CLAUDE.md` invariant 1) rather than a catalog one. What the suite needs is the
+    /// statement to work and the column to be right; what it does not need is the data loss.
+    Unlogged,
+}
+
+impl Persistence {
+    /// The one character `pg_class.relpersistence` carries.
+    #[must_use]
+    pub fn relpersistence(self) -> &'static str {
+        match self {
+            Persistence::Permanent => "p",
+            Persistence::Unlogged => "u",
+        }
+    }
 }
 
 /// A stored function — **defined and never executed**.
@@ -2658,6 +2697,7 @@ mod tests {
     fn accounts(id: u64) -> TableDef {
         TableDef {
             id,
+            persistence: super::Persistence::Permanent,
             name: "accounts".into(),
             comment: None,
             primary_key_comment: None,
@@ -2736,7 +2776,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "16",               // catalog format version
+                "17",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -2829,7 +2869,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "16",       // catalog format version
+                "17",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -2887,7 +2927,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "16",                 // catalog format version
+                "17",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -2964,6 +3004,9 @@ mod tests {
                 "00", // `id`'s
                 "00", // `email`'s
                 "00", // `accounts_email_key`'s
+                // Version 23. Permanent: this table was not created `UNLOGGED`. One byte for the
+                // whole table, because every relation it owns reads its persistence from here.
+                "00",
             )
         );
         assert_eq!(record::decode_table(&encoded).unwrap(), accounts(7));
@@ -3930,7 +3973,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "16",               // catalog format version
+                "17",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

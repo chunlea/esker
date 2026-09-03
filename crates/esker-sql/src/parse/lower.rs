@@ -37,6 +37,16 @@ impl Parsed {
     /// Lowers this statement into the plan types the executor runs, or names the construct that
     /// stopped it (contract C2).
     pub fn lower(&self) -> Result<plan::Statement> {
+        // **Built here, not parsed.** `ALTER TABLE … SET { LOGGED | UNLOGGED }` was rewritten to a
+        // placeholder because the parser has no `LOGGED` keyword, so the statement is reconstructed
+        // from what the class recorded — and then travels the ordinary `ALTER TABLE` path.
+        if let crate::parse::StatementClass::SetPersistence { table, persistence } = &self.class {
+            return Ok(plan::Statement::AlterTable(plan::AlterTable {
+                name: table.clone(),
+                if_exists: false,
+                actions: vec![plan::AlterTableAction::SetPersistence(*persistence)],
+            }));
+        }
         let mut lowered = lower_statement(&self.statement)?;
         // The one thing the parser could not carry (`crate::parse::Parsed::concurrently`).
         if let plan::Statement::DropIndex(drop) = &mut lowered {
@@ -45,6 +55,9 @@ impl Parsed {
         // And the clauses it could not read at all: an `EXCLUDE` constraint is cut out of the
         // source so the statement parses, and re-attached here from its own text.
         if let plan::Statement::CreateTable(create) = &mut lowered {
+            if self.is_unlogged() {
+                create.persistence = catalog::Persistence::Unlogged;
+            }
             for clause in self.exclude_constraints() {
                 create.excludes.push(crate::parse::parse_exclude_constraint(
                     clause,
@@ -1548,6 +1561,8 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
     )?;
 
     Ok(plan::CreateTable {
+        // Overridden in `Parsed::lower`, which is where the stripped keyword is in reach.
+        persistence: catalog::Persistence::Permanent,
         name,
         checks,
         foreign_keys,

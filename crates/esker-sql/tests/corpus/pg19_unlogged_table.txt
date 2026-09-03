@@ -1,0 +1,95 @@
+# `CREATE UNLOGGED TABLE` — as a real PostgreSQL 19beta1 answers it.
+#
+# **The largest single row in run 45's failure ranking: 198 tests across 24 files.** And it is one
+# setting, not twenty-four needs — `rails/activerecord/test/cases/helper.rb:14-16` does
+#
+#     if defined?(ActiveRecord::ConnectionAdapters::PostgreSQLAdapter)
+#       ActiveRecord::ConnectionAdapters::PostgreSQLAdapter.create_unlogged_tables = true
+#     end
+#
+# unconditionally, for the whole suite. So **every `create_table` any test issues is UNLOGGED**, and
+# this is not a niche feature test: it is how ActiveRecord's suite creates every table it makes.
+#
+# The statements below are what Rails actually emits, obtained by turning the flag on and
+# subscribing to `sql.active_record` rather than by reading the adapter source:
+#
+#     CREATE UNLOGGED TABLE "unlogged_probe" ("id" bigserial primary key, "name" character varying, "n" integer)
+#     CREATE UNLOGGED TABLE "unlogged_noid" ("a" integer)
+#
+# The keyword sits between `CREATE` and `TABLE`; everything after the table name is unchanged from
+# the logged form, which is the whole of the grammar difference.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way.
+#
+# **The whole capture runs inside `BEGIN … ROLLBACK`**, error probes in `SAVEPOINT` / `ROLLBACK TO`.
+# The `SELECT count(*)` at the end proves it left nothing behind and answers `0`. The `\gdesc` pass
+# runs after the rollback, so statements naming these tables have an **empty** declared-types column;
+# the `pg_typeof` line pins `"char"` for `relpersistence`.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`relpersistence` is a `"char"` with three values, and `u` is only one of them**: `p`
+#     permanent, `u` unlogged, `t` temporary. `CREATE TEMP TABLE` is `t`, not a kind of unlogged.
+#   * **The persistence is inherited by everything the table owns.** A `bigserial`'s sequence
+#     (`unlogged_probe_id_seq`) and every index including the primary key come out `u` as well. An
+#     implementation that stores the flag on the table alone reports the wrong thing for four
+#     relations out of five.
+#   * **`information_schema.tables` cannot tell them apart.** Both the logged and the unlogged table
+#     are `BASE TABLE`. Persistence is visible only in `pg_class.relpersistence`, so a client that
+#     reads the information schema has no way to see it — which is why the `relpersistence` column
+#     is the whole specification here.
+#   * **`ALTER TABLE … SET LOGGED` / `SET UNLOGGED` flips the indexes too**, in the same statement:
+#     after `SET LOGGED` the table *and* `unlogged_probe_n_idx` *and* `unlogged_probe_pkey` all read
+#     `p`, and `SET UNLOGGED` puts them back.
+#   * **A permanent table may not reference an unlogged one**:
+#     `42P16 constraints on permanent tables may reference only permanent tables`. The reverse is
+#     **allowed** — an unlogged table referencing a logged one is accepted with no error. The rule is
+#     one-directional, which is the half a symmetric implementation gets wrong.
+#   * **`ALTER TABLE … SET LOGGED` on a TEMP table is `42P16 cannot change logged status of table
+#     "temp_probe" because it is temporary`** — same SQLSTATE as the foreign-key rule, different
+#     sentence.
+#   * **`CREATE UNLOGGED VIEW` is `42601 views cannot be unlogged because they do not have
+#     storage`** — a syntax-class error, not `0A000`, and the message explains itself.
+#   * **`CREATE UNLOGGED TABLE IF NOT EXISTS` on an existing table is a plain success**, no error and
+#     no notice row here.
+BEGIN		-
+CREATE UNLOGGED TABLE "unlogged_probe" ("id" bigserial primary key, "name" character varying, "n" integer)		-
+CREATE UNLOGGED TABLE "unlogged_noid" ("a" integer)		-
+CREATE TABLE "logged_probe" ("id" bigserial primary key, "name" character varying)		-
+SELECT 'r', relname, relpersistence, relkind FROM pg_class WHERE relname IN ('unlogged_probe','unlogged_noid','logged_probe') ORDER BY relname	text,name,"char","char"	r|logged_probe|p|r ; r|unlogged_noid|u|r ; r|unlogged_probe|u|r
+SELECT 'r', relname, relpersistence FROM pg_class WHERE relname IN ('unlogged_probe_pkey','logged_probe_pkey','unlogged_probe_id_seq','logged_probe_id_seq') ORDER BY relname	text,name,"char"	r|logged_probe_id_seq|p ; r|logged_probe_pkey|p ; r|unlogged_probe_id_seq|u ; r|unlogged_probe_pkey|u
+SELECT 'r', table_name, table_type FROM information_schema.tables WHERE table_name IN ('unlogged_probe','logged_probe') ORDER BY table_name	text,name,character varying	r|logged_probe|BASE TABLE ; r|unlogged_probe|BASE TABLE
+INSERT INTO "unlogged_probe" ("name","n") VALUES ('a',1)		-
+INSERT INTO "unlogged_probe" ("name","n") VALUES ('b',2)		-
+SELECT 'r', id, name, n FROM "unlogged_probe" ORDER BY id		r|1|a|1 ; r|2|b|2
+CREATE INDEX unlogged_probe_n_idx ON "unlogged_probe" (n)		-
+SELECT 'r', i.relname, i.relpersistence FROM pg_class i JOIN pg_index x ON x.indexrelid = i.oid WHERE x.indrelid = 'unlogged_probe'::regclass ORDER BY i.relname		r|unlogged_probe_n_idx|u ; r|unlogged_probe_pkey|u
+ALTER TABLE "unlogged_probe" SET LOGGED		-
+SELECT 'r', relname, relpersistence FROM pg_class WHERE relname = 'unlogged_probe'	text,name,"char"	r|unlogged_probe|p
+SELECT 'r', i.relname, i.relpersistence FROM pg_class i JOIN pg_index x ON x.indexrelid = i.oid WHERE x.indrelid = 'unlogged_probe'::regclass ORDER BY i.relname		r|unlogged_probe_n_idx|p ; r|unlogged_probe_pkey|p
+ALTER TABLE "unlogged_probe" SET UNLOGGED		-
+SELECT 'r', relname, relpersistence FROM pg_class WHERE relname = 'unlogged_probe'	text,name,"char"	r|unlogged_probe|u
+CREATE UNLOGGED TABLE IF NOT EXISTS "unlogged_probe" ("id" bigserial primary key)		-
+CREATE TEMP TABLE "temp_probe" ("a" integer)		-
+SELECT 'r', relname, relpersistence FROM pg_class WHERE relname = 'temp_probe'	text,name,"char"	r|temp_probe|t
+SAVEPOINT s1		-
+CREATE TABLE "fk_to_unlogged" ("id" bigserial primary key, "u" bigint REFERENCES "unlogged_probe" ("id"))	!42P16 constraints on permanent tables may reference only permanent tables
+ROLLBACK TO s1		-
+CREATE UNLOGGED TABLE "fk_unlogged_to_unlogged" ("id" bigserial primary key, "u" bigint REFERENCES "unlogged_probe" ("id"))		-
+SELECT 'r', relname, relpersistence FROM pg_class WHERE relname = 'fk_unlogged_to_unlogged'	text,name,"char"	r|fk_unlogged_to_unlogged|u
+SAVEPOINT s2		-
+CREATE UNLOGGED TABLE "unlogged_fk_to_logged" ("id" bigserial primary key, "l" bigint REFERENCES "logged_probe" ("id"))		-
+ROLLBACK TO s2		-
+SAVEPOINT s3		-
+CREATE UNLOGGED VIEW "unlogged_view" AS SELECT 1	!42601 views cannot be unlogged because they do not have storage
+ROLLBACK TO s3		-
+SAVEPOINT s4		-
+ALTER TABLE "temp_probe" SET LOGGED	!42P16 cannot change logged status of table "temp_probe" because it is temporary
+ROLLBACK TO s4		-
+SELECT 'r', pg_typeof(relpersistence) FROM pg_class WHERE relname = 'logged_probe'	text,regtype	r|"char"
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('unlogged_probe','unlogged_noid','logged_probe','fk_unlogged_to_unlogged','temp_probe')	bigint	0

@@ -46,7 +46,6 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
         // and the language is what decides — `LANGUAGE sql` is `42704` from the executor, where
         // the one language this node names is `plpgsql`. `CREATE OR REPLACE VIEW` above still
         // stands, and still names itself.
-        ("CREATE UNLOGGED TABLE t (a int8)", "UNLOGGED"),
         // **Nothing about a column `DEFAULT` is on this list any more.** It took an arbitrary
         // expression from the `DEFAULT`-is-an-expression unit, and the last thing it could not
         // evaluate — arithmetic — arrived on `main` in the same round. What a default still
