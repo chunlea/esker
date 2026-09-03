@@ -1,0 +1,19 @@
+crates/esker-store/tests/promotion.rs
+  s_2ed9df2fd94fee::t_c00d763316f7a3 25,357-360,459-481,484-486,489-490,492-504
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "422cc0169e9c4dc70899684305719d7804d6c52a",
+  "prompts": {},
+  "sessions": {
+    "s_2ed9df2fd94fee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ec622e3b-48a0-4735-8805-fe22838e8b26",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
