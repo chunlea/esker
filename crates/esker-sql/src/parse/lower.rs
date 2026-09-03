@@ -2279,6 +2279,28 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                 },
             ))))
         }
+        // **`ARRAY( SELECT … )` is a sixth spelling**, and `sqlparser` gives it as a *function*
+        // named `ARRAY` whose arguments are a subquery — which is why it refused as "the function
+        // ARRAY is not supported" while `ARRAY[…]`, a different production entirely, answered.
+        // Its argument is any query, so `ARRAY(VALUES (1),(2))` is one too.
+        Expr::Function(function)
+            // Written without `relation_name`, which *refuses* a qualified name: reading it here
+            // turned `public.obj_description(…)`'s `42883` into this arm's `0A000` — a guard has
+            // to be a question, not a decision.
+            if function.name.to_string().eq_ignore_ascii_case("array")
+                && matches!(
+                    function.args,
+                    sqlparser::ast::FunctionArguments::Subquery(_)
+                ) =>
+        {
+            let sqlparser::ast::FunctionArguments::Subquery(query) = &function.args else {
+                return Err(SqlError::unsupported("the function ARRAY"));
+            };
+            Ok(plan::Expr::Subquery(Box::new(plan::SubqueryExpr::bare(
+                plan::SubqueryKind::Array,
+                Box::new(lower_query(query)?),
+            ))))
+        }
         Expr::Function(function) => lower_function(function),
         Expr::Cast {
             expr, data_type, ..
@@ -3988,6 +4010,54 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
     refuse_if(select.exclude.is_some(), "EXCLUDE")?;
     refuse_if(!select.optimizer_hints.is_empty(), "an optimizer hint")?;
 
+    // **`SELECT srf(…)` with no `FROM` is `SELECT * FROM srf(…)`.** A set-returning function in
+    // the target list multiplies the rows of the query it is written in; where there is no `FROM`
+    // there is one input row, so the two spellings are the same query and this is the rewrite
+    // rather than an approximation of one. It is deliberately narrow — one item, that item the
+    // whole projection, no `FROM` — because a set-returning function *beside* other items is the
+    // mechanism this does not have: two of them run in lockstep and pad the shorter with NULL,
+    // which is measured in `tests/corpus/pg19_generate_subscripts.txt` and is not this.
+    if select.from.is_empty()
+        && select.selection.is_none()
+        && let [SelectItem::UnnamedExpr(Expr::Function(function))] = select.projection.as_slice()
+        && is_set_returning(function)
+        && let Ok(name) = unqualified_function_name(function)
+        && matches!(
+            name.to_ascii_lowercase().as_str(),
+            "generate_series" | "generate_subscripts"
+        )
+        && let sqlparser::ast::FunctionArguments::List(list) = &function.args
+    {
+        // The same query with the call moved into the `FROM` and the projection made a wildcard,
+        // lowered by the ordinary path — so its `ORDER BY`, `LIMIT` and `OFFSET` are handled once,
+        // here as everywhere.
+        let mut rewritten = select.clone();
+        rewritten.projection = vec![SelectItem::Wildcard(
+            sqlparser::ast::WildcardAdditionalOptions::default(),
+        )];
+        rewritten.from = vec![sqlparser::ast::TableWithJoins {
+            relation: TableFactor::Table {
+                name: function.name.clone(),
+                alias: None,
+                args: Some(sqlparser::ast::TableFunctionArgs {
+                    args: list.args.clone(),
+                    settings: None,
+                }),
+                with_hints: Vec::new(),
+                version: None,
+                with_ordinality: false,
+                partitions: Vec::new(),
+                json_path: None,
+                sample: None,
+                index_hints: Vec::new(),
+            },
+            joins: Vec::new(),
+        }];
+        let mut inner = query.clone();
+        *inner.body = SetExpr::Select(rewritten);
+        return lower_query(&inner);
+    }
+
     let (from, joins) = match select.from.as_slice() {
         [] => (None, Vec::new()),
         [table] => {
@@ -4243,13 +4313,14 @@ fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
             partitions,
             ..
         } => {
-            // **A set-returning function standing where a relation does.** Only
-            // `generate_subscripts`, which is what the schema dump reads every constraint's
-            // column list through; anything else is still named rather than approximated.
+            // **A set-returning function standing where a relation does.** Two of them:
+            // `generate_subscripts`, which is what the schema dump reads every constraint's and
+            // every index's column list through, and `generate_series`. Anything else is still
+            // named rather than approximated.
             if let Some(args) = args {
                 let folded = relation_name(name)?;
                 refuse_if(
-                    folded != "generate_subscripts",
+                    !matches!(folded.as_str(), "generate_subscripts" | "generate_series"),
                     format!("the table function {folded}"),
                 )?;
                 let alias = match alias {

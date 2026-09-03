@@ -584,6 +584,14 @@ pub enum CatalogFunc {
     /// PostgreSQL's rendering of `InvalidOid`. Measured, both; an implementation that raised would
     /// break a `LEFT JOIN` that legitimately has no match.
     RegClassName,
+    /// `pg_typeof(x)`: the name of the type `x` has.
+    ///
+    /// **Read from the value, not from the plan.** A real server answers the *static* type, and
+    /// the two differ only for a NULL — `pg_typeof(NULL::int4)` is `integer` there and `text`
+    /// here, which is what an untyped NULL is in this crate everywhere else. Every other value
+    /// carries its own type and answers for itself, arrays included: an `ARRAY(SELECT 1)` is an
+    /// `integer[]` because that is what the value is.
+    PgTypeof,
     /// `now()`, and `CURRENT_TIMESTAMP` which is the same function under a keyword spelling.
     ///
     /// **The transaction's instant, not the statement's.** Two calls in one transaction are equal
@@ -656,6 +664,7 @@ impl CatalogFunc {
             () if name.eq_ignore_ascii_case("pg_get_triggerdef") => {
                 Some(CatalogFunc::PgGetTriggerdef)
             }
+            () if name.eq_ignore_ascii_case("pg_typeof") => Some(CatalogFunc::PgTypeof),
             () if name.eq_ignore_ascii_case("current_date") => Some(CatalogFunc::CurrentDate),
             () if name.eq_ignore_ascii_case("random") => Some(CatalogFunc::Random),
             () if name.eq_ignore_ascii_case("concat") => Some(CatalogFunc::Concat),
@@ -699,6 +708,7 @@ impl CatalogFunc {
             CatalogFunc::ArrayUpper => "array_upper",
             CatalogFunc::ArrayLength => "array_length",
             CatalogFunc::Cardinality => "cardinality",
+            CatalogFunc::PgTypeof => "pg_typeof",
             CatalogFunc::Now => "now",
             CatalogFunc::CurrentDate => "current_date",
             CatalogFunc::Random => "random",
@@ -730,7 +740,8 @@ impl CatalogFunc {
             | CatalogFunc::PgGetTriggerdef
             | CatalogFunc::RegClass
             | CatalogFunc::RegClassName
-            | CatalogFunc::Cardinality => &[1],
+            | CatalogFunc::Cardinality
+            | CatalogFunc::PgTypeof => &[1],
             CatalogFunc::Now | CatalogFunc::CurrentDate | CatalogFunc::Random => &[0],
             // Variadic: every arity from one up. `concat()` is the `42883` about the *number* of
             // arguments that a real server raises, so zero is not in the set.
@@ -754,7 +765,10 @@ impl CatalogFunc {
             | CatalogFunc::PgGetPartkeydef
             | CatalogFunc::RegClassName
             // `concat` answers `text` for the ordinary reason: it builds a string.
-            | CatalogFunc::Concat => ColumnType::Text,
+            | CatalogFunc::Concat
+            // A `regtype` on a real server, and `text` here for the reason `'x'::regtype` is:
+            // this node has no `regtype`, and what it prints is the name either way.
+            | CatalogFunc::PgTypeof => ColumnType::Text,
             // An `oid` on a real server, and a `bigint` here for the reason `pg_class.oid` is one.
             CatalogFunc::RegClass => ColumnType::Int8,
 
