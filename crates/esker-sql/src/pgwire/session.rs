@@ -74,6 +74,14 @@ pub struct Params<'a> {
     /// Type OIDs the client declared in `Parse`. May be shorter than `values`, and a zero means
     /// "you decide".
     pub declared: &'a [u32],
+    /// Whether a `Bind` produced these — **which changes the error for a missing value**.
+    ///
+    /// The simple query protocol never binds, and a `$1` in it is `42P02 there is no parameter $1`.
+    /// The extended one always binds, and a count that does not match is a *protocol* error,
+    /// `08P01 bind message supplies 0 parameters, but prepared statement "" requires 1`. The two
+    /// are indistinguishable from the values alone — a `Bind` carrying none looks like no `Bind` —
+    /// so the path says which it was.
+    pub bound: bool,
 }
 
 impl Params<'_> {
@@ -82,6 +90,7 @@ impl Params<'_> {
         values: &[],
         formats: &[],
         declared: &[],
+        bound: false,
     };
 
     /// The format code for one parameter, with the protocol's three-way rule applied.
@@ -580,6 +589,7 @@ impl Session {
                     values: &open.params,
                     formats: &open.formats,
                     declared: &prepared.param_types,
+                    bound: true,
                 },
             ),
         };

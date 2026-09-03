@@ -1,0 +1,83 @@
+# Bind parameters over the EXTENDED protocol (`Parse`/`Bind`/`Execute`) — as a real PostgreSQL
+# 19beta1 answers them.
+#
+# **Run 46 ranking: 98 tests across 19 files**, all `PG::UndefinedParameter: ERROR: there is no
+# parameter $N` — `calculations_test.rb` (20), `has_many_associations_test.rb` (14),
+# `nested_through_associations_test.rb` (11), `batches_test.rb` (9) and fifteen more. By parameter:
+# `$1` 68, `$6` 12, `$2` 9, `$4` 7, `$3` 2.
+#
+# **This file is NOT byte-compatible with `crates/esker-sql/tests/corpus/*`, on purpose.** Those are
+# three columns and have nowhere to put bind values; a bind corpus without them is not a
+# specification. Here it is FOUR:
+#
+#   <sql> <tab> <json params> <tab> <types> <tab> <rows | !SQLSTATE message>
+#
+# `scratchpad/sesscap.py` could not have produced it: it drives psql, which speaks the **simple**
+# query protocol and can never send a `Bind`. `scratchpad/bindcap.rb` drives libpq's `exec_params`
+# and `prepare`/`exec_prepared`, which is what `ActiveRecord` uses with `prepared_statements: true`
+# (this harness's `config.yml` defaults it to true). A replayer has to send the parameters too.
+#
+# The SQL is what the adapter really emits, obtained by subscribing to `sql.active_record` while
+# running the query shapes inside `transaction { … raise ActiveRecord::Rollback }` against the
+# oracle — five of the statements below are verbatim from that log, bind counts included.
+#
+# Everything runs inside one `BEGIN … ROLLBACK` with a `SAVEPOINT` per probe; the tool reports what
+# it left behind, and it is `0`.
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`LIMIT` and `OFFSET` are bound parameters, not literals.** ActiveRecord emits
+#     `… WHERE "title" = $1 LIMIT $2 OFFSET $3` with three binds. A node that substitutes `$n` only
+#     inside `WHERE` answers `there is no parameter $2` on the first paginated query it sees — which
+#     is exactly the reported shape, and `batches_test.rb` is nine of the failures.
+#   * **A NULL `LIMIT` means no limit.** `LIMIT $1` bound to NULL returns **every** row; it does not
+#     return zero and it is not an error.
+#   * **A parameter arrives as text and is coerced by position.** `LIMIT $1` bound to the *string*
+#     `"2"` works; `n = $1` bound to `"notanumber"` is `22P02 invalid input syntax for type
+#     integer`. The wire has no integers — the declared type of the position decides.
+#   * **Too few parameters is a PROTOCOL error, not a SQL one**: `08P01 bind message supplies 0
+#     parameters, but prepared statement "" requires 1`. The empty statement name is the *unnamed*
+#     prepared statement, which is what a plain `exec_params` uses.
+#   * **Gaps and extras are reported against a different parameter than you would name.** Sending one
+#     parameter to a statement that references `$2` is `42P18 could not determine data type of
+#     parameter $1` — `$1`, the one never mentioned. Sending two where only `$1` is used is
+#     `42P18 … parameter $2`.
+#   * **`$1` may repeat and binds once**: `SELECT $1, $1, $2` with `["a","b"]` gives `a|a|b`. The
+#     count is of distinct placeholders, not of occurrences.
+#   * **A parameter with no inferable type is `42P18` even when a value is supplied.**
+#     `SELECT pg_typeof($1)` fails; `SELECT pg_typeof($1::int8)` answers `bigint`. The cast makes it
+#     inferable and the value never participates.
+#   * **NULL binds compare as SQL NULL**: `n = $1` with NULL is zero rows.
+#   * **`$1 = ANY($2)` works with the array passed as its text literal** `{1,2,3}` — the shape
+#     `pg19_array.txt` records for four of ActiveRecord's boot statements.
+#   * **`exec_params` and `prepare`/`exec_prepared` answer identically** — the first two probes are
+#     that pair — so a node may implement one path and pass, while the suite uses the named one.
+CREATE TABLE bp_posts (id bigserial primary key, bp_author_id bigint, title character varying, n integer)	[]		-
+INSERT INTO bp_posts (bp_author_id, title, n) VALUES (1, 't', 1), (1, 'u', 2), (2, 'v', 3)	[]		-
+SELECT COUNT(*) FROM "bp_posts" WHERE "bp_posts"."n" = $1	[1]	bigint	1
+SELECT COUNT(*) FROM "bp_posts" WHERE "bp_posts"."n" = $1	[1]	bigint	1
+SELECT "bp_posts".* FROM "bp_posts" WHERE "bp_posts"."title" = $1 LIMIT $2 OFFSET $3	["t", 2, 0]	bigint,bigint,character varying,integer	1|1|t|1
+SELECT "bp_posts".* FROM "bp_posts" WHERE "bp_posts"."title" = $1 LIMIT $2 OFFSET $3	["u", 2, 1]	bigint,bigint,character varying,integer	-
+SELECT id FROM bp_posts ORDER BY id LIMIT $1	[2]	bigint	1 ; 2
+SELECT id FROM bp_posts ORDER BY id OFFSET $1	[1]	bigint	2 ; 3
+SELECT id FROM bp_posts ORDER BY id LIMIT $1 OFFSET $2	[1, 1]	bigint	2
+SELECT COUNT(*) FROM "bp_posts" WHERE "bp_posts"."n" IN ($1, $2, $3)	[1, 2, 3]	bigint	3
+SELECT SUM("bp_posts"."n") FROM "bp_posts" WHERE (n > $1)	[0]	bigint	6
+SELECT $1	["x"]	text	x
+SELECT $1::int4 + $2::int4	[1, 2]	integer	3
+SELECT $1, $1, $2	["a", "b"]	text,text,text	a|a|b
+SELECT COUNT(*) FROM bp_posts WHERE n = $1	[]		!08P01 bind message supplies 0 parameters, but prepared statement "" requires 1
+SELECT COUNT(*) FROM bp_posts WHERE n = $2	[1]		!42P18 could not determine data type of parameter $1
+SELECT COUNT(*) FROM bp_posts WHERE n = $1	[1, 2]		!42P18 could not determine data type of parameter $2
+SELECT COUNT(*) FROM bp_posts WHERE n = $1	["notanumber"]		!22P02 invalid input syntax for type integer: "notanumber"
+SELECT COUNT(*) FROM bp_posts WHERE n = $1	[null]	bigint	0
+SELECT COUNT(*) FROM bp_posts WHERE n IS NOT DISTINCT FROM $1	[null]	bigint	0
+SELECT id FROM bp_posts ORDER BY id LIMIT $1	[null]	bigint	1 ; 2 ; 3
+SELECT id FROM bp_posts ORDER BY id LIMIT $1	["2"]	bigint	1 ; 2
+SELECT $1 = ANY($2)	[1, "{1,2,3}"]	boolean	t
+SELECT pg_typeof($1)	["x"]		!42P18 could not determine data type of parameter $1
+SELECT pg_typeof($1::int8)	[7]	regtype	bigint
+UPDATE bp_posts SET title = $1 WHERE n = $2	["z", 1]		-
+DELETE FROM bp_posts WHERE n = $1	[3]		-
+INSERT INTO bp_posts (title, n) VALUES ($1, $2) RETURNING id	["new", 9]	bigint	4
+SELECT count(*) FROM bp_posts	[]	bigint	3
