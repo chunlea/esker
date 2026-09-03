@@ -33,6 +33,8 @@
 // that block and resolve its links in *this* module's scope, where `result_type` and `apply` are
 // not — which is what broke `cargo doc -D warnings` the moment the two met.
 pub mod arith;
+/// `array_in` and `array_out`: an array literal read, and an array value printed.
+pub mod array;
 pub mod date;
 /// PostgreSQL's character-set names, for the two errors `convert_to` tells apart.
 pub mod encoding;
@@ -390,6 +392,13 @@ impl Named {
 #[must_use]
 pub fn array_oid(ty: ColumnType) -> u32 {
     match ty {
+        // There is no array of an array: an array type is a constructor over a *scalar* here, so
+        // asking for one has no answer and `0` is `InvalidOid`, which is what a real server's
+        // `typarray` holds for a type that has no array.
+        ColumnType::Int8Array
+        | ColumnType::Int4Array
+        | ColumnType::NumericArray
+        | ColumnType::TextArray => 0,
         ColumnType::Bool => 1000,
         ColumnType::Bytea => 1001,
         ColumnType::Int8 => 1016,
@@ -487,7 +496,14 @@ fn takes_typmod(ty: ColumnType) -> bool {
         | ColumnType::Real
         | ColumnType::Uuid
         | ColumnType::Oid
-        | ColumnType::Date => false,
+        | ColumnType::Date
+        // `numeric(10,2)[]` is a real declaration on a real server and this node does not read
+        // one; the array types take no typmod here, and a declaration that carries one is
+        // refused where it is parsed rather than silently dropped.
+        | ColumnType::Int8Array
+        | ColumnType::Int4Array
+        | ColumnType::NumericArray
+        | ColumnType::TextArray => false,
     }
 }
 
@@ -571,6 +587,12 @@ pub trait PgType: Copy {
 
 impl PgType for ColumnType {
     fn oid(self) -> u32 {
+        // **An array type's OID is its element's `typarray`**, which this crate already knows —
+        // `array_oid` is where `_int4` is 1007 and `_int8` is 1016. Derived rather than repeated,
+        // so the two can never disagree.
+        if let Some(element) = esker_keys::array::ArrayValue::element_of(self) {
+            return array_oid(element);
+        }
         match self {
             ColumnType::Bool => 16,
             ColumnType::Bytea => 17,
@@ -592,11 +614,23 @@ impl PgType for ColumnType {
             ColumnType::Uuid => 2950,
             ColumnType::Interval => 1186,
             ColumnType::Oid => 26,
+            // Unreachable: the four array types answered above, from their element's `typarray`.
+            ColumnType::Int8Array
+            | ColumnType::Int4Array
+            | ColumnType::NumericArray
+            | ColumnType::TextArray => 0,
         }
     }
 
     fn name(self) -> &'static str {
         match self {
+            // What an error message calls it: the element's name with `[]`, which is how
+            // PostgreSQL words `cannot cast type integer[] to uuid` — not the internal `_int4`
+            // that `pg_type.typname` holds.
+            ColumnType::Int8Array => "bigint[]",
+            ColumnType::Int4Array => "integer[]",
+            ColumnType::NumericArray => "numeric[]",
+            ColumnType::TextArray => "text[]",
             ColumnType::Int8 => "bigint",
             ColumnType::Int4 => "integer",
             ColumnType::Int2 => "smallint",
@@ -640,7 +674,12 @@ impl PgType for ColumnType {
             | ColumnType::Json
             | ColumnType::Jsonb
             | ColumnType::Numeric
-            | ColumnType::Bytea => -1,
+            | ColumnType::Bytea
+            // However many elements it has, which is the definition of a varlena.
+            | ColumnType::Int8Array
+            | ColumnType::Int4Array
+            | ColumnType::NumericArray
+            | ColumnType::TextArray => -1,
         }
     }
 }
@@ -705,6 +744,7 @@ impl PgDatum for Datum {
     fn to_text(&self) -> Option<String> {
         Some(match self {
             Datum::Null => return None,
+            Datum::Array(value) => array::to_text(value),
             Datum::Int8(v) => v.to_string(),
             Datum::Int4(v) => v.to_string(),
             Datum::Int2(v) => v.to_string(),
@@ -745,6 +785,17 @@ impl PgDatum for Datum {
 
     fn from_text(ty: ColumnType, text: &str) -> Result<Datum> {
         Ok(match ty {
+            // The literal's *shape* is read here and each element by its own type's input
+            // function, which is what makes `'{1,x}'::int[]` `int4`'s error and `'{a,,b}'` the
+            // array's (`crate::value::array`).
+            ColumnType::Int8Array
+            | ColumnType::Int4Array
+            | ColumnType::NumericArray
+            | ColumnType::TextArray => {
+                let element =
+                    esker_keys::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text);
+                Datum::Array(array::from_text(text, element)?)
+            }
             ColumnType::Int8 => Datum::Int8(parse_int8(text)?),
             ColumnType::Int4 => Datum::Int4(parse_int4(text)?),
             ColumnType::Int2 => Datum::Int2(parse_int2(text)?),
@@ -808,7 +859,10 @@ impl PgDatum for Datum {
                 out.extend_from_slice(&months.to_be_bytes());
                 out
             }
-            Datum::Null | Datum::Numeric(_) => return None,
+            // `array_send`'s form is a dimension header, a flags word, the element OID and then
+            // each element's own binary form — a shape nothing here has ever sent or read, so an
+            // array is refused with the `numeric` beside it rather than guessed.
+            Datum::Null | Datum::Numeric(_) | Datum::Array(_) => return None,
             // A `time` joins them: `time_send` is the microsecond count as eight big-endian
             // bytes, measured with `COPY ... (FORMAT binary)` — `12:34:56` is `0x0a8bda1c00`
             // (45_296_000_000) and `24:00:00` is `0x141dd76000`, the top of the closed range.
@@ -837,6 +891,17 @@ impl PgDatum for Datum {
             })
         };
         Ok(match ty {
+            // The mirror of `to_binary`: `array_recv`'s shape has never been read here, so a
+            // client that sends one is told so rather than given a value built from a guess.
+            ColumnType::Int8Array
+            | ColumnType::Int4Array
+            | ColumnType::NumericArray
+            | ColumnType::TextArray => {
+                return Err(SqlError::unsupported(format!(
+                    "a binary-format {}",
+                    ty.name()
+                )));
+            }
             ColumnType::Int8
             | ColumnType::TimestampTz
             | ColumnType::Timestamp
@@ -918,12 +983,41 @@ impl PgDatum for Datum {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per comparable pair of variants; the list is the vocabulary"
+    )]
     fn pg_cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
             (Datum::Null, Datum::Null) => Ordering::Equal,
             // NULLS LAST, PostgreSQL's default for ascending order.
             (Datum::Null, _) => Ordering::Greater,
             (_, Datum::Null) => Ordering::Less,
+            // **`array_cmp`**: element by element over the flattened elements, a NULL element
+            // above every value, then by how many there are and by the shape. Measured:
+            // `'{}'` sorts first, `'{1,2,3}'` before `'{{1,2},{3,4}}'` — four elements, longer —
+            // and `'{1,NULL,3}'` after both. `esker_keys::row::encode_key_array` writes the same
+            // order into an index key, and the two have to agree or a scan and a sort disagree.
+            (Datum::Array(a), Datum::Array(b)) => {
+                for (left, right) in a.values.iter().zip(&b.values) {
+                    let ordering = match (left, right) {
+                        (Some(left), Some(right)) => left.pg_cmp(right),
+                        (None, None) => Ordering::Equal,
+                        // A NULL element sorts **above** a value, which is the opposite of what
+                        // `pg_cmp` does for a NULL *row* value and is measured for this one.
+                        (None, Some(_)) => Ordering::Greater,
+                        (Some(_), None) => Ordering::Less,
+                    };
+                    if ordering != Ordering::Equal {
+                        return ordering;
+                    }
+                }
+                a.values
+                    .len()
+                    .cmp(&b.values.len())
+                    .then_with(|| a.dims.cmp(&b.dims))
+                    .then_with(|| a.lower.cmp(&b.lower))
+            }
             (Datum::Int8(a), Datum::Int8(b))
             | (Datum::TimestampTz(a), Datum::TimestampTz(b))
             // Plain integer order, and only against another `time`: this type compares with
@@ -1058,6 +1152,9 @@ impl PgDatum for Datum {
 /// rather than something a client can ask for.
 fn variant_rank(value: &Datum) -> u8 {
     match value {
+        // Above every scalar, which only decides the order between two values of *different*
+        // types — a comparison SQL does not have and this crate's total order still needs.
+        Datum::Array(_) => 20,
         Datum::Bool(_) => 0,
         // The two integer widths share a rank: they are one type to a comparison, and `pg_cmp`
         // answers the pair above rather than falling through to here.
@@ -1322,6 +1419,11 @@ mod tests {
                         // carries are the value, and `numeric(10,2)` bounds them in the typmod,
                         // not in the type.
                         | ColumnType::Numeric
+                        // However many elements it has, which is the definition of a varlena.
+                        | ColumnType::Int8Array
+                        | ColumnType::Int4Array
+                        | ColumnType::NumericArray
+                        | ColumnType::TextArray
                 ),
                 "{ty:?} reports the wrong width"
             );

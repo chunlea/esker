@@ -42,6 +42,7 @@ use std::sync::OnceLock;
 use crate::catalog::{ColumnDef, TableDef};
 use crate::error::{Result, SqlError};
 use crate::value::{ColumnType, Datum, PgType};
+use esker_keys::array::ArrayValue;
 
 /// Where the reserved relation ids for catalog views start.
 ///
@@ -420,9 +421,15 @@ impl CatalogView {
                         vec![
                             Datum::Int8(i64::from(ty.oid())),
                             Datum::Text(typname(*ty).to_owned()),
-                            // No array types here, so no element type and no base type; `b` is
-                            // "base", as against `r`ange, `e`num, `d`omain and `c`omposite.
-                            Datum::Int8(0),
+                            // **`typelem` is the element type's OID**, and zero for everything
+                            // that is not an array — which is how a client reads what an array is
+                            // over. `typtype` stays `b` for an array too: `b` is "base", as
+                            // against `r`ange, `e`num, `d`omain and `c`omposite, and an array is
+                            // none of those.
+                            Datum::Int8(
+                                ArrayValue::element_of(*ty)
+                                    .map_or(0, |element| i64::from(element.oid())),
+                            ),
                             Datum::Text(",".to_owned()),
                             Datum::Text(typinput(*ty).to_owned()),
                             Datum::Text("b".to_owned()),
@@ -720,6 +727,13 @@ fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
 /// is declared `int8` and named `bigint` in an error. Measured against 19beta1, all six.
 pub(crate) fn typname(ty: ColumnType) -> &'static str {
     match ty {
+        // **An array type's internal name is the element's with a leading underscore** — `_int4`,
+        // not `int4[]`. That spelling is what `pg_type.typname` holds on a real server and what a
+        // client matching on it expects.
+        ColumnType::Int8Array => "_int8",
+        ColumnType::Int4Array => "_int4",
+        ColumnType::NumericArray => "_numeric",
+        ColumnType::TextArray => "_text",
         ColumnType::Int8 => "int8",
         ColumnType::Int4 => "int4",
         ColumnType::Int2 => "int2",
@@ -767,6 +781,12 @@ fn typcategory(ty: ColumnType) -> &'static str {
         ColumnType::Bytea | ColumnType::Json | ColumnType::Jsonb | ColumnType::Uuid => "U",
         // `T` for timespan, which is its own category and not the datetimes' `D`.
         ColumnType::Interval => "T",
+        // `A` for array, whatever the elements are — the category is the constructor's, not the
+        // element type's.
+        ColumnType::Int8Array
+        | ColumnType::Int4Array
+        | ColumnType::NumericArray
+        | ColumnType::TextArray => "A",
     }
 }
 
@@ -778,6 +798,14 @@ fn typcategory(ty: ColumnType) -> &'static str {
 /// capture's, underscore and all: `timestamptz_in` has one and `int8in` does not.
 fn typinput(ty: ColumnType) -> &'static str {
     match ty {
+        // **`array_in` for every array type**, and this one value is load-bearing beyond the
+        // catalog: `ActiveRecord` decides that a column is an array by comparing this string, and
+        // a column it does not know to be an array is what makes it hand a Ruby `Array` to
+        // `quote` and fail client-side with `can't quote Array`.
+        ColumnType::Int8Array
+        | ColumnType::Int4Array
+        | ColumnType::NumericArray
+        | ColumnType::TextArray => "array_in",
         ColumnType::Int8 => "int8in",
         ColumnType::Int4 => "int4in",
         ColumnType::Int2 => "int2in",

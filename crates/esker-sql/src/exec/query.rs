@@ -1843,6 +1843,13 @@ fn same_family(left: ColumnType, right: ColumnType) -> bool {
     // the case PostgreSQL refuses.
     fn family(ty: ColumnType) -> u8 {
         match ty {
+            // **A family of one each.** `'{1}'::int[] = '{1}'::int8[]` is `42883` on a real
+            // server — an array's comparison is its element type's, and two element types are two
+            // operators — so no two of these share a family and none shares one with a scalar.
+            ColumnType::Int8Array => 20,
+            ColumnType::Int4Array => 21,
+            ColumnType::NumericArray => 22,
+            ColumnType::TextArray => 23,
             ColumnType::Int8
             | ColumnType::Int4
             | ColumnType::Int2
@@ -1972,6 +1979,14 @@ fn reconcile(op: BinaryOp, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
 /// `pg_catalog` column makes. Their **elements** are attnums either way, and that is a fact about
 /// the relation rather than about the column's storage, so it is read from the relation.
 fn attnum_vector_element(operand: &Expr, scope: &Scope<'_>) -> Option<ColumnType> {
+    // **A real array knows its own element type**, so a subscript of one needs no rule: the
+    // catalog's text vectors below are the case that does, because their element type is a fact
+    // about the relation rather than about the value.
+    if let Ok(ty) = expr_type(operand, scope)
+        && let Some(element) = esker_keys::array::ArrayValue::element_of(ty)
+    {
+        return Some(element);
+    }
     let Expr::Column { table, name } = operand else {
         return None;
     };
@@ -2463,10 +2478,19 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         Expr::Literal(Literal::Decimal(_)) => ColumnType::Double,
 
         // `abs` is the one scalar function that answers its argument's type rather than `text`.
+        //
+        // **An aggregate argument is `text` here rather than an error.** `abs(min(n))` is typed
+        // while the aggregates are still un-rewritten — every other scalar function answers a
+        // fixed type and never asks — and reporting the internal "reached `expr_type`" for a
+        // statement a real server answers would be worse than reporting a type the executor then
+        // corrects. The executor's own refusal is what the caller sees.
         Expr::Scalar {
             func: crate::plan::ScalarFunc::Abs,
             operand,
-        } => expr_type(operand, scope)?,
+        } => match operand.as_ref() {
+            Expr::Aggregate(_) => ColumnType::Text,
+            operand => expr_type(operand, scope)?,
+        },
         // Whatever the operand is, a cast to `text` answers `text` — that is what it is for.
         // The two text functions take text and answer text.
         Expr::Scalar { .. }
@@ -2488,7 +2512,16 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // rather than untyped.
         // The type the element is read **as**, which a comparison sets and which is `text` until
         // one does — the same rule an `= ANY`'s elements follow.
-        Expr::Subscript { element, .. } => *element,
+        // **The array's own element type wins over the node's.** A subscript's `element` is
+        // filled where the expression is lowered, before anything knows what it is subscripting;
+        // a real array carries its element type in the value, so it answers for itself and the
+        // stored field is the fallback for the catalog's text vectors.
+        Expr::Subscript {
+            operand, element, ..
+        } => expr_type(operand, scope)
+            .ok()
+            .and_then(esker_keys::array::ArrayValue::element_of)
+            .unwrap_or(*element),
         Expr::Uuid(_) => ColumnType::Uuid,
         Expr::Case {
             branches,

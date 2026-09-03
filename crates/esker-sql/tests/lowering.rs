@@ -76,7 +76,6 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
             "CREATE TABLE t (a varchar(5 OCTETS))",
             "a length unit on varchar",
         ),
-        ("CREATE TABLE t (a int8[])", "the type"),
         ("CREATE TABLE s.t (a int8)", "the qualified name"),
         // `CASCADE` is built and `DROP ... PURGE` is Oracle's, which PostgreSQL does not take
         // either — so it is the one `DROP` clause left to name.
@@ -203,7 +202,6 @@ fn every_alter_table_action_but_add_column_is_refused_by_name() {
             "ALTER TABLE ... DROP CONSTRAINT",
         ),
         ("ALTER TABLE ONLY t ADD COLUMN c int8", "ALTER TABLE ONLY"),
-        ("ALTER TABLE t ADD COLUMN c int8[]", "the type"),
         ("ALTER TABLE t OWNER TO someone", "ALTER TABLE ..."),
     ];
     refuses_by_name(&cases);

@@ -40,3 +40,12 @@ time	00:00:00	00:00:00.000001	12:34:56	12:34:56.123456	23:59:59.999999	24:00:00
 uuid	00000000-0000-0000-0000-000000000000	00000000-0000-0000-0000-000000000001	a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11	a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12	ffffffff-ffff-ffff-ffff-ffffffffffff
 interval	-1 days	00:00:00	00:00:01	1 day	1 mon	30 days	1 year	400 days
 oid	0	1	26	1186	4294967295
+# The four array types. Three rules in these rows and each is measured: **a NULL element sorts
+# above every value** (`{1,NULL}` after `{1,2,3}`), a **prefix sorts first** (`{1,2}` before
+# `{1,2,3}`, and `{1,2,3}` before the four elements of `{{1,2},{3,4}}`), and the **lower bound is
+# the last tiebreak** — `[0:1]={1,2}` and `{1,2}` have the same elements and the same shape and
+# are two values, ordered by where their subscripts start.
+int8[]	{}	[0:1]={1,2}	{1,2}	{1,2,3}	{1,NULL}	{2}	{NULL}
+int4[]	{}	{-1}	{0}	{1,2}	{1,2,3}	{{1,2},{3,4}}	{1,NULL,3}
+numeric[]	{}	{0.0}	{1.00}	{1.0}	{1,2}	{1.5}	{NaN}
+text[]	{}	{""}	{a}	{a,b}	{"a b"}	{b}	{NULL}

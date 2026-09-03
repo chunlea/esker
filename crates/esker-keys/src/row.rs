@@ -159,6 +159,29 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
             varint::put_u64(v.len() as u64, out);
             out.extend_from_slice(v);
         }
+        // **The shape is written, not derived.** An empty array has no dimensions and a
+        // two-dimensional one is a flat element list with a shape beside it, so neither can be
+        // reconstructed from the elements alone — and the lower bound is part of the value:
+        // `'[0:2]={1,2,3}'` has to print back as `[0:2]={1,2,3}`.
+        Datum::Array(v) => {
+            varint::put_u64(varint::zigzag_encode(i64::from(v.lower)), out);
+            varint::put_u64(v.dims.len() as u64, out);
+            for dim in &v.dims {
+                varint::put_u64(varint::zigzag_encode(i64::from(*dim)), out);
+            }
+            varint::put_u64(v.values.len() as u64, out);
+            for element in &v.values {
+                // A byte per element, because a NULL element is not the array being NULL and the
+                // row's own NULL bitmap has nothing to say about it.
+                match element {
+                    None => out.push(0),
+                    Some(value) => {
+                        out.push(1);
+                        encode_column(value, out);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -337,6 +360,10 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
             let (head, rest) = bytes.split_first_chunk::<4>().ok_or_else(truncated)?;
             (Datum::Oid(u32::from_le_bytes(*head)), rest)
         }
+        ColumnType::Int8Array
+        | ColumnType::Int4Array
+        | ColumnType::NumericArray
+        | ColumnType::TextArray => return decode_array(ty, bytes),
         ColumnType::Int2 => {
             let (head, rest) = bytes.split_first_chunk::<2>().ok_or_else(truncated)?;
             (Datum::Int2(i16::from_le_bytes(*head)), rest)
@@ -527,7 +554,138 @@ fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
         // differed for them would let a `UNIQUE` index hold both. The row keeps the scale it was
         // written with; the key keeps the number.
         Datum::Numeric(v) => encode_key_numeric(v, out),
+        Datum::Array(v) => encode_key_array(v, out),
     }
+}
+
+/// An array as bytes that sort the way PostgreSQL's `array_cmp` compares.
+///
+/// Element by element over the **flattened** elements, then by how many there are, then by the
+/// shape. Three rules and each is measured: `'{}'` sorts first, `'{1,2,3}'` before
+/// `'{{1,2},{3,4}}'` — which flattens to four elements and is longer — and `'{1,NULL,3}'` after
+/// both, because **a NULL element sorts above every value**, not below.
+///
+/// The marker before each element is what produces all three: `0x00` ends the sequence and is
+/// below the `0x01` that introduces a value, so a prefix sorts first; `0xFF` stands for a NULL
+/// and is above every value. The shape follows the terminator, so it decides only between arrays
+/// whose elements are identical — which is the tiebreak that keeps `'{1,2,3,4}'` and
+/// `'{{1,2},{3,4}}'` two rows in a unique index, as they are two values on a real server.
+fn encode_key_array(value: &crate::array::ArrayValue, out: &mut Vec<u8>) {
+    for element in &value.values {
+        match element {
+            Some(element) => {
+                out.push(1);
+                encode_key_column(element, out);
+            }
+            None => out.push(0xFF),
+        }
+    }
+    out.push(0);
+    codec::encode_i64(i64::try_from(value.dims.len()).unwrap_or(i64::MAX), out);
+    for dim in &value.dims {
+        codec::encode_i64(i64::from(*dim), out);
+    }
+    codec::encode_i64(i64::from(value.lower), out);
+}
+
+/// An array back out of a row, given the type the schema says the column is.
+fn decode_array(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
+    let Some(element) = crate::array::ArrayValue::element_of(ty) else {
+        return Err(corrupt(format!("{ty:?} is not an array type")));
+    };
+    let truncated = || corrupt(format!("a {ty:?} is truncated"));
+    let mut rest = bytes;
+    let read = |rest: &mut &[u8]| -> Result<u64> {
+        let (value, used) =
+            varint::get_u64(rest).map_err(|error| corrupt(format!("an array: {error}")))?;
+        *rest = rest.get(used..).ok_or_else(truncated)?;
+        Ok(value)
+    };
+    let lower = narrow_dimension(varint::zigzag_decode(read(&mut rest)?))?;
+    let count = usize::try_from(read(&mut rest)?).map_err(|_| truncated())?;
+    let mut dims = Vec::with_capacity(count.min(16));
+    for _ in 0..count {
+        dims.push(narrow_dimension(varint::zigzag_decode(read(&mut rest)?))?);
+    }
+    let elements = usize::try_from(read(&mut rest)?).map_err(|_| truncated())?;
+    let mut values = Vec::with_capacity(elements.min(1024));
+    for _ in 0..elements {
+        let (&present, tail) = rest.split_first().ok_or_else(truncated)?;
+        rest = tail;
+        match present {
+            0 => values.push(None),
+            1 => {
+                let (value, tail) = decode_column(element, rest)?;
+                values.push(Some(value));
+                rest = tail;
+            }
+            other => {
+                return Err(corrupt(format!(
+                    "an array element's presence byte is {other}"
+                )));
+            }
+        }
+    }
+    Ok((
+        Datum::Array(crate::array::ArrayValue {
+            element,
+            lower,
+            dims,
+            values,
+        }),
+        rest,
+    ))
+}
+
+/// A dimension or a lower bound, which are `i32` on a real server too.
+fn narrow_dimension(value: i64) -> Result<i32> {
+    i32::try_from(value).map_err(|_| corrupt(format!("an array dimension of {value}")))
+}
+
+/// An array back out of an index key, in the shape [`encode_key_array`] wrote.
+fn decode_key_array(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
+    let Some(element) = crate::array::ArrayValue::element_of(ty) else {
+        return Err(corrupt(format!("{ty:?} is not an array type")));
+    };
+    let truncated = || corrupt(format!("an index key holding a {ty:?} is truncated"));
+    let decoded = |error: codec::CodecError| corrupt(format!("index key array: {error}"));
+    let mut rest = bytes;
+    let mut values = Vec::new();
+    loop {
+        let (&marker, tail) = rest.split_first().ok_or_else(truncated)?;
+        rest = tail;
+        match marker {
+            0 => break,
+            0xFF => values.push(None),
+            1 => {
+                let (value, tail) = decode_key_column(element, rest)?;
+                values.push(Some(value));
+                rest = tail;
+            }
+            other => {
+                return Err(corrupt(format!("an array element's key marker is {other}")));
+            }
+        }
+    }
+    let (count, tail) = codec::decode_i64(rest).map_err(decoded)?;
+    rest = tail;
+    let count = usize::try_from(count).map_err(|_| truncated())?;
+    let mut dims = Vec::with_capacity(count.min(16));
+    for _ in 0..count {
+        let (dim, tail) = codec::decode_i64(rest).map_err(decoded)?;
+        rest = tail;
+        dims.push(narrow_dimension(dim)?);
+    }
+    let (lower, tail) = codec::decode_i64(rest).map_err(decoded)?;
+    Ok((
+        Datum::Array(crate::array::ArrayValue {
+            element,
+            lower: narrow_dimension(lower)?,
+            dims,
+            values,
+        }),
+        tail,
+    ))
 }
 
 /// A `numeric` as bytes that sort by value.
@@ -622,6 +780,10 @@ pub fn decode_key_columns(types: &[ColumnType], mut bytes: &[u8]) -> Result<(Vec
 fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
     let decoded = |error: codec::CodecError| corrupt(format!("index key column: {error}"));
     Ok(match ty {
+        ColumnType::Int8Array
+        | ColumnType::Int4Array
+        | ColumnType::NumericArray
+        | ColumnType::TextArray => return decode_key_array(ty, bytes),
         ColumnType::Int8 => {
             let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
             (Datum::Int8(value), rest)
@@ -1276,6 +1438,11 @@ mod tests {
     }
 
     /// Every value a column of `ty` can hold, NULL included.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one strategy per column type; the list is the vocabulary and splitting it would \
+                  hide which types are covered"
+    )]
     fn values_of(ty: ColumnType) -> proptest::strategy::BoxedStrategy<Datum> {
         use proptest::prelude::*;
         let values: BoxedStrategy<Datum> = match ty {
@@ -1314,6 +1481,37 @@ mod tests {
                 .prop_map(Datum::Numeric),
             ]
             .boxed(),
+            // **An array of the element type's own values**, NULL elements included, at a lower
+            // bound that is sometimes not one and occasionally in two dimensions — every part of
+            // the value the encodings have to carry, so the round trip is what proves they do.
+            ColumnType::Int8Array
+            | ColumnType::Int4Array
+            | ColumnType::NumericArray
+            | ColumnType::TextArray => {
+                let element = crate::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text);
+                (
+                    proptest::collection::vec(
+                        proptest::option::of(values_of(element).prop_filter(
+                            "a NULL element is the `None`, not a `Datum::Null`",
+                            |value| !matches!(value, Datum::Null),
+                        )),
+                        0..6,
+                    ),
+                    -2i32..3,
+                    any::<bool>(),
+                )
+                    .prop_map(move |(values, lower, two_dimensional)| {
+                        let mut value =
+                            crate::array::ArrayValue::one_dimensional(element, lower, values);
+                        // A shape with the same elements under it, which is the case the key's
+                        // dimension tiebreak exists for.
+                        if two_dimensional && value.values.len() == 4 {
+                            value.dims = vec![2, 2];
+                        }
+                        Datum::Array(value)
+                    })
+                    .boxed()
+            }
             ColumnType::Int2 => any::<i16>().prop_map(Datum::Int2).boxed(),
             ColumnType::Real => prop_oneof![
                 7 => any::<f32>().prop_map(Datum::Real),

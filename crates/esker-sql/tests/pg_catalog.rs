@@ -130,6 +130,10 @@ fn every_catalog_answer_is_postgresql_19_s() {
 /// They are in `tests/corpus/activerecord_8_1_statements.txt` and `tests/activerecord_surface.rs`
 /// counts them; this asserts what they *say*, which a count cannot. Numbering is that file's.
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one assertion per query ActiveRecord sends"
+)]
 fn activerecord_s_four_type_map_queries_answer() {
     let mut node = parity::Node::new(&[]);
 
@@ -242,18 +246,65 @@ fn activerecord_s_four_type_map_queries_answer() {
         .is_empty()
     );
 
-    // 9 — array types, found by their element type. This node has no arrays, so every `typelem`
-    // is 0 and nothing matches.
-    assert!(
+    // 9 — array types, found by their element type. **This one answers now**: the four array
+    // types report their element's OID in `typelem`, which is how `ActiveRecord` finds them, and
+    // `typinput` is `array_in`, which is how it decides a column is an array at all. It returned
+    // nothing while this node had no arrays; a row per array type is the whole point of the unit
+    // that gave it them.
+    assert_eq!(
         node.rows(
             "SELECT t.oid, t.typname, t.typelem, t.typdelim, t.typinput, r.rngsubtype, \
              t.typtype, t.typbasetype FROM pg_type as t LEFT JOIN pg_range as r ON oid = \
              rngtypid WHERE t.typelem IN (16, 17, 18, 19, 20, 21, 23, 25, 26, 114, 142, 600, \
              601, 602, 603, 604, 628, 700, 701, 718, 790, 829, 869, 650, 1042, 1043, 1082, 1083, \
              1114, 1184, 1186, 1560, 1562, 1700, 2950, 3614, 3802, 13356, 13359, 13361, 13367, \
-             13369, 3904, 3906, 3908, 3910, 3912, 3926)"
-        )
-        .is_empty()
+             13369, 3904, 3906, 3908, 3910, 3912, 3926) ORDER BY t.oid"
+        ),
+        vec![
+            // `_int2` is 1005 over `int2` 21, `_int4` 1007 over 23, `_text` 1009 over 25 — the
+            // numbers are not derivable from the element's and each is a measurement
+            // (`crate::value::array_oid`). `rngsubtype` is NULL because no array is a range.
+            vec![
+                "1007".to_owned(),
+                "_int4".to_owned(),
+                "23".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "1009".to_owned(),
+                "_text".to_owned(),
+                "25".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "1016".to_owned(),
+                "_int8".to_owned(),
+                "20".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "1231".to_owned(),
+                "_numeric".to_owned(),
+                "1700".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+        ]
     );
 }
 
