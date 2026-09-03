@@ -63,6 +63,12 @@ pub struct TableRef {
     pub alias: Option<String>,
     /// `FROM (SELECT …) AS t` — the sub-select this entry is, or `None` for a real relation.
     pub derived: Option<Box<crate::plan::Derived>>,
+    /// `FROM generate_subscripts(a, 1) AS i` — a **set-returning function** standing where a
+    /// relation would, or `None` for anything else.
+    ///
+    /// A third kind of `FROM` entry beside a relation and a derived table: it has no key range,
+    /// no statistics and no rows on disk, and its shape is one column of the alias's name.
+    pub function: Option<Box<TableFunction>>,
     /// Set when this name is a `WITH` item **this part of the query cannot see** — a forward
     /// reference, or a CTE referring to itself.
     ///
@@ -83,6 +89,7 @@ impl TableRef {
             name,
             alias: None,
             derived: None,
+            function: None,
             hidden_cte: false,
         }
     }
@@ -230,8 +237,24 @@ pub struct OrderItem {
     pub nulls_first: Option<bool>,
 }
 
+/// A set-returning function used as a `FROM` entry.
+///
+/// Only `generate_subscripts`, which is what `ActiveRecord`'s schema dump reads every foreign key
+/// and unique constraint through — it turns `pg_constraint.conkey`, an array of attribute
+/// numbers, into the column *names* in the order the constraint declares them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableFunction {
+    /// The function's name, folded — for the message when something else is asked for.
+    pub name: String,
+    /// Its arguments, lowered.
+    pub args: Vec<Expr>,
+    /// The one-column relation it stands for, filled in by the planner.
+    pub def: Option<std::sync::Arc<crate::catalog::TableDef>>,
+}
+
 /// A physical plan node: rows come out of it one at a time.
 #[derive(Debug, Clone)]
+
 pub enum Node {
     /// One row of no table, for `SELECT 1`.
     OneRow,
@@ -246,6 +269,16 @@ pub enum Node {
         /// Which relation.
         view: CatalogView,
         /// How its rows are shaped, so everything above it reads a row like any other.
+        columns: RowSchema,
+    },
+    /// The rows a set-returning function in `FROM` yields.
+    ///
+    /// Computed when the cursor opens, like a catalog view and for the same reason: there is no
+    /// key range to seek in and the row count is the length of one array.
+    TableFunction {
+        /// The call, whose arguments are evaluated at open.
+        call: Box<TableFunction>,
+        /// One column, of the alias's name.
         columns: RowSchema,
     },
     /// Every row of a table, in primary key order, over a key range.
@@ -583,6 +616,11 @@ impl Node {
         let names = &self.input_names(columns)[..];
         match self {
             Node::OneRow => ("Result".to_owned(), None, None),
+            // Named for what it is: one access path, no costs, and a row count that is the length
+            // of an array nobody has read yet.
+            Node::TableFunction { call, .. } => {
+                (format!("Function Scan on {}", call.name), None, None)
+            }
             // No costs and no alternative: a computed relation has one access path. The name says
             // what it is rather than implying a choice that was not made -- the same rule the
             // aggregate and access-path plans already print by.

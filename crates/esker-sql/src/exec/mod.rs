@@ -41,6 +41,7 @@ pub(crate) mod query;
 pub mod redrive;
 mod savepoint;
 mod subquery;
+mod table_function;
 mod verbs;
 
 use std::sync::Arc;

@@ -1,0 +1,80 @@
+# `generate_subscripts` — a set-returning function in `FROM`, as a real PostgreSQL 19beta1 answers
+# it.
+#
+# NOT a type. This is **rung 3's blocker at `3301fc3`** and **two of the three boot statements left**
+# (35 and 36). `sum`/`avg` over `int4`/`int2`/`numeric` landed and rung 3 moved straight onto
+# `a table function is not supported`, which is this:
+#
+#   ( SELECT array_agg(a.attname ORDER BY idx)
+#       FROM ( SELECT idx, c.conkey[idx] AS conkey_elem
+#                FROM generate_subscripts(c.conkey, 1) AS idx ) indexed_conkeys
+#       JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = indexed_conkeys.conkey_elem )
+#
+# `ActiveRecord` uses it to turn `pg_constraint.conkey` — an array of attribute numbers — into
+# column *names* in the order the constraint declares them, and it is how the schema dumper reads
+# every foreign key and unique constraint. Three features meet in it: the SRF in `FROM`, array
+# subscripting by the value it yields, and `array_agg(… ORDER BY …)`.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way. It builds one
+# table, dropping whatever a previous run left, and does not drop it — `\gdesc` needs it afterwards.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **It yields the array's own subscripts, not `1..length`.** For `'[0:2]={a,b,c}'` it yields
+#     **0, 1, 2** — a custom lower bound is honoured, which is the whole reason the function exists
+#     rather than `generate_series(1, array_length(a, 1))`. An implementation built on the latter
+#     is right for every array `ActiveRecord` happens to send and wrong by construction.
+#   * **Every "nothing to do" case is zero rows, never NULL and never an error**: an empty array, a
+#     NULL array, a dimension the array does not have (`2` on a 1-D array), and dimensions `0` and
+#     `-1` all produce **no rows**. A `SELECT` of it therefore returns nothing at all, and a
+#     `count(*)` over it returns `0`.
+#   * **Two set-returning functions in one SELECT list run in LOCKSTEP, not as a cross product.**
+#     `generate_subscripts('{a,b}',1) AS i, generate_subscripts('{x,y,z}',1) AS j` yields
+#     **three** rows — `(1,1)`, `(2,2)`, `(NULL,3)` — the shorter one padded with NULL. The same two
+#     in `FROM`, comma-separated, are a cross product of **six**. Same functions, same arguments,
+#     different arity of the result depending on where they are written. (This is the ROWS FROM
+#     rule PostgreSQL 10 introduced; the pre-10 behaviour was the least common multiple, which is
+#     what an implementation copied from older memory would produce.)
+#   * **The third argument reverses it.** `generate_subscripts(a, 1, true)` yields `3, 2, 1`. It is
+#     a separate two- and three-argument function: calling it with one argument is
+#     `42883 … does not exist` with `DETAIL: No function of that name accepts the given number of
+#     arguments.`, and with a non-array first argument the DETAIL is `… the given argument types.`
+#     — the two DETAILs this corpus keeps finding.
+#   * **It returns `integer`**, so the subscript it yields can be fed straight back into `a[i]`.
+DROP TABLE IF EXISTS gs		-
+SELECT 'g', generate_subscripts('{a,b,c}'::text[], 1)	text,integer	g|1 ; g|2 ; g|3
+SELECT 'g', generate_subscripts('{}'::text[], 1)	text,integer	-
+SELECT 'g', count(*) FROM generate_subscripts('{}'::text[], 1) AS i	text,bigint	g|0
+SELECT 'g', generate_subscripts(NULL::text[], 1)	text,integer	-
+SELECT 'g', count(*) FROM generate_subscripts(NULL::text[], 1) AS i	text,bigint	g|0
+SELECT 'g', generate_subscripts('{a,b,c}'::text[], 2)	text,integer	-
+SELECT 'g', count(*) FROM generate_subscripts('{a,b,c}'::text[], 2) AS i	text,bigint	g|0
+SELECT 'g', generate_subscripts('{a,b,c}'::text[], 0)	text,integer	-
+SELECT 'g', generate_subscripts('{a,b,c}'::text[], -1)	text,integer	-
+SELECT 'g', generate_subscripts('{{1,2},{3,4}}'::int[], 1)	text,integer	g|1 ; g|2
+SELECT 'g', generate_subscripts('{{1,2},{3,4}}'::int[], 2)	text,integer	g|1 ; g|2
+SELECT 'g', generate_subscripts('{a,b,c}'::text[], 1, true)	text,integer	g|3 ; g|2 ; g|1
+SELECT 'g', generate_subscripts('[0:2]={a,b,c}'::text[], 1)	text,integer	g|0 ; g|1 ; g|2
+SELECT pg_typeof(generate_subscripts('{a}'::text[], 1))	regtype	integer
+SELECT idx FROM generate_subscripts('{a,b,c}'::text[], 1) AS idx ORDER BY idx	integer	1 ; 2 ; 3
+SELECT 'g', i, ('{a,b,c}'::text[])[i] FROM generate_subscripts('{a,b,c}'::text[], 1) AS i ORDER BY i	text,integer,text	g|1|a ; g|2|b ; g|3|c
+SELECT 'g', array_agg(x ORDER BY i) FROM (SELECT i, ('{c,a,b}'::text[])[i] AS x FROM generate_subscripts('{c,a,b}'::text[], 1) AS i) s	text,text[]	g|{c,a,b}
+SELECT 'g', array_agg(x ORDER BY x) FROM (SELECT ('{c,a,b}'::text[])[i] AS x FROM generate_subscripts('{c,a,b}'::text[], 1) AS i) s	text,text[]	g|{a,b,c}
+SELECT 'g', count(*) FROM generate_subscripts('{a,b,c}'::text[], 1) AS i, generate_subscripts('{x,y}'::text[], 1) AS j	text,bigint	g|6
+SELECT 'g', generate_subscripts('{a,b}'::text[], 1) AS i, generate_subscripts('{x,y,z}'::text[], 1) AS j	text,integer,integer	g|1|1 ; g|2|2 ; g|\N|3
+SELECT 'g', generate_subscripts('{a,b,c}'::text[])	!42883 function generate_subscripts(text[]) does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT 'g', generate_subscripts(1, 1)	!42883 function generate_subscripts(integer, integer) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+# The `ActiveRecord` shape end to end, over the relation it really reads: `pg_constraint.conkey`
+# is an array of attribute numbers and the dump turns it into column *names* in the constraint's
+# own order. `UNIQUE` is not here because this node has no `contype = 'u'` row to read yet.
+CREATE TABLE gsp (a int8, b int8, c int8, CONSTRAINT gsp_pk PRIMARY KEY (b, a))		-
+CREATE TABLE gsc (x int8 PRIMARY KEY, y int8 NOT NULL, z int8, CONSTRAINT gsc_fk FOREIGN KEY (y, z) REFERENCES gsp (b, a))		-
+SELECT conname, contype, conkey FROM pg_constraint WHERE conrelid = 'gsc'::regclass ORDER BY conname	name,"char",smallint[]	gsc_fk|f|{2,3} ; gsc_pkey|p|{1} ; gsc_x_not_null|n|{1} ; gsc_y_not_null|n|{2}
+SELECT conname, conkey FROM pg_constraint WHERE conrelid = 'gsc'::regclass AND contype IN ('p','f') ORDER BY conname	name,smallint[]	gsc_fk|{2,3} ; gsc_pkey|{1}
+SELECT c.conname, (SELECT array_agg(a.attname ORDER BY idx) FROM (SELECT idx, c.conkey[idx] AS conkey_elem FROM generate_subscripts(c.conkey, 1) AS idx) indexed_conkeys JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = indexed_conkeys.conkey_elem) AS cols FROM pg_constraint c WHERE c.conrelid = 'gsc'::regclass AND c.contype IN ('p','f') ORDER BY c.conname	name,name[]	gsc_fk|{y,z} ; gsc_pkey|{x}
+SELECT c.conname, (SELECT count(*) FROM generate_subscripts(c.conkey, 1) AS idx) AS n FROM pg_constraint c WHERE c.conrelid = 'gsc'::regclass AND c.contype IN ('p','f') ORDER BY c.conname	name,bigint	gsc_fk|2 ; gsc_pkey|1
+SELECT c.conname, (SELECT array_agg(idx ORDER BY idx) FROM generate_subscripts(c.conkey, 1) AS idx) AS subs FROM pg_constraint c WHERE c.conrelid = 'gsp'::regclass AND c.contype = 'p'	name,integer[]	gsp_pk|{1,2}

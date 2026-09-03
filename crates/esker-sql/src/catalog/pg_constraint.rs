@@ -189,8 +189,8 @@ pub fn rows_from(relations: &Relations) -> Vec<Vec<Datum>> {
                         .map_or(NO_FOREIGN_ACTION, |foreign| foreign.confdeltype)
                         .to_owned(),
                 ),
-                match &constraint.foreign {
-                    Some(foreign) => Datum::Text(foreign.conkey.clone()),
+                match &constraint.conkey {
+                    Some(conkey) => Datum::Text(conkey.clone()),
                     None => Datum::Null,
                 },
                 match &constraint.foreign {
@@ -260,7 +260,17 @@ struct Constraint {
     name: String,
     contype: &'static str,
     conindid: i64,
-    /// A `FOREIGN KEY`'s five columns, or `None` for every other kind.
+    /// The constrained columns as an `int2vector` prints — `{2}`, `{1,3}` — or `None` where the
+    /// constraint does not name any.
+    ///
+    /// **Every kind but `CHECK` has one**, measured: a `NOT NULL` names its column, a primary key
+    /// and a foreign key name theirs in declaration order, and that order is the answer — the
+    /// schema dump reads `conkey` through `generate_subscripts` precisely to recover it. A
+    /// `CHECK`'s `conkey` is the set of columns its expression mentions, which needs the
+    /// expression analysed rather than the definition read, so it is `None` here and a divergence
+    /// where a statement asks for it.
+    conkey: Option<String>,
+    /// A `FOREIGN KEY`'s columns, or `None` for every other kind.
     foreign: Option<ForeignColumns>,
 }
 
@@ -270,8 +280,8 @@ struct ForeignColumns {
     confupdtype: &'static str,
     confdeltype: &'static str,
     condeferrable: bool,
-    /// `conkey` and `confkey` as an `int2vector` prints: `{2}`, `{1,3}`.
-    conkey: String,
+    /// The **parent**'s key columns, as an `int2vector` prints. The child's are `Constraint`'s
+    /// `conkey`, which every kind of constraint has.
     confkey: String,
 }
 
@@ -286,6 +296,7 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             contype: "n",
             // Zero, measured: a `NOT NULL` is enforced by the column and has no index behind it.
             conindid: 0,
+            conkey: Some(attnum_vector(table, &[at])),
             foreign: None,
         })
         .collect();
@@ -301,6 +312,7 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             name: table.primary_key_name.clone(),
             contype: "p",
             conindid: oid,
+            conkey: Some(attnum_vector(table, &table.primary_key)),
             foreign: None,
         });
     }
@@ -312,6 +324,7 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             name: check.name.clone(),
             contype: "c",
             conindid: 0,
+            conkey: None,
             foreign: None,
         });
     }
@@ -330,12 +343,12 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             name: key.name.clone(),
             contype: "f",
             conindid: 0,
+            conkey: Some(attnum_vector(table, &key.columns)),
             foreign: Some(ForeignColumns {
                 confrelid: parent_oid,
                 confupdtype: key.on_update.code(),
                 confdeltype: key.on_delete.code(),
                 condeferrable: key.deferrable,
-                conkey: attnum_vector(table, &key.columns),
                 confkey: parent.map_or_else(String::new, |parent| {
                     attnum_vector(parent, &key.parent_columns)
                 }),

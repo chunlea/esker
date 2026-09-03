@@ -282,6 +282,30 @@ impl<'a> Scope<'a> {
         }
     }
 
+    /// The relation a column reference belongs to, walking outward exactly as [`Scope::lookup`]
+    /// does — or `None` when the name resolves to nothing, which is the caller's error to report.
+    ///
+    /// It exists for one question: **is this column one of the catalog's attnum vectors?** A
+    /// `ColumnDef` carries a name and a type and neither says which relation it came from, and
+    /// `pg_constraint.conkey` is only an `int2vector` because of the relation it is in.
+    fn relation_of(&self, qualifier: Option<&str>, name: &str) -> Option<&TableDef> {
+        if let Some(qualifier) = qualifier {
+            if let Ok(index) = self.entry(qualifier)
+                && self.tables[index].column(name).is_some()
+            {
+                return Some(self.tables[index]);
+            }
+        } else if let Some(table) = self
+            .tables
+            .iter()
+            .find(|table| table.column(name).is_some())
+        {
+            return Some(table);
+        }
+        self.outer
+            .and_then(|outer| outer.relation_of(qualifier, name))
+    }
+
     /// The lookup at this level only.
     fn resolve_here(&self, qualifier: Option<&str>, name: &str) -> Result<(usize, &ColumnDef)> {
         if let Some(qualifier) = qualifier {
@@ -474,6 +498,12 @@ pub(super) fn plan_under(
         // A derived table's "access path" is the sub-select's own plan. Nothing narrows it and
         // nothing seeks in it -- the `WHERE` below becomes a `Filter` over these rows, which is
         // what the same statement over an unindexed table already gets.
+        // A set-returning function is a third kind of source, beside a relation and a derived
+        // table: no key range, no statistics, and rows that exist only once its arguments are
+        // evaluated. It is checked before the derived plan because it has neither.
+        Some(table) if outer_entry.is_some_and(|entry| entry.function.is_some()) => {
+            function_node(outer_entry.unwrap_or_else(|| unreachable!()), table, outer)?
+        }
         Some(table) => {
             if let Some(plan) = outer_entry.and_then(crate::plan::TableRef::derived_plan) {
                 plan.clone()
@@ -489,13 +519,18 @@ pub(super) fn plan_under(
 
     if let Some(join) = only_join {
         let inner = inner_table.ok_or_else(|| SqlError::UndefinedTable(join.table.name.clone()))?;
+        // The inner side may be a function too — `FROM generate_subscripts(…) i, generate_subscripts(…) j` is a join of two of them — and it is read exactly as a derived side is,
+        // because both are plans rather than key ranges.
+        let inner_function = source_function(inner_entry, inner, outer)?;
         node = join_node(
             node,
             condition.as_ref(),
             left_join,
             &scope,
             inner,
-            inner_entry.and_then(crate::plan::TableRef::derived_plan),
+            inner_function
+                .as_ref()
+                .or_else(|| inner_entry.and_then(crate::plan::TableRef::derived_plan)),
         )?;
     }
 
@@ -816,12 +851,15 @@ fn plan_chain(
 
     // The `WHERE` cannot narrow the outer access path here: with more than one table it may
     // mention any of them, and a value from a table not yet read is not one a scan can seek on.
-    let mut node = match select
-        .from
-        .as_ref()
-        .and_then(crate::plan::TableRef::derived_plan)
-    {
-        Some(plan) => plan.clone(),
+    let mut node = match select.from.as_ref() {
+        // A set-returning function is a third kind of source, beside a relation and a derived
+        // table: no key range, no statistics, and rows that exist only once its arguments are
+        // evaluated.
+        Some(entry) if entry.function.is_some() => function_node(entry, outer, enclosing)?,
+        Some(entry) => match entry.derived_plan() {
+            Some(plan) => plan.clone(),
+            None => access_path(None, tenant, outer)?,
+        },
         None => access_path(None, tenant, outer)?,
     };
     // Grown one table at a time, so each step's `ON` sees exactly the tables to its left plus the
@@ -830,13 +868,16 @@ fn plan_chain(
     for (at, (join, inner)) in select.joins.iter().zip(inners).enumerate() {
         let scope = Scope::chain(&entries[..=at + 1]).under(enclosing);
         let left_join = join.kind == crate::plan::JoinKind::Left;
+        let inner_function = source_function(Some(&join.table), inner, enclosing)?;
         node = join_node(
             node,
             join.on.as_ref(),
             left_join,
             &scope,
             inner,
-            join.table.derived_plan(),
+            inner_function
+                .as_ref()
+                .or_else(|| join.table.derived_plan()),
         )?;
     }
 
@@ -1147,6 +1188,48 @@ fn probe_for(on: &Expr, scope: &Scope<'_>, inner: &TableDef) -> Option<crate::pl
 
 /// Rule 1, 2 and 3 from `plan::query`: pin the whole primary key, bound its first column, or pin a
 /// unique index's whole key. Otherwise a scan.
+/// The node a `FROM` entry that is a set-returning function becomes.
+/// The plan for a `FROM` entry that is a set-returning function, or `None` when it is a relation.
+fn source_function(
+    entry: Option<&crate::plan::TableRef>,
+    def: &TableDef,
+    enclosing: Option<&Scope<'_>>,
+) -> Result<Option<Node>> {
+    entry
+        .filter(|entry| entry.function.is_some())
+        .map(|entry| function_node(entry, def, enclosing))
+        .transpose()
+}
+
+/// A set-returning function standing where a relation does.
+///
+/// **Its arguments are resolved against the enclosing scope and nothing else.** A function in
+/// `FROM` cannot see the rows it is itself producing, so the scope it resolves in is empty of
+/// local tables — which is what turns `generate_subscripts(c.conkey, 1)` inside a correlated
+/// subquery into an `Outer` reference that the row above supplies, and what makes a reference to
+/// a table of this same `FROM` an "undefined column" rather than a silent NULL.
+fn function_node(
+    entry: &crate::plan::TableRef,
+    def: &TableDef,
+    enclosing: Option<&Scope<'_>>,
+) -> Result<Node> {
+    let mut call = entry.function.clone().unwrap_or_else(|| {
+        Box::new(crate::plan::TableFunction {
+            name: String::new(),
+            args: Vec::new(),
+            def: None,
+        })
+    });
+    let scope = Scope::empty().under(enclosing);
+    for arg in &mut call.args {
+        *arg = resolve(arg, &scope)?;
+    }
+    Ok(Node::TableFunction {
+        call,
+        columns: def.row_schema(),
+    })
+}
+
 fn access_path(filter: Option<&Expr>, tenant: u64, table: &TableDef) -> Result<Node> {
     let columns = table.row_schema();
     // A `pg_catalog` relation is computed, so it has no key range to narrow and no index to seek
@@ -1518,6 +1601,14 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             operand: Box::new(resolve(operand, scope)?),
             array: Box::new(resolve(array, scope)?),
         },
+        // **The element type comes from the array where the array knows it.** An array is text
+        // here and its elements normally take their type from what they are compared against
+        // (`retype_subscript`) — but that rule needs the comparison to be *in the same statement*,
+        // and the schema dump puts the subscript inside a derived table and the comparison
+        // outside it. `pg_constraint.conkey` is an `int2vector` on a real server, so its elements
+        // are `int2` wherever they are read, and typing them here is what lets
+        // `a.attnum = indexed_conkeys.conkey_elem` match instead of comparing an `int2` to a
+        // `Datum::Text` and finding nothing.
         Expr::Subscript {
             operand,
             index,
@@ -1525,7 +1616,7 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
         } => Expr::Subscript {
             operand: Box::new(resolve(operand, scope)?),
             index: Box::new(resolve(index, scope)?),
-            element: *element,
+            element: attnum_vector_element(operand, scope).unwrap_or(*element),
         },
         Expr::Case {
             branches,
@@ -1864,6 +1955,25 @@ fn reconcile(op: BinaryOp, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
 }
 
 /// One subscript, told which type to read its element as.
+/// `int2` when this expression is one of the catalog's attnum vectors, or `None`.
+///
+/// The three of them — `pg_index.indkey`, `pg_constraint.conkey`, `pg_constraint.confkey` — are
+/// `int2vector` and `int2[]` on a real server and `text` here, which is the trade every
+/// `pg_catalog` column makes. Their **elements** are attnums either way, and that is a fact about
+/// the relation rather than about the column's storage, so it is read from the relation.
+fn attnum_vector_element(operand: &Expr, scope: &Scope<'_>) -> Option<ColumnType> {
+    let Expr::Column { table, name } = operand else {
+        return None;
+    };
+    let relation = scope.relation_of(table.as_deref(), name)?;
+    let vector = match relation.name.as_str() {
+        "pg_index" => name == "indkey",
+        "pg_constraint" => name == "conkey" || name == "confkey",
+        _ => false,
+    };
+    vector.then_some(ColumnType::Int2)
+}
+
 fn retype_subscript(expr: &Expr, ty: ColumnType) -> Expr {
     match expr {
         Expr::Subscript { operand, index, .. } => Expr::Subscript {

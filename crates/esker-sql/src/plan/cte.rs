@@ -62,6 +62,7 @@ pub fn inline(select: &mut Select, name: &str, body: &Select, columns: &[String]
                 Box::new(body.clone()),
                 columns.to_vec(),
             ))),
+            function: None,
             hidden_cte: false,
         };
     });
