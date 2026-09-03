@@ -1,0 +1,82 @@
+crates/esker-sql/src/error.rs
+  h_44076b318daf9c 525-553,1307-1310,1390-1391
+crates/esker-sql/src/exec/cursor.rs
+  h_44076b318daf9c 844-853,881-884,895-916,922-927,933-934,1215-1247,1260-1289
+crates/esker-sql/src/exec/ddl.rs
+  h_44076b318daf9c 414-415,417-421,1183-1187,1407-1410
+crates/esker-sql/src/exec/dml.rs
+  h_44076b318daf9c 143,169,185-188,199-235,242-246,287,552
+crates/esker-sql/src/exec/fragment.rs
+  h_44076b318daf9c 411-413,682
+crates/esker-sql/src/exec/query.rs
+  h_44076b318daf9c 1612-1618,2353-2445,2448-2452,2461-2465,2467
+crates/esker-sql/src/exec/subquery.rs
+  h_44076b318daf9c 540,961,1029
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 49-52,767-769,771-772,865-869,874,1219-1222,1756-1782,1900-1909,2437-2444,3068-3085
+crates/esker-sql/src/parse/mod.rs
+  h_44076b318daf9c 294
+crates/esker-sql/src/plan/cte.rs
+  h_44076b318daf9c 159
+crates/esker-sql/src/plan/ddl.rs
+  h_44076b318daf9c 112
+crates/esker-sql/src/plan/expr.rs
+  h_44076b318daf9c 35-41,48-65,367-370,380,390,396,398-405,407-408,499-529,561-571,610-614,632-633,641-644,661-663,674-677,842-880,1212
+crates/esker-sql/src/plan/mod.rs
+  h_44076b318daf9c 41-42,73-74,163,166,203
+crates/esker-sql/src/plan/query.rs
+  h_44076b318daf9c 811-820
+crates/esker-sql/src/sqlstate.rs
+  h_44076b318daf9c 52-54
+crates/esker-sql/src/value/arith.rs
+  h_44076b318daf9c 1-584
+crates/esker-sql/src/value/encoding.rs
+  h_44076b318daf9c 1-64
+crates/esker-sql/src/value/mod.rs
+  h_44076b318daf9c 32-33,35-36
+crates/esker-sql/src/value/numeric.rs
+  h_44076b318daf9c 368-377,493-590,610-615,618-625
+crates/esker-sql/tests/arithmetic.rs
+  h_44076b318daf9c 1-55
+crates/esker-sql/tests/corpus/pg19_arithmetic.txt
+  h_44076b318daf9c 1-89
+crates/esker-sql/tests/corpus/pg19_numeric_arithmetic.txt
+  h_44076b318daf9c 1-78
+crates/esker-sql/tests/corpus/pg19_scalar_functions.txt
+  h_44076b318daf9c 1-60
+crates/esker-sql/tests/default_expression.rs
+  h_44076b318daf9c 43-48
+crates/esker-sql/tests/float_spelling.rs
+  h_44076b318daf9c 21
+crates/esker-sql/tests/lowering.rs
+  h_44076b318daf9c 39-44
+crates/esker-sql/tests/numeric.rs
+  h_44076b318daf9c 103-111
+crates/esker-sql/tests/numeric_arithmetic.rs
+  h_44076b318daf9c 1-65
+crates/esker-sql/tests/scalar_functions.rs
+  h_44076b318daf9c 1-4,11,17-62,68,73,78,80-84,86-90,93-100,103,105-107,109,111-115,117-118
+crates/esker-sql/tests/schema_change.rs
+  h_44076b318daf9c 279-280,282-285,287,292-299
+crates/esker-sql/tests/select.rs
+  h_44076b318daf9c 399-404
+crates/esker-sql/tests/slt/unsupported.slt
+  h_44076b318daf9c 52-55
+crates/esker-sql/tests/subquery.rs
+  h_44076b318daf9c 75-77,79
+crates/esker-sql/tests/time.rs
+  h_44076b318daf9c 191-194,197-200
+docs/adr/0046-arithmetic-is-its-own-node-and-postgresql-s-promotion-table.md
+  h_44076b318daf9c 1-87
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a4d3d7986f38a7db73d6d75acaaafa6e8abc692f",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
