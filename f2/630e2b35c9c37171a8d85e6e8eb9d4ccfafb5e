@@ -1,0 +1,38 @@
+crates/esker-sql/src/catalog/pg_constraint.rs
+  h_44076b318daf9c 192-193,263-273,283-284,299,315,327,346
+crates/esker-sql/src/exec/cursor.rs
+  h_44076b318daf9c 185-188,195-201
+crates/esker-sql/src/exec/mod.rs
+  h_44076b318daf9c 44
+crates/esker-sql/src/exec/query.rs
+  h_44076b318daf9c 285-308,501-506,522-524,531-533,854-862,871,878-880,1191-1232,1604-1611,1619,1958-1976
+crates/esker-sql/src/exec/subquery.rs
+  h_44076b318daf9c 107,155-198,322-326,823-829,892-898
+crates/esker-sql/src/exec/table_function.rs
+  h_44076b318daf9c 1-147
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 21-25,2618,3505,3592-3632,3648,3683
+crates/esker-sql/src/plan/cte.rs
+  h_44076b318daf9c 65
+crates/esker-sql/src/plan/mod.rs
+  h_44076b318daf9c 44-45
+crates/esker-sql/src/plan/query.rs
+  h_44076b318daf9c 66-71,92,240-254,257,274-283,619-623
+crates/esker-sql/tests/activerecord_surface.rs
+  h_44076b318daf9c 140-146,148
+crates/esker-sql/tests/corpus/pg19_generate_subscripts.txt
+  h_44076b318daf9c 1-80
+crates/esker-sql/tests/generate_subscripts.rs
+  h_44076b318daf9c 1-101
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "f2630e2b35c9c37171a8d85e6e8eb9d4ccfafb5e",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
