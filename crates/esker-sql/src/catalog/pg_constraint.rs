@@ -301,14 +301,36 @@ struct ForeignColumns {
     confkey: String,
 }
 
+/// Whose name a table's `NOT NULL` constraints are built from.
+///
+/// Its own, except for a **partition**, which inherits its parent's constraints along with its
+/// columns and reports them under the parent's name. Measured for a partition; an `INHERITS` child
+/// is not captured and keeps its own name, which is what it has always reported.
+fn not_null_declared_by<'a>(relations: &'a Relations, table: &'a TableDef) -> &'a str {
+    if table.partition_bound.is_none() {
+        return &table.name;
+    }
+    table
+        .parents
+        .first()
+        .and_then(|&parent_id| relations.table_by_id(parent_id))
+        .map_or(table.name.as_str(), |parent| parent.name.as_str())
+}
+
 /// Every constraint one table has, in name order — which is the order `pg_constraint` is read in.
 fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Vec<Constraint> {
+    // **A partition's `NOT NULL` rows carry the *parent's* name.** They are the parent's
+    // constraints, inherited with the column rather than declared again: `pk_part_1` reports
+    // `pk_part_a_not_null`, not `pk_part_1_a_not_null`. Measured. Its primary key is its own and
+    // keeps its own name, which is why the two are decided separately here — and why name order
+    // puts `pk_part_1_pkey` first.
+    let declaring = not_null_declared_by(relations, table);
     let mut out: Vec<Constraint> = not_null_columns(table)
         .into_iter()
         .map(|(name, at)| Constraint {
             oid: not_null_oid(table.id, pg_relations::attnum_of(table, at)),
             // PostgreSQL's own spelling, measured: `ka_id_not_null`.
-            name: format!("{}_{name}_not_null", table.name),
+            name: format!("{declaring}_{name}_not_null"),
             contype: "n",
             // Zero, measured: a `NOT NULL` is enforced by the column and has no index behind it.
             conindid: 0,

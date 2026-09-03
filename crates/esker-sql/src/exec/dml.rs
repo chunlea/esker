@@ -469,10 +469,6 @@ pub(super) fn write_row(
         // its entries carry a suffix so that two colliding rows can coexist until the check runs.
         // Which is *now* for an immediate one and at `COMMIT` for a deferred one; the transaction
         // decides, and `SET CONSTRAINTS` is how it says (`crate::exec::deferred`).
-        eprintln!(
-            "PROBE index {} unique={} deferrable={:?}",
-            index.name, index.unique, index.constraint
-        );
         // **A NULL is still not a duplicate.** `UNIQUE` admits any number of NULLs unless
         // `NULLS NOT DISTINCT` says otherwise, and the by-value test below carried that rule for
         // an immediate constraint. A deferrable one is scanned rather than read, and the scan

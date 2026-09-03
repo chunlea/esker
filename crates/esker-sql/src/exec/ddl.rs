@@ -74,10 +74,18 @@ pub(super) fn create_table(
             .ok_or_else(|| SqlError::UndefinedColumnInKey(name.clone()))
     };
 
+    // **A partition takes the parent's primary key as well as its columns.** Without it the
+    // partition declares no key, gets an internal row id the parent has not, and a row routed
+    // from the parent is one value short of the partition's width — an internal error at the
+    // first `INSERT`, measured. The parent's key is taken by *name*, which is what makes it land
+    // on the partition's own columns.
+    let inherited_key = partition_primary_key(create, parents.first());
+    let declared_key = inherited_key.as_ref().unwrap_or(&create.primary_key);
+
     // No declared key: the table gets an internal row id at position 0, and the primary key
     // points at it. Position 0 rather than the end so that a later `ALTER TABLE ADD COLUMN`
     // appends after the user's columns and cannot move it.
-    let (columns, primary_key, primary_key_name) = if create.primary_key.is_empty() {
+    let (columns, primary_key, primary_key_name) = if declared_key.is_empty() {
         let mut with_row_id = Vec::with_capacity(columns.len() + 1);
         with_row_id.push(ColumnDef {
             name: catalog::INTERNAL_ROW_ID_NAME.to_owned(),
@@ -94,11 +102,13 @@ pub(super) fn create_table(
         with_row_id.extend(columns);
         (with_row_id, vec![0], String::new())
     } else {
-        let primary_key = create
-            .primary_key
+        let primary_key = declared_key
             .iter()
             .map(key_position)
             .collect::<Result<Vec<_>>>()?;
+        // **`<partition>_pkey`, not the parent's name.** A partition's key is its own relation and
+        // its own `pg_index` row, and it is that name a duplicate row quotes back — measured,
+        // `pk_part_1_pkey` rather than `pk_part_pkey`.
         let name = create
             .primary_key_name
             .clone()
@@ -111,6 +121,7 @@ pub(super) fn create_table(
     // an overlapping bound leaves the catalog untouched.
     let partition_by = partition_key(create, &columns)?;
     let partition_bound = partition_bound(executor, txn, create, parents.first())?;
+    refuse_uncovered_primary_key(create, partition_by.as_ref(), &primary_key, &columns)?;
 
     let table_id = catalog::allocate_id(txn, executor.tenant)?;
     let sequences = sequences_for(executor, txn, create, table_id)?;
@@ -483,6 +494,60 @@ fn set_column_default(
         }
     }
     Ok(())
+}
+
+/// **A `PRIMARY KEY` on a partitioned table is the unique-index rule again**, in PostgreSQL's own
+/// two sentences with the word substituted.
+///
+/// Checked here rather than in [`create_index`] because this is the *inline* spelling, the one a
+/// `CREATE TABLE` carries — and checked before the table is written, so a refusal leaves nothing
+/// behind. A key this node **derived** (the internal row id) is not a declared one and is not
+/// checked: nothing was written for it to miss.
+fn refuse_uncovered_primary_key(
+    create: &CreateTable,
+    partition_by: Option<&catalog::PartitionKey>,
+    primary_key: &[usize],
+    columns: &[ColumnDef],
+) -> Result<()> {
+    let Some(key) = partition_by else {
+        return Ok(());
+    };
+    if create.primary_key.is_empty() {
+        return Ok(());
+    }
+    if let Some(&missing) = key.columns.iter().find(|at| !primary_key.contains(at)) {
+        return Err(SqlError::PartitionKeyNotCovered {
+            kind: "PRIMARY KEY",
+            relation: create.name.clone(),
+            missing: columns[missing].name.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// The parent's primary key column names, for a partition that declares none of its own.
+///
+/// `None` for a table that is not a partition, and for a partition whose parent has no declared
+/// key either — that parent carries an **internal row id** instead, and the partition gets one of
+/// its own at the same position, which keeps the two the same width.
+///
+/// By **name**, because the ordinals are the parent's: a partition takes the parent's columns and
+/// may not lay them out identically.
+fn partition_primary_key(
+    create: &CreateTable,
+    parent: Option<&std::sync::Arc<TableDef>>,
+) -> Option<Vec<String>> {
+    let parent = parent.filter(|_| create.partition_of.is_some())?;
+    if parent.row_id().is_some() {
+        return None;
+    }
+    Some(
+        parent
+            .primary_key
+            .iter()
+            .filter_map(|&at| parent.columns.get(at).map(|column| column.name.clone()))
+            .collect(),
+    )
 }
 
 /// **A partition takes the parent's columns and declares none of its own.**
@@ -1457,9 +1522,16 @@ pub(super) fn drop_table(
         // foreign key does — `2BP01`, with a `DETAIL` naming the child. `CASCADE` takes the child
         // *table*, unlike the foreign-key case above where it takes only the constraint: a child
         // has no meaning without the parent whose columns it borrowed.
+        //
+        // **A partition is the opposite, and the two share this edge.** `DROP TABLE measurements`
+        // with two partitions holding rows succeeds and takes both — no `CASCADE` — leaving zero
+        // relations under that name. Measured, in the same session that measured the `INHERITS`
+        // refusal above, and the difference is not cosmetic: it is the statement
+        // `create_table(:measurements, force: true)` sends on every schema reload, so a node that
+        // refused it could not load the suite's schema twice.
         for &child_id in &table.children {
             let child = executor.table_by_id(txn, child_id)?;
-            if !drop.cascade {
+            if !drop.cascade && child.partition_bound.is_none() {
                 return Err(SqlError::DependentTable {
                     relation: table.name.clone(),
                     detail: format!("table {} depends on table {}", child.name, table.name),
@@ -1892,6 +1964,26 @@ fn refuse_unless_immutable(expr: &plan::Expr) -> Result<()> {
     });
     refusal.map_or(Ok(()), Err)
 }
+/// An index's key as column **names**, which is how a partition's copy is matched to its parent's.
+///
+/// Positions cannot do it: the copy's ordinals are the partition's and the original's are the
+/// parent's, and the two differ the moment a partition carries an internal row id the parent has
+/// not. An expression part has no column and is named by its printed text, so two copies of one
+/// expression index still match.
+fn index_key_names(table: &TableDef, index: &IndexDef) -> Vec<String> {
+    index
+        .keys
+        .iter()
+        .map(|key| {
+            key.position()
+                .and_then(|at| table.columns.get(at))
+                .map_or_else(
+                    || key.attname(table).to_owned(),
+                    |column| column.name.clone(),
+                )
+        })
+        .collect()
+}
 
 pub(super) fn drop_index(
     executor: &mut Executor,
@@ -1959,6 +2051,41 @@ pub(super) fn drop_index(
             continue;
         }
 
+        // **Dropping the partitioned index takes every partition's own copy with it.** Measured:
+        // after `DROP INDEX index_measurements_on_logdate_and_city_id`, *zero* relations match
+        // `%logdate_city_id%` — the children the suite never named go with the parent it did. So
+        // the copies are found the way they were made, by the key columns' names, and dropped
+        // first; the parent's own entries and record follow below.
+        if table.partition_by.is_some()
+            && let Some(index) = table.indexes.iter().find(|index| index.id == index_id)
+        {
+            let key = index_key_names(&table, index);
+            for &child_id in &table.children {
+                let child = executor.table_by_id(txn, child_id)?;
+                let mine: Vec<u64> = child
+                    .indexes
+                    .iter()
+                    .filter(|copy| index_key_names(&child, copy) == key)
+                    .map(|copy| copy.id)
+                    .collect();
+                if mine.is_empty() {
+                    continue;
+                }
+                let mut without = (*child).clone();
+                for copy_id in &mine {
+                    let (start, end) = crate::row::index_range(executor.tenant, child.id, *copy_id);
+                    super::for_each_page(txn, &start, &end, |txn, page| {
+                        for (key, _) in page {
+                            txn.delete(key);
+                        }
+                        Ok(())
+                    })?;
+                }
+                without.indexes.retain(|copy| !mine.contains(&copy.id));
+                without.schema_version += 1;
+                catalog::replace_table(txn, executor.tenant, &child, &without)?;
+            }
+        }
         let (start, end) = crate::row::index_range(executor.tenant, table_id, index_id);
         super::for_each_page(txn, &start, &end, |txn, page| {
             for (key, _) in page {
