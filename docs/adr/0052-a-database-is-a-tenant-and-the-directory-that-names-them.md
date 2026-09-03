@@ -1,0 +1,155 @@
+# 0051 — A database is a tenant, and the directory that names them
+
+## Context
+
+`docs/plans/phase-9-rails.md` measures this node against ActiveRecord's own suite (ADR 0031), and
+run 46's seventh row is **103 tests across three files** — `counter_cache_test.rb` (56),
+`associations_test.rb` (46), `fixtures_test.rb` (1) — every one of them failing with the same
+sentence:
+
+    ActiveRecord::Fixture::FixtureError: table "dogs" has no columns named
+    "trainer_id", "dog_lover_id".
+
+**There is no server error underneath it.** `ActiveRecord` raises that itself, after reading the
+table's columns and finding the fixture's keys missing, and the introspection it read was answered
+correctly: the table really does lack the columns. The cause is two lines of the suite's own schema:
+
+* `schema.rb:578` — `create_table :dogs` with `trainer_id, breeder_id, dog_lover_id, alias`, on the
+  default connection (`arunit`).
+* `schema.rb:1496`, the **last line of the file** — `OtherDog.lease_connection.create_table :dogs,
+  force: true`, a bare `id`-only table. `OtherDog < ARUnit2Model`, so on a real server that runs
+  against the **`arunit2` database** and creates a second, independent `dogs`.
+
+The harness points `arunit` and `arunit2` at the same listener because this node has one namespace
+and ignores the name. So the second `create_table … force: true` does not create a second table —
+`force: true` is `DROP TABLE IF EXISTS` followed by `CREATE TABLE`, it does not merge — and it
+**drops and recreates the first one**, five live columns down to one. Measured on a real
+PostgreSQL, in one database, in `tests/corpus/pg19_two_database_dogs.txt`: `pg_attribute` goes
+5 → 1 and the introspection filters `attisdropped`, so there is no trace of the first definition
+left for anything to find.
+
+Those 103 tests cannot pass until the node has more than one database, whatever any other lane
+does. They are the largest single block on the scoreboard that is not a type.
+
+What exists today is one database and a comment saying so:
+
+* `bin/esker-sql.rs`: `const TENANT: u64 = 1` — *"the tenant every connection is served as, until
+  there is a way to say otherwise"*.
+* `pgwire::server`'s `complete_startup` reads the startup packet's `user` and **discards its
+  `database`**.
+* `parse::lower`'s `DATABASE_NAME = "esker"` is what `current_database()` answers and what the
+  single hard-coded `pg_database` row carries, deliberately the same constant so that
+  `WHERE datname = current_database()` matches by construction.
+
+## Decision
+
+**A database is a tenant id.** There is no new level in the key space, and `esker-keys` does not
+change.
+
+Every SQL key already carries a tenant, and it is the *first* field after the namespace byte in
+both halves of the layout (`esker_keys::prefix`, `catalog::record`):
+
+```text
+'t' ++ tenant:u64 ++ table_id:u64 ++ 'r' ++ row_id       rows
+'t' ++ tenant:u64 ++ table_id:u64 ++ 'i' ++ index_id …   indexes
+'m' ++ "sql" ++ kind ++ tenant:u64 ++ …                  every catalog record, the id
+                                                         sequence, the name index, a sequence's
+                                                         value, a schema-change job, a flashback
+```
+
+So the isolation a database needs is already a property of the encoding rather than a check
+somebody has to remember to write. Three things follow from that and they are the argument:
+
+1. **No table of one database can be named from another**, because the name index is
+   `'n' ++ tenant ++ name` and a lookup in the wrong tenant reads a different key. PostgreSQL's own
+   rule is that a connection sees exactly one database and *cannot* query across, so the constraint
+   the encoding imposes is the constraint the semantics want. A design where cross-database access
+   were possible would have to add the refusal back.
+2. **`DROP DATABASE` is two range deletes** — the tenant's slice of `'t'` and its slice of each
+   `'m' ++ "sql"` kind — and there is no third place a row can hide. Anything else makes dropping a
+   database a walk that a future record kind can silently fall out of.
+3. **The id sequence is already per tenant** (`'m' ++ "sql" ++ 's' ++ tenant`), so two databases
+   cannot collide on a relation id, and each starts counting from its own beginning the way a real
+   database does.
+
+### The two designs this rejects, and why
+
+**A database as a name qualification, the way a schema is.** Schemas here are not a key-space
+level: `catalog::qualify` folds `schema.name` into one string and stores it in the tenant's name
+index. Doing the same for a database would be the cheapest change and it is the wrong one — two
+databases would share one id sequence and one key range, so a scan of one database's tables visits
+the other's rows, `DROP DATABASE` becomes a walk over names rather than a range delete, and the
+isolation would be a convention rather than a property. A schema is qualifiable *because*
+PostgreSQL lets one statement name two schemas; a database is not, and encoding it the same way
+would make the illegal thing expressible.
+
+**A new level between tenant and table** — `'t' ++ tenant ++ db ++ table_id`. Rejected because it
+is an on-disk format change with golden tests behind it (`CLAUDE.md`: ask before changing one), and
+it buys a second axis that nothing asks for. A tenant that is not a database has no user today: the
+one caller sets it to `1` and the comment beside it says it is waiting for exactly this. Adding a
+level to keep the word "tenant" free for a feature nobody has specified is paying a format change
+for a name.
+
+### The one thing a tenant cannot hold: the directory
+
+`pg_database` must answer from **every** database — `ActiveRecord`'s adapter opens a connection and
+immediately runs `SELECT current_database()` and three joins against `pg_database` for the
+encoding, the collation and the ctype (`postgresql/schema_statements.rb:230-258`, measured in
+`tests/corpus/pg19_coalesce_current_database.txt`) — and `CREATE DATABASE` has to check a name that
+belongs to no database in particular. So the directory is the one piece of state that cannot be
+tenant-scoped, and it is a new record kind in **`esker-sql`'s own metadata space**, which
+`catalog::record` owns end to end:
+
+```text
+'m' ++ "sql" ++ 'D' ++ id:u64     a database: its name and the properties pg_database reports
+'m' ++ "sql" ++ 'N' ++ name       that name's id, the directory's only index
+'m' ++ "sql" ++ 'C'               the next database id, one counter for the cluster
+```
+
+`esker_keys::prefix::meta_key` takes an arbitrary suffix and the `"sql"` kind bytes are constants in
+`catalog::record`, so none of this reaches `esker-keys`: the reserved layout in `docs/DESIGN.md` §3
+is unchanged, and its four namespace bytes still mean what they meant.
+
+Two properties are inherited rather than re-argued. The name is the **whole tail** of its key, so
+it needs no length and cannot be confused with a longer one — the property `name_key` and the
+checkpoint keys already rely on. And the id is memcomparable, so the directory scans in id order.
+
+**The database id is the tenant id is the `pg_database` oid.** One number, so there is no mapping
+to keep consistent and no way for two of them to disagree.
+
+### A cluster with no directory has one database, and it is the one that is there
+
+An existing cluster has a tenant `1` full of rows and no `'D'` record. The directory is therefore
+**seeded rather than migrated**: a read that finds no databases answers with one — id `1`, named
+`DATABASE_NAME` — which is exactly what this node reports today. So an upgrade needs no step, the
+first `CREATE DATABASE` writes the seed row alongside the new one, and the constant that has been
+standing in for the directory becomes its default rather than being deleted.
+
+### What the startup packet selects, and what a wrong name costs
+
+The `database` parameter names the tenant the session runs as. A name the directory does not have
+is `3D000 database "x" does not exist`, at startup, which is what a real server answers and what
+`rake db:create` depends on to know it must create one.
+
+## Consequences
+
+- **103 tests become reachable**, and they are reachable by the harness pointing `arunit2` at a
+  second database rather than by any change to the tests. The exclusion list that ADR 0031 requires
+  loses its first three candidates instead of gaining them.
+- **`CREATE DATABASE` cannot be captured the way everything else in this phase is.** It is
+  `25001 CREATE DATABASE cannot run inside a transaction block` on a real server — measured — so
+  the corpus convention of `BEGIN … ROLLBACK` around a whole capture cannot cover it, and its
+  capture has to create and drop a real database by name and prove it left nothing behind.
+- The same `25001` is a rule here and not only a limitation: creating a database writes the
+  directory outside the session's transaction, so a `CREATE DATABASE` inside a block would be a
+  write that a `ROLLBACK` could not take back.
+- **`DROP DATABASE` deletes data that no `RESTRICT` protects.** PostgreSQL refuses to drop a
+  database with sessions connected to it; that refusal needs a session registry, and until there is
+  one the node has a way to delete a database another connection is using.
+- Anything that reads the tenant from a constant becomes a session property: the re-driver and the
+  columnar asserter in `bin/esker-sql.rs` each take `TENANT` today and each has to say *which*
+  database it is working on, or work on all of them.
+- `template0` / `template1` are not implemented and `CREATE DATABASE … TEMPLATE x` is refused by
+  name (contract C2). `rake db:create` sends `CREATE DATABASE "x" ENCODING = 'utf8'`, which the
+  directory can answer; copying a database's contents is a second unit and this one does not
+  pretend to it.
