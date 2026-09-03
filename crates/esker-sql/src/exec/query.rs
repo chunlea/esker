@@ -2072,6 +2072,29 @@ fn reconcile(op: BinaryOp, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
                 _ => (left, right),
             }
         }
+        // **Two columns whose types have no operator between them.** The same rule one line up,
+        // for the case where neither side is a literal: `WHERE id = title` over a `bigint` and a
+        // `text` is `42883 operator does not exist: bigint = text` on a real server, and this node
+        // compared two `Datum`s of different variants, found none equal and answered **no rows**.
+        // A query that silently finds nothing is what a suite reports as a wrong count rather than
+        // as an error, which is why it ranks worse than a refusal.
+        //
+        // The message names the two types **in the order they were written** — `s = id` is
+        // `text = bigint` — because they are two different operators that both do not exist.
+        _ if matches!(
+            (carried_type(&left), carried_type(&right)),
+            (Some(a), Some(b)) if !same_family(a, b) && !attnum_against_a_vector(a, b)
+        ) =>
+        {
+            let (Some(a), Some(b)) = (carried_type(&left), carried_type(&right)) else {
+                unreachable!("both types are Some in the guard above")
+            };
+            return Err(SqlError::UndefinedOperator {
+                left: a.name(),
+                op: op.symbol(),
+                right: b.name(),
+            });
+        }
         _ => (left, right),
     })
 }
@@ -2102,6 +2125,41 @@ fn attnum_vector_element(operand: &Expr, scope: &Scope<'_>) -> Option<ColumnType
         _ => false,
     };
     vector.then_some(ColumnType::Int2)
+}
+
+/// Whether the pair is an **attnum against a catalog vector's element**, which this node must not
+/// refuse.
+///
+/// `pg_index.indkey` and `pg_constraint.conkey` are `int2vector` on a real server and `text` here
+/// (`attnum_vector_element`), so an element of one is an `int2` there and a `text` here. Where the
+/// subscript is visible, `retype_subscript` puts the type back; where it is hidden behind a derived
+/// table — `(SELECT c.conkey[idx] AS elem …) JOIN pg_attribute a ON a.attnum = elem`, which is what
+/// `ActiveRecord`'s schema dump writes — the column arrives typed `text` and nothing can put it
+/// back. Refusing that pair would turn a statement this node answers today into `42883`, so it is
+/// exempted here and named as what it is: a consequence of the vector trade, not a rule about
+/// `int2`. It closes when the catalog vectors are real `int2[]` columns.
+fn attnum_against_a_vector(left: ColumnType, right: ColumnType) -> bool {
+    matches!(
+        (left, right),
+        (ColumnType::Int2, ColumnType::Text) | (ColumnType::Text, ColumnType::Int2)
+    )
+}
+
+/// The type an expression **carries in the node**, without a scope to resolve it against.
+///
+/// [`reconcile`] has no scope — it is given two already-resolved expressions — so it can only ask
+/// the ones that hold their own type. That is enough for the case it exists for: a column
+/// (`Ordinal`), a correlated reference (`Outer`), an arithmetic result and a per-row cast to
+/// `text`, which is every shape a cross-type comparison reached it as in the capture. Anything
+/// else answers `None` and falls through, because a rule that guessed here would refuse a
+/// statement a real server answers.
+fn carried_type(expr: &Expr) -> Option<ColumnType> {
+    match expr {
+        Expr::Ordinal { ty, .. } | Expr::Outer { ty, .. } => Some(*ty),
+        Expr::Arithmetic { ty, .. } => *ty,
+        Expr::ToText { .. } => Some(ColumnType::Text),
+        _ => None,
+    }
 }
 
 fn retype_subscript(expr: &Expr, ty: ColumnType) -> Expr {
