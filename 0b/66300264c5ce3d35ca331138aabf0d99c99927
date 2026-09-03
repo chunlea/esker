@@ -1,0 +1,23 @@
+crates/esker-sql/tests/regtype.rs
+  s_fd699569a45331::t_f621cb01577e6d 86-93,281-346
+crates/esker-sql/src/parse/lower.rs
+  s_fd699569a45331::t_b66c302edf0fe7 2504,2507,2538,2541
+crates/esker-sql/src/value/mod.rs
+  s_fd699569a45331::t_534eaaceeddd0c 243-270,323-407
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "0b66300264c5ce3d35ca331138aabf0d99c99927",
+  "prompts": {},
+  "sessions": {
+    "s_fd699569a45331": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cd0a4880-ec88-4a19-aaa2-d3c0300c3ffd",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
