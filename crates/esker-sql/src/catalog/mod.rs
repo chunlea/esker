@@ -774,18 +774,29 @@ pub struct PartitionKey {
 /// The strategy letter `pg_partitioned_table.partstrat` reports.
 ///
 /// **A one-letter code, not the word in the DDL** — `l`, never `LIST`. Measured.
+///
+/// `HASH` is not here: nothing captured it, and a strategy whose routing nobody measured is a row
+/// this node would put in the wrong partition. It is refused by name where the statement is
+/// lowered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PartitionStrategy {
     /// `LIST`, reported as `l`.
     List,
+    /// `RANGE`, reported as `r`.
+    Range,
 }
 
 impl PartitionStrategy {
     /// `partstrat`.
+    ///
+    /// `l` is measured. `r` is PostgreSQL's own code for `RANGE` and this capture never asked for
+    /// it — `pg_partitioned_table` is probed only over the `LIST` table — so it is the one letter
+    /// here that is taken from PostgreSQL rather than from a row.
     #[must_use]
     pub fn code(self) -> &'static str {
         match self {
             PartitionStrategy::List => "l",
+            PartitionStrategy::Range => "r",
         }
     }
 
@@ -794,6 +805,7 @@ impl PartitionStrategy {
     pub fn word(self) -> &'static str {
         match self {
             PartitionStrategy::List => "LIST",
+            PartitionStrategy::Range => "RANGE",
         }
     }
 }
@@ -807,8 +819,95 @@ pub enum PartitionBound {
     /// key and a real server prints the bound back as `FOR VALUES IN ('1')`, quoted. Storing the
     /// literal as written would diverge the moment `ActiveRecord` dumps the schema.
     Values(Vec<Datum>),
+    /// `FOR VALUES FROM (…) TO (…)` — **half-open**, `from` included and `to` excluded.
+    ///
+    /// Measured: `FROM (MINVALUE) TO (10)` takes `9` and `FROM (10) TO (MAXVALUE)` takes `10`. A
+    /// closed upper bound would put `10` in both partitions, which is why the two ranges in the
+    /// capture do not overlap despite sharing the number.
+    Range {
+        /// The lower bound, one entry per key column.
+        from: Vec<RangeBound>,
+        /// The upper bound, one entry per key column.
+        to: Vec<RangeBound>,
+    },
     /// `DEFAULT` — everything no other partition takes, and its bound prints as the bare word.
     Default,
+}
+
+/// One end of a `RANGE` bound: a value, or an infinity.
+///
+/// **`MINVALUE` and `MAXVALUE` print back verbatim** — they are not a very small and a very large
+/// number, and a node that stored them as `i64::MIN` and `i64::MAX` would print numbers where a
+/// real server prints the words.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RangeBound {
+    /// `MINVALUE`: below every value, NULL included.
+    MinValue,
+    /// A value, **already coerced to the key column's type**.
+    Value(Datum),
+    /// `MAXVALUE`: above every value.
+    MaxValue,
+}
+
+impl RangeBound {
+    /// Where a key value sits relative to this end.
+    ///
+    /// `MINVALUE` is below everything and `MAXVALUE` above it, which makes the half-open test one
+    /// comparison either side rather than four cases.
+    #[must_use]
+    pub fn cmp_value(&self, value: &Datum) -> core::cmp::Ordering {
+        match self {
+            RangeBound::MinValue => core::cmp::Ordering::Less,
+            RangeBound::MaxValue => core::cmp::Ordering::Greater,
+            RangeBound::Value(bound) => value::PgDatum::pg_cmp(bound, value),
+        }
+    }
+
+    /// How two ends of the same kind order against each other.
+    #[must_use]
+    pub fn cmp_bound(&self, other: &RangeBound) -> core::cmp::Ordering {
+        use core::cmp::Ordering;
+        match (self, other) {
+            (RangeBound::MinValue, RangeBound::MinValue)
+            | (RangeBound::MaxValue, RangeBound::MaxValue) => Ordering::Equal,
+            (RangeBound::MinValue, _) | (_, RangeBound::MaxValue) => Ordering::Less,
+            (RangeBound::MaxValue, _) | (_, RangeBound::MinValue) => Ordering::Greater,
+            (RangeBound::Value(ours), RangeBound::Value(theirs)) => {
+                value::PgDatum::pg_cmp(ours, theirs)
+            }
+        }
+    }
+
+    /// The text `pg_get_expr(relpartbound, oid)` prints for this end.
+    #[must_use]
+    pub fn printed(&self) -> String {
+        match self {
+            RangeBound::MinValue => "MINVALUE".to_owned(),
+            RangeBound::MaxValue => "MAXVALUE".to_owned(),
+            RangeBound::Value(value) => partition_literal(value),
+        }
+    }
+}
+
+/// A bound value as PostgreSQL deparses it: **a number bare and a string quoted**.
+///
+/// Both spellings are in one capture. The `LIST` bound is on a `character varying` key and comes
+/// back `FOR VALUES IN ('1')`; the `RANGE` bound is on an `int4` key and comes back
+/// `FOR VALUES FROM (MINVALUE) TO (10)` — no quotes. The type decides, which is why the value is
+/// coerced before it is stored rather than printed as it was typed.
+fn partition_literal(value: &Datum) -> String {
+    let text = value::PgDatum::to_text(value).unwrap_or_else(|| "NULL".to_owned());
+    match value {
+        Datum::Int2(_)
+        | Datum::Int4(_)
+        | Datum::Int8(_)
+        | Datum::Numeric(_)
+        | Datum::Double(_)
+        | Datum::Real(_)
+        | Datum::Oid(_) => text,
+        Datum::Bool(flag) => (if *flag { "true" } else { "false" }).to_owned(),
+        _ => format!("'{}'", text.replace('\'', "''")),
+    }
 }
 
 /// `pg_get_partkeydef(oid)` — `LIST (city_id)`, or NULL for a relation that is not partitioned.
@@ -837,24 +936,34 @@ pub fn partition_key_definition(relations: &pg_relations::Relations, oid: Option
     Datum::Text(format!("{} ({})", key.strategy.word(), columns.join(", ")))
 }
 
-/// `FOR VALUES IN ('1')` or `DEFAULT` — the bound as `pg_get_expr(relpartbound, oid)` prints it.
+/// `FOR VALUES IN ('1')`, `FOR VALUES FROM (MINVALUE) TO (10)` or `DEFAULT` — the bound as
+/// `pg_get_expr(relpartbound, oid)` prints it.
 ///
-/// **Every value is quoted**, whatever the key's type: the suite writes `FOR VALUES IN (1)` against
-/// a `character varying` key and a real server prints `FOR VALUES IN ('1')` back. The bound stored
-/// here has already been coerced, so this prints what the column holds and not what was typed.
+/// The bound stored here has already been coerced to the key columns' types, so this prints what
+/// the column holds and not what was typed — which is the whole reason the suite's
+/// `FOR VALUES IN (1)` against a `character varying` key comes back quoted
+/// ([`partition_literal`]).
 #[must_use]
 pub fn partition_bound_definition(bound: &PartitionBound) -> String {
+    let listed = |values: &[Datum]| {
+        values
+            .iter()
+            .map(partition_literal)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let ends = |bounds: &[RangeBound]| {
+        bounds
+            .iter()
+            .map(RangeBound::printed)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     match bound {
         PartitionBound::Default => "DEFAULT".to_owned(),
-        PartitionBound::Values(values) => {
-            let printed: Vec<String> = values
-                .iter()
-                .map(|value| {
-                    let text = value::PgDatum::to_text(value).unwrap_or_default();
-                    format!("'{}'", text.replace('\'', "''"))
-                })
-                .collect();
-            format!("FOR VALUES IN ({})", printed.join(", "))
+        PartitionBound::Values(values) => format!("FOR VALUES IN ({})", listed(values)),
+        PartitionBound::Range { from, to } => {
+            format!("FOR VALUES FROM ({}) TO ({})", ends(from), ends(to))
         }
     }
 }

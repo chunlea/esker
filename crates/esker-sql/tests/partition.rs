@@ -260,3 +260,121 @@ fn an_overlapping_partition_is_refused() {
         "partition \"m_dup\" would overlap partition \"m_t\""
     );
 }
+
+/// **A `RANGE` bound is half-open**, and `MINVALUE`/`MAXVALUE` print back as the words.
+///
+/// The two partitions share the number `10` and do not overlap: `FROM (MINVALUE) TO (10)` takes
+/// `9` and `FROM (10) TO (MAXVALUE)` takes `10`. A closed upper end would put `10` in both.
+#[test]
+fn a_range_partition_is_half_open() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE mp_range (id int8, r int4) PARTITION BY RANGE (r)",
+        "CREATE TABLE mp_range_lo PARTITION OF mp_range FOR VALUES FROM (MINVALUE) TO (10)",
+        "CREATE TABLE mp_range_hi PARTITION OF mp_range FOR VALUES FROM (10) TO (MAXVALUE)",
+    ]);
+    // **The words, verbatim** — and the `10` **unquoted**, where the `LIST` bound on a
+    // `character varying` key prints `'1'`. The key's type decides, which is why the bound is
+    // coerced before it is stored.
+    assert_eq!(
+        node.rows(
+            "SELECT relname, pg_get_expr(relpartbound, oid) FROM pg_class WHERE relname LIKE \
+             'mp_range_%' ORDER BY relname"
+        ),
+        vec![
+            vec!["mp_range_hi", "FOR VALUES FROM (10) TO (MAXVALUE)"],
+            vec!["mp_range_lo", "FOR VALUES FROM (MINVALUE) TO (10)"],
+        ]
+    );
+    node.run("INSERT INTO mp_range VALUES (1, 9), (2, 10)")
+        .unwrap();
+    assert_eq!(node.rows("SELECT id FROM mp_range_lo"), [["1"]]);
+    assert_eq!(node.rows("SELECT id FROM mp_range_hi"), [["2"]]);
+    assert_eq!(node.rows("SELECT count(*) FROM mp_range"), [["2"]]);
+    // `partstrat` is `r` where the LIST table's is `l`, and `pg_get_partkeydef` says the word.
+    assert_eq!(
+        node.rows(
+            "SELECT partstrat FROM pg_partitioned_table WHERE partrelid = 'mp_range'::regclass"
+        ),
+        [["r"]]
+    );
+    assert_eq!(
+        node.rows("SELECT pg_get_partkeydef('mp_range'::regclass)"),
+        [["RANGE (r)"]]
+    );
+    // Two ranges that really do overlap are still `42P17`.
+    let error = node
+        .run("CREATE TABLE mp_range_mid PARTITION OF mp_range FOR VALUES FROM (5) TO (20)")
+        .unwrap_err();
+    assert_eq!(error.sqlstate(), "42P17");
+}
+
+/// **`HASH` is refused by name**, because nothing captured how it routes.
+#[test]
+fn hash_partitioning_is_refused_by_name() {
+    let mut node = parity::Node::new(&[]);
+    let error = node
+        .run("CREATE TABLE h (id int8) PARTITION BY HASH (id)")
+        .unwrap_err();
+    assert_eq!(error.sqlstate(), "0A000");
+    assert_eq!(
+        error.to_string(),
+        "CREATE TABLE ... PARTITION BY HASH is not supported"
+    );
+}
+
+/// **The duplicate names the partition's own index, not the parent's.**
+///
+/// Statement 782 creates `index_measurements_on_logdate_and_city_id` before a single partition
+/// exists; the row that collides is refused by `measurements_toronto_logdate_city_id_idx`, an
+/// index the suite never wrote.
+#[test]
+fn a_duplicate_key_names_the_partitions_own_index() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE measurements (city_id character varying NOT NULL, logdate date NOT NULL) \
+         PARTITION BY LIST (city_id)",
+        "CREATE UNIQUE INDEX index_measurements_on_logdate_and_city_id ON measurements (logdate, \
+         city_id)",
+        "CREATE TABLE measurements_toronto PARTITION OF measurements FOR VALUES IN (1)",
+        "INSERT INTO measurements (city_id, logdate) VALUES ('1', '2026-09-01')",
+    ]);
+    let error = node
+        .run("INSERT INTO measurements (city_id, logdate) VALUES ('1', '2026-09-01')")
+        .unwrap_err();
+    assert_eq!(error.sqlstate(), "23505");
+    assert_eq!(
+        error.to_string(),
+        "duplicate key value violates unique constraint \
+         \"measurements_toronto_logdate_city_id_idx\""
+    );
+    // **`ON ONLY`** in the definition of the index that covers every partition, and it does not
+    // change when a partition is added.
+    assert_eq!(
+        node.rows("SELECT pg_get_indexdef('index_measurements_on_logdate_and_city_id'::regclass)"),
+        [[
+            "CREATE UNIQUE INDEX index_measurements_on_logdate_and_city_id ON ONLY \
+             public.measurements USING btree (logdate, city_id)"
+        ]]
+    );
+}
+
+/// **`DROP TABLE <partition>` is allowed outright** — the parent does not protect it.
+#[test]
+fn a_partition_can_be_dropped() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE m (city_id character varying NOT NULL) PARTITION BY LIST (city_id)",
+        "CREATE TABLE m_t PARTITION OF m FOR VALUES IN (1)",
+        "CREATE TABLE m_c PARTITION OF m FOR VALUES IN (2)",
+        "INSERT INTO m (city_id) VALUES ('1')",
+        "INSERT INTO m (city_id) VALUES ('2')",
+    ]);
+    node.run("DROP TABLE m_t").unwrap();
+    // The parent loses that partition's rows with it, and keeps the rest.
+    assert_eq!(node.rows("SELECT count(*) FROM m"), [["1"]]);
+    assert_eq!(
+        node.rows("SELECT count(*) FROM pg_class WHERE relname = 'm_t'"),
+        [["0"]]
+    );
+    // And the bound it held is free again.
+    node.run("CREATE TABLE m_t2 PARTITION OF m FOR VALUES IN (1)")
+        .unwrap();
+}

@@ -212,8 +212,30 @@ pub struct DropFunction {
 pub enum PartitionSpec {
     /// `FOR VALUES IN (…)`.
     Values(Vec<Datum>),
+    /// `FOR VALUES FROM (…) TO (…)`.
+    Range {
+        /// The lower bound, one entry per key column.
+        from: Vec<RangeEnd>,
+        /// The upper bound, one entry per key column.
+        to: Vec<RangeEnd>,
+    },
     /// `DEFAULT`.
     Default,
+}
+
+/// One end of a `FOR VALUES FROM … TO …`, as written.
+///
+/// `MINVALUE` and `MAXVALUE` are **keywords and not values**, so they cannot be a `Datum` waiting
+/// for a type — which is the whole reason this enum exists beside [`PartitionSpec::Values`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum RangeEnd {
+    /// `MINVALUE`.
+    MinValue,
+    /// A literal, still untyped: the key column's type is the parent's and the parent is the
+    /// executor's.
+    Value(Datum),
+    /// `MAXVALUE`.
+    MaxValue,
 }
 
 /// `CREATE SEQUENCE [IF NOT EXISTS] s [START n] [INCREMENT BY n] [OWNED BY t.c | NONE]`.

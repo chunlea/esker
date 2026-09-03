@@ -49,8 +49,8 @@ use esker_keys::{codec, prefix};
 
 use crate::catalog::{
     CheckDef, ColumnDef, ExprShape, ForeignKeyDef, FunctionDef, Identity, IndexDef, IndexKey,
-    KeyOrder, KeyPart, PartitionBound, PartitionKey, PartitionStrategy, ReferentialAction,
-    Relation, SchemaState, SequenceDef, TableDef, TriggerDef, UniqueKind,
+    KeyOrder, KeyPart, PartitionBound, PartitionKey, PartitionStrategy, RangeBound,
+    ReferentialAction, Relation, SchemaState, SequenceDef, TableDef, TriggerDef, UniqueKind,
 };
 use crate::error::{Result, SqlError};
 use crate::value::{ColumnType, Datum, NO_TYPMOD};
@@ -1129,6 +1129,7 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
             out.push(1);
             out.push(match key.strategy {
                 PartitionStrategy::List => b'l',
+                PartitionStrategy::Range => b'r',
             });
             varint::put_u64(key.columns.len() as u64, &mut out);
             for &column in &key.columns {
@@ -1143,13 +1144,26 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
             out.push(2);
             varint::put_u64(values.len() as u64, &mut out);
             for value in values {
-                // As **text**, because a bound's values are the key columns' types and those are
-                // the parent's — a bound decoded without the parent in hand has no type to read
-                // the bytes as, and the parent is not loaded here.
-                put_str(
-                    &crate::value::PgDatum::to_text(value).unwrap_or_default(),
-                    &mut out,
-                );
+                put_bound_value(value, &mut out);
+            }
+        }
+        Some(PartitionBound::Range { from, to }) => {
+            out.push(3);
+            for side in [from, to] {
+                varint::put_u64(side.len() as u64, &mut out);
+                for end in side {
+                    // One tag byte per end, because `MINVALUE` and `MAXVALUE` are not values: a
+                    // range that stored them as the extremes of the key's type would print
+                    // numbers where a real server prints the words.
+                    match end {
+                        RangeBound::MinValue => out.push(0),
+                        RangeBound::MaxValue => out.push(2),
+                        RangeBound::Value(value) => {
+                            out.push(1);
+                            put_bound_value(value, &mut out);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1368,6 +1382,32 @@ fn read_triggers(reader: &mut Reader<'_>) -> Result<Vec<TriggerDef>> {
     Ok(triggers)
 }
 
+/// One bound value: its **type tag** and then its text.
+///
+/// The type is written because the bound is compared, not only printed. A value stored as text and
+/// read back as text compares equal to another text and to nothing else — so an `int4` range bound
+/// decoded without its type would say `10` and `10` are different values, and the second partition
+/// of a two-partition range would be refused as overlapping the first. A bound's type is the key
+/// column's, which belongs to the **parent**, and the parent is not loaded here: writing the tag is
+/// what makes the record self-describing rather than needing one.
+fn put_bound_value(value: &Datum, out: &mut Vec<u8>) {
+    // A NULL bound value cannot be written by any statement — `FOR VALUES IN (NULL)` is refused
+    // where it is lowered — so `text` is a tag that will never be read back, not a coercion.
+    out.push(tag_of(value.column_type().unwrap_or(ColumnType::Text)));
+    put_str(
+        &crate::value::PgDatum::to_text(value).unwrap_or_default(),
+        out,
+    );
+}
+
+/// One bound value, read back as the type it was written with.
+fn bound_value(reader: &mut Reader<'_>) -> Result<Datum> {
+    let ty = type_of(reader.byte()?)?;
+    let text = reader.string()?;
+    <Datum as crate::value::PgDatum>::from_text(ty, &text)
+        .map_err(|_| corrupt("a partition bound value of the wrong type"))
+}
+
 /// The version 19 section: the partition key, then this table's own bound.
 ///
 /// A bound's values come back as **text**, to be read as the key columns' types where the parent
@@ -1383,6 +1423,7 @@ fn read_partitioning(
         1 => {
             let strategy = match reader.byte()? {
                 b'l' => PartitionStrategy::List,
+                b'r' => PartitionStrategy::Range,
                 other => return Err(corrupt(format!("partition strategy byte {other}"))),
             };
             let count = reader.count()?;
@@ -1404,9 +1445,25 @@ fn read_partitioning(
             let count = reader.count()?;
             let mut values = Vec::with_capacity(count);
             for _ in 0..count {
-                values.push(Datum::Text(reader.string()?));
+                values.push(bound_value(reader)?);
             }
             Some(PartitionBound::Values(values))
+        }
+        3 => {
+            let mut sides = [Vec::new(), Vec::new()];
+            for side in &mut sides {
+                let count = reader.count()?;
+                for _ in 0..count {
+                    side.push(match reader.byte()? {
+                        0 => RangeBound::MinValue,
+                        1 => RangeBound::Value(bound_value(reader)?),
+                        2 => RangeBound::MaxValue,
+                        other => return Err(corrupt(format!("range bound tag {other}"))),
+                    });
+                }
+            }
+            let [from, to] = sides;
+            Some(PartitionBound::Range { from, to })
         }
         other => return Err(corrupt(format!("partition bound tag {other}"))),
     };

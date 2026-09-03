@@ -357,11 +357,19 @@ pub(super) fn insert(
         // selects, and lands there under that table's own row id, key and indexes. A row no
         // partition takes is `23514` naming the *parent* — there is no partition to name, which
         // is the whole condition.
-        let target = route_to_partition(executor, txn, &table, &row)?;
-        let target = target.as_ref().unwrap_or(&table);
-        // Written straight into a partition, the bound is a constraint rather than a route.
-        check_partition_bound(target, &row)?;
-        write_row(executor, txn, target, &row, written)?;
+        let routed = route_to_partition(executor, txn, &table, &row)?;
+        // Not routed is either an ordinary table or a row written **straight into a partition**,
+        // where the bound is a constraint rather than a route.
+        if routed.is_none() {
+            check_partition_bound(executor, txn, &table, &row)?;
+        }
+        write_row(
+            executor,
+            txn,
+            routed.as_ref().unwrap_or(&table),
+            &row,
+            written,
+        )?;
         // The row **as stored**, so a column filled from its `DEFAULT` comes back with that value
         // rather than with the NULL the user did not write.
         if let Some(returned) = &mut returned {
@@ -690,21 +698,45 @@ fn route_to_partition(
     for &child_id in &table.children {
         let child = executor.table_by_id(txn, child_id)?;
         match &child.partition_bound {
-            Some(crate::catalog::PartitionBound::Values(bound)) => {
-                if bound.len() == values.len()
-                    && bound.iter().zip(&values).all(|(one, other)| one == *other)
-                {
-                    return Ok(Some(child));
-                }
-            }
+            Some(bound) if bound_admits(bound, &values) => return Ok(Some(child)),
             Some(crate::catalog::PartitionBound::Default) => fallback = Some(child),
-            None => {}
+            Some(_) | None => {}
         }
     }
     fallback.map_or_else(
         || Err(SqlError::NoPartitionForRow(table.name.clone())),
         |child| Ok(Some(child)),
     )
+}
+
+/// Whether one partition's bound admits this key.
+///
+/// **`DEFAULT` admits nothing here** — it is the fallback the caller reaches after every other
+/// partition has said no, which is what makes a value list win over a default declared before it.
+///
+/// A `RANGE` bound is **half-open**: `FROM (MINVALUE) TO (10)` takes `9` and `FROM (10) TO
+/// (MAXVALUE)` takes `10`, so the lower end is compared with `<=` and the upper with `<`.
+fn bound_admits(bound: &crate::catalog::PartitionBound, values: &[&Datum]) -> bool {
+    use crate::catalog::PartitionBound::{Default, Range, Values};
+    match bound {
+        Default => false,
+        Values(listed) => {
+            listed.len() == values.len()
+                && listed.iter().zip(values).all(|(one, other)| one == *other)
+        }
+        Range { from, to } => {
+            from.len() == values.len()
+                && to.len() == values.len()
+                && from
+                    .iter()
+                    .zip(values)
+                    .all(|(end, value)| end.cmp_value(value).is_le())
+                && to
+                    .iter()
+                    .zip(values)
+                    .all(|(end, value)| end.cmp_value(value).is_gt())
+        }
+    }
 }
 
 /// A row written **straight into a partition**, against that partition's own bound.
@@ -715,25 +747,43 @@ fn route_to_partition(
 ///
 /// A `DEFAULT` partition admits anything by this test, and correctly: what excludes a row from it
 /// is another partition's list claiming that row, which routing has already settled.
-fn check_partition_bound(table: &TableDef, row: &[Datum]) -> Result<()> {
-    let Some(crate::catalog::PartitionBound::Values(bound)) = &table.partition_bound else {
+fn check_partition_bound(
+    executor: &Executor,
+    txn: &dyn Txn,
+    table: &TableDef,
+    row: &[Datum],
+) -> Result<()> {
+    let Some(bound) = &table.partition_bound else {
         return Ok(());
     };
-    // The key is the **parent's**, and its ordinals are the parent's — but a partition takes the
-    // parent's columns in the parent's order, so the same positions read the same columns.
-    let matches = bound
-        .iter()
-        .enumerate()
-        .all(|(at, value)| row.get(at + partition_key_offset(table)) == Some(value));
-    if matches {
+    // A `DEFAULT` partition admits anything by this test, and correctly.
+    if matches!(bound, crate::catalog::PartitionBound::Default) {
+        return Ok(());
+    }
+    let Some(parent) = parent_of_partition(executor, txn, table)? else {
+        return Ok(());
+    };
+    let Some(key) = &parent.partition_by else {
+        return Ok(());
+    };
+    // **The key columns are found by name**, because the ordinals in it are the *parent's*: a
+    // partition carries the parent's columns and may carry an internal row id the parent has not,
+    // which moves every one of them by a position. Matching positionally is how a bound on a key
+    // that is not the table's first column reads the wrong column.
+    let mut values = Vec::with_capacity(key.columns.len());
+    for &at in &key.columns {
+        let Some(name) = parent.columns.get(at).map(|column| &column.name) else {
+            return Ok(());
+        };
+        let Some(mine) = table.column(name) else {
+            return Ok(());
+        };
+        values.push(row.get(mine).unwrap_or(&Datum::Null));
+    }
+    if bound_admits(bound, &values) {
         return Ok(());
     }
     Err(SqlError::PartitionConstraintViolation(table.name.clone()))
-}
-
-/// Where a partition's inherited columns begin: after its own internal row id, if it has one.
-fn partition_key_offset(table: &TableDef) -> usize {
-    usize::from(table.row_id().is_some())
 }
 
 /// The relations an `UPDATE` or a `DELETE` on this one acts on: itself and everything that

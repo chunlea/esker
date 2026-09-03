@@ -71,9 +71,12 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
             "ALTER TABLE ... ADD COLUMN ... bigserial",
         ),
         ("CREATE TABLE t (a text COLLATE \"C\")", "COLLATE"),
+        // **`PARTITION BY LIST` and `RANGE` left this list** with statements 781-786; `HASH` is
+        // what is still refused, because nothing captured how it routes and a strategy this node
+        // guessed at would put rows in the wrong partition.
         (
-            "CREATE TABLE t (a int8) PARTITION BY RANGE (a)",
-            "PARTITION BY",
+            "CREATE TABLE t (a int8) PARTITION BY HASH (a)",
+            "PARTITION BY HASH",
         ),
         // **`INHERITS` left this list** with statement 762: the child takes the parent's
         // columns, a scan of the parent returns the child's rows, and an `UPDATE` or `DELETE` on

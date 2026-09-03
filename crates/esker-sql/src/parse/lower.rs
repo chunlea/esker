@@ -1144,11 +1144,12 @@ fn lower_create_trigger(create: &sqlparser::ast::CreateTrigger) -> Result<plan::
     })
 }
 
-/// `PARTITION BY LIST (col, …)` — the strategy and the key columns.
+/// `PARTITION BY LIST|RANGE (col, …)` — the strategy and the key columns.
 ///
-/// **Only `LIST`.** `RANGE` and `HASH` are captured and are refused by name: a bound this node
-/// cannot compare is a row it would misroute, and misrouting is a wrong answer rather than a gap.
-/// The suite partitions by `LIST` (`postgresql_specific_schema.rb` statement 781).
+/// **`HASH` is refused by name.** Nothing captured it — the capture pins `LIST` (the suite's, at
+/// `postgresql_specific_schema.rb` statement 781) and `RANGE` — and a strategy whose routing
+/// nobody measured is a row this node would put in the wrong partition, which is a wrong answer
+/// rather than a gap.
 ///
 /// `sqlparser` gives the whole clause as one expression, so `LIST (city_id)` arrives looking like
 /// a function call — the strategy is the "function" and the key columns are its arguments.
@@ -1166,6 +1167,7 @@ fn lower_partition_by(
     let name = unqualified_function_name(function)?;
     let strategy = match name.to_ascii_uppercase().as_str() {
         "LIST" => catalog::PartitionStrategy::List,
+        "RANGE" => catalog::PartitionStrategy::Range,
         other => {
             return Err(SqlError::unsupported(format!(
                 "CREATE TABLE ... PARTITION BY {other}"
@@ -1186,11 +1188,11 @@ fn lower_partition_by(
     Ok(Some((strategy, columns)))
 }
 
-/// `PARTITION OF parent FOR VALUES IN (…)` and `… DEFAULT`.
+/// `PARTITION OF parent FOR VALUES IN (…)`, `… FROM (…) TO (…)` and `… DEFAULT`.
 ///
 /// The values stay literals here: coercing them to the key's types needs the parent, and a plan is
-/// lowered without the catalog. `RANGE` and `HASH` bounds are refused for the reason their
-/// strategies are.
+/// lowered without the catalog. `FOR VALUES WITH (MODULUS …)` is `HASH`'s and is refused for the
+/// reason that strategy is.
 fn lower_partition_of(
     partition_of: Option<&ObjectName>,
     for_values: Option<&sqlparser::ast::ForValues>,
@@ -1214,8 +1216,19 @@ fn lower_partition_of(
                 })
                 .collect::<Result<Vec<_>>>()?,
         ),
-        Some(ForValues::From { .. }) => {
-            return Err(SqlError::unsupported("PARTITION OF ... FOR VALUES FROM"));
+        // **Multi-column `RANGE` bounds are refused by name.** One column is what the capture
+        // shows, and PostgreSQL's rule past that is not the obvious one — `MINVALUE` in a position
+        // makes every column after it unbounded whatever was written there — so a lexicographic
+        // guess would route rows a real server routes elsewhere.
+        Some(ForValues::From { from, to }) => {
+            refuse_if(
+                from.len() != 1 || to.len() != 1,
+                "FOR VALUES FROM ... TO ... over more than one column",
+            )?;
+            plan::PartitionSpec::Range {
+                from: range_ends(from)?,
+                to: range_ends(to)?,
+            }
         }
         Some(ForValues::With { .. }) => {
             return Err(SqlError::unsupported("PARTITION OF ... FOR VALUES WITH"));
@@ -1223,6 +1236,25 @@ fn lower_partition_of(
         None => return Err(SqlError::unsupported("PARTITION OF with no bound")),
     };
     Ok(Some((relation_name(parent)?, spec)))
+}
+
+/// `(MINVALUE)`, `(10)` — one end of a `FOR VALUES FROM … TO …`, still untyped.
+fn range_ends(ends: &[sqlparser::ast::PartitionBoundValue]) -> Result<Vec<plan::RangeEnd>> {
+    use sqlparser::ast::PartitionBoundValue;
+    ends.iter()
+        .map(|end| match end {
+            PartitionBoundValue::MinValue => Ok(plan::RangeEnd::MinValue),
+            PartitionBoundValue::MaxValue => Ok(plan::RangeEnd::MaxValue),
+            PartitionBoundValue::Expr(expr) => match unwrap_nested(expr) {
+                Expr::Value(literal) => Ok(plan::RangeEnd::Value(Datum::Text(literal_text(
+                    &literal.value,
+                )))),
+                other => Err(SqlError::unsupported(format!(
+                    "FOR VALUES FROM ... TO ... over {other}, which is not a literal"
+                ))),
+            },
+        })
+        .collect()
 }
 
 /// A literal's text, for a partition bound: what the value would be written as.

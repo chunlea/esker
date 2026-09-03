@@ -641,6 +641,11 @@ fn partition_bound(
     let Some(key) = &parent.partition_by else {
         return Err(SqlError::NotPartitioned(parent.name.clone()));
     };
+    let coerce = |value: &Datum, at: usize| -> Result<Datum> {
+        let ty = parent.columns[at].ty;
+        let text = crate::value::PgDatum::to_text(value).unwrap_or_default();
+        Datum::from_text(ty, &text)
+    };
     let bound = match spec {
         plan::PartitionSpec::Default => catalog::PartitionBound::Default,
         plan::PartitionSpec::Values(values) => {
@@ -653,13 +658,34 @@ fn partition_bound(
                 values
                     .iter()
                     .zip(&key.columns)
-                    .map(|(value, &at)| {
-                        let ty = parent.columns[at].ty;
-                        let text = crate::value::PgDatum::to_text(value).unwrap_or_default();
-                        Datum::from_text(ty, &text)
-                    })
+                    .map(|(value, &at)| coerce(value, at))
                     .collect::<Result<Vec<_>>>()?,
             )
+        }
+        plan::PartitionSpec::Range { from, to } => {
+            if from.len() != key.columns.len() || to.len() != key.columns.len() {
+                return Err(SqlError::unsupported(
+                    "FOR VALUES FROM ... TO ... over a different number of columns than the key",
+                ));
+            }
+            let ends = |side: &[plan::RangeEnd]| -> Result<Vec<catalog::RangeBound>> {
+                side.iter()
+                    .zip(&key.columns)
+                    .map(|(end, &at)| {
+                        Ok(match end {
+                            plan::RangeEnd::MinValue => catalog::RangeBound::MinValue,
+                            plan::RangeEnd::MaxValue => catalog::RangeBound::MaxValue,
+                            plan::RangeEnd::Value(value) => {
+                                catalog::RangeBound::Value(coerce(value, at)?)
+                            }
+                        })
+                    })
+                    .collect()
+            };
+            catalog::PartitionBound::Range {
+                from: ends(from)?,
+                to: ends(to)?,
+            }
         }
     };
     // **An overlapping bound is `42P17`, and the message names the partition it would overlap.**
@@ -680,16 +706,35 @@ fn partition_bound(
     Ok(Some(bound))
 }
 
-/// Whether two `LIST` bounds admit any row in common.
+/// Whether two bounds admit any row in common.
 ///
 /// Two `DEFAULT`s do — a table may have only one — and two value lists do when they share a value.
-/// A `DEFAULT` and a list never do: `DEFAULT` takes what the lists do not, by definition.
+/// A `DEFAULT` and anything else never do: `DEFAULT` takes what the others do not, by definition.
+///
+/// Two ranges overlap when each starts before the other ends, which is the **half-open** test:
+/// `FROM (MINVALUE) TO (10)` and `FROM (10) TO (MAXVALUE)` share the number `10` and do not
+/// overlap, because the first excludes its upper end. Measured — the capture creates both.
+///
+/// A list and a range cannot meet, because one strategy is a table's and a partition of it cannot
+/// be declared with the other's grammar.
 fn bounds_overlap(one: &catalog::PartitionBound, other: &catalog::PartitionBound) -> bool {
-    use catalog::PartitionBound::{Default, Values};
+    use catalog::PartitionBound::{Default, Range, Values};
     match (one, other) {
         (Default, Default) => true,
-        (Default, Values(_)) | (Values(_), Default) => false,
         (Values(ours), Values(theirs)) => ours.iter().any(|value| theirs.contains(value)),
+        (
+            Range { from, to },
+            Range {
+                from: their_from,
+                to: their_to,
+            },
+        ) => {
+            catalog::RangeBound::cmp_bound(&from[0], &their_to[0]).is_lt()
+                && catalog::RangeBound::cmp_bound(&their_from[0], &to[0]).is_lt()
+        }
+        // A `DEFAULT` and anything else; and a list against a range, which cannot happen because
+        // the strategy is the parent's and both partitions are declared against the same one.
+        _ => false,
     }
 }
 
