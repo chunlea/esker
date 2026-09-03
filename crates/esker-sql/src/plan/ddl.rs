@@ -95,13 +95,18 @@ pub struct UniqueConstraint {
     /// The consequence catches a reader out: an `INSERT` that never mentions the column still
     /// collides with the first, because omitting it writes a NULL.
     pub nulls_not_distinct: bool,
-    /// `DEFERRABLE INITIALLY IMMEDIATE`, which is **not deferred**.
+    /// `DEFERRABLE`, in either of its two initial modes.
     ///
-    /// It checks at the statement like any other unique constraint; what differs is `condeferrable`
-    /// and what `pg_get_constraintdef` prints — which keeps `DEFERRABLE` and drops the
-    /// `INITIALLY IMMEDIATE` half, so the text out is not the text in. `INITIALLY DEFERRED` really
-    /// waits for `COMMIT` and is refused by name where this is lowered.
+    /// `INITIALLY IMMEDIATE` checks at the statement like any other unique constraint; what
+    /// differs is `condeferrable` and what `pg_get_constraintdef` prints, which keeps `DEFERRABLE`
+    /// and drops the `INITIALLY IMMEDIATE` half, so the text out is not the text in.
     pub deferrable: bool,
+    /// `INITIALLY DEFERRED`: the check waits for `COMMIT` (`crate::exec::deferred`).
+    ///
+    /// Never true without [`UniqueConstraint::deferrable`] — `INITIALLY DEFERRED` implies
+    /// `DEFERRABLE` in the grammar, and a constraint that is not deferrable cannot be deferred by
+    /// `SET CONSTRAINTS` either.
+    pub deferred: bool,
 }
 
 /// `CREATE EXTENSION [IF NOT EXISTS] name`.

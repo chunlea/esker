@@ -1126,6 +1126,9 @@ fn unique_kind_tag(kind: Option<UniqueKind>) -> u8 {
         None => 0,
         Some(UniqueKind::Immediate) => 1,
         Some(UniqueKind::Deferrable) => 2,
+        // Appended, never renumbered: a record written before deferred constraints existed has no
+        // tag above 2 and reads back as the kind it was.
+        Some(UniqueKind::Deferred) => 3,
     }
 }
 
@@ -1134,6 +1137,7 @@ fn unique_kind_of(tag: u8) -> Result<Option<UniqueKind>> {
         0 => None,
         1 => Some(UniqueKind::Immediate),
         2 => Some(UniqueKind::Deferrable),
+        3 => Some(UniqueKind::Deferred),
         other => return Err(corrupt(format!("unique constraint tag {other}"))),
     })
 }
