@@ -33,6 +33,7 @@ mod store;
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -410,25 +411,34 @@ impl Txn for MemoryTxn {
     fn scan(&self, start: &[u8], end: &[u8], limit: u32) -> Result<Vec<(Bytes, Bytes)>> {
         let versions = self.lock();
         let mut merged: BTreeMap<Vec<u8>, Bytes> = BTreeMap::new();
-        for key in versions.keys.keys() {
-            if key.as_slice() >= start && key.as_slice() < end {
-                if let Some(value) = versions.visible(key, self.start_ts) {
-                    merged.insert(key.clone(), value);
-                }
+        // **`range`, not a walk with a comparison inside it.** Both maps are ordered by key, so
+        // the range is a pair of seeks; iterating every key and testing the bounds costs the whole
+        // store per scan, and a catalog read makes one scan per relation. That is what stopped the
+        // Rails suite: 866 relations over a suite's worth of rows made a single `::regclass` take
+        // two seconds and a fixture load never finish (`a_scan_costs_its_range_and_not_the_store`).
+        for (key, _) in versions
+            .keys
+            .range::<[u8], _>((Bound::Included(start), Bound::Excluded(end)))
+        {
+            if let Some(value) = versions.visible(key, self.start_ts) {
+                merged.insert(key.clone(), value);
             }
         }
         drop(versions);
         // The buffer is applied over the snapshot, so a row this transaction wrote is in its own
-        // range scan and one it deleted is not.
-        for (key, write) in &self.buffer {
-            if key.as_slice() >= start && key.as_slice() < end {
-                match write {
-                    Write::Put(value) => {
-                        merged.insert(key.clone(), value.clone());
-                    }
-                    Write::Delete => {
-                        merged.remove(key);
-                    }
+        // range scan and one it deleted is not — and it is ranged for the same reason: a
+        // transaction that has written a hundred thousand rows must not pay for all of them on
+        // every unrelated scan.
+        for (key, write) in self
+            .buffer
+            .range::<[u8], _>((Bound::Included(start), Bound::Excluded(end)))
+        {
+            match write {
+                Write::Put(value) => {
+                    merged.insert(key.clone(), value.clone());
+                }
+                Write::Delete => {
+                    merged.remove(key);
                 }
             }
         }
@@ -526,6 +536,79 @@ mod tests {
         }
         txn.put(index_key, row);
         Ok(())
+    }
+
+    /// A scan costs its **range**, not the store.
+    ///
+    /// This is the shape of the bug that stopped the Rails suite dead at
+    /// `test/cases/custom_locking_test.rb`: `scan` walked every key in the store and compared each
+    /// one against the bounds, so the cost of reading a table's sequences — a prefix of a few keys
+    /// — was the size of everything anyone had ever written. `Relations::read` does one of those
+    /// scans **per relation**, and `Executor::resolve_regclass` does a `Relations::read` per
+    /// `::regclass` literal, so a node with 866 relations and a suite's worth of rows spent two
+    /// seconds resolving one name and a fixture load never finished.
+    ///
+    /// **Asserted as a ratio against a control, not as a stopwatch.** The same scan runs against a
+    /// small store and against one with two hundred thousand more keys *outside* the range; a
+    /// range scan is indifferent to them and a full walk is a thousand times slower. Comparing the
+    /// two is what makes this a statement about complexity rather than about this machine.
+    #[test]
+    fn a_scan_costs_its_range_and_not_the_store() {
+        fn elapsed(outside: usize) -> std::time::Duration {
+            let backend = MemoryBackend::new();
+            let mut writer = backend.begin().unwrap();
+            for at in 0..8u32 {
+                writer.put(format!("a/{at:08}").as_bytes(), b"in the range");
+            }
+            for at in 0..outside {
+                writer.put(format!("b/{at:08}").as_bytes(), b"not in the range");
+            }
+            writer.commit().unwrap();
+
+            let reader = backend.begin().unwrap();
+            let start = std::time::Instant::now();
+            for _ in 0..200 {
+                assert_eq!(reader.scan(b"a/", b"a0", 0).unwrap().len(), 8);
+            }
+            start.elapsed()
+        }
+
+        let control = elapsed(8);
+        let loaded = elapsed(200_000);
+        assert!(
+            loaded < control * 50 + std::time::Duration::from_millis(500),
+            "a scan of the same eight keys took {loaded:?} in a store of 200_008 and {control:?}              in a store of 16: the scan is walking the store rather than its range"
+        );
+    }
+
+    /// A transaction dropped without a commit blocks nothing.
+    ///
+    /// Written to answer the first hypothesis about the suite hang — that a connection killed
+    /// mid-transaction left a lock behind — with evidence rather than argument. **There is no lock
+    /// to leave**: `FOR UPDATE` and `LOCK TABLE` are both `0A000` on this node, measured against
+    /// the live one, and a transaction's writes live in its own buffer until commit. Dropping the
+    /// connection drops the buffer, so the next transaction reads the value that was there before
+    /// and may write the same key at once.
+    #[test]
+    fn a_transaction_dropped_without_a_commit_blocks_nothing() {
+        let backend = MemoryBackend::new();
+        let mut setup = backend.begin().unwrap();
+        setup.put(b"k", b"committed");
+        setup.commit().unwrap();
+
+        // The connection that dies mid-transaction: it writes and is never heard from again.
+        let mut abandoned = backend.begin().unwrap();
+        abandoned.put(b"k", b"uncommitted");
+        abandoned.put(b"other", b"uncommitted");
+        drop(abandoned);
+
+        let mut next = backend.begin().unwrap();
+        assert_eq!(next.get(b"k").unwrap().as_deref(), Some(&b"committed"[..]));
+        assert_eq!(next.get(b"other").unwrap(), None);
+        next.put(b"k", b"after");
+        next.commit().unwrap();
+        let reader = backend.begin().unwrap();
+        assert_eq!(reader.get(b"k").unwrap().as_deref(), Some(&b"after"[..]));
     }
 
     #[test]
