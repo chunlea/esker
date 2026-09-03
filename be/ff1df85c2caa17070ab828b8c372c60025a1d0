@@ -1,0 +1,19 @@
+docs/adr/0051-a-dropped-column-keeps-its-slot.md
+  s_2bed4ac2b1c944::t_dcbb03b6925a13 1-162
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "beff1df85c2caa17070ab828b8c372c60025a1d0",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
