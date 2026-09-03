@@ -815,6 +815,11 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
         Expr::Binary { op, left, right } => {
             format!("({} {} {})", sub(left), op.symbol(), sub(right))
         }
+        Expr::Arithmetic {
+            op, left, right, ..
+        } => {
+            format!("({} {} {})", sub(left), op.symbol(), sub(right))
+        }
         Expr::Not(operand) => format!("(NOT {})", sub(operand)),
         Expr::IsNull { operand, negated } => format!(
             "({} IS {}NULL)",

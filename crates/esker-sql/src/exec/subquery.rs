@@ -537,7 +537,7 @@ fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
                 Some(value) => Literal::Typed(Box::new(value.clone())),
             });
         }
-        Expr::Binary { left, right, .. } => {
+        Expr::Binary { left, right, .. } | Expr::Arithmetic { left, right, .. } => {
             substitute_in_expr(left, outer, depth);
             substitute_in_expr(right, outer, depth);
         }
@@ -958,7 +958,7 @@ fn for_each_node_expr_mut(node: &mut Node, visit: &mut impl FnMut(&mut Expr)) {
 pub(super) fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
     visit(expr);
     match expr {
-        Expr::Binary { left, right, .. } => {
+        Expr::Binary { left, right, .. } | Expr::Arithmetic { left, right, .. } => {
             walk(left, visit);
             walk(right, visit);
         }
@@ -1026,7 +1026,7 @@ pub(super) fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
 /// outer one's rows are what the inner one is asked about.
 fn walk_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr) -> Result<()>) -> Result<()> {
     match expr {
-        Expr::Binary { left, right, .. } => {
+        Expr::Binary { left, right, .. } | Expr::Arithmetic { left, right, .. } => {
             walk_mut(left, visit)?;
             walk_mut(right, visit)?;
         }

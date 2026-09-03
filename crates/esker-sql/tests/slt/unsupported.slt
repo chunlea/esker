@@ -36,9 +36,6 @@ SELECT count(*) OVER () FROM t
 statement error (0A000)
 SELECT count(*) FILTER (WHERE a > 0) FROM t
 
-statement error (0A000)
-SELECT a + 1 FROM t
-
 
 statement error (0A000)
 INSERT INTO t VALUES (1, 2, 'x') ON CONFLICT DO NOTHING

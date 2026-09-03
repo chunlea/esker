@@ -61,10 +61,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "`pg_typeof` is `0A000` naming itself, for every type. The first of its four answers is also the declared bare-decimal divergence: `1.5` is a `numeric` on a real server and a `double precision` here, which is the next unit's to close now that the type exists.",
         ),
         (
-            "SELECT 0.1::float8 + 0.2::float8 = 0.3::float8",
-            "Arithmetic. This crate has no operators beyond comparison and the connectives, for any type; the value rules the line measures are proved by the storage half of this corpus.",
-        ),
-        (
             "SELECT 0.1::numeric + 0.2::numeric = 0.3::numeric",
             "Arithmetic. This crate has no operators beyond comparison and the connectives, for any type; the value rules the line measures are proved by the storage half of this corpus.",
         ),
@@ -91,10 +87,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'NaN'::numeric / 0",
             "Arithmetic. The **value** it measures is right and is proved elsewhere in this file: `NaN` is a value that equals itself and absorbs. `'NaN' / 0` is `NaN` on a real server where `1 / 0` is `22012`, and neither operator exists here.",
-        ),
-        (
-            "SELECT 1::int4 / 2",
-            "Arithmetic, and not about `numeric` at all — integer division truncating to `0` is the line that says so.",
         ),
         (
             "SELECT 1::numeric / 0",

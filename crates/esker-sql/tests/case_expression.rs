@@ -29,11 +29,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT CASE WHEN false THEN 1/0 ELSE 2 END",
             "The mirror of the line above, and the same refusal for the same reason",
         ),
-        (
-            "SELECT CASE WHEN false THEN 1 WHEN 1/0 = 0 THEN 2 ELSE 3 END",
-            "PostgreSQL reaches the second WHEN and raises 22012 from it, which is the half that \
-             proves the walk continues. Same `0A000` here, same reason",
-        ),
     ],
 };
 

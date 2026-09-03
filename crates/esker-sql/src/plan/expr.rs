@@ -32,16 +32,37 @@ use crate::value::{PgDatum, PgType};
 
 /// An expression, as far as phase 6a needs one.
 ///
-/// Arithmetic is deliberately absent. `a + 1` is refused by name rather than implemented, because
-/// every operator brings its own overflow, division and type-resolution rules and each of them is
-/// a way to return a confidently wrong number. §3's scope is projection, `WHERE`, `ORDER BY`,
-/// `LIMIT` and `OFFSET`, and this is exactly what those need.
+/// **Arithmetic was deliberately absent and is here now** ([ADR
+/// 0046](../../docs/adr/0046-arithmetic-is-its-own-node-and-postgresql-s-promotion-table.md)).
+/// The reason it was left out still holds — every operator brings its own overflow, division and
+/// type-resolution rules, and each of them is a way to return a confidently wrong number — so it
+/// arrived the way the rest of this crate does: a capture of what a real server answers first,
+/// and one table (`crate::value::arith`) that the planner and the evaluator both read, so the
+/// type a client is told cannot drift from the values it is sent.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     /// A constant as written.
     Literal(Literal),
     /// `$1`, one-based as PostgreSQL writes it.
     Parameter(u32),
+    /// `left <op> right` where the operator yields a **value**, not a boolean.
+    ///
+    /// The type it yields is `crate::value::arith::result_type`'s answer and is computed once, at
+    /// plan time, because a client is told the column's OID before any row is read.
+    Arithmetic {
+        /// Which operator.
+        op: ArithOp,
+        /// The left operand.
+        left: Box<Expr>,
+        /// The right operand.
+        right: Box<Expr>,
+        /// The type the operator yields, once a scope has been available to work it out — and
+        /// `None` until then, which is a **state and not a default**. A `DEFAULT` expression is
+        /// evaluated by the DDL path without ever being resolved against a row, so the evaluator
+        /// falls back to the operands' own types there; putting a guess here instead would make
+        /// that path silently disagree with the one a `SELECT` takes.
+        ty: Option<ColumnType>,
+    },
     /// A column of the row being evaluated, by name. The planner resolves it to a position.
     Column {
         /// The table it was qualified with — `a` in `a.id` — or `None` for a bare name.
@@ -343,6 +364,10 @@ pub enum ScalarFunc {
     Lower,
     /// `upper(text)`.
     Upper,
+    /// `abs(numeric type)` — the one scalar function whose result type is its **argument's**,
+    /// and whose failure is an overflow: `abs((-32768)::int2)` is `22003`, because the positive
+    /// of the smallest `int2` is not one.
+    Abs,
 }
 
 impl ScalarFunc {
@@ -352,6 +377,7 @@ impl ScalarFunc {
         match self {
             ScalarFunc::Lower => "lower",
             ScalarFunc::Upper => "upper",
+            ScalarFunc::Abs => "abs",
         }
     }
 
@@ -361,6 +387,7 @@ impl ScalarFunc {
         match name.to_ascii_lowercase().as_str() {
             "lower" => Some(ScalarFunc::Lower),
             "upper" => Some(ScalarFunc::Upper),
+            "abs" => Some(ScalarFunc::Abs),
             _ => None,
         }
     }
@@ -740,6 +767,45 @@ impl AggregateCall {
     }
 }
 
+/// A binary arithmetic operator.
+///
+/// **A separate enum from [`BinaryOp`], deliberately.** Every match on `BinaryOp` in this crate
+/// assumes the expression yields a boolean — a comparison or a connective — and there are enough
+/// of them that adding `+` there would mean auditing each one for a case it was never written to
+/// have. Arithmetic yields a *value* whose type depends on both operands, which is a different
+/// shape of question, so it gets a different node (`crate::value::arith`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithOp {
+    /// `+`.
+    Add,
+    /// `-`.
+    Subtract,
+    /// `*`.
+    Multiply,
+    /// `/` — integer division truncates **toward zero**.
+    Divide,
+    /// `%` — the sign of the **dividend**, and undefined for the floats.
+    Modulo,
+    /// `^` — **left-associative** (`2 ^ 3 ^ 2` is 64) and looser than unary minus
+    /// (`-2 ^ 2` is 4). Both measured, both the opposite of the mathematical convention.
+    Power,
+}
+
+impl ArithOp {
+    /// The symbol, for the `operator does not exist: boolean + integer` message.
+    #[must_use]
+    pub fn symbol(self) -> &'static str {
+        match self {
+            ArithOp::Add => "+",
+            ArithOp::Subtract => "-",
+            ArithOp::Multiply => "*",
+            ArithOp::Divide => "/",
+            ArithOp::Modulo => "%",
+            ArithOp::Power => "^",
+        }
+    }
+}
+
 /// The operators phase 6a evaluates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
@@ -1071,6 +1137,7 @@ fn describe(expr: &Expr) -> &'static str {
         Expr::Column { .. } | Expr::Ordinal { .. } => "a column reference",
         Expr::Outer { .. } => "a correlated column reference",
         Expr::Binary { .. } => "an operator",
+        Expr::Arithmetic { .. } => "an arithmetic operator",
         Expr::Not(_) => "NOT",
         Expr::IsNull { .. } => "IS NULL",
         Expr::InList { negated: false, .. } => "IN",

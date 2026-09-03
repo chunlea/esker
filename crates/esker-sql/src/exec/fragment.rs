@@ -408,6 +408,9 @@ fn push_filter(
         Expr::Ordinal { at, .. } => ColExpr::Column(slot(*at)),
         // A cast is not expressible in the fragment language, so the filter stays on the row side.
         Expr::ToText { .. } => return Err(refused("a cast to text")),
+        // Neither is arithmetic: the fragment language compares and combines, and every operator
+        // brings an overflow rule the scan would have to reproduce exactly to be worth pushing.
+        Expr::Arithmetic { .. } => return Err(refused("arithmetic")),
         // Not expressible in the fragment language; the filter stays on the row side.
         Expr::Scalar { .. } => return Err(refused("a scalar function")),
         // The fragment language has no conditional, and a `CASE` is the one expression whose
@@ -676,7 +679,7 @@ fn ordinal(expr: &Expr) -> Option<usize> {
 fn collect_columns(expr: &Expr, into: &mut Vec<usize>) {
     match expr {
         Expr::Ordinal { at, .. } => into.push(*at),
-        Expr::Binary { left, right, .. } => {
+        Expr::Binary { left, right, .. } | Expr::Arithmetic { left, right, .. } => {
             collect_columns(left, into);
             collect_columns(right, into);
         }

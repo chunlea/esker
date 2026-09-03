@@ -808,6 +808,16 @@ impl Node {
 /// user wrote or could have written.
 fn render(expr: &Expr, columns: &[String]) -> String {
     match expr {
+        // Its own parentheses, as the comparison operators print theirs — `EXPLAIN` shows the
+        // grouping the parser chose rather than the one the user typed.
+        Expr::Arithmetic {
+            op, left, right, ..
+        } => format!(
+            "({} {} {})",
+            render(left, columns),
+            op.symbol(),
+            render(right, columns)
+        ),
         Expr::Literal(literal) => render_literal(literal),
         // As the user wrote it: `EXPLAIN` prints a cast the way SQL spells one.
         Expr::ToText { operand, .. } => format!("{}::text", render(operand, columns)),

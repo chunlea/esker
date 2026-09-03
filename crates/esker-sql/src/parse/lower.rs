@@ -1412,7 +1412,33 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             expr,
         } => match expr.as_ref() {
             Expr::Value(value) => lower_value(&value.value, true),
-            other => Err(SqlError::unsupported(format!("the expression -{other}"))),
+            // **`-2 ^ 2` is 4, not -4.** Unary minus binds *tighter* than `^` on a real server and
+            // looser in this parser, so the minus is pushed into the base here. Measured, and the
+            // opposite of the mathematical convention — which is why it is worth a line rather
+            // than an assumption.
+            Expr::BinaryOp { op, left, right }
+                if arithmetic_op(op) == Some(plan::ArithOp::Power) =>
+            {
+                Ok(plan::Expr::Arithmetic {
+                    op: plan::ArithOp::Power,
+                    left: Box::new(lower_expr(&Expr::UnaryOp {
+                        op: UnaryOperator::Minus,
+                        expr: left.clone(),
+                    })?),
+                    right: Box::new(lower_expr(right)?),
+                    ty: None,
+                })
+            }
+            // **`0 - x`, not a negated value.** It is the same answer for every input and it is
+            // the same *error* too: `-((-2147483648)::int4)` is `22003 integer out of range`,
+            // which a negation written as its own operation has to remember to raise and a
+            // subtraction gets from the width it is done at. Measured.
+            other => Ok(plan::Expr::Arithmetic {
+                op: plan::ArithOp::Subtract,
+                left: Box::new(plan::Expr::Literal(plan::Literal::Integer(0))),
+                right: Box::new(lower_expr(other)?),
+                ty: None,
+            }),
         },
         Expr::UnaryOp {
             op: UnaryOperator::Plus,
@@ -1529,6 +1555,16 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
                 Datum::Timestamp(micros),
             ))))
+        }
+        // The six that yield a **value**. They are lowered before the comparisons because they are
+        // a different node: `crate::plan::ArithOp` says why the two are not one enum.
+        Expr::BinaryOp { op, left, right } if arithmetic_op(op).is_some() => {
+            Ok(plan::Expr::Arithmetic {
+                op: arithmetic_op(op).unwrap_or(plan::ArithOp::Add),
+                left: Box::new(lower_expr(left)?),
+                right: Box::new(lower_expr(right)?),
+                ty: None,
+            })
         }
         Expr::BinaryOp { op, left, right } => {
             let op = match op {
@@ -2676,6 +2712,24 @@ fn is_json_expr(expr: &Expr) -> bool {
         } => matches!(data_type, DataType::JSON | DataType::JSONB) || is_json_expr(expr),
         _ => false,
     }
+}
+
+/// The arithmetic operator a token is, or `None` for one that compares or combines.
+///
+/// `^` is here and `#`, `&`, `|`, `<<` and `>>` are not: PostgreSQL's bit operators are a separate
+/// surface with their own types, and naming them is better than approximating them.
+fn arithmetic_op(op: &BinaryOperator) -> Option<plan::ArithOp> {
+    Some(match op {
+        BinaryOperator::Plus => plan::ArithOp::Add,
+        BinaryOperator::Minus => plan::ArithOp::Subtract,
+        BinaryOperator::Multiply => plan::ArithOp::Multiply,
+        BinaryOperator::Divide => plan::ArithOp::Divide,
+        BinaryOperator::Modulo => plan::ArithOp::Modulo,
+        // `^` under the PostgreSQL dialect is exponentiation, not a bitwise XOR — that is `#`
+        // there — so both spellings the parser can produce for the token mean the same operator.
+        BinaryOperator::PGExp | BinaryOperator::BitwiseXor => plan::ArithOp::Power,
+        _ => return None,
+    })
 }
 
 /// Whether an operator compares, as against combines.

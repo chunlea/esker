@@ -874,16 +874,46 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
     use crate::plan::Literal;
     Ok(match expr {
         Expr::Ordinal { at, .. } => row.get(*at).cloned().unwrap_or(Datum::Null),
+        // The type was settled when the expression was resolved. Where it was not — a `DEFAULT`
+        // evaluated by the DDL path, which never resolves against a row — the operands' own types
+        // answer the same question, and a NULL operand makes the question moot.
+        Expr::Arithmetic {
+            op,
+            left,
+            right,
+            ty,
+        } => {
+            let left = evaluate_in(left, row, env)?;
+            let right = evaluate_in(right, row, env)?;
+            let ty = match ty {
+                Some(ty) => *ty,
+                None => match (left.column_type(), right.column_type()) {
+                    (Some(left), Some(right)) => {
+                        crate::value::arith::result_type(*op, left, right)?
+                    }
+                    _ => return Ok(Datum::Null),
+                },
+            };
+            crate::value::arith::apply(*op, ty, &left, &right)?
+        }
         // A cast to `text` is the operand's own output function, and NULL stays NULL: a cast
         // changes a value's type and never invents one.
         // Rust's own case conversion, which is full Unicode and agrees with PostgreSQL's
         // under a UTF-8 locale — measured on an accented pair, since that is where a byte-wise
         // implementation would differ. NULL in, NULL out.
+        // `abs` is not a text function and does not reach the arm below: its argument is a
+        // number and its answer is one of the same type, overflow included.
+        Expr::Scalar {
+            func: crate::plan::ScalarFunc::Abs,
+            operand,
+        } => crate::value::arith::abs(&evaluate_in(operand, row, env)?)?,
         Expr::Scalar { func, operand } => match evaluate_in(operand, row, env)? {
             Datum::Null => Datum::Null,
             Datum::Text(text) => Datum::Text(match func {
                 crate::plan::ScalarFunc::Lower => text.to_lowercase(),
                 crate::plan::ScalarFunc::Upper => text.to_uppercase(),
+                // Unreachable: the arm above catches `abs` before this one is tried.
+                crate::plan::ScalarFunc::Abs => text,
             }),
             other => {
                 // A non-text argument: `lower(1)` is `42883 function lower(integer) does not

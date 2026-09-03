@@ -1609,6 +1609,13 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
         // are `int2` wherever they are read, and typing them here is what lets
         // `a.attnum = indexed_conkeys.conkey_elem` match instead of comparing an `int2` to a
         // `Datum::Text` and finding nothing.
+        // Its operands are ordinary expressions and its **type is settled here**, where the scope
+        // that gives each column a type is in hand. Falling through to the clone below would leave
+        // the operands as `Expr::Column` and the evaluator would report them as having reached it
+        // unresolved — the same trap `Expr::CatalogFunc` documents below.
+        Expr::Arithmetic {
+            op, left, right, ..
+        } => resolve_arithmetic(*op, left, right, scope)?,
         Expr::Subscript {
             operand,
             index,
@@ -2343,8 +2350,106 @@ pub(super) fn typmod_of(expr: &Expr, scope: &Scope<'_>) -> i32 {
     }
 }
 
+/// An arithmetic operator with both operands resolved and its type settled.
+fn resolve_arithmetic(
+    op: crate::plan::ArithOp,
+    left: &Expr,
+    right: &Expr,
+    scope: &Scope<'_>,
+) -> Result<Expr> {
+    let left = resolve(left, scope)?;
+    let right = resolve(right, scope)?;
+    let ty = arithmetic_type(op, &left, &right, scope)?;
+    Ok(Expr::Arithmetic {
+        op,
+        left: Box::new(left),
+        right: Box::new(right),
+        ty: Some(ty),
+    })
+}
+
+/// The type `left <op> right` has, with an **untyped NULL taking the other side's**.
+///
+/// `NULL::int4 / 0` is an `integer` on a real server and this node's lowering drops the cast — a
+/// `NULL` is a `Literal::Null` whatever it was written as, because every comparison with one is
+/// NULL and the type never mattered before. It matters here: without this the statement is
+/// `42883 operator does not exist: text / integer` where PostgreSQL returns a NULL row.
+fn arithmetic_type(
+    op: crate::plan::ArithOp,
+    left: &Expr,
+    right: &Expr,
+    scope: &Scope<'_>,
+) -> Result<ColumnType> {
+    let (left, right) = (operand(left, scope)?, operand(right, scope)?);
+    let (left, right) = match (left, right) {
+        (Operand::Fixed(left), Operand::Fixed(right)) => (left, right),
+        // One side has no type of its own: the operator is the other side's, and an `unknown` that
+        // will not read as that type is the `22P02` its input function raises.
+        (Operand::Fixed(known), Operand::Unknown) | (Operand::Unknown, Operand::Fixed(known)) => {
+            (known, known)
+        }
+        // **An integer constant takes the other side's width when it fits in it**, which is
+        // PostgreSQL's own rule and the reason `-((-2147483648)::int4)` overflows: the `0` this
+        // node lowers the negation to is an `int4` beside an `int4`, and the subtraction is done
+        // at that width. A constant too big for the other side keeps its own.
+        (Operand::Fixed(known), Operand::Integer(value))
+        | (Operand::Integer(value), Operand::Fixed(known)) => {
+            if fits(value, known) {
+                (known, known)
+            } else {
+                (known, ColumnType::Int8)
+            }
+        }
+        // Two constants, or a constant beside a NULL: this node's own literal type, which is
+        // `int8` where a real server's is `int4` — the divergence `tests/unknown_literal.rs`
+        // holds, visible here as a `bigint` where PostgreSQL reports an `integer`.
+        (Operand::Integer(_), _) | (_, Operand::Integer(_)) => (ColumnType::Int8, ColumnType::Int8),
+        // Both are `unknown`. PostgreSQL answers `operator is not unique: unknown + unknown`;
+        // this node reports the `42883` its own resolution gives, naming the same missing
+        // operator.
+        (Operand::Unknown, Operand::Unknown) => (ColumnType::Text, ColumnType::Text),
+    };
+    crate::value::arith::result_type(op, left, right)
+}
+
+/// What one side of an arithmetic operator brings to the type resolution.
+enum Operand {
+    /// A type of its own: a column, a cast, an operator.
+    Fixed(ColumnType),
+    /// A NULL or a quoted string — PostgreSQL's `unknown`, which takes the other side's type.
+    Unknown,
+    /// An integer constant, which takes the other side's **width** when it fits.
+    Integer(i64),
+}
+
+fn operand(expr: &Expr, scope: &Scope<'_>) -> Result<Operand> {
+    Ok(match expr {
+        Expr::Literal(Literal::Null | Literal::String(_)) => Operand::Unknown,
+        Expr::Literal(Literal::Integer(value)) => Operand::Integer(*value),
+        other => Operand::Fixed(expr_type(other, scope)?),
+    })
+}
+
+/// Whether an integer constant can be read as `ty` without changing value.
+///
+/// True for every float and for `numeric`, which is what makes `1.5::float8 + 2` a double rather
+/// than an error: a constant beside an inexact type takes that type.
+fn fits(value: i64, ty: ColumnType) -> bool {
+    match ty {
+        ColumnType::Int2 => i16::try_from(value).is_ok(),
+        ColumnType::Int4 => i32::try_from(value).is_ok(),
+        ColumnType::Int8 | ColumnType::Double | ColumnType::Real | ColumnType::Numeric => true,
+        _ => false,
+    }
+}
+
 pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
     Ok(match expr {
+        // Both operands, then the promotion table — the same table the evaluator uses, so the
+        // type a client is told matches the values it is sent.
+        Expr::Arithmetic {
+            op, left, right, ..
+        } => arithmetic_type(*op, left, right, scope)?,
         Expr::Column { table, name } => scope.resolve_column(table.as_deref(), name)?.1.ty,
         Expr::Ordinal { ty, .. } | Expr::Outer { ty, .. } => *ty,
         // A sequence function answers `bigint` on a real server, all four of them.
@@ -2353,8 +2458,13 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         Expr::CatalogFunc(call) => call.func.result_type(),
         Expr::Literal(Literal::Decimal(_)) => ColumnType::Double,
 
+        // `abs` is the one scalar function that answers its argument's type rather than `text`.
+        Expr::Scalar {
+            func: crate::plan::ScalarFunc::Abs,
+            operand,
+        } => expr_type(operand, scope)?,
         // Whatever the operand is, a cast to `text` answers `text` — that is what it is for.
-        // Both scalar functions take text and answer text.
+        // The two text functions take text and answer text.
         Expr::Scalar { .. }
         | Expr::ToText { .. }
         | Expr::Literal(Literal::String(_) | Literal::Null) => ColumnType::Text,

@@ -1,0 +1,89 @@
+# Binary arithmetic over the integers and the floats, as a real PostgreSQL 19beta1 answers.
+#
+# Captured in one rolled-back session against 127.0.0.1:55432. Statement 741 of the specific
+# schema — `DEFAULT random() * 100` — is the first statement in either schema file that asks this
+# node to do arithmetic at all, so this is not "float multiplication": it is every binary operator
+# on every numeric type.
+#
+# The facts a reading of the operators would get wrong, all measured here:
+#
+#   * `-2 ^ 2` is **4**, not -4: unary minus binds tighter than `^`. And `2 ^ 3 ^ 2` is 64, so `^`
+#     is left-associative — the opposite of the mathematical convention.
+#   * **`NULL::int4 / 0` is NULL, not `22012`.** Strictness comes first: an operator with a NULL
+#     operand is never evaluated, so the divisor is never looked at. An implementation that checks
+#     for a zero divisor before checking for NULL raises where PostgreSQL returns a row.
+#   * **`%` does not exist for `double precision`** — `42883`, not a modulo. Only the integers and
+#     `numeric` have one.
+#   * **A float divided by zero raises `22012`**; it does not yield `Infinity`. And a float
+#     overflow raises `22003 value out of range: overflow` rather than saturating.
+#   * **`^` yields `double precision` whatever it is given** — `2::int4 ^ 3::int4` is a float.
+#   * Integer division truncates **toward zero** (`-7 / 2` is -3, not -4) and `%` takes the sign of
+#     the **dividend** (`-7 % 3` is -1).
+#   * Overflow is at the **declared width**: `32767::int2 + 1` is `22003 smallint out of range`,
+#     and so are `abs((-32768)::int2)`, `-((-2147483648)::int4)` and `int4 min / -1`.
+#   * `int4 + float4` is **double precision**, not `real`: there is no mixed operator, so both
+#     sides go to `float8`. `float4 + float4` really is `real`.
+#   * `'a' + 1` is `22P02`, not `42883`: the unknown literal is resolved to `integer` first and
+#     then fails to parse. `true + 1` is the `42883`.
+SELECT 2 + 3	integer	5
+SELECT 2 - 3	integer	-1
+SELECT 2 * 3	integer	6
+SELECT 6 / 3	integer	2
+SELECT 7 % 3	integer	1
+SELECT 2 ^ 3	double precision	8
+SELECT abs(-3)	integer	3
+SELECT 2 + 3 * 4	integer	14
+SELECT (2 + 3) * 4	integer	20
+SELECT -2 ^ 2	double precision	4
+SELECT 2 ^ 3 ^ 2	double precision	64
+SELECT 2::int2 + 3::int2, 2::int2 - 3::int2, 2::int2 * 3::int2, 7::int2 / 2::int2, 7::int2 % 3::int2	smallint,smallint,smallint,smallint,smallint	5|-1|6|3|1
+SELECT 2::int4 + 3::int4, 2::int4 - 3::int4, 2::int4 * 3::int4, 7::int4 / 2::int4, 7::int4 % 3::int4	integer,integer,integer,integer,integer	5|-1|6|3|1
+SELECT 2::int8 + 3::int8, 2::int8 - 3::int8, 2::int8 * 3::int8, 7::int8 / 2::int8, 7::int8 % 3::int8	bigint,bigint,bigint,bigint,bigint	5|-1|6|3|1
+SELECT 7::int4 / 2::int4, (-7)::int4 / 2::int4, 7::int4 / (-2)::int4, (-7)::int4 / (-2)::int4	integer,integer,integer,integer	3|-3|-3|3
+SELECT 7::int4 % 3::int4, (-7)::int4 % 3::int4, 7::int4 % (-3)::int4, (-7)::int4 % (-3)::int4	integer,integer,integer,integer	1|-1|1|-1
+SELECT 1::int2 / 0::int2	!22012 division by zero
+SELECT 1::int4 / 0::int4	!22012 division by zero
+SELECT 1::int8 / 0::int8	!22012 division by zero
+SELECT 1::int4 % 0::int4	!22012 division by zero
+SELECT NULL::int4 / 0::int4	integer	\N
+SELECT 1::int4 + NULL::int4	integer	\N
+SELECT 32767::int2 + 1::int2	!22003 smallint out of range
+SELECT (-32768)::int2 - 1::int2	!22003 smallint out of range
+SELECT 32767::int2 * 2::int2	!22003 smallint out of range
+SELECT (-32768)::int2 / (-1)::int2	!22003 smallint out of range
+SELECT 2147483647::int4 + 1::int4	!22003 integer out of range
+SELECT (-2147483648)::int4 - 1::int4	!22003 integer out of range
+SELECT 2147483647::int4 * 2::int4	!22003 integer out of range
+SELECT (-2147483648)::int4 / (-1)::int4	!22003 integer out of range
+SELECT 9223372036854775807::int8 + 1::int8	!22003 bigint out of range
+SELECT (-9223372036854775808)::int8 / (-1)::int8	!22003 bigint out of range
+SELECT abs((-2147483648)::int4)	!22003 integer out of range
+SELECT abs((-32768)::int2)	!22003 smallint out of range
+SELECT abs((-3)::int2), abs((-3)::int4), abs((-3)::int8)	smallint,integer,bigint	3|3|3
+SELECT -((-2147483648)::int4)	!22003 integer out of range
+SELECT 2::int2 + 3::int4	integer	5
+SELECT 2::int2 + 3::int8	bigint	5
+SELECT 2::int4 + 3::int8	bigint	5
+SELECT 2::int4 + 3::float4	double precision	5
+SELECT 2::int4 + 3::float8	double precision	5
+SELECT 2::int8 + 3::float8	double precision	5
+SELECT 2::float4 + 3::float4, 2::float4 * 3::float4, 7::float4 / 2::float4	real,real,real	5|6|3.5
+SELECT 2::float8 + 3::float8, 2::float8 * 3::float8, 7::float8 / 2::float8	double precision,double precision,double precision	5|6|3.5
+SELECT 2::float4 + 3::float8	double precision	5
+SELECT 7::float8 % 2::float8	!42883 operator does not exist: double precision % double precision DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 1::float8 / 0::float8	!22012 division by zero
+SELECT 1::float4 / 0::float4	!22012 division by zero
+SELECT 'Infinity'::float8 + 1	double precision	Infinity
+SELECT 'NaN'::float8 + 1	double precision	NaN
+SELECT 'Infinity'::float8 - 'Infinity'::float8	double precision	NaN
+SELECT 1e308::float8 * 10::float8	!22003 value out of range: overflow
+SELECT abs((-3.5)::float8), abs((-3.5)::float4)	double precision,real	3.5|3.5
+SELECT 2::float8 ^ 3::float8, 2::float8 ^ 0.5::float8	double precision,double precision	8|1.4142135623730951
+SELECT (-2)::float8 ^ 0.5::float8	!2201F a negative number raised to a non-integer power yields a complex result
+SELECT 0::float8 ^ 0::float8	double precision	1
+SELECT 'a' + 1	!22P02 invalid input syntax for type integer: "a"
+SELECT true + 1	!42883 operator does not exist: boolean + integer DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 2::int4 + 3::numeric	numeric	5
+SELECT 2::int8 + 3::numeric	numeric	5
+SELECT 2::float8 + 3::numeric	double precision	5
+SELECT 2::numeric + 3::numeric	numeric	5

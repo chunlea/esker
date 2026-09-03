@@ -60,15 +60,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              A bare constant is `integer` on a real server and `int8` here, so the message names \
              `bigint`. `tests/unknown_literal.rs` has the eleven statements this costs.",
         ),
-        (
-            "SELECT id FROM inl WHERE k IN (id + 6) ORDER BY id",
-            "the operator `+` is `0A000` naming itself and was before this unit. The list is a \
-             list of *expressions* here, so this runs the moment arithmetic does.",
-        ),
-        (
-            "SELECT id FROM inl WHERE id + 0 IN (1, 2) ORDER BY id",
-            "the operator `+`, as above, on the left-hand side.",
-        ),
     ],
 };
 
