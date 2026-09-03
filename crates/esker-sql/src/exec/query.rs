@@ -609,9 +609,22 @@ fn finish_plan(
     // rather than working around it: deduplication happens over the target list, so a sort key
     // the target list does not contain has no defined position to sort at. Its keys are resolved
     // against the *output* columns and a key that is not one of them is `42P10`.
-    let sort_keys = order_keys(select, scope, aggregation.as_ref(), &exprs, &columns)?;
+    // **A set-returning call in the target list moves the sort above the projection.** The rows
+    // do not exist until the projection has run — `SELECT generate_series(1,3) ORDER BY 2 DESC` is
+    // three rows to order and one row before it — so a sort underneath would order the input and
+    // leave the generated values in generation order, which is what it did. `DISTINCT` moves it
+    // for its own reason, and both then resolve their keys against the **output** columns.
+    let expands = exprs.iter().any(contains_set_func);
+    let sort_keys = order_keys(
+        select,
+        scope,
+        aggregation.as_ref(),
+        &exprs,
+        &columns,
+        select.distinct || expands,
+    )?;
     refuse_json_sort(&sort_keys)?;
-    if !select.distinct && !sort_keys.is_empty() {
+    if !select.distinct && !expands && !sort_keys.is_empty() {
         node = Node::Sort {
             input: Box::new(node),
             keys: sort_keys.clone(),
@@ -622,6 +635,13 @@ fn finish_plan(
         input: Box::new(node),
         exprs,
     };
+
+    if expands && !select.distinct && !sort_keys.is_empty() {
+        node = Node::Sort {
+            input: Box::new(node),
+            keys: sort_keys.clone(),
+        };
+    }
 
     if select.distinct {
         node = Node::Distinct {
@@ -702,6 +722,7 @@ fn order_keys(
     aggregation: Option<&aggregate::Aggregation>,
     outputs: &[Expr],
     columns: &[(String, ColumnType, i32)],
+    over_output: bool,
 ) -> Result<Vec<SortKey>> {
     let mut keys = Vec::new();
     for item in &select.order_by {
@@ -739,7 +760,7 @@ fn order_keys(
                 Some(aggregation) => aggregation.rewrite(&resolved, scope)?,
             }
         };
-        let expr = if select.distinct {
+        let expr = if select.distinct || over_output {
             let at = outputs
                 .iter()
                 .position(|output| output == &resolved)
@@ -1689,6 +1710,16 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             otherwise,
         } => resolve_case(branches, otherwise.as_deref(), scope)?,
         Expr::Coalesce(args) => resolve_coalesce(args, scope)?,
+        // Its arguments are expressions of the row like a catalog function's — `unnest(tags)` is a
+        // column reference — so they resolve the same way. Falling through to the clone below left
+        // them as `Expr::Column` and the evaluator reported one as having reached it unresolved.
+        Expr::SetFunc(call) => {
+            let mut resolved = call.clone();
+            for arg in &mut resolved.args {
+                *arg = resolve(arg, scope)?;
+            }
+            Expr::SetFunc(resolved)
+        }
         // Its arguments are ordinary expressions of the row — `format_type(a.atttypid,
         // a.atttypmod)` is two column references — so they resolve like any others. Falling
         // through to the clone below would leave them as `Expr::Column` and the evaluator would
@@ -1892,6 +1923,15 @@ fn resolve_coalesce(args: &[Expr], scope: &Scope<'_>) -> Result<Expr> {
         }
     }
     Ok(Expr::Coalesce(resolved))
+}
+
+/// Whether an expression holds a set-returning call anywhere inside it.
+fn contains_set_func(expr: &Expr) -> bool {
+    let mut found = false;
+    super::bind::descend(expr, &mut |expr| {
+        found |= matches!(expr, Expr::SetFunc(_));
+    });
+    found
 }
 
 /// The left-hand side of an `IN`/`ANY`/`ALL`, typed against the subquery's column.
@@ -2339,6 +2379,14 @@ fn check_predicate(expr: &Expr, clause: &'static str, scope: &Scope<'_>) -> Resu
     // An `UPDATE` or `DELETE` reaches here without going through `Aggregation::build`, and
     // `WHERE count(*) > 1` is `42803` on all three statements. One check rather than three.
     // A `HAVING` is the one clause where an aggregate belongs, so only `WHERE` refuses it.
+    // **A set-returning function is not allowed in a `WHERE`**, and PostgreSQL names the clause.
+    // The projection is the only place that expands one, so without this the call reaches the row
+    // evaluator and answers `XX000` — a bug report for a statement a real server declines politely.
+    if contains_set_func(expr) {
+        return Err(SqlError::SetFunctionNotAllowed(format!(
+            "set-returning functions are not allowed in {clause}"
+        )));
+    }
     if clause == "WHERE" && aggregate::contains_aggregate(expr) {
         return Err(SqlError::AggregateNotAllowed(
             "aggregate functions are not allowed in WHERE",
@@ -2681,6 +2729,9 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // it: a bare NULL answers `text` from the second and nothing from the first, and
         // `COALESCE(NULL, 2)` typed as `text` made `COALESCE(1, NULL) + COALESCE(NULL, 2)` the
         // `42883 operator does not exist: bigint + text` that a real server adds without blinking.
+        // One generated **value**, not the set: the column a client is described is the element
+        // type. `unnest` answers its array's element type and the two generators answer their own.
+        Expr::SetFunc(call) => super::table_function::result_type(call, scope),
         Expr::Coalesce(args) => args
             .iter()
             .find_map(|arg| branch_type(arg, scope))

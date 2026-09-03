@@ -962,6 +962,15 @@ fn render(expr: &Expr, columns: &[String]) -> String {
         // On one line, the way `EXPLAIN` prints everything else — `pg_get_indexdef`'s five-line
         // layout is for a stored definition and is built where that is written
         // (`crate::exec::ddl`), not here.
+        Expr::SetFunc(call) => format!(
+            "{}({})",
+            call.name,
+            call.args
+                .iter()
+                .map(|arg| render(arg, columns))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Expr::Coalesce(args) => format!(
             "COALESCE({})",
             args.iter()

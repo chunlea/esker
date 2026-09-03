@@ -658,6 +658,21 @@ pub(super) fn check_not_nested(expr: &Expr) -> Result<()> {
                 "aggregate function calls cannot be nested",
             ));
         }
+        // **A set-returning call inside an aggregate is its own sentence**, and PostgreSQL adds a
+        // HINT about `LATERAL`. `count(generate_series(1,3))` asks an aggregate to fold a set that
+        // the projection would have expanded into rows *around* it — the two cannot both happen,
+        // and a real server says which one loses.
+        if call.args.iter().any(|arg| {
+            let mut found = false;
+            super::bind::descend(arg, &mut |expr| {
+                found |= matches!(expr, Expr::SetFunc(_));
+            });
+            found
+        }) {
+            return Err(SqlError::SetFunctionNotAllowed(
+                "aggregate function calls cannot contain set-returning function calls".to_owned(),
+            ));
+        }
     }
     Ok(())
 }

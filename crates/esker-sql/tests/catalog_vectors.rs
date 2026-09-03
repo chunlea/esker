@@ -48,16 +48,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // A set-returning function in the **target list** is a different feature from one in
         // `FROM`, which is where `generate_subscripts` is implemented. Both lines below are that
         // gap and neither is about the vectors.
-        (
-            "SELECT 'r', generate_subscripts(conkey, 1) FROM pg_constraint WHERE conname = \
-             'vt_pkey'",
-            "a set-returning function in the target list is not implemented; in FROM it is",
-        ),
-        (
-            "SELECT 'r', generate_subscripts(indkey, 1) FROM pg_index WHERE indexrelid = \
-             'vt_ab'::regclass",
-            "a set-returning function in the target list is not implemented; in FROM it is",
-        ),
         // **An implicit `LATERAL`.** A set-returning function in a comma `FROM` list may name a
         // table to its left on a real server — `generate_subscripts(c.conkey, 1)` after
         // `pg_constraint c` — and here the entries are independent, so `c` is not in scope. The

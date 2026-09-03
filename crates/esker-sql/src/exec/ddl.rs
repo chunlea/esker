@@ -2043,6 +2043,15 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
         // why `ActiveRecord`'s schema dumper sees a multi-line definition for statement 198.
         // Captured with the newlines escaped, because a corpus line cannot hold one
         // (`tests/corpus/pg19_case_expression.txt`).
+        Expr::SetFunc(call) => format!(
+            "{}({})",
+            call.name,
+            call.args
+                .iter()
+                .map(|arg| deparse(arg, table, ty))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Expr::Coalesce(args) => format!(
             "COALESCE({})",
             args.iter()

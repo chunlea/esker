@@ -426,6 +426,9 @@ fn push_filter(
         // which of them raises. Rows, and the row evaluator answers it.
         // A fragment is pushed down to a learner that has no expression evaluator of its own, so
         // the two conditional constructs are refused there and computed here.
+        // A fragment is a projection a learner evaluates, and a set-returning call makes rows —
+        // which is a shape the fragment protocol has no room for.
+        Expr::SetFunc(_) => return Err(refused("a set-returning function")),
         Expr::Coalesce(_) => return Err(refused("a COALESCE expression")),
         Expr::Case { .. } => return Err(refused("a CASE expression")),
         // The fragment language has no array. Rows, and the row evaluator answers it.
@@ -725,6 +728,11 @@ fn collect_columns(expr: &Expr, into: &mut Vec<usize>) {
             collect_columns(operand, into);
             for item in list {
                 collect_columns(item, into);
+            }
+        }
+        Expr::SetFunc(call) => {
+            for arg in &call.args {
+                collect_columns(arg, into);
             }
         }
         Expr::Coalesce(args) => {

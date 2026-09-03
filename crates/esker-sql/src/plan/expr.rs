@@ -334,6 +334,22 @@ pub enum Expr {
         /// does not know it came from a `bpchar`.
         strip_blanks: bool,
     },
+    /// A **set-returning function in the target list**: `SELECT generate_series(1,3)`.
+    ///
+    /// The same call that stands where a table does ([`crate::plan::TableFunction`]), in the one
+    /// other place PostgreSQL allows it — and there it does something no other expression does:
+    /// **it makes rows**. `SELECT 'r', generate_series(1,3)` is three rows of `r`, and
+    /// `SELECT id, unnest(tags) FROM t` is one row per element per input row. Everything beside it
+    /// repeats.
+    ///
+    /// Two of them run **in lockstep**, not as a cross join: `generate_series(1,3),
+    /// generate_series(1,2)` is three rows and the second column's third is NULL. Measured; a
+    /// Cartesian reading would give six.
+    ///
+    /// It may sit **inside** an expression — `abs(generate_series(-1,1))` is `1, 0, 1` — so the
+    /// expansion is over the whole target list and the expressions are evaluated per generated
+    /// value, which is why this is a variant of [`Expr`] and not a kind of projection.
+    SetFunc(Box<crate::plan::TableFunction>),
     /// `COALESCE(a, b, …)`: the first argument that is not NULL.
     ///
     /// **Not a function**, which is the first thing an implementation gets wrong: PostgreSQL has it
@@ -1471,6 +1487,7 @@ fn describe(expr: &Expr) -> &'static str {
         Expr::Default => "DEFAULT",
         Expr::Sequence(_) => "a sequence function",
         Expr::CatalogFunc(_) => "a catalog function",
+        Expr::SetFunc(_) => "a set-returning function",
         Expr::Coalesce(_) => "COALESCE",
         Expr::Case { .. } => "CASE",
         Expr::Subquery(sub) => sub.kind.describe(),

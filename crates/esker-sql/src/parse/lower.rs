@@ -2886,6 +2886,19 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
     if let Some(func) = plan::CatalogFunc::from_name(&name) {
         return lower_catalog_function(func, function);
     }
+    // **A set-returning function in the target list.** The same call `FROM` takes, in the one
+    // other place PostgreSQL allows it; what it does there is make rows, which the cursor's
+    // projection does rather than this.
+    if is_set_returning(function) {
+        return Ok(plan::Expr::SetFunc(Box::new(plan::TableFunction {
+            name: name.to_ascii_lowercase(),
+            args: function_arguments(function, &name)?
+                .into_iter()
+                .map(lower_expr)
+                .collect::<Result<Vec<_>>>()?,
+            def: None,
+        })));
+    }
     let Some(func) = plan::AggregateFunc::from_name(&name) else {
         return Err(SqlError::unsupported(format!("the function {name}")));
     };
