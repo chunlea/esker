@@ -2286,7 +2286,7 @@ pub(super) fn alter_table(
         // statement and there is no second place to keep in step.
         if let AlterTableAction::SetPersistence(persistence) = action {
             updated.persistence = *persistence;
-            catalog::replace_table(txn, executor.tenant, &table, &mut updated)?;
+            catalog::replace_table(txn, executor.tenant, &table, &updated)?;
             changed = true;
             continue;
         }

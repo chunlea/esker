@@ -37,6 +37,46 @@ impl Parsed {
     /// Lowers this statement into the plan types the executor runs, or names the construct that
     /// stopped it (contract C2).
     pub fn lower(&self) -> Result<plan::Statement> {
+        // **Deep once, then deep properly.** `lower_expr` stops at `INLINE_LOWER_DEPTH` on the
+        // caller's stack, which is a tokio worker's 2 MiB. A statement past it is not refused —
+        // it is lowered again on a thread with room for `MAX_NESTING_DEPTH` levels, exactly as
+        // `crate::parse` re-parses a deeply nested statement on one. So the limit a client meets
+        // is the parser's, and the worker's stack decides only *where* the work happens.
+        match self.lower_inline() {
+            Err(SqlError::StatementTooComplex) => self.lower_on_a_deep_stack(),
+            other => other,
+        }
+    }
+
+    /// [`Parsed::lower`] on a thread sized for the full depth, and only for a statement that needs
+    /// it. A thread spawn costs tens of microseconds; the statement is about to become a
+    /// distributed transaction.
+    fn lower_on_a_deep_stack(&self) -> Result<plan::Statement> {
+        // **Borrowed, not cloned.** `Parsed` holds `sqlparser`'s tree, and `Clone` on that tree is
+        // as recursive as lowering it — cloning a 500-term chain to hand it to the deep thread
+        // overflowed the very stack this exists to get off. A scoped thread borrows it instead, so
+        // nothing walks the tree on the caller's stack.
+        std::thread::scope(|scope| {
+            let worker = std::thread::Builder::new()
+                .name("esker-sql-lower".into())
+                .stack_size(crate::parse::DEEP_PARSE_STACK_BYTES)
+                .spawn_scoped(scope, || {
+                    LOWER_LIMIT.with(|cell| cell.set(crate::parse::MAX_NESTING_DEPTH));
+                    self.lower_inline()
+                })
+                .map_err(|error| {
+                    SqlError::Internal(format!("could not spawn a lowering thread: {error}"))
+                })?;
+            // A panic here is a bug in this crate and not something the client did, so it is an
+            // internal error rather than a dropped connection — the reading
+            // `parse_on_a_deep_stack` takes, and for the same invariant.
+            worker
+                .join()
+                .map_err(|_| SqlError::Internal("the lowering thread panicked".into()))?
+        })
+    }
+
+    fn lower_inline(&self) -> Result<plan::Statement> {
         // **Built here, not parsed.** `ALTER TABLE … SET { LOGGED | UNLOGGED }` was rewritten to a
         // placeholder because the parser has no `LOGGED` keyword, so the statement is reconstructed
         // from what the class recorded — and then travels the ordinary `ALTER TABLE` path.
@@ -2196,7 +2236,64 @@ fn lower_on_conflict(on: &sqlparser::ast::OnInsert) -> Result<plan::OnConflict> 
     clippy::too_many_lines,
     reason = "one arm per expression shape; splitting it would hide the vocabulary rather than clarify it"
 )]
+/// How deep [`lower_expr`] may descend on the caller's own stack.
+///
+/// **Measured, not chosen**: an `OR` chain overflows a 2 MiB stack at 59 terms in a debug build,
+/// which is about 35 KiB of frame per level — `lower_expr` is one large match and every arm's
+/// locals get a slot. Half of that measurement, so the guard fires with the stack half used.
+///
+/// A statement past it is not refused: it is lowered again on a thread sized for
+/// [`crate::parse::MAX_NESTING_DEPTH`] levels, which is what `crate::parse` already does for a
+/// deeply nested *parse* and for the same reason. Only a statement past **that** is `54001`, so
+/// the set of statements this node accepts is the parser's set and not the worker stack's.
+const INLINE_LOWER_DEPTH: usize = if cfg!(debug_assertions) { 24 } else { 128 };
+
+thread_local! {
+    /// How many [`lower_expr`] frames this thread is inside.
+    static LOWER_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The ceiling this thread is working to: the inline budget, or the full limit on a thread
+    /// spawned with a stack for it.
+    static LOWER_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(INLINE_LOWER_DEPTH) };
+}
+
+/// Counts one level of [`lower_expr`] and gives it back on the way out.
+///
+/// A guard object rather than a depth parameter, because `lower_expr` is reached from a dozen
+/// sibling walkers — the query lowerer, the `CASE` arms, the function arguments — and a parameter
+/// would have to be threaded through every one of them, where any missed call site silently
+/// resets the count to zero.
+struct DepthGuard;
+
+impl DepthGuard {
+    fn enter() -> Result<Self> {
+        let limit = LOWER_LIMIT.with(std::cell::Cell::get);
+        let depth = LOWER_DEPTH.with(std::cell::Cell::get);
+        if depth >= limit {
+            return Err(SqlError::StatementTooComplex);
+        }
+        LOWER_DEPTH.with(|cell| cell.set(depth + 1));
+        Ok(DepthGuard)
+    }
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        LOWER_DEPTH.with(|cell| cell.set(cell.get().saturating_sub(1)));
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per `sqlparser` expression node, in the parser's own order; splitting it \
+              would put half the tree's shapes in a function named after nothing"
+)]
 fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
+    // **Invariant 9, at the one place that was missing it.** The parser has been guarded since
+    // phase 6a, and its guard counts *brackets* — which is why it never saw this: `a OR b OR c`
+    // has one bracket and builds an N-deep tree, so run 46's node parsed a boolean chain happily
+    // and then overflowed a tokio worker's stack lowering it. Counted here rather than inferred
+    // from the source, because the tree's depth is what this function descends.
+    let _depth = DepthGuard::enter()?;
     let expr_ref = expr;
     match expr {
         Expr::Value(value) => lower_value(&value.value, false),

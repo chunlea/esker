@@ -86,7 +86,8 @@ const INLINE_PARSE_DEPTH: usize = INLINE_STACK_BUDGET / STACK_PER_NESTING_LEVEL;
 /// committed memory, so a thread that does not descend does not pay for it.
 /// `the_deepest_admissible_statement_parses` is the test that keeps this honest -- it parses
 /// nested subqueries at exactly [`MAX_NESTING_DEPTH`], which needed 256 MiB when measured directly.
-const DEEP_PARSE_STACK_BYTES: usize = MAX_NESTING_DEPTH * STACK_PER_NESTING_LEVEL + 4 * 1024 * 1024;
+pub(crate) const DEEP_PARSE_STACK_BYTES: usize =
+    MAX_NESTING_DEPTH * STACK_PER_NESTING_LEVEL + 4 * 1024 * 1024;
 
 /// The recursion limit handed to `sqlparser` itself.
 ///
@@ -225,7 +226,11 @@ impl Parsed {
         &self.class
     }
 
-    /// Whether the `CREATE TABLE` said `UNLOGGED`. See [`Parsed::unlogged`].
+    /// Whether the `CREATE TABLE` said `UNLOGGED`.
+    ///
+    /// The keyword is cut out of the source before the parse (`strip_unlogged`), because
+    /// `sqlparser` 0.62.0 reads `TEMP` before `TABLE` and not this — so the tree cannot carry it
+    /// and this is where it travels.
     #[must_use]
     pub fn is_unlogged(&self) -> bool {
         self.unlogged
@@ -1397,6 +1402,9 @@ fn rewrite_synonym(sql: &str, scanned: &Scan<'_>) -> Option<String> {
 /// * brackets — `(`, `[`, and `CASE`, which pairs with `END` exactly as a bracket does;
 /// * runs of prefix operators — `NOT NOT NOT x` descends three levels without a bracket in sight,
 ///   and so does `- - - 1`, so the length of the current run is added to the bracket depth;
+/// * chains of `AND`/`OR` — `a OR b OR c` has **one** bracket and builds a three-level tree, which
+///   is the shape that crashed a node: the parser accepted it, and walking it overflowed the
+///   stack. A chain is as deep as a nest and is counted the same way;
 /// * nothing at all inside a string, a quoted identifier, a dollar-quoted body or a comment.
 ///
 /// An unterminated string or comment ends the scan rather than failing it: the statement is
@@ -1432,6 +1440,8 @@ fn scan(sql: &str) -> Scan<'_> {
     let mut index = 0;
     let mut depth: usize = 0;
     let mut max: usize = 0;
+    // How many `AND`/`OR` operators have chained at the current bracket level.
+    let mut chain: usize = 0;
     let mut run: usize = 0;
 
     while index < bytes.len() {
@@ -1488,14 +1498,23 @@ fn scan(sql: &str) -> Scan<'_> {
                         depth += 1;
                         max = max.max(depth + run);
                         run = 0;
+                        chain = 0;
                     }
                     Keyword::End => {
                         depth = depth.saturating_sub(1);
                         run = 0;
+                        chain = 0;
                     }
                     Keyword::Not => {
                         run += 1;
                         max = max.max(depth + run);
+                    }
+                    // **Not reset by the operands between them.** `a = 1 OR a = 2 OR a = 3` is
+                    // three levels with five ordinary words in between, so the chain is counted on
+                    // its own rather than folded into `run`, which any word clears.
+                    Keyword::Chain => {
+                        chain += 1;
+                        max = max.max(depth + chain);
                     }
                     Keyword::Other => run = 0,
                 }
@@ -1514,8 +1533,15 @@ fn scan(sql: &str) -> Scan<'_> {
     }
 }
 
-/// The three keywords that move the depth. Everything else resets the prefix run.
+/// The keywords that move the depth. Everything else resets the prefix run.
 enum Keyword {
+    /// `AND` / `OR`: a **left-deep chain**, one tree level per operator.
+    ///
+    /// Counted because bracket depth does not see it. `a OR b OR c OR …` has one bracket and
+    /// builds an N-deep tree — which is how run 46's node parsed a boolean chain from
+    /// `ActiveRecord`'s `.or()` and then died walking it. A chain is as deep as a nest, so it is
+    /// measured the same way.
+    Chain,
     Case,
     End,
     Not,
@@ -1524,6 +1550,8 @@ enum Keyword {
 
 fn keyword(word: &[u8]) -> Keyword {
     match word.len() {
+        2 if word.eq_ignore_ascii_case(b"OR") => Keyword::Chain,
+        3 if word.eq_ignore_ascii_case(b"AND") => Keyword::Chain,
         3 if word.eq_ignore_ascii_case(b"NOT") => Keyword::Not,
         3 if word.eq_ignore_ascii_case(b"END") => Keyword::End,
         4 if word.eq_ignore_ascii_case(b"CASE") => Keyword::Case,
