@@ -104,6 +104,7 @@ pub(super) fn plan_subqueries(
         .flatten()
         .chain(select.joins.iter_mut().map(|join| &mut join.table))
     {
+        plan_table_function(entry);
         plan_derived(entry, tenant, txn, tables, outer)?;
     }
     let table = match &select.from {
@@ -151,6 +152,50 @@ pub(super) fn plan_subqueries(
 /// turns on. With it, `Scope` resolves a name, `SELECT *` expands, `EXPLAIN` prints the names the
 /// user typed and the join machinery probes or materialises, all without learning that nothing
 /// stores these rows. Without it every one of those would need a second code path.
+/// The relation a set-returning function in `FROM` stands for.
+///
+/// **One column, of the alias's name, typed `integer`** — `generate_subscripts` returns an
+/// `integer`, which is what lets the subscript it yields be fed straight back into `a[i]`. The
+/// same trick `plan_derived` turns on: with a synthetic `TableDef`, `Scope` resolves the name,
+/// `SELECT *` expands it, `EXPLAIN` prints it and the join machinery materialises it, none of
+/// them learning that nothing stores these rows.
+pub(super) fn table_function_def(
+    entry: &crate::plan::TableRef,
+) -> std::sync::Arc<crate::catalog::TableDef> {
+    let name = entry.referred_as().to_owned();
+    std::sync::Arc::new(crate::catalog::TableDef {
+        id: crate::catalog::DERIVED_TABLE_ID,
+        name: name.clone(),
+        columns: vec![crate::catalog::ColumnDef {
+            name,
+            ty: crate::value::ColumnType::Int4,
+            typmod: crate::value::NO_TYPMOD,
+            default_expr: None,
+            not_null: false,
+            default: None,
+            missing: None,
+            generated: None,
+        }],
+        primary_key: Vec::new(),
+        indexes: Vec::new(),
+        primary_key_name: String::new(),
+        schema_version: 1,
+        sequences: Vec::new(),
+        checks: Vec::new(),
+        foreign_keys: Vec::new(),
+        triggers_disabled: false,
+    })
+}
+
+fn plan_table_function(entry: &mut crate::plan::TableRef) {
+    let name = entry.referred_as().to_owned();
+    let Some(function) = entry.function.as_mut() else {
+        return;
+    };
+    let _ = name;
+    function.def = None;
+}
+
 fn plan_derived(
     entry: &mut crate::plan::TableRef,
     tenant: u64,
@@ -274,6 +319,11 @@ pub(super) fn relation_of(
     entry: &crate::plan::TableRef,
     tables: &dyn Tables,
 ) -> Result<std::sync::Arc<crate::catalog::TableDef>> {
+    // Built here rather than in a pre-pass, so that it cannot depend on one having run: a
+    // function's shape is fixed — one column of the alias's name — and needs nothing looked up.
+    if entry.function.is_some() {
+        return Ok(table_function_def(entry));
+    }
     match entry.derived.as_ref() {
         // A name that is a `WITH` item this part of the query cannot see becomes PostgreSQL's
         // three-part answer -- **only when the catalog has no such relation**, because a later CTE
@@ -770,6 +820,13 @@ fn for_each_written_expr_mut(select: &mut Select, visit: &mut impl FnMut(&mut Ex
 /// The same walk over a plan's expressions, immutably.
 fn for_each_node_expr(node: &Node, visit: &mut impl FnMut(&Expr)) {
     match node {
+        // A table function's arguments are expressions like any other, so an outer reference
+        // in one is rewritten by the same walk that rewrites everything else.
+        Node::TableFunction { call, .. } => {
+            for arg in &call.args {
+                visit(arg);
+            }
+        }
         Node::Filter { input, predicate } => {
             visit(predicate);
             for_each_node_expr(input, visit);
@@ -832,6 +889,13 @@ fn for_each_node_expr(node: &Node, visit: &mut impl FnMut(&Expr)) {
 /// Every expression a *plan node* holds, in one place. Recursive over the tree.
 fn for_each_node_expr_mut(node: &mut Node, visit: &mut impl FnMut(&mut Expr)) {
     match node {
+        // A table function's arguments are expressions like any other, so an outer reference
+        // in one is rewritten by the same walk that rewrites everything else.
+        Node::TableFunction { call, .. } => {
+            for arg in &mut call.args {
+                visit(arg);
+            }
+        }
         Node::Filter { input, predicate } => {
             visit(predicate);
             for_each_node_expr_mut(input, visit);

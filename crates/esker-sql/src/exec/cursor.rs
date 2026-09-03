@@ -182,12 +182,23 @@ fn inner_side(
 
 impl<'a> Cursor<'a> {
     /// Opens a cursor over a plan.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per node kind, the same shape as `next`"
+    )]
     pub(super) fn open(txn: &'a dyn Txn, tenant: u64, node: &Node) -> Result<Self> {
         let kind = match node {
             Node::OneRow => Kind::One(false),
             // Computed here, once, rather than page by page: `pg_type` is six rows and `pg_range`
             // is none. If a catalog view ever is not small, this is the line that changes.
             Node::CatalogView { view, .. } => Kind::Rows(view.rows_of(txn, tenant)?.into_iter()),
+            // A set-returning function in `FROM`: its rows are computed here, once, exactly as a
+            // catalog view's are — there is no key range to seek in and the row count is the
+            // length of one array. Its arguments are evaluated against **no row**, which is what
+            // makes an argument that reads a column the refusal below rather than a wrong answer.
+            Node::TableFunction { call, .. } => {
+                Kind::Rows(super::table_function::rows(call, &[])?.into_iter())
+            }
             Node::SeqScan {
                 columns,
                 start,

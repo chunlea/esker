@@ -137,10 +137,15 @@ const FIXTURE: &[&str] =
 /// `pg_catalog.obj_description(…)` was refused because the name a call resolves by was taken with
 /// the schema still attached. Three statements for one rule.
 ///
-/// The one that still does not run is the other half of the array surface: line 52 (`indexes()`)
-/// wants `ARRAY(SELECT …)` over `generate_subscripts`, and `c.conkey[idx]` with it. **The rows
+/// **Thirty-five with boot statements 35 and 36**, the two that read a constraint's columns
+/// through `generate_subscripts(c.conkey, 1)` in `FROM`. A set-returning function standing where
+/// a relation does is a third kind of `FROM` entry beside a relation and a derived table, and the
+/// two statements are one unit because they are the same shape twice.
+///
+/// The one that still does not run is line 52 (`indexes()`), which wants `ARRAY(SELECT …)` —
+/// the array *constructor*, a different thing from the array-valued column it reads. **The rows
 /// behind it are here and agree** (`tests/pg_catalog_*.rs`).
-const RUNS: usize = 33;
+const RUNS: usize = 35;
 
 #[test]
 fn every_statement_activerecord_sends_parses_and_is_answered_by_name() {

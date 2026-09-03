@@ -18,11 +18,11 @@
 use sqlparser::ast::{
     AlterTableOperation, AssignmentTarget, BinaryOperator, CharacterLength, ColumnOption,
     ConstraintReferenceMatchKind, CreateTableOptions, DataType, DeferrableInitial, Distinct,
-    DollarQuotedString, ExactNumberInfo, Expr, FromTable, GeneratedAs, GroupByExpr, Ident,
-    IndexColumn, IndexType, JoinConstraint, JoinOperator, LimitClause, NullsDistinctOption,
-    ObjectName, ObjectType, OffsetRows, OrderByKind, Query, SelectItem,
-    SelectItemQualifiedWildcardKind, SetExpr, Statement, TableConstraint, TableFactor, TableObject,
-    TimezoneInfo, UnaryOperator, Value,
+    DollarQuotedString, ExactNumberInfo, Expr, FromTable, FunctionArg, FunctionArgExpr,
+    GeneratedAs, GroupByExpr, Ident, IndexColumn, IndexType, JoinConstraint, JoinOperator,
+    LimitClause, NullsDistinctOption, ObjectName, ObjectType, OffsetRows, OrderByKind, Query,
+    SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, TableConstraint, TableFactor,
+    TableObject, TimezoneInfo, UnaryOperator, Value,
 };
 
 use crate::catalog::{self, KeyOrder, fold_identifier};
@@ -2615,8 +2615,7 @@ fn function_arguments<'a>(
 }
 
 /// The type name PostgreSQL would print for one argument in a `42883`.
-fn argument_type_name(arg: &sqlparser::ast::FunctionArg) -> String {
-    use sqlparser::ast::{FunctionArg, FunctionArgExpr};
+fn argument_type_name(arg: &FunctionArg) -> String {
     let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg else {
         return "unknown".to_owned();
     };
@@ -3503,6 +3502,7 @@ fn lower_with(with: Option<&sqlparser::ast::With>, into: &mut plan::Select) -> R
                 Box::new(body.clone()),
                 columns.clone(),
             ))),
+            function: None,
             hidden_cte: false,
         });
     }
@@ -3589,6 +3589,47 @@ fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
             partitions,
             ..
         } => {
+            // **A set-returning function standing where a relation does.** Only
+            // `generate_subscripts`, which is what the schema dump reads every constraint's
+            // column list through; anything else is still named rather than approximated.
+            if let Some(args) = args {
+                let folded = relation_name(name)?;
+                refuse_if(
+                    folded != "generate_subscripts",
+                    format!("the table function {folded}"),
+                )?;
+                let alias = match alias {
+                    None => None,
+                    Some(alias) => {
+                        refuse_if(!alias.columns.is_empty(), "a column alias list")?;
+                        Some(ident(&alias.name))
+                    }
+                };
+                let mut lowered = Vec::new();
+                for arg in &args.args {
+                    match arg {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
+                            lowered.push(lower_expr(expr)?);
+                        }
+                        other => {
+                            return Err(SqlError::unsupported(format!(
+                                "the table function argument {other}"
+                            )));
+                        }
+                    }
+                }
+                return Ok(plan::TableRef {
+                    name: folded.clone(),
+                    alias,
+                    derived: None,
+                    function: Some(Box::new(plan::TableFunction {
+                        name: folded,
+                        args: lowered,
+                        def: None,
+                    })),
+                    hidden_cte: false,
+                });
+            }
             refuse_if(args.is_some(), "a table function")?;
             refuse_if(!with_hints.is_empty(), "a table hint")?;
             refuse_if(version.is_some(), "a table version")?;
@@ -3604,6 +3645,7 @@ fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
                 name: relation_name(name)?,
                 alias,
                 derived: None,
+                function: None,
                 hidden_cte: false,
             })
         }
@@ -3638,6 +3680,7 @@ fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
                     Box::new(lower_query(subquery)?),
                     columns,
                 ))),
+                function: None,
                 hidden_cte: false,
             })
         }

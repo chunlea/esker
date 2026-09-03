@@ -41,7 +41,8 @@ pub use expr::{
     Literal, PlainFunc, ScalarFunc, SequenceCall, SequenceFunc, UuidFunc,
 };
 pub use query::{
-    AggregateSpec, Join, JoinKind, Node, OrderItem, Probe, Select, SelectItem, SortKey, TableRef,
+    AggregateSpec, Join, JoinKind, Node, OrderItem, Probe, Select, SelectItem, SortKey,
+    TableFunction, TableRef,
 };
 pub use routing::{Columnar, Decision, Engine, Reason, Setting};
 pub use session::SessionStatement;
