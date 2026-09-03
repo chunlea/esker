@@ -21,13 +21,12 @@ const DIVERGENCES: bind::Divergences = bind::Divergences {
             "SELECT pg_typeof($1::int8)",
             "The same cast, and the same unit",
         ),
-        (
-            "SELECT COUNT(*) FROM bp_posts WHERE n IS NOT DISTINCT FROM $1",
-            "`IS NOT DISTINCT FROM` is an **operator this node does not have**, and nothing about \
-             it is bind parameters — `pg19_on_conflict.txt` declares the same gap for the same \
-             operator. The parameter half works: the identical statement with `=` binds NULL and \
-             answers `0` two lines above",
-        ),
+        // **An entry stood here and is deleted** (ADR 0031, rule 2): `IS NOT DISTINCT FROM` was
+        // an operator this node did not have. It arrived with the `upsert_all` template that
+        // needed it (`tests/values_catalog_function.rs`), and the parameter half had always
+        // worked — the identical statement with `=` binds NULL two lines above. The entry was
+        // *found* by this harness learning rule 2, which it did not have: a listed answer
+        // divergence was skipped without being compared, so closing one was absorbed silently.
         (
             "SELECT pg_typeof($1)",
             "**A parameter in a function argument needs overload resolution**, which this node \
